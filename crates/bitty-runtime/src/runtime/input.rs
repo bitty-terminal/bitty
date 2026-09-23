@@ -981,6 +981,14 @@ impl Runtime {
             if self.end_alt_drag() {
                 return;
             }
+            // Issue #1348: a release also ends a border-drag resize — but
+            // like the Alt+drag move it returns early, skipping the
+            // selection commit/copy (the grabbing press never started a
+            // selection, so there is nothing to commit and stale highlights
+            // must not auto-copy).
+            if self.end_border_drag() {
+                return;
+            }
         }
         // CTX-0260: Alt+Left-press on a floating overlay grabs it for an
         // Alt+drag move and consumes the event (no selection starts). The
@@ -993,6 +1001,20 @@ impl Runtime {
             && event.state == PressState::Pressed
             && self.alt_pressed
             && self.begin_alt_drag()
+        {
+            return;
+        }
+        // Issue #1348: a plain left press on a split divider grabs it for
+        // a border-drag resize and consumes the event (no selection
+        // starts, no focus moves — a border owns no leaf). Shift/Alt
+        // presses fall through to the selection and Alt+drag paths, and
+        // mouse-capture apps never reach here (they returned above), so
+        // border-drag never breaks selection or app pointer ownership.
+        if !shift_override
+            && event.button == MouseButton::Left
+            && event.state == PressState::Pressed
+            && !self.alt_pressed
+            && self.begin_border_drag()
         {
             return;
         }
@@ -1125,6 +1147,13 @@ impl Runtime {
         // CTX-0260: an active Alt+drag consumes motion (it moves the
         // grabbed float; selection/hover/capture-motion all stay out).
         if self.update_alt_drag(pos) {
+            self.clear_hover_pending();
+            return;
+        }
+        // Issue #1348: an active border drag consumes motion (it adjusts
+        // the grabbed split ratio live; selection/hover/capture-motion all
+        // stay out).
+        if self.update_border_drag(pos) {
             self.clear_hover_pending();
             return;
         }

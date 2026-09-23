@@ -157,7 +157,7 @@ pub use self::present::{ImeCursorArea, PresentStats};
 use self::click::ClickTracker;
 use self::close_confirm::PendingCloseConfirm;
 use self::layout_focus::{default_container, default_layout};
-use self::mouse_chrome::{AltDragState, HoverPending};
+use self::mouse_chrome::{AltDragState, BorderDragState, HoverPending};
 use self::panes::PaneSession;
 use self::present::{AnyRasterizer, HeadlessRasterizer, ImeCaret};
 use self::scrollbar::ScrollbarDrag;
@@ -564,6 +564,14 @@ pub struct Runtime {
     /// truth. Shift still forces the selection path (the grab never starts
     /// while Shift is held, per the CTX-0181 precedent).
     alt_drag: Option<AltDragState>,
+    /// Active border-drag split-divider resize (issue #1348).
+    ///
+    /// Plain left press on a split handle grabs the divider; motion
+    /// adjusts the adjacent split ratio live (same clamped geometry as
+    /// keyboard resize). `None` when no drag is active; cleared on release
+    /// and when the cursor leaves the window. Never starts while Shift or
+    /// Alt is held, and never while a mouse-mode app captures the pointer.
+    border_drag: Option<BorderDragState>,
     /// Pending dwell before hover activation moves focus (CTX-0334).
     ///
     /// `Some` only while `mouse.focus_follows_mouse` is enabled with a
@@ -1159,6 +1167,7 @@ impl Runtime {
             scrollbar_cursor_left: false,
             scrollbar_visible: false,
             alt_drag: None,
+            border_drag: None,
             hover_pending: None,
             animator: PanelAnimator::new(config.animations),
             closing_frames: Vec::new(),
@@ -1350,6 +1359,7 @@ impl Runtime {
             scrollbar_cursor_left: false,
             scrollbar_visible: false,
             alt_drag: None,
+            border_drag: None,
             hover_pending: None,
             animator: PanelAnimator::new(config.animations),
             closing_frames: Vec::new(),

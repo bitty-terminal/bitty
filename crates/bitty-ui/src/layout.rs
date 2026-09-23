@@ -851,6 +851,40 @@ impl LayoutNode {
         }
     }
 
+    /// Reads the split axis at `path` (`[]` = this node), or `None` when
+    /// `path` addresses no split. Paths use the same indexing as
+    /// [`Self::set_split_ratio_at`].
+    ///
+    /// Border-drag resize (`hit_test_split_handle` + `resize_split_by_drag`)
+    /// needs the axis to map pointer motion onto the split: `Horizontal`
+    /// splits (side-by-side panes, vertical divider) consume the column
+    /// delta, `Vertical` splits the row delta. Total and deterministic.
+    #[must_use]
+    pub fn split_axis_at(&self, path: &[usize]) -> Option<SplitAxis> {
+        if path.is_empty() {
+            if let Self::Split { axis, .. } = self {
+                return Some(*axis);
+            }
+            return None;
+        }
+        let idx = path[0];
+        let rest = &path[1..];
+        match self {
+            Self::Split { first, second, .. } => match idx {
+                0 => first.split_axis_at(rest),
+                1 => second.split_axis_at(rest),
+                _ => None,
+            },
+            Self::Stack(children) => children.get(idx)?.split_axis_at(rest),
+            Self::Overlay { base, overlay, .. } => match idx {
+                0 => base.split_axis_at(rest),
+                1 => overlay.split_axis_at(rest),
+                _ => None,
+            },
+            Self::Leaf(_) => None,
+        }
+    }
+
     /// Hit-tests `point` against the current allocations (CW-09).
     ///
     /// Returns the leaf id whose allocation contains the point, or `None`
@@ -1360,6 +1394,28 @@ mod tests {
         }
         assert!(!root.set_split_ratio_at(&[5], 0.5));
         assert!(!root.set_split_ratio_at(&[], 0.5) || matches!(root, LayoutNode::Split { .. }));
+    }
+
+    #[test]
+    fn split_axis_at_reads_nested_axes() {
+        let root = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::split(
+                SplitAxis::Vertical,
+                0.5,
+                LayoutNode::leaf(view(1, 1, 1)),
+                LayoutNode::leaf(view(2, 1, 1)),
+            ),
+            LayoutNode::leaf(view(3, 1, 1)),
+        );
+        assert_eq!(root.split_axis_at(&[]), Some(SplitAxis::Horizontal));
+        assert_eq!(root.split_axis_at(&[0]), Some(SplitAxis::Vertical));
+        // Leaves and out-of-range paths address no split (fail-closed).
+        assert_eq!(root.split_axis_at(&[1]), None);
+        assert_eq!(root.split_axis_at(&[0, 0]), None);
+        assert_eq!(root.split_axis_at(&[7]), None);
+        assert_eq!(LayoutNode::leaf(view(9, 1, 1)).split_axis_at(&[]), None);
     }
 
     #[test]

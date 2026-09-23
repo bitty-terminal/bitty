@@ -30,6 +30,7 @@
 
 use super::*;
 use bitty_platform::CursorPosition;
+use bitty_ui::{Point as UiPoint, SplitAxis};
 use std::time::Instant;
 
 /// Pending hover activation with a positive dwell delay (CTX-0334).
@@ -52,6 +53,25 @@ pub(super) struct HoverPending {
 pub struct AltDragState {
     /// Grabbed floating leaf.
     pub leaf: ViewId,
+    /// Anchor column (container cells) at grab or last move.
+    pub anchor_col: i32,
+    /// Anchor row (container cells) at grab or last move.
+    pub anchor_row: i32,
+}
+
+/// Active border-drag resize: which split divider is grabbed plus the
+/// press-time anchor in container cells (issue #1348).
+///
+/// A plain left press on a split handle grabs the divider; motion adjusts
+/// the adjacent split ratio live through the same clamped geometry the
+/// keyboard resize path uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BorderDragState {
+    /// Path of the grabbed split (same indexing as
+    /// [`LayoutNode::set_split_ratio_at`](bitty_ui::LayoutNode::set_split_ratio_at)).
+    pub path: Vec<usize>,
+    /// Axis of the grabbed split (selects the motion component).
+    pub axis: SplitAxis,
     /// Anchor column (container cells) at grab or last move.
     pub anchor_col: i32,
     /// Anchor row (container cells) at grab or last move.
@@ -161,6 +181,171 @@ impl Runtime {
             return false;
         }
         self.alt_drag = None;
+        true
+    }
+
+    /// Maps a physical cursor position to container-cell coordinates for
+    /// split-handle hit-testing (issue #1348).
+    ///
+    /// Uses the same origin mapping as [`Runtime::cursor_to_leaf_cell`]
+    /// (window padding plus the outer gap inset, live cell metrics) so a
+    /// border press and a leaf press agree on which cell owns the pointer.
+    /// Unlike the leaf variant there is no leaf lookup: gap bands and
+    /// zero-gap boundary lines own no leaf but may own a split handle.
+    /// Returns `None` when the pointer maps outside the container origin
+    /// or the cell metrics are degenerate.
+    fn cursor_to_layout_point(&self, pos: CursorPosition) -> Option<UiPoint> {
+        let live = self.live_cell_metrics();
+        let cell_w = live.width as f64;
+        let cell_h = live.height as f64;
+        if cell_w <= 0.0 || cell_h <= 0.0 {
+            return None;
+        }
+        let pad_px = f64::from(self.window_padding_physical());
+        let x = pos.x - pad_px - f64::from(self.config.gaps_out) * cell_w;
+        let y = pos.y - pad_px - f64::from(self.config.gaps_out) * cell_h;
+        if x < 0.0 || y < 0.0 {
+            return None;
+        }
+        let col = (x / cell_w).floor() as i64;
+        let row = (y / cell_h).floor() as i64;
+        if col < 0 || row < 0 || col > u16::MAX as i64 || row > u16::MAX as i64 {
+            return None;
+        }
+        Some(UiPoint::new(col as u16, row as u16))
+    }
+
+    /// Split axis under the pointer, if any (issue #1348 hover affordance).
+    ///
+    /// Pure query over [`LayoutNode::hit_test_split_handle`]: returns the
+    /// divider axis so a future platform cursor-icon API can show a
+    /// column/row-resize shape on hover. The platform layer currently
+    /// exposes no cursor-icon setter, so no caller sets a shape yet; the
+    /// drag itself works without it.
+    #[must_use]
+    pub fn border_drag_hover_at(&self, pos: CursorPosition) -> Option<SplitAxis> {
+        let point = self.cursor_to_layout_point(pos)?;
+        let path = self
+            .layout
+            .hit_test_split_handle(self.container, self.gaps(), point)?;
+        self.layout.split_axis_at(&path)
+    }
+
+    /// Whether a border-drag resize is currently active.
+    #[must_use]
+    pub fn border_drag_active(&self) -> bool {
+        self.border_drag.is_some()
+    }
+
+    /// Attempts to grab the split divider under the last known cursor for
+    /// a border-drag resize (issue #1348).
+    ///
+    /// Requires a plain press: Shift and Alt released (those force the
+    /// selection and Alt+drag paths per the CTX-0181/CTX-0260 precedents)
+    /// plus a known cursor over a split handle
+    /// ([`LayoutNode::hit_test_split_handle`]). Callers run this after the
+    /// mouse-capture and scrollbar checks, so a mouse-mode app and the
+    /// scroll thumb keep the pointer. Returns `true` when the drag started
+    /// (caller consumes the press and skips selection); `false` leaves all
+    /// state untouched so the press falls through to selection.
+    pub fn begin_border_drag(&mut self) -> bool {
+        if self.alt_pressed || self.shift_pressed {
+            return false;
+        }
+        let Some(cursor) = self.last_cursor else {
+            return false;
+        };
+        let Some(point) = self.cursor_to_layout_point(cursor) else {
+            return false;
+        };
+        let gaps = self.gaps();
+        let Some(path) = self
+            .layout
+            .hit_test_split_handle(self.container, gaps, point)
+        else {
+            return false;
+        };
+        let Some(axis) = self.layout.split_axis_at(&path) else {
+            return false;
+        };
+        self.border_drag = Some(BorderDragState {
+            path,
+            axis,
+            anchor_col: i32::from(point.x),
+            anchor_row: i32::from(point.y),
+        });
+        // A border owns no leaf, so — unlike click-to-focus — the grab
+        // moves no focus. A pending hover dwell is dropped: the pointer is
+        // committed to a gesture, not a hover target.
+        self.clear_hover_pending();
+        true
+    }
+
+    /// Moves the active border drag to `pos`, adjusting the grabbed split
+    /// ratio live (issue #1348).
+    ///
+    /// The cell delta since the grab (or last move) along the split axis
+    /// flows through [`LayoutNode::resize_split_by_drag`] — the same
+    /// clamped geometry the keyboard resize path uses — installed via
+    /// [`Runtime::set_layout`] so leaf Views, pane sessions, and the
+    /// primary grid reflow exactly like a keyboard resize (sizes persist
+    /// in the tree per layout). Overshoot clamps fail-closed at
+    /// `[MIN_RATIO, MAX_RATIO]`; a zero delta keeps the drag armed with no
+    /// redraw. When the layout no longer owns the split (pane closed
+    /// mid-drag) the drag ends fail-soft and `false` is returned so the
+    /// motion falls through to normal handling.
+    ///
+    /// Returns `true` when a drag was active (caller consumes the motion:
+    /// no selection update, no hover-focus, no capture motion encoding).
+    pub fn update_border_drag(&mut self, pos: CursorPosition) -> bool {
+        let Some(drag) = self.border_drag.clone() else {
+            return false;
+        };
+        let Some(point) = self.cursor_to_layout_point(pos) else {
+            // Unmappable motion (outside the container origin) keeps the
+            // drag armed but changes nothing.
+            return true;
+        };
+        let raw = match drag.axis {
+            SplitAxis::Horizontal => i32::from(point.x) - drag.anchor_col,
+            SplitAxis::Vertical => i32::from(point.y) - drag.anchor_row,
+        };
+        if raw == 0 {
+            return true;
+        }
+        // `resize_split_by_drag` narrows to `i16`: clamp the cell delta so
+        // a pointer teleport can never wrap the ratio step.
+        let delta = raw.clamp(i32::from(i16::MIN), i32::from(i16::MAX));
+        let total = match drag.axis {
+            SplitAxis::Horizontal => self.container.width,
+            SplitAxis::Vertical => self.container.height,
+        };
+        let mut next = self.layout.clone();
+        let before = next.split_ratio_at(&drag.path);
+        if !next.resize_split_by_drag(&drag.path, delta, total) {
+            self.border_drag = None;
+            return false;
+        }
+        if next.split_ratio_at(&drag.path) != before {
+            self.set_layout(next);
+        }
+        self.border_drag = Some(BorderDragState {
+            path: drag.path,
+            axis: drag.axis,
+            anchor_col: i32::from(point.x),
+            anchor_row: i32::from(point.y),
+        });
+        true
+    }
+
+    /// Ends the active border drag, if any. Returns `true` when one was
+    /// active (caller skips the selection-release commit/copy: no selection
+    /// was started by the grabbing press).
+    pub fn end_border_drag(&mut self) -> bool {
+        if self.border_drag.is_none() {
+            return false;
+        }
+        self.border_drag = None;
         true
     }
 

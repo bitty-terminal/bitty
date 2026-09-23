@@ -48,6 +48,12 @@ pub const MAX_TOOL_VERSION_REQ_LEN: usize = 128;
 ///
 /// Any other `[tools.*]` table fails closed until its own slice is accepted.
 pub const ACCEPTED_TOOLS: &[&str] = &["git"];
+/// Maximum structured network egress declarations (`[[network.egress]]`).
+pub const MAX_NETWORK_EGRESS: usize = 16;
+/// Maximum ports per egress entry.
+pub const MAX_NETWORK_PORTS_PER_HOST: usize = 16;
+/// Maximum egress host length (DNS name ceiling).
+pub const MAX_HOST_LEN: usize = 253;
 
 // ── plugin id ────────────────────────────────────────────────────────────
 
@@ -613,6 +619,264 @@ impl ToolDeclaration {
 
 // ── manifest structs ─────────────────────────────────────────────────────
 
+/// One structured network egress declaration (`[[network.egress]]`).
+///
+/// The structured counterpart to `network.connect:HOST[:PORT]` capability
+/// identifiers: each entry names a single destination host plus the allowed
+/// ports on it. Pairing is fail-closed in both directions (mirrors the
+/// `process.spawn:<tool>` / `[tools.<tool>]` rule): every `network.connect`
+/// capability needs a covering egress entry and every entry needs a covering
+/// capability, so the consent surface and the grant always tell one story.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkEgress {
+    /// Destination host (DNS name, no port, no wildcard).
+    pub host: String,
+    /// Allowed ports on this host (1..=65535, at least one).
+    pub ports: Vec<u16>,
+}
+
+impl NetworkEgress {
+    /// Validate this declaration as untrusted input (fail-closed).
+    pub fn validate(&self) -> Result<(), PluginError> {
+        validate_egress_host(&self.host)?;
+        if self.ports.is_empty() {
+            return Err(PluginError::manifest(
+                "network.egress.ports",
+                "egress entry must list at least one port",
+            ));
+        }
+        if self.ports.len() > MAX_NETWORK_PORTS_PER_HOST {
+            return Err(PluginError::LimitExceeded {
+                field: "network.egress.ports".to_string(),
+                limit: MAX_NETWORK_PORTS_PER_HOST,
+                actual: self.ports.len(),
+            });
+        }
+        for port in &self.ports {
+            if *port == 0 {
+                return Err(PluginError::manifest(
+                    "network.egress.ports",
+                    "port 0 is not a connectable destination",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether this entry covers a `network.connect` parameter (`HOST` or
+    /// `HOST:PORT`).
+    ///
+    /// The host must match exactly. A bare `HOST` parameter defers to host
+    /// policy for the port; an explicit `HOST:PORT` parameter must list a
+    /// declared port, otherwise the table would understate the grant.
+    #[must_use]
+    pub fn covers(&self, param: &str) -> bool {
+        let (host, port) = split_host_port(param);
+        if host != self.host {
+            return false;
+        }
+        match port {
+            None => true,
+            Some(p) => self.ports.contains(&p),
+        }
+    }
+}
+
+/// Split a `network.connect` parameter into `(host, port)`.
+///
+/// A trailing `:PORT` (all digits) is the port; anything else is a bare
+/// host. Never fails: unparseable shapes simply do not match any entry and
+/// fail closed at the pairing check.
+fn split_host_port(param: &str) -> (&str, Option<u16>) {
+    match param.rsplit_once(':') {
+        Some((host, port_str))
+            if !host.is_empty()
+                && !port_str.is_empty()
+                && port_str.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            match port_str.parse::<u16>() {
+                Ok(port) => (host, Some(port)),
+                Err(_) => (param, None),
+            }
+        }
+        _ => (param, None),
+    }
+}
+
+/// Validate one egress host as untrusted input (fail-closed, no wildcards).
+fn validate_egress_host(host: &str) -> Result<(), PluginError> {
+    if host.is_empty() {
+        return Err(PluginError::manifest(
+            "network.egress.host",
+            "egress host must not be empty",
+        ));
+    }
+    if host.len() > MAX_HOST_LEN {
+        return Err(PluginError::LimitExceeded {
+            field: "network.egress.host".to_string(),
+            limit: MAX_HOST_LEN,
+            actual: host.len(),
+        });
+    }
+    if host.contains('\0') || host.contains('\u{1b}') {
+        return Err(PluginError::manifest(
+            "network.egress.host",
+            "egress host must not contain NUL or ESC",
+        ));
+    }
+    if host.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(PluginError::manifest(
+            "network.egress.host",
+            "egress host must not contain control characters or whitespace",
+        ));
+    }
+    if host.contains('*') {
+        return Err(PluginError::manifest(
+            "network.egress.host",
+            "egress host must not contain wildcards (no allow-all)",
+        ));
+    }
+    if host.contains(':') || host.contains('/') {
+        return Err(PluginError::manifest(
+            "network.egress.host",
+            "egress host must be a bare DNS name (no port, no path)",
+        ));
+    }
+    // DNS shape: dot-separated labels, 1..64 bytes each, ASCII alphanumerics
+    // and hyphens, never leading or trailing with a hyphen or dot.
+    for label in host.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err(PluginError::manifest(
+                "network.egress.host",
+                "egress host label must be 1..64 bytes",
+            ));
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(PluginError::manifest(
+                "network.egress.host",
+                "egress host label must not start or end with '-'",
+            ));
+        }
+        for b in label.bytes() {
+            if !(b.is_ascii_alphanumeric() || b == b'-') {
+                return Err(PluginError::manifest(
+                    "network.egress.host",
+                    "egress host must be [a-z0-9.-] (lowercase DNS)",
+                ));
+            }
+            if b.is_ascii_uppercase() {
+                return Err(PluginError::manifest(
+                    "network.egress.host",
+                    "egress host must be lowercase",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Self-declared tighter budgets (`[limits]`).
+///
+/// Every key is optional; absent means the host ceiling applies. A present
+/// value must be `1..=HOST_CEILING`: zero is meaningless and above the host
+/// ceiling is an escalation attempt, so both fail closed. The declared
+/// values additionally bound the manifest's own contents (a manifest that
+/// exceeds its own declared limits fails validation).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PluginLimits {
+    /// Tighter bound on `lazy.commands` (host ceiling [`MAX_COMMANDS`]).
+    pub max_commands: Option<usize>,
+    /// Tighter bound on `lazy.events` (host ceiling [`MAX_EVENT_TYPES`]).
+    pub max_event_types: Option<usize>,
+    /// Tighter bound on `tools` (host ceiling [`MAX_TOOLS`]).
+    pub max_tools: Option<usize>,
+    /// Tighter bound on total filesystem pattern text (host ceiling
+    /// [`MAX_PATTERN_TEXT_BYTES`]).
+    pub max_pattern_text_bytes: Option<usize>,
+    /// Tighter bound on plugin dependencies (host ceiling
+    /// [`MAX_DEPENDENCIES`]).
+    pub max_dependencies: Option<usize>,
+    /// Tighter bound on provided services (host ceiling
+    /// [`MAX_PROVIDED_SERVICES`]).
+    pub max_provided_services: Option<usize>,
+    /// Tighter bound on required services (host ceiling
+    /// [`MAX_REQUIRED_SERVICES`]).
+    pub max_required_services: Option<usize>,
+    /// Tighter bound on filesystem patterns per access kind (host ceiling
+    /// [`MAX_FS_PATTERNS_PER_KIND`]).
+    pub max_fs_patterns_per_kind: Option<usize>,
+    /// Tighter bound on `[[network.egress]]` entries (host ceiling
+    /// [`MAX_NETWORK_EGRESS`]).
+    pub max_network_egress: Option<usize>,
+    /// Tighter bound on ports per egress entry (host ceiling
+    /// [`MAX_NETWORK_PORTS_PER_HOST`]).
+    pub max_network_ports_per_host: Option<usize>,
+}
+
+impl PluginLimits {
+    /// Validate declared values against the host ceilings (fail-closed).
+    pub fn validate(&self) -> Result<(), PluginError> {
+        for (field, value, ceiling) in [
+            ("limits.max_commands", self.max_commands, MAX_COMMANDS),
+            (
+                "limits.max_event_types",
+                self.max_event_types,
+                MAX_EVENT_TYPES,
+            ),
+            ("limits.max_tools", self.max_tools, MAX_TOOLS),
+            (
+                "limits.max_pattern_text_bytes",
+                self.max_pattern_text_bytes,
+                MAX_PATTERN_TEXT_BYTES,
+            ),
+            (
+                "limits.max_dependencies",
+                self.max_dependencies,
+                MAX_DEPENDENCIES,
+            ),
+            (
+                "limits.max_provided_services",
+                self.max_provided_services,
+                MAX_PROVIDED_SERVICES,
+            ),
+            (
+                "limits.max_required_services",
+                self.max_required_services,
+                MAX_REQUIRED_SERVICES,
+            ),
+            (
+                "limits.max_fs_patterns_per_kind",
+                self.max_fs_patterns_per_kind,
+                MAX_FS_PATTERNS_PER_KIND,
+            ),
+            (
+                "limits.max_network_egress",
+                self.max_network_egress,
+                MAX_NETWORK_EGRESS,
+            ),
+            (
+                "limits.max_network_ports_per_host",
+                self.max_network_ports_per_host,
+                MAX_NETWORK_PORTS_PER_HOST,
+            ),
+        ] {
+            if let Some(v) = value {
+                if v == 0 {
+                    return Err(PluginError::manifest(field, "limit must be at least 1"));
+                }
+                if v > ceiling {
+                    return Err(PluginError::LimitExceeded {
+                        field: field.to_string(),
+                        limit: ceiling,
+                        actual: v,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Identity block `[plugin]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginIdentity {
@@ -915,6 +1179,11 @@ pub struct PluginManifest {
     pub capabilities: CapabilityRequests,
     /// Layer-2 system-CLI tool declarations (`[tools.*]`, accepted v1: only `git`).
     pub tools: Vec<ToolDeclaration>,
+    /// Structured network egress declarations (`[[network.egress]]`, paired
+    /// with `network.connect:*` capabilities in both directions).
+    pub network: Vec<NetworkEgress>,
+    /// Self-declared tighter budgets (`[limits]`, all keys optional).
+    pub limits: PluginLimits,
     /// Lazy trigger declarations.
     pub lazy: LazyTriggers,
     /// Raw manifest byte length (for the 256 KiB size check).
@@ -922,19 +1191,20 @@ pub struct PluginManifest {
 }
 
 impl PluginManifest {
-    /// Deterministic canonical bytes for hash binding (draft `bitty-manifest-v3`).
+    /// Deterministic canonical bytes for hash binding (draft `bitty-manifest-v4`).
     ///
     /// Sorted, cross-platform, no wall-clock. Covers identity, compat, resolved
     /// capability set (including filesystem `fs.read:PARAM`/`fs.write:PARAM` expansion),
-    /// dependencies, provided services, required services, and Layer-2 `tools`
-    /// declarations. Used to bind grant records to the exact manifest
+    /// dependencies, provided services, required services, Layer-2 `tools`
+    /// declarations, structured `network.egress` destinations, and `[limits]`
+    /// budgets. Used to bind grant records to the exact manifest
     /// that was approved (`hash(manifest) == record.manifest_hash`).
     /// Raising `tools.<name>.required` from `false` to `true` changes the hash
     /// and is a capability increase whose grant must be re-confirmed.
     #[must_use]
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut buf = String::new();
-        buf.push_str("bitty-manifest-v3\n");
+        buf.push_str("bitty-manifest-v4\n");
         buf.push_str(self.identity.id.as_str());
         buf.push('|');
         buf.push_str(&self.identity.version);
@@ -1016,6 +1286,47 @@ impl PluginManifest {
             buf.push_str(&t);
             buf.push(',');
         }
+        buf.push('|');
+        // Structured network egress sorted (v4 segment: `host=port,port`).
+        let mut egress: Vec<String> = self
+            .network
+            .iter()
+            .map(|e| {
+                let mut ports: Vec<String> = e.ports.iter().map(|p| p.to_string()).collect();
+                ports.sort_unstable();
+                format!("{}={}", e.host, ports.join(","))
+            })
+            .collect();
+        egress.sort_unstable();
+        for e in egress {
+            buf.push_str(&e);
+            buf.push(';');
+        }
+        buf.push('|');
+        // Self-declared limits (v4 segment: `key=value`, absent keys empty).
+        for (key, value) in [
+            ("max_commands", self.limits.max_commands),
+            ("max_event_types", self.limits.max_event_types),
+            ("max_tools", self.limits.max_tools),
+            ("max_pattern_text_bytes", self.limits.max_pattern_text_bytes),
+            ("max_dependencies", self.limits.max_dependencies),
+            ("max_provided_services", self.limits.max_provided_services),
+            ("max_required_services", self.limits.max_required_services),
+            (
+                "max_fs_patterns_per_kind",
+                self.limits.max_fs_patterns_per_kind,
+            ),
+            ("max_network_egress", self.limits.max_network_egress),
+            (
+                "max_network_ports_per_host",
+                self.limits.max_network_ports_per_host,
+            ),
+        ] {
+            match value {
+                Some(v) => buf.push_str(&format!("{key}={v},")),
+                None => buf.push_str(&format!("{key}=,")),
+            }
+        }
         buf.into_bytes()
     }
 
@@ -1042,6 +1353,10 @@ impl PluginManifest {
     /// - Layer-2 `tools` declarations (accepted v1: only `git`; unknown tools
     ///   fail closed; `process.spawn:<tool>` requires `[tools.<tool>]` and vice
     ///   versa),
+    /// - structured network egress (`[[network.egress]]` paired with
+    ///   `network.connect:*` capabilities in both directions),
+    /// - self-declared `[limits]` budgets (checked against host ceilings,
+    ///   then enforced on the manifest's own contents),
     /// - lazy trigger bounds,
     /// - manifest size already supplied via `raw_bytes_len`.
     pub fn validate(&self) -> Result<(), PluginError> {
@@ -1183,6 +1498,161 @@ impl PluginManifest {
         // Total pattern text is also checked inside capabilities; duplicate capability ids
         // would have been deduplicated in the BTreeSet (no error, just one grant check).
 
+        // Structured network egress (`[[network.egress]]`), paired with
+        // `network.connect:*` capabilities in both directions (fail-closed;
+        // mirrors the `process.spawn:<tool>` / `[tools.<tool>]` rule so the
+        // consent surface and the grant always tell one story).
+        if self.network.len() > MAX_NETWORK_EGRESS {
+            return Err(PluginError::LimitExceeded {
+                field: "network.egress".to_string(),
+                limit: MAX_NETWORK_EGRESS,
+                actual: self.network.len(),
+            });
+        }
+        for entry in &self.network {
+            entry.validate()?;
+        }
+        {
+            let mut seen = BTreeSet::new();
+            for entry in &self.network {
+                let mut ports = entry.ports.clone();
+                ports.sort_unstable();
+                let key = format!("{}:{ports:?}", entry.host);
+                if !seen.insert(key) {
+                    return Err(PluginError::Duplicate {
+                        kind: "network-egress".to_string(),
+                        value: entry.host.clone(),
+                    });
+                }
+            }
+        }
+        {
+            let mut connect_params = Vec::new();
+            for id in &self.capabilities.ids {
+                let raw = id.as_str();
+                if let Some((head, param)) = raw.split_once(':') {
+                    if head == "network.connect" {
+                        connect_params.push(param.to_string());
+                    }
+                } else if raw == "network.connect" {
+                    return Err(PluginError::manifest(
+                        "network",
+                        "capability 'network.connect' requires a ':HOST[:PORT]' parameter",
+                    ));
+                }
+            }
+            for param in &connect_params {
+                if !self.network.iter().any(|entry| entry.covers(param)) {
+                    return Err(PluginError::manifest(
+                        "network",
+                        format!(
+                            "capability 'network.connect:{param}' requires a covering '[[network.egress]]' entry"
+                        ),
+                    ));
+                }
+            }
+            for entry in &self.network {
+                let covered = connect_params.iter().any(|param| {
+                    let (host, _) = split_host_port(param);
+                    host == entry.host
+                });
+                if !covered {
+                    return Err(PluginError::manifest(
+                        "capabilities",
+                        format!(
+                            "'[[network.egress]]' entry for '{}' requires a 'network.connect:{}' capability",
+                            entry.host, entry.host
+                        ),
+                    ));
+                }
+            }
+        }
+
+        // Self-declared limits (`[limits]`): ceilings first, then the
+        // manifest's own contents against the declared values.
+        self.limits.validate()?;
+        {
+            let declared = &self.limits;
+            let pattern_text: usize = self
+                .capabilities
+                .filesystem
+                .iter()
+                .flat_map(|req| req.paths.iter())
+                .map(|p| p.len())
+                .sum();
+            let fs_patterns_max = self
+                .capabilities
+                .filesystem
+                .iter()
+                .map(|req| req.paths.len())
+                .max()
+                .unwrap_or(0);
+            for (field, actual, declared_opt) in [
+                (
+                    "limits.max_commands",
+                    self.lazy.commands.len(),
+                    declared.max_commands,
+                ),
+                (
+                    "limits.max_event_types",
+                    self.lazy.events.len(),
+                    declared.max_event_types,
+                ),
+                ("limits.max_tools", self.tools.len(), declared.max_tools),
+                (
+                    "limits.max_pattern_text_bytes",
+                    pattern_text,
+                    declared.max_pattern_text_bytes,
+                ),
+                (
+                    "limits.max_dependencies",
+                    self.dependencies.len(),
+                    declared.max_dependencies,
+                ),
+                (
+                    "limits.max_provided_services",
+                    self.provided_services.len(),
+                    declared.max_provided_services,
+                ),
+                (
+                    "limits.max_required_services",
+                    self.required_services.len(),
+                    declared.max_required_services,
+                ),
+                (
+                    "limits.max_fs_patterns_per_kind",
+                    fs_patterns_max,
+                    declared.max_fs_patterns_per_kind,
+                ),
+                (
+                    "limits.max_network_egress",
+                    self.network.len(),
+                    declared.max_network_egress,
+                ),
+            ] {
+                if let Some(max) = declared_opt {
+                    if actual > max {
+                        return Err(PluginError::LimitExceeded {
+                            field: field.to_string(),
+                            limit: max,
+                            actual,
+                        });
+                    }
+                }
+            }
+            if let Some(max) = declared.max_network_ports_per_host {
+                for entry in &self.network {
+                    if entry.ports.len() > max {
+                        return Err(PluginError::LimitExceeded {
+                            field: "limits.max_network_ports_per_host".to_string(),
+                            limit: max,
+                            actual: entry.ports.len(),
+                        });
+                    }
+                }
+            }
+        }
+
         // Every string field is bounded and treated as untrusted display data.
         // No additional handling is needed beyond the bounds already enforced;
         // callers must render names/descriptions with host-owned components.
@@ -1223,6 +1693,8 @@ mod tests {
             required_services: Vec::new(),
             capabilities: CapabilityRequests::default(),
             tools: Vec::new(),
+            network: Vec::new(),
+            limits: PluginLimits::default(),
             lazy: LazyTriggers::default(),
             raw_bytes_len: 512,
         }
@@ -1911,6 +2383,169 @@ mod tests {
         // Flipping `required` is a capability increase (hash must change).
         let mut m3 = m2.clone();
         m3.tools[0].required = false;
+        assert_ne!(m2.manifest_hash(), m3.manifest_hash());
+        assert_eq!(m3.manifest_hash(), m3.clone().manifest_hash());
+    }
+
+    fn manifest_with_network(id: &str) -> PluginManifest {
+        let mut m = minimal_manifest(id);
+        m.capabilities
+            .ids
+            .insert(CapabilityId::parse("network.connect:example.com:443").unwrap());
+        m.network.push(NetworkEgress {
+            host: "example.com".to_string(),
+            ports: vec![443],
+        });
+        m
+    }
+
+    #[test]
+    fn network_egress_pairing_validates() {
+        let m = manifest_with_network("xuepoo.net");
+        assert!(m.validate().is_ok());
+    }
+
+    #[test]
+    fn network_requires_pairing_both_directions() {
+        // Capability without a covering egress entry fails closed.
+        let mut m = minimal_manifest("xuepoo.netpair");
+        m.capabilities
+            .ids
+            .insert(CapabilityId::parse("network.connect:example.com:443").unwrap());
+        assert!(m.validate().is_err());
+
+        // Egress entry without a covering capability fails closed.
+        let mut m = minimal_manifest("xuepoo.netpair");
+        m.network.push(NetworkEgress {
+            host: "example.com".to_string(),
+            ports: vec![443],
+        });
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn network_rejects_undeclared_ports_and_hosts() {
+        // Explicit port outside the declared set fails closed.
+        let mut m = minimal_manifest("xuepoo.netport");
+        m.capabilities
+            .ids
+            .insert(CapabilityId::parse("network.connect:example.com:993").unwrap());
+        m.network.push(NetworkEgress {
+            host: "example.com".to_string(),
+            ports: vec![443],
+        });
+        assert!(m.validate().is_err());
+
+        // Different host fails closed.
+        let mut m = minimal_manifest("xuepoo.nethost");
+        m.capabilities
+            .ids
+            .insert(CapabilityId::parse("network.connect:evil.example.com:443").unwrap());
+        m.network.push(NetworkEgress {
+            host: "example.com".to_string(),
+            ports: vec![443],
+        });
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn network_rejects_hostile_hosts_and_bad_ports() {
+        for evil in [
+            "*.example.com",
+            "example.com:443",
+            "example.com/path",
+            "Example.COM",
+            "example..com",
+            "-example.com",
+            "",
+        ] {
+            let entry = NetworkEgress {
+                host: evil.to_string(),
+                ports: vec![443],
+            };
+            assert!(entry.validate().is_err(), "must reject host {evil:?}");
+        }
+        // Empty ports and port 0 fail closed.
+        assert!(
+            NetworkEgress {
+                host: "example.com".to_string(),
+                ports: Vec::new(),
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            NetworkEgress {
+                host: "example.com".to_string(),
+                ports: vec![0],
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn network_rejects_duplicates_and_over_limit() {
+        let mut m = manifest_with_network("xuepoo.netdup");
+        m.network.push(NetworkEgress {
+            host: "example.com".to_string(),
+            ports: vec![443],
+        });
+        assert!(m.validate().is_err());
+
+        let mut m = minimal_manifest("xuepoo.netmany");
+        for i in 0..(MAX_NETWORK_EGRESS + 1) {
+            m.network.push(NetworkEgress {
+                host: format!("host{i}.example.com"),
+                ports: vec![443],
+            });
+        }
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn limits_accept_tighter_and_enforce_contents() {
+        let mut m = manifest_with_network("xuepoo.lim");
+        m.lazy
+            .commands
+            .push(QualifiedName::new("xuepoo.lim:run").unwrap());
+        m.lazy
+            .commands
+            .push(QualifiedName::new("xuepoo.lim:stop").unwrap());
+        m.limits.max_network_egress = Some(1);
+        m.limits.max_commands = Some(2);
+        assert!(m.validate().is_ok());
+
+        // Manifest contents beyond the declared budget fail closed.
+        m.limits.max_commands = Some(1);
+        assert!(m.validate().is_err());
+        m.limits.max_commands = Some(2);
+        m.limits.max_network_egress = Some(0);
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn limits_reject_zero_and_above_ceiling() {
+        let mut m = minimal_manifest("xuepoo.limceil");
+        m.limits.max_commands = Some(0);
+        assert!(m.validate().is_err());
+        m.limits.max_commands = Some(MAX_COMMANDS + 1);
+        assert!(m.validate().is_err());
+        m.limits.max_tools = Some(MAX_TOOLS + 1);
+        assert!(m.validate().is_err());
+        m.limits.max_network_egress = Some(MAX_NETWORK_EGRESS + 1);
+        assert!(m.validate().is_err());
+        m.limits = PluginLimits::default();
+        assert!(m.validate().is_ok());
+    }
+
+    #[test]
+    fn manifest_hash_covers_network_and_limits() {
+        let m1 = minimal_manifest("xuepoo.nhash");
+        let m2 = manifest_with_network("xuepoo.nhash");
+        assert_ne!(m1.manifest_hash(), m2.manifest_hash());
+        let mut m3 = m2.clone();
+        m3.limits.max_commands = Some(4);
         assert_ne!(m2.manifest_hash(), m3.manifest_hash());
         assert_eq!(m3.manifest_hash(), m3.clone().manifest_hash());
     }

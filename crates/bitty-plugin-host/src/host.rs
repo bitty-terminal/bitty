@@ -1271,6 +1271,8 @@ mod tests {
             required_services: Vec::new(),
             capabilities: CapabilityRequests::default(),
             tools: Vec::new(),
+            network: Vec::new(),
+            limits: Default::default(),
             lazy: LazyTriggers {
                 commands: Vec::new(),
                 events: events.into_iter().map(|s| s.to_string()).collect(),

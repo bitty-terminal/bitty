@@ -41,6 +41,8 @@ fn host_manifest(id: &str, commands: Vec<&str>, events: Vec<&str>) -> HostManife
         required_services: Vec::new(),
         capabilities: CapabilityRequests::default(),
         tools: Vec::new(),
+        network: Vec::new(),
+        limits: Default::default(),
         lazy: LazyTriggers {
             commands: commands
                 .into_iter()

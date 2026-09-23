@@ -45,6 +45,8 @@ fn minimal_manifest(id: &str) -> PluginManifest {
         required_services: Vec::new(),
         capabilities: CapabilityRequests::default(),
         tools: Vec::new(),
+        network: Vec::new(),
+        limits: Default::default(),
         lazy: LazyTriggers {
             commands: Vec::new(),
             events: Vec::new(),

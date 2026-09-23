@@ -8,17 +8,18 @@
 //! supplies the already-bounded bytes.
 //!
 //! Supported sections: `[plugin]`, `[compat]`, `[capabilities]`, `[lazy]`,
-//! `[tools.git]` (accepted Layer-2 v1, CTX-0425), and
-//! `[[capabilities.filesystem]]` (array-of-tables). Strings, booleans, and
-//! arrays of strings are supported. Unknown sections, sub-tables, numeric
-//! values, and duplicate keys fail closed.
+//! `[limits]`, `[tools.git]` (accepted Layer-2 v1, CTX-0425),
+//! `[[capabilities.filesystem]]` and `[[network.egress]]` (array-of-tables).
+//! Strings, booleans, arrays of strings, and (in `[limits]` only) bare
+//! non-negative integers are supported. Unknown sections, sub-tables, other
+//! numeric values, and duplicate keys fail closed.
 
 use std::collections::BTreeSet;
 
 use bitty_plugin_host::capability::CapabilityId;
 use bitty_plugin_host::manifest::{
     ACCEPTED_TOOLS, CapabilityRequests, Compat, FilesystemRequest, FsAccess, LazyTriggers,
-    PluginIdentity, PluginManifest, QualifiedName, ToolDeclaration,
+    NetworkEgress, PluginIdentity, PluginLimits, PluginManifest, QualifiedName, ToolDeclaration,
 };
 
 /// Parse a bounded `bitty-plugin.toml` body.
@@ -59,6 +60,16 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
     let mut tools_git_required: Option<bool> = None;
     let mut tools_git_version: Option<String> = None;
 
+    // `[[network.egress]]` array entries.
+    let mut network: Vec<NetworkEgress> = Vec::new();
+    let mut egress_host: Option<String> = None;
+    let mut egress_ports: Option<Vec<u16>> = None;
+    let mut egress_index: usize = 0;
+    let mut egress_entry_active = false;
+
+    // `[limits]` budgets (all keys optional, bare integers only).
+    let mut limits = PluginLimits::default();
+
     let flush_filesystem_entry = |fs_access: &mut Option<String>,
                                   fs_paths: &mut Option<Vec<String>>,
                                   filesystem: &mut Vec<FilesystemRequest>,
@@ -88,6 +99,25 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
         Ok(())
     };
 
+    let flush_egress_entry = |egress_host: &mut Option<String>,
+                              egress_ports: &mut Option<Vec<u16>>,
+                              network: &mut Vec<NetworkEgress>,
+                              egress_entry_active: &mut bool|
+     -> Result<(), String> {
+        if !*egress_entry_active {
+            return Ok(());
+        }
+        let host = egress_host
+            .take()
+            .ok_or("[[network.egress]] entry is missing 'host = \"...\"'".to_string())?;
+        let ports = egress_ports
+            .take()
+            .ok_or("[[network.egress]] entry is missing 'ports = [...]'".to_string())?;
+        network.push(NetworkEgress { host, ports });
+        *egress_entry_active = false;
+        Ok(())
+    };
+
     let mut lines = text.lines().enumerate().peekable();
     while let Some((line_number, raw_line)) = lines.next() {
         let line = strip_comment(raw_line).trim().to_string();
@@ -95,10 +125,11 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
             continue;
         }
         if line.starts_with('[') && line.ends_with(']') {
-            // Array-of-tables `[[...]]` (only `[[capabilities.filesystem]]`).
+            // Array-of-tables `[[...]]` (only `[[capabilities.filesystem]]`
+            // and `[[network.egress]]`).
             if line.starts_with("[[") && line.ends_with("]]") {
                 let inner = line[2..line.len() - 2].trim().to_string();
-                if inner != "capabilities.filesystem" {
+                if inner != "capabilities.filesystem" && inner != "network.egress" {
                     return Err(format!(
                         "unsupported manifest section '[[{inner}]]' at line {}",
                         line_number + 1
@@ -110,10 +141,21 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
                     &mut filesystem,
                     &mut fs_entry_active,
                 )?;
-                fs_entry_active = true;
-                // Index for dedupe is the count of already-flushed entries.
-                fs_index = filesystem.len();
-                section = "capabilities.filesystem".to_string();
+                flush_egress_entry(
+                    &mut egress_host,
+                    &mut egress_ports,
+                    &mut network,
+                    &mut egress_entry_active,
+                )?;
+                if inner == "capabilities.filesystem" {
+                    fs_entry_active = true;
+                    // Index for dedupe is the count of already-flushed entries.
+                    fs_index = filesystem.len();
+                } else {
+                    egress_entry_active = true;
+                    egress_index = network.len();
+                }
+                section = inner;
                 continue;
             }
             // Single-table `[...]`.
@@ -125,6 +167,13 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
                     line_number + 1
                 ));
             }
+            // Reject single-bracket network egress (must be `[[...]]` array).
+            if inner == "network.egress" || inner == "network" {
+                return Err(format!(
+                    "unsupported manifest section '[{inner}]' at line {} (expected '[[network.egress]]')",
+                    line_number + 1
+                ));
+            }
             if let Some(tool) = inner.strip_prefix("tools.") {
                 // Only the accepted `[tools.git]` slice (CTX-0425 v1).
                 if !ACCEPTED_TOOLS.contains(&tool) {
@@ -133,24 +182,36 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
                         line_number + 1
                     ));
                 }
-                // Flush any open filesystem entry before switching sections.
+                // Flush any open filesystem/network entry before switching sections.
                 flush_filesystem_entry(
                     &mut fs_access,
                     &mut fs_paths,
                     &mut filesystem,
                     &mut fs_entry_active,
                 )?;
+                flush_egress_entry(
+                    &mut egress_host,
+                    &mut egress_ports,
+                    &mut network,
+                    &mut egress_entry_active,
+                )?;
                 tools_git_seen = true;
                 section = inner;
                 continue;
             }
             match inner.as_str() {
-                "plugin" | "compat" | "capabilities" | "lazy" => {
+                "plugin" | "compat" | "capabilities" | "lazy" | "limits" => {
                     flush_filesystem_entry(
                         &mut fs_access,
                         &mut fs_paths,
                         &mut filesystem,
                         &mut fs_entry_active,
+                    )?;
+                    flush_egress_entry(
+                        &mut egress_host,
+                        &mut egress_ports,
+                        &mut network,
+                        &mut egress_entry_active,
                     )?;
                     section = inner;
                 }
@@ -193,6 +254,8 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
 
         let section_key = if section == "capabilities.filesystem" {
             format!("capabilities.filesystem[{fs_index}].{key}")
+        } else if section == "network.egress" {
+            format!("network.egress[{egress_index}].{key}")
         } else {
             format!("{section}.{key}")
         };
@@ -272,6 +335,50 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
                     other => return Err(format!("unsupported [lazy] key '{other}'")),
                 }
             }
+            "network.egress" => {
+                if !egress_entry_active {
+                    return Err("manifest key outside a supported section".to_string());
+                }
+                if !seen_keys.insert(section_key) {
+                    return Err(format!("duplicate key '{key}' in [[network.egress]]"));
+                }
+                match key.as_str() {
+                    "host" => {
+                        egress_host = Some(parse_string(&value)?);
+                    }
+                    "ports" => {
+                        egress_ports = Some(
+                            parse_port_array(&value)
+                                .map_err(|e| format!("invalid [[network.egress]] ports: {e}"))?,
+                        );
+                    }
+                    other => {
+                        return Err(format!("unsupported [[network.egress]] key '{other}'"));
+                    }
+                }
+            }
+            "limits" => {
+                if !seen_keys.insert(section_key) {
+                    return Err(format!("duplicate [limits] key '{key}'"));
+                }
+                let slot = match key.as_str() {
+                    "max_commands" => &mut limits.max_commands,
+                    "max_event_types" => &mut limits.max_event_types,
+                    "max_tools" => &mut limits.max_tools,
+                    "max_pattern_text_bytes" => &mut limits.max_pattern_text_bytes,
+                    "max_dependencies" => &mut limits.max_dependencies,
+                    "max_provided_services" => &mut limits.max_provided_services,
+                    "max_required_services" => &mut limits.max_required_services,
+                    "max_fs_patterns_per_kind" => &mut limits.max_fs_patterns_per_kind,
+                    "max_network_egress" => &mut limits.max_network_egress,
+                    "max_network_ports_per_host" => &mut limits.max_network_ports_per_host,
+                    other => return Err(format!("unsupported [limits] key '{other}'")),
+                };
+                *slot = Some(
+                    parse_limit_uint(&value, &key)
+                        .map_err(|e| format!("invalid [limits] key '{key}': {e}"))?,
+                );
+            }
             s if s.starts_with("tools.") => {
                 if !seen_keys.insert(section_key.clone()) {
                     return Err(format!("duplicate key '{key}' in [{s}]"));
@@ -302,6 +409,12 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
         &mut fs_paths,
         &mut filesystem,
         &mut fs_entry_active,
+    )?;
+    flush_egress_entry(
+        &mut egress_host,
+        &mut egress_ports,
+        &mut network,
+        &mut egress_entry_active,
     )?;
 
     let mut tools = Vec::new();
@@ -346,6 +459,8 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
             filesystem,
         },
         tools,
+        network,
+        limits,
         lazy: LazyTriggers {
             commands,
             events: lazy_events,
@@ -456,6 +571,67 @@ fn parse_bool(value: &str) -> Option<bool> {
         "false" => Some(false),
         _ => None,
     }
+}
+
+/// Parse a `[limits]` budget: bare ASCII digits only (fail-closed).
+///
+/// Quoted strings, signs, hex, floats, and empty values are rejected: limits
+/// are integers in real TOML and the subset keeps that shape. Overflow fails
+/// closed. Ceiling/zero checks belong to [`PluginLimits::validate`].
+fn parse_limit_uint(value: &str, key: &str) -> Result<usize, String> {
+    let value = value.trim();
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!(
+            "expected a bare non-negative integer for '{key}', found '{value}'"
+        ));
+    }
+    // Bound the digit run before parsing (fail fast on absurd input).
+    if value.len() > 10 {
+        return Err(format!("integer for '{key}' is too large"));
+    }
+    value
+        .parse::<usize>()
+        .map_err(|_| format!("integer for '{key}' is too large"))
+}
+
+/// Parse a `[[network.egress]]` port list: `[443, "993"]`.
+///
+/// Items may be bare ASCII-digit runs (real TOML integers) or quoted decimal
+/// strings; both must fit in `u16`. Signs, hex, floats, empty items, and
+/// non-numeric junk fail closed. At least one item is required (an empty
+/// array fails here; port 0 fails later in [`NetworkEgress::validate`]).
+fn parse_port_array(value: &str) -> Result<Vec<u16>, String> {
+    let value = value.trim();
+    if !(value.starts_with('[') && value.ends_with(']')) {
+        return Err(format!("expected an array, found '{value}'"));
+    }
+    let inner = &value[1..value.len() - 1];
+    let mut ports = Vec::new();
+    for item in inner.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let digits = if item.starts_with('"') && item.ends_with('"') && item.len() >= 2 {
+            parse_string(item)?
+        } else {
+            item.to_string()
+        };
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(format!("expected a decimal port, found '{item}'"));
+        }
+        if digits.len() > 5 {
+            return Err(format!("port '{item}' is too large"));
+        }
+        let port: u16 = digits
+            .parse()
+            .map_err(|_| format!("port '{item}' is too large"))?;
+        ports.push(port);
+    }
+    if ports.is_empty() {
+        return Err("ports array must list at least one port".to_string());
+    }
+    Ok(ports)
 }
 
 fn parse_array(value: &str) -> Result<Vec<String>, String> {
@@ -622,6 +798,138 @@ mod tests {
         let body = format!(
             "{}\n[capabilities]\n\"fs.read:~/projects/**\" = true\n",
             minimal_body("xuepoo.fsbool")
+        );
+        assert!(parse_manifest(body.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn network_egress_parses_and_pairs_with_capability() {
+        let body = format!(
+            "{}\n[capabilities]\npanel.provider = true\n\"network.connect:example.com:443\" = true\n[[network.egress]]\nhost = \"example.com\"\nports = [443]\n",
+            minimal_body("xuepoo.nettoml")
+        );
+        let manifest = parse_manifest(body.as_bytes()).expect("network shape must parse");
+        assert_eq!(manifest.network.len(), 1);
+        assert_eq!(manifest.network[0].host, "example.com");
+        assert_eq!(manifest.network[0].ports, vec![443]);
+    }
+
+    #[test]
+    fn network_egress_requires_pairing_both_directions() {
+        // Capability without an egress entry fails closed.
+        let body = format!(
+            "{}\n[capabilities]\npanel.provider = true\n\"network.connect:example.com:443\" = true\n",
+            minimal_body("xuepoo.netnocov")
+        );
+        assert!(parse_manifest(body.as_bytes()).is_err());
+
+        // Egress entry without a capability fails closed.
+        let body = format!(
+            "{}\n[capabilities]\npanel.provider = true\n[[network.egress]]\nhost = \"example.com\"\nports = [443]\n",
+            minimal_body("xuepoo.netnocap")
+        );
+        assert!(parse_manifest(body.as_bytes()).is_err());
+
+        // Undeclared port fails closed.
+        let body = format!(
+            "{}\n[capabilities]\npanel.provider = true\n\"network.connect:example.com:993\" = true\n[[network.egress]]\nhost = \"example.com\"\nports = [443]\n",
+            minimal_body("xuepoo.netport")
+        );
+        assert!(parse_manifest(body.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn network_egress_rejects_bad_sections_keys_and_ports() {
+        // Single-bracket `[network]` / `[network.egress]` fail closed.
+        for section in ["[network]", "[network.egress]"] {
+            let body = format!(
+                "{}\n[capabilities]\npanel.provider = true\n{section}\nhost = \"example.com\"\n",
+                minimal_body("xuepoo.netsingle")
+            );
+            assert!(
+                parse_manifest(body.as_bytes()).is_err(),
+                "{section} must fail closed"
+            );
+        }
+
+        // Unknown keys, missing keys, and bad port shapes fail closed.
+        for fragment in [
+            "host = \"example.com\"\nports = [443]\nport = 443\n",
+            "ports = [443]\n",
+            "host = \"example.com\"\n",
+            "host = \"example.com\"\nports = []\n",
+            "host = \"example.com\"\nports = [-1]\n",
+            "host = \"example.com\"\nports = [99999]\n",
+            "host = \"*.example.com\"\nports = [443]\n",
+            "host = \"Example.COM\"\nports = [443]\n",
+            "host = \"example.com\"\nports = 443\n",
+        ] {
+            let body = format!(
+                "{}\n[capabilities]\npanel.provider = true\n\"network.connect:example.com:443\" = true\n[[network.egress]]\n{fragment}",
+                minimal_body("xuepoo.netbad")
+            );
+            assert!(
+                parse_manifest(body.as_bytes()).is_err(),
+                "fragment must fail closed: {fragment:?}"
+            );
+        }
+
+        // Duplicate keys within one entry fail closed.
+        let body = format!(
+            "{}\n[capabilities]\npanel.provider = true\n\"network.connect:example.com:443\" = true\n[[network.egress]]\nhost = \"example.com\"\nhost = \"example.com\"\nports = [443]\n",
+            minimal_body("xuepoo.netdup")
+        );
+        assert!(parse_manifest(body.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn limits_parse_and_enforce() {
+        let body = format!(
+            "{}\n[capabilities]\npanel.provider = true\n[limits]\nmax_commands = 4\nmax_tools = 2\n",
+            minimal_body("xuepoo.limtoml")
+        );
+        let manifest = parse_manifest(body.as_bytes()).expect("limits shape must parse");
+        assert_eq!(manifest.limits.max_commands, Some(4));
+        assert_eq!(manifest.limits.max_tools, Some(2));
+        assert_eq!(manifest.limits.max_event_types, None);
+    }
+
+    #[test]
+    fn limits_reject_bad_keys_values_and_types() {
+        for fragment in [
+            // Unknown key.
+            "max_everything = 4\n",
+            // Above the host ceiling (escalation attempt).
+            "max_commands = 129\n",
+            // Zero is meaningless.
+            "max_commands = 0\n",
+            // Quoted, signed, float, and empty values fail closed.
+            "max_commands = \"4\"\n",
+            "max_commands = -1\n",
+            "max_commands = 4.0\n",
+            "max_commands = \n",
+        ] {
+            let body = format!(
+                "{}\n[capabilities]\npanel.provider = true\n[limits]\n{fragment}",
+                minimal_body("xuepoo.limbad")
+            );
+            assert!(
+                parse_manifest(body.as_bytes()).is_err(),
+                "fragment must fail closed: {fragment:?}"
+            );
+        }
+
+        // Duplicate keys fail closed.
+        let body = format!(
+            "{}\n[capabilities]\npanel.provider = true\n[limits]\nmax_commands = 4\nmax_commands = 4\n",
+            minimal_body("xuepoo.limdup")
+        );
+        assert!(parse_manifest(body.as_bytes()).is_err());
+
+        // Declared budget exceeded by the manifest's own contents fails.
+        let body = format!(
+            "{}\n[capabilities]\npanel.provider = true\n[limits]\nmax_commands = 0\n",
+            minimal_body("xuepoo.limself")
         );
         assert!(parse_manifest(body.as_bytes()).is_err());
     }

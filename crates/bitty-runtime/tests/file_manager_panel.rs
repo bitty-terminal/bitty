@@ -126,6 +126,8 @@ fn file_manager_manifest() -> bitty_plugin_host::PluginManifest {
         required_services: Vec::new(),
         capabilities: caps,
         tools: Vec::new(),
+        network: Vec::new(),
+        limits: Default::default(),
         lazy: LazyTriggers {
             commands: FILE_MANAGER_COMMANDS
                 .iter()

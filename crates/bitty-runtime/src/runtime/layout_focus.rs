@@ -191,7 +191,8 @@ impl Runtime {
     }
 
     /// Core-owned workspace decoration from the validated runtime config
-    /// (CTX-0292; accepted spec CTX-0118 defaults `4/6/2/6` logical px).
+    /// (CTX-0292; unified defaults `6/6/1/6/6` since #1342, spec sync
+    /// tracked by #1374).
     ///
     /// Decoration is never part of the `LayoutTree`; it is applied by
     /// [`Self::decorated_allocations`] (and, in a later render stage, the

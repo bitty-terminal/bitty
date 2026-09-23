@@ -430,8 +430,11 @@ fn dispatcher_registers_new_methods_for_follow_up() {
     // captureFrame) plus CTX-0244 digest (frameHash) plus DT-03 trace
     // lifecycle (startTrace, stopTrace, fetchTraceChunk) plus CTX-0189
     // profiling (getProcessStats, getFrameStats, streamProcessStats,
-    // streamFrameStats).
-    assert_eq!(dispatcher.method_count(), 33);
+    // streamFrameStats) plus issue #1377 plugin-runtime v1 (listPlugins,
+    // getPlugin, listSubscriptions, getBudgets, getQueueSnapshot,
+    // listHandles, streamEvents, suspendHandler, resumePlugin,
+    // disposeGeneration).
+    assert_eq!(dispatcher.method_count(), 43);
     assert!(dispatcher.contains("bitty.debug/getGridText"));
     assert!(dispatcher.contains("bitty.debug/getInputRing"));
     assert!(dispatcher.contains("bitty.debug/getModifiers"));
@@ -1441,9 +1444,13 @@ fn introspection_publish_is_bounded() {
 //   `transport`), never an off-taxonomy class. Pins the control-denial
 //   mapping (`auth` -> `scope`).
 // The RFC's plugin-runtime methods (`listPlugins`, `getPlugin`,
-// `getBudgets`, `disposeGeneration`, ...) are not registered on this server
-// slice, so their generation-ownership acceptance items stay open; the
-// generation invariant that IS reachable (grid `generation` is output-only,
+// `getBudgets`, `disposeGeneration`, ...) are registered on this server
+// slice as scope- and param-gated fail-closed stubs (issue #1377): no
+// plugin host lives in this crate, so valid calls fail closed with
+// `capability`/`PluginRuntimeUnavailable` instead of leaking or inventing
+// data. Their generation-ownership acceptance items are covered by the
+// `(pluginId, generation)` param gates pinned below; the generation
+// invariant that IS reachable (grid `generation` is output-only,
 // with no caller-supplied stale-generation parameter) is pinned below.
 
 /// Accepted error categories per devtools-rfc (L331-333): every failure must
@@ -4359,4 +4366,320 @@ fn a3_test_exit_teardown_routes_through_control_queue() {
     let cli = crate::scope::ScopeSet::cli_default();
     assert!(crate::ctl::authorize_ctl_method(METHOD_TEST_EXIT, &cli).is_err());
     clear_introspection_for_tests();
+}
+
+// ── plugin-runtime v1 methods (issue #1377) ─────────────────────────────────
+//
+// The ten accepted devtools-rfc plugin-runtime methods are registered on the
+// default table as scope- and param-gated fail-closed stubs: no plugin host
+// lives in `bitty-ipc`, so a scoped, well-formed call fails closed with
+// `capability`/`PluginRuntimeUnavailable` (on-taxonomy, zero partial state)
+// instead of `usage`/`UnknownMethod`. Headless only: no live composer, no
+// compositor, no socket I/O.
+
+/// Scope sets for the plugin-runtime matrix: empty, inspect-only,
+/// trace-only, control-only, and fully scoped.
+fn plugin_runtime_scopes() -> (
+    crate::scope::ScopeSet,
+    crate::scope::ScopeSet,
+    crate::scope::ScopeSet,
+    crate::scope::ScopeSet,
+    crate::scope::ScopeSet,
+) {
+    use crate::scope::Scope::{DebugControl, DebugInspect, DebugTrace};
+    let mut inspect = crate::scope::ScopeSet::new();
+    inspect.insert(DebugInspect);
+    let mut trace = crate::scope::ScopeSet::new();
+    trace.insert(DebugTrace);
+    let mut control = crate::scope::ScopeSet::new();
+    control.insert(DebugControl);
+    let mut full = crate::scope::ScopeSet::new();
+    full.insert(DebugInspect);
+    full.insert(DebugTrace);
+    full.insert(DebugControl);
+    (crate::scope::ScopeSet::new(), inspect, trace, control, full)
+}
+
+fn plugin_runtime_envelope(method: &str, params: &str) -> Vec<u8> {
+    format!("{{\"id\":1,\"method\":\"{method}\",\"version\":\"1.0\",\"params\":{params}}}")
+        .into_bytes()
+}
+
+#[test]
+fn plugin_runtime_v1_methods_registered_and_mcp_hidden() {
+    // Every accepted v1 method from the RFC table is callable (registered),
+    // and none is advertised as an MCP tool (fail-closed stubs must not
+    // promise data the server cannot serve).
+    let dispatcher = Dispatcher::with_defaults();
+    for method in [
+        METHOD_LIST_PLUGINS,
+        METHOD_GET_PLUGIN,
+        METHOD_LIST_SUBSCRIPTIONS,
+        METHOD_GET_BUDGETS,
+        METHOD_GET_QUEUE_SNAPSHOT,
+        METHOD_LIST_HANDLES,
+        METHOD_STREAM_EVENTS,
+        METHOD_SUSPEND_HANDLER,
+        METHOD_RESUME_PLUGIN,
+        METHOD_DISPOSE_GENERATION,
+    ] {
+        assert!(dispatcher.contains(method), "{method} must be registered");
+        assert!(
+            !is_mcp_exposed_debug_method(method),
+            "{method} must stay MCP-hidden"
+        );
+        assert!(
+            mcp_tool_for_debug_method(method).is_none(),
+            "{method} must map to no MCP tool"
+        );
+        assert!(
+            mcp_denied_debug_methods().contains(&method),
+            "{method} must be MCP-denied"
+        );
+    }
+}
+
+#[test]
+fn plugin_runtime_scope_matrix_per_rfc() {
+    // RFC scope table: six readers need `debug.inspect` (any debug scope
+    // reads), `streamEvents` needs `debug.trace` (or `control`), and the
+    // three lifecycle verbs need exactly `debug.control`. Connection alone
+    // grants nothing: every method denies with `scope`/`ScopeDenied`.
+    let dispatcher = Dispatcher::with_defaults();
+    let server = test_server_info();
+    let (empty, inspect, trace, control, _full) = plugin_runtime_scopes();
+    let readers = [
+        (METHOD_LIST_PLUGINS, "{\"generation\":null}"),
+        (METHOD_GET_PLUGIN, "{\"pluginId\":\"p\"}"),
+        (METHOD_LIST_SUBSCRIPTIONS, "{\"pluginId\":\"p\"}"),
+        (METHOD_GET_BUDGETS, "{\"pluginId\":\"p\",\"generation\":2}"),
+        (METHOD_GET_QUEUE_SNAPSHOT, "{\"pluginId\":\"p\"}"),
+        (METHOD_LIST_HANDLES, "{\"pluginId\":\"p\"}"),
+    ];
+    let stream = [(
+        METHOD_STREAM_EVENTS,
+        "{\"types\":[\"a\"],\"batch\":{\"maxEvents\":8,\"maxBytes\":1024}}",
+    )];
+    let verbs = [
+        (
+            METHOD_SUSPEND_HANDLER,
+            "{\"pluginId\":\"p\",\"handlerId\":\"h\",\"cause\":\"c\"}",
+        ),
+        (
+            METHOD_RESUME_PLUGIN,
+            "{\"pluginId\":\"p\",\"generation\":2}",
+        ),
+        (
+            METHOD_DISPOSE_GENERATION,
+            "{\"pluginId\":\"p\",\"generation\":2}",
+        ),
+    ];
+    // Zero scopes: everything denies with typed scope, zero partial state.
+    for (method, params) in readers.iter().chain(stream.iter()).chain(verbs.iter()) {
+        let ctx = ServeContext::with_granted(&server, empty.clone());
+        let outcome = handle_envelope(&plugin_runtime_envelope(method, params), &dispatcher, &ctx);
+        assert!(outcome.was_error, "{method} must deny with zero scopes");
+        let text = response_text(&outcome);
+        assert_eq!(
+            error_category(&text).as_deref(),
+            Some("scope"),
+            "{method} denial must be typed scope: {text}"
+        );
+        assert!(
+            text.contains("\"code\":\"ScopeDenied\""),
+            "{method} got: {text}"
+        );
+    }
+    // Inspect-only: readers are callable (fail-closed stub verdict, not a
+    // scope denial); the stream and the verbs still deny.
+    let inspect_ctx = ServeContext::with_granted(&server, inspect);
+    for (method, params) in readers {
+        let outcome = handle_envelope(
+            &plugin_runtime_envelope(method, params),
+            &dispatcher,
+            &inspect_ctx,
+        );
+        assert!(outcome.was_error, "{method} stub must fail closed");
+        let text = response_text(&outcome);
+        assert!(
+            text.contains("PluginRuntimeUnavailable"),
+            "{method} got: {text}"
+        );
+    }
+    for (method, params) in stream.iter().chain(verbs.iter()) {
+        let outcome = handle_envelope(
+            &plugin_runtime_envelope(method, params),
+            &dispatcher,
+            &inspect_ctx,
+        );
+        assert!(outcome.was_error, "{method} must deny inspect-only");
+        assert!(
+            response_text(&outcome).contains("ScopeDenied"),
+            "{method} got: {}",
+            response_text(&outcome)
+        );
+    }
+    // Trace-only: the stream is callable; the control verbs still deny.
+    let trace_ctx = ServeContext::with_granted(&server, trace);
+    let outcome = handle_envelope(
+        &plugin_runtime_envelope(stream[0].0, stream[0].1),
+        &dispatcher,
+        &trace_ctx,
+    );
+    assert!(outcome.was_error);
+    assert!(
+        response_text(&outcome).contains("PluginRuntimeUnavailable"),
+        "streamEvents got: {}",
+        response_text(&outcome)
+    );
+    for (method, params) in verbs {
+        let outcome = handle_envelope(
+            &plugin_runtime_envelope(method, params),
+            &dispatcher,
+            &trace_ctx,
+        );
+        assert!(outcome.was_error, "{method} must deny trace-only");
+        assert!(
+            response_text(&outcome).contains("ScopeDenied"),
+            "{method} got: {}",
+            response_text(&outcome)
+        );
+    }
+    // Control-only: the verbs are callable.
+    let control_ctx = ServeContext::with_granted(&server, control);
+    for (method, params) in verbs {
+        let outcome = handle_envelope(
+            &plugin_runtime_envelope(method, params),
+            &dispatcher,
+            &control_ctx,
+        );
+        assert!(outcome.was_error, "{method} stub must fail closed");
+        assert!(
+            response_text(&outcome).contains("PluginRuntimeUnavailable"),
+            "{method} got: {}",
+            response_text(&outcome)
+        );
+    }
+}
+
+#[test]
+fn plugin_runtime_param_gates_generation_ownership() {
+    // Generation ownership at the wire boundary: resources are addressed as
+    // `(pluginId, generation)`. Malformed addresses fail closed with
+    // `usage`/`InvalidParams` before any stub verdict; well-formed ones
+    // reach the `capability` stub verdict.
+    let dispatcher = Dispatcher::with_defaults();
+    let server = test_server_info();
+    let (_empty, _inspect, _trace, _control, full) = plugin_runtime_scopes();
+    let ctx = ServeContext::with_granted(&server, full);
+    // (method, params, expect_invalid_params)
+    let probes: &[(&str, &str, bool)] = &[
+        (METHOD_LIST_PLUGINS, "{}", false),
+        (METHOD_LIST_PLUGINS, "{\"generation\":null}", false),
+        (METHOD_LIST_PLUGINS, "{\"generation\":3}", false),
+        (METHOD_LIST_PLUGINS, "{\"generation\":0}", true),
+        (METHOD_LIST_PLUGINS, "{\"generation\":\"3\"}", true),
+        (METHOD_GET_PLUGIN, "{\"pluginId\":\"p\"}", false),
+        (METHOD_GET_PLUGIN, "{}", true),
+        (METHOD_GET_PLUGIN, "{\"pluginId\":\"\"}", true),
+        (METHOD_LIST_SUBSCRIPTIONS, "{\"pluginId\":\"p\"}", false),
+        (METHOD_LIST_SUBSCRIPTIONS, "{}", true),
+        (
+            METHOD_GET_BUDGETS,
+            "{\"pluginId\":\"p\",\"generation\":2}",
+            false,
+        ),
+        (METHOD_GET_BUDGETS, "{\"pluginId\":\"p\"}", true),
+        (
+            METHOD_GET_BUDGETS,
+            "{\"pluginId\":\"p\",\"generation\":0}",
+            true,
+        ),
+        (METHOD_GET_QUEUE_SNAPSHOT, "{\"pluginId\":\"p\"}", false),
+        (METHOD_GET_QUEUE_SNAPSHOT, "{\"pluginId\":\"\"}", true),
+        (METHOD_LIST_HANDLES, "{\"pluginId\":\"p\"}", false),
+        (METHOD_LIST_HANDLES, "[]", true),
+        (
+            METHOD_STREAM_EVENTS,
+            "{\"types\":[\"a\"],\"batch\":{\"maxEvents\":8,\"maxBytes\":1024}}",
+            false,
+        ),
+        (METHOD_STREAM_EVENTS, "{}", true),
+        (
+            METHOD_STREAM_EVENTS,
+            "{\"types\":[],\"batch\":{\"maxEvents\":8,\"maxBytes\":1024}}",
+            true,
+        ),
+        (
+            METHOD_STREAM_EVENTS,
+            "{\"types\":[\"a\"],\"batch\":{\"maxEvents\":0,\"maxBytes\":1024}}",
+            true,
+        ),
+        (
+            METHOD_STREAM_EVENTS,
+            "{\"types\":[\"a\"],\"batch\":{\"maxEvents\":8,\"maxBytes\":0}}",
+            true,
+        ),
+        (
+            METHOD_SUSPEND_HANDLER,
+            "{\"pluginId\":\"p\",\"handlerId\":\"h\",\"cause\":\"c\"}",
+            false,
+        ),
+        (
+            METHOD_SUSPEND_HANDLER,
+            "{\"pluginId\":\"p\",\"handlerId\":\"h\"}",
+            true,
+        ),
+        (
+            METHOD_SUSPEND_HANDLER,
+            "{\"pluginId\":\"p\",\"handlerId\":\"\",\"cause\":\"c\"}",
+            true,
+        ),
+        (
+            METHOD_RESUME_PLUGIN,
+            "{\"pluginId\":\"p\",\"generation\":2}",
+            false,
+        ),
+        (METHOD_RESUME_PLUGIN, "{\"pluginId\":\"p\"}", true),
+        (
+            METHOD_DISPOSE_GENERATION,
+            "{\"pluginId\":\"p\",\"generation\":2}",
+            false,
+        ),
+        (
+            METHOD_DISPOSE_GENERATION,
+            "{\"pluginId\":\"p\",\"generation\":0}",
+            true,
+        ),
+    ];
+    for (method, params, expect_invalid) in probes {
+        let outcome = handle_envelope(&plugin_runtime_envelope(method, params), &dispatcher, &ctx);
+        assert!(outcome.was_error, "{method} {params} must fail closed");
+        let text = response_text(&outcome);
+        if *expect_invalid {
+            assert_eq!(
+                error_category(&text).as_deref(),
+                Some("usage"),
+                "{method} {params} must be typed usage: {text}"
+            );
+            assert!(
+                text.contains("\"code\":\"InvalidParams\""),
+                "{method} {params} got: {text}"
+            );
+        } else {
+            assert_eq!(
+                error_category(&text).as_deref(),
+                Some("capability"),
+                "{method} {params} must be typed capability: {text}"
+            );
+            assert!(
+                text.contains("\"code\":\"PluginRuntimeUnavailable\""),
+                "{method} {params} got: {text}"
+            );
+        }
+        assert!(
+            ACCEPTED_DEBUG_CATEGORIES.contains(&error_category(&text).unwrap().as_str()),
+            "{method} {params} off-taxonomy: {text}"
+        );
+    }
 }

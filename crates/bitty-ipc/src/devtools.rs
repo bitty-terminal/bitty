@@ -232,6 +232,48 @@ pub const METHOD_STOP_TRACE: &str = "bitty.debug/stopTrace";
 /// Wire method for `fetchTraceChunk` (DT-03, #1099: 256 KiB pages).
 pub const METHOD_FETCH_TRACE_CHUNK: &str = "bitty.debug/fetchTraceChunk";
 
+// ── plugin-runtime methods (devtools-rfc accepted v1, issue #1377) ──────────
+//
+// The six `inspect` readers, the `trace` event stream, and the three
+// `control` lifecycle verbs. `bitty-ipc` owns no plugin host: no registry,
+// VM, queue, or handle table lives in this crate (those live in
+// `bitty-plugin-host` / `bitty-lua`, owned upstream by `bitty-runtime`),
+// so every handler below enforces the RFC scope plus the RFC param grammar
+// (generation ownership included) and then fails closed with a typed
+// `capability` error naming the missing backend. Registration itself is the
+// fix: callers get scope/param validation and an on-taxonomy verdict
+// instead of `usage`/`UnknownMethod`.
+
+/// Wire method for `listPlugins` (inspect: optional `generation` filter).
+pub const METHOD_LIST_PLUGINS: &str = "bitty.debug/listPlugins";
+
+/// Wire method for `getPlugin` (inspect: required `pluginId`).
+pub const METHOD_GET_PLUGIN: &str = "bitty.debug/getPlugin";
+
+/// Wire method for `listSubscriptions` (inspect: required `pluginId`).
+pub const METHOD_LIST_SUBSCRIPTIONS: &str = "bitty.debug/listSubscriptions";
+
+/// Wire method for `getBudgets` (inspect: required `pluginId` + `generation`).
+pub const METHOD_GET_BUDGETS: &str = "bitty.debug/getBudgets";
+
+/// Wire method for `getQueueSnapshot` (inspect: required `pluginId`).
+pub const METHOD_GET_QUEUE_SNAPSHOT: &str = "bitty.debug/getQueueSnapshot";
+
+/// Wire method for `listHandles` (inspect: required `pluginId`).
+pub const METHOD_LIST_HANDLES: &str = "bitty.debug/listHandles";
+
+/// Wire method for `streamEvents` (trace: `types[]` + `batch`).
+pub const METHOD_STREAM_EVENTS: &str = "bitty.debug/streamEvents";
+
+/// Wire method for `suspendHandler` (control: `pluginId` + `handlerId` + `cause`).
+pub const METHOD_SUSPEND_HANDLER: &str = "bitty.debug/suspendHandler";
+
+/// Wire method for `resumePlugin` (control: `pluginId` + `generation`).
+pub const METHOD_RESUME_PLUGIN: &str = "bitty.debug/resumePlugin";
+
+/// Wire method for `disposeGeneration` (control: `pluginId` + `generation`).
+pub const METHOD_DISPOSE_GENERATION: &str = "bitty.debug/disposeGeneration";
+
 /// Maximum synthetic events per `synthesizeInput` call (Amendment A1).
 pub const MAX_SYNTH_EVENTS_PER_CALL: usize = 64;
 
@@ -355,6 +397,7 @@ mod automation_ops;
 mod handlers;
 mod json;
 mod mcp_adapter;
+mod plugin_runtime;
 mod profiling;
 mod record;
 mod serve;

@@ -431,6 +431,20 @@ impl Runtime {
         self.pty.as_ref().and_then(|p| p.pid())
     }
 
+    /// Exit status of the primary shell child when it has already exited,
+    /// without blocking (issue #1356).
+    ///
+    /// Non-blocking [`Pty::try_wait`](bitty_pty::Pty::try_wait): `Some` once
+    /// the child has exited (reaped exactly once, like
+    /// [`Self::pane_try_wait`]); `None` while it is still running, when no
+    /// primary child is owned, or when the status was already consumed. The
+    /// embedder closes the session on `Some` (ghostty/kitty close the window
+    /// on child exit) instead of freezing on a stale grid with
+    /// silently-dropped input.
+    pub fn primary_exit_status(&mut self) -> Option<bitty_pty::ExitStatus> {
+        self.pty.as_mut().and_then(|p| p.try_wait().ok()?)
+    }
+
     /// Current PTY size as known by the kernel, if a PTY is owned.
     pub fn pty_size(&self) -> Option<(u16, u16)> {
         self.pty.as_ref().and_then(|p| p.size().ok())

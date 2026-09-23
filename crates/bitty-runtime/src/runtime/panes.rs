@@ -403,6 +403,16 @@ impl Runtime {
         self.pane_sessions.keys().copied().collect()
     }
 
+    /// How many split leaves own a private shell session (issue #1356).
+    ///
+    /// The embedder keeps the window open while split sessions exist even
+    /// after the primary shell exits; a lone primary exit closes the
+    /// session (ghostty/kitty close the window on child exit).
+    #[must_use]
+    pub fn pane_session_count(&self) -> usize {
+        self.pane_sessions.len()
+    }
+
     /// Process id of the leaf's shell child, when the session exists and the
     /// platform reports one.
     #[must_use]

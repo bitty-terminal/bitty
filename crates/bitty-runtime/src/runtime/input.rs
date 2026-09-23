@@ -1472,6 +1472,18 @@ impl Runtime {
         }
         let gained = focused;
         self.focused = focused;
+        // Issue #1356: a composition cannot outlive input focus — the
+        // compositor drops it on `leave` — so losing focus clears a stale
+        // preedit overlay. Without this a preedit whose clearing event never
+        // arrives (IME restart, backend quirk) bricks all keyboard input
+        // forever (`handle_key_event` consumes raw presses while a preedit
+        // is active) while output stays fine. Mirrors the CTX-0187
+        // modifier-mirror clear on focus transitions.
+        if !focused && self.ime_preedit.is_some() {
+            self.ime_preedit = None;
+            self.ime_cursor = 0;
+            self.pending_full_redraw = true;
+        }
         // CTX-0159: retain focus transitions for screenshots-free probes.
         self.inspect_ring.push_focus(
             focused,

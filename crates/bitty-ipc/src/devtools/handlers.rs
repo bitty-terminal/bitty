@@ -2,6 +2,11 @@ use super::*;
 
 use super::automation_ops::{handle_capture_frame, handle_frame_hash, handle_synthesize_input};
 use super::json::{echo_snippet, truncate_chars, validate_method};
+use super::plugin_runtime::{
+    handle_dispose_generation, handle_get_budgets, handle_get_plugin, handle_get_queue_snapshot,
+    handle_list_handles, handle_list_plugins, handle_list_subscriptions, handle_resume_plugin,
+    handle_stream_events, handle_suspend_handler,
+};
 use super::profiling::{
     handle_get_frame_stats, handle_get_process_stats, handle_stream_frame_stats,
     handle_stream_process_stats,
@@ -69,7 +74,13 @@ impl Dispatcher {
     /// lifecycle (`startTrace`, `stopTrace`, `fetchTraceChunk`, requiring
     /// `debug.trace`) plus CTX-0189 live
     /// profiling (`getProcessStats`, `getFrameStats`, `streamProcessStats`,
-    /// `streamFrameStats`; sampling-only, scope-gated per Amendment A1).
+    /// `streamFrameStats`; sampling-only, scope-gated per Amendment A1)
+    /// plus issue #1377 plugin-runtime v1 (`listPlugins`, `getPlugin`,
+    /// `listSubscriptions`, `getBudgets`, `getQueueSnapshot`, `listHandles`
+    /// requiring `debug.inspect`; `streamEvents` requiring `debug.trace`;
+    /// `suspendHandler`, `resumePlugin`, `disposeGeneration` requiring
+    /// `debug.control`; scope- and param-gated fail-closed stubs until a
+    /// plugin host publishes live data).
     ///
     /// Introspection handlers register via [`Dispatcher::register`] (the
     /// CTX-0159 hook) so the registration path itself is exercised here, not
@@ -162,6 +173,27 @@ impl Dispatcher {
         for (method, handler) in profiling {
             if table.register(method, *handler).is_err() {
                 debug_assert!(false, "statically valid profiling method rejected");
+            }
+        }
+        // Issue #1377 plugin-runtime v1 (accepted devtools-rfc table):
+        // inspect readers, the trace event stream, and the control
+        // lifecycle verbs. Scope- and param-gated fail-closed stubs (no
+        // plugin host lives in this crate); see `plugin_runtime`.
+        let plugin_runtime: &[(&'static str, DevtoolsHandler)] = &[
+            (METHOD_LIST_PLUGINS, handle_list_plugins),
+            (METHOD_GET_PLUGIN, handle_get_plugin),
+            (METHOD_LIST_SUBSCRIPTIONS, handle_list_subscriptions),
+            (METHOD_GET_BUDGETS, handle_get_budgets),
+            (METHOD_GET_QUEUE_SNAPSHOT, handle_get_queue_snapshot),
+            (METHOD_LIST_HANDLES, handle_list_handles),
+            (METHOD_STREAM_EVENTS, handle_stream_events),
+            (METHOD_SUSPEND_HANDLER, handle_suspend_handler),
+            (METHOD_RESUME_PLUGIN, handle_resume_plugin),
+            (METHOD_DISPOSE_GENERATION, handle_dispose_generation),
+        ];
+        for (method, handler) in plugin_runtime {
+            if table.register(method, *handler).is_err() {
+                debug_assert!(false, "statically valid plugin-runtime method rejected");
             }
         }
         table

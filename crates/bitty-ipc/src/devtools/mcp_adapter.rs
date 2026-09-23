@@ -23,9 +23,12 @@
 //! read-only surface?".
 
 use super::{
-    METHOD_CAPTURE_FRAME, METHOD_FETCH_TRACE_CHUNK, METHOD_FRAME_HASH, METHOD_GET_FRAME_STATS,
-    METHOD_GET_PROCESS_STATS, METHOD_START_TRACE, METHOD_STOP_TRACE, METHOD_STREAM_FRAME_STATS,
-    METHOD_STREAM_PROCESS_STATS, METHOD_SYNTHESIZE_INPUT, METHOD_TEST_EXIT, METHOD_TEST_INFO,
+    METHOD_CAPTURE_FRAME, METHOD_DISPOSE_GENERATION, METHOD_FETCH_TRACE_CHUNK, METHOD_FRAME_HASH,
+    METHOD_GET_BUDGETS, METHOD_GET_FRAME_STATS, METHOD_GET_PLUGIN, METHOD_GET_PROCESS_STATS,
+    METHOD_GET_QUEUE_SNAPSHOT, METHOD_LIST_HANDLES, METHOD_LIST_PLUGINS, METHOD_LIST_SUBSCRIPTIONS,
+    METHOD_RESUME_PLUGIN, METHOD_START_TRACE, METHOD_STOP_TRACE, METHOD_STREAM_EVENTS,
+    METHOD_STREAM_FRAME_STATS, METHOD_STREAM_PROCESS_STATS, METHOD_SUSPEND_HANDLER,
+    METHOD_SYNTHESIZE_INPUT, METHOD_TEST_EXIT, METHOD_TEST_INFO,
 };
 
 /// MCP adapter protocol version (tracks [`super::DEVTOOLS_PROTOCOL_VERSION`]).
@@ -57,6 +60,10 @@ const MCP_EXPOSED_DEBUG_METHODS: &[&str] = &[
 /// Automation (bearer) surface, trace lifecycle writers, test-mode surface.
 /// Control verbs are covered separately via
 /// [`crate::ctl::all_control_methods`] and are likewise denied.
+/// The accepted plugin-runtime v1 methods (issue #1377) stay denied too:
+/// they are scope- and param-gated fail-closed stubs with no plugin host
+/// behind them, so advertising them as MCP tools would promise data the
+/// server cannot serve.
 const MCP_DENIED_DEBUG_METHODS: &[&str] = &[
     METHOD_SYNTHESIZE_INPUT,
     METHOD_CAPTURE_FRAME,
@@ -65,6 +72,16 @@ const MCP_DENIED_DEBUG_METHODS: &[&str] = &[
     METHOD_STOP_TRACE,
     METHOD_TEST_INFO,
     METHOD_TEST_EXIT,
+    METHOD_LIST_PLUGINS,
+    METHOD_GET_PLUGIN,
+    METHOD_LIST_SUBSCRIPTIONS,
+    METHOD_GET_BUDGETS,
+    METHOD_GET_QUEUE_SNAPSHOT,
+    METHOD_LIST_HANDLES,
+    METHOD_STREAM_EVENTS,
+    METHOD_SUSPEND_HANDLER,
+    METHOD_RESUME_PLUGIN,
+    METHOD_DISPOSE_GENERATION,
 ];
 
 /// MCP tool names exposed under the v1 default (parallel to

@@ -23,15 +23,28 @@
 //! those remain with `bitty-pty`, `bitty-render`, and `bitty-platform`.
 //! Every failure is fail-closed and typed: the previous valid state is
 //! retained and a bounded diagnostic counter advances in the registry.
+//!
+//! Live adoption (CTX-0700): the host mirrors every mount/unmount/dispose
+//! into the [`bitty_ui::placement::Placement`] binding map, gates
+//! provider-backed creation through [`PanelProviderRegistry`], mints v1
+//! taxonomy topics via [`core_topic`](super::event_bus_v1::core_topic), and
+//! resolves cross-window scope via
+//! [`CrossWindowRoute`](super::event_bus_v1::CrossWindowRoute), so the
+//! candidate contracts have live consumers outside unit tests.
 
 use bitty_ui::ViewId;
+use bitty_ui::placement::{Placement, PlacementError};
 
-use super::event_bus_v1::{BUS_PUBLISH_CAPABILITY, BUS_SUBSCRIBE_CAPABILITY};
+use super::event_bus_v1::{
+    BUS_PUBLISH_CAPABILITY, BUS_SUBSCRIBE_CAPABILITY, BusTopicFamily, CrossWindowRoute,
+    RoutingError, RoutingScope, core_topic,
+};
 use super::panel::PanelType;
 use super::panel::{
     BoundedPayload, BusEvent, EventTopic, PanelError, PanelHandle, PanelRegistry,
-    PanelRegistryConfig, PanelState,
+    PanelRegistryConfig, PanelState, ViewContent,
 };
+use super::provider::{PanelProviderManifest, PanelProviderRegistry, ProviderContractError};
 use super::{Generation, WorkspaceId};
 
 // ---------------------------------------------------------------------------
@@ -44,9 +57,16 @@ use super::{Generation, WorkspaceId};
 /// Spelling decision (CW-20): the host is a facade, not a second store.
 /// Identity, attachment, budgets, and capability grants live in the wrapped
 /// [`PanelRegistry`]; queues live in its [`PanelEventBus`](super::panel::PanelEventBus).
+/// The host additionally mirrors attachment into the live
+/// [`Placement`] map and provider declarations into the live
+/// [`PanelProviderRegistry`]; both mirrors are updated only after the
+/// registry commits, and any mirror failure rolls the registry back, so the
+/// three views never desynchronize.
 #[derive(Debug)]
 pub struct PanelRuntime {
     registry: PanelRegistry,
+    placement: Placement,
+    providers: PanelProviderRegistry,
 }
 
 impl PanelRuntime {
@@ -59,6 +79,8 @@ impl PanelRuntime {
     pub fn new(config: PanelRegistryConfig) -> Result<Self, PanelError> {
         Ok(Self {
             registry: PanelRegistry::new(config)?,
+            placement: Placement::new(),
+            providers: PanelProviderRegistry::new(),
         })
     }
 
@@ -85,6 +107,10 @@ impl PanelRuntime {
 
     /// Mounts a created panel onto an empty view (`Created -> Mounted`).
     ///
+    /// Mirrors the attachment into the live [`Placement`] map after the
+    /// registry commits; a mirror failure rolls the registry mount back so
+    /// both views stay in sync.
+    ///
     /// # Errors
     ///
     /// [`PanelError::StaleHandle`], [`PanelError::AlreadyMounted`],
@@ -95,10 +121,19 @@ impl PanelRuntime {
         generation: Generation,
         view: ViewId,
     ) -> Result<(), PanelError> {
-        self.registry.mount_panel(id, generation, view)
+        self.registry.mount_panel(id, generation, view)?;
+        if let Err(place_err) = self.placement.bind(id, view) {
+            let _ = self.registry.unmount_panel(id, generation);
+            return Err(map_placement_bind(place_err, id, view, &self.placement));
+        }
+        Ok(())
     }
 
     /// Unmounts a panel, returning its former view (suspend, not destroy).
+    ///
+    /// Clears the live [`Placement`] mirror after the registry commits; a
+    /// missing mirror entry is ignored because the registry is the source of
+    /// truth.
     ///
     /// # Errors
     ///
@@ -109,7 +144,9 @@ impl PanelRuntime {
         id: super::panel::PanelId,
         generation: Generation,
     ) -> Result<ViewId, PanelError> {
-        self.registry.unmount_panel(id, generation)
+        let view = self.registry.unmount_panel(id, generation)?;
+        let _ = self.placement.unbind(id);
+        Ok(view)
     }
 
     /// Focuses a mounted panel within `workspace`.
@@ -155,6 +192,9 @@ impl PanelRuntime {
     /// Disposes a panel, retiring its `(PanelId, Generation)` and clearing
     /// its bus queues.
     ///
+    /// Clears the live [`Placement`] mirror when the registry dispose
+    /// commits.
+    ///
     /// # Errors
     ///
     /// [`PanelError::StaleHandle`] or [`PanelError::NotFound`].
@@ -163,7 +203,11 @@ impl PanelRuntime {
         id: super::panel::PanelId,
         generation: Generation,
     ) -> Result<(), PanelError> {
-        self.registry.dispose_panel(id, generation)
+        let result = self.registry.dispose_panel(id, generation);
+        if result.is_ok() {
+            let _ = self.placement.unbind(id);
+        }
+        result
     }
 
     /// Reads a panel's lifecycle state after handle validation.
@@ -279,6 +323,191 @@ impl PanelRuntime {
     #[must_use]
     pub fn panel_count(&self) -> usize {
         self.registry.panel_count()
+    }
+
+    /// Returns the view the live [`Placement`] mirror binds `panel` to.
+    ///
+    /// Mirrors the registry attachment after every host mount/unmount/dispose,
+    /// so panel focus and hit-testing can read placement without touching the
+    /// identity store.
+    #[must_use]
+    pub fn placement_view_of(&self, panel: super::panel::PanelId) -> Option<ViewId> {
+        self.placement.view_of(panel)
+    }
+
+    /// Returns the panel the live [`Placement`] mirror hosts on `view`.
+    #[must_use]
+    pub fn placement_panel_of(&self, view: ViewId) -> Option<super::panel::PanelId> {
+        self.placement.panel_of(view)
+    }
+
+    /// Number of live placement bindings.
+    #[must_use]
+    pub fn placement_len(&self) -> usize {
+        self.placement.len()
+    }
+
+    /// Registers a validated provider manifest behind the `panel.provider`
+    /// capability gate (CW-23 surface, live through the host).
+    ///
+    /// Duplicate owners are rejected, not shadowed; each registration mints a
+    /// fresh generation so reload swaps provider content atomically.
+    ///
+    /// # Errors
+    ///
+    /// [`ProviderContractError::CapabilityDenied`] or
+    /// [`ProviderContractError::DuplicateOwner`]; state is unchanged.
+    pub fn register_panel_provider(
+        &mut self,
+        manifest: PanelProviderManifest,
+        capability_granted: bool,
+    ) -> Result<u64, ProviderContractError> {
+        self.providers.register(manifest, capability_granted)
+    }
+
+    /// Removes a provider; unload drops its contributed content without
+    /// tearing down the host.
+    ///
+    /// # Errors
+    ///
+    /// [`ProviderContractError::UnknownOwner`]; state is unchanged.
+    pub fn unregister_panel_provider(
+        &mut self,
+        owner: &str,
+    ) -> Result<PanelProviderManifest, ProviderContractError> {
+        self.providers.unregister(owner)
+    }
+
+    /// Owners declaring `panel_type`, in lexicographic order.
+    #[must_use]
+    pub fn providers_for_type(&self, panel_type: PanelType) -> Vec<String> {
+        self.providers.providers_for_type(panel_type)
+    }
+
+    /// Registration generation for `owner`, if registered.
+    #[must_use]
+    pub fn provider_generation_of(&self, owner: &str) -> Option<u64> {
+        self.providers.generation_of(owner)
+    }
+
+    /// Creates a panel gated on a registered provider declaration.
+    ///
+    /// The provider must be registered and must declare `panel_type`;
+    /// otherwise creation fails closed without allocating. Existing
+    /// [`PanelRuntime::create_panel`] behavior is unchanged.
+    ///
+    /// # Errors
+    ///
+    /// [`PanelError::UnknownPanelType`] when `owner` is unknown or does not
+    /// declare `panel_type`, plus the [`PanelRuntime::create_panel`] errors.
+    pub fn create_panel_for_provider(
+        &mut self,
+        owner: &str,
+        panel_type: PanelType,
+        workspace: Option<WorkspaceId>,
+    ) -> Result<PanelHandle, PanelError> {
+        let declares = self
+            .providers
+            .get(owner)
+            .is_some_and(|manifest| manifest.declares(panel_type));
+        if !declares {
+            let value = if self.providers.get(owner).is_none() {
+                owner.to_string()
+            } else {
+                panel_type.as_str().to_string()
+            };
+            return Err(PanelError::UnknownPanelType { value });
+        }
+        self.registry.create_panel(panel_type, workspace)
+    }
+
+    /// Declares a v1 Core topic `bitty.panel:<family>.<event>` through the
+    /// accepted [`EventTopic`] grammar (issue #1000).
+    ///
+    /// Providers subscribe to these; only the host mints them.
+    ///
+    /// # Errors
+    ///
+    /// [`PanelError::UnknownTopic`] or [`PanelError::TooManyTopics`].
+    pub fn declare_core_topic(
+        &mut self,
+        family: BusTopicFamily,
+        event: &str,
+    ) -> Result<EventTopic, PanelError> {
+        let topic = core_topic(family, event)?;
+        self.registry.declare_topic(topic.as_str())
+    }
+
+    /// Publishes a bounded payload on a freshly minted v1 Core topic through
+    /// live host mediation (issue #1000).
+    ///
+    /// Mints `bitty.panel:<family>.<event>` via [`core_topic`], then routes
+    /// through [`PanelRuntime::publish`] with the v1 publish-capability gate
+    /// and stale-handle validation, so a real event type
+    /// (for example `git.branch-changed`) exercises the taxonomy, ledger,
+    /// and queue budgets in one call.
+    ///
+    /// # Errors
+    ///
+    /// [`PanelError::UnknownTopic`], [`PanelError::CapabilityDenied`],
+    /// [`PanelError::StaleHandle`], or [`PanelError::PayloadTooLarge`].
+    pub fn publish_core(
+        &mut self,
+        id: super::panel::PanelId,
+        generation: Generation,
+        family: BusTopicFamily,
+        event: &str,
+        payload: BoundedPayload,
+    ) -> Result<(), PanelError> {
+        let topic = core_topic(family, event)?;
+        self.publish(id, generation, &topic, payload)
+    }
+
+    /// Resolves the v1 cross-window routing decision for one process
+    /// (issue #1000).
+    ///
+    /// Same-window traffic routes [`RoutingScope::InProcess`]; cross-window
+    /// traffic fails closed with [`RoutingError::CrossProcessDeferred`]
+    /// until an IPC framing follow-up lands.
+    ///
+    /// # Errors
+    ///
+    /// [`RoutingError::CrossProcessDeferred`] for differing windows.
+    pub fn check_window_route(
+        from_window: u64,
+        to_window: u64,
+    ) -> Result<RoutingScope, RoutingError> {
+        CrossWindowRoute::new(from_window, to_window).resolve()
+    }
+}
+
+/// Maps a [`PlacementError`] bind failure onto the host [`PanelError`]
+/// vocabulary after rolling the registry mount back.
+fn map_placement_bind(
+    err: PlacementError,
+    panel: super::panel::PanelId,
+    view: ViewId,
+    placement: &Placement,
+) -> PanelError {
+    match err {
+        PlacementError::ViewOccupied { view: occupied } => {
+            let existing = placement.panel_of(occupied).unwrap_or(panel);
+            PanelError::AlreadyMounted {
+                view_id: occupied,
+                existing: ViewContent::Panel(existing),
+            }
+        }
+        PlacementError::PanelAlreadyMounted { panel: mounted } => {
+            let current_view = placement.view_of(mounted).unwrap_or(view);
+            PanelError::PanelAlreadyMounted {
+                panel_id: mounted,
+                current_view,
+            }
+        }
+        PlacementError::NotMounted { panel: missing } => PanelError::NotFound {
+            kind: "panel",
+            id_raw: missing.0,
+        },
     }
 }
 

@@ -341,7 +341,16 @@ fn erased_snapshot(base: &Snapshot) -> Snapshot {
 /// top while the cursor fits in the first window; once the cursor is below,
 /// the window scrolls the minimum amount and clamps to the screen bottom, so
 /// it ends bottom-anchored on the last rows (the live prompt case). CTX-0361.
-fn cursor_follow_window_start(cursor_row: usize, src_len: usize, window: usize) -> usize {
+///
+/// `pub(super)` (not private): the CW hint-overlay resolver
+/// ([`Runtime::cw_hint_overlay_cells`](super::Runtime::cw_hint_overlay_cells),
+/// #1344) mirrors the leaf-pass window math from the sibling `cw_live`
+/// module, so both windows stay one formula.
+pub(super) fn cursor_follow_window_start(
+    cursor_row: usize,
+    src_len: usize,
+    window: usize,
+) -> usize {
     if window == 0 {
         return 0;
     }
@@ -1305,7 +1314,9 @@ impl Runtime {
     /// Phase 4 (CTX-0474): paint every overlay layer in the accepted order.
     ///
     /// Closing rings, selection highlight, IME preedit, the three pending
-    /// confirmation banners, the help panel, then the scrollbar thumb. The
+    /// confirmation banners, the help panel, the scrollbar thumb, then the
+    /// Leader hint overlay. The hint overlay paints last so its label pills
+    /// stay above grid chrome while armed (issue #1344). The
     /// kitty image layer is painted afterwards by [`Self::paint_kitty_images`].
     fn paint_frame_overlays(
         &mut self,
@@ -1332,6 +1343,7 @@ impl Runtime {
         self.paint_help_overlay(&basis.allocations, &basis.view_map, basis.pad_px, layers);
         self.paint_bell_and_notification(&basis.allocations, basis.pad_px, now, layers);
         self.paint_scrollbar_overlay(layers);
+        self.paint_hint_overlay(&basis.allocations, basis.pad_px, layers);
     }
 
     /// CTX-0577 (M1-16): the bounded visual bell flash and the single
@@ -1710,6 +1722,78 @@ impl Runtime {
             layers.any_needs_draw = true;
         }
         self.scrollbar_visible = paints;
+    }
+
+    /// Leader hint overlay (issue #1344: the missing
+    /// [`HintOverlayPresent`](crate::cw_present::HintOverlayPresent)
+    /// consumer).
+    ///
+    /// Resolves the armed session's overlay to paint cells via
+    /// [`Runtime::cw_hint_overlay_cells`](super::Runtime::cw_hint_overlay_cells)
+    /// and paints one single-cell-high pill per entry: a theme-selection
+    /// fill (the pair the theme guarantees legible, like the selection
+    /// highlight) plus label glyphs in the theme foreground through the
+    /// same overlay-text path the IME preedit uses. kitty/ghostty feel:
+    /// ephemeral label badges sitting on their targets, gone on disarm.
+    ///
+    /// Presentation-only like every other overlay: no grid, scrollback,
+    /// fold, session, or layout mutation. Fail-closed twice — the resolver
+    /// yields no cells while disarmed or unplaceable, and this paint skips
+    /// any cell whose frame vanished or whose pill would overdraw past the
+    /// frame's right edge (never into a neighbour pane).
+    fn paint_hint_overlay(
+        &mut self,
+        allocations: &[layout_focus::PresentFrame],
+        pad_px: i32,
+        layers: &mut FrameLayers,
+    ) {
+        // Owned cells first: the resolver borrows `self` immutably and the
+        // glyph path below needs `&mut`, so no borrow is held across.
+        let cells = self.cw_hint_overlay_cells(allocations);
+        if cells.is_empty() {
+            return;
+        }
+        let live = self.live_cell_metrics();
+        if live.width == 0 || live.height == 0 {
+            return;
+        }
+        for cell in &cells {
+            let Some(frame) = allocations.iter().find(|frame| frame.view == cell.view) else {
+                continue;
+            };
+            let width_cells = cell.width_cells();
+            if width_cells == 0
+                || cell.col as usize + width_cells > frame.cols as usize
+                || cell.row >= frame.rows
+            {
+                continue;
+            }
+            let origin_x = px_add(
+                px_add(pad_px, frame.content.x),
+                px_offset_cells(0, cell.col, live.width),
+            );
+            let origin_y = px_add(
+                px_add(pad_px, frame.content.y),
+                px_offset_cells(0, cell.row, live.height),
+            );
+            layers.combined_overlay.push(bitty_render::grid::FillRect {
+                rect: bitty_render::geometry::RectPx::new(
+                    origin_x,
+                    origin_y,
+                    px_span_usize(width_cells, live.width),
+                    live.height,
+                ),
+                color: self.config.theme.selection,
+            });
+            let glyphs = self.renderer.overlay_text_glyphs(
+                &cell.label,
+                (origin_x, origin_y),
+                width_cells,
+                self.config.theme.foreground,
+            );
+            layers.combined_glyphs.extend(glyphs);
+            layers.any_needs_draw = true;
+        }
     }
 
     /// Phase 5 (CTX-0474): the CTX-0248/0252/0254 kitty image layer.

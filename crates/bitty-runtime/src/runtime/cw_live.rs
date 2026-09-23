@@ -53,16 +53,16 @@ use super::*;
 use bitty_rich::blocks::{CommandBlock, CommandId, blocks};
 use bitty_rich::composer::{ComposerFeedError, ComposerKeyEvent};
 use bitty_rich::hints::{
-    DispatchError, DispatchOutcome, HINT_LABEL_MAX_CHARS, HintAction, HintBatch, HintFeedError,
-    HintOperator, HintScope, OperatorConflict,
+    DispatchError, DispatchOutcome, HINT_LABEL_MAX_CHARS, HintAction, HintAnchor, HintBatch,
+    HintFeedError, HintOperator, HintScope, OperatorConflict,
 };
 use bitty_rich::scene::Scene;
 
 use crate::cw_present::{
     ComposerPresent, CwComposerFeed, CwFoldAction, CwHintProvider, CwInputRoute, CwPresentInputs,
-    CwPresentPlan, FoldPresent, HintKeyOutcome, apply_fold_action, composer_present,
-    dispatch_present, feed_present, fold_present, persist_fold_ordinals, plan_present,
-    route_present_input,
+    CwPresentPlan, FoldPresent, HintKeyOutcome, HintOverlayCell, apply_fold_action,
+    composer_present, dispatch_present, feed_present, fold_present, hint_overlay_present,
+    persist_fold_ordinals, plan_present, route_present_input,
 };
 use crate::registry::PanelRuntime;
 
@@ -476,4 +476,178 @@ impl Runtime {
         };
         plan_present(&inputs)
     }
+
+    /// Resolves the armed hint overlay to paint cells for one present frame
+    /// (issue #1344: the [`HintOverlayPresent`](crate::cw_present::HintOverlayPresent)
+    /// consumer the terminal present path was missing).
+    ///
+    /// Derives the overlay from the armed session's live batch (the same
+    /// authority dispatch uses) and resolves each entry to a viewport cell:
+    /// command pills sit at column 0 of their prompt's live viewport row in
+    /// the primary owner's frame, view pills badge the leaf's top-left cell.
+    /// Pure except for reading live present state; terminal truth, the fold,
+    /// and the session are never mutated here.
+    ///
+    /// Fail-closed: disarmed (or batch-less, or empty) resolves to no cells,
+    /// and any entry that cannot be placed is skipped — alt-screen command
+    /// rows (meaningless off the primary grid), a missing primary frame,
+    /// unknown owner geometry, rows outside the presented window, pills wider
+    /// than the frame, and panel anchors (no panel-to-view map exists in the
+    /// present path; the OQ-051 placed-contract follow-up owns that).
+    /// Collisions keep the first entry in batch order so pills never stack.
+    #[must_use]
+    pub fn cw_hint_overlay_cells(
+        &self,
+        frames: &[layout_focus::PresentFrame],
+    ) -> Vec<HintOverlayCell> {
+        if !self.cw_hint_session.is_armed() {
+            return Vec::new();
+        }
+        let Some(batch) = self.cw_hint_session.batch() else {
+            return Vec::new();
+        };
+        let overlay = hint_overlay_present(batch);
+        if overlay.is_empty() {
+            return Vec::new();
+        }
+        // Prompt buffer rows for the primary state (the arm-time collection
+        // source), re-queried live so scroll/eviction since arming applies.
+        let prompt_rows: Vec<(CommandId, usize)> = blocks(&self.state)
+            .iter()
+            .filter_map(|block| block.region.prompt_row.map(|row| (block.id, row)))
+            .collect();
+        let on_alt = self.state.alt_screen_active();
+        let sb_len = self.state.scrollback_len();
+        let screen_height = self.state.height();
+        let cursor_row = usize::from(self.state.cursor().position.row);
+        let owner = self.primary_view();
+        let mut cells: Vec<HintOverlayCell> = Vec::with_capacity(overlay.len());
+        let mut painted: std::collections::HashSet<(ViewId, u16, u16)> =
+            std::collections::HashSet::with_capacity(overlay.len());
+        for entry in &overlay.entries {
+            let placed = match entry.anchor {
+                HintAnchor::View(raw) => {
+                    let view = ViewId::new(raw);
+                    frames
+                        .iter()
+                        .find(|frame| frame.view == view)
+                        .filter(|frame| {
+                            entry.label.chars().count() <= usize::from(frame.cols)
+                                && frame.cols > 0
+                                && frame.rows > 0
+                        })
+                        .map(|_| HintOverlayCell {
+                            view,
+                            col: 0,
+                            row: 0,
+                            label: entry.label.clone(),
+                        })
+                }
+                HintAnchor::Command(id) => self.hint_command_cell(HintCommandQuery {
+                    frames,
+                    prompt_rows: &prompt_rows,
+                    on_alt,
+                    sb_len,
+                    screen_height,
+                    cursor_row,
+                    owner,
+                    id,
+                    label: &entry.label,
+                }),
+                // No panel-to-view map in the present path: skip fail-closed.
+                HintAnchor::Panel(_) => None,
+            };
+            if let Some(cell) = placed {
+                if painted.insert((cell.view, cell.col, cell.row)) {
+                    cells.push(cell);
+                }
+            }
+        }
+        cells
+    }
+
+    /// Viewport cell for one command-anchored hint label, if placeable.
+    ///
+    /// Mirrors the leaf pass window math: a scrolled owner shows the
+    /// `visible_cells` composite window, otherwise the cursor-follow
+    /// `viewport_snapshot` window. All out-of-window rows (evicted,
+    /// alt-screen, or scrolled away) fail closed to `None`.
+    fn hint_command_cell(&self, query: HintCommandQuery<'_>) -> Option<HintOverlayCell> {
+        if query.on_alt {
+            return None;
+        }
+        let prompt_row = query
+            .prompt_rows
+            .iter()
+            .find(|(candidate, _)| *candidate == query.id)
+            .map(|(_, row)| *row)?;
+        let owner = query.owner?;
+        let frame = query.frames.iter().find(|frame| frame.view == owner)?;
+        if frame.cols == 0 || frame.rows == 0 {
+            return None;
+        }
+        if query.label.chars().count() > usize::from(frame.cols) {
+            return None;
+        }
+        let view = self.layout.find_leaf(owner)?;
+        let frame_rows = usize::from(frame.rows);
+        let row = if view.scroll_offset() != 0 {
+            let total = query.sb_len.saturating_add(query.screen_height);
+            let offset = view.scroll_offset().min(query.sb_len);
+            let start = total
+                .saturating_sub(usize::from(view.rows()))
+                .saturating_sub(offset);
+            let viewport_row = prompt_row.checked_sub(start)?;
+            if viewport_row >= usize::from(view.rows()) || viewport_row >= frame_rows {
+                return None;
+            }
+            viewport_row
+        } else {
+            let screen_row = prompt_row.checked_sub(query.sb_len)?;
+            if screen_row >= query.screen_height {
+                return None;
+            }
+            let start = super::present::cursor_follow_window_start(
+                query.cursor_row,
+                query.screen_height,
+                frame_rows,
+            );
+            let viewport_row = screen_row.checked_sub(start)?;
+            if viewport_row >= frame_rows {
+                return None;
+            }
+            viewport_row
+        };
+        u16::try_from(row).ok().map(|row| HintOverlayCell {
+            view: owner,
+            col: 0,
+            row,
+            label: query.label.to_string(),
+        })
+    }
+}
+
+/// Bundled inputs for one
+/// [`Runtime::hint_command_cell`](Runtime::hint_command_cell) derivation
+/// (one argument: clippy's argument-count lint stays quiet and call sites
+/// stay readable).
+struct HintCommandQuery<'a> {
+    /// Live leaf allocations for this frame.
+    frames: &'a [layout_focus::PresentFrame],
+    /// Prompt buffer rows for the primary state, re-queried live.
+    prompt_rows: &'a [(CommandId, usize)],
+    /// Alternate screen active (command rows meaningless then).
+    on_alt: bool,
+    /// Primary scrollback length (combined-buffer base).
+    sb_len: usize,
+    /// Primary active-screen height.
+    screen_height: usize,
+    /// Primary cursor row on the active screen.
+    cursor_row: usize,
+    /// Primary owner leaf (paints command pills).
+    owner: Option<ViewId>,
+    /// Command anchor to place.
+    id: CommandId,
+    /// Label glyphs painted.
+    label: &'a str,
 }

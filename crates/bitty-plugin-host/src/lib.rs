@@ -82,15 +82,15 @@
 //! ([`effective::authorize_with_trust`]), the role contract gates it too
 //! ([`effective::authorize_with_role`]), and the credential exclusive-or
 //! order is enforced by [`credential_ref::resolve_choice`] at the call
-//! boundary where two references meet (no live config field carries those
-//! references yet, so that gate waits on the provider-schema follow-up).
+//! boundary where two references meet, with actual resolution on the
+//! provider-schema surface ([`credential_ref::ProviderCredentialConfig`]).
 //!
 //! | Open question | Module | Adopted shape |
 //! |---------------|--------|-----------------|
 //! | OQ-085 trust levels + capability domains | `trust_levels` | [`trust_levels::TrustLevel`] levels 0–4, [`trust_levels::CapabilityDomain`] admission sets narrowing with level, mapping onto accepted [`capability::CapabilityFamily`] only; [`trust_levels::TrustLevel::check_family`] enforced by [`effective::authorize_with_trust`] |
 //! | OQ-084 ontology/identity | `identity` | [`identity::EntityKind`] ten first-class kinds, [`identity::OntologyId`] `kind:value` identifiers, [`identity::Ownership`] links plus [`identity::Lifetime`] |
-//! | OQ-055 secret-storage tiers | `secret_tiers` | [`secret_tiers::SecretTier`] four tiers with per-tier [`secret_tiers::TierPolicy`] (consent/audit/redaction); [`secret_tiers::CommandRef`] names commands without running them; [`secret_tiers::check_tier_access`] enforced at the resolve boundary |
-//! | OQ-054 `api_key_env` vs `api_key_cmd` | `credential_ref` | [`credential_ref::CredentialRef`] env/cmd references (names only), [`credential_ref::resolve_precedence`] exclusive-or order plus [`credential_ref::resolve_choice`] call-boundary enforcement, [`credential_ref::check_project_override`] narrow-only boundary |
+//! | OQ-055 secret-storage tiers | `secret_tiers` | [`secret_tiers::SecretTier`] four tiers with per-tier [`secret_tiers::TierPolicy`] (consent/audit/redaction); [`secret_tiers::CommandRef`] resolved by [`secret_tiers::execute_command_ref`] (shell-free, bounded); [`secret_tiers::KeyringBackend`] selection plus [`secret_tiers::RotationPolicy`]; [`secret_tiers::check_tier_access`] enforced at the resolve boundary |
+//! | OQ-054 `api_key_env` vs `api_key_cmd` | `credential_ref` | [`credential_ref::CredentialRef`] env/cmd references (names only), [`credential_ref::resolve_precedence`] exclusive-or order plus [`credential_ref::resolve_choice`] call-boundary enforcement, [`credential_ref::check_project_override`] narrow-only boundary, [`credential_ref::ProviderCredentialConfig`] schema surface with [`credential_ref::resolve_provider_credential`] |
 //! | OQ-057 role contract | `roles` | [`roles::AgentRole`] Commander/Implementer/Tester/Reviewer, [`roles::EnforcementPoint`] checks (incl. [`roles::EnforcementPoint::for_request_kind`]), [`roles::SandboxRestrictions`] flags, capability ceilings intersected with grants elsewhere; [`roles::AgentRole::check_request`] enforced by [`effective::authorize_with_role`] |
 //!
 //! # Drop policy — DropOldest accepted default for v1 (OQ-013 closed decision point)
@@ -166,8 +166,10 @@ pub use capability::{
 };
 pub use credential_ref::{
     CredentialPrecedence, CredentialRef, CredentialSource, MAX_CREDENTIAL_CMD_ARGS,
-    MAX_CREDENTIAL_CMD_PART_BYTES, MAX_CREDENTIAL_ENV_NAME_BYTES, check_project_override,
-    resolve_choice, resolve_precedence,
+    MAX_CREDENTIAL_CMD_OUTPUT_BYTES, MAX_CREDENTIAL_CMD_PART_BYTES, MAX_CREDENTIAL_ENV_NAME_BYTES,
+    ProviderCredentialConfig, check_project_override, check_provider_override,
+    execute_credential_cmd, resolve_choice, resolve_precedence, resolve_provider_credential,
+    resolve_provider_credential_live,
 };
 pub use effective::{
     AgentRequest, AuditDecision, AuditEntry, AuditLedger, CapabilityScope, DenialKind, DenialStep,
@@ -223,8 +225,12 @@ pub use origin::{
 pub use registry::{Generation, PluginState, Registry, RegistryEntry};
 pub use roles::{AgentRole, EnforcementPoint, MAX_ROLE_LABEL_BYTES, SandboxRestrictions};
 pub use secret_tiers::{
-    CommandRef as SecretCommandRef, ConsentRule, MAX_COMMAND_REF_ARGS, MAX_COMMAND_REF_PART_BYTES,
-    MAX_TIER_LABEL_BYTES, SecretTier, TierAccess, TierPolicy, check_tier_access,
+    CommandRef as SecretCommandRef, ConsentRule, DEFAULT_ROTATION_MAX_AGE_SECS, KeyringBackend,
+    KeyringRef, MAX_COMMAND_OUTPUT_BYTES, MAX_COMMAND_REF_ARGS, MAX_COMMAND_REF_PART_BYTES,
+    MAX_KEYRING_ACCOUNT_BYTES, MAX_KEYRING_BACKEND_LABEL_BYTES, MAX_KEYRING_SERVICE_BYTES,
+    MAX_ROTATION_MAX_AGE_SECS, MAX_TIER_LABEL_BYTES, RotationPolicy, SecretTier, TierAccess,
+    TierPolicy, check_tier_access, execute_command_ref, read_keyring_ref, rotate_secret_value,
+    select_keyring_backend, select_keyring_backend_with,
 };
 pub use secrets::{
     FileSecretStore, MAX_HANDLE_NAME_BYTES, MAX_RESOLVED_ENV_VARS, MAX_SECRET_AUDIT_ENTRIES,

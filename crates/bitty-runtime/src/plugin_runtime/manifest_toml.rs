@@ -8,11 +8,19 @@
 //! supplies the already-bounded bytes.
 //!
 //! Supported sections: `[plugin]`, `[compat]`, `[capabilities]`, `[lazy]`,
-//! `[limits]`, `[tools.git]` (accepted Layer-2 v1, CTX-0425),
+//! `[limits]`, `[dependencies]`, `[services.provided]`, `[services.required]`,
+//! `[tools.git]` (accepted Layer-2 v1, CTX-0425),
 //! `[[capabilities.filesystem]]` and `[[network.egress]]` (array-of-tables).
 //! Strings, booleans, arrays of strings, and (in `[limits]` only) bare
 //! non-negative integers are supported. Unknown sections, sub-tables, other
 //! numeric values, and duplicate keys fail closed.
+//!
+//! The `[dependencies]` and `[services.*]` sections accept the string form
+//! only (`"owner.name" = ">=2.0"`, `"iface" = "1.0.0"`). Inline-table values
+//! (`{ version = ..., prerelease = ... }`, `{ version, args_schema,
+//! result_schema }`, `[{ id, ... }]` in `[lazy].commands`) fail closed as
+//! unsupported; they are follow-up work tracked against the accepted
+//! plugin-platform RFC open reconciliation item.
 
 use std::collections::BTreeSet;
 
@@ -69,6 +77,13 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
 
     // `[limits]` budgets (all keys optional, bare integers only).
     let mut limits = PluginLimits::default();
+
+    // `[dependencies]` entries (`"owner.name" = ">=2.0"`, string form only).
+    let mut dependencies: Vec<(String, String)> = Vec::new();
+    // `[services.provided]` / `[services.required]` entries
+    // (`"iface" = "1.0.0"`, string form only).
+    let mut provided_services: Vec<(String, String)> = Vec::new();
+    let mut required_services: Vec<(String, String)> = Vec::new();
 
     let flush_filesystem_entry = |fs_access: &mut Option<String>,
                                   fs_paths: &mut Option<Vec<String>>,
@@ -200,7 +215,8 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
                 continue;
             }
             match inner.as_str() {
-                "plugin" | "compat" | "capabilities" | "lazy" | "limits" => {
+                "plugin" | "compat" | "capabilities" | "lazy" | "limits" | "dependencies"
+                | "services.provided" | "services.required" => {
                     flush_filesystem_entry(
                         &mut fs_access,
                         &mut fs_paths,
@@ -379,6 +395,17 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
                         .map_err(|e| format!("invalid [limits] key '{key}': {e}"))?,
                 );
             }
+            "dependencies" | "services.provided" | "services.required" => {
+                if !seen_keys.insert(section_key) {
+                    return Err(format!("duplicate key '{key}' in [{section}]"));
+                }
+                let requirement = parse_string_entry(&value, &section, &key)?;
+                match section.as_str() {
+                    "dependencies" => dependencies.push((key, requirement)),
+                    "services.provided" => provided_services.push((key, requirement)),
+                    _ => required_services.push((key, requirement)),
+                }
+            }
             s if s.starts_with("tools.") => {
                 if !seen_keys.insert(section_key.clone()) {
                     return Err(format!("duplicate key '{key}' in [{s}]"));
@@ -445,15 +472,21 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
                 .map_err(|e| format!("invalid lazy.commands entry '{command}': {e}"))?,
         );
     }
+    let mut parsed_dependencies = Vec::new();
+    for (id, req) in dependencies {
+        let plugin_id = bitty_plugin_host::manifest::PluginId::new(&id)
+            .map_err(|e| format!("invalid [dependencies] id '{id}': {e}"))?;
+        parsed_dependencies.push((plugin_id, req));
+    }
     let manifest = PluginManifest {
         identity,
         compat: Compat {
             bitty: compat_bitty,
             plugin_api: compat_api,
         },
-        dependencies: Vec::new(),
-        provided_services: Vec::new(),
-        required_services: Vec::new(),
+        dependencies: parsed_dependencies,
+        provided_services,
+        required_services,
         capabilities: CapabilityRequests {
             ids: capabilities,
             filesystem,
@@ -632,6 +665,20 @@ fn parse_port_array(value: &str) -> Result<Vec<u16>, String> {
         return Err("ports array must list at least one port".to_string());
     }
     Ok(ports)
+}
+
+/// Parse a string-form value in `[dependencies]` / `[services.*]`.
+///
+/// Inline-table values (`{ ... }`) fail closed as unsupported: the table
+/// forms (dependency prerelease opt-in, service JSON Schemas) are follow-up
+/// work, and silently coercing them would mis-resolve the dependency graph.
+fn parse_string_entry(value: &str, section: &str, key: &str) -> Result<String, String> {
+    if value.trim_start().starts_with('{') {
+        return Err(format!(
+            "inline-table value for '[{section}] {key}' is not supported (string form only)"
+        ));
+    }
+    parse_string(value).map_err(|e| format!("invalid '[{section}] {key}': {e}"))
 }
 
 fn parse_array(value: &str) -> Result<Vec<String>, String> {
@@ -954,6 +1001,70 @@ mod tests {
         let body = format!(
             "{}\n[capabilities]\nprocess.spawn = true\n[tools.git]\nrequired = true\nversion = \">=2.30\"\n",
             minimal_body("xuepoo.barespawn")
+        );
+        assert!(parse_manifest(body.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn dependencies_and_services_string_forms_parse() {
+        let body = format!(
+            "{}\n[dependencies]\n\"xuepoo.gitcore\" = \">=2.0\"\n[services.provided]\n\"markdown.render\" = \"1.0.0\"\n[services.required]\n\"git.status\" = \">=1.2\"\n",
+            minimal_body("xuepoo.depsvc")
+        );
+        let manifest = parse_manifest(body.as_bytes()).expect("deps/services shape must parse");
+        assert_eq!(manifest.dependencies.len(), 1);
+        assert_eq!(manifest.dependencies[0].0.as_str(), "xuepoo.gitcore");
+        assert_eq!(manifest.dependencies[0].1, ">=2.0");
+        assert_eq!(
+            manifest.provided_services,
+            vec![("markdown.render".to_string(), "1.0.0".to_string())]
+        );
+        assert_eq!(
+            manifest.required_services,
+            vec![("git.status".to_string(), ">=1.2".to_string())]
+        );
+    }
+
+    #[test]
+    fn dependencies_and_services_fail_closed() {
+        // Bare `[services]` (without `.provided`/`.required`) fails closed.
+        let body = format!(
+            "{}\n[services]\n\"markdown.render\" = \"1.0.0\"\n",
+            minimal_body("xuepoo.baresvc")
+        );
+        assert!(parse_manifest(body.as_bytes()).is_err());
+
+        // Inline-table values fail closed as unsupported (follow-up work).
+        for fragment in [
+            "[dependencies]\n\"xuepoo.gitcore\" = { version = \">=2.0\", prerelease = true }\n",
+            "[services.provided]\n\"markdown.render\" = { version = \"1.0.0\" }\n",
+            "[services.required]\n\"git.status\" = { version = \">=1.2\" }\n",
+        ] {
+            let body = format!("{}\n{fragment}", minimal_body("xuepoo.svcbad"));
+            assert!(
+                parse_manifest(body.as_bytes()).is_err(),
+                "fragment must fail closed: {fragment:?}"
+            );
+        }
+
+        // Invalid dependency id, bad version requirement, and bad semver fail.
+        for fragment in [
+            "[dependencies]\n\"BAD-ID\" = \">=2.0\"\n",
+            "[dependencies]\n\"xuepoo.gitcore\" = \">=2.0; rm -rf\"\n",
+            "[services.provided]\n\"markdown.render\" = \"not-a-version\"\n",
+            "[services.provided]\n\"markdown.render\" = 42\n",
+        ] {
+            let body = format!("{}\n{fragment}", minimal_body("xuepoo.svcbad2"));
+            assert!(
+                parse_manifest(body.as_bytes()).is_err(),
+                "fragment must fail closed: {fragment:?}"
+            );
+        }
+
+        // Duplicate keys within one section fail closed.
+        let body = format!(
+            "{}\n[dependencies]\n\"xuepoo.gitcore\" = \">=2.0\"\n\"xuepoo.gitcore\" = \">=2.0\"\n",
+            minimal_body("xuepoo.svcdup")
         );
         assert!(parse_manifest(body.as_bytes()).is_err());
     }

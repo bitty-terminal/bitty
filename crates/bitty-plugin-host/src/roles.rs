@@ -9,19 +9,26 @@
 //! (and [`AgentRole::check_request`] per privileged request kind) denies
 //! roles outside their mapped points, and
 //! [`crate::effective::authorize_with_role`] runs that gate before the
-//! six-layer grant intersection. Roles never grant authority by themselves,
-//! prompts never confer capability (there is deliberately no `bind_prompt`
-//! constructor), and delegation only narrows through the accepted
-//! intersection engine ([`crate::effective`]). The chat-message
-//! [`Role`](bitty-agent) distinction stays untouched; this kernel answers
-//! "may role R act at enforcement point P, and under which sandbox
-//! restrictions". Unknown roles or points deny rather than default.
+//! six-layer grant intersection. Delegation fan-out and depth are bounded
+//! per role ([`AgentRole::check_dispatch`], enforced by
+//! [`crate::effective::delegate_with_role`]). Roles never grant authority
+//! by themselves, prompts never confer capability (there is deliberately no
+//! `bind_prompt` constructor; [`deny_prompt_authority`] is the executable
+//! form of that invariant and always denies), and delegation only narrows
+//! through the accepted intersection engine ([`crate::effective`]).
+//! Execution spawns carry a declared sandbox posture ([`SandboxDecl`])
+//! checked against the role table ([`AgentRole::check_sandbox_exec`]); the
+//! full shell-write closure mechanism (CRE-5) stays open work. The
+//! chat-message [`Role`](bitty-agent) distinction stays untouched; this
+//! kernel answers "may role R act at enforcement point P, and under which
+//! sandbox restrictions". Unknown roles or points deny rather than default.
 //!
 //! # Non-goals
 //!
-//! Model routing, memory, skill growth, dispatch budgets, and the shell
-//! write path (CRE-5) stay open. There is no `unsafe`, no I/O, and no new
-//! dependency (`std` only).
+//! Model routing, memory, and skill growth stay open. The sandbox mechanism
+//! itself (CRE-5 shell-write closure) stays undecided: the declaration gate
+//! constrains what a spawn may claim, it does not build the sandbox.
+//! There is no `unsafe`, no I/O, and no new dependency (`std` only).
 
 #![forbid(unsafe_code)]
 
@@ -35,6 +42,21 @@ use crate::error::PluginError;
 
 /// Maximum bytes of a role label accepted by [`AgentRole::parse`].
 pub const MAX_ROLE_LABEL_BYTES: usize = 32;
+
+/// Delegation fan-out ceiling for the Commander role (OQ-057 adopted).
+///
+/// Mirrors the host default agent ceiling
+/// ([`crate::effective::HOST_DEFAULT_MAX_AGENTS`]): without an explicit
+/// per-task grant, no delegation tree fans wider than this. Every other
+/// role carries no dispatch authority, so their ceiling is zero.
+pub const MAX_DISPATCH_FANOUT: u32 = 16;
+
+/// Delegation depth ceiling for the Commander role (OQ-057 adopted).
+///
+/// Bounds how deep a commander-rooted delegation chain may nest before a
+/// fresh authorization is required. Every other role carries no dispatch
+/// authority, so their ceiling is zero.
+pub const MAX_DELEGATION_DEPTH: u32 = 3;
 
 // ── roles ─────────────────────────────────────────────────────────────────
 
@@ -148,6 +170,61 @@ impl AgentRole {
         self.check_point(EnforcementPoint::for_request_kind(kind))
     }
 
+    /// Maximum subagent fan-out this role may dispatch at once (OQ-057
+    /// adopted dispatch limit).
+    ///
+    /// Only the Commander dispatches; every other role carries no dispatch
+    /// authority and reads zero here (their dispatch attempts already fail
+    /// at [`Self::check_point`] with the delegation point).
+    #[must_use]
+    pub const fn max_dispatch(self) -> u32 {
+        match self {
+            Self::Commander => MAX_DISPATCH_FANOUT,
+            Self::Implementer | Self::Tester | Self::Reviewer => 0,
+        }
+    }
+
+    /// Maximum delegation-chain depth this role may nest (OQ-057 adopted
+    /// dispatch limit).
+    ///
+    /// Only the Commander dispatches; every other role reads zero.
+    #[must_use]
+    pub const fn max_delegation_depth(self) -> u32 {
+        match self {
+            Self::Commander => MAX_DELEGATION_DEPTH,
+            Self::Implementer | Self::Tester | Self::Reviewer => 0,
+        }
+    }
+
+    /// Check a dispatch of `child_count` subagents at chain `depth`
+    /// (OQ-057 adopted).
+    ///
+    /// Call-boundary gate enforced by
+    /// [`crate::effective::delegate_with_role`]: the role must admit the
+    /// delegation point first, then the fan-out and depth must fit the
+    /// per-role ceilings. Over-ceiling dispatches deny fail-closed with a
+    /// limit error naming the bound only (never a plan or payload).
+    pub fn check_dispatch(self, child_count: u32, depth: u32) -> Result<(), PluginError> {
+        self.check_point(EnforcementPoint::Delegation)?;
+        let ceiling = self.max_dispatch();
+        if child_count > ceiling {
+            return Err(PluginError::LimitExceeded {
+                field: "dispatch_fanout".to_string(),
+                limit: ceiling as usize,
+                actual: child_count as usize,
+            });
+        }
+        let max_depth = self.max_delegation_depth();
+        if depth > max_depth {
+            return Err(PluginError::LimitExceeded {
+                field: "delegation_depth".to_string(),
+                limit: max_depth as usize,
+                actual: depth as usize,
+            });
+        }
+        Ok(())
+    }
+
     /// Execution-sandbox restrictions for this role (candidate).
     ///
     /// Restrictions only tighten down the table; the sandbox mechanism
@@ -181,6 +258,19 @@ impl AgentRole {
                 env_sealed: true,
             },
         }
+    }
+
+    /// Check an execution spawn carrying `decl` against this role's sandbox
+    /// posture (OQ-057 adopted, CRE-5 declaration gate).
+    ///
+    /// The role must admit the sandbox point first, then the declared
+    /// posture must fit [`Self::sandbox`]: a spawn claiming filesystem
+    /// writes, network, a child process, or a broken environment seal
+    /// denies when the role forbids it. The gate constrains what a spawn
+    /// may claim; the sandbox mechanism itself stays open work.
+    pub fn check_sandbox_exec(self, decl: &SandboxDecl) -> Result<(), PluginError> {
+        self.check_point(EnforcementPoint::SandboxExec)?;
+        self.sandbox().check_decl(decl)
     }
 
     /// Capability families this role may exercise *at most*, intersected
@@ -276,6 +366,84 @@ impl fmt::Display for EnforcementPoint {
 
 // ── sandbox restrictions ──────────────────────────────────────────────────
 
+/// Prompt text never confers capability (OQ-057 adopted).
+///
+/// Executable form of the "prompts never grant authority" invariant: this
+/// function always denies with a grant error naming the invariant only
+/// (never prompt content). There is deliberately no `bind_prompt`
+/// constructor on [`AgentRole`]; any future call site tempted to authorize
+/// from prompt text must route through this denial instead.
+pub fn deny_prompt_authority() -> Result<(), PluginError> {
+    Err(PluginError::grant(
+        "prompt text confers no authority (OQ-057 adopted; bind the role, never the prompt)",
+    ))
+}
+
+/// Declared sandbox posture for one execution spawn (OQ-057 adopted,
+/// CRE-5 declaration gate).
+///
+/// The spawner declares what the spawn will be allowed; the role table
+/// ([`SandboxRestrictions::check_decl`]) admits or denies the claim. The
+/// declaration is self-attested — it constrains claims, it does not build
+/// the sandbox mechanism (open work).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SandboxDecl {
+    fs_write: bool,
+    network: bool,
+    child_process: bool,
+    env_sealed: bool,
+}
+
+impl SandboxDecl {
+    /// A fully sealed spawn: no filesystem writes, no network, no child
+    /// process, environment sealed. Admitted by every role that reaches
+    /// the sandbox point.
+    #[must_use]
+    pub const fn sealed() -> Self {
+        Self {
+            fs_write: false,
+            network: false,
+            child_process: false,
+            env_sealed: true,
+        }
+    }
+
+    /// A custom posture claim; each `true` needs the role to allow it.
+    #[must_use]
+    pub const fn new(fs_write: bool, network: bool, child_process: bool, env_sealed: bool) -> Self {
+        Self {
+            fs_write,
+            network,
+            child_process,
+            env_sealed,
+        }
+    }
+
+    /// Whether the spawn claims filesystem writes.
+    #[must_use]
+    pub const fn fs_write(self) -> bool {
+        self.fs_write
+    }
+
+    /// Whether the spawn claims network access.
+    #[must_use]
+    pub const fn network(self) -> bool {
+        self.network
+    }
+
+    /// Whether the spawn claims a child process beyond itself.
+    #[must_use]
+    pub const fn child_process(self) -> bool {
+        self.child_process
+    }
+
+    /// Whether the spawn claims a sealed environment (no inherited secrets).
+    #[must_use]
+    pub const fn env_sealed(self) -> bool {
+        self.env_sealed
+    }
+}
+
 /// Candidate execution-sandbox restrictions for a role (OQ-057).
 ///
 /// Pure flags describing what the sandbox would forbid; no sandbox
@@ -311,6 +479,36 @@ impl SandboxRestrictions {
     #[must_use]
     pub const fn env_sealed(self) -> bool {
         self.env_sealed
+    }
+
+    /// Check a declared spawn posture against these restrictions (OQ-057
+    /// adopted, CRE-5 declaration gate).
+    ///
+    /// Each claim the declaration makes must be one the restrictions allow;
+    /// the first forbidden claim denies fail-closed with a grant error
+    /// naming the restriction only (never a program, argument, or path).
+    pub fn check_decl(self, decl: &SandboxDecl) -> Result<(), PluginError> {
+        if self.no_fs_write && decl.fs_write() {
+            return Err(PluginError::grant(
+                "sandbox declaration claims filesystem writes the role forbids (OQ-057 adopted)",
+            ));
+        }
+        if self.no_network && decl.network() {
+            return Err(PluginError::grant(
+                "sandbox declaration claims network access the role forbids (OQ-057 adopted)",
+            ));
+        }
+        if self.no_child_process && decl.child_process() {
+            return Err(PluginError::grant(
+                "sandbox declaration claims a child process the role forbids (OQ-057 adopted)",
+            ));
+        }
+        if self.env_sealed && !decl.env_sealed() {
+            return Err(PluginError::grant(
+                "sandbox declaration breaks the environment seal the role requires (OQ-057 adopted)",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -478,5 +676,90 @@ mod tests {
         let text = error.to_string();
         assert!(text.contains("reviewer"), "{text}");
         assert!(text.contains("tool-call"), "{text}");
+    }
+
+    #[test]
+    fn dispatch_limits_admit_commander_within_ceiling() {
+        assert_eq!(AgentRole::Commander.max_dispatch(), MAX_DISPATCH_FANOUT);
+        assert_eq!(
+            AgentRole::Commander.max_delegation_depth(),
+            MAX_DELEGATION_DEPTH
+        );
+        assert!(AgentRole::Commander.check_dispatch(1, 0).is_ok());
+        assert!(
+            AgentRole::Commander
+                .check_dispatch(MAX_DISPATCH_FANOUT, MAX_DELEGATION_DEPTH)
+                .is_ok()
+        );
+        for role in [
+            AgentRole::Implementer,
+            AgentRole::Tester,
+            AgentRole::Reviewer,
+        ] {
+            assert_eq!(role.max_dispatch(), 0, "{role} dispatches nothing");
+            assert_eq!(role.max_delegation_depth(), 0, "{role} nests nothing");
+        }
+    }
+
+    #[test]
+    fn dispatch_over_ceiling_denies_fail_closed() {
+        let error = AgentRole::Commander
+            .check_dispatch(MAX_DISPATCH_FANOUT + 1, 0)
+            .expect_err("fan-out over ceiling must deny");
+        let text = error.to_string();
+        assert!(text.contains("dispatch_fanout"), "{text}");
+        let error = AgentRole::Commander
+            .check_dispatch(1, MAX_DELEGATION_DEPTH + 1)
+            .expect_err("depth over ceiling must deny");
+        let text = error.to_string();
+        assert!(text.contains("delegation_depth"), "{text}");
+        // Non-commanders deny at the delegation point before any bound.
+        let error = AgentRole::Implementer
+            .check_dispatch(0, 0)
+            .expect_err("implementer dispatches nothing");
+        let text = error.to_string();
+        assert!(text.contains("delegation"), "{text}");
+        assert!(
+            AgentRole::Reviewer.check_dispatch(0, 0).is_err(),
+            "reviewer dispatches nothing"
+        );
+    }
+
+    #[test]
+    fn prompt_text_never_confers_authority() {
+        let error = deny_prompt_authority().expect_err("prompts never authorize");
+        let text = error.to_string();
+        assert!(text.contains("no authority"), "{text}");
+        assert!(text.contains("OQ-057"), "{text}");
+    }
+
+    #[test]
+    fn sandbox_decl_gate_tightens_down_the_table() {
+        let sealed = SandboxDecl::sealed();
+        // The sealed posture passes every role that reaches the sandbox point.
+        assert!(AgentRole::Commander.check_sandbox_exec(&sealed).is_ok());
+        assert!(AgentRole::Implementer.check_sandbox_exec(&sealed).is_ok());
+        assert!(AgentRole::Tester.check_sandbox_exec(&sealed).is_ok());
+        // Reviewers never reach the sandbox point.
+        assert!(AgentRole::Reviewer.check_sandbox_exec(&sealed).is_err());
+        // Implementers claim no network; testers claim nothing beyond sealed.
+        let net = SandboxDecl::new(false, true, false, true);
+        assert!(AgentRole::Commander.check_sandbox_exec(&net).is_ok());
+        assert!(AgentRole::Implementer.check_sandbox_exec(&net).is_err());
+        assert!(AgentRole::Tester.check_sandbox_exec(&net).is_err());
+        let unsealed = SandboxDecl::new(false, false, false, false);
+        assert!(AgentRole::Commander.check_sandbox_exec(&unsealed).is_ok());
+        assert!(
+            AgentRole::Implementer
+                .check_sandbox_exec(&unsealed)
+                .is_err(),
+            "implementer requires the environment seal"
+        );
+        let child = SandboxDecl::new(false, false, true, true);
+        assert!(AgentRole::Commander.check_sandbox_exec(&child).is_ok());
+        assert!(
+            AgentRole::Tester.check_sandbox_exec(&child).is_err(),
+            "tester claims no child process"
+        );
     }
 }

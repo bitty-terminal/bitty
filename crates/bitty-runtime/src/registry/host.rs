@@ -136,6 +136,45 @@ struct PanelLeaseEntry {
     description: Option<String>,
 }
 
+/// Bus event name for panel lease transitions (OQ-083 adopted routing).
+///
+/// Lease transitions publish on `bitty.panel:lifecycle.lease-changed` with
+/// an id-only payload (panel id, kernel audit name, holder tag, tenure
+/// deadline — never panel content).
+pub const LEASE_CHANGED_EVENT: &str = "lease-changed";
+
+/// Mints the lease-transition bus topic through the accepted topic grammar.
+///
+/// # Errors
+///
+/// [`PanelError::UnknownTopic`] or [`PanelError::ResourceExhausted`] when
+/// the minted topic violates the grammar (unreachable for the fixed
+/// `lease-changed` name; the `Result` keeps the grammar as the single
+/// authority).
+pub fn lease_event_topic() -> Result<EventTopic, PanelError> {
+    core_topic(BusTopicFamily::Lifecycle, LEASE_CHANGED_EVENT)
+}
+
+/// Formats one lease transition as an id-only bus payload.
+///
+/// Holder tags are opaque and the tenure deadline is a tick count:
+/// the payload carries no panel content, title, or description.
+fn lease_event_payload(panel: super::panel::PanelId, event: LeaseEvent) -> BoundedPayload {
+    let holder = event
+        .holder()
+        .map_or_else(|| "-".to_string(), |holder| holder.to_string());
+    let expires_at = match event {
+        LeaseEvent::Acquired { expires_at, .. } | LeaseEvent::Handoff { expires_at, .. } => {
+            expires_at.to_string()
+        }
+        LeaseEvent::Released { .. } | LeaseEvent::Expired { .. } => "-".to_string(),
+    };
+    BoundedPayload::new_truncated(&format!(
+        "panel={panel} lease={} holder={holder} expires_at={expires_at}",
+        event.as_str()
+    ))
+}
+
 impl PanelLeaseEntry {
     fn idle() -> Self {
         Self {
@@ -318,36 +357,45 @@ impl PanelRuntime {
         result
     }
 
-    /// Acquires an idle panel's lease for `holder` (RUN-21, #1052).
+    /// Acquires an idle panel's lease for `holder` for `term_ticks` host
+    /// ticks starting at `now` (RUN-21, #1052; bounded tenure #1095).
     ///
     /// The handle generation is validated first (`StaleHandle` before any
     /// lease access); the transition itself runs in the [`PanelLease`]
     /// kernel and a refusal maps to [`PanelError::LeaseDenied`] with the
-    /// stable kernel audit name. A human takeover stays outside the lease:
-    /// release back to `Idle`, never a holder value.
+    /// stable kernel audit name. A successful transition routes to the
+    /// event bus (`bitty.panel:lifecycle.lease-changed`). A human takeover
+    /// stays outside the lease: release back to `Idle`, never a holder
+    /// value.
     ///
     /// # Errors
     ///
     /// [`PanelError::StaleHandle`], [`PanelError::NotFound`], or
-    /// [`PanelError::LeaseDenied`] (`already_occupied`).
+    /// [`PanelError::LeaseDenied`] (`already_occupied` / `invalid_term`).
     pub fn acquire_panel_lease(
         &mut self,
         id: super::panel::PanelId,
         generation: Generation,
         holder: LeaseHolder,
+        term_ticks: u64,
+        now: u64,
     ) -> Result<LeaseEvent, PanelError> {
         self.registry.panel_state(id, generation)?;
         let entry = self.leases.entry(id).or_insert_with(PanelLeaseEntry::idle);
-        entry
+        let event = entry
             .lease
-            .acquire(holder)
-            .map_err(|error| map_lease_error(id, error))
+            .acquire(holder, term_ticks, now)
+            .map_err(|error| map_lease_error(id, error))?;
+        self.route_lease_event(id, event);
+        Ok(event)
     }
 
     /// Releases an occupied panel's lease back to idle (RUN-21, #1052).
     ///
     /// Only the current occupant may release; anything else fails with
-    /// [`PanelError::LeaseDenied`] and the lease is unchanged.
+    /// [`PanelError::LeaseDenied`] and the lease is unchanged. A successful
+    /// transition routes to the event bus
+    /// (`bitty.panel:lifecycle.lease-changed`).
     ///
     /// # Errors
     ///
@@ -361,33 +409,133 @@ impl PanelRuntime {
     ) -> Result<LeaseEvent, PanelError> {
         self.registry.panel_state(id, generation)?;
         let entry = self.leases.entry(id).or_insert_with(PanelLeaseEntry::idle);
-        entry
+        let event = entry
             .lease
             .release(holder)
-            .map_err(|error| map_lease_error(id, error))
+            .map_err(|error| map_lease_error(id, error))?;
+        self.route_lease_event(id, event);
+        Ok(event)
     }
 
     /// Moves a panel's lease directly from `from` to `to` with no idle gap
     /// (RUN-21, #1052): a handoff cannot be intercepted mid-release by a
     /// third acquirer.
     ///
+    /// The tenure deadline is preserved (handoff never extends tenure).
+    /// A successful transition routes to the event bus
+    /// (`bitty.panel:lifecycle.lease-changed`).
+    ///
     /// # Errors
     ///
     /// [`PanelError::StaleHandle`], [`PanelError::NotFound`], or
-    /// [`PanelError::LeaseDenied`] (`not_occupied` / `not_holder`).
+    /// [`PanelError::LeaseDenied`] (`not_occupied` / `not_holder` /
+    /// `expired`).
     pub fn handoff_panel_lease(
         &mut self,
         id: super::panel::PanelId,
         generation: Generation,
         from: LeaseHolder,
         to: LeaseHolder,
+        now: u64,
     ) -> Result<LeaseEvent, PanelError> {
         self.registry.panel_state(id, generation)?;
         let entry = self.leases.entry(id).or_insert_with(PanelLeaseEntry::idle);
-        entry
+        let event = entry
             .lease
-            .handoff(from, to)
+            .handoff(from, to, now)
+            .map_err(|error| map_lease_error(id, error))?;
+        self.route_lease_event(id, event);
+        Ok(event)
+    }
+
+    /// Sweeps every lapsed tenure back to idle at `now` (#1095).
+    ///
+    /// Returns the swept `(panel, event)` pairs in ascending panel order;
+    /// each sweep routes to the event bus
+    /// (`bitty.panel:lifecycle.lease-changed`). Live tenures and idle
+    /// panels are untouched. The host calls this with its tick before
+    /// enforcing write gates.
+    pub fn sweep_expired_leases(&mut self, now: u64) -> Vec<(super::panel::PanelId, LeaseEvent)> {
+        let mut expired: Vec<super::panel::PanelId> = self.leases.keys().copied().collect();
+        expired.sort();
+        let mut swept = Vec::new();
+        for id in expired {
+            let event = self
+                .leases
+                .get_mut(&id)
+                .and_then(|entry| entry.lease.sweep(now));
+            if let Some(event) = event {
+                self.route_lease_event(id, event);
+                swept.push((id, event));
+            }
+        }
+        swept
+    }
+
+    /// Checks write permission for `holder` at `now` after handle validation
+    /// (SEC-26 write-lease enforcement, #1095).
+    ///
+    /// This is the enforcement call site panel write surfaces gate on:
+    /// only the current occupant within a live tenure may write. Idle
+    /// panels, non-holders, and lapsed tenures deny with
+    /// [`PanelError::LeaseDenied`] carrying the stable kernel audit name.
+    ///
+    /// # Errors
+    ///
+    /// [`PanelError::StaleHandle`], [`PanelError::NotFound`], or
+    /// [`PanelError::LeaseDenied`] (`not_occupied` / `not_holder` /
+    /// `expired`).
+    pub fn check_panel_write(
+        &self,
+        id: super::panel::PanelId,
+        generation: Generation,
+        holder: LeaseHolder,
+        now: u64,
+    ) -> Result<(), PanelError> {
+        self.registry.panel_state(id, generation)?;
+        let lease = match self.leases.get(&id) {
+            Some(entry) => entry.lease,
+            None => PanelLease::idle(),
+        };
+        lease
+            .check_write(holder, now)
             .map_err(|error| map_lease_error(id, error))
+    }
+
+    /// Reads whether a panel's current tenure lapsed at `now` after handle
+    /// validation (#1095).
+    ///
+    /// A lapsed tenure still reads `Occupied` from [`Self::panel_lease_state`]
+    /// until [`Self::sweep_expired_leases`] moves it back to idle; this
+    /// check reports the lapse without changing the lease.
+    ///
+    /// # Errors
+    ///
+    /// [`PanelError::StaleHandle`] or [`PanelError::NotFound`].
+    pub fn lease_is_expired(
+        &self,
+        id: super::panel::PanelId,
+        generation: Generation,
+        now: u64,
+    ) -> Result<bool, PanelError> {
+        self.registry.panel_state(id, generation)?;
+        Ok(self
+            .leases
+            .get(&id)
+            .is_some_and(|entry| entry.lease.is_expired(now)))
+    }
+
+    /// Routes one lease transition to the event bus (OQ-083 adopted routing).
+    ///
+    /// Publishes [`LEASE_CHANGED_EVENT`] with an id-only payload (never
+    /// panel content). With no subscribers the publish is a no-op; the
+    /// payload is bounded by construction, so a publish refusal is
+    /// unreachable and never fails the transition that already happened.
+    fn route_lease_event(&mut self, panel: super::panel::PanelId, event: LeaseEvent) {
+        if let Ok(topic) = lease_event_topic() {
+            let payload = lease_event_payload(panel, event);
+            let _ = self.registry.publish(&topic, payload);
+        }
     }
 
     /// Reads a panel's current lease state after handle validation

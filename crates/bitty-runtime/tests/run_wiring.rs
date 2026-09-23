@@ -23,10 +23,11 @@ use std::time::Duration;
 
 use bitty_runtime::execution::{
     EchoState, InteractionClass, JobError, JobPrincipal, JobRegistry, JobSpec, LeaseEvent,
-    LeaseHolder, LeaseState, OperationIntent, PanelLease,
+    LeaseHolder, LeaseState, MAX_LEASE_TERM_TICKS, OperationIntent, PanelLease,
 };
 use bitty_runtime::registry::{
-    Generation, PanelError, PanelRegistryConfig, PanelRuntime, PanelState, PanelType, WorkspaceId,
+    BUS_SUBSCRIBE_CAPABILITY, Generation, PanelError, PanelRegistryConfig, PanelRuntime,
+    PanelState, PanelType, WorkspaceId,
 };
 
 const HELPER_ENV: &str = "__BITTY_RUN_WIRING_HELPER";
@@ -86,6 +87,10 @@ fn create_terminal(host: &mut PanelRuntime) -> (bitty_runtime::registry::PanelId
 
 const HOLDER_A: LeaseHolder = LeaseHolder(7);
 const HOLDER_B: LeaseHolder = LeaseHolder(9);
+/// Host tick for lease tests (monotonic, never wall-clock).
+const NOW: u64 = 1_000;
+/// Tenure for lease tests in host ticks.
+const TERM: u64 = 100;
 
 // ── RUN-21: lease issuance and transitions through the panel host ───────────
 
@@ -109,7 +114,7 @@ fn lease_recreated_panel_starts_idle_after_dispose() {
     // previous occupant's lease.
     let mut host = host();
     let (id, generation) = create_terminal(&mut host);
-    host.acquire_panel_lease(id, generation, HOLDER_A)
+    host.acquire_panel_lease(id, generation, HOLDER_A, TERM, NOW)
         .expect("acquire");
     host.dispose_panel(id, generation).expect("dispose");
     let (id2, generation2) = create_terminal(&mut host);
@@ -120,8 +125,11 @@ fn lease_recreated_panel_starts_idle_after_dispose() {
     );
     // The recreated binding is live: it can be acquired fresh.
     assert_eq!(
-        host.acquire_panel_lease(id2, generation2, HOLDER_B),
-        Ok(LeaseEvent::Acquired { holder: HOLDER_B })
+        host.acquire_panel_lease(id2, generation2, HOLDER_B, TERM, NOW),
+        Ok(LeaseEvent::Acquired {
+            holder: HOLDER_B,
+            expires_at: NOW + TERM
+        })
     );
 }
 
@@ -130,12 +138,18 @@ fn lease_acquire_release_round_trip_through_host() {
     let mut host = host();
     let (id, generation) = create_terminal(&mut host);
     assert_eq!(
-        host.acquire_panel_lease(id, generation, HOLDER_A),
-        Ok(LeaseEvent::Acquired { holder: HOLDER_A })
+        host.acquire_panel_lease(id, generation, HOLDER_A, TERM, NOW),
+        Ok(LeaseEvent::Acquired {
+            holder: HOLDER_A,
+            expires_at: NOW + TERM
+        })
     );
     assert_eq!(
         host.panel_lease_state(id, generation),
-        Ok(LeaseState::Occupied { holder: HOLDER_A })
+        Ok(LeaseState::Occupied {
+            holder: HOLDER_A,
+            expires_at: NOW + TERM
+        })
     );
     assert_eq!(
         host.release_panel_lease(id, generation, HOLDER_A),
@@ -148,10 +162,10 @@ fn lease_acquire_release_round_trip_through_host() {
 fn lease_double_acquire_denied_keeps_holder() {
     let mut host = host();
     let (id, generation) = create_terminal(&mut host);
-    host.acquire_panel_lease(id, generation, HOLDER_A)
+    host.acquire_panel_lease(id, generation, HOLDER_A, TERM, NOW)
         .expect("first acquire");
     let denial = host
-        .acquire_panel_lease(id, generation, HOLDER_B)
+        .acquire_panel_lease(id, generation, HOLDER_B, TERM, NOW)
         .expect_err("second acquire must fail");
     match &denial {
         PanelError::LeaseDenied { panel_id, reason } => {
@@ -165,7 +179,10 @@ fn lease_double_acquire_denied_keeps_holder() {
     }
     assert_eq!(
         host.panel_lease_state(id, generation),
-        Ok(LeaseState::Occupied { holder: HOLDER_A }),
+        Ok(LeaseState::Occupied {
+            holder: HOLDER_A,
+            expires_at: NOW + TERM
+        }),
         "refusal changes nothing"
     );
 }
@@ -174,22 +191,26 @@ fn lease_double_acquire_denied_keeps_holder() {
 fn lease_handoff_moves_occupancy_without_idle_gap() {
     let mut host = host();
     let (id, generation) = create_terminal(&mut host);
-    host.acquire_panel_lease(id, generation, HOLDER_A)
+    host.acquire_panel_lease(id, generation, HOLDER_A, TERM, NOW)
         .expect("acquire");
     assert_eq!(
-        host.handoff_panel_lease(id, generation, HOLDER_A, HOLDER_B),
+        host.handoff_panel_lease(id, generation, HOLDER_A, HOLDER_B, NOW),
         Ok(LeaseEvent::Handoff {
             from: HOLDER_A,
-            to: HOLDER_B
+            to: HOLDER_B,
+            expires_at: NOW + TERM
         })
     );
     assert_eq!(
         host.panel_lease_state(id, generation),
-        Ok(LeaseState::Occupied { holder: HOLDER_B })
+        Ok(LeaseState::Occupied {
+            holder: HOLDER_B,
+            expires_at: NOW + TERM
+        })
     );
     // A handoff from the departed holder is refused; occupancy is unchanged.
     let denial = host
-        .handoff_panel_lease(id, generation, HOLDER_A, HOLDER_B)
+        .handoff_panel_lease(id, generation, HOLDER_A, HOLDER_B, NOW)
         .expect_err("stale handoff must fail");
     assert!(
         matches!(denial, PanelError::LeaseDenied { .. }),
@@ -197,7 +218,10 @@ fn lease_handoff_moves_occupancy_without_idle_gap() {
     );
     assert_eq!(
         host.panel_lease_state(id, generation),
-        Ok(LeaseState::Occupied { holder: HOLDER_B })
+        Ok(LeaseState::Occupied {
+            holder: HOLDER_B,
+            expires_at: NOW + TERM
+        })
     );
 }
 
@@ -212,7 +236,7 @@ fn lease_idle_release_and_wrong_holder_release_denied() {
         matches!(idle_denial, PanelError::LeaseDenied { .. }),
         "expected LeaseDenied, got {idle_denial:?}"
     );
-    host.acquire_panel_lease(id, generation, HOLDER_A)
+    host.acquire_panel_lease(id, generation, HOLDER_A, TERM, NOW)
         .expect("acquire");
     let holder_denial = host
         .release_panel_lease(id, generation, HOLDER_B)
@@ -226,7 +250,10 @@ fn lease_idle_release_and_wrong_holder_release_denied() {
     }
     assert_eq!(
         host.panel_lease_state(id, generation),
-        Ok(LeaseState::Occupied { holder: HOLDER_A })
+        Ok(LeaseState::Occupied {
+            holder: HOLDER_A,
+            expires_at: NOW + TERM
+        })
     );
 }
 
@@ -236,7 +263,7 @@ fn lease_stale_handle_rejected_before_kernel() {
     let (id, generation) = create_terminal(&mut host);
     let stale = Generation(generation.0.wrapping_add(1000).max(1));
     assert!(matches!(
-        host.acquire_panel_lease(id, stale, HOLDER_A),
+        host.acquire_panel_lease(id, stale, HOLDER_A, TERM, NOW),
         Err(PanelError::StaleHandle { .. })
     ));
     assert!(matches!(
@@ -244,7 +271,7 @@ fn lease_stale_handle_rejected_before_kernel() {
         Err(PanelError::StaleHandle { .. })
     ));
     // The valid handle still works afterwards: failure was fail-closed.
-    host.acquire_panel_lease(id, generation, HOLDER_A)
+    host.acquire_panel_lease(id, generation, HOLDER_A, TERM, NOW)
         .expect("valid handle unaffected");
 }
 
@@ -292,7 +319,7 @@ fn lease_description_bounds_enforced_at_host() {
 fn lease_cleared_at_dispose() {
     let mut host = host();
     let (id, generation) = create_terminal(&mut host);
-    host.acquire_panel_lease(id, generation, HOLDER_A)
+    host.acquire_panel_lease(id, generation, HOLDER_A, TERM, NOW)
         .expect("acquire");
     host.dispose_panel(id, generation).expect("dispose");
     assert!(
@@ -303,15 +330,24 @@ fn lease_cleared_at_dispose() {
 
 #[test]
 fn lease_kernel_still_pure_beside_host() {
-    // The host owns the binding; the kernel still owns the transition.
-    // This pins the layering: no bus, clock, or agent symbol in the kernel.
+    // The host owns the binding, the clock, and the bus routing; the kernel
+    // still owns the transition and only compares host-supplied ticks.
     let mut lease = PanelLease::idle();
     assert_eq!(lease.state(), LeaseState::Idle);
     assert_eq!(
-        lease.acquire(HOLDER_A),
-        Ok(LeaseEvent::Acquired { holder: HOLDER_A })
+        lease.acquire(HOLDER_A, TERM, NOW),
+        Ok(LeaseEvent::Acquired {
+            holder: HOLDER_A,
+            expires_at: NOW + TERM
+        })
     );
-    assert_eq!(lease.state(), LeaseState::Occupied { holder: HOLDER_A });
+    assert_eq!(
+        lease.state(),
+        LeaseState::Occupied {
+            holder: HOLDER_A,
+            expires_at: NOW + TERM
+        }
+    );
 }
 
 #[test]
@@ -325,13 +361,184 @@ fn lease_lifecycle_state_untouched_by_host() {
             .expect("lifecycle readable"),
         PanelState::Created
     );
-    host.acquire_panel_lease(id, generation, HOLDER_A)
+    host.acquire_panel_lease(id, generation, HOLDER_A, TERM, NOW)
         .expect("acquire");
     assert_eq!(
         host.panel_state(id, generation)
             .expect("lifecycle unchanged"),
         PanelState::Created
     );
+}
+
+// ── #1095: bounded tenure, tick clock, bus routing, write gate ──────────────
+
+#[test]
+fn lease_bounded_term_enforced_at_host() {
+    let mut host = host();
+    let (id, generation) = create_terminal(&mut host);
+    for bad_term in [0, MAX_LEASE_TERM_TICKS + 1] {
+        let denial = host
+            .acquire_panel_lease(id, generation, HOLDER_A, bad_term, NOW)
+            .expect_err("out-of-bound term must fail");
+        match &denial {
+            PanelError::LeaseDenied { reason, .. } => assert!(
+                reason.starts_with("invalid_term"),
+                "stable audit name first, got {reason}"
+            ),
+            other => panic!("expected LeaseDenied, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        host.panel_lease_state(id, generation),
+        Ok(LeaseState::Idle),
+        "refusals acquire nothing"
+    );
+    host.acquire_panel_lease(id, generation, HOLDER_A, MAX_LEASE_TERM_TICKS, NOW)
+        .expect("max term acquires");
+}
+
+#[test]
+fn lease_expiry_sweep_and_write_gate() {
+    let mut host = host();
+    let (id, generation) = create_terminal(&mut host);
+    host.acquire_panel_lease(id, generation, HOLDER_A, TERM, NOW)
+        .expect("acquire");
+    // Live tenure: the occupant may write.
+    assert!(
+        host.check_panel_write(id, generation, HOLDER_A, NOW)
+            .is_ok()
+    );
+    assert!(
+        !host
+            .lease_is_expired(id, generation, NOW)
+            .expect("expiry readable")
+    );
+    // Past the deadline: writes deny, the lapse is reported, and the lease
+    // still reads occupied until swept.
+    let denial = host
+        .check_panel_write(id, generation, HOLDER_A, NOW + TERM)
+        .expect_err("lapsed tenure writes nothing");
+    match &denial {
+        PanelError::LeaseDenied { reason, .. } => assert!(
+            reason.starts_with("expired"),
+            "stable audit name first, got {reason}"
+        ),
+        other => panic!("expected LeaseDenied, got {other:?}"),
+    }
+    assert!(
+        host.lease_is_expired(id, generation, NOW + TERM)
+            .expect("lapse readable")
+    );
+    assert_eq!(
+        host.panel_lease_state(id, generation),
+        Ok(LeaseState::Occupied {
+            holder: HOLDER_A,
+            expires_at: NOW + TERM
+        })
+    );
+    // Sweep moves the lapsed tenure back to idle and reports it.
+    assert_eq!(
+        host.sweep_expired_leases(NOW),
+        Vec::new(),
+        "live sweep moves nothing"
+    );
+    let swept = host.sweep_expired_leases(NOW + TERM);
+    assert_eq!(swept, vec![(id, LeaseEvent::Expired { holder: HOLDER_A })]);
+    assert_eq!(host.panel_lease_state(id, generation), Ok(LeaseState::Idle));
+    assert!(
+        host.check_panel_write(id, generation, HOLDER_A, NOW + TERM)
+            .is_err(),
+        "idle panels write nothing"
+    );
+    // The panel is acquirable again after the sweep.
+    host.acquire_panel_lease(id, generation, HOLDER_B, TERM, NOW + TERM)
+        .expect("re-acquire after sweep");
+}
+
+#[test]
+fn lease_transitions_route_to_bus() {
+    use bitty_runtime::registry::lease_event_topic;
+
+    let mut host = host();
+    let (id, generation) = create_terminal(&mut host);
+    let topic = lease_event_topic().expect("lease topic mints");
+    assert_eq!(topic.as_str(), "bitty.panel:lifecycle.lease-changed");
+    host.declare_topic(topic.as_str()).expect("topic declared");
+    host.grant_capability(id, generation, BUS_SUBSCRIBE_CAPABILITY)
+        .expect("subscribe capability");
+    host.subscribe(id, generation, &topic).expect("subscribed");
+    host.acquire_panel_lease(id, generation, HOLDER_A, TERM, NOW)
+        .expect("acquire");
+    let events = host
+        .drain_batch(id, generation, topic.as_str(), 8, 8192)
+        .expect("drain acquire event");
+    assert_eq!(events.len(), 1, "acquire routes exactly one bus event");
+    assert_eq!(events[0].topic, topic);
+    let payload = events[0].payload.as_str();
+    assert!(payload.contains("lease=acquired"), "{payload}");
+    assert!(payload.contains("holder-7"), "{payload}");
+    assert!(!payload.contains("Tracks"), "{payload}");
+    host.release_panel_lease(id, generation, HOLDER_A)
+        .expect("release");
+    let events = host
+        .drain_batch(id, generation, topic.as_str(), 8, 8192)
+        .expect("drain release event");
+    assert_eq!(events.len(), 1, "release routes exactly one bus event");
+    assert!(
+        events[0].payload.as_str().contains("lease=released"),
+        "{payload}"
+    );
+}
+
+// ── #1094: role sandbox gate at the spawn boundary ──────────────────────────
+
+#[test]
+fn spawn_role_sandbox_gate() {
+    use bitty_plugin_host::roles::{AgentRole, SandboxDecl};
+
+    let registry = JobRegistry::with_capacity(8);
+    let principal = owner("run-role-owner");
+    let sealed = SandboxDecl::sealed();
+    // Reviewers never reach the sandbox point.
+    let denial = registry
+        .spawn_checked_as_with_role(
+            principal.clone(),
+            helper_spec("quiet"),
+            OperationIntent::Execute,
+            AgentRole::Reviewer,
+            &sealed,
+        )
+        .expect_err("reviewer spawns nothing");
+    assert!(
+        matches!(denial, JobError::Denied { .. }),
+        "expected Denied, got {denial:?}"
+    );
+    // Testers claim nothing beyond sealed.
+    let net = SandboxDecl::new(false, true, false, true);
+    let denial = registry
+        .spawn_checked_as_with_role(
+            principal.clone(),
+            helper_spec("quiet"),
+            OperationIntent::Execute,
+            AgentRole::Tester,
+            &net,
+        )
+        .expect_err("tester claims no network");
+    assert!(
+        matches!(denial, JobError::Denied { .. }),
+        "expected Denied, got {denial:?}"
+    );
+    // A commander with a sealed declaration spawns the quiet child.
+    let id = registry
+        .spawn_checked_as_with_role(
+            principal.clone(),
+            helper_spec("quiet"),
+            OperationIntent::Execute,
+            AgentRole::Commander,
+            &sealed,
+        )
+        .expect("commander sealed spawn");
+    let _ = registry.cancel_as(&principal, id);
 }
 
 // ── RUN-22: sensitive-input interlock at the input boundary ─────────────────

@@ -114,20 +114,47 @@ on the same OQ-083 ruling; nothing here authorizes write-lease enforcement.
   holds no lease.
 - Reproduce: `cargo test -p bitty-runtime --test run_wiring lease_`.
 
+## Bounded tenure, tick clock, bus routing, write gate (CTX-0733)
+
+- Tenure: `acquire_panel_lease` names `term_ticks` host ticks starting at
+  `now`, capped at `MAX_LEASE_TERM_TICKS` (`invalid_term` otherwise);
+  `Occupied` carries `expires_at`; `handoff_panel_lease` preserves the
+  deadline (never extends); `sweep_expired_leases(now)` moves lapsed
+  tenures back to `Idle` with `Expired` events in ascending panel order.
+- Clock: host-supplied monotonic `u64` ticks on every entry (same pattern
+  as the routable ledger's `now_ticks`); the kernel compares ticks but
+  never reads a clock. `lease_is_expired` reports the lapse without
+  changing the lease.
+- Bus routing: every successful transition (acquire, release, handoff,
+  sweep) publishes `bitty.panel:lifecycle.lease-changed`
+  (`lease_event_topic`, grammar-minted) with an id-only payload
+  (`panel=<id> lease=<audit-name> holder=<tag> expires_at=<ticks|->`,
+  never panel content); no subscribers means no-op, never failure.
+- Write gate: `check_panel_write` is the enforcement call site panel
+  write surfaces gate on (occupant plus live tenure; `not_occupied` /
+  `not_holder` / `expired` denials with the stable kernel audit name).
+- Reproduce: `cargo test -p bitty-runtime --lib lease::` (18 kernel
+  tests) plus `cargo test -p bitty-runtime --test run_wiring
+  lease_bounded_term_enforced_at_host lease_expiry_sweep_and_write_gate
+  lease_transitions_route_to_bus`.
+
 ## Gates
 
 - `cargo fmt --check`, `cargo clippy --workspace --all-targets` with
   `-D warnings`, and `cargo test -p bitty-runtime` stay green.
-- The kernel is pure and deterministic: no wall-clock, no randomness, no
-  platform handle, no bus traffic.
+- The kernel is pure and deterministic: host-supplied ticks, no wall-clock,
+  no randomness, no platform handle. Bus traffic is host-routed
+  (`route_lease_event`); the kernel itself emits no bus events.
 
 ## Open points (owner ruling needed)
 
-OQ-083 must still accept: the bounded lease term and expiry behavior; the
-event-bus kinds, routing, and delivery semantics (shared with OQ-058); the
-Stable Id hierarchy composition; roaming vocabulary; and the SEC-26
-write-lease enforcement built on this evidence. Until that ruling, C-1–C-3
-are design candidates and authorize no bus or enforcement work.
+OQ-083 must still accept: the Stable Id hierarchy composition; roaming
+vocabulary; and the SEC-26 write-lease enforcement built on this evidence
+(the `check_panel_write` call site exists; panel write surfaces must now
+gate on it). Until that ruling, the composition and roaming points stay
+design candidates. The bounded term, tick clock, bus topic/routing, and
+write-gate slice above (CTX-0733) is implementation evidence for #1095,
+not a substitute for the OQ-083 ruling.
 
 ## Verdict
 

@@ -28,6 +28,17 @@
 //!   validated [`AgentMessage`](super::routable::AgentMessage) envelope
 //!   (identity, attribution, deadline, priority, dedup, cancel, expiry).
 //!
+//! - Scene consumption (`OQ-051` Accepted, issues #985 CW-06 / #990 CW-11):
+//!   the host owns the per-panel [`Scene`](bitty_rich::scene::Scene) slots
+//!   and the leaf-to-paint derivation. [`PanelRuntime::attach_panel_scene`]
+//!   binds a scene to a live panel handle (stale handles fail closed),
+//!   [`PanelRuntime::scene_present_for`] budgets the attached scene for one
+//!   present frame (missing scene yields the empty budget, never a crash),
+//!   and [`PanelRuntime::nonterminal_for_leaf`] maps `Panel`/`Browser`/
+//!   `Rich` leaves to the beyond-grid payload (`Terminal`/`Empty` stay on
+//!   the grid path). The render pipeline consumes this contract through
+//!   [`Runtime::cw_present_plan_for_host`](crate::runtime::Runtime::cw_present_plan_for_host).
+//!
 //! The runtime holds no PTY descriptor, GPU object, or OS window handle;
 //! those remain with `bitty-pty`, `bitty-render`, and `bitty-platform`.
 //! Every failure is fail-closed and typed: the previous valid state is
@@ -43,10 +54,16 @@
 //! through the routable ledger, so the accepted contracts have live
 //! consumers outside unit tests.
 
+use bitty_rich::scene::Scene;
 use bitty_ui::ViewId;
 use bitty_ui::placement::{Placement, PlacementError};
+use bitty_ui::uitree::UiNodeId;
 
 use std::collections::HashMap;
+
+use crate::cw_present::{
+    NonTerminalPresent, ScenePresent, consume_scene_present, nonterminal_for_content,
+};
 
 use crate::execution::{
     LeaseError, LeaseEvent, LeaseHolder, LeaseState, PanelLease, validate_description,
@@ -97,6 +114,17 @@ pub struct PanelRuntime {
     /// true, and holder tags are opaque [`LeaseHolder`] values the caller
     /// assigns.
     leases: HashMap<super::panel::PanelId, PanelLeaseEntry>,
+    /// Render-scene slots (OQ-051, issues #985 CW-06 / #990 CW-11): at most
+    /// one [`Scene`] per live panel, consumed by the render pipeline
+    /// through [`PanelRuntime::scene_present_for`]. Follows the lease-table
+    /// discipline: entries are keyed by [`PanelId`](super::panel::PanelId),
+    /// replaced on re-attach, and cleared at
+    /// [`PanelRuntime::dispose_panel`] so a scene can never outlive its
+    /// leaf. The slot count inherits the registry window panel budget (one
+    /// slot per panel at most), and each scene carries its own `SCN-1..5`
+    /// insert-time bounds. A missing entry is not an error: the render
+    /// path budgets the empty scene instead (fail-closed, never a crash).
+    scenes: HashMap<super::panel::PanelId, Scene>,
 }
 
 /// Per-panel lease binding: the transition kernel plus the validated
@@ -142,6 +170,7 @@ impl PanelRuntime {
             providers: PanelProviderRegistry::new(),
             routable: RoutableLedger::new(),
             leases: HashMap::new(),
+            scenes: HashMap::new(),
         })
     }
 
@@ -268,6 +297,10 @@ impl PanelRuntime {
     /// holds no lease, and a later panel reusing the id is issued a fresh
     /// `Idle` lease at [`PanelRuntime::create_panel`].
     ///
+    /// Also clears the panel's render scene (OQ-051, #985/#990): a disposed
+    /// panel paints nothing, and a later panel reusing the id starts with
+    /// no scene until [`PanelRuntime::attach_panel_scene`] binds one.
+    ///
     /// # Errors
     ///
     /// [`PanelError::StaleHandle`] or [`PanelError::NotFound`].
@@ -280,6 +313,7 @@ impl PanelRuntime {
         if result.is_ok() {
             let _ = self.placement.unbind(id);
             self.leases.remove(&id);
+            self.scenes.remove(&id);
         }
         result
     }
@@ -771,6 +805,93 @@ impl PanelRuntime {
     pub fn routable_len(&self) -> usize {
         self.routable.len()
     }
+
+    /// Attaches a render scene to a live panel (OQ-051, issues #985/#990).
+    ///
+    /// The handle generation is validated first (`StaleHandle` before any
+    /// scene access, like every other host entry); re-attaching replaces
+    /// the previous scene. Any live panel state (`Created`, `Mounted`,
+    /// `Suspended`, ...) may carry a scene — attachment is paint content,
+    /// not lifecycle.
+    ///
+    /// # Errors
+    ///
+    /// [`PanelError::StaleHandle`] or [`PanelError::NotFound`] when the
+    /// handle is not live. Failures leave the previous scene (if any) in
+    /// place.
+    pub fn attach_panel_scene(
+        &mut self,
+        handle: super::panel::PanelHandle,
+        scene: Scene,
+    ) -> Result<(), PanelError> {
+        self.registry.panel_state(handle.id, handle.generation)?;
+        self.scenes.insert(handle.id, scene);
+        Ok(())
+    }
+
+    /// Borrows the render scene attached to `id`, if any (OQ-051, #985).
+    ///
+    /// A missing entry is not an error: panels without scene content keep
+    /// the grid path, and the render pipeline budgets the empty scene
+    /// instead (see [`PanelRuntime::scene_present_for`]).
+    #[must_use]
+    pub fn panel_scene(&self, id: super::panel::PanelId) -> Option<&Scene> {
+        self.scenes.get(&id)
+    }
+
+    /// Detaches the render scene from `id`, if one is attached.
+    ///
+    /// Returns `true` when a scene was removed. Detach is always safe and
+    /// idempotent: the panel keeps the grid path afterwards.
+    pub fn detach_panel_scene(&mut self, id: super::panel::PanelId) -> bool {
+        self.scenes.remove(&id).is_some()
+    }
+
+    /// Number of panels with an attached render scene.
+    #[must_use]
+    pub fn panel_scene_len(&self) -> usize {
+        self.scenes.len()
+    }
+
+    /// Derives the one-frame scene paint budget for a leaf (OQ-051, #985).
+    ///
+    /// `Panel` leaves budget their attached scene through
+    /// [`consume_scene_present`]; a panel with no attached scene yields the
+    /// empty budget (missing scene is fail-closed, never a crash).
+    /// `Terminal`, `Empty`, `Browser`, and `Rich` leaves yield the empty
+    /// budget: terminal content stays on the grid path, and browser/rich
+    /// surfaces carry no host-owned scene slot (their beyond-grid content
+    /// is described by [`PanelRuntime::nonterminal_for_leaf`]).
+    #[must_use]
+    pub fn scene_present_for(
+        &self,
+        content: super::panel::ViewContent,
+        paint_cap: usize,
+    ) -> ScenePresent {
+        match content {
+            super::panel::ViewContent::Panel(id) => match self.scenes.get(&id) {
+                Some(scene) => consume_scene_present(scene, paint_cap),
+                None => ScenePresent::default(),
+            },
+            _ => ScenePresent::default(),
+        }
+    }
+
+    /// Maps leaf content to its beyond-grid present payload (OQ-051, #990).
+    ///
+    /// Delegates to [`nonterminal_for_content`]: `Panel`, `Browser`, and
+    /// `Rich` leaves yield a payload addressed by the canonical
+    /// [`UiNodeId`]; `Terminal` and `Empty` yield `None` so those leaves
+    /// keep the grid path. Like hint batches, the payload consumes zero
+    /// overlay slots.
+    #[must_use]
+    pub fn nonterminal_for_leaf(
+        content: super::panel::ViewContent,
+        node: UiNodeId,
+        items: usize,
+    ) -> Option<NonTerminalPresent> {
+        nonterminal_for_content(content, node, items)
+    }
 }
 
 /// Maps a [`PlacementError`] bind failure onto the host [`PanelError`]
@@ -959,5 +1080,197 @@ mod tests {
             host.panel_state(handle.id, handle.generation),
             Err(PanelError::NotFound { .. })
         ));
+    }
+
+    // ------------------------------------------------------------------
+    // OQ-051 scene-consumption contract (issues #985 CW-06 / #990 CW-11)
+    // ------------------------------------------------------------------
+
+    use bitty_rich::scene::{
+        BlockAnchor, BlockId, RichBlock, SceneNode, ScrollBehavior, StyledSpan,
+    };
+    use bitty_ui::panel::BrowserSurfaceId;
+
+    fn scene_with_blocks(count: u64) -> Scene {
+        let mut scene = Scene::new();
+        for id in 1..=count {
+            let block = RichBlock::new(
+                BlockId(id),
+                BlockAnchor::Zone(id),
+                SceneNode::Text(StyledSpan {
+                    text: format!("block {id}"),
+                    bold: false,
+                    italic: false,
+                }),
+                ScrollBehavior::Inline,
+                1,
+                1,
+                1,
+            )
+            .expect("test block fits scene caps");
+            scene.insert(block).expect("test scene fits scene caps");
+        }
+        scene
+    }
+
+    #[test]
+    fn scene_attach_lookup_detach_round_trip() {
+        let mut host = runtime();
+        let handle = host
+            .create_panel(PanelType::Rich, Some(workspace()))
+            .unwrap();
+        // No scene yet: grid path, not an error.
+        assert!(host.panel_scene(handle.id).is_none());
+        assert_eq!(host.panel_scene_len(), 0);
+        assert!(!host.detach_panel_scene(handle.id));
+
+        host.attach_panel_scene(handle, scene_with_blocks(2))
+            .unwrap();
+        assert_eq!(host.panel_scene_len(), 1);
+        assert_eq!(host.panel_scene(handle.id).expect("attached").len(), 2);
+
+        assert!(host.detach_panel_scene(handle.id));
+        assert!(host.panel_scene(handle.id).is_none());
+        assert_eq!(host.panel_scene_len(), 0);
+        // Detach stays idempotent: the panel keeps the grid path.
+        assert!(!host.detach_panel_scene(handle.id));
+    }
+
+    #[test]
+    fn scene_attach_replaces_previous() {
+        let mut host = runtime();
+        let handle = host
+            .create_panel(PanelType::Rich, Some(workspace()))
+            .unwrap();
+        host.attach_panel_scene(handle, scene_with_blocks(1))
+            .unwrap();
+        host.attach_panel_scene(handle, scene_with_blocks(3))
+            .unwrap();
+        assert_eq!(host.panel_scene_len(), 1);
+        assert_eq!(host.panel_scene(handle.id).expect("replaced").len(), 3);
+    }
+
+    #[test]
+    fn scene_attach_rejects_stale_handle_fail_closed() {
+        let mut host = runtime();
+        let handle = host
+            .create_panel(PanelType::Rich, Some(workspace()))
+            .unwrap();
+        host.attach_panel_scene(handle, scene_with_blocks(1))
+            .unwrap();
+        let stale = Generation(handle.generation.0.wrapping_add(1000).max(1));
+        assert!(matches!(
+            host.attach_panel_scene(
+                super::super::panel::PanelHandle {
+                    id: handle.id,
+                    generation: stale,
+                },
+                scene_with_blocks(2),
+            ),
+            Err(PanelError::StaleHandle { .. })
+        ));
+        // The previous scene survives the refused attach.
+        assert_eq!(host.panel_scene(handle.id).expect("retained").len(), 1);
+    }
+
+    #[test]
+    fn scene_attach_rejects_disposed_panel() {
+        let mut host = runtime();
+        let handle = host
+            .create_panel(PanelType::Rich, Some(workspace()))
+            .unwrap();
+        host.dispose_panel(handle.id, handle.generation).unwrap();
+        assert!(matches!(
+            host.attach_panel_scene(handle, scene_with_blocks(1)),
+            Err(PanelError::NotFound { .. })
+        ));
+        assert_eq!(host.panel_scene_len(), 0);
+    }
+
+    #[test]
+    fn scene_dispose_clears_scene() {
+        let mut host = runtime();
+        let handle = host
+            .create_panel(PanelType::Rich, Some(workspace()))
+            .unwrap();
+        host.attach_panel_scene(handle, scene_with_blocks(2))
+            .unwrap();
+        host.dispose_panel(handle.id, handle.generation).unwrap();
+        // A disposed panel paints nothing: the scene cannot outlive its leaf.
+        assert!(host.panel_scene(handle.id).is_none());
+        assert_eq!(host.panel_scene_len(), 0);
+    }
+
+    #[test]
+    fn scene_present_for_budgets_attached_scene_and_sheds_tail() {
+        let mut host = runtime();
+        let handle = host
+            .create_panel(PanelType::Rich, Some(workspace()))
+            .unwrap();
+        host.attach_panel_scene(handle, scene_with_blocks(3))
+            .unwrap();
+        let content = ViewContent::Panel(handle.id);
+        let full = host.scene_present_for(content, 64);
+        assert_eq!(full.block_ids, vec![BlockId(1), BlockId(2), BlockId(3)]);
+        assert_eq!(full.shed, 0);
+        let capped = host.scene_present_for(content, 2);
+        assert_eq!(capped.block_ids, vec![BlockId(1), BlockId(2)]);
+        assert_eq!(capped.shed, 1);
+    }
+
+    #[test]
+    fn scene_present_for_missing_scene_and_grid_leaves_yield_empty() {
+        let mut host = runtime();
+        let handle = host
+            .create_panel(PanelType::Rich, Some(workspace()))
+            .unwrap();
+        // Panel with no attached scene: empty budget, never a crash.
+        let missing = host.scene_present_for(ViewContent::Panel(handle.id), 64);
+        assert_eq!(missing, ScenePresent::default());
+        // Non-scene leaves stay on the grid path with the empty budget.
+        for content in [
+            ViewContent::Terminal(7),
+            ViewContent::Empty,
+            ViewContent::Browser(BrowserSurfaceId::new(9)),
+            ViewContent::Rich(11),
+        ] {
+            assert_eq!(host.scene_present_for(content, 64), ScenePresent::default());
+        }
+    }
+
+    #[test]
+    fn nonterminal_for_leaf_maps_content_split() {
+        let node = UiNodeId::new(3);
+        // Panel/Browser/Rich leaves carry the beyond-grid payload.
+        let panel = PanelRuntime::nonterminal_for_leaf(
+            ViewContent::Panel(super::super::panel::PanelId::new(9)),
+            node,
+            5,
+        )
+        .expect("panel leaf has beyond-grid content");
+        assert_eq!(panel.panel, 9);
+        assert_eq!(panel.node, node);
+        assert_eq!(panel.items, 5);
+        assert!(!panel.truncated);
+        assert_eq!(panel.overlay_cost(), 0);
+        let browser = PanelRuntime::nonterminal_for_leaf(
+            ViewContent::Browser(BrowserSurfaceId::new(9)),
+            node,
+            0,
+        )
+        .expect("browser leaf has beyond-grid content");
+        assert_eq!(browser.panel, 9);
+        assert!(PanelRuntime::nonterminal_for_leaf(ViewContent::Rich(11), node, 0).is_some());
+        // Saturation is flagged, never silent.
+        let saturated = PanelRuntime::nonterminal_for_leaf(
+            ViewContent::Panel(super::super::panel::PanelId::new(9)),
+            node,
+            usize::MAX,
+        )
+        .expect("saturation still yields a payload");
+        assert!(saturated.truncated);
+        // Terminal/Empty leaves keep the grid path: no payload.
+        assert!(PanelRuntime::nonterminal_for_leaf(ViewContent::Terminal(7), node, 5).is_none());
+        assert!(PanelRuntime::nonterminal_for_leaf(ViewContent::Empty, node, 5).is_none());
     }
 }

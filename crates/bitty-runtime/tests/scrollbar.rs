@@ -33,12 +33,12 @@ use bitty_runtime::{
 use bitty_ui::scrollbar::TrackRect;
 
 /// Default decorated track in physical pixels: 80x24 cells of 9x19px, 8px
-/// padding, unified decoration `6/6/2/6/6` (gaps_out 6 + border 2 + content
-/// inset 6 inset the content frame to `(14, 14, 692, 428)`; right edge
-/// 14 + 692 = 706, thumb 8 wide).
-const TRACK_X: f64 = 706.0;
-const TRACK_Y: f64 = 22.0;
-const TRACK_H: f64 = 428.0;
+/// padding, unified decoration `6/6/1/6/6` (gaps_out 6 + border 1 + content
+/// inset 6 inset the content frame to `(13, 13, 694, 430)`; right edge
+/// 13 + 694 = 707, thumb 8 wide).
+const TRACK_X: f64 = 707.0;
+const TRACK_Y: f64 = 21.0;
+const TRACK_H: f64 = 430.0;
 
 fn window() -> WindowId {
     WindowId::from_raw_public(1)
@@ -237,10 +237,10 @@ fn always_paints_exactly_one_thumb_fill_with_scrollback() {
     assert_eq!(
         shown.scrollbar_track(),
         Some(TrackRect {
-            x: 706,
-            y: 22,
+            x: 707,
+            y: 21,
             width: 8,
-            height: 428,
+            height: 430,
         })
     );
 }
@@ -355,16 +355,16 @@ fn gaps_and_padding_shift_hit_testing() {
         "outer gap must move the track"
     );
     // The resolved track hugs the decorated content frame (outer cell gap
-    // plus decoration gaps_out 6, border 2, content inset 6) translated by
-    // the 8px pad: content (23, 33, 674, 390) -> right edge
-    // 8 + 23 + 674 - 8 = 697.
+    // plus decoration gaps_out 6, border 1, content inset 6) translated by
+    // the 8px pad: content (22, 32, 676, 392) -> right edge
+    // 8 + 22 + 676 - 8 = 698.
     assert_eq!(
         track,
         TrackRect {
-            x: 697,
-            y: 41,
+            x: 698,
+            y: 40,
             width: 8,
-            height: 390,
+            height: 392,
         },
         "track must follow the decorated content frame plus padding"
     );
@@ -389,7 +389,7 @@ fn gaps_and_padding_shift_hit_testing() {
     release(&mut rt);
 
     // CTX-0223: zero padding puts the track flush at the decorated content
-    // edge (default decoration: content (14, 14, 692, 428) -> x 698, y 14).
+    // edge (default decoration: content (13, 13, 694, 430) -> x 699, y 13).
     let mut bare = runtime_with_config(RuntimeConfig {
         scrollbar_mode: ScrollbarMode::Always,
         window_padding: 0,
@@ -400,10 +400,10 @@ fn gaps_and_padding_shift_hit_testing() {
     assert_eq!(
         bare.scrollbar_track(),
         Some(TrackRect {
-            x: 698,
-            y: 14,
+            x: 699,
+            y: 13,
             width: 8,
-            height: 428,
+            height: 430,
         })
     );
 }
@@ -474,10 +474,10 @@ fn scrollbar_width_scales_track_and_thumb() {
         let track = rt.scrollbar_track().expect("track");
         assert_eq!(track.width, width, "track carries the configured width");
         // Right edge hugs the decorated content frame at default padding:
-        // x = 8px pad + 14px content origin + 692px content - width.
-        assert_eq!(track.x, 714 - width as i32);
-        assert_eq!(track.y, 22);
-        assert_eq!(track.height, 428);
+        // x = 8px pad + 13px content origin + 694px content - width.
+        assert_eq!(track.x, 715 - width as i32);
+        assert_eq!(track.y, 21);
+        assert_eq!(track.height, 430);
 
         // The painted thumb is exactly `width` physical pixels wide: sample
         // one row inside the thumb near the live (bottom) position and count
@@ -531,16 +531,16 @@ fn scrollbar_width_scales_track_and_thumb() {
 fn track_follows_decorated_content_frame_defaults_and_zero() {
     // CTX-0313: the track hugs the decorated content frame the live present
     // paints (CTX-0294), not the raw cell allocation. Unified decoration
-    // `6/6/2/6/6` insets the content frame to `(14, 14, 692, 428)` before the
-    // 8px padding: track top 22, right edge 8 + 14 + 692 - 8 = 706.
+    // `6/6/1/6/6` insets the content frame to `(13, 13, 694, 430)` before the
+    // 8px padding: track top 21, right edge 8 + 13 + 694 - 8 = 707.
     for (decoration, expected) in [
         (
             Decoration::default(),
             TrackRect {
-                x: 706,
-                y: 22,
+                x: 707,
+                y: 21,
                 width: 8,
-                height: 428,
+                height: 430,
             },
         ),
         (
@@ -634,16 +634,16 @@ fn split_inner_gap_moves_track_to_focused_content_frame() {
     assert!(sb > 0, "need scrollback for the test");
     rt.tick().expect("presents");
     // Outer gaps_out 6 splits the 720px area into frames inset 6, then the
-    // 6px inner band leaves two 351px frames; border 2 + content inset 6
-    // shrink each content to (14, 14, 335, 428) and (371, 14, 335, 428);
+    // 6px inner band leaves two 351px frames; border 1 + content inset 6
+    // shrink each content to (13, 13, 337, 430) and (370, 13, 337, 430);
     // track right edge = content + 8px pad.
     assert_eq!(
         rt.scrollbar_track(),
         Some(TrackRect {
-            x: 349,
-            y: 22,
+            x: 350,
+            y: 21,
             width: 8,
-            height: 428,
+            height: 430,
         }),
         "focused first leaf"
     );
@@ -651,10 +651,10 @@ fn split_inner_gap_moves_track_to_focused_content_frame() {
     assert_eq!(
         rt.scrollbar_track(),
         Some(TrackRect {
-            x: 706,
-            y: 22,
+            x: 707,
+            y: 21,
             width: 8,
-            height: 428,
+            height: 430,
         }),
         "focused second leaf"
     );

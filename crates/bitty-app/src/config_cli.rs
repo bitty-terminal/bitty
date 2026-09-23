@@ -449,8 +449,8 @@ pub(crate) fn starter_init_lua() -> &'static str {
      \x20\x20-- around views (unified 6/6 so panel-panel matches panel-\n\
      \x20\x20-- terminal), border inside each View frame, corner radius, and\n\
      \x20\x20-- content_inset padding between the border and the text.\n\
-     \x20\x20-- Defaults 6/6/2/6/6; safe mode forces 0/0/1/0/0.\n\
-     \x20\x20-- decoration = { gaps_in = 6, gaps_out = 6, border = 2, radius = 6, content_inset = 6 },\n\
+     \x20\x20-- Defaults 6/6/1/6/6; safe mode forces 0/0/1/0/0.\n\
+     \x20\x20-- decoration = { gaps_in = 6, gaps_out = 6, border = 1, radius = 6, content_inset = 6 },\n\
      \x20\x20-- Focused/idle outline colors (CTX-0340): '#RRGGBB' or\n\
      \x20\x20-- '#RRGGBBAA'. border_color sets both states; the focused/idle\n\
      \x20\x20-- keys override it per state. Defaults #33CCFF / #595959AA.\n\

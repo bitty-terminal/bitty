@@ -259,7 +259,7 @@ fn golden_synchronized_update_commit_frame() {
     let commit = rt.tick_at(t0 + Duration::from_millis(1)).expect("commit");
     let actual = digest(&rt, &commit);
     assert_eq!(
-        actual, 0xef47_e015_6a5e_7b63,
+        actual, 0x636f_64b4_dce4_c871,
         "synchronized-update commit digest changed (actual 0x{actual:016x})"
     );
 }

@@ -69,8 +69,8 @@ fn dump_evidence(name: &str, rgba: &[u8], width: u32, height: u32) {
 
 #[test]
 fn present_frames_apply_logical_decoration_at_live_scale() {
-    // Unified 6/6/2/6/6 at 9x19 cells, 80x24 container: frame inset 6px,
-    // content inset by border 2 + content inset 6 = 8px more; content grid
+    // Unified 6/6/1/6/6 at 9x19 cells, 80x24 container: frame inset 6px,
+    // content inset by border 1 + content inset 6 = 7px more; content grid
     // floors the remainder.
     let mut rt = runtime_with(Decoration::default());
     single_leaf(&mut rt);
@@ -82,14 +82,14 @@ fn present_frames_apply_logical_decoration_at_live_scale() {
     assert_eq!(frame.frame.y, 6);
     assert_eq!(frame.frame.width, 708);
     assert_eq!(frame.frame.height, 444);
-    assert_eq!(frame.content.x, 14);
-    assert_eq!(frame.content.y, 14);
-    assert_eq!(frame.content.width, 692);
-    assert_eq!(frame.content.height, 428);
-    // 692 = 76 * 9 + 8 remainder; 428 = 22 * 19 + 10.
-    assert_eq!(frame.cols, 76);
+    assert_eq!(frame.content.x, 13);
+    assert_eq!(frame.content.y, 13);
+    assert_eq!(frame.content.width, 694);
+    assert_eq!(frame.content.height, 430);
+    // 694 = 77 * 9 + 1 remainder; 430 = 22 * 19 + 12.
+    assert_eq!(frame.cols, 77);
     assert_eq!(frame.rows, 22);
-    assert_eq!(frame.border, 2);
+    assert_eq!(frame.border, 1);
     assert_eq!(frame.radius, 6);
 }
 
@@ -118,25 +118,25 @@ fn live_present_paints_gap_bands_border_ring_and_fractional_remainder() {
             "gaps_out must be bg at x={x}"
         );
     }
-    // Border ring: the 2px band after the outer gap.
+    // Border ring: the 1px band after the outer gap (#1342 thin default).
     assert_eq!(probe(&rgba, width, pad + 6, y), border, "border ring left");
     assert_eq!(
         probe(&rgba, width, pad + 7, y),
-        border,
-        "border ring left 2"
+        bg,
+        "content inset starts right after the 1px ring"
     );
     assert_eq!(
         probe(&rgba, width, pad + 6 + 708 - 1, y),
         border,
         "border ring right"
     );
-    // The border+inset band is background: content starts at pad + 14
-    // (gaps_out 6 + border 2 + content_inset 6).
-    assert_eq!(probe(&rgba, width, pad + 14, y), bg, "content start");
-    // Sub-cell remainder: content width 692 = 76 * 9 + 8; the trailing 8px
+    // The border+inset band is background: content starts at pad + 13
+    // (gaps_out 6 + border 1 + content_inset 6).
+    assert_eq!(probe(&rgba, width, pad + 13, y), bg, "content start");
+    // Sub-cell remainder: content width 694 = 77 * 9 + 1; the trailing 1px
     // band stays background.
     assert_eq!(
-        probe(&rgba, width, pad + 14 + 684 + 1, y),
+        probe(&rgba, width, pad + 13 + 693, y),
         bg,
         "fractional-cell remainder stays bg"
     );
@@ -278,11 +278,11 @@ fn decorated_hit_testing_uses_frame_for_hit_and_content_for_cells() {
     let mut rt = runtime_with(Decoration::default());
     single_leaf(&mut rt);
     let pad = rt.window_padding_physical() as f64;
-    // Content starts at gaps_out 6 + border 2 + content_inset 6 = 14px.
+    // Content starts at gaps_out 6 + border 1 + content_inset 6 = 13px.
     // A position inside the content maps to the content-local cell.
     let inside = CursorPosition {
-        x: pad + 14.0 + 9.0 * 2.0 + 1.0,
-        y: pad + 14.0 + 19.0 * 4.0 + 1.0,
+        x: pad + 13.0 + 9.0 * 2.0 + 1.0,
+        y: pad + 13.0 + 19.0 * 4.0 + 1.0,
     };
     assert_eq!(
         rt.cursor_to_present_cell(inside),
@@ -290,12 +290,12 @@ fn decorated_hit_testing_uses_frame_for_hit_and_content_for_cells() {
     );
     // The global mapping subtracts the outer gap plus border plus inset.
     assert_eq!(rt.cursor_to_cell(inside), CellPos::new(4, 2));
-    // A position over the border ring still hits the frame and clamps to
-    // the first content cell (spec rule 4: radius never widens hit testing
-    // beyond the frame).
+    // A position over the 1px border ring still hits the frame and clamps
+    // to the first content cell (spec rule 4: radius never widens hit
+    // testing beyond the frame).
     let on_border = CursorPosition {
-        x: pad + 7.0,
-        y: pad + 14.0 + 19.0 * 4.0 + 1.0,
+        x: pad + 6.5,
+        y: pad + 13.0 + 19.0 * 4.0 + 1.0,
     };
     assert_eq!(
         rt.cursor_to_present_cell(on_border),
@@ -304,7 +304,7 @@ fn decorated_hit_testing_uses_frame_for_hit_and_content_for_cells() {
     // A position in the outer gap band belongs to no pane.
     let in_gap = CursorPosition {
         x: pad + 3.0,
-        y: pad + 14.0 + 19.0 * 4.0 + 1.0,
+        y: pad + 13.0 + 19.0 * 4.0 + 1.0,
     };
     assert_eq!(rt.cursor_to_present_cell(in_gap), None);
     // Over the window padding band: no pane.
@@ -366,18 +366,18 @@ fn live_present_paints_focused_then_idle_outline_per_pane() {
     let idle = bitty_runtime::config::DEFAULT_OUTLINE_IDLE;
     assert_eq!(focused, [0x33, 0xCC, 0xFF, 0xFF]);
     assert_eq!(idle, [0x59, 0x59, 0x59, 0xAA]);
-    // Focused pane's left ring band (frame.x + 0..border).
+    // Focused pane's 1px ring band (frame.x + 0).
     let f = &frames[0];
-    let focus_x = pad + usize::try_from(f.frame.x).unwrap() + 1;
+    let focus_x = pad + usize::try_from(f.frame.x).unwrap();
     let y = pad + usize::try_from(f.frame.y).unwrap() + 100;
     assert_eq!(
         probe(&rgba, width, focus_x, y),
         focused,
         "focused pane paints the accent outline"
     );
-    // Idle pane's left ring band composites the translucent idle over bg.
+    // Idle pane's 1px ring band composites the translucent idle over bg.
     let idle_frame = &frames[1];
-    let idle_x = pad + usize::try_from(idle_frame.frame.x).unwrap() + 1;
+    let idle_x = pad + usize::try_from(idle_frame.frame.x).unwrap();
     let got = probe(&rgba, width, idle_x, y);
     // The idle outline is translucent gray composited over the background;
     // the software compositor rounds within one byte of the sRGB composite
@@ -579,11 +579,11 @@ fn per_view_outline_overrides_paint_only_their_panel() {
     // Focused View 1 uses the global focused color (no rule matches it).
     let fy = pad + usize::try_from(frames[0].frame.y).unwrap() + 100;
     let fx0 = pad + usize::try_from(frames[0].frame.x).unwrap();
-    assert_eq!(probe(&rgba, width, fx0 + 1, fy), [0xFF, 0x00, 0x00, 0xFF]);
+    assert_eq!(probe(&rgba, width, fx0, fy), [0xFF, 0x00, 0x00, 0xFF]);
     // Idle View 2 uses its own idle override, not the global idle color.
     let iy = pad + usize::try_from(frames[1].frame.y).unwrap() + 100;
     let ix0 = pad + usize::try_from(frames[1].frame.x).unwrap();
-    assert_eq!(probe(&rgba, width, ix0 + 1, iy), [0xFF, 0xFF, 0x00, 0xFF]);
+    assert_eq!(probe(&rgba, width, ix0, iy), [0xFF, 0xFF, 0x00, 0xFF]);
 }
 
 #[test]
@@ -619,10 +619,10 @@ fn per_view_rule_follows_the_selector_across_focus() {
     let pad = usize::try_from(rt.window_padding_physical()).expect("pad fits");
     let fy = pad + usize::try_from(frames[1].frame.y).unwrap() + 100;
     let fx0 = pad + usize::try_from(frames[1].frame.x).unwrap();
-    assert_eq!(probe(&rgba, width, fx0 + 1, fy), [0x00, 0x00, 0xFF, 0xFF]);
+    assert_eq!(probe(&rgba, width, fx0, fy), [0x00, 0x00, 0xFF, 0xFF]);
     let iy = pad + usize::try_from(frames[0].frame.y).unwrap() + 100;
     let ix0 = pad + usize::try_from(frames[0].frame.x).unwrap();
-    assert_eq!(probe(&rgba, width, ix0 + 1, iy), [0x00, 0xFF, 0x00, 0xFF]);
+    assert_eq!(probe(&rgba, width, ix0, iy), [0x00, 0xFF, 0x00, 0xFF]);
 }
 
 #[test]

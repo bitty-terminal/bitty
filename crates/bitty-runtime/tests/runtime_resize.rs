@@ -112,9 +112,9 @@ fn invalid_dpi_scales_are_sanitized_fail_safe() {
         let snap = rt.snapshot();
         assert_eq!(
             (snap.width, snap.height),
-            (83, 28),
+            (84, 28),
             "unscaled 9x19 cells over 800x600 minus the 8px padding inset \
-             and the 14px per-side decoration inset (CTX-0375)"
+             and the 13px per-side decoration inset (CTX-0375)"
         );
         assert_eq!(rt.surface_extent(), Some(PhysicalSize::new(800, 600)));
         assert!(rt.tick().is_some(), "window stays drawable");
@@ -195,15 +195,15 @@ fn repeated_rescales_start_from_design_base_without_drift() {
     rt.apply_dpi_scale(2.0, Some(PhysicalSize::new(1600, 1200)));
     let scaled = rt.snapshot();
     // 9x19 base at 2x -> 18x38 cells, physical padding round(8 * 2) =
-    // 16px per side (CTX-0223) and decoration round(14 * 2) = 28px per
-    // side (CTX-0375): (1600-32-56)/18=83, (1200-32-56)/38=28.
-    assert_eq!((scaled.width, scaled.height), (83, 28));
+    // 16px per side (CTX-0223) and decoration round(13 * 2) = 26px per
+    // side (CTX-0375): 84x28 (87x30 container cells minus the 52px insets).
+    assert_eq!((scaled.width, scaled.height), (84, 28));
     // Back to 1.0 must restore the exact base grid, not a rounded echo.
-    // Padding is 8px per side and decoration 14px per side again:
-    // (1600-16-28)/9=172, (1200-16-28)/19=60.
+    // Padding is 8px per side and decoration 13px per side again:
+    // (1600-16-26)/9=173, (1200-16-26)/19=60.
     rt.apply_dpi_scale(1.0, Some(PhysicalSize::new(1600, 1200)));
     let restored = rt.snapshot();
-    assert_eq!((restored.width, restored.height), (172, 60));
+    assert_eq!((restored.width, restored.height), (173, 60));
     assert_eq!(rt.dpi_scale(), 1.0);
 }
 
@@ -215,9 +215,9 @@ fn resized_after_scale_uses_scaled_cells() {
         .expect("valid resize");
     let snap = rt.snapshot();
     // 18x38 scaled cells minus the 16px physical padding per side
-    // (CTX-0223) and the 28px decoration inset per side (CTX-0375):
-    // (800-32-56)/18=38, (600-32-56)/38=12.
-    assert_eq!((snap.width, snap.height), (38, 12));
+    // (CTX-0223) and the 26px decoration inset per side (CTX-0375):
+    // 39x12 (42x14 container cells minus the 52px insets).
+    assert_eq!((snap.width, snap.height), (39, 12));
 }
 
 #[test]

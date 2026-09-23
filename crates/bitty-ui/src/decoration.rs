@@ -5,7 +5,7 @@
 //! CTX-0333 unified the sibling/container gap defaults at `6 / 6` (the older
 //! accepted spec had `gaps_in = 4`, which read as too tight next to a
 //! terminal) and added `content_inset` (inner padding between the border and
-//! the painted content). Current defaults are `6 / 6 / 2 / 6 / 6` with the
+//! the painted content). Current defaults are `6 / 6 / 1 / 6 / 6` with the
 //! ranges `0..=32 / 0..=32 / 0..=8 / 0..=16 / 0..=32`. Decoration is never
 //! part of a `LayoutTree`, never proposed by a `LayoutProvider`, and never
 //! carried by a `View`; it is a parameter of the Core composition step, so no
@@ -40,8 +40,9 @@ pub const DEFAULT_GAPS_IN_PX: u16 = 6;
 /// Default outer gap (`gaps_out`) in logical pixels.
 pub const DEFAULT_GAPS_OUT_PX: u16 = 6;
 
-/// Default border thickness in logical pixels (CTX-0292).
-pub const DEFAULT_BORDER_PX: u16 = 2;
+/// Default border thickness in logical pixels (CTX-0292; thinned to `1` by
+/// #1342 so adjacent 1px rings leave the 6px sibling gap dominant).
+pub const DEFAULT_BORDER_PX: u16 = 1;
 
 /// Default View frame corner radius in logical pixels (CTX-0292).
 pub const DEFAULT_RADIUS_PX: u16 = 6;
@@ -488,7 +489,7 @@ mod tests {
         let d = Decoration::default();
         assert_eq!(d.gaps_in, 6);
         assert_eq!(d.gaps_out, 6);
-        assert_eq!(d.border, 2);
+        assert_eq!(d.border, 1);
         assert_eq!(d.radius, 6);
         assert_eq!(d.content_inset, 6);
         // The sibling and container defaults match, so panel-panel and

@@ -2,7 +2,7 @@
 //! Core-owned workspace decoration carry + application (CTX-0292).
 //!
 //! Pins the workspace-compositor contract (spec CTX-0118; unified CTX-0333):
-//! - defaults `gaps_in = 6`, `gaps_out = 6`, `border = 2`, `radius = 6`,
+//! - defaults `gaps_in = 6`, `gaps_out = 6`, `border = 1`, `radius = 6`,
 //!   `content_inset = 6` logical px, carried from `bitty-ui` into
 //!   `RuntimeConfig` unchanged (the sibling and container gaps match);
 //! - ranges `0..=32 / 0..=32 / 0..=8 / 0..=16 / 0..=32` fail closed in
@@ -48,7 +48,7 @@ fn runtime_config_carries_unified_defaults() {
     let rt = Runtime::new(RuntimeConfig::default()).expect("default runtime");
     assert_eq!(
         rt.decoration(),
-        Decoration::new(6, 6, 2, 6, 6),
+        Decoration::new(6, 6, 1, 6, 6),
         "runtime must carry the unified defaults"
     );
     assert_eq!(rt.decoration(), Decoration::default());
@@ -125,7 +125,7 @@ fn decorated_allocations_apply_outer_gap_border_radius_and_inset() {
 
 #[test]
 fn decorated_allocations_default_content_inset_pads_content() {
-    // CTX-0333 defaults: frame inset 6 (gaps_out), content inset 2 + 6 = 8,
+    // CTX-0333 defaults: frame inset 6 (gaps_out), content inset 1 + 6 = 7,
     // so text is never flush against the panel margin line.
     let mut rt = runtime_with_decoration(Decoration::default());
     rt.set_layout(LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)));
@@ -141,7 +141,7 @@ fn decorated_allocations_default_content_inset_pads_content() {
     );
     assert_eq!(
         view.content,
-        bitty_runtime::UiRect::new(14, 14, area_w - 28, area_h - 28)
+        bitty_runtime::UiRect::new(13, 13, area_w - 26, area_h - 26)
     );
 }
 

@@ -419,7 +419,7 @@ fn open_transition_fades_the_core_owned_ring_alpha() {
         .into_iter()
         .find(|f| f.view == ViewId::new(2))
         .expect("opened view frame");
-    let ring_x = pad + usize::try_from(frame.frame.x).unwrap() + 1;
+    let ring_x = pad + usize::try_from(frame.frame.x).unwrap();
     let ring_y = pad + usize::try_from(frame.frame.y).unwrap() + 50;
 
     let mid = start + Duration::from_millis(40);

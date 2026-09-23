@@ -73,9 +73,14 @@ pub(crate) struct ChromeState {
     /// Hint collection generation, bumped once per Leader arming (CTX-0723,
     /// #981). Fresh batches per arming keep stale labels unreachable.
     pub(crate) hint_generation: u64,
+<<<<<<< HEAD
     /// Panel-hosted external-editor session (CTX-0731, #982): at most one
     /// pending `$EDITOR` round trip; empty otherwise.
     pub(crate) editor: crate::editor_host::ExternalEditorHost,
+    /// Hint session kill switch (CTX-0735 / OQ-089 #981): resolved from the
+    /// effective config at startup (default-on). While disabled the Leader
+    /// never arms — presses keep their normal owner (fail-open routing).
+    pub(crate) hints_enabled: bool,
 }
 
 impl ChromeState {
@@ -99,12 +104,19 @@ impl ChromeState {
             leader_clock: std::time::Instant::now(),
             hint_generation: 0,
             editor: crate::editor_host::ExternalEditorHost::new(),
+            hints_enabled: true,
         }
     }
 
     /// Injects the effective-config Leader binding (startup path).
     pub(crate) fn with_leader(mut self, leader: bitty_config::ResolvedLeader) -> Self {
         self.leader = leader;
+        self
+    }
+
+    /// Injects the effective-config hint kill switch (startup path).
+    pub(crate) fn with_hints_enabled(mut self, enabled: bool) -> Self {
+        self.hints_enabled = enabled;
         self
     }
 
@@ -1412,6 +1424,12 @@ impl TerminalApp {
             return self.route_hint_armed(key, keyref);
         }
         if self.chrome.leader.arms(*keyref) {
+            if !self.chrome.hints_enabled {
+                // CTX-0735 (#981): hints disabled — the Leader keeps its
+                // normal owner (fail-open); the press is not consumed and no
+                // session arms, so follow-up keys never route to hint code.
+                return false;
+            }
             if !key.repeat {
                 self.arm_hint_session();
             }
@@ -3820,6 +3838,37 @@ mod tests {
         assert!(
             app.runtime.drain_pending_input().is_empty(),
             "hint keystrokes never reach the PTY"
+        );
+    }
+
+    #[test]
+    fn hint_disabled_leader_keeps_normal_owner() {
+        // CTX-0735 (#981): `hints_enabled = false` keeps the Leader from
+        // arming — the press falls through to normal routing (fail-open)
+        // and no hint session ever owns follow-up keys.
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let mut app = help_test_app(maps).with_hints_enabled(false);
+        mark_test_command(&mut app);
+        set_leader_mods(&mut app, true);
+        let space = test_key(LogicalKey::Named(NamedKey::Space));
+        assert!(
+            !drive_chrome(&mut app, WindowEventKind::KeyboardInput(space)),
+            "disabled hints leave the leader press unconsumed"
+        );
+        assert!(
+            !app.runtime.cw_hint_is_armed(),
+            "no session arms while disabled"
+        );
+        // Follow-up letters are not hint-owned either: unconsumed, shell-bound.
+        set_leader_mods(&mut app, false);
+        assert!(
+            !drive_chrome(&mut app, WindowEventKind::KeyboardInput(test_char_key("z"))),
+            "letters keep their normal owner while disabled"
+        );
+        assert!(
+            !app.runtime.cw_hint_is_armed(),
+            "letters never arm while disabled"
         );
     }
 

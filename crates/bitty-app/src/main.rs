@@ -585,6 +585,14 @@ fn main() {
             std::process::exit(2);
         }
     };
+    // CTX-0735 (#981): resolve the effective hint switch (`hints_enabled`
+    // or default-on). Infallible: a raw boolean needs no range check, and
+    // non-booleans never leave the Lua layer. Disabled keeps the Leader
+    // from arming a hint session (fail-open routing); log loudly once.
+    let hints = bitty_config::resolve_hint_config(&app_config.effective);
+    if !hints.enabled {
+        logging::info(|| "bitty: hints disabled by config — leader never arms".to_string());
+    }
     let runtime_cfg = match runtime_config_from_effective(&app_config.effective) {
         Ok(cfg) => cfg,
         Err(msg) => {
@@ -760,6 +768,8 @@ fn main() {
     )
     // CTX-0723 (#981): the effective Leader binding arms the hint session.
     .with_leader(leader)
+    // CTX-0735 (#981): the effective hint switch gates that arming.
+    .with_hints_enabled(hints.enabled)
     // CTX-0223: `window.opacity` flows effective -> window creation
     // (sanitized by the platform config; fail-soft where unsupported).
     .with_window_opacity(app_config.effective.window.opacity)

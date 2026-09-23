@@ -10,7 +10,10 @@
 //!   `fold_toggle` / `fold_expand` / `fold_collapse` keymap actions.
 //! - #981 (CW-02): `cw_hint_arm` / `cw_hint_push_key` / `cw_hint_disarm`
 //!   own the live hint session behind the operator-conflict gate with
-//!   prefix-completion dispatch over sequential keystrokes.
+//!   prefix-completion dispatch over sequential keystrokes;
+//!   `cw_hint_dispatch_armed` dispatches against the armed batch only (no
+//!   caller-supplied batch), and `cw_present_plan` carries the live batch
+//!   as a single zero-slot overlay payload.
 //! - #982 (CW-03): submit frames from `cw_composer_feed` reach the focused
 //!   PTY through the single input router; the external-editor request
 //!   stays a routing flag.
@@ -197,6 +200,80 @@ fn cw981_prefix_completion_waits_for_disambiguation() {
 }
 
 // -- #982: composer submit reaches the PTY -----------------------------------
+
+#[test]
+fn cw981_armed_dispatch_uses_session_batch_only() {
+    // CTX-0735 (#981 dispatch authority): the armed batch is the single
+    // dispatch authority — `cw_hint_dispatch_armed` takes no batch, so a
+    // stale or foreign batch can never be smuggled through the live path.
+    use bitty_rich::hints::HintAction;
+    use bitty_runtime::HintFeedError;
+    let mut rt = runtime();
+    assert!(rt.cw_hint_register(CwHintProvider::new(7)));
+    // Disarmed: no authority, keys belong to the shell.
+    assert_eq!(
+        rt.cw_hint_dispatch_armed("a", HintAction::Focus),
+        Err(HintFeedError::NotArmed)
+    );
+    assert!(!rt.cw_hint_is_armed());
+    rt.cw_hint_arm(HintScope(1), 1, &[]).expect("arms");
+    // Unknown label rejects but keeps the window open for a retry.
+    assert!(
+        matches!(
+            rt.cw_hint_dispatch_armed("zzz", HintAction::Focus),
+            Err(HintFeedError::Dispatch(_))
+        ),
+        "unknown label dispatches nothing"
+    );
+    assert!(rt.cw_hint_is_armed(), "failed dispatch keeps the session");
+    // The armed batch dispatches and disarms (chrome is ephemeral).
+    assert_eq!(
+        rt.cw_hint_dispatch_armed("a", HintAction::Focus),
+        Ok(DispatchOutcome::FocusPanel { panel: 7 })
+    );
+    assert!(!rt.cw_hint_is_armed(), "dispatch disarms");
+    // A second call finds no authority: the window is gone.
+    assert_eq!(
+        rt.cw_hint_dispatch_armed("a", HintAction::Focus),
+        Err(HintFeedError::NotArmed)
+    );
+}
+
+#[test]
+fn cw981_present_plan_carries_hint_overlay() {
+    // CTX-0735 (#981 overlay): the present plan carries the live batch as
+    // a single zero-slot annotation payload — paint shows exactly what
+    // dispatch can resolve.
+    use bitty_rich::scene::Scene;
+    use bitty_ui::panel::{PanelId, ViewContent};
+    use bitty_ui::uitree::UiNodeId;
+    use bitty_ui::view::ViewId;
+    let mut rt = runtime();
+    assert!(rt.cw_hint_register(CwHintProvider::new(7)));
+    let batch = rt.cw_hint_collect(HintScope(1), 9);
+    assert_eq!(batch.len(), 1);
+    let scene = Scene::new();
+    let plan = rt.cw_present_plan(
+        ViewId::new(1),
+        9,
+        &[],
+        &batch,
+        &scene,
+        ViewContent::Panel(PanelId::new(7)),
+        UiNodeId::new(3),
+    );
+    assert_eq!(plan.hint_labels, 1);
+    assert_eq!(plan.hint_shed, 0);
+    assert_eq!(plan.hint_overlay_cost, 0);
+    assert_eq!(plan.hint_overlay.len(), 1);
+    assert_eq!(plan.hint_overlay.overlay_cost(), 0);
+    assert_eq!(plan.hint_overlay.shed, 0);
+    assert_eq!(
+        plan.hint_overlay.entries[0].label,
+        batch.labels()[0].label,
+        "overlay paints the allocated label"
+    );
+}
 
 #[test]
 fn cw982_composer_submit_writes_single_frame_to_pty() {

@@ -11,7 +11,7 @@
 //! | Issue | Slice | Entry point |
 //! |---|---|---|
 //! | #980 CW-01 | fold toggle/expand/collapse into present | [`CwFoldAction`] + [`apply_fold_action`] + [`fold_present`] |
-//! | #981 CW-02 | hint overlay + dispatch | [`present_hint_batch`] + [`present_overlay_cost`] + [`dispatch_present`] |
+//! | #981 CW-02 | hint overlay + dispatch | [`present_hint_batch`] + [`present_overlay_cost`] + [`hint_overlay_present`] + [`dispatch_present`] |
 //! | #982 CW-03 | composer overlay + input routing + editor flag | [`CwInputRoute`] + [`feed_present`] + [`composer_present`] |
 //! | #983 CW-04 | cross-panel hint API, one engine | [`CwHintEngine`] + [`CwHintProvider`] |
 //! | #984 CW-05 | semantic anchor identity + fold persistence | [`SemanticAnchor`] + [`anchor_for_command`] + [`persist_fold_ordinals`] |
@@ -45,6 +45,7 @@
 //! | scene blocks per plan | [`CW_PRESENT_MAX_SCENE_BLOCKS`] (64) | deterministic shed of the iteration tail, [`ScenePresent::shed`] reports it |
 //! | non-terminal items | [`CW_PRESENT_MAX_NONTERMINAL_ITEMS`] (64) | saturate + [`NonTerminalPresent::truncated`] |
 //! | hint labels / text | `HINT_TARGET_MAX` / `HINT_TEXT_MAX_BYTES` (via [`HintBatch`](bitty_rich::hints::HintBatch)) | shed tail, never an overlay |
+//! | hint overlay entries | batch labels 1:1 (via [`HintOverlayPresent`]) | same shed as the batch, zero overlay slots |
 //! | fold ids | `FOLD_MAX` (via [`FoldState`](bitty_rich::blocks::FoldState)) | fold-to-closed fails closed |
 //! | anchors per plan | input blocks (≤ `COMMAND_BLOCK_MAX`) | no allocation beyond the input slice |
 //!
@@ -53,8 +54,8 @@
 use bitty_rich::blocks::{CommandBlock, CommandId, FoldState, hidden_blocks, visible_blocks};
 use bitty_rich::composer::{ComposerKeyEvent, ComposerSession, frame_submit};
 use bitty_rich::hints::{
-    DispatchError, DispatchOutcome, HintAction, HintBatch, HintRegistry, HintScope,
-    collect_command_targets, collect_panel_targets, collect_view_targets, dispatch,
+    DispatchError, DispatchOutcome, HintAction, HintAnchor, HintBatch, HintKind, HintRegistry,
+    HintScope, collect_command_targets, collect_panel_targets, collect_view_targets, dispatch,
 };
 use bitty_rich::scene::{BlockId, Scene};
 use bitty_term_state::State;
@@ -247,6 +248,86 @@ pub fn present_hint_batch(registry: &HintRegistry, generation: u64) -> HintBatch
 #[must_use]
 pub const fn present_overlay_cost(batch: &HintBatch) -> usize {
     batch.overlay_cost()
+}
+
+// ---------------------------------------------------------------------------
+// CW-02 (#981): hint overlay paint payload — the single annotation pass
+// ---------------------------------------------------------------------------
+
+/// One paint entry of the hint overlay: the label glyphs plus the target
+/// identity the render path resolves to cells (CTX-0735, #981).
+///
+/// Data only — no pixels, no overlay allocation. The compositor paints every
+/// entry in one annotation pass alongside selection/IME; the `4+1` overlay
+/// bound is untouched (see [`HintOverlayPresent::overlay_cost`]). Label
+/// order follows the batch (allocation rank). The render path resolves
+/// `anchor` to viewport cells; command anchors are ordinals (never grid
+/// rows), so OQ-050 row anchoring cannot reshape this payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HintOverlayEntry {
+    /// Label glyphs painted for this target (`a`, `s`, ..., `aa`, ...).
+    pub label: String,
+    /// Object kind (lets paint style commands vs leaves differently).
+    pub kind: HintKind,
+    /// Stable anchor the label addresses (never a grid row).
+    pub anchor: HintAnchor,
+}
+
+/// Single batched hint overlay for one present frame (CTX-0735, #981).
+///
+/// Exactly the live [`HintBatch`] labels as paint data: one layer, never one
+/// overlay per label. Bounded by the batch itself (`HINT_TARGET_MAX` /
+/// `HINT_TEXT_MAX_BYTES`); [`shed`](Self::shed) mirrors the batch shed
+/// count so paint and dispatch agree on what is addressable.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HintOverlayPresent {
+    /// Paint entries in batch label order (allocation rank).
+    pub entries: Vec<HintOverlayEntry>,
+    /// Targets shed by the label caps (mirrors [`HintBatch::shed`]).
+    pub shed: usize,
+}
+
+impl HintOverlayPresent {
+    /// Number of paint entries (at most `HINT_TARGET_MAX`, via the batch).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the overlay paints nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Overlay slots consumed: always `0` (never touches the `4+1` bound).
+    #[must_use]
+    pub const fn overlay_cost(&self) -> usize {
+        0
+    }
+}
+
+/// Derives the one-frame hint overlay from the live batch (CTX-0735, #981).
+///
+/// A 1:1 projection of [`HintBatch::labels`] in label order with the batch
+/// shed count carried over: paint shows exactly what dispatch can resolve,
+/// no more, no less. Pure and headless; the caller passes the armed
+/// session's batch (or the plan input) so overlay and dispatch share one
+/// authority.
+#[must_use]
+pub fn hint_overlay_present(batch: &HintBatch) -> HintOverlayPresent {
+    HintOverlayPresent {
+        entries: batch
+            .labels()
+            .iter()
+            .map(|item| HintOverlayEntry {
+                label: item.label.clone(),
+                kind: item.kind,
+                anchor: item.anchor,
+            })
+            .collect(),
+        shed: batch.shed,
+    }
 }
 
 /// Dispatches `Action(Target)` from the present path.
@@ -713,6 +794,9 @@ pub struct CwPresentPlan {
     pub hint_shed: usize,
     /// Hint overlay slots consumed: always `0`.
     pub hint_overlay_cost: usize,
+    /// One-frame hint overlay paint payload (CTX-0735, #981): the batch
+    /// labels as a single annotation pass (zero overlay slots).
+    pub hint_overlay: HintOverlayPresent,
     /// Whether the composer overlay paints.
     pub composer_open: bool,
     /// Composer draft bytes.
@@ -738,6 +822,7 @@ pub fn plan_present(inputs: &CwPresentInputs<'_>) -> CwPresentPlan {
         hint_labels: inputs.hints.len(),
         hint_shed: inputs.hints.shed,
         hint_overlay_cost: present_overlay_cost(inputs.hints),
+        hint_overlay: hint_overlay_present(inputs.hints),
         composer_open: inputs.composer.is_open(),
         composer_draft_bytes: inputs.composer.content().len(),
         input_route: route_present_input(inputs.composer),
@@ -867,6 +952,50 @@ mod tests {
         assert_eq!(batch.len(), 1);
         assert_eq!(present_overlay_cost(&batch), 0);
         assert_eq!(batch.overlay_cost(), 0);
+    }
+
+    #[test]
+    fn hint_overlay_projects_batch_labels_one_to_one() {
+        // CTX-0735 (#981): the overlay paints exactly what dispatch can
+        // resolve — same labels in the same order, same anchors, same shed,
+        // zero overlay slots.
+        let mut registry = HintRegistry::new();
+        let scope = HintScope(1);
+        for panel in [7u64, 3u64] {
+            assert!(
+                registry
+                    .register(
+                        HintKind::Panel,
+                        HintAnchor::Panel(panel),
+                        scope,
+                        HintActions::default_for(HintKind::Panel),
+                    )
+                    .is_some()
+            );
+        }
+        let batch = present_hint_batch(&registry, 3);
+        assert_eq!(batch.len(), 2);
+        let overlay = hint_overlay_present(&batch);
+        assert_eq!(overlay.len(), 2);
+        assert!(!overlay.is_empty());
+        assert_eq!(overlay.overlay_cost(), 0);
+        assert_eq!(overlay.shed, batch.shed);
+        let batch_labels: Vec<&str> = batch.labels().iter().map(|l| l.label.as_str()).collect();
+        let paint_labels: Vec<&str> = overlay.entries.iter().map(|e| e.label.as_str()).collect();
+        assert_eq!(paint_labels, batch_labels, "paint follows label order");
+        for (entry, item) in overlay.entries.iter().zip(batch.labels().iter()) {
+            assert_eq!(entry.kind, item.kind);
+            assert_eq!(entry.anchor, item.anchor);
+        }
+    }
+
+    #[test]
+    fn hint_overlay_empty_batch_paints_nothing() {
+        let overlay = hint_overlay_present(&empty_batch());
+        assert!(overlay.is_empty());
+        assert_eq!(overlay.len(), 0);
+        assert_eq!(overlay.overlay_cost(), 0);
+        assert_eq!(overlay.shed, 0);
     }
 
     #[test]

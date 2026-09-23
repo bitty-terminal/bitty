@@ -207,7 +207,7 @@ pub mod workspace;
 // (CTX-0723): the Leader/hint/composer/fold input path consumes these
 // without taking a direct `bitty-rich` dependency in `bitty-app`.
 pub use bitty_rich::composer::{ComposerKey, ComposerKeyEvent};
-pub use bitty_rich::hints::{DispatchOutcome, HintScope};
+pub use bitty_rich::hints::{DispatchOutcome, HintFeedError, HintScope};
 
 pub use config::{
     BACKGROUND_FITS, CloseConfirmMode, DEFAULT_BACKGROUND_FIT, MAX_BACKGROUND_IMAGE_PATH_BYTES,

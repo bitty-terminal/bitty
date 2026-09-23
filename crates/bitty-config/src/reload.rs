@@ -109,6 +109,7 @@ impl std::fmt::Display for ReloadClass {
 /// | `mod_key`                 | Live               |
 /// | `leader_key`              | Live               |
 /// | `leader_timeout_ms`       | Live               |
+/// | `hints_enabled`           | Live               |
 /// | `keymaps`                 | Live               |
 /// | `terminal.scrollback`     | RestartRequired    |
 /// | `terminal.shell`          | RestartRequired    |
@@ -175,6 +176,7 @@ pub fn classify_field(field: &str) -> ReloadClass {
         | "mod_key"
         | "leader_key"
         | "leader_timeout_ms"
+        | "hints_enabled"
         | "keymaps" => ReloadClass::Live,
         "terminal.scrollback"
         | "terminal.shell"
@@ -565,6 +567,16 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
         new.leader_timeout_ms
             .map_or_else(|| "default".to_string(), |ms| ms.to_string()),
     );
+    // CTX-0735: the hint switch gates the same leader-armed session, so it
+    // reconciles live with the leader. `None` renders as the default-on
+    // marker (resolves at use via `resolve_hint_config`).
+    push_if_changed(
+        "hints_enabled",
+        old.hints_enabled
+            .map_or_else(|| "default".to_string(), |b| b.to_string()),
+        new.hints_enabled
+            .map_or_else(|| "default".to_string(), |b| b.to_string()),
+    );
     // Keymaps and plugins are set-by-identifier stores: compare the sorted
     // `id -> value` pairs (never raw order; merge already sorts them) so a
     // rebind of an existing chord or an enabled-flag flip is detected.
@@ -735,6 +747,23 @@ mod tests {
         reconcile_live(&mut cur, &new).expect("leader reconciles live");
         assert_eq!(cur.leader_key.expect("chord").canonical(), "ctrl+q");
         assert_eq!(cur.leader_timeout_ms, Some(2500));
+    }
+
+    #[test]
+    fn diff_hints_enabled_is_live() {
+        // CTX-0735 (#981): the hint switch reconciles live with the leader
+        // (re-resolves at use via `resolve_hint_config`).
+        assert_eq!(classify_field("hints_enabled"), ReloadClass::Live);
+        let old = EffectiveConfig::default();
+        let mut new = old.clone();
+        new.hints_enabled = Some(false);
+        let r = diff(&old, &new);
+        assert_eq!(r.overall, ReloadClass::Live);
+        assert!(!r.needs_restart);
+        assert!(r.diffs.iter().any(|d| d.field == "hints_enabled"));
+        let mut cur = old;
+        reconcile_live(&mut cur, &new).expect("hints switch reconciles live");
+        assert_eq!(cur.hints_enabled, Some(false));
     }
 
     #[test]

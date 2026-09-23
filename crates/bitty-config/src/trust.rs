@@ -453,6 +453,15 @@ pub fn validate_project_plan(plan: &ConfigPlan) -> Result<(), ConfigError> {
             message: "project config must not declare leader_timeout_ms".into(),
         });
     }
+    // CTX-0735: `hints_enabled` gates the same hint session the leader
+    // arms, so it stays out of project layers with the leader itself: a
+    // project-local file must not be able to silence hint chrome (or
+    // re-enable what the user disabled).
+    if plan.hints_enabled.is_some() {
+        return Err(ConfigError::TrustViolation {
+            message: "project config must not declare hints_enabled".into(),
+        });
+    }
     // CTX-0370: close confirmation is a data-loss guard; a project-local
     // file must not be able to disable or weaken it, so the key stays out of
     // project layers (like the keymaps and the mod).
@@ -804,6 +813,18 @@ mod tests {
         };
         let err = validate_project_plan(&plan).unwrap_err();
         assert!(err.to_string().contains("leader_timeout_ms"));
+    }
+
+    #[test]
+    fn project_plan_rejects_hints_enabled() {
+        // CTX-0735 (#981): the hint kill switch gates leader-armed chrome,
+        // so it stays out of project layers with the leader fields.
+        let plan = ConfigPlan {
+            hints_enabled: Some(false),
+            ..Default::default()
+        };
+        let err = validate_project_plan(&plan).unwrap_err();
+        assert!(err.to_string().contains("hints_enabled"));
     }
 
     #[test]

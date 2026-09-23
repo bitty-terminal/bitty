@@ -41,6 +41,7 @@
 //!     mod_key = "alt", -- leader/mod for the shipped chrome map: "alt" (default) or "super" (CTX-0236)
 //!     leader_key = "ctrl+q", -- leader chord override: any chord spelling (default Alt+Space, Ctrl+Space on Windows; CTX-0715)
 //!     leader_timeout_ms = 1500, -- leader fail-open timeout override in ms, 100..=60000 (default 1000; CTX-0715)
+//!     hints_enabled = true, -- hint session kill switch, default true = Leader arms (CTX-0735)
 //!     close_confirm = "when_busy", -- close safety: always | when_busy (default) | never (CTX-0370)
 //!     keymaps = {
 //!         { chord = "ctrl+p", action = "palette:toggle", context = "global" },
@@ -410,6 +411,10 @@ pub struct ConfigData {
     /// Top-level `leader_timeout_ms` scalar (CTX-0715 fail-open timeout
     /// override; raw integer, range-checked fail-closed downstream).
     pub leader_timeout_ms: Option<i64>,
+    /// Top-level `hints_enabled` scalar (CTX-0735 / OQ-089 #981 hint kill
+    /// switch; raw boolean, honored downstream as the default-on hint
+    /// config: `false` keeps the Leader from arming a hint session).
+    pub hints_enabled: Option<bool>,
     /// Top-level `close_confirm` scalar (CTX-0370 view/window close
     /// confirmation mode; raw string, parsed fail-closed downstream).
     pub close_confirm: Option<String>,
@@ -447,6 +452,7 @@ impl ConfigData {
             && self.mod_key.is_none()
             && self.leader_key.is_none()
             && self.leader_timeout_ms.is_none()
+            && self.hints_enabled.is_none()
             && self.close_confirm.is_none()
             && self.keymaps.is_none()
     }
@@ -1465,6 +1471,12 @@ impl ConfigData {
                 "leader_timeout_ms" => {
                     out.leader_timeout_ms = Some(expect_integer(key, val)?);
                 }
+                // CTX-0735: top-level `hints_enabled` kill switch (raw
+                // boolean; honored downstream in `bitty-config` as the
+                // default-on hint config).
+                "hints_enabled" => {
+                    out.hints_enabled = Some(expect_bool(key, val)?);
+                }
                 // CTX-0370: top-level `close_confirm` scalar (raw string;
                 // typed parsing and fail-closed validation live downstream
                 // in `bitty-config`).
@@ -2022,6 +2034,35 @@ mod tests {
         assert_eq!(data.animations, None);
         let data = eval_ok(r#"return { appearance = {} }"#);
         assert_eq!(data.animations, None);
+    }
+
+    #[test]
+    fn top_hints_enabled_extracts_and_absent_means_no_override() {
+        // CTX-0735 (#981): explicit boolean parses; absent key is `None`
+        // so merge keeps the lower-precedence value (default-on).
+        let data = eval_ok(r#"return { hints_enabled = false }"#);
+        assert_eq!(data.hints_enabled, Some(false));
+        let data = eval_ok(r#"return { hints_enabled = true }"#);
+        assert_eq!(data.hints_enabled, Some(true));
+        let data = eval_ok(r#"return { theme = "dark" }"#);
+        assert_eq!(data.hints_enabled, None);
+    }
+
+    #[test]
+    fn top_hints_enabled_wrong_type_fails_closed() {
+        let mut vm = LuaVm::new("test.hints-enabled-type");
+        for code in [
+            r#"return { hints_enabled = "no" }"#,
+            r#"return { hints_enabled = 0 }"#,
+            r#"return { hints_enabled = 1 }"#,
+        ] {
+            match vm.eval_config(code).expect("no refuse") {
+                ConfigOutcome::ShapeError { message } => {
+                    assert!(message.contains("hints_enabled"), "{code:?}: {message}");
+                }
+                other => panic!("{code:?}: expected shape error, got {other:?}"),
+            }
+        }
     }
 
     #[test]

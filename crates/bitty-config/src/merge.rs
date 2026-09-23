@@ -109,6 +109,7 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "mod_key"
         | "leader_key"
         | "leader_timeout_ms"
+        | "hints_enabled"
         | "close_confirm"
         | "extends"
         | "profile"
@@ -1550,6 +1551,49 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
             }
         }
 
+        // CTX-0735: `hints_enabled` is scalar-replace like `leader_key`;
+        // absent means "says nothing" (lower-precedence value wins, and
+        // `None` resolves default-on).
+        if let Some(hints_enabled) = &plan.hints_enabled {
+            let field = "hints_enabled";
+            if is_policy {
+                policy_fields.insert(field.to_string(), src.clone());
+                effective.hints_enabled = Some(*hints_enabled);
+                let prev = attribution.get(field).cloned();
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            } else if let Some(policy_src) = policy_fields.get(field) {
+                policy_violations.push(ConfigError::NonOverridable {
+                    field: field.to_string(),
+                    policy_source: policy_src.describe(),
+                    attempted_source: src.describe(),
+                });
+                conflicts.push(MergeConflict {
+                    field: field.to_string(),
+                    previous_source: policy_src.clone(),
+                    new_source: src.clone(),
+                    merge_class: MergeClass::ScalarReplace,
+                });
+            } else {
+                let prev = attribution.get(field).cloned();
+                effective.hints_enabled = Some(*hints_enabled);
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            }
+        }
+
         // CTX-0370: `close_confirm` is scalar-replace like `mod_key`; absent
         // means "says nothing" (lower-precedence value wins).
         if let Some(close_confirm) = &plan.close_confirm {
@@ -2559,6 +2603,49 @@ fn merge_layers_allow_policy_violations(
                 );
             }
         }
+        // CTX-0735: `hints_enabled` is scalar-replace like `leader_key`;
+        // absent means "says nothing" (lower-precedence value wins, and
+        // `None` resolves default-on).
+        if let Some(hints_enabled) = &plan.hints_enabled {
+            let field = "hints_enabled";
+            if is_policy {
+                policy_fields.insert(field.to_string(), src.clone());
+                effective.hints_enabled = Some(*hints_enabled);
+                let prev = attribution.get(field).cloned();
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            } else if let Some(policy_src) = policy_fields.get(field) {
+                policy_violations.push(ConfigError::NonOverridable {
+                    field: field.to_string(),
+                    policy_source: policy_src.describe(),
+                    attempted_source: src.describe(),
+                });
+                conflicts.push(MergeConflict {
+                    field: field.to_string(),
+                    previous_source: policy_src.clone(),
+                    new_source: src.clone(),
+                    merge_class: MergeClass::ScalarReplace,
+                });
+            } else {
+                let prev = attribution.get(field).cloned();
+                effective.hints_enabled = Some(*hints_enabled);
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            }
+        }
+
         // CTX-0370: `close_confirm` is scalar-replace like `mod_key`; absent
         // means "says nothing" (lower-precedence value wins).
         // (Second merge path: allow-policy-violations variant for diagnostics.)
@@ -2862,6 +2949,44 @@ mod tests {
         let merged2 = try_merge_layers(vec![user2]).expect("try merge");
         assert_eq!(merged2.effective.mod_key, ModKey::Super);
         assert_eq!(merged2.source_of("mod_key").unwrap().layer, LayerKind::User);
+    }
+
+    #[test]
+    fn hints_enabled_merges_scalar_replace_with_attribution() {
+        // CTX-0735 (#981): user layer wins with per-field attribution on
+        // both merge paths; absent keeps `None` (default-on at resolve).
+        let user = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                hints_enabled: Some(false),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged = merge_layers(vec![user]).expect("merge");
+        assert_eq!(merged.effective.hints_enabled, Some(false));
+        assert_eq!(
+            merged.source_of("hints_enabled").unwrap().layer,
+            LayerKind::User
+        );
+        assert_eq!(
+            crate::merge::merge_class_for("hints_enabled"),
+            Some(MergeClass::ScalarReplace)
+        );
+        // Absent rides `None` (default-on at resolve).
+        let empty = merge_layers(vec![]).expect("empty merges");
+        assert!(empty.effective.hints_enabled.is_none());
+        // try_merge_layers agrees (second merge path).
+        let user2 = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                hints_enabled: Some(false),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged2 = try_merge_layers(vec![user2]).expect("try merge");
+        assert_eq!(merged2.effective.hints_enabled, Some(false));
     }
 
     #[test]

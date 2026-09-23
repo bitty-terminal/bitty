@@ -309,6 +309,16 @@ impl TerminalApp {
         self
     }
 
+    /// Injects the effective-config hint kill switch (CTX-0735 #981).
+    ///
+    /// Resolved once at startup from `hints_enabled` via
+    /// [`bitty_config::resolve_hint_config`]; while disabled the Leader
+    /// never arms a hint session.
+    pub(crate) fn with_hints_enabled(mut self, enabled: bool) -> Self {
+        self.chrome = self.chrome.with_hints_enabled(enabled);
+        self
+    }
+
     /// True when per-frame `bitty tick` stderr lines are emitted.
     ///
     /// Hot-path guard: a single comparison, checked before any formatting so

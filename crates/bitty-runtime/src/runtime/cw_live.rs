@@ -24,6 +24,9 @@
 //!   [`Runtime::cw_hint_unregister`] + [`Runtime::cw_hint_collect`] +
 //!   [`Runtime::cw_hint_dispatch`] own one
 //!   [`crate::cw_present::CwHintEngine`] for labels, overlay, and dispatch;
+//!   [`Runtime::cw_hint_dispatch_armed`] is the session-authority live path
+//!   (issue #981): it dispatches against the armed batch only, never a
+//!   caller-supplied one;
 //! - issue #984 (CW-05): [`Runtime::cw_fold_snapshot_ordinals`] +
 //!   [`Runtime::cw_fold_restore_ordinals`] own fold persistence as anchor
 //!   ordinals (stable scrollback identity stays deferred per owner ruling);
@@ -39,8 +42,8 @@ use super::*;
 use bitty_rich::blocks::{CommandBlock, CommandId, blocks};
 use bitty_rich::composer::{ComposerFeedError, ComposerKeyEvent};
 use bitty_rich::hints::{
-    DispatchError, DispatchOutcome, HINT_LABEL_MAX_CHARS, HintAction, HintBatch, HintOperator,
-    HintScope, OperatorConflict,
+    DispatchError, DispatchOutcome, HINT_LABEL_MAX_CHARS, HintAction, HintBatch, HintFeedError,
+    HintOperator, HintScope, OperatorConflict,
 };
 use bitty_rich::scene::Scene;
 
@@ -188,6 +191,37 @@ impl Runtime {
         action: HintAction,
     ) -> Result<DispatchOutcome, DispatchError> {
         dispatch_present(batch, &mut self.cw_fold, label, action)
+    }
+
+    /// Dispatches `Action(Target)` against the armed session's live batch
+    /// (issue #981 dispatch authority, CTX-0735).
+    ///
+    /// The armed batch is the single dispatch authority: unlike
+    /// [`Runtime::cw_hint_dispatch`] (which trusts a caller-supplied batch),
+    /// this takes no batch at all, so a stale or foreign batch can never be
+    /// smuggled through the live path. Success disarms the session (hint
+    /// chrome is ephemeral); dispatch errors keep the session armed so the
+    /// caller can retry the label inside the same window.
+    ///
+    /// # Errors
+    ///
+    /// [`HintFeedError::NotArmed`] while disarmed (or armed with no batch:
+    /// keys belong to the shell then); [`HintFeedError::Dispatch`] for the
+    /// [`dispatch_present`] rejection, with the fold untouched.
+    pub fn cw_hint_dispatch_armed(
+        &mut self,
+        label: &str,
+        action: HintAction,
+    ) -> Result<DispatchOutcome, HintFeedError> {
+        if !self.cw_hint_session.is_armed() {
+            return Err(HintFeedError::NotArmed);
+        }
+        let outcome = match self.cw_hint_session.batch() {
+            Some(batch) => dispatch_present(batch, &mut self.cw_fold, label, action)?,
+            None => return Err(HintFeedError::NotArmed),
+        };
+        self.cw_hint_disarm();
+        Ok(outcome)
     }
 
     /// Arms the live hint session from the live engine (issue #981).

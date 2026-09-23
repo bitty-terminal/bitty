@@ -97,11 +97,12 @@ pub mod wheel;
 
 pub use error::{ConfigError, ErrorClass};
 pub use keymap::{
-    Chord, ChromeAction, KeyName, KeyRef, LEADER_DEFAULT_CHORD_RAW, LEADER_TIMEOUT_MS_DEFAULT,
-    LEADER_TIMEOUT_MS_MAX, LEADER_TIMEOUT_MS_MIN, LEADER_WINDOWS_FALLBACK_CHORDS_RAW,
-    LeaderPlatform, LeaderPoll, LeaderState, ModKey, ResolvedKeymap, ResolvedLeader, SplitDir,
-    default_keymaps, default_keymaps_with_mod, match_keymap, resolve_keymaps, resolve_leader,
-    resolve_leader_for, validate_leader_timeout_ms,
+    Chord, ChromeAction, HintConfig, KeyName, KeyRef, LEADER_DEFAULT_CHORD_RAW,
+    LEADER_TIMEOUT_MS_DEFAULT, LEADER_TIMEOUT_MS_MAX, LEADER_TIMEOUT_MS_MIN,
+    LEADER_WINDOWS_FALLBACK_CHORDS_RAW, LeaderPlatform, LeaderPoll, LeaderState, ModKey,
+    ResolvedKeymap, ResolvedLeader, SplitDir, default_keymaps, default_keymaps_with_mod,
+    match_keymap, resolve_hint_config, resolve_keymaps, resolve_leader, resolve_leader_for,
+    validate_leader_timeout_ms,
 };
 pub use merge::{
     MergeClass, MergeConflict, MergedConfig, merge_class_for, merge_layers, resolve_profile_chain,

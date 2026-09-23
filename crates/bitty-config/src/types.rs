@@ -62,8 +62,9 @@ pub const DEFAULT_DECORATION_GAPS_IN_PX: u32 = 6;
 /// Default outer workspace decoration gap (CTX-0292): 6 logical px.
 pub const DEFAULT_DECORATION_GAPS_OUT_PX: u32 = 6;
 
-/// Default View frame border thickness (CTX-0292): 2 logical px.
-pub const DEFAULT_DECORATION_BORDER_PX: u32 = 2;
+/// Default View frame border thickness (CTX-0292; thinned to `1` by #1342 so
+/// adjacent 1px rings leave the 6px sibling gap dominant).
+pub const DEFAULT_DECORATION_BORDER_PX: u32 = 1;
 
 /// Default View frame corner radius (CTX-0292): 6 logical px.
 pub const DEFAULT_DECORATION_RADIUS_PX: u32 = 6;
@@ -107,7 +108,7 @@ pub const SAFE_DECORATION_GAPS_IN_PX: u32 = 0;
 /// Safe-mode decoration outer gap; see [`SAFE_DECORATION_GAPS_IN_PX`].
 pub const SAFE_DECORATION_GAPS_OUT_PX: u32 = 0;
 
-/// Safe-mode View frame border thickness (`1`, not the `2` default).
+/// Safe-mode View frame border thickness (`1`, matching the default).
 pub const SAFE_DECORATION_BORDER_PX: u32 = 1;
 
 /// Safe-mode View frame corner radius (`0`, not the `6` default).
@@ -3649,12 +3650,12 @@ mod tests {
 
     #[test]
     fn decoration_defaults_match_unified_spec_and_validate() {
-        // CTX-0333: unified 6/6 sibling/container gaps, 2px border, 6px
-        // radius, 6px content inset; ranges 0..=32 / 0..=32 / 0..=8 /
+        // CTX-0333: unified 6/6 sibling/container gaps, 1px border (#1342),
+        // 6px radius, 6px content inset; ranges 0..=32 / 0..=32 / 0..=8 /
         // 0..=16 / 0..=32, fail closed.
         const { assert!(DEFAULT_DECORATION_GAPS_IN_PX == 6) }
         const { assert!(DEFAULT_DECORATION_GAPS_OUT_PX == 6) }
-        const { assert!(DEFAULT_DECORATION_BORDER_PX == 2) }
+        const { assert!(DEFAULT_DECORATION_BORDER_PX == 1) }
         const { assert!(DEFAULT_DECORATION_RADIUS_PX == 6) }
         const { assert!(DEFAULT_DECORATION_CONTENT_INSET_PX == 6) }
         const { assert!(MAX_DECORATION_GAP_PX == 32) }
@@ -3664,7 +3665,7 @@ mod tests {
         let d = DecorationConfig::default();
         assert_eq!(
             (d.gaps_in, d.gaps_out, d.border, d.radius, d.content_inset),
-            (6, 6, 2, 6, 6)
+            (6, 6, 1, 6, 6)
         );
         d.validate().expect("default valid");
         assert!(!d.is_zero());
@@ -3994,10 +3995,10 @@ mod tests {
         // forces the equal `1`/`1` pair.
         const { assert!(MAX_DECORATION_BORDER_WIDTH_PX == 16) }
         const { assert!(SAFE_DECORATION_BORDER_WIDTH_PX == 1) }
-        // Default: everything unset -> both states inherit border 2.
+        // Default: everything unset -> both states inherit border 1.
         let d = DecorationConfig::default();
         let w = d.resolve_outline_width();
-        assert_eq!((w.focused, w.idle), (2, 2));
+        assert_eq!((w.focused, w.idle), (1, 1));
         assert!(!d.has_non_color_focus_cue());
         // Base set -> both states use the base.
         let d = DecorationConfig {

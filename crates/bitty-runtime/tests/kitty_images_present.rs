@@ -21,14 +21,14 @@ fn default_geometry() -> (usize, usize, usize) {
     // Mirrors `tick_cursor_overlay_uses_theme_cursor_hue`: 9x19 cells,
     // 8px padding inset at scale 1.0, 80x24 grid. The returned origin
     // includes the unified CTX-0294/CTX-0333 default decoration outer gap +
-    // border + content inset (6 + 2 + 6 = 14px), where cell (0,0) content
+    // border + content inset (6 + 1 + 6 = 13px), where cell (0,0) content
     // actually starts.
     let cfg = RuntimeConfig::default();
     assert_eq!((cfg.cell_width, cfg.cell_height), (9, 19));
     let rt = make_runtime();
     let pad = usize::try_from(rt.window_padding_physical()).expect("pad fits usize");
     assert_eq!(pad, 8);
-    (9, 19, pad + 14)
+    (9, 19, pad + 13)
 }
 
 /// Absolute content origin `(x, y)` in physical px and the derived content

@@ -83,10 +83,10 @@ fn zero_padding_restores_legacy_origin() {
     rt.set_window_padding(0).expect("zero padding is valid");
     assert_eq!(rt.window_padding(), 0);
     // Window keeps its size; the grid absorbs the freed inset. CTX-0375: the
-    // content grid also removes the 14px per-side decoration: the 81x24
-    // container leaves 77x22 content cells.
+    // content grid also removes the 13px per-side decoration: the 81x24
+    // container leaves 78x22 content cells.
     assert_eq!(rt.surface_extent(), Some(PhysicalSize::new(736, 472)));
-    assert_eq!(rt.snapshot().width, 77, "736/9 container minus decoration");
+    assert_eq!(rt.snapshot().width, 78, "736/9 container minus decoration");
     assert_eq!(
         rt.snapshot().height,
         22,
@@ -112,9 +112,9 @@ fn set_window_padding_is_live_and_fail_closed() {
     rt.set_window_padding(16)
         .expect("valid padding applies live");
     assert_eq!(rt.window_padding(), 16);
-    // (736-32)/9 = 78 container cells; minus decoration -> 74 content cells.
+    // (736-32)/9 = 78 container cells; minus decoration -> 75 content cells.
     // (472-32)/19 = 23 container rows; minus decoration -> 21 content rows.
-    assert_eq!(rt.snapshot().width, 74, "grid absorbs inset + decoration");
+    assert_eq!(rt.snapshot().width, 75, "grid absorbs inset + decoration");
     assert_eq!(rt.snapshot().height, 21, "grid absorbs inset + decoration");
     assert_eq!(rt.surface_extent(), Some(PhysicalSize::new(736, 472)));
     assert!(rt.tick().is_some(), "padding change forces full redraw");
@@ -125,9 +125,9 @@ fn resize_derives_grid_minus_padding() {
     let mut rt = make_runtime();
     rt.handle_resize(PhysicalSize::new(800, 600))
         .expect("valid resize");
-    // (800-16)/9 x (600-16)/19 = 87x30 container cells; minus the 14px
-    // per-side decoration inset -> 83x28 content. The window keeps its size.
-    assert_eq!((rt.snapshot().width, rt.snapshot().height), (83, 28));
+    // (800-16)/9 x (600-16)/19 = 87x30 container cells; minus the 13px
+    // per-side decoration inset -> 84x28 content. The window keeps its size.
+    assert_eq!((rt.snapshot().width, rt.snapshot().height), (84, 28));
     assert_eq!(rt.surface_extent(), Some(PhysicalSize::new(800, 600)));
 }
 

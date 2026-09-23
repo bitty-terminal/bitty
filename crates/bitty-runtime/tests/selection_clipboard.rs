@@ -206,15 +206,15 @@ fn select_all_covers_whole_grid() {
     rt.select_all();
     assert!(rt.has_selection());
     // Resize to smaller grid clamps selection (CTX-0223/CTX-0375: the window
-    // carries the default 8px padding inset and the 14px per-side decoration
-    // inset, so a window-sized 8x4 container cell area insets to a 4x2 content
+    // carries the default 8px padding inset and the 13px per-side decoration
+    // inset, so a window-sized 8x4 container cell area insets to a 5x2 content
     // grid, which is what a 4*9+16 x 2*19+16 window used to be pre-decoration).
     rt.handle_resize(PhysicalSize::new(9 * 8 + 16, 19 * 4 + 16))
         .expect("resize small");
     assert!(rt.has_selection());
-    // New selection should be within new bounds (4 cols x 2 rows).
+    // New selection should be within new bounds (5 cols x 2 rows).
     let sel = rt.selection().expect("selection after resize");
-    assert!(sel.anchor.col < 4 && sel.focus.col < 4);
+    assert!(sel.anchor.col < 5 && sel.focus.col < 5);
 }
 
 #[test]
@@ -222,8 +222,8 @@ fn cursor_to_cell_mapping_is_headless_and_clamped() {
     let rt = make_runtime();
     // Default readable cell 9x19 (CTX-0157), the default 8px window
     // padding inset (CTX-0223), and the default CTX-0294/CTX-0333
-    // decoration outer gap + border + content inset (6 + 2 + 6 px): cell
-    // (2, 2) starts at (8 + 14 + 18, 8 + 14 + 38) = (40, 60).
+    // decoration outer gap + border + content inset (6 + 1 + 6 px): cell
+    // (2, 2) starts at (8 + 13 + 18, 8 + 13 + 38) = (39, 59).
     let pos = CursorPosition { x: 41.0, y: 61.0 };
     let cell = rt.cursor_to_cell(pos);
     assert_eq!(cell, CellPos::new(2, 2));

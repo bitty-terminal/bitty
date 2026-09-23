@@ -2136,7 +2136,7 @@ fn runtime_config_inherits_file_decoration() {
     // `decoration.border`, `decoration.radius`, `decoration.content_inset`
     // flow file -> effective -> runtime; the crate constants stay equal
     // (bitty-runtime aliases bitty-ui, bitty-config owns its own copy;
-    // the pairing is pinned here). Defaults are unified 6/6/2/6/6.
+    // the pairing is pinned here). Defaults are unified 6/6/1/6/6.
     assert_eq!(
         bitty_runtime::config::DEFAULT_DECORATION_GAPS_IN_PX,
         bitty_config::types::DEFAULT_DECORATION_GAPS_IN_PX as u16
@@ -2212,7 +2212,7 @@ fn runtime_config_inherits_file_decoration() {
     assert_eq!(cfg2.decoration, bitty_runtime::Decoration::default());
     assert_eq!(
         cfg2.decoration,
-        bitty_runtime::Decoration::new(6, 6, 2, 6, 6)
+        bitty_runtime::Decoration::new(6, 6, 1, 6, 6)
     );
     // CTX-0340: with no color config the runtime carries the ratified
     // theme-token pair.
@@ -2299,7 +2299,7 @@ fn runtime_config_inherits_file_outline_width() {
         (cfg.outline_width_focused, cfg.outline_width_idle),
         (Some(6), Some(2))
     );
-    // No width config -> both inherit the runtime `decoration.border` (2).
+    // No width config -> both inherit the runtime `decoration.border` (1).
     let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
     let plan = parse_lua_config(r#"return { terminal = { scrollback = 10000 } }"#, &src)
         .expect("no decoration parses");
@@ -2308,8 +2308,8 @@ fn runtime_config_inherits_file_outline_width() {
     let cfg = runtime_config_from_effective(&merged.effective).expect("builds");
     assert_eq!(
         (cfg.outline_width_focused, cfg.outline_width_idle),
-        (Some(2), Some(2)),
-        "unset widths inherit decoration.border (2)"
+        (Some(1), Some(1)),
+        "unset widths inherit decoration.border (1)"
     );
     // Safe mode forces 1/1 (equal, no width cue).
     let safe = bitty_config::reload::fallback_builtin();
@@ -3732,7 +3732,7 @@ fn init_render_default_and_vim() {
     assert!(lua.contains("shell = \"/bin/bash\""));
     assert!(lua.contains("scrollback = 10000"));
     assert!(lua.contains("close_confirm = \"when_busy\""));
-    assert!(lua.contains("decoration = { gaps_in = 6, gaps_out = 6, border = 2, radius = 6 }"));
+    assert!(lua.contains("decoration = { gaps_in = 6, gaps_out = 6, border = 1, radius = 6 }"));
     assert!(!lua.contains("keymaps = {"));
 
     // No shell: the terminal table still carries scrollback.

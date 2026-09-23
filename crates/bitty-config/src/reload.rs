@@ -984,8 +984,11 @@ mod tests {
     fn diff_decoration_is_live_and_reconcile() {
         // CTX-0292: every decoration field surfaces as a Live diff and
         // reconciles into the effective config without restart.
-        let old = EffectiveConfig::default();
+        let mut old = EffectiveConfig::default();
         let mut new = old.clone();
+        // #1342: the default border is 1 (matching safe), so the old side
+        // carries an explicit 2 to keep every field diffing.
+        old.decoration.border = 2;
         new.decoration.gaps_in = 0;
         new.decoration.gaps_out = 0;
         new.decoration.border = 1;

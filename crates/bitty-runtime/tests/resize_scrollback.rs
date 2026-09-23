@@ -16,12 +16,12 @@ fn runtime_handle_resize_actually_resizes_state_and_is_headless() {
     let gen_before = rt.snapshot().generation;
 
     // Resize physics: 800x600 at 9x19 readable cell minus the default 8px
-    // window padding inset (CTX-0223) and the 14px per-side decoration
-    // inset (CTX-0375) => 83x28. The layout container keeps the window cell
+    // window padding inset (CTX-0223) and the 13px per-side decoration
+    // inset (CTX-0375) => 84x28. The layout container keeps the window cell
     // count (87x30) so the decoration lands inside the Window.
     rt.handle_resize(PhysicalSize::new(800, 600))
         .expect("resize");
-    assert_eq!(rt.snapshot().width, 83);
+    assert_eq!(rt.snapshot().width, 84);
     assert_eq!(rt.snapshot().height, 28);
     assert_eq!(rt.container(), bitty_ui::Rect::new(0, 0, 87, 30));
     assert!(
@@ -45,7 +45,7 @@ fn runtime_handle_resize_actually_resizes_state_and_is_headless() {
     rt.handle_resize(PhysicalSize::new(0, 0))
         .expect("zero no-op");
     assert_eq!(rt.surface_extent(), extent_before);
-    assert_eq!(rt.snapshot().width, 83);
+    assert_eq!(rt.snapshot().width, 84);
 }
 
 #[test]
@@ -60,21 +60,21 @@ fn runtime_resize_updates_scrollback_width_and_views() {
     assert!(sb_before > 0);
 
     // Resize wider: scrollback lines must be padded (CTX-0223/CTX-0375:
-    // 800x600 minus the 8px padding and 14px decoration insets => 83 cols).
+    // 800x600 minus the 8px padding and 13px decoration insets => 84 cols).
     rt.handle_resize(PhysicalSize::new(800, 600))
         .expect("resize wide");
-    assert_eq!(rt.snapshot().width, 83);
+    assert_eq!(rt.snapshot().width, 84);
     for line in rt.state().scrollback() {
-        assert_eq!(line.cells.len(), 83);
+        assert_eq!(line.cells.len(), 84);
     }
     // Narrower: truncate with repair.
     rt.handle_resize(PhysicalSize::new(320, 240))
         .expect("resize narrow");
-    // (320-16-28)/9=29 cols, (240-16-28)/19=9 rows.
-    assert_eq!(rt.snapshot().width, 29);
+    // (320-16-26)/9=30 cols, rows stay 9.
+    assert_eq!(rt.snapshot().width, 30);
     assert_eq!(rt.snapshot().height, 9);
     for line in rt.state().scrollback() {
-        assert_eq!(line.cells.len(), 29);
+        assert_eq!(line.cells.len(), 30);
     }
     assert!(rt.state().check_invariants().is_ok());
     // Headless tick still works after multiple resizes.

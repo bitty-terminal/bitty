@@ -1952,12 +1952,13 @@ mod tests {
 
     #[test]
     fn decoration_defaults_match_unified_spec_and_validate() {
-        // CTX-0292/CTX-0333: unified defaults 6/6/2/6/6 logical px; runtime
-        // constants alias the bitty-ui solver bounds so they cannot drift;
-        // out-of-range values fail closed naming the property.
+        // CTX-0292/CTX-0333 (#1342 thins border to 1): unified defaults
+        // 6/6/1/6/6 logical px; runtime constants alias the bitty-ui solver
+        // bounds so they cannot drift; out-of-range values fail closed
+        // naming the property.
         const { assert!(DEFAULT_DECORATION_GAPS_IN_PX == 6) }
         const { assert!(DEFAULT_DECORATION_GAPS_OUT_PX == 6) }
-        const { assert!(DEFAULT_DECORATION_BORDER_PX == 2) }
+        const { assert!(DEFAULT_DECORATION_BORDER_PX == 1) }
         const { assert!(DEFAULT_DECORATION_RADIUS_PX == 6) }
         const { assert!(DEFAULT_DECORATION_CONTENT_INSET_PX == 6) }
         const { assert!(MAX_DECORATION_GAP_PX == 32) }
@@ -1966,7 +1967,7 @@ mod tests {
         const { assert!(MAX_DECORATION_CONTENT_INSET_PX == 32) }
         let cfg = RuntimeConfig::default();
         assert_eq!((cfg.decoration.gaps_in, cfg.decoration.gaps_out), (6, 6));
-        assert_eq!((cfg.decoration.border, cfg.decoration.radius), (2, 6));
+        assert_eq!((cfg.decoration.border, cfg.decoration.radius), (1, 6));
         assert_eq!(cfg.decoration.content_inset, 6);
         // CTX-0333: sibling and container gaps match by default.
         assert_eq!(cfg.decoration.gaps_in, cfg.decoration.gaps_out);

@@ -184,16 +184,16 @@ fn persistent_selection_survives_resize_clamping_headless() {
     rt.end_selection(CellPos::new(0, 4));
     assert_eq!(rt.selection_text().as_deref(), Some("hello"));
     let pers = rt.persistent_selection().unwrap();
-    // Resize to smaller grid: 4 cols x 2 rows -> selection col 4 clamped to 3.
+    // Resize to smaller grid: 5 cols x 2 rows -> selection col 4 stays valid.
     // CTX-0223/CTX-0375: the window carries the default 8px padding inset on
-    // every side plus the 14px per-side decoration inset. A window-sized
-    // 8x4 container cell area insets to a 4x2 content grid.
+    // every side plus the 13px per-side decoration inset. A window-sized
+    // 8x4 container cell area insets to a 5x2 content grid.
     rt.handle_resize(PhysicalSize::new(9 * 8 + 16, 19 * 4 + 16))
         .expect("resize small must succeed");
-    // Persistent selection columns should be clamped to new width (3)
+    // Persistent selection columns should be clamped to new width (4)
     let clamped = pers.clamped(rt.state());
-    // Original anchor col 0 stays 0, focus col 4 -> clamped to 3
-    assert!(clamped.focus.col <= 3);
+    // Original anchor col 0 stays 0, focus col 4 stays 4
+    assert!(clamped.focus.col <= 4);
     assert!(clamped.is_valid(rt.state()));
     // Restoring the clamped persistent should succeed as still live
     let mut rt2 = make_runtime();
@@ -206,12 +206,12 @@ fn persistent_selection_survives_resize_clamping_headless() {
     // Runtime's automatic clamping after resize should keep selection valid and non-empty
     assert!(rt2.has_selection());
     let sel = rt2.selection().unwrap();
-    assert!(sel.anchor.col < 4 && sel.focus.col < 4);
+    assert!(sel.anchor.col < 5 && sel.focus.col < 5);
     assert!(rt2.persistent_selection().is_some());
     // After resize, search still headless and deterministic
     let m = rt2.search("hello", SearchOptions::default());
-    // "hello" was truncated? After resize width 4, the line "hello resize" was truncated to width 4,
-    // so "hello" no longer fits as contiguous in the grid (only "hell" visible). Search may find prefix.
+    // After resize width 5, the line "hello resize" was truncated to width 5,
+    // so "hello" still fits as contiguous in the grid. Search may find it.
     // We just assert headless not panic and result is deterministic.
     assert!(m.len() <= SEARCH_MAX_RESULTS);
     // Original persistent's text after resize may be truncated due to width change

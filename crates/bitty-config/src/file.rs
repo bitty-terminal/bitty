@@ -33,7 +33,7 @@
 //!     terminal = { scrollback = 10000, shell = "/bin/fish", scroll_lines_per_notch = 3, scroll_pixels_per_notch = 16 },
 //!     selection = { auto_copy = true }, -- opt in to copy-on-select; false (default) matches kitty/ghostty (CTX-0371)
 //!     layout = { gaps_in = 1, gaps_out = 2 }, -- Hyprland-like panel gaps in cells, 0 = edge-to-edge (CTX-0177, default 0/0)
-//!     decoration = { gaps_in = 6, gaps_out = 6, border = 2, radius = 6, content_inset = 6 }, -- Core-owned workspace decoration in logical px; unified sibling/container gap + content padding (CTX-0292/CTX-0333)
+//!     decoration = { gaps_in = 6, gaps_out = 6, border = 1, radius = 6, content_inset = 6 }, -- Core-owned workspace decoration in logical px; unified sibling/container gap + content padding (CTX-0292/CTX-0333)
 //!     scrollbar = { mode = "auto", width = 8 }, -- overlay scrollback thumb: auto (default) | hidden | always (CTX-0181, default auto/8)
 //!     mouse = { focus_follows_mouse = true, focus_follows_mouse_delay_ms = 0 }, -- opt-in hover focus, default false = click-to-focus (CTX-0260/CTX-0334)
 //!     mod_key = "alt", -- leader/mod for the shipped chrome map: "alt" (default) or "super" (CTX-0236)
@@ -1457,7 +1457,7 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
     // pattern: absent table means "this layer says nothing" (plan.decoration
     // None so merge keeps the lower-precedence value). When the table is
     // present, omitted keys default to the unified decoration defaults
-    // (gaps 6/6, border 2, radius 6, content inset 6) so
+    // (gaps 6/6, border 1, radius 6, content inset 6) so
     // `decoration = { gaps_in = 2 }` keeps working without forcing the other
     // keys. Present values are range-checked here (fail-closed with the
     // field path) and again by `DecorationConfig::validate` via
@@ -2372,7 +2372,7 @@ mod tests {
         // CTX-0292/CTX-0333: explicit decoration parses; absent table means
         // "says nothing" (plan.decoration None so merge keeps lower);
         // present-but-partial defaults omitted keys to the unified defaults
-        // (gaps 6/6, border 2, radius 6, content inset 6); wrong types and
+        // (gaps 6/6, border 1, radius 6, content inset 6); wrong types and
         // out-of-range fail closed naming the field.
         let plan = parse_lua_config(
             r#"return { decoration = { gaps_in = 0, gaps_out = 1, border = 1, radius = 0, content_inset = 2 } }"#,

@@ -175,7 +175,7 @@ fn golden_default_theme_first_frame_digest() {
     let first = rt.tick().expect("first themed frame presents");
     let actual = digest(&rt, &first);
     assert_eq!(
-        actual, 0xd4aa_0a9b_8ff1_e093,
+        actual, 0xf194_7117_d9e4_06d1,
         "default themed frame digest changed (actual 0x{actual:016x})"
     );
     let rgba = rt.headless_rgba().expect("rgba");

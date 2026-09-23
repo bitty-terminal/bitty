@@ -252,7 +252,7 @@ fn live_split_then_close_restores_primary_grid_without_loss() {
         .expect("widen-back leaves exactly one frame");
     let wide_cols = usize::from(wide_frame.cols);
     assert_eq!(rt.present_frames().len(), 1, "close leaves one leaf");
-    assert_eq!(wide_cols, 76, "single decorated pane keeps 76 content cols");
+    assert_eq!(wide_cols, 77, "single decorated pane keeps 77 content cols");
     assert_eq!(
         rt.snapshot().width,
         wide_cols,

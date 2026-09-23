@@ -273,6 +273,10 @@ impl Runtime {
         // CTX-0297: the pane terminal captures the configured scrollback
         // capacity at creation (restart-required reload class).
         let mut state = State::with_scrollback_lines(self.config.scrollback);
+        // CTX-0756 (issue #1359): every spawned pane seeds the configured
+        // default cursor shape (effective `terminal.cursor_style`), like the
+        // primary terminal at construction.
+        state.set_default_cursor_style(self.config.cursor_style);
         state.resize(cols as usize, rows as usize);
         let old_session = self.pane_sessions.remove(&view);
         let old_handle = old_session.and_then(|mut old| {

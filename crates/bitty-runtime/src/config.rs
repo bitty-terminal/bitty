@@ -68,6 +68,21 @@ pub const DEFAULT_SELECTION_AUTO_COPY: bool = false;
 /// defaults must stay equal — covered by a cross-crate test in `bitty-app`).
 pub const DEFAULT_CLOSE_CONFIRM_MODE: CloseConfirmMode = CloseConfirmMode::WhenBusy;
 
+/// Default cursor rendering shape (CTX-0756, issue #1359
+/// `terminal.cursor_style`): `Default` (the renderer's block fallback).
+/// Mirrors `bitty-config` `DEFAULT_CURSOR_STYLE` by value (kept as a local
+/// constant because `bitty-runtime` must not depend on `bitty-config`;
+/// `bitty-app` maps the effective value across at startup and the two
+/// defaults must stay equal — covered by a cross-crate test in `bitty-app`).
+pub const DEFAULT_CURSOR_STYLE: bitty_vt::CursorStyle = bitty_vt::CursorStyle::Default;
+
+/// Default user-visible bell behavior (CTX-0756, issue #1359
+/// `terminal.bell`): `Visual` (bounded flash, never audible).
+/// Mirrors `bitty-config` `DEFAULT_BELL_MODE` by value (same no-dependency
+/// rule and cross-crate test as above).
+pub const DEFAULT_BELL_MODE: crate::runtime::bell::BellMode =
+    crate::runtime::bell::BellMode::Visual;
+
 /// Close-confirmation mode for view/window close gestures (CTX-0370 top-level
 /// `close_confirm`).
 ///
@@ -700,6 +715,20 @@ pub struct RuntimeConfig {
     /// tracker lives on [`crate::Runtime`] because it holds wall-clock state;
     /// this is the immutable contract it is armed from.
     pub animations: AnimationPolicy,
+    /// Default cursor rendering shape (CTX-0756, issue #1359
+    /// `terminal.cursor_style`; default [`DEFAULT_CURSOR_STYLE`]). Applied
+    /// by [`crate::Runtime`] at terminal creation: it seeds new panes and
+    /// resolves app `DECSCUSR 0` resets. The app layer assigns the validated
+    /// effective value post-construction, following the `focus_follows_mouse`
+    /// pattern.
+    pub cursor_style: bitty_vt::CursorStyle,
+    /// User-visible bell behavior (CTX-0756, issue #1359 `terminal.bell`;
+    /// default [`DEFAULT_BELL_MODE`]). Applied by [`crate::Runtime`] at
+    /// construction; live toggles go through
+    /// [`crate::Runtime::set_bell_mode`]. The app layer assigns the validated
+    /// effective value post-construction, following the `focus_follows_mouse`
+    /// pattern.
+    pub bell_mode: crate::runtime::bell::BellMode,
 }
 
 /// Default cell width in logical pixels (CTX-0157 breathing-room cell).
@@ -755,6 +784,8 @@ impl Default for RuntimeConfig {
             scrollbar_mode: bitty_ui::ScrollbarMode::Auto,
             scrollbar_width: DEFAULT_SCROLLBAR_WIDTH,
             animations: AnimationPolicy::default(),
+            cursor_style: DEFAULT_CURSOR_STYLE,
+            bell_mode: DEFAULT_BELL_MODE,
         }
     }
 }
@@ -838,6 +869,8 @@ impl RuntimeConfig {
             scrollbar_mode,
             scrollbar_width,
             animations: AnimationPolicy::default(),
+            cursor_style: DEFAULT_CURSOR_STYLE,
+            bell_mode: DEFAULT_BELL_MODE,
         };
         cfg.validate()?;
         Ok(cfg)

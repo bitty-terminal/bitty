@@ -716,6 +716,10 @@ pub fn inspect_config(query: &str) -> Option<ConfigInfo> {
             .shell
             .clone()
             .unwrap_or_else(|| "(unset: $SHELL or /bin/sh)".to_string()),
+        // CTX-0756 (issue #1359): default cursor shape (renderer block
+        // fallback) and bell behavior (visual flash).
+        "terminal.cursor_style" => defaults.terminal.cursor_style.as_str().to_string(),
+        "terminal.bell" => defaults.terminal.bell.as_str().to_string(),
         "selection.auto_copy" => defaults.selection.auto_copy.to_string(),
         "layout.gaps_in" => defaults.layout.gaps_in.to_string(),
         "layout.gaps_out" => defaults.layout.gaps_out.to_string(),
@@ -1231,7 +1235,7 @@ pub fn run_inspect(request: &InspectRequest) -> i32 {
             }
             None => {
                 let message = format!(
-                    "bitty inspect: unknown config key {:?} (try font.size, font.family, appearance.theme, window.opacity, terminal.scrollback, selection.auto_copy, layout.gaps_in, decoration.content_inset, scrollbar.mode, mouse.focus_follows_mouse, mouse.focus_follows_mouse_delay_ms, appearance.animations.enabled, appearance.animations.reduced_motion, appearance.animations.duration_ms.open, appearance.animations.easing.open, mod_key, close_confirm)",
+                    "bitty inspect: unknown config key {:?} (try font.size, font.family, appearance.theme, window.opacity, terminal.scrollback, terminal.cursor_style, terminal.bell, selection.auto_copy, layout.gaps_in, decoration.content_inset, scrollbar.mode, mouse.focus_follows_mouse, mouse.focus_follows_mouse_delay_ms, appearance.animations.enabled, appearance.animations.reduced_motion, appearance.animations.duration_ms.open, appearance.animations.easing.open, mod_key, close_confirm)",
                     request.value,
                 );
                 if emit_json {
@@ -1522,6 +1526,14 @@ mod tests {
             inspect_config("mouse.focus_follows_mouse_delay_ms").expect("mouse delay key");
         assert_eq!(hover_delay.key, "mouse.focus_follows_mouse_delay_ms");
         assert_eq!(hover_delay.value, "0");
+        // CTX-0756 (issue #1359): cursor shape and bell defaults are
+        // inspectable like every scalar.
+        let cursor_style = inspect_config("terminal.cursor_style").expect("cursor key");
+        assert_eq!(cursor_style.key, "terminal.cursor_style");
+        assert_eq!(cursor_style.value, "default");
+        let bell = inspect_config("TERMINAL.BELL").expect("bell key (case-insensitive)");
+        assert_eq!(bell.key, "terminal.bell");
+        assert_eq!(bell.value, "visual");
         assert!(inspect_config("font.nope").is_none());
         assert!(inspect_config("").is_none());
     }

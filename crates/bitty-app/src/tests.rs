@@ -1958,6 +1958,96 @@ fn runtime_config_inherits_file_close_confirm() {
 }
 
 #[test]
+fn runtime_config_inherits_file_cursor_style_and_bell() {
+    // CTX-0756 (issue #1359): `terminal.cursor_style` / `terminal.bell`
+    // flow file -> effective -> runtime; crate defaults stay equal
+    // (`bitty-runtime` must not depend on `bitty-config`, so the pairing
+    // is by value, pinned here). Defaults preserve pre-1359 behavior
+    // (block-fallback cursor, visual flash).
+    assert_eq!(
+        bitty_runtime::config::DEFAULT_CURSOR_STYLE,
+        bitty_vt::CursorStyle::Default
+    );
+    assert_eq!(
+        bitty_config::types::DEFAULT_CURSOR_STYLE.as_str(),
+        "default"
+    );
+    assert_eq!(
+        bitty_runtime::config::DEFAULT_BELL_MODE,
+        bitty_runtime::BellMode::Visual
+    );
+    assert_eq!(bitty_config::types::DEFAULT_BELL_MODE.as_str(), "visual");
+    use bitty_config::file::{parse_lua_config, resolve_effective};
+    use bitty_config::plan::{ConfigSource, LayerKind};
+    let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+    let plan = parse_lua_config(
+        r#"return { terminal = { scrollback = 10000, cursor_style = "steady_bar", bell = "off" } }"#,
+        &src,
+    )
+    .expect("cursor/bell parse");
+    let merged = resolve_effective(Some(bitty_config::plan::LayeredPlan::new(src, plan)), None)
+        .expect("merge");
+    assert_eq!(
+        merged.effective.terminal.cursor_style,
+        bitty_config::CursorStyle::SteadyBar
+    );
+    assert_eq!(merged.effective.terminal.bell, bitty_config::BellMode::Off);
+    let cfg = runtime_config_from_effective(&merged.effective).expect("runtime cfg builds");
+    assert_eq!(cfg.cursor_style, bitty_vt::CursorStyle::SteadyBar);
+    assert_eq!(cfg.bell_mode, bitty_runtime::BellMode::Off);
+    assert_eq!(
+        merged.source_of("terminal.cursor_style").unwrap().layer,
+        bitty_config::plan::LayerKind::User
+    );
+    assert_eq!(
+        merged.source_of("terminal.bell").unwrap().layer,
+        bitty_config::plan::LayerKind::User
+    );
+    // Absent leaves ride the fail-closed defaults end to end.
+    let src2 = ConfigSource::new(LayerKind::User, Some("init.lua"));
+    let plan2 = parse_lua_config(r#"return { terminal = { scrollback = 10000 } }"#, &src2)
+        .expect("minimal terminal parses");
+    let merged2 = resolve_effective(
+        Some(bitty_config::plan::LayeredPlan::new(src2, plan2)),
+        None,
+    )
+    .expect("merge");
+    let cfg2 = runtime_config_from_effective(&merged2.effective).expect("builds");
+    assert_eq!(cfg2.cursor_style, bitty_vt::CursorStyle::Default);
+    assert_eq!(cfg2.bell_mode, bitty_runtime::BellMode::Visual);
+    // Every cursor spelling maps across without loss.
+    for (raw, expected) in [
+        ("default", bitty_vt::CursorStyle::Default),
+        ("blinking_block", bitty_vt::CursorStyle::BlinkingBlock),
+        ("steady_block", bitty_vt::CursorStyle::SteadyBlock),
+        (
+            "blinking_underline",
+            bitty_vt::CursorStyle::BlinkingUnderline,
+        ),
+        ("steady_underline", bitty_vt::CursorStyle::SteadyUnderline),
+        ("blinking_bar", bitty_vt::CursorStyle::BlinkingBar),
+        ("steady_bar", bitty_vt::CursorStyle::SteadyBar),
+    ] {
+        let mut effective = bitty_config::EffectiveConfig::default();
+        effective.terminal.cursor_style =
+            bitty_config::CursorStyle::parse(raw).expect("spelling valid");
+        let mapped = runtime_config_from_effective(&effective).expect("builds");
+        assert_eq!(mapped.cursor_style, expected, "cursor {raw}");
+    }
+    for (raw, expected) in [
+        ("off", bitty_runtime::BellMode::Off),
+        ("visual", bitty_runtime::BellMode::Visual),
+        ("audible", bitty_runtime::BellMode::Audible),
+        ("both", bitty_runtime::BellMode::Both),
+    ] {
+        let mut effective = bitty_config::EffectiveConfig::default();
+        effective.terminal.bell = bitty_config::BellMode::parse(raw).expect("spelling valid");
+        let mapped = runtime_config_from_effective(&effective).expect("builds");
+        assert_eq!(mapped.bell_mode, expected, "bell {raw}");
+    }
+}
+
+#[test]
 fn runtime_config_inherits_file_focus_follows_mouse() {
     // CTX-0260: `mouse.focus_follows_mouse` flows file -> effective ->
     // runtime; crate defaults stay equal (bitty-runtime must not depend

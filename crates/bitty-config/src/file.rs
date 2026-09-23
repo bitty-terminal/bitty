@@ -30,7 +30,7 @@
 //!     -- font = { family = "JetBrainsMono Nerd Font", size = 12.0,
 //!     --          line_height = 1.375, letter_spacing = 2.0 },
 //!     window = { opacity = 0.95, padding = 8 },
-//!     terminal = { scrollback = 10000, shell = "/bin/fish", scroll_lines_per_notch = 3, scroll_pixels_per_notch = 16 },
+//!     terminal = { scrollback = 10000, shell = "/bin/fish", scroll_lines_per_notch = 3, scroll_pixels_per_notch = 16, cursor_style = "steady_bar", bell = "visual" },
 //!     selection = { auto_copy = true }, -- opt in to copy-on-select; false (default) matches kitty/ghostty (CTX-0371)
 //!     layout = { gaps_in = 1, gaps_out = 2 }, -- Hyprland-like panel gaps in cells, 0 = edge-to-edge (CTX-0177, default 0/0)
 //!     decoration = { gaps_in = 6, gaps_out = 6, border = 1, radius = 6, content_inset = 6 }, -- Core-owned workspace decoration in logical px; unified sibling/container gap + content padding (CTX-0292/CTX-0333)
@@ -91,8 +91,15 @@
 //!   no-op, CTX-0241 S0) when omitted, so existing `{ opacity, padding }`
 //!   tables keep working), `terminal` needs
 //!   `scrollback` (`shell`, `scroll_lines_per_notch`,
-//!   `scroll_pixels_per_notch` optional, defaulting to
-//!   [`TerminalConfig`](crate::types::TerminalConfig) defaults when absent).
+//!   `scroll_pixels_per_notch`, `cursor_style`, `bell` optional, defaulting to
+//!   [`TerminalConfig`](crate::types::TerminalConfig) defaults when absent:
+//!   `cursor_style` is one of `"default"` (renderer block fallback) |
+//!   `"blinking_block"` | `"steady_block"` | `"blinking_underline"` |
+//!   `"steady_underline"` | `"blinking_bar"` | `"steady_bar"` (CTX-0756);
+//!   `bell` is one of `"off"` | `"visual"` (default) | `"audible"` |
+//!   `"both"`, where `audible`/`both` count without sounding until the
+//!   owner-pending OS primitive lands (OQ-076, CTX-0754/#1361); unknown
+//!   spellings fail closed with the field path).
 //!   `selection` is fully optional (absent table/key means "this layer says
 //!   nothing"); when present, `auto_copy` defaults to
 //!   [`SelectionConfig`](crate::types::SelectionConfig) default `false`
@@ -1331,11 +1338,46 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
                         v as u32
                     }
                 };
+                // CTX-0756 (issue #1359): cursor shape and bell behavior are
+                // optional closed-enum leaves following the table-present
+                // convention of the scroll-speed leaves above: absent
+                // inherits the type default, present values are parsed
+                // fail-closed with the field path (unknown spellings reject
+                // the reload, never a silent fallback) and again by
+                // `TerminalConfig::validate` via `plan.validate()`.
+                let cursor_style = match t.cursor_style.as_deref() {
+                    None => defaults.cursor_style,
+                    Some(raw) => match crate::types::CursorStyle::parse(raw.trim()) {
+                        Some(style) => style,
+                        None => {
+                            return Err(ConfigError::validation(
+                                "terminal.cursor_style",
+                                "must be one of \"default\", \"blinking_block\", \
+                                 \"steady_block\", \"blinking_underline\", \
+                                 \"steady_underline\", \"blinking_bar\", \"steady_bar\"",
+                            ));
+                        }
+                    },
+                };
+                let bell = match t.bell.as_deref() {
+                    None => defaults.bell,
+                    Some(raw) => match crate::types::BellMode::parse(raw.trim()) {
+                        Some(mode) => mode,
+                        None => {
+                            return Err(ConfigError::validation(
+                                "terminal.bell",
+                                "must be one of \"off\", \"visual\", \"audible\", \"both\"",
+                            ));
+                        }
+                    },
+                };
                 Some(TerminalConfig {
                     scrollback: scrollback as u32,
                     shell: t.shell,
                     scroll_lines_per_notch,
                     scroll_pixels_per_notch,
+                    cursor_style,
+                    bell,
                 })
             }
             None => {
@@ -2193,6 +2235,45 @@ mod tests {
             let msg = err.to_string();
             assert!(
                 msg.contains("scroll_lines_per_notch") || msg.contains("scroll_pixels_per_notch"),
+                "must name the field: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn lua_terminal_cursor_style_and_bell_parse_and_validate() {
+        // CTX-0756 (issue #1359): explicit cursor/bell leaves parse;
+        // absent leaves inherit the type defaults (same table-present
+        // convention as the scroll-speed leaves); unknown spellings and
+        // wrong types fail closed naming the field.
+        let plan = parse_lua_config(
+            r#"return { terminal = { scrollback = 10000, cursor_style = "steady_bar", bell = "both" } }"#,
+            &test_source(),
+        )
+        .expect("cursor/bell parse");
+        let term = plan.terminal.unwrap();
+        assert_eq!(term.cursor_style, crate::types::CursorStyle::SteadyBar);
+        assert_eq!(term.bell, crate::types::BellMode::Both);
+        let plan = parse_lua_config(
+            r#"return { terminal = { scrollback = 10000 } }"#,
+            &test_source(),
+        )
+        .expect("absent cursor/bell parse");
+        let term = plan.terminal.unwrap();
+        assert_eq!(term.cursor_style, crate::types::DEFAULT_CURSOR_STYLE);
+        assert_eq!(term.bell, crate::types::DEFAULT_BELL_MODE);
+        for bad in [
+            r#"return { terminal = { scrollback = 10000, cursor_style = "bar" } }"#,
+            r#"return { terminal = { scrollback = 10000, cursor_style = "STEADY_BAR" } }"#,
+            r#"return { terminal = { scrollback = 10000, cursor_style = 5 } }"#,
+            r#"return { terminal = { scrollback = 10000, bell = "loud" } }"#,
+            r#"return { terminal = { scrollback = 10000, bell = "VISUAL" } }"#,
+            r#"return { terminal = { scrollback = 10000, bell = true } }"#,
+        ] {
+            let err = parse_lua_config(bad, &test_source()).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("terminal.cursor_style") || msg.contains("terminal.bell"),
                 "must name the field: {msg}"
             );
         }

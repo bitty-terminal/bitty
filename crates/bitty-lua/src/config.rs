@@ -32,7 +32,7 @@
 //!     appearance = { theme = "bitty-dark" }, -- wins over the alias
 //!     font = { family = "JetBrains Mono", size = 13.0 },
 //!     window = { opacity = 0.95, padding = 8 },
-//!     terminal = { scrollback = 10000, shell = "/bin/fish", scroll_lines_per_notch = 3, scroll_pixels_per_notch = 16 },
+//!     terminal = { scrollback = 10000, shell = "/bin/fish", scroll_lines_per_notch = 3, scroll_pixels_per_notch = 16, cursor_style = "steady_bar", bell = "visual" },
 //!     selection = { auto_copy = true }, -- opt in to copy-on-select; false (default) matches kitty/ghostty (CTX-0371)
 //!     layout = { gaps_in = 1, gaps_out = 2 }, -- Hyprland-like panel gaps in cells, 0 = edge-to-edge (CTX-0177)
 //!     decoration = { gaps_in = 6, gaps_out = 6, border = 2, radius = 6, content_inset = 6 }, -- Core-owned workspace decoration in logical px; unified gaps + content padding (CTX-0292/CTX-0333)
@@ -186,6 +186,14 @@ pub struct TerminalData {
     pub scroll_lines_per_notch: Option<i64>,
     /// Smooth-scroll pixels per wheel notch (present only when the key is set).
     pub scroll_pixels_per_notch: Option<i64>,
+    /// Default cursor shape string (CTX-0756, issue #1359
+    /// `terminal.cursor_style`; present only when the key is set, raw
+    /// spelling validated downstream in `bitty-config`).
+    pub cursor_style: Option<String>,
+    /// Bell behavior string (CTX-0756, issue #1359 `terminal.bell`;
+    /// present only when the key is set, raw spelling validated downstream
+    /// in `bitty-config`).
+    pub bell: Option<String>,
 }
 
 /// Selection overrides, plain data (CTX-0191; see [`FontData`] for `Option`
@@ -1138,6 +1146,8 @@ impl ConfigData {
                             "shell",
                             "scroll_lines_per_notch",
                             "scroll_pixels_per_notch",
+                            "cursor_style",
+                            "bell",
                         ],
                     )?;
                     let scrollback = match get_field(nested, "scrollback") {
@@ -1157,11 +1167,21 @@ impl ConfigData {
                         Some(v) => Some(expect_integer("terminal.scroll_pixels_per_notch", v)?),
                         None => None,
                     };
+                    let cursor_style = match get_field(nested, "cursor_style") {
+                        Some(v) => Some(expect_string("terminal.cursor_style", v)?),
+                        None => None,
+                    };
+                    let bell = match get_field(nested, "bell") {
+                        Some(v) => Some(expect_string("terminal.bell", v)?),
+                        None => None,
+                    };
                     out.terminal = Some(TerminalData {
                         scrollback,
                         shell,
                         scroll_lines_per_notch,
                         scroll_pixels_per_notch,
+                        cursor_style,
+                        bell,
                     });
                 }
                 "selection" => {
@@ -1849,6 +1869,39 @@ mod tests {
         assert_eq!(term.shell, None);
         assert_eq!(term.scroll_lines_per_notch, None);
         assert_eq!(term.scroll_pixels_per_notch, None);
+        // CTX-0756 (issue #1359): cursor/bell leaves are optional extras
+        // with the same absent-means-silent contract.
+        assert_eq!(term.cursor_style, None);
+        assert_eq!(term.bell, None);
+    }
+
+    #[test]
+    fn terminal_cursor_style_and_bell_extract() {
+        // CTX-0756 (issue #1359): explicit strings extract raw (typed
+        // validation lives downstream in `bitty-config`); absent keys are
+        // `None`; wrong types are shape errors naming the field.
+        let data = eval_ok(
+            r#"return { terminal = { scrollback = 10000, cursor_style = "steady_bar", bell = "both" } }"#,
+        );
+        let term = data.terminal.unwrap();
+        assert_eq!(term.cursor_style.as_deref(), Some("steady_bar"));
+        assert_eq!(term.bell.as_deref(), Some("both"));
+        let mut vm = LuaVm::new("test.terminal-cursor-bell-type");
+        for code in [
+            r#"return { terminal = { scrollback = 10000, cursor_style = 5 } }"#,
+            r#"return { terminal = { scrollback = 10000, bell = true } }"#,
+        ] {
+            match vm.eval_config(code).expect("no refuse") {
+                ConfigOutcome::ShapeError { message } => {
+                    assert!(
+                        message.contains("terminal.cursor_style")
+                            || message.contains("terminal.bell"),
+                        "must name the field: {message}"
+                    );
+                }
+                other => panic!("expected shape error, got {other:?}"),
+            }
+        }
     }
 
     #[test]

@@ -171,7 +171,15 @@ cmd_run() {
     if ((rc != 0)) || ((failed > 0)) || ((ignored > 0)); then
       status="fail"
     elif ((passed < min)); then
-      status="fail"
+      # live_compat.rs is #![cfg(unix)]: on windows it legitimately
+      # compiles to zero tests. Waive the floor only for that exact
+      # empty shape (0 passed with rc 0 and 0 failed); any real
+      # shortfall (e.g. 7 passed) still fails the leg.
+      if [ "$suite" = "live_compat" ] && [ "$platform" = "windows" ] && ((passed == 0)); then
+        status="pass"
+      else
+        status="fail"
+      fi
     fi
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$platform" "$suite" "$status" "$passed" "$failed" "$ignored" >>"$out"
     printf '| `%s` | %s | %s | %s | %s | %s |\n' "$suite" "$pkg" "$status" "$passed" "$failed" "$ignored" >>"$table"

@@ -71,16 +71,19 @@ pub fn wheel_project_file(dir: &Path) -> PathBuf {
 
 /// Discover the project definition above `start` (OQ-068 order).
 ///
-/// Walks `start` and its ancestors (at most [`MAX_WHEEL_SEARCH_DEPTH`]
-/// levels): the nearest `.wheel/project.toml` wins; otherwise the nearest
-/// `.agents/` directory wins as compatibility. Returns `None` when neither
-/// exists within range. `exists` is injected so tests cover the order without
-/// touching the filesystem; [`discover_on_fs`] supplies the live seam.
+/// Two-phase walk over `start` and its ancestors (at most
+/// [`MAX_WHEEL_SEARCH_DEPTH`] levels each): first the nearest
+/// `.wheel/project.toml` wins; only when no `.wheel/project.toml` exists
+/// within range does a second pass return the nearest `.agents/` directory
+/// as compatibility. An ancestor `.wheel/` is therefore never shadowed by a
+/// nested `.agents/`. Returns `None` when neither exists within range.
+/// `exists` is injected so tests cover the order without touching the
+/// filesystem; [`discover_on_fs`] supplies the live seam.
 pub fn discover(start: &Path, exists: &dyn Fn(&Path) -> bool) -> Option<WheelDiscovery> {
     let mut current = Some(start);
     let mut depth = 0;
     while depth < MAX_WHEEL_SEARCH_DEPTH {
-        let dir = current?;
+        let Some(dir) = current else { break };
         let project = wheel_project_file(dir);
         if exists(&project) {
             return Some(WheelDiscovery {
@@ -88,6 +91,13 @@ pub fn discover(start: &Path, exists: &dyn Fn(&Path) -> bool) -> Option<WheelDis
                 source: WheelSource::Wheel,
             });
         }
+        current = dir.parent();
+        depth += 1;
+    }
+    let mut current = Some(start);
+    let mut depth = 0;
+    while depth < MAX_WHEEL_SEARCH_DEPTH {
+        let Some(dir) = current else { break };
         let agents = dir.join(AGENTS_DIR_NAME);
         if exists(&agents) {
             return Some(WheelDiscovery {
@@ -125,6 +135,18 @@ mod tests {
             .expect("a definition must be found");
         assert_eq!(found.source, WheelSource::Wheel);
         assert_eq!(found.path, PathBuf::from("/repo/.wheel/project.toml"));
+    }
+
+    #[test]
+    fn ancestor_wheel_wins_over_nested_agents() {
+        // Regression for #1313: a nested `.agents/` must never shadow an
+        // ancestor `.wheel/project.toml` (two-phase walk, never a competing
+        // source of truth).
+        let present = existing(&["/r/.wheel/project.toml", "/r/a/b/.agents"]);
+        let found = discover(Path::new("/r/a/b"), &|path| present.contains(path))
+            .expect("ancestor wheel definition must be found");
+        assert_eq!(found.source, WheelSource::Wheel);
+        assert_eq!(found.path, PathBuf::from("/r/.wheel/project.toml"));
     }
 
     #[test]

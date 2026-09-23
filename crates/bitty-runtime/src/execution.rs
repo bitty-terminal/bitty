@@ -124,8 +124,9 @@ pub use delivery::{
     MAX_STORED_OBSERVATION_EVENTS, StoredEvent,
 };
 pub use lease::{
-    LeaseError, LeaseEvent, LeaseHolder, LeaseState, MAX_PANEL_DESCRIPTION_CHARS,
-    MAX_PANEL_TITLE_CHARS, PanelLease, validate_description, validate_title,
+    LeaseError, LeaseEvent, LeaseHolder, LeaseState, MAX_LEASE_TERM_TICKS,
+    MAX_PANEL_DESCRIPTION_CHARS, MAX_PANEL_TITLE_CHARS, PanelLease, validate_description,
+    validate_title,
 };
 pub use model::{
     AttachReceipt, DEFAULT_RETENTION_TTL, JobCancel, JobError, JobEvent, JobGrant, JobId, JobIo,

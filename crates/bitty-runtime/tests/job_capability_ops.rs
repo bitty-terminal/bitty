@@ -1014,7 +1014,7 @@ fn principal_validation_edges_fail_closed() {
         assert!(!operation.as_str().is_empty());
         assert_eq!(operation.to_string(), operation.as_str());
     }
-    assert_eq!(JobOperation::all().len(), 7);
+    assert_eq!(JobOperation::all().len(), 8);
 }
 
 // ── hostile: unknown ids deny identically (no existence oracle) ─────────────

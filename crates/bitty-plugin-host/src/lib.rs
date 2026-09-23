@@ -91,7 +91,7 @@
 //! | OQ-084 ontology/identity | `identity` | [`identity::EntityKind`] ten first-class kinds, [`identity::OntologyId`] `kind:value` identifiers, [`identity::Ownership`] links plus [`identity::Lifetime`] |
 //! | OQ-055 secret-storage tiers | `secret_tiers` | [`secret_tiers::SecretTier`] four tiers with per-tier [`secret_tiers::TierPolicy`] (consent/audit/redaction); [`secret_tiers::CommandRef`] resolved by [`secret_tiers::execute_command_ref`] (shell-free, bounded); [`secret_tiers::KeyringBackend`] selection plus [`secret_tiers::RotationPolicy`]; [`secret_tiers::check_tier_access`] enforced at the resolve boundary |
 //! | OQ-054 `api_key_env` vs `api_key_cmd` | `credential_ref` | [`credential_ref::CredentialRef`] env/cmd references (names only), [`credential_ref::resolve_precedence`] exclusive-or order plus [`credential_ref::resolve_choice`] call-boundary enforcement, [`credential_ref::check_project_override`] narrow-only boundary, [`credential_ref::ProviderCredentialConfig`] schema surface with [`credential_ref::resolve_provider_credential`] |
-//! | OQ-057 role contract | `roles` | [`roles::AgentRole`] Commander/Implementer/Tester/Reviewer, [`roles::EnforcementPoint`] checks (incl. [`roles::EnforcementPoint::for_request_kind`]), [`roles::SandboxRestrictions`] flags, capability ceilings intersected with grants elsewhere; [`roles::AgentRole::check_request`] enforced by [`effective::authorize_with_role`] |
+//! | OQ-057 role contract | `roles` | [`roles::AgentRole`] Commander/Implementer/Tester/Reviewer, [`roles::EnforcementPoint`] checks (incl. [`roles::EnforcementPoint::for_request_kind`]), per-role dispatch fan-out/depth ceilings ([`roles::AgentRole::check_dispatch`]) enforced by [`effective::delegate_with_role`], prompt-text denial ([`roles::deny_prompt_authority`]), [`roles::SandboxDecl`] posture checked against [`roles::SandboxRestrictions`] ([`roles::AgentRole::check_sandbox_exec`]), capability ceilings intersected with grants elsewhere; [`roles::AgentRole::check_request`] enforced by [`effective::authorize_with_role`] |
 //!
 //! # Drop policy — DropOldest accepted default for v1 (OQ-013 closed decision point)
 //!
@@ -223,7 +223,10 @@ pub use origin::{
     resolve_origin_policy,
 };
 pub use registry::{Generation, PluginState, Registry, RegistryEntry};
-pub use roles::{AgentRole, EnforcementPoint, MAX_ROLE_LABEL_BYTES, SandboxRestrictions};
+pub use roles::{
+    AgentRole, EnforcementPoint, MAX_DELEGATION_DEPTH, MAX_DISPATCH_FANOUT, MAX_ROLE_LABEL_BYTES,
+    SandboxDecl, SandboxRestrictions, deny_prompt_authority,
+};
 pub use secret_tiers::{
     CommandRef as SecretCommandRef, ConsentRule, DEFAULT_ROTATION_MAX_AGE_SECS, KeyringBackend,
     KeyringRef, MAX_COMMAND_OUTPUT_BYTES, MAX_COMMAND_REF_ARGS, MAX_COMMAND_REF_PART_BYTES,

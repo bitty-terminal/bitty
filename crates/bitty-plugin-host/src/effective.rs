@@ -976,6 +976,36 @@ pub fn delegate(
     })
 }
 
+/// Attenuate `request` under `parent` after the adopted role dispatch gate
+/// (OQ-057).
+///
+/// `role` must admit a dispatch of `child_count` subagents at chain
+/// `depth` ([`AgentRole::check_dispatch`]) before [`delegate`] runs;
+/// otherwise the delegation denies fail-closed with
+/// [`DenialKind::PolicyConflict`], naming the bound only (never a plan or
+/// payload). On success this is exactly [`delegate`]: the role gate never
+/// grants, children still narrow under the parent.
+pub fn delegate_with_role(
+    parent: &EffectiveCapability,
+    request: &AgentRequest,
+    kind: RequestKind,
+    role: AgentRole,
+    child_count: u32,
+    depth: u32,
+) -> Result<EffectiveCapability, EffectiveDenial> {
+    if let Err(error) = role.check_dispatch(child_count, depth) {
+        return Err(EffectiveDenial {
+            kind: DenialKind::PolicyConflict,
+            request_kind: kind,
+            chain: vec![DenialStep {
+                layer: None,
+                detail: error.to_string(),
+            }],
+        });
+    }
+    delegate(parent, request, kind)
+}
+
 /// Wide-declaration denials: unrepresentable claims, never widened.
 struct SelfGrant;
 
@@ -1561,6 +1591,54 @@ mod tests {
         };
         let denial = delegate(&parent, &wide, RequestKind::PluginLifecycle).unwrap_err();
         assert_eq!(denial.kind, DenialKind::SelfGrant);
+    }
+
+    #[test]
+    fn delegation_with_role_enforces_dispatch_limits() {
+        // OQ-057: the role dispatch gate runs before attenuation.
+        use crate::roles::MAX_DISPATCH_FANOUT;
+        let parent = EffectiveCapability {
+            caps: [cap("terminal.semantic-read")].into_iter().collect(),
+            max_agents: 3,
+            allow_root: false,
+        };
+        let narrow = AgentRequest {
+            scope: scope_with("child", &["terminal.semantic-read"]),
+            raw_wide: Vec::new(),
+        };
+        // Commander within ceiling attenuates exactly like `delegate`.
+        let child = delegate_with_role(
+            &parent,
+            &narrow,
+            RequestKind::PluginLifecycle,
+            AgentRole::Commander,
+            2,
+            1,
+        )
+        .expect("commander within ceiling attenuates");
+        assert!(child.is_subset_of(&parent));
+        // Commander over fan-out denies before attenuation.
+        let denial = delegate_with_role(
+            &parent,
+            &narrow,
+            RequestKind::PluginLifecycle,
+            AgentRole::Commander,
+            MAX_DISPATCH_FANOUT + 1,
+            0,
+        )
+        .expect_err("fan-out over ceiling must deny");
+        assert_eq!(denial.kind, DenialKind::PolicyConflict);
+        // Non-commanders carry no dispatch authority.
+        let denial = delegate_with_role(
+            &parent,
+            &narrow,
+            RequestKind::AgentSpawn,
+            AgentRole::Implementer,
+            0,
+            0,
+        )
+        .expect_err("implementer dispatches nothing");
+        assert_eq!(denial.kind, DenialKind::PolicyConflict);
     }
 
     #[test]

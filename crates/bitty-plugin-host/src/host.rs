@@ -703,6 +703,48 @@ impl PluginHost {
         }
     }
 
+    /// Attenuate a child request under `parent` after the adopted role
+    /// dispatch gate (OQ-057).
+    ///
+    /// `role` must admit a dispatch of `child_count` subagents at chain
+    /// `depth` before [`crate::effective::delegate`] runs; the gate denies
+    /// fail-closed with [`crate::effective::DenialKind::PolicyConflict`] and
+    /// audits like [`PluginHost::authorize_effective`]. On success the child
+    /// still narrows under the parent: the role gate never grants.
+    pub fn delegate_effective_with_role(
+        &mut self,
+        parent: &crate::effective::EffectiveCapability,
+        request: &crate::effective::AgentRequest,
+        kind: crate::effective::RequestKind,
+        role: crate::roles::AgentRole,
+        child_count: u32,
+        depth: u32,
+    ) -> Result<crate::effective::EffectiveCapability, crate::effective::EffectiveDenial> {
+        let requested: Vec<String> = request
+            .scope
+            .caps
+            .iter()
+            .map(|cap| cap.as_str().to_string())
+            .collect();
+        match crate::effective::delegate_with_role(parent, request, kind, role, child_count, depth)
+        {
+            Ok(child) => {
+                debug_assert!(child.is_subset_of(parent));
+                let granted: Vec<String> = child
+                    .caps
+                    .iter()
+                    .map(|cap| cap.as_str().to_string())
+                    .collect();
+                self.audit.push_allow(kind, &requested, &granted);
+                Ok(child)
+            }
+            Err(denial) => {
+                self.audit.push_deny(kind, &requested, denial.kind);
+                Err(denial)
+            }
+        }
+    }
+
     /// Audit ledger of effective grants and denials (oldest first).
     #[must_use]
     pub fn audit(&self) -> &crate::effective::AuditLedger {

@@ -21,6 +21,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bitty_ipc::execution::EnvPolicy;
+use bitty_plugin_host::roles::{AgentRole, SandboxDecl};
 use bitty_pty::{Pty, PtyBuilder, PtyReader};
 
 use super::closed_pipe_command;
@@ -71,6 +72,19 @@ fn classify_job_spec(spec: &JobSpec, intent: OperationIntent) -> RiskVerdict {
     argv.push(program);
     argv.extend(spec.args.iter().map(String::as_str));
     classify_argv(&argv, false, intent)
+}
+
+/// Whether a spec environment carries no inherited variables (OQ-057).
+///
+/// Both [`EnvPolicy`] variants are sealed today (`Isolated` runs empty,
+/// `Explicit` runs exactly the declared entries); the match stays
+/// exhaustive so a future inheriting variant fails closed at compile time
+/// instead of silently passing sealed roles.
+fn env_policy_is_sealed(policy: &EnvPolicy) -> bool {
+    match policy {
+        EnvPolicy::Isolated => true,
+        EnvPolicy::Explicit { .. } => true,
+    }
 }
 
 // ── registry ────────────────────────────────────────────────────────────────
@@ -320,6 +334,56 @@ impl JobRegistry {
         if owner.as_str().len() > super::model::MAX_JOB_PRINCIPAL_BYTES {
             return Err(JobError::invalid_principal("job principal exceeds bound"));
         };
+        match classify_job_spec(&spec, intent) {
+            RiskVerdict::Allow(_) => {}
+            RiskVerdict::Deny(deny) => return Err(JobError::command_risk_denied(deny)),
+            RiskVerdict::NeedsConsent(tier) => {
+                return Err(JobError::command_risk_needs_consent(tier));
+            }
+        }
+        self.spawn_owned(owner, spec)
+    }
+
+    /// Tracks `spec` owned by `owner` after the command-risk interlock
+    /// *and* the adopted role sandbox gate (OQ-057, #1094), then starts its
+    /// supervisor thread.
+    ///
+    /// `role` must admit the sandbox point for `decl`
+    /// ([`AgentRole::check_sandbox_exec`]), and a role requiring a sealed
+    /// environment additionally requires a sealed spec environment
+    /// ([`env_policy_is_sealed`]): an unsealed spawn for a sealed role
+    /// fails with [`JobError::Denied`] (`spawn`) before anything is
+    /// tracked. The declaration gate constrains what a spawn may claim;
+    /// the sandbox mechanism itself (CRE-5 shell-write closure) stays open
+    /// work. Every other refusal matches [`Self::spawn_checked_as`], and
+    /// every refusal happens before tracking, threading, or execution.
+    ///
+    /// # Errors
+    ///
+    /// [`JobError::Denied`] when the role gate or the environment-seal
+    /// cross-check refuses the spawn, plus the [`Self::spawn_checked_as`]
+    /// failure set otherwise.
+    pub fn spawn_checked_as_with_role(
+        &self,
+        owner: JobPrincipal,
+        spec: JobSpec,
+        intent: OperationIntent,
+        role: AgentRole,
+        decl: &SandboxDecl,
+    ) -> Result<JobId, JobError> {
+        spec.validate()?;
+        if owner.as_str().len() > super::model::MAX_JOB_PRINCIPAL_BYTES {
+            return Err(JobError::invalid_principal("job principal exceeds bound"));
+        };
+        if let Err(error) = role.check_sandbox_exec(decl) {
+            return Err(JobError::denied(JobOperation::Spawn, error.to_string()));
+        }
+        if role.sandbox().env_sealed() && !env_policy_is_sealed(&spec.env) {
+            return Err(JobError::denied(
+                JobOperation::Spawn,
+                "role requires a sealed environment (OQ-057 adopted)",
+            ));
+        }
         match classify_job_spec(&spec, intent) {
             RiskVerdict::Allow(_) => {}
             RiskVerdict::Deny(deny) => return Err(JobError::command_risk_denied(deny)),

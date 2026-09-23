@@ -667,12 +667,14 @@ impl fmt::Display for JobPrincipal {
 
 /// One independently grantable job operation (research 044 §3).
 ///
-/// Every operation is its own capability: holding six of the seven grants
-/// never implies the seventh, and no blanket scope exists.
+/// Every operation is its own capability: holding seven of the eight grants
+/// never implies the eighth, and no blanket scope exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum JobOperation {
     /// Observe lifecycle state: `get`, `list`, event replay, acknowledge.
     Observe,
+    /// Spawn a job under a role-checked sandbox declaration (OQ-057).
+    Spawn,
     /// Read retained output bytes and the metadata-only output index.
     ReadOutput,
     /// Write bytes to an interactive job's stdin.
@@ -693,6 +695,7 @@ impl JobOperation {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Observe => "observe",
+            Self::Spawn => "spawn",
             Self::ReadOutput => "read_output",
             Self::WriteInput => "write_input",
             Self::Signal => "signal",
@@ -702,11 +705,12 @@ impl JobOperation {
         }
     }
 
-    /// All seven operations in a deterministic order.
+    /// All eight operations in a deterministic order.
     #[must_use]
     pub const fn all() -> &'static [JobOperation] {
         &[
             Self::Observe,
+            Self::Spawn,
             Self::ReadOutput,
             Self::WriteInput,
             Self::Signal,
@@ -1297,7 +1301,8 @@ mod tests {
         assert_eq!(owner.to_string(), "owner-a");
         assert_eq!(JobOperation::Cancel.as_str(), "cancel");
         assert_eq!(JobOperation::Cancel.to_string(), "cancel");
-        assert_eq!(JobOperation::all().len(), 7);
+        assert_eq!(JobOperation::Spawn.as_str(), "spawn");
+        assert_eq!(JobOperation::all().len(), 8);
         assert_eq!(JobSignal::Kill.as_str(), "kill");
     }
 }

@@ -122,8 +122,10 @@
 //!   merge-by-id rule). Duplicate ids within one layer fail closed with the
 //!   `plugins[<n>].id` path. Bare strings are not accepted (tables only,
 //!   like `keymaps`).
-//! - `extends` and profile names remain non-user layers and are rejected
-//!   as undeclared here.
+//! - `extends` is accepted only in profile layers (`LayerKind::Profile`,
+//!   CTX-0759): a single-parent profile name validated fail-closed and
+//!   resolved by [`load_profile_chain`]. In every other layer it is
+//!   rejected as undeclared here.
 //! - Empty chunk / no return / `return nil` means "no user overrides".
 //!
 //! # Bounds and failure posture (threat T-01)
@@ -181,6 +183,12 @@ pub const PROFILES_DIR_NAME: &str = "profiles";
 
 /// Maximum profile name length (fail-closed; keeps paths bounded).
 pub const MAX_PROFILE_NAME_LEN: usize = 64;
+
+/// Maximum `extends` hops followed for one `--profile` request (CTX-0759,
+/// fail-closed). Cycles are rejected earlier by the visited set; this
+/// bounds degenerate linear chains so one request cannot force unbounded
+/// file reads.
+pub const MAX_PROFILE_CHAIN_LEN: usize = 16;
 
 /// Maximum config file size in bytes (fail-closed).
 pub const MAX_CONFIG_FILE_BYTES: usize = 64 * 1024;
@@ -897,6 +905,9 @@ pub fn resolve_effective(
 /// Merges optional profile + file (User) layers with CLI overrides into the
 /// effective config (CTX-0169; appearance overrides extended by CTX-0180).
 ///
+/// Single-profile shorthand for [`resolve_effective_with_profiles`]; pass a
+/// [`load_profile_chain`] result there to merge a full `extends` chain.
+///
 /// Precedence (per `lua-and-xdg.md` §Layers and #271): `CLI > user file >
 /// profile > defaults` via [`crate::merge_layers`] — the merge sorts by
 /// [`LayerKind::precedence`] (`Cli 70 > User 50 > Profile 40`), so input
@@ -918,8 +929,27 @@ pub fn resolve_effective_full(
     profile: Option<LayeredPlan>,
     cli: &CliOverrides,
 ) -> Result<crate::merge::MergedConfig, ConfigError> {
+    resolve_effective_with_profiles(file, profile.into_iter().collect(), cli)
+}
+
+/// Merges an optional file (User) layer, a base-first profile `extends`
+/// chain, and CLI overrides into the effective config (CTX-0759, #1366).
+///
+/// Same precedence as [`resolve_effective_full`] (`CLI > user file >
+/// profile > defaults`); every chain link is a [`LayerKind::Profile`]
+/// layer, and the stable precedence sort keeps the chain's base-first
+/// order so the requested profile overrides its ancestors per field.
+///
+/// # Errors
+///
+/// Same as [`resolve_effective_full`].
+pub fn resolve_effective_with_profiles(
+    file: Option<LayeredPlan>,
+    profiles: Vec<LayeredPlan>,
+    cli: &CliOverrides,
+) -> Result<crate::merge::MergedConfig, ConfigError> {
     let mut lower = Vec::new();
-    if let Some(p) = profile {
+    for p in profiles {
         debug_assert_eq!(
             p.source.layer,
             LayerKind::Profile,
@@ -1048,6 +1078,24 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
             source: Some(src_desc),
         });
     }
+
+    // CTX-0759 (#1366): top-level `extends` is a profile-layer-only key.
+    // Profile layers carry it as the single-parent chain link (validated
+    // fail-closed by `plan.validate()` below and resolved by
+    // `load_profile_chain`); every other layer rejects it as undeclared,
+    // preserving the pre-extends behavior for `init.lua`.
+    let extends = match data.extends {
+        None => None,
+        Some(raw) => {
+            if source.layer != LayerKind::Profile {
+                return Err(ConfigError::UndeclaredField {
+                    field: "extends".to_string(),
+                    source: Some(src_desc),
+                });
+            }
+            Some(raw)
+        }
+    };
 
     // Table-wins for the theme alias.
     let theme = data.appearance_theme.or(data.theme);
@@ -1896,7 +1944,7 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
         keymaps,
         plugins,
         profile_name: None,
-        extends: None,
+        extends,
         undeclared_fields: Vec::new(),
     };
     plan.validate()?;
@@ -2004,6 +2052,96 @@ fn load_layer_with_kind(path: &Path, kind: LayerKind) -> Result<LayeredPlan, Con
     let plan = parse_lua_config(&content, &source)?;
     let migrated = crate::migration::migrate(plan)?;
     Ok(LayeredPlan::new(source, migrated))
+}
+
+/// Loads one named profile plus its single-parent `extends` ancestors as
+/// [`LayerKind::Profile`] layers, base-first (CTX-0759, #1366).
+///
+/// The requested profile is last (highest precedence among profiles); the
+/// merge sorts by [`LayerKind::precedence`] with a stable sort, so the
+/// child overrides the base per field while `init.lua` still wins over
+/// the whole chain. Reads the live environment for the config root; unit
+/// tests stay hermetic via [`load_profile_chain_with_env`].
+///
+/// # Errors
+///
+/// Fail-closed [`ConfigError`]: invalid requested/parent names (charset,
+/// length, traversal — parents are re-validated through
+/// [`validate_profile_name`]), unreadable entry file, missing parent
+/// (named on the `extends` field path), `extends` cycles
+/// ([`ConfigError::CycleDetected`]), and chains longer than
+/// [`MAX_PROFILE_CHAIN_LEN`].
+pub fn load_profile_chain(name: &str) -> Result<Vec<LayeredPlan>, ConfigError> {
+    let xdg = std::env::var("XDG_CONFIG_HOME").ok();
+    let home = std::env::var("HOME").ok();
+    let appdata = std::env::var("APPDATA").ok();
+    let localappdata = std::env::var("LOCALAPPDATA").ok();
+    load_profile_chain_with_env(
+        name,
+        xdg.as_deref(),
+        home.as_deref(),
+        appdata.as_deref(),
+        localappdata.as_deref(),
+    )
+}
+
+/// Hermetic [`load_profile_chain`] over injected environment values (same
+/// root precedence as [`profile_file_path_with_platform_env`]).
+///
+/// # Errors
+///
+/// Same as [`load_profile_chain`].
+pub fn load_profile_chain_with_env(
+    name: &str,
+    xdg_config_home: Option<&str>,
+    home: Option<&str>,
+    appdata: Option<&str>,
+    localappdata: Option<&str>,
+) -> Result<Vec<LayeredPlan>, ConfigError> {
+    let mut chain: Vec<LayeredPlan> = Vec::new();
+    let mut visited: Vec<String> = Vec::new();
+    let mut current = validate_profile_name(name)?;
+    loop {
+        if visited.iter().any(|seen| seen == &current) {
+            visited.push(current.clone());
+            return Err(ConfigError::CycleDetected { chain: visited });
+        }
+        if chain.len() >= MAX_PROFILE_CHAIN_LEN {
+            return Err(ConfigError::validation(
+                "extends",
+                format!("profile extends chain exceeds {MAX_PROFILE_CHAIN_LEN} profiles"),
+            ));
+        }
+        visited.push(current.clone());
+        let path = profile_file_path_with_platform_env(
+            &current,
+            xdg_config_home,
+            home,
+            appdata,
+            localappdata,
+        )?;
+        let is_parent_hop = !chain.is_empty();
+        if is_parent_hop && !path.exists() {
+            return Err(ConfigError::validation(
+                "extends",
+                format!("profile '{current}' not found ('{}')", path.display()),
+            ));
+        }
+        let layer = load_layer_with_kind(&path, LayerKind::Profile)?;
+        let parent = match &layer.plan.extends {
+            None => None,
+            Some(raw) => Some(validate_profile_name(raw).map_err(|e| {
+                ConfigError::validation("extends", format!("invalid parent profile: {e}"))
+            })?),
+        };
+        chain.push(layer);
+        match parent {
+            None => break,
+            Some(next) => current = next,
+        }
+    }
+    chain.reverse();
+    Ok(chain)
 }
 
 #[cfg(test)]
@@ -3439,6 +3577,138 @@ mod tests {
     fn load_missing_profile_fails_closed() {
         let path = Path::new("/nonexistent-bitty-ctx0169/profiles/ghost.lua");
         assert!(load_profile_layer(path).is_err());
+    }
+
+    // CTX-0759 (#1366): `extends` is a profile-layer-only key. Profile
+    // sources carry it as the chain link; user sources keep rejecting it
+    // as undeclared (pre-extends behavior for `init.lua`).
+    #[test]
+    fn parse_extends_accepted_only_in_profile_layers() {
+        let profile_src = ConfigSource::new(LayerKind::Profile, Some("profiles/child.lua"));
+        let plan =
+            parse_lua_config(r#"return { extends = "base" }"#, &profile_src).expect("profile");
+        assert_eq!(plan.extends.as_deref(), Some("base"));
+
+        let user_src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+        let err = parse_lua_config(r#"return { extends = "base" }"#, &user_src)
+            .expect_err("user rejects");
+        assert_eq!(err.field(), Some("extends"));
+    }
+
+    /// Isolated `$XDG_CONFIG_HOME`-style root with a `bitty/profiles/`
+    /// directory; the caller writes `<root>/bitty/profiles/<name>.lua`.
+    fn profiles_scratch(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "bitty-ctx0759-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("bitty").join("profiles")).expect("profiles dir");
+        root
+    }
+
+    fn write_profile(root: &Path, name: &str, body: &str) {
+        std::fs::write(
+            root.join("bitty")
+                .join("profiles")
+                .join(format!("{name}.lua")),
+            body,
+        )
+        .expect("write profile");
+    }
+
+    #[test]
+    fn profile_chain_child_overrides_base_per_field() {
+        let root = profiles_scratch("chain");
+        write_profile(
+            &root,
+            "base",
+            r#"return { font = { family = "Maple Mono", size = 14 }, window = { opacity = 1.0, padding = 4 } }"#,
+        );
+        write_profile(
+            &root,
+            "child",
+            r#"return { extends = "base", window = { opacity = 0.9, padding = 8 } }"#,
+        );
+        let root_str = root.to_str().expect("utf8 scratch");
+        let chain =
+            load_profile_chain_with_env("child", Some(root_str), None, None, None).expect("chain");
+        assert_eq!(chain.len(), 2);
+        assert!(chain[0].plan.extends.is_none(), "base first");
+        assert_eq!(chain[1].plan.extends.as_deref(), Some("base"));
+
+        let merged = resolve_effective_with_profiles(None, chain, &CliOverrides::default())
+            .expect("merge chain");
+        assert_eq!(merged.effective.font.family, "Maple Mono");
+        assert_eq!(merged.effective.window.padding, 8);
+        assert_eq!(
+            merged.source_of("font.family").unwrap().layer,
+            LayerKind::Profile
+        );
+        assert_eq!(
+            merged.source_of("window.padding").unwrap().layer,
+            LayerKind::Profile
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn profile_chain_user_file_still_wins() {
+        let root = profiles_scratch("userwins");
+        write_profile(&root, "base", r#"return { theme = "dark" }"#);
+        write_profile(&root, "child", r#"return { extends = "base" }"#);
+        let root_str = root.to_str().expect("utf8 scratch");
+        let chain =
+            load_profile_chain_with_env("child", Some(root_str), None, None, None).expect("chain");
+        let user_src = test_source();
+        let user_plan = parse_lua_config(r#"return { theme = "light" }"#, &user_src).expect("user");
+        let user = LayeredPlan::new(user_src, user_plan);
+        let merged = resolve_effective_with_profiles(Some(user), chain, &CliOverrides::default())
+            .expect("merge");
+        assert_eq!(merged.effective.appearance.theme.as_deref(), Some("light"));
+        assert_eq!(
+            merged.source_of("appearance.theme").unwrap().layer,
+            LayerKind::User
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn profile_chain_cycle_fails_closed() {
+        let root = profiles_scratch("cycle");
+        write_profile(&root, "a", r#"return { extends = "b" }"#);
+        write_profile(&root, "b", r#"return { extends = "a" }"#);
+        let root_str = root.to_str().expect("utf8 scratch");
+        let err =
+            load_profile_chain_with_env("a", Some(root_str), None, None, None).expect_err("cycle");
+        assert!(matches!(err, ConfigError::CycleDetected { .. }), "{err}");
+        assert!(err.to_string().contains("extends"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn profile_chain_missing_parent_names_extends_path() {
+        let root = profiles_scratch("missing");
+        write_profile(&root, "child", r#"return { extends = "ghost" }"#);
+        let root_str = root.to_str().expect("utf8 scratch");
+        let err = load_profile_chain_with_env("child", Some(root_str), None, None, None)
+            .expect_err("missing parent");
+        assert_eq!(err.field(), Some("extends"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn profile_chain_parent_traversal_rejected() {
+        let root = profiles_scratch("traversal");
+        write_profile(&root, "child", r#"return { extends = "../evil" }"#);
+        let root_str = root.to_str().expect("utf8 scratch");
+        let err = load_profile_chain_with_env("child", Some(root_str), None, None, None)
+            .expect_err("traversal");
+        assert_eq!(err.field(), Some("extends"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // CTX-0180 CLI appearance overrides: each flag overrides only its own

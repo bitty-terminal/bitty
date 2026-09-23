@@ -445,6 +445,11 @@ pub struct ConfigData {
     /// Top-level `close_confirm` scalar (CTX-0370 view/window close
     /// confirmation mode; raw string, parsed fail-closed downstream).
     pub close_confirm: Option<String>,
+    /// Top-level `extends` scalar (CTX-0759 profile single-parent chain;
+    /// raw profile name, validated fail-closed downstream in
+    /// `bitty-config`: charset/length per `validate_profile_name`, honored
+    /// only in `LayerKind::Profile` layers).
+    pub extends: Option<String>,
     /// `keymaps` array.
     pub keymaps: Option<Vec<KeymapData>>,
     /// `plugins` array (each entry `{ id, enabled? }`; absent means "this
@@ -484,6 +489,7 @@ impl ConfigData {
             && self.leader_timeout_ms.is_none()
             && self.hints_enabled.is_none()
             && self.close_confirm.is_none()
+            && self.extends.is_none()
             && self.keymaps.is_none()
             && self.plugins.is_none()
     }
@@ -1519,6 +1525,11 @@ impl ConfigData {
                 // typed parsing and fail-closed validation live downstream
                 // in `bitty-config`).
                 "close_confirm" => out.close_confirm = Some(expect_string(key, val)?),
+                // CTX-0759: top-level `extends` scalar (raw profile name;
+                // charset/length validated and layer-kind gating enforced
+                // downstream in `bitty-config`). Non-strings fail closed
+                // here with the `extends` path, like every other scalar.
+                "extends" => out.extends = Some(expect_string(key, val)?),
                 _ => out.undeclared.push(key.clone()),
             }
         }
@@ -2494,6 +2505,24 @@ mod tests {
         let data = eval_ok(r#"return { theme = "dark", frobnicate = { "x" } }"#);
         assert_eq!(data.theme.as_deref(), Some("dark"));
         assert_eq!(data.undeclared, vec!["frobnicate".to_string()]);
+    }
+
+    #[test]
+    fn extends_extracts_as_declared_scalar() {
+        // CTX-0759 (#1366): top-level `extends` is a declared key carrying
+        // the raw parent name; layer gating and name validation live in
+        // `bitty-config`.
+        let data = eval_ok(r#"return { extends = "base" }"#);
+        assert_eq!(data.extends.as_deref(), Some("base"));
+        assert!(data.undeclared.is_empty());
+        assert!(!data.is_empty());
+    }
+
+    #[test]
+    fn extends_wrong_type_fails_closed_with_path() {
+        let message = eval_err(r#"return { extends = 42 }"#);
+        assert!(message.contains("extends"), "{message}");
+        assert!(!message.contains("42"), "must not echo value: {message}");
     }
 
     #[test]

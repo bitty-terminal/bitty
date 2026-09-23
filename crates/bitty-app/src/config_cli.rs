@@ -185,7 +185,7 @@ pub(crate) fn load_merged_config(args: &Args) -> Result<LoadedConfig, String> {
         .profile
         .as_deref()
         .is_some_and(|p| !p.trim().is_empty());
-    let mut profile_layer: Option<bitty_config::LayeredPlan> = None;
+    let mut profile_layers: Vec<bitty_config::LayeredPlan> = Vec::new();
     let mut profile_path: Option<std::path::PathBuf> = None;
     if let Some(requested) = profile_request.clone() {
         let resolved = bitty_config::file::profile_file_path(&requested).map_err(|err| {
@@ -207,10 +207,14 @@ pub(crate) fn load_merged_config(args: &Args) -> Result<LoadedConfig, String> {
                 resolved.display()
             ));
         }
-        match bitty_config::file::load_profile_layer(&resolved) {
-            Ok(layer) => {
+        // CTX-0759 (#1366): resolve the single-parent `extends` chain
+        // (base-first `Profile` layers); the child overrides the base per
+        // field. Chain failures (cycle, missing parent, invalid name) fail
+        // closed with the `extends` field path.
+        match bitty_config::file::load_profile_chain(&requested) {
+            Ok(layers) => {
                 profile_path = Some(resolved.clone());
-                profile_layer = Some(layer);
+                profile_layers = layers;
             }
             Err(err) => {
                 return Err(format!(
@@ -239,16 +243,17 @@ pub(crate) fn load_merged_config(args: &Args) -> Result<LoadedConfig, String> {
         let flag = appearance_flag_for_field(err.field());
         return Err(format!("bitty: invalid {flag}: {err}\n{}", help_text()));
     }
-    let merged = bitty_config::file::resolve_effective_full(file_layer, profile_layer, &cli)
-        .map_err(|err| {
-            if let Some(p) = &used_path {
-                format!("bitty: invalid config '{}': {err}", p.display())
-            } else if let Some(p) = &profile_path {
-                format!("bitty: invalid profile '{}': {err}", p.display())
-            } else {
-                format!("bitty: invalid --theme: {err}")
-            }
-        })?;
+    let merged =
+        bitty_config::file::resolve_effective_with_profiles(file_layer, profile_layers, &cli)
+            .map_err(|err| {
+                if let Some(p) = &used_path {
+                    format!("bitty: invalid config '{}': {err}", p.display())
+                } else if let Some(p) = &profile_path {
+                    format!("bitty: invalid profile '{}': {err}", p.display())
+                } else {
+                    format!("bitty: invalid --theme: {err}")
+                }
+            })?;
     Ok(LoadedConfig {
         merged,
         probed,

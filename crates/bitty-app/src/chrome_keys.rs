@@ -3577,6 +3577,37 @@ mod tests {
     }
 
     #[test]
+    fn shell_control_bytes_pass_chrome_unchanged() {
+        // Issue #1356: with no modal pending, shell control bytes are never
+        // chrome — Ctrl+C reaches the PTY as `0x03` (SIGINT via the line
+        // discipline), Ctrl+D as `0x04` (EOF), and plain typing plus Enter
+        // as their bytes. The Wayland shape carries `text=None` for
+        // control chords; the tracked modifier snapshot synthesizes C0.
+        let mut app = workspace_test_app();
+        // Ctrl+C: ModifiersChanged then the press, like winit delivers.
+        assert!(!drive_chrome(&mut app, mods_event(false, true)));
+        assert!(!drive_chrome(
+            &mut app,
+            WindowEventKind::KeyboardInput(KeyEvent {
+                logical_key: LogicalKey::Character("c".to_string()),
+                text: None,
+                location: bitty_platform::KeyLocation::Standard,
+                state: PressState::Pressed,
+                repeat: false,
+                is_synthetic: false,
+            })
+        ));
+        assert_eq!(app.runtime.drain_pending_input(), b"\x03");
+        assert!(!drive_chrome(&mut app, clear_mods_event()));
+        // Typing `exit` plus Enter passes through byte-identical.
+        for ch in ["e", "x", "i", "t"] {
+            assert!(!drive_chrome(&mut app, char_press(ch, ch, false)));
+        }
+        assert!(!drive_chrome(&mut app, named_press(NamedKey::Enter)));
+        assert_eq!(app.runtime.drain_pending_input(), b"exit\r");
+    }
+
+    #[test]
     fn dispatch_priority_emergency_esc_overrides_user_remap() {
         // A user `escape` remap applies with no modal active but never
         // steals the emergency cancel while a confirmation pends.

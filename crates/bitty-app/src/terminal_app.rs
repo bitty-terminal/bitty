@@ -726,6 +726,30 @@ impl AppHandler for TerminalApp {
         // visible to the state machine before the tick.
         self.poll_pty_pump();
 
+        // Issue #1356: an exited primary shell closes the session instead of
+        // freezing on a stale grid with silently-dropped input (ghostty/kitty
+        // close the window on child exit). The check runs on every event so
+        // no pump cadence can strand a dead shell; it stays open while
+        // split-pane sessions exist (their shells still run). No child owned
+        // (headless smoke, spawn failure) never exits here.
+        if self.runtime.pane_session_count() == 0 {
+            // Single `try_wait` reap: `primary_exit_status` consumes the
+            // status exactly once, so bind it here and never call it twice.
+            if let Some(status) = self.runtime.primary_exit_status() {
+                crate::logging::info(|| {
+                    format!(
+                        "bitty: primary shell exited (success={} code={} signal={:?}) — closing session",
+                        status.is_success(),
+                        status.code(),
+                        status.signal()
+                    )
+                });
+                self.save_session_best_effort("shell-exit");
+                ctx.exit();
+                return;
+            }
+        }
+
         // CTX-0153 single-owner intercept with CTX-0275 explicit dispatch
         // priority (see `intercept_chrome_key` / `DispatchPriority`):
         // emergency/reserved > active overlay-modal > user-defined keymap >

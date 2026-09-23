@@ -126,6 +126,7 @@ pub mod bell;
 pub mod click;
 pub mod close_confirm;
 pub mod copy_mode;
+pub mod cw_live;
 pub mod help;
 pub mod input;
 pub mod kitty_images;
@@ -475,6 +476,15 @@ pub struct Runtime {
     overlay_modal_active: bool,
     /// Next workspace creation sequence (display names `ws{seq}`).
     next_workspace_seq: u64,
+    /// CW live present state (CTX-0700): caller-owned fold projection,
+    /// composer overlay session, and cross-panel hint engine.
+    ///
+    /// Headless, bounded, presentation-only. The grid, scrollback, PTY, and
+    /// GPU are never touched through these fields; they feed the
+    /// [`crate::cw_present`] live path via `runtime::cw_live`.
+    cw_fold: bitty_rich::blocks::FoldState,
+    cw_composer: bitty_rich::composer::ComposerSession,
+    cw_hints: crate::cw_present::CwHintEngine,
     container: UiRect,
     clipboard: Clipboard,
     selection: Option<Selection>,
@@ -1224,6 +1234,9 @@ impl Runtime {
             help_rows: Vec::new(),
             overlay_modal_active: false,
             next_workspace_seq: 2,
+            cw_fold: bitty_rich::blocks::FoldState::new(),
+            cw_composer: bitty_rich::composer::ComposerSession::new(),
+            cw_hints: crate::cw_present::CwHintEngine::new(),
         };
         // CTX-0355: install the resolved palette on both the renderer (cell
         // defaults, ANSI, emitted fills) and the surface (clear color).
@@ -1404,6 +1417,9 @@ impl Runtime {
             help_rows: Vec::new(),
             overlay_modal_active: false,
             next_workspace_seq: 2,
+            cw_fold: bitty_rich::blocks::FoldState::new(),
+            cw_composer: bitty_rich::composer::ComposerSession::new(),
+            cw_hints: crate::cw_present::CwHintEngine::new(),
         };
         // CTX-0355: install the resolved palette on both the renderer (cell
         // defaults, ANSI, emitted fills) and the surface (clear color).

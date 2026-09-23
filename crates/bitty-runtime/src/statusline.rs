@@ -18,8 +18,9 @@
 //! are verified headlessly.
 
 use bitty_term_state::State;
+use bitty_ui::status_registry::{StatusInputs, StatusModuleId, StatusSlots, render_module};
 
-use crate::registry::{PanelId, PanelRegistry, PanelRegistryConfig, PanelType};
+use crate::registry::{PanelId, PanelRegistry, PanelRegistryConfig, PanelRuntime, PanelType};
 
 /// Maximum statusline components to compose — bounded for presentation.
 pub const STATUSLINE_MAX_COMPONENTS: usize = 8;
@@ -147,6 +148,96 @@ pub fn create_statusline_panel(
     let handle = registry.create_panel(ty, Some(workspace))?;
     registry.mount_panel(handle.id, handle.generation, view)?;
     Ok(handle.id)
+}
+
+/// Creates a statusline panel through the Core-owned [`PanelRuntime`] host
+/// facade (issue #998, live adoption).
+///
+/// `PanelRuntime::new` → `create_panel` → `mount_panel` with
+/// `PanelType::Helper`, so the statusline exercises the host generation
+/// validation and the live [`bitty_ui::placement::Placement`] mirror instead
+/// of touching [`PanelRegistry`] directly. No private channel, no `unsafe`.
+pub fn create_statusline_panel_via_host(
+    host: &mut PanelRuntime,
+    workspace: crate::registry::WorkspaceId,
+    view: crate::ViewId,
+) -> Result<PanelId, crate::registry::PanelError> {
+    let handle = host.create_panel(PanelType::Helper, Some(workspace))?;
+    host.mount_panel(handle.id, handle.generation, view)?;
+    Ok(handle.id)
+}
+
+/// Builds a [`StatusInputs`] snapshot from committed terminal state (issue
+/// #1002, live bridge).
+///
+/// Reads only committed observations (`State::cwd_report` via `OSC 7` plus
+/// the caller-formatted `clock_text`); metric fields stay `None` until the
+/// Platform metrics service fills them, rendering as the registry
+/// placeholder. Never reads grid internals and never mutates `State`.
+#[must_use]
+pub fn status_inputs_from_state(state: &State, clock_text: &str) -> StatusInputs {
+    StatusInputs {
+        workspace: None,
+        cwd: state.cwd_report().map(str::to_string),
+        git_branch: None,
+        git_dirty: None,
+        cpu_percent: None,
+        memory_percent: None,
+        network_summary: None,
+        battery_percent: None,
+        clock_text: clock_text.to_string(),
+    }
+}
+
+impl StatuslineIntegration {
+    /// Renders the statusline through the [`StatusSlots`] registry (issue
+    /// #1002, live consumer).
+    ///
+    /// Validates unique slot membership, composes one [`render_module`]
+    /// segment per slot in `left → center → right` order, joins segment
+    /// texts with `" | "`, and truncates to [`STATUSLINE_MAX_CHARS`] at a
+    /// char boundary. Empty slot sets render empty (no fallback pollution).
+    /// Deterministic and pure: rendering twice yields the same string and
+    /// `State` is never mutated.
+    ///
+    /// # Errors
+    ///
+    /// [`bitty_ui::status_registry::StatusRegistryError`] for duplicate slot
+    /// membership or more than
+    /// [`bitty_ui::status_registry::STATUS_MAX_MODULES`] modules.
+    pub fn render_registry_slots(
+        state: &State,
+        slots: &StatusSlots,
+        clock_text: &str,
+    ) -> Result<String, bitty_ui::status_registry::StatusRegistryError> {
+        slots.validate()?;
+        let inputs = status_inputs_from_state(state, clock_text);
+        let mut texts = Vec::new();
+        for id in slots.render_order() {
+            if let Some(segment) = render_module(&id, &inputs) {
+                texts.push(segment.text);
+            }
+        }
+        if texts.is_empty() {
+            return Ok(String::new());
+        }
+        let joined = texts.join(" | ");
+        if joined.chars().count() <= STATUSLINE_MAX_CHARS {
+            Ok(joined)
+        } else {
+            Ok(joined.chars().take(STATUSLINE_MAX_CHARS).collect())
+        }
+    }
+
+    /// Registry keys for `slots` in render order, for debugging and tests.
+    #[must_use]
+    pub fn registry_slot_keys(slots: &StatusSlots) -> Vec<String> {
+        slots
+            .render_order()
+            .iter()
+            .map(StatusModuleId::key)
+            .collect()
+    }
 }
 
 /// Validates that statusline panel creation respects bounded defaults and leaves

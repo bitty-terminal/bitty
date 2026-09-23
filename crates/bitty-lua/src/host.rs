@@ -138,6 +138,40 @@ pub const REGISTRATION_MAX_EVENT_KIND_BYTES: usize = 128;
 /// `E_DEF_INVALID`.
 pub const REGISTRATION_MAX_TIMER_DELAY_MS: u64 = 86_400_000;
 
+/// Maximum keymap suggestions captured from one `init.lua` (CTX-0707).
+///
+/// Activation-scoped registrations like commands (no manifest ceiling names
+/// suggestions), so this mirrors `REGISTRATION_MAX_COMMANDS`: a generation
+/// that suggests more bindings than the manifest can declare commands for is
+/// hostile or broken. The 129th suggestion fails closed with typed
+/// `E_DEF_LIMIT`. Precedence and conflict diagnostics stay host-side (the
+/// runtime applies suggestions after activation); the bridge only captures.
+pub const REGISTRATION_MAX_KEYMAP_SUGGESTIONS: usize = 128;
+
+/// Maximum bytes of one suggested chord (`CTX-0707` admission bound).
+///
+/// Matches the policy-layer resource-segment ceiling (manifest qualified-name
+/// resource part, 128 bytes max); the shipped chord grammar itself is
+/// validated host-side at application time (LUA-OQ-5), the bridge checks
+/// shape only.
+pub const REGISTRATION_MAX_KEYMAP_CHORD_BYTES: usize = 128;
+
+/// Maximum bytes of one suggested command name (`CTX-0707` admission bound).
+///
+/// Matches `REGISTRATION_MAX_ID_BYTES`: a suggestion names a command
+/// registered by the same generation, so it can never legitimately exceed
+/// the command-id ceiling.
+pub const REGISTRATION_MAX_KEYMAP_COMMAND_BYTES: usize = 128;
+
+/// Maximum tasks captured from one `init.lua` (CTX-0707, RC-4).
+///
+/// The accepted RC-4 cap is 64 live tasks per plugin (ADR 0007, LUA-OQ-9):
+/// the 65th spawn fails closed with typed `E_BUDGET_TASK` (`budget` class),
+/// never queues silently. Scheduling and resumption stay host-side (tasks
+/// resume through the event path); the bridge only captures the entry
+/// function and owns the handle, mirroring `timers.create`/`cancel`.
+pub const REGISTRATION_MAX_TASKS: usize = 64;
+
 /// One bounded, immutable data value crossing the host bridge.
 ///
 /// This is deliberately smaller than the Lua value space: functions, threads,
@@ -362,6 +396,22 @@ impl BridgeError {
             "runtime",
             "E_CAPABILITY_DENIED",
             format!("capability '{capability}' is not granted"),
+        )
+    }
+
+    /// Construct the typed `E_NOT_IMPLEMENTED` runtime error for an accepted
+    /// v1 namespace the host has not wired yet (CTX-0707 parity gap).
+    ///
+    /// `item` is the static `bitty.<namespace>.<fn>` spelling (never
+    /// untrusted content): the namespace stays present and callable so
+    /// misconfiguration is observable, but every call fails closed until a
+    /// follow-up wires the host backend.
+    #[must_use]
+    pub fn not_implemented(item: &str) -> Self {
+        Self::new(
+            "runtime",
+            "E_NOT_IMPLEMENTED",
+            format!("{item} is not implemented by this host"),
         )
     }
 
@@ -598,6 +648,34 @@ pub struct TimerRegistration {
     pub callback: StashedFunction,
 }
 
+/// One captured key-binding suggestion from `init.lua` (CTX-0707, LUA-OQ-5).
+///
+/// Suggestion only: precedence (`user > workspace > first-party/default >
+/// plugin`) and conflict diagnostics are applied host-side after activation.
+/// `when` is normalized to `"global"` at capture (the only v1 context).
+#[derive(Debug, Clone)]
+pub struct KeymapSuggestion {
+    /// Suggested chord (shipped config grammar, validated at application).
+    pub chord: String,
+    /// Command registered by the same generation.
+    pub command: String,
+    /// Activation context, always `"global"` in v1.
+    pub when: String,
+}
+
+/// One captured task spawn from `init.lua` or a callback (CTX-0707, LUA-OQ-9).
+///
+/// The bridge owns the integer handle and stashes the entry function;
+/// scheduling, cooperative cancellation, and resumption through the event
+/// path stay host-side.
+#[derive(Debug, Clone)]
+pub struct TaskRegistration {
+    /// Numeric handle returned to Lua.
+    pub handle: i64,
+    /// Stashed entry function handle (generation-scoped).
+    pub entry: StashedFunction,
+}
+
 /// Generation-scoped capture of `init.lua` registrations, validated by the
 /// runtime after `init.lua` returns and before atomic commit.
 #[derive(Debug, Default)]
@@ -610,6 +688,12 @@ pub struct RegistrationCapture {
     pub timers: Vec<TimerRegistration>,
     /// Next timer handle.
     pub next_timer_handle: i64,
+    /// Captured keymap suggestions in suggestion order (CTX-0707).
+    pub keymaps: Vec<KeymapSuggestion>,
+    /// Captured task spawns keyed by handle (CTX-0707).
+    pub tasks: Vec<TaskRegistration>,
+    /// Next task handle.
+    pub next_task_handle: i64,
 }
 
 impl RegistrationCapture {
@@ -621,6 +705,9 @@ impl RegistrationCapture {
             events: Vec::new(),
             timers: Vec::new(),
             next_timer_handle: 1,
+            keymaps: Vec::new(),
+            tasks: Vec::new(),
+            next_task_handle: 1,
         }
     }
 
@@ -629,6 +716,16 @@ impl RegistrationCapture {
         let before = self.timers.len();
         self.timers.retain(|timer| timer.handle != handle);
         self.timers.len() != before
+    }
+
+    /// Remove a task by handle; returns whether it existed (CTX-0707).
+    ///
+    /// Bridge-side removal releases the RC-4 cap slot; cooperative
+    /// cancellation at the next host slice stays host-side.
+    pub fn cancel_task(&mut self, handle: i64) -> bool {
+        let before = self.tasks.len();
+        self.tasks.retain(|task| task.handle != handle);
+        self.tasks.len() != before
     }
 
     /// Allocate the next timer handle with checked arithmetic (HOST-002).
@@ -649,6 +746,24 @@ impl RegistrationCapture {
         // a reachable `None`.
         self.next_timer_handle = self
             .next_timer_handle
+            .checked_add(1)
+            .expect("handle below i64::MAX increments");
+        Some(handle)
+    }
+
+    /// Allocate the next task handle with checked arithmetic (CTX-0707).
+    ///
+    /// Same no-wrap contract as [`Self::alloc_timer_handle`]: `i64::MAX`
+    /// is the reserved exhaustion sentinel and is never issued, so handles
+    /// are `1..i64::MAX`; the caller fails the `tasks.spawn` call closed
+    /// with typed `E_BUDGET_TASK` instead of aliasing a live task.
+    pub fn alloc_task_handle(&mut self) -> Option<i64> {
+        if self.next_task_handle == i64::MAX {
+            return None;
+        }
+        let handle = self.next_task_handle;
+        self.next_task_handle = self
+            .next_task_handle
             .checked_add(1)
             .expect("handle below i64::MAX increments");
         Some(handle)
@@ -852,6 +967,9 @@ impl LuaVm {
             events: capture.events.clone(),
             timers: capture.timers.clone(),
             next_timer_handle: capture.next_timer_handle,
+            keymaps: capture.keymaps.clone(),
+            tasks: capture.tasks.clone(),
+            next_task_handle: capture.next_task_handle,
         }
     }
 
@@ -1230,6 +1348,13 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         .expect("notify table accepts 'show'");
 
     let process = Table::new(&ctx);
+    // CTX-0707 ruling: `bitty.process.spawn` is v1-OUT. The accepted v1
+    // exclusion list bars ambient process authority, so this consent-gated
+    // spawn extra is NOT part of the Plugin API v1 guarantee: it ships for
+    // first-party needs (CTX-0445), carries no `api_version` stability
+    // promise, and may change outside minor-version rules. The bridge keeps
+    // serving it with the same typed diagnostics; SDK conformance must not
+    // assert it as v1 surface.
     process
         .set(
             ctx,
@@ -1356,6 +1481,221 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         )
         .expect("timers table accepts 'cancel'");
 
+    // CTX-0707 parity: `bitty.keymaps.suggest` is WIRED as a bridge capture
+    // (LUA-OQ-5). Suggestion-only and activation-scoped like
+    // `commands.register`: the bridge checks shape (`chord`/`command`
+    // non-empty bounded strings, `when` absent-or-`"global"`) and captures;
+    // chord-grammar validation, precedence, and conflict diagnostics are
+    // applied host-side after activation.
+    let keymaps = Table::new(&ctx);
+    keymaps
+        .set(
+            ctx,
+            "suggest",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let def = match stack.get(0) {
+                        Value::Table(table) => table,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_DEF_INVALID",
+                                "keymap suggestion must be a table",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let chord = required_string(ctx, def, "chord")?;
+                    let command = required_string(ctx, def, "command")?;
+                    if chord.len() > REGISTRATION_MAX_KEYMAP_CHORD_BYTES {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            format!(
+                                "keymap chord exceeds {REGISTRATION_MAX_KEYMAP_CHORD_BYTES} bytes"
+                            ),
+                        )
+                        .to_error(ctx));
+                    }
+                    if command.len() > REGISTRATION_MAX_KEYMAP_COMMAND_BYTES {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            format!(
+                                "keymap command exceeds \
+                                 {REGISTRATION_MAX_KEYMAP_COMMAND_BYTES} bytes"
+                            ),
+                        )
+                        .to_error(ctx));
+                    }
+                    let when = match optional_string(ctx, def, "when") {
+                        None => "global".to_string(),
+                        Some(when) if when == "global" => when,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_DEF_INVALID",
+                                "keymap suggestion 'when' must be absent or \"global\" in v1",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let handle = {
+                        let mut capture = state.capture.borrow_mut();
+                        if capture.keymaps.len() >= REGISTRATION_MAX_KEYMAP_SUGGESTIONS {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_DEF_LIMIT",
+                                format!(
+                                    "keymap suggestion limit \
+                                     ({REGISTRATION_MAX_KEYMAP_SUGGESTIONS}) exceeded"
+                                ),
+                            )
+                            .to_error(ctx));
+                        }
+                        capture.keymaps.push(KeymapSuggestion {
+                            chord,
+                            command,
+                            when,
+                        });
+                        capture.keymaps.len() as i64
+                    };
+                    stack.replace(ctx, Value::Integer(handle));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("keymaps table accepts 'suggest'");
+
+    // CTX-0707 parity: `bitty.services.get`/`provide` are DEFERRED
+    // (LUA-OQ-8). Consumer resolution needs the version grammar, interface
+    // schemas, and manifest `[services.provided]` table form; provider
+    // disappearance needs `E_SERVICE_GONE` lifecycle wiring. None of that
+    // host backend exists yet, so both spellings stay present and fail
+    // closed with typed `E_NOT_IMPLEMENTED` until a follow-up wires them.
+    let services = Table::new(&ctx);
+    services
+        .set(
+            ctx,
+            "get",
+            Callback::from_fn(&ctx, move |ctx, _exec, _stack| {
+                Err(BridgeError::not_implemented("bitty.services.get").to_error(ctx))
+            }),
+        )
+        .expect("services table accepts 'get'");
+    services
+        .set(
+            ctx,
+            "provide",
+            Callback::from_fn(&ctx, move |ctx, _exec, _stack| {
+                Err(BridgeError::not_implemented("bitty.services.provide").to_error(ctx))
+            }),
+        )
+        .expect("services table accepts 'provide'");
+
+    // CTX-0707 parity: `bitty.tasks.spawn`/`cancel` are WIRED as a bridge
+    // capture (LUA-OQ-9, RC-4). The bridge stashes the entry function, owns
+    // the integer handle under the 64-live-task cap (`E_BUDGET_TASK` past
+    // it), and releases the slot on cancel; scheduling, cooperative
+    // cancellation, and resumption through the event path stay host-side,
+    // mirroring `timers.create`/`cancel`.
+    let tasks = Table::new(&ctx);
+    tasks
+        .set(
+            ctx,
+            "spawn",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let entry = match stack.get(0) {
+                        Value::Function(function) => ctx.stash(function),
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_DEF_INVALID",
+                                "task entry must be a function",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let handle = {
+                        let mut capture = state.capture.borrow_mut();
+                        if capture.tasks.len() >= REGISTRATION_MAX_TASKS {
+                            return Err(BridgeError::new(
+                                "budget",
+                                "E_BUDGET_TASK",
+                                format!("task limit ({REGISTRATION_MAX_TASKS}) exceeded"),
+                            )
+                            .to_error(ctx));
+                        }
+                        let Some(handle) = capture.alloc_task_handle() else {
+                            return Err(BridgeError::new(
+                                "budget",
+                                "E_BUDGET_TASK",
+                                "task handle space exhausted",
+                            )
+                            .to_error(ctx));
+                        };
+                        capture.tasks.push(TaskRegistration { handle, entry });
+                        handle
+                    };
+                    stack.replace(ctx, Value::Integer(handle));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("tasks table accepts 'spawn'");
+    tasks
+        .set(
+            ctx,
+            "cancel",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let handle = match stack.get(0) {
+                        Value::Integer(i) => i,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_DEF_INVALID",
+                                "task handle must be an integer",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let removed = state.capture.borrow_mut().cancel_task(handle);
+                    stack.replace(ctx, Value::Boolean(removed));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("tasks table accepts 'cancel'");
+
+    // CTX-0707 parity: `bitty.env.get`/`has` are DEFERRED (ADR 0006). Reads
+    // need the `env:<KEY>` grant intersection, the bounded allowlist, and
+    // desensitized values; the bridge knows no manifest, so both spellings
+    // stay present and fail closed with typed `E_NOT_IMPLEMENTED` until a
+    // follow-up wires the grant-aware backend (including the
+    // absent-unless-declared carve-out).
+    let env = Table::new(&ctx);
+    env.set(
+        ctx,
+        "get",
+        Callback::from_fn(&ctx, move |ctx, _exec, _stack| {
+            Err(BridgeError::not_implemented("bitty.env.get").to_error(ctx))
+        }),
+    )
+    .expect("env table accepts 'get'");
+    env.set(
+        ctx,
+        "has",
+        Callback::from_fn(&ctx, move |ctx, _exec, _stack| {
+            Err(BridgeError::not_implemented("bitty.env.has").to_error(ctx))
+        }),
+    )
+    .expect("env table accepts 'has'");
+
     let ui = Table::new(&ctx);
     ui.set(
         ctx,
@@ -1443,6 +1783,17 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         .expect("root accepts ui");
     root.set(ctx, "timers", readonly_table(ctx, timers))
         .expect("root accepts timers");
+    // CTX-0707 parity shape: all four accepted v1 namespaces are present.
+    // `keymaps`/`tasks` capture at the bridge; `services`/`env` fail closed
+    // with `E_NOT_IMPLEMENTED` until their host backends land.
+    root.set(ctx, "keymaps", readonly_table(ctx, keymaps))
+        .expect("root accepts keymaps");
+    root.set(ctx, "services", readonly_table(ctx, services))
+        .expect("root accepts services");
+    root.set(ctx, "tasks", readonly_table(ctx, tasks))
+        .expect("root accepts tasks");
+    root.set(ctx, "env", readonly_table(ctx, env))
+        .expect("root accepts env");
     Value::Table(readonly_table(ctx, root))
 }
 

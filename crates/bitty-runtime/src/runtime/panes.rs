@@ -410,6 +410,19 @@ impl Runtime {
         self.pane_sessions.get(view).and_then(|sess| sess.pty.pid())
     }
 
+    /// Exit status of the leaf's child when it has already exited, without
+    /// blocking (CTX-0731, #982).
+    ///
+    /// Mirrors [`pane_pid`](Self::pane_pid): `None` when the leaf owns no
+    /// session, the child is still running, or the platform reports no
+    /// status (including an already-reaped child). The composer
+    /// external-editor host polls this once per event-loop tick to detect
+    /// editor exit and round the edited buffer back.
+    pub fn pane_try_wait(&mut self, view: &ViewId) -> Option<bitty_pty::ExitStatus> {
+        let sess = self.pane_sessions.get_mut(view)?;
+        sess.pty.try_wait().ok()?
+    }
+
     /// Current kernel winsize of the leaf's PTY, when the session exists.
     ///
     /// Introspection for split/resize verification (CTX-0269):

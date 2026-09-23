@@ -73,6 +73,9 @@ pub(crate) struct ChromeState {
     /// Hint collection generation, bumped once per Leader arming (CTX-0723,
     /// #981). Fresh batches per arming keep stale labels unreachable.
     pub(crate) hint_generation: u64,
+    /// Panel-hosted external-editor session (CTX-0731, #982): at most one
+    /// pending `$EDITOR` round trip; empty otherwise.
+    pub(crate) editor: crate::editor_host::ExternalEditorHost,
 }
 
 impl ChromeState {
@@ -95,6 +98,7 @@ impl ChromeState {
             leader_state: bitty_config::LeaderState::Idle,
             leader_clock: std::time::Instant::now(),
             hint_generation: 0,
+            editor: crate::editor_host::ExternalEditorHost::new(),
         }
     }
 
@@ -1630,9 +1634,11 @@ impl TerminalApp {
                 true
             }
             CwComposerFeed::EditorRequested => {
-                eprintln!(
-                    "warning: composer external editor not hosted in this GUI root (no terminal fd to lend `$EDITOR`; event loop must not block) — draft kept, session stays open"
-                );
+                // CTX-0731 (#982): host the allowlisted `$EDITOR` in a new
+                // PTY leaf and round the edited buffer back on exit. The
+                // open fails loud with the draft kept; while hosted, the
+                // overlay closes (draft preserved) and reopens on finish.
+                self.open_external_editor();
                 true
             }
             CwComposerFeed::Ignored => true,

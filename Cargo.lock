@@ -193,6 +193,7 @@ dependencies = [
  "bitty-platform",
  "bitty-plugin-host",
  "bitty-render",
+ "bitty-rich",
  "bitty-runtime",
  "bitty-term-state",
  "bitty-test-support",

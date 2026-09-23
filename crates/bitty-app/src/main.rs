@@ -230,6 +230,7 @@ mod config_cli;
 mod ctl;
 mod dev;
 mod doctor;
+mod editor_host;
 mod init;
 mod inspect;
 mod ipc_serve;

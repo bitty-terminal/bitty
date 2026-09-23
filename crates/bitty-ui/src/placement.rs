@@ -1,32 +1,36 @@
 #![forbid(unsafe_code)]
 //! Panel placement decision contract (CW-19, issue #997; `RFC-OQ-3`).
 //!
-//! Contract source: the accepted [Panel Runtime RFC] leaves placement
-//! undecided between three options, and the draft [Panel Placement Decision]
-//! records the candidate direction this module pins as types:
+//! Contract source: the accepted [Panel Runtime RFC] lists placement
+//! between three options, and the owner ruling of 2026-09-23 accepts
+//! Option A over the `bitty` owner decision packet (merged `bitty`
+//! #1300; register `bitty-docs` #367, Accepted Option A; `bitty` #997
+//! closed):
 //!
 //! - Option A — Panel as typed `View` content
 //!   (`ViewContent::Panel(PanelId)`); smallest change, `ViewId` stays leaf.
+//!   **Accepted.**
 //! - Option B — Panel replaces `View` as `LayoutTree` leaf; **rejected** by
 //!   the accepted RFC (breaks `ViewId` generation history).
 //! - Option C — Panel composes beside `View` as a side-car binding.
+//!   **Not selected**: the refined Option C direction was the prior
+//!   candidate and is superseded by the Option A acceptance.
 //!
-//! Recorded direction (candidate, awaiting acceptance): **refined Option C**
-//! in identity terms — Panel is the visible application identity, `View`
-//! remains the internal compositor attachment point hidden from end users
-//! and plugin APIs — with the Option A `ViewContent::Panel(PanelId)`
-//! encoding retained as the transitional representation until a successor
-//! RFC re-expresses it as the side-car map.
+//! Accepted direction: **Option A** in identity terms — Panel is the
+//! visible application identity carried as typed `View` content,
+//! `View` remains the tiling leaf identity. The `ViewContent::Panel`
+//! encoding is the accepted spelling, not a transitional placeholder.
 //!
 //! What this module provides:
 //!
 //! - [`PlacementOption`] — the three RFC options, plus [`PLACEMENT_DIRECTION`]
-//!   naming the recorded direction (`C`, refined).
+//!   naming the accepted direction (`A`).
 //! - [`Placement`] — the explicit directional binding map (`PanelId` mounts
 //!   onto a `ViewId`, at most one-to-one). A move re-parents the binding
 //!   while preserving both identities; unbinding suspends, never destroys.
-//! - [`TRANSITIONAL_ENCODING`] — the retained `ViewContent::Panel(PanelId)`
-//!   spelling, so call sites keep compiling while the semantics move to C.
+//! - [`TRANSITIONAL_ENCODING`] — retained name for the accepted
+//!   `ViewContent::Panel(PanelId)` spelling, so call sites keep a stable
+//!   reference while the semantics stay Option A.
 //! - [`FocusTarget`] + [`resolve_focus`] — the visible focus target is a
 //!   `PanelId`; internal hit-testing stays a `View` rectangle; panel focus
 //!   wins over view focus.
@@ -63,16 +67,14 @@ pub enum PlacementOption {
     C,
 }
 
-/// Recorded candidate direction: a refined Option C (Panel is the visible
-/// application identity, `View` the internal attachment point).
+/// Accepted direction: Option A (Panel as typed `View` content).
 ///
-/// Candidate, awaiting acceptance via a Panel Runtime RFC amendment or a
-/// successor RFC; it changes no accepted text on its own.
-pub const PLACEMENT_DIRECTION: PlacementOption = PlacementOption::C;
+/// Accepted by the owner ruling of 2026-09-23 (`RFC-OQ-3` Option A;
+/// `bitty` #997 closed); supersedes the prior refined Option C candidate.
+pub const PLACEMENT_DIRECTION: PlacementOption = PlacementOption::A;
 
-/// Transitional encoding retained while the direction is candidate: the
-/// binding rides the existing `ViewContent::Panel(PanelId)` variant rather
-/// than being reverted or widened.
+/// Accepted encoding: the `ViewContent::Panel(PanelId)` spelling.
+/// Retained under its historic name so call sites keep a stable reference.
 pub const TRANSITIONAL_ENCODING: &str = "ViewContent::Panel(PanelId)";
 
 // ---------------------------------------------------------------------------
@@ -338,8 +340,8 @@ mod tests {
     }
 
     #[test]
-    fn recorded_direction_is_refined_option_c() {
-        assert_eq!(PLACEMENT_DIRECTION, PlacementOption::C);
+    fn accepted_direction_is_option_a() {
+        assert_eq!(PLACEMENT_DIRECTION, PlacementOption::A);
         assert_eq!(TRANSITIONAL_ENCODING, "ViewContent::Panel(PanelId)");
     }
 }

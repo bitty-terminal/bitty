@@ -594,13 +594,16 @@ fn hot_path_refresh_is_invalidation_driven() {
 }
 
 // ---------------------------------------------------------------------------
-// SessionId decision (F-3, CW-17): ViewId keying retained, no new type
+// SessionId decision (F-3, CW-17, issue #995): ViewId keying retained,
+// re-confirmed vs ADR-0013 (CTX-0721)
 // ---------------------------------------------------------------------------
 
 #[test]
 fn session_f3_keeps_viewid_keying() {
-    // Decision F-3 (`[BLOCKED: OQ-058]`): no `SessionId` newtype exists;
-    // scenes stay keyed by `ViewId` until the owner resolves `OQ-058`.
+    // Decision F-3 (re-confirmed CTX-0721 against adopted `OQ-058` and
+    // `ADR-0013`): no `SessionId` newtype exists; scenes stay keyed by
+    // `ViewId`. `ADR-0013` `Session` maps to the headless continuity
+    // layer, not to the view key.
     use bitty_ui::{
         LayoutNode, PanelId, TerminalBinding, View, ViewId, WorkspaceScene, WorkspaceSceneId,
     };
@@ -616,5 +619,32 @@ fn session_f3_keeps_viewid_keying() {
     assert_eq!(
         scene.attachment_of(panel).expect("attached").view,
         ViewId::new(11)
+    );
+}
+
+#[test]
+fn session_f3_reconfirmed_vs_adr0013() {
+    // F-3 re-confirmation (CTX-0721, issue #995): pane-session identity is
+    // the owning live `ViewId`; `ADR-0013` Panel/Execution separation holds
+    // (panels never own executions, presentation non-authoritative), and
+    // `ADR-0013` `Session` (attachable continuity scope) stays a separate
+    // layer that introduces no UI-layer `SessionId` newtype here.
+    use bitty_ui::{
+        LayoutNode, PanelId, TerminalBinding, View, ViewId, WorkspaceScene, WorkspaceSceneId,
+    };
+    let tiled = LayoutNode::leaf(View::new(ViewId::new(21), 80, 24));
+    let mut scene = WorkspaceScene::new(WorkspaceSceneId::new(2), tiled);
+    let panel = PanelId::new(9);
+    scene
+        .bind(panel, ViewId::new(21), TerminalBinding::new(88))
+        .expect("bind by ViewId");
+    // No session key participates: the attachment is (panel, view, terminal).
+    let attachment = scene.attachment_of(panel).expect("attached");
+    assert_eq!(attachment.view, ViewId::new(21));
+    assert_eq!(attachment.terminal, TerminalBinding::new(88));
+    // Panel and view lanes stay pairwise distinct: no conversion exists.
+    assert_ne!(
+        std::any::TypeId::of::<PanelId>(),
+        std::any::TypeId::of::<ViewId>()
     );
 }

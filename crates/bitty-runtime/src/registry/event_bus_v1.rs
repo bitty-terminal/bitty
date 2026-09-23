@@ -5,11 +5,13 @@
 //! Contract source: the accepted Panel Runtime RFC, which requires a
 //! host-mediated bus with qualified `owner.name:topic` identifiers inside
 //! the three-level budget envelope (per-subscription `64`, per-panel
-//! `1024`/`256 KiB`, global `8192`/`2 MiB`, `DropOldest` default), and
-//! leaves the v1 topic taxonomy (`RFC-OQ-4`) and the per-type capability
-//! mapping (`RFC-OQ-5`) open.
+//! `1024`/`256 KiB`, global `8192`/`2 MiB`, `DropOldest` default). The
+//! owner ruling of 2026-09-23 defers `OQ-056` to API v2: the v1 surface
+//! below is frozen, and capability dimensions beyond v1 (semantic UI
+//! slots, presentation projection, workspace policies, automation actions,
+//! service multiplicity) are v2 scope, not v1 gates.
 //!
-//! What this module records for v1:
+//! What this module records for v1 (frozen):
 //!
 //! - [`BusTopicFamily`] + [`core_topic`] + [`V1_CORE_TOPICS`] — the closed
 //!   v1 taxonomy: panel lifecycle, focus, file, git, AI, and helper-process
@@ -19,7 +21,7 @@
 //!   require the existing closed host capability ([`BUS_PUBLISH_CAPABILITY`]
 //!   / [`BUS_SUBSCRIBE_CAPABILITY`], both `panel.provider` today), verified
 //!   through the registry's deny-by-default grant table. Per-family
-//!   refinement (for example future `panel.bus.*` names) stays candidate
+//!   refinement (for example future `panel.bus.*` names) stays v2 scope
 //!   under `RFC-OQ-5`: [`CapabilityLedger::candidate_capability`] names the
 //!   direction without enforcing it, because the host closed set does not
 //!   know those identifiers yet.

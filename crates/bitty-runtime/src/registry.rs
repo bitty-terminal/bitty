@@ -569,6 +569,7 @@ mod panel;
 #[cfg(test)]
 mod panel_tests;
 mod provider;
+mod routable;
 mod terminal;
 #[cfg(test)]
 mod tests;
@@ -577,4 +578,5 @@ pub use event_bus_v1::*;
 pub use host::*;
 pub use panel::*;
 pub use provider::*;
+pub use routable::*;
 pub use terminal::*;

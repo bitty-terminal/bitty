@@ -3,13 +3,13 @@
 //!
 //! Contract source: the accepted Panel Runtime RFC defines a
 //! `PanelProvider` as the plugin-supplied factory declaring one or more
-//! `PanelType` values behind the `panel.provider` capability, while the
-//! candidate Workspace Panel Invariants (`OQ-058`) keep the
-//! workspace/session lifecycle coupling those providers depend on open.
+//! `PanelType` values behind the `panel.provider` capability. The owner
+//! ruling of 2026-09-23 accepts `OQ-058` `SMO-1..SMO-4` including delivery
+//! semantics, with terms from `ADR-0013` (`bitty-docs` #367, `bb96efe`).
 //!
 //! Status: the in-tree `bitty-panels` scaffolding stays crate-private
-//! until this contract lands; this module is the public surface that
-//! lifts it:
+//! until this contract lands; this module plus
+//! [`routable`](super::routable) is the public surface that lifts it:
 //!
 //! - [`PANEL_PROVIDER_CAPABILITY`] — the closed host capability gating
 //!   provider registration (`panel.provider`, already in the host set).
@@ -22,6 +22,12 @@
 //! - [`PanelProviderRegistry`] — name-keyed provider set with the
 //!   capability gate, duplicate rejection, and per-registration generation
 //!   so reload/unload swaps provider content atomically.
+//! - Routable delivery lives in [`routable`](super::routable):
+//!   [`AgentMessage`](super::routable::AgentMessage) envelope identity,
+//!   sender/recipient attribution, deadline, priority, `message_id`
+//!   deduplication, explicit cancellation, and expiry, with fail-closed
+//!   routing to unregistered recipients through
+//!   [`PanelRuntime::route_message`](super::host::PanelRuntime::route_message).
 //!
 //! Capability *enforcement* for live panels stays with the host registry;
 //! this registry stores the grant flag carried at registration so the

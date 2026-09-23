@@ -92,6 +92,7 @@ pub mod theme;
 pub mod trust;
 pub mod types;
 pub mod validation;
+pub mod wheel;
 
 pub use error::{ConfigError, ErrorClass};
 pub use keymap::{
@@ -128,6 +129,10 @@ pub use types::{
     ViewContent, ViewOverride, ViewSelector, WindowConfig, WorkspaceConfig,
 };
 pub use validation::{Validate, collect_diagnostics, validate_stack};
+pub use wheel::{
+    AGENTS_DIR_NAME, MAX_WHEEL_SEARCH_DEPTH, WHEEL_DIR_NAME, WHEEL_PROJECT_FILE_NAME,
+    WheelDiscovery, WheelSource, discover, discover_on_fs, wheel_project_file,
+};
 
 #[cfg(test)]
 mod integration_tests {

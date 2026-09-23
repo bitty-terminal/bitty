@@ -1,23 +1,25 @@
-//! Candidate trust-level model with per-level capability domains (OQ-085).
+//! Trust-level model with per-level capability domains (OQ-085).
 //!
-//! `OQ-085` is still open: no owner ruling fixes which trust levels apply
-//! to plugin, helper, and tool boundaries or which capability domains each
-//! level may use. This module records the candidate direction only —
-//! level 0 Core, 1 bundled Lua, 2 third-party Lua, 3 native sidecar,
-//! 4 external tools/MCP/network — as pure, bounded, fail-closed data.
+//! `OQ-085` is adopted (register accepted 2026-09-23): level 0 Core,
+//! 1 bundled Lua, 2 third-party Lua, 3 native sidecar, 4 external
+//! tools/MCP/network, as pure, bounded, fail-closed data with the
+//! per-level admission matrix below.
 //!
-//! Nothing here is wired into any live path: no caller grants authority
-//! from a [`TrustLevel`], and unknown levels or domains deny rather than
+//! One seam is enforced at a live call boundary:
+//! [`TrustLevel::check_family`] denies families outside the level's admitted
+//! domains, and [`crate::effective::authorize_with_trust`] runs that gate
+//! before the six-layer grant intersection. No caller grants authority from
+//! a [`TrustLevel`] alone, and unknown levels or domains deny rather than
 //! default. The accepted capability grammar ([`crate::capability`]) and
 //! the deny-by-default grant lifecycle ([`crate::grant`]) stay
-//! authoritative; this kernel only answers "would level L admit domain D"
-//! so a future ruling has a tested shape to accept or replace.
+//! authoritative; this kernel answers "would level L admit domain D" and
+//! the effective boundary enforces the answer.
 //!
 //! # Non-goals
 //!
-//! Numeric level semantics beyond ordering, per-domain parameter bounds,
-//! and enforcement plumbing stay undecided until the OQ-085 ruling.
-//! There is no `unsafe`, no I/O, and no new dependency (`std` only).
+//! Numeric level semantics beyond ordering and per-domain parameter bounds
+//! stay open. There is no `unsafe`, no I/O, and no new dependency
+//! (`std` only).
 
 #![forbid(unsafe_code)]
 
@@ -157,6 +159,34 @@ impl TrustLevel {
         }
         false
     }
+
+    /// Check one accepted capability family against this level (OQ-085 adopted).
+    ///
+    /// Call-boundary gate enforced by [`crate::effective::authorize_with_trust`]:
+    /// families with a domain mapping must be admitted by this level, otherwise
+    /// the request denies fail-closed with a grant error naming the level and
+    /// the family only (never a value). Families without a domain mapping
+    /// (`Ui`, `Runtime`, `Agent`, `Mcp`, `Ai`, and the rest) pass here: the
+    /// adopted matrix says nothing about them, so their grants decide
+    /// elsewhere. The check is coarse at the shared `Terminal` family: it
+    /// passes when the level admits either `TerminalInput` or
+    /// `TerminalOutput`; per-head narrowing stays with the grant intersection.
+    pub fn check_family(self, family: CapabilityFamily) -> Result<(), PluginError> {
+        let domains = CapabilityDomain::for_family(family);
+        if domains.is_empty() {
+            return Ok(());
+        }
+        for domain in domains {
+            if self.admits(*domain) {
+                return Ok(());
+            }
+        }
+        Err(PluginError::grant(format!(
+            "trust level '{}' does not admit '{}' capabilities (OQ-085 adopted)",
+            self.as_str(),
+            family.as_str()
+        )))
+    }
 }
 
 impl fmt::Display for TrustLevel {
@@ -224,6 +254,39 @@ impl CapabilityDomain {
             Self::Ipc => &[],
             // No GPU capability family exists in the accepted grammar.
             Self::Gpu => &[],
+        }
+    }
+
+    /// Adopted domains covering one accepted family (reverse of
+    /// [`CapabilityDomain::accepted_families`]).
+    ///
+    /// Families the adopted matrix does not cover map to an empty set: the
+    /// trust gate passes them through and their grants decide elsewhere, so
+    /// the matrix never invents authority the accepted grammar does not
+    /// already name.
+    #[must_use]
+    pub const fn for_family(family: CapabilityFamily) -> &'static [CapabilityDomain] {
+        match family {
+            CapabilityFamily::Fs => &[CapabilityDomain::Filesystem],
+            CapabilityFamily::Network => &[CapabilityDomain::Network],
+            CapabilityFamily::Process => &[CapabilityDomain::Process],
+            CapabilityFamily::Clipboard => &[CapabilityDomain::Clipboard],
+            CapabilityFamily::Terminal => &[
+                CapabilityDomain::TerminalInput,
+                CapabilityDomain::TerminalOutput,
+            ],
+            CapabilityFamily::Ui
+            | CapabilityFamily::Runtime
+            | CapabilityFamily::Env
+            | CapabilityFamily::Debug
+            | CapabilityFamily::Platform
+            | CapabilityFamily::Protocol
+            | CapabilityFamily::Panel
+            | CapabilityFamily::Browser
+            | CapabilityFamily::Layout
+            | CapabilityFamily::Agent
+            | CapabilityFamily::Mcp
+            | CapabilityFamily::Ai => &[],
         }
     }
 }
@@ -321,5 +384,128 @@ mod tests {
         assert!(CapabilityDomain::Credentials.accepted_families().is_empty());
         assert!(CapabilityDomain::Ipc.accepted_families().is_empty());
         assert!(CapabilityDomain::Gpu.accepted_families().is_empty());
+    }
+
+    #[test]
+    fn for_family_covers_exactly_the_mapped_domains() {
+        assert_eq!(
+            CapabilityDomain::for_family(CapabilityFamily::Fs),
+            &[CapabilityDomain::Filesystem]
+        );
+        assert_eq!(
+            CapabilityDomain::for_family(CapabilityFamily::Terminal),
+            &[
+                CapabilityDomain::TerminalInput,
+                CapabilityDomain::TerminalOutput
+            ]
+        );
+        assert!(CapabilityDomain::for_family(CapabilityFamily::Agent).is_empty());
+        assert!(CapabilityDomain::for_family(CapabilityFamily::Ai).is_empty());
+        assert!(CapabilityDomain::for_family(CapabilityFamily::Ui).is_empty());
+        // `Env` reads are host-mediated per-key grants (`bitty.env`); the
+        // trust matrix claims no domain for them (added with #1308).
+        assert!(CapabilityDomain::for_family(CapabilityFamily::Env).is_empty());
+    }
+
+    #[test]
+    fn family_gate_denies_outside_admission() {
+        // External tools admit no domain: every mapped family denies.
+        for family in [
+            CapabilityFamily::Fs,
+            CapabilityFamily::Network,
+            CapabilityFamily::Process,
+            CapabilityFamily::Clipboard,
+            CapabilityFamily::Terminal,
+        ] {
+            assert!(
+                TrustLevel::ExternalTool.check_family(family).is_err(),
+                "{} must deny {}",
+                TrustLevel::ExternalTool,
+                family.as_str()
+            );
+        }
+        // Core admits everything mapped.
+        for family in [
+            CapabilityFamily::Fs,
+            CapabilityFamily::Network,
+            CapabilityFamily::Process,
+            CapabilityFamily::Clipboard,
+            CapabilityFamily::Terminal,
+        ] {
+            assert!(
+                TrustLevel::Core.check_family(family).is_ok(),
+                "{} must admit {}",
+                TrustLevel::Core,
+                family.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn family_gate_narrows_with_level() {
+        // Bundled Lua keeps network and process; the native sidecar loses both.
+        assert!(
+            TrustLevel::BundledLua
+                .check_family(CapabilityFamily::Network)
+                .is_ok()
+        );
+        assert!(
+            TrustLevel::BundledLua
+                .check_family(CapabilityFamily::Process)
+                .is_ok()
+        );
+        assert!(
+            TrustLevel::NativeSidecar
+                .check_family(CapabilityFamily::Network)
+                .is_err()
+        );
+        assert!(
+            TrustLevel::NativeSidecar
+                .check_family(CapabilityFamily::Fs)
+                .is_ok()
+        );
+        // Third-party Lua keeps the shared terminal family through its
+        // admitted output domain; per-head narrowing stays with grants.
+        assert!(
+            TrustLevel::ThirdPartyLua
+                .check_family(CapabilityFamily::Terminal)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn unmapped_families_defer_to_grants() {
+        // The adopted matrix covers no agent/AI/UI families: trust passes
+        // them through at every level and their grants decide elsewhere.
+        for family in [
+            CapabilityFamily::Agent,
+            CapabilityFamily::Mcp,
+            CapabilityFamily::Ai,
+            CapabilityFamily::Ui,
+        ] {
+            for level in [
+                TrustLevel::Core,
+                TrustLevel::BundledLua,
+                TrustLevel::ThirdPartyLua,
+                TrustLevel::NativeSidecar,
+                TrustLevel::ExternalTool,
+            ] {
+                assert!(
+                    level.check_family(family).is_ok(),
+                    "{level} must defer {} to grants",
+                    family.as_str()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn family_denial_names_level_and_family_only() {
+        let error = TrustLevel::ExternalTool
+            .check_family(CapabilityFamily::Fs)
+            .expect_err("external tools must deny filesystem");
+        let text = error.to_string();
+        assert!(text.contains("external-tool"), "{text}");
+        assert!(text.contains("'fs'"), "{text}");
     }
 }

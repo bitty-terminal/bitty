@@ -69,25 +69,29 @@
 //! | Unknown-origin restrictive policy (R-020, P0-AC-032) | `origin` | [`origin::DetectedOrigin`] advisory classification (fail-closed to `Unknown` on absent/conflicting signals), [`origin::OriginPolicy`] `Unknown`/`Remote` restrictive, relaxation only via explicit [`origin::OriginOverride::RelaxToStandard`] |
 //! | Verification remaining under closed OQ-011..OQ-014 | docs + `event::DropPolicy` | `DropOldest` accepted v1 default; exact queue depths/timeouts per accepted `OQ-014` budgets; remaining work is implementation verification, not open RFC points |
 //!
-//! # Candidate kernels for open security OQs (not normative, no live-path wiring)
+//! # Adopted security directions with live-boundary seams (OQ-054/055/057/084/085)
 //!
-//! The following modules record candidate directions for still-open owner
-//! questions. Each is pure, bounded, fail-closed data with unit tests; none
-//! grants authority by itself. Two seams are enforced at live boundaries:
-//! per-key `env.read:<KEY>` grants gate `bitty.env` reads (fail-closed,
-//! typed `E_NOT_IMPLEMENTED` until granted), and the secret-tier consent
-//! gate ([`secret_tiers::check_tier_access`]) runs at the secret resolve
-//! boundary ([`host::PluginHost::resolve_secret_with_tier`]) with names-only
-//! audit. Tier admission, keyring backend choice, command execution, and
-//! rotation stay undecided.
+//! The following modules record the adopted owner directions for the
+//! security open questions. Each is pure, bounded, fail-closed data with unit
+//! tests; none grants authority by itself. Live-boundary seams: per-key
+//! `env.read:<KEY>` grants gate `bitty.env` reads (fail-closed, typed
+//! `E_NOT_IMPLEMENTED` until granted), and the secret-tier consent gate
+//! ([`secret_tiers::check_tier_access`]) runs at the secret resolve boundary
+//! ([`host::PluginHost::resolve_secret_with_tier`]) with names-only audit;
+//! trust-level admission gates effective authorization
+//! ([`effective::authorize_with_trust`]), the role contract gates it too
+//! ([`effective::authorize_with_role`]), and the credential exclusive-or
+//! order is enforced by [`credential_ref::resolve_choice`] at the call
+//! boundary where two references meet (no live config field carries those
+//! references yet, so that gate waits on the provider-schema follow-up).
 //!
-//! | Open question | Module | Candidate shape |
+//! | Open question | Module | Adopted shape |
 //! |---------------|--------|-----------------|
-//! | OQ-085 trust levels + capability domains | `trust_levels` | [`trust_levels::TrustLevel`] levels 0–4, [`trust_levels::CapabilityDomain`] admission sets narrowing with level, mapping onto accepted [`capability::CapabilityFamily`] only |
+//! | OQ-085 trust levels + capability domains | `trust_levels` | [`trust_levels::TrustLevel`] levels 0–4, [`trust_levels::CapabilityDomain`] admission sets narrowing with level, mapping onto accepted [`capability::CapabilityFamily`] only; [`trust_levels::TrustLevel::check_family`] enforced by [`effective::authorize_with_trust`] |
 //! | OQ-084 ontology/identity | `identity` | [`identity::EntityKind`] ten first-class kinds, [`identity::OntologyId`] `kind:value` identifiers, [`identity::Ownership`] links plus [`identity::Lifetime`] |
 //! | OQ-055 secret-storage tiers | `secret_tiers` | [`secret_tiers::SecretTier`] four tiers with per-tier [`secret_tiers::TierPolicy`] (consent/audit/redaction); [`secret_tiers::CommandRef`] names commands without running them; [`secret_tiers::check_tier_access`] enforced at the resolve boundary |
-//! | OQ-054 `api_key_env` vs `api_key_cmd` | `credential_ref` | [`credential_ref::CredentialRef`] env/cmd references (names only), [`credential_ref::resolve_precedence`] exclusive-or order, [`credential_ref::check_project_override`] narrow-only boundary |
-//! | OQ-057 role contract | `roles` | [`roles::AgentRole`] Commander/Implementer/Tester/Reviewer, [`roles::EnforcementPoint`] checks, [`roles::SandboxRestrictions`] flags, capability ceilings intersected with grants elsewhere |
+//! | OQ-054 `api_key_env` vs `api_key_cmd` | `credential_ref` | [`credential_ref::CredentialRef`] env/cmd references (names only), [`credential_ref::resolve_precedence`] exclusive-or order plus [`credential_ref::resolve_choice`] call-boundary enforcement, [`credential_ref::check_project_override`] narrow-only boundary |
+//! | OQ-057 role contract | `roles` | [`roles::AgentRole`] Commander/Implementer/Tester/Reviewer, [`roles::EnforcementPoint`] checks (incl. [`roles::EnforcementPoint::for_request_kind`]), [`roles::SandboxRestrictions`] flags, capability ceilings intersected with grants elsewhere; [`roles::AgentRole::check_request`] enforced by [`effective::authorize_with_role`] |
 //!
 //! # Drop policy — DropOldest accepted default for v1 (OQ-013 closed decision point)
 //!
@@ -163,7 +167,7 @@ pub use capability::{
 pub use credential_ref::{
     CredentialPrecedence, CredentialRef, CredentialSource, MAX_CREDENTIAL_CMD_ARGS,
     MAX_CREDENTIAL_CMD_PART_BYTES, MAX_CREDENTIAL_ENV_NAME_BYTES, check_project_override,
-    resolve_precedence,
+    resolve_choice, resolve_precedence,
 };
 pub use effective::{
     AgentRequest, AuditDecision, AuditEntry, AuditLedger, CapabilityScope, DenialKind, DenialStep,
@@ -172,8 +176,8 @@ pub use effective::{
     MAX_AUDIT_ENTRIES, MAX_DENIAL_ITEMS, MAX_POLICY_FILE_BYTES, MAX_POLICY_FILE_LINES,
     MAX_POLICY_LINE_BYTES, MAX_RAW_DECLARATION_BYTES, MAX_RAW_DECLARATIONS, MAX_SCOPE_CAPS,
     PROJECT_POLICY_DIR_NAME, PROJECT_POLICY_FILE_NAME, PolicyProvenance, RequestKind,
-    USER_POLICY_FILE_NAME, authorize, delegate, enforcement_class_for, parse_policy,
-    project_policy_path, user_policy_path_with_env,
+    USER_POLICY_FILE_NAME, authorize, authorize_with_role, authorize_with_trust, delegate,
+    enforcement_class_for, parse_policy, project_policy_path, user_policy_path_with_env,
 };
 pub use error::{ErrorClass, PluginError};
 pub use event::{

@@ -1,6 +1,6 @@
-//! Panel lease/description/handoff candidate signal (RUN-21, #1052).
+//! Panel lease/description/handoff signal (RUN-21, #1052; SEC-26 cross-ref #1095).
 //!
-//! Candidate evidence for
+//! Adopted direction for
 //! [OQ-083](https://github.com/bitty-terminal/bitty-docs/blob/main/docs/decisions/open-questions.md):
 //! a panel as a workstation with a stable id, a human-readable
 //! title/description, a lease state (`Idle` / `Occupied`), and
@@ -11,13 +11,16 @@
 //! The host owns identity, routing, and the event bus; this module owns only
 //! the pure transition kernel: [`PanelLease`] moves between [`LeaseState`]
 //! variants and answers every move with a [`LeaseEvent`] or a
-//! [`LeaseError`]. There is no clock (a bounded lease term stays OQ-083 open
-//! work), no bus, and no agent symbol beyond the opaque [`LeaseHolder`] tag
-//! the host assigns.
+//! [`LeaseError`]. Panel write surfaces gate on the lease through
+//! [`PanelLease::may_write`] / [`PanelLease::check_write`]: only the current
+//! occupant may write (SEC-26 write hook). There is no clock (a bounded lease
+//! term stays OQ-083 open work), no bus, and no agent symbol beyond the
+//! opaque [`LeaseHolder`] tag the host assigns.
 //!
 //! Fail-closed defaults: a fresh lease is `Idle`; acquiring an occupied panel
-//! fails; releasing or handing off requires the current holder; an event is
-//! produced only for a transition that actually happened.
+//! fails; releasing or handing off requires the current holder; writing
+//! requires occupancy by the writer; an event is produced only for a
+//! transition that actually happened.
 
 use std::fmt;
 
@@ -263,6 +266,40 @@ impl PanelLease {
             }
         }
     }
+
+    /// Whether `holder` may write to this panel now (SEC-26 write hook,
+    /// OQ-083 adopted).
+    ///
+    /// Only the current occupant may write; idle panels and non-holders fail.
+    /// The human path acts outside the lease (a takeover releases to idle
+    /// first). Panel write surfaces must call [`Self::check_write`] before
+    /// mutating panel content; the bounded lease term, clock, and bus routing
+    /// stay open OQ-083 work.
+    #[must_use]
+    pub fn may_write(&self, holder: LeaseHolder) -> bool {
+        match self.state {
+            LeaseState::Idle => false,
+            LeaseState::Occupied { holder: current } => current == holder,
+        }
+    }
+
+    /// Check write permission for `holder` without changing the lease.
+    ///
+    /// Idle panels deny with [`LeaseError::NotOccupied`]; occupied panels deny
+    /// non-holders with [`LeaseError::NotHolder`] naming the current occupant.
+    /// Holder tags are opaque: diagnostics never carry panel content.
+    pub fn check_write(&self, holder: LeaseHolder) -> Result<(), LeaseError> {
+        match self.state {
+            LeaseState::Idle => Err(LeaseError::NotOccupied),
+            LeaseState::Occupied { holder: current } => {
+                if current == holder {
+                    Ok(())
+                } else {
+                    Err(LeaseError::NotHolder { holder: current })
+                }
+            }
+        }
+    }
 }
 
 /// Validates a panel title: at most [`MAX_PANEL_TITLE_CHARS`] characters,
@@ -387,5 +424,33 @@ mod tests {
         );
         assert_eq!(LeaseError::NotOccupied.as_str(), "not_occupied");
         assert_eq!(LeaseError::NotHolder { holder: A }.as_str(), "not_holder");
+    }
+
+    #[test]
+    fn write_hook_allows_only_the_occupant() {
+        let lease = PanelLease::idle();
+        assert!(!lease.may_write(A));
+        assert_eq!(lease.check_write(A), Err(LeaseError::NotOccupied));
+        let mut lease = PanelLease::idle();
+        assert!(lease.acquire(A).is_ok());
+        assert!(lease.may_write(A));
+        assert!(!lease.may_write(B));
+        assert_eq!(lease.check_write(A), Ok(()));
+        assert_eq!(
+            lease.check_write(B),
+            Err(LeaseError::NotHolder { holder: A })
+        );
+        // Denials leave the lease unchanged.
+        assert_eq!(lease.state(), LeaseState::Occupied { holder: A });
+    }
+
+    #[test]
+    fn write_hook_follows_handoff() {
+        let mut lease = PanelLease::idle();
+        assert!(lease.acquire(A).is_ok());
+        assert!(lease.handoff(A, B).is_ok());
+        assert!(!lease.may_write(A));
+        assert!(lease.may_write(B));
+        assert_eq!(lease.check_write(B), Ok(()));
     }
 }

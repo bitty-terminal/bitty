@@ -1,0 +1,14 @@
+[package]
+name = "bitty-net"
+description = "Bitty network dependency seam — capability, error, and offline-first policy types (no sockets yet)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/bitty-terminal/bitty"
+keywords = ["network", "capability", "offline", "bitty"]
+categories = ["network-programming"]
+publish = true
+
+[lints]
+workspace = true

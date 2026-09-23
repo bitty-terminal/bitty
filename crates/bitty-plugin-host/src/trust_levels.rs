@@ -277,6 +277,7 @@ impl CapabilityDomain {
             ],
             CapabilityFamily::Ui
             | CapabilityFamily::Runtime
+            | CapabilityFamily::Env
             | CapabilityFamily::Debug
             | CapabilityFamily::Platform
             | CapabilityFamily::Protocol
@@ -401,6 +402,9 @@ mod tests {
         assert!(CapabilityDomain::for_family(CapabilityFamily::Agent).is_empty());
         assert!(CapabilityDomain::for_family(CapabilityFamily::Ai).is_empty());
         assert!(CapabilityDomain::for_family(CapabilityFamily::Ui).is_empty());
+        // `Env` reads are host-mediated per-key grants (`bitty.env`); the
+        // trust matrix claims no domain for them (added with #1308).
+        assert!(CapabilityDomain::for_family(CapabilityFamily::Env).is_empty());
     }
 
     #[test]

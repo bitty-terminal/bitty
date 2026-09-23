@@ -350,6 +350,11 @@ impl AgentMessage {
     ///
     /// `deadline == 0` has no deadline; otherwise past when
     /// `now_ticks > deadline`.
+    ///
+    /// Invariant (CTX-0727, #1315): [`AgentMessage::new`] rejects
+    /// deadline-without-expiry, so `deadline != 0` always implies
+    /// `expires_at != 0` here — no separate `expires_at == 0` branch is
+    /// needed or reachable.
     #[must_use]
     pub fn is_past_deadline(&self, now_ticks: u64) -> bool {
         if self.deadline == 0 {

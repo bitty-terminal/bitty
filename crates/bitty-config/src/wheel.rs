@@ -174,8 +174,19 @@ mod tests {
     #[test]
     fn live_seam_finds_wheel_then_agents_on_fs() {
         // Filesystem coverage for `discover_on_fs` through a unique scratch
-        // tree (derived from the process id, removed afterwards).
+        // tree (derived from the process id). A `Drop` guard removes the
+        // tree even when a mid-test assertion panics (CTX-0727, #1315), so
+        // a failure cannot leak `bitty-wheel-<pid>` into the temp dir.
+        struct ScratchGuard {
+            root: PathBuf,
+        }
+        impl Drop for ScratchGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.root);
+            }
+        }
         let root = std::env::temp_dir().join(format!("bitty-wheel-{}", std::process::id()));
+        let _guard = ScratchGuard { root: root.clone() };
         let nested = root.join("a").join("b");
         std::fs::create_dir_all(&nested).expect("scratch tree creates");
         let project = wheel_project_file(&root);

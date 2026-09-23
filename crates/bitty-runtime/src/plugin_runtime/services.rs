@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::Rc;
 
 use bitty_lua::ui::{UI_MAX_AGGREGATED_TEXT_BYTES, UI_MAX_BLOCKS, UiNode};
-use bitty_lua::{BridgeError, ENV_KEY_MAX_BYTES, HostServices, LuaValue, SNAPSHOT_MAX_BYTES};
+use bitty_lua::{BridgeError, HostServices, LuaValue, SNAPSHOT_MAX_BYTES, validate_env_key};
 use bitty_plugin_host::bundled::{WORKSPACELINE_CLAIM, canonicalize_ui_claim};
 
 use super::store::{self, PluginStore};
@@ -134,37 +134,6 @@ impl EnvSource for MapEnv {
     fn get(&self, key: &str) -> Option<String> {
         self.values.get(key).cloned()
     }
-}
-
-/// Validate one `bitty.env` key at the services boundary (CTX-0330).
-///
-/// Same shape as the bridge ([`ENV_KEY_MAX_BYTES`], `[A-Za-z_][A-Za-z0-9_]*`):
-/// a direct caller that bypasses the bridge gets the same typed rejection,
-/// so the allowlist never sees a malformed key.
-fn validate_env_key_shape(key: &str) -> Result<(), BridgeError> {
-    if key.is_empty() || key.len() > ENV_KEY_MAX_BYTES {
-        return Err(BridgeError::new(
-            "validation",
-            if key.is_empty() {
-                "E_DEF_INVALID"
-            } else {
-                "E_DEF_LIMIT"
-            },
-            "env key must be 1..128 bytes",
-        ));
-    }
-    let mut bytes = key.bytes();
-    let first = bytes.next().unwrap_or(b'_');
-    if !(first.is_ascii_alphabetic() || first == b'_')
-        || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-    {
-        return Err(BridgeError::new(
-            "validation",
-            "E_DEF_INVALID",
-            "env key must be [A-Za-z_][A-Za-z0-9_]*",
-        ));
-    }
-    Ok(())
 }
 
 /// One accepted notification handed to the platform asynchronously.
@@ -566,7 +535,7 @@ impl PluginServices {
             ));
         }
         for key in &keys {
-            validate_env_key_shape(key)?;
+            validate_env_key(key)?;
         }
         *self.env_grants.borrow_mut() = keys;
         Ok(())
@@ -612,7 +581,7 @@ impl HostServices for PluginServices {
     }
 
     fn env_get(&self, key: &str) -> Result<Option<LuaValue>, BridgeError> {
-        validate_env_key_shape(key)?;
+        validate_env_key(key)?;
         if !self.env_grants.borrow().contains(key) {
             // Desensitized denial: ungranted keys share the backend-absent
             // code, so callers cannot probe which variables exist.
@@ -635,7 +604,7 @@ impl HostServices for PluginServices {
     }
 
     fn env_has(&self, key: &str) -> Result<bool, BridgeError> {
-        validate_env_key_shape(key)?;
+        validate_env_key(key)?;
         if !self.env_grants.borrow().contains(key) {
             return Err(BridgeError::not_implemented("bitty.env.has"));
         }
@@ -767,6 +736,7 @@ impl HostServices for PluginServices {
 mod tests {
     use super::*;
     use crate::plugin_runtime::store::PluginStore;
+    use bitty_lua::ENV_KEY_MAX_BYTES;
     use bitty_lua::ui::UI_MAX_TEXT_BYTES;
 
     fn services() -> PluginServices {

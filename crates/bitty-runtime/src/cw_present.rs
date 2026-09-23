@@ -330,6 +330,35 @@ pub fn hint_overlay_present(batch: &HintBatch) -> HintOverlayPresent {
     }
 }
 
+/// One resolved hint-overlay paint cell: the leaf frame plus the viewport
+/// cell the label pill covers (CTX-0751, #1344).
+///
+/// The terminal present path derives these from the armed session's
+/// [`HintOverlayPresent`] once per frame and paints each as a single-cell-
+/// high pill (label glyphs over a theme fill) in the annotation pass. Pure
+/// data: positions are viewport cells, never pixels, so the compositor owns
+/// all geometry. Fail-closed by construction — unresolvable anchors simply
+/// yield no cell (see [`Runtime::cw_hint_overlay_cells`](crate::runtime::Runtime::cw_hint_overlay_cells)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HintOverlayCell {
+    /// Leaf frame the pill paints in.
+    pub view: ViewId,
+    /// Viewport column of the pill's left edge (cells).
+    pub col: u16,
+    /// Viewport row of the pill (cells).
+    pub row: u16,
+    /// Label glyphs painted (`a`, `s`, ..., `aa`, ...).
+    pub label: String,
+}
+
+impl HintOverlayCell {
+    /// Pill width in cells (labels are ASCII lowercase, one cell each).
+    #[must_use]
+    pub fn width_cells(&self) -> usize {
+        self.label.chars().count()
+    }
+}
+
 /// Dispatches `Action(Target)` from the present path.
 ///
 /// Resolves `label` in `batch` and applies `action`, mutating only the

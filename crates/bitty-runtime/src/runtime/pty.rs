@@ -812,12 +812,27 @@ impl Runtime {
                 self.plugin_host
                     .push_observation(HostObservation::Damage { generation });
             }
-            // Selection persistence (CTX-0060): FullReset erases grid and scrollback,
-            // so any live selection is no longer anchored to valid content.
-            // ED 3 (EraseDisplayMode::Scrollback) clears scrollback history but
-            // leaves the live grid; live-grid selections remain valid. We only
-            // clear on FullReset here; scrollback-only clears keep live selection.
-            if matches!(action, TerminalAction::FullReset) {
+            // Selection invalidation (CTX-0060, extended for issue #1337):
+            // FullReset erases grid and scrollback, so any live selection
+            // is no longer anchored to valid content. The same holds for
+            // every ED mode that erases live-grid cells (Below/Above/All):
+            // the highlight overlay paints from grid coordinates on the
+            // next present, so a kept selection would keep painting its
+            // rects over erased cells as a persistent block after `clear`.
+            // Fail closed: drop the selection on all grid-erasing actions.
+            // ED 3 (EraseDisplayMode::Scrollback) clears scrollback history
+            // but leaves the live grid; live-grid selections remain valid,
+            // so scrollback-only clears keep live selection.
+            let grid_erased = matches!(action, TerminalAction::FullReset)
+                || matches!(
+                    action,
+                    TerminalAction::EraseInDisplay {
+                        mode: bitty_vt::EraseDisplayMode::Below
+                            | bitty_vt::EraseDisplayMode::Above
+                            | bitty_vt::EraseDisplayMode::All,
+                    }
+                );
+            if grid_erased {
                 self.clear_selection();
             }
             // CTX-0146 (Issue #238): answer standard terminal queries with

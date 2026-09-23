@@ -83,7 +83,15 @@ impl ChromeState {
             held: HashSet::new(),
             zoom: ZoomState::new(),
             leader: bitty_config::resolve_leader(None, None, bitty_config::LeaderPlatform::host())
-                .expect("internal leader defaults parse"),
+                .unwrap_or(bitty_config::ResolvedLeader {
+                    // Fail-closed: internal defaults are `const` chord
+                    // strings, so this arm is unreachable in practice; an
+                    // empty chord set simply never arms the Leader and keys
+                    // keep their normal owner (fail-open routing).
+                    chords: Vec::new(),
+                    timeout_ms: bitty_config::LEADER_TIMEOUT_MS_DEFAULT,
+                    from_default: true,
+                }),
             leader_state: bitty_config::LeaderState::Idle,
             leader_clock: std::time::Instant::now(),
             hint_generation: 0,

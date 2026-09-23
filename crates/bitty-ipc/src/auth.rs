@@ -155,6 +155,13 @@ impl VerifiedPeer {
     /// # Errors
     ///
     /// Returns `IpcError::Unauthenticated` when UIDs differ.
+    ///
+    /// The only non-test caller is the `#[cfg(unix)]`
+    /// `transport_attested_peer` (the non-unix stub fails closed without
+    /// minting), so on non-unix targets the lib unit sees no caller — the
+    /// scoped allow keeps the `-D warnings` gate green there without
+    /// weakening it anywhere else.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn attested(peer: PeerCredentials, runtime_uid: u32) -> Result<Self, IpcError> {
         verify_peer_uid(peer, runtime_uid)?;
         Ok(Self {

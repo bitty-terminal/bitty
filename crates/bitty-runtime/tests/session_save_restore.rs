@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::time::Duration;
 
 use bitty_runtime::runtime::session::{
@@ -886,6 +887,9 @@ fn safe_mode_does_not_apply_a_valid_store() {
 /// Physical default cwd a child gets when nothing is inherited: the PTY
 /// layer falls back to `$HOME`, else the process cwd (mirrors
 /// `cwd_inherit.rs::default_cwd`).
+// Callers are all `#[cfg(unix)]`; gate the helpers so the `-D warnings`
+// gate stays green on non-unix targets.
+#[cfg(unix)]
 fn default_cwd() -> String {
     let home = std::env::var_os("HOME").filter(|home| !home.is_empty());
     let cwd = home
@@ -898,11 +902,13 @@ fn default_cwd() -> String {
         .to_string()
 }
 
+#[cfg(unix)]
 fn primary_text(rt: &Runtime) -> String {
     rt.snapshot().cells.iter().map(|c| c.glyph).collect()
 }
 
 /// Polls and ticks until the primary grid shows `needle` or times out.
+#[cfg(unix)]
 fn wait_for_primary_text(rt: &mut Runtime, needle: &str) -> bool {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while std::time::Instant::now() < deadline {

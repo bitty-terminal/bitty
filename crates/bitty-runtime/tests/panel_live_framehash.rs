@@ -39,7 +39,11 @@
 //! their frame counters identically (asserted in V1) or the real-seq
 //! comparisons would be meaningless.
 
-use bitty_ipc::frame_digest::{FRAME_DIGEST_ALGO, frame_digest_hex};
+use bitty_ipc::frame_digest::frame_digest_hex;
+// `FRAME_DIGEST_ALGO` is asserted only by the unix socket roundtrip below;
+// gate it so the `-D warnings` gate stays green on non-unix targets.
+#[cfg(unix)]
+use bitty_ipc::frame_digest::FRAME_DIGEST_ALGO;
 use bitty_runtime::{
     AnimationPolicy, LayoutNode, PresentStats, Runtime, RuntimeConfig, SplitAxis, UiRect, View,
     ViewId, tabs::TabsIntegration, workspace::WorkspaceIntegration,

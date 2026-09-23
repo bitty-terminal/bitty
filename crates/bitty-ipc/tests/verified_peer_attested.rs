@@ -12,9 +12,10 @@
 
 use bitty_ipc::auth::{PeerCredentials, verify_peer_for_connection, verify_peer_uid};
 use bitty_ipc::devtools::{
-    Dispatcher, METHOD_FRAME_HASH, ServeContext, ServerInfo, handle_envelope, prepare_socket_dir,
-    transport_attested_peer,
+    Dispatcher, METHOD_FRAME_HASH, ServeContext, ServerInfo, handle_envelope,
 };
+#[cfg(unix)]
+use bitty_ipc::devtools::{prepare_socket_dir, transport_attested_peer};
 use bitty_ipc::error::{ErrorClass, IpcError};
 use bitty_ipc::scope::ScopeSet;
 

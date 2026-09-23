@@ -2,10 +2,13 @@ use super::handlers::{live_input_store, parse_optional_uint_param};
 use super::*;
 #[cfg(unix)]
 use crate::auth::DIR_MODE;
+#[cfg(unix)]
 use crate::error::IpcError;
 use crate::frame::{MAX_FRAME_BYTES, encode_frame};
+#[cfg(unix)]
 use crate::limits::RateLimiter;
 use crate::wire::MAX_JSON_DEPTH;
+#[cfg(unix)]
 use std::io::{Read, Write};
 use std::sync::{Mutex, OnceLock};
 

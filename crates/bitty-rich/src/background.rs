@@ -2162,6 +2162,9 @@ mod tests {
         let outside = temp_root("trust-outside");
         let approved_png = write_file(&approved, "ok.png", &encode_png(2, 2, [1, 2, 3, 4]));
         let outside_png = write_file(&outside, "no.png", &encode_png(2, 2, [1, 2, 3, 4]));
+        // Only consumed by the unix symlink-escape block below; gate it so
+        // the `-D warnings` gate stays green on non-unix targets.
+        #[cfg(unix)]
         let link = approved.join("escape.png");
         #[cfg(unix)]
         std::os::unix::fs::symlink(&outside_png, &link).expect("symlink");

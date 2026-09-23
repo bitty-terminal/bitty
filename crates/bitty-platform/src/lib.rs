@@ -83,8 +83,9 @@
 //!   renderer/GpuContext slice owns that contract.
 //! - IME, modifiers state, raw device events, touch/gesture, drag-and-drop,
 //!   theme, and occlusion events are currently filtered out (documented in
-//!   [`event`]); clipboard, monitors, notifications, and URL primitives from
-//!   the ADR-0003 row land in later slices.
+//!   [`event`]); clipboard, monitors, and URL primitives from the ADR-0003
+//!   row land in later slices, while desktop-notification delivery and the
+//!   audible bell primitive live in [`notification`].
 
 #![forbid(unsafe_code)]
 
@@ -95,6 +96,7 @@ pub mod error;
 pub mod event;
 pub mod keyboard;
 pub mod metrics;
+pub mod notification;
 pub mod surface;
 pub mod url;
 
@@ -116,5 +118,9 @@ pub use event::{
     MouseEvent, NamedKey, PlatformEvent, PressState, ScrollDelta, WindowEventKind, WindowId,
 };
 pub use keyboard::{encode_key_event, encode_named_key, ext_functional_key, ext_modifier_key};
+pub use notification::{
+    BellSink, DesktopNotification, NOTIFICATION_BODY_MAX_CHARS, NOTIFICATION_TITLE_MAX_CHARS,
+    NotificationSink, OsBellSink, OsDeliveryOutcome, OsDeliverySkip, OsNotificationSink,
+};
 pub use surface::{SurfaceTarget, map_resize_to_surface_extent};
 pub use url::{URL_MAX_LEN, ValidatedUrl, validate_file_url, validate_url};

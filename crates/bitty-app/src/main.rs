@@ -607,6 +607,14 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // CTX-0754 (issue #1361): OS delivery for bells/notifications is an
+    // embedder capability, fail-closed by default (no sink: counted, silent).
+    // Real runs install the best-effort OS sinks; headless/test-mode runs
+    // stay sink-free so CI and deterministic E2E never touch the OS.
+    if !args.headless && !args.test_mode {
+        runtime.set_bell_sink(Some(Box::new(bitty_platform::OsBellSink)));
+        runtime.set_notification_sink(Some(Box::new(bitty_platform::OsNotificationSink)));
+    }
     // Validate that the config-derived extent is non-zero (defense in depth;
     // Runtime::new already validates, but the app documents the invariant).
     if runtime.surface_extent().is_none() {

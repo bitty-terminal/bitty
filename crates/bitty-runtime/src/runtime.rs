@@ -736,6 +736,31 @@ pub struct Runtime {
     notifications_denied: u64,
     /// Count of bell/notification events dropped by the `RC-8` limiter.
     bell_rate_dropped: u64,
+    /// OS hand-off for an admitted audible bell (CTX-0754, issue #1361).
+    ///
+    /// `None` (the default) is fail-closed: admitted audible requests are
+    /// counted in [`Self::audible_bell_requests`] but make no sound. The
+    /// app installs [`bitty_platform::OsBellSink`] at startup for real
+    /// runs; tests install a recording double.
+    bell_sink: Option<Box<dyn bitty_platform::BellSink>>,
+    /// OS hand-off for an admitted terminal notification (CTX-0754).
+    ///
+    /// Same seam discipline as [`Self::bell_sink`]: `None` by default, the
+    /// app installs [`bitty_platform::OsNotificationSink`] for real runs.
+    notification_sink: Option<Box<dyn bitty_platform::NotificationSink>>,
+    /// Admitted audible bell requests (`BellMode::Audible`/`Both`, past
+    /// the `RC-8` limiter), whether or not a sink was installed.
+    audible_bell_requests: u64,
+    /// Admitted audible bell requests the sink reported as delivered.
+    audible_bell_delivered: u64,
+    /// Admitted audible bell requests not delivered (no sink installed,
+    /// skipped, or failed).
+    audible_bell_undelivered: u64,
+    /// Admitted notifications the sink reported as delivered.
+    notifications_os_delivered: u64,
+    /// Admitted notifications not delivered (no sink installed, skipped,
+    /// or failed).
+    notifications_os_undelivered: u64,
     // Input/Pointer RFC (CTX-0107) state for single-window slice
     enhanced_keyboard_flags: u32,
     shift_pressed: bool,
@@ -1217,6 +1242,13 @@ impl Runtime {
             notification_banner: None,
             notifications_denied: 0,
             bell_rate_dropped: 0,
+            bell_sink: None,
+            notification_sink: None,
+            audible_bell_requests: 0,
+            audible_bell_delivered: 0,
+            audible_bell_undelivered: 0,
+            notifications_os_delivered: 0,
+            notifications_os_undelivered: 0,
             enhanced_keyboard_flags: 0,
             shift_pressed: false,
             control_pressed: false,
@@ -1409,6 +1441,13 @@ impl Runtime {
             notification_banner: None,
             notifications_denied: 0,
             bell_rate_dropped: 0,
+            bell_sink: None,
+            notification_sink: None,
+            audible_bell_requests: 0,
+            audible_bell_delivered: 0,
+            audible_bell_undelivered: 0,
+            notifications_os_delivered: 0,
+            notifications_os_undelivered: 0,
             enhanced_keyboard_flags: 0,
             shift_pressed: false,
             control_pressed: false,
@@ -1716,9 +1755,11 @@ impl Runtime {
 
     /// Sets the user-visible bell behavior (CTX-0577, `OQ-076` policy input).
     ///
-    /// Defaults to [`bell::BellMode::Visual`]. Audible is an owner-pending
-    /// surface: no OS primitive is wired yet, so [`bell::BellMode::Audible`]
-    /// only counts requests for a future sink.
+    /// Defaults to [`bell::BellMode::Visual`]. `Audible`/`Both` hand one
+    /// ring per admitted `BEL` to the installed
+    /// [`bitty_platform::BellSink`] (CTX-0754): with no sink installed the
+    /// request is counted in [`Self::audible_bell_requests`] and stays
+    /// silent (fail-closed), so tests and headless runs never beep.
     pub fn set_bell_mode(&mut self, mode: bell::BellMode) {
         self.bell_mode = mode;
     }
@@ -1788,9 +1829,10 @@ impl Runtime {
     ///
     /// The event itself already crossed to the bounded cold queue (the
     /// plugin-visible observation is unchanged); this only decides the
-    /// user-visible surface. Rate-limited under `RC-8`; audible is a counted
-    /// request only (no OS primitive). Returns `true` when the visual flash
-    /// was (re)armed.
+    /// user-visible surface. Rate-limited under `RC-8`; an audible-mode
+    /// request additionally rings the installed
+    /// [`bitty_platform::BellSink`] (counted delivered/undelivered, never
+    /// blocking). Returns `true` when the visual flash was (re)armed.
     pub(super) fn apply_bell_policy(&mut self, now: std::time::Instant) -> bool {
         if self.bell_mode == bell::BellMode::Off {
             return false;
@@ -1798,6 +1840,18 @@ impl Runtime {
         if !self.bell_limiter.admit_at(now) {
             self.bell_rate_dropped = self.bell_rate_dropped.saturating_add(1);
             return false;
+        }
+        if self.bell_mode.audible() {
+            self.audible_bell_requests = self.audible_bell_requests.saturating_add(1);
+            let outcome = self.bell_sink.as_ref().map(|sink| sink.ring());
+            match outcome {
+                Some(bitty_platform::OsDeliveryOutcome::Delivered) => {
+                    self.audible_bell_delivered = self.audible_bell_delivered.saturating_add(1);
+                }
+                _ => {
+                    self.audible_bell_undelivered = self.audible_bell_undelivered.saturating_add(1);
+                }
+            }
         }
         if self.bell_mode.visual() {
             self.bell_flash_at = Some(now);
@@ -1811,6 +1865,13 @@ impl Runtime {
     /// Applies the bell/notification policy to one `OSC 9` / `OSC 777`
     /// request (CTX-0577). Returns `true` when the notification was admitted
     /// into the bounded queue.
+    ///
+    /// An admitted notification is additionally handed to the installed
+    /// [`bitty_platform::NotificationSink`] at admission time (CTX-0754),
+    /// so desktop delivery never waits behind the one-banner-at-a-time
+    /// in-grid queue. Delivery is counted
+    /// ([`Self::notifications_os_delivered`] /
+    /// [`Self::notifications_os_undelivered`]) and never blocks.
     pub(super) fn apply_notification_policy(
         &mut self,
         notification: &bitty_vt::Notification,
@@ -1827,11 +1888,94 @@ impl Runtime {
         // Show immediately when no banner is live, so an admitted
         // notification is never silently parked until a frame arrives; queue
         // it otherwise (the present path advances the queue on expiry).
-        if self.notification_banner_at(now).is_none() {
+        let admitted = if self.notification_banner_at(now).is_none() {
             self.show_notification_banner(notification, now).is_some()
         } else {
             self.notifications.push(notification.clone())
+        };
+        if admitted {
+            self.deliver_notification_to_os(notification);
         }
+        admitted
+    }
+
+    /// Hands one admitted notification to the installed OS sink (CTX-0754).
+    ///
+    /// Fail-closed: with no sink installed the notification still shows in
+    /// the bounded in-grid banner, and the miss is counted in
+    /// [`Self::notifications_os_undelivered`].
+    fn deliver_notification_to_os(&mut self, notification: &bitty_vt::Notification) {
+        let title = notification
+            .title
+            .as_ref()
+            .map_or("", |title| title.as_str());
+        let os_notification =
+            bitty_platform::DesktopNotification::new(title, notification.body.as_str());
+        if os_notification.is_empty() {
+            return;
+        }
+        let outcome = self
+            .notification_sink
+            .as_ref()
+            .map(|sink| sink.deliver(&os_notification));
+        match outcome {
+            Some(bitty_platform::OsDeliveryOutcome::Delivered) => {
+                self.notifications_os_delivered = self.notifications_os_delivered.saturating_add(1);
+            }
+            _ => {
+                self.notifications_os_undelivered =
+                    self.notifications_os_undelivered.saturating_add(1);
+            }
+        }
+    }
+
+    /// Installs the OS hand-off for audible bells (CTX-0754, issue #1361).
+    ///
+    /// Production installs [`bitty_platform::OsBellSink`] at startup; tests
+    /// install a recording double. `None` restores the fail-closed default.
+    pub fn set_bell_sink(&mut self, sink: Option<Box<dyn bitty_platform::BellSink>>) {
+        self.bell_sink = sink;
+    }
+
+    /// Installs the OS hand-off for admitted notifications (CTX-0754).
+    ///
+    /// Same seam discipline as [`Self::set_bell_sink`]: the app installs
+    /// [`bitty_platform::OsNotificationSink`] for real runs.
+    pub fn set_notification_sink(
+        &mut self,
+        sink: Option<Box<dyn bitty_platform::NotificationSink>>,
+    ) {
+        self.notification_sink = sink;
+    }
+
+    /// Admitted audible bell requests, whether or not a sink was installed.
+    #[must_use]
+    pub const fn audible_bell_requests(&self) -> u64 {
+        self.audible_bell_requests
+    }
+
+    /// Admitted audible bell requests the sink reported as delivered.
+    #[must_use]
+    pub const fn audible_bell_delivered(&self) -> u64 {
+        self.audible_bell_delivered
+    }
+
+    /// Admitted audible bell requests not delivered (no sink, skipped, failed).
+    #[must_use]
+    pub const fn audible_bell_undelivered(&self) -> u64 {
+        self.audible_bell_undelivered
+    }
+
+    /// Admitted notifications the OS sink reported as delivered.
+    #[must_use]
+    pub const fn notifications_os_delivered(&self) -> u64 {
+        self.notifications_os_delivered
+    }
+
+    /// Admitted notifications not delivered (no sink, skipped, failed).
+    #[must_use]
+    pub const fn notifications_os_undelivered(&self) -> u64 {
+        self.notifications_os_undelivered
     }
 
     /// Promotes the next queued notification to the visible banner once the

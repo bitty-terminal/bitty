@@ -69,6 +69,20 @@
 //! | Unknown-origin restrictive policy (R-020, P0-AC-032) | `origin` | [`origin::DetectedOrigin`] advisory classification (fail-closed to `Unknown` on absent/conflicting signals), [`origin::OriginPolicy`] `Unknown`/`Remote` restrictive, relaxation only via explicit [`origin::OriginOverride::RelaxToStandard`] |
 //! | Verification remaining under closed OQ-011..OQ-014 | docs + `event::DropPolicy` | `DropOldest` accepted v1 default; exact queue depths/timeouts per accepted `OQ-014` budgets; remaining work is implementation verification, not open RFC points |
 //!
+//! # Candidate kernels for open security OQs (not normative, no live-path wiring)
+//!
+//! The following modules record candidate directions for still-open owner
+//! questions. Each is pure, bounded, fail-closed data with unit tests; none
+//! is called from any live path and none grants authority by itself:
+//!
+//! | Open question | Module | Candidate shape |
+//! |---------------|--------|-----------------|
+//! | OQ-085 trust levels + capability domains | `trust_levels` | [`trust_levels::TrustLevel`] levels 0–4, [`trust_levels::CapabilityDomain`] admission sets narrowing with level, mapping onto accepted [`capability::CapabilityFamily`] only |
+//! | OQ-084 ontology/identity | `identity` | [`identity::EntityKind`] ten first-class kinds, [`identity::OntologyId`] `kind:value` identifiers, [`identity::Ownership`] links plus [`identity::Lifetime`] |
+//! | OQ-055 secret-storage tiers | `secret_tiers` | [`secret_tiers::SecretTier`] four tiers with per-tier [`secret_tiers::TierPolicy`] (consent/audit/redaction); [`secret_tiers::CommandRef`] names commands without running them |
+//! | OQ-054 `api_key_env` vs `api_key_cmd` | `credential_ref` | [`credential_ref::CredentialRef`] env/cmd references (names only), [`credential_ref::resolve_precedence`] exclusive-or order, [`credential_ref::check_project_override`] narrow-only boundary |
+//! | OQ-057 role contract | `roles` | [`roles::AgentRole`] Commander/Implementer/Tester/Reviewer, [`roles::EnforcementPoint`] checks, [`roles::SandboxRestrictions`] flags, capability ceilings intersected with grants elsewhere |
+//!
 //! # Drop policy — DropOldest accepted default for v1 (OQ-013 closed decision point)
 //!
 //! Queue overflow when a queue is full was a single shared decision
@@ -118,22 +132,32 @@
 
 pub mod bundled;
 pub mod capability;
+pub mod credential_ref;
 pub mod effective;
 pub mod error;
 pub mod event;
 pub mod fs_authz;
 pub mod grant;
 pub mod host;
+pub mod identity;
 pub mod install;
 pub mod lifecycle;
 pub mod manifest;
 pub mod origin;
 pub mod registry;
+pub mod roles;
+pub mod secret_tiers;
 pub mod secrets;
 pub mod tools;
+pub mod trust_levels;
 
 pub use capability::{
     CapabilityFamily, CapabilityId, effect_statement, validate_closed_capability,
+};
+pub use credential_ref::{
+    CredentialPrecedence, CredentialRef, CredentialSource, MAX_CREDENTIAL_CMD_ARGS,
+    MAX_CREDENTIAL_CMD_PART_BYTES, MAX_CREDENTIAL_ENV_NAME_BYTES, check_project_override,
+    resolve_precedence,
 };
 pub use effective::{
     AgentRequest, AuditDecision, AuditEntry, AuditLedger, CapabilityScope, DenialKind, DenialStep,
@@ -164,6 +188,7 @@ pub use fs_authz::{
 };
 pub use grant::{GrantConsent, GrantOrigin, GrantRecord, GrantStore, RevokeReport};
 pub use host::{HostObservation, PluginHost, SideQueue};
+pub use identity::{EntityKind, Lifetime, MAX_ONTOLOGY_ID_BYTES, OntologyId, Ownership};
 pub use install::{
     DoctorIssue, InstallInputs, NATIVE_ARTIFACT_EXTENSIONS, is_native_artifact_file_name,
     is_staging_allowed, reject_native_artifact_files, verify_install, verify_install_with_files,
@@ -185,6 +210,11 @@ pub use origin::{
     resolve_origin_policy,
 };
 pub use registry::{Generation, PluginState, Registry, RegistryEntry};
+pub use roles::{AgentRole, EnforcementPoint, MAX_ROLE_LABEL_BYTES, SandboxRestrictions};
+pub use secret_tiers::{
+    CommandRef as SecretCommandRef, ConsentRule, MAX_COMMAND_REF_ARGS, MAX_COMMAND_REF_PART_BYTES,
+    MAX_TIER_LABEL_BYTES, SecretTier, TierPolicy,
+};
 pub use secrets::{
     FileSecretStore, MAX_HANDLE_NAME_BYTES, MAX_RESOLVED_ENV_VARS, MAX_SECRET_AUDIT_ENTRIES,
     MAX_SECRET_AUDIT_ITEMS, MAX_SECRET_FILE_BYTES, MAX_SECRET_FILE_LINE_BYTES,
@@ -201,3 +231,4 @@ pub use tools::{
     MAX_GIT_ARG_BYTES, MAX_GIT_ARGS, MAX_GIT_TOTAL_BYTES, PAYLOAD_MAX_BYTES, is_accepted_tool,
     is_allowed_git_args, is_safe_spawn_env, is_tool_spawn_allowed, is_valid_tool_name,
 };
+pub use trust_levels::{CapabilityDomain, MAX_TRUST_LABEL_BYTES, TrustLevel};

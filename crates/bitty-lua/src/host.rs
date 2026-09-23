@@ -78,6 +78,12 @@ pub const SPAWN_LUA_MAX_ARGS: usize = 64;
 pub const SPAWN_LUA_MAX_ARG_BYTES: usize = 4096;
 /// Maximum bytes of one module name accepted by `require`.
 pub const MODULE_NAME_MAX_BYTES: usize = 128;
+/// Maximum bytes of one `bitty.env` key (CTX-0330).
+///
+/// Mirrors the credential/secret env-name ceiling (`128`): an over-bound key
+/// is rejected fail-closed with `E_DEF_LIMIT` before any grant check, so
+/// oversize input never reaches the allowlist.
+pub const ENV_KEY_MAX_BYTES: usize = 128;
 /// Maximum bytes of one source module file accepted by `require`.
 pub const MODULE_FILE_MAX_BYTES: usize = 1024 * 1024;
 
@@ -478,6 +484,37 @@ pub trait HostServices {
     }
     /// Read a typed setting; `Ok(None)` means absent.
     fn settings_get(&self, key: &str) -> Result<Option<LuaValue>, BridgeError>;
+    /// Read one host environment variable for `bitty.env.get` (CTX-0330).
+    ///
+    /// Host-mediated and grant-gated: the implementation must return
+    /// [`BridgeError::not_implemented`](BridgeError::not_implemented) with
+    /// `bitty.env.get` until the calling generation holds an
+    /// `env.read:<KEY>` grant for `key` (fail-closed, desensitized — the
+    /// same code as a host without an env backend, so ungranted keys are
+    /// indistinguishable from unimplemented ones). `Ok(None)` means the
+    /// granted key is absent from the host environment
+    /// (absent-unless-declared). Values cross as bounded strings; keys are
+    /// validated by the caller shape (`[A-Za-z_][A-Za-z0-9_]*`, `1..128`
+    /// bytes) with `E_DEF_INVALID`/`E_DEF_LIMIT`.
+    ///
+    /// The default implementation fails closed with `E_NOT_IMPLEMENTED`: a
+    /// host without an env backend can never gain ambient reads from the
+    /// always-present `bitty.env` namespace.
+    fn env_get(&self, key: &str) -> Result<Option<LuaValue>, BridgeError> {
+        let _ = key;
+        Err(BridgeError::not_implemented("bitty.env.get"))
+    }
+    /// Whether one host environment variable is present, for `bitty.env.has`
+    /// (CTX-0330).
+    ///
+    /// Same grant gate as [`HostServices::env_get`]: `E_NOT_IMPLEMENTED`
+    /// until the calling generation holds `env.read:<KEY>`, otherwise
+    /// presence of the granted key. The default implementation fails closed
+    /// like [`HostServices::env_get`].
+    fn env_has(&self, key: &str) -> Result<bool, BridgeError> {
+        let _ = key;
+        Err(BridgeError::not_implemented("bitty.env.has"))
+    }
     /// Read a bounded committed terminal snapshot for `scope`.
     fn terminal_snapshot(&self, scope: &str) -> Result<LuaValue, BridgeError>;
     /// Hand a notification to the platform asynchronously; returns acceptance.
@@ -1672,26 +1709,67 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         )
         .expect("tasks table accepts 'cancel'");
 
-    // CTX-0707 parity: `bitty.env.get`/`has` are DEFERRED (ADR 0006). Reads
-    // need the `env:<KEY>` grant intersection, the bounded allowlist, and
-    // desensitized values; the bridge knows no manifest, so both spellings
-    // stay present and fail closed with typed `E_NOT_IMPLEMENTED` until a
-    // follow-up wires the grant-aware backend (including the
-    // absent-unless-declared carve-out).
+    // CTX-0330: `bitty.env.get`/`has` are grant-gated (ADR-0006). The bridge
+    // validates the key shape, then delegates to the host services through
+    // the deadline-checked read path. Hosts without an env backend — and
+    // generations without an `env.read:<KEY>` grant — fail closed with typed
+    // `E_NOT_IMPLEMENTED`, so ungranted keys stay indistinguishable from
+    // unimplemented ones.
     let env = Table::new(&ctx);
     env.set(
         ctx,
         "get",
-        Callback::from_fn(&ctx, move |ctx, _exec, _stack| {
-            Err(BridgeError::not_implemented("bitty.env.get").to_error(ctx))
+        Callback::from_fn(&ctx, {
+            let state = state.clone();
+            move |ctx, _exec, mut stack| {
+                let key = match stack.get(0) {
+                    Value::String(s) => String::from_utf8_lossy(s.as_bytes()).into_owned(),
+                    _ => {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            "env.get key must be a string",
+                        )
+                        .to_error(ctx));
+                    }
+                };
+                validate_env_key(&key).map_err(|e| e.to_error(ctx))?;
+                let value = state
+                    .bounded(|_expiry| state.services.env_get(&key))
+                    .map_err(|e| e.to_error(ctx))?;
+                match value {
+                    Some(value) => stack.replace(ctx, value.to_lua(ctx)),
+                    None => stack.replace(ctx, Value::Nil),
+                }
+                Ok(CallbackReturn::Return)
+            }
         }),
     )
     .expect("env table accepts 'get'");
     env.set(
         ctx,
         "has",
-        Callback::from_fn(&ctx, move |ctx, _exec, _stack| {
-            Err(BridgeError::not_implemented("bitty.env.has").to_error(ctx))
+        Callback::from_fn(&ctx, {
+            let state = state.clone();
+            move |ctx, _exec, mut stack| {
+                let key = match stack.get(0) {
+                    Value::String(s) => String::from_utf8_lossy(s.as_bytes()).into_owned(),
+                    _ => {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            "env.has key must be a string",
+                        )
+                        .to_error(ctx));
+                    }
+                };
+                validate_env_key(&key).map_err(|e| e.to_error(ctx))?;
+                let present = state
+                    .bounded(|_expiry| state.services.env_has(&key))
+                    .map_err(|e| e.to_error(ctx))?;
+                stack.replace(ctx, Value::Boolean(present));
+                Ok(CallbackReturn::Return)
+            }
         }),
     )
     .expect("env table accepts 'has'");
@@ -1784,8 +1862,10 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
     root.set(ctx, "timers", readonly_table(ctx, timers))
         .expect("root accepts timers");
     // CTX-0707 parity shape: all four accepted v1 namespaces are present.
-    // `keymaps`/`tasks` capture at the bridge; `services`/`env` fail closed
-    // with `E_NOT_IMPLEMENTED` until their host backends land.
+    // `keymaps`/`tasks` capture at the bridge; `services` fails closed
+    // with `E_NOT_IMPLEMENTED` until its host backend lands, while `env`
+    // delegates to the grant-gated backend (CTX-0330: `E_NOT_IMPLEMENTED`
+    // until an `env.read:<KEY>` grant exists).
     root.set(ctx, "keymaps", readonly_table(ctx, keymaps))
         .expect("root accepts keymaps");
     root.set(ctx, "services", readonly_table(ctx, services))
@@ -1937,6 +2017,52 @@ fn bounded_token(token: &str) -> String {
     let mut bounded: String = token.chars().take(MAX_CHARS).collect();
     bounded.push('…');
     bounded
+}
+
+/// Validate a `bitty.env` key shape (CTX-0330).
+///
+/// Keys are `[A-Za-z_][A-Za-z0-9_]*` within `1..=ENV_KEY_MAX_BYTES` bytes.
+/// Shape failures are `E_DEF_INVALID`/`E_DEF_LIMIT` (validation class) and
+/// run before the grant gate; diagnostics quote the bounded key only, never
+/// a value.
+fn validate_env_key(key: &str) -> Result<(), BridgeError> {
+    if key.is_empty() {
+        return Err(BridgeError::new(
+            "validation",
+            "E_DEF_INVALID",
+            "env key must not be empty",
+        ));
+    }
+    if key.len() > ENV_KEY_MAX_BYTES {
+        return Err(BridgeError::new(
+            "validation",
+            "E_DEF_LIMIT",
+            format!("env key exceeds {ENV_KEY_MAX_BYTES} bytes"),
+        ));
+    }
+    let mut bytes = key.bytes();
+    let first = bytes.next().unwrap_or(b'_');
+    if !(first.is_ascii_alphabetic() || first == b'_') {
+        return Err(BridgeError::new(
+            "validation",
+            "E_DEF_INVALID",
+            format!(
+                "env key '{}' must start with a letter or '_'",
+                bounded_token(key)
+            ),
+        ));
+    }
+    if !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        return Err(BridgeError::new(
+            "validation",
+            "E_DEF_INVALID",
+            format!(
+                "env key '{}' must be [A-Za-z_][A-Za-z0-9_]*",
+                bounded_token(key)
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Extract a 1-based argv array of strings from a marshalled Lua value.

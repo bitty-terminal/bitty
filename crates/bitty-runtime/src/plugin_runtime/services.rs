@@ -7,14 +7,29 @@
 //! grant fails closed before any side effect.
 
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::Rc;
 
 use bitty_lua::ui::{UI_MAX_AGGREGATED_TEXT_BYTES, UI_MAX_BLOCKS, UiNode};
-use bitty_lua::{BridgeError, HostServices, LuaValue, SNAPSHOT_MAX_BYTES};
+use bitty_lua::{BridgeError, ENV_KEY_MAX_BYTES, HostServices, LuaValue, SNAPSHOT_MAX_BYTES};
 use bitty_plugin_host::bundled::{WORKSPACELINE_CLAIM, canonicalize_ui_claim};
 
 use super::store::{self, PluginStore};
+
+/// Maximum `env.read:<KEY>` grants held by one plugin generation (CTX-0330).
+///
+/// Precedent: `MAX_RESOLVED_ENV_VARS` (`64`) bounds secret env bindings in
+/// the accepted host store; the `bitty.env` grant set reuses it so one
+/// generation can never accumulate an unbounded allowlist.
+pub const MAX_ENV_GRANTS: usize = 64;
+
+/// Maximum bytes of one `bitty.env` value crossing into Lua (CTX-0330).
+///
+/// Precedent: `MAX_SECRET_VALUE_BYTES` (`4096`) bounds secret values in the
+/// accepted IPC execution budgets; host environment values reuse it so an
+/// unbounded variable (e.g. a dumped keyring) fails closed with
+/// `E_DEF_LIMIT` instead of crossing the bridge.
+pub const MAX_ENV_VALUE_BYTES: usize = 4096;
 
 /// Injected spawn backend for one plugin generation.
 ///
@@ -63,6 +78,93 @@ impl SnapshotSource for UnavailableSnapshot {
             "no committed terminal state is available for snapshot",
         ))
     }
+}
+
+/// Host environment source for `bitty.env` reads (CTX-0330).
+///
+/// Values are read host-side only; the grant gate in [`PluginServices`]
+/// decides *which* keys a generation may see, while the source decides
+/// *what* a granted key resolves to. Split so tests inject [`MapEnv`]
+/// without touching the process environment.
+pub trait EnvSource {
+    /// Read one variable; `None` when absent.
+    fn get(&self, key: &str) -> Option<String>;
+}
+
+/// Environment source that resolves nothing (default: deny by absence).
+#[derive(Debug, Default)]
+pub struct EmptyEnv;
+
+impl EnvSource for EmptyEnv {
+    fn get(&self, _key: &str) -> Option<String> {
+        None
+    }
+}
+
+/// Environment source reading the host process environment.
+///
+/// Wired at activation; values cross only for granted keys and within
+/// [`MAX_ENV_VALUE_BYTES`]. Non-UTF-8 variables resolve as absent rather
+/// than lossy: a plugin must never observe mojibake it could mistake for a
+/// credential.
+#[derive(Debug, Default)]
+pub struct ProcessEnv;
+
+impl EnvSource for ProcessEnv {
+    fn get(&self, key: &str) -> Option<String> {
+        std::env::var(key).ok()
+    }
+}
+
+/// Fixed-map environment source (tests, embedding).
+#[derive(Debug, Default, Clone)]
+pub struct MapEnv {
+    values: BTreeMap<String, String>,
+}
+
+impl MapEnv {
+    /// Build a source from owned pairs.
+    #[must_use]
+    pub fn new(values: BTreeMap<String, String>) -> Self {
+        Self { values }
+    }
+}
+
+impl EnvSource for MapEnv {
+    fn get(&self, key: &str) -> Option<String> {
+        self.values.get(key).cloned()
+    }
+}
+
+/// Validate one `bitty.env` key at the services boundary (CTX-0330).
+///
+/// Same shape as the bridge ([`ENV_KEY_MAX_BYTES`], `[A-Za-z_][A-Za-z0-9_]*`):
+/// a direct caller that bypasses the bridge gets the same typed rejection,
+/// so the allowlist never sees a malformed key.
+fn validate_env_key_shape(key: &str) -> Result<(), BridgeError> {
+    if key.is_empty() || key.len() > ENV_KEY_MAX_BYTES {
+        return Err(BridgeError::new(
+            "validation",
+            if key.is_empty() {
+                "E_DEF_INVALID"
+            } else {
+                "E_DEF_LIMIT"
+            },
+            "env key must be 1..128 bytes",
+        ));
+    }
+    let mut bytes = key.bytes();
+    let first = bytes.next().unwrap_or(b'_');
+    if !(first.is_ascii_alphabetic() || first == b'_')
+        || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        return Err(BridgeError::new(
+            "validation",
+            "E_DEF_INVALID",
+            "env key must be [A-Za-z_][A-Za-z0-9_]*",
+        ));
+    }
+    Ok(())
 }
 
 /// One accepted notification handed to the platform asynchronously.
@@ -347,6 +449,8 @@ pub struct PluginServices {
     spawn_backend: RefCell<Option<SpawnHandler>>,
     ui_access: RefCell<UiAccess>,
     ui_blocks: RefCell<UiBlocks>,
+    env_grants: RefCell<BTreeSet<String>>,
+    env_source: RefCell<Rc<dyn EnvSource>>,
 }
 
 impl PluginServices {
@@ -373,6 +477,8 @@ impl PluginServices {
             spawn_backend: RefCell::new(None),
             ui_access: RefCell::new(UiAccess::default()),
             ui_blocks: RefCell::new(UiBlocks::new()),
+            env_grants: RefCell::new(BTreeSet::new()),
+            env_source: RefCell::new(Rc::new(EmptyEnv)),
         }
     }
 
@@ -439,6 +545,45 @@ impl PluginServices {
         f(&self.store.borrow())
     }
 
+    /// Grant `bitty.env` reads for exact keys (CTX-0330).
+    ///
+    /// Set from the activation grant snapshot (`env.read:<KEY>` entries with
+    /// the prefix stripped); absent grants fail closed at call time with
+    /// `E_NOT_IMPLEMENTED`. Every key is shape-validated here — a malformed
+    /// recorded grant fails the whole set rather than silently dropping —
+    /// and the set is capped at [`MAX_ENV_GRANTS`].
+    ///
+    /// # Errors
+    ///
+    /// [`BridgeError`] with `E_DEF_INVALID`/`E_DEF_LIMIT` when a key is
+    /// malformed or the set exceeds [`MAX_ENV_GRANTS`].
+    pub fn set_env_grants(&self, keys: BTreeSet<String>) -> Result<(), BridgeError> {
+        if keys.len() > MAX_ENV_GRANTS {
+            return Err(BridgeError::new(
+                "budget",
+                "E_DEF_LIMIT",
+                format!("env grant set exceeds {MAX_ENV_GRANTS} keys"),
+            ));
+        }
+        for key in &keys {
+            validate_env_key_shape(key)?;
+        }
+        *self.env_grants.borrow_mut() = keys;
+        Ok(())
+    }
+
+    /// Granted `bitty.env` keys for this generation (tests, diagnostics).
+    #[must_use]
+    pub fn env_grants(&self) -> BTreeSet<String> {
+        self.env_grants.borrow().clone()
+    }
+
+    /// Inject the host environment source (`None` restores fail-by-absence
+    /// [`EmptyEnv`]).
+    pub fn set_env_source(&self, source: Option<Rc<dyn EnvSource>>) {
+        *self.env_source.borrow_mut() = source.unwrap_or_else(|| Rc::new(EmptyEnv));
+    }
+
     /// Plugin id this service set belongs to.
     #[must_use]
     pub fn plugin_id(&self) -> &str {
@@ -464,6 +609,37 @@ impl HostServices for PluginServices {
             ));
         }
         Ok(self.settings.get(key))
+    }
+
+    fn env_get(&self, key: &str) -> Result<Option<LuaValue>, BridgeError> {
+        validate_env_key_shape(key)?;
+        if !self.env_grants.borrow().contains(key) {
+            // Desensitized denial: ungranted keys share the backend-absent
+            // code, so callers cannot probe which variables exist.
+            return Err(BridgeError::not_implemented("bitty.env.get"));
+        }
+        let value = self.env_source.borrow().get(key);
+        match value {
+            None => Ok(None),
+            Some(value) => {
+                if value.len() > MAX_ENV_VALUE_BYTES {
+                    return Err(BridgeError::new(
+                        "budget",
+                        "E_DEF_LIMIT",
+                        format!("env value exceeds {MAX_ENV_VALUE_BYTES} bytes"),
+                    ));
+                }
+                Ok(Some(LuaValue::String(value)))
+            }
+        }
+    }
+
+    fn env_has(&self, key: &str) -> Result<bool, BridgeError> {
+        validate_env_key_shape(key)?;
+        if !self.env_grants.borrow().contains(key) {
+            return Err(BridgeError::not_implemented("bitty.env.has"));
+        }
+        Ok(self.env_source.borrow().get(key).is_some())
     }
 
     fn terminal_snapshot(&self, scope: &str) -> Result<LuaValue, BridgeError> {
@@ -612,6 +788,88 @@ mod tests {
             .process_spawn(&["status".to_owned()])
             .expect_err("grant absent must deny");
         assert_eq!(error.code, "E_CAPABILITY_DENIED");
+    }
+
+    fn env_services(grants: &[&str], values: &[(&str, &str)]) -> PluginServices {
+        let services = services();
+        let keys: BTreeSet<String> = grants.iter().map(|key| (*key).to_string()).collect();
+        services
+            .set_env_grants(keys)
+            .expect("test grants are valid");
+        let map: BTreeMap<String, String> = values
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect();
+        services.set_env_source(Some(Rc::new(MapEnv::new(map))));
+        services
+    }
+
+    #[test]
+    fn env_without_grant_is_not_implemented() {
+        let services = env_services(&[], &[("HOME", "/home/tester")]);
+        let error = services
+            .env_get("HOME")
+            .expect_err("grant absent must deny");
+        assert_eq!(error.code, "E_NOT_IMPLEMENTED");
+        assert_eq!(error.class, "runtime");
+        let error = services
+            .env_has("HOME")
+            .expect_err("grant absent must deny");
+        assert_eq!(error.code, "E_NOT_IMPLEMENTED");
+    }
+
+    #[test]
+    fn env_granted_key_resolves_and_absent_reads_none() {
+        let services = env_services(&["HOME", "EMPTY_VAR"], &[("HOME", "/home/tester")]);
+        assert_eq!(
+            HostServices::env_get(&services, "HOME"),
+            Ok(Some(LuaValue::String("/home/tester".to_string())))
+        );
+        assert_eq!(HostServices::env_has(&services, "HOME"), Ok(true));
+        assert_eq!(HostServices::env_get(&services, "EMPTY_VAR"), Ok(None));
+        assert_eq!(HostServices::env_has(&services, "EMPTY_VAR"), Ok(false));
+    }
+
+    #[test]
+    fn env_key_shape_rejected_before_grants() {
+        let services = env_services(&["HOME"], &[("HOME", "x")]);
+        for key in ["", "has space", "9LIVES", "lower-ok?"] {
+            let error = HostServices::env_get(&services, key).expect_err("shape must deny");
+            assert_eq!(error.code, "E_DEF_INVALID", "key '{key}'");
+        }
+        let long = "A".repeat(ENV_KEY_MAX_BYTES + 1);
+        let error = HostServices::env_has(&services, &long).expect_err("over-bound must deny");
+        assert_eq!(error.code, "E_DEF_LIMIT");
+    }
+
+    #[test]
+    fn env_oversize_value_fails_closed() {
+        let big = "x".repeat(MAX_ENV_VALUE_BYTES + 1);
+        let services = env_services(&["BIG_VAR"], &[("BIG_VAR", big.as_str())]);
+        let error = services.env_get("BIG_VAR").expect_err("oversize must deny");
+        assert_eq!(error.code, "E_DEF_LIMIT");
+        assert_eq!(error.class, "budget");
+        // Presence alone does not cross the value.
+        assert_eq!(HostServices::env_has(&services, "BIG_VAR"), Ok(true));
+    }
+
+    #[test]
+    fn env_grant_set_validates_and_bounds() {
+        let services = services();
+        let bad: BTreeSet<String> = BTreeSet::from(["9LIVES".to_string()]);
+        let error = services
+            .set_env_grants(bad)
+            .expect_err("malformed grant must fail");
+        assert_eq!(error.code, "E_DEF_INVALID");
+        assert!(services.env_grants().is_empty());
+        let many: BTreeSet<String> = (0..MAX_ENV_GRANTS + 1)
+            .map(|index| format!("VAR_{index}"))
+            .collect();
+        let error = services
+            .set_env_grants(many)
+            .expect_err("over-limit must fail");
+        assert_eq!(error.code, "E_DEF_LIMIT");
+        assert!(services.env_grants().is_empty());
     }
 
     #[test]

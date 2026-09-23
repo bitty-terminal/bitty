@@ -13,6 +13,12 @@ pub enum CapabilityFamily {
     Terminal,
     Ui,
     Clipboard,
+    /// Host-mediated environment reads (`env.read:<KEY>`, CTX-0330).
+    ///
+    /// Keys name one variable each; values are read host-side through the
+    /// `bitty.env` boundary, never through ambient `os.getenv` (which stays
+    /// denied per ADR-0006). Grants are per-key and fail closed.
+    Env,
     Fs,
     Process,
     Network,
@@ -42,6 +48,7 @@ impl CapabilityFamily {
             "terminal" => Some(Self::Terminal),
             "ui" => Some(Self::Ui),
             "clipboard" => Some(Self::Clipboard),
+            "env" => Some(Self::Env),
             "fs" => Some(Self::Fs),
             "process" => Some(Self::Process),
             "network" => Some(Self::Network),
@@ -66,6 +73,7 @@ impl CapabilityFamily {
             Self::Terminal => "terminal",
             Self::Ui => "ui",
             Self::Clipboard => "clipboard",
+            Self::Env => "env",
             Self::Fs => "fs",
             Self::Process => "process",
             Self::Network => "network",
@@ -104,6 +112,7 @@ impl CapabilityFamily {
             ],
             Self::Ui => &["ui.rich", "ui.overlay", "ui.protocol-register"],
             Self::Clipboard => &["clipboard.read", "clipboard.write"],
+            Self::Env => &["env.read"],
             Self::Fs => &["fs.read", "fs.write"],
             Self::Process => &["process.spawn"],
             Self::Network => &["network.connect"],
@@ -252,7 +261,8 @@ impl CapabilityId {
     /// Whether this identifier is flagged high-risk per RFC rule 3.
     ///
     /// High-risk: `terminal.input.all`, `terminal.raw-read`, `ui.protocol-register`,
-    /// `debug.control`, and `runtime.plugin-manage`. Consent UI must present them
+    /// `debug.control`, `runtime.plugin-manage`, `browser.embed`, and `env.read`.
+    /// Consent UI must present them
     /// distinctly and they cannot be granted implicitly via workspace config or
     /// service indirection.
     #[must_use]
@@ -310,6 +320,9 @@ fn is_high_risk(head: &str) -> bool {
             | "debug.control"
             | "runtime.plugin-manage"
             | "browser.embed"
+            // Environment variables routinely carry credentials, so every
+            // `env.read` grant gets distinct consent presentation.
+            | "env.read"
     )
 }
 
@@ -327,6 +340,7 @@ pub fn effect_statement(id: &CapabilityId) -> &'static str {
         "ui.protocol-register" => "Register custom URL protocols (high-risk)",
         "clipboard.read" => "Read clipboard contents",
         "clipboard.write" => "Write to clipboard",
+        "env.read" => "Read the named host environment variable (high-risk)",
         "fs.read" => "Read files matching the declared globs",
         "fs.write" => "Write files matching the declared globs",
         "process.spawn" => "Spawn the allowlisted program",
@@ -422,6 +436,7 @@ mod tests {
             "terminal.semantic-read",
             "ui.rich",
             "clipboard.read",
+            "env.read:HOME",
             "fs.read:~/Documents/**/*.md",
             "process.spawn:git",
             "network.connect:example.com:443",
@@ -449,6 +464,7 @@ mod tests {
             CapabilityFamily::Network,
             CapabilityFamily::Terminal,
             CapabilityFamily::Clipboard,
+            CapabilityFamily::Env,
             CapabilityFamily::Ui,
             CapabilityFamily::Protocol,
             CapabilityFamily::Runtime,
@@ -470,6 +486,7 @@ mod tests {
                         | CapabilityFamily::Process
                         | CapabilityFamily::Network
                         | CapabilityFamily::Mcp
+                        | CapabilityFamily::Env
                 ) || *raw == "agent.memory"
                 {
                     assert!(
@@ -494,6 +511,20 @@ mod tests {
         assert!(CapabilityId::parse("fs.read").is_err());
         assert!(CapabilityId::parse("fs.write").is_err());
         assert!(CapabilityId::parse("fs.read:~/docs/*.md").is_ok());
+    }
+
+    #[test]
+    fn env_read_requires_key_param() {
+        assert!(CapabilityId::parse("env.read").is_err());
+        assert!(CapabilityId::parse("env.read:HOME").is_ok());
+        let granted = CapabilityId::parse("env.read:HOME").expect("env.read:HOME parses");
+        assert_eq!(granted.family(), CapabilityFamily::Env);
+        assert!(granted.has_param());
+        assert!(granted.is_high_risk());
+        assert_eq!(
+            effect_statement(&granted),
+            "Read the named host environment variable (high-risk)"
+        );
     }
 
     #[test]
@@ -561,6 +592,7 @@ mod tests {
             CapabilityFamily::Terminal,
             CapabilityFamily::Ui,
             CapabilityFamily::Clipboard,
+            CapabilityFamily::Env,
             CapabilityFamily::Fs,
             CapabilityFamily::Process,
             CapabilityFamily::Network,

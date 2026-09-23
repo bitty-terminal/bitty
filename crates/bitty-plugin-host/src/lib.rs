@@ -73,13 +73,19 @@
 //!
 //! The following modules record candidate directions for still-open owner
 //! questions. Each is pure, bounded, fail-closed data with unit tests; none
-//! is called from any live path and none grants authority by itself:
+//! grants authority by itself. Two seams are enforced at live boundaries:
+//! per-key `env.read:<KEY>` grants gate `bitty.env` reads (fail-closed,
+//! typed `E_NOT_IMPLEMENTED` until granted), and the secret-tier consent
+//! gate ([`secret_tiers::check_tier_access`]) runs at the secret resolve
+//! boundary ([`host::PluginHost::resolve_secret_with_tier`]) with names-only
+//! audit. Tier admission, keyring backend choice, command execution, and
+//! rotation stay undecided.
 //!
 //! | Open question | Module | Candidate shape |
 //! |---------------|--------|-----------------|
 //! | OQ-085 trust levels + capability domains | `trust_levels` | [`trust_levels::TrustLevel`] levels 0–4, [`trust_levels::CapabilityDomain`] admission sets narrowing with level, mapping onto accepted [`capability::CapabilityFamily`] only |
 //! | OQ-084 ontology/identity | `identity` | [`identity::EntityKind`] ten first-class kinds, [`identity::OntologyId`] `kind:value` identifiers, [`identity::Ownership`] links plus [`identity::Lifetime`] |
-//! | OQ-055 secret-storage tiers | `secret_tiers` | [`secret_tiers::SecretTier`] four tiers with per-tier [`secret_tiers::TierPolicy`] (consent/audit/redaction); [`secret_tiers::CommandRef`] names commands without running them |
+//! | OQ-055 secret-storage tiers | `secret_tiers` | [`secret_tiers::SecretTier`] four tiers with per-tier [`secret_tiers::TierPolicy`] (consent/audit/redaction); [`secret_tiers::CommandRef`] names commands without running them; [`secret_tiers::check_tier_access`] enforced at the resolve boundary |
 //! | OQ-054 `api_key_env` vs `api_key_cmd` | `credential_ref` | [`credential_ref::CredentialRef`] env/cmd references (names only), [`credential_ref::resolve_precedence`] exclusive-or order, [`credential_ref::check_project_override`] narrow-only boundary |
 //! | OQ-057 role contract | `roles` | [`roles::AgentRole`] Commander/Implementer/Tester/Reviewer, [`roles::EnforcementPoint`] checks, [`roles::SandboxRestrictions`] flags, capability ceilings intersected with grants elsewhere |
 //!
@@ -213,7 +219,7 @@ pub use registry::{Generation, PluginState, Registry, RegistryEntry};
 pub use roles::{AgentRole, EnforcementPoint, MAX_ROLE_LABEL_BYTES, SandboxRestrictions};
 pub use secret_tiers::{
     CommandRef as SecretCommandRef, ConsentRule, MAX_COMMAND_REF_ARGS, MAX_COMMAND_REF_PART_BYTES,
-    MAX_TIER_LABEL_BYTES, SecretTier, TierPolicy,
+    MAX_TIER_LABEL_BYTES, SecretTier, TierAccess, TierPolicy, check_tier_access,
 };
 pub use secrets::{
     FileSecretStore, MAX_HANDLE_NAME_BYTES, MAX_RESOLVED_ENV_VARS, MAX_SECRET_AUDIT_ENTRIES,

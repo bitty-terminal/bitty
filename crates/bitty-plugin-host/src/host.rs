@@ -904,6 +904,44 @@ impl PluginHost {
             .map_err(PluginError::from)
     }
 
+    /// Resolve `(env_name, handle)` bindings with a secret-tier consent gate
+    /// (CTX-0330).
+    ///
+    /// The tier consent half runs first
+    /// ([`crate::secret_tiers::check_tier_access`]): tiers whose policy
+    /// requires an explicit grant fail closed here when `tier_consent` is
+    /// false, and the denial is recorded in the secret audit ledger (names
+    /// only) via [`crate::secrets::SecretStore::audit_tier_deny`] before the
+    /// store is contacted. `HostEnv`-tier reads pass the gate — their
+    /// per-key allowlist is enforced at the `bitty.env` boundary — and then
+    /// follow the same capability authorization and per-handle consent path
+    /// as [`Self::resolve_secret_for_spawn`]. Values flow only into the
+    /// returned child-env pairs, never into diagnostics.
+    ///
+    /// # Errors
+    ///
+    /// [`PluginError::Grant`] when the tier gate denies; otherwise the same
+    /// errors as [`Self::resolve_secret_for_spawn`].
+    pub fn resolve_secret_with_tier(
+        &mut self,
+        stack: &crate::effective::EffectiveStack,
+        request: &crate::effective::AgentRequest,
+        project_trusted: bool,
+        bindings: &[(String, crate::secrets::SecretHandle)],
+        now_ms: u64,
+        access: crate::secret_tiers::TierAccess,
+    ) -> Result<Vec<(String, String)>, PluginError> {
+        if let Err(error) = access.check() {
+            let names: Vec<String> = bindings
+                .iter()
+                .map(|(_, handle)| handle.name().to_string())
+                .collect();
+            self.secrets.audit_tier_deny(access.tier, &names);
+            return Err(error);
+        }
+        self.resolve_secret_for_spawn(stack, request, project_trusted, bindings, now_ms)
+    }
+
     /// Agent-visible sanitized view over explicit env entries.
     ///
     /// Presence plus non-secret values only (panel-environment Agent View
@@ -1987,6 +2025,57 @@ mod secrets_tests {
             vec![("GITHUB_TOKEN".to_string(), SEED.to_string())]
         );
         assert_eq!(host.secrets().audit().len(), allowed_before + 1);
+    }
+
+    #[test]
+    fn tiered_secret_resolve_gates_consent_before_store() {
+        use crate::secret_tiers::{SecretTier, TierAccess};
+
+        let denied_access = TierAccess {
+            tier: SecretTier::OsKeyring,
+            consent: false,
+        };
+        let allowed_access = TierAccess {
+            tier: SecretTier::OsKeyring,
+            consent: true,
+        };
+        let host_env_access = TierAccess {
+            tier: SecretTier::HostEnv,
+            consent: false,
+        };
+        let mut host = PluginHost::new(DropPolicy::DropOldest, 8);
+        host.secrets_mut().insert("github", SEED).unwrap();
+        host.secrets_mut().grant_consent("github", 0, None);
+        let (stack, request) = authorized_stack();
+        let bindings = vec![(
+            "GITHUB_TOKEN".to_string(),
+            SecretHandle::parse("secret://github").unwrap(),
+        )];
+        // Grant tiers without tier consent deny before the store is
+        // contacted, with a typed grant error and a names-only audit entry.
+        let audit_before = host.secrets().audit().len();
+        let denied = host
+            .resolve_secret_with_tier(&stack, &request, true, &bindings, 10, denied_access)
+            .expect_err("tier without consent must deny");
+        assert!(denied.to_string().contains("explicit consent"));
+        assert!(!denied.to_string().contains(SEED));
+        assert_eq!(host.secrets().audit().len(), audit_before + 1);
+        // With tier consent the same bindings resolve through the store path.
+        let resolved = host
+            .resolve_secret_with_tier(&stack, &request, true, &bindings, 10, allowed_access)
+            .expect("tier with consent resolves");
+        assert_eq!(
+            resolved,
+            vec![("GITHUB_TOKEN".to_string(), SEED.to_string())]
+        );
+        // Host-env tier needs no tier consent beyond the store path.
+        let resolved = host
+            .resolve_secret_with_tier(&stack, &request, true, &bindings, 10, host_env_access)
+            .expect("host-env tier passes the gate");
+        assert_eq!(
+            resolved,
+            vec![("GITHUB_TOKEN".to_string(), SEED.to_string())]
+        );
     }
 
     #[test]

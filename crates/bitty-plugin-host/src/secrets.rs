@@ -1354,6 +1354,22 @@ impl SecretStore {
         &self.audit
     }
 
+    /// Record a secret-tier gate denial (CTX-0330; names only, never values).
+    ///
+    /// Called by the tier-aware resolve boundary when
+    /// [`crate::secret_tiers::check_tier_access`] denies before the store is
+    /// contacted: the denial is attributed to the named handles with the
+    /// tier label in the detail so the ledger shows *why* consent was
+    /// required. Handle values never enter this function.
+    pub fn audit_tier_deny(&mut self, tier: crate::secret_tiers::SecretTier, handles: &[String]) {
+        let detail = format!(
+            "secret tier '{}' denied without explicit consent",
+            tier.as_str()
+        );
+        self.audit
+            .push_deny(handles, SecretDenialKind::ConsentRequired, detail);
+    }
+
     /// Values for in-memory scrubbing only (never serialize or log).
     ///
     /// The returned references borrow the store; callers must use them

@@ -49,8 +49,9 @@ pub use resolution::{
     load_index_with_fs, write_index, write_index_with_fs,
 };
 pub use services::{
-    EmptySettings, Notification, NotificationQueue, PluginServices, SettingsSource, SnapshotSource,
-    UiAccess, UiBlock, UiBlocks, UnavailableSnapshot,
+    EmptyEnv, EmptySettings, EnvSource, MAX_ENV_GRANTS, MAX_ENV_VALUE_BYTES, MapEnv, Notification,
+    NotificationQueue, PluginServices, ProcessEnv, SettingsSource, SnapshotSource, UiAccess,
+    UiBlock, UiBlocks, UnavailableSnapshot,
 };
 pub use store::PluginStore;
 // Bridge value/error types the host-service traits are expressed in, so the
@@ -299,6 +300,87 @@ pub enum PluginRuntimeError {
         /// Bounded detail.
         detail: String,
     },
+    /// Resource quota exceeded (budgets, queue ceilings, grant-set bounds).
+    ///
+    /// Quota-shaped rejections carry `E_BUDGET_*`/`E_DEF_LIMIT` codes via
+    /// [`PluginRuntimeError::code`]; the counters are host-authored and
+    /// bounded, never untrusted content.
+    Budget {
+        /// Plugin id or path identifier.
+        plugin: String,
+        /// Bounded detail.
+        detail: String,
+    },
+    /// Operation exceeded its wall-clock deadline.
+    ///
+    /// Maps to `E_TIMEOUT`, the same code the bridge emits for host-call and
+    /// spawn timeouts, so budget timeouts and bridge timeouts share one
+    /// class and one code.
+    Timeout {
+        /// Plugin id.
+        plugin: String,
+        /// Bounded detail.
+        detail: String,
+    },
+    /// A hard count/size limit was exceeded.
+    LimitExceeded {
+        /// Plugin id or path identifier.
+        plugin: String,
+        /// Field or resource.
+        field: String,
+        /// Configured limit.
+        limit: usize,
+        /// Actual value.
+        actual: usize,
+    },
+}
+
+impl PluginRuntimeError {
+    /// Stable `E_*` code for this failure (CTX-0330 taxonomy).
+    ///
+    /// Every variant maps to exactly one code so diagnostics, doctor
+    /// surfaces, and Lua bridge errors stay joinable on a closed set.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Manifest { .. } => "E_MANIFEST",
+            Self::ModuleTree { .. } => "E_MODULE_TREE",
+            Self::Io(_) => "E_IO",
+            Self::NotFound { .. } => "E_NOT_FOUND",
+            Self::Integrity { .. } => "E_INTEGRITY",
+            Self::Incompatible { .. } => "E_INCOMPATIBLE",
+            Self::Lifecycle { .. } => "E_LIFECYCLE",
+            Self::Host(_) => "E_HOST",
+            Self::Vm(_) => "E_VM",
+            Self::Capture { .. } => "E_CAPTURE",
+            Self::Budget { .. } => "E_BUDGET_EXCEEDED",
+            Self::Timeout { .. } => "E_TIMEOUT",
+            Self::LimitExceeded { .. } => "E_DEF_LIMIT",
+        }
+    }
+
+    /// Diagnostic class for this failure (CTX-0330 taxonomy).
+    ///
+    /// Mirrors the bridge classes: `validation` for malformed/over-bound
+    /// input, `budget` for quota and time failures, `runtime` for
+    /// lifecycle, host, and VM failures.
+    #[must_use]
+    pub fn error_class(&self) -> &'static str {
+        match self {
+            Self::Manifest { .. }
+            | Self::ModuleTree { .. }
+            | Self::LimitExceeded { .. }
+            | Self::Incompatible { .. } => "validation",
+            Self::Budget { .. } | Self::Timeout { .. } => "budget",
+            Self::Io(_)
+            | Self::NotFound { .. }
+            | Self::Integrity { .. }
+            | Self::Lifecycle { .. }
+            | Self::Host(_)
+            | Self::Vm(_)
+            | Self::Capture { .. } => "runtime",
+        }
+    }
 }
 
 impl std::fmt::Display for PluginRuntimeError {
@@ -333,6 +415,23 @@ impl std::fmt::Display for PluginRuntimeError {
             Self::Vm(detail) => write!(f, "plugin vm error: {detail}"),
             Self::Capture { plugin, detail } => {
                 write!(f, "registration capture error for '{plugin}': {detail}")
+            }
+            Self::Budget { plugin, detail } => {
+                write!(f, "plugin '{plugin}' budget exceeded: {detail}")
+            }
+            Self::Timeout { plugin, detail } => {
+                write!(f, "plugin '{plugin}' timed out: {detail}")
+            }
+            Self::LimitExceeded {
+                plugin,
+                field,
+                limit,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "plugin '{plugin}' {field}: limit {limit} exceeded (actual {actual})"
+                )
             }
         }
     }
@@ -697,6 +796,27 @@ impl PluginRuntime {
         if spawn_git {
             plugin_services.set_spawn_git(true);
             plugin_services.set_spawn_backend(Some(spawn::git_spawn_backend(id.as_str())));
+        }
+        // CTX-0330: `bitty.env` grant gate. Per-key `env.read:<KEY>` grants
+        // from the activation snapshot become the generation allowlist;
+        // malformed or over-limit sets fail closed with rollback before any
+        // VM exists. Values resolve from the host process environment.
+        match env_grant_keys(id, &granted) {
+            Ok(env_keys) => {
+                plugin_services.set_env_source(Some(Rc::new(services::ProcessEnv)));
+                if let Err(error) = plugin_services.set_env_grants(env_keys) {
+                    let error = PluginRuntimeError::Integrity {
+                        plugin: id.to_string(),
+                        detail: error.to_string(),
+                    };
+                    self.rollback(id, error.to_string());
+                    return Err(error);
+                }
+            }
+            Err(error) => {
+                self.rollback(id, error.to_string());
+                return Err(error);
+            }
         }
         // RC-1/RC-2 enter through the fail-closed gate: no VM exists without
         // explicit budgets (the deprecated `LuaVm::new` default path is sealed).
@@ -1298,6 +1418,49 @@ fn verify_module_tree(id: &PluginId, root: &Path) -> Result<(), PluginRuntimeErr
     resolution::scan_module_tree(id.as_str(), root).map(|_| ())
 }
 
+/// Extract `bitty.env` keys from the activation grant snapshot (CTX-0330).
+///
+/// Only `env.read:<KEY>` grants contribute, and only with a well-shaped key
+/// (`[A-Za-z_][A-Za-z0-9_]*`, `1..128` bytes): a recorded grant with a
+/// malformed key fails closed as store integrity before any VM exists, like
+/// any other undeclared grant. The set is capped at
+/// [`services::MAX_ENV_GRANTS`].
+fn env_grant_keys(
+    id: &PluginId,
+    granted: &BTreeSet<CapabilityId>,
+) -> Result<BTreeSet<String>, PluginRuntimeError> {
+    let mut keys = BTreeSet::new();
+    for capability in granted {
+        let Some(key) = capability.as_str().strip_prefix("env.read:") else {
+            continue;
+        };
+        let mut bytes = key.bytes();
+        let first_ok = bytes
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic() || first == b'_');
+        let shape_ok = first_ok
+            && !key.is_empty()
+            && key.len() <= bitty_lua::ENV_KEY_MAX_BYTES
+            && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+        if !shape_ok {
+            return Err(PluginRuntimeError::Integrity {
+                plugin: id.to_string(),
+                detail: format!("recorded env grant for '{key}' is not a valid env key"),
+            });
+        }
+        keys.insert(key.to_string());
+    }
+    if keys.len() > services::MAX_ENV_GRANTS {
+        return Err(PluginRuntimeError::LimitExceeded {
+            plugin: id.to_string(),
+            field: "env.read grants".to_string(),
+            limit: services::MAX_ENV_GRANTS,
+            actual: keys.len(),
+        });
+    }
+    Ok(keys)
+}
+
 /// The capabilities a generation may exercise: the declared set intersected
 /// with the consented store record, or the full declared set when the package
 /// has no record (bundled and development sources).
@@ -1458,5 +1621,167 @@ impl PluginRuntime {
     #[must_use]
     pub fn store_root_ref(&self) -> Option<&Path> {
         self.store_root.as_deref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_error_taxonomy_codes_and_classes() {
+        let plugin = "xuepoo.test".to_string();
+        let cases: Vec<(PluginRuntimeError, &str, &str)> = vec![
+            (
+                PluginRuntimeError::Manifest {
+                    plugin: plugin.clone(),
+                    detail: "bad".to_string(),
+                },
+                "E_MANIFEST",
+                "validation",
+            ),
+            (
+                PluginRuntimeError::ModuleTree {
+                    plugin: plugin.clone(),
+                    detail: "bad".to_string(),
+                },
+                "E_MODULE_TREE",
+                "validation",
+            ),
+            (PluginRuntimeError::Io("io".to_string()), "E_IO", "runtime"),
+            (
+                PluginRuntimeError::NotFound {
+                    plugin: plugin.clone(),
+                    detail: "missing".to_string(),
+                },
+                "E_NOT_FOUND",
+                "runtime",
+            ),
+            (
+                PluginRuntimeError::Integrity {
+                    plugin: plugin.clone(),
+                    detail: "tampered".to_string(),
+                },
+                "E_INTEGRITY",
+                "runtime",
+            ),
+            (
+                PluginRuntimeError::Incompatible {
+                    plugin: plugin.clone(),
+                    field: "compat.bitty".to_string(),
+                    requested: ">=9".to_string(),
+                    host: "0.0.1".to_string(),
+                },
+                "E_INCOMPATIBLE",
+                "validation",
+            ),
+            (
+                PluginRuntimeError::Lifecycle {
+                    plugin: plugin.clone(),
+                    detail: "state".to_string(),
+                },
+                "E_LIFECYCLE",
+                "runtime",
+            ),
+            (
+                PluginRuntimeError::Host("host".to_string()),
+                "E_HOST",
+                "runtime",
+            ),
+            (PluginRuntimeError::Vm("vm".to_string()), "E_VM", "runtime"),
+            (
+                PluginRuntimeError::Capture {
+                    plugin: plugin.clone(),
+                    detail: "capture".to_string(),
+                },
+                "E_CAPTURE",
+                "runtime",
+            ),
+            (
+                PluginRuntimeError::Budget {
+                    plugin: plugin.clone(),
+                    detail: "quota".to_string(),
+                },
+                "E_BUDGET_EXCEEDED",
+                "budget",
+            ),
+            (
+                PluginRuntimeError::Timeout {
+                    plugin: plugin.clone(),
+                    detail: "deadline".to_string(),
+                },
+                "E_TIMEOUT",
+                "budget",
+            ),
+            (
+                PluginRuntimeError::LimitExceeded {
+                    plugin: plugin.clone(),
+                    field: "env.read grants".to_string(),
+                    limit: 64,
+                    actual: 65,
+                },
+                "E_DEF_LIMIT",
+                "validation",
+            ),
+        ];
+        for (error, code, class) in cases {
+            assert_eq!(error.code(), code, "code for {error}");
+            assert_eq!(error.error_class(), class, "class for {error}");
+            assert!(!error.to_string().is_empty());
+        }
+    }
+
+    fn parsed_grants(raw: &[&str]) -> BTreeSet<CapabilityId> {
+        raw.iter()
+            .map(|grant| CapabilityId::parse(grant).expect("test grant parses"))
+            .collect()
+    }
+
+    #[test]
+    fn env_grant_keys_extract_only_well_shaped_keys() {
+        let id = PluginId::new("xuepoo.test").expect("id");
+        let granted = parsed_grants(&["terminal.semantic-read", "env.read:HOME", "env.read:PATH"]);
+        assert_eq!(
+            env_grant_keys(&id, &granted).expect("keys extract"),
+            BTreeSet::from(["HOME".to_string(), "PATH".to_string()])
+        );
+        assert!(
+            env_grant_keys(&id, &BTreeSet::new())
+                .expect("empty")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn env_grant_keys_reject_malformed_recorded_key() {
+        let id = PluginId::new("xuepoo.test").expect("id");
+        let granted = parsed_grants(&["env.read:9LIVES"]);
+        let error = env_grant_keys(&id, &granted).expect_err("malformed key must fail");
+        assert_eq!(error.code(), "E_INTEGRITY");
+        assert!(error.to_string().contains("9LIVES"));
+    }
+
+    #[test]
+    fn env_grant_keys_enforce_count_limit() {
+        let id = PluginId::new("xuepoo.test").expect("id");
+        let raw: Vec<String> = (0..services::MAX_ENV_GRANTS + 1)
+            .map(|index| format!("env.read:VAR_{index}"))
+            .collect();
+        let borrowed: Vec<&str> = raw.iter().map(String::as_str).collect();
+        let granted = parsed_grants(&borrowed);
+        match env_grant_keys(&id, &granted).expect_err("over-limit must fail") {
+            PluginRuntimeError::LimitExceeded {
+                plugin,
+                field,
+                limit,
+                actual,
+            } => {
+                assert_eq!(plugin, "xuepoo.test");
+                assert_eq!(field, "env.read grants");
+                assert_eq!(limit, services::MAX_ENV_GRANTS);
+                assert_eq!(actual, services::MAX_ENV_GRANTS + 1);
+            }
+            other => panic!("expected LimitExceeded, got {other}"),
+        }
     }
 }

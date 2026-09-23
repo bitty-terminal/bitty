@@ -255,6 +255,57 @@ fn validate_command_part(field: &str, part: &str) -> Result<(), PluginError> {
     Ok(())
 }
 
+// ── call-boundary gate (CTX-0330) ──────────────────────────────────────────
+
+/// Tier access context for the call-boundary gate (CTX-0330).
+///
+/// Bundles the tier being read with whether the caller holds an explicit
+/// grant for it, so the resolve boundary takes one argument instead of a
+/// bare boolean that is easy to misread at call sites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TierAccess {
+    /// Tier holding the secret.
+    pub tier: SecretTier,
+    /// Whether the caller holds an explicit grant for this tier.
+    pub consent: bool,
+}
+
+impl TierAccess {
+    /// Check this access against the tier policy (fail-closed).
+    pub fn check(self) -> Result<(), PluginError> {
+        check_tier_access(self.tier, self.consent)
+    }
+}
+
+/// Check tier access at the secret call boundary (CTX-0330).
+///
+/// Pure, fail-closed, names-only: `tier` names *where* a secret would live
+/// and `tier_consent` records whether the caller holds an explicit grant
+/// for that tier. Tiers whose policy is [`ConsentRule::AllowlistedRead`]
+/// (`HostEnv`) pass here — the per-key allowlist is enforced separately at
+/// the `bitty.env` boundary — while [`ConsentRule::ExplicitGrant`] tiers
+/// fail closed with a grant error until consent is shown. Values never
+/// enter this function, so there is nothing to redact.
+///
+/// This is the consent half of the per-tier policy; the audit half runs at
+/// the resolve boundary (`PluginHost::resolve_secret_with_tier`), which
+/// records the allow/deny outcome in the secret audit ledger.
+pub fn check_tier_access(tier: SecretTier, tier_consent: bool) -> Result<(), PluginError> {
+    match tier.policy().consent() {
+        ConsentRule::AllowlistedRead => Ok(()),
+        ConsentRule::ExplicitGrant => {
+            if tier_consent {
+                Ok(())
+            } else {
+                Err(PluginError::grant(format!(
+                    "secret tier '{}' requires explicit consent (deny by default)",
+                    tier.as_str()
+                )))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,5 +386,28 @@ mod tests {
     fn consent_labels_stable() {
         assert_eq!(ConsentRule::AllowlistedRead.to_string(), "allowlisted-read");
         assert_eq!(ConsentRule::ExplicitGrant.to_string(), "explicit-grant");
+    }
+
+    #[test]
+    fn tier_gate_allows_host_env_without_consent() {
+        assert!(check_tier_access(SecretTier::HostEnv, false).is_ok());
+        assert!(check_tier_access(SecretTier::HostEnv, true).is_ok());
+    }
+
+    #[test]
+    fn tier_gate_denies_grant_tiers_without_consent() {
+        for tier in [
+            SecretTier::ConfigFile,
+            SecretTier::OsKeyring,
+            SecretTier::CommandRef,
+        ] {
+            let error =
+                check_tier_access(tier, false).expect_err("grant tier without consent must deny");
+            assert!(
+                matches!(error, PluginError::Grant { .. }),
+                "tier {tier} must fail with a grant error"
+            );
+            assert!(check_tier_access(tier, true).is_ok());
+        }
     }
 }

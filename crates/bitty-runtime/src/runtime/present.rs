@@ -1180,7 +1180,15 @@ impl Runtime {
                 // Determine viewport snapshot: when view scroll_offset !=0,
                 // visible_cells composites scrollback.
                 let view_snapshot = if let Some(v) = view {
-                    if v.scroll_offset() != 0 && pane_snap.is_some() {
+                    // #1338 fail-closed: the alternate screen owns no
+                    // scrollback view — a stale offset (scrolled on primary,
+                    // then entered alt) must not composite primary history
+                    // over the alt grid.
+                    let on_alt = match self.pane_sessions.get(&view_id) {
+                        Some(sess) => sess.state.alt_screen_active(),
+                        None => self.state.alt_screen_active(),
+                    };
+                    if v.scroll_offset() != 0 && pane_snap.is_some() && !on_alt {
                         let cells = match self.pane_sessions.get(&view_id) {
                             Some(sess) => v.visible_cells(&sess.state),
                             None => v.visible_cells(&self.state),

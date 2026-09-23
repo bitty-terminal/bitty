@@ -27,6 +27,17 @@
 //! - issue #984 (CW-05): [`Runtime::cw_fold_snapshot_ordinals`] +
 //!   [`Runtime::cw_fold_restore_ordinals`] own fold persistence as anchor
 //!   ordinals (stable scrollback identity stays deferred per owner ruling);
+//! - issue #985 (CW-06): [`Runtime::cw_present_plan_for_host`] resolves the
+//!   leaf scene through the PanelRuntime-owned slots
+//!   ([`PanelRuntime::panel_scene`](crate::registry::PanelRuntime::panel_scene))
+//!   so the render pipeline consumes the placed Scene path; a panel with no
+//!   attached scene budgets the empty scene (fail-closed), and
+//!   `Terminal`/`Empty` leaves never leave the grid path;
+//! - issue #990 (CW-11): the same derivation carries the beyond-grid
+//!   payload for `Panel`/`Browser`/`Rich` leaves through the plan's
+//!   `nonterminal` field
+//!   ([`PanelRuntime::nonterminal_for_leaf`](crate::registry::PanelRuntime::nonterminal_for_leaf)),
+//!   with zero overlay-slot cost;
 //! - all seven slices: [`Runtime::cw_present_plan`] calls
 //!   [`crate::cw_present::plan_present`] once per present derivation.
 //!
@@ -50,6 +61,7 @@ use crate::cw_present::{
     dispatch_present, feed_present, fold_present, persist_fold_ordinals, plan_present,
     route_present_input,
 };
+use crate::registry::PanelRuntime;
 
 impl Runtime {
     /// Applies one present-path fold verb to the live fold state (issue #980).
@@ -347,6 +359,53 @@ impl Runtime {
             }
         }
         admitted
+    }
+
+    /// Derives the one-frame CW present enrichment for a live view
+    /// against the PanelRuntime-owned scene contract (issues #985/#990).
+    ///
+    /// Same frame as [`Runtime::cw_present_plan`], except the leaf scene
+    /// resolves through `host` (the OQ-051 option-A owner) instead of a
+    /// caller-supplied [`Scene`]: `Panel` leaves budget their attached
+    /// scene, panels with no attached scene budget the empty scene
+    /// (fail-closed, never a crash), and `Terminal`/`Empty`/`Browser`/
+    /// `Rich` leaves resolve the empty scene so terminal content never
+    /// leaves the grid path. The beyond-grid payload for `Panel`/`Browser`/
+    /// `Rich` leaves rides the plan's `nonterminal` field with zero
+    /// overlay-slot cost. Pure except for reading live present state; the
+    /// live fold is never mutated here.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn cw_present_plan_for_host(
+        &self,
+        host: &PanelRuntime,
+        view: ViewId,
+        generation: u64,
+        blocks: &[CommandBlock],
+        hints: &HintBatch,
+        content: bitty_ui::panel::ViewContent,
+        node: bitty_ui::uitree::UiNodeId,
+    ) -> CwPresentPlan {
+        let empty = Scene::new();
+        let scene: &Scene = match content {
+            bitty_ui::panel::ViewContent::Panel(id) => match host.panel_scene(id) {
+                Some(attached) => attached,
+                None => &empty,
+            },
+            _ => &empty,
+        };
+        let inputs = CwPresentInputs {
+            view,
+            generation,
+            blocks,
+            fold: &self.cw_fold,
+            hints,
+            composer: &self.cw_composer,
+            scene,
+            content,
+            node,
+        };
+        plan_present(&inputs)
     }
 
     /// Derives the one-frame CW present enrichment for a live view

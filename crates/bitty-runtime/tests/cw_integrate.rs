@@ -43,7 +43,7 @@ use bitty_runtime::statusline::{
 };
 use bitty_term_state::{State, TerminalAction};
 use bitty_ui::ViewId;
-use bitty_ui::panel::{PanelId, ViewContent};
+use bitty_ui::panel::{BrowserSurfaceId, PanelId, ViewContent};
 use bitty_ui::status_registry::{StatusModuleId, StatusSlots};
 use bitty_ui::uitree::UiNodeId;
 use bitty_vt::BoundedString;
@@ -425,4 +425,132 @@ fn cw1002_statusline_renders_through_registry_slots() {
         scene.insert(test_scene_block(id, "hello")).unwrap();
     }
     assert_eq!(scene.len(), 3);
+}
+
+// CTX-0736: OQ-051 scene-consumption render path (issues #985 CW-06 /
+// #990 CW-11).
+//
+// Each test drives the live render-path derivation
+// (`Runtime::cw_present_plan_for_host`) against the PanelRuntime-owned
+// scene slots, so removing the host resolution fails these tests while
+// the in-module unit tests keep passing.
+
+fn scene_with_blocks(count: u64) -> Scene {
+    let mut scene = Scene::new();
+    for id in 1..=count {
+        scene.insert(test_scene_block(id, "hello")).unwrap();
+    }
+    scene
+}
+
+#[test]
+fn cw985_panel_scene_consumed_in_render_plan_via_host() {
+    let rt = runtime();
+    let mut host = PanelRuntime::new(PanelRegistryConfig::default()).unwrap();
+    let handle = host
+        .create_panel(PanelType::Rich, Some(workspace()))
+        .unwrap();
+    host.attach_panel_scene(handle, scene_with_blocks(3))
+        .unwrap();
+
+    let blocks = vec![test_block(1)];
+    let batch = HintBatch::build(0, &HintRegistry::new());
+    let plan = rt.cw_present_plan_for_host(
+        &host,
+        ViewId::new(1),
+        7,
+        &blocks,
+        &batch,
+        ViewContent::Panel(handle.id),
+        UiNodeId::new(3),
+    );
+    // The attached scene reaches the frame paint budget through the host.
+    assert_eq!(plan.generation, 7);
+    assert_eq!(
+        plan.scene.block_ids,
+        vec![BlockId(1), BlockId(2), BlockId(3)]
+    );
+    assert_eq!(plan.scene.shed, 0);
+    // The panel leaf also carries the beyond-grid payload (issue #990).
+    let payload = plan
+        .nonterminal
+        .expect("panel leaf carries beyond-grid payload");
+    assert_eq!(payload.panel, handle.id.get());
+    assert_eq!(payload.node, UiNodeId::new(3));
+    assert_eq!(payload.overlay_cost(), 0);
+}
+
+#[test]
+fn cw985_missing_scene_fails_closed_in_render_plan() {
+    let rt = runtime();
+    let mut host = PanelRuntime::new(PanelRegistryConfig::default()).unwrap();
+    let handle = host
+        .create_panel(PanelType::Rich, Some(workspace()))
+        .unwrap();
+
+    // No scene attached: the frame budgets nothing and never crashes, while
+    // the leaf content is still described beyond the grid.
+    let blocks = vec![test_block(1)];
+    let batch = HintBatch::build(0, &HintRegistry::new());
+    let plan = rt.cw_present_plan_for_host(
+        &host,
+        ViewId::new(1),
+        7,
+        &blocks,
+        &batch,
+        ViewContent::Panel(handle.id),
+        UiNodeId::new(3),
+    );
+    assert!(plan.scene.block_ids.is_empty());
+    assert_eq!(plan.scene.shed, 0);
+    assert!(plan.nonterminal.is_some());
+}
+
+#[test]
+fn cw985_terminal_leaf_keeps_grid_path_in_render_plan() {
+    let rt = runtime();
+    let host = PanelRuntime::new(PanelRegistryConfig::default()).unwrap();
+    let blocks = vec![test_block(1)];
+    let batch = HintBatch::build(0, &HintRegistry::new());
+    // Terminal and Empty leaves never leave the grid path: no scene budget
+    // and no beyond-grid payload, even with scenes attached elsewhere.
+    for content in [ViewContent::Terminal(7), ViewContent::Empty] {
+        let plan = rt.cw_present_plan_for_host(
+            &host,
+            ViewId::new(1),
+            7,
+            &blocks,
+            &batch,
+            content,
+            UiNodeId::new(3),
+        );
+        assert!(plan.scene.block_ids.is_empty());
+        assert!(plan.nonterminal.is_none());
+    }
+}
+
+#[test]
+fn cw990_browser_leaf_beyond_grid_payload_in_render_plan() {
+    let rt = runtime();
+    let host = PanelRuntime::new(PanelRegistryConfig::default()).unwrap();
+    let blocks = vec![test_block(1)];
+    let batch = HintBatch::build(0, &HintRegistry::new());
+    // Browser leaves carry no host-owned scene slot (empty budget) but do
+    // carry the beyond-grid payload addressed by the canonical node.
+    let plan = rt.cw_present_plan_for_host(
+        &host,
+        ViewId::new(1),
+        7,
+        &blocks,
+        &batch,
+        ViewContent::Browser(BrowserSurfaceId::new(9)),
+        UiNodeId::new(3),
+    );
+    assert!(plan.scene.block_ids.is_empty());
+    let payload = plan
+        .nonterminal
+        .expect("browser leaf carries beyond-grid payload");
+    assert_eq!(payload.panel, 9);
+    assert_eq!(payload.node, UiNodeId::new(3));
+    assert_eq!(payload.overlay_cost(), 0);
 }

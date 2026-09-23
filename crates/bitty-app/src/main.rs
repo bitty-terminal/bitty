@@ -1,12 +1,3 @@
-//! Bittie, the Bitty mascot (ASCII portrait).
-//!
-//! More Bittie art will live in `recording/bitty-mascot/`; planned uses:
-//! first-run / init splash and website assets.
-//!
-//!
-//!
-//!
-//!
 //!            _. ..- ._.                                           ,.-'^j=,.
 //!          .,>=?-_``"^=_._                                     _-"   ."^` ``,
 //!         .*_=..`>>,   ``*,         ... .,.>:?,:L..,.       .>`    ."'  '   1_

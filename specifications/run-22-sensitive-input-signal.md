@@ -88,11 +88,14 @@ with text excluded from the decision by construction:
 
 - Implementation: `crates/bitty-runtime/src/execution/sensitive_input.rs`
   (`EchoState`, `InteractionClass`, `SecureInputDenial`,
-  `automated_input_allowed`, `may_capture`), re-exported from
+  `automated_input_allowed`, `may_capture`, `classify_with_verdict`),
+  re-exported from
   `crates/bitty-runtime/src/execution.rs`.
 - Unit tests in the same file cover both directions: no-echo programs deny
   every class, echo-on safe prompts allow, echo-on confirmations require a
-  human, stale labels stay denied, and no-echo capture is excluded.
+  human, stale labels stay denied, and no-echo capture is excluded; denial
+  audit names hold, and the OQ-087 verdict bridge keeps echo winning while
+  never auto-allowing gated verdicts.
 - Reproduce: `cargo test -p bitty-runtime --lib sensitive_input::`.
 
 ## Gates

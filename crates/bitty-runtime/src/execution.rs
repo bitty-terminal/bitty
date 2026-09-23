@@ -86,12 +86,17 @@
 //!
 //! - Panel lease kernel ([`PanelLease`]): idle/occupied transitions with
 //!   acquire/release/handoff events for OQ-083; lease vocabulary stays a UX
-//!   metaphor and owns no bus, clock, or agent ontology.
+//!   metaphor and owns no bus, clock, or agent ontology. Stable audit names
+//!   (`LeaseEvent::as_str`, `LeaseError::as_str`) cover events and refusals.
 //! - Sensitive-input gate ([`automated_input_allowed`]): the observed PTY
 //!   echo state is the only signal for OQ-086; no-echo denies automated
-//!   input with a typed denial and excludes capture.
+//!   input with a typed denial and excludes capture. A verdict-fed sort
+//!   (`classify_with_verdict`) composes the OQ-087 answer (SI-5 seam)
+//!   without touching dispatch.
 //! - Command-risk kernel ([`classify_argv`]): structural argv tiers and
 //!   hard-deny classes for OQ-087; shell-AST resolution stays open work.
+//!   Verdict projections (`RiskVerdict::tier`,
+//!   `RiskVerdict::requires_explicit_decision`) feed the OQ-086 seam.
 //! - Detached-supervisor trust boundary: analysis only
 //!   (`specifications/run-20-detached-supervisor-trust-boundary.md`); no
 //!   daemon code, per the accepted headless/daemon decision.
@@ -146,7 +151,8 @@ pub use process_tree::{KillScope, ProcessTreeBackend};
 pub use registry::{DEFAULT_MAX_JOBS, JobRegistry, MAX_STORED_JOB_EVENTS};
 pub use retention::{MAX_RETENTION_TTL, RetentionError, RetentionPolicy, RetentionTier};
 pub use sensitive_input::{
-    EchoState, InteractionClass, SecureInputDenial, automated_input_allowed, may_capture,
+    EchoState, InteractionClass, SecureInputDenial, automated_input_allowed, classify_with_verdict,
+    may_capture,
 };
 pub use supervisor::{
     AdoptedJob, AdoptionKind, DaemonError, HandoffOffer, ScheduleDecision, SchedulePolicy,

@@ -124,6 +124,30 @@ pub enum RiskVerdict {
     Deny(HardDeny),
 }
 
+impl RiskVerdict {
+    /// Tier carried by an allow or consent-gated answer; [`None`] for a hard
+    /// deny, which carries a [`HardDeny`] class instead of a tier.
+    #[must_use]
+    pub const fn tier(self) -> Option<RiskTier> {
+        match self {
+            Self::Allow(tier) | Self::NeedsConsent(tier) => Some(tier),
+            Self::Deny(_) => None,
+        }
+    }
+
+    /// True when dispatch needs an explicit human decision recorded in the
+    /// consent ledger (PP-3) before anything executes: consent-gated and
+    /// hard-denied answers alike. Fail-closed composition input for the
+    /// OQ-086 interlock (SI-5 seam); nothing here records or grants.
+    #[must_use]
+    pub const fn requires_explicit_decision(self) -> bool {
+        match self {
+            Self::Allow(_) => false,
+            Self::NeedsConsent(_) | Self::Deny(_) => true,
+        }
+    }
+}
+
 /// Basename of `argv[0]`: everything from the last `/`, so an absolute
 /// tool path cannot dodge the program match.
 fn program_basename(argv0: &str) -> &str {
@@ -442,5 +466,28 @@ mod tests {
             classify_argv(&["cargo", "test"], false, OperationIntent::Execute),
             RiskVerdict::Allow(RiskTier::Standard)
         );
+    }
+
+    #[test]
+    fn verdict_tier_projection_holds() {
+        assert_eq!(
+            RiskVerdict::Allow(RiskTier::ReadOnly).tier(),
+            Some(RiskTier::ReadOnly)
+        );
+        assert_eq!(
+            RiskVerdict::NeedsConsent(RiskTier::Restricted).tier(),
+            Some(RiskTier::Restricted)
+        );
+        assert_eq!(
+            RiskVerdict::Deny(HardDeny::PrivilegeEscalation).tier(),
+            None
+        );
+    }
+
+    #[test]
+    fn only_allow_avoids_explicit_decision() {
+        assert!(!RiskVerdict::Allow(RiskTier::Standard).requires_explicit_decision());
+        assert!(RiskVerdict::NeedsConsent(RiskTier::Restricted).requires_explicit_decision());
+        assert!(RiskVerdict::Deny(HardDeny::PipeToInterpreter).requires_explicit_decision());
     }
 }

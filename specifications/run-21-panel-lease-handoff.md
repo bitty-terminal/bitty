@@ -95,7 +95,7 @@ on the same OQ-083 ruling; nothing here authorizes write-lease enforcement.
   `crates/bitty-runtime/src/execution.rs`.
 - Unit tests in the same file: acquire/release round trip, double-acquire
   refusal, non-holder release/handoff refusals, idle release/handoff
-  refusals, title and description bounds.
+  refusals, title and description bounds, stable audit names.
 - Reproduce: `cargo test -p bitty-runtime --lib lease::`.
 
 ## Gates

@@ -4,8 +4,11 @@
 //! Contract source: the accepted Panel Runtime RFC names `PanelRuntime`
 //! as the Core-owned host that creates, mounts, suspends, resumes, and
 //! disposes panels, validates `(PanelId, Generation)`, and mediates bus
-//! traffic — but no `PanelRuntime` type exists; `PanelRegistry` is the
-//! orchestration. This module records the spelling decision:
+//! traffic. The owner ruling of 2026-09-23 accepts `RFC-OQ-3` Option A
+//! (Panel as typed `View` content, `ViewContent::Panel(PanelId)`) and
+//! `OQ-058` `SMO-1..SMO-4` including delivery semantics, with terms from
+//! `ADR-0013` (`bitty-docs` #367). This module records the spelling
+//! decision:
 //!
 //! - [`PanelRegistry`] stays the identity/attachment/budget store: id
 //!   allocation, `(PanelId, Generation)` validation, the `PanelId -> ViewId`
@@ -18,19 +21,27 @@
 //!   handle generation first (`StaleHandle` before any grid or PTY access)
 //!   and gates bus mediation on the v1 capability ledger (`panel.provider`,
 //!   deny-by-default; see `event_bus_v1`).
+//! - Routable delivery (`OQ-058`, issue #1001) rides the
+//!   [`RoutableLedger`](super::routable::RoutableLedger): the host checks
+//!   sender/recipient registration against [`PanelProviderRegistry`] so a
+//!   missing or stale route fails closed (`SMO-3`), then admits the
+//!   validated [`AgentMessage`](super::routable::AgentMessage) envelope
+//!   (identity, attribution, deadline, priority, dedup, cancel, expiry).
 //!
 //! The runtime holds no PTY descriptor, GPU object, or OS window handle;
 //! those remain with `bitty-pty`, `bitty-render`, and `bitty-platform`.
 //! Every failure is fail-closed and typed: the previous valid state is
 //! retained and a bounded diagnostic counter advances in the registry.
 //!
-//! Live adoption (CTX-0700): the host mirrors every mount/unmount/dispose
-//! into the [`bitty_ui::placement::Placement`] binding map, gates
-//! provider-backed creation through [`PanelProviderRegistry`], mints v1
-//! taxonomy topics via [`core_topic`](super::event_bus_v1::core_topic), and
-//! resolves cross-window scope via
-//! [`CrossWindowRoute`](super::event_bus_v1::CrossWindowRoute), so the
-//! candidate contracts have live consumers outside unit tests.
+//! Live adoption (CTX-0700, extended CTX-0721): the host mirrors every
+//! mount/unmount/dispose into the [`bitty_ui::placement::Placement`]
+//! binding map, gates provider-backed creation through
+//! [`PanelProviderRegistry`], mints v1 taxonomy topics via
+//! [`core_topic`](super::event_bus_v1::core_topic), resolves cross-window
+//! scope via [`CrossWindowRoute`](super::event_bus_v1::CrossWindowRoute),
+//! and routes [`AgentMessage`](super::routable::AgentMessage) envelopes
+//! through the routable ledger, so the accepted contracts have live
+//! consumers outside unit tests.
 
 use bitty_ui::ViewId;
 use bitty_ui::placement::{Placement, PlacementError};
@@ -45,6 +56,7 @@ use super::panel::{
     PanelRegistryConfig, PanelState, ViewContent,
 };
 use super::provider::{PanelProviderManifest, PanelProviderRegistry, ProviderContractError};
+use super::routable::{AgentMessage, RoutableError, RoutableLedger};
 use super::{Generation, WorkspaceId};
 
 // ---------------------------------------------------------------------------
@@ -67,6 +79,7 @@ pub struct PanelRuntime {
     registry: PanelRegistry,
     placement: Placement,
     providers: PanelProviderRegistry,
+    routable: RoutableLedger,
 }
 
 impl PanelRuntime {
@@ -81,6 +94,7 @@ impl PanelRuntime {
             registry: PanelRegistry::new(config)?,
             placement: Placement::new(),
             providers: PanelProviderRegistry::new(),
+            routable: RoutableLedger::new(),
         })
     }
 
@@ -478,6 +492,72 @@ impl PanelRuntime {
         to_window: u64,
     ) -> Result<RoutingScope, RoutingError> {
         CrossWindowRoute::new(from_window, to_window).resolve()
+    }
+
+    /// Routes a validated [`AgentMessage`] envelope through the routable
+    /// ledger (issue #1001, `OQ-058` delivery semantics).
+    ///
+    /// The host checks sender/recipient registration against the live
+    /// [`PanelProviderRegistry`] so a missing or stale route fails closed
+    /// (`SMO-3`) instead of falling back to an ambient recipient, then
+    /// admits the envelope into the bounded [`RoutableLedger`] (identity,
+    /// deadline, priority, dedup, expiry). Ledger state is unchanged when
+    /// attribution or admission fails.
+    ///
+    /// # Errors
+    ///
+    /// [`RoutableError::UnknownSender`], [`RoutableError::UnknownRecipient`],
+    /// [`RoutableError::Expired`], [`RoutableError::DuplicateMessageId`],
+    /// or [`RoutableError::TooManyInflight`].
+    pub fn route_message(
+        &mut self,
+        message: AgentMessage,
+        now_ticks: u64,
+    ) -> Result<(), RoutableError> {
+        if self.providers.get(message.sender()).is_none() {
+            return Err(RoutableError::UnknownSender {
+                sender: message.sender().to_string(),
+            });
+        }
+        if self.providers.get(message.recipient()).is_none() {
+            return Err(RoutableError::UnknownRecipient {
+                recipient: message.recipient().to_string(),
+            });
+        }
+        self.routable.send(message, now_ticks)
+    }
+
+    /// Cancels an inflight routable envelope by `message_id` (issue #1001).
+    ///
+    /// Explicit removal for cancellation: the envelope leaves the inflight
+    /// set and is handed back for audit.
+    ///
+    /// # Errors
+    ///
+    /// [`RoutableError::UnknownMessageId`]; state is unchanged.
+    pub fn cancel_message(&mut self, message_id: u64) -> Result<AgentMessage, RoutableError> {
+        self.routable.cancel(message_id)
+    }
+
+    /// Drops every routable envelope expired at `now_ticks` (issue #1001).
+    ///
+    /// Returned in `message_id` order for deterministic audit.
+    #[must_use]
+    pub fn sweep_expired_messages(&mut self, now_ticks: u64) -> Vec<AgentMessage> {
+        self.routable.sweep_expired(now_ticks)
+    }
+
+    /// Drains up to `max` routable envelopes, highest-priority first
+    /// (issue #1001).
+    #[must_use]
+    pub fn drain_routable_by_priority(&mut self, max: usize) -> Vec<AgentMessage> {
+        self.routable.drain_by_priority(max)
+    }
+
+    /// Number of inflight routable envelopes.
+    #[must_use]
+    pub fn routable_len(&self) -> usize {
+        self.routable.len()
     }
 }
 

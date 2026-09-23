@@ -4,10 +4,22 @@
 //! pure data. Rendering is deferred to runtime composition. The viewport
 //! algebra is deterministic and headless-testable.
 //!
-//! Decision F-3 (CW-17, `[BLOCKED: OQ-058]`): no distinct `SessionId`
-//! newtype is introduced here. Views stay keyed by [`ViewId`] until the
-//! owner resolves `OQ-058`; a session type, if the RFC wants one, lands
-//! as a separate decision, never as a rename of this key.
+//! Decision F-3 (CW-17, issue #995): no distinct `SessionId` newtype is
+//! introduced here. Views stay keyed by [`ViewId`]. Re-confirmed against
+//! the owner ruling of 2026-09-23 (adopted `OQ-058` `SMO-1..SMO-4`
+//! including delivery semantics; `RFC-OQ-3` Option A, `bitty` #997 closed)
+//! and `ADR-0013` (`bitty-docs` #367, `bb96efe`): `ADR-0013` fixes
+//! `Session` as an attachable continuity scope (detach/reattach without
+//! losing the underlying execution, Session-grained per the headless ADR,
+//! bounded persistence per ADR 0008), distinct from pane-session keying.
+//! Pane sessions stay keyed by the owning live [`ViewId`] and registry
+//! terminal incarnations by `RuntimeId` per `workspace-panel-invariants`
+//! F-3; `ADR-0013` `Session` maps to the headless continuity layer, not
+//! to the view key. A session type, if a future RFC wants one, lands as
+//! a distinct newtype with no `From` bridge and the same
+//! generation-retirement rule as `ViewId`/`TerminalId`, never as a rename
+//! of this key. Panel/Execution separation holds: panels never own
+//! executions and presentation stays non-authoritative.
 
 #![forbid(unsafe_code)]
 

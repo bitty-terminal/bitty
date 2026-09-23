@@ -87,6 +87,7 @@ pub mod keymap;
 pub mod merge;
 pub mod migration;
 pub mod plan;
+pub mod project_schema;
 pub mod reload;
 pub mod theme;
 pub mod trust;
@@ -108,6 +109,13 @@ pub use merge::{
 };
 pub use migration::{CURRENT_SCHEMA_VERSION, migrate, needs_migration};
 pub use plan::{ConfigPlan, ConfigSource, LayerKind, LayeredPlan};
+pub use project_schema::{
+    MAX_ENTRY_NAME_BYTES, MAX_ENTRY_PATH_BYTES, MAX_PATH_SEGMENT_BYTES,
+    MAX_PROJECT_DESCRIPTION_CHARS, MAX_PROJECT_NAME_BYTES, MAX_PROJECT_TOML_BYTES,
+    MAX_PROJECT_TOML_LINES, MAX_PROJECT_VERSION_BYTES, MAX_SECTION_ENTRIES, MAX_TABLE_KEYS,
+    PROJECT_SCHEMA_VERSION, ProjectDefinition, ProjectEntry, ProjectMeta, ProjectSection,
+    parse_project_toml,
+};
 pub use reload::{
     ReloadClass, ReloadReport, classify_field, diff, fallback_builtin, reconcile_live,
 };

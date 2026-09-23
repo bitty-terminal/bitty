@@ -7,9 +7,11 @@
 //! the compatibility fallback (never a competing source of truth). This
 //! module implements that discovery order as pure, bounded, fail-closed path
 //! logic plus one narrow filesystem seam ([`discover_on_fs`]); the schema of
-//! `project.toml`, the tracked-vs-state split, and trust enforcement stay
-//! open, so a definition is located but never read, executed, or trusted
-//! here.
+//! `project.toml` is drafted as a candidate in [`crate::project_schema`]
+//! (strict subset, names and section-confined relative paths only — a
+//! definition is located here but never read, executed, or trusted), while
+//! the tracked-vs-state split and trust enforcement stay open, so a
+//! definition is located but never read, executed, or trusted here.
 //!
 //! There is no `unsafe`, no network, and no new dependency (`std` only).
 
@@ -113,8 +115,9 @@ pub fn discover(start: &Path, exists: &dyn Fn(&Path) -> bool) -> Option<WheelDis
 
 /// Live discovery seam: [`discover`] against the real filesystem.
 ///
-/// Returns paths only — nothing is read, parsed, or trusted here; schema and
-/// trust stay open OQ-068 work.
+/// Returns paths only — nothing is read, parsed, or trusted here; parse a
+/// located file with [`crate::project_schema`], and trust enforcement stays
+/// open OQ-068 work.
 pub fn discover_on_fs(start: &Path) -> Option<WheelDiscovery> {
     discover(start, &|path| path.exists())
 }

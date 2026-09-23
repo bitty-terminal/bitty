@@ -10,8 +10,10 @@
 //! `specifications/bell-notification-policy.md`):
 //!
 //! - **Bell (`BEL`)**: visual flash by default ([`BellMode::Visual`]), never
-//!   audible by default. Audible needs an OS primitive that does not exist
-//!   yet, so an audible request is only counted for a future sink.
+//!   audible by default. An audible request rings the installed
+//!   [`bitty_platform::BellSink`] (the app installs the best-effort OS
+//!   primitive for real runs); with no sink installed the request is only
+//!   counted, so headless runs stay silent.
 //! - **`OSC 9` / `OSC 777` notifications**: default **deny**; an embedder
 //!   must opt in with `Runtime::set_osc_notification_allowed`.
 //! - **Rate**: both surfaces are governed by the accepted `RC-8`
@@ -61,7 +63,8 @@ pub enum BellMode {
     /// Visual flash only (the bounded default).
     #[default]
     Visual,
-    /// Audible request only (owner-pending: no OS primitive is wired yet).
+    /// Audible request only (rings the installed sink; counted-only when no
+    /// sink is installed, so the default headless runtime stays silent).
     Audible,
     /// Visual flash plus audible request.
     Both,

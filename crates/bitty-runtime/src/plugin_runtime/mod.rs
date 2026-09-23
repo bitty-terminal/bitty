@@ -1226,6 +1226,68 @@ fn validate_capture(
             });
         }
     }
+    // CTX-0707: the bridge captures keymap suggestions and task spawns, so
+    // the commit gate re-checks their bounds here like commands/events/timers
+    // (a hand-built capture must still fail closed).
+    if capture.keymaps.len() > bitty_lua::REGISTRATION_MAX_KEYMAP_SUGGESTIONS {
+        return Err(PluginRuntimeError::Capture {
+            plugin: id.to_string(),
+            detail: format!(
+                "keymap suggestion count {} exceeds limit {}",
+                capture.keymaps.len(),
+                bitty_lua::REGISTRATION_MAX_KEYMAP_SUGGESTIONS
+            ),
+        });
+    }
+    for suggestion in &capture.keymaps {
+        if suggestion.chord.is_empty()
+            || suggestion.chord.len() > bitty_lua::REGISTRATION_MAX_KEYMAP_CHORD_BYTES
+        {
+            return Err(PluginRuntimeError::Capture {
+                plugin: id.to_string(),
+                detail: format!(
+                    "keymap chord exceeds {} bytes",
+                    bitty_lua::REGISTRATION_MAX_KEYMAP_CHORD_BYTES
+                ),
+            });
+        }
+        if suggestion.command.is_empty()
+            || suggestion.command.len() > bitty_lua::REGISTRATION_MAX_KEYMAP_COMMAND_BYTES
+        {
+            return Err(PluginRuntimeError::Capture {
+                plugin: id.to_string(),
+                detail: format!(
+                    "keymap command exceeds {} bytes",
+                    bitty_lua::REGISTRATION_MAX_KEYMAP_COMMAND_BYTES
+                ),
+            });
+        }
+        if suggestion.when != "global" {
+            return Err(PluginRuntimeError::Capture {
+                plugin: id.to_string(),
+                detail: "keymap suggestion context must be \"global\" in v1".to_string(),
+            });
+        }
+    }
+    if capture.tasks.len() > bitty_lua::REGISTRATION_MAX_TASKS {
+        return Err(PluginRuntimeError::Capture {
+            plugin: id.to_string(),
+            detail: format!(
+                "task count {} exceeds limit {}",
+                capture.tasks.len(),
+                bitty_lua::REGISTRATION_MAX_TASKS
+            ),
+        });
+    }
+    let mut seen_task_handles = BTreeSet::new();
+    for task in &capture.tasks {
+        if !seen_task_handles.insert(task.handle) {
+            return Err(PluginRuntimeError::Capture {
+                plugin: id.to_string(),
+                detail: format!("duplicate task handle {}", task.handle),
+            });
+        }
+    }
     Ok(())
 }
 

@@ -126,7 +126,6 @@ fn map_lease_error(panel: super::panel::PanelId, error: LeaseError) -> PanelErro
         panel_id: panel,
         reason: format!("{}: {error}", error.as_str()),
     }
->>>>>>> 5a0ce6b ([CTX-0720] feat(runtime): RUN kernels wired to live paths (lease/sensitive-input/risk) (#1052 #1053 #1054))
 }
 
 impl PanelRuntime {

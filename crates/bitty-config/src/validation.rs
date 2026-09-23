@@ -121,6 +121,11 @@ pub fn collect_diagnostics(plan: &ConfigPlan) -> Vec<ConfigError> {
             out.push(ConfigError::validation("mod_key", e.to_string()));
         }
     }
+    if let Some(ms) = plan.leader_timeout_ms {
+        if let Err(e) = crate::keymap::validate_leader_timeout_ms(ms) {
+            out.push(ConfigError::validation("leader_timeout_ms", e.to_string()));
+        }
+    }
     if let Some(v) = &plan.layout {
         if let Err(e) = v.validate() {
             out.push(e);

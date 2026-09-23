@@ -107,6 +107,8 @@ impl std::fmt::Display for ReloadClass {
 /// | `appearance.theme`        | Live               |
 /// | `appearance.colors`       | Live               |
 /// | `mod_key`                 | Live               |
+/// | `leader_key`              | Live               |
+/// | `leader_timeout_ms`       | Live               |
 /// | `keymaps`                 | Live               |
 /// | `terminal.scrollback`     | RestartRequired    |
 /// | `terminal.shell`          | RestartRequired    |
@@ -171,6 +173,8 @@ pub fn classify_field(field: &str) -> ReloadClass {
         | "appearance.animations"
         | "appearance"
         | "mod_key"
+        | "leader_key"
+        | "leader_timeout_ms"
         | "keymaps" => ReloadClass::Live,
         "terminal.scrollback"
         | "terminal.shell"
@@ -543,6 +547,24 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
         old.mod_key.canonical().to_string(),
         new.mod_key.canonical().to_string(),
     );
+    // CTX-0715: the leader re-resolves from the same live table (chord
+    // and armed window), so it reconciles live with the mod and keymaps.
+    // `None` renders as the platform-neutral "default" marker: the
+    // platform-specific spelling resolves at use (`resolve_leader_for`).
+    push_if_changed(
+        "leader_key",
+        old.leader_key
+            .map_or_else(|| "default".to_string(), |c| c.canonical()),
+        new.leader_key
+            .map_or_else(|| "default".to_string(), |c| c.canonical()),
+    );
+    push_if_changed(
+        "leader_timeout_ms",
+        old.leader_timeout_ms
+            .map_or_else(|| "default".to_string(), |ms| ms.to_string()),
+        new.leader_timeout_ms
+            .map_or_else(|| "default".to_string(), |ms| ms.to_string()),
+    );
     // Keymaps and plugins are set-by-identifier stores: compare the sorted
     // `id -> value` pairs (never raw order; merge already sorts them) so a
     // rebind of an existing chord or an enabled-flag flip is detected.
@@ -691,6 +713,28 @@ mod tests {
         assert_eq!(r.overall, ReloadClass::Live);
         assert!(!r.needs_restart);
         assert!(r.diffs.iter().any(|d| d.field == "font.family"));
+    }
+
+    #[test]
+    fn diff_leader_overrides_are_live() {
+        // CTX-0715: leader chord/timeout edits reconcile live (re-resolve
+        // at use), exactly like the mod.
+        use crate::keymap::Chord;
+        assert_eq!(classify_field("leader_key"), ReloadClass::Live);
+        assert_eq!(classify_field("leader_timeout_ms"), ReloadClass::Live);
+        let old = EffectiveConfig::default();
+        let mut new = old.clone();
+        new.leader_key = Some(Chord::parse("ctrl+q").expect("parses"));
+        new.leader_timeout_ms = Some(2500);
+        let r = diff(&old, &new);
+        assert_eq!(r.overall, ReloadClass::Live);
+        assert!(!r.needs_restart);
+        assert!(r.diffs.iter().any(|d| d.field == "leader_key"));
+        assert!(r.diffs.iter().any(|d| d.field == "leader_timeout_ms"));
+        let mut cur = old;
+        reconcile_live(&mut cur, &new).expect("leader reconciles live");
+        assert_eq!(cur.leader_key.expect("chord").canonical(), "ctrl+q");
+        assert_eq!(cur.leader_timeout_ms, Some(2500));
     }
 
     #[test]

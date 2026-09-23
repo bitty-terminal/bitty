@@ -13,7 +13,7 @@
 //! table.
 
 use crate::error::ConfigError;
-use crate::keymap::ModKey;
+use crate::keymap::{Chord, ModKey};
 
 /// Upper bounds that keep every structure bounded against untrusted input
 /// (threat T-01).
@@ -2733,6 +2733,17 @@ pub struct EffectiveConfig {
     /// Leader/Mod key the shipped chrome map is expressed against (CTX-0236;
     /// default Alt). Honored by [`crate::keymap::resolve_keymaps`].
     pub mod_key: ModKey,
+    /// Leader key override chord (CTX-0715 / OQ-088 leader contract; `None`
+    /// means the platform default: `Alt+Space`, `Ctrl+Space` on Windows).
+    /// Keeps its exact spelling under any `mod_key` (OQ-052 Mod unification
+    /// stays deferred). Honored by [`crate::keymap::resolve_leader_for`];
+    /// app input-path wiring rides OQ-089 (#981).
+    pub leader_key: Option<Chord>,
+    /// Leader fail-open timeout override in milliseconds (CTX-0715; `None`
+    /// means [`crate::keymap::LEADER_TIMEOUT_MS_DEFAULT`]). Range-checked
+    /// fail-closed against [`crate::keymap::LEADER_TIMEOUT_MS_MIN`]..=
+    /// [`crate::keymap::LEADER_TIMEOUT_MS_MAX`].
+    pub leader_timeout_ms: Option<u64>,
     /// Keymaps, possibly empty.
     pub keymaps: Vec<KeymapEntry>,
     /// Plugins, possibly empty.
@@ -2760,6 +2771,8 @@ impl Default for EffectiveConfig {
             appearance: AppearanceConfig::default(),
             animations: AnimationsConfig::default(),
             mod_key: ModKey::default(),
+            leader_key: None,
+            leader_timeout_ms: None,
             keymaps: Vec::new(),
             plugins: Vec::new(),
             profile: None,

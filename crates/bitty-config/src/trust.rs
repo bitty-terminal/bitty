@@ -440,6 +440,19 @@ pub fn validate_project_plan(plan: &ConfigPlan) -> Result<(), ConfigError> {
             message: "project config must not declare mod_key".into(),
         });
     }
+    // CTX-0715: the leader arms the overlay session and reroutes follow-up
+    // keys, so it is keymap-adjacent like the mod: a project-local file
+    // must not be able to hijack it (or stretch its armed window).
+    if plan.leader_key.is_some() {
+        return Err(ConfigError::TrustViolation {
+            message: "project config must not declare leader_key".into(),
+        });
+    }
+    if plan.leader_timeout_ms.is_some() {
+        return Err(ConfigError::TrustViolation {
+            message: "project config must not declare leader_timeout_ms".into(),
+        });
+    }
     // CTX-0370: close confirmation is a data-loss guard; a project-local
     // file must not be able to disable or weaken it, so the key stays out of
     // project layers (like the keymaps and the mod).
@@ -771,6 +784,26 @@ mod tests {
         };
         let err = validate_project_plan(&plan).unwrap_err();
         assert!(err.to_string().contains("mod_key"));
+    }
+
+    #[test]
+    fn project_plan_rejects_leader() {
+        // CTX-0715: the leader reroutes follow-up keys (and its timeout
+        // stretches the armed window), so both fields stay out of project
+        // layers with the keymaps and the mod.
+        use crate::keymap::Chord;
+        let plan = ConfigPlan {
+            leader_key: Some(Chord::parse("ctrl+q").expect("parses")),
+            ..Default::default()
+        };
+        let err = validate_project_plan(&plan).unwrap_err();
+        assert!(err.to_string().contains("leader_key"));
+        let plan = ConfigPlan {
+            leader_timeout_ms: Some(2500),
+            ..Default::default()
+        };
+        let err = validate_project_plan(&plan).unwrap_err();
+        assert!(err.to_string().contains("leader_timeout_ms"));
     }
 
     #[test]

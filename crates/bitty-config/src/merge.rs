@@ -107,6 +107,8 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "appearance.animations.easing.focus"
         | "appearance.animations.easing.workspace"
         | "mod_key"
+        | "leader_key"
+        | "leader_timeout_ms"
         | "close_confirm"
         | "extends"
         | "profile"
@@ -1467,6 +1469,87 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
             }
         }
 
+        // CTX-0715: `leader_key` / `leader_timeout_ms` are scalar-replace
+        // like `mod_key`; absent means "says nothing".
+        if let Some(leader_key) = &plan.leader_key {
+            let field = "leader_key";
+            if is_policy {
+                policy_fields.insert(field.to_string(), src.clone());
+                effective.leader_key = Some(*leader_key);
+                let prev = attribution.get(field).cloned();
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            } else if let Some(policy_src) = policy_fields.get(field) {
+                policy_violations.push(ConfigError::NonOverridable {
+                    field: field.to_string(),
+                    policy_source: policy_src.describe(),
+                    attempted_source: src.describe(),
+                });
+                conflicts.push(MergeConflict {
+                    field: field.to_string(),
+                    previous_source: policy_src.clone(),
+                    new_source: src.clone(),
+                    merge_class: MergeClass::ScalarReplace,
+                });
+            } else {
+                let prev = attribution.get(field).cloned();
+                effective.leader_key = Some(*leader_key);
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            }
+        }
+        if let Some(leader_timeout_ms) = &plan.leader_timeout_ms {
+            let field = "leader_timeout_ms";
+            if is_policy {
+                policy_fields.insert(field.to_string(), src.clone());
+                effective.leader_timeout_ms = Some(*leader_timeout_ms);
+                let prev = attribution.get(field).cloned();
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            } else if let Some(policy_src) = policy_fields.get(field) {
+                policy_violations.push(ConfigError::NonOverridable {
+                    field: field.to_string(),
+                    policy_source: policy_src.describe(),
+                    attempted_source: src.describe(),
+                });
+                conflicts.push(MergeConflict {
+                    field: field.to_string(),
+                    previous_source: policy_src.clone(),
+                    new_source: src.clone(),
+                    merge_class: MergeClass::ScalarReplace,
+                });
+            } else {
+                let prev = attribution.get(field).cloned();
+                effective.leader_timeout_ms = Some(*leader_timeout_ms);
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            }
+        }
+
         // CTX-0370: `close_confirm` is scalar-replace like `mod_key`; absent
         // means "says nothing" (lower-precedence value wins).
         if let Some(close_confirm) = &plan.close_confirm {
@@ -2395,6 +2478,87 @@ fn merge_layers_allow_policy_violations(
                 );
             }
         }
+        // CTX-0715: `leader_key` / `leader_timeout_ms` are scalar-replace
+        // like `mod_key`; absent means "says nothing".
+        // (Second merge path: allow-policy-violations variant for diagnostics.)
+        if let Some(leader_key) = &plan.leader_key {
+            let field = "leader_key";
+            if is_policy {
+                policy_fields.insert(field.to_string(), src.clone());
+                effective.leader_key = Some(*leader_key);
+                let prev = attribution.get(field).cloned();
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            } else if let Some(policy_src) = policy_fields.get(field) {
+                policy_violations.push(ConfigError::NonOverridable {
+                    field: field.to_string(),
+                    policy_source: policy_src.describe(),
+                    attempted_source: src.describe(),
+                });
+                conflicts.push(MergeConflict {
+                    field: field.to_string(),
+                    previous_source: policy_src.clone(),
+                    new_source: src.clone(),
+                    merge_class: MergeClass::ScalarReplace,
+                });
+            } else {
+                let prev = attribution.get(field).cloned();
+                effective.leader_key = Some(*leader_key);
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            }
+        }
+        if let Some(leader_timeout_ms) = &plan.leader_timeout_ms {
+            let field = "leader_timeout_ms";
+            if is_policy {
+                policy_fields.insert(field.to_string(), src.clone());
+                effective.leader_timeout_ms = Some(*leader_timeout_ms);
+                let prev = attribution.get(field).cloned();
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            } else if let Some(policy_src) = policy_fields.get(field) {
+                policy_violations.push(ConfigError::NonOverridable {
+                    field: field.to_string(),
+                    policy_source: policy_src.describe(),
+                    attempted_source: src.describe(),
+                });
+                conflicts.push(MergeConflict {
+                    field: field.to_string(),
+                    previous_source: policy_src.clone(),
+                    new_source: src.clone(),
+                    merge_class: MergeClass::ScalarReplace,
+                });
+            } else {
+                let prev = attribution.get(field).cloned();
+                effective.leader_timeout_ms = Some(*leader_timeout_ms);
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            }
+        }
         // CTX-0370: `close_confirm` is scalar-replace like `mod_key`; absent
         // means "says nothing" (lower-precedence value wins).
         // (Second merge path: allow-policy-violations variant for diagnostics.)
@@ -2698,6 +2862,64 @@ mod tests {
         let merged2 = try_merge_layers(vec![user2]).expect("try merge");
         assert_eq!(merged2.effective.mod_key, ModKey::Super);
         assert_eq!(merged2.source_of("mod_key").unwrap().layer, LayerKind::User);
+    }
+
+    #[test]
+    fn leader_merges_scalar_replace_with_attribution() {
+        // CTX-0715: user layer wins with per-field attribution; absent keeps
+        // `None` (the platform default resolves at use, not at merge).
+        use crate::keymap::Chord;
+        let user = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                leader_key: Some(Chord::parse("ctrl+q").expect("parses")),
+                leader_timeout_ms: Some(2500),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged = merge_layers(vec![user]).expect("merge");
+        assert_eq!(
+            merged.effective.leader_key.expect("chord").canonical(),
+            "ctrl+q"
+        );
+        assert_eq!(merged.effective.leader_timeout_ms, Some(2500));
+        assert_eq!(
+            merged.source_of("leader_key").unwrap().layer,
+            LayerKind::User
+        );
+        assert_eq!(
+            merged.source_of("leader_timeout_ms").unwrap().layer,
+            LayerKind::User
+        );
+        assert_eq!(
+            crate::merge::merge_class_for("leader_key"),
+            Some(MergeClass::ScalarReplace)
+        );
+        assert_eq!(
+            crate::merge::merge_class_for("leader_timeout_ms"),
+            Some(MergeClass::ScalarReplace)
+        );
+        // Absent rides `None` (platform default at use).
+        let empty = merge_layers(vec![]).expect("empty merges");
+        assert!(empty.effective.leader_key.is_none());
+        assert!(empty.effective.leader_timeout_ms.is_none());
+        // try_merge_layers agrees (second merge path).
+        let user2 = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                leader_key: Some(Chord::parse("ctrl+q").expect("parses")),
+                leader_timeout_ms: Some(2500),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged2 = try_merge_layers(vec![user2]).expect("try merge");
+        assert_eq!(
+            merged2.effective.leader_key.expect("chord").canonical(),
+            "ctrl+q"
+        );
+        assert_eq!(merged2.effective.leader_timeout_ms, Some(2500));
     }
 
     #[test]

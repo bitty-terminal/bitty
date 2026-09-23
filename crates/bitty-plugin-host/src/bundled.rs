@@ -48,8 +48,8 @@
 
 use crate::capability::CapabilityId;
 use crate::manifest::{
-    CapabilityRequests, Compat, FilesystemRequest, FsAccess, LazyTriggers, PluginId,
-    PluginIdentity, PluginManifest, QualifiedName,
+    CapabilityRequests, Compat, FilesystemRequest, FsAccess, LazyTriggers, NetworkEgress, PluginId,
+    PluginIdentity, PluginLimits, PluginManifest, QualifiedName,
 };
 
 /// Canonical version for the six `v1` bundled plugins (SemVer 2).
@@ -98,6 +98,8 @@ pub fn shell_integration_manifest() -> PluginManifest {
         required_services: Vec::new(),
         capabilities: caps,
         tools: Vec::new(),
+        network: Vec::new(),
+        limits: Default::default(),
         lazy: LazyTriggers {
             commands: Vec::new(),
             events: vec![
@@ -251,6 +253,8 @@ pub fn workspace_manifest() -> PluginManifest {
         required_services: Vec::new(),
         capabilities: caps,
         tools: Vec::new(),
+        network: Vec::new(),
+        limits: Default::default(),
         lazy: workspace_lazy_triggers(),
         raw_bytes_len: 512,
     }
@@ -285,6 +289,8 @@ pub fn tabs_manifest() -> PluginManifest {
         required_services: Vec::new(),
         capabilities: caps,
         tools: Vec::new(),
+        network: Vec::new(),
+        limits: Default::default(),
         lazy: workspace_lazy_triggers(),
         raw_bytes_len: 512,
     }
@@ -317,6 +323,8 @@ pub fn project_manifest() -> PluginManifest {
         required_services: Vec::new(),
         capabilities: caps,
         tools: Vec::new(),
+        network: Vec::new(),
+        limits: Default::default(),
         lazy: LazyTriggers {
             commands: vec![
                 QualifiedName::new("bitty-terminal.project:open").expect("qualified"),
@@ -371,6 +379,8 @@ pub fn browser_panel_manifest() -> PluginManifest {
         required_services: Vec::new(),
         capabilities: caps,
         tools: Vec::new(),
+        network: Vec::new(),
+        limits: Default::default(),
         lazy: LazyTriggers {
             commands: vec![
                 QualifiedName::new("bitty-terminal.browser-panel:open").expect("qualified"),
@@ -441,6 +451,8 @@ pub fn ai_panel_manifest() -> PluginManifest {
         required_services: Vec::new(),
         capabilities: caps,
         tools: Vec::new(),
+        network: Vec::new(),
+        limits: Default::default(),
         lazy: LazyTriggers {
             commands: vec![
                 QualifiedName::new("bitty-terminal.ai-panel:open").expect("qualified"),
@@ -506,6 +518,18 @@ pub fn mail_panel_manifest() -> PluginManifest {
         access: FsAccess::Write,
         paths: vec!["~/mail/**".to_string()],
     });
+    // Structured egress paired with the `network.connect:*` capabilities
+    // above (both directions fail closed in `PluginManifest::validate`).
+    let network = vec![
+        NetworkEgress {
+            host: "imap.example.com".to_string(),
+            ports: vec![993],
+        },
+        NetworkEgress {
+            host: "smtp.example.com".to_string(),
+            ports: vec![465],
+        },
+    ];
     PluginManifest {
         identity: bundled_identity(
             "bitty-terminal.mail-panel",
@@ -518,6 +542,8 @@ pub fn mail_panel_manifest() -> PluginManifest {
         required_services: Vec::new(),
         capabilities: caps,
         tools: Vec::new(),
+        network,
+        limits: PluginLimits::default(),
         lazy: LazyTriggers {
             commands: vec![
                 QualifiedName::new("bitty-terminal.mail-panel:open").expect("qualified"),

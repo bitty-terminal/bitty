@@ -162,6 +162,8 @@ fn git_panel_manifest() -> bitty_plugin_host::PluginManifest {
             required: true,
             version_req: ">=2.30".to_string(),
         }],
+        network: Vec::new(),
+        limits: Default::default(),
         lazy: LazyTriggers {
             commands: GIT_PANEL_COMMANDS
                 .iter()

@@ -4632,6 +4632,7 @@ fn splash_show_policy_is_once_only_and_suppressible() {
     assert!(!should_show_splash(false, Some(&marker)));
 
     let _ = std::fs::remove_dir_all(&dir);
+}
 // -- CTX-0731 (#982): panel-hosted `$EDITOR` round trip ------------------------
 
 fn editor_test_app() -> TerminalApp {

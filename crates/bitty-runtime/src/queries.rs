@@ -18,8 +18,15 @@
 //! | `CSI > q` / `CSI > 0 q` (XTVERSION) | `DCS > \| Bitty <ver> ST` | [`xterm_version_reply`] |
 //! | `DCS + q <hex> ST` (XTGETTCAP) | `DCS 1 + r <hex>=<hex> ST` or `DCS 0 + r ST` | [`xtgettcap_reply`] |
 //! | `CSI Ps $ p` / `CSI ? Ps $ p` (DECRQM) | `CSI [?] Ps ; Pm $ y` (`Pm`: 0 unknown, 1 set, 2 reset) | [`decrqm_value`] reads live `State` |
+//! | `CSI 14 t` (XTWINOPS text area, pixels) | `CSI 4 ; height ; width t` | [`xtwinops_pixels_reply`]: focused leaf content grid × live cell metrics (exact multiples) |
+//! | `CSI 18 t` (XTWINOPS text area, cells) | `CSI 8 ; rows ; cols t` | [`xtwinops_cells_reply`]: focused leaf content grid |
 //!
 //! Values are bitty's TRUE capabilities, never borrowed prestige:
+//!
+//! - XTWINOPS answers only `14 t` / `18 t` (fastfetch's kitty cell-size
+//!   probe, #1334): every other window operation stays silent, and the
+//!   pixel reply is the exact `cols × cell` / `rows × cell` product so a
+//!   prober recovers the live cell dimensions without rounding error.
 //!
 //! - XTGETTCAP answers only `TN`/`name` (= [`bitty_pty::DEFAULT_TERM`], the
 //!   `TERM` children actually see), `Co`/`colors` (`256`: SGR `38;5` indexed
@@ -481,6 +488,57 @@ pub(crate) fn xtgettcap_reply(payload: &[u8]) -> Vec<u8> {
     reply
 }
 
+/// XTWINOPS text-area-in-pixels reply (`CSI 4 ; height ; width t`).
+///
+/// `width`/`height` are the exact `cols × cell` / `rows × cell` products
+/// the runtime passes in, so a prober (fastfetch kitty backend, #1334)
+/// recovers the live cell dimensions without rounding error.
+#[must_use]
+pub(crate) fn xtwinops_pixels_reply(width: u32, height: u32) -> Vec<u8> {
+    format!("\x1b[4;{height};{width}t").into_bytes()
+}
+
+/// XTWINOPS text-area-in-cells reply (`CSI 8 ; rows ; cols t`).
+#[must_use]
+pub(crate) fn xtwinops_cells_reply(cols: u16, rows: u16) -> Vec<u8> {
+    format!("\x1b[8;{rows};{cols}t").into_bytes()
+}
+
+/// Scan for fresh XTWINOPS text-area queries (`CSI 14 t` / `CSI 18 t`).
+///
+/// Params must be exactly `14` or `18` (no private markers, no extra
+/// params): every other window operation stays silent, and our own
+/// replies (`CSI 4 ; .. t`, `CSI 8 ; .. t`) can never retrigger the
+/// scan, which closes the reply-echo loop. Returns the requested ops in
+/// byte order, at most [`QUERY_MATCHES_MAX`].
+#[must_use]
+pub(crate) fn find_xtwinops(combined: &[u8], new_start: usize) -> Vec<u16> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i + 5 <= combined.len() && out.len() < QUERY_MATCHES_MAX {
+        if combined[i] != 0x1b || *combined.get(i + 1).unwrap_or(&0) != b'[' {
+            i += 1;
+            continue;
+        }
+        let params = &combined[i + 2..i + 4];
+        let op = if params == b"14" {
+            14u16
+        } else if params == b"18" {
+            18u16
+        } else {
+            i += 1;
+            continue;
+        };
+        if combined[i + 4] == b't' && i + 5 > new_start {
+            out.push(op);
+            i += 5;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
 // Precise [`UnrecognizedSequence`] triggers (kind/final/intermediates).
 // The parser maps every query below to `Unknown` today; matching the full
 // triple keeps unrelated sequences silent.
@@ -527,6 +585,16 @@ pub(crate) fn is_xtgettcap(seq: &UnrecognizedSequence) -> bool {
     seq.kind == bitty_vt::SequenceKind::Dcs
         && seq.final_byte == b'q'
         && seq.intermediates == [b'+', 0]
+}
+
+/// `CSI 14 t` / `CSI 18 t` (XTWINOPS text-area request shape).
+///
+/// The parser reports no params on [`UnrecognizedSequence`], so the
+/// precise `14`/`18` match comes from the [`find_xtwinops`] raw scan;
+/// this triple only gates the answer arm to the `t`-final CSI family.
+#[must_use]
+pub(crate) fn is_xtwinops(seq: &UnrecognizedSequence) -> bool {
+    seq.kind == bitty_vt::SequenceKind::Csi && seq.final_byte == b't' && seq.intermediates == [0, 0]
 }
 
 #[cfg(test)]
@@ -664,5 +732,47 @@ mod tests {
         assert!(find_xtgettcap(bytes, bytes.len()).is_empty());
         // Unterminated DCS fails closed.
         assert!(find_xtgettcap(b"\x1bP+q544E", 0).is_empty());
+    }
+
+    #[test]
+    fn xtwinops_replies_follow_ctlseqs_shapes() {
+        assert_eq!(
+            xtwinops_pixels_reply(720, 418),
+            b"\x1b[4;418;720t",
+            "14t reports height before width"
+        );
+        assert_eq!(
+            xtwinops_cells_reply(80, 22),
+            b"\x1b[8;22;80t",
+            "18t reports rows before cols"
+        );
+    }
+
+    #[test]
+    fn find_xtwinops_accepts_exact_14_and_18_only() {
+        // fastfetch's probe shape: both ops in one write, byte order kept.
+        assert_eq!(find_xtwinops(b"\x1b[18t\x1b[14t", 0), vec![18, 14]);
+        assert_eq!(find_xtwinops(b"\x1b[14t", 0), vec![14]);
+        // Stale (fully in overlap) matches are skipped.
+        let bytes = b"\x1b[14t";
+        assert!(find_xtwinops(bytes, bytes.len()).is_empty());
+        // Every other window op stays silent, including near-misses.
+        for shape in [
+            b"\x1b[1t".as_slice(),
+            b"\x1b[2t".as_slice(),
+            b"\x1b[4t".as_slice(),
+            b"\x1b[8t".as_slice(),
+            b"\x1b[13t".as_slice(),
+            b"\x1b[19t".as_slice(),
+            b"\x1b[114t".as_slice(),
+            b"\x1b[14;2t".as_slice(),
+            b"\x1b[?14t".as_slice(),
+            b"\x1b[>14t".as_slice(),
+        ] {
+            assert!(find_xtwinops(shape, 0).is_empty(), "shape {shape:?}");
+        }
+        // Echoes of our own replies must not retrigger (loop guard).
+        assert!(find_xtwinops(b"\x1b[4;418;720t", 0).is_empty());
+        assert!(find_xtwinops(b"\x1b[8;22;80t", 0).is_empty());
     }
 }

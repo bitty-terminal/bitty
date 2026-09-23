@@ -415,3 +415,113 @@ fn gpu_image_budget_mirrors_rich_present_budget() {
         bitty_rich::KITTY_PRESENT_MAX_BYTES_PER_FRAME,
     );
 }
+
+/// Minimal standard-alphabet base64 encoder (test-only, no new deps).
+fn b64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let word = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        out.push(ALPHABET[(word >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(word >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(word >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[word as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Vertical range of opaque-blue rows in a headless frame, if any.
+fn blue_band(rgba: &[u8], width: usize) -> Option<(usize, usize)> {
+    let mut top = None;
+    let mut bottom = 0;
+    for (i, px) in rgba.chunks_exact(4).enumerate() {
+        if px == [0, 0, 0xFF, 0xFF] {
+            let y = i / width.max(1);
+            if top.is_none() {
+                top = Some(y);
+            }
+            bottom = y;
+        }
+    }
+    top.map(|t| (t, bottom))
+}
+
+#[test]
+fn first_paint_crops_overflow_instead_of_squeezing() {
+    // #1334 (CTX-0744): chafa-shaped `APC G` (`a=T`, explicit `c=`/`r=`)
+    // anchored at the grid bottom so the placement overflows the viewport.
+    // First paint must crop (correct aspect, top part visible), never
+    // squeeze the whole image into the visible rows (vertical squash that
+    // later scrolls "heal" into the right aspect).
+    let mut rt = make_runtime();
+    let cfg = RuntimeConfig::default();
+    let cw = cfg.cell_width as usize;
+    let ch = cfg.cell_height as usize;
+    let width = usize::try_from(cfg.window_extent().width()).expect("width fits usize");
+    let (origin_x, origin_y, rows) = content_frame_geometry(&rt);
+    // 2 cols x 4 rows of cells; pixels: top half red, bottom half blue.
+    let (pw, ph) = (2 * cw, 4 * ch);
+    let mut rgba = vec![0u8; pw * ph * 4];
+    for y in 0..ph {
+        let color = if y < ph / 2 {
+            [0xFF, 0, 0, 0xFF]
+        } else {
+            [0, 0, 0xFF, 0xFF]
+        };
+        for x in 0..pw {
+            rgba[(y * pw + x) * 4..(y * pw + x) * 4 + 4].copy_from_slice(&color);
+        }
+    }
+    // Anchor at the last grid row: the CTX-0361 cursor-follow window slides
+    // the effective anchor to the last content row, so exactly one cell row
+    // stays visible (robust for any decorated frame smaller than the grid).
+    rt.handle_pty_bytes(b"\x1b[24;1H");
+    let seq = format!(
+        "\x1b_Ga=T,f=32,s={},v={},c=2,r=4,m=0;{}\x1b\\",
+        pw,
+        ph,
+        b64_encode(&rgba)
+    );
+    rt.handle_pty_bytes(seq.as_bytes());
+    assert_eq!(rt.kitty_image_count(), 1);
+    assert_eq!(rt.kitty_placement_count(), 1);
+    rt.tick().expect("display forces a present");
+    let first = rt.headless_rgba().expect("rgba");
+    assert_eq!(
+        blue_band(&first, width),
+        None,
+        "first paint must show only the top (red) part at true scale, never squeezed blue"
+    );
+    assert_eq!(
+        red_band(&first, width).map(|(t, b)| b + 1 - t),
+        Some(ch),
+        "visible red band must be exactly one cell row tall"
+    );
+    // Scroll the placement fully into view: the whole image appears at the
+    // same scale (red over blue, two cell rows each).
+    rt.handle_pty_bytes(&[b'\n'; 6]);
+    rt.tick().expect("scroll damage must present");
+    let after = rt.headless_rgba().expect("rgba");
+    let top = origin_y + (rows - 7) * ch;
+    assert_eq!(
+        red_band(&after, width),
+        Some((top, top + 2 * ch - 1)),
+        "scrolled image keeps its aspect: red over blue"
+    );
+    assert_eq!(
+        blue_band(&after, width),
+        Some((top + 2 * ch, top + 4 * ch - 1)),
+        "scrolled image keeps its aspect: blue below red"
+    );
+    let _ = origin_x;
+}

@@ -1809,6 +1809,19 @@ impl Runtime {
                                 let Some(img) = self.kitty_images.get(placement.image) else {
                                     continue;
                                 };
+                                // #1334: scale into the FULL (unclamped)
+                                // placement extent, then crop the visible
+                                // window — never re-scale the whole source
+                                // into the clamped rect (first-paint squash).
+                                let Some(full_px) =
+                                    bitty_rich::KittyImageLayer::placement_full_rect(
+                                        placement,
+                                        rich_metrics,
+                                        scrollback,
+                                    )
+                                else {
+                                    continue;
+                                };
                                 let Some(rect_px) = bitty_rich::KittyImageLayer::placement_rect(
                                     placement,
                                     rich_metrics,
@@ -1840,9 +1853,10 @@ impl Runtime {
                                     viewport_cols: frame.cols,
                                     viewport_rows: frame.rows,
                                 };
-                                let Some(scaled) = self
-                                    .kitty_raster_cache
-                                    .get_or_rasterize(key, || bitty_rich::rasterize(img, rect_px))
+                                let Some(scaled) =
+                                    self.kitty_raster_cache.get_or_rasterize(key, || {
+                                        bitty_rich::rasterize_clipped(img, full_px, rect_px)
+                                    })
                                 else {
                                     continue;
                                 };

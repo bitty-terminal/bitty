@@ -604,7 +604,7 @@ impl Runtime {
     pub(super) fn handle_pty_bytes_inner(&mut self, bytes: &[u8]) {
         // CTX-0146: pre-scan overlap ++ new bytes for parameterized queries
         // (DECRQM mode numbers, XTGETTCAP payloads, secondary-DA request
-        // forms). Bounded scans; matches ending inside the overlap were
+        // forms, XTWINOPS 14/18 ops). Bounded scans; matches ending inside the overlap were
         // answered on the earlier call and are filtered by the scanners.
         let overlap_len = self.query_overlap.len();
         let mut combined = Vec::with_capacity(overlap_len + bytes.len());
@@ -613,6 +613,7 @@ impl Runtime {
         let mut decrqm = crate::queries::find_decrqm(&combined, overlap_len);
         let mut secondary = crate::queries::find_secondary_da(&combined, overlap_len);
         let mut tcaps = crate::queries::find_xtgettcap(&combined, overlap_len);
+        let mut xtwinops = crate::queries::find_xtwinops(&combined, overlap_len);
         let mut actions: Vec<TerminalAction> = Vec::new();
         self.parser.advance(bytes, |action| actions.push(action));
         for action in actions {
@@ -870,6 +871,18 @@ impl Runtime {
                 } else if crate::queries::is_xtgettcap(seq) && !tcaps.is_empty() {
                     let query = tcaps.remove(0);
                     pending.push(crate::queries::xtgettcap_reply(&query.payload));
+                } else if crate::queries::is_xtwinops(seq) && !xtwinops.is_empty() {
+                    // XTWINOPS text area (#1334 fastfetch kitty probe):
+                    // `14 t` wants pixels, `18 t` wants cells. The
+                    // pre-scan carries the exact op (the parser reports
+                    // no params), consumed in parse order like DECRQM.
+                    let op = xtwinops.remove(0);
+                    let (cols, rows, width, height) = self.xtwinops_text_area();
+                    pending.push(if op == 14 {
+                        crate::queries::xtwinops_pixels_reply(width, height)
+                    } else {
+                        crate::queries::xtwinops_cells_reply(cols, rows)
+                    });
                 }
                 for reply in pending {
                     self.state.apply(&TerminalAction::Reply {
@@ -905,6 +918,37 @@ impl Runtime {
     /// master via `PtyWriter`. No upstream type is exposed.
     pub fn take_replies(&mut self) -> Vec<Box<[u8]>> {
         self.state.take_replies()
+    }
+
+    /// Text area for XTWINOPS `14 t` / `18 t` replies (#1334 fastfetch probe).
+    ///
+    /// `(cols, rows, width_px, height_px)` of the focused leaf's content
+    /// frame (first frame when focus is unknown, primary grid when the
+    /// layout is empty). Pixel extents are the exact `cols × cell` /
+    /// `rows × cell` products (saturating) at the live DPI scale, so a
+    /// prober dividing pixels by cells recovers the live cell dimensions
+    /// without rounding error.
+    fn xtwinops_text_area(&self) -> (u16, u16, u32, u32) {
+        let frames = self.present_frames();
+        let (cols, rows) = self
+            .focused_view()
+            .and_then(|fid| frames.iter().find(|frame| frame.view == fid))
+            .or_else(|| frames.first())
+            .map(|frame| (frame.cols, frame.rows))
+            .unwrap_or_else(|| {
+                (
+                    u16::try_from(self.state.width()).unwrap_or(u16::MAX),
+                    u16::try_from(self.state.height()).unwrap_or(u16::MAX),
+                )
+            });
+        let live = self.live_cell_metrics();
+        let width = u64::from(cols)
+            .saturating_mul(u64::from(live.width))
+            .min(u64::from(u32::MAX)) as u32;
+        let height = u64::from(rows)
+            .saturating_mul(u64::from(live.height))
+            .min(u64::from(u32::MAX)) as u32;
+        (cols, rows, width, height)
     }
 
     /// Writes pending PTY replies to the PTY writer (bounded, fail-closed).

@@ -98,6 +98,22 @@ on the same OQ-083 ruling; nothing here authorizes write-lease enforcement.
   refusals, title and description bounds, stable audit names.
 - Reproduce: `cargo test -p bitty-runtime --lib lease::`.
 
+## Live wiring (CTX-0720)
+
+- Host binding: `PanelRuntime` (`crates/bitty-runtime/src/registry/host.rs`)
+  issues one `PanelLease` per panel at `create_panel` (fresh `Idle`),
+  moves it only through `acquire_panel_lease` / `release_panel_lease` /
+  `handoff_panel_lease` (handle generation validated first; refusals map
+  to `PanelError::LeaseDenied` with the stable kernel audit name first),
+  reads it via `panel_lease_state`, stores validated orientation text via
+  `set_panel_description` / `panel_description` (`InvalidDescription` on
+  refusal, nothing stored), and clears the binding at `dispose_panel`.
+  Lease moves never disturb panel lifecycle state.
+- Fail-closed wiring defaults: occupancy is never assumed (unissued reads
+  `Idle`); stale handles are rejected before the kernel; a disposed panel
+  holds no lease.
+- Reproduce: `cargo test -p bitty-runtime --test run_wiring lease_`.
+
 ## Gates
 
 - `cargo fmt --check`, `cargo clippy --workspace --all-targets` with

@@ -24,6 +24,7 @@ use bitty_ipc::execution::EnvPolicy;
 use bitty_pty::{Pty, PtyBuilder, PtyReader};
 
 use super::closed_pipe_command;
+use super::command_risk::{OperationIntent, RiskVerdict, classify_argv};
 use super::delivery::{DeliveryLog, DeliveryState, EventReplay};
 use super::model::{
     AttachReceipt, JobCancel, JobError, JobEvent, JobGrant, JobId, JobIo, JobOperation,
@@ -32,6 +33,7 @@ use super::model::{
     MAX_WRITES_PER_WINDOW, SignalOutcome, TransferReceipt,
 };
 use super::output::{OutputIndex, OutputSink, OutputView, ReadOutput};
+use super::sensitive_input::{EchoState, InteractionClass, automated_input_allowed};
 
 /// Default registry capacity.
 ///
@@ -55,6 +57,21 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const DRAIN_CHUNK_BYTES: usize = 8 * 1024;
 
 type Shared = Arc<Mutex<RegistryInner>>;
+
+/// Classifies a spawn-time [`JobSpec`] with the command-risk kernel
+/// (RUN-23): `argv[0]` is the declared program and the rest are the
+/// declared args — both already parsed, never a raw command line, so
+/// quoting cannot hide the operation from this layer. Spawn closes stdin
+/// (pipe jobs) or opens a fresh PTY master (PTY jobs), so `stdin_piped`
+/// is always false: a pipe into a new interpreter cannot exist at spawn
+/// time and needs no shell-AST parser here.
+fn classify_job_spec(spec: &JobSpec, intent: OperationIntent) -> RiskVerdict {
+    let program = spec.program.as_str();
+    let mut argv: Vec<&str> = Vec::with_capacity(spec.args.len() + 1);
+    argv.push(program);
+    argv.extend(spec.args.iter().map(String::as_str));
+    classify_argv(&argv, false, intent)
+}
 
 // ── registry ────────────────────────────────────────────────────────────────
 
@@ -250,11 +267,51 @@ impl JobRegistry {
     /// (capacity, spec validation, supervisor startup) behave exactly like
     /// [`JobRegistry::spawn`].
     ///
+    /// Agent-command boundary (RUN-23): the spec is classified with
+    /// [`classify_argv`] under [`OperationIntent::Execute`] before anything
+    /// is tracked — a hard-deny match fails with
+    /// [`JobError::CommandRiskDenied`] and a consent-gated shape fails with
+    /// [`JobError::CommandRiskNeedsConsent`], both before any thread or
+    /// process starts. Callers with a Tool Bus-declared intent use
+    /// [`JobRegistry::spawn_checked_as`] instead. The legacy
+    /// [`JobRegistry::spawn`] stays ungated host authority.
+    ///
     /// # Errors
     ///
     /// Same failure set as [`JobRegistry::spawn`] (no denial: spawning
-    /// confers the first ownership rather than exercising one).
+    /// confers the first ownership rather than exercising one), plus the
+    /// command-risk refusals above.
     pub fn spawn_as(&self, owner: JobPrincipal, spec: JobSpec) -> Result<JobId, JobError> {
+        self.spawn_checked_as(owner, spec, OperationIntent::Execute)
+    }
+
+    /// Tracks `spec` as [`JobState::Queued`] owned by `owner` after the
+    /// command-risk interlock, then starts its supervisor thread.
+    ///
+    /// Agent-command boundary with explicit Tool Bus-declared `intent`
+    /// (RUN-23, #1054): `intent` is declared by the tool schema, never
+    /// inferred from bytes, so a read through a mutating-looking path stays
+    /// a read. Spawn closes stdin (pipe jobs) or opens a fresh PTY master
+    /// (PTY jobs), so `stdin_piped` is always false here: a pipe into a new
+    /// interpreter cannot exist at spawn time. A positive hard-deny match
+    /// fails with [`JobError::CommandRiskDenied`]; a consent-gated shape
+    /// fails with [`JobError::CommandRiskNeedsConsent`] (fail-closed: the
+    /// PP-3 consent ledger does not exist yet, so nothing can release it).
+    /// Either refusal happens before tracking, threading, or execution.
+    ///
+    /// # Errors
+    ///
+    /// [`JobError::InvalidSpec`] when `spec` fails validation,
+    /// [`JobError::CommandRiskDenied`] on a hard-deny match,
+    /// [`JobError::CommandRiskNeedsConsent`] on a consent-gated shape,
+    /// [`JobError::RegistryFull`] at capacity, and [`JobError::Unavailable`]
+    /// when the supervisor thread cannot start.
+    pub fn spawn_checked_as(
+        &self,
+        owner: JobPrincipal,
+        spec: JobSpec,
+        intent: OperationIntent,
+    ) -> Result<JobId, JobError> {
         spec.validate()?;
         // Principals are validated at the boundary: a name that fails the
         // model bounds fails here, before anything is tracked. (`JobPrincipal`
@@ -263,6 +320,21 @@ impl JobRegistry {
         if owner.as_str().len() > super::model::MAX_JOB_PRINCIPAL_BYTES {
             return Err(JobError::invalid_principal("job principal exceeds bound"));
         };
+        match classify_job_spec(&spec, intent) {
+            RiskVerdict::Allow(_) => {}
+            RiskVerdict::Deny(deny) => return Err(JobError::command_risk_denied(deny)),
+            RiskVerdict::NeedsConsent(tier) => {
+                return Err(JobError::command_risk_needs_consent(tier));
+            }
+        }
+        self.spawn_owned(owner, spec)
+    }
+
+    /// Shared owned-spawn body: tracks `spec` owned by `owner` and starts
+    /// its supervisor thread. Validation, principal bounds, and the
+    /// command-risk interlock all run in the caller
+    /// ([`JobRegistry::spawn_checked_as`]) before anything is tracked.
+    fn spawn_owned(&self, owner: JobPrincipal, spec: JobSpec) -> Result<JobId, JobError> {
         let (id, control, output) = {
             let mut inner = lock_inner(&self.shared);
             inner.evict_expired(now_ms());
@@ -398,9 +470,53 @@ impl JobRegistry {
         Ok(record.output.index())
     }
 
+    /// Records the observed PTY echo state and interaction class for one
+    /// tracked job (RUN-22, #1053).
+    ///
+    /// Host authority (not capability-scoped): the host owns termios
+    /// observation — it holds the PTY master side — and reports the slave
+    /// `ECHO` bit here via [`EchoState::of_echo_bit`], plus the class it
+    /// sorted with [`InteractionClass::classify`] or the verdict-fed
+    /// [`classify_with_verdict`](super::sensitive_input::classify_with_verdict)
+    /// (SI-5 seam into the OQ-087 audit). [`JobRegistry::write_input_as`]
+    /// re-checks both on every dispatch; a denial changes no dispatch
+    /// state and spends no rate budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobError::UnknownJob`] when `id` is not tracked.
+    pub fn set_job_input_gate(
+        &self,
+        id: JobId,
+        echo: EchoState,
+        class: InteractionClass,
+    ) -> Result<(), JobError> {
+        let mut inner = lock_inner(&self.shared);
+        let record = inner.jobs.get_mut(&id).ok_or(JobError::UnknownJob(id))?;
+        record.echo = echo;
+        record.interaction = class;
+        Ok(())
+    }
+
+    /// Reads the recorded input-gate state for one tracked job (RUN-22).
+    ///
+    /// The check side of [`JobRegistry::set_job_input_gate`]: hosts and
+    /// tests observe what the next [`JobRegistry::write_input_as`] will
+    /// enforce without dispatching anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobError::UnknownJob`] when `id` is not tracked.
+    pub fn job_input_gate(&self, id: JobId) -> Result<(EchoState, InteractionClass), JobError> {
+        let inner = lock_inner(&self.shared);
+        let record = inner.jobs.get(&id).ok_or(JobError::UnknownJob(id))?;
+        Ok((record.echo, record.interaction))
+    }
+
     /// Writes `data` to a live interactive (PTY) job's stdin as `principal`.
     ///
-    /// Enforcement order: `write_input` grant, then payload bound, then the
+    /// Enforcement order: `write_input` grant, then the sensitive-input
+    /// interlock, then payload bound, then the
     /// per-principal rate budget, then backend/state gating. Pipe jobs run
     /// with closed stdin by design, so an authorized write there reports
     /// [`JobError::Unsupported`]; a terminal job reports `Unsupported` as
@@ -415,6 +531,8 @@ impl JobRegistry {
     ///
     /// Returns [`JobError::Denied`] with operation `write_input` for callers
     /// without the grant (unknown ids deny identically),
+    /// [`JobError::SecureInputDenied`] while the sensitive-input interlock
+    /// holds (no-echo, or a confirmation class the host sorted),
     /// [`JobError::InvalidWrite`] for empty or over-bound payloads,
     /// [`JobError::RateLimited`] once the per-window budget is spent, and
     /// [`JobError::Unsupported`] for pipe backends or terminal jobs.
@@ -425,15 +543,27 @@ impl JobRegistry {
         data: &[u8],
     ) -> Result<usize, JobError> {
         let mut inner = lock_inner(&self.shared);
-        let authorized = inner
-            .jobs
-            .get(&id)
-            .is_some_and(|record| record.authorized(principal, JobOperation::WriteInput));
-        if !authorized {
+        // Authorization first (deny-by-default, existence hidden), then the
+        // interlock snapshot from the same borrow: an authorized caller may
+        // learn the gate state, and a denied caller learns nothing.
+        let gate = inner.jobs.get(&id).map(|record| {
+            (
+                record.authorized(principal, JobOperation::WriteInput),
+                record.echo,
+                record.interaction,
+            )
+        });
+        let Some((true, echo, class)) = gate else {
             return Err(JobError::denied(
                 JobOperation::WriteInput,
                 "caller holds no grant for this operation",
             ));
+        };
+        // Sensitive-input interlock (RUN-22): the recorded echo state is
+        // re-checked on every dispatch, so a no-echo span suspends dispatch
+        // for its duration without touching grants or spending budget.
+        if let Err(denial) = automated_input_allowed(echo, class) {
+            return Err(JobError::secure_input_denied(denial));
         }
         if data.is_empty() {
             return Err(JobError::invalid_write(
@@ -1056,6 +1186,18 @@ struct JobRecord {
     /// starts. `Mutex<Option<...>>` because exactly one `write_input_as`
     /// call may hold it at a time; pipe jobs and pre-start jobs hold `None`.
     pty_stdin: Arc<Mutex<Option<PtyStdinWriter>>>,
+    /// Last observed PTY echo state for the sensitive-input interlock
+    /// (RUN-22): the host records the slave `termios` `ECHO` bit here, and
+    /// [`JobRegistry::write_input_as`] re-checks it on every dispatch.
+    /// Defaults to [`EchoState::EchoOn`]; the host sets
+    /// [`EchoState::NoEcho`] while a no-echo program reads.
+    echo: EchoState,
+    /// Interaction class for the sensitive-input interlock (RUN-22): the
+    /// host sorts it with [`InteractionClass::classify`] (or the
+    /// verdict-fed [`classify_with_verdict`](super::sensitive_input::classify_with_verdict))
+    /// and [`JobRegistry::write_input_as`] enforces it together with
+    /// `echo`. Defaults to [`InteractionClass::SafeInteractive`].
+    interaction: InteractionClass,
 }
 
 impl JobRecord {
@@ -1086,6 +1228,8 @@ impl JobRecord {
                 Duration::from_millis(MAX_SIGNAL_WINDOW_MS),
             ),
             pty_stdin: Arc::new(Mutex::new(None)),
+            echo: EchoState::EchoOn,
+            interaction: InteractionClass::SafeInteractive,
         }
     }
 
@@ -1113,6 +1257,8 @@ impl JobRecord {
                 Duration::from_millis(MAX_SIGNAL_WINDOW_MS),
             ),
             pty_stdin: Arc::new(Mutex::new(None)),
+            echo: EchoState::EchoOn,
+            interaction: InteractionClass::SafeInteractive,
         }
     }
 

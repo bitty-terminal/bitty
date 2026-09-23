@@ -46,6 +46,13 @@
 use bitty_ui::ViewId;
 use bitty_ui::placement::{Placement, PlacementError};
 
+use std::collections::HashMap;
+
+use crate::execution::{
+    LeaseError, LeaseEvent, LeaseHolder, LeaseState, PanelLease, validate_description,
+    validate_title,
+};
+
 use super::event_bus_v1::{
     BUS_PUBLISH_CAPABILITY, BUS_SUBSCRIBE_CAPABILITY, BusTopicFamily, CrossWindowRoute,
     RoutingError, RoutingScope, core_topic,
@@ -80,6 +87,46 @@ pub struct PanelRuntime {
     placement: Placement,
     providers: PanelProviderRegistry,
     routable: RoutableLedger,
+    /// Panel lease table (RUN-21, #1052): one pure [`PanelLease`] kernel
+    /// per live panel plus its chrome-facing title/description. Issued at
+    /// [`PanelRuntime::create_panel`] (fresh `Idle`), moved only through
+    /// the acquire/release/handoff entries below, and cleared at
+    /// [`PanelRuntime::dispose_panel`]. The kernel owns the transition;
+    /// this table owns the per-panel binding. Lease vocabulary stays a UX
+    /// metaphor: the lease records who may drive a panel, never what is
+    /// true, and holder tags are opaque [`LeaseHolder`] values the caller
+    /// assigns.
+    leases: HashMap<super::panel::PanelId, PanelLeaseEntry>,
+}
+
+/// Per-panel lease binding: the transition kernel plus the validated
+/// human/agent orientation text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PanelLeaseEntry {
+    lease: PanelLease,
+    title: Option<String>,
+    description: Option<String>,
+}
+
+impl PanelLeaseEntry {
+    fn idle() -> Self {
+        Self {
+            lease: PanelLease::idle(),
+            title: None,
+            description: None,
+        }
+    }
+}
+
+/// Maps a refused kernel transition to the typed host denial, keeping the
+/// stable kernel audit name (`already_occupied` / `not_occupied` /
+/// `not_holder`) at the front of the reason.
+fn map_lease_error(panel: super::panel::PanelId, error: LeaseError) -> PanelError {
+    PanelError::LeaseDenied {
+        panel_id: panel,
+        reason: format!("{}: {error}", error.as_str()),
+    }
+>>>>>>> 5a0ce6b ([CTX-0720] feat(runtime): RUN kernels wired to live paths (lease/sensitive-input/risk) (#1052 #1053 #1054))
 }
 
 impl PanelRuntime {
@@ -95,6 +142,7 @@ impl PanelRuntime {
             placement: Placement::new(),
             providers: PanelProviderRegistry::new(),
             routable: RoutableLedger::new(),
+            leases: HashMap::new(),
         })
     }
 
@@ -106,6 +154,9 @@ impl PanelRuntime {
 
     /// Creates a panel of `panel_type` without mounting it.
     ///
+    /// Issues the panel's lease on success (RUN-21): a fresh `Idle` kernel
+    /// binding, so every live panel has exactly one lease from birth.
+    ///
     /// # Errors
     ///
     /// [`PanelError::TooManyPanels`], [`PanelError::UnknownPanelType`],
@@ -116,7 +167,11 @@ impl PanelRuntime {
         panel_type: PanelType,
         workspace: Option<WorkspaceId>,
     ) -> Result<PanelHandle, PanelError> {
-        self.registry.create_panel(panel_type, workspace)
+        let handle = self.registry.create_panel(panel_type, workspace)?;
+        self.leases
+            .entry(handle.id)
+            .or_insert_with(PanelLeaseEntry::idle);
+        Ok(handle)
     }
 
     /// Mounts a created panel onto an empty view (`Created -> Mounted`).
@@ -209,6 +264,10 @@ impl PanelRuntime {
     /// Clears the live [`Placement`] mirror when the registry dispose
     /// commits.
     ///
+    /// Also clears the panel's lease binding (RUN-21): a disposed panel
+    /// holds no lease, and a later panel reusing the id is issued a fresh
+    /// `Idle` lease at [`PanelRuntime::create_panel`].
+    ///
     /// # Errors
     ///
     /// [`PanelError::StaleHandle`] or [`PanelError::NotFound`].
@@ -220,8 +279,161 @@ impl PanelRuntime {
         let result = self.registry.dispose_panel(id, generation);
         if result.is_ok() {
             let _ = self.placement.unbind(id);
+            self.leases.remove(&id);
         }
         result
+    }
+
+    /// Acquires an idle panel's lease for `holder` (RUN-21, #1052).
+    ///
+    /// The handle generation is validated first (`StaleHandle` before any
+    /// lease access); the transition itself runs in the [`PanelLease`]
+    /// kernel and a refusal maps to [`PanelError::LeaseDenied`] with the
+    /// stable kernel audit name. A human takeover stays outside the lease:
+    /// release back to `Idle`, never a holder value.
+    ///
+    /// # Errors
+    ///
+    /// [`PanelError::StaleHandle`], [`PanelError::NotFound`], or
+    /// [`PanelError::LeaseDenied`] (`already_occupied`).
+    pub fn acquire_panel_lease(
+        &mut self,
+        id: super::panel::PanelId,
+        generation: Generation,
+        holder: LeaseHolder,
+    ) -> Result<LeaseEvent, PanelError> {
+        self.registry.panel_state(id, generation)?;
+        let entry = self.leases.entry(id).or_insert_with(PanelLeaseEntry::idle);
+        entry
+            .lease
+            .acquire(holder)
+            .map_err(|error| map_lease_error(id, error))
+    }
+
+    /// Releases an occupied panel's lease back to idle (RUN-21, #1052).
+    ///
+    /// Only the current occupant may release; anything else fails with
+    /// [`PanelError::LeaseDenied`] and the lease is unchanged.
+    ///
+    /// # Errors
+    ///
+    /// [`PanelError::StaleHandle`], [`PanelError::NotFound`], or
+    /// [`PanelError::LeaseDenied`] (`not_occupied` / `not_holder`).
+    pub fn release_panel_lease(
+        &mut self,
+        id: super::panel::PanelId,
+        generation: Generation,
+        holder: LeaseHolder,
+    ) -> Result<LeaseEvent, PanelError> {
+        self.registry.panel_state(id, generation)?;
+        let entry = self.leases.entry(id).or_insert_with(PanelLeaseEntry::idle);
+        entry
+            .lease
+            .release(holder)
+            .map_err(|error| map_lease_error(id, error))
+    }
+
+    /// Moves a panel's lease directly from `from` to `to` with no idle gap
+    /// (RUN-21, #1052): a handoff cannot be intercepted mid-release by a
+    /// third acquirer.
+    ///
+    /// # Errors
+    ///
+    /// [`PanelError::StaleHandle`], [`PanelError::NotFound`], or
+    /// [`PanelError::LeaseDenied`] (`not_occupied` / `not_holder`).
+    pub fn handoff_panel_lease(
+        &mut self,
+        id: super::panel::PanelId,
+        generation: Generation,
+        from: LeaseHolder,
+        to: LeaseHolder,
+    ) -> Result<LeaseEvent, PanelError> {
+        self.registry.panel_state(id, generation)?;
+        let entry = self.leases.entry(id).or_insert_with(PanelLeaseEntry::idle);
+        entry
+            .lease
+            .handoff(from, to)
+            .map_err(|error| map_lease_error(id, error))
+    }
+
+    /// Reads a panel's current lease state after handle validation
+    /// (RUN-21): the check side of the lease entries above. A panel that
+    /// was never issued a lease reads `Idle` — occupancy is never assumed.
+    ///
+    /// # Errors
+    ///
+    /// [`PanelError::StaleHandle`] or [`PanelError::NotFound`].
+    pub fn panel_lease_state(
+        &self,
+        id: super::panel::PanelId,
+        generation: Generation,
+    ) -> Result<LeaseState, PanelError> {
+        self.registry.panel_state(id, generation)?;
+        Ok(self
+            .leases
+            .get(&id)
+            .map_or(LeaseState::Idle, |entry| entry.lease.state()))
+    }
+
+    /// Stores a panel's chrome-facing title and description after
+    /// handle validation (RUN-21, #1052).
+    ///
+    /// Titles render in workspace chrome: 1–128 chars, no control
+    /// characters ([`validate_title`]). Descriptions are orientation text,
+    /// not a data channel: up to 1024 chars, newline excepted
+    /// ([`validate_description`]). A refusal stores nothing and maps to
+    /// [`PanelError::InvalidDescription`].
+    ///
+    /// # Errors
+    ///
+    /// [`PanelError::StaleHandle`], [`PanelError::NotFound`], or
+    /// [`PanelError::InvalidDescription`].
+    pub fn set_panel_description(
+        &mut self,
+        id: super::panel::PanelId,
+        generation: Generation,
+        title: &str,
+        description: &str,
+    ) -> Result<(), PanelError> {
+        self.registry.panel_state(id, generation)?;
+        if !validate_title(title) {
+            return Err(PanelError::InvalidDescription {
+                reason: format!(
+                    "panel title must be 1-128 chars with no control characters (got {} chars)",
+                    title.chars().count()
+                ),
+            });
+        }
+        if !validate_description(description) {
+            return Err(PanelError::InvalidDescription {
+                reason: format!(
+                    "panel description must be at most 1024 chars with no control characters other than newline (got {} chars)",
+                    description.chars().count()
+                ),
+            });
+        }
+        let entry = self.leases.entry(id).or_insert_with(PanelLeaseEntry::idle);
+        entry.title = Some(title.to_owned());
+        entry.description = Some(description.to_owned());
+        Ok(())
+    }
+
+    /// Reads a panel's stored title and description after handle
+    /// validation (RUN-21): `(title, description)`, each `None` until
+    /// [`PanelRuntime::set_panel_description`] stores it.
+    ///
+    /// # Errors
+    ///
+    /// [`PanelError::StaleHandle`] or [`PanelError::NotFound`].
+    pub fn panel_description(
+        &self,
+        id: super::panel::PanelId,
+        generation: Generation,
+    ) -> Result<(Option<String>, Option<String>), PanelError> {
+        self.registry.panel_state(id, generation)?;
+        Ok(self.leases.get(&id).map_or((None, None), |entry| {
+            (entry.title.clone(), entry.description.clone())
+        }))
     }
 
     /// Reads a panel's lifecycle state after handle validation.

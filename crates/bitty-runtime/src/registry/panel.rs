@@ -137,6 +137,20 @@ pub enum PanelError {
         kind: &'static str,
         id_raw: u64,
     },
+    /// A panel lease transition was refused; the lease is unchanged
+    /// (RUN-21, #1052). `reason` carries the stable kernel audit name
+    /// (`already_occupied` / `not_occupied` / `not_holder`) plus the
+    /// human-readable cause.
+    LeaseDenied {
+        panel_id: PanelId,
+        reason: String,
+    },
+    /// A panel title or description failed the lease-kernel bounds
+    /// (RUN-21, #1052): empty or over-long titles, control characters, or
+    /// over-long descriptions. Nothing was stored.
+    InvalidDescription {
+        reason: String,
+    },
     InvalidState {
         current: PanelState,
         expected: &'static str,
@@ -201,6 +215,12 @@ impl std::fmt::Display for PanelError {
                 write!(f, "too many commands: max {max}, current {current}")
             }
             Self::NotFound { kind, id_raw } => write!(f, "{kind} {id_raw} not found"),
+            Self::LeaseDenied { panel_id, reason } => {
+                write!(f, "panel {panel_id} lease denied: {reason}")
+            }
+            Self::InvalidDescription { reason } => {
+                write!(f, "invalid panel description: {reason}")
+            }
             Self::InvalidState { current, expected } => {
                 write!(f, "invalid state {current}: expected {expected}")
             }

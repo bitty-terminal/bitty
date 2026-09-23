@@ -103,6 +103,21 @@ needs, stopping exactly where the open parser work begins:
   and explicit-decision projections.
 - Reproduce: `cargo test -p bitty-runtime --lib command_risk::`.
 
+## Live wiring (CTX-0720)
+
+- Agent-command boundary: `JobRegistry::spawn_as` classifies every spec
+  with `classify_argv` under `OperationIntent::Execute` before tracking,
+  threading, or execution; `spawn_checked_as` takes the Tool Bus-declared
+  intent instead (declared by the tool schema, never inferred from bytes).
+  Spawn closes stdin (pipe jobs) or opens a fresh PTY master (PTY jobs),
+  so `stdin_piped` is always false at this boundary. A hard-deny match
+  fails with `JobError::CommandRiskDenied` (stable `HardDeny` audit name);
+  a consent-gated shape fails with `JobError::CommandRiskNeedsConsent`
+  (fail-closed: the PP-3 consent ledger does not exist yet, so nothing can
+  release it). Spec bounds (`InvalidSpec`) still run before classification.
+  The legacy `JobRegistry::spawn` stays ungated host authority.
+- Reproduce: `cargo test -p bitty-runtime --test run_wiring risk_`.
+
 ## Gates
 
 - `cargo fmt --check`, `cargo clippy --workspace --all-targets` with

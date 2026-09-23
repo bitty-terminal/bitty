@@ -607,6 +607,10 @@ impl Runtime {
                     self.scrollbar_cursor_left = true;
                     self.scrollbar_release();
                     self.end_alt_drag();
+                    // Issue #1348: leaving the window also ends a
+                    // border-drag resize (deterministic teardown like the
+                    // Alt+drag move above).
+                    self.end_border_drag();
                     // CTX-0334: leaving the window also drops a pending
                     // hover dwell so a re-entry starts a fresh clock.
                     self.clear_hover_pending();

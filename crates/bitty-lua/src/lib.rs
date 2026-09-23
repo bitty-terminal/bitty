@@ -70,8 +70,8 @@ pub mod ui;
 
 pub use config::{
     AnimationsData, ColorsData, ConfigData, ConfigOutcome, DecorationData, FontData, KeymapData,
-    LayoutData, MouseData, ScrollbarData, SelectionData, TerminalData, ViewOverrideData,
-    WindowData,
+    LayoutData, MouseData, PluginData, ScrollbarData, SelectionData, TerminalData,
+    ViewOverrideData, WindowData,
 };
 pub use host::{
     API_VERSION, BoundedExecution, BridgeError, CommandRegistration, ENV_KEY_MAX_BYTES,

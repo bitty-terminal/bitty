@@ -118,6 +118,18 @@ pub enum LeaseEvent {
     },
 }
 
+impl LeaseEvent {
+    /// Stable lowercase name for audit records.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Acquired { .. } => "acquired",
+            Self::Released { .. } => "released",
+            Self::Handoff { .. } => "handoff",
+        }
+    }
+}
+
 /// A refused lease transition; the lease is unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LeaseError {
@@ -133,6 +145,18 @@ pub enum LeaseError {
         /// Current occupant, which keeps the lease.
         holder: LeaseHolder,
     },
+}
+
+impl LeaseError {
+    /// Stable lowercase name for audit records.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AlreadyOccupied { .. } => "already_occupied",
+            Self::NotOccupied => "not_occupied",
+            Self::NotHolder { .. } => "not_holder",
+        }
+    }
 }
 
 impl fmt::Display for LeaseError {
@@ -350,5 +374,18 @@ mod tests {
             &"d".repeat(MAX_PANEL_DESCRIPTION_CHARS + 1)
         ));
         assert!(!validate_description("bad\x00desc"));
+    }
+
+    #[test]
+    fn event_and_error_names_are_stable() {
+        assert_eq!(LeaseEvent::Acquired { holder: A }.as_str(), "acquired");
+        assert_eq!(LeaseEvent::Released { holder: A }.as_str(), "released");
+        assert_eq!(LeaseEvent::Handoff { from: A, to: B }.as_str(), "handoff");
+        assert_eq!(
+            LeaseError::AlreadyOccupied { holder: A }.as_str(),
+            "already_occupied"
+        );
+        assert_eq!(LeaseError::NotOccupied.as_str(), "not_occupied");
+        assert_eq!(LeaseError::NotHolder { holder: A }.as_str(), "not_holder");
     }
 }

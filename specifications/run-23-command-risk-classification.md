@@ -99,7 +99,8 @@ needs, stopping exactly where the open parser work begins:
   absolute path), piped interpreters denied, broad-root `rm -rf` denied,
   narrow `rm -rf` gated to consent, `dd of=/dev/...` denied, credential and
   system-config writes denied while reads allow, `git` subcommands sorted
-  into tiers, empty `argv` gated, unknown commands standard.
+  into tiers, empty `argv` gated, unknown commands standard, verdict tier
+  and explicit-decision projections.
 - Reproduce: `cargo test -p bitty-runtime --lib command_risk::`.
 
 ## Gates

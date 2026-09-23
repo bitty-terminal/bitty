@@ -22,6 +22,8 @@
 
 use std::fmt;
 
+use super::command_risk::RiskVerdict;
+
 /// Observed PTY echo state: the slave `termios` `ECHO` bit as last seen by
 /// the host.
 ///
@@ -124,6 +126,17 @@ pub enum SecureInputDenial {
     ConfirmationRequiresHuman,
 }
 
+impl SecureInputDenial {
+    /// Stable lowercase name for audit records.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TargetInSecureInputMode => "target_in_secure_input_mode",
+            Self::ConfirmationRequiresHuman => "confirmation_requires_human",
+        }
+    }
+}
+
 impl fmt::Display for SecureInputDenial {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -174,8 +187,24 @@ pub const fn may_capture(echo: EchoState) -> bool {
     }
 }
 
+/// Sorts one interaction from the observed echo state and the OQ-087
+/// command-risk answer.
+///
+/// Candidate composition for the SI-5 seam: the verdict feeds the risk flag
+/// through [`RiskVerdict::requires_explicit_decision`], and the echo state
+/// still wins — no-echo is always [`SecretInput`](InteractionClass::SecretInput)
+/// regardless of the verdict. A verdict that needs an explicit decision
+/// sorts echo-on input as
+/// [`PrivilegedConfirmation`](InteractionClass::PrivilegedConfirmation), so
+/// the gate answers with a typed denial until a human decides.
+#[must_use]
+pub const fn classify_with_verdict(echo: EchoState, verdict: RiskVerdict) -> InteractionClass {
+    InteractionClass::classify(echo, verdict.requires_explicit_decision())
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::command_risk::{HardDeny, RiskTier};
     use super::*;
 
     #[test]
@@ -245,5 +274,69 @@ mod tests {
     fn echo_bit_mapping_matches_termios_semantics() {
         assert_eq!(EchoState::of_echo_bit(true), EchoState::EchoOn);
         assert_eq!(EchoState::of_echo_bit(false), EchoState::NoEcho);
+    }
+
+    #[test]
+    fn denial_names_are_stable() {
+        assert_eq!(
+            SecureInputDenial::TargetInSecureInputMode.as_str(),
+            "target_in_secure_input_mode"
+        );
+        assert_eq!(
+            SecureInputDenial::ConfirmationRequiresHuman.as_str(),
+            "confirmation_requires_human"
+        );
+    }
+
+    #[test]
+    fn verdict_bridge_keeps_echo_state_winning() {
+        // No-echo denies the shape of every verdict, including plain allow.
+        assert_eq!(
+            classify_with_verdict(EchoState::NoEcho, RiskVerdict::Allow(RiskTier::ReadOnly)),
+            InteractionClass::SecretInput
+        );
+        assert_eq!(
+            classify_with_verdict(
+                EchoState::NoEcho,
+                RiskVerdict::Deny(HardDeny::PrivilegeEscalation)
+            ),
+            InteractionClass::SecretInput
+        );
+    }
+
+    #[test]
+    fn verdict_bridge_sorts_echo_on_by_decision_need() {
+        assert_eq!(
+            classify_with_verdict(EchoState::EchoOn, RiskVerdict::Allow(RiskTier::Standard)),
+            InteractionClass::SafeInteractive
+        );
+        assert_eq!(
+            classify_with_verdict(
+                EchoState::EchoOn,
+                RiskVerdict::NeedsConsent(RiskTier::Restricted)
+            ),
+            InteractionClass::PrivilegedConfirmation
+        );
+        assert_eq!(
+            classify_with_verdict(
+                EchoState::EchoOn,
+                RiskVerdict::Deny(HardDeny::PipeToInterpreter)
+            ),
+            InteractionClass::PrivilegedConfirmation
+        );
+    }
+
+    #[test]
+    fn verdict_bridge_never_auto_allows_gated_verdicts() {
+        for verdict in [
+            RiskVerdict::NeedsConsent(RiskTier::Restricted),
+            RiskVerdict::Deny(HardDeny::BlockDeviceWrite),
+        ] {
+            let class = classify_with_verdict(EchoState::EchoOn, verdict);
+            assert!(
+                automated_input_allowed(EchoState::EchoOn, class).is_err(),
+                "gated verdict must not auto-allow"
+            );
+        }
     }
 }

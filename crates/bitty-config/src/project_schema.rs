@@ -446,10 +446,12 @@ impl Parser {
                 )?;
             }
             Table::Section(section) => {
-                let keys = self
-                    .section_keys
-                    .get_mut(&section)
-                    .expect("section key set exists once its table opens");
+                let keys = self.section_keys.get_mut(&section).ok_or_else(|| {
+                    ConfigError::validation(
+                        format!("line {lineno}"),
+                        format!("section '{}' was never opened", section.dir_name()),
+                    )
+                })?;
                 let entries = self.sections.entry(section).or_default();
                 insert_bounded(
                     keys,
@@ -672,7 +674,12 @@ fn parse_basic_string(
                 let rest = std::str::from_utf8(&line[pos..]).map_err(|_| {
                     ConfigError::validation(format!("line {lineno}"), "string content is not UTF-8")
                 })?;
-                let chr = rest.chars().next().expect("non-empty UTF-8 tail");
+                let chr = rest.chars().next().ok_or_else(|| {
+                    ConfigError::validation(
+                        format!("line {lineno}"),
+                        "unexpected end of line inside string",
+                    )
+                })?;
                 out.push(chr);
                 pos += chr.len_utf8();
             }
@@ -786,7 +793,9 @@ fn validate_name_shape(field: &str, name: &str, limit: usize) -> Result<(), Conf
         ));
     }
     let mut bytes = name.bytes();
-    let first = bytes.next().expect("name is non-empty (checked above)");
+    let Some(first) = bytes.next() else {
+        return Err(ConfigError::validation(field, "name must not be empty"));
+    };
     let ok = (first.is_ascii_lowercase() || first.is_ascii_digit())
         && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-');
     if !ok {

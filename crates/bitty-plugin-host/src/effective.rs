@@ -805,6 +805,46 @@ pub fn authorize(
 
 // ── adopted-contract wrappers (OQ-085 trust, OQ-057 roles) ─────────────────
 
+/// Trust-level pre-check shared by [`authorize_with_trust`] and
+/// [`authorize_with_trust_and_role`]: every requested capability's family
+/// must pass [`TrustLevel::check_family`] for `level`.
+fn check_trust_gate(
+    request: &AgentRequest,
+    kind: RequestKind,
+    level: TrustLevel,
+) -> Result<(), EffectiveDenial> {
+    for cap in &request.scope.caps {
+        if let Err(error) = level.check_family(cap.family()) {
+            return Err(EffectiveDenial {
+                kind: DenialKind::PolicyConflict,
+                request_kind: kind,
+                chain: vec![DenialStep {
+                    layer: None,
+                    detail: error.to_string(),
+                }],
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Role-contract pre-check shared by [`authorize_with_role`] and
+/// [`authorize_with_trust_and_role`]: `role` must admit the enforcement
+/// point guarding `kind`.
+fn check_role_gate(kind: RequestKind, role: AgentRole) -> Result<(), EffectiveDenial> {
+    if let Err(error) = role.check_request(kind) {
+        return Err(EffectiveDenial {
+            kind: DenialKind::PolicyConflict,
+            request_kind: kind,
+            chain: vec![DenialStep {
+                layer: None,
+                detail: error.to_string(),
+            }],
+        });
+    }
+    Ok(())
+}
+
 /// Authorize with the adopted trust-level admission gate first (OQ-085).
 ///
 /// Every requested capability's family must pass
@@ -821,18 +861,7 @@ pub fn authorize_with_trust(
     project_trusted: bool,
     level: TrustLevel,
 ) -> Result<EffectiveCapability, EffectiveDenial> {
-    for cap in &request.scope.caps {
-        if let Err(error) = level.check_family(cap.family()) {
-            return Err(EffectiveDenial {
-                kind: DenialKind::PolicyConflict,
-                request_kind: kind,
-                chain: vec![DenialStep {
-                    layer: None,
-                    detail: error.to_string(),
-                }],
-            });
-        }
-    }
+    check_trust_gate(request, kind, level)?;
     authorize(stack, request, kind, project_trusted)
 }
 
@@ -852,16 +881,28 @@ pub fn authorize_with_role(
     project_trusted: bool,
     role: AgentRole,
 ) -> Result<EffectiveCapability, EffectiveDenial> {
-    if let Err(error) = role.check_request(kind) {
-        return Err(EffectiveDenial {
-            kind: DenialKind::PolicyConflict,
-            request_kind: kind,
-            chain: vec![DenialStep {
-                layer: None,
-                detail: error.to_string(),
-            }],
-        });
-    }
+    check_role_gate(kind, role)?;
+    authorize(stack, request, kind, project_trusted)
+}
+
+/// Authorize with both adopted gates first: trust-level admission (OQ-085)
+/// then the role contract (OQ-057), fail-closed in that order.
+///
+/// Either gate denies with [`DenialKind::PolicyConflict`] before the
+/// six-layer intersection runs; on success this is exactly [`authorize`]:
+/// neither gate ever grants. This is the single entry point for host seams
+/// ([`crate::host::PluginHost::authorize_effective`]) so callers cannot
+/// adopt the intersection while skipping a gate.
+pub fn authorize_with_trust_and_role(
+    stack: &EffectiveStack,
+    request: &AgentRequest,
+    kind: RequestKind,
+    project_trusted: bool,
+    level: TrustLevel,
+    role: AgentRole,
+) -> Result<EffectiveCapability, EffectiveDenial> {
+    check_trust_gate(request, kind, level)?;
+    check_role_gate(kind, role)?;
     authorize(stack, request, kind, project_trusted)
 }
 
@@ -1434,6 +1475,64 @@ mod tests {
             AgentRole::Commander,
         )
         .expect("commanders act at every point their grants allow");
+        assert_eq!(
+            effective.caps,
+            [cap("fs.read:~/docs/*.md")].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn combined_gates_deny_either_gate_before_intersection() {
+        // The host seam entry point: trust denies first, then role, and an
+        // admitted pair authorizes exactly like `authorize`.
+        let stack = EffectiveStack {
+            host: scope_with("host", &["fs.read:~/docs/*.md"]),
+            user: scope_with("user", &["fs.read:~/docs/*.md"]),
+            project: None,
+            parent: scope_with("parent", &["fs.read:~/docs/*.md"]),
+            task: scope_with("task", &["fs.read:~/docs/*.md"]),
+        };
+        let request = AgentRequest {
+            scope: scope_with("req", &["fs.read:~/docs/*.md"]),
+            raw_wide: Vec::new(),
+        };
+        let trust_denial = authorize_with_trust_and_role(
+            &stack,
+            &request,
+            RequestKind::FsRead,
+            true,
+            TrustLevel::ExternalTool,
+            AgentRole::Commander,
+        )
+        .expect_err("external tools admit no filesystem domain");
+        assert_eq!(trust_denial.kind, DenialKind::PolicyConflict);
+        assert!(
+            trust_denial
+                .reason_chain()
+                .join("\n")
+                .contains("external-tool"),
+            "{}",
+            trust_denial.reason_chain().join("\n")
+        );
+        let role_denial = authorize_with_trust_and_role(
+            &stack,
+            &request,
+            RequestKind::FsRead,
+            true,
+            TrustLevel::Core,
+            AgentRole::Reviewer,
+        )
+        .expect_err("reviewers invoke no tools");
+        assert_eq!(role_denial.kind, DenialKind::PolicyConflict);
+        let effective = authorize_with_trust_and_role(
+            &stack,
+            &request,
+            RequestKind::FsRead,
+            true,
+            TrustLevel::Core,
+            AgentRole::Commander,
+        )
+        .expect("admitted pair authorizes");
         assert_eq!(
             effective.caps,
             [cap("fs.read:~/docs/*.md")].into_iter().collect()

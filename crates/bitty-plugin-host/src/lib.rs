@@ -176,8 +176,9 @@ pub use effective::{
     MAX_AUDIT_ENTRIES, MAX_DENIAL_ITEMS, MAX_POLICY_FILE_BYTES, MAX_POLICY_FILE_LINES,
     MAX_POLICY_LINE_BYTES, MAX_RAW_DECLARATION_BYTES, MAX_RAW_DECLARATIONS, MAX_SCOPE_CAPS,
     PROJECT_POLICY_DIR_NAME, PROJECT_POLICY_FILE_NAME, PolicyProvenance, RequestKind,
-    USER_POLICY_FILE_NAME, authorize, authorize_with_role, authorize_with_trust, delegate,
-    enforcement_class_for, parse_policy, project_policy_path, user_policy_path_with_env,
+    USER_POLICY_FILE_NAME, authorize, authorize_with_role, authorize_with_trust,
+    authorize_with_trust_and_role, delegate, enforcement_class_for, parse_policy,
+    project_policy_path, user_policy_path_with_env,
 };
 pub use error::{ErrorClass, PluginError};
 pub use event::{

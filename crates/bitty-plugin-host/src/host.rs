@@ -615,12 +615,17 @@ impl PluginHost {
 
     // ── effective-capability authorization (research 045 §8 §12 §13) ────
 
-    /// Authorize a privileged request through the six-layer intersection.
+    /// Authorize a privileged request through the adopted gates plus the
+    /// six-layer intersection.
     ///
     /// `stack` carries host/user/project/parent/task voices; `request` is the
-    /// agent/plugin/Lua voice. Wide declarations fail closed as self-grant,
-    /// excess over the intersection denies with a reason chain, and success
-    /// returns exactly what may be exercised. Outcomes are appended to the
+    /// agent/plugin/Lua voice. The adopted trust-level admission gate
+    /// (`level`, OQ-085) and role contract gate (`role`, OQ-057) run first
+    /// and fail closed with [`crate::effective::DenialKind::PolicyConflict`];
+    /// only a request both gates admit reaches the grant intersection.
+    /// Wide declarations fail closed as self-grant, excess over the
+    /// intersection denies with a reason chain, and success returns exactly
+    /// what may be exercised. Outcomes are appended to the
     /// host [`crate::effective::AuditLedger`] (drop-oldest when full). The
     /// pre-existing [`PluginHost::activate`] grant gate is unchanged: this is
     /// an additional seam for privileged requests, never a bypass.
@@ -630,6 +635,8 @@ impl PluginHost {
         request: &crate::effective::AgentRequest,
         kind: crate::effective::RequestKind,
         project_trusted: bool,
+        level: crate::trust_levels::TrustLevel,
+        role: crate::roles::AgentRole,
     ) -> Result<crate::effective::EffectiveCapability, crate::effective::EffectiveDenial> {
         let requested: Vec<String> = request
             .scope
@@ -637,7 +644,14 @@ impl PluginHost {
             .iter()
             .map(|cap| cap.as_str().to_string())
             .collect();
-        match crate::effective::authorize(stack, request, kind, project_trusted) {
+        match crate::effective::authorize_with_trust_and_role(
+            stack,
+            request,
+            kind,
+            project_trusted,
+            level,
+            role,
+        ) {
             Ok(effective) => {
                 let granted: Vec<String> = effective
                     .caps
@@ -766,6 +780,8 @@ impl PluginHost {
         stack: &crate::effective::EffectiveStack,
         request: &crate::effective::AgentRequest,
         project_trusted: bool,
+        level: crate::trust_levels::TrustLevel,
+        role: crate::roles::AgentRole,
         scope_patterns: &[String],
         path: &str,
         is_write: bool,
@@ -777,7 +793,9 @@ impl PluginHost {
         } else {
             crate::effective::RequestKind::FsRead
         };
-        if let Err(denial) = self.authorize_effective(stack, request, kind, project_trusted) {
+        if let Err(denial) =
+            self.authorize_effective(stack, request, kind, project_trusted, level, role)
+        {
             // Capability denial before the FS layers are contacted: record
             // a scope-denial marker in the FS ledger (path only) so every
             // FS decision audits exactly once per ledger.
@@ -877,11 +895,14 @@ impl PluginHost {
     ///   [`crate::secrets::SecretError::ConsentRequired`] (as `PluginError`)
     ///   when a handle is unknown or lacks active per-handle consent.
     /// - [`crate::secrets::SecretError`] for malformed/over-bound bindings.
+    #[allow(clippy::too_many_arguments)]
     pub fn resolve_secret_for_spawn(
         &mut self,
         stack: &crate::effective::EffectiveStack,
         request: &crate::effective::AgentRequest,
         project_trusted: bool,
+        level: crate::trust_levels::TrustLevel,
+        role: crate::roles::AgentRole,
         bindings: &[(String, crate::secrets::SecretHandle)],
         now_ms: u64,
     ) -> Result<Vec<(String, String)>, PluginError> {
@@ -890,6 +911,8 @@ impl PluginHost {
             request,
             crate::effective::RequestKind::ExecutionRun,
             project_trusted,
+            level,
+            role,
         ) {
             // Authorization denied before the store is contacted: resolve in
             // unauthorized mode so failures stay typed but leave no
@@ -922,11 +945,14 @@ impl PluginHost {
     ///
     /// [`PluginError::Grant`] when the tier gate denies; otherwise the same
     /// errors as [`Self::resolve_secret_for_spawn`].
+    #[allow(clippy::too_many_arguments)]
     pub fn resolve_secret_with_tier(
         &mut self,
         stack: &crate::effective::EffectiveStack,
         request: &crate::effective::AgentRequest,
         project_trusted: bool,
+        level: crate::trust_levels::TrustLevel,
+        role: crate::roles::AgentRole,
         bindings: &[(String, crate::secrets::SecretHandle)],
         now_ms: u64,
         access: crate::secret_tiers::TierAccess,
@@ -939,7 +965,15 @@ impl PluginHost {
             self.secrets.audit_tier_deny(access.tier, &names);
             return Err(error);
         }
-        self.resolve_secret_for_spawn(stack, request, project_trusted, bindings, now_ms)
+        self.resolve_secret_for_spawn(
+            stack,
+            request,
+            project_trusted,
+            level,
+            role,
+            bindings,
+            now_ms,
+        )
     }
 
     /// Agent-visible sanitized view over explicit env entries.
@@ -1685,6 +1719,8 @@ mod effective_tests {
     use crate::effective::{
         AgentRequest, CapabilityScope, DenialKind, EffectiveStack, RequestKind,
     };
+    use crate::roles::AgentRole;
+    use crate::trust_levels::TrustLevel;
 
     fn scope_with(source: &str, caps: &[&str]) -> CapabilityScope {
         let mut scope = CapabilityScope::unconstrained(source);
@@ -1708,17 +1744,108 @@ mod effective_tests {
             scope: scope_with("req", &["terminal.semantic-read"]),
             raw_wide: Vec::new(),
         };
-        host.authorize_effective(&stack, &request, RequestKind::PluginLifecycle, true)
-            .unwrap();
+        host.authorize_effective(
+            &stack,
+            &request,
+            RequestKind::PluginLifecycle,
+            true,
+            TrustLevel::Core,
+            AgentRole::Commander,
+        )
+        .unwrap();
         let wide = AgentRequest {
             scope: CapabilityScope::unconstrained("lua"),
             raw_wide: vec!["filesystem=all".to_string()],
         };
         let denial = host
-            .authorize_effective(&stack, &wide, RequestKind::AgentSpawn, true)
+            .authorize_effective(
+                &stack,
+                &wide,
+                RequestKind::AgentSpawn,
+                true,
+                TrustLevel::Core,
+                AgentRole::Commander,
+            )
             .unwrap_err();
         assert_eq!(denial.kind, DenialKind::SelfGrant);
         assert_eq!(host.audit().len(), 2);
+    }
+
+    #[test]
+    fn host_authorize_effective_denies_distrusted_level() {
+        // #1314: every layer grants `fs.read`, so bare `authorize` would
+        // allow — but the external-tool level admits no filesystem domain,
+        // so the host seam must deny fail-closed and audit the denial.
+        let mut host = PluginHost::new(DropPolicy::DropOldest, 8);
+        let stack = EffectiveStack {
+            host: scope_with("host", &["fs.read:~/docs/*.md"]),
+            user: scope_with("user", &["fs.read:~/docs/*.md"]),
+            project: None,
+            parent: scope_with("parent", &["fs.read:~/docs/*.md"]),
+            task: scope_with("task", &["fs.read:~/docs/*.md"]),
+        };
+        let request = AgentRequest {
+            scope: scope_with("req", &["fs.read:~/docs/*.md"]),
+            raw_wide: Vec::new(),
+        };
+        let denial = host
+            .authorize_effective(
+                &stack,
+                &request,
+                RequestKind::FsRead,
+                true,
+                TrustLevel::ExternalTool,
+                AgentRole::Commander,
+            )
+            .expect_err("external tools admit no filesystem domain");
+        assert_eq!(denial.kind, DenialKind::PolicyConflict);
+        assert_eq!(denial.request_kind, RequestKind::FsRead);
+        let chain = denial.reason_chain().join("\n");
+        assert!(chain.contains("external-tool"), "{chain}");
+        assert_eq!(host.audit().len(), 1);
+        assert_eq!(
+            host.audit().iter().last().expect("audit entry").decision,
+            crate::effective::AuditDecision::Deny
+        );
+    }
+
+    #[test]
+    fn host_authorize_effective_denies_unauthorized_role() {
+        // #1314: grants allow `fs.read` and core admits the filesystem
+        // domain, but reviewers invoke no tools — the role gate must deny
+        // fail-closed on the host path too.
+        let mut host = PluginHost::new(DropPolicy::DropOldest, 8);
+        let stack = EffectiveStack {
+            host: scope_with("host", &["fs.read:~/docs/*.md"]),
+            user: scope_with("user", &["fs.read:~/docs/*.md"]),
+            project: None,
+            parent: scope_with("parent", &["fs.read:~/docs/*.md"]),
+            task: scope_with("task", &["fs.read:~/docs/*.md"]),
+        };
+        let request = AgentRequest {
+            scope: scope_with("req", &["fs.read:~/docs/*.md"]),
+            raw_wide: Vec::new(),
+        };
+        let denial = host
+            .authorize_effective(
+                &stack,
+                &request,
+                RequestKind::FsRead,
+                true,
+                TrustLevel::Core,
+                AgentRole::Reviewer,
+            )
+            .expect_err("reviewers invoke no tools");
+        assert_eq!(denial.kind, DenialKind::PolicyConflict);
+        assert_eq!(denial.request_kind, RequestKind::FsRead);
+        let chain = denial.reason_chain().join("\n");
+        assert!(chain.contains("reviewer"), "{chain}");
+        assert!(chain.contains("tool-call"), "{chain}");
+        assert_eq!(host.audit().len(), 1);
+        assert_eq!(
+            host.audit().iter().last().expect("audit entry").decision,
+            crate::effective::AuditDecision::Deny
+        );
     }
 
     #[test]
@@ -1773,6 +1900,8 @@ mod effective_tests {
                 &stack,
                 &request,
                 true,
+                TrustLevel::Core,
+                AgentRole::Commander,
                 &patterns,
                 "~/projects/notes.md",
                 false,
@@ -1787,6 +1916,8 @@ mod effective_tests {
                 &stack,
                 &request,
                 true,
+                TrustLevel::Core,
+                AgentRole::Commander,
                 &patterns,
                 "~/projects/.env",
                 false,
@@ -1805,6 +1936,8 @@ mod effective_tests {
                 &stack,
                 &request,
                 true,
+                TrustLevel::Core,
+                AgentRole::Commander,
                 &patterns,
                 "~/projects/.env",
                 false,
@@ -1821,6 +1954,8 @@ mod effective_tests {
                 &stack,
                 &request,
                 true,
+                TrustLevel::Core,
+                AgentRole::Commander,
                 &patterns,
                 "~/projects/secret.txt",
                 false,
@@ -1845,6 +1980,8 @@ mod effective_tests {
                 &stack,
                 &bad,
                 true,
+                TrustLevel::Core,
+                AgentRole::Commander,
                 &patterns,
                 "~/projects/a.md",
                 false,
@@ -1880,6 +2017,8 @@ mod effective_tests {
                 &stack,
                 &request,
                 true,
+                TrustLevel::Core,
+                AgentRole::Commander,
                 &hostile,
                 "~/projects/notes.md",
                 false,
@@ -1927,8 +2066,19 @@ mod effective_tests {
                 "/etc/passwd",
             ] {
                 assert!(
-                    host.authorize_fs(&stack, request, true, &patterns, path, false, None, 0)
-                        .is_err(),
+                    host.authorize_fs(
+                        &stack,
+                        request,
+                        true,
+                        TrustLevel::Core,
+                        AgentRole::Commander,
+                        &patterns,
+                        path,
+                        false,
+                        None,
+                        0
+                    )
+                    .is_err(),
                     "surface request for {path:?} must not bypass"
                 );
             }
@@ -1940,6 +2090,8 @@ mod effective_tests {
                     &stack,
                     request,
                     true,
+                    TrustLevel::Core,
+                    AgentRole::Commander,
                     &patterns,
                     "~\\PROJECTS\\.env",
                     false,
@@ -1956,7 +2108,9 @@ mod effective_tests {
 mod secrets_tests {
     use super::*;
     use crate::effective::{AgentRequest, CapabilityScope, EffectiveStack};
+    use crate::roles::AgentRole;
     use crate::secrets::{SecretError, SecretHandle};
+    use crate::trust_levels::TrustLevel;
 
     const SEED: &str = "ghp_seededSecretFixtureAAAA1111";
 
@@ -2007,6 +2161,8 @@ mod secrets_tests {
                 &EffectiveStack::unconstrained(),
                 &denied_request(),
                 true,
+                TrustLevel::Core,
+                AgentRole::Commander,
                 &bindings,
                 10,
             )
@@ -2018,7 +2174,15 @@ mod secrets_tests {
         let allowed_before = host.secrets().audit().len();
         let (stack, request) = authorized_stack();
         let resolved = host
-            .resolve_secret_for_spawn(&stack, &request, true, &bindings, 10)
+            .resolve_secret_for_spawn(
+                &stack,
+                &request,
+                true,
+                TrustLevel::Core,
+                AgentRole::Commander,
+                &bindings,
+                10,
+            )
             .unwrap();
         assert_eq!(
             resolved,
@@ -2055,14 +2219,32 @@ mod secrets_tests {
         // contacted, with a typed grant error and a names-only audit entry.
         let audit_before = host.secrets().audit().len();
         let denied = host
-            .resolve_secret_with_tier(&stack, &request, true, &bindings, 10, denied_access)
+            .resolve_secret_with_tier(
+                &stack,
+                &request,
+                true,
+                TrustLevel::Core,
+                AgentRole::Commander,
+                &bindings,
+                10,
+                denied_access,
+            )
             .expect_err("tier without consent must deny");
         assert!(denied.to_string().contains("explicit consent"));
         assert!(!denied.to_string().contains(SEED));
         assert_eq!(host.secrets().audit().len(), audit_before + 1);
         // With tier consent the same bindings resolve through the store path.
         let resolved = host
-            .resolve_secret_with_tier(&stack, &request, true, &bindings, 10, allowed_access)
+            .resolve_secret_with_tier(
+                &stack,
+                &request,
+                true,
+                TrustLevel::Core,
+                AgentRole::Commander,
+                &bindings,
+                10,
+                allowed_access,
+            )
             .expect("tier with consent resolves");
         assert_eq!(
             resolved,
@@ -2070,7 +2252,16 @@ mod secrets_tests {
         );
         // Host-env tier needs no tier consent beyond the store path.
         let resolved = host
-            .resolve_secret_with_tier(&stack, &request, true, &bindings, 10, host_env_access)
+            .resolve_secret_with_tier(
+                &stack,
+                &request,
+                true,
+                TrustLevel::Core,
+                AgentRole::Commander,
+                &bindings,
+                10,
+                host_env_access,
+            )
             .expect("host-env tier passes the gate");
         assert_eq!(
             resolved,
@@ -2088,7 +2279,15 @@ mod secrets_tests {
             SecretHandle::parse("secret://nope").unwrap(),
         )];
         let err = host
-            .resolve_secret_for_spawn(&stack, &request, true, &missing, 10)
+            .resolve_secret_for_spawn(
+                &stack,
+                &request,
+                true,
+                TrustLevel::Core,
+                AgentRole::Commander,
+                &missing,
+                10,
+            )
             .unwrap_err();
         assert!(err.to_string().contains("missing secret handle 'nope'"));
         assert!(!err.to_string().contains(SEED));
@@ -2099,7 +2298,15 @@ mod secrets_tests {
             SecretHandle::parse("secret://github").unwrap(),
         )];
         let err = host
-            .resolve_secret_for_spawn(&stack, &request, true, &bindings, 10)
+            .resolve_secret_for_spawn(
+                &stack,
+                &request,
+                true,
+                TrustLevel::Core,
+                AgentRole::Commander,
+                &bindings,
+                10,
+            )
             .unwrap_err();
         assert!(err.to_string().contains("consent required"));
         assert!(!err.to_string().contains(SEED));
@@ -2116,6 +2323,8 @@ mod secrets_tests {
                 &stack,
                 &request,
                 true,
+                TrustLevel::Core,
+                AgentRole::Commander,
                 &[(
                     "GITHUB_TOKEN".to_string(),
                     SecretHandle::parse("secret://github").unwrap(),

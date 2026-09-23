@@ -1,6 +1,6 @@
 [package]
-name = "bitty-net"
-description = "Bitty network dependency seam — capability, error, and offline-first policy types (no sockets yet)"
+name = "bitty-network-api"
+description = "Bitty stable network vocabulary — requests, capability, errors, and service trait (no implementation, no dependencies)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

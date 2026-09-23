@@ -1,0 +1,27 @@
+[package]
+name = "bitty-network"
+description = "Bitty network implementation shell — module skeleton only, sockets arrive in a follow-up"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/bitty-terminal/bitty"
+keywords = ["network", "bitty"]
+categories = ["network-programming"]
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+bitty-network-api = { path = "../bitty-network-api" }
+
+[features]
+default = []
+client = []
+server = []
+http = []
+websocket = []
+quic = []
+proxy = []
+oauth = []

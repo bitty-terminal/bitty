@@ -235,7 +235,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "bitty-net"
+name = "bitty-network"
+version = "0.0.20"
+dependencies = [
+ "bitty-network-api",
+]
+
+[[package]]
+name = "bitty-network-api"
 version = "0.0.20"
 
 [[package]]

@@ -423,10 +423,7 @@ fn xtwinops_reports_cell_exact_text_area() {
     assert!(cols > 0 && rows > 0, "non-degenerate grid, got {replies:?}");
     assert_eq!(
         (width, height),
-        (
-            cols * cfg.cell_width,
-            rows * cfg.cell_height
-        ),
+        (cols * cfg.cell_width, rows * cfg.cell_height),
         "pixels must be exact cell multiples, got {replies:?}"
     );
 }

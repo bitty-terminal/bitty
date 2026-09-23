@@ -63,8 +63,38 @@ fn release_ctrl(rt: &mut Runtime) {
     rt.handle_key_event(named_key(NamedKey::Control, PressState::Released));
 }
 
+fn numpad_char_key(logical: &str, text: Option<&str>) -> KeyEvent {
+    KeyEvent {
+        logical_key: LogicalKey::Character(logical.to_string()),
+        text: text.map(|s| s.to_string()),
+        location: KeyLocation::Numpad,
+        state: PressState::Pressed,
+        repeat: false,
+        is_synthetic: false,
+    }
+}
+
+fn numpad_named_key(named: NamedKey) -> KeyEvent {
+    KeyEvent {
+        logical_key: LogicalKey::Named(named),
+        text: None,
+        location: KeyLocation::Numpad,
+        state: PressState::Pressed,
+        repeat: false,
+        is_synthetic: false,
+    }
+}
+
+fn press_super(rt: &mut Runtime) {
+    rt.handle_key_event(named_key(NamedKey::Super, PressState::Pressed));
+}
+
 fn press_shift(rt: &mut Runtime) {
     rt.handle_key_event(named_key(NamedKey::Shift, PressState::Pressed));
+}
+
+fn release_super(rt: &mut Runtime) {
+    rt.handle_key_event(named_key(NamedKey::Super, PressState::Released));
 }
 
 // ----------------------------------------------------------------------
@@ -454,6 +484,199 @@ fn enter_tab_backspace_keep_legacy_bytes_under_disambiguate() {
         rt.handle_key_event_ref(&named_key(NamedKey::Backspace, PressState::Pressed)),
         Some(b"\x7f".to_vec())
     );
+}
+
+// ----------------------------------------------------------------------
+// CTX-0755 (Issue #1362): super/hyper/meta modifiers, keypad codes,
+// media/volume keys — the declared CSI-u coverage delta.
+// ----------------------------------------------------------------------
+
+#[test]
+fn super_modifier_encodes_bit_8_under_disambiguate() {
+    let mut rt = make_runtime();
+    send(&mut rt, b"\x1b[=1u");
+    press_super(&mut rt);
+    assert_eq!(
+        rt.handle_key_event_ref(&char_key("a", None, PressState::Pressed, false)),
+        Some(b"\x1b[97;9u".to_vec()),
+        "Super+A under disambiguate is CSI 97;9u (super bit 8 -> 9)"
+    );
+    assert_eq!(
+        rt.handle_key_event_ref(&named_key(NamedKey::Space, PressState::Pressed)),
+        Some(b"\x1b[32;9u".to_vec()),
+        "Super+Space under disambiguate is CSI 32;9u"
+    );
+    release_super(&mut rt);
+    assert_eq!(
+        rt.handle_key_event_ref(&char_key("a", None, PressState::Pressed, false)),
+        Some(b"a".to_vec()),
+        "releasing Super returns to the text path"
+    );
+}
+
+#[test]
+fn hyper_and_meta_modifiers_encode_bits_16_and_32() {
+    let mut rt = make_runtime();
+    send(&mut rt, b"\x1b[=1u");
+    rt.handle_key_event(named_key(NamedKey::Hyper, PressState::Pressed));
+    assert_eq!(
+        rt.handle_key_event_ref(&char_key("a", None, PressState::Pressed, false)),
+        Some(b"\x1b[97;17u".to_vec()),
+        "Hyper+A under disambiguate is CSI 97;17u (hyper bit 16 -> 17)"
+    );
+    rt.handle_key_event(named_key(NamedKey::Hyper, PressState::Released));
+    rt.handle_key_event(named_key(NamedKey::Meta, PressState::Pressed));
+    assert_eq!(
+        rt.handle_key_event_ref(&char_key("a", None, PressState::Pressed, false)),
+        Some(b"\x1b[97;33u".to_vec()),
+        "Meta+A under disambiguate is CSI 97;33u (meta bit 32 -> 33)"
+    );
+    rt.handle_key_event(named_key(NamedKey::Meta, PressState::Released));
+}
+
+#[test]
+fn report_all_keys_reports_super_hyper_meta_presses() {
+    let mut rt = make_runtime();
+    send(&mut rt, b"\x1b[=8u");
+    assert_eq!(
+        rt.handle_key_event_ref(&named_key(NamedKey::Super, PressState::Pressed)),
+        Some(b"\x1b[57444;9u".to_vec())
+    );
+    rt.handle_key_event(named_key(NamedKey::Super, PressState::Released));
+    assert_eq!(
+        rt.handle_key_event_ref(&named_key(NamedKey::Hyper, PressState::Pressed)),
+        Some(b"\x1b[57445;17u".to_vec())
+    );
+    rt.handle_key_event(named_key(NamedKey::Hyper, PressState::Released));
+    assert_eq!(
+        rt.handle_key_event_ref(&named_key(NamedKey::Meta, PressState::Pressed)),
+        Some(b"\x1b[57446;33u".to_vec())
+    );
+    rt.handle_key_event(named_key(NamedKey::Meta, PressState::Released));
+}
+
+#[test]
+fn numpad_digits_encode_kp_codes_under_disambiguate() {
+    let mut rt = make_runtime();
+    send(&mut rt, b"\x1b[=1u");
+    assert_eq!(
+        rt.handle_key_event_ref(&numpad_char_key("1", Some("1"))),
+        Some(b"\x1b[57400u".to_vec()),
+        "numpad 1 under disambiguate is KP_1"
+    );
+    assert_eq!(
+        rt.handle_key_event_ref(&numpad_char_key(".", Some("."))),
+        Some(b"\x1b[57409u".to_vec()),
+        "numpad decimal under disambiguate is KP_DECIMAL"
+    );
+    // The standard-located twin keeps the text path.
+    assert_eq!(
+        rt.handle_key_event_ref(&char_key("1", Some("1"), PressState::Pressed, false)),
+        Some(b"1".to_vec())
+    );
+}
+
+#[test]
+fn numpad_keys_keep_legacy_bytes_without_enhancement() {
+    let mut rt = make_runtime();
+    assert_eq!(
+        rt.handle_key_event_ref(&numpad_char_key("1", Some("1"))),
+        Some(b"1".to_vec())
+    );
+    assert_eq!(
+        rt.handle_key_event_ref(&numpad_named_key(NamedKey::Enter)),
+        Some(b"\r".to_vec())
+    );
+    assert_eq!(
+        rt.handle_key_event_ref(&numpad_named_key(NamedKey::ArrowUp)),
+        Some(b"\x1b[A".to_vec())
+    );
+}
+
+#[test]
+fn numpad_named_keys_encode_kp_codes_under_disambiguate() {
+    let mut rt = make_runtime();
+    send(&mut rt, b"\x1b[=1u");
+    // Numpad Enter is NOT covered by the bare-Enter legacy exception: the
+    // exception types `reset` on the main key, while keypad keys must stay
+    // distinguishable.
+    assert_eq!(
+        rt.handle_key_event_ref(&numpad_named_key(NamedKey::Enter)),
+        Some(b"\x1b[57414u".to_vec())
+    );
+    assert_eq!(
+        rt.handle_key_event_ref(&numpad_named_key(NamedKey::ArrowUp)),
+        Some(b"\x1b[57419u".to_vec())
+    );
+    assert_eq!(
+        rt.handle_key_event_ref(&numpad_named_key(NamedKey::Home)),
+        Some(b"\x1b[57423u".to_vec())
+    );
+    // The standard-located twins keep their legacy/disambiguated forms.
+    assert_eq!(
+        rt.handle_key_event_ref(&named_key(NamedKey::Enter, PressState::Pressed)),
+        Some(b"\r".to_vec())
+    );
+    assert_eq!(
+        rt.handle_key_event_ref(&named_key(NamedKey::ArrowUp, PressState::Pressed)),
+        Some(b"\x1b[A".to_vec())
+    );
+}
+
+#[test]
+fn media_and_volume_keys_encode_under_report_all() {
+    let mut rt = make_runtime();
+    send(&mut rt, b"\x1b[=8u");
+    assert_eq!(
+        rt.handle_key_event_ref(&named_key(NamedKey::MediaPlay, PressState::Pressed)),
+        Some(b"\x1b[57428u".to_vec())
+    );
+    assert_eq!(
+        rt.handle_key_event_ref(&named_key(NamedKey::MediaTrackNext, PressState::Pressed)),
+        Some(b"\x1b[57435u".to_vec())
+    );
+    assert_eq!(
+        rt.handle_key_event_ref(&named_key(NamedKey::AudioVolumeMute, PressState::Pressed)),
+        Some(b"\x1b[57440u".to_vec())
+    );
+    // The legacy path has no encoding for these keys: nothing is emitted.
+    let mut legacy = make_runtime();
+    assert_eq!(
+        legacy.handle_key_event_ref(&named_key(NamedKey::MediaPlay, PressState::Pressed)),
+        None
+    );
+}
+
+#[test]
+fn default_off_ignores_numpad_location_and_extra_modifiers() {
+    // Extension of the differential proof: numpad location and the
+    // super/hyper/meta latches change nothing while flags are 0.
+    let mut rt = make_runtime();
+    press_super(&mut rt);
+    let events = [
+        numpad_char_key("1", Some("1")),
+        numpad_named_key(NamedKey::Enter),
+        numpad_named_key(NamedKey::ArrowUp),
+        char_key("a", Some("a"), PressState::Pressed, false),
+        named_key(NamedKey::MediaPlay, PressState::Pressed),
+    ];
+    for event in &events {
+        let enhanced = rt.handle_key_event_ref(event);
+        let legacy = bitty_platform::keyboard::encode_key_event_with_modifiers(
+            event,
+            &bitty_platform::ModifiersState {
+                shift: false,
+                control: false,
+                alt: false,
+                super_pressed: false,
+            },
+        );
+        assert_eq!(
+            enhanced, legacy,
+            "flags 0 must match the legacy encoder for {event:?}"
+        );
+    }
+    release_super(&mut rt);
 }
 
 #[test]

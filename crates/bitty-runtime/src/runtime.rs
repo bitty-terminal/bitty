@@ -766,6 +766,13 @@ pub struct Runtime {
     shift_pressed: bool,
     control_pressed: bool,
     alt_pressed: bool,
+    /// Super/Hyper/Meta latches for the Kitty `CSI u` modifier bits 8/16/32
+    /// (CTX-0755). Tracked from named key press/release like the other
+    /// modifiers; the legacy xterm encoder ignores them (no legacy encoding
+    /// exists), so the default-off differential proof is unaffected.
+    super_pressed: bool,
+    hyper_pressed: bool,
+    meta_pressed: bool,
     // Focus/mouse capture tracking per lifecycle RFC
     focused: bool,
     mouse_capture_enabled: bool,
@@ -1253,6 +1260,9 @@ impl Runtime {
             shift_pressed: false,
             control_pressed: false,
             alt_pressed: false,
+            super_pressed: false,
+            hyper_pressed: false,
+            meta_pressed: false,
             focused: true,
             mouse_capture_enabled: false,
             ime_preedit: None,
@@ -1452,6 +1462,9 @@ impl Runtime {
             shift_pressed: false,
             control_pressed: false,
             alt_pressed: false,
+            super_pressed: false,
+            hyper_pressed: false,
+            meta_pressed: false,
             focused: true,
             mouse_capture_enabled: false,
             ime_preedit: None,
@@ -1575,6 +1588,33 @@ impl Runtime {
     #[must_use]
     pub fn alt_pressed(&self) -> bool {
         self.alt_pressed
+    }
+
+    /// Whether Super is currently latched (CTX-0755 read-only accessor).
+    ///
+    /// Feeds the Kitty `CSI u` super modifier bit (8); the legacy encoder
+    /// ignores it.
+    #[must_use]
+    pub fn super_pressed(&self) -> bool {
+        self.super_pressed
+    }
+
+    /// Whether Hyper is currently latched (CTX-0755 read-only accessor).
+    ///
+    /// Feeds the Kitty `CSI u` hyper modifier bit (16); the legacy encoder
+    /// ignores it.
+    #[must_use]
+    pub fn hyper_pressed(&self) -> bool {
+        self.hyper_pressed
+    }
+
+    /// Whether Meta is currently latched (CTX-0755 read-only accessor).
+    ///
+    /// Feeds the Kitty `CSI u` meta modifier bit (32); the legacy encoder
+    /// ignores it.
+    #[must_use]
+    pub fn meta_pressed(&self) -> bool {
+        self.meta_pressed
     }
 
     /// Whether the window currently holds keyboard focus (CTX-0159).

@@ -192,7 +192,9 @@ pub enum CommandState {
 /// for traceability.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CommandBlock {
-    /// Stable id (anchor ordinal); survives resize/reflow/scroll.
+    /// Candidate stable id (anchor ordinal); resize/reflow/scroll
+    /// survival is the design goal, not a verified guarantee — row
+    /// anchoring stays future work under OQ-050 (OQ-S1/S2).
     pub id: CommandId,
     /// Ordinal span from the first to the last marker of this command.
     pub command_range: SemanticRange,

@@ -61,7 +61,9 @@ fn report_statuses_declare_consistent_methods() {
     }
     assert!(row_count(Status::Ci) > 0, "need ci rows");
     assert!(row_count(Status::Local) > 0, "need local rows");
-    assert!(row_count(Status::Partial) > 0, "need partial rows");
+    // No `Partial` assertion: CTX-0757 closed the only partial row (OSC
+    // 5522, now a `ci` non-goal lock), so zero partial rows is the
+    // expected steady state until a new partial row is declared.
     assert!(row_count(Status::Gap) > 0, "need gap rows");
 }
 

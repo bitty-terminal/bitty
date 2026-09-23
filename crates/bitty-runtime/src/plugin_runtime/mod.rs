@@ -1421,10 +1421,10 @@ fn verify_module_tree(id: &PluginId, root: &Path) -> Result<(), PluginRuntimeErr
 /// Extract `bitty.env` keys from the activation grant snapshot (CTX-0330).
 ///
 /// Only `env.read:<KEY>` grants contribute, and only with a well-shaped key
-/// (`[A-Za-z_][A-Za-z0-9_]*`, `1..128` bytes): a recorded grant with a
-/// malformed key fails closed as store integrity before any VM exists, like
-/// any other undeclared grant. The set is capped at
-/// [`services::MAX_ENV_GRANTS`].
+/// (`[A-Za-z_][A-Za-z0-9_]*`, `1..=ENV_KEY_MAX_BYTES` bytes, shared rule in
+/// [`bitty_lua::env_key_shape_ok`]): a recorded grant with a malformed key
+/// fails closed as store integrity before any VM exists, like any other
+/// undeclared grant. The set is capped at [`services::MAX_ENV_GRANTS`].
 fn env_grant_keys(
     id: &PluginId,
     granted: &BTreeSet<CapabilityId>,
@@ -1434,15 +1434,7 @@ fn env_grant_keys(
         let Some(key) = capability.as_str().strip_prefix("env.read:") else {
             continue;
         };
-        let mut bytes = key.bytes();
-        let first_ok = bytes
-            .next()
-            .is_some_and(|first| first.is_ascii_alphabetic() || first == b'_');
-        let shape_ok = first_ok
-            && !key.is_empty()
-            && key.len() <= bitty_lua::ENV_KEY_MAX_BYTES
-            && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
-        if !shape_ok {
+        if !bitty_lua::env_key_shape_ok(key) {
             return Err(PluginRuntimeError::Integrity {
                 plugin: id.to_string(),
                 detail: format!("recorded env grant for '{key}' is not a valid env key"),

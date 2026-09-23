@@ -1500,6 +1500,14 @@ pub fn resolve_leader(
     user_timeout_ms: Option<u64>,
     platform: LeaderPlatform,
 ) -> Result<ResolvedLeader, ConfigError> {
+    // Fail-closed on an emptied Windows fallback set (CTX-0727, #1315):
+    // `primary_canonical` is "never empty by construction" only while this
+    // const stays non-empty, so a future edit that empties it must error
+    // here rather than silently resolve a chordless Leader.
+    debug_assert!(
+        !LEADER_WINDOWS_FALLBACK_CHORDS_RAW.is_empty(),
+        "internal Windows leader fallback must not be empty"
+    );
     let mut chords: Vec<Chord> = match user_chord {
         Some(chord) => vec![chord],
         None => match platform {
@@ -1512,6 +1520,11 @@ pub fn resolve_leader(
     };
     chords.sort_by_key(|c| c.canonical());
     chords.dedup();
+    if chords.is_empty() {
+        return Err(ConfigError::InvalidInput {
+            message: "internal Windows leader fallback is empty".to_string(),
+        });
+    }
     let timeout_ms = match user_timeout_ms {
         Some(ms) => {
             validate_leader_timeout_ms(ms)?;
@@ -3316,6 +3329,28 @@ mod tests {
                 "fallback set member {raw} resolves"
             );
         }
+    }
+
+    #[test]
+    fn leader_windows_fallback_set_cannot_silently_empty() {
+        // CTX-0727 (#1315): `primary_canonical` is "never empty by
+        // construction" only while the fallback const stays non-empty; pin
+        // the invariant so a future edit that empties it fails here, and
+        // resolution stays fail-closed with a non-empty primary.
+        assert!(
+            !LEADER_WINDOWS_FALLBACK_CHORDS_RAW.is_empty(),
+            "Windows leader fallback must hold at least one chord"
+        );
+        let leader =
+            resolve_leader(None, None, LeaderPlatform::Windows).expect("fallback resolves");
+        assert!(
+            !leader.chords.is_empty(),
+            "resolved Windows leader must arm at least one chord"
+        );
+        assert!(
+            !leader.primary_canonical().is_empty(),
+            "resolved primary canonical must not be empty"
+        );
     }
 
     #[test]

@@ -235,6 +235,35 @@ fn ctx0721_routable_routing_fails_closed_for_unknown_recipient() {
 }
 
 #[test]
+fn ctx0727_routable_routing_fails_closed_for_unknown_sender() {
+    // CTX-0727 (#1315): `route_message` checks sender registration first;
+    // the recipient case was covered, the sender case was not. An envelope
+    // from an unregistered sender fails closed with `UnknownSender` and
+    // leaves the ledger unchanged, even when the recipient is registered.
+    let mut host = routable_host();
+    let stray = AgentMessage::new(
+        10,
+        "example.ghost",
+        "example.worker",
+        None,
+        None,
+        MessageKind::Observation,
+        BoundedPayload::try_new("stray").unwrap(),
+        0,
+        0,
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        host.route_message(stray, 0),
+        Err(RoutableError::UnknownSender {
+            sender: "example.ghost".to_string(),
+        })
+    );
+    assert_eq!(host.routable_len(), 0);
+}
+
+#[test]
 fn ctx0721_routable_cancel_and_expiry_are_explicit() {
     let mut host = routable_host();
     host.route_message(routable_message(2, MessageKind::StatusUpdate, 1), 0)

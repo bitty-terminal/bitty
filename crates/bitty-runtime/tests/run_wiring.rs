@@ -102,6 +102,30 @@ fn lease_issued_idle_at_create() {
 }
 
 #[test]
+fn lease_recreated_panel_starts_idle_after_dispose() {
+    // CTX-0727 (#1315): `create_panel` unconditionally resets the lease
+    // binding, and `dispose_panel` clears it — a panel created after a
+    // dispose (id reuse or not) always starts `Idle`, never inheriting a
+    // previous occupant's lease.
+    let mut host = host();
+    let (id, generation) = create_terminal(&mut host);
+    host.acquire_panel_lease(id, generation, HOLDER_A)
+        .expect("acquire");
+    host.dispose_panel(id, generation).expect("dispose");
+    let (id2, generation2) = create_terminal(&mut host);
+    assert_eq!(
+        host.panel_lease_state(id2, generation2),
+        Ok(LeaseState::Idle),
+        "recreated panel must start idle"
+    );
+    // The recreated binding is live: it can be acquired fresh.
+    assert_eq!(
+        host.acquire_panel_lease(id2, generation2, HOLDER_B),
+        Ok(LeaseEvent::Acquired { holder: HOLDER_B })
+    );
+}
+
+#[test]
 fn lease_acquire_release_round_trip_through_host() {
     let mut host = host();
     let (id, generation) = create_terminal(&mut host);

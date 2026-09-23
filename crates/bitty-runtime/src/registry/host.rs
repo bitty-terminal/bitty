@@ -154,7 +154,10 @@ impl PanelRuntime {
     /// Creates a panel of `panel_type` without mounting it.
     ///
     /// Issues the panel's lease on success (RUN-21): a fresh `Idle` kernel
-    /// binding, so every live panel has exactly one lease from birth.
+    /// binding, so every live panel has exactly one lease from birth. The
+    /// binding is unconditionally reset (CTX-0727, #1315): a `PanelId` ever
+    /// reused without [`PanelRuntime::dispose_panel`] cannot inherit a
+    /// non-idle lease from a previous occupant.
     ///
     /// # Errors
     ///
@@ -167,9 +170,7 @@ impl PanelRuntime {
         workspace: Option<WorkspaceId>,
     ) -> Result<PanelHandle, PanelError> {
         let handle = self.registry.create_panel(panel_type, workspace)?;
-        self.leases
-            .entry(handle.id)
-            .or_insert_with(PanelLeaseEntry::idle);
+        self.leases.insert(handle.id, PanelLeaseEntry::idle());
         Ok(handle)
     }
 

@@ -2019,13 +2019,37 @@ fn bounded_token(token: &str) -> String {
     bounded
 }
 
+/// Pure `bitty.env` key-shape predicate shared by every validation site
+/// (CTX-0727, #1315).
+///
+/// Single source of truth for `[A-Za-z_][A-Za-z0-9_]*` within
+/// `1..=ENV_KEY_MAX_BYTES` bytes: the bridge [`validate_env_key`], the
+/// services boundary, and the `bitty-runtime` grant extractor all agree through this
+/// predicate instead of re-spelling the rule. Error-typed callers map `false`
+/// to their own fail-closed error; the `bitty-runtime` grant extractor uses
+/// it directly.
+#[must_use]
+pub fn env_key_shape_ok(key: &str) -> bool {
+    if key.is_empty() || key.len() > ENV_KEY_MAX_BYTES {
+        return false;
+    }
+    let mut bytes = key.bytes();
+    let first_ok = bytes
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == b'_');
+    first_ok && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
 /// Validate a `bitty.env` key shape (CTX-0330).
 ///
 /// Keys are `[A-Za-z_][A-Za-z0-9_]*` within `1..=ENV_KEY_MAX_BYTES` bytes.
 /// Shape failures are `E_DEF_INVALID`/`E_DEF_LIMIT` (validation class) and
 /// run before the grant gate; diagnostics quote the bounded key only, never
 /// a value.
-fn validate_env_key(key: &str) -> Result<(), BridgeError> {
+///
+/// The shape rule itself lives in [`env_key_shape_ok`]; this wrapper only
+/// attaches the typed errors.
+pub fn validate_env_key(key: &str) -> Result<(), BridgeError> {
     if key.is_empty() {
         return Err(BridgeError::new(
             "validation",
@@ -2040,19 +2064,19 @@ fn validate_env_key(key: &str) -> Result<(), BridgeError> {
             format!("env key exceeds {ENV_KEY_MAX_BYTES} bytes"),
         ));
     }
-    let mut bytes = key.bytes();
-    let first = bytes.next().unwrap_or(b'_');
-    if !(first.is_ascii_alphabetic() || first == b'_') {
-        return Err(BridgeError::new(
-            "validation",
-            "E_DEF_INVALID",
-            format!(
-                "env key '{}' must start with a letter or '_'",
-                bounded_token(key)
-            ),
-        ));
-    }
-    if !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+    if !env_key_shape_ok(key) {
+        let mut bytes = key.bytes();
+        let first = bytes.next().unwrap_or(b'_');
+        if !(first.is_ascii_alphabetic() || first == b'_') {
+            return Err(BridgeError::new(
+                "validation",
+                "E_DEF_INVALID",
+                format!(
+                    "env key '{}' must start with a letter or '_'",
+                    bounded_token(key)
+                ),
+            ));
+        }
         return Err(BridgeError::new(
             "validation",
             "E_DEF_INVALID",
@@ -2315,6 +2339,33 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let canonical = std::fs::canonicalize(&dir).expect("canonicalize temp dir");
         TempDir(canonical)
+    }
+
+    #[test]
+    fn env_key_validator_and_shape_predicate_agree() {
+        // CTX-0727 (#1315): the shared rule lives in `env_key_shape_ok`;
+        // `validate_env_key` only attaches typed errors. Pin agreement so
+        // the sites cannot drift.
+        let long = "A".repeat(ENV_KEY_MAX_BYTES + 1);
+        let cases: &[(&str, bool, Option<&str>)] = &[
+            ("HOME", true, None),
+            ("_x1", true, None),
+            ("", false, Some("E_DEF_INVALID")),
+            ("9LIVES", false, Some("E_DEF_INVALID")),
+            ("has space", false, Some("E_DEF_INVALID")),
+            ("lower-ok?", false, Some("E_DEF_INVALID")),
+            (long.as_str(), false, Some("E_DEF_LIMIT")),
+        ];
+        for (key, ok, code) in cases {
+            assert_eq!(env_key_shape_ok(key), *ok, "predicate for '{key}'");
+            match validate_env_key(key) {
+                Ok(()) => assert!(ok, "validator accepts '{key}'"),
+                Err(error) => {
+                    assert!(!ok, "validator rejects '{key}'");
+                    assert_eq!(error.code, code.unwrap(), "code for '{key}'");
+                }
+            }
+        }
     }
 
     #[test]

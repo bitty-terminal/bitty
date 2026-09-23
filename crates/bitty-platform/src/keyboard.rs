@@ -29,9 +29,27 @@
 //! - Kitty keyboard protocol is M1 opt-in, not M1-required
 //!   (`compatibility-milestone-rfc`): this module owns the legacy baseline
 //!   and the Kitty code tables ([`ext_functional_key`],
-//!   [`ext_modifier_key`]); the runtime's `encode_key_enhanced` composes
+//!   [`ext_modifier_key`], [`ext_keypad_named_key`],
+//!   [`ext_keypad_char_key`]); the runtime's `encode_key_enhanced` composes
 //!   them under the negotiated flags. The legacy path here is the
 //!   byte-identical fallback when the protocol is off.
+//!
+//! # Kitty coverage declaration (CTX-0755, Issue #1362)
+//!
+//! Encoded against `sw.kovidgoyal.net/kitty/keyboard-protocol`:
+//! progressive flags 1/2/4/8/16 (disambiguate, report events, report
+//! alternates, report all keys, report associated text); modifier bits
+//! shift/alt/ctrl/super/hyper/meta; the single shifted-key alternate;
+//! associated text as trailing codepoints; the functional table below
+//! (including media/volume keys); and the keypad table (numpad-located
+//! keys decode to `KP_*` codes under enhancement).
+//!
+//! Explicitly deferred (no stable platform source in winit, so no encoding
+//! is guessed): the base-layout alternate key (third `code:shifted:base`
+//! sub-field); caps-lock/num-lock modifier bits; key-number-`0` pure-text
+//! events (every `KeyEvent` here carries its key); `ISO_LEVEL3/5_SHIFT`
+//! (no winit named key); and browser/launch/eject/power keys (the spec
+//! assigns them no codes, so they keep the legacy path).
 //!
 //! The table mirrors xterm's legacy encoding sufficient for shells, editors,
 //! and TUIs; application-cursor / keypad nuances (`DECCKM` etc.) are deferred
@@ -404,6 +422,18 @@ pub fn ext_functional_key(named: NamedKey) -> Option<(u32, u8)> {
         NamedKey::F33 => (57396, b'u'),
         NamedKey::F34 => (57397, b'u'),
         NamedKey::F35 => (57398, b'u'),
+        // Media and volume keys (CTX-0755): the spec assigns dedicated
+        // Private Use codes; previously these fell through to `None` and
+        // produced no input even under report-all-keys.
+        NamedKey::MediaPlay => (57428, b'u'),
+        NamedKey::MediaPause => (57429, b'u'),
+        NamedKey::MediaPlayPause => (57430, b'u'),
+        NamedKey::MediaStop => (57432, b'u'),
+        NamedKey::MediaTrackNext => (57435, b'u'),
+        NamedKey::MediaTrackPrevious => (57436, b'u'),
+        NamedKey::AudioVolumeDown => (57438, b'u'),
+        NamedKey::AudioVolumeUp => (57439, b'u'),
+        NamedKey::AudioVolumeMute => (57440, b'u'),
         _ => return None,
     };
     Some(pair)
@@ -460,6 +490,77 @@ pub const fn ext_modifier_key(named: NamedKey, location: KeyLocation) -> Option<
                 57446
             }
         }
+        _ => return None,
+    };
+    Some(code)
+}
+
+/// Maps a numpad-located [`NamedKey`] to its Kitty keyboard-protocol keypad
+/// code (CTX-0755, Issue #1362).
+///
+/// The spec reports keypad keys as their dedicated `KP_*` codes
+/// (`57399..=57427`) so applications can distinguish them from the
+/// equivalent non-keypad keys once the disambiguate enhancement is active;
+/// without enhancement they keep the legacy encoding of the equivalent key.
+/// Only `Numpad`-located events consult this table — the caller checks
+/// [`KeyLocation::Numpad`] first, so `Standard`-located keys never alias
+/// here. Returns `None` for keys with no keypad form (the caller falls back
+/// to [`ext_functional_key`]).
+///
+/// `KP_BEGIN` (`57427`) has no stable winit source and stays deferred (see
+/// the module coverage declaration).
+pub const fn ext_keypad_named_key(named: NamedKey) -> Option<(u32, u8)> {
+    let pair = match named {
+        NamedKey::Enter => (57414, b'u'),
+        NamedKey::Insert => (57425, b'u'),
+        NamedKey::Delete => (57426, b'u'),
+        NamedKey::ArrowLeft => (57417, b'u'),
+        NamedKey::ArrowRight => (57418, b'u'),
+        NamedKey::ArrowUp => (57419, b'u'),
+        NamedKey::ArrowDown => (57420, b'u'),
+        NamedKey::PageUp => (57421, b'u'),
+        NamedKey::PageDown => (57422, b'u'),
+        NamedKey::Home => (57423, b'u'),
+        NamedKey::End => (57424, b'u'),
+        _ => return None,
+    };
+    Some(pair)
+}
+
+/// Maps a numpad-located character key's logical text to its Kitty
+/// keyboard-protocol keypad code (CTX-0755, Issue #1362).
+///
+/// winit delivers numpad digits and symbols as `Character` keys with
+/// [`KeyLocation::Numpad`]; the spec assigns them `KP_0..=KP_9`
+/// (`57399..=57408`), `KP_DECIMAL` (`57409`), `KP_DIVIDE` (`57410`),
+/// `KP_MULTIPLY` (`57411`), `KP_SUBTRACT` (`57412`), `KP_ADD` (`57413`),
+/// and `KP_EQUAL` (`57415`). The input must be exactly one character;
+/// anything else returns `None` so the caller keeps the text path.
+/// `KP_SEPARATOR` (`57416`) has no stable single-character source across
+/// layouts and stays deferred (see the module coverage declaration).
+pub fn ext_keypad_char_key(logical: &str) -> Option<u32> {
+    let mut chars = logical.chars();
+    let first = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+    let code = match first {
+        '0' => 57399,
+        '1' => 57400,
+        '2' => 57401,
+        '3' => 57402,
+        '4' => 57403,
+        '5' => 57404,
+        '6' => 57405,
+        '7' => 57406,
+        '8' => 57407,
+        '9' => 57408,
+        '.' => 57409,
+        '/' => 57410,
+        '*' => 57411,
+        '-' => 57412,
+        '+' => 57413,
+        '=' => 57415,
         _ => return None,
     };
     Some(code)
@@ -996,5 +1097,111 @@ mod tests {
             ext_modifier_key(NamedKey::Enter, KeyLocation::Standard),
             None
         );
+    }
+
+    #[test]
+    fn ext_functional_table_covers_media_and_volume_keys() {
+        // CTX-0755: media/volume rows from the spec's functional table.
+        assert_eq!(ext_functional_key(NamedKey::MediaPlay), Some((57428, b'u')));
+        assert_eq!(
+            ext_functional_key(NamedKey::MediaPause),
+            Some((57429, b'u'))
+        );
+        assert_eq!(
+            ext_functional_key(NamedKey::MediaPlayPause),
+            Some((57430, b'u'))
+        );
+        assert_eq!(ext_functional_key(NamedKey::MediaStop), Some((57432, b'u')));
+        assert_eq!(
+            ext_functional_key(NamedKey::MediaTrackNext),
+            Some((57435, b'u'))
+        );
+        assert_eq!(
+            ext_functional_key(NamedKey::MediaTrackPrevious),
+            Some((57436, b'u'))
+        );
+        assert_eq!(
+            ext_functional_key(NamedKey::AudioVolumeDown),
+            Some((57438, b'u'))
+        );
+        assert_eq!(
+            ext_functional_key(NamedKey::AudioVolumeUp),
+            Some((57439, b'u'))
+        );
+        assert_eq!(
+            ext_functional_key(NamedKey::AudioVolumeMute),
+            Some((57440, b'u'))
+        );
+        // Keys the spec assigns no codes to keep the legacy path.
+        assert_eq!(ext_functional_key(NamedKey::BrowserBack), None);
+        assert_eq!(ext_functional_key(NamedKey::LaunchMail), None);
+        assert_eq!(ext_functional_key(NamedKey::Space), None);
+    }
+
+    #[test]
+    fn ext_keypad_named_table_covers_navigation_and_enter() {
+        // CTX-0755: numpad-located named keys decode to KP_* codes.
+        assert_eq!(ext_keypad_named_key(NamedKey::Enter), Some((57414, b'u')));
+        assert_eq!(
+            ext_keypad_named_key(NamedKey::ArrowLeft),
+            Some((57417, b'u'))
+        );
+        assert_eq!(
+            ext_keypad_named_key(NamedKey::ArrowRight),
+            Some((57418, b'u'))
+        );
+        assert_eq!(ext_keypad_named_key(NamedKey::ArrowUp), Some((57419, b'u')));
+        assert_eq!(
+            ext_keypad_named_key(NamedKey::ArrowDown),
+            Some((57420, b'u'))
+        );
+        assert_eq!(ext_keypad_named_key(NamedKey::PageUp), Some((57421, b'u')));
+        assert_eq!(
+            ext_keypad_named_key(NamedKey::PageDown),
+            Some((57422, b'u'))
+        );
+        assert_eq!(ext_keypad_named_key(NamedKey::Home), Some((57423, b'u')));
+        assert_eq!(ext_keypad_named_key(NamedKey::End), Some((57424, b'u')));
+        assert_eq!(ext_keypad_named_key(NamedKey::Insert), Some((57425, b'u')));
+        assert_eq!(ext_keypad_named_key(NamedKey::Delete), Some((57426, b'u')));
+        // No keypad form: the caller falls back to the standard table.
+        assert_eq!(ext_keypad_named_key(NamedKey::Tab), None);
+        assert_eq!(ext_keypad_named_key(NamedKey::F5), None);
+        assert_eq!(ext_keypad_named_key(NamedKey::Space), None);
+    }
+
+    #[test]
+    fn ext_keypad_char_table_covers_digits_and_symbols() {
+        // CTX-0755: numpad digits/symbols decode to KP_* codes.
+        for (index, digit) in ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9']
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(
+                ext_keypad_char_key(&digit.to_string()),
+                Some(57399 + index as u32),
+                "numpad {digit} must map to KP_{digit}"
+            );
+        }
+        let symbols: &[(&str, u32)] = &[
+            (".", 57409),
+            ("/", 57410),
+            ("*", 57411),
+            ("-", 57412),
+            ("+", 57413),
+            ("=", 57415),
+        ];
+        for (logical, code) in symbols {
+            assert_eq!(
+                ext_keypad_char_key(logical),
+                Some(*code),
+                "numpad {logical} must map to {code}"
+            );
+        }
+        // Multi-character input and plain letters keep the text path.
+        assert_eq!(ext_keypad_char_key("ab"), None);
+        assert_eq!(ext_keypad_char_key(""), None);
+        assert_eq!(ext_keypad_char_key("a"), None);
+        assert_eq!(ext_keypad_char_key(","), None);
     }
 }

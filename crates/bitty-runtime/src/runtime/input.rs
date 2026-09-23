@@ -241,6 +241,15 @@ impl Runtime {
     /// than truncated. With flags `0` this delegates straight to the
     /// legacy encoder, so the opt-in default-off behavior stays
     /// byte-identical (differential proof).
+    ///
+    /// CTX-0755 declares the encoded subset against the authoritative spec:
+    /// modifier bits shift/alt/ctrl/super/hyper/meta; the single shifted-key
+    /// alternate (no base-layout key: winit exposes no layout source);
+    /// associated text as trailing codepoints; media/volume functional keys;
+    /// and numpad-located keys as `KP_*` codes once disambiguate (or
+    /// report-all-keys) is active. Caps-lock/num-lock bits, key-number-`0`
+    /// pure-text events, and `ISO_LEVEL3/5_SHIFT` stay deferred — no stable
+    /// platform source exists, so no encoding is guessed.
     pub(super) fn encode_key_enhanced(&self, event: &KeyEvent) -> Option<Vec<u8>> {
         let flags = self.focused_modes().enhanced_keyboard.flags();
         if flags == 0 {
@@ -265,7 +274,10 @@ impl Runtime {
 
         let mods: u32 = u32::from(self.shift_pressed)
             | (u32::from(self.alt_pressed) << 1)
-            | (u32::from(self.control_pressed) << 2);
+            | (u32::from(self.control_pressed) << 2)
+            | (u32::from(self.super_pressed) << 3)
+            | (u32::from(self.hyper_pressed) << 4)
+            | (u32::from(self.meta_pressed) << 5);
         // Repeat (2) and release (3) carry `:n`; press (1) is the default.
         let event_type = if !report_events {
             None
@@ -283,8 +295,21 @@ impl Runtime {
                 return self.ext_key_fallback(event);
             };
             // The protocol key code is always the un-shifted codepoint.
-            let code = u32::from(base.to_lowercase().next().unwrap_or(base));
-            let shifted = if report_alternates && self.shift_pressed {
+            let plain_code = u32::from(base.to_lowercase().next().unwrap_or(base));
+            // Numpad-located character keys decode to the dedicated `KP_*`
+            // codes (CTX-0755): the spec distinguishes keypad keys from
+            // their non-keypad equivalents once enhancement is active.
+            // Keypad codes carry no shifted alternate.
+            let keypad_code = if event.location == bitty_platform::KeyLocation::Numpad {
+                bitty_platform::ext_keypad_char_key(chars)
+            } else {
+                None
+            };
+            let is_keypad = keypad_code.is_some();
+            let code = keypad_code.unwrap_or(plain_code);
+            let shifted = if is_keypad {
+                None
+            } else if report_alternates && self.shift_pressed {
                 base.to_uppercase()
                     .next()
                     .map(u32::from)
@@ -312,9 +337,22 @@ impl Runtime {
             };
             let simple_encoding_ok = !add_actions && !add_alternates && embed.is_none();
             // Disambiguation applies to alt/ctrl/ctrl+alt/shift+alt — i.e. any
-            // chord with alt or ctrl — but never shift alone.
-            let disambiguated_chord = self.alt_pressed || self.control_pressed;
-            if simple_encoding_ok && !report_all && !(disambiguate && disambiguated_chord) {
+            // chord with alt, ctrl, super, hyper, or meta — but never shift
+            // alone. The legacy text algorithm covers only shift/alt/ctrl, so
+            // any other held modifier forces the `CSI u` form (CTX-0755).
+            let disambiguated_chord = self.alt_pressed
+                || self.control_pressed
+                || self.super_pressed
+                || self.hyper_pressed
+                || self.meta_pressed;
+            // Numpad keys take the keypad-code form once disambiguate is
+            // active, even with no modifiers held (CTX-0755).
+            let escape_for_keypad = is_keypad && disambiguate;
+            if simple_encoding_ok
+                && !report_all
+                && !(disambiguate && disambiguated_chord)
+                && !escape_for_keypad
+            {
                 return self.ext_key_fallback(event);
             }
             let frame = ext_key_frame(code, shifted, mods, event_type, embed, b'u');
@@ -330,7 +368,11 @@ impl Runtime {
             // `ctrl+Space` -> `CSI 32;5u` instead of the legacy NUL). A bare
             // or shift-only Space stays text.
             if *named == bitty_platform::NamedKey::Space {
-                let disambiguated_chord = self.alt_pressed || self.control_pressed;
+                let disambiguated_chord = self.alt_pressed
+                    || self.control_pressed
+                    || self.super_pressed
+                    || self.hyper_pressed
+                    || self.meta_pressed;
                 if !report_all && !(disambiguate && disambiguated_chord) {
                     return self.ext_key_fallback(event);
                 }
@@ -350,6 +392,19 @@ impl Runtime {
                 return self.ext_key_or_fallback(frame);
             }
             if let Some((code, trailer)) = bitty_platform::ext_functional_key(*named) {
+                // Numpad-located named keys substitute the dedicated `KP_*`
+                // codes (CTX-0755) and then run the same gates below, except
+                // the bare Enter/Tab/Backspace legacy exception (typed
+                // `reset` after a crash) applies to the main keys only: a
+                // numpad key under enhancement always takes the `CSI u` form
+                // so applications can distinguish it.
+                let is_keypad = event.location == bitty_platform::KeyLocation::Numpad
+                    && bitty_platform::ext_keypad_named_key(*named).is_some();
+                let (code, trailer) = if is_keypad {
+                    bitty_platform::ext_keypad_named_key(*named).unwrap_or((code, trailer))
+                } else {
+                    (code, trailer)
+                };
                 if legacy_mode {
                     return self.ext_key_fallback(event);
                 }
@@ -360,12 +415,15 @@ impl Runtime {
                 }
                 // Bare Enter/Tab/Backspace keep their legacy bytes under
                 // disambiguate/report-events; report-all-keys encodes them.
-                let legacy_exception = matches!(
-                    named,
-                    bitty_platform::NamedKey::Enter
-                        | bitty_platform::NamedKey::Tab
-                        | bitty_platform::NamedKey::Backspace
-                );
+                // The exception covers the main keys only, never numpad
+                // substitutes (CTX-0755).
+                let legacy_exception = !is_keypad
+                    && matches!(
+                        named,
+                        bitty_platform::NamedKey::Enter
+                            | bitty_platform::NamedKey::Tab
+                            | bitty_platform::NamedKey::Backspace
+                    );
                 if legacy_exception && !report_all && mods == 0 {
                     return self.ext_key_fallback(event);
                 }
@@ -426,6 +484,7 @@ impl Runtime {
                     | bitty_platform::NamedKey::Alt
                     | bitty_platform::NamedKey::AltGraph
                     | bitty_platform::NamedKey::Super
+                    | bitty_platform::NamedKey::Hyper
                     | bitty_platform::NamedKey::Meta
             )
         );
@@ -567,6 +626,7 @@ impl Runtime {
                     | bitty_platform::NamedKey::Alt
                     | bitty_platform::NamedKey::AltGraph
                     | bitty_platform::NamedKey::Super
+                    | bitty_platform::NamedKey::Hyper
                     | bitty_platform::NamedKey::Meta
             )
         );
@@ -1445,9 +1505,9 @@ impl Runtime {
         scrolled
     }
 
-    /// Tracks modifier state from keyboard events (Shift/Ctrl/Alt).
+    /// Tracks modifier state from keyboard events (Shift/Ctrl/Alt/Super/Hyper/Meta).
     pub fn track_modifiers_from_key(&mut self, event: &KeyEvent) {
-        // Update shift/ctrl/alt pressed state based on named keys.
+        // Update shift/ctrl/alt/super/hyper/meta pressed state based on named keys.
         // This keeps hot-path allocation-free (no HashMap) and bounded.
         if let bitty_platform::LogicalKey::Named(named) = &event.logical_key {
             match named {
@@ -1459,6 +1519,15 @@ impl Runtime {
                 }
                 bitty_platform::NamedKey::Alt | bitty_platform::NamedKey::AltGraph => {
                     self.alt_pressed = event.state == PressState::Pressed;
+                }
+                bitty_platform::NamedKey::Super => {
+                    self.super_pressed = event.state == PressState::Pressed;
+                }
+                bitty_platform::NamedKey::Hyper => {
+                    self.hyper_pressed = event.state == PressState::Pressed;
+                }
+                bitty_platform::NamedKey::Meta => {
+                    self.meta_pressed = event.state == PressState::Pressed;
                 }
                 _ => {}
             }

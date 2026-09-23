@@ -885,6 +885,35 @@ pub enum JobError {
         /// Configured grant capacity per job.
         limit: usize,
     },
+    /// The sensitive-input interlock refused automated input: the target
+    /// job's observed PTY echo state (or its verdict-fed interaction class)
+    /// denies dispatch. Dispatch state is unchanged; retry once the host
+    /// observes echo restored (RUN-22, #1053).
+    SecureInputDenied {
+        /// Stable audit name from [`SecureInputDenial::as_str`].
+        denial: String,
+        /// Owned denial reason.
+        reason: String,
+    },
+    /// The command-risk kernel hard-denied an agent-command spawn: a
+    /// positive structural match blocks dispatch and routes to the consent
+    /// surface. Nothing was tracked and no process started (RUN-23, #1054).
+    CommandRiskDenied {
+        /// Stable audit name from [`HardDeny::as_str`].
+        deny: String,
+        /// Owned denial reason.
+        reason: String,
+    },
+    /// The command-risk kernel gated an agent-command spawn on explicit
+    /// human consent: no consent ledger exists yet (PP-3 open work), so the
+    /// spawn fails closed. Nothing was tracked and no process started
+    /// (RUN-23, #1054).
+    CommandRiskNeedsConsent {
+        /// Stable audit name from [`RiskTier::as_str`].
+        tier: String,
+        /// Owned gating reason.
+        reason: String,
+    },
 }
 
 impl JobError {
@@ -947,6 +976,31 @@ impl JobError {
             reason: reason.into(),
         }
     }
+
+    pub(crate) fn secure_input_denied(denial: super::sensitive_input::SecureInputDenial) -> Self {
+        Self::SecureInputDenied {
+            denial: denial.as_str().into(),
+            reason: denial.to_string(),
+        }
+    }
+
+    pub(crate) fn command_risk_denied(deny: super::command_risk::HardDeny) -> Self {
+        Self::CommandRiskDenied {
+            deny: deny.as_str().into(),
+            reason: format!(
+                "command hard-denied by risk class {deny}; routed to the consent surface"
+            ),
+        }
+    }
+
+    pub(crate) fn command_risk_needs_consent(tier: super::command_risk::RiskTier) -> Self {
+        Self::CommandRiskNeedsConsent {
+            tier: tier.as_str().into(),
+            reason: format!(
+                "command needs explicit human consent at tier {tier}; no consent ledger exists yet"
+            ),
+        }
+    }
 }
 
 impl fmt::Display for JobError {
@@ -975,6 +1029,15 @@ impl fmt::Display for JobError {
             Self::Unsupported { reason } => write!(f, "unsupported job operation: {reason}"),
             Self::GrantsFull { limit } => {
                 write!(f, "job grant table is full (limit {limit})")
+            }
+            Self::SecureInputDenied { denial, reason } => {
+                write!(f, "automated input denied ({denial}): {reason}")
+            }
+            Self::CommandRiskDenied { deny, reason } => {
+                write!(f, "command spawn denied ({deny}): {reason}")
+            }
+            Self::CommandRiskNeedsConsent { tier, reason } => {
+                write!(f, "command spawn needs consent ({tier}): {reason}")
             }
         }
     }

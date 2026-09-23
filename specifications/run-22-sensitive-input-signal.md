@@ -98,6 +98,25 @@ with text excluded from the decision by construction:
   never auto-allowing gated verdicts.
 - Reproduce: `cargo test -p bitty-runtime --lib sensitive_input::`.
 
+## Live wiring (CTX-0720)
+
+- Input boundary: `JobRegistry::write_input_as`
+  (`crates/bitty-runtime/src/execution/registry.rs`) re-checks the recorded
+  echo state and interaction class on every dispatch — after the
+  `write_input` grant check (denied callers learn nothing, not even the
+  gate state), before payload bounds, rate budget, and backend gating. A
+  denial reports `JobError::SecureInputDenied` with the stable kernel audit
+  name (`target_in_secure_input_mode` / `confirmation_requires_human`);
+  grants are untouched and no budget is spent.
+- Host observation seam: `set_job_input_gate` / `job_input_gate` record and
+  read the `(EchoState, InteractionClass)` pair per job under host
+  authority (default `(EchoOn, SafeInteractive)`); the host sorts the class
+  with `InteractionClass::classify` or the verdict-fed
+  `classify_with_verdict` (SI-5 seam into the OQ-087 audit).
+- Fail-closed wiring defaults: echo loss suspends dispatch for its
+  duration only — restoring echo resumes it; stale labels stay denied.
+- Reproduce: `cargo test -p bitty-runtime --test run_wiring input_gate_`.
+
 ## Gates
 
 - `cargo fmt --check`, `cargo clippy --workspace --all-targets` with

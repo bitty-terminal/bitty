@@ -24,7 +24,13 @@ osc/
   corpus/
     01-title-hyperlink.bin    # OSC 0/8 curated
     02-clipboard.bin          # OSC 52 c/p/? with base64
+    03-dogfooding-osc7-8-52-title.bin  # OSC 7/8/52 + title dogfooding
+    04-kitty-clipboard-5522.bin        # OSC 5522 non-goal lock (see below)
     vttest-osc-placeholder.bin
 ```
+
+## Non-goal: kitty clipboard extension (OSC 5522)
+
+- `corpus/04-kitty-clipboard-5522.bin` records a read-shaped and a write-shaped packet. CTX-0757 (bitty#1360) declares the extension a permanent non-goal for M1/v0.1.0: no typed action, no session reassembly, no reply. The corpus must keep replaying to bounded inert `OscUnknown { id: 5522 }` with no clipboard effect, locked by `crates/bitty-rich/tests/kitty_5522_nongoal.rs::kitty_5522_locked_as_inert_nongoal` and referenced as `ci` negative evidence from the compat-lab report row. Revisit only through a future RFC with security review.
 
 No window/GPU leak — this lab never opens display.

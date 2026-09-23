@@ -379,11 +379,12 @@ pub const ROWS: &[Row] = &[
     Row {
         area: "clipboard",
         scenario: "kitty clipboard extension (OSC 5522)",
-        status: Status::Partial,
-        method: Method::Corpus {
-            path: "tests/compat/osc/corpus/04-kitty-clipboard-5522.bin",
+        status: Status::Ci,
+        method: Method::Test {
+            file: "crates/bitty-rich/tests/kitty_5522_nongoal.rs",
+            name: "kitty_5522_locked_as_inert_nongoal",
         },
-        note: "parses as bounded inert unknown OSC; extension not implemented (gap)",
+        note: "permanent non-goal (CTX-0757): bounded inert unknown OSC; clipboard untouched under every policy",
     },
     Row {
         area: "clipboard",

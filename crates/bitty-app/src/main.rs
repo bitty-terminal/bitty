@@ -226,6 +226,8 @@ use bitty_runtime::Runtime;
 
 mod chrome_keys;
 mod cli;
+mod cmd;
+mod completion;
 mod config_cli;
 mod ctl;
 mod dev;
@@ -237,6 +239,7 @@ mod ipc_serve;
 mod layout_cmd;
 mod logging;
 mod plugin_runtime;
+mod version;
 
 mod list;
 mod mascot;
@@ -245,8 +248,9 @@ mod run;
 mod spawn;
 mod terminal_app;
 mod test_mode;
+mod x;
 
-use cli::{help_text, parse_args, version_text};
+use cli::{help_text, parse_args};
 use config_cli::{
     config_usage, load_app_config, run_config_subcommand, runtime_config_from_effective,
 };
@@ -365,13 +369,42 @@ fn main() {
         println!("{}", plugin::plugin_help_text());
         std::process::exit(0);
     }
+    // `bitty version --help` shows version help (local class: no instance,
+    // no config, no VM).
+    if args.help && args.version_word {
+        println!("{}", version::version_help_text());
+        std::process::exit(0);
+    }
+    // `bitty completion --help` / `bitty comp --help` show completion help
+    // under the invoked spelling (local class).
+    if args.help && args.completion_word {
+        println!(
+            "{}",
+            completion::completion_help_text(&args.completion_spelling)
+        );
+        std::process::exit(0);
+    }
+    // `bitty cmd --help` shows cmd help (local class).
+    if args.help && args.cmd_word {
+        println!("{}", cmd::cmd_help_text());
+        std::process::exit(0);
+    }
+    // `bitty x --help` lists the installed plugin set (local class, static
+    // manifests only, never a plugin VM).
+    if args.help && args.x_word && args.x_raw.is_empty() {
+        print!("{}", x::x_help_text());
+        std::process::exit(0);
+    }
     if args.help {
         println!("{}", help_text());
         std::process::exit(0);
     }
-    if args.version {
-        println!("{}", version_text());
-        std::process::exit(0);
+    // `bitty version` / `-V` / `--version` (CTX-0763, #1375, local class).
+    // Dispatched with `--help`: no config, no instance, no plugin VM. The
+    // flag is an alias for the table form; `bitty --format json --version`
+    // emits the envelope via the same request path.
+    if args.version || args.version_word {
+        std::process::exit(version::run_cli(&args));
     }
 
     // `bitty --mascot`: print the Bittie mascot art and exit 0 (issue
@@ -516,6 +549,31 @@ fn main() {
             &mut input,
             &mut output,
         ));
+    }
+
+    // `bitty completion <shell>` static completion scripts (CTX-0763, #1375,
+    // local class). Dispatched before config load and GUI startup: no
+    // instance, no IPC, no plugin VM. Parse failures are usage errors
+    // (exit 2).
+    if args.completion_word {
+        std::process::exit(completion::run_cli(&args));
+    }
+
+    // `bitty cmd <qualified-id>` direct executable invocation (CTX-0763,
+    // #1375). Dispatched before config load and GUI startup: `--help` never
+    // needs an instance; well-formed ids fail closed without IPC in this
+    // slice (exit 6). Parse failures are usage errors (exit 2).
+    if args.cmd_word {
+        std::process::exit(cmd::run_cli(&args));
+    }
+
+    // `bitty x` qualified plugin namespace (CTX-0763, #1375, extension
+    // class). Dispatched before config load and GUI startup from static
+    // manifests only: no instance, no IPC, no plugin VM ever loaded.
+    // `--help` paths exit 0; unknown plugins and execution attempts fail
+    // closed (exit 4/8); parse failures are usage errors (exit 2).
+    if args.x_word {
+        std::process::exit(x::run_cli(&args));
     }
 
     // First-run Bittie splash (issue #1318, CTX-0729): once-only stdout

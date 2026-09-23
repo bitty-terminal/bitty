@@ -602,7 +602,14 @@ fn help_and_version_text_are_non_empty() {
     assert!(help_text().contains("--headless"));
     assert!(help_text().contains("--split"));
     assert!(help_text().contains("--layout"));
-    assert!(!version_text().is_empty());
+    // #1375: `--version` prints `bitty <semver> (<channel> <commit>)`.
+    let text = crate::version::version_text();
+    assert!(text.starts_with("bitty "), "version table form: {text}");
+    assert!(
+        text.contains(crate::version::version_semver()),
+        "semver: {text}"
+    );
+    assert!(!text.is_empty());
 }
 
 #[test]
@@ -2965,6 +2972,100 @@ fn parse_init_subcommand() {
     let p = parse_args(&args_of(&["bitty", "config", "init"]));
     assert!(p.config_word);
     assert!(!p.init_word);
+}
+
+#[test]
+fn parse_cli_v1_gap_words() {
+    // `version` consumes the tail verbatim; escape hatch preserved.
+    let p = parse_args(&args_of(&["bitty", "version"]));
+    assert!(p.version_word);
+    assert!(p.version_raw.is_empty());
+    assert_eq!(p.program, None);
+    let p = parse_args(&args_of(&["bitty", "version", "--format", "json"]));
+    assert!(p.version_word);
+    assert_eq!(
+        p.version_raw,
+        vec!["--format".to_string(), "json".to_string()]
+    );
+    let p = parse_args(&args_of(&["bitty", "--", "version"]));
+    assert!(!p.version_word);
+    assert_eq!(p.program.as_deref(), Some("version"));
+
+    // `completion` + stable `comp` alias record the invoked spelling.
+    let p = parse_args(&args_of(&["bitty", "completion", "bash"]));
+    assert!(p.completion_word);
+    assert_eq!(p.completion_spelling, "completion");
+    assert_eq!(p.completion_raw, vec!["bash".to_string()]);
+    let p = parse_args(&args_of(&["bitty", "comp", "fish"]));
+    assert!(p.completion_word);
+    assert_eq!(p.completion_spelling, "comp");
+    let p = parse_args(&args_of(&["bitty", "--", "comp"]));
+    assert!(!p.completion_word);
+    assert_eq!(p.program.as_deref(), Some("comp"));
+
+    // `cmd` keeps the separator-owned tail verbatim.
+    let p = parse_args(&args_of(&[
+        "bitty",
+        "cmd",
+        "core.terminal.text",
+        "--format",
+        "json",
+        "--",
+        "{\"terminal_id\":\"t:4\"}",
+    ]));
+    assert!(p.cmd_word);
+    assert_eq!(
+        p.cmd_raw,
+        vec![
+            "core.terminal.text".to_string(),
+            "--format".to_string(),
+            "json".to_string(),
+            "--".to_string(),
+            "{\"terminal_id\":\"t:4\"}".to_string(),
+        ]
+    );
+    let p = parse_args(&args_of(&["bitty", "--", "cmd"]));
+    assert!(!p.cmd_word);
+    assert_eq!(p.program.as_deref(), Some("cmd"));
+
+    // `x` keeps plugin args (including dash tokens) verbatim.
+    let p = parse_args(&args_of(&[
+        "bitty",
+        "x",
+        "example.markdown",
+        "render",
+        "--file",
+        "README.md",
+    ]));
+    assert!(p.x_word);
+    assert_eq!(
+        p.x_raw,
+        vec![
+            "example.markdown".to_string(),
+            "render".to_string(),
+            "--file".to_string(),
+            "README.md".to_string(),
+        ]
+    );
+    let p = parse_args(&args_of(&["bitty", "--", "x"]));
+    assert!(!p.x_word);
+    assert_eq!(p.program.as_deref(), Some("x"));
+
+    // First word wins; later words are verbatim tail, never programs.
+    let p = parse_args(&args_of(&["bitty", "version", "x"]));
+    assert!(p.version_word);
+    assert!(!p.x_word);
+    let p = parse_args(&args_of(&["bitty", "cmd", "run"]));
+    assert!(p.cmd_word);
+    assert!(!p.run_word);
+
+    // `cfg` is the stable alias for `config`.
+    let p = parse_args(&args_of(&["bitty", "cfg", "path"]));
+    assert!(p.config_word);
+    assert_eq!(p.config_cmd, Some(ConfigCommand::Path));
+    let p = parse_args(&args_of(&["bitty", "--", "cfg"]));
+    assert!(!p.config_word);
+    assert_eq!(p.program.as_deref(), Some("cfg"));
 }
 
 #[test]

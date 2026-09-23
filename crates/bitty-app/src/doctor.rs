@@ -1055,8 +1055,9 @@ fn truncate(raw: &str, max: usize) -> String {
 // `bitty doctor` CLI entry point (relocated from `main.rs`, CTX-0305)
 // ---------------------------------------------------------------------------
 
-use crate::cli::{Args, version_text};
+use crate::cli::Args;
 use crate::config_cli::load_merged_config;
+use crate::version::version_semver;
 
 /// Clipboard helpers probed on `PATH` in order (Wayland first, then X11).
 const DOCTOR_CLIPBOARD_CANDIDATES: &[&str] = &["wl-copy", "xclip", "xsel"];
@@ -1085,7 +1086,10 @@ fn doctor_shell_executable(path: &std::path::Path) -> bool {
 /// plugin VM is ever loaded (safe-mode posture); all external commands run
 /// under `run_bounded` (no shell, no pipes, kill by PID on timeout).
 fn collect_doctor_inputs(args: &Args) -> DoctorInputs {
-    let version = version_text();
+    // Bare semver: the doctor `version` field stays the machine-comparable
+    // release version; the `bitty <semver> (<channel> <commit>)` table form
+    // lives in `crate::version::version_text` (#1375).
+    let version = version_semver().to_string();
     let (exe_ok, exe_detail) = match std::env::current_exe() {
         Ok(path) => (true, path.display().to_string()),
         Err(_) => (false, String::new()),

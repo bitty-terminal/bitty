@@ -258,6 +258,48 @@ pub(crate) struct Args {
     pub(crate) plugin_format: Option<String>,
     /// `--no-color` for plugin table output (global or post-word).
     pub(crate) plugin_no_color: bool,
+    /// `bitty version` version and build metadata (#1375, CTX-0763).
+    /// True once the first positional `version` word is seen; a program
+    /// literally named `version` needs `bitty run -- version ...` or the
+    /// legacy `bitty -- version ...`. Tokens after the word land verbatim
+    /// in `version_raw` for [`crate::version::parse_version_request`].
+    /// `-V` / `--version` is an alias for the table form.
+    pub(crate) version_word: bool,
+    /// Raw tokens after the `version` word for
+    /// [`crate::version::parse_version_request`]. Empty until `version_word`
+    /// is set.
+    pub(crate) version_raw: Vec<String>,
+    /// `bitty completion <shell>` shell completion (#1375, CTX-0763).
+    /// True once the first positional `completion`/`comp` word is seen; a
+    /// program literally named `completion`/`comp` needs
+    /// `bitty run -- completion ...` or the legacy `bitty -- completion ...`.
+    /// Tokens after the word land verbatim in `completion_raw` for
+    /// [`crate::completion::parse_completion_request`].
+    pub(crate) completion_word: bool,
+    /// Invoked spelling (`completion` or `comp`) for usage/help.
+    pub(crate) completion_spelling: String,
+    /// Raw tokens after the `completion` word (shell, flags) for
+    /// [`crate::completion::parse_completion_request`]. Empty until
+    /// `completion_word` is set.
+    pub(crate) completion_raw: Vec<String>,
+    /// `bitty cmd` direct qualified executable invocation (#1375, CTX-0763).
+    /// True once the first positional `cmd` word is seen; a program
+    /// literally named `cmd` needs `bitty run -- cmd ...` or the legacy
+    /// `bitty -- cmd ...`. Tokens after the word land verbatim in `cmd_raw`
+    /// for [`crate::cmd::parse_cmd_request`].
+    pub(crate) cmd_word: bool,
+    /// Raw tokens after the `cmd` word for [`crate::cmd::parse_cmd_request`].
+    /// Empty until `cmd_word` is set.
+    pub(crate) cmd_raw: Vec<String>,
+    /// `bitty x` qualified plugin namespace (#1375, CTX-0763). True once
+    /// the first positional `x` word is seen; a program literally named `x`
+    /// needs `bitty run -- x ...` or the legacy `bitty -- x ...`. Tokens
+    /// after the word land verbatim in `x_raw` for
+    /// [`crate::x::parse_x_request`].
+    pub(crate) x_word: bool,
+    /// Raw tokens after the `x` word for [`crate::x::parse_x_request`].
+    /// Empty until `x_word` is set.
+    pub(crate) x_raw: Vec<String>,
     /// When true emit per-frame `bitty tick` stats (CTX-0190).
     /// `-v` / `--verbose` (also `BITTY_VERBOSE=1`); shorthand for
     /// `--log-level debug`. Default (unset) is quiet: no tick lines.
@@ -376,6 +418,15 @@ impl Args {
             plugin_raw: Vec::new(),
             plugin_format: None,
             plugin_no_color: false,
+            version_word: false,
+            version_raw: Vec::new(),
+            completion_word: false,
+            completion_spelling: String::from("completion"),
+            completion_raw: Vec::new(),
+            cmd_word: false,
+            cmd_raw: Vec::new(),
+            x_word: false,
+            x_raw: Vec::new(),
             verbose: false,
             log_level: None,
         }
@@ -427,6 +478,39 @@ fn validate_split_value(val: &str) -> Result<(Option<SplitAxis>, Option<f32>), S
         }
     }
     Ok((axis, ratio))
+}
+
+/// Route one token verbatim into the active `version`/`completion`/`cmd`/`x`
+/// post-word buffer (CTX-0763, #1375).
+///
+/// These four words consume the argv tail verbatim (like `run`/`ctl`/`dev`/
+/// `plugin`): their dedicated parsers own `--format`/`--help`/separator
+/// validation there. Space-form value flags (`--format`/`--socket`/
+/// `--instance`) take their value along when the next token is not a flag.
+/// Returns the next index when a new word owned the token, `None` when no new
+/// word is active (the caller falls through to the existing arms).
+fn push_verbatim_new_word(out: &mut Args, raw: &[String], i: usize) -> Option<usize> {
+    let token = raw.get(i)?;
+    let buf = if out.version_word {
+        &mut out.version_raw
+    } else if out.completion_word {
+        &mut out.completion_raw
+    } else if out.cmd_word {
+        &mut out.cmd_raw
+    } else if out.x_word {
+        &mut out.x_raw
+    } else {
+        return None;
+    };
+    buf.push(token.clone());
+    if (token == "--format" || token == "--socket" || token == "--instance")
+        && raw.get(i + 1).is_some_and(|next| !next.starts_with('-'))
+    {
+        buf.push(raw[i + 1].clone());
+        Some(i + 2)
+    } else {
+        Some(i + 1)
+    }
 }
 
 /// Parses `raw` (including `argv[0]` at index 0) into [`Args`].
@@ -488,7 +572,25 @@ fn validate_split_value(val: &str) -> Result<(Option<SplitAxis>, Option<f32>), S
 ///   `bitty -- run ...`. Tokens after `run` are kept verbatim for
 ///   `run::parse_run_request`, which requires `--` before COMMAND.
 /// - `config <path|check|edit>` → config subcommand (DEC-0007); a program
-///   literally named `config` needs `bitty -- config ...`
+///   literally named `config` needs `bitty -- config ...`. `cfg` is the
+///   stable v1 alias (same executable).
+/// - `version [--format table|json|jsonl]` → version and build metadata
+///   (#1375, CTX-0763); a program literally named `version` needs
+///   `bitty run -- version ...` or `bitty -- version ...`. Tokens after the
+///   word are kept verbatim for `version::parse_version_request`.
+/// - `completion <shell>` → shell completion (#1375, CTX-0763); `comp` is
+///   the stable v1 alias. A program literally named `completion`/`comp`
+///   needs `bitty run -- completion ...` or `bitty -- completion ...`.
+///   Tokens after the word are kept verbatim for
+///   `completion::parse_completion_request`.
+/// - `cmd <qualified-id> [--format SHAPE] [-- <args-json>]` → direct
+///   qualified executable invocation (#1375, CTX-0763); a program literally
+///   named `cmd` needs `bitty run -- cmd ...` or `bitty -- cmd ...`.
+///   Tokens after the word are kept verbatim for `cmd::parse_cmd_request`.
+/// - `x <publisher>.<name> <command> [args]` → qualified plugin namespace
+///   (#1375, CTX-0763); a program literally named `x` needs
+///   `bitty run -- x ...` or `bitty -- x ...`. Tokens after the word are
+///   kept verbatim for `x::parse_x_request`.
 /// - `init [--yes] [--force] [value flags]` → opt-in setup wizard (#243,
 ///   CTX-0149; guided config surface CTX-0345); a program literally named
 ///   `init` needs `bitty -- init ...`
@@ -500,8 +602,9 @@ fn validate_split_value(val: &str) -> Result<(Option<SplitAxis>, Option<f32>), S
 /// - `inspect <target> <value>` → state and ownership (CTX-0173, local
 ///   class, safe mode); a program literally named `inspect` needs
 ///   `bitty -- inspect ...`
-/// - `--format SHAPE` → doctor/ctl/list/inspect output shape (parsed
-///   globally, consumed by each subcommand dispatch; ignored by startup)
+/// - `--format SHAPE` → doctor/ctl/list/inspect/dev/plugin/version/cmd/x
+///   output shape (parsed globally, consumed by each subcommand dispatch;
+///   ignored by startup)
 /// - `--no-color` → disable ANSI coloring in doctor/list table output
 ///   (accepted by inspect for parity; its tables are plain text)
 /// - `--yes` / `--force` / init value flags are init-only (parsed globally,
@@ -546,6 +649,12 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
         }
         // Handle flags with `=` first
         if let Some(val) = token.strip_prefix("--format=") {
+            // CTX-0763: post-word tokens stay verbatim for the
+            // `version`/`completion`/`cmd`/`x` parsers (own `--format` there).
+            if let Some(next) = push_verbatim_new_word(&mut out, raw, i) {
+                i = next;
+                continue;
+            }
             // Raw on purpose: validated at doctor/ctl/list/inspect/dev dispatch
             // (fail-closed exit 2 on unknown shapes, never warn-ignored).
             // Merged CTX-0171 + CTX-0172 + CTX-0173 + CTX-0174: same token feeds
@@ -567,6 +676,13 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
             continue;
         }
         if let Some(val) = token.strip_prefix("--socket=") {
+            // CTX-0763: post-word tokens stay verbatim for the
+            // `version`/`completion`/`cmd`/`x` parsers (rejected there: those
+            // commands carry no target selection).
+            if let Some(next) = push_verbatim_new_word(&mut out, raw, i) {
+                i = next;
+                continue;
+            }
             // `bitty ctl --socket PATH` global form (before the `ctl` word);
             // raw on purpose, validated at ctl/list dispatch (exit 2 on shape).
             // After the `ctl` word tokens go verbatim to `ctl_raw` instead.
@@ -590,6 +706,12 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
             continue;
         }
         if let Some(val) = token.strip_prefix("--instance=") {
+            // CTX-0763: post-word tokens stay verbatim for the
+            // `version`/`completion`/`cmd`/`x` parsers (rejected there).
+            if let Some(next) = push_verbatim_new_word(&mut out, raw, i) {
+                i = next;
+                continue;
+            }
             // Merged CTX-0171 + CTX-0172: pre-word form feeds both dispatches.
             // CTX-0174: post-`dev` tokens stay verbatim for
             // `dev::parse_dev_request` (rejected local-only there); pre-word
@@ -754,6 +876,13 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
         }
         match token.as_str() {
             "--" => {
+                // CTX-0763: post-word `--` stays verbatim for the
+                // `version`/`completion`/`cmd`/`x` parsers (`cmd` owns the
+                // separator; the other three reject it as a usage error).
+                if let Some(next) = push_verbatim_new_word(&mut out, raw, i) {
+                    i = next;
+                    continue;
+                }
                 // In `list`/`inspect`/`dev` mode `--` is a stray separator
                 // (UsageError at dispatch); elsewhere it ends flags for
                 // PROGRAM argv.
@@ -898,6 +1027,12 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                 }
             }
             "--format" => {
+                // CTX-0763: post-word pairs stay verbatim for the
+                // `version`/`completion`/`cmd`/`x` parsers.
+                if let Some(next) = push_verbatim_new_word(&mut out, raw, i) {
+                    i = next;
+                    continue;
+                }
                 // `bitty doctor/ctl/list/inspect/dev --format SHAPE`: raw on
                 // purpose, validated at dispatch (fail-closed exit 2). Parsed
                 // globally so it composes before or after the subcommand word.
@@ -934,6 +1069,12 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                 }
             }
             "--socket" => {
+                // CTX-0763: post-word pairs stay verbatim for the
+                // `version`/`completion`/`cmd`/`x` parsers (rejected there).
+                if let Some(next) = push_verbatim_new_word(&mut out, raw, i) {
+                    i = next;
+                    continue;
+                }
                 // `bitty ctl/list --socket PATH` global form (before the word).
                 // Raw on purpose, validated at dispatch. After the `ctl` word
                 // tokens go verbatim to `ctl_raw` (see `ctl` arm below).
@@ -964,6 +1105,12 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                 }
             }
             "--instance" => {
+                // CTX-0763: post-word pairs stay verbatim for the
+                // `version`/`completion`/`cmd`/`x` parsers (rejected there).
+                if let Some(next) = push_verbatim_new_word(&mut out, raw, i) {
+                    i = next;
+                    continue;
+                }
                 // `bitty ctl/list --instance ID` global form (before the word).
                 // Merged: feeds both; missing warns and fail-closes list.
                 // CTX-0174: post-`dev` pairs stay verbatim for
@@ -992,6 +1139,13 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                 }
             }
             "--no-color" => {
+                // CTX-0763: post-word `--no-color` stays verbatim for the
+                // `version`/`completion`/`cmd`/`x` parsers (accepted there for
+                // parity; their output is never colorized).
+                if let Some(next) = push_verbatim_new_word(&mut out, raw, i) {
+                    i = next;
+                    continue;
+                }
                 out.doctor_no_color = true;
                 out.list_no_color = true;
                 out.inspect_no_color = true;
@@ -1172,6 +1326,12 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                 // dash-tokens are that program's argv tail (e.g. `cat -A`).
                 // (`dev` normally breaks verbatim at its word, so this arm
                 // only fires for flags before the word — kept for parity.)
+                // CTX-0763: post-word flags stay verbatim for the
+                // `version`/`completion`/`cmd`/`x` parsers.
+                if let Some(next) = push_verbatim_new_word(&mut out, raw, i) {
+                    i = next;
+                    continue;
+                }
                 if out.list_word {
                     out.list_args.push(token.clone());
                     i += 1;
@@ -1243,6 +1403,7 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                 // `bitty config <verb>` subcommand (first positional only;
                 // `--` escape hatch bypasses this via after_double_dash).
                 // A program literally named `config` needs `bitty -- config`.
+                // `cfg` is the stable v1 alias (same executable).
                 if !program_set
                     && !out.config_word
                     && !out.doctor_word
@@ -1251,7 +1412,7 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                     && !out.list_word
                     && !out.inspect_word
                     && !out.dev_word
-                    && token == "config"
+                    && (token == "config" || token == "cfg")
                 {
                     out.config_word = true;
                     if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
@@ -1460,6 +1621,112 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                     out.plugin_raw.extend_from_slice(&raw[i + 1..]);
                     break;
                 }
+                // `bitty version` version and build metadata (first positional
+                // only; CTX-0763, #1375). The word `version` is always this
+                // subcommand, never a program named `version`: use
+                // `bitty run -- version ...` (or legacy `bitty -- version ...`)
+                // for that program. Tokens after the word are kept verbatim
+                // for `version::parse_version_request`. `-V` / `--version`
+                // is an alias for the table form.
+                if !program_set
+                    && !out.config_word
+                    && !out.inspect_word
+                    && !out.init_word
+                    && !out.doctor_word
+                    && !out.run_word
+                    && !out.ctl_word
+                    && !out.list_word
+                    && !out.dev_word
+                    && !out.plugin_word
+                    && !out.version_word
+                    && !out.completion_word
+                    && !out.cmd_word
+                    && !out.x_word
+                    && token == "version"
+                {
+                    out.version_word = true;
+                    out.version_raw.extend_from_slice(&raw[i + 1..]);
+                    break;
+                }
+                // `bitty completion <shell>` shell completion (first positional
+                // only; CTX-0763, #1375). `comp` is the stable v1 alias. The
+                // words are always this subcommand, never a program: use
+                // `bitty run -- completion ...` (or legacy
+                // `bitty -- completion ...`) for that program. Tokens after
+                // the word are kept verbatim for
+                // `completion::parse_completion_request`.
+                if !program_set
+                    && !out.config_word
+                    && !out.inspect_word
+                    && !out.init_word
+                    && !out.doctor_word
+                    && !out.run_word
+                    && !out.ctl_word
+                    && !out.list_word
+                    && !out.dev_word
+                    && !out.plugin_word
+                    && !out.version_word
+                    && !out.completion_word
+                    && !out.cmd_word
+                    && !out.x_word
+                    && (token == "completion" || token == "comp")
+                {
+                    out.completion_word = true;
+                    out.completion_spelling = token.clone();
+                    out.completion_raw.extend_from_slice(&raw[i + 1..]);
+                    break;
+                }
+                // `bitty cmd` direct qualified executable invocation (first
+                // positional only; CTX-0763, #1375). The word `cmd` is always
+                // this subcommand, never a program named `cmd`: use
+                // `bitty run -- cmd ...` (or legacy `bitty -- cmd ...`) for
+                // that program. Tokens after the word are kept verbatim for
+                // `cmd::parse_cmd_request`, which owns the `--` separator.
+                if !program_set
+                    && !out.config_word
+                    && !out.inspect_word
+                    && !out.init_word
+                    && !out.doctor_word
+                    && !out.run_word
+                    && !out.ctl_word
+                    && !out.list_word
+                    && !out.dev_word
+                    && !out.plugin_word
+                    && !out.version_word
+                    && !out.completion_word
+                    && !out.cmd_word
+                    && !out.x_word
+                    && token == "cmd"
+                {
+                    out.cmd_word = true;
+                    out.cmd_raw.extend_from_slice(&raw[i + 1..]);
+                    break;
+                }
+                // `bitty x` qualified plugin namespace (first positional only;
+                // CTX-0763, #1375). The word `x` is always this subcommand,
+                // never a program named `x`: use `bitty run -- x ...` (or
+                // legacy `bitty -- x ...`) for that program. Tokens after the
+                // word are kept verbatim for `x::parse_x_request`.
+                if !program_set
+                    && !out.config_word
+                    && !out.inspect_word
+                    && !out.init_word
+                    && !out.doctor_word
+                    && !out.run_word
+                    && !out.ctl_word
+                    && !out.list_word
+                    && !out.dev_word
+                    && !out.plugin_word
+                    && !out.version_word
+                    && !out.completion_word
+                    && !out.cmd_word
+                    && !out.x_word
+                    && token == "x"
+                {
+                    out.x_word = true;
+                    out.x_raw.extend_from_slice(&raw[i + 1..]);
+                    break;
+                }
                 if !program_set {
                     out.program = Some(token.clone());
                     program_set = true;
@@ -1537,11 +1804,14 @@ pub(crate) fn help_text() -> String {
                               Precedence: CLI flags > file > profile > defaults;\n  \
                               each flag overrides only its own field (siblings\n  \
                               keep file values).\n  \
-                 --format SHAPE  Doctor/ctl/list/inspect/plugin output shape:\n  \
+                 --format SHAPE  Doctor/ctl/list/inspect/plugin/version/cmd/x\n  \
+                              output shape:\n  \
                               table|json|jsonl (default table; parsed globally,\n  \
                               consumed by `bitty doctor`, `bitty ctl`,\n  \
-                              `bitty list`, `bitty inspect`, and\n  \
-                              `bitty plugin list|info`; ignored by startup).\n  \
+                              `bitty list`, `bitty inspect`,\n  \
+                              `bitty plugin list|info`, `bitty version`,\n  \
+                              `bitty cmd`, and `bitty x` (`bitty completion`\n  \
+                              emits a script and ignores it; ignored by startup).\n\
                --socket PATH   Ctl target socket (global `bitty --socket P ctl ...`\n  \
                               or `bitty ctl --socket P ...`; bypasses discovery).\n  \
                --instance ID   Ctl target instance (global or per-`ctl` flag).\n  \
@@ -1557,7 +1827,7 @@ pub(crate) fn help_text() -> String {
             ctl [--socket P] [--instance ID] [--format SHAPE] <resource> <verb>  Control a running instance (runtime)\n  \
                              instance|window|view|terminal list; terminal spawn|close|send|text;\n  \
                              view split|focus; config reload. `ctl --help` never needs an instance.\n  \
-            config path      Print the resolved config file path\n  \
+            config path      Print the resolved config file path (alias `cfg`)\n\
            config check     Load + validate; print per-key sources\n  \
                             (cli/file/default), exit non-zero on invalid files\n  \
             config edit      Open the file in $VISUAL/$EDITOR (vi fallback);\n  \
@@ -1601,6 +1871,21 @@ pub(crate) fn help_text() -> String {
                              managed manifest (bitty-plugins.toml); install\n  \
                              requires capability consent; remove requires\n  \
                              --force; `bitty plugin --help` for detail\n  \
+            cmd <qualified-id> [--format SHAPE] [-- <args-json>]  Direct qualified\n  \
+                             executable invocation for automation/diagnostics\n  \
+                             (e.g. `bitty cmd core.terminal.text --format json\n  \
+                             -- '{{\"terminal_id\": \"t:4\"}}'`; `bitty cmd --help`)\n\
+            x <publisher>.<name> <command> [args]  Qualified plugin namespace\n  \
+                             (extension, no VM load; `bitty x --help` lists\n  \
+                             installed plugins, `bitty x <id> --help` its\n  \
+                             commands)\n  \
+            completion <shell>  Emit shell completion script to stdout\n  \
+                             (bash|zsh|fish|powershell|nushell; alias `comp`;\n  \
+                             `bitty completion --help` for detail)\n  \
+            version [--format SHAPE]  Version and build metadata:\n  \
+                             `bitty <semver> (<channel> <commit>)` on stdout\n  \
+                             (same fields in `--format json`; `-V`/`--version`\n  \
+                             alias; local, no instance)\n\
          \n\
          Arguments:\n  \
            PROGRAM          Program to spawn inside the PTY (direct argv[0],\n  \
@@ -1662,10 +1947,6 @@ pub(crate) fn help_text() -> String {
            bitty doctor --format json\n  \
            bitty plugin list\n  \
            bitty plugin install bitty-terminal.tabs --yes\n",
-        version_text()
+        crate::version::version_semver()
     )
-}
-
-pub(crate) fn version_text() -> String {
-    env!("CARGO_PKG_VERSION").to_string()
 }

@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **CLI contract v1 gaps closed (CTX-0763, #1375):**
+  new `bitty version` (table `bitty <semver> (<channel> <commit>)` plus
+  `--format json`/`jsonl` envelope v1; `-V`/`--version` is an alias for the
+  table form), `bitty completion <shell>` (static Bash/Zsh/Fish/PowerShell/
+  Nushell scripts, no VM), `bitty cmd <qualified-id> [--format SHAPE]
+  [-- <args-json>]` (id validation per the registry rule, live dispatch
+  fails closed as `Unavailable`/exit 6), and `bitty x <publisher>.<name>
+  <command> [args]` (static-manifest help, short-alias collision diagnostics,
+  execution fails closed as a plugin error/exit 4 without loading a VM).
+  Stable `cfg` and `comp` aliases added. `--version` no longer prints the
+  bare semver. Pinned by headless unit tests and binary dispatch proofs.
+  `bitty init` stays as the extra setup-wizard token pending an RFC revision.
+
 - **Workspace switcher bar, switching, and panel operations (CTX-0740, #1333):**
   the workspaceline bar presents by default with a `workspace.show_bar`
   opt-out (file -> effective -> runtime, absent keeps the default-on bar);

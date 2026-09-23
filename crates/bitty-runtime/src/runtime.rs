@@ -1241,7 +1241,7 @@ impl Runtime {
             url_opener: Box::new(plugin::SystemUrlOpener),
             url_activations: 0,
             url_activation_refusals: 0,
-            bell_mode: bell::BellMode::default(),
+            bell_mode: config.bell_mode,
             osc_notification_allowed: false,
             bell_limiter: bell::Rc8Limiter::new(bell::RC8_WINDOW, bell::RC8_EVENTS_PER_WINDOW),
             notifications: bell::TerminalNotificationQueue::new(bell::NOTIFICATION_QUEUE_CAPACITY),
@@ -1313,6 +1313,10 @@ impl Runtime {
         // defaults, ANSI, emitted fills) and the surface (clear color).
         runtime.renderer.set_theme_palette(config.theme);
         runtime.surface.set_theme_palette(config.theme);
+        // CTX-0756 (issue #1359): seed the configured default cursor shape
+        // (effective `terminal.cursor_style`) so new panes start on it and
+        // app `DECSCUSR 0` resets resolve back to it.
+        runtime.state.set_default_cursor_style(config.cursor_style);
         runtime.init_workspaces();
         runtime.reload_backgrounds()?;
         Ok(runtime)
@@ -1443,7 +1447,7 @@ impl Runtime {
             url_opener: Box::new(plugin::SystemUrlOpener),
             url_activations: 0,
             url_activation_refusals: 0,
-            bell_mode: bell::BellMode::default(),
+            bell_mode: config.bell_mode,
             osc_notification_allowed: false,
             bell_limiter: bell::Rc8Limiter::new(bell::RC8_WINDOW, bell::RC8_EVENTS_PER_WINDOW),
             notifications: bell::TerminalNotificationQueue::new(bell::NOTIFICATION_QUEUE_CAPACITY),
@@ -1515,6 +1519,10 @@ impl Runtime {
         // defaults, ANSI, emitted fills) and the surface (clear color).
         runtime.renderer.set_theme_palette(config.theme);
         runtime.surface.set_theme_palette(config.theme);
+        // CTX-0756 (issue #1359): seed the configured default cursor shape
+        // (effective `terminal.cursor_style`) so new panes start on it and
+        // app `DECSCUSR 0` resets resolve back to it.
+        runtime.state.set_default_cursor_style(config.cursor_style);
         runtime.init_workspaces();
         runtime.reload_backgrounds()?;
         Ok(runtime)

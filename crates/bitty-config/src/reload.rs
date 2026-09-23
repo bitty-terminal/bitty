@@ -115,6 +115,8 @@ impl std::fmt::Display for ReloadClass {
 /// | `terminal.shell`          | RestartRequired    |
 /// | `terminal.scroll_lines_per_notch` | RestartRequired |
 /// | `terminal.scroll_pixels_per_notch` | RestartRequired |
+/// | `terminal.cursor_style`         | RestartRequired    |
+/// | `terminal.bell`                 | RestartRequired    |
 /// | `selection.auto_copy`     | RestartRequired    |
 /// | `close_confirm`           | RestartRequired    |
 /// | `layout.gaps_in`          | RestartRequired    |
@@ -182,6 +184,8 @@ pub fn classify_field(field: &str) -> ReloadClass {
         | "terminal.shell"
         | "terminal.scroll_lines_per_notch"
         | "terminal.scroll_pixels_per_notch"
+        | "terminal.cursor_style"
+        | "terminal.bell"
         | "terminal"
         | "selection.auto_copy"
         | "selection"
@@ -401,6 +405,20 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
         "terminal.scroll_pixels_per_notch",
         old.terminal.scroll_pixels_per_notch.to_string(),
         new.terminal.scroll_pixels_per_notch.to_string(),
+    );
+    // CTX-0756 (issue #1359): cursor shape and bell behavior are adopted at
+    // startup (RuntimeConfig is built once from the effective config and
+    // terminals are created once), so changes are restart-required, not
+    // live — like scrollback above.
+    push_if_changed(
+        "terminal.cursor_style",
+        old.terminal.cursor_style.as_str().to_string(),
+        new.terminal.cursor_style.as_str().to_string(),
+    );
+    push_if_changed(
+        "terminal.bell",
+        old.terminal.bell.as_str().to_string(),
+        new.terminal.bell.as_str().to_string(),
     );
     // CTX-0191: auto-copy is adopted at startup (RuntimeConfig is built once
     // from the effective config), so changes are restart-required, not live.
@@ -898,6 +916,18 @@ mod tests {
             classify_field("terminal.scroll_pixels_per_notch"),
             ReloadClass::RestartRequired
         );
+        // CTX-0756 (issue #1359): cursor shape and bell behavior are
+        // adopted at startup (RuntimeConfig built once, terminals created
+        // once), so changes are restart-required, not live.
+        assert_eq!(
+            classify_field("terminal.cursor_style"),
+            ReloadClass::RestartRequired
+        );
+        assert_eq!(
+            classify_field("terminal.bell"),
+            ReloadClass::RestartRequired
+        );
+        assert_eq!(classify_field("terminal"), ReloadClass::RestartRequired);
         // CTX-0191: auto-copy is restart-required (adopted at startup).
         assert_eq!(
             classify_field("selection.auto_copy"),
@@ -1051,6 +1081,28 @@ mod tests {
                 .iter()
                 .any(|d| d.field == "terminal.scroll_pixels_per_notch")
         );
+    }
+
+    #[test]
+    fn diff_cursor_style_and_bell_are_restart_required() {
+        // CTX-0756 (issue #1359): flipping the cursor shape or the bell
+        // behavior must surface as a restart-required diff (adopted at
+        // startup; no silent no-op on reload).
+        use crate::types::{BellMode, CursorStyle};
+        let old = EffectiveConfig::default();
+        assert_eq!(old.terminal.cursor_style, CursorStyle::Default);
+        assert_eq!(old.terminal.bell, BellMode::Visual);
+        let mut new = old.clone();
+        new.terminal.cursor_style = CursorStyle::SteadyBar;
+        new.terminal.bell = BellMode::Off;
+        let r = diff(&old, &new);
+        assert_eq!(r.overall, ReloadClass::RestartRequired);
+        assert!(r.needs_restart);
+        assert!(r.diffs.iter().any(|d| d.field == "terminal.cursor_style"));
+        assert!(r.diffs.iter().any(|d| d.field == "terminal.bell"));
+        // Live reconcile must reject the restart-required change.
+        let mut cur = old;
+        assert!(reconcile_live(&mut cur, &new).is_err());
     }
 
     #[test]

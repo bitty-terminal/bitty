@@ -409,7 +409,10 @@ impl TrustStore {
 ///
 /// The allowed subset in this draft: `font`, `window`, `layout`,
 /// `terminal.scrollback`, `terminal.scroll_lines_per_notch`,
-/// `terminal.scroll_pixels_per_notch`, `selection.auto_copy`,
+/// `terminal.scroll_pixels_per_notch`, `terminal.cursor_style`,
+/// `terminal.bell` (CTX-0756: presentation-only chrome like scroll speed;
+/// `bell` never grants OSC 9/777 notification permission, which stays
+/// deny-by-default), `selection.auto_copy`,
 /// `decoration` (geometry and the CTX-0340 outline colors), `scrollbar`,
 /// `mouse`, `appearance`, `views` (CTX-0343 per-View appearance; like
 /// `decoration`, presentation-only chrome, still grammar/bounds checked).

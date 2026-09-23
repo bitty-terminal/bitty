@@ -611,6 +611,44 @@ fn decscusr_tracks_style_in_snapshot_and_ris_resets() {
 }
 
 #[test]
+fn configured_default_cursor_style_seeds_and_resolves_resets() {
+    // CTX-0756 (issue #1359 `terminal.cursor_style`): one setter call at
+    // creation seeds a fresh pane and resolves every later app `DECSCUSR 0`
+    // reset back to the configured shape; explicit app shapes still apply;
+    // RIS restores the configured shape (not the hardcoded fallback); and
+    // the setter never clobbers an app-reshaped live cursor.
+    let mut s = State::new();
+    s.set_default_cursor_style(CursorStyle::SteadyBar);
+    assert_eq!(s.default_cursor_style(), CursorStyle::SteadyBar);
+    assert_eq!(s.snapshot().cursor.cursor_style, CursorStyle::SteadyBar);
+    // App reset (CSI 0 SP q) resolves back to the configured shape.
+    s.apply(&TerminalAction::CursorStyle {
+        style: CursorStyle::Default,
+    });
+    assert_eq!(s.snapshot().cursor.cursor_style, CursorStyle::SteadyBar);
+    // Explicit app shapes still win at runtime.
+    s.apply(&TerminalAction::CursorStyle {
+        style: CursorStyle::BlinkingUnderline,
+    });
+    assert_eq!(
+        s.snapshot().cursor.cursor_style,
+        CursorStyle::BlinkingUnderline
+    );
+    // Re-seeding while the app owns the shape only moves the stored
+    // default, never the live cursor.
+    s.set_default_cursor_style(CursorStyle::SteadyBlock);
+    assert_eq!(s.default_cursor_style(), CursorStyle::SteadyBlock);
+    assert_eq!(
+        s.snapshot().cursor.cursor_style,
+        CursorStyle::BlinkingUnderline
+    );
+    // RIS restores the configured shape.
+    s.apply(&TerminalAction::FullReset);
+    assert_eq!(s.snapshot().cursor.cursor_style, CursorStyle::SteadyBlock);
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
 fn alt_screen_exit_restores_saved_cursor_style() {
     // CTX-0162: alt-screen apps (nvim) set their own DECSCUSR shape;
     // leaving must restore the primary shape instead of leaking bar.

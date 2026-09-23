@@ -72,6 +72,8 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "terminal.shell"
         | "terminal.scroll_lines_per_notch"
         | "terminal.scroll_pixels_per_notch"
+        | "terminal.cursor_style"
+        | "terminal.bell"
         | "selection.auto_copy"
         | "layout.gaps_in"
         | "layout.gaps_out"
@@ -542,6 +544,8 @@ const ATTRIBUTED_FIELDS: &[&str] = &[
     "terminal.shell",
     "terminal.scroll_lines_per_notch",
     "terminal.scroll_pixels_per_notch",
+    "terminal.cursor_style",
+    "terminal.bell",
     "terminal",
     "selection.auto_copy",
     "selection",
@@ -811,6 +815,8 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
                 "terminal.shell",
                 "terminal.scroll_lines_per_notch",
                 "terminal.scroll_pixels_per_notch",
+                "terminal.cursor_style",
+                "terminal.bell",
             ] {
                 if is_policy {
                     policy_fields.insert(field.to_string(), src.clone());
@@ -837,6 +843,12 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
                     }
                     "terminal.scroll_pixels_per_notch" => {
                         effective.terminal.scroll_pixels_per_notch = term.scroll_pixels_per_notch;
+                    }
+                    "terminal.cursor_style" => {
+                        effective.terminal.cursor_style = term.cursor_style;
+                    }
+                    "terminal.bell" => {
+                        effective.terminal.bell = term.bell;
                     }
                     _ => {}
                 }
@@ -1967,6 +1979,8 @@ fn merge_layers_allow_policy_violations(
                 "terminal.shell",
                 "terminal.scroll_lines_per_notch",
                 "terminal.scroll_pixels_per_notch",
+                "terminal.cursor_style",
+                "terminal.bell",
             ] {
                 if is_policy {
                     policy_fields.insert(field.to_string(), src.clone());
@@ -1993,6 +2007,12 @@ fn merge_layers_allow_policy_violations(
                     }
                     "terminal.scroll_pixels_per_notch" => {
                         effective.terminal.scroll_pixels_per_notch = term.scroll_pixels_per_notch;
+                    }
+                    "terminal.cursor_style" => {
+                        effective.terminal.cursor_style = term.cursor_style;
+                    }
+                    "terminal.bell" => {
+                        effective.terminal.bell = term.bell;
                     }
                     _ => {}
                 }
@@ -3569,6 +3589,16 @@ mod tests {
             merge_class_for("terminal.scroll_pixels_per_notch"),
             Some(MergeClass::ScalarReplace)
         );
+        // CTX-0756 (issue #1359): cursor shape and bell behavior are
+        // scalar-replace leaves under `terminal`, like the scroll-speed keys.
+        assert_eq!(
+            merge_class_for("terminal.cursor_style"),
+            Some(MergeClass::ScalarReplace)
+        );
+        assert_eq!(
+            merge_class_for("terminal.bell"),
+            Some(MergeClass::ScalarReplace)
+        );
         // CTX-0191: selection opt-out is scalar-replace like scrollback.
         assert_eq!(
             merge_class_for("selection.auto_copy"),
@@ -3617,6 +3647,7 @@ mod tests {
                     shell: None,
                     scroll_lines_per_notch: 5,
                     scroll_pixels_per_notch: 24,
+                    ..Default::default()
                 }),
                 ..Default::default()
             },
@@ -3629,6 +3660,7 @@ mod tests {
                     shell: None,
                     scroll_lines_per_notch: 2,
                     scroll_pixels_per_notch: 8,
+                    ..Default::default()
                 }),
                 ..Default::default()
             },
@@ -3649,6 +3681,68 @@ mod tests {
                 .iter()
                 .any(|c| c.field == "terminal.scroll_lines_per_notch")
         );
+    }
+
+    #[test]
+    fn later_layer_wins_terminal_cursor_style_and_bell() {
+        // CTX-0756 (issue #1359): cursor shape and bell behavior resolve by
+        // layer precedence with source attribution; no layers at all leaves
+        // the fail-closed defaults (`default` block fallback, `visual`
+        // flash) attributed to core defaults.
+        use crate::types::{BellMode, CursorStyle, TerminalConfig};
+        let user = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                terminal: Some(TerminalConfig {
+                    scrollback: 10_000,
+                    shell: None,
+                    cursor_style: CursorStyle::SteadyBar,
+                    bell: BellMode::Both,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        let cli = LayeredPlan::new(
+            ConfigSource::new(LayerKind::Cli, Some("cli")),
+            ConfigPlan {
+                terminal: Some(TerminalConfig {
+                    scrollback: 10_000,
+                    shell: None,
+                    cursor_style: CursorStyle::BlinkingUnderline,
+                    bell: BellMode::Off,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        let merged = merge_layers(vec![user, cli]).expect("merge");
+        assert_eq!(
+            merged.effective.terminal.cursor_style,
+            CursorStyle::BlinkingUnderline
+        );
+        assert_eq!(merged.effective.terminal.bell, BellMode::Off);
+        assert_eq!(
+            merged.source_of("terminal.cursor_style").unwrap().layer,
+            LayerKind::Cli
+        );
+        assert_eq!(
+            merged.source_of("terminal.bell").unwrap().layer,
+            LayerKind::Cli
+        );
+        assert!(
+            merged
+                .conflicts
+                .iter()
+                .any(|c| c.field == "terminal.cursor_style")
+        );
+        assert!(merged.conflicts.iter().any(|c| c.field == "terminal.bell"));
+        let merged_default = merge_layers(vec![]).expect("merge");
+        assert_eq!(
+            merged_default.effective.terminal.cursor_style,
+            CursorStyle::Default
+        );
+        assert_eq!(merged_default.effective.terminal.bell, BellMode::Visual);
     }
 
     #[test]

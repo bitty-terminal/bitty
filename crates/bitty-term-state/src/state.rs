@@ -195,6 +195,11 @@ pub struct State {
     enhanced_keyboard_stash: EnhancedKeyboardState,
     saved_cursors: [Option<SavedCursor>; 2],
     cursor: Cursor,
+    /// Configured default cursor shape (CTX-0756, issue #1359
+    /// `terminal.cursor_style`). Seeds new panes and resolves an app
+    /// `DECSCUSR 0` (`CursorStyle::Default`) reset; `Default` itself means
+    /// the renderer's block fallback.
+    default_cursor_style: CursorStyle,
     modes: Modes,
     scroll_region_top: u16,
     scroll_region_bottom: u16,
@@ -255,6 +260,7 @@ impl State {
             enhanced_keyboard_stash: EnhancedKeyboardState::default(),
             saved_cursors: [None, None],
             cursor: Cursor::default(),
+            default_cursor_style: CursorStyle::Default,
             modes: Modes::default(),
             scroll_region_top: 0,
             scroll_region_bottom: (GRID_ROWS - 1) as u16,
@@ -276,6 +282,38 @@ impl State {
             batch_scroll_events: Vec::new(),
             telemetry: TelemetryCounters::default(),
             images: ImageStore::new(),
+        }
+    }
+
+    /// Configured default cursor shape (CTX-0756, issue #1359).
+    #[must_use]
+    pub fn default_cursor_style(&self) -> CursorStyle {
+        self.default_cursor_style
+    }
+
+    /// Sets the configured default cursor shape (the effective
+    /// `terminal.cursor_style` value, applied by the runtime at terminal
+    /// creation).
+    ///
+    /// The stored default resolves every later app `DECSCUSR 0` reset. When
+    /// the live cursor still shows `Default` (a fresh pane, or one the app
+    /// never reshaped) it is seeded to `style` as well, so one call at
+    /// creation establishes both; an app-reshaped live cursor is never
+    /// clobbered.
+    pub fn set_default_cursor_style(&mut self, style: CursorStyle) {
+        self.default_cursor_style = style;
+        if self.cursor.cursor_style == CursorStyle::Default {
+            self.cursor.cursor_style = style;
+        }
+    }
+
+    /// Resolves an incoming `DECSCUSR` style against the configured
+    /// default: `Default` (app reset, `CSI 0 SP q`) maps back to
+    /// [`Self::default_cursor_style`]; every explicit shape applies as-is.
+    fn resolve_cursor_style(&self, style: CursorStyle) -> CursorStyle {
+        match style {
+            CursorStyle::Default => self.default_cursor_style,
+            other => other,
         }
     }
 
@@ -1055,7 +1093,9 @@ impl State {
             TerminalAction::CursorPosition { row, col } => self.cursor_position(*row, *col),
             TerminalAction::CursorSave => self.cursor_save(),
             TerminalAction::CursorRestore => self.cursor_restore(),
-            TerminalAction::CursorStyle { style } => self.cursor.cursor_style = *style,
+            TerminalAction::CursorStyle { style } => {
+                self.cursor.cursor_style = self.resolve_cursor_style(*style);
+            }
             TerminalAction::CursorVisibility { visible } => self.cursor.visible = *visible,
 
             TerminalAction::EraseInDisplay { mode } => self.erase_in_display(*mode),
@@ -2137,6 +2177,7 @@ impl State {
         self.enhanced_keyboard_stash = EnhancedKeyboardState::default();
         self.saved_cursors = [None, None];
         self.cursor = Cursor::default();
+        self.cursor.cursor_style = self.default_cursor_style;
         self.modes = Modes::default();
         self.scroll_region_top = 0;
         self.scroll_region_bottom = self.height as u16 - 1;

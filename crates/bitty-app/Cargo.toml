@@ -27,6 +27,7 @@ bitty-runtime = { path = "../bitty-runtime" }
 bitty-render = { path = "../bitty-render" }
 bitty-rich = { path = "../bitty-rich" }
 bitty-term-state = { path = "../bitty-term-state" }
+bitty-vt = { path = "../bitty-vt" }
 pollster = { workspace = true }
 
 [dev-dependencies]

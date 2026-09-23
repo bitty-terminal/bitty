@@ -687,6 +687,22 @@ pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                 println!(
                     "{}",
                     check_row(
+                        "terminal.cursor_style",
+                        e.terminal.cursor_style.as_str().to_string(),
+                        &src("terminal.cursor_style")
+                    )
+                );
+                println!(
+                    "{}",
+                    check_row(
+                        "terminal.bell",
+                        e.terminal.bell.as_str().to_string(),
+                        &src("terminal.bell")
+                    )
+                );
+                println!(
+                    "{}",
+                    check_row(
                         "selection.auto_copy",
                         format!("{}", e.selection.auto_copy),
                         &src("selection.auto_copy")
@@ -1380,6 +1396,33 @@ pub(crate) fn runtime_config_from_effective_with_warnings(
         // CTX-0297: effective `terminal.scrollback` is carried the same way;
         // terminal creation captures it as the retention cap.
         cfg.scrollback = scrollback;
+        // CTX-0756 (issue #1359): `terminal.cursor_style` flows file ->
+        // effective -> runtime by value (`bitty-runtime` owns no
+        // `bitty-config` dependency); the match is total with a fail-closed
+        // `Default` fallback so a future variant drift can never misroute
+        // the pane seed into a shape the renderer does not know (upstream
+        // `bitty-config` only ever yields the seven `DECSCUSR` spellings).
+        cfg.cursor_style = match effective.terminal.cursor_style {
+            bitty_config::CursorStyle::BlinkingBlock => bitty_vt::CursorStyle::BlinkingBlock,
+            bitty_config::CursorStyle::SteadyBlock => bitty_vt::CursorStyle::SteadyBlock,
+            bitty_config::CursorStyle::BlinkingUnderline => {
+                bitty_vt::CursorStyle::BlinkingUnderline
+            }
+            bitty_config::CursorStyle::SteadyUnderline => bitty_vt::CursorStyle::SteadyUnderline,
+            bitty_config::CursorStyle::BlinkingBar => bitty_vt::CursorStyle::BlinkingBar,
+            bitty_config::CursorStyle::SteadyBar => bitty_vt::CursorStyle::SteadyBar,
+            bitty_config::CursorStyle::Default => bitty_vt::CursorStyle::Default,
+        };
+        // CTX-0756 (issue #1359): `terminal.bell` flows the same way; the
+        // match is total with a fail-closed `Visual` fallback so a future
+        // variant drift can never silence the bell into `Off` (upstream
+        // only ever yields `off`/`visual`/`audible`/`both`).
+        cfg.bell_mode = match effective.terminal.bell {
+            bitty_config::BellMode::Off => bitty_runtime::BellMode::Off,
+            bitty_config::BellMode::Audible => bitty_runtime::BellMode::Audible,
+            bitty_config::BellMode::Both => bitty_runtime::BellMode::Both,
+            bitty_config::BellMode::Visual => bitty_runtime::BellMode::Visual,
+        };
         (cfg, warnings)
     })
     .map_err(|err| format!("bitty: invalid effective config for runtime: {err}"))

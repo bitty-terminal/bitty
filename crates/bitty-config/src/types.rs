@@ -1774,6 +1774,161 @@ impl WindowConfig {
 /// config can never exceed the startup bound).
 pub const MAX_TERMINAL_SCROLLBACK: u32 = 100_000;
 
+/// Default `terminal.cursor_style` (CTX-0756, issue #1359): `default`.
+pub const DEFAULT_CURSOR_STYLE: CursorStyle = CursorStyle::Default;
+
+/// Default `terminal.bell` (CTX-0756, issue #1359): `visual`.
+pub const DEFAULT_BELL_MODE: BellMode = BellMode::Visual;
+
+/// Default cursor rendering shape (CTX-0756, issue #1359
+/// `terminal.cursor_style`).
+///
+/// Mirrors `bitty_vt::CursorStyle` by value (`bitty-config` owns no
+/// workspace-crate dependency; `bitty-app` maps the effective value across
+/// at startup and the two defaults must stay equal — covered by a
+/// cross-crate test in `bitty-app`). `Default` means "the renderer's block
+/// fallback"; every other variant is an explicit `DECSCUSR` shape and also
+/// seeds new panes (the terminal-state default-style resolver maps an app
+/// `DECSCUSR 0` reset back to the configured value).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum CursorStyle {
+    /// Renderer block fallback; also the `DECSCUSR 0` reset target when no
+    /// explicit style is configured.
+    #[default]
+    Default,
+    /// Blinking block (`DECSCUSR 1`).
+    BlinkingBlock,
+    /// Steady block (`DECSCUSR 2`).
+    SteadyBlock,
+    /// Blinking underline (`DECSCUSR 3`).
+    BlinkingUnderline,
+    /// Steady underline (`DECSCUSR 4`).
+    SteadyUnderline,
+    /// Blinking bar (`DECSCUSR 5`).
+    BlinkingBar,
+    /// Steady bar (`DECSCUSR 6`).
+    SteadyBar,
+}
+
+impl CursorStyle {
+    /// Parses a config string (exact lowercase snake_case; fail-closed).
+    ///
+    /// Returns `None` for anything but the seven `DECSCUSR` spellings.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "default" => Some(Self::Default),
+            "blinking_block" => Some(Self::BlinkingBlock),
+            "steady_block" => Some(Self::SteadyBlock),
+            "blinking_underline" => Some(Self::BlinkingUnderline),
+            "steady_underline" => Some(Self::SteadyUnderline),
+            "blinking_bar" => Some(Self::BlinkingBar),
+            "steady_bar" => Some(Self::SteadyBar),
+            _ => None,
+        }
+    }
+
+    /// Validate a parsed value (total: the type can only hold accepted
+    /// variants; the exhaustive match keeps coverage explicit so a future
+    /// variant forces a review of the `bitty_vt::CursorStyle` mapping).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        match self {
+            Self::Default
+            | Self::BlinkingBlock
+            | Self::SteadyBlock
+            | Self::BlinkingUnderline
+            | Self::SteadyUnderline
+            | Self::BlinkingBar
+            | Self::SteadyBar => Ok(()),
+        }
+    }
+
+    /// Canonical config spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::BlinkingBlock => "blinking_block",
+            Self::SteadyBlock => "steady_block",
+            Self::BlinkingUnderline => "blinking_underline",
+            Self::SteadyUnderline => "steady_underline",
+            Self::BlinkingBar => "blinking_bar",
+            Self::SteadyBar => "steady_bar",
+        }
+    }
+}
+
+impl std::fmt::Display for CursorStyle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// User-visible bell behavior (CTX-0756, issue #1359 `terminal.bell`).
+///
+/// Mirrors `bitty_runtime::bell::BellMode` by value (`bitty-config` owns no
+/// workspace-crate dependency; `bitty-app` maps the effective value across
+/// at startup and the two defaults must stay equal — covered by a
+/// cross-crate test in `bitty-app`). `Audible`/`Both` request the
+/// owner-pending OS primitive (OQ-076, CTX-0754/#1361): until it lands an
+/// audible request is only counted, never sounded — the spelling is
+/// accepted so configs do not churn when the sink arrives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum BellMode {
+    /// No bell surface at all.
+    Off,
+    /// Visual flash only (the bounded default).
+    #[default]
+    Visual,
+    /// Audible request only (owner-pending: no OS primitive is wired yet).
+    Audible,
+    /// Visual flash plus audible request.
+    Both,
+}
+
+impl BellMode {
+    /// Parses a config string (exact lowercase; fail-closed).
+    ///
+    /// Returns `None` for anything but `"off"`, `"visual"`, `"audible"`,
+    /// `"both"`.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "off" => Some(Self::Off),
+            "visual" => Some(Self::Visual),
+            "audible" => Some(Self::Audible),
+            "both" => Some(Self::Both),
+            _ => None,
+        }
+    }
+
+    /// Validate a parsed value (total: the type can only hold accepted
+    /// variants; the exhaustive match keeps coverage explicit so a future
+    /// variant forces a review of the runtime `BellMode` mapping).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        match self {
+            Self::Off | Self::Visual | Self::Audible | Self::Both => Ok(()),
+        }
+    }
+
+    /// Canonical config spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Visual => "visual",
+            Self::Audible => "audible",
+            Self::Both => "both",
+        }
+    }
+}
+
+impl std::fmt::Display for BellMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Terminal behavior configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalConfig {
@@ -1787,6 +1942,14 @@ pub struct TerminalConfig {
     /// Smooth-scroll pixels per wheel notch, `1..=256` (CTX-0185; default 16,
     /// one default cell height per notch before the lines multiplier).
     pub scroll_pixels_per_notch: u32,
+    /// Default cursor rendering shape (CTX-0756, issue #1359
+    /// `terminal.cursor_style`; default `default` = renderer block
+    /// fallback). Seeds new panes and resolves app `DECSCUSR 0` resets.
+    pub cursor_style: CursorStyle,
+    /// User-visible bell behavior (CTX-0756, issue #1359 `terminal.bell`;
+    /// default `visual`). `audible`/`both` count without sounding until the
+    /// owner-pending OS primitive lands (OQ-076, CTX-0754/#1361).
+    pub bell: BellMode,
 }
 
 impl Default for TerminalConfig {
@@ -1796,6 +1959,8 @@ impl Default for TerminalConfig {
             shell: None,
             scroll_lines_per_notch: DEFAULT_SCROLL_LINES_PER_NOTCH,
             scroll_pixels_per_notch: DEFAULT_SCROLL_PIXELS_PER_NOTCH,
+            cursor_style: DEFAULT_CURSOR_STYLE,
+            bell: DEFAULT_BELL_MODE,
         }
     }
 }
@@ -1821,6 +1986,14 @@ impl TerminalConfig {
                 format!("must be within [1, {MAX_SCROLL_PIXELS_PER_NOTCH}]"),
             ));
         }
+        // CTX-0756: closed enums are total, but the explicit calls keep a
+        // future variant from slipping past review (see `CloseConfirm`).
+        self.cursor_style
+            .validate()
+            .map_err(|e| ConfigError::validation("terminal.cursor_style", e.to_string()))?;
+        self.bell
+            .validate()
+            .map_err(|e| ConfigError::validation("terminal.bell", e.to_string()))?;
         if let Some(s) = &self.shell {
             let t = s.trim();
             if t.is_empty() {
@@ -3440,6 +3613,69 @@ mod tests {
             .validate()
             .expect("boundary scroll speed must be valid");
         }
+    }
+
+    #[test]
+    fn cursor_style_and_bell_parse_round_trip_with_fail_closed_defaults() {
+        // CTX-0756 (issue #1359): both leaves accept only their exact
+        // lowercase spellings; everything else fails closed (`parse` ->
+        // None). Defaults are `default` (renderer block fallback) and
+        // `visual` (bounded flash) in the constants, the enums, and the
+        // effective config.
+        assert_eq!(DEFAULT_CURSOR_STYLE, CursorStyle::Default);
+        assert_eq!(CursorStyle::default(), CursorStyle::Default);
+        assert_eq!(DEFAULT_BELL_MODE, BellMode::Visual);
+        assert_eq!(BellMode::default(), BellMode::Visual);
+        assert_eq!(
+            EffectiveConfig::default().terminal.cursor_style,
+            CursorStyle::Default
+        );
+        assert_eq!(EffectiveConfig::default().terminal.bell, BellMode::Visual);
+        for (raw, expected) in [
+            ("default", CursorStyle::Default),
+            ("blinking_block", CursorStyle::BlinkingBlock),
+            ("steady_block", CursorStyle::SteadyBlock),
+            ("blinking_underline", CursorStyle::BlinkingUnderline),
+            ("steady_underline", CursorStyle::SteadyUnderline),
+            ("blinking_bar", CursorStyle::BlinkingBar),
+            ("steady_bar", CursorStyle::SteadyBar),
+        ] {
+            let parsed = CursorStyle::parse(raw).expect("accepted spelling");
+            assert_eq!(parsed, expected);
+            assert_eq!(parsed.as_str(), raw);
+            assert_eq!(parsed.to_string(), raw);
+            parsed.validate().expect("parsed value valid");
+        }
+        for (raw, expected) in [
+            ("off", BellMode::Off),
+            ("visual", BellMode::Visual),
+            ("audible", BellMode::Audible),
+            ("both", BellMode::Both),
+        ] {
+            let parsed = BellMode::parse(raw).expect("accepted spelling");
+            assert_eq!(parsed, expected);
+            assert_eq!(parsed.as_str(), raw);
+            assert_eq!(parsed.to_string(), raw);
+            parsed.validate().expect("parsed value valid");
+        }
+        for bad in [
+            "",
+            "block",
+            "BAR",
+            "Blinking_Block",
+            "loud",
+            "VISUAL",
+            "none",
+        ] {
+            assert!(CursorStyle::parse(bad).is_none(), "cursor rejects {bad:?}");
+            assert!(BellMode::parse(bad).is_none(), "bell rejects {bad:?}");
+        }
+        TerminalConfig::default()
+            .validate()
+            .expect("default terminal valid");
+        EffectiveConfig::default()
+            .validate()
+            .expect("default effective valid");
     }
 
     #[test]

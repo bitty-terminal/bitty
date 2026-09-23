@@ -197,6 +197,7 @@ dependencies = [
  "bitty-runtime",
  "bitty-term-state",
  "bitty-test-support",
+ "bitty-vt",
  "pollster",
 ]
 

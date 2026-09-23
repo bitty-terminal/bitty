@@ -1318,21 +1318,34 @@ impl Runtime {
                     self.wheel_line_accum_x = 0.0;
                     // Viewport scroll
                     if lines_y != 0 {
-                        // winit LineDelta y>0 = wheel up; View::scroll_by
-                        // positive = up into history, so delta is +lines.
-                        let max = self.state.scrollback_len();
-                        if let Some(view_id) = self.focused_view() {
-                            if let Some(view) = self.layout.find_leaf_mut(view_id) {
-                                view.scroll_by(lines_y, max);
-                            }
+                        // #1338 fail-closed: the alternate screen owns no
+                        // scrollback view, so a wheel that reached this
+                        // branch (no alternate scroll, no mouse capture, no
+                        // modal) is inert there — never a viewport scroll.
+                        // Drain the fraction so it cannot leak into a later
+                        // primary-screen session.
+                        if self.focused_alt_screen_active() {
+                            self.wheel_line_accum_y = 0.0;
                         } else {
-                            // Single-window fallback: find leaf 1
-                            if let Some(view) = self.layout.find_leaf_mut(ViewId::new(1)) {
-                                view.scroll_by(lines_y, max);
+                            // winit LineDelta y>0 = wheel up; View::scroll_by
+                            // positive = up into history, so delta is +lines.
+                            // #1338: focused-aware bound — split panes own
+                            // their shells, so the primary length would clamp
+                            // a focused split scroll to the wrong limit.
+                            let max = self.scrollback_len();
+                            if let Some(view_id) = self.focused_view() {
+                                if let Some(view) = self.layout.find_leaf_mut(view_id) {
+                                    view.scroll_by(lines_y, max);
+                                }
+                            } else {
+                                // Single-window fallback: find leaf 1
+                                if let Some(view) = self.layout.find_leaf_mut(ViewId::new(1)) {
+                                    view.scroll_by(lines_y, max);
+                                }
                             }
+                            self.wheel_line_accum_y -= lines_y as f32;
+                            self.pending_full_redraw = true;
                         }
-                        self.wheel_line_accum_y -= lines_y as f32;
-                        self.pending_full_redraw = true;
                     }
                 }
             }
@@ -1364,9 +1377,17 @@ impl Runtime {
     /// less-like paging behind the `scroll_page_up`/`scroll_page_down`
     /// chrome actions). Clamped to `[0, scrollback_len]`; bounded to one
     /// leaf mutation plus a redraw flag. Returns false only when no leaf
-    /// holds the focused id (empty or stale layout).
+    /// holds the focused id (empty or stale layout). #1338: inert on the
+    /// alternate screen (no scrollback view there), and clamped to the
+    /// focused pane's own backing store under splits.
     pub fn scroll_focused_page(&mut self, up: bool) -> bool {
-        let max = self.state.scrollback_len();
+        // #1338 fail-closed: zero bound on the alternate screen, so paging
+        // is a no-op there; focused-aware bound under splits.
+        let max = if self.focused_alt_screen_active() {
+            0
+        } else {
+            self.scrollback_len()
+        };
         let target = match self.focused_view() {
             Some(id) => id,
             None => return false,

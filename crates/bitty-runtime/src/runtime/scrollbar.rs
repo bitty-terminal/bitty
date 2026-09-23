@@ -80,6 +80,11 @@ impl Runtime {
         if width == 0 {
             return None;
         }
+        // #1338 fail-closed: the alternate screen owns no scrollback view,
+        // so no thumb paints there even with retained primary history.
+        if self.focused_alt_screen_active() {
+            return None;
+        }
         let frames = self.present_frames();
         let fid = self
             .focused_view()

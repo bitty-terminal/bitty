@@ -434,12 +434,17 @@ impl Runtime {
         let _damage = self.state.resize(cols, rows);
         self.cols = cols;
         self.rows = rows;
-        // Clamp any leaf View scroll offsets to the new scrollback limit
+        // Clamp any leaf View scroll offsets to its own backing store
         // (scrollback may have been truncated on shrink, though we preserve
-        // ids; clamp keeps offset in-bounds deterministically).
-        let max_scrollback = self.state.scrollback_len();
+        // ids; clamp keeps offset in-bounds deterministically). #1338: split
+        // panes own their shells, so the primary length is the wrong bound
+        // for a focused split leaf.
         let ids = self.layout.leaf_ids();
         for id in ids {
+            let max_scrollback = match self.pane_sessions.get(&id) {
+                Some(sess) => sess.state.scrollback_len(),
+                None => self.state.scrollback_len(),
+            };
             if let Some(view) = self.layout.find_leaf_mut(id) {
                 view.clamp_scroll_offset(max_scrollback);
             }

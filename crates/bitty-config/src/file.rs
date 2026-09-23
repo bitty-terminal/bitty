@@ -39,6 +39,7 @@
 //!     mod_key = "alt", -- leader/mod for the shipped chrome map: "alt" (default) or "super" (CTX-0236)
 //!     leader_key = "ctrl+q", -- leader chord override: any chord spelling (default Alt+Space, Ctrl+Space on Windows; CTX-0715)
 //!     leader_timeout_ms = 1500, -- leader fail-open timeout in ms, 100..=60000 (default 1000; CTX-0715)
+//!     hints_enabled = true, -- hint session kill switch, default true = Leader arms (CTX-0735)
 //!     close_confirm = "when_busy", -- close safety: always | when_busy (default) | never (CTX-0370)
 //!     keymaps = {
 //!         { chord = "alt+h", action = "goto_split:left", context = "global" },
@@ -64,6 +65,12 @@
 //!   absent-means-silent contract (CTX-0715). When present it must be
 //!   `100..=60000` (default `1000`); anything else fails closed with the
 //!   `leader_timeout_ms` field path.
+//!
+//! - `hints_enabled` is a fully-optional top-level boolean with the same
+//!   absent-means-silent contract (CTX-0735 / OQ-089 #981). When present it
+//!   must be a boolean (default `true`); anything else fails closed with
+//!   the `hints_enabled` field path. `false` keeps the Leader from arming
+//!   a hint session (keys keep their normal owner).
 //!
 //! - `close_confirm` is a fully-optional top-level scalar with the same
 //!   absent-means-silent contract (CTX-0370). When present it must be
@@ -1781,6 +1788,12 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
         }
     };
 
+    // CTX-0735: `hints_enabled` is a fully-optional top-level boolean
+    // with the same absent-means-silent contract. The Lua layer already
+    // rejects non-booleans fail-closed, so this passes the value through
+    // (`None` resolves default-on downstream).
+    let hints_enabled = data.hints_enabled;
+
     // CTX-0370: `close_confirm` is a fully-optional top-level scalar with the
     // same absent-means-silent contract. When present it parses fail-closed
     // (`CloseConfirm::parse` accepts only always/when_busy/never) so existing
@@ -1822,6 +1835,7 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
         mod_key,
         leader_key,
         leader_timeout_ms,
+        hints_enabled,
         keymaps,
         plugins: None,
         profile_name: None,
@@ -2964,6 +2978,46 @@ mod tests {
         assert_eq!(
             merged.source_of("leader_timeout_ms").unwrap().layer,
             LayerKind::User
+        );
+    }
+
+    #[test]
+    fn lua_hints_enabled_parses_absent_means_silent_and_bad_fails_closed() {
+        // CTX-0735 (#981): absent says nothing (merge keeps lower, so the
+        // resolve stays default-on); present passes the boolean through;
+        // non-booleans fail closed on the `hints_enabled` field path.
+        let src = test_source();
+        let plan = parse_lua_config(r#"return { theme = "dark" }"#, &src).expect("no hints");
+        assert!(plan.hints_enabled.is_none());
+        let plan = parse_lua_config(r#"return { hints_enabled = false }"#, &src).expect("disabled");
+        assert_eq!(plan.hints_enabled, Some(false));
+        let plan = parse_lua_config(r#"return { hints_enabled = true }"#, &src).expect("enabled");
+        assert_eq!(plan.hints_enabled, Some(true));
+        for content in [
+            r#"return { hints_enabled = "false" }"#,
+            r#"return { hints_enabled = 0 }"#,
+            r#"return { hints_enabled = 1 }"#,
+        ] {
+            let err = parse_lua_config(content, &src).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("hints_enabled"),
+                "must name field for {content:?}: {err}"
+            );
+        }
+        // End to end: the file layer's flag reaches the effective config
+        // with user attribution and resolves through `resolve_hint_config`.
+        let plan = parse_lua_config(r#"return { hints_enabled = false }"#, &src).expect("disabled");
+        let layer = LayeredPlan::new(src, plan);
+        let merged = resolve_effective(Some(layer), None).expect("merge");
+        assert_eq!(merged.effective.hints_enabled, Some(false));
+        assert_eq!(
+            merged.source_of("hints_enabled").unwrap().layer,
+            LayerKind::User
+        );
+        assert!(
+            !crate::keymap::resolve_hint_config(&merged.effective).enabled,
+            "effective false disables arming"
         );
     }
 

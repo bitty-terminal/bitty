@@ -1549,6 +1549,37 @@ pub fn resolve_leader_for(
     resolve_leader(effective.leader_key, effective.leader_timeout_ms, platform)
 }
 
+/// Effective hint session config (CTX-0735 / OQ-089 #981).
+///
+/// The OQ-089 label/authority/config follow-ups stay ordered after OQ-050
+/// anchors; this is the minimal config surface that is anchor-independent:
+/// a default-on kill switch. While disabled the Leader never arms a hint
+/// session and every key keeps its normal owner (fail-open routing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HintConfig {
+    /// Whether the Leader may arm a hint session (default `true`).
+    pub enabled: bool,
+}
+
+impl HintConfig {
+    /// Default-on hint config (no layer declared `hints_enabled`).
+    #[must_use]
+    pub const fn default_on() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// Resolve the effective hint config: the `hints_enabled` override when a
+/// layer declares it, else default-on. Infallible by construction (a raw
+/// boolean needs no range check); unknown shapes never reach here — the
+/// Lua layer rejects non-booleans fail-closed.
+#[must_use]
+pub fn resolve_hint_config(effective: &EffectiveConfig) -> HintConfig {
+    HintConfig {
+        enabled: effective.hints_enabled.unwrap_or(true),
+    }
+}
+
 /// Armed-window routing for one Leader press (CTX-0715 / OQ-088 timeout and
 /// cancel semantics).
 ///
@@ -3394,6 +3425,35 @@ mod tests {
         let leader = resolve_leader_for(&chord_only, LeaderPlatform::Other).expect("resolves");
         assert_eq!(leader.timeout_ms, LEADER_TIMEOUT_MS_DEFAULT);
         assert_eq!(leader.primary_canonical(), "alt+x");
+    }
+
+    #[test]
+    fn hint_config_resolves_default_on_and_explicit_off() {
+        // CTX-0735 (#981): no layer declaration resolves default-on; an
+        // explicit `false` disables arming; `true` re-enables.
+        assert_eq!(
+            resolve_hint_config(&EffectiveConfig::default()),
+            HintConfig::default_on(),
+            "absent hints_enabled stays default-on"
+        );
+        let disabled = EffectiveConfig {
+            hints_enabled: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_hint_config(&disabled),
+            HintConfig { enabled: false },
+            "explicit false disables"
+        );
+        let enabled = EffectiveConfig {
+            hints_enabled: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_hint_config(&enabled),
+            HintConfig { enabled: true },
+            "explicit true enables"
+        );
     }
 
     #[test]

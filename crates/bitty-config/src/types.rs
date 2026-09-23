@@ -2744,6 +2744,10 @@ pub struct EffectiveConfig {
     /// fail-closed against [`crate::keymap::LEADER_TIMEOUT_MS_MIN`]..=
     /// [`crate::keymap::LEADER_TIMEOUT_MS_MAX`].
     pub leader_timeout_ms: Option<u64>,
+    /// Hint session kill switch (CTX-0735 / OQ-089 #981; `None` means
+    /// default-on). Honored by [`crate::keymap::resolve_hint_config`];
+    /// the app input path refuses to arm a hint session while disabled.
+    pub hints_enabled: Option<bool>,
     /// Keymaps, possibly empty.
     pub keymaps: Vec<KeymapEntry>,
     /// Plugins, possibly empty.
@@ -2773,6 +2777,7 @@ impl Default for EffectiveConfig {
             mod_key: ModKey::default(),
             leader_key: None,
             leader_timeout_ms: None,
+            hints_enabled: None,
             keymaps: Vec::new(),
             plugins: Vec::new(),
             profile: None,

@@ -75,6 +75,11 @@ pub struct ConfigPlan {
     /// nothing"; the file layer parses it from the top-level
     /// `leader_timeout_ms` integer.
     pub leader_timeout_ms: Option<u64>,
+    /// Hint session kill switch (CTX-0735 / OQ-089 #981; scalar-replace
+    /// like `mod_key`). `None` means "this layer says nothing"; the file
+    /// layer reads the top-level `hints_enabled` boolean (`None` resolves
+    /// default-on via [`crate::keymap::resolve_hint_config`]).
+    pub hints_enabled: Option<bool>,
     /// Key mappings (full set for this layer).
     pub keymaps: Option<Vec<KeymapEntry>>,
     /// Plugin set (full set for this layer).
@@ -289,6 +294,7 @@ impl ConfigPlan {
             && self.mod_key.is_none()
             && self.leader_key.is_none()
             && self.leader_timeout_ms.is_none()
+            && self.hints_enabled.is_none()
             && self.keymaps.is_none()
             && self.plugins.is_none()
             && self.extends.is_none()

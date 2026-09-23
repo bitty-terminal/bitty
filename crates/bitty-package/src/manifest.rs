@@ -320,6 +320,7 @@ pub const CLOSED_CAPABILITY_HEADS: &[&str] = &[
     "ui.protocol-register",
     "clipboard.read",
     "clipboard.write",
+    "env.read",
     "fs.read",
     "fs.write",
     "process.spawn",
@@ -366,6 +367,7 @@ pub fn capability_requires_param(head: &str) -> bool {
             | "network.connect"
             | "mcp.invoke"
             | "agent.memory"
+            | "env.read"
     )
 }
 
@@ -943,6 +945,7 @@ mod tests {
         assert!(CapabilityId::new("agent.evil").is_err());
         // Parameter rules are part of the closed set.
         assert!(CapabilityId::new("fs.read").is_err());
+        assert!(CapabilityId::new("env.read").is_err());
         assert!(CapabilityId::new("network.connect").is_err());
         assert!(CapabilityId::new("terminal.semantic-read:param").is_err());
         assert!(CapabilityId::new("ui.rich:param").is_err());
@@ -971,6 +974,7 @@ mod tests {
             "agent.context.terminal",
             "mcp.invoke:mail.list",
             "ai.provider",
+            "env.read:HOME",
         ] {
             assert!(
                 CapabilityId::new(raw).is_ok(),

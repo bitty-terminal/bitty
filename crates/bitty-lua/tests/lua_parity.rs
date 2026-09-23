@@ -7,12 +7,14 @@
 //! - `keymaps.suggest` — WIRED as a bridge capture (LUA-OQ-5).
 //! - `tasks.spawn`/`cancel` — WIRED as a bridge capture (LUA-OQ-9, RC-4).
 //! - `services.get`/`provide` — DEFERRED, typed `E_NOT_IMPLEMENTED` (LUA-OQ-8).
-//! - `env.get`/`has` — DEFERRED, typed `E_NOT_IMPLEMENTED` (ADR 0006).
+//! - `env.get`/`has` — GRANT-GATED via `HostServices::env_get`/`env_has`
+//!   (CTX-0330, ADR 0006): shape-validated at the bridge, `E_NOT_IMPLEMENTED`
+//!   until an `env.read:<KEY>` grant exists, values only for granted keys.
 //! - `process.spawn` — v1-OUT ruling: kept serving (CTX-0445 consent-gated
 //!   extra) but outside the v1 API guarantee.
 //!
 //! Follow-ups own the host backends (keymap application, task scheduling,
-//! service registry, grant-aware env) and the SDK `pending-host` flags.
+//! service registry) and the SDK `pending-host` flags.
 
 #![forbid(unsafe_code)]
 
@@ -404,6 +406,167 @@ fn env_get_has_are_not_implemented() {
         record_call(&mut vm, call);
         assert_code(&services, "E_NOT_IMPLEMENTED", "runtime", tag);
     }
+}
+
+/// Grant-aware stub backend for the CTX-0330 env seam: only `granted`
+/// keys resolve, everything else stays `E_NOT_IMPLEMENTED`.
+struct GrantedEnv {
+    store: RefCell<BTreeMap<String, LuaValue>>,
+    values: BTreeMap<String, String>,
+    granted: Vec<String>,
+}
+
+impl HostServices for GrantedEnv {
+    fn store_get(&self, key: &str) -> Result<Option<LuaValue>, BridgeError> {
+        Ok(self.store.borrow().get(key).cloned())
+    }
+
+    fn store_set(&self, key: &str, value: LuaValue) -> Result<(), BridgeError> {
+        if matches!(value, LuaValue::Nil) {
+            self.store.borrow_mut().remove(key);
+        } else {
+            self.store.borrow_mut().insert(key.to_string(), value);
+        }
+        Ok(())
+    }
+
+    fn settings_get(&self, _key: &str) -> Result<Option<LuaValue>, BridgeError> {
+        Ok(None)
+    }
+
+    fn env_get(&self, key: &str) -> Result<Option<LuaValue>, BridgeError> {
+        if !self.granted.iter().any(|granted| granted == key) {
+            return Err(BridgeError::not_implemented("bitty.env.get"));
+        }
+        Ok(self.values.get(key).cloned().map(LuaValue::String))
+    }
+
+    fn env_has(&self, key: &str) -> Result<bool, BridgeError> {
+        if !self.granted.iter().any(|granted| granted == key) {
+            return Err(BridgeError::not_implemented("bitty.env.has"));
+        }
+        Ok(self.values.contains_key(key))
+    }
+
+    fn terminal_snapshot(&self, _scope: &str) -> Result<LuaValue, BridgeError> {
+        Err(BridgeError::capability_denied("terminal.semantic-read"))
+    }
+
+    fn notify_show(&self, _payload: &LuaValue) -> Result<bool, BridgeError> {
+        Err(BridgeError::capability_denied("platform.notify"))
+    }
+}
+
+fn install_env(vm: &mut LuaVm, services: Rc<GrantedEnv>) {
+    let services: Rc<dyn HostServices> = services;
+    vm.install_host_module(services, MarshallingLimits::default(), 50)
+        .expect("install");
+}
+
+#[test]
+fn env_bridge_delegates_to_grant_aware_backend() {
+    let services = Rc::new(GrantedEnv {
+        store: RefCell::new(BTreeMap::new()),
+        values: BTreeMap::from([("HOME".to_string(), "/home/tester".to_string())]),
+        granted: vec!["HOME".to_string(), "EMPTY_VAR".to_string()],
+    });
+    let mut vm = gate_vm("parity-env-granted");
+    install_env(&mut vm, services.clone());
+    // Granted + present: value crosses; presence is true. Granted but
+    // absent from the host environment reads nil/false
+    // (absent-unless-declared carve-out).
+    let outcome = vm
+        .execute_bounded(
+            r#"
+            assert(bitty.env.get("HOME") == "/home/tester")
+            assert(bitty.env.has("HOME") == true)
+            assert(bitty.env.get("EMPTY_VAR") == nil)
+            assert(bitty.env.has("EMPTY_VAR") == false)
+        "#,
+        )
+        .expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{outcome:?}"
+    );
+    // Granted-but-absent reads nil/false (absent-unless-declared carve-out).
+    let outcome = vm
+        .execute_bounded("assert(bitty.env.get(\"EMPTY_VAR\") == nil)")
+        .expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn env_bridge_denies_ungranted_keys_without_leak() {
+    let services = Rc::new(GrantedEnv {
+        store: RefCell::new(BTreeMap::new()),
+        values: BTreeMap::from([("SECRET_KEY".to_string(), "s3cr3t".to_string())]),
+        granted: Vec::new(),
+    });
+    let mut vm = gate_vm("parity-env-denied");
+    install_env(&mut vm, services.clone());
+    // Unimplemented backend and ungranted key share one code: callers cannot
+    // probe which keys exist.
+    for (tag, call) in [
+        ("get", "bitty.env.get(\"SECRET_KEY\")"),
+        ("has", "bitty.env.has(\"SECRET_KEY\")"),
+    ] {
+        let outcome = vm
+            .execute_bounded(&format!(
+                r#"
+            local ok, err = pcall(function() return {call} end)
+            assert(not ok)
+            assert(err.code == "E_NOT_IMPLEMENTED")
+            assert(err.class == "runtime")
+            bitty.store.set("code-{tag}", err.code)
+        "#
+            ))
+            .expect("execute");
+        assert!(
+            matches!(outcome, BoundedExecution::Completed),
+            "{tag}: {outcome:?}"
+        );
+    }
+    assert_eq!(
+        services.store.borrow().get("code-get"),
+        Some(&LuaValue::String("E_NOT_IMPLEMENTED".to_string()))
+    );
+}
+
+#[test]
+fn env_bridge_rejects_malformed_keys_before_grants() {
+    let services = Rc::new(GrantedEnv {
+        store: RefCell::new(BTreeMap::new()),
+        values: BTreeMap::new(),
+        granted: vec!["HOME".to_string()],
+    });
+    let mut vm = gate_vm("parity-env-shape");
+    install_env(&mut vm, services.clone());
+    // Non-string, empty, bad-shape, and over-bound keys fail with validation
+    // codes before any grant check.
+    let outcome = vm
+        .execute_bounded(
+            r#"
+            local function code_of(call)
+                local ok, err = pcall(call)
+                assert(not ok)
+                return err.code
+            end
+            assert(code_of(function() return bitty.env.get(42) end) == "E_DEF_INVALID")
+            assert(code_of(function() return bitty.env.get("") end) == "E_DEF_INVALID")
+            assert(code_of(function() return bitty.env.get("has space") end) == "E_DEF_INVALID")
+            assert(code_of(function() return bitty.env.get("9LIVES") end) == "E_DEF_INVALID")
+            assert(code_of(function() return bitty.env.has(string.rep("A", 129)) end) == "E_DEF_LIMIT")
+        "#,
+        )
+        .expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{outcome:?}"
+    );
 }
 
 #[test]

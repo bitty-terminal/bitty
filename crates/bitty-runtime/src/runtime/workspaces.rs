@@ -225,21 +225,7 @@ impl Runtime {
     /// switch/new/close is reflected on the next call.
     #[must_use]
     pub fn workspaceline_text(&self) -> String {
-        let mut parts = Vec::with_capacity(self.workspaces.len());
-        for (idx, slot) in self.workspaces.iter().enumerate() {
-            let mark = if idx == self.active_workspace {
-                "*"
-            } else {
-                ""
-            };
-            parts.push(format!(
-                "{}:{}{}",
-                idx + 1,
-                truncate_ws_name(&slot.name),
-                mark
-            ));
-        }
-        let mut out = parts.join(" ");
+        let mut out = self.workspaceline_tokens().join(" ");
         out.push_str(&format!(" ({})", self.workspaces.len()));
         if out.len() <= WORKSPACELINE_MAX_CHARS {
             return out;
@@ -250,6 +236,167 @@ impl Runtime {
         }
         out.truncate(end);
         out
+    }
+
+    /// One rendered token per workspace slot (`{1-based}:{name}[*]`), in
+    /// index order. Shared by [`Self::workspaceline_text`] and
+    /// [`Self::workspaceline_hit_test`] so the bar text and its click
+    /// columns can never drift apart.
+    fn workspaceline_tokens(&self) -> Vec<String> {
+        self.workspaces
+            .iter()
+            .enumerate()
+            .map(|(idx, slot)| {
+                let mark = if idx == self.active_workspace {
+                    "*"
+                } else {
+                    ""
+                };
+                format!("{}:{}{}", idx + 1, truncate_ws_name(&slot.name), mark)
+            })
+            .collect()
+    }
+
+    /// Whether the workspace switcher bar presents (issue #1333).
+    ///
+    /// Default-on: seeded from [`crate::config::RuntimeConfig::workspaceline_visible`]
+    /// at construction. Presentation-only; toggling changes no workspace,
+    /// focus, or session state.
+    #[must_use]
+    pub fn workspaceline_visible(&self) -> bool {
+        self.workspaceline_visible
+    }
+
+    /// Live-toggle the switcher bar (opt-out path for `workspace.show_bar`).
+    /// Presentation-only; always succeeds.
+    pub fn set_workspaceline_visible(&mut self, visible: bool) {
+        self.workspaceline_visible = visible;
+        self.pending_full_redraw = true;
+    }
+
+    /// The bar string as chrome should present it, or `None` when opted
+    /// out. `Some` on the default config (bar renders by default).
+    #[must_use]
+    pub fn workspaceline_present(&self) -> Option<String> {
+        if self.workspaceline_visible {
+            Some(self.workspaceline_text())
+        } else {
+            None
+        }
+    }
+
+    /// Maps a bar column (0-based, in characters of
+    /// [`Self::workspaceline_text`]) to a workspace index. `None` when the
+    /// bar is hidden, when the column lands on a separator or the trailing
+    /// ` (count)` suffix, or when out of range — every unknown target fails
+    /// closed with no state change.
+    #[must_use]
+    pub fn workspaceline_hit_test(&self, column: usize) -> Option<usize> {
+        if !self.workspaceline_visible {
+            return None;
+        }
+        let mut start = 0usize;
+        for (idx, token) in self.workspaceline_tokens().iter().enumerate() {
+            let width = token.chars().count();
+            if column >= start && column < start + width {
+                return Some(idx);
+            }
+            // Single-space separator between tokens.
+            start += width + 1;
+        }
+        None
+    }
+
+    /// Mouse switching (issue #1333): a click at bar `column` switches to
+    /// the hit workspace. Returns `false` (no state change) when the bar is
+    /// hidden, the column hits no workspace, or the column names the
+    /// already-active workspace — including the single-workspace case, so a
+    /// lone workspace can never switch away from itself.
+    pub fn workspaceline_click(&mut self, column: usize) -> bool {
+        let Some(target) = self.workspaceline_hit_test(column) else {
+            return false;
+        };
+        if target == self.active_workspace {
+            return false;
+        }
+        self.workspace_switch(target)
+    }
+
+    /// Rename workspace `index` (0-based) to `name`.
+    ///
+    /// Fail-closed: unknown indices and blank names are refused with state
+    /// untouched; overlong names truncate at a char boundary to
+    /// [`WORKSPACE_NAME_MAX_CHARS`], mirroring the workspaceline display
+    /// bound. Names live on the slots (never stashed), so renaming the
+    /// active workspace takes effect on the next
+    /// [`Self::workspaceline_text`] call.
+    pub fn workspace_rename(&mut self, index: usize, name: &str) -> Result<(), String> {
+        if index >= self.workspaces.len() {
+            return Err(format!("no such workspace ws:{}", index.saturating_add(1)));
+        }
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err(String::from("workspace name must not be empty"));
+        }
+        if let Some(slot) = self.workspaces.get_mut(index) {
+            slot.name = truncate_ws_name(trimmed);
+        }
+        self.pending_full_redraw = true;
+        Ok(())
+    }
+
+    /// Reposition the focused panel at leaf-order `position` (0-based)
+    /// within the active workspace (issue #1333).
+    ///
+    /// Reuses [`LayoutNode::reparent_leaf`](bitty_ui::LayoutNode::reparent_leaf):
+    /// the focused leaf is detached and re-inserted beside the leaf
+    /// currently at `position` (tiling-first horizontal 50/50 wrap, the same
+    /// wrap [`Self::workspace_move_focused_to`] uses for cross-workspace
+    /// moves). Focus stays on the moved panel; pane sessions stay keyed by
+    /// [`ViewId`](bitty_ui::ViewId) and are never killed; the pending close
+    /// arm (if any) is preserved untouched.
+    ///
+    /// Fail-closed with state untouched: unknown positions, no focused pane,
+    /// a focused pane outside the live layout, or a refused reparent.
+    /// Moving to the already-held position is a no-op success.
+    pub fn workspace_move_focused_to_position(
+        &mut self,
+        position: usize,
+    ) -> Result<ViewId, String> {
+        let ids = self.layout.leaf_ids();
+        let focused = self
+            .focused_view()
+            .ok_or_else(|| String::from("no focused pane to move"))?;
+        let current = ids
+            .iter()
+            .position(|id| *id == focused)
+            .ok_or_else(|| String::from("focused pane not in layout"))?;
+        if position >= ids.len() {
+            return Err(format!(
+                "no such panel position {} (workspace holds {})",
+                position.saturating_add(1),
+                ids.len()
+            ));
+        }
+        if position == current {
+            return Ok(focused);
+        }
+        // CTX-0334: restructuring the live tree abandons any pending hover
+        // dwell, mirroring the cross-workspace move.
+        self.clear_hover_pending();
+        let target = ids[position];
+        let after = position > current;
+        if !self
+            .layout
+            .reparent_leaf(focused, target, crate::SplitAxis::Horizontal, 0.5, after)
+        {
+            return Err(String::from("panel reposition refused"));
+        }
+        // CTX-0405: boundaries moved in place; re-sync before presenting.
+        self.sync_primary_geometry();
+        self.sync_pane_geometry();
+        self.pending_full_redraw = true;
+        Ok(focused)
     }
 
     /// Fresh [`ViewId`] unique across every slot and the live layout.
@@ -913,6 +1060,154 @@ mod tests {
     }
 
     #[test]
+    fn switcher_bar_renders_by_default_with_opt_out() {
+        // Issue #1333: the bar is visible on the default config.
+        let rt = fresh();
+        assert!(rt.workspaceline_visible());
+        let presented = rt.workspaceline_present().expect("bar presents by default");
+        assert_eq!(presented, "1:ws1* (1)");
+        assert_eq!(presented, rt.workspaceline_text());
+        // Opt-out hides the present string and blinds hit-testing, with no
+        // workspace, focus, or session state change.
+        let mut rt = fresh();
+        rt.set_workspaceline_visible(false);
+        assert!(!rt.workspaceline_visible());
+        assert_eq!(rt.workspaceline_present(), None);
+        assert_eq!(rt.workspaceline_hit_test(0), None);
+        assert_eq!(rt.workspace_count(), 1);
+        assert_eq!(rt.active_workspace_index(), 0);
+        // Re-enabling restores the bar.
+        rt.set_workspaceline_visible(true);
+        assert_eq!(rt.workspaceline_present().as_deref(), Some("1:ws1* (1)"));
+    }
+
+    #[test]
+    fn bar_hit_test_maps_columns_to_workspaces() {
+        let mut rt = fresh();
+        rt.workspace_new().expect("ws2");
+        rt.workspace_new().expect("ws3");
+        assert!(rt.workspace_switch(0));
+        // Tokens: `1:ws1*` (0..6), sep, `2:ws2` (7..12), sep, `3:ws3`
+        // (13..18), then the ` (3)` suffix.
+        assert_eq!(rt.workspaceline_text(), "1:ws1* 2:ws2 3:ws3 (3)");
+        assert_eq!(rt.workspaceline_hit_test(0), Some(0));
+        assert_eq!(rt.workspaceline_hit_test(5), Some(0));
+        assert_eq!(rt.workspaceline_hit_test(6), None, "separator fails closed");
+        assert_eq!(rt.workspaceline_hit_test(7), Some(1));
+        assert_eq!(rt.workspaceline_hit_test(11), Some(1));
+        assert_eq!(
+            rt.workspaceline_hit_test(12),
+            None,
+            "separator fails closed"
+        );
+        assert_eq!(rt.workspaceline_hit_test(13), Some(2));
+        assert_eq!(rt.workspaceline_hit_test(17), Some(2));
+        assert_eq!(rt.workspaceline_hit_test(18), None, "suffix fails closed");
+        assert_eq!(
+            rt.workspaceline_hit_test(999),
+            None,
+            "out of range fails closed"
+        );
+    }
+
+    #[test]
+    fn bar_click_switches_and_fails_closed() {
+        let mut rt = fresh();
+        rt.workspace_new().expect("ws2");
+        assert!(rt.workspace_switch(0));
+        // Click on ws2's token switches.
+        assert!(rt.workspaceline_click(7));
+        assert_eq!(rt.active_workspace_index(), 1);
+        assert_eq!(rt.workspaceline_text(), "1:ws1 2:ws2* (2)");
+        // Clicking the active workspace is a no-op false.
+        assert!(!rt.workspaceline_click(7));
+        assert_eq!(rt.active_workspace_index(), 1);
+        // Separators and out-of-range columns fail closed.
+        assert!(!rt.workspaceline_click(6));
+        assert!(!rt.workspaceline_click(999));
+        assert_eq!(rt.active_workspace_index(), 1);
+        // Hidden bar never switches.
+        rt.set_workspaceline_visible(false);
+        assert!(!rt.workspaceline_click(0));
+        assert_eq!(rt.active_workspace_index(), 1);
+        // Single workspace: the only column is the active one, so a click
+        // can never switch away.
+        let mut solo = fresh();
+        assert!(!solo.workspaceline_click(0));
+        assert_eq!(solo.active_workspace_index(), 0);
+    }
+
+    #[test]
+    fn workspace_rename_updates_bar_and_fails_closed() {
+        let mut rt = fresh();
+        rt.workspace_new().expect("ws2");
+        rt.workspace_rename(1, "editor").expect("rename");
+        assert_eq!(
+            rt.workspace_names(),
+            vec![String::from("ws1"), String::from("editor")]
+        );
+        assert_eq!(rt.workspaceline_text(), "1:ws1 2:editor* (2)");
+        // Renaming the active workspace reflects immediately.
+        rt.workspace_rename(1, "  docs  ").expect("trims");
+        assert_eq!(rt.workspaceline_text(), "1:ws1 2:docs* (2)");
+        // Overlong names truncate at the display bound.
+        let long = "x".repeat(WORKSPACE_NAME_MAX_CHARS + 10);
+        rt.workspace_rename(0, &long).expect("truncates");
+        assert_eq!(
+            rt.workspace_names()[0].chars().count(),
+            WORKSPACE_NAME_MAX_CHARS
+        );
+        // Unknown index and blank names fail closed with state untouched.
+        let before = rt.workspaceline_text();
+        assert!(rt.workspace_rename(9, "nope").is_err());
+        assert!(rt.workspace_rename(0, "").is_err());
+        assert!(rt.workspace_rename(0, "   ").is_err());
+        assert_eq!(rt.workspaceline_text(), before);
+    }
+
+    #[test]
+    fn move_focused_within_reorders_panels() {
+        let mut rt = fresh();
+        // Deterministic three-pane order [first, second, third].
+        let first = rt.focused_view().expect("focus");
+        let second = ViewId::new(2);
+        let third = ViewId::new(3);
+        let leaf1 = rt.layout().find_leaf(first).cloned().expect("leaf1");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::split(
+                SplitAxis::Horizontal,
+                0.5,
+                LayoutNode::leaf(leaf1),
+                LayoutNode::leaf(View::new(second, 40, 24)),
+            ),
+            LayoutNode::leaf(View::new(third, 40, 24)),
+        ));
+        assert!(rt.set_focus(first));
+        assert_eq!(rt.layout().leaf_ids(), vec![first, second, third]);
+        // Move first to position 3 (index 2): order becomes [2nd, 3rd, 1st].
+        let moved = rt.workspace_move_focused_to_position(2).expect("move");
+        assert_eq!(moved, first);
+        assert_eq!(rt.focused_view(), Some(first));
+        let ids = rt.layout().leaf_ids();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.contains(&first) && ids.contains(&second) && ids.contains(&third));
+        assert_eq!(ids[2], first, "focused panel lands at the target position");
+        // Same-position move is a no-op success.
+        assert_eq!(
+            rt.workspace_move_focused_to_position(2).expect("noop"),
+            first
+        );
+        // Unknown positions fail closed with the order untouched.
+        let before = rt.layout().leaf_ids();
+        assert!(rt.workspace_move_focused_to_position(3).is_err());
+        assert!(rt.workspace_move_focused_to_position(99).is_err());
+        assert_eq!(rt.layout().leaf_ids(), before);
+        assert_eq!(rt.focused_view(), Some(first));
+    }
+
+    #[test]
     fn new_switch_prev_next_last_update_tabline() {
         let mut rt = fresh();
         let one = rt.workspace_new().expect("new");
@@ -1080,6 +1375,63 @@ mod tests {
         assert_eq!(rt.workspace_count(), 1);
         assert_eq!(rt.layout().leaf_count(), 1);
         assert!(!rt.has_pending_ws_close());
+    }
+
+    // Issue #1333 live leg: click switching, rename, and within-move
+    // with a real shell behind the focused pane. None of the switcher ops
+    // may kill or detach the session; the bar follows every op.
+    #[test]
+    #[cfg(unix)]
+    fn live_switcher_click_rename_and_move_preserve_session() {
+        require_pty!();
+        let mut rt = fresh();
+        // Two panes in ws1; the second owns a live shell.
+        let live_id = ViewId::new(2);
+        let mut layout = rt.layout().clone();
+        let focused = rt.focused_view().expect("focus");
+        let old = layout.find_leaf(focused).cloned().expect("leaf");
+        let fresh_leaf = View::new(live_id, usize::from(old.cols()), usize::from(old.rows()));
+        layout = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(old),
+            LayoutNode::leaf(fresh_leaf),
+        );
+        rt.set_layout(layout);
+        rt.spawn_shell_for_view(live_id, "/bin/sh", &[], 40, 12)
+            .expect("pane shell must spawn headless");
+        assert!(rt.set_focus(live_id));
+        rt.workspace_new().expect("new ws2");
+        assert!(rt.workspace_switch(0));
+        assert!(rt.set_focus(live_id));
+        assert_eq!(rt.workspaceline_text(), "1:ws1* 2:ws2 (2)");
+        // Click ws2's token (column 7) switches away; the session survives.
+        assert!(rt.workspaceline_click(7));
+        assert_eq!(rt.active_workspace_index(), 1);
+        assert!(
+            rt.has_pane_session(&live_id),
+            "click must not kill the session"
+        );
+        // Click back to ws1 (column 0) and rename it.
+        assert!(rt.workspaceline_click(0));
+        assert_eq!(rt.active_workspace_index(), 0);
+        rt.workspace_rename(0, "live").expect("rename");
+        assert_eq!(rt.workspaceline_text(), "1:live* 2:ws2 (2)");
+        assert!(
+            rt.has_pane_session(&live_id),
+            "rename must not kill the session"
+        );
+        // Reposition the live pane within ws1; session and focus follow.
+        let moved = rt
+            .workspace_move_focused_to_position(0)
+            .expect("move within");
+        assert_eq!(moved, live_id);
+        assert_eq!(rt.focused_view(), Some(live_id));
+        assert!(
+            rt.has_pane_session(&live_id),
+            "move must not kill the session"
+        );
+        assert!(rt.layout().leaf_ids().contains(&live_id));
     }
 
     // Live-spawn: runs a real POSIX shell (`/bin/sh` has no Windows

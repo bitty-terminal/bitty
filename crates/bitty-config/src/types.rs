@@ -2025,6 +2025,10 @@ impl LayoutConfig {
 pub struct WorkspaceConfig {
     /// Default provider name (`workspace.layout`).
     pub layout: Option<String>,
+    /// Switcher bar visibility (`workspace.show_bar`). `None` means the
+    /// layer says nothing and the default-on bar stays; `Some(false)` opts
+    /// out (issue #1333). Effective default resolves to `true`.
+    pub show_bar: Option<bool>,
 }
 
 impl WorkspaceConfig {

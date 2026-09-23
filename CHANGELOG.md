@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Workspace switcher bar, switching, and panel operations (CTX-0740, #1333):**
+  the workspaceline bar presents by default with a `workspace.show_bar`
+  opt-out (file -> effective -> runtime, absent keeps the default-on bar);
+  mouse switching via bar-column hit-testing (`workspaceline_hit_test` /
+  `workspaceline_click`, fail-closed on hidden bars, separators, unknown
+  columns, and the single-workspace case) beside the existing keyboard
+  switching (`workspace_focus`, prev/next/last); new operations
+  `workspace_rename`, `workspace_move_focused_to_position` (reposition the
+  focused panel within its workspace via the accepted `reparent_leaf`
+  machinery), and the `ctl workspace rename ws:N NAME` /
+  `workspace move-panel N` verbs (`renameWorkspace` / `movePanel`,
+  `view.manage`-scoped). Every unknown target fails closed with state
+  untouched. Pinned by headless unit tests, a live-POSIX-shell test
+  proving click/rename/move never kill sessions, and control-envelope
+  tests.
+
 - **Plugin persistent store quota backend (CTX-0596, RUN-25):**
   `crates/bitty-lua/src/store.rs` owns the host-side `bitty.store` backend
   behind `HostServices`: one `PluginStore` per plugin identity with RC-11

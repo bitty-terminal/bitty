@@ -327,6 +327,18 @@ fn render_table(request: &CtlRequest, result_json: &str, target: &ResolvedTarget
                 target.instance
             ));
         }
+        CtlRequest::WorkspaceRename { workspace_id, name } => {
+            out.push_str(&format!(
+                "renamed {workspace_id} to {name} on {}\n",
+                target.instance
+            ));
+        }
+        CtlRequest::WorkspaceMovePanel { position } => {
+            out.push_str(&format!(
+                "moved focused panel to position {position} on {}\n",
+                target.instance
+            ));
+        }
         CtlRequest::ConfigReload => {
             out.push_str(&format!(
                 "config probe on {} — result: {result_json}\n",

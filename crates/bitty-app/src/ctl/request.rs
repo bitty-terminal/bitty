@@ -59,6 +59,8 @@ pub enum CtlRequest {
     WorkspaceClose { workspace_id: String },
     WorkspaceFocus { workspace_id: String },
     WorkspaceMove { workspace_id: String },
+    WorkspaceRename { workspace_id: String, name: String },
+    WorkspaceMovePanel { position: u64 },
     ConfigReload,
 }
 
@@ -82,6 +84,8 @@ impl CtlRequest {
             Self::WorkspaceClose { .. } => "core.workspace.close",
             Self::WorkspaceFocus { .. } => "core.workspace.focus",
             Self::WorkspaceMove { .. } => "core.workspace.move",
+            Self::WorkspaceRename { .. } => "core.workspace.rename",
+            Self::WorkspaceMovePanel { .. } => "core.workspace.move_panel",
             Self::ConfigReload => "core.config.reload",
         }
     }
@@ -105,6 +109,8 @@ impl CtlRequest {
             Self::WorkspaceClose { .. } => Some(ipc_ctl::METHOD_CLOSE_WORKSPACE),
             Self::WorkspaceFocus { .. } => Some(ipc_ctl::METHOD_FOCUS_WORKSPACE),
             Self::WorkspaceMove { .. } => Some(ipc_ctl::METHOD_MOVE_WORKSPACE),
+            Self::WorkspaceRename { .. } => Some(ipc_ctl::METHOD_RENAME_WORKSPACE),
+            Self::WorkspaceMovePanel { .. } => Some(ipc_ctl::METHOD_MOVE_PANEL),
             Self::ConfigReload => Some(ipc_ctl::METHOD_RELOAD_CONFIG),
         }
     }
@@ -131,6 +137,10 @@ impl CtlRequest {
             Self::WorkspaceClose { workspace_id }
             | Self::WorkspaceFocus { workspace_id }
             | Self::WorkspaceMove { workspace_id } => Some(ipc_ctl::params_workspace(workspace_id)),
+            Self::WorkspaceRename { workspace_id, name } => {
+                Some(ipc_ctl::params_workspace_rename(workspace_id, name))
+            }
+            Self::WorkspaceMovePanel { position } => Some(ipc_ctl::params_move_panel(*position)),
         }
     }
 }
@@ -171,6 +181,7 @@ pub fn ctl_usage() -> String {
          \x20 terminal list | terminal spawn [--cwd PATH] | terminal close t:N\n\
          \x20 terminal send t:N TEXT | terminal text t:N\n\
          \x20 workspace list | workspace new | workspace close ws:N | workspace focus ws:N | workspace move ws:N\n\
+         \x20 workspace rename ws:N NAME | workspace move-panel POSITION\n\
          \x20 config reload\n\
          examples:\n\
          \x20 bitty ctl instance list\n\
@@ -211,6 +222,8 @@ pub fn ctl_help_text() -> String {
             workspace close ws:N          core.workspace.close (terminal.manage, elevation; kills live sessions)\n  \
             workspace focus ws:N          core.workspace.focus (view.manage)\n  \
             workspace move ws:N           core.workspace.move (view.manage; moves focused window)\n  \
+            workspace rename ws:N NAME    core.workspace.rename (view.manage; renames workspace)\n  \
+            workspace move-panel N        core.workspace.move_panel (view.manage; repositions focused panel)\n  \
             config reload                 core.config.reload (config.modify, elevation)\n\
          \n\
          Elevation: only terminal spawn, terminal close (terminal.manage),\n  \
@@ -219,7 +232,7 @@ pub fn ctl_help_text() -> String {
          \x20 (comma-separated scopes, e.g. BITTY_CTL_ELEVATE=terminal.manage,config.modify).\n\
          \x20 Without it those four verbs fail closed (exit 7, no partial state).\n\
          \x20 All other verbs — including view split / view focus (view.manage)\n\
-         \x20 and workspace list / new / focus / move, and every list, terminal send,\n\
+         \x20 and workspace list / new / focus / move / rename / move-panel, and every list, terminal send,\n\
          \x20 and terminal text verb — need no elevation.\n\
          \n\
          Exit codes: 0 ok; 1 generic; 2 usage; 3 config; 5 compat; 6 unavailable;\n\
@@ -570,6 +583,59 @@ pub fn parse_ctl_request(tokens: &[String]) -> Result<(CtlRequest, CtlTargeting)
                 },
                 targeting,
             ))
+        }
+        (Some("workspace"), Some("rename")) => {
+            reject_ctl_options_for("workspace rename", split_dir.is_some(), spawn_cwd.is_some())?;
+            let (id, name) = match rest {
+                [id, name] => (id.as_str(), name.as_str()),
+                _ => {
+                    return Err(CtlParseError::Usage {
+                        message: String::from(
+                            "bitty ctl: workspace rename needs ws:N and NAME (e.g. ws:2 editor)",
+                        ),
+                    });
+                }
+            };
+            ipc_ctl::parse_workspace_id(id).map_err(|err| CtlParseError::Usage {
+                message: format!("bitty ctl: invalid workspace id {id:?}: {err}"),
+            })?;
+            if name.trim().is_empty() || name.len() > ipc_ctl::MAX_WORKSPACE_RENAME_BYTES {
+                return Err(CtlParseError::Usage {
+                    message: String::from(
+                        "bitty ctl: workspace rename needs a non-empty NAME (<= 256 bytes)",
+                    ),
+                });
+            }
+            Ok((
+                CtlRequest::WorkspaceRename {
+                    workspace_id: id.to_string(),
+                    name: name.to_string(),
+                },
+                targeting,
+            ))
+        }
+        (Some("workspace"), Some("move-panel")) => {
+            reject_ctl_options_for(
+                "workspace move-panel",
+                split_dir.is_some(),
+                spawn_cwd.is_some(),
+            )?;
+            let pos = single_arg(rest, "workspace move-panel", "POSITION (e.g. 2)")?;
+            let position: u64 = pos.parse().map_err(|_| CtlParseError::Usage {
+                message: format!(
+                    "bitty ctl: invalid panel position {pos:?}: expected 1..={}",
+                    ipc_ctl::MAX_PANEL_POSITION
+                ),
+            })?;
+            if position == 0 || position > ipc_ctl::MAX_PANEL_POSITION {
+                return Err(CtlParseError::Usage {
+                    message: format!(
+                        "bitty ctl: invalid panel position {pos:?}: expected 1..={}",
+                        ipc_ctl::MAX_PANEL_POSITION
+                    ),
+                });
+            }
+            Ok((CtlRequest::WorkspaceMovePanel { position }, targeting))
         }
         (Some("config"), Some("reload")) => {
             reject_extra(rest, "config reload")?;

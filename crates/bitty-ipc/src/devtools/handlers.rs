@@ -62,7 +62,8 @@ impl Dispatcher {
     /// `sendInput`, `getTerminalText`, `splitView`, `focusView`,
     /// `reloadConfig`) plus CTX-0257 workspace entry (`listWorkspaces`,
     /// `createWorkspace`, `closeWorkspace`, `focusWorkspace`) plus CTX-0259
-    /// workspace move (`moveWorkspace`) plus CTX-0188
+    /// workspace move (`moveWorkspace`) plus issue #1333 switcher ops
+    /// (`renameWorkspace`, `movePanel`) plus CTX-0188
     /// test automation (`synthesizeInput`,
     /// `captureFrame`, bearer-scoped per Amendment A1) plus DT-03 trace
     /// lifecycle (`startTrace`, `stopTrace`, `fetchTraceChunk`, requiring
@@ -116,6 +117,8 @@ impl Dispatcher {
             (crate::ctl::METHOD_CLOSE_WORKSPACE, handle_control),
             (crate::ctl::METHOD_FOCUS_WORKSPACE, handle_control),
             (crate::ctl::METHOD_MOVE_WORKSPACE, handle_control),
+            (crate::ctl::METHOD_RENAME_WORKSPACE, handle_control),
+            (crate::ctl::METHOD_MOVE_PANEL, handle_control),
             (crate::ctl::METHOD_RELOAD_CONFIG, handle_control),
         ];
         for (method, handler) in control {

@@ -453,6 +453,12 @@ pub struct Runtime {
     session_restored: bool,
     /// Pending kill-confirm close arm, if any (never silent kill).
     pending_ws_close: Option<PendingWsClose>,
+    /// Whether the workspace switcher bar presents (issue #1333). Seeded
+    /// from [`RuntimeConfig::workspaceline_visible`] at construction
+    /// (default-on); live toggles go through
+    /// [`Runtime::set_workspaceline_visible`]. Presentation-only: hiding
+    /// the bar changes no workspace, focus, or session state.
+    workspaceline_visible: bool,
     /// Whether the help popup (CTX-0265) is currently shown.
     ///
     /// Presentation-only overlay state: toggled by the `toggle_help`
@@ -1236,6 +1242,7 @@ impl Runtime {
             session_primary_cwd: None,
             session_restored: false,
             pending_ws_close: None,
+            workspaceline_visible: config.workspaceline_visible,
             help_visible: false,
             help_rows: Vec::new(),
             overlay_modal_active: false,
@@ -1426,6 +1433,7 @@ impl Runtime {
             session_primary_cwd: None,
             session_restored: false,
             pending_ws_close: None,
+            workspaceline_visible: config.workspaceline_visible,
             help_visible: false,
             help_rows: Vec::new(),
             overlay_modal_active: false,

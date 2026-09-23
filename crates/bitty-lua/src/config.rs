@@ -220,6 +220,10 @@ pub struct LayoutData {
 pub struct WorkspaceData {
     /// Provider name (present only when the key is set; raw string).
     pub layout: Option<String>,
+    /// Switcher bar visibility (present only when the key is set; raw bool).
+    /// `workspace = { show_bar = false }` opts out of the default-on
+    /// workspaceline bar (issue #1333); absent means "says nothing".
+    pub show_bar: Option<bool>,
 }
 
 /// Core-owned workspace decoration overrides, plain data (CTX-0292; unified
@@ -1199,12 +1203,16 @@ impl ConfigData {
                     // `bitty-config`; unknown provider names fail at apply
                     // time in `bitty-runtime`.
                     let nested = expect_table(key, val)?;
-                    check_nested_keys(key, nested, &["layout"])?;
+                    check_nested_keys(key, nested, &["layout", "show_bar"])?;
                     let layout = match get_field(nested, "layout") {
                         Some(v) => Some(expect_string("workspace.layout", v)?),
                         None => None,
                     };
-                    out.workspace = Some(WorkspaceData { layout });
+                    let show_bar = match get_field(nested, "show_bar") {
+                        Some(v) => Some(expect_bool("workspace.show_bar", v)?),
+                        None => None,
+                    };
+                    out.workspace = Some(WorkspaceData { layout, show_bar });
                 }
                 "decoration" => {
                     // CTX-0292/CTX-0333: `decoration = { gaps_in = 6,

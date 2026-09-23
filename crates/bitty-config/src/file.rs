@@ -1869,7 +1869,10 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
     // and unknown provider names fail at apply time in `bitty-runtime`.
     let workspace = match data.workspace {
         None => None,
-        Some(w) => Some(crate::types::WorkspaceConfig { layout: w.layout }),
+        Some(w) => Some(crate::types::WorkspaceConfig {
+            layout: w.layout,
+            show_bar: w.show_bar,
+        }),
     };
 
     let plan = ConfigPlan {
@@ -2308,6 +2311,34 @@ mod tests {
         assert_eq!(
             plan.workspace.expect("workspace present").layout.as_deref(),
             Some("acme.tiling:spiral")
+        );
+        let plan = parse_lua_config(
+            r#"return { workspace = { show_bar = false } }"#,
+            &test_source(),
+        )
+        .expect("workspace show_bar parses");
+        assert_eq!(
+            plan.workspace.expect("workspace present").show_bar,
+            Some(false)
+        );
+        let plan = parse_lua_config(
+            r#"return { workspace = { layout = "dwindle", show_bar = true } }"#,
+            &test_source(),
+        )
+        .expect("workspace layout + show_bar parses");
+        let ws = plan.workspace.expect("workspace present");
+        assert_eq!(ws.layout.as_deref(), Some("dwindle"));
+        assert_eq!(ws.show_bar, Some(true));
+        // Wrong types and unknown sub-keys fail closed naming the field.
+        assert!(
+            parse_lua_config(
+                r#"return { workspace = { show_bar = "yes" } }"#,
+                &test_source()
+            )
+            .is_err()
+        );
+        assert!(
+            parse_lua_config(r#"return { workspace = { bogus = 1 } }"#, &test_source()).is_err()
         );
         let plan = parse_lua_config(r#"return { workspace = {} }"#, &test_source())
             .expect("empty workspace parses");

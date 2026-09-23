@@ -183,6 +183,38 @@ fn workspace_verbs_parse_and_validate_ids() {
         Some(ipc_ctl::METHOD_MOVE_WORKSPACE),
         "wire method pinned"
     );
+    let (req, _) =
+        parse_ctl_request(&words(&["workspace", "rename", "ws:2", "editor"])).expect("must parse");
+    assert_eq!(
+        req,
+        CtlRequest::WorkspaceRename {
+            workspace_id: String::from("ws:2"),
+            name: String::from("editor"),
+        }
+    );
+    assert_eq!(
+        req.registry_id(),
+        "core.workspace.rename",
+        "registry id pinned"
+    );
+    assert_eq!(
+        req.wire_method(),
+        Some(ipc_ctl::METHOD_RENAME_WORKSPACE),
+        "wire method pinned"
+    );
+    let (req, _) =
+        parse_ctl_request(&words(&["workspace", "move-panel", "2"])).expect("must parse");
+    assert_eq!(req, CtlRequest::WorkspaceMovePanel { position: 2 });
+    assert_eq!(
+        req.registry_id(),
+        "core.workspace.move_panel",
+        "registry id pinned"
+    );
+    assert_eq!(
+        req.wire_method(),
+        Some(ipc_ctl::METHOD_MOVE_PANEL),
+        "wire method pinned"
+    );
     // Fail closed: missing/extra args, wrong id shapes, misplaced flags.
     assert!(parse_ctl_request(&words(&["workspace"])).is_err());
     assert!(parse_ctl_request(&words(&["workspace", "close"])).is_err());
@@ -195,6 +227,14 @@ fn workspace_verbs_parse_and_validate_ids() {
     assert!(parse_ctl_request(&words(&["workspace", "focus", "t:1"])).is_err());
     assert!(parse_ctl_request(&words(&["workspace", "move", "v:2"])).is_err());
     assert!(parse_ctl_request(&words(&["workspace", "move", "ws:2", "extra"])).is_err());
+    assert!(parse_ctl_request(&words(&["workspace", "rename", "ws:2"])).is_err());
+    assert!(parse_ctl_request(&words(&["workspace", "rename"])).is_err());
+    assert!(parse_ctl_request(&words(&["workspace", "rename", "v:2", "x"])).is_err());
+    assert!(parse_ctl_request(&words(&["workspace", "rename", "ws:2", "x", "extra"])).is_err());
+    assert!(parse_ctl_request(&words(&["workspace", "move-panel"])).is_err());
+    assert!(parse_ctl_request(&words(&["workspace", "move-panel", "0"])).is_err());
+    assert!(parse_ctl_request(&words(&["workspace", "move-panel", "257"])).is_err());
+    assert!(parse_ctl_request(&words(&["workspace", "move-panel", "x"])).is_err());
     assert!(parse_ctl_request(&words(&["workspace", "move", "ws:007"])).is_err());
     assert!(parse_ctl_request(&words(&["workspace", "move", "ws:2", "--right"])).is_err());
     assert!(parse_ctl_request(&words(&["workspace", "close", "ws:007"])).is_err());
@@ -1272,6 +1312,74 @@ fn control_workspace_new_focuses_fresh_view() {
             .contains("\"id\":\"v:2\",\"focused\":true"),
         "fresh workspace view must be focused: {views:?}"
     );
+}
+
+#[test]
+fn control_workspace_rename_and_move_panel_headless() {
+    // Issue #1333 parity: `workspace rename ws:N NAME` renames with the
+    // bar following, and `workspace move-panel N` repositions the focused
+    // panel; both ride view.manage (no elevation) and fail closed on
+    // unknown targets with no partial state.
+    use bitty_runtime::{LayoutNode, SplitAxis, View, ViewId};
+    let mut rt = headless_runtime();
+    let cli = bitty_ipc::ScopeSet::cli_default();
+    let created = apply_control_envelope(&mut rt, ipc_ctl::METHOD_NEW_WORKSPACE, None, &cli);
+    assert!(created.ok, "setup ws2: {created:?}");
+    let params = ipc_ctl::params_workspace_rename("ws:2", "editor");
+    let done = apply_control_envelope(
+        &mut rt,
+        ipc_ctl::METHOD_RENAME_WORKSPACE,
+        Some(&params),
+        &cli,
+    );
+    assert!(
+        done.ok,
+        "workspace rename must succeed without elevation: {done:?}"
+    );
+    assert!(done.result_json.contains("\"renamed\":\"ws:2\""));
+    assert!(done.result_json.contains("2:editor*"));
+    assert_eq!(rt.workspace_names()[1], "editor");
+    // Unknown workspace fails closed with names untouched.
+    let bad = ipc_ctl::params_workspace_rename("ws:99", "nope");
+    let denied =
+        apply_control_envelope(&mut rt, ipc_ctl::METHOD_RENAME_WORKSPACE, Some(&bad), &cli);
+    assert!(!denied.ok, "unknown rename target must fail: {denied:?}");
+    assert_eq!(rt.workspace_names()[1], "editor");
+    // Split ws2 so the focused panel has somewhere to move within.
+    let back = apply_control_envelope(
+        &mut rt,
+        ipc_ctl::METHOD_FOCUS_WORKSPACE,
+        Some(&ipc_ctl::params_workspace("ws:1")),
+        &cli,
+    );
+    assert!(back.ok, "setup focus ws1: {back:?}");
+    let moved_id = ViewId::new(60);
+    let mut layout = rt.layout().clone();
+    let focused = rt.focused_view().expect("focus");
+    let old = layout.find_leaf(focused).cloned().expect("leaf");
+    let fresh_leaf = View::new(moved_id, usize::from(old.cols()), usize::from(old.rows()));
+    layout = LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.5,
+        LayoutNode::leaf(old),
+        LayoutNode::leaf(fresh_leaf),
+    );
+    rt.set_layout(layout);
+    assert!(rt.set_focus(focused));
+    let params = ipc_ctl::params_move_panel(2);
+    let done = apply_control_envelope(&mut rt, ipc_ctl::METHOD_MOVE_PANEL, Some(&params), &cli);
+    assert!(
+        done.ok,
+        "move-panel must succeed without elevation: {done:?}"
+    );
+    assert!(done.result_json.contains("\"moved\":\"v:1\""));
+    assert_eq!(rt.focused_view(), Some(focused));
+    // Unknown position fails closed with the order untouched.
+    let before = rt.layout().leaf_ids();
+    let bad = ipc_ctl::params_move_panel(9);
+    let denied = apply_control_envelope(&mut rt, ipc_ctl::METHOD_MOVE_PANEL, Some(&bad), &cli);
+    assert!(!denied.ok, "unknown position must fail: {denied:?}");
+    assert_eq!(rt.layout().leaf_ids(), before);
 }
 
 #[test]

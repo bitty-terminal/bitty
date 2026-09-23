@@ -534,6 +534,56 @@ pub fn apply_control(
             }
         }
     }
+    if method == ipc_ctl::METHOD_RENAME_WORKSPACE {
+        // Issue #1333: rename a workspace display name. Display state only
+        // (no session touched); unknown ids are NotFound with no partial
+        // state, blank names are InvalidParams.
+        let (workspace_id, name) = ipc_ctl::parse_workspace_rename_params(params)
+            .map_err(|err| ("usage", "InvalidParams", format!("{err}")))?;
+        let num = ipc_ctl::parse_workspace_id(&workspace_id)
+            .map_err(|err| ("usage", "InvalidParams", format!("{err}")))?;
+        // CTX-0322: resolve the stable sequence id `ws:N` to the current slot.
+        let Some(index) = runtime.workspace_index_by_seq(u64::from(num)) else {
+            return Err((
+                "usage",
+                "NotFound",
+                format!("no such workspace {workspace_id}"),
+            ));
+        };
+        match runtime.workspace_rename(index, &name) {
+            Ok(()) => {
+                return Ok(format!(
+                    "{{\"renamed\":\"{workspace_id}\",\"name\":\"{}\",\"tabline\":\"{}\"}}",
+                    json_escape(&name),
+                    json_escape(&runtime.workspaceline_text()),
+                ));
+            }
+            Err(message) => {
+                return Err(("usage", "InvalidParams", message));
+            }
+        }
+    }
+    if method == ipc_ctl::METHOD_MOVE_PANEL {
+        // Issue #1333: reposition the focused panel at a 1-based leaf
+        // position within the active workspace. Never kills (sessions move
+        // with the leaf); unknown positions are Conflict with no partial
+        // state.
+        let position = ipc_ctl::parse_move_panel_params(params)
+            .map_err(|err| ("usage", "InvalidParams", format!("{err}")))?;
+        let index = (position - 1) as usize;
+        match runtime.workspace_move_focused_to_position(index) {
+            Ok(moved) => {
+                return Ok(format!(
+                    "{{\"moved\":\"v:{}\",\"position\":{position},\"tabline\":\"{}\"}}",
+                    moved.0,
+                    json_escape(&runtime.workspaceline_text()),
+                ));
+            }
+            Err(message) => {
+                return Err(("usage", "Conflict", message));
+            }
+        }
+    }
     if method == ipc_ctl::METHOD_RELOAD_CONFIG {
         // CTX-0537 (APP-001): probe-only until live hot-swap lands. The
         // response reports exactly what happened — `probed` true and

@@ -2030,6 +2030,47 @@ fn runtime_config_inherits_file_focus_follows_mouse() {
 }
 
 #[test]
+fn runtime_config_inherits_workspace_show_bar_opt_out() {
+    // Issue #1333: the switcher bar is default-on; `workspace.show_bar`
+    // flows file -> effective -> runtime, and absent means the default-on
+    // bar stays (opt-out, not opt-in).
+    const { assert!(bitty_runtime::config::DEFAULT_WORKSPACELINE_VISIBLE) }
+    use bitty_config::file::{parse_lua_config, resolve_effective};
+    use bitty_config::plan::{ConfigSource, LayerKind};
+    // Absent table rides the default-on end to end.
+    let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+    let plan = parse_lua_config(r#"return { terminal = { scrollback = 10000 } }"#, &src)
+        .expect("no workspace table parses");
+    let merged = resolve_effective(Some(bitty_config::plan::LayeredPlan::new(src, plan)), None)
+        .expect("merge");
+    assert!(merged.effective.workspace.show_bar.is_none());
+    let cfg = runtime_config_from_effective(&merged.effective).expect("builds");
+    assert!(
+        cfg.workspaceline_visible,
+        "absent key keeps the default-on bar"
+    );
+    // Explicit opt-out reaches the runtime and hides the present string.
+    let src2 = ConfigSource::new(LayerKind::User, Some("init.lua"));
+    let plan2 = parse_lua_config(r#"return { workspace = { show_bar = false } }"#, &src2)
+        .expect("opt-out parses");
+    let merged2 = resolve_effective(
+        Some(bitty_config::plan::LayeredPlan::new(src2, plan2)),
+        None,
+    )
+    .expect("merge");
+    assert_eq!(merged2.effective.workspace.show_bar, Some(false));
+    let cfg2 = runtime_config_from_effective(&merged2.effective).expect("builds");
+    assert!(!cfg2.workspaceline_visible);
+    let rt = bitty_runtime::Runtime::new(cfg2).expect("runtime builds");
+    assert!(!rt.workspaceline_visible());
+    assert_eq!(rt.workspaceline_present(), None);
+    assert_eq!(
+        merged2.source_of("workspace.show_bar").unwrap().layer,
+        bitty_config::plan::LayerKind::User
+    );
+}
+
+#[test]
 fn runtime_config_inherits_file_layout_gaps() {
     // CTX-0177: `layout.gaps_in`/`gaps_out` flow file -> effective ->
     // runtime; crate defaults stay equal (bitty-runtime must not depend

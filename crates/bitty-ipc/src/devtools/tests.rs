@@ -431,7 +431,7 @@ fn dispatcher_registers_new_methods_for_follow_up() {
     // lifecycle (startTrace, stopTrace, fetchTraceChunk) plus CTX-0189
     // profiling (getProcessStats, getFrameStats, streamProcessStats,
     // streamFrameStats).
-    assert_eq!(dispatcher.method_count(), 31);
+    assert_eq!(dispatcher.method_count(), 33);
     assert!(dispatcher.contains("bitty.debug/getGridText"));
     assert!(dispatcher.contains("bitty.debug/getInputRing"));
     assert!(dispatcher.contains("bitty.debug/getModifiers"));

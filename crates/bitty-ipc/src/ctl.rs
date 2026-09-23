@@ -123,6 +123,11 @@ pub const METHOD_CLOSE_WORKSPACE: &str = "bitty.debug/closeWorkspace";
 pub const METHOD_FOCUS_WORKSPACE: &str = "bitty.debug/focusWorkspace";
 /// Wire method for `ctl workspace move` (CTX-0259: move focused window to ws:N).
 pub const METHOD_MOVE_WORKSPACE: &str = "bitty.debug/moveWorkspace";
+/// Wire method for `ctl workspace rename` (issue #1333: rename ws:N).
+pub const METHOD_RENAME_WORKSPACE: &str = "bitty.debug/renameWorkspace";
+/// Wire method for `ctl workspace move-panel` (issue #1333: reposition the
+/// focused panel at a 1-based leaf position within its workspace).
+pub const METHOD_MOVE_PANEL: &str = "bitty.debug/movePanel";
 /// Wire method for `ctl config reload`.
 pub const METHOD_RELOAD_CONFIG: &str = "bitty.debug/reloadConfig";
 
@@ -144,6 +149,8 @@ pub fn all_control_methods() -> &'static [&'static str] {
         METHOD_CLOSE_WORKSPACE,
         METHOD_FOCUS_WORKSPACE,
         METHOD_MOVE_WORKSPACE,
+        METHOD_RENAME_WORKSPACE,
+        METHOD_MOVE_PANEL,
         METHOD_RELOAD_CONFIG,
     ]
 }
@@ -178,6 +185,10 @@ pub fn required_scope_for_ctl_method(method: &str) -> Option<Scope> {
         METHOD_NEW_WORKSPACE | METHOD_FOCUS_WORKSPACE | METHOD_MOVE_WORKSPACE => {
             Some(Scope::ViewManage)
         }
+        // Issue #1333: rename changes a display name only (no session
+        // touched) and move-panel reparents within the live tree without
+        // killing, so both ride `view.manage` like new/focus/move.
+        METHOD_RENAME_WORKSPACE | METHOD_MOVE_PANEL => Some(Scope::ViewManage),
         METHOD_CLOSE_WORKSPACE => Some(Scope::TerminalManage),
         METHOD_RELOAD_CONFIG => Some(Scope::ConfigModify),
         // CTX-0506 test-mode surface: `testExit` stops the `--test-mode`
@@ -466,6 +477,32 @@ pub fn params_workspace(workspace_id: &str) -> String {
     out
 }
 
+/// Maximum workspace rename bytes on the wire (issue #1333). The runtime
+/// truncates to its 32-char display bound; this cap only bounds transport.
+pub const MAX_WORKSPACE_RENAME_BYTES: usize = 256;
+
+/// Maximum 1-based panel position accepted on the wire (issue #1333).
+/// Shape-only: existence resolves server-side (`NotFound`/`Conflict` when
+/// the position is beyond the live leaf count).
+pub const MAX_PANEL_POSITION: u64 = 256;
+
+/// Build `{ "workspace_id": "ws:N", "name": "..." }` params for rename.
+#[must_use]
+pub fn params_workspace_rename(workspace_id: &str, name: &str) -> String {
+    let mut out = String::from("{\"workspace_id\":\"");
+    json_escape_into(&mut out, workspace_id);
+    out.push_str("\",\"name\":\"");
+    json_escape_into(&mut out, name);
+    out.push_str("\"}");
+    out
+}
+
+/// Build `{ "position": N }` params for move-panel (1-based display position).
+#[must_use]
+pub fn params_move_panel(position: u64) -> String {
+    format!("{{\"position\":{position}}}")
+}
+
 // ── params parsing (server, bounded, no new deps) ─────────────────────────
 
 /// Extract a top-level string field from a flat params object.
@@ -659,6 +696,104 @@ pub fn parse_workspace_params(params: Option<&str>) -> Result<String, IpcError> 
     })?;
     parse_workspace_id(&id)?;
     Ok(id)
+}
+
+/// Parse workspace `rename` params
+/// (`{ "workspace_id": "ws:N", "name": "..." }`).
+///
+/// The name must be non-blank after trimming and within
+/// [`MAX_WORKSPACE_RENAME_BYTES`]; the runtime applies its own
+/// char-boundary truncation to the display bound.
+pub fn parse_workspace_rename_params(params: Option<&str>) -> Result<(String, String), IpcError> {
+    let raw = params.ok_or_else(|| IpcError::InvalidRequest {
+        reason: "missing params.workspace_id".into(),
+    })?;
+    if raw.len() > MAX_CTL_PARAMS_BYTES {
+        return Err(IpcError::LimitExceeded {
+            field: "params".into(),
+            limit: MAX_CTL_PARAMS_BYTES,
+            actual: raw.len(),
+        });
+    }
+    let id = extract_string_field(raw, "workspace_id").ok_or_else(|| IpcError::InvalidRequest {
+        reason: "params.workspace_id must be a string like \"ws:2\"".into(),
+    })?;
+    parse_workspace_id(&id)?;
+    let name = extract_string_field(raw, "name").ok_or_else(|| IpcError::InvalidRequest {
+        reason: "params.name must be a non-empty string".into(),
+    })?;
+    if name.trim().is_empty() {
+        return Err(IpcError::InvalidRequest {
+            reason: "params.name must be a non-empty string".into(),
+        });
+    }
+    if name.len() > MAX_WORKSPACE_RENAME_BYTES {
+        return Err(IpcError::LimitExceeded {
+            field: "params.name".into(),
+            limit: MAX_WORKSPACE_RENAME_BYTES,
+            actual: name.len(),
+        });
+    }
+    Ok((id, name))
+}
+
+/// Extract a top-level unsigned integer field from a flat params object
+/// (`{ "position": 3 }`). Returns `None` when absent or malformed.
+fn extract_u64_field(params: &str, key: &str) -> Option<u64> {
+    let needle = format!("\"{key}\"");
+    let mut search = 0usize;
+    let bytes = params.as_bytes();
+    while let Some(pos) = params[search..].find(&needle) {
+        let abs = search + pos;
+        let mut i = abs + needle.len();
+        while i < bytes.len()
+            && (bytes[i] == b' ' || bytes[i] == b'\t' || bytes[i] == b'\n' || bytes[i] == b'\r')
+        {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b':' {
+            search = abs + needle.len();
+            continue;
+        }
+        i += 1;
+        while i < bytes.len()
+            && (bytes[i] == b' ' || bytes[i] == b'\t' || bytes[i] == b'\n' || bytes[i] == b'\r')
+        {
+            i += 1;
+        }
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if start == i {
+            return None;
+        }
+        return params[start..i].parse::<u64>().ok();
+    }
+    None
+}
+
+/// Parse move-panel params (`{ "position": N }`, 1-based display position).
+pub fn parse_move_panel_params(params: Option<&str>) -> Result<u64, IpcError> {
+    let raw = params.ok_or_else(|| IpcError::InvalidRequest {
+        reason: "missing params.position".into(),
+    })?;
+    if raw.len() > MAX_CTL_PARAMS_BYTES {
+        return Err(IpcError::LimitExceeded {
+            field: "params".into(),
+            limit: MAX_CTL_PARAMS_BYTES,
+            actual: raw.len(),
+        });
+    }
+    let position = extract_u64_field(raw, "position").ok_or_else(|| IpcError::InvalidRequest {
+        reason: "params.position must be an integer 1..=256".into(),
+    })?;
+    if position == 0 || position > MAX_PANEL_POSITION {
+        return Err(IpcError::InvalidRequest {
+            reason: "params.position must be an integer 1..=256".into(),
+        });
+    }
+    Ok(position)
 }
 
 #[cfg(test)]
@@ -917,6 +1052,52 @@ mod tests {
                 "{method} with empty scopes must be ScopeDenied, got {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn workspace_rename_and_move_panel_params_round_trip() {
+        // Issue #1333: rename/move-panel params build and parse back.
+        let params = params_workspace_rename("ws:2", "editor");
+        let (id, name) = parse_workspace_rename_params(Some(&params)).expect("rename parses");
+        assert_eq!(id, "ws:2");
+        assert_eq!(name, "editor");
+        let params = params_move_panel(3);
+        assert_eq!(
+            parse_move_panel_params(Some(&params)).expect("position parses"),
+            3
+        );
+        // New verbs ride view.manage (no elevation, no kill).
+        assert_eq!(
+            required_scope_for_ctl_method(METHOD_RENAME_WORKSPACE),
+            Some(Scope::ViewManage)
+        );
+        assert_eq!(
+            required_scope_for_ctl_method(METHOD_MOVE_PANEL),
+            Some(Scope::ViewManage)
+        );
+        assert!(all_control_methods().contains(&METHOD_RENAME_WORKSPACE));
+        assert!(all_control_methods().contains(&METHOD_MOVE_PANEL));
+        // Fail closed: blank names, missing fields, bad shapes, out-of-range
+        // positions, oversized payloads.
+        assert!(parse_workspace_rename_params(None).is_err());
+        assert!(parse_workspace_rename_params(Some("{\"workspace_id\":\"ws:2\"}")).is_err());
+        assert!(
+            parse_workspace_rename_params(Some("{\"workspace_id\":\"ws:2\",\"name\":\"   \"}"))
+                .is_err()
+        );
+        assert!(
+            parse_workspace_rename_params(Some("{\"workspace_id\":\"v:2\",\"name\":\"x\"}"))
+                .is_err()
+        );
+        let big = "y".repeat(MAX_WORKSPACE_RENAME_BYTES + 1);
+        assert!(
+            parse_workspace_rename_params(Some(&params_workspace_rename("ws:1", &big))).is_err()
+        );
+        assert!(parse_move_panel_params(None).is_err());
+        assert!(parse_move_panel_params(Some("{\"position\":0}")).is_err());
+        assert!(parse_move_panel_params(Some("{\"position\":257}")).is_err());
+        assert!(parse_move_panel_params(Some("{\"position\":\"3\"}")).is_err());
+        assert!(parse_move_panel_params(Some("{}")).is_err());
     }
 
     #[test]

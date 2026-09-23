@@ -474,6 +474,9 @@ pub(crate) fn starter_init_lua() -> &'static str {
      \x20\x20-- max 2000). Alt+drag moves a floating pane where the layout\n\
      \x20\x20-- model permits.\n\
      \x20\x20-- mouse = { focus_follows_mouse = true, focus_follows_mouse_delay_ms = 0 },\n\
+     \x20\x20-- Workspace switcher bar (on by default: lists workspaces,\n\
+     \x20\x20-- click/keyboard switching). Uncomment to opt out:\n\
+     \x20\x20-- workspace = { show_bar = false },\n\
      \x20\x20-- keymaps = {\n\
      \x20\x20--     { chord = \"alt+h\", action = \"goto_split:left\", context = \"global\" },\n\
      \x20\x20--     { chord = \"alt+1\", action = \"focus:1\", context = \"global\" },\n\
@@ -1296,6 +1299,10 @@ pub(crate) fn runtime_config_from_effective_with_warnings(
         // validated runtime config (same post-construction pattern as
         // `focus_follows_mouse`).
         cfg.decoration = decoration;
+        // Issue #1333: the switcher bar is default-on; `workspace.show_bar`
+        // opts out (`None` says nothing, so the runtime default `true`
+        // stands). Booleans are total — no validation needed.
+        cfg.workspaceline_visible = effective.workspace.show_bar.unwrap_or(true);
         // CTX-0340: resolve the focused/idle outline pair from the theme
         // token / `decoration.border_color` / explicit pair and carry it onto
         // the runtime config. The `bitty-config` validation already enforced

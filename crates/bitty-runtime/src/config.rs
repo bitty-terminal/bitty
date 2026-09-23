@@ -112,6 +112,13 @@ pub const DEFAULT_FOCUS_FOLLOWS_MOUSE: bool = false;
 /// `0` activates on pointer entry (CTX-0260 behavior).
 pub const DEFAULT_FOCUS_FOLLOWS_MOUSE_DELAY_MS: u32 = 0;
 
+/// Whether the workspace switcher bar presents by default (issue #1333).
+/// `true` renders the workspaceline present string on the default config;
+/// `false` is the opt-out (`workspace.show_bar = false`). Read once at
+/// construction; live toggles go through
+/// [`crate::Runtime::set_workspaceline_visible`].
+pub const DEFAULT_WORKSPACELINE_VISIBLE: bool = true;
+
 /// Maximum accepted hover-activation delay in milliseconds (CTX-0334).
 /// Mirrors `bitty-config` `MAX_MOUSE_FOCUS_FOLLOWS_MOUSE_DELAY_MS`;
 /// [`RuntimeConfig::validate`] rejects larger values fail-closed.
@@ -583,6 +590,12 @@ pub struct RuntimeConfig {
     /// hovered pane for at least this long, so a transient pass-through
     /// never steals focus. Bounded by [`MAX_FOCUS_FOLLOWS_MOUSE_DELAY_MS`].
     pub focus_follows_mouse_delay: std::time::Duration,
+    /// Whether the workspace switcher bar presents (issue #1333
+    /// `workspace.show_bar`; default `true` = bar renders on the default
+    /// config). Read at view present time only, never on the input hot
+    /// path. The app layer assigns the validated effective value
+    /// post-construction, following the `focus_follows_mouse` pattern.
+    pub workspaceline_visible: bool,
     /// Spacing between sibling panes in cells (CTX-0177 `layout.gaps_in`).
     /// `0..=MAX_LAYOUT_GAP_CELLS`; default `0` = edge-to-edge tiling.
     /// The gap band shows the window background; per-leaf rendering and
@@ -723,6 +736,7 @@ impl Default for RuntimeConfig {
             focus_follows_mouse_delay: std::time::Duration::from_millis(u64::from(
                 DEFAULT_FOCUS_FOLLOWS_MOUSE_DELAY_MS,
             )),
+            workspaceline_visible: DEFAULT_WORKSPACELINE_VISIBLE,
             gaps_in: DEFAULT_LAYOUT_GAPS_IN,
             gaps_out: DEFAULT_LAYOUT_GAPS_OUT,
             decoration: bitty_ui::Decoration::default(),
@@ -805,6 +819,7 @@ impl RuntimeConfig {
             focus_follows_mouse_delay: std::time::Duration::from_millis(u64::from(
                 DEFAULT_FOCUS_FOLLOWS_MOUSE_DELAY_MS,
             )),
+            workspaceline_visible: DEFAULT_WORKSPACELINE_VISIBLE,
             gaps_in,
             gaps_out,
             decoration: bitty_ui::Decoration::default(),

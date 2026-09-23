@@ -76,6 +76,7 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "layout.gaps_in"
         | "layout.gaps_out"
         | "workspace.layout"
+        | "workspace.show_bar"
         | "decoration.gaps_in"
         | "decoration.gaps_out"
         | "decoration.border"
@@ -549,6 +550,7 @@ const ATTRIBUTED_FIELDS: &[&str] = &[
     "layout.gaps_out",
     "layout",
     "workspace.layout",
+    "workspace.show_bar",
     "workspace",
     "decoration.gaps_in",
     "decoration.gaps_out",
@@ -985,6 +987,49 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
                     src,
                     MergeClass::ScalarReplace,
                 );
+            }
+            // Issue #1333: `workspace.show_bar` is scalar-replace like
+            // `workspace.layout`, but only a present key overwrites — an
+            // absent key says nothing and must not clobber a lower layer's
+            // explicit opt-out.
+            if let Some(show_bar) = ws.show_bar {
+                let bar_field = "workspace.show_bar";
+                if is_policy {
+                    policy_fields.insert(bar_field.to_string(), src.clone());
+                    effective.workspace.show_bar = Some(show_bar);
+                    let prev = attribution.get(bar_field).cloned();
+                    record_attribution(
+                        &mut attribution,
+                        &mut conflicts,
+                        bar_field,
+                        prev,
+                        src,
+                        MergeClass::ScalarReplace,
+                    );
+                } else if let Some(policy_src) = policy_fields.get(bar_field) {
+                    policy_violations.push(ConfigError::NonOverridable {
+                        field: bar_field.to_string(),
+                        policy_source: policy_src.describe(),
+                        attempted_source: src.describe(),
+                    });
+                    conflicts.push(MergeConflict {
+                        field: bar_field.to_string(),
+                        previous_source: policy_src.clone(),
+                        new_source: src.clone(),
+                        merge_class: MergeClass::ScalarReplace,
+                    });
+                } else {
+                    let prev = attribution.get(bar_field).cloned();
+                    effective.workspace.show_bar = Some(show_bar);
+                    record_attribution(
+                        &mut attribution,
+                        &mut conflicts,
+                        bar_field,
+                        prev,
+                        src,
+                        MergeClass::ScalarReplace,
+                    );
+                }
             }
             attribution.insert("workspace".to_string(), src.clone());
         }
@@ -2098,6 +2143,50 @@ fn merge_layers_allow_policy_violations(
                     src,
                     MergeClass::ScalarReplace,
                 );
+            }
+            // Issue #1333: `workspace.show_bar` is scalar-replace like
+            // `workspace.layout`, but only a present key overwrites — an
+            // absent key says nothing and must not clobber a lower layer's
+            // explicit opt-out. (Second merge path: allow-policy-violations
+            // variant for diagnostics.)
+            if let Some(show_bar) = ws.show_bar {
+                let bar_field = "workspace.show_bar";
+                if is_policy {
+                    policy_fields.insert(bar_field.to_string(), src.clone());
+                    effective.workspace.show_bar = Some(show_bar);
+                    let prev = attribution.get(bar_field).cloned();
+                    record_attribution(
+                        &mut attribution,
+                        &mut conflicts,
+                        bar_field,
+                        prev,
+                        src,
+                        MergeClass::ScalarReplace,
+                    );
+                } else if let Some(policy_src) = policy_fields.get(bar_field) {
+                    policy_violations.push(ConfigError::NonOverridable {
+                        field: bar_field.to_string(),
+                        policy_source: policy_src.describe(),
+                        attempted_source: src.describe(),
+                    });
+                    conflicts.push(MergeConflict {
+                        field: bar_field.to_string(),
+                        previous_source: policy_src.clone(),
+                        new_source: src.clone(),
+                        merge_class: MergeClass::ScalarReplace,
+                    });
+                } else {
+                    let prev = attribution.get(bar_field).cloned();
+                    effective.workspace.show_bar = Some(show_bar);
+                    record_attribution(
+                        &mut attribution,
+                        &mut conflicts,
+                        bar_field,
+                        prev,
+                        src,
+                        MergeClass::ScalarReplace,
+                    );
+                }
             }
             attribution.insert("workspace".to_string(), src.clone());
         }
@@ -3733,6 +3822,7 @@ mod tests {
             ConfigPlan {
                 workspace: Some(WorkspaceConfig {
                     layout: Some("dwindle".to_string()),
+                    show_bar: None,
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -3752,6 +3842,7 @@ mod tests {
             ConfigPlan {
                 workspace: Some(WorkspaceConfig {
                     layout: Some("grid".to_string()),
+                    show_bar: None,
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -3762,6 +3853,7 @@ mod tests {
             ConfigPlan {
                 workspace: Some(WorkspaceConfig {
                     layout: Some("dwindle".to_string()),
+                    show_bar: None,
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -3784,6 +3876,66 @@ mod tests {
         assert!(merged3.effective.workspace.layout.is_none());
         assert_eq!(
             merged3.source_of("workspace.layout").unwrap().layer,
+            LayerKind::CoreDefaults
+        );
+    }
+
+    #[test]
+    fn workspace_show_bar_merges_opt_out_with_attribution() {
+        // Issue #1333: `workspace.show_bar = false` lands in effective with
+        // user attribution; absent keys keep the default-on bar (None);
+        // a higher layer without the key never clobbers a lower opt-out.
+        use crate::types::WorkspaceConfig;
+        let user = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                workspace: Some(WorkspaceConfig {
+                    layout: None,
+                    show_bar: Some(false),
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged = merge_layers(vec![user]).expect("merge");
+        assert_eq!(merged.effective.workspace.show_bar, Some(false));
+        assert_eq!(
+            merged.source_of("workspace.show_bar").unwrap().layer,
+            LayerKind::User
+        );
+        // Higher layer with a workspace table but no show_bar key keeps the
+        // lower opt-out (absent key says nothing).
+        let cli = LayeredPlan::new(
+            ConfigSource::new(LayerKind::Cli, Some("cli")),
+            ConfigPlan {
+                workspace: Some(WorkspaceConfig {
+                    layout: Some("grid".to_string()),
+                    show_bar: None,
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let user2 = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                workspace: Some(WorkspaceConfig {
+                    layout: None,
+                    show_bar: Some(false),
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged2 = merge_layers(vec![user2, cli]).expect("merge");
+        assert_eq!(merged2.effective.workspace.show_bar, Some(false));
+        assert_eq!(merged2.effective.workspace.layout.as_deref(), Some("grid"));
+        // Empty stack keeps the default-on bar (None) with core-defaults
+        // attribution.
+        let merged3 = merge_layers(vec![]).expect("empty layers merge");
+        assert!(merged3.effective.workspace.show_bar.is_none());
+        assert_eq!(
+            merged3.source_of("workspace.show_bar").unwrap().layer,
             LayerKind::CoreDefaults
         );
     }

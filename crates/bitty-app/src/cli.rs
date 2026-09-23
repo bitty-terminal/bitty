@@ -1947,10 +1947,6 @@ pub(crate) fn help_text() -> String {
            bitty doctor --format json\n  \
            bitty plugin list\n  \
            bitty plugin install bitty-terminal.tabs --yes\n",
-        version_text()
+        crate::version::version_semver()
     )
-}
-
-pub(crate) fn version_text() -> String {
-    crate::version::version_text()
 }

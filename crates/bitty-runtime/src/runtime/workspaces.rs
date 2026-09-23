@@ -633,6 +633,23 @@ impl Runtime {
         self.active_workspace
     }
 
+    /// Jump to workspace `one_based` (1-based display index, the `Alt+N`
+    /// key path). Issue #1365: `N` beyond the live count clamps to the
+    /// last workspace instead of failing; `0` (and an empty slot list,
+    /// defended though the invariant keeps `>= 1`) fails closed with
+    /// state untouched. Reuses [`Self::workspace_switch`], so every
+    /// switch side effect (stash/load, MRU, pending-shell respawn,
+    /// redraw) matches the other switch paths. Returns the active index
+    /// afterwards, or `None` when the jump refused.
+    pub fn workspace_focus_clamped(&mut self, one_based: u64) -> Option<usize> {
+        if one_based == 0 || self.workspaces.is_empty() {
+            return None;
+        }
+        let index = ((one_based - 1) as usize).min(self.workspaces.len() - 1);
+        self.workspace_switch(index);
+        Some(self.active_workspace)
+    }
+
     /// Live pane sessions owned by workspace `index`'s leaves.
     ///
     /// The active index reads the live layout (the active slot copy is stale
@@ -1135,6 +1152,30 @@ mod tests {
         let mut solo = fresh();
         assert!(!solo.workspaceline_click(0));
         assert_eq!(solo.active_workspace_index(), 0);
+    }
+
+    #[test]
+    fn alt_n_jump_clamps_to_max_and_fails_closed_on_zero() {
+        // Issue #1365: Alt+N jumps to workspace N; N beyond the live
+        // count lands on the last workspace; 0 fails closed.
+        let mut rt = fresh();
+        rt.workspace_new().expect("ws2");
+        rt.workspace_new().expect("ws3");
+        assert!(rt.workspace_switch(0));
+        // Exact jump within range.
+        assert_eq!(rt.workspace_focus_clamped(2), Some(1));
+        assert_eq!(rt.active_workspace_index(), 1);
+        assert_eq!(rt.workspaceline_text(), "1:ws1 2:ws2* 3:ws3 (3)");
+        // Clamp: N beyond the count goes last.
+        assert_eq!(rt.workspace_focus_clamped(6), Some(2));
+        assert_eq!(rt.active_workspace_index(), 2);
+        assert_eq!(rt.workspaceline_text(), "1:ws1 2:ws2 3:ws3* (3)");
+        assert_eq!(rt.workspace_focus_clamped(9), Some(2));
+        assert_eq!(rt.active_workspace_index(), 2);
+        // Zero fails closed with state untouched.
+        assert_eq!(rt.workspace_focus_clamped(0), None);
+        assert_eq!(rt.active_workspace_index(), 2);
+        assert_eq!(rt.workspaceline_text(), "1:ws1 2:ws2 3:ws3* (3)");
     }
 
     #[test]

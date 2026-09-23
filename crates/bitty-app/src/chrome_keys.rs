@@ -1200,18 +1200,20 @@ impl TerminalApp {
                 );
             }
             A::WorkspaceFocus(n) => {
-                let index = n.saturating_sub(1) as usize;
-                if self.runtime.workspace_switch(index) {
-                    eprintln!(
+                // Issue #1365: Alt+N clamps to the last workspace when N
+                // exceeds the live count; zero fails closed with no state
+                // change. Reuses the workspace_switch path via
+                // workspace_focus_clamped.
+                match self.runtime.workspace_focus_clamped(n) {
+                    Some(index) => eprintln!(
                         "bitty: keymap workspace_focus:{n} -> workspace {} ({})",
                         index + 1,
                         self.runtime.workspaceline_text()
-                    );
-                } else {
-                    eprintln!(
+                    ),
+                    None => eprintln!(
                         "warning: keymap workspace_focus:{n} has no such workspace ({}) — ignoring",
                         self.runtime.workspaceline_text()
-                    );
+                    ),
                 }
             }
             A::WorkspaceMove(n) => {
@@ -3142,7 +3144,8 @@ mod tests {
         assert_eq!(app.runtime.active_workspace_index(), 0);
         app.apply_chrome_action(ChromeAction::WorkspaceLast);
         assert_eq!(app.runtime.active_workspace_index(), 1);
-        // Unknown workspace warns and keeps state.
+        // Beyond-count N clamps to the last workspace (issue #1365); here
+        // the clamp target is already active, so state holds.
         app.apply_chrome_action(ChromeAction::WorkspaceFocus(9));
         assert_eq!(app.runtime.active_workspace_index(), 1);
         assert_eq!(app.runtime.workspaceline_text(), "1:ws1 2:ws2* (2)");
@@ -3150,6 +3153,34 @@ mod tests {
         app.apply_chrome_action(ChromeAction::WorkspaceClose);
         assert!(!app.runtime.has_pending_ws_close());
         assert_eq!(app.runtime.workspaceline_text(), "1:ws1* (1)");
+    }
+
+    #[test]
+    fn chrome_workspace_focus_clamps_to_max_and_zero_fails_closed() {
+        // Issue #1365: Alt+N through the chrome arms jumps exactly within
+        // range, clamps beyond-count N to the last workspace, and refuses
+        // zero with state untouched — headless (no window).
+        use bitty_config::ChromeAction;
+        let mut app = workspace_test_app();
+        app.apply_chrome_action(ChromeAction::WorkspaceNew);
+        app.apply_chrome_action(ChromeAction::WorkspaceNew);
+        app.apply_chrome_action(ChromeAction::WorkspaceFocus(1));
+        assert_eq!(app.runtime.active_workspace_index(), 0);
+        // Exact jump.
+        app.apply_chrome_action(ChromeAction::WorkspaceFocus(2));
+        assert_eq!(app.runtime.active_workspace_index(), 1);
+        assert_eq!(app.runtime.workspaceline_text(), "1:ws1 2:ws2* 3:ws3 (3)");
+        // Clamp: Alt+6 / Alt+9 with 3 workspaces go to workspace 3.
+        app.apply_chrome_action(ChromeAction::WorkspaceFocus(6));
+        assert_eq!(app.runtime.active_workspace_index(), 2);
+        assert_eq!(app.runtime.workspaceline_text(), "1:ws1 2:ws2 3:ws3* (3)");
+        app.apply_chrome_action(ChromeAction::WorkspaceFocus(1));
+        app.apply_chrome_action(ChromeAction::WorkspaceFocus(9));
+        assert_eq!(app.runtime.active_workspace_index(), 2);
+        // Zero fails closed with state untouched.
+        app.apply_chrome_action(ChromeAction::WorkspaceFocus(0));
+        assert_eq!(app.runtime.active_workspace_index(), 2);
+        assert_eq!(app.runtime.workspaceline_text(), "1:ws1 2:ws2 3:ws3* (3)");
     }
 
     #[test]

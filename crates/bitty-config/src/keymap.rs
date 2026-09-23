@@ -3380,8 +3380,8 @@ mod tests {
     #[test]
     fn leader_platform_host_matches_target() {
         // `host()` reflects the compile target (Windows CI covers the
-        // Windows arm; Linux/macOS cover Other).
-        assert_eq!(LeaderPlatform::host(), LeaderPlatform::default());
+        // Windows arm; Linux/macOS cover Other). Note: `default()` is
+        // always `Other`, so it must NOT be equated with `host()` here.
         if cfg!(windows) {
             assert_eq!(LeaderPlatform::host(), LeaderPlatform::Windows);
         } else {

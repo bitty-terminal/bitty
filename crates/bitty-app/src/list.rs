@@ -488,7 +488,7 @@ pub fn list_plugins_from_manifests(
                 .lazy
                 .commands
                 .iter()
-                .map(|c| c.as_str().to_string())
+                .map(|c| c.id.as_str().to_string())
                 .collect(),
         })
         .collect();

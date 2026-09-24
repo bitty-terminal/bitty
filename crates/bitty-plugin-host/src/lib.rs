@@ -217,16 +217,18 @@ pub use lifecycle::{
     reload_generation,
 };
 pub use manifest::{
-    CapabilityRequests, Compat, FilesystemRequest, FsAccess, LazyTriggers, MANIFEST_MAX_BYTES,
-    MAX_COMMANDS, MAX_DEPENDENCIES, MAX_EVENT_TYPES, MAX_FS_PATTERNS_PER_KIND,
-    MAX_PATTERN_TEXT_BYTES, MAX_PROVIDED_SERVICES, MAX_TOOLS, PluginId, PluginIdentity,
-    PluginManifest, QualifiedName, ToolDeclaration, is_hostile_fs_pattern,
+    CMD_SCHEMA_MAX_BYTES, CMD_SCHEMA_MAX_DEPTH, CapabilityRequests, Compat, FilesystemRequest,
+    FsAccess, LazyCommand, LazyTriggers, MANIFEST_MAX_BYTES, MAX_COMMANDS, MAX_DEPENDENCIES,
+    MAX_EVENT_TYPES, MAX_FS_PATTERNS_PER_KIND, MAX_PATTERN_TEXT_BYTES, MAX_PROVIDED_SERVICES,
+    MAX_TOOLS, PluginDependency, PluginId, PluginIdentity, PluginManifest, ProvidedService,
+    QualifiedName, SchemaSummary, ToolDeclaration, is_hostile_fs_pattern,
+    summarize_interface_schema, validate_interface_schema,
 };
 pub use origin::{
     DetectedOrigin, OriginOverride, OriginPolicy, OriginSignals, classify_origin,
     resolve_origin_policy,
 };
-pub use registry::{Generation, PluginState, Registry, RegistryEntry};
+pub use registry::{Generation, PluginState, Registry, RegistryEntry, check_command_equivalence};
 pub use roles::{
     AgentRole, EnforcementPoint, MAX_DELEGATION_DEPTH, MAX_DISPATCH_FANOUT, MAX_ROLE_LABEL_BYTES,
     SandboxDecl, SandboxRestrictions, deny_prompt_authority,

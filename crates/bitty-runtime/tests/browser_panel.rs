@@ -92,14 +92,14 @@ fn browser_panel_via_public_plugin_host_path() {
             .lazy
             .commands
             .iter()
-            .any(|c| c.as_str() == "bitty-terminal.browser-panel:open")
+            .any(|c| c.id.as_str() == "bitty-terminal.browser-panel:open")
     );
     assert!(
         manifest
             .lazy
             .commands
             .iter()
-            .any(|c| c.as_str() == "bitty-terminal.browser-panel:navigate")
+            .any(|c| c.id.as_str() == "bitty-terminal.browser-panel:navigate")
     );
     // browser.embed is high-risk
     assert!(CapabilityId::parse("browser.embed").unwrap().is_high_risk());

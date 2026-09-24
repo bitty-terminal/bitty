@@ -91,8 +91,8 @@ const FILE_MANAGER_PAYLOAD_MAX_BYTES: usize = 8192;
 /// against a plain manifest instead of the bundled catalog.
 fn file_manager_manifest() -> bitty_plugin_host::PluginManifest {
     use bitty_plugin_host::{
-        CapabilityRequests, Compat, FilesystemRequest, FsAccess, LazyTriggers, PluginId,
-        PluginIdentity, PluginManifest, QualifiedName,
+        CapabilityRequests, Compat, FilesystemRequest, FsAccess, LazyCommand, LazyTriggers,
+        PluginId, PluginIdentity, PluginManifest, QualifiedName,
     };
     let mut caps = CapabilityRequests::default();
     caps.ids
@@ -131,7 +131,11 @@ fn file_manager_manifest() -> bitty_plugin_host::PluginManifest {
         lazy: LazyTriggers {
             commands: FILE_MANAGER_COMMANDS
                 .iter()
-                .map(|c| QualifiedName::new(c).expect("qualified"))
+                .map(|c| LazyCommand {
+                    id: QualifiedName::new(c).expect("qualified"),
+                    args_schema: None,
+                    result_schema: None,
+                })
                 .collect(),
             events: FILE_MANAGER_EVENTS.iter().map(|e| e.to_string()).collect(),
             claims: Vec::new(),
@@ -217,7 +221,7 @@ fn file_manager_fixture_matches_former_bundled_manifest() {
                 .lazy
                 .commands
                 .iter()
-                .any(|c| c.as_str() == *command),
+                .any(|c| c.id.as_str() == *command),
             "missing {command}"
         );
     }

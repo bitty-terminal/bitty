@@ -1348,7 +1348,7 @@ fn rows_from_state(
                 .lazy
                 .commands
                 .iter()
-                .map(|command| command.as_str().to_string())
+                .map(|command| command.id.as_str().to_string())
                 .collect(),
             manifest_hash,
         });
@@ -1457,7 +1457,7 @@ fn store_row(store_root: &Path, record: &bitty_runtime::plugin_runtime::PluginRe
                     .lazy
                     .commands
                     .iter()
-                    .map(|command| command.as_str().to_string())
+                    .map(|command| command.id.as_str().to_string())
                     .collect()
             })
             .unwrap_or_default(),

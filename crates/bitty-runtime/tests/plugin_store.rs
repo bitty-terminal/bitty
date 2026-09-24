@@ -268,7 +268,14 @@ fn local_path_dev_is_unverified_and_drift_is_tolerated() {
 
     // Drift after resolution: still loadable, still visibly unverified.
     rt.dispose(&id).expect("dispose");
-    std::fs::write(package.join("lua/init.lua"), "return { drifted = true }").expect("drift write");
+    // Drifted content differs (title changed) but still registers the
+    // declared command: digest drift is tolerated, registration equivalence
+    // still holds.
+    std::fs::write(
+        package.join("lua/init.lua"),
+        "bitty.commands.register({\n  id = \"summary\",\n  title = \"Store summary (drifted)\",\n  run = function(_args) return \"ok\" end,\n})\nreturn {}\n",
+    )
+    .expect("drift write");
     let report = rt
         .activate(&id)
         .expect("drift does not fail closed for local-path");

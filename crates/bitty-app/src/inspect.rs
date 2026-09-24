@@ -524,7 +524,7 @@ pub fn list_plugin_commands() -> Vec<PluginCommandInfo> {
         let owner = manifest.id().to_string();
         for cmd in &manifest.lazy.commands {
             out.push(PluginCommandInfo {
-                id: cmd.as_str().to_string(),
+                id: cmd.id.as_str().to_string(),
                 owner: owner.clone(),
             });
         }
@@ -649,7 +649,7 @@ pub fn inspect_plugin(query: &str) -> Option<InspectedPlugin> {
         .lazy
         .commands
         .iter()
-        .map(|c| c.as_str().to_string())
+        .map(|c| c.id.as_str().to_string())
         .collect();
     commands.sort();
     Some(InspectedPlugin {

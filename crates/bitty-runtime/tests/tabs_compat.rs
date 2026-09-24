@@ -83,11 +83,11 @@ fn old_and_new_commands_dispatch_identically() {
     let old = tabs_manifest();
     for cmd in WORKSPACE_COMMANDS.iter().chain(TABS_COMMANDS.iter()) {
         assert!(
-            new.lazy.commands.iter().any(|c| c.as_str() == *cmd),
+            new.lazy.commands.iter().any(|c| c.id.as_str() == *cmd),
             "workspace manifest missing {cmd}"
         );
         assert!(
-            old.lazy.commands.iter().any(|c| c.as_str() == *cmd),
+            old.lazy.commands.iter().any(|c| c.id.as_str() == *cmd),
             "tabs shim missing {cmd}"
         );
     }
@@ -123,7 +123,12 @@ fn old_and_new_commands_dispatch_identically() {
     // `inspect command` lists both forms via the canonical manifest (which carries all 6).
     let canonical_cmds: Vec<String> = bitty_plugin_host::bundled::all_bundled_manifests()
         .into_iter()
-        .flat_map(|m| m.lazy.commands.into_iter().map(|c| c.as_str().to_string()))
+        .flat_map(|m| {
+            m.lazy
+                .commands
+                .into_iter()
+                .map(|c| c.id.as_str().to_string())
+        })
         .collect();
     for cmd in WORKSPACE_COMMANDS.iter().chain(TABS_COMMANDS.iter()) {
         assert!(

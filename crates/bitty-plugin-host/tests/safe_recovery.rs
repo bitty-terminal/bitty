@@ -29,9 +29,9 @@ use std::collections::BTreeSet;
 
 use bitty_plugin_host::{
     BudgetDimension, CapabilityId, CapabilityRequests, Clock, Compat, DropPolicy,
-    EnforcementAction, FilesystemRequest, FsAccess, GrantRecord, LazyTriggers, LifecycleEnforcer,
-    ManualClock, PluginHost, PluginId, PluginIdentity, PluginManifest, PluginState, QualifiedName,
-    ToolDeclaration,
+    EnforcementAction, FilesystemRequest, FsAccess, GrantRecord, LazyCommand, LazyTriggers,
+    LifecycleEnforcer, ManualClock, PluginDependency, PluginHost, PluginId, PluginIdentity,
+    PluginManifest, PluginState, QualifiedName, ToolDeclaration,
 };
 
 const BUILTIN: &str = "bitty.core";
@@ -140,8 +140,11 @@ fn hostile_valid_fixtures() -> Vec<(&'static str, PluginManifest)> {
     // Command-table saturation at the hard bound.
     let mut saturated = minimal("xuepoo.cmds");
     saturated.lazy.commands = (0..128)
-        .map(|i| {
-            QualifiedName::new(&format!("xuepoo.cmds:cmd{i}")).expect("qualified name must parse")
+        .map(|i| LazyCommand {
+            id: QualifiedName::new(&format!("xuepoo.cmds:cmd{i}"))
+                .expect("qualified name must parse"),
+            args_schema: None,
+            result_schema: None,
         })
         .collect();
     fixtures.push(("command saturation", saturated));
@@ -153,15 +156,18 @@ fn hostile_valid_fixtures() -> Vec<(&'static str, PluginManifest)> {
 
     // Dependency cycle: each half declares first.
     let mut cycle_a = minimal("xuepoo.cyclea");
-    cycle_a.dependencies = vec![(plugin_id("xuepoo.cycleb"), "^1.0".to_string())];
+    cycle_a.dependencies =
+        vec![PluginDependency::new(plugin_id("xuepoo.cycleb"), "^1.0".to_string(), false).unwrap()];
     fixtures.push(("dependency cycle A", cycle_a));
     let mut cycle_b = minimal("xuepoo.cycleb");
-    cycle_b.dependencies = vec![(plugin_id("xuepoo.cyclea"), "^1.0".to_string())];
+    cycle_b.dependencies =
+        vec![PluginDependency::new(plugin_id("xuepoo.cyclea"), "^1.0".to_string(), false).unwrap()];
     fixtures.push(("dependency cycle B", cycle_b));
 
     // Missing dependency: resolves nowhere.
     let mut missing = minimal("xuepoo.missing");
-    missing.dependencies = vec![(plugin_id("xuepoo.ghost"), "^1.0".to_string())];
+    missing.dependencies =
+        vec![PluginDependency::new(plugin_id("xuepoo.ghost"), "^1.0".to_string(), false).unwrap()];
     fixtures.push(("missing dependency", missing));
 
     // Capability overreach: high-risk input observation plus raw read.
@@ -216,7 +222,11 @@ fn hostile_invalid_fixtures() -> Vec<(&'static str, PluginManifest)> {
     // Command table one past the hard bound.
     let mut over_commands = minimal("xuepoo.overcmds");
     over_commands.lazy.commands = (0..129)
-        .map(|i| QualifiedName::new(&format!("xuepoo.overcmds:cmd{i}")).expect("name must parse"))
+        .map(|i| LazyCommand {
+            id: QualifiedName::new(&format!("xuepoo.overcmds:cmd{i}")).expect("name must parse"),
+            args_schema: None,
+            result_schema: None,
+        })
         .collect();
     fixtures.push(("oversized commands", over_commands));
 

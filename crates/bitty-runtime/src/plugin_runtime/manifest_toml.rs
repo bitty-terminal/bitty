@@ -12,22 +12,26 @@
 //! `[tools.git]` (accepted Layer-2 v1, CTX-0425),
 //! `[[capabilities.filesystem]]` and `[[network.egress]]` (array-of-tables).
 //! Strings, booleans, arrays of strings, and (in `[limits]` only) bare
-//! non-negative integers are supported. Unknown sections, sub-tables, other
-//! numeric values, and duplicate keys fail closed.
+//! non-negative integers are supported. Inline-table values are accepted for
+//! the declared shapes only: `[dependencies]` `{ version, prerelease }`,
+//! `[services.provided]` `{ version, args_schema, result_schema }`,
+//! `[services.required]` `{ version }`, and `[lazy].commands` elements
+//! `{ id, args_schema, result_schema }`. Schemas are bounded JSON documents
+//! (16 KiB per schema, depth at most 16, explicit `additionalProperties`).
+//! Unknown sections, sub-tables, other table keys,
+//! other numeric values, and duplicate keys fail closed.
 //!
-//! The `[dependencies]` and `[services.*]` sections accept the string form
-//! only (`"owner.name" = ">=2.0"`, `"iface" = "1.0.0"`). Inline-table values
-//! (`{ version = ..., prerelease = ... }`, `{ version, args_schema,
-//! result_schema }`, `[{ id, ... }]` in `[lazy].commands`) fail closed as
-//! unsupported; they are follow-up work tracked against the accepted
-//! plugin-platform RFC open reconciliation item.
+//! The string forms stay accepted everywhere (`"owner.name" = ">=2.0"`,
+//! `"iface" = "1.0.0"`, `commands = ["owner:cmd"]`) and carry no schemas and
+//! no prerelease opt-in.
 
 use std::collections::BTreeSet;
 
 use bitty_plugin_host::capability::CapabilityId;
 use bitty_plugin_host::manifest::{
-    ACCEPTED_TOOLS, CapabilityRequests, Compat, FilesystemRequest, FsAccess, LazyTriggers,
-    NetworkEgress, PluginIdentity, PluginLimits, PluginManifest, QualifiedName, ToolDeclaration,
+    ACCEPTED_TOOLS, CapabilityRequests, Compat, FilesystemRequest, FsAccess, LazyCommand,
+    LazyTriggers, NetworkEgress, PluginDependency, PluginIdentity, PluginLimits, PluginManifest,
+    ProvidedService, QualifiedName, ToolDeclaration,
 };
 
 /// Parse a bounded `bitty-plugin.toml` body.
@@ -51,7 +55,7 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
     let mut compat_bitty: Option<String> = None;
     let mut compat_api: Option<String> = None;
     let mut capabilities: BTreeSet<CapabilityId> = BTreeSet::new();
-    let mut lazy_commands: Vec<String> = Vec::new();
+    let mut lazy_commands: Vec<LazyCommand> = Vec::new();
     let mut lazy_events: Vec<String> = Vec::new();
     let mut lazy_claims: Vec<String> = Vec::new();
     let mut seen_keys: BTreeSet<String> = BTreeSet::new();
@@ -78,11 +82,14 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
     // `[limits]` budgets (all keys optional, bare integers only).
     let mut limits = PluginLimits::default();
 
-    // `[dependencies]` entries (`"owner.name" = ">=2.0"`, string form only).
-    let mut dependencies: Vec<(String, String)> = Vec::new();
-    // `[services.provided]` / `[services.required]` entries
-    // (`"iface" = "1.0.0"`, string form only).
-    let mut provided_services: Vec<(String, String)> = Vec::new();
+    // `[dependencies]` entries: `"owner.name" = ">=2.0"` or
+    // `"owner.name" = { version = ">=2.0", prerelease = true }`.
+    let mut dependencies: Vec<PluginDependency> = Vec::new();
+    // `[services.provided]` entries: `"iface" = "1.0.0"` or
+    // `"iface" = { version = "1.0.0", args_schema = "{...}", result_schema = "{...}" }`.
+    let mut provided_services: Vec<ProvidedService> = Vec::new();
+    // `[services.required]` entries: `"iface" = ">=1.2"` or
+    // `"iface" = { version = ">=1.2" }` (schemas are provider-side only).
     let mut required_services: Vec<(String, String)> = Vec::new();
 
     let flush_filesystem_entry = |fs_access: &mut Option<String>,
@@ -253,17 +260,18 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
             parse_key(raw_key.trim()).map_err(|e| format!("{e} at line {}", line_number + 1))?;
         let mut value = value.trim().to_string();
 
-        // Multi-line arrays: keep consuming until the bracket closes.
-        if value.starts_with('[') && !balanced_brackets(&value) {
+        // Multi-line arrays and inline tables: keep consuming until all
+        // brackets and braces close.
+        if !balanced_delims(&value) {
             for (next_number, next_raw) in lines.by_ref() {
                 let next = strip_comment(next_raw).trim().to_string();
                 value.push(' ');
                 value.push_str(&next);
-                if balanced_brackets(&value) {
+                if balanced_delims(&value) {
                     break;
                 }
                 if next_number > line_number + 4096 {
-                    return Err("manifest array exceeded the line ceiling".to_string());
+                    return Err("manifest value exceeded the line ceiling".to_string());
                 }
             }
         }
@@ -345,7 +353,10 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
                     return Err(format!("duplicate [lazy] key '{key}'"));
                 }
                 match key.as_str() {
-                    "commands" => lazy_commands = parse_array(&value)?,
+                    "commands" => {
+                        lazy_commands = parse_commands_array(&value)
+                            .map_err(|e| format!("invalid [lazy] commands: {e}"))?;
+                    }
                     "events" => lazy_events = parse_array(&value)?,
                     "claims" => lazy_claims = parse_array(&value)?,
                     other => return Err(format!("unsupported [lazy] key '{other}'")),
@@ -399,11 +410,17 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
                 if !seen_keys.insert(section_key) {
                     return Err(format!("duplicate key '{key}' in [{section}]"));
                 }
-                let requirement = parse_string_entry(&value, &section, &key)?;
                 match section.as_str() {
-                    "dependencies" => dependencies.push((key, requirement)),
-                    "services.provided" => provided_services.push((key, requirement)),
-                    _ => required_services.push((key, requirement)),
+                    "dependencies" => {
+                        dependencies.push(parse_dependency_entry(&key, &value)?);
+                    }
+                    "services.provided" => {
+                        provided_services.push(parse_provided_entry(&key, &value)?);
+                    }
+                    _ => {
+                        let req = parse_required_entry(&key, &value)?;
+                        required_services.push((key, req));
+                    }
                 }
             }
             s if s.starts_with("tools.") => {
@@ -465,18 +482,22 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
         description,
         license,
     };
-    let mut commands = Vec::new();
+    let mut commands: Vec<LazyCommand> = Vec::new();
     for command in lazy_commands {
-        commands.push(
-            QualifiedName::new(&command)
-                .map_err(|e| format!("invalid lazy.commands entry '{command}': {e}"))?,
-        );
+        if commands.iter().any(|seen| seen.id == command.id) {
+            return Err(format!(
+                "duplicate [lazy] commands entry '{}'",
+                command.id.as_str()
+            ));
+        }
+        commands.push(command);
     }
-    let mut parsed_dependencies = Vec::new();
-    for (id, req) in dependencies {
-        let plugin_id = bitty_plugin_host::manifest::PluginId::new(&id)
-            .map_err(|e| format!("invalid [dependencies] id '{id}': {e}"))?;
-        parsed_dependencies.push((plugin_id, req));
+    let mut parsed_dependencies: Vec<PluginDependency> = Vec::new();
+    for dep in dependencies {
+        if parsed_dependencies.iter().any(|seen| seen.id == dep.id) {
+            return Err(format!("duplicate [dependencies] id '{}'", dep.id.as_str()));
+        }
+        parsed_dependencies.push(dep);
     }
     let manifest = PluginManifest {
         identity,
@@ -558,18 +579,42 @@ fn strip_comment(line: &str) -> &str {
     line
 }
 
-fn balanced_brackets(value: &str) -> bool {
-    let mut depth = 0i32;
+fn balanced_delims(value: &str) -> bool {
+    let mut brackets = 0i32;
+    let mut braces = 0i32;
     let mut in_string = false;
+    let mut escaped = false;
     for ch in value.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
         match ch {
-            '"' => in_string = !in_string,
-            '[' if !in_string => depth += 1,
-            ']' if !in_string => depth -= 1,
+            '"' => in_string = true,
+            '[' => brackets += 1,
+            ']' => {
+                brackets -= 1;
+                if brackets < 0 {
+                    return true;
+                }
+            }
+            '{' => braces += 1,
+            '}' => {
+                braces -= 1;
+                if braces < 0 {
+                    return true;
+                }
+            }
             _ => {}
         }
     }
-    depth <= 0
+    !in_string && brackets <= 0 && braces <= 0
 }
 
 fn parse_string(value: &str) -> Result<String, String> {
@@ -667,18 +712,283 @@ fn parse_port_array(value: &str) -> Result<Vec<u16>, String> {
     Ok(ports)
 }
 
-/// Parse a string-form value in `[dependencies]` / `[services.*]`.
-///
-/// Inline-table values (`{ ... }`) fail closed as unsupported: the table
-/// forms (dependency prerelease opt-in, service JSON Schemas) are follow-up
-/// work, and silently coercing them would mis-resolve the dependency graph.
-fn parse_string_entry(value: &str, section: &str, key: &str) -> Result<String, String> {
+/// Parse one `[dependencies]` value: string form or `{ version, prerelease }`.
+fn parse_dependency_entry(key: &str, value: &str) -> Result<PluginDependency, String> {
+    let id = bitty_plugin_host::manifest::PluginId::new(key)
+        .map_err(|e| format!("invalid [dependencies] id '{key}': {e}"))?;
     if value.trim_start().starts_with('{') {
+        let fields = parse_inline_table(value)
+            .map_err(|e| format!("invalid '[dependencies] {key}': {e}"))?;
+        let version = inline_required_string(&fields, "version", "dependencies", key)?;
+        let prerelease = inline_optional_bool(&fields, "prerelease", "dependencies", key)?;
+        reject_inline_keys(&fields, &["version", "prerelease"], "dependencies", key)?;
+        return Ok(PluginDependency {
+            id,
+            req: version,
+            prerelease,
+        });
+    }
+    let req = parse_string(value).map_err(|e| format!("invalid '[dependencies] {key}': {e}"))?;
+    Ok(PluginDependency {
+        id,
+        req,
+        prerelease: false,
+    })
+}
+
+/// Parse one `[services.provided]` value: string form or
+/// `{ version, args_schema, result_schema }`.
+fn parse_provided_entry(key: &str, value: &str) -> Result<ProvidedService, String> {
+    if value.trim_start().starts_with('{') {
+        let fields = parse_inline_table(value)
+            .map_err(|e| format!("invalid '[services.provided] {key}': {e}"))?;
+        let version = inline_required_string(&fields, "version", "services.provided", key)?;
+        let args_schema = inline_optional_string(&fields, "args_schema", "services.provided", key)?;
+        let result_schema =
+            inline_optional_string(&fields, "result_schema", "services.provided", key)?;
+        reject_inline_keys(
+            &fields,
+            &["version", "args_schema", "result_schema"],
+            "services.provided",
+            key,
+        )?;
+        return Ok(ProvidedService {
+            iface: key.to_string(),
+            version,
+            args_schema,
+            result_schema,
+        });
+    }
+    let version =
+        parse_string(value).map_err(|e| format!("invalid '[services.provided] {key}': {e}"))?;
+    Ok(ProvidedService {
+        iface: key.to_string(),
+        version,
+        args_schema: None,
+        result_schema: None,
+    })
+}
+
+/// Parse one `[services.required]` value: string form or `{ version }`.
+///
+/// Schemas are provider-side only: `args_schema` / `result_schema` keys fail
+/// closed here so a consumer can never smuggle a provider shape.
+fn parse_required_entry(key: &str, value: &str) -> Result<String, String> {
+    if value.trim_start().starts_with('{') {
+        let fields = parse_inline_table(value)
+            .map_err(|e| format!("invalid '[services.required] {key}': {e}"))?;
+        let version = inline_required_string(&fields, "version", "services.required", key)?;
+        reject_inline_keys(&fields, &["version"], "services.required", key)?;
+        return Ok(version);
+    }
+    parse_string(value).map_err(|e| format!("invalid '[services.required] {key}': {e}"))
+}
+
+/// Parse the `[lazy] commands` array: string elements or
+/// `{ id, args_schema, result_schema }` inline tables.
+fn parse_commands_array(value: &str) -> Result<Vec<LazyCommand>, String> {
+    let value = value.trim();
+    if !(value.starts_with('[') && value.ends_with(']')) {
+        return Err(format!("expected an array, found '{value}'"));
+    }
+    let inner = &value[1..value.len() - 1];
+    let mut commands = Vec::new();
+    for item in split_top_level(inner, ',')? {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        if item.starts_with('{') {
+            let fields =
+                parse_inline_table(item).map_err(|e| format!("invalid commands entry: {e}"))?;
+            let id_raw = inline_required_string(&fields, "id", "lazy.commands", "<entry>")?;
+            let id = QualifiedName::new(&id_raw)
+                .map_err(|e| format!("invalid lazy.commands entry '{id_raw}': {e}"))?;
+            let args_schema =
+                inline_optional_string(&fields, "args_schema", "lazy.commands", &id_raw)?;
+            let result_schema =
+                inline_optional_string(&fields, "result_schema", "lazy.commands", &id_raw)?;
+            reject_inline_keys(
+                &fields,
+                &["id", "args_schema", "result_schema"],
+                "lazy.commands",
+                &id_raw,
+            )?;
+            commands.push(LazyCommand {
+                id,
+                args_schema,
+                result_schema,
+            });
+        } else {
+            let id_raw = parse_string(item)
+                .map_err(|e| format!("invalid lazy.commands entry '{item}': {e}"))?;
+            let id = QualifiedName::new(&id_raw)
+                .map_err(|e| format!("invalid lazy.commands entry '{id_raw}': {e}"))?;
+            commands.push(LazyCommand {
+                id,
+                args_schema: None,
+                result_schema: None,
+            });
+        }
+    }
+    Ok(commands)
+}
+
+/// Parse `{ key = value, ... }` into raw (key, value-text) pairs.
+///
+/// Keys are bare or quoted (via [`parse_key`]); values stay raw — quoted
+/// strings (unescaped by the caller) or bare literals (`true`/`false`).
+/// Top-level commas split pairs; commas inside strings are respected.
+/// Nested-table values fail closed at interpretation (no declared shape nests).
+fn parse_inline_table(value: &str) -> Result<Vec<(String, String)>, String> {
+    let value = value.trim();
+    if !(value.starts_with('{') && value.ends_with('}')) {
+        return Err(format!("expected an inline table, found '{value}'"));
+    }
+    let inner = &value[1..value.len() - 1];
+    let mut pairs = Vec::new();
+    for part in split_top_level(inner, ',')? {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (raw_key, raw_value) = part
+            .split_once('=')
+            .ok_or_else(|| format!("expected 'key = value' in inline table, found '{part}'"))?;
+        let key = parse_key(raw_key.trim())?;
+        if pairs.iter().any(|(seen, _)| seen == &key) {
+            return Err(format!("duplicate key '{key}' in inline table"));
+        }
+        pairs.push((key, raw_value.trim().to_string()));
+    }
+    Ok(pairs)
+}
+
+/// Split on a top-level separator, respecting double-quoted strings (with
+/// `\` escapes) and `{...}`/`[...]` nesting. Anything unbalanced fails closed.
+fn split_top_level(inner: &str, sep: char) -> Result<Vec<String>, String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut depth = 0usize;
+    for ch in inner.chars() {
+        if in_string {
+            current.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => {
+                in_string = true;
+                current.push(ch);
+            }
+            '{' | '[' => {
+                depth += 1;
+                current.push(ch);
+            }
+            '}' | ']' => {
+                if depth == 0 {
+                    return Err(format!("unbalanced '{ch}' in manifest value"));
+                }
+                depth -= 1;
+                current.push(ch);
+            }
+            _ if ch == sep && depth == 0 => {
+                parts.push(std::mem::take(&mut current));
+            }
+            _ => current.push(ch),
+        }
+    }
+    if in_string {
+        return Err("unterminated string in manifest value".to_string());
+    }
+    if depth != 0 {
+        return Err("unbalanced brackets in manifest value".to_string());
+    }
+    parts.push(current);
+    Ok(parts)
+}
+
+/// Required string field of an inline table.
+fn inline_required_string(
+    fields: &[(String, String)],
+    name: &str,
+    section: &str,
+    entry: &str,
+) -> Result<String, String> {
+    let raw = fields
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.as_str())
+        .ok_or_else(|| format!("'[{section}] {entry}' is missing '{name} = \"...\"'"))?;
+    if raw.trim_start().starts_with('{') {
         return Err(format!(
-            "inline-table value for '[{section}] {key}' is not supported (string form only)"
+            "'[{section}] {entry}' field '{name}' must be a string (nested tables are not supported)"
         ));
     }
-    parse_string(value).map_err(|e| format!("invalid '[{section}] {key}': {e}"))
+    parse_string(raw).map_err(|e| format!("'[{section}] {entry}' field '{name}': {e}"))
+}
+
+/// Optional string field of an inline table.
+fn inline_optional_string(
+    fields: &[(String, String)],
+    name: &str,
+    section: &str,
+    entry: &str,
+) -> Result<Option<String>, String> {
+    fields
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| {
+            if value.trim_start().starts_with('{') {
+                return Err(format!(
+                    "'[{section}] {entry}' field '{name}' must be a string (nested tables are not supported)"
+                ));
+            }
+            parse_string(value).map_err(|e| format!("'[{section}] {entry}' field '{name}': {e}"))
+        })
+        .transpose()
+}
+
+/// Optional boolean field of an inline table (absent means `false`).
+fn inline_optional_bool(
+    fields: &[(String, String)],
+    name: &str,
+    section: &str,
+    entry: &str,
+) -> Result<bool, String> {
+    match fields.iter().find(|(key, _)| key == name) {
+        None => Ok(false),
+        Some((_, value)) => match value.trim() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            other => Err(format!(
+                "'[{section}] {entry}' field '{name}' must be 'true' or 'false', found '{other}'"
+            )),
+        },
+    }
+}
+
+/// Reject unknown inline-table keys (fail-closed against smuggled fields).
+fn reject_inline_keys(
+    fields: &[(String, String)],
+    allowed: &[&str],
+    section: &str,
+    entry: &str,
+) -> Result<(), String> {
+    for (key, _) in fields {
+        if !allowed.contains(&key.as_str()) {
+            return Err(format!("unsupported '[{section}] {entry}' field '{key}'"));
+        }
+    }
+    Ok(())
 }
 
 fn parse_array(value: &str) -> Result<Vec<String>, String> {
@@ -1013,16 +1323,82 @@ mod tests {
         );
         let manifest = parse_manifest(body.as_bytes()).expect("deps/services shape must parse");
         assert_eq!(manifest.dependencies.len(), 1);
-        assert_eq!(manifest.dependencies[0].0.as_str(), "xuepoo.gitcore");
-        assert_eq!(manifest.dependencies[0].1, ">=2.0");
-        assert_eq!(
-            manifest.provided_services,
-            vec![("markdown.render".to_string(), "1.0.0".to_string())]
-        );
+        assert_eq!(manifest.dependencies[0].id.as_str(), "xuepoo.gitcore");
+        assert_eq!(manifest.dependencies[0].req, ">=2.0");
+        assert!(!manifest.dependencies[0].prerelease);
+        assert_eq!(manifest.provided_services.len(), 1);
+        assert_eq!(manifest.provided_services[0].iface, "markdown.render");
+        assert_eq!(manifest.provided_services[0].version, "1.0.0");
+        assert!(!manifest.provided_services[0].has_schemas());
         assert_eq!(
             manifest.required_services,
             vec![("git.status".to_string(), ">=1.2".to_string())]
         );
+    }
+
+    #[test]
+    fn dependency_table_form_parses_with_prerelease_opt_in() {
+        let body = format!(
+            "{}\n[dependencies]\n\"xuepoo.gitcore\" = {{ version = \">=2.0\", prerelease = true }}\n\"xuepoo.stable\" = {{ version = \"^1.0\" }}\n",
+            minimal_body("xuepoo.deptable")
+        );
+        let manifest = parse_manifest(body.as_bytes()).expect("table form must parse");
+        assert_eq!(manifest.dependencies.len(), 2);
+        assert_eq!(manifest.dependencies[0].id.as_str(), "xuepoo.gitcore");
+        assert_eq!(manifest.dependencies[0].req, ">=2.0");
+        assert!(manifest.dependencies[0].prerelease);
+        assert!(!manifest.dependencies[1].prerelease);
+        // The prerelease bit plumbs through to the resolver edge.
+        let edge = manifest.dependencies[0]
+            .as_package_edge()
+            .expect("plugin id converts to package id");
+        assert!(edge.prerelease);
+        assert_eq!(edge.version_req, ">=2.0");
+    }
+
+    #[test]
+    fn provided_table_form_parses_with_schemas() {
+        let args = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"additionalProperties\":false}";
+        let result = "{\"type\":\"object\",\"additionalProperties\":false}";
+        let body = format!(
+            "{}\n[services.provided]\n\"markdown.render\" = {{ version = \"1.0.0\", args_schema = \"{args}\", result_schema = \"{result}\" }}\n",
+            minimal_body("xuepoo.svctable")
+        );
+        let manifest = parse_manifest(body.as_bytes()).expect("table form must parse");
+        assert_eq!(manifest.provided_services.len(), 1);
+        let svc = &manifest.provided_services[0];
+        assert_eq!(svc.iface, "markdown.render");
+        assert_eq!(svc.version, "1.0.0");
+        assert!(svc.has_schemas());
+        assert_eq!(svc.args_schema.as_deref(), Some(args));
+    }
+
+    #[test]
+    fn required_table_form_accepts_version_only() {
+        let body = format!(
+            "{}\n[services.required]\n\"git.status\" = {{ version = \">=1.2\" }}\n",
+            minimal_body("xuepoo.reqtable")
+        );
+        let manifest = parse_manifest(body.as_bytes()).expect("table form must parse");
+        assert_eq!(
+            manifest.required_services,
+            vec![("git.status".to_string(), ">=1.2".to_string())]
+        );
+    }
+
+    #[test]
+    fn lazy_commands_table_form_parses_with_schemas() {
+        let args = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"additionalProperties\":false}";
+        let body = format!(
+            "{}\n[lazy]\ncommands = [\"xuepoo.plain:run\", {{ id = \"xuepoo.typed:open\", args_schema = \"{args}\" }}]\n",
+            minimal_body("xuepoo.cmdtable")
+        );
+        let manifest = parse_manifest(body.as_bytes()).expect("table form must parse");
+        assert_eq!(manifest.lazy.commands.len(), 2);
+        assert_eq!(manifest.lazy.commands[0].id.as_str(), "xuepoo.plain:run");
+        assert!(manifest.lazy.commands[0].args_schema.is_none());
+        assert_eq!(manifest.lazy.commands[1].id.as_str(), "xuepoo.typed:open");
+        assert_eq!(manifest.lazy.commands[1].args_schema.as_deref(), Some(args));
     }
 
     #[test]
@@ -1034,13 +1410,62 @@ mod tests {
         );
         assert!(parse_manifest(body.as_bytes()).is_err());
 
-        // Inline-table values fail closed as unsupported (follow-up work).
+        // Malformed inline tables fail closed: missing version, bad types,
+        // unknown keys, nested tables, duplicate keys.
         for fragment in [
-            "[dependencies]\n\"xuepoo.gitcore\" = { version = \">=2.0\", prerelease = true }\n",
-            "[services.provided]\n\"markdown.render\" = { version = \"1.0.0\" }\n",
-            "[services.required]\n\"git.status\" = { version = \">=1.2\" }\n",
+            "[dependencies]\n\"xuepoo.gitcore\" = { prerelease = true }\n",
+            "[dependencies]\n\"xuepoo.gitcore\" = { version = \">=2.0\", prerelease = \"yes\" }\n",
+            "[dependencies]\n\"xuepoo.gitcore\" = { version = \">=2.0\", channel = \"nightly\" }\n",
+            "[dependencies]\n\"xuepoo.gitcore\" = { version = { min = \">=2.0\" } }\n",
+            "[dependencies]\n\"xuepoo.gitcore\" = { version = \">=2.0\", version = \"^1.0\" }\n",
+            "[services.provided]\n\"markdown.render\" = { args_schema = \"{}\" }\n",
+            "[services.provided]\n\"markdown.render\" = { version = \"1.0.0\", unknown = \"x\" }\n",
+            "[services.required]\n\"git.status\" = { version = \">=1.2\", args_schema = \"{}\" }\n",
+            "[services.required]\n\"git.status\" = { version = \">=1.2\", version = \"^1.0\" }\n",
         ] {
             let body = format!("{}\n{fragment}", minimal_body("xuepoo.svcbad"));
+            assert!(
+                parse_manifest(body.as_bytes()).is_err(),
+                "fragment must fail closed: {fragment:?}"
+            );
+        }
+
+        // Hostile schemas fail closed: oversized, non-object, open object,
+        // non-boolean additionalProperties, over-deep, malformed JSON.
+        let big_schema = format!("\"{}\"}}", "x".repeat(16 * 1024));
+        let deep_schema = format!("{}\"x\"{}", "{\"a\":".repeat(20), "}".repeat(20));
+        for fragment in [
+            format!(
+                "[services.provided]\n\"markdown.render\" = {{ version = \"1.0.0\", args_schema = {big_schema} }}\n"
+            ),
+            "[services.provided]\n\"markdown.render\" = { version = \"1.0.0\", args_schema = \"[]\" }\n"
+                .to_string(),
+            "[services.provided]\n\"markdown.render\" = { version = \"1.0.0\", args_schema = \"{\\\"properties\\\":{}}\" }\n"
+                .to_string(),
+            "[services.provided]\n\"markdown.render\" = { version = \"1.0.0\", args_schema = \"{\\\"properties\\\":{},\\\"additionalProperties\\\":\\\"no\\\"}\" }\n"
+                .to_string(),
+            format!(
+                "[services.provided]\n\"markdown.render\" = {{ version = \"1.0.0\", args_schema = \"{deep_schema}\" }}\n"
+            ),
+            "[services.provided]\n\"markdown.render\" = { version = \"1.0.0\", args_schema = \"{oops\" }\n"
+                .to_string(),
+        ] {
+            let body = format!("{}\n{fragment}", minimal_body("xuepoo.svcbad2"));
+            assert!(
+                parse_manifest(body.as_bytes()).is_err(),
+                "fragment must fail closed: {fragment:?}"
+            );
+        }
+
+        // Bad lazy command entries fail closed: missing id, unknown keys,
+        // bare (unquoted) ids, duplicate commands across string/table forms.
+        for fragment in [
+            "[lazy]\ncommands = [{ args_schema = \"{}\" }]\n",
+            "[lazy]\ncommands = [{ id = \"xuepoo.a:run\", help = \"run it\" }]\n",
+            "[lazy]\ncommands = [xuepoo.a:run]\n",
+            "[lazy]\ncommands = [\"xuepoo.a:run\", { id = \"xuepoo.a:run\" }]\n",
+        ] {
+            let body = format!("{}\n{fragment}", minimal_body("xuepoo.cmdbad"));
             assert!(
                 parse_manifest(body.as_bytes()).is_err(),
                 "fragment must fail closed: {fragment:?}"

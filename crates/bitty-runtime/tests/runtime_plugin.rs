@@ -22,7 +22,7 @@ fn make_runtime() -> Runtime {
 
 fn host_manifest(id: &str, commands: Vec<&str>, events: Vec<&str>) -> HostManifest {
     use bitty_plugin_host::{
-        CapabilityRequests, Compat, LazyTriggers, PluginIdentity, QualifiedName,
+        CapabilityRequests, Compat, LazyCommand, LazyTriggers, PluginIdentity, QualifiedName,
     };
     HostManifest {
         identity: PluginIdentity {
@@ -46,7 +46,11 @@ fn host_manifest(id: &str, commands: Vec<&str>, events: Vec<&str>) -> HostManife
         lazy: LazyTriggers {
             commands: commands
                 .into_iter()
-                .map(|c| QualifiedName::new(c).unwrap())
+                .map(|c| LazyCommand {
+                    id: QualifiedName::new(c).unwrap(),
+                    args_schema: None,
+                    result_schema: None,
+                })
                 .collect(),
             events: events.into_iter().map(|s| s.to_string()).collect(),
             claims: Vec::new(),

@@ -14,10 +14,10 @@ publish = true
 workspace = true
 
 [dependencies]
-bitty-term-state = { version = "0.0.20", path = "../bitty-term-state" }
+bitty-term-state = { version = "0.0.21", path = "../bitty-term-state" }
 
 
 [dev-dependencies]
-bitty-rich = { version = "0.0.20", path = "../bitty-rich" }
-bitty-term-state = { version = "0.0.20", path = "../bitty-term-state" }
-bitty-vt = { version = "0.0.20", path = "../bitty-vt" }
+bitty-rich = { version = "0.0.21", path = "../bitty-rich" }
+bitty-term-state = { version = "0.0.21", path = "../bitty-term-state" }
+bitty-vt = { version = "0.0.21", path = "../bitty-vt" }

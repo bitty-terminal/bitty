@@ -374,8 +374,16 @@ jobs:
         run: |
           set -euo pipefail
           apk add --no-cache binutils
-          readelf -l target/release/bitty | grep -q 'ld-musl-x86_64.so.1'
-          if readelf -l target/release/bitty | grep -q 'ld-linux'; then
+          # Capture readelf output once, then match. Piping readelf straight into
+          # `grep -q` makes grep exit on the first match, readelf takes SIGPIPE,
+          # and `set -o pipefail` turns that into exit 141 (GH Actions reports it
+          # as a failed assertion even though the binary is correct).
+          program_headers="$(readelf -l target/release/bitty)"
+          if ! grep -q 'ld-musl-x86_64.so.1' <<<"$program_headers"; then
+            echo "::error::binary does not request the musl loader" >&2
+            exit 1
+          fi
+          if grep -q 'ld-linux' <<<"$program_headers"; then
             echo "::error::musl build carries a glibc interpreter" >&2
             exit 1
           fi

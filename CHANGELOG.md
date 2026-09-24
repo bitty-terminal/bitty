@@ -102,7 +102,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `scripts/check-release-version.sh --tag v0.0.21` keeps `bitty --version`,
   packaging metadata, and the release tag in agreement.
 - Docs pin advanced to the pre-0.0.21 inventory
-  (`5fabe4b`; terminal-docs #115/#116).
+  (`c679936` -> `a1e7cea`; terminal-docs #115/#116/#117/#119/#120/#121).
 
 ### Added
 

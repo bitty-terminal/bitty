@@ -8,13 +8,26 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use bitty_lua::ui::{UI_MAX_AGGREGATED_TEXT_BYTES, UI_MAX_BLOCKS, UiNode};
-use bitty_lua::{BridgeError, HostServices, LuaValue, SNAPSHOT_MAX_BYTES, validate_env_key};
+use bitty_lua::{
+    BridgeError, HostServices, LuaValue, LuaVm, SNAPSHOT_MAX_BYTES, ServiceRoute, StashedFunction,
+    validate_env_key,
+};
+use bitty_package::Version;
 use bitty_plugin_host::bundled::{WORKSPACELINE_CLAIM, canonicalize_ui_claim};
+use bitty_plugin_host::{ProvidedService, service_version_satisfies, value_satisfies_schema};
 
 use super::store::{self, PluginStore};
+
+/// Maximum characters of a provider failure message relayed to the consumer
+/// (`E_SERVICE_FAILED`).
+///
+/// Provider errors cross as diagnostics, never as live values; the cap keeps
+/// a hostile provider from stuffing an unbounded string into a consumer
+/// error table (bridge error tables are themselves bounded downstream).
+pub const SERVICE_FAILED_MESSAGE_LIMIT: usize = 256;
 
 /// Maximum `env.read:<KEY>` grants held by one plugin generation (CTX-0330).
 ///
@@ -405,6 +418,158 @@ impl UiBlocks {
     }
 }
 
+/// One published service record in the runtime service directory (LUA-OQ-8).
+///
+/// Published at activation from the provider manifest's `services.provided`
+/// entry (version and schemas) plus the generation capture (impl functions);
+/// version and schemas come from the manifest, never from Lua. The provider
+/// VM is held weakly: dispose drops the strong handle, so a stale consumer
+/// route upgrades to nothing and fails closed with `E_SERVICE_GONE`.
+///
+/// Cloned out of the directory before any VM invocation, so the directory
+/// borrow never spans a (potentially re-entrant) provider call.
+#[derive(Debug, Clone)]
+pub struct ServiceRecord {
+    /// Providing plugin id.
+    pub provider: String,
+    /// Activation generation that published the record.
+    pub generation: u32,
+    /// Service interface name.
+    pub iface: String,
+    /// Published interface version (exact SemVer from the manifest).
+    pub version: String,
+    /// Provided method names in impl-table order.
+    pub methods: Vec<String>,
+    /// Method name to stashed impl function (generation-scoped to the
+    /// provider VM; functions never cross as values).
+    pub funcs: BTreeMap<String, StashedFunction>,
+    /// Optional JSON Schema for call arguments (manifest table form).
+    pub args_schema: Option<String>,
+    /// Optional JSON Schema for call results (manifest table form).
+    pub result_schema: Option<String>,
+    /// Provider VM (weak: dispose invalidates without directory coordination).
+    pub vm: Weak<RefCell<LuaVm>>,
+    /// Set while the provider is suspended; suspended records resolve and
+    /// serve nothing until resume republishes them in place.
+    pub suspended: bool,
+}
+
+/// Live per-runtime service directory (LUA-OQ-8).
+///
+/// Owned by [`PluginRuntime`](super::PluginRuntime) and shared with every
+/// generation's [`PluginServices`]: activation publishes, suspend parks,
+/// resume restores, dispose/reload revokes. Keyed by interface with one
+/// record per provider, so several plugins may provide the same interface
+/// and resolution picks deterministically (highest satisfying version,
+/// ties broken by provider id).
+#[derive(Debug, Default)]
+pub struct ServiceDirectory {
+    records: BTreeMap<String, Vec<ServiceRecord>>,
+}
+
+impl ServiceDirectory {
+    /// An empty directory.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Publish one activation record, replacing the same provider's prior
+    /// record for the interface (a provider publishes each interface once
+    /// per generation; re-activation after revoke starts clean).
+    pub fn publish(&mut self, record: ServiceRecord) {
+        let entry = self.records.entry(record.iface.clone()).or_default();
+        entry.retain(|existing| existing.provider != record.provider);
+        entry.push(record);
+    }
+
+    /// Park every record of `provider` (suspend): resolution skips them and
+    /// live handles fail closed with `E_SERVICE_GONE` until resume.
+    pub fn suspend_provider(&mut self, provider: &str) {
+        for records in self.records.values_mut() {
+            for record in records {
+                if record.provider == provider {
+                    record.suspended = true;
+                }
+            }
+        }
+    }
+
+    /// Restore every parked record of `provider` (resume).
+    pub fn resume_provider(&mut self, provider: &str) {
+        for records in self.records.values_mut() {
+            for record in records {
+                if record.provider == provider {
+                    record.suspended = false;
+                }
+            }
+        }
+    }
+
+    /// Drop every record of `provider` (dispose/reload/failed activation).
+    pub fn revoke_provider(&mut self, provider: &str) {
+        for records in self.records.values_mut() {
+            records.retain(|record| record.provider != provider);
+        }
+        self.records.retain(|_, records| !records.is_empty());
+    }
+
+    /// Cloned active (non-suspended) records for `iface`, in publish order.
+    #[must_use]
+    pub fn active_for(&self, iface: &str) -> Vec<ServiceRecord> {
+        self.records
+            .get(iface)
+            .map(|records| {
+                records
+                    .iter()
+                    .filter(|record| !record.suspended)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Cloned active record for (`iface`, `provider`), if published.
+    #[must_use]
+    pub fn find_active(&self, iface: &str, provider: &str) -> Option<ServiceRecord> {
+        self.records.get(iface).and_then(|records| {
+            records
+                .iter()
+                .find(|record| record.provider == provider && !record.suspended)
+                .cloned()
+        })
+    }
+
+    /// Total published records (suspended included; diagnostics and tests).
+    #[must_use]
+    pub fn published_count(&self) -> usize {
+        self.records.values().map(Vec::len).sum()
+    }
+}
+
+/// Truncate a provider failure message to [`SERVICE_FAILED_MESSAGE_LIMIT`]
+/// characters (char-boundary safe).
+fn truncate_service_message(message: String) -> String {
+    if message.chars().count() <= SERVICE_FAILED_MESSAGE_LIMIT {
+        return message;
+    }
+    message.chars().take(SERVICE_FAILED_MESSAGE_LIMIT).collect()
+}
+
+/// `E_SERVICE_RESOLUTION` for an unresolvable consumer lookup.
+fn service_resolution_error(iface: &str, detail: String) -> BridgeError {
+    BridgeError::new(
+        "runtime",
+        "E_SERVICE_RESOLUTION",
+        format!("service '{iface}' cannot be resolved: {detail}"),
+    )
+}
+
+/// `E_SERVICE_GONE` for a dead, stale, or parked provider record.
+fn service_gone_error(detail: String) -> BridgeError {
+    BridgeError::new("runtime", "E_SERVICE_GONE", detail)
+}
+
 /// Per-generation host services for one plugin.
 pub struct PluginServices {
     plugin_id: String,
@@ -420,6 +585,9 @@ pub struct PluginServices {
     ui_blocks: RefCell<UiBlocks>,
     env_grants: RefCell<BTreeSet<String>>,
     env_source: RefCell<Rc<dyn EnvSource>>,
+    service_provided: RefCell<Vec<ProvidedService>>,
+    service_required: RefCell<Vec<(String, String)>>,
+    service_directory: RefCell<Option<Rc<RefCell<ServiceDirectory>>>>,
 }
 
 impl PluginServices {
@@ -448,6 +616,9 @@ impl PluginServices {
             ui_blocks: RefCell::new(UiBlocks::new()),
             env_grants: RefCell::new(BTreeSet::new()),
             env_source: RefCell::new(Rc::new(EmptyEnv)),
+            service_provided: RefCell::new(Vec::new()),
+            service_required: RefCell::new(Vec::new()),
+            service_directory: RefCell::new(None),
         }
     }
 
@@ -557,6 +728,42 @@ impl PluginServices {
     #[must_use]
     pub fn plugin_id(&self) -> &str {
         &self.plugin_id
+    }
+
+    /// Attach the caller manifest's service declarations for this generation.
+    ///
+    /// Wired once at activation from the verified manifest: `provided` gates
+    /// [`HostServices::service_provide_check`], `required` supplies the
+    /// fallback requirement for [`HostServices::service_resolve`]. Absent
+    /// entries fail closed at call time (undeclared provide/resolve is
+    /// rejected, never inferred).
+    pub fn set_service_manifest(
+        &self,
+        provided: Vec<ProvidedService>,
+        required: Vec<(String, String)>,
+    ) {
+        *self.service_provided.borrow_mut() = provided;
+        *self.service_required.borrow_mut() = required;
+    }
+
+    /// Declared provided services for this generation (tests, diagnostics).
+    #[must_use]
+    pub fn provided_services(&self) -> Vec<ProvidedService> {
+        self.service_provided.borrow().clone()
+    }
+
+    /// Declared required services for this generation (tests, diagnostics).
+    #[must_use]
+    pub fn required_services(&self) -> Vec<(String, String)> {
+        self.service_required.borrow().clone()
+    }
+
+    /// Attach the runtime-shared service directory for this generation.
+    ///
+    /// Wired once at activation; without it every service call fails closed
+    /// with `E_NOT_IMPLEMENTED` (no service backend).
+    pub fn set_service_directory(&self, directory: Rc<RefCell<ServiceDirectory>>) {
+        *self.service_directory.borrow_mut() = Some(directory);
     }
 }
 
@@ -729,6 +936,181 @@ impl HostServices for PluginServices {
         self.ui_blocks
             .borrow_mut()
             .update(handle, component.clone())
+    }
+
+    fn service_provide_check(&self, iface: &str) -> Result<(), BridgeError> {
+        if self.service_directory.borrow().is_none() {
+            return Err(BridgeError::not_implemented("bitty.services.provide"));
+        }
+        if self
+            .service_provided
+            .borrow()
+            .iter()
+            .any(|service| service.iface == iface)
+        {
+            return Ok(());
+        }
+        Err(BridgeError::new(
+            "validation",
+            "E_SERVICE_UNDECLARED",
+            format!("service '{iface}' is not declared in services.provided"),
+        ))
+    }
+
+    fn service_resolve(
+        &self,
+        iface: &str,
+        req: Option<&str>,
+        optional: bool,
+    ) -> Result<Option<ServiceRoute>, BridgeError> {
+        let directory = self.service_directory.borrow().clone();
+        let Some(directory) = directory else {
+            return Err(BridgeError::not_implemented("bitty.services.get"));
+        };
+        // Declaration discipline: the caller manifest's `services.required`
+        // entry is mandatory. `opts.version` overrides its requirement text
+        // but never substitutes for the declaration.
+        let manifest_req = self
+            .service_required
+            .borrow()
+            .iter()
+            .find(|(name, _)| name == iface)
+            .map(|(_, req)| req.clone());
+        let Some(manifest_req) = manifest_req else {
+            return Err(service_resolution_error(
+                iface,
+                "it is not declared in services.required".to_string(),
+            ));
+        };
+        let effective = req.unwrap_or(&manifest_req).to_string();
+        // Deterministic pick over the live directory: highest satisfying
+        // version wins, ties break by provider id. Unparseable requirements
+        // or versions satisfy nothing (fail-closed, same grammar as the
+        // policy registry gate).
+        let mut best: Option<(Version, String, ServiceRecord)> = None;
+        for record in directory.borrow().active_for(iface) {
+            if !service_version_satisfies(&record.version, &effective) {
+                continue;
+            }
+            let Ok(version) = Version::parse(&record.version) else {
+                continue;
+            };
+            let replace = match &best {
+                Some((best_version, best_provider, _)) => {
+                    version > *best_version
+                        || (version == *best_version && record.provider < *best_provider)
+                }
+                None => true,
+            };
+            if replace {
+                best = Some((version, record.provider.clone(), record));
+            }
+        }
+        let Some((_, _, record)) = best else {
+            if optional {
+                return Ok(None);
+            }
+            return Err(service_resolution_error(
+                iface,
+                format!("no provider satisfies '{effective}'"),
+            ));
+        };
+        Ok(Some(ServiceRoute {
+            provider: record.provider,
+            generation: record.generation,
+            iface: record.iface,
+            version: record.version,
+            methods: record.methods,
+        }))
+    }
+
+    fn service_call(
+        &self,
+        provider: &str,
+        generation: u32,
+        iface: &str,
+        method: &str,
+        args: &LuaValue,
+    ) -> Result<LuaValue, BridgeError> {
+        let directory = self.service_directory.borrow().clone();
+        let Some(directory) = directory else {
+            return Err(BridgeError::not_implemented("bitty.services.get"));
+        };
+        // Snapshot the record under a short borrow: the directory borrow
+        // must never span the (potentially re-entrant) provider VM call.
+        let record = directory.borrow().find_active(iface, provider);
+        let Some(record) = record else {
+            return Err(service_gone_error(format!(
+                "service '{iface}' is unavailable"
+            )));
+        };
+        if record.generation != generation {
+            return Err(service_gone_error(format!(
+                "service '{iface}' handle is stale"
+            )));
+        }
+        if !record.methods.iter().any(|name| name == method) {
+            return Err(service_gone_error(format!(
+                "service method '{iface}.{method}' is not published"
+            )));
+        }
+        // Args cross as JSON and are validated before the provider runs, so
+        // a schema violation never executes callee code.
+        if let Some(schema) = &record.args_schema {
+            let json = store::encode_json(args);
+            if !value_satisfies_schema(schema, &json) {
+                return Err(BridgeError::new(
+                    "validation",
+                    "E_SERVICE_INVALID",
+                    format!("service '{iface}.{method}' args do not satisfy the interface schema"),
+                ));
+            }
+        }
+        let vm = record
+            .vm
+            .upgrade()
+            .ok_or_else(|| service_gone_error(format!("service provider '{provider}' is gone")))?;
+        let func = record.funcs.get(method).cloned().ok_or_else(|| {
+            service_gone_error(format!(
+                "service method '{iface}.{method}' is not published"
+            ))
+        })?;
+        // `try_borrow_mut`: a re-entrant call into the already-executing
+        // provider VM (including a service calling itself) fails closed
+        // instead of panicking the RefCell.
+        let result = match vm.try_borrow_mut() {
+            Ok(mut vm) => vm.call_function(&func, std::slice::from_ref(args)),
+            Err(_) => {
+                return Err(BridgeError::new(
+                    "runtime",
+                    "E_SERVICE_FAILED",
+                    format!("service provider '{provider}' is busy"),
+                ));
+            }
+        };
+        let result = result.map_err(|error| {
+            BridgeError::new(
+                "runtime",
+                "E_SERVICE_FAILED",
+                truncate_service_message(error.to_string()),
+            )
+        })?;
+        // Results are observations, never live handles: function results
+        // already fail closed at the provider marshalling boundary, and the
+        // declared result schema is re-checked here before crossing back.
+        if let Some(schema) = &record.result_schema {
+            let json = store::encode_json(&result);
+            if !value_satisfies_schema(schema, &json) {
+                return Err(BridgeError::new(
+                    "validation",
+                    "E_SERVICE_INVALID",
+                    format!(
+                        "service '{iface}.{method}' result does not satisfy the interface schema"
+                    ),
+                ));
+            }
+        }
+        Ok(result)
     }
 }
 
@@ -1087,5 +1469,302 @@ mod tests {
                 UI_MAX_AGGREGATED_TEXT_BYTES / UI_MAX_TEXT_BYTES
             )
         });
+    }
+
+    fn service_host() -> (Rc<RefCell<ServiceDirectory>>, PluginServices) {
+        let directory = Rc::new(RefCell::new(ServiceDirectory::new()));
+        let host = services();
+        host.set_service_directory(directory.clone());
+        host.set_service_manifest(
+            vec![ProvidedService {
+                iface: "calc.add".to_string(),
+                version: "1.0.0".to_string(),
+                args_schema: None,
+                result_schema: None,
+            }],
+            vec![("calc.add".to_string(), ">=1.0".to_string())],
+        );
+        (directory, host)
+    }
+
+    fn publish_record(
+        directory: &Rc<RefCell<ServiceDirectory>>,
+        provider: &str,
+        generation: u32,
+        iface: &str,
+        version: &str,
+        methods: &[&str],
+    ) {
+        directory.borrow_mut().publish(ServiceRecord {
+            provider: provider.to_string(),
+            generation,
+            iface: iface.to_string(),
+            version: version.to_string(),
+            methods: methods.iter().map(|name| (*name).to_string()).collect(),
+            funcs: BTreeMap::new(),
+            args_schema: None,
+            result_schema: None,
+            vm: Weak::new(),
+            suspended: false,
+        });
+    }
+
+    #[test]
+    fn provide_check_declared_passes_and_undeclared_rejected() {
+        let (_, host) = service_host();
+        assert!(host.service_provide_check("calc.add").is_ok());
+        assert_eq!(host.provided_services().len(), 1);
+        let error = host
+            .service_provide_check("calc.other")
+            .expect_err("undeclared provision must fail");
+        assert_eq!(error.code, "E_SERVICE_UNDECLARED");
+        assert_eq!(error.class, "validation");
+    }
+
+    #[test]
+    fn provide_check_without_directory_is_not_implemented() {
+        let host = services();
+        host.set_service_manifest(
+            vec![ProvidedService {
+                iface: "calc.add".to_string(),
+                version: "1.0.0".to_string(),
+                args_schema: None,
+                result_schema: None,
+            }],
+            Vec::new(),
+        );
+        let error = host
+            .service_provide_check("calc.add")
+            .expect_err("no backend must stay not-implemented");
+        assert_eq!(error.code, "E_NOT_IMPLEMENTED");
+    }
+
+    #[test]
+    fn resolve_without_directory_is_not_implemented() {
+        let host = services();
+        let error = HostServices::service_resolve(&host, "calc.add", None, false)
+            .expect_err("no backend must stay not-implemented");
+        assert_eq!(error.code, "E_NOT_IMPLEMENTED");
+        assert_eq!(error.class, "runtime");
+    }
+
+    #[test]
+    fn resolve_picks_highest_satisfying_version() {
+        let (directory, host) = service_host();
+        publish_record(&directory, "xuepoo.old", 1, "calc.add", "1.2.0", &["add"]);
+        publish_record(&directory, "xuepoo.new", 1, "calc.add", "1.5.0", &["add"]);
+        publish_record(&directory, "xuepoo.next", 1, "calc.add", "2.0.0", &["add"]);
+        let route = HostServices::service_resolve(&host, "calc.add", None, false)
+            .expect("resolution serves")
+            .expect("route present");
+        assert_eq!(route.provider, "xuepoo.next");
+        assert_eq!(route.version, "2.0.0");
+        assert_eq!(route.generation, 1);
+        assert_eq!(route.methods, vec!["add".to_string()]);
+    }
+
+    #[test]
+    fn resolve_tie_breaks_by_provider_id() {
+        let (directory, host) = service_host();
+        publish_record(&directory, "xuepoo.b", 1, "calc.add", "1.2.0", &["add"]);
+        publish_record(&directory, "xuepoo.a", 1, "calc.add", "1.2.0", &["add"]);
+        let route = HostServices::service_resolve(&host, "calc.add", None, false)
+            .expect("resolution serves")
+            .expect("route present");
+        assert_eq!(route.provider, "xuepoo.a");
+    }
+
+    #[test]
+    fn resolve_opts_version_overrides_manifest_req() {
+        let (directory, host) = service_host();
+        publish_record(&directory, "xuepoo.old", 1, "calc.add", "1.2.0", &["add"]);
+        publish_record(&directory, "xuepoo.new", 1, "calc.add", "1.5.0", &["add"]);
+        let route = HostServices::service_resolve(&host, "calc.add", Some(">=1.2,<1.5"), false)
+            .expect("resolution serves")
+            .expect("route present");
+        assert_eq!(route.version, "1.2.0");
+    }
+
+    #[test]
+    fn resolve_undeclared_iface_is_resolution_error() {
+        let (directory, host) = service_host();
+        publish_record(
+            &directory,
+            "xuepoo.other",
+            1,
+            "calc.other",
+            "1.0.0",
+            &["run"],
+        );
+        // Even with an explicit version override, consumption without a
+        // manifest `services.required` entry fails closed.
+        for optional in [false, true] {
+            let error = HostServices::service_resolve(&host, "calc.other", Some("^1.0"), optional)
+                .expect_err("undeclared consume must fail");
+            assert_eq!(error.code, "E_SERVICE_RESOLUTION", "optional={optional}");
+            assert_eq!(error.class, "runtime");
+        }
+    }
+
+    #[test]
+    fn resolve_failure_and_optional_nil() {
+        let (directory, host) = service_host();
+        publish_record(&directory, "xuepoo.old", 1, "calc.add", "1.2.0", &["add"]);
+        let error = HostServices::service_resolve(&host, "calc.add", Some(">=9.0"), false)
+            .expect_err("unsatisfiable requirement must fail");
+        assert_eq!(error.code, "E_SERVICE_RESOLUTION");
+        assert_eq!(
+            HostServices::service_resolve(&host, "calc.add", Some(">=9.0"), true)
+                .expect("optional degrades to nil"),
+            None
+        );
+        // No provider at all degrades the same way.
+        directory.borrow_mut().revoke_provider("xuepoo.old");
+        assert_eq!(
+            HostServices::service_resolve(&host, "calc.add", None, true)
+                .expect("optional degrades to nil"),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_skips_suspended_records() {
+        let (directory, host) = service_host();
+        publish_record(&directory, "xuepoo.calc", 1, "calc.add", "1.2.0", &["add"]);
+        directory.borrow_mut().suspend_provider("xuepoo.calc");
+        let error = HostServices::service_resolve(&host, "calc.add", None, false)
+            .expect_err("suspended provider must not resolve");
+        assert_eq!(error.code, "E_SERVICE_RESOLUTION");
+        directory.borrow_mut().resume_provider("xuepoo.calc");
+        assert!(
+            HostServices::service_resolve(&host, "calc.add", None, false)
+                .expect("resumed resolves")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn directory_publish_replaces_same_provider_record() {
+        let directory = Rc::new(RefCell::new(ServiceDirectory::new()));
+        publish_record(&directory, "xuepoo.calc", 1, "calc.add", "1.0.0", &["add"]);
+        publish_record(&directory, "xuepoo.calc", 2, "calc.add", "1.1.0", &["add"]);
+        assert_eq!(directory.borrow().published_count(), 1);
+        let record = directory
+            .borrow()
+            .find_active("calc.add", "xuepoo.calc")
+            .expect("republished record present");
+        assert_eq!(record.generation, 2);
+        assert_eq!(record.version, "1.1.0");
+    }
+
+    #[test]
+    fn call_without_directory_is_not_implemented() {
+        let host = services();
+        let error =
+            HostServices::service_call(&host, "xuepoo.calc", 1, "calc.add", "add", &LuaValue::Nil)
+                .expect_err("no backend must stay not-implemented");
+        assert_eq!(error.code, "E_NOT_IMPLEMENTED");
+    }
+
+    #[test]
+    fn call_unknown_iface_is_gone() {
+        let (_, host) = service_host();
+        let error = HostServices::service_call(
+            &host,
+            "xuepoo.calc",
+            1,
+            "calc.missing",
+            "add",
+            &LuaValue::Nil,
+        )
+        .expect_err("unpublished iface must be gone");
+        assert_eq!(error.code, "E_SERVICE_GONE");
+        assert_eq!(error.class, "runtime");
+    }
+
+    #[test]
+    fn call_stale_generation_is_gone() {
+        let (directory, host) = service_host();
+        publish_record(&directory, "xuepoo.calc", 2, "calc.add", "1.2.0", &["add"]);
+        let error =
+            HostServices::service_call(&host, "xuepoo.calc", 1, "calc.add", "add", &LuaValue::Nil)
+                .expect_err("stale generation must be gone");
+        assert_eq!(error.code, "E_SERVICE_GONE");
+    }
+
+    #[test]
+    fn call_unknown_method_is_gone() {
+        let (directory, host) = service_host();
+        publish_record(&directory, "xuepoo.calc", 1, "calc.add", "1.2.0", &["add"]);
+        let error =
+            HostServices::service_call(&host, "xuepoo.calc", 1, "calc.add", "sub", &LuaValue::Nil)
+                .expect_err("unpublished method must be gone");
+        assert_eq!(error.code, "E_SERVICE_GONE");
+    }
+
+    #[test]
+    fn call_suspended_provider_is_gone() {
+        let (directory, host) = service_host();
+        publish_record(&directory, "xuepoo.calc", 1, "calc.add", "1.2.0", &["add"]);
+        directory.borrow_mut().suspend_provider("xuepoo.calc");
+        let error =
+            HostServices::service_call(&host, "xuepoo.calc", 1, "calc.add", "add", &LuaValue::Nil)
+                .expect_err("suspended provider must be gone");
+        assert_eq!(error.code, "E_SERVICE_GONE");
+    }
+
+    #[test]
+    fn call_dead_provider_is_gone() {
+        // `Weak::new` records never upgrade: models a disposed generation
+        // whose VM is dropped.
+        let (directory, host) = service_host();
+        publish_record(&directory, "xuepoo.calc", 1, "calc.add", "1.2.0", &["add"]);
+        let error =
+            HostServices::service_call(&host, "xuepoo.calc", 1, "calc.add", "add", &LuaValue::Nil)
+                .expect_err("dead provider VM must be gone");
+        assert_eq!(error.code, "E_SERVICE_GONE");
+    }
+
+    #[test]
+    fn call_args_schema_violation_is_invalid_before_execution() {
+        let (directory, host) = service_host();
+        directory.borrow_mut().publish(ServiceRecord {
+            provider: "xuepoo.calc".to_string(),
+            generation: 1,
+            iface: "calc.add".to_string(),
+            version: "1.2.0".to_string(),
+            methods: vec!["add".to_string()],
+            funcs: BTreeMap::new(),
+            args_schema: Some(
+                "{\"type\": \"object\", \"properties\": {\"a\": {\"type\": \"integer\"}}, \"required\": [\"a\"]}"
+                    .to_string(),
+            ),
+            result_schema: None,
+            vm: Weak::new(),
+            suspended: false,
+        });
+        // A bare integer is not the declared object: rejected before any
+        // provider code could run (the VM here is dead, proving no call
+        // was attempted — a call would report `E_SERVICE_GONE` instead).
+        let error = HostServices::service_call(
+            &host,
+            "xuepoo.calc",
+            1,
+            "calc.add",
+            "add",
+            &LuaValue::Integer(5),
+        )
+        .expect_err("schema violation must be invalid");
+        assert_eq!(error.code, "E_SERVICE_INVALID");
+        assert_eq!(error.class, "validation");
+    }
+
+    #[test]
+    fn truncate_service_message_caps_at_limit() {
+        let long = "e".repeat(SERVICE_FAILED_MESSAGE_LIMIT + 40);
+        let capped = truncate_service_message(long);
+        assert_eq!(capped.chars().count(), SERVICE_FAILED_MESSAGE_LIMIT);
+        let short = "boom".to_string();
+        assert_eq!(truncate_service_message(short.clone()), short);
     }
 }

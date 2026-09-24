@@ -6,7 +6,9 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use bitty_lua::gate::{VmBudgets, build_plugin_vm};
-use bitty_lua::{BoundedExecution, BridgeError, HostServices, LuaValue, LuaVm, MarshallingLimits};
+use bitty_lua::{
+    BoundedExecution, BridgeError, HostServices, LuaValue, LuaVm, MarshallingLimits, ServiceRoute,
+};
 
 /// Gate-built VM with default RC budgets (replaces deprecated `LuaVm::new`).
 fn gate_vm(id: impl Into<String>) -> LuaVm {
@@ -1124,4 +1126,342 @@ fn timer_handle_allocation_is_checked_not_wrapping() {
         None,
         "exhaustion must be sticky"
     );
+}
+
+// ── LUA-OQ-8 services bridge (get/provide ↔ HostServices) ────────────────
+
+/// One recorded `service_call`: provider, generation, iface, method, args.
+type ServiceCall = (String, u32, String, String, LuaValue);
+
+/// Canned `HostServices` service backend: scripted routes and gate errors,
+/// recorded invocations. Proves the bridge delegates shape-valid calls to
+/// the host and maps every failure to its typed code.
+struct ServiceStub {
+    store: RefCell<BTreeMap<String, LuaValue>>,
+    routes: RefCell<BTreeMap<String, ServiceRoute>>,
+    resolve_error: RefCell<Option<BridgeError>>,
+    provide_error: RefCell<Option<BridgeError>>,
+    call_error: RefCell<Option<BridgeError>>,
+    call_result: RefCell<LuaValue>,
+    calls: RefCell<Vec<ServiceCall>>,
+}
+
+impl Default for ServiceStub {
+    fn default() -> Self {
+        Self {
+            store: RefCell::new(BTreeMap::new()),
+            routes: RefCell::new(BTreeMap::new()),
+            resolve_error: RefCell::new(None),
+            provide_error: RefCell::new(None),
+            call_error: RefCell::new(None),
+            call_result: RefCell::new(LuaValue::Nil),
+            calls: RefCell::new(Vec::new()),
+        }
+    }
+}
+
+impl HostServices for ServiceStub {
+    fn store_get(&self, key: &str) -> Result<Option<LuaValue>, BridgeError> {
+        Ok(self.store.borrow().get(key).cloned())
+    }
+
+    fn store_set(&self, key: &str, value: LuaValue) -> Result<(), BridgeError> {
+        if matches!(value, LuaValue::Nil) {
+            self.store.borrow_mut().remove(key);
+        } else {
+            self.store.borrow_mut().insert(key.to_string(), value);
+        }
+        Ok(())
+    }
+
+    fn settings_get(&self, _key: &str) -> Result<Option<LuaValue>, BridgeError> {
+        Ok(None)
+    }
+
+    fn terminal_snapshot(&self, _scope: &str) -> Result<LuaValue, BridgeError> {
+        Err(BridgeError::capability_denied("terminal.semantic-read"))
+    }
+
+    fn notify_show(&self, _payload: &LuaValue) -> Result<bool, BridgeError> {
+        Err(BridgeError::capability_denied("platform.notify"))
+    }
+
+    fn service_provide_check(&self, _iface: &str) -> Result<(), BridgeError> {
+        match self.provide_error.borrow().clone() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn service_resolve(
+        &self,
+        iface: &str,
+        _req: Option<&str>,
+        _optional: bool,
+    ) -> Result<Option<ServiceRoute>, BridgeError> {
+        match self.resolve_error.borrow().clone() {
+            Some(error) => Err(error),
+            None => Ok(self.routes.borrow().get(iface).cloned()),
+        }
+    }
+
+    fn service_call(
+        &self,
+        provider: &str,
+        generation: u32,
+        iface: &str,
+        method: &str,
+        args: &LuaValue,
+    ) -> Result<LuaValue, BridgeError> {
+        self.calls.borrow_mut().push((
+            provider.to_string(),
+            generation,
+            iface.to_string(),
+            method.to_string(),
+            args.clone(),
+        ));
+        match self.call_error.borrow().clone() {
+            Some(error) => Err(error),
+            None => Ok(self.call_result.borrow().clone()),
+        }
+    }
+}
+
+fn install_services(vm: &mut LuaVm, services: Rc<ServiceStub>) {
+    let services: Rc<dyn HostServices> = services;
+    vm.install_host_module(services, MarshallingLimits::default(), 50)
+        .expect("install");
+}
+
+fn assert_service_code(vm: &mut LuaVm, services: &Rc<ServiceStub>, call: &str, want: &str) {
+    let outcome = vm
+        .execute_bounded(&format!(
+            "local ok, err = pcall(function() return {call} end)\nif ok then bitty.store.set(\"code\", \"NONE\") else bitty.store.set(\"code\", err.code) end"
+        ))
+        .expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{want}: chunk must complete via pcall: {outcome:?}"
+    );
+    assert_eq!(
+        services.store.borrow().get("code"),
+        Some(&LuaValue::String(want.to_string())),
+        "{want}: typed code for `{call}`"
+    );
+}
+
+#[test]
+fn services_get_rejects_malformed_shape() {
+    for (tag, call) in [
+        ("non-string", "bitty.services.get(42)"),
+        ("empty", "bitty.services.get(\"\")"),
+        ("space", "bitty.services.get(\"has space\")"),
+        ("empty-segment", "bitty.services.get(\"calc..add\")"),
+        ("non-table-opts", "bitty.services.get(\"calc.add\", 42)"),
+        (
+            "unknown-opt",
+            "bitty.services.get(\"calc.add\", { bogus = true })",
+        ),
+        (
+            "bad-version",
+            "bitty.services.get(\"calc.add\", { version = 42 })",
+        ),
+        (
+            "bad-optional",
+            "bitty.services.get(\"calc.add\", { optional = 1 })",
+        ),
+    ] {
+        let services = Rc::new(ServiceStub::default());
+        let mut vm = gate_vm(format!("svc-shape-{tag}"));
+        install_services(&mut vm, services.clone());
+        assert_service_code(&mut vm, &services, call, "E_DEF_INVALID");
+        assert!(
+            services.calls.borrow().is_empty(),
+            "{tag}: malformed shape must never reach the host"
+        );
+    }
+}
+
+#[test]
+fn services_provide_rejects_malformed_impl() {
+    for (tag, call) in [
+        ("non-table", "bitty.services.provide(\"calc.add\", 42)"),
+        (
+            "non-function",
+            "bitty.services.provide(\"calc.add\", { add = 42 })",
+        ),
+        ("empty", "bitty.services.provide(\"calc.add\", {})"),
+        ("non-string-iface", "bitty.services.provide(42, {})"),
+    ] {
+        let services = Rc::new(ServiceStub::default());
+        let mut vm = gate_vm(format!("svc-provide-shape-{tag}"));
+        install_services(&mut vm, services.clone());
+        assert_service_code(&mut vm, &services, call, "E_DEF_INVALID");
+        assert!(
+            vm.take_registrations().services.is_empty(),
+            "{tag}: malformed impl must not be captured"
+        );
+    }
+}
+
+#[test]
+fn services_provide_captures_impl_functions() {
+    let services = Rc::new(ServiceStub::default());
+    let mut vm = gate_vm("svc-provide-capture");
+    install_services(&mut vm, services.clone());
+    assert_service_code(
+        &mut vm,
+        &services,
+        "bitty.services.provide(\"calc.add\", { add = function(a) return a end, sub = function(a) return a end })",
+        "NONE",
+    );
+    let capture = vm.take_registrations();
+    assert_eq!(capture.services.len(), 1);
+    let provision = &capture.services[0];
+    assert_eq!(provision.iface, "calc.add");
+    // Impl-table iteration order is hash order, not source order.
+    let mut methods = provision
+        .methods
+        .iter()
+        .map(|method| method.name.clone())
+        .collect::<Vec<_>>();
+    methods.sort();
+    assert_eq!(methods, vec!["add".to_string(), "sub".to_string()]);
+}
+
+#[test]
+fn services_provide_propagates_host_gate() {
+    let services = Rc::new(ServiceStub::default());
+    *services.provide_error.borrow_mut() = Some(BridgeError::new(
+        "validation",
+        "E_SERVICE_UNDECLARED",
+        "service 'calc.add' is not declared in services.provided",
+    ));
+    let mut vm = gate_vm("svc-provide-gate");
+    install_services(&mut vm, services.clone());
+    assert_service_code(
+        &mut vm,
+        &services,
+        "bitty.services.provide(\"calc.add\", { add = function(a) return a end })",
+        "E_SERVICE_UNDECLARED",
+    );
+    assert!(
+        vm.take_registrations().services.is_empty(),
+        "rejected provision must not be captured"
+    );
+}
+
+#[test]
+fn services_get_builds_pinned_handle() {
+    let services = Rc::new(ServiceStub::default());
+    services.routes.borrow_mut().insert(
+        "calc.add".to_string(),
+        ServiceRoute {
+            provider: "xuepoo.calc".to_string(),
+            generation: 7,
+            iface: "calc.add".to_string(),
+            version: "1.0.0".to_string(),
+            methods: vec!["add".to_string()],
+        },
+    );
+    *services.call_result.borrow_mut() = LuaValue::Integer(3);
+    let mut vm = gate_vm("svc-get-handle");
+    install_services(&mut vm, services.clone());
+    let outcome = vm
+        .execute_bounded(
+            r#"
+            local calc = bitty.services.get("calc.add")
+            bitty.store.set("kind", type(calc.add))
+            bitty.store.set("out", calc.add({ a = 1 }))
+        "#,
+        )
+        .expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        services.store.borrow().get("kind"),
+        Some(&LuaValue::String("function".to_string()))
+    );
+    assert_eq!(
+        services.store.borrow().get("out"),
+        Some(&LuaValue::Integer(3))
+    );
+    // The closure pins provider, generation, interface, and method; the
+    // marshalled args cross as values.
+    assert_eq!(
+        services.calls.borrow().as_slice(),
+        &[(
+            "xuepoo.calc".to_string(),
+            7,
+            "calc.add".to_string(),
+            "add".to_string(),
+            LuaValue::table([("a", LuaValue::Integer(1))]),
+        )]
+    );
+}
+
+#[test]
+fn services_get_optional_missing_returns_nil() {
+    let services = Rc::new(ServiceStub::default());
+    let mut vm = gate_vm("svc-get-nil");
+    install_services(&mut vm, services.clone());
+    let outcome = vm
+        .execute_bounded(
+            r#"bitty.store.set("got", bitty.services.get("calc.add", { optional = true }))"#,
+        )
+        .expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{outcome:?}"
+    );
+    assert_eq!(services.store.borrow().get("got"), None);
+}
+
+#[test]
+fn services_get_propagates_resolution_failure() {
+    let services = Rc::new(ServiceStub::default());
+    *services.resolve_error.borrow_mut() = Some(BridgeError::new(
+        "runtime",
+        "E_SERVICE_RESOLUTION",
+        "service 'calc.add' cannot be resolved: no provider satisfies '>=9.0'",
+    ));
+    let mut vm = gate_vm("svc-get-resolution");
+    install_services(&mut vm, services.clone());
+    assert_service_code(
+        &mut vm,
+        &services,
+        "bitty.services.get(\"calc.add\", { version = \">=9.0\" })",
+        "E_SERVICE_RESOLUTION",
+    );
+}
+
+#[test]
+fn services_call_propagates_provider_failure() {
+    let services = Rc::new(ServiceStub::default());
+    services.routes.borrow_mut().insert(
+        "calc.add".to_string(),
+        ServiceRoute {
+            provider: "xuepoo.calc".to_string(),
+            generation: 1,
+            iface: "calc.add".to_string(),
+            version: "1.0.0".to_string(),
+            methods: vec!["add".to_string()],
+        },
+    );
+    *services.call_error.borrow_mut() = Some(BridgeError::new(
+        "runtime",
+        "E_SERVICE_GONE",
+        "service 'calc.add' is unavailable",
+    ));
+    let mut vm = gate_vm("svc-call-gone");
+    install_services(&mut vm, services.clone());
+    assert_service_code(
+        &mut vm,
+        &services,
+        "bitty.services.get(\"calc.add\").add({ a = 1 })",
+        "E_SERVICE_GONE",
+    );
+    assert_eq!(services.calls.borrow().len(), 1);
 }

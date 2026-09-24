@@ -6,15 +6,19 @@
 //!
 //! - `keymaps.suggest` — WIRED as a bridge capture (LUA-OQ-5).
 //! - `tasks.spawn`/`cancel` — WIRED as a bridge capture (LUA-OQ-9, RC-4).
-//! - `services.get`/`provide` — DEFERRED, typed `E_NOT_IMPLEMENTED` (LUA-OQ-8).
+//! - `services.get`/`provide` — WIRED to the host backend (LUA-OQ-8):
+//!   shape-validated and captured at the bridge, resolved/published/called
+//!   through `HostServices::service_resolve`/`service_provide_check`/
+//!   `service_call`. Hosts without a backend keep the typed
+//!   `E_NOT_IMPLEMENTED` default, pinned below.
 //! - `env.get`/`has` — GRANT-GATED via `HostServices::env_get`/`env_has`
 //!   (CTX-0330, ADR 0006): shape-validated at the bridge, `E_NOT_IMPLEMENTED`
 //!   until an `env.read:<KEY>` grant exists, values only for granted keys.
 //! - `process.spawn` — v1-OUT ruling: kept serving (CTX-0445 consent-gated
 //!   extra) but outside the v1 API guarantee.
 //!
-//! Follow-ups own the host backends (keymap application, task scheduling,
-//! service registry) and the SDK `pending-host` flags.
+//! Follow-ups own the remaining host backends (keymap application, task
+//! scheduling) and the SDK `pending-host` flags.
 
 #![forbid(unsafe_code)]
 

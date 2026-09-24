@@ -50,8 +50,8 @@ pub use resolution::{
 };
 pub use services::{
     EmptyEnv, EmptySettings, EnvSource, MAX_ENV_GRANTS, MAX_ENV_VALUE_BYTES, MapEnv, Notification,
-    NotificationQueue, PluginServices, ProcessEnv, SettingsSource, SnapshotSource, UiAccess,
-    UiBlock, UiBlocks, UnavailableSnapshot,
+    NotificationQueue, PluginServices, ProcessEnv, ServiceDirectory, ServiceRecord, SettingsSource,
+    SnapshotSource, UiAccess, UiBlock, UiBlocks, UnavailableSnapshot,
 };
 pub use store::PluginStore;
 // Bridge value/error types the host-service traits are expressed in, so the
@@ -449,7 +449,7 @@ struct PluginEntry {
     package: PluginPackage,
     generation: u32,
     state: LifecycleState,
-    vm: Option<LuaVm>,
+    vm: Option<Rc<RefCell<LuaVm>>>,
     services: Option<Rc<PluginServices>>,
     registrations: RegistrationCapture,
 }
@@ -471,6 +471,7 @@ pub struct PluginRuntime {
     event_sequence: u64,
     entries: BTreeMap<PluginId, PluginEntry>,
     order: Vec<PluginId>,
+    service_directory: Rc<RefCell<ServiceDirectory>>,
 }
 
 impl PluginRuntime {
@@ -492,6 +493,7 @@ impl PluginRuntime {
             event_sequence: 0,
             entries: BTreeMap::new(),
             order: Vec::new(),
+            service_directory: Rc::new(RefCell::new(ServiceDirectory::new())),
         }
     }
 
@@ -789,6 +791,17 @@ impl PluginRuntime {
             overlay: ui_overlay,
             claims: manifest.lazy.claims.clone(),
         });
+        // LUA-OQ-8: service backend wiring. The verified manifest's
+        // `services.provided`/`services.required` become this generation's
+        // declaration gate and resolution fallback; the runtime-shared
+        // directory is where activation publishes and suspend/dispose
+        // revokes. Without both, `services.get`/`provide` fail closed with
+        // `E_NOT_IMPLEMENTED`.
+        plugin_services.set_service_directory(self.service_directory.clone());
+        plugin_services.set_service_manifest(
+            manifest.provided_services.clone(),
+            manifest.required_services.clone(),
+        );
         // CTX-0445: Layer-2 spawn surface. The grant gate lives here; the
         // execution backend closes over the consent ledger and (until
         // CTX-0444) a deny-all allowlist, so granted-but-unenforced tools
@@ -888,6 +901,16 @@ impl PluginRuntime {
         }
 
         let (commands, events) = (capture.commands.len(), capture.events.len());
+        // LUA-OQ-8: publish captured provisions into the live directory
+        // before committing the generation. `validate_capture` already
+        // rejected undeclared/duplicate/over-limit provisions, so the
+        // manifest lookup below is infallible; version and schemas come from
+        // the manifest, impl functions from the capture, the VM weakly.
+        let vm = Rc::new(RefCell::new(vm));
+        {
+            let generation = self.entries.get(id).expect("entry exists").generation;
+            self.publish_services(id, generation, &manifest, &capture, &vm);
+        }
         let entry = self.entries.get_mut(id).expect("entry exists");
         let source_class = entry.package.source_class;
         let unverified = entry.package.unverified;
@@ -943,6 +966,12 @@ impl PluginRuntime {
         if let Some(services) = entry.services.as_ref() {
             services.clear_ui_blocks();
         }
+        // LUA-OQ-8: park this generation's publications in place. Records
+        // stay keyed for resume but resolve and serve nothing while parked,
+        // so live consumer handles fail closed with `E_SERVICE_GONE`.
+        self.service_directory
+            .borrow_mut()
+            .suspend_provider(id.as_str());
         let _ = self.host.suspend(id);
         Ok(())
     }
@@ -964,6 +993,11 @@ impl PluginRuntime {
             ));
         }
         entry.state = LifecycleState::Active;
+        // LUA-OQ-8: restore the parked publications (same generation, so
+        // pre-suspend consumer handles serve again).
+        self.service_directory
+            .borrow_mut()
+            .resume_provider(id.as_str());
         let _ = self.host.resume(id);
         Ok(())
     }
@@ -993,6 +1027,12 @@ impl PluginRuntime {
             services.clear_ui_blocks();
         }
         entry.state = LifecycleState::Disposed;
+        // LUA-OQ-8: revoke this generation's publications. The entry VM is
+        // already dropped, so even a lingering record could never upgrade;
+        // revocation additionally makes resolution fail closed immediately.
+        self.service_directory
+            .borrow_mut()
+            .revoke_provider(id.as_str());
         let _ = self.host.remove(id);
         Ok(())
     }
@@ -1091,11 +1131,16 @@ impl PluginRuntime {
                 })?
         };
         let entry = self.entries.get_mut(id).expect("entry exists");
+        // Shared VM ownership: the cell is borrowed mutably for the call so
+        // a re-entrant service invocation into this same VM fails closed
+        // (`E_SERVICE_FAILED`) instead of aliasing it.
         let vm = entry
             .vm
-            .as_mut()
+            .as_ref()
+            .cloned()
             .ok_or_else(|| lifecycle_error(id, "no VM"))?;
-        vm.call_function(&run, args)
+        vm.borrow_mut()
+            .call_function(&run, args)
             .map_err(|error| PluginRuntimeError::Vm(error.to_string()))
     }
 
@@ -1131,9 +1176,13 @@ impl PluginRuntime {
             let Some(entry) = self.entries.get_mut(&id) else {
                 continue;
             };
-            let Some(vm) = entry.vm.as_mut() else {
+            let Some(vm) = entry.vm.as_ref().cloned() else {
                 continue;
             };
+            // One mutable borrow per plugin per event: a handler that
+            // re-enters this same VM through services fails closed host-side
+            // (`E_SERVICE_FAILED`) instead of aliasing it.
+            let mut vm = vm.borrow_mut();
             for handler in handlers {
                 if vm
                     .call_function(&handler, std::slice::from_ref(&envelope))
@@ -1153,6 +1202,48 @@ impl PluginRuntime {
                 PluginStore::load(path).map_err(PluginRuntimeError::Io)
             }
             None => Ok(PluginStore::in_memory()),
+        }
+    }
+
+    /// Publish a generation's captured service provisions (LUA-OQ-8).
+    ///
+    /// Called after [`validate_capture`] and before the atomic commit, so
+    /// every provision here is declared in the manifest, uniquely named, and
+    /// within bounds. Version and schemas come from the manifest's
+    /// `services.provided` entry (never from Lua); impl functions come from
+    /// the capture; the provider VM is held weakly so dispose invalidates
+    /// consumer handles without further coordination.
+    fn publish_services(
+        &self,
+        id: &PluginId,
+        generation: u32,
+        manifest: &PluginManifest,
+        capture: &RegistrationCapture,
+        vm: &Rc<RefCell<LuaVm>>,
+    ) {
+        let mut directory = self.service_directory.borrow_mut();
+        for provision in &capture.services {
+            let declared = manifest
+                .provided_services
+                .iter()
+                .find(|service| service.iface == provision.iface)
+                .expect("validate_capture guarantees declared provisions");
+            let mut funcs = BTreeMap::new();
+            for method in &provision.methods {
+                funcs.insert(method.name.clone(), method.func.clone());
+            }
+            directory.publish(ServiceRecord {
+                provider: id.as_str().to_string(),
+                generation,
+                iface: provision.iface.clone(),
+                version: declared.version.clone(),
+                methods: provision.methods.iter().map(|m| m.name.clone()).collect(),
+                funcs,
+                args_schema: declared.args_schema.clone(),
+                result_schema: declared.result_schema.clone(),
+                vm: Rc::downgrade(vm),
+                suspended: false,
+            });
         }
     }
 
@@ -1185,6 +1276,12 @@ impl PluginRuntime {
     #[must_use]
     pub fn host_owns_command(&self, qualified: &str) -> bool {
         self.host.registry().is_command_owned(qualified)
+    }
+
+    /// Shared live service directory (diagnostics, tests).
+    #[must_use]
+    pub fn service_directory(&self) -> &Rc<RefCell<ServiceDirectory>> {
+        &self.service_directory
     }
 }
 
@@ -1422,6 +1519,70 @@ fn validate_capture(
                 plugin: id.to_string(),
                 detail: format!("duplicate task handle {}", task.handle),
             });
+        }
+    }
+    // LUA-OQ-8: the bridge captures service provisions, so the commit gate
+    // re-checks their bounds here like commands/events/timers/tasks. Every
+    // provision must be declared in the manifest's `services.provided`
+    // (version and schemas resolve from the manifest, never from Lua).
+    // Unlike commands there is no reverse equivalence: a declared service
+    // with no provision simply never publishes, and resolution fails closed
+    // (`E_SERVICE_RESOLUTION`) instead of activation failing.
+    if capture.services.len() > bitty_lua::REGISTRATION_MAX_SERVICES {
+        return Err(PluginRuntimeError::Capture {
+            plugin: id.to_string(),
+            detail: format!(
+                "service provision count {} exceeds limit {}",
+                capture.services.len(),
+                bitty_lua::REGISTRATION_MAX_SERVICES
+            ),
+        });
+    }
+    let declared_services: BTreeSet<&str> = manifest
+        .provided_services
+        .iter()
+        .map(|service| service.iface.as_str())
+        .collect();
+    let mut seen_services = BTreeSet::new();
+    for provision in &capture.services {
+        if !declared_services.contains(provision.iface.as_str()) {
+            return Err(PluginRuntimeError::Capture {
+                plugin: id.to_string(),
+                detail: format!(
+                    "service '{}' is not declared in services.provided",
+                    provision.iface
+                ),
+            });
+        }
+        if !seen_services.insert(provision.iface.clone()) {
+            return Err(PluginRuntimeError::Capture {
+                plugin: id.to_string(),
+                detail: format!("duplicate service provision '{}'", provision.iface),
+            });
+        }
+        if provision.methods.is_empty()
+            || provision.methods.len() > bitty_lua::REGISTRATION_MAX_SERVICE_METHODS
+        {
+            return Err(PluginRuntimeError::Capture {
+                plugin: id.to_string(),
+                detail: format!(
+                    "service '{}' method count {} exceeds limit {}",
+                    provision.iface,
+                    provision.methods.len(),
+                    bitty_lua::REGISTRATION_MAX_SERVICE_METHODS
+                ),
+            });
+        }
+        for method in &provision.methods {
+            if method.name.is_empty() || method.name.len() > bitty_lua::SERVICE_MAX_METHOD_BYTES {
+                return Err(PluginRuntimeError::Capture {
+                    plugin: id.to_string(),
+                    detail: format!(
+                        "service method name exceeds {} bytes",
+                        bitty_lua::SERVICE_MAX_METHOD_BYTES
+                    ),
+                });
+            }
         }
     }
     Ok(())

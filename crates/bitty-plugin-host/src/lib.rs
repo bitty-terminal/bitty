@@ -222,7 +222,8 @@ pub use manifest::{
     MAX_EVENT_TYPES, MAX_FS_PATTERNS_PER_KIND, MAX_PATTERN_TEXT_BYTES, MAX_PROVIDED_SERVICES,
     MAX_TOOLS, PluginDependency, PluginId, PluginIdentity, PluginManifest, ProvidedService,
     QualifiedName, SchemaSummary, ToolDeclaration, is_hostile_fs_pattern,
-    summarize_interface_schema, validate_interface_schema,
+    service_version_satisfies, summarize_interface_schema, validate_interface_schema,
+    value_satisfies_schema,
 };
 pub use origin::{
     DetectedOrigin, OriginOverride, OriginPolicy, OriginSignals, classify_origin,

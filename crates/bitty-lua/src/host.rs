@@ -30,9 +30,9 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+pub use phodopus::StashedFunction;
 use phodopus::{
-    Callback, CallbackReturn, Closure, Context, Error, ExecutorMode, Function, StashedFunction,
-    Table, Value,
+    Callback, CallbackReturn, Closure, Context, Error, ExecutorMode, Function, Table, Value,
 };
 
 use crate::ui::{UiNode, component_invalid, is_ui_slot, read_component};
@@ -177,6 +177,34 @@ pub const REGISTRATION_MAX_KEYMAP_COMMAND_BYTES: usize = 128;
 /// resume through the event path); the bridge only captures the entry
 /// function and owns the handle, mirroring `timers.create`/`cancel`.
 pub const REGISTRATION_MAX_TASKS: usize = 64;
+
+/// Maximum provided interfaces captured from one `init.lua` (LUA-OQ-8).
+///
+/// Mirrors `REGISTRATION_MAX_COMMANDS` in spirit at a smaller scale: a
+/// generation that provides more interfaces than it could plausibly
+/// implement is hostile or broken. The 17th `provide` fails closed with
+/// typed `E_DEF_LIMIT`. The bridge only captures the impl functions;
+/// publication into the runtime service directory happens at activation.
+pub const REGISTRATION_MAX_SERVICES: usize = 16;
+
+/// Maximum methods captured per provided interface (LUA-OQ-8).
+///
+/// Bounds the impl-table scan: a 33rd function entry fails closed with
+/// typed `E_DEF_LIMIT` instead of stashing an unbounded handle set.
+pub const REGISTRATION_MAX_SERVICE_METHODS: usize = 32;
+
+/// Maximum bytes of one service interface name (LUA-OQ-8 admission bound).
+///
+/// Matches the manifest `services.provided` ceiling (1..128 bytes); the
+/// dot-separated grammar itself is enforced host-side at resolution
+/// (the bridge checks shape only).
+pub const SERVICE_MAX_IFACE_BYTES: usize = 128;
+
+/// Maximum bytes of one service method name (LUA-OQ-8 admission bound).
+///
+/// Method names are plain Lua table keys naming the impl functions; the
+/// ceiling keeps handle-table scans bounded.
+pub const SERVICE_MAX_METHOD_BYTES: usize = 128;
 
 /// One bounded, immutable data value crossing the host bridge.
 ///
@@ -650,6 +678,59 @@ pub trait HostServices {
         }
         self.ui_update(handle, component)
     }
+
+    /// Gate one `bitty.services.provide(iface)` declaration (LUA-OQ-8).
+    ///
+    /// The bridge validates shapes and stashes the impl functions into the
+    /// generation capture; this hook lets the host reject the declaration
+    /// against the caller manifest (undeclared interface). The default
+    /// fails closed with `E_NOT_IMPLEMENTED` (no service backend); the
+    /// runtime overrides it with the manifest-declaration check.
+    fn service_provide_check(&self, iface: &str) -> Result<(), BridgeError> {
+        let _ = iface;
+        Err(BridgeError::not_implemented("bitty.services.provide"))
+    }
+
+    /// Resolve one `bitty.services.get(iface, opts)` call (LUA-OQ-8).
+    ///
+    /// `req` is the caller-supplied version requirement (`opts.version`),
+    /// or `None` when the host must fall back to the caller manifest's
+    /// `services.required` entry. `optional` mirrors `opts.optional`:
+    /// when true, an unresolvable interface returns `Ok(None)` (Lua `nil`)
+    /// instead of `E_SERVICE_RESOLUTION`. The default fails closed with
+    /// `E_NOT_IMPLEMENTED` (no service backend); the runtime overrides it
+    /// with manifest-checked directory resolution.
+    fn service_resolve(
+        &self,
+        iface: &str,
+        req: Option<&str>,
+        optional: bool,
+    ) -> Result<Option<ServiceRoute>, BridgeError> {
+        let _ = (iface, req, optional);
+        Err(BridgeError::not_implemented("bitty.services.get"))
+    }
+
+    /// Invoke one provided service method (LUA-OQ-8).
+    ///
+    /// `provider`/`generation`/`iface`/`method` pin the exact published record
+    /// the consumer handle captured (no re-resolution: a republished
+    /// replacement never hijacks a live handle, and a stale generation fails
+    /// closed with `E_SERVICE_GONE`). The default fails closed
+    /// with `E_NOT_IMPLEMENTED`; the runtime overrides it with
+    /// generation-checked schema-validated cross-VM invocation
+    /// (`E_SERVICE_GONE` past disappearance, `E_SERVICE_INVALID` on
+    /// schema violation).
+    fn service_call(
+        &self,
+        provider: &str,
+        generation: u32,
+        iface: &str,
+        method: &str,
+        args: &LuaValue,
+    ) -> Result<LuaValue, BridgeError> {
+        let _ = (provider, generation, iface, method, args);
+        Err(BridgeError::not_implemented("bitty.services.get"))
+    }
 }
 
 /// One captured command registration from `init.lua`.
@@ -713,6 +794,55 @@ pub struct TaskRegistration {
     pub entry: StashedFunction,
 }
 
+/// One resolved service route handed to `bitty.services.get` (LUA-OQ-8).
+///
+/// A snapshot, not a live reference: the bridge builds one callable closure
+/// per method pinning `provider` (id plus generation, exact-published
+/// record — a republished replacement never hijacks the handle). The host
+/// owns freshness: past disappearance the pinned record is gone and the
+/// closure fails closed with `E_SERVICE_GONE`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceRoute {
+    /// Providing plugin id.
+    pub provider: String,
+    /// Activation generation that published the record.
+    pub generation: u32,
+    /// Service interface name.
+    pub iface: String,
+    /// Published interface version.
+    pub version: String,
+    /// Provided method names (closure set).
+    pub methods: Vec<String>,
+}
+
+/// One captured service method from a `provide` impl table (LUA-OQ-8).
+///
+/// Impl tables are plain function tables: every value must be a Lua
+/// function, stashed generation-scoped at capture. Non-function entries
+/// fail closed with `E_DEF_INVALID`; the handle set never crosses as
+/// values (functions cannot cross the host bridge).
+#[derive(Debug, Clone)]
+pub struct ServiceMethod {
+    /// Method name (impl-table key).
+    pub name: String,
+    /// Stashed impl function handle (generation-scoped).
+    pub func: StashedFunction,
+}
+
+/// One captured service provision from `init.lua` (LUA-OQ-8).
+///
+/// The bridge captures only; the runtime publishes the record into the
+/// service directory at activation after checking it against the caller
+/// manifest's `services.provided` entry (version and schemas come from the
+/// manifest, never from Lua).
+#[derive(Debug, Clone)]
+pub struct ServiceProvision {
+    /// Service interface name.
+    pub iface: String,
+    /// Provided methods in impl-table order.
+    pub methods: Vec<ServiceMethod>,
+}
+
 /// Generation-scoped capture of `init.lua` registrations, validated by the
 /// runtime after `init.lua` returns and before atomic commit.
 #[derive(Debug, Default)]
@@ -731,6 +861,8 @@ pub struct RegistrationCapture {
     pub tasks: Vec<TaskRegistration>,
     /// Next task handle.
     pub next_task_handle: i64,
+    /// Captured service provisions in declaration order (LUA-OQ-8).
+    pub services: Vec<ServiceProvision>,
 }
 
 impl RegistrationCapture {
@@ -745,6 +877,7 @@ impl RegistrationCapture {
             keymaps: Vec::new(),
             tasks: Vec::new(),
             next_task_handle: 1,
+            services: Vec::new(),
         }
     }
 
@@ -1007,6 +1140,7 @@ impl LuaVm {
             keymaps: capture.keymaps.clone(),
             tasks: capture.tasks.clone(),
             next_task_handle: capture.next_task_handle,
+            services: capture.services.clone(),
         }
     }
 
@@ -1605,19 +1739,112 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         )
         .expect("keymaps table accepts 'suggest'");
 
-    // CTX-0707 parity: `bitty.services.get`/`provide` are DEFERRED
-    // (LUA-OQ-8). Consumer resolution needs the version grammar, interface
-    // schemas, and manifest `[services.provided]` table form; provider
-    // disappearance needs `E_SERVICE_GONE` lifecycle wiring. None of that
-    // host backend exists yet, so both spellings stay present and fail
-    // closed with typed `E_NOT_IMPLEMENTED` until a follow-up wires them.
+    // `bitty.services.get`/`provide` are WIRED to the host backend
+    // (LUA-OQ-8). The bridge validates shapes and owns the generation
+    // capture; policy lives host-side behind `HostServices`
+    // (`service_provide_check` / `service_resolve` / `service_call`).
+    // Hosts without a backend keep the typed `E_NOT_IMPLEMENTED` default,
+    // so the spellings stay present and misconfiguration is observable.
     let services = Table::new(&ctx);
     services
         .set(
             ctx,
             "get",
-            Callback::from_fn(&ctx, move |ctx, _exec, _stack| {
-                Err(BridgeError::not_implemented("bitty.services.get").to_error(ctx))
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let iface = match stack.get(0) {
+                        Value::String(name) => {
+                            String::from_utf8_lossy(name.as_bytes()).into_owned()
+                        }
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_DEF_INVALID",
+                                "service interface must be a string",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    if let Err(detail) = check_service_iface_shape(&iface) {
+                        return Err(
+                            BridgeError::new("validation", "E_DEF_INVALID", detail).to_error(ctx)
+                        );
+                    }
+                    let (req, optional) = match stack.get(1) {
+                        Value::Nil => (None, false),
+                        Value::Table(opts) => match read_service_opts(opts) {
+                            Ok(parsed) => parsed,
+                            Err(detail) => {
+                                return Err(BridgeError::new(
+                                    "validation",
+                                    "E_DEF_INVALID",
+                                    detail,
+                                )
+                                .to_error(ctx));
+                            }
+                        },
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_DEF_INVALID",
+                                "service options must be a table",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let route = state
+                        .bounded(|_expiry| {
+                            state
+                                .services
+                                .service_resolve(&iface, req.as_deref(), optional)
+                        })
+                        .map_err(|error| error.to_error(ctx))?;
+                    let Some(route) = route else {
+                        stack.replace(ctx, Value::Nil);
+                        return Ok(CallbackReturn::Return);
+                    };
+                    let table = Table::new(&ctx);
+                    for method in &route.methods {
+                        let state = state.clone();
+                        let provider = route.provider.clone();
+                        let generation = route.generation;
+                        let iface = route.iface.clone();
+                        let name = method.clone();
+                        let method = method.clone();
+                        table
+                            .set(
+                                ctx,
+                                name,
+                                Callback::from_fn(&ctx, move |ctx, _exec, mut stack| {
+                                    let arg = match stack.get(0) {
+                                        Value::Nil => LuaValue::Nil,
+                                        value => LuaValue::from_lua(value, state.limits)
+                                            .map_err(|error| error.to_error(ctx))?,
+                                    };
+                                    let result = state
+                                        .bounded(|_expiry| {
+                                            state.services.service_call(
+                                                &provider, generation, &iface, &method, &arg,
+                                            )
+                                        })
+                                        .map_err(|error| error.to_error(ctx))?;
+                                    stack.replace(ctx, result.to_lua(ctx));
+                                    Ok(CallbackReturn::Return)
+                                }),
+                            )
+                            .map_err(|error| {
+                                BridgeError::new(
+                                    "runtime",
+                                    "E_SERVICE_FAILED",
+                                    format!("failed to build service handle: {error:?}"),
+                                )
+                                .to_error(ctx)
+                            })?;
+                    }
+                    stack.replace(ctx, Value::Table(table));
+                    Ok(CallbackReturn::Return)
+                }
             }),
         )
         .expect("services table accepts 'get'");
@@ -1625,8 +1852,134 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         .set(
             ctx,
             "provide",
-            Callback::from_fn(&ctx, move |ctx, _exec, _stack| {
-                Err(BridgeError::not_implemented("bitty.services.provide").to_error(ctx))
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let iface = match stack.get(0) {
+                        Value::String(name) => {
+                            String::from_utf8_lossy(name.as_bytes()).into_owned()
+                        }
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_DEF_INVALID",
+                                "service interface must be a string",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    if let Err(detail) = check_service_iface_shape(&iface) {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            detail,
+                        )
+                        .to_error(ctx));
+                    }
+                    let impl_table = match stack.get(1) {
+                        Value::Table(table) => table,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_DEF_INVALID",
+                                "service impl must be a table",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    // Host gate before the impl scan: hosts without a
+                    // backend fail closed with `E_NOT_IMPLEMENTED` here,
+                    // while the runtime checks the caller manifest.
+                    state
+                        .bounded(|_expiry| state.services.service_provide_check(&iface))
+                        .map_err(|error| error.to_error(ctx))?;
+                    let mut methods = Vec::new();
+                    for (key, value) in impl_table.iter() {
+                        if methods.len() >= REGISTRATION_MAX_SERVICE_METHODS {
+                            return Err(BridgeError::new(
+                                "budget",
+                                "E_DEF_LIMIT",
+                                format!(
+                                    "service method limit ({REGISTRATION_MAX_SERVICE_METHODS}) exceeded"
+                                ),
+                            )
+                            .to_error(ctx));
+                        }
+                        let Value::String(raw) = key else {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_DEF_INVALID",
+                                "service method names must be strings",
+                            )
+                            .to_error(ctx));
+                        };
+                        let name: String =
+                            String::from_utf8_lossy(raw.as_bytes()).into_owned();
+                        if name.is_empty()
+                            || name.len() > SERVICE_MAX_METHOD_BYTES
+                            || name.contains('\0')
+                        {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_DEF_INVALID",
+                                "service method name must be 1..128 bytes without NUL",
+                            )
+                            .to_error(ctx));
+                        }
+                        if methods.iter().any(|m: &ServiceMethod| m.name == name) {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_DEF_INVALID",
+                                format!("duplicate service method '{name}'"),
+                            )
+                            .to_error(ctx));
+                        }
+                        let Value::Function(function) = value else {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_DEF_INVALID",
+                                "service impl entries must be functions",
+                            )
+                            .to_error(ctx));
+                        };
+                        methods.push(ServiceMethod {
+                            name,
+                            func: ctx.stash(function),
+                        });
+                    }
+                    if methods.is_empty() {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            "service impl must declare at least one method",
+                        )
+                        .to_error(ctx));
+                    }
+                    {
+                        let mut capture = state.capture.borrow_mut();
+                        if capture.services.len() >= REGISTRATION_MAX_SERVICES {
+                            return Err(BridgeError::new(
+                                "budget",
+                                "E_DEF_LIMIT",
+                                format!(
+                                    "service provision limit ({REGISTRATION_MAX_SERVICES}) exceeded"
+                                ),
+                            )
+                            .to_error(ctx));
+                        }
+                        if capture.services.iter().any(|p| p.iface == iface) {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_DEF_INVALID",
+                                format!("duplicate service provision '{iface}'"),
+                            )
+                            .to_error(ctx));
+                        }
+                        capture.services.push(ServiceProvision { iface, methods });
+                    }
+                    stack.replace(ctx, Value::Boolean(true));
+                    Ok(CallbackReturn::Return)
+                }
             }),
         )
         .expect("services table accepts 'provide'");
@@ -2167,6 +2520,61 @@ fn optional_string<'gc>(ctx: Context<'gc>, table: Table<'gc>, field: &str) -> Op
         Value::String(s) => Some(String::from_utf8_lossy(s.as_bytes()).into_owned()),
         _ => None,
     }
+}
+
+/// Shape-check one service interface name (LUA-OQ-8 admission bound).
+///
+/// Mirrors the manifest `services.provided` ceiling (1..128 bytes,
+/// dot-separated non-empty segments of at most 64 bytes, no NUL or
+/// space); the full grammar stays host-side, the bridge rejects only
+/// malformed shapes with a static detail for the caller to wrap.
+fn check_service_iface_shape(iface: &str) -> Result<(), &'static str> {
+    if iface.is_empty() || iface.len() > SERVICE_MAX_IFACE_BYTES {
+        return Err("service interface must be 1..128 bytes");
+    }
+    if iface.contains('\0') || iface.contains(' ') {
+        return Err("service interface must not contain NUL or space");
+    }
+    for segment in iface.split('.') {
+        if segment.is_empty() || segment.len() > 64 {
+            return Err("service interface segment must be 1..64 bytes");
+        }
+    }
+    Ok(())
+}
+
+/// Read `bitty.services.get(iface, opts)` options (LUA-OQ-8).
+///
+/// Returns `(version_req, optional)`: `version` overrides the caller
+/// manifest's `services.required` entry for this call, `optional`
+/// degrades an unresolvable interface to Lua `nil`. Unknown keys and
+/// mistyped values fail closed — silent options would hide typos such
+/// as `optinal = true`.
+fn read_service_opts(opts: Table<'_>) -> Result<(Option<String>, bool), &'static str> {
+    let mut req = None;
+    let mut optional = false;
+    for (key, value) in opts.iter() {
+        let Value::String(raw) = key else {
+            return Err("service option keys must be strings");
+        };
+        let name: String = String::from_utf8_lossy(raw.as_bytes()).into_owned();
+        match (name.as_str(), value) {
+            ("version", Value::String(text)) => {
+                let text: String = String::from_utf8_lossy(text.as_bytes()).into_owned();
+                if text.is_empty() || text.len() > 128 {
+                    return Err("service option 'version' must be 1..128 bytes");
+                }
+                req = Some(text);
+            }
+            ("version", Value::Nil) => {}
+            ("optional", Value::Boolean(flag)) => optional = flag,
+            ("optional", Value::Nil) => {}
+            ("version", _) => return Err("service option 'version' must be a string"),
+            ("optional", _) => return Err("service option 'optional' must be a boolean"),
+            _ => return Err("unknown service option"),
+        }
+    }
+    Ok((req, optional))
 }
 
 fn validate_module_name(name: &str) -> Result<(), BridgeError> {

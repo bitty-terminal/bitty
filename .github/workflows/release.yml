@@ -769,7 +769,12 @@ jobs:
               exit 1
             fi
             expected="$(printf '%s\n' CHANGELOG.md LICENSE README.md bin share)"
-            actual="$(tar -tf "$bundle" | cut -d/ -f2 | LC_ALL=C sort -u)"
+            # `tar -tf` also lists the archive's own top-level directory entry
+            # ("<base>/"), which yields an empty field from `cut -d/ -f2` and a
+            # leading empty line. That made this comparison impossible to
+            # satisfy for every well-formed bundle, so the check rejected the
+            # release's own archives. Filter empty fields.
+            actual="$(tar -tf "$bundle" | cut -d/ -f2 | sed '/^$/d' | LC_ALL=C sort -u)"
             if [[ "$actual" != "$expected" ]]; then
               echo "::error::$base member roots mismatch (actual: $actual)" >&2
               exit 1

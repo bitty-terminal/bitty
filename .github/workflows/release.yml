@@ -801,13 +801,39 @@ jobs:
             # matched literally rather than treated as a glob pattern.
             target="${base#"bitty-${version}-"}"
             case "$target" in
-              x86_64-unknown-linux-gnu | x86_64-unknown-linux-musl)
+              x86_64-unknown-linux-gnu)
                 output="$("$exe" --version)"
                 echo "bitty --version => $output"
-                if [[ "$output" != *"$version"* ]]; then
-                  echo "::error::version mismatch: bundle $version, binary $output" >&2
+                if [[ "$output" != *"${version}"* ]]; then
+                  echo "::error::version mismatch: bundle ${version}, binary ${output}" >&2
                   exit 1
                 fi
+                ;;
+              x86_64-unknown-linux-musl)
+                # The musl bundle is built with `-crt-static` disabled so that
+                # fontconfig/FreeType and the runtime dlopen of Vulkan/X11/
+                # Wayland keep working (see the build-alpine job). That makes
+                # it a dynamically linked musl binary, so it needs
+                # /lib/ld-musl-x86_64.so.1, which this glibc runner does not
+                # ship: executing it here fails with 127 and "required file
+                # not found" while the archive is perfectly fine. The Alpine
+                # `install smoke` job already executes the same binary on musl
+                # and is the authoritative runtime check, so this gate only
+                # asserts the ELF machine and records that it was not run.
+                head_out="$(readelf -h "$exe" 2>&1)" || {
+                  echo "::error::readelf -h failed for $base: $head_out" >&2
+                  exit 1
+                }
+                machine="$(printf '%s\n' "$head_out" \
+                  | sed -n 's/^[[:space:]]*Machine:[[:space:]]*//p' | head -n1)"
+                case "$machine" in
+                  *X86-64*) ;;
+                  *)
+                    echo "::error::$base machine mismatch: expected X86-64, got '${machine}'" >&2
+                    exit 1
+                    ;;
+                esac
+                echo "$base: X86-64 ELF verified (not executed: needs the musl loader; runtime covered by install smoke on Alpine)"
                 ;;
               *)
                 case "$target" in

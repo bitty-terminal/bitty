@@ -8,7 +8,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::error::PluginError;
-use crate::manifest::{PluginId, PluginManifest, QualifiedName};
+use crate::manifest::{
+    LazyCommand, PluginId, PluginManifest, QualifiedName, summarize_interface_schema,
+};
 
 /// Monotonic instance counter per plugin id.
 ///
@@ -40,6 +42,59 @@ fn quoted_path(nodes: &[String]) -> String {
         .map(|n| format!("'{n}'"))
         .collect::<Vec<_>>()
         .join(" -> ")
+}
+
+/// Check static-vs-registration command equivalence after canonicalization.
+///
+/// `declared` is the manifest `[lazy].commands` set (static side);
+/// `registered` is the command set the generation actually registered.
+/// Both sides are compared by canonical qualified-name string, order-free:
+/// activation fails with a validation diagnostic on any mismatch (missing,
+/// extra, or duplicated command). No state mutation; headless.
+pub fn check_command_equivalence(
+    declared: &[LazyCommand],
+    registered: &[QualifiedName],
+) -> Result<(), PluginError> {
+    let mut want: Vec<&str> = declared.iter().map(|c| c.id.as_str()).collect();
+    want.sort_unstable();
+    let mut got: Vec<&str> = registered.iter().map(|q| q.as_str()).collect();
+    got.sort_unstable();
+    if want != got {
+        return Err(PluginError::manifest(
+            "lazy.commands",
+            format!(
+                "static command set does not match registration (declared [{}], registered [{}])",
+                want.join(", "),
+                got.join(", ")
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Render static help for one lazy command from its manifest declaration.
+fn render_command_help(owner: &str, command: &LazyCommand) -> String {
+    let mut out = format!("{} (from plugin '{owner}')", command.id.as_str());
+    if let Some(schema) = command
+        .args_schema
+        .as_deref()
+        .and_then(summarize_interface_schema)
+    {
+        if let Some(description) = schema.description {
+            out.push_str(&format!("\n{description}"));
+        }
+        if schema.properties.is_empty() {
+            out.push_str("\nargs: (typed object, no declared properties)");
+        } else {
+            out.push_str(&format!("\nargs: {}", schema.properties.join(", ")));
+        }
+    } else {
+        out.push_str("\nargs: (untyped)");
+    }
+    if command.result_schema.is_some() {
+        out.push_str("\nreturns: typed result");
+    }
+    out
 }
 
 /// Lifecycle state per
@@ -93,7 +148,14 @@ pub struct RegistryEntry {
 impl RegistryEntry {
     /// Create a Declared entry at generation 1.
     fn declared(manifest: PluginManifest) -> Self {
-        let commands = manifest.lazy.commands.clone();
+        // Registration side starts as the canonicalized static set; the
+        // activation-time equivalence check pins them together.
+        let commands = manifest
+            .lazy
+            .commands
+            .iter()
+            .map(|c| c.id.clone())
+            .collect();
         let subscribed_events = manifest.lazy.events.clone();
         Self {
             manifest,
@@ -190,8 +252,8 @@ impl Registry {
             });
         }
         // Cycle detection stub: self-dependency is rejected immediately.
-        for (dep_id, _) in &entry.manifest.dependencies {
-            if dep_id == id {
+        for dep in &entry.manifest.dependencies {
+            if &dep.id == id {
                 return Err(PluginError::registry(format!(
                     "plugin '{}' cannot depend on itself",
                     id.as_str()
@@ -234,12 +296,12 @@ impl Registry {
         let known: BTreeSet<String> = self.plugins.keys().cloned().collect();
         for id in &ids {
             let entry = self.plugins.get(id.as_str()).unwrap();
-            for (dep, _) in &entry.manifest.dependencies {
-                if !known.contains(dep.as_str()) {
+            for dep in &entry.manifest.dependencies {
+                if !known.contains(dep.id.as_str()) {
                     return Err(PluginError::registry(format!(
                         "plugin '{}' depends on unknown plugin '{}'",
                         id.as_str(),
-                        dep.as_str()
+                        dep.id.as_str()
                     )));
                 }
             }
@@ -257,22 +319,22 @@ impl Registry {
                     )));
                 }
                 if let Some(entry) = self.plugins.get(&cur) {
-                    for (dep, _) in &entry.manifest.dependencies {
+                    for dep in &entry.manifest.dependencies {
                         // Only follow edges among the declared set; resolved plugins are already acyclic.
                         if self
                             .plugins
-                            .get(dep.as_str())
+                            .get(dep.id.as_str())
                             .map(|e| e.state == PluginState::Declared)
                             .unwrap_or(false)
                         {
-                            if visiting.contains(dep.as_str()) {
+                            if visiting.contains(dep.id.as_str()) {
                                 return Err(PluginError::registry(format!(
                                     "dependency cycle: '{}' -> '{}'",
                                     cur,
-                                    dep.as_str()
+                                    dep.id.as_str()
                                 )));
                             }
-                            stack.push(dep.as_str().to_string());
+                            stack.push(dep.id.as_str().to_string());
                         }
                     }
                 }
@@ -290,11 +352,11 @@ impl Registry {
             if entry.state == PluginState::Disposed {
                 continue;
             }
-            for (iface, ver) in &entry.manifest.provided_services {
+            for svc in &entry.manifest.provided_services {
                 providers
-                    .entry(iface.clone())
+                    .entry(svc.iface.clone())
                     .or_default()
-                    .push((pid.clone(), ver.clone()));
+                    .push((pid.clone(), svc.version.clone()));
             }
         }
         // Requirer -> satisfying cross-plugin providers. Self-provision with
@@ -317,9 +379,7 @@ impl Registry {
                     .manifest
                     .provided_services
                     .iter()
-                    .any(|(p_iface, p_ver)| {
-                        p_iface == iface && service_version_satisfies(p_ver, req)
-                    })
+                    .any(|svc| &svc.iface == iface && service_version_satisfies(&svc.version, req))
                 {
                     continue;
                 }
@@ -369,9 +429,9 @@ impl Registry {
                     continue;
                 }
                 let mut outs = Vec::new();
-                for (dep, _) in &entry.manifest.dependencies {
-                    if self.plugins.contains_key(dep.as_str()) {
-                        outs.push(dep.as_str().to_string());
+                for dep in &entry.manifest.dependencies {
+                    if self.plugins.contains_key(dep.id.as_str()) {
+                        outs.push(dep.id.as_str().to_string());
                     }
                 }
                 if let Some(svcs) = service_edges.get(pid) {
@@ -489,6 +549,10 @@ impl Registry {
     /// In the full host this creates the VM and completes event subscriptions
     /// and claims, then replays the triggering command once (lazy load). Failure
     /// during activation rejects the invocation with no partially activated state.
+    ///
+    /// The static `[lazy].commands` set must match the registered command set
+    /// after canonicalization; drift fails activation with a validation
+    /// diagnostic and no state mutation.
     pub fn activate(&mut self, id: &PluginId) -> Result<(), PluginError> {
         let entry = self
             .get_mut(id)
@@ -500,6 +564,7 @@ impl Registry {
                 expected: PluginState::Registered.to_string(),
             });
         }
+        check_command_equivalence(&entry.manifest.lazy.commands, &entry.commands)?;
         entry.state = PluginState::Activated;
         Ok(())
     }
@@ -676,6 +741,53 @@ impl Registry {
         self.command_owners.contains_key(qualified)
     }
 
+    /// Complete a command prefix against declared lazy commands (no VM).
+    ///
+    /// Covers every live (non-Disposed) plugin's static `[lazy].commands`
+    /// set, so completion works before activation or any VM exists. Results
+    /// are sorted and deduplicated; an empty prefix lists everything.
+    #[must_use]
+    pub fn complete_commands(&self, prefix: &str) -> Vec<String> {
+        let mut out = BTreeSet::new();
+        for entry in self.plugins.values() {
+            if entry.state == PluginState::Disposed {
+                continue;
+            }
+            for command in &entry.manifest.lazy.commands {
+                if command.id.as_str().starts_with(prefix) {
+                    out.insert(command.id.to_string());
+                }
+            }
+        }
+        out.into_iter().collect()
+    }
+
+    /// Render static help for one declared command (no VM).
+    ///
+    /// Returns `None` when no live plugin declares `id`. Otherwise renders
+    /// the owning plugin, the optional schema description, and the declared
+    /// argument properties — all from the manifest, so help works before
+    /// activation or any VM exists.
+    #[must_use]
+    pub fn command_help(&self, id: &str) -> Option<String> {
+        for (pid, entry) in &self.plugins {
+            if entry.state == PluginState::Disposed {
+                continue;
+            }
+            let Some(command) = entry
+                .manifest
+                .lazy
+                .commands
+                .iter()
+                .find(|c| c.id.as_str() == id)
+            else {
+                continue;
+            };
+            return Some(render_command_help(pid, command));
+        }
+        None
+    }
+
     /// Handler-violation isolation stub: first violations log, sustained violations
     /// suspend the handler and surface via `bitty plugin doctor`. Only a stub counter
     /// is kept here; thresholds belong to OQ-014.
@@ -691,7 +803,8 @@ impl Registry {
 mod tests {
     use super::*;
     use crate::manifest::{
-        CapabilityRequests, Compat, LazyTriggers, PluginIdentity, PluginManifest,
+        CapabilityRequests, Compat, LazyTriggers, PluginDependency, PluginIdentity, PluginManifest,
+        ProvidedService,
     };
 
     fn minimal_manifest(id: &str, commands: Vec<&str>) -> PluginManifest {
@@ -717,7 +830,11 @@ mod tests {
             lazy: LazyTriggers {
                 commands: commands
                     .into_iter()
-                    .map(|c| QualifiedName::new(c).unwrap())
+                    .map(|c| LazyCommand {
+                        id: QualifiedName::new(c).unwrap(),
+                        args_schema: None,
+                        result_schema: None,
+                    })
                     .collect(),
                 events: Vec::new(),
                 claims: Vec::new(),
@@ -773,8 +890,14 @@ mod tests {
     fn self_dependency_rejected() {
         let mut reg = Registry::new();
         let mut m = minimal_manifest("xuepoo.a", vec![]);
-        m.dependencies
-            .push((PluginId::new("xuepoo.a").unwrap(), ">=1.0".to_string()));
+        m.dependencies.push(
+            PluginDependency::new(
+                PluginId::new("xuepoo.a").unwrap(),
+                ">=1.0".to_string(),
+                false,
+            )
+            .unwrap(),
+        );
         reg.declare(m).unwrap();
         assert!(reg.resolve(&PluginId::new("xuepoo.a").unwrap()).is_err());
     }
@@ -876,7 +999,12 @@ mod tests {
         let mut m = minimal_manifest(id, vec![]);
         m.provided_services = provided
             .into_iter()
-            .map(|(iface, ver)| (iface.to_string(), ver.to_string()))
+            .map(|(iface, ver)| ProvidedService {
+                iface: iface.to_string(),
+                version: ver.to_string(),
+                args_schema: None,
+                result_schema: None,
+            })
             .collect();
         m.required_services = required
             .into_iter()
@@ -1030,5 +1158,219 @@ mod tests {
         reg.resolve_all().unwrap();
         assert_eq!(state_of(&reg, "xuepoo.provider"), PluginState::Resolved);
         assert_eq!(state_of(&reg, "xuepoo.consumer"), PluginState::Resolved);
+    }
+
+    const TYPED_ARGS_SCHEMA: &str = "{\"type\":\"object\",\"description\":\"Open a path\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"additionalProperties\":false}";
+    const TYPED_RESULT_SCHEMA: &str = "{\"type\":\"object\",\"additionalProperties\":false}";
+
+    fn table_form_manifest(id: &str) -> PluginManifest {
+        let mut m = minimal_manifest(id, vec![]);
+        m.lazy.commands = vec![LazyCommand {
+            id: QualifiedName::new(&format!("{id}:open")).unwrap(),
+            args_schema: Some(TYPED_ARGS_SCHEMA.to_string()),
+            result_schema: Some(TYPED_RESULT_SCHEMA.to_string()),
+        }];
+        m.dependencies.push(
+            PluginDependency::new(
+                PluginId::new("xuepoo.gitcore").unwrap(),
+                ">=2.0".to_string(),
+                true,
+            )
+            .unwrap(),
+        );
+        m.provided_services.push(ProvidedService {
+            iface: "markdown.render".to_string(),
+            version: "1.0.0".to_string(),
+            args_schema: Some(TYPED_ARGS_SCHEMA.to_string()),
+            result_schema: Some(TYPED_RESULT_SCHEMA.to_string()),
+        });
+        m
+    }
+
+    #[test]
+    fn table_form_manifest_validates() {
+        let m = table_form_manifest("xuepoo.typed");
+        m.validate().expect("table forms must validate");
+    }
+
+    #[test]
+    fn schema_validation_fails_closed_matrix() {
+        use crate::manifest::validate_interface_schema;
+        // Oversized.
+        let big = "x".repeat(crate::manifest::CMD_SCHEMA_MAX_BYTES + 1);
+        assert!(validate_interface_schema(&big, "test").is_err());
+        // Empty and non-object.
+        assert!(validate_interface_schema("", "test").is_err());
+        assert!(validate_interface_schema("[]", "test").is_err());
+        assert!(validate_interface_schema("\"str\"", "test").is_err());
+        assert!(validate_interface_schema("42", "test").is_err());
+        // Open object (properties without explicit additionalProperties).
+        assert!(validate_interface_schema("{\"properties\":{}}", "test").is_err());
+        // Non-boolean additionalProperties.
+        assert!(
+            validate_interface_schema(
+                "{\"properties\":{},\"additionalProperties\":\"no\"}",
+                "test"
+            )
+            .is_err()
+        );
+        // Over-deep nesting.
+        let deep = format!("{}\"x\"{}", "{\"a\":".repeat(20), "}".repeat(20));
+        assert!(validate_interface_schema(&deep, "test").is_err());
+        // Malformed JSON and duplicate keys.
+        assert!(validate_interface_schema("{oops", "test").is_err());
+        assert!(validate_interface_schema("{\"a\":1,\"a\":2}", "test").is_err());
+        // Nested open object fails even when the top level is explicit.
+        assert!(
+            validate_interface_schema(
+                "{\"properties\":{\"nested\":{\"properties\":{}}},\"additionalProperties\":false}",
+                "test"
+            )
+            .is_err()
+        );
+        // Well-formed closed schemas pass, including nested ones.
+        assert!(validate_interface_schema(TYPED_ARGS_SCHEMA, "test").is_ok());
+        assert!(
+            validate_interface_schema(
+                "{\"properties\":{\"nested\":{\"properties\":{},\"additionalProperties\":false}},\"additionalProperties\":false}",
+                "test"
+            )
+            .is_ok()
+        );
+        // Unicode descriptions survive the bounded parser.
+        assert!(
+            validate_interface_schema(
+                "{\"description\":\"打开路径\",\"additionalProperties\":false}",
+                "test"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn prerelease_edge_plumbs_through_to_package_resolver() {
+        use bitty_package::{PackageId, PackageIndex, resolve};
+        // Mirror the package-resolver harness: stable plus prerelease candidate.
+        let pid = PackageId::new("xuepoo.gitcore").unwrap();
+        let mut idx = PackageIndex::new();
+        for ver in ["2.0.0", "2.1.0-beta.1"] {
+            idx.insert(
+                bitty_package::IndexEntry::new(pid.clone(), ver.to_string(), false, vec![])
+                    .unwrap(),
+            )
+            .unwrap();
+        }
+        let root = |pre: bool| {
+            let dep = PluginDependency::new(pid_as_plugin(), ">=2.0".to_string(), pre).unwrap();
+            let edge = dep.as_package_edge().expect("id converts");
+            assert_eq!(edge.prerelease, pre);
+            let mut m = package_root_manifest();
+            m.dependencies = vec![edge];
+            m
+        };
+        let res = resolve(&root(false), &idx).unwrap();
+        assert_eq!(res.packages[&pid].version, "2.0.0");
+        let res = resolve(&root(true), &idx).unwrap();
+        assert_eq!(res.packages[&pid].version, "2.1.0-beta.1");
+
+        fn pid_as_plugin() -> PluginId {
+            PluginId::new("xuepoo.gitcore").unwrap()
+        }
+        fn package_root_manifest() -> bitty_package::PackageManifest {
+            use bitty_package::{Compat, PackageIdentity, PackageManifest};
+            PackageManifest {
+                identity: PackageIdentity {
+                    id: PackageId::new("xuepoo.root").unwrap(),
+                    name: "Root".to_string(),
+                    version: "0.1.0".to_string(),
+                    description: "root".to_string(),
+                    license: None,
+                },
+                compat: Compat::default(),
+                dependencies: Vec::new(),
+                capabilities: Vec::new(),
+                raw_bytes_len: 256,
+                undeclared_fields: Vec::new(),
+            }
+        }
+    }
+
+    #[test]
+    fn activation_fails_on_command_drift() {
+        let mut reg = Registry::new();
+        let m = table_form_manifest("xuepoo.typed");
+        reg.declare(m).unwrap();
+        let id = PluginId::new("xuepoo.typed").unwrap();
+        reg.resolve(&id).unwrap();
+        reg.register(&id).unwrap();
+        // Drift the registration side (a command the VM never registered).
+        reg.plugins.get_mut(id.as_str()).unwrap().commands.pop();
+        let err = reg.activate(&id).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("lazy.commands"), "{msg}");
+        assert!(msg.contains("does not match"), "{msg}");
+        // No partial activation.
+        assert_eq!(state_of(&reg, "xuepoo.typed"), PluginState::Registered);
+        // Restoring the set lets activation proceed.
+        reg.plugins
+            .get_mut(id.as_str())
+            .unwrap()
+            .commands
+            .push(QualifiedName::new("xuepoo.typed:open").unwrap());
+        reg.activate(&id).unwrap();
+        assert_eq!(state_of(&reg, "xuepoo.typed"), PluginState::Activated);
+    }
+
+    #[test]
+    fn command_equivalence_is_order_free_but_exact() {
+        let declared = vec![LazyCommand {
+            id: QualifiedName::new("xuepoo.a:run").unwrap(),
+            args_schema: None,
+            result_schema: None,
+        }];
+        let same = vec![QualifiedName::new("xuepoo.a:run").unwrap()];
+        assert!(check_command_equivalence(&declared, &same).is_ok());
+        // Extra, missing, and duplicated registrations all fail.
+        let extra = vec![
+            QualifiedName::new("xuepoo.a:run").unwrap(),
+            QualifiedName::new("xuepoo.a:stop").unwrap(),
+        ];
+        assert!(check_command_equivalence(&declared, &extra).is_err());
+        assert!(check_command_equivalence(&declared, &[]).is_err());
+        let dup = vec![
+            QualifiedName::new("xuepoo.a:run").unwrap(),
+            QualifiedName::new("xuepoo.a:run").unwrap(),
+        ];
+        assert!(check_command_equivalence(&declared, &dup).is_err());
+    }
+
+    #[test]
+    fn help_and_completion_work_without_a_vm() {
+        let mut reg = Registry::new();
+        // Declared only: never resolved, registered, or activated (no VM).
+        reg.declare(table_form_manifest("xuepoo.typed")).unwrap();
+        reg.declare(minimal_manifest("xuepoo.plain", vec!["xuepoo.plain:run"]))
+            .unwrap();
+        // Completion covers declared commands of live plugins.
+        assert_eq!(
+            reg.complete_commands("xuepoo.typed:"),
+            vec!["xuepoo.typed:open".to_string()]
+        );
+        assert_eq!(reg.complete_commands("").len(), 2);
+        assert!(reg.complete_commands("nope:").is_empty());
+        // Help renders owner, schema description, and required args.
+        let help = reg
+            .command_help("xuepoo.typed:open")
+            .expect("declared command has help");
+        assert!(help.contains("xuepoo.typed:open"), "{help}");
+        assert!(help.contains("xuepoo.typed"), "{help}");
+        assert!(help.contains("Open a path"), "{help}");
+        assert!(help.contains("path (required)"), "{help}");
+        assert!(help.contains("typed result"), "{help}");
+        // Untyped commands degrade to the id line.
+        let plain = reg.command_help("xuepoo.plain:run").expect("help");
+        assert!(plain.contains("(untyped)"), "{plain}");
+        // Unknown commands have no help.
+        assert!(reg.command_help("xuepoo.missing:run").is_none());
     }
 }

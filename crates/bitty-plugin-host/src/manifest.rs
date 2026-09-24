@@ -7,7 +7,7 @@
 //! typo-squat) so every field is treated as untrusted display data and is
 //! bounded before use.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::capability::CapabilityId;
 use crate::error::PluginError;
@@ -54,6 +54,18 @@ pub const MAX_NETWORK_EGRESS: usize = 16;
 pub const MAX_NETWORK_PORTS_PER_HOST: usize = 16;
 /// Maximum egress host length (DNS name ceiling).
 pub const MAX_HOST_LEN: usize = 253;
+/// Maximum bytes of one command/service interface schema (`args_schema` /
+/// `result_schema`, 16 KiB per schema).
+///
+/// Precedent: tool-call args/results are each bounded to 16 KiB on the agent
+/// boundary; interface schemas reuse the bound so a single declaration can
+/// never smuggle an unbounded document into help text or validation.
+pub const CMD_SCHEMA_MAX_BYTES: usize = 16 * 1024;
+/// Maximum nesting depth of a parsed interface schema value.
+///
+/// JSON Schema composes through `$ref`-style nesting; unbounded depth is a
+/// stack-exhaustion vector, so validation fails closed past this depth.
+pub const CMD_SCHEMA_MAX_DEPTH: usize = 16;
 
 // ── plugin id ────────────────────────────────────────────────────────────
 
@@ -1071,7 +1083,10 @@ impl CapabilityRequests {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LazyTriggers {
     /// Commands that load the plugin on first invocation.
-    pub commands: Vec<QualifiedName>,
+    ///
+    /// String form carries bare ids; table form additionally declares the
+    /// typed call shape used for static help text.
+    pub commands: Vec<LazyCommand>,
     /// Event types that load the plugin.
     pub events: Vec<String>,
     /// UI claim names that load the plugin (e.g. `workspaceline`; `tabline` is a deprecated alias).
@@ -1087,6 +1102,18 @@ impl LazyTriggers {
                 limit: MAX_COMMANDS,
                 actual: self.commands.len(),
             });
+        }
+        {
+            let mut seen = BTreeSet::new();
+            for command in &self.commands {
+                command.validate()?;
+                if !seen.insert(command.id.as_str().to_string()) {
+                    return Err(PluginError::Duplicate {
+                        kind: "lazy-command".to_string(),
+                        value: command.id.to_string(),
+                    });
+                }
+            }
         }
         if self.events.len() > MAX_EVENT_TYPES {
             return Err(PluginError::LimitExceeded {
@@ -1151,6 +1178,489 @@ fn validate_service_iface(iface: &str, field: &str) -> Result<(), PluginError> {
     Ok(())
 }
 
+// ── inline-table manifest forms (dependency prerelease, service schemas,
+// lazy command schemas) ──────────────────────────────────────────────────
+
+/// One plugin dependency edge: id plus version requirement plus prerelease opt-in.
+///
+/// String form (`"owner.name" = ">=2.0"`) carries `prerelease = false`.
+/// Table form (`"owner.name" = { version = ">=2.0", prerelease = true }`)
+/// opts this edge into prerelease selection in the resolver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginDependency {
+    /// Required plugin id.
+    pub id: PluginId,
+    /// Version requirement (closed comparator grammar).
+    pub req: String,
+    /// Whether this edge opts into prerelease selection.
+    pub prerelease: bool,
+}
+
+impl PluginDependency {
+    /// Build an edge, validating the requirement syntax.
+    pub fn new(id: PluginId, req: String, prerelease: bool) -> Result<Self, PluginError> {
+        validate_version_req(&req, "dependencies")?;
+        Ok(Self {
+            id,
+            req,
+            prerelease,
+        })
+    }
+
+    /// Validate this edge.
+    pub fn validate(&self) -> Result<(), PluginError> {
+        validate_version_req(&self.req, "dependencies")?;
+        Ok(())
+    }
+
+    /// Convert to a package-resolver edge, plumbing the manifest
+    /// prerelease bit through to the resolver's per-edge flag.
+    ///
+    /// Returns `None` when the plugin id is not a valid package id (the two
+    /// share the `owner.name` grammar; divergence fails closed here rather
+    /// than silently resolving a different package).
+    #[must_use]
+    pub fn as_package_edge(&self) -> Option<bitty_package::PackageDependency> {
+        let id = bitty_package::PackageId::new(self.id.as_str()).ok()?;
+        Some(bitty_package::PackageDependency::with_prerelease(
+            id,
+            self.req.clone(),
+            self.prerelease,
+        ))
+    }
+}
+
+/// One provided service with its interface version and optional JSON Schemas.
+///
+/// String form (`"iface" = "1.0.0"`) carries no schemas and is resolvable by
+/// non-schema consumers only. Table form
+/// (`"iface" = { version = "1.0.0", args_schema = "{...}", result_schema = "{...}" }`)
+/// additionally declares the typed call shape; only table-form providers are
+/// resolvable by schema-validating consumers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvidedService {
+    /// Service interface name (dot-separated grammar).
+    pub iface: String,
+    /// Provided interface version (exact SemVer).
+    pub version: String,
+    /// Optional JSON Schema for call arguments.
+    pub args_schema: Option<String>,
+    /// Optional JSON Schema for call results.
+    pub result_schema: Option<String>,
+}
+
+impl ProvidedService {
+    /// Validate interface name, version, and any declared schemas.
+    pub fn validate(&self) -> Result<(), PluginError> {
+        validate_service_iface(&self.iface, "services.provided")?;
+        validate_semver(&self.version, "services.provided")?;
+        if let Some(schema) = &self.args_schema {
+            validate_interface_schema(schema, "services.provided.args_schema")?;
+        }
+        if let Some(schema) = &self.result_schema {
+            validate_interface_schema(schema, "services.provided.result_schema")?;
+        }
+        Ok(())
+    }
+
+    /// Whether this provider declares a complete schema pair.
+    #[must_use]
+    pub fn has_schemas(&self) -> bool {
+        self.args_schema.is_some() && self.result_schema.is_some()
+    }
+}
+
+/// One lazily-loaded command with optional JSON Schemas.
+///
+/// String form (`commands = ["owner:cmd"]`) carries no schemas. Table form
+/// (`commands = [{ id = "owner:cmd", args_schema = "{...}", result_schema = "{...}" }]`)
+/// additionally declares the typed call shape used for static help text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LazyCommand {
+    /// Qualified command id (`owner:resource`).
+    pub id: QualifiedName,
+    /// Optional JSON Schema for command arguments.
+    pub args_schema: Option<String>,
+    /// Optional JSON Schema for command results.
+    pub result_schema: Option<String>,
+}
+
+impl LazyCommand {
+    /// Validate the id (done at parse) and any declared schemas.
+    pub fn validate(&self) -> Result<(), PluginError> {
+        if let Some(schema) = &self.args_schema {
+            validate_interface_schema(schema, "lazy.commands.args_schema")?;
+        }
+        if let Some(schema) = &self.result_schema {
+            validate_interface_schema(schema, "lazy.commands.result_schema")?;
+        }
+        Ok(())
+    }
+}
+
+/// Bounded JSON value (interface schemas only; no floats, no escapes beyond
+/// the string basics).
+#[derive(Debug, Clone, PartialEq)]
+enum SchemaJson {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Str(String),
+    Array(Vec<SchemaJson>),
+    Object(BTreeMap<String, SchemaJson>),
+}
+
+/// Minimal bounded JSON parser for interface schemas.
+///
+/// Total, headless, no allocation beyond the schema itself: byte budget is
+/// enforced by the caller ([`CMD_SCHEMA_MAX_BYTES`]), depth by
+/// [`CMD_SCHEMA_MAX_DEPTH`]. Duplicate object keys fail closed (they would be
+/// silent shadowing otherwise). Numbers are integers only (JSON Schema
+/// documents that need floats do not belong in a manifest); exponent and
+/// leading-zero shapes fail closed.
+struct SchemaJsonParser<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> SchemaJsonParser<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            bytes: text.as_bytes(),
+            pos: 0,
+        }
+    }
+
+    fn parse_value(&mut self, depth: usize) -> Result<SchemaJson, String> {
+        if depth > CMD_SCHEMA_MAX_DEPTH {
+            return Err(format!(
+                "schema exceeds the nesting depth ceiling ({CMD_SCHEMA_MAX_DEPTH})"
+            ));
+        }
+        self.skip_ws();
+        let byte = self.peek().ok_or("schema is empty or truncated")?;
+        match byte {
+            b'{' => self.parse_object(depth),
+            b'[' => self.parse_array(depth),
+            b'"' => Ok(SchemaJson::Str(self.parse_string()?)),
+            b't' => self.parse_literal("true", SchemaJson::Bool(true)),
+            b'f' => self.parse_literal("false", SchemaJson::Bool(false)),
+            b'n' => self.parse_literal("null", SchemaJson::Null),
+            b'-' | b'0'..=b'9' => Ok(SchemaJson::Int(self.parse_int()?)),
+            other => Err(format!("unexpected character '{other}' in schema")),
+        }
+    }
+
+    fn parse_literal(&mut self, word: &str, value: SchemaJson) -> Result<SchemaJson, String> {
+        if self.bytes.len().saturating_sub(self.pos) < word.len()
+            || &self.bytes[self.pos..self.pos + word.len()] != word.as_bytes()
+        {
+            return Err(format!("malformed literal in schema (expected '{word}')"));
+        }
+        self.pos += word.len();
+        Ok(value)
+    }
+
+    fn parse_int(&mut self) -> Result<i64, String> {
+        let start = self.pos;
+        if self.peek() == Some(b'-') {
+            self.pos += 1;
+        }
+        let digits_start = self.pos;
+        while matches!(self.peek(), Some(b'0'..=b'9')) {
+            self.pos += 1;
+        }
+        if self.pos == digits_start {
+            return Err("malformed number in schema".to_string());
+        }
+        let text = std::str::from_utf8(&self.bytes[start..self.pos])
+            .map_err(|_| "schema number is not valid UTF-8".to_string())?;
+        // Reject floats, exponents, and leading zeros (fail-closed shapes).
+        if text.contains(['.', 'e', 'E']) {
+            return Err("schema numbers must be integers".to_string());
+        }
+        let digits = text.strip_prefix('-').unwrap_or(text);
+        if digits.len() > 1 && digits.starts_with('0') {
+            return Err("schema number must not have leading zeros".to_string());
+        }
+        text.parse::<i64>()
+            .map_err(|_| "schema number is out of range".to_string())
+    }
+
+    fn parse_string(&mut self) -> Result<String, String> {
+        // Caller consumed nothing; the opening quote is current.
+        assert_eq!(self.bytes[self.pos], b'"');
+        self.pos += 1;
+        // Raw bytes first: pushing decoded chars per byte would corrupt
+        // multi-byte UTF-8 sequences.
+        let mut out: Vec<u8> = Vec::new();
+        loop {
+            let byte = self
+                .bytes
+                .get(self.pos)
+                .copied()
+                .ok_or("unterminated string in schema")?;
+            self.pos += 1;
+            match byte {
+                b'"' => {
+                    return String::from_utf8(out)
+                        .map_err(|_| "schema string is not valid UTF-8".to_string());
+                }
+                b'\\' => {
+                    let esc = self
+                        .bytes
+                        .get(self.pos)
+                        .copied()
+                        .ok_or("truncated escape in schema")?;
+                    self.pos += 1;
+                    match esc {
+                        b'"' => out.push(b'"'),
+                        b'\\' => out.push(b'\\'),
+                        b'/' => out.push(b'/'),
+                        b'n' => out.push(b'\n'),
+                        b't' => out.push(b'\t'),
+                        b'r' => out.push(b'\r'),
+                        b'u' => {
+                            if self.pos + 4 > self.bytes.len() {
+                                return Err("truncated unicode escape in schema".to_string());
+                            }
+                            let hex = std::str::from_utf8(&self.bytes[self.pos..self.pos + 4])
+                                .map_err(|_| "bad unicode escape in schema".to_string())?;
+                            let code = u32::from_str_radix(hex, 16)
+                                .map_err(|_| "bad unicode escape in schema".to_string())?;
+                            let ch = char::from_u32(code)
+                                .ok_or("bad unicode escape in schema".to_string())?;
+                            self.pos += 4;
+                            let mut buf = [0u8; 4];
+                            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                        }
+                        other => {
+                            return Err(format!(
+                                "unsupported escape '\\{}' in schema",
+                                other as char
+                            ));
+                        }
+                    }
+                }
+                0x00..=0x1F => return Err("unescaped control in schema string".to_string()),
+                _ => {
+                    out.push(byte);
+                }
+            }
+        }
+    }
+
+    fn parse_array(&mut self, depth: usize) -> Result<SchemaJson, String> {
+        assert_eq!(self.bytes[self.pos], b'[');
+        self.pos += 1;
+        let mut items = Vec::new();
+        loop {
+            self.skip_ws();
+            match self.peek() {
+                None => return Err("unterminated array in schema".to_string()),
+                Some(b']') => {
+                    self.pos += 1;
+                    return Ok(SchemaJson::Array(items));
+                }
+                _ => {}
+            }
+            items.push(self.parse_value(depth + 1)?);
+            // A schema-sized array can never legitimately approach host memory
+            // on its own, but cap the element count so a malicious
+            // `[[[[...` spray fails fast instead of growing a vector.
+            if items.len() > 4096 {
+                return Err("schema array exceeds 4096 elements".to_string());
+            }
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => {
+                    self.pos += 1;
+                }
+                Some(b']') => {}
+                _ => return Err("expected ',' or ']' in schema array".to_string()),
+            }
+        }
+    }
+
+    fn parse_object(&mut self, depth: usize) -> Result<SchemaJson, String> {
+        assert_eq!(self.bytes[self.pos], b'{');
+        self.pos += 1;
+        let mut map = BTreeMap::new();
+        loop {
+            self.skip_ws();
+            match self.peek() {
+                None => return Err("unterminated object in schema".to_string()),
+                Some(b'}') => {
+                    self.pos += 1;
+                    return Ok(SchemaJson::Object(map));
+                }
+                _ => {}
+            }
+            self.skip_ws();
+            if self.peek() != Some(b'"') {
+                return Err("schema object keys must be strings".to_string());
+            }
+            let key = self.parse_string()?;
+            if key.len() > 128 {
+                return Err("schema object key exceeds 128 bytes".to_string());
+            }
+            self.skip_ws();
+            if self.peek() != Some(b':') {
+                return Err("expected ':' in schema object".to_string());
+            }
+            self.pos += 1;
+            let value = self.parse_value(depth + 1)?;
+            if map.insert(key.clone(), value).is_some() {
+                return Err(format!("duplicate schema object key '{key}'"));
+            }
+            if map.len() > 1024 {
+                return Err("schema object exceeds 1024 keys".to_string());
+            }
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => {
+                    self.pos += 1;
+                }
+                Some(b'}') => {}
+                _ => return Err("expected ',' or '}' in schema object".to_string()),
+            }
+        }
+    }
+
+    fn skip_ws(&mut self) {
+        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            self.pos += 1;
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
+    }
+}
+
+/// Parse one bounded interface schema document.
+fn parse_interface_schema(text: &str) -> Result<SchemaJson, String> {
+    let mut parser = SchemaJsonParser::new(text);
+    let value = parser.parse_value(0)?;
+    parser.skip_ws();
+    if parser.peek().is_some() {
+        return Err("trailing content after schema document".to_string());
+    }
+    Ok(value)
+}
+
+/// Validate one interface schema (`args_schema` / `result_schema`).
+///
+/// Fail-closed rules: at most [`CMD_SCHEMA_MAX_BYTES`] bytes, valid bounded
+/// JSON, top-level object, nesting depth at most [`CMD_SCHEMA_MAX_DEPTH`],
+/// and `additionalProperties` explicit on every object node that declares
+/// `properties` (an open object schema would accept undeclared fields, so
+/// silence there is a validation hole, not leniency).
+pub fn validate_interface_schema(schema: &str, field: &str) -> Result<(), PluginError> {
+    if schema.len() > CMD_SCHEMA_MAX_BYTES {
+        return Err(PluginError::LimitExceeded {
+            field: field.to_string(),
+            limit: CMD_SCHEMA_MAX_BYTES,
+            actual: schema.len(),
+        });
+    }
+    if schema.is_empty() {
+        return Err(PluginError::manifest(field, "schema must not be empty"));
+    }
+    let value = parse_interface_schema(schema).map_err(|e| PluginError::manifest(field, e))?;
+    let SchemaJson::Object(_) = value else {
+        return Err(PluginError::manifest(field, "schema must be a JSON object"));
+    };
+    check_schema_explicit(&value, field)?;
+    Ok(())
+}
+
+/// Enforce explicit `additionalProperties` on every object node declaring `properties`.
+fn check_schema_explicit(value: &SchemaJson, field: &str) -> Result<(), PluginError> {
+    match value {
+        SchemaJson::Object(map) => {
+            if map.contains_key("properties") && !map.contains_key("additionalProperties") {
+                return Err(PluginError::manifest(
+                    field,
+                    "schema object with 'properties' must declare 'additionalProperties' explicitly",
+                ));
+            }
+            if let Some(extra) = map.get("additionalProperties") {
+                if !matches!(extra, SchemaJson::Bool(_)) {
+                    return Err(PluginError::manifest(
+                        field,
+                        "'additionalProperties' must be a boolean",
+                    ));
+                }
+            }
+            for value in map.values() {
+                check_schema_explicit(value, field)?;
+            }
+            Ok(())
+        }
+        SchemaJson::Array(items) => {
+            for item in items {
+                check_schema_explicit(item, field)?;
+            }
+            Ok(())
+        }
+        SchemaJson::Null | SchemaJson::Bool(_) | SchemaJson::Int(_) | SchemaJson::Str(_) => Ok(()),
+    }
+}
+
+/// Summarize one interface schema for static help text (no VM).
+///
+/// Returns the top-level `description` plus the declared property names with
+/// their required marks, or `None` when the schema does not parse (help
+/// rendering never fails: validation already rejected bad schemas, and a
+/// `None` here degrades to the raw id line).
+#[must_use]
+pub fn summarize_interface_schema(schema: &str) -> Option<SchemaSummary> {
+    let value = parse_interface_schema(schema).ok()?;
+    let SchemaJson::Object(map) = &value else {
+        return None;
+    };
+    let description = match map.get("description") {
+        Some(SchemaJson::Str(text)) => Some(text.clone()),
+        _ => None,
+    };
+    let required: Vec<String> = match map.get("required") {
+        Some(SchemaJson::Array(items)) => items
+            .iter()
+            .filter_map(|item| match item {
+                SchemaJson::Str(name) => Some(name.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let mut properties = Vec::new();
+    if let Some(SchemaJson::Object(props)) = map.get("properties") {
+        for name in props.keys() {
+            let mark = if required.iter().any(|r| r == name) {
+                " (required)"
+            } else {
+                ""
+            };
+            properties.push(format!("{name}{mark}"));
+        }
+        properties.sort();
+    }
+    Some(SchemaSummary {
+        description,
+        properties,
+    })
+}
+
+/// Static summary of one interface schema for help text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaSummary {
+    /// Top-level `description`, when present.
+    pub description: Option<String>,
+    /// Declared property names (`name (required)` for required entries).
+    pub properties: Vec<String>,
+}
+
 /// The full candidate manifest for `bitty-plugin.toml`.
 ///
 /// This is the in-memory, already-parsed shape. TOML parsing itself is
@@ -1162,10 +1672,10 @@ pub struct PluginManifest {
     pub identity: PluginIdentity,
     /// Compatibility block.
     pub compat: Compat,
-    /// Optional plugin dependencies by id -> version req.
-    pub dependencies: Vec<(PluginId, String)>,
-    /// Optional provided services `interface -> version`.
-    pub provided_services: Vec<(String, String)>,
+    /// Optional plugin dependency edges (id, requirement, prerelease opt-in).
+    pub dependencies: Vec<PluginDependency>,
+    /// Optional provided services (interface, version, interface schemas).
+    pub provided_services: Vec<ProvidedService>,
     /// Optional required services `interface -> version requirement`.
     ///
     /// The consumes side of the provide/require loop: each entry names a
@@ -1191,12 +1701,14 @@ pub struct PluginManifest {
 }
 
 impl PluginManifest {
-    /// Deterministic canonical bytes for hash binding (draft `bitty-manifest-v4`).
+    /// Deterministic canonical bytes for hash binding (draft `bitty-manifest-v5`).
     ///
     /// Sorted, cross-platform, no wall-clock. Covers identity, compat, resolved
     /// capability set (including filesystem `fs.read:PARAM`/`fs.write:PARAM` expansion),
-    /// dependencies, provided services, required services, Layer-2 `tools`
-    /// declarations, structured `network.egress` destinations, and `[limits]`
+    /// dependencies (with per-edge prerelease opt-in), provided services (with
+    /// interface schemas), required services, Layer-2 `tools`
+    /// declarations, structured `network.egress` destinations, lazy command
+    /// declarations (with schemas), and `[limits]`
     /// budgets. Used to bind grant records to the exact manifest
     /// that was approved (`hash(manifest) == record.manifest_hash`).
     /// Raising `tools.<name>.required` from `false` to `true` changes the hash
@@ -1204,7 +1716,7 @@ impl PluginManifest {
     #[must_use]
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut buf = String::new();
-        buf.push_str("bitty-manifest-v4\n");
+        buf.push_str("bitty-manifest-v5\n");
         buf.push_str(self.identity.id.as_str());
         buf.push('|');
         buf.push_str(&self.identity.version);
@@ -1239,11 +1751,12 @@ impl PluginManifest {
         buf.push('|');
         buf.push_str(self.compat.plugin_api.as_deref().unwrap_or(""));
         buf.push('|');
-        // Dependencies sorted.
+        // Dependencies sorted (v5 segment: `id=req:prerelease`, so flipping
+        // the prerelease opt-in changes the hash and re-binds grants).
         let mut deps: Vec<String> = self
             .dependencies
             .iter()
-            .map(|(id, req)| format!("{}={}", id.as_str(), req))
+            .map(|dep| format!("{}={}:{}", dep.id.as_str(), dep.req, dep.prerelease))
             .collect();
         deps.sort_unstable();
         for d in deps {
@@ -1251,11 +1764,20 @@ impl PluginManifest {
             buf.push(',');
         }
         buf.push('|');
-        // Services sorted.
+        // Services sorted (v5 segment: `iface=version` plus schema presence
+        // and content, so adding a schema re-binds grants).
         let mut svcs: Vec<String> = self
             .provided_services
             .iter()
-            .map(|(iface, ver)| format!("{iface}={ver}"))
+            .map(|svc| {
+                format!(
+                    "{}={}:{}:{}",
+                    svc.iface,
+                    svc.version,
+                    svc.args_schema.as_deref().unwrap_or(""),
+                    svc.result_schema.as_deref().unwrap_or("")
+                )
+            })
             .collect();
         svcs.sort_unstable();
         for s in svcs {
@@ -1272,6 +1794,27 @@ impl PluginManifest {
         reqs.sort_unstable();
         for s in reqs {
             buf.push_str(&s);
+            buf.push(',');
+        }
+        buf.push('|');
+        // Lazy commands sorted (v5 segment: `id` plus schema content, so
+        // declaring a schema re-binds grants).
+        let mut cmds: Vec<String> = self
+            .lazy
+            .commands
+            .iter()
+            .map(|cmd| {
+                format!(
+                    "{}:{}:{}",
+                    cmd.id.as_str(),
+                    cmd.args_schema.as_deref().unwrap_or(""),
+                    cmd.result_schema.as_deref().unwrap_or("")
+                )
+            })
+            .collect();
+        cmds.sort_unstable();
+        for c in cmds {
+            buf.push_str(&c);
             buf.push(',');
         }
         buf.push('|');
@@ -1378,19 +1921,17 @@ impl PluginManifest {
                 actual: self.dependencies.len(),
             });
         }
-        for (id, req) in &self.dependencies {
-            // id already validated
-            let _ = id;
-            validate_version_req(req, "dependencies")?;
+        for dep in &self.dependencies {
+            dep.validate()?;
         }
         // Duplicate dependency ids rejected (would be silent shadowing otherwise).
         {
             let mut seen = BTreeSet::new();
-            for (id, _) in &self.dependencies {
-                if !seen.insert(id.as_str().to_string()) {
+            for dep in &self.dependencies {
+                if !seen.insert(dep.id.as_str().to_string()) {
                     return Err(PluginError::Duplicate {
                         kind: "dependency".to_string(),
-                        value: id.to_string(),
+                        value: dep.id.to_string(),
                     });
                 }
             }
@@ -1403,9 +1944,20 @@ impl PluginManifest {
                 actual: self.provided_services.len(),
             });
         }
-        for (iface, ver) in &self.provided_services {
-            validate_service_iface(iface, "services.provided")?;
-            validate_semver(ver, "services.provided")?;
+        for svc in &self.provided_services {
+            svc.validate()?;
+        }
+        // Duplicate provided interfaces rejected (would be silent shadowing otherwise).
+        {
+            let mut seen = BTreeSet::new();
+            for svc in &self.provided_services {
+                if !seen.insert(svc.iface.clone()) {
+                    return Err(PluginError::Duplicate {
+                        kind: "provided-service".to_string(),
+                        value: svc.iface.clone(),
+                    });
+                }
+            }
         }
 
         if self.required_services.len() > MAX_REQUIRED_SERVICES {
@@ -1726,10 +2278,14 @@ mod tests {
     fn dependency_limit() {
         let mut m = minimal_manifest("xuepoo.test");
         for i in 0..(MAX_DEPENDENCIES + 1) {
-            m.dependencies.push((
-                PluginId::new(&format!("xuepoo.dep{i}")).unwrap(),
-                ">=1.0".to_string(),
-            ));
+            m.dependencies.push(
+                PluginDependency::new(
+                    PluginId::new(&format!("xuepoo.dep{i}")).unwrap(),
+                    ">=1.0".to_string(),
+                    false,
+                )
+                .unwrap(),
+            );
         }
         assert!(m.validate().is_err());
     }
@@ -2190,7 +2746,11 @@ mod tests {
     fn lazy_bounds() {
         let mut m = minimal_manifest("xuepoo.test");
         m.lazy.commands = (0..(MAX_COMMANDS + 1))
-            .map(|i| QualifiedName::new(&format!("xuepoo.test:cmd{i}")).unwrap())
+            .map(|i| LazyCommand {
+                id: QualifiedName::new(&format!("xuepoo.test:cmd{i}")).unwrap(),
+                args_schema: None,
+                result_schema: None,
+            })
             .collect();
         assert!(m.validate().is_err());
     }
@@ -2506,12 +3066,16 @@ mod tests {
     #[test]
     fn limits_accept_tighter_and_enforce_contents() {
         let mut m = manifest_with_network("xuepoo.lim");
-        m.lazy
-            .commands
-            .push(QualifiedName::new("xuepoo.lim:run").unwrap());
-        m.lazy
-            .commands
-            .push(QualifiedName::new("xuepoo.lim:stop").unwrap());
+        m.lazy.commands.push(LazyCommand {
+            id: QualifiedName::new("xuepoo.lim:run").unwrap(),
+            args_schema: None,
+            result_schema: None,
+        });
+        m.lazy.commands.push(LazyCommand {
+            id: QualifiedName::new("xuepoo.lim:stop").unwrap(),
+            args_schema: None,
+            result_schema: None,
+        });
         m.limits.max_network_egress = Some(1);
         m.limits.max_commands = Some(2);
         assert!(m.validate().is_ok());

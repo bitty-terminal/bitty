@@ -48,9 +48,18 @@
 
 use crate::capability::CapabilityId;
 use crate::manifest::{
-    CapabilityRequests, Compat, FilesystemRequest, FsAccess, LazyTriggers, NetworkEgress, PluginId,
-    PluginIdentity, PluginLimits, PluginManifest, QualifiedName,
+    CapabilityRequests, Compat, FilesystemRequest, FsAccess, LazyCommand, LazyTriggers,
+    NetworkEgress, PluginId, PluginIdentity, PluginLimits, PluginManifest, QualifiedName,
 };
+
+/// One schema-less lazy command declaration (bundled manifests are static).
+fn lazy_command(id: &str) -> LazyCommand {
+    LazyCommand {
+        id: QualifiedName::new(id).expect("bundled command id must parse"),
+        args_schema: None,
+        result_schema: None,
+    }
+}
 
 /// Canonical version for the six `v1` bundled plugins (SemVer 2).
 const BUNDLED_VERSION: &str = "0.1.0";
@@ -212,7 +221,7 @@ fn workspace_lazy_triggers() -> LazyTriggers {
         commands: WORKSPACE_COMMANDS
             .iter()
             .chain(TABS_COMMANDS.iter())
-            .map(|c| QualifiedName::new(c).expect("qualified"))
+            .map(|c| lazy_command(c))
             .collect(),
         events: vec![
             "terminal.title-changed".to_string(),
@@ -327,8 +336,8 @@ pub fn project_manifest() -> PluginManifest {
         limits: Default::default(),
         lazy: LazyTriggers {
             commands: vec![
-                QualifiedName::new("bitty-terminal.project:open").expect("qualified"),
-                QualifiedName::new("bitty-terminal.project:switch").expect("qualified"),
+                lazy_command("bitty-terminal.project:open"),
+                lazy_command("bitty-terminal.project:switch"),
             ],
             events: vec!["terminal.cwd-changed".to_string()],
             claims: Vec::new(),
@@ -383,11 +392,11 @@ pub fn browser_panel_manifest() -> PluginManifest {
         limits: Default::default(),
         lazy: LazyTriggers {
             commands: vec![
-                QualifiedName::new("bitty-terminal.browser-panel:open").expect("qualified"),
-                QualifiedName::new("bitty-terminal.browser-panel:navigate").expect("qualified"),
-                QualifiedName::new("bitty-terminal.browser-panel:back").expect("qualified"),
-                QualifiedName::new("bitty-terminal.browser-panel:forward").expect("qualified"),
-                QualifiedName::new("bitty-terminal.browser-panel:reload").expect("qualified"),
+                lazy_command("bitty-terminal.browser-panel:open"),
+                lazy_command("bitty-terminal.browser-panel:navigate"),
+                lazy_command("bitty-terminal.browser-panel:back"),
+                lazy_command("bitty-terminal.browser-panel:forward"),
+                lazy_command("bitty-terminal.browser-panel:reload"),
             ],
             events: vec![
                 "terminal.cwd-changed".to_string(),
@@ -455,11 +464,11 @@ pub fn ai_panel_manifest() -> PluginManifest {
         limits: Default::default(),
         lazy: LazyTriggers {
             commands: vec![
-                QualifiedName::new("bitty-terminal.ai-panel:open").expect("qualified"),
-                QualifiedName::new("bitty-terminal.ai-panel:send").expect("qualified"),
-                QualifiedName::new("bitty-terminal.ai-panel:clear").expect("qualified"),
-                QualifiedName::new("bitty-terminal.ai-panel:new-session").expect("qualified"),
-                QualifiedName::new("bitty-terminal.ai-panel:stop").expect("qualified"),
+                lazy_command("bitty-terminal.ai-panel:open"),
+                lazy_command("bitty-terminal.ai-panel:send"),
+                lazy_command("bitty-terminal.ai-panel:clear"),
+                lazy_command("bitty-terminal.ai-panel:new-session"),
+                lazy_command("bitty-terminal.ai-panel:stop"),
             ],
             events: vec![
                 "terminal.cwd-changed".to_string(),
@@ -546,11 +555,11 @@ pub fn mail_panel_manifest() -> PluginManifest {
         limits: PluginLimits::default(),
         lazy: LazyTriggers {
             commands: vec![
-                QualifiedName::new("bitty-terminal.mail-panel:open").expect("qualified"),
-                QualifiedName::new("bitty-terminal.mail-panel:list").expect("qualified"),
-                QualifiedName::new("bitty-terminal.mail-panel:read").expect("qualified"),
-                QualifiedName::new("bitty-terminal.mail-panel:compose").expect("qualified"),
-                QualifiedName::new("bitty-terminal.mail-panel:send").expect("qualified"),
+                lazy_command("bitty-terminal.mail-panel:open"),
+                lazy_command("bitty-terminal.mail-panel:list"),
+                lazy_command("bitty-terminal.mail-panel:read"),
+                lazy_command("bitty-terminal.mail-panel:compose"),
+                lazy_command("bitty-terminal.mail-panel:send"),
             ],
             events: vec![
                 "terminal.cwd-changed".to_string(),
@@ -729,7 +738,7 @@ mod tests {
             "bitty-terminal.tabs:next",
         ] {
             assert!(
-                m.lazy.commands.iter().any(|c| c.as_str() == cmd),
+                m.lazy.commands.iter().any(|c| c.id.as_str() == cmd),
                 "missing {cmd}"
             );
         }
@@ -814,13 +823,13 @@ mod tests {
             m.lazy
                 .commands
                 .iter()
-                .any(|c| c.as_str() == "bitty-terminal.browser-panel:open")
+                .any(|c| c.id.as_str() == "bitty-terminal.browser-panel:open")
         );
         assert!(
             m.lazy
                 .commands
                 .iter()
-                .any(|c| c.as_str() == "bitty-terminal.browser-panel:navigate")
+                .any(|c| c.id.as_str() == "bitty-terminal.browser-panel:navigate")
         );
         assert!(m.lazy.events.contains(&"terminal.cwd-changed".to_string()));
         assert!(m.lazy.events.contains(&"focus.changed".to_string()));
@@ -912,19 +921,19 @@ mod tests {
             m.lazy
                 .commands
                 .iter()
-                .any(|c| c.as_str() == "bitty-terminal.mail-panel:open")
+                .any(|c| c.id.as_str() == "bitty-terminal.mail-panel:open")
         );
         assert!(
             m.lazy
                 .commands
                 .iter()
-                .any(|c| c.as_str() == "bitty-terminal.mail-panel:list")
+                .any(|c| c.id.as_str() == "bitty-terminal.mail-panel:list")
         );
         assert!(
             m.lazy
                 .commands
                 .iter()
-                .any(|c| c.as_str() == "bitty-terminal.mail-panel:send")
+                .any(|c| c.id.as_str() == "bitty-terminal.mail-panel:send")
         );
         assert!(m.lazy.events.contains(&"terminal.cwd-changed".to_string()));
         assert!(m.lazy.events.contains(&"focus.changed".to_string()));

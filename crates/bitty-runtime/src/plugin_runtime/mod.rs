@@ -1208,6 +1208,11 @@ fn invalid_plugin_id() -> PluginId {
 /// forgets a bound) must still fail closed here — `validate_capture` is the
 /// commit gate before atomic activation. Field-length violations surface as
 /// `Capture` details naming the bound, never echoing untrusted content.
+///
+/// Static-vs-registration equivalence holds after canonicalization
+/// (`owner:resource` strings): an undeclared registration fails, and a
+/// declared command with no registration fails — activation commits only the
+/// exact declared set.
 fn validate_capture(
     id: &PluginId,
     manifest: &PluginManifest,
@@ -1247,7 +1252,7 @@ fn validate_capture(
         .lazy
         .commands
         .iter()
-        .map(|command| command.as_str())
+        .map(|command| command.id.as_str())
         .collect();
     let declared_events: BTreeSet<&str> = manifest
         .lazy
@@ -1295,6 +1300,17 @@ fn validate_capture(
             return Err(PluginRuntimeError::Capture {
                 plugin: id.to_string(),
                 detail: format!("duplicate command registration '{qualified}'"),
+            });
+        }
+    }
+    // Equivalence, second direction: every declared command must have a
+    // registration. A lazy command with no runtime entry would load the
+    // plugin and then fail dispatch, so activation fails instead.
+    for qualified in &declared {
+        if !seen.contains(*qualified) {
+            return Err(PluginRuntimeError::Capture {
+                plugin: id.to_string(),
+                detail: format!("declared command '{qualified}' was not registered"),
             });
         }
     }

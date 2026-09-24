@@ -1453,7 +1453,7 @@ mod tests {
             m.lazy
                 .commands
                 .iter()
-                .any(|c| c.as_str() == MAIL_PANEL_COMMAND_OPEN)
+                .any(|c| c.id.as_str() == MAIL_PANEL_COMMAND_OPEN)
         );
     }
 

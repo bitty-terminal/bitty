@@ -106,7 +106,7 @@ fn mail_panel_via_public_plugin_host_path() {
             .lazy
             .commands
             .iter()
-            .any(|c| c.as_str() == "bitty-terminal.mail-panel:open")
+            .any(|c| c.id.as_str() == "bitty-terminal.mail-panel:open")
     );
 
     let mut host = PluginHost::new(DropPolicy::DropOldest, 16);

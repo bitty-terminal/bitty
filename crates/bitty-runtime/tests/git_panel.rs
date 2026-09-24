@@ -125,8 +125,8 @@ const GIT_PANEL_MAX_SELECTION: usize = 64;
 /// against a plain manifest instead of the bundled catalog.
 fn git_panel_manifest() -> bitty_plugin_host::PluginManifest {
     use bitty_plugin_host::{
-        CapabilityRequests, Compat, FilesystemRequest, FsAccess, LazyTriggers, PluginId,
-        PluginIdentity, PluginManifest, QualifiedName, ToolDeclaration,
+        CapabilityRequests, Compat, FilesystemRequest, FsAccess, LazyCommand, LazyTriggers,
+        PluginId, PluginIdentity, PluginManifest, QualifiedName, ToolDeclaration,
     };
     let mut caps = CapabilityRequests::default();
     caps.ids
@@ -167,7 +167,11 @@ fn git_panel_manifest() -> bitty_plugin_host::PluginManifest {
         lazy: LazyTriggers {
             commands: GIT_PANEL_COMMANDS
                 .iter()
-                .map(|c| QualifiedName::new(c).expect("qualified"))
+                .map(|c| LazyCommand {
+                    id: QualifiedName::new(c).expect("qualified"),
+                    args_schema: None,
+                    result_schema: None,
+                })
                 .collect(),
             events: GIT_PANEL_EVENTS.iter().map(|e| e.to_string()).collect(),
             claims: Vec::new(),
@@ -253,7 +257,7 @@ fn git_panel_fixture_matches_former_bundled_manifest() {
                 .lazy
                 .commands
                 .iter()
-                .any(|c| c.as_str() == *command),
+                .any(|c| c.id.as_str() == *command),
             "missing {command}"
         );
     }
@@ -388,14 +392,14 @@ fn git_panel_via_public_plugin_host_path() {
             .lazy
             .commands
             .iter()
-            .any(|c| c.as_str() == "bitty-terminal.git-panel:open")
+            .any(|c| c.id.as_str() == "bitty-terminal.git-panel:open")
     );
     assert!(
         manifest
             .lazy
             .commands
             .iter()
-            .any(|c| c.as_str() == "bitty-terminal.git-panel:status")
+            .any(|c| c.id.as_str() == "bitty-terminal.git-panel:status")
     );
 
     let mut host = PluginHost::new(DropPolicy::DropOldest, 16);

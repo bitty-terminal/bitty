@@ -56,8 +56,8 @@ fn granted_set_for(
 /// against a plain manifest instead of the bundled catalog.
 fn palette_manifest() -> bitty_plugin_host::PluginManifest {
     use bitty_plugin_host::{
-        CapabilityRequests, Compat, LazyTriggers, PluginId, PluginIdentity, PluginManifest,
-        QualifiedName,
+        CapabilityRequests, Compat, LazyCommand, LazyTriggers, PluginId, PluginIdentity,
+        PluginManifest, QualifiedName,
     };
     let mut caps = CapabilityRequests::default();
     caps.ids
@@ -84,7 +84,11 @@ fn palette_manifest() -> bitty_plugin_host::PluginManifest {
         network: Vec::new(),
         limits: Default::default(),
         lazy: LazyTriggers {
-            commands: vec![QualifiedName::new("bitty-terminal.palette:toggle").expect("qualified")],
+            commands: vec![LazyCommand {
+                id: QualifiedName::new("bitty-terminal.palette:toggle").expect("qualified"),
+                args_schema: None,
+                result_schema: None,
+            }],
             events: vec!["focus.changed".to_string()],
             claims: Vec::new(),
         },
@@ -167,7 +171,7 @@ fn palette_via_public_plugin_host_path() {
     assert!(granted.contains(&CapabilityId::parse("ui.overlay").unwrap()));
     assert_eq!(manifest.lazy.commands.len(), 1);
     assert_eq!(
-        manifest.lazy.commands[0].as_str(),
+        manifest.lazy.commands[0].id.as_str(),
         "bitty-terminal.palette:toggle"
     );
 
@@ -398,9 +402,12 @@ fn palette_statusline_project_subscribe_publish_drain_bounded_drop_oldest() {
         let mut m = palette_manifest();
         m.identity.id = bitty_plugin_host::PluginId::new(&format!("xuepoo.palette-{n}")).unwrap();
         // Unique command per instance to avoid duplicate qualified-name reservation
-        m.lazy.commands = vec![
-            bitty_plugin_host::QualifiedName::new(&format!("xuepoo.palette-{n}:toggle")).unwrap(),
-        ];
+        m.lazy.commands = vec![bitty_plugin_host::LazyCommand {
+            id: bitty_plugin_host::QualifiedName::new(&format!("xuepoo.palette-{n}:toggle"))
+                .unwrap(),
+            args_schema: None,
+            result_schema: None,
+        }];
         let iid = m.id().clone();
         let hh = m.manifest_hash();
         let gg = granted_set_for(&m);

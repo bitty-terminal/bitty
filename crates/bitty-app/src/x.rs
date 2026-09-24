@@ -118,7 +118,8 @@ pub fn rows_from_manifests(manifests: &[bitty_plugin_host::PluginManifest]) -> V
         .map(|m| {
             let id = m.identity.id.to_string();
             let short = id.rsplit('.').next().unwrap_or(&id).to_string();
-            let mut commands: Vec<String> = m.lazy.commands.iter().map(|c| c.to_string()).collect();
+            let mut commands: Vec<String> =
+                m.lazy.commands.iter().map(|c| c.id.to_string()).collect();
             commands.sort();
             commands.dedup();
             XPluginRow {

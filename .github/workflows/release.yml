@@ -707,7 +707,15 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: bitty-${{ matrix.target }}-bundle
-          path: dist/bitty-*.tar.zst*
+          # Exact path, not a glob. The `build` job's Arch packaging writes
+          # `bitty-<version>-<pkgrel>-<arch>.pkg.tar.zst` into the same `dist/`
+          # tree (nfpm's conventional pacman name), so `dist/bitty-*.tar.zst*`
+          # also swept up the pacman package. `verify-unix-bundle` then tried
+          # to treat that archive as a Bitty source bundle and failed with
+          # "extracts outside its top-level directory".
+          path: |
+            dist/bitty-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.zst
+            dist/bitty-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.zst.sha256
           if-no-files-found: error
           retention-days: 14
 
@@ -735,6 +743,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends zstd
           shopt -s nullglob
+          # Only the versioned source bundles belong here. A pacman package
+          # (`*.pkg.tar.zst`) or any other archive that leaked into the
+          # artifact is a packaging bug, not something to silently ignore.
+          stray=(pkg/*.pkg.tar.zst)
+          if [[ "${#stray[@]}" -ne 0 ]]; then
+            echo "::error::non-bundle archives present: ${stray[*]}" >&2
+            exit 1
+          fi
           bundles=(pkg/bitty-*.tar.zst)
           if [[ "${#bundles[@]}" -eq 0 ]]; then
             echo "::error::no versioned bundle artifacts found"

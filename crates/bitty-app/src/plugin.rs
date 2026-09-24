@@ -9,7 +9,7 @@
 //!
 //! # Contract (implemented)
 //!
-//! - Shape: `bitty plugin list|install|remove|enable|disable|info`
+//! - Shape: `bitty plugin list|install|remove|enable|disable|revoke|info`
 //!   with `list`/`info` accepting `--format table|json|jsonl` (default
 //!   table) and `--no-color` (accepted; tables are plain text).
 //! - `install <id>` resolves a **bundled** plugin manifest, pins its
@@ -33,7 +33,10 @@
 //!   store record and staged tree. `enable`/`disable` are idempotent toggles
 //!   in the managed manifest or the store index respectively; `enable`
 //!   re-checks the hash pin and the grant coverage and fails closed on a
-//!   mismatch.
+//!   mismatch. `revoke <id> [--cap <capability>]` drops grants without
+//!   dropping the record: a full revoke clears the granted set and disables,
+//!   a `--cap` revoke drops one capability and remembers it as an explicit
+//!   denial (no silent re-prompt); re-grant goes through `install` consent.
 //! - `list` shows every bundled plugin plus any recorded or installed extra,
 //!   with source, state (`enabled`/`disabled`/`available`), pin status, and
 //!   granted/requested capability counts. `info` shows one plugin's manifest
@@ -89,6 +92,7 @@ use std::path::{Path, PathBuf};
 
 use bitty_plugin_host::bundled::{all_bundled_manifests, bundled_manifest_for};
 use bitty_plugin_host::capability::{CapabilityId, effect_statement};
+use bitty_plugin_host::grant::{GrantRecord as HostGrantRecord, GrantStore};
 use bitty_plugin_host::manifest::{PluginId, PluginManifest};
 use bitty_runtime::plugin_runtime::{
     load_index, manifest_toml,
@@ -187,6 +191,8 @@ pub enum PluginVerb {
     Disable,
     /// `info <id>`: explain one plugin's static manifest + state.
     Info,
+    /// `revoke <id> [--cap <capability>]`: drop grants (durable denial).
+    Revoke,
 }
 
 impl PluginVerb {
@@ -200,6 +206,7 @@ impl PluginVerb {
             "enable" => Some(Self::Enable),
             "disable" => Some(Self::Disable),
             "info" => Some(Self::Info),
+            "revoke" => Some(Self::Revoke),
             _ => None,
         }
     }
@@ -214,6 +221,7 @@ impl PluginVerb {
             Self::Enable => "enable",
             Self::Disable => "disable",
             Self::Info => "info",
+            Self::Revoke => "revoke",
         }
     }
 
@@ -237,6 +245,8 @@ pub struct PluginRequest {
     pub yes: bool,
     /// `remove --force`: required for the destructive removal.
     pub force: bool,
+    /// `revoke --cap <capability>`: revoke one capability instead of all.
+    pub cap: Option<String>,
     /// `--no-color` (accepted for parity; tables are plain text).
     pub no_color: bool,
 }
@@ -278,6 +288,7 @@ pub fn parse_plugin_request(
     let mut format: Option<String> = None;
     let mut yes = false;
     let mut force = false;
+    let mut cap: Option<String> = None;
     let mut no_color = false;
 
     let mut index = 0usize;
@@ -295,6 +306,28 @@ pub fn parse_plugin_request(
                 index += 1;
                 continue;
             }
+            "--cap" => {
+                // Pair form: consume the next token as the capability value;
+                // a missing value is usage (fail closed before dispatch).
+                let Some(value) = raw.get(index + 1) else {
+                    return Err(PluginParseError::Usage(
+                        "bitty plugin: --cap needs a value (a capability id)".to_string(),
+                    ));
+                };
+                if !bare_token_ok(value) {
+                    return Err(PluginParseError::Usage(format!(
+                        "bitty plugin: --cap value is empty, contains NUL, or exceeds {MAX_PLUGIN_TOKEN_BYTES} bytes"
+                    )));
+                }
+                if cap.is_some() {
+                    return Err(PluginParseError::Usage(
+                        "bitty plugin: duplicate --cap".to_string(),
+                    ));
+                }
+                cap = Some(value.clone());
+                index += 2;
+                continue;
+            }
             "--no-color" => {
                 no_color = true;
                 index += 1;
@@ -309,6 +342,21 @@ pub fn parse_plugin_request(
         }
         if let Some(value) = token.strip_prefix("--format=") {
             format = Some(value.to_string());
+            index += 1;
+            continue;
+        }
+        if let Some(value) = token.strip_prefix("--cap=") {
+            if !bare_token_ok(value) {
+                return Err(PluginParseError::Usage(format!(
+                    "bitty plugin: --cap value is empty, contains NUL, or exceeds {MAX_PLUGIN_TOKEN_BYTES} bytes"
+                )));
+            }
+            if cap.is_some() {
+                return Err(PluginParseError::Usage(
+                    "bitty plugin: duplicate --cap".to_string(),
+                ));
+            }
+            cap = Some(value.to_string());
             index += 1;
             continue;
         }
@@ -340,7 +388,7 @@ pub fn parse_plugin_request(
                 None => {
                     return Err(PluginParseError::Usage(format!(
                         "bitty plugin: unknown verb {token:?} \
-                         (want list|install|remove|enable|disable|info)"
+                         (want list|install|remove|enable|disable|info|revoke)"
                     )));
                 }
             }
@@ -359,7 +407,8 @@ pub fn parse_plugin_request(
 
     let verb = verb.ok_or_else(|| {
         PluginParseError::Usage(
-            "bitty plugin: missing verb (want list|install|remove|enable|disable|info)".to_string(),
+            "bitty plugin: missing verb (want list|install|remove|enable|disable|info|revoke)"
+                .to_string(),
         )
     })?;
 
@@ -391,6 +440,12 @@ pub fn parse_plugin_request(
             verb.name()
         )));
     }
+    if cap.is_some() && verb != PluginVerb::Revoke {
+        return Err(PluginParseError::Usage(format!(
+            "bitty plugin: --cap only applies to `revoke` (got `{}`)",
+            verb.name()
+        )));
+    }
     if (format != PluginFormat::Table || no_color)
         && !matches!(verb, PluginVerb::List | PluginVerb::Info)
     {
@@ -406,6 +461,7 @@ pub fn parse_plugin_request(
         format,
         yes,
         force,
+        cap,
         no_color,
     })
 }
@@ -419,6 +475,7 @@ pub fn plugin_usage() -> String {
      \x20      bitty plugin remove <id> --force\n\
      \x20      bitty plugin enable <id>\n\
      \x20      bitty plugin disable <id>\n\
+     \x20      bitty plugin revoke <id> [--cap <capability>]\n\
      \x20      bitty plugin info <id> [--format table|json|jsonl] [--no-color]\n\
      \n\
      Bundled plugins are recorded in $XDG_CONFIG_HOME/bitty/bitty-plugins.toml\n\
@@ -458,7 +515,13 @@ pub fn plugin_help_text() -> String {
      \x20                             and grants are re-checked; installed records\n\
      \x20                             are switched atomically in the store index.\n\
      \x20 disable <id>                Disable without dropping the record or grant.\n\
-     \x20 info <id>                   Manifest + recorded state, with the plain-\n\
+     \x20 revoke <id> [--cap <cap>]   Revoke grants without dropping the record:\n\
+     \x20                             without --cap every granted capability is\n\
+     \x20                             dropped and the plugin disabled; with --cap\n\
+     \x20                             one capability is dropped and remembered\n\
+     \x20                             as explicitly denied (no silent re-prompt).\n\
+     \x20                             Re-grant with `install` (explicit consent).\n\
+     \x20 info <id>                   Manifest + recorded state, with the plain-\
      \x20                             language effect per capability.\n\
      \n\
      flags:\n\
@@ -466,6 +529,7 @@ pub fn plugin_help_text() -> String {
      \x20 --no-color                  Accepted for parity (tables are plain text).\n\
      \x20 --yes                       install only: approve capability consent.\n\
      \x20 --force                     remove only: confirm the destructive drop.\n\
+     \x20 --cap <capability>          revoke only: revoke one capability.\n\
      \n\
      authority:\n\
      \x20 Plugin code is never executed by any `bitty plugin` operation. A\n\
@@ -494,8 +558,9 @@ pub fn plugin_help_text() -> String {
 // Managed manifest (strict bounded TOML subset, owned by this module)
 // ---------------------------------------------------------------------------
 
-/// One recorded plugin: source, pinned manifest hash, enabled flag, and the
-/// granted capability set bound to that hash.
+/// One recorded plugin: source, pinned manifest hash, enabled flag, the
+/// granted capability set bound to that hash, and explicitly revoked
+/// (denied) capabilities that must not be silently re-prompted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginRecord {
     /// Provenance (`bundled` today; closed set).
@@ -506,12 +571,25 @@ pub struct PluginRecord {
     pub enabled: bool,
     /// Granted capabilities for this exact manifest hash.
     pub granted: BTreeSet<CapabilityId>,
+    /// Explicitly revoked capabilities (durable deny-loop guard; only
+    /// `install` consent clears entries that are re-granted).
+    pub denied: BTreeSet<CapabilityId>,
 }
 
 /// Parsed managed manifest (`bitty-plugins.toml`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PluginState {
     records: BTreeMap<String, PluginRecord>,
+}
+
+/// Per-section key accumulators during [`PluginState::parse`].
+#[derive(Default)]
+struct SectionAccum {
+    source: Option<String>,
+    manifest_hash: Option<String>,
+    enabled: Option<bool>,
+    granted: Option<BTreeSet<CapabilityId>>,
+    denied: Option<BTreeSet<CapabilityId>>,
 }
 
 /// Managed-manifest parse/validation failure (owned message incl. line).
@@ -592,10 +670,7 @@ impl PluginState {
         let mut version_seen = false;
         let mut section_id: Option<String> = None;
         let mut section_line = 0usize;
-        let mut source: Option<String> = None;
-        let mut manifest_hash: Option<String> = None;
-        let mut enabled: Option<bool> = None;
-        let mut granted: Option<BTreeSet<CapabilityId>> = None;
+        let mut accum = SectionAccum::default();
 
         for (index, raw_line) in text.lines().enumerate() {
             let line = index + 1;
@@ -614,15 +689,7 @@ impl PluginState {
                     StateError::new(line, "section header is missing the closing `]`")
                 })?;
                 if section_id.is_some() {
-                    flush_section(
-                        &mut state,
-                        section_id.take(),
-                        section_line,
-                        &mut source,
-                        &mut manifest_hash,
-                        &mut enabled,
-                        &mut granted,
-                    )?;
+                    flush_section(&mut state, section_id.take(), section_line, &mut accum)?;
                 }
                 let id = parse_section_header(header, line)?;
                 if state.records.contains_key(&id) {
@@ -659,7 +726,7 @@ impl PluginState {
             let (key, value) = split_assignment(trimmed, line)?;
             match key {
                 "source" => {
-                    reject_duplicate(source.is_some(), "source", line)?;
+                    reject_duplicate(accum.source.is_some(), "source", line)?;
                     let parsed = parse_quoted(value, line)?;
                     if parsed != "bundled" {
                         return Err(StateError::new(
@@ -667,10 +734,10 @@ impl PluginState {
                             format!("unsupported source '{parsed}' (want bundled)"),
                         ));
                     }
-                    source = Some(parsed);
+                    accum.source = Some(parsed);
                 }
                 "manifest_hash" => {
-                    reject_duplicate(manifest_hash.is_some(), "manifest_hash", line)?;
+                    reject_duplicate(accum.manifest_hash.is_some(), "manifest_hash", line)?;
                     let parsed = parse_quoted(value, line)?;
                     if !is_lower_hex(&parsed, HEX_HASH_LEN) {
                         return Err(StateError::new(
@@ -680,11 +747,11 @@ impl PluginState {
                             ),
                         ));
                     }
-                    manifest_hash = Some(parsed);
+                    accum.manifest_hash = Some(parsed);
                 }
                 "enabled" => {
-                    reject_duplicate(enabled.is_some(), "enabled", line)?;
-                    enabled = Some(match value {
+                    reject_duplicate(accum.enabled.is_some(), "enabled", line)?;
+                    accum.enabled = Some(match value {
                         "true" => true,
                         "false" => false,
                         other => {
@@ -696,8 +763,12 @@ impl PluginState {
                     });
                 }
                 "granted" => {
-                    reject_duplicate(granted.is_some(), "granted", line)?;
-                    granted = Some(parse_capability_array(value, line)?);
+                    reject_duplicate(accum.granted.is_some(), "granted", line)?;
+                    accum.granted = Some(parse_capability_array(value, line)?);
+                }
+                "denied" => {
+                    reject_duplicate(accum.denied.is_some(), "denied", line)?;
+                    accum.denied = Some(parse_capability_array(value, line)?);
                 }
                 other => {
                     return Err(StateError::new(
@@ -708,15 +779,7 @@ impl PluginState {
             }
         }
         if section_id.is_some() {
-            flush_section(
-                &mut state,
-                section_id.take(),
-                section_line,
-                &mut source,
-                &mut manifest_hash,
-                &mut enabled,
-                &mut granted,
-            )?;
+            flush_section(&mut state, section_id.take(), section_line, &mut accum)?;
         }
         if !version_seen {
             return Err(StateError::new(1, "missing `state_version = 1`"));
@@ -736,7 +799,7 @@ impl PluginState {
     pub fn render(&self) -> String {
         let mut out = String::from(
             "# bitty managed plugin manifest — machine-generated by `bitty plugin`.\n\
-             # Do not edit by hand; use bitty plugin list|install|remove|enable|disable.\n",
+             # Do not edit by hand; use bitty plugin list|install|remove|enable|disable|revoke.\n",
         );
         let _ = writeln!(out, "state_version = {STATE_VERSION}");
         for (id, record) in &self.records {
@@ -753,6 +816,14 @@ impl PluginState {
                 let _ = write!(out, "\"{}\"", capability.as_str());
             }
             out.push_str("]\n");
+            out.push_str("denied = [");
+            for (index, capability) in record.denied.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(", ");
+                }
+                let _ = write!(out, "\"{}\"", capability.as_str());
+            }
+            out.push_str("]\n");
         }
         out
     }
@@ -762,30 +833,45 @@ fn flush_section(
     state: &mut PluginState,
     id: Option<String>,
     line: usize,
-    source: &mut Option<String>,
-    manifest_hash: &mut Option<String>,
-    enabled: &mut Option<bool>,
-    granted: &mut Option<BTreeSet<CapabilityId>>,
+    accum: &mut SectionAccum,
 ) -> Result<(), StateError> {
     let Some(id) = id else {
         return Ok(());
     };
-    let source = source
+    let source = accum
+        .source
         .take()
         .ok_or_else(|| StateError::new(line, format!("plugin '{id}' is missing `source`")))?;
-    let manifest_hash = manifest_hash.take().ok_or_else(|| {
+    let manifest_hash = accum.manifest_hash.take().ok_or_else(|| {
         StateError::new(line, format!("plugin '{id}' is missing `manifest_hash`"))
     })?;
-    let enabled = enabled
+    let enabled = accum
+        .enabled
         .take()
         .ok_or_else(|| StateError::new(line, format!("plugin '{id}' is missing `enabled`")))?;
-    let granted = granted
+    let granted = accum
+        .granted
         .take()
         .ok_or_else(|| StateError::new(line, format!("plugin '{id}' is missing `granted`")))?;
     if granted.len() > MAX_STATE_GRANTS {
         return Err(StateError::new(
             line,
             format!("plugin '{id}' exceeds {MAX_STATE_GRANTS} granted capabilities"),
+        ));
+    }
+    // `denied` is optional (absent in manifests written before revocation
+    // existed); missing means no explicit denials.
+    let denied = accum.denied.take().unwrap_or_default();
+    if denied.len() > MAX_STATE_GRANTS {
+        return Err(StateError::new(
+            line,
+            format!("plugin '{id}' exceeds {MAX_STATE_GRANTS} denied capabilities"),
+        ));
+    }
+    if !granted.is_disjoint(&denied) {
+        return Err(StateError::new(
+            line,
+            format!("plugin '{id}' lists a capability as both granted and denied"),
         ));
     }
     state.insert(
@@ -795,6 +881,7 @@ fn flush_section(
             manifest_hash,
             enabled,
             granted,
+            denied,
         },
     );
     Ok(())
@@ -1149,6 +1236,8 @@ pub struct PluginRow {
     pub requested: BTreeSet<CapabilityId>,
     /// Capabilities recorded as granted.
     pub granted: BTreeSet<CapabilityId>,
+    /// Capabilities explicitly revoked (durable denials; managed records only).
+    pub denied: BTreeSet<CapabilityId>,
     /// Qualified commands from the static manifest.
     pub commands: Vec<String>,
     /// Pinned manifest hash when recorded.
@@ -1161,14 +1250,25 @@ impl PluginRow {
     pub fn capability_rows(&self) -> Vec<CapabilityRow> {
         let mut ids: BTreeSet<CapabilityId> = self.requested.clone();
         ids.extend(self.granted.iter().cloned());
+        ids.extend(self.denied.iter().cloned());
         ids.into_iter()
             .map(|capability| CapabilityRow {
                 effect: effect_statement(&capability).to_string(),
                 high_risk: capability.is_high_risk(),
                 requested: self.requested.contains(&capability),
                 granted: self.granted.contains(&capability),
+                denied: self.denied.contains(&capability),
                 id: capability.as_str().to_string(),
             })
+            .collect()
+    }
+
+    /// Explicitly revoked capabilities in sorted order (display only).
+    #[must_use]
+    pub fn denied_ids(&self) -> Vec<String> {
+        self.denied
+            .iter()
+            .map(|capability| capability.as_str().to_string())
             .collect()
     }
 }
@@ -1186,6 +1286,8 @@ pub struct CapabilityRow {
     pub requested: bool,
     /// Whether it is recorded as granted.
     pub granted: bool,
+    /// Whether it was explicitly revoked (re-grant needs `install` consent).
+    pub denied: bool,
 }
 
 fn rows_from_state(
@@ -1207,7 +1309,7 @@ fn rows_from_state(
             )
         })?;
         let record = state.get(&id);
-        let (state_label, enabled, pin_ok, granted, manifest_hash) = match record {
+        let (state_label, enabled, pin_ok, granted, denied, manifest_hash) = match record {
             Some(record) => (
                 if record.enabled {
                     "enabled"
@@ -1217,9 +1319,17 @@ fn rows_from_state(
                 record.enabled,
                 Some(record.manifest_hash == manifest.manifest_hash()),
                 record.granted.clone(),
+                record.denied.clone(),
                 Some(record.manifest_hash.clone()),
             ),
-            None => ("available", false, None, BTreeSet::new(), None),
+            None => (
+                "available",
+                false,
+                None,
+                BTreeSet::new(),
+                BTreeSet::new(),
+                None,
+            ),
         };
         rows.push(PluginRow {
             id,
@@ -1233,6 +1343,7 @@ fn rows_from_state(
             pin_ok,
             requested,
             granted,
+            denied,
             commands: manifest
                 .lazy
                 .commands
@@ -1265,6 +1376,7 @@ fn rows_from_state(
             pin_ok: None,
             requested: record.granted.clone(),
             granted: record.granted.clone(),
+            denied: record.denied.clone(),
             commands: Vec::new(),
             manifest_hash: Some(record.manifest_hash.clone()),
         });
@@ -1337,6 +1449,7 @@ fn store_row(store_root: &Path, record: &bitty_runtime::plugin_runtime::PluginRe
         pin_ok: None,
         requested,
         granted,
+        denied: BTreeSet::new(),
         commands: manifest
             .as_ref()
             .map(|manifest| {
@@ -1463,7 +1576,9 @@ fn format_info_table(row: &PluginRow, no_color: bool) -> String {
     let capabilities = row.capability_rows();
     let _ = writeln!(out, "  capabilities ({}):", capabilities.len());
     for capability in &capabilities {
-        let marker = if capability.granted {
+        let marker = if capability.denied {
+            "revoked"
+        } else if capability.granted {
             "granted"
         } else if capability.requested {
             "requested, not granted"
@@ -1483,6 +1598,16 @@ fn format_info_table(row: &PluginRow, no_color: bool) -> String {
     }
     if capabilities.is_empty() {
         out.push_str("    (none requested)\n");
+    }
+    let revoked = row.denied_ids();
+    if !revoked.is_empty() {
+        let _ = writeln!(
+            out,
+            "  revoked ({}): {} — re-grant with `bitty plugin install {}`",
+            revoked.len(),
+            revoked.join(", "),
+            row.id
+        );
     }
     out
 }
@@ -1513,12 +1638,13 @@ fn write_capability_array(out: &mut String, capabilities: &[CapabilityRow]) {
         }
         let _ = write!(
             out,
-            "{{\"id\":\"{}\",\"effect\":\"{}\",\"high_risk\":{},\"requested\":{},\"granted\":{}}}",
+            "{{\"id\":\"{}\",\"effect\":\"{}\",\"high_risk\":{},\"requested\":{},\"granted\":{},\"denied\":{}}}",
             json_escape(&capability.id),
             json_escape(&capability.effect),
             capability.high_risk,
             capability.requested,
-            capability.granted
+            capability.granted,
+            capability.denied
         );
     }
     out.push(']');
@@ -1764,6 +1890,24 @@ pub fn run_plugin_subcommand(
                 }
             } else {
                 uninstall_store(&store_root, id, request.force, output)
+            }
+        }
+        PluginVerb::Revoke => {
+            let id = request.id.as_deref().expect("revoke requires an id");
+            if !is_managed_operand(&state, id) {
+                eprintln!(
+                    "bitty plugin: `revoke {id}` needs a managed record (bundled plugin); \
+                     installed packages revoke through `bitty plugin remove {id} --force` \
+                     followed by `bitty plugin install <path>` to re-grant"
+                );
+                return EXIT_PLUGIN;
+            }
+            match op_revoke(&mut state, id, request.cap.as_deref()) {
+                Ok(result) => finish_mutation(&path, state, result, output),
+                Err(failure) => {
+                    eprintln!("{}", failure.message);
+                    failure.exit
+                }
             }
         }
     }
@@ -2137,14 +2281,17 @@ fn op_install(
     input: &mut dyn std::io::BufRead,
     output: &mut dyn std::io::Write,
 ) -> Result<OpOutput, PluginFailure> {
-    resolve_plugin_id(id)?;
+    let plugin_id = resolve_plugin_id(id)?;
     let manifest = bundled_manifest(id)?;
     let manifest_hash = manifest.manifest_hash();
     let requested = requested_capabilities(&manifest)?;
     let existing = state.get(id).cloned();
+    let now = now_unix_secs();
 
     // P0-AC-030 pattern: only capabilities absent from the recorded grant
     // need consent; unchanged/narrowed sets carry forward silently.
+    // Revoked-then-requested capabilities are absent from `granted`, so they
+    // always need explicit re-grant consent (no silent re-prompt loops).
     let needed: BTreeSet<CapabilityId> = match &existing {
         Some(record) => requested.difference(&record.granted).cloned().collect(),
         None => requested.clone(),
@@ -2171,9 +2318,50 @@ fn op_install(
         ));
     }
 
+    // Explicit consent is the re-grant action: requested capabilities leave
+    // the denial set. Only consent clears denials; enable/disable/revoke
+    // never do (deny-loop guard).
+    let denied: BTreeSet<CapabilityId> = match &existing {
+        Some(record) => record.denied.difference(&requested).cloned().collect(),
+        None => BTreeSet::new(),
+    };
+
+    // Manifest-hash changes commit through the grant engine so the P0-AC-030
+    // update gate owns the transition (OQ-012 grant lifecycle): stale hashes
+    // and unapproved additions fail closed with no state change.
+    if let Some(record) = &existing {
+        if record.manifest_hash != manifest_hash {
+            let mut engine = GrantStore::new();
+            engine.insert(HostGrantRecord::granted(
+                plugin_id.clone(),
+                record.manifest_hash.clone(),
+                record.granted.clone(),
+                now,
+            ));
+            engine
+                .apply_update(
+                    &plugin_id,
+                    &record.manifest_hash,
+                    &manifest_hash,
+                    &requested,
+                    true,
+                    now,
+                )
+                .map_err(|error| {
+                    PluginFailure::plugin(
+                        "CapabilityBlocked",
+                        format!("bitty plugin: '{id}' update rejected by the grant gate: {error}"),
+                    )
+                })?;
+        }
+    }
+
     let changed = match &existing {
         Some(record) => {
-            record.manifest_hash != manifest_hash || !record.enabled || record.granted != requested
+            record.manifest_hash != manifest_hash
+                || !record.enabled
+                || record.granted != requested
+                || record.denied != denied
         }
         None => true,
     };
@@ -2185,6 +2373,7 @@ fn op_install(
                 manifest_hash: manifest_hash.clone(),
                 enabled: true,
                 granted: requested.clone(),
+                denied,
             },
         );
     }
@@ -2298,6 +2487,96 @@ fn op_remove(state: &mut PluginState, id: &str, force: bool) -> Result<OpOutput,
 
 fn short_hash(hash: &str) -> String {
     hash.chars().take(12).collect()
+}
+
+/// Monotonic-ish host time for grant records (Unix seconds; 0 when the clock
+/// is unavailable). Used only as opaque `decided_at` evidence, never ordering.
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+/// Revoke grants for a recorded plugin without dropping the record.
+///
+/// - Without `capability`: every granted capability is dropped and the plugin
+///   disabled (mirrors the grant-store full revoke; the record stays so the
+///   decision is durable and auditable).
+/// - With `capability`: one capability is dropped and remembered as an
+///   explicit denial (no silent re-prompt); when the last granted capability
+///   goes, the plugin is disabled exactly like a full revoke. Re-granting a
+///   denied capability requires explicit `install` consent.
+fn op_revoke(
+    state: &mut PluginState,
+    id: &str,
+    capability: Option<&str>,
+) -> Result<OpOutput, PluginFailure> {
+    resolve_plugin_id(id)?;
+    let record = state.get(id).cloned().ok_or_else(|| not_installed(id))?;
+    let Some(capability) = capability else {
+        if record.granted.is_empty() && !record.enabled {
+            return Ok(OpOutput {
+                summary: format!("bitty plugin: '{id}' already revoked"),
+                changed: false,
+            });
+        }
+        let count = record.granted.len();
+        let kept_denied = record.denied.len();
+        let entry = state.get_mut(id).expect("checked");
+        entry.granted.clear();
+        entry.enabled = false;
+        return Ok(OpOutput {
+            summary: format!(
+                "bitty plugin: revoked '{id}' ({} grant{} dropped{}; re-grant with `bitty plugin install {id}`)",
+                count,
+                if count == 1 { "" } else { "s" },
+                if kept_denied == 0 {
+                    String::new()
+                } else {
+                    format!(
+                        ", {} explicit denial{} kept",
+                        kept_denied,
+                        if kept_denied == 1 { "" } else { "s" }
+                    )
+                },
+            ),
+            changed: true,
+        });
+    };
+    let capability = CapabilityId::parse(capability).map_err(|error| {
+        PluginFailure::usage(format!("bitty plugin: invalid capability: {error}"))
+    })?;
+    if !record.granted.contains(&capability) {
+        return Err(PluginFailure::plugin(
+            "CapabilityNotGranted",
+            format!(
+                "bitty plugin: '{}' is not granted for '{id}' (nothing revoked)",
+                capability.as_str()
+            ),
+        ));
+    }
+    let entry = state.get_mut(id).expect("checked");
+    entry.granted.remove(&capability);
+    entry.denied.insert(capability.clone());
+    let fully_revoked = entry.granted.is_empty();
+    if fully_revoked {
+        entry.enabled = false;
+    }
+    Ok(OpOutput {
+        summary: if fully_revoked {
+            format!(
+                "bitty plugin: revoked '{}' for '{id}' (last grant; plugin disabled, denial kept; re-grant with `bitty plugin install {id}`)",
+                capability.as_str()
+            )
+        } else {
+            format!(
+                "bitty plugin: revoked '{}' for '{id}' (denial kept; re-grant with `bitty plugin install {id}`)",
+                capability.as_str()
+            )
+        },
+        changed: true,
+    })
 }
 
 /// Ask the interactive capability-consent question (fails closed).
@@ -2512,6 +2791,7 @@ mod tests {
                 manifest_hash: "ab".repeat(32),
                 enabled: true,
                 granted,
+                denied: BTreeSet::new(),
             },
         );
         PluginState::from_records(records)
@@ -2790,6 +3070,7 @@ mod tests {
                 manifest_hash: "00".repeat(32),
                 enabled: false,
                 granted: BTreeSet::new(),
+                denied: BTreeSet::new(),
             },
         );
         std::fs::write(&file, PluginState::from_records(records).render()).expect("seed state");
@@ -2880,5 +3161,328 @@ mod tests {
         assert!(text.contains("(high risk)"), "{text}");
         assert!(text.contains("Read raw terminal bytes"), "{text}");
         assert!(text.contains("Grant these capabilities? [y/N]:"), "{text}");
+    }
+
+    // ── revocation (CTX-0765, #1381) ────────────────────────────────────────
+
+    #[test]
+    fn parse_revoke_with_cap_pair_and_equals_forms() {
+        let request = parse_ok(&["revoke", "bitty-terminal.tabs", "--cap", "ui.rich"]);
+        assert_eq!(request.verb, PluginVerb::Revoke);
+        assert_eq!(request.id.as_deref(), Some("bitty-terminal.tabs"));
+        assert_eq!(request.cap.as_deref(), Some("ui.rich"));
+        let request = parse_ok(&["revoke", "bitty-terminal.tabs", "--cap=ui.rich"]);
+        assert_eq!(request.cap.as_deref(), Some("ui.rich"));
+        let request = parse_ok(&["revoke", "bitty-terminal.tabs"]);
+        assert_eq!(request.cap, None);
+    }
+
+    #[test]
+    fn parse_cap_is_revoke_only() {
+        assert!(
+            parse_error(&["install", "bitty-terminal.tabs", "--cap", "ui.rich"])
+                .contains("--cap only applies to `revoke`")
+        );
+        assert!(
+            parse_error(&["revoke", "bitty-terminal.tabs", "--cap"])
+                .contains("--cap needs a value")
+        );
+        assert!(
+            parse_error(&[
+                "revoke",
+                "bitty-terminal.tabs",
+                "--cap",
+                "ui.rich",
+                "--cap",
+                "ui.rich"
+            ])
+            .contains("duplicate --cap")
+        );
+        assert!(parse_error(&["revoke"]).contains("needs a plugin id"));
+    }
+
+    fn install_shell_integration(config: &str) {
+        let (code, out, _) = run(
+            &["install", "bitty-terminal.shell-integration", "--yes"],
+            Some(config),
+            "",
+        );
+        assert_eq!(code, EXIT_OK, "{out}");
+    }
+
+    #[test]
+    fn revoke_full_clears_grants_disables_and_is_idempotent() {
+        let dir = scratch_dir("revoke-full");
+        let target = dir.join("init.lua");
+        let config = target.display().to_string();
+        install_shell_integration(&config);
+        let file = state_path(&dir);
+
+        let (code, out, _) = run(
+            &["revoke", "bitty-terminal.shell-integration"],
+            Some(&config),
+            "",
+        );
+        assert_eq!(code, EXIT_OK, "{out}");
+        assert!(out.contains("revoked"), "{out}");
+        let text = std::fs::read_to_string(&file).expect("state rewritten");
+        assert!(text.contains("granted = []"), "{text}");
+        assert!(text.contains("enabled = false"), "{text}");
+        assert!(text.contains("denied = []"), "{text}");
+
+        // Second revoke is an idempotent no-op (no rewrite, still success).
+        let (code, out, _) = run(
+            &["revoke", "bitty-terminal.shell-integration"],
+            Some(&config),
+            "",
+        );
+        assert_eq!(code, EXIT_OK, "{out}");
+        assert!(out.contains("already revoked"), "{out}");
+
+        // list reflects the revoked grant count without touching other rows.
+        let (code, out, _) = run(&["list"], Some(&config), "");
+        assert_eq!(code, EXIT_OK);
+        assert!(out.contains("0/1"), "{out}");
+
+        // enable fails closed: the manifest requests more than is granted.
+        let (code, _, _) = run(
+            &["enable", "bitty-terminal.shell-integration"],
+            Some(&config),
+            "",
+        );
+        assert_eq!(code, EXIT_PLUGIN);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn revoke_cap_records_denial_blocks_enable_and_shows_in_info() {
+        let dir = scratch_dir("revoke-cap");
+        let target = dir.join("init.lua");
+        let config = target.display().to_string();
+        install_shell_integration(&config);
+        let file = state_path(&dir);
+
+        // Single granted capability out: escalates to disabled, denial kept.
+        let (code, out, _) = run(
+            &[
+                "revoke",
+                "bitty-terminal.shell-integration",
+                "--cap",
+                "terminal.semantic-read",
+            ],
+            Some(&config),
+            "",
+        );
+        assert_eq!(code, EXIT_OK, "{out}");
+        assert!(out.contains("denial kept"), "{out}");
+        let text = std::fs::read_to_string(&file).expect("state rewritten");
+        assert!(text.contains("granted = []"), "{text}");
+        assert!(
+            text.contains("denied = [\"terminal.semantic-read\"]"),
+            "{text}"
+        );
+        assert!(text.contains("enabled = false"), "{text}");
+
+        // info surfaces the revocation in table and json shapes.
+        let (code, out, _) = run(
+            &["info", "bitty-terminal.shell-integration"],
+            Some(&config),
+            "",
+        );
+        assert_eq!(code, EXIT_OK);
+        assert!(out.contains("[revoked] terminal.semantic-read"), "{out}");
+        assert!(out.contains("revoked (1)"), "{out}");
+        let (code, out, _) = run(
+            &[
+                "info",
+                "bitty-terminal.shell-integration",
+                "--format",
+                "json",
+            ],
+            Some(&config),
+            "",
+        );
+        assert_eq!(code, EXIT_OK);
+        assert!(out.contains("\"denied\":true"), "{out}");
+
+        // enable stays blocked while the denial stands.
+        let (code, _, _) = run(
+            &["enable", "bitty-terminal.shell-integration"],
+            Some(&config),
+            "",
+        );
+        assert_eq!(code, EXIT_PLUGIN);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn revoke_cap_partial_keeps_remaining_grants() {
+        let dir = scratch_dir("revoke-partial");
+        let target = dir.join("init.lua");
+        let config = target.display().to_string();
+        let (code, out, _) = run(
+            &["install", "bitty-terminal.browser-panel", "--yes"],
+            Some(&config),
+            "",
+        );
+        assert_eq!(code, EXIT_OK, "{out}");
+        let file = state_path(&dir);
+
+        let (code, out, _) = run(
+            &[
+                "revoke",
+                "bitty-terminal.browser-panel",
+                "--cap",
+                "panel.create",
+            ],
+            Some(&config),
+            "",
+        );
+        assert_eq!(code, EXIT_OK, "{out}");
+        assert!(out.contains("revoked 'panel.create'"), "{out}");
+        let text = std::fs::read_to_string(&file).expect("state rewritten");
+        let granted_line = text
+            .lines()
+            .find(|line| line.starts_with("granted = "))
+            .expect("granted line");
+        assert!(!granted_line.contains("\"panel.create\""), "{text}");
+        assert!(text.contains("denied = [\"panel.create\"]"), "{text}");
+        // Remaining grants stay: the plugin record is not disabled by a
+        // partial revoke.
+        assert!(text.contains("enabled = true"), "{text}");
+        assert!(text.contains("\"panel.provider\""), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn revoke_rejects_unknown_plugin_and_ungranted_capability() {
+        let dir = scratch_dir("revoke-reject");
+        let target = dir.join("init.lua");
+        let config = target.display().to_string();
+        install_shell_integration(&config);
+        let file = state_path(&dir);
+        let before = std::fs::read_to_string(&file).expect("state written");
+
+        let (code, _, _) = run(&["revoke", "xuepoo.markdown"], Some(&config), "");
+        assert_eq!(code, EXIT_PLUGIN);
+        let (code, _, _) = run(
+            &[
+                "revoke",
+                "bitty-terminal.shell-integration",
+                "--cap",
+                "ui.rich",
+            ],
+            Some(&config),
+            "",
+        );
+        assert_eq!(code, EXIT_PLUGIN);
+        let (code, _, _) = run(
+            &[
+                "revoke",
+                "bitty-terminal.shell-integration",
+                "--cap",
+                "not.a.cap!!",
+            ],
+            Some(&config),
+            "",
+        );
+        assert_eq!(code, EXIT_USAGE);
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("kept"),
+            before,
+            "failed revokes change nothing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn regrant_after_revoke_needs_consent_and_clears_denial() {
+        let dir = scratch_dir("regrant");
+        let target = dir.join("init.lua");
+        let config = target.display().to_string();
+        install_shell_integration(&config);
+        let file = state_path(&dir);
+        let (code, _, _) = run(
+            &[
+                "revoke",
+                "bitty-terminal.shell-integration",
+                "--cap",
+                "terminal.semantic-read",
+            ],
+            Some(&config),
+            "",
+        );
+        assert_eq!(code, EXIT_OK);
+
+        // Declined consent changes nothing: the denial persists.
+        let (code, _, _) = run(
+            &["install", "bitty-terminal.shell-integration"],
+            Some(&config),
+            "n\n",
+        );
+        assert_eq!(code, EXIT_GENERIC);
+        let text = std::fs::read_to_string(&file).expect("kept");
+        assert!(
+            text.contains("denied = [\"terminal.semantic-read\"]"),
+            "{text}"
+        );
+
+        // Explicit consent re-grants and clears the denial (re-grant flow).
+        let (code, out, _) = run(
+            &["install", "bitty-terminal.shell-integration", "--yes"],
+            Some(&config),
+            "",
+        );
+        assert_eq!(code, EXIT_OK, "{out}");
+        let text = std::fs::read_to_string(&file).expect("state rewritten");
+        assert!(
+            text.contains("granted = [\"terminal.semantic-read\"]"),
+            "{text}"
+        );
+        assert!(text.contains("denied = []"), "{text}");
+        assert!(text.contains("enabled = true"), "{text}");
+
+        // enable works again after the re-grant.
+        let (code, out, _) = run(
+            &["enable", "bitty-terminal.shell-integration"],
+            Some(&config),
+            "",
+        );
+        assert_eq!(code, EXIT_OK, "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn managed_manifest_denied_codec_round_trips_and_rejects_overlap() {
+        let mut records = BTreeMap::new();
+        let mut granted = BTreeSet::new();
+        granted.insert(CapabilityId::parse("terminal.semantic-read").expect("cap"));
+        let mut denied = BTreeSet::new();
+        denied.insert(CapabilityId::parse("ui.rich").expect("cap"));
+        records.insert(
+            "bitty-terminal.shell-integration".to_string(),
+            PluginRecord {
+                source: "bundled".to_string(),
+                manifest_hash: "ab".repeat(32),
+                enabled: false,
+                granted,
+                denied,
+            },
+        );
+        let rendered = PluginState::from_records(records).render();
+        assert!(rendered.contains("denied = [\"ui.rich\"]"), "{rendered}");
+        let parsed = PluginState::parse(&rendered).expect("parses");
+        assert_eq!(parsed.render(), rendered);
+
+        // A capability cannot be both granted and denied (hostile edit fails closed).
+        let hostile = rendered.replace(
+            "denied = [\"ui.rich\"]",
+            "denied = [\"terminal.semantic-read\"]",
+        );
+        assert!(PluginState::parse(&hostile).is_err());
+
+        // Unknown capabilities in `denied` fail closed like `granted`.
+        let hostile = rendered.replace("denied = [\"ui.rich\"]", "denied = [\"nope.everything\"]");
+        assert!(PluginState::parse(&hostile).is_err());
     }
 }

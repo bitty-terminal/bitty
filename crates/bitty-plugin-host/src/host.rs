@@ -600,6 +600,10 @@ impl PluginHost {
     }
 
     /// Revoke a grant (single capability or all), detaching at the next dispatch boundary.
+    ///
+    /// Revocation touches only this plugin's records: unrelated plugins keep
+    /// their grants and need no restart. Persist with [`Self::save_grants`]
+    /// so the revocation survives restarts.
     pub fn revoke(
         &mut self,
         plugin_id: &PluginId,
@@ -608,7 +612,33 @@ impl PluginHost {
         self.grants.revoke(plugin_id, capability)
     }
 
-    /// Insert a grant record (headless helper; persistence is deferred).
+    /// Revoke all grants for `plugin_id` (manager convenience over
+    /// [`Self::revoke`] with no capability).
+    pub fn revoke_all(
+        &mut self,
+        plugin_id: &PluginId,
+    ) -> Result<crate::grant::RevokeReport, PluginError> {
+        self.grants.revoke_all(plugin_id)
+    }
+
+    /// Load persisted grant records from `path`, replacing the in-memory
+    /// store only after the whole file verifies (startup entry point).
+    ///
+    /// A missing file loads an empty store (first run); hostile contents
+    /// fail closed and leave the current store untouched.
+    pub fn load_grants(&mut self, path: &std::path::Path) -> Result<(), PluginError> {
+        let store = GrantStore::load(path)?;
+        self.grants = store;
+        Ok(())
+    }
+
+    /// Persist grant records to `path` (call after grant, update, or revoke
+    /// so the decision survives restarts).
+    pub fn save_grants(&self, path: &std::path::Path) -> Result<(), PluginError> {
+        self.grants.save(path)
+    }
+
+    /// Insert a grant record (explicit-consent path; persistence via [`Self::save_grants`]).
     pub fn insert_grant(&mut self, record: GrantRecord) {
         self.grants.insert(record);
     }
@@ -1754,6 +1784,137 @@ mod tests {
                 .contains("safe mode")
         );
         assert_eq!(host.registry().get(&id).unwrap().generation, 1);
+    }
+
+    fn grant_test_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("bitty-ctx0765-host-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn grant_test_host(id: &str) -> (PluginHost, PluginId, String) {
+        let mut host = PluginHost::new(DropPolicy::DropOldest, 8);
+        let manifest = manifest_with_caps(id, vec!["terminal.semantic-read", "ui.rich"]);
+        host.declare(manifest.clone()).unwrap();
+        let plugin_id = PluginId::new(id).unwrap();
+        host.resolve(&plugin_id).unwrap();
+        host.register(&plugin_id).unwrap();
+        let hash = manifest.manifest_hash();
+        let mut granted = std::collections::BTreeSet::new();
+        granted.insert(CapabilityId::parse("terminal.semantic-read").unwrap());
+        granted.insert(CapabilityId::parse("ui.rich").unwrap());
+        host.insert_grant(GrantRecord::granted(
+            plugin_id.clone(),
+            hash.clone(),
+            granted,
+            1,
+        ));
+        assert!(host.activate(&plugin_id).is_ok());
+        (host, plugin_id, hash)
+    }
+
+    #[test]
+    fn host_revoke_takes_effect_without_restart_of_unrelated_plugins() {
+        // CTX-0765 (#1381): revocation touches only the revoked plugin.
+        let (mut host, revoked_id, _) = grant_test_host("xuepoo.revoked");
+        let other_id = {
+            let manifest = manifest_with_caps("xuepoo.other", vec!["ui.rich"]);
+            host.declare(manifest.clone()).unwrap();
+            let other_id = PluginId::new("xuepoo.other").unwrap();
+            host.resolve(&other_id).unwrap();
+            host.register(&other_id).unwrap();
+            let mut granted = std::collections::BTreeSet::new();
+            granted.insert(CapabilityId::parse("ui.rich").unwrap());
+            host.insert_grant(GrantRecord::granted(
+                other_id.clone(),
+                manifest.manifest_hash(),
+                granted,
+                2,
+            ));
+            assert!(host.activate(&other_id).is_ok());
+            other_id
+        };
+        let report = host
+            .revoke(&revoked_id, Some(&CapabilityId::parse("ui.rich").unwrap()))
+            .unwrap();
+        assert_eq!(report.revoked.len(), 1);
+        assert!(!report.fully_revoked);
+        assert!(host.activate(&revoked_id).is_err());
+        // The unrelated plugin is unaffected by the revocation.
+        assert!(
+            host.grants()
+                .is_cap_denied(&revoked_id, &CapabilityId::parse("ui.rich").unwrap())
+        );
+        assert!(!host.grants().is_denied(&other_id));
+        assert!(host.grants().get(&other_id).is_some());
+        // The unrelated plugin's grant record is untouched.
+        let other_record = host.grants().get(&other_id).expect("record kept");
+        assert!(
+            other_record
+                .granted
+                .contains(&CapabilityId::parse("ui.rich").unwrap())
+        );
+    }
+
+    #[test]
+    fn host_revoke_all_blocks_activation_until_regrant() {
+        let (mut host, plugin_id, hash) = grant_test_host("xuepoo.gone");
+        let report = host.revoke_all(&plugin_id).unwrap();
+        assert!(report.fully_revoked);
+        assert_eq!(report.revoked.len(), 2);
+        assert!(host.activate(&plugin_id).is_err());
+        // An update cannot revive the denial: explicit re-grant is required.
+        let mut caps = std::collections::BTreeSet::new();
+        caps.insert(CapabilityId::parse("terminal.semantic-read").unwrap());
+        assert!(
+            host.grants_mut()
+                .apply_update(&plugin_id, &hash, "new-hash", &caps, true, 3)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn host_grants_persist_across_restart_and_fail_closed() {
+        // CTX-0765 (#1381): save, reload into a fresh host (restart), verify
+        // the revocation is still enforced; hostile files change nothing.
+        let dir = grant_test_dir("persist");
+        let path = dir.join("grants.toml");
+        let (mut host, plugin_id, _) = grant_test_host("xuepoo.saved");
+        host.revoke(&plugin_id, Some(&CapabilityId::parse("ui.rich").unwrap()))
+            .unwrap();
+        host.save_grants(&path).unwrap();
+
+        let mut restarted = PluginHost::new(DropPolicy::DropOldest, 8);
+        let manifest =
+            manifest_with_caps("xuepoo.saved", vec!["terminal.semantic-read", "ui.rich"]);
+        restarted.declare(manifest).unwrap();
+        restarted.resolve(&plugin_id).unwrap();
+        restarted.register(&plugin_id).unwrap();
+        restarted.load_grants(&path).unwrap();
+        assert!(restarted.activate(&plugin_id).is_err());
+        assert!(
+            restarted
+                .grants()
+                .is_cap_denied(&plugin_id, &CapabilityId::parse("ui.rich").unwrap())
+        );
+
+        // Hostile contents fail closed and leave the loaded store untouched.
+        let before = restarted.grants().clone();
+        std::fs::write(&path, "grants_version = 99\n").unwrap();
+        assert!(restarted.load_grants(&path).is_err());
+        assert_eq!(restarted.grants().len(), before.len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn host_load_grants_missing_file_is_empty() {
+        let dir = grant_test_dir("missing");
+        let mut host = PluginHost::new(DropPolicy::DropOldest, 8);
+        host.load_grants(&dir.join("grants.toml")).unwrap();
+        assert!(host.grants().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

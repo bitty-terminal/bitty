@@ -9,31 +9,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::error::PluginError;
 use crate::manifest::{
-    LazyCommand, PluginId, PluginManifest, QualifiedName, summarize_interface_schema,
+    LazyCommand, PluginId, PluginManifest, QualifiedName, service_version_satisfies,
+    summarize_interface_schema,
 };
 
 /// Monotonic instance counter per plugin id.
 ///
 /// All runtime resources are owned by one generation; reload increments it.
 pub type Generation = u64;
-
-/// Whether a provided service version satisfies a version requirement.
-///
-/// Uses the canonical package evaluator (`bitty_package::VersionReq`, the same
-/// grammar family as plugin dependencies): caret/tilde expansion plus
-/// comparator intersection. Fail-closed: unparseable versions or requirements
-/// never satisfy. Prerelease candidates require an explicit prerelease opt-in
-/// in the requirement text (same rule as the package resolver); a stable-only
-/// requirement never matches a prerelease build.
-fn service_version_satisfies(provided: &str, requirement: &str) -> bool {
-    let (Ok(version), Ok(req)) = (
-        bitty_package::Version::parse(provided),
-        bitty_package::VersionReq::parse(requirement),
-    ) else {
-        return false;
-    };
-    req.matches(&version) && req.allows_prerelease_for(&version)
-}
 
 /// Render a cycle path with stable quoting (`'a' -> 'b' -> 'a'`).
 fn quoted_path(nodes: &[String]) -> String {

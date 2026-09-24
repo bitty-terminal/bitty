@@ -1178,6 +1178,29 @@ fn validate_service_iface(iface: &str, field: &str) -> Result<(), PluginError> {
     Ok(())
 }
 
+/// Whether a provided service version satisfies a version requirement.
+///
+/// Uses the canonical package evaluator (`bitty_package::VersionReq`, the same
+/// grammar family as plugin dependencies): caret/tilde expansion plus
+/// comparator intersection. Fail-closed: unparseable versions or requirements
+/// never satisfy. Prerelease candidates require an explicit prerelease opt-in
+/// in the requirement text (same rule as the package resolver); a stable-only
+/// requirement never matches a prerelease build.
+///
+/// Shared by the policy registry (`resolve_all` graph gate) and the runtime
+/// service directory (live `services.get` resolution) so both agree on what
+/// "satisfies" means.
+#[must_use]
+pub fn service_version_satisfies(provided: &str, requirement: &str) -> bool {
+    let (Ok(version), Ok(req)) = (
+        bitty_package::Version::parse(provided),
+        bitty_package::VersionReq::parse(requirement),
+    ) else {
+        return false;
+    };
+    req.matches(&version) && req.allows_prerelease_for(&version)
+}
+
 // ── inline-table manifest forms (dependency prerelease, service schemas,
 // lazy command schemas) ──────────────────────────────────────────────────
 
@@ -1305,6 +1328,10 @@ enum SchemaJson {
     Null,
     Bool(bool),
     Int(i64),
+    /// Non-integral JSON number. Only produced by the *value* parser
+    /// ([`parse_value_json`): schemas stay integers-only (fail-closed
+    /// shapes), while marshalled call arguments may carry Lua numbers.
+    Float(f64),
     Str(String),
     Array(Vec<SchemaJson>),
     Object(BTreeMap<String, SchemaJson>),
@@ -1527,6 +1554,100 @@ impl<'a> SchemaJsonParser<'a> {
         }
     }
 
+    /// Raw input slice for the value-number scanner.
+    fn bytes_as_slice(&self) -> &[u8] {
+        self.bytes
+    }
+
+    /// Current cursor for the value-number scanner.
+    fn cursor(&self) -> usize {
+        self.pos
+    }
+
+    /// Advance the cursor past a scanned value number.
+    fn advance_to(&mut self, pos: usize) {
+        self.pos = pos;
+    }
+
+    /// Array parser mirroring [`Self::parse_array`] for values: elements
+    /// recurse through the float-tolerant value parser.
+    fn parse_array_value(&mut self, depth: usize) -> Result<SchemaJson, String> {
+        assert_eq!(self.bytes[self.pos], b'[');
+        self.pos += 1;
+        let mut items = Vec::new();
+        loop {
+            self.skip_ws();
+            match self.peek() {
+                None => return Err("unterminated array in value".to_string()),
+                Some(b']') => {
+                    self.pos += 1;
+                    return Ok(SchemaJson::Array(items));
+                }
+                _ => {}
+            }
+            items.push(parse_value_number_tolerant(self, depth + 1)?);
+            if items.len() > 4096 {
+                return Err("value array exceeds 4096 elements".to_string());
+            }
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => {
+                    self.pos += 1;
+                }
+                Some(b']') => {}
+                _ => return Err("expected ',' or ']' in value array".to_string()),
+            }
+        }
+    }
+
+    /// Object parser mirroring [`Self::parse_object`] for values: member
+    /// values recurse through the float-tolerant value parser, duplicate
+    /// keys fail closed.
+    fn parse_object_value(&mut self, depth: usize) -> Result<SchemaJson, String> {
+        assert_eq!(self.bytes[self.pos], b'{');
+        self.pos += 1;
+        let mut map = BTreeMap::new();
+        loop {
+            self.skip_ws();
+            match self.peek() {
+                None => return Err("unterminated object in value".to_string()),
+                Some(b'}') => {
+                    self.pos += 1;
+                    return Ok(SchemaJson::Object(map));
+                }
+                _ => {}
+            }
+            self.skip_ws();
+            if self.peek() != Some(b'"') {
+                return Err("value object keys must be strings".to_string());
+            }
+            let key = self.parse_string()?;
+            if key.len() > 128 {
+                return Err("value object key exceeds 128 bytes".to_string());
+            }
+            self.skip_ws();
+            if self.peek() != Some(b':') {
+                return Err("expected ':' in value object".to_string());
+            }
+            self.pos += 1;
+            let value = parse_value_number_tolerant(self, depth + 1)?;
+            if map.insert(key.clone(), value).is_some() {
+                return Err(format!("duplicate value object key '{key}'"));
+            }
+            if map.len() > 1024 {
+                return Err("value object exceeds 1024 keys".to_string());
+            }
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => {
+                    self.pos += 1;
+                }
+                Some(b'}') => {}
+                _ => return Err("expected ',' or '}' in value object".to_string()),
+            }
+        }
+    }
+
     fn skip_ws(&mut self) {
         while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
             self.pos += 1;
@@ -1547,6 +1668,138 @@ fn parse_interface_schema(text: &str) -> Result<SchemaJson, String> {
         return Err("trailing content after schema document".to_string());
     }
     Ok(value)
+}
+
+/// Depth ceiling for marshalled value documents ([`parse_value_json`]).
+///
+/// Call arguments cross bounded by the bridge marshalling depth (8), but
+/// host-constructed values are not bridge-checked, so the value parser
+/// allows twice the schema ceiling rather than aliasing it.
+const VALUE_JSON_MAX_DEPTH: usize = 32;
+
+/// Parse one marshalled call value for schema checking.
+///
+/// Same bounded grammar as [`parse_interface_schema`] (duplicate keys fail
+/// closed), except numbers admit the full JSON shape: integral numbers
+/// become [`SchemaJson::Int`], the rest [`SchemaJson::Float`]. Total and
+/// headless; depth is capped at [`VALUE_JSON_MAX_DEPTH`].
+fn parse_value_json(text: &str) -> Result<SchemaJson, String> {
+    let mut parser = SchemaJsonParser::new(text);
+    let value = parse_value_number_tolerant(&mut parser, 0)?;
+    parser.skip_ws();
+    if parser.peek().is_some() {
+        return Err("trailing content after value document".to_string());
+    }
+    Ok(value)
+}
+
+/// Float-tolerant mirror of [`SchemaJsonParser::parse_value`] for values.
+fn parse_value_number_tolerant(
+    parser: &mut SchemaJsonParser<'_>,
+    depth: usize,
+) -> Result<SchemaJson, String> {
+    if depth > VALUE_JSON_MAX_DEPTH {
+        return Err(format!(
+            "value exceeds the nesting depth ceiling ({VALUE_JSON_MAX_DEPTH})"
+        ));
+    }
+    parser.skip_ws();
+    let byte = parser.peek().ok_or("value is empty or truncated")?;
+    match byte {
+        b'{' => parser.parse_object_value(depth),
+        b'[' => parser.parse_array_value(depth),
+        b'"' => Ok(SchemaJson::Str(parser.parse_string()?)),
+        b't' => parser.parse_literal("true", SchemaJson::Bool(true)),
+        b'f' => parser.parse_literal("false", SchemaJson::Bool(false)),
+        b'n' => parser.parse_literal("null", SchemaJson::Null),
+        b'-' | b'0'..=b'9' => Ok(parse_value_number(parser)?),
+        other => Err(format!("unexpected character '{other}' in value")),
+    }
+}
+
+/// Parse one JSON number for a value: integral shapes become
+/// [`SchemaJson::Int`], fractional/exponent shapes [`SchemaJson::Float`].
+/// Leading zeros fail closed; overflow past `i64` degrades to `Float`
+/// (values are observations, not manifest policy); non-finite results
+/// fail closed.
+fn parse_value_number(parser: &mut SchemaJsonParser<'_>) -> Result<SchemaJson, String> {
+    let start = parser.cursor();
+    let (text, integral) = {
+        let bytes = parser.bytes_as_slice();
+        let mut pos = start;
+        if bytes.get(pos) == Some(&b'-') {
+            pos += 1;
+        }
+        let digits_start = pos;
+        while matches!(bytes.get(pos), Some(b'0'..=b'9')) {
+            pos += 1;
+        }
+        if pos == digits_start {
+            return Err("malformed number in value".to_string());
+        }
+        let mut integral = true;
+        if bytes.get(pos) == Some(&b'.') {
+            integral = false;
+            pos += 1;
+            let frac_start = pos;
+            while matches!(bytes.get(pos), Some(b'0'..=b'9')) {
+                pos += 1;
+            }
+            if pos == frac_start {
+                return Err("malformed number in value".to_string());
+            }
+        }
+        if matches!(bytes.get(pos), Some(b'e') | Some(b'E')) {
+            integral = false;
+            pos += 1;
+            if matches!(bytes.get(pos), Some(b'+') | Some(b'-')) {
+                pos += 1;
+            }
+            let exp_start = pos;
+            while matches!(bytes.get(pos), Some(b'0'..=b'9')) {
+                pos += 1;
+            }
+            if pos == exp_start {
+                return Err("malformed number in value".to_string());
+            }
+        }
+        let text = std::str::from_utf8(&bytes[start..pos])
+            .map_err(|_| "value number is not valid UTF-8".to_string())?
+            .to_string();
+        (text, (integral, pos))
+    };
+    let (integral, end) = integral;
+    let digits = text.strip_prefix('-').unwrap_or(&text);
+    let int_part = digits.split(['.', 'e', 'E']).next().unwrap_or(digits);
+    if int_part.len() > 1 && int_part.starts_with('0') {
+        return Err("value number must not have leading zeros".to_string());
+    }
+    parser.advance_to(end);
+    if integral {
+        match text.parse::<i64>() {
+            Ok(int) => Ok(SchemaJson::Int(int)),
+            Err(_) => text
+                .parse::<f64>()
+                .map_err(|_| "value number is out of range".to_string())
+                .and_then(|float| {
+                    if float.is_finite() {
+                        Ok(SchemaJson::Float(float))
+                    } else {
+                        Err("value number is out of range".to_string())
+                    }
+                }),
+        }
+    } else {
+        text.parse::<f64>()
+            .map_err(|_| "value number is out of range".to_string())
+            .and_then(|float| {
+                if float.is_finite() {
+                    Ok(SchemaJson::Float(float))
+                } else {
+                    Err("value number is out of range".to_string())
+                }
+            })
+    }
 }
 
 /// Validate one interface schema (`args_schema` / `result_schema`).
@@ -1573,6 +1826,136 @@ pub fn validate_interface_schema(schema: &str, field: &str) -> Result<(), Plugin
     };
     check_schema_explicit(&value, field)?;
     Ok(())
+}
+
+/// Check one marshalled call value against an interface schema (LUA-OQ-8).
+///
+/// Total and headless: any parse failure or shape mismatch returns `false`
+/// (the caller maps it to `E_SERVICE_INVALID`). The covered subset is
+/// `type` (`object`/`array`/`string`/`integer`/`number`/`boolean`/`null`;
+/// `integer` also accepts integral floats since Lua numbers cross as
+/// `f64`), `properties`/`required`/`additionalProperties` for objects,
+/// `items` for arrays (single-schema form applies to every element;
+/// array form checks pairwise with exact length), and `enum`. Unknown
+/// keywords are ignored; a non-object schema never matches.
+///
+/// Schemas are re-parsed per call: they are at most 16 KiB (validated at
+/// manifest parse), so this stays cheap without caching mutable state.
+#[must_use]
+pub fn value_satisfies_schema(schema: &str, value_json: &str) -> bool {
+    let (Ok(schema), Ok(value)) = (parse_interface_schema(schema), parse_value_json(value_json))
+    else {
+        return false;
+    };
+    check_value(&schema, &value, 0)
+}
+
+/// Recursion ceiling for [`check_value`] (schemas already cap at 16, values
+/// at 32; this is the backstop, not the policy).
+const VALUE_CHECK_DEPTH: usize = 64;
+
+fn check_value(schema: &SchemaJson, value: &SchemaJson, depth: usize) -> bool {
+    if depth > VALUE_CHECK_DEPTH {
+        return false;
+    }
+    let SchemaJson::Object(map) = schema else {
+        return false;
+    };
+    if let Some(want) = map.get("type") {
+        let SchemaJson::Str(name) = want else {
+            return false;
+        };
+        let ok = match name.as_str() {
+            "object" => matches!(value, SchemaJson::Object(_)),
+            "array" => matches!(value, SchemaJson::Array(_)),
+            "string" => matches!(value, SchemaJson::Str(_)),
+            "integer" => match value {
+                SchemaJson::Int(_) => true,
+                SchemaJson::Float(f) => f.is_finite() && f.fract() == 0.0,
+                _ => false,
+            },
+            "number" => matches!(value, SchemaJson::Int(_) | SchemaJson::Float(_)),
+            "boolean" => matches!(value, SchemaJson::Bool(_)),
+            "null" => matches!(value, SchemaJson::Null),
+            _ => return false,
+        };
+        if !ok {
+            return false;
+        }
+    }
+    if let Some(SchemaJson::Array(options)) = map.get("enum") {
+        if !options.iter().any(|option| option == value) {
+            return false;
+        }
+    }
+    if map.contains_key("properties")
+        || map.contains_key("required")
+        || map.contains_key("additionalProperties")
+    {
+        let SchemaJson::Object(fields) = value else {
+            return false;
+        };
+        if let Some(required) = map.get("required") {
+            let SchemaJson::Array(names) = required else {
+                return false;
+            };
+            for name in names {
+                let SchemaJson::Str(key) = name else {
+                    return false;
+                };
+                if !fields.contains_key(key) {
+                    return false;
+                }
+            }
+        }
+        if let Some(SchemaJson::Object(props)) = map.get("properties") {
+            for (key, subschema) in props {
+                if let Some(field) = fields.get(key) {
+                    if !check_value(subschema, field, depth + 1) {
+                        return false;
+                    }
+                }
+            }
+        }
+        if matches!(
+            map.get("additionalProperties"),
+            Some(SchemaJson::Bool(false))
+        ) {
+            let declared = match map.get("properties") {
+                Some(SchemaJson::Object(props)) => props,
+                _ => return fields.is_empty(),
+            };
+            if fields.keys().any(|key| !declared.contains_key(key)) {
+                return false;
+            }
+        }
+    }
+    if let Some(items) = map.get("items") {
+        let SchemaJson::Array(elements) = value else {
+            return false;
+        };
+        match items {
+            SchemaJson::Object(_) => {
+                for element in elements {
+                    if !check_value(items, element, depth + 1) {
+                        return false;
+                    }
+                }
+            }
+            SchemaJson::Array(forms) => {
+                if forms.len() != elements.len() {
+                    return false;
+                }
+                for (form, element) in forms.iter().zip(elements.iter()) {
+                    if !check_value(form, element, depth + 1) {
+                        return false;
+                    }
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Enforce explicit `additionalProperties` on every object node declaring `properties`.
@@ -1604,7 +1987,11 @@ fn check_schema_explicit(value: &SchemaJson, field: &str) -> Result<(), PluginEr
             }
             Ok(())
         }
-        SchemaJson::Null | SchemaJson::Bool(_) | SchemaJson::Int(_) | SchemaJson::Str(_) => Ok(()),
+        SchemaJson::Null
+        | SchemaJson::Bool(_)
+        | SchemaJson::Int(_)
+        | SchemaJson::Float(_)
+        | SchemaJson::Str(_) => Ok(()),
     }
 }
 

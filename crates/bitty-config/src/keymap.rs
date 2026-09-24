@@ -60,8 +60,9 @@
 //!   #980: latest-command fold verbs, manual bind only, never in defaults),
 //!   `workspace_new`, `workspace_close`, `workspace_prev`, `workspace_next`,
 //!   `workspace_last`, `workspace_focus:<1..=16>`, `workspace_move:<1..=16>`
-//!   (CTX-0257 workspace ops entry per DEC-0034 plus CTX-0259 move:
-//!   `alt+n` new, `alt+w` close with kill-confirm,
+//!   (CTX-0257 workspace ops entry per DEC-0034 plus CTX-0259 move, rechorded
+//!   CTX-0766: `alt+n` opens a new panel, `alt+t` opens a new workspace):
+//!   `alt+n` new panel, `alt+t` new, `alt+w` close with kill-confirm,
 //!   `alt+-`/`alt+=` prev/next (`=` is the unshifted DEC `+`), `alt+tab`
 //!   last-used, `alt+1..=9` jump to workspace N,
 //!   `shift+alt+1..=9` move focused window to workspace N),
@@ -84,7 +85,8 @@
 //! Mod-aware resize variant plus CTX-0262 `ctrl+shift+alt+arrows` aliases (pure `shift+alt` stays creation: it cannot
 //! also resize under the single-owner rule), `ctrl+alt+arrows` navigate,
 //! `ctrl+tab` cycles, `ctrl+shift+c/v` copy/paste) plus the DEC-0034
-//! workspace entry (CTX-0257): `alt+n` new workspace, `alt+1..=9` jump to
+//! workspace entry (CTX-0257, rechorded CTX-0766): `alt+t` new workspace,
+//! `alt+1..=9` jump to
 //! workspace N, `alt+-`/`alt+=` prev/next, `alt+tab` last-used, `alt+w`
 //! close with kill-confirm. `alt+w` and `alt+1..=9` previously drove pane
 //! ops (`close_view`, `focus:<n>`); those actions stay parseable and
@@ -686,7 +688,8 @@ pub enum ChromeAction {
     /// [`DEFAULT_KEYMAPS`].
     FoldCollapse,
     /// Create a fresh workspace and switch to it (`workspace_new`, CTX-0257
-    /// DEC-0034 entry, default chord `alt+n`). The new workspace starts as
+    /// DEC-0034 entry, default chord `alt+t` since CTX-0766 — previously
+    /// `alt+n`, now the new-panel chord). The new workspace starts as
     /// a single idle leaf; no shell spawns until the user splits or types
     /// (lazy spawn is a follow-up).
     WorkspaceNew,
@@ -1192,7 +1195,11 @@ pub const DEFAULT_KEYMAPS: &[(&str, &str)] = &[
     ("ctrl+shift+c", "copy_to_clipboard"),
     ("ctrl+shift+v", "paste_from_clipboard"),
     ("alt+z", "toggle_zoom"),
-    ("alt+n", "workspace_new"),
+    // Owner default: `alt+n` opens a new panel (Niri-style: new column to
+    // the right of the focused leaf; the tiling layout places it), `alt+t`
+    // opens a fresh workspace (CTX-0766).
+    ("alt+n", "new_split:right"),
+    ("alt+t", "workspace_new"),
     ("alt+-", "workspace_prev"),
     ("alt+=", "workspace_next"),
     ("alt+tab", "workspace_last"),
@@ -1755,7 +1762,7 @@ mod tests {
         );
         assert_eq!(
             match_keymap(&maps, key_ref_super(KeyName::Char('n'), false, false)),
-            Some(ChromeAction::WorkspaceNew)
+            Some(ChromeAction::NewSplit(SplitDir::Right))
         );
         assert_eq!(
             match_keymap(&maps, key_ref_super(KeyName::Char('m'), false, false)),
@@ -2374,15 +2381,17 @@ mod tests {
         // (shift+alt+1..=9) = 75, plus CTX-0265's 4 help chords (alt+backtick
         // + 3 alt+? shifted-symbol spellings) = 79 total, plus CTX-0384's 1
         // copy-mode chord (ctrl+shift+space) = 80 total, plus CTX-0383's 1
-        // search chord (ctrl+shift+f) = 81 total, and the full DEC
+        // search chord (ctrl+shift+f) = 81 total, plus CTX-0766's 1 new
+        // workspace chord (alt+t; alt+n becomes new-panel) = 82 total,
+        // and the full DEC
         // set resolves. Zoom chords carry
         // no `alt`, so they must stay unique under Alt and Super alike.
         for mod_key in [ModKey::Alt, ModKey::Super] {
             let maps = default_keymaps_with_mod(mod_key).expect("defaults valid");
             assert_eq!(
                 maps.len(),
-                81,
-                "35 shipped + 4 workspace-entry chords + 4 resize chords + 16 arrow aliases + 7 zoom chords + 9 move chords + 4 help chords + 1 copy-mode chord + 1 search chord"
+                82,
+                "35 shipped + 4 workspace-entry chords + 4 resize chords + 16 arrow aliases + 7 zoom chords + 9 move chords + 4 help chords + 1 copy-mode chord + 1 search chord + 1 CTX-0766 rechord"
             );
             let mut seen = std::collections::HashSet::new();
             for m in &maps {
@@ -2400,9 +2409,10 @@ mod tests {
             assert!(seen.insert(m.id()), "duplicate default id {}", m.id());
         }
         let maps = default_keymaps().expect("defaults valid");
-        // The DEC-0034 entry set resolves through the shipped table.
+        // The DEC-0034 entry set resolves through the shipped table
+        // (CTX-0766: new-workspace moved alt+n -> alt+t).
         let dec: &[(&str, bool, bool, ChromeAction)] = &[
-            ("n", false, false, ChromeAction::WorkspaceNew),
+            ("t", false, false, ChromeAction::WorkspaceNew),
             ("w", false, false, ChromeAction::WorkspaceClose),
             ("-", false, false, ChromeAction::WorkspacePrev),
             ("=", false, false, ChromeAction::WorkspaceNext),
@@ -2419,6 +2429,12 @@ mod tests {
             match_keymap(&maps, key_ref(KeyName::Tab, false, true, false)),
             Some(ChromeAction::WorkspaceLast),
             "alt+tab is last-used workspace"
+        );
+        // CTX-0766: alt+n opens a new panel to the right (Niri-style).
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('n'), false, true, false)),
+            Some(ChromeAction::NewSplit(SplitDir::Right)),
+            "alt+n is new panel"
         );
         // All single-character defaults require a modifier (typing safety).
         for (chord, _) in DEFAULT_KEYMAPS {
@@ -2571,6 +2587,11 @@ mod tests {
         }
         assert_eq!(
             match_keymap(&maps, key_ref_super(KeyName::Char('n'), false, false)),
+            Some(ChromeAction::NewSplit(SplitDir::Right))
+        );
+        // CTX-0766: new-workspace moved super+n -> super+t.
+        assert_eq!(
+            match_keymap(&maps, key_ref_super(KeyName::Char('t'), false, false)),
             Some(ChromeAction::WorkspaceNew)
         );
         assert_eq!(
@@ -2991,14 +3012,14 @@ mod tests {
             let defaults = default_keymaps_with_mod(mod_key).expect("defaults valid");
             assert_eq!(
                 defaults.len(),
-                81,
+                82,
                 "no new shipped defaults under mod {:?}",
                 mod_key
             );
             let maps = resolve_keymaps(&mk_effective(mod_key)).expect("resolves");
             assert_eq!(
                 maps.len(),
-                81 + entries.len(),
+                82 + entries.len(),
                 "explicit binds append, never shadow, under mod {:?}",
                 mod_key
             );

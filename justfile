@@ -156,6 +156,12 @@ install-smoke-test:
 unix-bundle-test:
     ./scripts/tests/make-unix-bundle.test.sh
 
+# Exercise the DMG hdiutil retry loop and the Universal 2 guard on any host
+# (stubs lipo/hdiutil), so a transient macOS-runner `Resource busy` cannot
+# silently become a red release again.
+macos-dmg-test:
+    ./scripts/tests/make-macos-dmg.test.sh
+
 # Install a package in a clean container and run the version/doctor/headless
 # smoke: `just install-smoke ubuntu dist/bitty-x86_64-unknown-linux-gnu.deb`
 install-smoke distro package:
@@ -189,7 +195,7 @@ commit-check message:
     @cp commitlint.config.ts target/dev-tools/commitlint.config.ts
     @msg="$(realpath "{{message}}")" && cd target/dev-tools && bunx --bun commitlint --edit "$msg"
 
-check: fmt-check clippy test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate status-drift status-drift-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test unix-bundle-test rust-channel-test binary-arch-test workflow-publish-test m1-matrix-test compat-matrix-test real-render-soak-test dogfood-session-test actionlint markdownlint
+check: fmt-check clippy test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate status-drift status-drift-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test unix-bundle-test macos-dmg-test rust-channel-test binary-arch-test workflow-publish-test m1-matrix-test compat-matrix-test real-render-soak-test dogfood-session-test actionlint markdownlint
 
 # Parser-throughput baseline (CTX-0576, M1-11). Runs the deterministic
 # headless parser benchmark over the committed VT/escape corpora and verifies

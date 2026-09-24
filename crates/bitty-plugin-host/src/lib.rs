@@ -199,7 +199,11 @@ pub use fs_authz::{
     MAX_FS_PATH_BYTES, SensitivePathPolicy, authorize_fs, content_looks_secret,
     is_literal_scope_pattern,
 };
-pub use grant::{GrantConsent, GrantOrigin, GrantRecord, GrantStore, RevokeReport};
+pub use grant::{
+    GRANTS_FILE_NAME, GRANTS_STATE_VERSION, GrantConsent, GrantOrigin, GrantRecord, GrantStore,
+    MAX_GRANT_HASH_CHARS, MAX_GRANTS_CAPS, MAX_GRANTS_FILE_BYTES, MAX_GRANTS_LINES,
+    MAX_GRANTS_PLUGINS, RevokeReport, grants_path_for,
+};
 pub use host::{HostObservation, PluginHost, SideQueue};
 pub use identity::{EntityKind, Lifetime, MAX_ONTOLOGY_ID_BYTES, OntologyId, Ownership};
 pub use install::{

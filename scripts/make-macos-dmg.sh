@@ -24,6 +24,11 @@ VOLUME_NAME="Bitty"
 # The arm64 slice already requires macOS 11, so the app as a whole does too.
 MINIMUM_MACOS="11.0"
 DRY_RUN=0
+# hdiutil occasionally fails with "Resource busy" on a busy CI runner while a
+# diskimages-helper process still holds the previous device. The archive is
+# reproducible from the same inputs, so a small bounded retry is safe; the
+# final attempt's stderr is what the failure reports.
+HDIUTIL_ATTEMPTS=3
 
 VERSION=""
 ARM64_BIN=""
@@ -157,13 +162,27 @@ fi
 ln -s /Applications "$STAGE/Applications"
 
 mkdir -p "$(dirname "$OUTPUT")"
-hdiutil create \
-	-volname "$VOLUME_NAME" \
-	-srcfolder "$STAGE" \
-	-ov \
-	-format UDZO \
-	-fs HFS+ \
-	"$OUTPUT"
+# Retried boundedly: see HDIUTIL_ATTEMPTS above. Each attempt rebuilds the
+# image from the same staged tree, and `-ov` replaces a partial output.
+hdiutil_attempt=1
+while true; do
+	if hdiutil create \
+		-volname "$VOLUME_NAME" \
+		-srcfolder "$STAGE" \
+		-ov \
+		-format UDZO \
+		-fs HFS+ \
+		"$OUTPUT"; then
+		break
+	fi
+	if [[ "$hdiutil_attempt" -ge "$HDIUTIL_ATTEMPTS" ]]; then
+		die "hdiutil create failed after ${HDIUTIL_ATTEMPTS} attempts: $OUTPUT"
+	fi
+	echo "make-macos-dmg: hdiutil attempt ${hdiutil_attempt} failed; retrying" >&2
+	hdiutil_attempt=$((hdiutil_attempt + 1))
+	rm -f "$OUTPUT"
+	sleep 5
+done
 
 ls -lh "$OUTPUT"
 echo "make-macos-dmg: PASS (version=$VERSION, slices=$ARCHS, output=$OUTPUT)"

@@ -786,12 +786,41 @@ jobs:
               echo "::error::$base bin/bitty missing or not executable" >&2
               exit 1
             fi
-            output="$("$exe" --version)"
-            echo "bitty --version => $output"
-            if [[ "$output" != *"$version"* ]]; then
-              echo "::error::version mismatch: bundle $version, binary $output" >&2
-              exit 1
-            fi
+            # The matrix carries aarch64 bundles, and this gate runs on one
+            # x86_64 runner. Executing a foreign-arch binary fails with 126
+            # (Exec format error) and says nothing about the archive, so only
+            # the host-native target is run; every target is still checked for
+            # ELF machine and interpreter by the repo-owned inspector.
+            # Strip the leading "bitty-<version>-" to recover the full target
+            # triple; `${base##*-}` would only drop the final segment and
+            # leave a bare "gnu"/"musl". The inner expansion is quoted so it is
+            # matched literally rather than treated as a glob pattern.
+            target="${base#"bitty-${version}-"}"
+            case "$target" in
+              x86_64-unknown-linux-gnu | x86_64-unknown-linux-musl)
+                output="$("$exe" --version)"
+                echo "bitty --version => $output"
+                if [[ "$output" != *"$version"* ]]; then
+                  echo "::error::version mismatch: bundle $version, binary $output" >&2
+                  exit 1
+                fi
+                ;;
+              *)
+                case "$target" in
+                  aarch64-unknown-linux-gnu) arch=aarch64 ;;
+                  *)
+                    echo "::error::unknown bundle target: $target" >&2
+                    exit 1
+                    ;;
+                esac
+                if ! bash scripts/check-binary-arch.sh \
+                  --binary "$exe" --arch "$arch"; then
+                  echo "::error::$base binary is not a valid $arch ELF" >&2
+                  exit 1
+                fi
+                echo "$base: $arch ELF verified (not executed: foreign arch on this runner)"
+                ;;
+            esac
             rm -rf "$dest"
           done
 

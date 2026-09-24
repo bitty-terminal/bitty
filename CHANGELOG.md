@@ -7,6 +7,103 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.21] - 2026-09-24
+
+### Release highlights
+
+- **Plugin services backend (CTX-0767, #1379):** the accepted v1
+  consumer/provider contract is wired — the bridge delegates
+  `bitty.services.get`/`provide` to `HostServices` (shape checks, opts
+  parsing, provide capture, per-method closures pinning provider and
+  generation) and `PluginServices` resolves against the caller manifest plus
+  a live runtime `ServiceDirectory` with schema-validated cross-VM calls.
+  Resolution is deterministic (highest satisfying version, provider-id
+  tie-break); failures are typed (`E_SERVICE_RESOLUTION`,
+  `E_SERVICE_UNDECLARED`, `E_SERVICE_INVALID`, `E_SERVICE_FAILED`,
+  `E_SERVICE_GONE`); activation publishes, suspend parks, resume restores,
+  and dispose/reload revokes.
+- **Plugin platform wave:** manifest inline-table forms for dependencies,
+  service schemas, and lazy commands (CTX-0764) on top of the string-form
+  wiring for `[dependencies]`/`[services.*]` (CTX-0760); grant store
+  persistence with CLI/manager revocation (CTX-0765); fail-closed
+  `[network]`/`[limits]` manifest sections (CTX-0739); the `plugins` Lua
+  surface plus keymap docs (CTX-0737); candidate `project.toml` schema kernel
+  (CTX-0730); two-phase wheel discovery where a nested `.agents` never shadows
+  an ancestor `.wheel` (CTX-0726); the Leader key binding contract (CTX-0715);
+  the env grant gate with the runtime error taxonomy and secret-tier hooks
+  (CTX-0330); RUN kernels wired to live paths (CTX-0720); candidate
+  trust/identity/secrets/roles kernels (CTX-0711) with adopted SEC seams at
+  live boundaries (CTX-0719); `authorize_effective` routed through the
+  trust/role gates (CTX-0728); and plugin-host secret tier mechanisms with the
+  provider credential schema (CTX-0734).
+- **Lua parity freeze point (CTX-0707):** keymaps/tasks/services/env parity
+  with the `spawn` v1-OUT ruling — the revision the plugin SDK freezes its
+  generation pipeline on for this release.
+- **CLI contract v1 gaps closed (CTX-0763):** `bitty version` (table plus
+  `--format json`/`jsonl`), `bitty completion`, `bitty cmd`, and `bitty x`
+  with stable `cfg`/`comp` aliases; accepted v1 plugin-runtime methods
+  registered on the debug server (CTX-0762).
+- **Workspace and panel operations:** the workspace switcher bar with mouse
+  switching, rename, and move-panel verbs (CTX-0740); `Mod+N` opens a new
+  panel and `Mod+T` a new workspace (CTX-0766); `Alt+N` clamps to the last
+  workspace (CTX-0758); the shipped `decoration.border` default synced to 1
+  (CTX-0761); single-parent profile `extends` chains resolve (CTX-0759); the
+  PW panel series — identity, persist, guard, bar, Lua, tabs (CTX-0684); U-7
+  panel state axes with declarative rehydration (CTX-0672) and the U-8
+  CommandBlockProvider (CTX-0675); provider routable envelope, session
+  reconfirm, bus v1, and naming (CTX-0721).
+- **Input correctness:** the Kitty CSI-u encoding subset gap closed (CTX-0755);
+  shell exit hangs and dead `Ctrl+C` fixed (CTX-0752); the paste-confirm gate
+  no longer traps `Esc`/`Ctrl+D`/zoom (CTX-0742).
+- **Render and grid correctness:** in-grid status bar row (CTX-0748); split
+  tiling locked with headless regression (CTX-0745); mouse drag-resize on
+  borders (CTX-0747); starship/vim-mode prompt stability guards (CTX-0749);
+  content padding pinned (CTX-0753); Leader hint overlay painted from the
+  armed session (CTX-0751); default panel border thinned to 1px (CTX-0746);
+  Kitty first-paint crop plus XTWINOPS probe (CTX-0744); selection dropped on
+  grid-erasing ED (CTX-0741); wheel-scroll alt-screen fail-closed with focused
+  scroll bounds (CTX-0743); fail-closed OS delivery for bell plus desktop
+  notifications (CTX-0754); cursor style/blink and bell Lua surface (CTX-0756);
+  OSC 5522 recorded as a permanent non-goal with a regression lock (CTX-0757).
+- **Rich presentation in the render path:** the Rich Scene consumed via
+  `PanelRuntime` (CTX-0736) with fold/hint/composer wired into the live input
+  path (CTX-0723) and CW present wiring for fold/hint/composer/anchor/rich
+  (CTX-0687).
+- **Accessibility baseline (CTX-0693):** announcements, settings, hot path,
+  and the `SessionId` decision.
+- **Compatibility evidence:** M1-29 vertical-slice review gates A1-A9
+  (CTX-0689); PB-3 typical-session and PB-6 throughput-floor evidence
+  (CTX-0676); PB-4 latency with harness pins (CTX-0686); PB-7 ten-minute idle
+  soak (CTX-0699); the compat release-matrix automation (CTX-0692); PB-2 idle
+  RSS real-window evidence (CTX-0694).
+- **DevTools DT batch 2 (CTX-0685):** hardening, contract, MCP adapter, and
+  A3 end-to-end.
+- **Execution/RUN batches:** analysis batch — risk class, sensitive input,
+  lease, supervisor (CTX-0678); OQ batch verdict seams with audit names
+  (CTX-0710); CW status/provider/bus/host/placement contracts (CTX-0688).
+- **Bittie mascot splash slice (CTX-0729):** `--mascot`/`--no-splash` with a
+  first-run marker; ASCII portrait header in `main.rs`.
+- **Docs sync:** pre-0.0.21 configuration options inventory and shipped
+  leader/close-confirm/inline-palette keys (terminal-docs #115/#116, new docs
+  pin); plugin SDK/template/Lua readiness recon (CTX-0705); SEC closure batch
+  evidence with R-014/R-015/R-022 verified (CTX-0680); small-batch closure
+  evidence (CTX-0691); DOC-05 close plus SEC-19 Phase E evidence (CTX-0701);
+  M1 scope decisions — quake, tabs, multiwindow, Kitty extensions, ligature,
+  BiDi (CTX-0677); UX decision batch adopting ActivityStack and deferring
+  seven blocked items (CTX-0679).
+- **Repository and CI:** `CODEOWNERS` added; rustc warnings denied on
+  workspace build/check steps (CTX-0697); `ed25519-dalek` 2.2.0 -> 3.0.0.
+
+### Release engineering
+
+- Workspace version bumped `0.0.20 -> 0.0.21`, applied to `Cargo.toml`,
+  `Cargo.lock`, internal `path` dependency pins, `packaging/PKGBUILD*`
+  `pkgver`, `nfpm.yaml`, and the `flake.nix` fallback.
+  `scripts/check-release-version.sh --tag v0.0.21` keeps `bitty --version`,
+  packaging metadata, and the release tag in agreement.
+- Docs pin advanced to the pre-0.0.21 inventory
+  (`c679936` -> `a1e7cea`; terminal-docs #115/#116/#117/#119/#120/#121).
+
 ### Added
 
 - **CLI contract v1 gaps closed (CTX-0763, #1375):**

@@ -37,7 +37,12 @@ jobs:
       - name: Cache apt archives
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: /var/cache/apt/archives
+          # Glob only the .deb files: caching the directory itself makes the
+          # post-job save walk into /var/cache/apt/archives/partial, which
+          # `apt-get install` recreates as root while downloading. tar then
+          # fails with "Cannot open: Permission denied" and emits a cache-save
+          # warning. In-progress downloads are not worth caching anyway.
+          path: /var/cache/apt/archives/*.deb
           key: ${{ runner.os }}-apt-${{ hashFiles('.github/workflows/ci.yml') }}
           restore-keys: |
             ${{ runner.os }}-apt-
@@ -173,7 +178,12 @@ jobs:
       - name: Cache apt archives
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: /var/cache/apt/archives
+          # Glob only the .deb files: caching the directory itself makes the
+          # post-job save walk into /var/cache/apt/archives/partial, which
+          # `apt-get install` recreates as root while downloading. tar then
+          # fails with "Cannot open: Permission denied" and emits a cache-save
+          # warning. In-progress downloads are not worth caching anyway.
+          path: /var/cache/apt/archives/*.deb
           key: ${{ runner.os }}-apt-${{ hashFiles('.github/workflows/ci.yml') }}
           restore-keys: |
             ${{ runner.os }}-apt-
@@ -226,7 +236,12 @@ jobs:
       - name: Cache apt archives
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: /var/cache/apt/archives
+          # Glob only the .deb files: caching the directory itself makes the
+          # post-job save walk into /var/cache/apt/archives/partial, which
+          # `apt-get install` recreates as root while downloading. tar then
+          # fails with "Cannot open: Permission denied" and emits a cache-save
+          # warning. In-progress downloads are not worth caching anyway.
+          path: /var/cache/apt/archives/*.deb
           key: ${{ runner.os }}-apt-${{ hashFiles('.github/workflows/ci.yml') }}
           restore-keys: |
             ${{ runner.os }}-apt-
@@ -322,7 +337,12 @@ jobs:
       - name: Cache apt archives
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: /var/cache/apt/archives
+          # Glob only the .deb files: caching the directory itself makes the
+          # post-job save walk into /var/cache/apt/archives/partial, which
+          # `apt-get install` recreates as root while downloading. tar then
+          # fails with "Cannot open: Permission denied" and emits a cache-save
+          # warning. In-progress downloads are not worth caching anyway.
+          path: /var/cache/apt/archives/*.deb
           key: ${{ runner.os }}-apt-${{ hashFiles('.github/workflows/ci.yml') }}
           restore-keys: |
             ${{ runner.os }}-apt-

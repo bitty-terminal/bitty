@@ -2126,9 +2126,16 @@ mod tests {
             match_keymap(&maps, shell(KeyName::Char('9'), false, true, false)),
             Some(bitty_config::ChromeAction::WorkspaceFocus(9))
         );
-        // CTX-0257 DEC entry set: new/close/prev/next/last.
+        // CTX-0257 DEC entry set: new/close/prev/next/last
+        // (CTX-0766: new-workspace moved alt+n -> alt+t; alt+n is new panel).
         assert_eq!(
             match_keymap(&maps, shell(KeyName::Char('n'), false, true, false)),
+            Some(bitty_config::ChromeAction::NewSplit(
+                bitty_config::SplitDir::Right
+            ))
+        );
+        assert_eq!(
+            match_keymap(&maps, shell(KeyName::Char('t'), false, true, false)),
             Some(bitty_config::ChromeAction::WorkspaceNew)
         );
         assert_eq!(

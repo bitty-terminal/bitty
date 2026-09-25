@@ -51,6 +51,8 @@ pollster = "1.0"
 # no build script, no network/I/O). Pinned to the 2.x line: the 3.x major
 # is new and buys nothing here; re-evaluate on a dated ADR-0004 revision.
 ed25519-dalek = "3"
+rustix = { version = "1.1.4", default-features = false }
+nix = { version = "0.28.0", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

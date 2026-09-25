@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Socket + in-process profiling proof over the devtools surface (CTX-0189).
 //!
 //! Amendment A1 (proposed, bitty-docs CTX-0124) live-profiling scope:
@@ -23,11 +25,12 @@
 //!   `untrusted-observation` labeling on frame responses.
 //! - Socket-level proof over a real Unix socket (CTX-0183 harness pattern).
 //!
-//! Headless and Unix-gated for the socket proofs; the in-process proofs run
-//! anywhere. Profiling shares the process-global store, so every test holds
-//! the file-local serial guard (CTX-0179 pattern; std-only, no extra
-//! dev-dependency) and clears profiling before and after.
+//! Headless and Unix-gated because the production dispatch proof requires an
+//! accepted Unix stream. Profiling shares the process-global store, so every
+//! test holds the file-local serial guard (CTX-0179 pattern; std-only, no
+//! extra dev-dependency) and clears profiling before and after.
 
+use std::os::unix::net::UnixStream;
 use std::sync::{Mutex, OnceLock};
 
 use bitty_ipc::devtools::{
@@ -71,7 +74,10 @@ fn trace_scopes() -> ScopeSet {
 }
 
 fn context_with(granted: ScopeSet) -> ServeContext {
-    ServeContext::with_granted_session(&test_server(), granted, "prof-sess")
+    let (_client, stream) = UnixStream::pair().unwrap();
+    let mut context = ServeContext::with_granted_session(&test_server(), granted, "prof-sess");
+    context.bind_connected_stream_current(&stream).unwrap();
+    context
 }
 
 fn envelope(id: u64, method: &str, params: Option<&str>) -> Vec<u8> {
@@ -500,8 +506,7 @@ mod socket {
 
     use bitty_ipc::devtools::{
         Dispatcher, ServeContext, ServerInfo, attest_bound_socket, clear_profiling_for_tests,
-        prepare_socket_dir, publish_frame_stats, publish_process_stats, serve_connection,
-        transport_attested_peer,
+        prepare_socket_dir, publish_frame_stats, publish_process_stats, serve_bound_connection,
     };
     use bitty_ipc::frame::{MAX_FRAME_BYTES, encode_frame};
     use bitty_ipc::limits::RateLimiter;
@@ -579,11 +584,12 @@ mod socket {
                 .unwrap();
             let dir = prepare_socket_dir(&socket_path).unwrap();
             let runtime_uid = attest_bound_socket(&socket_path, &dir).unwrap();
-            let verified = transport_attested_peer(&socket_path, runtime_uid).unwrap();
             let dispatcher = Dispatcher::with_defaults();
             let server =
                 ServerInfo::new("profiling-proof".to_string(), socket_path.clone(), 80, 24);
-            let context = ServeContext::with_granted_session(&server, granted, "prof-sock");
+            let mut context = ServeContext::with_granted_session(&server, granted, "prof-sock");
+            let proof = context.bind_connected_stream(&stream, runtime_uid).unwrap();
+            context.attest_local_peer(&proof.identity());
             let mut limiter = RateLimiter::rc9_default();
             let clock = || {
                 SystemTime::now()
@@ -591,9 +597,9 @@ mod socket {
                     .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
                     .unwrap_or(0)
             };
-            let stats = serve_connection(
+            let stats = serve_bound_connection(
                 &mut stream,
-                verified,
+                &proof,
                 &dispatcher,
                 &context,
                 &mut limiter,

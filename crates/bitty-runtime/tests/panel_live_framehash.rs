@@ -361,7 +361,7 @@ fn framehash_socket_roundtrip_matches_runtime_frame() {
         AutomationFamily, Dispatcher, ServeContext, ServerInfo, attest_bound_socket,
         clear_automation_for_tests, clear_introspection_for_tests,
         issue_automation_bearer_with_ttl, prepare_socket_dir, publish_frame_rgba,
-        publish_grid_text, serve_connection, transport_attested_peer,
+        publish_grid_text, serve_bound_connection,
     };
     use bitty_ipc::frame::{MAX_FRAME_BYTES, encode_frame};
     use bitty_ipc::limits::RateLimiter;
@@ -425,13 +425,14 @@ fn framehash_socket_roundtrip_matches_runtime_frame() {
             .expect("timeout");
         let dir = prepare_socket_dir(&socket_path).expect("re-prepare");
         let runtime_uid = attest_bound_socket(&socket_path, &dir).expect("attest");
-        let verified = transport_attested_peer(&socket_path, runtime_uid).expect("verify");
         let dispatcher = Dispatcher::with_defaults();
         let info = ServerInfo::new("panel-live-proof".to_string(), socket_path.clone(), 80, 24);
         let mut context =
             ServeContext::with_granted_session(&info, server_scopes, "panel-live-proof");
-        // CTX-0528/IPC-001: the mark is bound to the verified marker.
-        context.attest_local_peer(&verified);
+        let proof = context
+            .bind_connected_stream(&stream, runtime_uid)
+            .expect("bind peer");
+        context.attest_local_peer(&proof.identity());
         let mut limiter = RateLimiter::rc9_default();
         let clock = || {
             SystemTime::now()
@@ -439,9 +440,9 @@ fn framehash_socket_roundtrip_matches_runtime_frame() {
                 .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
                 .unwrap_or(0)
         };
-        let stats = serve_connection(
+        let stats = serve_bound_connection(
             &mut stream,
-            verified,
+            &proof,
             &dispatcher,
             &context,
             &mut limiter,

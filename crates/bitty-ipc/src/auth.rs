@@ -25,11 +25,11 @@
 //! or SSH forwarding would leak (R-012, P0-AC-023 parity). Expiry is enforced
 //! server-side; a replayed token after expiry fails closed.
 //!
-//! This module is **headless, bounded, and `forbid(unsafe)`**. Real
-//! `getsockopt(SO_PEERCRED)` and `GetNamedPipeClientProcessId` calls require
-//! `unsafe` and live in the runtime/platform seam; this crate exposes only
-//! pure, bounded verification over already-extracted credentials so tests run
-//! on any host without a live socket.
+//! This module is **bounded and `forbid(unsafe)`**. The platform adapter uses
+//! safe `rustix` or `nix` calls to obtain credentials from the connected Unix
+//! stream; this module verifies the extracted triple and retains only the
+//! sanitized UID marker. Windows named-pipe verification remains an explicit
+//! unsupported result until a safe platform adapter is supplied.
 
 use crate::error::IpcError;
 use crate::scope::Scope;
@@ -56,41 +56,28 @@ pub const MAX_CHILD_TOKENS: usize = 64;
 
 // ── peer credentials ────────────────────────────────────────────────────────
 
-/// Extracted peer credentials (headless, owned).
+/// Extracted peer credentials (owned and bounded).
 ///
-/// In production the runtime obtains these via `SO_PEERCRED` / `LOCAL_PEERCRED`
-/// on the accepted `UnixStream` (which requires `unsafe` in the platform
-/// seam). This crate only verifies the already-extracted triple, keeping the
-/// crate `forbid(unsafe)` and headless-testable.
+/// The target-specific adapter obtains these from the connected `UnixStream`
+/// through a safe platform API. This module verifies the extracted triple and
+/// keeps credential bytes out of the serving path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PeerCredentials {
-    /// User ID of the peer (connecting process).
-    pub uid: u32,
-    /// Group ID of the peer.
-    pub gid: u32,
-    /// Process ID of the peer (0 when not available, e.g. macOS `getpeereid` only gives euid/egid).
-    pub pid: i32,
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) struct PeerCredentials {
+    uid: u32,
+    gid: u32,
+    pid: i32,
 }
 
 impl PeerCredentials {
-    /// Create credentials for tests (headless).
-    #[must_use]
-    pub fn new(uid: u32, gid: u32, pid: i32) -> Self {
+    #[cfg(test)]
+    pub(crate) fn new(uid: u32, gid: u32, pid: i32) -> Self {
         Self { uid, gid, pid }
     }
 
-    /// Current process credentials (caller's own UID/GID/PID) — headless helper.
-    ///
-    /// Uses `std::process::id` for pid; uid/gid are 0 on non-Unix or when
-    /// unavailable without `unsafe` — callers on Unix that need real uid
-    /// should supply it from `nix::unistd::getuid` in the runtime seam.
-    #[must_use]
-    pub fn current() -> Self {
-        Self {
-            uid: 0,
-            gid: 0,
-            pid: std::process::id() as i32,
-        }
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn from_platform(uid: u32, gid: u32, pid: i32) -> Self {
+        Self { uid, gid, pid }
     }
 }
 
@@ -106,7 +93,8 @@ impl PeerCredentials {
 /// # Errors
 ///
 /// Returns `IpcError::Unauthenticated` when UIDs differ.
-pub fn verify_peer_uid(peer: PeerCredentials, expected_uid: u32) -> Result<(), IpcError> {
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn verify_peer_uid(peer: PeerCredentials, expected_uid: u32) -> Result<(), IpcError> {
     if peer.uid == expected_uid {
         Ok(())
     } else {
@@ -122,46 +110,23 @@ pub fn verify_peer_uid(peer: PeerCredentials, expected_uid: u32) -> Result<(), I
 /// Pre-verified peer marker: proof that UID equality was checked at the
 /// accept boundary before any request byte was parsed.
 ///
-/// The inner field is private so callers cannot forge it: the only
-/// constructors are [`verify_peer_for_connection`] (for `SO_PEERCRED` /
-/// `LOCAL_PEERCRED` triples) and the crate-private [`VerifiedPeer::attested`]
-/// (for the kernel-gated `0600` transport where only the owner could have
-/// connected; it re-runs the same UID-equality check instead of trusting its
-/// inputs). It carries no credential bytes itself — only the attested UID —
-/// so downstream serving and logging paths handle only this sanitized marker
-/// and never `PeerCredentials`-typed values (CodeQL `cleartext logging of
-/// sensitive information` stays clean by construction: credential dataflow
-/// ends at the accept boundary).
+/// The inner field is private so callers cannot forge it. Platform adapters
+/// construct it only through [`verify_peer_for_connection`] after querying the
+/// connected descriptor; a crate-private test constructor covers legacy
+/// endpoint fixtures. It carries no credential bytes itself — only the
+/// attested UID — so downstream serving and logging paths handle only this
+/// sanitized marker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct VerifiedPeer {
     peer_uid: u32,
 }
 
 impl VerifiedPeer {
-    /// Accept-boundary attestation for the kernel-gated owner-only transport.
+    /// Test-only constructor for endpoint compatibility fixtures.
     ///
-    /// Contract (enforced, not trusted): `peer` must equal `runtime_uid`.
-    /// That holds for the servo's owner-only (`0600`) socket file: the kernel
-    /// refuses `connect` from any other UID with `EACCES` before userspace
-    /// runs. The constructor re-verifies UID equality fail-closed and binds
-    /// the UID into the marker, so markers minted for different UIDs are
-    /// never equal and an unverified peer can never compare as attested.
-    /// No credential bytes are retained.
-    ///
-    /// Crate-private so only the accept boundary (`transport_attested_peer`)
-    /// can mint it: downstream crates must obtain the marker through
-    /// verification, never by naming a UID.
-    ///
-    /// # Errors
-    ///
-    /// Returns `IpcError::Unauthenticated` when UIDs differ.
-    ///
-    /// The only non-test caller is the `#[cfg(unix)]`
-    /// `transport_attested_peer` (the non-unix stub fails closed without
-    /// minting), so on non-unix targets the lib unit sees no caller — the
-    /// scoped allow keeps the `-D warnings` gate green there without
-    /// weakening it anywhere else.
-    #[cfg_attr(not(unix), allow(dead_code))]
+    /// The constructor re-verifies UID equality and is not compiled into the
+    /// production library.
+    #[cfg(test)]
     pub(crate) fn attested(peer: PeerCredentials, runtime_uid: u32) -> Result<Self, IpcError> {
         verify_peer_uid(peer, runtime_uid)?;
         Ok(Self {
@@ -186,7 +151,8 @@ impl VerifiedPeer {
 /// # Errors
 ///
 /// Returns `IpcError::Unauthenticated` when UIDs differ.
-pub fn verify_peer_for_connection(
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn verify_peer_for_connection(
     peer: PeerCredentials,
     expected_uid: u32,
 ) -> Result<VerifiedPeer, IpcError> {
@@ -206,7 +172,8 @@ pub fn verify_peer_for_connection(
 ///
 /// If any check fails, the endpoint must refuse to serve and exit the
 /// endpoint rather than falling back to an unauthenticated path (fail-closed).
-pub fn verify_unix_endpoint(
+#[cfg(test)]
+pub(crate) fn verify_unix_endpoint(
     runtime_uid: u32,
     peer: PeerCredentials,
     dir_mode: u32,
@@ -249,7 +216,8 @@ pub fn verify_unix_endpoint(
 /// equality as `u64` comparison for headless tests. Real Windows verification
 /// uses `GetNamedPipeClientProcessId` plus token SID comparison in the
 /// platform seam (requires `unsafe` there, not here).
-pub fn verify_windows_pipe(peer_sid: u64, runtime_sid: u64) -> Result<(), IpcError> {
+#[cfg(test)]
+pub(crate) fn verify_windows_pipe(peer_sid: u64, runtime_sid: u64) -> Result<(), IpcError> {
     if peer_sid == runtime_sid {
         Ok(())
     } else {
@@ -674,10 +642,8 @@ mod tests {
         let foreign = PeerCredentials::new(2000, 2000, 99);
         let err = verify_peer_for_connection(foreign, 1000).unwrap_err();
         assert!(matches!(err, IpcError::Unauthenticated { .. }));
-        // Attested transport produces a marker without credential bytes.
-        // CTX-0528 (IPC-001): the marker is only mintable after endpoint
-        // verification (see `transport_attested_peer`), never by trusting a
-        // bare UID value — the endpoint check is the gate, not this call.
+        // The test-only constructor also validates its inputs; production
+        // markers come from the real connected-stream adapter.
         let attested = VerifiedPeer::attested(good, 1000).unwrap();
         let verified = verify_peer_for_connection(good, 1000).unwrap();
         assert_eq!(attested, verified);
@@ -695,10 +661,8 @@ mod tests {
         assert_eq!(other_verified.peer_uid(), 2000);
     }
 
-    /// CTX-0528 (IPC-001): the endpoint-proxy marker must be unsatisfiable
-    /// by endpoint ownership alone — a foreign UID fails the headless
-    /// primitive before any byte is minted, mirroring the
-    /// `transport_attested_peer` gate.
+    /// CTX-0528 (IPC-001): a marker cannot be minted from endpoint ownership
+    /// alone; a foreign UID fails before any byte is served.
     #[test]
     fn ipc001_attested_marker_requires_uid_equality() {
         let foreign = PeerCredentials::new(2000, 2000, 99);

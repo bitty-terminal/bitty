@@ -37,9 +37,9 @@
 //! # Trust binding at this wiring site (CTX-0421 review outcome)
 //!
 //! - Snapshot/tools/execution dispatches take server-evaluated [`ScopeSet`](bitty_ipc::ScopeSet)
-//!   and server-clock `now_ms`; the IPC half binds them via
-//!   [`HostCaller`](bitty_ipc::HostCaller), which has no caller-scopes and
-//!   no caller-clock field to smuggle through.
+//!   and server-clock `now_ms`; the production host bridge does not expose a
+//!   caller-supplied authority constructor. The crate-test-only host caller
+//!   fixture rejects process authority and is not dispatchable.
 //! - The Lua/plugin path binds `client_id` to the installed plugin identity
 //!   (verified at install/activation, never caller-asserted), the clock to
 //!   the server `now_ms()`, and scopes to the activation grant snapshot.

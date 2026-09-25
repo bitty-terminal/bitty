@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Programmatic GUI-verification harness over the devtools socket (CTX-0183).
 //!
 //! Owner direction: replace ydotool/screenshot/polling live proofs with
@@ -33,8 +35,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use bitty_ipc::devtools::{
     Dispatcher, FocusPublish, InputEventPublish, ModifiersPublish, ServeContext, ServerInfo,
     attest_bound_socket, clear_introspection_for_tests, prepare_socket_dir, publish_focus,
-    publish_grid_text, publish_input_ring, publish_modifiers, serve_connection,
-    transport_attested_peer,
+    publish_grid_text, publish_input_ring, publish_modifiers, serve_bound_connection,
 };
 use bitty_ipc::frame::{MAX_FRAME_BYTES, encode_frame};
 use bitty_ipc::limits::RateLimiter;
@@ -144,10 +145,11 @@ fn spawn_verify_server(socket_path: String, granted: ScopeSet) -> std::thread::J
             .unwrap();
         let dir = prepare_socket_dir(&socket_path).unwrap();
         let runtime_uid = attest_bound_socket(&socket_path, &dir).unwrap();
-        let verified = transport_attested_peer(&socket_path, runtime_uid).unwrap();
         let dispatcher = Dispatcher::with_defaults();
         let server = ServerInfo::new("verify".to_string(), socket_path.clone(), 80, 24);
-        let context = ServeContext::with_granted(&server, granted);
+        let mut context = ServeContext::with_granted(&server, granted);
+        let proof = context.bind_connected_stream(&stream, runtime_uid).unwrap();
+        context.attest_local_peer(&proof.identity());
         let mut limiter = RateLimiter::rc9_default();
         let clock = || {
             SystemTime::now()
@@ -155,9 +157,9 @@ fn spawn_verify_server(socket_path: String, granted: ScopeSet) -> std::thread::J
                 .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
                 .unwrap_or(0)
         };
-        let stats = serve_connection(
+        let stats = serve_bound_connection(
             &mut stream,
-            verified,
+            &proof,
             &dispatcher,
             &context,
             &mut limiter,

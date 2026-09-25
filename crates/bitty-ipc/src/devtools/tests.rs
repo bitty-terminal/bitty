@@ -1,4 +1,8 @@
 use super::handlers::{live_input_store, parse_optional_uint_param};
+#[cfg(unix)]
+use super::serve::{
+    serve_bound_connection_with_test_identity, serve_connection, transport_attested_peer,
+};
 use super::*;
 #[cfg(unix)]
 use crate::auth::DIR_MODE;
@@ -7,9 +11,15 @@ use crate::error::IpcError;
 use crate::frame::{MAX_FRAME_BYTES, encode_frame};
 #[cfg(unix)]
 use crate::limits::RateLimiter;
+#[cfg(unix)]
+use crate::peer::StreamIdentity;
 use crate::wire::MAX_JSON_DEPTH;
 #[cfg(unix)]
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 
 fn test_server_info() -> ServerInfo {
@@ -26,7 +36,7 @@ fn test_context() -> ServeContext {
     // tests model a peer that has been granted `debug.inspect`.
     let mut granted = crate::scope::ScopeSet::cli_default();
     granted.insert(crate::scope::Scope::DebugInspect);
-    ServeContext::with_granted(&test_server_info(), granted)
+    ServeContext::with_granted_for_tests(&test_server_info(), granted)
 }
 
 // ── socket path ─────────────────────────────────────────────────────
@@ -613,6 +623,343 @@ fn serve_path_takes_verified_marker_only() {
     drop(client);
     let stats = handle.join().unwrap().unwrap();
     assert_eq!(stats.requests, 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn connected_peer_initial_mismatch_is_rejected_before_read() {
+    use std::collections::VecDeque;
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    let peer = crate::auth::verify_peer_for_connection(
+        crate::auth::PeerCredentials::new(1000, 1000, 1),
+        1000,
+    )
+    .unwrap();
+    let foreign = crate::auth::verify_peer_for_connection(
+        crate::auth::PeerCredentials::new(2000, 2000, 2),
+        1000,
+    );
+    let (_client, mut server) = UnixStream::pair().unwrap();
+    server
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    let sequence = Arc::new(Mutex::new(VecDeque::from([Ok(peer), foreign])));
+    let mut context = ServeContext::new(&test_server_info());
+    context
+        .bind_connected_stream_for_test(&server, move |_| {
+            sequence
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Err(IpcError::Unavailable {
+                    reason: "peer fixture exhausted".into(),
+                }))
+        })
+        .unwrap();
+    let dispatcher = Dispatcher::with_defaults();
+    let mut limiter = RateLimiter::rc9_default();
+    let clock = || 0u64;
+    let result = serve_connection(
+        &mut server,
+        peer,
+        &dispatcher,
+        &context,
+        &mut limiter,
+        &clock,
+    );
+    assert!(matches!(result, Err(IpcError::Unauthenticated { .. })));
+}
+
+#[cfg(unix)]
+#[test]
+fn connected_peer_binding_rejects_identity_replacement() {
+    use std::collections::VecDeque;
+    use std::os::unix::net::UnixStream;
+
+    let peer = crate::auth::verify_peer_for_connection(
+        crate::auth::PeerCredentials::new(1000, 1000, 1),
+        1000,
+    )
+    .unwrap();
+    let foreign = crate::auth::verify_peer_for_connection(
+        crate::auth::PeerCredentials::new(2000, 2000, 2),
+        2000,
+    )
+    .unwrap();
+    let (_client, server) = UnixStream::pair().unwrap();
+    let sequence = Arc::new(Mutex::new(VecDeque::from([Ok(peer), Ok(foreign)])));
+    let mut context = ServeContext::new(&test_server_info());
+    context
+        .bind_connected_stream_for_test(&server, move |_| {
+            sequence.lock().unwrap().pop_front().unwrap()
+        })
+        .unwrap();
+    let err = context.recheck_before_dispatch().unwrap_err();
+    assert!(matches!(err, IpcError::Unauthenticated { .. }));
+}
+
+#[cfg(unix)]
+#[test]
+fn bound_connection_rejects_a_different_accepted_stream() {
+    use std::os::unix::net::UnixStream;
+
+    let (_client_a, stream_a) = UnixStream::pair().unwrap();
+    let (_client_b, mut stream_b) = UnixStream::pair().unwrap();
+    let mut context = ServeContext::new(&test_server_info());
+    let proof = context.bind_connected_stream_current(&stream_a).unwrap();
+    let dispatcher = Dispatcher::with_defaults();
+    let mut limiter = RateLimiter::rc9_default();
+    let clock = || 0u64;
+    let err = serve_bound_connection(
+        &mut stream_b,
+        &proof,
+        &dispatcher,
+        &context,
+        &mut limiter,
+        &clock,
+    )
+    .unwrap_err();
+    assert!(matches!(err, IpcError::Unauthenticated { .. }));
+}
+
+#[cfg(unix)]
+const FD_REUSE_ATTEMPT_BUDGET: usize = 64;
+#[cfg(unix)]
+const FD_REUSE_TIME_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
+
+#[cfg(unix)]
+fn bounded_fd_reuse(
+    original_fd: std::os::fd::RawFd,
+) -> Option<(
+    std::os::unix::net::UnixStream,
+    std::os::unix::net::UnixStream,
+)> {
+    let deadline = std::time::Instant::now() + FD_REUSE_TIME_BUDGET;
+    for _ in 0..FD_REUSE_ATTEMPT_BUDGET {
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        let candidate = std::os::unix::net::UnixStream::pair().ok()?;
+        if candidate.0.as_raw_fd() == original_fd {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+#[test]
+fn bound_connection_rejects_fd_reuse_for_a_different_stream() {
+    use std::os::unix::net::UnixStream;
+
+    let (_client_a, stream_a) = UnixStream::pair().unwrap();
+    let original_fd = stream_a.as_raw_fd();
+    let mut context = ServeContext::new(&test_server_info());
+    let proof = context.bind_connected_stream_current(&stream_a).unwrap();
+    drop(stream_a);
+
+    let dispatcher = Dispatcher::with_defaults();
+    let mut limiter = RateLimiter::rc9_default();
+    let clock = || 0u64;
+    let result = if let Some((mut replacement, _replacement_peer)) = bounded_fd_reuse(original_fd) {
+        serve_bound_connection(
+            &mut replacement,
+            &proof,
+            &dispatcher,
+            &context,
+            &mut limiter,
+            &clock,
+        )
+    } else {
+        let (mut replacement, _replacement_peer) = UnixStream::pair().unwrap();
+        let original_identity = proof.stream_identity_for_test();
+        let synthetic_identity = StreamIdentity {
+            device: original_identity.device,
+            inode: original_identity.inode.wrapping_add(1),
+        };
+        serve_bound_connection_with_test_identity(
+            &mut replacement,
+            &proof,
+            &dispatcher,
+            &context,
+            &mut limiter,
+            &clock,
+            |_| Ok(synthetic_identity),
+        )
+    };
+    assert!(matches!(result, Err(IpcError::Unauthenticated { .. })));
+}
+
+#[test]
+fn replaced_ping_and_test_info_still_require_connected_peer() {
+    fn custom_handler(
+        _context: &ServeContext,
+        _request: &DevtoolsRequest,
+    ) -> Result<String, HandlerError> {
+        Ok("{\"custom\":true}".to_string())
+    }
+
+    let mut dispatcher = Dispatcher::with_test_mode();
+    dispatcher
+        .register("bitty.debug/ping", custom_handler)
+        .unwrap();
+    dispatcher
+        .register("bitty.debug/testInfo", custom_handler)
+        .unwrap();
+    let context = ServeContext::with_granted(&test_server_info(), crate::scope::ScopeSet::all());
+
+    for method in ["bitty.debug/ping", "bitty.debug/testInfo"] {
+        let request = DevtoolsRequest {
+            id_raw: "1".into(),
+            method: method.into(),
+            has_jsonrpc: false,
+            params_raw: None,
+        };
+        let error = dispatcher.dispatch(&context, &request).unwrap_err();
+        assert_eq!(error.code, "Unauthenticated");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn auth_recheck_failure_closes_the_bound_connection() {
+    use std::collections::VecDeque;
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    let peer = crate::auth::verify_peer_for_connection(
+        crate::auth::PeerCredentials::new(1000, 1000, 1),
+        1000,
+    )
+    .unwrap();
+    let (mut client, mut server) = UnixStream::pair().unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let sequence = Arc::new(Mutex::new(VecDeque::from([
+        Ok(peer),
+        Err(IpcError::Unauthenticated {
+            reason: "synthetic recheck mismatch".into(),
+        }),
+    ])));
+    let mut granted = crate::scope::ScopeSet::new();
+    granted.insert(crate::scope::Scope::DebugInspect);
+    let mut context = ServeContext::with_granted(&test_server_info(), granted);
+    let proof = context
+        .bind_connected_stream_for_test(&server, move |_| {
+            sequence.lock().unwrap().pop_front().unwrap()
+        })
+        .unwrap();
+    let dispatcher = Dispatcher::with_defaults();
+    let handle = std::thread::spawn(move || {
+        let mut limiter = RateLimiter::rc9_default();
+        let clock = || 0u64;
+        serve_bound_connection(
+            &mut server,
+            &proof,
+            &dispatcher,
+            &context,
+            &mut limiter,
+            &clock,
+        )
+    });
+    let payload = br#"{"id":1,"method":"bitty.debug/getSnapshot","version":"1.0"}"#;
+    client.write_all(&encode_frame(payload).unwrap()).unwrap();
+    let mut header = [0u8; 4];
+    match client.read_exact(&mut header) {
+        Ok(()) => {
+            let len = u32::from_be_bytes(header) as usize;
+            let mut response = vec![0u8; len];
+            client.read_exact(&mut response).unwrap();
+            assert!(
+                String::from_utf8(response)
+                    .unwrap()
+                    .contains("Unauthenticated")
+            );
+        }
+        Err(err) => assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset),
+    }
+    assert!(matches!(
+        handle.join().unwrap(),
+        Err(IpcError::Unauthenticated { .. })
+    ));
+    let mut byte = [0u8; 1];
+    assert!(matches!(client.read(&mut byte), Ok(0) | Err(_)));
+}
+
+#[cfg(unix)]
+#[test]
+fn every_privileged_dispatch_rechecks_the_bound_peer() {
+    use std::collections::VecDeque;
+    use std::os::unix::net::UnixStream;
+
+    let peer = crate::auth::verify_peer_for_connection(
+        crate::auth::PeerCredentials::new(1000, 1000, 1),
+        1000,
+    )
+    .unwrap();
+    let (_client, server) = UnixStream::pair().unwrap();
+    let sequence = Arc::new(Mutex::new(VecDeque::from([
+        Ok(peer),
+        Ok(peer),
+        Err(IpcError::Unauthenticated {
+            reason: "synthetic recheck mismatch".into(),
+        }),
+    ])));
+    let mut granted = crate::scope::ScopeSet::new();
+    granted.insert(crate::scope::Scope::DebugInspect);
+    let mut context = ServeContext::with_granted_for_tests(&test_server_info(), granted);
+    context
+        .bind_connected_stream_for_test(&server, move |_| {
+            sequence.lock().unwrap().pop_front().unwrap()
+        })
+        .unwrap();
+    let request = DevtoolsRequest {
+        id_raw: "1".into(),
+        method: "bitty.debug/getSnapshot".into(),
+        has_jsonrpc: false,
+        params_raw: None,
+    };
+    let dispatcher = Dispatcher::with_defaults();
+    assert!(dispatcher.dispatch(&context, &request).is_ok());
+    let err = dispatcher.dispatch(&context, &request).unwrap_err();
+    assert_eq!(err.code, "Unauthenticated");
+}
+
+#[cfg(unix)]
+#[test]
+fn pathname_attestation_cannot_mint_a_connected_peer() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    let base = std::env::temp_dir().join(format!("bitty-ctx0768-{}-pathname", std::process::id()));
+    let socket_path = base.join("bitty/a.sock");
+    let socket_string = socket_path.to_str().unwrap().to_string();
+    let _dir = prepare_socket_dir(&socket_string).unwrap();
+    let listener = UnixListener::bind(&socket_string).unwrap();
+    std::fs::set_permissions(&socket_string, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let runtime_uid = std::fs::symlink_metadata(&socket_string).unwrap().uid();
+    assert!(verify_socket_endpoint_for_connect(&socket_string, runtime_uid).is_ok());
+    let legacy_marker = transport_attested_peer(&socket_string, runtime_uid).unwrap();
+    assert_eq!(legacy_marker.peer_uid(), runtime_uid);
+    let mut context = ServeContext::new(&test_server_info());
+    assert!(context.recheck_before_dispatch().is_err());
+    let client = UnixStream::connect(&socket_string).unwrap();
+    let (server, _) = listener.accept().unwrap();
+    let result: Result<ConnectedPeerProof, IpcError> =
+        context.bind_connected_stream_for_test(&server, |_| {
+            Err(IpcError::Unauthenticated {
+                reason: "synthetic connected peer mismatch".into(),
+            })
+        });
+    assert!(matches!(result, Err(IpcError::Unauthenticated { .. })));
+    drop(client);
+    drop(server);
+    drop(listener);
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 #[cfg(unix)]
@@ -1481,7 +1828,8 @@ fn debug_read_surface_connection_alone_grants_nothing() {
     clear_introspection_for_tests();
     publish_grid_text(vec!["SECRET-GRID".to_string()], 0, 0, true, 5, 80, 24);
     let dispatcher = Dispatcher::with_defaults();
-    let ctx = ServeContext::with_granted(&test_server_info(), crate::scope::ScopeSet::new());
+    let ctx =
+        ServeContext::with_granted_for_tests(&test_server_info(), crate::scope::ScopeSet::new());
     for method in [
         "bitty.debug/getSnapshot",
         "bitty.debug/getGridText",
@@ -1530,7 +1878,7 @@ fn debug_read_surface_any_debug_scope_reads_but_others_do_not() {
     ] {
         let mut granted = crate::scope::ScopeSet::new();
         granted.insert(scope);
-        let ctx = ServeContext::with_granted(&test_server_info(), granted);
+        let ctx = ServeContext::with_granted_for_tests(&test_server_info(), granted);
         let outcome = handle_envelope(
             br#"{"id":1,"method":"bitty.debug/getGridText","version":"1.0"}"#,
             &dispatcher,
@@ -1541,7 +1889,7 @@ fn debug_read_surface_any_debug_scope_reads_but_others_do_not() {
     }
     let mut non_debug = crate::scope::ScopeSet::new();
     non_debug.insert(crate::scope::Scope::TerminalInspect);
-    let ctx = ServeContext::with_granted(&test_server_info(), non_debug);
+    let ctx = ServeContext::with_granted_for_tests(&test_server_info(), non_debug);
     let outcome = handle_envelope(
         br#"{"id":1,"method":"bitty.debug/getGridText","version":"1.0"}"#,
         &dispatcher,
@@ -1560,7 +1908,8 @@ fn debug_control_denial_category_is_on_taxonomy() {
     // Regression: the control path's internal `auth` CLI class must not leak
     // onto the debug wire; a scope denial is typed `scope` (RFC taxonomy).
     let dispatcher = Dispatcher::with_defaults();
-    let ctx = ServeContext::with_granted(&test_server_info(), crate::scope::ScopeSet::new());
+    let ctx =
+        ServeContext::with_granted_for_tests(&test_server_info(), crate::scope::ScopeSet::new());
     let outcome = handle_envelope(
         br#"{"id":1,"method":"bitty.debug/spawnTerminal","version":"1.0","params":{"cwd":null}}"#,
         &dispatcher,
@@ -1585,7 +1934,8 @@ fn debug_error_categories_stay_on_taxonomy() {
     // accepted set. Drives the same dispatcher through parse faults, scope
     // denials, unknown methods, and version faults.
     let dispatcher = Dispatcher::with_defaults();
-    let ctx = ServeContext::with_granted(&test_server_info(), crate::scope::ScopeSet::new());
+    let ctx =
+        ServeContext::with_granted_for_tests(&test_server_info(), crate::scope::ScopeSet::new());
     let probes: &[&[u8]] = &[
         br#"{"id":1,"method":"bitty.debug/nope","version":"1.0"}"#,
         br#"{"id":2,"method":"bitty.debug/ping","version":"9.9"}"#,
@@ -1667,7 +2017,7 @@ fn automation_context(
     session: &str,
     now_ms: u64,
 ) -> ServeContext {
-    let mut ctx = ServeContext::with_granted_session(server, granted, session);
+    let mut ctx = ServeContext::with_granted_session_for_tests(server, granted, session);
     ctx.uptime_ms = now_ms;
     ctx
 }
@@ -1709,11 +2059,9 @@ fn digest_context(
     session: &str,
     now_ms: u64,
 ) -> ServeContext {
-    // Attested like the production accept boundary
-    // (`transport_attested_peer` + `attest_local_peer`): same-process
+    // Same marker type as a connected-stream binding; same-process
     // in-process dispatch is local by construction. CTX-0528/IPC-001: the
-    // mark is bound to a test-only marker minted via the headless UID
-    // check (same marker type the accept boundary produces).
+    // mark is bound to a test-only marker minted via the headless UID check.
     let mut ctx = automation_context(server, granted, session, now_ms);
     let peer = crate::auth::verify_peer_for_connection(
         crate::auth::PeerCredentials::new(1000, 1000, 1),
@@ -2833,7 +3181,8 @@ fn trace_scopes() -> crate::scope::ScopeSet {
 }
 
 fn trace_context(server: &ServerInfo, now_ms: u64) -> ServeContext {
-    let mut ctx = ServeContext::with_granted_session(server, trace_scopes(), "trace-test");
+    let mut ctx =
+        ServeContext::with_granted_session_for_tests(server, trace_scopes(), "trace-test");
     ctx.uptime_ms = now_ms;
     ctx
 }
@@ -3040,7 +3389,7 @@ fn trace_scope_matrix_denies_inspect_and_unscoped() {
         }),
         ("unscoped", crate::scope::ScopeSet::new()),
     ] {
-        let ctx = ServeContext::with_granted_session(&server, granted, "trace-test");
+        let ctx = ServeContext::with_granted_session_for_tests(&server, granted, "trace-test");
         for (method, params) in methods {
             let outcome = handle_envelope(&trace_envelope(1, method, params), &dispatcher, &ctx);
             let text = response_text(&outcome);
@@ -3054,7 +3403,7 @@ fn trace_scope_matrix_denies_inspect_and_unscoped() {
     // `debug.control` is wider than `debug.trace`: start succeeds.
     let mut control = crate::scope::ScopeSet::new();
     control.insert(crate::scope::Scope::DebugControl);
-    let ctx = ServeContext::with_granted_session(&server, control, "trace-test");
+    let ctx = ServeContext::with_granted_session_for_tests(&server, control, "trace-test");
     let outcome = handle_envelope(
         &trace_envelope(2, METHOD_START_TRACE, "{}"),
         &dispatcher,
@@ -3995,7 +4344,7 @@ fn dt13_wire_fail_closed_regression_matrix() {
     assert!(response_text(&outcome).contains("UnknownMethod"));
     // Connection alone grants no debug scope: read surface denies.
     let bare_server = test_server_info();
-    let bare = ServeContext::with_granted(&bare_server, crate::scope::ScopeSet::new());
+    let bare = ServeContext::with_granted_for_tests(&bare_server, crate::scope::ScopeSet::new());
     let outcome = handle_envelope(
         br#"{"id":13,"method":"bitty.debug/getSnapshot","version":"1.0"}"#,
         &dispatcher,
@@ -4080,7 +4429,7 @@ fn dt11_trace_helpers_and_ctl_envelope_contract() {
     let mut inspect_only = crate::scope::ScopeSet::cli_default();
     inspect_only.insert(crate::scope::Scope::DebugInspect);
     let server = test_server_info();
-    let inspect_ctx = ServeContext::with_granted(&server, inspect_only);
+    let inspect_ctx = ServeContext::with_granted_for_tests(&server, inspect_only);
     let outcome = handle_envelope(
         br#"{"id":31,"method":"bitty.debug/startTrace","version":"1.0"}"#,
         &dispatcher,
@@ -4098,7 +4447,7 @@ fn dt11_trace_helpers_and_ctl_envelope_contract() {
     }
     // Unscoped control verbs deny on the debug-protocol taxonomy
     // (`scope`/`ScopeDenied`) and name the elevation allowlist.
-    let empty = ServeContext::with_granted(&server, crate::scope::ScopeSet::new());
+    let empty = ServeContext::with_granted_for_tests(&server, crate::scope::ScopeSet::new());
     let outcome = handle_envelope(
         br#"{"id":32,"method":"bitty.debug/listViews","version":"1.0"}"#,
         &dispatcher,
@@ -4230,7 +4579,7 @@ fn a3_test_surface_default_deny_even_when_elevated() {
     let default = Dispatcher::with_defaults();
     let elevated = crate::ctl::elevation_from_env(Some("debug.control"));
     let server = test_server_info();
-    let ctx = ServeContext::with_granted(&server, elevated);
+    let ctx = ServeContext::with_granted_for_tests(&server, elevated);
     for (id, method) in [(41u64, METHOD_TEST_INFO), (42u64, METHOD_TEST_EXIT)] {
         let payload = format!("{{\"id\":{id},\"method\":\"{method}\",\"version\":\"1.0\"}}");
         let outcome = handle_envelope(payload.as_bytes(), &default, &ctx);
@@ -4252,7 +4601,7 @@ fn a3_test_info_serves_without_scope_in_test_mode() {
     // terminal content — the only gate is test-mode registration.
     let test_mode = Dispatcher::with_test_mode();
     let server = test_server_info();
-    let bare = ServeContext::with_granted(&server, crate::scope::ScopeSet::new());
+    let bare = ServeContext::with_granted_for_tests(&server, crate::scope::ScopeSet::new());
     let outcome = handle_envelope(
         br#"{"id":43,"method":"bitty.debug/testInfo","version":"1.0"}"#,
         &test_mode,
@@ -4286,7 +4635,7 @@ fn a3_test_exit_elevation_matrix_over_wire() {
     let server = test_server_info();
     // CLI default holds no debug scope: ScopeDenied with the elevate hint
     // (auth fails before the queue, so no teardown is queued).
-    let cli = ServeContext::with_granted(&server, crate::scope::ScopeSet::cli_default());
+    let cli = ServeContext::with_granted_for_tests(&server, crate::scope::ScopeSet::cli_default());
     let outcome = handle_envelope(
         br#"{"id":44,"method":"bitty.debug/testExit","version":"1.0"}"#,
         &test_mode,
@@ -4297,7 +4646,7 @@ fn a3_test_exit_elevation_matrix_over_wire() {
     assert!(text.contains("ScopeDenied"), "got: {text}");
     assert!(text.contains("BITTY_CTL_ELEVATE"), "got: {text}");
     // A misspelled allowlist value grants nothing (fail-closed).
-    let bogus = ServeContext::with_granted(
+    let bogus = ServeContext::with_granted_for_tests(
         &server,
         crate::ctl::elevation_from_env(Some("debug-control")),
     );
@@ -4342,7 +4691,7 @@ fn a3_test_exit_teardown_routes_through_control_queue() {
     // Wire-shape identity with a sibling control verb: ungranted `testExit`
     // and ungranted `listViews` deny identically (same handler path, same
     // taxonomy, same elevation hint).
-    let empty = ServeContext::with_granted(&server, crate::scope::ScopeSet::new());
+    let empty = ServeContext::with_granted_for_tests(&server, crate::scope::ScopeSet::new());
     let exit_outcome = handle_envelope(
         br#"{"id":46,"method":"bitty.debug/testExit","version":"1.0"}"#,
         &test_mode,
@@ -4476,7 +4825,7 @@ fn plugin_runtime_scope_matrix_per_rfc() {
     ];
     // Zero scopes: everything denies with typed scope, zero partial state.
     for (method, params) in readers.iter().chain(stream.iter()).chain(verbs.iter()) {
-        let ctx = ServeContext::with_granted(&server, empty.clone());
+        let ctx = ServeContext::with_granted_for_tests(&server, empty.clone());
         let outcome = handle_envelope(&plugin_runtime_envelope(method, params), &dispatcher, &ctx);
         assert!(outcome.was_error, "{method} must deny with zero scopes");
         let text = response_text(&outcome);
@@ -4492,7 +4841,7 @@ fn plugin_runtime_scope_matrix_per_rfc() {
     }
     // Inspect-only: readers are callable (fail-closed stub verdict, not a
     // scope denial); the stream and the verbs still deny.
-    let inspect_ctx = ServeContext::with_granted(&server, inspect);
+    let inspect_ctx = ServeContext::with_granted_for_tests(&server, inspect);
     for (method, params) in readers {
         let outcome = handle_envelope(
             &plugin_runtime_envelope(method, params),
@@ -4520,7 +4869,7 @@ fn plugin_runtime_scope_matrix_per_rfc() {
         );
     }
     // Trace-only: the stream is callable; the control verbs still deny.
-    let trace_ctx = ServeContext::with_granted(&server, trace);
+    let trace_ctx = ServeContext::with_granted_for_tests(&server, trace);
     let outcome = handle_envelope(
         &plugin_runtime_envelope(stream[0].0, stream[0].1),
         &dispatcher,
@@ -4546,7 +4895,7 @@ fn plugin_runtime_scope_matrix_per_rfc() {
         );
     }
     // Control-only: the verbs are callable.
-    let control_ctx = ServeContext::with_granted(&server, control);
+    let control_ctx = ServeContext::with_granted_for_tests(&server, control);
     for (method, params) in verbs {
         let outcome = handle_envelope(
             &plugin_runtime_envelope(method, params),
@@ -4571,7 +4920,7 @@ fn plugin_runtime_param_gates_generation_ownership() {
     let dispatcher = Dispatcher::with_defaults();
     let server = test_server_info();
     let (_empty, _inspect, _trace, _control, full) = plugin_runtime_scopes();
-    let ctx = ServeContext::with_granted(&server, full);
+    let ctx = ServeContext::with_granted_for_tests(&server, full);
     // (method, params, expect_invalid_params)
     let probes: &[(&str, &str, bool)] = &[
         (METHOD_LIST_PLUGINS, "{}", false),

@@ -382,9 +382,10 @@ parent delegation ∩ task grant ∩ agent request` is computed on every
   mirrored in `bitty check`/`bitty inspect`.
 - **`--fail-loud` startup mode (CTX-0481, issue #762):** `bitty --fail-loud`
   (or `BITTY_FAIL_LOUD=1`) aborts startup with exit 1 when the primary shell,
-  a startup pane shell, or the IPC servo fails or is rejected, instead of
-  continuing in a degraded session; the default stays fail-soft and a
-  platform-unsupported IPC servo is never fatal.
+  a startup pane shell, or a servable-platform IPC servo fails or is rejected,
+  instead of continuing in a degraded session; the default stays fail-soft.
+  A platform without accepted-stream attestation remains unavailable with no
+  synthetic bypass and is never fatal.
 - **IPC wire version negotiation (CTX-0484, issue #765):** `bitty-ipc`
   advertises `SUPPORTED_WIRE_VERSIONS` and offers
   `negotiate_wire_version(&[u16])`, which selects the highest mutual version
@@ -648,13 +649,14 @@ layout.gap_cells * cell_axis`; with the default `layout` cell gaps of `0`
   accepting forgeries; the reserved Ed25519-shaped wire fields stay for the
   OQ-029 follow-up (bitty#767, DEC-0059). V-A/V-B verification and
   signature-first pin ordering are unchanged.
-- **Devtools IPC transport verifies its endpoint (CTX-0463, issue #744):**
-  `transport_attested_peer` re-verifies the bound endpoint per connection
-  (0700 directory and 0600 socket, both owned by the runtime uid, symlinks
-  rejected), the client checks the same ownership before connecting, and a
-  `BITTY_SOCKET` override is verified rather than trusted verbatim; child
-  token error paths return static, token-free reasons. True per-connection
-  `SO_PEERCRED` fd checks stay deferred (tracked for CTX-0159).
+- **Devtools IPC transport verifies its endpoint and accepted peer (CTX-0463, issue #744):**
+  `verify_socket_endpoint_for_connect` re-verifies the bound endpoint per
+  connection (0700 directory and 0600 socket, both owned by the runtime uid,
+  symlinks rejected), the client checks the same ownership before connecting,
+  and a `BITTY_SOCKET` override is verified rather than trusted verbatim. The
+  servo binds each accepted `UnixStream` to platform peer credentials and
+  rechecks that binding before dispatch; child token error paths return static,
+  token-free reasons.
 - **Lua sandbox budgets cover compile and host calls (CTX-0464, issue #745):**
   `drive_chunk` refuses chunks over a 1 MiB cap before parsing; the wall-clock
   budget now includes `Closure::load`, so an over-budget compile suspends with

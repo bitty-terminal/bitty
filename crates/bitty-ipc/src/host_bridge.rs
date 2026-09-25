@@ -51,18 +51,11 @@
 //! # Trust binding (CTX-0421 review outcome)
 //!
 //! Caller-supplied `client_id` / scopes / clock are untrusted until bound
-//! here. [`HostCaller::bind`] is the single choke point: it requires an
-//! already-attested [`VerifiedPeer`](crate::auth::VerifiedPeer) (the
-//! kernel-gated owner-only transport proves the *connection* crossed the
-//! accept boundary as the runtime UID; it says nothing about which
-//! human or plugin sent the bytes), shape-checks the `client_id`, and
-//! carries **only** server-evaluated scopes plus the server clock. There
-//! is no caller-scopes input at all: dispatch sites use
-//! [`HostCaller::granted`] and [`HostCaller::now_ms`], so a caller cannot
-//! smuggle scopes or rewind the consent clock. UID-to-`client_id`
-//! allocation (which plugin may claim which id) is the servo accept
-//! boundary's job and stays sequel work; this slice enforces everything
-//! below that line and documents the remainder honestly.
+//! here. The production build exposes no host-caller authority constructor;
+//! [`HostCaller::bind_for_tests`] is compiled only for crate tests and cannot
+//! mint `ProcessSpawn`. A future production binding must consume server-owned
+//! authority rather than caller-supplied scopes or clock. UID-to-`client_id`
+//! allocation remains outside this slice.
 //!
 //! The module is pure data plus one bounded process-global store, headless,
 //! and `forbid(unsafe)`: it owns no socket, spawns no thread, performs no
@@ -75,9 +68,12 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+#[cfg(test)]
 use crate::auth::{MAX_SCOPED_ID_BYTES, VerifiedPeer};
 use crate::error::IpcError;
-use crate::scope::{Scope, ScopeSet};
+use crate::scope::Scope;
+#[cfg(test)]
+use crate::scope::ScopeSet;
 use crate::snapshot::{SnapshotData, SnapshotRequest};
 use crate::tool_dispatch::{
     MAX_TOOL_RESULT_BYTES, ToolDispatchService, ToolOutput, ToolRequest, ToolSpec,
@@ -399,20 +395,12 @@ pub fn register_live_inspect_tools(service: &mut ToolDispatchService) -> Result<
 /// Caller identity bound to an attested connection plus server-evaluated
 /// authority (CTX-0421 review outcome).
 ///
-/// Construction requires an already-attested [`VerifiedPeer`]: only the
-/// kernel-gated owner-only transport could have produced it, so the bytes
-/// arrived over the accept boundary as the runtime UID. The struct carries
-/// no caller-supplied scopes and no caller-supplied clock — dispatch sites
-/// read [`HostCaller::granted`] and [`HostCaller::now_ms`] instead — so
-/// scope smuggling and clock rewinding fail by construction (there is no
-/// field to smuggle them through).
-///
-/// Explicit non-goals (sequel work, documented honestly): mapping the
-/// `client_id` string to a UID or plugin identity (the servo accept
-/// boundary allocates ids; this slice only shape-checks the label), and
-/// per-tool-name consent granularity (the accepted ledger is per
-/// `(client_id, scope)`; per-tool identity enters via routing and
-/// attribution).
+/// This type is compiled only for crate tests. Its test binding requires an
+/// already-attested [`VerifiedPeer`], records that peer's UID, and rejects
+/// `ProcessSpawn`; it is not exported or dispatchable from production code.
+/// Production host authority must be supplied by a future server-owned
+/// binding rather than this fixture.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct HostCaller {
     /// Server-validated client label presented over the attested connection.
@@ -421,8 +409,10 @@ pub struct HostCaller {
     granted: ScopeSet,
     /// Server clock in ms (never caller-supplied).
     now_ms: u64,
+    peer_uid: u32,
 }
 
+#[cfg(test)]
 impl HostCaller {
     /// Maximum client identity bytes (`auth::MAX_SCOPED_ID_BYTES`, 64).
     pub const MAX_CLIENT_ID_BYTES: usize = MAX_SCOPED_ID_BYTES;
@@ -433,8 +423,8 @@ impl HostCaller {
     ///
     /// - `InvalidRequest` when `client_id` is empty.
     /// - `LimitExceeded` when `client_id` exceeds 64 bytes.
-    pub fn bind(
-        _peer: &VerifiedPeer,
+    pub(crate) fn bind_for_tests(
+        peer: &VerifiedPeer,
         client_id: impl Into<String>,
         granted: ScopeSet,
         now_ms: u64,
@@ -452,10 +442,17 @@ impl HostCaller {
                 actual: client_id.len(),
             });
         }
+        if granted.contains(Scope::ProcessSpawn) {
+            return Err(IpcError::ScopeDenied {
+                scope: Scope::ProcessSpawn.as_str().into(),
+                action: "host_bridge_test".into(),
+            });
+        }
         Ok(Self {
             client_id,
             granted,
             now_ms,
+            peer_uid: peer.peer_uid(),
         })
     }
 
@@ -475,6 +472,12 @@ impl HostCaller {
     #[must_use]
     pub fn now_ms(&self) -> u64 {
         self.now_ms
+    }
+
+    /// UID of the verified peer used by the test-only binding.
+    #[must_use]
+    pub fn peer_uid(&self) -> u32 {
+        self.peer_uid
     }
 }
 
@@ -917,19 +920,24 @@ mod tests {
         let peer = verify_peer_for_connection(PeerCredentials::new(1000, 1000, 1), 1000)
             .expect("test-only local marker");
         let granted = granted_inspect();
-        let caller = HostCaller::bind(&peer, "bridge-tests", granted.clone(), 1_000)
+        let caller = HostCaller::bind_for_tests(&peer, "bridge-tests", granted.clone(), 1_000)
             .expect("valid label binds");
         assert_eq!(caller.client_id(), "bridge-tests");
         assert_eq!(caller.now_ms(), 1_000);
+        assert_eq!(caller.peer_uid(), 1000);
         assert!(caller.granted().contains(Scope::TerminalInspect));
         assert!(!caller.granted().contains(Scope::ProcessSpawn));
-        let error =
-            HostCaller::bind(&peer, "", granted.clone(), 1_000).expect_err("empty label must fail");
+        let process_scope_error =
+            HostCaller::bind_for_tests(&peer, "bridge-tests", ScopeSet::all(), 1_000)
+                .expect_err("test-only host bridge must not mint process authority");
+        assert!(matches!(process_scope_error, IpcError::ScopeDenied { .. }));
+        let error = HostCaller::bind_for_tests(&peer, "", granted.clone(), 1_000)
+            .expect_err("empty label must fail");
         assert!(
             matches!(error, IpcError::InvalidRequest { .. }),
             "got {error:?}"
         );
-        let error = HostCaller::bind(&peer, "x".repeat(65), granted, 1_000)
+        let error = HostCaller::bind_for_tests(&peer, "x".repeat(65), granted, 1_000)
             .expect_err("over-bound label must fail");
         assert!(
             matches!(error, IpcError::LimitExceeded { .. }),

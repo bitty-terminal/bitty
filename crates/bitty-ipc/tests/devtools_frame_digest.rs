@@ -1,9 +1,11 @@
+#![cfg(unix)]
+
 //! Socket-level `frameHash` proof over the devtools socket (CTX-0244).
 //!
 //! Same harness pattern as `devtools_automation.rs` (CTX-0188): publish a
 //! known synthetic RGBA frame plus grid text into the live stores, serve
 //! over a real Unix socket with `Dispatcher::with_defaults` through the
-//! production-equivalent accept boundary (`transport_attested_peer` +
+//! production-equivalent accept boundary (the real connected-stream proof plus
 //! `attest_local_peer`), and assert from the client side.
 //!
 //! Covered here:
@@ -30,7 +32,7 @@ use bitty_ipc::devtools::{
     AutomationFamily, Dispatcher, ServeContext, ServerInfo, attest_bound_socket,
     clear_automation_for_tests, clear_introspection_for_tests, frame_audit_len_for_tests,
     issue_automation_bearer_with_ttl, prepare_socket_dir, publish_frame_rgba, publish_grid_text,
-    serve_connection, transport_attested_peer,
+    serve_bound_connection,
 };
 use bitty_ipc::frame::{MAX_FRAME_BYTES, encode_frame};
 use bitty_ipc::frame_digest::{FRAME_DIGEST_ALGO, frame_digest_hex};
@@ -147,14 +149,11 @@ fn spawn_digest_server(
             .unwrap();
         let dir = prepare_socket_dir(&socket_path).unwrap();
         let runtime_uid = attest_bound_socket(&socket_path, &dir).unwrap();
-        let verified = transport_attested_peer(&socket_path, runtime_uid).unwrap();
         let dispatcher = Dispatcher::with_defaults();
         let server = ServerInfo::new("digest-proof".to_string(), socket_path.clone(), 80, 24);
-        // Production-equivalent: the accept boundary verified a local peer,
-        // so the context carries the attestation `frameHash` requires.
-        // CTX-0528/IPC-001: the mark is bound to the verified marker.
         let mut context = ServeContext::with_granted_session(&server, granted, &session);
-        context.attest_local_peer(&verified);
+        let proof = context.bind_connected_stream(&stream, runtime_uid).unwrap();
+        context.attest_local_peer(&proof.identity());
         let mut limiter = RateLimiter::rc9_default();
         let clock = || {
             SystemTime::now()
@@ -162,9 +161,9 @@ fn spawn_digest_server(
                 .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
                 .unwrap_or(0)
         };
-        let stats = serve_connection(
+        let stats = serve_bound_connection(
             &mut stream,
-            verified,
+            &proof,
             &dispatcher,
             &context,
             &mut limiter,

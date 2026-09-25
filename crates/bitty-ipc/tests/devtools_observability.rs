@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! DT-02 observability event pipeline verification (CTX-0591, issue #1098).
 //!
 //! Verifies the `bitty-ipc` profiling observability lane reachable today:
@@ -17,6 +19,7 @@
 //! (CTX-0179 pattern; std-only, no extra dev-dependency) and clears before and
 //! after.
 
+use std::os::unix::net::UnixStream;
 use std::sync::{Mutex, OnceLock};
 
 use bitty_ipc::devtools::{
@@ -60,7 +63,9 @@ fn trace_scopes() -> ScopeSet {
 
 fn call(granted: ScopeSet, method: &str, params: Option<&str>) -> (bool, String) {
     let dispatcher = Dispatcher::with_defaults();
-    let ctx = ServeContext::with_granted_session(&test_server(), granted, "obs-sess");
+    let (_client, stream) = UnixStream::pair().unwrap();
+    let mut ctx = ServeContext::with_granted_session(&test_server(), granted, "obs-sess");
+    ctx.bind_connected_stream_current(&stream).unwrap();
     let envelope = match params {
         Some(p) => {
             format!("{{\"id\":1,\"method\":\"{method}\",\"version\":\"1.0\",\"params\":{p}}}")

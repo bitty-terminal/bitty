@@ -1734,7 +1734,7 @@ fn control_socketpair_roundtrip_headless_live_instance() {
         80,
         24,
     );
-    let context = bitty_ipc::devtools::ServeContext::with_granted(
+    let mut context = bitty_ipc::devtools::ServeContext::with_granted(
         &server_info,
         bitty_ipc::ScopeSet::cli_default(),
     );
@@ -1742,17 +1742,16 @@ fn control_socketpair_roundtrip_headless_live_instance() {
     client
         .set_read_timeout(Some(std::time::Duration::from_secs(5)))
         .unwrap();
-    // Socketpair has no filesystem endpoint: mint the marker via the headless
-    // peer-UID check (same marker type the accept boundary produces after
-    // endpoint verification).
-    let peer = bitty_ipc::verify_peer_for_connection(bitty_ipc::PeerCredentials::new(0, 0, 1), 0)
-        .expect("headless peer check");
+    let proof = context
+        .bind_connected_stream_current(&server_stream)
+        .expect("bound peer proof");
+    context.attest_local_peer(&proof.identity());
     let handle = std::thread::spawn(move || {
         let mut limiter = bitty_ipc::RateLimiter::rc9_default();
         let clock = || 0u64;
-        bitty_ipc::devtools::serve_connection(
+        bitty_ipc::devtools::serve_bound_connection(
             &mut server_stream,
-            peer,
+            &proof,
             &dispatcher,
             &context,
             &mut limiter,
@@ -1983,8 +1982,6 @@ fn spawn_wm_server(
             .unwrap();
         let dir = bitty_ipc::devtools::prepare_socket_dir(&socket_path).unwrap();
         let runtime_uid = bitty_ipc::devtools::attest_bound_socket(&socket_path, &dir).unwrap();
-        let verified =
-            bitty_ipc::devtools::transport_attested_peer(&socket_path, runtime_uid).unwrap();
         let dispatcher = bitty_ipc::devtools::Dispatcher::with_defaults();
         let server = bitty_ipc::devtools::ServerInfo::new(
             "wm-proof".to_string(),
@@ -1992,8 +1989,10 @@ fn spawn_wm_server(
             80,
             24,
         );
-        let context =
+        let mut context =
             bitty_ipc::devtools::ServeContext::with_granted_session(&server, granted, &session);
+        let proof = context.bind_connected_stream(&stream, runtime_uid).unwrap();
+        context.attest_local_peer(&proof.identity());
         let mut limiter = bitty_ipc::RateLimiter::rc9_default();
         let clock = || {
             std::time::SystemTime::now()
@@ -2001,9 +2000,9 @@ fn spawn_wm_server(
                 .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
                 .unwrap_or(0)
         };
-        let stats = bitty_ipc::devtools::serve_connection(
+        let stats = bitty_ipc::devtools::serve_bound_connection(
             &mut stream,
-            verified,
+            &proof,
             &dispatcher,
             &context,
             &mut limiter,

@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! End-to-end round-trip over a real Unix socket (CTX-0144, Issue #236).
 //!
 //! Headless and Unix-only: binds a temporary socket, serves it with
@@ -16,7 +18,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bitty_ipc::devtools::{
     Dispatcher, MAX_SOCKET_PATH_BYTES, SUN_LEN_MACOS, ServeContext, ServerInfo,
-    attest_bound_socket, prepare_socket_dir, serve_connection, transport_attested_peer,
+    attest_bound_socket, prepare_socket_dir, serve_bound_connection,
 };
 use bitty_ipc::frame::{MAX_FRAME_BYTES, encode_frame};
 use bitty_ipc::limits::RateLimiter;
@@ -77,14 +79,15 @@ fn spawn_server(socket_path: String, min_requests: u64) -> std::thread::JoinHand
         // credentials flow into the serving path.
         let dir = prepare_socket_dir(&socket_path).unwrap();
         let runtime_uid = attest_bound_socket(&socket_path, &dir).unwrap();
-        let verified = transport_attested_peer(&socket_path, runtime_uid).unwrap();
         let dispatcher = Dispatcher::with_defaults();
         let server = ServerInfo::new("e2e".to_string(), socket_path.clone(), 80, 24);
         // A live read session: the peer has been granted `debug.inspect`
         // (connection alone grants no debug scope, P0-AC-025).
         let mut granted = bitty_ipc::scope::ScopeSet::cli_default();
         granted.insert(bitty_ipc::scope::Scope::DebugInspect);
-        let context = ServeContext::with_granted(&server, granted);
+        let mut context = ServeContext::with_granted(&server, granted);
+        let proof = context.bind_connected_stream(&stream, runtime_uid).unwrap();
+        context.attest_local_peer(&proof.identity());
         let mut limiter = RateLimiter::rc9_default();
         let clock = || {
             SystemTime::now()
@@ -92,9 +95,9 @@ fn spawn_server(socket_path: String, min_requests: u64) -> std::thread::JoinHand
                 .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
                 .unwrap_or(0)
         };
-        let stats = serve_connection(
+        let stats = serve_bound_connection(
             &mut stream,
-            verified,
+            &proof,
             &dispatcher,
             &context,
             &mut limiter,

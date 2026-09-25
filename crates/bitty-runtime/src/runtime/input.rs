@@ -598,7 +598,7 @@ impl Runtime {
             self.publish_inspect_snapshot();
             let bytes = self.encode_key_enhanced(&event);
             if let Some(bytes) = &bytes {
-                self.push_input_bytes(bytes);
+                self.push_encoded_key_bytes(&event, bytes);
             }
             return bytes;
         }
@@ -611,7 +611,7 @@ impl Runtime {
         );
         let bytes = self.encode_key_enhanced(&event)?;
         // Bounded encoding already ≤64; push respects MAX_PENDING_INPUT.
-        self.push_input_bytes(&bytes);
+        self.push_encoded_key_bytes(&event, &bytes);
         self.publish_inspect_snapshot();
         Some(bytes)
     }
@@ -717,7 +717,7 @@ impl Runtime {
             self.publish_inspect_snapshot();
             let bytes = self.encode_key_enhanced(event);
             if let Some(bytes) = &bytes {
-                self.push_input_bytes(bytes);
+                self.push_encoded_key_bytes(event, bytes);
             }
             return bytes;
         }
@@ -729,7 +729,7 @@ impl Runtime {
             pressed,
         );
         let bytes = self.encode_key_enhanced(event)?;
-        self.push_input_bytes(&bytes);
+        self.push_encoded_key_bytes(event, &bytes);
         self.publish_inspect_snapshot();
         Some(bytes)
     }
@@ -745,6 +745,9 @@ impl Runtime {
     /// Idempotent: no-op when already live or when no focused leaf exists;
     /// sets `pending_full_redraw` when it actually moved so the live frame
     /// presents even before the echo.
+    ///
+    /// Key *release* frames never reach here (issue #1394): a release
+    /// produces no new output, so it must not yank a scrolled viewport.
     pub(super) fn snap_focused_to_live(&mut self) {
         let Some(fid) = self.focus.focused() else {
             return;
@@ -776,6 +779,27 @@ impl Runtime {
         self.push_input_bytes_multipane(bytes);
     }
 
+    /// Routes one encoded key frame, snapping on press/repeat only
+    /// (issue #1394).
+    ///
+    /// Under Kitty `report event types` a key *release* is encoded as input
+    /// bytes too (`CSI ...:3 u`), so routing it through
+    /// [`Self::push_input_bytes`] snapped a scrolled viewport back to the
+    /// live bottom even though no new input was produced (upstream
+    /// precedent: ghostty #13026 — `scroll-to-bottom=keystroke` must not
+    /// fire on release events). A release frame is still delivered to the
+    /// shell; only the CTX-0243 snap is skipped. Press and repeat
+    /// (`event.repeat`) keep snapping.
+    fn push_encoded_key_bytes(&mut self, event: &KeyEvent, bytes: &[u8]) {
+        if event.state == PressState::Released {
+            if !bytes.is_empty() {
+                self.route_input_bytes(bytes);
+            }
+            return;
+        }
+        self.push_input_bytes(bytes);
+    }
+
     /// Focused-leaf input routing for split layouts (CTX-0176): the focused
     /// leaf's session writer wins; the shared writer serves only the primary
     /// owner leaf (CTX-0359); with no writer live, bytes fall back to the
@@ -784,6 +808,17 @@ impl Runtime {
         // CTX-0243: direct multipane sends must also snap (normally already
         // snapped by `push_input_bytes`; idempotent second snap is a no-op).
         self.snap_focused_to_live();
+        self.route_input_bytes(bytes);
+    }
+
+    /// Routes already-encoded input bytes to the focused shell without the
+    /// CTX-0243 snap-to-live (issue #1394).
+    ///
+    /// Split out of [`Self::push_input_bytes_multipane`] so a Kitty key
+    /// *release* frame can reuse the identical routing while skipping the
+    /// snap: a release carries no new output, so it must not yank a
+    /// viewport the user scrolled into history.
+    fn route_input_bytes(&mut self, bytes: &[u8]) {
         match self.focus.focused() {
             Some(focused) => {
                 if let Some(sess) = self.pane_sessions.get_mut(&focused) {

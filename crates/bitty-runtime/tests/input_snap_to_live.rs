@@ -19,6 +19,11 @@
 //! output continues must not yank); modifier-only keys do not snap.
 //!
 //! All tests headless and deterministic (no wall clock, no PTY spawn).
+//!
+//! Issue #1394 addendum: under Kitty `report event types` a key *release* is
+//! encoded as input bytes too (`CSI ...:3 u`), but it produces no new output
+//! — releasing a key while scrolled into history must not snap (ghostty
+//! #13026). Press/repeat keep the CTX-0243 snap.
 
 use bitty_platform::{KeyEvent, PressState};
 use bitty_runtime::Runtime;
@@ -41,6 +46,17 @@ fn modifier_key(named: bitty_platform::NamedKey) -> KeyEvent {
         location: bitty_platform::KeyLocation::Standard,
         state: PressState::Pressed,
         repeat: false,
+        is_synthetic: false,
+    }
+}
+
+fn char_key_with(c: &str, state: PressState, repeat: bool) -> KeyEvent {
+    KeyEvent {
+        logical_key: bitty_platform::LogicalKey::Character(c.to_string()),
+        text: Some(c.to_string()),
+        location: bitty_platform::KeyLocation::Standard,
+        state,
+        repeat,
         is_synthetic: false,
     }
 }
@@ -213,4 +229,56 @@ fn ime_preedit_and_commit_snap_to_live() {
     let _ = rt.tick();
     rt.handle_ime_commit("n".to_string());
     assert_eq!(focused_offset(&rt), 0, "IME commit must snap");
+}
+
+#[test]
+fn key_release_does_not_snap_but_press_and_repeat_do() {
+    // Issue #1394: with Kitty `report event types` (plus disambiguate) active
+    // a key *release* is encoded as `CSI ...:3 u` — real input bytes, but no
+    // new output. Releasing while scrolled into history must keep the
+    // viewport (upstream precedent: ghostty #13026); the frame must still
+    // reach the shell. Press/repeat keep the CTX-0243 snap.
+    let mut rt = Runtime::with_defaults().expect("build");
+    assert!(!rt.has_pty_writer(), "headless test expects no live writer");
+    rt.handle_pty_bytes(b"\x1b[=3u"); // assign: disambiguate | report events
+    assert_eq!(rt.enhanced_keyboard_flags(), 3, "flags must negotiate");
+    fill_with_scrollback(&mut rt);
+    scroll_up(&mut rt, 2.0);
+    let before = focused_offset(&rt);
+    assert_eq!(rt.pending_input_len(), 0, "no input queued yet");
+
+    let frame = rt
+        .handle_key_event_ref(&char_key_with("a", PressState::Released, false))
+        .expect("release must still encode under report events");
+    assert!(
+        frame.starts_with(b"\x1b[") && frame.ends_with(b":3u"),
+        "release frame must carry event type 3, got {frame:?}"
+    );
+    assert!(
+        rt.pending_input().ends_with(b":3u"),
+        "release frame must still reach the shell, got {:?}",
+        rt.pending_input()
+    );
+    assert_eq!(
+        focused_offset(&rt),
+        before,
+        "key release must not snap the viewport to live (issue #1394)"
+    );
+
+    // A press while scrolled still snaps (CTX-0243 behavior preserved).
+    let _ = rt.handle_key_event(char_key("a"));
+    assert_eq!(focused_offset(&rt), 0, "press must still snap");
+
+    // Scroll again; an auto-repeat (event type 2) must still snap.
+    rt.handle_wheel(bitty_platform::ScrollDelta::Lines(0.0, 2.0));
+    assert!(focused_offset(&rt) > 0, "must be scrolled again");
+    let _ = rt.tick();
+    let repeat_frame = rt
+        .handle_key_event_ref(&char_key_with("a", PressState::Pressed, true))
+        .expect("repeat must encode");
+    assert!(
+        repeat_frame.ends_with(b":2u"),
+        "repeat frame must carry event type 2, got {repeat_frame:?}"
+    );
+    assert_eq!(focused_offset(&rt), 0, "repeat must still snap");
 }

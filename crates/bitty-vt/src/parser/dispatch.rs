@@ -826,10 +826,16 @@ impl<F: FnMut(TerminalAction)> Perform for Bridge<'_, F> {
                 });
             }
             8 => {
-                let uri = rest
-                    .get(1)
-                    .map(|segment| String::from_utf8_lossy(segment).into_owned())
-                    .unwrap_or_default();
+                // `OSC 8 ; params ; URI` (CORE-ENG-002): the target is every
+                // segment after the params field, so a semicolon inside the
+                // URI is URI data and not a parameter separator. Rejoining
+                // the tail keeps the complete target; the bounded-string cap
+                // is applied only after the full payload is assembled, so the
+                // policy never truncates a partially reassembled URI. The
+                // reassembly is bounded upstream by `vte`'s 16-segment OSC
+                // parameter cap, pinned by
+                // `osc_hyperlink_uri_segment_cap_is_bounded_and_deterministic`.
+                let uri = join_segments(rest.get(1..).unwrap_or(&[]));
                 if uri.is_empty() {
                     self.emit(TerminalAction::OscHyperlink { link: None });
                 } else {
@@ -842,7 +848,7 @@ impl<F: FnMut(TerminalAction)> Perform for Bridge<'_, F> {
                     self.emit(TerminalAction::OscHyperlink {
                         link: Some(Hyperlink {
                             id,
-                            uri: BoundedString::new(uri),
+                            uri: BoundedString::new(String::from_utf8_lossy(&uri)),
                         }),
                     });
                 }

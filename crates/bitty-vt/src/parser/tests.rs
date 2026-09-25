@@ -21,6 +21,16 @@ fn parse(bytes: &[u8]) -> Vec<TerminalAction> {
     actions
 }
 
+/// Parses the same stream in fixed-size chunks; `1` is byte-wise feeding.
+fn parse_split(bytes: &[u8], chunk_size: usize) -> Vec<TerminalAction> {
+    let mut parser = Parser::new();
+    let mut actions = Vec::new();
+    for chunk in bytes.chunks(chunk_size.max(1)) {
+        parser.advance(chunk, |action| actions.push(action));
+    }
+    actions
+}
+
 fn attrs(changes: &[AttributeChange]) -> TerminalAction {
     TerminalAction::SetAttributes {
         attrs: AttributeDiff {
@@ -1015,6 +1025,166 @@ fn osc_hyperlink_open_close_and_ids() {
             })
         }]
     );
+}
+
+/// CORE-ENG-002: `OSC 8 ; params ; URI` carries the URI as everything after
+/// the second delimiter, so a semicolon inside the URI is URI data, not a
+/// parameter separator (Ghostty's `Pu` grammar; Alacritty shipped the same
+/// `;`-in-URI fix). Each case pins the full URI, the `id=` params field, and
+/// the absence of inert `OscUnknown` telemetry.
+#[test]
+fn osc_hyperlink_uri_preserves_semicolon_delimiters() {
+    let cases: &[(&[u8], Option<&str>, &str)] = &[
+        (
+            b"\x1b]8;;https://example.test/a;b?q=1\x07",
+            None,
+            "https://example.test/a;b?q=1",
+        ),
+        (
+            b"\x1b]8;id=x;https://example.test/a;b?q=1\x07",
+            Some("x"),
+            "https://example.test/a;b?q=1",
+        ),
+        (
+            b"\x1b]8;id=x;https://example.test/p;matrix=1;2;3\x1b\\",
+            Some("x"),
+            "https://example.test/p;matrix=1;2;3",
+        ),
+        (
+            b"\x1b]8;;file:///tmp/a;v=1.0;draft\x07",
+            None,
+            "file:///tmp/a;v=1.0;draft",
+        ),
+        (b"\x1b]8;id=x;a;;b\x07", Some("x"), "a;;b"),
+        (b"\x1b]8;id=x;trailing;\x07", Some("x"), "trailing;"),
+        // The URI is the whole remainder, so a leading or sole semicolon is
+        // URI data and must not be mistaken for the empty-URI close form.
+        (b"\x1b]8;;;leading\x07", None, ";leading"),
+        (b"\x1b]8;id=x;;\x07", Some("x"), ";"),
+    ];
+    for (sequence, expected_id, expected_uri) in cases {
+        let actions = parse(sequence);
+        assert_eq!(
+            actions,
+            vec![TerminalAction::OscHyperlink {
+                link: Some(Hyperlink {
+                    id: expected_id.map(BoundedString::new),
+                    uri: BoundedString::new(*expected_uri),
+                })
+            }],
+            "OSC 8 must keep the complete URI, got {actions:?} for {sequence:?}"
+        );
+    }
+}
+
+/// CORE-ENG-002: the semicolon-bearing URI is identical whether the stream
+/// arrives whole, byte-wise, or in mixed chunks; the expected action is
+/// asserted directly so identity cannot pass on two equally truncated reads.
+#[test]
+fn osc_hyperlink_semicolon_uri_is_chunking_invariant() {
+    let script = b"\x1b]8;id=link-1;https://example.test/a;b?q=1\x1b\\text\x1b]8;id=link-1;\x1b\\";
+    let whole = parse(script);
+    assert_eq!(
+        whole.first(),
+        Some(&TerminalAction::OscHyperlink {
+            link: Some(Hyperlink {
+                id: Some(BoundedString::new("link-1")),
+                uri: BoundedString::new("https://example.test/a;b?q=1"),
+            })
+        })
+    );
+    assert_eq!(
+        whole.last(),
+        Some(&TerminalAction::OscHyperlink { link: None })
+    );
+    for chunk_size in [1, 2, 3, 7, 16] {
+        assert_eq!(
+            whole,
+            parse_split(script, chunk_size),
+            "chunk size {chunk_size} changed the OSC 8 action stream"
+        );
+    }
+}
+
+/// CORE-ENG-002: only a completely empty URI closes the span. The close form
+/// stays inert-correct with and without an `id=`, under both terminators, and
+/// a close that follows a semicolon-bearing open still ends the span.
+#[test]
+fn osc_hyperlink_empty_uri_closes_span() {
+    for sequence in [
+        &b"\x1b]8;;\x07"[..],
+        &b"\x1b]8;id=x;\x07"[..],
+        &b"\x1b]8;;\x1b\\"[..],
+        &b"\x1b]8;id=x;\x1b\\"[..],
+        &b"\x1b]8;;\x07\x1b]8;;\x07"[..],
+    ] {
+        let actions = parse(sequence);
+        assert!(
+            actions
+                .iter()
+                .all(|action| *action == TerminalAction::OscHyperlink { link: None }),
+            "empty OSC 8 URI must only close spans, got {actions:?} for {sequence:?}"
+        );
+        assert!(!actions.is_empty());
+    }
+    let round_trip = parse(b"\x1b]8;id=x;https://example.test/a;b\x07\x1b]8;id=x;\x07");
+    assert_eq!(
+        round_trip,
+        vec![
+            TerminalAction::OscHyperlink {
+                link: Some(Hyperlink {
+                    id: Some(BoundedString::new("x")),
+                    uri: BoundedString::new("https://example.test/a;b"),
+                })
+            },
+            TerminalAction::OscHyperlink { link: None },
+        ]
+    );
+}
+
+/// Boundary pin for the one OSC 8 truncation that survives CORE-ENG-002:
+/// `vte` exposes at most `MAX_OSC_PARAMS` (16) OSC segments, so after the
+/// command ID and the params field at most 14 URI segments are reassemblable.
+/// The bridge cannot observe the overflow, so the excess is dropped upstream
+/// and this test pins the resulting deterministic bound at its last complete
+/// segment instead of leaving it silent. A change here is a vte upgrade or a
+/// follow-up that collects the raw OSC payload, not a behavior choice.
+#[test]
+fn osc_hyperlink_uri_segment_cap_is_bounded_and_deterministic() {
+    let segment = |count: usize| {
+        let mut uri = String::new();
+        for index in 0..count {
+            if index > 0 {
+                uri.push(';');
+            }
+            uri.push_str(&format!("s{index}"));
+        }
+        uri
+    };
+    let sequence = |uri: &str| {
+        let mut bytes = b"\x1b]8;id=x;".to_vec();
+        bytes.extend_from_slice(uri.as_bytes());
+        bytes.push(0x07);
+        bytes
+    };
+    let uri_of = |actions: &[TerminalAction]| match actions.first() {
+        Some(TerminalAction::OscHyperlink { link: Some(link) }) => link.uri.as_str().to_owned(),
+        other => panic!("OSC 8 must open a span, got {other:?}"),
+    };
+
+    // 14 URI segments (16 OSC params) is the last fully reassemblable shape.
+    let at_cap = sequence(&segment(14));
+    assert_eq!(uri_of(&parse(&at_cap)), segment(14));
+    assert_eq!(uri_of(&parse_split(&at_cap, 1)), segment(14));
+
+    // Past the cap the URI is a deterministic prefix of the same 14 segments,
+    // for whole and byte-wise feeds alike.
+    for count in [15, 20, 64] {
+        let overflowing = sequence(&segment(count));
+        assert_eq!(uri_of(&parse(&overflowing)), segment(14));
+        assert_eq!(uri_of(&parse_split(&overflowing, 1)), segment(14));
+        assert_eq!(parse(&overflowing), parse_split(&overflowing, 3));
+    }
 }
 
 #[test]

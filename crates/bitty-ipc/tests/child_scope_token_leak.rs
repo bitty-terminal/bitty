@@ -12,14 +12,11 @@
 
 use bitty_ipc::auth::{
     CHILD_TOKEN_TTL_MS, ChildToken, ChildTokenStore, MAX_CHILD_TOKENS, MAX_TOKEN_TTL_MS,
-    PeerCredentials, is_child_eligible_scope, verify_peer_uid,
+    is_child_eligible_scope,
 };
 use bitty_ipc::error::{ErrorClass, IpcError};
 use bitty_ipc::execution::EnvPolicy;
 use bitty_ipc::scope::Scope;
-
-const RUNTIME_UID: u32 = 1000;
-const FOREIGN_UID: u32 = 2000;
 
 /// All 13 accepted v1 scopes: exactly one is child-eligible.
 const ALL_SCOPES: [Scope; 13] = [
@@ -326,18 +323,6 @@ fn planted_env_token_grants_nothing() {
             .verify(real, Scope::TerminalInspect, "t:4", 1_000)
             .is_ok()
     );
-}
-
-#[test]
-fn forged_bitty_socket_and_ssh_env_grant_nothing() {
-    // Even with a forged `BITTY_SOCKET` identifier and SSH-forwarded vars in
-    // the environment, a foreign UID fails the peer-credential gate before
-    // any request is parsed — identifiers are advisory, never credentials.
-    let foreign = PeerCredentials::new(FOREIGN_UID, FOREIGN_UID, 99);
-    let err = verify_peer_uid(foreign, RUNTIME_UID).unwrap_err();
-    assert!(matches!(err, IpcError::Unauthenticated { .. }));
-    let good = PeerCredentials::new(RUNTIME_UID, RUNTIME_UID, 42);
-    assert!(verify_peer_uid(good, RUNTIME_UID).is_ok());
 }
 
 #[test]

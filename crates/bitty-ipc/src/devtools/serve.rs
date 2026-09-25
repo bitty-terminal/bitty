@@ -5,11 +5,19 @@ use super::json::truncate_chars;
 
 use crate::auth::VerifiedPeer;
 #[cfg(unix)]
-use crate::auth::{DIR_MODE, PeerCredentials, SOCKET_MODE, verify_peer_uid};
+use crate::auth::{DIR_MODE, SOCKET_MODE};
+#[cfg(all(test, unix))]
+use crate::auth::{PeerCredentials, verify_peer_uid};
 use crate::error::IpcError;
+#[cfg(unix)]
 use crate::frame::{MAX_FRAME_BYTES, encode_frame};
-use crate::limits::{RC9_MAX_CONNECTIONS, RateLimiter};
+use crate::limits::RC9_MAX_CONNECTIONS;
+#[cfg(unix)]
+use crate::limits::RateLimiter;
+use std::fmt;
+#[cfg(unix)]
 use std::io::{Read, Write};
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 // ── socket path ─────────────────────────────────────────────────────────────
@@ -29,7 +37,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 /// which returns the endpoint identity) followed by
 /// [`verify_connected_endpoint`] on the live stream (CTX-0539), or the
 /// bind-time [`prepare_socket_dir`] + [`attest_bound_socket`] pair plus
-/// per-connection [`transport_attested_peer`] (server accept). The
+/// the connected-stream binding used by the server accept path. The
 /// pre-connect check alone is defense in depth: a checked-then-swapped
 /// `BITTY_SOCKET` path is caught only by the post-connect binding.
 /// Connecting to or serving an unverified `BITTY_SOCKET` path fails closed
@@ -269,6 +277,50 @@ impl ServerInfo {
     }
 }
 
+#[cfg(unix)]
+use crate::peer::StreamIdentity;
+
+type PeerRecheck = dyn Fn() -> Result<VerifiedPeer, IpcError> + Send + Sync;
+
+#[derive(Clone)]
+pub struct ConnectedPeerProof {
+    identity: VerifiedPeer,
+    #[cfg(unix)]
+    stream_identity: StreamIdentity,
+    recheck: Arc<PeerRecheck>,
+}
+
+impl ConnectedPeerProof {
+    #[must_use]
+    pub fn identity(&self) -> VerifiedPeer {
+        self.identity
+    }
+
+    #[cfg(unix)]
+    fn same_binding(&self, other: &Self) -> bool {
+        self.identity == other.identity
+            && self.stream_identity == other.stream_identity
+            && Arc::ptr_eq(&self.recheck, &other.recheck)
+    }
+
+    #[cfg(unix)]
+    fn matches_stream_with<F>(
+        &self,
+        stream: &std::os::unix::net::UnixStream,
+        stream_identity: F,
+    ) -> Result<bool, IpcError>
+    where
+        F: FnOnce(&std::os::unix::net::UnixStream) -> Result<StreamIdentity, IpcError>,
+    {
+        Ok(stream_identity(stream)? == self.stream_identity)
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn stream_identity_for_test(&self) -> StreamIdentity {
+        self.stream_identity
+    }
+}
+
 /// Per-request dispatch context: static server facts plus fresh uptime.
 ///
 /// `granted` is the server-evaluated scope set for the authenticated peer
@@ -278,7 +330,7 @@ impl ServerInfo {
 /// ambient authority). `session_id` binds automation bearers to one debug
 /// session: a bearer issued for another session fails closed with
 /// `ScopeDenied` even when the token is otherwise valid.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ServeContext {
     /// Server facts.
     pub server: ServerInfo,
@@ -290,17 +342,24 @@ pub struct ServeContext {
     /// Opaque debug-session identity for bearer binding (per connection;
     /// the servo must set a distinct id per accepted connection).
     pub session_id: String,
-    /// Local-transport attestation (CTX-0244, CTX-0528/IPC-001): true only
-    /// when the serving path verified the peer is local — the Unix-socket
-    /// accept boundary (per-connection `transport_attested_peer`, P0-AC-021)
-    /// whose [`VerifiedPeer`] marker was passed to
-    /// [`attest_local_peer`](ServeContext::attest_local_peer), or
-    /// same-process in-process dispatch (a test-only marker minted via the
-    /// headless UID check, local by construction). Fail-closed default
-    /// `false`: `frameHash` denies without it, so a future non-local
-    /// dispatch path can never serve digests by accident (no TCP listener
-    /// exists today — keep it that way).
-    pub local_attested: bool,
+    local_attested: bool,
+    peer: Option<ConnectedPeerProof>,
+    #[cfg(test)]
+    test_dispatch: bool,
+}
+
+impl fmt::Debug for ServeContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ServeContext")
+            .field("server", &self.server)
+            .field("uptime_ms", &self.uptime_ms)
+            .field("granted", &self.granted)
+            .field("session_id", &self.session_id)
+            .field("local_attested", &self.local_attested)
+            .field("peer_bound", &self.peer.is_some())
+            .finish()
+    }
 }
 
 impl ServeContext {
@@ -321,27 +380,150 @@ impl ServeContext {
             ),
             session_id: String::from("local"),
             local_attested: false,
+            peer: None,
+            #[cfg(test)]
+            test_dispatch: false,
         }
     }
 
-    /// Mark this context as served over a verified-local transport
-    /// (CTX-0244): call only with the sanitized [`VerifiedPeer`] marker from
-    /// [`transport_attested_peer`] at the Unix-socket accept boundary in
-    /// hand (the marker is the proof — CTX-0528/IPC-001: never call this on
-    /// an unverified stream), or for same-process in-process dispatch (the
-    /// headless verify harness, local by construction). `frameHash` denies
-    /// without this mark; all other methods ignore it.
-    ///
-    /// Takes `&VerifiedPeer` (not `bool`) so the marker type — not a bare
-    /// flag — gates the attestation: call sites must name the proof they
-    /// verified (`let _ = &verified; ctx.attest_local_peer(&verified)`),
-    /// and a future non-local dispatch path cannot set the mark by
-    /// accident.
-    pub fn attest_local_peer(&mut self, _peer: &VerifiedPeer) {
-        self.local_attested = true;
+    #[cfg(unix)]
+    pub fn bind_connected_stream(
+        &mut self,
+        stream: &std::os::unix::net::UnixStream,
+        expected_uid: u32,
+    ) -> Result<ConnectedPeerProof, IpcError> {
+        self.bind_connected_stream_with(stream, move |stream| {
+            crate::peer::verify_unix_stream(stream, expected_uid)
+        })
     }
 
-    /// Build a context with explicit granted scopes (hermetic tests).
+    #[cfg(unix)]
+    pub fn bind_connected_stream_current(
+        &mut self,
+        stream: &std::os::unix::net::UnixStream,
+    ) -> Result<ConnectedPeerProof, IpcError> {
+        let expected_uid = crate::peer::current_unix_uid()?;
+        self.bind_connected_stream(stream, expected_uid)
+    }
+
+    #[cfg(unix)]
+    fn bind_connected_stream_with<F>(
+        &mut self,
+        stream: &std::os::unix::net::UnixStream,
+        verifier: F,
+    ) -> Result<ConnectedPeerProof, IpcError>
+    where
+        F: Fn(&std::os::unix::net::UnixStream) -> Result<VerifiedPeer, IpcError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let stream_identity = crate::peer::stream_identity(stream)?;
+        let identity = verifier(stream)?;
+        if crate::peer::stream_identity(stream)? != stream_identity {
+            return Err(IpcError::Unauthenticated {
+                reason: "connected stream identity changed during binding".into(),
+            });
+        }
+        let probe = stream.try_clone().map_err(|err| IpcError::Unavailable {
+            reason: format!("cannot retain connected peer descriptor: {err}"),
+        })?;
+        let verifier = Arc::new(verifier);
+        let proof = ConnectedPeerProof {
+            identity,
+            stream_identity,
+            recheck: Arc::new(move || verifier(&probe)),
+        };
+        self.peer = Some(proof.clone());
+        #[cfg(test)]
+        {
+            self.test_dispatch = false;
+        }
+        Ok(proof)
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn bind_connected_stream_for_test<F>(
+        &mut self,
+        stream: &std::os::unix::net::UnixStream,
+        verifier: F,
+    ) -> Result<ConnectedPeerProof, IpcError>
+    where
+        F: Fn(&std::os::unix::net::UnixStream) -> Result<VerifiedPeer, IpcError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.bind_connected_stream_with(stream, verifier)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn recheck_before_read(&self, proof: &ConnectedPeerProof) -> Result<(), IpcError> {
+        if !self
+            .peer
+            .as_ref()
+            .is_some_and(|bound| bound.same_binding(proof))
+        {
+            return Err(IpcError::Unauthenticated {
+                reason: "connected peer binding does not match the served stream".into(),
+            });
+        }
+        self.recheck_connection(Some(&proof.identity))
+    }
+
+    pub(crate) fn recheck_before_dispatch(&self) -> Result<(), IpcError> {
+        self.recheck_connection(None)
+    }
+
+    fn recheck_connection(&self, supplied: Option<&VerifiedPeer>) -> Result<(), IpcError> {
+        #[cfg(test)]
+        if self.test_dispatch {
+            return Ok(());
+        }
+        let Some(peer) = &self.peer else {
+            return Err(IpcError::Unauthenticated {
+                reason: "connected peer attestation is unavailable".into(),
+            });
+        };
+        if supplied.is_some_and(|identity| identity != &peer.identity) {
+            return Err(IpcError::Unauthenticated {
+                reason: "connected peer identity changed".into(),
+            });
+        }
+        let identity = (peer.recheck)()?;
+        if identity != peer.identity {
+            return Err(IpcError::Unauthenticated {
+                reason: "connected peer attestation changed".into(),
+            });
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn is_local_attested(&self) -> bool {
+        self.local_attested
+    }
+
+    /// Mark this context as served over a verified-local transport.
+    pub fn attest_local_peer(&mut self, peer: &VerifiedPeer) {
+        #[cfg(test)]
+        if self.test_dispatch {
+            self.local_attested = true;
+            return;
+        }
+        if self
+            .peer
+            .as_ref()
+            .is_some_and(|bound| bound.identity == *peer)
+        {
+            self.local_attested = true;
+        }
+    }
+
+    /// Build an unbound context with explicit granted scopes.
+    ///
+    /// This constructor does not establish peer proof; dispatch remains
+    /// fail-closed until [`Self::bind_connected_stream`] succeeds.
     #[must_use]
     pub fn with_granted(server: &ServerInfo, granted: crate::scope::ScopeSet) -> Self {
         Self {
@@ -350,11 +532,16 @@ impl ServeContext {
             granted,
             session_id: String::from("local"),
             local_attested: false,
+            peer: None,
+            #[cfg(test)]
+            test_dispatch: false,
         }
     }
 
-    /// Build a context with explicit scopes and session binding (hermetic
-    /// automation tests). `session_id` is truncated to 64 chars.
+    /// Build an unbound context with explicit scopes and session binding.
+    ///
+    /// This constructor does not establish peer proof; dispatch remains
+    /// fail-closed until [`Self::bind_connected_stream`] succeeds.
     #[must_use]
     pub fn with_granted_session(
         server: &ServerInfo,
@@ -374,7 +561,31 @@ impl ServeContext {
             granted,
             session_id: id,
             local_attested: false,
+            peer: None,
+            #[cfg(test)]
+            test_dispatch: false,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_granted_for_tests(
+        server: &ServerInfo,
+        granted: crate::scope::ScopeSet,
+    ) -> Self {
+        let mut context = Self::with_granted(server, granted);
+        context.test_dispatch = true;
+        context
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_granted_session_for_tests(
+        server: &ServerInfo,
+        granted: crate::scope::ScopeSet,
+        session_id: &str,
+    ) -> Self {
+        let mut context = Self::with_granted_session(server, granted, session_id);
+        context.test_dispatch = true;
+        context
     }
 }
 
@@ -408,6 +619,8 @@ pub struct HandleOutcome {
     pub response: Vec<u8>,
     /// Whether the response carries `error` rather than `result`.
     pub was_error: bool,
+    /// Whether the connection must close after this response.
+    pub close_connection: bool,
 }
 
 /// Handle one complete request envelope: parse, dispatch, serialize.
@@ -428,6 +641,7 @@ pub fn handle_envelope(
             return HandleOutcome {
                 response: encode_error(id, fault.category, fault.code, &fault.message),
                 was_error: true,
+                close_connection: false,
             };
         }
     };
@@ -435,6 +649,7 @@ pub fn handle_envelope(
         Ok(result_json) => HandleOutcome {
             response: encode_success(&request.id_raw, &result_json),
             was_error: false,
+            close_connection: false,
         },
         Err(handler_err) => HandleOutcome {
             response: encode_error(
@@ -444,6 +659,7 @@ pub fn handle_envelope(
                 &handler_err.message,
             ),
             was_error: true,
+            close_connection: handler_err.code == "Unauthenticated",
         },
     }
 }
@@ -681,8 +897,8 @@ pub struct SocketEndpointIdentity {
 ///
 /// Server bind uses [`prepare_socket_dir`] + [`attest_bound_socket`] instead
 /// (they create and chmod); this function is for pre-connect verification
-/// (client) and per-connection re-verification (server accept via
-/// [`transport_attested_peer`]).
+/// and independent endpoint tamper checks. The server must also bind and
+/// recheck the connected stream through [`ServeContext::bind_connected_stream`].
 ///
 /// # Errors
 ///
@@ -940,35 +1156,96 @@ pub struct ConnectionStats {
     pub framing_errors: u64,
 }
 
-/// Serve one connection until EOF, idle timeout, or fatal transport error.
+/// Serve one bound Unix connection until EOF, idle timeout, or fatal error.
+#[cfg(unix)]
+pub fn serve_bound_connection(
+    stream: &mut std::os::unix::net::UnixStream,
+    proof: &ConnectedPeerProof,
+    dispatcher: &Dispatcher,
+    context: &ServeContext,
+    limiter: &mut RateLimiter,
+    clock_ms: &dyn Fn() -> u64,
+) -> Result<ConnectionStats, IpcError> {
+    serve_bound_connection_with_identity(
+        stream,
+        proof,
+        dispatcher,
+        context,
+        limiter,
+        clock_ms,
+        crate::peer::stream_identity,
+    )
+}
+
+#[cfg(unix)]
+fn serve_bound_connection_with_identity<F>(
+    stream: &mut std::os::unix::net::UnixStream,
+    proof: &ConnectedPeerProof,
+    dispatcher: &Dispatcher,
+    context: &ServeContext,
+    limiter: &mut RateLimiter,
+    clock_ms: &dyn Fn() -> u64,
+    stream_identity: F,
+) -> Result<ConnectionStats, IpcError>
+where
+    F: FnOnce(&std::os::unix::net::UnixStream) -> Result<StreamIdentity, IpcError>,
+{
+    if !proof.matches_stream_with(stream, stream_identity)? {
+        return Err(IpcError::Unauthenticated {
+            reason: "connected peer proof does not match the accepted stream".into(),
+        });
+    }
+    context.recheck_before_read(proof)?;
+    serve_connection_inner(stream, dispatcher, context, limiter, clock_ms)
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn serve_bound_connection_with_test_identity<F>(
+    stream: &mut std::os::unix::net::UnixStream,
+    proof: &ConnectedPeerProof,
+    dispatcher: &Dispatcher,
+    context: &ServeContext,
+    limiter: &mut RateLimiter,
+    clock_ms: &dyn Fn() -> u64,
+    stream_identity: F,
+) -> Result<ConnectionStats, IpcError>
+where
+    F: FnOnce(&std::os::unix::net::UnixStream) -> Result<StreamIdentity, IpcError>,
+{
+    serve_bound_connection_with_identity(
+        stream,
+        proof,
+        dispatcher,
+        context,
+        limiter,
+        clock_ms,
+        stream_identity,
+    )
+}
+
+/// Serve a generic test stream with an already checked context.
 ///
-/// Reads length-prefixed frames (`u32` BE + payload `<= 256 KiB`), rate-limits
-/// per request (`RC-9` via `limiter` and caller-supplied `clock_ms`), and
-/// dispatches via [`handle_envelope`]. Oversize frames get one correlated
-/// error response and then the connection closes (fail-closed, no stream
-/// desync). Rate-limited requests get an error response and the connection
-/// stays open.
-///
-/// Authentication happens at the accept boundary, not here: the caller must
-/// verify peer UID before the first byte via
-/// [`verify_peer_for_connection`](crate::auth::verify_peer_for_connection)
-/// or [`transport_attested_peer`], and pass only the resulting sanitized
-/// [`VerifiedPeer`] marker. This function takes no `PeerCredentials`-typed
-/// value, so credential dataflow ends at the accept boundary and never
-/// reaches serving counters or logging (CodeQL `cleartext logging of
-/// sensitive information` clean by construction).
-///
-/// The stream is generic (`Read + Write`) so headless tests drive this exact
-/// function over `UnixStream::pair`; the servo passes live streams with
-/// read/write timeouts already set. Idle timeouts surface as a clean close
-/// (`Ok`), never an error.
-///
-/// # Errors
-///
-/// Returns `Transport` when the stream fails mid-protocol.
-pub fn serve_connection<S>(
+/// Production callers use [`serve_bound_connection`], which additionally
+/// proves that the stream is the descriptor captured by the verifier.
+#[cfg(all(test, unix))]
+pub(crate) fn serve_connection<S>(
     stream: &mut S,
-    _peer: VerifiedPeer,
+    peer: VerifiedPeer,
+    dispatcher: &Dispatcher,
+    context: &ServeContext,
+    limiter: &mut RateLimiter,
+    clock_ms: &dyn Fn() -> u64,
+) -> Result<ConnectionStats, IpcError>
+where
+    S: Read + Write,
+{
+    context.recheck_connection(Some(&peer))?;
+    serve_connection_inner(stream, dispatcher, context, limiter, clock_ms)
+}
+
+#[cfg(unix)]
+fn serve_connection_inner<S>(
+    stream: &mut S,
     dispatcher: &Dispatcher,
     context: &ServeContext,
     limiter: &mut RateLimiter,
@@ -979,8 +1256,6 @@ where
 {
     let mut stats = ConnectionStats::default();
     loop {
-        // Read the 4-byte header, distinguishing clean EOF (zero bytes) from
-        // truncation, and idle timeout (clean close) from hard failure.
         let mut first = [0u8; 1];
         match stream.read(&mut first) {
             Ok(0) => return Ok(stats),
@@ -1064,10 +1339,16 @@ where
             });
         }
         stats.responses += 1;
+        if outcome.close_connection {
+            return Err(IpcError::Unauthenticated {
+                reason: "connected peer recheck failed".into(),
+            });
+        }
     }
 }
 
 /// Frame and write one response payload.
+#[cfg(unix)]
 fn write_framed<S>(stream: &mut S, response: &[u8]) -> std::io::Result<()>
 where
     S: Read + Write,
@@ -1082,46 +1363,18 @@ where
     stream.flush()
 }
 
-/// Peer identity verified at the accept boundary (`SO_PEERCRED`-class).
+/// Test-only endpoint precondition fixture.
 ///
-/// Verifies the bound socket endpoint before minting the sanitized
-/// [`VerifiedPeer`] marker: the parent directory must be `0700` owned by
-/// `runtime_uid` and the socket file must be `0600` owned by `runtime_uid`,
-/// with symlinks rejected at either layer (see
-/// [`verify_socket_endpoint_for_connect`]). On success the endpoint owner is
-/// wired explicitly through the headless [`verify_peer_uid`](crate::auth::verify_peer_uid)
-/// primitive (the `0600` kernel gate means only the owner UID could have
-/// connected, so the socket owner is the peer proxy), and the marker is
-/// minted only after that check passes.
-///
-/// A forged `BITTY_SOCKET` pointing elsewhere fails here (wrong owner, mode,
-/// or symlink) before [`serve_connection`] reads the first byte. The accept
-/// boundary in `bitty-app/src/ipc_serve.rs` calls this per connection, so
-/// endpoint replacement after bind cannot escalate to serving.
-///
-/// Returns a sanitized [`VerifiedPeer`] marker carrying no credential bytes,
-/// so no `PeerCredentials`-typed value flows into the serving/logging path.
-///
-/// True per-connection `SO_PEERCRED` re-verification against file-descriptor
-/// passing (defense in depth beyond the `0600` gate) needs either nightly
-/// `peer_credentials_unix_socket` (still unstable, rust-lang/rust#42839) or
-/// a reviewed `unsafe` `getsockopt` seam, both `forbid(unsafe)`-incompatible
-/// here; it remains recorded hardening for CTX-0159.
-///
-/// # Errors
-///
-/// Returns `InvalidRequest` for malformed paths, `Unavailable` for
-/// filesystem failures, and `Unauthenticated` for ownership/mode/symlink or
-/// peer-UID violations (fail-closed: the caller must drop the connection).
-#[cfg(unix)]
-pub fn transport_attested_peer(
+/// This checks filesystem owner, mode, and symlink state only; it is not
+/// accepted-stream peer proof and is not compiled into production builds.
+/// Live serving requires [`ServeContext::bind_connected_stream`] and fails
+/// closed when no platform verifier is available.
+#[cfg(all(test, unix))]
+pub(crate) fn transport_attested_peer(
     socket_path: &str,
     runtime_uid: u32,
 ) -> Result<VerifiedPeer, IpcError> {
     verify_socket_endpoint_for_connect(socket_path, runtime_uid)?;
-    // SO_PEERCRED-class wiring: the verified socket owner is the peer proxy
-    // under the 0600 gate. Re-read the owner for the UID check so the
-    // headless primitive, not just the endpoint check, gates the marker.
     let sock_uid = {
         use std::os::unix::fs::MetadataExt;
         std::fs::symlink_metadata(socket_path)
@@ -1140,17 +1393,6 @@ pub fn transport_attested_peer(
     };
     verify_peer_uid(PeerCredentials::new(sock_uid, sock_gid, 0), runtime_uid)?;
     VerifiedPeer::attested(PeerCredentials::new(sock_uid, sock_gid, 0), runtime_uid)
-}
-
-/// Non-unix stub for [`transport_attested_peer`](fn.transport_attested_peer).
-#[cfg(not(unix))]
-pub fn transport_attested_peer(
-    _socket_path: &str,
-    _runtime_uid: u32,
-) -> Result<VerifiedPeer, IpcError> {
-    Err(IpcError::Unavailable {
-        reason: "unix socket serving requires a unix platform".into(),
-    })
 }
 
 /// Maximum concurrent connections served (`RC-9`, shed newest).

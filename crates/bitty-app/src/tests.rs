@@ -224,9 +224,10 @@ fn fail_loud_makes_an_unavailable_ipc_servo_fatal_only_when_opted_in() {
         message.contains("--fail-loud") && message.contains("bind /x failed"),
         "diagnostic must name the flag and the reason, got {message:?}"
     );
-    // A healthy or merely unsupported (disabled, no reason) servo is never
-    // fatal, even with --fail-loud.
-    let disabled = ipc_serve::IpcServeGuard::disabled_for_tests();
+    // A healthy or platform-unsupported (disabled, no failure reason) servo is
+    // never fatal, even with --fail-loud.
+    let disabled = ipc_serve::IpcServeGuard::unsupported_for_tests();
+    assert!(disabled.socket_path().is_empty());
     assert!(ipc_serve_failure_exit(true, &disabled).is_none());
 }
 

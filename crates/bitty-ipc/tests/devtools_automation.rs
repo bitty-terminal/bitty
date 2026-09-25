@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Socket-level automation proof over the devtools socket (CTX-0188).
 //!
 //! CTX-0183 harness pattern: publish known runtime snapshots into the live
@@ -28,7 +30,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bitty_ipc::devtools::{
     AutomationFamily, Dispatcher, ServeContext, ServerInfo, attest_bound_socket,
     clear_automation_for_tests, clear_introspection_for_tests, issue_automation_bearer,
-    prepare_socket_dir, publish_grid_text, serve_connection, transport_attested_peer,
+    prepare_socket_dir, publish_grid_text, serve_bound_connection,
 };
 use bitty_ipc::frame::{MAX_FRAME_BYTES, encode_frame};
 use bitty_ipc::limits::RateLimiter;
@@ -128,10 +130,11 @@ fn spawn_automation_server(
             .unwrap();
         let dir = prepare_socket_dir(&socket_path).unwrap();
         let runtime_uid = attest_bound_socket(&socket_path, &dir).unwrap();
-        let verified = transport_attested_peer(&socket_path, runtime_uid).unwrap();
         let dispatcher = Dispatcher::with_defaults();
         let server = ServerInfo::new("automation-proof".to_string(), socket_path.clone(), 80, 24);
-        let context = ServeContext::with_granted_session(&server, granted, &session);
+        let mut context = ServeContext::with_granted_session(&server, granted, &session);
+        let proof = context.bind_connected_stream(&stream, runtime_uid).unwrap();
+        context.attest_local_peer(&proof.identity());
         let mut limiter = RateLimiter::rc9_default();
         let clock = || {
             SystemTime::now()
@@ -139,9 +142,9 @@ fn spawn_automation_server(
                 .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
                 .unwrap_or(0)
         };
-        let stats = serve_connection(
+        let stats = serve_bound_connection(
             &mut stream,
-            verified,
+            &proof,
             &dispatcher,
             &context,
             &mut limiter,

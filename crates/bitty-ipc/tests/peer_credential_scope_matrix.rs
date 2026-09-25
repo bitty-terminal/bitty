@@ -1,15 +1,11 @@
-//! R-011 IPC peer-credential/scope closure (SEC-08, Issue #1077).
+//! R-011 IPC scope closure (SEC-08, Issue #1077).
 //!
-//! Negative auth (foreign UID, tampered peer creds, tampered endpoint) plus
-//! the full scope x action matrix over the generic IPC registry and the
-//! `bitty ctl` control registry. P0-AC-021 / P0-AC-022.
+//! Full scope x action matrix over the generic IPC registry and the `bitty
+//! ctl` control registry. Peer-credential and connected-stream regressions
+//! live with the platform-bound IPC tests.
 //!
 //! Headless and network-free: no sockets, no threads, no wall-clock.
 
-use bitty_ipc::auth::{
-    PeerCredentials, verify_peer_for_connection, verify_peer_uid, verify_unix_endpoint,
-    verify_windows_pipe,
-};
 use bitty_ipc::bridge::BridgeClient;
 use bitty_ipc::ctl::{all_control_methods, authorize_ctl_method, required_scope_for_ctl_method};
 use bitty_ipc::error::{ErrorClass, IpcError};
@@ -17,22 +13,6 @@ use bitty_ipc::scope::{
     ConsentLedger, Scope, ScopeSet, all_known_methods, authorize_method, required_scope_for_method,
 };
 use bitty_ipc::wire::{validate_no_ambient_auth, validate_request_envelope};
-
-const RUNTIME_UID: u32 = 1000;
-const FOREIGN_UID: u32 = 2000;
-
-fn expect_unauthenticated(result: Result<(), IpcError>, what: &str) {
-    let err = result.unwrap_err();
-    assert!(
-        matches!(err, IpcError::Unauthenticated { .. }),
-        "{what}: expected Unauthenticated, got {err:?}"
-    );
-    assert_eq!(
-        err.error_class(),
-        ErrorClass::Unauthenticated,
-        "{what}: wrong error class"
-    );
-}
 
 fn expect_scope_denied(result: Result<Scope, IpcError>, method: &str, scope: Scope) {
     let err = result.unwrap_err();
@@ -42,117 +22,6 @@ fn expect_scope_denied(result: Result<Scope, IpcError>, method: &str, scope: Sco
     };
     assert_eq!(denied_scope, scope.as_str(), "{method}: wrong scope");
     assert_eq!(action, method, "{method}: wrong action");
-}
-
-// ── negative auth ───────────────────────────────────────────────────────────
-
-#[test]
-fn foreign_uid_denied_at_every_gate() {
-    let foreign = PeerCredentials::new(FOREIGN_UID, FOREIGN_UID, 99);
-    expect_unauthenticated(verify_peer_uid(foreign, RUNTIME_UID), "verify_peer_uid");
-    expect_unauthenticated(
-        verify_peer_for_connection(foreign, RUNTIME_UID).map(|_| ()),
-        "verify_peer_for_connection",
-    );
-    expect_unauthenticated(
-        verify_unix_endpoint(RUNTIME_UID, foreign, 0o700, RUNTIME_UID, 0o600, RUNTIME_UID),
-        "verify_unix_endpoint",
-    );
-    assert!(verify_windows_pipe(FOREIGN_UID.into(), RUNTIME_UID.into()).is_err());
-}
-
-#[test]
-fn uid_tamper_by_one_denied() {
-    for tampered in [RUNTIME_UID - 1, RUNTIME_UID + 1, 0, u32::MAX] {
-        let peer = PeerCredentials::new(tampered, 1000, 42);
-        expect_unauthenticated(
-            verify_peer_uid(peer, RUNTIME_UID),
-            &format!("tampered uid {tampered}"),
-        );
-        assert!(
-            verify_peer_for_connection(peer, RUNTIME_UID).is_err(),
-            "tampered uid {tampered} must mint no marker"
-        );
-    }
-    // Sanity: the true UID still passes.
-    let good = PeerCredentials::new(RUNTIME_UID, 1000, 42);
-    assert!(verify_peer_uid(good, RUNTIME_UID).is_ok());
-    assert!(verify_peer_for_connection(good, RUNTIME_UID).is_ok());
-}
-
-#[test]
-fn gid_pid_tamper_changes_nothing() {
-    // The verdict is UID-only: wild gid/pid neither grant nor bypass.
-    for (gid, pid) in [(0, 0), (u32::MAX, -1), (9999, i32::MAX), (1000, 42)] {
-        let same_uid = PeerCredentials::new(RUNTIME_UID, gid, pid);
-        assert!(
-            verify_peer_uid(same_uid, RUNTIME_UID).is_ok(),
-            "same UID with gid {gid} pid {pid} must pass"
-        );
-        let foreign = PeerCredentials::new(FOREIGN_UID, gid, pid);
-        assert!(
-            verify_peer_uid(foreign, RUNTIME_UID).is_err(),
-            "foreign UID with gid {gid} pid {pid} must fail"
-        );
-    }
-}
-
-#[test]
-fn tampered_endpoint_each_check_fails_closed() {
-    let peer = PeerCredentials::new(RUNTIME_UID, RUNTIME_UID, 1);
-    // Baseline passes.
-    assert!(
-        verify_unix_endpoint(RUNTIME_UID, peer, 0o700, RUNTIME_UID, 0o600, RUNTIME_UID).is_ok()
-    );
-    // Each single mutation fails: modes, owners, and modes with extra bits.
-    let cases: &[(u32, u32, u32, u32, &str)] = &[
-        (
-            0o755,
-            RUNTIME_UID,
-            0o600,
-            RUNTIME_UID,
-            "group/world-readable dir",
-        ),
-        (
-            0o700,
-            RUNTIME_UID,
-            0o644,
-            RUNTIME_UID,
-            "group-readable socket",
-        ),
-        (0o700, 999, 0o600, RUNTIME_UID, "dir owner swapped"),
-        (0o700, RUNTIME_UID, 0o600, 999, "socket owner swapped"),
-        (
-            0o700,
-            FOREIGN_UID,
-            0o600,
-            FOREIGN_UID,
-            "endpoint owned by foreign uid",
-        ),
-        (0o1700, RUNTIME_UID, 0o600, RUNTIME_UID, "sticky dir"),
-        (0o4700, RUNTIME_UID, 0o600, RUNTIME_UID, "setuid dir"),
-        (
-            0o700,
-            RUNTIME_UID,
-            0o0600 | 0o111,
-            RUNTIME_UID,
-            "executable socket",
-        ),
-        (0o777, 0, 0o777, 0, "world-writable root-owned endpoint"),
-    ];
-    for (dir_mode, dir_owner, sock_mode, sock_owner, what) in cases {
-        expect_unauthenticated(
-            verify_unix_endpoint(
-                RUNTIME_UID,
-                peer,
-                *dir_mode,
-                *dir_owner,
-                *sock_mode,
-                *sock_owner,
-            ),
-            what,
-        );
-    }
 }
 
 #[test]

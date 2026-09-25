@@ -32,11 +32,11 @@
 //!   with 13 distinct scopes, `ScopeSet` defaults for CLI interactive vs
 //!   MCP/Agent read-only, per-method required scope, server-side
 //!   `authorize_method`, and per-client/per-scope `ConsentLedger` (scope).
-//! - Auth: headless peer-credential verification via UID equality
-//!   (`auth::verify_peer_uid`, `auth::verify_unix_endpoint` for `SO_PEERCRED`
-//!   / `LOCAL_PEERCRED`, `auth::verify_windows_pipe` for named-pipe ACL),
-//!   and short-lived child tokens over PTY fd never via environment
-//!   (`auth::ChildToken`, `auth::ChildTokenStore`, 60 s TTL, bounded 64).
+//! - Auth: safe platform peer-credential adapters via `rustix` on Linux and
+//!   `nix` on macOS/BSD, UID verification, and explicit unsupported results
+//!   on other targets; short-lived child tokens over PTY fd never via
+//!   environment (`auth::ChildToken`, `auth::ChildTokenStore`, 60 s TTL,
+//!   bounded 64).
 //! - Rate limits: `RC-9` (100 req/s, 2x burst, 1 MiB payload, 16 concurrent
 //!   connections, shed newest) and `RC-10` (256 KiB stream chunk ceiling)
 //!   with headless `limits::RateLimiter` and payload/connection checks.
@@ -44,7 +44,7 @@
 //!   `forward_to` headless pipe simulation, no OS handle, fail-closed at
 //!   capacity, `send_drop_oldest` only for observation streams.
 //! - DevTools socket contract (`devtools::Dispatcher`,
-//!   `devtools::resolve_socket_path`, `devtools::serve_connection`):
+//!   `devtools::resolve_socket_path`, `devtools::serve_bound_connection`):
 //!   headless `bitty.debug/*` request parsing, extensible method dispatch
 //!   (`ping`, `getSnapshot`), framed serving over caller-provided streams,
 //!   and socket-directory attestation (`0700`/`0600`). Opens no socket
@@ -106,8 +106,8 @@
 //! # Ownership rules (ADR-0003 / ADR-0004)
 //!
 //! - **Depends on:** no workspace crate (isolated boundary row; may be wired
-//!   into `bitty-runtime` in a follow-up slice). No third-party dependencies
-//!   — pure `std` only.
+//!   into `bitty-runtime` in a follow-up slice). Target-scoped safe platform
+//!   adapters use `rustix` and `nix`; all local code remains `forbid(unsafe)`.
 //! - **Never holds** GPU objects, window handles, PTY file descriptors, or
 //!   internal hot-path objects. It observes nothing from the VT/grid hot path
 //!   except bounded snapshots it is explicitly handed.
@@ -132,6 +132,7 @@ pub mod frame_digest;
 pub mod host_bridge;
 pub mod limits;
 pub mod mcp;
+mod peer;
 pub mod rich_fragment;
 pub mod scope;
 pub mod snapshot;
@@ -141,9 +142,7 @@ pub mod wire;
 
 pub use auth::{
     CHILD_TOKEN_TTL_MS, ChildToken, ChildTokenStore, DIR_MODE, MAX_CHILD_TOKENS,
-    MAX_SCOPED_ID_BYTES, MAX_TOKEN_TTL_MS, PeerCredentials, SOCKET_MODE, VerifiedPeer,
-    is_child_eligible_scope, verify_peer_for_connection, verify_peer_uid, verify_unix_endpoint,
-    verify_windows_pipe,
+    MAX_SCOPED_ID_BYTES, MAX_TOKEN_TTL_MS, SOCKET_MODE, VerifiedPeer, is_child_eligible_scope,
 };
 pub use bridge::{BridgeClient, MAX_BRIDGE_CLIENT_ID_BYTES, MAX_BRIDGE_PARAMS_BYTES};
 pub use channel::{
@@ -169,10 +168,10 @@ pub use execution_verbs::{
 };
 pub use frame::{Frame, Framer, MAX_BUFFERED_BYTES, MAX_FRAME_BYTES, decode_frame, encode_frame};
 pub use host_bridge::{
-    HostCaller, INSPECT_STATUS_TOOL, INSPECT_TEXT_TOOL, MAX_LIVE_SNAPSHOTS,
-    clear_live_snapshots_for_tests, inspect_status_provider, inspect_status_spec,
-    inspect_text_provider, inspect_text_spec, live_snapshot_count, live_snapshot_provider,
-    publish_live_snapshot, register_live_inspect_tools, retire_live_snapshot,
+    INSPECT_STATUS_TOOL, INSPECT_TEXT_TOOL, MAX_LIVE_SNAPSHOTS, clear_live_snapshots_for_tests,
+    inspect_status_provider, inspect_status_spec, inspect_text_provider, inspect_text_spec,
+    live_snapshot_count, live_snapshot_provider, publish_live_snapshot,
+    register_live_inspect_tools, retire_live_snapshot,
 };
 pub use limits::{
     RC9_BURST_PER_SEC, RC9_MAX_CONNECTIONS, RC9_PAYLOAD_CAP_BYTES, RC9_REQ_PER_SEC, RC9_WINDOW_MS,
@@ -182,6 +181,7 @@ pub use mcp::{
     DEFAULT_MCP_TIMEOUT_MS, MAX_MCP_PENDING, McpClientConfig, McpClientStub, McpNotification,
     McpRequest as McpIpcRequest, McpResponse as McpIpcResponse,
 };
+pub use peer::{accepted_stream_peer_attestation_available, current_unix_uid};
 pub use rich_fragment::{
     FragmentData, FragmentIngestService, MAX_FRAGMENT_TEXT_BYTES, MAX_PENDING_FRAGMENTS,
     RichFragment,
@@ -213,10 +213,10 @@ pub use wire::{
 /// Importing through `bitty_ipc::draft` keeps call sites that depend on the
 /// provisional surface self-documenting. The `draft` path now mirrors the
 /// accepted RFC's stable scopes/auth/wire; it remains for compatibility while
-/// new imports should prefer the top-level `bitty_ipc::Scope` / `PeerCredentials`.
+/// new imports should prefer the top-level `bitty_ipc::Scope`.
 #[allow(clippy::mixed_attributes_style)]
 pub mod draft {
-    pub use crate::auth::{ChildToken, ChildTokenStore, PeerCredentials};
+    pub use crate::auth::{ChildToken, ChildTokenStore};
     pub use crate::channel::{
         BoundedChannel, DEFAULT_REQUEST_TIMEOUT_MS, IpcEndpoint, IpcRequest, IpcResponse,
         MAX_REQUEST_TIMEOUT_MS, RequestId,
@@ -286,9 +286,9 @@ mod smoke {
         assert!(authorize_method("terminal.close", &cli).is_err());
 
         // Auth: same UID passes, different fails
-        let peer = PeerCredentials::new(1000, 1000, 42);
-        assert!(verify_peer_uid(peer, 1000).is_ok());
-        assert!(verify_peer_uid(peer, 1001).is_err());
+        let peer = crate::auth::PeerCredentials::new(1000, 1000, 42);
+        assert!(crate::auth::verify_peer_uid(peer, 1000).is_ok());
+        assert!(crate::auth::verify_peer_uid(peer, 1001).is_err());
 
         // Wire version
         assert!(validate_wire_version(1).is_ok());

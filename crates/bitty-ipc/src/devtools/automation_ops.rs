@@ -838,8 +838,8 @@ fn audit_digest_attempt(
 /// Params (object, `<= 32 KiB`): `{ terminalId|terminal_id: "t:N", bearer:
 /// "<token>" }`. Requires `debug.trace` + `terminal.inspect` plus a live
 /// `frame-digest` bearer for the addressed terminal/session, a
-/// local-attested transport ([`ServeContext::local_attested`], P0-AC-021
-/// parity), and a published headless frame. Returns the SHA-256 hex digest
+/// local-attested transport (the bound peer marker, P0-AC-021 parity), and a
+/// published headless frame. Returns the SHA-256 hex digest
 /// over `canonical_frame_bytes(width_px, height_px, frame_seq, rgba)` — 32
 /// bytes that prove frame equality with zero pixel bytes on the wire —
 /// plus the bound geometry and `"trust":"untrusted-observation"` (T-10
@@ -879,10 +879,10 @@ pub(super) fn handle_frame_hash(
         ));
     }
     // Local-only transport, revalidated per call before any digest work:
-    // the Unix-socket accept boundary (`transport_attested_peer`) or
-    // same-process dispatch must have marked this context. Never over TCP
-    // (no listener exists) and never for a foreign user.
-    if !context.local_attested {
+    // the connected-stream binding or same-process dispatch must have marked
+    // this context. Never over TCP (no listener exists) and never for a
+    // foreign user.
+    if !context.is_local_attested() {
         audit_digest_attempt(&context.session_id, &terminal_id, context.uptime_ms, 0, "");
         return Err(HandlerError::new(
             "scope",

@@ -434,12 +434,13 @@ pub use record::{
     recording_count_for_tests, replay_recording, set_recording_opt_in, start_recording,
     stop_recording,
 };
+#[cfg(unix)]
+pub use serve::serve_bound_connection;
 pub use serve::{
-    ConnectionStats, DirAttestation, HandleOutcome, ServeContext, ServerInfo,
+    ConnectedPeerProof, ConnectionStats, DirAttestation, HandleOutcome, ServeContext, ServerInfo,
     SocketEndpointIdentity, SocketEnv, attest_bound_socket, encode_error, encode_success,
     handle_envelope, id_zero_error, max_connections, prepare_socket_dir, resolve_socket_path,
-    resolve_socket_path_from_env, serve_connection, transport_attested_peer,
-    verify_connected_endpoint, verify_socket_endpoint_for_connect,
+    resolve_socket_path_from_env, verify_connected_endpoint, verify_socket_endpoint_for_connect,
 };
 pub use trace::{
     MAX_ACTIVE_TRACES, MAX_TRACE_BYTES, MAX_TRACE_DURATION_MS, TRACE_CHUNK_BYTES,

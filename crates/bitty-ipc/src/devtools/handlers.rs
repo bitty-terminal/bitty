@@ -265,6 +265,13 @@ impl Dispatcher {
         context: &ServeContext,
         request: &DevtoolsRequest,
     ) -> Result<String, HandlerError> {
+        if context.recheck_before_dispatch().is_err() {
+            return Err(HandlerError::new(
+                "scope",
+                "Unauthenticated",
+                "connected peer recheck failed".into(),
+            ));
+        }
         match self.handlers.get(request.method.as_str()) {
             Some(handler) => handler(context, request),
             None => Err(HandlerError::new(

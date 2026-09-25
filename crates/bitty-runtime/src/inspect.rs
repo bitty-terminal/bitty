@@ -667,6 +667,7 @@ mod tests {
         assert_eq!(all[3].kind, InputKind::Focus);
     }
 
+    #[cfg(unix)]
     #[test]
     fn publish_round_trip_reaches_serving_store() {
         clear_live_store_for_tests();
@@ -705,7 +706,11 @@ mod tests {
         // that has been granted `debug.inspect`.
         let mut granted = bitty_ipc::scope::ScopeSet::cli_default();
         granted.insert(bitty_ipc::scope::Scope::DebugInspect);
-        let context = bitty_ipc::devtools::ServeContext::with_granted(&server, granted);
+        let (_client, stream) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut context = bitty_ipc::devtools::ServeContext::with_granted(&server, granted);
+        context
+            .bind_connected_stream_current(&stream)
+            .expect("bind peer proof");
         let outcome = bitty_ipc::devtools::handle_envelope(
             br#"{"id":1,"method":"bitty.debug/getGridText","version":"1.0"}"#,
             &dispatcher,

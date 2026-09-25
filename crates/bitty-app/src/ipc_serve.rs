@@ -13,9 +13,10 @@
 //! serving with one stderr line and the terminal continues normally. Stale
 //! socket files from dead instances are reclaimed after a live check; a live
 //! peer keeps its socket (no stealing). Directory and socket modes are
-//! `0700`/`0600` with owner attestation; peer UID equality is verified
-//! before the first request byte is parsed; per-connection `RC-9` rate
-//! limits apply and the 16-connection cap sheds the newest arrival.
+//! `0700`/`0600` with owner and endpoint checks kept separate from peer proof.
+//! Normal Unix serving is disabled unless the accepted-stream platform seam
+//! can attest identity; per-connection `RC-9` rate limits and the 16-connection
+//! cap remain bounded.
 //!
 //! # Platform
 //!
@@ -105,6 +106,11 @@ impl IpcServeGuard {
         guard.failure_reason = Some(reason.to_string());
         guard
     }
+
+    #[cfg(test)]
+    pub(crate) fn unsupported_for_tests() -> Self {
+        Self::disabled_for_tests()
+    }
 }
 
 impl Drop for IpcServeGuard {
@@ -128,22 +134,19 @@ impl Drop for IpcServeGuard {
 pub fn serve_in_background(descriptor: ServerDescriptor) -> IpcServeGuard {
     #[cfg(unix)]
     {
-        unix_serve(descriptor)
+        unix_serve(
+            descriptor,
+            &bitty_ipc::devtools::SocketEnv::from_process_env(),
+        )
     }
     #[cfg(not(unix))]
     {
         let _ = descriptor;
-        crate::logging::warn(|| {
-            String::from(
-                "bitty: ipc socket serving is unavailable on this platform (continuing without IPC)",
-            )
-        });
+        let reason = "ipc socket serving is unavailable on this platform";
+        crate::logging::warn(|| format!("bitty: {reason} (continuing without IPC)"));
         IpcServeGuard {
             enabled: false,
             socket_path: String::new(),
-            // Deliberately no failure reason: a platform that cannot serve
-            // is not a servable-request failure, and `--fail-loud` must
-            // stay usable there (CTX-0481).
             failure_reason: None,
             shutdown: Arc::new(AtomicBool::new(true)),
         }
@@ -151,9 +154,23 @@ pub fn serve_in_background(descriptor: ServerDescriptor) -> IpcServeGuard {
 }
 
 /// Unix serving path: resolve, prepare, reclaim, bind, attest, spawn.
+/// `env` is the advisory resolution input, passed explicitly so tests can
+/// cover the enabled path without mutating process-global state.
 #[cfg(unix)]
-fn unix_serve(descriptor: ServerDescriptor) -> IpcServeGuard {
-    match try_listen() {
+fn unix_serve(descriptor: ServerDescriptor, env: &bitty_ipc::devtools::SocketEnv) -> IpcServeGuard {
+    if !bitty_ipc::accepted_stream_peer_attestation_available() {
+        let reason =
+            "accepted-stream peer attestation is unavailable; IPC surface disabled".to_string();
+        crate::logging::warn(|| format!("bitty: ipc unavailable (fail-soft): {reason}"));
+        return IpcServeGuard {
+            enabled: false,
+            socket_path: String::new(),
+            failure_reason: None,
+            shutdown: Arc::new(AtomicBool::new(true)),
+            handle: None,
+        };
+    }
+    match try_listen(env) {
         Ok(listen) => {
             // CTX-0506: test mode registers the E2E surface (`testInfo`,
             // `testExit`); normal instances keep the default table.
@@ -219,13 +236,13 @@ struct BoundListener {
 }
 
 /// Resolve, prepare, reclaim stale, bind, and attest. Fail-soft: every
-/// failure is a `String` reason, never a panic.
+/// failure is a `String` reason, never a panic. `env` is the explicit
+/// resolution input (never re-read from the process environment here).
 #[cfg(unix)]
-fn try_listen() -> Result<BoundListener, String> {
+fn try_listen(env: &bitty_ipc::devtools::SocketEnv) -> Result<BoundListener, String> {
     use std::os::unix::net::{UnixListener, UnixStream};
 
-    let env = bitty_ipc::devtools::SocketEnv::from_process_env();
-    let (socket_path, instance) = bitty_ipc::devtools::resolve_socket_path_from_env(&env, None)
+    let (socket_path, instance) = bitty_ipc::devtools::resolve_socket_path_from_env(env, None)
         .map_err(|err| {
             format!("socket path unavailable: {err} (set XDG_RUNTIME_DIR or BITTY_SOCKET)")
         })?;
@@ -359,21 +376,6 @@ impl Drop for ActiveCount {
     }
 }
 
-/// Serve one accepted stream: timeouts, accept-boundary auth, dispatch loop.
-///
-/// Peer identity is verified at the accept boundary before [`serve_connection`]
-/// reads the first byte: the bound socket endpoint is re-verified per
-/// connection (`0700` dir + `0600` socket, both owned by `runtime_uid`, no
-/// symlinks) via [`bitty_ipc::devtools::transport_attested_peer`], which folds
-/// the `0600` kernel gate (only the owner UID could have connected) plus an
-/// explicit headless UID check into a sanitized
-/// [`bitty_ipc::auth::VerifiedPeer`] marker carrying no credential bytes.
-/// Verification failure drops the connection before the first byte is read
-/// (fail-closed, one stderr line, never serving). [`serve_connection`] takes
-/// only the marker, so no `PeerCredentials`-typed value flows into the serving
-/// counters or the `eprintln` logging below (CodeQL `cleartext logging of
-/// sensitive information` clean by construction). See `transport_attested_peer`
-/// for the contract and the recorded `SO_PEERCRED` hardening for CTX-0159.
 #[cfg(unix)]
 fn serve_stream(
     mut stream: std::os::unix::net::UnixStream,
@@ -399,26 +401,25 @@ fn serve_stream(
     {
         return;
     }
-    // Accept-boundary verification: verified marker first, serving second.
-    // No credential-typed value survives past this line. Fail-closed: a
-    // tampered endpoint drops the connection before the first byte is read.
-    let verified =
-        match bitty_ipc::devtools::transport_attested_peer(&server.socket_path, runtime_uid) {
-            Ok(peer) => peer,
-            Err(err) => {
-                crate::logging::warn(|| {
-                    format!("bitty: ipc connection rejected (endpoint verification): {err}")
-                });
-                return;
-            }
-        };
+    if let Err(err) =
+        bitty_ipc::devtools::verify_socket_endpoint_for_connect(&server.socket_path, runtime_uid)
+    {
+        crate::logging::warn(|| {
+            format!("bitty: ipc connection rejected (endpoint verification): {err}")
+        });
+        return;
+    }
     let mut context = bitty_ipc::devtools::ServeContext::new(server);
-    // CTX-0244: this connection passed peer-credential verification at the
-    // Unix-socket accept boundary (P0-AC-021), so per-call local-only
-    // methods (`frameHash`) may serve it. CTX-0528/IPC-001: the verified
-    // marker is the proof — the context mark is bound to it, never set on
-    // an unverified stream.
-    context.attest_local_peer(&verified);
+    let proof = match context.bind_connected_stream(&stream, runtime_uid) {
+        Ok(proof) => proof,
+        Err(err) => {
+            crate::logging::warn(|| {
+                format!("bitty: ipc connection rejected (peer attestation): {err}")
+            });
+            return;
+        }
+    };
+    context.attest_local_peer(&proof.identity());
     let mut limiter = bitty_ipc::limits::RateLimiter::rc9_default();
     let clock = || {
         SystemTime::now()
@@ -426,9 +427,9 @@ fn serve_stream(
             .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
             .unwrap_or(0)
     };
-    match bitty_ipc::devtools::serve_connection(
+    match bitty_ipc::devtools::serve_bound_connection(
         &mut stream,
-        verified,
+        &proof,
         dispatcher,
         &context,
         &mut limiter,
@@ -480,6 +481,93 @@ mod tests {
             Some("bind failed")
         );
         assert!(!IpcServeGuard::failed_for_tests("bind failed").is_enabled());
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+    ))]
+    #[test]
+    fn supported_unix_mode_uses_real_stream_attestation() {
+        assert!(bitty_ipc::accepted_stream_peer_attestation_available());
+        // Provide an explicit socket base: some environments (macOS CI
+        // runners set neither variable) carry no runtime dir, and the
+        // servo deliberately fails closed without a derivable base. The
+        // env is passed explicitly so the process environment is never
+        // mutated (this module forbids unsafe code).
+        let socket_path = std::env::temp_dir()
+            .join(format!("bitty-serve-{}", std::process::id()))
+            .join("s.sock")
+            .to_string_lossy()
+            .into_owned();
+        let env = bitty_ipc::devtools::SocketEnv {
+            bitty_socket: Some(socket_path.clone()),
+            ..Default::default()
+        };
+        let guard = unix_serve(
+            ServerDescriptor {
+                cols: 80,
+                rows: 24,
+                test_mode: false,
+            },
+            &env,
+        );
+        assert!(guard.is_enabled());
+        assert_eq!(guard.socket_path(), socket_path.as_str());
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly",
+        )),
+    ))]
+    #[test]
+    fn unsupported_unix_mode_fails_closed() {
+        let guard = serve_in_background(ServerDescriptor {
+            cols: 80,
+            rows: 24,
+            test_mode: false,
+        });
+        assert!(!guard.is_enabled());
+        assert!(guard.failure_reason().is_none());
+        assert!(guard.socket_path().is_empty());
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+    ))]
+    #[test]
+    fn accepted_stream_proof_uses_platform_credentials() {
+        let (_client, stream) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut context = bitty_ipc::devtools::ServeContext::new(
+            &bitty_ipc::devtools::ServerInfo::new("proof".into(), "proof.sock".into(), 80, 24),
+        );
+        let proof = context.bind_connected_stream_current(&stream).unwrap();
+        assert_eq!(
+            proof.identity().peer_uid(),
+            bitty_ipc::current_unix_uid().unwrap()
+        );
     }
 
     #[test]
@@ -540,33 +628,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn serve_path_takes_verified_marker_only() {
+    fn serve_path_uses_real_bound_stream_proof() {
         use std::io::{Read, Write};
         use std::os::unix::net::UnixStream;
 
-        // Regression for CodeQL HIGH `cleartext logging of sensitive
-        // information`: the serving path accepts only the pre-verified marker
-        // produced at the accept boundary, never raw credentials. Socketpair
-        // has no filesystem endpoint, so the headless peer-UID check mints
-        // the marker here; live connections use `transport_attested_peer`
-        // (endpoint verification) in `serve_stream`.
-        let verified = bitty_ipc::verify_peer_for_connection(
-            bitty_ipc::PeerCredentials::new(1000, 1000, 1),
-            1000,
-        )
-        .unwrap();
-        // Type-level proof: `serve_connection` takes `VerifiedPeer`.
-        fn accepts_verified(_: bitty_ipc::auth::VerifiedPeer) {}
-        accepts_verified(verified);
-
-        // Fail-closed: foreign credentials cannot mint a marker.
-        let foreign = bitty_ipc::PeerCredentials::new(2000, 2000, 99);
-        assert!(
-            bitty_ipc::verify_peer_for_connection(foreign, 1000).is_err(),
-            "foreign UID must fail closed at the accept boundary"
-        );
-
-        // The verified marker drives the real serving loop.
         let (mut client, mut server) = UnixStream::pair().unwrap();
         let dispatcher = bitty_ipc::devtools::Dispatcher::with_defaults();
         let info = bitty_ipc::devtools::ServerInfo::new(
@@ -575,13 +640,15 @@ mod tests {
             80,
             24,
         );
-        let context = bitty_ipc::devtools::ServeContext::new(&info);
+        let mut context = bitty_ipc::devtools::ServeContext::new(&info);
+        let proof = context.bind_connected_stream_current(&server).unwrap();
+        context.attest_local_peer(&proof.identity());
         let mut limiter = bitty_ipc::limits::RateLimiter::rc9_default();
         let clock = || 0u64;
         let handle = std::thread::spawn(move || {
-            bitty_ipc::devtools::serve_connection(
+            bitty_ipc::devtools::serve_bound_connection(
                 &mut server,
-                verified,
+                &proof,
                 &dispatcher,
                 &context,
                 &mut limiter,

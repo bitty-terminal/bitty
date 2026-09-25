@@ -1738,6 +1738,83 @@ fn kitty_action(actions: &[TerminalAction]) -> &TerminalAction {
     &actions[0]
 }
 
+fn kitty_base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3).saturating_mul(4));
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        out.push(ALPHABET[(first >> 2) as usize] as char);
+        out.push(ALPHABET[(((first & 0x03) << 4) | (second >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[(((second & 0x0f) << 2) | (third >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[(third & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+#[test]
+fn apc_g_parser_budget_boundaries_and_peak_are_bounded() {
+    let cap = 9;
+    for (len, should_emit) in [(cap - 1, true), (cap, true), (cap + 1, false)] {
+        let encoded = kitty_base64(&vec![0x5a; len]);
+        let mut sequence = b"\x1b_Gf=100,m=0;".to_vec();
+        sequence.extend_from_slice(encoded.as_bytes());
+        sequence.extend_from_slice(b"\x1b\\");
+        let mut parser = Parser::with_ledger_cap(cap);
+        let mut actions = Vec::new();
+        parser.advance(&sequence, |action| actions.push(action));
+        assert_eq!(actions.len(), usize::from(should_emit));
+        assert!(parser.kitty_peak_memory() <= cap);
+        assert!(parser.kitty_peak_total_memory() <= cap + 4096 + 4);
+    }
+}
+
+#[test]
+fn apc_g_parser_continuation_accounts_for_current_header_and_peak() {
+    let cap = 9;
+    let encoded = kitty_base64(&vec![0x33; cap]);
+    let split = 4;
+    let mut first = b"\x1b_Gf=100,m=1;".to_vec();
+    first.extend_from_slice(&encoded.as_bytes()[..split]);
+    first.extend_from_slice(b"\x1b\\");
+    let mut parser = Parser::with_ledger_cap(cap);
+    let mut actions = Vec::new();
+    parser.advance(&first, |action| actions.push(action));
+    assert!(actions.is_empty());
+    assert!(parser.has_pending_kitty());
+    assert!(parser.kitty_peak_memory() <= cap);
+    let mut final_chunk = b"\x1b_Gm=0;".to_vec();
+    final_chunk.extend_from_slice(&encoded.as_bytes()[split..]);
+    final_chunk.extend_from_slice(b"\x1b\\");
+    parser.advance(&final_chunk, |action| actions.push(action));
+    assert_eq!(actions.len(), 1);
+    assert!(parser.kitty_peak_memory() <= cap);
+
+    let encoded = kitty_base64(&vec![0x33; cap + 1]);
+    let mut parser = Parser::with_ledger_cap(cap);
+    let mut actions = Vec::new();
+    let mut first = b"\x1b_Gf=100,m=1;".to_vec();
+    first.extend_from_slice(&encoded.as_bytes()[..split]);
+    first.extend_from_slice(b"\x1b\\");
+    parser.advance(&first, |action| actions.push(action));
+    let mut final_chunk = b"\x1b_Gm=0;".to_vec();
+    final_chunk.extend_from_slice(&encoded.as_bytes()[split..]);
+    final_chunk.extend_from_slice(b"\x1b\\");
+    parser.advance(&final_chunk, |action| actions.push(action));
+    assert!(actions.is_empty());
+    assert!(!parser.has_pending_kitty());
+    assert!(parser.kitty_peak_memory() <= cap);
+}
+
 #[test]
 fn apc_g_valid_single_shot_emits_decoded_payload() {
     // 2x2 opaque red RGBA (`f=32,s=2,v=2`), base64 `/wAA//8AAP//AAD//wAA/w==`.
@@ -1832,9 +1909,7 @@ fn apc_g_oversize_claim_fails_closed_without_alloc() {
 
 #[test]
 fn apc_g_oversize_accumulation_fails_closed() {
-    // Raw control overhead (~18B) must fit while encoded accumulation
-    // overflows: cap 40 fits first raw (26B) but rejects 8+33>40.
-    let mut parser = Parser::with_ledger_cap(40);
+    let mut parser = Parser::with_ledger_cap(20);
     let mut actions = Vec::new();
     parser.advance(b"\x1b_Gf=32,s=2,v=2,m=1;/wAA//8A\x1b\\", |a| {
         actions.push(a)
@@ -1902,4 +1977,41 @@ fn apc_g_split_across_advances_is_invariant() {
     assert!(matches!(actions[0], TerminalAction::Print(_)));
     assert!(matches!(actions[1], TerminalAction::KittyGraphics { .. }));
     assert!(matches!(actions[2], TerminalAction::Print(_)));
+}
+
+#[test]
+fn apc_g_discard_cancellation_is_chunk_invariant() {
+    let seq = b"\x1b_Gf=100,m=1;PM \x1b\x18X";
+    let whole = parse(seq);
+    let mut parser = Parser::new();
+    let mut bytewise = Vec::new();
+    for byte in seq {
+        parser.advance(std::slice::from_ref(byte), |action| bytewise.push(action));
+    }
+    assert_eq!(whole, bytewise);
+}
+
+#[test]
+fn apc_g_held_esc_bel_c1_st_is_chunk_invariant() {
+    for terminator in [0x07, 0x9c] {
+        let mut sequence = Vec::new();
+        sequence.extend_from_slice(b"\x1b_Gf=100,m=1;AAAA\x1b");
+        let held_end = sequence.len();
+        sequence.push(terminator);
+        sequence.extend_from_slice(b"\x1b_Gm=0;AAAA\x1b\\");
+
+        let whole = parse(&sequence);
+        let mut bytewise_parser = Parser::new();
+        let mut bytewise = Vec::new();
+        for byte in &sequence {
+            bytewise_parser.advance(std::slice::from_ref(byte), |action| bytewise.push(action));
+        }
+        assert_eq!(whole, bytewise, "terminator {terminator:#x}");
+
+        let mut split_parser = Parser::new();
+        let mut split = Vec::new();
+        split_parser.advance(&sequence[..held_end], |action| split.push(action));
+        split_parser.advance(&sequence[held_end..], |action| split.push(action));
+        assert_eq!(whole, split, "held terminator {terminator:#x}");
+    }
 }

@@ -21,7 +21,7 @@
 
 use crate::action::TerminalAction;
 use crate::diag::{RejectLog, warn_rejection};
-use crate::kitty_apc::{KittyApcAssembler, KittyFeedOutcome};
+use crate::kitty_apc::{KITTY_APC_MAX_CONTROL_BYTES, KittyApcAssembler, KittyFeedOutcome};
 use vte::Params;
 
 mod dispatch;
@@ -37,9 +37,9 @@ mod tests;
 /// parser/state split mandated by ADR-0003.
 ///
 /// Kitty `APC G` is pre-scanned here because `vte` 0.15 leaves
-/// `SOS/PM/APC` strings inert with no callback. Complete `APC` buffers are
-/// fed to [`KittyApcAssembler`] (base64 unwrap, `m=` reassembly under the
-/// ledger cap); completed transmissions emit
+/// `SOS/PM/APC` strings inert with no callback. The control header is bounded
+/// and payload bytes are streamed into [`KittyApcAssembler`] under the IMG-1
+/// parser budget; completed transmissions emit
 /// [`TerminalAction::KittyGraphics`]. All other `APC` (and `PM`/`SOS`,
 /// which stay with `vte`) remain inert.
 pub struct Parser {
@@ -47,6 +47,7 @@ pub struct Parser {
     dcs: PendingDcs,
     kitty: KittyApcAssembler,
     apc_buf: Vec<u8>,
+    apc_payload: bool,
     in_apc: bool,
     apc_discarding: bool,
     held_esc: bool,
@@ -82,6 +83,7 @@ impl Parser {
             dcs: PendingDcs::default(),
             kitty: KittyApcAssembler::new(),
             apc_buf: Vec::new(),
+            apc_payload: false,
             in_apc: false,
             apc_discarding: false,
             held_esc: false,
@@ -90,8 +92,7 @@ impl Parser {
         }
     }
 
-    /// Creates a parser with a custom kitty ledger cap (tests exercise cap
-    /// behavior without allocating hundreds of megabytes).
+    /// Creates a parser with a custom IMG-1 payload cap.
     #[must_use]
     pub fn with_ledger_cap(ledger_cap: usize) -> Self {
         Self {
@@ -99,6 +100,7 @@ impl Parser {
             dcs: PendingDcs::default(),
             kitty: KittyApcAssembler::with_ledger_cap(ledger_cap),
             apc_buf: Vec::new(),
+            apc_payload: false,
             in_apc: false,
             apc_discarding: false,
             held_esc: false,
@@ -107,7 +109,7 @@ impl Parser {
         }
     }
 
-    /// Kitty ledger cap in effect (max raw `APC` / encoded bytes in flight).
+    /// Kitty payload cap in effect.
     #[must_use]
     pub const fn ledger_cap(&self) -> usize {
         self.kitty.ledger_cap()
@@ -117,6 +119,16 @@ impl Parser {
     #[must_use]
     pub fn has_pending_kitty(&self) -> bool {
         self.kitty.has_pending()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn kitty_peak_memory(&self) -> usize {
+        self.kitty.peak_memory()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn kitty_peak_total_memory(&self) -> usize {
+        self.kitty.peak_total_memory()
     }
 
     /// Feeds raw PTY bytes into the parser, emitting one [`TerminalAction`]
@@ -138,6 +150,7 @@ impl Parser {
             dcs,
             kitty,
             apc_buf,
+            apc_payload,
             in_apc,
             apc_discarding,
             held_esc,
@@ -147,7 +160,6 @@ impl Parser {
         let mut bridge = Bridge { emit, dcs };
         let mut i = 0;
 
-        // Resolve a trailing ESC held from the previous call.
         if *held_esc {
             if bytes.is_empty() {
                 return;
@@ -155,31 +167,45 @@ impl Parser {
             let next = bytes[0];
             if *held_in_apc {
                 *held_esc = false;
-                if next == b'\\' {
+                if next == b'\\' || (*apc_discarding && (next == 0x07 || next == 0x9C)) {
                     i = 1;
-                    terminate_apc(&mut bridge, kitty, apc_buf, in_apc, apc_discarding);
+                    terminate_apc(
+                        &mut bridge,
+                        kitty,
+                        apc_buf,
+                        apc_payload,
+                        in_apc,
+                        apc_discarding,
+                    );
+                } else if next == 0x18 || next == 0x1A {
+                    clear_apc_header(kitty, apc_buf);
+                    *in_apc = false;
+                    *apc_payload = false;
+                    *apc_discarding = false;
+                    kitty.abort();
+                    state_machine.advance(&mut bridge, &[next]);
+                    i = 1;
                 } else if *apc_discarding {
-                    // Over-cap discard continues: the held ESC was payload.
+                    i = 1;
+                } else if next == b'_' {
+                    clear_apc_header(kitty, apc_buf);
+                    *in_apc = false;
+                    *apc_payload = false;
+                    kitty.abort();
+                    begin_apc(kitty, apc_buf, apc_payload, in_apc, apc_discarding);
                     i = 1;
                 } else {
-                    // Abort the raw APC (malformed: ESC without ST).
-                    apc_buf.clear();
+                    clear_apc_header(kitty, apc_buf);
                     *in_apc = false;
-                    if next == b'_' {
-                        *in_apc = true;
-                        *apc_discarding = false;
-                        i = 1;
-                    } else {
-                        state_machine.advance(&mut bridge, &[0x1B]);
-                        i = 0;
-                    }
+                    *apc_payload = false;
+                    kitty.abort();
+                    state_machine.advance(&mut bridge, &[0x1B]);
+                    i = 0;
                 }
             } else {
                 *held_esc = false;
                 if next == b'_' {
-                    *in_apc = true;
-                    *apc_discarding = false;
-                    apc_buf.clear();
+                    begin_apc(kitty, apc_buf, apc_payload, in_apc, apc_discarding);
                     i = 1;
                 } else {
                     state_machine.advance(&mut bridge, &[0x1B]);
@@ -200,16 +226,23 @@ impl Parser {
                     let nxt = bytes[i + 1];
                     if nxt == b'\\' {
                         i += 2;
-                        terminate_apc(&mut bridge, kitty, apc_buf, in_apc, apc_discarding);
+                        terminate_apc(
+                            &mut bridge,
+                            kitty,
+                            apc_buf,
+                            apc_payload,
+                            in_apc,
+                            apc_discarding,
+                        );
                     } else if *apc_discarding {
-                        // Stay discarding; the ESC was over-cap payload.
                         i += 1;
                     } else {
-                        apc_buf.clear();
+                        clear_apc_header(kitty, apc_buf);
                         *in_apc = false;
+                        *apc_payload = false;
+                        kitty.abort();
                         if nxt == b'_' {
-                            *in_apc = true;
-                            *apc_discarding = false;
+                            begin_apc(kitty, apc_buf, apc_payload, in_apc, apc_discarding);
                             i += 2;
                         } else {
                             state_machine.advance(&mut bridge, &[0x1B]);
@@ -218,25 +251,52 @@ impl Parser {
                     }
                 } else if b == 0x07 || b == 0x9C {
                     i += 1;
-                    terminate_apc(&mut bridge, kitty, apc_buf, in_apc, apc_discarding);
+                    terminate_apc(
+                        &mut bridge,
+                        kitty,
+                        apc_buf,
+                        apc_payload,
+                        in_apc,
+                        apc_discarding,
+                    );
                 } else if b == 0x18 || b == 0x1A {
                     i += 1;
-                    apc_buf.clear();
+                    clear_apc_header(kitty, apc_buf);
                     *in_apc = false;
+                    *apc_payload = false;
                     *apc_discarding = false;
+                    kitty.abort();
                     state_machine.advance(&mut bridge, &[b]);
                 } else if *apc_discarding {
                     i += 1;
-                } else if apc_buf.len() >= kitty.ledger_cap() {
-                    apc_buf.clear();
+                } else if *apc_payload {
+                    if kitty.push_payload(std::slice::from_ref(&b)).is_err() {
+                        *apc_payload = false;
+                        *apc_discarding = true;
+                    }
+                    i += 1;
+                } else if b == b';' {
+                    match kitty.begin_control(apc_buf) {
+                        Ok(()) => {
+                            *apc_payload = true;
+                            clear_apc_header(kitty, apc_buf);
+                        }
+                        Err(_) => {
+                            *apc_discarding = true;
+                            clear_apc_header(kitty, apc_buf);
+                        }
+                    }
+                    i += 1;
+                } else if apc_buf.len() >= KITTY_APC_MAX_CONTROL_BYTES
+                    || !kitty.reserve_header_byte()
+                {
+                    clear_apc_header(kitty, apc_buf);
                     *apc_discarding = true;
-                    // The current chunk is lost, so any in-flight `m=` stream
-                    // it belonged to is corrupted: drop it fail-closed too.
                     kitty.abort();
                     if let Some(occurrence) = reject_log.record() {
                         warn_rejection(
                             occurrence,
-                            "bitty: rejecting kitty APC: raw exceeds ledger cap: stored nothing",
+                            "bitty: rejecting kitty APC: control exceeds parser budget: stored nothing",
                         );
                     }
                     i += 1;
@@ -253,9 +313,7 @@ impl Parser {
                         break;
                     }
                     if bytes[i + 1] == b'_' {
-                        *in_apc = true;
-                        *apc_discarding = false;
-                        apc_buf.clear();
+                        begin_apc(kitty, apc_buf, apc_payload, in_apc, apc_discarding);
                         i += 2;
                     } else {
                         state_machine.advance(&mut bridge, &[0x1B]);
@@ -273,38 +331,60 @@ impl Parser {
     }
 }
 
-/// Completes one `APC` buffer: routes `G` through the kitty assembler and
-/// emits [`TerminalAction::KittyGraphics`] on success. Over-cap discards
-/// clear silently here (already warned at overflow); assembler rejections
-/// already warned inside [`KittyApcAssembler`].
+fn begin_apc(
+    kitty: &mut KittyApcAssembler,
+    apc_buf: &mut Vec<u8>,
+    apc_payload: &mut bool,
+    in_apc: &mut bool,
+    apc_discarding: &mut bool,
+) {
+    clear_apc_header(kitty, apc_buf);
+    *apc_payload = false;
+    *in_apc = true;
+    *apc_discarding = false;
+}
+
+fn clear_apc_header(kitty: &mut KittyApcAssembler, apc_buf: &mut Vec<u8>) {
+    kitty.release_header(apc_buf.len());
+    apc_buf.clear();
+}
+
 fn terminate_apc<F: FnMut(TerminalAction)>(
     bridge: &mut Bridge<'_, F>,
     kitty: &mut KittyApcAssembler,
     apc_buf: &mut Vec<u8>,
+    apc_payload: &mut bool,
     in_apc: &mut bool,
     apc_discarding: &mut bool,
 ) {
     if *apc_discarding {
         *in_apc = false;
         *apc_discarding = false;
-        apc_buf.clear();
+        *apc_payload = false;
+        clear_apc_header(kitty, apc_buf);
         return;
     }
-    let raw = std::mem::take(apc_buf);
-    *in_apc = false;
-    match kitty.feed(&raw) {
-        KittyFeedOutcome::NeedMore { .. } | KittyFeedOutcome::Rejected(_) => {}
-        KittyFeedOutcome::Completed(done) => {
-            bridge.emit(TerminalAction::KittyGraphics {
-                format_f: done.format_f,
-                width_s: done.width_s,
-                height_v: done.height_v,
-                action_a: done.action_a,
-                cols_c: done.cols_c,
-                rows_r: done.rows_r,
-                payload: done.payload,
-            });
+    let outcome = if *apc_payload {
+        Some(kitty.finish())
+    } else {
+        match kitty.begin_control(apc_buf) {
+            Ok(()) => Some(kitty.finish()),
+            Err(_) => None,
         }
+    };
+    clear_apc_header(kitty, apc_buf);
+    *in_apc = false;
+    *apc_payload = false;
+    if let Some(KittyFeedOutcome::Completed(done)) = outcome {
+        bridge.emit(TerminalAction::KittyGraphics {
+            format_f: done.format_f,
+            width_s: done.width_s,
+            height_v: done.height_v,
+            action_a: done.action_a,
+            cols_c: done.cols_c,
+            rows_r: done.rows_r,
+            payload: done.payload,
+        });
     }
 }
 

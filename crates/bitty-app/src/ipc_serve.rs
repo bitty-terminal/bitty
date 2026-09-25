@@ -134,7 +134,10 @@ impl Drop for IpcServeGuard {
 pub fn serve_in_background(descriptor: ServerDescriptor) -> IpcServeGuard {
     #[cfg(unix)]
     {
-        unix_serve(descriptor)
+        unix_serve(
+            descriptor,
+            &bitty_ipc::devtools::SocketEnv::from_process_env(),
+        )
     }
     #[cfg(not(unix))]
     {
@@ -151,8 +154,10 @@ pub fn serve_in_background(descriptor: ServerDescriptor) -> IpcServeGuard {
 }
 
 /// Unix serving path: resolve, prepare, reclaim, bind, attest, spawn.
+/// `env` is the advisory resolution input, passed explicitly so tests can
+/// cover the enabled path without mutating process-global state.
 #[cfg(unix)]
-fn unix_serve(descriptor: ServerDescriptor) -> IpcServeGuard {
+fn unix_serve(descriptor: ServerDescriptor, env: &bitty_ipc::devtools::SocketEnv) -> IpcServeGuard {
     if !bitty_ipc::accepted_stream_peer_attestation_available() {
         let reason =
             "accepted-stream peer attestation is unavailable; IPC surface disabled".to_string();
@@ -165,7 +170,7 @@ fn unix_serve(descriptor: ServerDescriptor) -> IpcServeGuard {
             handle: None,
         };
     }
-    match try_listen() {
+    match try_listen(env) {
         Ok(listen) => {
             // CTX-0506: test mode registers the E2E surface (`testInfo`,
             // `testExit`); normal instances keep the default table.
@@ -231,13 +236,13 @@ struct BoundListener {
 }
 
 /// Resolve, prepare, reclaim stale, bind, and attest. Fail-soft: every
-/// failure is a `String` reason, never a panic.
+/// failure is a `String` reason, never a panic. `env` is the explicit
+/// resolution input (never re-read from the process environment here).
 #[cfg(unix)]
-fn try_listen() -> Result<BoundListener, String> {
+fn try_listen(env: &bitty_ipc::devtools::SocketEnv) -> Result<BoundListener, String> {
     use std::os::unix::net::{UnixListener, UnixStream};
 
-    let env = bitty_ipc::devtools::SocketEnv::from_process_env();
-    let (socket_path, instance) = bitty_ipc::devtools::resolve_socket_path_from_env(&env, None)
+    let (socket_path, instance) = bitty_ipc::devtools::resolve_socket_path_from_env(env, None)
         .map_err(|err| {
             format!("socket path unavailable: {err} (set XDG_RUNTIME_DIR or BITTY_SOCKET)")
         })?;
@@ -491,12 +496,30 @@ mod tests {
     #[test]
     fn supported_unix_mode_uses_real_stream_attestation() {
         assert!(bitty_ipc::accepted_stream_peer_attestation_available());
-        let guard = serve_in_background(ServerDescriptor {
-            cols: 80,
-            rows: 24,
-            test_mode: false,
-        });
+        // Provide an explicit socket base: some environments (macOS CI
+        // runners set neither variable) carry no runtime dir, and the
+        // servo deliberately fails closed without a derivable base. The
+        // env is passed explicitly so the process environment is never
+        // mutated (this module forbids unsafe code).
+        let socket_path = std::env::temp_dir()
+            .join(format!("bitty-serve-{}", std::process::id()))
+            .join("s.sock")
+            .to_string_lossy()
+            .into_owned();
+        let env = bitty_ipc::devtools::SocketEnv {
+            bitty_socket: Some(socket_path.clone()),
+            ..Default::default()
+        };
+        let guard = unix_serve(
+            ServerDescriptor {
+                cols: 80,
+                rows: 24,
+                test_mode: false,
+            },
+            &env,
+        );
         assert!(guard.is_enabled());
+        assert_eq!(guard.socket_path(), socket_path.as_str());
     }
 
     #[cfg(all(

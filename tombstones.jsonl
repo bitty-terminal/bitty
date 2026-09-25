@@ -336,3 +336,10 @@
 {"deleted_at":"2026-09-24T06:51:24.511804446+00:00","deleted_by":null,"project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","reason":"worktree.removed","row_id":"01M38V5D62BZ1WQQ82ERFHR4ZW","table_name":"worktrees"}
 {"deleted_at":"2026-09-24T17:25:16.077059704+00:00","deleted_by":null,"project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","reason":"worktree.removed","row_id":"01M37WJ32M7VDN9XR12BJAXD61","table_name":"worktrees"}
 {"deleted_at":"2026-09-24T17:25:16.179528585+00:00","deleted_by":null,"project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","reason":"worktree.removed","row_id":"01M37WFB7J0Y2Q768W25RZS3PJ","table_name":"worktrees"}
+{"deleted_at":"2026-09-25T04:06:09.962580760+00:00","deleted_by":null,"project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","reason":"worktree.removed","row_id":"01M3B467KA64X36C9W87QGSW6K","table_name":"worktrees"}
+{"deleted_at":"2026-09-25T04:08:00.117184856+00:00","deleted_by":null,"project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","reason":"worktree.removed","row_id":"01M3B467QXXZKA8QK5RVA96SW7","table_name":"worktrees"}
+{"deleted_at":"2026-09-25T05:42:20.750103498+00:00","deleted_by":null,"project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","reason":"worktree.removed","row_id":"01M3ABMGTQM8FGG0RXCYDDHZSV","table_name":"worktrees"}
+{"deleted_at":"2026-09-25T07:22:41.679383312+00:00","deleted_by":null,"project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","reason":"worktree.removed","row_id":"01M3ABMGQGHD4CA54FV2CVTRYJ","table_name":"worktrees"}
+{"deleted_at":"2026-09-25T10:22:06.065889127+00:00","deleted_by":null,"project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","reason":"worktree.removed","row_id":"01M3BGJKJ1G5MX51ZTVNK347E4","table_name":"worktrees"}
+{"deleted_at":"2026-09-25T12:37:40.024479901+00:00","deleted_by":null,"project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","reason":"scope.removed","row_id":"01M3C03ER23M5CACNKQK25BJBV","table_name":"scopes"}
+{"deleted_at":"2026-09-25T12:37:40.054919837+00:00","deleted_by":null,"project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","reason":"scope.removed","row_id":"01M3C03ERRNB7S39C1BMTSMRHV","table_name":"scopes"}

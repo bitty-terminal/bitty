@@ -880,7 +880,24 @@ fn auth_recheck_failure_closes_the_bound_connection() {
                     .contains("Unauthenticated")
             );
         }
-        Err(err) => assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset),
+        Err(err) => {
+            // The recheck refusal closes the bound socket before any response.
+            // Linux/other Unix surface that close while request bytes are
+            // still unread as ECONNRESET; macOS ARM64 can complete an orderly
+            // close, so the client observes EOF (`UnexpectedEof`) instead.
+            // Both are fail-closed closes — pin the exact kind off macOS and
+            // widen on it so the divergence stays contained.
+            #[cfg(target_os = "macos")]
+            assert!(
+                matches!(
+                    err.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::UnexpectedEof
+                ),
+                "unexpected close error kind: {err:?}"
+            );
+            #[cfg(not(target_os = "macos"))]
+            assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
+        }
     }
     assert!(matches!(
         handle.join().unwrap(),

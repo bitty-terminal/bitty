@@ -17,23 +17,16 @@
 //! `a` (display action), `c`/`r` (cell spans), and `m` (more-chunks). All
 //! other keys are ignored (future-proof).
 //!
-//! # Bounds (reuse, not reinvention)
+//! # Bounds
 //!
-//! - Ledger cap [`KITTY_APC_LEDGER_CAP`] mirrors
-//!   `bitty-rich::kitty::KITTY_LEDGER_MAX_BYTES` (320 MiB, Ghostty
-//!   `total_limit` parity). Raw `APC` bytes and accumulated base64-encoded
-//!   bytes are both capped here, checked with `checked_add` **before** any
-//!   buffer growth, so hostile input can never force an over-cap allocation.
-//! - Oversize `s`/`v` claims for raw formats are rejected against
-//!   [`KITTY_APC_DECODE_MAX_DIMENSION`]/[`KITTY_APC_DECODE_MAX_PIXELS`]/
-//!   [`KITTY_APC_DECODE_MAX_BYTES`], mirroring
-//!   `bitty-rich::kitty_decode` caps, before any pixel buffer could exist.
-//!   PNG (`f=100`) ignores `s`/`v` (`IHDR` governs); unknown `f` skips the
-//!   claim check and lets the decoder fail closed.
-//! - The decoded length of every single decode is additionally bounded by
-//!   [`KITTY_APC_DECODE_MAX_BYTES`] (`decode_cap`): the encoded length is
-//!   checked before base64 decoding (bounding the decode allocation), and
-//!   the decoded length is re-checked before a transmission is completed.
+//! - [`KITTY_APC_LEDGER_CAP`] is the accepted IMG-1 4 MiB payload cap.
+//!   Base64 is decoded incrementally into one bounded payload buffer, so
+//!   pending chunks, current output, and decoder scratch never form a second
+//!   large APC allocation. The control header has a separate 4 KiB bound.
+//! - Raw `s`/`v` claims are checked before emission against the payload cap;
+//!   PNG dimensions remain governed by the downstream decoder contract.
+//! - Every growth and decoded-length check runs before the corresponding
+//!   allocation or adapter hand-off.
 //!
 //! # Fail-closed behavior
 //!
@@ -46,14 +39,12 @@
 
 use crate::diag::{RejectLog, warn_rejection};
 
-/// Ledger cap reused from `bitty-rich::kitty::KITTY_LEDGER_MAX_BYTES`.
-///
-/// Caps raw `APC` bytes per sequence and total base64-encoded bytes held
-/// across an `m=` chunked stream (stored + in-flight parity): a pre-decode
-/// intake bound on wire bytes. The decoded output of any single decode is
-/// independently bounded by [`KITTY_APC_DECODE_MAX_BYTES`], so this larger
-/// intake ceiling cannot be used to bypass the decode ceiling.
-pub const KITTY_APC_LEDGER_CAP: usize = 320 * 1000 * 1000;
+/// Accepted IMG-1 parser payload cap.
+pub const KITTY_APC_LEDGER_CAP: usize = 4 * 1024 * 1024;
+
+pub(crate) const KITTY_APC_MAX_CONTROL_BYTES: usize = 4096;
+
+const KITTY_APC_CODEC_SCRATCH_BYTES: usize = 4;
 
 /// Side cap mirroring `bitty-rich::kitty_decode::KITTY_DECODE_MAX_DIMENSION`.
 pub const KITTY_APC_DECODE_MAX_DIMENSION: u32 = 8192;
@@ -100,7 +91,7 @@ pub enum KittyApcReject {
     BadBase64,
     /// Raw `s`/`v` claim exceeds decode side/area/byte caps.
     OversizeClaim,
-    /// Growth would exceed the ledger cap.
+    /// Growth would exceed the parser payload budget.
     Oversize,
     /// Continuation (`m=` present, no `f=`) with no open stream.
     Orphan,
@@ -116,7 +107,7 @@ impl std::fmt::Display for KittyApcReject {
             Self::BadMore => write!(f, "malformed kitty m= flag"),
             Self::BadBase64 => write!(f, "invalid kitty base64 payload"),
             Self::OversizeClaim => write!(f, "kitty s/v claim exceeds decode caps"),
-            Self::Oversize => write!(f, "kitty stream exceeds ledger cap"),
+            Self::Oversize => write!(f, "kitty payload exceeds parser budget"),
             Self::Orphan => write!(f, "kitty chunk without an open stream"),
         }
     }
@@ -155,7 +146,7 @@ pub enum KittyFeedOutcome {
     Rejected(KittyApcReject),
 }
 
-/// In-flight `m=1` stream: first-chunk params plus accumulated base64.
+/// In-flight `m=1` stream: first-chunk params plus one decoded payload buffer.
 #[derive(Debug, Clone)]
 struct PendingKitty {
     format_f: u32,
@@ -164,136 +155,415 @@ struct PendingKitty {
     action_a: Option<char>,
     cols_c: u16,
     rows_r: u16,
-    encoded: Vec<u8>,
+    encoded_len: usize,
+    decoder: Base64Stream,
+    payload: Vec<u8>,
 }
 
-/// `m=` chunk reassembler with ledger-cap and decode-cap enforcement
-/// (CTX-0256, CTX-0470).
-///
-/// Mirrors `KittyGraphicsStub` accumulation semantics but over base64-encoded
-/// bytes (the wire splits base64 text, not binary): encoded chunks are
-/// concatenated, then decoded once at the final `m=0`. Two independent
-/// bounds apply: the ledger cap bounds encoded bytes held in flight, and
-/// the decode cap bounds the decoded byte length of every single decode
-/// (single-shot or final assembly), so a lone packet can never bypass the
-/// `IMG-3` decode ceiling via the larger ledger.
+#[derive(Debug, Clone, Copy, Default)]
+struct Base64Stream {
+    carry: [u8; 4],
+    carry_len: usize,
+    padding: usize,
+    finished: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IntakeBudget {
+    payload_limit: usize,
+    total_limit: usize,
+    current: usize,
+    decoded: usize,
+    peak_payload: usize,
+    peak_total: usize,
+}
+
+impl IntakeBudget {
+    fn new(payload_limit: usize) -> Self {
+        Self {
+            payload_limit,
+            total_limit: payload_limit
+                .saturating_add(KITTY_APC_MAX_CONTROL_BYTES)
+                .saturating_add(KITTY_APC_CODEC_SCRATCH_BYTES),
+            current: 0,
+            decoded: 0,
+            peak_payload: 0,
+            peak_total: KITTY_APC_CODEC_SCRATCH_BYTES,
+        }
+    }
+
+    fn total(&self) -> usize {
+        self.current
+            .saturating_add(self.decoded)
+            .saturating_add(KITTY_APC_CODEC_SCRATCH_BYTES)
+    }
+
+    fn reserve_current(&mut self, amount: usize) -> bool {
+        let Some(next) = self.current.checked_add(amount) else {
+            return false;
+        };
+        if next > KITTY_APC_MAX_CONTROL_BYTES
+            || self
+                .decoded
+                .saturating_add(next)
+                .saturating_add(KITTY_APC_CODEC_SCRATCH_BYTES)
+                > self.total_limit
+        {
+            return false;
+        }
+        self.current = next;
+        self.peak_total = self.peak_total.max(self.total());
+        true
+    }
+
+    fn release_current(&mut self, amount: usize) {
+        self.current = self.current.saturating_sub(amount);
+    }
+
+    fn reserve_retained(&mut self, amount: usize) -> bool {
+        if amount > self.payload_limit
+            || self
+                .current
+                .saturating_add(amount)
+                .saturating_add(KITTY_APC_CODEC_SCRATCH_BYTES)
+                > self.total_limit
+        {
+            return false;
+        }
+        self.decoded = amount;
+        self.peak_payload = self.peak_payload.max(amount);
+        self.peak_total = self.peak_total.max(self.total());
+        true
+    }
+
+    fn clear_retained(&mut self) {
+        self.decoded = 0;
+    }
+}
+
+impl Base64Stream {
+    fn push(
+        &mut self,
+        input: &[u8],
+        output: &mut Vec<u8>,
+        limit: usize,
+    ) -> Result<(), KittyApcReject> {
+        for &byte in input {
+            if self.finished {
+                return Err(KittyApcReject::BadBase64);
+            }
+            if self.padding != 0 {
+                if byte != b'=' {
+                    return Err(KittyApcReject::BadBase64);
+                }
+                self.padding += 1;
+                if self.padding > 2 {
+                    return Err(KittyApcReject::BadBase64);
+                }
+                if self.padding == 2 {
+                    self.finish_padded(output, limit)?;
+                    self.finished = true;
+                }
+                continue;
+            }
+            if byte == b'=' {
+                if self.carry_len < 2 {
+                    return Err(KittyApcReject::BadBase64);
+                }
+                self.padding = 1;
+                if self.carry_len == 3 {
+                    self.finish_padded(output, limit)?;
+                    self.finished = true;
+                }
+                continue;
+            }
+            if sextet(byte).is_none() {
+                return Err(KittyApcReject::BadBase64);
+            }
+            self.carry[self.carry_len] = byte;
+            self.carry_len += 1;
+            if self.carry_len == 4 {
+                self.finish_full(output, limit)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self, output: &mut Vec<u8>, limit: usize) -> Result<(), KittyApcReject> {
+        if self.finished {
+            return Ok(());
+        }
+        if self.padding != 0 {
+            return Err(KittyApcReject::BadBase64);
+        }
+        match self.carry_len {
+            0 => {}
+            1 => return Err(KittyApcReject::BadBase64),
+            2 => self.finish_tail(output, limit, 2)?,
+            3 => self.finish_tail(output, limit, 3)?,
+            _ => return Err(KittyApcReject::BadBase64),
+        }
+        self.finished = true;
+        Ok(())
+    }
+
+    fn finish_full(&mut self, output: &mut Vec<u8>, limit: usize) -> Result<(), KittyApcReject> {
+        let triple = (sextet(self.carry[0]).ok_or(KittyApcReject::BadBase64)? << 18)
+            | (sextet(self.carry[1]).ok_or(KittyApcReject::BadBase64)? << 12)
+            | (sextet(self.carry[2]).ok_or(KittyApcReject::BadBase64)? << 6)
+            | sextet(self.carry[3]).ok_or(KittyApcReject::BadBase64)?;
+        append_decoded(
+            output,
+            &[(triple >> 16) as u8, (triple >> 8) as u8, triple as u8],
+            limit,
+        )?;
+        self.carry_len = 0;
+        Ok(())
+    }
+
+    fn finish_padded(&mut self, output: &mut Vec<u8>, limit: usize) -> Result<(), KittyApcReject> {
+        let expected = if self.padding == 1 { 3 } else { 2 };
+        if self.carry_len != expected {
+            return Err(KittyApcReject::BadBase64);
+        }
+        let first = sextet(self.carry[0]).ok_or(KittyApcReject::BadBase64)?;
+        let second = sextet(self.carry[1]).ok_or(KittyApcReject::BadBase64)?;
+        if expected == 3 {
+            let third = sextet(self.carry[2]).ok_or(KittyApcReject::BadBase64)?;
+            let bits = (first << 18) | (second << 12) | (third << 6);
+            append_decoded(output, &[(bits >> 16) as u8, (bits >> 8) as u8], limit)?;
+        } else {
+            let bits = (first << 18) | (second << 12);
+            append_decoded(output, &[(bits >> 16) as u8], limit)?;
+        }
+        self.carry_len = 0;
+        Ok(())
+    }
+
+    fn finish_tail(
+        &mut self,
+        output: &mut Vec<u8>,
+        limit: usize,
+        len: usize,
+    ) -> Result<(), KittyApcReject> {
+        let first = sextet(self.carry[0]).ok_or(KittyApcReject::BadBase64)?;
+        let second = sextet(self.carry[1]).ok_or(KittyApcReject::BadBase64)?;
+        if len == 2 {
+            append_decoded(output, &[((first << 18 | second << 12) >> 16) as u8], limit)
+        } else {
+            let third = sextet(self.carry[2]).ok_or(KittyApcReject::BadBase64)?;
+            append_decoded(
+                output,
+                &[
+                    ((first << 18 | second << 12 | third << 6) >> 16) as u8,
+                    ((first << 18 | second << 12 | third << 6) >> 8) as u8,
+                ],
+                limit,
+            )
+        }
+    }
+}
+
+impl PendingKitty {
+    fn push(
+        &mut self,
+        input: &[u8],
+        available: usize,
+        budget: &mut IntakeBudget,
+    ) -> Result<(), KittyApcReject> {
+        let encoded_len = self
+            .encoded_len
+            .checked_add(input.len())
+            .ok_or(KittyApcReject::Oversize)?;
+        if encoded_len > max_encoded_len_for_decode_cap(available) {
+            return Err(KittyApcReject::Oversize);
+        }
+        self.encoded_len = encoded_len;
+        self.decoder.push(input, &mut self.payload, available)?;
+        if !budget.reserve_retained(self.payload.capacity()) {
+            return Err(KittyApcReject::Oversize);
+        }
+        Ok(())
+    }
+}
+
+fn sextet(byte: u8) -> Option<u32> {
+    match byte {
+        b'A'..=b'Z' => Some(u32::from(byte - b'A')),
+        b'a'..=b'z' => Some(u32::from(byte - b'a' + 26)),
+        b'0'..=b'9' => Some(u32::from(byte - b'0' + 52)),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+fn append_decoded(output: &mut Vec<u8>, bytes: &[u8], limit: usize) -> Result<(), KittyApcReject> {
+    let required = output
+        .len()
+        .checked_add(bytes.len())
+        .ok_or(KittyApcReject::Oversize)?;
+    if required > limit {
+        return Err(KittyApcReject::Oversize);
+    }
+    if output.capacity() < required {
+        let quantum = if limit >= 4096 { 4096 } else { 1 };
+        let target = required
+            .saturating_add(quantum - 1)
+            .checked_div(quantum)
+            .and_then(|value| value.checked_mul(quantum))
+            .unwrap_or(limit)
+            .min(limit);
+        if target < required {
+            return Err(KittyApcReject::Oversize);
+        }
+        output
+            .try_reserve_exact(target - output.len())
+            .map_err(|_| KittyApcReject::Oversize)?;
+    }
+    output.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn max_encoded_len_for_decode_cap(decode_cap: usize) -> usize {
+    let full = decode_cap / 3;
+    let remainder = decode_cap % 3;
+    full.saturating_mul(4)
+        .saturating_add(if remainder == 0 { 0 } else { 4 })
+}
+
 #[derive(Debug, Clone)]
 pub struct KittyApcAssembler {
     pending: Option<PendingKitty>,
+    current_final: Option<bool>,
     ledger_cap: usize,
     decode_cap: usize,
+    budget: IntakeBudget,
     log: RejectLog,
 }
 
-/// Largest base64-encoded length that can still decode to at most
-/// `decode_cap` bytes (base64 expands 3 bytes to 4 characters, plus up to
-/// one padding quartet).
-#[must_use]
-fn max_encoded_len_for_decode_cap(decode_cap: usize) -> usize {
-    (decode_cap / 3).saturating_mul(4).saturating_add(4)
-}
-
 impl KittyApcAssembler {
-    /// Empty assembler with the default ledger and decode caps.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            pending: None,
-            ledger_cap: KITTY_APC_LEDGER_CAP,
-            decode_cap: KITTY_APC_DECODE_MAX_BYTES,
-            log: RejectLog::default(),
-        }
+        Self::with_caps(KITTY_APC_LEDGER_CAP, KITTY_APC_DECODE_MAX_BYTES)
     }
 
-    /// Empty assembler with a custom ledger cap (tests exercise cap behavior
-    /// without allocating hundreds of megabytes).
     #[must_use]
     pub fn with_ledger_cap(ledger_cap: usize) -> Self {
-        Self {
-            pending: None,
-            ledger_cap,
-            ..Self::new()
-        }
+        Self::with_caps(ledger_cap, KITTY_APC_DECODE_MAX_BYTES)
     }
 
-    /// Empty assembler with custom ledger and decode caps (tests exercise
-    /// cap behavior without allocating hundreds of megabytes).
     #[must_use]
     pub fn with_caps(ledger_cap: usize, decode_cap: usize) -> Self {
         Self {
             pending: None,
+            current_final: None,
             ledger_cap,
             decode_cap,
+            budget: IntakeBudget::new(ledger_cap.min(decode_cap)),
             log: RejectLog::default(),
         }
     }
 
-    /// Ledger cap (max encoded bytes held in flight).
     #[must_use]
     pub const fn ledger_cap(&self) -> usize {
         self.ledger_cap
     }
 
-    /// Decode cap (max decoded bytes per single decode).
     #[must_use]
     pub const fn decode_cap(&self) -> usize {
         self.decode_cap
     }
 
-    /// Whether an `m=1` stream is open.
     #[must_use]
+    fn effective_cap(&self) -> usize {
+        self.ledger_cap.min(self.decode_cap)
+    }
+
+    pub(crate) fn reserve_header_byte(&mut self) -> bool {
+        self.budget.reserve_current(1)
+    }
+
+    pub(crate) fn release_header(&mut self, amount: usize) {
+        self.budget.release_current(amount);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn peak_memory(&self) -> usize {
+        self.budget.peak_payload
+    }
+
+    #[cfg(test)]
+    pub(crate) fn peak_total_memory(&self) -> usize {
+        self.budget.peak_total
+    }
+
     pub fn has_pending(&self) -> bool {
         self.pending.is_some()
     }
 
-    /// Base64-encoded bytes currently buffered (`0` when idle).
-    #[must_use]
     pub fn pending_encoded_len(&self) -> usize {
-        self.pending.as_ref().map_or(0, |p| p.encoded.len())
+        self.pending
+            .as_ref()
+            .map_or(0, |pending| pending.encoded_len)
     }
 
-    /// Abandons the open stream without emitting. Returns `true` when a
-    /// stream was actually discarded.
     pub fn abort(&mut self) -> bool {
+        self.current_final = None;
+        self.budget.clear_retained();
         self.pending.take().is_some()
     }
 
-    /// Feeds one complete `APC` raw buffer (after `ESC _`, before `ST`).
-    ///
-    /// Non-`G` buffers are inert (`Rejected(NotGraphics)`, silent: the
-    /// caller emits nothing and does not warn, preserving pre-existing APC
-    /// inert behavior for other commands).
     pub fn feed(&mut self, raw: &[u8]) -> KittyFeedOutcome {
-        let Some(after_g) = raw.strip_prefix(b"G") else {
-            return KittyFeedOutcome::Rejected(KittyApcReject::NotGraphics);
+        let (control, payload) = match raw.iter().position(|&byte| byte == b';') {
+            Some(semi) => (&raw[..semi], &raw[semi + 1..]),
+            None => (raw, &[][..]),
         };
-        let (control, payload_b64) = match after_g.iter().position(|&b| b == b';') {
-            Some(semi) => (&after_g[..semi], &after_g[semi + 1..]),
-            None => (after_g, &[][..]),
-        };
-        if self.pending.is_none() {
-            self.feed_new(control, payload_b64)
-        } else {
-            self.feed_continuation(control, payload_b64)
+        if let Err(reason) = self.begin_control(control) {
+            return KittyFeedOutcome::Rejected(reason);
         }
+        if let Err(reason) = self.push_payload(payload) {
+            return KittyFeedOutcome::Rejected(reason);
+        }
+        self.finish()
     }
 
-    /// Handles an `APC G` buffer with no open stream: new begin (`m=1`) or
-    /// lone single-shot (`m=0`/absent).
-    fn feed_new(&mut self, control: &[u8], payload_b64: &[u8]) -> KittyFeedOutcome {
-        let params = match parse_control(control) {
-            Ok(params) => params,
-            Err(reason) => {
-                self.warn_reject(reason, "control");
-                return KittyFeedOutcome::Rejected(reason);
-            }
+    pub(crate) fn begin_control(&mut self, control: &[u8]) -> Result<(), KittyApcReject> {
+        if self.current_final.is_some() {
+            let reason = KittyApcReject::Orphan;
+            self.warn_reject(reason, "nested APC chunk");
+            return Err(reason);
+        }
+        if control.len() > KITTY_APC_MAX_CONTROL_BYTES {
+            let reason = KittyApcReject::Oversize;
+            self.warn_reject(reason, "control");
+            return Err(reason);
+        }
+        let Some(after_g) = control.strip_prefix(b"G") else {
+            return Err(KittyApcReject::NotGraphics);
         };
-        if params.more {
-            if payload_b64.len() > self.ledger_cap {
-                self.warn_reject(KittyApcReject::Oversize, "first chunk");
-                return KittyFeedOutcome::Rejected(KittyApcReject::Oversize);
-            }
-            let buffered = payload_b64.len();
+        if self.pending.is_some() {
+            let more = match more_flag(after_g) {
+                Ok(Some(more)) => more,
+                Ok(None) => {
+                    let reason = KittyApcReject::Orphan;
+                    self.warn_reject(reason, "missing m= with open stream");
+                    return Err(reason);
+                }
+                Err(reason) => {
+                    self.warn_reject(reason, "continuation m=");
+                    return Err(reason);
+                }
+            };
+            self.current_final = Some(!more);
+        } else {
+            let params = match parse_control(after_g) {
+                Ok(params) => params,
+                Err(reason) => {
+                    self.warn_reject(reason, "control");
+                    return Err(reason);
+                }
+            };
             self.pending = Some(PendingKitty {
                 format_f: params.format_f,
                 width_s: params.width_s,
@@ -301,130 +571,80 @@ impl KittyApcAssembler {
                 action_a: params.action_a,
                 cols_c: params.cols_c,
                 rows_r: params.rows_r,
-                encoded: payload_b64.to_vec(),
+                encoded_len: 0,
+                decoder: Base64Stream::default(),
+                payload: Vec::new(),
             });
-            KittyFeedOutcome::NeedMore {
-                buffered_encoded: buffered,
-            }
-        } else {
-            // Lone single-shot: enforce the decode bound before allocating
-            // (a lone packet must not bypass the decode cap via the larger
-            // ledger), decode, re-check, then validate the raw claim.
-            if payload_b64.len() > max_encoded_len_for_decode_cap(self.decode_cap) {
-                self.warn_reject(KittyApcReject::Oversize, "single-shot decode cap");
-                return KittyFeedOutcome::Rejected(KittyApcReject::Oversize);
-            }
-            if payload_b64.len() > self.ledger_cap {
-                self.warn_reject(KittyApcReject::Oversize, "single-shot");
-                return KittyFeedOutcome::Rejected(KittyApcReject::Oversize);
-            }
-            let decoded = match base64_decode_standard(payload_b64) {
-                Ok(bytes) => bytes,
-                Err(_) => {
-                    self.warn_reject(KittyApcReject::BadBase64, "single-shot");
-                    return KittyFeedOutcome::Rejected(KittyApcReject::BadBase64);
-                }
-            };
-            if decoded.len() > self.decode_cap {
-                self.warn_reject(KittyApcReject::Oversize, "decoded single-shot");
-                return KittyFeedOutcome::Rejected(KittyApcReject::Oversize);
-            }
-            if let Err(reason) =
-                validate_raw_claim(params.format_f, params.width_s, params.height_v)
-            {
-                self.warn_reject(reason, "claim");
-                return KittyFeedOutcome::Rejected(reason);
-            }
-            KittyFeedOutcome::Completed(KittyCompleted {
-                format_f: params.format_f,
-                width_s: params.width_s,
-                height_v: params.height_v,
-                action_a: params.action_a,
-                cols_c: params.cols_c,
-                rows_r: params.rows_r,
-                payload: decoded.into_boxed_slice(),
-            })
+            self.current_final = Some(!params.more);
         }
+        Ok(())
     }
 
-    /// Handles an `APC G` buffer with an open stream: continuation (`m=1`)
-    /// appends, final (`m=0`/absent-with-pending) assembles and decodes.
-    ///
-    /// Continuation control params other than `m` are ignored (the first
-    /// chunk is authoritative). A missing `m` while a stream is open keeps
-    /// the open stream and drops the newcomer (fail-closed, no merge).
-    fn feed_continuation(&mut self, control: &[u8], payload_b64: &[u8]) -> KittyFeedOutcome {
-        let more = match more_flag(control) {
-            Ok(more) => more,
-            Err(reason) => {
-                self.warn_reject(reason, "continuation m=");
-                return KittyFeedOutcome::Rejected(reason);
-            }
+    pub(crate) fn push_payload(&mut self, payload: &[u8]) -> Result<(), KittyApcReject> {
+        if self.current_final.is_none() {
+            return Err(KittyApcReject::Orphan);
+        }
+        let available = self.budget.payload_limit;
+        let result = match self.pending.as_mut() {
+            Some(pending) => pending.push(payload, available, &mut self.budget),
+            None => Err(KittyApcReject::Orphan),
         };
-        let Some(more) = more else {
-            // No `m` while a stream is open: keep the open stream, drop the
-            // newcomer (it is likely an unrelated single-shot that must not
-            // corrupt the in-flight assembly).
-            self.warn_reject(KittyApcReject::Orphan, "missing m= with open stream");
+        if let Err(reason) = result {
+            self.abort();
+            self.warn_reject(reason, "payload");
+            return Err(reason);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(&mut self) -> KittyFeedOutcome {
+        let Some(final_chunk) = self.current_final.take() else {
             return KittyFeedOutcome::Rejected(KittyApcReject::Orphan);
         };
-        if more {
-            let buffered = self.pending_encoded_len();
-            let needed = buffered.saturating_add(payload_b64.len());
-            if needed > self.ledger_cap {
-                self.pending = None;
-                self.warn_reject(KittyApcReject::Oversize, "chunk growth");
-                return KittyFeedOutcome::Rejected(KittyApcReject::Oversize);
+        let Some(mut pending) = self.pending.take() else {
+            return KittyFeedOutcome::Rejected(KittyApcReject::Orphan);
+        };
+        if !final_chunk {
+            if pending.decoder.finished {
+                self.budget.clear_retained();
+                self.warn_reject(KittyApcReject::BadBase64, "non-final chunk");
+                return KittyFeedOutcome::Rejected(KittyApcReject::BadBase64);
             }
-            let pending = self.pending.as_mut().expect("open stream");
-            pending.encoded.extend_from_slice(payload_b64);
-            KittyFeedOutcome::NeedMore {
-                buffered_encoded: pending.encoded.len(),
-            }
-        } else {
-            let buffered = self.pending_encoded_len();
-            let needed = buffered.saturating_add(payload_b64.len());
-            if needed > self.ledger_cap {
-                self.pending = None;
-                self.warn_reject(KittyApcReject::Oversize, "final growth");
-                return KittyFeedOutcome::Rejected(KittyApcReject::Oversize);
-            }
-            let pending = self.pending.take().expect("open stream");
-            let mut encoded = pending.encoded;
-            encoded.extend_from_slice(payload_b64);
-            // Final assembly is a decode too: bound the decoded output before
-            // allocating it, even though the ledger admitted the intake.
-            if encoded.len() > max_encoded_len_for_decode_cap(self.decode_cap) {
-                self.warn_reject(KittyApcReject::Oversize, "assembled decode cap");
-                return KittyFeedOutcome::Rejected(KittyApcReject::Oversize);
-            }
-            let decoded = match base64_decode_standard(&encoded) {
-                Ok(bytes) => bytes,
-                Err(_) => {
-                    self.warn_reject(KittyApcReject::BadBase64, "assembled");
-                    return KittyFeedOutcome::Rejected(KittyApcReject::BadBase64);
-                }
+            self.pending = Some(pending);
+            return KittyFeedOutcome::NeedMore {
+                buffered_encoded: self.pending_encoded_len(),
             };
-            if decoded.len() > self.decode_cap {
-                self.warn_reject(KittyApcReject::Oversize, "decoded assembly");
-                return KittyFeedOutcome::Rejected(KittyApcReject::Oversize);
-            }
-            if let Err(reason) =
-                validate_raw_claim(pending.format_f, pending.width_s, pending.height_v)
-            {
-                self.warn_reject(reason, "assembled claim");
-                return KittyFeedOutcome::Rejected(reason);
-            }
-            KittyFeedOutcome::Completed(KittyCompleted {
-                format_f: pending.format_f,
-                width_s: pending.width_s,
-                height_v: pending.height_v,
-                action_a: pending.action_a,
-                cols_c: pending.cols_c,
-                rows_r: pending.rows_r,
-                payload: decoded.into_boxed_slice(),
-            })
         }
+        let available = self.budget.payload_limit;
+        let result = pending
+            .decoder
+            .finish(&mut pending.payload, available)
+            .and_then(|()| {
+                if !self.budget.reserve_retained(pending.payload.capacity()) {
+                    return Err(KittyApcReject::Oversize);
+                }
+                validate_raw_claim(
+                    pending.format_f,
+                    pending.width_s,
+                    pending.height_v,
+                    self.effective_cap(),
+                )
+            });
+        if let Err(reason) = result {
+            self.budget.clear_retained();
+            self.warn_reject(reason, "final payload");
+            return KittyFeedOutcome::Rejected(reason);
+        }
+        self.budget.clear_retained();
+        KittyFeedOutcome::Completed(KittyCompleted {
+            format_f: pending.format_f,
+            width_s: pending.width_s,
+            height_v: pending.height_v,
+            action_a: pending.action_a,
+            cols_c: pending.cols_c,
+            rows_r: pending.rows_r,
+            payload: pending.payload.into_boxed_slice(),
+        })
     }
 }
 
@@ -559,6 +779,7 @@ fn validate_raw_claim(
     format_f: u32,
     width_s: Option<u32>,
     height_v: Option<u32>,
+    payload_cap: usize,
 ) -> Result<(), KittyApcReject> {
     let channels: usize = match format_f {
         24 => 3,
@@ -580,7 +801,7 @@ fn validate_raw_claim(
     }
     (pixels as usize)
         .checked_mul(channels)
-        .filter(|&n| n <= KITTY_APC_DECODE_MAX_BYTES)
+        .filter(|&n| n <= payload_cap)
         .map(|_| ())
         .ok_or(KittyApcReject::OversizeClaim)
 }
@@ -613,79 +834,6 @@ fn parse_u16(value: &[u8]) -> Option<u16> {
         acc = acc.checked_mul(10)?.checked_add(u16::from(b - b'0'))?;
     }
     Some(acc)
-}
-
-/// Minimal standard-base64 decoder (RFC 4648 §4, `+/` with `=` padding).
-///
-/// Mirrors `bitty-runtime` OSC 52 `base64_decode_standard` without a new
-/// dependency: accepts padded and unpadded input; rejects non-alphabet
-/// bytes, misplaced padding, and lengths congruent to 1 mod 4. Empty input
-/// decodes to empty. Time O(n), space O(n) in the input length.
-fn base64_decode_standard(input: &[u8]) -> Result<Vec<u8>, &'static str> {
-    fn sextet(byte: u8) -> Result<u32, &'static str> {
-        match byte {
-            b'A'..=b'Z' => Ok(u32::from(byte - b'A')),
-            b'a'..=b'z' => Ok(u32::from(byte - b'a' + 26)),
-            b'0'..=b'9' => Ok(u32::from(byte - b'0' + 52)),
-            b'+' => Ok(62),
-            b'/' => Ok(63),
-            _ => Err("invalid base64 character"),
-        }
-    }
-    if input.is_empty() {
-        return Ok(Vec::new());
-    }
-    if input.len() % 4 == 1 {
-        return Err("invalid base64 length");
-    }
-    let mut pad = 0_usize;
-    for &byte in input.iter().rev() {
-        if byte == b'=' {
-            pad += 1;
-        } else {
-            break;
-        }
-    }
-    if pad > 2 {
-        return Err("invalid base64 padding");
-    }
-    let body_len = input.len() - pad;
-    if input[..body_len].contains(&b'=') {
-        return Err("misplaced base64 padding");
-    }
-    if pad == 1 && body_len % 4 != 3 {
-        return Err("invalid base64 padding");
-    }
-    if pad == 2 && body_len % 4 != 2 {
-        return Err("invalid base64 padding");
-    }
-    let body = &input[..body_len];
-    let (full, tail) = body.split_at(body.len() / 4 * 4);
-    let mut out = Vec::with_capacity(input.len() / 4 * 3 + 3);
-    for chunk in full.chunks_exact(4) {
-        let triple = (sextet(chunk[0])? << 18)
-            | (sextet(chunk[1])? << 12)
-            | (sextet(chunk[2])? << 6)
-            | sextet(chunk[3])?;
-        out.push((triple >> 16) as u8);
-        out.push((triple >> 8) as u8);
-        out.push(triple as u8);
-    }
-    match tail.len() {
-        0 => {}
-        2 => {
-            let bits = (sextet(tail[0])? << 18) | (sextet(tail[1])? << 12);
-            out.push((bits >> 16) as u8);
-        }
-        3 => {
-            let bits =
-                (sextet(tail[0])? << 18) | (sextet(tail[1])? << 12) | (sextet(tail[2])? << 6);
-            out.push((bits >> 16) as u8);
-            out.push((bits >> 8) as u8);
-        }
-        _ => return Err("invalid base64 length"),
-    }
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -800,6 +948,16 @@ mod tests {
             KittyFeedOutcome::Completed(_) | KittyFeedOutcome::Rejected(_) => {}
             KittyFeedOutcome::NeedMore { .. } => panic!("unexpected NeedMore"),
         }
+        assert!(!assembler.has_pending());
+    }
+
+    #[test]
+    fn raw_claim_over_img1_payload_budget_is_rejected_before_emit() {
+        let mut assembler = KittyApcAssembler::new();
+        assert!(matches!(
+            assembler.feed(b"Gf=32,s=2048,v=2048,m=0;AA=="),
+            KittyFeedOutcome::Rejected(KittyApcReject::OversizeClaim)
+        ));
         assert!(!assembler.has_pending());
     }
 
@@ -963,9 +1121,112 @@ mod tests {
         }
     }
 
+    fn base64_encode(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::with_capacity(bytes.len().div_ceil(3).saturating_mul(4));
+        for chunk in bytes.chunks(3) {
+            let first = chunk[0];
+            let second = chunk.get(1).copied().unwrap_or(0);
+            let third = chunk.get(2).copied().unwrap_or(0);
+            out.push(ALPHABET[(first >> 2) as usize] as char);
+            out.push(ALPHABET[(((first & 0x03) << 4) | (second >> 4)) as usize] as char);
+            if chunk.len() > 1 {
+                out.push(ALPHABET[(((second & 0x0f) << 2) | (third >> 6)) as usize] as char);
+            } else {
+                out.push('=');
+            }
+            if chunk.len() > 2 {
+                out.push(ALPHABET[(third & 0x3f) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn img1_payload_below_at_and_above_boundary_is_bounded() {
+        let cap = KITTY_APC_LEDGER_CAP;
+        for (len, should_complete) in [(cap - 1, true), (cap, true), (cap + 1, false)] {
+            let payload = vec![0x5a; len];
+            let encoded = base64_encode(&payload);
+            let mut raw = Vec::with_capacity(encoded.len() + 16);
+            raw.extend_from_slice(b"Gf=100,m=0;");
+            raw.extend_from_slice(encoded.as_bytes());
+            let mut assembler = KittyApcAssembler::new();
+            match assembler.feed(&raw) {
+                KittyFeedOutcome::Completed(done) if should_complete => {
+                    assert_eq!(done.payload.len(), len);
+                }
+                KittyFeedOutcome::Rejected(KittyApcReject::Oversize) if !should_complete => {}
+                other => panic!("unexpected boundary outcome for {len}: {other:?}"),
+            }
+            assert!(assembler.peak_memory() <= cap);
+            assert!(
+                assembler.peak_total_memory()
+                    <= cap + KITTY_APC_MAX_CONTROL_BYTES + KITTY_APC_CODEC_SCRATCH_BYTES
+            );
+        }
+    }
+
+    #[test]
+    fn small_cap_continuation_is_exact_and_over_budget_is_rejected() {
+        let cap = 9;
+        let encoded = base64_encode(&vec![0x33; cap]);
+        let split = encoded.len() - 4;
+        let mut assembler = KittyApcAssembler::with_caps(4096, cap);
+        let mut first = b"Gf=100,m=1;".to_vec();
+        first.extend_from_slice(&encoded.as_bytes()[..split]);
+        match assembler.feed(&first) {
+            KittyFeedOutcome::NeedMore { .. } => {}
+            other => panic!("expected NeedMore, got {other:?}"),
+        }
+        let mut final_chunk = b"Gm=0;".to_vec();
+        final_chunk.extend_from_slice(&encoded.as_bytes()[split..]);
+        match assembler.feed(&final_chunk) {
+            KittyFeedOutcome::Completed(done) => assert_eq!(done.payload.len(), cap),
+            other => panic!("expected completion, got {other:?}"),
+        }
+        assert!(assembler.peak_memory() <= cap);
+
+        let first = base64_encode(&[0x33; 6]);
+        let tail = base64_encode(&[0x33; 4]);
+        let mut assembler = KittyApcAssembler::with_caps(4096, cap);
+        let mut first_chunk = b"Gf=100,m=1;".to_vec();
+        first_chunk.extend_from_slice(first.as_bytes());
+        assert!(matches!(
+            assembler.feed(&first_chunk),
+            KittyFeedOutcome::NeedMore { .. }
+        ));
+        let mut final_chunk = b"Gm=0;".to_vec();
+        final_chunk.extend_from_slice(tail.as_bytes());
+        assert!(matches!(
+            assembler.feed(&final_chunk),
+            KittyFeedOutcome::Rejected(KittyApcReject::Oversize)
+        ));
+        assert!(!assembler.has_pending());
+        assert!(assembler.peak_memory() <= cap);
+    }
+
+    #[test]
+    fn first_chunk_over_budget_is_rejected_before_decode() {
+        let cap = 9;
+        let encoded = base64_encode(&vec![0x33; cap + 1]);
+        let mut raw = b"Gf=100,m=1;".to_vec();
+        raw.extend_from_slice(encoded.as_bytes());
+        let mut assembler = KittyApcAssembler::with_caps(4096, cap);
+        assert!(matches!(
+            assembler.feed(&raw),
+            KittyFeedOutcome::Rejected(KittyApcReject::Oversize)
+        ));
+        assert!(!assembler.has_pending());
+        assert!(assembler.peak_memory() <= cap);
+    }
+
     #[test]
     fn caps_mirror_canonical_crates() {
-        assert_eq!(KITTY_APC_LEDGER_CAP, 320 * 1000 * 1000);
+        assert_eq!(KITTY_APC_LEDGER_CAP, 4 * 1024 * 1024);
         assert_eq!(KITTY_APC_DECODE_MAX_DIMENSION, 8192);
         assert_eq!(KITTY_APC_DECODE_MAX_PIXELS, 4096 * 4096);
         assert_eq!(KITTY_APC_DECODE_MAX_BYTES, 64 * 1024 * 1024);

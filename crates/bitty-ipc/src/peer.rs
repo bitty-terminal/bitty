@@ -153,11 +153,7 @@ pub fn current_unix_uid() -> Result<u32, IpcError> {
         target_os = "dragonfly",
     ))]
     {
-        return nix::unistd::getuid()
-            .map(|uid| uid.as_raw())
-            .map_err(|err| IpcError::Unavailable {
-                reason: format!("current Unix uid query failed: {err}"),
-            });
+        Ok(nix::unistd::getuid().as_raw())
     }
     #[cfg(not(any(
         target_os = "linux",

@@ -236,6 +236,7 @@ fn arb_erase_display() -> impl Strategy<Value = EraseDisplayMode> {
         Just(EraseDisplayMode::Above),
         Just(EraseDisplayMode::All),
         Just(EraseDisplayMode::Scrollback),
+        Just(EraseDisplayMode::ScrollAndClear),
     ]
 }
 

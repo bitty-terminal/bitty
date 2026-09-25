@@ -592,6 +592,10 @@ impl<F: FnMut(TerminalAction)> Perform for Bridge<'_, F> {
                         1 => EraseDisplayMode::Above,
                         2 => EraseDisplayMode::All,
                         3 => EraseDisplayMode::Scrollback,
+                        // Kitty scroll-and-clear (issue #1396); ghostty
+                        // adopted it as the safe alternative to overloading
+                        // `ED 2`.
+                        22 => EraseDisplayMode::ScrollAndClear,
                         _ => {
                             self.unknown_csi(intermediates, final_byte);
                             return;

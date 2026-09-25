@@ -1702,6 +1702,33 @@ impl State {
                 // M1-18: wholesale buffer-identity invalidation for anchors.
                 self.buffer_epoch += 1;
             }
+            EraseDisplayMode::ScrollAndClear => {
+                // `ED 22` (kitty scroll-and-clear, adopted by ghostty): the
+                // visible screen scrolls into the scrollback and the screen
+                // is then cleared. Retained scrollback content is preserved
+                // (never `ED 3` semantics), and the capture is bounded like
+                // every other scroll-into-scrollback path: each row goes
+                // through `Scrollback::push_with_wrap`, so capacity pruning
+                // and eviction damage reuse the existing mechanism.
+                //
+                // The alternate screen owns no scrollback of its own, so
+                // `ED 22` there only clears: capturing alt-screen UI into the
+                // primary history would leak it. The cursor, scroll region,
+                // and pen are left unchanged, matching `ED 2`.
+                if !self.alt_screen_active() {
+                    for row in 0..self.height {
+                        let cells = self.screens_active().snapshot_row(row);
+                        let wrapped = self.screens_active().wrapped(row);
+                        let (_, evicted) = self.scrollback.push_with_wrap(cells, wrapped);
+                        self.push_scroll_damage(evicted);
+                    }
+                }
+                let erase = self.bce_style();
+                let (last_row_u, last_col_u) = (self.height as u16 - 1, self.width as u16 - 1);
+                self.screens_active_mut()
+                    .fill_rect(0, 0, last_row_u, last_col_u, &erase);
+                self.damage_grid_rect(0, 0, last_row_u, last_col_u);
+            }
         }
     }
 

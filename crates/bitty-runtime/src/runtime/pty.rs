@@ -830,11 +830,12 @@ impl Runtime {
             // Selection invalidation (CTX-0060, extended for issue #1337):
             // FullReset erases grid and scrollback, so any live selection
             // is no longer anchored to valid content. The same holds for
-            // every ED mode that erases live-grid cells (Below/Above/All):
-            // the highlight overlay paints from grid coordinates on the
-            // next present, so a kept selection would keep painting its
-            // rects over erased cells as a persistent block after `clear`.
-            // Fail closed: drop the selection on all grid-erasing actions.
+            // every ED mode that erases live-grid cells (Below/Above/All,
+            // plus ED 22 scroll-and-clear): the highlight overlay paints
+            // from grid coordinates on the next present, so a kept selection
+            // would keep painting its rects over erased cells as a
+            // persistent block after `clear`. Fail closed: drop the
+            // selection on all grid-erasing actions.
             // ED 3 (EraseDisplayMode::Scrollback) clears scrollback history
             // but leaves the live grid; live-grid selections remain valid,
             // so scrollback-only clears keep live selection.
@@ -844,7 +845,8 @@ impl Runtime {
                     TerminalAction::EraseInDisplay {
                         mode: bitty_vt::EraseDisplayMode::Below
                             | bitty_vt::EraseDisplayMode::Above
-                            | bitty_vt::EraseDisplayMode::All,
+                            | bitty_vt::EraseDisplayMode::All
+                            | bitty_vt::EraseDisplayMode::ScrollAndClear,
                     }
                 );
             if grid_erased {

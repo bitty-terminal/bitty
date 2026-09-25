@@ -191,6 +191,26 @@ fn erase_families_map_modes_and_reject_unknown_modes() {
 }
 
 #[test]
+fn ed22_parses_as_scroll_and_clear_while_neighbours_stay_unknown() {
+    // `ED 22` is the kitty scroll-and-clear extension (issue #1396); the
+    // neighbouring out-of-domain modes stay inert, and trailing extra
+    // parameters are tolerated like every other ED mode.
+    assert_eq!(
+        parse(b"\x1b[22J\x1b[22;7J\x1b[21J\x1b[4J"),
+        vec![
+            TerminalAction::EraseInDisplay {
+                mode: EraseDisplayMode::ScrollAndClear
+            },
+            TerminalAction::EraseInDisplay {
+                mode: EraseDisplayMode::ScrollAndClear
+            },
+            unknown(SequenceKind::Csi, b'J', [0, 0]),
+            unknown(SequenceKind::Csi, b'J', [0, 0]),
+        ]
+    );
+}
+
+#[test]
 fn insert_delete_erase_chars_default_counts() {
     assert_eq!(
         parse(b"\x1b[X\x1b[4@\x1b[P\x1b[2L\x1b[M"),

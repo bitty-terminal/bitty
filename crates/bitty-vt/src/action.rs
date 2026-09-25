@@ -148,6 +148,10 @@ pub enum EraseDisplayMode {
     All,
     /// The scrollback buffer (`ED 3`); visible cells are untouched.
     Scrollback,
+    /// Scroll the visible screen into the scrollback, then clear it
+    /// (`ED 22`, the kitty scroll-and-clear extension adopted by ghostty).
+    /// Retained scrollback content is preserved (no `ED 3` semantics).
+    ScrollAndClear,
 }
 
 /// Extent selector for erase-in-line (`EL`).

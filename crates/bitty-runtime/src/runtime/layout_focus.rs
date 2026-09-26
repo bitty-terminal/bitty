@@ -841,7 +841,7 @@ impl Runtime {
     /// Best-effort like the pane sync: matching dims skip, PTY errors never
     /// fail the layout change.
     pub fn set_layout(&mut self, layout: LayoutNode) {
-        self.replace_layout(layout, None);
+        self.replace_layout(layout, None, true);
     }
 
     /// Replaces the owned layout because leaf `closed` was explicitly closed.
@@ -855,10 +855,22 @@ impl Runtime {
     /// workspace installs) preserve the owner and its grid for the round
     /// trip back.
     pub fn set_layout_closing(&mut self, layout: LayoutNode, closed: ViewId) {
-        self.replace_layout(layout, Some(closed));
+        self.replace_layout(layout, Some(closed), true);
     }
 
-    fn replace_layout(&mut self, layout: LayoutNode, closed: Option<ViewId>) {
+    /// Replaces the owned layout without syncing terminal grid geometry.
+    ///
+    /// CTX-0790 (#1435): zoom engage/disengage are temporary layout changes
+    /// that preserve the primary grid dimensions for the round trip. Syncing
+    /// geometry during these transitions triggers terminal grid resize with
+    /// content reflow, which is lossy — scrollback content does not restore
+    /// perfectly when the layout returns. This variant skips the geometry
+    /// sync so the grid stays unchanged across zoom operations.
+    pub fn set_layout_preserve_grid(&mut self, layout: LayoutNode) {
+        self.replace_layout(layout, None, false);
+    }
+
+    fn replace_layout(&mut self, layout: LayoutNode, closed: Option<ViewId>, sync_geometry: bool) {
         // CTX-0334: a structural layout change abandons any pending hover
         // dwell; the candidate may no longer exist or may have moved.
         self.clear_hover_pending();
@@ -905,7 +917,11 @@ impl Runtime {
         // the primary owner leaf — the tile that paints primary input/cursor
         // — not the focused leaf. A layout without the owner (fresh
         // workspace) leaves the grid untouched until the owner returns.
-        self.sync_primary_geometry();
+        // CTX-0790 (#1435): zoom operations skip this sync to preserve grid
+        // dimensions across the engage/disengage round trip.
+        if sync_geometry {
+            self.sync_primary_geometry();
+        }
         // CTX-0176: leaf boundaries may have moved (split/close/resize),
         // so re-sync every pane session's grid + PTY winsize to its leaf.
         self.sync_pane_geometry_to(&frames);

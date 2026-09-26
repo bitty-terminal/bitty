@@ -15,3 +15,4 @@ workspace = true
 
 [dependencies]
 phodopus = { git = "https://github.com/bitty-terminal/phodopus", rev = "1653c51f7fbda5e93fa99aefb0e5be58dfacfeb0" }
+bitty-network-lua = { path = "../../../../../bitty-network/crates/bitty-network-lua" }

@@ -260,6 +260,7 @@ dependencies = [
 name = "bitty-lua"
 version = "0.0.21"
 dependencies = [
+ "bitty-network-lua",
  "phodopus",
 ]
 

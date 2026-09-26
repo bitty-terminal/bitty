@@ -99,6 +99,20 @@
 //! platform, CTX-0263 precedent). Plain `Tab`, bare arrows, letters, and digits
 //! are deliberately unbound so they reach the shell.
 //!
+//! # Shifted symbols (physical base key, issue #1446)
+//!
+//! A press carries the *modifier-applied* logical character, so a physical
+//! `Mod+Shift+2` — the accepted DEC-0034 workspace-move gesture, spelled
+//! `shift+alt+2` — arrives as `@` plus a held Shift and could never equal the
+//! base-key chord by exact equality. Matching therefore tries the reported
+//! spelling first and falls back to the physical base-key spelling of a
+//! shift-held shifted symbol ([`KeyRef::unshifted_base`],
+//! [`shifted_symbol_base`]) at the dispatch site (`bitty-app`): the gesture
+//! resolves, the exact spellings keep their precedence, and the symbol no
+//! longer leaks to the PTY. Ghostty's key events carry the same
+//! `unshifted_codepoint` and its character keybinds match on it, the same
+//! rule; the shipped pair table is the US reference layout's.
+//!
 //! The table is the canonical Alt spelling (kept byte-identical for the
 //! CTX-0178 wizard pin); [`default_keymaps_with_mod`] renders it against one
 //! [`ModKey`] so flipping `mod_key` rebinds the chrome map without touching
@@ -1044,6 +1058,50 @@ fn require_workspace_index(arg: Option<&str>, raw: &str) -> Result<u64, ConfigEr
     }
 }
 
+/// Base key of a shift-held shifted symbol on the shipped US reference
+/// layout, or `None` when `c` already is a base key.
+///
+/// Key events carry the *modifier-applied* logical character (winit
+/// `Key::Character` has Shift and the layout already applied), so a physical
+/// `Shift+2` arrives as `@` and a physical `Shift+/` as `?`. The shipped
+/// defaults spell physical gestures with the base key (`shift+alt+1..=9` for
+/// `Mod+Shift+Number`, DEC-0034), so matching recovers the base key through
+/// this table instead of duplicating every shifted-symbol spelling.
+/// [`KeyRef::unshifted_base`] applies it. Pair set: the US reference layout's
+/// digit and punctuation rows (`!@#$%^&*()`, `~_+{}|:"<>?`).
+///
+/// Layout scope: the pairs are the shipped reference layout's; a layout that
+/// reports a different symbol for the same physical key (for example a UK
+/// `Shift+2` = `"`) is not covered here — the reported spelling keeps its own
+/// exact-match path, so nothing regresses for those bindings.
+#[must_use]
+pub const fn shifted_symbol_base(c: char) -> Option<char> {
+    match c {
+        '!' => Some('1'),
+        '@' => Some('2'),
+        '#' => Some('3'),
+        '$' => Some('4'),
+        '%' => Some('5'),
+        '^' => Some('6'),
+        '&' => Some('7'),
+        '*' => Some('8'),
+        '(' => Some('9'),
+        ')' => Some('0'),
+        '~' => Some('`'),
+        '_' => Some('-'),
+        '+' => Some('='),
+        '{' => Some('['),
+        '}' => Some(']'),
+        '|' => Some('\\'),
+        ':' => Some(';'),
+        '"' => Some('\''),
+        '<' => Some(','),
+        '>' => Some('.'),
+        '?' => Some('/'),
+        _ => None,
+    }
+}
+
 /// Plain-data key reference for matching: the pressed key plus the held
 /// modifiers snapshot. The app builds this from its `KeyEvent` and its own
 /// modifier mirror (key events carry no modifier field); matching here stays
@@ -1072,6 +1130,33 @@ impl KeyRef {
             && self.alt == chord.alt
             && self.shift == chord.shift
             && self.super_held == chord.super_held
+    }
+
+    /// Physical base-key spelling of this press, or `None` when no shift-held
+    /// shifted symbol applies.
+    ///
+    /// Returns the same press with [`Self::key`] replaced by
+    /// [`shifted_symbol_base`]'s base key when Shift is held and the reported
+    /// key is a shifted symbol (`@` -> `Char('2')`), keeping every modifier
+    /// bit: the physical gesture `Shift+Mod+2` reports `@` + `shift` + the
+    /// Mod, and the base-key spelling `Char('2')` + `shift` + the Mod is the
+    /// one the accepted `shift+alt+2` chord (DEC-0034 workspace move) can
+    /// match. Exact matching stays untouched ([`Self::matches`]); callers try
+    /// the reported spelling first and consult this second, so every explicit
+    /// binding keeps its precedence.
+    #[must_use]
+    pub fn unshifted_base(&self) -> Option<Self> {
+        if !self.shift {
+            return None;
+        }
+        let KeyName::Char(c) = self.key else {
+            return None;
+        };
+        let base = shifted_symbol_base(c)?;
+        Some(Self {
+            key: KeyName::Char(base),
+            ..*self
+        })
     }
 }
 
@@ -2444,6 +2529,121 @@ mod tests {
                 "default '{chord}' must hold a modifier"
             );
         }
+    }
+
+    #[test]
+    fn shifted_symbol_base_recovers_us_reference_pairs() {
+        // Issue #1446: the platform reports the modifier-applied logical
+        // character, so the physical digit and punctuation rows must fold
+        // back to their base key.
+        for (symbol, base) in [
+            ('!', '1'),
+            ('@', '2'),
+            ('#', '3'),
+            ('$', '4'),
+            ('%', '5'),
+            ('^', '6'),
+            ('&', '7'),
+            ('*', '8'),
+            ('(', '9'),
+            (')', '0'),
+            ('~', '`'),
+            ('_', '-'),
+            ('+', '='),
+            ('{', '['),
+            ('}', ']'),
+            ('|', '\\'),
+            (':', ';'),
+            ('"', '\''),
+            ('<', ','),
+            ('>', '.'),
+            ('?', '/'),
+        ] {
+            assert_eq!(shifted_symbol_base(symbol), Some(base), "{symbol:?} folds");
+        }
+        // Base keys, letters, and unpaired characters fold to nothing.
+        for c in ['1', 'a', 'Z', 'ä', ' ', '\t'] {
+            assert_eq!(shifted_symbol_base(c), None, "{c:?} stays itself");
+        }
+    }
+
+    #[test]
+    fn physical_shift_number_resolves_through_base_key_fallback() {
+        // Issue #1446 regression pin at the config layer: the physical
+        // gesture Mod+Shift+Number arrives as the shifted symbol plus a held
+        // Shift and the Mod (winit applies both), while DEC-0034 spells the
+        // move chord with the base key (`shift+alt+2`). The reported spelling
+        // misses by exact equality; the base-key spelling — what the app
+        // dispatch consults second — hits. Without the fold the gesture moved
+        // nothing and the symbol leaked to the PTY.
+        let maps = default_keymaps().expect("defaults valid");
+        let digit_row = [
+            ('1', '!'),
+            ('2', '@'),
+            ('3', '#'),
+            ('4', '$'),
+            ('5', '%'),
+            ('6', '^'),
+            ('7', '&'),
+            ('8', '*'),
+            ('9', '('),
+        ];
+        for (index, (digit, symbol)) in digit_row.iter().enumerate() {
+            let one_based = (index + 1) as u64;
+            let digit = KeyName::Char(*digit);
+            let reported = KeyRef {
+                key: KeyName::Char(*symbol),
+                ctrl: false,
+                alt: true,
+                shift: true,
+                super_held: false,
+            };
+            assert_eq!(
+                match_keymap(&maps, reported),
+                None,
+                "the reported {symbol:?} is not a bound spelling"
+            );
+            let base = reported.unshifted_base().expect("shifted digit folds");
+            assert_eq!(base.key, digit, "{symbol:?} folds to its base key");
+            assert!(
+                base.alt && base.shift && !base.ctrl && !base.super_held,
+                "the fold keeps every modifier so Shift stays part of the chord"
+            );
+            assert_eq!(
+                match_keymap(&maps, base),
+                Some(ChromeAction::WorkspaceMove(one_based)),
+                "physical Mod+Shift+{digit:?} moves the focused pane to ws:{one_based}"
+            );
+            // The plain Mod+digit switch spelling is unchanged and needs no
+            // fold (a digit already is a base key).
+            let plain = key_ref(digit, false, true, false);
+            assert_eq!(
+                match_keymap(&maps, plain),
+                Some(ChromeAction::WorkspaceFocus(one_based)),
+                "physical Mod+{digit:?} jumps to ws:{one_based}"
+            );
+            assert!(plain.unshifted_base().is_none());
+        }
+        // The Super flip re-spells the same physical gesture.
+        let super_maps = default_keymaps_with_mod(ModKey::Super).expect("super valid");
+        let reported = KeyRef {
+            key: KeyName::Char('@'),
+            ctrl: false,
+            alt: false,
+            shift: true,
+            super_held: true,
+        };
+        assert_eq!(match_keymap(&super_maps, reported), None);
+        assert_eq!(
+            match_keymap(&super_maps, reported.unshifted_base().expect("folds")),
+            Some(ChromeAction::WorkspaceMove(2))
+        );
+        // Named keys never fold: Shift+Mod+Tab is not Mod+Tab.
+        assert!(
+            key_ref(KeyName::Tab, false, true, true)
+                .unshifted_base()
+                .is_none()
+        );
     }
 
     #[test]

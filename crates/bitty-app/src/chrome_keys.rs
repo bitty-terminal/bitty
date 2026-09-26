@@ -420,6 +420,32 @@ pub(crate) fn key_ref_from_event(
     })
 }
 
+/// Match one press against the resolved keymap table, with the physical
+/// base-key fallback for shifted symbols (issue #1446).
+///
+/// The event's logical character already carries Shift and the layout, so a
+/// physical `Mod+Shift+2` — the accepted DEC-0034 workspace-move gesture,
+/// spelled `shift+alt+2` — arrives as `@` with `shift=true` and can never
+/// equal the base-key chord by exact equality (single-owner matching, no
+/// fuzzy spellings). Matching therefore tries the reported spelling first —
+/// every exact binding, default or user, keeps its precedence — and falls
+/// back to the physical base-key spelling
+/// ([`bitty_config::KeyRef::unshifted_base`]) when that one missed. Ghostty
+/// carries the same `unshifted_codepoint` on its key events and matches
+/// character keybinds on it. Without the
+/// fallback the move gesture was unreachable and the shifted symbol leaked
+/// through the single-owner intercept into the PTY.
+pub(crate) fn match_chrome_keymap(
+    maps: &[bitty_config::ResolvedKeymap],
+    keyref: bitty_config::KeyRef,
+) -> Option<bitty_config::ChromeAction> {
+    bitty_config::match_keymap(maps, keyref).or_else(|| {
+        keyref
+            .unshifted_base()
+            .and_then(|base| bitty_config::match_keymap(maps, base))
+    })
+}
+
 /// Map a split direction onto focus movement.
 pub(crate) fn split_dir_to_focus(dir: bitty_config::SplitDir) -> FocusDirection {
     match dir {
@@ -1766,7 +1792,7 @@ impl TerminalApp {
                         }
                         return true;
                     }
-                    let matched = bitty_config::match_keymap(&self.chrome.keymaps, keyref);
+                    let matched = match_chrome_keymap(&self.chrome.keymaps, keyref);
                     // CTX-0384: copy mode is modal for chrome chords too.
                     // `Esc` routes to the runtime so copy mode exits there
                     // (never the paste/close emergency path while modal);
@@ -4228,6 +4254,396 @@ mod tests {
         assert!(
             !rows.iter().any(|r| r.starts_with("alt+")),
             "no Alt spellings survive the flip: {rows:?}"
+        );
+    }
+
+    /// Latch the app modifier mirror like the compositor-fed stream does and
+    /// drive one character press/release through the real intercept. The
+    /// mirror is set *before* the press, exactly like the `ModifiersChanged`
+    /// stream that precedes a chord on Wayland/winit.
+    fn drive_mod_char(
+        app: &mut TerminalApp,
+        reported: &str,
+        ctrl: bool,
+        alt: bool,
+        shift: bool,
+        super_held: bool,
+    ) -> bool {
+        app.chrome.app_mods = AppModifiers {
+            shift,
+            control: ctrl,
+            alt,
+            super_held,
+        };
+        let consumed = drive_chrome(app, char_press(reported, reported, false));
+        let _ = drive_chrome(app, char_release(reported));
+        app.chrome.app_mods = AppModifiers::default();
+        consumed
+    }
+
+    #[test]
+    fn mod_number_switches_workspaces_on_default_keymap() {
+        // Issue #1446, switch half: `Mod+Number` jumps workspaces through the
+        // real intercept on the default config (the shipped `alt+1..=9`
+        // defaults), and the view layer re-activates the target workspace's
+        // tree — index, layout, and focus all follow the jump, never just the
+        // tabline.
+        let mut app = workspace_test_app();
+        // Mod+T creates workspaces (the shipped creation chord; docs line).
+        assert!(drive_mod_char(&mut app, "t", false, true, false, false));
+        assert!(drive_mod_char(&mut app, "t", false, true, false, false));
+        assert_eq!(app.runtime.workspace_count(), 3);
+        assert_eq!(
+            app.runtime.active_workspace_index(),
+            2,
+            "Mod+T lands on ws3"
+        );
+        // Give ws1 two panes so a layout swap is observable, not just an index.
+        assert!(drive_mod_char(&mut app, "1", false, true, false, false));
+        assert_eq!(app.runtime.active_workspace_index(), 0);
+        let first_leaf = app.runtime.focused_view().expect("ws1 focus");
+        let fresh = ViewId::new(9);
+        let mut layout = app.runtime.layout().clone();
+        let old = layout
+            .find_leaf(first_leaf)
+            .cloned()
+            .expect("ws1 leaf present");
+        layout = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(old),
+            LayoutNode::leaf(View::new(fresh, 80, 24)),
+        );
+        app.runtime.set_layout(layout);
+        assert!(app.runtime.set_focus(fresh));
+        // Every supported digit is consumed (never typed into the shell), and
+        // in-range digits land exactly where they name.
+        for (digit, want_index) in [("1", 0usize), ("2", 1), ("3", 2)] {
+            assert!(
+                drive_mod_char(&mut app, digit, false, true, false, false),
+                "Mod+{digit} is bound (consumed)"
+            );
+            assert_eq!(
+                app.runtime.active_workspace_index(),
+                want_index,
+                "Mod+{digit} lands on ws{}",
+                want_index + 1
+            );
+            assert!(
+                app.runtime.drain_pending_input().is_empty(),
+                "the digit must never reach the shell"
+            );
+        }
+        // Jumping back to ws1 re-activates ITS tree (two leaves, the split
+        // leaf still focused), not ws3's single leaf.
+        assert!(drive_mod_char(&mut app, "1", false, true, false, false));
+        assert_eq!(app.runtime.active_workspace_index(), 0);
+        assert_eq!(app.runtime.layout().leaf_count(), 2);
+        assert!(app.runtime.layout().leaf_ids().contains(&fresh));
+        assert_eq!(app.runtime.focused_view(), Some(fresh));
+        // Out-of-range N clamps to the last workspace (issue #1365, accepted)
+        // and still never leaks the digit.
+        assert!(drive_mod_char(&mut app, "9", false, true, false, false));
+        assert_eq!(app.runtime.active_workspace_index(), 2);
+        assert_eq!(app.runtime.workspaceline_text(), "1:ws1 2:ws2 3:ws3* (3)");
+        assert!(app.runtime.drain_pending_input().is_empty());
+    }
+
+    #[test]
+    fn mod_number_single_workspace_clamps_and_never_leaks() {
+        // Issue #1446, "stuck on workspace 1" half: the shipped default
+        // session has exactly ONE workspace, so `Mod+2..9` clamp to it
+        // (issue #1365, accepted) and nothing visible changes — the reason a
+        // daily driver reads the numbers as dead. Creation is the separate
+        // `Mod+T` chord, so this test pins the two properties that must hold
+        // regardless: the bound chord is consumed, and the digit never
+        // reaches the shell.
+        let mut app = workspace_test_app();
+        assert_eq!(app.runtime.workspace_count(), 1, "shipped default");
+        for digit in ["1", "2", "9"] {
+            assert!(
+                drive_mod_char(&mut app, digit, false, true, false, false),
+                "Mod+{digit} is a bound chord (consumed)"
+            );
+            assert_eq!(app.runtime.active_workspace_index(), 0);
+            assert_eq!(app.runtime.workspace_count(), 1);
+            assert!(
+                app.runtime.drain_pending_input().is_empty(),
+                "the digit must never reach the shell"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_creation_chord_is_listed_in_help() {
+        // Issue #1446, "unclear how to create a new workspace": the shipped
+        // creation chord is `Mod+T` (`alt+t` = `workspace_new`, the docs line
+        // for bitty-terminal-docs), and the `Mod+`` popup lists it from the
+        // live registry so the gesture is discoverable in-app.
+        let mut app = workspace_test_app();
+        assert!(drive_mod_char(&mut app, "`", false, true, false, false));
+        assert!(app.runtime.help_visible(), "Mod+backtick shows the popup");
+        assert!(
+            app.runtime
+                .help_rows()
+                .iter()
+                .any(|row| row == "alt+t  workspace_new"),
+            "creation chord listed: {:?}",
+            app.runtime.help_rows()
+        );
+        assert!(
+            app.runtime
+                .help_rows()
+                .iter()
+                .any(|row| row == "alt+1  workspace_focus:1"),
+            "switch chord listed: {:?}",
+            app.runtime.help_rows()
+        );
+        assert!(
+            app.runtime
+                .help_rows()
+                .iter()
+                .any(|row| row == "alt+shift+1  workspace_move:1"),
+            "move chord listed under its canonical spelling: {:?}",
+            app.runtime.help_rows()
+        );
+    }
+
+    #[test]
+    fn mod_shift_number_moves_focused_pane_on_default_keymap() {
+        // Issue #1446, move half (the regression): the platform reports the
+        // modifier-applied character, so the physical move gesture arrives as
+        // the shifted symbol (`@` for Shift+2) while DEC-0034 spells the
+        // chord `shift+alt+2`. Before the base-key fallback the press matched
+        // nothing: no pane moved AND the symbol leaked to the PTY as shell
+        // input. Through the real intercept the gesture now reparents the
+        // focused leaf into the target workspace without switching.
+        let mut app = workspace_test_app();
+        assert!(drive_mod_char(&mut app, "t", false, true, false, false));
+        assert_eq!(app.runtime.workspace_count(), 2);
+        assert!(drive_mod_char(&mut app, "1", false, true, false, false));
+        assert_eq!(app.runtime.active_workspace_index(), 0);
+        // Split ws1: the move needs a second leaf to reparent.
+        let moved = ViewId::new(9);
+        let mut layout = app.runtime.layout().clone();
+        let focused = app.runtime.focused_view().expect("ws1 focus");
+        let old = layout
+            .find_leaf(focused)
+            .cloned()
+            .expect("ws1 leaf present");
+        layout = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(old),
+            LayoutNode::leaf(View::new(moved, 80, 24)),
+        );
+        app.runtime.set_layout(layout);
+        assert!(app.runtime.set_focus(moved));
+        // Physical Mod+Shift+2: the platform reports `@` with Shift held.
+        assert!(
+            drive_mod_char(&mut app, "@", false, true, true, false),
+            "the physical move gesture is chrome-owned"
+        );
+        assert!(
+            app.runtime.drain_pending_input().is_empty(),
+            "the shifted symbol must never reach the shell"
+        );
+        assert_eq!(
+            app.runtime.workspace_count(),
+            2,
+            "move never removes a slot"
+        );
+        assert_eq!(
+            app.runtime.active_workspace_index(),
+            0,
+            "move reparents; it never switches the active workspace"
+        );
+        assert_eq!(app.runtime.layout().leaf_count(), 1, "ws1 promoted a leaf");
+        // The moved pane is in ws2, focused, with its id intact.
+        assert!(drive_mod_char(&mut app, "2", false, true, false, false));
+        assert_eq!(app.runtime.active_workspace_index(), 1);
+        assert!(app.runtime.layout().leaf_ids().contains(&moved));
+        assert_eq!(app.runtime.focused_view(), Some(moved));
+        // Every digit's shifted symbol folds the same way (1..=9).
+        let symbols = ["!", "@", "#", "$", "%", "^", "&", "*", "("];
+        for (index, symbol) in symbols.iter().enumerate() {
+            let one_based = index + 1;
+            assert!(
+                drive_mod_char(&mut app, symbol, false, true, true, false),
+                "physical Mod+Shift+{one_based} ({symbol}) is consumed"
+            );
+            assert!(
+                app.runtime.drain_pending_input().is_empty(),
+                "no byte leak for {symbol}"
+            );
+            assert_eq!(
+                app.runtime.workspace_count(),
+                2,
+                "Mod+Shift+{one_based} never removes a workspace"
+            );
+        }
+        // Same gesture under the Super flip (`mod_key = "super"`).
+        let effective = bitty_config::EffectiveConfig {
+            mod_key: bitty_config::ModKey::Super,
+            ..Default::default()
+        };
+        let maps = bitty_config::resolve_keymaps(&effective).expect("resolves");
+        let mut app = TerminalApp::with_theme(
+            Runtime::with_defaults().expect("must build"),
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            maps,
+            SpawnSpec::default(),
+        );
+        assert!(drive_mod_char(&mut app, "t", false, false, false, true));
+        assert!(drive_mod_char(&mut app, "1", false, false, false, true));
+        assert_eq!(app.runtime.active_workspace_index(), 0);
+        assert!(
+            drive_mod_char(&mut app, "@", false, false, true, true),
+            "shift+super+2 is consumed"
+        );
+        assert!(
+            app.runtime.drain_pending_input().is_empty(),
+            "no byte leak under the Super flip"
+        );
+    }
+
+    // Live-spawn: real POSIX shells in two workspaces. `#[cfg(unix)]` keeps it
+    // off Windows CI; `require_pty!()` keeps the force-no-PTY simulation path.
+    // ConPTY coverage lives in bitty-pty/tests/spawn_windows.rs (CTX-0268).
+    #[test]
+    #[cfg(unix)]
+    fn workspace_keys_switch_and_move_keep_live_sessions() {
+        require_pty!();
+        let mut app = workspace_test_app();
+        // The primary shell attaches to ws1's leaf and its recipe is
+        // remembered; every fresh workspace replays it (CTX-0359).
+        app.runtime
+            .spawn_shell_with_args("/bin/sh", &[])
+            .expect("primary shell must spawn headless");
+        let ws1_leaf = app.runtime.focused_view().expect("primary leaf");
+        // Mod+T: a fresh workspace with its OWN shell, never the primary's.
+        assert!(drive_mod_char(&mut app, "t", false, true, false, false));
+        assert_eq!(app.runtime.workspace_count(), 2);
+        assert_eq!(app.runtime.active_workspace_index(), 1);
+        let ws2_leaf = app.runtime.focused_view().expect("ws2 leaf");
+        assert_ne!(ws2_leaf, ws1_leaf, "ws2 gets its own View");
+        assert!(app.runtime.has_pane_session(&ws2_leaf), "ws2 owns a shell");
+        // Switching jumps the live layout and focus; the other workspace's
+        // session keeps running (view layer re-activates, no session teardown).
+        assert!(drive_mod_char(&mut app, "1", false, true, false, false));
+        assert_eq!(app.runtime.active_workspace_index(), 0);
+        assert_eq!(app.runtime.focused_view(), Some(ws1_leaf));
+        assert!(
+            app.runtime.has_pane_session(&ws2_leaf),
+            "ws2's shell survives the switch away"
+        );
+        assert!(drive_mod_char(&mut app, "2", false, true, false, false));
+        assert_eq!(app.runtime.active_workspace_index(), 1);
+        assert_eq!(app.runtime.focused_view(), Some(ws2_leaf));
+        // Physical Mod+Shift+1 (reported `!`): ws2's pane moves into ws1 with
+        // its session, without switching away from ws2.
+        assert!(drive_mod_char(&mut app, "!", false, true, true, false));
+        assert!(
+            app.runtime.drain_pending_input().is_empty(),
+            "the shifted symbol never reaches a shell"
+        );
+        assert_eq!(
+            app.runtime.active_workspace_index(),
+            1,
+            "the move reparents, it never switches"
+        );
+        assert!(drive_mod_char(&mut app, "1", false, true, false, false));
+        assert!(
+            app.runtime.layout().leaf_ids().contains(&ws2_leaf),
+            "the moved pane is live in ws1"
+        );
+        assert!(
+            app.runtime.has_pane_session(&ws2_leaf),
+            "the moved pane keeps its shell"
+        );
+    }
+
+    #[test]
+    fn user_symbol_chord_keeps_precedence_over_base_key_fallback() {
+        // Single owner: the reported spelling is matched first, so an explicit
+        // user binding on the shifted symbol wins over the physical base-key
+        // fallback — the fallback only ever runs when nothing matched.
+        use bitty_config::{ChromeAction, EffectiveConfig, KeymapEntry, ModKey};
+        let effective = EffectiveConfig {
+            mod_key: ModKey::Alt,
+            keymaps: vec![KeymapEntry {
+                chord: "shift+alt+@".into(),
+                action: "focus_next".into(),
+                context: "global".into(),
+            }],
+            ..Default::default()
+        };
+        let maps = bitty_config::resolve_keymaps(&effective).expect("resolves");
+        // The reported spelling stays the first owner at the table level.
+        assert_eq!(
+            bitty_config::match_keymap(
+                &maps,
+                bitty_config::KeyRef {
+                    key: bitty_config::KeyName::Char('@'),
+                    ctrl: false,
+                    alt: true,
+                    shift: true,
+                    super_held: false,
+                }
+            ),
+            Some(ChromeAction::FocusNext)
+        );
+        let mut app = TerminalApp::with_theme(
+            Runtime::with_defaults().expect("must build"),
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            maps,
+            SpawnSpec::default(),
+        );
+        // ws2 exists, so the base-key fallback (workspace_move:2) would be
+        // observable if it won.
+        assert!(drive_mod_char(&mut app, "t", false, true, false, false));
+        assert!(drive_mod_char(&mut app, "1", false, true, false, false));
+        assert_eq!(app.runtime.active_workspace_index(), 0);
+        // Split ws1 and focus the new leaf so `focus_next` is observable.
+        let fresh = ViewId::new(9);
+        let mut layout = app.runtime.layout().clone();
+        let focused = app.runtime.focused_view().expect("ws1 focus");
+        let old = layout
+            .find_leaf(focused)
+            .cloned()
+            .expect("ws1 leaf present");
+        layout = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(old),
+            LayoutNode::leaf(View::new(fresh, 80, 24)),
+        );
+        app.runtime.set_layout(layout);
+        assert!(app.runtime.set_focus(fresh));
+        assert!(drive_mod_char(&mut app, "@", false, true, true, false));
+        assert_ne!(
+            app.runtime.focused_view(),
+            Some(fresh),
+            "the user's symbol chord ran (focus_next)"
+        );
+        assert_eq!(
+            app.runtime.layout().leaf_count(),
+            2,
+            "no move: both ws1 panes stay put"
+        );
+        assert_eq!(app.runtime.active_workspace_index(), 0, "no switch either");
+        assert_eq!(app.runtime.workspace_count(), 2);
+        assert!(
+            app.runtime.drain_pending_input().is_empty(),
+            "a consumed chord types nothing into the shell"
+        );
+        // A shifted symbol with no chord either way still routes to the PTY
+        // (the fallback never over-consumes).
+        assert!(
+            !drive_mod_char(&mut app, "\"", false, true, true, false),
+            "unbound shifted symbol falls through to the terminal path"
         );
     }
 }

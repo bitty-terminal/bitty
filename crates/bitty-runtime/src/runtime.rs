@@ -157,8 +157,13 @@ pub use self::animations::{
 pub use self::kitty_images::{KittyDisplayOutcome, KittyImageError};
 pub use self::present::{ImeCursorArea, PresentStats};
 
+// Re-exported so the IME contract tests share the one definition of the
+// post-commit echo bound rather than restating its value (CTX-0783).
+pub use self::input::IME_COMMIT_ECHO_WINDOW;
+
 use self::click::ClickTracker;
 use self::close_confirm::PendingCloseConfirm;
+use self::input::ImeKeyClaim;
 use self::layout_focus::{default_container, default_layout};
 use self::mouse_chrome::{AltDragState, BorderDragState, HoverPending};
 use self::panes::PaneSession;
@@ -793,6 +798,11 @@ pub struct Runtime {
     /// Focused caret rect + preedit clip budget, refreshed each presented
     /// frame (CTX-0367). `None` when no focused cursor was painted.
     ime_caret: Option<ImeCaret>,
+    /// CTX-0783: who owns raw key presses between IME keystrokes. Distinct
+    /// from `ime_preedit`, which is presentation state: winit clears the
+    /// preedit *before* emitting the commit, so the raw copy of the committing
+    /// key arrives with no preedit left to suppress it.
+    ime_key_claim: ImeKeyClaim,
     // Wheel accumulator for pixel scroll (candidate: 4*cell bound)
     wheel_accum_y: f32,
     wheel_accum_x: f32,
@@ -1279,6 +1289,7 @@ impl Runtime {
             ime_preedit: None,
             ime_cursor: 0,
             ime_caret: None,
+            ime_key_claim: ImeKeyClaim::Free,
             wheel_accum_y: 0.0,
             wheel_accum_x: 0.0,
             wheel_line_accum_y: 0.0,
@@ -1486,6 +1497,7 @@ impl Runtime {
             ime_preedit: None,
             ime_cursor: 0,
             ime_caret: None,
+            ime_key_claim: ImeKeyClaim::Free,
             wheel_accum_y: 0.0,
             wheel_accum_x: 0.0,
             wheel_line_accum_y: 0.0,

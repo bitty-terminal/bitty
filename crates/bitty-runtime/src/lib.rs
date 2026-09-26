@@ -261,7 +261,7 @@ pub use runtime::workspaces::{MAX_WORKSPACES, WsCloseRequest};
 pub use runtime::{
     ActivationGesture, AnimationCurve, AnimationKind, AnimationPolicy, ClosingFrame,
     DEFAULT_PLUGIN_DROP_POLICY, DEFAULT_PLUGIN_PIPELINE_CAPACITY, DEFAULT_PLUGIN_SIDE_CAPACITY,
-    FileUrlActivation, ImeCursorArea, KittyDisplayOutcome, KittyImageError,
+    FileUrlActivation, IME_COMMIT_ECHO_WINDOW, ImeCursorArea, KittyDisplayOutcome, KittyImageError,
     MAX_CONCURRENT_ANIMATIONS, PASTE_BANNER_FLASH_TEXT, PASTE_BANNER_FULL_DURATION,
     POLL_PTY_MAX_BYTES, POLL_PTY_MAX_CHUNKS, POLL_PTY_TIME_BUDGET, PTY_FORWARD_CAPACITY_CHUNKS,
     PanelAnimator, PresentStats, PtyWaker, ReducedMotionMode, Runtime, SYNC_UPDATE_DEFER_TIMEOUT,

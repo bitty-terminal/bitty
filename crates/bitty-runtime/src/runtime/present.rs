@@ -780,6 +780,15 @@ impl Runtime {
     /// [`PASTE_BANNER_FULL_DURATION`] → still pending (never-silent) → gone
     /// on confirm/cancel. Behavior is otherwise identical to `tick()`.
     pub fn tick_at(&mut self, now: std::time::Instant) -> Option<PresentStats> {
+        // CTX-0783: the embedder ticks once per dispatched event batch
+        // (`ApplicationHandler::about_to_wait`), which is the boundary a
+        // compositor may or may not put the commit and its echoing key in. Age
+        // the post-commit claim against the clock here instead of dropping it:
+        // dropping it at the first tick loses the echo whenever the two arrive
+        // in consecutive batches, which is a legal compositor flush and brings
+        // issue #1449 straight back. The claim goes when it is observed (the
+        // echo lands) or when its window elapses, whichever comes first.
+        self.age_ime_commit_key_claim(now);
         if self.tick_time_gates(now) {
             return None;
         }

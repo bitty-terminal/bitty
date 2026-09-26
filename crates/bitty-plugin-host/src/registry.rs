@@ -772,9 +772,8 @@ impl Registry {
     /// Suspended or Disposed plugins are denied to prevent stale-handle dispatch.
     #[must_use]
     pub fn can_dispatch(&self, id: &PluginId) -> bool {
-        self.get(id).is_some_and(|entry| {
-            entry.state == PluginState::Activated && entry.generation > 0
-        })
+        self.get(id)
+            .is_some_and(|entry| entry.state == PluginState::Activated && entry.generation > 0)
     }
 
     /// List all plugin ids.

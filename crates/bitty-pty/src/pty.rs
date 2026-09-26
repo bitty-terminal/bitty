@@ -457,8 +457,21 @@ mod tests {
             pty.pid().expect("child pid"),
             "job is not the shell"
         );
+        // CTX-0784: the kernel promotes the forked child to the foreground
+        // group before it has `exec`-ed, so the first snapshot that already
+        // reports a job can still name the shell. Wait for the settled name
+        // of that same job rather than asserting on the pre-`exec` one; the
+        // property under test (a bounded, non-shell job name) is unchanged
+        // and a job that never reports `sleep` still fails the bound.
         #[cfg(target_os = "linux")]
-        assert_eq!(job.name.as_deref(), Some("sleep"), "bounded job name");
+        {
+            let name = wait_until(Duration::from_secs(10), || {
+                let settled = pty.foreground_job()?;
+                (settled.pid == job.pid && settled.name.as_deref() == Some("sleep"))
+                    .then_some(settled.name)
+            });
+            assert_eq!(name.as_deref(), Some("sleep"), "bounded job name");
+        }
 
         // Ctrl-C through the line discipline interrupts the foreground job;
         // the shell takes the foreground back and busy clears.

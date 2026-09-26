@@ -867,10 +867,28 @@ fn auth_recheck_failure_closes_the_bound_connection() {
         )
     });
     let payload = br#"{"id":1,"method":"bitty.debug/getSnapshot","version":"1.0"}"#;
-    client.write_all(&encode_frame(payload).unwrap()).unwrap();
+    // CTX-0784: the server rejects the recheck before it reads a single
+    // request byte, so this write races the fail-closed shutdown it is
+    // testing. The raced write is itself a close observation, not a defect:
+    // `EPIPE`/`ECONNRESET` on a refused stream proves the bound connection
+    // went away. Any other error still fails, and a request that did reach
+    // the wire is still parsed and checked for the `Unauthenticated` body.
+    let request = match client.write_all(&encode_frame(payload).unwrap()) {
+        Ok(()) => Some(()),
+        Err(err) => {
+            assert!(
+                matches!(
+                    err.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                ),
+                "unexpected request write error: {err:?}"
+            );
+            None
+        }
+    };
     let mut header = [0u8; 4];
-    match client.read_exact(&mut header) {
-        Ok(()) => {
+    match request.map(|()| client.read_exact(&mut header)) {
+        Some(Ok(())) => {
             let len = u32::from_be_bytes(header) as usize;
             let mut response = vec![0u8; len];
             client.read_exact(&mut response).unwrap();
@@ -880,7 +898,7 @@ fn auth_recheck_failure_closes_the_bound_connection() {
                     .contains("Unauthenticated")
             );
         }
-        Err(err) => {
+        Some(Err(err)) => {
             // The recheck refusal closes the bound socket before any response.
             // Linux/other Unix surface that close while request bytes are
             // still unread as ECONNRESET; macOS ARM64 can complete an orderly
@@ -898,6 +916,9 @@ fn auth_recheck_failure_closes_the_bound_connection() {
             #[cfg(not(target_os = "macos"))]
             assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
         }
+        // The request write already observed the refusal close; the read side
+        // of that same close is asserted by the read at the end of the test.
+        None => {}
     }
     assert!(matches!(
         handle.join().unwrap(),

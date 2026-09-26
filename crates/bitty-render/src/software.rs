@@ -802,6 +802,7 @@ mod tests {
         surface.clear([0, 0, 0, 255]);
         let list = DrawList {
             generation: 1,
+            atlas_epoch: 0,
             plan: crate::frame::FramePlan {
                 extent: crate::geometry::ExtentPx::new(8, 8),
                 mode: crate::frame::FrameMode::Full,
@@ -868,6 +869,7 @@ mod tests {
         surface.clear([0, 0, 0, 255]);
         let list = DrawList {
             generation: 1,
+            atlas_epoch: 0,
             plan: crate::frame::FramePlan {
                 extent: crate::geometry::ExtentPx::new(8, 8),
                 mode: crate::frame::FrameMode::Full,

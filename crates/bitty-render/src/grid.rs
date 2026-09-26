@@ -1397,6 +1397,14 @@ impl ImageBlit {
 pub struct DrawList {
     /// Snapshot generation this list was built from.
     pub generation: u64,
+    /// Atlas epoch at which this list's glyph slots were placed (CTX-0531).
+    ///
+    /// Every glyph slot in this list must resolve against the atlas at exactly
+    /// this epoch. If the atlas epoch changes after the list is built (e.g., by
+    /// a subsequent `overlay_text_glyphs` call that exhausts and resets the
+    /// atlas), the list becomes stale and must be rebuilt to maintain frame
+    /// consistency.
+    pub atlas_epoch: u64,
     /// The frame plan that drove cell selection.
     pub plan: FramePlan,
     /// Background and decoration rectangles.
@@ -1428,6 +1436,16 @@ impl DrawList {
             || !self.overlay_fills.is_empty()
             || !self.glyphs.is_empty()
             || !self.images.is_empty()
+    }
+
+    /// True when this DrawList's atlas slots are still valid for `current_epoch`.
+    ///
+    /// Returns false when the atlas has been reset since this list was built,
+    /// meaning the glyph slots in this list reference stale atlas texels and
+    /// the frame must be rebuilt for consistency.
+    #[must_use]
+    pub fn is_atlas_epoch_valid(&self, current_epoch: u64) -> bool {
+        self.atlas_epoch == current_epoch
     }
 }
 
@@ -1978,6 +1996,16 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         )
     }
 
+    /// Current atlas placement epoch.
+    ///
+    /// The epoch increments on every wholesale atlas reset (eviction or DPI
+    /// rescale). Used to detect when a [`DrawList`] has become stale due to
+    /// atlas eviction after it was built.
+    #[must_use]
+    pub const fn atlas_epoch(&self) -> u64 {
+        self.atlas.epoch()
+    }
+
     /// Number of glyph placements currently held by the atlas.
     #[must_use]
     pub fn atlas_placements(&self) -> usize {
@@ -2037,6 +2065,7 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
 
         let list = DrawList {
             generation: snapshot.generation,
+            atlas_epoch: self.atlas.epoch(),
             fills: Vec::new(),
             // Rounded decoration is composed by the runtime present path
             // (CTX-0311); grid truth carries no rounded geometry.
@@ -2101,6 +2130,7 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         self.atlas.clear_exhausted();
         let mut pass = DrawList {
             generation: snapshot.generation,
+            atlas_epoch: self.atlas.epoch(),
             fills: Vec::new(),
             rounded_fills: Vec::new(),
             backgrounds: Vec::new(),

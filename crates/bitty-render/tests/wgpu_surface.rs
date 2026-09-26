@@ -192,6 +192,7 @@ fn headless_image_parity_is_observable_not_silent() {
     .expect("blit bytes match extent");
     let list = bitty_render::grid::DrawList {
         generation: 7,
+            atlas_epoch: 0,
         plan: bitty_render::frame::FramePlan {
             extent: bitty_render::geometry::ExtentPx::new(8, 8),
             mode: bitty_render::frame::FrameMode::Full,
@@ -263,6 +264,7 @@ fn real_wgpu_surface_present_is_env_gated() {
             let surface = Surface::headless(PhysicalSize::new(64, 64)).expect("headless with GPU");
             let empty = bitty_render::grid::DrawList {
                 generation: 0,
+            atlas_epoch: 0,
                 plan: bitty_render::frame::FramePlan {
                     extent: bitty_render::geometry::ExtentPx::new(0, 0),
                     mode: bitty_render::frame::FrameMode::Clean,

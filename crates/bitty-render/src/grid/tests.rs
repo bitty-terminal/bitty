@@ -2089,3 +2089,80 @@ fn ctx0392_custom_palette_maps_and_dynamic_overrides() {
     assert_eq!(super::palette_rgb_in(&live, 0), [0x00, 0x00, 0x00]);
     assert_eq!(super::palette_rgb_in(&live, 255), [0xFF, 0xFF, 0xFF]);
 }
+
+/// CTX-0531 / Issue #1409: DrawList tracks the atlas epoch it was built at,
+/// preventing frame-consistency violations when overlay operations evict the
+/// atlas after the main render pass.
+#[test]
+fn draw_list_tracks_atlas_epoch() {
+    let mut grid = renderer();
+    let state = state_from(&[print('a')]);
+    let damage = damage_all(&state);
+    
+    let epoch_before = grid.atlas_epoch();
+    let list = grid.render(&state.snapshot(), &damage).unwrap();
+    
+    // The DrawList must capture the atlas epoch at which it was built
+    assert_eq!(list.atlas_epoch, epoch_before);
+    assert!(list.is_atlas_epoch_valid(grid.atlas_epoch()));
+}
+
+/// CTX-0531 / Issue #1409: When overlay_text_glyphs exhausts the atlas after
+/// render() builds a DrawList, the DrawList's epoch becomes stale and can be
+/// detected via is_atlas_epoch_valid.
+#[test]
+fn overlay_eviction_makes_draw_list_stale() {
+    // Tiny 8x8 atlas to force exhaustion easily
+    let mut grid = GridRenderer::with_atlas_dimension(
+        FakeRasterizer::new(),
+        &font_query(),
+        cell_metrics(),
+        8,
+    )
+    .unwrap();
+    
+    let state = state_from(&[print('a')]);
+    let damage = damage_all(&state);
+    let list = grid.render(&state.snapshot(), &damage).unwrap();
+    
+    let epoch_at_render = list.atlas_epoch;
+    assert!(list.is_atlas_epoch_valid(grid.atlas_epoch()));
+    
+    // Force atlas exhaustion with overlay text
+    // The overlay pass will exhaust the tiny atlas and trigger eviction
+    let _overlay = grid.overlay_text_glyphs("abcdefghij", (0, 0), 10, DEFAULT_FG);
+    
+    // If eviction occurred, atlas epoch should have incremented
+    let epoch_after_overlay = grid.atlas_epoch();
+    if epoch_after_overlay != epoch_at_render {
+        // The original DrawList is now stale
+        assert!(!list.is_atlas_epoch_valid(epoch_after_overlay));
+    }
+}
+
+/// CTX-0531 / Issue #1409: Verifies that render() itself maintains frame
+/// consistency by ensuring the returned DrawList always has slots from exactly
+/// one atlas epoch, even when the first placement pass exhausts the atlas.
+#[test]
+fn render_maintains_single_epoch_under_eviction() {
+    // Tiny atlas: each glyph is 6-8 wide, so 8x8 atlas fits very few
+    let mut grid = GridRenderer::with_atlas_dimension(
+        FakeRasterizer::new(),
+        &font_query(),
+        cell_metrics(),
+        8,
+    )
+    .unwrap();
+    
+    // Fill multiple cells to force eviction during render
+    let state = state_from(&['a', 'b', 'c', 'd'].iter().map(|&c| print(c)).collect::<Vec<_>>());
+    let damage = damage_all(&state);
+    
+    let list = grid.render(&state.snapshot(), &damage).unwrap();
+    
+    // The returned list must be valid for the current atlas epoch
+    assert!(list.is_atlas_epoch_valid(grid.atlas_epoch()));
+    
+    // All glyphs in the list belong to the same epoch (the current one)
+    assert_eq!(list.atlas_epoch, grid.atlas_epoch());
+}

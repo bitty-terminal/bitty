@@ -2036,6 +2036,7 @@ mod tests {
         assert_eq!(surface.theme_palette(), light);
         let empty = DrawList {
             generation: 0,
+            atlas_epoch: 0,
             plan: crate::frame::FramePlan {
                 extent: crate::geometry::ExtentPx::new(4, 2),
                 mode: crate::frame::FrameMode::Clean,
@@ -2067,6 +2068,7 @@ mod tests {
         };
         let _draw = crate::grid::DrawList {
             generation: 0,
+            atlas_epoch: 0,
             plan: crate::frame::FramePlan {
                 extent: crate::geometry::ExtentPx::new(0, 0),
                 mode: crate::frame::FrameMode::Clean,
@@ -2249,6 +2251,7 @@ mod tests {
         let surface = Surface::headless(PhysicalSize::new(32, 16)).expect("valid extent");
         let empty = crate::grid::DrawList {
             generation: 0,
+            atlas_epoch: 0,
             plan: crate::frame::FramePlan {
                 extent: crate::geometry::ExtentPx::new(32, 16),
                 mode: crate::frame::FrameMode::Full,
@@ -2276,6 +2279,7 @@ mod tests {
     fn empty_draw_list(width: u32, height: u32) -> crate::grid::DrawList {
         crate::grid::DrawList {
             generation: 0,
+            atlas_epoch: 0,
             plan: crate::frame::FramePlan {
                 extent: crate::geometry::ExtentPx::new(width, height),
                 mode: crate::frame::FrameMode::Full,
@@ -2450,6 +2454,7 @@ mod tests {
         let surface = Surface::headless(PhysicalSize::new(5000, 5000)).expect("valid extent");
         let empty = crate::grid::DrawList {
             generation: 0,
+            atlas_epoch: 0,
             plan: crate::frame::FramePlan {
                 extent: crate::geometry::ExtentPx::new(5000, 5000),
                 mode: crate::frame::FrameMode::Full,
@@ -2491,6 +2496,7 @@ mod tests {
     fn image_test_list(images: Vec<crate::grid::ImageBlit>) -> crate::grid::DrawList {
         crate::grid::DrawList {
             generation: 7,
+            atlas_epoch: 0,
             plan: crate::frame::FramePlan {
                 extent: crate::geometry::ExtentPx::new(8, 8),
                 mode: crate::frame::FrameMode::Full,
@@ -2781,6 +2787,7 @@ mod tests {
         // literal that must be refused fail-closed and counted.
         let list = DrawList {
             generation: 1,
+            atlas_epoch: 0,
             plan: crate::frame::FramePlan {
                 extent: crate::geometry::ExtentPx::new(width, height),
                 mode: crate::frame::FrameMode::Full,
@@ -2922,6 +2929,7 @@ mod tests {
         };
         let list = DrawList {
             generation: 1,
+            atlas_epoch: 0,
             plan: crate::frame::FramePlan {
                 extent: crate::geometry::ExtentPx::new(32, 32),
                 mode: crate::frame::FrameMode::Full,

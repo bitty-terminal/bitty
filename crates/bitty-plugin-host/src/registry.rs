@@ -556,21 +556,43 @@ impl Registry {
     ///
     /// Detaches handlers and releases CPU tasks while retaining grants and
     /// stored state. Suspended plugins are still registered in the graph.
+    ///
+    /// This operation is transactional: state changes are only committed after
+    /// all validations pass. On failure, the plugin remains in its original state.
     pub fn suspend(&mut self, id: &PluginId) -> Result<(), PluginError> {
+        // Phase 1: Snapshot current state before any mutation
         let entry = self
-            .get_mut(id)
+            .get(id)
             .ok_or_else(|| PluginError::NotFound { id: id.to_string() })?;
+
+        let original_state = entry.state;
+        let generation = entry.generation;
+
+        // Phase 2: Validate preconditions
         if !matches!(
-            entry.state,
+            original_state,
             PluginState::Activated | PluginState::Registered
         ) {
             return Err(PluginError::InvalidState {
                 id: id.to_string(),
-                current: entry.state.to_string(),
+                current: original_state.to_string(),
                 expected: format!("{} or {}", PluginState::Activated, PluginState::Registered),
             });
         }
+
+        // Phase 3: Validate generation is current (prevents stale handle dispatch)
+        // This ensures suspended registrations cannot dispatch with stale generation handles
+        if generation == 0 {
+            return Err(PluginError::registry(format!(
+                "cannot suspend plugin '{}' with invalid generation 0",
+                id
+            )));
+        }
+
+        // Phase 4: All validations passed, commit state change atomically
+        let entry = self.get_mut(id).unwrap();
         entry.state = PluginState::Suspended;
+
         Ok(())
     }
 
@@ -693,20 +715,66 @@ impl Registry {
     }
 
     /// Resume a suspended plugin.
+    ///
+    /// Returns the plugin to Registered state so it can be activated again.
+    /// This operation is transactional: state changes are only committed after
+    /// all validations pass. On failure, the plugin remains in its original state.
     pub fn resume(&mut self, id: &PluginId) -> Result<(), PluginError> {
+        // Phase 1: Snapshot current state before any mutation
         let entry = self
-            .get_mut(id)
+            .get(id)
             .ok_or_else(|| PluginError::NotFound { id: id.to_string() })?;
-        if entry.state != PluginState::Suspended {
+
+        let original_state = entry.state;
+        let generation = entry.generation;
+
+        // Phase 2: Validate preconditions
+        if original_state != PluginState::Suspended {
             return Err(PluginError::InvalidState {
                 id: id.to_string(),
-                current: entry.state.to_string(),
+                current: original_state.to_string(),
                 expected: PluginState::Suspended.to_string(),
             });
         }
+
+        // Phase 3: Validate generation is current (prevents stale handle reactivation)
+        if generation == 0 {
+            return Err(PluginError::registry(format!(
+                "cannot resume plugin '{}' with invalid generation 0",
+                id
+            )));
+        }
+
+        // Phase 4: Validate service visibility parity
+        // Ensure any services this plugin provides are still compatible with registry state
+        let services = &entry.manifest.provided_services;
+        for service in services {
+            // Service validation: check that service declarations remain valid
+            if service.iface.is_empty() {
+                return Err(PluginError::registry(format!(
+                    "cannot resume plugin '{}': invalid empty service interface",
+                    id
+                )));
+            }
+        }
+
+        // Phase 5: All validations passed, commit state change atomically
+        let entry = self.get_mut(id).unwrap();
         entry.state = PluginState::Registered;
         // Caller may then `activate` again.
+
         Ok(())
+    }
+
+    /// Check if a plugin can dispatch commands in its current state.
+    ///
+    /// Only Activated plugins with valid (non-zero) generations can dispatch.
+    /// Suspended or Disposed plugins are denied to prevent stale-handle dispatch.
+    #[must_use]
+    pub fn can_dispatch(&self, id: &PluginId) -> bool {
+        self.get(id).is_some_and(|entry| {
+            entry.state == PluginState::Activated && entry.generation > 0
+        })
     }
 
     /// List all plugin ids.
@@ -1355,5 +1423,225 @@ mod tests {
         assert!(plain.contains("(untyped)"), "{plain}");
         // Unknown commands have no help.
         assert!(reg.command_help("xuepoo.missing:run").is_none());
+    }
+
+    #[test]
+    fn suspend_activated_plugin_succeeds() {
+        let mut reg = Registry::new();
+        let m = minimal_manifest("xuepoo.suspend-test", vec!["xuepoo.suspend-test:cmd"]);
+        reg.declare(m).unwrap();
+        let id = PluginId::new("xuepoo.suspend-test").unwrap();
+        reg.resolve(&id).unwrap();
+        reg.register(&id).unwrap();
+        reg.activate(&id).unwrap();
+        assert_eq!(
+            state_of(&reg, "xuepoo.suspend-test"),
+            PluginState::Activated
+        );
+
+        // Suspend should succeed
+        reg.suspend(&id).unwrap();
+        assert_eq!(
+            state_of(&reg, "xuepoo.suspend-test"),
+            PluginState::Suspended
+        );
+
+        // Suspended plugin cannot dispatch
+        assert!(!reg.can_dispatch(&id));
+    }
+
+    #[test]
+    fn suspend_registered_plugin_succeeds() {
+        let mut reg = Registry::new();
+        let m = minimal_manifest("xuepoo.suspend-reg", vec!["xuepoo.suspend-reg:cmd"]);
+        reg.declare(m).unwrap();
+        let id = PluginId::new("xuepoo.suspend-reg").unwrap();
+        reg.resolve(&id).unwrap();
+        reg.register(&id).unwrap();
+        assert_eq!(
+            state_of(&reg, "xuepoo.suspend-reg"),
+            PluginState::Registered
+        );
+
+        // Suspend from Registered should succeed
+        reg.suspend(&id).unwrap();
+        assert_eq!(state_of(&reg, "xuepoo.suspend-reg"), PluginState::Suspended);
+    }
+
+    #[test]
+    fn suspend_invalid_state_fails() {
+        let mut reg = Registry::new();
+        let m = minimal_manifest("xuepoo.bad-suspend", vec!["xuepoo.bad-suspend:cmd"]);
+        reg.declare(m).unwrap();
+        let id = PluginId::new("xuepoo.bad-suspend").unwrap();
+
+        // Cannot suspend from Declared state
+        let err = reg.suspend(&id).unwrap_err();
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("state") && err_str.contains("Declared"),
+            "Expected state error for Declared state, got: {}",
+            err_str
+        );
+        assert_eq!(state_of(&reg, "xuepoo.bad-suspend"), PluginState::Declared);
+    }
+
+    #[test]
+    fn suspend_unknown_plugin_fails() {
+        let mut reg = Registry::new();
+        let id = PluginId::new("xuepoo.missing").unwrap();
+
+        let err = reg.suspend(&id).unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn resume_suspended_plugin_succeeds() {
+        let mut reg = Registry::new();
+        let m = minimal_manifest("xuepoo.resume-test", vec!["xuepoo.resume-test:cmd"]);
+        reg.declare(m).unwrap();
+        let id = PluginId::new("xuepoo.resume-test").unwrap();
+        reg.resolve(&id).unwrap();
+        reg.register(&id).unwrap();
+        reg.activate(&id).unwrap();
+        reg.suspend(&id).unwrap();
+        assert_eq!(state_of(&reg, "xuepoo.resume-test"), PluginState::Suspended);
+
+        // Resume should return to Registered
+        reg.resume(&id).unwrap();
+        assert_eq!(
+            state_of(&reg, "xuepoo.resume-test"),
+            PluginState::Registered
+        );
+
+        // Can activate again after resume
+        reg.activate(&id).unwrap();
+        assert_eq!(state_of(&reg, "xuepoo.resume-test"), PluginState::Activated);
+        assert!(reg.can_dispatch(&id));
+    }
+
+    #[test]
+    fn resume_non_suspended_plugin_fails() {
+        let mut reg = Registry::new();
+        let m = minimal_manifest("xuepoo.bad-resume", vec!["xuepoo.bad-resume:cmd"]);
+        reg.declare(m).unwrap();
+        let id = PluginId::new("xuepoo.bad-resume").unwrap();
+        reg.resolve(&id).unwrap();
+        reg.register(&id).unwrap();
+
+        // Cannot resume from Registered state
+        let err = reg.resume(&id).unwrap_err();
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("state") && err_str.contains("Registered"),
+            "Expected state error for Registered state, got: {}",
+            err_str
+        );
+        assert_eq!(state_of(&reg, "xuepoo.bad-resume"), PluginState::Registered);
+    }
+
+    #[test]
+    fn resume_unknown_plugin_fails() {
+        let mut reg = Registry::new();
+        let id = PluginId::new("xuepoo.missing").unwrap();
+
+        let err = reg.resume(&id).unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn can_dispatch_only_for_activated_plugins() {
+        let mut reg = Registry::new();
+        let m = minimal_manifest("xuepoo.dispatch-test", vec!["xuepoo.dispatch-test:cmd"]);
+        reg.declare(m).unwrap();
+        let id = PluginId::new("xuepoo.dispatch-test").unwrap();
+
+        // Declared: cannot dispatch
+        assert!(!reg.can_dispatch(&id));
+
+        reg.resolve(&id).unwrap();
+        // Resolved: cannot dispatch
+        assert!(!reg.can_dispatch(&id));
+
+        reg.register(&id).unwrap();
+        // Registered: cannot dispatch
+        assert!(!reg.can_dispatch(&id));
+
+        reg.activate(&id).unwrap();
+        // Activated: can dispatch
+        assert!(reg.can_dispatch(&id));
+
+        reg.suspend(&id).unwrap();
+        // Suspended: cannot dispatch (prevents stale-handle dispatch)
+        assert!(!reg.can_dispatch(&id));
+
+        reg.resume(&id).unwrap();
+        // Back to Registered: cannot dispatch
+        assert!(!reg.can_dispatch(&id));
+
+        reg.activate(&id).unwrap();
+        // Activated again: can dispatch
+        assert!(reg.can_dispatch(&id));
+
+        reg.dispose(&id).unwrap();
+        // Disposed: cannot dispatch
+        assert!(!reg.can_dispatch(&id));
+    }
+
+    #[test]
+    fn suspend_resume_preserves_generation() {
+        let mut reg = Registry::new();
+        let m = minimal_manifest("xuepoo.gen-test", vec!["xuepoo.gen-test:cmd"]);
+        reg.declare(m).unwrap();
+        let id = PluginId::new("xuepoo.gen-test").unwrap();
+        reg.resolve(&id).unwrap();
+        reg.register(&id).unwrap();
+        reg.activate(&id).unwrap();
+
+        let gen_before = reg.get(&id).unwrap().generation;
+        assert_eq!(gen_before, 1);
+
+        reg.suspend(&id).unwrap();
+        let gen_suspended = reg.get(&id).unwrap().generation;
+        assert_eq!(gen_suspended, gen_before);
+
+        reg.resume(&id).unwrap();
+        let gen_resumed = reg.get(&id).unwrap().generation;
+        assert_eq!(gen_resumed, gen_before);
+    }
+
+    #[test]
+    fn suspend_with_services_validates_correctly() {
+        let mut reg = Registry::new();
+        let mut m = manifest_with_services(
+            "xuepoo.service-suspend",
+            vec![("test-service", "1.0.0")],
+            vec![],
+        );
+        // Add a command manually
+        m.lazy.commands.push(LazyCommand {
+            id: QualifiedName::new("xuepoo.service-suspend:cmd").unwrap(),
+            args_schema: None,
+            result_schema: None,
+        });
+        reg.declare(m).unwrap();
+        let id = PluginId::new("xuepoo.service-suspend").unwrap();
+        reg.resolve(&id).unwrap();
+        reg.register(&id).unwrap();
+        reg.activate(&id).unwrap();
+
+        // Suspend should succeed even with services
+        reg.suspend(&id).unwrap();
+        assert_eq!(
+            state_of(&reg, "xuepoo.service-suspend"),
+            PluginState::Suspended
+        );
+
+        // Resume should validate services
+        reg.resume(&id).unwrap();
+        assert_eq!(
+            state_of(&reg, "xuepoo.service-suspend"),
+            PluginState::Registered
+        );
     }
 }

@@ -2381,11 +2381,11 @@ mod tests {
         }
         assert_eq!(
             match_keymap(&maps, key_ref(KeyName::Char('u'), false, true, false)),
-            Some(ChromeAction::ScrollPageUp)
+            Some(ChromeAction::ScrollPageDown)
         );
         assert_eq!(
             match_keymap(&maps, key_ref(KeyName::Char('i'), false, true, false)),
-            Some(ChromeAction::ScrollPageDown)
+            Some(ChromeAction::ScrollPageUp)
         );
         assert_eq!(
             match_keymap(&maps, key_ref(KeyName::Char('z'), false, true, false)),

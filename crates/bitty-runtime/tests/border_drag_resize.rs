@@ -292,3 +292,197 @@ fn cursor_leaving_window_ends_drag() {
     cursor_left(&mut rt);
     assert!(!rt.border_drag_active());
 }
+
+// ---------------------------------------------------------------------------
+// Issue #1445: Corner-drag resize (Hyprland/Niri 4-way model)
+// ---------------------------------------------------------------------------
+
+/// 2x2 grid: four panes in a quad layout.
+fn four_pane_grid() -> LayoutNode {
+    LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.5,
+        LayoutNode::split(
+            SplitAxis::Vertical,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 40, 12)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 40, 12)),
+        ),
+        LayoutNode::split(
+            SplitAxis::Vertical,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(3), 40, 12)),
+            LayoutNode::leaf(View::new(ViewId::new(4), 40, 12)),
+        ),
+    )
+}
+
+#[test]
+fn corner_drag_grabs_both_perpendicular_splits() {
+    let mut rt = make_runtime();
+    rt.set_layout(four_pane_grid());
+    // Column 39-40, row 11-12 is near the center corner where splits meet.
+    // Use (39, 11) to ensure we're inside the left child's bounds and can
+    // hit both the horizontal split at x=40 and vertical split at y=12.
+    rt.handle_cursor_moved(cell_pixels(39, 11));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(
+        rt.border_drag_active(),
+        "corner press must grab perpendicular splits"
+    );
+    rt.handle_mouse_input(release(MouseButton::Left));
+}
+
+#[test]
+fn corner_drag_resizes_all_four_adjacent_panels() {
+    let mut rt = make_runtime();
+    rt.set_layout(four_pane_grid());
+    // Grab near the center corner - use (39, 11) to be inside left child's
+    // bounds so we can hit both the horizontal [] and vertical [0] splits.
+    rt.handle_cursor_moved(cell_pixels(39, 11));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(rt.border_drag_active());
+    // Drag right (+8 cols) and down (+4 rows): resizes horizontally via []
+    // and vertically via [0].
+    rt.handle_cursor_moved(cell_pixels(47, 15));
+
+    // Check horizontal resize: left column grows, right column shrinks.
+    // Top-left pane (ViewId 1) should be in a 48-wide column.
+    let top_left = rt
+        .layout_allocations()
+        .into_iter()
+        .find(|(id, _)| *id == ViewId::new(1))
+        .map(|(_, rect)| rect)
+        .expect("top-left pane must be allocated");
+    assert_eq!(
+        top_left.width, 48,
+        "corner drag right should grow left column (all left panes)"
+    );
+
+    // Check vertical resize: only left column's vertical split [0] resizes.
+    // Top-left grows to 16 rows, bottom-left shrinks to 8 rows.
+    assert_eq!(
+        top_left.height, 16,
+        "corner drag down should grow top-left pane via [0] vertical split"
+    );
+
+    let bottom_left = rt
+        .layout_allocations()
+        .into_iter()
+        .find(|(id, _)| *id == ViewId::new(2))
+        .map(|(_, rect)| rect)
+        .expect("bottom-left pane must be allocated");
+    assert_eq!(
+        bottom_left.height, 8,
+        "corner drag down should shrink bottom-left pane"
+    );
+
+    // Right column (32 wide) keeps its 50/50 vertical split (12 rows each).
+    let top_right = rt
+        .layout_allocations()
+        .into_iter()
+        .find(|(id, _)| *id == ViewId::new(3))
+        .map(|(_, rect)| rect)
+        .expect("top-right pane must be allocated");
+    assert_eq!(
+        top_right.width, 32,
+        "corner drag right should shrink right column"
+    );
+    assert_eq!(
+        top_right.height, 12,
+        "right column's vertical split [1] should be unaffected"
+    );
+
+    rt.handle_mouse_input(release(MouseButton::Left));
+}
+
+#[test]
+fn corner_drag_left_and_up_shrinks_first_quadrant() {
+    let mut rt = make_runtime();
+    rt.set_layout(four_pane_grid());
+    rt.handle_cursor_moved(cell_pixels(39, 11));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    // Drag left (-8 cols) and up (-4 rows).
+    rt.handle_cursor_moved(cell_pixels(31, 7));
+
+    // Horizontal: left column shrinks to 32, right grows to 48.
+    // Vertical: only [0] split in left column resizes.
+    let top_left = rt
+        .layout_allocations()
+        .into_iter()
+        .find(|(id, _)| *id == ViewId::new(1))
+        .map(|(_, rect)| rect)
+        .expect("top-left pane must be allocated");
+    assert_eq!(
+        top_left.width, 32,
+        "corner drag left should shrink left column"
+    );
+    // Dragging from (39, 11) to (31, 7) is a delta of (-8, -4).
+    // The vertical split ratio change is -4/24 = -0.167, so 0.5 - 0.167 ≈ 0.333.
+    // On a 24-row container, 0.333 * 24 = 8 rows, but cell boundaries may round to 7.
+    assert!(
+        top_left.height >= 7 && top_left.height <= 8,
+        "corner drag up should shrink top-left pane to ~8 rows, got {}",
+        top_left.height
+    );
+    rt.handle_mouse_input(release(MouseButton::Left));
+}
+
+#[test]
+fn corner_drag_persists_both_ratios_across_reflow() {
+    let mut rt = make_runtime();
+    rt.set_layout(four_pane_grid());
+    rt.handle_cursor_moved(cell_pixels(39, 11));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    rt.handle_cursor_moved(cell_pixels(47, 15));
+    rt.handle_mouse_input(release(MouseButton::Left));
+
+    // Horizontal split [] ratio changed (left column grew).
+    let h_ratio = rt
+        .layout()
+        .split_ratio_at(&[])
+        .expect("root horizontal split must exist");
+    assert!(
+        (h_ratio - 0.6).abs() < 1e-6,
+        "horizontal ratio should be 0.6"
+    );
+
+    // Vertical split [0] in left column changed (top-left grew).
+    let v_ratio_left = rt
+        .layout()
+        .split_ratio_at(&[0])
+        .expect("left vertical split must exist");
+    let expected_v = 16.0 / 24.0; // ~0.667
+    assert!(
+        (v_ratio_left - expected_v).abs() < 1e-6,
+        "left vertical ratio should be ~0.667, got {v_ratio_left}"
+    );
+
+    // Vertical split [1] in right column unchanged (still 0.5).
+    let v_ratio_right = rt
+        .layout()
+        .split_ratio_at(&[1])
+        .expect("right vertical split must exist");
+    assert!(
+        (v_ratio_right - 0.5).abs() < 1e-6,
+        "right vertical ratio should stay 0.5"
+    );
+
+    // Reflow preserves all ratios.
+    rt.reflow_layout();
+    assert_eq!(
+        rt.layout().split_ratio_at(&[]),
+        Some(h_ratio),
+        "horizontal ratio must persist"
+    );
+    assert_eq!(
+        rt.layout().split_ratio_at(&[0]),
+        Some(v_ratio_left),
+        "left vertical ratio must persist"
+    );
+    assert_eq!(
+        rt.layout().split_ratio_at(&[1]),
+        Some(v_ratio_right),
+        "right vertical ratio must persist"
+    );
+}

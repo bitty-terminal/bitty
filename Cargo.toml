@@ -59,3 +59,12 @@ unsafe_code = "deny"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+# CTX-0791: patch bitty-network crates from local checkout for CI
+[patch.crates-io]
+bitty-network-api = { path = "bitty-network/crates/bitty-network-api" }
+bitty-network-core = { path = "bitty-network/crates/bitty-network-core" }
+bitty-network-dns = { path = "bitty-network/crates/bitty-network-dns" }
+bitty-network-tls = { path = "bitty-network/crates/bitty-network-tls" }
+bitty-network = { path = "bitty-network/crates/bitty-network" }
+bitty-network-lua = { path = "bitty-network/crates/bitty-network-lua" }

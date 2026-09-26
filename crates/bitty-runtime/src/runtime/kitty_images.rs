@@ -166,6 +166,7 @@ impl Runtime {
         action_a: Option<char>,
         cols_c: u16,
         rows_r: u16,
+        cursor_movement_C: u8,
         payload: &[u8],
         z: i32,
     ) -> Result<KittyDisplayOutcome, KittyImageError> {
@@ -204,6 +205,21 @@ impl Runtime {
             )
             .map_err(KittyImageError::Placement)?;
         self.pending_full_redraw = true;
+        
+        // Move cursor according to Kitty spec: after placing an image, cursor
+        // moves right by cols and down by rows, unless C=1 (do not move).
+        if cursor_movement_C != 1 && (cols_c > 0 || rows_r > 0) {
+            let current_pos = self.state.cursor().position;
+            let new_col = current_pos.col.saturating_add(cols_c);
+            let new_row = current_pos.row.saturating_add(rows_r);
+            
+            // Use CursorPosition action to move cursor
+            self.state.apply(&TerminalAction::CursorPosition {
+                row: bitty_vt::Row(new_row),
+                col: bitty_vt::Col(new_col),
+            });
+        }
+        
         Ok(KittyDisplayOutcome::Displayed { image, placement })
     }
 }

@@ -70,7 +70,7 @@ fn display_paints_image_pixels_topmost() {
     let (cw, ch, pad) = default_geometry();
     let mut rt = make_runtime();
     let outcome = rt
-        .kitty_display_image(32, Some(2), Some(2), None, 2, 2, &red_2x2(), 0)
+        .kitty_display_image(32, Some(2), Some(2), None, 2, 2, 0, &red_2x2(), 0)
         .expect("display must succeed");
     assert!(matches!(outcome, KittyDisplayOutcome::Displayed { .. }));
     assert_eq!(rt.kitty_image_count(), 1);
@@ -102,7 +102,7 @@ fn image_covers_grid_text_where_they_overlap() {
     rt.handle_pty_bytes(b"A");
     // Cursor is now col 1; move back over the 'A' cell and cover it.
     rt.handle_pty_bytes(b"\x1b[1;1H");
-    rt.kitty_display_image(32, Some(2), Some(2), None, 1, 1, &red_2x2(), 0)
+    rt.kitty_display_image(32, Some(2), Some(2), None, 1, 1, 0, &red_2x2(), 0)
         .expect("display must succeed");
     rt.tick().expect("display forces a present");
     let rgba = rt.headless_rgba().expect("rgba after tick");
@@ -117,7 +117,7 @@ fn transmit_only_stores_without_painting() {
     let (_, _, pad) = default_geometry();
     let mut rt = make_runtime();
     let outcome = rt
-        .kitty_display_image(32, Some(2), Some(2), Some('t'), 2, 2, &red_2x2(), 0)
+        .kitty_display_image(32, Some(2), Some(2), Some('t'), 2, 2, 0, &red_2x2(), 0)
         .expect("transmit must succeed");
     assert!(matches!(outcome, KittyDisplayOutcome::Stored { .. }));
     assert_eq!(rt.kitty_image_count(), 1);
@@ -140,7 +140,7 @@ fn unsupported_action_stores_without_painting() {
     let mut rt = make_runtime();
     for action in ['p', 'd', 'q', 'f'] {
         let outcome = rt
-            .kitty_display_image(32, Some(1), Some(1), Some(action), 1, 1, &[9, 9, 9, 9], 0)
+            .kitty_display_image(32, Some(1), Some(1), Some(action), 1, 1, 0, &[9, 9, 9, 9], 0)
             .expect("unsupported action must still store");
         assert!(
             matches!(outcome, KittyDisplayOutcome::StoredNotDisplayed { .. }),
@@ -155,14 +155,14 @@ fn unsupported_action_stores_without_painting() {
 fn unknown_format_and_oversize_fail_closed() {
     let mut rt = make_runtime();
     let err = rt
-        .kitty_display_image(7, Some(2), Some(2), None, 1, 1, &red_2x2(), 0)
+        .kitty_display_image(7, Some(2), Some(2), None, 1, 1, 0, &red_2x2(), 0)
         .expect_err("f=7 must fail");
     assert!(matches!(
         err,
         bitty_runtime::KittyImageError::UnknownFormat(7)
     ));
     let err = rt
-        .kitty_display_image(32, Some(9000), Some(1), None, 1, 1, &[0; 4], 0)
+        .kitty_display_image(32, Some(9000), Some(1), None, 1, 1, 0, &[0; 4], 0)
         .expect_err("9000px side must fail");
     assert!(matches!(err, bitty_runtime::KittyImageError::Decode(_)));
     assert_eq!(rt.kitty_image_count(), 0);
@@ -176,7 +176,7 @@ fn scroll_moves_image_with_content() {
     let bottom = rows - 1;
     // Anchor at the last content row.
     rt.handle_pty_bytes(format!("\x1b[{};1H", rows).as_bytes());
-    rt.kitty_display_image(32, Some(2), Some(2), None, 1, 1, &red_2x2(), 0)
+    rt.kitty_display_image(32, Some(2), Some(2), None, 1, 1, 0, &red_2x2(), 0)
         .expect("display must succeed");
     rt.tick().expect("display forces a present");
     let cfg = RuntimeConfig::default();
@@ -216,7 +216,7 @@ fn image_scrolled_off_top_paints_nothing_but_is_retained() {
     let (_, _, pad) = default_geometry();
     let mut rt = make_runtime();
     rt.handle_pty_bytes(b"\x1b[24;1H");
-    rt.kitty_display_image(32, Some(2), Some(2), None, 1, 1, &red_2x2(), 0)
+    rt.kitty_display_image(32, Some(2), Some(2), None, 1, 1, 0, &red_2x2(), 0)
         .expect("display must succeed");
     rt.tick().expect("display forces a present");
     // Scroll the anchor (row 23) fully off the top.
@@ -236,7 +236,7 @@ fn image_scrolled_off_top_paints_nothing_but_is_retained() {
 fn alt_screen_clears_and_suppresses() {
     let (_, _, pad) = default_geometry();
     let mut rt = make_runtime();
-    rt.kitty_display_image(32, Some(2), Some(2), None, 2, 2, &red_2x2(), 0)
+    rt.kitty_display_image(32, Some(2), Some(2), None, 2, 2, 0, &red_2x2(), 0)
         .expect("display must succeed");
     rt.tick().expect("display forces a present");
     let cfg = RuntimeConfig::default();
@@ -265,7 +265,7 @@ fn alt_screen_clears_and_suppresses() {
     // pre-alt image is still in the store (per-origin clear), so the
     // suppressed store brings the count to two.
     let outcome = rt
-        .kitty_display_image(32, Some(2), Some(2), None, 2, 2, &red_2x2(), 0)
+        .kitty_display_image(32, Some(2), Some(2), None, 2, 2, 0, &red_2x2(), 0)
         .expect("alt display must store");
     assert!(matches!(
         outcome,
@@ -292,7 +292,7 @@ fn pathological_placement_count_is_budgeted_per_frame() {
     // the full 128-candidate shed.
     let mut rt = make_runtime();
     for z in 0..64 {
-        rt.kitty_display_image(32, Some(2), Some(2), None, 2, 2, &red_2x2(), z)
+        rt.kitty_display_image(32, Some(2), Some(2), None, 2, 2, 0, &red_2x2(), z)
             .expect("display must succeed");
     }
     assert_eq!(rt.kitty_image_count(), 64);
@@ -313,7 +313,7 @@ fn static_frame_reuses_cached_raster() {
     // scrollback must not re-rasterize (hit), and the pixels stay red.
     let (_, _, pad) = default_geometry();
     let mut rt = make_runtime();
-    rt.kitty_display_image(32, Some(2), Some(2), None, 2, 2, &red_2x2(), 0)
+    rt.kitty_display_image(32, Some(2), Some(2), None, 2, 2, 0, &red_2x2(), 0)
         .expect("display must succeed");
     rt.tick().expect("first present rasterizes");
     let after_first = rt.kitty_raster_stats();
@@ -345,7 +345,7 @@ fn scroll_invalidates_cached_raster_without_stale_pixels() {
     let (origin_x, origin_y, rows) = content_frame_geometry(&rt);
     let bottom = rows - 1;
     rt.handle_pty_bytes(format!("\x1b[{};1H", rows).as_bytes());
-    rt.kitty_display_image(32, Some(2), Some(2), None, 1, 1, &red_2x2(), 0)
+    rt.kitty_display_image(32, Some(2), Some(2), None, 1, 1, 0, &red_2x2(), 0)
         .expect("display must succeed");
     rt.tick().expect("display forces a present");
     let misses_before = rt.kitty_raster_stats().misses;
@@ -386,7 +386,7 @@ fn tick_stats_report_images_drawn_not_skipped() {
     // uploads and paints the same blit, reporting a skip only for
     // malformed or over-budget blits instead of diverging silently.
     let mut rt = make_runtime();
-    rt.kitty_display_image(32, Some(2), Some(2), None, 2, 2, &red_2x2(), 0)
+    rt.kitty_display_image(32, Some(2), Some(2), None, 2, 2, 0, &red_2x2(), 0)
         .expect("display must succeed");
     let stats = rt.tick().expect("display forces a present");
     assert!(stats.headless);

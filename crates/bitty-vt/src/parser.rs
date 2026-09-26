@@ -383,6 +383,7 @@ fn terminate_apc<F: FnMut(TerminalAction)>(
             action_a: done.action_a,
             cols_c: done.cols_c,
             rows_r: done.rows_r,
+            cursor_movement_C: done.cursor_movement_C,
             payload: done.payload,
         });
     }

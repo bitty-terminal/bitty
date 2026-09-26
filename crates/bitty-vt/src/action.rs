@@ -876,6 +876,8 @@ pub enum TerminalAction {
         cols_c: u16,
         /// Wire `r=` explicit cell rows (`0` derives from pixels).
         rows_r: u16,
+        /// Wire `C=` cursor movement flag (`0` moves cursor, `1` keeps it).
+        cursor_movement_C: u8,
         /// Base64-decoded payload bytes (assembled across `m=` chunks).
         payload: Box<[u8]>,
     },

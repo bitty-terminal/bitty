@@ -70,8 +70,8 @@ pub struct KittyApcParams {
     pub cols_c: u16,
     /// Wire `r=` rows (`0` when absent).
     pub rows_r: u16,
-    /// Wire `m=` more-chunks (`false` when absent, i.e. single-shot/final).
-    pub more: bool,
+    /// Wire `C=` cursor movement (`0` moves cursor, `1` keeps it, default `0`).
+    pub cursor_movement_C: u8,
 }
 
 /// Why an `APC G` buffer was rejected (fail-closed, warns, emits nothing).
@@ -128,7 +128,9 @@ pub struct KittyCompleted {
     pub cols_c: u16,
     /// Wire `r=` rows (`0` when absent).
     pub rows_r: u16,
-    /// Assembled base64-decoded bytes across `m=` chunks.
+    /// Wire `C=` cursor movement (`0` moves cursor, `1` keeps it).
+    pub cursor_movement_C: u8,
+    /// Base64-decoded payload bytes (assembled across `m=` chunks).
     pub payload: Box<[u8]>,
 }
 
@@ -155,6 +157,7 @@ struct PendingKitty {
     action_a: Option<char>,
     cols_c: u16,
     rows_r: u16,
+    cursor_movement_C: u8,
     encoded_len: usize,
     decoder: Base64Stream,
     payload: Vec<u8>,
@@ -564,6 +567,14 @@ impl KittyApcAssembler {
                     return Err(reason);
                 }
             };
+            let more = match more_flag(after_g) {
+                Ok(Some(m)) => m,
+                Ok(None) => false, // No m= means single-shot (m=0)
+                Err(reason) => {
+                    self.warn_reject(reason, "m= in new transmission");
+                    return Err(reason);
+                }
+            };
             self.pending = Some(PendingKitty {
                 format_f: params.format_f,
                 width_s: params.width_s,
@@ -571,11 +582,12 @@ impl KittyApcAssembler {
                 action_a: params.action_a,
                 cols_c: params.cols_c,
                 rows_r: params.rows_r,
+                cursor_movement_C: params.cursor_movement_C,
                 encoded_len: 0,
                 decoder: Base64Stream::default(),
                 payload: Vec::new(),
             });
-            self.current_final = Some(!params.more);
+            self.current_final = Some(!more);
         }
         Ok(())
     }
@@ -643,6 +655,7 @@ impl KittyApcAssembler {
             action_a: pending.action_a,
             cols_c: pending.cols_c,
             rows_r: pending.rows_r,
+            cursor_movement_C: pending.cursor_movement_C,
             payload: pending.payload.into_boxed_slice(),
         })
     }
@@ -684,6 +697,7 @@ fn parse_control(control: &[u8]) -> Result<KittyApcParams, KittyApcReject> {
     let mut action_a: Option<char> = None;
     let mut cols_c: u16 = 0;
     let mut rows_r: u16 = 0;
+    let mut cursor_movement_C: u8 = 0;
     let mut more = false;
     for piece in control.split(|&b| b == b',') {
         if piece.is_empty() {
@@ -728,9 +742,12 @@ fn parse_control(control: &[u8]) -> Result<KittyApcParams, KittyApcReject> {
                     _ => return Err(KittyApcReject::BadMore),
                 };
             }
+            b'C' => {
+                cursor_movement_C = parse_u8(value).ok_or(KittyApcReject::MalformedControl)?;
+            }
             _ => {
                 // Unknown single-letter keys (i, p, q, d, e, t, o, X, Y, w,
-                // h, x, y, z, C, R, ...): ignored for transmit/display.
+                // h, x, y, z, R, ...): ignored for transmit/display.
             }
         }
     }
@@ -744,7 +761,7 @@ fn parse_control(control: &[u8]) -> Result<KittyApcParams, KittyApcReject> {
         action_a,
         cols_c,
         rows_r,
-        more,
+        cursor_movement_C,
     })
 }
 
@@ -821,7 +838,20 @@ fn parse_u32(value: &[u8]) -> Option<u32> {
     Some(acc)
 }
 
-/// Strict ASCII decimal `u16` (no sign, no whitespace, no empty).
+fn parse_u8(value: &[u8]) -> Option<u8> {
+    if value.is_empty() || value.len() > 3 {
+        return None;
+    }
+    let mut acc: u8 = 0;
+    for &b in value {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        acc = acc.checked_mul(10)?.checked_add(b - b'0')?;
+    }
+    Some(acc)
+}
+
 fn parse_u16(value: &[u8]) -> Option<u16> {
     if value.is_empty() || value.len() > 5 {
         return None;

@@ -907,16 +907,27 @@ impl PluginRuntime {
         // manifest lookup below is infallible; version and schemas come from
         // the manifest, impl functions from the capture, the VM weakly.
         let vm = Rc::new(RefCell::new(vm));
+        // Store the strong VM reference in the entry BEFORE publishing services
+        // so the Weak pointers in ServiceRecords always have a valid strong
+        // reference to upgrade to. On Windows, delaying the store until after
+        // publish_services caused the Weak upgrade to fail intermittently during
+        // cross-plugin service calls in consumer init scripts (issue #1452).
+        let (source_class, unverified, generation) = {
+            let entry = self.entries.get_mut(id).expect("entry exists");
+            entry.vm = Some(vm.clone());
+            entry.registrations = capture;
+            entry.state = LifecycleState::Active;
+            (
+                entry.package.source_class,
+                entry.package.unverified,
+                entry.generation,
+            )
+        };
+        // Publish services after the VM is safely stored
         {
-            let generation = self.entries.get(id).expect("entry exists").generation;
-            self.publish_services(id, generation, &manifest, &capture, &vm);
+            let entry = self.entries.get(id).expect("entry exists");
+            self.publish_services(id, generation, &manifest, &entry.registrations, &vm);
         }
-        let entry = self.entries.get_mut(id).expect("entry exists");
-        let source_class = entry.package.source_class;
-        let unverified = entry.package.unverified;
-        entry.registrations = capture;
-        entry.vm = Some(vm);
-        entry.state = LifecycleState::Active;
         Ok(ActivationReport {
             plugin: id.clone(),
             state: LifecycleState::Active,

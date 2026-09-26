@@ -27,10 +27,11 @@ skip-tree = []
 
 [licenses]
 # ADR-0004 rule 5 admits the permissive core set (MIT, Apache-2.0, BSD, ISC,
-# Zlib). The three extras below are permissive licenses in use by unavoidable
+# Zlib). The extras below are permissive licenses in use by unavoidable
 # transitive dependencies and are recorded for the ADR-0004 revision:
 # Unicode-3.0 -> unicode-ident, CC0-1.0 -> hexf-parse (naga),
-# BSL-1.0 -> clipboard-win / error-code (arboard on Windows).
+# BSL-1.0 -> clipboard-win / error-code (arboard on Windows),
+# CDLA-Permissive-2.0 -> webpki-root-certs (bitty-network-lua via rustls-platform-verifier).
 allow = [
   "MIT",
   "Apache-2.0",
@@ -42,6 +43,7 @@ allow = [
   "Unicode-3.0",
   "CC0-1.0",
   "BSL-1.0",
+  "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
 # ADR-0004 rule 5 prohibits MPL-2.0 anywhere in the shipped dependency graph.
@@ -64,10 +66,13 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # kyren/gc-arena is phodopus's own rev-pinned transitive dep (arena backing
 # for the Lua GC), not bitty's choice — kept visible here rather than hidden
 # behind a wildcard so any new git source still fails loudly.
-# Time bound (CTX-0634, P0-AC-034 exception policy): re-audit both pins
+# bitty-network is pinned to commit 59c398e (PR #60 merged) for network
+# capability integration (CTX-0796).
+# Time bound (CTX-0634, P0-AC-034 exception policy): re-audit all pins
 # (rev freshness, source trust) no later than 2027-03-31; any new git source
 # needs a dated ADR-0004/ADR-0012 revision, never a silent allowlist edit.
 allow-git = [
     "https://github.com/bitty-terminal/phodopus",
     "https://github.com/kyren/gc-arena",
+    "https://github.com/bitty-terminal/bitty-network",
 ]

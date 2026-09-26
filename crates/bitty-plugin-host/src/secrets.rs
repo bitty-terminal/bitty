@@ -1125,6 +1125,15 @@ struct StoredSecret {
     value: String,
 }
 
+impl fmt::Debug for StoredSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Redacting on purpose: never log secret values (P0-AC-026).
+        f.debug_struct("StoredSecret")
+            .field("value", &SECRET_REDACTED_MARKER)
+            .finish()
+    }
+}
+
 impl SecretStore {
     /// Empty store (resolves nothing until seeded).
     #[must_use]
@@ -2165,5 +2174,47 @@ mod tests {
         let long_value = format!("secret://{}", "x".repeat(5000));
         let err = SecretHandle::parse(&long_value).unwrap_err();
         assert!(err.to_string().len() < 1000);
+    }
+
+    #[test]
+    fn debug_never_logs_secret_values() {
+        // P0-AC-026: Debug implementations must redact secret values.
+        // StoredSecret Debug must never emit the actual value.
+        let mut store = SecretStore::new();
+        store
+            .insert("github_token", "ghp_sensitive_secret_value_12345")
+            .unwrap();
+        store.insert("api_key", "sk_live_another_secret").unwrap();
+
+        // Debug output of SecretStore must not contain actual values.
+        let debug_output = format!("{:?}", store);
+        assert!(
+            !debug_output.contains("ghp_sensitive_secret_value_12345"),
+            "SecretStore Debug must not leak secret values"
+        );
+        assert!(
+            !debug_output.contains("sk_live_another_secret"),
+            "SecretStore Debug must not leak secret values"
+        );
+        assert!(
+            debug_output.contains("github_token"),
+            "SecretStore Debug should show handle names"
+        );
+        assert!(
+            debug_output.contains("api_key"),
+            "SecretStore Debug should show handle names"
+        );
+
+        // StoredSecret Debug (when accessed directly) must redact.
+        let stored = &store.entries["github_token"];
+        let stored_debug = format!("{:?}", stored);
+        assert!(
+            !stored_debug.contains("ghp_sensitive_secret_value_12345"),
+            "StoredSecret Debug must not leak the value"
+        );
+        assert!(
+            stored_debug.contains(SECRET_REDACTED_MARKER),
+            "StoredSecret Debug should use the redaction marker"
+        );
     }
 }

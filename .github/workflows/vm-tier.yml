@@ -34,6 +34,16 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # Checkout bitty-network for cross-repository path dependencies (CTX-0791).
+      - name: Check out bitty-network
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: bitty-terminal/bitty-network
+          path: bitty-network
+
+      - name: Create symlink for cross-repo path compatibility
+        run: ln -s bitty-network ../bitty-network
+
       - name: Resolve Rust channel (rust-toolchain.toml)
         id: rust-channel
         run: |
@@ -63,6 +73,16 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # Checkout bitty-network for cross-repository path dependencies (CTX-0791).
+      - name: Check out bitty-network
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: bitty-terminal/bitty-network
+          path: bitty-network
+
+      - name: Create symlink for cross-repo path compatibility
+        run: ln -s bitty-network ../bitty-network
+
       - name: Resolve Rust channel (rust-toolchain.toml)
         id: rust-channel
         run: |
@@ -90,6 +110,16 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Checkout bitty-network for cross-repository path dependencies (CTX-0791).
+      - name: Check out bitty-network
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: bitty-terminal/bitty-network
+          path: bitty-network
+
+      - name: Create symlink for cross-repo path compatibility
+        run: ln -s bitty-network ../bitty-network
 
       - name: Resolve Rust channel (rust-toolchain.toml)
         id: rust-channel

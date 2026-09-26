@@ -102,6 +102,31 @@ pub const IME_COMMIT_MAX_CHARS: usize = 256;
 /// Maximum UTF-8 bytes committed from one IME commit (CTX-0367).
 pub const IME_COMMIT_MAX_BYTES: usize = 1024;
 
+/// How long after a commit the platform's echo of the *committing* key is
+/// still accepted as the IME's, not the terminal's (CTX-0783).
+///
+/// A compositor answers the keystroke that committed an input method with the
+/// commit itself and the matching `wl_keyboard` key. Both are legal to flush
+/// in the same `wl_display` roundtrip or in two consecutive ones, so the echo
+/// can land in the batch *after* the commit's — winit raises `AboutToWait`
+/// once per dispatch cycle, and the embedder ticks on it. The claim therefore
+/// has to outlive the first tick, or the echo arrives to an open keyboard and
+/// the trailing space of issue #1449 comes back.
+///
+/// The bound is what makes holding safe rather than merely different: an input
+/// method that filters the committing key outright (X11 XIM swallows it
+/// server-side) never produces an echo, and without a deadline its claim would
+/// eat the user's next keystroke. A deadline distinguishes "the echo is still
+/// in flight" from "the event loop has been idle since the commit", which a
+/// tick count cannot: a tick only happens when something arrives, and the
+/// keystroke we must not lose is exactly the next thing to arrive.
+///
+/// 250 ms is far above any compositor echo latency (sub-millisecond to a few
+/// milliseconds even under load) and far below any human inter-key interval,
+/// so the absorbed keystroke this can cost a filtering backend is bounded to
+/// an immediate retype.
+pub const IME_COMMIT_ECHO_WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Protocol button bits for a platform mouse button (CTX-0566).
 ///
 /// `0`/`1`/`2` are left/middle/right, `8`/`9` are back/forward; vendor
@@ -155,6 +180,38 @@ pub(super) fn key_inspect_label(event: &KeyEvent) -> String {
     }
 }
 
+/// Who owns raw key presses while the IME is between keystrokes (CTX-0783).
+///
+/// The state exists because `wlr_text_input_v3` (Wayland) and XIM (X11) both
+/// split one physical keystroke into two event streams, and the split point
+/// differs. A key pressed during composition updates the preedit *and* still
+/// reaches `wl_keyboard`, so the IME must swallow the raw copy. But the
+/// committing key is special: winit emits the preedit-clear and `Ime::Commit`
+/// before the matching `KeyboardInput`, so the raw copy of the very key that
+/// committed arrives with no preedit left to suppress it. Keying the guard on
+/// the preedit alone therefore let that key re-enter the PTY — the fcitx5
+/// trailing space of issue #1449, or a bare `Enter` that submits the line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ImeKeyClaim {
+    /// No composition is live; raw presses belong to the terminal.
+    Free,
+    /// A preedit is up; every raw press belongs to the IME (CTX-0367).
+    Composing,
+    /// A composition just closed and the platform's echo of the committing key
+    /// may still be in flight, until `echo_by`. Closed with text or closed
+    /// empty (a cancel) alike: the echo is owed for the keystroke, and only the
+    /// keystroke decides that, never the committed string.
+    ///
+    /// Deadline-bounded rather than tick-bounded: the echo is the compositor's
+    /// answer to the same keystroke, so it lands in the commit's dispatch
+    /// cycle or the one after, and a tick cannot prove which. See
+    /// [`IME_COMMIT_ECHO_WINDOW`].
+    CommitKey {
+        /// Instant past which no echo is still expected.
+        echo_by: std::time::Instant,
+    },
+}
+
 impl Runtime {
     /// Current IME preedit overlay, if any (presentation only).
     ///
@@ -176,6 +233,85 @@ impl Runtime {
     #[must_use]
     pub fn ime_cursor_area(&self) -> Option<ImeCursorArea> {
         self.ime_caret.map(|caret| caret.area)
+    }
+
+    /// CTX-0783: the IME owns this raw press, so the key path consumes it.
+    ///
+    /// `Composing` absorbs every raw press while a preedit is up.
+    /// `CommitKey` absorbs exactly one more press, the raw copy of the key
+    /// that closed the composition, which arrives after winit has already
+    /// emitted the preedit-clear and the commit — possibly in a later
+    /// dispatched batch than the commit itself. Modifier and synthetic events
+    /// are excluded so chord state never desyncs; releases produce no bytes, so
+    /// the paired release of a consumed press needs no claim.
+    ///
+    /// A repeat is never the echo: the echo is a platform's answer to the
+    /// keystroke that committed, and a `repeat` press is by definition the
+    /// platform re-reporting a press it has already delivered. Repeats are
+    /// therefore real input that neither spends nor waits on the claim, which
+    /// keeps a held key from either eating the echo or being eaten by it.
+    /// `Composing` still absorbs repeats, unchanged from CTX-0367: during a
+    /// composition the raw copy of *every* keystroke must be suppressed, held
+    /// keys included.
+    ///
+    /// The deadline is read from the clock here rather than from a cached tick
+    /// because this is the one event that has to decide, and only elapsed time
+    /// separates "the echo is still in flight" from "the loop has been idle
+    /// since the commit" — a cached tick is at best one batch stale, which is
+    /// the case that must not decide it. The read is reached only while a
+    /// commit claim is armed (at most once per IME commit, never on the
+    /// `Composing`/`Free` paths), so it costs one vDSO call per committed
+    /// composition, not per keystroke.
+    fn ime_owns_key_press(&mut self, event: &KeyEvent, is_modifier: bool) -> bool {
+        if event.state != PressState::Pressed || event.is_synthetic || is_modifier {
+            return false;
+        }
+        match self.ime_key_claim {
+            ImeKeyClaim::Composing => true,
+            ImeKeyClaim::CommitKey { echo_by } => {
+                if event.repeat {
+                    return false;
+                }
+                // One-shot: the claim is spent whatever this press was, so a
+                // real keystroke that follows a commit the platform never
+                // echoed can never be swallowed twice. Past the deadline
+                // nothing is owed any more, so the key is the user's.
+                let owned = std::time::Instant::now() <= echo_by;
+                self.ime_key_claim = ImeKeyClaim::Free;
+                owned
+            }
+            ImeKeyClaim::Free => false,
+        }
+    }
+
+    /// Ages the post-commit raw-key claim against the clock (CTX-0783).
+    ///
+    /// Called once per dispatched batch (`tick_at`). The claim is only dropped
+    /// once its [`IME_COMMIT_ECHO_WINDOW`] has elapsed, so a compositor that
+    /// flushes the commit and the echoing `wl_keyboard` key in consecutive
+    /// batches still finds the claim held when the echo lands. Ageing is a
+    /// bound, not the release signal: the release is the observation of the
+    /// echo in [`Self::ime_owns_key_press`].
+    ///
+    /// `Composing` is deliberately left alone: a live preedit owns every raw
+    /// press for as long as it is up, and a tick lands after every batch
+    /// including mid-composition. Releasing it would re-open the keyboard under
+    /// an active input method, which is the CTX-0367 double-input defect.
+    pub(crate) fn age_ime_commit_key_claim(&mut self, now: std::time::Instant) {
+        if let ImeKeyClaim::CommitKey { echo_by } = self.ime_key_claim {
+            if now > echo_by {
+                self.ime_key_claim = ImeKeyClaim::Free;
+            }
+        }
+    }
+
+    /// Drops any IME key claim outright (CTX-0783).
+    ///
+    /// For the paths where the platform has told us the input method is gone,
+    /// so no echo can be outstanding: `Ime::Disabled`, and focus loss, which
+    /// drops the composition with it (issue #1356).
+    pub(crate) fn force_release_ime_key_claim(&mut self) {
+        self.ime_key_claim = ImeKeyClaim::Free;
     }
 
     /// Encodes a [`KeyEvent`] into the terminal input bytes (legacy xterm).
@@ -469,12 +605,13 @@ impl Runtime {
     /// callers may synthesize [`KeyEvent`]s without a window and drive this
     /// path deterministically.
     ///
-    /// While an IME composition is active (`ime_preedit.is_some()`) raw key
-    /// presses are consumed here: winit already suppresses `KeyboardInput`
-    /// during the preedit phase on every backend, and this guard keeps the
-    /// single-commit invariant even if a platform quirk delivers both — the
-    /// raw Latin key must never insert alongside the eventual
-    /// `Ime::Commit` (CTX-0367).
+    /// While the IME owns the keyboard (a live preedit, plus the one raw press
+    /// of the key that committed it) presses are consumed here: winit already
+    /// suppresses `KeyboardInput` during the preedit phase on every backend,
+    /// and this guard keeps the single-commit invariant even if a platform
+    /// quirk delivers both — the raw Latin key must never insert alongside the
+    /// eventual `Ime::Commit` (CTX-0367), and neither must the raw copy of the
+    /// committing key itself (CTX-0783).
     pub fn handle_key_event(&mut self, event: KeyEvent) -> Option<Vec<u8>> {
         let is_modifier = matches!(
             &event.logical_key,
@@ -539,17 +676,17 @@ impl Runtime {
             let _ = self.handle_copy_mode_key(&event);
             return None;
         }
-        // CTX-0367 IME composition guard: consume raw presses while a
-        // preedit is active. winit suppresses `KeyboardInput` during the
-        // preedit phase on every backend; if a platform quirk ever delivers
-        // one anyway, inserting it would double-input the composition
-        // (preedit/commit already carries the text). Modifier tracking stays
-        // above so chord state never desyncs; releases produce no bytes.
-        if self.ime_preedit.is_some()
-            && event.state == PressState::Pressed
-            && !event.is_synthetic
-            && !is_modifier
-        {
+        // CTX-0367 IME composition guard / CTX-0783 post-commit claim: the
+        // IME owns raw presses while a preedit is up, and owns one more press
+        // after the commit that closed it, for as long as that key's echo can
+        // still arrive. winit suppresses `KeyboardInput` during the preedit
+        // phase on every backend; if a platform quirk ever delivers one
+        // anyway, inserting it would double-input the composition
+        // (preedit/commit already carries the text). The post-commit claim
+        // closes the same hole after the preedit is cleared (issue #1449).
+        // Modifier tracking stays above so chord state never desyncs;
+        // releases produce no bytes.
+        if self.ime_owns_key_press(&event, is_modifier) {
             return None;
         }
         // CTX-0243: any non-modifier press snaps to live (covers Esc-cancel
@@ -677,13 +814,10 @@ impl Runtime {
             let _ = self.handle_copy_mode_key(event);
             return None;
         }
-        // CTX-0367 IME composition guard (see the owned path): raw presses
-        // are consumed while a preedit is active.
-        if self.ime_preedit.is_some()
-            && event.state == PressState::Pressed
-            && !event.is_synthetic
-            && !is_modifier
-        {
+        // CTX-0367 IME composition guard / CTX-0783 post-commit claim (see
+        // the owned path): the IME owns raw presses while a preedit is up and
+        // exactly one more press after the commit that closed it.
+        if self.ime_owns_key_press(event, is_modifier) {
             return None;
         }
         // CTX-0243: any non-modifier press snaps to live (see owned path).
@@ -1598,6 +1732,10 @@ impl Runtime {
         if !focused && self.ime_preedit.is_some() {
             self.ime_preedit = None;
             self.ime_cursor = 0;
+            // CTX-0783: the compositor dropped the composition, so no raw
+            // key is owed for it. The claim must go with the preedit or the
+            // terminal would stay keyboard-dead for the rest of the session.
+            self.force_release_ime_key_claim();
             self.pending_full_redraw = true;
         }
         // CTX-0159: retain focus transitions for screenshots-free probes.
@@ -1631,7 +1769,22 @@ impl Runtime {
     /// scalars at a char boundary (TXT-10), and an empty preedit clears the
     /// overlay (winit sends one right before [`Self::handle_ime_commit`], per
     /// its `Ime::Commit` contract).
+    ///
+    /// `handle_ime_preedit` delegates with `Instant::now()` via
+    /// [`Self::handle_ime_preedit_at`], the clock seam the rest of the runtime
+    /// uses. Only the clearing branch reads it, to stamp the post-commit echo
+    /// deadline for a cancel (CTX-0783).
     pub fn handle_ime_preedit(&mut self, text: Option<String>, cursor: Option<usize>) {
+        self.handle_ime_preedit_at(text, cursor, std::time::Instant::now());
+    }
+
+    /// [`Self::handle_ime_preedit`] with an explicit `now`.
+    pub fn handle_ime_preedit_at(
+        &mut self,
+        text: Option<String>,
+        cursor: Option<usize>,
+        now: std::time::Instant,
+    ) {
         // CTX-0243: preedit is typing — snap to live so the overlay lands on
         // the visible window instead of a scrolled history viewport.
         self.snap_focused_to_live();
@@ -1649,10 +1802,28 @@ impl Runtime {
                 .min(char_len);
             self.ime_preedit = Some(truncated);
             self.ime_cursor = cur;
+            // CTX-0783: a fresh composition owns the keyboard outright, so
+            // any claim left by a previous commit is dead. Dropping it here
+            // keeps the one-shot claim from outliving its own gesture when
+            // type-ahead starts a new composition in the same batch.
+            self.ime_key_claim = ImeKeyClaim::Composing;
             self.pending_full_redraw = true;
         } else {
             self.ime_preedit = None;
             self.ime_cursor = 0;
+            // CTX-0783: the empty preedit is the *front* of a commit (winit
+            // emits it inside the same `done` as `Commit`, just ahead of it),
+            // so it must not release the claim — the raw copy of the key that
+            // produced it has still not been delivered. The same shape covers
+            // a cancel, whose committing key is owed the same one-shot claim
+            // and is the only case where this stamp is load-bearing: every
+            // commit re-stamps it a moment later, empty or not. A stray empty
+            // preedit with no composition behind it owns no key.
+            if self.ime_key_claim == ImeKeyClaim::Composing {
+                self.ime_key_claim = ImeKeyClaim::CommitKey {
+                    echo_by: now + IME_COMMIT_ECHO_WINDOW,
+                };
+            }
             self.pending_full_redraw = true;
         }
     }
@@ -1664,8 +1835,25 @@ impl Runtime {
     /// paste framing is deliberately not applied (input-pointer RFC "IME
     /// composition and commit"). The preedit overlay clears first so a cancel
     /// of a stale composition can never paint after the commit.
-    #[allow(clippy::explicit_counter_loop)]
+    ///
+    /// The commit string is passed through **verbatim** — never trimmed. A
+    /// trailing space that an input method genuinely appends is user input
+    /// (Terminal Truth); the synthetic one from issue #1449 is a raw key
+    /// re-inserted after the commit, which
+    /// [`Self::ime_owns_key_press`](Self::ime_owns_key_press) consumes, not a
+    /// byte the commit path adds.
+    ///
+    /// `handle_ime_commit` delegates with `Instant::now()` via
+    /// [`Self::handle_ime_commit_at`], the clock seam the rest of the runtime
+    /// uses (`tick_at`, `handle_cursor_moved_at`, `handle_mouse_input_at`).
     pub fn handle_ime_commit(&mut self, text: String) {
+        self.handle_ime_commit_at(text, std::time::Instant::now());
+    }
+
+    /// [`Self::handle_ime_commit`] with an explicit `now`, stamping the
+    /// post-commit echo deadline (CTX-0783).
+    #[allow(clippy::explicit_counter_loop)]
+    pub fn handle_ime_commit_at(&mut self, text: String, now: std::time::Instant) {
         // Bounded before allocation (TXT-11)
         let bytes_len = text.len();
         let char_count = text.chars().count();
@@ -1685,6 +1873,34 @@ impl Runtime {
             out
         } else {
             text
+        };
+        // CTX-0783: a commit ends the gesture, and the raw copy of the key
+        // that produced it is still in flight — hold the one-shot claim so it
+        // cannot re-enter the PTY. Whether the commit carries text decides
+        // what is *inserted*, never whether an echo is owed: the keystroke
+        // that closed the composition is a physical key that reached
+        // `wl_keyboard`, and a commit with an empty string says nothing about
+        // it. A cancel (Esc, or Backspace clearing a selection) commits empty
+        // and its raw key arrives exactly like the fcitx5 commit key did, so
+        // releasing here would reinstate the #1449 shape for that ordering.
+        //
+        // The gesture can only have been a live composition: winit clears the
+        // preedit inside the same `done` just ahead of the commit, so the live
+        // evidence at this point is the claim, not `ime_preedit`. A commit
+        // with no composition behind it is unsolicited (a stray IME `done`, an
+        // input method committing without composing) and owns no key, because
+        // winit never announced a preedit for it, so no raw copy of a
+        // committing keystroke can be outstanding.
+        //
+        // An armed claim is re-stamped rather than merely kept, so the window
+        // is measured from the last piece of IME evidence in the `done`; a
+        // claim that arrived as `Composing` becomes deadline-bounded here
+        // instead of staying open until a preedit clear that will never come.
+        self.ime_key_claim = match self.ime_key_claim {
+            ImeKeyClaim::Free => ImeKeyClaim::Free,
+            ImeKeyClaim::Composing | ImeKeyClaim::CommitKey { .. } => ImeKeyClaim::CommitKey {
+                echo_by: now + IME_COMMIT_ECHO_WINDOW,
+            },
         };
         self.ime_preedit = None;
         self.ime_cursor = 0;

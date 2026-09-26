@@ -657,6 +657,13 @@ impl Runtime {
                             // No grid mutation; just ensure overlay cleared on disabled
                             if matches!(ime, bitty_platform::ImeEvent::Disabled) {
                                 self.handle_ime_preedit(None, None);
+                                // CTX-0783: a disabled input method will never
+                                // echo a committing key, so nothing is owed
+                                // and the claim must not outlive the
+                                // composition to eat a later keystroke. This
+                                // runs after the preedit clear, which is what
+                                // arms the claim for a cancel.
+                                self.force_release_ime_key_claim();
                             }
                         }
                     }

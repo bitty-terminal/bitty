@@ -2175,6 +2175,7 @@ impl Runtime {
                 .render(&tmp_snap, &tmp_damage)
                 .unwrap_or(DrawList {
                     generation: current_gen,
+                    atlas_epoch: 0,
                     plan: FramePlan {
                         dirty_rects: Vec::new(),
                         extent: bitty_render::geometry::ExtentPx::new(0, 0),

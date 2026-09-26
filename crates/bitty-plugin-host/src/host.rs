@@ -8,6 +8,7 @@
 //! (pure reads of the terminal truth).
 
 use std::collections::{BTreeSet, VecDeque};
+use std::sync::Arc;
 
 use crate::capability::CapabilityId;
 use crate::error::PluginError;
@@ -165,7 +166,6 @@ pub enum HostObservation {
 /// - Native in-process plugins remain forbidden (risk `R-017`); this host only
 ///   tracks manifest-declared capabilities and never confers authority on
 ///   native payloads.
-#[derive(Debug)]
 pub struct PluginHost {
     registry: Registry,
     grants: GrantStore,
@@ -176,6 +176,24 @@ pub struct PluginHost {
     secrets: crate::secrets::SecretStore,
     fs_policy: crate::fs_authz::SensitivePathPolicy,
     fs_audit: crate::fs_authz::FsAuditLedger,
+    network_runtime: Arc<bitty_network_lua::SharedNetworkRuntime>,
+}
+
+impl std::fmt::Debug for PluginHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PluginHost")
+            .field("registry", &self.registry)
+            .field("grants", &self.grants)
+            .field("pipeline", &self.pipeline)
+            .field("side_queue", &self.side_queue)
+            .field("safe_mode", &self.safe_mode)
+            .field("audit", &self.audit)
+            .field("secrets", &self.secrets)
+            .field("fs_policy", &self.fs_policy)
+            .field("fs_audit", &self.fs_audit)
+            .field("network_runtime", &"<SharedNetworkRuntime>")
+            .finish()
+    }
 }
 
 impl PluginHost {
@@ -199,6 +217,7 @@ impl PluginHost {
             secrets: crate::secrets::SecretStore::new(),
             fs_policy: crate::fs_authz::SensitivePathPolicy::default_policy(),
             fs_audit: crate::fs_authz::FsAuditLedger::new(),
+            network_runtime: Arc::new(bitty_network_lua::SharedNetworkRuntime::new()),
         }
     }
 
@@ -218,6 +237,7 @@ impl PluginHost {
             secrets: crate::secrets::SecretStore::new(),
             fs_policy: crate::fs_authz::SensitivePathPolicy::default_policy(),
             fs_audit: crate::fs_authz::FsAuditLedger::new(),
+            network_runtime: Arc::new(bitty_network_lua::SharedNetworkRuntime::new()),
         }
     }
 
@@ -1273,6 +1293,80 @@ impl PluginHost {
     /// Drain side-queue observations up to `limit`.
     pub fn drain_observations_bounded(&mut self, limit: usize) -> Vec<HostObservation> {
         self.side_queue.drain_bounded(limit)
+    }
+
+    // ── network capability integration ────────────────────────────────
+
+    /// Access the shared network runtime (for Lua module registration).
+    ///
+    /// The runtime is shared across all plugins for DNS cache, TLS sessions,
+    /// and HTTP connection pool efficiency, but enforces per-plugin
+    /// capability checking and rate limits.
+    #[must_use]
+    pub fn network_runtime(&self) -> &Arc<bitty_network_lua::SharedNetworkRuntime> {
+        &self.network_runtime
+    }
+
+    /// Check if plugin has any network.connect capabilities granted.
+    ///
+    /// Returns true if the plugin has at least one `network.connect:*` capability
+    /// in its granted set, indicating it should have the network module registered.
+    ///
+    /// # Implementation Note
+    ///
+    /// The actual capability checking happens per-request in the network runtime.
+    /// This method only determines whether to register the `bitty.network` module
+    /// in the plugin's Lua VM during activation.
+    #[must_use]
+    pub fn has_network_capability(&self, plugin_id: &PluginId) -> bool {
+        if self.registry.get(plugin_id).is_none() {
+            return false;
+        }
+        let Some(record) = self.grants.get(plugin_id) else {
+            return false;
+        };
+
+        // Check if any granted capability starts with "network.connect:"
+        record.granted.iter().any(|cap| {
+            cap.family() == crate::capability::CapabilityFamily::Network
+                && cap.as_str().starts_with("network.connect:")
+        })
+    }
+
+    /// Register network module for a plugin with network.connect capabilities.
+    ///
+    /// This should be called during plugin activation if the plugin has any
+    /// `network.connect:*` capabilities granted. The network module will be
+    /// registered in the plugin's Lua VM globals as `bitty.network`.
+    ///
+    /// # Implementation Note
+    ///
+    /// This is a placeholder integration point. Full implementation requires:
+    /// - Plugin context propagation (PluginId to network callbacks)
+    /// - Phodopus VM reference from plugin lifecycle
+    /// - Async suspension bridge for network operations
+    ///
+    /// The actual module registration happens in the Lua VM layer (bitty-lua)
+    /// which has access to the Phodopus Context. This method provides the
+    /// shared runtime reference that will be passed during registration.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if the plugin doesn't have any network capabilities
+    /// or if validation fails.
+    pub fn register_network_capability(&self, plugin_id: &PluginId) -> Result<(), PluginError> {
+        if !self.has_network_capability(plugin_id) {
+            return Err(PluginError::grant(format!(
+                "plugin '{}' does not have any network.connect capabilities",
+                plugin_id.as_str()
+            )));
+        }
+
+        // Module registration will happen in the Lua VM integration layer
+        // (bitty-lua crate) which has access to the Phodopus Context.
+        // This method validates that network capabilities exist and provides
+        // access to the shared runtime via network_runtime().
+        Ok(())
     }
 }
 

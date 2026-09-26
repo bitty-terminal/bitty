@@ -66,8 +66,8 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # kyren/gc-arena is phodopus's own rev-pinned transitive dep (arena backing
 # for the Lua GC), not bitty's choice — kept visible here rather than hidden
 # behind a wildcard so any new git source still fails loudly.
-# bitty-network is pinned to commit 59c398e (PR #60 merged) for network
-# capability integration (CTX-0796).
+# bitty-network is pinned to commit d97c5da (includes MSRV 1.85 fixes for
+# yoke-derive 0.8.3 compatibility) for network capability integration (CTX-0796).
 # Time bound (CTX-0634, P0-AC-034 exception policy): re-audit all pins
 # (rev freshness, source trust) no later than 2027-03-31; any new git source
 # needs a dated ADR-0004/ADR-0012 revision, never a silent allowlist edit.

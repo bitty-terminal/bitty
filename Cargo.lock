@@ -267,6 +267,7 @@ dependencies = [
 [[package]]
 name = "bitty-network"
 version = "0.1.0"
+source = "git+https://github.com/bitty-terminal/bitty-network?rev=59c398e#59c398eb0964e7f6bcb7419eabaa16bcb0b152f7"
 dependencies = [
  "bitty-network-api",
  "bitty-network-core",
@@ -279,10 +280,12 @@ dependencies = [
 [[package]]
 name = "bitty-network-api"
 version = "0.1.0"
+source = "git+https://github.com/bitty-terminal/bitty-network?rev=59c398e#59c398eb0964e7f6bcb7419eabaa16bcb0b152f7"
 
 [[package]]
 name = "bitty-network-core"
 version = "0.1.0"
+source = "git+https://github.com/bitty-terminal/bitty-network?rev=59c398e#59c398eb0964e7f6bcb7419eabaa16bcb0b152f7"
 dependencies = [
  "bitty-network-api",
 ]
@@ -290,10 +293,12 @@ dependencies = [
 [[package]]
 name = "bitty-network-dns"
 version = "0.1.0"
+source = "git+https://github.com/bitty-terminal/bitty-network?rev=59c398e#59c398eb0964e7f6bcb7419eabaa16bcb0b152f7"
 
 [[package]]
 name = "bitty-network-lua"
 version = "0.1.0"
+source = "git+https://github.com/bitty-terminal/bitty-network?rev=59c398e#59c398eb0964e7f6bcb7419eabaa16bcb0b152f7"
 dependencies = [
  "bitty-network",
  "bitty-network-api",
@@ -304,6 +309,7 @@ dependencies = [
 [[package]]
 name = "bitty-network-tls"
 version = "0.1.0"
+source = "git+https://github.com/bitty-terminal/bitty-network?rev=59c398e#59c398eb0964e7f6bcb7419eabaa16bcb0b152f7"
 dependencies = [
  "bitty-network-api",
  "idna",

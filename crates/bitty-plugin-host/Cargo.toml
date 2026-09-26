@@ -17,7 +17,7 @@ workspace = true
 bitty-term-state = { path = "../bitty-term-state" }
 bitty-config = { path = "../bitty-config" }
 bitty-package = { path = "../bitty-package" }
-bitty-network-lua = { git = "https://github.com/bitty-terminal/bitty-network", rev = "59c398e" }
+bitty-network-lua = { git = "https://github.com/bitty-terminal/bitty-network", rev = "d97c5da" }
 
 [dev-dependencies]
 # V-C install tests mint real Ed25519 signatures (bitty#767).

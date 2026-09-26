@@ -200,7 +200,7 @@ impl ZoomState {
         };
         let backup = runtime.layout().clone();
         let proxy = LayoutNode::leaf(leaf);
-        runtime.set_layout(proxy.clone());
+        runtime.set_layout_preserve_grid(proxy.clone());
         self.entries.insert(seq, ZoomEntry { backup, proxy });
         true
     }
@@ -217,7 +217,7 @@ impl ZoomState {
             return false;
         };
         if same_layout_shape(runtime.layout(), &entry.proxy) {
-            runtime.set_layout(entry.backup);
+            runtime.set_layout_preserve_grid(entry.backup);
             return true;
         }
         eprintln!(

@@ -23,9 +23,40 @@ set -euo pipefail
 root="$(git rev-parse --show-toplevel)"
 dir="$root/tests/compat/oracle/scenarios"
 cite_index="$root/tests/compat/oracle/authority-cites.txt"
-workspace="${BITTY_WORKSPACE:-$(dirname "$root")}"
+# The workspace is the parent of the primary checkout; derive it from the
+# common git dir so a task worktree (<repo>/.worktrees/<task>) resolves too.
+common_dir="$(git rev-parse --path-format=absolute --git-common-dir)"
+workspace="${BITTY_WORKSPACE:-$(dirname "$(dirname "$common_dir")")}"
 refs="$workspace/recording/references"
 mkdir -p "$dir"
+
+# Repo-docs authorities are read at the pinned `docs` revision. A populated
+# `docs/` mount is used as is; otherwise (the Bitty workspace keeps the mount
+# empty, CTX-0810) the pinned blobs are read on demand from the workspace docs
+# checkout (`$BITTY_TERMINAL_DOCS`, or `<workspace>/<.gitmodules repo name>`)
+# into a scratch directory, without populating the mount.
+docs_pin="$(git -C "$root" ls-files --stage -- docs | cut -d' ' -f2)"
+docs_url="$(git config -f "$root/.gitmodules" --get submodule.docs.url || true)"
+docs_repo="${BITTY_TERMINAL_DOCS:-$workspace/$(basename "${docs_url%.git}")}"
+docs_scratch=""
+if [ ! -e "$root/docs/.git" ]; then
+  docs_scratch="$(mktemp -d "${TMPDIR:-/tmp}/gen-oracle-docs.XXXXXX")"
+  trap 'rm -rf "$docs_scratch"' EXIT
+fi
+
+docs_source() {
+  local rel="$1"
+  if [ -z "$docs_scratch" ]; then
+    printf '%s' "$root/docs/$rel"
+    return
+  fi
+  local out="$docs_scratch/$rel"
+  if [ ! -f "$out" ] && [ -n "$docs_pin" ]; then
+    mkdir -p "$(dirname "$out")"
+    git -C "$docs_repo" show "$docs_pin:$rel" >"$out" 2>/dev/null || rm -f "$out"
+  fi
+  printf '%s' "$out"
+}
 
 # Authority id -> exact source file. Kept in lockstep with AUTHORITIES in
 # crates/bitty-compat-lab/src/oracle.rs. Every cite token below is verified
@@ -38,8 +69,8 @@ authority_path() {
   ghostty-modes) printf '%s' "$refs/ghostty/src/terminal/modes.zig" ;;
   ghostty-terminal) printf '%s' "$refs/ghostty/src/terminal/Terminal.zig" ;;
   kitty-window) printf '%s' "$refs/kitty/kitty/window.py" ;;
-  m1-rfc) printf '%s' "$root/docs/specifications/compatibility-milestone-rfc.md" ;;
-  text-rendering-rfc) printf '%s' "$root/docs/specifications/text-rendering-rfc.md" ;;
+  m1-rfc) docs_source specifications/compatibility-milestone-rfc.md ;;
+  text-rendering-rfc) docs_source specifications/text-rendering-rfc.md ;;
   *) printf '%s' "" ;;
   esac
 }

@@ -240,7 +240,10 @@ and is mounted at `docs/` as a Git submodule pinned by commit:
 - New clone: `git clone --recurse-submodules …` (or
   `git submodule update --init` in an existing checkout).
 - Bump the pin: `git submodule update --remote docs`, then `git add docs` and
-  commit the pointer change.
+  commit the pointer change; without a checkout, `just docs-pin [<rev>]`
+  stages a merged `bitty-terminal-docs` commit from a sibling checkout.
+- Edit: change documents in the `bitty-terminal-docs` repository, never in
+  the pinned `docs/` copy.
 - Read: [`docs/README.md`](https://github.com/bitty-terminal/bitty-terminal-docs/blob/main/docs/README.md)
   is the documentation map.
 

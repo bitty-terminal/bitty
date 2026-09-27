@@ -8,8 +8,9 @@
 - All formal Bitty repositories belong under <https://github.com/bitty-terminal>.
 - `bitty-terminal-docs` is the canonical source for terminal-platform product,
   architecture, configuration, interface, and specification documents. It is
-  mounted at `docs/` as a Git submodule pinned to a commit; initialize it with
-  `git submodule update --init`.
+  mounted at `docs/` as a Git submodule pinned to a commit. In the Bitty
+  workspace the mount stays empty (see Documentation contract): read and edit
+  the workspace `bitty-terminal-docs` checkout instead.
 - `bitty-docs` is the canonical source for shared governance: decisions, the
   security corpus, reviews, findings, and project state.
 
@@ -31,9 +32,9 @@
 1. Read this guide and the applicable files in `.carryctx/rules/`.
 2. Adopt the assigned persona in `.carryctx/personas/`.
 3. Read the task, team context, exact scopes, dependencies, and relevant
-   canonical contracts in the `docs/` submodule (bitty-terminal-docs) and
-   shared governance in `bitty-docs`; run `git submodule update --init` first
-   when `docs/` is empty.
+   canonical contracts in the workspace `bitty-terminal-docs` checkout
+   (`$BITTY_WORKSPACE/bitty-terminal-docs`) and shared governance in
+   `bitty-docs`; do not initialize the empty `docs/` mount.
 4. Use `ctxctl outline` before targeted `symbol`, `read`, or `deps` inspection.
 
 ## CarryCtx workflow
@@ -112,11 +113,24 @@
   (decisions, security corpus, reviews, project state) stays in `bitty-docs`;
   AI-core and plugin-ecosystem corpora live in `bitty-ai-docs` and
   `bitty-plugins-docs` and are linked by absolute URL.
-- Initialize/refresh the submodule with `git submodule update --init`; bump the
-  pin with `git submodule update --remote docs` followed by `git add docs` and
-  a `docs:` commit. `docs/` is external content: `just check` excludes it from
-  markdownlint and the scratch-path gate, so gates behave identically with and
-  without the submodule initialized.
+- Workspace rule: the local clone keeps `docs/` uninitialized
+  (`git config submodule.docs.update none` plus
+  `git config --add submodule.active ':(exclude)docs'`), so
+  `git submodule update --init` prints `Skipping submodule 'docs'` and an
+  agent cannot edit a pinned copy by mistake. Documentation changes are made
+  only in the workspace `bitty-terminal-docs` checkout (or its worktrees) and
+  land through that repository's PRs. Never replace the mount with a symlink:
+  Git refuses symlinked submodule paths and `git add -A` would commit the link.
+- Bump the pin with `just docs-pin [<rev>]` (default `origin/main` of the
+  workspace checkout; fetch it first). It stages the gitlink without
+  populating the mount and refuses a commit that is not reachable from
+  `origin/main` or a checkout whose origin is not the `.gitmodules` URL;
+  commit the result under the owning task. Standalone clones outside the
+  workspace may still use `git submodule update --init` (read-only) and
+  `git submodule update --remote docs` + `git add docs`. `docs/` is external
+  content: `just check` excludes it from markdownlint and the scratch-path
+  gate, so gates behave identically with and without the submodule
+  initialized; CI checks out the submodule itself.
 - Synchronize affected canonical material in `bitty-terminal-docs` (platform)
   or `bitty-docs` (governance) when architecture, security, public behavior,
   configuration, compatibility, or developer workflows change.

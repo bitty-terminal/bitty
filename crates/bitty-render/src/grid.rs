@@ -1397,7 +1397,7 @@ impl ImageBlit {
 pub struct DrawList {
     /// Snapshot generation this list was built from.
     pub generation: u64,
-    /// Atlas epoch at which this list's glyph slots were placed (CTX-0531).
+    /// Atlas epoch at which this list's glyph slots were placed (CTX-0797).
     ///
     /// Every glyph slot in this list must resolve against the atlas at exactly
     /// this epoch. If the atlas epoch changes after the list is built (e.g., by

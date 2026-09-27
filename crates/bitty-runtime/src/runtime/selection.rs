@@ -58,8 +58,30 @@ impl Runtime {
     pub fn clear_selection(&mut self) {
         self.selection = None;
         self.selection_dragging = false;
+        self.selection_origin_view = None;
+        self.selection_origin_bounds = None;
         self.selection_anchor_press = None;
         self.pending_full_redraw = true;
+    }
+
+    /// Records the originating panel for a selection drag.
+    fn record_selection_origin(&mut self, pos: CellPos) {
+        // Find which view contains this cell position
+        for (view_id, bounds) in self.layout_allocations() {
+            if !bounds.is_empty()
+                && u32::from(pos.col) >= u32::from(bounds.x)
+                && u32::from(pos.row) >= u32::from(bounds.y)
+                && u32::from(pos.col) < bounds.right()
+                && u32::from(pos.row) < bounds.bottom()
+            {
+                self.selection_origin_view = Some(view_id);
+                self.selection_origin_bounds = Some(bounds);
+                return;
+            }
+        }
+        // If no view contains the position (shouldn't happen), clear origin
+        self.selection_origin_view = None;
+        self.selection_origin_bounds = None;
     }
 
     /// Directly sets the selection (headless test seam).
@@ -69,6 +91,9 @@ impl Runtime {
         self.selection_anchor_press = Some(clamped.anchor);
         self.selection = Some(clamped);
         self.selection_dragging = clamped.active;
+        // Clear origin tracking since this is a test seam
+        self.selection_origin_view = None;
+        self.selection_origin_bounds = None;
         self.pending_full_redraw = true;
     }
 
@@ -101,6 +126,8 @@ impl Runtime {
             active: true,
         });
         self.selection_dragging = true;
+        // Record originating panel for drag clamping
+        self.record_selection_origin(snapped);
         self.pending_full_redraw = true;
     }
 
@@ -123,6 +150,8 @@ impl Runtime {
             active: true,
         });
         self.selection_dragging = true;
+        // Record originating panel for drag clamping
+        self.record_selection_origin(snapped);
         self.pending_full_redraw = true;
     }
 
@@ -143,6 +172,8 @@ impl Runtime {
             active: true,
         });
         self.selection_dragging = true;
+        // Record originating panel for drag clamping
+        self.record_selection_origin(snapped);
         self.pending_full_redraw = true;
     }
 
@@ -162,6 +193,8 @@ impl Runtime {
             active: true,
         });
         self.selection_dragging = true;
+        // Record originating panel for drag clamping
+        self.record_selection_origin(snapped);
         self.pending_full_redraw = true;
     }
 
@@ -179,7 +212,21 @@ impl Runtime {
             return;
         }
         let snap = self.state.snapshot();
-        let clamped = clamp_cell_pos(&snap, pos);
+        let mut clamped = clamp_cell_pos(&snap, pos);
+
+        // Clamp to originating panel bounds if we have them
+        if let Some(bounds) = self.selection_origin_bounds {
+            // Convert bounds to container cell coordinates
+            let min_col = bounds.x;
+            let min_row = bounds.y;
+            let max_col = bounds.right().saturating_sub(1) as u16;
+            let max_row = bounds.bottom().saturating_sub(1) as u16;
+
+            // Clamp the cell position
+            clamped.col = clamped.col.max(min_col).min(max_col);
+            clamped.row = clamped.row.max(min_row).min(max_row);
+        }
+
         let snapped = bitty_ui::snap_to_leading(&snap, clamped);
         let anchor_press = self.selection_anchor_press.unwrap_or(sel.anchor);
         let next = match sel.kind {
@@ -212,7 +259,21 @@ impl Runtime {
             return;
         };
         let snap = self.state.snapshot();
-        let clamped = clamp_cell_pos(&snap, pos);
+        let mut clamped = clamp_cell_pos(&snap, pos);
+
+        // Clamp to originating panel bounds if we have them
+        if let Some(bounds) = self.selection_origin_bounds {
+            // Convert bounds to container cell coordinates
+            let min_col = bounds.x;
+            let min_row = bounds.y;
+            let max_col = bounds.right().saturating_sub(1) as u16;
+            let max_row = bounds.bottom().saturating_sub(1) as u16;
+
+            // Clamp the cell position
+            clamped.col = clamped.col.max(min_col).min(max_col);
+            clamped.row = clamped.row.max(min_row).min(max_row);
+        }
+
         let snapped = bitty_ui::snap_to_leading(&snap, clamped);
         let anchor_press = self.selection_anchor_press.unwrap_or(sel.anchor);
         let was_drag = super::click::cell_distance(anchor_press, snapped)
@@ -228,6 +289,8 @@ impl Runtime {
         };
         finished.active = false;
         self.selection_dragging = false;
+        self.selection_origin_view = None;
+        self.selection_origin_bounds = None;
         self.selection_anchor_press = None;
         if was_drag {
             self.click_tracker.reset();

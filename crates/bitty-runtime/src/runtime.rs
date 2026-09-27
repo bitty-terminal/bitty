@@ -517,6 +517,12 @@ pub struct Runtime {
     clipboard: Clipboard,
     selection: Option<Selection>,
     selection_dragging: bool,
+    /// View and bounds where the current selection drag started.
+    ///
+    /// When `selection_dragging` is true, this records the originating panel
+    /// so drag updates can be clamped to stay within the same panel bounds.
+    selection_origin_view: Option<ViewId>,
+    selection_origin_bounds: Option<UiRect>,
     /// Bounded multi-click tracker for word/line selection (CTX-0385).
     ///
     /// `O(1)` state (last press time, cell, button, count); the runtime is
@@ -1211,6 +1217,8 @@ impl Runtime {
             clipboard: Clipboard::new(),
             selection: None,
             selection_dragging: false,
+            selection_origin_view: None,
+            selection_origin_bounds: None,
             click_tracker: ClickTracker::new(),
             selection_anchor_press: None,
             last_click_count: crate::runtime::click::CLICK_COUNT_MIN,
@@ -1419,6 +1427,8 @@ impl Runtime {
             clipboard: Clipboard::new(),
             selection: None,
             selection_dragging: false,
+            selection_origin_view: None,
+            selection_origin_bounds: None,
             click_tracker: ClickTracker::new(),
             selection_anchor_press: None,
             last_click_count: crate::runtime::click::CLICK_COUNT_MIN,

@@ -17,6 +17,24 @@ pub(super) fn default_container(cols: usize, rows: usize) -> UiRect {
     UiRect::new(0, 0, w, h)
 }
 
+/// Frame-local cell index along one axis for a pixel offset, clamped to
+/// `0..=max` (CTX-0803).
+///
+/// Total: a negative offset (pointer left of / above the frame) clamps to `0`,
+/// an offset past the frame clamps to `max`, and a degenerate cell size or a
+/// non-finite offset clamps to `0`. This is what makes the owner-confined drag
+/// mapping total without ever naming another `View`'s cell.
+fn clamp_frame_axis(offset_px: f64, cell_px: f64, max: i64) -> u16 {
+    if cell_px <= 0.0 || !offset_px.is_finite() {
+        return 0;
+    }
+    let index = (offset_px / cell_px).floor();
+    // `f64 as i64` saturates in Rust, so a huge offset lands on `i64::MAX`
+    // and clamps to `max` below rather than wrapping.
+    let index = (index as i64).clamp(0, max.max(0));
+    u16::try_from(index).unwrap_or(u16::MAX)
+}
+
 /// One live-present View frame in physical pixels (CTX-0294).
 ///
 /// Produced by [`Runtime::present_frames`]: the accepted Core-owned
@@ -684,6 +702,18 @@ impl Runtime {
     /// ([`Self::cursor_to_leaf_cell`]) is unchanged.
     #[must_use]
     pub fn cursor_to_present_cell(&self, pos: CursorPosition) -> Option<(ViewId, CellPos)> {
+        self.present_cell_in(&self.present_frames(), pos)
+    }
+
+    /// [`Self::cursor_to_present_cell`] against an already-solved frame list.
+    ///
+    /// CTX-0803: lets the selection press path hit-test and read the owner's
+    /// frame geometry from one solver pass instead of two.
+    fn present_cell_in(
+        &self,
+        frames: &[PresentFrame],
+        pos: CursorPosition,
+    ) -> Option<(ViewId, CellPos)> {
         let live = self.live_cell_metrics();
         let cell_w = live.width as f64;
         let cell_h = live.height as f64;
@@ -696,8 +726,12 @@ impl Runtime {
         if x < 0.0 || y < 0.0 {
             return None;
         }
-        let frames = self.present_frames();
-        let (frame, content) = frames.iter().find_map(|frame| {
+        // CTX-0803: frames are stable-sorted in paint order (base first, then
+        // overlay tiers), so the *last* frame containing the point is the one
+        // visible under the pointer. Tiled base frames never overlap, so this
+        // only changes which frame wins under a float/popup overlay: the
+        // visible overlay, not the base leaf painted beneath it.
+        let (frame, content) = frames.iter().rev().find_map(|frame| {
             let rect = frame.frame;
             if rect.width == 0 || rect.height == 0 {
                 return None;
@@ -726,14 +760,209 @@ impl Runtime {
         ))
     }
 
+    /// Frame-local cell of `frame` nearest to `pos`, clamped into the frame.
+    ///
+    /// CTX-0803: total inside the frame — a position over a sibling panel, a
+    /// gap band, the window padding, or outside the window clamps to the
+    /// nearest cell of *this* frame. `None` only for degenerate cell metrics.
+    fn clamped_frame_cell(&self, frame: &PresentFrame, pos: CursorPosition) -> Option<CellPos> {
+        let live = self.live_cell_metrics();
+        let cell_w = live.width as f64;
+        let cell_h = live.height as f64;
+        if cell_w <= 0.0 || cell_h <= 0.0 {
+            return None;
+        }
+        let pad = f64::from(self.window_padding_physical());
+        let x = pos.x - pad - f64::from(frame.content.x);
+        let y = pos.y - pad - f64::from(frame.content.y);
+        let max_col = i64::from(frame.cols.saturating_sub(1));
+        let max_row = i64::from(frame.rows.saturating_sub(1));
+        Some(CellPos::new(
+            clamp_frame_axis(y, cell_h, max_row),
+            clamp_frame_axis(x, cell_w, max_col),
+        ))
+    }
+
+    /// Live cell size in physical pixels at the current DPI scale
+    /// (read-only headless seam, CTX-0803).
+    ///
+    /// The `(width, height)` pair every pointer mapping and every pixel
+    /// origin in the present path divides by. Exposed so tests and embedders
+    /// can derive pointer positions from [`Self::present_frames`] plus
+    /// [`Self::window_padding_physical`] instead of hard-coding pixel,
+    /// padding, or decoration constants. Observation only: it mutates
+    /// nothing and grants no access to terminal state.
+    #[must_use]
+    pub fn live_cell_size(&self) -> (u32, u32) {
+        let live = self.live_cell_metrics();
+        (live.width, live.height)
+    }
+
+    /// First owner-grid row painted at the top of `owner`'s content frame.
+    ///
+    /// CTX-0803: the single row-window translation shared by the pointer
+    /// mapping ([`Self::cursor_to_owner_cell`],
+    /// [`Self::selection_press_target`]) and the selection paint
+    /// (`present::paint_selection_highlight`). A grid taller than its content
+    /// frame is painted through
+    /// [`present::viewport_snapshot`](super::present::viewport_snapshot),
+    /// whose window follows the cursor, so frame-local row `r` is owner-grid
+    /// row `window_start + r`. Defining it once is what keeps hit-testing and
+    /// painting from disagreeing.
+    ///
+    /// Zero when the owner resolves to no live grid, when the grid is not
+    /// taller than the frame, or when the owner is scrolled into history (the
+    /// scrolled leaf pass composites scrollback instead of windowing the live
+    /// grid; the selection paint is suppressed there).
+    pub(super) fn owner_row_window_start(&self, owner: ViewId, frame_rows: u16) -> usize {
+        let Some(state) = self.live_view_state(owner) else {
+            return 0;
+        };
+        if self.view_scroll_offset(owner) != 0 {
+            return 0;
+        }
+        super::present::cursor_follow_window_start(
+            usize::from(state.cursor().position.row),
+            state.height(),
+            usize::from(frame_rows),
+        )
+    }
+
+    /// Scroll offset of leaf `view` in the active layout (`0` when absent).
+    pub(super) fn view_scroll_offset(&self, view: ViewId) -> usize {
+        self.layout
+            .find_leaf(view)
+            .map_or(0, |leaf| leaf.scroll_offset())
+    }
+
+    /// Translates a frame-local cell of `owner`'s content frame into a cell of
+    /// `owner`'s grid, clamped and wide-char snapped (CTX-0803).
+    ///
+    /// `None` when `owner` resolves to no live grid. Shares
+    /// [`Self::owner_row_window_start`] with the selection paint.
+    pub(super) fn frame_cell_to_owner_cell(
+        &self,
+        owner: ViewId,
+        frame_rows: u16,
+        local: CellPos,
+    ) -> Option<CellPos> {
+        let start = self.owner_row_window_start(owner, frame_rows);
+        let state = self.live_view_state(owner)?;
+        let snap = state.snapshot();
+        let row = start
+            .saturating_add(usize::from(local.row))
+            .min(snap.height.saturating_sub(1));
+        let col = usize::from(local.col).min(snap.width.saturating_sub(1));
+        let cell = CellPos::new(
+            u16::try_from(row).unwrap_or(u16::MAX),
+            u16::try_from(col).unwrap_or(u16::MAX),
+        );
+        Some(bitty_ui::snap_to_leading(&snap, cell))
+    }
+
+    /// Maps a physical cursor position into a cell of `owner`'s grid, clamped
+    /// to `owner`'s content frame (CTX-0803, the #1433 drag fix).
+    ///
+    /// Total inside the owner like [`Self::cursor_to_cell`] is total inside
+    /// the primary grid: a position anywhere on screen — over a sibling panel,
+    /// a gap band, the window padding, or outside the window entirely —
+    /// clamps to the nearest cell of `owner`'s own grid and can never name a
+    /// cell of another `View`. That is what confines a cross-panel drag to the
+    /// panel it started in.
+    ///
+    /// `None` only when `owner` has no present frame any more or owns no live
+    /// grid; callers then end the drag and drop the selection (fail closed).
+    pub(super) fn cursor_to_owner_cell(
+        &self,
+        owner: ViewId,
+        pos: CursorPosition,
+    ) -> Option<CellPos> {
+        let frames = self.present_frames();
+        let frame = frames.iter().find(|frame| frame.view == owner)?;
+        let local = self.clamped_frame_cell(frame, pos)?;
+        self.frame_cell_to_owner_cell(owner, frame.rows, local)
+    }
+
+    /// Owner and owner-grid cell for a selection press at `pos` (CTX-0803).
+    ///
+    /// The owner is the **hit** `View`, not the focused one, so `Shift`+press
+    /// selects in the panel under the pointer without moving focus. A press
+    /// that lands outside every frame (window padding or a gap band) falls
+    /// back to the focused `View` with the clamped mapping, which preserves
+    /// today's single-pane padding-press behavior.
+    ///
+    /// `None` when the resolved `View` owns no live grid (a session-less,
+    /// non-primary leaf): such a press selects nothing instead of selecting
+    /// in the primary grid.
+    pub(super) fn selection_press_target(&self, pos: CursorPosition) -> Option<(ViewId, CellPos)> {
+        // One solver pass for both the hit test and the frame geometry.
+        let frames = self.present_frames();
+        if let Some((view, local)) = self.present_cell_in(&frames, pos) {
+            let rows = frames
+                .iter()
+                .find(|frame| frame.view == view)
+                .map_or(0, |frame| frame.rows);
+            let cell = self.frame_cell_to_owner_cell(view, rows, local)?;
+            return Some((view, cell));
+        }
+        let focused = self.focused_view()?;
+        let frame = frames.iter().find(|frame| frame.view == focused)?;
+        let local = self.clamped_frame_cell(frame, pos)?;
+        let cell = self.frame_cell_to_owner_cell(focused, frame.rows, local)?;
+        Some((focused, cell))
+    }
+
+    /// Cell reported to the focused pane's app for a mouse event at `pos`
+    /// (CTX-0804, #1477).
+    ///
+    /// Mouse reports are routed to the focused pane (`push_input_bytes`), so
+    /// their coordinates are that pane's own grid cells. The pointer maps
+    /// into the focused View's content frame through the same clamped,
+    /// row-window-aware mapping the selection drag uses. A pointer outside
+    /// the frame clamps to the nearest edge cell (xterm drag semantics) and
+    /// never names a sibling pane's cell. The legacy primary-global
+    /// [`Self::cursor_to_cell`] remains only as the fallback when the focused
+    /// View has no present frame or no grid; bytes for such a leaf are
+    /// dropped by the router anyway.
+    pub(super) fn mouse_report_cell(&self, pos: CursorPosition) -> CellPos {
+        self.focused_view()
+            .and_then(|view| self.cursor_to_owner_cell(view, pos))
+            .unwrap_or_else(|| self.cursor_to_cell(pos))
+    }
+
+    /// URI of the OSC 8 hyperlink under `pos`, resolved in the grid of the
+    /// View under the pointer (CTX-0804, #1477).
+    ///
+    /// Uses the selection-press target rule ([`Self::selection_press_target`]:
+    /// the hit View, or the focused View for a padding or gap press), so a
+    /// click and a selection agree on which grid they address. Fails closed
+    /// when that View is scrolled into history: the live-grid cell is not
+    /// the cell on screen there, and activating it would open a link the
+    /// user cannot see.
+    pub(super) fn hyperlink_uri_at(&self, pos: CursorPosition) -> Option<String> {
+        let (view, cell) = self.selection_press_target(pos)?;
+        if self.view_scroll_offset(view) != 0 {
+            return None;
+        }
+        let state = self.live_view_state(view)?;
+        let snapshot = state.snapshot();
+        let index = usize::from(cell.row)
+            .checked_mul(snapshot.width)?
+            .checked_add(usize::from(cell.col))?;
+        let id = snapshot.cells.get(index)?.hyperlink?;
+        state.hyperlink_entry(id).map(|(_, uri)| uri.to_owned())
+    }
+
     /// Maps a physical cursor position to its leaf and leaf-local cell
     /// (CTX-0177).
     ///
     /// Unlike [`Self::cursor_to_cell`] (global, clamped, single-grid), this
     /// is leaf-aware: the window padding inset (CTX-0223) and the outer gap
     /// are subtracted in live pixels, the remainder is divided by the live
-    /// cell metrics (0157 math), the containing gapped allocation is
-    /// resolved, and the leaf origin is subtracted for the local cell.
+    /// cell metrics (0157 math), the topmost containing gapped allocation is
+    /// resolved in paint order (a visible float wins over the base leaf it
+    /// covers, matching [`Self::cursor_to_present_cell`]), and the leaf
+    /// origin is subtracted for the local cell.
     /// Positions over the padding band, a gap band (inner or outer), or
     /// outside all leaves yield `None`.
     ///
@@ -759,13 +988,28 @@ impl Runtime {
         if col < 0 || row < 0 || col > u16::MAX as i64 || row > u16::MAX as i64 {
             return None;
         }
-        let (id, rect) = self.layout_allocations().into_iter().find(|(_, r)| {
-            !r.is_empty()
-                && (col as u32) >= u32::from(r.x)
-                && (row as u32) >= u32::from(r.y)
-                && (col as u32) < r.right()
-                && (row as u32) < r.bottom()
-        })?;
+        // CTX-0803: resolve the *topmost* leaf under the pointer, in
+        // the same paint order as `present_frames` (stable by overlay tier,
+        // then solver order) and the selection press hit test. The solver
+        // lists a float's base leaves first, so a first-match lookup focused
+        // the base leaf painted *beneath* a visible float: a click on a float
+        // moved keyboard focus to the pane behind it, and the capture
+        // pre-focus stole focus from a mouse-tracking app in a focused float.
+        let tiers: std::collections::HashMap<ViewId, Option<OverlayTier>> =
+            self.layout.leaf_overlay_tiers().into_iter().collect();
+        let (_, id, rect) = self
+            .layout_allocations()
+            .into_iter()
+            .enumerate()
+            .filter(|(_, (_, r))| {
+                !r.is_empty()
+                    && (col as u32) >= u32::from(r.x)
+                    && (row as u32) >= u32::from(r.y)
+                    && (col as u32) < r.right()
+                    && (row as u32) < r.bottom()
+            })
+            .map(|(index, (id, rect))| (index, id, rect))
+            .max_by_key(|(index, id, _)| (tiers.get(id).copied().flatten(), *index))?;
         let local_col = (col as u16)
             .saturating_sub(rect.x)
             .min(rect.width.saturating_sub(1));
@@ -931,6 +1175,12 @@ impl Runtime {
         // CTX-0532: focus may have moved to a survivor or the new tree's
         // first leaf; attribute the input-mode caches to it.
         self.sync_mode_caches_to_focus();
+        // CTX-0803 (#1476): this is the layout-install funnel, so it covers
+        // close, zoom, and workspace switch. A selection whose owner is no
+        // longer a live leaf is dropped here rather than left addressing a
+        // grid that is gone; the primary re-home above is also observed,
+        // because a re-homed primary retires the old owner's grid.
+        self.invalidate_stale_view_bindings();
         self.pending_full_redraw = true;
     }
 

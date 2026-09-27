@@ -376,53 +376,76 @@ impl Runtime {
     /// cells underneath must not start a selection while hidden behind
     /// the bar.
     pub(super) fn status_bar_press(&mut self) -> bool {
-        if !self.workspaceline_visible {
-            return false;
-        }
         let Some(pos) = self.last_cursor else {
             return false;
         };
-        if !pos.x.is_finite() || !pos.y.is_finite() {
+        let Some(col) = self.status_bar_hit(pos) else {
             return false;
+        };
+        self.workspaceline_click(col);
+        true
+    }
+
+    /// Column of the drawn status bar band under `pos`
+    /// (pure probe behind [`Self::status_bar_press`]).
+    ///
+    /// Only the topmost frame under the pointer is considered, in the same
+    /// paint order as the present path and the selection press hit test: a
+    /// float painted over a base leaf's bar row hides that bar, so a press
+    /// there belongs to the float, not to the base leaf's chrome (#1481 made
+    /// floats present at their real bounds, which exposed this).
+    fn status_bar_hit(&self, pos: CursorPosition) -> Option<usize> {
+        if !self.workspaceline_visible {
+            return None;
+        }
+        if !pos.x.is_finite() || !pos.y.is_finite() {
+            return None;
         }
         let live = self.live_cell_metrics();
         if live.width == 0 || live.height == 0 {
-            return false;
+            return None;
         }
         let pad = f64::from(self.window_padding_physical());
         let cell_w = f64::from(live.width);
         let cell_h = f64::from(live.height);
-        for frame in self.present_frames() {
-            if frame.cols == 0 || frame.rows == 0 {
-                continue;
-            }
-            // Mirror the overlay skip in present.rs: no bar is drawn on the
-            // alternate screen (a fullscreen app owns every row there), so a
-            // press there must fall through instead of hitting chrome.
-            let leaf_on_alt = match self.pane_sessions.get(&frame.view) {
-                Some(sess) => sess.state.alt_screen_active(),
-                None => self.state.alt_screen_active(),
-            };
-            if leaf_on_alt {
-                continue;
-            }
-            let Some(bar) = self.status_bar_row(usize::from(frame.rows)) else {
-                continue;
-            };
-            let origin_x = pad + f64::from(frame.content.x.max(0));
-            let origin_y = pad + f64::from(frame.content.y.max(0)) + (bar as f64) * cell_h;
-            let band_w = f64::from(frame.cols) * cell_w;
-            if pos.x >= origin_x
-                && pos.x < origin_x + band_w
-                && pos.y >= origin_y
-                && pos.y < origin_y + cell_h
-            {
-                let col = ((pos.x - origin_x) / cell_w).floor() as usize;
-                self.workspaceline_click(col);
-                return true;
-            }
+        let frames = self.present_frames();
+        let frame = frames.iter().rev().find(|frame| {
+            let rect = frame.frame;
+            let left = pad + f64::from(rect.x);
+            let top = pad + f64::from(rect.y);
+            rect.width > 0
+                && rect.height > 0
+                && pos.x >= left
+                && pos.x < left + f64::from(rect.width)
+                && pos.y >= top
+                && pos.y < top + f64::from(rect.height)
+        })?;
+        if frame.cols == 0 || frame.rows == 0 {
+            return None;
         }
-        false
+        // Mirror the overlay skip in present.rs: no bar is drawn on the
+        // alternate screen (a fullscreen app owns every row there), so a
+        // press there must fall through instead of hitting chrome.
+        let leaf_on_alt = match self.pane_sessions.get(&frame.view) {
+            Some(sess) => sess.state.alt_screen_active(),
+            None => self.state.alt_screen_active(),
+        };
+        if leaf_on_alt {
+            return None;
+        }
+        let bar = self.status_bar_row(usize::from(frame.rows))?;
+        let origin_x = pad + f64::from(frame.content.x.max(0));
+        let origin_y = pad + f64::from(frame.content.y.max(0)) + (bar as f64) * cell_h;
+        let band_w = f64::from(frame.cols) * cell_w;
+        if pos.x >= origin_x
+            && pos.x < origin_x + band_w
+            && pos.y >= origin_y
+            && pos.y < origin_y + cell_h
+        {
+            let col = ((pos.x - origin_x) / cell_w).floor() as usize;
+            return Some(col);
+        }
+        None
     }
 
     /// Rename workspace `index` (0-based) to `name`.
@@ -589,6 +612,12 @@ impl Runtime {
         // CTX-0532: the loaded slot's focus is a focus transition; attribute
         // the input-mode caches to it before any input can arrive.
         self.sync_mode_caches_to_focus();
+        // CTX-0803/CTX-0805: a slot swap is a layout install that bypasses
+        // `replace_layout`, so it runs the View-binding funnel itself: a
+        // selection, copy mode, or search bound to a View this slot hides is
+        // dropped instead of lingering behind the read guard (and resurfacing
+        // on a switch back).
+        self.invalidate_stale_view_bindings();
     }
 
     /// Front an index in the MRU (each live index exactly once).
@@ -644,6 +673,9 @@ impl Runtime {
         // CTX-0536 (#923): record the fresh id so its later retirement can
         // never fall back below the monotonic high-water mark.
         self.raise_view_id_high_water();
+        // CTX-0803/CTX-0805: the fresh slot is a direct layout install; drop
+        // bindings to Views it hides (see `load_slot`).
+        self.invalidate_stale_view_bindings();
         // CTX-0532: a brand-new slot's leaf starts focused; attribute the
         // input-mode caches to it before any pane spawn/output path runs.
         self.sync_mode_caches_to_focus();
@@ -883,6 +915,9 @@ impl Runtime {
         if let Some(owner) = self.primary_view {
             if !self.live_view_raws().contains(&owner.0) {
                 self.primary_view = self.focus.focused();
+                // CTX-0803 (#1476): primary ownership just moved off a dead
+                // id; a selection still owned by it is dropped.
+                self.invalidate_stale_view_bindings();
                 self.sync_primary_geometry();
                 // CTX-0501: the re-homed leaf may still carry a pending
                 // restore. Primary ownership supersedes the pane spawn — the
@@ -1077,6 +1112,9 @@ impl Runtime {
         // is loaded), so re-sync the active source before presenting again.
         self.sync_primary_geometry();
         self.sync_pane_geometry();
+        // CTX-0803/CTX-0805: the moved leaf left the live layout directly;
+        // bindings to it (selection, copy mode, search) are dropped.
+        self.invalidate_stale_view_bindings();
         self.pending_full_redraw = true;
         Ok(focused)
     }

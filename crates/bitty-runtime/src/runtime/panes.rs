@@ -122,6 +122,11 @@ impl Runtime {
             program.to_string(),
             args.iter().map(|arg| (*arg).to_string()).collect(),
         ));
+        // CTX-0803 (#1476): primary ownership may just have moved to the
+        // focused leaf. A selection owned by the previous owner now resolves
+        // to no grid, so it is dropped here rather than left for the read
+        // guard.
+        self.invalidate_stale_view_bindings();
         // If a waker is already installed (respawn after `set_pty_waker`),
         // promote immediately so the new child wakes the loop too.
         if self.pty_waker.is_some() {
@@ -326,6 +331,11 @@ impl Runtime {
         // focused leaf, the cached/reader state must read its register, not
         // a previous pane's. No-op when another pane is focused.
         self.sync_mode_caches_to_focus();
+        // CTX-0803 (#1476): a respawn replaced this leaf's grid, so a
+        // selection owned by it addresses cells of a grid that no longer
+        // exists. Dropping it is the only honest option (the new grid has no
+        // equivalent range).
+        self.drop_view_bindings_for(view);
         self.pending_full_redraw = true;
         Ok(())
     }
@@ -492,6 +502,9 @@ impl Runtime {
         // consult `focused_modes` directly and fall back to the primary
         // register for a now-session-less focused leaf.
         self.sync_mode_caches_to_focus();
+        // CTX-0803 (#1476): the grid a selection owned by this leaf addressed
+        // is gone. Drop it rather than let it fall back to the primary grid.
+        self.drop_view_bindings_for(*view);
         self.pending_full_redraw = true;
         true
     }
@@ -652,6 +665,27 @@ impl Runtime {
         self.sync_mode_caches_to_focus();
     }
 
+    /// View whose grid the output pipeline is feeding right now (CTX-0805).
+    ///
+    /// [`Self::handle_pane_bytes`] swaps the pane's grid into the primary
+    /// slot and tags the drain with that pane's origin token, so inside the
+    /// shared `handle_pty_bytes_inner` pipeline `self.state` is the pane's
+    /// grid. Outside a pane drain the pipeline feeds the primary grid, owned
+    /// by `primary_view`. View-bound consumers (selection, search) use this
+    /// to react only to output on the grid they address.
+    pub(super) fn fed_grid_view(&self) -> Option<ViewId> {
+        match self.kitty_origin {
+            Some(raw) => Some(ViewId::new(raw)),
+            // Same precedence as `selection::grid_of`: a primary owner that
+            // also holds a pane session (re-homed onto a split leaf) reads
+            // that session's grid, so the primary drain feeds a grid no View
+            // resolves to and must not name the owner.
+            None => self
+                .primary_view
+                .filter(|view| !self.pane_sessions.contains_key(view)),
+        }
+    }
+
     /// Flushes one pane's queued terminal replies (DA/DECRQM/XTGETTCAP,
     /// OSC 52 read answers) to that pane's own PTY master.
     ///
@@ -701,6 +735,15 @@ impl Runtime {
             Some(sess) => sess.state.modes(),
             None => self.state.modes(),
         }
+    }
+
+    /// Whether leaf `view`'s app tracks the mouse, with the same attribution
+    /// rule as [`Self::focused_modes`] (CTX-0804): the leaf's own session
+    /// modes, else the primary grid's modes when `view` is the primary owner.
+    /// A session-less, non-primary leaf runs no app, so it tracks nothing.
+    pub(super) fn view_tracks_mouse(&self, view: ViewId) -> bool {
+        self.session_state_for(view)
+            .is_some_and(|state| state.modes().mouse_tracking.is_some())
     }
 
     /// Whether the focused pane's grid is on the alternate screen.

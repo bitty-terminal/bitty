@@ -453,30 +453,37 @@ impl Runtime {
         // CTX-0176: the container moved, so every pane session's grid +
         // PTY winsize follows its leaf (primary state/PTY handled below).
         self.sync_pane_geometry();
-        // Clamp selection to new snapshot bounds (keeps invariants after reflow;
-        // wide-char snapping is preserved). Headless so deterministic.
-        if let Some(sel) = self.selection {
-            let snap = self.state.snapshot();
-            let clamped = sel.clamped(&snap).snapped(Some(&snap));
-            if clamped.is_empty() {
-                self.selection = None;
-                self.selection_dragging = false;
-                self.selection_anchor_press = None;
-            } else {
-                self.selection = Some(clamped);
-                // Keep the drag pin in bounds for future word/line extension.
-                if let Some(pin) = self.selection_anchor_press {
-                    let max_row = snap.height.saturating_sub(1) as u16;
-                    let max_col = snap.width.saturating_sub(1) as u16;
-                    self.selection_anchor_press =
-                        Some(CellPos::new(pin.row.min(max_row), pin.col.min(max_col)));
+        // Clamp selection to the owner's new snapshot bounds (keeps
+        // invariants after reflow; wide-char snapping is preserved). Headless
+        // so deterministic. CTX-0803 (#1476): the bound is the *owner's* grid,
+        // not the primary grid — a split pane's selection is reclamped against
+        // that pane. A selection whose owner is no longer live is dropped by
+        // the fail-closed guard.
+        if let Some(sel) = self.selection_state {
+            match self.live_view_state(sel.owner) {
+                Some(state) => {
+                    let snap = state.snapshot();
+                    let clamped = sel.selection.clamped(&snap).snapped(Some(&snap));
+                    if clamped.is_empty() {
+                        self.drop_selection();
+                    } else {
+                        // Keep the drag pin in bounds for future word/line
+                        // extension.
+                        let max_row = snap.height.saturating_sub(1) as u16;
+                        let max_col = snap.width.saturating_sub(1) as u16;
+                        let pin = sel
+                            .anchor_press
+                            .map(|pin| CellPos::new(pin.row.min(max_row), pin.col.min(max_col)));
+                        self.install_selection(sel.owner, clamped, pin, sel.dragging);
+                    }
                 }
+                None => self.drop_selection(),
             }
         }
         // Search UI integration (CTX-0061): clamp matches to new geometry; refresh
         // is bounded and deterministic. Keeps current index clamped.
         if self.search_state.is_active() {
-            self.search_state.refresh(&self.state);
+            self.search_refresh();
         }
         // Surface resize: real GPU path when attached, else headless
         if let Some(gpu) = self.gpu.as_ref() {
@@ -553,32 +560,28 @@ impl Runtime {
                             if self.scrollbar_hit_at(pos) {
                                 return false;
                             }
-                            let cell = self.cursor_to_cell(pos);
-                            let snapshot = self.state.snapshot();
-                            let Some(index) = (cell.row as usize)
-                                .checked_mul(snapshot.width)
-                                .and_then(|base| base.checked_add(cell.col as usize))
-                            else {
+                            // CTX-0804 (#1477): resolve the link in the grid of
+                            // the View under the pointer (same target rule as a
+                            // selection press), never the primary grid at a
+                            // primary-global cell: in a split that armed a URL
+                            // from another pane than the one clicked.
+                            let Some(uri) = self.hyperlink_uri_at(pos) else {
                                 return false;
                             };
-                            if let Some(id) = snapshot.cells.get(index).and_then(|c| c.hyperlink) {
-                                if let Some((_, uri)) = self.state.hyperlink_entry(id) {
-                                    let is_safe = if uri.starts_with("file:") {
-                                        bitty_platform::validate_file_url(uri).is_ok()
-                                    } else {
-                                        bitty_platform::validate_url(uri).is_ok()
-                                    };
-                                    if is_safe {
-                                        let token = ActivationGesture(self.next_activation_gesture);
-                                        self.next_activation_gesture =
-                                            self.next_activation_gesture.wrapping_add(1).max(1);
-                                        self.pending_activation_gesture = Some(token);
-                                        // CTX-0577: bind the exact URI to the
-                                        // gesture so the live consumer cannot
-                                        // be handed a substitute target.
-                                        self.pending_activation_uri = Some(uri.to_owned());
-                                    }
-                                }
+                            let is_safe = if uri.starts_with("file:") {
+                                bitty_platform::validate_file_url(&uri).is_ok()
+                            } else {
+                                bitty_platform::validate_url(&uri).is_ok()
+                            };
+                            if is_safe {
+                                let token = ActivationGesture(self.next_activation_gesture);
+                                self.next_activation_gesture =
+                                    self.next_activation_gesture.wrapping_add(1).max(1);
+                                self.pending_activation_gesture = Some(token);
+                                // CTX-0577: bind the exact URI to the
+                                // gesture so the live consumer cannot
+                                // be handed a substitute target.
+                                self.pending_activation_uri = Some(uri);
                             }
                         }
                     }
@@ -590,15 +593,7 @@ impl Runtime {
                 }
                 WindowEventKind::CursorLeft => {
                     // Cursor left window: end drag if active (deterministic).
-                    if self.selection_dragging {
-                        self.selection_dragging = false;
-                        self.selection_anchor_press = None;
-                        self.click_tracker.reset();
-                        if let Some(mut sel) = self.selection {
-                            sel.active = false;
-                            self.selection = Some(sel);
-                        }
-                    }
+                    self.end_selection_drag_in_place();
                     // CTX-0181: leaving the window ends a thumb drag and
                     // disengages auto-hide (tracked separately from
                     // `last_cursor`, whose selection-path meaning is kept).

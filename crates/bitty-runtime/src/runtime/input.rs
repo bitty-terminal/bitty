@@ -703,7 +703,7 @@ impl Runtime {
         if event.state == PressState::Pressed
             && !event.is_synthetic
             && !is_modifier
-            && self.selection.is_some()
+            && self.selection_state.is_some()
         {
             self.clear_selection();
         }
@@ -829,7 +829,7 @@ impl Runtime {
         if event.state == PressState::Pressed
             && !event.is_synthetic
             && !is_modifier
-            && self.selection.is_some()
+            && self.selection_state.is_some()
         {
             self.clear_selection();
         }
@@ -1149,6 +1149,12 @@ impl Runtime {
         }
         // Shift override always forces selection path.
         let shift_override = self.shift_pressed;
+        // CTX-0804 (#1477): a left press on another pane is a focus choice
+        // first when a mouse-tracking app is involved, so the capture
+        // decision below reads the pane the click landed on.
+        if event.button == MouseButton::Left && event.state == PressState::Pressed {
+            self.focus_pointer_pane_before_capture();
+        }
         // CTX-0532: capture decision reads the focused pane's modes (primary
         // fallback for session-less leaves) — a focus change with no pump
         // must never capture with the previous pane's tracking/encoding.
@@ -1162,7 +1168,9 @@ impl Runtime {
 
         if capture {
             if let Some(pos) = self.last_cursor {
-                let cell = self.cursor_to_cell(pos);
+                // CTX-0804 (#1477): pane-local cell of the focused pane that
+                // receives the report, never the primary-global mapping.
+                let cell = self.mouse_report_cell(pos);
                 let format = super::mouse_encode::MouseFormat::from_encoding(
                     focused_modes.mouse_coordinate_encoding,
                 );
@@ -1181,7 +1189,7 @@ impl Runtime {
             // CTX-0166: a captured click must still dismiss any stale
             // highlight so the gray rect never lingers while a mouse-mode app
             // owns the pointer. Additive clearing only; range logic untouched.
-            if self.selection.is_some() {
+            if self.selection_state.is_some() {
                 self.clear_selection();
             }
             return;
@@ -1271,7 +1279,20 @@ impl Runtime {
                     // suppresses focus so Shift+click selects without
                     // stealing focus, coherent with the hover path.
                     self.click_focus_at(pos);
-                    let cell = self.cursor_to_cell(pos);
+                    // CTX-0803 (#1476): the selection owner is the *hit*
+                    // View and the cell is in that View's own grid, so
+                    // Shift+press selects in the panel under the pointer
+                    // without moving focus, and a press in a split never
+                    // addresses the primary grid. A press outside every
+                    // frame (padding / gap band) falls back to the focused
+                    // View with the clamped mapping.
+                    let Some((owner, cell)) = self.selection_press_target(pos) else {
+                        // No live grid under (or focused behind) the pointer:
+                        // select nothing rather than the primary grid.
+                        self.clear_selection();
+                        self.click_tracker.reset();
+                        return;
+                    };
                     // CTX-0385: the tracker is the click-count authority
                     // (wire `click_count` is advisory); non-left buttons
                     // already returned above, so only left chains here.
@@ -1280,34 +1301,37 @@ impl Runtime {
                     // `Alt`+press starts a rectangular block when the press
                     // was not consumed as a float move above (tiled layouts
                     // fall through here); Shift does not suppress it.
-                    if self.alt_pressed {
-                        self.start_block_selection(cell);
+                    let kind = if self.alt_pressed {
+                        SelectionKind::Block
                     } else if count == 2 {
-                        self.start_word_selection(cell);
+                        SelectionKind::Word
                     } else if count >= super::click::CLICK_COUNT_MAX {
-                        self.start_line_selection(cell);
+                        SelectionKind::Line
                     } else {
-                        self.start_selection(cell);
-                    }
-                } else if self.selection.is_some() {
+                        SelectionKind::Simple
+                    };
+                    self.start_view_selection(owner, kind, cell);
+                } else if self.selection_state.is_some() {
                     // CTX-0166: click without cursor tracking still dismisses
                     // the highlight (no stale rect when `last_cursor` is None).
                     self.clear_selection();
                 }
             }
             (MouseButton::Left, PressState::Released) => {
-                if let Some(pos) = self.last_cursor {
-                    let cell = self.cursor_to_cell(pos);
-                    self.end_selection(cell);
-                } else {
-                    self.selection_dragging = false;
-                    self.selection_anchor_press = None;
-                    self.click_tracker.reset();
-                    if let Some(mut sel) = self.selection {
-                        sel.active = false;
-                        self.selection = Some(sel);
-                    }
-                    self.pending_full_redraw = true;
+                // CTX-0803 (#1476): the release maps into the *owner's*
+                // content frame, clamped. The mapping is total inside the
+                // owner, so a release over a sibling panel commits at the
+                // owner's edge instead of leaking a foreign cell (#1433).
+                let release_cell = self
+                    .last_cursor
+                    .zip(self.selection_owner())
+                    .and_then(|(pos, owner)| self.cursor_to_owner_cell(owner, pos));
+                match release_cell {
+                    Some(cell) => self.end_selection(cell),
+                    // No tracked cursor, no selection, or the owner lost its
+                    // present frame: end the drag in place (the owner-stale
+                    // case is dropped by the read guard).
+                    None => self.end_selection_drag_in_place(),
                 }
                 // Copy-on-select is opt-in (CTX-0191/CTX-0371; default off,
                 // matching kitty/ghostty): when enabled, a committed drag
@@ -1379,10 +1403,22 @@ impl Runtime {
         if self.scrollbar_should_paint() != self.scrollbar_visible {
             self.pending_full_redraw = true;
         }
-        if self.selection_dragging {
+        if self.is_selection_dragging() {
             self.clear_hover_pending();
-            let cell = self.cursor_to_cell(pos);
-            self.update_selection(cell);
+            // CTX-0803 (#1476/#1433): motion maps into the *owner's* content
+            // frame, clamped, so a drag that leaves the owning panel stops at
+            // its edge and never selects a sibling's cell. An owner that lost
+            // its present frame ends the drag and drops the selection.
+            match self
+                .selection_owner()
+                .and_then(|owner| self.cursor_to_owner_cell(owner, pos))
+            {
+                Some(cell) => self.update_selection(cell),
+                // The owner lost its present frame mid-drag: end the drag and
+                // drop the selection rather than extend it against a frame
+                // that is no longer painted (fail closed).
+                None => self.clear_selection(),
+            }
             return;
         }
         // CTX-0260: an active Alt+drag consumes motion (it moves the
@@ -1415,7 +1451,7 @@ impl Runtime {
             let format = super::mouse_encode::MouseFormat::from_encoding(
                 focused_modes.mouse_coordinate_encoding,
             );
-            let cell = self.cursor_to_cell(pos);
+            let cell = self.mouse_report_cell(pos);
             // Motion reports carry the "no button" code (`3`); the motion
             // flag adds the `+32` motion bit in every encoding.
             let report = super::mouse_encode::MouseReport {
@@ -1559,7 +1595,7 @@ impl Runtime {
                     let modifiers = self.mouse_modifier_bits();
                     let (col, row) = match self.last_cursor {
                         Some(pos) => {
-                            let cell = self.cursor_to_cell(pos);
+                            let cell = self.mouse_report_cell(pos);
                             (cell.col, cell.row)
                         }
                         None => (0, 0),
@@ -1910,7 +1946,7 @@ impl Runtime {
         // CTX-0166: IME commit is typing — dismiss the highlight first so the
         // rect never lingers a frame past the state. `clear_selection` forces
         // the next tick to present; the final flag below keeps that promise.
-        if self.selection.is_some() {
+        if self.selection_state.is_some() {
             self.clear_selection();
         }
         // IME commit shares PTY write queue with keyboard (bounded 8192)

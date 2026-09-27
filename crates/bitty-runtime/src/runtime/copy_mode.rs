@@ -10,9 +10,10 @@
 //!   and kind. The cursor lives in *cursor-space* snapshot coordinates
 //!   and is always clamped plus wide-snapped, so every motion is total
 //!   over all inputs.
-//! - Cursor space is the live grid while the focused view is live, and
-//!   the focused viewport (scrollback history composited with the live
-//!   grid via `View::visible_cells`) while it is scrolled into history
+//! - Cursor space is the live grid of the View copy mode is bound to
+//!   (the focused View at entry, CTX-0805) while that View is live, and its
+//!   viewport (scrollback history composited with the live grid via
+//!   `View::visible_cells`) while it is scrolled into history
 //!   (M1-15, CTX-0665): the same motions drive both, so history rows are
 //!   navigable and selectable with the keyboard, and yank reads the
 //!   visible buffer text. While scrolled the live-grid `selection` stays
@@ -80,42 +81,74 @@ struct CopySpace {
 }
 
 impl Runtime {
+    /// Grid the active copy mode walks (CTX-0805, #1478): the live grid of
+    /// the View bound at entry, never the primary grid by assumption.
+    ///
+    /// Copy mode only runs while that grid is live: `enter_copy_mode`
+    /// fails closed without one, the lifecycle funnels end copy mode when
+    /// the binding goes stale, and every key re-validates first. The primary
+    /// fallback is therefore unreachable in practice; it only keeps the
+    /// motion helpers total.
+    fn copy_state(&self) -> &State {
+        self.copy_mode_view
+            .and_then(|view| self.live_view_state(view))
+            .unwrap_or(&self.state)
+    }
+
+    /// Leaf of the View copy mode is bound to, if still in the layout.
+    fn copy_view(&self) -> Option<&View> {
+        self.copy_mode_view.and_then(|id| self.layout.find_leaf(id))
+    }
+
+    /// Whether the bound copy-mode View still resolves to a live grid.
+    fn copy_binding_live(&self) -> bool {
+        self.copy_mode_view
+            .is_some_and(|view| self.live_view_state(view).is_some())
+    }
+
+    /// Installs a copy-mode visual as the live selection, owned by the View
+    /// copy mode walks (CTX-0805).
+    fn set_copy_selection(&mut self, selection: Selection) {
+        match self.copy_mode_view {
+            Some(view) => self.install_selection(view, selection, None, false),
+            None => self.drop_selection(),
+        }
+    }
+
     /// Whether the copy cursor currently addresses scrolled history
-    /// (focused view offset nonzero and resolvable).
+    /// (bound view offset nonzero and resolvable).
     fn is_copy_space_scrolled(&self) -> bool {
-        self.focused_view()
-            .and_then(|id| self.layout.find_leaf(id))
+        self.copy_view()
             .is_some_and(|view| view.scroll_offset() != 0)
     }
 
     /// Builds the cursor-space snapshot for copy motions.
     fn copy_space(&self) -> CopySpace {
-        if let Some(id) = self.focused_view() {
-            if let Some(view) = self.layout.find_leaf(id) {
-                if view.scroll_offset() != 0 {
-                    let rows = view.rows() as usize;
-                    let cols = view.cols() as usize;
-                    if rows > 0 && cols > 0 {
-                        let sb_len = self.state.scrollback_len();
-                        let total = sb_len + self.state.height();
-                        let offset = view.scroll_offset().min(sb_len);
-                        let origin = total.saturating_sub(rows).saturating_sub(offset);
-                        let mut snapshot = self.state.snapshot();
-                        snapshot.width = cols;
-                        snapshot.height = rows;
-                        snapshot.cells = view.visible_cells(&self.state);
-                        return CopySpace {
-                            snapshot,
-                            origin,
-                            col_origin: view.col_offset() as usize,
-                        };
-                    }
+        let state = self.copy_state();
+        if let Some(view) = self.copy_view() {
+            if view.scroll_offset() != 0 {
+                let rows = view.rows() as usize;
+                let cols = view.cols() as usize;
+                if rows > 0 && cols > 0 {
+                    let sb_len = state.scrollback_len();
+                    let total = sb_len + state.height();
+                    let offset = view.scroll_offset().min(sb_len);
+                    let origin = total.saturating_sub(rows).saturating_sub(offset);
+                    let mut snapshot = state.snapshot();
+                    snapshot.width = cols;
+                    snapshot.height = rows;
+                    snapshot.cells = view.visible_cells(state);
+                    return CopySpace {
+                        snapshot,
+                        origin,
+                        col_origin: view.col_offset() as usize,
+                    };
                 }
             }
         }
         CopySpace {
-            snapshot: self.state.snapshot(),
-            origin: self.state.scrollback_len(),
+            snapshot: state.snapshot(),
+            origin: state.scrollback_len(),
             col_origin: 0,
         }
     }
@@ -174,10 +207,19 @@ impl Runtime {
         if self.search_mode {
             self.exit_search_mode();
         }
-        let term = self.state.snapshot().cursor.position;
+        // CTX-0805 (#1478): bind to the focused View's own grid for the whole
+        // session. A focused leaf that owns no grid cannot enter (fail closed).
+        let Some(view) = self.focused_view() else {
+            return;
+        };
+        if self.live_view_state(view).is_none() {
+            return;
+        }
+        self.copy_mode_view = Some(view);
+        let term = self.copy_state().snapshot().cursor.position;
         let space = self.copy_space();
         let snap = &space.snapshot;
-        let buf_row = self.state.scrollback_len() + term.row as usize;
+        let buf_row = self.copy_state().scrollback_len() + term.row as usize;
         let rel = buf_row
             .saturating_sub(space.origin)
             .min(snap.height.saturating_sub(1)) as u16;
@@ -200,9 +242,8 @@ impl Runtime {
             return;
         }
         self.copy_mode = None;
-        self.selection = None;
-        self.selection_dragging = false;
-        self.selection_anchor_press = None;
+        self.copy_mode_view = None;
+        self.drop_selection();
         self.pending_full_redraw = true;
     }
 
@@ -220,6 +261,11 @@ impl Runtime {
     /// copy mode so the user can adjust).
     pub fn copy_mode_yank(&mut self) -> Option<String> {
         self.copy_mode?;
+        if !self.copy_binding_live() {
+            // CTX-0805: the bound View lost its grid; nothing to yank from.
+            self.exit_copy_mode();
+            return None;
+        }
         if self.is_copy_space_scrolled() {
             return self.copy_mode_yank_viewport();
         }
@@ -273,6 +319,14 @@ impl Runtime {
         use bitty_platform::{LogicalKey, NamedKey, PressState};
         if self.copy_mode.is_none() {
             return false;
+        }
+        // CTX-0805 (#1478): copy mode walks the grid of the View bound at
+        // entry. If that grid is gone (pane closed or respawned without a
+        // lifecycle funnel observing it), end the session instead of moving
+        // a cursor over another grid; the key is consumed.
+        if !self.copy_binding_live() {
+            self.exit_copy_mode();
+            return true;
         }
         // Releases and synthetic events produce no PTY bytes anyway; consume
         // them so copy mode stays modal until an explicit exit/yank.
@@ -406,9 +460,7 @@ impl Runtime {
         };
         if mode.visual_kind == Some(kind) {
             self.copy_mode = Some(CopyModeState::new(mode.cursor));
-            self.selection = None;
-            self.selection_dragging = false;
-            self.selection_anchor_press = None;
+            self.drop_selection();
             self.pending_full_redraw = true;
             return;
         }
@@ -433,12 +485,12 @@ impl Runtime {
         // there (the visual survives in `CopyModeState` for yank).
         let scrolled = self.is_copy_space_scrolled();
         if selection.anchor == selection.focus || scrolled {
-            self.selection = None;
+            self.drop_selection();
         } else {
-            self.selection = Some(selection);
+            // CTX-0805 (#1478): the visual addresses the grid copy mode
+            // walks, so it is owned by the bound View.
+            self.set_copy_selection(selection);
         }
-        self.selection_dragging = false;
-        self.selection_anchor_press = None;
         self.pending_full_redraw = true;
     }
 
@@ -467,13 +519,13 @@ impl Runtime {
         let Some(anchor) = mode.anchor else {
             self.copy_mode = Some(CopyModeState::new(cursor));
             // Cursor-only motion clears any stale highlight.
-            self.selection = None;
+            self.drop_selection();
             self.pending_full_redraw = true;
             return;
         };
         let Some(kind) = mode.visual_kind else {
             self.copy_mode = Some(CopyModeState::new(cursor));
-            self.selection = None;
+            self.drop_selection();
             self.pending_full_redraw = true;
             return;
         };
@@ -491,12 +543,12 @@ impl Runtime {
         // live selection stays clear (same rationale as the visual
         // toggle above); the visual survives in `CopyModeState`.
         if selection.anchor == selection.focus || self.is_copy_space_scrolled() {
-            self.selection = None;
+            self.drop_selection();
         } else {
             let clamped = selection.clamped(snap).snapped(Some(snap));
-            self.selection = Some(clamped);
+            // CTX-0805: bound-grid coordinates, so owned by the bound View.
+            self.set_copy_selection(clamped);
         }
-        self.selection_dragging = false;
         self.pending_full_redraw = true;
     }
 
@@ -512,18 +564,19 @@ impl Runtime {
         let Some(mode) = self.copy_mode else {
             return;
         };
-        let total = self.state.scrollback_len() + self.state.height();
+        let total = self.copy_state().scrollback_len() + self.copy_state().height();
         if total == 0 {
             return;
         }
         let space = self.copy_space();
         let buf = space.origin + mode.cursor.row as usize;
         let new_buf = (buf as isize + dir * page).clamp(0, total as isize - 1) as usize;
-        // Follow with the focused viewport when the target leaves it.
-        if let Some(id) = self.focused_view() {
+        // Follow with the bound viewport when the target leaves it
+        // (CTX-0805: the View copy mode walks, not whichever is focused).
+        let max = self.copy_state().scrollback_len();
+        if let Some(id) = self.copy_mode_view {
             if let Some(view) = self.layout.find_leaf_mut(id) {
                 let rows = view.rows() as usize;
-                let max = self.state.scrollback_len();
                 if rows > 0 {
                     let offset = view.scroll_offset().min(max);
                     let start = total.saturating_sub(rows).saturating_sub(offset);
@@ -554,17 +607,15 @@ impl Runtime {
         self.pending_full_redraw = true;
     }
 
-    /// Page size: focused view rows when available, else snapshot height.
+    /// Page size: bound view rows when available, else snapshot height.
     fn copy_mode_page_rows(&self) -> usize {
-        if let Some(id) = self.focused_view() {
-            if let Some(view) = self.layout.find_leaf(id) {
-                let rows = usize::from(view.rows());
-                if rows > 0 {
-                    return rows;
-                }
+        if let Some(view) = self.copy_view() {
+            let rows = usize::from(view.rows());
+            if rows > 0 {
+                return rows;
             }
         }
-        self.state.snapshot().height.max(1)
+        self.copy_state().snapshot().height.max(1)
     }
 
     /// Jump to the first row, first column.

@@ -205,7 +205,14 @@ fn golden_selection_overlay() {
     let _ = rt.tick().expect("grid present");
     rt.select_all();
     let selected = rt.tick().expect("selection present");
-    assert_digest("selection", &rt, &selected, 0x432d_c85e_7ada_e793);
+    // Re-recorded under CTX-0803 (#1476): the selection highlight is now
+    // clipped to the owner's content frame. This fixture's grid is 80x24 while
+    // its decorated content frame is 77x22, so the pre-CTX-0803 paint built
+    // fill rects for the full grid and spilled three columns and two rows of
+    // highlight past the frame into the decoration band. The frame-clipped
+    // paint is the intended behavior change; the rest of the matrix is
+    // byte-identical.
+    assert_digest("selection", &rt, &selected, 0x2d1f_7aea_3288_2366);
 }
 
 #[test]

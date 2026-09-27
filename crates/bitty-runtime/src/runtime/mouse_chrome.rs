@@ -103,8 +103,9 @@ impl Runtime {
             return false;
         };
         // Topmost hit-test (paint order): overlapping floats own the cursor
-        // over the base layer. The shared `cursor_to_leaf_cell` returns the
-        // first (base) match, which would never grab a visible float.
+        // over the base layer. The grab anchors in the primary-global cell
+        // space `update_alt_drag` measures its deltas in, so it resolves the
+        // leaf from that cell rather than through `cursor_to_leaf_cell`.
         let anchor = self.cursor_to_cell(cursor);
         let leaf = self
             .layout_allocations()
@@ -390,6 +391,60 @@ impl Runtime {
         // pending hover dwell, so hover can never override it.
         self.set_focus(id);
         true
+    }
+
+    /// Whether `pos` lies on a split handle (divider) of the active layout.
+    ///
+    /// Pure twin of the hit test inside [`Self::begin_border_drag`], used by
+    /// the capture pre-focus (CTX-0804) so a divider press never moves focus.
+    fn pointer_on_split_handle(&self, pos: CursorPosition) -> bool {
+        self.cursor_to_layout_point(pos).is_some_and(|point| {
+            !self
+                .layout
+                .hit_test_split_handles(self.container, self.gaps(), point)
+                .is_empty()
+        })
+    }
+
+    /// Capture-aware click-to-focus (CTX-0804, #1477).
+    ///
+    /// Mouse reports route to the focused pane, and the capture decision
+    /// reads the focused pane's modes. Without this step, a left press on
+    /// another pane while a mouse-tracking app (vim, htop, yazi) held focus
+    /// was reported to that app at clamped coordinates, and focus could
+    /// never leave it by clicking. Conversely, a press on a capturing pane
+    /// while a plain pane was focused started a selection instead of
+    /// reaching the app.
+    ///
+    /// When either the focused pane or the pane under the pointer tracks
+    /// the mouse, a left press on a *different* leaf moves focus first
+    /// through [`Self::click_focus_at`]. The caller then re-evaluates
+    /// capture against the newly focused pane, so the click reaches the
+    /// pane it landed on. Nothing changes when no pane involved tracks the
+    /// mouse (the selection path's own click-to-focus stays authoritative),
+    /// under Shift or Alt (selection and float-move escapes), over a gap
+    /// band, or on a split handle (a divider owns no leaf).
+    pub(super) fn focus_pointer_pane_before_capture(&mut self) {
+        if self.shift_pressed || self.alt_pressed {
+            return;
+        }
+        let Some(pos) = self.last_cursor else {
+            return;
+        };
+        let Some((hit, _)) = self.cursor_to_leaf_cell(pos) else {
+            return;
+        };
+        if Some(hit) == self.focus.focused() {
+            return;
+        }
+        let hit_tracks = self.view_tracks_mouse(hit);
+        if !hit_tracks && !self.should_capture_mouse() {
+            return;
+        }
+        if self.pointer_on_split_handle(pos) {
+            return;
+        }
+        let _ = self.click_focus_at(pos);
     }
 
     /// Dwell-delay-aware hover activation (CTX-0334 virtual-clock seam).

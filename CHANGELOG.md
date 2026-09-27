@@ -7,6 +7,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Text selection is View-owned (CTX-0803, #1476, #1433):** the runtime kept
+  one global selection that worked only against the primary grid. The pointer
+  mapped through the primary-global `cursor_to_cell`, which subtracts no leaf
+  origin. Text extraction and clamping read the primary grid. The highlight
+  painted at the focused View's frame. In a split, a drag leaked across
+  panels, copied the wrong pane's text, and painted in the wrong frame.
+
+  The selection now carries the `ViewId` that owns it: at most one live
+  selection, owned by exactly one View.
+  - Press hit-tests the visible frame under the pointer (topmost overlay
+    first) and maps into the owner's own grid.
+  - Drag and release clamp to the owner's content frame, so a cross-panel
+    drag stops at the owner's edge.
+  - `Shift`+press selects in the hit View without moving focus.
+  - Text, word/line expansion, resize reclamping, and the frame-clipped
+    highlight all resolve the owner's grid through one fail-closed guard.
+  - Select-all covers the focused View's grid.
+  - The selection is dropped when its owner leaves the active layout (close,
+    zoom, workspace switch), when its pane session is removed or respawned,
+    and when primary ownership moves away from it.
+
+  New APIs: `selection_owner()` and `set_view_selection()`, plus the read-only
+  seam `live_cell_size()`. `cursor_to_cell` stays public and primary-global
+  (alt-drag chrome, the inspect trace); mouse reports no longer use it (see
+  the #1477 entry below). `cursor_to_present_cell` and `cursor_to_leaf_cell`
+  now resolve the topmost frame under the pointer in paint order, so
+  click-to-focus, hover focus, the capture pre-focus, the status bar, and the
+  selection press agree on a float over a base leaf.
+
+- **Copy mode and search are View-bound (CTX-0805, #1478):** copy mode and
+  scrollback search read the primary grid. They consulted the focused View
+  only for its scroll offset. Output on any pane refreshed a search against
+  that pane's grid, and a `clear` in any pane dropped a selection made in
+  another.
+  - Copy mode binds to the focused View on entry and walks, pages, and yanks
+    that View's grid. It stays bound if focus moves and ends when its View
+    loses its grid.
+  - The search overlay and `search_set` bind to the focused View
+    (`search_view()`), match only its grid, and refresh only on output to
+    it.
+  - A grid erase drops only a selection owned by the erased grid. Output from
+    a primary shell whose owner re-homed onto a pane-session leaf (workspace
+    close) is attributed to no View, so it neither erases that leaf's
+    selection nor refreshes its search.
+  - The persistent-selection API follows the keyboard View.
+
+- **Floats present at their cell bounds (CTX-0807, #1481):** the cell-path
+  solver, `layout_cmd`, and Alt+drag read `LayoutNode::Overlay` bounds as
+  cells. The decorated present solver used the raw cell numbers as pixels,
+  so a float presented as a sliver near the window origin with a 1x1 pane
+  grid. The px solver now scales overlay bounds by the live cell size. The
+  unit-agnostic `layout_with_decoration` output is unchanged.
+
+- **Pointer consumers address the pane under the pointer (CTX-0804,
+  #1477):** mouse reports, capture click-to-focus, and OSC 8 hyperlink
+  activation used the primary-global `cursor_to_cell`. In a split, an app in
+  a non-primary pane received coordinates offset by its pane origin. Focus
+  could not leave a mouse-tracking pane by clicking. A click on one pane
+  could arm a link from the primary grid.
+  - Press, release, motion, and wheel reports now carry the receiving
+    (focused) pane's own grid cells, clamped at its edge rather than dropped.
+  - A left press on another pane moves focus first whenever a
+    mouse-tracking app is involved, so the click reaches the pane it landed
+    on. Shift, Alt, gap bands, and split handles keep their existing
+    meaning.
+  - Hyperlink activation resolves the link in the clicked pane's grid, and
+    fails closed while that pane is scrolled into history.
+
 ## [0.0.21] - 2026-09-24
 
 ### Release highlights

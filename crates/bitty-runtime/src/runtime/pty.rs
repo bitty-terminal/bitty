@@ -850,7 +850,12 @@ impl Runtime {
                     }
                 );
             if grid_erased {
-                self.clear_selection();
+                // CTX-0805: the selection is View-owned, so only an erase on
+                // the owner's own grid drops it. A `clear` in a background
+                // pane must not discard a selection made in another pane.
+                if let Some(fed) = self.fed_grid_view() {
+                    self.drop_selection_owned_by(fed);
+                }
             }
             // CTX-0146 (Issue #238): answer standard terminal queries with
             // true capabilities. The parser maps these shapes to `Unknown`
@@ -921,8 +926,15 @@ impl Runtime {
         }
         // Search UI integration (CTX-0061): keep bounded matches in sync after
         // state growth/scrollback pushes; headless refresh is cheap (truncated
-        // pattern, capped results) and deterministic. No I/O.
-        if self.search_state.is_active() {
+        // pattern, capped results) and deterministic. No I/O. CTX-0805: the
+        // matches are rows of the search's bound grid, so only output on that
+        // grid refreshes them (a pane drain swaps its grid into `self.state`;
+        // refreshing another pane's search against it would replace the
+        // matches with foreign rows). An unbound search (test seam) keeps the
+        // historic refresh.
+        if self.search_state.is_active()
+            && (self.search_view.is_none() || self.search_view == self.fed_grid_view())
+        {
             self.search_state.refresh(&self.state);
         }
     }

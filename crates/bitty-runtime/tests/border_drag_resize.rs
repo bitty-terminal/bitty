@@ -197,15 +197,52 @@ fn shift_press_on_border_forces_selection() {
     let mut rt = make_runtime();
     rt.set_layout(two_pane_horizontal());
     set_modifiers(&mut rt, true, false);
+    let before = ratio(&rt);
     rt.handle_cursor_moved(cell_pixels(40, 12));
     rt.handle_mouse_input(press(MouseButton::Left));
     assert!(
         !rt.border_drag_active(),
         "Shift keeps the accessibility escape: no grab"
     );
+    // CTX-0803 (#1476): the press falls through to the selection path, and
+    // the selection path is View-owned. The divider cell lies inside the
+    // right pane's frame, and that pane owns no grid here (no shell, and the
+    // primary grid belongs to the left pane), so the press selects nothing
+    // instead of fabricating a selection bound to the *left* pane's grid.
+    // The pre-CTX-0803 assertion (`selection().is_some()`) passed only
+    // because of that primary binding.
+    assert_eq!(
+        rt.selection_owner(),
+        None,
+        "a press in a pane that owns no grid must not select another pane's grid"
+    );
     assert!(
-        rt.selection().is_some(),
-        "Shift+press keeps the selection path"
+        rt.selection().is_none(),
+        "fail closed: no grid under the pointer means no selection"
+    );
+    rt.handle_mouse_input(release(MouseButton::Left));
+    assert!(
+        (ratio(&rt) - before).abs() < 1e-6,
+        "Shift+press must not resize the split"
+    );
+}
+
+/// Companion to [`shift_press_on_border_forces_selection`]: the same Shift
+/// escape over a pane that *does* own a grid still selects, and the selection
+/// is owned by that pane (CTX-0803).
+#[test]
+fn shift_press_selects_in_the_pane_that_owns_the_grid() {
+    let mut rt = make_runtime();
+    rt.set_layout(two_pane_horizontal());
+    let primary = rt.primary_view().expect("headless runtime pins a primary");
+    set_modifiers(&mut rt, true, false);
+    rt.handle_cursor_moved(cell_pixels(4, 6));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(!rt.border_drag_active(), "no divider under the pointer");
+    assert_eq!(
+        rt.selection_owner(),
+        Some(primary),
+        "the selection belongs to the pane under the pointer"
     );
     rt.handle_mouse_input(release(MouseButton::Left));
 }

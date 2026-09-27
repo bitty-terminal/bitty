@@ -78,8 +78,18 @@ impl Runtime {
         if self.copy_mode.is_some() {
             self.exit_copy_mode();
         }
+        // CTX-0805 (#1478): the overlay searches the focused View's own grid
+        // for its whole session. A focused leaf without a grid cannot open
+        // it (fail closed).
+        let Some(view) = self.focused_view() else {
+            return;
+        };
+        if self.live_view_state(view).is_none() {
+            return;
+        }
         self.clear_selection();
-        self.search_state.clear();
+        self.search_clear();
+        self.search_view = Some(view);
         self.search_mode = true;
         self.pending_full_redraw = true;
     }
@@ -94,10 +104,8 @@ impl Runtime {
             return;
         }
         self.search_mode = false;
-        self.search_state.clear();
-        self.selection = None;
-        self.selection_dragging = false;
-        self.selection_anchor_press = None;
+        self.search_clear();
+        self.drop_selection();
         self.pending_full_redraw = true;
     }
 
@@ -152,7 +160,7 @@ impl Runtime {
         let pattern = self.search_state.pattern().to_string();
         let opts = self.search_state.options();
         let next = SearchOptions::new(!opts.case_sensitive, opts.max_results);
-        self.search_state.set_search(&self.state, &pattern, next);
+        self.search_set_bound(&pattern, next);
         // `set_search` resets current to the head; restore the clamped
         // position so toggling does not lose the user's place.
         if let Some(idx) = prev_index {
@@ -165,27 +173,35 @@ impl Runtime {
         self.pending_full_redraw = true;
     }
 
-    /// Reveals the current match in the focused viewport.
+    /// Reveals the current match in the viewport of the View the search is
+    /// bound to (CTX-0805; formerly whichever View was focused).
     ///
-    /// Scrolls the focused view minimally so the current match becomes
-    /// visible (no-op when closed, empty, or already visible). Returns
-    /// `true` when the viewport moved.
+    /// Scrolls that view minimally so the current match becomes visible
+    /// (no-op when closed, empty, or already visible). Returns `true` when
+    /// the viewport moved.
     pub fn search_reveal_current(&mut self) -> bool {
         if !self.search_mode || self.search_state.current_match().is_none() {
             return false;
         }
-        let Some(focused) = self.focused_view() else {
+        let Some(bound) = self.search_view else {
             return false;
         };
         // Disjoint field borrows in a tight scope: `layout` mutably plus
-        // `search_state`/`state` immutably (avoids a whole-`self` borrow
-        // while the view is live).
+        // `search_state` and the bound grid immutably (avoids a whole-`self`
+        // borrow while the view is live).
         let changed = {
-            let (search_state, state, layout) = (&self.search_state, &self.state, &mut self.layout);
-            let Some(view) = layout.find_leaf_mut(focused) else {
+            let Some(state) = super::selection::grid_of(
+                &self.pane_sessions,
+                self.primary_view,
+                &self.state,
+                bound,
+            ) else {
                 return false;
             };
-            search_state.scroll_to_current(view, state)
+            let Some(view) = self.layout.find_leaf_mut(bound) else {
+                return false;
+            };
+            self.search_state.scroll_to_current(view, state)
         };
         if changed {
             self.pending_full_redraw = true;
@@ -208,7 +224,7 @@ impl Runtime {
         }
         pattern.push(ch);
         let opts = self.search_state.options();
-        self.search_state.set_search(&self.state, &pattern, opts);
+        self.search_set_bound(&pattern, opts);
         self.search_reveal_current();
         let _ = self.search_apply_selection();
         self.pending_full_redraw = true;
@@ -231,11 +247,10 @@ impl Runtime {
         let mut next = pattern;
         next.pop();
         let opts = self.search_state.options();
-        self.search_state.set_search(&self.state, &next, opts);
+        self.search_set_bound(&next, opts);
         // Empty query: clear the live highlight but stay open.
         if next.is_empty() {
-            self.selection = None;
-            self.selection_dragging = false;
+            self.drop_selection();
         } else {
             self.search_reveal_current();
             let _ = self.search_apply_selection();
@@ -254,7 +269,7 @@ impl Runtime {
             return;
         }
         let opts = SearchOptions::default();
-        self.search_state.set_search(&self.state, pattern, opts);
+        self.search_set_bound(pattern, opts);
         self.search_reveal_current();
         let _ = self.search_apply_selection();
         self.pending_full_redraw = true;

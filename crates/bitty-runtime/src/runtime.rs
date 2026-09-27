@@ -522,20 +522,28 @@ pub struct Runtime {
     cw_hint_label: String,
     container: UiRect,
     clipboard: Clipboard,
-    selection: Option<Selection>,
-    selection_dragging: bool,
+    /// The single live selection and the `View` that owns it (CTX-0803,
+    /// DEC-0078 D1, issues #1476/#1433).
+    ///
+    /// `None` means no selection exists. `Some` always carries an owner, so
+    /// an owner-less selection is not representable: the anchor, the focus,
+    /// the drag pin, and the drag flag can never drift apart from the grid
+    /// they address. Pressing in another `View` replaces the selection
+    /// (exactly one live selection); per-`View` persistent selections are
+    /// deferred, and this shape makes moving to a `ViewId`-keyed map a
+    /// mechanical change.
+    ///
+    /// Every write goes through the helpers in `runtime::selection`; every
+    /// read resolves the owner's grid through
+    /// [`Runtime::selection_owner_state`](crate::Runtime) and fails closed
+    /// when the owner is no longer a live leaf of the active layout.
+    selection_state: Option<selection::SelectionState>,
     /// Bounded multi-click tracker for word/line selection (CTX-0385).
     ///
     /// `O(1)` state (last press time, cell, button, count); the runtime is
     /// the authority — the wire [`bitty_platform::MouseEvent::click_count`]
     /// is advisory and recomputed here from press time and cell.
     click_tracker: ClickTracker,
-    /// Raw press cell that started the current selection drag (CTX-0385).
-    ///
-    /// `O(1)`: one cell that pins word/line drag extension direction
-    /// (`word_drag`/`line_drag` compare the live pointer against this, not
-    /// against the expanded range). `None` when no selection is active.
-    selection_anchor_press: Option<CellPos>,
     /// Click count of the last left press (`1..=3`, CTX-0385).
     ///
     /// Extension point for copy-mode (CTX-0384) and search UI (CTX-0383):
@@ -549,6 +557,13 @@ pub struct Runtime {
     /// CTX-0385 `SelectionKind` seams, yank to clipboard plus primary).
     /// Bounded `O(1)` state; see `runtime::copy_mode`.
     copy_mode: Option<crate::runtime::copy_mode::CopyModeState>,
+    /// View whose grid the active copy mode walks (CTX-0805, #1478).
+    ///
+    /// Bound to the focused View on entry and cleared on exit, so a focus
+    /// change mid-session never retargets the cursor onto another grid.
+    /// `Some` exactly while `copy_mode` is `Some`; a bound View that loses
+    /// its live grid ends copy mode (fail closed).
+    copy_mode_view: Option<ViewId>,
     /// Scrollback search overlay open flag (CTX-0383, issue #639).
     ///
     /// `false` in normal operation; `true` while the keyboard-first modal
@@ -558,6 +573,14 @@ pub struct Runtime {
     /// heap stays `<=256` bytes and matches `<=1000`. See
     /// `runtime::search_mode`.
     search_mode: bool,
+    /// View whose grid `search_state` was computed against (CTX-0805,
+    /// #1478).
+    ///
+    /// Set to the focused View when a search starts (`search_set`, the
+    /// overlay's first query) and cleared with the search. Matches are
+    /// buffer rows of exactly this grid, so refresh, reveal, highlights, and
+    /// the live selection they drive all address it, even if focus moves.
+    search_view: Option<ViewId>,
     /// Active overlay-scrollbar thumb drag (CTX-0181).
     ///
     /// Press+move on the painted thumb scrolls the focused view through the
@@ -952,8 +975,18 @@ impl std::fmt::Debug for Runtime {
                 "plugin_drop_policy",
                 &self.plugin_host.pipeline().drop_policy(),
             )
-            .field("has_selection", &self.selection.is_some())
-            .field("selection_dragging", &self.selection_dragging)
+            .field("has_selection", &self.selection_state.is_some())
+            .field(
+                "selection_owner",
+                &self.selection_state.as_ref().map(|sel| sel.owner),
+            )
+            .field(
+                "selection_dragging",
+                &self
+                    .selection_state
+                    .as_ref()
+                    .is_some_and(|sel| sel.dragging),
+            )
             .field("clipboard_headless", &self.clipboard.is_headless())
             .field("search_active", &self.search_state.is_active())
             .field("search_matches", &self.search_state.match_count())
@@ -1217,13 +1250,13 @@ impl Runtime {
             focus,
             container,
             clipboard: Clipboard::new(),
-            selection: None,
-            selection_dragging: false,
+            selection_state: None,
             click_tracker: ClickTracker::new(),
-            selection_anchor_press: None,
             last_click_count: crate::runtime::click::CLICK_COUNT_MIN,
             copy_mode: None,
+            copy_mode_view: None,
             search_mode: false,
+            search_view: None,
             scrollbar_drag: None,
             scrollbar_cursor_left: false,
             scrollbar_visible: false,
@@ -1426,13 +1459,13 @@ impl Runtime {
             focus,
             container,
             clipboard: Clipboard::new(),
-            selection: None,
-            selection_dragging: false,
+            selection_state: None,
             click_tracker: ClickTracker::new(),
-            selection_anchor_press: None,
             last_click_count: crate::runtime::click::CLICK_COUNT_MIN,
             copy_mode: None,
+            copy_mode_view: None,
             search_mode: false,
+            search_view: None,
             scrollbar_drag: None,
             scrollbar_cursor_left: false,
             scrollbar_visible: false,

@@ -1039,3 +1039,10 @@
 {"created_at":"2026-09-27T11:46:55.821966107+00:00","id":"01M3HB12PECH6TX57QNR9AYZYK","kind":"include","pattern":"crates/bitty-runtime/tests/selection_view_owned.rs","project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","task_id":"01M3HAWGBDK7RRN8BKFGCTAKSY"}
 {"created_at":"2026-09-27T11:46:55.846109493+00:00","id":"01M3HB12Q6BYXDWBXD11CWHBE0","kind":"include","pattern":"CHANGELOG.md","project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","task_id":"01M3HAWGBDK7RRN8BKFGCTAKSY"}
 {"created_at":"2026-09-27T17:09:44.870394139+00:00","id":"01M3HXG5S66JTQ76FJ20BX8TNA","kind":"include","pattern":"docs","project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","task_id":"01M3HPS4RKACEX37EFKX7KYN5V"}
+{"created_at":"2026-09-27T17:58:21.536478335+00:00","id":"01M3J09630TA4NPEJG58P942D5","kind":"include","pattern":"AGENTS.md","project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","task_id":"01M3J08VVCQ21HG2B1VNKA6JNF"}
+{"created_at":"2026-09-27T17:58:21.571689872+00:00","id":"01M3J09643EZH37H3RQX9B3CD9","kind":"include","pattern":"README.md","project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","task_id":"01M3J08VVCQ21HG2B1VNKA6JNF"}
+{"created_at":"2026-09-27T17:58:21.600856194+00:00","id":"01M3J09650QR24TEG0N9DM7TKV","kind":"include","pattern":"justfile","project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","task_id":"01M3J08VVCQ21HG2B1VNKA6JNF"}
+{"created_at":"2026-09-27T17:58:21.624107256+00:00","id":"01M3J0965RB4E6DHYWMVBTZZPN","kind":"include","pattern":"scripts/docs-pin.sh","project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","task_id":"01M3J08VVCQ21HG2B1VNKA6JNF"}
+{"created_at":"2026-09-27T17:58:21.645735004+00:00","id":"01M3J0966D2VH9DGP6SBXG55M5","kind":"include","pattern":"scripts/tests/docs-pin.test.sh","project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","task_id":"01M3J08VVCQ21HG2B1VNKA6JNF"}
+{"created_at":"2026-09-27T17:58:21.668204998+00:00","id":"01M3J09674BNDCZPR5BF3VMF5Y","kind":"include","pattern":"scripts/gen-oracle-scenarios.sh","project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","task_id":"01M3J08VVCQ21HG2B1VNKA6JNF"}
+{"created_at":"2026-09-27T17:58:21.690155671+00:00","id":"01M3J0967TFCNV69WR6DDR4BKJ","kind":"include","pattern":"TODO.md","project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","task_id":"01M3J08VVCQ21HG2B1VNKA6JNF"}

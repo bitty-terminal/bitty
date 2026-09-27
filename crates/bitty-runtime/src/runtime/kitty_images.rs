@@ -195,7 +195,7 @@ impl Runtime {
             width: metrics.width,
             height: metrics.height,
         };
-        let placement = self
+        let placement_id = self
             .kitty_images
             .display_for_origin(
                 image,
@@ -211,20 +211,31 @@ impl Runtime {
             .map_err(KittyImageError::Placement)?;
         self.pending_full_redraw = true;
 
-        // Move cursor according to Kitty spec: after placing an image, cursor
-        // moves right by cols and down by rows, unless C=1 (do not move).
+        // Per Kitty spec: after placing an image, the cursor moves right by the
+        // number of columns and down by the number of rows in the placement
+        // rectangle, unless C=1 is explicitly set. Use the effective placement
+        // dimensions (what was actually rendered), not the requested spans which
+        // may be zero when omitted.
         if cursor_movement_c != 1 {
-            // Cursor moves right by cols_c and down by rows_r
-            let new_col = cursor.col.saturating_add(cols_c);
-            let new_row = cursor.row.saturating_add(rows_r);
+            // Retrieve the actual placement to get effective dimensions
+            let placement = self
+                .kitty_images
+                .get_placement(placement_id)
+                .expect("placement just created must exist");
 
-            // Apply cursor movement using CursorPosition
+            let effective_cols = if cols_c > 0 { cols_c } else { placement.cols };
+            let effective_rows = if rows_r > 0 { rows_r } else { placement.rows };
+            let new_col = cursor.col.saturating_add(effective_cols);
+            let new_row = cursor.row.saturating_add(effective_rows);
             self.state.apply(&bitty_vt::TerminalAction::CursorPosition {
                 row: bitty_vt::Row(new_row),
                 col: bitty_vt::Col(new_col),
             });
         }
 
-        Ok(KittyDisplayOutcome::Displayed { image, placement })
+        Ok(KittyDisplayOutcome::Displayed {
+            image,
+            placement: placement_id,
+        })
     }
 }

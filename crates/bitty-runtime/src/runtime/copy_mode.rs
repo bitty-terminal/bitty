@@ -200,9 +200,7 @@ impl Runtime {
             return;
         }
         self.copy_mode = None;
-        self.selection = None;
-        self.selection_dragging = false;
-        self.selection_anchor_press = None;
+        self.drop_selection();
         self.pending_full_redraw = true;
     }
 
@@ -406,9 +404,7 @@ impl Runtime {
         };
         if mode.visual_kind == Some(kind) {
             self.copy_mode = Some(CopyModeState::new(mode.cursor));
-            self.selection = None;
-            self.selection_dragging = false;
-            self.selection_anchor_press = None;
+            self.drop_selection();
             self.pending_full_redraw = true;
             return;
         }
@@ -433,12 +429,12 @@ impl Runtime {
         // there (the visual survives in `CopyModeState` for yank).
         let scrolled = self.is_copy_space_scrolled();
         if selection.anchor == selection.focus || scrolled {
-            self.selection = None;
+            self.drop_selection();
         } else {
-            self.selection = Some(selection);
+            // CTX-0803: copy mode reads the primary grid, so the visual it
+            // creates is owned by `primary_view` (#1478 rebinds it).
+            self.set_primary_selection(selection, None, false);
         }
-        self.selection_dragging = false;
-        self.selection_anchor_press = None;
         self.pending_full_redraw = true;
     }
 
@@ -467,13 +463,13 @@ impl Runtime {
         let Some(anchor) = mode.anchor else {
             self.copy_mode = Some(CopyModeState::new(cursor));
             // Cursor-only motion clears any stale highlight.
-            self.selection = None;
+            self.drop_selection();
             self.pending_full_redraw = true;
             return;
         };
         let Some(kind) = mode.visual_kind else {
             self.copy_mode = Some(CopyModeState::new(cursor));
-            self.selection = None;
+            self.drop_selection();
             self.pending_full_redraw = true;
             return;
         };
@@ -491,12 +487,12 @@ impl Runtime {
         // live selection stays clear (same rationale as the visual
         // toggle above); the visual survives in `CopyModeState`.
         if selection.anchor == selection.focus || self.is_copy_space_scrolled() {
-            self.selection = None;
+            self.drop_selection();
         } else {
             let clamped = selection.clamped(snap).snapped(Some(snap));
-            self.selection = Some(clamped);
+            // CTX-0803: primary-grid coordinates, so owned by `primary_view`.
+            self.set_primary_selection(clamped, None, false);
         }
-        self.selection_dragging = false;
         self.pending_full_redraw = true;
     }
 

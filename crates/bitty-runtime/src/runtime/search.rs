@@ -27,8 +27,19 @@ impl Runtime {
     /// (clamped). Returns `None` when no selection exists.
     #[must_use]
     pub fn persistent_selection(&self) -> Option<PersistentSelection> {
-        let sel = self.selection?;
-        Some(PersistentSelection::from_grid_selection(sel, &self.state))
+        // CTX-0803: `PersistentSelection` rows are primary-grid buffer rows
+        // (its restore path installs into the primary grid), so only a
+        // selection owned by `primary_view` has a persistent form. A pane-owned
+        // selection reports `None` instead of being re-expressed against the
+        // wrong grid (#1478 rebinds search and copy mode to the focused View).
+        let (sel, state) = self.selection_owner_state()?;
+        if Some(sel.owner) != self.primary_view {
+            return None;
+        }
+        Some(PersistentSelection::from_grid_selection(
+            sel.selection,
+            state,
+        ))
     }
 
     /// Attempts to restore a persistent selection into the live-grid selection.
@@ -40,19 +51,16 @@ impl Runtime {
     /// linger as stale grid coords). Headless and bounded.
     pub fn restore_persistent_selection(&mut self, pers: PersistentSelection) -> bool {
         if let Some(sel) = pers.to_grid_selection(&self.state) {
-            self.selection_anchor_press = Some(sel.anchor);
-            self.selection = Some(sel);
-            self.selection_dragging = sel.active;
-            if !sel.active {
-                self.selection_anchor_press = None;
-            }
-            true
+            // CTX-0803: buffer rows are primary-grid rows here, so the
+            // restored selection is owned by `primary_view` (#1478 rebinds
+            // the search/copy consumers to the focused View).
+            let pin = if sel.active { Some(sel.anchor) } else { None };
+            self.set_primary_selection(sel, pin, sel.active);
+            self.selection_state.is_some()
         } else {
             // Buffer is either pruned or now in history: clear live selection.
             // Caller may still use `pers.text(&state)` for history highlight.
-            self.selection = None;
-            self.selection_dragging = false;
-            self.selection_anchor_press = None;
+            self.drop_selection();
             false
         }
     }
@@ -269,15 +277,14 @@ impl Runtime {
         };
         // Try to restore as live-grid selection.
         if let Some(sel) = pers.to_grid_selection(&self.state) {
-            self.selection_anchor_press = if sel.active { Some(sel.anchor) } else { None };
-            self.selection = Some(sel);
-            self.selection_dragging = sel.active;
-            true
+            // CTX-0803: the match lives in the primary grid, so the live
+            // selection it drives is owned by `primary_view` (#1478).
+            let pin = if sel.active { Some(sel.anchor) } else { None };
+            self.set_primary_selection(sel, pin, sel.active);
+            self.selection_state.is_some()
         } else {
             // In history or pruned: leave a history highlight but clear live selection.
-            self.selection = None;
-            self.selection_dragging = false;
-            self.selection_anchor_press = None;
+            self.drop_selection();
             false
         }
     }

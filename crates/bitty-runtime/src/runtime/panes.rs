@@ -122,6 +122,11 @@ impl Runtime {
             program.to_string(),
             args.iter().map(|arg| (*arg).to_string()).collect(),
         ));
+        // CTX-0803 (#1476): primary ownership may just have moved to the
+        // focused leaf. A selection owned by the previous owner now resolves
+        // to no grid, so it is dropped here rather than left for the read
+        // guard.
+        self.invalidate_selection_if_owner_stale();
         // If a waker is already installed (respawn after `set_pty_waker`),
         // promote immediately so the new child wakes the loop too.
         if self.pty_waker.is_some() {
@@ -326,6 +331,11 @@ impl Runtime {
         // focused leaf, the cached/reader state must read its register, not
         // a previous pane's. No-op when another pane is focused.
         self.sync_mode_caches_to_focus();
+        // CTX-0803 (#1476): a respawn replaced this leaf's grid, so a
+        // selection owned by it addresses cells of a grid that no longer
+        // exists. Dropping it is the only honest option (the new grid has no
+        // equivalent range).
+        self.drop_selection_owned_by(view);
         self.pending_full_redraw = true;
         Ok(())
     }
@@ -492,6 +502,9 @@ impl Runtime {
         // consult `focused_modes` directly and fall back to the primary
         // register for a now-session-less focused leaf.
         self.sync_mode_caches_to_focus();
+        // CTX-0803 (#1476): the grid a selection owned by this leaf addressed
+        // is gone. Drop it rather than let it fall back to the primary grid.
+        self.drop_selection_owned_by(*view);
         self.pending_full_redraw = true;
         true
     }

@@ -160,6 +160,14 @@ fn left_click_in_gap_band_keeps_focus() {
 fn shift_left_click_selects_without_focus() {
     // CTX-0181 accessibility escape: Shift forces the selection path and,
     // consistent with `shift_suppresses_hover_focus`, never steals focus.
+    //
+    // CTX-0803 (#1476): the selection path is View-owned, so it selects in the
+    // *hit* pane. Here the hit pane (`2`) owns no grid — there is no shell and
+    // the primary grid belongs to pane `1` — so the press selects nothing
+    // instead of arming a drag bound to pane `1`'s grid. The pre-CTX-0803
+    // `is_selection_dragging` assertion passed only because of that primary
+    // binding; `shift_left_click_selects_in_the_hit_pane_without_focus` below
+    // pins the drag against a pane that really owns a grid.
     let mut rt = make_runtime();
     rt.set_layout(two_pane());
     rt.handle_cursor_moved(cell_pixels(60, 12));
@@ -170,7 +178,37 @@ fn shift_left_click_selects_without_focus() {
         Some(ViewId::new(1)),
         "Shift+click must not focus the hit pane"
     );
+    assert_eq!(
+        rt.selection_owner(),
+        None,
+        "a press in a pane that owns no grid must not select another pane's grid"
+    );
+    rt.handle_mouse_input(release(MouseButton::Left));
+    rt.handle_key_event(named_key(NamedKey::Shift, PressState::Released));
+}
+
+#[test]
+fn shift_left_click_selects_in_the_hit_pane_without_focus() {
+    // CTX-0803 companion: Shift+click over a pane that owns a grid arms the
+    // drag in *that* pane and still leaves focus where it was.
+    let mut rt = make_runtime();
+    rt.set_layout(two_pane());
+    let owner = rt.primary_view().expect("headless runtime pins a primary");
+    assert!(rt.set_focus(ViewId::new(2)), "park focus on the other pane");
+    rt.handle_cursor_moved(cell_pixels(4, 6));
+    rt.handle_key_event(named_key(NamedKey::Shift, PressState::Pressed));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert_eq!(
+        rt.focused_view(),
+        Some(ViewId::new(2)),
+        "Shift+click must not focus the hit pane"
+    );
     assert!(rt.is_selection_dragging(), "Shift+click still selects");
+    assert_eq!(
+        rt.selection_owner(),
+        Some(owner),
+        "the drag belongs to the hit pane, not the focused one"
+    );
     rt.handle_mouse_input(release(MouseButton::Left));
     rt.handle_key_event(named_key(NamedKey::Shift, PressState::Released));
 }

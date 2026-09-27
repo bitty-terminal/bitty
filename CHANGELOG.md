@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Text selection is View-owned (CTX-0803, #1476, #1433):** the runtime kept
+  one global selection that worked only against the primary grid. The pointer
+  mapped through the primary-global `cursor_to_cell`, which subtracts no leaf
+  origin. Text extraction and clamping read the primary grid. The highlight
+  painted at the focused View's frame. In a split, a drag leaked across
+  panels, copied the wrong pane's text, and painted in the wrong frame.
+
+  The selection now carries the `ViewId` that owns it: at most one live
+  selection, owned by exactly one View.
+  - Press hit-tests the visible frame under the pointer (topmost overlay
+    first) and maps into the owner's own grid.
+  - Drag and release clamp to the owner's content frame, so a cross-panel
+    drag stops at the owner's edge.
+  - `Shift`+press selects in the hit View without moving focus.
+  - Text, word/line expansion, resize reclamping, and the frame-clipped
+    highlight all resolve the owner's grid through one fail-closed guard.
+  - Select-all covers the focused View's grid.
+  - The selection is dropped when its owner leaves the active layout (close,
+    zoom, workspace switch), when its pane session is removed or respawned,
+    and when primary ownership moves away from it.
+
+  New APIs: `selection_owner()` and `set_view_selection()`, plus the read-only
+  seam `live_cell_size()`. Unchanged: `cursor_to_cell` still serves mouse
+  reporting and alt-drag chrome (#1477). Still primary-bound: copy mode,
+  search, and `persistent_selection()` read the primary grid and own their
+  selections by `primary_view` (#1478).
+
 ## [0.0.21] - 2026-09-24
 
 ### Release highlights

@@ -95,9 +95,7 @@ impl Runtime {
         }
         self.search_mode = false;
         self.search_state.clear();
-        self.selection = None;
-        self.selection_dragging = false;
-        self.selection_anchor_press = None;
+        self.drop_selection();
         self.pending_full_redraw = true;
     }
 
@@ -234,8 +232,7 @@ impl Runtime {
         self.search_state.set_search(&self.state, &next, opts);
         // Empty query: clear the live highlight but stay open.
         if next.is_empty() {
-            self.selection = None;
-            self.selection_dragging = false;
+            self.drop_selection();
         } else {
             self.search_reveal_current();
             let _ = self.search_apply_selection();

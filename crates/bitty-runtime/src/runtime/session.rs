@@ -1590,18 +1590,6 @@ impl Runtime {
         }
     }
 
-    /// Returns the live grid backing `view`: its pane session, else the
-    /// primary grid when `view` owns it, else `None` (session-less leaf).
-    fn session_state_for(&self, view: ViewId) -> Option<&State> {
-        if let Some(session) = self.pane_sessions.get(&view) {
-            return Some(&session.state);
-        }
-        if self.primary_view == Some(view) {
-            return Some(&self.state);
-        }
-        None
-    }
-
     /// Applies a validated snapshot: rebuilds workspaces, the live
     /// layout/focus pair, and the primary owner, rehydrates scrollback into
     /// live grids, and stashes the rest in the pending map for the next
@@ -1661,6 +1649,10 @@ impl Runtime {
         // to a pending respawn by `resolve_attachment` below).
         let owner = derive_startup_owner(snap);
         self.primary_view = Some(owner);
+        // CTX-0803 (#1476): a restore installs a whole new world (layout,
+        // focus, primary owner, grids). Any live selection addresses the
+        // pre-restore grids, so it is dropped.
+        self.drop_selection();
         self.pending_ws_close = None;
         self.session_pending.clear();
         self.session_primary_cwd = None;

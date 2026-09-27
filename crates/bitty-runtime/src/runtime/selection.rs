@@ -2,8 +2,41 @@
 //!
 //! Split from `super` (`runtime.rs`) as a pure move under CTX-0232:
 //! byte-identical logic, only module wiring changed.
+//!
+//! CTX-0803 (DEC-0078 D1, issues #1476/#1433): the selection is View-owned.
+//! [`SelectionState`] binds the range, the drag pin, and the drag flag to the
+//! one [`ViewId`] whose grid they address, and every reader resolves that
+//! owner's live grid before touching a snapshot. There is at most one live
+//! selection; pressing in another `View` replaces it.
 use super::input::key_inspect_label;
 use super::*;
+
+/// The single live selection plus the `View` that owns it (CTX-0803, D1).
+///
+/// Held as `Option<SelectionState>` on [`Runtime`], so an owner-less
+/// selection is not representable. `selection` addresses cells of `owner`'s
+/// grid (the pane session's grid, or the primary grid when `owner` is
+/// [`Runtime::primary_view`]), never the runtime-global primary grid by
+/// assumption.
+///
+/// Keyed by owner on purpose: moving to per-`View` persistent selections
+/// (deferred) is a mechanical change from `Option<SelectionState>` to a
+/// `ViewId`-keyed map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SelectionState {
+    /// `View` whose grid `selection` addresses.
+    pub(crate) owner: ViewId,
+    /// Live range in the owner's grid coordinates.
+    pub(crate) selection: Selection,
+    /// Raw press cell that started the current drag (CTX-0385).
+    ///
+    /// Pins word/line drag extension direction (`word_drag`/`line_drag`
+    /// compare the live pointer against this, not against the expanded
+    /// range). `None` once the drag is committed.
+    pub(crate) anchor_press: Option<CellPos>,
+    /// Whether a pointer drag is currently extending `selection`.
+    pub(crate) dragging: bool,
+}
 
 pub(super) fn clamp_cell_pos(snapshot: &Snapshot, pos: CellPos) -> CellPos {
     let max_row = snapshot.height.saturating_sub(1) as u16;
@@ -36,40 +69,198 @@ fn truncate_str_to_bytes(s: &str, max_bytes: usize) -> &str {
 }
 
 impl Runtime {
+    /// Live grid backing `view`: its pane session, else the primary grid when
+    /// `view` owns it, else `None` (CTX-0803 promoted from `session.rs`).
+    ///
+    /// Presence-only: it does not check that `view` is a leaf of the active
+    /// layout. Selection readers use [`Self::selection_owner_state`], which
+    /// adds that check and fails closed.
+    pub(super) fn session_state_for(&self, view: ViewId) -> Option<&State> {
+        if let Some(session) = self.pane_sessions.get(&view) {
+            return Some(&session.state);
+        }
+        if self.primary_view == Some(view) {
+            return Some(&self.state);
+        }
+        None
+    }
+
+    /// Live grid backing `view` **and** its membership in the active layout.
+    ///
+    /// `None` when `view` is not a leaf of the current tree (closed, on
+    /// another workspace, hidden by a zoom) or owns no grid. This is the
+    /// fail-closed guard every selection reader goes through: a stale owner
+    /// yields no grid, so it yields no selection.
+    pub(super) fn live_view_state(&self, view: ViewId) -> Option<&State> {
+        self.layout.find_leaf(view)?;
+        self.session_state_for(view)
+    }
+
+    /// The live selection together with its owner's grid, fail-closed.
+    ///
+    /// `None` when no selection exists or the owner no longer resolves to a
+    /// live grid in the active layout. Readers must not reach for
+    /// `self.state` (the primary grid) on their own: that is the #1476 bug.
+    pub(super) fn selection_owner_state(&self) -> Option<(&SelectionState, &State)> {
+        let sel = self.selection_state.as_ref()?;
+        let state = self.live_view_state(sel.owner)?;
+        Some((sel, state))
+    }
+
+    /// Drops the live selection unconditionally (single clear funnel).
+    ///
+    /// Every clear — pointer, keyboard, copy mode, search, lifecycle
+    /// invalidation — goes through here so the owner, the range, the drag
+    /// pin, and the drag flag can never be cleared apart.
+    pub(super) fn drop_selection(&mut self) {
+        if self.selection_state.is_some() {
+            self.selection_state = None;
+        }
+        self.pending_full_redraw = true;
+    }
+
+    /// Installs `selection` owned by `owner`, replacing any live selection.
+    ///
+    /// The caller has already clamped and snapped against `owner`'s grid.
+    /// D1: at most one live selection, so a press in another `View` replaces
+    /// the previous one rather than stacking.
+    pub(super) fn install_selection(
+        &mut self,
+        owner: ViewId,
+        selection: Selection,
+        anchor_press: Option<CellPos>,
+        dragging: bool,
+    ) {
+        self.selection_state = Some(SelectionState {
+            owner,
+            selection,
+            anchor_press,
+            dragging,
+        });
+        self.pending_full_redraw = true;
+    }
+
+    /// Installs a primary-grid selection created by a keyboard consumer
+    /// (CTX-0803).
+    ///
+    /// Copy mode, the search overlay, and persistent-selection restore still
+    /// read the primary grid, so the selection they create is owned by
+    /// [`Self::primary_view`]; without a primary owner they create none (fail
+    /// closed). Rebinding those consumers to the focused `View` is #1478 and
+    /// deliberately out of scope here.
+    pub(super) fn set_primary_selection(
+        &mut self,
+        selection: Selection,
+        anchor_press: Option<CellPos>,
+        dragging: bool,
+    ) {
+        let Some(primary) = self.primary_view else {
+            self.drop_selection();
+            return;
+        };
+        self.install_selection(primary, selection, anchor_press, dragging);
+    }
+
+    /// Drops the live selection when `view` owns it (CTX-0803 lifecycle).
+    ///
+    /// Used where `view`'s grid itself is replaced or torn down while the leaf
+    /// may still exist in the layout (pane close, pane respawn): the range
+    /// addresses a grid that is gone, so the stale-owner guard alone would not
+    /// catch it.
+    pub(super) fn drop_selection_owned_by(&mut self, view: ViewId) {
+        if self
+            .selection_state
+            .as_ref()
+            .is_some_and(|sel| sel.owner == view)
+        {
+            self.drop_selection();
+        }
+    }
+
+    /// Drops the live selection when its owner is no longer a live grid in
+    /// the active layout (CTX-0803 lifecycle funnel).
+    ///
+    /// Called from the layout-install funnel (`replace_layout`, which covers
+    /// close, zoom, and workspace switch), the pane-session remove/respawn
+    /// sites, and the primary re-home sites. Backed by the same fail-closed
+    /// read guard, so a missed call degrades to "no selection" rather than to
+    /// a selection painted against the wrong grid.
+    pub(super) fn invalidate_selection_if_owner_stale(&mut self) {
+        let Some(sel) = self.selection_state.as_ref() else {
+            return;
+        };
+        if self.live_view_state(sel.owner).is_none() {
+            self.drop_selection();
+        }
+    }
+
     /// Current selection, if any (read-only).
+    ///
+    /// CTX-0803: fails closed when the owning `View` is no longer a live leaf
+    /// of the active layout — a stale owner reports no selection instead of
+    /// coordinates into someone else's grid.
     #[must_use]
     pub fn selection(&self) -> Option<Selection> {
-        self.selection
+        self.selection_owner_state().map(|(sel, _)| sel.selection)
+    }
+
+    /// `View` that owns the live selection, if any (CTX-0803).
+    ///
+    /// Fails closed like [`Self::selection`]: a selection whose owner left
+    /// the active layout reports `None`.
+    #[must_use]
+    pub fn selection_owner(&self) -> Option<ViewId> {
+        self.selection_owner_state().map(|(sel, _)| sel.owner)
     }
 
     /// Whether a drag is in progress.
     #[must_use]
     pub fn is_selection_dragging(&self) -> bool {
-        self.selection_dragging
+        self.selection_owner_state()
+            .is_some_and(|(sel, _)| sel.dragging)
     }
 
     /// Whether a selection currently exists and is non-empty.
     #[must_use]
     pub fn has_selection(&self) -> bool {
-        self.selection.is_some_and(|s| !s.is_empty())
+        self.selection().is_some_and(|s| !s.is_empty())
     }
 
     /// Clears the current selection.
     pub fn clear_selection(&mut self) {
-        self.selection = None;
-        self.selection_dragging = false;
-        self.selection_anchor_press = None;
-        self.pending_full_redraw = true;
+        self.drop_selection();
     }
 
-    /// Directly sets the selection (headless test seam).
+    /// Directly sets the selection on the primary grid (headless test seam).
+    ///
+    /// CTX-0803: the selection is owned by [`Self::primary_view`], which
+    /// keeps the historic single-pane semantics. A runtime with no primary
+    /// owner installs nothing (fail closed) — use
+    /// [`Self::set_view_selection`] to target a specific `View`.
     pub fn set_selection(&mut self, selection: Selection) {
-        let snap = self.state.snapshot();
+        if let Some(primary) = self.primary_view {
+            let _ = self.set_view_selection(primary, selection);
+        } else {
+            self.drop_selection();
+        }
+    }
+
+    /// Directly sets the selection owned by `view` (headless test seam).
+    ///
+    /// Clamps and snaps against `view`'s own grid. Returns `false` when
+    /// `view` is not a live leaf of the active layout or owns no grid, in
+    /// which case no selection is installed and any previous one is dropped
+    /// (fail closed).
+    pub fn set_view_selection(&mut self, view: ViewId, selection: Selection) -> bool {
+        let Some(state) = self.live_view_state(view) else {
+            self.drop_selection();
+            return false;
+        };
+        let snap = state.snapshot();
         let clamped = selection.clamped(&snap).snapped(Some(&snap));
-        self.selection_anchor_press = Some(clamped.anchor);
-        self.selection = Some(clamped);
-        self.selection_dragging = clamped.active;
-        self.pending_full_redraw = true;
+        let active = clamped.active;
+        self.install_selection(view, clamped, Some(clamped.anchor), active);
+        true
     }
 
     /// Current selection kind, if a selection exists (CTX-0385).
@@ -79,7 +270,7 @@ impl Runtime {
     /// the click tracker.
     #[must_use]
     pub fn selection_kind(&self) -> Option<SelectionKind> {
-        self.selection.map(|s| s.kind)
+        self.selection().map(|s| s.kind)
     }
 
     /// Click count of the last left press (`1..=3`, CTX-0385).
@@ -88,103 +279,135 @@ impl Runtime {
         self.last_click_count
     }
 
-    /// Starts a new selection at `pos` (mouse down).
+    /// Starts a new selection at `pos` in the primary grid (mouse down).
+    ///
+    /// CTX-0803: the primary-grid entry point, kept for its existing
+    /// callers and single-pane semantics. The pointer path uses
+    /// [`Self::start_selection_in`] with the hit-tested owner.
     pub fn start_selection(&mut self, pos: CellPos) {
-        let snap = self.state.snapshot();
-        let clamped = clamp_cell_pos(&snap, pos);
-        let snapped = bitty_ui::snap_to_leading(&snap, clamped);
-        self.selection_anchor_press = Some(snapped);
-        self.selection = Some(Selection {
-            anchor: snapped,
-            focus: snapped,
-            kind: SelectionKind::Simple,
-            active: true,
-        });
-        self.selection_dragging = true;
-        self.pending_full_redraw = true;
+        self.start_selection_in(SelectionKind::Simple, pos);
     }
 
-    /// Starts a word selection at `pos` (double-click, CTX-0385).
+    /// Starts a word selection at `pos` in the primary grid (double-click,
+    /// CTX-0385).
     ///
     /// Expands to the containing word via [`Selection::word_at`]; a press on
     /// a delimiter yields a collapsed single cell (no selection on release,
     /// matching stream semantics). Drag after this extends word-wise via
     /// [`Self::update_selection`].
     pub fn start_word_selection(&mut self, pos: CellPos) {
-        let snap = self.state.snapshot();
-        let clamped = clamp_cell_pos(&snap, pos);
-        let snapped = bitty_ui::snap_to_leading(&snap, clamped);
-        self.selection_anchor_press = Some(snapped);
-        let range = Selection::word_at(&snap, snapped);
-        self.selection = Some(Selection {
-            anchor: range.start,
-            focus: range.end,
-            kind: SelectionKind::Word,
-            active: true,
-        });
-        self.selection_dragging = true;
-        self.pending_full_redraw = true;
+        self.start_selection_in(SelectionKind::Word, pos);
     }
 
-    /// Starts a line selection at `pos` row (triple-click, CTX-0385).
+    /// Starts a line selection at `pos` row in the primary grid
+    /// (triple-click, CTX-0385).
     ///
     /// Covers the whole row via [`Selection::line_at`]; drag after this
     /// extends line-wise. Columns of `pos` are ignored.
     pub fn start_line_selection(&mut self, pos: CellPos) {
-        let snap = self.state.snapshot();
-        let clamped = clamp_cell_pos(&snap, pos);
-        let snapped = bitty_ui::snap_to_leading(&snap, clamped);
-        self.selection_anchor_press = Some(snapped);
-        let range = Selection::line_at(&snap, snapped.row);
-        self.selection = Some(Selection {
-            anchor: range.start,
-            focus: range.end,
-            kind: SelectionKind::Line,
-            active: true,
-        });
-        self.selection_dragging = true;
-        self.pending_full_redraw = true;
+        self.start_selection_in(SelectionKind::Line, pos);
     }
 
-    /// Starts a rectangular block selection at `pos` (`Alt` modifier, CTX-0385).
+    /// Starts a rectangular block selection at `pos` in the primary grid
+    /// (`Alt` modifier, CTX-0385).
     ///
     /// The anchor and focus start collapsed; drag extends the rectangle.
     /// Text extraction stays rectangular via [`Selection::block_text`].
     pub fn start_block_selection(&mut self, pos: CellPos) {
-        let snap = self.state.snapshot();
+        self.start_selection_in(SelectionKind::Block, pos);
+    }
+
+    /// Starts a selection of `kind` at primary-grid cell `pos`.
+    ///
+    /// Owner is [`Self::primary_view`]; without one, nothing is installed
+    /// (fail closed).
+    fn start_selection_in(&mut self, kind: SelectionKind, pos: CellPos) {
+        let Some(primary) = self.primary_view else {
+            self.drop_selection();
+            return;
+        };
+        self.start_view_selection(primary, kind, pos);
+    }
+
+    /// Starts a selection of `kind` owned by `owner` at `pos`, a cell in
+    /// `owner`'s own grid (CTX-0803 pointer-press entry point).
+    ///
+    /// Clamps and snaps against the owner's snapshot. A press whose owner
+    /// resolves to no live grid drops the selection instead of installing one
+    /// against the primary grid.
+    pub(super) fn start_view_selection(
+        &mut self,
+        owner: ViewId,
+        kind: SelectionKind,
+        pos: CellPos,
+    ) {
+        let Some(state) = self.live_view_state(owner) else {
+            self.drop_selection();
+            return;
+        };
+        let snap = state.snapshot();
         let clamped = clamp_cell_pos(&snap, pos);
         let snapped = bitty_ui::snap_to_leading(&snap, clamped);
-        self.selection_anchor_press = Some(snapped);
-        self.selection = Some(Selection {
-            anchor: snapped,
-            focus: snapped,
-            kind: SelectionKind::Block,
-            active: true,
-        });
-        self.selection_dragging = true;
-        self.pending_full_redraw = true;
+        let selection = match kind {
+            SelectionKind::Simple | SelectionKind::Block => Selection {
+                anchor: snapped,
+                focus: snapped,
+                kind,
+                active: true,
+            },
+            SelectionKind::Word => {
+                let range = Selection::word_at(&snap, snapped);
+                Selection {
+                    anchor: range.start,
+                    focus: range.end,
+                    kind,
+                    active: true,
+                }
+            }
+            SelectionKind::Line => {
+                let range = Selection::line_at(&snap, snapped.row);
+                Selection {
+                    anchor: range.start,
+                    focus: range.end,
+                    kind,
+                    active: true,
+                }
+            }
+        };
+        self.install_selection(owner, selection, Some(snapped), true);
     }
 
     /// Updates the current selection's focus to `pos` (mouse drag).
+    ///
+    /// `pos` is a cell in the **owner's** grid: the pointer path maps into
+    /// the owner's content frame first (CTX-0803), so a drag that leaves the
+    /// owner's panel clamps at its edge instead of leaking into a sibling
+    /// panel (#1433).
     ///
     /// Kind-aware (CTX-0385): `Simple`/`Block` move the focus; `Word`
     /// re-expands word-wise around the pinned press cell
     /// ([`Selection::word_drag`]); `Line` covers whole lines between the
     /// press row and `pos` ([`Selection::line_drag`]).
     pub fn update_selection(&mut self, pos: CellPos) {
-        let Some(sel) = self.selection else {
+        let Some(sel) = self.selection_state else {
             return;
         };
-        if !self.selection_dragging {
+        let Some(state) = self.live_view_state(sel.owner) else {
+            // Owner lost its grid mid-drag: fail closed rather than extend a
+            // range into a grid that is no longer there.
+            self.drop_selection();
+            return;
+        };
+        if !sel.dragging {
             return;
         }
-        let snap = self.state.snapshot();
+        let snap = state.snapshot();
         let clamped = clamp_cell_pos(&snap, pos);
         let snapped = bitty_ui::snap_to_leading(&snap, clamped);
-        let anchor_press = self.selection_anchor_press.unwrap_or(sel.anchor);
-        let next = match sel.kind {
+        let anchor_press = sel.anchor_press.unwrap_or(sel.selection.anchor);
+        let next = match sel.selection.kind {
             SelectionKind::Simple | SelectionKind::Block => {
-                let mut next = sel;
+                let mut next = sel.selection;
                 next.focus = snapped;
                 next.active = true;
                 next
@@ -192,11 +415,12 @@ impl Runtime {
             SelectionKind::Word => Selection::word_drag(&snap, anchor_press, snapped),
             SelectionKind::Line => Selection::line_drag(&snap, anchor_press, snapped),
         };
-        self.selection = Some(next);
-        self.pending_full_redraw = true;
+        self.install_selection(sel.owner, next, Some(anchor_press), true);
     }
 
     /// Ends the selection at `pos` (mouse up) and leaves it active for copy.
+    ///
+    /// `pos` is a cell in the **owner's** grid, like [`Self::update_selection`].
     ///
     /// Kind-aware like [`Self::update_selection`]: a press+release without
     /// motion keeps the word/line expansion from the press, while a drag
@@ -208,18 +432,24 @@ impl Runtime {
     /// (standard click-vs-drag classification; a double-click word with no
     /// pointer motion still chains to triple).
     pub fn end_selection(&mut self, pos: CellPos) {
-        let Some(sel) = self.selection else {
+        let Some(sel) = self.selection_state else {
             return;
         };
-        let snap = self.state.snapshot();
+        let Some(state) = self.live_view_state(sel.owner) else {
+            // Owner lost its grid before the release: fail closed.
+            self.drop_selection();
+            self.click_tracker.reset();
+            return;
+        };
+        let snap = state.snapshot();
         let clamped = clamp_cell_pos(&snap, pos);
         let snapped = bitty_ui::snap_to_leading(&snap, clamped);
-        let anchor_press = self.selection_anchor_press.unwrap_or(sel.anchor);
+        let anchor_press = sel.anchor_press.unwrap_or(sel.selection.anchor);
         let was_drag = super::click::cell_distance(anchor_press, snapped)
             > super::click::MULTI_CLICK_MAX_CELL_DISTANCE;
-        let mut finished = match sel.kind {
+        let mut finished = match sel.selection.kind {
             SelectionKind::Simple | SelectionKind::Block => {
-                let mut next = sel;
+                let mut next = sel.selection;
                 next.focus = snapped;
                 next
             }
@@ -227,8 +457,6 @@ impl Runtime {
             SelectionKind::Line => Selection::line_drag(&snap, anchor_press, snapped),
         };
         finished.active = false;
-        self.selection_dragging = false;
-        self.selection_anchor_press = None;
         if was_drag {
             self.click_tracker.reset();
         }
@@ -236,19 +464,39 @@ impl Runtime {
         // Note: a double-click word of length > 1 survives (anchor != focus);
         // a delimiter press collapses and clears, matching stream semantics.
         if finished.anchor == finished.focus {
-            self.selection = None;
+            self.drop_selection();
         } else {
-            self.selection = Some(finished);
+            self.install_selection(sel.owner, finished, None, false);
         }
-        self.pending_full_redraw = true;
+    }
+
+    /// Ends any in-flight drag without moving the focus cell.
+    ///
+    /// Used by the pointer paths that lose the pointer (cursor left the
+    /// window, no tracked cursor, owner lost its frame): the range stays as
+    /// last extended and becomes inactive, exactly like a release in place.
+    pub(super) fn end_selection_drag_in_place(&mut self) {
+        let Some(sel) = self.selection_state else {
+            return;
+        };
+        if !sel.dragging {
+            return;
+        }
+        let mut selection = sel.selection;
+        selection.active = false;
+        self.click_tracker.reset();
+        self.install_selection(sel.owner, selection, None, false);
     }
 
     /// Returns selected text for the current selection, if any.
+    ///
+    /// CTX-0803: read from the **owner's** grid, so a selection made in a
+    /// split pane copies that pane's text, never the primary grid's.
     #[must_use]
     pub fn selection_text(&self) -> Option<String> {
-        let sel = self.selection?;
-        let snap = self.state.snapshot();
-        let text = sel.text(&snap);
+        let (sel, state) = self.selection_owner_state()?;
+        let snap = state.snapshot();
+        let text = sel.selection.text(&snap);
         if text.is_empty() { None } else { Some(text) }
     }
 
@@ -753,12 +1001,25 @@ impl Runtime {
         self.write_input(&bytes);
     }
 
-    /// Selects all cells in the current snapshot (Ctrl+Shift+A / triple-click equivalent).
+    /// Selects all cells of the focused View's grid (Ctrl+Shift+A /
+    /// triple-click equivalent).
+    ///
+    /// CTX-0803: the selection is owned by the focused View and covers that
+    /// View's own grid, so select-all in a split pane selects that pane, not
+    /// the primary grid. A focused leaf that owns no grid (session-less,
+    /// non-primary) selects nothing (fail closed).
     pub fn select_all(&mut self) {
-        let snap = self.state.snapshot();
+        let Some(owner) = self.focused_view() else {
+            self.drop_selection();
+            return;
+        };
+        let Some(state) = self.live_view_state(owner) else {
+            self.drop_selection();
+            return;
+        };
+        let snap = state.snapshot();
         if snap.width == 0 || snap.height == 0 {
-            self.selection = None;
-            self.pending_full_redraw = true;
+            self.drop_selection();
             return;
         }
         let start = CellPos::new(0, 0);
@@ -769,9 +1030,7 @@ impl Runtime {
             kind: SelectionKind::Simple,
             active: false,
         };
-        self.selection = Some(sel);
-        self.selection_dragging = false;
-        self.pending_full_redraw = true;
+        self.install_selection(owner, sel, None, false);
     }
 
     /// Owned clipboard handle (mutable) for advanced use (e.g. OSC 52 tests).

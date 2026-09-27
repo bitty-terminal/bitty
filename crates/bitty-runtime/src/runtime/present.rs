@@ -452,6 +452,50 @@ pub(super) fn cursor_follow_window_start(
     }
 }
 
+/// Clips a normalized owner-grid stream span into the painted frame window
+/// (CTX-0803).
+///
+/// The exact inverse of the pointer mapping's row translation: owner-grid row
+/// `r` paints at frame-local row `r - window_start`. A span that starts above
+/// the window continues from the window's first cell, and a span that ends
+/// below it runs to the window's last column, so the on-screen part is tinted
+/// exactly as the stream fill would tint it without the window. Returns
+/// frame-local `((row, col), (row, col))`, or `None` when the span is entirely
+/// outside the window or the frame has no rows or columns.
+fn clip_span_to_window(
+    start: CellPos,
+    end: CellPos,
+    window_start: usize,
+    frame_rows: u16,
+    frame_cols: u16,
+) -> Option<((u16, u16), (u16, u16))> {
+    let rows = usize::from(frame_rows);
+    if rows == 0 || frame_cols == 0 {
+        return None;
+    }
+    let window_end = window_start.saturating_add(rows);
+    let start_row = usize::from(start.row);
+    let end_row = usize::from(end.row);
+    if end_row < window_start || start_row >= window_end {
+        return None;
+    }
+    let (local_start_row, local_start_col) = if start_row < window_start {
+        (0, 0)
+    } else {
+        (start_row - window_start, usize::from(start.col))
+    };
+    let (local_end_row, local_end_col) = if end_row >= window_end {
+        (rows - 1, usize::from(frame_cols - 1))
+    } else {
+        (end_row - window_start, usize::from(end.col))
+    };
+    let to_u16 = |value: usize| u16::try_from(value).unwrap_or(u16::MAX);
+    Some((
+        (to_u16(local_start_row), to_u16(local_start_col)),
+        (to_u16(local_end_row), to_u16(local_end_col)),
+    ))
+}
+
 /// Creates a viewport snapshot of `snapshot` limited to `cols x rows`.
 ///
 /// When the requested size matches the snapshot the snapshot is returned
@@ -1520,13 +1564,7 @@ impl Runtime {
         layers: &mut FrameLayers,
     ) {
         self.paint_closing_rings(basis.pad_px, now, layers);
-        self.paint_selection_highlight(
-            &basis.allocations,
-            &basis.view_map,
-            &basis.snapshot,
-            basis.pad_px,
-            layers,
-        );
+        self.paint_selection_highlight(&basis.allocations, &basis.view_map, basis.pad_px, layers);
         self.paint_ime_preedit(layers);
         self.paint_pending_banners(
             &basis.allocations,
@@ -1635,13 +1673,11 @@ impl Runtime {
         }
     }
 
-    /// CTX-0158 selection highlight (CTX-0474 extraction; body moved
-    /// verbatim from `tick_at`).
+    /// CTX-0158 selection highlight, painted at the owner's frame (CTX-0803).
     fn paint_selection_highlight(
         &mut self,
         allocations: &[layout_focus::PresentFrame],
         view_map: &std::collections::HashMap<ViewId, View>,
-        snapshot: &Snapshot,
         pad_px: i32,
         layers: &mut FrameLayers,
     ) {
@@ -1650,46 +1686,68 @@ impl Runtime {
         // cell backgrounds. `DrawList` paint order is fills first, then
         // glyphs, so the highlight tints the background while text stays
         // legible on top. Bounded: at most one rect per selected row.
-        // Skipped while the focused view is scrolled into history (the live
-        // grid selection does not map to the scrollback viewport).
-        if let Some(sel) = self.selection {
-            if !sel.is_empty() {
-                let norm = sel.normalized();
-                let scrolled = self
-                    .focused_view()
-                    .and_then(|fid| view_map.get(&fid))
-                    .map(|v| v.scroll_offset() != 0)
-                    .unwrap_or(false);
-                if !scrolled {
-                    let live = self.live_cell_metrics();
-                    let fid = self.focused_view().or(view_map.keys().next().copied());
-                    if let Some(focused_id) = fid {
-                        if let Some(frame) =
-                            allocations.iter().find(|frame| frame.view == focused_id)
-                        {
-                            let rects = bitty_render::grid::selection_fill_rects_in(
-                                &self.config.theme,
-                                (norm.start.row, norm.start.col),
-                                (norm.end.row, norm.end.col),
-                                snapshot.width,
-                                snapshot.height,
-                                live,
-                            );
-                            if !rects.is_empty() {
-                                let origin_px_x = px_add(pad_px, frame.content.x);
-                                let origin_px_y = px_add(pad_px, frame.content.y);
-                                for mut fill in rects {
-                                    fill.rect.x = px_add(fill.rect.x, origin_px_x);
-                                    fill.rect.y = px_add(fill.rect.y, origin_px_y);
-                                    layers.combined_overlay.push(fill);
-                                }
-                                layers.any_needs_draw = true;
-                            }
-                        }
-                    }
-                }
-            }
+        //
+        // CTX-0803 (#1476): the highlight paints at the frame of the View that
+        // *owns* the selection, against that View's grid dimensions and
+        // through the same row-window translation the pointer mapping uses
+        // (`owner_row_window_start`), so hit testing and painting can never
+        // disagree. Skipped when the owner is not presented this frame or is
+        // scrolled into history (the live-grid selection does not map to the
+        // composited scrollback viewport) — the suppression is keyed to the
+        // owner now, not to focus.
+        let Some(owner) = self.selection_owner() else {
+            return;
+        };
+        let Some(sel) = self.selection() else {
+            return;
+        };
+        if sel.is_empty() {
+            return;
         }
+        if view_map
+            .get(&owner)
+            .is_some_and(|view| view.scroll_offset() != 0)
+        {
+            return;
+        }
+        let Some(frame) = allocations.iter().find(|frame| frame.view == owner) else {
+            return;
+        };
+        let Some(state) = self.live_view_state(owner) else {
+            return;
+        };
+        let grid_w = state.width();
+        let grid_h = state.height();
+        let window_start = self.owner_row_window_start(owner, frame.rows);
+        let norm = sel.normalized();
+        // Frame-local span: the inverse of the pointer mapping. The part of
+        // the span above or below the painted window is clipped away; the
+        // fill builder clips columns to the frame below.
+        let Some((start, end)) =
+            clip_span_to_window(norm.start, norm.end, window_start, frame.rows, frame.cols)
+        else {
+            return;
+        };
+        let live = self.live_cell_metrics();
+        let rects = bitty_render::grid::selection_fill_rects_in(
+            &self.config.theme,
+            start,
+            end,
+            grid_w.min(usize::from(frame.cols)),
+            grid_h.min(usize::from(frame.rows)),
+            live,
+        );
+        if rects.is_empty() {
+            return;
+        }
+        let origin_px_x = px_add(pad_px, frame.content.x);
+        let origin_px_y = px_add(pad_px, frame.content.y);
+        for mut fill in rects {
+            fill.rect.x = px_add(fill.rect.x, origin_px_x);
+            fill.rect.y = px_add(fill.rect.y, origin_px_y);
+            layers.combined_overlay.push(fill);
+        }
+        layers.any_needs_draw = true;
     }
 
     /// CTX-0367 inline IME preedit overlay (CTX-0474 extraction; body moved
@@ -2946,5 +3004,54 @@ mod status_bar_overlay_tests {
         short.cells = short.cells[0..4].to_vec().into_boxed_slice();
         overlay_status_bar(&mut short, "1:a*");
         assert_eq!(short.cells.len(), 4);
+    }
+}
+
+#[cfg(test)]
+mod selection_window_clip_tests {
+    //! CTX-0803: the selection paint's frame-window clip is the inverse of
+    //! the pointer mapping's row translation. These pin the stream-span
+    //! continuation rules at the window edges.
+    use super::clip_span_to_window;
+    use bitty_ui::CellPos;
+
+    const ROWS: u16 = 4;
+    const COLS: u16 = 10;
+
+    #[test]
+    fn span_inside_the_window_translates_by_the_window_start() {
+        let clip = clip_span_to_window(CellPos::new(6, 2), CellPos::new(7, 5), 5, ROWS, COLS);
+        assert_eq!(clip, Some(((1, 2), (2, 5))));
+    }
+
+    #[test]
+    fn span_starting_above_the_window_continues_from_its_first_cell() {
+        let clip = clip_span_to_window(CellPos::new(1, 7), CellPos::new(6, 3), 5, ROWS, COLS);
+        assert_eq!(clip, Some(((0, 0), (1, 3))));
+    }
+
+    #[test]
+    fn span_ending_below_the_window_runs_to_its_last_column() {
+        let clip = clip_span_to_window(CellPos::new(6, 4), CellPos::new(20, 1), 5, ROWS, COLS);
+        assert_eq!(clip, Some(((1, 4), (ROWS - 1, COLS - 1))));
+    }
+
+    #[test]
+    fn span_outside_the_window_paints_nothing() {
+        assert_eq!(
+            clip_span_to_window(CellPos::new(0, 0), CellPos::new(4, 9), 5, ROWS, COLS),
+            None
+        );
+        assert_eq!(
+            clip_span_to_window(CellPos::new(9, 0), CellPos::new(12, 9), 5, ROWS, COLS),
+            None
+        );
+    }
+
+    #[test]
+    fn degenerate_frames_paint_nothing() {
+        let (start, end) = (CellPos::new(0, 0), CellPos::new(1, 1));
+        assert_eq!(clip_span_to_window(start, end, 0, 0, COLS), None);
+        assert_eq!(clip_span_to_window(start, end, 0, ROWS, 0), None);
     }
 }

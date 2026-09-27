@@ -376,53 +376,76 @@ impl Runtime {
     /// cells underneath must not start a selection while hidden behind
     /// the bar.
     pub(super) fn status_bar_press(&mut self) -> bool {
-        if !self.workspaceline_visible {
-            return false;
-        }
         let Some(pos) = self.last_cursor else {
             return false;
         };
-        if !pos.x.is_finite() || !pos.y.is_finite() {
+        let Some(col) = self.status_bar_hit(pos) else {
             return false;
+        };
+        self.workspaceline_click(col);
+        true
+    }
+
+    /// Column of the drawn status bar band under `pos`
+    /// (pure probe behind [`Self::status_bar_press`]).
+    ///
+    /// Only the topmost frame under the pointer is considered, in the same
+    /// paint order as the present path and the selection press hit test: a
+    /// float painted over a base leaf's bar row hides that bar, so a press
+    /// there belongs to the float, not to the base leaf's chrome (#1481 made
+    /// floats present at their real bounds, which exposed this).
+    fn status_bar_hit(&self, pos: CursorPosition) -> Option<usize> {
+        if !self.workspaceline_visible {
+            return None;
+        }
+        if !pos.x.is_finite() || !pos.y.is_finite() {
+            return None;
         }
         let live = self.live_cell_metrics();
         if live.width == 0 || live.height == 0 {
-            return false;
+            return None;
         }
         let pad = f64::from(self.window_padding_physical());
         let cell_w = f64::from(live.width);
         let cell_h = f64::from(live.height);
-        for frame in self.present_frames() {
-            if frame.cols == 0 || frame.rows == 0 {
-                continue;
-            }
-            // Mirror the overlay skip in present.rs: no bar is drawn on the
-            // alternate screen (a fullscreen app owns every row there), so a
-            // press there must fall through instead of hitting chrome.
-            let leaf_on_alt = match self.pane_sessions.get(&frame.view) {
-                Some(sess) => sess.state.alt_screen_active(),
-                None => self.state.alt_screen_active(),
-            };
-            if leaf_on_alt {
-                continue;
-            }
-            let Some(bar) = self.status_bar_row(usize::from(frame.rows)) else {
-                continue;
-            };
-            let origin_x = pad + f64::from(frame.content.x.max(0));
-            let origin_y = pad + f64::from(frame.content.y.max(0)) + (bar as f64) * cell_h;
-            let band_w = f64::from(frame.cols) * cell_w;
-            if pos.x >= origin_x
-                && pos.x < origin_x + band_w
-                && pos.y >= origin_y
-                && pos.y < origin_y + cell_h
-            {
-                let col = ((pos.x - origin_x) / cell_w).floor() as usize;
-                self.workspaceline_click(col);
-                return true;
-            }
+        let frames = self.present_frames();
+        let frame = frames.iter().rev().find(|frame| {
+            let rect = frame.frame;
+            let left = pad + f64::from(rect.x);
+            let top = pad + f64::from(rect.y);
+            rect.width > 0
+                && rect.height > 0
+                && pos.x >= left
+                && pos.x < left + f64::from(rect.width)
+                && pos.y >= top
+                && pos.y < top + f64::from(rect.height)
+        })?;
+        if frame.cols == 0 || frame.rows == 0 {
+            return None;
         }
-        false
+        // Mirror the overlay skip in present.rs: no bar is drawn on the
+        // alternate screen (a fullscreen app owns every row there), so a
+        // press there must fall through instead of hitting chrome.
+        let leaf_on_alt = match self.pane_sessions.get(&frame.view) {
+            Some(sess) => sess.state.alt_screen_active(),
+            None => self.state.alt_screen_active(),
+        };
+        if leaf_on_alt {
+            return None;
+        }
+        let bar = self.status_bar_row(usize::from(frame.rows))?;
+        let origin_x = pad + f64::from(frame.content.x.max(0));
+        let origin_y = pad + f64::from(frame.content.y.max(0)) + (bar as f64) * cell_h;
+        let band_w = f64::from(frame.cols) * cell_w;
+        if pos.x >= origin_x
+            && pos.x < origin_x + band_w
+            && pos.y >= origin_y
+            && pos.y < origin_y + cell_h
+        {
+            let col = ((pos.x - origin_x) / cell_w).floor() as usize;
+            return Some(col);
+        }
+        None
     }
 
     /// Rename workspace `index` (0-based) to `name`.

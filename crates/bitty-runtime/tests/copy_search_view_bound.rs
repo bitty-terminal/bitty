@@ -268,3 +268,53 @@ fn persistent_selection_follows_the_keyboard_view() {
     );
     assert_eq!(rt.selection_text().as_deref(), Some("gamma"));
 }
+
+#[test]
+fn primary_drain_after_a_rehome_onto_a_pane_leaf_leaves_its_bindings_alone() {
+    bitty_test_support::require_pty!();
+    // Closing the workspace that holds the primary owner re-homes primary
+    // ownership onto the loaded workspace's focused leaf, which already runs
+    // its own pane session. That leaf reads its pane grid, so output the
+    // still-running primary shell writes into the (now unattributed) primary
+    // grid must neither erase the leaf's selection nor refresh its search.
+    let mut rt = Runtime::new(RuntimeConfig::default()).expect("headless build");
+    rt.force_headless_clipboard();
+    rt.workspace_new().expect("a second workspace");
+    let leaf = rt
+        .focused_view()
+        .expect("the new workspace has a focused leaf");
+    let frame = rt
+        .present_frames()
+        .into_iter()
+        .find(|frame| frame.view == leaf)
+        .expect("the new leaf is presented");
+    rt.spawn_shell_for_view(leaf, "/bin/sh", &["-c", "sleep 30"], frame.cols, frame.rows)
+        .expect("spawn the leaf's pane session");
+    rt.handle_pane_bytes(leaf, PANE_TEXT.as_bytes());
+    assert!(rt.workspace_switch(0), "back to the primary's workspace");
+    let _ = rt.workspace_close_request();
+    assert_eq!(
+        rt.primary_view(),
+        Some(leaf),
+        "primary ownership re-homed onto the pane leaf"
+    );
+
+    let range = Selection::simple(CellPos::new(0, 0), CellPos::new(0, 4));
+    assert!(rt.set_view_selection(leaf, range));
+    rt.search_set("gamma", SearchOptions::default());
+    assert_eq!(rt.search_match_count(), 1, "the leaf's own text matches");
+
+    rt.handle_pty_bytes(b"\x1b[2J");
+    rt.handle_pty_bytes(b"gamma gamma");
+    assert_eq!(
+        rt.selection_owner(),
+        Some(leaf),
+        "an erase on the unattributed primary grid keeps the leaf's selection"
+    );
+    assert_eq!(rt.selection_text().as_deref(), Some("gamma"));
+    assert_eq!(
+        rt.search_match_count(),
+        1,
+        "primary output must not refresh the leaf's search against another grid"
+    );
+}

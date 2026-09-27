@@ -278,9 +278,10 @@ fn press_in_a_non_origin_pane_anchors_at_that_pane_own_origin() {
         "the owner's own leading word, proving the leaf origin was subtracted"
     );
     // `cursor_to_cell` stays public and primary-global for its other callers
-    // (mouse reporting is #1477, alt-drag chrome). It maps this very position
-    // far from the owner's first cell, which is what the selection path used
-    // to do and no longer does.
+    // (alt-drag chrome, the inspect trace, and the mouse-report fallback for a
+    // focused leaf without a frame). It maps this very position far from the
+    // owner's first cell, which is what the selection path used to do and no
+    // longer does.
     assert_ne!(
         rt.cursor_to_cell(pos),
         CellPos::new(0, 0),
@@ -664,25 +665,30 @@ fn select_all_selects_the_focused_pane_grid() {
 }
 
 #[test]
-fn persistent_selection_is_primary_grid_only() {
+fn persistent_selection_skips_a_selection_off_the_keyboard_view() {
     bitty_test_support::require_pty!();
     let mut rt = split_runtime(SplitAxis::Horizontal);
+    assert!(
+        rt.set_focus(PRIMARY),
+        "the keyboard View is the primary pane"
+    );
     let range = Selection::simple(CellPos::new(0, 0), CellPos::new(0, 4));
 
     assert!(rt.set_view_selection(PANE, range));
     assert!(
         rt.persistent_selection().is_none(),
-        "a pane-owned selection has no primary-grid persistent form"
+        "a selection owned by another View has no persistent form on the \
+         keyboard View's grid"
     );
 
     assert!(rt.set_view_selection(PRIMARY, range));
     let pers = rt
         .persistent_selection()
-        .expect("a primary-owned selection persists");
+        .expect("a selection on the keyboard View persists");
     assert_eq!(
         rt.persistent_selection_text(&pers).as_deref(),
         Some("alpha"),
-        "the persistent form addresses the primary grid"
+        "the persistent form addresses the keyboard View's grid"
     );
 }
 
@@ -714,14 +720,65 @@ fn press_on_a_visible_float_selects_in_the_float() {
         Some(PANE),
         "the hit test resolves the visible float, not the base leaf beneath it"
     );
+    assert!(rt.set_focus(PRIMARY), "park focus on the base leaf");
     drag_between(&mut rt, (PANE, 0, 0), (PANE, 0, 4));
 
+    assert_eq!(
+        rt.focused_view(),
+        Some(PANE),
+        "click-to-focus agrees with the selection hit test: the visible float, \
+         not the base leaf painted beneath it"
+    );
     assert_eq!(rt.selection_owner(), Some(PANE));
     assert_eq!(
         rt.selection_text().as_deref(),
         Some("gamma"),
         "the float's own grid supplies the text"
     );
+}
+
+#[test]
+fn a_float_over_the_base_status_bar_owns_the_press() {
+    bitty_test_support::require_pty!();
+    // The base leaf draws its in-grid status bar on its last content row. A
+    // float that covers that row paints over the bar, so a press there
+    // belongs to the float (topmost in paint order), not to the hidden bar's
+    // workspace chrome.
+    let mut rt = Runtime::new(RuntimeConfig::default()).expect("headless build");
+    rt.set_layout(LayoutNode::overlay(
+        LayoutNode::leaf(View::new(PRIMARY, 80, 24)),
+        LayoutNode::leaf(View::new(PANE, 40, 14)),
+        UiRect::new(10, 10, 40, 14),
+    ));
+    rt.force_headless_clipboard();
+    let float = frame_of(&rt, PANE);
+    rt.spawn_shell_for_view(PANE, "/bin/sh", &["-c", "sleep 30"], float.cols, float.rows)
+        .expect("spawn float shell");
+    rt.handle_pty_bytes(PRIMARY_TEXT.as_bytes());
+    // The float runs a fullscreen app (alternate screen), which draws no bar
+    // of its own, so the only bar under the pointer is the hidden base one.
+    rt.handle_pane_bytes(PANE, b"\x1b[?1049h");
+    rt.handle_pane_bytes(PANE, PANE_TEXT.as_bytes());
+
+    let base_rows = usize::from(frame_of(&rt, PRIMARY).rows);
+    let base_bar = rt
+        .status_bar_row(base_rows)
+        .expect("the default config draws the in-grid status bar");
+    let pos = cell_center(&rt, PRIMARY, u16::try_from(base_bar).expect("fits"), 20);
+    assert_eq!(
+        rt.cursor_to_present_cell(pos).map(|(view, _)| view),
+        Some(PANE),
+        "the float covers the base leaf's bar row"
+    );
+
+    rt.handle_cursor_moved(pos);
+    press(&mut rt);
+    assert_eq!(
+        rt.selection_owner(),
+        Some(PANE),
+        "the press reaches the visible float instead of the hidden bar"
+    );
+    release(&mut rt);
 }
 
 // ---------------------------------------------------------------------------

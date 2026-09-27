@@ -31,8 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     and when primary ownership moves away from it.
 
   New APIs: `selection_owner()` and `set_view_selection()`, plus the read-only
-  seam `live_cell_size()`. Unchanged: `cursor_to_cell` still serves mouse
-  reporting and alt-drag chrome (#1477).
+  seam `live_cell_size()`. `cursor_to_cell` stays public and primary-global
+  (alt-drag chrome, the inspect trace); mouse reports no longer use it (see
+  the #1477 entry below). `cursor_to_present_cell` and `cursor_to_leaf_cell`
+  now resolve the topmost frame under the pointer in paint order, so
+  click-to-focus, hover focus, the capture pre-focus, the status bar, and the
+  selection press agree on a float over a base leaf.
 
 - **Copy mode and search are View-bound (CTX-0805, #1478):** copy mode and
   scrollback search read the primary grid. They consulted the focused View
@@ -45,7 +49,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The search overlay and `search_set` bind to the focused View
     (`search_view()`), match only its grid, and refresh only on output to
     it.
-  - A grid erase drops only a selection owned by the erased grid.
+  - A grid erase drops only a selection owned by the erased grid. Output from
+    a primary shell whose owner re-homed onto a pane-session leaf (workspace
+    close) is attributed to no View, so it neither erases that leaf's
+    selection nor refreshes its search.
   - The persistent-selection API follows the keyboard View.
 
 - **Floats present at their cell bounds (CTX-0807, #1481):** the cell-path

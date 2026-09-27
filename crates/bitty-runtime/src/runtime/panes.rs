@@ -676,7 +676,13 @@ impl Runtime {
     pub(super) fn fed_grid_view(&self) -> Option<ViewId> {
         match self.kitty_origin {
             Some(raw) => Some(ViewId::new(raw)),
-            None => self.primary_view,
+            // Same precedence as `selection::grid_of`: a primary owner that
+            // also holds a pane session (re-homed onto a split leaf) reads
+            // that session's grid, so the primary drain feeds a grid no View
+            // resolves to and must not name the owner.
+            None => self
+                .primary_view
+                .filter(|view| !self.pane_sessions.contains_key(view)),
         }
     }
 

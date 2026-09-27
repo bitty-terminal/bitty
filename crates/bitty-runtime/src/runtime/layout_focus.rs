@@ -959,8 +959,10 @@ impl Runtime {
     /// Unlike [`Self::cursor_to_cell`] (global, clamped, single-grid), this
     /// is leaf-aware: the window padding inset (CTX-0223) and the outer gap
     /// are subtracted in live pixels, the remainder is divided by the live
-    /// cell metrics (0157 math), the containing gapped allocation is
-    /// resolved, and the leaf origin is subtracted for the local cell.
+    /// cell metrics (0157 math), the topmost containing gapped allocation is
+    /// resolved in paint order (a visible float wins over the base leaf it
+    /// covers, matching [`Self::cursor_to_present_cell`]), and the leaf
+    /// origin is subtracted for the local cell.
     /// Positions over the padding band, a gap band (inner or outer), or
     /// outside all leaves yield `None`.
     ///
@@ -986,13 +988,28 @@ impl Runtime {
         if col < 0 || row < 0 || col > u16::MAX as i64 || row > u16::MAX as i64 {
             return None;
         }
-        let (id, rect) = self.layout_allocations().into_iter().find(|(_, r)| {
-            !r.is_empty()
-                && (col as u32) >= u32::from(r.x)
-                && (row as u32) >= u32::from(r.y)
-                && (col as u32) < r.right()
-                && (row as u32) < r.bottom()
-        })?;
+        // CTX-0803: resolve the *topmost* leaf under the pointer, in
+        // the same paint order as `present_frames` (stable by overlay tier,
+        // then solver order) and the selection press hit test. The solver
+        // lists a float's base leaves first, so a first-match lookup focused
+        // the base leaf painted *beneath* a visible float: a click on a float
+        // moved keyboard focus to the pane behind it, and the capture
+        // pre-focus stole focus from a mouse-tracking app in a focused float.
+        let tiers: std::collections::HashMap<ViewId, Option<OverlayTier>> =
+            self.layout.leaf_overlay_tiers().into_iter().collect();
+        let (_, id, rect) = self
+            .layout_allocations()
+            .into_iter()
+            .enumerate()
+            .filter(|(_, (_, r))| {
+                !r.is_empty()
+                    && (col as u32) >= u32::from(r.x)
+                    && (row as u32) >= u32::from(r.y)
+                    && (col as u32) < r.right()
+                    && (row as u32) < r.bottom()
+            })
+            .map(|(index, (id, rect))| (index, id, rect))
+            .max_by_key(|(index, id, _)| (tiers.get(id).copied().flatten(), *index))?;
         let local_col = (col as u16)
             .saturating_sub(rect.x)
             .min(rect.width.saturating_sub(1));

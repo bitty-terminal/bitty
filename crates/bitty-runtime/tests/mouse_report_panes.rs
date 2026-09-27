@@ -32,8 +32,8 @@ use bitty_platform::{
     WindowEventKind, WindowId,
 };
 use bitty_runtime::{
-    LayoutNode, PresentFrame, Runtime, RuntimeConfig, SplitAxis, UrlActivation, UrlOpener, View,
-    ViewId,
+    LayoutNode, PresentFrame, Runtime, RuntimeConfig, SplitAxis, UiRect, UrlActivation, UrlOpener,
+    View, ViewId,
 };
 
 const PRIMARY: ViewId = ViewId::new(1);
@@ -298,6 +298,46 @@ fn shift_click_on_another_pane_keeps_focus_and_selects_there() {
         rt.selection_owner(),
         Some(PANE),
         "Shift+press selects in the hit pane, bypassing its capture"
+    );
+    release(&mut rt, MouseButton::Left);
+}
+
+#[test]
+fn clicking_inside_a_focused_capturing_float_reaches_its_app() {
+    bitty_test_support::require_pty!();
+    // A mouse-tracking app in a float that holds focus, over a plain base
+    // leaf. The capture pre-focus must resolve the *visible* float under the
+    // pointer; resolving the base leaf painted beneath it stole focus from
+    // the app and dropped its click.
+    let mut rt = Runtime::new(RuntimeConfig::default()).expect("headless build");
+    rt.set_layout(LayoutNode::overlay(
+        LayoutNode::leaf(View::new(PRIMARY, 80, 24)),
+        LayoutNode::leaf(View::new(PANE, 30, 8)),
+        UiRect::new(20, 6, 30, 8),
+    ));
+    rt.force_headless_clipboard();
+    let frame = frame_of(&rt, PANE);
+    rt.spawn_shell_for_view(PANE, "/bin/sh", &["-c", "cat -v"], frame.cols, frame.rows)
+        .expect("spawn float app");
+    rt.handle_pane_bytes(PANE, SGR_PRESS_TRACKING);
+    assert!(rt.set_focus(PANE));
+
+    rt.handle_cursor_moved(cell_center(&rt, PANE, 1, 2));
+    press(&mut rt, MouseButton::Left);
+    assert_eq!(
+        rt.focused_view(),
+        Some(PANE),
+        "a click inside the focused float keeps focus on the float"
+    );
+    assert!(
+        rt.selection().is_none(),
+        "the float's app consumes the click instead of a selection"
+    );
+    let expected = sgr(0, 1, 2, true);
+    let text = wait_for_pane_text(&mut rt, &expected);
+    assert!(
+        text.contains(&expected),
+        "the float's app receives the click at its own cell; pane text: {text:?}"
     );
     release(&mut rt, MouseButton::Left);
 }

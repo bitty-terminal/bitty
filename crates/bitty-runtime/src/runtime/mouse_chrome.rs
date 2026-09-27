@@ -103,8 +103,9 @@ impl Runtime {
             return false;
         };
         // Topmost hit-test (paint order): overlapping floats own the cursor
-        // over the base layer. The shared `cursor_to_leaf_cell` returns the
-        // first (base) match, which would never grab a visible float.
+        // over the base layer. The grab anchors in the primary-global cell
+        // space `update_alt_drag` measures its deltas in, so it resolves the
+        // leaf from that cell rather than through `cursor_to_leaf_cell`.
         let anchor = self.cursor_to_cell(cursor);
         let leaf = self
             .layout_allocations()

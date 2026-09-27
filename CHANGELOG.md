@@ -48,6 +48,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A grid erase drops only a selection owned by the erased grid.
   - The persistent-selection API follows the keyboard View.
 
+- **Floats present at their cell bounds (CTX-0807, #1481):** the cell-path
+  solver, `layout_cmd`, and Alt+drag read `LayoutNode::Overlay` bounds as
+  cells. The decorated present solver used the raw cell numbers as pixels,
+  so a float presented as a sliver near the window origin with a 1x1 pane
+  grid. The px solver now scales overlay bounds by the live cell size. The
+  unit-agnostic `layout_with_decoration` output is unchanged.
+
 - **Pointer consumers address the pane under the pointer (CTX-0804,
   #1477):** mouse reports, capture click-to-focus, and OSC 8 hyperlink
   activation used the primary-global `cursor_to_cell`. In a split, an app in

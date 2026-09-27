@@ -694,17 +694,12 @@ fn persistent_selection_is_primary_grid_only() {
 fn press_on_a_visible_float_selects_in_the_float() {
     bitty_test_support::require_pty!();
     let mut rt = Runtime::new(RuntimeConfig::default()).expect("headless build");
-    // The decorated present solver currently places overlay bounds in surface
-    // pixels while the cell path reads them as cells (#1481), so the float is
-    // sized in pixels from the live cell size (no literal pixels). The
-    // assertions hold under either unit once #1481 lands: the float stays the
-    // topmost frame under the pointer.
-    let (cw, ch) = rt.live_cell_size();
-    let px = |cells: u32, cell: u32| u16::try_from(cells * cell).expect("fits the surface");
+    // Overlay bounds are cells (#1481 aligned the decorated present solver
+    // with the cell path).
     rt.set_layout(LayoutNode::overlay(
         LayoutNode::leaf(View::new(PRIMARY, 80, 24)),
         LayoutNode::leaf(View::new(PANE, 30, 8)),
-        UiRect::new(px(20, cw), px(6, ch), px(30, cw), px(8, ch)),
+        UiRect::new(20, 6, 30, 8),
     ));
     rt.force_headless_clipboard();
     let float = frame_of(&rt, PANE);

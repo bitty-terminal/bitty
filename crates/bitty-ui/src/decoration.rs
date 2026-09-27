@@ -272,6 +272,39 @@ struct Bands {
     border: u16,
     content_inset: u16,
     radius: u16,
+    /// How overlay bounds map into this solver's unit (#1481, CTX-0807).
+    overlay: OverlayUnits,
+}
+
+/// Mapping from [`LayoutNode::Overlay`] bounds to the solver's unit.
+///
+/// Overlay bounds are authored in **cells**, in the same coordinate space as
+/// the container. That is the unit the cell-path solver, `layout_cmd`, and
+/// Alt+drag moves use. The unit-agnostic
+/// [`LayoutNode::layout_with_decoration`] keeps them as-is (`scale = (1, 1)`),
+/// which is bit-identical to its historic output. The physical-pixel solver
+/// receives its area as the container scaled by the live cell size, so it
+/// scales overlay bounds by the same cell size. Without that, a float was
+/// presented as a sliver whose pixel frame equalled its cell numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OverlayUnits {
+    /// Solver units per overlay cell along `(x, y)`.
+    scale: (u16, u16),
+}
+
+impl OverlayUnits {
+    /// Identity mapping (overlay bounds already in solver units).
+    const IDENTITY: Self = Self { scale: (1, 1) };
+
+    /// Maps overlay `bounds` into solver units, saturating.
+    fn map(self, bounds: Rect) -> Rect {
+        Rect::new(
+            bounds.x.saturating_mul(self.scale.0),
+            bounds.y.saturating_mul(self.scale.1),
+            bounds.width.saturating_mul(self.scale.0),
+            bounds.height.saturating_mul(self.scale.1),
+        )
+    }
 }
 
 /// Round-half-away-from-zero conversion of a logical-px decoration value to
@@ -343,6 +376,7 @@ impl LayoutNode {
             border: decoration.border,
             content_inset: decoration.content_inset,
             radius: decoration.radius,
+            overlay: OverlayUnits::IDENTITY,
         };
         let area = inset_axes(bounds, bands.outer_x, bands.outer_y);
         let mut out = Vec::new();
@@ -362,13 +396,16 @@ impl LayoutNode {
     /// - outer inset axis: `scaled(gaps_out) + gaps.outer * cell_axis`;
     /// - sibling band axis: `scaled(gaps_in) + gaps.inner * cell_axis`;
     /// - content inset and radius: `scaled(...)`; the leaf content rectangle
-    ///   is inset by `scaled(border) + scaled(content_inset)` (CTX-0333).
+    ///   is inset by `scaled(border) + scaled(content_inset)` (CTX-0333);
+    /// - overlay bounds (authored in cells, #1481): `bounds * cell_axis`.
     ///
     /// With `gaps == Gaps::ZERO` and `scale == 1.0` this is bit-identical to
-    /// [`Self::layout_with_decoration`] (same integer unit); with
+    /// [`Self::layout_with_decoration`] for trees without overlays (and for
+    /// overlays too when `cell == (1, 1)`); with
     /// `decoration == Decoration::ZERO` it is the CTX-0177 cell-gap solver
     /// expressed in physical pixels. `bounds` is the workspace area in
-    /// physical pixels (window padding is Window chrome, not decoration).
+    /// physical pixels (window padding is Window chrome, not decoration),
+    /// i.e. the container scaled by `cell`.
     #[must_use]
     pub fn layout_with_decoration_scaled(
         &self,
@@ -391,6 +428,10 @@ impl LayoutNode {
             border,
             content_inset,
             radius,
+            // #1481: overlay bounds are cells in the container's coordinate
+            // space; this solver's area is that container scaled by the live
+            // cell size, so overlay bounds scale the same way.
+            overlay: OverlayUnits { scale: cell },
         };
         let area = inset_axes(bounds, bands.outer_x, bands.outer_y);
         let mut out = Vec::new();
@@ -444,11 +485,12 @@ impl LayoutNode {
                 ..
             } => {
                 base.layout_bands_inner(bounds, bands, out);
-                let clipped = if let Some(inter) = overlay_bounds.clip_to(bounds) {
-                    inter
-                } else {
-                    Rect::zero()
-                };
+                let clipped =
+                    if let Some(inter) = bands.overlay.map(*overlay_bounds).clip_to(bounds) {
+                        inter
+                    } else {
+                        Rect::zero()
+                    };
                 overlay.layout_bands_inner(clipped, bands, out);
             }
         }
@@ -714,6 +756,58 @@ mod tests {
         assert_eq!(
             node.layout_with_decoration(bounds, d),
             node.layout_with_decoration_scaled(bounds, d, 1.0, (9, 19), Gaps::ZERO)
+        );
+    }
+
+    #[test]
+    fn scaled_overlay_bounds_are_cells_scaled_by_the_cell_size() {
+        // #1481 (CTX-0807): overlay bounds are authored in cells, like the
+        // cell-path solver reads them. The px solver scales them by the live
+        // cell size instead of using the raw cell numbers as pixels.
+        const CELL: (u16, u16) = (9, 19);
+        let node = LayoutNode::overlay(
+            LayoutNode::leaf(view(1, 80, 24)),
+            LayoutNode::leaf(view(2, 30, 8)),
+            Rect::new(20, 6, 30, 8),
+        );
+        let area = Rect::new(0, 0, 80 * CELL.0, 24 * CELL.1);
+        let out = node.layout_with_decoration_scaled(area, Decoration::ZERO, 1.0, CELL, Gaps::ZERO);
+        let float = out
+            .iter()
+            .find(|(id, _)| *id == ViewId::new(2))
+            .expect("the float is laid out");
+        assert_eq!(
+            float.1.frame,
+            Rect::new(20 * CELL.0, 6 * CELL.1, 30 * CELL.0, 8 * CELL.1)
+        );
+        // The cell-unit solver keeps the authored bounds as-is.
+        let cells = node.layout_with_decoration(Rect::new(0, 0, 80, 24), Decoration::ZERO);
+        let float = cells
+            .iter()
+            .find(|(id, _)| *id == ViewId::new(2))
+            .expect("the float is laid out");
+        assert_eq!(float.1.frame, Rect::new(20, 6, 30, 8));
+    }
+
+    #[test]
+    fn scaled_overlay_bounds_clip_to_the_parent_area() {
+        // A float authored past the container edge clips to the px area,
+        // exactly like the cell path clips it to the container.
+        const CELL: (u16, u16) = (9, 19);
+        let node = LayoutNode::overlay(
+            LayoutNode::leaf(view(1, 10, 5)),
+            LayoutNode::leaf(view(2, 10, 5)),
+            Rect::new(6, 3, 10, 5),
+        );
+        let area = Rect::new(0, 0, 10 * CELL.0, 5 * CELL.1);
+        let out = node.layout_with_decoration_scaled(area, Decoration::ZERO, 1.0, CELL, Gaps::ZERO);
+        let float = out
+            .iter()
+            .find(|(id, _)| *id == ViewId::new(2))
+            .expect("the float is laid out");
+        assert_eq!(
+            float.1.frame,
+            Rect::new(6 * CELL.0, 3 * CELL.1, 4 * CELL.0, 2 * CELL.1)
         );
     }
 

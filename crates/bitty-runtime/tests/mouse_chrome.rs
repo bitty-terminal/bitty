@@ -279,14 +279,30 @@ fn alt_press_on_tiled_layout_falls_through_to_selection() {
 fn shift_alt_press_forces_selection_not_drag() {
     // Shift wins over chrome (CTX-0181 accessibility escape): even over a
     // float, Shift+Alt+press selects instead of grabbing.
+    //
+    // #1481 (CTX-0807): the float now presents at its cell bounds, so the
+    // press lands on the float itself, and the View-owned selection
+    // (CTX-0803) selects in the float's own grid. The shared
+    // `overlay_tree` float owns no grid, so this test puts the primary grid
+    // on the float to keep exercising the Shift escape against a float that
+    // can select.
     let mut rt = make_runtime();
-    rt.set_layout(overlay_tree());
+    rt.set_layout(LayoutNode::overlay(
+        LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+        LayoutNode::leaf(View::new(ViewId::new(1), 10, 5)),
+        UiRect::new(50, 10, 10, 5),
+    ));
     rt.handle_cursor_moved(cell_pixels(55, 12));
     rt.handle_key_event(named_key(NamedKey::Shift, PressState::Pressed));
     rt.handle_key_event(named_key(NamedKey::Alt, PressState::Pressed));
     rt.handle_mouse_input(press(MouseButton::Left));
     assert!(!rt.alt_drag_active(), "Shift must suppress the grab");
     assert!(rt.is_selection_dragging());
+    assert_eq!(
+        rt.selection_owner(),
+        Some(ViewId::new(1)),
+        "the selection belongs to the float under the pointer"
+    );
     rt.handle_mouse_input(release(MouseButton::Left));
     rt.handle_key_event(named_key(NamedKey::Shift, PressState::Released));
     rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));

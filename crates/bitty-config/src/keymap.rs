@@ -62,7 +62,8 @@
 //!   `workspace_last`, `workspace_focus:<1..=16>`, `workspace_move:<1..=16>`
 //!   (CTX-0257 workspace ops entry per DEC-0034 plus CTX-0259 move, rechorded
 //!   CTX-0766: `alt+n` opens a new panel, `alt+t` opens a new workspace):
-//!   `alt+n` new panel, `alt+t` new, `alt+w` close with kill-confirm,
+//!   `alt+n` new panel, `alt+t` new, `alt+d` close pane/view with confirm,
+//!   `alt+w` close workspace with kill-confirm,
 //!   `alt+-`/`alt+=` prev/next (`=` is the unshifted DEC `+`), `alt+tab`
 //!   last-used, `alt+1..=9` jump to workspace N,
 //!   `shift+alt+1..=9` move focused window to workspace N),
@@ -87,11 +88,12 @@
 //! `ctrl+tab` cycles, `ctrl+shift+c/v` copy/paste) plus the DEC-0034
 //! workspace entry (CTX-0257, rechorded CTX-0766): `alt+t` new workspace,
 //! `alt+1..=9` jump to
-//! workspace N, `alt+-`/`alt+=` prev/next, `alt+tab` last-used, `alt+w`
-//! close with kill-confirm. `alt+w` and `alt+1..=9` previously drove pane
-//! ops (`close_view`, `focus:<n>`); those actions stay parseable and
-//! user-bindable but are no longer bound by default — workspace numbers won
-//! the Alt slot per the owner spec, panes navigate spatially (`goto_split`,
+//! workspace N, `alt+-`/`alt+=` prev/next, `alt+tab` last-used, `alt+d`
+//! close pane with confirm, `alt+w` close workspace with kill-confirm.
+//! `alt+w` and `alt+1..=9` previously drove pane ops (`close_view`,
+//! `focus:<n>`); those actions stay parseable and user-bindable but are
+//! no longer bound by default — workspace numbers won the Alt slot per
+//! the owner spec, panes navigate spatially (`goto_split`,
 //! `focus_next`/`focus_prev`). The CTX-0265 help popup (009 §which-key:
 //! floating overlay listing every bound shortcut, generated from the live
 //! registry) toggles on `alt+`` plus the `alt+?` shifted-symbol spellings
@@ -628,9 +630,10 @@ pub enum ChromeAction {
     ResizeSplit(SplitDir),
     /// Close the focused pane (`close_view`, alias `close_surface`).
     ///
-    /// No longer bound by default (CTX-0257: `alt+w` closes the workspace);
-    /// stays parseable so users keep pane-granularity close via an explicit
-    /// bind, and `ctl terminal close` is unchanged.
+    /// Default binding: `alt+d` (issue #1444). Respects the `close_confirm`
+    /// mode: `when_busy` (default) prompts when a foreground job runs,
+    /// `always` prompts unconditionally, `never` closes immediately.
+    /// The first gesture arms a confirmation; repeat to confirm, `Esc` to cancel.
     CloseView,
     /// Toggle single-pane zoom (`toggle_zoom`, alias `toggle_split_zoom`).
     ToggleZoom,
@@ -1233,8 +1236,8 @@ pub const DEFAULT_KEYMAPS: &[(&str, &str)] = &[
     ("shift+alt+7", "workspace_move:7"),
     ("shift+alt+8", "workspace_move:8"),
     ("shift+alt+9", "workspace_move:9"),
-    ("alt+u", "scroll_page_up"),
-    ("alt+i", "scroll_page_down"),
+    ("alt+u", "scroll_page_down"),
+    ("alt+i", "scroll_page_up"),
     ("ctrl+alt+left", "goto_split:left"),
     ("ctrl+alt+right", "goto_split:right"),
     ("ctrl+alt+up", "goto_split:up"),
@@ -1274,6 +1277,7 @@ pub const DEFAULT_KEYMAPS: &[(&str, &str)] = &[
     ("ctrl+shift+alt+down", "resize_split:down"),
     ("ctrl+shift+alt+up", "resize_split:up"),
     ("ctrl+shift+alt+right", "resize_split:right"),
+    ("alt+d", "close_view"),
     ("alt+w", "workspace_close"),
     ("alt+m", "toggle_zoom"),
     ("alt+f", "toggle_zoom"),
@@ -2381,11 +2385,11 @@ mod tests {
         }
         assert_eq!(
             match_keymap(&maps, key_ref(KeyName::Char('u'), false, true, false)),
-            Some(ChromeAction::ScrollPageUp)
+            Some(ChromeAction::ScrollPageDown)
         );
         assert_eq!(
             match_keymap(&maps, key_ref(KeyName::Char('i'), false, true, false)),
-            Some(ChromeAction::ScrollPageDown)
+            Some(ChromeAction::ScrollPageUp)
         );
         assert_eq!(
             match_keymap(&maps, key_ref(KeyName::Char('z'), false, true, false)),
@@ -2453,6 +2457,53 @@ mod tests {
     }
 
     #[test]
+    fn defaults_close_shortcuts_issue_1444() {
+        // Issue #1444: alt+d closes pane/view, alt+w closes workspace.
+        // Both respect close_confirm mode (tested in bitty-runtime).
+        let maps = default_keymaps().expect("defaults valid");
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('d'), false, true, false)),
+            Some(ChromeAction::CloseView),
+            "alt+d closes pane/view"
+        );
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('w'), false, true, false)),
+            Some(ChromeAction::WorkspaceClose),
+            "alt+w closes workspace"
+        );
+        // Super flip rebinds both (Mod slot carried).
+        let super_maps = default_keymaps_with_mod(ModKey::Super).expect("super valid");
+        assert_eq!(
+            match_keymap(
+                &super_maps,
+                KeyRef {
+                    key: KeyName::Char('d'),
+                    ctrl: false,
+                    alt: false,
+                    shift: false,
+                    super_held: true,
+                }
+            ),
+            Some(ChromeAction::CloseView),
+            "super+d closes pane under Super mod"
+        );
+        assert_eq!(
+            match_keymap(
+                &super_maps,
+                KeyRef {
+                    key: KeyName::Char('w'),
+                    ctrl: false,
+                    alt: false,
+                    shift: false,
+                    super_held: true,
+                }
+            ),
+            Some(ChromeAction::WorkspaceClose),
+            "super+w closes workspace under Super mod"
+        );
+    }
+
+    #[test]
     fn defaults_have_unique_chord_identities() {
         // Collision audit as a test: every default chord identity is unique
         // so no default shadows another (CTX-0178, extended CTX-0258 to
@@ -2468,6 +2519,7 @@ mod tests {
         // copy-mode chord (ctrl+shift+space) = 80 total, plus CTX-0383's 1
         // search chord (ctrl+shift+f) = 81 total, plus CTX-0766's 1 new
         // workspace chord (alt+t; alt+n becomes new-panel) = 82 total,
+        // plus issue #1444's 1 close-view chord (alt+d) = 83 total,
         // and the full DEC
         // set resolves. Zoom chords carry
         // no `alt`, so they must stay unique under Alt and Super alike.
@@ -2475,8 +2527,8 @@ mod tests {
             let maps = default_keymaps_with_mod(mod_key).expect("defaults valid");
             assert_eq!(
                 maps.len(),
-                82,
-                "35 shipped + 4 workspace-entry chords + 4 resize chords + 16 arrow aliases + 7 zoom chords + 9 move chords + 4 help chords + 1 copy-mode chord + 1 search chord + 1 CTX-0766 rechord"
+                83,
+                "35 shipped + 4 workspace-entry chords + 4 resize chords + 16 arrow aliases + 7 zoom chords + 9 move chords + 4 help chords + 1 copy-mode chord + 1 search chord + 1 CTX-0766 rechord + 1 issue-1444 close-view"
             );
             let mut seen = std::collections::HashSet::new();
             for m in &maps {
@@ -3180,11 +3232,10 @@ mod tests {
         // owns exactly one action, no identity collides (with each other or
         // with the shipped defaults), and the Super rebound keeps the
         // explicit Alt spellings intact while the Super spellings stay free.
-        // This task allocates NO new shipped defaults (CTX-0259 owns
-        // Mod+Shift+Number, CTX-0265 owns Mod+backtick/Mod+?), so the
-        // default count stays pinned at 81 under both mods (35 shipped
-        // + 4 workspace + 4 resize + 16 arrow + 9 move + 7 zoom + 4 help
-        // + 1 copy-mode + 1 search).
+        // The default count is 83 under Alt mod (35 shipped + 4 workspace
+        // + 4 resize + 16 arrow + 9 move + 7 zoom + 4 help + 1 copy-mode
+        // + 1 search + 1 CTX-0766 rechord + 1 issue-1444 close-view).
+        // Under Super mod, alt+d becomes super+d (still counted).
         let entries: &[(&str, &str)] = &[
             ("alt+f1", "goto_split:left"),
             ("alt+f5", "goto_split:right"),
@@ -3212,14 +3263,14 @@ mod tests {
             let defaults = default_keymaps_with_mod(mod_key).expect("defaults valid");
             assert_eq!(
                 defaults.len(),
-                82,
+                83,
                 "no new shipped defaults under mod {:?}",
                 mod_key
             );
             let maps = resolve_keymaps(&mk_effective(mod_key)).expect("resolves");
             assert_eq!(
                 maps.len(),
-                82 + entries.len(),
+                83 + entries.len(),
                 "explicit binds append, never shadow, under mod {:?}",
                 mod_key
             );
@@ -3782,5 +3833,46 @@ mod tests {
         } else {
             assert_eq!(LeaderPlatform::host(), LeaderPlatform::Other);
         }
+    }
+
+    #[test]
+    fn alt_u_i_page_scroll_order_fixed() {
+        // Issue #1437: alt+u/alt+i were swapped; corrected so alt+u scrolls
+        // down (toward live, less-like `d` behavior) and alt+i scrolls up
+        // (into history, less-like `u` behavior reversed from the key name).
+        let mk_effective = |mod_key| EffectiveConfig {
+            mod_key,
+            ..Default::default()
+        };
+        let maps = resolve_keymaps(&mk_effective(ModKey::Alt)).expect("resolves");
+
+        let u_chord = Chord::parse("alt+u").expect("alt+u parses");
+        let i_chord = Chord::parse("alt+i").expect("alt+i parses");
+
+        let u_key = KeyRef {
+            key: u_chord.key,
+            ctrl: u_chord.ctrl,
+            alt: u_chord.alt,
+            shift: u_chord.shift,
+            super_held: u_chord.super_held,
+        };
+        let i_key = KeyRef {
+            key: i_chord.key,
+            ctrl: i_chord.ctrl,
+            alt: i_chord.alt,
+            shift: i_chord.shift,
+            super_held: i_chord.super_held,
+        };
+
+        assert_eq!(
+            match_keymap(&maps, u_key),
+            Some(ChromeAction::ScrollPageDown),
+            "alt+u scrolls down (toward live)"
+        );
+        assert_eq!(
+            match_keymap(&maps, i_key),
+            Some(ChromeAction::ScrollPageUp),
+            "alt+i scrolls up (into history)"
+        );
     }
 }

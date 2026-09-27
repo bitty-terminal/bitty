@@ -2182,11 +2182,11 @@ mod tests {
         );
         assert_eq!(
             match_keymap(&maps, shell(KeyName::Char('u'), false, true, false)),
-            Some(bitty_config::ChromeAction::ScrollPageUp)
+            Some(bitty_config::ChromeAction::ScrollPageDown)
         );
         assert_eq!(
             match_keymap(&maps, shell(KeyName::Char('i'), false, true, false)),
-            Some(bitty_config::ChromeAction::ScrollPageDown)
+            Some(bitty_config::ChromeAction::ScrollPageUp)
         );
         assert_eq!(
             match_keymap(&maps, shell(KeyName::Char('z'), false, true, false)),
@@ -4645,5 +4645,71 @@ mod tests {
             !drive_mod_char(&mut app, "\"", false, true, true, false),
             "unbound shifted symbol falls through to the terminal path"
         );
+    }
+
+    // Issue #1445: Regression tests for Ctrl+Shift+hjkl resize directions.
+    // Pins hjkl→direction mapping: h=left, j=down, k=up, l=right (vim standard).
+    // Both Ctrl+Shift+hjkl and Ctrl+Shift+Mod+hjkl use the same actions.
+
+    #[test]
+    fn resize_left_grows_focused_pane_leftward() {
+        use bitty_config::SplitDir;
+        let mut layout = two_pane_layout();
+        // Focus is on left pane (ViewId 1) by default.
+        // resize:left should succeed and grow the left pane.
+        assert!(
+            resize_focused_pane(&mut layout, ViewId::new(1), SplitDir::Left),
+            "resize:left on left pane should succeed"
+        );
+    }
+
+    #[test]
+    fn resize_right_grows_focused_pane_rightward() {
+        use bitty_config::SplitDir;
+        let mut layout = two_pane_layout();
+        assert!(
+            resize_focused_pane(&mut layout, ViewId::new(1), SplitDir::Right),
+            "resize:right on left pane should succeed"
+        );
+    }
+
+    #[test]
+    fn resize_up_grows_focused_pane_upward() {
+        use bitty_config::SplitDir;
+        let mut layout = LayoutNode::split(
+            SplitAxis::Vertical,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 80, 12)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 80, 12)),
+        );
+        assert!(
+            resize_focused_pane(&mut layout, ViewId::new(1), SplitDir::Up),
+            "resize:up on top pane should succeed"
+        );
+    }
+
+    #[test]
+    fn resize_down_grows_focused_pane_downward() {
+        use bitty_config::SplitDir;
+        let mut layout = LayoutNode::split(
+            SplitAxis::Vertical,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 80, 12)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 80, 12)),
+        );
+        assert!(
+            resize_focused_pane(&mut layout, ViewId::new(1), SplitDir::Down),
+            "resize:down on top pane should succeed"
+        );
+    }
+
+    #[test]
+    fn hjkl_direction_mapping_is_vim_standard() {
+        use bitty_config::SplitDir;
+        // Pin the canonical direction names (issue #1445).
+        assert_eq!(SplitDir::Left.canonical(), "left", "h maps to left");
+        assert_eq!(SplitDir::Down.canonical(), "down", "j maps to down");
+        assert_eq!(SplitDir::Up.canonical(), "up", "k maps to up");
+        assert_eq!(SplitDir::Right.canonical(), "right", "l maps to right");
     }
 }

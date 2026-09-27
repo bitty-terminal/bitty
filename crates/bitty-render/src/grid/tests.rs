@@ -2089,3 +2089,99 @@ fn ctx0392_custom_palette_maps_and_dynamic_overrides() {
     assert_eq!(super::palette_rgb_in(&live, 0), [0x00, 0x00, 0x00]);
     assert_eq!(super::palette_rgb_in(&live, 255), [0xFF, 0xFF, 0xFF]);
 }
+
+/// CTX-0797 / Issue #1409: a `DrawList` records the atlas epoch its glyph
+/// slots were placed at, so a consumer can tell a live list from one whose
+/// slots were wiped by a later eviction.
+#[test]
+fn draw_list_tracks_atlas_epoch() {
+    let mut grid = renderer();
+    let state = state_from(&[print('a')]);
+    let damage = damage_all(&state);
+
+    let epoch_before = grid.atlas_epoch();
+    let list = grid.render(&state.snapshot(), &damage).unwrap();
+
+    // The default atlas is large enough for one glyph: no reset, so the list
+    // carries the epoch it entered `render` with and is still valid.
+    assert_eq!(grid.atlas_stats().2, 0, "no eviction on the default atlas");
+    assert_eq!(list.atlas_epoch, epoch_before);
+    assert!(list.is_atlas_epoch_valid(grid.atlas_epoch()));
+    assert!(
+        !list.is_atlas_epoch_valid(epoch_before.wrapping_add(1)),
+        "a newer epoch must invalidate the list"
+    );
+}
+
+/// CTX-0797 / Issue #1409: when `overlay_text_glyphs` exhausts the atlas after
+/// `render` built a `DrawList`, that list's slots are dead and
+/// `is_atlas_epoch_valid` must report it.
+///
+/// The fixture forces the eviction rather than observing it opportunistically:
+/// 8x8 atlas, fake bitmaps 6..=8 wide and 6 tall, so exactly one placement
+/// fits. `render` places 'a' without a reset, then a ten-cell overlay line
+/// cannot fit its second glyph and evicts. Both facts are asserted, so the
+/// staleness assertion below can never pass vacuously.
+#[test]
+fn overlay_eviction_makes_draw_list_stale() {
+    let mut grid =
+        GridRenderer::with_atlas_dimension(FakeRasterizer::new(), &font_query(), cell_metrics(), 8)
+            .unwrap();
+
+    let state = state_from(&[print('a')]);
+    let damage = damage_all(&state);
+    let list = grid.render(&state.snapshot(), &damage).unwrap();
+
+    let epoch_at_render = list.atlas_epoch;
+    assert_eq!(grid.atlas_stats().2, 0, "one glyph fits without a reset");
+    assert!(list.is_atlas_epoch_valid(grid.atlas_epoch()));
+
+    // Overlay text wider than one atlas generation: the pass exhausts, resets
+    // wholesale, and replaces the slots the DrawList above still points at.
+    let overlay = grid.overlay_text_glyphs("abcdefghij", (0, 0), 10, DEFAULT_FG);
+    assert!(!overlay.is_empty(), "the overlay line emitted instances");
+
+    let epoch_after_overlay = grid.atlas_epoch();
+    assert_eq!(
+        grid.atlas_stats().2,
+        1,
+        "the overlay pass must evict exactly once"
+    );
+    assert_ne!(
+        epoch_after_overlay, epoch_at_render,
+        "an atlas reset must advance the epoch"
+    );
+    assert!(
+        !list.is_atlas_epoch_valid(epoch_after_overlay),
+        "the pre-overlay DrawList must read as stale"
+    );
+}
+
+/// CTX-0797 / Issue #1409: `render` stays frame-consistent on its own — the
+/// returned `DrawList` reports the epoch its surviving placement pass used,
+/// even when the first pass exhausted the atlas and forced a reset.
+#[test]
+fn render_maintains_single_epoch_under_eviction() {
+    let mut grid =
+        GridRenderer::with_atlas_dimension(FakeRasterizer::new(), &font_query(), cell_metrics(), 8)
+            .unwrap();
+
+    // Four glyphs on an atlas that holds one: exhaustion mid-pass is certain.
+    let state = state_from(
+        &['a', 'b', 'c', 'd']
+            .iter()
+            .map(|&c| print(c))
+            .collect::<Vec<_>>(),
+    );
+    let damage = damage_all(&state);
+
+    let list = grid.render(&state.snapshot(), &damage).unwrap();
+
+    // The reset really happened, so the assertions below are not vacuous.
+    assert_eq!(grid.atlas_stats().2, 1, "one frame-consistent reset");
+    assert_ne!(list.atlas_epoch, 0, "the list reports the post-reset epoch");
+
+    // Every slot in the returned list belongs to the live epoch.
+    assert_eq!(list.atlas_epoch, grid.atlas_epoch());
+    assert!(list.is_atlas_epoch_valid(grid.atlas_epoch()));
+}

@@ -139,6 +139,7 @@ impl Runtime {
     /// `action_a` is the wire `a=` value (`None` when absent, which means
     /// transmit-and-display per the kitty specification); `cols_c`/`rows_r`
     /// are the explicit `c=`/`r=` cell spans (0 derives from pixels).
+    /// `cursor_movement_c` is the wire `C=` value (`0` moves cursor, `1` keeps it).
     /// `z` orders images ascending among themselves.
     ///
     /// The placement is tagged with the currently-drained stream's origin
@@ -153,6 +154,10 @@ impl Runtime {
     /// the new placement. Alternate-screen display stores without placing
     /// ([`KittyDisplayOutcome::SuppressedAlternateScreen`]).
     ///
+    /// Per Kitty spec: after placing an image, cursor moves right by the
+    /// number of columns and down by the number of rows in the placement
+    /// rectangle, unless `C=1` is set.
+    ///
     /// # Errors
     ///
     /// Same as [`Runtime::kitty_transmit_image`]; failures store nothing
@@ -166,6 +171,7 @@ impl Runtime {
         action_a: Option<char>,
         cols_c: u16,
         rows_r: u16,
+        cursor_movement_c: u8,
         payload: &[u8],
         z: i32,
     ) -> Result<KittyDisplayOutcome, KittyImageError> {
@@ -204,6 +210,21 @@ impl Runtime {
             )
             .map_err(KittyImageError::Placement)?;
         self.pending_full_redraw = true;
+
+        // Move cursor according to Kitty spec: after placing an image, cursor
+        // moves right by cols and down by rows, unless C=1 (do not move).
+        if cursor_movement_c != 1 {
+            // Cursor moves right by cols_c and down by rows_r
+            let new_col = cursor.col.saturating_add(cols_c);
+            let new_row = cursor.row.saturating_add(rows_r);
+
+            // Apply cursor movement using CursorPosition
+            self.state.apply(&bitty_vt::TerminalAction::CursorPosition {
+                row: bitty_vt::Row(new_row),
+                col: bitty_vt::Col(new_col),
+            });
+        }
+
         Ok(KittyDisplayOutcome::Displayed { image, placement })
     }
 }

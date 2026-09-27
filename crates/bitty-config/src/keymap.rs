@@ -3232,11 +3232,10 @@ mod tests {
         // owns exactly one action, no identity collides (with each other or
         // with the shipped defaults), and the Super rebound keeps the
         // explicit Alt spellings intact while the Super spellings stay free.
-        // This task allocates NO new shipped defaults (CTX-0259 owns
-        // Mod+Shift+Number, CTX-0265 owns Mod+backtick/Mod+?), so the
-        // default count stays pinned at 81 under both mods (35 shipped
-        // + 4 workspace + 4 resize + 16 arrow + 9 move + 7 zoom + 4 help
-        // + 1 copy-mode + 1 search).
+        // The default count is 83 under Alt mod (35 shipped + 4 workspace
+        // + 4 resize + 16 arrow + 9 move + 7 zoom + 4 help + 1 copy-mode
+        // + 1 search + 1 CTX-0766 rechord + 1 issue-1444 close-view).
+        // Under Super mod, alt+d becomes super+d (still counted).
         let entries: &[(&str, &str)] = &[
             ("alt+f1", "goto_split:left"),
             ("alt+f5", "goto_split:right"),
@@ -3264,14 +3263,14 @@ mod tests {
             let defaults = default_keymaps_with_mod(mod_key).expect("defaults valid");
             assert_eq!(
                 defaults.len(),
-                82,
+                83,
                 "no new shipped defaults under mod {:?}",
                 mod_key
             );
             let maps = resolve_keymaps(&mk_effective(mod_key)).expect("resolves");
             assert_eq!(
                 maps.len(),
-                82 + entries.len(),
+                83 + entries.len(),
                 "explicit binds append, never shadow, under mod {:?}",
                 mod_key
             );

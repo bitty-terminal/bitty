@@ -919,6 +919,28 @@ impl LayoutNode {
         self.hit_test_handle_inner(inner, gaps.inner, point, Vec::new())
     }
 
+    /// Hit-tests `point` against all split-handle bands for corner-drag
+    /// resize (issue #1445: Hyprland/Niri 4-way corner model).
+    ///
+    /// Returns all splits whose handles contain the point, paired with
+    /// their axes. At a corner intersection of perpendicular splits, both
+    /// handles are returned so drag resize can adjust all adjacent panels
+    /// simultaneously. Returns an empty vec when the point lands on no
+    /// handle. Paths use the same indexing as [`Self::set_split_ratio_at`].
+    /// Total and deterministic.
+    #[must_use]
+    pub fn hit_test_split_handles(
+        &self,
+        bounds: Rect,
+        gaps: Gaps,
+        point: Point,
+    ) -> Vec<(Vec<usize>, SplitAxis)> {
+        let inner = gaps.inset_outer(bounds);
+        let mut result = Vec::new();
+        self.hit_test_handles_all_inner(inner, gaps.inner, point, Vec::new(), &mut result);
+        result
+    }
+
     /// Recursion for [`Self::hit_test_split_handle`]: `bounds` is the
     /// gap-inset region owned by `self`; `prefix` is the path to `self`.
     fn hit_test_handle_inner(
@@ -982,6 +1004,68 @@ impl LayoutNode {
                 let mut overlay_prefix = prefix;
                 overlay_prefix.push(1);
                 overlay.hit_test_handle_inner(clipped, gap_in, point, overlay_prefix)
+            }
+        }
+    }
+
+    /// Recursion for [`Self::hit_test_split_handles`]: collects all split
+    /// handles containing `point` into `result`. Unlike the single-hit
+    /// variant, this continues searching after finding a match to detect
+    /// corner intersections (issue #1445).
+    fn hit_test_handles_all_inner(
+        &self,
+        bounds: Rect,
+        gap_in: u16,
+        point: Point,
+        prefix: Vec<usize>,
+        result: &mut Vec<(Vec<usize>, SplitAxis)>,
+    ) {
+        match self {
+            Self::Leaf(_) => {}
+            Self::Split {
+                axis,
+                ratio,
+                first,
+                second,
+            } => {
+                let (a, b) = split_rect_with_gap(bounds, *axis, *ratio, gap_in);
+                let handle = handle_band_between(a, b, *axis, gap_in);
+                let hit = if let Some(rect) = handle {
+                    rect.contains_point(point)
+                } else {
+                    on_child_boundary(a, b, *axis, point)
+                };
+                if hit {
+                    result.push((prefix.clone(), *axis));
+                }
+                // Always recurse into both children to find nested handles.
+                let mut first_prefix = prefix.clone();
+                first_prefix.push(0);
+                first.hit_test_handles_all_inner(a, gap_in, point, first_prefix, result);
+                let mut second_prefix = prefix;
+                second_prefix.push(1);
+                second.hit_test_handles_all_inner(b, gap_in, point, second_prefix, result);
+            }
+            Self::Stack(children) => {
+                for (i, child) in children.iter().enumerate() {
+                    let mut child_prefix = prefix.clone();
+                    child_prefix.push(i);
+                    child.hit_test_handles_all_inner(bounds, gap_in, point, child_prefix, result);
+                }
+            }
+            Self::Overlay {
+                base,
+                overlay,
+                bounds: overlay_bounds,
+                ..
+            } => {
+                let clipped = overlay_bounds.clip_to(bounds).unwrap_or(Rect::zero());
+                let mut base_prefix = prefix.clone();
+                base_prefix.push(0);
+                base.hit_test_handles_all_inner(bounds, gap_in, point, base_prefix, result);
+                let mut overlay_prefix = prefix;
+                overlay_prefix.push(1);
+                overlay.hit_test_handles_all_inner(clipped, gap_in, point, overlay_prefix, result);
             }
         }
     }

@@ -88,7 +88,10 @@ fn copy_mode_walks_and_yanks_the_focused_pane() {
     assert!(rt.is_copy_mode());
     assert_eq!(
         rt.copy_mode_cursor(),
-        Some(CellPos::new(0, u16::try_from(PANE_TEXT.len()).expect("fits"))),
+        Some(CellPos::new(
+            0,
+            u16::try_from(PANE_TEXT.len()).expect("fits")
+        )),
         "the copy cursor starts at the pane's own terminal cursor"
     );
     visual_from_line_start(&mut rt, 4);
@@ -251,7 +254,10 @@ fn persistent_selection_follows_the_keyboard_view() {
     let pers = rt
         .persistent_selection()
         .expect("a selection on the keyboard View persists");
-    assert_eq!(rt.persistent_selection_text(&pers).as_deref(), Some("gamma"));
+    assert_eq!(
+        rt.persistent_selection_text(&pers).as_deref(),
+        Some("gamma")
+    );
 
     rt.clear_selection();
     assert!(rt.restore_persistent_selection(pers));

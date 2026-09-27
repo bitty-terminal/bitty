@@ -106,6 +106,16 @@ status-drift:
 status-drift-test:
     ./scripts/tests/check-status-drift.test.sh
 
+# Move the docs/ submodule pin to a bitty-terminal-docs commit reachable from
+# its origin/main without populating the mount (CTX-0810): `just docs-pin`
+# pins origin/main of the workspace checkout, `just docs-pin <rev>` a merged
+# rev. Stages the gitlink only; see scripts/docs-pin.sh.
+docs-pin rev="origin/main":
+    ./scripts/docs-pin.sh {{ quote(rev) }}
+
+docs-pin-test:
+    ./scripts/tests/docs-pin.test.sh
+
 runtime-deps-test:
     ./scripts/tests/check-runtime-deps.test.sh
 
@@ -202,7 +212,7 @@ commit-check message:
     @cp commitlint.config.ts target/dev-tools/commitlint.config.ts
     @msg="$(realpath "{{message}}")" && cd target/dev-tools && bunx --bun commitlint --edit "$msg"
 
-check: fmt-check clippy test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate status-drift status-drift-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test unix-bundle-test macos-dmg-test verify-unix-bundle-dispatch-test rust-channel-test binary-arch-test workflow-publish-test m1-matrix-test compat-matrix-test real-render-soak-test dogfood-session-test actionlint markdownlint
+check: fmt-check clippy test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate status-drift status-drift-test docs-pin-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test unix-bundle-test macos-dmg-test verify-unix-bundle-dispatch-test rust-channel-test binary-arch-test workflow-publish-test m1-matrix-test compat-matrix-test real-render-soak-test dogfood-session-test actionlint markdownlint
 
 # Parser-throughput baseline (CTX-0576, M1-11). Runs the deterministic
 # headless parser benchmark over the committed VT/escape corpora and verifies

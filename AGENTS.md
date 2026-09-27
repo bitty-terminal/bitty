@@ -8,8 +8,9 @@
 - All formal Bitty repositories belong under <https://github.com/bitty-terminal>.
 - `bitty-terminal-docs` is the canonical source for terminal-platform product,
   architecture, configuration, interface, and specification documents. It is
-  mounted at `docs/` as a Git submodule pinned to a commit; initialize it with
-  `git submodule update --init`.
+  mounted at `docs/` as a Git submodule pinned to a commit. In the Bitty
+  workspace the mount stays empty (see Documentation contract): read and edit
+  the workspace `bitty-terminal-docs` checkout instead.
 - `bitty-docs` is the canonical source for shared governance: decisions, the
   security corpus, reviews, findings, and project state.
 
@@ -31,9 +32,9 @@
 1. Read this guide and the applicable files in `.carryctx/rules/`.
 2. Adopt the assigned persona in `.carryctx/personas/`.
 3. Read the task, team context, exact scopes, dependencies, and relevant
-   canonical contracts in the `docs/` submodule (bitty-terminal-docs) and
-   shared governance in `bitty-docs`; run `git submodule update --init` first
-   when `docs/` is empty.
+   canonical contracts in the workspace `bitty-terminal-docs` checkout
+   (`$BITTY_WORKSPACE/bitty-terminal-docs`) and shared governance in
+   `bitty-docs`; do not initialize the empty `docs/` mount.
 4. Use `ctxctl outline` before targeted `symbol`, `read`, or `deps` inspection.
 
 ## CarryCtx workflow
@@ -98,6 +99,8 @@
 ### Remote monitoring and merge (bitty)
 
 - After push, monitor via `HTTPS_PROXY=$NETWORK_PROXY gh pr checks <PR> --watch --interval 15` until CodeQL, Quality gates, Windows all pass, mergeable==MERGEABLE, then `gh pr merge --squash`. Prefer `--watch` over `sleep` loops; `pty_spawn` with `notifyOnExit` handles long waits without polling.
+- CodeRabbit comments gate the merge: before merging, read every CodeRabbit review comment and inline suggestion on the PR. Apply each valid suggestion in the PR (reply with the fix commit), reply with the reason for each declined one, and file out-of-scope findings as follow-up tasks/issues; record the disposition in a CarryCtx progress note. Re-run the local gates after applying fixes and wait for CI on the new head; do not merge while a CodeRabbit comment has neither an applied fix nor a reply.
+- Docs-only PRs merge immediately (owner directive): a PR that changes only Markdown prose (no code, scripts, `justfile`, workflows, config, lockfiles, fixtures, or submodule pins) is exempt from `just ci-local` and does not wait for remote CI, a reviewer, or CodeRabbit. Run the local Markdown gates (`just markdownlint`, `just status-drift`, `just scratch-paths`), push, open the PR with labels and milestone, apply any CodeRabbit comment already posted, then `gh pr merge --squash --delete-branch`. Comments that arrive after the merge become follow-up tasks. Anything beyond Markdown prose follows the full gate above.
 
 ### Continuous patrol and Code Review
 
@@ -112,11 +115,24 @@
   (decisions, security corpus, reviews, project state) stays in `bitty-docs`;
   AI-core and plugin-ecosystem corpora live in `bitty-ai-docs` and
   `bitty-plugins-docs` and are linked by absolute URL.
-- Initialize/refresh the submodule with `git submodule update --init`; bump the
-  pin with `git submodule update --remote docs` followed by `git add docs` and
-  a `docs:` commit. `docs/` is external content: `just check` excludes it from
-  markdownlint and the scratch-path gate, so gates behave identically with and
-  without the submodule initialized.
+- Workspace rule: the local clone keeps `docs/` uninitialized
+  (`git config submodule.docs.update none` plus
+  `git config --add submodule.active ':(exclude)docs'`), so
+  `git submodule update --init` prints `Skipping submodule 'docs'` and an
+  agent cannot edit a pinned copy by mistake. Documentation changes are made
+  only in the workspace `bitty-terminal-docs` checkout (or its worktrees) and
+  land through that repository's PRs. Never replace the mount with a symlink:
+  Git refuses symlinked submodule paths and `git add -A` would commit the link.
+- Bump the pin with `just docs-pin [<rev>]` (default `origin/main` of the
+  workspace checkout; fetch it first). It stages the gitlink without
+  populating the mount and refuses a commit that is not reachable from
+  `origin/main` or a checkout whose origin is not the `.gitmodules` URL;
+  commit the result under the owning task. Standalone clones outside the
+  workspace may still use `git submodule update --init` (read-only) and
+  `git submodule update --remote docs` + `git add docs`. `docs/` is external
+  content: `just check` excludes it from markdownlint and the scratch-path
+  gate, so gates behave identically with and without the submodule
+  initialized; CI checks out the submodule itself.
 - Synchronize affected canonical material in `bitty-terminal-docs` (platform)
   or `bitty-docs` (governance) when architecture, security, public behavior,
   configuration, compatibility, or developer workflows change.

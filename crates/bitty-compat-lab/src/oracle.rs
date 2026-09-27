@@ -1161,6 +1161,7 @@ pub fn canonical_action(action: &TerminalAction) -> String {
             let target = match target {
                 DynamicColorTarget::Foreground => "fg",
                 DynamicColorTarget::Background => "bg",
+                DynamicColorTarget::Cursor => "cursor",
             };
             let op = match op {
                 DynamicColorOp::Query => "query".to_string(),

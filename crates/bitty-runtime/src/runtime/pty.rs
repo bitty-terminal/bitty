@@ -749,6 +749,7 @@ impl Runtime {
                             let color = match target {
                                 DynamicColorTarget::Foreground => self.active_foreground(),
                                 DynamicColorTarget::Background => self.active_background(),
+                                DynamicColorTarget::Cursor => self.active_cursor_color(),
                             };
                             let reply = crate::queries::osc_color_reply(*target, color);
                             self.state.apply(&TerminalAction::Reply {

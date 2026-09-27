@@ -784,11 +784,12 @@ impl<F: FnMut(TerminalAction)> Perform for Bridge<'_, F> {
                     text: BoundedString::new(text),
                 });
             }
-            10 | 11 => {
-                let target = if id == 10 {
-                    DynamicColorTarget::Foreground
-                } else {
-                    DynamicColorTarget::Background
+            10..=12 => {
+                let target = match id {
+                    10 => DynamicColorTarget::Foreground,
+                    11 => DynamicColorTarget::Background,
+                    12 => DynamicColorTarget::Cursor,
+                    _ => unreachable!(),
                 };
                 match parse_dynamic_color(rest) {
                     Some(op) => self.emit(TerminalAction::OscDynamicColor { target, op }),

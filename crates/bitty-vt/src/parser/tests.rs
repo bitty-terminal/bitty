@@ -863,6 +863,26 @@ fn osc_dynamic_color_query_and_set_forms() {
             }),
         }]
     );
+    // OSC 12: cursor color query
+    assert_eq!(
+        parse(b"\x1b]12;?\x1b\\"),
+        vec![TerminalAction::OscDynamicColor {
+            target: DynamicColorTarget::Cursor,
+            op: DynamicColorOp::Query,
+        }]
+    );
+    // OSC 12: cursor color set
+    assert_eq!(
+        parse(b"\x1b]12;rgb:12/ab/34\x1b\\"),
+        vec![TerminalAction::OscDynamicColor {
+            target: DynamicColorTarget::Cursor,
+            op: DynamicColorOp::Set(Rgb {
+                r: 0x12,
+                g: 0xAB,
+                b: 0x34
+            }),
+        }]
+    );
 }
 
 #[test]

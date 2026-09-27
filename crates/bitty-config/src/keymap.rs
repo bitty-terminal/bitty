@@ -1233,8 +1233,8 @@ pub const DEFAULT_KEYMAPS: &[(&str, &str)] = &[
     ("shift+alt+7", "workspace_move:7"),
     ("shift+alt+8", "workspace_move:8"),
     ("shift+alt+9", "workspace_move:9"),
-    ("alt+u", "scroll_page_up"),
-    ("alt+i", "scroll_page_down"),
+    ("alt+u", "scroll_page_down"),
+    ("alt+i", "scroll_page_up"),
     ("ctrl+alt+left", "goto_split:left"),
     ("ctrl+alt+right", "goto_split:right"),
     ("ctrl+alt+up", "goto_split:up"),
@@ -2381,11 +2381,11 @@ mod tests {
         }
         assert_eq!(
             match_keymap(&maps, key_ref(KeyName::Char('u'), false, true, false)),
-            Some(ChromeAction::ScrollPageUp)
+            Some(ChromeAction::ScrollPageDown)
         );
         assert_eq!(
             match_keymap(&maps, key_ref(KeyName::Char('i'), false, true, false)),
-            Some(ChromeAction::ScrollPageDown)
+            Some(ChromeAction::ScrollPageUp)
         );
         assert_eq!(
             match_keymap(&maps, key_ref(KeyName::Char('z'), false, true, false)),
@@ -3782,5 +3782,46 @@ mod tests {
         } else {
             assert_eq!(LeaderPlatform::host(), LeaderPlatform::Other);
         }
+    }
+
+    #[test]
+    fn alt_u_i_page_scroll_order_fixed() {
+        // Issue #1437: alt+u/alt+i were swapped; corrected so alt+u scrolls
+        // down (toward live, less-like `d` behavior) and alt+i scrolls up
+        // (into history, less-like `u` behavior reversed from the key name).
+        let mk_effective = |mod_key| EffectiveConfig {
+            mod_key,
+            ..Default::default()
+        };
+        let maps = resolve_keymaps(&mk_effective(ModKey::Alt)).expect("resolves");
+
+        let u_chord = Chord::parse("alt+u").expect("alt+u parses");
+        let i_chord = Chord::parse("alt+i").expect("alt+i parses");
+
+        let u_key = KeyRef {
+            key: u_chord.key,
+            ctrl: u_chord.ctrl,
+            alt: u_chord.alt,
+            shift: u_chord.shift,
+            super_held: u_chord.super_held,
+        };
+        let i_key = KeyRef {
+            key: i_chord.key,
+            ctrl: i_chord.ctrl,
+            alt: i_chord.alt,
+            shift: i_chord.shift,
+            super_held: i_chord.super_held,
+        };
+
+        assert_eq!(
+            match_keymap(&maps, u_key),
+            Some(ChromeAction::ScrollPageDown),
+            "alt+u scrolls down (toward live)"
+        );
+        assert_eq!(
+            match_keymap(&maps, i_key),
+            Some(ChromeAction::ScrollPageUp),
+            "alt+i scrolls up (into history)"
+        );
     }
 }

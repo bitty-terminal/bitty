@@ -2182,11 +2182,11 @@ mod tests {
         );
         assert_eq!(
             match_keymap(&maps, shell(KeyName::Char('u'), false, true, false)),
-            Some(bitty_config::ChromeAction::ScrollPageUp)
+            Some(bitty_config::ChromeAction::ScrollPageDown)
         );
         assert_eq!(
             match_keymap(&maps, shell(KeyName::Char('i'), false, true, false)),
-            Some(bitty_config::ChromeAction::ScrollPageDown)
+            Some(bitty_config::ChromeAction::ScrollPageUp)
         );
         assert_eq!(
             match_keymap(&maps, shell(KeyName::Char('z'), false, true, false)),

@@ -40,3 +40,13 @@ doc = false
 bench = false
 
 [workspace]
+
+[dependencies.bitty-term-state]
+path = "../crates/bitty-term-state"
+
+[[bin]]
+name = "parser_to_state"
+path = "fuzz_targets/parser_to_state.rs"
+test = false
+doc = false
+bench = false

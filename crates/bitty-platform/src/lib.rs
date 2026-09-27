@@ -118,8 +118,9 @@ pub use event::{
     MouseEvent, NamedKey, PlatformEvent, PressState, ScrollDelta, WindowEventKind, WindowId,
 };
 pub use keyboard::{
-    encode_key_event, encode_named_key, ext_functional_key, ext_keypad_char_key,
-    ext_keypad_named_key, ext_modifier_key,
+    encode_key_event, encode_key_event_with_modifiers, encode_key_event_with_terminal_modes,
+    encode_named_key, ext_functional_key, ext_keypad_char_key, ext_keypad_named_key,
+    ext_modifier_key,
 };
 pub use notification::{
     BellSink, DesktopNotification, NOTIFICATION_BODY_MAX_CHARS, NOTIFICATION_TITLE_MAX_CHARS,

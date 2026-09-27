@@ -1038,3 +1038,4 @@
 {"created_at":"2026-09-27T11:46:55.798565790+00:00","id":"01M3HB12NPSBM9NR01XNNKR51Y","kind":"include","pattern":"crates/bitty-runtime/src/runtime/mouse_chrome.rs","project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","task_id":"01M3HAWGBDK7RRN8BKFGCTAKSY"}
 {"created_at":"2026-09-27T11:46:55.821966107+00:00","id":"01M3HB12PECH6TX57QNR9AYZYK","kind":"include","pattern":"crates/bitty-runtime/tests/selection_view_owned.rs","project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","task_id":"01M3HAWGBDK7RRN8BKFGCTAKSY"}
 {"created_at":"2026-09-27T11:46:55.846109493+00:00","id":"01M3HB12Q6BYXDWBXD11CWHBE0","kind":"include","pattern":"CHANGELOG.md","project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","task_id":"01M3HAWGBDK7RRN8BKFGCTAKSY"}
+{"created_at":"2026-09-27T17:09:44.870394139+00:00","id":"01M3HXG5S66JTQ76FJ20BX8TNA","kind":"include","pattern":"docs","project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","task_id":"01M3HPS4RKACEX37EFKX7KYN5V"}

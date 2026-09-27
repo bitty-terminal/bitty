@@ -548,6 +548,58 @@ fn switching_workspace_clears_the_selection() {
         "the owner is not a leaf of the newly active layout"
     );
     assert!(rt.selection().is_none());
+    // The slot install drops the state, not just hides it: switching back
+    // must not resurrect the selection (CodeRabbit review on #1485).
+    assert!(rt.workspace_switch(0), "back to the owner's workspace");
+    assert_eq!(
+        rt.selection_owner(),
+        None,
+        "a dropped selection stays dropped after switching back"
+    );
+}
+
+#[test]
+fn switching_workspace_ends_copy_mode_and_search_bound_to_a_hidden_view() {
+    bitty_test_support::require_pty!();
+    let mut rt = split_runtime(SplitAxis::Horizontal);
+    assert!(rt.set_focus(PANE));
+    rt.enter_copy_mode();
+    assert!(rt.is_copy_mode());
+
+    rt.workspace_new().expect("a second workspace");
+    assert!(
+        !rt.is_copy_mode(),
+        "copy mode cannot keep the keyboard for a View the slot hides"
+    );
+
+    assert!(rt.workspace_switch(0));
+    assert!(rt.set_focus(PANE));
+    rt.enter_search_mode();
+    rt.search_set_overlay_query("gamma");
+    assert_eq!(rt.search_match_count(), 1);
+    rt.workspace_new().expect("a third workspace");
+    assert!(
+        !rt.is_search_mode(),
+        "the search overlay closes when its View is hidden"
+    );
+}
+
+#[test]
+fn a_release_without_a_drag_leaves_a_committed_selection_alone() {
+    bitty_test_support::require_pty!();
+    let mut rt = split_runtime(SplitAxis::Horizontal);
+    drag_between(&mut rt, (PANE, 0, 0), (PANE, 0, 4));
+    let committed = rt.selection().expect("a committed selection");
+    assert!(!rt.is_selection_dragging());
+
+    // A later release whose press was consumed by chrome (status bar,
+    // scrollbar) reaches `end_selection` with no drag in flight.
+    rt.end_selection(CellPos::new(0, 9));
+    assert_eq!(
+        rt.selection(),
+        Some(committed),
+        "a release without a drag must not move the committed focus"
+    );
 }
 
 #[test]

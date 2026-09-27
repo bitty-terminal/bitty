@@ -217,7 +217,17 @@ impl Runtime {
     /// historic primary-grid refresh.
     pub fn search_refresh(&mut self) {
         let Some(view) = self.search_view else {
-            self.search_state.refresh(&self.state);
+            // Unbound (test seam): refresh against the same keyboard grid the
+            // other unbound readers use (`search_grid`).
+            let grid = self
+                .keyboard_view()
+                .filter(|view| self.layout.find_leaf(*view).is_some())
+                .and_then(|view| {
+                    grid_of(&self.pane_sessions, self.primary_view, &self.state, view)
+                });
+            if let Some(grid) = grid {
+                self.search_state.refresh(grid);
+            }
             return;
         };
         let grid = self

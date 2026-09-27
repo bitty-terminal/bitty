@@ -493,6 +493,13 @@ impl Runtime {
         let Some(sel) = self.selection_state else {
             return;
         };
+        if !sel.dragging {
+            // No drag in flight: the press was consumed by chrome (status
+            // bar, scrollbar) or the selection was already committed. A
+            // release must not move a committed selection's focus (nor
+            // auto-copy the changed text).
+            return;
+        }
         let Some(state) = self.live_view_state(sel.owner) else {
             // Owner lost its grid before the release: fail closed.
             self.drop_selection();

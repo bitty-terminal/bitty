@@ -612,6 +612,12 @@ impl Runtime {
         // CTX-0532: the loaded slot's focus is a focus transition; attribute
         // the input-mode caches to it before any input can arrive.
         self.sync_mode_caches_to_focus();
+        // CTX-0803/CTX-0805: a slot swap is a layout install that bypasses
+        // `replace_layout`, so it runs the View-binding funnel itself: a
+        // selection, copy mode, or search bound to a View this slot hides is
+        // dropped instead of lingering behind the read guard (and resurfacing
+        // on a switch back).
+        self.invalidate_stale_view_bindings();
     }
 
     /// Front an index in the MRU (each live index exactly once).
@@ -667,6 +673,9 @@ impl Runtime {
         // CTX-0536 (#923): record the fresh id so its later retirement can
         // never fall back below the monotonic high-water mark.
         self.raise_view_id_high_water();
+        // CTX-0803/CTX-0805: the fresh slot is a direct layout install; drop
+        // bindings to Views it hides (see `load_slot`).
+        self.invalidate_stale_view_bindings();
         // CTX-0532: a brand-new slot's leaf starts focused; attribute the
         // input-mode caches to it before any pane spawn/output path runs.
         self.sync_mode_caches_to_focus();
@@ -1103,6 +1112,9 @@ impl Runtime {
         // is loaded), so re-sync the active source before presenting again.
         self.sync_primary_geometry();
         self.sync_pane_geometry();
+        // CTX-0803/CTX-0805: the moved leaf left the live layout directly;
+        // bindings to it (selection, copy mode, search) are dropped.
+        self.invalidate_stale_view_bindings();
         self.pending_full_redraw = true;
         Ok(focused)
     }

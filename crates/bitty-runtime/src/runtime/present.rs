@@ -272,6 +272,13 @@ struct CombinedLeaves {
     glyphs: Vec<bitty_render::grid::GlyphInstance>,
     needs_draw: bool,
     cursor: Option<CursorPaint>,
+    /// Atlas epoch the glyph slots collected so far were placed at
+    /// (issue #1409, CTX-0797).
+    ///
+    /// Set by the first leaf of an attempt and then held fixed: every later
+    /// leaf must plan against the same epoch or the slots already collected
+    /// address dead texels.
+    atlas_epoch: Option<u64>,
 }
 
 /// Loop-invariant inputs for the per-leaf decoration ring (CTX-0386).
@@ -799,7 +806,44 @@ impl Runtime {
         }
         self.paint_frame_overlays(&basis, now, &mut layers);
         self.paint_kitty_images(&basis, &mut layers);
+        if self.reject_stale_atlas_frame(&layers) {
+            return None;
+        }
         self.present_assembled_frame(basis, layers)
+    }
+
+    /// Issue #1409 (CTX-0797): refuse to present a frame whose leaf glyph
+    /// slots were placed at an older atlas epoch than the live atlas.
+    ///
+    /// [`Self::build_leaf_primitives`] is internally frame-consistent, but the
+    /// overlay phase runs after it and places its own text through
+    /// `GridRenderer::overlay_text_glyphs`. That call evicts and resets the
+    /// atlas wholesale when it cannot fit its line, which silently kills every
+    /// leaf slot already collected: the assembled frame would then sample two
+    /// atlas epochs at once, which is exactly the frame-consistency violation
+    /// issue #1409 describes. Drop such a frame instead. Damage is retained
+    /// (the frame is never marked presented) and the retained per-leaf stores
+    /// plus `pending_full_redraw` force a full rebuild against the fresh atlas
+    /// on the next tick.
+    ///
+    /// Liveness bound: a layout whose leaves and overlays together never fit
+    /// one epoch would reset on every tick and starve presentation forever, so
+    /// after [`ATLAS_REBUILD_LIMIT`] consecutive rejections the frame is
+    /// presented anyway. One frame of stale texels beats a window that never
+    /// paints again.
+    fn reject_stale_atlas_frame(&mut self, layers: &FrameLayers) -> bool {
+        if self.renderer.atlas_epoch() == layers.atlas_epoch {
+            self.stale_atlas_frame_rejects = 0;
+            return false;
+        }
+        if self.stale_atlas_frame_rejects >= ATLAS_REBUILD_LIMIT {
+            self.stale_atlas_frame_rejects = 0;
+            return false;
+        }
+        self.stale_atlas_frame_rejects = self.stale_atlas_frame_rejects.saturating_add(1);
+        self.presented_leaf_frames.clear();
+        self.pending_full_redraw = true;
+        true
     }
 
     /// Phase 1 (CTX-0474): time-based gates that can defer the whole frame.
@@ -1117,6 +1161,9 @@ impl Runtime {
             attempt += 1;
             let mut built = CombinedLeaves::default();
             let evictions_before = self.renderer.atlas_stats().2;
+            // Issue #1409 (CTX-0797): set when a leaf planned against a newer
+            // atlas epoch than the slots already collected in this attempt.
+            let mut stale_epoch = false;
 
             for frame in allocations {
                 if frame.content.width == 0 || frame.content.height == 0 {
@@ -1356,6 +1403,22 @@ impl Runtime {
                     Ok(list) => list,
                     Err(_) => continue,
                 };
+                // Issue #1409 (CTX-0797): the first leaf of this attempt fixes
+                // the atlas epoch every glyph slot in the frame must resolve
+                // against. `render` is internally frame-consistent, but a later
+                // leaf can exhaust the atlas and be planned against a fresh
+                // epoch, which kills the slots earlier leaves already pushed
+                // into `built`. Abandon the attempt rather than compose a
+                // mixed-epoch frame; the enclosing loop rebuilds every leaf
+                // against the fresh atlas. At the `ATLAS_REBUILD_LIMIT` bound
+                // the attempt is kept as-is: a working set that never fits one
+                // epoch must still present something (liveness over a
+                // perfectly consistent frame that never arrives).
+                let frame_epoch = *built.atlas_epoch.get_or_insert(list.atlas_epoch);
+                if !list.is_atlas_epoch_valid(frame_epoch) && attempt < ATLAS_REBUILD_LIMIT {
+                    stale_epoch = true;
+                    break;
+                }
                 if is_focused_view && view_snapshot.cursor.visible && !scrolled {
                     let cur = &view_snapshot.cursor.position;
                     if (cur.row as usize) < view_snapshot.height
@@ -1407,6 +1470,13 @@ impl Runtime {
                 built.glyphs.extend(glyphs);
             }
 
+            if stale_epoch {
+                // Partial attempt: every slot collected before the reset is
+                // dead, so drop the retained stores and rebuild from scratch.
+                self.presented_leaf_frames.clear();
+                full_frame = true;
+                continue;
+            }
             if self.renderer.atlas_stats().2 == evictions_before || attempt >= ATLAS_REBUILD_LIMIT {
                 break built;
             }
@@ -1426,6 +1496,12 @@ impl Runtime {
             combined_glyphs: built.glyphs,
             any_needs_draw: built.needs_draw,
             cursor: built.cursor,
+            // Issue #1409 (CTX-0797): the epoch the surviving attempt placed
+            // its slots at. `built.atlas_epoch` is unset only when no leaf
+            // rendered, in which case the live epoch is trivially correct.
+            atlas_epoch: built
+                .atlas_epoch
+                .unwrap_or_else(|| self.renderer.atlas_epoch()),
             ..FrameLayers::default()
         }
     }
@@ -2170,11 +2246,19 @@ impl Runtime {
                 generation: current_gen,
                 regions: vec![DamagedRegion::Grid(DamageRect::full(1, 1))].into_boxed_slice(),
             };
+            let live_atlas_epoch = self.renderer.atlas_epoch();
             let mut tmp_list = self
                 .renderer
                 .render(&tmp_snap, &tmp_damage)
                 .unwrap_or(DrawList {
                     generation: current_gen,
+                    // Issue #1409 (CTX-0797): the live atlas epoch, never a
+                    // literal 0. This fallback list carries no glyph slots of
+                    // its own (the combined layers are moved in below), so it
+                    // must report the epoch those slots were placed at;
+                    // hardcoding 0 makes it born-stale the moment the atlas
+                    // has ever reset.
+                    atlas_epoch: live_atlas_epoch,
                     plan: FramePlan {
                         dirty_rects: Vec::new(),
                         extent: bitty_render::geometry::ExtentPx::new(0, 0),
@@ -2362,6 +2446,142 @@ struct FrameLayers {
     any_needs_draw: bool,
     /// Deferred focused-cursor overlay (CTX-0386); drained before overlays.
     cursor: Option<CursorPaint>,
+    /// Atlas epoch the leaf glyph slots in `combined_glyphs` were placed at
+    /// (issue #1409, CTX-0797).
+    ///
+    /// Compared against the live atlas epoch after the overlay phase: the
+    /// overlay painters place text through `overlay_text_glyphs`, which can
+    /// exhaust and reset the atlas long after the leaf pass settled.
+    atlas_epoch: u64,
+}
+
+/// Issue #1409 (CTX-0797): the production guard that keeps a presented frame
+/// on one atlas epoch.
+///
+/// These are in-crate tests because the guard reads private runtime state (the
+/// renderer, the retained per-leaf stores, and the bounded rejection counter);
+/// no public test seam is added for them. The epoch is advanced through a real
+/// wholesale atlas reset (`GridRenderer::apply_dpi_scale` clears the atlas and
+/// bumps its placement generation), never by writing a fabricated number, so
+/// the fixture exercises the same mechanism `overlay_text_glyphs` uses when it
+/// exhausts the atlas mid-frame.
+#[cfg(test)]
+mod atlas_epoch_guard_tests {
+    use super::{ATLAS_REBUILD_LIMIT, FrameLayers};
+    use crate::runtime::{Runtime, RuntimeConfig};
+
+    fn runtime() -> Runtime {
+        Runtime::with_deterministic_rasterizer(RuntimeConfig::default())
+            .expect("deterministic runtime must build")
+    }
+
+    /// Advances the live atlas epoch by one wholesale reset.
+    ///
+    /// Drives the public `Runtime::apply_dpi_scale` entry point, which clears
+    /// the atlas and bumps its placement generation exactly like the exhaustion
+    /// reset inside `overlay_text_glyphs`. `pending_full_redraw` is cleared
+    /// afterwards because the rescale sets it on its own; the guard's own
+    /// invalidation must be observable independently.
+    fn reset_atlas(rt: &mut Runtime, scale: f64) {
+        let before = rt.renderer.atlas_epoch();
+        rt.apply_dpi_scale(scale, None);
+        assert_ne!(
+            rt.renderer.atlas_epoch(),
+            before,
+            "a wholesale atlas reset must bump the epoch"
+        );
+        rt.pending_full_redraw = false;
+    }
+
+    fn layers_at(epoch: u64) -> FrameLayers {
+        FrameLayers {
+            atlas_epoch: epoch,
+            ..FrameLayers::default()
+        }
+    }
+
+    #[test]
+    fn epoch_consistent_frame_is_presented() {
+        let mut rt = runtime();
+        let layers = layers_at(rt.renderer.atlas_epoch());
+        assert!(
+            !rt.reject_stale_atlas_frame(&layers),
+            "a frame planned at the live epoch must present"
+        );
+        assert_eq!(rt.stale_atlas_frame_rejects, 0);
+    }
+
+    #[test]
+    fn overlay_phase_atlas_reset_rejects_the_frame() {
+        let mut rt = runtime();
+        rt.handle_pty_bytes(b"hello");
+        rt.tick().expect("printed bytes must present a frame");
+        assert!(
+            !rt.presented_leaf_frames.is_empty(),
+            "the present must retain at least one leaf store"
+        );
+
+        // The leaf pass planned at this epoch; the reset below stands in for an
+        // overlay line that exhausted the atlas after the leaf pass settled.
+        let planned_epoch = rt.renderer.atlas_epoch();
+        let layers = layers_at(planned_epoch);
+        reset_atlas(&mut rt, 2.0);
+
+        assert!(
+            rt.reject_stale_atlas_frame(&layers),
+            "a frame whose leaf slots were wiped must not be presented"
+        );
+        assert!(
+            rt.presented_leaf_frames.is_empty(),
+            "retained leaf slots from the wiped epoch must be dropped"
+        );
+        assert!(
+            rt.pending_full_redraw,
+            "the next tick must rebuild against the fresh atlas"
+        );
+        assert_eq!(rt.stale_atlas_frame_rejects, 1);
+    }
+
+    #[test]
+    fn repeated_rejection_is_bounded_so_presentation_never_starves() {
+        let mut rt = runtime();
+        // A working set that never fits one epoch would reset on every tick.
+        // The guard must give up after the bound instead of dropping frames
+        // forever.
+        for expected in 1..=ATLAS_REBUILD_LIMIT {
+            let stale = layers_at(rt.renderer.atlas_epoch());
+            reset_atlas(&mut rt, 2.0);
+            assert!(rt.reject_stale_atlas_frame(&stale), "within the bound");
+            assert_eq!(rt.stale_atlas_frame_rejects, expected);
+        }
+
+        let stale = layers_at(rt.renderer.atlas_epoch());
+        reset_atlas(&mut rt, 1.5);
+        assert!(
+            !rt.reject_stale_atlas_frame(&stale),
+            "at the bound the frame presents anyway (liveness over consistency)"
+        );
+        assert_eq!(
+            rt.stale_atlas_frame_rejects, 0,
+            "the counter rearms for the next episode"
+        );
+    }
+
+    #[test]
+    fn a_consistent_frame_clears_an_earlier_rejection() {
+        let mut rt = runtime();
+        let stale = layers_at(rt.renderer.atlas_epoch());
+        reset_atlas(&mut rt, 2.0);
+        assert!(rt.reject_stale_atlas_frame(&stale));
+        assert_eq!(rt.stale_atlas_frame_rejects, 1);
+
+        let fresh = layers_at(rt.renderer.atlas_epoch());
+        assert!(!rt.reject_stale_atlas_frame(&fresh));
+        assert_eq!(
+            rt.stale_atlas_frame_rejects, 0,
+            "a clean frame must not leave the bound partly consumed"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -1163,7 +1163,7 @@ impl Runtime {
         // longer a live leaf is dropped here rather than left addressing a
         // grid that is gone; the primary re-home above is also observed,
         // because a re-homed primary retires the old owner's grid.
-        self.invalidate_selection_if_owner_stale();
+        self.invalidate_stale_view_bindings();
         self.pending_full_redraw = true;
     }
 

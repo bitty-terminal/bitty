@@ -483,7 +483,7 @@ impl Runtime {
         // Search UI integration (CTX-0061): clamp matches to new geometry; refresh
         // is bounded and deterministic. Keeps current index clamped.
         if self.search_state.is_active() {
-            self.search_state.refresh(&self.state);
+            self.search_refresh();
         }
         // Surface resize: real GPU path when attached, else headless
         if let Some(gpu) = self.gpu.as_ref() {

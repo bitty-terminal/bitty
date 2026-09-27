@@ -1650,9 +1650,10 @@ impl Runtime {
         let owner = derive_startup_owner(snap);
         self.primary_view = Some(owner);
         // CTX-0803 (#1476): a restore installs a whole new world (layout,
-        // focus, primary owner, grids). Any live selection addresses the
-        // pre-restore grids, so it is dropped.
-        self.drop_selection();
+        // focus, primary owner, grids). Any live selection, copy mode, or
+        // search addresses the pre-restore grids, so all are dropped
+        // (CTX-0805).
+        self.drop_all_view_bindings();
         self.pending_ws_close = None;
         self.session_pending.clear();
         self.session_primary_cwd = None;

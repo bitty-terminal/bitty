@@ -2,17 +2,58 @@
 //!
 //! Split from `super` (`runtime.rs`) as a pure move under CTX-0232:
 //! byte-identical logic, only module wiring changed.
+//!
+//! CTX-0805 (#1478): search is View-bound. A search starts on the focused
+//! View (`search_view`), its matches are buffer rows of that View's own grid,
+//! and every refresh, reveal, highlight, and live selection it drives
+//! addresses that grid, never the primary grid by assumption. The
+//! persistent-selection API addresses the same keyboard View
+//! ([`Runtime::keyboard_view`]).
+use super::selection::grid_of;
 use super::*;
 
 impl Runtime {
+    /// Grid the current search's matches belong to (CTX-0805).
+    ///
+    /// The bound View's live grid; an unbound search (only reachable through
+    /// the `search_state_mut` test seam) reads the keyboard View's grid.
+    /// `None` when the bound View no longer resolves to a live grid.
+    fn search_grid(&self) -> Option<&State> {
+        match self.search_view {
+            Some(view) => self.live_view_state(view),
+            None => self.keyboard_grid(),
+        }
+    }
+
+    /// Whether `view` is the View the current search addresses.
+    fn search_targets(&self, view: ViewId) -> bool {
+        self.search_view.or_else(|| self.keyboard_view()) == Some(view)
+    }
+
+    /// Recomputes matches for `pattern` over the bound grid without
+    /// rebinding (CTX-0805). A bound View that lost its grid ends the
+    /// search (fail closed).
+    pub(super) fn search_set_bound(&mut self, pattern: &str, options: SearchOptions) {
+        let grid = self
+            .search_view
+            .filter(|view| self.layout.find_leaf(*view).is_some())
+            .and_then(|view| grid_of(&self.pane_sessions, self.primary_view, &self.state, view));
+        match grid {
+            Some(grid) => self.search_state.set_search(grid, pattern, options),
+            None => self.search_clear(),
+        }
+    }
+
     /// Searches scrollback and live grid for `pattern`.
     ///
     /// Bounded by [`bitty_term_state::search::SEARCH_MAX_PATTERN_LEN`] and
     /// [`bitty_term_state::search::SEARCH_MAX_RESULTS`]; headless and deterministic;
-    /// no I/O. Delegates to [`State::search`].
+    /// no I/O. Delegates to [`State::search`] on the keyboard View's grid
+    /// (CTX-0805); a keyboard View without a grid yields no matches.
     #[must_use]
     pub fn search(&self, pattern: &str, options: SearchOptions) -> Vec<SearchMatch> {
-        self.state.search(pattern, options)
+        self.keyboard_grid()
+            .map_or_else(Vec::new, |grid| grid.search(pattern, options))
     }
 
     /// Convenience: case-sensitive search with default limits.
@@ -25,15 +66,16 @@ impl Runtime {
     /// selection, if any. The returned value survives scroll (lines moving
     /// from grid into scrollback), `View` scroll offset changes, and resize
     /// (clamped). Returns `None` when no selection exists.
+    ///
+    /// CTX-0805: `PersistentSelection` carries buffer rows, not a View, so
+    /// it is expressed against the keyboard View's grid (the grid
+    /// [`Self::restore_persistent_selection`] restores into). A selection
+    /// owned by another View reports `None` instead of being re-expressed
+    /// against the wrong grid.
     #[must_use]
     pub fn persistent_selection(&self) -> Option<PersistentSelection> {
-        // CTX-0803: `PersistentSelection` rows are primary-grid buffer rows
-        // (its restore path installs into the primary grid), so only a
-        // selection owned by `primary_view` has a persistent form. A pane-owned
-        // selection reports `None` instead of being re-expressed against the
-        // wrong grid (#1478 rebinds search and copy mode to the focused View).
         let (sel, state) = self.selection_owner_state()?;
-        if Some(sel.owner) != self.primary_view {
+        if Some(sel.owner) != self.keyboard_view() {
             return None;
         }
         Some(PersistentSelection::from_grid_selection(
@@ -49,14 +91,19 @@ impl Runtime {
     /// selection has moved into history or been pruned. On `false` the live
     /// selection is cleared to keep invariants (empty pruned selections never
     /// linger as stale grid coords). Headless and bounded.
+    ///
+    /// CTX-0805: restores into the keyboard View's grid and installs the
+    /// selection owned by that View.
     pub fn restore_persistent_selection(&mut self, pers: PersistentSelection) -> bool {
-        if let Some(sel) = pers.to_grid_selection(&self.state) {
-            // CTX-0803: buffer rows are primary-grid rows here, so the
-            // restored selection is owned by `primary_view` (#1478 rebinds
-            // the search/copy consumers to the focused View).
+        let restored = self.keyboard_view().and_then(|view| {
+            self.live_view_state(view)
+                .and_then(|grid| pers.to_grid_selection(grid))
+                .map(|sel| (view, sel))
+        });
+        if let Some((view, sel)) = restored {
             let pin = if sel.active { Some(sel.anchor) } else { None };
-            self.set_primary_selection(sel, pin, sel.active);
-            self.selection_state.is_some()
+            self.install_selection(view, sel, pin, sel.active);
+            true
         } else {
             // Buffer is either pruned or now in history: clear live selection.
             // Caller may still use `pers.text(&state)` for history highlight.
@@ -69,41 +116,48 @@ impl Runtime {
     ///
     /// This reads from scrollback + live grid according to the persistent
     /// buffer rows, so a selection that has scrolled into history still yields
-    /// its original text (unless pruned). Headless.
+    /// its original text (unless pruned). Headless. Reads the keyboard View's
+    /// grid (CTX-0805).
     #[must_use]
     pub fn persistent_selection_text(&self, pers: &PersistentSelection) -> Option<String> {
-        pers.text(&self.state)
+        pers.text(self.keyboard_grid()?)
     }
 
     /// Whether a persistent selection is still valid against the current state
-    /// (not pruned, buffer rows in bounds).
+    /// (not pruned, buffer rows in bounds) of the keyboard View's grid.
     #[must_use]
     pub fn is_persistent_selection_valid(&self, pers: &PersistentSelection) -> bool {
-        pers.is_valid(&self.state)
+        self.keyboard_grid().is_some_and(|grid| pers.is_valid(grid))
     }
 
     /// View-aware persistence: lifts a viewport `Selection` (viewport rows) to
     /// a persistent selection anchored to the combined buffer (respects `View`
     /// scroll offset). Headless.
+    ///
+    /// CTX-0805: anchored to `view`'s own grid. A View that owns no grid
+    /// falls back to the primary grid only to keep this historic infallible
+    /// signature; such a View presents no content to select.
     #[must_use]
     pub fn persistent_selection_from_view(
         &self,
         sel: Selection,
         view: &View,
     ) -> PersistentSelection {
-        PersistentSelection::from_view_selection(sel, view, &self.state)
+        let grid = self.session_state_for(view.id()).unwrap_or(&self.state);
+        PersistentSelection::from_view_selection(sel, view, grid)
     }
 
     /// View-aware restore: attempts to map a persistent selection back into a
     /// viewport `Selection` for the given `View`. Returns `None` when the
-    /// selection is outside the current viewport window or pruned.
+    /// selection is outside the current viewport window, pruned, or `view`
+    /// owns no grid (CTX-0805).
     #[must_use]
     pub fn persistent_to_view_selection(
         &self,
         pers: &PersistentSelection,
         view: &View,
     ) -> Option<Selection> {
-        pers.to_view_selection(view, &self.state)
+        pers.to_view_selection(view, self.session_state_for(view.id())?)
     }
 
     /// Owned search UI state (read-only).
@@ -124,6 +178,12 @@ impl Runtime {
         &mut self.search_state
     }
 
+    /// View the current search is bound to, if any (CTX-0805).
+    #[must_use]
+    pub fn search_view(&self) -> Option<ViewId> {
+        self.search_view
+    }
+
     /// Sets the search query and recomputes bounded matches against the live state.
     ///
     /// Bounded by [`bitty_term_state::search::SEARCH_MAX_PATTERN_LEN`] and
@@ -133,20 +193,41 @@ impl Runtime {
     /// `Some(0)`, otherwise cleared. Does not touch `selection` automatically;
     /// call [`Self::search_apply_selection`] to move the live selection to the
     /// current match when desired (selection-persistence integration).
+    ///
+    /// CTX-0805: a new search binds to the focused View and searches its own
+    /// grid; a focused leaf without a grid yields an inactive search.
     pub fn search_set(&mut self, pattern: &str, options: SearchOptions) {
-        self.search_state.set_search(&self.state, pattern, options);
+        self.search_view = self.focused_view();
+        self.search_set_bound(pattern, options);
     }
 
-    /// Clears the search UI (pattern empty, matches cleared, inactive).
+    /// Clears the search UI (pattern empty, matches cleared, inactive) and
+    /// releases its View binding.
     pub fn search_clear(&mut self) {
         self.search_state.clear();
+        self.search_view = None;
     }
 
     /// Refreshes the current search against the live state after scrollback
     /// growth, resize, or new input. Preserves `current` clamped to the new
     /// match count (or `None` when empty). No-op when search is inactive.
+    ///
+    /// CTX-0805: refreshes against the bound grid; a bound View that lost
+    /// its grid ends the search. An unbound search (test seam) keeps the
+    /// historic primary-grid refresh.
     pub fn search_refresh(&mut self) {
-        self.search_state.refresh(&self.state);
+        let Some(view) = self.search_view else {
+            self.search_state.refresh(&self.state);
+            return;
+        };
+        let grid = self
+            .layout
+            .find_leaf(view)
+            .and_then(|_| grid_of(&self.pane_sessions, self.primary_view, &self.state, view));
+        match grid {
+            Some(grid) => self.search_state.refresh(grid),
+            None => self.search_clear(),
+        }
     }
 
     /// Advances to the next match (wraps deterministically).
@@ -215,14 +296,15 @@ impl Runtime {
     /// still readable via `pers.text(&state)`.
     #[must_use]
     pub fn search_current_persistent_selection(&self) -> Option<PersistentSelection> {
-        self.search_state.current_persistent_selection(&self.state)
+        self.search_state
+            .current_persistent_selection(self.search_grid()?)
     }
 
     /// Persistent selection for match `idx`, if in bounds and still valid.
     #[must_use]
     pub fn search_match_persistent_selection(&self, idx: usize) -> Option<PersistentSelection> {
         self.search_state
-            .match_persistent_selection(&self.state, idx)
+            .match_persistent_selection(self.search_grid()?, idx)
     }
 
     /// All current matches as bounded persistent selections (≤ `SEARCH_MAX_RESULTS`).
@@ -231,13 +313,23 @@ impl Runtime {
     /// deterministically.
     #[must_use]
     pub fn search_all_persistent_selections(&self) -> Vec<PersistentSelection> {
-        self.search_state.all_persistent_selections(&self.state)
+        self.search_grid().map_or_else(Vec::new, |grid| {
+            self.search_state.all_persistent_selections(grid)
+        })
     }
 
     /// Indices of matches whose `buffer_row` is currently visible in `view`.
+    ///
+    /// CTX-0805: empty for any View other than the one the search is bound
+    /// to (its matches are rows of that View's grid only).
     #[must_use]
     pub fn search_visible_match_indices(&self, view: &View) -> Vec<usize> {
-        self.search_state.visible_match_indices(view, &self.state)
+        match self.search_grid() {
+            Some(grid) if self.search_targets(view.id()) => {
+                self.search_state.visible_match_indices(view, grid)
+            }
+            _ => Vec::new(),
+        }
     }
 
     /// Highlights for matches currently visible in `view`, with view-local
@@ -245,10 +337,16 @@ impl Runtime {
     ///
     /// Headless helper for the renderer: maps each visible `SearchMatch` to its
     /// `view_row`, `view_col_start..view_col_end`, and whether it is the
-    /// current navigated target.
+    /// current navigated target. Empty for any View other than the bound one
+    /// (CTX-0805).
     #[must_use]
     pub fn search_visible_highlights(&self, view: &View) -> Vec<SearchHighlight> {
-        self.search_state.visible_highlights(view, &self.state)
+        match self.search_grid() {
+            Some(grid) if self.search_targets(view.id()) => {
+                self.search_state.visible_highlights(view, grid)
+            }
+            _ => Vec::new(),
+        }
     }
 
     /// Scrolls `view` vertically (and horizontally when needed) to bring the
@@ -256,10 +354,15 @@ impl Runtime {
     /// `scroll_offset` or `col_offset` changed.
     ///
     /// Deterministic and bounded: the target offset is the minimal adjustment
-    /// that makes `current.buffer_row` visible. No-op when no current match
-    /// or already visible.
+    /// that makes `current.buffer_row` visible. No-op when no current match,
+    /// already visible, or `view` is not the bound View (CTX-0805).
     pub fn search_scroll_view_to_current(&self, view: &mut View) -> bool {
-        self.search_state.scroll_to_current(view, &self.state)
+        match self.search_grid() {
+            Some(grid) if self.search_targets(view.id()) => {
+                self.search_state.scroll_to_current(view, grid)
+            }
+            _ => false,
+        }
     }
 
     /// Moves the live `selection` to exactly cover the current search match,
@@ -271,17 +374,23 @@ impl Runtime {
     /// Returns `true` when the live selection was set to the match; `false`
     /// when the match is in history or pruned (live selection cleared).
     /// Headless: `selection_text` will then equal `matched_text` for live matches.
+    ///
+    /// CTX-0805: the selection is owned by the View the search is bound to.
     pub fn search_apply_selection(&mut self) -> bool {
-        let Some(pers) = self.search_state.current_persistent_selection(&self.state) else {
+        let Some(view) = self.search_view.or_else(|| self.keyboard_view()) else {
+            return false;
+        };
+        let Some(grid) = self.search_grid() else {
+            return false;
+        };
+        let Some(pers) = self.search_state.current_persistent_selection(grid) else {
             return false;
         };
         // Try to restore as live-grid selection.
-        if let Some(sel) = pers.to_grid_selection(&self.state) {
-            // CTX-0803: the match lives in the primary grid, so the live
-            // selection it drives is owned by `primary_view` (#1478).
+        if let Some(sel) = pers.to_grid_selection(grid) {
             let pin = if sel.active { Some(sel.anchor) } else { None };
-            self.set_primary_selection(sel, pin, sel.active);
-            self.selection_state.is_some()
+            self.install_selection(view, sel, pin, sel.active);
+            true
         } else {
             // In history or pruned: leave a history highlight but clear live selection.
             self.drop_selection();

@@ -126,7 +126,7 @@ impl Runtime {
         // focused leaf. A selection owned by the previous owner now resolves
         // to no grid, so it is dropped here rather than left for the read
         // guard.
-        self.invalidate_selection_if_owner_stale();
+        self.invalidate_stale_view_bindings();
         // If a waker is already installed (respawn after `set_pty_waker`),
         // promote immediately so the new child wakes the loop too.
         if self.pty_waker.is_some() {
@@ -335,7 +335,7 @@ impl Runtime {
         // selection owned by it addresses cells of a grid that no longer
         // exists. Dropping it is the only honest option (the new grid has no
         // equivalent range).
-        self.drop_selection_owned_by(view);
+        self.drop_view_bindings_for(view);
         self.pending_full_redraw = true;
         Ok(())
     }
@@ -504,7 +504,7 @@ impl Runtime {
         self.sync_mode_caches_to_focus();
         // CTX-0803 (#1476): the grid a selection owned by this leaf addressed
         // is gone. Drop it rather than let it fall back to the primary grid.
-        self.drop_selection_owned_by(*view);
+        self.drop_view_bindings_for(*view);
         self.pending_full_redraw = true;
         true
     }
@@ -663,6 +663,21 @@ impl Runtime {
         // CTX-0532: mode changes landed on the pane's register; re-attribute
         // the input-mode caches to the focused pane.
         self.sync_mode_caches_to_focus();
+    }
+
+    /// View whose grid the output pipeline is feeding right now (CTX-0805).
+    ///
+    /// [`Self::handle_pane_bytes`] swaps the pane's grid into the primary
+    /// slot and tags the drain with that pane's origin token, so inside the
+    /// shared `handle_pty_bytes_inner` pipeline `self.state` is the pane's
+    /// grid. Outside a pane drain the pipeline feeds the primary grid, owned
+    /// by `primary_view`. View-bound consumers (selection, search) use this
+    /// to react only to output on the grid they address.
+    pub(super) fn fed_grid_view(&self) -> Option<ViewId> {
+        match self.kitty_origin {
+            Some(raw) => Some(ViewId::new(raw)),
+            None => self.primary_view,
+        }
     }
 
     /// Flushes one pane's queued terminal replies (DA/DECRQM/XTGETTCAP,

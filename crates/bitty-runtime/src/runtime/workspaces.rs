@@ -885,7 +885,7 @@ impl Runtime {
                 self.primary_view = self.focus.focused();
                 // CTX-0803 (#1476): primary ownership just moved off a dead
                 // id; a selection still owned by it is dropped.
-                self.invalidate_selection_if_owner_stale();
+                self.invalidate_stale_view_bindings();
                 self.sync_primary_geometry();
                 // CTX-0501: the re-homed leaf may still carry a pending
                 // restore. Primary ownership supersedes the pane spawn — the

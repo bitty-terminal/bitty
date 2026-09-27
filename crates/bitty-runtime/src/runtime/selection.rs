@@ -38,6 +38,24 @@ pub(crate) struct SelectionState {
     pub(crate) dragging: bool,
 }
 
+/// Grid backing `view` from disjoint field borrows (CTX-0805).
+///
+/// The free-function twin of [`Runtime::session_state_for`]: the pane
+/// session's grid, else the primary grid when `view` is the primary owner.
+/// Taking the fields separately lets a caller hold this grid while it
+/// mutably borrows another field (the search state, a layout leaf).
+pub(super) fn grid_of<'a>(
+    pane_sessions: &'a BTreeMap<ViewId, super::panes::PaneSession>,
+    primary_view: Option<ViewId>,
+    primary: &'a State,
+    view: ViewId,
+) -> Option<&'a State> {
+    if let Some(session) = pane_sessions.get(&view) {
+        return Some(&session.state);
+    }
+    (primary_view == Some(view)).then_some(primary)
+}
+
 pub(super) fn clamp_cell_pos(snapshot: &Snapshot, pos: CellPos) -> CellPos {
     let max_row = snapshot.height.saturating_sub(1) as u16;
     let max_col = snapshot.width.saturating_sub(1) as u16;
@@ -76,13 +94,7 @@ impl Runtime {
     /// layout. Selection readers use [`Self::selection_owner_state`], which
     /// adds that check and fails closed.
     pub(super) fn session_state_for(&self, view: ViewId) -> Option<&State> {
-        if let Some(session) = self.pane_sessions.get(&view) {
-            return Some(&session.state);
-        }
-        if self.primary_view == Some(view) {
-            return Some(&self.state);
-        }
-        None
+        grid_of(&self.pane_sessions, self.primary_view, &self.state, view)
     }
 
     /// Live grid backing `view` **and** its membership in the active layout.
@@ -140,27 +152,6 @@ impl Runtime {
         self.pending_full_redraw = true;
     }
 
-    /// Installs a primary-grid selection created by a keyboard consumer
-    /// (CTX-0803).
-    ///
-    /// Copy mode, the search overlay, and persistent-selection restore still
-    /// read the primary grid, so the selection they create is owned by
-    /// [`Self::primary_view`]; without a primary owner they create none (fail
-    /// closed). Rebinding those consumers to the focused `View` is #1478 and
-    /// deliberately out of scope here.
-    pub(super) fn set_primary_selection(
-        &mut self,
-        selection: Selection,
-        anchor_press: Option<CellPos>,
-        dragging: bool,
-    ) {
-        let Some(primary) = self.primary_view else {
-            self.drop_selection();
-            return;
-        };
-        self.install_selection(primary, selection, anchor_press, dragging);
-    }
-
     /// Drops the live selection when `view` owns it (CTX-0803 lifecycle).
     ///
     /// Used where `view`'s grid itself is replaced or torn down while the leaf
@@ -192,6 +183,73 @@ impl Runtime {
         if self.live_view_state(sel.owner).is_none() {
             self.drop_selection();
         }
+    }
+
+    /// Lifecycle funnel for every View-bound consumer (CTX-0803/CTX-0805).
+    ///
+    /// Drops the selection, ends copy mode, and ends the search when the
+    /// View each is bound to no longer resolves to a live grid in the active
+    /// layout. Called from the same funnels as the selection invalidation
+    /// (layout install, primary re-home, session restore).
+    pub(super) fn invalidate_stale_view_bindings(&mut self) {
+        self.invalidate_selection_if_owner_stale();
+        if self
+            .copy_mode_view
+            .is_some_and(|view| self.live_view_state(view).is_none())
+        {
+            self.exit_copy_mode();
+        }
+        if self
+            .search_view
+            .is_some_and(|view| self.live_view_state(view).is_none())
+        {
+            self.end_search_binding();
+        }
+    }
+
+    /// Drops every consumer bound to `view` because its grid was replaced
+    /// or torn down while the leaf may still be in the layout (pane close,
+    /// pane respawn): selection, copy mode, and search (CTX-0803/CTX-0805).
+    pub(super) fn drop_view_bindings_for(&mut self, view: ViewId) {
+        self.drop_selection_owned_by(view);
+        if self.copy_mode_view == Some(view) {
+            self.exit_copy_mode();
+        }
+        if self.search_view == Some(view) {
+            self.end_search_binding();
+        }
+    }
+
+    /// Ends the search bound to a View that lost its grid: closes the
+    /// overlay when open, else clears the non-modal search state.
+    fn end_search_binding(&mut self) {
+        if self.search_mode {
+            self.exit_search_mode();
+        } else {
+            self.search_clear();
+        }
+    }
+
+    /// Drops every View-bound consumer unconditionally (session restore
+    /// installs a new world whose grids none of them addressed).
+    pub(super) fn drop_all_view_bindings(&mut self) {
+        self.drop_selection();
+        self.exit_copy_mode();
+        self.end_search_binding();
+    }
+
+    /// View the keyboard consumers address (CTX-0805, #1478): the View an
+    /// active search is bound to, else the focused View.
+    ///
+    /// The persistent-selection API and a fresh search read this View's
+    /// grid instead of assuming the primary grid.
+    pub(super) fn keyboard_view(&self) -> Option<ViewId> {
+        self.search_view.or_else(|| self.focused_view())
+    }
+
+    /// Live grid of [`Self::keyboard_view`], fail-closed.
+    pub(super) fn keyboard_grid(&self) -> Option<&State> {
+        self.live_view_state(self.keyboard_view()?)
     }
 
     /// Current selection, if any (read-only).

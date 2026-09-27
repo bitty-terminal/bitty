@@ -557,6 +557,13 @@ pub struct Runtime {
     /// CTX-0385 `SelectionKind` seams, yank to clipboard plus primary).
     /// Bounded `O(1)` state; see `runtime::copy_mode`.
     copy_mode: Option<crate::runtime::copy_mode::CopyModeState>,
+    /// View whose grid the active copy mode walks (CTX-0805, #1478).
+    ///
+    /// Bound to the focused View on entry and cleared on exit, so a focus
+    /// change mid-session never retargets the cursor onto another grid.
+    /// `Some` exactly while `copy_mode` is `Some`; a bound View that loses
+    /// its live grid ends copy mode (fail closed).
+    copy_mode_view: Option<ViewId>,
     /// Scrollback search overlay open flag (CTX-0383, issue #639).
     ///
     /// `false` in normal operation; `true` while the keyboard-first modal
@@ -566,6 +573,14 @@ pub struct Runtime {
     /// heap stays `<=256` bytes and matches `<=1000`. See
     /// `runtime::search_mode`.
     search_mode: bool,
+    /// View whose grid `search_state` was computed against (CTX-0805,
+    /// #1478).
+    ///
+    /// Set to the focused View when a search starts (`search_set`, the
+    /// overlay's first query) and cleared with the search. Matches are
+    /// buffer rows of exactly this grid, so refresh, reveal, highlights, and
+    /// the live selection they drive all address it, even if focus moves.
+    search_view: Option<ViewId>,
     /// Active overlay-scrollbar thumb drag (CTX-0181).
     ///
     /// Press+move on the painted thumb scrolls the focused view through the
@@ -1239,7 +1254,9 @@ impl Runtime {
             click_tracker: ClickTracker::new(),
             last_click_count: crate::runtime::click::CLICK_COUNT_MIN,
             copy_mode: None,
+            copy_mode_view: None,
             search_mode: false,
+            search_view: None,
             scrollbar_drag: None,
             scrollbar_cursor_left: false,
             scrollbar_visible: false,
@@ -1446,7 +1463,9 @@ impl Runtime {
             click_tracker: ClickTracker::new(),
             last_click_count: crate::runtime::click::CLICK_COUNT_MIN,
             copy_mode: None,
+            copy_mode_view: None,
             search_mode: false,
+            search_view: None,
             scrollbar_drag: None,
             scrollbar_cursor_left: false,
             scrollbar_visible: false,

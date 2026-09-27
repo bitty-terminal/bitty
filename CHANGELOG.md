@@ -32,9 +32,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   New APIs: `selection_owner()` and `set_view_selection()`, plus the read-only
   seam `live_cell_size()`. Unchanged: `cursor_to_cell` still serves mouse
-  reporting and alt-drag chrome (#1477). Still primary-bound: copy mode,
-  search, and `persistent_selection()` read the primary grid and own their
-  selections by `primary_view` (#1478).
+  reporting and alt-drag chrome (#1477).
+
+- **Copy mode and search are View-bound (CTX-0805, #1478):** copy mode and
+  scrollback search read the primary grid. They consulted the focused View
+  only for its scroll offset. Output on any pane refreshed a search against
+  that pane's grid, and a `clear` in any pane dropped a selection made in
+  another.
+  - Copy mode binds to the focused View on entry and walks, pages, and yanks
+    that View's grid. It stays bound if focus moves and ends when its View
+    loses its grid.
+  - The search overlay and `search_set` bind to the focused View
+    (`search_view()`), match only its grid, and refresh only on output to
+    it.
+  - A grid erase drops only a selection owned by the erased grid.
+  - The persistent-selection API follows the keyboard View.
 
 - **Pointer consumers address the pane under the pointer (CTX-0804,
   #1477):** mouse reports, capture click-to-focus, and OSC 8 hyperlink

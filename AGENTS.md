@@ -100,6 +100,7 @@
 
 - After push, monitor via `HTTPS_PROXY=$NETWORK_PROXY gh pr checks <PR> --watch --interval 15` until CodeQL, Quality gates, Windows all pass, mergeable==MERGEABLE, then `gh pr merge --squash`. Prefer `--watch` over `sleep` loops; `pty_spawn` with `notifyOnExit` handles long waits without polling.
 - CodeRabbit comments gate the merge: before merging, read every CodeRabbit review comment and inline suggestion on the PR. Apply each valid suggestion in the PR (reply with the fix commit), reply with the reason for each declined one, and file out-of-scope findings as follow-up tasks/issues; record the disposition in a CarryCtx progress note. Re-run the local gates after applying fixes and wait for CI on the new head; do not merge while a CodeRabbit comment has neither an applied fix nor a reply.
+- Docs-only PRs merge immediately (owner directive): a PR that changes only Markdown prose (no code, scripts, `justfile`, workflows, config, lockfiles, fixtures, or submodule pins) is exempt from `just ci-local` and does not wait for remote CI, a reviewer, or CodeRabbit. Run the local Markdown gates (`just markdownlint`, `just status-drift`, `just scratch-paths`), push, open the PR with labels and milestone, apply any CodeRabbit comment already posted, then `gh pr merge --squash --delete-branch`. Comments that arrive after the merge become follow-up tasks. Anything beyond Markdown prose follows the full gate above.
 
 ### Continuous patrol and Code Review
 

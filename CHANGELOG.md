@@ -36,6 +36,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   search, and `persistent_selection()` read the primary grid and own their
   selections by `primary_view` (#1478).
 
+- **Pointer consumers address the pane under the pointer (CTX-0804,
+  #1477):** mouse reports, capture click-to-focus, and OSC 8 hyperlink
+  activation used the primary-global `cursor_to_cell`. In a split, an app in
+  a non-primary pane received coordinates offset by its pane origin. Focus
+  could not leave a mouse-tracking pane by clicking. A click on one pane
+  could arm a link from the primary grid.
+  - Press, release, motion, and wheel reports now carry the receiving
+    (focused) pane's own grid cells, clamped at its edge rather than dropped.
+  - A left press on another pane moves focus first whenever a
+    mouse-tracking app is involved, so the click reaches the pane it landed
+    on. Shift, Alt, gap bands, and split handles keep their existing
+    meaning.
+  - Hyperlink activation resolves the link in the clicked pane's grid, and
+    fails closed while that pane is scrolled into history.
+
 ## [0.0.21] - 2026-09-24
 
 ### Release highlights

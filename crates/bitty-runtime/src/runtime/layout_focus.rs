@@ -912,6 +912,47 @@ impl Runtime {
         Some((focused, cell))
     }
 
+    /// Cell reported to the focused pane's app for a mouse event at `pos`
+    /// (CTX-0804, #1477).
+    ///
+    /// Mouse reports are routed to the focused pane (`push_input_bytes`), so
+    /// their coordinates are that pane's own grid cells. The pointer maps
+    /// into the focused View's content frame through the same clamped,
+    /// row-window-aware mapping the selection drag uses. A pointer outside
+    /// the frame clamps to the nearest edge cell (xterm drag semantics) and
+    /// never names a sibling pane's cell. The legacy primary-global
+    /// [`Self::cursor_to_cell`] remains only as the fallback when the focused
+    /// View has no present frame or no grid; bytes for such a leaf are
+    /// dropped by the router anyway.
+    pub(super) fn mouse_report_cell(&self, pos: CursorPosition) -> CellPos {
+        self.focused_view()
+            .and_then(|view| self.cursor_to_owner_cell(view, pos))
+            .unwrap_or_else(|| self.cursor_to_cell(pos))
+    }
+
+    /// URI of the OSC 8 hyperlink under `pos`, resolved in the grid of the
+    /// View under the pointer (CTX-0804, #1477).
+    ///
+    /// Uses the selection-press target rule ([`Self::selection_press_target`]:
+    /// the hit View, or the focused View for a padding or gap press), so a
+    /// click and a selection agree on which grid they address. Fails closed
+    /// when that View is scrolled into history: the live-grid cell is not
+    /// the cell on screen there, and activating it would open a link the
+    /// user cannot see.
+    pub(super) fn hyperlink_uri_at(&self, pos: CursorPosition) -> Option<String> {
+        let (view, cell) = self.selection_press_target(pos)?;
+        if self.view_scroll_offset(view) != 0 {
+            return None;
+        }
+        let state = self.live_view_state(view)?;
+        let snapshot = state.snapshot();
+        let index = usize::from(cell.row)
+            .checked_mul(snapshot.width)?
+            .checked_add(usize::from(cell.col))?;
+        let id = snapshot.cells.get(index)?.hyperlink?;
+        state.hyperlink_entry(id).map(|(_, uri)| uri.to_owned())
+    }
+
     /// Maps a physical cursor position to its leaf and leaf-local cell
     /// (CTX-0177).
     ///

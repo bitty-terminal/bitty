@@ -1149,6 +1149,12 @@ impl Runtime {
         }
         // Shift override always forces selection path.
         let shift_override = self.shift_pressed;
+        // CTX-0804 (#1477): a left press on another pane is a focus choice
+        // first when a mouse-tracking app is involved, so the capture
+        // decision below reads the pane the click landed on.
+        if event.button == MouseButton::Left && event.state == PressState::Pressed {
+            self.focus_pointer_pane_before_capture();
+        }
         // CTX-0532: capture decision reads the focused pane's modes (primary
         // fallback for session-less leaves) — a focus change with no pump
         // must never capture with the previous pane's tracking/encoding.
@@ -1162,7 +1168,9 @@ impl Runtime {
 
         if capture {
             if let Some(pos) = self.last_cursor {
-                let cell = self.cursor_to_cell(pos);
+                // CTX-0804 (#1477): pane-local cell of the focused pane that
+                // receives the report, never the primary-global mapping.
+                let cell = self.mouse_report_cell(pos);
                 let format = super::mouse_encode::MouseFormat::from_encoding(
                     focused_modes.mouse_coordinate_encoding,
                 );
@@ -1443,7 +1451,7 @@ impl Runtime {
             let format = super::mouse_encode::MouseFormat::from_encoding(
                 focused_modes.mouse_coordinate_encoding,
             );
-            let cell = self.cursor_to_cell(pos);
+            let cell = self.mouse_report_cell(pos);
             // Motion reports carry the "no button" code (`3`); the motion
             // flag adds the `+32` motion bit in every encoding.
             let report = super::mouse_encode::MouseReport {
@@ -1587,7 +1595,7 @@ impl Runtime {
                     let modifiers = self.mouse_modifier_bits();
                     let (col, row) = match self.last_cursor {
                         Some(pos) => {
-                            let cell = self.cursor_to_cell(pos);
+                            let cell = self.mouse_report_cell(pos);
                             (cell.col, cell.row)
                         }
                         None => (0, 0),

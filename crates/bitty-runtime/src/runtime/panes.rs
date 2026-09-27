@@ -716,6 +716,15 @@ impl Runtime {
         }
     }
 
+    /// Whether leaf `view`'s app tracks the mouse, with the same attribution
+    /// rule as [`Self::focused_modes`] (CTX-0804): the leaf's own session
+    /// modes, else the primary grid's modes when `view` is the primary owner.
+    /// A session-less, non-primary leaf runs no app, so it tracks nothing.
+    pub(super) fn view_tracks_mouse(&self, view: ViewId) -> bool {
+        self.session_state_for(view)
+            .is_some_and(|state| state.modes().mouse_tracking.is_some())
+    }
+
     /// Whether the focused pane's grid is on the alternate screen.
     ///
     /// Mirrors [`Self::focused_modes`] attribution (CTX-0532): alternate

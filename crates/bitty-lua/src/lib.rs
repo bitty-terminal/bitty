@@ -591,6 +591,28 @@ impl LuaVm {
         self.wall_elapsed_ms = 0;
     }
 
+    /// Register the network module (`bitty.network`) for this VM.
+    ///
+    /// This should be called after VM creation by the plugin host when the
+    /// plugin has `network.connect:*` capabilities granted. The runtime
+    /// reference must remain valid for the VM's lifetime.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if module registration fails (e.g., Lua errors during
+    /// table creation or callback registration).
+    pub fn register_network_module(
+        &mut self,
+        runtime: &bitty_network_lua::SharedNetworkRuntime,
+    ) -> Result<(), VmError> {
+        self.lua
+            .enter(|ctx| {
+                bitty_network_lua::register_network_module(ctx, runtime)
+                    .map_err(|e| format!("network module registration failed: {:?}", e))
+            })
+            .map_err(VmError::Runtime)
+    }
+
     /// Replace budgets (for tuning without recreation).
     pub fn set_budgets(
         &mut self,

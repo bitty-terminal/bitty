@@ -407,6 +407,13 @@ pub struct Runtime {
     /// exhaustion reset. Entries are pruned to the visible allocation set
     /// after every presented frame. See `runtime::present`.
     presented_leaf_frames: std::collections::BTreeMap<ViewId, self::present::PresentedLeaf>,
+    /// Consecutive frames dropped because the overlay phase reset the glyph
+    /// atlas after the leaf pass planned its slots (issue #1409, CTX-0797).
+    ///
+    /// Bounds the rejection path so a working set that never fits one atlas
+    /// epoch still presents instead of starving the window. Reset on the first
+    /// epoch-consistent frame. See `runtime::present::reject_stale_atlas_frame`.
+    stale_atlas_frame_rejects: u8,
     pending_full_redraw: bool,
     /// Last presented View frames (CTX-0228, decoration-aware CTX-0294).
     ///
@@ -1202,6 +1209,7 @@ impl Runtime {
             plugin_host,
             last_presented_generation: u64::MAX,
             presented_leaf_frames: std::collections::BTreeMap::new(),
+            stale_atlas_frame_rejects: 0,
             pending_full_redraw: true,
             last_presented_allocations: Vec::new(),
             last_presented_focus: None,
@@ -1410,6 +1418,7 @@ impl Runtime {
             plugin_host,
             last_presented_generation: u64::MAX,
             presented_leaf_frames: std::collections::BTreeMap::new(),
+            stale_atlas_frame_rejects: 0,
             pending_full_redraw: true,
             last_presented_allocations: Vec::new(),
             last_presented_focus: None,

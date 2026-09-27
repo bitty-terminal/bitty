@@ -99,6 +99,7 @@
 ### Remote monitoring and merge (bitty)
 
 - After push, monitor via `HTTPS_PROXY=$NETWORK_PROXY gh pr checks <PR> --watch --interval 15` until CodeQL, Quality gates, Windows all pass, mergeable==MERGEABLE, then `gh pr merge --squash`. Prefer `--watch` over `sleep` loops; `pty_spawn` with `notifyOnExit` handles long waits without polling.
+- CodeRabbit comments gate the merge: before merging, read every CodeRabbit review comment and inline suggestion on the PR. Apply each valid suggestion in the PR (reply with the fix commit), reply with the reason for each declined one, and file out-of-scope findings as follow-up tasks/issues; record the disposition in a CarryCtx progress note. Re-run the local gates after applying fixes and wait for CI on the new head; do not merge while a CodeRabbit comment has neither an applied fix nor a reply.
 
 ### Continuous patrol and Code Review
 

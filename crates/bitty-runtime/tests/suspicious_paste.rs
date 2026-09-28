@@ -839,3 +839,153 @@ fn ctx0369_dangerous_controls_still_gate_and_name_their_class() {
         assert_eq!(rt.pending_input(), text.as_bytes());
     }
 }
+
+// ── Issue #1438: auto-cancel timeout for pending paste ────────────────
+
+#[test]
+fn issue_1438_pending_paste_auto_cancels_after_timeout() {
+    // A pending paste that is not confirmed or cancelled within the configured
+    // timeout is automatically cancelled without delivery.
+    use bitty_runtime::{Runtime, RuntimeConfig};
+
+    // Create runtime with a short timeout for testing (1 second minimum).
+    let mut config = RuntimeConfig::default();
+    config.paste_confirm_timeout = std::time::Duration::from_secs(1);
+    let mut rt = Runtime::new(config).expect("runtime must build");
+    rt.force_headless_clipboard();
+
+    rt.clipboard_mut()
+        .set_text("line1\nline2".to_string())
+        .unwrap();
+    rt.drain_pending_input();
+
+    // Gate the paste.
+    let t0 = std::time::Instant::now();
+    assert!(rt.paste_from_clipboard().unwrap().unwrap());
+    assert!(rt.has_pending_paste());
+    assert_eq!(rt.pending_input(), b"");
+
+    // Before timeout: paste still pending.
+    let before_timeout = t0 + std::time::Duration::from_millis(500);
+    assert_eq!(
+        rt.paste_should_auto_cancel_at(before_timeout),
+        Some(false),
+        "paste must not auto-cancel before timeout"
+    );
+    assert!(rt.has_pending_paste());
+
+    // After timeout: auto-cancel check should cancel the paste.
+    let after_timeout = t0 + std::time::Duration::from_millis(1100);
+    assert_eq!(
+        rt.paste_should_auto_cancel_at(after_timeout),
+        Some(true),
+        "paste should be eligible for auto-cancel after timeout"
+    );
+
+    // Wait for the actual timeout to elapse.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    // Now check_and_auto_cancel_paste should cancel it.
+    assert!(
+        rt.check_and_auto_cancel_paste(),
+        "check_and_auto_cancel_paste must return true when it cancelled"
+    );
+    assert!(!rt.has_pending_paste(), "paste must be cancelled");
+    assert_eq!(rt.pending_input(), b"", "auto-cancel must not deliver");
+}
+
+#[test]
+fn issue_1438_auto_cancel_does_not_fire_when_no_paste_pending() {
+    let mut rt = make_runtime();
+    assert!(!rt.has_pending_paste());
+    assert!(
+        !rt.check_and_auto_cancel_paste(),
+        "must return false when no paste pending"
+    );
+}
+
+#[test]
+fn issue_1438_confirm_before_timeout_delivers_normally() {
+    // Confirming a paste before the timeout expires delivers it normally.
+    let mut rt = make_runtime();
+    rt.clipboard_mut()
+        .set_text("hello\nworld".to_string())
+        .unwrap();
+    rt.drain_pending_input();
+
+    assert!(rt.paste_from_clipboard().unwrap().unwrap());
+    assert!(rt.has_pending_paste());
+
+    // Confirm before timeout.
+    assert!(rt.confirm_pending_paste(true));
+    assert!(!rt.has_pending_paste());
+    assert_eq!(rt.pending_input(), b"hello\nworld");
+
+    // Auto-cancel check after confirm does nothing.
+    assert!(!rt.check_and_auto_cancel_paste());
+}
+
+#[test]
+fn issue_1438_manual_cancel_before_timeout_prevents_auto_cancel() {
+    let mut rt = make_runtime();
+    rt.clipboard_mut().set_text("a\nb".to_string()).unwrap();
+    rt.drain_pending_input();
+
+    assert!(rt.paste_from_clipboard().unwrap().unwrap());
+    assert!(rt.has_pending_paste());
+
+    // Manual cancel before timeout.
+    assert!(rt.cancel_pending_paste());
+    assert!(!rt.has_pending_paste());
+    assert_eq!(rt.pending_input(), b"");
+
+    // Auto-cancel check after manual cancel does nothing.
+    assert!(!rt.check_and_auto_cancel_paste());
+}
+
+#[test]
+fn issue_1438_paste_confirm_timeout_validation() {
+    use bitty_runtime::{
+        MAX_PASTE_CONFIRM_TIMEOUT_SECS, MIN_PASTE_CONFIRM_TIMEOUT_SECS, RuntimeConfig,
+    };
+
+    // Valid timeouts.
+    for secs in [
+        MIN_PASTE_CONFIRM_TIMEOUT_SECS,
+        30,
+        MAX_PASTE_CONFIRM_TIMEOUT_SECS,
+    ] {
+        let config = RuntimeConfig {
+            paste_confirm_timeout: std::time::Duration::from_secs(secs),
+            ..Default::default()
+        };
+        assert!(
+            config.validate().is_ok(),
+            "timeout of {secs} seconds must be valid"
+        );
+    }
+
+    // Too short.
+    let config_short = RuntimeConfig {
+        paste_confirm_timeout: std::time::Duration::from_secs(
+            MIN_PASTE_CONFIRM_TIMEOUT_SECS - 1,
+        ),
+        ..Default::default()
+    };
+    assert!(
+        config_short.validate().is_err(),
+        "timeout below minimum must be rejected"
+    );
+
+    // Too long.
+    let config_long = RuntimeConfig {
+        paste_confirm_timeout: std::time::Duration::from_secs(
+            MAX_PASTE_CONFIRM_TIMEOUT_SECS + 1,
+        ),
+        ..Default::default()
+    };
+    assert!(
+        config_long.validate().is_err(),
+        "timeout above maximum must be rejected"
+    );
+}

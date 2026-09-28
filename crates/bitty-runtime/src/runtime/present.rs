@@ -1916,8 +1916,12 @@ impl Runtime {
         layers: &mut FrameLayers,
     ) {
         let focused = self.focused_view().or(view_map.keys().next().copied());
+        // Issue #1438: auto-cancel expired pending paste before presenting banner.
         if self.has_pending_paste() {
-            if let Some(banner) = self.paste_banner_text_at(now) {
+            if self.check_and_auto_cancel_paste() {
+                // Paste was auto-cancelled; request redraw to clear banner.
+                self.pending_full_redraw = true;
+            } else if let Some(banner) = self.paste_banner_text_at(now) {
                 self.paint_banner_pill(allocations, focused, &banner, pad_px, layers);
             }
         }

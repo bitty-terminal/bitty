@@ -83,6 +83,14 @@ pub const DEFAULT_CURSOR_STYLE: bitty_vt::CursorStyle = bitty_vt::CursorStyle::D
 pub const DEFAULT_BELL_MODE: crate::runtime::bell::BellMode =
     crate::runtime::bell::BellMode::Visual;
 
+/// Minimum paste confirmation timeout in seconds (issue #1438).
+/// Prevents accidentally setting a timeout too short for users to react.
+pub const MIN_PASTE_CONFIRM_TIMEOUT_SECS: u64 = 1;
+
+/// Maximum paste confirmation timeout in seconds (issue #1438).
+/// Bounded to prevent indefinite paste-pending state (5 minutes max).
+pub const MAX_PASTE_CONFIRM_TIMEOUT_SECS: u64 = 300;
+
 /// Close-confirmation mode for view/window close gestures (CTX-0370 top-level
 /// `close_confirm`).
 ///
@@ -731,6 +739,13 @@ pub struct RuntimeConfig {
     /// effective value post-construction, following the `focus_follows_mouse`
     /// pattern.
     pub bell_mode: crate::runtime::bell::BellMode,
+    /// Auto-cancel timeout for pending paste confirmation (issue #1438).
+    ///
+    /// A gated paste that has not been confirmed (by repeating the paste gesture)
+    /// or cancelled (via Esc) within this duration is automatically cancelled.
+    /// Default [`crate::runtime::DEFAULT_PASTE_CONFIRM_TIMEOUT`] (30 seconds).
+    /// Bounded by 1 second minimum and 300 seconds (5 minutes) maximum.
+    pub paste_confirm_timeout: std::time::Duration,
 }
 
 /// Default cell width in logical pixels (CTX-0157 breathing-room cell).
@@ -788,6 +803,7 @@ impl Default for RuntimeConfig {
             animations: AnimationPolicy::default(),
             cursor_style: DEFAULT_CURSOR_STYLE,
             bell_mode: DEFAULT_BELL_MODE,
+            paste_confirm_timeout: crate::runtime::DEFAULT_PASTE_CONFIRM_TIMEOUT,
         }
     }
 }
@@ -873,6 +889,7 @@ impl RuntimeConfig {
             animations: AnimationPolicy::default(),
             cursor_style: DEFAULT_CURSOR_STYLE,
             bell_mode: DEFAULT_BELL_MODE,
+            paste_confirm_timeout: crate::runtime::DEFAULT_PASTE_CONFIRM_TIMEOUT,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -1021,6 +1038,16 @@ impl RuntimeConfig {
         }
         for root in &self.background_image_roots {
             validate_background_path(root)?;
+        }
+        // Issue #1438: paste confirmation timeout must be bounded to prevent
+        // indefinite paste-pending state and ensure users have reasonable time to react.
+        let timeout_secs = self.paste_confirm_timeout.as_secs();
+        if !(MIN_PASTE_CONFIRM_TIMEOUT_SECS..=MAX_PASTE_CONFIRM_TIMEOUT_SECS)
+            .contains(&timeout_secs)
+        {
+            return Err(RuntimeError::InvalidConfig(
+                "paste_confirm_timeout must be within [1, 300] seconds",
+            ));
         }
         Ok(())
     }

@@ -332,6 +332,14 @@ pub const POLL_PTY_TIME_BUDGET: std::time::Duration = std::time::Duration::from_
 /// The flash keeps the never-silent signal without occluding the grid.
 pub const PASTE_BANNER_FULL_DURATION: std::time::Duration = std::time::Duration::from_secs(4);
 
+/// Auto-cancel timeout for pending paste confirmation (issue #1438).
+///
+/// A gated paste that has not been confirmed (by repeating the paste gesture)
+/// or cancelled (via Esc) within this duration is automatically cancelled.
+/// This prevents indefinite paste-pending state and provides a bounded UX.
+/// Default is 30 seconds; configurable via runtime config.
+pub const DEFAULT_PASTE_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Maximum time presentation defers frames while synchronized updates
 /// (`DECSET 2026`, CTX-0380) are active.
 ///

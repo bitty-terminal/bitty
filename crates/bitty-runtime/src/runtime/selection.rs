@@ -791,6 +791,33 @@ impl Runtime {
         self.paste_banner_text_at(std::time::Instant::now())
     }
 
+    /// Whether the pending paste should be auto-cancelled at `now` (issue #1438).
+    ///
+    /// Returns `true` when a paste is pending and has exceeded the configured
+    /// `paste_confirm_timeout` duration without confirmation or cancellation.
+    /// `None` when no paste pends.
+    #[must_use]
+    pub fn paste_should_auto_cancel_at(&self, now: std::time::Instant) -> Option<bool> {
+        self.pending_paste.as_ref()?;
+        let since = self.pending_paste_since?;
+        let timeout = self.config.paste_confirm_timeout;
+        Some(now.saturating_duration_since(since) >= timeout)
+    }
+
+    /// Auto-cancel the pending paste if the timeout has expired (issue #1438).
+    ///
+    /// Checks if a pending paste has exceeded the configured timeout and
+    /// automatically cancels it. Returns `true` when a paste was auto-cancelled.
+    /// This should be called during presentation/tick to enforce bounded paste-pending state.
+    pub fn check_and_auto_cancel_paste(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        if self.paste_should_auto_cancel_at(now) == Some(true) {
+            self.cancel_pending_paste()
+        } else {
+            false
+        }
+    }
+
     /// Pastes text from the system clipboard (or headless buffer) and routes
     /// it as terminal input via the bounded pending path. Returns
     /// `Err(PlatformError)` when clipboard acquisition fails, `Ok(None)` when

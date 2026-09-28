@@ -2393,6 +2393,42 @@ pub fn env_key_shape_ok(key: &str) -> bool {
     first_ok && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
+/// Prefix-wildcard `bitty.env` grant shape (CTX-0830, #1483).
+///
+/// A grant suffix (the `env.read:` prefix stripped) is either an exact key
+/// ([`env_key_shape_ok`]) or a prefix wildcard `PREFIX*`: a non-empty
+/// well-shaped prefix followed by one literal trailing asterisk. The bare
+/// star (`*`, empty prefix) is rejected — there is no allow-all grant — as
+/// is any star that is not the single trailing byte.
+#[must_use]
+pub fn env_grant_shape_ok(grant: &str) -> bool {
+    if env_key_shape_ok(grant) {
+        return true;
+    }
+    let Some(prefix) = grant.strip_suffix('*') else {
+        return false;
+    };
+    !prefix.is_empty() && env_key_shape_ok(prefix) && !prefix.contains('*')
+}
+
+/// Whether a retained grant suffix authorizes a concrete `bitty.env` key
+/// (CTX-0830, #1483).
+///
+/// Exact grants authorize only their own key; `PREFIX*` grants authorize
+/// every well-shaped key with that prefix. The bare star never authorizes
+/// (`env_grant_shape_ok` rejects it at the boundary, and this matcher
+/// treats a non-shape-conforming grant as deny).
+#[must_use]
+pub fn env_grant_authorizes(grant: &str, key: &str) -> bool {
+    if !env_key_shape_ok(key) {
+        return false;
+    }
+    if let Some(prefix) = grant.strip_suffix('*') {
+        return !prefix.is_empty() && env_key_shape_ok(prefix) && key.starts_with(prefix);
+    }
+    grant == key
+}
+
 /// Validate a `bitty.env` key shape (CTX-0330).
 ///
 /// Keys are `[A-Za-z_][A-Za-z0-9_]*` within `1..=ENV_KEY_MAX_BYTES` bytes.
@@ -2774,6 +2810,50 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn env_grant_shape_ok_accepts_exact_and_prefix_wildcard() {
+        // CTX-0830 (#1483): exact keys and `PREFIX*` are well-shaped grants;
+        // the bare star and non-trailing stars are not.
+        for grant in ["HOME", "_x1", "APP_*", "A_*"] {
+            assert!(env_grant_shape_ok(grant), "accept '{grant}'");
+        }
+        for grant in [
+            "",
+            "*",
+            "*APP",
+            "AP*P",
+            "APP**",
+            "9LIVES",
+            "9LIVES*",
+            "has space",
+            "lower-ok?",
+        ] {
+            assert!(!env_grant_shape_ok(grant), "reject '{grant}'");
+        }
+        let long_prefix = "A".repeat(ENV_KEY_MAX_BYTES + 1);
+        let long_grant = format!("{long_prefix}*");
+        assert!(
+            !env_grant_shape_ok(&long_grant),
+            "over-bound prefix rejected"
+        );
+    }
+
+    #[test]
+    fn env_grant_authorizes_matches_exact_and_prefix() {
+        // CTX-0830 (#1483): exact grants match only their own key, `PREFIX*`
+        // matches keys carrying that prefix, everything else fails closed.
+        assert!(env_grant_authorizes("HOME", "HOME"));
+        assert!(!env_grant_authorizes("HOME", "HOMELY"));
+        assert!(env_grant_authorizes("APP_*", "APP_TOKEN"));
+        assert!(env_grant_authorizes("APP_*", "APP_"));
+        assert!(!env_grant_authorizes("APP_*", "APP"));
+        assert!(!env_grant_authorizes("APP_*", "OTHER"));
+        assert!(!env_grant_authorizes("*", "HOME"));
+        assert!(!env_grant_authorizes("AP*P", "APXP"));
+        assert!(!env_grant_authorizes("HOME", "9LIVES"));
+        assert!(!env_grant_authorizes("APP_*", ""));
     }
 
     #[test]

@@ -1606,13 +1606,18 @@ fn verify_module_tree(id: &PluginId, root: &Path) -> Result<(), PluginRuntimeErr
     resolution::scan_module_tree(id.as_str(), root).map(|_| ())
 }
 
-/// Extract `bitty.env` keys from the activation grant snapshot (CTX-0330).
+/// Extract `bitty.env` grant suffixes from the activation grant snapshot
+/// (CTX-0330, CTX-0830).
 ///
-/// Only `env.read:<KEY>` grants contribute, and only with a well-shaped key
-/// (`[A-Za-z_][A-Za-z0-9_]*`, `1..=ENV_KEY_MAX_BYTES` bytes, shared rule in
-/// [`bitty_lua::env_key_shape_ok`]): a recorded grant with a malformed key
-/// fails closed as store integrity before any VM exists, like any other
-/// undeclared grant. The set is capped at [`services::MAX_ENV_GRANTS`].
+/// `env.read:<KEY>` grants contribute their exact key and
+/// `env.read:PREFIX*` grants contribute their prefix-wildcard suffix, each
+/// validated by the shared [`bitty_lua::env_grant_shape_ok`] rule
+/// (`[A-Za-z_][A-Za-z0-9_]*` prefix, `1..=ENV_KEY_MAX_BYTES` bytes, one
+/// literal trailing `*` for wildcards). The bare-star allow-all (`env.read:*`)
+/// is rejected like any other malformed recorded grant: a recorded grant with
+/// a malformed suffix fails closed as store integrity before any VM exists,
+/// like any other undeclared grant. The set is capped at
+/// [`services::MAX_ENV_GRANTS`].
 fn env_grant_keys(
     id: &PluginId,
     granted: &BTreeSet<CapabilityId>,
@@ -1622,7 +1627,7 @@ fn env_grant_keys(
         let Some(key) = capability.as_str().strip_prefix("env.read:") else {
             continue;
         };
-        if !bitty_lua::env_key_shape_ok(key) {
+        if !bitty_lua::env_grant_shape_ok(key) {
             return Err(PluginRuntimeError::Integrity {
                 plugin: id.to_string(),
                 detail: format!("recorded env grant for '{key}' is not a valid env key"),
@@ -1920,16 +1925,33 @@ mod tests {
     #[test]
     fn env_grant_keys_extract_only_well_shaped_keys() {
         let id = PluginId::new("xuepoo.test").expect("id");
-        let granted = parsed_grants(&["terminal.semantic-read", "env.read:HOME", "env.read:PATH"]);
+        let granted = parsed_grants(&[
+            "terminal.semantic-read",
+            "env.read:HOME",
+            "env.read:PATH",
+            "env.read:APP_*",
+        ]);
         assert_eq!(
             env_grant_keys(&id, &granted).expect("keys extract"),
-            BTreeSet::from(["HOME".to_string(), "PATH".to_string()])
+            BTreeSet::from(["APP_*".to_string(), "HOME".to_string(), "PATH".to_string()])
         );
         assert!(
             env_grant_keys(&id, &BTreeSet::new())
                 .expect("empty")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn env_grant_keys_reject_bare_star_allow_all() {
+        // CTX-0830 (#1483): `env.read:*` is not a prefix wildcard (empty
+        // prefix) and must fail closed as store integrity.
+        let id = PluginId::new("xuepoo.test").expect("id");
+        for raw in ["env.read:*", "env.read:9LIVES*"] {
+            let granted = parsed_grants(&[raw]);
+            let error = env_grant_keys(&id, &granted).expect_err("must fail");
+            assert_eq!(error.code(), "E_INTEGRITY");
+        }
     }
 
     #[test]

@@ -13,7 +13,7 @@ use std::rc::{Rc, Weak};
 use bitty_lua::ui::{UI_MAX_AGGREGATED_TEXT_BYTES, UI_MAX_BLOCKS, UiNode};
 use bitty_lua::{
     BridgeError, HostServices, LuaValue, LuaVm, SNAPSHOT_MAX_BYTES, ServiceRoute, StashedFunction,
-    validate_env_key,
+    env_grant_authorizes, env_grant_shape_ok, validate_env_key,
 };
 use bitty_package::Version;
 use bitty_plugin_host::bundled::{WORKSPACELINE_CLAIM, canonicalize_ui_claim};
@@ -685,17 +685,20 @@ impl PluginServices {
         f(&self.store.borrow())
     }
 
-    /// Grant `bitty.env` reads for exact keys (CTX-0330).
+    /// Grant `bitty.env` reads for exact keys and prefix wildcards (CTX-0330,
+    /// CTX-0830).
     ///
-    /// Set from the activation grant snapshot (`env.read:<KEY>` entries with
-    /// the prefix stripped); absent grants fail closed at call time with
-    /// `E_NOT_IMPLEMENTED`. Every key is shape-validated here — a malformed
-    /// recorded grant fails the whole set rather than silently dropping —
-    /// and the set is capped at [`MAX_ENV_GRANTS`].
+    /// Set from the activation grant snapshot (`env.read:<KEY>` and
+    /// `env.read:PREFIX*` entries with the prefix stripped); absent grants
+    /// fail closed at call time with `E_NOT_IMPLEMENTED`. Every entry is
+    /// shape-validated here via [`env_grant_shape_ok`] — a malformed
+    /// recorded grant (including the bare-star allow-all `*`) fails the
+    /// whole set rather than silently dropping — and the set is capped at
+    /// [`MAX_ENV_GRANTS`].
     ///
     /// # Errors
     ///
-    /// [`BridgeError`] with `E_DEF_INVALID`/`E_DEF_LIMIT` when a key is
+    /// [`BridgeError`] with `E_DEF_INVALID`/`E_DEF_LIMIT` when a grant is
     /// malformed or the set exceeds [`MAX_ENV_GRANTS`].
     pub fn set_env_grants(&self, keys: BTreeSet<String>) -> Result<(), BridgeError> {
         if keys.len() > MAX_ENV_GRANTS {
@@ -706,7 +709,13 @@ impl PluginServices {
             ));
         }
         for key in &keys {
-            validate_env_key(key)?;
+            if !env_grant_shape_ok(key) {
+                return Err(BridgeError::new(
+                    "validation",
+                    "E_DEF_INVALID",
+                    format!("env grant '{key}' is not a valid key or prefix wildcard"),
+                ));
+            }
         }
         *self.env_grants.borrow_mut() = keys;
         Ok(())
@@ -789,7 +798,13 @@ impl HostServices for PluginServices {
 
     fn env_get(&self, key: &str) -> Result<Option<LuaValue>, BridgeError> {
         validate_env_key(key)?;
-        if !self.env_grants.borrow().contains(key) {
+        // CTX-0830: Check wildcard grants
+        let granted = self
+            .env_grants
+            .borrow()
+            .iter()
+            .any(|grant| bitty_lua::env_grant_authorizes(grant, key));
+        if !granted {
             // Desensitized denial: ungranted keys share the backend-absent
             // code, so callers cannot probe which variables exist.
             return Err(BridgeError::not_implemented("bitty.env.get"));
@@ -812,7 +827,13 @@ impl HostServices for PluginServices {
 
     fn env_has(&self, key: &str) -> Result<bool, BridgeError> {
         validate_env_key(key)?;
-        if !self.env_grants.borrow().contains(key) {
+        // CTX-0830: Check wildcard grants
+        let granted = self
+            .env_grants
+            .borrow()
+            .iter()
+            .any(|grant| bitty_lua::env_grant_authorizes(grant, key));
+        if !granted {
             return Err(BridgeError::not_implemented("bitty.env.has"));
         }
         Ok(self.env_source.borrow().get(key).is_some())
@@ -1180,6 +1201,53 @@ mod tests {
         assert_eq!(HostServices::env_has(&services, "HOME"), Ok(true));
         assert_eq!(HostServices::env_get(&services, "EMPTY_VAR"), Ok(None));
         assert_eq!(HostServices::env_has(&services, "EMPTY_VAR"), Ok(false));
+    }
+
+    #[test]
+    fn env_prefix_wildcard_grant_authorizes_get_and_has() {
+        // CTX-0830 (#1483): `APP_*` authorizes matching keys through
+        // `env_get`/`env_has` while non-matching keys stay fail-closed.
+        let services = env_services(&["APP_*"], &[("APP_TOKEN", "secret"), ("OTHER", "nope")]);
+        assert_eq!(
+            HostServices::env_get(&services, "APP_TOKEN"),
+            Ok(Some(LuaValue::String("secret".to_string())))
+        );
+        assert_eq!(HostServices::env_has(&services, "APP_TOKEN"), Ok(true));
+        let error = services
+            .env_get("OTHER")
+            .expect_err("non-matching key must deny");
+        assert_eq!(error.code, "E_NOT_IMPLEMENTED");
+        let error = services
+            .env_has("OTHER")
+            .expect_err("non-matching key must deny");
+        assert_eq!(error.code, "E_NOT_IMPLEMENTED");
+    }
+
+    #[test]
+    fn env_exact_grant_does_not_match_longer_key() {
+        // Exact-key behavior is unchanged: `HOME` does not authorize `HOMELY`.
+        let services = env_services(&["HOME"], &[("HOME", "x"), ("HOMELY", "y")]);
+        assert_eq!(
+            HostServices::env_get(&services, "HOME"),
+            Ok(Some(LuaValue::String("x".to_string())))
+        );
+        let error = services
+            .env_get("HOMELY")
+            .expect_err("longer key must deny");
+        assert_eq!(error.code, "E_NOT_IMPLEMENTED");
+    }
+
+    #[test]
+    fn env_bare_star_grant_rejected_at_set() {
+        // The bare-star allow-all is rejected at `set_env_grants`, and the
+        // existing set is left untouched (fail-closed, fail-whole-set).
+        let services = services();
+        let bad: BTreeSet<String> = BTreeSet::from(["*".to_string()]);
+        let error = services
+            .set_env_grants(bad)
+            .expect_err("bare star must fail");
+        assert_eq!(error.code, "E_DEF_INVALID");
+        assert!(services.env_grants().is_empty());
     }
 
     #[test]

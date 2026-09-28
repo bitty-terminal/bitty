@@ -839,3 +839,269 @@ fn ctx0369_dangerous_controls_still_gate_and_name_their_class() {
         assert_eq!(rt.pending_input(), text.as_bytes());
     }
 }
+
+// ── Issue #1438: auto-cancel timeout for pending paste ────────────────
+
+#[test]
+fn issue_1438_pending_paste_auto_cancels_after_timeout() {
+    // A pending paste that is not confirmed or cancelled within the configured
+    // timeout is automatically cancelled without delivery.
+    use bitty_runtime::{Runtime, RuntimeConfig};
+
+    // Create runtime with a short timeout for testing (1 second minimum).
+    let config = RuntimeConfig {
+        paste_confirm_timeout: std::time::Duration::from_secs(1),
+        ..Default::default()
+    };
+    let mut rt = Runtime::new(config).expect("runtime must build");
+    rt.force_headless_clipboard();
+
+    rt.clipboard_mut()
+        .set_text("line1\nline2".to_string())
+        .unwrap();
+    rt.drain_pending_input();
+
+    // Gate the paste.
+    let t0 = std::time::Instant::now();
+    assert!(rt.paste_from_clipboard().unwrap().unwrap());
+    assert!(rt.has_pending_paste());
+    assert_eq!(rt.pending_input(), b"");
+
+    // Before timeout: paste still pending.
+    let before_timeout = t0 + std::time::Duration::from_millis(500);
+    assert_eq!(
+        rt.paste_should_auto_cancel_at(before_timeout),
+        Some(false),
+        "paste must not auto-cancel before timeout"
+    );
+    assert!(rt.has_pending_paste());
+
+    // After timeout: auto-cancel check should cancel the paste.
+    let after_timeout = t0 + std::time::Duration::from_millis(1100);
+    assert_eq!(
+        rt.paste_should_auto_cancel_at(after_timeout),
+        Some(true),
+        "paste should be eligible for auto-cancel after timeout"
+    );
+
+    // Wait for the actual timeout to elapse.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    // Now check_and_auto_cancel_paste should cancel it.
+    assert!(
+        rt.check_and_auto_cancel_paste(),
+        "check_and_auto_cancel_paste must return true when it cancelled"
+    );
+    assert!(!rt.has_pending_paste(), "paste must be cancelled");
+    assert_eq!(rt.pending_input(), b"", "auto-cancel must not deliver");
+}
+
+#[test]
+fn issue_1438_auto_cancel_does_not_fire_when_no_paste_pending() {
+    let mut rt = make_runtime();
+    assert!(!rt.has_pending_paste());
+    assert!(
+        !rt.check_and_auto_cancel_paste(),
+        "must return false when no paste pending"
+    );
+}
+
+#[test]
+fn issue_1438_confirm_before_timeout_delivers_normally() {
+    // Confirming a paste before the timeout expires delivers it normally.
+    let mut rt = make_runtime();
+    rt.clipboard_mut()
+        .set_text("hello\nworld".to_string())
+        .unwrap();
+    rt.drain_pending_input();
+
+    assert!(rt.paste_from_clipboard().unwrap().unwrap());
+    assert!(rt.has_pending_paste());
+
+    // Confirm before timeout.
+    assert!(rt.confirm_pending_paste(true));
+    assert!(!rt.has_pending_paste());
+    assert_eq!(rt.pending_input(), b"hello\nworld");
+
+    // Auto-cancel check after confirm does nothing.
+    assert!(!rt.check_and_auto_cancel_paste());
+}
+
+#[test]
+fn issue_1438_manual_cancel_before_timeout_prevents_auto_cancel() {
+    let mut rt = make_runtime();
+    rt.clipboard_mut().set_text("a\nb".to_string()).unwrap();
+    rt.drain_pending_input();
+
+    assert!(rt.paste_from_clipboard().unwrap().unwrap());
+    assert!(rt.has_pending_paste());
+
+    // Manual cancel before timeout.
+    assert!(rt.cancel_pending_paste());
+    assert!(!rt.has_pending_paste());
+    assert_eq!(rt.pending_input(), b"");
+
+    // Auto-cancel check after manual cancel does nothing.
+    assert!(!rt.check_and_auto_cancel_paste());
+}
+
+#[test]
+fn issue_1438_paste_confirm_timeout_validation() {
+    use bitty_runtime::{
+        MAX_PASTE_CONFIRM_TIMEOUT_SECS, MIN_PASTE_CONFIRM_TIMEOUT_SECS, RuntimeConfig,
+    };
+
+    // Valid timeouts.
+    for secs in [
+        MIN_PASTE_CONFIRM_TIMEOUT_SECS,
+        30,
+        MAX_PASTE_CONFIRM_TIMEOUT_SECS,
+    ] {
+        let config = RuntimeConfig {
+            paste_confirm_timeout: std::time::Duration::from_secs(secs),
+            ..Default::default()
+        };
+        assert!(
+            config.validate().is_ok(),
+            "timeout of {secs} seconds must be valid"
+        );
+    }
+
+    // Too short.
+    let config_short = RuntimeConfig {
+        paste_confirm_timeout: std::time::Duration::from_secs(MIN_PASTE_CONFIRM_TIMEOUT_SECS - 1),
+        ..Default::default()
+    };
+    assert!(
+        config_short.validate().is_err(),
+        "timeout below minimum must be rejected"
+    );
+
+    // Too long.
+    let config_long = RuntimeConfig {
+        paste_confirm_timeout: std::time::Duration::from_secs(MAX_PASTE_CONFIRM_TIMEOUT_SECS + 1),
+        ..Default::default()
+    };
+    assert!(
+        config_long.validate().is_err(),
+        "timeout above maximum must be rejected"
+    );
+}
+
+// ── Issue #1438 CodeRabbit follow-ups ─────────────────────────────────
+
+#[test]
+fn issue_1438_fractional_timeout_rejected() {
+    // CodeRabbit: `as_secs()` discarded fractions — 300.5s must be rejected.
+    use bitty_runtime::RuntimeConfig;
+    let config = RuntimeConfig {
+        paste_confirm_timeout: std::time::Duration::from_millis(300_500),
+        ..Default::default()
+    };
+    assert!(
+        config.validate().is_err(),
+        "300.5s must be rejected (above 300s max)"
+    );
+    let config = RuntimeConfig {
+        paste_confirm_timeout: std::time::Duration::from_millis(500),
+        ..Default::default()
+    };
+    assert!(
+        config.validate().is_err(),
+        "0.5s must be rejected (below 1s min)"
+    );
+}
+
+#[test]
+fn issue_1438_expired_paste_never_delivers() {
+    // CodeRabbit Major: repeat-chord and confirm on an expired gate must
+    // clear first instead of delivering terminal input. Uses the injected
+    // clock (`paste_should_auto_cancel_at`) — no wall-clock sleeps.
+    let mut rt = make_runtime();
+    // Exercise the expiry path with an injected clock far past the
+    // default 30s timeout (config validation keeps [1, 300]s, so a
+    // sub-second timeout is not constructible through validation).
+    rt.clipboard_mut()
+        .set_text("line1\nline2".to_string())
+        .unwrap();
+    rt.drain_pending_input();
+
+    assert!(rt.paste_from_clipboard().unwrap().unwrap());
+    assert!(rt.has_pending_paste());
+
+    // Deadline passes (default 30s timeout): repeat of the identical paste
+    // must clear, not deliver.
+    let expired = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    assert_eq!(
+        rt.paste_should_auto_cancel_at(expired),
+        Some(true),
+        "gate must be expired at the injected clock"
+    );
+    assert!(
+        rt.check_and_auto_cancel_paste_at(expired),
+        "timer must cancel the expired paste"
+    );
+    assert!(
+        !rt.has_pending_paste(),
+        "expired gate must be cleared by the timer"
+    );
+    assert_eq!(rt.pending_input(), b"", "expired gate must not deliver");
+
+    // Confirm path on an expired gate must clear, not deliver.
+    assert!(rt.paste_from_clipboard().unwrap().unwrap());
+    assert!(
+        rt.check_and_auto_cancel_paste_at(expired),
+        "timer must cancel the re-armed expired paste"
+    );
+    assert!(!rt.confirm_pending_paste(true), "no live gate to confirm");
+    assert_eq!(rt.pending_input(), b"", "expired gate must not deliver");
+}
+
+#[test]
+fn issue_1438_timer_cancel_keeps_viewport() {
+    // CodeRabbit Major: timer expiry must not snap the viewport (unlike
+    // user-initiated cancel, which snaps by design). Uses the injected
+    // clock — no wall-clock sleeps.
+    let mut rt = make_runtime();
+    rt.clipboard_mut().set_text("a\nb".to_string()).unwrap();
+    rt.drain_pending_input();
+
+    assert!(rt.paste_from_clipboard().unwrap().unwrap());
+    assert!(rt.has_pending_paste());
+
+    // Scroll away from live before the timer fires: fill scrollback, then
+    // wheel up so there is real history to sit in.
+    for i in 0..40 {
+        rt.handle_pty_bytes(format!("line {i}\n").as_bytes());
+    }
+    let _ = rt.tick();
+    assert!(rt.state().scrollback_len() > 5, "need history to scroll");
+    rt.handle_wheel(bitty_platform::ScrollDelta::Lines(0.0, 5.0));
+    let _ = rt.tick();
+    let offset_before = {
+        let vid = rt.focused_view().expect("focused");
+        rt.layout()
+            .find_leaf(vid)
+            .map(|v| v.scroll_offset())
+            .unwrap_or(0)
+    };
+    assert!(offset_before > 0, "must be scrolled away from live");
+
+    let expired = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    assert!(
+        rt.check_and_auto_cancel_paste_at(expired),
+        "timer must cancel the expired paste"
+    );
+    assert!(!rt.has_pending_paste());
+    let offset_after = {
+        let vid = rt.focused_view().expect("focused");
+        rt.layout()
+            .find_leaf(vid)
+            .map(|v| v.scroll_offset())
+            .unwrap_or(usize::MAX)
+    };
+    assert_eq!(
+        offset_after, offset_before,
+        "timer cancel must not move the viewport"
+    );
+}

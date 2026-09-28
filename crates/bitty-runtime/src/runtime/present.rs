@@ -916,6 +916,14 @@ impl Runtime {
         if self.advance_notification_banner_at(now) {
             self.pending_full_redraw = true;
         }
+        // Issue #1438: expire the pending paste here — before the idle
+        // short-circuit in `collect_tick_basis` — so a quiet runtime (no PTY
+        // bytes, no layout change) still auto-cancels on time instead of
+        // leaving the paste pending indefinitely. The paint-phase
+        // `check_and_auto_cancel_paste` below stays as defense-in-depth.
+        if self.check_and_auto_cancel_paste_at(now) {
+            self.pending_full_redraw = true;
+        }
         // CTX-0192 transient: collapse the full banner to the flash once its
         // duration expires. Force exactly one repaint for the transition so
         // the retained frame keeps a visible (smaller) signal while pending.
@@ -1916,8 +1924,14 @@ impl Runtime {
         layers: &mut FrameLayers,
     ) {
         let focused = self.focused_view().or(view_map.keys().next().copied());
+        // Issue #1438: auto-cancel expired pending paste before presenting banner.
+        // Expiry already ran in `tick_time_gates`; this is defense-in-depth
+        // for callers that paint without ticking.
         if self.has_pending_paste() {
-            if let Some(banner) = self.paste_banner_text_at(now) {
+            if self.check_and_auto_cancel_paste() {
+                // Paste was auto-cancelled; request redraw to clear banner.
+                self.pending_full_redraw = true;
+            } else if let Some(banner) = self.paste_banner_text_at(now) {
                 self.paint_banner_pill(allocations, focused, &banner, pad_px, layers);
             }
         }

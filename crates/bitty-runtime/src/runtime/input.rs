@@ -1138,6 +1138,19 @@ impl Runtime {
             );
             self.publish_inspect_snapshot();
         }
+        // CTX-0808 (#1484, review): the release paired with a
+        // chrome-consumed status-bar press on a non-focused frame never
+        // reaches a capturing app as an orphan report. One-shot: clear and
+        // swallow. Runs ahead of the modal return so the paired release is
+        // consumed even when copy/search activates mid-gesture; the inspect
+        // trace above stays either way.
+        if event.button == MouseButton::Left
+            && event.state == PressState::Released
+            && self.bar_release_swallow
+        {
+            self.bar_release_swallow = false;
+            return;
+        }
         // CTX-0384: copy mode consumes mouse selection while active (the
         // keyboard cursor owns the highlight). The inspect trace above stays;
         // every selection, drag, capture, and paste path below is suppressed
@@ -1145,16 +1158,6 @@ impl Runtime {
         // CTX-0383: the search overlay consumes mouse selection the same
         // way (the search highlight owns the selection path).
         if self.copy_mode.is_some() || self.search_mode {
-            return;
-        }
-        // CTX-0808 (#1484): the release paired with a chrome-consumed
-        // status-bar press on a non-focused frame never reaches a capturing
-        // app as an orphan report. One-shot: clear and swallow.
-        if event.button == MouseButton::Left
-            && event.state == PressState::Released
-            && self.bar_release_swallow
-        {
-            self.bar_release_swallow = false;
             return;
         }
         // Shift override always forces selection path.
@@ -1774,6 +1777,15 @@ impl Runtime {
 
     /// Sets focus state and emits focus reports when mode 1004 is enabled.
     pub fn set_focused(&mut self, focused: bool) {
+        // CTX-0808 (#1484, review): losing window focus orphans an armed
+        // bar-release swallow — the app that would receive the paired
+        // release is no longer the focused one, so the swallow must not
+        // fire. Cleared whenever the window is (or stays) unfocused, ahead
+        // of the unchanged-state return; a focus gain keeps the flag so
+        // the paired release still swallows.
+        if !focused {
+            self.bar_release_swallow = false;
+        }
         if self.focused == focused {
             return;
         }

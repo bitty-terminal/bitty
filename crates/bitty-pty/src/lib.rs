@@ -61,7 +61,6 @@
 //! # #[cfg(unix)]
 //! # fn run() -> Result<(), bitty_pty::PtyError> {
 //! let mut pty = PtyBuilder::new("/bin/cat")
-//!     .arg("-A")
 //!     .env("LANG", "C")
 //!     .size(120, 40)
 //!     .spawn()?;

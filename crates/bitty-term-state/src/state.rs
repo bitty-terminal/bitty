@@ -1281,6 +1281,11 @@ impl State {
         if ch == '\0' {
             return;
         }
+        // CTX-0822: Kitty Unicode placeholders U+10EEEE-U+10EEFF reserved for image placements
+        if matches!(ch as u32, 0x10EEEE..=0x10EEFF) {
+            // Placeholder detected: store as regular cell for now, full integration deferred
+            // to Kitty rendering epic (image store linkage, sizing, z-index)
+        }
         let glyph_width = char_cell_width(ch);
         if glyph_width == 0 {
             // CR-TERM-01: zero-width scalars (combining marks, ZWJ,

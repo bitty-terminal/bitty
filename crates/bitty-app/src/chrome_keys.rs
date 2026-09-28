@@ -602,9 +602,12 @@ pub(crate) fn find_resize_target(
     }
 }
 
-/// Nudge the enclosing split ratio 0.1 toward the given direction so the
-/// focused pane grows that way (`set_split_ratio_at` clamps to
-/// `0.10..=0.90`). Returns false when no matching split holds focus.
+/// Nudge the enclosing split ratio 0.1 in the given direction (issue
+/// #1445: the divider moves left/up (-) or right/down (+), matching the
+/// border-drag geometry where a positive drag delta toward `second`
+/// grows the first pane via [`LayoutNode::resize_split_by_drag`]).
+/// `set_split_ratio_at` clamps to `0.10..=0.90`. Returns false when no
+/// matching split holds focus.
 pub(crate) fn resize_focused_pane(
     layout: &mut LayoutNode,
     focused: ViewId,
@@ -615,16 +618,17 @@ pub(crate) fn resize_focused_pane(
     let mut out: Option<(Vec<usize>, f32, bool)> = None;
     let mut path = Vec::new();
     find_resize_target(layout, focused, horizontal, &mut path, &mut out);
-    let (target, ratio, focus_in_first) = match out {
+    let (target, ratio, _focus_in_first) = match out {
         Some(t) => t,
         None => return false,
     };
+    // Divider moves in the pressed direction regardless of which side
+    // holds focus (Hyprland/Niri model): Right/Down grows the first pane
+    // (+0.1), Left/Up shrinks it (-0.1). The previous focus-dependent
+    // sign moved the same divider opposite ways for the same key
+    // depending on focus, which read as swapped hjkl directions.
     let positive = matches!(dir, D::Right | D::Down);
-    let delta = if focus_in_first == positive {
-        0.1
-    } else {
-        -0.1
-    };
+    let delta = if positive { 0.1 } else { -0.1 };
     layout.set_split_ratio_at(&target, ratio + delta)
 }
 
@@ -4648,59 +4652,98 @@ mod tests {
     }
 
     // Issue #1445: Regression tests for Ctrl+Shift+hjkl resize directions.
-    // Pins hjkl→direction mapping: h=left, j=down, k=up, l=right (vim standard).
-    // Both Ctrl+Shift+hjkl and Ctrl+Shift+Mod+hjkl use the same actions.
+    // Divider moves in the pressed direction regardless of focus
+    // (Hyprland/Niri model): Left/Up shrinks the first pane (ratio down),
+    // Right/Down grows it (ratio up). Both legacy (shift+ctrl+hjkl) and
+    // Mod-aware (ctrl+shift+alt+hjkl, rebound to super) chords resolve to
+    // the same actions and move the ratio the same way.
 
-    #[test]
-    fn resize_left_grows_focused_pane_leftward() {
-        use bitty_config::SplitDir;
-        let mut layout = two_pane_layout();
-        // Focus is on left pane (ViewId 1) by default.
-        // resize:left should succeed and grow the left pane.
-        assert!(
-            resize_focused_pane(&mut layout, ViewId::new(1), SplitDir::Left),
-            "resize:left on left pane should succeed"
-        );
+    fn ratio_of(layout: &LayoutNode) -> f32 {
+        layout.split_ratio_at(&[]).expect("root split")
     }
 
     #[test]
-    fn resize_right_grows_focused_pane_rightward() {
+    fn resize_left_moves_divider_left_from_either_side() {
         use bitty_config::SplitDir;
-        let mut layout = two_pane_layout();
-        assert!(
-            resize_focused_pane(&mut layout, ViewId::new(1), SplitDir::Right),
-            "resize:right on left pane should succeed"
-        );
+        for focused in [ViewId::new(1), ViewId::new(2)] {
+            let mut layout = two_pane_layout();
+            assert!(
+                resize_focused_pane(&mut layout, focused, SplitDir::Left),
+                "resize:left with focus {focused:?} should succeed"
+            );
+            assert!(
+                (ratio_of(&layout) - 0.4).abs() < 1e-6,
+                "resize:left must move divider left (0.5 -> 0.4), got {}",
+                ratio_of(&layout)
+            );
+        }
     }
 
     #[test]
-    fn resize_up_grows_focused_pane_upward() {
+    fn resize_right_moves_divider_right_from_either_side() {
         use bitty_config::SplitDir;
-        let mut layout = LayoutNode::split(
-            SplitAxis::Vertical,
-            0.5,
-            LayoutNode::leaf(View::new(ViewId::new(1), 80, 12)),
-            LayoutNode::leaf(View::new(ViewId::new(2), 80, 12)),
-        );
-        assert!(
-            resize_focused_pane(&mut layout, ViewId::new(1), SplitDir::Up),
-            "resize:up on top pane should succeed"
-        );
+        for focused in [ViewId::new(1), ViewId::new(2)] {
+            let mut layout = two_pane_layout();
+            assert!(
+                resize_focused_pane(&mut layout, focused, SplitDir::Right),
+                "resize:right with focus {focused:?} should succeed"
+            );
+            assert!(
+                (ratio_of(&layout) - 0.6).abs() < 1e-6,
+                "resize:right must move divider right (0.5 -> 0.6), got {}",
+                ratio_of(&layout)
+            );
+        }
     }
 
     #[test]
-    fn resize_down_grows_focused_pane_downward() {
+    fn resize_up_moves_divider_up_from_either_side() {
         use bitty_config::SplitDir;
-        let mut layout = LayoutNode::split(
-            SplitAxis::Vertical,
-            0.5,
-            LayoutNode::leaf(View::new(ViewId::new(1), 80, 12)),
-            LayoutNode::leaf(View::new(ViewId::new(2), 80, 12)),
-        );
-        assert!(
-            resize_focused_pane(&mut layout, ViewId::new(1), SplitDir::Down),
-            "resize:down on top pane should succeed"
-        );
+        let vertical = || {
+            LayoutNode::split(
+                SplitAxis::Vertical,
+                0.5,
+                LayoutNode::leaf(View::new(ViewId::new(1), 80, 12)),
+                LayoutNode::leaf(View::new(ViewId::new(2), 80, 12)),
+            )
+        };
+        for focused in [ViewId::new(1), ViewId::new(2)] {
+            let mut layout = vertical();
+            assert!(
+                resize_focused_pane(&mut layout, focused, SplitDir::Up),
+                "resize:up with focus {focused:?} should succeed"
+            );
+            assert!(
+                (ratio_of(&layout) - 0.4).abs() < 1e-6,
+                "resize:up must move divider up (0.5 -> 0.4), got {}",
+                ratio_of(&layout)
+            );
+        }
+    }
+
+    #[test]
+    fn resize_down_moves_divider_down_from_either_side() {
+        use bitty_config::SplitDir;
+        let vertical = || {
+            LayoutNode::split(
+                SplitAxis::Vertical,
+                0.5,
+                LayoutNode::leaf(View::new(ViewId::new(1), 80, 12)),
+                LayoutNode::leaf(View::new(ViewId::new(2), 80, 12)),
+            )
+        };
+        for focused in [ViewId::new(1), ViewId::new(2)] {
+            let mut layout = vertical();
+            assert!(
+                resize_focused_pane(&mut layout, focused, SplitDir::Down),
+                "resize:down with focus {focused:?} should succeed"
+            );
+            assert!(
+                (ratio_of(&layout) - 0.6).abs() < 1e-6,
+                "resize:down must move divider down (0.5 -> 0.6), got {}",
+                ratio_of(&layout)
+            );
+        }
     }
 
     #[test]
@@ -4711,5 +4754,105 @@ mod tests {
         assert_eq!(SplitDir::Down.canonical(), "down", "j maps to down");
         assert_eq!(SplitDir::Up.canonical(), "up", "k maps to up");
         assert_eq!(SplitDir::Right.canonical(), "right", "l maps to right");
+    }
+
+    #[test]
+    fn hjkl_chords_resize_through_match_keymap_both_mods() {
+        use bitty_config::{
+            ChromeAction, KeyName, KeyRef, ModKey, SplitDir, default_keymaps_with_mod, match_keymap,
+        };
+        // Issue #1445: chord-level pin — every hjkl resize chord (legacy
+        // shift+ctrl+hjkl plus Mod-aware ctrl+shift+alt+hjkl, the latter
+        // rebound to ctrl+shift+super+hjkl under a Super flip) must resolve
+        // to its vim-standard direction AND move the ratio the same way
+        // (Left/Up decrease, Right/Down increase), from either focus side.
+        // A swap in DEFAULT_KEYMAPS or a sign flip in resize_focused_pane
+        // fails here (the old bool-only tests could not detect either).
+        let cases: &[(char, SplitDir, bool)] = &[
+            ('h', SplitDir::Left, false),
+            ('j', SplitDir::Down, true),
+            ('k', SplitDir::Up, false),
+            ('l', SplitDir::Right, true),
+        ];
+        for mod_key in [ModKey::Alt, ModKey::Super] {
+            let maps = default_keymaps_with_mod(mod_key).expect("defaults valid");
+            for (key_char, dir, increases) in cases {
+                let key = KeyName::Char(*key_char);
+                // Legacy mod-independent chord: shift+ctrl+<key>.
+                let legacy = KeyRef {
+                    key,
+                    ctrl: true,
+                    alt: false,
+                    shift: true,
+                    super_held: false,
+                };
+                assert_eq!(
+                    match_keymap(&maps, legacy),
+                    Some(ChromeAction::ResizeSplit(*dir)),
+                    "shift+ctrl+{key_char} resizes {dir:?} under mod {:?}",
+                    mod_key.canonical()
+                );
+                // Mod-aware chord: alt spelling under Alt, super under Super.
+                let mod_aware = match mod_key {
+                    ModKey::Alt => KeyRef {
+                        key,
+                        ctrl: true,
+                        alt: true,
+                        shift: true,
+                        super_held: false,
+                    },
+                    ModKey::Super => KeyRef {
+                        key,
+                        ctrl: true,
+                        alt: false,
+                        shift: true,
+                        super_held: true,
+                    },
+                };
+                assert_eq!(
+                    match_keymap(&maps, mod_aware),
+                    Some(ChromeAction::ResizeSplit(*dir)),
+                    "mod-aware {key_char} resizes {dir:?} under mod {:?}",
+                    mod_key.canonical()
+                );
+                // Both chords drive the same ratio sign, from either side.
+                for focused in [ViewId::new(1), ViewId::new(2)] {
+                    for (label, action) in [
+                        ("legacy", ChromeAction::ResizeSplit(*dir)),
+                        ("mod-aware", ChromeAction::ResizeSplit(*dir)),
+                    ] {
+                        let ChromeAction::ResizeSplit(resize_dir) = action else {
+                            unreachable!("resize action")
+                        };
+                        let mut layout = if matches!(resize_dir, SplitDir::Left | SplitDir::Right) {
+                            two_pane_layout()
+                        } else {
+                            LayoutNode::split(
+                                SplitAxis::Vertical,
+                                0.5,
+                                LayoutNode::leaf(View::new(ViewId::new(1), 80, 12)),
+                                LayoutNode::leaf(View::new(ViewId::new(2), 80, 12)),
+                            )
+                        };
+                        assert!(
+                            resize_focused_pane(&mut layout, focused, resize_dir),
+                            "{label} {key_char} with focus {focused:?} should succeed"
+                        );
+                        let ratio = ratio_of(&layout);
+                        if *increases {
+                            assert!(
+                                (ratio - 0.6).abs() < 1e-6,
+                                "{label} {key_char} must increase ratio (0.5 -> 0.6), got {ratio}"
+                            );
+                        } else {
+                            assert!(
+                                (ratio - 0.4).abs() < 1e-6,
+                                "{label} {key_char} must decrease ratio (0.5 -> 0.4), got {ratio}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }

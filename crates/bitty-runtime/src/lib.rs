@@ -212,8 +212,9 @@ pub use runtime::cw_live::HintLinkOpenError;
 
 pub use config::{
     BACKGROUND_FITS, CloseConfirmMode, DEFAULT_BACKGROUND_FIT, MAX_BACKGROUND_IMAGE_PATH_BYTES,
-    MAX_BACKGROUND_IMAGE_ROOTS, RuntimeConfig, RuntimeViewBackground, RuntimeViewOutline,
-    RuntimeViewTarget, ViewAppearanceRule,
+    MAX_BACKGROUND_IMAGE_ROOTS, MAX_PASTE_CONFIRM_TIMEOUT_SECS, MIN_PASTE_CONFIRM_TIMEOUT_SECS,
+    RuntimeConfig, RuntimeViewBackground, RuntimeViewOutline, RuntimeViewTarget,
+    ViewAppearanceRule,
 };
 pub use error::RuntimeError;
 pub use execution::{
@@ -261,12 +262,12 @@ pub use runtime::session::{
 pub use runtime::workspaces::{MAX_WORKSPACES, WsCloseRequest};
 pub use runtime::{
     ActivationGesture, AnimationCurve, AnimationKind, AnimationPolicy, ClosingFrame,
-    DEFAULT_PLUGIN_DROP_POLICY, DEFAULT_PLUGIN_PIPELINE_CAPACITY, DEFAULT_PLUGIN_SIDE_CAPACITY,
-    FileUrlActivation, IME_COMMIT_ECHO_WINDOW, ImeCursorArea, KittyDisplayOutcome, KittyImageError,
-    MAX_CONCURRENT_ANIMATIONS, PASTE_BANNER_FLASH_TEXT, PASTE_BANNER_FULL_DURATION,
-    POLL_PTY_MAX_BYTES, POLL_PTY_MAX_CHUNKS, POLL_PTY_TIME_BUDGET, PTY_FORWARD_CAPACITY_CHUNKS,
-    PanelAnimator, PresentStats, PtyWaker, ReducedMotionMode, Runtime, SYNC_UPDATE_DEFER_TIMEOUT,
-    UrlActivation,
+    DEFAULT_PASTE_CONFIRM_TIMEOUT, DEFAULT_PLUGIN_DROP_POLICY, DEFAULT_PLUGIN_PIPELINE_CAPACITY,
+    DEFAULT_PLUGIN_SIDE_CAPACITY, FileUrlActivation, IME_COMMIT_ECHO_WINDOW, ImeCursorArea,
+    KittyDisplayOutcome, KittyImageError, MAX_CONCURRENT_ANIMATIONS, PASTE_BANNER_FLASH_TEXT,
+    PASTE_BANNER_FULL_DURATION, POLL_PTY_MAX_BYTES, POLL_PTY_MAX_CHUNKS, POLL_PTY_TIME_BUDGET,
+    PTY_FORWARD_CAPACITY_CHUNKS, PanelAnimator, PresentStats, PtyWaker, ReducedMotionMode, Runtime,
+    SYNC_UPDATE_DEFER_TIMEOUT, UrlActivation,
 };
 
 // Re-export layout primitives for ergonomic `Runtime::set_layout` callers.

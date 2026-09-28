@@ -57,7 +57,7 @@ All checks run through the justfile:
 just check              # fmt-check + clippy + test + scratch-path/PTY/status-drift gates + actionlint + markdownlint
 just fmt-check          # cargo fmt --all -- --check
 just clippy             # cargo clippy --workspace --all-targets --locked -- -D warnings
-just test               # cargo test --workspace --all-targets --locked
+just test               # cargo nextest (workspace) + doctests + harness=false platform entry points
 just status-drift       # scripts/check-status-drift.sh (OQ/RFC/crate-count/submodule gate)
 just status-drift-test  # scripts/tests/check-status-drift.test.sh (gate fixture tests)
 just markdownlint       # markdownlint-cli2 over the repository Markdown

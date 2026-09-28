@@ -1,0 +1,46 @@
+# cargo-nextest configuration (CTX-0847).
+#
+# Why nextest: each test runs in its own process (isolation), per-test
+# timeouts (no whole-suite hang), named test groups (cap contention for
+# real-process suites), and retries that are REPORTED in the summary instead
+# of a silent manual CI re-run.
+#
+# Run: cargo nextest run --workspace --locked [--profile ci]
+
+[store]
+dir = "target/nextest"
+
+[profile.default]
+# nextest's list phase runs each test binary with `--list`. Targets declared
+# `harness = false` are plain process entry points that emit no libtest list,
+# which aborts the whole run. bitty-platform ships two (headless_run,
+# winit_window) because winit requires the OS main thread; the justfile and CI
+# run them explicitly with `cargo test --test ...`, so exclude them here.
+default-filter = 'not binary(headless_run) and not binary(winit_window)'
+fail-fast = false
+
+[profile.ci]
+inherits = "default"
+# A stuck test fails the run at 60s and is killed after three slow periods,
+# so a wedged PTY assertion cannot burn the 30-minute job budget.
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+# Real-process suites (bitty-pty and the runtime integration harnesses that
+# spawn shells) poll bounded process/kernel state. On a 2-3 core shared runner
+# unbounded parallelism starves those polls past their deadlines -- the macOS
+# `idle_shell_is_not_busy_and_running_job_is_detected` flake. Cap this group
+# so system tests never exhaust the runner; unit tests stay fully parallel.
+[test-groups.live-pty]
+max-threads = 2
+
+[[profile.default.overrides]]
+filter = 'package(bitty-pty) | binary(/^(m1_shell_coverage|selection_view_owned|mouse_report_panes|session_save_restore|job_capability_ops|job_supervisor|pane_damage|shell_input_1356|panel_session_invariants|focused_input_modes|poll_budget_0476|copy_search_view_bound|dogfooding|shell_knob)$/)'
+test-group = "live-pty"
+
+# Retries apply ONLY to the system group: a transient spawn/scheduling miss is
+# retried visibly (nextest prints RETRY), never silently. Unit tests get no
+# retries, so real bugs stay red.
+[[profile.ci.overrides]]
+filter = 'package(bitty-pty) | binary(/^(m1_shell_coverage|selection_view_owned|mouse_report_panes|session_save_restore|job_capability_ops|job_supervisor|pane_damage|shell_input_1356|panel_session_invariants|focused_input_modes|poll_budget_0476|copy_search_view_bound|dogfooding|shell_knob)$/)'
+test-group = "live-pty"
+retries = 2

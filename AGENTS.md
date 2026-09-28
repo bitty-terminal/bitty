@@ -87,7 +87,7 @@
 
 ### Local gates before push (mandatory)
 
-- Before pushing any branch: run repository justfile gates locally and ensure 0 issues: `just check` (fmt-check + clippy -D warnings + test + actionlint + markdownlint) plus full `cargo test --workspace --all-targets --locked` and `cargo check --target x86_64-pc-windows-gnu --workspace --all-targets`. Never push with known local failures to save CI.
+- Before pushing any branch: run repository justfile gates locally and ensure 0 issues: `just check` (fmt-check + clippy -D warnings + test + actionlint + markdownlint) plus `just test` (cargo-nextest + doctests + the `harness=false` platform entry points) and `cargo check --target x86_64-pc-windows-gnu --workspace --all-targets`. Never push with known local failures to save CI.
 - **Local CI pre-validation is mandatory before opening or updating a PR**: run the remote `Quality gates` job locally with real `act` execution (`just ci-local`) and get a green job before pushing. The recipe owns the working configuration:
   - the `bitty-act` image (built automatically on first `just ci-local` from the in-repo `.github/act/Dockerfile`) ships the pinned 1.98.1 toolchain plus a non-root `ubuntu` user matching the host uid, because some tests (`chmod 000` unreadable-file checks) fail when run as root;
   - the repo is bind-mounted, the cargo registry/git caches are persisted and pre-seeded under `../.targets/act-cache`, and the build target dir is shared so repeat runs are incremental; `CARGO_BUILD_JOBS` defaults to `nproc` (override, e.g. `CARGO_BUILD_JOBS=4 just ci-local`, when running two local-CI jobs at once);

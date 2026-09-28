@@ -21,6 +21,8 @@ FROM catthehacker/ubuntu:act-latest
 
 ARG RUST_CHANNEL=1.98.1
 ARG MSRV_CHANNEL=1.85
+# CTX-0847: pinned cargo-nextest, matching the version installed by CI.
+ARG NEXTEST_VERSION=0.9.145
 
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
@@ -33,6 +35,15 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     && rustup component add rustfmt clippy \
     && rustup target add x86_64-pc-windows-gnu \
     && rustc --version && cargo --version
+
+# CTX-0847: cargo-nextest for the `just test` / CI test steps. Installed from
+# the official release archive at the pinned version so local `act` runs match
+# the GitHub runners.
+RUN curl --proto '=https' --tlsv1.2 -LsSf \
+      "https://get.nexte.st/${NEXTEST_VERSION}/linux" -o /tmp/nextest.tar.gz \
+    && tar -xzf /tmp/nextest.tar.gz -C /usr/local/cargo/bin \
+    && rm /tmp/nextest.tar.gz \
+    && cargo nextest --version
 
 # GitHub-hosted runners execute jobs as a non-root user; some tests (e.g.
 # chmod-000 unreadable-file checks) depend on that. The catthehacker image

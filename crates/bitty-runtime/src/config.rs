@@ -1041,10 +1041,11 @@ impl RuntimeConfig {
         }
         // Issue #1438: paste confirmation timeout must be bounded to prevent
         // indefinite paste-pending state and ensure users have reasonable time to react.
-        let timeout_secs = self.paste_confirm_timeout.as_secs();
-        if !(MIN_PASTE_CONFIRM_TIMEOUT_SECS..=MAX_PASTE_CONFIRM_TIMEOUT_SECS)
-            .contains(&timeout_secs)
-        {
+        // Compare the full Duration (not `as_secs()`) so fractional seconds
+        // outside [1, 300] are rejected too.
+        let min = std::time::Duration::from_secs(MIN_PASTE_CONFIRM_TIMEOUT_SECS);
+        let max = std::time::Duration::from_secs(MAX_PASTE_CONFIRM_TIMEOUT_SECS);
+        if self.paste_confirm_timeout < min || self.paste_confirm_timeout > max {
             return Err(RuntimeError::InvalidConfig(
                 "paste_confirm_timeout must be within [1, 300] seconds",
             ));

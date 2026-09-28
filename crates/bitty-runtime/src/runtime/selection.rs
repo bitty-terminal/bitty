@@ -804,18 +804,33 @@ impl Runtime {
         Some(now.saturating_duration_since(since) >= timeout)
     }
 
-    /// Auto-cancel the pending paste if the timeout has expired (issue #1438).
+    /// Auto-cancel the pending paste if the timeout has expired at `now` (issue #1438).
     ///
-    /// Checks if a pending paste has exceeded the configured timeout and
-    /// automatically cancels it. Returns `true` when a paste was auto-cancelled.
+    /// Uses the caller-supplied clock (not `Instant::now()`) so virtual ticks
+    /// enforce the deadline consistently with `paste_should_auto_cancel_at`.
+    /// Timer expiry clears pending without delivery or the PTY input it would
+    /// imply; unlike user cancellation it must not move the viewport (no
+    /// `snap_focused_to_live`), so a user reading scrollback stays put.
+    /// Returns `true` when a paste was auto-cancelled.
     /// This should be called during presentation/tick to enforce bounded paste-pending state.
-    pub fn check_and_auto_cancel_paste(&mut self) -> bool {
-        let now = std::time::Instant::now();
+    pub fn check_and_auto_cancel_paste_at(&mut self, now: std::time::Instant) -> bool {
         if self.paste_should_auto_cancel_at(now) == Some(true) {
-            self.cancel_pending_paste()
+            self.pending_paste = None;
+            self.pending_paste_since = None;
+            self.paste_banner_collapsed = false;
+            self.pending_full_redraw = true;
+            true
         } else {
             false
         }
+    }
+
+    /// Auto-cancel the pending paste if the timeout has expired (issue #1438).
+    ///
+    /// Wall-clock shorthand for [`Self::check_and_auto_cancel_paste_at`].
+    /// This should be called during presentation/tick to enforce bounded paste-pending state.
+    pub fn check_and_auto_cancel_paste(&mut self) -> bool {
+        self.check_and_auto_cancel_paste_at(std::time::Instant::now())
     }
 
     /// Pastes text from the system clipboard (or headless buffer) and routes
@@ -898,6 +913,12 @@ impl Runtime {
     ///
     /// No silent delivery path exists for `needs_confirmation() == true`.
     pub fn request_paste(&mut self, text: String) -> bool {
+        // Issue #1438: an expired pending paste must never deliver. A stale
+        // confirmation (repeat chord hours later, or a confirm after the
+        // deadline passed with no tick in between) clears first so neither
+        // the repeat-paste path below nor `confirm_pending_paste(true)` can
+        // write terminal input from an expired gate.
+        self.check_and_auto_cancel_paste();
         // CTX-0243: paste is typing — snap to live so the pending banner and
         // the eventual echo land on the visible window (delivery via
         // `write_input` also snaps; explicit here for the pending-confirm path
@@ -944,6 +965,10 @@ impl Runtime {
     ///
     /// Returns `true` when a pending paste existed and was handled.
     pub fn confirm_pending_paste(&mut self, confirm: bool) -> bool {
+        // Issue #1438: never deliver an expired gate — clear it first.
+        if confirm {
+            self.check_and_auto_cancel_paste();
+        }
         // CTX-0243: confirming/cancelling is user intent — snap to live
         // (confirm delivers via `write_input` which also snaps; cancel has
         // no bytes so needs the explicit snap).

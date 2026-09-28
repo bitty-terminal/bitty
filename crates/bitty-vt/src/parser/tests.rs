@@ -2018,6 +2018,7 @@ fn apc_g_valid_single_shot_emits_decoded_payload() {
             action_a,
             cols_c,
             rows_r,
+            cursor_movement_c: _,
             payload,
         } => {
             assert_eq!(*format_f, 32);

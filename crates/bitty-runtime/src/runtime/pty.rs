@@ -804,11 +804,20 @@ impl Runtime {
                 action_a,
                 cols_c,
                 rows_r,
+                cursor_movement_c,
                 payload,
             } = &action
             {
                 if let Err(err) = self.kitty_display_image(
-                    *format_f, *width_s, *height_v, *action_a, *cols_c, *rows_r, payload, 0,
+                    *format_f,
+                    *width_s,
+                    *height_v,
+                    *action_a,
+                    *cols_c,
+                    *rows_r,
+                    *cursor_movement_c,
+                    payload,
+                    0,
                 ) {
                     // Rate-limited (CTX-0473): a hostile child can spam rejected
                     // kitty payloads; the parser's own warnings stay bounded too.

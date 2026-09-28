@@ -124,6 +124,15 @@ impl Runtime {
         };
         // Probe: a zero-delta move succeeds only where the layout model
         // permits (an owning float exists); tiled leaves fail soft here.
+        //
+        // Tiled Mod+drag panel repositioning is deferred (#1390): the
+        // `DragMoveSession` primitive (bitty-ui/src/drag.rs) and cross-workspace
+        // drop (`move_leaf_to_workspace`, Bar surface) are headless-tested but
+        // have zero pointer-path callers. Clean wiring needs compositor-layer
+        // architecture (command registry for `bitty.workspace:drag-move`, drop
+        // target presentation, tiled drag state machine). The workspace compositor
+        // spec records Mod+drag as CANDIDATE (PW-1/PW-7), not accepted. Milestone
+        // proposal: v0.2.0 (post-compositor-architecture acceptance).
         if !self
             .layout
             .move_overlay_containing(leaf, 0, 0, self.container)

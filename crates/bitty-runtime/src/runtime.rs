@@ -663,6 +663,16 @@ pub struct Runtime {
     /// operation clears the slot. Bounded: at most one retained error.
     last_clipboard_error: Option<bitty_platform::PlatformError>,
     last_cursor: Option<CursorPosition>,
+    /// One-shot swallow for the left release paired with a chrome-consumed
+    /// status-bar press (#1484, CTX-0808).
+    ///
+    /// A bar press on a non-focused frame is consumed as chrome before
+    /// capture, so the capturing app never saw the press; the paired
+    /// release must not reach it as an orphan report. Set when the early
+    /// bar path consumes a press, cleared (and the release swallowed) on
+    /// the next left release. No selection or drag can be in flight across
+    /// it: the bar press returns before any of those start.
+    bar_release_swallow: bool,
     search_state: SearchState,
     pending_paste: Option<crate::paste::PendingPaste>,
     /// Wall time when the current pending paste was gated (CTX-0192).
@@ -1272,6 +1282,7 @@ impl Runtime {
             last_clipboard_error: None,
             paste_truncated_pastes: 0,
             last_cursor: None,
+            bar_release_swallow: false,
             search_state: SearchState::new(),
             pending_paste: None,
             pending_paste_since: None,
@@ -1482,6 +1493,7 @@ impl Runtime {
             last_clipboard_error: None,
             paste_truncated_pastes: 0,
             last_cursor: None,
+            bar_release_swallow: false,
             search_state: SearchState::new(),
             pending_paste: None,
             pending_paste_since: None,

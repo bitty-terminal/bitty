@@ -931,16 +931,24 @@ impl Runtime {
     }
 
     /// URI of the OSC 8 hyperlink under `pos`, resolved in the grid of the
-    /// View under the pointer (CTX-0804, #1477).
+    /// View under the pointer (CTX-0804, #1477; CTX-0808 fail-closed padding).
     ///
-    /// Uses the selection-press target rule ([`Self::selection_press_target`]:
-    /// the hit View, or the focused View for a padding or gap press), so a
-    /// click and a selection agree on which grid they address. Fails closed
-    /// when that View is scrolled into history: the live-grid cell is not
-    /// the cell on screen there, and activating it would open a link the
-    /// user cannot see.
+    /// Uses the in-frame hit test only (`present_cell_in` +
+    /// `frame_cell_to_owner_cell`): a press outside every present frame
+    /// (window padding or a gap band) yields `None` and never arms a link.
+    /// Unlike [`Self::selection_press_target`] there is no fallback to the
+    /// focused View's clamped edge cell, so a click and a selection agree
+    /// only inside a frame. Fails closed when that View is scrolled into
+    /// history: the live-grid cell is not the cell on screen there, and
+    /// activating it would open a link the user cannot see.
     pub(super) fn hyperlink_uri_at(&self, pos: CursorPosition) -> Option<String> {
-        let (view, cell) = self.selection_press_target(pos)?;
+        let frames = self.present_frames();
+        let (view, local) = self.present_cell_in(&frames, pos)?;
+        let rows = frames
+            .iter()
+            .find(|frame| frame.view == view)
+            .map_or(0, |frame| frame.rows);
+        let cell = self.frame_cell_to_owner_cell(view, rows, local)?;
         if self.view_scroll_offset(view) != 0 {
             return None;
         }

@@ -18,7 +18,7 @@
 //!   the band keep the selection path.
 
 use bitty_platform::{CursorPosition, MouseButton, PressState};
-use bitty_runtime::{Runtime, RuntimeConfig};
+use bitty_runtime::{LayoutNode, Runtime, RuntimeConfig, SplitAxis, View, ViewId};
 
 /// Default headless cell metrics (mirrors `mouse_chrome.rs`).
 const CELL_W: f64 = 9.0;
@@ -235,5 +235,80 @@ fn alt_screen_press_falls_through_instead_of_hitting_chrome() {
         rt.active_workspace_index(),
         1,
         "press on alt screen must not switch workspaces"
+    );
+}
+
+#[test]
+fn non_focused_bar_press_is_chrome_before_capture() {
+    // CTX-0808 (#1484): a status-bar press on a non-focused frame is chrome
+    // before mouse capture. With a mouse-tracking app live, the press must
+    // neither move focus nor produce PTY input bytes; the paired release is
+    // swallowed too, so the capturing app never sees an orphan report.
+    let view_a = ViewId::new(1);
+    let view_b = ViewId::new(2);
+    let mut rt = Runtime::with_defaults().expect("default runtime builds");
+    rt.set_layout(LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.5,
+        LayoutNode::leaf(View::new(view_a, 80, 24)),
+        LayoutNode::leaf(View::new(view_b, 80, 24)),
+    ));
+    assert!(rt.set_focus(view_a), "pane A must be focusable");
+    // A mouse-tracking app owns the pointer: without the early chrome path
+    // this press would focus pane B and capture both press and release.
+    rt.handle_pty_bytes(b"\x1b[?1000h");
+    rt.drain_pending_input();
+
+    // Bar band of pane B, derived from public geometry only.
+    let frame_b = rt
+        .present_frames()
+        .into_iter()
+        .find(|frame| frame.view == view_b)
+        .expect("pane B must be presented");
+    assert_eq!(
+        rt.present_frames().len(),
+        2,
+        "the split must present both panes"
+    );
+    let (cw, ch) = rt.live_cell_size();
+    let pad = f64::from(rt.window_padding_physical());
+    let bar = rt
+        .status_bar_row(usize::from(frame_b.rows))
+        .expect("bar row must exist");
+    rt.handle_cursor_moved(CursorPosition {
+        x: pad + f64::from(frame_b.content.x.max(0)) + 0.5 * f64::from(cw),
+        y: pad
+            + f64::from(frame_b.content.y.max(0))
+            + (bar as f64) * f64::from(ch)
+            + 0.5 * f64::from(ch),
+    });
+    rt.handle_mouse_input(press());
+    assert_eq!(
+        rt.focused_view(),
+        Some(view_a),
+        "a chrome press must not move focus"
+    );
+    assert!(
+        rt.pending_input().is_empty(),
+        "a chrome press must not reach the capturing app"
+    );
+    assert!(
+        !rt.has_selection(),
+        "the bar row is chrome: no selection may start underneath it"
+    );
+
+    // The paired release is swallowed: no orphan report reaches the app.
+    rt.handle_mouse_input(bitty_platform::MouseEvent::new(
+        MouseButton::Left,
+        PressState::Released,
+    ));
+    assert_eq!(
+        rt.focused_view(),
+        Some(view_a),
+        "the swallowed release must not move focus"
+    );
+    assert!(
+        rt.pending_input().is_empty(),
+        "the paired release must be swallowed"
     );
 }

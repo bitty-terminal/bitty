@@ -59,15 +59,31 @@ fn host_manifest(id: &str, commands: Vec<&str>, events: Vec<&str>) -> HostManife
     }
 }
 
+/// Physical cursor at the centre of grid cell (row 0, col 0), derived from
+/// public geometry (CTX-0808, #1484).
+///
+/// The OSC 8 link text starts at grid col 0, so this lands on the live link.
+/// Hard-coded `(1, 1)` is window padding and must never arm a link.
+fn link_cell(rt: &Runtime) -> CursorPosition {
+    let frame = rt.present_frames()[0];
+    let (cw, ch) = rt.live_cell_size();
+    let pad = f64::from(rt.window_padding_physical());
+    CursorPosition {
+        x: pad + f64::from(frame.content.x.max(0)) + 0.5 * f64::from(cw),
+        y: pad + f64::from(frame.content.y.max(0)) + 0.5 * f64::from(ch),
+    }
+}
+
 fn foreign_gesture() -> ActivationGesture {
     // Mint a real gesture on a scratch runtime; used as a forgery
     // against the runtime under test (see CTX-0232 wiring note).
     let mut scratch = make_runtime();
     scratch.handle_pty_bytes(b"\x1b]8;;https://example.test\x07link\x1b]8;;\x07");
     let window_id = bitty_platform::WindowId::from_raw_public(1);
+    let pos = link_cell(&scratch);
     scratch.handle_platform_event(PlatformEvent::Window {
         window_id,
-        kind: WindowEventKind::CursorMoved(CursorPosition { x: 1.0, y: 1.0 }),
+        kind: WindowEventKind::CursorMoved(pos),
     });
     scratch.handle_platform_event(PlatformEvent::Window {
         window_id,
@@ -349,9 +365,10 @@ fn platform_hyperlink_activation_mints_single_use_gesture() {
     let mut rt = make_runtime();
     rt.handle_pty_bytes(b"\x1b]8;;https://example.test\x07link\x1b]8;;\x07");
     let window_id = bitty_platform::WindowId::from_raw_public(1);
+    let pos = link_cell(&rt);
     rt.handle_platform_event(PlatformEvent::Window {
         window_id,
-        kind: WindowEventKind::CursorMoved(CursorPosition { x: 1.0, y: 1.0 }),
+        kind: WindowEventKind::CursorMoved(pos),
     });
     rt.handle_platform_event(PlatformEvent::Window {
         window_id,
@@ -424,9 +441,10 @@ fn hostile_hyperlink_does_not_consume_gesture_slot() {
     // Hostile URI should not mint a gesture.
     rt.handle_pty_bytes(b"\x1b]8;;javascript:alert(1)\x07link\x1b]8;;\x07");
     let window_id = bitty_platform::WindowId::from_raw_public(1);
+    let pos = link_cell(&rt);
     rt.handle_platform_event(PlatformEvent::Window {
         window_id,
-        kind: WindowEventKind::CursorMoved(CursorPosition { x: 1.0, y: 1.0 }),
+        kind: WindowEventKind::CursorMoved(pos),
     });
     rt.handle_platform_event(PlatformEvent::Window {
         window_id,
@@ -442,9 +460,10 @@ fn hostile_hyperlink_does_not_consume_gesture_slot() {
     // Safe hyperlink after hostile must still mint.
     let mut rt2 = make_runtime();
     rt2.handle_pty_bytes(b"\x1b]8;;https://example.test\x07link\x1b]8;;\x07");
+    let pos2 = link_cell(&rt2);
     rt2.handle_platform_event(PlatformEvent::Window {
         window_id,
-        kind: WindowEventKind::CursorMoved(CursorPosition { x: 1.0, y: 1.0 }),
+        kind: WindowEventKind::CursorMoved(pos2),
     });
     rt2.handle_platform_event(PlatformEvent::Window {
         window_id,
@@ -465,9 +484,10 @@ fn hostile_then_safe_in_same_runtime_preserves_gesture_for_safe() {
     let window_id = bitty_platform::WindowId::from_raw_public(2);
     // First, hostile.
     rt.handle_pty_bytes(b"\x1b]8;;javascript:alert(1)\x07x\x1b]8;;\x07");
+    let pos = link_cell(&rt);
     rt.handle_platform_event(PlatformEvent::Window {
         window_id,
-        kind: WindowEventKind::CursorMoved(CursorPosition { x: 1.0, y: 1.0 }),
+        kind: WindowEventKind::CursorMoved(pos),
     });
     rt.handle_platform_event(PlatformEvent::Window {
         window_id,
@@ -479,9 +499,10 @@ fn hostile_then_safe_in_same_runtime_preserves_gesture_for_safe() {
     assert!(rt.take_activation_gesture().is_none());
     // Then safe link overwriting same cell (carriage return to col 0).
     rt.handle_pty_bytes(b"\r\x1b]8;;https://example.test\x07y\x1b]8;;\x07");
+    let pos = link_cell(&rt);
     rt.handle_platform_event(PlatformEvent::Window {
         window_id,
-        kind: WindowEventKind::CursorMoved(CursorPosition { x: 1.0, y: 1.0 }),
+        kind: WindowEventKind::CursorMoved(pos),
     });
     rt.handle_platform_event(PlatformEvent::Window {
         window_id,

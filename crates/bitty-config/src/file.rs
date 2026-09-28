@@ -640,6 +640,7 @@ impl CliOverrides {
                     opacity: o,
                     padding: base.window.padding,
                     radius_px: base.window.radius_px,
+                    blur_radius: base.window.blur_radius,
                 };
                 cfg.validate()?;
                 Some(cfg)
@@ -1330,6 +1331,7 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
                     opacity: opacity as f32,
                     padding: padding as u32,
                     radius_px,
+                    blur_radius: 0,
                 })
             }
             _ => {

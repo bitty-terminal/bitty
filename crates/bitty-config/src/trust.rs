@@ -863,6 +863,7 @@ mod tests {
                 opacity: 1.0,
                 padding: 8,
                 radius_px: 12,
+                blur_radius: 0,
             }),
             ..Default::default()
         };
@@ -872,6 +873,7 @@ mod tests {
                 opacity: 1.0,
                 padding: 8,
                 radius_px: crate::types::MAX_WINDOW_RADIUS_PX + 1,
+                blur_radius: 0,
             }),
             ..Default::default()
         };

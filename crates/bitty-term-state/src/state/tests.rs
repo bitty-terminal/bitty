@@ -1543,3 +1543,39 @@ fn zone_anchor_hash_deterministic_across_identical_states() {
     mark_prompt(&mut c);
     assert_ne!(a.state_hash(), c.state_hash());
 }
+
+#[test]
+fn ctx_0829_width_one_reflow_preserves_wide_char_leads() {
+    // CTX-0829: reflow to width=1 must emit width=2 chars as width=1 leads
+    // without spacers, preserving grid invariants (no orphan spacers).
+    let mut state = State::new();
+    prints(&mut state, "X"); // Narrow char first for clear separation
+    prints(&mut state, "あ"); // Wide char
+
+    state.resize(1, 24);
+
+    // After resize to width=1: should have separate rows
+    let row0 = state.screens.main.get(0, 0);
+    let row1 = state.screens.main.get(1, 0);
+
+    // Both should be leads (not spacers)
+    assert!(!row0.spacer);
+    assert!(!row1.spacer);
+
+    // Wide char should be width=1 after reflow
+    if row0.glyph == 'あ' {
+        assert_eq!(
+            row0.width, 1,
+            "Wide char should be width=1 in 1-column grid"
+        );
+    }
+    if row1.glyph == 'あ' {
+        assert_eq!(
+            row1.width, 1,
+            "Wide char should be width=1 in 1-column grid"
+        );
+    }
+
+    // Invariants must hold
+    state.check_invariants().unwrap();
+}

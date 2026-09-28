@@ -572,7 +572,12 @@ impl Runtime {
 
     /// Legacy encoder fallback for keys without a Kitty encoding.
     fn ext_key_fallback(&self, event: &KeyEvent) -> Option<Vec<u8>> {
-        bitty_platform::keyboard::encode_key_event_with_modifiers(event, &self.modifier_snapshot())
+        let application_cursor_keys = self.focused_modes().application_cursor_keys;
+        bitty_platform::keyboard::encode_key_event_with_terminal_modes(
+            event,
+            &self.modifier_snapshot(),
+            application_cursor_keys,
+        )
     }
 
     /// Returns `frame` when it fits the per-key byte bound, else drops it.

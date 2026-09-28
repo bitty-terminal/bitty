@@ -55,7 +55,8 @@ use bitty_rich::blocks::{CommandBlock, CommandId, FoldState, hidden_blocks, visi
 use bitty_rich::composer::{ComposerKeyEvent, ComposerSession, frame_submit};
 use bitty_rich::hints::{
     DispatchError, DispatchOutcome, HintAction, HintAnchor, HintBatch, HintKind, HintRegistry,
-    HintScope, collect_command_targets, collect_panel_targets, collect_view_targets, dispatch,
+    HintScope, collect_command_targets, collect_link_targets, collect_panel_targets,
+    collect_view_targets, dispatch, dispatch_link,
 };
 use bitty_rich::scene::{BlockId, Scene};
 use bitty_term_state::State;
@@ -363,6 +364,8 @@ impl HintOverlayCell {
 ///
 /// Resolves `label` in `batch` and applies `action`, mutating only the
 /// caller's [`FoldState`]. See [`dispatch`] for the fail-closed contract.
+/// Link labels fail closed here ([`DispatchError::LinkNeedsState`]);
+/// callers with live truth use [`dispatch_link_present`] instead.
 pub fn dispatch_present(
     batch: &HintBatch,
     fold: &mut FoldState,
@@ -370,6 +373,23 @@ pub fn dispatch_present(
     action: HintAction,
 ) -> Result<DispatchOutcome, DispatchError> {
     dispatch(batch, fold, label, action)
+}
+
+/// Dispatches a link `Action(Target)` against live terminal truth
+/// (CTX-0840, #1395).
+///
+/// Same contract as [`dispatch_present`] plus the [`dispatch_link`]
+/// stateful step: the URI is re-resolved from `state` at dispatch time,
+/// so a stale cell or an evicted hyperlink fails closed instead of
+/// opening a substitute target.
+pub fn dispatch_link_present(
+    batch: &HintBatch,
+    fold: &mut FoldState,
+    state: &State,
+    label: &str,
+    action: HintAction,
+) -> Result<DispatchOutcome, DispatchError> {
+    dispatch_link(batch, fold, state, label, action)
 }
 
 /// Outcome of feeding one letter to an armed hint interaction (CW-02 live
@@ -641,9 +661,11 @@ impl CwHintEngine {
     /// Collects one cross-panel batch for `generation`.
     ///
     /// Builds a single [`HintRegistry`] (command targets once when enabled,
-    /// then every provider's panel + views under `scope`), then allocates
-    /// the single overlay batch from it. Deterministic per target set;
-    /// over-cap shedding follows the [`HintBatch`] tail-shed rule.
+    /// then every provider's panel + views under `scope`, then safe OSC 8
+    /// link targets from the live grid via [`collect_link_targets`]),
+    /// then allocates the single overlay batch from it. Deterministic per
+    /// target set; over-cap shedding follows the [`HintBatch`] tail-shed
+    /// rule.
     #[must_use]
     pub fn collect(&self, state: &State, scope: HintScope, generation: u64) -> HintBatch {
         let mut registry = HintRegistry::new();
@@ -654,6 +676,11 @@ impl CwHintEngine {
             collect_panel_targets(&mut registry, &[provider.panel], scope);
             collect_view_targets(&mut registry, &provider.views, scope);
         }
+        // CTX-0840 (#1395): OSC 8 links join every collection from the
+        // live grid (safe schemes only; hostile/stale spans never admit).
+        // Providers stay the explicit panel/view source; links are grid
+        // truth, so they need no registration.
+        collect_link_targets(&mut registry, state, scope);
         HintBatch::build(generation, &registry)
     }
 }

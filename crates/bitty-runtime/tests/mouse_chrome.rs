@@ -258,6 +258,13 @@ fn alt_drag_moves_floating_overlay_without_selection() {
 fn alt_press_on_tiled_layout_falls_through_to_selection() {
     // Tiled splits have no movable position: the grab fails soft and the
     // press selects normally ("without breaking selection").
+    //
+    // #1390: Tiled Mod+drag panel repositioning is explicitly deferred
+    // (milestone proposal: v0.2.0). The `DragMoveSession` primitive exists in
+    // bitty-ui with headless tests but has zero pointer-path callers. Clean
+    // wiring needs compositor-layer architecture (command registry, drop target
+    // presentation, tiled drag state machine). This test pins the current
+    // fail-soft behavior until that architecture lands.
     let mut rt = make_runtime();
     rt.handle_pty_bytes(b"hello world");
     rt.set_layout(two_pane());

@@ -671,6 +671,16 @@ pub struct Runtime {
     /// operation clears the slot. Bounded: at most one retained error.
     last_clipboard_error: Option<bitty_platform::PlatformError>,
     last_cursor: Option<CursorPosition>,
+    /// One-shot swallow for the left release paired with a chrome-consumed
+    /// status-bar press (#1484, CTX-0808).
+    ///
+    /// A bar press on a non-focused frame is consumed as chrome before
+    /// capture, so the capturing app never saw the press; the paired
+    /// release must not reach it as an orphan report. Set when the early
+    /// bar path consumes a press, cleared (and the release swallowed) on
+    /// the next left release. No selection or drag can be in flight across
+    /// it: the bar press returns before any of those start.
+    bar_release_swallow: bool,
     search_state: SearchState,
     pending_paste: Option<crate::paste::PendingPaste>,
     /// Wall time when the current pending paste was gated (CTX-0192).
@@ -710,6 +720,9 @@ pub struct Runtime {
     /// Dynamic background override from an authorized `OSC 11` set
     /// (CTX-0381); `None` = the resolved theme background.
     dynamic_background: Option<[u8; 3]>,
+    /// Dynamic cursor color override from an authorized `OSC 12` set
+    /// (CTX-0820); `None` = the resolved theme cursor color.
+    dynamic_cursor: Option<[u8; 3]>,
     /// When the active synchronized-update deferral window began (CTX-0380).
     ///
     /// `Some` while `DECSET 2026` is active; bounded by
@@ -1277,6 +1290,7 @@ impl Runtime {
             last_clipboard_error: None,
             paste_truncated_pastes: 0,
             last_cursor: None,
+            bar_release_swallow: false,
             search_state: SearchState::new(),
             pending_paste: None,
             pending_paste_since: None,
@@ -1287,6 +1301,7 @@ impl Runtime {
             osc_color_set_allowed: false,
             dynamic_foreground: None,
             dynamic_background: None,
+            dynamic_cursor: None,
             sync_defer_since: None,
             osc52_rejected_writes: 0,
             input_write_dropped_bytes: 0,
@@ -1486,6 +1501,7 @@ impl Runtime {
             last_clipboard_error: None,
             paste_truncated_pastes: 0,
             last_cursor: None,
+            bar_release_swallow: false,
             search_state: SearchState::new(),
             pending_paste: None,
             pending_paste_since: None,
@@ -1496,6 +1512,7 @@ impl Runtime {
             osc_color_set_allowed: false,
             dynamic_foreground: None,
             dynamic_background: None,
+            dynamic_cursor: None,
             sync_defer_since: None,
             osc52_rejected_writes: 0,
             input_write_dropped_bytes: 0,
@@ -2262,6 +2279,15 @@ impl Runtime {
         }
     }
 
+    /// Returns the active cursor color: OSC 12 override or theme default (CTX-0820).
+    #[must_use]
+    pub fn active_cursor_color(&self) -> [u8; 4] {
+        match self.dynamic_cursor {
+            Some([r, g, b]) => [r, g, b, 0xFF],
+            None => self.config.theme.cursor,
+        }
+    }
+
     /// Applies an authorized `OSC 10`/`OSC 11` set and forces a repaint.
     ///
     /// The default fg/bg live on the renderer/surface palettes, so the
@@ -2272,6 +2298,7 @@ impl Runtime {
         match target {
             bitty_vt::DynamicColorTarget::Foreground => self.dynamic_foreground = Some(rgb),
             bitty_vt::DynamicColorTarget::Background => self.dynamic_background = Some(rgb),
+            bitty_vt::DynamicColorTarget::Cursor => self.dynamic_cursor = Some(rgb),
         }
         let palette = bitty_render::ThemePalette {
             foreground: self.active_foreground(),

@@ -82,14 +82,18 @@
 //! [`HintSession::feed`] returns [`HintFeedError::NotArmed`]. No I/O, no
 //! wall-clock, no randomness, no unsafe.
 //!
-//! # Wiring status (CTX-0391 / GitHub #647): future, not yet shipped
+//! # Wiring status (CTX-0391 / GitHub #647; CTX-0840 / #1395 link slice)
 //!
-//! Headless P3 is implemented and tested here, but no `bitty-app` or
-//! `bitty-runtime` input/render path instantiates it yet. Wiring needs a
-//! Leader chord, session state, batch collection from truth, compositor
-//! painting, and focus/scroll/clipboard routing -- a full feature, not a P2
-//! fix. Until then this module is intentionally unused by the app; the
-//! tracked follow-up is #647. Do not wire ad hoc.
+//! Headless P3 is implemented and tested here. The Leader chord, session
+//! state, batch collection, and compositor paint are wired through
+//! `bitty-runtime` (`cw_hint_arm` / `cw_hint_push_key` / `cw_hint_disarm` /
+//! `cw_hint_overlay_cells`) and the `bitty-app` Leader input path; the
+//! link provider below is the quick-select slice added for #1395.
+//! `collect_link_targets` turns safe OSC 8 hyperlink spans into
+//! keyboard-addressable targets, and link dispatch opens through the
+//! runtime's gesture-bound URL gate -- never a bare opener call. See
+//! `crates/bitty-runtime/src/cw_present.rs` (`CwHintEngine`) and
+//! `crates/bitty-runtime/src/runtime/cw_live.rs` for the runtime side.
 
 #![forbid(unsafe_code)]
 
@@ -154,25 +158,32 @@ pub enum HintKind {
     Panel,
     /// A view leaf, addressed by raw `ViewId` value (no `bitty-ui` dep).
     View,
+    /// A safe OSC 8 hyperlink span on the live grid (CTX-0840, #1395).
+    ///
+    /// Anchored by the span's leading cell `(row, col)` packed into the
+    /// anchor payload; resolved back to a URI through terminal truth at
+    /// dispatch time (never from label chrome).
+    Link,
 }
 
 impl HintKind {
     /// Deterministic sort rank: commands first (oldest first by anchor),
-    /// then panels, then views. Labels therefore depend only on the target
-    /// set, never on registration order.
+    /// then panels, then views, then links. Labels therefore depend only on
+    /// the target set, never on registration order.
     #[must_use]
     pub const fn rank(self) -> u8 {
         match self {
             Self::CommandBlock => 0,
             Self::Panel => 1,
             Self::View => 2,
+            Self::Link => 3,
         }
     }
 }
 
 /// Stable anchor of one hint target: ordinal-anchored for commands (survives
 /// resize/reflow/scroll like [`CommandBlock`](crate::blocks::CommandBlock)),
-/// id-anchored for Panel/View leaves.
+/// id-anchored for Panel/View leaves, cell-anchored for links.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HintAnchor {
     /// Anchored on [`CommandId`](crate::blocks::CommandId) (an OSC 133
@@ -182,7 +193,27 @@ pub enum HintAnchor {
     Panel(u64),
     /// Raw `ViewId` value; resolved to a view by the caller.
     View(u64),
+    /// Leading cell of a safe OSC 8 hyperlink span, packed as
+    /// `row * LINK_ANCHOR_STRIDE + col` (CTX-0840, #1395).
+    ///
+    /// The caller unpacks with [`HintAnchor::link_cell`] and resolves the
+    /// URI from terminal truth (snapshot cell + hyperlink table) at
+    /// dispatch time; a stale or unsafe cell fails closed.
+    Link(u64),
 }
+
+/// Row/column packing stride for [`HintAnchor::Link`] payloads (CTX-0840).
+///
+/// Grid dims are clamped to `MAX_GRID_DIM` (1000) per side, so a stride of
+/// 4096 keeps every reachable `(row, col)` unpackable without collision.
+pub const LINK_ANCHOR_STRIDE: u64 = 4096;
+
+/// Maximum link targets admitted per [`collect_link_targets`] call (CTX-0840).
+///
+/// Bounds one collection against the shared [`HINT_TARGET_MAX`] batch cap:
+/// the snapshot walk stops here so hostile grids cannot force an unbounded
+/// scan, and registry-full shedding stays the second bound.
+pub const LINK_TARGET_MAX: usize = 256;
 
 impl HintAnchor {
     /// The [`HintKind`] this anchor addresses.
@@ -192,17 +223,50 @@ impl HintAnchor {
             Self::Command(_) => HintKind::CommandBlock,
             Self::Panel(_) => HintKind::Panel,
             Self::View(_) => HintKind::View,
+            Self::Link(_) => HintKind::Link,
         }
     }
 
-    /// Raw sort key within a kind: command anchor ordinal, else the leaf id.
+    /// Raw sort key within a kind: command anchor ordinal, leaf id, or the
+    /// packed link cell payload.
     #[must_use]
     pub const fn sort_key(self) -> u64 {
         match self {
             // `CommandId::get` is not const; the field is public, so read it
             // directly to keep this usable in const contexts.
             Self::Command(id) => id.0,
-            Self::Panel(raw) | Self::View(raw) => raw,
+            Self::Panel(raw) | Self::View(raw) | Self::Link(raw) => raw,
+        }
+    }
+
+    /// Packs a link leading cell into a [`HintAnchor::Link`] payload.
+    ///
+    /// Returns `None` (fail-closed) when the cell is outside the reachable
+    /// grid (`row`/`col` past `LINK_ANCHOR_STRIDE`) or the pack would
+    /// overflow.
+    #[must_use]
+    pub const fn pack_link_cell(row: usize, col: usize) -> Option<u64> {
+        if row >= LINK_ANCHOR_STRIDE as usize || col >= LINK_ANCHOR_STRIDE as usize {
+            return None;
+        }
+        let packed = (row as u64)
+            .saturating_mul(LINK_ANCHOR_STRIDE)
+            .saturating_add(col as u64);
+        Some(packed)
+    }
+
+    /// Unpacks a [`HintAnchor::Link`] payload into its leading `(row, col)`.
+    ///
+    /// Returns `None` for non-link anchors.
+    #[must_use]
+    pub const fn link_cell(self) -> Option<(usize, usize)> {
+        match self {
+            Self::Link(raw) => {
+                let row = (raw / LINK_ANCHOR_STRIDE) as usize;
+                let col = (raw % LINK_ANCHOR_STRIDE) as usize;
+                Some((row, col))
+            }
+            Self::Command(_) | Self::Panel(_) | Self::View(_) => None,
         }
     }
 
@@ -211,7 +275,7 @@ impl HintAnchor {
     pub const fn command_id(self) -> Option<crate::blocks::CommandId> {
         match self {
             Self::Command(id) => Some(id),
-            Self::Panel(_) | Self::View(_) => None,
+            Self::Panel(_) | Self::View(_) | Self::Link(_) => None,
         }
     }
 }
@@ -304,8 +368,9 @@ impl HintActions {
     }
 
     /// Default actions per target kind (seed-provider contract):
-    /// commands support everything but `Focus`; leaves support `Focus`,
-    /// `Jump`, and `Copy`.
+    /// commands support everything but `Focus`; panel/view leaves and links
+    /// support `Focus`, `Jump`, and `Copy` (links additionally open through
+    /// the runtime URL gate on the `Jump` verb; see `LinkOpen`).
     #[must_use]
     pub const fn default_for(kind: HintKind) -> Self {
         match kind {
@@ -316,7 +381,9 @@ impl HintActions {
                     | Self::COLLAPSE.0
                     | Self::COPY.0,
             ),
-            HintKind::Panel | HintKind::View => Self(Self::FOCUS.0 | Self::JUMP.0 | Self::COPY.0),
+            HintKind::Panel | HintKind::View | HintKind::Link => {
+                Self(Self::FOCUS.0 | Self::JUMP.0 | Self::COPY.0)
+            }
         }
     }
 }
@@ -552,6 +619,152 @@ pub fn collect_view_targets(registry: &mut HintRegistry, views: &[u64], scope: H
     admitted
 }
 
+/// One collected OSC 8 hyperlink target: the span's leading cell plus its
+/// resolved URI (CTX-0840, #1395).
+///
+/// The URI is resolved against terminal truth at collection time through
+/// the snapshot + hyperlink table, so dispatch never re-reads label chrome.
+/// Carrying the URI here (bounded by the platform `URL_MAX_LEN`) keeps the
+/// runtime dispatch a pure resolve-and-open against the already-validated
+/// target.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LinkTarget {
+    /// Leading `(row, col)` of the hyperlink span on the live grid.
+    pub row: usize,
+    /// Leading column of the hyperlink span.
+    pub col: usize,
+    /// Safe URI resolved from the hyperlink table at collection time.
+    pub uri: String,
+}
+
+/// Registers one target per safe OSC 8 hyperlink span on the live grid
+/// (CTX-0840, #1395 quick-select provider).
+///
+/// Walks the snapshot row-major, grouping contiguous leading cells that
+/// carry the same hyperlink id into one span (same grouping as
+/// [`crate::hyperlink::hyperlink_spans`]), resolves each span's URI through
+/// `state.hyperlink_entry`, and admits spans whose URI passes
+/// [`crate::hyperlink::is_safe_hyperlink_uri`] (`http`/`https`/`mailto`
+/// only; `file:` and hostile schemes never become targets). Each admitted
+/// span registers with [`HintActions::default_for`] link verbs under a
+/// packed [`HintAnchor::Link`] cell payload.
+///
+/// Pure read of `State` (snapshot + table); never mutates terminal truth.
+/// Bounded: at most [`LINK_TARGET_MAX`] spans are admitted and the walk
+/// visits each live cell once. Returns the number of targets admitted
+/// (registry-full shedding fails closed and is simply not counted).
+pub fn collect_link_targets(registry: &mut HintRegistry, state: &State, scope: HintScope) -> usize {
+    let snapshot = state.snapshot();
+    if snapshot.width == 0 || snapshot.height == 0 {
+        return 0;
+    }
+    let mut admitted = 0usize;
+    let mut spans = 0usize;
+    for row in 0..snapshot.height {
+        let mut col = 0usize;
+        while col < snapshot.width {
+            if spans >= LINK_TARGET_MAX {
+                return admitted;
+            }
+            let Some(index) = row
+                .checked_mul(snapshot.width)
+                .and_then(|base| base.checked_add(col))
+            else {
+                break;
+            };
+            let Some(cell) = snapshot.cells.get(index) else {
+                col = col.saturating_add(1);
+                continue;
+            };
+            if cell.spacer {
+                col = col.saturating_add(1);
+                continue;
+            }
+            let Some(id) = cell.hyperlink else {
+                col = col.saturating_add(1);
+                continue;
+            };
+            // Resolve through truth; stale ids (evicted table entries) and
+            // unsafe URIs never become targets.
+            let Some((_, uri)) = state.hyperlink_entry(id) else {
+                col = col.saturating_add(1);
+                continue;
+            };
+            if !crate::hyperlink::is_safe_hyperlink_uri(uri) {
+                col = col.saturating_add(1);
+                continue;
+            }
+            // Group the contiguous run carrying this id (leading cells
+            // only; spacers end the run like `hyperlink_spans`).
+            let start = col;
+            let mut end = col;
+            while let Some(next) = end.checked_add(1) {
+                if next >= snapshot.width {
+                    break;
+                }
+                let Some(next_index) = row
+                    .checked_mul(snapshot.width)
+                    .and_then(|base| base.checked_add(next))
+                else {
+                    break;
+                };
+                let Some(next_cell) = snapshot.cells.get(next_index) else {
+                    break;
+                };
+                if next_cell.spacer || next_cell.hyperlink != Some(id) {
+                    break;
+                }
+                end = next;
+            }
+            spans = spans.saturating_add(1);
+            let Some(payload) = HintAnchor::pack_link_cell(row, start) else {
+                col = end.saturating_add(1);
+                continue;
+            };
+            if registry
+                .register(
+                    HintKind::Link,
+                    HintAnchor::Link(payload),
+                    scope,
+                    HintActions::default_for(HintKind::Link),
+                )
+                .is_some()
+            {
+                admitted = admitted.saturating_add(1);
+            }
+            col = end.saturating_add(1);
+        }
+    }
+    admitted
+}
+
+/// Resolves the URI behind a link-anchored label at dispatch time (CTX-0840).
+///
+/// Reads the packed cell from `anchor`, bounds-checks it against the live
+/// snapshot, and resolves the cell's hyperlink id through the table with
+/// the [`crate::hyperlink::is_safe_hyperlink_uri`] gate. Returns `None`
+/// (fail-closed) for non-link anchors, out-of-bounds cells, spacer cells,
+/// stale ids, or unsafe URIs.
+#[must_use]
+pub fn resolve_link_uri(state: &State, anchor: HintAnchor) -> Option<String> {
+    let (row, col) = anchor.link_cell()?;
+    let snapshot = state.snapshot();
+    if row >= snapshot.height || col >= snapshot.width {
+        return None;
+    }
+    let index = row.checked_mul(snapshot.width)?.checked_add(col)?;
+    let cell = snapshot.cells.get(index)?;
+    if cell.spacer {
+        return None;
+    }
+    let id = cell.hyperlink?;
+    let (_, uri) = state.hyperlink_entry(id)?;
+    if !crate::hyperlink::is_safe_hyperlink_uri(uri) {
+        return None;
+    }
+    Some(uri.to_owned())
+}
+
 // ---------------------------------------------------------------------------
 // Label allocator
 // ---------------------------------------------------------------------------
@@ -741,11 +954,11 @@ impl HintBatch {
 /// What dispatching one `(label, action)` pair did.
 ///
 /// Intents that need caller context (`FocusView`, `FocusPanel`, `Jump`,
-/// `CopyRequested`) carry ids only — never grid text, never label chrome —
-/// so the caller resolves them against truth through its own focus, scroll,
-/// and clipboard policies. Fold mutations apply directly to the caller's
-/// [`FoldState`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// `CopyRequested`, `LinkOpen`) carry ids only — never grid text, never
+/// label chrome — so the caller resolves them against truth through its
+/// own focus, scroll, clipboard, and URL-gate policies. Fold mutations
+/// apply directly to the caller's [`FoldState`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DispatchOutcome {
     /// Focus the view leaf (caller resolves the raw `ViewId` value).
     FocusView {
@@ -787,11 +1000,23 @@ pub enum DispatchOutcome {
         /// Target whose truth bytes should be copied.
         target: TargetId,
     },
+    /// Open the link target's URI through the runtime URL gate (CTX-0840).
+    ///
+    /// The URI was resolved from terminal truth at collection time and
+    /// re-checked at dispatch; the runtime still mints its gesture-bound
+    /// activation before any opener runs, so this outcome never opens
+    /// directly. Carries the exact URI the gate must authorize.
+    LinkOpen {
+        /// Safe URI to open (`http`/`https`/`mailto` only).
+        uri: String,
+        /// Target the URI was resolved from.
+        target: TargetId,
+    },
 }
 
 /// Why a dispatch failed (all fail-closed: [`FoldState`] untouched, except a
 /// successful unfold preceding... no — errors never mutate `fold`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DispatchError {
     /// No label in this batch matches (stale or mistyped input).
     UnknownLabel,
@@ -808,6 +1033,14 @@ pub enum DispatchError {
         /// Block that stays unfolded.
         id: crate::blocks::CommandId,
     },
+    /// Link dispatch needs terminal truth (URI re-resolution) that the
+    /// caller did not supply: the target moved, the cell is stale, or the
+    /// URI is no longer safe. The caller retries via the stateful
+    /// [`dispatch_link`] with the live `State`.
+    LinkNeedsState {
+        /// Link target whose URI could not be resolved from the batch.
+        target: TargetId,
+    },
 }
 
 impl std::fmt::Display for DispatchError {
@@ -818,6 +1051,9 @@ impl std::fmt::Display for DispatchError {
                 write!(f, "{action:?} not supported for {kind:?}")
             }
             Self::FoldFull { id } => write!(f, "fold set full; {id} stays unfolded"),
+            Self::LinkNeedsState { target } => {
+                write!(f, "link target {target} needs live state to resolve")
+            }
         }
     }
 }
@@ -830,6 +1066,11 @@ impl std::error::Error for DispatchError {}
 /// Pure with respect to terminal truth: the only mutation in the system is
 /// fold membership (presentation projection, owned by the caller). Errors
 /// leave `fold` untouched.
+///
+/// Link targets need live truth to resolve their URI: dispatching a
+/// `Link` label through this stateless entry point fails closed with
+/// [`DispatchError::LinkNeedsState`]. Callers with the live [`State`]
+/// use [`dispatch_link`] instead (the runtime live path does this).
 pub fn dispatch(
     batch: &HintBatch,
     fold: &mut FoldState,
@@ -841,6 +1082,11 @@ pub fn dispatch(
         return Err(DispatchError::ActionNotSupported {
             action,
             kind: found.kind,
+        });
+    }
+    if found.kind == HintKind::Link {
+        return Err(DispatchError::LinkNeedsState {
+            target: found.target,
         });
     }
     match (found.kind, action) {
@@ -911,6 +1157,58 @@ pub fn dispatch(
             }
         }
         (_, HintAction::Copy) => Ok(DispatchOutcome::CopyRequested {
+            target: found.target,
+        }),
+        _ => Err(DispatchError::ActionNotSupported {
+            action,
+            kind: found.kind,
+        }),
+    }
+}
+
+/// Dispatches `Action(Target)` for link targets against live terminal truth
+/// (CTX-0840, #1395).
+///
+/// Resolves `label` in `batch` like [`dispatch`], then re-resolves the link
+/// anchor's URI from `state` via [`resolve_link_uri`]: the label only names
+/// the cell, the URI always comes from truth. `Jump` yields
+/// [`DispatchOutcome::LinkOpen`] with the resolved URI (the caller still
+/// routes it through its URL gate; nothing opens here); `Copy` yields
+/// [`DispatchOutcome::CopyRequested`] with the handle (the caller extracts
+/// the URI bytes through its clipboard policy); `Focus` is unsupported for
+/// links. Non-link labels dispatch through [`dispatch`] unchanged.
+///
+/// Fail-closed: unknown labels, unsupported verbs, stale cells, and unsafe
+/// URIs all error with `fold` untouched.
+pub fn dispatch_link(
+    batch: &HintBatch,
+    fold: &mut FoldState,
+    state: &State,
+    label: &str,
+    action: HintAction,
+) -> Result<DispatchOutcome, DispatchError> {
+    let found = batch.resolve(label).ok_or(DispatchError::UnknownLabel)?;
+    if found.kind != HintKind::Link {
+        return dispatch(batch, fold, label, action);
+    }
+    if !found.actions.contains(action) {
+        return Err(DispatchError::ActionNotSupported {
+            action,
+            kind: found.kind,
+        });
+    }
+    match action {
+        HintAction::Jump => {
+            let uri =
+                resolve_link_uri(state, found.anchor).ok_or(DispatchError::LinkNeedsState {
+                    target: found.target,
+                })?;
+            Ok(DispatchOutcome::LinkOpen {
+                uri,
+                target: found.target,
+            })
+        }
+        HintAction::Copy => Ok(DispatchOutcome::CopyRequested {
             target: found.target,
         }),
         _ => Err(DispatchError::ActionNotSupported {
@@ -1206,7 +1504,9 @@ impl HintSession {
     ///
     /// # Errors
     /// [`HintFeedError::NotArmed`] while disarmed; parse/dispatch errors
-    /// otherwise (fold untouched on any error).
+    /// otherwise (fold untouched on any error). Link labels fail closed
+    /// with [`DispatchError::LinkNeedsState`] here: use [`feed_link`] with
+    /// live truth instead.
     pub fn feed(
         &self,
         fold: &mut FoldState,
@@ -1221,6 +1521,34 @@ impl HintSession {
         };
         let chord = parse_hint_chord(operator_key, label)?;
         dispatch(batch, fold, &chord.label, chord.operator.action()).map_err(HintFeedError::from)
+    }
+
+    /// Feeds one `operator + label` chord with live truth for link targets
+    /// (CTX-0840, #1395).
+    ///
+    /// Same routing as [`feed`](Self::feed), except link labels take the
+    /// stateful [`dispatch_link`] path: the URI is re-resolved from `state`
+    /// at dispatch time and stale/unsafe cells fail closed. Non-link
+    /// labels dispatch through [`feed`](Self::feed) unchanged.
+    ///
+    /// # Errors
+    /// Same as [`feed`](Self::feed), plus the link resolution failures.
+    pub fn feed_link(
+        &self,
+        fold: &mut FoldState,
+        state: &State,
+        operator_key: char,
+        label: &str,
+    ) -> Result<DispatchOutcome, HintFeedError> {
+        if !self.armed {
+            return Err(HintFeedError::NotArmed);
+        }
+        let Some(batch) = self.batch.as_ref() else {
+            return Err(HintFeedError::NotArmed);
+        };
+        let chord = parse_hint_chord(operator_key, label)?;
+        dispatch_link(batch, fold, state, &chord.label, chord.operator.action())
+            .map_err(HintFeedError::from)
     }
 
     /// Disarms and drops the batch (hint chrome is ephemeral).
@@ -1864,6 +2192,184 @@ mod tests {
         let batch = HintBatch::build(1, &empty);
         assert!(batch.is_empty(), "empty registry yields empty batch");
         assert_eq!(batch.overlay_cost(), 0);
+    }
+
+    fn link_state(uri: &str, text: &str) -> State {
+        use bitty_vt::BoundedString;
+        use bitty_vt::Hyperlink;
+        let mut state = State::new();
+        state.apply(&TerminalAction::OscHyperlink {
+            link: Some(Hyperlink {
+                id: None,
+                uri: BoundedString::new(uri),
+            }),
+        });
+        print(&mut state, text);
+        state.apply(&TerminalAction::OscHyperlink { link: None });
+        state
+    }
+
+    #[test]
+    fn link_anchor_pack_round_trips_cells() {
+        assert_eq!(HintAnchor::pack_link_cell(0, 0), Some(0));
+        let packed = HintAnchor::pack_link_cell(7, 41).expect("fits stride");
+        assert_eq!(HintAnchor::Link(packed).link_cell(), Some((7, 41)));
+        assert_eq!(
+            HintAnchor::Link(packed).kind(),
+            HintKind::Link,
+            "link anchor reports its kind"
+        );
+        assert_eq!(
+            HintAnchor::Link(packed).sort_key(),
+            packed,
+            "sort key is the packed payload"
+        );
+        assert!(HintAnchor::pack_link_cell(usize::MAX, 0).is_none());
+        assert!(HintAnchor::pack_link_cell(0, usize::MAX).is_none());
+        assert_eq!(HintAnchor::Command(CommandId(3)).link_cell(), None);
+        assert_eq!(
+            HintKind::Link.rank(),
+            3,
+            "links sort after commands, panels, and views"
+        );
+        assert!(
+            HintActions::default_for(HintKind::Link).contains(HintAction::Jump),
+            "links jump (open)"
+        );
+        assert!(
+            HintActions::default_for(HintKind::Link).contains(HintAction::Copy),
+            "links copy"
+        );
+        assert!(
+            !HintActions::default_for(HintKind::Link).contains(HintAction::ToggleFold),
+            "links never fold"
+        );
+    }
+
+    #[test]
+    fn link_provider_collects_safe_spans_only() {
+        // CTX-0840 (#1395): safe OSC 8 spans become targets; hostile
+        // schemes and `file:` never admit.
+        let state = link_state("https://example.test/path", "click");
+        let mut registry = HintRegistry::new();
+        let admitted = collect_link_targets(&mut registry, &state, SCOPE);
+        assert_eq!(admitted, 1, "one safe span admits one target");
+        assert_eq!(registry.len(), 1);
+        let target = &registry.targets()[0];
+        assert_eq!(target.kind, HintKind::Link);
+        assert_eq!(target.anchor.kind(), HintKind::Link);
+        // One span, not one target per cell: the contiguous run groups.
+        let batch = HintBatch::build(9, &registry);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(
+            resolve_link_uri(&state, target.anchor),
+            Some("https://example.test/path".to_owned()),
+            "dispatch-time resolve returns truth URI"
+        );
+
+        // Hostile schemes never become targets.
+        for uri in [
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "file:///tmp/report.txt",
+        ] {
+            let hostile = link_state(uri, "x");
+            let mut denied = HintRegistry::new();
+            assert_eq!(
+                collect_link_targets(&mut denied, &hostile, SCOPE),
+                0,
+                "unsafe URI must not admit: {uri}"
+            );
+            assert!(denied.is_empty());
+        }
+
+        // Empty grids collect nothing, fail-closed.
+        let mut empty = HintRegistry::new();
+        assert_eq!(collect_link_targets(&mut empty, &State::new(), SCOPE), 0);
+    }
+
+    #[test]
+    fn link_dispatch_resolves_uri_from_truth() {
+        // CTX-0840: `Jump` on a link label yields the truth URI (the
+        // caller still gates it); stateless dispatch refuses instead of
+        // inventing one.
+        let state = link_state("https://example.test/a", "link");
+        let mut registry = HintRegistry::new();
+        assert_eq!(collect_link_targets(&mut registry, &state, SCOPE), 1);
+        let batch = HintBatch::build(1, &registry);
+        let label = batch.labels()[0].label.clone();
+        let mut fold = FoldState::new();
+        assert_eq!(
+            dispatch(&batch, &mut fold, &label, HintAction::Jump),
+            Err(DispatchError::LinkNeedsState {
+                target: batch.labels()[0].target,
+            }),
+            "stateless dispatch never invents a URI"
+        );
+        let outcome = dispatch_link(&batch, &mut fold, &state, &label, HintAction::Jump)
+            .expect("stateful link dispatch resolves");
+        match outcome {
+            DispatchOutcome::LinkOpen { uri, target } => {
+                assert_eq!(uri, "https://example.test/a");
+                assert_eq!(target, batch.labels()[0].target);
+            }
+            other => panic!("expected LinkOpen, got {other:?}"),
+        }
+        // Copy carries the handle; Focus is unsupported for links.
+        assert!(matches!(
+            dispatch_link(&batch, &mut fold, &state, &label, HintAction::Copy),
+            Ok(DispatchOutcome::CopyRequested { .. })
+        ));
+        assert_eq!(
+            dispatch_link(&batch, &mut fold, &state, &label, HintAction::Focus),
+            Err(DispatchError::ActionNotSupported {
+                action: HintAction::Focus,
+                kind: HintKind::Link,
+            })
+        );
+        // A cleared grid stales the anchor: fail closed, no substitute.
+        let cleared = State::new();
+        assert_eq!(
+            dispatch_link(&batch, &mut fold, &cleared, &label, HintAction::Jump),
+            Err(DispatchError::LinkNeedsState {
+                target: batch.labels()[0].target,
+            })
+        );
+        assert_eq!(
+            resolve_link_uri(&cleared, batch.labels()[0].anchor),
+            None,
+            "stale cell resolves nothing"
+        );
+    }
+
+    #[test]
+    fn link_session_feed_link_routes_statefully() {
+        // CTX-0840: the armed session feeds link chords through truth.
+        let state = link_state("mailto:user@example.test", "mail");
+        let mut registry = HintRegistry::new();
+        assert_eq!(collect_link_targets(&mut registry, &state, SCOPE), 1);
+        let batch = HintBatch::build(4, &registry);
+        let label = batch.labels()[0].label.clone();
+        let mut session = HintSession::new();
+        session.arm(batch, &[]).expect("no conflicts");
+        let mut fold = FoldState::new();
+        assert_eq!(
+            session.feed(&mut fold, 'j', &label),
+            Err(HintFeedError::Dispatch(DispatchError::LinkNeedsState {
+                target: TargetId(1),
+            })),
+            "stateless feed refuses link labels"
+        );
+        let outcome = session
+            .feed_link(&mut fold, &state, 'j', &label)
+            .expect("stateful feed resolves");
+        match outcome {
+            DispatchOutcome::LinkOpen { uri, .. } => {
+                assert_eq!(uri, "mailto:user@example.test");
+            }
+            other => panic!("expected LinkOpen, got {other:?}"),
+        }
+        assert!(session.is_armed(), "feed never auto-disarms");
     }
 
     #[test]

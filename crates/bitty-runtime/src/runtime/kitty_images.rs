@@ -16,6 +16,18 @@
 //! stream's origin token so the present layer confines it to its own leaf
 //! (CTX-0254). While the alternate screen is active, transmissions decode
 //! and store but never place (fail closed, same shape as transmit-only).
+//!
+//! Unicode placeholders (CTX-0821, issue #1400) resolve at print time in
+//! [`bitty_term_state::State`]: `U+10EEEE` cells carry the pen colors and
+//! combining diacritics, decoded headlessly via
+//! [`bitty_term_state::kitty_unicode`] (`State::kitty_unicode_run_at`,
+//! `State::kitty_unicode_runs_on_row`) and sized via
+//! [`bitty_rich::kitty_unicode`] (`unicode_run_rect`). This module adds
+//! the runtime delete seam: [`Runtime::kitty_unicode_delete`] clears the
+//! named runs' grid cells ([`bitty_term_state::State::kitty_unicode_clear`]),
+//! so `a=d,d=i[,p=]` has deterministic grid-text semantics. Stored-image
+//! and placement-layer bookkeeping for the `U=1` virtual prototype itself
+//! stays follow-up work (recorded in the PR body).
 
 use super::*;
 
@@ -139,6 +151,7 @@ impl Runtime {
     /// `action_a` is the wire `a=` value (`None` when absent, which means
     /// transmit-and-display per the kitty specification); `cols_c`/`rows_r`
     /// are the explicit `c=`/`r=` cell spans (0 derives from pixels).
+    /// `cursor_movement_c` is the wire `C=` value (`0` moves cursor, `1` keeps it).
     /// `z` orders images ascending among themselves.
     ///
     /// The placement is tagged with the currently-drained stream's origin
@@ -153,6 +166,10 @@ impl Runtime {
     /// the new placement. Alternate-screen display stores without placing
     /// ([`KittyDisplayOutcome::SuppressedAlternateScreen`]).
     ///
+    /// Per Kitty spec: after placing an image, cursor moves right by the
+    /// number of columns and down by the number of rows in the placement
+    /// rectangle, unless `C=1` is set.
+    ///
     /// # Errors
     ///
     /// Same as [`Runtime::kitty_transmit_image`]; failures store nothing
@@ -166,6 +183,7 @@ impl Runtime {
         action_a: Option<char>,
         cols_c: u16,
         rows_r: u16,
+        cursor_movement_c: u8,
         payload: &[u8],
         z: i32,
     ) -> Result<KittyDisplayOutcome, KittyImageError> {
@@ -189,7 +207,7 @@ impl Runtime {
             width: metrics.width,
             height: metrics.height,
         };
-        let placement = self
+        let placement_id = self
             .kitty_images
             .display_for_origin(
                 image,
@@ -204,6 +222,65 @@ impl Runtime {
             )
             .map_err(KittyImageError::Placement)?;
         self.pending_full_redraw = true;
-        Ok(KittyDisplayOutcome::Displayed { image, placement })
+
+        // Per Kitty spec: after placing an image, the cursor moves right by the
+        // number of columns and down by the number of rows in the placement
+        // rectangle, unless C=1 is explicitly set. Use the effective placement
+        // dimensions (what was actually rendered), not the requested spans which
+        // may be zero when omitted.
+        if cursor_movement_c != 1 {
+            // Retrieve the actual placement to get effective dimensions
+            let placement = self
+                .kitty_images
+                .get_placement(placement_id)
+                .expect("placement just created must exist");
+
+            let effective_cols = if cols_c > 0 { cols_c } else { placement.cols };
+            let effective_rows = if rows_r > 0 { rows_r } else { placement.rows };
+            let new_col = cursor.col.saturating_add(effective_cols);
+            let new_row = cursor.row.saturating_add(effective_rows);
+            self.state.apply(&bitty_vt::TerminalAction::CursorPosition {
+                row: bitty_vt::Row(new_row),
+                col: bitty_vt::Col(new_col),
+            });
+        }
+
+        Ok(KittyDisplayOutcome::Displayed {
+            image,
+            placement: placement_id,
+        })
+    }
+
+    /// Deletes Unicode placeholder grid cells naming `(image_id,
+    /// placement_id)` (CTX-0821, issue #1400).
+    ///
+    /// `placement_id == None` clears every run naming `image_id` (kitty
+    /// `a=d,d=i`); `Some(p)` clears only runs naming `(image_id, Some(p))`
+    /// (kitty `a=d,d=i,p=`). Only the focused stream's grid
+    /// (`self.state`, which `handle_pane_bytes` swaps per pane) is
+    /// touched; scrollback history is immutable and keeps its bytes
+    /// (dangling cells fail closed: they decode to runs that name
+    /// nothing the present layer resolves). Returns the cleared cell
+    /// count. A positive count forces a full redraw so the next tick
+    /// repaints the cleared cells.
+    pub fn kitty_unicode_delete(&mut self, image_id: u32, placement_id: Option<u32>) -> usize {
+        let cleared = self.state.kitty_unicode_clear(image_id, placement_id);
+        if cleared > 0 {
+            self.pending_full_redraw = true;
+        }
+        cleared
+    }
+
+    /// Placeholder runs on one grid row, left-to-right (CTX-0821).
+    ///
+    /// Headless-observable seam over
+    /// [`bitty_term_state::State::kitty_unicode_runs_on_row`]: each entry
+    /// is the decoded cells plus the `(image_id, placement_id)` key.
+    #[must_use]
+    pub fn kitty_unicode_runs_on_row(
+        &self,
+        row: usize,
+    ) -> Vec<bitty_term_state::KittyUnicodeRunCells> {
+        self.state.kitty_unicode_runs_on_row(row)
     }
 }

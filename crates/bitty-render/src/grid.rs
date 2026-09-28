@@ -860,8 +860,10 @@ pub const fn selection_fill_in(palette: &ThemePalette) -> Rgba8 {
 /// most `grid_height` rects (bounded by the grid, never by input).
 ///
 /// Endpoints are sorted and clamped to the `grid_width` x `grid_height` grid;
-/// empty grids, zero cells, or collapsed ranges yield no rects. Total over
-/// all inputs: no panics, no allocation beyond the bounded row count, no I/O.
+/// empty grids or zero cells yield no rects. Ranges are inclusive, so a
+/// single-cell range paints one rect; truly empty selections are filtered by
+/// the caller. Total over all inputs: no panics, no allocation beyond the
+/// bounded row count, no I/O.
 #[must_use]
 pub fn selection_fill_rects(
     anchor: (u16, u16),
@@ -903,18 +905,12 @@ pub fn selection_fill_rects_in(
         core::mem::swap(&mut start_row, &mut end_row);
         core::mem::swap(&mut start_col, &mut end_col);
     }
-    if start_row == end_row && start_col == end_col {
-        return Vec::new();
-    }
     let max_row = grid_height.saturating_sub(1);
     let max_col = grid_width.saturating_sub(1);
     start_row = start_row.min(max_row);
     start_col = start_col.min(max_col);
     end_row = end_row.min(max_row);
     end_col = end_col.min(max_col);
-    if (start_row, start_col) == (end_row, end_col) {
-        return Vec::new();
-    }
     let mut rects = Vec::new();
     let mut row = start_row;
     while row <= end_row {

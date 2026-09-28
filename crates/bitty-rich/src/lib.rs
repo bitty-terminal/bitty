@@ -94,6 +94,7 @@ pub mod image;
 pub mod kitty;
 pub mod kitty_decode;
 pub mod kitty_place;
+pub mod kitty_unicode;
 pub mod loader;
 pub mod presentation;
 pub mod projection;
@@ -130,9 +131,10 @@ pub use hints::{
     ChordError, DispatchError, DispatchOutcome, HINT_LABEL_ALPHABET, HINT_LABEL_MAX_CHARS,
     HINT_OPERATOR_KEYS, HINT_TARGET_MAX, HINT_TEXT_MAX_BYTES, HintAction, HintActions, HintAnchor,
     HintBatch, HintChord, HintFeedError, HintKind, HintLabel, HintOperator, HintRegistry,
-    HintScope, HintSession, HintTarget, OperatorConflict, TargetId, allocate_labels,
-    check_operator_conflicts, collect_command_targets, collect_panel_targets, collect_view_targets,
-    dispatch, label_for_index, parse_hint_chord,
+    HintScope, HintSession, HintTarget, LINK_ANCHOR_STRIDE, LINK_TARGET_MAX, LinkTarget,
+    OperatorConflict, TargetId, allocate_labels, check_operator_conflicts, collect_command_targets,
+    collect_link_targets, collect_panel_targets, collect_view_targets, dispatch, dispatch_link,
+    label_for_index, parse_hint_chord, resolve_link_uri,
 };
 pub use hyperlink::{HyperlinkInfo, HyperlinkSpan};
 pub use image::{
@@ -153,6 +155,9 @@ pub use kitty_place::{
     KittyImageId, KittyImageLayer, KittyPlacedImage, KittyPlacement, KittyPlacementError,
     KittyPlacementId, KittyRasterCache, KittyRasterKey, KittyRasterStats, placement_full_rect_for,
     placement_rect_for, rasterize, rasterize_clipped, viewport_extent,
+};
+pub use kitty_unicode::{
+    KittyUnicodeRect, KittyUnicodeVirtual, unicode_run_rect, virtual_extent_cells,
 };
 pub use loader::{MAX_PATH_LEN, MAX_ROOTS, ResourceError, ResourcePolicy, validate_resource_path};
 pub use projection::{ProjectedBlock, ProjectionError, project_fragments};

@@ -110,9 +110,26 @@ pub fn encode_key_event(event: &KeyEvent) -> Option<Vec<u8>> {
 /// - `shift` has no legacy effect: the logical character already reflects it
 ///   (`^`/`_`/`?` arrive shifted), and `super_pressed` is ignored (Super
 ///   chords are compositor-reserved on the supported targets).
+///
+/// For terminal-mode-aware encoding (application cursor keys), use
+/// [`encode_key_event_with_terminal_modes`] instead.
 pub fn encode_key_event_with_modifiers(
     event: &KeyEvent,
     modifiers: &ModifiersState,
+) -> Option<Vec<u8>> {
+    encode_key_event_with_terminal_modes(event, modifiers, false)
+}
+
+/// Encodes `event` with modifiers and terminal mode state (CTX-0826).
+///
+/// This extends [`encode_key_event_with_modifiers`] with terminal mode
+/// awareness. When `application_cursor_keys` is true, arrow keys and Home/End
+/// encode in application mode (ESC OA/B/C/D/H/F) per DECCKM; otherwise normal
+/// mode (ESC [A/B/C/D/H/F).
+pub fn encode_key_event_with_terminal_modes(
+    event: &KeyEvent,
+    modifiers: &ModifiersState,
+    application_cursor_keys: bool,
 ) -> Option<Vec<u8>> {
     if event.state != PressState::Pressed {
         return None;
@@ -148,7 +165,7 @@ pub fn encode_key_event_with_modifiers(
                 }
                 return Some(vec![0x00]);
             }
-            if let Some(seq) = encode_named_key(*named) {
+            if let Some(seq) = encode_named_key(*named, application_cursor_keys) {
                 if modifiers.alt {
                     return Some(esc_prefix(seq));
                 }
@@ -228,22 +245,62 @@ fn esc_prefix(body: &[u8]) -> Vec<u8> {
 
 /// Maps an explicitly modeled [`NamedKey`] to its legacy VT byte sequence.
 ///
+/// `application_cursor_keys`: When true, encodes cursor arrows in application
+/// mode (`ESC OA` through `ESC OD` per DECCKM), else normal mode (`ESC [A`
+/// through `ESC [D`). Home/End follow the same rule.
+///
 /// Returns `None` for modifier-only or unmapped keys that should not emit.
-pub fn encode_named_key(named: NamedKey) -> Option<&'static [u8]> {
+pub fn encode_named_key(named: NamedKey, application_cursor_keys: bool) -> Option<&'static [u8]> {
     match named {
         NamedKey::Enter => Some(b"\r"),
         NamedKey::Tab => Some(b"\t"),
         NamedKey::Backspace => Some(b"\x7f"),
         NamedKey::Delete => Some(b"\x1b[3~"),
         NamedKey::Insert => Some(b"\x1b[2~"),
-        NamedKey::Home => Some(b"\x1b[H"),
-        NamedKey::End => Some(b"\x1b[F"),
+        NamedKey::Home => {
+            if application_cursor_keys {
+                Some(b"\x1bOH")
+            } else {
+                Some(b"\x1b[H")
+            }
+        }
+        NamedKey::End => {
+            if application_cursor_keys {
+                Some(b"\x1bOF")
+            } else {
+                Some(b"\x1b[F")
+            }
+        }
         NamedKey::PageUp => Some(b"\x1b[5~"),
         NamedKey::PageDown => Some(b"\x1b[6~"),
-        NamedKey::ArrowUp => Some(b"\x1b[A"),
-        NamedKey::ArrowDown => Some(b"\x1b[B"),
-        NamedKey::ArrowRight => Some(b"\x1b[C"),
-        NamedKey::ArrowLeft => Some(b"\x1b[D"),
+        NamedKey::ArrowUp => {
+            if application_cursor_keys {
+                Some(b"\x1bOA")
+            } else {
+                Some(b"\x1b[A")
+            }
+        }
+        NamedKey::ArrowDown => {
+            if application_cursor_keys {
+                Some(b"\x1bOB")
+            } else {
+                Some(b"\x1b[B")
+            }
+        }
+        NamedKey::ArrowRight => {
+            if application_cursor_keys {
+                Some(b"\x1bOC")
+            } else {
+                Some(b"\x1b[C")
+            }
+        }
+        NamedKey::ArrowLeft => {
+            if application_cursor_keys {
+                Some(b"\x1bOD")
+            } else {
+                Some(b"\x1b[D")
+            }
+        }
         NamedKey::Escape => Some(b"\x1b"),
         NamedKey::Space => Some(b" "),
         // F-keys: xterm / xterm-256color legacy

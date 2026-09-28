@@ -265,8 +265,13 @@ fn selection_highlight_renders_end_to_end() {
             .iter()
             .all(|f| f.color == bitty_render::grid::selection_fill())
     );
-    // Collapsed and empty grids paint nothing.
-    assert!(bitty_render::grid::selection_fill_rects((2, 2), (2, 2), 80, 24, cell).is_empty());
+    // A single visible selected cell paints one rect of one cell size
+    // (CTX-0808, #1484: inclusive ranges paint; truly empty selections are
+    // filtered by the caller). Empty grids still paint nothing.
+    let collapsed = bitty_render::grid::selection_fill_rects((2, 2), (2, 2), 80, 24, cell);
+    assert_eq!(collapsed.len(), 1);
+    assert_eq!(collapsed[0].rect.width, 8);
+    assert_eq!(collapsed[0].rect.height, 16);
     assert!(bitty_render::grid::selection_fill_rects((0, 0), (0, 4), 0, 24, cell).is_empty());
 
     // Runtime end-to-end: a committed selection forces the next tick to

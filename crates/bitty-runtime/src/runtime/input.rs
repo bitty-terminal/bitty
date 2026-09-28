@@ -572,7 +572,12 @@ impl Runtime {
 
     /// Legacy encoder fallback for keys without a Kitty encoding.
     fn ext_key_fallback(&self, event: &KeyEvent) -> Option<Vec<u8>> {
-        bitty_platform::keyboard::encode_key_event_with_modifiers(event, &self.modifier_snapshot())
+        let application_cursor_keys = self.focused_modes().application_cursor_keys;
+        bitty_platform::keyboard::encode_key_event_with_terminal_modes(
+            event,
+            &self.modifier_snapshot(),
+            application_cursor_keys,
+        )
     }
 
     /// Returns `frame` when it fits the per-key byte bound, else drops it.
@@ -1138,6 +1143,19 @@ impl Runtime {
             );
             self.publish_inspect_snapshot();
         }
+        // CTX-0808 (#1484, review): the release paired with a
+        // chrome-consumed status-bar press on a non-focused frame never
+        // reaches a capturing app as an orphan report. One-shot: clear and
+        // swallow. Runs ahead of the modal return so the paired release is
+        // consumed even when copy/search activates mid-gesture; the inspect
+        // trace above stays either way.
+        if event.button == MouseButton::Left
+            && event.state == PressState::Released
+            && self.bar_release_swallow
+        {
+            self.bar_release_swallow = false;
+            return;
+        }
         // CTX-0384: copy mode consumes mouse selection while active (the
         // keyboard cursor owns the highlight). The inspect trace above stays;
         // every selection, drag, capture, and paste path below is suppressed
@@ -1149,6 +1167,17 @@ impl Runtime {
         }
         // Shift override always forces selection path.
         let shift_override = self.shift_pressed;
+        // CTX-0808 (#1484): a bar press on a non-focused frame is chrome
+        // before capture — consume it before the focus-then-capture decision
+        // below so the capturing app never sees the press (and the release
+        // swallow above pairs with it). Shift still forces selection.
+        if !shift_override
+            && event.button == MouseButton::Left
+            && event.state == PressState::Pressed
+            && self.status_bar_press_non_focused()
+        {
+            return;
+        }
         // CTX-0804 (#1477): a left press on another pane is a focus choice
         // first when a mouse-tracking app is involved, so the capture
         // decision below reads the pane the click landed on.
@@ -1753,6 +1782,15 @@ impl Runtime {
 
     /// Sets focus state and emits focus reports when mode 1004 is enabled.
     pub fn set_focused(&mut self, focused: bool) {
+        // CTX-0808 (#1484, review): losing window focus orphans an armed
+        // bar-release swallow — the app that would receive the paired
+        // release is no longer the focused one, so the swallow must not
+        // fire. Cleared whenever the window is (or stays) unfocused, ahead
+        // of the unchanged-state return; a focus gain keeps the flag so
+        // the paired release still swallows.
+        if !focused {
+            self.bar_release_swallow = false;
+        }
         if self.focused == focused {
             return;
         }

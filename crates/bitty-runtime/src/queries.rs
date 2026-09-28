@@ -167,6 +167,7 @@ pub(crate) fn osc_color_reply(target: bitty_vt::DynamicColorTarget, color: [u8; 
     let id = match target {
         bitty_vt::DynamicColorTarget::Foreground => 10,
         bitty_vt::DynamicColorTarget::Background => 11,
+        bitty_vt::DynamicColorTarget::Cursor => 12,
     };
     format!(
         "\x1b]{id};rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}\x1b\\",
@@ -234,6 +235,10 @@ pub(crate) fn decrqm_value(state: &State, private: bool, mode: u16) -> u8 {
         1015 => Some(
             state.modes().mouse_coordinate_encoding
                 == Some(bitty_vt::MouseCoordinateEncoding::Urxvt),
+        ),
+        1016 => Some(
+            state.modes().mouse_coordinate_encoding
+                == Some(bitty_vt::MouseCoordinateEncoding::SgrPixels),
         ),
         2004 => Some(state.modes().bracketed_paste),
         2026 => Some(state.modes().synchronized_update),

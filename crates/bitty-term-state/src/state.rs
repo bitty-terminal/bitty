@@ -25,6 +25,7 @@ use crate::damage::{
 };
 use crate::grid::{Grid, ScreenPair};
 use crate::image::ImageStore;
+use crate::kitty_unicode::{KittyUnicodeCell, KittyUnicodeRunCells};
 use crate::modes::{AltScreen, EnhancedKeyboardState, Modes};
 use crate::replies::Replies;
 use crate::scrollback::{ClearedRange, SCROLLBACK_DEFAULT_LINES, Scrollback, ScrollbackLine};
@@ -1281,6 +1282,18 @@ impl State {
         if ch == '\0' {
             return;
         }
+        // CTX-0821: Kitty Unicode placeholder U+10EEEE (issue #1400).
+        // The base scalar is an ordinary width-1 grid cell carrying the
+        // cursor pen (foreground names the image id, underline color the
+        // placement id; row/column/high-byte diacritics ride in the
+        // combining buffer, decoded headlessly via kitty_unicode).
+        // Recognition, sizing, and resize/delete semantics live in
+        // `kitty_unicode` + `State::kitty_unicode_*` below; printing stays
+        // total and grid-shaped here.
+        if crate::kitty_unicode::is_kitty_placeholder(ch) {
+            self.print_kitty_placeholder(ch);
+            return;
+        }
         let glyph_width = char_cell_width(ch);
         if glyph_width == 0 {
             // CR-TERM-01: zero-width scalars (combining marks, ZWJ,
@@ -1398,6 +1411,346 @@ impl State {
         } else {
             self.cursor.position.col = advanced as u16;
         }
+    }
+
+    /// Prints one Kitty Unicode placeholder cell (CTX-0821, issue #1400).
+    ///
+    /// The `U+10EEEE` base is an ordinary width-1 cell carrying the cursor
+    /// pen: the foreground names the image id and the underline color the
+    /// placement id (kitty wire rules; see [`crate::kitty_unicode`]).
+    /// Row/column/high-byte diacritics arrive as following zero-width
+    /// marks and attach through the normal combining path, so the run
+    /// decoders read them from the cell's combining buffer. Wrap,
+    /// insert-mode, wide-pair repair, and damage behave exactly like any
+    /// other width-1 print (grid invariants unchanged).
+    fn print_kitty_placeholder(&mut self, ch: char) {
+        debug_assert!(crate::kitty_unicode::is_kitty_placeholder(ch));
+        let cols = self.width as u16;
+        if self.modes.auto_wrap && self.cursor.pending_wrap {
+            let old_row = self.cursor.position.row as usize;
+            self.screens_active_mut().set_wrapped(old_row, true);
+            self.index_linefeed();
+            self.cursor.position.col = 0;
+        }
+        self.cursor.pending_wrap = false;
+        let row = self.cursor.position.row as usize;
+        let col = self.cursor.position.col as usize;
+        let last_col_idx = self.width - 1;
+        let erase = self.bce_style();
+        let old_at_col = *self.screens_active().get(row, col);
+        if old_at_col.spacer && col > 0 {
+            let cleared = Cell::erased(erase);
+            self.screens_active_mut().set(row, col - 1, cleared);
+            let c = (col - 1) as u16;
+            self.damage_grid_rect(c, c, c, c);
+        }
+        if old_at_col.width == 2 && !old_at_col.spacer && col < last_col_idx {
+            let cleared = Cell::erased(erase);
+            self.screens_active_mut().set(row, col + 1, cleared);
+            let c = (col + 1) as u16;
+            self.damage_grid_rect(c, c, c, c);
+        }
+        if self.modes.insert {
+            let insert_erase = self.bce_style();
+            self.screens_active_mut()
+                .insert_blanks_in_row(row, col, 1, &insert_erase);
+        }
+        let style = self.cursor.style;
+        let link = self.current_hyperlink;
+        self.screens_active_mut().set(
+            row,
+            col,
+            Cell {
+                glyph: ch,
+                style,
+                width: 1,
+                spacer: false,
+                hyperlink: link,
+                zerowidth: Zerowidth::new(),
+            },
+        );
+        let write_erase = self.bce_style();
+        if self.screens_active_mut().repair_row(row, &write_erase) {
+            let last_col = self.width as u16 - 1;
+            self.damage_grid_rect(row as u16, col as u16, row as u16, last_col);
+        }
+        self.damage_grid_rect(row as u16, col as u16, row as u16, col as u16);
+        let advanced = col + 1;
+        if advanced >= self.width {
+            self.cursor.position.col = cols - 1;
+            self.cursor.pending_wrap = self.modes.auto_wrap;
+        } else {
+            self.cursor.position.col = advanced as u16;
+        }
+    }
+
+    /// Decodes the placeholder run covering `(row, col)` on the active
+    /// screen, if that cell is a Kitty Unicode placeholder (CTX-0821).
+    ///
+    /// The run extends left and right across adjacent placeholder cells
+    /// whose decoded image/placement identity and tile row match with
+    /// consecutive tile columns (the kitty left-to-right inheritance
+    /// rule, applied here at query time so decode never depends on print
+    /// order). Returns the decoded cells left-to-right plus the run key
+    /// `(image_id, placement_id)`, or `None` when the cell is not a
+    /// placeholder. Headless, deterministic, total: neighboring
+    /// reservation-window scalars (`U+10EEEF..=U+10EEFF`) are ordinary
+    /// text and never start or extend a run.
+    #[must_use]
+    pub fn kitty_unicode_run_at(&self, row: usize, col: usize) -> Option<KittyUnicodeRunCells> {
+        use crate::kitty_unicode::{KittyRunBuilder, is_kitty_placeholder};
+        let (rows, cols) = self.screens_active().dims();
+        if row >= rows || col >= cols {
+            return None;
+        }
+        if !is_kitty_placeholder(self.screens_active().get(row, col).glyph) {
+            return None;
+        }
+        // Find the run start: scan left while cells decode as a run.
+        let mut start_col = col;
+        while start_col > 0 {
+            let candidate = start_col - 1;
+            if !self.kitty_run_covers(row, candidate, col) {
+                break;
+            }
+            start_col = candidate;
+        }
+        let mut builder = KittyRunBuilder::new();
+        let mut cells = Vec::new();
+        let mut c = start_col;
+        while c < cols {
+            let cell = self.screens_active().get(row, c);
+            let accepted = builder.push(
+                row,
+                c,
+                is_kitty_placeholder(cell.glyph),
+                cell.style.foreground,
+                cell.style.underline_color,
+                cell.zerowidth.as_slice(),
+            );
+            match accepted {
+                Some(decoded) => {
+                    cells.push(decoded);
+                    c += 1;
+                }
+                None => break,
+            }
+        }
+        if cells.is_empty() {
+            return None;
+        }
+        // The query cell must lie inside the decoded run.
+        if col < start_col || col >= start_col + cells.len() {
+            return None;
+        }
+        let key = crate::kitty_unicode::run_key(&cells[0]);
+        Some((cells, key))
+    }
+
+    /// Whether the placeholder cell at `(row, candidate)` belongs to the
+    /// same run as the anchor column: decodes the `candidate..=anchor`
+    /// segment and checks the anchor joins one run.
+    fn kitty_run_covers(&self, row: usize, candidate: usize, anchor: usize) -> bool {
+        use crate::kitty_unicode::{KittyRunBuilder, is_kitty_placeholder};
+        let (_, cols) = self.screens_active().dims();
+        if candidate > anchor || anchor >= cols {
+            return false;
+        }
+        let mut builder = KittyRunBuilder::new();
+        for c in candidate..=anchor {
+            let cell = self.screens_active().get(row, c);
+            let accepted = builder.push(
+                row,
+                c,
+                is_kitty_placeholder(cell.glyph),
+                cell.style.foreground,
+                cell.style.underline_color,
+                cell.zerowidth.as_slice(),
+            );
+            if accepted.is_none() {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// All placeholder runs on the active screen's `row`, left-to-right
+    /// (CTX-0821).
+    ///
+    /// Each run is `(cells, key)` like [`Self::kitty_unicode_run_at`].
+    /// Non-placeholder cells split runs; every cell belongs to at most
+    /// one run. Headless and deterministic.
+    #[must_use]
+    pub fn kitty_unicode_runs_on_row(&self, row: usize) -> Vec<KittyUnicodeRunCells> {
+        use crate::kitty_unicode::{KittyRunBuilder, is_kitty_placeholder};
+        let (rows, cols) = self.screens_active().dims();
+        if row >= rows {
+            return Vec::new();
+        }
+        let mut runs: Vec<KittyUnicodeRunCells> = Vec::new();
+        let mut builder = KittyRunBuilder::new();
+        let mut current: Vec<KittyUnicodeCell> = Vec::new();
+        let flush = |current: &mut Vec<KittyUnicodeCell>, runs: &mut Vec<KittyUnicodeRunCells>| {
+            if !current.is_empty() {
+                let key = crate::kitty_unicode::run_key(&current[0]);
+                runs.push((std::mem::take(current), key));
+            }
+        };
+        for c in 0..cols {
+            let cell = self.screens_active().get(row, c);
+            match builder.push(
+                row,
+                c,
+                is_kitty_placeholder(cell.glyph),
+                cell.style.foreground,
+                cell.style.underline_color,
+                cell.zerowidth.as_slice(),
+            ) {
+                Some(decoded) => current.push(decoded),
+                None => {
+                    flush(&mut current, &mut runs);
+                    if is_kitty_placeholder(cell.glyph) {
+                        // A placeholder that breaks the run starts the next
+                        // run (new image, new row, or column jump).
+                        builder = KittyRunBuilder::new();
+                        if let Some(decoded) = builder.push(
+                            row,
+                            c,
+                            true,
+                            cell.style.foreground,
+                            cell.style.underline_color,
+                            cell.zerowidth.as_slice(),
+                        ) {
+                            current.push(decoded);
+                        } else {
+                            builder = KittyRunBuilder::new();
+                        }
+                    } else {
+                        builder = KittyRunBuilder::new();
+                    }
+                }
+            }
+        }
+        flush(&mut current, &mut runs);
+        runs
+    }
+
+    /// Clears every grid cell whose placeholder run names `(image_id,
+    /// placement_id)` (CTX-0821 delete semantics).
+    ///
+    /// `placement_id == None` clears every run naming `image_id`
+    /// (placement-unspecified delete, kitty `d=i`); `Some(p)` clears only
+    /// runs naming `(image_id, Some(p))` (kitty `d=i,p=`). Matching runs
+    /// on both screens' live grids are erased with the BCE style; scrollback
+    /// lines are immutable and keep their (now-dangling, fail-closed)
+    /// placeholder bytes. Returns the cleared cell count. Deterministic.
+    pub fn kitty_unicode_clear(&mut self, image_id: u32, placement_id: Option<u32>) -> usize {
+        let mut cleared = 0usize;
+        let erase = self.bce_style();
+        for screen in 0..2 {
+            let (rows, cols) = if screen == 0 {
+                self.screens.main.dims()
+            } else {
+                self.screens.alt.dims()
+            };
+            // Collect first (immutable scan), then erase: the run decode
+            // borrows the grid.
+            let mut targets: Vec<(usize, usize)> = Vec::new();
+            for row in 0..rows {
+                for run in self.kitty_runs_on_screen_row(screen, row, cols) {
+                    let (cells, _) = run;
+                    if cells.is_empty() {
+                        continue;
+                    }
+                    let first = &cells[0];
+                    let matches = first.id.image_id == image_id
+                        && (placement_id.is_none() || first.id.placement_id == placement_id);
+                    if matches {
+                        targets.extend(cells.iter().map(|c| (c.grid_row, c.grid_col)));
+                    }
+                }
+            }
+            let mut damaged: Vec<(u16, u16)> = Vec::with_capacity(targets.len());
+            if screen == 0 {
+                for (row, col) in targets {
+                    self.screens.main.set(row, col, Cell::erased(erase));
+                    self.screens.main.set_wrapped(row, false);
+                    damaged.push((row as u16, col as u16));
+                    cleared += 1;
+                }
+            } else {
+                for (row, col) in targets {
+                    self.screens.alt.set(row, col, Cell::erased(erase));
+                    self.screens.alt.set_wrapped(row, false);
+                    damaged.push((row as u16, col as u16));
+                    cleared += 1;
+                }
+            }
+            for (row, col) in damaged {
+                self.damage_grid_rect(row, col, row, col);
+            }
+        }
+        cleared
+    }
+
+    /// Placeholder runs on one screen's row (helper for
+    /// [`Self::kitty_unicode_clear`]; `screen` 0 = main, 1 = alt).
+    fn kitty_runs_on_screen_row(
+        &self,
+        screen: usize,
+        row: usize,
+        cols: usize,
+    ) -> Vec<KittyUnicodeRunCells> {
+        use crate::kitty_unicode::{KittyRunBuilder, is_kitty_placeholder};
+        let grid = if screen == 0 {
+            &self.screens.main
+        } else {
+            &self.screens.alt
+        };
+        let mut runs: Vec<KittyUnicodeRunCells> = Vec::new();
+        let mut builder = KittyRunBuilder::new();
+        let mut current: Vec<KittyUnicodeCell> = Vec::new();
+        for c in 0..cols {
+            let cell = grid.get(row, c);
+            match builder.push(
+                row,
+                c,
+                is_kitty_placeholder(cell.glyph),
+                cell.style.foreground,
+                cell.style.underline_color,
+                cell.zerowidth.as_slice(),
+            ) {
+                Some(decoded) => current.push(decoded),
+                None => {
+                    if !current.is_empty() {
+                        let key = crate::kitty_unicode::run_key(&current[0]);
+                        runs.push((std::mem::take(&mut current), key));
+                    }
+                    if is_kitty_placeholder(cell.glyph) {
+                        builder = KittyRunBuilder::new();
+                        if let Some(decoded) = builder.push(
+                            row,
+                            c,
+                            true,
+                            cell.style.foreground,
+                            cell.style.underline_color,
+                            cell.zerowidth.as_slice(),
+                        ) {
+                            current.push(decoded);
+                        } else {
+                            builder = KittyRunBuilder::new();
+                        }
+                    } else {
+                        builder = KittyRunBuilder::new();
+                    }
+                }
+            }
+        }
+        if !current.is_empty() {
+            let key = crate::kitty_unicode::run_key(&current[0]);
+            runs.push((current, key));
+        }
+        runs
     }
 
     /// Attaches a zero-width scalar to the preceding cell (CR-TERM-01).
@@ -2345,11 +2698,20 @@ fn rewrap_one_logical(logical: &[Cell], new_cols: usize, erase: &Style) -> Vec<(
                 flush_row(&mut cur, &mut used, true);
             }
         }
-        cur.push(*lead);
-        used += 1;
-        if w == 2 {
-            cur.push(Cell::wide_spacer(lead.style));
+        // Width-one bounded representation (CTX-0829): when new_cols == 1,
+        // a width=2 char cannot fit with its spacer. Emit the lead as width=1.
+        if w == 2 && new_cols == 1 {
+            let mut narrow = *lead;
+            narrow.width = 1;
+            cur.push(narrow);
             used += 1;
+        } else {
+            cur.push(*lead);
+            used += 1;
+            if w == 2 {
+                cur.push(Cell::wide_spacer(lead.style));
+                used += 1;
+            }
         }
     }
     flush_row(&mut cur, &mut used, false);

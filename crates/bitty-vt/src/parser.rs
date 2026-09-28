@@ -374,7 +374,6 @@ fn terminate_apc<F: FnMut(TerminalAction)>(
     };
     clear_apc_header(kitty, apc_buf);
     *in_apc = false;
-    *apc_payload = false;
     if let Some(KittyFeedOutcome::Completed(done)) = outcome {
         bridge.emit(TerminalAction::KittyGraphics {
             format_f: done.format_f,
@@ -383,6 +382,7 @@ fn terminate_apc<F: FnMut(TerminalAction)>(
             action_a: done.action_a,
             cols_c: done.cols_c,
             rows_r: done.rows_r,
+            cursor_movement_c: done.cursor_movement_c,
             payload: done.payload,
         });
     }

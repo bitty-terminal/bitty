@@ -849,8 +849,10 @@ fn issue_1438_pending_paste_auto_cancels_after_timeout() {
     use bitty_runtime::{Runtime, RuntimeConfig};
 
     // Create runtime with a short timeout for testing (1 second minimum).
-    let mut config = RuntimeConfig::default();
-    config.paste_confirm_timeout = std::time::Duration::from_secs(1);
+    let config = RuntimeConfig {
+        paste_confirm_timeout: std::time::Duration::from_secs(1),
+        ..Default::default()
+    };
     let mut rt = Runtime::new(config).expect("runtime must build");
     rt.force_headless_clipboard();
 

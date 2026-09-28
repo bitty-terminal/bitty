@@ -208,6 +208,7 @@ pub mod workspace;
 // without taking a direct `bitty-rich` dependency in `bitty-app`.
 pub use bitty_rich::composer::{ComposerKey, ComposerKeyEvent};
 pub use bitty_rich::hints::{DispatchOutcome, HintFeedError, HintScope};
+pub use runtime::cw_live::HintLinkOpenError;
 
 pub use config::{
     BACKGROUND_FITS, CloseConfirmMode, DEFAULT_BACKGROUND_FIT, MAX_BACKGROUND_IMAGE_PATH_BYTES,

@@ -50,6 +50,7 @@
 
 use super::*;
 
+use bitty_plugin_host::InterceptionDecision;
 use bitty_rich::blocks::{CommandBlock, CommandId, blocks};
 use bitty_rich::composer::{ComposerFeedError, ComposerKeyEvent};
 use bitty_rich::hints::{
@@ -61,8 +62,8 @@ use bitty_rich::scene::Scene;
 use crate::cw_present::{
     ComposerPresent, CwComposerFeed, CwFoldAction, CwHintProvider, CwInputRoute, CwPresentInputs,
     CwPresentPlan, FoldPresent, HintKeyOutcome, HintOverlayCell, apply_fold_action,
-    composer_present, dispatch_present, feed_present, fold_present, hint_overlay_present,
-    persist_fold_ordinals, plan_present, route_present_input,
+    composer_present, dispatch_link_present, dispatch_present, feed_present, fold_present,
+    hint_overlay_present, persist_fold_ordinals, plan_present, route_present_input,
 };
 use crate::registry::PanelRuntime;
 
@@ -181,10 +182,105 @@ impl Runtime {
     /// One engine owns provider registration, label allocation, the overlay
     /// batch, and dispatch, so labels stay unique across panels and the
     /// overlay stays one layer with zero overlay-slot cost. Command-block
-    /// targets join every collection (the live engine enables them).
+    /// targets join every collection (the live engine enables them); safe
+    /// OSC 8 link spans join from the live grid (CTX-0840, #1395).
     #[must_use]
     pub fn cw_hint_collect(&self, scope: HintScope, generation: u64) -> HintBatch {
         self.cw_hints.collect(&self.state, scope, generation)
+    }
+
+    /// Resolves the URI behind a link-anchored armed label against live
+    /// terminal truth (CTX-0840, #1395).
+    ///
+    /// Reads the label's anchor from the armed batch and re-resolves it
+    /// through the live snapshot + hyperlink table. Returns `None`
+    /// (fail-closed) while disarmed, for unknown labels, non-link labels,
+    /// stale cells, or unsafe URIs.
+    #[must_use]
+    pub fn cw_hint_link_uri(&self, label: &str) -> Option<String> {
+        let batch = self.cw_hint_session.batch()?;
+        if !self.cw_hint_session.is_armed() {
+            return None;
+        }
+        let found = batch.resolve(label)?;
+        bitty_rich::hints::resolve_link_uri(&self.state, found.anchor)
+    }
+
+    /// Opens the armed link label's URI through the gesture-bound URL gate
+    /// (CTX-0840, #1395 quick-select activation).
+    ///
+    /// Dispatches `Jump` against the armed batch (URI re-resolved from
+    /// truth, fail-closed on stale cells), then routes the resulting
+    /// [`DispatchOutcome::LinkOpen`] through the same
+    /// gesture + scheme + intercept gate as the OSC 8 click path:
+    /// the caller supplies the mouse-minted `gesture` plus the
+    /// `decisions`/`timed_out` intercept verdict, and the URI bound to
+    /// the gesture at mint time is what opens — never a substitute.
+    /// Success disarms the session (chrome is ephemeral); refusal keeps
+    /// the refusal count honest via the shared gate and leaves the
+    /// session armed for a retry.
+    ///
+    /// # Errors
+    ///
+    /// [`HintFeedError::NotArmed`] while disarmed; [`HintFeedError::Dispatch`]
+    /// for label/URI resolution failures; the platform denial when the gate
+    /// refuses (no gesture, stale binding, veto, timeout, or an URI
+    /// outside the allowlist).
+    pub fn cw_hint_open_link(
+        &mut self,
+        label: &str,
+        gesture: ActivationGesture,
+        decisions: &[InterceptionDecision],
+        timed_out: bool,
+    ) -> Result<String, HintLinkOpenError> {
+        let outcome = self
+            .cw_hint_dispatch_armed(label, HintAction::Jump)
+            .map_err(HintLinkOpenError::Dispatch)?;
+        let (uri, _) = match outcome {
+            DispatchOutcome::LinkOpen { uri, target } => (uri, target),
+            DispatchOutcome::Jump { .. }
+            | DispatchOutcome::FocusView { .. }
+            | DispatchOutcome::FocusPanel { .. }
+            | DispatchOutcome::FoldToggled { .. }
+            | DispatchOutcome::Expanded { .. }
+            | DispatchOutcome::Collapsed { .. }
+            | DispatchOutcome::CopyRequested { .. } => {
+                return Err(HintLinkOpenError::NotALink {
+                    label: label.to_owned(),
+                });
+            }
+        };
+        // The gesture binds its own URI at mint time (click path), which
+        // may differ from the hint label's URI: refuse loudly rather than
+        // open either side as a confused deputy. The binding is consumed
+        // (single-use, like the click path) so a replay cannot retry
+        // against a stale URI.
+        let bound = self.pending_activation_uri.clone();
+        if bound.as_deref() != Some(uri.as_str()) {
+            self.pending_activation_gesture = None;
+            self.pending_activation_uri = None;
+            self.url_activation_refusals = self.url_activation_refusals.saturating_add(1);
+            return Err(HintLinkOpenError::GestureMismatch);
+        }
+        self.authorize_url_activation(&uri, gesture, decisions, timed_out)
+            .map_err(|err| {
+                self.pending_activation_uri = None;
+                self.url_activation_refusals = self.url_activation_refusals.saturating_add(1);
+                HintLinkOpenError::Denied(err)
+            })?;
+        let activation = UrlActivation { uri: uri.clone() };
+        let opened = activation.uri().to_owned();
+        match self.url_opener.open_url(activation) {
+            Ok(()) => {
+                self.pending_activation_uri = None;
+                self.url_activations = self.url_activations.saturating_add(1);
+                Ok(opened)
+            }
+            Err(err) => {
+                self.url_activation_refusals = self.url_activation_refusals.saturating_add(1);
+                Err(HintLinkOpenError::Denied(err))
+            }
+        }
     }
 
     /// Dispatches `Action(Target)` from the live present path.
@@ -215,11 +311,16 @@ impl Runtime {
     /// chrome is ephemeral); dispatch errors keep the session armed so the
     /// caller can retry the label inside the same window.
     ///
+    /// Link labels resolve their URI from live terminal truth at dispatch
+    /// time (CTX-0840, #1395): a stale cell or an evicted hyperlink fails
+    /// closed instead of yielding a substitute URI.
+    ///
     /// # Errors
     ///
     /// [`HintFeedError::NotArmed`] while disarmed (or armed with no batch:
     /// keys belong to the shell then); [`HintFeedError::Dispatch`] for the
-    /// [`dispatch_present`] rejection, with the fold untouched.
+    /// [`dispatch_present`] / [`dispatch_link_present`] rejection, with the
+    /// fold untouched.
     pub fn cw_hint_dispatch_armed(
         &mut self,
         label: &str,
@@ -229,7 +330,19 @@ impl Runtime {
             return Err(HintFeedError::NotArmed);
         }
         let outcome = match self.cw_hint_session.batch() {
-            Some(batch) => dispatch_present(batch, &mut self.cw_fold, label, action)?,
+            Some(batch) => {
+                // Link anchors carry only a cell: truth must re-resolve the
+                // URI, so they take the stateful path. Everything else keeps
+                // the stateless batch-only dispatch.
+                let is_link = batch
+                    .resolve(label)
+                    .is_some_and(|found| found.kind == bitty_rich::hints::HintKind::Link);
+                if is_link {
+                    dispatch_link_present(batch, &mut self.cw_fold, &self.state, label, action)?
+                } else {
+                    dispatch_present(batch, &mut self.cw_fold, label, action)?
+                }
+            }
             None => return Err(HintFeedError::NotArmed),
         };
         self.cw_hint_disarm();
@@ -322,10 +435,29 @@ impl Runtime {
         if resolves && !extendable {
             let operator = self.cw_hint_operator.unwrap_or(key);
             let label = self.cw_hint_label.clone();
-            match self
-                .cw_hint_session
-                .feed(&mut self.cw_fold, operator, label.as_str())
-            {
+            // Link anchors carry only a cell: dispatch needs live truth to
+            // re-resolve the URI, so they take the stateful path (CTX-0840).
+            // Everything else keeps the stateless batch-only dispatch.
+            let outcome = match self.cw_hint_session.batch() {
+                Some(batch) => {
+                    let is_link = batch
+                        .resolve(&label)
+                        .is_some_and(|found| found.kind == bitty_rich::hints::HintKind::Link);
+                    if is_link {
+                        self.cw_hint_session.feed_link(
+                            &mut self.cw_fold,
+                            &self.state,
+                            operator,
+                            label.as_str(),
+                        )
+                    } else {
+                        self.cw_hint_session
+                            .feed(&mut self.cw_fold, operator, label.as_str())
+                    }
+                }
+                None => Err(bitty_rich::hints::HintFeedError::NotArmed),
+            };
+            match outcome {
                 Ok(outcome) => {
                     self.cw_hint_disarm();
                     HintKeyOutcome::Dispatched(outcome)
@@ -554,6 +686,11 @@ impl Runtime {
                     id,
                     label: &entry.label,
                 }),
+                // Link anchors paint at their leading cell in the primary
+                // owner's frame (CTX-0840, #1395): links are grid truth on
+                // the primary state, so they share the command pill's
+                // viewport math via the same owner frame.
+                HintAnchor::Link(raw) => self.hint_link_cell(frames, raw, &entry.label),
                 // No panel-to-view map in the present path: skip fail-closed.
                 HintAnchor::Panel(_) => None,
             };
@@ -625,6 +762,84 @@ impl Runtime {
             label: query.label.to_string(),
         })
     }
+
+    /// Viewport cell for one link-anchored hint label, if placeable
+    /// (CTX-0840, #1395).
+    ///
+    /// Unpacks the packed `(row, col)` cell from `payload` and maps the
+    /// combined-buffer row into the owner's viewport with the same window
+    /// math as [`Runtime::hint_command_cell`](Self::hint_command_cell):
+    /// a scrolled owner shows the composite window, otherwise the
+    /// cursor-follow window. Fail-closed: alt-screen, a missing owner or
+    /// frame, zero-sized frames, pills wider than the frame, and any
+    /// out-of-window row yield `None`.
+    fn hint_link_cell(
+        &self,
+        frames: &[layout_focus::PresentFrame],
+        payload: u64,
+        label: &str,
+    ) -> Option<HintOverlayCell> {
+        use bitty_rich::hints::{HintAnchor, LINK_ANCHOR_STRIDE};
+        let row = (payload / LINK_ANCHOR_STRIDE) as usize;
+        let col = (payload % LINK_ANCHOR_STRIDE) as usize;
+        let _ = HintAnchor::Link(payload);
+        if self.state.alt_screen_active() {
+            return None;
+        }
+        let owner = self.primary_view()?;
+        let frame = frames.iter().find(|frame| frame.view == owner)?;
+        if frame.cols == 0 || frame.rows == 0 {
+            return None;
+        }
+        if label.chars().count() > usize::from(frame.cols) {
+            return None;
+        }
+        let snapshot = self.state.snapshot();
+        if row >= snapshot.height.saturating_add(self.state.scrollback_len()) {
+            return None;
+        }
+        if col >= snapshot.width {
+            return None;
+        }
+        let view = self.layout.find_leaf(owner)?;
+        let frame_rows = usize::from(frame.rows);
+        let sb_len = self.state.scrollback_len();
+        let screen_height = self.state.height();
+        let cursor_row = usize::from(self.state.cursor().position.row);
+        let placed_row = if view.scroll_offset() != 0 {
+            let total = sb_len.saturating_add(screen_height);
+            let offset = view.scroll_offset().min(sb_len);
+            let start = total
+                .saturating_sub(usize::from(view.rows()))
+                .saturating_sub(offset);
+            let viewport_row = row.checked_sub(start)?;
+            if viewport_row >= usize::from(view.rows()) || viewport_row >= frame_rows {
+                return None;
+            }
+            viewport_row
+        } else {
+            let screen_row = row.checked_sub(sb_len)?;
+            if screen_row >= screen_height {
+                return None;
+            }
+            let start =
+                super::present::cursor_follow_window_start(cursor_row, screen_height, frame_rows);
+            let viewport_row = screen_row.checked_sub(start)?;
+            if viewport_row >= frame_rows {
+                return None;
+            }
+            viewport_row
+        };
+        let placed_col = (col as u16).min(frame.cols.saturating_sub(1));
+        u16::try_from(placed_row)
+            .ok()
+            .map(|placed_row| HintOverlayCell {
+                view: owner,
+                col: placed_col,
+                row: placed_row,
+                label: label.to_owned(),
+            })
+    }
 }
 
 /// Bundled inputs for one
@@ -650,4 +865,50 @@ struct HintCommandQuery<'a> {
     id: CommandId,
     /// Label glyphs painted.
     label: &'a str,
+}
+
+/// Why a headless quick-select link open failed (CTX-0840, #1395).
+///
+/// All arms are fail-closed: terminal truth, the fold, the clipboard, and
+/// the opener are untouched, and the refusal is counted on the shared URL
+/// gate where a gate decision was involved.
+#[derive(Debug, PartialEq)]
+pub enum HintLinkOpenError {
+    /// Label dispatch failed (disarmed, unknown label, stale cell, or an
+    /// unsupported verb for the link target).
+    Dispatch(HintFeedError),
+    /// The armed label names a non-link target (commands, panels, views
+    /// open through their own verbs, never the URL gate).
+    NotALink {
+        /// The rejected label text.
+        label: String,
+    },
+    /// No gesture is pending, or the pending gesture binds a different URI
+    /// than the hint label's (confused-deputy refusal, counted).
+    GestureMismatch,
+    /// The gesture + scheme + intercept gate refused the open.
+    Denied(bitty_platform::PlatformError),
+}
+
+impl std::fmt::Display for HintLinkOpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Dispatch(err) => write!(f, "hint link dispatch: {err}"),
+            Self::NotALink { label } => write!(f, "hint label '{label}' is not a link"),
+            Self::GestureMismatch => {
+                f.write_str("hint link gesture binds a different URI (or none)")
+            }
+            Self::Denied(err) => write!(f, "hint link denied: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for HintLinkOpenError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Dispatch(err) => Some(err),
+            Self::Denied(err) => Some(err),
+            Self::NotALink { .. } | Self::GestureMismatch => None,
+        }
+    }
 }

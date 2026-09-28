@@ -1632,6 +1632,12 @@ impl TerminalApp {
                     target.get()
                 );
             }
+            DispatchOutcome::LinkOpen { uri, target } => {
+                eprintln!(
+                    "bitty: hint -> link target {} selects {uri} (opening stays on the URL gate — click the link to authorize; keyboard-only open is a follow-up)",
+                    target.get()
+                );
+            }
         }
     }
 

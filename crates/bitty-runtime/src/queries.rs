@@ -236,6 +236,10 @@ pub(crate) fn decrqm_value(state: &State, private: bool, mode: u16) -> u8 {
             state.modes().mouse_coordinate_encoding
                 == Some(bitty_vt::MouseCoordinateEncoding::Urxvt),
         ),
+        1016 => Some(
+            state.modes().mouse_coordinate_encoding
+                == Some(bitty_vt::MouseCoordinateEncoding::SgrPixels),
+        ),
         2004 => Some(state.modes().bracketed_paste),
         2026 => Some(state.modes().synchronized_update),
         7727 => Some(state.modes().enhanced_keyboard.flags() != 0),

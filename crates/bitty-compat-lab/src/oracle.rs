@@ -1076,6 +1076,7 @@ fn mouse_encoding(encoding: Option<MouseCoordinateEncoding>) -> String {
         Some(MouseCoordinateEncoding::Utf8) => "utf8".to_string(),
         Some(MouseCoordinateEncoding::Sgr) => "sgr".to_string(),
         Some(MouseCoordinateEncoding::Urxvt) => "urxvt".to_string(),
+        Some(MouseCoordinateEncoding::SgrPixels) => "sgr-pixels".to_string(),
     }
 }
 

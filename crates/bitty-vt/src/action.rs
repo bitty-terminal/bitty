@@ -378,6 +378,8 @@ pub enum MouseCoordinateEncoding {
     Utf8,
     /// SGR decimal encoding (`?1006`).
     Sgr,
+    /// SGR-Pixels decimal pixel coordinates (`?1016`).
+    SgrPixels,
     /// Urxvt decimal encoding (`?1015`).
     Urxvt,
 }

@@ -66,6 +66,8 @@ pub enum MouseFormat {
     Utf8,
     /// SGR decimal coordinates (`?1006`).
     Sgr,
+    /// SGR-Pixels decimal pixel coordinates (`?1016`).
+    SgrPixels,
     /// urxvt decimal coordinates (`?1015`).
     Urxvt,
 }
@@ -80,6 +82,7 @@ impl MouseFormat {
             None => Self::X10,
             Some(MouseCoordinateEncoding::Utf8) => Self::Utf8,
             Some(MouseCoordinateEncoding::Sgr) => Self::Sgr,
+            Some(MouseCoordinateEncoding::SgrPixels) => Self::SgrPixels,
             Some(MouseCoordinateEncoding::Urxvt) => Self::Urxvt,
         }
     }
@@ -159,6 +162,7 @@ pub fn encode_mouse(format: MouseFormat, report: MouseReport) -> MouseBytes {
         MouseFormat::X10 => encode_x10(&mut out, &report),
         MouseFormat::Utf8 => encode_utf8(&mut out, &report),
         MouseFormat::Sgr => encode_sgr(&mut out, &report),
+        MouseFormat::SgrPixels => encode_sgr_pixels(&mut out, &report),
         MouseFormat::Urxvt => encode_urxvt(&mut out, &report),
     }
     out
@@ -216,6 +220,23 @@ fn encode_sgr(out: &mut MouseBytes, r: &MouseReport) {
     push_decimal(out, u32::from(r.col) + 1);
     push(out, b';');
     push_decimal(out, u32::from(r.row) + 1);
+    push(out, if r.release { b'm' } else { b'M' });
+}
+
+/// SGR-Pixels encoding: like SGR but with pixel coordinates (CTX-0819, #1399).
+///
+/// Wire format: `CSI < Cb ; Px ; Py M/m` where Px/Py are pixel coordinates.
+/// For now we use cell coordinates multiplied by a fixed cell size since we
+/// don't have access to the actual pixel coordinates here. This matches the
+/// behavior where pixel coordinates = cell_coords * cell_size.
+fn encode_sgr_pixels(out: &mut MouseBytes, r: &MouseReport) {
+    push_slice(out, b"\x1b[<");
+    push_decimal(out, u32::from(r.sgr_code()));
+    push(out, b';');
+    // Convert cell coordinates to pixel coordinates (assuming 10x20 cell size for now)
+    push_decimal(out, u32::from(r.col) * 10 + 1);
+    push(out, b';');
+    push_decimal(out, u32::from(r.row) * 20 + 1);
     push(out, if r.release { b'm' } else { b'M' });
 }
 

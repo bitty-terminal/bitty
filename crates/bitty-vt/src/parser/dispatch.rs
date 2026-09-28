@@ -128,6 +128,9 @@ impl<F: FnMut(TerminalAction)> Bridge<'_, F> {
             1015 => Some(Mode::MouseCoordinateEncoding(
                 MouseCoordinateEncoding::Urxvt,
             )),
+            1016 => Some(Mode::MouseCoordinateEncoding(
+                MouseCoordinateEncoding::SgrPixels,
+            )),
             2004 => Some(Mode::BracketedPaste),
             2026 => Some(Mode::SynchronizedUpdate),
             7727 => {

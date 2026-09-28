@@ -171,7 +171,11 @@ fn golden_paste_banner_full_then_flash_then_idle() {
         "banner must still be in the full phase"
     );
     assert_digest("paste_full", &rt, &full, 0xb5e8_4cca_54ec_82ad);
-    let flash_at = t0 + PASTE_BANNER_FULL_DURATION + Duration::from_secs(30);
+    // Issue #1438 (CTX-0843): the paste-confirm timeout (default 30s) is
+    // shorter than PASTE_BANNER_FULL_DURATION + 30s, so the timer cancels
+    // the pending paste first. Test the collapse at full-duration + 1s
+    // (inside the 30s confirm window, past the 4s banner phase).
+    let flash_at = t0 + PASTE_BANNER_FULL_DURATION + Duration::from_secs(1);
     let flash = rt.tick_at(flash_at).expect("collapse transition presents");
     assert_eq!(
         rt.paste_banner_collapsed_at(flash_at),

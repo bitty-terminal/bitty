@@ -18,12 +18,13 @@ dir = "target/nextest"
 # run them explicitly with `cargo test --test ...`, so exclude them here.
 default-filter = 'not binary(headless_run) and not binary(winit_window)'
 fail-fast = false
+# A stuck test fails the run at 60s and is killed after three slow periods.
+# In the default profile too, so a local `just test` (which runs this profile)
+# is bounded exactly like CI and a wedged PTY assertion cannot hang forever.
+slow-timeout = { period = "60s", terminate-after = 3 }
 
 [profile.ci]
 inherits = "default"
-# A stuck test fails the run at 60s and is killed after three slow periods,
-# so a wedged PTY assertion cannot burn the 30-minute job budget.
-slow-timeout = { period = "60s", terminate-after = 3 }
 
 # Real-process suites (bitty-pty and the runtime integration harnesses that
 # spawn shells) poll bounded process/kernel state. On a 2-3 core shared runner

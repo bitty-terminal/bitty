@@ -128,6 +128,14 @@ jobs:
       - name: Run harness=false platform entry points
         run: cargo test -p bitty-platform --test headless_run --test winit_window --locked
 
+      # CTX-0847: the previous `cargo test --all-targets` also executed the
+      # bitty-perf benches and the bitty-ipc example; nextest runs neither, so
+      # keep that coverage explicitly here.
+      - name: Run benches and examples
+        run: |
+          cargo test -p bitty-perf --benches --locked
+          cargo test -p bitty-ipc --examples --locked
+
       # M1-10 / CTX-0574: pin the M1 matrix driver's reporting logic (suite
       # floors, ignored-test rejection, aggregate failure modes, step summary)
       # without running the real suites here; the four Tier 1 platform legs and
@@ -313,6 +321,15 @@ jobs:
       - name: Run harness=false platform entry points (X11)
         run: xvfb-run -a cargo test -p bitty-platform --test headless_run --test winit_window --locked
 
+      # CTX-0847: the previous `--all-targets` run also executed the bitty-perf
+      # benches and the bitty-ipc example; nextest runs neither, so keep that
+      # coverage explicitly here (headless, opt-in benches exit 0 with
+      # UNMEASURED without their BITTY_PERF_* env gates).
+      - name: Run benches and examples (X11)
+        run: |
+          cargo test -p bitty-perf --benches --locked
+          cargo test -p bitty-ipc --examples --locked
+
       # M1-10 / CTX-0574: run the M1 evidence suites by name so a
       # per-platform regression is a distinct, reported result instead of
       # being buried in the blanket test run above. The suites are headless
@@ -427,6 +444,14 @@ jobs:
       - name: Run harness=false platform entry points (Wayland)
         run: cargo test -p bitty-platform --test headless_run --test winit_window --locked
 
+      # CTX-0847: the previous `--all-targets` run also executed the bitty-perf
+      # benches and the bitty-ipc example; nextest runs neither, so keep that
+      # coverage explicitly here.
+      - name: Run benches and examples (Wayland)
+        run: |
+          cargo test -p bitty-perf --benches --locked
+          cargo test -p bitty-ipc --examples --locked
+
       # M1-10 / CTX-0574: Wayland leg of the M1 compatibility matrix. The M1
       # suites are display-independent; the Wayland env above only proves the
       # workspace still builds and tests on the Wayland path.
@@ -514,6 +539,14 @@ jobs:
 
       - name: Run harness=false platform entry points (macOS ARM64)
         run: cargo test -p bitty-platform --test headless_run --test winit_window --locked
+
+      # CTX-0847: the previous `--all-targets` run also executed the bitty-perf
+      # benches and the bitty-ipc example; nextest runs neither, so keep that
+      # coverage explicitly here.
+      - name: Run benches and examples (macOS ARM64)
+        run: |
+          cargo test -p bitty-perf --benches --locked
+          cargo test -p bitty-ipc --examples --locked
 
       # M1-10 / CTX-0574: macOS ARM64 leg of the M1 compatibility matrix. The
       # suites are headless and free of window/font/GPU dependencies, so the

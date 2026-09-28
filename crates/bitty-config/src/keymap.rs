@@ -41,7 +41,8 @@
 //!   shell typing; named keys (including `tab`) may be unmodified by explicit
 //!   user choice.
 //! - `action`: one of `goto_split:<left|right|up|down>`,
-//!   `new_split:<left|right|up|down>`, `resize_split:<left|right|up|down>`,
+//!   `new_split:<left|right|up|down>`, `new_panel`,
+//!   `resize_split:<left|right|up|down>`,
 //!   `close_view` (alias `close_surface`), `toggle_zoom` (alias
 //!   `toggle_split_zoom`), `focus_next`, `focus_prev`, `focus:<1..=256>`,
 //!   `copy_to_clipboard`, `paste_from_clipboard`,
@@ -89,7 +90,9 @@
 //! workspace entry (CTX-0257, rechorded CTX-0766): `alt+t` new workspace,
 //! `alt+1..=9` jump to
 //! workspace N, `alt+-`/`alt+=` prev/next, `alt+tab` last-used, `alt+d`
-//! close pane with confirm, `alt+w` close workspace with kill-confirm.
+//! close pane with confirm, `alt+w` close workspace with kill-confirm,
+//! plus the Hyprland-style panel entry (CTX-0838 #1441): `alt+n`
+//! `new_panel` (adaptive dwindle axis, new-second, focus follows).
 //! `alt+w` and `alt+1..=9` previously drove pane ops (`close_view`,
 //! `focus:<n>`); those actions stay parseable and user-bindable but are
 //! no longer bound by default — workspace numbers won the Alt slot per
@@ -626,6 +629,18 @@ pub enum ChromeAction {
     GotoSplit(SplitDir),
     /// Split the focused pane (`new_split:right`, ...).
     NewSplit(SplitDir),
+    /// Open a new panel with Hyprland-dwindle semantics (`new_panel`).
+    ///
+    /// CTX-0838 (#1441): the Mod+N owner default. Split axis follows the
+    /// focused leaf's cell allocation via the `smart_split_axis` heuristic
+    /// (wide splits side-by-side, tall stacks, square ties break
+    /// side-by-side), mirroring Hyprland's
+    /// `splitTop = height * split_width_multiplier > width` at the default
+    /// multiplier `1.0`. Placement is always new-second (right/below) and
+    /// focus follows the fresh pane. Explicit `new_split:<dir>` keeps its
+    /// fixed axis for directional splits; Niri-ribbon ordering is out of
+    /// scope.
+    NewPanel,
     /// Nudge the enclosing split ratio (`resize_split:left`, ...).
     ResizeSplit(SplitDir),
     /// Close the focused pane (`close_view`, alias `close_surface`).
@@ -823,6 +838,10 @@ impl ChromeAction {
                 let dir = require_dir_arg(arg, trimmed)?;
                 Ok(Self::NewSplit(dir))
             }
+            "new_panel" => {
+                reject_arg(arg, trimmed)?;
+                Ok(Self::NewPanel)
+            }
             "resize_split" => {
                 let dir = require_dir_arg(arg, trimmed)?;
                 Ok(Self::ResizeSplit(dir))
@@ -964,6 +983,7 @@ impl ChromeAction {
         match self {
             Self::GotoSplit(d) => format!("goto_split:{}", d.canonical()),
             Self::NewSplit(d) => format!("new_split:{}", d.canonical()),
+            Self::NewPanel => "new_panel".to_string(),
             Self::ResizeSplit(d) => format!("resize_split:{}", d.canonical()),
             Self::CloseView => "close_view".to_string(),
             Self::ToggleZoom => "toggle_zoom".to_string(),
@@ -1001,7 +1021,7 @@ impl ChromeAction {
 }
 
 /// Hint listing the accepted action vocabulary.
-const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, resize_split:<left|right|up|down>, close_view, toggle_zoom, toggle_help, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, fold_toggle, fold_expand, fold_collapse, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_focus:<1..=16>, workspace_move:<1..=16>, enter_copy_mode, open_search, search_next, search_prev, close_search, search_toggle_case, toggle_palette";
+const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, new_panel, resize_split:<left|right|up|down>, close_view, toggle_zoom, toggle_help, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, fold_toggle, fold_expand, fold_collapse, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_focus:<1..=16>, workspace_move:<1..=16>, enter_copy_mode, open_search, search_next, search_prev, close_search, search_toggle_case, toggle_palette";
 
 /// Require a `<head>:<dir>` argument.
 fn require_dir_arg(arg: Option<&str>, raw: &str) -> Result<SplitDir, ConfigError> {
@@ -1284,10 +1304,13 @@ pub const DEFAULT_KEYMAPS: &[(&str, &str)] = &[
     ("ctrl+shift+c", "copy_to_clipboard"),
     ("ctrl+shift+v", "paste_from_clipboard"),
     ("alt+z", "toggle_zoom"),
-    // Owner default: `alt+n` opens a new panel (Niri-style: new column to
-    // the right of the focused leaf; the tiling layout places it), `alt+t`
-    // opens a fresh workspace (CTX-0766).
-    ("alt+n", "new_split:right"),
+    // Owner default: `alt+n` opens a new panel with Hyprland-dwindle
+    // semantics (CTX-0838 #1441: adaptive axis from the focused leaf's
+    // allocation — wide splits side-by-side, tall stacks, square ties break
+    // side-by-side; new panel goes right/below, focus follows it).
+    // Explicit `new_split:<dir>` keeps its fixed axis for directional
+    // splits. `alt+t` opens a fresh workspace (CTX-0766).
+    ("alt+n", "new_panel"),
     ("alt+t", "workspace_new"),
     ("alt+-", "workspace_prev"),
     ("alt+=", "workspace_next"),
@@ -1851,7 +1874,7 @@ mod tests {
         );
         assert_eq!(
             match_keymap(&maps, key_ref_super(KeyName::Char('n'), false, false)),
-            Some(ChromeAction::NewSplit(SplitDir::Right))
+            Some(ChromeAction::NewPanel)
         );
         assert_eq!(
             match_keymap(&maps, key_ref_super(KeyName::Char('m'), false, false)),
@@ -2007,6 +2030,11 @@ mod tests {
             ChromeAction::parse("new_split:down").expect("new"),
             ChromeAction::NewSplit(SplitDir::Down)
         );
+        assert_eq!(
+            ChromeAction::parse("new_panel").expect("new panel"),
+            ChromeAction::NewPanel
+        );
+        assert_eq!(ChromeAction::NewPanel.canonical(), "new_panel");
         assert_eq!(
             ChromeAction::parse("resize_split:up").expect("resize"),
             ChromeAction::ResizeSplit(SplitDir::Up)
@@ -2567,10 +2595,11 @@ mod tests {
             Some(ChromeAction::WorkspaceLast),
             "alt+tab is last-used workspace"
         );
-        // CTX-0766: alt+n opens a new panel to the right (Niri-style).
+        // CTX-0838 (#1441): alt+n opens a new panel with Hyprland-dwindle
+        // semantics (adaptive axis, new-second, focus follows).
         assert_eq!(
             match_keymap(&maps, key_ref(KeyName::Char('n'), false, true, false)),
-            Some(ChromeAction::NewSplit(SplitDir::Right)),
+            Some(ChromeAction::NewPanel),
             "alt+n is new panel"
         );
         // All single-character defaults require a modifier (typing safety).
@@ -2839,7 +2868,7 @@ mod tests {
         }
         assert_eq!(
             match_keymap(&maps, key_ref_super(KeyName::Char('n'), false, false)),
-            Some(ChromeAction::NewSplit(SplitDir::Right))
+            Some(ChromeAction::NewPanel)
         );
         // CTX-0766: new-workspace moved super+n -> super+t.
         assert_eq!(

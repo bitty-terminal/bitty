@@ -825,6 +825,72 @@ impl TerminalApp {
         }
     }
 
+    /// Shared new-leaf creation for `new_split:<dir>` and `new_panel`
+    /// (CTX-0838 #1441).
+    ///
+    /// Fail-closed, headless-testable: no focused pane warns and keeps the
+    /// layout; a refused appearance keeps the layout; a missing focused leaf
+    /// in the tree warns and keeps the layout. On success the fresh leaf gets
+    /// a best-effort shell, focus follows it (Hyprland/kitty/ghostty parity),
+    /// and `label` names the action in the loud log line.
+    fn apply_new_leaf(&mut self, axis: SplitAxis, place_new_first: bool, label: &str) {
+        self.restore_zoom();
+        let focused = match self.runtime.focused_view() {
+            Some(id) => id,
+            None => {
+                eprintln!("warning: keymap {label} has no focused pane — ignoring");
+                return;
+            }
+        };
+        let mut layout = self.runtime.layout().clone();
+        // CTX-0378: the id comes from the runtime-wide allocator
+        // (every slot + the live layout), never this layout's max + 1:
+        // `pane_sessions` is keyed globally by `ViewId`, so a local
+        // scan would alias another workspace's shell and the spawn
+        // below would replace its session.
+        let new_id = self.runtime.next_view_id_global();
+        // CTX-0343 first match: a previously inert `ws:`/`view:`
+        // selector can match the fresh `View`; fail the creation
+        // closed before the layout commits it.
+        if let Err(err) = self.runtime.validate_new_view_appearance(new_id) {
+            eprintln!("warning: keymap {label} refused: {err}");
+            return;
+        }
+        if split_focused_leaf(&mut layout, focused, axis, new_id, place_new_first) {
+            self.runtime.set_layout(layout);
+            // CTX-0176: the fresh leaf gets its own shell/PTY sized
+            // to its allocation — best-effort (startup parity). On
+            // failure the pane stays empty (CTX-0359: it never
+            // paints or feeds the primary grid) with a loud warning.
+            let (cols, rows) = self
+                .runtime
+                .layout_allocations()
+                .iter()
+                .find(|(id, _)| *id == new_id)
+                .map(|(_, r)| (r.width.max(1), r.height.max(1)))
+                .unwrap_or((80, 24));
+            let spawn_result =
+                spawn_pane_shell(&mut self.runtime, &self.spawn_spec, new_id, cols, rows);
+            // CTX-0364: focus follows the fresh pane (kitty/ghostty
+            // parity). Set after the spawn so CTX-0357 cwd
+            // inheritance still reads the source pane as focused.
+            self.runtime.set_focus(new_id);
+            match spawn_result {
+                Ok(()) => eprintln!(
+                    "bitty: keymap {label} -> leafs={} focused={:?} pane_shell={new_id:?} pid={:?}",
+                    self.runtime.leaf_count(),
+                    self.runtime.focused_view(),
+                    self.runtime.pane_pid(&new_id),
+                ),
+                Err(err) => eprintln!(
+                    "warning: keymap {label} pane shell spawn failed ({err}) — pane {new_id:?} stays empty",
+                ),
+            }
+        } else {
+            eprintln!("warning: keymap {label} found no focused pane — ignoring");
+        }
+    }
+
     /// Execute one bound chrome action (single owner: the PTY never sees the
     /// chord). All mutations go through existing `Runtime`/`LayoutNode` APIs;
     /// refusals warn and keep the current layout.
@@ -921,73 +987,29 @@ impl TerminalApp {
                 );
             }
             A::NewSplit(dir) => {
-                self.restore_zoom();
-                let focused = match self.runtime.focused_view() {
-                    Some(id) => id,
-                    None => {
-                        eprintln!("warning: keymap new_split has no focused pane — ignoring");
-                        return;
-                    }
-                };
-                let mut layout = self.runtime.layout().clone();
-                // CTX-0378: the id comes from the runtime-wide allocator
-                // (every slot + the live layout), never this layout's max + 1:
-                // `pane_sessions` is keyed globally by `ViewId`, so a local
-                // scan would alias another workspace's shell and the spawn
-                // below would replace its session.
-                let new_id = self.runtime.next_view_id_global();
                 let place_new_first = matches!(
                     dir,
                     bitty_config::SplitDir::Left | bitty_config::SplitDir::Up
                 );
-                // CTX-0343 first match: a previously inert `ws:`/`view:`
-                // selector can match the fresh `View`; fail the creation
-                // closed before the layout commits it.
-                if let Err(err) = self.runtime.validate_new_view_appearance(new_id) {
-                    eprintln!("warning: keymap new_split refused: {err}");
-                    return;
-                }
-                if split_focused_leaf(
-                    &mut layout,
-                    focused,
-                    split_dir_to_axis(dir),
-                    new_id,
-                    place_new_first,
-                ) {
-                    self.runtime.set_layout(layout);
-                    // CTX-0176: the fresh leaf gets its own shell/PTY sized
-                    // to its allocation — best-effort (startup parity). On
-                    // failure the pane stays empty (CTX-0359: it never
-                    // paints or feeds the primary grid) with a loud warning.
-                    let (cols, rows) = self
-                        .runtime
-                        .layout_allocations()
-                        .iter()
-                        .find(|(id, _)| *id == new_id)
-                        .map(|(_, r)| (r.width.max(1), r.height.max(1)))
-                        .unwrap_or((80, 24));
-                    let spawn_result =
-                        spawn_pane_shell(&mut self.runtime, &self.spawn_spec, new_id, cols, rows);
-                    // CTX-0364: focus follows the fresh pane (kitty/ghostty
-                    // parity). Set after the spawn so CTX-0357 cwd
-                    // inheritance still reads the source pane as focused.
-                    self.runtime.set_focus(new_id);
-                    match spawn_result {
-                        Ok(()) => eprintln!(
-                            "bitty: keymap new_split:{} -> leafs={} focused={:?} pane_shell={new_id:?} pid={:?}",
-                            dir.canonical(),
-                            self.runtime.leaf_count(),
-                            self.runtime.focused_view(),
-                            self.runtime.pane_pid(&new_id),
-                        ),
-                        Err(err) => eprintln!(
-                            "warning: keymap new_split:{} pane shell spawn failed ({err}) — pane {new_id:?} stays empty",
-                            dir.canonical(),
-                        ),
+                let label = format!("new_split:{}", dir.canonical());
+                self.apply_new_leaf(split_dir_to_axis(dir), place_new_first, &label);
+            }
+            A::NewPanel => {
+                // CTX-0838 (#1441): Hyprland-dwindle panel creation. Axis
+                // follows the focused leaf's cell allocation (wide splits
+                // side-by-side, tall stacks, square ties break side-by-side);
+                // placement is always new-second (right/below) and focus
+                // follows the fresh pane. Explicit `new_split:<dir>` above
+                // keeps its fixed axis for directional splits.
+                let focused = match self.runtime.focused_view() {
+                    Some(id) => id,
+                    None => {
+                        eprintln!("warning: keymap new_panel has no focused pane — ignoring");
+                        return;
                     }
-                } else {
-                    eprintln!("warning: keymap new_split found no focused pane — ignoring");
-                }
+                };
+                let axis = self.runtime.panel_split_axis(focused);
+                self.apply_new_leaf(axis, false, "new_panel");
             }
             A::CloseView => {
                 let focused = match self.runtime.focused_view() {
@@ -2164,11 +2186,11 @@ mod tests {
         );
         // CTX-0257 DEC entry set: new/close/prev/next/last
         // (CTX-0766: new-workspace moved alt+n -> alt+t; alt+n is new panel).
+        // CTX-0838 (#1441): alt+n is Hyprland-style `new_panel` (adaptive
+        // axis), not fixed `new_split:right`.
         assert_eq!(
             match_keymap(&maps, shell(KeyName::Char('n'), false, true, false)),
-            Some(bitty_config::ChromeAction::NewSplit(
-                bitty_config::SplitDir::Right
-            ))
+            Some(bitty_config::ChromeAction::NewPanel)
         );
         assert_eq!(
             match_keymap(&maps, shell(KeyName::Char('t'), false, true, false)),
@@ -2980,6 +3002,79 @@ mod tests {
             Some(ViewId::new(3)),
             "new_split must focus the fresh pane v:3"
         );
+    }
+
+    #[test]
+    fn chrome_new_panel_wide_splits_side_by_side_new_second_focus_follows() {
+        // CTX-0838 (#1441): Mod+N `new_panel` uses Hyprland-dwindle axis.
+        // Default headless container is wide, so the split is side-by-side
+        // (Horizontal), the new panel goes second (right), focus follows it.
+        use bitty_config::ChromeAction;
+        let mut app = workspace_test_app();
+        let focused_before = app.runtime.focused_view().expect("seed focus");
+        app.apply_chrome_action(ChromeAction::NewPanel);
+        assert_eq!(app.runtime.leaf_count(), 2);
+        let focused_after = app.runtime.focused_view().expect("focus follows");
+        assert_ne!(
+            focused_before, focused_after,
+            "focus must move to the fresh pane"
+        );
+        match app.runtime.layout() {
+            LayoutNode::Split {
+                axis,
+                first,
+                second,
+                ..
+            } => {
+                assert_eq!(*axis, SplitAxis::Horizontal, "wide must split side-by-side");
+                assert!(
+                    matches!(first.as_ref(), LayoutNode::Leaf(v) if v.id() == focused_before),
+                    "focused leaf stays first (left)"
+                );
+                assert!(
+                    matches!(second.as_ref(), LayoutNode::Leaf(v) if v.id() == focused_after),
+                    "fresh panel goes second (right)"
+                );
+            }
+            other => panic!("single leaf new_panel must split, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chrome_new_panel_tall_stacks_new_below_focus_follows() {
+        // CTX-0838 (#1441): a tall focused leaf stacks (Vertical), new panel
+        // goes second (below), focus follows it.
+        use bitty_config::ChromeAction;
+        let mut app = workspace_test_app();
+        app.runtime
+            .set_container(bitty_runtime::UiRect::new(0, 0, 24, 80));
+        let focused_before = app.runtime.focused_view().expect("seed focus");
+        app.apply_chrome_action(ChromeAction::NewPanel);
+        assert_eq!(app.runtime.leaf_count(), 2);
+        let focused_after = app.runtime.focused_view().expect("focus follows");
+        assert_ne!(
+            focused_before, focused_after,
+            "focus must move to the fresh pane"
+        );
+        match app.runtime.layout() {
+            LayoutNode::Split {
+                axis,
+                first,
+                second,
+                ..
+            } => {
+                assert_eq!(*axis, SplitAxis::Vertical, "tall must stack");
+                assert!(
+                    matches!(first.as_ref(), LayoutNode::Leaf(v) if v.id() == focused_before),
+                    "focused leaf stays first (top)"
+                );
+                assert!(
+                    matches!(second.as_ref(), LayoutNode::Leaf(v) if v.id() == focused_after),
+                    "fresh panel goes second (below)"
+                );
+            }
+            other => panic!("single leaf new_panel must split, got {other:?}"),
+        }
     }
 
     #[test]

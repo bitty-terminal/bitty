@@ -94,6 +94,7 @@ pub mod image;
 pub mod kitty;
 pub mod kitty_decode;
 pub mod kitty_place;
+pub mod kitty_unicode;
 pub mod loader;
 pub mod presentation;
 pub mod projection;
@@ -153,6 +154,9 @@ pub use kitty_place::{
     KittyImageId, KittyImageLayer, KittyPlacedImage, KittyPlacement, KittyPlacementError,
     KittyPlacementId, KittyRasterCache, KittyRasterKey, KittyRasterStats, placement_full_rect_for,
     placement_rect_for, rasterize, rasterize_clipped, viewport_extent,
+};
+pub use kitty_unicode::{
+    KittyUnicodeRect, KittyUnicodeVirtual, unicode_run_rect, virtual_extent_cells,
 };
 pub use loader::{MAX_PATH_LEN, MAX_ROOTS, ResourceError, ResourcePolicy, validate_resource_path};
 pub use projection::{ProjectedBlock, ProjectionError, project_fragments};

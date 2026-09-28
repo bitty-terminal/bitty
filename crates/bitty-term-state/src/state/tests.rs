@@ -1579,3 +1579,242 @@ fn ctx_0829_width_one_reflow_preserves_wide_char_leads() {
     // Invariants must hold
     state.check_invariants().unwrap();
 }
+
+fn set_fg(state: &mut State, color: Color) {
+    state.apply(&TerminalAction::SetAttributes {
+        attrs: AttributeDiff {
+            changes: vec![AttributeChange::Foreground(color)].into_boxed_slice(),
+        },
+    });
+}
+
+fn set_underline(state: &mut State, color: Color) {
+    state.apply(&TerminalAction::SetAttributes {
+        attrs: AttributeDiff {
+            changes: vec![AttributeChange::UnderlineColor(color)].into_boxed_slice(),
+        },
+    });
+}
+
+#[test]
+fn ctx_0821_placeholder_prints_width_one_with_pen() {
+    // CTX-0821 (issue #1400): U+10EEEE prints as a width-1 cell carrying
+    // the cursor pen (fg names the image id), with diacritics attached.
+    let mut s = State::new();
+    set_fg(&mut s, Color::Indexed(42));
+    prints(&mut s, "\u{10EEEE}\u{0305}\u{0305}");
+    prints(&mut s, "\u{10EEEE}\u{0305}\u{030D}");
+    let snap = s.snapshot();
+    assert_eq!(snap.cells[0].glyph, '\u{10EEEE}');
+    assert_eq!(snap.cells[0].width, 1);
+    assert!(!snap.cells[0].spacer);
+    assert_eq!(snap.cells[0].style.foreground, Some(Color::Indexed(42)));
+    assert_eq!(
+        snap.cells[0].zerowidth.as_slice(),
+        &['\u{0305}', '\u{0305}']
+    );
+    assert_eq!(
+        snap.cells[1].zerowidth.as_slice(),
+        &['\u{0305}', '\u{030D}']
+    );
+    assert_eq!(s.cursor().position.col, 2);
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn ctx_0821_placeholder_run_decodes_tiles() {
+    // A 2-cell run with explicit row/col diacritics decodes to tiles
+    // (0,0)+(0,1) of image 42.
+    let mut s = State::new();
+    set_fg(&mut s, Color::Indexed(42));
+    prints(&mut s, "\u{10EEEE}\u{0305}\u{0305}");
+    prints(&mut s, "\u{10EEEE}\u{0305}\u{030D}");
+    let (cells, key) = s.kitty_unicode_run_at(0, 0).expect("run at origin");
+    assert_eq!(key, (42, None));
+    assert_eq!(cells.len(), 2);
+    assert_eq!((cells[0].id.row, cells[0].id.col), (0, 0));
+    assert_eq!((cells[1].id.row, cells[1].id.col), (0, 1));
+    assert_eq!(cells[0].id.image_id, 42);
+    // Querying the second cell resolves the same run.
+    let (cells2, key2) = s.kitty_unicode_run_at(0, 1).expect("run at col 1");
+    assert_eq!(key2, (42, None));
+    assert_eq!(cells2.len(), 2);
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn ctx_0821_placeholder_bare_continuation_inherits() {
+    // No diacritics: the column advances past the previous cell (kitty
+    // left-to-right inheritance); row-only marks inherit the column.
+    let mut s = State::new();
+    set_fg(&mut s, Color::Indexed(7));
+    prints(&mut s, "\u{10EEEE}\u{0305}\u{0305}");
+    prints(&mut s, "\u{10EEEE}");
+    let (cells, _) = s.kitty_unicode_run_at(0, 0).expect("bare run");
+    assert_eq!(cells.len(), 2);
+    assert_eq!((cells[1].id.row, cells[1].id.col), (0, 1));
+
+    let mut s = State::new();
+    set_fg(&mut s, Color::Indexed(7));
+    prints(&mut s, "\u{10EEEE}\u{0305}\u{0305}");
+    prints(&mut s, "\u{10EEEE}\u{0305}");
+    let (cells, _) = s.kitty_unicode_run_at(0, 0).expect("row-only run");
+    assert_eq!((cells[1].id.row, cells[1].id.col), (0, 1));
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn ctx_0821_placeholder_run_breaks_on_color_change() {
+    // A foreground change starts a new run (different image id).
+    let mut s = State::new();
+    set_fg(&mut s, Color::Indexed(7));
+    prints(&mut s, "\u{10EEEE}\u{0305}\u{0305}");
+    set_fg(&mut s, Color::Indexed(8));
+    prints(&mut s, "\u{10EEEE}\u{0305}\u{030D}");
+    let runs = s.kitty_unicode_runs_on_row(0);
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0].1, (7, None));
+    assert_eq!(runs[1].1, (8, None));
+    assert_eq!(runs[0].0.len(), 1);
+    assert_eq!(runs[1].0.len(), 1);
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn ctx_0821_placeholder_high_byte_and_placement_id() {
+    // Third diacritic carries the image-id high byte (42 + 2<<24, the
+    // kitty spec example); underline color carries the placement id.
+    let mut s = State::new();
+    set_fg(&mut s, Color::Indexed(42));
+    prints(&mut s, "\u{10EEEE}\u{0305}\u{0305}\u{030E}");
+    let (cells, key) = s.kitty_unicode_run_at(0, 0).expect("high-byte run");
+    assert_eq!(cells[0].id.image_id, 42 + (2 << 24));
+    assert_eq!(key, (42 + (2 << 24), None));
+
+    let mut s = State::new();
+    set_fg(&mut s, Color::Indexed(42));
+    set_underline(&mut s, Color::Indexed(21));
+    prints(&mut s, "\u{10EEEE}\u{0305}\u{0305}");
+    let (cells, key) = s.kitty_unicode_run_at(0, 0).expect("placed run");
+    assert_eq!(cells[0].id.placement_id, Some(21));
+    assert_eq!(key, (42, Some(21)));
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn ctx_0821_reservation_neighbors_are_plain_text() {
+    // Only U+10EEEE is the placeholder; U+10EEEF..=U+10EEFF print as
+    // ordinary width-1 glyphs and never start or join a run.
+    let mut s = State::new();
+    prints(&mut s, "\u{10EEEF}\u{10EEFF}A");
+    let snap = s.snapshot();
+    assert_eq!(snap.cells[0].glyph, '\u{10EEEF}');
+    assert_eq!(snap.cells[1].glyph, '\u{10EEFF}');
+    assert!(s.kitty_unicode_run_at(0, 0).is_none());
+    assert!(s.kitty_unicode_runs_on_row(0).is_empty());
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn ctx_0821_placeholder_clear_removes_only_named_runs() {
+    // Delete semantics: clearing image 7 removes its run but keeps the
+    // neighboring image-8 run; unknown ids clear nothing.
+    let mut s = State::new();
+    set_fg(&mut s, Color::Indexed(7));
+    prints(&mut s, "\u{10EEEE}\u{0305}\u{0305}");
+    prints(&mut s, "\u{10EEEE}\u{0305}\u{030D}");
+    set_fg(&mut s, Color::Indexed(8));
+    prints(&mut s, "\u{10EEEE}\u{0305}\u{0305}");
+    assert_eq!(s.kitty_unicode_clear(99, None), 0);
+    assert_eq!(s.kitty_unicode_clear(7, None), 2);
+    let snap = s.snapshot();
+    assert!(snap.cells[0].is_blank());
+    assert!(snap.cells[1].is_blank());
+    assert_eq!(snap.cells[2].glyph, '\u{10EEEE}');
+    assert_eq!(s.kitty_unicode_runs_on_row(0).len(), 1);
+    // Placement-scoped clear: Some(p) keeps runs with other placements.
+    let mut s = State::new();
+    set_fg(&mut s, Color::Indexed(7));
+    set_underline(&mut s, Color::Indexed(1));
+    prints(&mut s, "\u{10EEEE}\u{0305}\u{0305}");
+    set_underline(&mut s, Color::Indexed(2));
+    prints(&mut s, "\u{10EEEE}\u{0305}\u{0305}");
+    assert_eq!(s.kitty_unicode_clear(7, Some(1)), 1);
+    let snap = s.snapshot();
+    assert!(snap.cells[0].is_blank());
+    assert_eq!(snap.cells[1].glyph, '\u{10EEEE}');
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn ctx_0821_placeholder_reflow_moves_cells_with_text() {
+    // Resize reflow keeps placeholder cells deterministic: they travel
+    // with surrounding text through the soft-wrap rewrap (into scrollback
+    // when the grid narrows past them), preserving grid invariants.
+    let mut s = State::new();
+    set_fg(&mut s, Color::Indexed(7));
+    prints(
+        &mut s,
+        "\u{10EEEE}\u{0305}\u{0305}\u{10EEEE}\u{0305}\u{030D}",
+    );
+    for _ in 0..(GRID_COLUMNS - 2) {
+        prints(&mut s, "x");
+    }
+    assert_eq!(s.kitty_unicode_runs_on_row(0).len(), 1);
+    s.resize(40, GRID_ROWS);
+    assert!(s.check_invariants().is_ok());
+    // The 80-col logical line rewraps to two 40-col rows; the run's
+    // cells survive either on the grid or in scrollback.
+    let grid_runs: usize = (0..GRID_ROWS)
+        .map(|r| s.kitty_unicode_runs_on_row(r).len())
+        .sum();
+    let sb_cells = s
+        .scrollback()
+        .flat_map(|line| line.cells.iter())
+        .filter(|c| c.glyph == '\u{10EEEE}')
+        .count();
+    let grid_cells = s
+        .snapshot()
+        .cells
+        .iter()
+        .filter(|c| c.glyph == '\u{10EEEE}')
+        .count();
+    assert_eq!(
+        sb_cells + grid_cells,
+        2,
+        "both placeholder cells survive reflow"
+    );
+    assert!(grid_runs <= 2);
+}
+
+#[test]
+fn ctx_0821_placeholder_erase_and_scroll_drop_deterministically() {
+    // EL Right over a run erases its cells (runs decode empty after);
+    // scrolling the run off the grid moves its bytes into scrollback
+    // (immutable history keeps them; the live grid decodes nothing).
+    let mut s = State::new();
+    set_fg(&mut s, Color::Indexed(7));
+    prints(
+        &mut s,
+        "\u{10EEEE}\u{0305}\u{0305}\u{10EEEE}\u{0305}\u{030D}",
+    );
+    s.apply(&TerminalAction::CursorPosition {
+        row: Row(1),
+        col: Col(1),
+    });
+    s.apply(&TerminalAction::EraseInLine {
+        mode: EraseLineMode::Right,
+    });
+    assert!(s.kitty_unicode_runs_on_row(0).is_empty());
+    assert!(s.check_invariants().is_ok());
+
+    let mut s = State::new();
+    set_fg(&mut s, Color::Indexed(7));
+    prints(&mut s, "\u{10EEEE}\u{0305}\u{0305}");
+    for _ in 0..(GRID_ROWS + 5) {
+        s.apply(&TerminalAction::PrintControl(ControlChar(0x0A)));
+    }
+    assert!(s.scrollback_len() > 0);
+    assert!(s.kitty_unicode_runs_on_row(GRID_ROWS - 1).is_empty());
+    assert!(s.check_invariants().is_ok());
+}

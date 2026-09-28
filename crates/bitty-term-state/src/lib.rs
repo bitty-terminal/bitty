@@ -71,6 +71,7 @@ pub mod damage;
 pub mod grapheme;
 mod grid;
 pub mod image;
+pub mod kitty_unicode;
 pub mod modes;
 pub mod replies;
 pub mod scrollback;
@@ -104,6 +105,12 @@ pub use grapheme::{
 };
 pub use image::{
     IMAGE_STORE_MAX_ENTRIES, IMAGE_STORE_MAX_PAYLOAD_BYTES, ImageId, ImagePlaceholder, ImageStore,
+};
+pub use kitty_unicode::{
+    KITTY_PLACEHOLDER, KITTY_PLACEHOLDER_RANGE_END, KITTY_PLACEHOLDER_RANGE_START, KittyRunBuilder,
+    KittyUnicodeCell, KittyUnicodeId, KittyUnicodePrev, KittyUnicodeRun, KittyUnicodeRunCells,
+    color_id_fragment, decode_cell, decode_cell_with_prev, decode_marks, diacritic_index,
+    is_kitty_placeholder, kitty_image_id, kitty_placement_id, run_key,
 };
 pub use modes::Modes;
 pub use replies::{REPLY_CAP_BYTES, Replies};

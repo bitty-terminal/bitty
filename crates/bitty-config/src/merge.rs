@@ -4411,6 +4411,7 @@ mod tests {
                     opacity: 1.0,
                     padding: 8,
                     radius_px: 12,
+                    blur_radius: 0,
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -4429,6 +4430,7 @@ mod tests {
                     opacity: 1.0,
                     padding: 8,
                     radius_px: 6,
+                    blur_radius: 0,
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -4441,6 +4443,7 @@ mod tests {
                     opacity: 1.0,
                     padding: 8,
                     radius_px: 12,
+                    blur_radius: 0,
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()

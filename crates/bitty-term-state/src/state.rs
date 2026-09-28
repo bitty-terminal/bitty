@@ -1281,6 +1281,11 @@ impl State {
         if ch == '\0' {
             return;
         }
+        // CTX-0822: Kitty Unicode placeholders U+10EEEE-U+10EEFF reserved for image placements
+        if matches!(ch as u32, 0x10EEEE..=0x10EEFF) {
+            // Placeholder detected: store as regular cell for now, full integration deferred
+            // to Kitty rendering epic (image store linkage, sizing, z-index)
+        }
         let glyph_width = char_cell_width(ch);
         if glyph_width == 0 {
             // CR-TERM-01: zero-width scalars (combining marks, ZWJ,
@@ -2345,11 +2350,20 @@ fn rewrap_one_logical(logical: &[Cell], new_cols: usize, erase: &Style) -> Vec<(
                 flush_row(&mut cur, &mut used, true);
             }
         }
-        cur.push(*lead);
-        used += 1;
-        if w == 2 {
-            cur.push(Cell::wide_spacer(lead.style));
+        // Width-one bounded representation (CTX-0829): when new_cols == 1,
+        // a width=2 char cannot fit with its spacer. Emit the lead as width=1.
+        if w == 2 && new_cols == 1 {
+            let mut narrow = *lead;
+            narrow.width = 1;
+            cur.push(narrow);
             used += 1;
+        } else {
+            cur.push(*lead);
+            used += 1;
+            if w == 2 {
+                cur.push(Cell::wide_spacer(lead.style));
+                used += 1;
+            }
         }
     }
     flush_row(&mut cur, &mut used, false);

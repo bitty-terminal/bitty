@@ -378,6 +378,8 @@ pub enum MouseCoordinateEncoding {
     Utf8,
     /// SGR decimal encoding (`?1006`).
     Sgr,
+    /// SGR-Pixels decimal pixel coordinates (`?1016`).
+    SgrPixels,
     /// Urxvt decimal encoding (`?1015`).
     Urxvt,
 }
@@ -443,25 +445,27 @@ pub struct Hyperlink {
     pub uri: BoundedString,
 }
 
-/// Which default color an `OSC 10`/`OSC 11` operation addresses (CTX-0381).
+/// Which default color an `OSC 10`/`OSC 11`/`OSC 12` operation addresses (CTX-0381, CTX-0820).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DynamicColorTarget {
     /// `OSC 10`: the default foreground color.
     Foreground,
     /// `OSC 11`: the default background color.
     Background,
+    /// `OSC 12`: the cursor color (CTX-0820).
+    Cursor,
 }
 
-/// Operation carried by an `OSC 10`/`OSC 11` sequence (CTX-0381).
+/// Operation carried by an `OSC 10`/`OSC 11`/`OSC 12` sequence (CTX-0381, CTX-0820).
 ///
 /// The parser only classifies and bounds the payload. Answering queries and
 /// gating sets belong to the runtime, which owns the active theme palette
 /// and the set capability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DynamicColorOp {
-    /// `OSC 10;?` / `OSC 11;?`: report the active color.
+    /// `OSC 10;?` / `OSC 11;?` / `OSC 12;?`: report the active color.
     Query,
-    /// `OSC 10;<color>` / `OSC 11;<color>`: parsed set value.
+    /// `OSC 10;<color>` / `OSC 11;<color>` / `OSC 12;<color>`: parsed set value.
     Set(Rgb),
 }
 
@@ -876,6 +880,8 @@ pub enum TerminalAction {
         cols_c: u16,
         /// Wire `r=` explicit cell rows (`0` derives from pixels).
         rows_r: u16,
+        /// Wire `C=` cursor movement flag (`0` moves cursor, `1` keeps it).
+        cursor_movement_c: u8,
         /// Base64-decoded payload bytes (assembled across `m=` chunks).
         payload: Box<[u8]>,
     },

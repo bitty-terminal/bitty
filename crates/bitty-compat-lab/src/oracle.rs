@@ -1076,6 +1076,7 @@ fn mouse_encoding(encoding: Option<MouseCoordinateEncoding>) -> String {
         Some(MouseCoordinateEncoding::Utf8) => "utf8".to_string(),
         Some(MouseCoordinateEncoding::Sgr) => "sgr".to_string(),
         Some(MouseCoordinateEncoding::Urxvt) => "urxvt".to_string(),
+        Some(MouseCoordinateEncoding::SgrPixels) => "sgr-pixels".to_string(),
     }
 }
 
@@ -1161,6 +1162,7 @@ pub fn canonical_action(action: &TerminalAction) -> String {
             let target = match target {
                 DynamicColorTarget::Foreground => "fg",
                 DynamicColorTarget::Background => "bg",
+                DynamicColorTarget::Cursor => "cursor",
             };
             let op = match op {
                 DynamicColorOp::Query => "query".to_string(),

@@ -128,6 +128,9 @@ impl<F: FnMut(TerminalAction)> Bridge<'_, F> {
             1015 => Some(Mode::MouseCoordinateEncoding(
                 MouseCoordinateEncoding::Urxvt,
             )),
+            1016 => Some(Mode::MouseCoordinateEncoding(
+                MouseCoordinateEncoding::SgrPixels,
+            )),
             2004 => Some(Mode::BracketedPaste),
             2026 => Some(Mode::SynchronizedUpdate),
             7727 => {
@@ -784,11 +787,12 @@ impl<F: FnMut(TerminalAction)> Perform for Bridge<'_, F> {
                     text: BoundedString::new(text),
                 });
             }
-            10 | 11 => {
-                let target = if id == 10 {
-                    DynamicColorTarget::Foreground
-                } else {
-                    DynamicColorTarget::Background
+            10..=12 => {
+                let target = match id {
+                    10 => DynamicColorTarget::Foreground,
+                    11 => DynamicColorTarget::Background,
+                    12 => DynamicColorTarget::Cursor,
+                    _ => unreachable!(),
                 };
                 match parse_dynamic_color(rest) {
                     Some(op) => self.emit(TerminalAction::OscDynamicColor { target, op }),

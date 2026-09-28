@@ -2345,11 +2345,20 @@ fn rewrap_one_logical(logical: &[Cell], new_cols: usize, erase: &Style) -> Vec<(
                 flush_row(&mut cur, &mut used, true);
             }
         }
-        cur.push(*lead);
-        used += 1;
-        if w == 2 {
-            cur.push(Cell::wide_spacer(lead.style));
+        // Width-one bounded representation (CTX-0829): when new_cols == 1,
+        // a width=2 char cannot fit with its spacer. Emit the lead as width=1.
+        if w == 2 && new_cols == 1 {
+            let mut narrow = *lead;
+            narrow.width = 1;
+            cur.push(narrow);
             used += 1;
+        } else {
+            cur.push(*lead);
+            used += 1;
+            if w == 2 {
+                cur.push(Cell::wide_spacer(lead.style));
+                used += 1;
+            }
         }
     }
     flush_row(&mut cur, &mut used, false);

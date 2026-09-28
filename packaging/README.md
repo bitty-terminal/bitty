@@ -134,14 +134,16 @@ There is no crates.io install path for the binary. `bitty-app` is
 unrelated project. The supported cargo path builds from the Git repository:
 
 ```sh
-cargo install --git https://github.com/bitty-terminal/bitty.git bitty-app --locked
+cargo +1.98.1 install --git https://github.com/bitty-terminal/bitty.git bitty-app --locked
 ```
 
-This installs the executable `bitty` (crate `bitty-app`, binary `bitty`). It
-requires the pinned Rust toolchain and builds the workspace from source; pass
-`--force` to overwrite an existing install. No release artifact, checksum, or
-install-smoke leg covers this path — it is a convenience source install, not a
-packaged one.
+This installs the executable `bitty` (crate `bitty-app`, binary `bitty`) and
+builds the workspace from source. Pin the toolchain with `+1.98.1` (rustup
+installs it on demand): `cargo install --git` runs from your current directory
+and does not read the repository's `rust-toolchain.toml`, so the pinned channel
+must be selected explicitly. Pass `--force` to overwrite an existing install.
+No release artifact, checksum, or install-smoke leg covers this path — it is a
+convenience source install, not a packaged one.
 
 ## Homebrew
 

@@ -113,15 +113,18 @@ API.
 you can skip the manual clone and build above:
 
 ```sh
-cargo install --git https://github.com/bitty-terminal/bitty.git bitty-app --locked
+cargo +1.98.1 install --git https://github.com/bitty-terminal/bitty.git bitty-app --locked
 ```
 
 The installed executable is `bitty`. This is a **git source install**, not a
 crates.io install: the binary crate is `bitty-app` and it is `publish = false`,
 so `cargo install bitty-app` from the registry would fail. Plain
 `cargo install bitty` is also impossible — the `bitty` name on crates.io is an
-unrelated project. Pass `--locked` to build the pinned dependency set, and
-`--force` to overwrite an existing install.
+unrelated project. Pin the toolchain with `+1.98.1` (rustup installs it on
+demand): unlike an in-tree build, `cargo install --git` runs from your current
+directory and does **not** read the repository's `rust-toolchain.toml`, so the
+pinned channel must be selected explicitly. Pass `--locked` to build the pinned
+dependency set, and `--force` to overwrite an existing install.
 
 ### Other packaging
 

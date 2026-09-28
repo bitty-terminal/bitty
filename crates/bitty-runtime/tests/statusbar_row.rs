@@ -93,7 +93,6 @@ fn press() -> bitty_platform::MouseEvent {
 fn bar_row_drawn_by_default_and_truth_untouched() {
     let mut rt = Runtime::with_defaults().expect("default runtime builds");
     rt.workspace_new().expect("ws2 for bar");
-    rt.workspace_new().expect("ws2 for bar");
     let stats = rt.tick().expect("first frame must present");
     assert!(stats.glyphs > 0, "bar glyphs must reach the frame");
     assert_eq!(
@@ -151,7 +150,6 @@ fn quiet_workspace_switch_still_presents_the_new_bar() {
 #[test]
 fn alt_screen_owns_every_row() {
     let mut rt = Runtime::with_defaults().expect("default runtime builds");
-    rt.workspace_new().expect("ws2 for bar");
     rt.workspace_new().expect("ws2 for bar");
     let _ = rt.tick();
     assert!(last_row_painted(&rt), "bar paints before alt screen");

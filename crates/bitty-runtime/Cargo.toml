@@ -31,6 +31,11 @@ bitty-package = { path = "../bitty-package" }
 # placement rects through the rich layer (moved from dev-dependencies;
 # same workspace crate, no new supply-chain surface).
 bitty-rich = { path = "../bitty-rich" }
+# CTX-0846: the plugin runtime owns the optional shared network runtime and
+# registers the `bitty.network` module per capability-granted plugin VM. Same
+# external pin as `bitty-lua`/`bitty-plugin-host` (rev d97c5da); do not bump
+# here independently.
+bitty-network-lua = { git = "https://github.com/bitty-terminal/bitty-network", rev = "d97c5da" }
 
 
 [dev-dependencies]

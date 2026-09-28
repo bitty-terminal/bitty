@@ -423,6 +423,7 @@ dependencies = [
  "bitty-config",
  "bitty-ipc",
  "bitty-lua",
+ "bitty-network-lua",
  "bitty-package",
  "bitty-platform",
  "bitty-plugin-host",

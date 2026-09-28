@@ -337,6 +337,116 @@ fn cw983_unregister_stops_provider_targets() {
     rt.cw_hint_disarm();
 }
 
+// -- #1395: OSC 8 link targets join the armed quick-select path ---------------
+
+#[test]
+fn cw1395_arm_collects_link_target_and_push_key_dispatches_link_open() {
+    // CTX-0840 (#1395): a safe OSC 8 span arms like any other target —
+    // arm via API, push operator + label, assert the dispatch target —
+    // and dispatch yields the truth URI through the gate-owned outcome.
+    use bitty_runtime::cw_present::HintKeyOutcome;
+    let mut rt = runtime();
+    rt.handle_pty_bytes(b"\x1b]8;;https://example.test/path\x07link\x1b]8;;\x07");
+    let count = rt.cw_hint_arm(HintScope(1), 1, &[]).expect("arms");
+    assert_eq!(count, 1, "one safe link span arms one label");
+    assert!(rt.cw_hint_is_armed());
+    let label = rt
+        .cw_hint_link_uri("a")
+        .expect("armed link label resolves its URI");
+    assert_eq!(label, "https://example.test/path");
+    assert_eq!(rt.cw_hint_push_key('j'), HintKeyOutcome::NeedMore);
+    assert_eq!(
+        rt.cw_hint_push_key('a'),
+        HintKeyOutcome::Dispatched(bitty_runtime::DispatchOutcome::LinkOpen {
+            uri: "https://example.test/path".to_owned(),
+            target: bitty_rich::hints::TargetId(1),
+        })
+    );
+    assert!(!rt.cw_hint_is_armed(), "dispatch disarms");
+}
+
+#[test]
+fn cw1395_hostile_link_never_arms_a_target() {
+    // CTX-0840: hostile schemes (`javascript:`, `file:`) never admit a
+    // target, so arming finds nothing to label.
+    let mut rt = runtime();
+    rt.handle_pty_bytes(b"\x1b]8;;javascript:alert(1)\x07x\x1b]8;;\x07");
+    assert_eq!(rt.cw_hint_arm(HintScope(1), 1, &[]).expect("arms"), 0);
+    rt.cw_hint_disarm();
+    let mut file = runtime();
+    file.handle_pty_bytes(b"\x1b]8;;file:///etc/passwd\x07x\x1b]8;;\x07");
+    assert_eq!(file.cw_hint_arm(HintScope(1), 1, &[]).expect("arms"), 0);
+    file.cw_hint_disarm();
+}
+
+#[test]
+fn cw1395_link_overlay_cells_paint_the_span_cell() {
+    // CTX-0840: armed link labels resolve to overlay cells (non-empty),
+    // so the compositor paint path reaches them.
+    use bitty_render::geometry::RectPx;
+    use bitty_runtime::{LayoutNode, PresentFrame, View, ViewId};
+    let mut rt = runtime();
+    rt.set_layout(LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)));
+    rt.handle_pty_bytes(b"\x1b]8;;https://example.test/a\x07link\x1b]8;;\x07");
+    assert_eq!(rt.cw_hint_arm(HintScope(1), 1, &[]).expect("arms"), 1);
+    let frames = vec![PresentFrame {
+        view: ViewId::new(1),
+        frame: RectPx::new(0, 0, 80 * 9, 24 * 19),
+        content: RectPx::new(0, 0, 80 * 9, 24 * 19),
+        cols: 80,
+        rows: 24,
+        border: 0,
+        radius: 0,
+        tier: None,
+    }];
+    let cells = rt.cw_hint_overlay_cells(&frames);
+    assert_eq!(cells.len(), 1, "armed link label paints one pill");
+    assert_eq!(cells[0].view, ViewId::new(1));
+    assert_eq!(cells[0].label, "a");
+    rt.cw_hint_disarm();
+    assert!(rt.cw_hint_overlay_cells(&frames).is_empty());
+}
+
+#[test]
+fn cw1395_link_open_needs_a_matching_gesture() {
+    // CTX-0840: keyboard quick-select dispatches the URI, but the actual
+    // open still needs the click-minted gesture bound to the same URI —
+    // a vetoed gate refuses loudly, fail-closed, and the session stays
+    // armed for a retry.
+    use bitty_platform::{CursorPosition, MouseButton, PlatformEvent, PressState, WindowEventKind};
+    use bitty_plugin_host::InterceptionDecision;
+    use bitty_runtime::HintLinkOpenError;
+    let mut rt = runtime();
+    rt.handle_pty_bytes(b"\x1b]8;;https://example.test/a\x07link\x1b]8;;\x07");
+    rt.cw_hint_arm(HintScope(1), 1, &[]).expect("arms");
+    // PTY output alone mints no gesture.
+    assert!(
+        !rt.has_pending_hyperlink_activation(),
+        "PTY output alone mints no gesture"
+    );
+    // Mint a gesture by clicking the link, then open with it.
+    let window = |kind| PlatformEvent::Window {
+        window_id: bitty_platform::WindowId::from_raw_public(1),
+        kind,
+    };
+    rt.handle_platform_event(window(WindowEventKind::CursorMoved(CursorPosition {
+        x: 1.0,
+        y: 1.0,
+    })));
+    rt.handle_platform_event(window(WindowEventKind::MouseInput(
+        bitty_platform::MouseEvent::new(MouseButton::Left, PressState::Released),
+    )));
+    assert!(rt.has_pending_hyperlink_activation());
+    let gesture = rt.take_activation_gesture().expect("click mints a gesture");
+    // A plugin veto refuses loudly without opening (fail-closed).
+    assert!(matches!(
+        rt.cw_hint_open_link("a", gesture, &[InterceptionDecision::Veto], false),
+        Err(HintLinkOpenError::Denied(_))
+    ));
+    assert_eq!(rt.url_activations(), 0);
+    assert_eq!(rt.url_activation_refusals(), 1);
+}
+
 // -- #984: fold-ordinal persistence --------------------------------------------
 
 #[test]

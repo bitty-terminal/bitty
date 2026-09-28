@@ -11,7 +11,7 @@ use bitty_platform::{
     CursorPosition, ModifiersState, MouseButton, PlatformEvent, PressState, WindowEventKind,
     WindowId,
 };
-use bitty_runtime::{LayoutNode, Runtime, SplitAxis, UiRect, View, ViewId};
+use bitty_runtime::{LayoutNode, Runtime, RuntimeConfig, SplitAxis, UiRect, View, ViewId};
 
 fn make_runtime() -> Runtime {
     Runtime::with_defaults().expect("defaults must build")
@@ -367,6 +367,30 @@ fn corner_drag_grabs_both_perpendicular_splits() {
         rt.border_drag_active(),
         "corner press must grab perpendicular splits"
     );
+    // Non-vacuous (issue #1445): a single-edge grab also activates, so
+    // assert the grab holds exactly two perpendicular dividers (one per
+    // axis) for up to four panels — the old single-divider path fails here.
+    let splits = rt.border_drag_splits().expect("active drag exposes splits");
+    assert_eq!(
+        splits.len(),
+        2,
+        "corner press must grab two splits, got {splits:?}"
+    );
+    let mut axes: Vec<_> = splits.iter().map(|(_, axis)| *axis).collect();
+    axes.sort_by_key(|axis| (*axis == SplitAxis::Vertical) as u8);
+    assert_eq!(
+        axes,
+        vec![SplitAxis::Horizontal, SplitAxis::Vertical],
+        "corner grab must span both axes, got {splits:?}"
+    );
+    assert!(
+        splits.contains(&(Vec::new(), SplitAxis::Horizontal)),
+        "corner must grab root horizontal split, got {splits:?}"
+    );
+    assert!(
+        splits.contains(&(vec![0], SplitAxis::Vertical)),
+        "corner must grab left vertical split [0], got {splits:?}"
+    );
     rt.handle_mouse_input(release(MouseButton::Left));
 }
 
@@ -455,12 +479,11 @@ fn corner_drag_left_and_up_shrinks_first_quadrant() {
         "corner drag left should shrink left column"
     );
     // Dragging from (39, 11) to (31, 7) is a delta of (-8, -4).
-    // The vertical split ratio change is -4/24 = -0.167, so 0.5 - 0.167 ≈ 0.333.
-    // On a 24-row container, 0.333 * 24 = 8 rows, but cell boundaries may round to 7.
-    assert!(
-        top_left.height >= 7 && top_left.height <= 8,
-        "corner drag up should shrink top-left pane to ~8 rows, got {}",
-        top_left.height
+    // The vertical split ratio becomes 0.5 - 4/24 = 1/3 in f32; the
+    // deterministic solver floors 24 * ratio to exactly 7 rows.
+    assert_eq!(
+        top_left.height, 7,
+        "corner drag up should shrink top-left pane to 7 rows"
     );
     rt.handle_mouse_input(release(MouseButton::Left));
 }
@@ -522,4 +545,73 @@ fn corner_drag_persists_both_ratios_across_reflow() {
         Some(v_ratio_right),
         "right vertical ratio must persist"
     );
+}
+
+#[test]
+fn corner_drag_with_gaps_grabs_both_perpendicular_splits() {
+    // Issue #1445: with gaps_in > 0 the gap-intersection square belongs
+    // only to the outer band, so an offset corner press (inside the left
+    // column's inflated inner band and the inflated outer band) must still
+    // grab both perpendicular splits. A dead-center gap press is ambiguous
+    // (both sibling verticals in tolerance) and fails closed (no grab).
+    let mut rt = Runtime::new(RuntimeConfig {
+        gaps_in: 2,
+        gaps_out: 0,
+        ..RuntimeConfig::default()
+    })
+    .expect("gapped config must build");
+    rt.set_layout(four_pane_grid());
+    // Offset corner (38, 12): inside left column, on the inner vertical
+    // band (y 11-13) and within one cell of the outer vertical band
+    // (x 39-41 inflated to 38-42) — grabs both.
+    rt.handle_cursor_moved(cell_pixels(38, 12));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(
+        rt.border_drag_active(),
+        "gapped offset corner press must grab"
+    );
+    let splits = rt.border_drag_splits().expect("active drag exposes splits");
+    assert_eq!(
+        splits.len(),
+        2,
+        "gapped corner must grab two splits, got {splits:?}"
+    );
+    assert!(splits.contains(&(Vec::new(), SplitAxis::Horizontal)));
+    assert!(splits.contains(&(vec![0], SplitAxis::Vertical)));
+    // Diagonal drag moves both ratios like the gapless corner.
+    rt.handle_cursor_moved(cell_pixels(46, 16));
+    let h_ratio = rt.layout().split_ratio_at(&[]).expect("root split");
+    assert!(
+        (h_ratio - 0.6).abs() < 1e-6,
+        "gapped horizontal ratio should be 0.6, got {h_ratio}"
+    );
+    let v_ratio = rt.layout().split_ratio_at(&[0]).expect("left split");
+    let expected_v = 0.5 + 4.0f32 / 24.0;
+    assert!(
+        (v_ratio - expected_v).abs() < 1e-6,
+        "gapped left vertical ratio should be {expected_v}, got {v_ratio}"
+    );
+    rt.handle_mouse_input(release(MouseButton::Left));
+    assert!(!rt.border_drag_active());
+}
+
+#[test]
+fn corner_drag_with_gaps_center_press_fails_closed() {
+    // Issue #1445: dead-center gap press (40, 12) sits within tolerance of
+    // both sibling vertical dividers — ambiguous which quadrant owns the
+    // corner, so no grab (fail closed, press falls through).
+    let mut rt = Runtime::new(RuntimeConfig {
+        gaps_in: 2,
+        gaps_out: 0,
+        ..RuntimeConfig::default()
+    })
+    .expect("gapped config must build");
+    rt.set_layout(four_pane_grid());
+    rt.handle_cursor_moved(cell_pixels(40, 12));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(
+        !rt.border_drag_active(),
+        "ambiguous center gap press must not grab"
+    );
+    rt.handle_mouse_input(release(MouseButton::Left));
 }

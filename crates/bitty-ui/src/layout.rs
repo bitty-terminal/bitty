@@ -922,12 +922,13 @@ impl LayoutNode {
     /// Hit-tests `point` against all split-handle bands for corner-drag
     /// resize (issue #1445: Hyprland/Niri 4-way corner model).
     ///
-    /// Returns all splits whose handles contain the point, paired with
-    /// their axes. At a corner intersection of perpendicular splits, both
-    /// handles are returned so drag resize can adjust all adjacent panels
-    /// simultaneously. Returns an empty vec when the point lands on no
-    /// handle. Paths use the same indexing as [`Self::set_split_ratio_at`].
-    /// Total and deterministic.
+    /// Returns at most one split per axis (outermost on nesting), so a
+    /// corner intersection of perpendicular splits yields at most two
+    /// entries (one per axis) for up to four adjacent panels. Returns an
+    /// empty vec when the point lands on no handle, or fail-closed when
+    /// the same axis matches at the same depth on different paths
+    /// (ambiguous sibling dividers: no grab). Paths use the same indexing
+    /// as [`Self::set_split_ratio_at`]. Total and deterministic.
     #[must_use]
     pub fn hit_test_split_handles(
         &self,
@@ -938,7 +939,7 @@ impl LayoutNode {
         let inner = gaps.inset_outer(bounds);
         let mut result = Vec::new();
         self.hit_test_handles_all_inner(inner, gaps.inner, point, Vec::new(), &mut result);
-        result
+        dedup_handles_to_one_per_axis(result)
     }
 
     /// Recursion for [`Self::hit_test_split_handle`]: `bounds` is the
@@ -978,7 +979,9 @@ impl LayoutNode {
                 second.hit_test_handle_inner(b, gap_in, point, second_prefix)
             }
             Self::Stack(children) => {
-                for (i, child) in children.iter().enumerate() {
+                // Only the last (top-most, visible) child owns the pointer;
+                // hidden stacked children never own a handle (issue #1445).
+                if let Some((i, child)) = children.iter().enumerate().next_back() {
                     let mut child_prefix = prefix.clone();
                     child_prefix.push(i);
                     if let Some(hit) =
@@ -996,14 +999,17 @@ impl LayoutNode {
                 ..
             } => {
                 let clipped = overlay_bounds.clip_to(bounds).unwrap_or(Rect::zero());
-                let mut base_prefix = prefix.clone();
-                base_prefix.push(0);
-                if let Some(hit) = base.hit_test_handle_inner(bounds, gap_in, point, base_prefix) {
-                    return Some(hit);
+                // Overlay occlusion (issue #1445): when the pointer is over
+                // the floating overlay, base handles beneath are hidden.
+                if clipped.contains_point(point) {
+                    let mut overlay_prefix = prefix;
+                    overlay_prefix.push(1);
+                    overlay.hit_test_handle_inner(clipped, gap_in, point, overlay_prefix)
+                } else {
+                    let mut base_prefix = prefix.clone();
+                    base_prefix.push(0);
+                    base.hit_test_handle_inner(bounds, gap_in, point, base_prefix)
                 }
-                let mut overlay_prefix = prefix;
-                overlay_prefix.push(1);
-                overlay.hit_test_handle_inner(clipped, gap_in, point, overlay_prefix)
             }
         }
     }
@@ -1011,7 +1017,11 @@ impl LayoutNode {
     /// Recursion for [`Self::hit_test_split_handles`]: collects all split
     /// handles containing `point` into `result`. Unlike the single-hit
     /// variant, this continues searching after finding a match to detect
-    /// corner intersections (issue #1445).
+    /// corner intersections (issue #1445). Only the visible Stack child
+    /// and the occlusion-winning Overlay branch are searched; gapped
+    /// handle bands are inflated by one cell so perpendicular gap bands
+    /// overlap at corners (otherwise the gap-intersection square belongs
+    /// to neither inner band and corner-drag is dead with `gaps_in > 0`).
     fn hit_test_handles_all_inner(
         &self,
         bounds: Rect,
@@ -1031,7 +1041,7 @@ impl LayoutNode {
                 let (a, b) = split_rect_with_gap(bounds, *axis, *ratio, gap_in);
                 let handle = handle_band_between(a, b, *axis, gap_in);
                 let hit = if let Some(rect) = handle {
-                    rect.contains_point(point)
+                    inflate_handle_band(rect).contains_point(point)
                 } else {
                     on_child_boundary(a, b, *axis, point)
                 };
@@ -1047,7 +1057,8 @@ impl LayoutNode {
                 second.hit_test_handles_all_inner(b, gap_in, point, second_prefix, result);
             }
             Self::Stack(children) => {
-                for (i, child) in children.iter().enumerate() {
+                // Only the last (top-most, visible) child owns the pointer.
+                if let Some((i, child)) = children.iter().enumerate().next_back() {
                     let mut child_prefix = prefix.clone();
                     child_prefix.push(i);
                     child.hit_test_handles_all_inner(bounds, gap_in, point, child_prefix, result);
@@ -1060,15 +1071,101 @@ impl LayoutNode {
                 ..
             } => {
                 let clipped = overlay_bounds.clip_to(bounds).unwrap_or(Rect::zero());
-                let mut base_prefix = prefix.clone();
-                base_prefix.push(0);
-                base.hit_test_handles_all_inner(bounds, gap_in, point, base_prefix, result);
-                let mut overlay_prefix = prefix;
-                overlay_prefix.push(1);
-                overlay.hit_test_handles_all_inner(clipped, gap_in, point, overlay_prefix, result);
+                // Overlay occlusion: the floating layer hides base handles
+                // beneath it; outside it only the base can own the pointer.
+                if clipped.contains_point(point) {
+                    let mut overlay_prefix = prefix;
+                    overlay_prefix.push(1);
+                    overlay.hit_test_handles_all_inner(
+                        clipped,
+                        gap_in,
+                        point,
+                        overlay_prefix,
+                        result,
+                    );
+                } else {
+                    let mut base_prefix = prefix.clone();
+                    base_prefix.push(0);
+                    base.hit_test_handles_all_inner(bounds, gap_in, point, base_prefix, result);
+                }
             }
         }
     }
+}
+
+/// Inflates a gapped split-handle band by one cell on every side
+/// (saturating) so perpendicular gap bands overlap at corners (issue
+/// #1445).
+///
+/// Without this, the gap-intersection square belongs only to the outer
+/// split's band (inner bands end at the gap edge, exclusive), and no
+/// pointer position hits both perpendicular splits when `gaps_in > 0`.
+/// The one-cell tolerance creates a small overlap where an offset corner
+/// press grabs both dividers; the [`dedup_handles_to_one_per_axis`]
+/// bound below keeps the grab to at most one split per axis.
+fn inflate_handle_band(rect: Rect) -> Rect {
+    Rect::new(
+        rect.x.saturating_sub(1),
+        rect.y.saturating_sub(1),
+        rect.width.saturating_add(2),
+        rect.height.saturating_add(2),
+    )
+}
+
+/// Bounds raw corner hits to at most one split per axis (issue #1445).
+///
+/// Keeps the outermost (shortest-path, first in depth-first order) split
+/// per [`SplitAxis`], so parallel nested splits collapse to the outer
+/// divider and a corner yields at most two entries (one per axis) for up
+/// to four panels. Fail-closed on ambiguity: when the same axis matches
+/// at the same minimal depth on different paths (sibling dividers both
+/// within tolerance, e.g. a dead-center gap press), returns empty (no
+/// grab) instead of guessing a quadrant. Total and deterministic.
+fn dedup_handles_to_one_per_axis(
+    hits: Vec<(Vec<usize>, SplitAxis)>,
+) -> Vec<(Vec<usize>, SplitAxis)> {
+    use SplitAxis::{Horizontal, Vertical};
+    let mut best_h: Option<(Vec<usize>, SplitAxis)> = None;
+    let mut best_v: Option<(Vec<usize>, SplitAxis)> = None;
+    let mut ambiguous_h = false;
+    let mut ambiguous_v = false;
+    for (path, axis) in hits {
+        match axis {
+            Horizontal => match &best_h {
+                None => best_h = Some((path, axis)),
+                Some((best_path, _)) => {
+                    if path.len() < best_path.len() {
+                        best_h = Some((path, axis));
+                        ambiguous_h = false;
+                    } else if path.len() == best_path.len() && path != *best_path {
+                        ambiguous_h = true;
+                    }
+                }
+            },
+            Vertical => match &best_v {
+                None => best_v = Some((path, axis)),
+                Some((best_path, _)) => {
+                    if path.len() < best_path.len() {
+                        best_v = Some((path, axis));
+                        ambiguous_v = false;
+                    } else if path.len() == best_path.len() && path != *best_path {
+                        ambiguous_v = true;
+                    }
+                }
+            },
+        }
+    }
+    if ambiguous_h || ambiguous_v {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(2);
+    if let Some(h) = best_h {
+        out.push(h);
+    }
+    if let Some(v) = best_v {
+        out.push(v);
+    }
+    out
 }
 
 /// Handle band between two gap-split siblings (CW-09 helper for
@@ -2346,5 +2443,163 @@ mod tests {
             Some(vec![1]),
             "nested vertical divider resolves to path [1]"
         );
+    }
+
+    fn four_pane_grid() -> LayoutNode {
+        LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::split(
+                SplitAxis::Vertical,
+                0.5,
+                LayoutNode::leaf(view(1, 40, 12)),
+                LayoutNode::leaf(view(2, 40, 12)),
+            ),
+            LayoutNode::split(
+                SplitAxis::Vertical,
+                0.5,
+                LayoutNode::leaf(view(3, 40, 12)),
+                LayoutNode::leaf(view(4, 40, 12)),
+            ),
+        )
+    }
+
+    #[test]
+    fn corner_handles_grab_both_perpendicular_zero_gap() {
+        use crate::geometry::{Gaps, Point};
+        // Issue #1445: a corner press on the 2x2 intersection grabs the
+        // outer horizontal split plus the containing column's vertical
+        // split (at most one per axis, outermost).
+        let tree = four_pane_grid();
+        let bounds = Rect::new(0, 0, 80, 24);
+        let hits = tree.hit_test_split_handles(bounds, Gaps::ZERO, Point::new(39, 11));
+        assert_eq!(
+            hits.len(),
+            2,
+            "corner grabs two perpendicular splits: {hits:?}"
+        );
+        assert!(hits.contains(&(Vec::new(), SplitAxis::Horizontal)));
+        assert!(hits.contains(&(vec![0], SplitAxis::Vertical)));
+    }
+
+    #[test]
+    fn corner_handles_grab_both_perpendicular_with_gaps() {
+        use crate::geometry::{Gaps, Point};
+        // Issue #1445: with gaps_in > 0 the gap-intersection square belongs
+        // only to the outer band, so an offset corner press (inside the
+        // left column's inflated inner band and the inflated outer band)
+        // must still grab both perpendicular splits.
+        let tree = four_pane_grid();
+        let bounds = Rect::new(0, 0, 80, 24);
+        let gaps = Gaps::new(2, 0);
+        let hits = tree.hit_test_split_handles(bounds, gaps, Point::new(38, 12));
+        assert_eq!(
+            hits.len(),
+            2,
+            "gapped offset corner grabs both splits: {hits:?}"
+        );
+        assert!(hits.contains(&(Vec::new(), SplitAxis::Horizontal)));
+        assert!(hits.contains(&(vec![0], SplitAxis::Vertical)));
+    }
+
+    #[test]
+    fn corner_handles_fail_closed_on_ambiguous_center_gap_press() {
+        use crate::geometry::{Gaps, Point};
+        // Issue #1445: a dead-center gap press is within tolerance of both
+        // sibling vertical dividers ([0] and [1]); guessing a quadrant
+        // would surprise, so the hit test fails closed (no grab).
+        let tree = four_pane_grid();
+        let bounds = Rect::new(0, 0, 80, 24);
+        let gaps = Gaps::new(2, 0);
+        let hits = tree.hit_test_split_handles(bounds, gaps, Point::new(40, 12));
+        assert!(
+            hits.is_empty(),
+            "ambiguous center gap press must not grab: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn corner_handles_collapse_parallel_nested_to_outer() {
+        use crate::geometry::{Gaps, Point};
+        // Issue #1445: parallel nested splits (two Horizontals) under one
+        // pointer collapse to the outermost divider (single-edge drag).
+        let tree = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::split(
+                SplitAxis::Horizontal,
+                0.9,
+                LayoutNode::leaf(view(1, 9, 24)),
+                LayoutNode::leaf(view(2, 1, 24)),
+            ),
+            LayoutNode::leaf(view(3, 10, 24)),
+        );
+        let bounds = Rect::new(0, 0, 20, 24);
+        let hits = tree.hit_test_split_handles(bounds, Gaps::ZERO, Point::new(9, 5));
+        assert_eq!(hits.len(), 1, "parallel nested keeps one split: {hits:?}");
+        assert_eq!(hits[0], (Vec::new(), SplitAxis::Horizontal));
+    }
+
+    #[test]
+    fn corner_handles_ignore_hidden_stack_children() {
+        use crate::geometry::{Gaps, Point};
+        // Issue #1445: only the last (visible) Stack child owns handles;
+        // a divider in a hidden child must not grab.
+        let hidden_split = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(view(1, 10, 10)),
+            LayoutNode::leaf(view(2, 10, 10)),
+        );
+        let bounds = Rect::new(0, 0, 20, 10);
+        let hidden = LayoutNode::stack(vec![hidden_split, LayoutNode::leaf(view(9, 20, 10))]);
+        assert!(
+            hidden
+                .hit_test_split_handles(bounds, Gaps::ZERO, Point::new(10, 5))
+                .is_empty(),
+            "hidden stack child owns no handle"
+        );
+        let visible_split = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(view(1, 10, 10)),
+            LayoutNode::leaf(view(2, 10, 10)),
+        );
+        let visible = LayoutNode::stack(vec![LayoutNode::leaf(view(9, 20, 10)), visible_split]);
+        let hits = visible.hit_test_split_handles(bounds, Gaps::ZERO, Point::new(10, 5));
+        assert_eq!(hits.len(), 1, "visible stack child owns the handle");
+    }
+
+    #[test]
+    fn corner_handles_respect_overlay_occlusion() {
+        use crate::geometry::{Gaps, Point};
+        // Issue #1445: a floating overlay hides base handles beneath it.
+        let base = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(view(1, 40, 24)),
+            LayoutNode::leaf(view(2, 40, 24)),
+        );
+        let bounds = Rect::new(0, 0, 80, 24);
+        // Overlay covers the center divider: base handle hidden.
+        let covered = LayoutNode::overlay(
+            base.clone(),
+            LayoutNode::leaf(view(9, 20, 24)),
+            Rect::new(30, 0, 20, 24),
+        );
+        assert!(
+            covered
+                .hit_test_split_handles(bounds, Gaps::ZERO, Point::new(40, 12))
+                .is_empty(),
+            "overlay-covered divider must not grab the base split"
+        );
+        // Overlay elsewhere: base handle still grabs.
+        let clear = LayoutNode::overlay(
+            base,
+            LayoutNode::leaf(view(9, 10, 10)),
+            Rect::new(0, 0, 10, 10),
+        );
+        let hits = clear.hit_test_split_handles(bounds, Gaps::ZERO, Point::new(40, 12));
+        assert_eq!(hits.len(), 1, "uncovered divider still grabs");
     }
 }

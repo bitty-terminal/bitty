@@ -239,6 +239,18 @@ impl Runtime {
         self.border_drag.is_some()
     }
 
+    /// Grabbed split divider(s) for the active border drag, if any (issue
+    /// #1445 corner-drag test seam).
+    ///
+    /// Returns the divider paths and axes grabbed by
+    /// [`Self::begin_border_drag`]: one entry for a single-edge drag, two
+    /// perpendicular entries for a corner-drag (at most one per axis, so
+    /// up to four adjacent panels). Headless-testable without a window.
+    #[must_use]
+    pub fn border_drag_splits(&self) -> Option<Vec<(Vec<usize>, SplitAxis)>> {
+        self.border_drag.as_ref().map(|drag| drag.splits.clone())
+    }
+
     /// Attempts to grab the split divider(s) under the last known cursor for
     /// a border-drag resize (issue #1348, #1445 corner-drag).
     ///
@@ -270,6 +282,33 @@ impl Runtime {
             .hit_test_split_handles(self.container, gaps, point);
         if splits.is_empty() {
             return false;
+        }
+        // Bounded corner grab (issue #1445): at most two perpendicular
+        // dividers (one per axis) for up to four panels. The layout hit
+        // test already enforces this, but fail closed here too rather
+        // than driving an unbounded set.
+        if splits.len() > 2 {
+            return false;
+        }
+        {
+            let mut seen_h = false;
+            let mut seen_v = false;
+            for (_, axis) in &splits {
+                match axis {
+                    SplitAxis::Horizontal => {
+                        if seen_h {
+                            return false;
+                        }
+                        seen_h = true;
+                    }
+                    SplitAxis::Vertical => {
+                        if seen_v {
+                            return false;
+                        }
+                        seen_v = true;
+                    }
+                }
+            }
         }
         self.border_drag = Some(BorderDragState {
             splits,

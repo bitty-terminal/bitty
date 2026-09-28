@@ -4,6 +4,7 @@
 //! byte-identical logic, only module wiring changed.
 use super::*;
 use crate::config::decoration_runtime_error;
+use bitty_ui::{SplitAxis, smart_split_axis};
 use core::ops::{Deref, DerefMut};
 
 pub(super) fn default_layout(cols: usize, rows: usize) -> LayoutNode {
@@ -1293,6 +1294,27 @@ impl Runtime {
     #[must_use]
     pub fn layout_allocations(&self) -> Vec<(ViewId, UiRect)> {
         self.layout.layout_with_gaps(self.container, self.gaps())
+    }
+
+    /// Hyprland-dwindle axis for a new panel at `focused` (CTX-0838 #1441).
+    ///
+    /// Pure, total, headless: reads the focused leaf's cell allocation and
+    /// applies the `smart_split_axis` heuristic (wide splits side-by-side,
+    /// tall stacks, square ties break side-by-side, matching Hyprland's
+    /// `splitTop = height * split_width_multiplier > width` at the default
+    /// multiplier `1.0`). Falls back to the container when the leaf has no
+    /// allocation (fail-closed: never panics, never mutates). Explicit
+    /// `new_split:<dir>` keeps its fixed axis; this is only the Mod+N
+    /// `new_panel` path.
+    #[must_use]
+    pub fn panel_split_axis(&self, focused: ViewId) -> SplitAxis {
+        let rect = self
+            .layout_allocations()
+            .into_iter()
+            .find(|(id, _)| *id == focused)
+            .map(|(_, r)| r)
+            .unwrap_or(self.container);
+        smart_split_axis(rect, 1.0)
     }
 
     /// Leaf count of the current layout.

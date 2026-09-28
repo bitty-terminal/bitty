@@ -21,11 +21,32 @@ plugin-platform RFC is accepted and closed `OQ-011`, `OQ-012`, and `OQ-013`.
 The implementation is `Implemented`, not yet `Verified`; the install wiring
 to the still-proposed package-lifecycle RFC is a draft seam.
 
+## Network capability (CTX-0846, #1454)
+
+Network access is an optional plugin extension. The manifest-shaped grant is a
+`network.connect:HOST[:PORT]` capability (closed grammar, `src/capability.rs`),
+paired fail-closed with a structured `[[network.egress]]` entry
+(`src/manifest.rs`): every `network.connect` capability needs a covering egress
+entry and every entry needs a covering capability, so the consent surface and
+the grant always tell one story (mirrors the `process.spawn:<tool>` /
+`[tools.<tool>]` rule).
+
+The runtime half lives in `bitty-runtime`: `PluginRuntime` optionally owns one
+shared `bitty-network-lua::SharedNetworkRuntime` (set via `set_network_runtime`)
+and registers the `bitty.network` module only in a plugin VM whose activation
+grant includes a `network.connect*` capability. A granted plugin on a
+network-less host activates cleanly without the module; an ungranted plugin
+never sees it even when the host has a runtime. The module surface today is
+`bitty.network.echo` / `bitty.network.info` (test backends); real
+request/resolve operations await the external `bitty-network` backend
+(<https://github.com/bitty-terminal/bitty-network/blob/main/docs/lua-integration/design.md>).
+
 ## Boundaries
 
 - Workspace-internal dependencies, per `Cargo.toml`: `bitty-term-state`,
-  `bitty-config`, and `bitty-package`; no network-facing dependency is
-  declared.
+  `bitty-config`, and `bitty-package`; the external `bitty-network-lua` crate
+  is declared for the optional network capability described above, and no
+  first-party network I/O lives in this crate.
 - Pure data plus validation on the host side: no Lua VM coupling, no file
   I/O, no platform window or GPU coupling, and no `unsafe`.
 - The capability grammar is deny-by-default and closed: unknown identifiers

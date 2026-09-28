@@ -859,6 +859,21 @@ impl bitty_runtime::UrlOpener for RecordingUrlOpener {
     }
 }
 
+/// Physical cursor at the centre of grid cell (row 0, col 0), derived from
+/// public geometry (CTX-0808, #1484).
+///
+/// The OSC 8 link text starts at grid col 0, so this lands on the live link.
+/// Hard-coded `(1, 1)` is window padding and must never arm a link.
+fn osc8_link_cell(rt: &Runtime) -> bitty_platform::CursorPosition {
+    let frame = rt.present_frames()[0];
+    let (cw, ch) = rt.live_cell_size();
+    let pad = f64::from(rt.window_padding_physical());
+    bitty_platform::CursorPosition {
+        x: pad + f64::from(frame.content.x.max(0)) + 0.5 * f64::from(cw),
+        y: pad + f64::from(frame.content.y.max(0)) + 0.5 * f64::from(ch),
+    }
+}
+
 #[test]
 fn osc8_click_path_reaches_the_live_url_consumer() {
     // M1-17 evidence (#1143): the app's click path must consume the runtime
@@ -880,9 +895,10 @@ fn osc8_click_path_reaches_the_live_url_consumer() {
     app.runtime
         .handle_pty_bytes(b"\x1b]8;;https://example.test\x07link\x1b]8;;\x07");
     let window_id = bitty_platform::WindowId::from_raw_public(1);
+    let link_pos = osc8_link_cell(&app.runtime);
     app.runtime.handle_platform_event(PlatformEvent::Window {
         window_id,
-        kind: WindowEventKind::CursorMoved(bitty_platform::CursorPosition { x: 1.0, y: 1.0 }),
+        kind: WindowEventKind::CursorMoved(link_pos),
     });
     app.runtime.handle_platform_event(PlatformEvent::Window {
         window_id,
@@ -919,6 +935,45 @@ fn osc8_click_path_never_opens_a_hostile_scheme() {
     app.runtime
         .handle_pty_bytes(b"\x1b]8;;javascript:alert(1)\x07x\x1b]8;;\x07");
     let window_id = bitty_platform::WindowId::from_raw_public(1);
+    let link_pos = osc8_link_cell(&app.runtime);
+    app.runtime.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::CursorMoved(link_pos),
+    });
+    app.runtime.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
+            bitty_platform::MouseButton::Left,
+            bitty_platform::PressState::Released,
+        )),
+    });
+    // No gesture was minted, so the app path has nothing to consume.
+    assert!(!app.runtime.has_pending_hyperlink_activation());
+    app.activate_pending_hyperlink_now();
+    assert!(opened.lock().expect("poison-free").is_empty());
+}
+
+#[test]
+fn osc8_padding_click_never_arms_a_live_link() {
+    // CTX-0808 (#1484): a click in the window-padding band must not arm an
+    // OSC 8 link, even with a live link on screen. The in-frame hit test
+    // yields no cell there, so no gesture is minted (fail closed).
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        Vec::new(),
+        SpawnSpec::default(),
+    );
+    let opened = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    app.runtime.set_url_opener(Box::new(RecordingUrlOpener {
+        opened: std::sync::Arc::clone(&opened),
+    }));
+
+    app.runtime
+        .handle_pty_bytes(b"\x1b]8;;https://example.test\x07link\x1b]8;;\x07");
+    let window_id = bitty_platform::WindowId::from_raw_public(1);
     app.runtime.handle_platform_event(PlatformEvent::Window {
         window_id,
         kind: WindowEventKind::CursorMoved(bitty_platform::CursorPosition { x: 1.0, y: 1.0 }),
@@ -930,8 +985,10 @@ fn osc8_click_path_never_opens_a_hostile_scheme() {
             bitty_platform::PressState::Released,
         )),
     });
-    // No gesture was minted, so the app path has nothing to consume.
-    assert!(!app.runtime.has_pending_hyperlink_activation());
+    assert!(
+        !app.runtime.has_pending_hyperlink_activation(),
+        "a padding click must not arm the live link"
+    );
     app.activate_pending_hyperlink_now();
     assert!(opened.lock().expect("poison-free").is_empty());
 }

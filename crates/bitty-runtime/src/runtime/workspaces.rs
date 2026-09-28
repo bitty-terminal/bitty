@@ -386,7 +386,42 @@ impl Runtime {
         true
     }
 
+    /// Routes a left press on a non-focused frame's drawn bar band to the
+    /// workspace hit-test before mouse capture (CTX-0808, #1484).
+    ///
+    /// Probes `last_cursor` via [`Self::status_bar_hit_frame`]: when the hit
+    /// frame is the focused view (or there is no hit) returns `false` so the
+    /// normal chrome path below stays authoritative. Otherwise calls the
+    /// existing [`Self::status_bar_press`] and, if it consumed, arms the
+    /// one-shot `bar_release_swallow` so the paired release never reaches a
+    /// capturing app as an orphan report. No selection or drag can be in
+    /// flight across it: the early return happens before any of those start.
+    pub(super) fn status_bar_press_non_focused(&mut self) -> bool {
+        let Some(pos) = self.last_cursor else {
+            return false;
+        };
+        let Some((hit_view, _)) = self.status_bar_hit_frame(pos) else {
+            return false;
+        };
+        if Some(hit_view) == self.focused_view() {
+            return false;
+        }
+        if self.status_bar_press() {
+            self.bar_release_swallow = true;
+            return true;
+        }
+        false
+    }
+
     /// Column of the drawn status bar band under `pos`
+    /// (pure probe behind [`Self::status_bar_press`]).
+    ///
+    /// Delegates to [`Self::status_bar_hit_frame`], dropping the hit view.
+    fn status_bar_hit(&self, pos: CursorPosition) -> Option<usize> {
+        self.status_bar_hit_frame(pos).map(|(_, col)| col)
+    }
+
+    /// Topmost hit frame and bar column under `pos`
     /// (pure probe behind [`Self::status_bar_press`]).
     ///
     /// Only the topmost frame under the pointer is considered, in the same
@@ -394,7 +429,7 @@ impl Runtime {
     /// float painted over a base leaf's bar row hides that bar, so a press
     /// there belongs to the float, not to the base leaf's chrome (#1481 made
     /// floats present at their real bounds, which exposed this).
-    fn status_bar_hit(&self, pos: CursorPosition) -> Option<usize> {
+    pub(super) fn status_bar_hit_frame(&self, pos: CursorPosition) -> Option<(ViewId, usize)> {
         if !self.workspaceline_visible {
             return None;
         }
@@ -443,7 +478,7 @@ impl Runtime {
             && pos.y < origin_y + cell_h
         {
             let col = ((pos.x - origin_x) / cell_w).floor() as usize;
-            return Some(col);
+            return Some((frame.view, col));
         }
         None
     }

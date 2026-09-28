@@ -42,9 +42,15 @@ fn window_event(kind: WindowEventKind) -> PlatformEvent {
 }
 
 fn click_link(rt: &mut Runtime) {
+    // Land on the live link cell (grid col 0, row 0) via public geometry
+    // (CTX-0808, #1484): hard-coded `(1, 1)` is window padding and must
+    // never arm a link.
+    let frame = rt.present_frames()[0];
+    let (cw, ch) = rt.live_cell_size();
+    let pad = f64::from(rt.window_padding_physical());
     rt.handle_platform_event(window_event(WindowEventKind::CursorMoved(CursorPosition {
-        x: 1.0,
-        y: 1.0,
+        x: pad + f64::from(frame.content.x.max(0)) + 0.5 * f64::from(cw),
+        y: pad + f64::from(frame.content.y.max(0)) + 0.5 * f64::from(ch),
     })));
     rt.handle_platform_event(window_event(WindowEventKind::MouseInput(
         bitty_platform::MouseEvent::new(MouseButton::Left, PressState::Released),

@@ -1147,8 +1147,29 @@ impl Runtime {
         if self.copy_mode.is_some() || self.search_mode {
             return;
         }
+        // CTX-0808 (#1484): the release paired with a chrome-consumed
+        // status-bar press on a non-focused frame never reaches a capturing
+        // app as an orphan report. One-shot: clear and swallow.
+        if event.button == MouseButton::Left
+            && event.state == PressState::Released
+            && self.bar_release_swallow
+        {
+            self.bar_release_swallow = false;
+            return;
+        }
         // Shift override always forces selection path.
         let shift_override = self.shift_pressed;
+        // CTX-0808 (#1484): a bar press on a non-focused frame is chrome
+        // before capture — consume it before the focus-then-capture decision
+        // below so the capturing app never sees the press (and the release
+        // swallow above pairs with it). Shift still forces selection.
+        if !shift_override
+            && event.button == MouseButton::Left
+            && event.state == PressState::Pressed
+            && self.status_bar_press_non_focused()
+        {
+            return;
+        }
         // CTX-0804 (#1477): a left press on another pane is a focus choice
         // first when a mouse-tracking app is involved, so the capture
         // decision below reads the pane the click landed on.

@@ -425,14 +425,26 @@ fn cw1395_link_open_needs_a_matching_gesture() {
         "PTY output alone mints no gesture"
     );
     // Mint a gesture by clicking the link, then open with it.
+    // CTX-0838 note: after lone-workspace bar hiding, the click lands on
+    // the first frame's link cell derived from public geometry (headless
+    // cell metrics + present frame origin), never raw (1,1) padding.
+    use bitty_runtime::{LayoutNode, View, ViewId};
+    rt.set_layout(LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)));
+    rt.workspace_new().expect("second workspace for the bar");
+    rt.workspace_switch(0);
+    let frames = rt.present_frames();
+    let frame = frames.first().expect("single leaf presents");
+    let (cw, ch) = rt.live_cell_size();
+    let pad = f64::from(rt.window_padding_physical());
+    let link_pos = CursorPosition {
+        x: pad + f64::from(frame.content.x.max(0)) + 0.5 * f64::from(cw),
+        y: pad + f64::from(frame.content.y.max(0)) + 0.5 * f64::from(ch),
+    };
     let window = |kind| PlatformEvent::Window {
         window_id: bitty_platform::WindowId::from_raw_public(1),
         kind,
     };
-    rt.handle_platform_event(window(WindowEventKind::CursorMoved(CursorPosition {
-        x: 1.0,
-        y: 1.0,
-    })));
+    rt.handle_platform_event(window(WindowEventKind::CursorMoved(link_pos)));
     rt.handle_platform_event(window(WindowEventKind::MouseInput(
         bitty_platform::MouseEvent::new(MouseButton::Left, PressState::Released),
     )));

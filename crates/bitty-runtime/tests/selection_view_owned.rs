@@ -796,12 +796,19 @@ fn a_float_over_the_base_status_bar_owns_the_press() {
     // float that covers that row paints over the bar, so a press there
     // belongs to the float (topmost in paint order), not to the hidden bar's
     // workspace chrome.
+    // CTX-0838 (#1441): the lone-workspace bar never presents, so this test
+    // needs two workspaces for the bar to exist.
     let mut rt = Runtime::new(RuntimeConfig::default()).expect("headless build");
+    // Review (#1441): install the float layout in workspace zero first —
+    // `workspace_new` switches the active slot, so laying out after it
+    // would put the overlay in the fresh workspace instead of the primary.
     rt.set_layout(LayoutNode::overlay(
         LayoutNode::leaf(View::new(PRIMARY, 80, 24)),
         LayoutNode::leaf(View::new(PANE, 40, 14)),
         UiRect::new(10, 10, 40, 14),
     ));
+    rt.workspace_new().expect("second workspace for the bar");
+    assert!(rt.workspace_switch(0), "checks run on the primary layout");
     rt.force_headless_clipboard();
     let float = frame_of(&rt, PANE);
     rt.spawn_shell_for_view(PANE, "/bin/sh", &["-c", "sleep 30"], float.cols, float.rows)

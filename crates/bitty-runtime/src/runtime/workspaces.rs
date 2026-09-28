@@ -264,11 +264,14 @@ impl Runtime {
             .collect()
     }
 
-    /// Whether the workspace switcher bar presents (issue #1333).
+    /// Whether the workspace switcher bar is enabled (issue #1333).
     ///
     /// Default-on: seeded from [`crate::config::RuntimeConfig::workspaceline_visible`]
     /// at construction. Presentation-only; toggling changes no workspace,
-    /// focus, or session state.
+    /// focus, or session state. Note CTX-0838 (#1441): even when enabled,
+    /// [`Self::status_bar_text`]/[`Self::workspaceline_present`] hide the
+    /// lone-workspace bar (compositor already shows it); the flag is the
+    /// opt-out gate, not a force-show.
     #[must_use]
     pub fn workspaceline_visible(&self) -> bool {
         self.workspaceline_visible
@@ -282,24 +285,32 @@ impl Runtime {
     }
 
     /// The bar string as chrome should present it, or `None` when opted
-    /// out. `Some` on the default config (bar renders by default).
+    /// out or when only one workspace exists.
+    ///
+    /// CTX-0838 (#1441): legacy alias merged onto [`Self::status_bar_text`]
+    /// (single source — the redundant indicator is one string, not two).
+    /// A lone workspace never presents: the compositor (Hyprland/Waybar)
+    /// already shows it, so `1:ws1* (1)` adds no information. The data path
+    /// [`Self::workspaceline_text`] still renders for `ctl`/tabline; only
+    /// the chrome present hides. The full Ghostty-style tabs strip
+    /// (placement, drag, colors) stays in #1431.
     #[must_use]
     pub fn workspaceline_present(&self) -> Option<String> {
-        if self.workspaceline_visible {
-            Some(self.workspaceline_text())
-        } else {
-            None
-        }
+        self.status_bar_text()
     }
 
     /// StatusBar text as chrome should present it, or `None` when opted
-    /// out (issue #1349).
+    /// out (issue #1349) or when only one workspace exists (CTX-0838 #1441).
     ///
     /// v1 composes the `workspace` module only (status-system design:
     /// event-driven, fail-closed em-dash when no workspace slot exists).
     /// The `cwd`/`git`/`clock`/metrics slots compose here once their
     /// snapshots exist; `--safe` needs no stripping because no
     /// configuration-dependent module is composed yet.
+    ///
+    /// Single-workspace suppression removes the duplication with the
+    /// compositor bar where it adds no information; multi-workspace
+    /// Bitty workspaces live inside one OS window, so the bar presents.
     #[must_use]
     pub fn status_bar_text(&self) -> Option<String> {
         if !self.workspaceline_visible {
@@ -308,18 +319,26 @@ impl Runtime {
         if self.workspaces.is_empty() {
             return Some(String::from("\u{2014}"));
         }
+        if self.workspaces.len() <= 1 {
+            return None;
+        }
         Some(self.workspaceline_text())
     }
 
     /// In-grid bar row (0-based) inside a leaf content frame `height_rows`
-    /// tall, or `None` when the bar is hidden or the frame has no bar row.
+    /// tall, or `None` when the bar is hidden, when only one workspace
+    /// exists (CTX-0838 #1441: no bar, no reserved row), or the frame has
+    /// no bar row.
     ///
     /// Shared by the present overlay, the mouse routing, and headless
     /// tests so the drawn row and its click geometry can never drift
     /// apart.
     #[must_use]
     pub fn status_bar_row(&self, height_rows: usize) -> Option<usize> {
-        if !self.workspaceline_visible || height_rows < STATUS_BAR_ROWS {
+        if !self.workspaceline_visible
+            || self.workspaces.len() <= 1
+            || height_rows < STATUS_BAR_ROWS
+        {
             return None;
         }
         Some(height_rows - STATUS_BAR_ROWS)
@@ -327,12 +346,13 @@ impl Runtime {
 
     /// Maps a bar column (0-based, in characters of
     /// [`Self::workspaceline_text`]) to a workspace index. `None` when the
-    /// bar is hidden, when the column lands on a separator or the trailing
+    /// bar is hidden, when only one workspace exists (CTX-0838 #1441: no
+    /// bar to click), when the column lands on a separator or the trailing
     /// ` (count)` suffix, or when out of range — every unknown target fails
     /// closed with no state change.
     #[must_use]
     pub fn workspaceline_hit_test(&self, column: usize) -> Option<usize> {
-        if !self.workspaceline_visible {
+        if !self.workspaceline_visible || self.workspaces.len() <= 1 {
             return None;
         }
         let mut start = 0usize;
@@ -1254,41 +1274,73 @@ mod tests {
 
     #[test]
     fn switcher_bar_renders_by_default_with_opt_out() {
-        // Issue #1333: the bar is visible on the default config.
-        let rt = fresh();
+        // Issue #1333: the bar is enabled on the default config.
+        // CTX-0838 (#1441): a lone workspace never presents (the compositor
+        // already shows it); the data path still renders for ctl/tabline.
+        let mut rt = fresh();
         assert!(rt.workspaceline_visible());
-        let presented = rt.workspaceline_present().expect("bar presents by default");
-        assert_eq!(presented, "1:ws1* (1)");
+        assert_eq!(rt.workspaceline_text(), "1:ws1* (1)");
+        assert_eq!(rt.workspaceline_present(), None, "lone workspace hides");
+        assert_eq!(rt.status_bar_text(), None, "merged present hides too");
+        assert_eq!(rt.workspaceline_hit_test(0), None, "no bar to click");
+        // A second workspace presents the merged indicator.
+        rt.workspace_new().expect("ws2");
+        let presented = rt
+            .workspaceline_present()
+            .expect("bar presents with two workspaces");
+        assert_eq!(presented, "1:ws1 2:ws2* (2)");
         assert_eq!(presented, rt.workspaceline_text());
+        assert_eq!(
+            presented,
+            rt.status_bar_text().expect("merged single source")
+        );
         // Opt-out hides the present string and blinds hit-testing, with no
         // workspace, focus, or session state change.
         let mut rt = fresh();
+        rt.workspace_new().expect("ws2");
         rt.set_workspaceline_visible(false);
         assert!(!rt.workspaceline_visible());
         assert_eq!(rt.workspaceline_present(), None);
+        assert_eq!(rt.status_bar_text(), None);
         assert_eq!(rt.workspaceline_hit_test(0), None);
-        assert_eq!(rt.workspace_count(), 1);
-        assert_eq!(rt.active_workspace_index(), 0);
-        // Re-enabling restores the bar.
+        assert_eq!(rt.workspace_count(), 2);
+        // Re-enabling restores the bar (multi-workspace).
         rt.set_workspaceline_visible(true);
-        assert_eq!(rt.workspaceline_present().as_deref(), Some("1:ws1* (1)"));
+        assert_eq!(
+            rt.workspaceline_present().as_deref(),
+            Some("1:ws1 2:ws2* (2)")
+        );
     }
 
     #[test]
     fn status_bar_composes_workspace_module_with_shared_row_geometry() {
-        // Issue #1349: the composer serves the workspace module by
-        // default and hides with the same opt-out; the row helper names
-        // the last content row so overlay, mouse, and tests agree.
+        // Issue #1349: the composer serves the workspace module and hides
+        // with the same opt-out; the row helper names the last content row
+        // so overlay, mouse, and tests agree.
+        // CTX-0838 (#1441): lone-workspace hides (no bar, no reserved row);
+        // the data path still renders.
         let rt = fresh();
+        assert_eq!(rt.workspaceline_text(), "1:ws1* (1)");
+        assert_eq!(rt.status_bar_text(), None, "lone workspace hides");
+        assert_eq!(
+            rt.status_bar_row(24),
+            None,
+            "lone workspace reserves no row"
+        );
+        assert_eq!(rt.status_bar_row(1), None);
+        assert_eq!(rt.status_bar_row(0), None, "no rows means no bar row");
+        let mut rt = fresh();
+        rt.workspace_new().expect("ws2");
         assert_eq!(
             rt.status_bar_text().as_deref(),
-            Some("1:ws1* (1)"),
+            Some("1:ws1 2:ws2* (2)"),
             "workspace module minimum"
         );
         assert_eq!(rt.status_bar_row(24), Some(23));
         assert_eq!(rt.status_bar_row(1), Some(0));
         assert_eq!(rt.status_bar_row(0), None, "no rows means no bar row");
         let mut hidden = fresh();
+        hidden.workspace_new().expect("ws2");
         hidden.set_workspaceline_visible(false);
         assert_eq!(hidden.status_bar_text(), None);
         assert_eq!(hidden.status_bar_row(24), None);

@@ -967,9 +967,7 @@ fn issue_1438_paste_confirm_timeout_validation() {
 
     // Too short.
     let config_short = RuntimeConfig {
-        paste_confirm_timeout: std::time::Duration::from_secs(
-            MIN_PASTE_CONFIRM_TIMEOUT_SECS - 1,
-        ),
+        paste_confirm_timeout: std::time::Duration::from_secs(MIN_PASTE_CONFIRM_TIMEOUT_SECS - 1),
         ..Default::default()
     };
     assert!(
@@ -979,9 +977,7 @@ fn issue_1438_paste_confirm_timeout_validation() {
 
     // Too long.
     let config_long = RuntimeConfig {
-        paste_confirm_timeout: std::time::Duration::from_secs(
-            MAX_PASTE_CONFIRM_TIMEOUT_SECS + 1,
-        ),
+        paste_confirm_timeout: std::time::Duration::from_secs(MAX_PASTE_CONFIRM_TIMEOUT_SECS + 1),
         ..Default::default()
     };
     assert!(

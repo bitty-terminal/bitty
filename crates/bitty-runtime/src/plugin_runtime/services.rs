@@ -13,7 +13,7 @@ use std::rc::{Rc, Weak};
 use bitty_lua::ui::{UI_MAX_AGGREGATED_TEXT_BYTES, UI_MAX_BLOCKS, UiNode};
 use bitty_lua::{
     BridgeError, HostServices, LuaValue, LuaVm, SNAPSHOT_MAX_BYTES, ServiceRoute, StashedFunction,
-    env_grant_authorizes, env_grant_shape_ok, validate_env_key,
+    env_grant_shape_ok, validate_env_key,
 };
 use bitty_package::Version;
 use bitty_plugin_host::bundled::{WORKSPACELINE_CLAIM, canonicalize_ui_claim};

@@ -9,8 +9,19 @@ fmt-check:
 clippy:
     cargo clippy --workspace --all-targets --locked -- -D warnings
 
+# Run the Rust test suite. cargo-nextest runs each test in its own process
+# (isolation + per-test timeouts + the `live-pty` group cap that keeps
+# real-process suites from starving each other on small runners). nextest does
+# not execute doctests, cannot list the two `harness = false` platform binaries
+# (winit needs the OS main thread), and does not run benches/examples, so those
+# run here explicitly -- keeping coverage identical to the previous
+# `cargo test --workspace --all-targets` (which executed all three).
 test:
-    cargo test --workspace --all-targets --locked
+    cargo nextest run --workspace --locked
+    cargo test --workspace --doc --locked
+    cargo test -p bitty-platform --test headless_run --test winit_window --locked
+    cargo test -p bitty-perf --benches --locked
+    cargo test -p bitty-ipc --examples --locked
 
 typecheck:
     cargo check --workspace --all-targets --locked

@@ -18,6 +18,9 @@ and agent must follow.
 - Rust — the exact channel is pinned in `rust-toolchain.toml`; `rustup`
   resolves and installs it automatically (includes `rustfmt` and Clippy)
 - `just` — command runner for the quality gates
+- `cargo-nextest` **0.9.145** (pinned) — the test runner behind `just test`;
+  install with `cargo install cargo-nextest --version 0.9.145 --locked` or
+  `curl -LsSf https://get.nexte.st/0.9.145/linux | tar zxf - -C "$HOME/.cargo/bin"`
 - `actionlint` — GitHub Actions workflow linting, invoked by `just actionlint`
 - `lefthook` — Git hook manager, installed into the repository hooks by
   `just setup`
@@ -57,7 +60,7 @@ All checks run through the justfile:
 just check              # fmt-check + clippy + test + scratch-path/PTY/status-drift gates + actionlint + markdownlint
 just fmt-check          # cargo fmt --all -- --check
 just clippy             # cargo clippy --workspace --all-targets --locked -- -D warnings
-just test               # cargo test --workspace --all-targets --locked
+just test               # cargo nextest (workspace) + doctests + harness=false platform entry points
 just status-drift       # scripts/check-status-drift.sh (OQ/RFC/crate-count/submodule gate)
 just status-drift-test  # scripts/tests/check-status-drift.test.sh (gate fixture tests)
 just markdownlint       # markdownlint-cli2 over the repository Markdown

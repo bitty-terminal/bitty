@@ -109,8 +109,32 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      - name: Run tests
-        run: cargo test --workspace --all-targets --locked
+      # CTX-0847: cargo-nextest isolates every test in its own process, caps
+      # the real-process `live-pty` group so system suites cannot starve each
+      # other on small runners, bounds each test with a timeout, and reports
+      # retries visibly. It does not run doctests and cannot list
+      # `harness = false` binaries, which are run explicitly just below.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: nextest@0.9.145
+
+      - name: Run tests (nextest, ci profile)
+        run: cargo nextest run --workspace --locked --profile ci
+
+      - name: Run doctests
+        run: cargo test --workspace --doc --locked
+
+      - name: Run harness=false platform entry points
+        run: cargo test -p bitty-platform --test headless_run --test winit_window --locked
+
+      # CTX-0847: the previous `cargo test --all-targets` also executed the
+      # bitty-perf benches and the bitty-ipc example; nextest runs neither, so
+      # keep that coverage explicitly here.
+      - name: Run benches and examples
+        run: |
+          cargo test -p bitty-perf --benches --locked
+          cargo test -p bitty-ipc --examples --locked
 
       # M1-10 / CTX-0574: pin the M1 matrix driver's reporting logic (suite
       # floors, ignored-test rejection, aggregate failure modes, step summary)
@@ -280,8 +304,31 @@ jobs:
         with:
           prefix-key: v1-rust-${{ runner.os }}-${{ steps.rust-channel.outputs.channel }}
 
-      - name: Run tests under xvfb (X11)
-        run: xvfb-run -a cargo test --workspace --all-targets --locked
+      # CTX-0847: nextest (isolated processes, bounded timeouts, capped
+      # real-process group) plus explicit doctests and the two harness=false
+      # platform entry points that nextest cannot list.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: nextest@0.9.145
+
+      - name: Run tests under xvfb (X11, nextest ci profile)
+        run: xvfb-run -a cargo nextest run --workspace --locked --profile ci
+
+      - name: Run doctests (X11)
+        run: cargo test --workspace --doc --locked
+
+      - name: Run harness=false platform entry points (X11)
+        run: xvfb-run -a cargo test -p bitty-platform --test headless_run --test winit_window --locked
+
+      # CTX-0847: the previous `--all-targets` run also executed the bitty-perf
+      # benches and the bitty-ipc example; nextest runs neither, so keep that
+      # coverage explicitly here (headless, opt-in benches exit 0 with
+      # UNMEASURED without their BITTY_PERF_* env gates).
+      - name: Run benches and examples (X11)
+        run: |
+          cargo test -p bitty-perf --benches --locked
+          cargo test -p bitty-ipc --examples --locked
 
       # M1-10 / CTX-0574: run the M1 evidence suites by name so a
       # per-platform regression is a distinct, reported result instead of
@@ -380,8 +427,30 @@ jobs:
         with:
           prefix-key: v1-rust-${{ runner.os }}-${{ steps.rust-channel.outputs.channel }}
 
-      - name: Run tests with Wayland env
-        run: cargo test --workspace --all-targets --locked
+      # CTX-0847: nextest (isolated processes, bounded timeouts, capped
+      # real-process group) plus explicit doctests and the two harness=false
+      # platform entry points that nextest cannot list.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: nextest@0.9.145
+
+      - name: Run tests with Wayland env (nextest ci profile)
+        run: cargo nextest run --workspace --locked --profile ci
+
+      - name: Run doctests (Wayland)
+        run: cargo test --workspace --doc --locked
+
+      - name: Run harness=false platform entry points (Wayland)
+        run: cargo test -p bitty-platform --test headless_run --test winit_window --locked
+
+      # CTX-0847: the previous `--all-targets` run also executed the bitty-perf
+      # benches and the bitty-ipc example; nextest runs neither, so keep that
+      # coverage explicitly here.
+      - name: Run benches and examples (Wayland)
+        run: |
+          cargo test -p bitty-perf --benches --locked
+          cargo test -p bitty-ipc --examples --locked
 
       # M1-10 / CTX-0574: Wayland leg of the M1 compatibility matrix. The M1
       # suites are display-independent; the Wayland env above only proves the
@@ -453,8 +522,31 @@ jobs:
           RUSTFLAGS: "-D warnings"
         run: cargo check --workspace --all-targets --locked
 
-      - name: Run tests (macOS ARM64)
-        run: cargo test --workspace --all-targets --locked
+      # CTX-0847: nextest (isolated processes, bounded timeouts, capped
+      # real-process group) replaces the libtest run; doctests and the two
+      # harness=false platform entry points run explicitly since nextest
+      # covers neither.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: nextest@0.9.145
+
+      - name: Run tests (macOS ARM64, nextest ci profile)
+        run: cargo nextest run --workspace --locked --profile ci
+
+      - name: Run doctests (macOS ARM64)
+        run: cargo test --workspace --doc --locked
+
+      - name: Run harness=false platform entry points (macOS ARM64)
+        run: cargo test -p bitty-platform --test headless_run --test winit_window --locked
+
+      # CTX-0847: the previous `--all-targets` run also executed the bitty-perf
+      # benches and the bitty-ipc example; nextest runs neither, so keep that
+      # coverage explicitly here.
+      - name: Run benches and examples (macOS ARM64)
+        run: |
+          cargo test -p bitty-perf --benches --locked
+          cargo test -p bitty-ipc --examples --locked
 
       # M1-10 / CTX-0574: macOS ARM64 leg of the M1 compatibility matrix. The
       # suites are headless and free of window/font/GPU dependencies, so the
@@ -574,8 +666,26 @@ jobs:
           RUSTFLAGS: "-D warnings"
         run: cargo check --workspace --all-targets --locked
 
-      - name: Run tests
-        run: cargo test --workspace --locked
+      # CTX-0847: nextest (isolated processes, bounded timeouts, capped
+      # real-process group) replaces the libtest run; doctests and the two
+      # harness=false platform entry points run explicitly since nextest
+      # covers neither. `shell: bash` keeps the git-bash environment.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: nextest@0.9.145
+
+      - name: Run tests (nextest ci profile)
+        shell: bash
+        run: cargo nextest run --workspace --locked --profile ci
+
+      - name: Run doctests
+        shell: bash
+        run: cargo test --workspace --doc --locked
+
+      - name: Run harness=false platform entry points
+        shell: bash
+        run: cargo test -p bitty-platform --test headless_run --test winit_window --locked
 
       # M1-10 / CTX-0574: Windows x86_64 (ConPTY) leg of the M1 compatibility
       # matrix, the third ADR-0002 Tier 1 platform. `shell: bash` selects the

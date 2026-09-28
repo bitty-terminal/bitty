@@ -1432,6 +1432,15 @@ pub const DEFAULT_WINDOW_RADIUS_PX: u32 = 0;
 /// untrusted input bounded (threat T-01). Larger values fail closed.
 pub const MAX_WINDOW_RADIUS_PX: u32 = 24;
 
+/// Default `window.blur_radius` (CTX-0832: 0 = no blur).
+pub const DEFAULT_WINDOW_BLUR_RADIUS: u32 = 0;
+
+/// Maximum `window.blur_radius` in logical pixels (CTX-0832: `0..=128`).
+///
+/// Platform support varies: Wayland (KDE/Hyprland), macOS NSVisualEffectView.
+/// Bounds untrusted input; larger values fail closed.
+pub const MAX_WINDOW_BLUR_RADIUS: u32 = 128;
+
 /// Default window padding in logical pixels (CTX-0223).
 ///
 /// 8px keeps ghostty/alacritty-class breathing room between the grid and the
@@ -1730,8 +1739,11 @@ pub struct WindowConfig {
     /// Padding in logical pixels `0..=64`.
     pub padding: u32,
     /// Corner radius in physical px `0..=24` (CTX-0241 S0: parsed no-op,
-    /// default 0 = square, zero render effect; later stages add rounding).
+    /// S1+ compositor opt-in).
     pub radius_px: u32,
+    /// Background blur radius in logical pixels `0..=128` (CTX-0832).
+    /// Platform support varies: Wayland (KDE/Hyprland), macOS NSVisualEffectView.
+    pub blur_radius: u32,
 }
 
 impl Default for WindowConfig {
@@ -1740,6 +1752,7 @@ impl Default for WindowConfig {
             opacity: 1.0,
             padding: DEFAULT_WINDOW_PADDING,
             radius_px: DEFAULT_WINDOW_RADIUS_PX,
+            blur_radius: DEFAULT_WINDOW_BLUR_RADIUS,
         }
     }
 }
@@ -1763,6 +1776,12 @@ impl WindowConfig {
             return Err(ConfigError::validation(
                 "window.radius_px",
                 format!("must be <= {MAX_WINDOW_RADIUS_PX}"),
+            ));
+        }
+        if self.blur_radius > MAX_WINDOW_BLUR_RADIUS {
+            return Err(ConfigError::validation(
+                "window.blur_radius",
+                format!("must be <= {MAX_WINDOW_BLUR_RADIUS}"),
             ));
         }
         Ok(())

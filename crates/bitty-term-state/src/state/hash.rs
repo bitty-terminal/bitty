@@ -197,6 +197,7 @@ fn mouse_encoding_discriminant(encoding: bitty_vt::MouseCoordinateEncoding) -> u
         bitty_vt::MouseCoordinateEncoding::Utf8 => 1,
         bitty_vt::MouseCoordinateEncoding::Sgr => 2,
         bitty_vt::MouseCoordinateEncoding::Urxvt => 3,
+        bitty_vt::MouseCoordinateEncoding::SgrPixels => 4,
     }
 }
 

@@ -712,6 +712,9 @@ pub struct Runtime {
     /// Dynamic background override from an authorized `OSC 11` set
     /// (CTX-0381); `None` = the resolved theme background.
     dynamic_background: Option<[u8; 3]>,
+    /// Dynamic cursor color override from an authorized `OSC 12` set
+    /// (CTX-0820); `None` = the resolved theme cursor color.
+    dynamic_cursor: Option<[u8; 3]>,
     /// When the active synchronized-update deferral window began (CTX-0380).
     ///
     /// `Some` while `DECSET 2026` is active; bounded by
@@ -1290,6 +1293,7 @@ impl Runtime {
             osc_color_set_allowed: false,
             dynamic_foreground: None,
             dynamic_background: None,
+            dynamic_cursor: None,
             sync_defer_since: None,
             osc52_rejected_writes: 0,
             input_write_dropped_bytes: 0,
@@ -1500,6 +1504,7 @@ impl Runtime {
             osc_color_set_allowed: false,
             dynamic_foreground: None,
             dynamic_background: None,
+            dynamic_cursor: None,
             sync_defer_since: None,
             osc52_rejected_writes: 0,
             input_write_dropped_bytes: 0,
@@ -2266,6 +2271,15 @@ impl Runtime {
         }
     }
 
+    /// Returns the active cursor color: OSC 12 override or theme default (CTX-0820).
+    #[must_use]
+    pub fn active_cursor_color(&self) -> [u8; 4] {
+        match self.dynamic_cursor {
+            Some([r, g, b]) => [r, g, b, 0xFF],
+            None => self.config.theme.cursor,
+        }
+    }
+
     /// Applies an authorized `OSC 10`/`OSC 11` set and forces a repaint.
     ///
     /// The default fg/bg live on the renderer/surface palettes, so the
@@ -2276,6 +2290,7 @@ impl Runtime {
         match target {
             bitty_vt::DynamicColorTarget::Foreground => self.dynamic_foreground = Some(rgb),
             bitty_vt::DynamicColorTarget::Background => self.dynamic_background = Some(rgb),
+            bitty_vt::DynamicColorTarget::Cursor => self.dynamic_cursor = Some(rgb),
         }
         let palette = bitty_render::ThemePalette {
             foreground: self.active_foreground(),

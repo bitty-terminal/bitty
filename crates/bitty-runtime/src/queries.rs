@@ -167,6 +167,7 @@ pub(crate) fn osc_color_reply(target: bitty_vt::DynamicColorTarget, color: [u8; 
     let id = match target {
         bitty_vt::DynamicColorTarget::Foreground => 10,
         bitty_vt::DynamicColorTarget::Background => 11,
+        bitty_vt::DynamicColorTarget::Cursor => 12,
     };
     format!(
         "\x1b]{id};rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}\x1b\\",

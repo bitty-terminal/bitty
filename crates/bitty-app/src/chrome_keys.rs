@@ -1008,6 +1008,11 @@ impl TerminalApp {
                         return;
                     }
                 };
+                // Review (#1441): restore zoom before measuring — a zoomed
+                // view collapses the live layout to one leaf, so the axis
+                // must come from the restored layout that `apply_new_leaf`
+                // will split. Idempotent: `apply_new_leaf` restores again.
+                self.restore_zoom();
                 let axis = self.runtime.panel_split_axis(focused);
                 self.apply_new_leaf(axis, false, "new_panel");
             }

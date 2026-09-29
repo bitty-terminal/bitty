@@ -45,12 +45,3 @@ test-group = "live-pty"
 filter = 'package(bitty-pty) | binary(/^(m1_shell_coverage|selection_view_owned|mouse_report_panes|session_save_restore|job_capability_ops|job_supervisor|pane_damage|shell_input_1356|panel_session_invariants|focused_input_modes|poll_budget_0476|copy_search_view_bound|dogfooding|shell_knob)$/)'
 test-group = "live-pty"
 retries = 2
-
-# `plugin_services` drives several plugin VMs in one test and times each
-# cross-VM host call against the 50ms cheap-call budget. The logic is
-# deterministic, but a loaded Windows runner can miss that budget
-# probabilistically and fall back to the `-1` error sentinel (CTX-0854). Retry
-# this binary visibly too; it is not in the process-heavy `live-pty` group.
-[[profile.ci.overrides]]
-filter = 'binary(plugin_services)'
-retries = 3

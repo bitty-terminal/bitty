@@ -35,6 +35,57 @@ pub mod startup;
 pub mod throughput_floor;
 pub mod typical_session;
 
+/// How a `harness = false` bench binary was invoked (CTX-0854).
+///
+/// `cargo bench` passes `--bench` to every bench binary; `cargo test
+/// --benches` (the CI compile-and-run gate) does not. Measurement loops sized
+/// for an optimized `bench` build run for minutes in the unoptimized `test`
+/// profile without producing a meaningful number, so the smoke invocation
+/// scales them down while every code path and invariant check still runs.
+/// Budget verdicts come only from [`BenchInvocation::Measure`] runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BenchInvocation {
+    /// `cargo bench`: full measurement workload.
+    Measure,
+    /// `cargo test --benches`: reduced workload, same code paths.
+    Smoke,
+}
+
+/// Divisor applied to measurement workloads in [`BenchInvocation::Smoke`].
+pub const SMOKE_WORKLOAD_DIVISOR: usize = 100;
+
+impl BenchInvocation {
+    /// Classify a bench binary's arguments (program name excluded).
+    #[must_use]
+    pub fn from_args<I, S>(args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        if args.into_iter().any(|arg| arg.as_ref() == "--bench") {
+            Self::Measure
+        } else {
+            Self::Smoke
+        }
+    }
+
+    /// Classify the running bench binary from its process arguments.
+    #[must_use]
+    pub fn current() -> Self {
+        Self::from_args(std::env::args().skip(1))
+    }
+
+    /// Scale a measurement workload (iterations, bytes) for this invocation,
+    /// never below `floor`.
+    #[must_use]
+    pub fn workload(self, full: usize, floor: usize) -> usize {
+        match self {
+            Self::Measure => full,
+            Self::Smoke => (full / SMOKE_WORKLOAD_DIVISOR).max(floor),
+        }
+    }
+}
+
 /// PB-1 cold startup budget — p50 / p99 (ms).
 pub const PB1_STARTUP_MS_P50: u64 = 100;
 /// PB-1 p99.
@@ -83,4 +134,36 @@ pub const MAX_ACTIONS: usize = 4096;
 #[must_use]
 pub const fn is_headless_witness() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BenchInvocation, SMOKE_WORKLOAD_DIVISOR};
+
+    #[test]
+    fn cargo_bench_flag_selects_the_full_measurement() {
+        assert_eq!(
+            BenchInvocation::from_args(["--bench", "--nocapture"]),
+            BenchInvocation::Measure
+        );
+        assert_eq!(
+            BenchInvocation::from_args(Vec::<String>::new()),
+            BenchInvocation::Smoke
+        );
+        assert_eq!(
+            BenchInvocation::from_args(["--nocapture"]),
+            BenchInvocation::Smoke
+        );
+    }
+
+    #[test]
+    fn smoke_workload_is_scaled_but_never_below_its_floor() {
+        assert_eq!(BenchInvocation::Measure.workload(5_000, 1), 5_000);
+        assert_eq!(
+            BenchInvocation::Smoke.workload(5_000, 1),
+            5_000 / SMOKE_WORKLOAD_DIVISOR
+        );
+        assert_eq!(BenchInvocation::Smoke.workload(3, 1), 1);
+        assert_eq!(BenchInvocation::Smoke.workload(10_000, 8_192), 8_192);
+    }
 }

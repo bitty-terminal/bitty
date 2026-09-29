@@ -1628,10 +1628,9 @@ impl GlyphAtlas {
     }
 
     /// True when `width` x `height` can never fit this atlas, regardless of
-    /// how full it is (zero span or larger than the atlas itself).
+    /// how full it is (zero span or larger than the configured maximum).
     fn oversized(&self, width: u16, height: u16) -> bool {
-        let dims = self.layout.dimensions();
-        width == 0 || height == 0 || width > dims.width || height > dims.height
+        width == 0 || height == 0 || width > self.max_dimension || height > self.max_dimension
     }
 
     /// Atlas texture dimensions.
@@ -1725,7 +1724,11 @@ impl GlyphAtlas {
         }
 
         // Double the dimension, but don't exceed max_dimension.
-        let next = (current * 2).min(self.max_dimension);
+        // Use u32 arithmetic to avoid overflow, then cap and convert back.
+        let next = u32::from(current)
+            .saturating_mul(2)
+            .min(u32::from(self.max_dimension));
+        let next = u16::try_from(next).expect("capped by max_dimension which is u16");
 
         // Reallocate texture buffer.
         let new_len = usize::from(next) * usize::from(next);

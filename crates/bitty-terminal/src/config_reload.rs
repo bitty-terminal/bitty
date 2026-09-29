@@ -274,6 +274,10 @@ impl ConfigFileWatcher {
 /// The installed reload context: the engine plus how to re-resolve the config.
 struct ReloadContext {
     engine: ReloadEngine,
+    /// The config the process started with. Fields without a runtime adopter
+    /// still run with these values until restart, so pending restart fields
+    /// are always computed against it rather than against the last reload.
+    launched: EffectiveConfig,
     /// Re-resolve the effective config from the original sources.
     resolve: Box<dyn Fn() -> Result<EffectiveConfig, String>>,
     watcher: Option<ConfigFileWatcher>,
@@ -306,6 +310,7 @@ pub(crate) fn install(
         Box::new(move || crate::config_cli::load_app_config(&args).map(|app| app.effective));
     CONTEXT.with(|slot| {
         *slot.borrow_mut() = Some(ReloadContext {
+            launched: effective.clone(),
             engine: ReloadEngine::new(effective),
             resolve,
             watcher,
@@ -335,6 +340,7 @@ pub(crate) fn install_with(
     let watcher = watch.map(ConfigFileWatcher::new);
     CONTEXT.with(|slot| {
         *slot.borrow_mut() = Some(ReloadContext {
+            launched: effective.clone(),
             engine: ReloadEngine::new(effective),
             resolve,
             watcher,
@@ -382,6 +388,21 @@ fn poll_file_at(runtime: &mut bitty_runtime::Runtime, at: Instant) -> Option<Rel
 }
 
 impl ReloadContext {
+    /// Live-class fields whose accepted value differs from the launch value
+    /// but that the runtime cannot adopt live: they stay pending until restart
+    /// on every later reply, including an `unchanged` one (CodeRabbit on
+    /// #1516), and drop out once the file returns to the launch value.
+    fn pending_restart_fields(&self) -> Vec<String> {
+        bitty_config::diff(&self.launched, self.engine.current())
+            .diffs
+            .into_iter()
+            .filter(|diff| {
+                diff.class == bitty_config::ReloadClass::Live && !runtime_adopts(&diff.field)
+            })
+            .map(|diff| diff.field)
+            .collect()
+    }
+
     /// Re-resolve, classify, adopt if live, and build the caller-visible info.
     fn reload_into(&mut self, runtime: &mut bitty_runtime::Runtime) -> ReloadOutcomeInfo {
         let incoming = match (self.resolve)() {
@@ -428,15 +449,7 @@ impl ReloadContext {
             .iter()
             .map(|diff| diff.field.clone())
             .collect();
-        let restart_required = if matches!(outcome, ReloadOutcome::Applied(_)) {
-            changed
-                .iter()
-                .filter(|field| !runtime_adopts(field))
-                .cloned()
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let restart_required = self.pending_restart_fields();
         ReloadOutcomeInfo {
             path: self.path_label.clone(),
             kind: outcome.kind(),
@@ -497,6 +510,37 @@ mod tests {
             "change seen at the next check"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unadopted_live_field_stays_pending_across_reloads() {
+        let baseline = bitty_config::fallback_builtin();
+        let mut edited = baseline.clone();
+        edited.font.family = format!("{} Alt", baseline.font.family);
+        let desired = std::rc::Rc::new(std::cell::RefCell::new(edited));
+        let source = std::rc::Rc::clone(&desired);
+        clear();
+        install_with(
+            baseline.clone(),
+            Box::new(move || Ok(source.borrow().clone())),
+            None,
+        );
+        let mut runtime = bitty_runtime::Runtime::with_defaults().expect("runtime");
+        let first = reload_requested(&mut runtime).expect("context installed");
+        assert_eq!(first.kind, "applied");
+        assert_eq!(first.restart_required, vec![String::from("font.family")]);
+        let second = reload_requested(&mut runtime).expect("context installed");
+        assert_eq!(second.kind, "unchanged");
+        assert_eq!(
+            second.restart_required,
+            vec![String::from("font.family")],
+            "a pending restart is reported until it takes effect"
+        );
+        // Reverting the file to the launch value clears the pending field.
+        *desired.borrow_mut() = baseline;
+        let reverted = reload_requested(&mut runtime).expect("context installed");
+        assert!(reverted.restart_required.is_empty(), "{reverted:?}");
+        clear();
     }
 
     #[test]

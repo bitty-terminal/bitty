@@ -12,12 +12,12 @@ use bitty_ipc::ctl as ipc_ctl;
 // `Runtime`) drains via [`drain_global_control_queue`] and applies each
 // action with [`apply_control`]. Tests drive [`apply_control`] directly
 // (same thread, no queue).
-
-/// Granted scopes for the live servo: CLI default plus explicit elevation.
-#[must_use]
-pub fn granted_scopes_for_servo() -> bitty_ipc::ScopeSet {
-    ipc_ctl::elevation_from_env(std::env::var("BITTY_CTL_ELEVATE").ok().as_deref())
-}
+//
+// CTX-0792 (#1403): every served connection enqueues with its own
+// authorization snapshot, re-validated against the connection authority at
+// drain. The drain's `granted` argument is only the fallback for
+// authority-less entries, and the live callers pass an empty set so such an
+// entry can never borrow process-wide scopes.
 
 /// [`drain_global_control_queue`] with a pre-mutation hook (CTX-0481, #762).
 ///
@@ -29,29 +29,74 @@ pub fn granted_scopes_for_servo() -> bitty_ipc::ScopeSet {
 pub fn drain_global_control_queue_with(
     runtime: &mut bitty_runtime::Runtime,
     granted: &bitty_ipc::ScopeSet,
+    before_mutation: impl FnMut(&mut bitty_runtime::Runtime, &str),
+) -> usize {
+    drain_global_control_queue_inner(runtime, granted, before_mutation, |_| {})
+}
+
+/// Test-only drain variant that runs a hook between the claim and the apply.
+///
+/// The hook is what makes the claim/apply window observable (a cancel or a
+/// deadline crossing there), and every test that uses it drives a Unix PTY, so
+/// the variant is unix-only: keeping it alive on Windows would be dead code and
+/// the Windows `-D warnings` cross-check would fail on it.
+#[cfg(all(test, unix))]
+pub(crate) fn drain_global_control_queue_with_barrier(
+    runtime: &mut bitty_runtime::Runtime,
+    granted: &bitty_ipc::ScopeSet,
+    before_mutation: impl FnMut(&mut bitty_runtime::Runtime, &str),
+    after_claim: impl FnMut(&ipc_ctl::PendingControl),
+) -> usize {
+    drain_global_control_queue_inner(runtime, granted, before_mutation, after_claim)
+}
+
+fn drain_global_control_queue_inner(
+    runtime: &mut bitty_runtime::Runtime,
+    granted: &bitty_ipc::ScopeSet,
     mut before_mutation: impl FnMut(&mut bitty_runtime::Runtime, &str),
+    mut after_claim: impl FnMut(&ipc_ctl::PendingControl),
 ) -> usize {
     let mut count = 0usize;
     loop {
-        // CTX-0529: `pop_pending_control` already withdrew expired entries
-        // (never applied, no `count`, no reply), so every item here is live:
-        // the caller-visible outcome always matches whether the effect
-        // landed. The reply `send` is best-effort — a waiter that timed out
-        // concurrently already reclaimed its entry, and a disconnected
-        // receiver only means nobody reads the answer.
         let Some(item) = ipc_ctl::pop_pending_control() else {
             break;
         };
         count += 1;
-        // Authorize before the hook: an unauthorized verb must never touch
-        // zoom or layout state. `apply_control_envelope` re-authorizes
-        // (defense in depth).
-        if ipc_ctl::authorize_ctl_method(&item.method, granted).is_ok()
-            && method_mutates_layout(&item.method)
-        {
+        after_claim(&item);
+        if !item.begin_apply() {
+            // Withdrawn by the waiter, already applied, or too close to its
+            // deadline: `begin_apply` re-checks the deadline under the phase
+            // lock (and answers a late entry itself), so no effect can land
+            // after the client-side timeout.
+            continue;
+        }
+        // CTX-0792 (#1403): the single authorization recheck runs after the
+        // apply phase is claimed and immediately before mutation, against
+        // the live connection authority (session, consent generation, scopes,
+        // terminal capability map).
+        if let Err(err) = item.authorize_at_drain(granted) {
+            item.finish_without_apply();
+            let (category, code, message) = ipc_error_triple(&err);
+            let _ = item.reply.send(ipc_ctl::ControlReply {
+                ok: false,
+                result_json: String::new(),
+                category,
+                code,
+                message,
+            });
+            continue;
+        }
+        let effective_scopes = item.effective_scopes(granted);
+        if method_mutates_layout(&item.method) {
             before_mutation(runtime, &item.method);
         }
-        let reply = apply_control_envelope(runtime, &item.method, item.params.as_deref(), granted);
+        let reply = apply_control_envelope(
+            runtime,
+            &item.method,
+            item.params.as_deref(),
+            &effective_scopes,
+        );
+        item.finish_apply();
         let _ = item.reply.send(reply);
     }
     count
@@ -113,33 +158,24 @@ pub fn apply_control_envelope(
 }
 
 fn ipc_error_triple(err: &bitty_ipc::IpcError) -> (&'static str, &'static str, String) {
-    match err {
-        bitty_ipc::IpcError::ScopeDenied { .. } => (
-            "auth",
-            "ScopeDenied",
-            format!("permission denied: {err} (needs elevation via BITTY_CTL_ELEVATE)"),
-        ),
+    // One class table for enqueue and drain (CTX-0792): the category and code
+    // come from `bitty_ipc::ctl::control_error_class`; only the message is
+    // drain-specific (it may name the rejected id, never params text).
+    let (category, code) = ipc_ctl::control_error_class(err);
+    let message = match err {
+        bitty_ipc::IpcError::ScopeDenied { .. } => {
+            format!("permission denied: {err} (needs elevation via BITTY_CTL_ELEVATE)")
+        }
         // Generic denials and unauthenticated peers are permission failures
         // (CLI exit 7), never transport timeouts: surface the denial with
         // the elevation hint instead of exit 6.
-        bitty_ipc::IpcError::Denied { code, reason } => (
-            "auth",
-            "Denied",
-            format!("permission denied: [{code}] {reason} (needs elevation via BITTY_CTL_ELEVATE)"),
-        ),
-        bitty_ipc::IpcError::Unauthenticated { .. } => (
-            "auth",
-            "Unauthenticated",
-            format!("permission denied: {err}"),
-        ),
-        bitty_ipc::IpcError::NotFound { .. } => ("usage", "NotFound", format!("{err}")),
-        bitty_ipc::IpcError::InvalidMethod { .. } => ("usage", "InvalidMethod", format!("{err}")),
-        bitty_ipc::IpcError::InvalidRequest { .. } => ("usage", "InvalidParams", format!("{err}")),
-        bitty_ipc::IpcError::LimitExceeded { .. } => {
-            ("transport", "PayloadTooLarge", format!("{err}"))
+        bitty_ipc::IpcError::Denied { code, reason } if category == "auth" => {
+            format!("permission denied: [{code}] {reason} (needs elevation via BITTY_CTL_ELEVATE)")
         }
-        _ => ("transport", "Transport", format!("{err}")),
-    }
+        bitty_ipc::IpcError::Unauthenticated { .. } => format!("permission denied: {err}"),
+        _ => format!("{err}"),
+    };
+    (category, code, message)
 }
 
 /// Apply an authorized control method to `runtime`.

@@ -10,7 +10,7 @@
 `bitty-perf` owns the performance baseline harness: it hosts the
 workspace-root `benches/` targets so `cargo bench` compiles while the
 workspace stays virtual, and it carries probe instrumentation covering the
-`bitty-app` cold path plus input latency and idle behavior. Everything is
+`bitty-terminal` cold path plus input latency and idle behavior. Everything is
 headless, bounded, and `forbid(unsafe_code)`; budget definitions live in the
 referenced performance RFC and evidence notes, not here (see `src/lib.rs`).
 

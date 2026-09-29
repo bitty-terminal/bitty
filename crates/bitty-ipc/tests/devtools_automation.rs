@@ -4,7 +4,7 @@
 //!
 //! CTX-0183 harness pattern: publish known runtime snapshots into the live
 //! stores, serve them over a real Unix socket with `Dispatcher::with_defaults`
-//! (the same code path the `bitty-app` servo drives), and assert from the
+//! (the same code path the `bitty-terminal` servo drives), and assert from the
 //! client side — no seat, no screenshots, no pixel polling.
 //!
 //! Covered here (Amendment A1 candidate):

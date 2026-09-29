@@ -52,7 +52,7 @@ main() {
 		echo "runner: hyperfine 5 runs, timeout ${TIMEOUT_SECS}s"
 		bin="./target/release/bitty"
 		if [ ! -x "${bin}" ]; then
-			cargo build --release -p bitty-app >/dev/null 2>&1 || true
+			cargo build --release -p bitty-terminal >/dev/null 2>&1 || true
 		fi
 		if [ -x "${bin}" ]; then
 			# scratch-paths-exempt: ephemeral hyperfine JSON, tail-displayed only, not durable evidence

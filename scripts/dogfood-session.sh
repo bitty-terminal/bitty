@@ -359,9 +359,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "dogfood-session: building bitty binary (crate bitty-app, profile $BITTY_PROFILE_DIR)"
+echo "dogfood-session: building bitty binary (crate bitty-terminal, profile $BITTY_PROFILE_DIR)"
 # shellcheck disable=SC2086
-cargo build -p bitty-app --locked --quiet $CARGO_PROFILE_FLAG
+cargo build -p bitty-terminal --locked --quiet $CARGO_PROFILE_FLAG
 if [ ! -x "$BIN" ]; then
 	echo "build produced no binary at $BIN" >&2
 	exit 1

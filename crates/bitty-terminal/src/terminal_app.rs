@@ -1035,7 +1035,7 @@ impl AppHandler for TerminalApp {
 // The `bitty-pty` bounded-channel seam uses `READ_CHUNK_SIZE` and
 // `CHANNEL_CAPACITY_CHUNKS` constants, but we keep the demo pump's channel
 // capacity literal (16) mirroring that constant without importing the crate
-// directly — `bitty-app` wires `bitty-runtime` + `bitty-platform` +
+// directly — `bitty-terminal` wires `bitty-runtime` + `bitty-platform` +
 // `bitty-render` + `bitty-config` as the thin composition root (ADR-0003
 // entry point; no business logic beyond wiring). The literal is documented
 // here to avoid a hidden dependency.

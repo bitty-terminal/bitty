@@ -225,7 +225,7 @@ pub fn resolve_socket_path_from_env(
 
 // ── server info ─────────────────────────────────────────────────────────────
 
-/// Static server description captured at serve time (wired by `bitty-app`).
+/// Static server description captured at serve time (wired by `bitty-terminal`).
 ///
 /// All fields are startup facts, never live terminal content: live grid
 /// introspection is CTX-0159. `cols`/`rows` are the grid geometry the runtime

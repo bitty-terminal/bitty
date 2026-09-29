@@ -1,7 +1,7 @@
 //! Binary artifact name guard for CTX-0164 (#264).
 //!
-//! The `bitty-app` crate must produce a binary named `bitty` (not
-//! `bitty-app`) so `target/debug/bitty`, `ps`, and fastfetch agree with
+//! The `bitty-terminal` crate must produce a binary named `bitty` (not
+//! `bitty-terminal`) so `target/debug/bitty`, `ps`, and fastfetch agree with
 //! `/usr/bin/bitty`. Cargo exposes each binary to integration tests via
 //! `CARGO_BIN_EXE_<name>`; referencing `CARGO_BIN_EXE_bitty` fails to
 //! compile if the `[[bin]]` rename regresses.
@@ -25,18 +25,18 @@ fn binary_artifact_is_named_bitty() {
 #[test]
 fn cargo_manifest_declares_bin_bitty() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
-    let text = std::fs::read_to_string(&manifest).expect("read bitty-app Cargo.toml");
+    let text = std::fs::read_to_string(&manifest).expect("read bitty-terminal Cargo.toml");
     assert!(
         text.contains("[[bin]]"),
-        "crates/bitty-app/Cargo.toml must contain a [[bin]] section"
+        "crates/bitty-terminal/Cargo.toml must contain a [[bin]] section"
     );
     assert!(
         text.contains("name = \"bitty\""),
-        "crates/bitty-app/Cargo.toml [[bin]] must set name = \"bitty\""
+        "crates/bitty-terminal/Cargo.toml [[bin]] must set name = \"bitty\""
     );
-    // Crate itself keeps the `bitty-app` name; only the artifact renames.
+    // Crate itself keeps the `bitty-terminal` name; only the artifact renames.
     assert!(
-        text.contains("name = \"bitty-app\""),
-        "crate package name must stay `bitty-app`"
+        text.contains("name = \"bitty-terminal\""),
+        "crate package name must stay `bitty-terminal`"
     );
 }

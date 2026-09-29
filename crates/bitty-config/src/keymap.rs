@@ -3,7 +3,7 @@
 //! Config-file keymaps drive all chrome keys (ghostty-style, read-only
 //! reference: `recording/references/ghostty` plus the user's
 //! `~/.config/ghostty/keybinds.conf`). The single-owner rule lives here as
-//! data and in `bitty-app` as enforcement: a key event that matches a bound
+//! data and in `bitty-terminal` as enforcement: a key event that matches a bound
 //! chord is consumed by the chrome action and never reaches the PTY; an
 //! unbound key (Tab, arrows, plain letters, ...) always goes to the shell.
 //!
@@ -112,7 +112,7 @@
 //! base-key chord by exact equality. Matching therefore tries the reported
 //! spelling first and falls back to the physical base-key spelling of a
 //! shift-held shifted symbol ([`KeyRef::unshifted_base`],
-//! [`shifted_symbol_base`]) at the dispatch site (`bitty-app`): the gesture
+//! [`shifted_symbol_base`]) at the dispatch site (`bitty-terminal`): the gesture
 //! resolves, the exact spellings keep their precedence, and the symbol no
 //! longer leaks to the PTY. Ghostty's key events carry the same
 //! `unshifted_codepoint` and its character keybinds match on it, the same

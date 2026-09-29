@@ -486,7 +486,7 @@ pub struct FocusSnapshot {
 //
 // The serving side (`bitty-ipc/src/devtools.rs`) owns the cross-thread live
 // store (its globals are `Send` and bounded). These helpers convert runtime
-// observations into the serving-side publish types so `bitty-app` needs no
+// observations into the serving-side publish types so `bitty-terminal` needs no
 // extra wiring: [`crate::Runtime`] calls them on input and on tick (`&self`
 // only, never mutating terminal truth).
 

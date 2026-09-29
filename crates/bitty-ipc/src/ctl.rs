@@ -1530,7 +1530,7 @@ mod tests {
     #[test]
     fn ctl_timeout_budget_is_pinned() {
         // CTX-0301: one server budget for the control channel; the client
-        // read timeout in `bitty-app` `ctl_roundtrip` is this plus a fixed
+        // read timeout in `bitty-terminal` `ctl_roundtrip` is this plus a fixed
         // reply grace (CTX-0792), so the client outlives the server's
         // deadline reply.
         assert_eq!(CTL_TIMEOUT, std::time::Duration::from_secs(5));

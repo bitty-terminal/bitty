@@ -31,9 +31,9 @@
 //!            ,^ !|  ]  |  ! ``                            `    H  3  / .?,,
 //!            ``^!!_!!_.|s_` `                              `"_>/.u!.!!.^ `
 //!
-//! `bitty-app`: Correct Terminal thin composition root.
+//! `bitty-terminal`: Correct Terminal thin composition root.
 //!
-//! This binary is the **thin composition root** per ADR-0003 ("`bitty-app`
+//! This binary is the **thin composition root** per ADR-0003 ("`bitty-terminal`
 //! Binary entry point; argument handling, startup, safe-mode selection;
 //! depends on `bitty-runtime` only"). It owns **no business logic** beyond
 //! wiring already-owned libraries: argument parsing, [`bitty_runtime::Runtime`]

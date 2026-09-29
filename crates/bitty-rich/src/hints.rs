@@ -87,7 +87,7 @@
 //! Headless P3 is implemented and tested here. The Leader chord, session
 //! state, batch collection, and compositor paint are wired through
 //! `bitty-runtime` (`cw_hint_arm` / `cw_hint_push_key` / `cw_hint_disarm` /
-//! `cw_hint_overlay_cells`) and the `bitty-app` Leader input path; the
+//! `cw_hint_overlay_cells`) and the `bitty-terminal` Leader input path; the
 //! link provider below is the quick-select slice added for #1395.
 //! `collect_link_targets` turns safe OSC 8 hyperlink spans into
 //! keyboard-addressable targets, and link dispatch opens through the

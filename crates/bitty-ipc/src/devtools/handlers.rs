@@ -413,7 +413,7 @@ fn handle_get_snapshot(
     json_escape_into(&mut out, &server.instance);
     out.push_str("\",\"pid\":");
     out.push_str(&server.pid.to_string());
-    out.push_str(",\"app\":\"bitty-app\",\"app_version\":\"");
+    out.push_str(",\"app\":\"bitty-terminal\",\"app_version\":\"");
     json_escape_into(&mut out, &server.app_version);
     out.push_str("\",\"cols\":");
     out.push_str(&server.cols.to_string());

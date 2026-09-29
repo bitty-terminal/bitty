@@ -1,7 +1,7 @@
 //! Bittie mascot splash (issue #1318, CTX-0729).
 //!
 //! Single owner of the vendored mascot art and the first-run splash
-//! policy. `crates/bitty-app/assets/mascot.txt` is the only text asset
+//! policy. `crates/bitty-terminal/assets/mascot.txt` is the only text asset
 //! compiled into the binary (pure ASCII, bounded: see [`MASCOT_MAX_LINES`]
 //! / [`MASCOT_MAX_WIDTH`]); the sixel/block variants in
 //! `recording/bitty-mascot/` stay out. `init.rs` re-exports these names

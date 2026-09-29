@@ -1777,7 +1777,7 @@ pub fn run_dev(request: &DevRequest, options: &DevOptions) -> i32 {
 
 // ---------------------------------------------------------------------------
 // Tests (pure parser plus bounded helpers; binary dispatch is covered by
-// `crates/bitty-app/tests/cli_dev.rs`)
+// `crates/bitty-terminal/tests/cli_dev.rs`)
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------

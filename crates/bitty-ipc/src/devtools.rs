@@ -1,10 +1,10 @@
 //! DevTools-facing socket contract (CTX-0144, Issue #236).
 //!
 //! This module is the headless, bounded core of the `BITTY_SOCKET` server that
-//! `bitty-app` exposes for `bitty-devtools`. It owns no socket, spawns no
+//! `bitty-terminal` exposes for `bitty-devtools`. It owns no socket, spawns no
 //! thread, and performs no ambient I/O beyond caller-supplied streams and the
 //! socket-directory it is explicitly handed: the listener lifecycle lives in
-//! `bitty-app/src/ipc_serve.rs` (the servo), which calls into this module.
+//! `bitty-terminal/src/ipc_serve.rs` (the servo), which calls into this module.
 //!
 //! # Reference-first (DEC-0017)
 //!

@@ -264,4 +264,4 @@ decision to turn them into hard gates).
 - `crates/bitty-perf/baselines/pb-idle.json` (committed artifact)
 - `crates/bitty-perf/src/idle.rs` (harness)
 - `benches/idle_real.rs` (human-facing bench)
-- `crates/bitty-app/src/terminal_app.rs` (`AboutToWait` → `set_wait()`)
+- `crates/bitty-terminal/src/terminal_app.rs` (`AboutToWait` → `set_wait()`)

@@ -21,7 +21,7 @@ prepare() {
 
 build() {
   cd "$pkgname-$pkgver"
-  cargo build --release --locked -p bitty-app
+  cargo build --release --locked -p bitty-terminal
 }
 
 check() {

@@ -3,7 +3,7 @@
 //! End-to-end round-trip over a real Unix socket (CTX-0144, Issue #236).
 //!
 //! Headless and Unix-only: binds a temporary socket, serves it with
-//! `bitty_ipc::devtools` (the same code path the `bitty-app` servo drives),
+//! `bitty_ipc::devtools` (the same code path the `bitty-terminal` servo drives),
 //! and speaks the `bitty-devtools` wire from the client side: `u32`
 //! big-endian length-prefixed JSON (`bitty-devtools/src/transport.ts`
 //! framing) carrying `protocol.ts`-shaped envelopes. Proves handshake

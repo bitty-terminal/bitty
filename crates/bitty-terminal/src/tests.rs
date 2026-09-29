@@ -295,7 +295,7 @@ fn log_level_from_env_value_accepts_rust_log_filters() {
         Some(LogLevel::Debug)
     );
     assert_eq!(
-        log_level_from_env_value("info,bitty-app=trace"),
+        log_level_from_env_value("info,bitty-terminal=trace"),
         Some(LogLevel::Trace)
     );
     assert_eq!(log_level_from_env_value("WARN"), Some(LogLevel::Warn));
@@ -319,7 +319,7 @@ fn rust_log_filters_parse_directives_not_substrings() {
         Some(LogLevel::Error)
     );
     assert_eq!(
-        log_level_from_env_value("bitty-app=debug"),
+        log_level_from_env_value("bitty-terminal=debug"),
         Some(LogLevel::Debug)
     );
     // A later global directive replaces an earlier one (last wins), and

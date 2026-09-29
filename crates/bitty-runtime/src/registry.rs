@@ -203,12 +203,17 @@ pub use bitty_ui::ViewId as RegistryViewId;
 
 /// Validated rectangle in logical pixels produced by the Workspace
 /// compositor. Converted to PTY grid via DPI-aware cell metrics.
+///
+/// Fields are private so [`LogicalRect::new`] is the only public way to
+/// build one (CORE-RUN-010). A rejected rectangle still travels inside
+/// [`RegistryError::InvalidGeometry`], so every registry boundary
+/// revalidates before converting.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LogicalRect {
-    pub x: f64,
-    pub y: f64,
-    pub width: f64,
-    pub height: f64,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
 }
 
 impl LogicalRect {
@@ -219,36 +224,62 @@ impl LogicalRect {
     /// # Errors
     /// `InvalidGeometry` when non-finite or negative.
     pub fn new(x: f64, y: f64, width: f64, height: f64) -> Result<Self, RegistryError> {
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+        .validated()
+    }
+
+    /// Re-checks the [`LogicalRect::new`] invariants.
+    fn validated(self) -> Result<Self, RegistryError> {
+        let Self {
+            x,
+            y,
+            width,
+            height,
+        } = self;
         if !x.is_finite() || !y.is_finite() || !width.is_finite() || !height.is_finite() {
             return Err(RegistryError::InvalidGeometry {
                 reason: "rect components must be finite",
-                rect: Self {
-                    x,
-                    y,
-                    width,
-                    height,
-                },
+                rect: self,
                 computed: None,
             });
         }
         if width < 0.0 || height < 0.0 {
             return Err(RegistryError::InvalidGeometry {
                 reason: "rect width/height must be >= 0",
-                rect: Self {
-                    x,
-                    y,
-                    width,
-                    height,
-                },
+                rect: self,
                 computed: None,
             });
         }
-        Ok(Self {
-            x,
-            y,
-            width,
-            height,
-        })
+        Ok(self)
+    }
+
+    /// Left edge in logical pixels.
+    #[must_use]
+    pub const fn x(self) -> f64 {
+        self.x
+    }
+
+    /// Top edge in logical pixels.
+    #[must_use]
+    pub const fn y(self) -> f64 {
+        self.y
+    }
+
+    /// Width in logical pixels.
+    #[must_use]
+    pub const fn width(self) -> f64 {
+        self.width
+    }
+
+    /// Height in logical pixels.
+    #[must_use]
+    pub const fn height(self) -> f64 {
+        self.height
     }
 
     #[must_use]

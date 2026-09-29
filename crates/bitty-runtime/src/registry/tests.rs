@@ -377,6 +377,58 @@ fn zero_area_never_reaches_pty_and_retains_previous_geometry() {
     assert_eq!(reg.flush_pending_resizes().len(), 0);
 }
 
+/// CORE-RUN-010: a rejected rect still travels inside `InvalidGeometry`, so
+/// an embedder can hand it back. Every boundary must refuse it with no
+/// attachment, geometry change, or queued resize.
+#[test]
+fn smuggled_invalid_rects_are_rejected_at_every_boundary() {
+    for (label, width) in [
+        ("nan", f64::NAN),
+        ("+inf", f64::INFINITY),
+        ("-inf", f64::NEG_INFINITY),
+        ("negative", -720.0),
+    ] {
+        let Err(RegistryError::InvalidGeometry { rect: smuggled, .. }) =
+            LogicalRect::new(0.0, 0.0, width, 456.0)
+        else {
+            panic!("{label}: constructor must reject");
+        };
+        let mut reg = default_registry();
+        let invalid = |result: Result<(), RegistryError>| {
+            matches!(result, Err(RegistryError::InvalidGeometry { .. }))
+        };
+        assert!(
+            invalid(reg.logical_rect_to_grid(smuggled).map(drop)),
+            "{label}: grid conversion"
+        );
+
+        let wid = reg.create_workspace().unwrap();
+        let vh = reg.create_view(wid).unwrap();
+        let th = reg.create_terminal(None).unwrap();
+        assert!(
+            invalid(reg.attach(wid, vh.id, vh.generation, th.id, th.generation, smuggled)),
+            "{label}: attach"
+        );
+        assert_eq!(reg.attached_view(th.id), None, "{label}: no attachment");
+
+        let valid = LogicalRect::new(0.0, 0.0, 720.0, 456.0).unwrap();
+        reg.attach(wid, vh.id, vh.generation, th.id, th.generation, valid)
+            .unwrap();
+        let attached = reg.terminal_snapshot(th.id, th.generation).unwrap();
+        assert!(
+            invalid(reg.handle_view_rect(wid, vh.id, vh.generation, smuggled)),
+            "{label}: view rect"
+        );
+        assert_eq!(reg.flush_pending_resizes().len(), 0, "{label}: no resize");
+        let after = reg.terminal_snapshot(th.id, th.generation).unwrap();
+        assert_eq!(
+            (attached.width, attached.height),
+            (after.width, after.height),
+            "{label}: geometry unchanged"
+        );
+    }
+}
+
 #[test]
 fn logical_rect_to_grid_floor_and_clamp() {
     let reg = default_registry();

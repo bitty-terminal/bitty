@@ -231,14 +231,16 @@ impl Pty {
         if self.reaped {
             return Err(PtyError::ChildAlreadyReaped);
         }
-        let deadline = std::time::Instant::now() + timeout;
+        // An unrepresentable deadline (e.g. `Duration::MAX`) means "no
+        // deadline": wait until the child exits.
+        let deadline = std::time::Instant::now().checked_add(timeout);
         loop {
             let status = self.session.try_wait()?;
             if status.is_some() {
                 self.reaped = true;
                 return Ok(status);
             }
-            if std::time::Instant::now() >= deadline {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
                 return Ok(None);
             }
             std::thread::sleep(WAIT_POLL_INTERVAL);
@@ -391,6 +393,22 @@ mod tests {
     }
 
     #[test]
+    fn wait_timeout_with_an_unrepresentable_deadline_does_not_panic() {
+        // CORE-ENG-024: `Instant::now() + Duration::MAX` overflowed.
+        bitty_test_support::require_pty!();
+        let mut pty = crate::PtyBuilder::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("spawn sh");
+        let status = pty
+            .wait_timeout(Duration::MAX)
+            .expect("wait_timeout")
+            .expect("an unbounded wait returns once the child exits");
+        assert!(status.is_success());
+    }
+
+    #[test]
     fn drop_reaps_a_live_child_without_blocking() {
         // CTX-0477 hang regression: the old Drop called the unbounded
         // `Session::wait`, which never returns for a child that never
@@ -411,7 +429,9 @@ mod tests {
 
     /// Polls `check` until it returns `Some`, or panics past `timeout`.
     fn wait_until<T>(timeout: Duration, mut check: impl FnMut() -> Option<T>) -> T {
-        let deadline = std::time::Instant::now() + timeout;
+        let deadline = std::time::Instant::now()
+            .checked_add(timeout)
+            .expect("test poll timeout must be representable");
         loop {
             if let Some(value) = check() {
                 return value;

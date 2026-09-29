@@ -530,11 +530,17 @@ pub(super) fn handle_synthesize_input(
     }
     // Authorize (scope intersection + bearer binding + rate ceiling) before
     // any observable effect.
+    let authorization = context.current_authorization().map_err(|_| {
+        HandlerError::new(
+            "scope",
+            "Unauthenticated",
+            "connection authority is unavailable".into(),
+        )
+    })?;
     authorize_automation(
-        &context.granted,
+        &authorization,
         &[DebugControl, TerminalInput],
         bearer.as_deref(),
-        &context.session_id,
         &terminal_id,
         AutomationFamily::Synthesize,
         context.uptime_ms,
@@ -680,11 +686,17 @@ pub(super) fn handle_capture_frame(
             "pixels capture requires explicitOptIn true".to_string(),
         ));
     }
+    let authorization = context.current_authorization().map_err(|_| {
+        HandlerError::new(
+            "scope",
+            "Unauthenticated",
+            "connection authority is unavailable".into(),
+        )
+    })?;
     authorize_automation(
-        &context.granted,
+        &authorization,
         &[DebugTrace, TerminalInspect],
         bearer.as_deref(),
-        &context.session_id,
         &terminal_id,
         AutomationFamily::Capture,
         context.uptime_ms,
@@ -891,15 +903,23 @@ pub(super) fn handle_frame_hash(
         ));
     }
     let bearer = extract_top_string(params, "bearer");
-    if let Err(err) = authorize_automation(
-        &context.granted,
-        &[DebugTrace, TerminalInspect],
-        bearer.as_deref(),
-        &context.session_id,
-        &terminal_id,
-        AutomationFamily::FrameDigest,
-        context.uptime_ms,
-    ) {
+    let authorization = context.current_authorization().map_err(|_| {
+        HandlerError::new(
+            "scope",
+            "Unauthenticated",
+            "connection authority is unavailable".into(),
+        )
+    });
+    if let Err(err) = authorization.and_then(|authorization| {
+        authorize_automation(
+            &authorization,
+            &[DebugTrace, TerminalInspect],
+            bearer.as_deref(),
+            &terminal_id,
+            AutomationFamily::FrameDigest,
+            context.uptime_ms,
+        )
+    }) {
         audit_digest_attempt(&context.session_id, &terminal_id, context.uptime_ms, 0, "");
         return Err(err);
     }

@@ -65,6 +65,9 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
+use std::fmt;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::error::IpcError;
@@ -92,6 +95,632 @@ pub const MAX_CTL_PARAMS_BYTES: usize = 4096;
 
 /// Maximum digits after `t:` / `v:` (u32 range with margin).
 pub const MAX_CTL_ID_DIGITS: usize = 10;
+
+/// Maximum live connection sessions one [`ControlAuthority`] tracks.
+///
+/// Above the RC-9 connection cap ([`crate::limits::RC9_MAX_CONNECTIONS`]) so
+/// the accept-path shed, not this bound, is what a normal overload hits; past
+/// it `open_connection` fails closed with `LimitExceeded`.
+pub const MAX_AUTHORITY_SESSIONS: usize = 64;
+/// Maximum bytes of a minted principal or session identifier.
+pub const MAX_AUTHORITY_ID_BYTES: usize = 64;
+/// Maximum entries (wildcard plus per-terminal) in one [`TerminalCapabilities`].
+pub const MAX_TERMINAL_CAPABILITY_ENTRIES: usize = 64;
+
+/// Key of the connection-wide capability entry in [`TerminalCapabilities`].
+///
+/// A terminal without its own entry is answered by this wildcard; a terminal
+/// with an entry is answered by that entry alone.
+pub const WILDCARD_TERMINAL: &str = "*";
+
+/// Server-minted identity of one accepted connection (CTX-0792, #1403).
+///
+/// Never client-asserted: `open_connection` mints the principal and session
+/// from one process-wide, non-reusing counter, so two connections can never
+/// share a session and a bearer or queued control bound to one connection
+/// cannot be satisfied by another. The identifiers are not secrets; bearers
+/// are the secret material.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnectionIdentity {
+    /// Opaque caller identity the authority evaluates grants against.
+    pub principal_id: String,
+    /// Debug/automation session bound to this connection's lifetime.
+    pub session_id: String,
+    /// Bumped on every consent change; a snapshot taken under an older
+    /// generation no longer authorizes anything.
+    pub consent_generation: u64,
+}
+
+/// Per-terminal capability map (CTX-0792, #1404).
+///
+/// Holds the connection wildcard ([`WILDCARD_TERMINAL`]) plus bounded
+/// per-terminal entries. Authorization reads it through
+/// [`AuthorizationSnapshot::allows_terminal`]; for an authority-owned session
+/// every entry stays bounded by the session's scopes, so an entry can only
+/// narrow what the connection holds, never widen it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TerminalCapabilities {
+    grants: BTreeMap<String, ScopeSet>,
+}
+
+impl TerminalCapabilities {
+    /// An empty map: no wildcard, so every terminal is denied.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Seed the connection wildcard entry (`"*"`).
+    ///
+    /// The wildcard is the ceiling for every per-terminal entry: a grant can
+    /// only ever narrow it (see [`TerminalCapabilities::grant`]).
+    #[must_use]
+    pub fn from_scopes(scopes: &ScopeSet) -> Self {
+        let mut grants = BTreeMap::new();
+        grants.insert(String::from(WILDCARD_TERMINAL), scopes.clone());
+        Self { grants }
+    }
+
+    /// Add `scope` to `terminal_id`'s per-terminal entry.
+    ///
+    /// The per-terminal entry is the intersection surface: once a terminal has
+    /// an entry, [`TerminalCapabilities::allows`] answers from that entry
+    /// alone and the wildcard no longer applies to it. Grants are additive per
+    /// terminal (no order dependence: capture then synthesize yields the union)
+    /// and a terminal id is validated and entry-count bounded
+    /// ([`MAX_TERMINAL_CAPABILITY_ENTRIES`]).
+    ///
+    /// This is the map primitive only. Runtime consent enforcement lives in
+    /// [`ControlAuthority::grant_terminal_capability`], which refuses a grant
+    /// the connection's own scopes do not allow, so a per-terminal entry can
+    /// never widen what a connection holds.
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::InvalidRequest`] for a malformed terminal id and
+    /// [`IpcError::LimitExceeded`] past
+    /// [`MAX_TERMINAL_CAPABILITY_ENTRIES`] distinct terminals.
+    pub fn grant(&mut self, terminal_id: &str, scope: Scope) -> Result<(), IpcError> {
+        parse_terminal_id(terminal_id)?;
+        if !self.grants.contains_key(terminal_id)
+            && self.grants.len() >= MAX_TERMINAL_CAPABILITY_ENTRIES
+        {
+            return Err(IpcError::LimitExceeded {
+                field: "terminal_capabilities".into(),
+                limit: MAX_TERMINAL_CAPABILITY_ENTRIES,
+                actual: self.grants.len() + 1,
+            });
+        }
+        self.grants
+            .entry(terminal_id.to_string())
+            .or_default()
+            .insert(scope);
+        Ok(())
+    }
+
+    /// Drop `scope` from `terminal_id`'s entry; an emptied entry is removed so
+    /// the terminal falls back to the wildcard again.
+    pub fn revoke(&mut self, terminal_id: &str, scope: Scope) -> bool {
+        let Some(entry) = self.grants.get_mut(terminal_id) else {
+            return false;
+        };
+        let had = entry.contains(scope);
+        entry.remove(scope);
+        if entry.is_empty() {
+            self.grants.remove(terminal_id);
+        }
+        had
+    }
+
+    /// Whether the connection wildcard entry allows `scope` (the ceiling a
+    /// per-terminal entry is read against when no entry exists).
+    #[must_use]
+    pub fn wildcard_allows(&self, scope: Scope) -> bool {
+        self.grants
+            .get(WILDCARD_TERMINAL)
+            .is_some_and(|scopes| scopes.contains(scope))
+    }
+
+    /// Intersection check: the per-terminal entry when one exists, else the
+    /// wildcard. A terminal with an entry is never answered by the wildcard.
+    ///
+    /// This is the map half only; authorization decisions go through
+    /// [`AuthorizationSnapshot::allows_terminal`].
+    #[must_use]
+    pub fn allows(&self, terminal_id: &str, scope: Scope) -> bool {
+        self.grants
+            .get(terminal_id)
+            .or_else(|| self.grants.get(WILDCARD_TERMINAL))
+            .is_some_and(|scopes| scopes.contains(scope))
+    }
+
+    /// Remove `scope` from every entry (wildcard included), dropping entries
+    /// that become empty. Used when consent for `scope` is revoked so the map
+    /// never outlives the connection's scopes.
+    fn revoke_everywhere(&mut self, scope: Scope) {
+        self.grants.retain(|terminal, scopes| {
+            scopes.remove(scope);
+            terminal == WILDCARD_TERMINAL || !scopes.is_empty()
+        });
+    }
+
+    /// Number of entries (wildcard included).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.grants.len()
+    }
+
+    /// Whether the map has no entries at all (not even a wildcard).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.grants.is_empty()
+    }
+}
+
+/// Immutable authorization context captured for one request or queue item.
+///
+/// A queued control carries the snapshot taken at enqueue; the drain
+/// re-validates it against the live authority ([`ControlAuthority::authorize_snapshot`])
+/// immediately before mutation, so a revoked session or a consent change in
+/// between denies the mutation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorizationSnapshot {
+    /// Connection identity and consent generation the snapshot was taken under.
+    pub identity: ConnectionIdentity,
+    /// Scopes the connection held at that generation.
+    pub scopes: ScopeSet,
+    /// Per-terminal capability map at that generation.
+    pub terminal_capabilities: TerminalCapabilities,
+}
+
+impl AuthorizationSnapshot {
+    /// Terminal capability intersection (CTX-0792, #1404): the terminal's
+    /// entry, or the wildcard when the terminal has no entry, must allow
+    /// `scope`. `None` names no terminal and is answered by the wildcard.
+    ///
+    /// For an authority-owned session the map is always bounded by the
+    /// session's scopes: the wildcard is seeded from them at open, a
+    /// per-terminal grant is refused unless the session holds the scope, and a
+    /// consent revocation strips the scope from every entry. Hermetic contexts
+    /// may declare a terminal capability explicitly; that declaration is the
+    /// answer there.
+    #[must_use]
+    pub fn allows_terminal(&self, terminal_id: Option<&str>, scope: Scope) -> bool {
+        self.terminal_capabilities
+            .allows(terminal_id.unwrap_or(WILDCARD_TERMINAL), scope)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SessionRecord {
+    identity: ConnectionIdentity,
+    scopes: ScopeSet,
+    terminal_capabilities: TerminalCapabilities,
+}
+
+#[derive(Debug)]
+struct AuthorityState {
+    sessions: BTreeMap<String, SessionRecord>,
+}
+
+/// Process-wide, non-reusing connection counter behind every minted identity.
+///
+/// One counter for every [`ControlAuthority`] in the process, so a session id
+/// is unique even across authorities (the automation bearer store is
+/// process-wide and keyed by session). Exhaustion is terminal: once the
+/// counter cannot advance, no further identity is minted.
+fn next_connection_number() -> Result<u64, IpcError> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_update(
+        std::sync::atomic::Ordering::SeqCst,
+        std::sync::atomic::Ordering::SeqCst,
+        |current| current.checked_add(1),
+    )
+    .map_err(|_| IpcError::Denied {
+        code: "AuthorityExhausted".into(),
+        reason: "connection identity space exhausted".into(),
+    })
+}
+
+/// Server-owned consent/session service for accepted connections
+/// (CTX-0792, #1403/#1404).
+///
+/// Mints one principal/session per connection, holds each session's scopes and
+/// per-terminal capabilities, and is the only place a consent change or a
+/// session end takes effect. Cheap to clone: clones share one state.
+#[derive(Clone, Debug)]
+pub struct ControlAuthority {
+    state: Arc<Mutex<AuthorityState>>,
+}
+
+impl Default for ControlAuthority {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ControlAuthority {
+    /// A fresh authority with no sessions.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(AuthorityState {
+                sessions: BTreeMap::new(),
+            })),
+        }
+    }
+
+    /// Mint the principal/session for one accepted connection.
+    ///
+    /// `scopes` is the operator-consented ceiling for the connection and
+    /// `terminal_capabilities` its initial per-terminal map. The returned
+    /// grant revokes the session when dropped.
+    ///
+    /// # Errors
+    ///
+    /// `LimitExceeded` past [`MAX_AUTHORITY_SESSIONS`], `Denied`
+    /// (`AuthorityExhausted`) when the identity counter is exhausted, and
+    /// `Unavailable` when the authority lock is poisoned.
+    pub fn open_connection(
+        &self,
+        scopes: ScopeSet,
+        terminal_capabilities: TerminalCapabilities,
+    ) -> Result<ConnectionGrant, IpcError> {
+        let mut state = self.state.lock().map_err(|_| IpcError::Unavailable {
+            reason: "control authority unavailable".into(),
+        })?;
+        if state.sessions.len() >= MAX_AUTHORITY_SESSIONS {
+            return Err(IpcError::LimitExceeded {
+                field: "authority_sessions".into(),
+                limit: MAX_AUTHORITY_SESSIONS,
+                actual: state.sessions.len() + 1,
+            });
+        }
+        let connection = next_connection_number()?;
+        let principal_id = bounded_identity("principal", connection)?;
+        let session_id = bounded_identity("session", connection)?;
+        let identity = ConnectionIdentity {
+            principal_id,
+            session_id: session_id.clone(),
+            consent_generation: 1,
+        };
+        let record = SessionRecord {
+            identity: identity.clone(),
+            scopes,
+            terminal_capabilities,
+        };
+        let snapshot = AuthorizationSnapshot {
+            identity,
+            scopes: record.scopes.clone(),
+            terminal_capabilities: record.terminal_capabilities.clone(),
+        };
+        state.sessions.insert(session_id, record);
+        Ok(ConnectionGrant {
+            authority: self.clone(),
+            initial: snapshot,
+        })
+    }
+
+    /// Current authorization for a live session.
+    ///
+    /// # Errors
+    ///
+    /// `Unauthenticated` once the session is gone (closed, revoked, or its
+    /// consent generation exhausted); `Unavailable` on a poisoned lock.
+    pub fn snapshot(&self, session_id: &str) -> Result<AuthorizationSnapshot, IpcError> {
+        let state = self.state.lock().map_err(|_| IpcError::Unavailable {
+            reason: "control authority unavailable".into(),
+        })?;
+        let record = state
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| IpcError::Unauthenticated {
+                reason: "connection authority is no longer active".into(),
+            })?;
+        Ok(AuthorizationSnapshot {
+            identity: record.identity.clone(),
+            scopes: record.scopes.clone(),
+            terminal_capabilities: record.terminal_capabilities.clone(),
+        })
+    }
+
+    /// Re-validate a captured snapshot against the live session, then
+    /// authorize `method` (scope plus terminal capability) under it.
+    ///
+    /// This is the drain-time recheck: the session must still exist and its
+    /// identity, including the consent generation, must equal the snapshot's,
+    /// so any consent change or session end after enqueue denies the action.
+    ///
+    /// # Errors
+    ///
+    /// `Unauthenticated` for a gone or changed session, and every error of
+    /// [`authorize_ctl_action`].
+    pub fn authorize_snapshot(
+        &self,
+        snapshot: &AuthorizationSnapshot,
+        method: &str,
+        params: Option<&str>,
+    ) -> Result<Scope, IpcError> {
+        let state = self.state.lock().map_err(|_| IpcError::Unavailable {
+            reason: "control authority unavailable".into(),
+        })?;
+        let record = state
+            .sessions
+            .get(&snapshot.identity.session_id)
+            .ok_or_else(|| IpcError::Unauthenticated {
+                reason: "connection authority is no longer active".into(),
+            })?;
+        if record.identity != snapshot.identity {
+            return Err(IpcError::Unauthenticated {
+                reason: "connection consent is no longer current".into(),
+            });
+        }
+        authorize_ctl_action(method, params, snapshot)
+    }
+
+    /// Add `scope` to a live session and advance its consent generation, so
+    /// every snapshot (and bearer) minted before the change stops authorizing.
+    /// Returns `false` when the session is gone or already holds `scope`.
+    pub fn grant_scope(&self, session_id: &str, scope: Scope) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        let Some(record) = state.sessions.get_mut(session_id) else {
+            return false;
+        };
+        if record.scopes.contains(scope) {
+            return false;
+        }
+        record.scopes.insert(scope);
+        let Some(next_generation) = record.identity.consent_generation.checked_add(1) else {
+            state.sessions.remove(session_id);
+            return true;
+        };
+        record.identity.consent_generation = next_generation;
+        true
+    }
+
+    /// Narrow one terminal of a live session (CTX-0792, #1404).
+    ///
+    /// This is the production grant path behind the per-terminal capability
+    /// intersection: a session that binds itself to `terminal_id` (an
+    /// automation bearer) gets an entry for that terminal, and every later
+    /// `authorize` for it answers from the entry instead of the wildcard.
+    ///
+    /// Fail-closed on every path: an unknown session, a malformed terminal id,
+    /// a scope the connection's scopes do not allow, or a full capability map
+    /// all refuse the grant instead of widening anything.
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::Unauthenticated`] when the session is gone,
+    /// [`IpcError::InvalidRequest`] for a malformed terminal id,
+    /// [`IpcError::ScopeDenied`] when the connection does not hold `scope`, and
+    /// [`IpcError::LimitExceeded`] past [`MAX_TERMINAL_CAPABILITY_ENTRIES`].
+    pub(crate) fn grant_terminal_capability(
+        &self,
+        session_id: &str,
+        terminal_id: &str,
+        scope: Scope,
+    ) -> Result<(), IpcError> {
+        let mut state = self.state.lock().map_err(|_| IpcError::Unavailable {
+            reason: "control authority unavailable".into(),
+        })?;
+        let Some(record) = state.sessions.get_mut(session_id) else {
+            return Err(IpcError::Unauthenticated {
+                reason: "connection authority is no longer active".into(),
+            });
+        };
+        if !record.scopes.contains(scope) {
+            return Err(IpcError::ScopeDenied {
+                scope: scope.as_str().into(),
+                action: format!("terminal capability grant for {terminal_id}"),
+            });
+        }
+        record.terminal_capabilities.grant(terminal_id, scope)
+    }
+
+    /// Drop `scope` from one terminal entry, restoring wildcard coverage for
+    /// that terminal once its last capability is released.
+    pub(crate) fn release_terminal_capability(
+        &self,
+        session_id: &str,
+        terminal_id: &str,
+        scope: Scope,
+    ) -> bool {
+        self.state
+            .lock()
+            .map(|mut state| {
+                state
+                    .sessions
+                    .get_mut(session_id)
+                    .is_some_and(|record| record.terminal_capabilities.revoke(terminal_id, scope))
+            })
+            .unwrap_or(false)
+    }
+
+    /// Revoke `scope` from a live session (consent revocation): the scope is
+    /// removed from the session and from every terminal capability entry, and
+    /// the consent generation advances so queued controls and bearers issued
+    /// under the old consent are denied before any mutation. Returns `false`
+    /// when the session is gone or did not hold `scope`.
+    pub fn revoke_scope(&self, session_id: &str, scope: Scope) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        let Some(record) = state.sessions.get_mut(session_id) else {
+            return false;
+        };
+        if !record.scopes.remove(scope) {
+            return false;
+        }
+        record.terminal_capabilities.revoke_everywhere(scope);
+        let Some(next_generation) = record.identity.consent_generation.checked_add(1) else {
+            state.sessions.remove(session_id);
+            return true;
+        };
+        record.identity.consent_generation = next_generation;
+        true
+    }
+
+    /// End a session: every later snapshot, queued control, or bearer bound to
+    /// it fails closed. Returns `false` when it was already gone.
+    pub fn revoke_session(&self, session_id: &str) -> bool {
+        self.state
+            .lock()
+            .map(|mut state| state.sessions.remove(session_id).is_some())
+            .unwrap_or(false)
+    }
+
+    /// Number of live sessions (observability and tests).
+    pub fn active_sessions(&self) -> usize {
+        self.state
+            .lock()
+            .map(|state| state.sessions.len())
+            .unwrap_or(0)
+    }
+}
+
+/// Render a bounded, non-secret identifier (`<prefix>-<n>`).
+fn bounded_identity(prefix: &str, value: u64) -> Result<String, IpcError> {
+    let id = format!("{prefix}-{value}");
+    if id.len() > MAX_AUTHORITY_ID_BYTES {
+        return Err(IpcError::LimitExceeded {
+            field: "authority_id".into(),
+            limit: MAX_AUTHORITY_ID_BYTES,
+            actual: id.len(),
+        });
+    }
+    Ok(id)
+}
+
+/// Live authority for one accepted connection.
+///
+/// Deliberately **not** `Clone`: [`Drop`] revokes the session, so a stray
+/// clone leaving scope would tear down the live connection's authority and
+/// every later `authorize` would fail closed. Hand out the borrowed
+/// [`ControlAuthority`] instead ([`ConnectionGrant::authority`]).
+#[derive(Debug)]
+pub struct ConnectionGrant {
+    authority: ControlAuthority,
+    /// Snapshot minted at `open_connection`. Identity fields never change for
+    /// the session; scopes and capabilities are read live via
+    /// [`ConnectionGrant::snapshot`], never from this copy.
+    initial: AuthorizationSnapshot,
+}
+
+impl ConnectionGrant {
+    /// The authority that owns this connection's session.
+    #[must_use]
+    pub fn authority(&self) -> &ControlAuthority {
+        &self.authority
+    }
+
+    /// Identity minted for this connection (consent generation as of open).
+    #[must_use]
+    pub fn identity(&self) -> &ConnectionIdentity {
+        &self.initial.identity
+    }
+
+    /// Session identifier bound to this connection.
+    #[must_use]
+    pub fn session_id(&self) -> &str {
+        &self.initial.identity.session_id
+    }
+
+    /// Principal identifier bound to this connection.
+    #[must_use]
+    pub fn principal_id(&self) -> &str {
+        &self.initial.identity.principal_id
+    }
+
+    /// The snapshot minted at open (identity, initial scopes, initial map).
+    #[must_use]
+    pub fn initial_snapshot(&self) -> &AuthorizationSnapshot {
+        &self.initial
+    }
+
+    /// Fresh authorization for the live session.
+    ///
+    /// # Errors
+    ///
+    /// `Unauthenticated` once the session is closed or revoked.
+    pub fn snapshot(&self) -> Result<AuthorizationSnapshot, IpcError> {
+        self.authority.snapshot(self.session_id())
+    }
+
+    /// Authorize `method` under the live session (scope plus terminal
+    /// capability).
+    ///
+    /// # Errors
+    ///
+    /// See [`ControlAuthority::authorize_snapshot`].
+    pub fn authorize(&self, method: &str, params: Option<&str>) -> Result<Scope, IpcError> {
+        let snapshot = self.snapshot()?;
+        self.authority.authorize_snapshot(&snapshot, method, params)
+    }
+
+    /// End the session now (idempotent; `Drop` does the same).
+    pub fn close(&self) {
+        self.authority.revoke_session(self.session_id());
+    }
+}
+
+impl Drop for ConnectionGrant {
+    fn drop(&mut self) {
+        self.authority.revoke_session(self.session_id());
+    }
+}
+
+/// Terminal capability a terminal-addressed control verb requires on the
+/// addressed terminal, beyond its method scope (CTX-0792, #1404). `None` for
+/// verbs that address no terminal.
+#[must_use]
+pub fn required_terminal_capability_for_ctl_method(method: &str) -> Option<Scope> {
+    match method {
+        METHOD_GET_TERMINAL_TEXT => Some(Scope::TerminalInspect),
+        METHOD_SEND_INPUT => Some(Scope::TerminalInput),
+        METHOD_CLOSE_TERMINAL => Some(Scope::TerminalManage),
+        _ => None,
+    }
+}
+
+/// Authorize one control action under `authorization`: the method scope
+/// first, then, for terminal-addressed verbs, the capability intersection on
+/// the terminal the params address (CTX-0792, #1404). Both halves deny before
+/// any store or runtime access.
+///
+/// # Errors
+///
+/// Every error of [`authorize_ctl_method`], `InvalidRequest` for malformed
+/// terminal params, and `ScopeDenied` when the terminal capability is absent.
+pub fn authorize_ctl_action(
+    method: &str,
+    params: Option<&str>,
+    authorization: &AuthorizationSnapshot,
+) -> Result<Scope, IpcError> {
+    let required = authorize_ctl_method(method, &authorization.scopes)?;
+    let Some(capability) = required_terminal_capability_for_ctl_method(method) else {
+        return Ok(required);
+    };
+    let terminal_id = match method {
+        METHOD_SEND_INPUT => parse_send_params(params)?.0,
+        METHOD_GET_TERMINAL_TEXT | METHOD_CLOSE_TERMINAL => parse_terminal_id_params(params)?,
+        _ => {
+            return Err(IpcError::NotFound {
+                reason: "unknown terminal action".into(),
+            });
+        }
+    };
+    if authorization.allows_terminal(Some(&terminal_id), capability) {
+        Ok(required)
+    } else {
+        Err(IpcError::ScopeDenied {
+            scope: capability.as_str().into(),
+            action: method.into(),
+        })
+    }
+}
 
 // ── wire method names ─────────────────────────────────────────────────────
 
@@ -510,6 +1139,14 @@ pub fn params_move_panel(position: u64) -> String {
 /// Bounded, quote-aware, backslash-aware; rejects nested objects for the
 /// requested key (control params are flat). Returns `None` when absent.
 fn extract_string_field(params: &str, key: &str) -> Option<String> {
+    extract_optional_string_field(params, key).ok().flatten()
+}
+
+/// Like [`extract_string_field`] but distinguishes an absent key (`Ok(None)`)
+/// from a present key whose value is not a plain string (`Err(())`), so an
+/// optional-field parser can accept absence and reject a malformed value
+/// instead of silently treating both as "not provided".
+fn extract_optional_string_field(params: &str, key: &str) -> Result<Option<String>, ()> {
     let needle = format!("\"{key}\"");
     let mut search = 0usize;
     let bytes = params.as_bytes();
@@ -533,17 +1170,17 @@ fn extract_string_field(params: &str, key: &str) -> Option<String> {
             i += 1;
         }
         if i >= bytes.len() || bytes[i] != b'"' {
-            return None;
+            return Err(());
         }
         i += 1;
         let mut out = String::new();
         while i < bytes.len() {
             match bytes[i] {
-                b'"' => return Some(out),
+                b'"' => return Ok(Some(out)),
                 b'\\' => {
                     i += 1;
                     if i >= bytes.len() {
-                        return None;
+                        return Err(());
                     }
                     match bytes[i] {
                         b'"' => out.push('"'),
@@ -555,28 +1192,28 @@ fn extract_string_field(params: &str, key: &str) -> Option<String> {
                             // Minimal \uXXXX (BMP only, no surrogate handling:
                             // control params never need astral escapes).
                             if i + 4 >= bytes.len() {
-                                return None;
+                                return Err(());
                             }
                             let hex = &params[i + 1..i + 5];
-                            let code = u32::from_str_radix(hex, 16).ok()?;
-                            out.push(char::from_u32(code)?);
+                            let code = u32::from_str_radix(hex, 16).map_err(|_| ())?;
+                            out.push(char::from_u32(code).ok_or(())?);
                             i += 4;
                         }
-                        _ => return None,
+                        _ => return Err(()),
                     }
                     i += 1;
                 }
                 _ => {
                     // Raw UTF-8: advance by char.
-                    let ch = params[i..].chars().next()?;
+                    let ch = params[i..].chars().next().ok_or(())?;
                     out.push(ch);
                     i += ch.len_utf8();
                 }
             }
         }
-        return None;
+        return Err(());
     }
-    None
+    Ok(None)
 }
 
 /// Parse `close`/`text` params (`{ "terminal_id": "t:N" }`).
@@ -596,6 +1233,47 @@ pub fn parse_terminal_id_params(params: Option<&str>) -> Result<String, IpcError
     })?;
     parse_terminal_id(&id)?;
     Ok(id)
+}
+
+/// Parse an optional `terminal_id`/`terminalId` params field.
+///
+/// Same parser (and same [`MAX_CTL_PARAMS_BYTES`] bound) as
+/// [`parse_terminal_id_params`], for read surfaces where the terminal is
+/// optional: a request that names none is answered by the connection wildcard,
+/// a request that names one is validated exactly like the control verbs.
+/// Callers that use the value as a security decision input must use this
+/// rather than scanning the raw params text.
+pub fn parse_optional_terminal_id_params(params: Option<&str>) -> Result<Option<String>, IpcError> {
+    let Some(raw) = params else {
+        return Ok(None);
+    };
+    if raw.len() > MAX_CTL_PARAMS_BYTES {
+        return Err(IpcError::LimitExceeded {
+            field: "params".into(),
+            limit: MAX_CTL_PARAMS_BYTES,
+            actual: raw.len(),
+        });
+    }
+    // Both spellings are accepted; the first one present wins, and a present
+    // but malformed value is rejected instead of being read as "not provided".
+    let found = match extract_optional_string_field(raw, "terminal_id") {
+        Ok(Some(value)) => Some(value),
+        Ok(None) => extract_optional_string_field(raw, "terminalId").map_err(|()| {
+            IpcError::InvalidRequest {
+                reason: "params.terminal_id must be a string like \"t:3\"".into(),
+            }
+        })?,
+        Err(()) => {
+            return Err(IpcError::InvalidRequest {
+                reason: "params.terminal_id must be a string like \"t:3\"".into(),
+            });
+        }
+    };
+    let Some(id) = found else {
+        return Ok(None);
+    };
+    parse_terminal_id(&id)?;
+    Ok(Some(id))
 }
 
 /// Parse `send` params (`{ "terminal_id": "t:N", "text": "..." }`).
@@ -803,10 +1481,319 @@ mod tests {
 
     #[test]
     fn ctl_timeout_budget_is_pinned() {
-        // CTX-0301: one shared budget for both ends of the control channel;
-        // the client socket timeouts in `bitty-app` reuse this constant.
         assert_eq!(CTL_TIMEOUT, std::time::Duration::from_secs(5));
         assert_eq!(CTL_TIMEOUT.as_secs(), 5);
+    }
+
+    #[test]
+    fn authority_mints_distinct_principals_and_sessions() {
+        let authority = ControlAuthority::new();
+        let grant_a = authority
+            .open_connection(
+                ScopeSet::all(),
+                TerminalCapabilities::from_scopes(&ScopeSet::all()),
+            )
+            .expect("first connection");
+        let grant_b = authority
+            .open_connection(
+                ScopeSet::all(),
+                TerminalCapabilities::from_scopes(&ScopeSet::all()),
+            )
+            .expect("second connection");
+        assert_ne!(grant_a.principal_id(), grant_b.principal_id());
+        assert_ne!(grant_a.session_id(), grant_b.session_id());
+        assert_eq!(authority.active_sessions(), 2);
+        grant_a.close();
+        assert!(grant_a.authorize(METHOD_LIST_VIEWS, None).is_err());
+        assert!(grant_b.authorize(METHOD_LIST_VIEWS, None).is_ok());
+    }
+
+    #[test]
+    fn authority_intersects_terminal_capability_per_action() {
+        let mut capabilities = TerminalCapabilities::new();
+        capabilities
+            .grant("t:1", Scope::TerminalInspect)
+            .expect("terminal capability");
+        let authority = ControlAuthority::new();
+        let grant = authority
+            .open_connection(ScopeSet::all(), capabilities)
+            .expect("connection");
+        let text = params_terminal_id("t:1");
+        let input = params_send_input("t:1", "x");
+        assert!(
+            grant
+                .authorize(METHOD_GET_TERMINAL_TEXT, Some(&text))
+                .is_ok()
+        );
+        assert!(grant.authorize(METHOD_SEND_INPUT, Some(&input)).is_err());
+        let other = params_terminal_id("t:2");
+        assert!(
+            grant
+                .authorize(METHOD_GET_TERMINAL_TEXT, Some(&other))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn authority_terminal_capability_grant_narrows_and_releases() {
+        let authority = ControlAuthority::new();
+        let grant = authority
+            .open_connection(
+                ScopeSet::all(),
+                TerminalCapabilities::from_scopes(&ScopeSet::all()),
+            )
+            .expect("connection");
+        let session = grant.session_id().to_string();
+        let text = params_terminal_id("t:1");
+        let input = params_send_input("t:1", "x");
+        let other_input = params_send_input("t:2", "x");
+
+        // Narrow t:1 to inspect: the connection may read it, never drive it.
+        assert!(
+            authority
+                .grant_terminal_capability(&session, "t:1", Scope::TerminalInspect)
+                .is_ok()
+        );
+        assert!(
+            grant
+                .authorize(METHOD_GET_TERMINAL_TEXT, Some(&text))
+                .is_ok()
+        );
+        assert!(grant.authorize(METHOD_SEND_INPUT, Some(&input)).is_err());
+        // The narrowing is per terminal, not per connection.
+        assert!(
+            grant
+                .authorize(METHOD_SEND_INPUT, Some(&other_input))
+                .is_ok()
+        );
+
+        // Grants are additive: a second capability widens that terminal back.
+        assert!(
+            authority
+                .grant_terminal_capability(&session, "t:1", Scope::TerminalInput)
+                .is_ok()
+        );
+        assert!(grant.authorize(METHOD_SEND_INPUT, Some(&input)).is_ok());
+
+        // Releasing the last capability restores wildcard coverage.
+        assert!(authority.release_terminal_capability(&session, "t:1", Scope::TerminalInput));
+        assert!(authority.release_terminal_capability(&session, "t:1", Scope::TerminalInspect));
+        assert!(
+            grant
+                .authorize(METHOD_GET_TERMINAL_TEXT, Some(&text))
+                .is_ok()
+        );
+        assert!(grant.authorize(METHOD_SEND_INPUT, Some(&input)).is_ok());
+        assert!(!authority.release_terminal_capability(&session, "t:1", Scope::TerminalInput));
+    }
+
+    #[test]
+    fn authority_terminal_capability_grant_never_widens() {
+        let authority = ControlAuthority::new();
+        let scopes = ScopeSet::single(Scope::TerminalInspect);
+        let grant = authority
+            .open_connection(scopes.clone(), TerminalCapabilities::from_scopes(&scopes))
+            .expect("connection");
+        let session = grant.session_id().to_string();
+        // A grant the connection's own scopes do not allow is refused, and the
+        // refusal leaves no entry behind that could answer for t:1.
+        assert!(matches!(
+            authority.grant_terminal_capability(&session, "t:1", Scope::TerminalInput),
+            Err(IpcError::ScopeDenied { .. })
+        ));
+        assert!(
+            !grant
+                .snapshot()
+                .expect("snapshot")
+                .terminal_capabilities
+                .allows("t:1", Scope::TerminalInput)
+        );
+        // Unknown session and malformed terminal id fail closed too.
+        assert!(matches!(
+            authority.grant_terminal_capability("session-absent", "t:1", Scope::TerminalInspect),
+            Err(IpcError::Unauthenticated { .. })
+        ));
+        assert!(matches!(
+            authority.grant_terminal_capability(&session, "not-an-id", Scope::TerminalInspect),
+            Err(IpcError::InvalidRequest { .. })
+        ));
+    }
+
+    #[test]
+    fn await_control_reply_reports_unknown_outcome_when_apply_is_in_flight() {
+        let (tx, rx) = std::sync::mpsc::channel::<ControlReply>();
+        let budget = CTL_APPLY_MARGIN + std::time::Duration::from_millis(200);
+        let item = PendingControl::with_deadline(
+            METHOD_LIST_VIEWS,
+            None,
+            "1",
+            tx,
+            std::time::Instant::now() + budget,
+        )
+        .expect("pending control");
+        // The drain claimed the entry and started applying: the effect is in
+        // flight and the waiter must never await it a second time.
+        assert!(item.claim());
+        assert!(item.begin_apply());
+        let started = std::time::Instant::now();
+        let reply = await_control_reply(&rx, item.deadline, item.seq, &item.ticket());
+        let elapsed = started.elapsed();
+        assert!(!reply.ok);
+        assert_eq!(reply.code, "Unavailable");
+        assert!(
+            reply.message.contains("outcome unknown"),
+            "an in-flight apply is never reported as a no-effect timeout: {}",
+            reply.message
+        );
+        assert!(
+            elapsed < budget + std::time::Duration::from_millis(600),
+            "one deadline is the whole bound, got {elapsed:?}"
+        );
+        // The in-flight apply keeps the ticket: the timeout neither withdraws
+        // nor mutates a phase the drain already owns.
+        assert!(!item.ticket().cancel());
+        assert!(!withdraw_control_by_seq(item.seq));
+    }
+
+    #[test]
+    fn await_control_reply_withdraws_a_claimed_entry_before_apply() {
+        let (tx, rx) = std::sync::mpsc::channel::<ControlReply>();
+        let item = PendingControl::with_deadline(
+            METHOD_SPLIT_VIEW,
+            Some(&params_split(SplitDirection::Right)),
+            "1",
+            tx,
+            std::time::Instant::now() + std::time::Duration::from_millis(50),
+        )
+        .expect("pending control");
+        // Popped by the drain but not started: the waiter's timeout withdraws
+        // it, so the drain's `begin_apply` must refuse.
+        assert!(item.claim());
+        let reply = await_control_reply(&rx, item.deadline, item.seq, &item.ticket());
+        assert_eq!(reply.code, "Unavailable");
+        assert!(reply.message.contains("timed out"), "{}", reply.message);
+        assert!(!item.begin_apply(), "a withdrawn entry never applies");
+    }
+
+    #[test]
+    fn begin_apply_refuses_an_entry_inside_the_apply_margin() {
+        let (tx, rx) = std::sync::mpsc::channel::<ControlReply>();
+        let item = PendingControl::with_deadline(
+            METHOD_SPLIT_VIEW,
+            Some(&params_split(SplitDirection::Right)),
+            "1",
+            tx,
+            std::time::Instant::now() + CTL_APPLY_MARGIN / 2,
+        )
+        .expect("pending control");
+        assert!(item.claim());
+        assert!(
+            !item.begin_apply(),
+            "an apply that cannot answer inside the deadline never starts"
+        );
+        let reply = rx.try_recv().expect("immediate no-effect reply");
+        assert!(!reply.ok);
+        assert!(reply.message.contains("timed out"), "{}", reply.message);
+    }
+
+    #[test]
+    fn begin_apply_refuses_a_claimed_entry_past_its_deadline() {
+        let (tx, _rx) = std::sync::mpsc::channel::<ControlReply>();
+        let item = PendingControl::with_deadline(
+            METHOD_SPLIT_VIEW,
+            Some(&params_split(SplitDirection::Right)),
+            "1",
+            tx,
+            std::time::Instant::now() - std::time::Duration::from_millis(1),
+        )
+        .expect("pending control");
+        assert!(item.claim());
+        assert!(!item.begin_apply(), "expired entry must never apply");
+        // Withdrawn, so the client-side cancel has nothing left to cancel and
+        // the drain cannot pick it up again.
+        assert!(!item.ticket().cancel());
+    }
+
+    #[test]
+    fn authority_grant_scope_invalidates_stale_snapshot() {
+        let authority = ControlAuthority::new();
+        let grant = authority
+            .open_connection(ScopeSet::new(), TerminalCapabilities::new())
+            .expect("connection");
+        let stale = grant.snapshot().expect("initial snapshot");
+        assert!(grant.authorize(METHOD_LIST_VIEWS, None).is_err());
+        assert!(authority.grant_scope(grant.session_id(), Scope::ViewInspect));
+        assert!(grant.authorize(METHOD_LIST_VIEWS, None).is_ok());
+        assert!(
+            authority
+                .authorize_snapshot(&stale, METHOD_LIST_VIEWS, None)
+                .is_err()
+        );
+        assert!(!authority.grant_scope(grant.session_id(), Scope::ViewInspect));
+    }
+
+    /// CTX-0792 (#1404): revoking a scope strips it from the terminal
+    /// capability map too (wildcard and per-terminal entries), so the map can
+    /// never keep authorizing a terminal read the connection no longer holds.
+    #[test]
+    fn authority_revoke_scope_strips_terminal_capabilities() {
+        let mut scopes = ScopeSet::new();
+        scopes.insert(Scope::TerminalInspect);
+        scopes.insert(Scope::TerminalInput);
+        let authority = ControlAuthority::new();
+        let grant = authority
+            .open_connection(scopes.clone(), TerminalCapabilities::from_scopes(&scopes))
+            .expect("connection");
+        authority
+            .grant_terminal_capability(grant.session_id(), "t:1", Scope::TerminalInspect)
+            .expect("per-terminal grant");
+        let before = grant.snapshot().expect("snapshot");
+        assert!(before.allows_terminal(None, Scope::TerminalInspect));
+        assert!(before.allows_terminal(Some("t:1"), Scope::TerminalInspect));
+
+        assert!(authority.revoke_scope(grant.session_id(), Scope::TerminalInspect));
+        let after = grant.snapshot().expect("snapshot");
+        assert!(!after.allows_terminal(None, Scope::TerminalInspect));
+        assert!(!after.allows_terminal(Some("t:1"), Scope::TerminalInspect));
+        assert!(
+            !after.allows_terminal(Some("t:2"), Scope::TerminalInspect),
+            "the wildcard lost the scope as well"
+        );
+        assert!(
+            after.allows_terminal(Some("t:2"), Scope::TerminalInput),
+            "unrelated scopes are untouched"
+        );
+        assert_ne!(
+            before.identity.consent_generation, after.identity.consent_generation,
+            "revocation advances the consent generation"
+        );
+    }
+
+    /// CTX-0792 (#1403): identities come from one process-wide counter, so two
+    /// independent authorities can never mint the same session id (the
+    /// automation bearer store is process-wide and keyed by session).
+    #[test]
+    fn independent_authorities_never_share_a_session_id() {
+        let first = ControlAuthority::new()
+            .open_connection(ScopeSet::new(), TerminalCapabilities::new())
+            .expect("first");
+        let second = ControlAuthority::new()
+            .open_connection(ScopeSet::new(), TerminalCapabilities::new())
+            .expect("second");
+        assert_ne!(first.session_id(), second.session_id());
+        assert_ne!(first.principal_id(), second.principal_id());
+    }
+
+    #[test]
+    fn control_sequence_exhaustion_is_terminal() {
+        let mut state = ControlSequenceState {
+            next: Some(u64::MAX),
+        };
+        assert_eq!(allocate_control_seq(&mut state), Ok(u64::MAX));
+        assert!(matches!(
+            allocate_control_seq(&mut state),
+            Err(IpcError::Denied { ref code, .. }) if code == "SequenceExhausted"
+        ));
     }
 
     /// CTX-0529 (LIVE-IPC-004) failing-first: a queued control whose deadline
@@ -820,24 +1807,27 @@ mod tests {
         global_control_queue()
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
-            .push_back(PendingControl::with_deadline(
-                METHOD_LIST_VIEWS,
-                None,
-                "1",
-                tx,
-                // Already past: the caller gave up before the drain ran.
-                std::time::Instant::now()
-                    .checked_sub(std::time::Duration::from_secs(1))
-                    .unwrap_or_else(std::time::Instant::now),
-            ));
+            .push_back(
+                PendingControl::with_deadline(
+                    METHOD_LIST_VIEWS,
+                    None,
+                    "1",
+                    tx,
+                    std::time::Instant::now()
+                        .checked_sub(std::time::Duration::from_secs(1))
+                        .unwrap_or_else(std::time::Instant::now),
+                )
+                .expect("sequence allocation"),
+            );
         assert!(
             pop_pending_control().is_none(),
             "an expired entry must be withdrawn, never handed to the drain"
         );
-        assert!(
-            rx.try_recv().is_err(),
-            "a withdrawn entry must not fabricate a late success reply"
-        );
+        let reply = rx
+            .try_recv()
+            .expect("expired entry gets one terminal reply");
+        assert!(!reply.ok);
+        assert_eq!(reply.code, "Unavailable");
         assert!(
             pop_pending_control().is_none(),
             "the withdrawal must leave nothing behind for a later drain"
@@ -855,16 +1845,22 @@ mod tests {
             let mut guard = global_control_queue()
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
-            guard.push_back(PendingControl::with_deadline(
-                METHOD_LIST_VIEWS,
-                None,
-                "1",
-                stale_tx,
-                std::time::Instant::now()
-                    .checked_sub(std::time::Duration::from_secs(1))
-                    .unwrap_or_else(std::time::Instant::now),
-            ));
-            guard.push_back(PendingControl::new(METHOD_LIST_VIEWS, None, "2", live_tx));
+            guard.push_back(
+                PendingControl::with_deadline(
+                    METHOD_LIST_VIEWS,
+                    None,
+                    "1",
+                    stale_tx,
+                    std::time::Instant::now()
+                        .checked_sub(std::time::Duration::from_secs(1))
+                        .unwrap_or_else(std::time::Instant::now),
+                )
+                .expect("sequence allocation"),
+            );
+            guard.push_back(
+                PendingControl::new(METHOD_LIST_VIEWS, None, "2", live_tx)
+                    .expect("sequence allocation"),
+            );
         }
         let live = pop_pending_control().expect("live tail must still drain");
         assert_eq!(live.id_raw, "2");
@@ -885,13 +1881,16 @@ mod tests {
         global_control_queue()
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
-            .push_back(PendingControl::with_deadline(
-                METHOD_LIST_VIEWS,
-                None,
-                "1",
-                tx,
-                std::time::Instant::now() + Duration::from_millis(50),
-            ));
+            .push_back(
+                PendingControl::with_deadline(
+                    METHOD_LIST_VIEWS,
+                    None,
+                    "1",
+                    tx,
+                    std::time::Instant::now() + Duration::from_millis(50),
+                )
+                .expect("sequence allocation"),
+            );
         // Wait out the deadline exactly like the waiter does, then withdraw.
         assert!(
             rx.recv_timeout(Duration::from_millis(500)).is_err(),
@@ -922,7 +1921,8 @@ mod tests {
             "1",
             tx,
             std::time::Instant::now() + Duration::from_millis(20),
-        );
+        )
+        .expect("sequence allocation");
         assert!(!item.is_expired(std::time::Instant::now()));
         global_control_queue()
             .lock()
@@ -1411,54 +2411,145 @@ pub fn elevation_from_env(raw: Option<&str>) -> ScopeSet {
 /// Maximum queued control actions (drop-newest past this, fail-closed).
 pub const MAX_QUEUED_CONTROLS: usize = 64;
 
-/// Monotonic sequence for queued control actions (CTX-0529).
+/// Part of the [`CTL_TIMEOUT`] budget reserved for applying and answering
+/// (CTX-0792, #1403).
 ///
-/// Lets a timed-out waiter withdraw exactly its own entry without touching
-/// live ones; the drain never executes an entry past its deadline.
-fn next_control_seq() -> u64 {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    // Wrapping past `u64::MAX` lands on 0 once; skip it (0 is never
-    // allocated, mirroring the channel `RequestId` reservation).
-    let mut seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if seq == 0 {
-        seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+/// The drain only starts an apply while at least this much of the entry's
+/// deadline remains, so a normal apply finishes and its real reply reaches the
+/// waiter before the waiter's own timeout. An apply that still overruns the
+/// margin is reported as an unknown outcome, never as a plain timeout that
+/// would claim no effect landed.
+pub const CTL_APPLY_MARGIN: Duration = Duration::from_millis(500);
+
+/// Process-wide control sequence allocator state (non-reusing).
+#[derive(Debug)]
+struct ControlSequenceState {
+    /// Next value to hand out; `None` once the space is exhausted.
+    next: Option<u64>,
+}
+
+fn control_sequence_state() -> &'static Mutex<ControlSequenceState> {
+    static STATE: std::sync::OnceLock<Mutex<ControlSequenceState>> = std::sync::OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(ControlSequenceState { next: Some(1) }))
+}
+
+/// Checked, non-reusing allocation (CORE-RUN-024): a value is never handed
+/// out twice, and exhaustion is terminal (`SequenceExhausted`) instead of
+/// wrapping onto a live entry's sequence.
+fn allocate_control_seq(state: &mut ControlSequenceState) -> Result<u64, IpcError> {
+    let value = state.next.ok_or_else(|| IpcError::Denied {
+        code: "SequenceExhausted".into(),
+        reason: "control sequence space exhausted".into(),
+    })?;
+    state.next = value.checked_add(1);
+    Ok(value)
+}
+
+fn next_control_seq() -> Result<u64, IpcError> {
+    let mut state = control_sequence_state()
+        .lock()
+        .map_err(|_| IpcError::Unavailable {
+            reason: "control sequence allocator unavailable".into(),
+        })?;
+    allocate_control_seq(&mut state)
+}
+
+/// Queue-item lifecycle with exactly one completion owner (CORE-RUN-018).
+///
+/// `Queued -> Claimed -> Applying -> Applied`, or `Withdrawn` from `Queued`
+/// or `Claimed`. Only the drain moves past `Claimed`; a timed-out waiter can
+/// withdraw only an entry the drain has not started applying.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControlPhase {
+    Queued,
+    Claimed,
+    Applying,
+    Applied,
+    Withdrawn,
+}
+
+/// Shared handle on one queued control's phase.
+#[derive(Clone, Debug)]
+pub struct ControlTicket {
+    state: Arc<Mutex<ControlPhase>>,
+}
+
+impl ControlTicket {
+    /// Withdraw the entry if the drain has not started applying it.
+    /// Returns `true` when this call withdrew it.
+    pub fn cancel(&self) -> bool {
+        let Ok(mut phase) = self.state.lock() else {
+            return false;
+        };
+        if matches!(*phase, ControlPhase::Queued | ControlPhase::Claimed) {
+            *phase = ControlPhase::Withdrawn;
+            true
+        } else {
+            false
+        }
     }
-    seq
+
+    /// Whether the drain has started (or finished) applying the entry.
+    fn apply_started(&self) -> bool {
+        self.state
+            .lock()
+            .is_ok_and(|phase| matches!(*phase, ControlPhase::Applying | ControlPhase::Applied))
+    }
 }
 
 /// One queued control action (all `Send`; `Runtime` never crosses threads).
-#[derive(Debug)]
+///
+/// Carries the immutable authorization snapshot taken at enqueue plus the
+/// authority that minted it, so the drain can re-validate consent and session
+/// immediately before mutation (CTX-0792, #1403).
 pub struct PendingControl {
     /// Wire method (e.g. `bitty.debug/sendInput`).
     pub method: String,
-    /// Raw params object (if any).
+    /// Raw params object (if any). Redacted from `Debug`.
     pub params: Option<String>,
     /// Verbatim numeric id token for response correlation.
     pub id_raw: String,
     /// Reply channel back to the connection thread.
     pub reply: std::sync::mpsc::Sender<ControlReply>,
-    /// Owner sequence for targeted withdrawal (CTX-0529).
+    /// Non-reusing owner sequence for targeted withdrawal (CTX-0529).
     pub seq: u64,
-    /// Absolute wall-clock deadline: `enqueue Instant + CTL_TIMEOUT`.
-    ///
-    /// A drain that pops this entry at or past `deadline` withdraws it
-    /// instead of applying it (CTX-0483 never-execute-after-deadline rule
-    /// for the ctl queue), so a timed-out caller can never observe a
-    /// post-timeout effect.
+    /// Absolute deadline: `enqueue Instant + CTL_TIMEOUT`. The drain never
+    /// starts an apply at or past `deadline - CTL_APPLY_MARGIN`.
     pub deadline: std::time::Instant,
+    authority: Option<ControlAuthority>,
+    authorization: Option<AuthorizationSnapshot>,
+    ticket: ControlTicket,
+}
+
+impl fmt::Debug for PendingControl {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PendingControl")
+            .field("method", &self.method)
+            .field("params", &"<redacted>")
+            .field("id_raw", &self.id_raw)
+            .field("seq", &self.seq)
+            .field("deadline", &self.deadline)
+            .field("authority_bound", &self.authority.is_some())
+            .finish()
+    }
 }
 
 impl PendingControl {
-    /// Stamp a live entry: deadline is one full [`CTL_TIMEOUT`] budget from
-    /// now, matching the waiter's `recv_timeout` so pop-time expiry agrees
-    /// with the caller's timeout.
-    #[must_use]
+    /// Stamp an authority-less entry: deadline is one full [`CTL_TIMEOUT`]
+    /// budget from now. Without an authority snapshot the drain can only
+    /// authorize it against the drain's fallback scopes, which production
+    /// passes empty (fail closed).
+    ///
+    /// # Errors
+    ///
+    /// `SequenceExhausted` once the control sequence space is exhausted.
     pub fn new(
         method: &str,
         params: Option<&str>,
         id_raw: &str,
         reply: std::sync::mpsc::Sender<ControlReply>,
-    ) -> Self {
+    ) -> Result<Self, IpcError> {
         Self::with_deadline(
             method,
             params,
@@ -1468,30 +2559,183 @@ impl PendingControl {
         )
     }
 
-    /// Build an entry with an explicit deadline (production uses [`Self::new`];
-    /// tests use this to stage already-expired or short-lived entries).
-    #[must_use]
+    /// Build an authority-less entry with an explicit deadline (tests use this
+    /// to stage already-expired or short-lived entries).
+    ///
+    /// # Errors
+    ///
+    /// `SequenceExhausted` once the control sequence space is exhausted.
     pub fn with_deadline(
         method: &str,
         params: Option<&str>,
         id_raw: &str,
         reply: std::sync::mpsc::Sender<ControlReply>,
         deadline: std::time::Instant,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, IpcError> {
+        Self::with_authority_and_deadline(method, params, id_raw, reply, deadline, None, None)
+    }
+
+    /// Build an entry bound to one connection: it carries the connection's
+    /// live authorization snapshot and authority for the drain-time recheck.
+    ///
+    /// # Errors
+    ///
+    /// `Unauthenticated` when the connection's session is gone, and
+    /// `SequenceExhausted` once the control sequence space is exhausted.
+    pub fn with_connection(
+        method: &str,
+        params: Option<&str>,
+        id_raw: &str,
+        reply: std::sync::mpsc::Sender<ControlReply>,
+        grant: &ConnectionGrant,
+    ) -> Result<Self, IpcError> {
+        Self::with_authority_and_deadline(
+            method,
+            params,
+            id_raw,
+            reply,
+            std::time::Instant::now() + CTL_TIMEOUT,
+            Some(grant.authority().clone()),
+            Some(grant.snapshot()?),
+        )
+    }
+
+    fn with_authority_and_deadline(
+        method: &str,
+        params: Option<&str>,
+        id_raw: &str,
+        reply: std::sync::mpsc::Sender<ControlReply>,
+        deadline: std::time::Instant,
+        authority: Option<ControlAuthority>,
+        authorization: Option<AuthorizationSnapshot>,
+    ) -> Result<Self, IpcError> {
+        Ok(Self {
             method: method.to_string(),
             params: params.map(str::to_string),
             id_raw: id_raw.to_string(),
             reply,
-            seq: next_control_seq(),
+            seq: next_control_seq()?,
             deadline,
+            authority,
+            authorization,
+            ticket: ControlTicket {
+                state: Arc::new(Mutex::new(ControlPhase::Queued)),
+            },
+        })
+    }
+
+    /// Shared handle on this entry's phase (the waiter keeps one).
+    #[must_use]
+    pub fn ticket(&self) -> ControlTicket {
+        self.ticket.clone()
+    }
+
+    /// Authorization snapshot captured at enqueue, if connection-bound.
+    #[must_use]
+    pub fn authorization(&self) -> Option<&AuthorizationSnapshot> {
+        self.authorization.as_ref()
+    }
+
+    /// Authority that minted the snapshot, if connection-bound.
+    #[must_use]
+    pub fn authority(&self) -> Option<&ControlAuthority> {
+        self.authority.as_ref()
+    }
+
+    /// Drain-time authorization: a connection-bound entry is re-validated
+    /// against the live authority (session, consent generation, scope, and
+    /// terminal capability); an authority-less entry only against `fallback`.
+    ///
+    /// # Errors
+    ///
+    /// See [`ControlAuthority::authorize_snapshot`] and
+    /// [`authorize_ctl_method`].
+    pub fn authorize_at_drain(&self, fallback: &ScopeSet) -> Result<Scope, IpcError> {
+        if let (Some(authority), Some(snapshot)) = (&self.authority, &self.authorization) {
+            authority.authorize_snapshot(snapshot, &self.method, self.params.as_deref())
+        } else {
+            authorize_ctl_method(&self.method, fallback)
         }
+    }
+
+    /// Scopes the apply path may use: the snapshot's, never wider.
+    #[must_use]
+    pub fn effective_scopes(&self, fallback: &ScopeSet) -> ScopeSet {
+        self.authorization
+            .as_ref()
+            .map(|snapshot| snapshot.scopes.clone())
+            .unwrap_or_else(|| fallback.clone())
     }
 
     /// Whether `now` is at or past the entry deadline.
     #[must_use]
     pub fn is_expired(&self, now: std::time::Instant) -> bool {
         now >= self.deadline
+    }
+
+    /// Whether too little of the deadline remains to start an apply
+    /// ([`CTL_APPLY_MARGIN`]).
+    fn too_late_to_apply(&self, now: std::time::Instant) -> bool {
+        self.deadline.saturating_duration_since(now) < CTL_APPLY_MARGIN
+    }
+
+    fn claim(&self) -> bool {
+        let Ok(mut phase) = self.ticket.state.lock() else {
+            return false;
+        };
+        if *phase == ControlPhase::Queued {
+            *phase = ControlPhase::Claimed;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Claim the apply phase, refusing an entry too close to its deadline.
+    ///
+    /// A client-side timeout is final, so the deadline is re-checked under the
+    /// same lock as the phase transition: a claimed entry with less than
+    /// [`CTL_APPLY_MARGIN`] left is withdrawn instead of applied, so the apply
+    /// and its reply fit inside the waiter's budget. Once the phase is
+    /// `Applying` the effect is in flight and is never abandoned.
+    pub fn begin_apply(&self) -> bool {
+        let Ok(mut phase) = self.ticket.state.lock() else {
+            return false;
+        };
+        if *phase != ControlPhase::Claimed {
+            return false;
+        }
+        if self.too_late_to_apply(std::time::Instant::now()) {
+            *phase = ControlPhase::Withdrawn;
+            // Answer now with the honest no-effect timeout instead of leaving
+            // the waiter to run out its remaining budget.
+            let _ = self.reply.send(timed_out_control_reply());
+            return false;
+        }
+        *phase = ControlPhase::Applying;
+        true
+    }
+
+    fn cancel(&self) -> bool {
+        self.ticket.cancel()
+    }
+
+    /// Mark an in-flight apply as committed.
+    pub fn finish_apply(&self) {
+        if let Ok(mut phase) = self.ticket.state.lock() {
+            if *phase == ControlPhase::Applying {
+                *phase = ControlPhase::Applied;
+            }
+        }
+    }
+
+    /// Mark a claimed entry as withdrawn without effect (drain-time denial).
+    pub fn finish_without_apply(&self) {
+        if let Ok(mut phase) = self.ticket.state.lock() {
+            if matches!(*phase, ControlPhase::Claimed | ControlPhase::Applying) {
+                *phase = ControlPhase::Withdrawn;
+            }
+        }
     }
 }
 
@@ -1535,11 +2779,12 @@ pub fn pop_pending_control() -> Option<PendingControl> {
             .lock()
             .map(|mut q| q.pop_front())
             .unwrap_or(None)?;
+        if !item.claim() {
+            continue;
+        }
         if item.is_expired(std::time::Instant::now()) {
-            // Withdrawn: no effect applied, no reply sent — the waiter's own
-            // timeout path owns the outcome (including reclaiming the entry
-            // via `withdraw_control_by_seq` when it is still queued).
-            drop(item);
+            item.cancel();
+            let _ = item.reply.send(timed_out_control_reply());
             continue;
         }
         return Some(item);
@@ -1596,7 +2841,7 @@ fn withdraw_controls_where(
         let mut kept = std::collections::VecDeque::with_capacity(guard.len());
         while let Some(item) = guard.pop_front() {
             let owned = seq.is_none_or(|want| item.seq == want);
-            if owned && expired(&item) {
+            if owned && expired(&item) && item.cancel() {
                 dropped.push(item);
             } else {
                 kept.push_back(item);
@@ -1664,13 +2909,137 @@ fn wake_event_loop_for_control() {
     }
 }
 
-/// Enqueue a control action and wait for the main thread to apply it.
+/// Map a pre-enqueue or drain-time [`IpcError`] onto the stable control
+/// reply taxonomy (no new wire codes; messages never echo params or secrets).
+fn control_reply_from_error(ipc_err: IpcError) -> ControlReply {
+    let (category, code, message) = match ipc_err {
+        IpcError::ScopeDenied { scope, action } => (
+            "auth",
+            "ScopeDenied",
+            format!(
+                "permission denied: scope '{scope}' for {action} (needs elevation via BITTY_CTL_ELEVATE)"
+            ),
+        ),
+        // Identity/sequence exhaustion is a terminal service state, not a
+        // permission decision: surface it as `Unavailable` (transport, exit 6)
+        // with the exhausted resource named.
+        IpcError::Denied { code, reason }
+            if matches!(
+                code.as_str(),
+                "SequenceExhausted" | "AuthorityExhausted" | "BearerSequenceExhausted"
+            ) =>
+        {
+            (
+                "transport",
+                "Unavailable",
+                format!("control service unavailable: {code}: {reason}"),
+            )
+        }
+        IpcError::Denied { code, reason } => (
+            "auth",
+            "Denied",
+            format!("permission denied: [{code}] {reason} (needs elevation via BITTY_CTL_ELEVATE)"),
+        ),
+        IpcError::Unauthenticated { .. } => (
+            "auth",
+            "Unauthenticated",
+            String::from("permission denied: connection authority is not active"),
+        ),
+        IpcError::NotFound { .. } => ("usage", "NotFound", String::from("unknown control method")),
+        IpcError::LimitExceeded { .. } => (
+            "budget",
+            "RateLimited",
+            String::from("control authority limit exceeded; try again"),
+        ),
+        IpcError::Unavailable { .. } | IpcError::Internal { .. } => (
+            "transport",
+            "Unavailable",
+            String::from("control service unavailable"),
+        ),
+        IpcError::InvalidRequest { .. } => (
+            "usage",
+            "InvalidParams",
+            String::from("control request parameters rejected"),
+        ),
+        _ => (
+            "usage",
+            "InvalidMethod",
+            String::from("control request rejected"),
+        ),
+    };
+    ControlReply {
+        ok: false,
+        result_json: String::new(),
+        category,
+        code,
+        message,
+    }
+}
+
+/// Reply for a waiter whose deadline passed while the drain was applying:
+/// the effect may have landed, so this never reads as the no-effect timeout.
+fn outcome_unknown_control_reply() -> ControlReply {
+    ControlReply {
+        ok: false,
+        result_json: String::new(),
+        category: "transport",
+        code: "Unavailable",
+        message: String::from(
+            "control outcome unknown: the apply was in flight at the deadline; re-read state before retrying",
+        ),
+    }
+}
+
+/// Wait for the drain's reply under exactly one deadline.
 ///
-/// Called on IPC connection threads (via `devtools` handlers). Authorizes
-/// via `granted` before enqueue (fail-closed, no partial state); the main
-/// thread re-authorizes at apply (defense in depth). Waits up to
-/// [`CTL_TIMEOUT`] for the reply; timeout or a full queue becomes
-/// `Unavailable`.
+/// The control's own deadline is the single bound (the same [`CTL_TIMEOUT`] the
+/// client uses for its socket timeouts), so worst-case per-call server
+/// occupancy is one timeout, never two. On expiry the entry is withdrawn when
+/// the drain has not started it (honest no-effect timeout). An apply already
+/// in flight is not awaited again; the waiter reports an unknown outcome
+/// instead of claiming nothing happened, and the drain's late reply is dropped
+/// with the receiver.
+fn await_control_reply(
+    rx: &std::sync::mpsc::Receiver<ControlReply>,
+    deadline: std::time::Instant,
+    own_seq: u64,
+    ticket: &ControlTicket,
+) -> ControlReply {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    match rx.recv_timeout(remaining) {
+        Ok(reply) => reply,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => ControlReply {
+            ok: false,
+            result_json: String::new(),
+            category: "transport",
+            code: "Unavailable",
+            message: String::from("control completion unavailable"),
+        },
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            // Withdraws only when the entry is still queued: the drain owns a
+            // popped entry and completes or withdraws it under its own phases.
+            let _ = withdraw_control_by_seq(own_seq);
+            // A claimed-but-not-started entry is withdrawn here too, so the
+            // drain's `begin_apply` refuses it.
+            let _ = ticket.cancel();
+            if ticket.apply_started() {
+                // The drain may have answered in the gap; prefer the real reply.
+                return rx
+                    .try_recv()
+                    .unwrap_or_else(|_| outcome_unknown_control_reply());
+            }
+            timed_out_control_reply()
+        }
+    }
+}
+
+/// Enqueue an authority-less control action and wait for the main thread.
+///
+/// Authorizes via `granted` before enqueue (fail-closed, no partial state).
+/// The entry carries no authorization snapshot, so the production drain
+/// (empty fallback scopes) denies it; served connections use
+/// [`enqueue_control_and_wait_with_connection`]. Waits up to [`CTL_TIMEOUT`];
+/// timeout or a full queue becomes `Unavailable` / `RateLimited`.
 pub fn enqueue_control_and_wait(
     method: &str,
     params: Option<&str>,
@@ -1678,41 +3047,47 @@ pub fn enqueue_control_and_wait(
     granted: &ScopeSet,
 ) -> ControlReply {
     if let Err(ipc_err) = authorize_ctl_method(method, granted) {
-        let (category, code, message) = match ipc_err {
-            IpcError::ScopeDenied { .. } => (
-                "auth",
-                "ScopeDenied",
-                format!("permission denied: {ipc_err} (needs elevation via BITTY_CTL_ELEVATE)"),
-            ),
-            // Auth-family failures are permission errors (CLI exit 7), never
-            // transport timeouts or usage errors: name the denial and the
-            // elevation surface so operators never read them as timeouts.
-            IpcError::Denied { code, reason } => (
-                "auth",
-                "Denied",
-                format!(
-                    "permission denied: [{code}] {reason} (needs elevation via BITTY_CTL_ELEVATE)"
-                ),
-            ),
-            IpcError::Unauthenticated { .. } => (
-                "auth",
-                "Unauthenticated",
-                format!("permission denied: {ipc_err}"),
-            ),
-            IpcError::NotFound { .. } => ("usage", "NotFound", format!("{ipc_err}")),
-            _ => ("usage", "InvalidMethod", format!("{ipc_err}")),
-        };
-        return ControlReply {
-            ok: false,
-            result_json: String::new(),
-            category,
-            code,
-            message,
-        };
+        return control_reply_from_error(ipc_err);
     }
     let (tx, rx) = std::sync::mpsc::channel::<ControlReply>();
-    let pending = PendingControl::new(method, params, id_raw, tx);
+    let pending = match PendingControl::new(method, params, id_raw, tx) {
+        Ok(pending) => pending,
+        Err(err) => return control_reply_from_error(err),
+    };
+    enqueue_pending_and_wait(pending, &rx)
+}
+
+/// Enqueue a control action bound to one connection and wait for the drain.
+///
+/// Authorizes under the connection's live authority before enqueue, stamps
+/// the authorization snapshot into the entry, and lets the drain re-validate
+/// it immediately before mutation (CTX-0792, #1403). Waits up to one
+/// [`CTL_TIMEOUT`].
+pub fn enqueue_control_and_wait_with_connection(
+    method: &str,
+    params: Option<&str>,
+    id_raw: &str,
+    grant: &ConnectionGrant,
+) -> ControlReply {
+    if let Err(ipc_err) = grant.authorize(method, params) {
+        return control_reply_from_error(ipc_err);
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<ControlReply>();
+    let pending = match PendingControl::with_connection(method, params, id_raw, tx, grant) {
+        Ok(pending) => pending,
+        Err(err) => return control_reply_from_error(err),
+    };
+    enqueue_pending_and_wait(pending, &rx)
+}
+
+/// Push `pending` (bounded, drop-newest), wake the drain, and wait.
+fn enqueue_pending_and_wait(
+    pending: PendingControl,
+    rx: &std::sync::mpsc::Receiver<ControlReply>,
+) -> ControlReply {
     let own_seq = pending.seq;
+    let deadline = pending.deadline;
+    let ticket = pending.ticket();
     {
         let queue = global_control_queue();
         let mut guard = queue.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -1729,19 +3104,7 @@ pub fn enqueue_control_and_wait(
     }
     // CTX-0235: wake the event loop after queueing (never while holding the
     // queue lock) so an idle window drains promptly instead of timing out.
-    // Authorization already passed above and re-runs at drain; the wakeup
-    // grants nothing and bypasses no check.
+    // The wakeup grants nothing and bypasses no check.
     wake_event_loop_for_control();
-    match rx.recv_timeout(CTL_TIMEOUT) {
-        Ok(reply) => reply,
-        // CTX-0529: the waiter gave up — withdraw our own entry so a slow
-        // drain can never apply it after we already reported failure. When
-        // the drain already popped it, the real reply (or the pop-time
-        // withdraw) already decided the outcome and the extra timeout send
-        // below just finds a disconnected receiver.
-        Err(_) => {
-            withdraw_control_by_seq(own_seq);
-            timed_out_control_reply()
-        }
-    }
+    await_control_reply(rx, deadline, own_seq, &ticket)
 }

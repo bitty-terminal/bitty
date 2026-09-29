@@ -949,7 +949,13 @@ fn every_privileged_dispatch_rechecks_the_bound_peer() {
     ])));
     let mut granted = crate::scope::ScopeSet::new();
     granted.insert(crate::scope::Scope::DebugInspect);
-    let mut context = ServeContext::with_granted_for_tests(&test_server_info(), granted);
+    // `with_granted_session_for_tests` declares the `terminal.inspect` terminal
+    // capability that the debug read surfaces intersect with (CTX-0792 #1404)
+    // while leaving `granted` itself at `debug.inspect` only. Without it the
+    // capability gate would deny the read before the recheck ever runs, and
+    // this test would stop testing the per-dispatch recheck it is named for.
+    let mut context =
+        ServeContext::with_granted_session_for_tests(&test_server_info(), granted, "recheck-probe");
     context
         .bind_connected_stream_for_test(&server, move |_| {
             sequence.lock().unwrap().pop_front().unwrap()
@@ -1048,6 +1054,175 @@ fn serve_connection_rate_limits_with_error_response() {
     let stats = handle.join().unwrap().unwrap();
     assert_eq!(stats.requests, 2);
     assert_eq!(stats.denied, 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn endpoint_rate_budget_is_shared_across_connections() {
+    use std::os::unix::net::UnixStream;
+    use std::sync::{Arc, Mutex};
+
+    let limiter = Arc::new(Mutex::new(RateLimiter::new(100, 1)));
+    for expected_denied in [false, true] {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let dispatcher = Dispatcher::with_defaults();
+        let context = test_context();
+        let peer = crate::auth::verify_peer_for_connection(
+            crate::auth::PeerCredentials::new(1000, 1000, 1),
+            1000,
+        )
+        .unwrap();
+        let limiter = Arc::clone(&limiter);
+        let handle = std::thread::spawn(move || {
+            let clock = || 0u64;
+            dispatcher.serve_connection_with_shared_limiter(
+                &mut server,
+                peer,
+                &context,
+                &limiter,
+                &clock,
+            )
+        });
+        client
+            .write_all(
+                &encode_frame(br#"{"id":1,"method":"bitty.debug/ping","version":"1.0"}"#).unwrap(),
+            )
+            .unwrap();
+        let mut header = [0u8; 4];
+        client.read_exact(&mut header).unwrap();
+        let len = u32::from_be_bytes(header) as usize;
+        let mut body = vec![0u8; len];
+        client.read_exact(&mut body).unwrap();
+        let text = String::from_utf8(body).unwrap();
+        assert_eq!(text.contains("RateLimited"), expected_denied);
+        drop(client);
+        handle.join().unwrap().unwrap();
+    }
+}
+
+/// CTX-0792 / #1404: the endpoint budget is enforced *beside* a per-connection
+/// share, so one abusive connection cannot spend the shared budget (cross-client
+/// availability amplification) while the process-wide bound still holds.
+#[cfg(unix)]
+#[test]
+fn endpoint_budget_bounds_one_connection_without_starving_the_next() {
+    use std::os::unix::net::UnixStream;
+    use std::sync::{Arc, Mutex};
+
+    // Endpoint budget far above both per-connection shares, so the per-connection
+    // bound is the one under test.
+    let endpoint = Arc::new(Mutex::new(RateLimiter::new(10_000, 10_000)));
+    let share = super::serve::RC9_CONN_BURST_PER_SEC as usize;
+
+    let drive = |requests: usize| -> usize {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let dispatcher = Dispatcher::with_defaults();
+        let context = test_context();
+        let peer = crate::auth::verify_peer_for_connection(
+            crate::auth::PeerCredentials::new(1000, 1000, 1),
+            1000,
+        )
+        .unwrap();
+        let endpoint = Arc::clone(&endpoint);
+        let handle = std::thread::spawn(move || {
+            let clock = || 0u64;
+            dispatcher.serve_connection_with_shared_limiter(
+                &mut server,
+                peer,
+                &context,
+                &endpoint,
+                &clock,
+            )
+        });
+        let mut denied = 0usize;
+        for id in 1..=requests as u64 {
+            let payload =
+                format!("{{\"id\":{id},\"method\":\"bitty.debug/ping\",\"version\":\"1.0\"}}");
+            if client
+                .write_all(&encode_frame(payload.as_bytes()).unwrap())
+                .is_err()
+            {
+                break;
+            }
+            let mut header = [0u8; 4];
+            if client.read_exact(&mut header).is_err() {
+                break;
+            }
+            let len = u32::from_be_bytes(header) as usize;
+            let mut body = vec![0u8; len];
+            if client.read_exact(&mut body).is_err() {
+                break;
+            }
+            if String::from_utf8(body).unwrap().contains("RateLimited") {
+                denied += 1;
+            }
+        }
+        drop(client);
+        let _ = handle.join().unwrap().unwrap();
+        denied
+    };
+
+    // The abusive connection is capped at its own share...
+    assert_eq!(drive(share + 10), 10);
+    // ...and the next connection still gets a full share: no cross-connection
+    // starvation, because the shared budget was never the binding constraint.
+    assert_eq!(drive(share), 0);
+}
+
+/// CTX-0792: a panic in any connection thread must not deny IPC traffic for the
+/// process lifetime. The endpoint limiter is recovered with `into_inner`, the
+/// pattern every other shared lock in this crate uses.
+#[cfg(unix)]
+#[test]
+fn endpoint_rate_budget_recovers_from_a_poisoned_lock() {
+    use std::os::unix::net::UnixStream;
+    use std::sync::{Arc, Mutex};
+
+    let endpoint = Arc::new(Mutex::new(RateLimiter::new(100, 2)));
+    let poisoner = Arc::clone(&endpoint);
+    let _ = std::thread::spawn(move || {
+        let _guard = poisoner.lock().expect("first acquisition wins");
+        panic!("simulated panic while holding the endpoint budget");
+    })
+    .join();
+    assert!(endpoint.is_poisoned(), "fixture must poison the limiter");
+
+    let (mut client, mut server) = UnixStream::pair().unwrap();
+    let dispatcher = Dispatcher::with_defaults();
+    let context = test_context();
+    let peer = crate::auth::verify_peer_for_connection(
+        crate::auth::PeerCredentials::new(1000, 1000, 1),
+        1000,
+    )
+    .unwrap();
+    let handle = std::thread::spawn(move || {
+        let clock = || 0u64;
+        dispatcher.serve_connection_with_shared_limiter(
+            &mut server,
+            peer,
+            &context,
+            &endpoint,
+            &clock,
+        )
+    });
+    client
+        .write_all(
+            &encode_frame(br#"{"id":1,"method":"bitty.debug/ping","version":"1.0"}"#).unwrap(),
+        )
+        .unwrap();
+    let mut header = [0u8; 4];
+    client.read_exact(&mut header).unwrap();
+    let len = u32::from_be_bytes(header) as usize;
+    let mut body = vec![0u8; len];
+    client.read_exact(&mut body).unwrap();
+    let text = String::from_utf8(body).unwrap();
+    assert!(
+        text.contains("\"ok\":true"),
+        "a poisoned budget must be recovered, not reported as unavailable: {text}"
+    );
+    drop(client);
+    let stats = handle.join().unwrap().unwrap();
+    assert_eq!(stats.denied, 0);
 }
 
 #[cfg(unix)]
@@ -1901,6 +2076,97 @@ fn debug_read_surface_connection_alone_grants_nothing() {
 }
 
 #[test]
+fn terminal_content_requires_debug_and_terminal_capability_intersection() {
+    let _guard = lock_introspection_for_test();
+    clear_introspection_for_tests();
+    publish_grid_text(
+        vec!["CAPABILITY-SENTINEL".to_string()],
+        0,
+        0,
+        true,
+        1,
+        80,
+        24,
+    );
+    let dispatcher = Dispatcher::with_defaults();
+    let authority = crate::ctl::ControlAuthority::new();
+    let grant = authority
+        .open_connection(
+            crate::scope::ScopeSet::single(crate::scope::Scope::DebugInspect),
+            crate::ctl::TerminalCapabilities::new(),
+        )
+        .expect("connection grant");
+    let context = ServeContext::with_connection_grant_for_tests(&test_server_info(), grant);
+    let outcome = handle_envelope(
+        br#"{"id":1,"method":"bitty.debug/getGridText","version":"1.0"}"#,
+        &dispatcher,
+        &context,
+    );
+    assert!(outcome.was_error);
+    let text = response_text(&outcome);
+    assert!(text.contains("ScopeDenied"));
+    assert!(!text.contains("CAPABILITY-SENTINEL"));
+    let malformed = handle_envelope(
+        br#"{"id":2,"method":"bitty.debug/getGridText","version":"1.0","params":{"terminalId":"not-a-terminal"}}"#,
+        &dispatcher,
+        &ServeContext::with_granted_for_tests(
+            &test_server_info(),
+            crate::scope::ScopeSet::all(),
+        ),
+    );
+    assert!(malformed.was_error);
+    assert!(response_text(&malformed).contains("InvalidParams"));
+    assert!(!response_text(&malformed).contains("CAPABILITY-SENTINEL"));
+    clear_introspection_for_tests();
+}
+
+#[test]
+fn revoked_connection_loses_protected_debug_surface() {
+    let _guard = lock_introspection_for_test();
+    clear_introspection_for_tests();
+    publish_grid_text(vec!["REVOKED-SENTINEL".to_string()], 0, 0, true, 1, 80, 24);
+    let dispatcher = Dispatcher::with_defaults();
+    let authority = crate::ctl::ControlAuthority::new();
+    let mut scopes = crate::scope::ScopeSet::new();
+    scopes.insert(crate::scope::Scope::DebugInspect);
+    scopes.insert(crate::scope::Scope::TerminalInspect);
+    let mut capabilities = crate::ctl::TerminalCapabilities::new();
+    capabilities
+        .grant("t:1", crate::scope::Scope::TerminalInspect)
+        .expect("terminal capability");
+    let grant = authority
+        .open_connection(scopes, capabilities)
+        .expect("connection grant");
+    let session_id = grant.session_id().to_string();
+    let context = ServeContext::with_connection_grant_for_tests(&test_server_info(), grant);
+    let before = handle_envelope(
+        br#"{"id":1,"method":"bitty.debug/getGridText","version":"1.0","params":{"terminalId":"t:1"}}"#,
+        &dispatcher,
+        &context,
+    );
+    assert!(!before.was_error);
+    assert!(response_text(&before).contains("REVOKED-SENTINEL"));
+    assert!(authority.revoke_scope(&session_id, crate::scope::Scope::DebugInspect));
+    let after = handle_envelope(
+        br#"{"id":2,"method":"bitty.debug/getGridText","version":"1.0","params":{"terminalId":"t:1"}}"#,
+        &dispatcher,
+        &context,
+    );
+    assert!(after.was_error);
+    let text = response_text(&after);
+    assert!(text.contains("ScopeDenied"));
+    assert!(!text.contains("REVOKED-SENTINEL"));
+    let plugin = handle_envelope(
+        br#"{"id":3,"method":"bitty.debug/listPlugins","version":"1.0"}"#,
+        &dispatcher,
+        &context,
+    );
+    assert!(plugin.was_error);
+    assert!(response_text(&plugin).contains("ScopeDenied"));
+    clear_introspection_for_tests();
+}
+
+#[test]
 fn debug_read_surface_any_debug_scope_reads_but_others_do_not() {
     // The accepted hierarchy is debug.control > debug.trace > debug.inspect
     // (RFC scopes table), so any one debug scope reads the surface; a peer
@@ -1916,6 +2182,13 @@ fn debug_read_surface_any_debug_scope_reads_but_others_do_not() {
     ] {
         let mut granted = crate::scope::ScopeSet::new();
         granted.insert(scope);
+        // The debug read surface is the intersection of a debug scope with
+        // `terminal.inspect` (CTX-0792 #1404 narrowing, DEC-0073), so the
+        // capability is declared explicitly here to isolate the debug-scope
+        // dimension this test is about.
+        granted.insert(crate::scope::Scope::TerminalInspect);
+        // `with_granted_for_tests` is the hermetic seam that keeps dispatch
+        // open without a bound peer proof (CTX-0768 `test_dispatch`).
         let ctx = ServeContext::with_granted_for_tests(&test_server_info(), granted);
         let outcome = handle_envelope(
             br#"{"id":1,"method":"bitty.debug/getGridText","version":"1.0"}"#,
@@ -3107,6 +3380,324 @@ fn automation_bearer_lifecycle_revoke_ttl_cap_and_no_env_issuance() {
     assert_eq!(automation_bearer_count_for_tests(), 0);
     clear_automation_for_tests();
     clear_introspection_for_tests();
+}
+
+#[test]
+fn regranted_scope_does_not_resurrect_old_bearer() {
+    let _guard = lock_introspection_for_test();
+    clear_introspection_for_tests();
+    clear_automation_for_tests();
+    let authority = crate::ctl::ControlAuthority::new();
+    let mut scopes = crate::scope::ScopeSet::cli_default();
+    scopes.insert(crate::scope::Scope::DebugControl);
+    let grant = authority
+        .open_connection(
+            scopes.clone(),
+            crate::ctl::TerminalCapabilities::from_scopes(&scopes),
+        )
+        .expect("connection grant");
+    let session_id = grant.session_id().to_string();
+    let context = ServeContext::with_connection_grant_for_tests(&test_server_info(), grant);
+    let token = context
+        .issue_automation_bearer("t:1", AutomationFamily::Synthesize, 0)
+        .expect("bearer");
+    assert!(authority.revoke_scope(&session_id, crate::scope::Scope::DebugControl));
+    assert!(authority.grant_scope(&session_id, crate::scope::Scope::DebugControl));
+    let params = format!(
+        "{{\"terminalId\":\"t:1\",\"bearer\":\"{token}\",\"originLabel\":\"h\",\"events\":[{{\"type\":\"key\",\"key\":\"a\"}}]}}"
+    );
+    let outcome = handle_envelope(
+        &synth_envelope(1, &params),
+        &Dispatcher::with_defaults(),
+        &context,
+    );
+    assert!(outcome.was_error);
+    assert!(response_text(&outcome).contains("ScopeDenied"));
+    clear_automation_for_tests();
+    clear_introspection_for_tests();
+}
+
+#[test]
+fn bearer_is_bound_to_one_connection_and_revoked_on_disconnect() {
+    let _guard = lock_introspection_for_test();
+    clear_introspection_for_tests();
+    clear_automation_for_tests();
+    let authority = crate::ctl::ControlAuthority::new();
+    let scopes = crate::scope::ScopeSet::all();
+    let capabilities = crate::ctl::TerminalCapabilities::from_scopes(&scopes);
+    let grant_a = authority
+        .open_connection(scopes.clone(), capabilities.clone())
+        .expect("first connection");
+    let grant_b = authority
+        .open_connection(scopes, capabilities)
+        .expect("second connection");
+    let context_a = ServeContext::with_connection_grant_for_tests(&test_server_info(), grant_a);
+    let context_b = ServeContext::with_connection_grant_for_tests(&test_server_info(), grant_b);
+    let token = context_a
+        .issue_automation_bearer("t:1", AutomationFamily::Synthesize, 0)
+        .expect("bearer");
+    let params = format!(
+        "{{\"terminalId\":\"t:1\",\"bearer\":\"{token}\",\"originLabel\":\"h\",\"events\":[{{\"type\":\"key\",\"key\":\"a\"}}]}}"
+    );
+    let denied = handle_envelope(
+        &synth_envelope(1, &params),
+        &Dispatcher::with_defaults(),
+        &context_b,
+    );
+    assert!(denied.was_error);
+    assert!(response_text(&denied).contains("ScopeDenied"));
+    context_a.close_connection();
+    let revoked = handle_envelope(
+        &synth_envelope(2, &params),
+        &Dispatcher::with_defaults(),
+        &context_a,
+    );
+    assert!(revoked.was_error);
+    assert!(response_text(&revoked).contains("Unauthenticated"));
+    clear_automation_for_tests();
+    clear_introspection_for_tests();
+}
+
+#[test]
+fn automation_bearer_entropy_is_not_metadata_derived() {
+    let _guard = lock_introspection_for_test();
+    clear_automation_for_tests();
+    let first = issue_automation_bearer("entropy", "t:1", AutomationFamily::Synthesize, 7)
+        .expect("first bearer");
+    let second = issue_automation_bearer("entropy", "t:1", AutomationFamily::Synthesize, 7)
+        .expect("second bearer");
+    assert_ne!(first, second);
+    assert_eq!(first.len(), 32);
+    assert_eq!(second.len(), 32);
+    clear_automation_for_tests();
+}
+
+/// CTX-0792 / #1403: the bearer token is 128 bits of platform
+/// CSPRNG output on **every** platform (one `getrandom` path, no cfg split, no
+/// hash-derived fallback), so the properties that matter are pinned here rather
+/// than assumed: full width, distinct draws, halves that are distinct from each
+/// other, and every one of the 128 bit positions taking both values across
+/// draws. A constant source, a narrow source, a zeroed half, or a mirrored half
+/// fails this. What it cannot prove is CSPRNG quality — that is `getrandom`'s
+/// contract, and the point of this test is to fail loudly if anyone reintroduces
+/// a weaker source in its place.
+#[test]
+fn bearer_tokens_are_full_width_csprng_output_on_every_platform() {
+    const DRAWS: usize = 64;
+    const TOKEN_BYTES: usize = 16;
+    const HEX_CHARS: usize = TOKEN_BYTES * 2;
+
+    let _guard = lock_introspection_for_test();
+    clear_automation_for_tests();
+    let mut tokens = std::collections::BTreeSet::new();
+    // Each half is tracked separately: a source that fills only 64 bits and
+    // mirrors them would still vary every bit position and stay distinct, so
+    // half-distinctness is what actually pins the full 128-bit width.
+    let mut low_halves = std::collections::BTreeSet::new();
+    let mut high_halves = std::collections::BTreeSet::new();
+    let mut saw_one = [false; TOKEN_BYTES * 8];
+    let mut saw_zero = [false; TOKEN_BYTES * 8];
+    for _ in 0..DRAWS {
+        let token = issue_automation_bearer("csprng", "t:1", AutomationFamily::Synthesize, 7)
+            .expect("bearer");
+        assert_eq!(
+            token.len(),
+            HEX_CHARS,
+            "a bearer must carry the full 128-bit token width"
+        );
+        assert!(
+            token
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "token must stay the pinned lowercase hex shape: {token}"
+        );
+        let bytes: Vec<u8> = (0..TOKEN_BYTES)
+            .map(|i| u8::from_str_radix(&token[i * 2..i * 2 + 2], 16).expect("hex pair"))
+            .collect();
+        for (byte_index, byte) in bytes.iter().enumerate() {
+            for bit in 0..8 {
+                let position = byte_index * 8 + bit;
+                if byte & (1 << bit) == 0 {
+                    saw_zero[position] = true;
+                } else {
+                    saw_one[position] = true;
+                }
+            }
+        }
+        let (low, high) = bytes.split_at(TOKEN_BYTES / 2);
+        assert_ne!(
+            low, high,
+            "the high half must carry its own bytes, not a copy of the low half"
+        );
+        low_halves.insert(low.to_vec());
+        high_halves.insert(high.to_vec());
+        assert!(tokens.insert(token), "every draw must be distinct");
+    }
+    for position in 0..TOKEN_BYTES * 8 {
+        assert!(
+            saw_one[position] && saw_zero[position],
+            "token bit {position} never varied across {DRAWS} CSPRNG draws"
+        );
+    }
+    assert_eq!(
+        low_halves.len(),
+        DRAWS,
+        "the low 64 bits must be unpredictable on their own"
+    );
+    assert_eq!(
+        high_halves.len(),
+        DRAWS,
+        "the high 64 bits must be unpredictable on their own, not a copy of the low half"
+    );
+    clear_automation_for_tests();
+}
+
+/// CTX-0792 / #1404: a consent-issued automation bearer is the production
+/// per-terminal capability grant, and the intersection is enforced by every
+/// later authorize, not only by the automation path. A read-only binding on
+/// `t:1` may still read it, may never drive it, and leaves every other terminal
+/// on the connection untouched until the grant is released.
+#[test]
+fn automation_bearer_grant_narrows_the_terminal_capability_it_binds() {
+    let _guard = lock_introspection_for_test();
+    clear_automation_for_tests();
+    let authority = crate::ctl::ControlAuthority::new();
+    let scopes = crate::scope::ScopeSet::all();
+    let grant = authority
+        .open_connection(
+            scopes.clone(),
+            crate::ctl::TerminalCapabilities::from_scopes(&scopes),
+        )
+        .expect("connection grant");
+    let text = crate::ctl::params_terminal_id("t:1");
+    let input = crate::ctl::params_send_input("t:1", "x");
+    let other_input = crate::ctl::params_send_input("t:2", "x");
+    assert!(
+        grant
+            .authorize(crate::ctl::METHOD_SEND_INPUT, Some(&input))
+            .is_ok(),
+        "precondition: the connection may drive t:1 before it binds itself"
+    );
+
+    let token = crate::devtools::automation::issue_automation_bearer_for_connection(
+        &grant,
+        "t:1",
+        AutomationFamily::Capture,
+        0,
+        None,
+    )
+    .expect("capture bearer");
+
+    // The binding narrows t:1 to inspect; the control surface enforces it.
+    assert!(
+        grant
+            .authorize(crate::ctl::METHOD_GET_TERMINAL_TEXT, Some(&text))
+            .is_ok()
+    );
+    let denied = grant
+        .authorize(crate::ctl::METHOD_SEND_INPUT, Some(&input))
+        .expect_err("a capture binding must not be able to drive the terminal");
+    assert!(
+        matches!(denied, crate::IpcError::ScopeDenied { .. }),
+        "unexpected denial: {denied:?}"
+    );
+    assert!(
+        grant
+            .authorize(crate::ctl::METHOD_SEND_INPUT, Some(&other_input))
+            .is_ok(),
+        "the narrowing is per terminal, not per connection"
+    );
+
+    // A second binding for the same terminal unions, so ordering never traps a
+    // client that needs both families.
+    let synth = crate::devtools::automation::issue_automation_bearer_for_connection(
+        &grant,
+        "t:1",
+        AutomationFamily::Synthesize,
+        0,
+        None,
+    )
+    .expect("synthesize bearer");
+    assert!(
+        grant
+            .authorize(crate::ctl::METHOD_SEND_INPUT, Some(&input))
+            .is_ok()
+    );
+
+    // Revoking one binding releases only that capability: the surviving
+    // synthesize binding keeps input, inspect is withdrawn.
+    assert!(crate::devtools::automation::revoke_automation_bearer(
+        &token
+    ));
+    assert!(
+        grant
+            .authorize(crate::ctl::METHOD_SEND_INPUT, Some(&input))
+            .is_ok()
+    );
+    assert!(
+        grant
+            .authorize(crate::ctl::METHOD_GET_TERMINAL_TEXT, Some(&text))
+            .is_err()
+    );
+    assert!(
+        grant
+            .authorize(crate::ctl::METHOD_SEND_INPUT, Some(&other_input))
+            .is_ok()
+    );
+
+    // Releasing the last binding empties the entry, so the terminal falls back
+    // to the connection wildcard.
+    assert!(crate::devtools::automation::revoke_automation_bearer(
+        &synth
+    ));
+    assert!(
+        grant
+            .authorize(crate::ctl::METHOD_GET_TERMINAL_TEXT, Some(&text))
+            .is_ok()
+    );
+    assert!(
+        grant
+            .authorize(crate::ctl::METHOD_SEND_INPUT, Some(&input))
+            .is_ok()
+    );
+    clear_automation_for_tests();
+}
+
+/// A session that cannot drive a terminal never gains the capability to bind
+/// one: issuance is refused and no bearer is minted, so no automation token
+/// survives a denied capability.
+#[test]
+fn denied_terminal_capability_mints_no_bearer() {
+    let _guard = lock_introspection_for_test();
+    clear_automation_for_tests();
+    let authority = crate::ctl::ControlAuthority::new();
+    let mut scopes = crate::scope::ScopeSet::cli_default();
+    scopes.insert(crate::scope::Scope::DebugControl);
+    let grant = authority
+        .open_connection(
+            scopes.clone(),
+            crate::ctl::TerminalCapabilities::from_scopes(&scopes),
+        )
+        .expect("connection grant");
+    let session_id = grant.session_id().to_string();
+    // Consent is withdrawn between the capability decision and the binding.
+    assert!(authority.revoke_scope(&session_id, crate::scope::Scope::TerminalInput));
+    assert!(
+        crate::devtools::automation::issue_automation_bearer_for_connection(
+            &grant,
+            "t:1",
+            AutomationFamily::Synthesize,
+            0,
+            None,
+        )
+        .is_err()
+    );
+    assert_eq!(
+        crate::devtools::automation::automation_bearer_count_for_tests(),
+        0,
+        "a denied capability must not leave a bearer behind"
+    );
+    clear_automation_for_tests();
 }
 
 #[test]

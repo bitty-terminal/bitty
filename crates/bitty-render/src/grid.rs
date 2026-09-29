@@ -1517,6 +1517,8 @@ pub struct GlyphAtlas {
     /// Set when a placement pass could not fit a glyph and therefore needs
     /// the caller to reset and rebuild before the frame is returned.
     exhausted: bool,
+    /// Maximum dimension the atlas is allowed to grow to (lazily allocated).
+    max_dimension: u16,
     hits: u64,
     misses: u64,
     evictions: u64,
@@ -1524,7 +1526,8 @@ pub struct GlyphAtlas {
 }
 
 impl GlyphAtlas {
-    /// Creates an empty square atlas of side `dimension`.
+    /// Creates an empty square atlas of side `dimension` as the maximum size.
+    /// Allocation starts at INITIAL_ATLAS_DIMENSION and grows on demand.
     ///
     /// # Errors
     ///
@@ -1533,14 +1536,22 @@ impl GlyphAtlas {
         Self::with_dims(dimension, dimension)
     }
 
-    /// Creates an empty atlas with explicit dimensions.
+    /// Creates an empty atlas with explicit dimensions as the maximum size.
+    /// Allocation starts at INITIAL_ATLAS_DIMENSION and grows on demand.
     ///
     /// # Errors
     ///
     /// [`RenderError::InvalidInput`] when either dimension is zero.
     pub fn with_dims(width: u16, height: u16) -> Result<Self, RenderError> {
-        let layout = AtlasLayout::new(width, height)?;
-        let len = usize::from(width) * usize::from(height);
+        if width == 0 || height == 0 {
+            return Err(RenderError::InvalidInput {
+                reason: "atlas dimensions must be non-zero",
+            });
+        }
+        // Start with a small atlas, grow on demand up to the requested max.
+        let initial_dim = crate::atlas::INITIAL_ATLAS_DIMENSION.min(width.min(height));
+        let layout = AtlasLayout::new(initial_dim, initial_dim)?;
+        let len = usize::from(initial_dim) * usize::from(initial_dim);
         Ok(Self {
             layout,
             slots: HashMap::new(),
@@ -1548,6 +1559,7 @@ impl GlyphAtlas {
             pending: Vec::new(),
             epoch: 0,
             exhausted: false,
+            max_dimension: width.min(height),
             hits: 0,
             misses: 0,
             evictions: 0,
@@ -1616,10 +1628,9 @@ impl GlyphAtlas {
     }
 
     /// True when `width` x `height` can never fit this atlas, regardless of
-    /// how full it is (zero span or larger than the atlas itself).
+    /// how full it is (zero span or larger than the configured maximum).
     fn oversized(&self, width: u16, height: u16) -> bool {
-        let dims = self.layout.dimensions();
-        width == 0 || height == 0 || width > dims.width || height > dims.height
+        width == 0 || height == 0 || width > self.max_dimension || height > self.max_dimension
     }
 
     /// Atlas texture dimensions.
@@ -1701,6 +1712,67 @@ impl GlyphAtlas {
         self.reset_placements();
     }
 
+    /// Attempts to grow the atlas to the next power-of-two dimension.
+    /// Returns `true` if growth succeeded, `false` if already at max.
+    ///
+    /// Growth preserves existing placements by reallocating the texture
+    /// buffer and copying slot data to the new layout.
+    pub fn try_grow(&mut self) -> bool {
+        let current = self.layout.dimensions().width;
+        if current >= self.max_dimension {
+            return false; // Already at max
+        }
+
+        // Double the dimension, but don't exceed max_dimension.
+        // Use u32 arithmetic to avoid overflow, then cap and convert back.
+        let next = u32::from(current)
+            .saturating_mul(2)
+            .min(u32::from(self.max_dimension));
+        let next = u16::try_from(next).expect("capped by max_dimension which is u16");
+
+        // Reallocate texture buffer.
+        let new_len = usize::from(next) * usize::from(next);
+        let mut new_texels = vec![0; new_len];
+
+        // Copy existing slot data to the new buffer (coordinates stay valid
+        // since we're only expanding the canvas, not changing existing slots).
+        let old_stride = usize::from(current);
+        let new_stride = usize::from(next);
+        for slot in self.slots.values() {
+            let slot_w = usize::from(slot.width);
+            for row in 0..usize::from(slot.height) {
+                let old_offset = (usize::from(slot.y) + row) * old_stride + usize::from(slot.x);
+                let new_offset = (usize::from(slot.y) + row) * new_stride + usize::from(slot.x);
+                new_texels[new_offset..new_offset + slot_w]
+                    .copy_from_slice(&self.texels[old_offset..old_offset + slot_w]);
+            }
+        }
+
+        // Update layout and texels (keep slots, they're still valid).
+        self.layout = AtlasLayout::new(next, next).expect("valid dimension");
+        self.layout
+            .allocate(current, current)
+            .expect("grown layout can reserve the old region");
+        self.texels = new_texels;
+        self.epoch = self.epoch.wrapping_add(1);
+        self.exhausted = false;
+
+        // Mark all slots for re-upload since the texture changed.
+        self.pending.clear();
+        for slot in self.slots.values() {
+            let slot_w = usize::from(slot.width);
+            let slot_h = usize::from(slot.height);
+            let mut data = Vec::with_capacity(slot_w * slot_h);
+            for row in 0..slot_h {
+                let offset = (usize::from(slot.y) + row) * new_stride + usize::from(slot.x);
+                data.extend_from_slice(&self.texels[offset..offset + slot_w]);
+            }
+            self.pending.push(AtlasUpload { slot: *slot, data });
+        }
+
+        true
+    }
+
     /// Ensures `bitmap` is placed for `key`, queueing an upload when newly
     /// placed. Blank bitmaps are refused by callers before reaching the
     /// atlas.
@@ -1730,8 +1802,21 @@ impl GlyphAtlas {
         }
 
         let Some(slot) = self.layout.allocate(width, height) else {
-            // Exhaustion (not oversize): flag for a caller-driven reset and
-            // rebuild; this pass keeps a clean inline fallback meanwhile.
+            // Exhaustion (not oversize): try to grow before falling back.
+            if self.try_grow() {
+                // Growth succeeded, retry allocation.
+                if let Some(slot) = self.layout.allocate(width, height) {
+                    let coverage = coverage_mask(bitmap);
+                    write_slot_texels(&mut self.texels, self.layout.dimensions(), slot, &coverage);
+                    self.pending.push(AtlasUpload {
+                        slot,
+                        data: coverage,
+                    });
+                    self.slots.insert(key, slot);
+                    return GlyphSource::Atlas { slot };
+                }
+            }
+            // Growth failed or retry failed: flag exhaustion and use inline fallback.
             self.exhausted = true;
             return self.fallback_inline(bitmap);
         };
@@ -2153,7 +2238,22 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
                 }
             }
         }
+        self.refresh_atlas_uvs(&mut pass.glyphs);
+        pass.atlas_epoch = self.atlas.epoch();
         pass
+    }
+
+    /// Refreshes atlas-backed glyph UVs to match the current atlas dimensions.
+    /// Called after placement passes that may have grown the atlas, ensuring
+    /// earlier glyphs use the new dimensions rather than stale UVs normalized
+    /// against the old atlas size.
+    fn refresh_atlas_uvs(&self, glyphs: &mut [GlyphInstance]) {
+        let dims = self.atlas.dims();
+        for glyph in glyphs {
+            if let GlyphSource::Atlas { slot } = &glyph.source {
+                glyph.uv = slot.uv(dims);
+            }
+        }
     }
 
     /// Emits background, decorations, and (unless suppressed) one glyph for
@@ -2539,6 +2639,7 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
             self.counters.glyphs_emitted += 1;
             col += advance;
         }
+        self.refresh_atlas_uvs(&mut out);
         (out, self.atlas.is_exhausted())
     }
 }

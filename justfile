@@ -129,6 +129,12 @@ ci-local *args:
 pty-gate:
     ./scripts/check-pty-gated-tests.sh
 
+# #1519: a `test-support` feature (hermetic entry points such as bitty-ipc's
+# authority-less ServeContext constructors) must never be enabled through a
+# normal or build dependency edge.
+test-support-gate:
+    ./scripts/check-test-support-gate.sh
+
 # Run the M1 evidence suites on this host and print the per-platform
 # table: `just m1-matrix`. The aggregated Tier 1 view lives in CI
 # (`.github/workflows/ci.yml` job `m1-matrix`); see scripts/m1-matrix.sh.
@@ -266,7 +272,7 @@ commit-check message:
     @cp commitlint.config.ts target/dev-tools/commitlint.config.ts
     @msg="$(realpath "{{message}}")" && cd target/dev-tools && bunx --bun commitlint --edit "$msg"
 
-check: fmt-check clippy test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate status-drift status-drift-test docs-pin-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test unix-bundle-test macos-dmg-test verify-unix-bundle-dispatch-test rust-channel-test binary-arch-test workflow-publish-test m1-matrix-test compat-matrix-test real-render-soak-test dogfood-session-test actionlint markdownlint
+check: fmt-check clippy test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate test-support-gate status-drift status-drift-test docs-pin-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test unix-bundle-test macos-dmg-test verify-unix-bundle-dispatch-test rust-channel-test binary-arch-test workflow-publish-test m1-matrix-test compat-matrix-test real-render-soak-test dogfood-session-test actionlint markdownlint
 
 # Parser-throughput baseline (CTX-0576, M1-11). Runs the deterministic
 # headless parser benchmark over the committed VT/escape corpora and verifies

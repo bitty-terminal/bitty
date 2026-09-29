@@ -66,6 +66,9 @@ fn bench_apply(actions: &[TerminalAction], iters: usize) -> f64 {
 }
 
 fn main() {
+    // `cargo test --benches` runs this unoptimized as a smoke check; only
+    // `cargo bench` runs the full measurement (CTX-0854).
+    let invocation = bitty_perf::BenchInvocation::current();
     let bytes = synthetic_bytes();
     let actions = parse_actions(&bytes);
     assert!(!actions.is_empty(), "synthetic must decode");
@@ -73,7 +76,7 @@ fn main() {
     // PB-4 headroom: plugin event pipeline must stay off this hot path
     // (core-boundaries.md). This bench proves the core path alone is well
     // under 8 ms; plugins will be measured separately under isolation RFC.
-    let iters_small = 5_000usize;
+    let iters_small = invocation.workload(5_000, 1);
     let mean_us = bench_apply(&actions, iters_small);
     // Rough p50 gate: mean per batch; real p50/p99 comes from `tools/perf/latency`
     // which samples keystroke→photon. Here we just note the bound.
@@ -100,7 +103,7 @@ fn main() {
         v
     };
     let big_actions = parse_actions(&big_bytes);
-    let iters = 2_000usize;
+    let iters = invocation.workload(2_000, 1);
     let start = Instant::now();
     for _ in 0..iters {
         let mut s = State::new();
@@ -138,7 +141,7 @@ fn main() {
     // Copy appendaged glyph for latency sanity: single print via `TerminalAction::Print`
     let print_action = TerminalAction::Print(GraphemeCell::from('A'));
     let start = Instant::now();
-    let iters_print = 50_000usize;
+    let iters_print = invocation.workload(50_000, 1);
     for _ in 0..iters_print {
         let mut s = State::new();
         s.apply(black_box(&print_action));

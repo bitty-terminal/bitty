@@ -436,6 +436,8 @@ pub use record::{
 };
 #[cfg(unix)]
 pub use serve::serve_bound_connection;
+#[cfg(unix)]
+pub use serve::serve_bound_connection_with_endpoint_budget;
 pub use serve::{
     ConnectedPeerProof, ConnectionStats, DirAttestation, HandleOutcome, ServeContext, ServerInfo,
     SocketEndpointIdentity, SocketEnv, attest_bound_socket, encode_error, encode_success,

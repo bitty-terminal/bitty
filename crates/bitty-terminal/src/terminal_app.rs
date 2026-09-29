@@ -456,9 +456,12 @@ impl TerminalApp {
         // tree first (with the staleness/generation check inside
         // `ZoomState`), so the eventual zoom restore cannot drop the pane
         // the verb created.
+        // CTX-0792 (#1403): the empty fallback means only entries carrying a
+        // connection authorization snapshot can apply; the drain re-validates
+        // each snapshot against the live connection authority.
         let _ = ctl::drain_global_control_queue_with(
             &mut self.runtime,
-            &ctl::granted_scopes_for_servo(),
+            &bitty_ipc::ScopeSet::new(),
             |runtime, method| {
                 if ctl::method_mutates_layout(method) {
                     self.chrome.zoom.restore_for_mutation(runtime);

@@ -46,6 +46,21 @@ ci-local *args:
     #!/usr/bin/env bash
     set -euo pipefail
     root="$(git rev-parse --show-toplevel)"
+    # act derives job container names from the workflow and job, so two
+    # ci-local runs on one Docker daemon collide even from different
+    # worktrees: the second run removes the first run's container mid-job
+    # (exit 137). Serialize runs per repository with a lock in the shared git
+    # directory, and fail fast instead of clobbering a running job.
+    if command -v flock >/dev/null 2>&1; then
+      lock="$(git rev-parse --path-format=absolute --git-common-dir)/ci-local.lock"
+      exec 9>"$lock"
+      if ! flock -n 9; then
+        echo "ci-local: another ci-local run of this repository holds $lock; wait for it to finish" >&2
+        exit 1
+      fi
+    else
+      echo "ci-local: flock not found; concurrent runs are not serialized" >&2
+    fi
     branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo detached)"
     [ "$branch" = "HEAD" ] && branch="detached-$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
     tag="$(printf '%s' "$branch" | tr -c 'A-Za-z0-9_.-' '-' | cut -c1-64)"
@@ -61,6 +76,33 @@ ci-local *args:
     docker_gid="$(getent group docker 2>/dev/null | cut -d: -f3 || true)"
     group_add=()
     [ -n "$docker_gid" ] && group_add=(--group-add "$docker_gid")
+    # Job containers clone actions (checkout/cache) and fetch crates from
+    # GitHub and crates.io. On a host behind an egress proxy the container's
+    # direct connection dies mid-clone with a transient
+    # `Get .../info/refs...: unexpected EOF`, which reads like a flaky gate.
+    # Forward the host proxy when one is configured; act runs the container on
+    # the host network, so a 127.0.0.1 proxy stays reachable. NO_PROXY keeps
+    # loopback (the act server) off the proxy.
+    proxy="${HTTPS_PROXY:-${https_proxy:-${HTTP_PROXY:-${http_proxy:-${NETWORK_PROXY:-}}}}}"
+    # The job runs checked-out (possibly untrusted PR) code that can read its
+    # environment, so a proxy URL carrying credentials (`scheme://user:pass@`)
+    # is never forwarded; use a credential-free (for example loopback) proxy.
+    case "$proxy" in
+      *://*@*)
+        echo "ci-local: not forwarding a proxy URL that carries credentials into the job container" >&2
+        proxy=""
+        ;;
+    esac
+    proxy_env=()
+    if [ -n "$proxy" ]; then
+      proxy_env=(
+        --env "HTTP_PROXY=$proxy" --env "HTTPS_PROXY=$proxy"
+        --env "http_proxy=$proxy" --env "https_proxy=$proxy"
+        --env "ALL_PROXY=$proxy" --env "all_proxy=$proxy"
+        --env "NO_PROXY=localhost,127.0.0.1,::1"
+        --env "no_proxy=localhost,127.0.0.1,::1"
+      )
+    fi
     if ! docker image inspect bitty-act:latest >/dev/null 2>&1; then
       echo "building bitty-act:latest from .github/act/Dockerfile (one-time)" >&2
       docker build -t bitty-act:latest "$root/.github/act" >&2
@@ -81,6 +123,7 @@ ci-local *args:
       --container-options "-u ubuntu ${group_add[*]:-} -v $cache/cargo-registry:$ctr_cargo/registry -v $cache/cargo-git:$ctr_cargo/git -v $cache/target:/cache/target -v $cache/target:$root/target" \
       --env HOME=$ctr_home --env CARGO_HOME=$ctr_cargo --env RUSTUP_HOME=$ctr_rustup \
       --env CARGO_TARGET_DIR=/cache/target --env CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-$(nproc)}" \
+      ${proxy_env[@]+"${proxy_env[@]}"} \
       {{args}}
 
 pty-gate:

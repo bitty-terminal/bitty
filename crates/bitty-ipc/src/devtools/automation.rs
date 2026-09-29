@@ -57,8 +57,14 @@ impl AutomationFamily {
 /// One issued automation bearer (server-side only, never persisted).
 #[derive(Debug, Clone)]
 struct AutomationBearerRecord {
-    /// Debug-session identity it was issued to.
+    /// Session the bearer is bound to (revoked with the session).
     session_id: String,
+    /// Principal the bearer is bound to; empty for the unbound legacy
+    /// minters, which is why their bearers never satisfy an authority-bound
+    /// context.
+    principal_id: String,
+    /// Consent generation at issuance; a later consent change voids it.
+    consent_generation: u64,
     /// Single terminal it may address (`t:N`).
     terminal_id: String,
     /// Method family it may call.
@@ -66,6 +72,17 @@ struct AutomationBearerRecord {
     /// Expiry time (issuance + TTL, saturating; bearer-clock base matches
     /// `ServeContext::uptime_ms`).
     expires_at_ms: u64,
+}
+
+/// Terminal capability a family is bound to (never widened: see
+/// [`AutomationFamily`]).
+fn terminal_scope_for(family: AutomationFamily) -> crate::scope::Scope {
+    match family {
+        AutomationFamily::Synthesize => crate::scope::Scope::TerminalInput,
+        AutomationFamily::Capture | AutomationFamily::FrameDigest => {
+            crate::scope::Scope::TerminalInspect
+        }
+    }
 }
 
 /// One audited frame-observation entry (bounded, drop-oldest).
@@ -113,40 +130,33 @@ pub(super) fn automation_store() -> &'static Mutex<AutomationStore> {
     STORE.get_or_init(|| Mutex::new(AutomationStore::default()))
 }
 
-/// 64-bit FNV-1a (std-only, deterministic token mixing, not a security hash
-/// on its own: uniqueness comes from the per-process counter + time + pid).
-fn fnv1a64(bytes: &[u8], seed: u64) -> u64 {
-    const PRIME: u64 = 0x100000001b3;
-    let mut hash = seed;
-    for b in bytes {
-        hash ^= u64::from(*b);
-        hash = hash.wrapping_mul(PRIME);
-    }
-    hash
+/// Random bytes in one bearer token (128 bits of CSPRNG output).
+const BEARER_TOKEN_BYTES: usize = 16;
+
+/// Fill `dest` from the platform CSPRNG, on every platform.
+///
+/// `getrandom` is the in-tree entropy source (`bitty-rich` already mints its
+/// clipboard grant tokens with it, same version line, same purpose): the
+/// kernel CSPRNG on unix and `BCryptGenRandom` on Windows, behind one safe API.
+/// There is deliberately no fallback and no platform cfg here — a bearer is the
+/// authority token for automation synthesize, capture, and frame-digest, so a
+/// platform that cannot produce unpredictable bytes must fail the issuance
+/// closed rather than mint a token derived from anything weaker (CTX-0792,
+/// #1403).
+fn fill_secure_random(dest: &mut [u8]) -> Result<(), IpcError> {
+    getrandom::fill(dest).map_err(|err| IpcError::Unavailable {
+        reason: format!("secure bearer source unavailable: {err}"),
+    })
 }
 
-/// Render a 32-hex bearer token from issuance coordinates.
-fn render_bearer_token(
-    session_id: &str,
-    terminal_id: &str,
-    family: AutomationFamily,
-    counter: u64,
-    now_ms: u64,
-) -> String {
-    let pid = std::process::id();
-    let mut material = Vec::with_capacity(128);
-    material.extend_from_slice(session_id.as_bytes());
-    material.push(0);
-    material.extend_from_slice(terminal_id.as_bytes());
-    material.push(0);
-    material.extend_from_slice(family.as_str().as_bytes());
-    material.push(0);
-    material.extend_from_slice(&counter.to_le_bytes());
-    material.extend_from_slice(&now_ms.to_le_bytes());
-    material.extend_from_slice(&pid.to_le_bytes());
-    let h1 = fnv1a64(&material, 0xcbf29ce484222325);
-    let h2 = fnv1a64(&material, 0x84222325cbf29ce4);
-    format!("{h1:016x}{h2:016x}")
+fn random_bearer_token() -> Result<String, IpcError> {
+    let mut bytes = [0u8; BEARER_TOKEN_BYTES];
+    fill_secure_random(&mut bytes)?;
+    let mut token = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        token.push_str(&format!("{byte:02x}"));
+    }
+    Ok(token)
 }
 
 /// Validate a session id for bearer binding (1..=64 chars, no NUL/control).
@@ -233,6 +243,91 @@ pub fn issue_automation_bearer_with_ttl(
     now_ms: u64,
     ttl_ms: u64,
 ) -> Result<String, IpcError> {
+    issue_automation_bearer_internal(
+        session_id,
+        terminal_id,
+        family,
+        now_ms,
+        ttl_ms,
+        BearerBinding::unbound(),
+    )
+}
+
+/// Issue a bearer bound to one live connection (CTX-0792, #1403).
+///
+/// The bearer is bound to the connection's session, principal, and current
+/// consent generation, and to exactly one terminal and method family. The
+/// connection must hold the family's debug scope and terminal scope. Issuance
+/// does not touch the connection's terminal capability map: the terminal
+/// binding lives in the bearer record itself.
+///
+/// Test-only until explicit local-user consent is wired: the connection's
+/// scopes are an operator ceiling, not consent (see
+/// `ServeContext::issue_automation_bearer`).
+#[cfg(test)]
+pub(crate) fn issue_automation_bearer_for_connection(
+    grant: &crate::ctl::ConnectionGrant,
+    terminal_id: &str,
+    family: AutomationFamily,
+    now_ms: u64,
+    ttl_ms: Option<u64>,
+) -> Result<String, IpcError> {
+    let snapshot = grant.snapshot()?;
+    let debug_scope = match family {
+        AutomationFamily::Synthesize => crate::scope::Scope::DebugControl,
+        AutomationFamily::Capture | AutomationFamily::FrameDigest => {
+            crate::scope::Scope::DebugTrace
+        }
+    };
+    let terminal_scope = terminal_scope_for(family);
+    if !snapshot.scopes.contains(debug_scope)
+        || !snapshot.allows_terminal(Some(terminal_id), terminal_scope)
+    {
+        return Err(IpcError::ScopeDenied {
+            scope: terminal_scope.as_str().into(),
+            action: family.as_str().into(),
+        });
+    }
+    let ttl = ttl_ms.unwrap_or(AUTOMATION_BEARER_TTL_MS);
+    issue_automation_bearer_internal(
+        &snapshot.identity.session_id,
+        terminal_id,
+        family,
+        now_ms,
+        ttl,
+        BearerBinding {
+            principal_id: snapshot.identity.principal_id.clone(),
+            consent_generation: snapshot.identity.consent_generation,
+        },
+    )
+}
+
+/// Identity a minted bearer is bound to.
+///
+/// The context-free legacy minters pass an empty principal and generation 0,
+/// which is why such a bearer can never satisfy an authority-bound check.
+struct BearerBinding {
+    principal_id: String,
+    consent_generation: u64,
+}
+
+impl BearerBinding {
+    fn unbound() -> Self {
+        Self {
+            principal_id: String::new(),
+            consent_generation: 0,
+        }
+    }
+}
+
+fn issue_automation_bearer_internal(
+    session_id: &str,
+    terminal_id: &str,
+    family: AutomationFamily,
+    now_ms: u64,
+    ttl_ms: u64,
+    binding: BearerBinding,
+) -> Result<String, IpcError> {
     validate_session_id(session_id)?;
     crate::ctl::parse_terminal_id(terminal_id)?;
     let ttl_cap = if family == AutomationFamily::FrameDigest {
@@ -251,18 +346,11 @@ pub fn issue_automation_bearer_with_ttl(
             reason: "automation store unavailable".into(),
         })?;
     if store.bearers.len() >= MAX_AUTOMATION_BEARERS && !store.bearers.is_empty() {
-        // At capacity and no expiry drain helps yet: prune expired first,
-        // then fail closed if still full (never silent eviction).
         let expired: Vec<String> = store
             .bearers
             .iter()
-            .filter_map(|(tok, rec)| {
-                if now_ms >= rec.expires_at_ms {
-                    Some(tok.clone())
-                } else {
-                    None
-                }
-            })
+            .filter(|(_, rec)| now_ms >= rec.expires_at_ms)
+            .map(|(tok, _)| tok.clone())
             .collect();
         for tok in expired {
             store.bearers.remove(&tok);
@@ -278,15 +366,28 @@ pub fn issue_automation_bearer_with_ttl(
             });
         }
     }
-    store.counter = store.counter.wrapping_add(1);
-    let token = render_bearer_token(session_id, terminal_id, family, store.counter, now_ms);
-    if store.bearers.contains_key(&token) {
-        return Err(IpcError::Internal {
-            reason: "bearer token collision (retry issuance)".into(),
-        });
+    store.counter = store
+        .counter
+        .checked_add(1)
+        .ok_or_else(|| IpcError::Denied {
+            code: "BearerSequenceExhausted".into(),
+            reason: "automation bearer sequence exhausted".into(),
+        })?;
+    let mut token = None;
+    for _ in 0..8 {
+        let candidate = random_bearer_token()?;
+        if !store.bearers.contains_key(&candidate) {
+            token = Some(candidate);
+            break;
+        }
     }
+    let token = token.ok_or_else(|| IpcError::Unavailable {
+        reason: "secure bearer source repeatedly collided".into(),
+    })?;
     let record = AutomationBearerRecord {
         session_id: session_id.to_string(),
+        principal_id: binding.principal_id,
+        consent_generation: binding.consent_generation,
         terminal_id: terminal_id.to_string(),
         family,
         expires_at_ms: now_ms.saturating_add(ttl_ms),
@@ -306,6 +407,27 @@ pub fn revoke_automation_bearer(token: &str) -> bool {
     store.capture_hits.remove(token);
     store.digest_hits.remove(token);
     existed
+}
+
+/// Revoke every bearer bound to `session_id` (session end, CTX-0792 #1403).
+/// Returns true when at least one bearer was removed.
+pub(super) fn revoke_automation_session(session_id: &str) -> bool {
+    let Ok(mut store) = automation_store().lock() else {
+        return false;
+    };
+    let tokens: Vec<String> = store
+        .bearers
+        .iter()
+        .filter(|(_, record)| record.session_id == session_id)
+        .map(|(token, _)| token.clone())
+        .collect();
+    for token in &tokens {
+        store.bearers.remove(token);
+        store.synth_hits.remove(token);
+        store.capture_hits.remove(token);
+        store.digest_hits.remove(token);
+    }
+    !tokens.is_empty()
 }
 
 /// Clear all automation state (test helper only; production never calls it).
@@ -380,16 +502,15 @@ pub fn frame_audit_snapshot_for_tests() -> Vec<FrameAuditEntry> {
 /// authority). Rate overruns yield `budget`/`RateLimited` with zero partial
 /// state.
 pub(super) fn authorize_automation(
-    granted: &crate::scope::ScopeSet,
+    authorization: &crate::ctl::AuthorizationSnapshot,
     required: &[crate::scope::Scope; 2],
     token_opt: Option<&str>,
-    session_id: &str,
     terminal_id: &str,
     family: AutomationFamily,
     now_ms: u64,
 ) -> Result<(), HandlerError> {
     for scope in required {
-        if !granted.contains(*scope) {
+        if !authorization.scopes.contains(*scope) {
             return Err(HandlerError::new(
                 "scope",
                 "ScopeDenied",
@@ -399,6 +520,17 @@ pub(super) fn authorize_automation(
                 ),
             ));
         }
+    }
+    let terminal_scope = terminal_scope_for(family);
+    if !authorization.allows_terminal(Some(terminal_id), terminal_scope) {
+        return Err(HandlerError::new(
+            "scope",
+            "ScopeDenied",
+            format!(
+                "permission denied: terminal capability denied for {}",
+                family.as_str()
+            ),
+        ));
     }
     let Some(token) = token_opt else {
         return Err(HandlerError::new(
@@ -431,11 +563,25 @@ pub(super) fn authorize_automation(
             ));
         }
     };
-    if record.session_id != session_id {
+    if record.session_id != authorization.identity.session_id {
         return Err(HandlerError::new(
             "scope",
             "ScopeDenied",
             "permission denied: bearer bound to another session".to_string(),
+        ));
+    }
+    if record.principal_id != authorization.identity.principal_id {
+        return Err(HandlerError::new(
+            "scope",
+            "ScopeDenied",
+            "permission denied: bearer bound to another principal".to_string(),
+        ));
+    }
+    if record.consent_generation != authorization.identity.consent_generation {
+        return Err(HandlerError::new(
+            "scope",
+            "ScopeDenied",
+            "permission denied: bearer consent is no longer current".to_string(),
         ));
     }
     if record.terminal_id != terminal_id {

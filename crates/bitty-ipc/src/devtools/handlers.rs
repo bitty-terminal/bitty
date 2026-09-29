@@ -86,10 +86,10 @@ impl Dispatcher {
     /// CTX-0159 hook) so the registration path itself is exercised here, not
     /// just in tests. Method names are statically valid, so a registration
     /// failure here is a programming error surfaced loudly rather than a
-    /// silent partial table. Control handlers authorize against
-    /// `context.granted` on every request and enqueue to the cross-thread
-    /// queue for the main thread to apply (the connection thread never
-    /// touches `Runtime`).
+    /// silent partial table. Control handlers authorize against the
+    /// connection's live authority on every request (and again at drain) and
+    /// enqueue to the cross-thread queue for the main thread to apply (the
+    /// connection thread never touches `Runtime`).
     #[must_use]
     pub fn with_defaults() -> Self {
         let mut table = Self {
@@ -315,30 +315,66 @@ fn handle_test_info(
     Ok(out)
 }
 
-/// Require a debug scope for a read-only debug method (fail-closed).
+/// Gate for the terminal-reading debug surfaces (CTX-0792, #1404).
 ///
 /// The accepted scope hierarchy is `debug.control ⊃ debug.trace ⊃
-/// debug.inspect` ([`crate::scope::Scope`]: `trace` and `control` are
-/// "inspect plus ..."), so a caller holding any debug scope may read.
-/// Connection alone grants none of them, so a peer with no debug scope is
-/// denied with `scope`/`ScopeDenied` and zero partial state. This is the
-/// read-surface half of P0-AC-025 (DevTools scopes distinct and ungranted by
-/// connection); the write surface (automation) additionally intersects a
-/// capability scope and a bearer.
-fn require_debug_read_scope(context: &ServeContext, method: &str) -> Result<(), HandlerError> {
+/// debug.inspect`, so any one debug scope may read. On top of that coarse
+/// scope the read is intersected with the terminal capability
+/// `terminal.inspect`. The published grid, input, focus, and modifier stores
+/// are not attributed to one terminal, so the capability must hold for every
+/// terminal ([`crate::ctl::AuthorizationSnapshot::allows_every_terminal`]): a
+/// narrowed terminal entry denies the read, and a client-named terminal can
+/// never select a looser entry. Every half fails closed — no authority, no
+/// debug scope, or no terminal capability each deny with `ScopeDenied`.
+fn require_debug_terminal_read(context: &ServeContext, method: &str) -> Result<(), HandlerError> {
     use crate::scope::Scope;
-    let granted = &context.granted;
-    if granted.contains(Scope::DebugInspect)
-        || granted.contains(Scope::DebugTrace)
-        || granted.contains(Scope::DebugControl)
+    let authorization = context.current_authorization().map_err(|_| {
+        HandlerError::new(
+            "scope",
+            "Unauthenticated",
+            "connection authority is unavailable".into(),
+        )
+    })?;
+    if !authorization.scopes.contains(Scope::DebugInspect)
+        && !authorization.scopes.contains(Scope::DebugTrace)
+        && !authorization.scopes.contains(Scope::DebugControl)
     {
-        return Ok(());
+        return Err(HandlerError::new(
+            "scope",
+            "ScopeDenied",
+            format!(
+                "permission denied: scope 'debug.inspect' denied for {method} (needs elevation)"
+            ),
+        ));
     }
-    Err(HandlerError::new(
-        "scope",
-        "ScopeDenied",
-        format!("permission denied: scope 'debug.inspect' denied for {method} (needs elevation)"),
-    ))
+    if !authorization.allows_every_terminal(Scope::TerminalInspect) {
+        return Err(HandlerError::new(
+            "scope",
+            "ScopeDenied",
+            format!("permission denied: terminal.inspect denied for {method}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate an optional `terminal_id`/`terminalId` on a read surface.
+///
+/// Delegates to the ctl params parser — the same one the control verbs use —
+/// so a malformed or oversized id fails closed with `InvalidParams` instead of
+/// being ignored.
+fn request_terminal_id(params: Option<&str>) -> Result<Option<String>, HandlerError> {
+    crate::ctl::parse_optional_terminal_id_params(params).map_err(|err| match err {
+        crate::IpcError::LimitExceeded { field, limit, .. } => HandlerError::new(
+            "usage",
+            "InvalidParams",
+            format!("params {field} exceeds limit {limit}"),
+        ),
+        _ => HandlerError::new(
+            "usage",
+            "InvalidParams",
+            "params terminal_id must match ^t:[0-9]+$".to_string(),
+        ),
+    })
 }
 
 /// Escape a string as a JSON string body (without surrounding quotes).
@@ -368,7 +404,7 @@ fn handle_get_snapshot(
     context: &ServeContext,
     _request: &DevtoolsRequest,
 ) -> Result<String, HandlerError> {
-    require_debug_read_scope(context, "bitty.debug/getSnapshot")?;
+    require_debug_terminal_read(context, "bitty.debug/getSnapshot")?;
     let server = &context.server;
     let mut out = String::with_capacity(256);
     out.push_str("{\"version\":\"");
@@ -823,7 +859,10 @@ fn handle_get_grid_text(
     context: &ServeContext,
     request: &DevtoolsRequest,
 ) -> Result<String, HandlerError> {
-    require_debug_read_scope(context, "bitty.debug/getGridText")?;
+    // A named terminal is validated (fail closed on malformed ids) but the
+    // store is unattributed, so authorization covers every terminal.
+    request_terminal_id(request.params_raw.as_deref())?;
+    require_debug_terminal_read(context, "bitty.debug/getGridText")?;
     let rows = parse_optional_uint_param(
         request.params_raw.as_deref(),
         "rows",
@@ -901,7 +940,10 @@ fn handle_get_input_ring(
     context: &ServeContext,
     request: &DevtoolsRequest,
 ) -> Result<String, HandlerError> {
-    require_debug_read_scope(context, "bitty.debug/getInputRing")?;
+    // A named terminal is validated (fail closed on malformed ids) but the
+    // store is unattributed, so authorization covers every terminal.
+    request_terminal_id(request.params_raw.as_deref())?;
+    require_debug_terminal_read(context, "bitty.debug/getInputRing")?;
     let limit = parse_optional_uint_param(
         request.params_raw.as_deref(),
         "limit",
@@ -983,7 +1025,7 @@ fn handle_get_modifiers(
     context: &ServeContext,
     _request: &DevtoolsRequest,
 ) -> Result<String, HandlerError> {
-    require_debug_read_scope(context, "bitty.debug/getModifiers")?;
+    require_debug_terminal_read(context, "bitty.debug/getModifiers")?;
     let guard = live_modifiers_store().lock().map_err(|_| {
         HandlerError::new(
             "transport",
@@ -1011,7 +1053,7 @@ fn handle_get_focus(
     context: &ServeContext,
     _request: &DevtoolsRequest,
 ) -> Result<String, HandlerError> {
-    require_debug_read_scope(context, "bitty.debug/getFocus")?;
+    require_debug_terminal_read(context, "bitty.debug/getFocus")?;
     let guard = live_focus_store().lock().map_err(|_| {
         HandlerError::new(
             "transport",
@@ -1047,19 +1089,24 @@ fn handle_get_focus(
 
 // ── runtime control (CTX-0171) ─────────────────────────────────────────────
 //
-// Control handlers authorize against `context.granted` (server-evaluated,
-// never client-asserted) and enqueue to the cross-thread queue for the main
-// thread — the sole `Runtime` owner — to apply. The connection thread blocks
-// up to 5 s for the reply; timeout becomes `Unavailable` (fail-closed, no
-// partial state). List verbs (`listWindows`, `listViews`, `listTerminals`)
-// also flow through the queue so `view`/`terminal` listings reflect live
-// `Runtime` layout rather than stale startup facts.
+// Control handlers authorize against the connection's server-owned authority
+// (CTX-0792, #1403: a per-connection principal/session, never
+// client-asserted), carry that authorization snapshot in the queue item, and
+// enqueue for the main thread — the sole `Runtime` owner — which re-validates
+// the snapshot against the live authority immediately before mutation. The
+// connection thread blocks up to one `CTL_TIMEOUT` for the reply; timeout
+// becomes `Unavailable` (fail-closed, no partial state). List verbs
+// (`listWindows`, `listViews`, `listTerminals`) also flow through the queue so
+// `view`/`terminal` listings reflect live `Runtime` layout rather than stale
+// startup facts.
 
 /// Shared control handler for all fourteen `bitty.debug/*` control methods.
 ///
 /// Validates params shape via `ctl` parsers (fail-closed `InvalidParams`
-/// before enqueue), authorizes via `context.granted` (fail-closed
-/// `ScopeDenied` without elevation), then enqueues and waits.
+/// before enqueue), authorizes via the connection grant (scope plus terminal
+/// capability, fail-closed `ScopeDenied`), then enqueues and waits. Hermetic
+/// contexts without an authority (`authority_required == false`) fall back
+/// to their explicit granted scopes.
 fn handle_control(
     context: &ServeContext,
     request: &DevtoolsRequest,
@@ -1070,12 +1117,28 @@ fn handle_control(
     {
         return Err(HandlerError::new("usage", "InvalidParams", reason));
     }
-    let reply = crate::ctl::enqueue_control_and_wait(
-        &request.method,
-        request.params_raw.as_deref(),
-        &request.id_raw,
-        &context.granted,
-    );
+    let reply = if context.authority_required() {
+        let Some(grant) = context.connection_grant() else {
+            return Err(HandlerError::new(
+                "scope",
+                "Unauthenticated",
+                "connection authority is unavailable".into(),
+            ));
+        };
+        crate::ctl::enqueue_control_and_wait_with_connection(
+            &request.method,
+            request.params_raw.as_deref(),
+            &request.id_raw,
+            grant,
+        )
+    } else {
+        crate::ctl::enqueue_control_and_wait(
+            &request.method,
+            request.params_raw.as_deref(),
+            &request.id_raw,
+            context.construction_scopes(),
+        )
+    };
     if reply.ok {
         Ok(reply.result_json)
     } else {

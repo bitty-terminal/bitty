@@ -58,8 +58,11 @@ use bitty_term_state::ZoneKind;
 use bitty_test_support::require_pty;
 
 /// Bound for a one-shot shell to emit its bytes; a healthy shell finishes in
-/// milliseconds, so this only fires when something is genuinely stuck.
-const SHELL_TIMEOUT: Duration = Duration::from_secs(15);
+/// milliseconds, so this only fires when something is genuinely stuck. The
+/// headroom is generous because a loaded Windows CI runner can take many
+/// seconds just to start PowerShell and reach the payload (CTX-0854); this is
+/// a stuck-detector, not a performance assertion.
+const SHELL_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Environment variable listing executable extensions on Windows.
 #[cfg(windows)]

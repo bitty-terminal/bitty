@@ -1902,11 +1902,23 @@ fn resolve_cancel(shared: &Shared, id: JobId, outcome: CancelOutcome) {
 fn finish(shared: &Shared, id: JobId, outcome: ExecutionOutcome) {
     let at_ms = now_ms();
     let mut inner = lock_inner(shared);
+    let mut unanswered = None;
     if let Some(record) = inner.jobs.get_mut(&id) {
         record.state = JobState::Done(outcome);
         record.finished_at_ms = Some(at_ms);
         // The leader is reaped: no signal may reach its recycled id.
         record.tree = None;
+        // A request accepted while the job was still live but never
+        // executed (natural exit, deadline, failed start) still gets its
+        // one typed answer.
+        unanswered = record.control.take_cancel();
+    }
+    if unanswered.is_some() {
+        inner.events.push(JobEvent::CancelResolved {
+            id,
+            outcome: CancelOutcome::AlreadyExited,
+            at_ms,
+        });
     }
     inner.events.push(JobEvent::Stopped { id, outcome, at_ms });
 }
@@ -2239,19 +2251,16 @@ impl PipeJob {
             return Ok(exit);
         }
         let tree_kill = self.tree.as_ref().map(|tree| tree.signal(TreeSignal::Kill));
-        match tree_kill {
-            // The tree took the kill, or has no live member left.
-            Some(Ok(())) => {}
-            Some(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
-            // No tree, or the tree refused: the direct child is the last
-            // resort. Only a refusal stops the reap; any other error means
-            // the child is already gone and the reap returns at once.
-            _ => {
-                if let Err(error) = self.child.kill() {
-                    if error.kind() == std::io::ErrorKind::PermissionDenied {
-                        return Err(error);
-                    }
-                }
+        // Always kill the direct child too: a leader that left its group
+        // (`setpgid`) is not reached by the group kill, and its unreaped pid
+        // cannot be recycled, so this never hits another process. Without
+        // it the blocking reap below could wait forever.
+        let direct = self.child.kill();
+        let tree_ok = matches!(tree_kill, Some(Ok(())))
+            || matches!(&tree_kill, Some(Err(e)) if e.kind() == std::io::ErrorKind::NotFound);
+        if let Err(error) = direct {
+            if !tree_ok && error.kind() == std::io::ErrorKind::PermissionDenied {
+                return Err(error);
             }
         }
         let reaped = match &self.tree {

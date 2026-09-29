@@ -154,12 +154,11 @@ fn wait_grandchild(registry: &JobRegistry, id: JobId) -> u32 {
             .read_output(id, ReadOutput::new(OutputStream::Stdout))
             .expect("readable")
             .text;
-        if let Some(pid) = text
-            .lines()
-            .find_map(|line| line.strip_prefix("grandchild="))
-            .and_then(|pid| pid.trim().parse().ok())
-        {
-            return pid;
+        for part in text.split("grandchild=").skip(1) {
+            let digits: String = part.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(pid) = digits.parse() {
+                return pid;
+            }
         }
         assert!(Instant::now() < deadline, "no grandchild pid announced");
         std::thread::sleep(POLL);

@@ -12,7 +12,7 @@ use std::sync::{Mutex, PoisonError};
 use nix::errno::Errno;
 use nix::libc;
 use nix::sys::event::{EventFilter, EventFlag, FilterFlag, KEvent, Kqueue};
-use nix::sys::signal::{Signal, killpg};
+use nix::sys::signal::{Signal, kill, killpg};
 use nix::unistd::{Pid, getpgrp};
 
 use super::{LeaderExit, TreeBackend, TreeSignal};
@@ -113,9 +113,15 @@ pub(super) fn signal_group(pgid: u32, signal: TreeSignal) -> io::Result<()> {
     };
     let pgid = i32::try_from(pgid)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "pid out of range"))?;
-    killpg(Pid::from_raw(pgid), signal).map_err(|errno| {
-        // `ESRCH` has no std kind of its own; the tree contract names it.
-        if errno == Errno::ESRCH {
+    let target = Pid::from_raw(pgid);
+    killpg(target, signal).map_err(|errno| {
+        // Darwin quirk: `killpg` returns `EPERM` when a process group contains
+        // only zombie processes (the leader exited and waits to be reaped).
+        // If signal-0 to the leader succeeds, the caller has permission and
+        // the group has no live members left, satisfying the `NotFound` contract.
+        if errno == Errno::ESRCH
+            || (errno == Errno::EPERM && matches!(kill(target, None), Ok(()) | Err(Errno::ESRCH)))
+        {
             io::Error::new(io::ErrorKind::NotFound, "process group has no member")
         } else {
             io::Error::from(errno)

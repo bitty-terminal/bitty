@@ -1536,6 +1536,43 @@ fn continuation_stalled_stream_reports_timeout_without_dispatch() {
 
 #[cfg(unix)]
 #[test]
+fn continuation_slow_drip_is_cut_at_the_deadline() {
+    // CodeRabbit on #1525: while a reassembly is open, every read is bounded
+    // by the time left before the continuation deadline, so dripping a
+    // fragment byte by byte cannot hold the connection past it. The fake
+    // clock advances 2 s per reading, so the deadline passes after a few
+    // drips; the 30 s idle timeout alone would keep the connection open far
+    // longer than the client waits.
+    let tag = "a4-slow-drip";
+    let ticks = std::sync::atomic::AtomicU64::new(0);
+    let clock = move || ticks.fetch_add(2_000, std::sync::atomic::Ordering::SeqCst);
+    let (mut client, handle) = spawn_continuation_server(std::time::Duration::from_secs(30), clock);
+    let request = padded_probe_request(50, tag, CONTINUATION_CHUNK_BYTES * 2 + 10);
+    let frames = encode_request_frames(&request, 13).unwrap();
+    assert_eq!(
+        frames[1].len(),
+        4 + MAX_FRAME_BYTES,
+        "the dripped fragment is full"
+    );
+    client.write_all(&frames[0]).unwrap();
+    // Only the first bytes of the full second fragment ever arrive.
+    for byte in frames[1].iter().take(64) {
+        if client.write_all(&[*byte]).is_err() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let text = read_response(&mut client).expect("the deadline must cut the drip");
+    assert!(text.contains("ContinuationTimeout"), "{text}");
+    assert!(text.contains("\"id\":0"), "{text}");
+    let stats = handle.join().unwrap().unwrap();
+    assert_eq!(stats.requests, 0);
+    assert_eq!(stats.framing_errors, 1);
+    assert_eq!(continuation_probe_count(tag), 0);
+}
+
+#[cfg(unix)]
+#[test]
 fn continuation_eof_mid_request_closes_silently() {
     let tag = "a4-eof";
     let (mut client, handle) = spawn_continuation_server(std::time::Duration::from_secs(5), || 0);

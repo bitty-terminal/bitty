@@ -226,6 +226,18 @@ impl Reassembler {
         self.open.is_some()
     }
 
+    /// Absolute deadline (same clock as [`Self::accept`]) for the open
+    /// reassembly's final fragment, or `None` when nothing is open.
+    ///
+    /// The serve loop bounds every socket read by this deadline, so a peer
+    /// that drips a fragment byte by byte cannot hold the connection past it.
+    #[must_use]
+    pub fn deadline_ms(&self) -> Option<u64> {
+        self.open
+            .as_ref()
+            .map(|open| open.started_ms.saturating_add(CONTINUATION_DEADLINE_MS))
+    }
+
     /// Feed one physical frame payload read at `now_ms`.
     ///
     /// # Errors

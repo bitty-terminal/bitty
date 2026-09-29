@@ -20,8 +20,8 @@ use std::time::{Duration, Instant};
 use bitty_runtime::{
     CancelEffect, CancelMode, CancelOutcome, CancelReceipt, CancelRequest, DeadlineClock,
     ExecutionGeneration, ExecutionHandle, ExecutionOutcome, JobCancel, JobError, JobEvent, JobId,
-    JobIo, JobKind, JobPrincipal, JobRegistry, JobSnapshot, JobSpec, JobState, JobTimeouts,
-    KillScope, OutputStream, ProcessTreeBackend, ReadOutput,
+    JobKind, JobPrincipal, JobRegistry, JobSnapshot, JobSpec, JobState, JobTimeouts, KillScope,
+    OutputStream, ProcessTreeBackend, ReadOutput,
 };
 
 const HELPER_ENV: &str = "__BITTY_JOB_OUTCOME_HELPER";
@@ -554,6 +554,7 @@ fn a_stronger_request_escalates_the_cancel_in_flight() {
 #[cfg(unix)]
 #[test]
 fn a_pty_cancel_kills_the_owned_tree() {
+    use bitty_runtime::JobIo;
     bitty_test_support::require_pty!();
     let registry = JobRegistry::new();
     let spec = helper_spec("fork")

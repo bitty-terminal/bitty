@@ -36,6 +36,23 @@ pub(super) struct PaneSession {
     pub(super) last_presented_generation: u64,
 }
 
+impl PaneSession {
+    /// Next immediately available chunk: the wakeup-forwarder channel when
+    /// promoted, otherwise the direct pump channel. Either way the bound
+    /// holds (`CHANNEL_CAPACITY_CHUNKS` x `READ_CHUNK_SIZE` per stage).
+    pub(super) fn try_next_chunk(&self) -> Option<Vec<u8>> {
+        if let Some(rx) = self.forward_rx.as_ref() {
+            return rx.try_recv().ok();
+        }
+        match self.reader.as_ref()?.try_recv() {
+            bitty_pty::PtyRecv::Chunk(chunk) => Some(chunk),
+            bitty_pty::PtyRecv::Empty | bitty_pty::PtyRecv::Eof | bitty_pty::PtyRecv::Error(_) => {
+                None
+            }
+        }
+    }
+}
+
 impl Runtime {
     /// Spawns `program` inside a PTY sized to the current grid, storing the
     /// child handle. The program is taken as a direct argv[0] without shell
@@ -378,7 +395,7 @@ impl Runtime {
     /// the forwarder blocks in `recv` (zero wakeups when quiet), forwards
     /// each batch into a bounded channel
     /// ([`PTY_FORWARD_CAPACITY_CHUNKS`]), and invokes the shared waker once
-    /// per batch plus once on EOF (CTX-0476 waker merge). [`pump_pane_sessions`](Self::pump_pane_sessions)
+    /// per batch plus once on EOF (CTX-0476 waker merge). [`poll_pty`](Self::poll_pty)
     /// drains the forwarding channel, so the bounded-drain contract holds
     /// end to end. Idempotent: no-op without a session, without a waker, or
     /// when already promoted.
@@ -581,70 +598,6 @@ impl Runtime {
         }
     }
 
-    /// Drains every pane session's reader — the wakeup-forwarder channel
-    /// when [`promote_pane_reader_to_forwarder`](Self::promote_pane_reader_to_forwarder)
-    /// promoted the pump, otherwise the direct reader — into its private
-    /// grid via the shared PTY pipeline (see [`handle_pane_bytes`](Self::handle_pane_bytes)),
-    /// flushes pane replies to each pane's own writer, and re-syncs the
-    /// global input-mode caches to the focused leaf. Returns the drained
-    /// chunk count. No-op when no pane session exists.
-    pub(super) fn pump_pane_sessions(&mut self) -> usize {
-        if self.pane_sessions.is_empty() {
-            return 0;
-        }
-        // Collect without holding a borrow across the mutable pump calls.
-        // `BTreeMap` iteration is `ViewId`-ordered, so multi-pane wakeups
-        // are deterministic. CTX-0476: same poll budgets as the primary path
-        // (`POLL_PTY_MAX_CHUNKS` / `POLL_PTY_MAX_BYTES` / `POLL_PTY_TIME_BUDGET`)
-        // shared across panes, so N panes can never cost N x 1024 chunks.
-        let start = std::time::Instant::now();
-        let mut drained_bytes = 0usize;
-        let mut pending: Vec<(ViewId, Vec<u8>)> = Vec::new();
-        for (id, sess) in self.pane_sessions.iter() {
-            while pending.len() < POLL_PTY_MAX_CHUNKS && drained_bytes < POLL_PTY_MAX_BYTES {
-                if !pending.is_empty() && start.elapsed() >= POLL_PTY_TIME_BUDGET {
-                    break;
-                }
-                // Promoted panes drain the forwarder channel; direct panes
-                // drain the pump channel. Either way the bound holds
-                // (`CHANNEL_CAPACITY_CHUNKS` x `READ_CHUNK_SIZE` per stage).
-                let chunk = if let Some(rx) = sess.forward_rx.as_ref() {
-                    rx.try_recv().ok()
-                } else if let Some(reader) = sess.reader.as_ref() {
-                    match reader.try_recv() {
-                        bitty_pty::PtyRecv::Chunk(chunk) => Some(chunk),
-                        bitty_pty::PtyRecv::Empty
-                        | bitty_pty::PtyRecv::Eof
-                        | bitty_pty::PtyRecv::Error(_) => None,
-                    }
-                } else {
-                    None
-                };
-                match chunk {
-                    Some(chunk) => {
-                        debug_assert!(chunk.len() <= bitty_pty::READ_CHUNK_SIZE);
-                        drained_bytes = drained_bytes.saturating_add(chunk.len());
-                        pending.push((*id, chunk));
-                    }
-                    None => break,
-                }
-            }
-            if pending.len() >= POLL_PTY_MAX_CHUNKS
-                || drained_bytes >= POLL_PTY_MAX_BYTES
-                || (!pending.is_empty() && start.elapsed() >= POLL_PTY_TIME_BUDGET)
-            {
-                break;
-            }
-        }
-        let drained = pending.len();
-        for (id, chunk) in pending {
-            self.handle_pane_bytes(id, &chunk);
-            let _ = self.write_pane_replies(id);
-        }
-        self.sync_mode_caches_to_focus();
-        drained
-    }
-
     /// Feeds raw PTY bytes from one pane's shell into that pane's private
     /// grid through the exact [`handle_pty_bytes`](Self::handle_pty_bytes)
     /// pipeline (query replies, clipboard policy, cold bridge, search).
@@ -723,7 +676,7 @@ impl Runtime {
     ///
     /// Per-pane mirror of [`write_replies`](Self::write_replies): bounded
     /// (4 KiB reply cap, fail-closed), no-op without a session or when
-    /// empty. Returns bytes written. [`pump_pane_sessions`](Self::pump_pane_sessions)
+    /// empty. Returns bytes written. [`poll_pty`](Self::poll_pty)
     /// already calls this per drained pane; embedders also call it after
     /// `tick` (like the primary post-tick flush) so replies queued outside
     /// the pump still reach the pane's shell promptly.

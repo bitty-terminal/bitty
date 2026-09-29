@@ -949,11 +949,10 @@ fn every_privileged_dispatch_rechecks_the_bound_peer() {
     ])));
     let mut granted = crate::scope::ScopeSet::new();
     granted.insert(crate::scope::Scope::DebugInspect);
-    // `with_granted_session_for_tests` declares the `terminal.inspect` terminal
-    // capability that the debug read surfaces intersect with (CTX-0792 #1404)
-    // while leaving `granted` itself at `debug.inspect` only. Without it the
-    // capability gate would deny the read before the recheck ever runs, and
-    // this test would stop testing the per-dispatch recheck it is named for.
+    // The debug read surfaces intersect a debug scope with `terminal.inspect`
+    // (CTX-0792 #1404); grant both explicitly so the capability gate passes
+    // and this test keeps testing the per-dispatch recheck it is named for.
+    granted.insert(crate::scope::Scope::TerminalInspect);
     let mut context =
         ServeContext::with_granted_session_for_tests(&test_server_info(), granted, "recheck-probe");
     context
@@ -1100,19 +1099,17 @@ fn endpoint_rate_budget_is_shared_across_connections() {
     }
 }
 
-/// CTX-0792 / #1404: the endpoint budget is enforced *beside* a per-connection
-/// share, so one abusive connection cannot spend the shared budget (cross-client
-/// availability amplification) while the process-wide bound still holds.
+/// CTX-0792 / #1404: one conforming client gets the full accepted RC-9 burst
+/// (no hidden per-connection share), and the budget it spends is the endpoint
+/// budget every other connection draws from.
 #[cfg(unix)]
 #[test]
-fn endpoint_budget_bounds_one_connection_without_starving_the_next() {
+fn single_connection_gets_the_full_rc9_burst_from_the_shared_endpoint_budget() {
     use std::os::unix::net::UnixStream;
     use std::sync::{Arc, Mutex};
 
-    // Endpoint budget far above both per-connection shares, so the per-connection
-    // bound is the one under test.
-    let endpoint = Arc::new(Mutex::new(RateLimiter::new(10_000, 10_000)));
-    let share = super::serve::RC9_CONN_BURST_PER_SEC as usize;
+    let endpoint = Arc::new(Mutex::new(RateLimiter::rc9_default()));
+    let burst = crate::limits::RC9_BURST_PER_SEC as usize;
 
     let drive = |requests: usize| -> usize {
         let (mut client, mut server) = UnixStream::pair().unwrap();
@@ -1162,11 +1159,15 @@ fn endpoint_budget_bounds_one_connection_without_starving_the_next() {
         denied
     };
 
-    // The abusive connection is capped at its own share...
-    assert_eq!(drive(share + 10), 10);
-    // ...and the next connection still gets a full share: no cross-connection
-    // starvation, because the shared budget was never the binding constraint.
-    assert_eq!(drive(share), 0);
+    // The whole documented burst is admitted for a single client...
+    assert_eq!(drive(burst), 0, "a single client gets the full RC-9 burst");
+    // ...and it was the shared endpoint budget: a second connection in the same
+    // instant is shed instead of receiving a fresh budget.
+    assert_eq!(
+        drive(1),
+        1,
+        "a new connection does not reset the endpoint budget"
+    );
 }
 
 /// CTX-0792: a panic in any connection thread must not deny IPC traffic for the
@@ -2120,6 +2121,106 @@ fn terminal_content_requires_debug_and_terminal_capability_intersection() {
     clear_introspection_for_tests();
 }
 
+/// CTX-0792 / #1404: the full debug-scope × terminal-capability matrix for
+/// every terminal-reading debug surface. The stores are not attributed to one
+/// terminal, so a narrowed per-terminal entry denies the read whether or not
+/// the request names a terminal, and a map entry can never stand in for a
+/// scope the session does not hold.
+#[test]
+fn terminal_read_surfaces_deny_without_the_full_intersection() {
+    use crate::ctl::{ControlAuthority, TerminalCapabilities};
+    use crate::scope::{Scope, ScopeSet};
+
+    let _guard = lock_introspection_for_test();
+    clear_introspection_for_tests();
+    publish_grid_text(vec!["MATRIX-SENTINEL".to_string()], 0, 0, true, 1, 80, 24);
+    let dispatcher = Dispatcher::with_defaults();
+    let methods = [
+        "bitty.debug/getSnapshot",
+        "bitty.debug/getGridText",
+        "bitty.debug/getInputRing",
+        "bitty.debug/getModifiers",
+        "bitty.debug/getFocus",
+    ];
+    let set = |scopes: &[Scope]| {
+        let mut out = ScopeSet::new();
+        for scope in scopes {
+            out.insert(*scope);
+        }
+        out
+    };
+    let debug_only = set(&[Scope::DebugInspect]);
+    let terminal_only = set(&[Scope::TerminalInspect]);
+    let both = set(&[Scope::DebugInspect, Scope::TerminalInspect]);
+    let mut narrowed = TerminalCapabilities::from_scopes(&both);
+    // t:2 keeps an entry without `terminal.inspect` (input only).
+    narrowed.grant("t:2", Scope::TerminalInput).expect("entry");
+    let mut both_with_input = both.clone();
+    both_with_input.insert(Scope::TerminalInput);
+    let cases: [(&str, ScopeSet, TerminalCapabilities, bool); 5] = [
+        (
+            "debug only",
+            debug_only.clone(),
+            TerminalCapabilities::from_scopes(&debug_only),
+            false,
+        ),
+        (
+            "terminal only",
+            terminal_only.clone(),
+            TerminalCapabilities::from_scopes(&terminal_only),
+            false,
+        ),
+        // A map that claims `terminal.inspect` is clamped to the session's scopes.
+        (
+            "map without scope",
+            debug_only.clone(),
+            TerminalCapabilities::from_scopes(&both),
+            false,
+        ),
+        ("narrowed terminal entry", both_with_input, narrowed, false),
+        (
+            "debug and terminal",
+            both.clone(),
+            TerminalCapabilities::from_scopes(&both),
+            true,
+        ),
+    ];
+    for (label, scopes, capabilities, allowed) in cases {
+        let grant = ControlAuthority::new()
+            .open_connection(scopes, capabilities)
+            .expect("connection grant");
+        let context = ServeContext::with_connection_grant_for_tests(&test_server_info(), grant);
+        for method in methods {
+            for params in [
+                "",
+                r#","params":{"terminalId":"t:1"}"#,
+                r#","params":{"terminalId":"t:2"}"#,
+            ] {
+                let frame = format!(r#"{{"id":1,"method":"{method}","version":"1.0"{params}}}"#);
+                let outcome = handle_envelope(frame.as_bytes(), &dispatcher, &context);
+                let text = response_text(&outcome);
+                if allowed {
+                    assert!(
+                        !outcome.was_error,
+                        "{label}: {method}{params} must pass: {text}"
+                    );
+                } else {
+                    assert!(outcome.was_error, "{label}: {method}{params} must deny");
+                    assert!(
+                        text.contains("ScopeDenied"),
+                        "{label}: {method}{params}: {text}"
+                    );
+                    assert!(
+                        !text.contains("MATRIX-SENTINEL"),
+                        "{label}: {method} leaked data"
+                    );
+                }
+            }
+        }
+    }
+    clear_introspection_for_tests();
+}
+
 #[test]
 fn revoked_connection_loses_protected_debug_surface() {
     let _guard = lock_introspection_for_test();
@@ -2130,10 +2231,7 @@ fn revoked_connection_loses_protected_debug_surface() {
     let mut scopes = crate::scope::ScopeSet::new();
     scopes.insert(crate::scope::Scope::DebugInspect);
     scopes.insert(crate::scope::Scope::TerminalInspect);
-    let mut capabilities = crate::ctl::TerminalCapabilities::new();
-    capabilities
-        .grant("t:1", crate::scope::Scope::TerminalInspect)
-        .expect("terminal capability");
+    let capabilities = crate::ctl::TerminalCapabilities::from_scopes(&scopes);
     let grant = authority
         .open_connection(scopes, capabilities)
         .expect("connection grant");
@@ -3552,13 +3650,12 @@ fn bearer_tokens_are_full_width_csprng_output_on_every_platform() {
     clear_automation_for_tests();
 }
 
-/// CTX-0792 / #1404: a consent-issued automation bearer is the production
-/// per-terminal capability grant, and the intersection is enforced by every
-/// later authorize, not only by the automation path. A read-only binding on
-/// `t:1` may still read it, may never drive it, and leaves every other terminal
-/// on the connection untouched until the grant is released.
+/// CTX-0792 / #1403: issuing a bearer binds the bearer, not the connection.
+/// The bearer is limited to its terminal and family by its own record; the
+/// connection's terminal capabilities are unchanged, so a harness that binds
+/// a capture bearer to `t:1` can still verify its own input on `t:1`.
 #[test]
-fn automation_bearer_grant_narrows_the_terminal_capability_it_binds() {
+fn automation_bearer_issuance_leaves_connection_capabilities_untouched() {
     let _guard = lock_introspection_for_test();
     clear_automation_for_tests();
     let authority = crate::ctl::ControlAuthority::new();
@@ -3569,15 +3666,9 @@ fn automation_bearer_grant_narrows_the_terminal_capability_it_binds() {
             crate::ctl::TerminalCapabilities::from_scopes(&scopes),
         )
         .expect("connection grant");
-    let text = crate::ctl::params_terminal_id("t:1");
+    let before = grant.snapshot().expect("snapshot");
     let input = crate::ctl::params_send_input("t:1", "x");
-    let other_input = crate::ctl::params_send_input("t:2", "x");
-    assert!(
-        grant
-            .authorize(crate::ctl::METHOD_SEND_INPUT, Some(&input))
-            .is_ok(),
-        "precondition: the connection may drive t:1 before it binds itself"
-    );
+    let text = crate::ctl::params_terminal_id("t:1");
 
     let token = crate::devtools::automation::issue_automation_bearer_for_connection(
         &grant,
@@ -3587,79 +3678,25 @@ fn automation_bearer_grant_narrows_the_terminal_capability_it_binds() {
         None,
     )
     .expect("capture bearer");
-
-    // The binding narrows t:1 to inspect; the control surface enforces it.
-    assert!(
-        grant
-            .authorize(crate::ctl::METHOD_GET_TERMINAL_TEXT, Some(&text))
-            .is_ok()
+    assert_eq!(
+        grant.snapshot().expect("snapshot"),
+        before,
+        "issuance changes neither scopes, map, nor consent generation"
     );
-    let denied = grant
-        .authorize(crate::ctl::METHOD_SEND_INPUT, Some(&input))
-        .expect_err("a capture binding must not be able to drive the terminal");
-    assert!(
-        matches!(denied, crate::IpcError::ScopeDenied { .. }),
-        "unexpected denial: {denied:?}"
-    );
-    assert!(
-        grant
-            .authorize(crate::ctl::METHOD_SEND_INPUT, Some(&other_input))
-            .is_ok(),
-        "the narrowing is per terminal, not per connection"
-    );
-
-    // A second binding for the same terminal unions, so ordering never traps a
-    // client that needs both families.
-    let synth = crate::devtools::automation::issue_automation_bearer_for_connection(
-        &grant,
-        "t:1",
-        AutomationFamily::Synthesize,
-        0,
-        None,
-    )
-    .expect("synthesize bearer");
     assert!(
         grant
             .authorize(crate::ctl::METHOD_SEND_INPUT, Some(&input))
             .is_ok()
     );
-
-    // Revoking one binding releases only that capability: the surviving
-    // synthesize binding keeps input, inspect is withdrawn.
+    assert!(
+        grant
+            .authorize(crate::ctl::METHOD_GET_TERMINAL_TEXT, Some(&text))
+            .is_ok()
+    );
     assert!(crate::devtools::automation::revoke_automation_bearer(
         &token
     ));
-    assert!(
-        grant
-            .authorize(crate::ctl::METHOD_SEND_INPUT, Some(&input))
-            .is_ok()
-    );
-    assert!(
-        grant
-            .authorize(crate::ctl::METHOD_GET_TERMINAL_TEXT, Some(&text))
-            .is_err()
-    );
-    assert!(
-        grant
-            .authorize(crate::ctl::METHOD_SEND_INPUT, Some(&other_input))
-            .is_ok()
-    );
-
-    // Releasing the last binding empties the entry, so the terminal falls back
-    // to the connection wildcard.
-    assert!(crate::devtools::automation::revoke_automation_bearer(
-        &synth
-    ));
-    assert!(
-        grant
-            .authorize(crate::ctl::METHOD_GET_TERMINAL_TEXT, Some(&text))
-            .is_ok()
-    );
-    assert!(
-        grant
-            .authorize(crate::ctl::METHOD_SEND_INPUT, Some(&input))
-            .is_ok()
-    );
+    assert_eq!(grant.snapshot().expect("snapshot"), before);
     clear_automation_for_tests();
 }
 

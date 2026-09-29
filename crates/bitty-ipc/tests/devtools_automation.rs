@@ -168,7 +168,11 @@ fn automation_synthesize_receipt_and_markers_over_socket() {
         issue_automation_bearer("proof-synth", "t:1", AutomationFamily::Synthesize, 0).unwrap();
     let socket_path = temp_socket_path("as");
     prepare_socket_dir(&socket_path).unwrap();
-    let server = spawn_automation_server(socket_path.clone(), synth_scopes(), "proof-synth");
+    // The marker assertion below reads the input ring, a terminal-content
+    // surface that intersects a debug scope with `terminal.inspect` (#1404).
+    let mut scopes = synth_scopes();
+    scopes.insert(Scope::TerminalInspect);
+    let server = spawn_automation_server(socket_path.clone(), scopes, "proof-synth");
     std::thread::sleep(Duration::from_millis(100));
     let mut client = AutomationClient::connect(&socket_path);
 

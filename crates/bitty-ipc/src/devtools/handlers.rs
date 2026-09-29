@@ -319,19 +319,14 @@ fn handle_test_info(
 ///
 /// The accepted scope hierarchy is `debug.control ⊃ debug.trace ⊃
 /// debug.inspect`, so any one debug scope may read. On top of that coarse
-/// scope the read is intersected with the terminal capability: the connection's
-/// terminal capability map must allow `terminal.inspect`. A terminal-scoped
-/// request is answered by that terminal's entry, a request that names no
-/// terminal by the connection wildcard. The published grid and input stores are
-/// not terminal-attributed today, so the named terminal only ever selects an
-/// entry bounded by the connection's scopes; it can never widen the read. Every
-/// half fails closed — no authority, no debug scope, or no terminal capability
-/// each deny with `ScopeDenied`.
-fn require_debug_terminal_capability(
-    context: &ServeContext,
-    method: &str,
-    terminal_id: Option<&str>,
-) -> Result<(), HandlerError> {
+/// scope the read is intersected with the terminal capability
+/// `terminal.inspect`. The published grid, input, focus, and modifier stores
+/// are not attributed to one terminal, so the capability must hold for every
+/// terminal ([`crate::ctl::AuthorizationSnapshot::allows_every_terminal`]): a
+/// narrowed terminal entry denies the read, and a client-named terminal can
+/// never select a looser entry. Every half fails closed — no authority, no
+/// debug scope, or no terminal capability each deny with `ScopeDenied`.
+fn require_debug_terminal_read(context: &ServeContext, method: &str) -> Result<(), HandlerError> {
     use crate::scope::Scope;
     let authorization = context.current_authorization().map_err(|_| {
         HandlerError::new(
@@ -352,7 +347,7 @@ fn require_debug_terminal_capability(
             ),
         ));
     }
-    if !authorization.allows_terminal(terminal_id, Scope::TerminalInspect) {
+    if !authorization.allows_every_terminal(Scope::TerminalInspect) {
         return Err(HandlerError::new(
             "scope",
             "ScopeDenied",
@@ -362,11 +357,11 @@ fn require_debug_terminal_capability(
     Ok(())
 }
 
-/// Optional `terminal_id`/`terminalId` for a read surface.
+/// Validate an optional `terminal_id`/`terminalId` on a read surface.
 ///
 /// Delegates to the ctl params parser — the same one the control verbs use —
-/// so the value that selects a capability-map key is never a substring match
-/// on raw params text.
+/// so a malformed or oversized id fails closed with `InvalidParams` instead of
+/// being ignored.
 fn request_terminal_id(params: Option<&str>) -> Result<Option<String>, HandlerError> {
     crate::ctl::parse_optional_terminal_id_params(params).map_err(|err| match err {
         crate::IpcError::LimitExceeded { field, limit, .. } => HandlerError::new(
@@ -409,7 +404,7 @@ fn handle_get_snapshot(
     context: &ServeContext,
     _request: &DevtoolsRequest,
 ) -> Result<String, HandlerError> {
-    require_debug_terminal_capability(context, "bitty.debug/getSnapshot", None)?;
+    require_debug_terminal_read(context, "bitty.debug/getSnapshot")?;
     let server = &context.server;
     let mut out = String::with_capacity(256);
     out.push_str("{\"version\":\"");
@@ -864,8 +859,10 @@ fn handle_get_grid_text(
     context: &ServeContext,
     request: &DevtoolsRequest,
 ) -> Result<String, HandlerError> {
-    let terminal_id = request_terminal_id(request.params_raw.as_deref())?;
-    require_debug_terminal_capability(context, "bitty.debug/getGridText", terminal_id.as_deref())?;
+    // A named terminal is validated (fail closed on malformed ids) but the
+    // store is unattributed, so authorization covers every terminal.
+    request_terminal_id(request.params_raw.as_deref())?;
+    require_debug_terminal_read(context, "bitty.debug/getGridText")?;
     let rows = parse_optional_uint_param(
         request.params_raw.as_deref(),
         "rows",
@@ -943,8 +940,10 @@ fn handle_get_input_ring(
     context: &ServeContext,
     request: &DevtoolsRequest,
 ) -> Result<String, HandlerError> {
-    let terminal_id = request_terminal_id(request.params_raw.as_deref())?;
-    require_debug_terminal_capability(context, "bitty.debug/getInputRing", terminal_id.as_deref())?;
+    // A named terminal is validated (fail closed on malformed ids) but the
+    // store is unattributed, so authorization covers every terminal.
+    request_terminal_id(request.params_raw.as_deref())?;
+    require_debug_terminal_read(context, "bitty.debug/getInputRing")?;
     let limit = parse_optional_uint_param(
         request.params_raw.as_deref(),
         "limit",
@@ -1026,7 +1025,7 @@ fn handle_get_modifiers(
     context: &ServeContext,
     _request: &DevtoolsRequest,
 ) -> Result<String, HandlerError> {
-    require_debug_terminal_capability(context, "bitty.debug/getModifiers", None)?;
+    require_debug_terminal_read(context, "bitty.debug/getModifiers")?;
     let guard = live_modifiers_store().lock().map_err(|_| {
         HandlerError::new(
             "transport",
@@ -1054,7 +1053,7 @@ fn handle_get_focus(
     context: &ServeContext,
     _request: &DevtoolsRequest,
 ) -> Result<String, HandlerError> {
-    require_debug_terminal_capability(context, "bitty.debug/getFocus", None)?;
+    require_debug_terminal_read(context, "bitty.debug/getFocus")?;
     let guard = live_focus_store().lock().map_err(|_| {
         HandlerError::new(
             "transport",
@@ -1137,7 +1136,7 @@ fn handle_control(
             &request.method,
             request.params_raw.as_deref(),
             &request.id_raw,
-            &context.granted,
+            context.construction_scopes(),
         )
     };
     if reply.ok {

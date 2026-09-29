@@ -249,10 +249,8 @@ struct BoundListener {
 struct ConnectionServices {
     /// Mints and revokes one principal/session per accepted connection.
     authority: bitty_ipc::ctl::ControlAuthority,
-    /// Endpoint-wide RC-9 request budget, shared across connections. Each
-    /// connection is additionally capped at its own share inside
-    /// `serve_bound_connection_with_endpoint_budget`, so one peer cannot spend
-    /// the whole budget for the others.
+    /// Endpoint-wide RC-9 request budget (100 req/s, 200 burst), shared by
+    /// every connection: opening more connections never buys more requests.
     endpoint_limiter: Arc<Mutex<bitty_ipc::limits::RateLimiter>>,
     /// Operator-consented scope ceiling (`BITTY_CTL_ELEVATE` on top of the CLI
     /// default), read once at listener start. It seeds each connection's
@@ -301,9 +299,9 @@ fn classify_socket_probe(error: &std::io::Error) -> SocketProbe {
 /// is inspected and removed is exactly the object that was moved: a
 /// replacement that lands at `socket_path` after the probe is never unlinked.
 /// The quarantined object must still be the endpoint identity captured before
-/// the probe (dev/ino/uid/mode); a symlink or any identity change restores the
-/// quarantined object when the original path is still free and refuses the
-/// takeover.
+/// the probe (dev/ino/uid/mode); a symlink or any identity change puts the
+/// quarantined object back without replacing anything bound meanwhile
+/// ([`restore_quarantined`]) and refuses the takeover.
 #[cfg(unix)]
 fn reclaim_socket_path(
     socket_path: &str,
@@ -332,10 +330,10 @@ fn reclaim_socket_path(
     let moved = std::fs::symlink_metadata(&quarantine)
         .map_err(|err| format!("quarantined socket cannot be inspected: {err}"))?;
     if moved.file_type().is_symlink() {
-        if std::fs::symlink_metadata(socket_path).is_err() {
-            let _ = std::fs::rename(&quarantine, socket_path);
-        }
-        return Err("quarantined socket is a symlink; refusing takeover".into());
+        let restore = restore_quarantined(&quarantine, socket_path);
+        return Err(format!(
+            "quarantined socket is a symlink; refusing takeover ({restore})"
+        ));
     }
     let actual = bitty_ipc::devtools::SocketEndpointIdentity {
         dev: moved.dev(),
@@ -344,13 +342,35 @@ fn reclaim_socket_path(
         mode: moved.mode() & 0o777,
     };
     if actual != expected || actual.uid != runtime_uid || actual.mode != bitty_ipc::SOCKET_MODE {
-        if std::fs::symlink_metadata(socket_path).is_err() {
-            let _ = std::fs::rename(&quarantine, socket_path);
-        }
-        return Err("socket endpoint changed during reclaim; refusing takeover".into());
+        let restore = restore_quarantined(&quarantine, socket_path);
+        return Err(format!(
+            "socket endpoint changed during reclaim; refusing takeover ({restore})"
+        ));
     }
     std::fs::remove_file(&quarantine)
         .map_err(|err| format!("dead socket quarantine could not be removed: {err}"))
+}
+
+/// Put a quarantined object back at `socket_path` without replacing anything
+/// that appeared there meanwhile (a hard link never overwrites its
+/// destination), and describe the outcome for the refusal message. When the
+/// path is occupied, the object stays at its quarantine name and the message
+/// names it, so nothing is silently stranded or clobbered.
+#[cfg(unix)]
+fn restore_quarantined(quarantine: &std::path::Path, socket_path: &str) -> String {
+    match std::fs::hard_link(quarantine, socket_path) {
+        Ok(()) => match std::fs::remove_file(quarantine) {
+            Ok(()) => String::from("original restored"),
+            Err(err) => format!(
+                "original restored; quarantine link {} not removed: {err}",
+                quarantine.display()
+            ),
+        },
+        Err(err) => format!(
+            "original left at {} because the path could not be restored: {err}",
+            quarantine.display()
+        ),
+    }
 }
 
 /// Serializes the probe-quarantine-unlink reclaim sequence in this process.
@@ -639,10 +659,10 @@ fn serve_stream(
             .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
             .unwrap_or(0)
     };
-    // Proof-first, two-level budget: `serve_bound_connection_with_endpoint_budget`
+    // Proof-first, then budget: `serve_bound_connection_with_endpoint_budget`
     // re-matches the bound proof to the accepted stream and rechecks the live
-    // peer before serving a byte, then admits through the per-connection and
-    // shared endpoint limiters.
+    // peer before serving a byte, then admits every request through the
+    // shared endpoint limiter.
     let result = bitty_ipc::devtools::serve_bound_connection_with_endpoint_budget(
         &mut stream,
         &proof,
@@ -898,6 +918,61 @@ mod tests {
             "the replacement is never unlinked"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reclaim_restore_never_clobbers_an_occupied_path() {
+        let (dir, path, _identity, _uid) = dead_socket_fixture("occupied");
+        // The quarantined object, plus a new endpoint bound at the original
+        // path between the quarantine and the restore.
+        let quarantine = dir.join(".s.sock.reclaim-test");
+        std::fs::rename(&path, &quarantine).expect("quarantine");
+        std::fs::write(&path, b"new instance").expect("occupant");
+        let note = restore_quarantined(&quarantine, &path);
+        assert!(note.contains("original left at"), "{note}");
+        assert!(
+            note.contains(".s.sock.reclaim-test"),
+            "the stranded object is named: {note}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("occupant intact"),
+            b"new instance",
+            "the new endpoint is never replaced"
+        );
+        assert!(
+            std::fs::symlink_metadata(&quarantine).is_ok(),
+            "quarantine kept"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn endpoint_probe_is_ambiguous_for_every_error_but_refusal() {
+        use std::io::ErrorKind;
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::NotFound,
+            ErrorKind::WouldBlock,
+            ErrorKind::TimedOut,
+            ErrorKind::AddrInUse,
+            ErrorKind::AddrNotAvailable,
+            ErrorKind::ConnectionReset,
+            ErrorKind::Interrupted,
+            ErrorKind::OutOfMemory,
+            ErrorKind::Other,
+        ] {
+            assert_eq!(
+                classify_socket_probe(&std::io::Error::from(kind)),
+                SocketProbe::Ambiguous,
+                "{kind:?} must never authorize an unlink"
+            );
+        }
+        assert_eq!(
+            classify_socket_probe(&std::io::Error::from(ErrorKind::ConnectionRefused)),
+            SocketProbe::Dead
+        );
     }
 
     #[cfg(unix)]

@@ -63,24 +63,17 @@ fn drain_global_control_queue_inner(
         };
         count += 1;
         after_claim(&item);
-        if let Err(err) = item.authorize_at_drain(granted) {
-            item.finish_without_apply();
-            let (category, code, message) = ipc_error_triple(&err);
-            let _ = item.reply.send(ipc_ctl::ControlReply {
-                ok: false,
-                result_json: String::new(),
-                category,
-                code,
-                message,
-            });
-            continue;
-        }
         if !item.begin_apply() {
-            // Withdrawn by the waiter, already applied, or past its deadline:
-            // `begin_apply` re-checks the deadline under the phase lock, so no
-            // effect can land after the client-side timeout.
+            // Withdrawn by the waiter, already applied, or too close to its
+            // deadline: `begin_apply` re-checks the deadline under the phase
+            // lock (and answers a late entry itself), so no effect can land
+            // after the client-side timeout.
             continue;
         }
+        // CTX-0792 (#1403): the single authorization recheck runs after the
+        // apply phase is claimed and immediately before mutation, against
+        // the live connection authority (session, consent generation, scopes,
+        // terminal capability map).
         if let Err(err) = item.authorize_at_drain(granted) {
             item.finish_without_apply();
             let (category, code, message) = ipc_error_triple(&err);
@@ -165,33 +158,24 @@ pub fn apply_control_envelope(
 }
 
 fn ipc_error_triple(err: &bitty_ipc::IpcError) -> (&'static str, &'static str, String) {
-    match err {
-        bitty_ipc::IpcError::ScopeDenied { .. } => (
-            "auth",
-            "ScopeDenied",
-            format!("permission denied: {err} (needs elevation via BITTY_CTL_ELEVATE)"),
-        ),
+    // One class table for enqueue and drain (CTX-0792): the category and code
+    // come from `bitty_ipc::ctl::control_error_class`; only the message is
+    // drain-specific (it may name the rejected id, never params text).
+    let (category, code) = ipc_ctl::control_error_class(err);
+    let message = match err {
+        bitty_ipc::IpcError::ScopeDenied { .. } => {
+            format!("permission denied: {err} (needs elevation via BITTY_CTL_ELEVATE)")
+        }
         // Generic denials and unauthenticated peers are permission failures
         // (CLI exit 7), never transport timeouts: surface the denial with
         // the elevation hint instead of exit 6.
-        bitty_ipc::IpcError::Denied { code, reason } => (
-            "auth",
-            "Denied",
-            format!("permission denied: [{code}] {reason} (needs elevation via BITTY_CTL_ELEVATE)"),
-        ),
-        bitty_ipc::IpcError::Unauthenticated { .. } => (
-            "auth",
-            "Unauthenticated",
-            format!("permission denied: {err}"),
-        ),
-        bitty_ipc::IpcError::NotFound { .. } => ("usage", "NotFound", format!("{err}")),
-        bitty_ipc::IpcError::InvalidMethod { .. } => ("usage", "InvalidMethod", format!("{err}")),
-        bitty_ipc::IpcError::InvalidRequest { .. } => ("usage", "InvalidParams", format!("{err}")),
-        bitty_ipc::IpcError::LimitExceeded { .. } => {
-            ("transport", "PayloadTooLarge", format!("{err}"))
+        bitty_ipc::IpcError::Denied { code, reason } if category == "auth" => {
+            format!("permission denied: [{code}] {reason} (needs elevation via BITTY_CTL_ELEVATE)")
         }
-        _ => ("transport", "Transport", format!("{err}")),
-    }
+        bitty_ipc::IpcError::Unauthenticated { .. } => format!("permission denied: {err}"),
+        _ => format!("{err}"),
+    };
+    (category, code, message)
 }
 
 /// Apply an authorized control method to `runtime`.

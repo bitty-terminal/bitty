@@ -1878,7 +1878,6 @@ impl PtyJob {
                     .map_err(|error| format!("job drain worker failed to start: {error}"))
             });
         if let Err(reason) = drained {
-            // `shutdown` is kill-then-reap.
             // `shutdown` is kill-then-reap; its error means the child may
             // still be alive or unreaped, which the failure must not hide.
             let reap = pty.shutdown().map(drop);

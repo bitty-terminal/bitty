@@ -46,6 +46,21 @@ ci-local *args:
     #!/usr/bin/env bash
     set -euo pipefail
     root="$(git rev-parse --show-toplevel)"
+    # act derives job container names from the workflow and job, so two
+    # ci-local runs on one Docker daemon collide even from different
+    # worktrees: the second run removes the first run's container mid-job
+    # (exit 137). Serialize runs per repository with a lock in the shared git
+    # directory, and fail fast instead of clobbering a running job.
+    if command -v flock >/dev/null 2>&1; then
+      lock="$(git rev-parse --path-format=absolute --git-common-dir)/ci-local.lock"
+      exec 9>"$lock"
+      if ! flock -n 9; then
+        echo "ci-local: another ci-local run of this repository holds $lock; wait for it to finish" >&2
+        exit 1
+      fi
+    else
+      echo "ci-local: flock not found; concurrent runs are not serialized" >&2
+    fi
     branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo detached)"
     [ "$branch" = "HEAD" ] && branch="detached-$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
     tag="$(printf '%s' "$branch" | tr -c 'A-Za-z0-9_.-' '-' | cut -c1-64)"

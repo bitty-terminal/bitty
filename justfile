@@ -68,7 +68,7 @@ ci-local *args:
     # Forward the host proxy when one is configured; act runs the container on
     # the host network, so a 127.0.0.1 proxy stays reachable. NO_PROXY keeps
     # loopback (the act server) off the proxy.
-    proxy="${http_proxy:-${https_proxy:-${NETWORK_PROXY:-}}}"
+    proxy="${HTTPS_PROXY:-${https_proxy:-${HTTP_PROXY:-${http_proxy:-${NETWORK_PROXY:-}}}}}"
     proxy_env=()
     if [ -n "$proxy" ]; then
       proxy_env=(

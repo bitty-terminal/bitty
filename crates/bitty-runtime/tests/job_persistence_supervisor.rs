@@ -388,6 +388,192 @@ fn daemon_claim_is_exclusive_and_stale_locks_are_adoptable() {
     drop_scratch(&dir);
 }
 
+// ── execution integrity (CORE-RUN-003/004, #1526) ───────────────────────────
+
+/// Concurrent claimants in the claim race.
+const CLAIMANTS: usize = 8;
+
+/// Rounds of the heartbeat-versus-adoption race.
+const ADOPTION_ROUNDS: usize = 16;
+
+/// Concurrent savers in the checkpoint race, and checkpoints per saver.
+const SAVERS: usize = 4;
+const CHECKPOINTS_PER_SAVER: usize = 12;
+
+fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// Ages the current lock's claim stamp and the heartbeat past the stale
+/// bound while keeping the lock's generation: the directory looks exactly
+/// as a hung or dead owner would leave it.
+fn age_claim(dir: &std::path::Path) {
+    let stale = epoch_ms().saturating_sub(bitty_runtime::STALE_HEARTBEAT_MS + 5_000);
+    let lock = dir.join(bitty_runtime::SUPERVISOR_LOCK_NAME);
+    let text = std::fs::read_to_string(&lock).expect("lock readable");
+    let mut fields: Vec<String> = text.trim_end().split('\t').map(str::to_owned).collect();
+    assert_eq!(fields.len(), 5, "a fresh claim writes a v2 lock: {text:?}");
+    fields[3] = stale.to_string();
+    std::fs::write(&lock, fields.join("\t")).expect("age the claim");
+    std::fs::write(
+        dir.join(bitty_runtime::SUPERVISOR_HEARTBEAT_NAME),
+        stale.to_string(),
+    )
+    .expect("age the heartbeat");
+}
+
+#[test]
+fn racing_claimants_have_exactly_one_winner() {
+    let (_store, dir) = scratch_store("claim-race");
+    let barrier = std::sync::Barrier::new(CLAIMANTS);
+    let results: Vec<Result<SupervisorDaemon, DaemonError>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..CLAIMANTS)
+            .map(|_| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    SupervisorDaemon::claim(&dir)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("claimant thread"))
+            .collect()
+    });
+    let winners: Vec<&SupervisorDaemon> = results.iter().filter_map(|r| r.as_ref().ok()).collect();
+    assert_eq!(winners.len(), 1, "exactly one claimant owns: {results:?}");
+    assert!(winners[0].is_owner());
+    for result in &results {
+        match result {
+            Ok(_) | Err(DaemonError::AlreadyOwned { .. }) => {}
+            Err(other) => panic!("a losing claimant must see AlreadyOwned, got {other:?}"),
+        }
+    }
+    drop_scratch(&dir);
+}
+
+#[test]
+fn a_same_pid_adopter_never_shares_ownership() {
+    // Both claims run in this process, so they share a pid: ownership must
+    // follow the generation token, never the pid.
+    let (_store, dir) = scratch_store("same-pid");
+    let old = SupervisorDaemon::claim(&dir).expect("first claim");
+    age_claim(&dir);
+    let adopter = SupervisorDaemon::claim(&dir).expect("a stale claim is adoptable");
+    assert_eq!(old.pid(), adopter.pid());
+    assert!(adopter.is_owner());
+    assert!(!old.is_owner(), "the adopted owner lost the directory");
+    assert!(matches!(old.heartbeat(), Err(DaemonError::NotOwner { .. })));
+    assert!(matches!(old.release(), Err(DaemonError::NotOwner { .. })));
+    assert!(
+        adopter.is_owner(),
+        "a stale owner's release removed nothing"
+    );
+    adopter.heartbeat().expect("the adopter heartbeats");
+    adopter.release().expect("the adopter releases");
+    drop_scratch(&dir);
+}
+
+#[test]
+fn a_heartbeat_racing_an_adoption_leaves_exactly_one_owner() {
+    let (_store, dir) = scratch_store("beat-race");
+    for round in 0..ADOPTION_ROUNDS {
+        let owner = SupervisorDaemon::claim(&dir).expect("claim");
+        age_claim(&dir);
+        let barrier = std::sync::Barrier::new(2);
+        let (beat, adoption) = std::thread::scope(|scope| {
+            let beat = scope.spawn(|| {
+                barrier.wait();
+                owner.heartbeat()
+            });
+            let adoption = scope.spawn(|| {
+                barrier.wait();
+                SupervisorDaemon::claim(&dir)
+            });
+            (
+                beat.join().expect("heartbeat thread"),
+                adoption.join().expect("adopter thread"),
+            )
+        });
+        match (beat, adoption) {
+            // The beat landed first: the owner is live again and the
+            // adopter is denied.
+            (Ok(()), Err(DaemonError::AlreadyOwned { .. })) => {
+                assert!(owner.is_owner(), "round {round}");
+                owner.release().expect("owner releases");
+            }
+            // The adoption landed first: the old owner's beat is refused.
+            (Err(DaemonError::NotOwner { .. }), Ok(adopter)) => {
+                assert!(!owner.is_owner(), "round {round}");
+                assert!(adopter.is_owner(), "round {round}");
+                assert!(matches!(
+                    owner.heartbeat(),
+                    Err(DaemonError::NotOwner { .. })
+                ));
+                adopter.release().expect("adopter releases");
+            }
+            other => panic!("round {round}: exactly one owner must survive, got {other:?}"),
+        }
+    }
+    drop_scratch(&dir);
+}
+
+#[test]
+fn concurrent_heartbeats_of_one_owner_all_land() {
+    let (_store, dir) = scratch_store("beats");
+    let owner = SupervisorDaemon::claim(&dir).expect("claim");
+    let barrier = std::sync::Barrier::new(SAVERS);
+    std::thread::scope(|scope| {
+        for _ in 0..SAVERS {
+            scope.spawn(|| {
+                barrier.wait();
+                for _ in 0..CHECKPOINTS_PER_SAVER {
+                    owner.heartbeat().expect("every heartbeat lands");
+                }
+            });
+        }
+    });
+    assert!(owner.is_owner());
+    owner.release().expect("release");
+    drop_scratch(&dir);
+}
+
+#[test]
+fn concurrent_checkpoints_of_one_store_all_land_intact() {
+    let registry = JobRegistry::new();
+    let said = registry.spawn(helper_spec("say")).expect("tracked");
+    wait_terminal(&registry, said);
+    wait_output(&registry, said, CANARY);
+    let (store, dir) = scratch_store("checkpoint-race");
+    let barrier = std::sync::Barrier::new(SAVERS);
+    std::thread::scope(|scope| {
+        for _ in 0..SAVERS {
+            scope.spawn(|| {
+                barrier.wait();
+                for _ in 0..CHECKPOINTS_PER_SAVER {
+                    store
+                        .checkpoint(&registry)
+                        .expect("a concurrent saver never loses its temp");
+                }
+            });
+        }
+    });
+    let loaded = store.load().expect("the manifest is one whole write");
+    assert_eq!(loaded.jobs.len(), 1);
+    assert_eq!(loaded.jobs[0].id, said);
+    let litter: Vec<String> = std::fs::read_dir(&dir)
+        .expect("store dir")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".tmp."))
+        .collect();
+    assert!(litter.is_empty(), "no temp survives: {litter:?}");
+    drop_scratch(&dir);
+}
+
 #[test]
 fn handoff_roundtrip_names_jobs_and_cursor_then_clears() {
     let registry = JobRegistry::new();

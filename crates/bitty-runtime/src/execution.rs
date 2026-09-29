@@ -101,6 +101,8 @@
 //!   (`specifications/run-20-detached-supervisor-trust-boundary.md`); no
 //!   daemon code, per the accepted headless/daemon decision.
 
+mod atomic_file;
+mod claim_lock;
 mod command_risk;
 mod delivery;
 mod lease;
@@ -160,9 +162,10 @@ pub use supervisor::{
     SupervisorDaemon, adoption_plan, clear_handoff, read_handoff, write_handoff,
 };
 pub use supervisor::{
-    DEFAULT_MAX_RUNNING, HANDOFF_FILE_NAME, MAX_HANDOFF_BYTES, MAX_HANDOFF_JOBS,
-    MAX_HEARTBEAT_BYTES, MAX_SCHEDULE_RUNNING, STALE_HEARTBEAT_MS, SUPERVISOR_FORMAT_VERSION,
-    SUPERVISOR_HEARTBEAT_NAME, SUPERVISOR_LOCK_NAME,
+    CLAIM_LOCK_TIMEOUT_MS, DEFAULT_MAX_RUNNING, HANDOFF_FILE_NAME, MAX_HANDOFF_BYTES,
+    MAX_HANDOFF_JOBS, MAX_HEARTBEAT_BYTES, MAX_LOCK_BYTES, MAX_SCHEDULE_RUNNING,
+    STALE_HEARTBEAT_MS, SUPERVISOR_CLAIM_NAME, SUPERVISOR_FORMAT_VERSION,
+    SUPERVISOR_HEARTBEAT_NAME, SUPERVISOR_LOCK_NAME, SUPERVISOR_LOCK_VERSION,
 };
 
 /// Builds the closed-environment pipe command shared by the CTX-0442

@@ -46,8 +46,13 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use super::atomic_file::{self, AtomicWrite};
+use super::claim_lock;
 use super::persistence::{MAX_PERSISTED_JOBS, ReconciledJob, ResumeDecision};
 use super::{JobId, JobRegistry};
 
@@ -57,11 +62,31 @@ pub const SUPERVISOR_LOCK_NAME: &str = "supervisor.lock";
 /// Heartbeat file name inside a supervised directory.
 pub const SUPERVISOR_HEARTBEAT_NAME: &str = "supervisor.heartbeat";
 
+/// Claim-lock file name inside a supervised directory (CORE-RUN-003).
+///
+/// It only carries the OS-held exclusive lock that serializes claim,
+/// heartbeat, and release; its content is empty and it is never removed
+/// (unlinking a lock file lets two holders lock two different inodes).
+pub const SUPERVISOR_CLAIM_NAME: &str = "supervisor.claim";
+
 /// Handoff note name inside a supervised directory.
 pub const HANDOFF_FILE_NAME: &str = "handoff";
 
-/// Lock/heartbeat/handoff format version.
+/// Heartbeat/handoff format version.
 pub const SUPERVISOR_FORMAT_VERSION: u32 = 1;
+
+/// Lock file format version: v2 adds the owner's random generation token.
+/// A v1 lock (pid only) is still read so it can deny or be adopted, but it
+/// never names an owner: ownership is the token, never a reusable pid.
+pub const SUPERVISOR_LOCK_VERSION: u32 = 2;
+
+/// Upper bound on waiting for the claim lock. Claim, heartbeat, and release
+/// hold it for one small read plus one small write, so a holder past this
+/// bound is wedged and the caller fails with [`DaemonError::ClaimBusy`].
+pub const CLAIM_LOCK_TIMEOUT_MS: u64 = 2_000;
+
+/// Back-off between claim-lock attempts while another holder has it.
+const CLAIM_LOCK_RETRY: Duration = Duration::from_millis(2);
 
 /// Heartbeat age past which a lock is stale and adoptable.
 pub const STALE_HEARTBEAT_MS: u64 = 30_000;
@@ -76,6 +101,11 @@ pub const MAX_HANDOFF_BYTES: usize = 256 * 1024;
 /// Maximum heartbeat file bytes (a decimal timestamp; anything larger is
 /// foreign and corrupt).
 pub const MAX_HEARTBEAT_BYTES: usize = 64;
+
+/// Maximum lock file bytes: magic, version, pid, stamp, and a 16-digit hex
+/// generation fit with room to spare; anything larger is foreign and
+/// corrupt.
+pub const MAX_LOCK_BYTES: usize = 128;
 
 /// Default ceiling for concurrent running jobs under a fresh policy.
 pub const DEFAULT_MAX_RUNNING: usize = 16;
@@ -108,6 +138,9 @@ pub enum DaemonError {
         /// Owned reason.
         reason: String,
     },
+    /// Another claim, heartbeat, or release held the claim lock for longer
+    /// than [`CLAIM_LOCK_TIMEOUT_MS`]; nothing was read or written.
+    ClaimBusy,
     /// A handoff or policy value exceeds its bound; nothing was applied.
     TooLarge {
         /// What exceeded the bound.
@@ -143,6 +176,7 @@ impl std::fmt::Display for DaemonError {
                 write!(f, "supervisor directory already owned by pid {owner_pid}")
             }
             Self::NotOwner { reason } => write!(f, "not the owning supervisor: {reason}"),
+            Self::ClaimBusy => f.write_str("supervisor claim lock busy"),
             Self::TooLarge {
                 what,
                 actual,
@@ -169,29 +203,44 @@ fn now_ms() -> u64 {
 /// Single-owner coordination over one supervised directory.
 ///
 /// A value exists only after a successful [`SupervisorDaemon::claim`]; the
-/// lock file carries `(version, pid, claimed_at_ms)` and the heartbeat file
-/// carries the newest liveness stamp. A second claimant reads both: a fresh
-/// heartbeat denies with [`DaemonError::AlreadyOwned`], while a stale or
-/// missing heartbeat means the owner died and the lock is adopted (crash
-/// adoption without a babysitter process).
+/// lock file carries `(version, pid, claimed_at_ms, generation)` and the
+/// heartbeat file carries the newest liveness stamp. A second claimant reads
+/// both: a fresh heartbeat denies with [`DaemonError::AlreadyOwned`], while
+/// a stale or missing heartbeat means the owner died and the lock is adopted
+/// (crash adoption without a babysitter process).
+///
+/// Exclusivity (CORE-RUN-003): claim, heartbeat, and release run under one
+/// OS-held claim lock ([`SUPERVISOR_CLAIM_NAME`]) that the kernel drops when
+/// its holder dies, so the stale check and the lock write form one critical
+/// section and two claimants can never both pass it. Ownership is the random
+/// generation token a claim writes, never the pid: a claimant in the same
+/// process (same pid) or a later process that reuses a dead owner's pid is
+/// still a different owner.
 #[derive(Debug)]
 pub struct SupervisorDaemon {
     dir: PathBuf,
     pid: u32,
+    generation: u64,
 }
 
 impl SupervisorDaemon {
     /// Claims ownership of `dir`, adopting a stale lock when the previous
     /// owner's heartbeat stopped.
     ///
+    /// Abandoned temp files from crashed coordination writes are swept while
+    /// the claim lock is held; live temps are never touched.
+    ///
     /// # Errors
     ///
     /// Returns [`DaemonError::AlreadyOwned`] when a live supervisor holds
-    /// the directory, and [`DaemonError::Io`] when the lock or heartbeat
-    /// cannot be written.
+    /// the directory, [`DaemonError::ClaimBusy`] when the claim lock stays
+    /// held past [`CLAIM_LOCK_TIMEOUT_MS`], and [`DaemonError::Io`] when the
+    /// lock or heartbeat cannot be written.
     pub fn claim(dir: &Path) -> Result<Self, DaemonError> {
-        let pid = std::process::id();
-        if let Some((owner_pid, claimed_at_ms)) = read_lock(dir)? {
+        fs::create_dir_all(dir).map_err(|error| DaemonError::io("create supervised dir", error))?;
+        let _guard = ClaimGuard::acquire(dir)?;
+        atomic_file::sweep_abandoned_temps(dir);
+        if let Some(lock) = read_lock(dir)? {
             // A lock is adoptable only when BOTH stamps are stale: a fresh
             // claim may not have written its first heartbeat yet (a claimant
             // alive but mid-claim must never lose its directory), and a fresh
@@ -199,19 +248,31 @@ impl SupervisorDaemon {
             // says. Clock skew toward the past saturates to age zero, which
             // denies — the safe direction.
             let now = now_ms();
-            let lock_stale = now.saturating_sub(claimed_at_ms) > STALE_HEARTBEAT_MS;
+            let lock_stale = now.saturating_sub(lock.claimed_at_ms) > STALE_HEARTBEAT_MS;
             let beat_stale = now.saturating_sub(read_heartbeat(dir)?) > STALE_HEARTBEAT_MS;
             if !(lock_stale && beat_stale) {
-                return Err(DaemonError::AlreadyOwned { owner_pid });
+                return Err(DaemonError::AlreadyOwned {
+                    owner_pid: lock.pid,
+                });
             }
-            // Stale: the owner died without releasing. Adoption overwrites
-            // the lock below; the old pid is never trusted.
+            // Stale: the owner died or hung without releasing. Adoption
+            // overwrites the lock below with a new generation, so the old
+            // owner's next heartbeat or release fails with `NotOwner`.
         }
-        write_lock(dir, pid, now_ms())?;
-        write_heartbeat(dir, now_ms())?;
+        let pid = std::process::id();
+        let generation = new_generation();
+        let claimed_at_ms = now_ms();
+        write_lock(dir, pid, claimed_at_ms, generation)?;
+        if let Err(error) = write_heartbeat(dir, claimed_at_ms) {
+            // Still inside the critical section: withdraw the half-made
+            // claim instead of leaving a lock nobody holds a token for.
+            let _ = fs::remove_file(dir.join(SUPERVISOR_LOCK_NAME));
+            return Err(error);
+        }
         Ok(Self {
             dir: dir.to_owned(),
             pid,
+            generation,
         })
     }
 
@@ -221,19 +282,20 @@ impl SupervisorDaemon {
         &self.dir
     }
 
-    /// Owning pid recorded at claim time.
+    /// Owning pid recorded at claim time (provenance only: ownership is the
+    /// generation token, see [`SupervisorDaemon::is_owner`]).
     #[must_use]
     pub fn pid(&self) -> u32 {
         self.pid
     }
 
-    /// Whether the lock file still names this supervisor.
+    /// Whether the lock file still carries this claim's generation token.
     #[must_use]
     pub fn is_owner(&self) -> bool {
         read_lock(&self.dir)
             .ok()
             .flatten()
-            .is_some_and(|(owner_pid, _)| owner_pid == self.pid)
+            .is_some_and(|lock| lock.generation == Some(self.generation))
     }
 
     /// Renews liveness; owners call this on a period well under
@@ -241,16 +303,23 @@ impl SupervisorDaemon {
     ///
     /// # Errors
     ///
-    /// Returns [`DaemonError::NotOwner`] when the lock no longer names this
-    /// supervisor (adopted or released elsewhere), and [`DaemonError::Io`]
-    /// when the heartbeat cannot be written.
+    /// Returns [`DaemonError::NotOwner`] when the lock no longer carries this
+    /// claim's generation (adopted or released elsewhere),
+    /// [`DaemonError::ClaimBusy`] when the claim lock stays held, and
+    /// [`DaemonError::Io`] when the heartbeat cannot be written.
     pub fn heartbeat(&self) -> Result<(), DaemonError> {
-        if !self.is_owner() {
-            return Err(DaemonError::NotOwner {
-                reason: "lock names another supervisor".into(),
-            });
+        let _guard = ClaimGuard::acquire(&self.dir)?;
+        match read_lock(&self.dir)? {
+            Some(lock) if lock.generation == Some(self.generation) => {
+                write_heartbeat(&self.dir, now_ms())
+            }
+            Some(_) => Err(DaemonError::NotOwner {
+                reason: "lock carries another supervisor's generation".into(),
+            }),
+            None => Err(DaemonError::NotOwner {
+                reason: "lock was released".into(),
+            }),
         }
-        write_heartbeat(&self.dir, now_ms())
     }
 
     /// Releases ownership, removing the lock and heartbeat. Idempotent
@@ -258,12 +327,14 @@ impl SupervisorDaemon {
     ///
     /// # Errors
     ///
-    /// Returns [`DaemonError::NotOwner`] when the lock names another live
-    /// supervisor, and [`DaemonError::Io`] when removal fails.
+    /// Returns [`DaemonError::NotOwner`] when the lock carries another
+    /// supervisor's generation, [`DaemonError::ClaimBusy`] when the claim
+    /// lock stays held, and [`DaemonError::Io`] when removal fails.
     pub fn release(self) -> Result<(), DaemonError> {
+        let _guard = ClaimGuard::acquire(&self.dir)?;
         match read_lock(&self.dir)? {
-            Some((owner_pid, _)) if owner_pid != self.pid => Err(DaemonError::NotOwner {
-                reason: "lock names another supervisor".into(),
+            Some(lock) if lock.generation != Some(self.generation) => Err(DaemonError::NotOwner {
+                reason: "lock carries another supervisor's generation".into(),
             }),
             _ => {
                 let _ = fs::remove_file(self.dir.join(SUPERVISOR_LOCK_NAME));
@@ -274,27 +345,104 @@ impl SupervisorDaemon {
     }
 }
 
-/// Reads the lock file: `None` when absent, otherwise `(pid, claimed_at_ms)`.
-fn read_lock(dir: &Path) -> Result<Option<(u32, u64)>, DaemonError> {
+/// Fresh, non-zero generation token for one claim.
+///
+/// `RandomState` draws its keys from the OS randomness source (and advances
+/// them per instance), and the pid, clock, and a process-wide counter are
+/// mixed in, so two claims — in one process or across processes — never
+/// share a token in practice. The token only has to be unique, not secret:
+/// it names an owner, it grants nothing.
+fn new_generation() -> u64 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher as _, Hasher as _};
+    static NEXT_CLAIM: AtomicU64 = AtomicU64::new(0);
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u32(std::process::id());
+    hasher.write_u64(now_ms());
+    hasher.write_u64(NEXT_CLAIM.fetch_add(1, Ordering::Relaxed));
+    hasher.finish().max(1)
+}
+
+/// Serializes claim, heartbeat, and release across threads and processes.
+///
+/// Holds a process-wide mutex (in-process exclusion that never depends on
+/// the filesystem's lock semantics) plus the OS-held lock on
+/// [`SUPERVISOR_CLAIM_NAME`] (cross-process exclusion the kernel releases
+/// when its holder dies, so a crash inside the critical section never wedges
+/// the directory). Both are released on drop.
+struct ClaimGuard {
+    // Field order is drop order: the OS lock goes before the mutex.
+    _os: claim_lock::HeldLock,
+    _process: MutexGuard<'static, ()>,
+}
+
+/// In-process half of [`ClaimGuard`].
+static PROCESS_CLAIM: Mutex<()> = Mutex::new(());
+
+impl ClaimGuard {
+    fn acquire(dir: &Path) -> Result<Self, DaemonError> {
+        let process = PROCESS_CLAIM.lock().unwrap_or_else(PoisonError::into_inner);
+        let path = dir.join(SUPERVISOR_CLAIM_NAME);
+        let deadline = Instant::now().checked_add(Duration::from_millis(CLAIM_LOCK_TIMEOUT_MS));
+        loop {
+            match claim_lock::try_lock(&path) {
+                Ok(Some(os)) => {
+                    return Ok(Self {
+                        _os: os,
+                        _process: process,
+                    });
+                }
+                Ok(None) => {
+                    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                        return Err(DaemonError::ClaimBusy);
+                    }
+                    thread::sleep(CLAIM_LOCK_RETRY);
+                }
+                Err(error) => return Err(DaemonError::io("lock supervisor claim", error)),
+            }
+        }
+    }
+}
+
+/// One parsed lock file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LockRecord {
+    pid: u32,
+    claimed_at_ms: u64,
+    /// The owner's token; `None` for a legacy v1 lock, which names no owner.
+    generation: Option<u64>,
+}
+
+/// Reads the lock file: `None` when absent.
+fn read_lock(dir: &Path) -> Result<Option<LockRecord>, DaemonError> {
     let path = dir.join(SUPERVISOR_LOCK_NAME);
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(DaemonError::io("read supervisor lock", error)),
     };
-    if bytes.len() > MAX_HEARTBEAT_BYTES {
+    if bytes.len() > MAX_LOCK_BYTES {
         return Err(DaemonError::corrupt("supervisor lock exceeds bound"));
     }
     let text = String::from_utf8(bytes)
         .map_err(|error| DaemonError::corrupt(format!("lock not UTF-8: {error}")))?;
     let fields: Vec<&str> = text.trim_end().split('\t').collect();
-    let [magic, version, pid, claimed] = fields.as_slice() else {
-        return Err(DaemonError::corrupt("supervisor lock has the wrong shape"));
+    let (magic, version, pid, claimed, generation) = match fields.as_slice() {
+        [magic, version, pid, claimed] => (*magic, *version, *pid, *claimed, None),
+        [magic, version, pid, claimed, generation] => {
+            (*magic, *version, *pid, *claimed, Some(*generation))
+        }
+        _ => return Err(DaemonError::corrupt("supervisor lock has the wrong shape")),
     };
-    if *magic != "BITTY-SUPERVISOR" {
+    if magic != "BITTY-SUPERVISOR" {
         return Err(DaemonError::corrupt("supervisor lock magic mismatch"));
     }
-    if *version != format!("v{SUPERVISOR_FORMAT_VERSION}") {
+    let expected = if generation.is_some() {
+        SUPERVISOR_LOCK_VERSION
+    } else {
+        SUPERVISOR_FORMAT_VERSION
+    };
+    if version != format!("v{expected}") {
         return Err(DaemonError::corrupt(format!(
             "unsupported supervisor version: {version}"
         )));
@@ -308,15 +456,36 @@ fn read_lock(dir: &Path) -> Result<Option<(u32, u64)>, DaemonError> {
     let claimed_at_ms: u64 = claimed
         .parse()
         .map_err(|_| DaemonError::corrupt("supervisor lock stamp is not a number"))?;
-    Ok(Some((owner_pid, claimed_at_ms)))
+    let generation = match generation {
+        None => None,
+        Some(raw) => {
+            let token = u64::from_str_radix(raw, 16)
+                .map_err(|_| DaemonError::corrupt("supervisor lock generation is not hex"))?;
+            if token == 0 {
+                return Err(DaemonError::corrupt("supervisor lock generation is zero"));
+            }
+            Some(token)
+        }
+    };
+    Ok(Some(LockRecord {
+        pid: owner_pid,
+        claimed_at_ms,
+        generation,
+    }))
 }
 
-/// Writes the lock file atomically (temp + rename; small enough that fsync
-/// rides on the directory sync of the persistence layer's heavier writes —
-/// the heartbeat, not the lock, is the liveness source of truth).
-fn write_lock(dir: &Path, pid: u32, claimed_at_ms: u64) -> Result<(), DaemonError> {
-    fs::create_dir_all(dir).map_err(|error| DaemonError::io("create supervised dir", error))?;
-    let text = format!("BITTY-SUPERVISOR\tv{SUPERVISOR_FORMAT_VERSION}\t{pid}\t{claimed_at_ms}");
+/// Writes the lock file atomically (unique temp + rename; small enough that
+/// fsync rides on the directory sync of the persistence layer's heavier
+/// writes — the heartbeat, not the lock, is the liveness source of truth).
+fn write_lock(
+    dir: &Path,
+    pid: u32,
+    claimed_at_ms: u64,
+    generation: u64,
+) -> Result<(), DaemonError> {
+    let text = format!(
+        "BITTY-SUPERVISOR\tv{SUPERVISOR_LOCK_VERSION}\t{pid}\t{claimed_at_ms}\t{generation:016x}"
+    );
     atomic_small_write(&dir.join(SUPERVISOR_LOCK_NAME), text.as_bytes())
 }
 
@@ -347,7 +516,8 @@ fn write_heartbeat(dir: &Path, at_ms: u64) -> Result<(), DaemonError> {
     )
 }
 
-/// Atomic temp-plus-rename write for small coordination files.
+/// Atomic unique-temp-plus-rename write for small coordination files
+/// (CORE-RUN-004): concurrent writers never share a temp name.
 fn atomic_small_write(path: &Path, bytes: &[u8]) -> Result<(), DaemonError> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -355,31 +525,15 @@ fn atomic_small_write(path: &Path, bytes: &[u8]) -> Result<(), DaemonError> {
                 .map_err(|error| DaemonError::io("create supervisor dir", error))?;
         }
     }
-    let temp = path.with_file_name(format!(
-        "{}.tmp.{}",
-        path.file_name().map_or_else(
-            || SUPERVISOR_LOCK_NAME.into(),
-            |name| name.to_string_lossy().into_owned()
-        ),
-        std::process::id()
-    ));
-    let _ = fs::remove_file(&temp);
-    let outcome = (|| -> Result<(), std::io::Error> {
-        use std::io::Write as _;
-        let mut file = fs::File::create(&temp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&temp, path)?;
-        Ok(())
-    })();
-    match outcome {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = fs::remove_file(&temp);
-            Err(DaemonError::io("write supervisor file", error))
-        }
-    }
+    atomic_file::write_atomic(
+        path,
+        bytes,
+        AtomicWrite {
+            owner_only: false,
+            sync_parent: false,
+        },
+    )
+    .map_err(|error| DaemonError::io("write supervisor file", error))
 }
 
 // ── handoff ───────────────────────────────────────────────────────────────
@@ -792,5 +946,94 @@ mod tests {
             },
             jobs: Vec::new(),
         };
+    }
+
+    // ── exclusive claim (CORE-RUN-003, #1526) ───────────────────────────────
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "bitty-supervisor-{tag}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    #[test]
+    fn the_os_claim_lock_excludes_a_second_holder_until_dropped() {
+        let dir = scratch_dir("oslock");
+        let path = dir.join(SUPERVISOR_CLAIM_NAME);
+        let first = claim_lock::try_lock(&path)
+            .expect("lock io")
+            .expect("free lock is taken");
+        assert!(
+            claim_lock::try_lock(&path).expect("lock io").is_none(),
+            "a second handle must not take a held lock"
+        );
+        drop(first);
+        assert!(
+            claim_lock::try_lock(&path).expect("lock io").is_some(),
+            "a dropped lock is free again"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn locks_round_trip_their_generation_and_legacy_locks_name_no_owner() {
+        let dir = scratch_dir("lockfmt");
+        write_lock(&dir, 42, 1_000, 0xfeed_beef).expect("write");
+        assert_eq!(
+            read_lock(&dir).expect("read"),
+            Some(LockRecord {
+                pid: 42,
+                claimed_at_ms: 1_000,
+                generation: Some(0xfeed_beef),
+            })
+        );
+        // Worst-case field widths still fit the bound.
+        write_lock(&dir, u32::MAX, u64::MAX, u64::MAX).expect("write");
+        assert!(read_lock(&dir).expect("read").is_some());
+
+        let lock = dir.join(SUPERVISOR_LOCK_NAME);
+        fs::write(
+            &lock,
+            format!("BITTY-SUPERVISOR\tv{SUPERVISOR_FORMAT_VERSION}\t42\t1000"),
+        )
+        .expect("legacy");
+        assert_eq!(
+            read_lock(&dir).expect("legacy lock still reads"),
+            Some(LockRecord {
+                pid: 42,
+                claimed_at_ms: 1_000,
+                generation: None,
+            })
+        );
+        for corrupt in [
+            format!("BITTY-SUPERVISOR\tv{SUPERVISOR_LOCK_VERSION}\t42\t1000\tnot-hex"),
+            format!("BITTY-SUPERVISOR\tv{SUPERVISOR_LOCK_VERSION}\t42\t1000\t0"),
+            format!("BITTY-SUPERVISOR\tv{SUPERVISOR_FORMAT_VERSION}\t42\t1000\tfeed"),
+            format!("BITTY-SUPERVISOR\tv{SUPERVISOR_LOCK_VERSION}\t42\t1000"),
+            "x".repeat(MAX_LOCK_BYTES + 1),
+        ] {
+            fs::write(&lock, &corrupt).expect("corrupt");
+            assert!(
+                matches!(read_lock(&dir), Err(DaemonError::Corrupt { .. })),
+                "{corrupt:?} must be corrupt"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn generations_are_unique_and_non_zero() {
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..1_000 {
+            let generation = new_generation();
+            assert_ne!(generation, 0);
+            assert!(seen.insert(generation), "generation reused");
+        }
     }
 }

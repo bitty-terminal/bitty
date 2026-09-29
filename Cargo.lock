@@ -418,6 +418,8 @@ dependencies = [
  "bitty-test-support",
  "bitty-ui",
  "bitty-vt",
+ "nix",
+ "rustix 1.1.5",
 ]
 
 [[package]]

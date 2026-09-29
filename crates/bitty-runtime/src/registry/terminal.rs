@@ -614,6 +614,7 @@ impl TerminalRegistry {
                 existing_terminal: existing,
             });
         }
+        let rect = rect.validated()?;
         if rect.is_zero_area() {
             self.bump_error("InvalidGeometry");
             return Err(RegistryError::InvalidGeometry {
@@ -732,6 +733,7 @@ impl TerminalRegistry {
                 existing_terminal: existing,
             });
         }
+        let rect = rect.validated()?;
         if rect.is_zero_area() {
             return Err(RegistryError::InvalidGeometry {
                 reason: "zero-area rect",
@@ -798,6 +800,7 @@ impl TerminalRegistry {
             });
         }
         let old = self.view_to_terminal.get(&view_id).copied();
+        let rect = rect.validated()?;
         if rect.is_zero_area() {
             return Err(RegistryError::InvalidGeometry {
                 reason: "zero-area rect",
@@ -878,6 +881,7 @@ impl TerminalRegistry {
     /// clamped to `[1, 1024]` each and to configured `max_cols`/`max_rows`.
     /// Zero-area returns `InvalidGeometry` with no PTY resize.
     pub fn logical_rect_to_grid(&self, rect: LogicalRect) -> Result<(u16, u16), RegistryError> {
+        let rect = rect.validated()?;
         if rect.is_zero_area() {
             return Err(RegistryError::InvalidGeometry {
                 reason: "zero-area rect retains previous geometry",
@@ -915,6 +919,7 @@ impl TerminalRegistry {
     ) -> Result<(), RegistryError> {
         self.ensure_not_disposed()?;
         self.validate_view(workspace_id, view_id, view_gen)?;
+        let rect = rect.validated()?;
         if rect.is_zero_area() {
             // Visibility ZeroArea: no PTY resize, previous geometry retained
             if let Ok(ws) = self.get_workspace_mut(workspace_id) {

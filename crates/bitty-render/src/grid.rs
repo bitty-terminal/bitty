@@ -1747,7 +1747,11 @@ impl GlyphAtlas {
 
         // Update layout and texels (keep slots, they're still valid).
         self.layout = AtlasLayout::new(next, next).expect("valid dimension");
+        self.layout
+            .allocate(current, current)
+            .expect("grown layout can reserve the old region");
         self.texels = new_texels;
+        self.epoch = self.epoch.wrapping_add(1);
         self.exhausted = false;
 
         // Mark all slots for re-upload since the texture changed.
@@ -2231,7 +2235,22 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
                 }
             }
         }
+        self.refresh_atlas_uvs(&mut pass.glyphs);
+        pass.atlas_epoch = self.atlas.epoch();
         pass
+    }
+
+    /// Refreshes atlas-backed glyph UVs to match the current atlas dimensions.
+    /// Called after placement passes that may have grown the atlas, ensuring
+    /// earlier glyphs use the new dimensions rather than stale UVs normalized
+    /// against the old atlas size.
+    fn refresh_atlas_uvs(&self, glyphs: &mut [GlyphInstance]) {
+        let dims = self.atlas.dims();
+        for glyph in glyphs {
+            if let GlyphSource::Atlas { slot } = &glyph.source {
+                glyph.uv = slot.uv(dims);
+            }
+        }
     }
 
     /// Emits background, decorations, and (unless suppressed) one glyph for
@@ -2617,6 +2636,7 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
             self.counters.glyphs_emitted += 1;
             col += advance;
         }
+        self.refresh_atlas_uvs(&mut out);
         (out, self.atlas.is_exhausted())
     }
 }

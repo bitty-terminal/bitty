@@ -240,8 +240,37 @@ impl Runtime {
         cols: u16,
         rows: u16,
     ) -> Result<(), RuntimeError> {
+        self.spawn_shell_for_view_in(view, program, args, cols, rows, None)
+    }
+
+    /// [`Self::spawn_shell_for_view`] with an explicit working directory.
+    ///
+    /// `cwd` of `Some` replaces the CTX-0357 `OSC 7` inheritance for this
+    /// spawn (#1528: `bitty ctl terminal spawn --cwd`). It is re-checked here,
+    /// at the spawn boundary, so a directory removed after the caller
+    /// validated it fails closed instead of silently falling back to another
+    /// directory. `None` keeps the inheritance unchanged.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::spawn_shell_for_view`], plus
+    /// [`RuntimeError::InvalidConfig`] when `cwd` is not an existing directory.
+    pub fn spawn_shell_for_view_in(
+        &mut self,
+        view: ViewId,
+        program: &str,
+        args: &[&str],
+        cols: u16,
+        rows: u16,
+        cwd: Option<&std::path::Path>,
+    ) -> Result<(), RuntimeError> {
         if program.trim().is_empty() {
             return Err(RuntimeError::InvalidConfig("program must not be empty"));
+        }
+        if cwd.is_some_and(|dir| !dir.is_dir()) {
+            return Err(RuntimeError::InvalidConfig(
+                "spawn cwd is not an existing directory",
+            ));
         }
         if !self.layout.leaf_ids().contains(&view) {
             return Err(RuntimeError::InvalidConfig(
@@ -259,9 +288,12 @@ impl Runtime {
         let mut builder = PtyBuilder::new(program).size(cols, rows);
         // CTX-0357: new panes inherit the focused pane's last `OSC 7` cwd
         // when it still names an existing directory; otherwise the builder
-        // keeps the platform default (fail-open, never an error here).
-        if let Some(cwd) = self.inherited_cwd_for(view) {
-            builder = builder.cwd(cwd);
+        // keeps the platform default (fail-open, never an error here). An
+        // explicit `cwd` (checked above) takes precedence (#1528).
+        if let Some(dir) = cwd {
+            builder = builder.cwd(dir);
+        } else if let Some(inherited) = self.inherited_cwd_for(view) {
+            builder = builder.cwd(inherited);
         }
         for arg in args {
             builder = builder.arg(*arg);

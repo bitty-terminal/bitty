@@ -211,6 +211,9 @@ pub(crate) fn apply_live_presentation(
 struct Stamp {
     mtime: Option<SystemTime>,
     len: u64,
+    /// Symlink target when the watched path is a symlink, so retargeting it to
+    /// a file with the same mtime and length is still a change.
+    target: Option<PathBuf>,
 }
 
 /// Minimum time between two `stat` calls of the watched file.
@@ -251,6 +254,7 @@ impl ConfigFileWatcher {
         Some(Stamp {
             mtime: meta.modified().ok(),
             len: meta.len(),
+            target: std::fs::read_link(path).ok(),
         })
     }
 
@@ -541,6 +545,37 @@ mod tests {
         let reverted = reload_requested(&mut runtime).expect("context installed");
         assert!(reverted.restart_required.is_empty(), "{reverted:?}");
         clear();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watcher_detects_a_symlink_retarget_with_identical_metadata() {
+        let dir = temp_dir("retarget");
+        let first = dir.join("a.toml");
+        let second = dir.join("b.toml");
+        write_config(&first, 12.0);
+        write_config(&second, 12.0);
+        // Same length and same mtime: only the link target differs.
+        let stamp = std::fs::metadata(&first)
+            .and_then(|meta| meta.modified())
+            .expect("mtime");
+        std::fs::File::options()
+            .write(true)
+            .open(&second)
+            .and_then(|file| file.set_modified(stamp))
+            .expect("align mtime");
+        let link = dir.join("config.toml");
+        std::os::unix::fs::symlink(&first, &link).expect("symlink");
+        let mut watcher = ConfigFileWatcher::new(link.clone());
+        let start = Instant::now();
+        assert!(!watcher.poll_at(start), "unchanged link");
+        std::fs::remove_file(&link).expect("unlink");
+        std::os::unix::fs::symlink(&second, &link).expect("retarget");
+        assert!(
+            watcher.poll_at(start + CONFIG_POLL_INTERVAL),
+            "a retarget is a change even with identical target metadata"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -183,13 +183,6 @@ fn render_outcome(
                 println!("{}", format_success(registry, &outcome.result_json));
             }
         }
-        // Warn when --cwd was accepted but not honored (stderr only, so
-        // JSON stdout stays clean).
-        if let CtlRequest::TerminalSpawn { cwd: Some(cwd) } = request {
-            eprintln!(
-                "bitty ctl: note: --cwd {cwd:?} validated but the spawn did not chdir (cwd honoring is a follow-up)"
-            );
-        }
         return EXIT_OK;
     }
     let class = class_for_server_error(&outcome.category, &outcome.code);

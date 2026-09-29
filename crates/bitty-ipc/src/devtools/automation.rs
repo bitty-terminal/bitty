@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg(any(test, feature = "test-support"))]
 use crate::error::IpcError;
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
@@ -14,9 +15,11 @@ use std::sync::{Mutex, OnceLock};
 //   `captureFrame` requires `debug.trace` + `terminal.inspect` (capability-
 //   plus-scope intersection, `getSnapshot` parity). Either missing yields
 //   `scope`/`ScopeDenied` with zero partial state.
-// - Bearers: per-session single-terminal sub-grants, consent-issued via
-//   [`issue_automation_bearer`] (no IPC issuance method, no env/config/flag
-//   path, never persisted, 10 min TTL). Unscoped callers (absent, expired,
+// - Bearers: per-session single-terminal sub-grants bound to the owning
+//   connection's session, principal, and consent generation (no IPC issuance
+//   method, no env/config/flag path, never persisted, 10 min TTL). Production
+//   issuance waits on the consent gesture (#1520); the context-free minters
+//   are `test-support` only (#1519). Unscoped callers (absent, expired,
 //   wrong-session, wrong-terminal, wrong-family) get `scope`/`ScopeDenied`.
 // - Bounds: 64 events/call, 10 calls/s (`synthesizeInput`), 10 fps
 //   (`captureFrame`), params 32 KiB, responses 32 KiB, frames 256 KiB.
@@ -131,6 +134,7 @@ pub(super) fn automation_store() -> &'static Mutex<AutomationStore> {
 }
 
 /// Random bytes in one bearer token (128 bits of CSPRNG output).
+#[cfg(any(test, feature = "test-support"))]
 const BEARER_TOKEN_BYTES: usize = 16;
 
 /// Fill `dest` from the platform CSPRNG, on every platform.
@@ -143,12 +147,14 @@ const BEARER_TOKEN_BYTES: usize = 16;
 /// platform that cannot produce unpredictable bytes must fail the issuance
 /// closed rather than mint a token derived from anything weaker (CTX-0792,
 /// #1403).
+#[cfg(any(test, feature = "test-support"))]
 fn fill_secure_random(dest: &mut [u8]) -> Result<(), IpcError> {
     getrandom::fill(dest).map_err(|err| IpcError::Unavailable {
         reason: format!("secure bearer source unavailable: {err}"),
     })
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn random_bearer_token() -> Result<String, IpcError> {
     let mut bytes = [0u8; BEARER_TOKEN_BYTES];
     fill_secure_random(&mut bytes)?;
@@ -160,6 +166,7 @@ fn random_bearer_token() -> Result<String, IpcError> {
 }
 
 /// Validate a session id for bearer binding (1..=64 chars, no NUL/control).
+#[cfg(any(test, feature = "test-support"))]
 fn validate_session_id(session_id: &str) -> Result<(), IpcError> {
     if session_id.is_empty() || session_id.len() > 64 {
         return Err(IpcError::InvalidRequest {
@@ -185,13 +192,16 @@ fn validate_bearer_shape(token: &str) -> Result<(), ()> {
     if ok { Ok(()) } else { Err(()) }
 }
 
-/// Issue an automation bearer for one session/terminal/family (consent path).
+/// Issue an unbound automation bearer for one session/terminal/family.
 ///
-/// Called server-side after explicit local-user consent (DevTools gesture or
-/// `bitty dev` prompt). There is deliberately no IPC method, env var, config
-/// key, flag, or child-inheritance path that issues bearers (P0-AC-023
-/// parity; no-bypass audit). The bearer lives in-memory only and expires
-/// after [`AUTOMATION_BEARER_TTL_MS`].
+/// Test support only (#1519, CORE-RUN-017): this context-free minter binds
+/// an empty principal and consent generation 0, so its bearer can never
+/// satisfy an authority-bound connection, and production builds do not
+/// compile it. There is deliberately no IPC method, env var, config key,
+/// flag, or child-inheritance path that issues bearers (P0-AC-023 parity;
+/// no-bypass audit); production issuance goes through the connection
+/// authority after explicit local-user consent (#1520). The bearer lives
+/// in-memory only and expires after [`AUTOMATION_BEARER_TTL_MS`].
 ///
 /// CTX-0244: [`AutomationFamily::FrameDigest`] cannot use this minter — its
 /// 10-minute default TTL exceeds the 2-minute digest cap, so digest grants
@@ -203,6 +213,7 @@ fn validate_bearer_shape(token: &str) -> Result<(), ()> {
 ///
 /// Returns `InvalidRequest` for bad session/terminal ids and `LimitExceeded`
 /// when the store is at capacity (fail-closed, no silent eviction).
+#[cfg(any(test, feature = "test-support"))]
 pub fn issue_automation_bearer(
     session_id: &str,
     terminal_id: &str,
@@ -236,6 +247,7 @@ pub fn issue_automation_bearer(
 ///
 /// Same as [`issue_automation_bearer`], plus `InvalidRequest` when `ttl_ms`
 /// is zero or exceeds the cap.
+#[cfg(any(test, feature = "test-support"))]
 pub fn issue_automation_bearer_with_ttl(
     session_id: &str,
     terminal_id: &str,
@@ -306,11 +318,13 @@ pub(crate) fn issue_automation_bearer_for_connection(
 ///
 /// The context-free legacy minters pass an empty principal and generation 0,
 /// which is why such a bearer can never satisfy an authority-bound check.
+#[cfg(any(test, feature = "test-support"))]
 struct BearerBinding {
     principal_id: String,
     consent_generation: u64,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl BearerBinding {
     fn unbound() -> Self {
         Self {
@@ -320,6 +334,7 @@ impl BearerBinding {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn issue_automation_bearer_internal(
     session_id: &str,
     terminal_id: &str,

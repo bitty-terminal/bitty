@@ -493,15 +493,26 @@ impl Runtime {
     /// same binary works headlessly (synthetic `handle_pty_bytes`) and with a
     /// real PTY (live `poll_pty`).
     pub fn poll_pty(&mut self) -> usize {
+        self.poll_pty_seeded(None)
+    }
+
+    /// The bounded drain behind [`Self::poll_pty`] and [`Self::poll_pty_timeout`].
+    ///
+    /// `seed` is a chunk a blocking wait already received. It is the first
+    /// chunk of this drain and counts against the same CTX-0476 chunk, byte,
+    /// and time budgets, so a blocking poll can never exceed one budget
+    /// (#1524: it used to handle the waited chunk and then drain a full
+    /// budget on top).
+    fn poll_pty_seeded(&mut self, seed: Option<Vec<u8>>) -> usize {
         // Collect without holding an immutable borrow across the mutable
         // `handle_pty_bytes` call (borrow checker). Bounded by chunk count,
         // byte total, and wall time (CTX-0476); at least one chunk drains
         // when data is available so a max-size chunk always makes progress.
         let start = std::time::Instant::now();
-        let mut drained_bytes = 0usize;
+        let mut drained_bytes = seed.as_ref().map_or(0, Vec::len);
+        let mut out: Vec<Vec<u8>> = seed.into_iter().collect();
         let chunks: Vec<Vec<u8>> = {
             if let Some(rx) = self.pty_forward_rx.as_ref() {
-                let mut out = Vec::new();
                 while out.len() < POLL_PTY_MAX_CHUNKS && drained_bytes < POLL_PTY_MAX_BYTES {
                     if !out.is_empty() && start.elapsed() >= POLL_PTY_TIME_BUDGET {
                         break;
@@ -519,9 +530,10 @@ impl Runtime {
             } else {
                 let Some(reader) = self.pty_reader.as_ref() else {
                     // No primary reader: pane sessions (if any) still pump.
+                    // A seed only ever comes from the primary reader.
+                    debug_assert!(out.is_empty(), "seed without a primary reader");
                     return self.pump_pane_sessions();
                 };
-                let mut out = Vec::new();
                 while out.len() < POLL_PTY_MAX_CHUNKS && drained_bytes < POLL_PTY_MAX_BYTES {
                     if !out.is_empty() && start.elapsed() >= POLL_PTY_TIME_BUDGET {
                         break;
@@ -554,9 +566,10 @@ impl Runtime {
     /// Blocking drain with a timeout, returning the number of chunks drained.
     ///
     /// Blocks at most `timeout` for the first chunk; once data is flowing it
-    /// drains all immediately available chunks without further blocking. Useful
-    /// for tests that need to wait for a shell echo. Returns `0` on timeout
-    /// or EOF.
+    /// drains immediately available chunks without further blocking, under
+    /// the same CTX-0476 budgets as [`Self::poll_pty`] (the waited chunk
+    /// counts as the first of them). Useful for tests that need to wait for
+    /// a shell echo. Returns `0` on timeout or EOF.
     pub fn poll_pty_timeout(&mut self, timeout: std::time::Duration) -> usize {
         let first: Option<Vec<u8>> = {
             if let Some(rx) = self.pty_forward_rx.as_ref() {
@@ -574,10 +587,7 @@ impl Runtime {
             }
         };
         match first {
-            Some(chunk) => {
-                self.handle_pty_bytes(&chunk);
-                1 + self.poll_pty()
-            }
+            Some(chunk) => self.poll_pty_seeded(Some(chunk)),
             // CTX-0230: a quiet primary must not starve panes. Drain every
             // pane session before reporting idle so split-shell queries
             // (e.g. fish `ESC[c` at startup) are answered on this path too.
@@ -1110,6 +1120,56 @@ mod tests {
 
     fn boxed(items: &[&[u8]]) -> Vec<Box<[u8]>> {
         items.iter().map(|item| (*item).into()).collect()
+    }
+
+    /// A headless runtime whose primary PTY stream is a channel pre-filled
+    /// with `chunks` small chunks (no child, no timing dependence).
+    fn runtime_with_queued_chunks(chunks: usize) -> (Runtime, std::sync::mpsc::Sender<Vec<u8>>) {
+        let mut rt = Runtime::new(crate::RuntimeConfig::default()).expect("headless build");
+        let (tx, rx) = std::sync::mpsc::channel();
+        for _ in 0..chunks {
+            tx.send(b"xxxxxxxx".to_vec()).expect("queue chunk");
+        }
+        rt.pty_forward_rx = Some(rx);
+        (rt, tx)
+    }
+
+    #[test]
+    fn poll_pty_timeout_counts_the_waited_chunk_against_the_budget() {
+        // #1524: more than one budget is already queued before the blocking
+        // wait. The waited chunk used to be handled on top of a full budget
+        // (1 + 32 = 33 chunks in one poll). The time budget may legitimately
+        // stop a poll early on a descheduled test thread, so each poll is
+        // checked against the bound and the queue is drained to the end.
+        let queued = POLL_PTY_MAX_CHUNKS + 8;
+        let (mut rt, _tx) = runtime_with_queued_chunks(queued);
+        let first = rt.poll_pty_timeout(std::time::Duration::from_secs(1));
+        assert!(
+            (1..=POLL_PTY_MAX_CHUNKS).contains(&first),
+            "blocking poll drained {first} chunks, budget is {POLL_PTY_MAX_CHUNKS}"
+        );
+        let mut total = first;
+        while total < queued {
+            let n = rt.poll_pty();
+            assert!(
+                n >= 1,
+                "queued chunks must keep draining ({total}/{queued})"
+            );
+            assert!(
+                n <= POLL_PTY_MAX_CHUNKS,
+                "poll drained {n} chunks, budget is {POLL_PTY_MAX_CHUNKS}"
+            );
+            total += n;
+        }
+        assert_eq!(total, queued, "every queued chunk drains exactly once");
+        assert_eq!(rt.poll_pty(), 0);
+    }
+
+    #[test]
+    fn poll_pty_timeout_drains_a_short_queue_completely() {
+        let (mut rt, _tx) = runtime_with_queued_chunks(3);
+        assert_eq!(rt.poll_pty_timeout(std::time::Duration::from_secs(1)), 3);
+        assert_eq!(rt.poll_pty(), 0);
     }
 
     #[test]

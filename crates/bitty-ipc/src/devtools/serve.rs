@@ -402,7 +402,8 @@ impl ServeContext {
     ///
     /// Granted scopes default to the CLI interactive set plus the explicit
     /// `BITTY_CTL_ELEVATE` allowlist (impure: reads one env var; tests that
-    /// need hermetic scopes use [`ServeContext::with_granted`]). The context
+    /// need hermetic scopes use the `test-support` constructor
+    /// `ServeContext::with_granted`). The context
     /// owns a standalone [`crate::ctl::ControlAuthority`] session, so it is
     /// authority-bound like a served connection; the accept path uses
     /// [`ServeContext::with_connection_grant`] with the listener's shared
@@ -602,6 +603,11 @@ impl ServeContext {
     ///
     /// This constructor does not establish peer proof; dispatch remains
     /// fail-closed until [`Self::bind_connected_stream`] succeeds.
+    ///
+    /// Test support only (#1519): the context has no server-owned authority,
+    /// so production builds do not compile it. Served connections use
+    /// [`Self::with_connection_grant`].
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn with_granted(server: &ServerInfo, granted: crate::scope::ScopeSet) -> Self {
         Self {
@@ -625,6 +631,9 @@ impl ServeContext {
     /// fail-closed until [`Self::bind_connected_stream`] succeeds. The terminal
     /// capability wildcard is exactly `granted`: nothing is added, so a harness
     /// that reads the grid must grant `terminal.inspect` explicitly.
+    ///
+    /// Test support only (#1519), like [`Self::with_granted`].
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn with_granted_session(
         server: &ServerInfo,
@@ -1469,7 +1478,7 @@ pub(crate) fn serve_connection<S>(
     clock_ms: &dyn Fn() -> u64,
 ) -> Result<ConnectionStats, IpcError>
 where
-    S: Read + Write,
+    S: ServeStream,
 {
     context.recheck_connection(Some(&peer))?;
     serve_connection_with_limiter(stream, dispatcher, context, limiter, clock_ms)
@@ -1489,7 +1498,7 @@ fn serve_connection_with_limiter<S>(
     clock_ms: &dyn Fn() -> u64,
 ) -> Result<ConnectionStats, IpcError>
 where
-    S: Read + Write,
+    S: ServeStream,
 {
     serve_connection_inner(stream, dispatcher, context, clock_ms, |now| {
         limiter.check(now)
@@ -1578,7 +1587,7 @@ pub(crate) fn serve_connection_with_shared_limiter<S>(
     clock_ms: &dyn Fn() -> u64,
 ) -> Result<ConnectionStats, IpcError>
 where
-    S: Read + Write,
+    S: ServeStream,
 {
     context.recheck_connection(Some(&peer))?;
     serve_connection_inner(
@@ -1601,7 +1610,7 @@ impl Dispatcher {
         clock_ms: &dyn Fn() -> u64,
     ) -> Result<ConnectionStats, IpcError>
     where
-        S: Read + Write,
+        S: ServeStream,
     {
         serve_connection_with_shared_limiter(stream, peer, self, context, limiter, clock_ms)
     }
@@ -1616,19 +1625,36 @@ fn serve_connection_inner<S, F>(
     mut admit: F,
 ) -> Result<ConnectionStats, IpcError>
 where
-    S: Read + Write,
+    S: ServeStream,
     F: FnMut(u64) -> Result<(), IpcError>,
 {
     let mut stats = ConnectionStats::default();
+    // Amendment A4 (#1482): at most one open continuation reassembly per
+    // connection. Fragments are buffered here and never parsed, admitted, or
+    // dispatched until the logical request is complete; every violation
+    // replies once with `id` 0 and closes, so a partial request has no side
+    // effect. EOF mid-reassembly closes silently, and a stalled stream is
+    // reported as `ContinuationTimeout` when the read times out. While a
+    // reassembly is open every read is bounded by the remaining 5 s
+    // deadline (not just the 60 s idle timeout), so a peer dripping a
+    // fragment byte by byte cannot hold the connection slot past it.
+    let mut reassembler = Reassembler::new();
+    let mut arming = ReadArming::new(stream);
     loop {
         let mut first = [0u8; 1];
-        match stream.read(&mut first) {
+        let read = arming
+            .arm(stream, &reassembler, clock_ms)
+            .and_then(|()| stream.read(&mut first));
+        match read {
             Ok(0) => return Ok(stats),
             Ok(_) => {}
             Err(err)
                 if err.kind() == std::io::ErrorKind::TimedOut
                     || err.kind() == std::io::ErrorKind::WouldBlock =>
             {
+                if report_stalled_continuation(stream, &mut reassembler, clock_ms) {
+                    stats.framing_errors += 1;
+                }
                 return Ok(stats);
             }
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -1639,8 +1665,11 @@ where
             }
         }
         let mut rest = [0u8; 3];
-        if stream.read_exact(&mut rest).is_err() {
+        if let Err(err) = read_exact_armed(stream, &mut rest, &mut arming, &reassembler, clock_ms) {
             stats.framing_errors += 1;
+            if is_read_timeout(&err) {
+                report_stalled_continuation(stream, &mut reassembler, clock_ms);
+            }
             return Ok(stats);
         }
         let len = u32::from_be_bytes([first[0], rest[0], rest[1], rest[2]]) as usize;
@@ -1657,14 +1686,15 @@ where
             return Ok(stats);
         }
         let mut payload = vec![0u8; len];
-        match stream.read_exact(&mut payload) {
+        match read_exact_armed(stream, &mut payload, &mut arming, &reassembler, clock_ms) {
             Ok(()) => {}
             Err(err)
-                if err.kind() == std::io::ErrorKind::UnexpectedEof
-                    || err.kind() == std::io::ErrorKind::TimedOut
-                    || err.kind() == std::io::ErrorKind::WouldBlock =>
+                if err.kind() == std::io::ErrorKind::UnexpectedEof || is_read_timeout(&err) =>
             {
                 stats.framing_errors += 1;
+                if is_read_timeout(&err) {
+                    report_stalled_continuation(stream, &mut reassembler, clock_ms);
+                }
                 return Ok(stats);
             }
             Err(err) => {
@@ -1673,6 +1703,16 @@ where
                 });
             }
         }
+        let payload = match reassembler.accept(payload, clock_ms()) {
+            Ok(Accepted::Request(request)) => request,
+            Ok(Accepted::Pending) => continue,
+            Err(err) => {
+                stats.framing_errors += 1;
+                let response = id_zero_error("transport", err.code(), &err.message());
+                let _ = write_framed(stream, &response);
+                return Ok(stats);
+            }
+        };
         stats.requests += 1;
         if admit(clock_ms()).is_err() {
             stats.denied += 1;
@@ -1710,6 +1750,133 @@ where
             });
         }
     }
+}
+
+/// A served stream whose read timeout the loop can set per read.
+///
+/// Amendment A4 (#1482): while a continuation reassembly is open, each read
+/// waits at most the time left before the continuation deadline.
+#[cfg(unix)]
+pub(crate) trait ServeStream: Read + Write {
+    /// The read timeout configured by the accept path (the idle timeout).
+    fn current_read_timeout(&self) -> std::io::Result<Option<std::time::Duration>>;
+    /// Replace the read timeout for the next read.
+    fn set_next_read_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()>;
+}
+
+#[cfg(unix)]
+impl ServeStream for std::os::unix::net::UnixStream {
+    fn current_read_timeout(&self) -> std::io::Result<Option<std::time::Duration>> {
+        self.read_timeout()
+    }
+
+    fn set_next_read_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()> {
+        self.set_read_timeout(timeout)
+    }
+}
+
+/// Per-read timeout state of one served connection.
+///
+/// With no reassembly open, reads use the idle timeout the accept path
+/// configured. While one is open, each read waits at most the time left
+/// before the continuation deadline (never longer than the idle timeout),
+/// and a read that would start after the deadline fails as `TimedOut`. The
+/// socket option is only rewritten when the wanted value changes.
+#[cfg(unix)]
+struct ReadArming {
+    idle: Option<std::time::Duration>,
+    armed: Option<std::time::Duration>,
+}
+
+#[cfg(unix)]
+impl ReadArming {
+    fn new<S: ServeStream>(stream: &S) -> Self {
+        let idle = stream.current_read_timeout().ok().flatten();
+        Self { idle, armed: idle }
+    }
+
+    fn arm<S: ServeStream>(
+        &mut self,
+        stream: &S,
+        reassembler: &Reassembler,
+        clock_ms: &dyn Fn() -> u64,
+    ) -> std::io::Result<()> {
+        let want = match reassembler.deadline_ms() {
+            None => self.idle,
+            Some(deadline) => {
+                let now = clock_ms();
+                if now > deadline {
+                    return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+                }
+                // `set_read_timeout` rejects a zero duration; the deadline
+                // itself is still honored by the `now > deadline` check.
+                let left = std::time::Duration::from_millis((deadline - now).max(1));
+                Some(self.idle.map_or(left, |idle| idle.min(left)))
+            }
+        };
+        if want != self.armed {
+            stream.set_next_read_timeout(want)?;
+            self.armed = want;
+        }
+        Ok(())
+    }
+}
+
+/// `read_exact` that re-arms the read timeout before every underlying read.
+///
+/// A plain `read_exact` would let each partial read wait the full timeout
+/// again, so a slow drip could stretch one frame far past the deadline.
+#[cfg(unix)]
+fn read_exact_armed<S: ServeStream>(
+    stream: &mut S,
+    buf: &mut [u8],
+    arming: &mut ReadArming,
+    reassembler: &Reassembler,
+    clock_ms: &dyn Fn() -> u64,
+) -> std::io::Result<()> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        arming.arm(stream, reassembler, clock_ms)?;
+        match stream.read(&mut buf[filled..]) {
+            Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
+            Ok(n) => filled += n,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
+/// Whether a read failed because the stream stalled (socket read timeout).
+#[cfg(unix)]
+fn is_read_timeout(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    )
+}
+
+/// Discard a stalled continuation reassembly and report it once.
+///
+/// Returns `true` when a reassembly was open: its buffer is dropped without
+/// dispatch and the peer receives one `ContinuationTimeout` error with `id` 0
+/// (best effort; the connection closes either way). Returns `false` for an
+/// ordinary idle timeout with nothing buffered.
+#[cfg(unix)]
+fn report_stalled_continuation<S>(
+    stream: &mut S,
+    reassembler: &mut Reassembler,
+    clock_ms: &dyn Fn() -> u64,
+) -> bool
+where
+    S: Read + Write,
+{
+    let Some(err) = reassembler.stalled(clock_ms()) else {
+        return false;
+    };
+    let response = id_zero_error("transport", err.code(), &err.message());
+    let _ = write_framed(stream, &response);
+    true
 }
 
 /// Frame and write one response payload.

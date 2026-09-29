@@ -59,8 +59,14 @@ fn burst_drains_bounded_per_poll_without_loss() {
     // No `tick` in the loop: state updates happen in `handle_pty_bytes`, and
     // a software present here would dominate the loop on headless CI without
     // exercising anything under test.
-    let deadline = Instant::now() + WAIT;
+    //
+    // #1524: `WAIT` bounds a stall, not the whole drain. The deadline moves
+    // forward whenever a poll makes progress, so a starved runner that
+    // drains slowly but steadily passes, while a pump that stops delivering
+    // still fails after `WAIT` without progress.
+    let mut deadline = Instant::now() + WAIT;
     let mut polls = 1usize;
+    let mut productive_polls = 1usize;
     let mut total_chunks = first;
     let mut found = false;
     while Instant::now() < deadline {
@@ -79,10 +85,18 @@ fn burst_drains_bounded_per_poll_without_loss() {
         }
         if n == 0 {
             std::thread::sleep(Duration::from_millis(20));
+        } else {
+            productive_polls += 1;
+            deadline = Instant::now() + WAIT;
         }
-        // Safety: a bounded poll needs at most a handful of rounds for
-        // 300 KiB; hundreds of rounds means the pump lost data or stalled.
-        assert!(polls < 500, "burst never converged after {polls} polls");
+        // Safety: a bounded poll needs at most a handful of productive
+        // rounds for 300 KiB; hundreds of them means the pump lost data or
+        // spins. Idle polls while the child is still starting are not
+        // counted.
+        assert!(
+            productive_polls < 500,
+            "burst never converged after {productive_polls} productive polls"
+        );
     }
     assert!(
         found,

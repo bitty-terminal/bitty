@@ -222,11 +222,11 @@ jobs:
           PKG_CONFIG_PATH_aarch64_unknown_linux_gnu: /usr/lib/aarch64-linux-gnu/pkgconfig
           PKG_CONFIG_LIBDIR_aarch64_unknown_linux_gnu: /usr/lib/aarch64-linux-gnu/pkgconfig
           PKG_CONFIG_SYSROOT_DIR_aarch64_unknown_linux_gnu: /
-        run: cargo build --release --locked -p bitty-app --target ${{ matrix.target }}
+        run: cargo build --release --locked -p bitty-terminal --target ${{ matrix.target }}
 
       - name: Build bitty binary (native)
         if: matrix.target != 'aarch64-unknown-linux-gnu'
-        run: cargo build --release --locked -p bitty-app --target ${{ matrix.target }}
+        run: cargo build --release --locked -p bitty-terminal --target ${{ matrix.target }}
 
       # CTX-0502: host-cross is verified (#819), so a wrong-architecture
       # artifact must fail here instead of being renamed, packaged, and
@@ -363,7 +363,7 @@ jobs:
         env:
           RUSTFLAGS: "-C target-feature=-crt-static"
         shell: bash
-        run: cargo build --release --locked -p bitty-app
+        run: cargo build --release --locked -p bitty-terminal
 
       - name: Rename artifact
         shell: bash
@@ -1030,7 +1030,7 @@ jobs:
           TAG="${{ github.ref_name }}"
           VERSION="${TAG#v}"
           # Asset stem comes from the template, never hardcoded twice:
-          # CTX-0164 (bitty-app -> bitty) must keep this dist name stable.
+          # CTX-0164 (bitty-terminal -> bitty) must keep this dist name stable.
           ASSET="$(awk -F'"' '/^_bitty_asset=/{print $2; exit}' packaging/PKGBUILD.bin)"
           if [ -z "$ASSET" ]; then
             echo "could not derive _bitty_asset from packaging/PKGBUILD.bin" >&2

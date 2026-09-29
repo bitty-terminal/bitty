@@ -2,7 +2,7 @@
 //!
 //! CLI-first demonstration that grid/input/modifier/focus snapshots round-trip
 //! over the served socket without screenshots. This is an example (not a
-//! release binary): it is never installed, never spawned by `bitty-app`, and
+//! release binary): it is never installed, never spawned by `bitty-terminal`, and
 //! performs only the four read-only `bitty.debug/*` introspection queries.
 //!
 //! Wire behavior mirrors the sibling `bitty-devtools` repository (read-only):

@@ -1803,9 +1803,9 @@ pub const DEFAULT_BELL_MODE: BellMode = BellMode::Visual;
 /// `terminal.cursor_style`).
 ///
 /// Mirrors `bitty_vt::CursorStyle` by value (`bitty-config` owns no
-/// workspace-crate dependency; `bitty-app` maps the effective value across
+/// workspace-crate dependency; `bitty-terminal` maps the effective value across
 /// at startup and the two defaults must stay equal — covered by a
-/// cross-crate test in `bitty-app`). `Default` means "the renderer's block
+/// cross-crate test in `bitty-terminal`). `Default` means "the renderer's block
 /// fallback"; every other variant is an explicit `DECSCUSR` shape and also
 /// seeds new panes (the terminal-state default-style resolver maps an app
 /// `DECSCUSR 0` reset back to the configured value).
@@ -1886,9 +1886,9 @@ impl std::fmt::Display for CursorStyle {
 /// User-visible bell behavior (CTX-0756, issue #1359 `terminal.bell`).
 ///
 /// Mirrors `bitty_runtime::bell::BellMode` by value (`bitty-config` owns no
-/// workspace-crate dependency; `bitty-app` maps the effective value across
+/// workspace-crate dependency; `bitty-terminal` maps the effective value across
 /// at startup and the two defaults must stay equal — covered by a
-/// cross-crate test in `bitty-app`). `Audible`/`Both` request the
+/// cross-crate test in `bitty-terminal`). `Audible`/`Both` request the
 /// owner-pending OS primitive (OQ-076, CTX-0754/#1361): until it lands an
 /// audible request is only counted, never sounded — the spelling is
 /// accepted so configs do not churn when the sink arrives.
@@ -2609,7 +2609,7 @@ impl DecorationConfig {
 /// Scrollbar display mode (CTX-0181).
 ///
 /// Mirrors `bitty-ui`'s mode by value (`bitty-config` owns no workspace
-/// dependencies, so the pairing is by string, pinned by a `bitty-app`
+/// dependencies, so the pairing is by string, pinned by a `bitty-terminal`
 /// cross-crate test): `auto` (default since CTX-0362, revealed on mouse
 /// proximity/hover/drag), `hidden` (opt-out, geometry-neutral), `always`
 /// (overlay thumb whenever scrollback exists).

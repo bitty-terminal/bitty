@@ -31,7 +31,7 @@
 //! The store lives outside the repository: paths resolve under the XDG data
 //! root (`$XDG_DATA_HOME/bitty/secrets`, fallback `$HOME/.local/share`),
 //! mirroring the derivation in `bitty-config` (`$XDG_CONFIG_HOME` else
-//! `$HOME/.config`) and the plugin store root in `bitty-app`
+//! `$HOME/.config`) and the plugin store root in `bitty-terminal`
 //! (`$XDG_DATA_HOME` else `$HOME/.local/share`). Every root comes from the
 //! caller; no host path is hardcoded. Files are created with user-only
 //! modes (`0600` files, `0700` directories on Unix; Windows relies on the

@@ -12,7 +12,7 @@
 - `crates/bitty-perf/src/lib.rs`: `PB5_BINARY_MB = 25`, `PB5_DIST_MB = 40`
   (`PB-5 package size — release binary ≤ 25 MB, dist ≤ 40 MB`).
 - `bitty-terminal-docs/specifications/performance-budget-rfc.md` § PB-5:
-  stripped release binary of `bitty-app` ≤ 25 MB per Tier 1 platform;
+  stripped release binary of `bitty-terminal` ≤ 25 MB per Tier 1 platform;
   default distribution download (compressed) ≤ 40 MB.
   Lower-confidence inference anchor; revisit after the first real link.
   This measurement IS that first-link data point.
@@ -22,7 +22,7 @@
 
 ## Method (replicates the release pipeline)
 
-1. `cargo build --release --locked -p bitty-app` (pinned toolchain 1.98.1,
+1. `cargo build --release --locked -p bitty-terminal` (pinned toolchain 1.98.1,
    host `x86_64-unknown-linux-gnu`, Linux x86_64, task-scoped ephemeral
    target dir; same command as the release `build` job native leg).
 2. `strip -o <stripped-copy> <binary>` for the stripped-binary budget check.
@@ -94,7 +94,7 @@ only once the remaining Tier 1 platform legs are measured.
 From a clean worktree at the base revision, with the pinned toolchain:
 
 ```sh
-CARGO_TARGET_DIR="$(mktemp -d)" cargo build --release --locked -p bitty-app
+CARGO_TARGET_DIR="$(mktemp -d)" cargo build --release --locked -p bitty-terminal
 stat -c '%s %n' "$CARGO_TARGET_DIR/release/bitty"
 strip -o /tmp/bitty-stripped "$CARGO_TARGET_DIR/release/bitty"
 stat -c '%s %n' /tmp/bitty-stripped

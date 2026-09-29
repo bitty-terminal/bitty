@@ -10,8 +10,8 @@
 ## Why
 
 The Bittie mascot (see `recording/bitty-mascot/`, `recording/bitty-ascii.txt`,
-the portrait header in `crates/bitty-app/src/main.rs`, and the vendored
-`crates/bitty-app/assets/mascot.txt`) needs one defined path into the
+the portrait header in `crates/bitty-terminal/src/main.rs`, and the vendored
+`crates/bitty-terminal/assets/mascot.txt`) needs one defined path into the
 product: a first-run greeting that never interferes with startup, plus a
 handoff of web-ready assets to `bitty-website`. Without a contract, art
 drifts between the workspace scratch tree and the binary, and every new
@@ -22,7 +22,7 @@ surface re-decides width handling, suppression, and persistence.
 | Kind | Lives in | Format | Rule |
 | ---- | -------- | ------ | ---- |
 | Source art (user-drawn, work in progress) | `recording/bitty-mascot/` (workspace scratch, gitignored or untracked) | text, sixel, block, pixel drafts | Never compiled in; freely iterated. |
-| Vendored binary art | `crates/bitty-app/assets/mascot.txt` | pure ASCII, `include_str!` | Byte-identical to the chosen source file; refreshed only by copying the accepted source over it. Single owner: `crates/bitty-app/src/mascot.rs`. |
+| Vendored binary art | `crates/bitty-terminal/assets/mascot.txt` | pure ASCII, `include_str!` | Byte-identical to the chosen source file; refreshed only by copying the accepted source over it. Single owner: `crates/bitty-terminal/src/mascot.rs`. |
 | Web assets | `bitty-website` (separate repo) | PNG/SVG | Exported from source art, never from the vendored `.txt`; tracked there, not here. |
 
 Rules:
@@ -39,13 +39,13 @@ Rules:
    (`bitty! (mascot skipped: window too narrow for the art)`) instead of
    a wrapped mess. Unknown width (piped headless, `COLUMNS` unset or
    garbage) prints the full art: pure text is always safe.
-4. `crates/bitty-app/src/init.rs` keeps its `INIT_MASCOT_*` names as thin
+4. `crates/bitty-terminal/src/init.rs` keeps its `INIT_MASCOT_*` names as thin
    re-exports of the mascot module so the `bitty init` wizard greeting
    and the splash can never disagree.
 
 ## Init-splash hook point
 
-Normal terminal startup in `crates/bitty-app/src/main.rs`, placed after
+Normal terminal startup in `crates/bitty-terminal/src/main.rs`, placed after
 every subcommand dispatch (`run`, `config`, `init`, `doctor`, `ctl`,
 `list`, `inspect`, `dev`, `plugin`) and before user-config loading:
 
@@ -83,7 +83,7 @@ shipped slice, recorded here so the export is not re-decided later):
 
 ## Shipped slice (CTX-0729)
 
-- `crates/bitty-app/src/mascot.rs`: art constant, width/fallback
+- `crates/bitty-terminal/src/mascot.rs`: art constant, width/fallback
   selection, marker path resolution, show/record policy. All pure over
   injected values except the two documented live edges (env vars,
   best-effort marker write in `main`).
@@ -108,7 +108,7 @@ shipped slice, recorded here so the export is not re-decided later):
 ## Acceptance criteria
 
 - `cargo fmt --check`, `cargo clippy --workspace --all-targets --locked`
-  with `-D warnings`, `cargo test -p bitty-app --locked`, and
+  with `-D warnings`, `cargo test -p bitty-terminal --locked`, and
   `cargo +1.85 check --workspace --all-targets --locked` are green.
 - `bitty --mascot` prints the vendored art and exits 0; `bitty
   --no-splash` parses and suppresses; the marker makes the splash

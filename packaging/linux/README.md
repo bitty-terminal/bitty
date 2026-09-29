@@ -38,7 +38,7 @@ without link evidence, or a format with no declarations).
 Run it locally after building:
 
 ```sh
-cargo build --locked -p bitty-app
+cargo build --locked -p bitty-terminal
 bash scripts/check-runtime-deps.sh --binary target/debug/bitty --packagers deb,rpm,archlinux
 # or: just runtime-deps target/debug/bitty deb,rpm,archlinux
 ```

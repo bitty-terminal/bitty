@@ -17,7 +17,7 @@
 //!   with a reason string; no number is ever fabricated. Headless CI therefore
 //!   reports `Unavailable` by design and stays green.
 //! - **Instrumented binary, not a proxy.** The child is the real
-//!   `crates/bitty-app` binary. When `BITTY_PERF_STARTUP_MARKER` is set the
+//!   `crates/bitty-terminal` binary. When `BITTY_PERF_STARTUP_MARKER` is set the
 //!   app emits `bitty perf: first-frame` on stdout *after* the first frame is
 //!   presented, so the harness measures launch-to-first-frame rather than
 //!   `--help` or a phase sum. When the marker is absent the harness still

@@ -7,7 +7,7 @@
 //! headlessly: it publishes known runtime snapshots into the introspection
 //! live stores (the same `publish_*` entry points `bitty-runtime` drives),
 //! serves them over a real Unix socket with `Dispatcher::with_defaults`
-//! (the same code path the `bitty-app` servo drives), and asserts grid,
+//! (the same code path the `bitty-terminal` servo drives), and asserts grid,
 //! focus, modifier, and input-ring state from the client side — no seat,
 //! no screenshots, no pixel polling.
 //!

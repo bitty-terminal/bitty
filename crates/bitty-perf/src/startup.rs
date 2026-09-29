@@ -1,7 +1,7 @@
 //! Real-window startup measurement — PB-1 cold startup.
 //!
 //! Replaces the former `--help` proxy with instrumentation that covers the
-//! full `bitty-app` cold path: process start → config load → PTY spawn →
+//! full `bitty-terminal` cold path: process start → config load → PTY spawn →
 //! winit window attempt → wgpu init attempt → font init → first shell bytes
 //! → first frame presented. Each phase is timestamped with `Instant` and
 //! bounded tracing (no unbounded log growth, no `unsafe`).

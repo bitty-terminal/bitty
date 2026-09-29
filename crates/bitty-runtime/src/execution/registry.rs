@@ -2287,6 +2287,11 @@ mod tests {
 
     /// Starts the first worker, refuses the rest: the partial-start shape
     /// (stdout drained, stderr drain unavailable).
+    ///
+    /// `WORKERS_STARTED` is thread-local, so this sequence holds only while
+    /// the caller invokes the spawner synchronously on the test thread, as
+    /// the direct `PipeJob::start` probe does. A spawner reached through
+    /// `supervise` (its own thread) would start from a fresh count.
     fn refuse_after_first_worker(
         name: String,
         work: Box<dyn FnOnce() + Send + 'static>,

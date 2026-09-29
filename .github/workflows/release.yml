@@ -418,6 +418,106 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # FreeBSD x86_64 (ADR-0002 Tier 2, CTX-0849 / #1509): a first-party binary
+  # plus a portable versioned tarball. There is no FreeBSD runner on GitHub
+  # Actions, so the build runs inside a real FreeBSD VM. nfpm has no FreeBSD
+  # `pkg` backend, so the package format is a plain `tar.xz` with the repo's
+  # fixed payload (bin/bitty + LICENSE + README.md + CHANGELOG.md); a native
+  # `.pkg` is deferred (see release-distribution.md). The tarball is assembled
+  # inside the guest, where the native binary lives, and synced back to the
+  # runner for upload. ADR-0002's Tier 2 release gate is "build plus core unit
+  # tests", so this job builds the binary for the artifact and runs the core
+  # headless suites before packaging.
+  build-freebsd:
+    name: Build x86_64-unknown-freebsd (FreeBSD 15.1)
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: cpa.sh {0}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Pinned to the v1.6.0 commit (the tag is mutable).
+      - name: Start FreeBSD 15.1 VM
+        uses: cross-platform-actions/action@48a7982e8230b812b030848825c2cb55a66daa4e # v1.6.0
+        with:
+          operating_system: freebsd
+          version: "15.1"
+          memory: 6G
+          cpu_count: 8
+
+      # clang is in the FreeBSD base image; cmake + pkgconf drive the
+      # aws-lc-sys C build (pulled in through bitty-network -> rustls) and
+      # crossfont's fontconfig/FreeType probes. git + ca_root_nss let
+      # `cargo --locked` fetch the pinned git dependencies over TLS.
+      - name: Install FreeBSD build prerequisites
+        run: |
+          set -eux
+          sudo pkg update
+          sudo pkg install -y git cmake pkgconf ca_root_nss freetype2 fontconfig
+
+      - name: Install pinned Rust toolchain (rustup)
+        run: |
+          set -eux
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --component rustfmt --component clippy
+          . "$HOME/.cargo/env"
+          cargo --version
+          rustc --version
+
+      - name: Build bitty binary (native FreeBSD)
+        run: |
+          set -eux
+          . "$HOME/.cargo/env"
+          cargo build --release --locked -p bitty-app
+
+      - name: Run core headless suites
+        run: |
+          set -eux
+          . "$HOME/.cargo/env"
+          cargo test --locked \
+            -p bitty-vt \
+            -p bitty-term-state \
+            -p bitty-ui \
+            -p bitty-pty
+
+      # Assemble the published artifacts inside the guest so the binary, the
+      # versioned tarball, and the checksums are generated where the binary is
+      # native. `tar` (with xz) is in the FreeBSD base system; checksums use
+      # FreeBSD's `sha256` because the base system has no `sha256sum`.
+      - name: Assemble FreeBSD artifacts
+        run: |
+          set -eux
+          mkdir -p dist
+          BIN="target/release/bitty"
+          TARGET="x86_64-unknown-freebsd"
+          cp "$BIN" "dist/bitty-${TARGET}"
+          version="$(bash scripts/check-release-version.sh --print)"
+          TOPDIR="bitty-${version}-${TARGET}"
+          stage="$(mktemp -d)"
+          mkdir -p "$stage/$TOPDIR/bin"
+          cp "$BIN" "$stage/$TOPDIR/bin/bitty"
+          cp LICENSE README.md CHANGELOG.md "$stage/$TOPDIR/"
+          (cd "$stage" && tar -cJf - "$TOPDIR") > "dist/${TOPDIR}.tar.xz"
+          rm -rf "$stage"
+          cd dist
+          for f in "bitty-${TARGET}" "${TOPDIR}.tar.xz"; do
+            printf '%s  %s\n' "$(sha256 -q "$f")" "$f"
+          done > "bitty-${TARGET}.sha256"
+          cat "bitty-${TARGET}.sha256"
+          ls -lh .
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bitty-x86_64-unknown-freebsd
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
   # Clean-container install smoke for every package (034 item 5 / CTX-0450):
   # a package that cannot install and run must not reach a release. The Alpine
   # leg keeps the CTX-0447 musl-apk check and extends it with the same
@@ -864,6 +964,7 @@ jobs:
       [
         build,
         build-alpine,
+        build-freebsd,
         verify-install,
         macos-universal,
         windows-zip,

@@ -1,0 +1,98 @@
+name: BSD tier
+
+# CTX-0849 (#1509): FreeBSD x86_64 is ADR-0002 **Tier 2** ("should work; fixes
+# are welcome but not gated"). Tier 2 is explicitly not a pull-request gate, so
+# this workflow runs only on a nightly schedule and manual dispatch — it never
+# blocks a Tier 1 merge.
+#
+# The hosted runner has no native FreeBSD, so the job boots a real FreeBSD VM
+# through cross-platform-actions and runs the checks *inside* the guest. It is
+# fail-closed: a VM that cannot boot, a failed prerequisite install, or any
+# portability break fails the job. Nothing here is wrapped in `|| true` and
+# there is no `continue-on-error`, so a broken Tier 2 leg is visible rather
+# than silently skipped.
+
+on:
+  schedule:
+    # Nightly FreeBSD x86_64 leg, 03:47 UTC (after the 03:17 vm-tier slot).
+    - cron: "47 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bsd-tier-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  freebsd-x86_64:
+    name: FreeBSD x86_64 (Tier 2)
+    runs-on: ubuntu-latest
+    # An emulated guest compiles the same workspace CI builds on native
+    # runners; 90 minutes bounds a wedged guest and keeps the nightly honest.
+    timeout-minutes: 90
+    # Every `run:` step executes inside the guest. `uses:` steps (checkout,
+    # the VM action, artifact upload) still run on the host.
+    defaults:
+      run:
+        shell: cpa.sh {0}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Pinned to the v1.6.0 commit (the tag is mutable). Supported FreeBSD
+      # versions include 15.1 on x86-64 (the Tier 2 target).
+      - name: Start FreeBSD 15.1 VM
+        uses: cross-platform-actions/action@48a7982e8230b812b030848825c2cb55a66daa4e # v1.6.0
+        with:
+          operating_system: freebsd
+          version: "15.1"
+          # The workspace build plus C dependencies (aws-lc-sys) needs room;
+          # CPU count keeps the emulated guest from serializing the build.
+          memory: 6G
+          cpu_count: 8
+
+      # FreeBSD base ships clang and a C toolchain for the aws-lc-sys build
+      # script; cmake and pkgconf are needed by that build (aws-lc-sys) and by
+      # crossfont's pkg-config probes (fontconfig/FreeType). git + ca_root_nss
+      # let `cargo --locked` fetch the pinned bitty-network/phodopus git deps
+      # over TLS.
+      - name: Install FreeBSD build prerequisites
+        run: |
+          set -eux
+          sudo pkg update
+          sudo pkg install -y git cmake pkgconf ca_root_nss freetype2 fontconfig
+
+      # rustup honors rust-toolchain.toml, so the channel is read from the
+      # checked-out file (1.98.1) rather than repeated here. `pkg install rust`
+      # would float with the ports tree, so the pin comes from rustup instead.
+      - name: Install pinned Rust toolchain (rustup)
+        run: |
+          set -eux
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --component rustfmt --component clippy
+          . "$HOME/.cargo/env"
+          cargo --version
+          rustc --version
+
+      # Tier 2 promise per ADR-0002: "Build plus core unit tests". The
+      # workspace check covers every target's compilation (including test and
+      # example code) against the FreeBSD target, and the core suites are the
+      # pure-Rust state/parser/UI/PTY crates that were verified to build by the
+      # local cross-check in CTX-0849.
+      - name: Check workspace for FreeBSD
+        run: |
+          set -eux
+          . "$HOME/.cargo/env"
+          cargo check --workspace --all-targets --locked
+
+      - name: Run core headless suites
+        run: |
+          set -eux
+          . "$HOME/.cargo/env"
+          cargo test --locked \
+            -p bitty-vt \
+            -p bitty-term-state \
+            -p bitty-ui \
+            -p bitty-pty

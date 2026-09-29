@@ -1640,11 +1640,24 @@ impl StartFailure {
         }
     }
 
-    /// The child `pid` existed and was killed and reaped.
-    fn after_reap(pid: Option<u32>, reason: impl fmt::Display) -> Self {
-        Self {
-            reason: reason.to_string(),
-            reaped_pid: pid,
+    /// The child `pid` existed and the start killed it; `reap` is the
+    /// cleanup's reap result. Only a successful reap reports the pid as
+    /// reaped: a failed one keeps `reaped_pid: None` and names the cleanup
+    /// error, so the failure is never reported as a finished cleanup.
+    fn after_cleanup<E: fmt::Display>(
+        pid: Option<u32>,
+        reap: Result<(), E>,
+        reason: impl fmt::Display,
+    ) -> Self {
+        match reap {
+            Ok(()) => Self {
+                reason: reason.to_string(),
+                reaped_pid: pid,
+            },
+            Err(error) => Self {
+                reason: format!("{reason}; cleanup reap failed: {error}"),
+                reaped_pid: None,
+            },
         }
     }
 }
@@ -1745,11 +1758,15 @@ impl PipeJob {
             // at EOF once the child is gone, and a failed spawn already
             // dropped (closed) its pipe. They are detached, never joined, so
             // a grandchild holding a pipe cannot wedge this path.
+            // `wait` already retries interrupted waits; an error here means
+            // the kernel cannot wait for this child at all, so there is
+            // nothing left to retry, only to report honestly.
             let _ = child.kill();
-            let _ = child.wait();
+            let reap = child.wait().map(drop);
             drop(drains);
-            return Err(StartFailure::after_reap(
+            return Err(StartFailure::after_cleanup(
                 Some(pid),
+                reap,
                 format!("job drain worker failed to start: {error}"),
             ));
         }
@@ -1862,8 +1879,10 @@ impl PtyJob {
             });
         if let Err(reason) = drained {
             // `shutdown` is kill-then-reap.
-            let _ = pty.shutdown();
-            return Err(StartFailure::after_reap(pid, reason));
+            // `shutdown` is kill-then-reap; its error means the child may
+            // still be alive or unreaped, which the failure must not hide.
+            let reap = pty.shutdown().map(drop);
+            return Err(StartFailure::after_cleanup(pid, reap, reason));
         }
         // Publish the writer half into the shared slot (when a scoped job
         // asked for one): `write_input_as` claims it for one call at a time
@@ -2366,6 +2385,15 @@ mod tests {
             Err(failure) => failure,
         };
         assert_reaped(&failure);
+    }
+
+    #[test]
+    fn a_failed_cleanup_reap_is_never_reported_as_reaped() {
+        let reaped = StartFailure::after_cleanup(Some(7), Ok::<(), String>(()), "drain");
+        assert_eq!(reaped.reaped_pid, Some(7));
+        let failed = StartFailure::after_cleanup(Some(7), Err("no child"), "drain");
+        assert_eq!(failed.reaped_pid, None, "a failed reap names no pid");
+        assert!(failed.reason.contains("cleanup reap failed: no child"));
     }
 
     #[test]

@@ -176,14 +176,29 @@ pub(crate) fn spawn_pane_shell(
     cols: u16,
     rows: u16,
 ) -> Result<(), bitty_runtime::RuntimeError> {
+    spawn_pane_shell_in(runtime, spec, view, cols, rows, None)
+}
+
+/// [`spawn_pane_shell`] with an explicit working directory (#1528,
+/// `bitty ctl terminal spawn --cwd`). `Some` replaces the `OSC 7`
+/// inheritance and is re-checked at the spawn boundary; the fallback retry
+/// uses the same directory, so no candidate starts anywhere else.
+pub(crate) fn spawn_pane_shell_in(
+    runtime: &mut Runtime,
+    spec: &SpawnSpec,
+    view: ViewId,
+    cols: u16,
+    rows: u16,
+    cwd: Option<&std::path::Path>,
+) -> Result<(), bitty_runtime::RuntimeError> {
     let (program, args) = spec.resolve();
     if spec.program.is_some() {
         // Explicit program: verbatim, no fallback (startup parity).
         let tail: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        return runtime.spawn_shell_for_view(view, &program, &tail, cols, rows);
+        return runtime.spawn_shell_for_view_in(view, &program, &tail, cols, rows, cwd);
     }
     spawn_with_fallback(
-        |candidate, _| runtime.spawn_shell_for_view(view, candidate, &[], cols, rows),
+        |candidate, _| runtime.spawn_shell_for_view_in(view, candidate, &[], cols, rows, cwd),
         &program,
     )
 }

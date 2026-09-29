@@ -439,6 +439,102 @@ fn control_terminal_spawn_creates_observable_session() {
     );
 }
 
+/// A fresh, uniquely named directory under the platform temp dir.
+#[cfg(unix)]
+fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let dir = std::env::temp_dir().join(format!("{tag}-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    dir
+}
+
+#[cfg(unix)]
+#[test]
+fn control_terminal_spawn_applies_cwd_and_names_it() {
+    // #1528 (CORE-RUN-022): `--cwd` used to be validated and then ignored.
+    // The new pane's shell must start in that directory, and the receipt
+    // must name it.
+    use bitty_runtime::ViewId;
+    bitty_test_support::require_pty!();
+    let dir = unique_temp_dir("bitty-1528-cwd");
+    let marker = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("utf-8 temp dir name")
+        .to_string();
+    let mut rt = headless_runtime();
+    // The recorded primary recipe replays for the spawned pane: it prints
+    // the basename of its working directory, then echoes input.
+    rt.spawn_shell_with_args("/bin/sh", &["-c", "basename \"$PWD\"; cat"])
+        .expect("primary shell must attach headless");
+    let all = bitty_ipc::ScopeSet::all();
+    let dir_str = dir.to_str().expect("utf-8 temp dir");
+    let spawn = ipc_ctl::params_spawn(Some(dir_str));
+    let spawned =
+        apply_control_envelope(&mut rt, ipc_ctl::METHOD_SPAWN_TERMINAL, Some(&spawn), &all);
+    assert!(spawned.ok, "spawn with --cwd must succeed: {spawned:?}");
+    assert!(
+        spawned.result_json.contains(&format!(
+            "\"cwd\":\"{}\"",
+            super::render::json_escape(dir_str)
+        )),
+        "receipt must name the applied cwd: {spawned:?}"
+    );
+    assert!(
+        wait_for_pane_text(&mut rt, ViewId::new(2), &marker),
+        "the spawned shell must start in the requested directory"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn control_terminal_spawn_rejects_missing_or_relative_cwd_without_a_leaf() {
+    let mut rt = headless_runtime();
+    let all = bitty_ipc::ScopeSet::all();
+    let leaves_before = rt.layout().leaf_ids().len();
+    let missing = unique_temp_dir("bitty-1528-missing");
+    std::fs::remove_dir_all(&missing).expect("remove temp dir");
+    let missing_str = missing.to_str().expect("utf-8 temp dir").to_string();
+    for (cwd, code) in [
+        (missing_str.as_str(), "Transport"),
+        ("relative/dir", "InvalidParams"),
+    ] {
+        let spawn = ipc_ctl::params_spawn(Some(cwd));
+        let denied =
+            apply_control_envelope(&mut rt, ipc_ctl::METHOD_SPAWN_TERMINAL, Some(&spawn), &all);
+        assert!(!denied.ok, "spawn --cwd {cwd:?} must fail closed");
+        assert_eq!(denied.code, code, "{denied:?}");
+        assert_eq!(
+            rt.layout().leaf_ids().len(),
+            leaves_before,
+            "a rejected spawn must not leave a new leaf"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn spawn_cwd_is_resolved_against_the_client_cwd() {
+    // #1528: the server only accepts absolute paths, so the client resolves
+    // a relative --cwd against its own working directory before sending.
+    let (request, _) = parse_ctl_request(&words(&["terminal", "spawn", "--cwd", "sub/dir"]))
+        .expect("relative --cwd parses");
+    let CtlRequest::TerminalSpawn { cwd: Some(cwd) } = request else {
+        panic!("expected terminal spawn with a cwd, got {request:?}");
+    };
+    let expected = std::env::current_dir().expect("cwd").join("sub/dir");
+    assert_eq!(std::path::Path::new(&cwd), expected.as_path());
+    let (request, _) = parse_ctl_request(&words(&["terminal", "spawn", "--cwd=/abs/dir"]))
+        .expect("absolute --cwd parses");
+    assert!(
+        matches!(request, CtlRequest::TerminalSpawn { cwd: Some(ref c) } if c == "/abs/dir"),
+        "absolute --cwd passes through unchanged: {request:?}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn control_terminal_spawn_focuses_new_view() {

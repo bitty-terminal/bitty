@@ -306,6 +306,16 @@ pub fn apply_control(
         let cwd = ipc_ctl::parse_spawn_params(params)
             .map_err(|err| ("usage", "InvalidParams", format!("{err}")))?;
         if let Some(dir) = cwd.as_deref() {
+            // #1528: the directory is resolved by the requesting client, so
+            // it must arrive absolute; a relative path would silently
+            // resolve against this terminal process's own cwd instead.
+            if !std::path::Path::new(dir).is_absolute() {
+                return Err((
+                    "usage",
+                    "InvalidParams",
+                    format!("spawn --cwd {dir:?} must be an absolute path"),
+                ));
+            }
             if !std::path::Path::new(dir).is_dir() {
                 return Err((
                     "transport",
@@ -313,11 +323,6 @@ pub fn apply_control(
                     format!("spawn --cwd {dir:?} is not a directory"),
                 ));
             }
-            // Accepted + validated, but the explicit `dir` is still not
-            // applied to the spawn below: new panes inherit the focused
-            // pane's OSC 7 cwd only (CTX-0357), never an IPC-supplied
-            // path; the client already warned on stderr, and the result
-            // names the gap.
         }
         // CTX-0323 (D3): a spawn must be representable in the ctl model. The
         // old path replaced the primary shell, which `terminal list` (layout
@@ -338,7 +343,13 @@ pub fn apply_control(
         let previous = runtime.layout().clone();
         let (new_id, cols, rows) =
             create_split_leaf(runtime, focused, SplitAxis::Horizontal, false)?;
-        if let Err(err) = spawn_leaf_shell(runtime, new_id, cols, rows) {
+        if let Err(err) = spawn_leaf_shell(
+            runtime,
+            new_id,
+            cols,
+            rows,
+            cwd.as_deref().map(std::path::Path::new),
+        ) {
             // Fail-closed: no observable terminal means no success.
             runtime.set_layout(previous);
             return Err(("transport", "Transport", format!("spawn failed: {err}")));
@@ -346,8 +357,14 @@ pub fn apply_control(
         // CTX-0364: focus follows the new panel. Set after the spawn so
         // CTX-0357 cwd inheritance still reads the source pane as focused.
         runtime.set_focus(new_id);
+        // #1528: the receipt names the directory the shell started in when
+        // the caller chose one (absent means `OSC 7` inheritance applied).
+        let cwd_field = cwd
+            .as_deref()
+            .map(|dir| format!(",\"cwd\":\"{}\"", json_escape(dir)))
+            .unwrap_or_default();
         return Ok(format!(
-            "{{\"spawned\":true,\"terminal_id\":\"t:{}\",\"view_id\":\"v:{}\"}}",
+            "{{\"spawned\":true,\"terminal_id\":\"t:{}\",\"view_id\":\"v:{}\"{cwd_field}}}",
             new_id.0, new_id.0
         ));
     }
@@ -403,7 +420,7 @@ pub fn apply_control(
         // keymap and `workspace_new`: a failed spawn leaves the pane empty
         // with a loud warning instead of failing the layout verb.
         let (new_id, cols, rows) = create_split_leaf(runtime, focused, axis, place_new_first)?;
-        if let Err(err) = spawn_leaf_shell(runtime, new_id, cols, rows) {
+        if let Err(err) = spawn_leaf_shell(runtime, new_id, cols, rows, None) {
             eprintln!(
                 "warning: ctl view split pane {new_id:?} shell spawn failed ({err}) — pane stays empty"
             );
@@ -754,6 +771,7 @@ fn spawn_leaf_shell(
     view: bitty_runtime::ViewId,
     cols: u16,
     rows: u16,
+    cwd: Option<&std::path::Path>,
 ) -> Result<(), bitty_runtime::RuntimeError> {
     let (program, program_args) = match runtime.primary_spawn_recipe() {
         Some((program, args)) => (Some(program.to_owned()), args.to_vec()),
@@ -765,7 +783,7 @@ fn spawn_leaf_shell(
         shell_env: std::env::var("SHELL").ok(),
         config_shell: None,
     };
-    crate::spawn::spawn_pane_shell(runtime, &spec, view, cols, rows)
+    crate::spawn::spawn_pane_shell_in(runtime, &spec, view, cols, rows, cwd)
 }
 
 /// Split the focused leaf (mirrors the composition-root helper).

@@ -444,7 +444,12 @@ pub fn parse_ctl_request(tokens: &[String]) -> Result<(CtlRequest, CtlTargeting)
                     ),
                 });
             }
-            Ok((CtlRequest::TerminalSpawn { cwd: spawn_cwd }, targeting))
+            Ok((
+                CtlRequest::TerminalSpawn {
+                    cwd: absolute_spawn_cwd(spawn_cwd)?,
+                },
+                targeting,
+            ))
         }
         (Some("terminal"), Some("close")) => {
             reject_ctl_options_for("terminal close", split_dir.is_some(), spawn_cwd.is_some())?;
@@ -684,6 +689,32 @@ fn reject_ctl_options_for(what: &str, has_split: bool, has_cwd: bool) -> Result<
         });
     }
     Ok(())
+}
+
+/// Resolve a `terminal spawn --cwd` value against this client's working
+/// directory (#1528). The shell starts inside the terminal process, whose
+/// own cwd is unrelated to the caller's, so the server accepts only absolute
+/// paths; an absolute value passes through unchanged (no symlink resolution).
+fn absolute_spawn_cwd(cwd: Option<String>) -> Result<Option<String>, CtlParseError> {
+    let Some(cwd) = cwd else {
+        return Ok(None);
+    };
+    if std::path::Path::new(&cwd).is_absolute() {
+        return Ok(Some(cwd));
+    }
+    let resolved = std::path::absolute(&cwd).map_err(|err| CtlParseError::Usage {
+        message: format!("bitty ctl: cannot resolve --cwd {cwd:?}: {err}"),
+    })?;
+    let resolved = resolved
+        .into_os_string()
+        .into_string()
+        .map_err(|_| CtlParseError::Usage {
+            message: String::from("bitty ctl: --cwd resolves to a non-UTF-8 path"),
+        })?;
+    ipc_ctl::validate_ctl_cwd(&resolved).map_err(|err| CtlParseError::Usage {
+        message: format!("bitty ctl: invalid --cwd: {err}"),
+    })?;
+    Ok(Some(resolved))
 }
 
 fn validate_socket_override(path: &str) -> Result<(), CtlParseError> {

@@ -32,6 +32,10 @@ jobs:
     # An emulated guest compiles the same workspace CI builds on native
     # runners; 90 minutes bounds a wedged guest and keeps the nightly honest.
     timeout-minutes: 90
+    # `cargo test` would otherwise emit target/debug/incremental output that
+    # the VM action syncs between guest and runner for no benefit.
+    env:
+      CARGO_INCREMENTAL: "0"
     # Every `run:` step executes inside the guest. `uses:` steps (checkout,
     # the VM action, artifact upload) still run on the host.
     defaults:

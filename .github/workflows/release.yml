@@ -433,6 +433,10 @@ jobs:
     needs: validate
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    # `cargo test` would otherwise emit target/debug/incremental output that
+    # the VM action syncs between guest and runner for no benefit.
+    env:
+      CARGO_INCREMENTAL: "0"
     defaults:
       run:
         shell: cpa.sh {0}

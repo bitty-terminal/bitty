@@ -1053,3 +1053,7 @@
 {"created_at":"2026-09-28T10:23:09.440449295+00:00","id":"01M3KRMD406B08DTQKSVPA6ZPJ","kind":"include","pattern":"crates/bitty-runtime/src/runtime/cw_live.rs","project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","task_id":"01M3KK6WYW98MW5HEVDA5FGH3M"}
 {"created_at":"2026-09-28T10:23:09.466420528+00:00","id":"01M3KRMD4TZSF6T5VQEMNHR8M9","kind":"include","pattern":"crates/bitty-runtime/tests/cw_uipresent.rs","project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","task_id":"01M3KK6WYW98MW5HEVDA5FGH3M"}
 {"created_at":"2026-09-28T10:23:09.493870254+00:00","id":"01M3KRMD5NBA35AHBQKNG8XK0E","kind":"include","pattern":"crates/bitty-app/src/chrome_keys.rs","project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","task_id":"01M3KK6WYW98MW5HEVDA5FGH3M"}
+{"created_at":"2026-09-29T06:49:48.426278171+00:00","id":"01M3NYTF4AVRETBN3KRS4RYFFS","kind":"include","pattern":"crates/bitty-ipc","project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","task_id":"01M3J5S5JBD9NBFVDFHP01BJQP"}
+{"created_at":"2026-09-29T06:49:48.473900489+00:00","id":"01M3NYTF5TVPKJ4BXQKRHBF488","kind":"include","pattern":"crates/bitty-app","project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","task_id":"01M3J5S5JBD9NBFVDFHP01BJQP"}
+{"created_at":"2026-09-29T06:52:56.893053752+00:00","id":"01M3NZ075X46YFQ1TJ4K4DCF31","kind":"include","pattern":"crates/bitty-ipc","project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","task_id":"01M3ENJNSRA536R5W5V6Q79PR3"}
+{"created_at":"2026-09-29T06:52:56.928541517+00:00","id":"01M3NZ0770BMJTK1TECPPN31RG","kind":"include","pattern":"crates/bitty-app","project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","task_id":"01M3ENJNSRA536R5W5V6Q79PR3"}

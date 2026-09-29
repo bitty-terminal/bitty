@@ -84,6 +84,15 @@ ci-local *args:
     # the host network, so a 127.0.0.1 proxy stays reachable. NO_PROXY keeps
     # loopback (the act server) off the proxy.
     proxy="${HTTPS_PROXY:-${https_proxy:-${HTTP_PROXY:-${http_proxy:-${NETWORK_PROXY:-}}}}}"
+    # The job runs checked-out (possibly untrusted PR) code that can read its
+    # environment, so a proxy URL carrying credentials (`scheme://user:pass@`)
+    # is never forwarded; use a credential-free (for example loopback) proxy.
+    case "$proxy" in
+      *://*@*)
+        echo "ci-local: not forwarding a proxy URL that carries credentials into the job container" >&2
+        proxy=""
+        ;;
+    esac
     proxy_env=()
     if [ -n "$proxy" ]; then
       proxy_env=(

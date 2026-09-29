@@ -668,10 +668,13 @@ mod tests {
 
     /// Stuck-detector bound for the winit/wgpu display probes. Adapter
     /// enumeration on software-rendered CI runners (Windows WARP) has taken
-    /// 10.2 s and 18.6 s, so a tight bound only measures the runner. Kept
-    /// below the nextest `terminate-after` window (3 x 60 s) so a genuinely
-    /// stuck probe fails this assertion instead of the harness timeout.
-    const DISPLAY_PROBE_STUCK_BOUND: Duration = Duration::from_secs(90);
+    /// 10.2 s and 18.6 s, so a tight bound only measures the runner. Both
+    /// probes run in one test, so two slow probes (2 x 60 s) plus the
+    /// in-process phases still end before the nextest `terminate-after`
+    /// window (3 x 60 s) and a stuck probe fails this assertion, not the
+    /// harness timeout. A probe that hangs outright still fails the test,
+    /// through that timeout.
+    const DISPLAY_PROBE_STUCK_BOUND: Duration = Duration::from_secs(60);
 
     fn stuck_bound(phase: &str) -> Duration {
         match phase {

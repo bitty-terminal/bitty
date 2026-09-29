@@ -61,6 +61,24 @@ ci-local *args:
     docker_gid="$(getent group docker 2>/dev/null | cut -d: -f3 || true)"
     group_add=()
     [ -n "$docker_gid" ] && group_add=(--group-add "$docker_gid")
+    # Job containers clone actions (checkout/cache) and fetch crates from
+    # GitHub and crates.io. On a host behind an egress proxy the container's
+    # direct connection dies mid-clone with a transient
+    # `Get .../info/refs...: unexpected EOF`, which reads like a flaky gate.
+    # Forward the host proxy when one is configured; act runs the container on
+    # the host network, so a 127.0.0.1 proxy stays reachable. NO_PROXY keeps
+    # loopback (the act server) off the proxy.
+    proxy="${http_proxy:-${https_proxy:-${NETWORK_PROXY:-}}}"
+    proxy_env=()
+    if [ -n "$proxy" ]; then
+      proxy_env=(
+        --env "HTTP_PROXY=$proxy" --env "HTTPS_PROXY=$proxy"
+        --env "http_proxy=$proxy" --env "https_proxy=$proxy"
+        --env "ALL_PROXY=$proxy" --env "all_proxy=$proxy"
+        --env "NO_PROXY=localhost,127.0.0.1,::1"
+        --env "no_proxy=localhost,127.0.0.1,::1"
+      )
+    fi
     if ! docker image inspect bitty-act:latest >/dev/null 2>&1; then
       echo "building bitty-act:latest from .github/act/Dockerfile (one-time)" >&2
       docker build -t bitty-act:latest "$root/.github/act" >&2
@@ -81,6 +99,7 @@ ci-local *args:
       --container-options "-u ubuntu ${group_add[*]:-} -v $cache/cargo-registry:$ctr_cargo/registry -v $cache/cargo-git:$ctr_cargo/git -v $cache/target:/cache/target -v $cache/target:$root/target" \
       --env HOME=$ctr_home --env CARGO_HOME=$ctr_cargo --env RUSTUP_HOME=$ctr_rustup \
       --env CARGO_TARGET_DIR=/cache/target --env CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-$(nproc)}" \
+      "${proxy_env[@]}" \
       {{args}}
 
 pty-gate:

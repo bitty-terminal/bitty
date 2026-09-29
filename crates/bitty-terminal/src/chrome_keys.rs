@@ -1,4 +1,4 @@
-//! Chrome-key intercept for the `bitty-app` composition root (CTX-0233).
+//! Chrome-key intercept for the `bitty-terminal` composition root (CTX-0233).
 //!
 //! Pure-move extraction from `main.rs`: the keymap-driven single-owner
 //! rule (CTX-0153), press-to-release `chrome_held` ownership (CTX-0229),

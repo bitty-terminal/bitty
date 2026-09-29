@@ -1,5 +1,5 @@
 [package]
-name = "bitty-app"
+name = "bitty-terminal"
 description = "Bitty terminal binary — thin composition root"
 version.workspace = true
 edition.workspace = true

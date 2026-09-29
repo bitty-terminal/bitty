@@ -53,7 +53,7 @@ After this task:
 - `benches/real_window.rs` — human-facing `harness = false` bench.
 - `crates/bitty-perf/tests/real_window_evidence.rs` — bounded CI contract test.
 - `crates/bitty-perf/baselines/pb-real-window.json` — committed artifact.
-- `crates/bitty-app` emits an opt-in `bitty perf: first-frame` stdout marker
+- `crates/bitty-terminal` emits an opt-in `bitty perf: first-frame` stdout marker
   (gated on `BITTY_PERF_STARTUP_MARKER`) after the first frame presents.
 
 ## Measurement contract

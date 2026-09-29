@@ -7,7 +7,7 @@
 //! bytes survive and only the split-path resize is missing.
 //!
 //! Root direction: both live split paths (keymap `NewSplit` in
-//! `bitty-app::chrome_keys`, `ctl view split` in `bitty-app::ctl`) funnel
+//! `bitty-terminal::chrome_keys`, `ctl view split` in `bitty-terminal::ctl`) funnel
 //! into `Runtime::set_layout`, which re-syncs pane *sessions* but never
 //! resizes the shared primary grid (or the primary PTY winsize). `tick` then
 //! only clips via `viewport_snapshot` — the CTX-0266 reflow never fires.

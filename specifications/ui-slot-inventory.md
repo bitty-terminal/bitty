@@ -234,7 +234,7 @@ concern; they never share state:
 The panel-overlay modal authority is surfaced through the runtime bit
 (`Runtime::overlay_modal_active`, set from `OverlayManager::modal_active` by
 the panel integration) and read by the app's single modal-capture predicate
-(`crates/bitty-app/src/chrome_keys.rs`; CTX-0482). A new overlay feature
+(`crates/bitty-terminal/src/chrome_keys.rs`; CTX-0482). A new overlay feature
 extends exactly one owner instead of adding a fourth system or a parallel
 modal gate.
 

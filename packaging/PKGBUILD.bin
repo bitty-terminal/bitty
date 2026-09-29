@@ -13,7 +13,7 @@
 # be `SKIP` in a published package.
 #
 # Asset-name dependency (CTX-0164, issue #264): the inner binary rename
-# `bitty-app` -> `bitty` changes `target/<triple>/release/<name>` inside the
+# `bitty-terminal` -> `bitty` changes `target/<triple>/release/<name>` inside the
 # build, but the published dist name `_bitty_asset` below is constructed by
 # the release workflow (`dist/bitty-${TARGET}`) and stays stable across that
 # rename (verified against the 0164 worktree). If the dist name ever changes,

@@ -67,8 +67,8 @@
 
         bitty = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
-          # Only build bitty-app binary, keep bounded.
-          cargoExtraArgs = "-p bitty-app";
+          # Only build bitty-terminal binary, keep bounded.
+          cargoExtraArgs = "-p bitty-terminal";
           # No unsafe - already denied via workspace lints.
         });
       in

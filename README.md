@@ -96,12 +96,12 @@ existing checkout runs `git submodule update --init`):
 ```sh
 git clone --recurse-submodules https://github.com/bitty-terminal/bitty.git
 cd bitty
-cargo build --release --locked -p bitty-app
+cargo build --release --locked -p bitty-terminal
 ./target/release/bitty
 ```
 
 The produced binary is named `bitty`. It is not published on crates.io
-(`bitty-app` is `publish = false`, and the unrelated `bitty` crate name on
+(`bitty-terminal` is `publish = false`, and the unrelated `bitty` crate name on
 crates.io is a different project), so install through the AUR, a release
 artifact, a source build, or the `cargo install --git` command below. Nine
 `bitty-*` library crates are published at `0.0.1`, but they are not a stable
@@ -113,12 +113,12 @@ API.
 you can skip the manual clone and build above:
 
 ```sh
-cargo +1.98.1 install --git https://github.com/bitty-terminal/bitty.git bitty-app --locked
+cargo +1.98.1 install --git https://github.com/bitty-terminal/bitty.git bitty-terminal --locked
 ```
 
 The installed executable is `bitty`. This is a **git source install**, not a
-crates.io install: the binary crate is `bitty-app` and it is `publish = false`,
-so `cargo install bitty-app` from the registry would fail. Plain
+crates.io install: the binary crate is `bitty-terminal` and it is `publish = false`,
+so `cargo install bitty-terminal` from the registry would fail. Plain
 `cargo install bitty` is also impossible — the `bitty` name on crates.io is an
 unrelated project. Pin the toolchain with `+1.98.1` (rustup installs it on
 demand): unlike an in-tree build, `cargo install --git` runs from your current

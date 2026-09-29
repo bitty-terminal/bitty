@@ -48,7 +48,7 @@
 //!   headless `bitty.debug/*` request parsing, extensible method dispatch
 //!   (`ping`, `getSnapshot`), framed serving over caller-provided streams,
 //!   and socket-directory attestation (`0700`/`0600`). Opens no socket
-//!   itself; the `bitty-app` servo owns the listener lifecycle.
+//!   itself; the `bitty-terminal` servo owns the listener lifecycle.
 //! - MCP stub: `mcp::McpClientStub` with bounded framing, correlation, and
 //!   deterministic timeouts (`DEFAULT_MCP_TIMEOUT_MS` 10 s, ceiling 30 s).
 //! - Out-of-process bridge client (`bridge::BridgeClient`, CTX-0419): the

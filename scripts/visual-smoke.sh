@@ -99,8 +99,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "visual-smoke: building bitty binary (crate bitty-app)"
-cargo build -p bitty-app --locked --quiet
+echo "visual-smoke: building bitty binary (crate bitty-terminal)"
+cargo build -p bitty-terminal --locked --quiet
 if [ ! -x "$BIN" ]; then
 	echo "build produced no binary at $BIN" >&2
 	exit 1

@@ -124,20 +124,20 @@ paru -S bitty-bin   # or: yay -S bitty-bin
 
 The source package (`bitty`) compiles the whole workspace locally and needs the Rust toolchain; prefer `bitty-bin` unless you specifically need a source build. `bitty` and `bitty-bin` conflict, so install one or the other.
 
-Validation: `bash -n packaging/PKGBUILD && (cd packaging && makepkg --printsrcinfo)`, plus `bash scripts/check-pkgbuild-source.sh` (source recipe installs the artifact declared by `crates/bitty-app/Cargo.toml`), `bash scripts/check-pkgbuild-bin.sh` (template render test) and `bash scripts/check-release-version.sh [--tag vX.Y.Z]` (Cargo version stays aligned with release tags so `bitty --version` matches the tag).
+Validation: `bash -n packaging/PKGBUILD && (cd packaging && makepkg --printsrcinfo)`, plus `bash scripts/check-pkgbuild-source.sh` (source recipe installs the artifact declared by `crates/bitty-terminal/Cargo.toml`), `bash scripts/check-pkgbuild-bin.sh` (template render test) and `bash scripts/check-release-version.sh [--tag vX.Y.Z]` (Cargo version stays aligned with release tags so `bitty --version` matches the tag).
 
 ## Cargo
 
-There is no crates.io install path for the binary. `bitty-app` is
+There is no crates.io install path for the binary. `bitty-terminal` is
 `publish = false` (the thin composition root is never published), and plain
 `cargo install bitty` cannot work because the `bitty` name on crates.io is an
 unrelated project. The supported cargo path builds from the Git repository:
 
 ```sh
-cargo +1.98.1 install --git https://github.com/bitty-terminal/bitty.git bitty-app --locked
+cargo +1.98.1 install --git https://github.com/bitty-terminal/bitty.git bitty-terminal --locked
 ```
 
-This installs the executable `bitty` (crate `bitty-app`, binary `bitty`) and
+This installs the executable `bitty` (crate `bitty-terminal`, binary `bitty`) and
 builds the workspace from source. Pin the toolchain with `+1.98.1` (rustup
 installs it on demand): `cargo install --git` runs from your current directory
 and does not read the repository's `rust-toolchain.toml`, so the pinned channel

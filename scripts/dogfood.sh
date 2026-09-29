@@ -96,7 +96,7 @@ echo ""
 # Headless app smoke proof (no display/GPU)
 echo "=== bitty --headless smoke (software present) ==="
 if have cargo; then
-	if timeout "$TIMEOUT_SECS" cargo run -p bitty-app -- --headless 2>&1 | tail -n 30; then
+	if timeout "$TIMEOUT_SECS" cargo run -p bitty-terminal -- --headless 2>&1 | tail -n 30; then
 		echo "bitty --headless: PASS"
 	else
 		echo "bitty --headless: WARN (timeout or build, bounded)" >&2

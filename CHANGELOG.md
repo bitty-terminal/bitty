@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Crate renamed `bitty-app` -> `bitty-terminal` (CTX-0852, #1512):** the
+  workspace already shipped a crate named `bitty-terminal` before CTX-0164
+  renamed the binary artifact; restoring that package name aligns the crate
+  with the reserved crates.io identifier and prepares
+  `cargo install bitty-terminal`. The directory, workspace member, CI
+  selectors, scripts, packaging, and `flake.nix` follow. The binary artifact
+  stays `bitty` (`[[bin]] name = "bitty"`); `publish` stays `false` until the
+  dependency chain can be published.
+
 ### Fixed
 
 - **Text selection is View-owned (CTX-0803, #1476, #1433):** the runtime kept
@@ -181,9 +192,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--format json`/`jsonl` envelope v1; `-V`/`--version` is an alias for the
   table form), `bitty completion <shell>` (static Bash/Zsh/Fish/PowerShell/
   Nushell scripts, no VM), `bitty cmd <qualified-id> [--format SHAPE]
-  [-- <args-json>]` (id validation per the registry rule, live dispatch
+[-- <args-json>]` (id validation per the registry rule, live dispatch
   fails closed as `Unavailable`/exit 6), and `bitty x <publisher>.<name>
-  <command> [args]` (static-manifest help, short-alias collision diagnostics,
+<command> [args]` (static-manifest help, short-alias collision diagnostics,
   execution fails closed as a plugin error/exit 4 without loading a VM).
   Stable `cfg` and `comp` aliases added. `--version` no longer prints the
   bare semver. Pinned by headless unit tests and binary dispatch proofs.

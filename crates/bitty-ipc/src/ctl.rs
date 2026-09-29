@@ -75,7 +75,7 @@ use crate::scope::{Scope, ScopeSet};
 /// End-to-end budget for one `bitty ctl` round trip.
 ///
 /// One value for both ends of the control channel: the client socket
-/// read/write timeouts in `bitty-app` `ctl_roundtrip` and the reply wait in
+/// read/write timeouts in `bitty-terminal` `ctl_roundtrip` and the reply wait in
 /// [`enqueue_control_and_wait`]. Sharing it keeps the client from giving up
 /// before a live runtime can drain the queued action and answer with the
 /// structured timeout error.
@@ -804,7 +804,7 @@ mod tests {
     #[test]
     fn ctl_timeout_budget_is_pinned() {
         // CTX-0301: one shared budget for both ends of the control channel;
-        // the client socket timeouts in `bitty-app` reuse this constant.
+        // the client socket timeouts in `bitty-terminal` reuse this constant.
         assert_eq!(CTL_TIMEOUT, std::time::Duration::from_secs(5));
         assert_eq!(CTL_TIMEOUT.as_secs(), 5);
     }

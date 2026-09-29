@@ -1,4 +1,4 @@
-# `bitty-app`
+# `bitty-terminal`
 
 > Part of the `bitty` workspace. Canonical product and architecture
 > documentation lives in `bitty-terminal-docs` (mounted at `docs/`) and
@@ -7,7 +7,7 @@
 
 ## Purpose
 
-`bitty-app` is the `bitty` binary: the thin composition root that parses
+`bitty-terminal` is the `bitty` binary: the thin composition root that parses
 arguments, loads user configuration through the `bitty-lua` sandbox via
 `bitty-config`, creates the `bitty-runtime` runtime, wires layout and focus,
 spawns the shell through the PTY layer, and forwards platform events into

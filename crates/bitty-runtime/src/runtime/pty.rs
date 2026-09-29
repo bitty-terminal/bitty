@@ -1138,16 +1138,30 @@ mod tests {
     fn poll_pty_timeout_counts_the_waited_chunk_against_the_budget() {
         // #1524: more than one budget is already queued before the blocking
         // wait. The waited chunk used to be handled on top of a full budget
-        // (1 + 32 = 33 chunks in one poll).
+        // (1 + 32 = 33 chunks in one poll). The time budget may legitimately
+        // stop a poll early on a descheduled test thread, so each poll is
+        // checked against the bound and the queue is drained to the end.
         let queued = POLL_PTY_MAX_CHUNKS + 8;
         let (mut rt, _tx) = runtime_with_queued_chunks(queued);
         let first = rt.poll_pty_timeout(std::time::Duration::from_secs(1));
-        assert_eq!(first, POLL_PTY_MAX_CHUNKS);
-        assert_eq!(
-            rt.poll_pty(),
-            queued - POLL_PTY_MAX_CHUNKS,
-            "the rest stays queued"
+        assert!(
+            (1..=POLL_PTY_MAX_CHUNKS).contains(&first),
+            "blocking poll drained {first} chunks, budget is {POLL_PTY_MAX_CHUNKS}"
         );
+        let mut total = first;
+        while total < queued {
+            let n = rt.poll_pty();
+            assert!(
+                n >= 1,
+                "queued chunks must keep draining ({total}/{queued})"
+            );
+            assert!(
+                n <= POLL_PTY_MAX_CHUNKS,
+                "poll drained {n} chunks, budget is {POLL_PTY_MAX_CHUNKS}"
+            );
+            total += n;
+        }
+        assert_eq!(total, queued, "every queued chunk drains exactly once");
         assert_eq!(rt.poll_pty(), 0);
     }
 

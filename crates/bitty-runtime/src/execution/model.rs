@@ -13,19 +13,21 @@
 //! semantic tasks is `bitty-ai` semantics; this side only executes and
 //! observes.
 //!
-//! # Phase-1 limits
+//! # Outcomes
 //!
-//! [`JobStop`] is an interim, observation-only terminal classification. The
-//! authoritative structured outcome set (`Success`, `ExitCode`, `Signaled`,
-//! `TimedOut`, `OomKilled`, `SupervisorLost`, ...) with process-tree kill and
-//! typed cancel is CTX-0512; output retention is CTX-0513; capability
-//! enforcement is CTX-0514. Nothing here claims those contracts.
+//! Terminal states carry the authoritative [`ExecutionOutcome`] (CTX-0512,
+//! defined in [`outcome`](super::outcome) with the typed cancel protocol and
+//! execution generations); output retention is CTX-0513; capability
+//! enforcement is CTX-0514.
 
 use std::fmt;
 use std::num::NonZeroU64;
 use std::time::Duration;
 
 use bitty_ipc::execution::{EnvPolicy, ExecutionRequest};
+
+use super::outcome::{CancelOutcome, ExecutionGeneration, ExecutionHandle, ExecutionOutcome};
+use super::process_tree::KillScope;
 
 /// Maximum provenance bytes for one job origin.
 pub const MAX_JOB_ORIGIN_BYTES: usize = 256;
@@ -427,38 +429,6 @@ fn validate_deadline(name: &str, value: Option<Duration>) -> Result<(), JobError
 
 // ── lifecycle ───────────────────────────────────────────────────────────────
 
-/// How a job reached its terminal state (phase-1 observation).
-///
-/// This is intentionally not the structured outcome set: it carries no exit
-/// code, signal, OOM, or cancel outcome, and it never claims more than the
-/// supervisor observed. CTX-0512 replaces it with the authoritative
-/// `ExecutionOutcome` plus typed cancel semantics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum JobStop {
-    /// The process ended on its own (any exit status; classification is
-    /// CTX-0512's contract, not asserted here).
-    Exited,
-    /// A cancel request ended the job before it exited on its own.
-    Cancelled,
-    /// A hard or idle deadline ended the job.
-    TimedOut,
-    /// No process was created (spawn failed).
-    SpawnFailed,
-}
-
-impl JobStop {
-    /// Stable lowercase wire/display name.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Exited => "exited",
-            Self::Cancelled => "cancelled",
-            Self::TimedOut => "timed_out",
-            Self::SpawnFailed => "spawn_failed",
-        }
-    }
-}
-
 /// Lifecycle state of one job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobState {
@@ -466,8 +436,8 @@ pub enum JobState {
     Queued,
     /// The OS process exists and is being supervised.
     Running,
-    /// Terminal state with the observed stop classification.
-    Done(JobStop),
+    /// Terminal state with the authoritative structured outcome.
+    Done(ExecutionOutcome),
 }
 
 impl JobState {
@@ -477,11 +447,11 @@ impl JobState {
         matches!(self, Self::Done(_))
     }
 
-    /// The stop classification for a terminal state.
+    /// The outcome of a terminal state.
     #[must_use]
-    pub const fn stop(self) -> Option<JobStop> {
+    pub const fn outcome(self) -> Option<ExecutionOutcome> {
         match self {
-            Self::Done(stop) => Some(stop),
+            Self::Done(outcome) => Some(outcome),
             Self::Queued | Self::Running => None,
         }
     }
@@ -500,9 +470,9 @@ impl JobState {
 /// One lifecycle observation emitted by the supervisor.
 ///
 /// Events are ordered per job (`Queued` -> `Started` -> `Stopped`) and
-/// timestamped with epoch milliseconds. They are observation records, not a
-/// delivery contract: at-least-once delivery, stable event ids, reconnect
-/// replay, and accepted/delivered/acknowledged states are CTX-0513.
+/// timestamped with epoch milliseconds; an executed cancel adds exactly one
+/// `CancelResolved` (before `Stopped` when the cancel ended the job).
+/// Delivery classes, replay, and acknowledgement are CTX-0513's lanes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobEvent {
     /// The job was accepted into the registry with state [`JobState::Queued`].
@@ -519,12 +489,21 @@ pub enum JobEvent {
         /// Event time (epoch milliseconds).
         at_ms: u64,
     },
+    /// The host finished executing an accepted cancel request.
+    CancelResolved {
+        /// Job the event belongs to.
+        id: JobId,
+        /// Typed result of the executed request.
+        outcome: CancelOutcome,
+        /// Event time (epoch milliseconds).
+        at_ms: u64,
+    },
     /// The job reached a terminal state.
     Stopped {
         /// Job the event belongs to.
         id: JobId,
-        /// Observed terminal classification.
-        stop: JobStop,
+        /// Authoritative structured outcome.
+        outcome: ExecutionOutcome,
         /// Event time (epoch milliseconds).
         at_ms: u64,
     },
@@ -535,7 +514,10 @@ impl JobEvent {
     #[must_use]
     pub const fn id(self) -> JobId {
         match self {
-            Self::Queued { id, .. } | Self::Started { id, .. } | Self::Stopped { id, .. } => id,
+            Self::Queued { id, .. }
+            | Self::Started { id, .. }
+            | Self::CancelResolved { id, .. }
+            | Self::Stopped { id, .. } => id,
         }
     }
 
@@ -545,6 +527,7 @@ impl JobEvent {
         match self {
             Self::Queued { at_ms, .. }
             | Self::Started { at_ms, .. }
+            | Self::CancelResolved { at_ms, .. }
             | Self::Stopped { at_ms, .. } => at_ms,
         }
     }
@@ -570,16 +553,34 @@ pub struct JobSnapshot {
     /// Metadata-only output index (CTX-0513): exact byte totals and
     /// truncation flags; never raw bytes.
     pub output: super::output::OutputIndex,
+    /// Execution generation minted at spawn: with [`JobSnapshot::id`] it
+    /// forms the [`ExecutionHandle`] the host checks on cancel.
+    pub generation: ExecutionGeneration,
+    /// What a kill reaches for this job: [`KillScope::OwnedTree`] once an
+    /// owned-tree backend adopted the process, else
+    /// [`KillScope::DirectChild`] (the gap is surfaced, never hidden).
+    pub kill_scope: KillScope,
 }
 
-/// Result of an accepted cancel request.
+impl JobSnapshot {
+    /// Host handle for this execution (id plus generation).
+    #[must_use]
+    pub const fn handle(&self) -> ExecutionHandle {
+        ExecutionHandle {
+            id: self.id,
+            generation: self.generation,
+        }
+    }
+}
+
+/// Result of an accepted legacy cancel request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobCancel {
-    /// The request was recorded; the supervisor will terminate the job and
-    /// emit `Stopped`.
+    /// The request was recorded; the supervisor kills the owned tree, emits
+    /// `CancelResolved`, and then `Stopped`.
     Requested,
     /// The job was already terminal; nothing changed.
-    AlreadyStopped(JobStop),
+    AlreadyStopped(ExecutionOutcome),
 }
 
 // ── capability-scoped operations (CTX-0514) ───────────────────────────────────
@@ -681,7 +682,8 @@ pub enum JobOperation {
     WriteInput,
     /// Deliver a portable signal request to a live job.
     Signal,
-    /// Request job termination (direct-child kill, CTX-0511 mechanism).
+    /// Request job termination (typed cancel executed by the host on the
+    /// owned tree, CTX-0512).
     Cancel,
     /// Subscribe to a live job's event cursor (reconnect-aware tail).
     Attach,
@@ -751,11 +753,11 @@ impl JobGrant {
     }
 }
 
-/// A portable signal request (research 044 §4; delivery is CTX-0512).
+/// A portable signal request (research 044 §4).
 ///
-/// The vocabulary is the portable intent set: the CTX-0512 typed-signal
-/// mechanism owns delivery (Unix signal numbers, process-group scope,
-/// graceful escalation), so this layer names intents only.
+/// The host delivers it to the job's owned tree (the whole process group,
+/// CTX-0512); jobs without an owned-tree backend refuse delivery with
+/// [`JobError::Unsupported`] rather than signal a single pid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JobSignal {
     /// Polite stop request (Unix `SIGINT` intent).
@@ -780,15 +782,20 @@ impl JobSignal {
 
 /// Outcome of an authorized `signal` call.
 ///
-/// Phase-1 delivery is CTX-0512's contract, so a live job reports the named
-/// delivery seam instead of an invented outcome. Terminal jobs observe their
-/// stop exactly like [`JobCancel::AlreadyStopped`].
+/// Terminal jobs observe their outcome exactly like
+/// [`JobCancel::AlreadyStopped`]; a live job's tree either received the
+/// signal or had no member left to receive it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignalOutcome {
     /// The job was already terminal; nothing changed.
-    AlreadyStopped(JobStop),
-    /// Recorded for delivery by the CTX-0512 typed-signal mechanism.
+    AlreadyStopped(ExecutionOutcome),
+    /// The signal reached the job's owned tree.
     Delivered,
+    /// The job's tree has no live member left (it is ending); nothing was
+    /// delivered and the terminal event follows.
+    Gone,
+    /// The kernel refused the signal for this job; nothing was delivered.
+    PermissionDenied,
 }
 
 /// Receipt of an accepted `attach`: which job, from which event cursor.
@@ -881,6 +888,12 @@ pub enum JobError {
     /// The operation is not supported for this job's state or backend.
     Unsupported {
         /// Owned reason.
+        reason: String,
+    },
+    /// The cancel request was malformed (over-bound grace); nothing was
+    /// recorded.
+    InvalidCancel {
+        /// Owned validation reason.
         reason: String,
     },
     /// The job's grant table is at capacity; delegate nothing new until the
@@ -1031,6 +1044,7 @@ impl fmt::Display for JobError {
                 write!(f, "job signal rate limited: {reason}")
             }
             Self::Unsupported { reason } => write!(f, "unsupported job operation: {reason}"),
+            Self::InvalidCancel { reason } => write!(f, "invalid cancel request: {reason}"),
             Self::GrantsFull { limit } => {
                 write!(f, "job grant table is full (limit {limit})")
             }
@@ -1051,6 +1065,7 @@ impl std::error::Error for JobError {}
 
 #[cfg(test)]
 mod tests {
+    use super::super::outcome::CancelEffect;
     use super::*;
     use bitty_ipc::execution::{MAX_EXEC_ARG_BYTES, MAX_EXEC_ARGS, MAX_EXEC_ARGS_TOTAL_BYTES};
 
@@ -1199,14 +1214,11 @@ mod tests {
     fn state_helpers_agree_with_variants() {
         assert!(!JobState::Queued.is_terminal());
         assert!(!JobState::Running.is_terminal());
-        assert_eq!(JobState::Queued.stop(), None);
-        assert!(JobState::Done(JobStop::Cancelled).is_terminal());
-        assert_eq!(
-            JobState::Done(JobStop::Cancelled).stop(),
-            Some(JobStop::Cancelled)
-        );
-        assert_eq!(JobState::Done(JobStop::Exited).as_str(), "done");
-        assert_eq!(JobStop::TimedOut.as_str(), "timed_out");
+        assert_eq!(JobState::Queued.outcome(), None);
+        let cancelled = ExecutionOutcome::Cancelled(CancelEffect::Killed);
+        assert!(JobState::Done(cancelled).is_terminal());
+        assert_eq!(JobState::Done(cancelled).outcome(), Some(cancelled));
+        assert_eq!(JobState::Done(ExecutionOutcome::Success).as_str(), "done");
         assert_eq!(JobKind::Watch.as_str(), "watch");
         assert_eq!(JobLifetime::Agent.as_str(), "agent");
         assert_eq!(JobIo::Pty.as_str(), "pty");
@@ -1218,11 +1230,18 @@ mod tests {
         let queued = JobEvent::Queued { id, at_ms: 10 };
         let stopped = JobEvent::Stopped {
             id,
-            stop: JobStop::Exited,
+            outcome: ExecutionOutcome::Success,
             at_ms: 30,
+        };
+        let resolved = JobEvent::CancelResolved {
+            id,
+            outcome: CancelOutcome::Killed,
+            at_ms: 20,
         };
         assert_eq!(queued.id(), id);
         assert_eq!(queued.at_ms(), 10);
+        assert_eq!(resolved.id(), id);
+        assert_eq!(resolved.at_ms(), 20);
         assert_eq!(stopped.id(), id);
         assert_eq!(stopped.at_ms(), 30);
     }

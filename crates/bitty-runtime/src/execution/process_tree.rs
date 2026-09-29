@@ -1,17 +1,19 @@
-//! Owned-process-tree kill backends (RUN-17, #1048).
+//! Owned-process-tree kill backends (RUN-17, #1048; mechanism CTX-0512).
 //!
 //! Cancel must terminate the owned process tree, never a single PID: a job
 //! that spawned grandchildren must not leave them behind. The mechanism is
-//! platform-split and confined here so the supervisor never branches on
+//! platform-split and confined to the `bitty-pty` boundary crate
+//! ([`bitty_pty::OwnedTree`]) so the supervisor never branches on
 //! `target_os` itself:
 //!
-//! - Linux: process groups plus pidfd;
-//! - macOS: process groups plus kqueue/process wait;
-//! - Windows: Job Objects plus ConPTY.
+//! - Linux: process groups plus pidfd (implemented);
+//! - macOS: process groups plus kqueue exit observation (implemented);
+//! - Windows: Job Objects plus ConPTY (reserved: the Job Object backend
+//!   needs a reviewed FFI boundary and is not implemented, so Windows
+//!   reports [`ProcessTreeBackend::Unsupported`] and direct-child scope).
 //!
-//! This module selects the backend and the kill scope it can honor. The
-//! actual kill, typed cancel, and generation fencing stay CTX-0512: nothing
-//! here signals a process, opens a handle, or uses `unsafe`.
+//! This module names the backend and the kill scope it can honor; the
+//! supervisor reports the scope per job (`JobSnapshot::kill_scope`).
 
 use std::fmt;
 
@@ -22,7 +24,8 @@ pub enum ProcessTreeBackend {
     LinuxProcessGroup,
     /// macOS process groups plus kqueue/process wait.
     MacosProcessGroup,
-    /// Windows Job Objects plus ConPTY.
+    /// Windows Job Objects plus ConPTY. Reserved: never detected until the
+    /// Job Object backend exists.
     WindowsJobObject,
     /// No owned-tree backend on this platform: only the direct child can be
     /// terminated. Callers must surface the gap, never silently single-kill
@@ -31,24 +34,20 @@ pub enum ProcessTreeBackend {
 }
 
 impl ProcessTreeBackend {
-    /// Backend for the compiling platform.
+    /// Backend implemented for the compiling platform (the one
+    /// [`bitty_pty::TreeBackend::detect`] runs).
     #[must_use]
     pub const fn detect() -> Self {
-        #[cfg(target_os = "windows")]
-        {
-            Self::WindowsJobObject
-        }
-        #[cfg(target_os = "macos")]
-        {
-            Self::MacosProcessGroup
-        }
-        #[cfg(target_os = "linux")]
-        {
-            Self::LinuxProcessGroup
-        }
-        #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-        {
-            Self::Unsupported
+        Self::from_tree_backend(bitty_pty::TreeBackend::detect())
+    }
+
+    /// Maps the boundary crate's backend onto this vocabulary.
+    #[must_use]
+    pub const fn from_tree_backend(backend: bitty_pty::TreeBackend) -> Self {
+        match backend {
+            bitty_pty::TreeBackend::ProcessGroupPidfd => Self::LinuxProcessGroup,
+            bitty_pty::TreeBackend::ProcessGroupKqueue => Self::MacosProcessGroup,
+            bitty_pty::TreeBackend::Unsupported => Self::Unsupported,
         }
     }
 
@@ -164,8 +163,13 @@ mod tests {
         assert_eq!(backend, ProcessTreeBackend::LinuxProcessGroup);
         #[cfg(target_os = "macos")]
         assert_eq!(backend, ProcessTreeBackend::MacosProcessGroup);
+        // No Job Object backend yet: Windows honestly reports no tree.
         #[cfg(target_os = "windows")]
-        assert_eq!(backend, ProcessTreeBackend::WindowsJobObject);
+        assert_eq!(backend, ProcessTreeBackend::Unsupported);
+        assert_eq!(
+            backend.kills_owned_tree(),
+            bitty_pty::TreeBackend::detect().kills_owned_tree()
+        );
     }
 
     #[test]

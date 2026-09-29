@@ -49,15 +49,20 @@ use std::time::Duration;
 use bitty_ipc::execution::{EnvPolicy, MAX_EXEC_ARGS, MAX_EXEC_ENV_VARS};
 
 use super::atomic_file::{self, AtomicWrite};
-use super::model::{
-    JobId, JobIo, JobKind, JobLifetime, JobOrigin, JobSpec, JobState, JobStop, JobTimeouts,
-};
+use super::model::{JobId, JobIo, JobKind, JobLifetime, JobOrigin, JobSpec, JobState, JobTimeouts};
+use super::outcome::{CancelEffect, DeadlineClock, ExecutionOutcome};
 use super::output::{OutputIndex, OutputStream, ReadOutput};
 use super::registry::DEFAULT_MAX_JOBS;
 use super::{JobRegistry, MAX_READ_BYTES};
 
 /// Manifest format version written by this slice.
-pub const PERSIST_FORMAT_VERSION: u32 = 1;
+///
+/// v2 (CTX-0512) stores terminal states as structured
+/// [`ExecutionOutcome`] tokens (`done:exit_code=3`, `done:cancelled=killed`,
+/// ...). v1 manifests carried the interim four-way stop and are refused as
+/// an unsupported version: their `exited` rows lack the exit code v2 needs,
+/// and no v1 store was ever written outside tests.
+pub const PERSIST_FORMAT_VERSION: u32 = 2;
 
 /// Manifest file name inside a [`JobStore`] directory.
 pub const MANIFEST_FILE_NAME: &str = "jobs.manifest";
@@ -291,6 +296,19 @@ pub struct ReconciledJob {
     pub record: PersistedJob,
     /// The restart decision for it.
     pub decision: ResumeDecision,
+}
+
+impl ReconciledJob {
+    /// The outcome restart truth allows for this row: a terminal row keeps
+    /// its recorded outcome; a row that was live when the supervisor went
+    /// away is [`ExecutionOutcome::SupervisorLost`], never a guessed exit.
+    #[must_use]
+    pub fn outcome(&self) -> ExecutionOutcome {
+        match (self.decision, self.record.state) {
+            (ResumeDecision::TerminalFacts, JobState::Done(outcome)) => outcome,
+            _ => ExecutionOutcome::SupervisorLost,
+        }
+    }
 }
 
 /// Maps every persisted row onto restart truth.
@@ -817,12 +835,28 @@ fn encode_row(row: &PersistedJob, text: &mut String) -> Result<(), PersistError>
     Ok(())
 }
 
-/// Encodes the lifecycle state (`done` carries its observed stop).
+/// Encodes the lifecycle state (`done` carries its structured outcome;
+/// payload-carrying outcomes append `=<value>`).
 fn encode_state(state: JobState) -> String {
     match state {
         JobState::Queued => "queued".to_owned(),
         JobState::Running => "running".to_owned(),
-        JobState::Done(stop) => format!("done:{}", stop.as_str()),
+        JobState::Done(outcome) => {
+            let name = outcome.as_str();
+            match outcome {
+                ExecutionOutcome::ExitCode(code) => format!("done:{name}={code}"),
+                ExecutionOutcome::Signaled(signal) => format!("done:{name}={signal}"),
+                ExecutionOutcome::Cancelled(effect) => {
+                    format!("done:{name}={}", effect.as_str())
+                }
+                ExecutionOutcome::TimedOut(clock) => format!("done:{name}={}", clock.as_str()),
+                ExecutionOutcome::Success
+                | ExecutionOutcome::SpawnFailed
+                | ExecutionOutcome::OomKilled
+                | ExecutionOutcome::SupervisorLost
+                | ExecutionOutcome::Unknown => format!("done:{name}"),
+            }
+        }
     }
 }
 
@@ -1075,25 +1109,48 @@ fn decode_env(fields: &mut Fields<'_>) -> Result<EnvPolicy, PersistError> {
     }
 }
 
+/// Parses one structured outcome token (the part after `done:`).
+fn decode_outcome(token: &str) -> Result<ExecutionOutcome, PersistError> {
+    let unknown = || PersistError::corrupt("manifest terminal outcome unknown");
+    let number = |raw: &str| raw.parse::<i32>().map_err(|_| unknown());
+    let (name, value) = match token.split_once('=') {
+        Some((name, value)) => (name, Some(value)),
+        None => (token, None),
+    };
+    let outcome = match (name, value) {
+        ("success", None) => ExecutionOutcome::Success,
+        ("exit_code", Some(code)) => ExecutionOutcome::ExitCode(number(code)?),
+        ("signaled", Some(signal)) => ExecutionOutcome::Signaled(number(signal)?),
+        ("spawn_failed", None) => ExecutionOutcome::SpawnFailed,
+        ("cancelled", Some(effect)) => ExecutionOutcome::Cancelled(match effect {
+            "before_start" => CancelEffect::BeforeStart,
+            "graceful" => CancelEffect::Graceful,
+            "killed" => CancelEffect::Killed,
+            _ => return Err(unknown()),
+        }),
+        ("timed_out", Some(clock)) => ExecutionOutcome::TimedOut(match clock {
+            "hard" => DeadlineClock::Hard,
+            "idle" => DeadlineClock::Idle,
+            _ => return Err(unknown()),
+        }),
+        ("oom_killed", None) => ExecutionOutcome::OomKilled,
+        ("supervisor_lost", None) => ExecutionOutcome::SupervisorLost,
+        ("unknown", None) => ExecutionOutcome::Unknown,
+        _ => return Err(unknown()),
+    };
+    Ok(outcome)
+}
+
 /// Parses the lifecycle state token.
 fn decode_state(raw: &str) -> Result<JobState, PersistError> {
     match raw {
         "queued" => Ok(JobState::Queued),
         "running" => Ok(JobState::Running),
-        stop => {
-            let name = stop
+        done => {
+            let token = done
                 .strip_prefix("done:")
                 .ok_or_else(|| PersistError::corrupt("manifest job state unknown"))?;
-            let stop = match name {
-                "exited" => JobStop::Exited,
-                "cancelled" => JobStop::Cancelled,
-                "timed_out" => JobStop::TimedOut,
-                "spawn_failed" => JobStop::SpawnFailed,
-                _ => {
-                    return Err(PersistError::corrupt("manifest terminal stop unknown"));
-                }
-            };
-            Ok(JobState::Done(stop))
+            decode_outcome(token).map(JobState::Done)
         }
     }
 }
@@ -1163,14 +1220,23 @@ mod tests {
     }
 
     #[test]
-    fn state_codec_covers_every_stop() {
-        for stop in [
-            JobStop::Exited,
-            JobStop::Cancelled,
-            JobStop::TimedOut,
-            JobStop::SpawnFailed,
+    fn state_codec_covers_every_outcome() {
+        for outcome in [
+            ExecutionOutcome::Success,
+            ExecutionOutcome::ExitCode(3),
+            ExecutionOutcome::ExitCode(-1_073_741_510),
+            ExecutionOutcome::Signaled(9),
+            ExecutionOutcome::SpawnFailed,
+            ExecutionOutcome::Cancelled(CancelEffect::BeforeStart),
+            ExecutionOutcome::Cancelled(CancelEffect::Graceful),
+            ExecutionOutcome::Cancelled(CancelEffect::Killed),
+            ExecutionOutcome::TimedOut(DeadlineClock::Hard),
+            ExecutionOutcome::TimedOut(DeadlineClock::Idle),
+            ExecutionOutcome::OomKilled,
+            ExecutionOutcome::SupervisorLost,
+            ExecutionOutcome::Unknown,
         ] {
-            let state = JobState::Done(stop);
+            let state = JobState::Done(outcome);
             assert_eq!(decode_state(&encode_state(state)).expect("decode"), state);
         }
         assert_eq!(
@@ -1181,8 +1247,22 @@ mod tests {
             decode_state(&encode_state(JobState::Running)).expect("decode"),
             JobState::Running
         );
-        assert!(decode_state("done:unknown").is_err());
-        assert!(decode_state("flying").is_err());
+        for corrupt in [
+            "flying",
+            "done:exited",
+            "done:cancelled",
+            "done:exit_code",
+            "done:exit_code=x",
+            "done:success=0",
+            "done:timed_out=forever",
+            "done:cancelled=maybe",
+            "done:",
+        ] {
+            assert!(
+                decode_state(corrupt).is_err(),
+                "{corrupt:?} must be corrupt"
+            );
+        }
     }
 
     #[test]
@@ -1225,7 +1305,7 @@ mod tests {
             stderr_log: None,
         };
         let mut done = live.clone();
-        done.state = JobState::Done(JobStop::Exited);
+        done.state = JobState::Done(ExecutionOutcome::Success);
         let store = PersistedStore {
             version: PERSIST_FORMAT_VERSION,
             cursor: ResumeCursor {

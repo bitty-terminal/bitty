@@ -14,10 +14,10 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use bitty_runtime::{
-    AdoptedJob, AdoptionKind, DaemonError, HandoffOffer, IdAllocator, JobId, JobRegistry, JobSpec,
-    JobState, JobStop, JobStore, OutputStream, PersistError, ReadOutput, ResumeDecision,
-    ScheduleDecision, SchedulePolicy, SupervisorDaemon, adoption_plan, clear_handoff, read_handoff,
-    reconcile, write_handoff,
+    AdoptedJob, AdoptionKind, DaemonError, ExecutionOutcome, HandoffOffer, IdAllocator, JobId,
+    JobRegistry, JobSpec, JobState, JobStore, OutputStream, PersistError, ReadOutput,
+    ResumeDecision, ScheduleDecision, SchedulePolicy, SupervisorDaemon, adoption_plan,
+    clear_handoff, read_handoff, reconcile, write_handoff,
 };
 
 const HELPER_ENV: &str = "__BITTY_JOB_PERSIST_HELPER";
@@ -162,7 +162,7 @@ fn checkpoint_roundtrip_preserves_metadata_index_and_cursors() {
         .iter()
         .find(|row| row.id == said)
         .expect("said row");
-    assert_eq!(said_row.state, JobState::Done(JobStop::Exited));
+    assert_eq!(said_row.state, JobState::Done(ExecutionOutcome::Success));
     assert!(said_row.finished_at_ms.is_some());
     assert!(said_row.output.stdout_total_bytes > 0);
     drop_scratch(&dir);
@@ -232,7 +232,10 @@ fn restart_marks_live_jobs_unknown_and_keeps_terminal_facts() {
         .find(|row| row.record.id == done)
         .expect("done row");
     assert_eq!(done_row.decision, ResumeDecision::TerminalFacts);
-    assert_eq!(done_row.record.state, JobState::Done(JobStop::Exited));
+    assert_eq!(
+        done_row.record.state,
+        JobState::Done(ExecutionOutcome::Success)
+    );
 
     // Adoption observes facts and never restarts the unknown job.
     let plan = adoption_plan(&reconciled);
@@ -297,10 +300,14 @@ fn corrupt_and_oversized_manifests_fail_closed() {
     std::fs::write(&manifest_path, "NOPE\tv1\t0\t0\n").expect("write");
     assert!(matches!(store.load(), Err(PersistError::Corrupt { .. })));
 
-    // Unsupported version.
-    let bad_version = valid.replacen("v1", "v9999", 1);
-    std::fs::write(&manifest_path, bad_version).expect("write");
-    assert!(matches!(store.load(), Err(PersistError::Corrupt { .. })));
+    // Unsupported version, and a v1 (interim four-way stop) manifest.
+    let current = format!("\tv{}\t", bitty_runtime::PERSIST_FORMAT_VERSION);
+    for version in ["\tv9999\t", "\tv1\t"] {
+        let bad_version = valid.replacen(&current, version, 1);
+        assert_ne!(bad_version, valid, "the header carries the version");
+        std::fs::write(&manifest_path, bad_version).expect("write");
+        assert!(matches!(store.load(), Err(PersistError::Corrupt { .. })));
+    }
 
     // Truncated row.
     let mut truncated = valid.clone();

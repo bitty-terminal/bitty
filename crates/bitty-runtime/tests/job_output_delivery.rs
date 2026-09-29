@@ -15,9 +15,10 @@ use std::io::Write;
 use std::time::{Duration, Instant};
 
 use bitty_runtime::{
-    DeliveryState, EventClass, JobError, JobEvent, JobId, JobRegistry, JobSnapshot, JobSpec,
-    JobState, JobStop, MAX_EVENT_REPLAY, MAX_OUTPUT_BYTES_PER_JOB, MAX_READ_BYTES, MAX_READ_LINES,
-    MAX_STORED_CRITICAL_EVENTS, MAX_STORED_JOB_EVENTS, OutputFilter, OutputStream, ReadOutput,
+    DeliveryState, EventClass, ExecutionOutcome, JobError, JobEvent, JobId, JobRegistry,
+    JobSnapshot, JobSpec, JobState, MAX_EVENT_REPLAY, MAX_OUTPUT_BYTES_PER_JOB, MAX_READ_BYTES,
+    MAX_READ_LINES, MAX_STORED_CRITICAL_EVENTS, MAX_STORED_JOB_EVENTS, OutputFilter, OutputStream,
+    ReadOutput,
 };
 
 const HELPER_ENV: &str = "__BITTY_JOB_OUTPUT_TEST_HELPER";
@@ -180,7 +181,7 @@ fn unbounded_output_is_bounded_and_honest() {
     let registry = JobRegistry::new();
     let id = registry.spawn(helper_spec("flood")).expect("tracked");
     let stopped = wait_stopped(&registry, id);
-    assert_eq!(stopped.state, JobState::Done(JobStop::Exited));
+    assert_eq!(stopped.state, JobState::Done(ExecutionOutcome::Success));
 
     // The store never retains more than the per-job byte bound even though
     // the child wrote far more. The child also prints the ordinary harness
@@ -219,7 +220,7 @@ fn tail_and_error_filter_read_surface() {
     let registry = JobRegistry::new();
     let id = registry.spawn(helper_spec("mixed")).expect("tracked");
     let stopped = wait_stopped(&registry, id);
-    assert_eq!(stopped.state, JobState::Done(JobStop::Exited));
+    assert_eq!(stopped.state, JobState::Done(ExecutionOutcome::Success));
 
     // Bounded tail: the last numbered stdout lines, in order. The child
     // prints the ordinary harness summary after the payload, so filter the
@@ -373,7 +374,7 @@ fn job_network_failure_is_facts_not_a_classification() {
     let stopped = wait_stopped(&registry, id);
     // No network_error stop exists: the supervisor observes a plain exit
     // (exit code/signal taxonomy is CTX-0512) and keeps the stderr facts.
-    assert_eq!(stopped.state, JobState::Done(JobStop::Exited));
+    assert_eq!(stopped.state, JobState::Done(ExecutionOutcome::Success));
 
     // Unfiltered read first: the raw facts must be present regardless of
     // filter shaping. NOTE: `dial ... connection refused` contains neither
@@ -430,7 +431,7 @@ fn reconnect_replays_mid_stream_events_with_stable_ids() {
 
     // The consumer disconnects while the job keeps running to completion.
     let stopped = wait_terminal(&registry, id);
-    assert_eq!(stopped.state, JobState::Done(JobStop::Exited));
+    assert_eq!(stopped.state, JobState::Done(ExecutionOutcome::Success));
 
     // Reconnect with the saved cursor: everything missed is replayed,
     // including the terminal critical event.
@@ -443,7 +444,7 @@ fn reconnect_replays_mid_stream_events_with_stable_ids() {
     assert!(matches!(
         last.event(),
         JobEvent::Stopped {
-            stop: JobStop::Exited,
+            outcome: ExecutionOutcome::Success,
             ..
         }
     ));

@@ -402,7 +402,8 @@ impl ServeContext {
     ///
     /// Granted scopes default to the CLI interactive set plus the explicit
     /// `BITTY_CTL_ELEVATE` allowlist (impure: reads one env var; tests that
-    /// need hermetic scopes use [`ServeContext::with_granted`]). The context
+    /// need hermetic scopes use the `test-support` constructor
+    /// `ServeContext::with_granted`). The context
     /// owns a standalone [`crate::ctl::ControlAuthority`] session, so it is
     /// authority-bound like a served connection; the accept path uses
     /// [`ServeContext::with_connection_grant`] with the listener's shared
@@ -602,6 +603,11 @@ impl ServeContext {
     ///
     /// This constructor does not establish peer proof; dispatch remains
     /// fail-closed until [`Self::bind_connected_stream`] succeeds.
+    ///
+    /// Test support only (#1519): the context has no server-owned authority,
+    /// so production builds do not compile it. Served connections use
+    /// [`Self::with_connection_grant`].
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn with_granted(server: &ServerInfo, granted: crate::scope::ScopeSet) -> Self {
         Self {
@@ -625,6 +631,9 @@ impl ServeContext {
     /// fail-closed until [`Self::bind_connected_stream`] succeeds. The terminal
     /// capability wildcard is exactly `granted`: nothing is added, so a harness
     /// that reads the grid must grant `terminal.inspect` explicitly.
+    ///
+    /// Test support only (#1519), like [`Self::with_granted`].
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn with_granted_session(
         server: &ServerInfo,

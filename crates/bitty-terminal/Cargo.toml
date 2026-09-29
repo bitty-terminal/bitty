@@ -31,4 +31,6 @@ bitty-vt = { path = "../bitty-vt" }
 pollster = { workspace = true }
 
 [dev-dependencies]
+# Hermetic `ServeContext` constructors and unbound bearer minters (#1519).
+bitty-ipc = { path = "../bitty-ipc", features = ["test-support"] }
 bitty-test-support = { path = "../bitty-test-support" }

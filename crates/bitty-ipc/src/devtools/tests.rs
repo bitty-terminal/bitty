@@ -1269,6 +1269,324 @@ fn serve_connection_oversize_frame_closes() {
     assert_eq!(stats.framing_errors, 1);
 }
 
+// ── inbound request continuation (Amendment A4, #1482) ──────────────
+
+/// Method the continuation fixtures dispatch to; records every call's params.
+#[cfg(unix)]
+const CONTINUATION_PROBE: &str = "bitty.debug/continuationProbe";
+
+#[cfg(unix)]
+fn continuation_probe_calls() -> &'static Mutex<Vec<String>> {
+    static CALLS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    CALLS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+#[cfg(unix)]
+fn continuation_probe(
+    _context: &ServeContext,
+    request: &DevtoolsRequest,
+) -> Result<String, HandlerError> {
+    continuation_probe_calls()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(request.params_raw.clone().unwrap_or_default());
+    Ok("{\"probed\":true}".to_string())
+}
+
+/// Dispatches recorded for `tag` (fixtures run in parallel, so each one
+/// filters by its own tag).
+#[cfg(unix)]
+fn continuation_probe_count(tag: &str) -> usize {
+    continuation_probe_calls()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|params| params.contains(tag))
+        .count()
+}
+
+/// A probe envelope for `tag` padded with insignificant whitespace to `len`.
+#[cfg(unix)]
+fn padded_probe_request(id: u32, tag: &str, len: usize) -> Vec<u8> {
+    let head = format!(
+        "{{\"id\":{id},\"method\":\"{CONTINUATION_PROBE}\",\"version\":\"1.0\",\"params\":{{\"tag\":\"{tag}\"}}"
+    );
+    let mut request = head.into_bytes();
+    request.resize(len - 1, b' ');
+    request.push(b'}');
+    request
+}
+
+/// Serve one hermetic connection in a thread with the probe registered.
+#[cfg(unix)]
+fn spawn_continuation_server(
+    read_timeout: std::time::Duration,
+    clock: impl Fn() -> u64 + Send + 'static,
+) -> (
+    std::os::unix::net::UnixStream,
+    std::thread::JoinHandle<Result<ConnectionStats, IpcError>>,
+) {
+    use std::os::unix::net::UnixStream;
+
+    let (client, mut server) = UnixStream::pair().unwrap();
+    server.set_read_timeout(Some(read_timeout)).unwrap();
+    client
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .unwrap();
+    let mut dispatcher = Dispatcher::with_defaults();
+    dispatcher
+        .register(CONTINUATION_PROBE, continuation_probe)
+        .unwrap();
+    let context = test_context();
+    let peer = crate::auth::verify_peer_for_connection(
+        crate::auth::PeerCredentials::new(1000, 1000, 1),
+        1000,
+    )
+    .unwrap();
+    let handle = std::thread::spawn(move || {
+        let mut limiter = RateLimiter::rc9_default();
+        serve_connection(
+            &mut server,
+            peer,
+            &dispatcher,
+            &context,
+            &mut limiter,
+            &clock,
+        )
+    });
+    (client, handle)
+}
+
+/// Read one response frame, or `None` when the server closed the stream.
+#[cfg(unix)]
+fn read_response(client: &mut std::os::unix::net::UnixStream) -> Option<String> {
+    let mut header = [0u8; 4];
+    client.read_exact(&mut header).ok()?;
+    let mut body = vec![0u8; u32::from_be_bytes(header) as usize];
+    client.read_exact(&mut body).unwrap();
+    Some(String::from_utf8(body).unwrap())
+}
+
+#[cfg(unix)]
+fn write_frames(client: &mut std::os::unix::net::UnixStream, frames: &[Vec<u8>]) {
+    for frame in frames {
+        client.write_all(frame).unwrap();
+    }
+}
+
+#[cfg(unix)]
+fn assert_one_exchange(len: usize, tag: &str) {
+    let (mut client, handle) = spawn_continuation_server(std::time::Duration::from_secs(5), || 0);
+    let request = padded_probe_request(41, tag, len);
+    let frames = encode_request_frames(&request, 9).unwrap();
+    assert!(frames.len() > 1, "fixture must need continuation");
+    write_frames(&mut client, &frames);
+    let text = read_response(&mut client).expect("one response");
+    assert!(text.contains("\"id\":41"), "{text}");
+    assert!(text.contains("\"probed\":true"), "{text}");
+    drop(client);
+    let stats = handle.join().unwrap().unwrap();
+    assert_eq!(
+        stats.requests, 1,
+        "one logical request, not one per fragment"
+    );
+    assert_eq!(stats.responses, 1);
+    assert_eq!(stats.framing_errors, 0);
+    assert_eq!(continuation_probe_count(tag), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn continuation_just_above_one_frame_is_one_exchange() {
+    assert_one_exchange(MAX_FRAME_BYTES + 1, "a4-above-one-frame");
+}
+
+#[cfg(unix)]
+#[test]
+fn continuation_near_the_inbound_limit_is_one_exchange() {
+    assert_one_exchange(MAX_LOGICAL_REQUEST_BYTES - 1, "a4-near-limit");
+}
+
+#[cfg(unix)]
+#[test]
+fn continuation_keeps_method_params_caps_and_correlates_the_error() {
+    let tag = "a4-params-cap";
+    let (mut client, handle) = spawn_continuation_server(std::time::Duration::from_secs(5), || 0);
+    let blob = "x".repeat(MAX_FRAME_BYTES);
+    let request = format!(
+        "{{\"id\":42,\"method\":\"{CONTINUATION_PROBE}\",\"version\":\"1.0\",\"params\":{{\"tag\":\"{tag}\",\"blob\":\"{blob}\"}}}}"
+    );
+    write_frames(
+        &mut client,
+        &encode_request_frames(request.as_bytes(), 3).unwrap(),
+    );
+    let text = read_response(&mut client).expect("one response");
+    assert!(text.contains("\"id\":42"), "{text}");
+    assert!(text.contains("PayloadTooLarge"), "{text}");
+    drop(client);
+    let stats = handle.join().unwrap().unwrap();
+    assert_eq!(stats.requests, 1);
+    assert_eq!(continuation_probe_count(tag), 0);
+}
+
+/// Send `frames`, expect one `id` 0 error carrying `code`, then EOF, with no
+/// dispatch of `tag`.
+#[cfg(unix)]
+fn assert_fails_closed(
+    clock: impl Fn() -> u64 + Send + 'static,
+    frames: &[Vec<u8>],
+    tag: &str,
+    code: &str,
+) {
+    let (mut client, handle) = spawn_continuation_server(std::time::Duration::from_secs(5), clock);
+    // The server may close before the last frame is written (it fails closed
+    // at the first violation), so a broken pipe here is expected.
+    for frame in frames {
+        if client.write_all(frame).is_err() {
+            break;
+        }
+    }
+    let text = read_response(&mut client).expect("one error response");
+    assert!(text.contains(code), "{text}");
+    assert!(text.contains("\"id\":0"), "{text}");
+    assert!(
+        read_response(&mut client).is_none(),
+        "connection must close"
+    );
+    let stats = handle.join().unwrap().unwrap();
+    assert_eq!(stats.requests, 0, "nothing was admitted");
+    assert_eq!(stats.framing_errors, 1);
+    assert_eq!(continuation_probe_count(tag), 0, "nothing was dispatched");
+}
+
+#[cfg(unix)]
+#[test]
+fn continuation_interleaved_plain_frame_fails_closed() {
+    let tag = "a4-interleaved";
+    let request = padded_probe_request(43, tag, MAX_FRAME_BYTES + 100);
+    let mut frames = encode_request_frames(&request, 5).unwrap();
+    frames.truncate(1);
+    let plain = format!(
+        "{{\"id\":44,\"method\":\"{CONTINUATION_PROBE}\",\"version\":\"1.0\",\"params\":{{\"tag\":\"{tag}\"}}}}"
+    );
+    frames.push(encode_frame(plain.as_bytes()).unwrap());
+    assert_fails_closed(|| 0, &frames, tag, "ContinuationInvalid");
+}
+
+#[cfg(unix)]
+#[test]
+fn continuation_out_of_order_fragment_fails_closed() {
+    let tag = "a4-out-of-order";
+    let request = padded_probe_request(45, tag, CONTINUATION_CHUNK_BYTES * 2 + 10);
+    let mut frames = encode_request_frames(&request, 6).unwrap();
+    assert_eq!(frames.len(), 3);
+    frames.swap(1, 2);
+    assert_fails_closed(|| 0, &frames, tag, "ContinuationInvalid");
+}
+
+#[cfg(unix)]
+#[test]
+fn continuation_over_limit_total_fails_closed() {
+    let tag = "a4-over-limit";
+    let mut first = encode_request_frames(&padded_probe_request(46, tag, MAX_FRAME_BYTES + 1), 8)
+        .unwrap()
+        .remove(0);
+    // Rewrite the declared total (payload offset 12, after the 4-byte prefix).
+    let over = u32::try_from(MAX_LOGICAL_REQUEST_BYTES + 1).unwrap();
+    first[4 + 12..4 + 16].copy_from_slice(&over.to_be_bytes());
+    assert_fails_closed(|| 0, &[first], tag, "FrameTooLarge");
+}
+
+#[cfg(unix)]
+#[test]
+fn continuation_late_final_fragment_fails_closed() {
+    let tag = "a4-late";
+    let request = padded_probe_request(47, tag, MAX_FRAME_BYTES + 1);
+    let frames = encode_request_frames(&request, 10).unwrap();
+    // The first fragment is read at t=0; every later clock read is past the
+    // deadline.
+    let calls = std::sync::atomic::AtomicU64::new(0);
+    let clock = move || {
+        if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            0
+        } else {
+            CONTINUATION_DEADLINE_MS + 1
+        }
+    };
+    assert_fails_closed(clock, &frames, tag, "ContinuationTimeout");
+}
+
+#[cfg(unix)]
+#[test]
+fn continuation_stalled_stream_reports_timeout_without_dispatch() {
+    let tag = "a4-stalled";
+    let (mut client, handle) =
+        spawn_continuation_server(std::time::Duration::from_millis(200), || 0);
+    let request = padded_probe_request(48, tag, MAX_FRAME_BYTES + 1);
+    let frames = encode_request_frames(&request, 11).unwrap();
+    write_frames(&mut client, &frames[..1]);
+    let text = read_response(&mut client).expect("one timeout response");
+    assert!(text.contains("ContinuationTimeout"), "{text}");
+    assert!(text.contains("\"id\":0"), "{text}");
+    let stats = handle.join().unwrap().unwrap();
+    assert_eq!(stats.requests, 0);
+    assert_eq!(stats.framing_errors, 1);
+    assert_eq!(continuation_probe_count(tag), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn continuation_slow_drip_is_cut_at_the_deadline() {
+    // CodeRabbit on #1525: while a reassembly is open, every read is bounded
+    // by the time left before the continuation deadline, so dripping a
+    // fragment byte by byte cannot hold the connection past it. The fake
+    // clock advances 2 s per reading, so the deadline passes after a few
+    // drips; the 30 s idle timeout alone would keep the connection open far
+    // longer than the client waits.
+    let tag = "a4-slow-drip";
+    let ticks = std::sync::atomic::AtomicU64::new(0);
+    let clock = move || ticks.fetch_add(2_000, std::sync::atomic::Ordering::SeqCst);
+    let (mut client, handle) = spawn_continuation_server(std::time::Duration::from_secs(30), clock);
+    let request = padded_probe_request(50, tag, CONTINUATION_CHUNK_BYTES * 2 + 10);
+    let frames = encode_request_frames(&request, 13).unwrap();
+    assert_eq!(
+        frames[1].len(),
+        4 + MAX_FRAME_BYTES,
+        "the dripped fragment is full"
+    );
+    client.write_all(&frames[0]).unwrap();
+    // Only the first bytes of the full second fragment ever arrive.
+    for byte in frames[1].iter().take(64) {
+        if client.write_all(&[*byte]).is_err() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let text = read_response(&mut client).expect("the deadline must cut the drip");
+    assert!(text.contains("ContinuationTimeout"), "{text}");
+    assert!(text.contains("\"id\":0"), "{text}");
+    let stats = handle.join().unwrap().unwrap();
+    assert_eq!(stats.requests, 0);
+    assert_eq!(stats.framing_errors, 1);
+    assert_eq!(continuation_probe_count(tag), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn continuation_eof_mid_request_closes_silently() {
+    let tag = "a4-eof";
+    let (mut client, handle) = spawn_continuation_server(std::time::Duration::from_secs(5), || 0);
+    let request = padded_probe_request(49, tag, CONTINUATION_CHUNK_BYTES * 2 + 1);
+    let frames = encode_request_frames(&request, 12).unwrap();
+    write_frames(&mut client, &frames[..2]);
+    client.shutdown(std::net::Shutdown::Write).unwrap();
+    assert!(read_response(&mut client).is_none(), "no reply after EOF");
+    let stats = handle.join().unwrap().unwrap();
+    assert_eq!(stats.requests, 0);
+    assert_eq!(stats.responses, 0);
+    assert_eq!(continuation_probe_count(tag), 0);
+}
+
 // ── directory attestation (unix, temp dirs) ─────────────────────────
 
 #[cfg(unix)]

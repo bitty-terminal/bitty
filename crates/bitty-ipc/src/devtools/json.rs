@@ -1,7 +1,6 @@
 use super::*;
 
 use crate::error::IpcError;
-use crate::frame::MAX_FRAME_BYTES;
 use crate::wire::{MAX_JSON_DEPTH, validate_json_depth};
 use std::collections::BTreeMap;
 
@@ -351,12 +350,18 @@ fn is_valid_number_token(token: &str) -> bool {
 /// Returns a [`RequestFault`] (renderable as an error response) for every
 /// malformed or unauthorized envelope; the fault carries the best-known id.
 pub fn parse_request(payload: &[u8]) -> Result<DevtoolsRequest, RequestFault> {
-    if payload.len() > MAX_FRAME_BYTES {
+    // The envelope bound is the 1 MiB logical-request limit: a request above
+    // one frame arrives reassembled from continuation fragments (Amendment A4,
+    // #1482). Per-method `params` caps below still apply unchanged.
+    if payload.len() > MAX_LOGICAL_REQUEST_BYTES {
         return Err(RequestFault::new(
             None,
             "transport",
             "FrameTooLarge",
-            format!("payload {} exceeds limit {MAX_FRAME_BYTES}", payload.len()),
+            format!(
+                "payload {} exceeds limit {MAX_LOGICAL_REQUEST_BYTES}",
+                payload.len()
+            ),
         ));
     }
     let text = std::str::from_utf8(payload).map_err(|_| {

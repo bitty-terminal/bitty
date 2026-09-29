@@ -394,6 +394,7 @@ pub const TEST_SURFACE_PROTOCOL: &str = "1.0";
 
 mod automation;
 mod automation_ops;
+mod continuation;
 mod handlers;
 mod json;
 mod mcp_adapter;
@@ -413,6 +414,11 @@ pub use automation::{
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use automation::{issue_automation_bearer, issue_automation_bearer_with_ttl};
+pub use continuation::{
+    Accepted, CONTINUATION_CHUNK_BYTES, CONTINUATION_DEADLINE_MS, CONTINUATION_FLAG_FINAL,
+    CONTINUATION_HEADER_BYTES, CONTINUATION_MAGIC, ContinuationError, MAX_LOGICAL_REQUEST_BYTES,
+    Reassembler, encode_request_frames, is_fragment,
+};
 pub use handlers::{
     DevtoolsHandler, Dispatcher, FocusPublish, GridPublish, HandlerError, InputEventPublish,
     MAX_DIGEST_RGBA_BYTES, ModifiersPublish, clear_introspection_for_tests, publish_focus,

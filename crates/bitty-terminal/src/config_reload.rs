@@ -32,7 +32,7 @@
 
 use std::cell::RefCell;
 use std::path::PathBuf;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use bitty_config::{EffectiveConfig, ReloadReport};
 
@@ -93,8 +93,35 @@ pub(crate) struct ReloadOutcomeInfo {
     pub(crate) applied: bool,
     /// Dotted paths that changed (the report's diff fields).
     pub(crate) changed: Vec<String>,
+    /// Changed live-class fields the running runtime has no adopter for yet;
+    /// they are recorded and take effect on the next start.
+    pub(crate) restart_required: Vec<String>,
     /// Detail for `load-error` / `apply-error`; `None` otherwise.
     pub(crate) message: Option<String>,
+}
+
+/// Whether the running runtime adopts `field` live through
+/// [`apply_live_presentation`]. Every other changed field, even when
+/// `bitty-config` classifies it `Live`, is reported under `restart_required`
+/// so a reply never claims an adoption that did not happen.
+fn runtime_adopts(field: &str) -> bool {
+    matches!(
+        field,
+        "font.size"
+            | "window.padding"
+            | "window.radius_px"
+            | "decoration.gaps_in"
+            | "decoration.gaps_out"
+            | "decoration.border"
+            | "decoration.radius"
+            | "decoration.content_inset"
+            | "decoration.border_color"
+            | "decoration.border_color_focused"
+            | "decoration.border_color_idle"
+            | "decoration.border_width"
+            | "decoration.border_width_focused"
+            | "decoration.border_width_idle"
+    ) || field.starts_with("appearance.animations")
 }
 
 /// The reload engine: pure policy driver over the last-applied config.
@@ -186,22 +213,37 @@ struct Stamp {
     len: u64,
 }
 
+/// Minimum time between two `stat` calls of the watched file.
+///
+/// The poll runs from the per-frame drive loop; stat-ing every frame would put
+/// filesystem latency (for example a network home directory) on the render
+/// path. Half a second keeps an edit visible almost immediately.
+pub(crate) const CONFIG_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
 /// Dependency-free poll watcher over one config path.
 ///
-/// Stat-ing the path each poll (rather than holding an open handle) means an
+/// Stat-ing the path (rather than holding an open handle) means an
 /// atomic-rename or symlink-retarget rewrite is observed as a change, and the
-/// watcher needs no event subscription. The cost is one `stat` per tick.
+/// watcher needs no event subscription. The cost is one `stat` per
+/// [`CONFIG_POLL_INTERVAL`]. An edit that keeps both the length and the
+/// filesystem's mtime granularity unchanged is not observed until the next
+/// differing write; `bitty ctl config reload` is the explicit path.
 #[derive(Debug)]
 pub(crate) struct ConfigFileWatcher {
     path: PathBuf,
     last: Option<Stamp>,
+    next_check: Instant,
 }
 
 impl ConfigFileWatcher {
     /// Start watching `path`, seeding the baseline from its current state.
     pub(crate) fn new(path: PathBuf) -> Self {
         let last = Self::stamp(&path);
-        Self { path, last }
+        Self {
+            path,
+            last,
+            next_check: Instant::now(),
+        }
     }
 
     fn stamp(path: &std::path::Path) -> Option<Stamp> {
@@ -212,10 +254,16 @@ impl ConfigFileWatcher {
         })
     }
 
-    /// True when the file changed since the previous poll. Creating, removing,
-    /// or rewriting the file all count; the baseline seeded by [`Self::new`]
-    /// means an unchanged file reports `false` on the first poll.
-    pub(crate) fn poll(&mut self) -> bool {
+    /// True when the file changed since the previous check. Creating,
+    /// removing, or rewriting the file all count; the baseline seeded by
+    /// [`Self::new`] means an unchanged file reports `false` on the first
+    /// check. Checks are throttled to [`CONFIG_POLL_INTERVAL`]: a call before
+    /// the next check time reports `false` without touching the filesystem.
+    pub(crate) fn poll_at(&mut self, at: Instant) -> bool {
+        if at < self.next_check {
+            return false;
+        }
+        self.next_check = at + CONFIG_POLL_INTERVAL;
         let now = Self::stamp(&self.path);
         let changed = now != self.last;
         self.last = now;
@@ -310,10 +358,16 @@ pub(crate) fn reload_requested(runtime: &mut bitty_runtime::Runtime) -> Option<R
 /// Poll the watched config file; when it changed, reload and adopt. Returns
 /// the outcome (for logging) only when a change was seen.
 pub(crate) fn poll_file(runtime: &mut bitty_runtime::Runtime) -> Option<ReloadOutcomeInfo> {
+    poll_file_at(runtime, Instant::now())
+}
+
+/// [`poll_file`] against an explicit clock (the watcher is throttled to
+/// [`CONFIG_POLL_INTERVAL`]).
+fn poll_file_at(runtime: &mut bitty_runtime::Runtime, at: Instant) -> Option<ReloadOutcomeInfo> {
     CONTEXT.with(|slot| {
         let mut slot = slot.borrow_mut();
         let ctx = slot.as_mut()?;
-        if !ctx.watcher.as_mut()?.poll() {
+        if !ctx.watcher.as_mut()?.poll_at(at) {
             return None;
         }
         let info = ctx.reload_into(runtime);
@@ -338,6 +392,7 @@ impl ReloadContext {
                     kind: "load-error",
                     applied: false,
                     changed: Vec::new(),
+                    restart_required: Vec::new(),
                     message: Some(message),
                 };
             }
@@ -348,27 +403,46 @@ impl ReloadContext {
         if matches!(outcome, ReloadOutcome::Applied(_)) {
             if let Err(message) = apply_live_presentation(runtime, self.engine.current()) {
                 // Keep engine and runtime consistent: a failed adopt must not
-                // leave the engine claiming the new config is live.
+                // leave the engine claiming the new config is live. Earlier
+                // setters may already have changed the runtime, so reapply the
+                // previous presentation first (CodeRabbit on #1516).
+                if let Err(restore) = apply_live_presentation(runtime, &previous) {
+                    crate::logging::warn(|| {
+                        format!("bitty: config reload rollback failed: {restore}")
+                    });
+                }
                 self.engine.replace_current(previous);
                 return ReloadOutcomeInfo {
                     path: self.path_label.clone(),
                     kind: "apply-error",
                     applied: false,
                     changed: Vec::new(),
+                    restart_required: Vec::new(),
                     message: Some(message),
                 };
             }
         }
+        let changed: Vec<String> = outcome
+            .report()
+            .diffs
+            .iter()
+            .map(|diff| diff.field.clone())
+            .collect();
+        let restart_required = if matches!(outcome, ReloadOutcome::Applied(_)) {
+            changed
+                .iter()
+                .filter(|field| !runtime_adopts(field))
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
         ReloadOutcomeInfo {
             path: self.path_label.clone(),
             kind: outcome.kind(),
             applied,
-            changed: outcome
-                .report()
-                .diffs
-                .iter()
-                .map(|diff| diff.field.clone())
-                .collect(),
+            changed,
+            restart_required,
             message: None,
         }
     }
@@ -403,6 +477,42 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir
+    }
+
+    #[test]
+    fn watcher_polls_at_most_once_per_interval() {
+        let dir = temp_dir("interval");
+        let path = dir.join("bitty.toml");
+        write_config(&path, 12.0);
+        let mut watcher = ConfigFileWatcher::new(path.clone());
+        let start = Instant::now();
+        assert!(!watcher.poll_at(start), "unchanged file");
+        write_config(&path, 13.25);
+        assert!(
+            !watcher.poll_at(start + CONFIG_POLL_INTERVAL / 2),
+            "no stat before the interval elapses"
+        );
+        assert!(
+            watcher.poll_at(start + CONFIG_POLL_INTERVAL),
+            "change seen at the next check"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn only_runtime_adopted_fields_are_reported_as_live() {
+        assert!(runtime_adopts("font.size"));
+        assert!(runtime_adopts("decoration.gaps_in"));
+        assert!(runtime_adopts("appearance.animations.duration_ms.open"));
+        for pending in [
+            "font.family",
+            "window.opacity",
+            "appearance.theme",
+            "decoration.background_image",
+            "keymaps",
+        ] {
+            assert!(!runtime_adopts(pending), "{pending} has no live adopter");
+        }
     }
 
     #[test]
@@ -447,18 +557,25 @@ mod tests {
     fn watcher_detects_create_modify_remove() {
         let dir = temp_dir("watch");
         let path = dir.join("config.toml");
-        // Start with no file: the baseline is "absent".
+        // Start with no file: the baseline is "absent". Each check advances
+        // the clock one poll interval so the throttle never masks a change.
         let mut watcher = ConfigFileWatcher::new(path.clone());
-        assert!(!watcher.poll(), "no change right after construction");
+        let mut at = Instant::now();
+        let mut poll = |watcher: &mut ConfigFileWatcher| {
+            let seen = watcher.poll_at(at);
+            at += CONFIG_POLL_INTERVAL;
+            seen
+        };
+        assert!(!poll(&mut watcher), "no change right after construction");
         write_config(&path, 12.0);
-        assert!(watcher.poll(), "file creation is a change");
-        assert!(!watcher.poll(), "no change when the file is untouched");
+        assert!(poll(&mut watcher), "file creation is a change");
+        assert!(!poll(&mut watcher), "no change when the file is untouched");
         // A rewrite with a different length changes the stamp even when the
         // mtime granularity is coarse.
         write_config(&path, 15.5);
-        assert!(watcher.poll(), "rewrite is a change");
+        assert!(poll(&mut watcher), "rewrite is a change");
         std::fs::remove_file(&path).expect("remove");
-        assert!(watcher.poll(), "removal is a change");
+        assert!(poll(&mut watcher), "removal is a change");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -537,10 +654,15 @@ mod tests {
         install_with(baseline, resolver, Some(path.clone()));
 
         let mut runtime = bitty_runtime::Runtime::with_defaults().expect("runtime");
-        assert!(poll_file(&mut runtime).is_none(), "no edit -> no reload");
-        // Rewrite with a new size; the poll must observe it and adopt.
+        let start = Instant::now();
+        assert!(
+            poll_file_at(&mut runtime, start).is_none(),
+            "no edit -> no reload"
+        );
+        // Rewrite with a new size; the next check must observe it and adopt.
         write_config(&path, 20.0);
-        let info = poll_file(&mut runtime).expect("change observed");
+        let info =
+            poll_file_at(&mut runtime, start + CONFIG_POLL_INTERVAL).expect("change observed");
         assert_eq!(info.kind, "applied");
         assert!((runtime.config().font_size - 20.0).abs() < f32::EPSILON);
         clear();

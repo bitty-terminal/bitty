@@ -664,7 +664,8 @@ pub fn apply_control(
 /// (CTX-0814, #1397). `reloaded` marks that the reload path ran;
 /// `applied` is false for a restart-required, rejected, load, or apply
 /// error, with `kind` naming which. `changed` lists the conflicting field
-/// paths when a classify-level report exists.
+/// paths when a classify-level report exists; `restart_required` lists the
+/// changed fields the runtime cannot adopt live yet.
 fn reload_config_json(info: &crate::config_reload::ReloadOutcomeInfo) -> String {
     let mut changed = String::new();
     for (index, field) in info.changed.iter().enumerate() {
@@ -675,17 +676,27 @@ fn reload_config_json(info: &crate::config_reload::ReloadOutcomeInfo) -> String 
         changed.push_str(&json_escape(field));
         changed.push('"');
     }
+    let mut restart_required = String::new();
+    for (index, field) in info.restart_required.iter().enumerate() {
+        if index > 0 {
+            restart_required.push(',');
+        }
+        restart_required.push('"');
+        restart_required.push_str(&json_escape(field));
+        restart_required.push('"');
+    }
     let message = info
         .message
         .as_ref()
         .map(|raw| format!(",\"message\":\"{}\"", json_escape(raw)))
         .unwrap_or_default();
     format!(
-        "{{\"reloaded\":true,\"applied\":{},\"kind\":\"{}\",\"path\":\"{}\",\"changed\":[{}]{message}}}",
+        "{{\"reloaded\":true,\"applied\":{},\"kind\":\"{}\",\"path\":\"{}\",\"changed\":[{}],\"restart_required\":[{}]{message}}}",
         info.applied,
         json_escape(info.kind),
         json_escape(&info.path),
         changed,
+        restart_required,
     )
 }
 

@@ -207,24 +207,6 @@ name = "bitty-agent"
 version = "0.0.21"
 
 [[package]]
-name = "bitty-app"
-version = "0.0.21"
-dependencies = [
- "bitty-config",
- "bitty-ipc",
- "bitty-perf",
- "bitty-platform",
- "bitty-plugin-host",
- "bitty-render",
- "bitty-rich",
- "bitty-runtime",
- "bitty-term-state",
- "bitty-test-support",
- "bitty-vt",
- "pollster",
-]
-
-[[package]]
 name = "bitty-compat-lab"
 version = "0.0.21"
 dependencies = [
@@ -442,6 +424,24 @@ version = "0.0.21"
 dependencies = [
  "bitty-vt",
  "proptest",
+]
+
+[[package]]
+name = "bitty-terminal"
+version = "0.0.21"
+dependencies = [
+ "bitty-config",
+ "bitty-ipc",
+ "bitty-perf",
+ "bitty-platform",
+ "bitty-plugin-host",
+ "bitty-render",
+ "bitty-rich",
+ "bitty-runtime",
+ "bitty-term-state",
+ "bitty-test-support",
+ "bitty-vt",
+ "pollster",
 ]
 
 [[package]]

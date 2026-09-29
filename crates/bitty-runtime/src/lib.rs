@@ -3,7 +3,7 @@
 //! This crate implements the runtime row of the Core Workspace Topology
 //! (ADR-0003: *Runtime orchestration: command/event/service/lifecycle
 //! wiring, cold-path event queue*; depends on all workspace crates except
-//! `bitty-app`). It owns the lifecycle of the PTY, VT parser, terminal
+//! `bitty-terminal`). It owns the lifecycle of the PTY, VT parser, terminal
 //! state, grid renderer, and GPU/software surface, and exposes a narrow
 //! owned API that never leaks upstream types (`portable-pty`, `vte`,
 //! `winit`, `wgpu`).
@@ -205,7 +205,7 @@ pub mod workspace;
 
 // Re-export present-path interaction types for the app composition root
 // (CTX-0723): the Leader/hint/composer/fold input path consumes these
-// without taking a direct `bitty-rich` dependency in `bitty-app`.
+// without taking a direct `bitty-rich` dependency in `bitty-terminal`.
 pub use bitty_rich::composer::{ComposerKey, ComposerKeyEvent};
 pub use bitty_rich::hints::{DispatchOutcome, HintFeedError, HintScope};
 pub use runtime::cw_live::HintLinkOpenError;

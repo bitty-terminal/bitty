@@ -168,7 +168,7 @@ jobs:
           RUSTFLAGS: "-D warnings"
         run: |
           bash scripts/tests/check-runtime-deps.test.sh
-          cargo build --locked -p bitty-app
+          cargo build --locked -p bitty-terminal
           bash scripts/check-runtime-deps.sh --binary target/debug/bitty --packagers deb,rpm,archlinux
 
       # 034 item 5 / CTX-0450: pin the install-smoke driver's distro leg

@@ -10,7 +10,7 @@
 //! `docs/specifications/performance-budget-rfc.md` PB-1..PB-7.
 //!
 //! CTX-0100 upgrade: the former `--help` proxy is replaced by
-//! instrumentation that covers the full `bitty-app` cold path:
+//! instrumentation that covers the full `bitty-terminal` cold path:
 //! process start → config → PTY spawn → winit window → wgpu init → font
 //! init → first shell bytes → first frame presented. Each phase is
 //! timestamped with `Instant` and bounded tracing; on headless CI the

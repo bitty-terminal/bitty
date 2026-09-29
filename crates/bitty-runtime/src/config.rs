@@ -23,8 +23,8 @@ pub const MAX_ANIMATION_DURATION_MS: u32 = 500;
 /// Default lines scrolled per wheel notch (CTX-0185).
 /// Mirrors `bitty-config` `DEFAULT_SCROLL_LINES_PER_NOTCH` (kept as a local
 /// constant because `bitty-runtime` must not depend on `bitty-config`;
-/// `bitty-app` maps the effective value across at startup and the two
-/// defaults must stay equal — covered by a cross-crate test in `bitty-app`).
+/// `bitty-terminal` maps the effective value across at startup and the two
+/// defaults must stay equal — covered by a cross-crate test in `bitty-terminal`).
 pub const DEFAULT_SCROLL_LINES_PER_NOTCH: u32 = 3;
 
 /// Maximum lines per wheel notch (matches the per-frame scroll cap).
@@ -42,7 +42,7 @@ pub const MAX_SCROLL_PIXELS_PER_NOTCH: u32 = 256;
 /// Mirrors `bitty_term_state::SCROLLBACK_DEFAULT_LINES` (kept as a re-export
 /// so runtime retention and terminal-state retention cannot drift) and the
 /// `bitty-config` `terminal.scrollback` default (`10 000`); the
-/// `bitty-app` mapping pins the pairing.
+/// `bitty-terminal` mapping pins the pairing.
 pub const DEFAULT_SCROLLBACK_LINES: usize = bitty_term_state::SCROLLBACK_DEFAULT_LINES;
 
 /// Hard maximum retained scrollback lines (CTX-0297).
@@ -56,24 +56,24 @@ pub const MAX_SCROLLBACK_LINES: usize = bitty_term_state::SCROLLBACK_MAX_LINES;
 /// Default selection auto-copy behavior (CTX-0191, CTX-0371).
 /// Mirrors `bitty-config` `DEFAULT_SELECTION_AUTO_COPY` (kept as a local
 /// constant because `bitty-runtime` must not depend on `bitty-config`;
-/// `bitty-app` maps the effective value across at startup and the two
-/// defaults must stay equal — covered by a cross-crate test in `bitty-app`).
+/// `bitty-terminal` maps the effective value across at startup and the two
+/// defaults must stay equal — covered by a cross-crate test in `bitty-terminal`).
 /// `false` matches kitty/ghostty: no implicit clipboard write on select.
 pub const DEFAULT_SELECTION_AUTO_COPY: bool = false;
 
 /// Default close-confirmation mode (CTX-0370): `when_busy`.
 /// Mirrors `bitty-config` `DEFAULT_CLOSE_CONFIRM` by value (kept as a local
 /// constant because `bitty-runtime` must not depend on `bitty-config`;
-/// `bitty-app` maps the effective value across at startup and the two
-/// defaults must stay equal — covered by a cross-crate test in `bitty-app`).
+/// `bitty-terminal` maps the effective value across at startup and the two
+/// defaults must stay equal — covered by a cross-crate test in `bitty-terminal`).
 pub const DEFAULT_CLOSE_CONFIRM_MODE: CloseConfirmMode = CloseConfirmMode::WhenBusy;
 
 /// Default cursor rendering shape (CTX-0756, issue #1359
 /// `terminal.cursor_style`): `Default` (the renderer's block fallback).
 /// Mirrors `bitty-config` `DEFAULT_CURSOR_STYLE` by value (kept as a local
 /// constant because `bitty-runtime` must not depend on `bitty-config`;
-/// `bitty-app` maps the effective value across at startup and the two
-/// defaults must stay equal — covered by a cross-crate test in `bitty-app`).
+/// `bitty-terminal` maps the effective value across at startup and the two
+/// defaults must stay equal — covered by a cross-crate test in `bitty-terminal`).
 pub const DEFAULT_CURSOR_STYLE: bitty_vt::CursorStyle = bitty_vt::CursorStyle::Default;
 
 /// Default user-visible bell behavior (CTX-0756, issue #1359
@@ -125,9 +125,9 @@ impl CloseConfirmMode {
 /// Default focus-follows-mouse behavior (CTX-0260).
 /// Mirrors `bitty-config` `DEFAULT_MOUSE_FOCUS_FOLLOWS_MOUSE` (kept as a
 /// local constant because `bitty-runtime` must not depend on
-/// `bitty-config`; `bitty-app` maps the effective value across at startup
+/// `bitty-config`; `bitty-terminal` maps the effective value across at startup
 /// and the two defaults must stay equal — covered by a cross-crate test in
-/// `bitty-app`). `false` preserves click-to-focus.
+/// `bitty-terminal`). `false` preserves click-to-focus.
 pub const DEFAULT_FOCUS_FOLLOWS_MOUSE: bool = false;
 
 /// Default hover-activation delay (CTX-0334).
@@ -149,7 +149,7 @@ pub const MAX_FOCUS_FOLLOWS_MOUSE_DELAY_MS: u32 = 2_000;
 
 /// Default inner panel gap in cells (CTX-0177).
 /// Mirrors `bitty-config` `DEFAULT_LAYOUT_GAPS_IN` (kept local for the same
-/// no-dependency reason; paired by value and pinned by a `bitty-app` test).
+/// no-dependency reason; paired by value and pinned by a `bitty-terminal` test).
 pub const DEFAULT_LAYOUT_GAPS_IN: u16 = 0;
 
 /// Default outer panel gap in cells (CTX-0177).
@@ -229,7 +229,7 @@ pub const DEFAULT_BACKGROUND_FIT: &str = "fill";
 /// (RFC-0001 AC-1, `3:1`). Mirrors
 /// `bitty-config` `MIN_OUTLINE_FOCUSED_BACKGROUND_CONTRAST`; `bitty-runtime`
 /// must not depend on `bitty-config`, so the parity is pinned by a
-/// cross-crate test in `bitty-app`.
+/// cross-crate test in `bitty-terminal`.
 pub const MIN_OUTLINE_FOCUSED_BACKGROUND_CONTRAST: f64 = 3.0;
 
 /// Minimum resolved focused-outline contrast against the idle outline when
@@ -496,8 +496,8 @@ pub(crate) fn decoration_runtime_error(err: bitty_ui::DecorationError) -> Runtim
 /// Default window padding in logical pixels (CTX-0223).
 /// Mirrors `bitty-config` `WindowConfig` default (`padding: 8`; kept as a
 /// local constant because `bitty-runtime` must not depend on `bitty-config`;
-/// `bitty-app` maps the effective value across at startup and the two
-/// defaults must stay equal — covered by a cross-crate test in `bitty-app`).
+/// `bitty-terminal` maps the effective value across at startup and the two
+/// defaults must stay equal — covered by a cross-crate test in `bitty-terminal`).
 pub const DEFAULT_WINDOW_PADDING: u32 = 8;
 
 /// Maximum window padding in logical pixels (CTX-0223).
@@ -508,8 +508,8 @@ pub const MAX_WINDOW_PADDING: u32 = 64;
 /// Default window corner radius in physical px (CTX-0241 S0).
 /// Mirrors `bitty-config` `DEFAULT_WINDOW_RADIUS_PX` (`0`; kept as a local
 /// constant because `bitty-runtime` must not depend on `bitty-config`;
-/// `bitty-app` maps the effective value across at startup and the two
-/// defaults must stay equal — covered by a cross-crate test in `bitty-app`).
+/// `bitty-terminal` maps the effective value across at startup and the two
+/// defaults must stay equal — covered by a cross-crate test in `bitty-terminal`).
 pub const DEFAULT_WINDOW_RADIUS_PX: u32 = 0;
 
 /// Maximum window corner radius in physical px (CTX-0241 S0).
@@ -519,8 +519,8 @@ pub const MAX_WINDOW_RADIUS_PX: u32 = 24;
 /// Default scrollbar thumb width in logical pixels (CTX-0181).
 /// Mirrors `bitty-config` `DEFAULT_SCROLLBAR_WIDTH` (kept as a local
 /// constant because `bitty-runtime` must not depend on `bitty-config`;
-/// `bitty-app` maps the effective value across at startup and the two
-/// defaults must stay equal — covered by a cross-crate test in `bitty-app`).
+/// `bitty-terminal` maps the effective value across at startup and the two
+/// defaults must stay equal — covered by a cross-crate test in `bitty-terminal`).
 pub const DEFAULT_SCROLLBAR_WIDTH: u32 = 8;
 
 /// Minimum scrollbar thumb width in logical pixels (CTX-0181).
@@ -675,7 +675,7 @@ pub struct RuntimeConfig {
     /// background (clear color), default foreground, cursor, selection, and
     /// the 16 ANSI colors.
     ///
-    /// `bitty-config` resolves the preset; `bitty-app` maps it onto this
+    /// `bitty-config` resolves the preset; `bitty-terminal` maps it onto this
     /// field; the runtime installs it on both the [`GridRenderer`] and the
     /// [`Surface`](bitty_render::gpu::Surface) so every default-path clear
     /// and cell color follows the selected preset. Defaults to the designed
@@ -687,7 +687,7 @@ pub struct RuntimeConfig {
     /// (CTX-0381).
     ///
     /// `false` (the default) marks a built-in fallback palette used by
-    /// headless/unit constructions; `bitty-app` sets `true` when it carries
+    /// headless/unit constructions; `bitty-terminal` sets `true` when it carries
     /// the preset resolved by `bitty-config`. OSC 10/11 queries are answered
     /// only when this is set, so no reply can precede theme resolution; the
     /// palette itself is never withheld from rendering.
@@ -1218,7 +1218,7 @@ impl RuntimeConfig {
     /// on creation, bind, or workspace move, so a previously inert
     /// `ws:`/`view:` entry that first matches never composes a violating
     /// pair. The WCAG math, compositing, and floors mirror `bitty-config`
-    /// (parity pinned by a cross-crate test in `bitty-app`).
+    /// (parity pinned by a cross-crate test in `bitty-terminal`).
     ///
     /// # Errors
     ///
@@ -1820,7 +1820,7 @@ mod tests {
     fn scrollbar_defaults_auto_and_validates_bounds() {
         // CTX-0362: the default is the geometry-neutral `auto` overlay
         // (transparent at rest); width bounds fail closed (mirrors
-        // `bitty-config` bounds, pinned in `bitty-app`).
+        // `bitty-config` bounds, pinned in `bitty-terminal`).
         const { assert!(DEFAULT_SCROLLBAR_WIDTH == 8) }
         const { assert!(MIN_SCROLLBAR_WIDTH_PX == 1) }
         const { assert!(MAX_SCROLLBAR_WIDTH_PX == 32) }
@@ -2077,7 +2077,7 @@ mod tests {
     #[test]
     fn window_padding_default_and_bounds() {
         // CTX-0223: default 8px mirrors `bitty-config` `WindowConfig`
-        // (pinned by value in `bitty-app`); bounds fail closed.
+        // (pinned by value in `bitty-terminal`); bounds fail closed.
         const { assert!(DEFAULT_WINDOW_PADDING == 8) }
         const { assert!(MAX_WINDOW_PADDING == 64) }
         let cfg = RuntimeConfig::default();

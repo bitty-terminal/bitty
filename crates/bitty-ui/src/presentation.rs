@@ -4,7 +4,7 @@
 //!
 //! - tiled tree: [`PresentationMode::Tiled`] leaves participate in the
 //!   [`LayoutNode`](crate::layout::LayoutNode) solver directly (status quo).
-//! - app-level zoom (`zoom_backup` backup/restore in `bitty-app`): conceptually
+//! - app-level zoom (`zoom_backup` backup/restore in `bitty-terminal`): conceptually
 //!   [`PresentationMode::Fullscreen`] full-bleed base. The existing
 //!   backup/restore mechanics are reused as-is; this crate adds no second
 //!   zoom path.

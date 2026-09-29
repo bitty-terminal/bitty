@@ -4,7 +4,7 @@
 #         PB-3 typical ≤250 MB 8-tab 4 h + reclaim within 15 % after close+GC
 #         (docs/specifications/performance-budget-rfc.md#pb-2, #pb-3)
 # Scope: Phase F baseline harness (CTX-0076). Headless bounded check: samples
-# the current process RSS and the `cargo run -p bitty-app --help` child RSS
+# the current process RSS and the `cargo run -p bitty-terminal --help` child RSS
 # via `ps -o rss=` (KiB) and `/proc/<pid>/status` when available, without
 # opening a window. Real 8-tab 4 h growth is measured on a Tier 1 reference
 # machine with a display server; this script proves plumbing and enforces the
@@ -79,14 +79,14 @@ main() {
 	fi
 
 	# Build check only; do not require release binary.
-	# Spawn a headless `cargo run --release -p bitty-app -- --help` and poll once.
+	# Spawn a headless `cargo run --release -p bitty-terminal -- --help` and poll once.
 	# `timeout` bounds it; `cargo` itself is heavier than the binary, so the
 	# measurement is an upper bound and is reported as such.
-	echo "spawn: cargo run -p bitty-app -- --help (headless fallback, bounded)"
+	echo "spawn: cargo run -p bitty-terminal -- --help (headless fallback, bounded)"
 	# Use a coprocess with timeout; sample its pid quickly.
 	# shellcheck disable=SC2094 # intentional
 	{
-		timeout "${TIMEOUT_SECS}" cargo run --release -p bitty-app -- --help >/dev/null 2>&1 &
+		timeout "${TIMEOUT_SECS}" cargo run --release -p bitty-terminal -- --help >/dev/null 2>&1 &
 		child_pid=$!
 		sleep 0.2
 		if kill -0 "${child_pid}" 2>/dev/null; then
@@ -115,7 +115,7 @@ main() {
 					echo "binary exited before rss sample (fast --help); treat as PASS for headless plumbing"
 				fi
 			else
-				echo "no release binary; headless plumbing OK (run cargo build --release -p bitty-app for direct rss)"
+				echo "no release binary; headless plumbing OK (run cargo build --release -p bitty-terminal for direct rss)"
 			fi
 		fi
 	} 2>/dev/null || true
@@ -125,7 +125,7 @@ main() {
 	echo "PB-3 reclaim proxy: 5× headless --help in a loop (no monotonic growth check)"
 	prev_kb=""
 	for i in $(seq 1 5); do
-		timeout 1 cargo run --release -p bitty-app -- --help >/dev/null 2>&1 || true
+		timeout 1 cargo run --release -p bitty-terminal -- --help >/dev/null 2>&1 || true
 		cur_kb="$(rss_kb_for_pid "$$")"
 		if [ -n "${prev_kb}" ] && [ "${cur_kb}" -gt 0 ] && [ "${prev_kb}" -gt 0 ]; then
 			# 15% reclaim band check on shell self RSS (proxy, not product RSS).

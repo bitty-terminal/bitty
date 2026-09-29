@@ -62,7 +62,7 @@ impl LogLevel {
 /// Derives a [`LogLevel`] from a `BITTY_LOG`/`RUST_LOG`-style value.
 ///
 /// Accepts bare levels (`debug`, `trace`, ...) and `RUST_LOG`-style
-/// comma-separated directives (`bitty=debug`, `info,bitty-app=trace`,
+/// comma-separated directives (`bitty=debug`, `info,bitty-terminal=trace`,
 /// `warn`). Each directive is `[target=]level`: a level only counts when it
 /// parses exactly, so a target name that merely contains a level word
 /// (`mydebug=warn`, CTX-0482) never flips the gate. Bare levels set the

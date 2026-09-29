@@ -58,10 +58,20 @@ fn temp_dir(tag: &str) -> PathBuf {
     dir
 }
 
-fn runtime(third_party_roots: Vec<PathBuf>, data_dir: PathBuf) -> PluginRuntime {
+/// Runtime under test, with in-memory plugin stores.
+///
+/// These tests cover service routing, schemas, and lifecycle, not store
+/// persistence. With a disk-backed store, the provider's `bitty.store.set`
+/// inside a cross-VM call does an atomic temp-then-rename write; on a Windows
+/// CI runner with filesystem scanning that write alone can exceed the 50 ms
+/// RC-1 cheap-call budget, so the consumer saw the `-1` error sentinel
+/// (CTX-0854). An in-memory store keeps the property under test independent
+/// of runner filesystem latency; the disk-latency interaction itself is
+/// tracked as bitty #1518, not hidden by retries here.
+fn runtime(third_party_roots: Vec<PathBuf>) -> PluginRuntime {
     PluginRuntime::new(PluginRuntimeConfig {
         safe_mode: false,
-        data_dir: Some(data_dir),
+        data_dir: None,
         store_root: None,
         bundled_roots: Vec::new(),
         third_party_roots,
@@ -216,8 +226,6 @@ fn store_int(rt: &PluginRuntime, id: &PluginId, key: &str) -> Option<i64> {
 
 fn setup(tag: &str) -> (PluginRuntime, PathBuf) {
     let root = temp_dir(tag);
-    let data = root.join("data");
-    std::fs::create_dir_all(&data).expect("data dir");
     let third = root.join("third");
     write_service_plugin(
         &third,
@@ -240,7 +248,7 @@ fn setup(tag: &str) -> (PluginRuntime, PathBuf) {
         &["xuepoo.shop:total"],
         SHOP_INIT,
     );
-    let rt = runtime(vec![third], data.clone());
+    let rt = runtime(vec![third]);
     (rt, root)
 }
 
@@ -352,8 +360,6 @@ fn suspend_resume_dispose_fail_closed_with_gone() {
 #[test]
 fn optional_missing_resolves_nil_while_provider_suspended() {
     let root = temp_dir("optional");
-    let data = root.join("data");
-    std::fs::create_dir_all(&data).expect("data dir");
     let third = root.join("third");
     write_service_plugin(
         &third,
@@ -378,7 +384,7 @@ bitty.store.set("is_nil", handle == nil)
 return {}
 "#,
     );
-    let mut rt = runtime(vec![third], data);
+    let mut rt = runtime(vec![third]);
     rt.discover();
     rt.activate(&calc_id()).expect("provider activates");
     rt.suspend(&calc_id()).expect("suspend");
@@ -399,8 +405,6 @@ return {}
 #[test]
 fn undeclared_provide_fails_activation() {
     let root = temp_dir("undeclared");
-    let data = root.join("data");
-    std::fs::create_dir_all(&data).expect("data dir");
     let third = root.join("third");
     write_service_plugin(
         &third,
@@ -417,7 +421,7 @@ bitty.services.provide("calc.add", { add = function(args) return args end })
 return {}
 "#,
     );
-    let mut rt = runtime(vec![third], data);
+    let mut rt = runtime(vec![third]);
     rt.discover();
     let rogue_id = PluginId::new("xuepoo.rogue").expect("id");
     assert!(
@@ -435,8 +439,6 @@ return {}
 #[test]
 fn unsatisfiable_requirement_resolves_to_error() {
     let root = temp_dir("unsat");
-    let data = root.join("data");
-    std::fs::create_dir_all(&data).expect("data dir");
     let third = root.join("third");
     write_service_plugin(
         &third,
@@ -466,7 +468,7 @@ bitty.store.set("opt_nil", opt == nil)
 return {}
 "#,
     );
-    let mut rt = runtime(vec![third], data);
+    let mut rt = runtime(vec![third]);
     rt.discover();
     rt.activate(&calc_id()).expect("provider activates");
     let picky_id = PluginId::new("xuepoo.picky").expect("id");

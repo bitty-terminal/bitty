@@ -22,7 +22,7 @@ use std::process::exit;
 
 use bitty_perf::real_window::BaselineMeta;
 use bitty_perf::throughput_floor::{
-    ROUNDS, SAMPLE_BYTES, THROUGHPUT_FLOOR_BASELINE_REL_PATH, baseline_json, measure,
+    CHUNK_BYTES, ROUNDS, SAMPLE_BYTES, THROUGHPUT_FLOOR_BASELINE_REL_PATH, baseline_json, measure,
 };
 
 fn main() {
@@ -43,7 +43,16 @@ fn main() {
         bitty_perf::PB6_THROUGHPUT_MB_S,
     );
 
-    let report = match measure(SAMPLE_BYTES, ROUNDS) {
+    // `cargo test --benches` runs this unoptimized as a smoke check; only
+    // `cargo bench` measures the full corpus (CTX-0854).
+    let invocation = bitty_perf::BenchInvocation::current();
+    if invocation == bitty_perf::BenchInvocation::Smoke && write_baseline.is_some() {
+        eprintln!("throughput_floor: --write-baseline requires `cargo bench`");
+        exit(2);
+    }
+    let sample_bytes = invocation.workload(SAMPLE_BYTES, CHUNK_BYTES);
+    let rounds = invocation.workload(ROUNDS, 1);
+    let report = match measure(sample_bytes, rounds) {
         Ok(report) => report,
         Err(err) => {
             eprintln!("throughput_floor: measurement failed: {err}");

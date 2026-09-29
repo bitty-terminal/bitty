@@ -41,4 +41,6 @@ bitty-network-lua = { git = "https://github.com/bitty-terminal/bitty-network", r
 [dev-dependencies]
 bitty-agent = { path = "../bitty-agent" }
 bitty-config = { path = "../bitty-config" }
+# Hermetic `ServeContext` constructors and unbound bearer minters (#1519).
+bitty-ipc = { path = "../bitty-ipc", features = ["test-support"] }
 bitty-test-support = { path = "../bitty-test-support" }

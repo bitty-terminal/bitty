@@ -109,6 +109,13 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # #1519 / CTX-0855: hermetic `test-support` entry points (bitty-ipc's
+      # authority-less ServeContext constructors and unbound bearer minters)
+      # may be enabled only from dev-dependencies. Clippy above always builds
+      # the dev graph, so this resolves the production feature graph instead.
+      - name: Check test-support feature gate
+        run: bash scripts/check-test-support-gate.sh
+
       # CTX-0847: cargo-nextest isolates every test in its own process, caps
       # the real-process `live-pty` group so system suites cannot starve each
       # other on small runners, bounds each test with a timeout, and reports

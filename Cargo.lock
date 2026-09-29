@@ -234,6 +234,7 @@ version = "0.0.21"
 name = "bitty-ipc"
 version = "0.0.21"
 dependencies = [
+ "bitty-ipc",
  "getrandom 0.4.3",
  "nix",
  "rustix 1.1.5",

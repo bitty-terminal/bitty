@@ -13,6 +13,16 @@ publish = true
 [lints]
 workspace = true
 
+[features]
+# Hermetic test entry points (#1519, CORE-RUN-017): the authority-less
+# `ServeContext::with_granted` / `with_granted_session` constructors and the
+# context-free `issue_automation_bearer` / `issue_automation_bearer_with_ttl`
+# minters. None of them can authorize a live, authority-bound connection, but
+# production code must not link them at all. Enable this feature only from
+# `[dev-dependencies]`; `just test-support-gate` fails the build when a normal
+# dependency edge of the `bitty` binary turns it on.
+test-support = []
+
 [dependencies]
 # 128-bit automation bearer tokens (CTX-0792, #1403). A
 # bearer is the authority token for automation synthesize, capture, and
@@ -23,7 +33,9 @@ workspace = true
 # this edge adds no new supply-chain surface. One CSPRNG for the whole tree
 # keeps token entropy auditable in a single place, and there is no weaker
 # fallback: a platform that cannot produce unpredictable bytes fails issuance
-# closed. See `fill_secure_random` in src/devtools/automation.rs.
+# closed. See `fill_secure_random` in src/devtools/automation.rs. Until the
+# consent gesture lands (#1520) every minter is `test-support` only, so a
+# production build links this crate without calling it.
 getrandom = "0.4"
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
@@ -31,3 +43,8 @@ rustix = { workspace = true, features = ["fs", "net", "process", "std"] }
 
 [target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly"))'.dependencies]
 nix = { workspace = true, features = ["fs", "socket", "user"] }
+
+[dev-dependencies]
+# Self edge: the crate's own `tests/` use the hermetic entry points above.
+# Path-only dev-dependencies are stripped from the published manifest.
+bitty-ipc = { path = ".", features = ["test-support"] }

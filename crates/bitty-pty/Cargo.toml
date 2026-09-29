@@ -16,5 +16,15 @@ workspace = true
 [dependencies]
 portable-pty = "0.9"
 
+# CTX-0512: the owned-process-tree boundary (`tree` module). Same workspace
+# pins and platform split as `bitty-ipc`/`bitty-runtime` (no new crates);
+# both wrap the process-group, pidfd, and kqueue system calls safely, so the
+# crate stays `forbid(unsafe_code)`.
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+rustix = { workspace = true, features = ["process", "std"] }
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+nix = { workspace = true, features = ["event", "process", "signal"] }
+
 [dev-dependencies]
 bitty-test-support = { path = "../bitty-test-support" }

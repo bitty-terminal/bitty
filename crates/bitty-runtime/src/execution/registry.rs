@@ -6,34 +6,41 @@
 //! [`JobId`] as soon as the job is tracked, and completion is published as
 //! [`JobEvent`]s.
 //!
-//! Supervisor threads own their child handle; cancellation is a flag the
-//! thread observes (no shared `Child` behind a lock, no cross-thread kill
-//! races). Terminating a job kills the direct child only — owned-process-tree
-//! kill and typed cancel outcomes are CTX-0512.
+//! Supervisor threads own their child handle; a cancel is a typed request
+//! the thread takes and executes (no shared `Child` behind a lock, no
+//! cross-thread kill races). Terminating a job kills its owned process tree
+//! where a backend exists ([`bitty_pty::OwnedTree`]) and reports
+//! [`KillScope::DirectChild`] where none does (CTX-0512).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::Read;
 use std::process::Child;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bitty_ipc::execution::EnvPolicy;
 use bitty_plugin_host::roles::{AgentRole, SandboxDecl};
-use bitty_pty::{Pty, PtyBuilder, PtyReader};
+use bitty_pty::{LeaderExit, OwnedTree, Pty, PtyBuilder, PtyReader, TreeSignal};
 
 use super::closed_pipe_command;
 use super::command_risk::{OperationIntent, RiskVerdict, classify_argv};
 use super::delivery::{DeliveryLog, DeliveryState, EventReplay};
 use super::model::{
     AttachReceipt, JobCancel, JobError, JobEvent, JobGrant, JobId, JobIo, JobOperation,
-    JobPrincipal, JobSignal, JobSnapshot, JobSpec, JobState, JobStop, MAX_GRANTS_PER_JOB,
+    JobPrincipal, JobSignal, JobSnapshot, JobSpec, JobState, MAX_GRANTS_PER_JOB,
     MAX_SIGNAL_WINDOW_MS, MAX_SIGNALS_PER_WINDOW, MAX_WRITE_INPUT_BYTES, MAX_WRITE_INPUT_WINDOW_MS,
     MAX_WRITES_PER_WINDOW, SignalOutcome, TransferReceipt,
 };
+use super::oom::OomVerdict;
+use super::outcome::{
+    CancelEffect, CancelMode, CancelOutcome, CancelReceipt, CancelRequest, DeadlineClock,
+    ExecutionGeneration, ExecutionHandle, ExecutionOutcome, ExitObservation,
+};
 use super::output::{OutputIndex, OutputSink, OutputStream, OutputView, ReadOutput};
+use super::process_tree::KillScope;
 use super::sensitive_input::{EchoState, InteractionClass, automated_input_allowed};
 
 /// Default registry capacity.
@@ -190,11 +197,18 @@ impl JobRegistry {
                 });
             }
             let id = inner.allocate_id()?;
+            let generation = inner.generation_for(id);
             let control = Arc::new(JobControl::new());
             let output = OutputSink::default();
             inner.jobs.insert(
                 id,
-                JobRecord::unowned(id, spec.clone(), Arc::clone(&control), output.clone()),
+                JobRecord::unowned(
+                    id,
+                    generation,
+                    spec.clone(),
+                    Arc::clone(&control),
+                    output.clone(),
+                ),
             );
             (id, control, output)
         };
@@ -237,12 +251,13 @@ impl JobRegistry {
             .collect()
     }
 
-    /// Requests job termination.
+    /// Requests immediate job termination (legacy ambient path).
     ///
-    /// The request is recorded and the supervisor terminates the job's
-    /// direct child and publishes `Stopped`; this returns as soon as the
-    /// request is recorded, never after the process is gone. Typed cancel
-    /// modes/grace periods and cancel outcomes are CTX-0512.
+    /// Records a [`CancelMode::Immediate`] request for the job's current
+    /// generation: the supervisor kills the owned tree, publishes
+    /// `CancelResolved`, then `Stopped`. This returns as soon as the request
+    /// is recorded, never after the process is gone. Callers holding a
+    /// handle use [`JobRegistry::cancel_typed`] instead.
     ///
     /// # Errors
     ///
@@ -250,11 +265,26 @@ impl JobRegistry {
     pub fn cancel(&self, id: JobId) -> Result<JobCancel, JobError> {
         let inner = lock_inner(&self.shared);
         let record = inner.jobs.get(&id).ok_or(JobError::UnknownJob(id))?;
-        if let JobState::Done(stop) = record.state {
-            return Ok(JobCancel::AlreadyStopped(stop));
-        }
-        record.control.cancel.store(true, Ordering::Release);
-        Ok(JobCancel::Requested)
+        Ok(record.legacy_cancel())
+    }
+
+    /// Submits a typed cancel request (ambient host authority, like
+    /// [`JobRegistry::cancel`]).
+    ///
+    /// The host checks the handle's generation itself: a stale generation is
+    /// answered with [`CancelOutcome::StaleGeneration`] and nothing changes;
+    /// a terminal job answers [`CancelOutcome::AlreadyExited`]. Otherwise
+    /// the request is accepted and the supervisor publishes exactly one
+    /// `JobEvent::CancelResolved` with the typed result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobError::UnknownJob`] when the handle's id is not tracked.
+    pub fn cancel_typed(&self, request: CancelRequest) -> Result<CancelReceipt, JobError> {
+        let id = request.handle().id;
+        let inner = lock_inner(&self.shared);
+        let record = inner.jobs.get(&id).ok_or(JobError::UnknownJob(id))?;
+        Ok(record.typed_cancel(request))
     }
 
     // ── capability-scoped operations (CTX-0514) ─────────────────────────────
@@ -414,12 +444,14 @@ impl JobRegistry {
                 });
             }
             let id = inner.allocate_id()?;
+            let generation = inner.generation_for(id);
             let control = Arc::new(JobControl::new());
             let output = OutputSink::default();
             inner.jobs.insert(
                 id,
                 JobRecord::owned(
                     id,
+                    generation,
                     spec.clone(),
                     Arc::clone(&control),
                     output.clone(),
@@ -493,11 +525,30 @@ impl JobRegistry {
         let record = inner.jobs.get(&id);
         authorize_strict(&inner, principal, record, id, JobOperation::Cancel)?;
         let record = record.ok_or(JobError::UnknownJob(id))?;
-        if let JobState::Done(stop) = record.state {
-            return Ok(JobCancel::AlreadyStopped(stop));
-        }
-        record.control.cancel.store(true, Ordering::Release);
-        Ok(JobCancel::Requested)
+        Ok(record.legacy_cancel())
+    }
+
+    /// Submits a typed cancel request under the principal's `cancel` grant.
+    ///
+    /// Enforcement order: existence and authorization first (an unauthorized
+    /// caller learns nothing, not even whether its generation is stale), then
+    /// the host's generation check, then the terminal check — exactly like
+    /// [`JobRegistry::cancel_typed`] afterwards.
+    ///
+    /// # Errors
+    ///
+    /// Same denial set as [`JobRegistry::cancel_as`].
+    pub fn cancel_typed_as(
+        &self,
+        principal: &JobPrincipal,
+        request: CancelRequest,
+    ) -> Result<CancelReceipt, JobError> {
+        let id = request.handle().id;
+        let inner = lock_inner(&self.shared);
+        let record = inner.jobs.get(&id);
+        authorize_strict(&inner, principal, record, id, JobOperation::Cancel)?;
+        let record = record.ok_or(JobError::UnknownJob(id))?;
+        Ok(record.typed_cancel(request))
     }
 
     /// Reads retained output of one tracked job as `principal` (CTX-0513
@@ -720,30 +771,51 @@ impl JobRegistry {
         id: JobId,
         signal: JobSignal,
     ) -> Result<SignalOutcome, JobError> {
-        let _ = signal;
-        let mut inner = lock_inner(&self.shared);
-        let authorized = inner
-            .jobs
-            .get(&id)
-            .is_some_and(|record| record.authorized(principal, JobOperation::Signal));
-        if !authorized {
-            return Err(JobError::denied(
-                JobOperation::Signal,
-                "caller holds no grant for this operation",
-            ));
+        let tree = {
+            let mut inner = lock_inner(&self.shared);
+            let authorized = inner
+                .jobs
+                .get(&id)
+                .is_some_and(|record| record.authorized(principal, JobOperation::Signal));
+            if !authorized {
+                return Err(JobError::denied(
+                    JobOperation::Signal,
+                    "caller holds no grant for this operation",
+                ));
+            }
+            let record = inner.jobs.get_mut(&id).ok_or(JobError::UnknownJob(id))?;
+            if let JobState::Done(outcome) = record.state {
+                return Ok(SignalOutcome::AlreadyStopped(outcome));
+            }
+            if !record.signal_budget.check() {
+                return Err(JobError::signal_rate_limited(format!(
+                    "signal budget of {MAX_SIGNALS_PER_WINDOW} calls per {MAX_SIGNAL_WINDOW_MS} ms spent"
+                )));
+            }
+            record.tree.clone().ok_or_else(|| {
+                JobError::unsupported(
+                    "no owned tree for this job (not started, or no backend on this \
+                     platform); a signal is never sent to a single pid",
+                )
+            })?
+        };
+        // Delivered outside the registry lock; the tree's own lock keeps the
+        // signal from racing the leader's reap.
+        let signal = match signal {
+            JobSignal::Interrupt => TreeSignal::Interrupt,
+            JobSignal::Terminate => TreeSignal::Terminate,
+            JobSignal::Kill => TreeSignal::Kill,
+        };
+        match tree.signal(signal) {
+            Ok(()) => Ok(SignalOutcome::Delivered),
+            Err(error) => match error.kind() {
+                std::io::ErrorKind::NotFound => Ok(SignalOutcome::Gone),
+                std::io::ErrorKind::PermissionDenied => Ok(SignalOutcome::PermissionDenied),
+                _ => Err(JobError::Unavailable {
+                    reason: format!("signal delivery failed: {error}"),
+                }),
+            },
         }
-        let record = inner.jobs.get_mut(&id).ok_or(JobError::UnknownJob(id))?;
-        if let JobState::Done(stop) = record.state {
-            return Ok(SignalOutcome::AlreadyStopped(stop));
-        }
-        if !record.signal_budget.check() {
-            return Err(JobError::signal_rate_limited(format!(
-                "signal budget of {MAX_SIGNALS_PER_WINDOW} calls per {MAX_SIGNAL_WINDOW_MS} ms spent"
-            )));
-        }
-        Err(JobError::unsupported(
-            "live-job signal delivery is the CTX-0512 typed-signal mechanism; intent recorded",
-        ))
     }
 
     /// Subscribes `principal` to a live job's event cursor.
@@ -1221,6 +1293,22 @@ fn spawn_worker(
 }
 
 impl RegistryInner {
+    /// Mints the execution generation for a freshly allocated `id`.
+    ///
+    /// Random per spawn (the std hasher's OS-seeded keys mixed with the id
+    /// and the clock), so a handle minted by another registry, another
+    /// process, or before a restart never matches a job here even when the
+    /// ids coincide. Stored on the record: it never changes for a job.
+    fn generation_for(&self, id: JobId) -> ExecutionGeneration {
+        use std::hash::{BuildHasher as _, Hasher as _};
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u64(id.get());
+        hasher.write_u64(now_ms());
+        ExecutionGeneration::from_nonzero(
+            std::num::NonZeroU64::new(hasher.finish()).unwrap_or(std::num::NonZeroU64::MIN),
+        )
+    }
+
     /// Issues the next id. Ids start at 1 and are never reused.
     fn allocate_id(&mut self) -> Result<JobId, JobError> {
         let id = JobId::from_raw(self.next_id).ok_or_else(id_space_exhausted)?;
@@ -1251,12 +1339,20 @@ fn id_space_exhausted() -> JobError {
 
 struct JobRecord {
     id: JobId,
+    /// Execution generation minted at spawn (the host's handle fence).
+    generation: ExecutionGeneration,
     spec: JobSpec,
     state: JobState,
     started_at_ms: Option<u64>,
     finished_at_ms: Option<u64>,
     control: Arc<JobControl>,
     output: OutputSink,
+    /// The adopted owned tree while the job runs (published by the
+    /// supervisor at start, cleared at the terminal event); `signal_as`
+    /// delivers through it.
+    tree: Option<Arc<OwnedTree>>,
+    /// What a kill reaches for this job (reported on every snapshot).
+    kill_scope: KillScope,
     /// Owning principal: assigned once at spawn, moves only via `transfer`.
     /// Ownership confers every operation implicitly (never a table entry).
     /// `None` marks a legacy phase-1 record (spawned through [`JobRegistry::spawn`]):
@@ -1291,6 +1387,7 @@ impl JobRecord {
     /// Owned record: `owner` holds the full operation set implicitly.
     fn owned(
         id: JobId,
+        generation: ExecutionGeneration,
         spec: JobSpec,
         control: Arc<JobControl>,
         output: OutputSink,
@@ -1298,12 +1395,15 @@ impl JobRecord {
     ) -> Self {
         Self {
             id,
+            generation,
             spec,
             state: JobState::Queued,
             started_at_ms: None,
             finished_at_ms: None,
             control,
             output,
+            tree: None,
+            kill_scope: KillScope::DirectChild,
             owner: Some(owner),
             grants: BTreeSet::new(),
             write_budget: RateBudget::new(
@@ -1324,15 +1424,24 @@ impl JobRecord {
     /// keeps working. Scoped `*_as` calls deny on these records (there is
     /// no owner to authorize against), which keeps the two APIs from
     /// conferring authority on each other.
-    fn unowned(id: JobId, spec: JobSpec, control: Arc<JobControl>, output: OutputSink) -> Self {
+    fn unowned(
+        id: JobId,
+        generation: ExecutionGeneration,
+        spec: JobSpec,
+        control: Arc<JobControl>,
+        output: OutputSink,
+    ) -> Self {
         Self {
             id,
+            generation,
             spec,
             state: JobState::Queued,
             started_at_ms: None,
             finished_at_ms: None,
             control,
             output,
+            tree: None,
+            kill_scope: KillScope::DirectChild,
             owner: None,
             grants: BTreeSet::new(),
             write_budget: RateBudget::new(
@@ -1347,6 +1456,37 @@ impl JobRecord {
             echo: EchoState::EchoOn,
             interaction: InteractionClass::SafeInteractive,
         }
+    }
+
+    /// Host handle for this execution.
+    fn handle(&self) -> ExecutionHandle {
+        ExecutionHandle {
+            id: self.id,
+            generation: self.generation,
+        }
+    }
+
+    /// Legacy cancel: an immediate request for the current generation.
+    fn legacy_cancel(&self) -> JobCancel {
+        if let JobState::Done(outcome) = self.state {
+            return JobCancel::AlreadyStopped(outcome);
+        }
+        self.control
+            .request_cancel(CancelRequest::immediate(self.handle()));
+        JobCancel::Requested
+    }
+
+    /// Typed cancel after authorization: generation fence, then the
+    /// terminal check, then acceptance.
+    fn typed_cancel(&self, request: CancelRequest) -> CancelReceipt {
+        if request.handle().generation != self.generation {
+            return CancelReceipt::Resolved(CancelOutcome::StaleGeneration);
+        }
+        if self.state.is_terminal() {
+            return CancelReceipt::Resolved(CancelOutcome::AlreadyExited);
+        }
+        self.control.request_cancel(request);
+        CancelReceipt::Accepted
     }
 
     fn authorized(&self, principal: &JobPrincipal, operation: JobOperation) -> bool {
@@ -1428,6 +1568,8 @@ impl JobRecord {
             started_at_ms: self.started_at_ms,
             finished_at_ms: self.finished_at_ms,
             output: self.output.index(),
+            generation: self.generation,
+            kill_scope: self.kill_scope,
         }
     }
 }
@@ -1435,20 +1577,38 @@ impl JobRecord {
 /// Shared control surface between the registry and one supervisor thread.
 #[derive(Debug)]
 struct JobControl {
-    cancel: AtomicBool,
+    /// The strongest pending cancel request; the supervisor takes it.
+    cancel: Mutex<Option<CancelRequest>>,
     clock: Arc<ActivityClock>,
 }
 
 impl JobControl {
     fn new() -> Self {
         Self {
-            cancel: AtomicBool::new(false),
+            cancel: Mutex::new(None),
             clock: Arc::new(ActivityClock::new()),
         }
     }
 
-    fn cancel_requested(&self) -> bool {
-        self.cancel.load(Ordering::Acquire)
+    /// Records `request`, coalescing with a pending one: the higher-ranked
+    /// mode wins, and on a tie the newer request (its grace) replaces the
+    /// older. The supervisor answers every coalesced request with the one
+    /// `CancelResolved` it publishes.
+    fn request_cancel(&self, request: CancelRequest) {
+        let mut pending = self.cancel.lock().unwrap_or_else(PoisonError::into_inner);
+        let keep = match *pending {
+            Some(current) if current.mode().rank() > request.mode().rank() => current,
+            _ => request,
+        };
+        *pending = Some(keep);
+    }
+
+    /// Takes the pending request, if any.
+    fn take_cancel(&self) -> Option<CancelRequest> {
+        self.cancel
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
     }
 }
 
@@ -1507,8 +1667,13 @@ fn supervise(
         id,
         at_ms: now_ms(),
     });
-    if control.cancel_requested() {
-        finish(&shared, id, JobStop::Cancelled);
+    if control.take_cancel().is_some() {
+        resolve_cancel(&shared, id, CancelOutcome::CancelledBeforeStart);
+        finish(
+            &shared,
+            id,
+            ExecutionOutcome::Cancelled(CancelEffect::BeforeStart),
+        );
         return;
     }
     // The stdin channel is published before the backend starts so a racing
@@ -1529,18 +1694,16 @@ fn supervise(
             // crash: the caller keeps a job id to observe. A start that got
             // as far as a child process already killed and reaped it, so
             // no live job is ever left without its drains (CORE-RUN-005).
-            finish(&shared, id, JobStop::SpawnFailed);
+            finish(&shared, id, ExecutionOutcome::SpawnFailed);
             return;
         }
     };
-    mark_running(&shared, id);
-    let stop = watch(&spec, &mut backend, &control);
-    backend.terminate();
-    // The terminal state is published before the detached drain threads
-    // finish feeding the store (pipes hold buffered bytes after the process
-    // is gone); output quiescence is a read-side concern, and waits must
-    // never block a supervisor thread on a drain.
-    finish(&shared, id, stop);
+    mark_running(&shared, id, backend.tree());
+    let outcome = watch(&shared, id, &spec, &mut backend, &control);
+    // The terminal state is published after the reap and the time-boxed
+    // drain join: the output store is quiescent unless a member escaped
+    // the owned tree and still holds a pipe.
+    finish(&shared, id, outcome);
 }
 
 /// Returns the shared stdin-writer slot for `id` when the job is interactive.
@@ -1555,56 +1718,197 @@ fn stdin_slot_handle(shared: &Shared, id: JobId) -> Option<Arc<Mutex<Option<PtyS
     (record.spec.io == JobIo::Pty).then(|| Arc::clone(&record.pty_stdin))
 }
 
-/// Observes exit, cancel, and deadlines until the job terminates.
+/// Observes exit, cancel, and deadlines until the job terminates, and
+/// returns its authoritative outcome.
 ///
-/// Checks the child first (a process that already exited is `Exited`, never
-/// `Cancelled`), then the cancel request, then the deadlines. Sleeping
-/// between checks keeps the supervisor thread off the hot path.
-fn watch(spec: &JobSpec, backend: &mut Backend, control: &JobControl) -> JobStop {
+/// Checks the process first (a job that already exited keeps its own exit
+/// outcome, never `Cancelled`), then a pending cancel, then the deadlines.
+/// Every path that ends the job has killed what is left of the owned tree
+/// and reaped the leader before it returns.
+fn watch(
+    shared: &Shared,
+    id: JobId,
+    spec: &JobSpec,
+    backend: &mut Backend,
+    control: &JobControl,
+) -> ExecutionOutcome {
     let hard_deadline = spec
         .timeouts
         .hard
         .and_then(|hard| Instant::now().checked_add(hard));
     loop {
-        if backend.exited() {
-            return JobStop::Exited;
+        if let Some(exit) = backend.poll_exit() {
+            // No per-job cgroup evidence exists yet, so the verdict is
+            // `Unknown` and a SIGKILL death is never claimed as OOM.
+            return ExecutionOutcome::classify_exit(exit, OomVerdict::Unknown);
         }
-        if control.cancel_requested() {
-            return JobStop::Cancelled;
+        if let Some(request) = control.take_cancel() {
+            let (resolution, ended) = execute_cancel(backend, control, request);
+            resolve_cancel(shared, id, resolution);
+            if let Some(outcome) = ended {
+                return outcome;
+            }
+            continue;
         }
         let now = Instant::now();
-        if hard_deadline.is_some_and(|deadline| now >= deadline) {
-            return JobStop::TimedOut;
-        }
-        if spec
+        let clock = if hard_deadline.is_some_and(|deadline| now >= deadline) {
+            Some(DeadlineClock::Hard)
+        } else if spec
             .timeouts
             .idle
             .is_some_and(|idle| control.clock.idle_for(now) >= idle)
         {
-            return JobStop::TimedOut;
+            Some(DeadlineClock::Idle)
+        } else {
+            None
+        };
+        if let Some(clock) = clock {
+            // A kill the kernel refuses (never expected for an own child)
+            // leaves the leader to the backend's drop path; the deadline
+            // fired, so the outcome is `TimedOut` either way.
+            let _ = backend.kill_and_reap();
+            return ExecutionOutcome::TimedOut(clock);
         }
         thread::sleep(POLL_INTERVAL);
     }
 }
 
-fn mark_running(shared: &Shared, id: JobId) {
+/// How a wait inside a cancel ended.
+enum Waited {
+    /// The job's process ended (and was reaped).
+    Exited,
+    /// A stronger cancel request arrived and takes over.
+    Escalated(CancelRequest),
+    /// The grace period elapsed with the job still running.
+    Elapsed,
+}
+
+/// Executes one cancel request against the owned tree (the host owns the
+/// sequence; callers only read the typed answer).
+///
+/// Returns the cancel outcome plus the job outcome when the cancel ended
+/// the job. `Graceful` sends `SIGINT` and waits; `GracefulThenKill` adds
+/// `SIGTERM` and a kill; `Immediate` kills. A stronger request arriving
+/// during a wait escalates this one in place, keeping the steps already
+/// taken; weaker or equal ones coalesce into it.
+fn execute_cancel(
+    backend: &mut Backend,
+    control: &JobControl,
+    first: CancelRequest,
+) -> (CancelOutcome, Option<ExecutionOutcome>) {
+    let mut request = first;
+    let mut sent = 0usize;
+    loop {
+        let graceful: &[TreeSignal] = match request.mode() {
+            CancelMode::Immediate => &[],
+            CancelMode::Graceful => &[TreeSignal::Interrupt],
+            CancelMode::GracefulThenKill => &[TreeSignal::Interrupt, TreeSignal::Terminate],
+        };
+        if let Some(&signal) = graceful.get(sent) {
+            sent += 1;
+            match backend.signal_tree(signal) {
+                // An empty group means the tree is already going away: the
+                // wait below observes the exit.
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    if request.mode() == CancelMode::Graceful {
+                        return (refused_outcome(&error), None);
+                    }
+                    // Escalating modes go straight to the kill.
+                    sent = graceful.len();
+                    continue;
+                }
+            }
+            match wait_for_exit(backend, control, request) {
+                Waited::Exited => {
+                    return (
+                        CancelOutcome::CancelledGracefully,
+                        Some(ExecutionOutcome::Cancelled(CancelEffect::Graceful)),
+                    );
+                }
+                Waited::Escalated(stronger) => request = stronger,
+                Waited::Elapsed => {}
+            }
+            continue;
+        }
+        if request.mode() == CancelMode::Graceful {
+            return (CancelOutcome::StillRunning, None);
+        }
+        return match backend.kill_and_reap() {
+            Ok(_) => (
+                CancelOutcome::Killed,
+                Some(ExecutionOutcome::Cancelled(CancelEffect::Killed)),
+            ),
+            Err(error) => (refused_outcome(&error), None),
+        };
+    }
+}
+
+/// Maps a refused signal onto the typed cancel vocabulary.
+fn refused_outcome(error: &std::io::Error) -> CancelOutcome {
+    match error.kind() {
+        std::io::ErrorKind::PermissionDenied => CancelOutcome::PermissionDenied,
+        std::io::ErrorKind::Unsupported => CancelOutcome::Unsupported,
+        _ => CancelOutcome::Unknown,
+    }
+}
+
+/// Waits up to the request's grace period for the job to end, watching for
+/// an escalating request. A zero grace checks once.
+fn wait_for_exit(backend: &mut Backend, control: &JobControl, request: CancelRequest) -> Waited {
+    let deadline = Instant::now().checked_add(request.grace());
+    loop {
+        if backend.poll_exit().is_some() {
+            return Waited::Exited;
+        }
+        if let Some(next) = control.take_cancel() {
+            if next.mode().rank() > request.mode().rank() {
+                return Waited::Escalated(next);
+            }
+            // Equal or weaker: coalesced into the running cancel.
+        }
+        if deadline.is_none_or(|deadline| Instant::now() >= deadline) {
+            return Waited::Elapsed;
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+}
+
+fn mark_running(shared: &Shared, id: JobId, tree: Option<Arc<OwnedTree>>) {
     let at_ms = now_ms();
     let mut inner = lock_inner(shared);
     if let Some(record) = inner.jobs.get_mut(&id) {
         record.state = JobState::Running;
         record.started_at_ms = Some(at_ms);
+        record.kill_scope = if tree.is_some() {
+            KillScope::OwnedTree
+        } else {
+            KillScope::DirectChild
+        };
+        record.tree = tree;
     }
     inner.events.push(JobEvent::Started { id, at_ms });
 }
 
-fn finish(shared: &Shared, id: JobId, stop: JobStop) {
+fn resolve_cancel(shared: &Shared, id: JobId, outcome: CancelOutcome) {
+    lock_inner(shared).events.push(JobEvent::CancelResolved {
+        id,
+        outcome,
+        at_ms: now_ms(),
+    });
+}
+
+fn finish(shared: &Shared, id: JobId, outcome: ExecutionOutcome) {
     let at_ms = now_ms();
     let mut inner = lock_inner(shared);
     if let Some(record) = inner.jobs.get_mut(&id) {
-        record.state = JobState::Done(stop);
+        record.state = JobState::Done(outcome);
         record.finished_at_ms = Some(at_ms);
+        // The leader is reaped: no signal may reach its recycled id.
+        record.tree = None;
     }
-    inner.events.push(JobEvent::Stopped { id, stop, at_ms });
+    inner.events.push(JobEvent::Stopped { id, outcome, at_ms });
 }
 
 fn now_ms() -> u64 {
@@ -1620,8 +1924,8 @@ fn now_ms() -> u64 {
 /// Why a backend could not start (CORE-RUN-005).
 ///
 /// The supervisor only needs the fact (the job becomes
-/// [`JobStop::SpawnFailed`]); the fields are diagnostics the unit tests read
-/// to prove a partially started child was killed and reaped.
+/// [`ExecutionOutcome::SpawnFailed`]); the fields are diagnostics the unit
+/// tests read to prove a partially started child was killed and reaped.
 #[derive(Debug)]
 #[cfg_attr(not(test), allow(dead_code))]
 struct StartFailure {
@@ -1662,6 +1966,51 @@ impl StartFailure {
     }
 }
 
+/// Adopts the owned tree led by a fresh child, or `None` where no backend
+/// exists (the job then reports [`KillScope::DirectChild`]).
+fn adopt_tree(leader: Option<u32>) -> Option<Arc<OwnedTree>> {
+    leader
+        .and_then(|pid| OwnedTree::adopt(pid).ok())
+        .map(Arc::new)
+}
+
+/// Converts a reaped `std` status.
+fn observe_std_status(status: std::process::ExitStatus) -> ExitObservation {
+    if let Some(code) = status.code() {
+        return ExitObservation::Code(code);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+        if let Some(signal) = status.signal() {
+            return ExitObservation::Signal(signal);
+        }
+    }
+    ExitObservation::Unobservable
+}
+
+/// Converts a reaped PTY status. The PTY primitive names a terminating
+/// signal but not its number, so a signalled PTY child is unobservable here
+/// (the owned-tree observer reports the number where it exists).
+fn observe_pty_status(status: &bitty_pty::ExitStatus) -> ExitObservation {
+    if status.signal().is_some() {
+        ExitObservation::Unobservable
+    } else if status.is_success() {
+        ExitObservation::Code(0)
+    } else {
+        i32::try_from(status.code()).map_or(ExitObservation::Unobservable, ExitObservation::Code)
+    }
+}
+
+/// Converts a non-reaping leader observation (`None`: read the reap).
+fn observe_leader(exit: LeaderExit) -> Option<ExitObservation> {
+    match exit {
+        LeaderExit::Exited(code) => Some(ExitObservation::Code(code)),
+        LeaderExit::Signaled(signal) => Some(ExitObservation::Signal(signal)),
+        LeaderExit::StatusUnavailable => None,
+    }
+}
+
 enum Backend {
     Pipe(PipeJob),
     Pty(PtyJob),
@@ -1683,44 +2032,96 @@ impl Backend {
         }
     }
 
-    /// Non-blocking exit observation; `true` once the process is reaped.
-    fn exited(&mut self) -> bool {
+    /// The adopted owned tree, if any.
+    fn tree(&self) -> Option<Arc<OwnedTree>> {
         match self {
-            Self::Pipe(job) => job.exited(),
-            Self::Pty(job) => job.exited(),
+            Self::Pipe(job) => job.tree.clone(),
+            Self::Pty(job) => job.tree.clone(),
         }
     }
 
-    /// Idempotent kill-and-reap of the direct child.
-    fn terminate(&mut self) {
+    /// Non-blocking end observation. Once the process ended, kills what is
+    /// left of the owned tree, reaps the leader, and (pipes) joins the
+    /// drains, then keeps returning the same observation.
+    fn poll_exit(&mut self) -> Option<ExitObservation> {
         match self {
-            Self::Pipe(job) => job.terminate(),
-            Self::Pty(job) => job.terminate(),
+            Self::Pipe(job) => job.poll_exit(),
+            Self::Pty(job) => job.poll_exit(),
+        }
+    }
+
+    /// Delivers a graceful signal to the owned tree.
+    ///
+    /// Without a tree only [`TreeSignal::Kill`] reaches the direct child;
+    /// graceful signals fail with [`std::io::ErrorKind::Unsupported`]
+    /// instead of pretending.
+    fn signal_tree(&mut self, signal: TreeSignal) -> std::io::Result<()> {
+        match self {
+            Self::Pipe(job) => job.signal_tree(signal),
+            Self::Pty(job) => job.signal_tree(signal),
+        }
+    }
+
+    /// Kills the owned tree (or the direct child), then reaps the leader.
+    ///
+    /// # Errors
+    ///
+    /// Returns the kernel's refusal when neither the tree nor the direct
+    /// child could be signalled; nothing is reaped then (a blocking reap of
+    /// an unkillable child would wedge the supervisor).
+    fn kill_and_reap(&mut self) -> std::io::Result<ExitObservation> {
+        match self {
+            Self::Pipe(job) => job.kill_and_reap(),
+            Self::Pty(job) => job.kill_and_reap(),
+        }
+    }
+}
+
+/// Upper bound on joining drain workers after the reap: a member that
+/// escaped the owned tree and still holds a pipe must not wedge the
+/// supervisor. Bytes drained so far stay in the store either way.
+const DRAIN_JOIN_BOUND: Duration = Duration::from_secs(5);
+
+/// Joins finished drains within [`DRAIN_JOIN_BOUND`]; unfinished ones are
+/// detached and keep their bounded store clone until EOF.
+fn join_drains(drains: &mut Vec<thread::JoinHandle<()>>) {
+    let deadline = Instant::now().checked_add(DRAIN_JOIN_BOUND);
+    while !drains.iter().all(thread::JoinHandle::is_finished) {
+        if deadline.is_none_or(|deadline| Instant::now() >= deadline) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    for drain in drains.drain(..) {
+        if drain.is_finished() {
+            let _ = drain.join();
         }
     }
 }
 
 /// Pipe-backed job: closed stdin, piped stdout/stderr, bounded drain.
 ///
-/// Each drain thread feeds its stream into the job's bounded output store
-/// (newest bytes win, oldest evicted first) and timestamps activity for the
-/// idle deadline. Drain handles are joined (not detached) once the child is
-/// reaped, so the store is quiescent before the supervisor publishes the
-/// terminal event. A grandchild that inherits a pipe can still delay that
-/// join; owned-process-tree cleanup stays CTX-0512.
+/// The child leads its own process group and, where a backend exists, its
+/// owned tree is adopted right after the spawn. Each drain thread feeds its
+/// stream into the job's bounded output store (newest bytes win, oldest
+/// evicted first) and timestamps activity for the idle deadline. Drain
+/// handles are joined after the leader is reaped and the rest of the tree
+/// is killed, so the store is quiescent before the terminal event.
 struct PipeJob {
     child: Child,
-    exited: bool,
+    tree: Option<Arc<OwnedTree>>,
+    exited: Option<ExitObservation>,
     drains: Vec<thread::JoinHandle<()>>,
 }
 
 impl PipeJob {
-    /// Spawns the child, then one drain worker per stream.
+    /// Spawns the child, adopts its owned tree, then starts one drain worker
+    /// per stream.
     ///
-    /// A drain worker that cannot start fails the whole start: the child is
-    /// killed and reaped first, so the job ends as a typed
-    /// [`JobStop::SpawnFailed`] instead of a live process nobody drains
-    /// (CORE-RUN-005).
+    /// A drain worker that cannot start fails the whole start: the tree and
+    /// the child are killed and the child reaped first, so the job ends as a
+    /// typed [`ExecutionOutcome::SpawnFailed`] instead of a live process
+    /// nobody drains (CORE-RUN-005).
     fn start(
         spec: &JobSpec,
         clock: Arc<ActivityClock>,
@@ -1729,8 +2130,10 @@ impl PipeJob {
     ) -> Result<Self, StartFailure> {
         let mut command =
             closed_pipe_command(&spec.program, &spec.args, spec.cwd.as_deref(), &spec.env);
+        OwnedTree::prepare_command(&mut command);
         let mut child = command.spawn().map_err(StartFailure::before_spawn)?;
         let pid = child.id();
+        let tree = adopt_tree(Some(pid));
         let mut drains = Vec::new();
         let started = (|| -> std::io::Result<()> {
             if let Some(stdout) = child.stdout.take() {
@@ -1755,14 +2158,18 @@ impl PipeJob {
         })();
         if let Err(error) = started {
             // Kill and reap before reporting: the drains that did start end
-            // at EOF once the child is gone, and a failed spawn already
+            // at EOF once the tree is gone, and a failed spawn already
             // dropped (closed) its pipe. They are detached, never joined, so
-            // a grandchild holding a pipe cannot wedge this path.
-            // `wait` already retries interrupted waits; an error here means
-            // the kernel cannot wait for this child at all, so there is
-            // nothing left to retry, only to report honestly.
-            let _ = child.kill();
-            let reap = child.wait().map(drop);
+            // an escaped member holding a pipe cannot wedge this path.
+            let mut job = Self {
+                child,
+                tree,
+                exited: None,
+                drains: Vec::new(),
+            };
+            // An error means the tree may still be alive or unreaped,
+            // which the failure must not hide.
+            let reap = job.kill_and_reap().map(drop);
             drop(drains);
             return Err(StartFailure::after_cleanup(
                 Some(pid),
@@ -1772,66 +2179,89 @@ impl PipeJob {
         }
         Ok(Self {
             child,
-            exited: false,
+            tree,
+            exited: None,
             drains,
         })
     }
 
-    fn exited(&mut self) -> bool {
-        if self.exited {
-            return true;
+    fn poll_exit(&mut self) -> Option<ExitObservation> {
+        if let Some(exit) = self.exited {
+            return Some(exit);
         }
-        match self.child.try_wait() {
-            Ok(Some(_)) => {
-                self.exited = true;
-                // Reap the child, then join the drains so buffered pipe
-                // bytes land in the store before the terminal event. The
-                // drains end at EOF once the last writer (the child) is
-                // gone; a grandchild holding a pipe open delays this join.
-                // To keep the supervisor fail-closed instead of wedged,
-                // the join is time-boxed (CTX-0512 owns process-tree
-                // cleanup): bytes drained so far stay in the store either
-                // way.
-                let _ = self.child.wait();
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-                while !self.drains.iter().all(|drain| drain.is_finished()) {
-                    if std::time::Instant::now() >= deadline {
-                        break;
-                    }
-                    thread::sleep(std::time::Duration::from_millis(1));
+        let observed = match &self.tree {
+            Some(tree) => match tree.leader_exit() {
+                Ok(None) => return None,
+                Ok(Some(exit)) => observe_leader(exit),
+                // The observer failed: end the job deterministically.
+                Err(_) => {
+                    let _ = self.kill_and_reap();
+                    self.exited = Some(ExitObservation::Unobservable);
+                    return self.exited;
                 }
-                for drain in self.drains.drain(..) {
-                    if !drain.is_finished() {
-                        continue;
-                    }
-                    let _ = drain.join();
+            },
+            None => match self.child.try_wait() {
+                Ok(None) => return None,
+                Ok(Some(status)) => {
+                    let exit = observe_std_status(status);
+                    join_drains(&mut self.drains);
+                    self.exited = Some(exit);
+                    return self.exited;
                 }
-                true
-            }
-            Ok(None) => false,
-            // The process cannot be observed anymore; stop the watch loop
-            // and let `terminate` attempt the kill/reap below.
-            Err(_) => true,
+                Err(_) => {
+                    let _ = self.kill_and_reap();
+                    self.exited = Some(ExitObservation::Unobservable);
+                    return self.exited;
+                }
+            },
+        };
+        // The leader ended on its own: whatever it left behind in its group
+        // dies with it, then the (still pinned) leader is reaped.
+        let reaped = self.kill_and_reap().ok();
+        let exit = observed.or(reaped).unwrap_or(ExitObservation::Unobservable);
+        self.exited = Some(exit);
+        Some(exit)
+    }
+
+    fn signal_tree(&mut self, signal: TreeSignal) -> std::io::Result<()> {
+        match (&self.tree, signal) {
+            (Some(tree), _) => tree.signal(signal),
+            (None, TreeSignal::Kill) => self.child.kill(),
+            (None, _) => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "no owned-tree backend: graceful signals are not delivered",
+            )),
         }
     }
 
-    fn terminate(&mut self) {
-        if self.exited {
-            return;
+    fn kill_and_reap(&mut self) -> std::io::Result<ExitObservation> {
+        if let Some(exit) = self.exited {
+            return Ok(exit);
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        // Best-effort drain join: never block termination on a grandchild
-        // holding a pipe (CTX-0512 owns process-tree cleanup). A thread that
-        // has not finished keeps its store clone until EOF, still under the
-        // per-stream bound, while the record keeps the bytes drained so far.
-        for drain in self.drains.drain(..) {
-            if !drain.is_finished() {
-                continue;
+        let tree_kill = self.tree.as_ref().map(|tree| tree.signal(TreeSignal::Kill));
+        match tree_kill {
+            // The tree took the kill, or has no live member left.
+            Some(Ok(())) => {}
+            Some(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+            // No tree, or the tree refused: the direct child is the last
+            // resort. Only a refusal stops the reap; any other error means
+            // the child is already gone and the reap returns at once.
+            _ => {
+                if let Err(error) = self.child.kill() {
+                    if error.kind() == std::io::ErrorKind::PermissionDenied {
+                        return Err(error);
+                    }
+                }
             }
-            let _ = drain.join();
         }
-        self.exited = true;
+        let reaped = match &self.tree {
+            Some(tree) => tree.retire(|| self.child.wait()),
+            None => self.child.wait(),
+        };
+        let exit = reaped.map_or(ExitObservation::Unobservable, observe_std_status);
+        join_drains(&mut self.drains);
+        self.exited = Some(exit);
+        Ok(exit)
     }
 }
 
@@ -1840,14 +2270,17 @@ impl PipeJob {
 /// The PTY primitive inherits the session environment by its accepted
 /// terminal contract (DEC-0017) with explicit variables as overrides; the
 /// model rejects isolated PTY jobs so no ambient variable can flow in
-/// unnoticed.
+/// unnoticed. The PTY child is a session leader, so it leads its own owned
+/// tree; kills also reach the terminal's foreground job group.
 struct PtyJob {
     pty: Pty,
-    exited: bool,
+    tree: Option<Arc<OwnedTree>>,
+    exited: Option<ExitObservation>,
 }
 
 impl PtyJob {
-    /// Spawns the PTY child, then its drain worker.
+    /// Spawns the PTY child, adopts its owned tree, then starts its drain
+    /// worker.
     ///
     /// Like [`PipeJob::start`], a reader or drain that cannot start kills
     /// and reaps the child before the failure is reported (CORE-RUN-005).
@@ -1868,9 +2301,16 @@ impl PtyJob {
                 builder = builder.env(&var.name, &var.value);
             }
         }
-        let mut pty = builder.spawn().map_err(StartFailure::before_spawn)?;
+        let pty = builder.spawn().map_err(StartFailure::before_spawn)?;
         let pid = pty.pid();
-        let drained = pty
+        let tree = adopt_tree(pid);
+        let mut job = Self {
+            pty,
+            tree,
+            exited: None,
+        };
+        let drained = job
+            .pty
             .take_reader()
             .map_err(|error| error.to_string())
             .and_then(|reader| {
@@ -1878,9 +2318,9 @@ impl PtyJob {
                     .map_err(|error| format!("job drain worker failed to start: {error}"))
             });
         if let Err(reason) = drained {
-            // `shutdown` is kill-then-reap; its error means the child may
-            // still be alive or unreaped, which the failure must not hide.
-            let reap = pty.shutdown().map(drop);
+            // An error means the tree may still be alive or unreaped,
+            // which the failure must not hide.
+            let reap = job.kill_and_reap().map(drop);
             return Err(StartFailure::after_cleanup(pid, reap, reason));
         }
         // Publish the writer half into the shared slot (when a scoped job
@@ -1896,37 +2336,101 @@ impl PtyJob {
             // `None` (backend starting): that call fails closed with
             // `Unsupported` and retries after `Running` is observable.
             // MSRV 1.85 has no let-chains: nest instead of `&& let`.
-            if let Ok(writer) = pty.take_writer() {
+            if let Ok(writer) = job.pty.take_writer() {
                 if let Ok(mut guard) = slot.lock() {
                     *guard = Some(writer);
                 }
             }
         }
-        Ok(Self { pty, exited: false })
+        Ok(job)
     }
 
-    fn exited(&mut self) -> bool {
-        if self.exited {
-            return true;
+    fn poll_exit(&mut self) -> Option<ExitObservation> {
+        if let Some(exit) = self.exited {
+            return Some(exit);
         }
-        match self.pty.try_wait() {
-            Ok(Some(_)) => {
-                self.exited = true;
-                true
+        let observed = match &self.tree {
+            Some(tree) => match tree.leader_exit() {
+                Ok(None) => return None,
+                Ok(Some(exit)) => observe_leader(exit),
+                Err(_) => {
+                    let _ = self.kill_and_reap();
+                    self.exited = Some(ExitObservation::Unobservable);
+                    return self.exited;
+                }
+            },
+            None => match self.pty.try_wait() {
+                Ok(None) => return None,
+                Ok(Some(status)) => {
+                    let exit = observe_pty_status(&status);
+                    self.exited = Some(exit);
+                    return self.exited;
+                }
+                Err(_) => {
+                    let _ = self.kill_and_reap();
+                    self.exited = Some(ExitObservation::Unobservable);
+                    return self.exited;
+                }
+            },
+        };
+        let reaped = self.kill_and_reap().ok();
+        let exit = observed.or(reaped).unwrap_or(ExitObservation::Unobservable);
+        self.exited = Some(exit);
+        Some(exit)
+    }
+
+    /// Signals the leader's group and the terminal's foreground job group
+    /// (a shell's foreground command leads a group of its own).
+    fn signal_tree(&mut self, signal: TreeSignal) -> std::io::Result<()> {
+        let Some(tree) = &self.tree else {
+            return match signal {
+                TreeSignal::Kill => self.pty.kill().map_err(std::io::Error::other),
+                _ => Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "no owned-tree backend: graceful signals are not delivered",
+                )),
+            };
+        };
+        if let Some(foreground) = self.pty.foreground_pgid() {
+            if foreground != tree.leader() {
+                let _ = tree.signal_group(foreground, signal);
             }
-            Ok(None) => false,
-            Err(_) => true,
         }
+        tree.signal(signal)
     }
 
-    fn terminate(&mut self) {
-        if self.exited {
-            return;
+    fn kill_and_reap(&mut self) -> std::io::Result<ExitObservation> {
+        if let Some(exit) = self.exited {
+            return Ok(exit);
         }
-        // `shutdown` is kill-then-reap; if the kill reports the child is
-        // already gone it returns before blocking on a wait.
-        let _ = self.pty.shutdown();
-        self.exited = true;
+        let exit = match self.tree.clone() {
+            Some(tree) => {
+                match self.signal_tree(TreeSignal::Kill) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        // The tree refused: the PTY primitive's own kill of
+                        // the direct child is the last resort.
+                        if self.pty.kill().is_err() {
+                            return Err(error);
+                        }
+                    }
+                }
+                tree.retire(|| self.pty.wait())
+                    .map_or(ExitObservation::Unobservable, |status| {
+                        observe_pty_status(&status)
+                    })
+            }
+            // `shutdown` is kill-then-reap of the direct child.
+            None => self
+                .pty
+                .shutdown()
+                .map_or(ExitObservation::Unobservable, |status| {
+                    observe_pty_status(&status)
+                }),
+        };
+        self.exited = Some(exit);
+        Ok(exit)
     }
 }
 
@@ -2073,7 +2577,10 @@ mod tests {
         let registry = JobRegistry::new();
         let id = registry.spawn(missing_spec()).expect("tracked");
         let snapshot = wait_terminal(&registry, id);
-        assert_eq!(snapshot.state, JobState::Done(JobStop::SpawnFailed));
+        assert_eq!(
+            snapshot.state,
+            JobState::Done(ExecutionOutcome::SpawnFailed)
+        );
         assert!(snapshot.started_at_ms.is_none());
         assert!(snapshot.finished_at_ms.is_some());
         assert_eq!(snapshot.spec.kind.as_str(), "command");
@@ -2085,7 +2592,7 @@ mod tests {
             events[1],
             JobEvent::Stopped {
                 id: second,
-                stop: JobStop::SpawnFailed,
+                outcome: ExecutionOutcome::SpawnFailed,
                 ..
             } if second == id
         ));
@@ -2132,7 +2639,10 @@ mod tests {
             .expect("expired record reclaimed at spawn");
         assert!(second > first);
         assert_eq!(reclaiming.len(), 1);
-        assert_eq!(finished.state, JobState::Done(JobStop::SpawnFailed));
+        assert_eq!(
+            finished.state,
+            JobState::Done(ExecutionOutcome::SpawnFailed)
+        );
     }
 
     #[test]
@@ -2161,7 +2671,7 @@ mod tests {
         wait_terminal(&registry, id);
         assert_eq!(
             registry.cancel(id),
-            Ok(JobCancel::AlreadyStopped(JobStop::SpawnFailed))
+            Ok(JobCancel::AlreadyStopped(ExecutionOutcome::SpawnFailed))
         );
     }
 
@@ -2401,7 +2911,10 @@ mod tests {
         let started = Instant::now();
         let id = registry.spawn(sleeping_helper_spec()).expect("tracked");
         let snapshot = wait_terminal(&registry, id);
-        assert_eq!(snapshot.state, JobState::Done(JobStop::SpawnFailed));
+        assert_eq!(
+            snapshot.state,
+            JobState::Done(ExecutionOutcome::SpawnFailed)
+        );
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "the start fails fast instead of waiting on the 30 s child"

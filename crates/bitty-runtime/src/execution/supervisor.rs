@@ -856,7 +856,7 @@ pub fn adoption_plan(reconciled: &[ReconciledJob]) -> Vec<AdoptedJob> {
 #[cfg(test)]
 mod tests {
     use super::super::persistence::{PersistedJob, PersistedStore, ResumeCursor};
-    use super::super::{JobState, JobStop};
+    use super::super::{ExecutionOutcome, JobState};
     use super::*;
     use bitty_ipc::execution::EnvPolicy;
 
@@ -864,7 +864,7 @@ mod tests {
         ReconciledJob {
             record: PersistedJob {
                 id: JobId::from_raw(id).expect("id"),
-                state: JobState::Done(JobStop::Exited),
+                state: JobState::Done(ExecutionOutcome::Success),
                 kind: super::super::JobKind::Command,
                 lifetime: super::super::JobLifetime::Detached,
                 io: super::super::JobIo::Pipes,

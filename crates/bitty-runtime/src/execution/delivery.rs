@@ -6,9 +6,11 @@
 //! increasing `seq` cursor in the style of Cursor's SSE `Last-Event-ID`
 //! (research 044 §17):
 //!
-//! - [`EventClass::Critical`] terminal events (`Stopped` of any
-//!   [`JobStop`](super::JobStop)) ride the critical lane and are delivered
-//!   at-least-once: retained under their own bound, replayed across a
+//! - [`EventClass::Critical`] control-plane answers (`Stopped` of any
+//!   [`ExecutionOutcome`](super::ExecutionOutcome), and `CancelResolved` of
+//!   any [`CancelOutcome`](super::CancelOutcome)) ride the critical lane and
+//!   are delivered at-least-once: retained under their own bound, replayed
+//!   across a
 //!   consumer disconnect via [`JobRegistry::events_since`](super::JobRegistry::events_since),
 //!   deduplicated by the consumer on the stable [`StoredEvent::seq`].
 //! - [`EventClass::Observation`] lifecycle notices (`Queued`, `Started`)
@@ -31,9 +33,9 @@
 
 use std::collections::VecDeque;
 
-#[cfg(test)]
-use super::model::JobStop;
 use super::model::{JobError, JobEvent, JobId};
+#[cfg(test)]
+use super::outcome::{CancelEffect, CancelOutcome, DeadlineClock, ExecutionOutcome};
 
 /// Maximum retained observation events (UI-only lifecycle notices).
 pub const MAX_STORED_OBSERVATION_EVENTS: usize = 256;
@@ -48,8 +50,10 @@ pub const MAX_EVENT_REPLAY: usize = 512;
 /// Delivery class of one stored event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EventClass {
-    /// Terminal `Stopped` (of any stop): must reach the consumer; replayable
-    /// across disconnects; a candidate model wake-up.
+    /// Terminal `Stopped` (of any outcome) and `CancelResolved` (of any
+    /// cancel outcome): must reach the consumer; replayable across
+    /// disconnects; a candidate model wake-up. A caller must never infer
+    /// what its cancel did, so the typed answer is never dropped.
     Critical,
     /// `Queued`/`Started` lifecycle notices: coalescible, drop-oldest,
     /// UI-only, never a model wake-up.
@@ -172,12 +176,12 @@ impl DeliveryLog {
         }
     }
 
-    /// Classifies a lifecycle payload: terminal stops are critical, queue
-    /// and start notices are observations.
+    /// Classifies a lifecycle payload: terminal stops and cancel answers are
+    /// critical, queue and start notices are observations.
     #[must_use]
     pub(crate) const fn classify(event: JobEvent) -> EventClass {
         match event {
-            JobEvent::Stopped { .. } => EventClass::Critical,
+            JobEvent::Stopped { .. } | JobEvent::CancelResolved { .. } => EventClass::Critical,
             JobEvent::Queued { .. } | JobEvent::Started { .. } => EventClass::Observation,
         }
     }
@@ -390,23 +394,37 @@ mod tests {
         JobEvent::Started { id, at_ms }
     }
 
-    fn stopped(id: JobId, stop: JobStop, at_ms: u64) -> JobEvent {
-        JobEvent::Stopped { id, stop, at_ms }
+    fn stopped(id: JobId, outcome: ExecutionOutcome, at_ms: u64) -> JobEvent {
+        JobEvent::Stopped { id, outcome, at_ms }
     }
 
     #[test]
-    fn lanes_classify_terminal_stops_as_critical() {
-        assert_eq!(
-            DeliveryLog::classify(stopped(JobId::from_raw(1).expect("id"), JobStop::Exited, 3)),
-            EventClass::Critical
-        );
-        for stop in [JobStop::Cancelled, JobStop::TimedOut, JobStop::SpawnFailed] {
+    fn lanes_classify_terminal_stops_and_cancel_answers_as_critical() {
+        let id = JobId::from_raw(1).expect("id");
+        for outcome in [
+            ExecutionOutcome::Success,
+            ExecutionOutcome::ExitCode(2),
+            ExecutionOutcome::Signaled(15),
+            ExecutionOutcome::SpawnFailed,
+            ExecutionOutcome::Cancelled(CancelEffect::Killed),
+            ExecutionOutcome::TimedOut(DeadlineClock::Hard),
+            ExecutionOutcome::OomKilled,
+            ExecutionOutcome::SupervisorLost,
+            ExecutionOutcome::Unknown,
+        ] {
             assert_eq!(
-                DeliveryLog::classify(stopped(JobId::from_raw(1).expect("id"), stop, 3)),
+                DeliveryLog::classify(stopped(id, outcome, 3)),
                 EventClass::Critical
             );
         }
-        let id = JobId::from_raw(1).expect("id");
+        assert_eq!(
+            DeliveryLog::classify(JobEvent::CancelResolved {
+                id,
+                outcome: CancelOutcome::StillRunning,
+                at_ms: 3,
+            }),
+            EventClass::Critical
+        );
         assert_eq!(
             DeliveryLog::classify(queued(id, 1)),
             EventClass::Observation
@@ -428,7 +446,7 @@ mod tests {
         let mut log = DeliveryLog::new();
         log.push(queued(id, 1));
         log.push(started(id, 2));
-        log.push(stopped(id, JobStop::Exited, 3));
+        log.push(stopped(id, ExecutionOutcome::Success, 3));
 
         let replay = log.replay_since(0, MAX_EVENT_REPLAY).expect("replay");
         assert_eq!(replay.events.len(), 3);
@@ -495,7 +513,7 @@ mod tests {
         for i in 0..(MAX_STORED_OBSERVATION_EVENTS + MAX_STORED_CRITICAL_EVENTS + 10) {
             log.push(queued(id, i as u64));
         }
-        log.push(stopped(id, JobStop::Exited, 999));
+        log.push(stopped(id, ExecutionOutcome::Success, 999));
         assert!(log.observation_dropped() > 0);
         assert_eq!(log.critical_dropped(), 0);
         let replay = log.replay_since(0, 8 * MAX_EVENT_REPLAY).expect("replay");
@@ -504,7 +522,7 @@ mod tests {
             replay.events.iter().any(|event| matches!(
                 event.event(),
                 JobEvent::Stopped {
-                    stop: JobStop::Exited,
+                    outcome: ExecutionOutcome::Success,
                     ..
                 }
             )),
@@ -518,7 +536,11 @@ mod tests {
         let mut log = DeliveryLog::new();
         log.push(queued(id, 1));
         log.push(started(id, 2));
-        log.push(stopped(id, JobStop::Cancelled, 3));
+        log.push(stopped(
+            id,
+            ExecutionOutcome::Cancelled(CancelEffect::Killed),
+            3,
+        ));
         let drained = log.drain(10);
         assert_eq!(drained.len(), 3);
         assert!(matches!(drained[0], JobEvent::Queued { .. }));

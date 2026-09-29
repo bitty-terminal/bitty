@@ -93,6 +93,7 @@ mod error;
 mod platform;
 mod pty;
 mod reader;
+mod tree;
 mod writer;
 
 pub use builder::DEFAULT_COLORTERM;
@@ -118,4 +119,8 @@ pub use reader::MAX_BUFFERED_BYTES;
 pub use reader::PtyReader;
 pub use reader::PtyRecv;
 pub use reader::READ_CHUNK_SIZE;
+pub use tree::LeaderExit;
+pub use tree::OwnedTree;
+pub use tree::TreeBackend;
+pub use tree::TreeSignal;
 pub use writer::PtyWriter;

@@ -1,7 +1,8 @@
 //! Phase-2 execution supervisor: async jobs plus bounded output,
 //! reliable event delivery, capability-scoped operations, persistent
-//! metadata with file-held logs, and the detached-supervisor contract
-//! (CTX-0511 + CTX-0513 + CTX-0514 + CTX-0516).
+//! metadata with file-held logs, the detached-supervisor contract, and
+//! structured outcomes with owned-tree kill and typed cancel
+//! (CTX-0511 + CTX-0513 + CTX-0514 + CTX-0516 + CTX-0512).
 //!
 //! This module is the Core-side foundation of the execution-host boundary
 //! (research record 044, captured as DIR-026 in the `bitty-docs` draft
@@ -42,12 +43,23 @@
 //!   prohibition is the CTX-0524 seam.
 //! - Origin is provenance only: [`JobOrigin`] records "started from here"
 //!   and no lifecycle path is coupled to it.
+//! - Structured outcomes and typed cancel (CTX-0512): terminal states carry
+//!   an [`ExecutionOutcome`] (`Success`, `ExitCode`, `Signaled`,
+//!   `SpawnFailed`, `Cancelled`, `TimedOut`, `OomKilled`, `SupervisorLost`,
+//!   `Unknown`). Kills reach the owned process tree through the
+//!   `bitty-pty` boundary ([`bitty_pty::OwnedTree`]: Linux process groups
+//!   plus pidfd, macOS process groups plus kqueue) and every snapshot
+//!   reports its [`KillScope`]. A [`CancelRequest`] carries the execution
+//!   id, the [`ExecutionGeneration`] the host checks, a [`CancelMode`], and
+//!   a grace period; the supervisor executes it and publishes one
+//!   `JobEvent::CancelResolved` with a typed [`CancelOutcome`].
 //!
 //! # Deliberate non-goals (sibling tasks own them)
 //!
-//! - Structured outcomes, owned-process-tree kill, typed cancel with
-//!   generation fencing: CTX-0512. [`JobStop`] is an interim observation
-//!   only, and cancel terminates the direct child.
+//! - OOM evidence and the Windows tree backend: no per-job cgroup exists,
+//!   so the host supplies [`OomVerdict::Unknown`] and never claims
+//!   `OomKilled`; Windows has no Job Object backend yet and reports
+//!   [`KillScope::DirectChild`].
 //! - Capability enforcement transport: this task is in-process only, with no
 //!   new IPC verbs. The existing IPC scope/auth registry plus the
 //!   consent/effect gate stays the transport boundary; these `*_as` methods
@@ -74,13 +86,13 @@
 //!   their own lane so observation pressure can never mask a `Stopped`.
 //! - No shell: specs are argv-first and processes are built with
 //!   [`std::process::Command`] directly; nothing routes through `bash -c`.
-//! - No zombie or wedged child: every supervisor path kills and reaps its
-//!   direct child, and pipe drain threads are joined after the reap so the
-//!   output store is quiescent before the terminal event (a grandchild
-//!   holding a pipe open delays the join; owned-process-tree cleanup stays
-//!   CTX-0512). A job's own network failure is recorded as the observed stop
-//!   plus retained stderr facts; no separate `network_error` classification
-//!   is invented.
+//! - No zombie or wedged child: every supervisor path kills what is left of
+//!   the owned tree, reaps the leader, and joins the pipe drains (time-boxed)
+//!   before the terminal event, so the output store is quiescent unless a
+//!   member escaped the tree (`setsid`/`setpgid`) and still holds a pipe.
+//!   A job's own network failure is recorded as the observed outcome plus
+//!   retained stderr facts; no separate `network_error` classification is
+//!   invented.
 //!
 //! # Candidate signals (CTX-0678, RUN-20..RUN-23 analysis batch)
 //!
@@ -108,6 +120,7 @@ mod delivery;
 mod lease;
 mod model;
 mod oom;
+mod outcome;
 mod output;
 mod persistence;
 mod process_tree;
@@ -133,11 +146,16 @@ pub use lease::{
 pub use model::{
     AttachReceipt, DEFAULT_RETENTION_TTL, JobCancel, JobError, JobEvent, JobGrant, JobId, JobIo,
     JobKind, JobLifetime, JobOperation, JobOrigin, JobPrincipal, JobSignal, JobSnapshot, JobSpec,
-    JobState, JobStop, JobTimeouts, MAX_GRANTS_PER_JOB, MAX_JOB_ORIGIN_BYTES,
-    MAX_JOB_PRINCIPAL_BYTES, MAX_SIGNAL_WINDOW_MS, MAX_SIGNALS_PER_WINDOW, MAX_WRITE_INPUT_BYTES,
-    MAX_WRITE_INPUT_WINDOW_MS, MAX_WRITES_PER_WINDOW, SignalOutcome, TransferReceipt,
+    JobState, JobTimeouts, MAX_GRANTS_PER_JOB, MAX_JOB_ORIGIN_BYTES, MAX_JOB_PRINCIPAL_BYTES,
+    MAX_SIGNAL_WINDOW_MS, MAX_SIGNALS_PER_WINDOW, MAX_WRITE_INPUT_BYTES, MAX_WRITE_INPUT_WINDOW_MS,
+    MAX_WRITES_PER_WINDOW, SignalOutcome, TransferReceipt,
 };
 pub use oom::{MAX_MEMORY_EVENTS_BYTES, OomVerdict, classify_oom, parse_oom_kill_count};
+pub use outcome::{
+    CancelEffect, CancelMode, CancelOutcome, CancelReceipt, CancelRequest, DEFAULT_CANCEL_GRACE_MS,
+    DeadlineClock, ExecutionGeneration, ExecutionHandle, ExecutionOutcome, ExitObservation,
+    MAX_CANCEL_GRACE_MS,
+};
 pub use output::{
     MAX_OUTPUT_BYTES_PER_JOB, MAX_READ_BYTES, MAX_READ_LINES, OutputFilter, OutputIndex,
     OutputStream, OutputView, ReadOutput,

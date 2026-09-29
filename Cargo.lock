@@ -370,7 +370,9 @@ name = "bitty-pty"
 version = "0.0.21"
 dependencies = [
  "bitty-test-support",
+ "nix",
  "portable-pty",
+ "rustix 1.1.5",
 ]
 
 [[package]]

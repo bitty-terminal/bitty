@@ -3,7 +3,10 @@
 //! Every child under test is this test binary, selected by an explicit
 //! environment variable and reached through an argv-first job spec:
 //! hermetic, portable, and shell-free (no `sh`/`sleep` PATH dependency), so
-//! the same file runs on Unix and Windows CI.
+//! the same file runs on Unix and Windows CI. The one exception is the Unix
+//! signal-storm target: `/bin/sh` ignores `SIGINT` and `exec`s the helper
+//! (which inherits the ignored disposition), because signals now really
+//! reach the job's owned tree (CTX-0512) and the storm must not end it.
 //!
 //! Hostile probes live here too: an unauthorized principal that tries to
 //! cancel, read, signal, attach, write, grant, or transfer is denied without
@@ -14,9 +17,9 @@
 use std::time::{Duration, Instant};
 
 use bitty_runtime::{
-    AttachReceipt, JobCancel, JobError, JobGrant, JobId, JobIo, JobKind, JobOperation,
-    JobPrincipal, JobRegistry, JobSignal, JobSnapshot, JobSpec, JobState, JobStop, OutputStream,
-    ReadOutput, TransferReceipt,
+    AttachReceipt, CancelEffect, ExecutionOutcome, JobCancel, JobError, JobGrant, JobId, JobIo,
+    JobKind, JobOperation, JobPrincipal, JobRegistry, JobSignal, JobSnapshot, JobSpec, JobState,
+    KillScope, OutputStream, ReadOutput, SignalOutcome, TransferReceipt,
 };
 use bitty_test_support::require_pty;
 
@@ -75,6 +78,34 @@ fn helper_spec(mode: &str) -> JobSpec {
         bitty_ipc::execution::EnvPolicy::explicit(vec![(HELPER_ENV.to_owned(), mode.to_owned())])
             .expect("explicit env"),
     )
+}
+
+/// A sleeping job that survives the signal storm: on Unix `/bin/sh` sets
+/// `SIGINT` to ignored and `exec`s the helper; elsewhere no owned tree
+/// exists and signals are refused, so the plain helper is enough.
+fn storm_target_spec() -> JobSpec {
+    #[cfg(unix)]
+    {
+        JobSpec::new(
+            "/bin/sh",
+            vec![
+                "-c".to_owned(),
+                "trap '' INT; exec \"$0\" __bitty_job_cap_helper_entry__ --nocapture".to_owned(),
+                helper_exe(),
+            ],
+        )
+        .with_env(
+            bitty_ipc::execution::EnvPolicy::explicit(vec![(
+                HELPER_ENV.to_owned(),
+                "sleep".to_owned(),
+            )])
+            .expect("explicit env"),
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        helper_spec("sleep")
+    }
 }
 
 fn owner(name: &str) -> JobPrincipal {
@@ -149,7 +180,10 @@ fn unauthorized_cancel_is_denied_and_job_survives() {
     // The owner path still works.
     assert_eq!(registry.cancel_as(&spawner, id), Ok(JobCancel::Requested));
     let stopped = wait_terminal(&registry, &spawner, id);
-    assert_eq!(stopped.state, JobState::Done(JobStop::Cancelled));
+    assert_eq!(
+        stopped.state,
+        JobState::Done(ExecutionOutcome::Cancelled(CancelEffect::Killed))
+    );
 }
 
 // ── hostile: unauthorized signal ────────────────────────────────────────────
@@ -179,22 +213,29 @@ fn signal_storm_is_rate_limited_without_disturbing_other_operations() {
     let registry = JobRegistry::new();
     let spawner = owner("owner-a");
     let id = registry
-        .spawn_as(spawner.clone(), helper_spec("sleep"))
+        .spawn_as(spawner.clone(), storm_target_spec())
         .expect("tracked");
-    wait_running(&registry, &spawner, id);
+    let live = wait_running(&registry, &spawner, id);
 
     // The burst budget is consumed by authorized calls, then fails closed.
-    // Live-job delivery is the CTX-0512 seam (Unsupported), which still
-    // counts against the budget: the limiter guards the intent path, not
-    // just successful deliveries.
+    // With an owned tree every burst signal is delivered (and ignored by
+    // the target); without one delivery is refused, which still counts
+    // against the budget: the limiter guards the intent path, not just
+    // successful deliveries.
     for _ in 0..bitty_runtime::MAX_SIGNALS_PER_WINDOW {
-        assert!(
-            matches!(
-                registry.signal_as(&spawner, id, JobSignal::Interrupt),
-                Err(JobError::Unsupported { .. })
-            ),
-            "burst signal must reach the delivery seam"
-        );
+        let burst = registry.signal_as(&spawner, id, JobSignal::Interrupt);
+        if live.kill_scope == KillScope::OwnedTree {
+            assert_eq!(
+                burst,
+                Ok(SignalOutcome::Delivered),
+                "burst reaches the tree"
+            );
+        } else {
+            assert!(
+                matches!(burst, Err(JobError::Unsupported { .. })),
+                "without a tree the burst is refused, got {burst:?}"
+            );
+        }
     }
     let limited = registry.signal_as(&spawner, id, JobSignal::Interrupt);
     assert!(
@@ -806,7 +847,10 @@ fn concurrent_write_races_cancel_and_observe_without_wedging_the_registry() {
     );
     assert_eq!(registry.cancel_as(&spawner, id), Ok(JobCancel::Requested));
     let stopped = wait_terminal(&registry, &spawner, id);
-    assert_eq!(stopped.state, JobState::Done(JobStop::Cancelled));
+    assert_eq!(
+        stopped.state,
+        JobState::Done(ExecutionOutcome::Cancelled(CancelEffect::Killed))
+    );
 }
 
 #[test]
@@ -829,26 +873,42 @@ fn write_input_to_a_pipes_job_reports_closed_stdin() {
     assert_eq!(registry.cancel_as(&spawner, id), Ok(JobCancel::Requested));
 }
 
-// ── signal allow-path: enforcement passes, delivery is a named seam ─────────
+// ── signal allow-path: enforcement passes, delivery reaches the tree ─────────
 
 #[test]
-fn authorized_signal_on_a_live_job_passes_enforcement_to_the_named_seam() {
+fn authorized_signal_on_a_live_job_reaches_its_owned_tree() {
     let registry = JobRegistry::new();
     let spawner = owner("owner-a");
     let id = registry
         .spawn_as(spawner.clone(), helper_spec("sleep"))
         .expect("tracked");
-    wait_running(&registry, &spawner, id);
+    let live = wait_running(&registry, &spawner, id);
 
-    // The owner holds `signal`, so enforcement passes; live-job delivery is
-    // the CTX-0512 typed-signal seam and reports unsupported — never denied.
-    let seam = registry.signal_as(&spawner, id, JobSignal::Kill);
+    // The owner holds `signal`, so enforcement passes and the kill reaches
+    // the job's owned tree. Without an owned-tree backend delivery is
+    // refused (never sent to a single pid) — and never denied.
+    let delivered = registry.signal_as(&spawner, id, JobSignal::Kill);
+    if live.kill_scope != KillScope::OwnedTree {
+        assert!(
+            matches!(delivered, Err(JobError::Unsupported { .. })),
+            "without a tree the signal is refused, got {delivered:?}"
+        );
+        assert_eq!(registry.cancel_as(&spawner, id), Ok(JobCancel::Requested));
+        return;
+    }
+    assert_eq!(delivered, Ok(SignalOutcome::Delivered));
+    let stopped = wait_terminal(&registry, &spawner, id);
     assert!(
-        matches!(seam, Err(JobError::Unsupported { .. })),
-        "authorized live signal must reach the delivery seam, got {seam:?}"
+        matches!(stopped.state, JobState::Done(ExecutionOutcome::Signaled(_))),
+        "an external kill is a signaled outcome, got {:?}",
+        stopped.state
     );
-
-    assert_eq!(registry.cancel_as(&spawner, id), Ok(JobCancel::Requested));
+    assert_eq!(
+        registry.signal_as(&spawner, id, JobSignal::Kill),
+        Ok(SignalOutcome::AlreadyStopped(
+            stopped.state.outcome().expect("done")
+        ))
+    );
 }
 
 // ── events stay scoped to observable jobs ───────────────────────────────────

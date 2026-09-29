@@ -12,8 +12,8 @@
 use std::time::{Duration, Instant};
 
 use bitty_runtime::{
-    JobCancel, JobError, JobEvent, JobId, JobIo, JobKind, JobLifetime, JobOrigin, JobRegistry,
-    JobSnapshot, JobSpec, JobState, JobStop, JobTimeouts,
+    CancelEffect, DeadlineClock, ExecutionOutcome, JobCancel, JobError, JobEvent, JobId, JobIo,
+    JobKind, JobLifetime, JobOrigin, JobRegistry, JobSnapshot, JobSpec, JobState, JobTimeouts,
 };
 use bitty_test_support::require_pty;
 
@@ -104,7 +104,7 @@ fn quiet_command_completes_and_reports_ordered_lifecycle_events() {
     let registry = JobRegistry::new();
     let id = registry.spawn(helper_spec("quiet")).expect("tracked");
     let snapshot = wait_terminal(&registry, id);
-    assert_eq!(snapshot.state, JobState::Done(JobStop::Exited));
+    assert_eq!(snapshot.state, JobState::Done(ExecutionOutcome::Success));
     assert!(snapshot.started_at_ms.is_some());
     assert!(snapshot.finished_at_ms.is_some());
 
@@ -116,7 +116,7 @@ fn quiet_command_completes_and_reports_ordered_lifecycle_events() {
         events[2],
         JobEvent::Stopped {
             id: e,
-            stop: JobStop::Exited,
+            outcome: ExecutionOutcome::Success,
             ..
         } if e == id
     ));
@@ -135,13 +135,16 @@ fn failed_spawn_is_a_terminal_observation_not_a_lost_job() {
     );
     let id = registry.spawn(spec).expect("tracked");
     let snapshot = wait_terminal(&registry, id);
-    assert_eq!(snapshot.state, JobState::Done(JobStop::SpawnFailed));
+    assert_eq!(
+        snapshot.state,
+        JobState::Done(ExecutionOutcome::SpawnFailed)
+    );
     assert!(snapshot.started_at_ms.is_none());
     let events = registry.drain_events(16);
     assert!(events.iter().any(|event| matches!(
         event,
         JobEvent::Stopped {
-            stop: JobStop::SpawnFailed,
+            outcome: ExecutionOutcome::SpawnFailed,
             ..
         }
     )));
@@ -165,7 +168,10 @@ fn service_job_is_never_killed_by_an_implicit_deadline() {
     );
     assert_eq!(registry.cancel(id), Ok(JobCancel::Requested));
     let stopped = wait_terminal(&registry, id);
-    assert_eq!(stopped.state, JobState::Done(JobStop::Cancelled));
+    assert_eq!(
+        stopped.state,
+        JobState::Done(ExecutionOutcome::Cancelled(CancelEffect::Killed))
+    );
 }
 
 #[test]
@@ -176,7 +182,10 @@ fn hard_timeout_terminates_a_long_job() {
         .with_timeouts(JobTimeouts::default().with_hard(Duration::from_millis(60)));
     let id = registry.spawn(spec).expect("tracked");
     let stopped = wait_terminal(&registry, id);
-    assert_eq!(stopped.state, JobState::Done(JobStop::TimedOut));
+    assert_eq!(
+        stopped.state,
+        JobState::Done(ExecutionOutcome::TimedOut(DeadlineClock::Hard))
+    );
 }
 
 #[test]
@@ -187,7 +196,10 @@ fn idle_timeout_terminates_a_quiet_job() {
         .with_timeouts(JobTimeouts::default().with_idle(Duration::from_millis(80)));
     let id = registry.spawn(spec).expect("tracked");
     let stopped = wait_terminal(&registry, id);
-    assert_eq!(stopped.state, JobState::Done(JobStop::TimedOut));
+    assert_eq!(
+        stopped.state,
+        JobState::Done(ExecutionOutcome::TimedOut(DeadlineClock::Idle))
+    );
 }
 
 #[test]
@@ -204,7 +216,10 @@ fn output_activity_resets_the_idle_deadline() {
     assert_eq!(registry.get(id).expect("tracked").state, JobState::Running);
     assert_eq!(registry.cancel(id), Ok(JobCancel::Requested));
     let stopped = wait_terminal(&registry, id);
-    assert_eq!(stopped.state, JobState::Done(JobStop::Cancelled));
+    assert_eq!(
+        stopped.state,
+        JobState::Done(ExecutionOutcome::Cancelled(CancelEffect::Killed))
+    );
 }
 
 #[test]
@@ -214,11 +229,16 @@ fn cancel_is_requested_then_observed_as_a_terminal_state() {
     wait_running(&registry, id);
     assert_eq!(registry.cancel(id), Ok(JobCancel::Requested));
     let stopped = wait_terminal(&registry, id);
-    assert_eq!(stopped.state, JobState::Done(JobStop::Cancelled));
+    assert_eq!(
+        stopped.state,
+        JobState::Done(ExecutionOutcome::Cancelled(CancelEffect::Killed))
+    );
     // Repeated cancel on a terminal job is reported, never re-run.
     assert_eq!(
         registry.cancel(id),
-        Ok(JobCancel::AlreadyStopped(JobStop::Cancelled))
+        Ok(JobCancel::AlreadyStopped(ExecutionOutcome::Cancelled(
+            CancelEffect::Killed
+        )))
     );
 }
 
@@ -305,5 +325,8 @@ fn interactive_pty_job_runs_and_cancels() {
     wait_running(&registry, id);
     assert_eq!(registry.cancel(id), Ok(JobCancel::Requested));
     let stopped = wait_terminal(&registry, id);
-    assert_eq!(stopped.state, JobState::Done(JobStop::Cancelled));
+    assert_eq!(
+        stopped.state,
+        JobState::Done(ExecutionOutcome::Cancelled(CancelEffect::Killed))
+    );
 }

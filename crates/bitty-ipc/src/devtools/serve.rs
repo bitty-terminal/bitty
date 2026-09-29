@@ -1620,6 +1620,13 @@ where
     F: FnMut(u64) -> Result<(), IpcError>,
 {
     let mut stats = ConnectionStats::default();
+    // Amendment A4 (#1482): at most one open continuation reassembly per
+    // connection. Fragments are buffered here and never parsed, admitted, or
+    // dispatched until the logical request is complete; every violation
+    // replies once with `id` 0 and closes, so a partial request has no side
+    // effect. EOF mid-reassembly closes silently, and a stalled stream is
+    // reported as `ContinuationTimeout` when the read times out.
+    let mut reassembler = Reassembler::new();
     loop {
         let mut first = [0u8; 1];
         match stream.read(&mut first) {
@@ -1629,6 +1636,9 @@ where
                 if err.kind() == std::io::ErrorKind::TimedOut
                     || err.kind() == std::io::ErrorKind::WouldBlock =>
             {
+                if report_stalled_continuation(stream, &mut reassembler, clock_ms) {
+                    stats.framing_errors += 1;
+                }
                 return Ok(stats);
             }
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -1639,8 +1649,11 @@ where
             }
         }
         let mut rest = [0u8; 3];
-        if stream.read_exact(&mut rest).is_err() {
+        if let Err(err) = stream.read_exact(&mut rest) {
             stats.framing_errors += 1;
+            if is_read_timeout(&err) {
+                report_stalled_continuation(stream, &mut reassembler, clock_ms);
+            }
             return Ok(stats);
         }
         let len = u32::from_be_bytes([first[0], rest[0], rest[1], rest[2]]) as usize;
@@ -1660,11 +1673,12 @@ where
         match stream.read_exact(&mut payload) {
             Ok(()) => {}
             Err(err)
-                if err.kind() == std::io::ErrorKind::UnexpectedEof
-                    || err.kind() == std::io::ErrorKind::TimedOut
-                    || err.kind() == std::io::ErrorKind::WouldBlock =>
+                if err.kind() == std::io::ErrorKind::UnexpectedEof || is_read_timeout(&err) =>
             {
                 stats.framing_errors += 1;
+                if is_read_timeout(&err) {
+                    report_stalled_continuation(stream, &mut reassembler, clock_ms);
+                }
                 return Ok(stats);
             }
             Err(err) => {
@@ -1673,6 +1687,16 @@ where
                 });
             }
         }
+        let payload = match reassembler.accept(payload, clock_ms()) {
+            Ok(Accepted::Request(request)) => request,
+            Ok(Accepted::Pending) => continue,
+            Err(err) => {
+                stats.framing_errors += 1;
+                let response = id_zero_error("transport", err.code(), &err.message());
+                let _ = write_framed(stream, &response);
+                return Ok(stats);
+            }
+        };
         stats.requests += 1;
         if admit(clock_ms()).is_err() {
             stats.denied += 1;
@@ -1710,6 +1734,38 @@ where
             });
         }
     }
+}
+
+/// Whether a read failed because the stream stalled (socket read timeout).
+#[cfg(unix)]
+fn is_read_timeout(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    )
+}
+
+/// Discard a stalled continuation reassembly and report it once.
+///
+/// Returns `true` when a reassembly was open: its buffer is dropped without
+/// dispatch and the peer receives one `ContinuationTimeout` error with `id` 0
+/// (best effort; the connection closes either way). Returns `false` for an
+/// ordinary idle timeout with nothing buffered.
+#[cfg(unix)]
+fn report_stalled_continuation<S>(
+    stream: &mut S,
+    reassembler: &mut Reassembler,
+    clock_ms: &dyn Fn() -> u64,
+) -> bool
+where
+    S: Read + Write,
+{
+    let Some(err) = reassembler.stalled(clock_ms()) else {
+        return false;
+    };
+    let response = id_zero_error("transport", err.code(), &err.message());
+    let _ = write_framed(stream, &response);
+    true
 }
 
 /// Frame and write one response payload.

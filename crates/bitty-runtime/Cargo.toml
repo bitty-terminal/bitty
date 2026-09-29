@@ -37,6 +37,14 @@ bitty-rich = { path = "../bitty-rich" }
 # here independently.
 bitty-network-lua = { git = "https://github.com/bitty-terminal/bitty-network", rev = "d97c5da" }
 
+# CORE-RUN-003 (#1526): the supervisor claim lock is an OS-held `flock`.
+# Same workspace pins and platform split as `bitty-ipc` (no new crates).
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+rustix = { workspace = true, features = ["fs", "std"] }
+
+[target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly"))'.dependencies]
+nix = { workspace = true, features = ["fs"] }
+
 
 [dev-dependencies]
 bitty-agent = { path = "../bitty-agent" }

@@ -14,6 +14,17 @@ publish = true
 workspace = true
 
 [dependencies]
+# 128-bit automation bearer tokens (CTX-0792, #1403). A
+# bearer is the authority token for automation synthesize, capture, and
+# frame-digest, so every platform needs a real CSPRNG: std has none and
+# `unsafe_code` is denied workspace-wide, so raw platform RNG FFI is not an
+# option. `getrandom 0.4` is already a direct dependency of `bitty-rich` for
+# the same purpose (clipboard grant tokens) and already in the lockfile, so
+# this edge adds no new supply-chain surface. One CSPRNG for the whole tree
+# keeps token entropy auditable in a single place, and there is no weaker
+# fallback: a platform that cannot produce unpredictable bytes fails issuance
+# closed. See `fill_secure_random` in src/devtools/automation.rs.
+getrandom = "0.4"
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 rustix = { workspace = true, features = ["fs", "net", "process", "std"] }

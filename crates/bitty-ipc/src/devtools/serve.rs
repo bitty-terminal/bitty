@@ -18,6 +18,8 @@ use std::fmt;
 #[cfg(unix)]
 use std::io::{Read, Write};
 use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::Mutex;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 // ── socket path ─────────────────────────────────────────────────────────────
@@ -330,22 +332,46 @@ impl ConnectedPeerProof {
 /// ambient authority). `session_id` binds automation bearers to one debug
 /// session: a bearer issued for another session fails closed with
 /// `ScopeDenied` even when the token is otherwise valid.
-#[derive(Clone)]
+/// Not `Clone`: it owns the connection's [`crate::ctl::ConnectionGrant`], and a
+/// clone would share (and revoke) one connection's authority.
+///
+/// `local_attested` and `peer` stay private (CTX-0768, P0-AC-021): the only way
+/// to reach the local-transport mark is
+/// [`attest_local_peer`](ServeContext::attest_local_peer), which requires a
+/// [`VerifiedPeer`] marker that equals the bound [`ConnectedPeerProof`], and
+/// the only way to bind that proof is a real accepted-stream attestation.
+/// A `pub` field would let any caller set the mark directly and would defeat
+/// the per-dispatch recheck. Debug is hand-written below because
+/// `ConnectedPeerProof` is not `Debug`; it deliberately reports
+/// `local_attested` and `peer_bound` for peer-proof diagnostics.
 pub struct ServeContext {
     /// Server facts.
     pub server: ServerInfo,
     /// Uptime at request time (millis). Automation handlers reuse this as
     /// the deterministic bearer/rate clock (headless, no wall-clock).
     pub uptime_ms: u64,
-    /// Server-evaluated granted scopes for this peer.
-    pub granted: crate::scope::ScopeSet,
-    /// Opaque debug-session identity for bearer binding (per connection;
-    /// the servo must set a distinct id per accepted connection).
-    pub session_id: String,
+    /// Construction-time scopes: the hermetic contexts' answer. Authority-bound
+    /// contexts never read it for a decision; use
+    /// [`ServeContext::current_authorization`]. Private so no caller can
+    /// widen it or mistake it for live authority.
+    granted: crate::scope::ScopeSet,
+    /// Opaque debug-session identity used for bearer binding and audit
+    /// attribution; minted by the connection authority on served connections.
+    session_id: String,
     local_attested: bool,
     peer: Option<ConnectedPeerProof>,
     #[cfg(test)]
     test_dispatch: bool,
+    /// Server-owned connection authority (CTX-0792, #1403). `None` only on
+    /// hermetic test/harness constructors, which set `authority_required` to
+    /// `false` so they cannot silently authorize production traffic.
+    connection_grant: Option<crate::ctl::ConnectionGrant>,
+    /// Server-owned per-terminal capability intersection (CTX-0792, #1404).
+    /// Authoritative value is read from the live grant via
+    /// [`Self::current_authorization`]; this copy is the hermetic answer for
+    /// `authority_required == false` contexts only.
+    terminal_capabilities: crate::ctl::TerminalCapabilities,
+    authority_required: bool,
 }
 
 impl fmt::Debug for ServeContext {
@@ -358,7 +384,16 @@ impl fmt::Debug for ServeContext {
             .field("session_id", &self.session_id)
             .field("local_attested", &self.local_attested)
             .field("peer_bound", &self.peer.is_some())
+            .field("authority_required", &self.authority_required)
             .finish()
+    }
+}
+
+impl Drop for ServeContext {
+    /// Session end on every exit path (including unwinding): the connection
+    /// authority and its automation bearers never outlive the context.
+    fn drop(&mut self) {
+        self.close_connection();
     }
 }
 
@@ -367,22 +402,35 @@ impl ServeContext {
     ///
     /// Granted scopes default to the CLI interactive set plus the explicit
     /// `BITTY_CTL_ELEVATE` allowlist (impure: reads one env var; tests that
-    /// need hermetic scopes use [`ServeContext::with_granted`]).
-    /// `session_id` defaults to `"local"`; the servo overrides it per
-    /// connection before dispatch.
+    /// need hermetic scopes use [`ServeContext::with_granted`]). The context
+    /// owns a standalone [`crate::ctl::ControlAuthority`] session, so it is
+    /// authority-bound like a served connection; the accept path uses
+    /// [`ServeContext::with_connection_grant`] with the listener's shared
+    /// authority instead.
     #[must_use]
     pub fn new(server: &ServerInfo) -> Self {
+        let granted =
+            crate::ctl::elevation_from_env(std::env::var("BITTY_CTL_ELEVATE").ok().as_deref());
+        let authority = crate::ctl::ControlAuthority::new();
+        let capabilities = crate::ctl::TerminalCapabilities::from_scopes(&granted);
+        let grant = authority
+            .open_connection(granted.clone(), capabilities.clone())
+            .ok();
         Self {
             server: server.clone(),
             uptime_ms: server.uptime_ms(),
-            granted: crate::ctl::elevation_from_env(
-                std::env::var("BITTY_CTL_ELEVATE").ok().as_deref(),
-            ),
-            session_id: String::from("local"),
+            session_id: grant
+                .as_ref()
+                .map(|grant| grant.session_id().to_string())
+                .unwrap_or_else(|| String::from("local")),
+            granted,
             local_attested: false,
             peer: None,
             #[cfg(test)]
             test_dispatch: false,
+            terminal_capabilities: capabilities,
+            connection_grant: grant,
+            authority_required: true,
         }
     }
 
@@ -520,6 +568,36 @@ impl ServeContext {
         }
     }
 
+    /// Build the production per-connection context from a server-owned
+    /// [`crate::ctl::ConnectionGrant`] (CTX-0792, #1403).
+    ///
+    /// This is the only constructor a served connection uses. It does **not**
+    /// establish peer proof: dispatch stays fail-closed until
+    /// [`Self::bind_connected_stream`] succeeds, so an accepted-stream
+    /// attestation is still required even though authority is already bound.
+    /// Granted scopes, session id, and the per-terminal capability set are all
+    /// read from the grant, so a context can never widen what the authority
+    /// consented to.
+    #[must_use]
+    pub fn with_connection_grant(server: &ServerInfo, grant: crate::ctl::ConnectionGrant) -> Self {
+        let snapshot = grant
+            .snapshot()
+            .unwrap_or_else(|_| grant.initial_snapshot().clone());
+        Self {
+            server: server.clone(),
+            uptime_ms: server.uptime_ms(),
+            granted: snapshot.scopes.clone(),
+            session_id: snapshot.identity.session_id.clone(),
+            local_attested: false,
+            peer: None,
+            #[cfg(test)]
+            test_dispatch: false,
+            terminal_capabilities: snapshot.terminal_capabilities,
+            connection_grant: Some(grant),
+            authority_required: true,
+        }
+    }
+
     /// Build an unbound context with explicit granted scopes.
     ///
     /// This constructor does not establish peer proof; dispatch remains
@@ -529,19 +607,24 @@ impl ServeContext {
         Self {
             server: server.clone(),
             uptime_ms: server.uptime_ms(),
+            terminal_capabilities: crate::ctl::TerminalCapabilities::from_scopes(&granted),
             granted,
             session_id: String::from("local"),
             local_attested: false,
             peer: None,
             #[cfg(test)]
             test_dispatch: false,
+            connection_grant: None,
+            authority_required: false,
         }
     }
 
     /// Build an unbound context with explicit scopes and session binding.
     ///
     /// This constructor does not establish peer proof; dispatch remains
-    /// fail-closed until [`Self::bind_connected_stream`] succeeds.
+    /// fail-closed until [`Self::bind_connected_stream`] succeeds. The terminal
+    /// capability wildcard is exactly `granted`: nothing is added, so a harness
+    /// that reads the grid must grant `terminal.inspect` explicitly.
     #[must_use]
     pub fn with_granted_session(
         server: &ServerInfo,
@@ -558,13 +641,36 @@ impl ServeContext {
         Self {
             server: server.clone(),
             uptime_ms: server.uptime_ms(),
+            terminal_capabilities: crate::ctl::TerminalCapabilities::from_scopes(&granted),
             granted,
             session_id: id,
             local_attested: false,
             peer: None,
             #[cfg(test)]
             test_dispatch: false,
+            connection_grant: None,
+            authority_required: false,
         }
+    }
+
+    /// Hermetic authority context: a real [`crate::ctl::ConnectionGrant`] plus
+    /// the `test_dispatch` seam.
+    ///
+    /// Mirrors [`Self::with_granted_for_tests`] for the authority path: hermetic
+    /// unit tests have no accepted stream, so the per-dispatch peer recheck
+    /// (CTX-0768) would fail closed and shadow the behaviour under test. The
+    /// grant itself is real and `authority_required` stays `true`, so scope,
+    /// consent-generation, and terminal-capability behaviour is exercised
+    /// exactly as in production — only peer proof is stubbed. Production code
+    /// must use [`Self::with_connection_grant`] and bind a real proof.
+    #[cfg(test)]
+    pub(crate) fn with_connection_grant_for_tests(
+        server: &ServerInfo,
+        grant: crate::ctl::ConnectionGrant,
+    ) -> Self {
+        let mut context = Self::with_connection_grant(server, grant);
+        context.test_dispatch = true;
+        context
     }
 
     #[cfg(test)]
@@ -586,6 +692,132 @@ impl ServeContext {
         let mut context = Self::with_granted_session(server, granted, session_id);
         context.test_dispatch = true;
         context
+    }
+
+    /// The server-owned connection grant, when this context has one.
+    #[must_use]
+    pub fn connection_grant(&self) -> Option<&crate::ctl::ConnectionGrant> {
+        self.connection_grant.as_ref()
+    }
+
+    /// Session identity for bearer binding and audit attribution.
+    #[must_use]
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// Construction-time scopes (hermetic contexts' explicit grant). Not a
+    /// live authorization: decisions use [`Self::current_authorization`].
+    #[must_use]
+    pub fn construction_scopes(&self) -> &crate::scope::ScopeSet {
+        &self.granted
+    }
+
+    /// Whether requests must be authorized by the connection authority
+    /// (`true` for every production and `ServeContext::new` context; `false`
+    /// only for the explicit-scope hermetic constructors).
+    #[must_use]
+    pub fn authority_required(&self) -> bool {
+        self.authority_required
+    }
+
+    /// Fresh server-owned authorization for this request.
+    ///
+    /// Never cached: a live connection reads the current grant, so a scope
+    /// revocation or a session-end revoke takes effect on the next request
+    /// instead of at the next connection. Peer proof is orthogonal and is
+    /// enforced separately by [`Self::recheck_before_dispatch`]; a context with
+    /// authority but no bound peer proof still fails closed.
+    pub fn current_authorization(&self) -> Result<crate::ctl::AuthorizationSnapshot, IpcError> {
+        if self.authority_required {
+            return self
+                .connection_grant
+                .as_ref()
+                .ok_or_else(|| IpcError::Unauthenticated {
+                    reason: "connection authority is unavailable".into(),
+                })?
+                .snapshot();
+        }
+        Ok(crate::ctl::AuthorizationSnapshot {
+            identity: crate::ctl::ConnectionIdentity {
+                principal_id: String::new(),
+                session_id: self.session_id.clone(),
+                consent_generation: 0,
+            },
+            scopes: self.granted.clone(),
+            terminal_capabilities: self.terminal_capabilities.clone(),
+        })
+    }
+
+    /// Whether the live authorization holds `scope`.
+    #[must_use]
+    pub fn has_scope(&self, scope: crate::scope::Scope) -> bool {
+        self.current_authorization()
+            .is_ok_and(|snapshot| snapshot.scopes.contains(scope))
+    }
+
+    /// Whether the live authorization holds any of `scopes`.
+    #[must_use]
+    pub fn has_any_scope(&self, scopes: &[crate::scope::Scope]) -> bool {
+        self.current_authorization()
+            .is_ok_and(|snapshot| scopes.iter().any(|scope| snapshot.scopes.contains(*scope)))
+    }
+
+    /// Terminal capability intersection under the live authorization
+    /// ([`crate::ctl::AuthorizationSnapshot::allows_terminal`]).
+    #[must_use]
+    pub fn allows_terminal_capability(
+        &self,
+        terminal_id: Option<&str>,
+        scope: crate::scope::Scope,
+    ) -> bool {
+        self.current_authorization()
+            .is_ok_and(|snapshot| snapshot.allows_terminal(terminal_id, scope))
+    }
+
+    /// End this connection's session: revoke its authority and every
+    /// automation bearer bound to it (idempotent; `Drop` calls it too).
+    pub fn close_connection(&self) {
+        if let Some(grant) = &self.connection_grant {
+            grant.close();
+            super::automation::revoke_automation_session(grant.session_id());
+        }
+    }
+
+    /// Issue an automation bearer bound to this connection's live session,
+    /// principal, and consent generation (CTX-0792, #1403).
+    ///
+    /// Test-only seam: the connection's scopes are the operator ceiling
+    /// (`BITTY_CTL_ELEVATE` on top of the CLI default), not an explicit
+    /// local-user consent, and the accepted contract forbids issuance from
+    /// environment or configuration. No production path may issue a bearer
+    /// until the consent flow exists.
+    ///
+    /// # Errors
+    ///
+    /// `Unauthenticated` without a live connection authority, `ScopeDenied`
+    /// when the connection lacks the family's debug and terminal scopes, and
+    /// the store's bound/entropy errors.
+    #[cfg(test)]
+    pub(crate) fn issue_automation_bearer(
+        &self,
+        terminal_id: &str,
+        family: super::automation::AutomationFamily,
+        now_ms: u64,
+    ) -> Result<String, IpcError> {
+        let grant = self
+            .connection_grant
+            .as_ref()
+            .ok_or_else(|| IpcError::Unauthenticated {
+                reason: "automation issuance requires a live connection authority".into(),
+            })?;
+        super::automation::issue_automation_bearer_for_connection(
+            grant,
+            terminal_id,
+            family,
+            now_ms,
+            None,
+        )
     }
 }
 
@@ -1196,7 +1428,7 @@ where
         });
     }
     context.recheck_before_read(proof)?;
-    serve_connection_inner(stream, dispatcher, context, limiter, clock_ms)
+    serve_connection_with_limiter(stream, dispatcher, context, limiter, clock_ms)
 }
 
 #[cfg(all(test, unix))]
@@ -1240,11 +1472,16 @@ where
     S: Read + Write,
 {
     context.recheck_connection(Some(&peer))?;
-    serve_connection_inner(stream, dispatcher, context, limiter, clock_ms)
+    serve_connection_with_limiter(stream, dispatcher, context, limiter, clock_ms)
 }
 
+/// Serve a generic stream under a single caller-supplied per-connection budget.
+///
+/// Thin adapter over [`serve_connection_inner`]: keeps CTX-0768's
+/// `&mut RateLimiter` entry point intact for the callers that already own a
+/// per-connection limiter, without duplicating the request loop.
 #[cfg(unix)]
-fn serve_connection_inner<S>(
+fn serve_connection_with_limiter<S>(
     stream: &mut S,
     dispatcher: &Dispatcher,
     context: &ServeContext,
@@ -1253,6 +1490,134 @@ fn serve_connection_inner<S>(
 ) -> Result<ConnectionStats, IpcError>
 where
     S: Read + Write,
+{
+    serve_connection_inner(stream, dispatcher, context, clock_ms, |now| {
+        limiter.check(now)
+    })
+}
+
+/// Endpoint-wide RC-9 admission shared by every connection (CTX-0792, #1404).
+///
+/// One token bucket per listener at the accepted RC-9 figures (100 req/s
+/// sustained, 200 burst), so the aggregate request rate is bounded no matter
+/// how many connections a peer opens, while a single conforming client still
+/// gets the full documented budget.
+///
+/// A poisoned endpoint lock is recovered with `PoisonError::into_inner` — the
+/// pattern used by every other shared lock in this crate — instead of denying
+/// IPC traffic for the rest of the process. Recovery is bounded: the inner
+/// value is a token bucket whose timestamp window is evicted per check
+/// ([`crate::limits::RateLimiter`]), so a recovered limiter cannot grow and
+/// keeps enforcing the remaining budget.
+#[cfg(unix)]
+fn endpoint_admit(
+    endpoint: &Arc<Mutex<RateLimiter>>,
+) -> impl FnMut(u64) -> Result<(), IpcError> + '_ {
+    move |now| {
+        endpoint
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .check(now)
+    }
+}
+
+/// Serve one bound Unix connection under the shared endpoint budget, with
+/// peer proof.
+///
+/// This is the **production** accept-path entry point (CTX-0768 peer proof +
+/// CTX-0792 endpoint budget, #1404). It keeps the whole CTX-0768 preamble
+/// before a single byte is served:
+///
+/// 1. the [`ConnectedPeerProof`] must match the accepted stream's
+///    dev/ino identity, so a proof captured from one descriptor cannot be
+///    replayed onto another;
+/// 2. [`ServeContext::recheck_before_read`] re-verifies the live peer against
+///    the bound identity, so a peer that changed after accept is refused.
+///
+/// Only then does it admit requests through [`endpoint_admit`]. Peer proof
+/// and rate admission are independent controls: neither substitutes for the
+/// other, and this function refuses before either is consulted if the proof
+/// does not hold.
+#[cfg(unix)]
+pub fn serve_bound_connection_with_endpoint_budget(
+    stream: &mut std::os::unix::net::UnixStream,
+    proof: &ConnectedPeerProof,
+    dispatcher: &Dispatcher,
+    context: &ServeContext,
+    endpoint_limiter: &Arc<Mutex<RateLimiter>>,
+    clock_ms: &dyn Fn() -> u64,
+) -> Result<ConnectionStats, IpcError> {
+    if !proof.matches_stream_with(stream, crate::peer::stream_identity)? {
+        return Err(IpcError::Unauthenticated {
+            reason: "connected peer proof does not match the accepted stream".into(),
+        });
+    }
+    context.recheck_before_read(proof)?;
+    serve_connection_inner(
+        stream,
+        dispatcher,
+        context,
+        clock_ms,
+        endpoint_admit(endpoint_limiter),
+    )
+}
+
+/// Hermetic generic-stream variant of
+/// [`serve_bound_connection_with_endpoint_budget`] (tests only).
+///
+/// It has no accepted stream to match a proof against, so it rechecks the
+/// supplied [`VerifiedPeer`] against the context instead, exactly like the
+/// test-only generic `serve_connection`.
+#[cfg(all(test, unix))]
+pub(crate) fn serve_connection_with_shared_limiter<S>(
+    stream: &mut S,
+    peer: VerifiedPeer,
+    dispatcher: &Dispatcher,
+    context: &ServeContext,
+    endpoint_limiter: &Arc<Mutex<RateLimiter>>,
+    clock_ms: &dyn Fn() -> u64,
+) -> Result<ConnectionStats, IpcError>
+where
+    S: Read + Write,
+{
+    context.recheck_connection(Some(&peer))?;
+    serve_connection_inner(
+        stream,
+        dispatcher,
+        context,
+        clock_ms,
+        endpoint_admit(endpoint_limiter),
+    )
+}
+
+#[cfg(all(test, unix))]
+impl Dispatcher {
+    pub(crate) fn serve_connection_with_shared_limiter<S>(
+        &self,
+        stream: &mut S,
+        peer: VerifiedPeer,
+        context: &ServeContext,
+        limiter: &Arc<Mutex<RateLimiter>>,
+        clock_ms: &dyn Fn() -> u64,
+    ) -> Result<ConnectionStats, IpcError>
+    where
+        S: Read + Write,
+    {
+        serve_connection_with_shared_limiter(stream, peer, self, context, limiter, clock_ms)
+    }
+}
+
+#[cfg(unix)]
+fn serve_connection_inner<S, F>(
+    stream: &mut S,
+    dispatcher: &Dispatcher,
+    context: &ServeContext,
+    clock_ms: &dyn Fn() -> u64,
+    mut admit: F,
+) -> Result<ConnectionStats, IpcError>
+where
+    S: Read + Write,
+    F: FnMut(u64) -> Result<(), IpcError>,
 {
     let mut stats = ConnectionStats::default();
     loop {
@@ -1309,7 +1674,7 @@ where
             }
         }
         stats.requests += 1;
-        if limiter.check(clock_ms()).is_err() {
+        if admit(clock_ms()).is_err() {
             stats.denied += 1;
             let id = match parse_request(&payload) {
                 Ok(request) => request.id_raw,

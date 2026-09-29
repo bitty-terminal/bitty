@@ -63,10 +63,7 @@ const MAX_BATCH_BYTES: u64 = 8 * 1024;
 /// Require any debug scope (the accepted read surface: `debug.inspect` or
 /// the wider `debug.trace` / `debug.control`).
 fn require_inspect_scope(context: &ServeContext, method: &str) -> Result<(), HandlerError> {
-    if context.granted.contains(Scope::DebugInspect)
-        || context.granted.contains(Scope::DebugTrace)
-        || context.granted.contains(Scope::DebugControl)
-    {
+    if context.has_any_scope(&[Scope::DebugInspect, Scope::DebugTrace, Scope::DebugControl]) {
         return Ok(());
     }
     Err(HandlerError::new(
@@ -79,8 +76,7 @@ fn require_inspect_scope(context: &ServeContext, method: &str) -> Result<(), Han
 /// Require `debug.trace` (or the wider `debug.control`) for the event
 /// stream, mirroring the trace-lifecycle gate.
 fn require_trace_scope(context: &ServeContext, method: &str) -> Result<(), HandlerError> {
-    if context.granted.contains(Scope::DebugTrace) || context.granted.contains(Scope::DebugControl)
-    {
+    if context.has_scope(Scope::DebugTrace) || context.has_scope(Scope::DebugControl) {
         return Ok(());
     }
     Err(HandlerError::new(
@@ -93,7 +89,7 @@ fn require_trace_scope(context: &ServeContext, method: &str) -> Result<(), Handl
 /// Require exactly `debug.control` for lifecycle verbs (generation suspend,
 /// resume, disposal affect live VM state).
 fn require_control_scope(context: &ServeContext, method: &str) -> Result<(), HandlerError> {
-    if context.granted.contains(Scope::DebugControl) {
+    if context.has_scope(Scope::DebugControl) {
         return Ok(());
     }
     Err(HandlerError::new(

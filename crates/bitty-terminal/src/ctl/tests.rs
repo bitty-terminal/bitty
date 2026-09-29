@@ -1,6 +1,6 @@
-#[cfg(unix)]
-use super::apply::drain_global_control_queue_with;
 use super::apply::{apply_control_envelope, snapshot_text};
+#[cfg(unix)]
+use super::apply::{drain_global_control_queue_with, drain_global_control_queue_with_barrier};
 use super::client::extract_string_from;
 #[cfg(unix)]
 use super::client::parse_ctl_response;
@@ -2625,12 +2625,15 @@ fn drain_offers_layout_mutations_to_the_pre_mutation_hook() {
     ipc_ctl::global_control_queue()
         .lock()
         .expect("queue lock")
-        .push_back(ipc_ctl::PendingControl::new(
-            ipc_ctl::METHOD_SPLIT_VIEW,
-            Some(&ipc_ctl::params_split(ipc_ctl::SplitDirection::Right)),
-            "1",
-            tx,
-        ));
+        .push_back(
+            ipc_ctl::PendingControl::new(
+                ipc_ctl::METHOD_SPLIT_VIEW,
+                Some(&ipc_ctl::params_split(ipc_ctl::SplitDirection::Right)),
+                "1",
+                tx,
+            )
+            .expect("sequence allocation"),
+        );
     let mut seen: Option<String> = None;
     let drained = drain_global_control_queue_with(
         &mut rt,
@@ -2659,16 +2662,18 @@ fn drain_withdraws_expired_control_without_effect() {
     ipc_ctl::global_control_queue()
         .lock()
         .expect("queue lock")
-        .push_back(ipc_ctl::PendingControl::with_deadline(
-            ipc_ctl::METHOD_SPLIT_VIEW,
-            Some(&ipc_ctl::params_split(ipc_ctl::SplitDirection::Right)),
-            "1",
-            tx,
-            // Already past: the caller gave up before this drain ran.
-            std::time::Instant::now()
-                .checked_sub(std::time::Duration::from_secs(1))
-                .unwrap_or_else(std::time::Instant::now),
-        ));
+        .push_back(
+            ipc_ctl::PendingControl::with_deadline(
+                ipc_ctl::METHOD_SPLIT_VIEW,
+                Some(&ipc_ctl::params_split(ipc_ctl::SplitDirection::Right)),
+                "1",
+                tx,
+                std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(1))
+                    .unwrap_or_else(std::time::Instant::now),
+            )
+            .expect("sequence allocation"),
+        );
     let mut hook_calls = 0usize;
     let drained =
         drain_global_control_queue_with(&mut rt, &bitty_ipc::ScopeSet::cli_default(), |_, _| {
@@ -2684,10 +2689,11 @@ fn drain_withdraws_expired_control_without_effect() {
         leaves_before,
         "the timed-out split must never land on the layout"
     );
-    assert!(
-        rx.try_recv().is_err(),
-        "withdrawal sends no late success the caller could mistake for applied"
-    );
+    let reply = rx
+        .try_recv()
+        .expect("expired entry gets one terminal reply");
+    assert!(!reply.ok);
+    assert_eq!(reply.code, "Unavailable");
     assert!(ipc_ctl::pop_pending_control().is_none());
 }
 
@@ -2713,7 +2719,8 @@ fn timed_out_waiter_never_observes_a_post_timeout_effect() {
             "1",
             tx,
             std::time::Instant::now(),
-        );
+        )
+        .expect("sequence allocation");
         let seq = item.seq;
         ipc_ctl::global_control_queue()
             .lock()
@@ -2734,6 +2741,172 @@ fn timed_out_waiter_never_observes_a_post_timeout_effect() {
         leaves_before,
         "no post-timeout effect may land"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn queued_control_rechecks_revoked_consent_before_mutation() {
+    let _guard = hold_wm_lock();
+    let mut rt = headless_runtime();
+    let leaves_before = rt.leaf_count();
+    let authority = ipc_ctl::ControlAuthority::new();
+    let grant = authority
+        .open_connection(
+            bitty_ipc::ScopeSet::all(),
+            ipc_ctl::TerminalCapabilities::from_scopes(&bitty_ipc::ScopeSet::all()),
+        )
+        .expect("connection grant");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let pending = ipc_ctl::PendingControl::with_connection(
+        ipc_ctl::METHOD_SPLIT_VIEW,
+        Some(&ipc_ctl::params_split(ipc_ctl::SplitDirection::Right)),
+        "1",
+        tx,
+        &grant,
+    )
+    .expect("queued control");
+    ipc_ctl::global_control_queue()
+        .lock()
+        .expect("queue lock")
+        .push_back(pending);
+    assert!(authority.revoke_scope(grant.session_id(), bitty_ipc::Scope::ViewManage));
+    let mut hook_calls = 0usize;
+    let drained = drain_global_control_queue_with(&mut rt, &bitty_ipc::ScopeSet::new(), |_, _| {
+        hook_calls += 1
+    });
+    assert_eq!(drained, 1);
+    assert_eq!(hook_calls, 0);
+    assert_eq!(rt.leaf_count(), leaves_before);
+    let reply = rx.try_recv().expect("revocation reply");
+    assert!(!reply.ok);
+}
+
+#[cfg(unix)]
+#[test]
+fn queued_control_intersects_terminal_capability() {
+    let _guard = hold_wm_lock();
+    let mut rt = headless_runtime();
+    let mut capabilities = ipc_ctl::TerminalCapabilities::new();
+    capabilities
+        .grant("t:1", bitty_ipc::Scope::TerminalInspect)
+        .expect("terminal capability");
+    let authority = ipc_ctl::ControlAuthority::new();
+    let grant = authority
+        .open_connection(bitty_ipc::ScopeSet::all(), capabilities)
+        .expect("connection grant");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let pending = ipc_ctl::PendingControl::with_connection(
+        ipc_ctl::METHOD_SEND_INPUT,
+        Some(&ipc_ctl::params_send_input("t:1", "x")),
+        "1",
+        tx,
+        &grant,
+    )
+    .expect("queued control");
+    ipc_ctl::global_control_queue()
+        .lock()
+        .expect("queue lock")
+        .push_back(pending);
+    let drained = drain_global_control_queue_with(&mut rt, &bitty_ipc::ScopeSet::new(), |_, _| {
+        panic!("capability denial must not mutate layout")
+    });
+    assert_eq!(drained, 1);
+    assert!(!rx.try_recv().expect("capability reply").ok);
+}
+
+/// CTX-0792 / #1403: a client-side timeout is final. An entry that is claimed
+/// and then crosses into the apply margin before the apply begins is
+/// withdrawn, never applied — so the drain can never land an effect the
+/// client already gave up on, and the apply phase is never entered after the
+/// deadline budget ran out.
+#[cfg(unix)]
+#[test]
+fn claimed_control_past_its_deadline_never_applies() {
+    let _guard = hold_wm_lock();
+    let mut rt = headless_runtime();
+    let leaves_before = rt.leaf_count();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let pending = ipc_ctl::PendingControl::with_deadline(
+        ipc_ctl::METHOD_SPLIT_VIEW,
+        Some(&ipc_ctl::params_split(ipc_ctl::SplitDirection::Right)),
+        "1",
+        tx,
+        std::time::Instant::now()
+            + ipc_ctl::CTL_APPLY_MARGIN
+            + std::time::Duration::from_millis(200),
+    )
+    .expect("queued control");
+    ipc_ctl::global_control_queue()
+        .lock()
+        .expect("queue lock")
+        .push_back(pending);
+    let mut hook_calls = 0usize;
+    let drained = drain_global_control_queue_with_barrier(
+        &mut rt,
+        &bitty_ipc::ScopeSet::all(),
+        |_, _| hook_calls += 1,
+        // The claim already happened; cross into the margin before the apply.
+        |_| std::thread::sleep(std::time::Duration::from_millis(400)),
+    );
+    assert_eq!(drained, 1);
+    assert_eq!(hook_calls, 0, "an expired entry must not reach mutation");
+    assert_eq!(
+        rt.leaf_count(),
+        leaves_before,
+        "no post-timeout effect may land"
+    );
+    // The only reply is the honest no-effect timeout.
+    let reply = rx.try_recv().expect("no-effect timeout reply");
+    assert!(!reply.ok);
+    assert!(reply.message.contains("timed out"), "{}", reply.message);
+    assert!(rx.try_recv().is_err(), "exactly one outcome");
+}
+
+#[cfg(unix)]
+#[test]
+fn claimed_control_timeout_cancels_before_apply() {
+    let _guard = hold_wm_lock();
+    let mut rt = headless_runtime();
+    let leaves_before = rt.leaf_count();
+    let authority = ipc_ctl::ControlAuthority::new();
+    let grant = authority
+        .open_connection(
+            bitty_ipc::ScopeSet::all(),
+            ipc_ctl::TerminalCapabilities::from_scopes(&bitty_ipc::ScopeSet::all()),
+        )
+        .expect("connection grant");
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let pending = ipc_ctl::PendingControl::with_connection(
+        ipc_ctl::METHOD_SPLIT_VIEW,
+        Some(&ipc_ctl::params_split(ipc_ctl::SplitDirection::Right)),
+        "1",
+        tx,
+        &grant,
+    )
+    .expect("queued control");
+    ipc_ctl::global_control_queue()
+        .lock()
+        .expect("queue lock")
+        .push_back(pending);
+    let mut hook_calls = 0usize;
+    let drained = drain_global_control_queue_with_barrier(
+        &mut rt,
+        &bitty_ipc::ScopeSet::new(),
+        |_, _| hook_calls += 1,
+        |item| {
+            assert!(item.ticket().cancel());
+            let _ = item.reply.send(ipc_ctl::ControlReply {
+                ok: false,
+                result_json: String::new(),
+                category: "transport",
+                code: "Unavailable",
+                message: String::from("control timed out"),
+            });
+        },
+    );
+    assert_eq!(drained, 1);
+    assert_eq!(hook_calls, 0);
+    assert_eq!(rt.leaf_count(), leaves_before);
 }
 
 // ── CTX-0539: post-connect server-identity binding ─────────────────────

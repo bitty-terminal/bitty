@@ -19,6 +19,10 @@ use crate::error::RenderError;
 /// comfortably above worst-case terminal font sets).
 pub const DEFAULT_ATLAS_DIMENSION: u16 = 2048;
 
+/// Initial atlas side length for lazy allocation (512x512 = 256 KiB).
+/// The atlas grows on demand up to DEFAULT_ATLAS_DIMENSION.
+pub const INITIAL_ATLAS_DIMENSION: u16 = 512;
+
 /// Fixed dimensions of an atlas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AtlasDims {

@@ -175,7 +175,8 @@ fn atlas_upload_bookkeeping_goes_full_clean_strip() {
     );
 
     // Row stride stays upload-aligned for real atlas sizes.
-    assert_eq!(padded_bytes_per_row(u32::from(dims.width)), 2048);
+    // After lazy allocation, initial atlas is 512×512.
+    assert_eq!(padded_bytes_per_row(u32::from(dims.width)), 512);
     assert_eq!(padded_bytes_per_row(100), 256);
 }
 

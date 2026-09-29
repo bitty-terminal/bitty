@@ -649,15 +649,34 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "missing phase {expected}");
         }
-        // Bounded: each elapsed < 15 s (no unbounded hang; relaxed from 5s for
-        // Windows wgpu slow path where wgpu_init_probe was 10.2s in run 33474778404).
+        // Stuck detection only: this test proves coverage, not PB-1 speed
+        // (that lives in the `startup_real` bench and its baselines).
         for p in &report.phases {
+            let bound = stuck_bound(p.name);
             assert!(
-                p.elapsed.as_secs() < 15,
-                "phase {} elapsed {:?} exceeds bounded 15s",
+                p.elapsed < bound,
+                "phase {} elapsed {:?} looks stuck (bound {bound:?})",
                 p.name,
                 p.elapsed
             );
+        }
+    }
+
+    /// Stuck-detector bound for in-process phases (config, runtime, PTY,
+    /// synthetic frame). These never touch the host display stack.
+    const PHASE_STUCK_BOUND: Duration = Duration::from_secs(15);
+
+    /// Stuck-detector bound for the winit/wgpu display probes. Adapter
+    /// enumeration on software-rendered CI runners (Windows WARP) has taken
+    /// 10.2 s and 18.6 s, so a tight bound only measures the runner. Kept
+    /// below the nextest `terminate-after` window (3 x 60 s) so a genuinely
+    /// stuck probe fails this assertion instead of the harness timeout.
+    const DISPLAY_PROBE_STUCK_BOUND: Duration = Duration::from_secs(90);
+
+    fn stuck_bound(phase: &str) -> Duration {
+        match phase {
+            "winit_window_probe" | "wgpu_init_probe" => DISPLAY_PROBE_STUCK_BOUND,
+            _ => PHASE_STUCK_BOUND,
         }
     }
 

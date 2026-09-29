@@ -33,7 +33,7 @@ use super::model::{
     MAX_SIGNAL_WINDOW_MS, MAX_SIGNALS_PER_WINDOW, MAX_WRITE_INPUT_BYTES, MAX_WRITE_INPUT_WINDOW_MS,
     MAX_WRITES_PER_WINDOW, SignalOutcome, TransferReceipt,
 };
-use super::output::{OutputIndex, OutputSink, OutputView, ReadOutput};
+use super::output::{OutputIndex, OutputSink, OutputStream, OutputView, ReadOutput};
 use super::sensitive_input::{EchoState, InteractionClass, automated_input_allowed};
 
 /// Default registry capacity.
@@ -131,6 +131,11 @@ impl JobRegistry {
     /// [`crate::ColdQueue`] follows the same rule).
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
+        Self::with_worker_spawner(capacity, spawn_worker)
+    }
+
+    /// Registry whose backends start drain workers through `worker_spawner`.
+    fn with_worker_spawner(capacity: usize, worker_spawner: WorkerSpawner) -> Self {
         assert!(capacity > 0, "job registry capacity must be > 0");
         Self {
             shared: Arc::new(Mutex::new(RegistryInner {
@@ -138,6 +143,7 @@ impl JobRegistry {
                 next_id: 1,
                 jobs: BTreeMap::new(),
                 events: DeliveryLog::new(),
+                worker_spawner,
             })),
         }
     }
@@ -1195,6 +1201,23 @@ struct RegistryInner {
     next_id: u64,
     jobs: BTreeMap<JobId, JobRecord>,
     events: DeliveryLog,
+    /// Starts drain workers; a test seam for spawn failures (CORE-RUN-005).
+    worker_spawner: WorkerSpawner,
+}
+
+/// Starts one named worker thread for a job backend.
+///
+/// Production uses [`spawn_worker`]; the unit tests inject a failing spawner
+/// to prove a drain that cannot start never leaves a live, undrained job.
+type WorkerSpawner =
+    fn(String, Box<dyn FnOnce() + Send + 'static>) -> std::io::Result<thread::JoinHandle<()>>;
+
+/// Default [`WorkerSpawner`]: a named OS thread.
+fn spawn_worker(
+    name: String,
+    work: Box<dyn FnOnce() + Send + 'static>,
+) -> std::io::Result<thread::JoinHandle<()>> {
+    thread::Builder::new().name(name).spawn(work)
 }
 
 impl RegistryInner {
@@ -1492,16 +1515,24 @@ fn supervise(
     // `write_input_as` either finds it (PTY) or fails closed (pipes), never
     // a stale half from a previous job: ids are never reused.
     let stdin_writer_slot = stdin_slot_handle(&shared, id);
-    let mut backend =
-        match Backend::start(&spec, Arc::clone(&control.clock), output, stdin_writer_slot) {
-            Ok(backend) => backend,
-            Err(_) => {
-                // Spawn failures are reported as a terminal state, never as a
-                // crash: the caller keeps a job id to observe.
-                finish(&shared, id, JobStop::SpawnFailed);
-                return;
-            }
-        };
+    let worker_spawner = lock_inner(&shared).worker_spawner;
+    let mut backend = match Backend::start(
+        &spec,
+        Arc::clone(&control.clock),
+        output,
+        stdin_writer_slot,
+        worker_spawner,
+    ) {
+        Ok(backend) => backend,
+        Err(_) => {
+            // Spawn failures are reported as a terminal state, never as a
+            // crash: the caller keeps a job id to observe. A start that got
+            // as far as a child process already killed and reaped it, so
+            // no live job is ever left without its drains (CORE-RUN-005).
+            finish(&shared, id, JobStop::SpawnFailed);
+            return;
+        }
+    };
     mark_running(&shared, id);
     let stop = watch(&spec, &mut backend, &control);
     backend.terminate();
@@ -1586,6 +1617,51 @@ fn now_ms() -> u64 {
 
 // ── process backends ────────────────────────────────────────────────────────
 
+/// Why a backend could not start (CORE-RUN-005).
+///
+/// The supervisor only needs the fact (the job becomes
+/// [`JobStop::SpawnFailed`]); the fields are diagnostics the unit tests read
+/// to prove a partially started child was killed and reaped.
+#[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct StartFailure {
+    reason: String,
+    /// Pid of a partially started child that was killed and reaped before
+    /// the failure was reported; `None` when no process was created.
+    reaped_pid: Option<u32>,
+}
+
+impl StartFailure {
+    /// No process was created.
+    fn before_spawn(reason: impl fmt::Display) -> Self {
+        Self {
+            reason: reason.to_string(),
+            reaped_pid: None,
+        }
+    }
+
+    /// The child `pid` existed and the start killed it; `reap` is the
+    /// cleanup's reap result. Only a successful reap reports the pid as
+    /// reaped: a failed one keeps `reaped_pid: None` and names the cleanup
+    /// error, so the failure is never reported as a finished cleanup.
+    fn after_cleanup<E: fmt::Display>(
+        pid: Option<u32>,
+        reap: Result<(), E>,
+        reason: impl fmt::Display,
+    ) -> Self {
+        match reap {
+            Ok(()) => Self {
+                reason: reason.to_string(),
+                reaped_pid: pid,
+            },
+            Err(error) => Self {
+                reason: format!("{reason}; cleanup reap failed: {error}"),
+                reaped_pid: None,
+            },
+        }
+    }
+}
+
 enum Backend {
     Pipe(PipeJob),
     Pty(PtyJob),
@@ -1597,10 +1673,13 @@ impl Backend {
         clock: Arc<ActivityClock>,
         output: OutputSink,
         stdin_writer_slot: Option<Arc<Mutex<Option<PtyStdinWriter>>>>,
-    ) -> Result<Self, String> {
+        worker_spawner: WorkerSpawner,
+    ) -> Result<Self, StartFailure> {
         match spec.io {
-            JobIo::Pipes => PipeJob::start(spec, clock, output).map(Self::Pipe),
-            JobIo::Pty => PtyJob::start(spec, clock, output, stdin_writer_slot).map(Self::Pty),
+            JobIo::Pipes => PipeJob::start(spec, clock, output, worker_spawner).map(Self::Pipe),
+            JobIo::Pty => {
+                PtyJob::start(spec, clock, output, stdin_writer_slot, worker_spawner).map(Self::Pty)
+            }
         }
     }
 
@@ -1636,24 +1715,60 @@ struct PipeJob {
 }
 
 impl PipeJob {
+    /// Spawns the child, then one drain worker per stream.
+    ///
+    /// A drain worker that cannot start fails the whole start: the child is
+    /// killed and reaped first, so the job ends as a typed
+    /// [`JobStop::SpawnFailed`] instead of a live process nobody drains
+    /// (CORE-RUN-005).
     fn start(
         spec: &JobSpec,
         clock: Arc<ActivityClock>,
         output: OutputSink,
-    ) -> Result<Self, String> {
+        worker_spawner: WorkerSpawner,
+    ) -> Result<Self, StartFailure> {
         let mut command =
             closed_pipe_command(&spec.program, &spec.args, spec.cwd.as_deref(), &spec.env);
-        let mut child = command.spawn().map_err(|error| error.to_string())?;
+        let mut child = command.spawn().map_err(StartFailure::before_spawn)?;
+        let pid = child.id();
         let mut drains = Vec::new();
-        if let Some(stdout) = child.stdout.take() {
-            drains.push(spawn_stdout_drain(
-                stdout,
-                Arc::clone(&clock),
-                output.clone(),
+        let started = (|| -> std::io::Result<()> {
+            if let Some(stdout) = child.stdout.take() {
+                drains.push(spawn_stream_drain(
+                    stdout,
+                    OutputStream::Stdout,
+                    Arc::clone(&clock),
+                    output.clone(),
+                    worker_spawner,
+                )?);
+            }
+            if let Some(stderr) = child.stderr.take() {
+                drains.push(spawn_stream_drain(
+                    stderr,
+                    OutputStream::Stderr,
+                    clock,
+                    output,
+                    worker_spawner,
+                )?);
+            }
+            Ok(())
+        })();
+        if let Err(error) = started {
+            // Kill and reap before reporting: the drains that did start end
+            // at EOF once the child is gone, and a failed spawn already
+            // dropped (closed) its pipe. They are detached, never joined, so
+            // a grandchild holding a pipe cannot wedge this path.
+            // `wait` already retries interrupted waits; an error here means
+            // the kernel cannot wait for this child at all, so there is
+            // nothing left to retry, only to report honestly.
+            let _ = child.kill();
+            let reap = child.wait().map(drop);
+            drop(drains);
+            return Err(StartFailure::after_cleanup(
+                Some(pid),
+                reap,
+                format!("job drain worker failed to start: {error}"),
             ));
-        }
-        if let Some(stderr) = child.stderr.take() {
-            drains.push(spawn_stderr_drain(stderr, clock, output));
         }
         Ok(Self {
             child,
@@ -1732,12 +1847,17 @@ struct PtyJob {
 }
 
 impl PtyJob {
+    /// Spawns the PTY child, then its drain worker.
+    ///
+    /// Like [`PipeJob::start`], a reader or drain that cannot start kills
+    /// and reaps the child before the failure is reported (CORE-RUN-005).
     fn start(
         spec: &JobSpec,
         clock: Arc<ActivityClock>,
         output: OutputSink,
         stdin_writer_slot: Option<Arc<Mutex<Option<PtyStdinWriter>>>>,
-    ) -> Result<Self, String> {
+        worker_spawner: WorkerSpawner,
+    ) -> Result<Self, StartFailure> {
         let mut builder = PtyBuilder::new(&spec.program);
         builder = builder.args(spec.args.iter().cloned());
         if let Some(cwd) = &spec.cwd {
@@ -1748,9 +1868,21 @@ impl PtyJob {
                 builder = builder.env(&var.name, &var.value);
             }
         }
-        let mut pty = builder.spawn().map_err(|error| error.to_string())?;
-        let reader = pty.take_reader().map_err(|error| error.to_string())?;
-        spawn_pty_drain(reader, clock, output);
+        let mut pty = builder.spawn().map_err(StartFailure::before_spawn)?;
+        let pid = pty.pid();
+        let drained = pty
+            .take_reader()
+            .map_err(|error| error.to_string())
+            .and_then(|reader| {
+                spawn_pty_drain(reader, clock, output, worker_spawner)
+                    .map_err(|error| format!("job drain worker failed to start: {error}"))
+            });
+        if let Err(reason) = drained {
+            // `shutdown` is kill-then-reap; its error means the child may
+            // still be alive or unreaped, which the failure must not hide.
+            let reap = pty.shutdown().map(drop);
+            return Err(StartFailure::after_cleanup(pid, reap, reason));
+        }
         // Publish the writer half into the shared slot (when a scoped job
         // asked for one): `write_input_as` claims it for one call at a time
         // and returns it, so concurrent writers serialize on the slot
@@ -1798,71 +1930,70 @@ impl PtyJob {
     }
 }
 
-/// Drains one stdout pipe into the bounded store, touching `clock` per
-/// chunk (both stdout activity and the drain keep the idle clock honest).
-/// The handle is joined after the child is reaped (see [`PipeJob`]); memory
-/// stays bounded because the store evicts oldest-first.
-fn spawn_stdout_drain(
+/// Starts the drain worker for one pipe stream, feeding the bounded store
+/// and touching `clock` per chunk (output activity keeps the idle clock
+/// honest). The handle is joined after the child is reaped (see
+/// [`PipeJob`]); memory stays bounded because the store evicts
+/// oldest-first.
+///
+/// # Errors
+///
+/// Returns the worker spawn error; the pipe is dropped (closed) with the
+/// unstarted closure.
+fn spawn_stream_drain(
     mut pipe: impl Read + Send + 'static,
+    stream: OutputStream,
     clock: Arc<ActivityClock>,
     output: OutputSink,
-) -> thread::JoinHandle<()> {
-    thread::Builder::new()
-        .name("bitty-job-drain".into())
-        .spawn(move || {
+    worker_spawner: WorkerSpawner,
+) -> std::io::Result<thread::JoinHandle<()>> {
+    worker_spawner(
+        "bitty-job-drain".into(),
+        Box::new(move || {
             let mut chunk = [0u8; DRAIN_CHUNK_BYTES];
             loop {
                 match pipe.read(&mut chunk) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         clock.touch();
-                        output.push_stdout(&chunk[..n]);
+                        match stream {
+                            OutputStream::Stdout => output.push_stdout(&chunk[..n]),
+                            OutputStream::Stderr => output.push_stderr(&chunk[..n]),
+                        }
                     }
                 }
             }
-        })
-        .expect("job drain thread spawns")
+        }),
+    )
 }
 
-/// Drains one stderr pipe into the bounded store; joined like
-/// [`spawn_stdout_drain`].
-fn spawn_stderr_drain(
-    mut pipe: impl Read + Send + 'static,
+/// Starts the drain worker for a PTY reader, feeding the bounded stdout
+/// store and touching `clock` per chunk. Detached: the reader channel is
+/// bounded by the `bitty-pty` backpressure contract and ends when the PTY
+/// closes. PTY output has no separate stderr: the terminal merges both
+/// streams.
+///
+/// # Errors
+///
+/// Returns the worker spawn error (the caller kills and reaps the child).
+fn spawn_pty_drain(
+    reader: PtyReader,
     clock: Arc<ActivityClock>,
     output: OutputSink,
-) -> thread::JoinHandle<()> {
-    thread::Builder::new()
-        .name("bitty-job-drain".into())
-        .spawn(move || {
-            let mut chunk = [0u8; DRAIN_CHUNK_BYTES];
-            loop {
-                match pipe.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        clock.touch();
-                        output.push_stderr(&chunk[..n]);
-                    }
-                }
-            }
-        })
-        .expect("job drain thread spawns")
-}
-
-/// Drains a PTY reader into the bounded stdout store, touching `clock` per
-/// chunk. Detached for the same reason as [`spawn_stdout_drain`]; the reader
-/// channel is bounded by the `bitty-pty` backpressure contract. PTY output
-/// has no separate stderr: the terminal merges both streams.
-fn spawn_pty_drain(reader: PtyReader, clock: Arc<ActivityClock>, output: OutputSink) {
-    let _ = thread::Builder::new()
-        .name("bitty-job-pty-drain".into())
-        .spawn(move || {
+    worker_spawner: WorkerSpawner,
+) -> std::io::Result<()> {
+    worker_spawner(
+        "bitty-job-pty-drain".into(),
+        Box::new(move || {
             while let Ok(Some(chunk)) = reader.recv() {
                 if !chunk.is_empty() {
                     clock.touch();
                     output.push_stdout(&chunk);
                 }
             }
-        });
+        }),
+    )
+    .map(drop)
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────
@@ -2121,5 +2252,165 @@ mod tests {
             clock.idle_for(start + Duration::from_millis(45)),
             Duration::from_millis(15)
         );
+    }
+
+    // ── fallible drain workers (CORE-RUN-005, #1526) ────────────────────────
+
+    const HELPER_ENV: &str = "__BITTY_REGISTRY_TEST_HELPER";
+
+    /// Child entry point: selected by `HELPER_ENV`, a no-op in the parent
+    /// suite. Children are this test binary, so the probes stay hermetic
+    /// and shell-free on every platform.
+    #[test]
+    fn __bitty_registry_helper_entry__() {
+        if std::env::var(HELPER_ENV).as_deref() == Ok("sleep") {
+            // Stay alive well past every test deadline.
+            thread::sleep(Duration::from_secs(30));
+        }
+    }
+
+    fn sleeping_helper_spec() -> JobSpec {
+        let exe = std::env::current_exe()
+            .expect("test binary path")
+            .to_string_lossy()
+            .into_owned();
+        JobSpec::new(
+            exe,
+            vec![
+                "__bitty_registry_helper_entry__".to_owned(),
+                "--nocapture".to_owned(),
+            ],
+        )
+        .with_env(
+            EnvPolicy::explicit(vec![(HELPER_ENV.to_owned(), "sleep".to_owned())])
+                .expect("explicit env"),
+        )
+    }
+
+    /// A spawner that refuses every worker, like an exhausted thread table.
+    fn refuse_every_worker(
+        _name: String,
+        work: Box<dyn FnOnce() + Send + 'static>,
+    ) -> std::io::Result<thread::JoinHandle<()>> {
+        drop(work);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::OutOfMemory,
+            "injected worker spawn failure",
+        ))
+    }
+
+    thread_local! {
+        static WORKERS_STARTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Starts the first worker, refuses the rest: the partial-start shape
+    /// (stdout drained, stderr drain unavailable).
+    ///
+    /// `WORKERS_STARTED` is thread-local, so this sequence holds only while
+    /// the caller invokes the spawner synchronously on the test thread, as
+    /// the direct `PipeJob::start` probe does. A spawner reached through
+    /// `supervise` (its own thread) would start from a fresh count.
+    fn refuse_after_first_worker(
+        name: String,
+        work: Box<dyn FnOnce() + Send + 'static>,
+    ) -> std::io::Result<thread::JoinHandle<()>> {
+        let started = WORKERS_STARTED.with(|count| {
+            let started = count.get();
+            count.set(started + 1);
+            started
+        });
+        if started == 0 {
+            spawn_worker(name, work)
+        } else {
+            refuse_every_worker(name, work)
+        }
+    }
+
+    /// The partially started child is gone: killed AND reaped (a zombie
+    /// would still own its `/proc` entry). Other platforms rely on the
+    /// failure naming the reaped pid.
+    fn assert_reaped(failure: &StartFailure) {
+        let pid = failure
+            .reaped_pid
+            .expect("the child existed and its pid is reported");
+        assert!(
+            failure.reason.contains("drain worker failed to start"),
+            "failure names the drain: {}",
+            failure.reason
+        );
+        #[cfg(target_os = "linux")]
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "child {pid} must be killed and reaped, not left running or zombie"
+        );
+        #[cfg(not(target_os = "linux"))]
+        let _ = pid;
+    }
+
+    #[test]
+    fn a_pipe_drain_that_cannot_start_reaps_the_child() {
+        for spawner in [
+            refuse_every_worker as WorkerSpawner,
+            refuse_after_first_worker,
+        ] {
+            WORKERS_STARTED.with(|count| count.set(0));
+            let failure = match PipeJob::start(
+                &sleeping_helper_spec(),
+                Arc::new(ActivityClock::new()),
+                OutputSink::default(),
+                spawner,
+            ) {
+                Ok(_) => panic!("a missing drain must fail the start"),
+                Err(failure) => failure,
+            };
+            assert_reaped(&failure);
+        }
+    }
+
+    #[test]
+    fn a_pty_drain_that_cannot_start_reaps_the_child() {
+        bitty_test_support::require_pty!();
+        let spec = sleeping_helper_spec()
+            .with_kind(crate::execution::JobKind::Interactive)
+            .with_io(JobIo::Pty);
+        let failure = match PtyJob::start(
+            &spec,
+            Arc::new(ActivityClock::new()),
+            OutputSink::default(),
+            None,
+            refuse_every_worker,
+        ) {
+            Ok(_) => panic!("a missing drain must fail the start"),
+            Err(failure) => failure,
+        };
+        assert_reaped(&failure);
+    }
+
+    #[test]
+    fn a_failed_cleanup_reap_is_never_reported_as_reaped() {
+        let reaped = StartFailure::after_cleanup(Some(7), Ok::<(), String>(()), "drain");
+        assert_eq!(reaped.reaped_pid, Some(7));
+        let failed = StartFailure::after_cleanup(Some(7), Err("no child"), "drain");
+        assert_eq!(failed.reaped_pid, None, "a failed reap names no pid");
+        assert!(failed.reason.contains("cleanup reap failed: no child"));
+    }
+
+    #[test]
+    fn a_job_whose_drains_cannot_start_ends_spawn_failed() {
+        let registry = JobRegistry::with_worker_spawner(DEFAULT_MAX_JOBS, refuse_every_worker);
+        let started = Instant::now();
+        let id = registry.spawn(sleeping_helper_spec()).expect("tracked");
+        let snapshot = wait_terminal(&registry, id);
+        assert_eq!(snapshot.state, JobState::Done(JobStop::SpawnFailed));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the start fails fast instead of waiting on the 30 s child"
+        );
+        let stopped = registry
+            .drain_events(MAX_STORED_OBSERVATION_EVENTS)
+            .into_iter()
+            .filter(|event| matches!(event, JobEvent::Stopped { .. }))
+            .count();
+        assert_eq!(stopped, 1, "exactly one typed terminal event");
     }
 }

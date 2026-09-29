@@ -48,6 +48,7 @@ use std::time::Duration;
 
 use bitty_ipc::execution::{EnvPolicy, MAX_EXEC_ARGS, MAX_EXEC_ENV_VARS};
 
+use super::atomic_file::{self, AtomicWrite};
 use super::model::{
     JobId, JobIo, JobKind, JobLifetime, JobOrigin, JobSpec, JobState, JobStop, JobTimeouts,
 };
@@ -573,13 +574,18 @@ impl JobStore {
         }
         fs::create_dir_all(&self.dir)
             .map_err(|error| PersistError::io("create job store dir", error))?;
-        clean_temp_siblings(&self.manifest_path());
+        // Only abandoned temps go (CORE-RUN-004): a concurrent saver's live
+        // temp is young and stays, so its rename still lands.
+        atomic_file::sweep_abandoned_temps(&self.dir);
         write_file_atomic(&self.manifest_path(), bytes)
     }
 
     /// Removes log files no current checkpoint references (best-effort:
     /// litter is bounded by one checkpoint's spill, never fatal).
     fn sweep_stale_logs(&self, referenced: &[String]) {
+        // Temps of a spill whose writer died stay out of the `.log` rule
+        // below; they go once abandoned (CORE-RUN-004).
+        atomic_file::sweep_abandoned_temps(&self.logs_dir());
         let Ok(entries) = fs::read_dir(self.logs_dir()) else {
             return;
         };
@@ -617,82 +623,21 @@ fn duration_ms(duration: Duration) -> Result<u64, PersistError> {
     })
 }
 
-/// Writes `bytes` atomically to `path`: temp sibling plus fsync plus rename,
-/// `0600` on Unix so job metadata (which may name working directories) is
-/// never world-readable in a crash window.
+/// Writes `bytes` atomically to `path` through a unique temp sibling plus
+/// fsync plus rename, `0600` on Unix so job metadata (which may name working
+/// directories) is never world-readable in a crash window. Concurrent savers
+/// never share a temp name (CORE-RUN-004), so none can unlink or rename
+/// another's in-flight file.
 fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), PersistError> {
-    let temp = temp_sibling_for(path);
-    let _ = fs::remove_file(&temp);
-    let outcome = (|| -> Result<(), std::io::Error> {
-        use std::io::Write as _;
-        #[cfg(unix)]
-        let mut file = {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&temp)?
-        };
-        #[cfg(not(unix))]
-        let mut file = fs::File::create(&temp)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        }
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&temp, path)?;
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                if let Ok(dir) = fs::File::open(parent) {
-                    let _ = dir.sync_all();
-                }
-            }
-        }
-        Ok(())
-    })();
-    match outcome {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = fs::remove_file(&temp);
-            Err(PersistError::io("write job store file", error))
-        }
-    }
-}
-
-/// Temp sibling for an atomic store write (`<file>.tmp.<pid>`).
-fn temp_sibling_for(path: &Path) -> PathBuf {
-    let name = path.file_name().map_or_else(
-        || MANIFEST_FILE_NAME.into(),
-        |name| name.to_string_lossy().into_owned(),
-    );
-    path.with_file_name(format!("{name}.tmp.{}", std::process::id()))
-}
-
-/// Removes stale `<file>.tmp.*` siblings before writing (crashed-save
-/// litter); never after the rename, so a concurrent saver's live temp is
-/// never deleted.
-fn clean_temp_siblings(path: &Path) {
-    let Some(parent) = path.parent() else {
-        return;
-    };
-    let prefix = path.file_name().map_or_else(
-        || format!("{MANIFEST_FILE_NAME}.tmp."),
-        |name| format!("{}.tmp.", name.to_string_lossy()),
-    );
-    let Ok(entries) = fs::read_dir(parent) else {
-        return;
-    };
-    for entry in entries.filter_map(Result::ok) {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with(&prefix) {
-            let _ = fs::remove_file(entry.path());
-        }
-    }
+    atomic_file::write_atomic(
+        path,
+        bytes,
+        AtomicWrite {
+            owner_only: true,
+            sync_parent: true,
+        },
+    )
+    .map_err(|error| PersistError::io("write job store file", error))
 }
 
 /// Rejects log file names that are not store-issued (`job-<n>.<stream>.log`),

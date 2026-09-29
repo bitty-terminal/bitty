@@ -975,7 +975,7 @@ impl SnapshotDamage {
                 bottom,
                 right,
             } = match region {
-                DamagedRegion::Grid(rect) => *rect,
+                DamagedRegion::Grid(rect) => ordered(*rect),
                 DamagedRegion::Scrollback { .. } => continue,
             };
             grid_regions.push(DamageRect {
@@ -1024,7 +1024,20 @@ impl DamageDescriptor for SnapshotDamage {
     }
 }
 
+/// Orders a damage rectangle's corners. `DamageRect` has public fields, so an
+/// embedder can hand in a reversed one; covering the swapped span is safe
+/// over-damage, and it keeps [`grid_rect_to_px`] free of unsigned underflow.
+fn ordered(rect: DamageRect) -> DamageRect {
+    DamageRect {
+        top: rect.top.min(rect.bottom),
+        left: rect.left.min(rect.right),
+        bottom: rect.top.max(rect.bottom),
+        right: rect.left.max(rect.right),
+    }
+}
+
 /// Inclusive grid rectangle to inclusive-cell pixel rectangle; saturating.
+/// Callers pass an [`ordered`] rectangle (`top <= bottom`, `left <= right`).
 fn grid_rect_to_px(top: u16, left: u16, bottom: u16, right: u16, cell: CellMetrics) -> RectPx {
     let cols = u64::from(right) - u64::from(left) + 1;
     let rows = u64::from(bottom) - u64::from(top) + 1;

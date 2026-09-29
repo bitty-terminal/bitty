@@ -161,6 +161,68 @@ pub(super) fn spawn_forwarder_default(
     })
 }
 
+/// One poll's CTX-0476 drain allowance, shared by the primary session and
+/// every pane session (#1530).
+struct PollBudget {
+    start: std::time::Instant,
+    chunks: usize,
+    bytes: usize,
+}
+
+impl PollBudget {
+    fn new() -> Self {
+        Self {
+            start: std::time::Instant::now(),
+            chunks: 0,
+            bytes: 0,
+        }
+    }
+
+    fn charge(&mut self, len: usize) {
+        self.chunks = self.chunks.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(len);
+    }
+
+    /// Whether one more chunk may drain. The first chunk of a poll always
+    /// may, so a max-size chunk makes progress even past the time budget.
+    fn allows_another(&self) -> bool {
+        self.chunks < POLL_PTY_MAX_CHUNKS
+            && self.bytes < POLL_PTY_MAX_BYTES
+            && (self.chunks == 0 || self.start.elapsed() < POLL_PTY_TIME_BUDGET)
+    }
+}
+
+/// Drains `sources` under one shared `budget`, visiting them in order from
+/// `first` and wrapping. Each source drains until it is empty or the budget
+/// is spent. Returns `(source index, chunk)` in drain order.
+///
+/// Fairness comes from the caller rotating `first` every poll: a source
+/// that leads a poll drains at least one available chunk, so every busy
+/// source progresses at least once per `sources.len()` polls.
+fn drain_fair(
+    budget: &mut PollBudget,
+    first: usize,
+    sources: &mut [&mut dyn FnMut() -> Option<Vec<u8>>],
+) -> Vec<(usize, Vec<u8>)> {
+    let count = sources.len();
+    let mut out = Vec::new();
+    for offset in 0..count {
+        let index = (first + offset) % count;
+        while budget.allows_another() {
+            let Some(chunk) = (sources[index])() else {
+                break;
+            };
+            debug_assert!(chunk.len() <= bitty_pty::READ_CHUNK_SIZE);
+            budget.charge(chunk.len());
+            out.push((index, chunk));
+        }
+        if !budget.allows_another() {
+            break;
+        }
+    }
+    out
+}
+
 /// Best-effort bounded write of `chunks` to `writer` (CTX-0473).
 ///
 /// Writes in order and stops at the first failure (fail-closed). Returns
@@ -504,63 +566,77 @@ impl Runtime {
     /// (#1524: it used to handle the waited chunk and then drain a full
     /// budget on top).
     fn poll_pty_seeded(&mut self, seed: Option<Vec<u8>>) -> usize {
-        // Collect without holding an immutable borrow across the mutable
-        // `handle_pty_bytes` call (borrow checker). Bounded by chunk count,
-        // byte total, and wall time (CTX-0476); at least one chunk drains
-        // when data is available so a max-size chunk always makes progress.
-        let start = std::time::Instant::now();
-        let mut drained_bytes = seed.as_ref().map_or(0, Vec::len);
-        let mut out: Vec<Vec<u8>> = seed.into_iter().collect();
-        let chunks: Vec<Vec<u8>> = {
-            if let Some(rx) = self.pty_forward_rx.as_ref() {
-                while out.len() < POLL_PTY_MAX_CHUNKS && drained_bytes < POLL_PTY_MAX_BYTES {
-                    if !out.is_empty() && start.elapsed() >= POLL_PTY_TIME_BUDGET {
-                        break;
-                    }
-                    match rx.try_recv() {
-                        Ok(chunk) => {
-                            debug_assert!(chunk.len() <= bitty_pty::READ_CHUNK_SIZE);
-                            drained_bytes = drained_bytes.saturating_add(chunk.len());
-                            out.push(chunk);
-                        }
-                        Err(_) => break,
-                    }
-                }
-                out
-            } else {
-                let Some(reader) = self.pty_reader.as_ref() else {
-                    // No primary reader: pane sessions (if any) still pump.
-                    // A seed only ever comes from the primary reader.
-                    debug_assert!(out.is_empty(), "seed without a primary reader");
-                    return self.pump_pane_sessions();
-                };
-                while out.len() < POLL_PTY_MAX_CHUNKS && drained_bytes < POLL_PTY_MAX_BYTES {
-                    if !out.is_empty() && start.elapsed() >= POLL_PTY_TIME_BUDGET {
-                        break;
-                    }
-                    match reader.try_recv() {
-                        bitty_pty::PtyRecv::Chunk(chunk) => {
-                            debug_assert!(chunk.len() <= bitty_pty::READ_CHUNK_SIZE);
-                            drained_bytes = drained_bytes.saturating_add(chunk.len());
-                            out.push(chunk);
-                        }
-                        bitty_pty::PtyRecv::Empty
-                        | bitty_pty::PtyRecv::Eof
-                        | bitty_pty::PtyRecv::Error(_) => break,
-                    }
-                }
-                out
+        // #1530: the primary and every pane session share ONE CTX-0476
+        // budget per poll, so a busy primary plus busy panes can never
+        // drain more than `POLL_PTY_MAX_CHUNKS` chunks in one call. The
+        // first drain source rotates every poll: each busy session leads
+        // (and so drains at least one chunk) once every `1 + panes` polls,
+        // so a flooding primary cannot starve a pane, nor one pane another.
+        let mut budget = PollBudget::new();
+        let mut primary: Vec<Vec<u8>> = Vec::new();
+        if let Some(seed) = seed {
+            budget.charge(seed.len());
+            primary.push(seed);
+        }
+        let panes: Vec<ViewId> = self.pane_sessions.keys().copied().collect();
+        let first = self.pty_poll_turn % (panes.len() + 1);
+        self.pty_poll_turn = self.pty_poll_turn.wrapping_add(1);
+        let drained: Vec<(usize, Vec<u8>)> = {
+            // Collect without holding an immutable borrow across the
+            // mutable `handle_*_bytes` calls (borrow checker).
+            let mut primary_next = || self.try_next_primary_chunk();
+            let mut pane_nexts: Vec<_> = self
+                .pane_sessions
+                .values()
+                .map(|session| move || session.try_next_chunk())
+                .collect();
+            let mut sources: Vec<&mut dyn FnMut() -> Option<Vec<u8>>> =
+                Vec::with_capacity(pane_nexts.len() + 1);
+            sources.push(&mut primary_next);
+            for next in &mut pane_nexts {
+                sources.push(next);
             }
+            drain_fair(&mut budget, first, &mut sources)
         };
-        let drained = chunks.len();
-        for chunk in chunks {
+        let mut pane_chunks: Vec<(ViewId, Vec<u8>)> = Vec::new();
+        for (source, chunk) in drained {
+            match source.checked_sub(1) {
+                None => primary.push(chunk),
+                Some(pane) => pane_chunks.push((panes[pane], chunk)),
+            }
+        }
+        let count = primary.len() + pane_chunks.len();
+        for chunk in primary {
             self.handle_pty_bytes(&chunk);
         }
         // Bounded PTY reply loop: parse->state->replies->writer (4 KiB cap, fail-closed)
         // Headless (no writer) keeps replies queued for `take_replies` observation.
         let _ = self.write_replies();
-        // CTX-0176: pump every pane session on the same bounded path.
-        drained + self.pump_pane_sessions()
+        // CTX-0176: pane chunks run through the same bounded pipeline, each
+        // pane's replies go to its own writer, and the global input-mode
+        // caches re-sync to the focused leaf.
+        if !panes.is_empty() {
+            for (id, chunk) in pane_chunks {
+                self.handle_pane_bytes(id, &chunk);
+                let _ = self.write_pane_replies(id);
+            }
+            self.sync_mode_caches_to_focus();
+        }
+        count
+    }
+
+    /// Next immediately available primary chunk: the wakeup-forwarder
+    /// channel when promoted, otherwise the direct pump channel.
+    fn try_next_primary_chunk(&self) -> Option<Vec<u8>> {
+        if let Some(rx) = self.pty_forward_rx.as_ref() {
+            return rx.try_recv().ok();
+        }
+        match self.pty_reader.as_ref()?.try_recv() {
+            bitty_pty::PtyRecv::Chunk(chunk) => Some(chunk),
+            bitty_pty::PtyRecv::Empty | bitty_pty::PtyRecv::Eof | bitty_pty::PtyRecv::Error(_) => {
+                None
+            }
+        }
     }
 
     /// Blocking drain with a timeout, returning the number of chunks drained.
@@ -577,8 +653,7 @@ impl Runtime {
             } else {
                 let Some(reader) = self.pty_reader.as_ref() else {
                     // CTX-0230: no primary reader must not starve panes.
-                    // (`poll_pty` already pumps panes in this case.)
-                    return self.pump_pane_sessions();
+                    return self.poll_pty_seeded(None);
                 };
                 match reader.recv_timeout(timeout) {
                     Ok(Some(chunk)) => Some(chunk),
@@ -586,13 +661,10 @@ impl Runtime {
                 }
             }
         };
-        match first {
-            Some(chunk) => self.poll_pty_seeded(Some(chunk)),
-            // CTX-0230: a quiet primary must not starve panes. Drain every
-            // pane session before reporting idle so split-shell queries
-            // (e.g. fish `ESC[c` at startup) are answered on this path too.
-            None => self.pump_pane_sessions(),
-        }
+        // CTX-0230: a quiet primary must not starve panes. The drain still
+        // visits every pane session before reporting idle so split-shell
+        // queries (e.g. fish `ESC[c` at startup) are answered on this path.
+        self.poll_pty_seeded(first)
     }
 
     /// Feeds raw PTY bytes through the parser into terminal state, enqueuing
@@ -1170,6 +1242,104 @@ mod tests {
         let (mut rt, _tx) = runtime_with_queued_chunks(3);
         assert_eq!(rt.poll_pty_timeout(std::time::Duration::from_secs(1)), 3);
         assert_eq!(rt.poll_pty(), 0);
+    }
+
+    /// A synthetic session: `chunks` small chunks, the last one an end
+    /// marker, then `flood` more chunks behind it that never run dry.
+    fn session(chunks: usize, flood: bool) -> std::sync::mpsc::Receiver<Vec<u8>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for index in 0..chunks {
+            let body = if index + 1 == chunks { b"END" } else { b"abc" };
+            tx.send(body.to_vec()).expect("queue chunk");
+        }
+        if flood {
+            for _ in 0..POLL_PTY_MAX_CHUNKS * 64 {
+                tx.send(b"zzz".to_vec()).expect("queue flood");
+            }
+        }
+        rx
+    }
+
+    /// Polls `sessions` the way `poll_pty_seeded` does (rotating first
+    /// source) until each shows its end marker. Asserts every poll stays
+    /// within one budget and returns the poll on which each marker drained.
+    fn polls_to_end_markers(sessions: &[std::sync::mpsc::Receiver<Vec<u8>>]) -> Vec<usize> {
+        let mut done: Vec<Option<usize>> = vec![None; sessions.len()];
+        let mut nexts: Vec<_> = sessions
+            .iter()
+            .map(|rx| move || rx.try_recv().ok())
+            .collect();
+        for turn in 0..10_000 {
+            let mut sources: Vec<&mut dyn FnMut() -> Option<Vec<u8>>> = Vec::new();
+            for next in &mut nexts {
+                sources.push(next);
+            }
+            let mut budget = PollBudget::new();
+            let drained = drain_fair(&mut budget, turn % sessions.len(), &mut sources);
+            assert!(
+                drained.len() <= POLL_PTY_MAX_CHUNKS,
+                "poll {turn} drained {} chunks, budget is {POLL_PTY_MAX_CHUNKS}",
+                drained.len()
+            );
+            let bytes: usize = drained.iter().map(|(_, chunk)| chunk.len()).sum();
+            assert!(
+                bytes <= POLL_PTY_MAX_BYTES,
+                "poll {turn} drained {bytes} bytes"
+            );
+            for (source, chunk) in drained {
+                if chunk == b"END" {
+                    done[source].get_or_insert(turn);
+                }
+            }
+            if done.iter().all(Option::is_some) {
+                return done.into_iter().map(Option::unwrap).collect();
+            }
+        }
+        panic!("sessions never reached their end markers: {done:?}");
+    }
+
+    #[test]
+    fn a_flooding_primary_shares_one_budget_and_cannot_starve_a_pane() {
+        // #1530: primary (source 0) never runs dry; the pane needs three
+        // budgets of output. Each poll stays within one budget and the pane
+        // still leads every other poll, so it finishes in bounded polls. A
+        // descheduled test thread can stop a poll early on the time budget,
+        // but a leading source always drains at least one chunk, so the
+        // worst case is one pane chunk per `sources` polls.
+        let pane_chunks = POLL_PTY_MAX_CHUNKS * 3;
+        let sessions = [session(1, true), session(pane_chunks, false)];
+        let finished = polls_to_end_markers(&sessions);
+        assert!(
+            finished[1] < sessions.len() * pane_chunks,
+            "pane finished on poll {}",
+            finished[1]
+        );
+    }
+
+    #[test]
+    fn several_busy_panes_all_progress_under_one_budget() {
+        let per_session = POLL_PTY_MAX_CHUNKS * 2;
+        let sessions: Vec<_> = (0..4).map(|_| session(per_session, false)).collect();
+        let finished = polls_to_end_markers(&sessions);
+        for (source, poll) in finished.into_iter().enumerate() {
+            assert!(
+                poll < sessions.len() * per_session,
+                "session {source} finished on poll {poll}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_first_chunk_of_a_poll_always_drains() {
+        let rx = session(1, false);
+        let mut next = || rx.try_recv().ok();
+        let mut budget = PollBudget {
+            start: std::time::Instant::now() - POLL_PTY_TIME_BUDGET * 2,
+            chunks: 0,
+            bytes: 0,
+        };
+        let drained = drain_fair(&mut budget, 0, &mut [&mut next]);
+        assert_eq!(drained.len(), 1, "an expired clock still drains one chunk");
     }
 
     #[test]

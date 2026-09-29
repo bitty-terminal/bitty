@@ -377,6 +377,9 @@ pub struct Runtime {
     /// Private shell sessions keyed by split-leaf id (CTX-0176). Empty in
     /// single-pane use, where the primary PTY/state path is unchanged.
     pane_sessions: BTreeMap<ViewId, PaneSession>,
+    /// Rotating first drain source for [`Runtime::poll_pty`] (#1530): the
+    /// primary is source `0`, panes follow in `ViewId` order.
+    pty_poll_turn: usize,
     /// Leaf that owns the runtime-global primary grid (CTX-0359).
     ///
     /// The primary PTY/state path is a runtime singleton, but its grid is
@@ -1252,6 +1255,7 @@ impl Runtime {
             pty_waker: None,
             pty_writer: None,
             pane_sessions: BTreeMap::new(),
+            pty_poll_turn: 0,
             primary_view: Some(ViewId::new(1)),
             primary_spawn: None,
             pending_input: Vec::new(),
@@ -1463,6 +1467,7 @@ impl Runtime {
             pty_waker: None,
             pty_writer: None,
             pane_sessions: BTreeMap::new(),
+            pty_poll_turn: 0,
             primary_view: Some(ViewId::new(1)),
             primary_spawn: None,
             pending_input: Vec::new(),

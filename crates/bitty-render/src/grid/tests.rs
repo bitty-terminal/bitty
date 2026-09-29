@@ -308,6 +308,35 @@ fn descriptor_drops_scrollback_and_converts_grid_rects() {
 }
 
 #[test]
+fn a_reversed_damage_rect_is_ordered_instead_of_panicking() {
+    // CORE-ENG-022: `right - left + 1` underflowed for an embedder-built
+    // rectangle whose corners were swapped.
+    let state = state_from(&[print('A')]);
+    let damage = Damage {
+        generation: state.generation(),
+        regions: Box::new([DamagedRegion::Grid(DamageRect {
+            top: 1,
+            left: 4,
+            bottom: 0,
+            right: 2,
+        })]),
+    };
+    let desc = super::SnapshotDamage::new(&state.snapshot(), &damage, cell_metrics());
+    let ordered = DamageRect {
+        top: 0,
+        left: 2,
+        bottom: 1,
+        right: 4,
+    };
+    assert_eq!(desc.grid_regions(), [ordered]);
+    let px = &desc.damaged_regions()[0];
+    assert_eq!((px.x, px.y, px.width, px.height), (16, 0, 24, 32));
+    let mut grid = renderer();
+    grid.render(&state.snapshot(), &damage)
+        .expect("a reversed damage rect renders without panicking");
+}
+
+#[test]
 fn stale_damage_far_outside_the_extent_clips_to_clean() {
     let state = state_from(&[print('A')]);
     let damage = Damage {

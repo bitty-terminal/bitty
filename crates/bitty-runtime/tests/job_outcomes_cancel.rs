@@ -68,7 +68,7 @@ fn spawn_grandchild() {
         .stdin(std::process::Stdio::null())
         .spawn()
         .expect("grandchild");
-    println!("grandchild={}", grandchild.id());
+    println!("grandchild={};", grandchild.id());
     let _ = std::io::stdout().flush();
 }
 
@@ -155,7 +155,9 @@ fn wait_grandchild(registry: &JobRegistry, id: JobId) -> u32 {
             .expect("readable")
             .text;
         for part in text.split("grandchild=").skip(1) {
-            let digits: String = part.chars().take_while(|c| c.is_ascii_digit()).collect();
+            let Some((digits, _)) = part.split_once(';') else {
+                continue;
+            };
             if let Ok(pid) = digits.parse() {
                 return pid;
             }
@@ -549,6 +551,7 @@ fn a_stronger_request_escalates_the_cancel_in_flight() {
     assert_eq!(cancel_answers(&registry, id), vec![CancelOutcome::Killed]);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_pty_cancel_kills_the_owned_tree() {
     bitty_test_support::require_pty!();

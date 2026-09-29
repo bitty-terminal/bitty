@@ -465,6 +465,11 @@ impl TerminalApp {
                 }
             },
         );
+        // CTX-0814 (#1397): adopt a live config change that landed on disk
+        // before the tick commits, so the presented frame reflects the new
+        // presentation values. The watcher is a per-tick poll; without an
+        // installed context this is a no-op.
+        let _ = crate::config_reload::poll_file(&mut self.runtime);
         // CTX-0382: drain cold-path events on every tick — including
         // deferred (synchronized update) and idle ticks — because a title
         // change produces no grid damage and would otherwise sit in the

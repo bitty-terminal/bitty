@@ -585,6 +585,15 @@ pub fn apply_control(
         }
     }
     if method == ipc_ctl::METHOD_RELOAD_CONFIG {
+        // CTX-0814 (#1397): when the app installed a live-reload context, an
+        // authorized reload re-reads the sources, classifies the change
+        // (live / restart-required / rejected), and adopts the live
+        // presentation subset. Without a context (headless tests, `--safe`)
+        // the CTX-0537 probe-only reply stands, so a client can never read a
+        // probe as an applied reload.
+        if let Some(info) = crate::config_reload::reload_requested(runtime) {
+            return Ok(reload_config_json(&info));
+        }
         // CTX-0537 (APP-001): probe-only until live hot-swap lands. The
         // response reports exactly what happened — `probed` true and
         // `applied` false — so a client can never read it as an applied
@@ -613,6 +622,35 @@ pub fn apply_control(
         "UnknownMethod",
         format!("unknown control method {method}"),
     ))
+}
+
+/// Encode a live-reload outcome as the `bitty.debug/reloadConfig` reply
+/// (CTX-0814, #1397). `reloaded` marks that the reload path ran;
+/// `applied` is false for a restart-required, rejected, load, or apply
+/// error, with `kind` naming which. `changed` lists the conflicting field
+/// paths when a classify-level report exists.
+fn reload_config_json(info: &crate::config_reload::ReloadOutcomeInfo) -> String {
+    let mut changed = String::new();
+    for (index, field) in info.changed.iter().enumerate() {
+        if index > 0 {
+            changed.push(',');
+        }
+        changed.push('"');
+        changed.push_str(&json_escape(field));
+        changed.push('"');
+    }
+    let message = info
+        .message
+        .as_ref()
+        .map(|raw| format!(",\"message\":\"{}\"", json_escape(raw)))
+        .unwrap_or_default();
+    format!(
+        "{{\"reloaded\":true,\"applied\":{},\"kind\":\"{}\",\"path\":\"{}\",\"changed\":[{}]{message}}}",
+        info.applied,
+        json_escape(info.kind),
+        json_escape(&info.path),
+        changed,
+    )
 }
 
 /// Shared ctl creation core (CTX-0387): allocate a globally unique leaf id,

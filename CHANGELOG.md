@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Live configuration reload (CTX-0814, #1397):** `reconcile_live` now has a
+  production caller. The composition root installs a reload context at startup
+  (skipped under `--safe`), and both `bitty ctl config reload` and an automatic
+  file poll (mtime + length, so atomic-rename writes are seen) drive it. A live
+  reload diffs the incoming file against the active config; when every change
+  is `Live`-reconcilable it adopts the new config and drives the runtime
+  live-adopt setters (`set_decoration`, `set_outline`, `set_animations`,
+  `set_window_padding`, `set_window_radius_px`, `set_font_size`) from the
+  derived `RuntimeConfig`. The control reply reports
+  `{"reloaded":true,"applied":<bool>,"kind":...,"path":...,"changed":[...]}`.
+  A restart-required or rejected change keeps the previous good plan active and
+  applies nothing; with no reload context installed (config probe, `--safe`)
+  the reply degrades to the older probe-only `"hot_swap":"follow-up"` shape.
+  Live-adopt coverage is the presentation subset the runtime exposes; the
+  remaining `Live` keys (`font.family`/`line_height`/`letter_spacing`,
+  `appearance.theme`/`colors`, `keymaps`/`leader`/`mod_key`, `window.opacity`)
+  are follow-ups with no runtime adopter yet.
+
 ### Changed
 
 - **Crate renamed `bitty-app` -> `bitty-terminal` (CTX-0852, #1512):** the

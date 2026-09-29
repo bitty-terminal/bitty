@@ -65,11 +65,10 @@ pub(crate) fn run(runtime: &mut Runtime) -> i32 {
         // queued control verbs on the runtime owner thread, present. The
         // pre-mutation zoom hook is a no-op: test mode has no chrome/zoom.
         let _ = runtime.poll_pty();
-        let _ = ctl::drain_global_control_queue_with(
-            runtime,
-            &ctl::granted_scopes_for_servo(),
-            |_, _| {},
-        );
+        // Empty fallback: queued controls carry their connection's own
+        // authorization snapshot (CTX-0792, #1403).
+        let _ =
+            ctl::drain_global_control_queue_with(runtime, &bitty_ipc::ScopeSet::new(), |_, _| {});
         let _ = runtime.tick();
         // `tick` publishes the inspect store only when it presents; publish
         // unconditionally so `getGridText` observes the latest state even on

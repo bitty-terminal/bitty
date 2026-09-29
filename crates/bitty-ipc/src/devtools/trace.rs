@@ -477,8 +477,7 @@ fn require_debug_trace_scope(
     method: &str,
 ) -> Result<(), super::handlers::HandlerError> {
     use super::handlers::HandlerError;
-    if context.granted.contains(Scope::DebugTrace) || context.granted.contains(Scope::DebugControl)
-    {
+    if context.has_scope(Scope::DebugTrace) || context.has_scope(Scope::DebugControl) {
         return Ok(());
     }
     Err(HandlerError::new(

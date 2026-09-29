@@ -193,8 +193,9 @@ pub struct CtlIpcOutcome {
 /// Connect, send one framed request, read one framed response.
 ///
 /// Unix-only (the servo is unix-only); non-unix returns unavailable.
-/// Time-bounded (`ipc_ctl::CTL_TIMEOUT` read/write timeouts, shared with
-/// the server-side reply wait) so a dead peer cannot hang the CLI.
+/// Time-bounded (`ipc_ctl::CTL_CLIENT_TIMEOUT` read timeout, which outlives
+/// the server-side reply wait by a fixed grace, and `ipc_ctl::CTL_TIMEOUT`
+/// write timeout) so a dead peer cannot hang the CLI.
 ///
 /// Server identity is established in two stages (CTX-0539). Before connect
 /// the endpoint is verified (`0700` dir + `0600` socket, both owned by
@@ -221,7 +222,7 @@ pub fn ctl_roundtrip(
         )?;
     let mut stream = connect_verified_endpoint(socket_path, expected)?;
     stream
-        .set_read_timeout(Some(ipc_ctl::CTL_TIMEOUT))
+        .set_read_timeout(Some(ipc_ctl::CTL_CLIENT_TIMEOUT))
         .map_err(|err| format!("bitty ctl: cannot set read timeout: {err}"))?;
     stream
         .set_write_timeout(Some(ipc_ctl::CTL_TIMEOUT))

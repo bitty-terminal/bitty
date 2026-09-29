@@ -226,10 +226,10 @@ pub fn clear_profiling_for_tests() {
 /// Scope checks run before any state is touched; denial carries the typed
 /// `scope`/`ScopeDenied` shape with zero partial state.
 fn require_profiling_scope(
-    granted: &crate::scope::ScopeSet,
+    context: &super::serve::ServeContext,
     scope: crate::scope::Scope,
 ) -> Result<(), HandlerError> {
-    if granted.contains(scope) {
+    if context.has_scope(scope) {
         return Ok(());
     }
     Err(HandlerError::new(
@@ -393,7 +393,7 @@ pub(super) fn handle_get_process_stats(
     _request: &DevtoolsRequest,
 ) -> Result<String, HandlerError> {
     use crate::scope::Scope::DebugInspect;
-    require_profiling_scope(&context.granted, DebugInspect)?;
+    require_profiling_scope(context, DebugInspect)?;
     let guard = live_profiling_store().lock().map_err(|_| {
         HandlerError::new(
             "transport",
@@ -438,7 +438,7 @@ pub(super) fn handle_get_frame_stats(
     _request: &DevtoolsRequest,
 ) -> Result<String, HandlerError> {
     use crate::scope::Scope::DebugInspect;
-    require_profiling_scope(&context.granted, DebugInspect)?;
+    require_profiling_scope(context, DebugInspect)?;
     let guard = live_profiling_store().lock().map_err(|_| {
         HandlerError::new(
             "transport",
@@ -577,7 +577,7 @@ pub(super) fn handle_stream_process_stats(
     request: &DevtoolsRequest,
 ) -> Result<String, HandlerError> {
     use crate::scope::Scope::DebugTrace;
-    require_profiling_scope(&context.granted, DebugTrace)?;
+    require_profiling_scope(context, DebugTrace)?;
     let interval_ms = parse_interval_ms_param(request.params_raw.as_deref())?;
     let max_samples = parse_optional_uint_param(
         request.params_raw.as_deref(),
@@ -614,7 +614,7 @@ pub(super) fn handle_stream_frame_stats(
     request: &DevtoolsRequest,
 ) -> Result<String, HandlerError> {
     use crate::scope::Scope::DebugTrace;
-    require_profiling_scope(&context.granted, DebugTrace)?;
+    require_profiling_scope(context, DebugTrace)?;
     let interval_ms = parse_interval_ms_param(request.params_raw.as_deref())?;
     let max_samples = parse_optional_uint_param(
         request.params_raw.as_deref(),

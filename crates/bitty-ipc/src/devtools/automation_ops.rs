@@ -56,7 +56,7 @@ fn extract_top_string(params: &str, key: &str) -> Option<String> {
                             if i + 4 >= bytes.len() {
                                 return None;
                             }
-                            let hex = &params[i + 1..i + 5];
+                            let hex = params.get(i + 1..i + 5)?;
                             let code = u32::from_str_radix(hex, 16).ok()?;
                             out.push(char::from_u32(code)?);
                             i += 4;
@@ -530,11 +530,17 @@ pub(super) fn handle_synthesize_input(
     }
     // Authorize (scope intersection + bearer binding + rate ceiling) before
     // any observable effect.
+    let authorization = context.current_authorization().map_err(|_| {
+        HandlerError::new(
+            "scope",
+            "Unauthenticated",
+            "connection authority is unavailable".into(),
+        )
+    })?;
     authorize_automation(
-        &context.granted,
+        &authorization,
         &[DebugControl, TerminalInput],
         bearer.as_deref(),
-        &context.session_id,
         &terminal_id,
         AutomationFamily::Synthesize,
         context.uptime_ms,
@@ -680,11 +686,17 @@ pub(super) fn handle_capture_frame(
             "pixels capture requires explicitOptIn true".to_string(),
         ));
     }
+    let authorization = context.current_authorization().map_err(|_| {
+        HandlerError::new(
+            "scope",
+            "Unauthenticated",
+            "connection authority is unavailable".into(),
+        )
+    })?;
     authorize_automation(
-        &context.granted,
+        &authorization,
         &[DebugTrace, TerminalInspect],
         bearer.as_deref(),
-        &context.session_id,
         &terminal_id,
         AutomationFamily::Capture,
         context.uptime_ms,
@@ -725,7 +737,7 @@ pub(super) fn handle_capture_frame(
     {
         if let Ok(mut store) = automation_store().lock() {
             store.audit.push(FrameAuditEntry {
-                session_id: context.session_id.clone(),
+                session_id: context.session_id().to_string(),
                 terminal_id: terminal_id.clone(),
                 format: format.clone(),
                 now_ms: context.uptime_ms,
@@ -750,7 +762,7 @@ pub(super) fn handle_capture_frame(
         out.push_str(",\"frameSeq\":");
         out.push_str(&frame_seq.to_string());
         out.push_str(",\"trust\":\"untrusted-observation\",\"caller\":\"");
-        json_escape_into(&mut out, &context.session_id);
+        json_escape_into(&mut out, context.session_id());
         out.push_str("\",\"audited\":true}");
         return Ok(out);
     }
@@ -883,7 +895,7 @@ pub(super) fn handle_frame_hash(
     // this context. Never over TCP (no listener exists) and never for a
     // foreign user.
     if !context.is_local_attested() {
-        audit_digest_attempt(&context.session_id, &terminal_id, context.uptime_ms, 0, "");
+        audit_digest_attempt(context.session_id(), &terminal_id, context.uptime_ms, 0, "");
         return Err(HandlerError::new(
             "scope",
             "ScopeDenied",
@@ -891,16 +903,24 @@ pub(super) fn handle_frame_hash(
         ));
     }
     let bearer = extract_top_string(params, "bearer");
-    if let Err(err) = authorize_automation(
-        &context.granted,
-        &[DebugTrace, TerminalInspect],
-        bearer.as_deref(),
-        &context.session_id,
-        &terminal_id,
-        AutomationFamily::FrameDigest,
-        context.uptime_ms,
-    ) {
-        audit_digest_attempt(&context.session_id, &terminal_id, context.uptime_ms, 0, "");
+    let authorization = context.current_authorization().map_err(|_| {
+        HandlerError::new(
+            "scope",
+            "Unauthenticated",
+            "connection authority is unavailable".into(),
+        )
+    });
+    if let Err(err) = authorization.and_then(|authorization| {
+        authorize_automation(
+            &authorization,
+            &[DebugTrace, TerminalInspect],
+            bearer.as_deref(),
+            &terminal_id,
+            AutomationFamily::FrameDigest,
+            context.uptime_ms,
+        )
+    }) {
+        audit_digest_attempt(context.session_id(), &terminal_id, context.uptime_ms, 0, "");
         return Err(err);
     }
     // Snapshot the published present source (clone under the lock, hash
@@ -915,7 +935,7 @@ pub(super) fn handle_frame_hash(
             )
         })?;
         if guard.rgba.is_empty() {
-            audit_digest_attempt(&context.session_id, &terminal_id, context.uptime_ms, 0, "");
+            audit_digest_attempt(context.session_id(), &terminal_id, context.uptime_ms, 0, "");
             return Err(HandlerError::new(
                 "transport",
                 "Unavailable",
@@ -931,7 +951,7 @@ pub(super) fn handle_frame_hash(
     };
     let digest = frame_digest_hex(width_px, height_px, frame_seq, &rgba);
     audit_digest_attempt(
-        &context.session_id,
+        context.session_id(),
         &terminal_id,
         context.uptime_ms,
         frame_seq,

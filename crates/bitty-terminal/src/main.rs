@@ -229,6 +229,7 @@ mod cli;
 mod cmd;
 mod completion;
 mod config_cli;
+mod config_reload;
 mod ctl;
 mod dev;
 mod doctor;
@@ -857,6 +858,19 @@ fn main() {
     // saved session on exit (the safe run owns a default layout, not the
     // user's session).
     app.set_session_persistence(!args.safe && !args.headless);
+    // CTX-0814 (#1397): install the live-reload context before the event
+    // loop. The explicit `bitty ctl` reload and the per-tick config-file poll
+    // both read it on this (main) thread that owns `Runtime`; without it the
+    // ctl verb keeps its probe-only reply. `--safe` selects the built-in
+    // config with every external layer disabled, so it installs nothing and
+    // a reload stays probe-only there.
+    if !args.safe {
+        config_reload::install(
+            args.clone(),
+            app_config.effective.clone(),
+            app_config.file_path.clone(),
+        );
+    }
     let headless_fallback_needed = match App::run(app) {
         Ok(()) => std::process::exit(0),
         Err(PlatformError::DisplayUnavailable(detail)) => {

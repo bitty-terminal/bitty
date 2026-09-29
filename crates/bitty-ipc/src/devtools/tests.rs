@@ -3607,7 +3607,8 @@ fn bearer_tokens_are_full_width_csprng_output_on_every_platform() {
             token
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
-            "token must stay the pinned lowercase hex shape: {token}"
+            "token must stay the pinned lowercase hex shape (length {})",
+            token.len()
         );
         let bytes: Vec<u8> = (0..TOKEN_BYTES)
             .map(|i| u8::from_str_radix(&token[i * 2..i * 2 + 2], 16).expect("hex pair"))

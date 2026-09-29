@@ -56,7 +56,7 @@ fn extract_top_string(params: &str, key: &str) -> Option<String> {
                             if i + 4 >= bytes.len() {
                                 return None;
                             }
-                            let hex = &params[i + 1..i + 5];
+                            let hex = params.get(i + 1..i + 5)?;
                             let code = u32::from_str_radix(hex, 16).ok()?;
                             out.push(char::from_u32(code)?);
                             i += 4;

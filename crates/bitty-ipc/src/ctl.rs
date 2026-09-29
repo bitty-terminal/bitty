@@ -748,6 +748,19 @@ pub fn authorize_ctl_action(
     authorization: &AuthorizationSnapshot,
 ) -> Result<Scope, IpcError> {
     let required = authorize_ctl_method(method, &authorization.scopes)?;
+    // Workspace close kills every pane session in the workspace, and those
+    // terminals are not named in the params, so every terminal entry must
+    // allow `terminal.manage` (same rule as the unattributed debug reads).
+    if method == METHOD_CLOSE_WORKSPACE {
+        return if authorization.allows_every_terminal(Scope::TerminalManage) {
+            Ok(required)
+        } else {
+            Err(IpcError::ScopeDenied {
+                scope: Scope::TerminalManage.as_str().into(),
+                action: method.into(),
+            })
+        };
+    }
     let Some(capability) = required_terminal_capability_for_ctl_method(method) else {
         return Ok(required);
     };
@@ -1242,7 +1255,7 @@ fn extract_optional_string_field(params: &str, key: &str) -> Result<Option<Strin
                             if i + 4 >= bytes.len() {
                                 return Err(());
                             }
-                            let hex = &params[i + 1..i + 5];
+                            let hex = params.get(i + 1..i + 5).ok_or(())?;
                             let code = u32::from_str_radix(hex, 16).map_err(|_| ())?;
                             out.push(char::from_u32(code).ok_or(())?);
                             i += 4;
@@ -1821,6 +1834,47 @@ mod tests {
             before.identity.consent_generation, after.identity.consent_generation,
             "revocation advances the consent generation"
         );
+    }
+
+    /// CTX-0792 (#1404, CodeRabbit): closing a workspace kills sessions that
+    /// the params do not name, so a narrowed terminal entry that lacks
+    /// `terminal.manage` denies it just like `closeTerminal` on that terminal.
+    #[test]
+    fn close_workspace_requires_manage_on_every_terminal() {
+        let mut scopes = ScopeSet::cli_default();
+        scopes.insert(Scope::TerminalManage);
+        let mut narrowed = TerminalCapabilities::from_scopes(&scopes);
+        narrowed
+            .grant("t:1", Scope::TerminalInspect)
+            .expect("entry");
+        let authority = ControlAuthority::new();
+        let open = authority
+            .open_connection(scopes.clone(), TerminalCapabilities::from_scopes(&scopes))
+            .expect("open connection");
+        let close = params_workspace("ws:1");
+        assert!(open.authorize(METHOD_CLOSE_WORKSPACE, Some(&close)).is_ok());
+        let narrow = authority
+            .open_connection(scopes, narrowed)
+            .expect("narrowed connection");
+        assert!(matches!(
+            narrow.authorize(METHOD_CLOSE_WORKSPACE, Some(&close)),
+            Err(IpcError::ScopeDenied { .. })
+        ));
+        assert!(matches!(
+            narrow.authorize(METHOD_CLOSE_TERMINAL, Some(&params_terminal_id("t:1"))),
+            Err(IpcError::ScopeDenied { .. })
+        ));
+    }
+
+    /// CodeRabbit: a `\uXXXX` escape whose four bytes cross a multibyte char
+    /// boundary is a parse error, never a panic.
+    #[test]
+    fn unicode_escape_across_a_char_boundary_is_rejected_not_panicking() {
+        let params = "{\"terminalId\":\"\\uab\u{20ac}\"}";
+        assert!(matches!(
+            parse_optional_terminal_id_params(Some(params)),
+            Err(IpcError::InvalidRequest { .. })
+        ));
     }
 
     /// CTX-0792 (#1403/#1404): the drain recheck reads the live terminal

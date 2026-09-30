@@ -1322,11 +1322,8 @@ impl PluginRuntime {
             .as_ref()
             .cloned()
             .ok_or_else(|| lifecycle_error(id, "no VM"))?;
-        // Wrap arguments in a table so the Lua function receives a single
-        // table argument that can be indexed/iterated.
-        let args_table = LuaValue::array(args.to_vec());
         vm.borrow_mut()
-            .call_function(&run, &[args_table])
+            .call_function(&run, args)
             .map_err(|error| PluginRuntimeError::Vm(error.to_string()))
     }
 

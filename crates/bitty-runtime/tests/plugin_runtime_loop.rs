@@ -238,8 +238,8 @@ fn command_dispatch_reaches_registered_handler() {
 bitty.commands.register({
     id = "test.command",
     title = "Test Command",
-    run = function(args)
-        return {result = "ok", arg_count = #args}
+    run = function(arg1)
+        return {result = "ok", received = arg1}
     end
 })
 
@@ -270,15 +270,15 @@ return {}
                 LuaValue::String(s) => Some(s.as_str()),
                 _ => None,
             });
-        let arg_count = fields
+        let received = fields
             .iter()
-            .find(|(k, _)| matches!(k, LuaValue::String(s) if s == "arg_count"))
+            .find(|(k, _)| matches!(k, LuaValue::String(s) if s == "received"))
             .and_then(|(_, v)| match v {
-                LuaValue::Integer(n) => Some(*n),
+                LuaValue::String(s) => Some(s.as_str()),
                 _ => None,
             });
         assert_eq!(result_field, Some("ok"));
-        assert_eq!(arg_count, Some(1));
+        assert_eq!(received, Some("hello"));
     } else {
         panic!("expected table result, got {result:?}");
     }

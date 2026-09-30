@@ -1372,13 +1372,23 @@ pub fn split_rect_with_gap(bounds: Rect, axis: SplitAxis, ratio: f32, gap_in: u1
 /// Picks a [`SplitAxis`] from container cell dimensions, mirroring Hyprland's
 /// dwindle heuristic `splitTop = box.h * split_width_multiplier > box.w`
 /// (CTX-0209, CR-UI-01).
+/// Default monospace terminal cell aspect ratio (height / width).
+///
+/// In terminal character cells, a glyph is roughly twice as tall as it is
+/// wide (~10px x 20px). To match pixel-space tiling heuristics (such as
+/// Hyprland's `dwindle`), row counts must be scaled by the cell aspect ratio
+/// so that physical aspect ratio is compared rather than raw cell counts.
+pub const CELL_ASPECT_RATIO: f32 = 2.0;
+
+/// Hyprland-style `dwindle` split heuristic for container bounds.
 ///
 /// Returns [`SplitAxis::Vertical`] (stacked, top/bottom) when the container is
-/// taller than it is wide after the multiplier, [`SplitAxis::Horizontal`]
-/// (side-by-side, left/right) otherwise — including the square tie. The
-/// comparison runs in `f32` cell space (exact for `u16` ranges); non-finite or
-/// non-positive `width_multiplier` falls back to `1.0`. Total over all inputs,
-/// including empty bounds (which yield [`SplitAxis::Horizontal`]).
+/// physically taller than it is wide after accounting for terminal cell aspect
+/// ratio and `width_multiplier`, [`SplitAxis::Horizontal`] (side-by-side,
+/// left/right) otherwise — including the square tie. The comparison runs in
+/// `f32` physical aspect space; non-finite or non-positive `width_multiplier`
+/// falls back to `1.0`. Total over all inputs, including empty bounds (which
+/// yield [`SplitAxis::Horizontal`]).
 #[must_use]
 pub fn smart_split_axis(container: Rect, width_multiplier: f32) -> SplitAxis {
     let mult = if width_multiplier.is_finite() && width_multiplier > 0.0 {
@@ -1386,7 +1396,8 @@ pub fn smart_split_axis(container: Rect, width_multiplier: f32) -> SplitAxis {
     } else {
         1.0
     };
-    if container.height as f32 * mult > container.width as f32 {
+    let effective_height = container.height as f32 * CELL_ASPECT_RATIO;
+    if effective_height * mult > container.width as f32 {
         SplitAxis::Vertical
     } else {
         SplitAxis::Horizontal
@@ -1847,19 +1858,20 @@ mod tests {
 
     #[test]
     fn smart_split_axis_square_tie_breaks_side_by_side() {
-        // CTX-0209: a square container ties (`h * 1.0 > w` is false) and
-        // splits side-by-side, matching Hyprland's default first split.
+        // CTX-0209: a physically square container (cols == rows * 2.0) ties
+        // (`effective_height * 1.0 > w` is false) and splits side-by-side,
+        // matching Hyprland's default first split.
         assert_eq!(
-            smart_split_axis(Rect::new(0, 0, 40, 40), 1.0),
+            smart_split_axis(Rect::new(0, 0, 80, 40), 1.0),
             SplitAxis::Horizontal
         );
     }
 
     #[test]
     fn smart_split_multiplier_shifts_threshold() {
-        // CTX-0209: mirrors `dwindle:split_width_multiplier`; 40 * 2.0 > 60
+        // CTX-0209: mirrors `dwindle:split_width_multiplier`; 40 * 2.0 * 2.0 > 100
         // flips a wide container to stacked, while 1.0 keeps it side-by-side.
-        let bounds = Rect::new(0, 0, 60, 40);
+        let bounds = Rect::new(0, 0, 100, 40);
         assert_eq!(smart_split_axis(bounds, 2.0), SplitAxis::Vertical);
         assert_eq!(smart_split_axis(bounds, 1.0), SplitAxis::Horizontal);
         // Degenerate multipliers fall back to 1.0 (total constructor).
@@ -1867,6 +1879,31 @@ mod tests {
         assert_eq!(smart_split_axis(bounds, f32::NAN), SplitAxis::Horizontal);
         // Empty bounds are total and deterministic.
         assert_eq!(smart_split_axis(Rect::zero(), 1.0), SplitAxis::Horizontal);
+    }
+
+    #[test]
+    fn smart_split_dwindle_spiral_alternates_axes() {
+        // Hyprland dwindle spiral on terminal cell geometry:
+        // 1st split: 156x40 (40 * 2.0 = 80 < 156) -> Horizontal (side-by-side)
+        assert_eq!(
+            smart_split_axis(Rect::new(0, 0, 156, 40), 1.0),
+            SplitAxis::Horizontal
+        );
+        // 2nd split: 78x40 (40 * 2.0 = 80 > 78) -> Vertical (stacked)
+        assert_eq!(
+            smart_split_axis(Rect::new(0, 0, 78, 40), 1.0),
+            SplitAxis::Vertical
+        );
+        // 3rd split: 78x20 (20 * 2.0 = 40 < 78) -> Horizontal (side-by-side)
+        assert_eq!(
+            smart_split_axis(Rect::new(0, 0, 78, 20), 1.0),
+            SplitAxis::Horizontal
+        );
+        // 4th split: 39x20 (20 * 2.0 = 40 > 39) -> Vertical (stacked)
+        assert_eq!(
+            smart_split_axis(Rect::new(0, 0, 39, 20), 1.0),
+            SplitAxis::Vertical
+        );
     }
 
     #[test]

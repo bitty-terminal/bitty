@@ -995,11 +995,11 @@ impl TerminalApp {
                 self.apply_new_leaf(split_dir_to_axis(dir), place_new_first, &label);
             }
             A::NewPanel => {
-                // CTX-0838 (#1441): Hyprland-dwindle panel creation. Axis
+                // CTX-0838 (#1441) / CTX-0881: 4-way spiral panel creation. Axis
                 // follows the focused leaf's cell allocation (wide splits
                 // side-by-side, tall stacks, square ties break side-by-side);
-                // placement is always new-second (right/below) and focus
-                // follows the fresh pane. Explicit `new_split:<dir>` above
+                // placement follows the spiral cycle (Right -> Down -> Left -> Up)
+                // and focus follows the fresh pane. Explicit `new_split:<dir>` above
                 // keeps its fixed axis for directional splits.
                 let focused = match self.runtime.focused_view() {
                     Some(id) => id,
@@ -1014,7 +1014,8 @@ impl TerminalApp {
                 // will split. Idempotent: `apply_new_leaf` restores again.
                 self.restore_zoom();
                 let axis = self.runtime.panel_split_axis(focused);
-                self.apply_new_leaf(axis, false, "new_panel");
+                let place_new_first = self.runtime.panel_split_place_new_first();
+                self.apply_new_leaf(axis, place_new_first, "new_panel");
             }
             A::CloseView => {
                 let focused = match self.runtime.focused_view() {
@@ -3080,6 +3081,47 @@ mod tests {
             }
             other => panic!("single leaf new_panel must split, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn chrome_new_panel_spirals_clockwise_across_splits() {
+        use bitty_config::ChromeAction;
+        let mut app = workspace_test_app();
+        app.runtime
+            .set_container(bitty_runtime::UiRect::new(0, 0, 160, 40));
+
+        let v1 = app.runtime.focused_view().expect("seed focus");
+
+        // Split 1 (1 -> 2): Step 0 -> Horizontal, Right (place_new_first = false).
+        app.apply_chrome_action(ChromeAction::NewPanel);
+        assert_eq!(app.runtime.leaf_count(), 2);
+        let v2 = app.runtime.focused_view().expect("v2 focus");
+        assert_ne!(v1, v2);
+
+        // Split 2 (2 -> 3): Step 1 -> Vertical, Bottom (place_new_first = false).
+        app.apply_chrome_action(ChromeAction::NewPanel);
+        assert_eq!(app.runtime.leaf_count(), 3);
+        let v3 = app.runtime.focused_view().expect("v3 focus");
+        assert_ne!(v2, v3);
+
+        // Split 3 (3 -> 4): Step 2 -> Horizontal, Left (place_new_first = true).
+        app.apply_chrome_action(ChromeAction::NewPanel);
+        assert_eq!(app.runtime.leaf_count(), 4);
+        let v4 = app.runtime.focused_view().expect("v4 focus");
+        assert_ne!(v3, v4);
+
+        // Split 4 (4 -> 5): Step 3 -> Vertical, Top (place_new_first = true).
+        app.apply_chrome_action(ChromeAction::NewPanel);
+        assert_eq!(app.runtime.leaf_count(), 5);
+        let v5 = app.runtime.focused_view().expect("v5 focus");
+        assert_ne!(v4, v5);
+
+        // Next split wraps back to Step 0 (Right).
+        assert_eq!(
+            app.runtime.panel_split_place_new_first(),
+            false,
+            "5 -> 6 wraps back to Step 0 (place_new_first = false)"
+        );
     }
 
     #[test]

@@ -26,7 +26,11 @@
 //!   with value `1` (the marker systemd writes on `Delegate=yes` units it
 //!   delegates; read through `rustix::fs::getxattr`, a safe wrapper).
 //!
-//! There is no fallback to the parent or any other ancestor. The qualifying
+//! When the own cgroup does not qualify, its immediate parent is used only
+//! if that parent carries the marker itself: the `Delegate=yes` layout moves
+//! this process into a child of the delegated cgroup so the delegated one
+//! can enable controllers. No unmarked ancestor is ever used, and nothing
+//! above the immediate parent is considered. The qualifying
 //! cgroup must also already enable `memory` in its `cgroup.subtree_control`,
 //! which the cgroup v2 no-internal-processes rule allows only when its own
 //! processes live in a child cgroup; the delegator arranges that, this
@@ -303,11 +307,25 @@ impl JobCgroups {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn discover_from(mount: &Path, relative: &Path) -> Result<Self, CgroupUnavailable> {
         let own = mount.join(relative);
-        let namespace_root = relative.as_os_str().is_empty();
-        if !namespace_root && !carries_delegation_marker(&own) {
-            return Err(CgroupUnavailable::NotDelegated);
+        if relative.as_os_str().is_empty() || carries_delegation_marker(&own) {
+            return Self::create_base(own, MAX_JOB_CGROUP_LEAVES);
         }
-        Self::create_base(own, MAX_JOB_CGROUP_LEAVES)
+        // `Delegate=yes`: the process sits in a child of the marked cgroup,
+        // because a populated cgroup cannot enable controllers for its
+        // children. Only the immediate parent is considered, and only when
+        // it carries the marker itself; the namespace root's parent is
+        // outside the namespace and never considered.
+        match relative.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => {
+                let parent = mount.join(parent);
+                if carries_delegation_marker(&parent) {
+                    Self::create_base(parent, MAX_JOB_CGROUP_LEAVES)
+                } else {
+                    Err(CgroupUnavailable::NotDelegated)
+                }
+            }
+            _ => Err(CgroupUnavailable::NotDelegated),
+        }
     }
 
     /// Creates `<parent>/bitty-jobs-<pid>-<seq>` with `+memory` enabled for
@@ -939,7 +957,7 @@ mod tests {
     }
 
     #[test]
-    fn discovery_refuses_an_undelegated_own_cgroup_and_never_uses_the_parent() {
+    fn discovery_refuses_an_undelegated_own_cgroup_and_an_unmarked_parent() {
         let mount = fake_root("discover");
         let own = mount.join("slice").join("own.scope");
         fs::create_dir_all(&own).expect("own cgroup");
@@ -1024,6 +1042,44 @@ mod tests {
         .expect("rewrite marker");
         assert_eq!(
             JobCgroups::discover_from(&mount, Path::new("app.slice/delegated.scope")).map(drop),
+            Err(CgroupUnavailable::NotDelegated)
+        );
+        let _ = fs::remove_dir_all(mount);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn discovery_uses_a_marked_immediate_parent_but_no_higher_ancestor() {
+        // `Delegate=yes` layout: the marked cgroup enables `memory` and this
+        // process lives in its child `runner`.
+        let mount = fake_root("marked-parent");
+        let delegated = mount.join("app.slice").join("delegated.scope");
+        let runner = delegated.join("runner");
+        fs::create_dir_all(&runner).expect("runner cgroup");
+        fs::write(delegated.join(SUBTREE_CONTROL_FILE), "memory").expect("subtree_control");
+        let marked = rustix::fs::setxattr(
+            &delegated,
+            DELEGATION_XATTRS[0],
+            DELEGATION_MARKER_VALUE,
+            rustix::fs::XattrFlags::empty(),
+        );
+        if marked.is_err() {
+            eprintln!("delegation marker test skipped: temp filesystem has no user xattrs");
+            let _ = fs::remove_dir_all(mount);
+            return;
+        }
+        let cgroups =
+            JobCgroups::discover_from(&mount, Path::new("app.slice/delegated.scope/runner"))
+                .expect("a marked immediate parent is delegated");
+        assert_eq!(cgroups.base().parent(), Some(delegated.as_path()));
+        drop_fake(cgroups);
+        // A grandchild of the marked cgroup is not accepted: only the
+        // immediate parent is considered.
+        let deeper = runner.join("deeper");
+        fs::create_dir_all(&deeper).expect("deeper cgroup");
+        assert_eq!(
+            JobCgroups::discover_from(&mount, Path::new("app.slice/delegated.scope/runner/deeper"))
+                .map(drop),
             Err(CgroupUnavailable::NotDelegated)
         );
         let _ = fs::remove_dir_all(mount);

@@ -745,7 +745,7 @@ fn main() {
     let live_snapshot = plugin_session
         .as_ref()
         .map(|(_, snapshot)| Rc::clone(snapshot));
-    let _plugin_runtime = plugin_session.map(|(runtime, _)| runtime);
+    let plugin_runtime_handle = plugin_session.map(|(runtime, _)| runtime);
 
     // Single-window vertical slice: one PTY per leaf, one shell each.
     // Explicit program spawns verbatim (with tail args via spawn_shell_with_args);
@@ -844,7 +844,9 @@ fn main() {
     // (platform-specific; silently ignored where unsupported).
     .with_blur_radius(app_config.effective.window.blur_radius)
     // CTX-0481: commit the live plugin snapshot from the tick loop.
-    .with_live_snapshot(live_snapshot);
+    .with_live_snapshot(live_snapshot)
+    // CTX-0892: wire the plugin runtime into the app loop for event delivery.
+    .with_plugin_runtime(plugin_runtime_handle);
     // CTX-0167: the synthetic demo pump stays off in real sessions so
     // startup shows only the shell. Opt-in debug only (`BITTY_DEMO_PUMP=1`).
     if demo_pump_enabled_from_env() {

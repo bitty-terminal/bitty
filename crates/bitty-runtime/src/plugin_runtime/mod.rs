@@ -38,6 +38,7 @@ use std::sync::Arc;
 
 use bitty_lua::gate::{VmBudgets, build_plugin_vm};
 use bitty_lua::host::DEFAULT_HOST_DEADLINE_MS;
+use bitty_lua::ui::UiNode;
 use bitty_lua::{HostServices, LuaVm, MarshallingLimits, RegistrationCapture};
 use bitty_plugin_host::DropPolicy;
 use bitty_plugin_host::capability::CapabilityId;
@@ -73,6 +74,8 @@ pub const PLUGIN_MODULE_PATH_MAX_BYTES: usize = 1024;
 pub const PLUGIN_INIT_MAX_BYTES: usize = 1024 * 1024;
 /// Notification queue capacity (`RC-8` rate governance candidate).
 pub const NOTIFICATION_QUEUE_CAPACITY: usize = 64;
+/// Maximum events delivered to plugins per tick (CTX-0892).
+pub const MAX_EVENTS_PER_TICK: usize = 50;
 
 /// Closed source-class set (RFC B.1): `bundled`, `registry`, `git`, `local-path`.
 ///
@@ -592,6 +595,29 @@ impl PluginRuntime {
         self.entries
             .get(id)
             .and_then(|entry| entry.services.as_ref())
+    }
+
+    /// Iterate over all mounted UI blocks across all activated plugins (CTX-0892).
+    ///
+    /// Returns (plugin_id, slot, node, version) tuples. Order is discovery
+    /// order. Rendering is deferred to the host; this is read-only access.
+    pub fn ui_blocks(&self) -> Vec<(PluginId, String, UiNode, u32)> {
+        let mut result = Vec::new();
+        for (id, entry) in &self.entries {
+            if let Some(svc) = &entry.services {
+                svc.with_ui_blocks(|blocks| {
+                    for (_handle, block) in blocks.iter() {
+                        result.push((
+                            id.clone(),
+                            block.slot().to_string(),
+                            block.node().clone(),
+                            block.version(),
+                        ));
+                    }
+                });
+            }
+        }
+        result
     }
 
     /// Drain accepted notifications (async hand-off side).
@@ -1296,8 +1322,11 @@ impl PluginRuntime {
             .as_ref()
             .cloned()
             .ok_or_else(|| lifecycle_error(id, "no VM"))?;
+        // Wrap arguments in a table so the Lua function receives a single
+        // table argument that can be indexed/iterated.
+        let args_table = LuaValue::array(args.to_vec());
         vm.borrow_mut()
-            .call_function(&run, args)
+            .call_function(&run, &[args_table])
             .map_err(|error| PluginRuntimeError::Vm(error.to_string()))
     }
 

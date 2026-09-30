@@ -127,6 +127,33 @@ impl WindowState {
     }
 }
 
+/// Maximum events delivered to plugin VMs per tick (CTX-0892).
+///
+/// Bounds the per-tick event delivery budget so a burst of state changes
+/// cannot block the tick loop. Identity-only events (focus, title) are
+/// coalesced per kind; only the most recent fires.
+const MAX_EVENTS_PER_TICK: usize = 16;
+
+/// Tracks previous runtime state to detect changes for plugin event delivery
+/// (CTX-0892).
+///
+/// Cheap to clone and compare; rebuilt from Runtime on every tick to detect
+/// title changes, focus changes, etc.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EventTracker {
+    title: String,
+    window_focused: bool,
+}
+
+impl EventTracker {
+    fn from_runtime(runtime: &Runtime) -> Self {
+        Self {
+            title: runtime.state().title().to_string(),
+            window_focused: runtime.is_window_focused(),
+        }
+    }
+}
+
 /// `AppModifiers` lives in [`crate::chrome_keys`] (CTX-0233 pure move).
 /// The Correct Terminal handler: owns `Runtime`, an optional window, and the
 /// real PTY pump via `Runtime::poll_pty` (plus an opt-in synthetic demo pump
@@ -169,6 +196,12 @@ pub(crate) struct TerminalApp {
     /// never serves the frozen generation-1 view. `None` when no plugin VM
     /// exists or a test does not exercise the bridge.
     pub(crate) live_snapshot: Option<std::rc::Rc<crate::plugin_runtime::LiveSnapshot>>,
+    /// Plugin runtime (CTX-0892): owns all plugin VMs, delivers events,
+    /// dispatches commands. Kept alive by the app loop.
+    pub(crate) plugin_runtime: Option<bitty_runtime::PluginRuntime>,
+    /// Previous runtime state for event change detection (CTX-0892).
+    /// Rebuilt from Runtime on every tick; changes trigger plugin events.
+    event_tracker: EventTracker,
 }
 
 /// Outcome of polling exited child processes across pane and primary sessions.
@@ -196,6 +229,7 @@ impl TerminalApp {
         keymaps: Vec<bitty_config::ResolvedKeymap>,
         spawn_spec: SpawnSpec,
     ) -> Self {
+        let event_tracker = EventTracker::from_runtime(&runtime);
         Self {
             runtime,
             window: WindowState::new(window_title_for_theme(theme_name, source)),
@@ -207,6 +241,8 @@ impl TerminalApp {
             log_level: LogLevel::default_level(),
             session_persistence: true,
             live_snapshot: None,
+            plugin_runtime: None,
+            event_tracker,
         }
     }
 
@@ -225,6 +261,7 @@ impl TerminalApp {
         spawn_spec: SpawnSpec,
     ) -> Self {
         let (pty_rx, handle) = spawn_demo_pty_pump_with_theme(theme_name, source);
+        let event_tracker = EventTracker::from_runtime(&runtime);
         Self {
             runtime,
             window: WindowState::new(window_title_for_theme(theme_name, source)),
@@ -236,6 +273,8 @@ impl TerminalApp {
             log_level: LogLevel::default_level(),
             session_persistence: true,
             live_snapshot: None,
+            plugin_runtime: None,
+            event_tracker,
         }
     }
 
@@ -323,6 +362,17 @@ impl TerminalApp {
         snapshot: Option<std::rc::Rc<crate::plugin_runtime::LiveSnapshot>>,
     ) -> Self {
         self.live_snapshot = snapshot;
+        self
+    }
+
+    /// Attaches the plugin runtime (CTX-0892). Production startup passes
+    /// the runtime returned by [`crate::plugin_runtime::discover_and_activate`];
+    /// tests and plugin-less runs leave it `None`.
+    pub(crate) fn with_plugin_runtime(
+        mut self,
+        runtime: Option<bitty_runtime::PluginRuntime>,
+    ) -> Self {
+        self.plugin_runtime = runtime;
         self
     }
 
@@ -516,6 +566,9 @@ impl TerminalApp {
         if let Some(snapshot) = self.live_snapshot.as_ref() {
             snapshot.publish(&self.runtime);
         }
+        // CTX-0892: deliver runtime events to plugin VMs off the hot path,
+        // bounded per tick and coalesced per kind.
+        self.deliver_runtime_events();
         // CTX-0367: the presented frame refreshed the focused caret; forward
         // it to the platform so the OS IME preedit/candidate window tracks
         // the terminal cursor (DPI-correct physical pixels, change-gated).
@@ -584,6 +637,47 @@ impl TerminalApp {
                 self.apply_window_title(&raw);
             }
         }
+    }
+
+    /// Delivers runtime state-change events to plugin VMs (CTX-0892).
+    ///
+    /// Called once per tick after `runtime.tick()` to detect and deliver
+    /// terminal events (title change, focus change, etc.) to subscribed
+    /// plugins. Bounded by [`MAX_EVENTS_PER_TICK`] and coalesced per kind
+    /// where identity-only. Plugin errors never crash the app.
+    fn deliver_runtime_events(&mut self) {
+        let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
+            return;
+        };
+
+        // Build current state and compare with previous tick
+        let current = EventTracker::from_runtime(&self.runtime);
+        let mut events_delivered = 0;
+
+        // Title changed
+        if current.title != self.event_tracker.title && events_delivered < MAX_EVENTS_PER_TICK {
+            let payload = bitty_runtime::LuaValue::table([(
+                "title",
+                bitty_runtime::LuaValue::String(current.title.clone()),
+            )]);
+            let _delivered = plugin_runtime.deliver_event("terminal.title-changed", &payload);
+            events_delivered += 1;
+        }
+
+        // Focus changed
+        if current.window_focused != self.event_tracker.window_focused
+            && events_delivered < MAX_EVENTS_PER_TICK
+        {
+            let payload = bitty_runtime::LuaValue::table([(
+                "focused",
+                bitty_runtime::LuaValue::Bool(current.window_focused),
+            )]);
+            let _delivered = plugin_runtime.deliver_event("focus.changed", &payload);
+            let _ = events_delivered + 1; // Would increment for future events
+        }
+
+        // Update tracker for next tick
+        self.event_tracker = current;
     }
 
     /// Checks for exited shell processes across both split pane sessions and

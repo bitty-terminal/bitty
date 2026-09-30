@@ -493,11 +493,17 @@ return {}
 /// Injected commit latency for the disk-backed regression (bitty #1518).
 ///
 /// Past the 50 ms RC-1 wall-clock budget on its own, so a callback that is
-/// still charged for its store commit always fails.
+/// still charged for its store commit always fails, and well under the
+/// 200 ms per-callback credit cap for the single provider commit each
+/// consumer callback waits on.
 const SLOW_COMMIT_MS: u64 = 60;
 
-/// Native filesystem whose atomic rename (the store commit point) is slow,
-/// standing in for a scanned Windows CI filesystem without real slow disks.
+/// Plugin whose store commits are slow; every other store stays fast.
+const SLOW_STORE_PLUGIN: &str = "xuepoo.calc";
+
+/// Native filesystem whose atomic rename (the store commit point) is slow
+/// for the provider's store only, standing in for a scanned Windows CI
+/// filesystem without real slow disks.
 #[derive(Debug)]
 struct SlowCommitFs;
 
@@ -512,7 +518,13 @@ impl FileSystem for SlowCommitFs {
         NativeFileSystem.sync_file(path)
     }
     fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
-        std::thread::sleep(std::time::Duration::from_millis(SLOW_COMMIT_MS));
+        let provider_store = to
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|dir| dir == SLOW_STORE_PLUGIN);
+        if provider_store {
+            std::thread::sleep(std::time::Duration::from_millis(SLOW_COMMIT_MS));
+        }
         NativeFileSystem.rename(from, to)
     }
     fn remove_file(&self, path: &Path) -> std::io::Result<()> {
@@ -528,6 +540,37 @@ impl FileSystem for SlowCommitFs {
         NativeFileSystem.exists(path)
     }
 }
+
+/// Consumer for the slow-disk regression: every service call is followed by
+/// Lua work spanning many `SLICE_FUEL` slices, so the RC-1 wall check runs
+/// after the provider's credited commit instead of the callback finishing
+/// inside the slice that made the call.
+const SLOW_SHOP_INIT: &str = r#"
+local calc = bitty.services.get("calc.add")
+local function cross_slices()
+  local n = 0
+  for i = 1, 4096 do n = n + i end
+  return n
+end
+bitty.commands.register({
+  id = "total",
+  title = "Total",
+  run = function()
+    local ok, r = pcall(calc.add, { a = 10, b = 20 })
+    cross_slices()
+    return ok and r.sum or -1
+  end,
+})
+local ok, result = pcall(calc.add, { a = 2, b = 3 })
+cross_slices()
+bitty.store.set("sum", ok and result.sum or -1)
+bitty.store.set("code", ok and "NONE" or result.code)
+return {}
+"#;
+
+const SLOW_SHOP_MANIFEST: &str = r#"[services.required]
+"calc.add" = ">=1.0"
+"#;
 
 #[test]
 fn slow_disk_store_commit_does_not_fail_cross_vm_service_call() {
@@ -547,17 +590,10 @@ fn slow_disk_store_commit_does_not_fail_cross_vm_service_call() {
     );
     write_service_plugin(
         &third,
-        "xuepoo.broken",
-        BROKEN_MANIFEST,
-        &["xuepoo.broken:ping"],
-        BROKEN_INIT,
-    );
-    write_service_plugin(
-        &third,
         "xuepoo.shop",
-        SHOP_MANIFEST,
+        SLOW_SHOP_MANIFEST,
         &["xuepoo.shop:total"],
-        SHOP_INIT,
+        SLOW_SHOP_INIT,
     );
     let mut rt = PluginRuntime::new(PluginRuntimeConfig {
         safe_mode: false,
@@ -571,10 +607,9 @@ fn slow_disk_store_commit_does_not_fail_cross_vm_service_call() {
     rt.set_store_filesystem(Arc::new(SlowCommitFs));
     rt.discover();
     rt.activate(&calc_id()).expect("provider activates");
-    rt.activate(&broken_id())
-        .expect("broken provider activates");
     rt.activate(&shop_id()).expect("consumer activates");
 
+    // The consumer receives the provider's real result, not the -1 sentinel.
     assert_eq!(store_int(&rt, &shop_id(), "sum"), Some(5));
     assert_eq!(
         store_string(&rt, &shop_id(), "code"),

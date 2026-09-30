@@ -746,6 +746,21 @@ pub struct RuntimeConfig {
     /// Default [`crate::runtime::DEFAULT_PASTE_CONFIRM_TIMEOUT`] (30 seconds).
     /// Bounded by 1 second minimum and 300 seconds (5 minutes) maximum.
     pub paste_confirm_timeout: std::time::Duration,
+    /// Layout mode for adaptive panel creation (`NewPanel` / `Mod+N`).
+    ///
+    /// Default [`PanelLayoutMode::Spiral`] (4-way clockwise spiral: Right -> Down -> Left -> Up).
+    /// `PanelLayoutMode::Dwindle` opts into Hyprland-style dwindle (always Right or Down).
+    pub panel_layout_mode: PanelLayoutMode,
+}
+
+/// Layout mode for adaptive panel creation (`NewPanel` / `Mod+N`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PanelLayoutMode {
+    /// 4-way clockwise spiral: Right -> Down -> Left -> Up.
+    #[default]
+    Spiral,
+    /// Hyprland-style dwindle: always splits Right or Down.
+    Dwindle,
 }
 
 /// Default cell width in logical pixels (CTX-0157 breathing-room cell).
@@ -804,6 +819,7 @@ impl Default for RuntimeConfig {
             cursor_style: DEFAULT_CURSOR_STYLE,
             bell_mode: DEFAULT_BELL_MODE,
             paste_confirm_timeout: crate::runtime::DEFAULT_PASTE_CONFIRM_TIMEOUT,
+            panel_layout_mode: PanelLayoutMode::Spiral,
         }
     }
 }
@@ -890,6 +906,7 @@ impl RuntimeConfig {
             cursor_style: DEFAULT_CURSOR_STYLE,
             bell_mode: DEFAULT_BELL_MODE,
             paste_confirm_timeout: crate::runtime::DEFAULT_PASTE_CONFIRM_TIMEOUT,
+            panel_layout_mode: PanelLayoutMode::default(),
         };
         cfg.validate()?;
         Ok(cfg)

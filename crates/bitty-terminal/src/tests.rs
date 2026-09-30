@@ -5139,3 +5139,138 @@ fn external_editor_nonzero_exit_discards_and_tears_down() {
     assert!(app.runtime.cw_composer_is_open());
     let _ = std::fs::remove_file(&script);
 }
+
+// ---------------------------------------------------------------------------
+// Shell child exit and panel auto-close regression tests (#1356, #1541, CTX-0881)
+// ---------------------------------------------------------------------------
+
+#[test]
+#[cfg(unix)]
+fn reap_exited_split_pane_closes_pane_and_promotes_sibling() {
+    require_pty!();
+    let mut app = editor_test_app();
+    assert_eq!(app.runtime.leaf_count(), 2);
+    let pane_view = ViewId::new(2);
+
+    // Spawn an immediately exiting shell script in split pane 2.
+    let script = write_fake_editor("exit-pane", "#!/bin/sh\nexit 0\n");
+    let script_arg = script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell_for_view_in(pane_view, script_arg.as_str(), &[], 80, 24, None)
+        .expect("spawn pane shell");
+    assert!(app.runtime.has_pane_session(&pane_view));
+
+    // Poll until reap_exited_shells detects exit and closes the pane.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut outcome = terminal_app::ShellExitOutcome::NoExit;
+    while std::time::Instant::now() < deadline {
+        let _ = app.poll_pty_pump();
+        outcome = app.reap_exited_shells();
+        if outcome != terminal_app::ShellExitOutcome::NoExit {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    assert_eq!(outcome, terminal_app::ShellExitOutcome::PaneClosed);
+    assert_eq!(
+        app.runtime.leaf_count(),
+        1,
+        "closed pane must reduce leaf count to 1"
+    );
+    assert!(
+        !app.runtime.has_pane_session(&pane_view),
+        "pane session must be dropped"
+    );
+    assert_eq!(
+        app.runtime.focused_view(),
+        Some(ViewId::new(1)),
+        "sibling must remain focused"
+    );
+    let _ = std::fs::remove_file(&script);
+}
+
+#[test]
+#[cfg(unix)]
+fn reap_exited_primary_with_active_pane_closes_primary_pane() {
+    require_pty!();
+    let mut app = editor_test_app();
+    assert_eq!(app.runtime.leaf_count(), 2);
+    let primary_view = ViewId::new(1);
+    let pane_view = ViewId::new(2);
+    assert_eq!(app.runtime.primary_view(), Some(primary_view));
+
+    // Spawn a long-running shell in split pane 2.
+    let pane_script = write_fake_editor("sleep-pane", "#!/bin/sh\nsleep 10\n");
+    let pane_script_arg = pane_script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell_for_view_in(pane_view, pane_script_arg.as_str(), &[], 80, 24, None)
+        .expect("spawn pane shell");
+
+    // Spawn an exiting shell in primary.
+    let primary_script = write_fake_editor("exit-primary", "#!/bin/sh\nexit 0\n");
+    let primary_script_arg = primary_script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell(primary_script_arg.as_str())
+        .expect("spawn primary shell");
+
+    // Poll until reap_exited_shells detects primary exit and closes the primary pane.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut outcome = terminal_app::ShellExitOutcome::NoExit;
+    while std::time::Instant::now() < deadline {
+        let _ = app.poll_pty_pump();
+        outcome = app.reap_exited_shells();
+        if outcome != terminal_app::ShellExitOutcome::NoExit {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    assert_eq!(outcome, terminal_app::ShellExitOutcome::PaneClosed);
+    assert_eq!(app.runtime.leaf_count(), 1);
+    assert_eq!(app.runtime.focused_view(), Some(pane_view));
+
+    // Clean up
+    app.runtime.close_pane_session(&pane_view);
+    let _ = std::fs::remove_file(&pane_script);
+    let _ = std::fs::remove_file(&primary_script);
+}
+
+#[test]
+#[cfg(unix)]
+fn reap_exited_last_remaining_shell_signals_app_exit() {
+    require_pty!();
+    let maps =
+        bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        maps,
+        SpawnSpec::default(),
+    );
+    assert_eq!(app.runtime.leaf_count(), 1);
+
+    // Spawn an exiting shell in primary.
+    let script = write_fake_editor("exit-last", "#!/bin/sh\nexit 0\n");
+    let script_arg = script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell(script_arg.as_str())
+        .expect("spawn primary shell");
+
+    // Poll until reap_exited_shells returns AppExiting.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut outcome = terminal_app::ShellExitOutcome::NoExit;
+    while std::time::Instant::now() < deadline {
+        let _ = app.poll_pty_pump();
+        outcome = app.reap_exited_shells();
+        if outcome != terminal_app::ShellExitOutcome::NoExit {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    assert_eq!(outcome, terminal_app::ShellExitOutcome::AppExiting);
+    let _ = std::fs::remove_file(&script);
+}

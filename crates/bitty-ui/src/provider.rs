@@ -57,7 +57,7 @@ pub const LAYOUT_PROVIDER_CAPABILITY: &str = "layout.provider";
 pub const NOOP_PROVIDER_NAME: &str = "noop";
 
 /// Bare names reserved for the canonical providers.
-pub const RESERVED_PROVIDER_NAMES: &[&str] = &["dwindle", "master", "grid"];
+pub const RESERVED_PROVIDER_NAMES: &[&str] = &["spiral", "dwindle", "master", "grid"];
 
 /// Maximum provider name length (the contract's `BoundedString<32>`).
 pub const MAX_PROVIDER_NAME_LEN: usize = 32;
@@ -73,6 +73,8 @@ pub const DWINDLE_PROVIDER_ID: ProviderId = ProviderId(1);
 pub const MASTER_PROVIDER_ID: ProviderId = ProviderId(2);
 /// Built-in provider id for grid.
 pub const GRID_PROVIDER_ID: ProviderId = ProviderId(3);
+/// Built-in provider id for spiral.
+pub const SPIRAL_PROVIDER_ID: ProviderId = ProviderId(4);
 
 // ---------------------------------------------------------------------------
 // Identity
@@ -623,6 +625,82 @@ impl LayoutProvider for DwindleProvider {
     }
 }
 
+/// Spiral provider: recursive `H`/`V` splits that spiral inward in a 4-way
+/// clockwise rotation (Left -> Top -> Right -> Bottom).
+///
+/// The opening axis follows the area aspect (tall stacks first, wide/square
+/// starts side-by-side). Each deeper level flips the axis and rotates the
+/// placement side so windows wrap clockwise around the center.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpiralProvider {
+    name: ProviderName,
+}
+
+impl SpiralProvider {
+    /// Creates the canonical spiral provider.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            name: ProviderName::parse("spiral").expect("spiral is a reserved name"),
+        }
+    }
+}
+
+impl Default for SpiralProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LayoutProvider for SpiralProvider {
+    fn id(&self) -> ProviderId {
+        SPIRAL_PROVIDER_ID
+    }
+
+    fn name(&self) -> &ProviderName {
+        &self.name
+    }
+
+    fn propose(
+        &self,
+        workspace: &WorkspaceSnapshot,
+        views: &[ViewId],
+        area: LogicalRect,
+    ) -> Result<LayoutNode, LayoutError> {
+        if views.is_empty() {
+            return Err(LayoutError::EmptyViewSet);
+        }
+        let mut axes = Vec::with_capacity(views.len().saturating_sub(1));
+        let mut axis = opening_axis(area);
+        for _ in 0..views.len().saturating_sub(1) {
+            axes.push(axis);
+            axis = match axis {
+                SplitAxis::Horizontal => SplitAxis::Vertical,
+                SplitAxis::Vertical => SplitAxis::Horizontal,
+            };
+        }
+        let mut iter = views.iter().rev();
+        let last = iter.next().expect("views are non-empty");
+        let mut tree = leaf_for(workspace, *last);
+        let n = views.len().saturating_sub(1);
+        for (i, (id, axis)) in views[..n].iter().zip(axes.iter()).enumerate().rev() {
+            // 4-way clockwise spiral:
+            // step 0: Left (leaf first, remainder second)
+            // step 1: Top (leaf first, remainder second)
+            // step 2: Right (remainder first, leaf second)
+            // step 3: Bottom (remainder first, leaf second)
+            let place_leaf_first = (i % 4) < 2;
+            let (first, second) = if place_leaf_first {
+                (leaf_for(workspace, *id), tree)
+            } else {
+                (tree, leaf_for(workspace, *id))
+            };
+            tree = LayoutNode::split(*axis, DEFAULT_PROVIDER_RATIO, first, second);
+        }
+        Ok(tree)
+    }
+}
+
 /// Master provider: one master `View` on the left at a fixed ratio with
 /// the remaining `View`s stacked vertically on the right.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -800,6 +878,9 @@ impl ProviderRegistry {
             .register(Box::new(GridProvider::new()), true)
             .expect("canonical grid registers");
         registry
+            .register(Box::new(SpiralProvider::new()), true)
+            .expect("canonical spiral registers");
+        registry
     }
 
     /// Registers a provider.
@@ -897,6 +978,7 @@ impl std::fmt::Debug for ProviderRegistry {
 
 fn canonical_id(name: &str) -> ProviderId {
     match name {
+        "spiral" => SPIRAL_PROVIDER_ID,
         "dwindle" => DWINDLE_PROVIDER_ID,
         "master" => MASTER_PROVIDER_ID,
         "grid" => GRID_PROVIDER_ID,
@@ -934,12 +1016,13 @@ mod tests {
 
     #[test]
     fn bare_and_reserved_names_parse() {
+        assert!(ProviderName::parse("spiral").unwrap().is_canonical());
         assert!(ProviderName::parse("dwindle").unwrap().is_canonical());
         assert!(ProviderName::parse("master").unwrap().is_canonical());
         assert!(ProviderName::parse("grid").unwrap().is_canonical());
-        let custom = ProviderName::parse("spiral").unwrap();
+        let custom = ProviderName::parse("stack").unwrap();
         assert!(!custom.is_canonical());
-        assert_eq!(custom.as_str(), "spiral");
+        assert_eq!(custom.as_str(), "stack");
     }
 
     #[test]
@@ -1108,6 +1191,7 @@ mod tests {
     fn canonical_providers_cover_1_to_16_views() {
         let providers: Vec<Box<dyn LayoutProvider>> = vec![
             Box::new(DwindleProvider::new()),
+            Box::new(SpiralProvider::new()),
             Box::new(MasterProvider::new()),
             Box::new(GridProvider::new()),
         ];
@@ -1140,6 +1224,7 @@ mod tests {
         let providers: Vec<Box<dyn LayoutProvider>> = vec![
             Box::new(NoopTiler::new()),
             Box::new(DwindleProvider::new()),
+            Box::new(SpiralProvider::new()),
             Box::new(MasterProvider::new()),
             Box::new(GridProvider::new()),
         ];
@@ -1187,6 +1272,55 @@ mod tests {
             panic!("dwindle of 3 must split");
         };
         assert_eq!(*tall_outer, SplitAxis::Vertical);
+    }
+
+    #[test]
+    fn spiral_rotates_clockwise_with_alternating_sides() {
+        let snap = snapshot(4);
+        let views = snap.views.clone();
+        let tree = SpiralProvider::new()
+            .propose(&snap, &views, LogicalRect::new(0.0, 0.0, 80.0, 80.0))
+            .unwrap();
+        // Depth 0: Horizontal split. First is Left (views[0]), second is remainder.
+        let LayoutNode::Split {
+            axis: ax0,
+            first: f0,
+            second: s0,
+            ..
+        } = &tree
+        else {
+            panic!("spiral of 4 must split");
+        };
+        assert_eq!(*ax0, SplitAxis::Horizontal);
+        assert_eq!(f0.leaf_ids(), vec![views[0]]);
+
+        // Depth 1: Vertical split. First is Top (views[1]), second is remainder.
+        let LayoutNode::Split {
+            axis: ax1,
+            first: f1,
+            second: s1,
+            ..
+        } = s0.as_ref()
+        else {
+            panic!("remainder 1 must split");
+        };
+        assert_eq!(*ax1, SplitAxis::Vertical);
+        assert_eq!(f1.leaf_ids(), vec![views[1]]);
+
+        // Depth 2: Horizontal split. Rotating clockwise:
+        // First is remainder (views[3], on Left), second is views[2] (on Right).
+        let LayoutNode::Split {
+            axis: ax2,
+            first: f2,
+            second: s2,
+            ..
+        } = s1.as_ref()
+        else {
+            panic!("remainder 2 must split");
+        };
+        assert_eq!(*ax2, SplitAxis::Horizontal);
+        assert_eq!(f2.leaf_ids(), vec![views[3]]);
+        assert_eq!(s2.leaf_ids(), vec![views[2]]);
     }
 
     #[test]
@@ -1379,6 +1513,7 @@ mod tests {
                 "dwindle".to_string(),
                 "master".to_string(),
                 "grid".to_string(),
+                "spiral".to_string(),
             ]
         );
     }

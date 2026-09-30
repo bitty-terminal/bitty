@@ -53,7 +53,8 @@ fn panel_axis_tall_stacks() {
 #[test]
 fn panel_axis_square_tie_breaks_side_by_side() {
     let mut rt = fresh();
-    rt.set_container(UiRect::new(0, 0, 40, 40));
+    // In terminal cell coordinates, a physically square container is cols == rows * 2.0.
+    rt.set_container(UiRect::new(0, 0, 80, 40));
     let focused = rt.focused_view().expect("live runtime always has focus");
     assert_eq!(
         rt.panel_split_axis(focused),

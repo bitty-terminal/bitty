@@ -3,6 +3,7 @@
 //! Split from `super` (`runtime.rs`) as a pure move under CTX-0232:
 //! byte-identical logic, only module wiring changed.
 use super::*;
+use crate::PanelLayoutMode;
 use crate::config::decoration_runtime_error;
 use bitty_ui::{SplitAxis, smart_split_axis};
 use core::ops::{Deref, DerefMut};
@@ -1315,6 +1316,35 @@ impl Runtime {
             .map(|(_, r)| r)
             .unwrap_or(self.container);
         smart_split_axis(rect, 1.0)
+    }
+
+    /// Returns the current panel layout mode for adaptive splits (Spiral vs Dwindle).
+    #[must_use]
+    pub fn panel_layout_mode(&self) -> PanelLayoutMode {
+        self.panel_layout_mode
+    }
+
+    /// Sets the panel layout mode for adaptive splits.
+    pub fn set_panel_layout_mode(&mut self, mode: PanelLayoutMode) {
+        self.panel_layout_mode = mode;
+    }
+
+    /// Placement for the fresh pane in an adaptive split (`NewPanel`):
+    /// - `Spiral` (default): 4-way clockwise rotating spiral (Right, Down, Left, Up):
+    ///   - Step 0 (1 -> 2 leaves): Right (`place_new_first = false`)
+    ///   - Step 1 (2 -> 3 leaves): Bottom (`place_new_first = false`)
+    ///   - Step 2 (3 -> 4 leaves): Left (`place_new_first = true`)
+    ///   - Step 3 (4 -> 5 leaves): Top (`place_new_first = true`)
+    /// - `Dwindle`: Hyprland-style dwindle (always Right or Bottom, `place_new_first = false`).
+    #[must_use]
+    pub fn panel_split_place_new_first(&self) -> bool {
+        match self.panel_layout_mode {
+            PanelLayoutMode::Spiral => {
+                let step = (self.layout.leaf_count().saturating_sub(1)) % 4;
+                step >= 2
+            }
+            PanelLayoutMode::Dwindle => false,
+        }
     }
 
     /// Leaf count of the current layout.

@@ -83,6 +83,7 @@
 //!   plugin VM remain deferred. This slice only wires the host-owned data structures
 //!   and the bounded crossing.
 
+use crate::PanelLayoutMode;
 use std::collections::BTreeMap;
 
 use bitty_platform::{
@@ -499,6 +500,8 @@ pub struct Runtime {
     /// chrome action, dismissed by `Esc` or the same chord. Never grid
     /// truth; see `runtime::help`.
     help_visible: bool,
+    /// Adaptive panel creation mode (Spiral vs Dwindle).
+    panel_layout_mode: PanelLayoutMode,
     /// Help popup rows (CTX-0265), regenerated from the live keymap
     /// registry by the app on every show.
     ///
@@ -1386,6 +1389,7 @@ impl Runtime {
             workspaceline_visible: config.workspaceline_visible,
             last_presented_bar: None,
             help_visible: false,
+            panel_layout_mode: config.panel_layout_mode,
             help_rows: Vec::new(),
             overlay_modal_active: false,
             next_workspace_seq: 2,
@@ -1598,6 +1602,7 @@ impl Runtime {
             workspaceline_visible: config.workspaceline_visible,
             last_presented_bar: None,
             help_visible: false,
+            panel_layout_mode: config.panel_layout_mode,
             help_rows: Vec::new(),
             overlay_modal_active: false,
             next_workspace_seq: 2,

@@ -164,6 +164,17 @@ pub(crate) struct TerminalApp {
     pub(crate) live_snapshot: Option<std::rc::Rc<crate::plugin_runtime::LiveSnapshot>>,
 }
 
+/// Outcome of polling exited child processes across pane and primary sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShellExitOutcome {
+    /// No shell child exited during this reap pass.
+    NoExit,
+    /// At least one split pane shell exited and its panel was closed.
+    PaneClosed,
+    /// The last remaining shell exited; the session must close.
+    AppExiting,
+}
+
 impl TerminalApp {
     /// Theme-aware constructor for real sessions (CTX-0167).
     ///
@@ -559,6 +570,94 @@ impl TerminalApp {
         }
     }
 
+    /// Checks for exited shell processes across both split pane sessions and
+    /// the primary session, reaping exited children and closing their panels.
+    ///
+    /// When the last remaining panel exits, returns [`ShellExitOutcome::AppExiting`]
+    /// so the caller can save session state and signal `ctx.exit()`.
+    pub(crate) fn reap_exited_shells(&mut self) -> ShellExitOutcome {
+        // 1. Split pane sessions: poll each active session's child.
+        let pane_ids: Vec<bitty_runtime::ViewId> = self.runtime.pane_session_ids();
+        let mut closed_any = false;
+
+        for view in pane_ids {
+            if let Some(status) = self.runtime.pane_try_wait(&view) {
+                // If there is only one leaf left, this was the last active pane.
+                if self.runtime.leaf_count() <= 1 {
+                    crate::logging::info(|| {
+                        format!(
+                            "bitty: last pane shell {view:?} exited (success={} code={} signal={:?}) — closing session",
+                            status.is_success(),
+                            status.code(),
+                            status.signal()
+                        )
+                    });
+                    return ShellExitOutcome::AppExiting;
+                }
+
+                crate::logging::info(|| {
+                    format!(
+                        "bitty: pane shell {view:?} exited (success={} code={} signal={:?}) — closing pane",
+                        status.is_success(),
+                        status.code(),
+                        status.signal()
+                    )
+                });
+                self.restore_zoom();
+                let mut layout = self.runtime.layout().clone();
+                if crate::chrome_keys::close_focused_leaf(&mut layout, view) {
+                    self.runtime.set_layout_closing(layout, view);
+                }
+                self.runtime.close_pane_session(&view);
+                closed_any = true;
+            }
+        }
+
+        // 2. Primary shell session.
+        if let Some(status) = self.runtime.primary_exit_status() {
+            if self.runtime.pane_session_count() == 0 || self.runtime.leaf_count() <= 1 {
+                crate::logging::info(|| {
+                    format!(
+                        "bitty: primary shell exited (success={} code={} signal={:?}) — closing session",
+                        status.is_success(),
+                        status.code(),
+                        status.signal()
+                    )
+                });
+                return ShellExitOutcome::AppExiting;
+            }
+
+            // Primary shell exited while split panes are still active:
+            // Close the primary pane leaf so remaining panes take over.
+            if let Some(primary_view) = self.runtime.primary_view() {
+                crate::logging::info(|| {
+                    format!(
+                        "bitty: primary shell {primary_view:?} exited (success={} code={} signal={:?}) with {} panes running — closing primary pane",
+                        status.is_success(),
+                        status.code(),
+                        status.signal(),
+                        self.runtime.pane_session_count()
+                    )
+                });
+                self.restore_zoom();
+                let mut layout = self.runtime.layout().clone();
+                if crate::chrome_keys::close_focused_leaf(&mut layout, primary_view) {
+                    self.runtime.set_layout_closing(layout, primary_view);
+                }
+                closed_any = true;
+            }
+        }
+
+        if closed_any {
+            if let Some(win) = self.window.handle.as_ref() {
+                win.request_redraw();
+            }
+            ShellExitOutcome::PaneClosed
+        } else {
+            ShellExitOutcome::NoExit
+        }
+    }
+
     /// Applies a sanitized, change-gated title to the OS window (CTX-0382,
     /// handoff seam CTX-0570).
     ///
@@ -734,28 +833,14 @@ impl AppHandler for TerminalApp {
         // visible to the state machine before the tick.
         self.poll_pty_pump();
 
-        // Issue #1356: an exited primary shell closes the session instead of
-        // freezing on a stale grid with silently-dropped input (ghostty/kitty
-        // close the window on child exit). The check runs on every event so
-        // no pump cadence can strand a dead shell; it stays open while
-        // split-pane sessions exist (their shells still run). No child owned
-        // (headless smoke, spawn failure) never exits here.
-        if self.runtime.pane_session_count() == 0 {
-            // Single `try_wait` reap: `primary_exit_status` consumes the
-            // status exactly once, so bind it here and never call it twice.
-            if let Some(status) = self.runtime.primary_exit_status() {
-                crate::logging::info(|| {
-                    format!(
-                        "bitty: primary shell exited (success={} code={} signal={:?}) — closing session",
-                        status.is_success(),
-                        status.code(),
-                        status.signal()
-                    )
-                });
-                self.save_session_best_effort("shell-exit");
-                ctx.exit();
-                return;
-            }
+        // Issue #1356 / #1541: reap exited child processes across primary and
+        // split pane sessions. When a split child exits, its pane is closed
+        // and its sibling promoted. When the last child exits, the session
+        // closes cleanly.
+        if self.reap_exited_shells() == ShellExitOutcome::AppExiting {
+            self.save_session_best_effort("shell-exit");
+            ctx.exit();
+            return;
         }
 
         // CTX-0153 single-owner intercept with CTX-0275 explicit dispatch
@@ -986,6 +1071,11 @@ impl AppHandler for TerminalApp {
                 // Poll PTY pump again and drive tick; request redraw only when
                 // tick produced a present (frame-on-demand).
                 self.poll_pty_pump();
+                if self.reap_exited_shells() == ShellExitOutcome::AppExiting {
+                    self.save_session_best_effort("shell-exit");
+                    ctx.exit();
+                    return;
+                }
                 if self.drive_tick().is_some() {
                     if let Some(win) = self.window.handle.as_ref() {
                         win.request_redraw();

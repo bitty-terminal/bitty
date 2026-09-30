@@ -7,8 +7,10 @@
 //! pure determination half; the structured outcome set stays CTX-0512.
 //!
 //! The host supplies the counter text; no cgroup path is hardcoded here (the
-//! supervisor reads the per-job cgroup's `memory.events` and passes the
-//! content in, so this module needs no filesystem access and no syscalls).
+//! per-job cgroup module `cgroup` reads the leaf's `memory.events` and
+//! passes the content in, so this module needs no filesystem access and no
+//! syscalls). Every job records [`OomEvidence`] on its snapshot, and a job
+//! without evidence names the [`OomEvidenceGap`] (CTX-0880, #1537).
 
 /// Largest `memory.events` text accepted (16 KiB).
 ///
@@ -37,6 +39,103 @@ impl OomVerdict {
             Self::OomKilled => "oom_killed",
             Self::NotOom => "not_oom",
             Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Why a job carries no OOM evidence (CTX-0880, #1537).
+///
+/// Every job either has a cgroup counter reading at both ends or names the
+/// reason it does not; a missing cgroup never fails the spawn and never
+/// hides behind a silent [`OomVerdict::Unknown`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OomEvidenceGap {
+    /// The registry was built without a delegated cgroup base.
+    NotConfigured,
+    /// Discovery found no usable delegated cgroup v2 subtree (no unified
+    /// hierarchy, no `memory` delegation, or not writable).
+    Undelegated,
+    /// The platform has no per-job cgroup mechanism (macOS, Windows, BSD).
+    UnsupportedPlatform,
+    /// The bounded count of per-job leaves (live plus not yet removed) was
+    /// reached, so this job runs without a leaf.
+    LeafLimit,
+    /// The per-job leaf directory could not be created.
+    LeafCreateFailed,
+    /// The job's leader could not be moved into its leaf (for example it
+    /// already exited).
+    PlacementFailed,
+    /// A `memory.events` reading was missing, over-bound, or malformed.
+    CounterUnreadable,
+    /// The job never started a process (cancelled before start or spawn
+    /// failure), so there is nothing to account.
+    NotStarted,
+}
+
+impl OomEvidenceGap {
+    /// Stable lowercase wire/display name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotConfigured => "not_configured",
+            Self::Undelegated => "undelegated",
+            Self::UnsupportedPlatform => "unsupported_platform",
+            Self::LeafLimit => "leaf_limit",
+            Self::LeafCreateFailed => "leaf_create_failed",
+            Self::PlacementFailed => "placement_failed",
+            Self::CounterUnreadable => "counter_unreadable",
+            Self::NotStarted => "not_started",
+        }
+    }
+}
+
+/// OOM evidence recorded on a job (reported on every snapshot).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OomEvidence {
+    /// The job has not reached the point where evidence is decided.
+    Pending,
+    /// The job runs inside its own cgroup leaf; the verdict is read at exit.
+    Tracked,
+    /// The leaf's `oom_kill` counter advanced while the job ran.
+    OomKilled,
+    /// Both counter readings exist and the counter did not advance.
+    NotOom,
+    /// No evidence exists for this job, for the named reason.
+    Missing(OomEvidenceGap),
+}
+
+impl OomEvidence {
+    /// Maps two-endpoint counter readings onto recorded evidence: a missing
+    /// endpoint is [`OomEvidenceGap::CounterUnreadable`], never a guess.
+    #[must_use]
+    pub const fn from_counts(before: Option<u64>, after: Option<u64>) -> Self {
+        match classify_oom(before, after) {
+            OomVerdict::OomKilled => Self::OomKilled,
+            OomVerdict::NotOom => Self::NotOom,
+            OomVerdict::Unknown => Self::Missing(OomEvidenceGap::CounterUnreadable),
+        }
+    }
+
+    /// The verdict the outcome classifier consumes: only a completed
+    /// reading yields [`OomVerdict::OomKilled`] or [`OomVerdict::NotOom`].
+    #[must_use]
+    pub const fn verdict(self) -> OomVerdict {
+        match self {
+            Self::OomKilled => OomVerdict::OomKilled,
+            Self::NotOom => OomVerdict::NotOom,
+            Self::Pending | Self::Tracked | Self::Missing(_) => OomVerdict::Unknown,
+        }
+    }
+
+    /// Stable lowercase wire/display name (the gap is named separately).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Tracked => "tracked",
+            Self::OomKilled => "oom_killed",
+            Self::NotOom => "not_oom",
+            Self::Missing(_) => "missing",
         }
     }
 }
@@ -112,6 +211,32 @@ mod tests {
         assert_eq!(classify_oom(None, Some(3)), OomVerdict::Unknown);
         assert_eq!(classify_oom(Some(2), None), OomVerdict::Unknown);
         assert_eq!(classify_oom(None, None), OomVerdict::Unknown);
+    }
+
+    #[test]
+    fn evidence_maps_counts_and_never_guesses() {
+        assert_eq!(
+            OomEvidence::from_counts(Some(0), Some(1)),
+            OomEvidence::OomKilled
+        );
+        assert_eq!(
+            OomEvidence::from_counts(Some(1), Some(1)),
+            OomEvidence::NotOom
+        );
+        assert_eq!(
+            OomEvidence::from_counts(Some(1), None),
+            OomEvidence::Missing(OomEvidenceGap::CounterUnreadable)
+        );
+        assert_eq!(OomEvidence::OomKilled.verdict(), OomVerdict::OomKilled);
+        assert_eq!(OomEvidence::NotOom.verdict(), OomVerdict::NotOom);
+        assert_eq!(OomEvidence::Pending.verdict(), OomVerdict::Unknown);
+        assert_eq!(OomEvidence::Tracked.verdict(), OomVerdict::Unknown);
+        assert_eq!(
+            OomEvidence::Missing(OomEvidenceGap::NotConfigured).verdict(),
+            OomVerdict::Unknown
+        );
+        assert_eq!(OomEvidenceGap::LeafLimit.as_str(), "leaf_limit");
+        assert_eq!(OomEvidence::Tracked.as_str(), "tracked");
     }
 
     #[test]

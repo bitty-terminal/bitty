@@ -137,11 +137,18 @@ impl EventContext<'_> {
     /// Returns [`PlatformError::WindowCreation`] when the platform refuses
     /// the request; the upstream diagnostic text is preserved.
     pub fn create_window(&mut self, config: WindowConfig) -> Result<WindowHandle, PlatformError> {
+        let blur_radius = config.blur_radius();
         let attributes = config.into_attributes();
         let window = self
             .event_loop
             .create_window(attributes)
             .map_err(|error| PlatformError::WindowCreation(error.to_string()))?;
+
+        // Apply background blur if requested (CTX-0832)
+        if blur_radius > 0 {
+            crate::blur::apply_blur(&window, blur_radius);
+        }
+
         let id = self.registry.register(&window.id());
         Ok(WindowHandle {
             id,
@@ -302,6 +309,10 @@ pub struct WindowConfig {
     /// Window opacity `0.0..=1.0` (CTX-0223 `window.opacity`; default `1.0`
     /// = opaque). Always sanitized (see [`sanitize_opacity`]).
     opacity: f32,
+    /// Background blur radius in logical pixels `0..=128` (CTX-0832).
+    /// Platform support varies: Wayland (KDE/Hyprland), macOS NSVisualEffectView.
+    /// Default `0` = no blur.
+    blur_radius: u32,
 }
 
 /// Coerces any opacity into the honored range (CTX-0223).
@@ -343,6 +354,7 @@ impl Default for WindowConfig {
             resizable: true,
             visible: true,
             opacity: 1.0,
+            blur_radius: 0,
         }
     }
 }
@@ -411,6 +423,21 @@ impl WindowConfig {
     /// Whether this config requests a transparent window.
     pub fn is_transparent(&self) -> bool {
         opacity_requests_transparency(self.opacity)
+    }
+
+    /// Sets the background blur radius (CTX-0832 `window.blur_radius`).
+    ///
+    /// Clamped to `0..=128` logical pixels. Platform support varies:
+    /// Wayland (KDE/Hyprland via blur protocol), macOS (NSVisualEffectView).
+    /// Unsupported platforms silently ignore the value.
+    pub fn with_blur_radius(mut self, radius: u32) -> Self {
+        self.blur_radius = radius.min(128);
+        self
+    }
+
+    /// The configured blur radius in logical pixels.
+    pub fn blur_radius(&self) -> u32 {
+        self.blur_radius
     }
 
     fn into_attributes(self) -> WindowAttributes {
@@ -613,6 +640,7 @@ mod tests {
                 resizable: false,
                 visible: false,
                 opacity: 0.9,
+                blur_radius: 0,
             }
         );
         assert_eq!(WindowConfig::default(), WindowConfig::new());

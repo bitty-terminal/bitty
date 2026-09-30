@@ -1029,36 +1029,33 @@ impl Runtime {
         // is pure and bounded by the leaf count.
         let allocations = frames;
         let focused = self.focus.focused();
-        // CTX-0254: Kitty origin binding. The image layer is keyed by the
-        // emitting PTY stream — `None` for the primary grid, `Some(id)`
-        // for the split-pane session owning the focused leaf — so a
-        // background pane can never paint over the focused pane
-        // (cross-pane spoof prevention). Alt-screen and scrollback resolve
-        // against the origin's own grid, never a global one; the latch
-        // below therefore tracks the focused origin's alt state.
-        let kitty_origin: Option<u64> = focused.and_then(|fid| {
-            if self.pane_sessions.contains_key(&fid) {
-                Some(fid.0)
+        // CTX-0248 / CTX-0254 / #1550: Kitty alternate-screen tracking across all
+        // visible allocations. An alternate-screen transition on any visible origin
+        // forces a full present even when the grid generation is unchanged, so
+        // entering alt clears that origin's painted images (and leaving alt repaints
+        // the restored grid) instead of idling on a stale frame. Other origins are
+        // untouched (CTX-0254 `clear_origin`).
+        let mut current_alt_screens = std::collections::BTreeSet::new();
+        for frame in &allocations {
+            let pane_origin: Option<u64> = if self.pane_sessions.contains_key(&frame.view) {
+                Some(frame.view.0)
             } else {
                 None
+            };
+            let is_alt = match pane_origin {
+                Some(token) => self
+                    .pane_sessions
+                    .get(&ViewId::new(token))
+                    .map(|sess| sess.state.alt_screen_active())
+                    .unwrap_or(false),
+                None => self.state.alt_screen_active(),
+            };
+            if is_alt {
+                current_alt_screens.insert(pane_origin);
             }
-        });
-        let (kitty_origin_alt, kitty_origin_scrollback) = match kitty_origin {
-            Some(token) => match self.pane_sessions.get(&ViewId::new(token)) {
-                Some(sess) => (sess.state.alt_screen_active(), sess.state.scrollback_len()),
-                // Unreachable single-threaded (checked above); fail closed
-                // to "alt active" so nothing paints against a wrong grid.
-                None => (true, self.state.scrollback_len()),
-            },
-            None => (self.state.alt_screen_active(), self.state.scrollback_len()),
-        };
-        // CTX-0248: an alternate-screen transition on the focused origin
-        // forces a full present even when the grid generation is unchanged,
-        // so entering alt clears that origin's painted images (and leaving
-        // alt repaints the restored grid) instead of idling on a stale
-        // frame. Other origins are untouched (CTX-0254 `clear_origin`).
-        if kitty_origin_alt != self.kitty_alt_screen_latched {
-            self.kitty_alt_screen_latched = kitty_origin_alt;
+        }
+        if current_alt_screens != self.kitty_alt_screens_latched {
+            self.kitty_alt_screens_latched = current_alt_screens;
             pending_full = true;
         }
         let last = self.last_presented_generation;
@@ -1209,9 +1206,6 @@ impl Runtime {
             focused,
             full_frame,
             current_gen,
-            kitty_origin,
-            kitty_origin_alt,
-            kitty_origin_scrollback,
             view_map,
             pad_px,
             ring_ctx,
@@ -2163,170 +2157,147 @@ impl Runtime {
     /// Phase 5 (CTX-0474): the CTX-0248/0252/0254 kitty image layer.
     ///
     /// Topmost focused-origin blits, budget-checked before rasterizing and
-    /// skipped while the focused view inspects scrollback. Body moved
-    /// verbatim from `tick_at`.
+    /// Phase 5 (CTX-0474, #1550): the CTX-0248/0252/0254 kitty image layer.
+    ///
+    /// Topmost per-pane blits for all visible allocations, budget-checked before
+    /// rasterizing and clipped to each pane's content rectangle. Placements are
+    /// skipped while a view inspects scrollback. Unfocused panes retain and
+    /// display their own Kitty images without disappearing on focus switch.
+    /// Alternate-screen entry clears only the entering origin (`clear_origin`).
     fn paint_kitty_images(&mut self, basis: &TickBasis, layers: &mut FrameLayers) {
         let snapshot = &basis.snapshot;
         let allocations = &basis.allocations;
         let view_map = &basis.view_map;
         let pad_px = basis.pad_px;
-        let kitty_origin = basis.kitty_origin;
-        let kitty_origin_alt = basis.kitty_origin_alt;
-        let kitty_origin_scrollback = basis.kitty_origin_scrollback;
-        // Kitty images (CTX-0248, budget + cache CTX-0252 F2, origin
-        // binding CTX-0254): topmost present-layer blits on the focused
-        // leaf, composited after fills and glyphs. Never grid truth: no
-        // cell, scrollback, or layout mutation. Each visible placement is
-        // scaled by the rich layer to its clamped cell-rect pixel extent
-        // and translated to the leaf origin (plus the window padding
-        // inset, like every other overlay).
-        //
-        // Only the focused leaf's origin paints here
-        // (`placements_in_paint_order_for`): placements emitted by any
-        // other pane stay retained but contribute zero pixels to this
-        // frame, so a background program cannot spoof content over the
-        // focused pane. Skipped while the focused view inspects scrollback
-        // (live-grid anchors do not map to the history viewport).
-        // Alternate-screen entry clears only the entering origin
-        // (`clear_origin`); other panes' images survive.
-        //
-        // Per-frame budget ([`bitty_rich::KittyFrameBudget`]): at most 32
-        // blits / 64 MiB of scaled bytes per frame, checked before
-        // rasterizing so refused bytes are never allocated; over-budget
-        // placements are skipped for the frame only (retained in paint
-        // order). Raster cache ([`bitty_rich::KittyRasterCache`]): scaled
-        // bytes keyed by placement + image identity, destination rect,
-        // source dims, scrollback sequence, and geometry, so static frames
-        // reuse blits while scroll/geometry changes miss (never stale).
-        if kitty_origin_alt {
-            self.kitty_images.clear_origin(kitty_origin);
-            self.kitty_raster_cache.clear();
-        } else if !self
-            .kitty_images
-            .placement_for_origin_is_empty(kitty_origin)
-        {
-            let scrolled = self
-                .focused_view()
-                .and_then(|fid| view_map.get(&fid))
+
+        let live = self.live_cell_metrics();
+        if live.width == 0 || live.height == 0 {
+            return;
+        }
+        let rich_metrics = bitty_rich::CellMetrics {
+            width: live.width,
+            height: live.height,
+        };
+
+        let mut budget = bitty_rich::KittyFrameBudget::new();
+
+        for frame in allocations {
+            if frame.cols == 0 || frame.rows == 0 {
+                continue;
+            }
+
+            let pane_origin: Option<u64> = if self.pane_sessions.contains_key(&frame.view) {
+                Some(frame.view.0)
+            } else {
+                None
+            };
+
+            let (alt_active, cursor_row, rows, scrollback_len) = match pane_origin {
+                Some(token) => match self.pane_sessions.get(&ViewId::new(token)) {
+                    Some(sess) => (
+                        sess.state.alt_screen_active(),
+                        usize::from(sess.state.cursor().position.row),
+                        sess.state.height(),
+                        sess.state.scrollback_len(),
+                    ),
+                    None => (
+                        self.state.alt_screen_active(),
+                        usize::from(snapshot.cursor.position.row),
+                        snapshot.height,
+                        self.state.scrollback_len(),
+                    ),
+                },
+                None => (
+                    self.state.alt_screen_active(),
+                    usize::from(snapshot.cursor.position.row),
+                    snapshot.height,
+                    self.state.scrollback_len(),
+                ),
+            };
+
+            if alt_active {
+                if !self.kitty_images.placement_for_origin_is_empty(pane_origin) {
+                    self.kitty_images.clear_origin(pane_origin);
+                    self.kitty_raster_cache.clear();
+                }
+                continue;
+            }
+
+            if self.kitty_images.placement_for_origin_is_empty(pane_origin) {
+                continue;
+            }
+
+            let scrolled = view_map
+                .get(&frame.view)
                 .map(|v| v.scroll_offset() != 0)
                 .unwrap_or(false);
-            if !scrolled {
-                if let Some(fid) = self.focused_view().or(view_map.keys().next().copied()) {
-                    if let Some(frame) = allocations.iter().find(|frame| frame.view == fid) {
-                        if frame.cols > 0 && frame.rows > 0 {
-                            let live = self.live_cell_metrics();
-                            let rich_metrics = bitty_rich::CellMetrics {
-                                width: live.width,
-                                height: live.height,
-                            };
-                            // CTX-0254: the origin's own scrollback sequence
-                            // (resolved above), so a pane's image tracks its
-                            // pane's content — never the primary grid's.
-                            // CTX-0361: fold the live cursor-follow window
-                            // start into the sequence so placements track the
-                            // same rows the text viewport presents (the
-                            // decorated content frame is smaller than the PTY
-                            // grid until reflow).
-                            let (origin_cursor_row, origin_rows) = match kitty_origin {
-                                Some(token) => match self.pane_sessions.get(&ViewId::new(token)) {
-                                    Some(sess) => (
-                                        usize::from(sess.state.cursor().position.row),
-                                        sess.state.height(),
-                                    ),
-                                    None => {
-                                        (usize::from(snapshot.cursor.position.row), snapshot.height)
-                                    }
-                                },
-                                None => {
-                                    (usize::from(snapshot.cursor.position.row), snapshot.height)
-                                }
-                            };
-                            let scrollback = kitty_origin_scrollback
-                                + cursor_follow_window_start(
-                                    origin_cursor_row,
-                                    origin_rows,
-                                    usize::from(frame.rows),
-                                );
-                            let origin_px_x = px_add(pad_px, frame.content.x);
-                            let origin_px_y = px_add(pad_px, frame.content.y);
-                            let mut budget = bitty_rich::KittyFrameBudget::new();
-                            for placement in self
-                                .kitty_images
-                                .placements_in_paint_order_for(kitty_origin)
-                            {
-                                let Some(img) = self.kitty_images.get(placement.image) else {
-                                    continue;
-                                };
-                                // #1334: scale into the FULL (unclamped)
-                                // placement extent, then crop the visible
-                                // window — never re-scale the whole source
-                                // into the clamped rect (first-paint squash).
-                                let Some(full_px) =
-                                    bitty_rich::KittyImageLayer::placement_full_rect(
-                                        placement,
-                                        rich_metrics,
-                                        scrollback,
-                                    )
-                                else {
-                                    continue;
-                                };
-                                let Some(rect_px) = bitty_rich::KittyImageLayer::placement_rect(
-                                    placement,
-                                    rich_metrics,
-                                    frame.cols,
-                                    frame.rows,
-                                    scrollback,
-                                ) else {
-                                    continue;
-                                };
-                                // Budget before rasterize: refused bytes are
-                                // never allocated, bounding the pathological
-                                // 128-placement transient per frame.
-                                let need = (u64::from(rect_px.width) * u64::from(rect_px.height))
-                                    .checked_mul(4)
-                                    .filter(|&n| n <= usize::MAX as u64)
-                                    .map(|n| n as usize);
-                                let Some(need) = need else { continue };
-                                if !budget.admit(need) {
-                                    continue;
-                                }
-                                let key = bitty_rich::KittyRasterKey {
-                                    placement: placement.id.0,
-                                    image: placement.image.0,
-                                    rect: rect_px,
-                                    src_w: img.width,
-                                    src_h: img.height,
-                                    scrollback,
-                                    cell: rich_metrics,
-                                    viewport_cols: frame.cols,
-                                    viewport_rows: frame.rows,
-                                };
-                                let Some(scaled) =
-                                    self.kitty_raster_cache.get_or_rasterize(key, || {
-                                        bitty_rich::rasterize_clipped(img, full_px, rect_px)
-                                    })
-                                else {
-                                    continue;
-                                };
-                                let dest = bitty_render::geometry::RectPx::new(
-                                    px_add(rect_px.x, origin_px_x),
-                                    px_add(rect_px.y, origin_px_y),
-                                    rect_px.width,
-                                    rect_px.height,
-                                );
-                                if let Ok(blit) =
-                                    bitty_render::grid::ImageBlit::try_new(dest, scaled)
-                                {
-                                    layers.combined_images.push(blit);
-                                }
-                            }
-                            if !layers.combined_images.is_empty() {
-                                layers.any_needs_draw = true;
-                            }
-                        }
-                    }
+            if scrolled {
+                continue;
+            }
+
+            let scrollback = scrollback_len
+                + cursor_follow_window_start(cursor_row, rows, usize::from(frame.rows));
+            let origin_px_x = px_add(pad_px, frame.content.x);
+            let origin_px_y = px_add(pad_px, frame.content.y);
+
+            for placement in self.kitty_images.placements_in_paint_order_for(pane_origin) {
+                let Some(img) = self.kitty_images.get(placement.image) else {
+                    continue;
+                };
+                let Some(full_px) = bitty_rich::KittyImageLayer::placement_full_rect(
+                    placement,
+                    rich_metrics,
+                    scrollback,
+                ) else {
+                    continue;
+                };
+                let Some(rect_px) = bitty_rich::KittyImageLayer::placement_rect(
+                    placement,
+                    rich_metrics,
+                    frame.cols,
+                    frame.rows,
+                    scrollback,
+                ) else {
+                    continue;
+                };
+                let need = (u64::from(rect_px.width) * u64::from(rect_px.height))
+                    .checked_mul(4)
+                    .filter(|&n| n <= usize::MAX as u64)
+                    .map(|n| n as usize);
+                let Some(need) = need else { continue };
+                if !budget.admit(need) {
+                    continue;
+                }
+                let key = bitty_rich::KittyRasterKey {
+                    placement: placement.id.0,
+                    image: placement.image.0,
+                    rect: rect_px,
+                    src_w: img.width,
+                    src_h: img.height,
+                    scrollback,
+                    cell: rich_metrics,
+                    viewport_cols: frame.cols,
+                    viewport_rows: frame.rows,
+                };
+                let Some(scaled) = self
+                    .kitty_raster_cache
+                    .get_or_rasterize(key, || bitty_rich::rasterize_clipped(img, full_px, rect_px))
+                else {
+                    continue;
+                };
+                let dest = bitty_render::geometry::RectPx::new(
+                    px_add(rect_px.x, origin_px_x),
+                    px_add(rect_px.y, origin_px_y),
+                    rect_px.width,
+                    rect_px.height,
+                );
+                if let Ok(blit) = bitty_render::grid::ImageBlit::try_new(dest, scaled) {
+                    layers.combined_images.push(blit);
                 }
             }
+        }
+        if !layers.combined_images.is_empty() {
+            layers.any_needs_draw = true;
         }
     }
 
@@ -2575,12 +2546,6 @@ struct TickBasis {
     full_frame: bool,
     /// Max grid generation across origins (present stats + damage).
     current_gen: u64,
-    /// Kitty origin token: `None` for the primary grid, else the pane view.
-    kitty_origin: Option<u64>,
-    /// Resolved alt-screen state of the kitty origin.
-    kitty_origin_alt: bool,
-    /// Resolved scrollback length of the kitty origin.
-    kitty_origin_scrollback: usize,
     /// id -> View map for scroll/selection/IME lookups.
     view_map: std::collections::HashMap<ViewId, View>,
     /// Physical window padding inset.

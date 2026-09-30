@@ -1039,8 +1039,10 @@ impl Runtime {
         for frame in &allocations {
             let pane_origin: Option<u64> = if self.pane_sessions.contains_key(&frame.view) {
                 Some(frame.view.0)
-            } else {
+            } else if Some(frame.view) == self.primary_view {
                 None
+            } else {
+                continue;
             };
             let is_alt = match pane_origin {
                 Some(token) => self
@@ -2188,8 +2190,11 @@ impl Runtime {
 
             let pane_origin: Option<u64> = if self.pane_sessions.contains_key(&frame.view) {
                 Some(frame.view.0)
-            } else {
+            } else if Some(frame.view) == self.primary_view {
                 None
+            } else {
+                // CTX-0359: a session-less non-owner leaf presents erased: no images.
+                continue;
             };
 
             let (alt_active, cursor_row, rows, scrollback_len) = match pane_origin {

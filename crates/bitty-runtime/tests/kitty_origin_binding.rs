@@ -206,6 +206,20 @@ fn multi_pane_kitty_images_persist_across_focus_switching() {
 }
 
 #[test]
+fn sessionless_unowned_leaf_never_inherits_primary_images() {
+    let mut rt = two_pane_runtime();
+    // ViewId(1) is the primary owner; ViewId(2) has no pane session and is not primary owner.
+    rt.handle_pty_bytes(&red_apc());
+    rt.tick().expect("display forces present");
+    assert!(view_has_opaque_red(&rt, ViewId::new(1)));
+    assert!(
+        !view_has_opaque_red(&rt, ViewId::new(2)),
+        "sessionless unowned leaf must never render primary Kitty images"
+    );
+    assert_eq!(rt.kitty_last_frame_images(), 1);
+}
+
+#[test]
 fn close_pane_session_drops_its_placements() {
     let mut rt = two_pane_runtime();
     assert!(rt.set_focus(ViewId::new(1)));

@@ -481,6 +481,7 @@ pub struct PluginRuntime {
     /// Network stays an optional extension: a missing runtime never fails
     /// activation, it only withholds the module (fail-closed, no ambient
     /// authority).
+    #[cfg(feature = "network")]
     network_runtime: Option<Rc<bitty_network_lua::SharedNetworkRuntime>>,
 }
 
@@ -504,6 +505,7 @@ impl PluginRuntime {
             entries: BTreeMap::new(),
             order: Vec::new(),
             service_directory: Rc::new(RefCell::new(ServiceDirectory::new())),
+            #[cfg(feature = "network")]
             network_runtime: None,
         }
     }
@@ -515,11 +517,13 @@ impl PluginRuntime {
     /// a `network.connect*` capability gets the `bitty.network` module; VMs
     /// without the grant never see it. Passing a runtime does not by itself
     /// widen any plugin's authority — the per-plugin grant is still the gate.
+    #[cfg(feature = "network")]
     pub fn set_network_runtime(&mut self, runtime: Rc<bitty_network_lua::SharedNetworkRuntime>) {
         self.network_runtime = Some(runtime);
     }
 
     /// The shared network runtime, if one was installed (CTX-0846, #1454).
+    #[cfg(feature = "network")]
     #[must_use]
     pub fn network_runtime(&self) -> Option<&Rc<bitty_network_lua::SharedNetworkRuntime>> {
         self.network_runtime.as_ref()
@@ -902,15 +906,18 @@ impl PluginRuntime {
         // Missing runtime is not an error: network is an optional extension,
         // so a granted plugin on a network-less host simply sees no module
         // (fail-closed, never ambient).
-        let network_granted = granted
-            .iter()
-            .any(|capability| capability.as_str().starts_with("network.connect"));
-        if network_granted {
-            if let Some(runtime) = self.network_runtime.clone() {
-                if let Err(error) = vm.register_network_module(&runtime) {
-                    let error = PluginRuntimeError::Vm(error.to_string());
-                    self.rollback(id, error.to_string());
-                    return Err(error);
+        #[cfg(feature = "network")]
+        {
+            let network_granted = granted
+                .iter()
+                .any(|capability| capability.as_str().starts_with("network.connect"));
+            if network_granted {
+                if let Some(runtime) = self.network_runtime.clone() {
+                    if let Err(error) = vm.register_network_module(&runtime) {
+                        let error = PluginRuntimeError::Vm(error.to_string());
+                        self.rollback(id, error.to_string());
+                        return Err(error);
+                    }
                 }
             }
         }

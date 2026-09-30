@@ -44,9 +44,8 @@ request/resolve operations await the external `bitty-network` backend
 ## Boundaries
 
 - Workspace-internal dependencies, per `Cargo.toml`: `bitty-term-state`,
-  `bitty-config`, and `bitty-package`; the external `bitty-network-lua` crate
-  is declared for the optional network capability described above, and no
-  first-party network I/O lives in this crate.
+  `bitty-config`, and `bitty-package`; no external network crates or
+  first-party network I/O live in this crate.
 - Pure data plus validation on the host side: no Lua VM coupling, no file
   I/O, no platform window or GPU coupling, and no `unsafe`.
 - The capability grammar is deny-by-default and closed: unknown identifiers

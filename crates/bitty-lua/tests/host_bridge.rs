@@ -1472,9 +1472,11 @@ const BUDGET_MARGIN_MS: u64 = 10;
 
 /// Store backend with injected commit latency (bitty #1518).
 ///
-/// `store_delay_ms` is spent inside the write before it commits (or fails,
-/// when `fail_writes` is set); `notify_delay_ms` is non-store host work on a
-/// mutating path that is never credited.
+/// `store_delay_ms` stands in for durable commit I/O of keys starting with
+/// `slow`: it is spent inside the write and, when the write commits,
+/// reported through `record_store_commit_io` like the disk-backed runtime
+/// store does. With `fail_writes` the write fails after the delay.
+/// `notify_delay_ms` is non-store host work that is never credited.
 #[derive(Default)]
 struct LatencyServices {
     store: RefCell<BTreeMap<String, LuaValue>>,
@@ -1498,6 +1500,7 @@ impl HostServices for LatencyServices {
                     "could not commit the plugin state file",
                 ));
             }
+            bitty_lua::record_store_commit_io(Duration::from_millis(self.store_delay_ms));
         }
         self.store.borrow_mut().insert(key.to_string(), value);
         Ok(())
@@ -1519,7 +1522,7 @@ impl HostServices for LatencyServices {
 
 /// Lua work after a delay that crosses several `SLICE_FUEL` slice
 /// boundaries, so the RC-1 wall check runs before the chunk completes.
-const CROSS_SLICES: &str = "local n = 0 for i = 1, 20000 do n = n + i end";
+const CROSS_SLICES: &str = "local n = 0 for i = 1, 4096 do n = n + i end";
 
 fn latency_vm(tag: &str, services: &Rc<LatencyServices>) -> LuaVm {
     let mut vm = gate_vm(tag);
@@ -1577,6 +1580,18 @@ fn committed_store_write_slower_than_rc1_does_not_suspend_callback() {
     assert_eq!(
         stored(&services, "read"),
         Some(LuaValue::String("v".into()))
+    );
+    // Reported wall time and the warning stay raw; the credit is separate.
+    let snapshot = vm.budget_snapshot();
+    assert!(
+        snapshot.wall_elapsed_ms >= services.store_delay_ms,
+        "{snapshot:?}"
+    );
+    assert!(snapshot.warning_triggered, "{snapshot:?}");
+    assert!(
+        snapshot.store_commit_credit_ms > 0
+            && snapshot.store_commit_credit_ms <= snapshot.wall_elapsed_ms,
+        "{snapshot:?}"
     );
 }
 
@@ -1668,4 +1683,47 @@ fn store_commit_credit_is_capped_per_callback() {
         Some(LuaValue::String("v".into()))
     );
     assert_eq!(stored(&services, "after"), None);
+}
+
+#[test]
+fn many_short_commits_accumulate_past_the_credit_cap() {
+    // Each committed write is about half the RC-1 budget, so no single
+    // write is suspicious, but together they pass the per-callback credit
+    // cap plus the budget. The excess is charged and the callback suspends
+    // at the next slice boundary.
+    let per_write_ms = bitty_lua::RC1_WALL_CLOCK_BUDGET_MS / 2;
+    let writes = (bitty_lua::STORE_COMMIT_CREDIT_MAX_MS + bitty_lua::RC1_WALL_CLOCK_BUDGET_MS)
+        / per_write_ms
+        + 1;
+    let services = Rc::new(LatencyServices {
+        store_delay_ms: per_write_ms,
+        ..LatencyServices::default()
+    });
+    let mut vm = latency_vm("credit-accumulate", &services);
+    let chunk = format!(
+        r#"
+            for i = 1, {writes} do bitty.store.set("slow" .. i, i) end
+            CROSS_SLICES
+            bitty.store.set("after", true)
+        "#
+    );
+    let outcome = run_latency(&mut vm, &chunk);
+    assert!(
+        matches!(
+            outcome,
+            BoundedExecution::Suspended(SuspendReason::WallClockExceeded { .. })
+        ),
+        "{outcome:?}"
+    );
+    let last = i64::try_from(writes).expect("small count");
+    assert_eq!(
+        stored(&services, &format!("slow{last}")),
+        Some(LuaValue::Integer(last)),
+        "every write committed before the suspension"
+    );
+    assert_eq!(stored(&services, "after"), None);
+    assert_eq!(
+        vm.budget_snapshot().store_commit_credit_ms,
+        bitty_lua::STORE_COMMIT_CREDIT_MAX_MS
+    );
 }

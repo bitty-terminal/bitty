@@ -479,9 +479,11 @@ impl std::error::Error for BridgeError {}
 /// not re-checked after success because a committed effect must never be
 /// reported as a timeout; mutating/spawn implementations must check the expiry
 /// before committing or delivering, so post-deadline effects never commit),
-/// and rejects re-entrant calls. Committed `store_set_with_expiry` time is
-/// credited out of the RC-1 wall clock of every enclosing callback, capped at
-/// [`crate::STORE_COMMIT_CREDIT_MAX_MS`] per callback (bitty #1518).
+/// and rejects re-entrant calls. Durable commit I/O that a disk-backed store
+/// reports through [`crate::record_store_commit_io`] during a successful
+/// `store_set_with_expiry` is credited out of the RC-1 hard wall limit of
+/// every enclosing callback, capped at [`crate::STORE_COMMIT_CREDIT_MAX_MS`]
+/// per callback (bitty #1518).
 /// `process.spawn` flows through the same
 /// bridge timeout path with its own spawn deadline
 /// ([`SPAWN_TIMEOUT_MS`]/[`SPAWN_TIMEOUT_MAX_MS`], default 5 s, maximum 30 s,
@@ -988,12 +990,13 @@ impl BridgeState {
     /// guarantees post-deadline effects never commit when services honor the
     /// expiry (tests prove it; real read services are in-memory fast).
     ///
-    /// The post-call check uses the RC-1 budget clock
-    /// ([`crate::BudgetMark`]): time spent in committed `bitty.store.set`
-    /// writes during `f` (a cross-VM provider writing its store inside
+    /// The post-call check uses charged RC-1 time ([`crate::BudgetMark`]):
+    /// durable commit I/O of committed disk-backed `bitty.store.set` writes
+    /// during `f` (a cross-VM provider writing its store inside
     /// `service_call`) is not charged to this call, up to
     /// [`crate::STORE_COMMIT_CREDIT_MAX_MS`] (bitty #1518). Every other
-    /// delay, including a slow read or slow provider Lua, still times out.
+    /// delay, including store validation/encoding, a slow read, or slow
+    /// provider Lua, still times out.
     fn bounded<T>(
         &self,
         f: impl FnOnce(Instant) -> Result<T, BridgeError>,
@@ -1006,30 +1009,33 @@ impl BridgeState {
             return Err(BridgeError::timeout());
         }
         let out = f(expiry)?;
-        if mark.elapsed() > deadline {
+        if mark.read().charged > deadline {
             return Err(BridgeError::timeout());
         }
         Ok(out)
     }
 
-    /// [`Self::bounded_mutation`] for the plugin store commit
-    /// (`store_set_with_expiry`), crediting the commit to the RC-1 clock.
+    /// [`Self::bounded_mutation`] for the plugin store write
+    /// (`store_set_with_expiry`), crediting only its durable commit I/O.
     ///
-    /// On `Ok` the write has committed atomically, so its measured duration
-    /// is recorded with [`crate::credit_store_commit`] and excluded from the
-    /// wall clock of every enclosing callback on this thread (this VM's, and
-    /// a consumer VM waiting through a service call), capped per callback at
-    /// [`crate::STORE_COMMIT_CREDIT_MAX_MS`]. Refused or failed writes commit
-    /// nothing and are charged normally (bitty #1518).
+    /// Opens a [`crate::StoreCommitWindow`] so the store backend can report
+    /// its temp-file write, fsync, and rename time through
+    /// [`crate::record_store_commit_io`]. On `Ok` the write has committed
+    /// atomically and the reported I/O (bounded by this call's measured
+    /// duration) is excluded from the RC-1 hard wall limit of every
+    /// enclosing callback on this thread (this VM's, and a consumer VM
+    /// waiting through a service call), capped per callback at
+    /// [`crate::STORE_COMMIT_CREDIT_MAX_MS`]. Validation, cloning, quota
+    /// checks, and encoding stay charged; in-memory stores report nothing;
+    /// refused or failed writes are never credited (bitty #1518).
     fn bounded_store_commit(
         &self,
         f: impl FnOnce(Instant) -> Result<(), BridgeError>,
     ) -> Result<(), BridgeError> {
         let started = Instant::now();
+        let window = crate::StoreCommitWindow::open();
         let out = self.bounded_mutation(f);
-        if out.is_ok() {
-            crate::credit_store_commit(started.elapsed());
-        }
+        window.close(out.is_ok(), started.elapsed());
         out
     }
 

@@ -30,7 +30,7 @@
 //! | RC-1 | per-VM instruction budget       | `RC1_INSTRUCTION_BUDGET = 10_000_000` | `Fuel` counter with per-slice cap (`SLICE_FUEL = 1024`); exceed => fail-closed suspend |
 //! | RC-1 | per-VM wall-clock budget        | `RC1_WALL_CLOCK_BUDGET_MS = 50 ms`   | `Instant` deadline checked at next instruction boundary; exceed => suspend |
 //! | RC-1 | warning threshold               | `RC1_WARNING_MS = 8 ms`              | sets `warning_triggered` flag, counted, does not suspend |
-//! | RC-1 | committed store-write credit    | `STORE_COMMIT_CREDIT_MAX_MS = 200 ms` | time spent in a committed `bitty.store.set` is excluded from the wall clock, capped per callback; excess is charged (bitty #1518) |
+//! | RC-1 | store commit I/O credit         | `STORE_COMMIT_CREDIT_MAX_MS = 200 ms` | durable commit I/O of a committed disk-backed `bitty.store.set` is excluded from the hard wall limit, capped per callback; see the constant (bitty #1518) |
 //! | RC-2 | per-VM heap (accounted)         | `RC2_MEMORY_PER_PLUGIN_BYTES = 32 MiB` | builder hard quota (`RuntimeBuilder::memory_limit`) refuses over-quota allocation, plus `Lua::total_memory()` polling before/after each slice; exceed => suspend |
 //!
 //! All budgets are **fail-closed**: once exceeded, the VM transitions to
@@ -102,23 +102,39 @@ pub const RC1_INSTRUCTION_BUDGET: u64 = 10_000_000;
 /// RC-1 wall-clock budget (candidate, OQ-014): `50 ms` per callback.
 pub const RC1_WALL_CLOCK_BUDGET_MS: u64 = 50;
 
-/// Maximum committed store-write time credited back to one callback's RC-1
-/// wall clock: `200 ms` (four RC-1 budgets, bitty #1518).
+/// Maximum store commit I/O time credited back to one callback's RC-1 hard
+/// wall-clock limit: `200 ms` (four RC-1 budgets, bitty #1518).
 ///
-/// `bitty.store.set` commits synchronously (atomic temp-then-rename, bounded
-/// by the RC-11 quotas) before it returns, so filesystem latency is not work
-/// the plugin controls. The bridge measures each committed write and the
-/// budget clock excludes that time, uniformly for the writing VM's own
-/// callback and for every VM whose callback is waiting on it through a
-/// cross-VM service call. The instruction budget is never credited.
+/// Rule:
 ///
-/// The credit is cumulative per callback and capped here, so neither many
-/// writes nor a hung filesystem can stretch a callback without bound: time
-/// past the cap is charged, and the callback suspends with
-/// [`SuspendReason::WallClockExceeded`] at the next instruction boundary
-/// after the write returns. The write itself stays committed and is still
-/// reported as committed. A write that never returns blocks the owning
-/// thread; the synchronous commit contract cannot preempt it.
+/// - Credited: only the durable commit I/O of a `bitty.store.set` that
+///   committed, meaning the temp-file write, fsync, and atomic rename of a
+///   disk-backed plugin store. The store reports it through
+///   [`record_store_commit_io`]; the bridge credits it only when that same
+///   `store.set` call returns success. Key/value validation, candidate
+///   clone, RC-11 quota checks, and JSON encoding are plugin-driven CPU and
+///   stay charged. In-memory stores (no persistence path) perform no commit
+///   I/O and receive no credit. Refused or failed writes receive no credit.
+///   Every other host call is charged in full.
+/// - Scope: the credit applies uniformly to every callback on the thread
+///   that is running while the commit happens: the writing VM's own callback
+///   and every VM whose callback waits on it through a cross-VM service call
+///   (including the bridge deadline guarding the service call).
+/// - Cap: the credit is cumulative per callback and capped at this value, so
+///   neither many writes nor a slow filesystem can stretch a callback
+///   without bound. Commit I/O past the cap is charged like any other time.
+/// - Charged time is raw wall-clock time minus the capped credit. Only the
+///   hard limit ([`RC1_WALL_CLOCK_BUDGET_MS`]) uses charged time; the
+///   advisory warning ([`RC1_WARNING_MS`]) and the reported
+///   `wall_elapsed_ms` use raw wall-clock time, and the applied credit is
+///   reported separately as `store_commit_credit_ms`.
+/// - The instruction budget ([`RC1_INSTRUCTION_BUDGET`]) is never credited.
+/// - Enforcement point: when charged time reaches the budget, the callback
+///   suspends with [`SuspendReason::WallClockExceeded`] at the next slice
+///   boundary; a callback that completes first is not suspended. A write
+///   that already committed stays committed and is reported as committed.
+///   A write that never returns blocks the owning thread; the synchronous
+///   commit contract cannot preempt it.
 pub const STORE_COMMIT_CREDIT_MAX_MS: u64 = 4 * RC1_WALL_CLOCK_BUDGET_MS;
 
 /// RC-1 warning threshold (candidate): `8 ms` — sets `warning_triggered` but
@@ -174,37 +190,107 @@ pub const SLICE_FUEL: i32 = 1024;
 /// suspending or touching the heap.
 pub const MAX_CHUNK_BYTES: usize = 1024 * 1024;
 
-// ── RC-1 budget clock (committed store-write credit, bitty #1518) ─────────
+// ── RC-1 budget clock (store commit I/O credit, bitty #1518) ─────────────
 
 thread_local! {
-    /// Total committed store-write time measured on this thread.
+    /// Total credited store commit I/O time on this thread.
     ///
     /// Monotonic and thread-scoped: plugin VMs are `!Send`, and a cross-VM
     /// service call runs the provider callback on the consumer's thread, so
     /// every nested callback observes the same ledger through its own mark.
     static STORE_COMMIT_CREDIT: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+    /// Commit I/O reported inside the open `bitty.store.set` window, or
+    /// `None` when no store write is in progress on this thread.
+    static STORE_COMMIT_WINDOW: Cell<Option<Duration>> = const { Cell::new(None) };
 }
 
-/// Record `spent` as committed store-write time on this thread.
-pub(crate) fn credit_store_commit(spent: Duration) {
-    STORE_COMMIT_CREDIT.with(|credit| credit.set(credit.get().saturating_add(spent)));
+/// Report `spent` as durable commit I/O of the plugin store write in
+/// progress on this thread (temp-file write, fsync, and atomic rename).
+///
+/// Store backends call this only after the commit I/O succeeded. The time is
+/// credited to the RC-1 hard wall limit only when it is reported inside a
+/// `bitty.store.set` bridge call that then returns success, capped per
+/// callback at [`STORE_COMMIT_CREDIT_MAX_MS`]; a report made anywhere else
+/// (outside a store write, or for a write that ends up failing) is
+/// discarded, so no other host path can earn credit.
+pub fn record_store_commit_io(spent: Duration) {
+    STORE_COMMIT_WINDOW.with(|window| {
+        if let Some(pending) = window.get() {
+            window.set(Some(pending.saturating_add(spent)));
+        }
+    });
+}
+
+/// One `bitty.store.set` bridge call collecting reported commit I/O.
+///
+/// Opening saves any enclosing window and starts an empty one; dropping
+/// (including on unwind) restores the enclosing window, so a report can
+/// never leak into another call.
+pub(crate) struct StoreCommitWindow {
+    enclosing: Option<Duration>,
+}
+
+impl StoreCommitWindow {
+    /// Open a window for one store write.
+    pub(crate) fn open() -> Self {
+        let enclosing = STORE_COMMIT_WINDOW.with(|window| window.replace(Some(Duration::ZERO)));
+        Self { enclosing }
+    }
+
+    /// Close the window; credit the reported commit I/O when `committed`.
+    ///
+    /// The credit never exceeds `bound` (the measured duration of the whole
+    /// store call), so a backend cannot report more time than it took.
+    pub(crate) fn close(self, committed: bool, bound: Duration) {
+        let reported = STORE_COMMIT_WINDOW
+            .with(Cell::get)
+            .unwrap_or(Duration::ZERO);
+        drop(self);
+        if committed {
+            STORE_COMMIT_CREDIT
+                .with(|credit| credit.set(credit.get().saturating_add(reported.min(bound))));
+        }
+    }
+}
+
+impl Drop for StoreCommitWindow {
+    fn drop(&mut self) {
+        STORE_COMMIT_WINDOW.with(|window| window.set(self.enclosing));
+    }
 }
 
 fn store_commit_credit_total() -> Duration {
     STORE_COMMIT_CREDIT.with(Cell::get)
 }
 
-/// Wall-clock elapsed minus the credited store-commit time, with the credit
-/// capped at `cap` (pure; see [`STORE_COMMIT_CREDIT_MAX_MS`]).
-fn credited_elapsed(raw: Duration, credit: Duration, cap: Duration) -> Duration {
-    raw.saturating_sub(credit.min(cap))
+/// One RC-1 wall-clock reading (see [`STORE_COMMIT_CREDIT_MAX_MS`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BudgetReading {
+    /// Raw wall-clock time since the origin (reported, warning threshold).
+    pub(crate) raw: Duration,
+    /// Store commit I/O credit applied, capped at the per-callback maximum.
+    pub(crate) credit: Duration,
+    /// `raw - credit`: the time charged against the hard wall limit.
+    pub(crate) charged: Duration,
+}
+
+impl BudgetReading {
+    /// Pure reading from raw elapsed and accrued credit under `cap`.
+    fn new(raw: Duration, accrued: Duration, cap: Duration) -> Self {
+        let credit = accrued.min(cap).min(raw);
+        Self {
+            raw,
+            credit,
+            charged: raw - credit,
+        }
+    }
 }
 
 /// Origin of one RC-1 wall-clock measurement.
 ///
-/// Records the wall instant and the thread's committed store-write credit at
-/// the origin; [`BudgetMark::elapsed`] charges everything since the origin
-/// except committed store writes, capped at [`STORE_COMMIT_CREDIT_MAX_MS`].
+/// Records the wall instant and the thread's store commit credit at the
+/// origin; [`BudgetMark::read`] reports raw time, the capped credit accrued
+/// since the origin, and the charged time used by the hard wall limit.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BudgetMark {
     start: Instant,
@@ -225,15 +311,19 @@ impl BudgetMark {
         self.start
     }
 
-    /// Budget-charged elapsed time since the origin.
-    pub(crate) fn elapsed(&self) -> Duration {
-        let credit = store_commit_credit_total().saturating_sub(self.credit_at_start);
-        credited_elapsed(
+    /// Current reading since the origin.
+    pub(crate) fn read(&self) -> BudgetReading {
+        let accrued = store_commit_credit_total().saturating_sub(self.credit_at_start);
+        BudgetReading::new(
             self.start.elapsed(),
-            credit,
+            accrued,
             Duration::from_millis(STORE_COMMIT_CREDIT_MAX_MS),
         )
     }
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 // ── errors ───────────────────────────────────────────────────────────────────
@@ -352,8 +442,12 @@ pub struct VmBudgetSnapshot {
     pub memory_limit: usize,
     /// Approx instructions consumed in last execute (or current).
     pub instructions_used: u64,
-    /// Wall elapsed ms of last execute.
+    /// Raw wall-clock elapsed ms of last execute (store commit credit is not
+    /// subtracted; see `store_commit_credit_ms`).
     pub wall_elapsed_ms: u64,
+    /// Store commit I/O credit (ms) applied to the RC-1 hard wall limit in
+    /// the last execute, capped at [`STORE_COMMIT_CREDIT_MAX_MS`].
+    pub store_commit_credit_ms: u64,
     /// Memory used (total_allocation).
     pub memory_used: usize,
     /// Whether warning threshold was triggered.
@@ -434,6 +528,7 @@ pub struct LuaVm {
     // metrics
     instructions_used: u64,
     wall_elapsed_ms: u64,
+    store_commit_credit_ms: u64,
     memory_used: usize,
     warning_triggered: bool,
     warning_count: u64,
@@ -535,6 +630,7 @@ impl LuaVm {
             memory_limit,
             instructions_used: 0,
             wall_elapsed_ms: 0,
+            store_commit_credit_ms: 0,
             memory_used: 0,
             warning_triggered: false,
             warning_count: 0,
@@ -599,6 +695,13 @@ impl LuaVm {
     #[must_use]
     pub fn wall_elapsed_ms(&self) -> u64 {
         self.wall_elapsed_ms
+    }
+
+    /// Store commit I/O credit (ms) applied to the RC-1 hard wall limit in
+    /// the last execution (see [`STORE_COMMIT_CREDIT_MAX_MS`]).
+    #[must_use]
+    pub fn store_commit_credit_ms(&self) -> u64 {
+        self.store_commit_credit_ms
     }
 
     /// Memory used (total_allocation) after last execution.
@@ -672,6 +775,7 @@ impl LuaVm {
         // Keep suspension_count for attribution, but clear per-execution metrics.
         self.instructions_used = 0;
         self.wall_elapsed_ms = 0;
+        self.store_commit_credit_ms = 0;
     }
 
     /// Register the network module (`bitty.network`) for this VM.
@@ -777,6 +881,7 @@ impl LuaVm {
             memory_limit: self.memory_limit,
             instructions_used: self.instructions_used,
             wall_elapsed_ms: self.wall_elapsed_ms,
+            store_commit_credit_ms: self.store_commit_credit_ms,
             memory_used: self.memory_used,
             warning_triggered: self.warning_triggered,
             suspended,
@@ -851,10 +956,12 @@ impl LuaVm {
         // No Lua code ran, so no globals, registrations, or host calls exist
         // to roll back; bookkeeping mirrors the wall-exceed path in
         // `drive_stashed`.
-        let elapsed_ms = start.elapsed().as_millis() as u64;
-        if elapsed_ms >= self.wall_budget_ms {
+        let reading = start.read();
+        let elapsed_ms = duration_ms(reading.raw);
+        let charged_ms = duration_ms(reading.charged);
+        if charged_ms >= self.wall_budget_ms {
             let reason = SuspendReason::WallClockExceeded {
-                elapsed_ms,
+                elapsed_ms: charged_ms,
                 budget_ms: self.wall_budget_ms,
             };
             self.total_executions = self.total_executions.wrapping_add(1);
@@ -862,6 +969,7 @@ impl LuaVm {
             self.suspension_count = self.suspension_count.wrapping_add(1);
             self.instructions_used = 0;
             self.wall_elapsed_ms = elapsed_ms;
+            self.store_commit_credit_ms = duration_ms(reading.credit);
             self.memory_used = self.lua.total_memory();
             if elapsed_ms >= self.warning_ms {
                 self.warning_triggered = true;
@@ -941,10 +1049,11 @@ impl LuaVm {
     /// origin: for `drive_chunk` it predates `Closure::load` (compile counts),
     /// for `call_function` it is the invocation entry (no compile).
     ///
-    /// Every wall-clock reading goes through [`BudgetMark::elapsed`], so time
-    /// spent in committed `bitty.store.set` writes (this VM's own or a nested
-    /// cross-VM provider's) is not charged, up to
-    /// [`STORE_COMMIT_CREDIT_MAX_MS`] per callback (bitty #1518).
+    /// The hard wall limit uses charged time from [`BudgetMark::read`]:
+    /// durable commit I/O of committed disk-backed `bitty.store.set` writes
+    /// (this VM's own or a nested cross-VM provider's) is not charged, up to
+    /// [`STORE_COMMIT_CREDIT_MAX_MS`] per callback. The warning threshold and
+    /// the reported `wall_elapsed_ms` use raw wall-clock time (bitty #1518).
     pub(crate) fn drive_stashed(
         &mut self,
         stashed: StashedExecutor,
@@ -960,6 +1069,7 @@ impl LuaVm {
         self.warning_triggered = false;
         self.instructions_used = 0;
         self.wall_elapsed_ms = 0;
+        self.store_commit_credit_ms = 0;
         self.memory_used = self.lua.total_memory();
 
         // Tighter slices (CR-LUA-01): each `Executor::step` gets at most
@@ -990,7 +1100,7 @@ impl LuaVm {
             self.suspension_count = self.suspension_count.wrapping_add(1);
             self.memory_used = mem_before;
             self.instructions_used = 0;
-            self.wall_elapsed_ms = start.elapsed().as_millis() as u64;
+            self.wall_elapsed_ms = duration_ms(start.read().raw);
             return Ok(DriveOutcome::Suspended {
                 reason,
                 instructions_used: 0,
@@ -999,10 +1109,13 @@ impl LuaVm {
             });
         }
 
-        // Stepping loop with budget checks at instruction boundaries.
+        // Stepping loop with budget checks at slice boundaries.
         loop {
-            let elapsed_ms = start.elapsed().as_millis() as u64;
+            let reading = start.read();
+            let elapsed_ms = duration_ms(reading.raw);
+            let charged_ms = duration_ms(reading.charged);
             self.wall_elapsed_ms = elapsed_ms;
+            self.store_commit_credit_ms = duration_ms(reading.credit);
 
             // Warning threshold — counted, not suspending.
             if elapsed_ms >= self.warning_ms && !self.warning_triggered {
@@ -1010,10 +1123,11 @@ impl LuaVm {
                 self.warning_count = self.warning_count.wrapping_add(1);
             }
 
-            // Wall hard limit.
-            if elapsed_ms >= self.wall_budget_ms {
+            // Wall hard limit on charged time (raw minus capped store commit
+            // I/O credit); the reason reports the charged time it compares.
+            if charged_ms >= self.wall_budget_ms {
                 let reason = SuspendReason::WallClockExceeded {
-                    elapsed_ms,
+                    elapsed_ms: charged_ms,
                     budget_ms: self.wall_budget_ms,
                 };
                 self.status = VmStatus::Suspended(reason.clone());
@@ -1126,9 +1240,9 @@ impl LuaVm {
 
             // Safety: if total elapsed exceeds wall budget *2, break to avoid
             // infinite loop on pathological fuel handling.
-            if elapsed_ms > self.wall_budget_ms.saturating_mul(2) {
+            if charged_ms > self.wall_budget_ms.saturating_mul(2) {
                 let reason = SuspendReason::WallClockExceeded {
-                    elapsed_ms,
+                    elapsed_ms: charged_ms,
                     budget_ms: self.wall_budget_ms,
                 };
                 self.status = VmStatus::Suspended(reason.clone());
@@ -1146,7 +1260,9 @@ impl LuaVm {
 
         // Completed without budget exceed.
         self.instructions_used = total_used;
-        self.wall_elapsed_ms = start.elapsed().as_millis() as u64;
+        let reading = start.read();
+        self.wall_elapsed_ms = duration_ms(reading.raw);
+        self.store_commit_credit_ms = duration_ms(reading.credit);
         self.memory_used = self.lua.total_memory();
 
         // Final wall warning check (if warning threshold hit during successful run).
@@ -1338,20 +1454,52 @@ mod vm_unit_tests {
     use super::*;
 
     #[test]
-    fn store_commit_credit_is_capped_and_scoped_to_the_mark() {
+    fn budget_reading_caps_credit_and_keeps_raw() {
         let cap = Duration::from_millis(STORE_COMMIT_CREDIT_MAX_MS);
         let ms = Duration::from_millis;
-        // Fully credited commit: nothing charged.
-        assert_eq!(credited_elapsed(ms(60), ms(60), cap), Duration::ZERO);
+        // Fully credited commit I/O: nothing charged, raw preserved.
+        let full = BudgetReading::new(ms(60), ms(60), cap);
+        assert_eq!(
+            (full.raw, full.credit, full.charged),
+            (ms(60), ms(60), ms(0))
+        );
         // No credit: everything charged.
-        assert_eq!(credited_elapsed(ms(60), Duration::ZERO, cap), ms(60));
+        let none = BudgetReading::new(ms(60), Duration::ZERO, cap);
+        assert_eq!(none.charged, ms(60));
         // Credit past the cap: the excess is charged.
-        assert_eq!(credited_elapsed(cap + ms(80), cap + ms(80), cap), ms(80));
+        let over = BudgetReading::new(cap + ms(80), cap + ms(80), cap);
+        assert_eq!((over.credit, over.charged), (cap, ms(80)));
+        // Credit never exceeds raw time.
+        let bounded = BudgetReading::new(ms(5), ms(9), cap);
+        assert_eq!((bounded.credit, bounded.charged), (ms(5), ms(0)));
+    }
+
+    #[test]
+    fn commit_io_is_credited_only_inside_a_committed_window() {
+        let ms = Duration::from_millis;
+        let before = store_commit_credit_total();
+        // Outside any store write: discarded.
+        record_store_commit_io(ms(7));
+        assert_eq!(store_commit_credit_total(), before);
+        // Inside a window whose write failed: discarded.
+        let window = StoreCommitWindow::open();
+        record_store_commit_io(ms(7));
+        window.close(false, ms(100));
+        assert_eq!(store_commit_credit_total(), before);
+        // Inside a committed window: credited, bounded by the call duration.
+        let window = StoreCommitWindow::open();
+        record_store_commit_io(ms(7));
+        window.close(true, ms(3));
+        assert_eq!(store_commit_credit_total(), before + ms(3));
+        // The window is closed again afterwards.
+        record_store_commit_io(ms(7));
+        assert_eq!(store_commit_credit_total(), before + ms(3));
         // Credit recorded before a mark never shortens that mark's clock.
-        credit_store_commit(cap);
         let mark = BudgetMark::now();
         std::thread::sleep(ms(2));
-        assert!(mark.elapsed() >= ms(2));
+        let reading = mark.read();
+        assert_eq!(reading.credit, Duration::ZERO);
+        assert!(reading.charged >= ms(2));
     }
 
     #[test]

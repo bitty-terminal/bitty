@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use bitty_lua::{BridgeError, LuaValue};
 
@@ -202,13 +203,21 @@ impl PluginStore {
             std::process::id(),
             STORE_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
+        // Only the durable commit I/O (temp write, fsync, atomic rename) is
+        // reported to the RC-1 budget clock; the validation, clone, quota
+        // check, and JSON encoding above stay charged to the callback. The
+        // bridge credits the report only when this `store.set` succeeds
+        // (bitty #1518).
+        let commit_started = Instant::now();
         write_atomic_durably(&*self.fs, path, buffer.as_bytes(), &temp).map_err(|_| {
             BridgeError::new(
                 "runtime",
                 "E_STORE_IO",
                 "could not commit the plugin state file",
             )
-        })
+        })?;
+        bitty_lua::record_store_commit_io(commit_started.elapsed());
+        Ok(())
     }
 }
 

@@ -29,6 +29,11 @@ const HELPER_ENV: &str = "__BITTY_CGROUP_OOM_HELPER";
 /// once the leaf's limit is set).
 const MARKER_ENV: &str = "__BITTY_CGROUP_OOM_MARKER";
 
+/// Name prefix of a per-job leaf (`job-<id>-<generation>`), as created by
+/// the runtime.
+#[cfg(target_os = "linux")]
+const LEAF_PREFIX: &str = "job";
+
 /// Test-only leaf memory limit (16 MiB).
 #[cfg(target_os = "linux")]
 const TEST_MEMORY_MAX_BYTES: u64 = 16 * 1024 * 1024;
@@ -356,5 +361,101 @@ fn a_plain_sigkill_in_a_leaf_stays_signaled_with_not_oom() {
     ));
     assert_eq!(stopped.oom_evidence, OomEvidence::NotOom);
     assert!(leaves(&base).is_empty());
+    drop_and_expect_base_removed(registry, &base);
+}
+
+/// Finding 2: an owner-delivered SIGKILL stays `Signaled(9)` even when the
+/// leaf's `oom_kill` counter advanced; the OOM kill survives only as
+/// evidence.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_host_kill_after_an_oom_kill_stays_signaled_with_oom_evidence() {
+    let Some(registry) = delegated_registry("host_kill_after_oom") else {
+        return;
+    };
+    let base = registry.job_cgroup_base().expect("delegated base");
+    let owner = JobPrincipal::new("owner-a").expect("principal");
+    // A shell leader survives while its hog child is OOM-killed inside the
+    // same leaf, so the counter advances and the job is still running when
+    // the owner kills it. After the hog dies the shell becomes the sleeping
+    // helper (no PATH lookup: the job environment is explicit).
+    let marker = std::env::temp_dir().join(format!(
+        "bitty-ctx0880-hostkill-marker-{}-{}",
+        std::process::id(),
+        base.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    ));
+    let _ = std::fs::remove_file(&marker);
+    let hog = helper_spec("hog", Some(&marker));
+    let spec = JobSpec::new(
+        "/bin/sh",
+        vec![
+            "-c".to_owned(),
+            // The leader waits (shell builtins only) until the supervisor
+            // placed it in its leaf before forking: a fork inside the
+            // documented placement window would leave the hog outside it.
+            format!(
+                "until {{ read -r line < /proc/$$/cgroup; case \"$line\" in */{LEAF_PREFIX}-*) true ;; \
+                 *) false ;; esac; }}; do :; done; \"$0\" \"$@\"; {HELPER_ENV}=sleep exec \"$0\" \"$@\""
+            ),
+            hog.program.clone(),
+        ]
+        .into_iter()
+        .chain(hog.args.iter().cloned())
+        .collect(),
+    )
+    .with_env(hog.env.clone());
+    let id = registry.spawn_as(owner.clone(), spec).expect("tracked");
+    assert_eq!(
+        wait_running(&registry, id).oom_evidence,
+        OomEvidence::Tracked
+    );
+    let leaf = {
+        let found = leaves(&base);
+        assert_eq!(found.len(), 1, "one leaf per running job");
+        found[0].clone()
+    };
+    // The shell forks the hog after its own placement; wait until both are
+    // members of the leaf (a hog outside it would never be counted).
+    let deadline = Instant::now() + WAIT_BOUND;
+    loop {
+        let members = std::fs::read_to_string(leaf.join("cgroup.procs"))
+            .unwrap_or_default()
+            .lines()
+            .count();
+        if members >= 2 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the hog never joined the leaf");
+        std::thread::sleep(POLL);
+    }
+    std::fs::write(leaf.join("memory.swap.max"), "0").expect("memory.swap.max");
+    std::fs::write(leaf.join("memory.max"), TEST_MEMORY_MAX_BYTES.to_string()).expect("memory.max");
+    std::fs::write(&marker, b"go").expect("marker");
+    // Wait for the kernel's OOM kill of the hog to show in the leaf, then
+    // kill the surviving leader.
+    let deadline = Instant::now() + WAIT_BOUND;
+    loop {
+        let events = std::fs::read_to_string(leaf.join("memory.events")).unwrap_or_default();
+        let killed = events
+            .lines()
+            .filter_map(|line| line.strip_prefix("oom_kill "))
+            .any(|count| count.trim().parse::<u64>().is_ok_and(|count| count > 0));
+        if killed {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the hog was never OOM-killed");
+        std::thread::sleep(POLL);
+    }
+    let _ = std::fs::remove_file(&marker);
+    let stopped = kill_running(&registry, &owner, id).expect("linux has a tree backend");
+    assert_eq!(
+        stopped.state,
+        JobState::Done(ExecutionOutcome::Signaled(SIGKILL)),
+        "a host kill is never reported as the kernel's OOM kill"
+    );
+    assert_eq!(stopped.oom_evidence, OomEvidence::OomKilled);
+    assert!(leaves(&base).is_empty(), "the leaf is removed after exit");
     drop_and_expect_base_removed(registry, &base);
 }

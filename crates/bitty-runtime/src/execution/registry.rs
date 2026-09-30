@@ -850,13 +850,15 @@ impl JobRegistry {
                     "signal budget of {MAX_SIGNALS_PER_WINDOW} calls per {MAX_SIGNAL_WINDOW_MS} ms spent"
                 )));
             }
-            record.tree.clone().ok_or_else(|| {
+            let tree = record.tree.clone().ok_or_else(|| {
                 JobError::unsupported(
                     "no owned tree for this job (not started, or no backend on this \
                      platform); a signal is never sent to a single pid",
                 )
-            })?
+            })?;
+            (tree, Arc::clone(&record.control))
         };
+        let (tree, control) = tree;
         // Delivered outside the registry lock; the tree's own lock keeps the
         // signal from racing the leader's reap.
         let signal = match signal {
@@ -864,6 +866,9 @@ impl JobRegistry {
             JobSignal::Terminate => TreeSignal::Terminate,
             JobSignal::Kill => TreeSignal::Kill,
         };
+        if signal == TreeSignal::Kill {
+            control.note_host_kill();
+        }
         match tree.signal(signal) {
             Ok(()) => Ok(SignalOutcome::Delivered),
             Err(error) => match error.kind() {
@@ -1645,6 +1650,10 @@ struct JobControl {
     /// The strongest pending cancel request; the supervisor takes it.
     cancel: Mutex<Option<CancelRequest>>,
     clock: Arc<ActivityClock>,
+    /// Set once the host itself sent `SIGKILL` to the job (an owner's
+    /// `signal_as(Kill)`, a cancel, or a deadline): a SIGKILL death is then
+    /// the host's kill, never classified as the kernel's OOM kill.
+    host_killed: std::sync::atomic::AtomicBool,
 }
 
 impl JobControl {
@@ -1652,7 +1661,19 @@ impl JobControl {
         Self {
             cancel: Mutex::new(None),
             clock: Arc::new(ActivityClock::new()),
+            host_killed: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Records that the host is about to deliver `SIGKILL` (set before the
+    /// delivery, so the exit it causes can never be observed without it).
+    fn note_host_kill(&self) {
+        self.host_killed.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the host delivered (or attempted) a `SIGKILL`.
+    fn host_killed(&self) -> bool {
+        self.host_killed.load(Ordering::SeqCst)
     }
 
     /// Records `request`, coalescing with a pending one: the higher-ranked
@@ -1839,7 +1860,8 @@ fn watch(
                 .take()
                 .map_or(OomEvidence::Pending, JobAccounting::finish);
             set_oom_evidence(shared, id, evidence);
-            return ExecutionOutcome::classify_exit(exit, evidence.verdict());
+            let verdict = exit_oom_verdict(evidence, control.host_killed());
+            return ExecutionOutcome::classify_exit(exit, verdict);
         }
         if let Some(request) = control.take_cancel() {
             let (resolution, ended) = execute_cancel(backend, control, request);
@@ -1865,10 +1887,26 @@ fn watch(
             // A kill the kernel refuses (never expected for an own child)
             // leaves the leader to the backend's drop path; the deadline
             // fired, so the outcome is `TimedOut` either way.
+            control.note_host_kill();
             let _ = backend.kill_and_reap();
             return ExecutionOutcome::TimedOut(clock);
         }
         thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// The verdict the outcome classifier gets for a job's exit.
+///
+/// Only a leaf reading can claim an OOM kill, and only when the host did
+/// not send `SIGKILL` itself: after a host kill (owner `signal_as(Kill)`,
+/// cancel, or deadline) a SIGKILL death is the host's, so the outcome stays
+/// `Signaled(9)` and an advanced counter survives only as the job's
+/// [`OomEvidence::OomKilled`] evidence.
+fn exit_oom_verdict(evidence: OomEvidence, host_killed: bool) -> super::oom::OomVerdict {
+    if host_killed {
+        super::oom::OomVerdict::Unknown
+    } else {
+        evidence.verdict()
     }
 }
 
@@ -1934,6 +1972,7 @@ fn execute_cancel(
         if request.mode() == CancelMode::Graceful {
             return (CancelOutcome::StillRunning, None);
         }
+        control.note_host_kill();
         return match backend.kill_and_reap() {
             Ok(_) => (
                 CancelOutcome::Killed,
@@ -2713,6 +2752,31 @@ mod tests {
         wait_for(registry, id, "a terminal state", |snapshot| {
             snapshot.state.is_terminal()
         })
+    }
+
+    #[test]
+    fn a_host_kill_is_never_classified_as_an_oom_kill() {
+        use crate::execution::ExitObservation;
+        let sigkill = ExitObservation::Signal(9);
+        let classify = |evidence, host_killed| {
+            ExecutionOutcome::classify_exit(sigkill, exit_oom_verdict(evidence, host_killed))
+        };
+        assert_eq!(
+            classify(OomEvidence::OomKilled, false),
+            ExecutionOutcome::OomKilled
+        );
+        assert_eq!(
+            classify(OomEvidence::OomKilled, true),
+            ExecutionOutcome::Signaled(9)
+        );
+        assert_eq!(
+            classify(OomEvidence::NotOom, false),
+            ExecutionOutcome::Signaled(9)
+        );
+        let control = JobControl::new();
+        assert!(!control.host_killed());
+        control.note_host_kill();
+        assert!(control.host_killed());
     }
 
     #[cfg(target_os = "linux")]

@@ -22,6 +22,7 @@ use bitty_ui::ViewId;
 /// the created `PanelId`. Errors are the typed `PanelError` values from the
 /// registry; no state is mutated on failure beyond the registry's own
 /// documented behavior.
+#[allow(dead_code)]
 pub(crate) fn create_mounted_panel(
     registry: &mut PanelRegistry,
     ty: PanelType,
@@ -37,6 +38,7 @@ pub(crate) fn create_mounted_panel(
 /// (`PanelRegistryConfig::validate`), preserving the fail-closed bounds
 /// (`[1,32]` per workspace, `[1,64]` per window, `[1,256]` topics,
 /// `[1,32]` subscriptions per panel).
+#[allow(dead_code)]
 pub(crate) fn validate_registry_config(cfg: &PanelRegistryConfig) -> Result<(), PanelError> {
     cfg.validate()
 }

@@ -180,7 +180,6 @@
 
 #![forbid(unsafe_code)]
 
-pub mod browser_panel;
 pub mod config;
 pub mod cw_present;
 pub mod error;
@@ -191,8 +190,6 @@ pub mod palette;
 pub mod panels_async;
 pub mod paste;
 pub mod plugin_runtime;
-pub mod project;
-pub mod project_scope;
 pub mod queries;
 pub mod queue;
 pub mod registry;

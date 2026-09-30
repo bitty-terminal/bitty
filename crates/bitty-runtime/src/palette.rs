@@ -242,7 +242,7 @@ mod tests {
     fn filter_entries_bounded_and_case_insensitive() {
         let entries = vec![
             "bitty-terminal.palette:toggle".to_string(),
-            "bitty-terminal.project:open".to_string(),
+            "bitty-terminal.workspace:new".to_string(),
             "Bitty-Terminal.Tabs:Next".to_string(),
             "xuepoo.git:open".to_string(),
         ];

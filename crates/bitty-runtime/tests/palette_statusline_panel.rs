@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
-//! Palette, statusline and project via Panel Runtime — public API verification (CTX-0105, OQ-011).
+//! Palette and statusline via Panel Runtime — public API verification (CTX-0105, OQ-011).
 //!
-//! Verifies `bitty-terminal.palette` (overlay/command), `bitty-terminal.statusline`
-//! (Panel reactive) and `bitty-terminal.project` (fs capability `~/projects/**`,
-//! isolation) as generic Panel Runtime consumers with no private channel,
+//! Verifies `bitty-terminal.palette` (overlay/command) and
+//! `bitty-terminal.statusline` (Panel reactive) as generic Panel Runtime
+//! consumers with no private channel,
 //! via the public PluginHost path (`declare → resolve → register →
 //! GrantRecord → activate → subscribe → publish → drain SideQueue
 //! DropOldest`), PanelRegistry public path (`PanelRegistry::new` →
@@ -12,10 +12,12 @@
 //! `publish`/`drain_batch`), bounded queues `64`/`1024`/`2 MiB`/`8192`,
 //! `DropOldest`, `8 KiB` payload, `32`/`8 KiB` batch, single-process `winit`
 //! one-registry-per-window, default disabled, safe-mode reject, `forbid(unsafe)`.
+//!
+//! The former `bitty-terminal.project` coverage was removed together with the
+//! project plugin (CTX-0886, issue #1556; Core provides mechanism only).
 
 use bitty_plugin_host::{
     CapabilityId, DropPolicy, Event, EventKind, EventPayload, GrantRecord, PluginHost,
-    bundled::project_manifest,
 };
 use bitty_runtime::{
     Runtime,
@@ -23,7 +25,6 @@ use bitty_runtime::{
         PaletteIntegration, create_palette_overlay, create_palette_panel,
         validate_palette_panel_config,
     },
-    project::{ProjectIntegration, create_project_panel, validate_project_panel_config},
     registry::{BoundedPayload, PanelRegistry, PanelRegistryConfig, WorkspaceId},
     statusline::{
         StatuslineIntegration, create_statusline_panel, validate_statusline_panel_config,
@@ -268,62 +269,10 @@ fn statusline_via_public_plugin_host_path() {
     assert!(StatuslineIntegration::is_render_bounded(&rendered));
 }
 
-// --- project via public PluginHost path (fs isolation) ----------------------
-
-#[test]
-fn project_via_public_plugin_host_path_and_fs_isolation() {
-    let manifest = project_manifest();
-    let id = manifest.id().clone();
-    let hash = manifest.manifest_hash();
-    let granted = granted_set_for(&manifest);
-    assert!(granted.contains(&CapabilityId::parse("terminal.semantic-read").unwrap()));
-    assert!(granted.contains(&CapabilityId::parse("fs.read:~/projects/**").unwrap()));
-    assert_eq!(
-        manifest.capabilities.filesystem[0].paths,
-        vec!["~/projects/**"]
-    );
-
-    let mut host = PluginHost::new(DropPolicy::DropOldest, 16);
-    host.declare(manifest.clone()).expect("declare");
-    host.resolve(&id).expect("resolve");
-    host.register(&id).expect("register");
-    assert!(host.activate(&id).is_err(), "must require grant");
-    host.insert_grant(GrantRecord::granted(
-        id.clone(),
-        hash.clone(),
-        granted.clone(),
-        1,
-    ));
-    host.activate(&id).expect("activate after grant");
-    assert_eq!(
-        host.registry().get(&id).unwrap().state,
-        bitty_plugin_host::PluginState::Activated
-    );
-    // fs isolation: granted pattern is exactly ~/projects/**, not /etc/passwd
-    let allowed = CapabilityId::parse("fs.read:~/projects/**").unwrap();
-    let outside = CapabilityId::parse("fs.read:/etc/passwd").unwrap();
-    assert!(host.is_granted(&id, &hash, &allowed));
-    assert!(!host.is_granted(&id, &hash, &outside));
-    // Pure helper also rejects outside
-    assert!(ProjectIntegration::is_within_projects("~/projects/foo"));
-    assert!(!ProjectIntegration::is_within_projects("/etc/passwd"));
-    assert!(!ProjectIntegration::is_within_projects(
-        "~/projects/../etc/passwd"
-    ));
-    assert_eq!(
-        ProjectIntegration::project_name("~/projects/foo"),
-        Some("foo".to_string())
-    );
-    // Revocation detaches
-    let report = host.revoke(&id, Some(&allowed)).unwrap();
-    assert_eq!(report.revoked.len(), 1);
-    assert!(!host.is_granted(&id, &hash, &allowed));
-}
-
 // --- subscribe → publish → drain via bounded SideQueue DropOldest -----------
 
 #[test]
-fn palette_statusline_project_subscribe_publish_drain_bounded_drop_oldest() {
+fn palette_statusline_subscribe_publish_drain_bounded_drop_oldest() {
     // Palette: focus.changed is declared
     let mut host = PluginHost::with_capacity(DropPolicy::DropOldest, 64, 4);
     let pal = palette_manifest();
@@ -363,24 +312,6 @@ fn palette_statusline_project_subscribe_publish_drain_bounded_drop_oldest() {
     host.subscribe(&sta_id, EventKind::TerminalTitleChanged)
         .unwrap();
 
-    // Project: cwd for context
-    let proj = project_manifest();
-    let proj_id = proj.id().clone();
-    let proj_hash = proj.manifest_hash();
-    let proj_granted = granted_set_for(&proj);
-    host.declare(proj).unwrap();
-    host.resolve(&proj_id).unwrap();
-    host.register(&proj_id).unwrap();
-    host.insert_grant(GrantRecord::granted(
-        proj_id.clone(),
-        proj_hash,
-        proj_granted,
-        1,
-    ));
-    host.activate(&proj_id).unwrap();
-    host.subscribe(&proj_id, EventKind::TerminalCwdChanged)
-        .unwrap();
-
     // Flood side queue beyond 4 → DropOldest
     for i in 0..10 {
         host.push_observation(bitty_plugin_host::HostObservation::TitleChanged(format!(
@@ -394,7 +325,7 @@ fn palette_statusline_project_subscribe_publish_drain_bounded_drop_oldest() {
     assert!(matches!(&drained[0], bitty_plugin_host::HostObservation::TitleChanged(s) if s=="t6"));
 
     // Per-subscription 64: flood non-coalescable TerminalBell (if subscribed) or FocusChanged coalescable?
-    // palette's FocusChanged is coalescable (focus), so flood with non-coalescable via project? Use TerminalBell via shell?
+    // palette's FocusChanged is coalescable (focus), so it cannot prove the per-sub cap directly.
     // Instead test per-sub 64 via PanelEventBus for palette overlay commands separately below.
     // Here test EventPipeline global 8192 via host publish storm
     let mut host2 = PluginHost::with_capacity(DropPolicy::DropOldest, 64, 16);
@@ -425,7 +356,7 @@ fn palette_statusline_project_subscribe_publish_drain_bounded_drop_oldest() {
     assert!(host2.total_queued_bytes() <= 2 * 1024 * 1024);
     assert!(host2.invariant_global_bounds());
 
-    // Panel EventBus bounded 64 per-sub DropOldest via palette/statusline/project panels
+    // Panel EventBus bounded 64 per-sub DropOldest via palette/statusline panels
     let mut preg = PanelRegistry::new(PanelRegistryConfig::default()).expect("panel reg");
     let ws = WorkspaceId::new(1);
     let view = ViewId::new(100);
@@ -587,103 +518,11 @@ fn statusline_panel_via_panel_runtime_public_path_bounded() {
     assert!(validate_statusline_panel_config(&bad).is_err());
 }
 
-// --- Project panel fs isolation via Panel and PluginHost -------------------
+// --- safe-mode rejects both without panic ------------------------------
 
 #[test]
-fn project_panel_via_panel_runtime_public_path_bounded_and_fs_isolation() {
-    let mut reg = PanelRegistry::new(PanelRegistryConfig::default()).expect("panel reg");
-    let ws = WorkspaceId::new(1);
-    let view = ViewId::new(1);
-    let pid = create_project_panel(&mut reg, ws, view).expect("create project panel");
-    assert_eq!(reg.panel_count(), 1);
-    let _raw = pid.get();
-
-    // fs isolation via helper
-    assert!(ProjectIntegration::is_within_projects("~/projects/foo"));
-    assert!(!ProjectIntegration::is_within_projects("/etc/passwd"));
-    assert!(!ProjectIntegration::is_within_projects(
-        "~/projects/../evil"
-    ));
-    assert_eq!(
-        ProjectIntegration::project_name("~/projects/foo/bar"),
-        Some("bar".to_string())
-    );
-    // Bounded listing
-    let raw = vec![
-        "~/projects/a".to_string(),
-        "~/projects/b".to_string(),
-        "/tmp/evil".to_string(),
-    ];
-    let listed = ProjectIntegration::list_projects(&raw);
-    assert_eq!(listed.len(), 2);
-    assert!(!listed.contains(&"/tmp/evil".to_string()));
-
-    // Panel EventBus bounded
-    let mut reg2 = PanelRegistry::new(PanelRegistryConfig::default()).unwrap();
-    let ws2 = WorkspaceId::new(2);
-    let view2 = ViewId::new(2);
-    let h = reg2
-        .create_panel(bitty_ui::panel::PanelType::Helper, Some(ws2))
-        .unwrap();
-    reg2.mount_panel(h.id, h.generation, view2).unwrap();
-    let topic = reg2.declare_topic("xuepoo.project:discovered").unwrap();
-    reg2.subscribe(h.id, h.generation, &topic).unwrap();
-    for i in 0..80 {
-        reg2.publish(
-            &topic,
-            BoundedPayload::try_new(format!("~/projects/proj{i}")).unwrap(),
-        )
-        .unwrap();
-    }
-    assert!(reg2.bus_events_for_panel(h.id) <= 64);
-    let batch = reg2.drain_batch(h.id, topic.as_str(), 32, 8192);
-    assert_eq!(batch.len(), 32);
-    assert_eq!(batch[0].payload.as_str(), "~/projects/proj16");
-    // Config validation
-    assert!(validate_project_panel_config(&PanelRegistryConfig::default()).is_ok());
-    let bad = PanelRegistryConfig {
-        max_panels_per_workspace: 0,
-        ..Default::default()
-    };
-    assert!(validate_project_panel_config(&bad).is_err());
-
-    // fs capability via PluginHost public path: only ~/projects/** is granted
-    let manifest = project_manifest();
-    let id = manifest.id().clone();
-    let hash = manifest.manifest_hash();
-    let granted = granted_set_for(&manifest);
-    let mut host = PluginHost::new(DropPolicy::DropOldest, 16);
-    host.declare(manifest).unwrap();
-    host.resolve(&id).unwrap();
-    host.register(&id).unwrap();
-    host.insert_grant(GrantRecord::granted(id.clone(), hash.clone(), granted, 1));
-    host.activate(&id).unwrap();
-    let allowed = CapabilityId::parse("fs.read:~/projects/**").unwrap();
-    let outside = CapabilityId::parse("fs.read:/tmp").unwrap();
-    assert!(host.is_granted(&id, &hash, &allowed));
-    assert!(!host.is_granted(&id, &hash, &outside));
-    // Panel capability deny-by-default per (PanelId,generation)
-    let h3 = reg2
-        .create_panel(bitty_ui::panel::PanelType::Helper, Some(ws2))
-        .unwrap();
-    assert!(
-        reg2.require_panel_capability(h3.id, h3.generation, "panel.provider")
-            .is_err()
-    );
-    reg2.grant_panel_capability(h3.id, h3.generation, "panel.provider")
-        .unwrap();
-    assert!(reg2.is_panel_capability_granted(h3.id, h3.generation, "panel.provider"));
-}
-
-// --- safe-mode rejects all three without panic ------------------------------
-
-#[test]
-fn safe_mode_rejects_palette_statusline_project_without_panic() {
-    for manifest in [
-        palette_manifest(),
-        statusline_manifest(),
-        project_manifest(),
-    ] {
+fn safe_mode_rejects_palette_statusline_without_panic() {
+    for manifest in [palette_manifest(), statusline_manifest()] {
         let mut host = PluginHost::new(DropPolicy::DropOldest, 16);
         host.set_safe_mode(true);
         assert!(host.declare(manifest.clone()).is_err());
@@ -695,22 +534,19 @@ fn safe_mode_rejects_palette_statusline_project_without_panic() {
     rt.set_plugin_safe_mode(true);
     assert!(rt.register_plugin(palette_manifest()).is_err());
     assert!(rt.register_plugin(statusline_manifest()).is_err());
-    assert!(rt.register_plugin(project_manifest()).is_err());
     assert!(rt.tick().is_some());
     rt.set_plugin_safe_mode(false);
     assert!(rt.register_plugin(palette_manifest()).is_ok());
     assert!(rt.register_plugin(statusline_manifest()).is_ok());
-    assert!(rt.register_plugin(project_manifest()).is_ok());
 }
 
 // --- no private channel: third-party parity --------------------------------
 
 #[test]
-fn palette_statusline_project_have_no_private_channel_parity_with_third_party() {
+fn palette_statusline_have_no_private_channel_parity_with_third_party() {
     for (label, bundled) in [
         ("palette", palette_manifest()),
         ("statusline", statusline_manifest()),
-        ("project", project_manifest()),
     ] {
         let mut third = bundled.clone();
         third.identity.id =
@@ -739,7 +575,7 @@ fn palette_statusline_project_have_no_private_channel_parity_with_third_party() 
 // --- bounded, headless, forbid(unsafe), single-process winit ---------------
 
 #[test]
-fn palette_statusline_project_are_headless_and_forbid_unsafe_single_process_winit() {
+fn palette_statusline_are_headless_and_forbid_unsafe_single_process_winit() {
     let host = PluginHost::new(DropPolicy::DropOldest, 8);
     assert!(!host.is_safe_mode());
     assert!(host.side_queue().is_empty());
@@ -777,7 +613,7 @@ fn palette_statusline_project_are_headless_and_forbid_unsafe_single_process_wini
         )
         .unwrap();
     }
-    // Payload bounded 8 KiB, batch 32/8 KiB proven via palette/statusline/project tests above
+    // Payload bounded 8 KiB, batch 32/8 KiB proven via palette/statusline tests above
     let dbg = format!("{preg:?}");
     assert!(dbg.contains("PanelRegistry"));
     assert!(!dbg.contains("pty"));
@@ -860,41 +696,7 @@ fn statusline_reactive_composed_no_grid_mutation() {
     assert!(!reg.is_panel_capability_granted(h.id, h.generation, "panel.provider"));
 }
 
-// --- project fs isolation via CapabilityId and real-path pattern -----------
-
-#[test]
-fn project_fs_isolation_via_capability_id_and_helper() {
-    let cap = CapabilityId::parse("fs.read:~/projects/**").unwrap();
-    assert_eq!(cap.family(), bitty_plugin_host::CapabilityFamily::Fs);
-    assert_eq!(cap.as_str(), "fs.read:~/projects/**");
-    // Outside pattern is different capability
-    let outside = CapabilityId::parse("fs.read:/tmp/**").unwrap();
-    assert_ne!(cap, outside);
-    // Host grant isolation already proven via project manifest above, here also verify
-    // that writing is never granted for project (read-only)
-    let write_cap = CapabilityId::parse("fs.write:~/projects/**").unwrap();
-    let m = project_manifest();
-    assert!(!m.capabilities.ids.contains(&write_cap));
-    assert!(
-        m.capabilities
-            .filesystem
-            .iter()
-            .all(|r| r.access == bitty_plugin_host::FsAccess::Read)
-    );
-    // Helper rejects write pattern traversal
-    assert!(!ProjectIntegration::is_within_projects(
-        "~/projects/foo/../../etc/passwd"
-    ));
-    assert!(!ProjectIntegration::is_fs_allowed(
-        "~/projects/foo/../../etc"
-    ));
-    assert!(ProjectIntegration::is_fs_allowed("~/projects/foo/bar"));
-    // Bounded listing already verified
-    let many: Vec<String> = (0..100).map(|i| format!("~/projects/proj{i}")).collect();
-    assert_eq!(ProjectIntegration::list_projects(&many).len(), 64);
-}
-
-// --- Runtime side-queue DropOldest for palette/statusline/project observations
+// --- Runtime side-queue DropOldest for palette/statusline observations
 
 #[test]
 fn runtime_side_queue_drop_oldest_for_observations() {
@@ -908,7 +710,7 @@ fn runtime_side_queue_drop_oldest_for_observations() {
     // Palette filtering over command registry is pure, not hot-path, bounded
     let cmds = vec![
         "bitty-terminal.palette:toggle".to_string(),
-        "bitty-terminal.project:open".to_string(),
+        "bitty-terminal.workspace:new".to_string(),
         "bitty-terminal.statusline:refresh".to_string(),
     ];
     let filtered = PaletteIntegration::filter_entries(&cmds, "palette");
@@ -916,12 +718,6 @@ fn runtime_side_queue_drop_oldest_for_observations() {
     // Statusline render over same state is reactive, no grid mutation
     let rendered = StatuslineIntegration::render(rt.state());
     assert!(StatuslineIntegration::is_render_bounded(&rendered));
-    // Project fs isolation over cwd state
-    assert!(
-        rt.state()
-            .cwd_report()
-            .is_some_and(|s| ProjectIntegration::is_within_projects(s) || s.contains("projects"))
-    );
     // Flood side queue beyond 128 (default) -> DropOldest newest survive
     let mut rt2 = Runtime::with_plugin_host_capacity(
         bitty_runtime::RuntimeConfig::default(),

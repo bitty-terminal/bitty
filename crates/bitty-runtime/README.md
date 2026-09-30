@@ -50,10 +50,9 @@ diagram lives in `src/lib.rs`.
 - `src/plugin_runtime/` — plugin runtime wiring and services.
 - `src/config.rs` — runtime-side configuration application.
 - `src/workspace.rs`, `src/tabs.rs` — workspace and tab orchestration.
-- `src/panels_async.rs`, `src/browser_panel.rs` — generic panel worker and
-  the stay-bundled browser-panel Core slice (`CTX-0401`).
+- `src/panels_async.rs` — generic panel worker.
 - `src/palette.rs`, `src/statusline.rs`, `src/paste.rs`,
-  `src/shell_integration.rs`, `src/project.rs`, `src/inspect.rs` —
+  `src/shell_integration.rs`, `src/inspect.rs` —
   experience helpers; `palette`/`statusline` are the residual Core Panel
   Runtime helpers recorded by the `CTX-0397`/`CTX-0398` splits.
 - `src/error.rs` — owned error types.

@@ -84,6 +84,12 @@ pub(crate) struct WindowState {
     /// output so the value has a visible effect. Platforms without
     /// premultiplied compositing stay opaque with a loud warning.
     pub(crate) opacity: f32,
+    /// Background blur radius from the effective config (CTX-0832
+    /// `window.blur_radius`; default `0` = no blur). Applied to the platform
+    /// [`WindowConfig`](bitty_platform::WindowConfig) at creation.
+    /// Platform-specific: supported on macOS, some Wayland compositors,
+    /// and Windows 10+. Ignored where unsupported.
+    pub(crate) blur_radius: u32,
     pub(crate) handle: Option<WindowHandle>,
     pub(crate) id: Option<WindowId>,
     /// Physical-pixel caret rect last pushed to the platform IME via
@@ -110,6 +116,7 @@ impl WindowState {
         Self {
             title,
             opacity: 1.0,
+            blur_radius: 0,
             handle: None,
             id: None,
             ime_cursor_area: None,
@@ -294,6 +301,15 @@ impl TerminalApp {
     /// surface, so out-of-range inputs degrade instead of failing creation.
     pub(crate) fn with_window_opacity(mut self, opacity: f32) -> Self {
         self.window.opacity = opacity;
+        self
+    }
+
+    /// Sets the background blur radius applied at window creation (CTX-0832).
+    /// Call once at startup from the effective config; platform-specific
+    /// support varies (macOS, some Wayland compositors, Windows 10+).
+    /// Unsupported platforms silently ignore the request.
+    pub(crate) fn with_blur_radius(mut self, blur_radius: u32) -> Self {
+        self.window.blur_radius = blur_radius;
         self
     }
 
@@ -958,6 +974,7 @@ impl AppHandler for TerminalApp {
                         .with_title(self.window.title.clone())
                         .with_inner_size(default_size)
                         .with_opacity(self.window.opacity)
+                        .with_blur_radius(self.window.blur_radius)
                         .with_visible(true);
                     match ctx.create_window(config) {
                         Ok(handle) => {

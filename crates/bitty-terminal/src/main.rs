@@ -840,6 +840,9 @@ fn main() {
     // CTX-0223: `window.opacity` flows effective -> window creation
     // (sanitized by the platform config; fail-soft where unsupported).
     .with_window_opacity(app_config.effective.window.opacity)
+    // CTX-0832: `window.blur_radius` flows effective -> window creation
+    // (platform-specific; silently ignored where unsupported).
+    .with_blur_radius(app_config.effective.window.blur_radius)
     // CTX-0481: commit the live plugin snapshot from the tick loop.
     .with_live_snapshot(live_snapshot);
     // CTX-0167: the synthetic demo pump stays off in real sessions so

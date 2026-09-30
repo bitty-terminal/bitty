@@ -90,6 +90,7 @@
 #![forbid(unsafe_code)]
 
 pub mod app;
+mod blur;
 pub mod clipboard;
 pub mod dpi;
 pub mod error;

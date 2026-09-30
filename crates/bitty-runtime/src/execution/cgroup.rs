@@ -12,19 +12,19 @@
 //!
 //! # Delegated subtree discovery
 //!
-//! [`JobCgroups::discover`] only ever uses this process's own cgroup, and
-//! only when that cgroup was delegated to it. Writable is not delegated:
-//! systemd-managed slices are often owned by the user, yet moving processes
-//! out of the scope systemd placed them in breaks its bookkeeping. The own
-//! cgroup is the `0::` line of `/proc/self/cgroup` joined onto the cgroup2
-//! mount point found in `/proc/self/mountinfo` (the mount is verified, never
-//! assumed), and it qualifies only when
+//! [`JobCgroups::discover`] accepts this process's own cgroup only when that
+//! cgroup was delegated to it. Writable is not delegated: systemd-managed
+//! slices are often owned by the user, yet moving processes out of the scope
+//! systemd placed them in breaks its bookkeeping. The own cgroup is the `0::`
+//! line of `/proc/self/cgroup` joined onto the cgroup2 mount point found in
+//! `/proc/self/mountinfo` (the mount is verified, never assumed), and it
+//! qualifies only when
 //!
 //! - it is the root of this process's cgroup namespace (`0::/`, the
 //!   container case), or
 //! - it carries the `user.delegate` or `trusted.delegate` extended attribute
 //!   with value `1` (the marker systemd writes on `Delegate=yes` units it
-//!   delegates; read through `rustix`'s safe `getxattr`).
+//!   delegates; read through `rustix::fs::getxattr`, a safe wrapper).
 //!
 //! There is no fallback to the parent or any other ancestor. The qualifying
 //! cgroup must also already enable `memory` in its `cgroup.subtree_control`,
@@ -297,9 +297,9 @@ impl JobCgroups {
         self.lock_book().unremoved.len()
     }
 
-    /// Uses the own cgroup `mount/relative` as the hosting parent when it
-    /// was delegated to this process (see the module docs); never an
-    /// ancestor.
+    /// Uses the own cgroup `mount/relative` as the hosting parent only when
+    /// it was delegated to this process (see the module docs). The parent
+    /// cgroup is never adopted, even when writable.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn discover_from(mount: &Path, relative: &Path) -> Result<Self, CgroupUnavailable> {
         let own = mount.join(relative);

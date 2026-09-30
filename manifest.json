@@ -4,41 +4,41 @@
   "carryctx_version": "0.11.6",
   "schema_version": 18,
   "project_id": "01M0WAMWPGZ2YDGM6M88AT3YGT",
-  "export_id": "01M3S6KP3HV9NQDV6BCS0GZX33",
-  "created_at": "2026-09-30T13:03:38.097550488+00:00",
+  "export_id": "01M3S86T0GEW0MEHYT26GWN3K0",
+  "created_at": "2026-09-30T13:31:33.264612519+00:00",
   "parents": [
-    "01M3S46C03KH9Y7PN5ZD11K0A4"
+    "01M3S6KP3HV9NQDV6BCS0GZX33"
   ],
   "sequences": {
-    "display_id_CTX": 886,
+    "display_id_CTX": 888,
     "display_id_decision": 83,
     "display_id_handoff": 51,
-    "display_id_progress": 4218
+    "display_id_progress": 4227
   },
   "source": {
-    "git_branch": "ctx-1554/chore-cleanup-bitty-panels",
-    "git_commit": "be0c551cd9c35bd161ea38206b5b976916792f73",
+    "git_branch": "main",
+    "git_commit": "5f6f59149d3268d94edd5b0e17f34b5e01e18063",
     "hostname": "unknown"
   },
   "counts": {
-    "agents": 1166,
+    "agents": 1168,
     "checkpoint_corrections": 0,
-    "checkpoints": 2473,
+    "checkpoints": 2483,
     "decisions": 82,
-    "events": 19609,
+    "events": 19654,
     "graph_edges": 1176,
     "graph_nodes": 388,
     "handoffs": 50,
-    "progress_items": 4217,
+    "progress_items": 4226,
     "scopes": 1069,
     "sequences": 4,
-    "sessions": 881,
+    "sessions": 882,
     "task_dependencies": 124,
-    "tasks": 885,
+    "tasks": 887,
     "team_members": 37,
     "teams": 2,
     "tombstones": 412,
-    "worktrees": 25
+    "worktrees": 27
   },
   "redacted": true
 }

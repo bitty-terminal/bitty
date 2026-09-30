@@ -33,6 +33,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use bitty_lua::gate::{VmBudgets, build_plugin_vm};
 use bitty_lua::host::DEFAULT_HOST_DEADLINE_MS;
@@ -483,6 +484,12 @@ pub struct PluginRuntime {
     /// authority).
     #[cfg(feature = "network")]
     network_runtime: Option<Rc<bitty_network_lua::SharedNetworkRuntime>>,
+    /// Filesystem adapter behind disk-backed plugin stores (`data_dir`).
+    ///
+    /// Defaults to [`NativeFileSystem`]; replaceable through
+    /// [`PluginRuntime::set_store_filesystem`] so latency and failure can be
+    /// injected deterministically (bitty #1518).
+    store_fs: Arc<dyn FileSystem>,
 }
 
 impl PluginRuntime {
@@ -507,7 +514,17 @@ impl PluginRuntime {
             service_directory: Rc::new(RefCell::new(ServiceDirectory::new())),
             #[cfg(feature = "network")]
             network_runtime: None,
+            store_fs: Arc::new(NativeFileSystem),
         }
+    }
+
+    /// Replace the filesystem adapter used by disk-backed plugin stores.
+    ///
+    /// Applies to stores opened by later activations. The adapter only
+    /// changes how `store.json` is read and committed; quotas, atomic
+    /// temp-then-rename, and the RC-1 accounting are unchanged.
+    pub fn set_store_filesystem(&mut self, fs: Arc<dyn FileSystem>) {
+        self.store_fs = fs;
     }
 
     /// Install the optional shared network runtime (CTX-0846, #1454).
@@ -1270,7 +1287,8 @@ impl PluginRuntime {
         match &self.data_dir {
             Some(root) => {
                 let path = root.join(id.as_str()).join("store.json");
-                PluginStore::load(path).map_err(PluginRuntimeError::Io)
+                PluginStore::load_with_fs(path, self.store_fs.clone())
+                    .map_err(PluginRuntimeError::Io)
             }
             None => Ok(PluginStore::in_memory()),
         }

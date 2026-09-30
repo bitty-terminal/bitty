@@ -25,6 +25,7 @@ use bitty_ipc::execution::EnvPolicy;
 use bitty_plugin_host::roles::{AgentRole, SandboxDecl};
 use bitty_pty::{LeaderExit, OwnedTree, Pty, PtyBuilder, PtyReader, TreeSignal};
 
+use super::cgroup::{CgroupSource, CgroupUnavailable, JobAccounting, JobCgroups};
 use super::closed_pipe_command;
 use super::command_risk::{OperationIntent, RiskVerdict, classify_argv};
 use super::delivery::{DeliveryLog, DeliveryState, EventReplay};
@@ -34,7 +35,7 @@ use super::model::{
     MAX_SIGNAL_WINDOW_MS, MAX_SIGNALS_PER_WINDOW, MAX_WRITE_INPUT_BYTES, MAX_WRITE_INPUT_WINDOW_MS,
     MAX_WRITES_PER_WINDOW, SignalOutcome, TransferReceipt,
 };
-use super::oom::OomVerdict;
+use super::oom::{OomEvidence, OomEvidenceGap};
 use super::outcome::{
     CancelEffect, CancelMode, CancelOutcome, CancelReceipt, CancelRequest, DeadlineClock,
     ExecutionGeneration, ExecutionHandle, ExecutionOutcome, ExitObservation,
@@ -141,6 +142,33 @@ impl JobRegistry {
         Self::with_worker_spawner(capacity, spawn_worker)
     }
 
+    /// Registry with `capacity` slots whose jobs each run in their own
+    /// cgroup v2 leaf under `cgroups` (CTX-0880, #1537).
+    ///
+    /// Pass [`JobCgroups::discover`] (or [`JobCgroups::under`] for an
+    /// injected base). An `Err` keeps the registry fully usable: every job
+    /// then records [`OomEvidence::Missing`] with
+    /// [`OomEvidenceGap::Undelegated`] (or `UnsupportedPlatform`), and
+    /// [`JobRegistry::cgroup_unavailable`] names the reason. OOM is never
+    /// claimed without a leaf.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `capacity == 0`, like [`JobRegistry::with_capacity`].
+    #[must_use]
+    pub fn with_job_cgroups(
+        capacity: usize,
+        cgroups: Result<JobCgroups, CgroupUnavailable>,
+    ) -> Self {
+        let registry = Self::with_worker_spawner(capacity, spawn_worker);
+        // The leaf bound follows the registry's capacity: every tracked job
+        // can hold a leaf, and a leak cannot exceed the table size.
+        lock_inner(&registry.shared).cgroups = CgroupSource::from_result(
+            cgroups.map(|cgroups| Arc::new(cgroups.with_max_leaves(capacity))),
+        );
+        registry
+    }
+
     /// Registry whose backends start drain workers through `worker_spawner`.
     fn with_worker_spawner(capacity: usize, worker_spawner: WorkerSpawner) -> Self {
         assert!(capacity > 0, "job registry capacity must be > 0");
@@ -151,7 +179,37 @@ impl JobRegistry {
                 jobs: BTreeMap::new(),
                 events: DeliveryLog::new(),
                 worker_spawner,
+                cgroups: CgroupSource::NotConfigured,
             })),
+        }
+    }
+
+    /// Why per-job cgroup accounting is unavailable, when it was requested
+    /// through [`JobRegistry::with_job_cgroups`] and could not be set up.
+    #[must_use]
+    pub fn cgroup_unavailable(&self) -> Option<CgroupUnavailable> {
+        match &lock_inner(&self.shared).cgroups {
+            CgroupSource::Unavailable(reason) => Some(*reason),
+            CgroupSource::NotConfigured | CgroupSource::Available(_) => None,
+        }
+    }
+
+    /// The delegated job base holding this registry's per-job leaves.
+    #[must_use]
+    pub fn job_cgroup_base(&self) -> Option<std::path::PathBuf> {
+        match &lock_inner(&self.shared).cgroups {
+            CgroupSource::Available(cgroups) => Some(cgroups.base().to_path_buf()),
+            CgroupSource::NotConfigured | CgroupSource::Unavailable(_) => None,
+        }
+    }
+
+    /// Released per-job leaves whose removal has not succeeded yet (a
+    /// diagnostic counter; nonzero means a job member outlived its kill).
+    #[must_use]
+    pub fn unremoved_cgroup_leaves(&self) -> usize {
+        match &lock_inner(&self.shared).cgroups {
+            CgroupSource::Available(cgroups) => cgroups.unremoved_leaves(),
+            CgroupSource::NotConfigured | CgroupSource::Unavailable(_) => 0,
         }
     }
 
@@ -792,13 +850,15 @@ impl JobRegistry {
                     "signal budget of {MAX_SIGNALS_PER_WINDOW} calls per {MAX_SIGNAL_WINDOW_MS} ms spent"
                 )));
             }
-            record.tree.clone().ok_or_else(|| {
+            let tree = record.tree.clone().ok_or_else(|| {
                 JobError::unsupported(
                     "no owned tree for this job (not started, or no backend on this \
                      platform); a signal is never sent to a single pid",
                 )
-            })?
+            })?;
+            (tree, Arc::clone(&record.control))
         };
+        let (tree, control) = tree;
         // Delivered outside the registry lock; the tree's own lock keeps the
         // signal from racing the leader's reap.
         let signal = match signal {
@@ -806,6 +866,9 @@ impl JobRegistry {
             JobSignal::Terminate => TreeSignal::Terminate,
             JobSignal::Kill => TreeSignal::Kill,
         };
+        if signal == TreeSignal::Kill {
+            control.note_host_kill();
+        }
         match tree.signal(signal) {
             Ok(()) => Ok(SignalOutcome::Delivered),
             Err(error) => match error.kind() {
@@ -1275,6 +1338,8 @@ struct RegistryInner {
     events: DeliveryLog,
     /// Starts drain workers; a test seam for spawn failures (CORE-RUN-005).
     worker_spawner: WorkerSpawner,
+    /// Where per-job cgroup leaves come from (CTX-0880).
+    cgroups: CgroupSource,
 }
 
 /// Starts one named worker thread for a job backend.
@@ -1353,6 +1418,8 @@ struct JobRecord {
     tree: Option<Arc<OwnedTree>>,
     /// What a kill reaches for this job (reported on every snapshot).
     kill_scope: KillScope,
+    /// OOM evidence for this job (reported on every snapshot, CTX-0880).
+    oom_evidence: OomEvidence,
     /// Owning principal: assigned once at spawn, moves only via `transfer`.
     /// Ownership confers every operation implicitly (never a table entry).
     /// `None` marks a legacy phase-1 record (spawned through [`JobRegistry::spawn`]):
@@ -1404,6 +1471,7 @@ impl JobRecord {
             output,
             tree: None,
             kill_scope: KillScope::DirectChild,
+            oom_evidence: OomEvidence::Pending,
             owner: Some(owner),
             grants: BTreeSet::new(),
             write_budget: RateBudget::new(
@@ -1442,6 +1510,7 @@ impl JobRecord {
             output,
             tree: None,
             kill_scope: KillScope::DirectChild,
+            oom_evidence: OomEvidence::Pending,
             owner: None,
             grants: BTreeSet::new(),
             write_budget: RateBudget::new(
@@ -1570,6 +1639,7 @@ impl JobRecord {
             output: self.output.index(),
             generation: self.generation,
             kill_scope: self.kill_scope,
+            oom_evidence: self.oom_evidence,
         }
     }
 }
@@ -1580,6 +1650,10 @@ struct JobControl {
     /// The strongest pending cancel request; the supervisor takes it.
     cancel: Mutex<Option<CancelRequest>>,
     clock: Arc<ActivityClock>,
+    /// Set once the host itself sent `SIGKILL` to the job (an owner's
+    /// `signal_as(Kill)`, a cancel, or a deadline): a SIGKILL death is then
+    /// the host's kill, never classified as the kernel's OOM kill.
+    host_killed: std::sync::atomic::AtomicBool,
 }
 
 impl JobControl {
@@ -1587,7 +1661,19 @@ impl JobControl {
         Self {
             cancel: Mutex::new(None),
             clock: Arc::new(ActivityClock::new()),
+            host_killed: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Records that the host is about to deliver `SIGKILL` (set before the
+    /// delivery, so the exit it causes can never be observed without it).
+    fn note_host_kill(&self) {
+        self.host_killed.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the host delivered (or attempted) a `SIGKILL`.
+    fn host_killed(&self) -> bool {
+        self.host_killed.load(Ordering::SeqCst)
     }
 
     /// Records `request`, coalescing with a pending one: the higher-ranked
@@ -1673,6 +1759,7 @@ fn supervise(
             &shared,
             id,
             ExecutionOutcome::Cancelled(CancelEffect::BeforeStart),
+            OomEvidence::Missing(OomEvidenceGap::NotStarted),
         );
         return;
     }
@@ -1680,13 +1767,24 @@ fn supervise(
     // `write_input_as` either finds it (PTY) or fails closed (pipes), never
     // a stale half from a previous job: ids are never reused.
     let stdin_writer_slot = stdin_slot_handle(&shared, id);
-    let worker_spawner = lock_inner(&shared).worker_spawner;
+    let (worker_spawner, cgroups, generation) = {
+        let inner = lock_inner(&shared);
+        let generation = inner
+            .jobs
+            .get(&id)
+            .map_or(0, |record| record.generation.get());
+        (inner.worker_spawner, inner.cgroups.clone(), generation)
+    };
+    // The leaf exists and its starting counter is read before the spawn;
+    // the backend moves the leader in right after it (CTX-0880).
+    let mut accounting = JobAccounting::prepare(cgroups, id.get(), generation);
     let mut backend = match Backend::start(
         &spec,
         Arc::clone(&control.clock),
         output,
         stdin_writer_slot,
         worker_spawner,
+        &mut accounting,
     ) {
         Ok(backend) => backend,
         Err(_) => {
@@ -1694,16 +1792,31 @@ fn supervise(
             // crash: the caller keeps a job id to observe. A start that got
             // as far as a child process already killed and reaped it, so
             // no live job is ever left without its drains (CORE-RUN-005).
-            finish(&shared, id, ExecutionOutcome::SpawnFailed);
+            finish(
+                &shared,
+                id,
+                ExecutionOutcome::SpawnFailed,
+                accounting.abandon(),
+            );
             return;
         }
     };
-    mark_running(&shared, id, backend.tree());
-    let outcome = watch(&shared, id, &spec, &mut backend, &control);
+    mark_running(&shared, id, backend.tree(), accounting.running_evidence());
+    let mut accounting = Some(accounting);
+    let outcome = watch(&shared, id, &spec, &mut backend, &control, &mut accounting);
+    // Paths that ended the job without a natural exit (cancel, deadline)
+    // still take the final reading once the tree is gone.
+    let evidence = match accounting.take() {
+        Some(accounting) => accounting.finish(),
+        None => lock_inner(&shared)
+            .jobs
+            .get(&id)
+            .map_or(OomEvidence::Pending, |record| record.oom_evidence),
+    };
     // The terminal state is published after the reap and the time-boxed
     // drain join: the output store is quiescent unless a member escaped
     // the owned tree and still holds a pipe.
-    finish(&shared, id, outcome);
+    finish(&shared, id, outcome, evidence);
 }
 
 /// Returns the shared stdin-writer slot for `id` when the job is interactive.
@@ -1731,6 +1844,7 @@ fn watch(
     spec: &JobSpec,
     backend: &mut Backend,
     control: &JobControl,
+    accounting: &mut Option<JobAccounting>,
 ) -> ExecutionOutcome {
     let hard_deadline = spec
         .timeouts
@@ -1738,9 +1852,16 @@ fn watch(
         .and_then(|hard| Instant::now().checked_add(hard));
     loop {
         if let Some(exit) = backend.poll_exit() {
-            // No per-job cgroup evidence exists yet, so the verdict is
-            // `Unknown` and a SIGKILL death is never claimed as OOM.
-            return ExecutionOutcome::classify_exit(exit, OomVerdict::Unknown);
+            // `poll_exit` returns only after the leader is reaped and the
+            // owned tree killed, so the leaf's final `oom_kill` reading is
+            // complete. Only a leaf reading yields `OomKilled`; every gap
+            // is `Unknown`, so a SIGKILL death is never guessed as OOM.
+            let evidence = accounting
+                .take()
+                .map_or(OomEvidence::Pending, JobAccounting::finish);
+            set_oom_evidence(shared, id, evidence);
+            let verdict = exit_oom_verdict(evidence, control.host_killed());
+            return ExecutionOutcome::classify_exit(exit, verdict);
         }
         if let Some(request) = control.take_cancel() {
             let (resolution, ended) = execute_cancel(backend, control, request);
@@ -1766,10 +1887,26 @@ fn watch(
             // A kill the kernel refuses (never expected for an own child)
             // leaves the leader to the backend's drop path; the deadline
             // fired, so the outcome is `TimedOut` either way.
+            control.note_host_kill();
             let _ = backend.kill_and_reap();
             return ExecutionOutcome::TimedOut(clock);
         }
         thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// The verdict the outcome classifier gets for a job's exit.
+///
+/// Only a leaf reading can claim an OOM kill, and only when the host did
+/// not send `SIGKILL` itself: after a host kill (owner `signal_as(Kill)`,
+/// cancel, or deadline) a SIGKILL death is the host's, so the outcome stays
+/// `Signaled(9)` and an advanced counter survives only as the job's
+/// [`OomEvidence::OomKilled`] evidence.
+fn exit_oom_verdict(evidence: OomEvidence, host_killed: bool) -> super::oom::OomVerdict {
+    if host_killed {
+        super::oom::OomVerdict::Unknown
+    } else {
+        evidence.verdict()
     }
 }
 
@@ -1835,6 +1972,7 @@ fn execute_cancel(
         if request.mode() == CancelMode::Graceful {
             return (CancelOutcome::StillRunning, None);
         }
+        control.note_host_kill();
         return match backend.kill_and_reap() {
             Ok(_) => (
                 CancelOutcome::Killed,
@@ -1875,11 +2013,17 @@ fn wait_for_exit(backend: &mut Backend, control: &JobControl, request: CancelReq
     }
 }
 
-fn mark_running(shared: &Shared, id: JobId, tree: Option<Arc<OwnedTree>>) {
+fn mark_running(
+    shared: &Shared,
+    id: JobId,
+    tree: Option<Arc<OwnedTree>>,
+    oom_evidence: OomEvidence,
+) {
     let at_ms = now_ms();
     let mut inner = lock_inner(shared);
     if let Some(record) = inner.jobs.get_mut(&id) {
         record.state = JobState::Running;
+        record.oom_evidence = oom_evidence;
         record.started_at_ms = Some(at_ms);
         record.kill_scope = if tree.is_some() {
             KillScope::OwnedTree
@@ -1899,12 +2043,20 @@ fn resolve_cancel(shared: &Shared, id: JobId, outcome: CancelOutcome) {
     });
 }
 
-fn finish(shared: &Shared, id: JobId, outcome: ExecutionOutcome) {
+/// Records the job's final OOM evidence before its outcome is published.
+fn set_oom_evidence(shared: &Shared, id: JobId, evidence: OomEvidence) {
+    if let Some(record) = lock_inner(shared).jobs.get_mut(&id) {
+        record.oom_evidence = evidence;
+    }
+}
+
+fn finish(shared: &Shared, id: JobId, outcome: ExecutionOutcome, oom_evidence: OomEvidence) {
     let at_ms = now_ms();
     let mut inner = lock_inner(shared);
     let mut unanswered = None;
     if let Some(record) = inner.jobs.get_mut(&id) {
         record.state = JobState::Done(outcome);
+        record.oom_evidence = oom_evidence;
         record.finished_at_ms = Some(at_ms);
         // The leader is reaped: no signal may reach its recycled id.
         record.tree = None;
@@ -2035,12 +2187,20 @@ impl Backend {
         output: OutputSink,
         stdin_writer_slot: Option<Arc<Mutex<Option<PtyStdinWriter>>>>,
         worker_spawner: WorkerSpawner,
+        accounting: &mut JobAccounting,
     ) -> Result<Self, StartFailure> {
         match spec.io {
-            JobIo::Pipes => PipeJob::start(spec, clock, output, worker_spawner).map(Self::Pipe),
-            JobIo::Pty => {
-                PtyJob::start(spec, clock, output, stdin_writer_slot, worker_spawner).map(Self::Pty)
-            }
+            JobIo::Pipes => PipeJob::start_placed(spec, clock, output, worker_spawner, accounting)
+                .map(Self::Pipe),
+            JobIo::Pty => PtyJob::start_placed(
+                spec,
+                clock,
+                output,
+                stdin_writer_slot,
+                worker_spawner,
+                accounting,
+            )
+            .map(Self::Pty),
         }
     }
 
@@ -2134,17 +2294,33 @@ impl PipeJob {
     /// the child are killed and the child reaped first, so the job ends as a
     /// typed [`ExecutionOutcome::SpawnFailed`] instead of a live process
     /// nobody drains (CORE-RUN-005).
+    #[cfg(test)]
     fn start(
         spec: &JobSpec,
         clock: Arc<ActivityClock>,
         output: OutputSink,
         worker_spawner: WorkerSpawner,
     ) -> Result<Self, StartFailure> {
+        let mut accounting = JobAccounting::prepare(CgroupSource::NotConfigured, 0, 0);
+        Self::start_placed(spec, clock, output, worker_spawner, &mut accounting)
+    }
+
+    /// Starts the pipe job and moves the leader into the job's cgroup leaf
+    /// right after the spawn, before the tree is adopted and the drains run
+    /// (the residual placement window is documented in the `cgroup` module).
+    fn start_placed(
+        spec: &JobSpec,
+        clock: Arc<ActivityClock>,
+        output: OutputSink,
+        worker_spawner: WorkerSpawner,
+        accounting: &mut JobAccounting,
+    ) -> Result<Self, StartFailure> {
         let mut command =
             closed_pipe_command(&spec.program, &spec.args, spec.cwd.as_deref(), &spec.env);
         OwnedTree::prepare_command(&mut command);
         let mut child = command.spawn().map_err(StartFailure::before_spawn)?;
         let pid = child.id();
+        accounting.place(pid);
         let tree = adopt_tree(Some(pid));
         let mut drains = Vec::new();
         let started = (|| -> std::io::Result<()> {
@@ -2291,14 +2467,36 @@ impl PtyJob {
     /// Spawns the PTY child, adopts its owned tree, then starts its drain
     /// worker.
     ///
-    /// Like [`PipeJob::start`], a reader or drain that cannot start kills
+    /// Like [`PipeJob::start_placed`], a reader or drain that cannot start kills
     /// and reaps the child before the failure is reported (CORE-RUN-005).
+    #[cfg(test)]
     fn start(
         spec: &JobSpec,
         clock: Arc<ActivityClock>,
         output: OutputSink,
         stdin_writer_slot: Option<Arc<Mutex<Option<PtyStdinWriter>>>>,
         worker_spawner: WorkerSpawner,
+    ) -> Result<Self, StartFailure> {
+        let mut accounting = JobAccounting::prepare(CgroupSource::NotConfigured, 0, 0);
+        Self::start_placed(
+            spec,
+            clock,
+            output,
+            stdin_writer_slot,
+            worker_spawner,
+            &mut accounting,
+        )
+    }
+
+    /// Starts the PTY job and moves the PTY leader into the job's cgroup
+    /// leaf right after the spawn (see [`PipeJob::start_placed`]).
+    fn start_placed(
+        spec: &JobSpec,
+        clock: Arc<ActivityClock>,
+        output: OutputSink,
+        stdin_writer_slot: Option<Arc<Mutex<Option<PtyStdinWriter>>>>,
+        worker_spawner: WorkerSpawner,
+        accounting: &mut JobAccounting,
     ) -> Result<Self, StartFailure> {
         let mut builder = PtyBuilder::new(&spec.program);
         builder = builder.args(spec.args.iter().cloned());
@@ -2312,6 +2510,9 @@ impl PtyJob {
         }
         let pty = builder.spawn().map_err(StartFailure::before_spawn)?;
         let pid = pty.pid();
+        if let Some(pid) = pid {
+            accounting.place(pid);
+        }
         let tree = adopt_tree(pid);
         let mut job = Self {
             pty,
@@ -2551,6 +2752,56 @@ mod tests {
         wait_for(registry, id, "a terminal state", |snapshot| {
             snapshot.state.is_terminal()
         })
+    }
+
+    #[test]
+    fn a_host_kill_is_never_classified_as_an_oom_kill() {
+        use crate::execution::ExitObservation;
+        let sigkill = ExitObservation::Signal(9);
+        let classify = |evidence, host_killed| {
+            ExecutionOutcome::classify_exit(sigkill, exit_oom_verdict(evidence, host_killed))
+        };
+        assert_eq!(
+            classify(OomEvidence::OomKilled, false),
+            ExecutionOutcome::OomKilled
+        );
+        assert_eq!(
+            classify(OomEvidence::OomKilled, true),
+            ExecutionOutcome::Signaled(9)
+        );
+        assert_eq!(
+            classify(OomEvidence::NotOom, false),
+            ExecutionOutcome::Signaled(9)
+        );
+        let control = JobControl::new();
+        assert!(!control.host_killed());
+        control.note_host_kill();
+        assert!(control.host_killed());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_leaf_bound_follows_the_registry_capacity() {
+        let root = std::env::temp_dir().join(format!(
+            "bitty-ctx0880-leafbound-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("fake root");
+        std::fs::write(root.join("cgroup.subtree_control"), "memory")
+            .unwrap_or_else(|error| panic!("fake control in {root:?}: {error}"));
+        let capacity = 3;
+        let registry = JobRegistry::with_job_cgroups(capacity, JobCgroups::under(&root));
+        let bound = match &lock_inner(&registry.shared).cgroups {
+            CgroupSource::Available(cgroups) => cgroups.max_leaves(),
+            other => panic!("fake base must be available: {other:?}"),
+        };
+        assert_eq!(bound, capacity);
+        let base = registry.job_cgroup_base().expect("base");
+        let _ = std::fs::remove_file(base.join("cgroup.subtree_control"));
+        drop(registry);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

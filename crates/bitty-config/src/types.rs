@@ -2222,6 +2222,44 @@ pub struct WorkspaceConfig {
     /// layer says nothing and the default-on bar stays; `Some(false)` opts
     /// out (issue #1333). Effective default resolves to `true`.
     pub show_bar: Option<bool>,
+    /// Window edge of the Core-owned workspace bar band
+    /// (`workspace.bar.edge`, CTX-0873). `None` means the layer says
+    /// nothing; the effective default is [`WorkspaceBarEdge::Bottom`].
+    pub bar_edge: Option<WorkspaceBarEdge>,
+}
+
+/// Window edge of the workspace bar band (CTX-0873, issue #1431).
+///
+/// Paired with `bitty-runtime` `BarEdge` by spelling (the crates share no
+/// dependency edge). Only the horizontal edges are accepted today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WorkspaceBarEdge {
+    /// Band on the first window row.
+    Top,
+    /// Band on the last window row (default).
+    #[default]
+    Bottom,
+}
+
+impl WorkspaceBarEdge {
+    /// Parses a config spelling (exact lowercase; fail-closed `None`).
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "top" => Some(Self::Top),
+            "bottom" => Some(Self::Bottom),
+            _ => None,
+        }
+    }
+
+    /// Canonical config spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Top => "top",
+            Self::Bottom => "bottom",
+        }
+    }
 }
 
 impl WorkspaceConfig {

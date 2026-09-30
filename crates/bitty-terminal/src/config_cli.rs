@@ -482,6 +482,9 @@ pub(crate) fn starter_init_lua() -> &'static str {
      \x20\x20-- Workspace switcher bar (on by default: lists workspaces,\n\
      \x20\x20-- click/keyboard switching). Uncomment to opt out:\n\
      \x20\x20-- workspace = { show_bar = false },\n\
+     \x20\x20-- The bar reserves its own row (bottom by default) so it never\n\
+     \x20\x20-- covers terminal content. Uncomment to move it to the top:\n\
+     \x20\x20-- workspace = { bar = { edge = \"top\" } },\n\
      \x20\x20-- keymaps = {\n\
      \x20\x20--     { chord = \"alt+h\", action = \"goto_split:left\", context = \"global\" },\n\
      \x20\x20--     { chord = \"alt+1\", action = \"focus:1\", context = \"global\" },\n\
@@ -522,6 +525,18 @@ pub(crate) fn layer_source_label(
             }
         }
         None => "default".to_string(),
+    }
+}
+
+/// Maps the validated config bar edge onto the runtime enum (CTX-0873).
+/// The crates share no dependency edge, so the pairing lives here, once;
+/// exhaustive on both sides so a new variant fails to compile until mapped.
+pub(crate) const fn runtime_bar_edge(
+    edge: bitty_config::types::WorkspaceBarEdge,
+) -> bitty_runtime::config::BarEdge {
+    match edge {
+        bitty_config::types::WorkspaceBarEdge::Top => bitty_runtime::config::BarEdge::Top,
+        bitty_config::types::WorkspaceBarEdge::Bottom => bitty_runtime::config::BarEdge::Bottom,
     }
 }
 
@@ -1324,6 +1339,9 @@ pub(crate) fn runtime_config_from_effective_with_warnings(
         // opts out (`None` says nothing, so the runtime default `true`
         // stands). Booleans are total — no validation needed.
         cfg.workspaceline_visible = effective.workspace.show_bar.unwrap_or(true);
+        // CTX-0873: the validated bar edge maps by variant; `None` keeps
+        // the runtime default (bottom).
+        cfg.workspace_bar_edge = runtime_bar_edge(effective.workspace.bar_edge.unwrap_or_default());
         // CTX-0340: resolve the focused/idle outline pair from the theme
         // token / `decoration.border_color` / explicit pair and carry it onto
         // the runtime config. The `bitty-config` validation already enforced

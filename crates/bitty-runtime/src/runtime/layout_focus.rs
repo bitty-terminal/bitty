@@ -181,8 +181,11 @@ impl Runtime {
         let deco_px =
             (f64::from(deco.gaps_out) + f64::from(deco.border) + f64::from(deco.content_inset))
                 * scale;
-        let gap_px_x = f64::from(self.config.gaps_out) * cell_w + deco_px;
-        let gap_px_y = f64::from(self.config.gaps_out) * cell_h + deco_px;
+        // CTX-0873: a top chrome band shifts the container origin.
+        let gap_px_x =
+            (f64::from(self.config.gaps_out) + f64::from(self.container.x)) * cell_w + deco_px;
+        let gap_px_y =
+            (f64::from(self.config.gaps_out) + f64::from(self.container.y)) * cell_h + deco_px;
         let col = if cell_w <= 0.0 {
             0
         } else {
@@ -1276,13 +1279,94 @@ impl Runtime {
         self.container
     }
 
-    /// Sets the container rect directly (cell coordinates). The container is
-    /// also updated automatically by `handle_resize` via pixel-to-cell
-    /// conversion; this setter exists for headless tests that drive layout
+    /// Sets the window grid directly (cell coordinates). The layout
+    /// container is derived from it minus the Core-owned chrome band
+    /// (CTX-0873), exactly as `handle_resize` derives it from the physical
+    /// extent; this setter exists for headless tests that drive layout
     /// without a physical surface.
-    pub fn set_container(&mut self, rect: UiRect) {
-        self.container = rect;
+    ///
+    /// It does not reflow leaves, grids, or PTYs: callers that need the
+    /// layout tree resized call [`Self::reflow_layout`] afterwards (the
+    /// pre-CTX-0873 `set_container` contract, kept so existing headless
+    /// drivers stay deterministic).
+    pub fn set_window_cells(&mut self, rect: UiRect) {
+        self.window_cells = rect;
+        self.container = self.chrome_layout().container;
         self.pending_full_redraw = true;
+    }
+
+    /// Alias of [`Self::set_window_cells`], kept for existing callers.
+    ///
+    /// CTX-0873 changed its meaning: `rect` is now the full **window** grid
+    /// and the layout container is derived from it minus the chrome band,
+    /// so with a reserved workspace bar [`Self::container`] reads one band
+    /// smaller than `rect`. Same no-reflow contract as the new name.
+    #[doc(alias = "set_window_cells")]
+    pub fn set_container(&mut self, rect: UiRect) {
+        self.set_window_cells(rect);
+    }
+
+    /// Full window grid in cells (CTX-0873): the layout [`Self::container`]
+    /// plus any reserved chrome band.
+    #[must_use]
+    pub fn window_cells(&self) -> UiRect {
+        self.window_cells
+    }
+
+    /// Solved chrome geometry for the current window grid (CTX-0873).
+    ///
+    /// The bar band is reserved exactly when [`Self::bar_present`] holds
+    /// (visible and more than one workspace) and the window keeps the
+    /// effective minimum content extent (see [`chrome_band::solve`]).
+    pub(super) fn chrome_layout(&self) -> chrome_band::ChromeLayout {
+        let thickness = u16::try_from(workspaces::STATUS_BAR_ROWS).unwrap_or(u16::MAX);
+        // Effective floor: content rows plus both outer cell gaps plus the
+        // vertical decoration ring (both sides, live DPI) in live rows, so a
+        // reserved band never leaves a leaf with zero content rows.
+        let deco = self.config.decoration;
+        let deco_px = 2.0
+            * (f64::from(deco.gaps_out) + f64::from(deco.border) + f64::from(deco.content_inset))
+            * self.dpi_scale();
+        let min_rows = chrome_band::min_container_rows(
+            self.config.gaps_out,
+            deco_px,
+            self.live_cell_metrics().height,
+        );
+        chrome_band::solve(
+            self.window_cells,
+            self.workspace_bar_edge,
+            thickness,
+            self.bar_present(),
+            min_rows,
+        )
+    }
+
+    /// Re-derives the container from the chrome band and, when it moved,
+    /// reflows leaves, the primary grid + PTY, and every pane session
+    /// through the normal geometry sync (CTX-0873).
+    ///
+    /// Called by every funnel that can change bar presence or placement
+    /// (visibility toggle, workspace count crossing one, edge change,
+    /// session restore) and once per tick as a safety net. Idempotent: an
+    /// unchanged container touches nothing. Returns whether it reflowed.
+    pub(super) fn refresh_chrome_band(&mut self) -> bool {
+        let container = self.chrome_layout().container;
+        if container == self.container {
+            return false;
+        }
+        self.container = container;
+        self.layout.reflow_with_gaps(self.container, self.gaps());
+        let frames = self.present_frames();
+        self.reflow_present_layout(&frames);
+        // Owner-follow (CTX-0359): the primary grid/PTY resizes only when its
+        // owner leaf is in the live layout; a fresh workspace leaves it be.
+        self.sync_primary_geometry();
+        self.cols = self.state.width().max(1);
+        self.rows = self.state.height().max(1);
+        self.sync_pane_geometry_to(&frames);
+        self.clamp_view_bindings_to_geometry();
+        self.pending_full_redraw = true;
+        true
     }
 
     /// Current leaf allocations `(ViewId, Rect)` in deterministic depth-first

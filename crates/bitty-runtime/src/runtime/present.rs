@@ -305,6 +305,12 @@ pub(super) fn px_add(a: i32, b: i32) -> i32 {
     a.saturating_add(b)
 }
 
+/// Window-cell coordinate times a live cell extent in pixels, saturated to
+/// `i32` (CTX-0873 band origin).
+fn px_mul(cells: u16, cell_px: u32) -> i32 {
+    i32::try_from(u64::from(cells).saturating_mul(u64::from(cell_px))).unwrap_or(i32::MAX)
+}
+
 /// Cell-span width in pixels (`cells * cell_px`), saturated to `u32`.
 pub(super) fn px_span(cells: u16, cell_px: u32) -> u32 {
     u32::try_from(u64::from(cells).saturating_mul(u64::from(cell_px))).unwrap_or(u32::MAX)
@@ -342,11 +348,37 @@ fn erased_snapshot(base: &Snapshot) -> Snapshot {
     }
 }
 
-/// Overlays the status bar text onto the last row of an owned present
-/// snapshot (issue #1349).
+/// Builds the owned snapshot the workspace bar band renders from
+/// (CTX-0873, issue #1431): `cols` x `rows` erased cells with the bar text
+/// painted on its last row by [`overlay_status_bar`]. The cursor is hidden
+/// (the band is chrome, never a caret target) and the modes and title are
+/// defaults: the band never inherits a grid's screen modes (for example
+/// DECSCNM reverse video) or copies its title. Pure; never touches grid
+/// truth.
+fn band_snapshot(base: &Snapshot, cols: usize, rows: usize, text: &str) -> Snapshot {
+    let len = cols.saturating_mul(rows);
+    let mut cursor = base.cursor.clone();
+    cursor.visible = false;
+    let mut snapshot = Snapshot {
+        version: base.version,
+        generation: base.generation,
+        width: cols,
+        height: rows,
+        cells: vec![Cell::erased(Style::default()); len].into_boxed_slice(),
+        cursor,
+        modes: bitty_term_state::Modes::default(),
+        title: bitty_vt::BoundedString::new(""),
+    };
+    overlay_status_bar(&mut snapshot, text);
+    snapshot
+}
+
+/// Paints the status bar text onto the last row of an owned band
+/// snapshot (issue #1349; CTX-0873 retargeted it from leaf snapshots to the
+/// dedicated band snapshot built by [`band_snapshot`]).
 ///
-/// Presentation-only: the caller passes the per-leaf present copy, so
-/// grid truth is never mutated. The full row takes inverse video so it
+/// Presentation-only: the caller passes an owned copy, so grid truth is
+/// never mutated. The full row takes inverse video so it
 /// reads as a bar; `text` is laid out width-aware
 /// ([`char_cell_width`]) with wide-spacer halves, truncated at the frame
 /// edge, and the remainder padded with bar-styled spaces. Control
@@ -983,6 +1015,10 @@ impl Runtime {
         // the accepted gaps/border/radius instead of cell-aligned tiling.
         // The reflow mutates leaf Views to the decorated *content* grid so
         // scroll/selection/PTY geometry matches the painted viewport.
+        // CTX-0873: safety net for any bar-presence change that bypassed the
+        // explicit funnels (for example a `layout_mut` escape); a no-op when
+        // the band already matches.
+        self.refresh_chrome_band();
         let frames = self.present_frames();
         self.reflow_present_layout(&frames);
 
@@ -1055,12 +1091,15 @@ impl Runtime {
             pending_full = true;
         }
 
-        // Issue #1349: the bar overlays owned present copies, so a
-        // workspace switch/new/close/rename with a quiet grid still needs
-        // a frame. The text comparison is the bar's damage signal;
+        // Issue #1349 / CTX-0873: the bar band is rebuilt every frame from
+        // live text, so a workspace switch/new/close/rename with a quiet
+        // grid still needs a frame. The text comparison is the bar's damage signal;
         // `set_workspaceline_visible` already forces via
         // `pending_full_redraw`. Bounded (`WORKSPACELINE_MAX_CHARS`).
-        if self.status_bar_text() != self.last_presented_bar {
+        // Formatted once per tick and carried on the basis so the band
+        // render and the presented-bar bookkeeping reuse this one value.
+        let bar_text = self.status_bar_text();
+        if bar_text != self.last_presented_bar {
             pending_full = true;
         }
 
@@ -1178,7 +1217,61 @@ impl Runtime {
             ring_ctx,
             cells_before,
             glyphs_before,
+            bar_text,
         })
+    }
+
+    /// Renders the workspace bar band into `built` at its window origin
+    /// (CTX-0873). Returns `true` when the render planned against a newer
+    /// atlas epoch than the slots already collected (the caller abandons the
+    /// attempt, exactly like a stale leaf).
+    fn push_status_bar_band(
+        &mut self,
+        band: UiRect,
+        text: &str,
+        base: &Snapshot,
+        pad_px: i32,
+        attempt: u8,
+        built: &mut CombinedLeaves,
+    ) -> bool {
+        let live = self.live_cell_metrics();
+        let snap = band_snapshot(
+            base,
+            usize::from(band.width),
+            usize::from(band.height),
+            text,
+        );
+        let damage = Damage {
+            generation: base.generation,
+            regions: vec![DamagedRegion::Grid(DamageRect::full(
+                band.height,
+                band.width,
+            ))]
+            .into_boxed_slice(),
+        };
+        let Ok(list) = self.renderer.render(&snap, &damage) else {
+            return false;
+        };
+        let frame_epoch = *built.atlas_epoch.get_or_insert(list.atlas_epoch);
+        if !list.is_atlas_epoch_valid(frame_epoch) && attempt < ATLAS_REBUILD_LIMIT {
+            return true;
+        }
+        let origin_x = px_add(pad_px, px_mul(band.x, live.width));
+        let origin_y = px_add(pad_px, px_mul(band.y, live.height));
+        built.needs_draw |= list.needs_draw();
+        for mut fill in list.fills {
+            fill.rect.x = px_add(fill.rect.x, origin_x);
+            fill.rect.y = px_add(fill.rect.y, origin_y);
+            built.fills.push(fill);
+            built.needs_draw = true;
+        }
+        for mut glyph in list.glyphs {
+            glyph.dest[0] = px_add(glyph.dest[0], origin_x);
+            glyph.dest[1] = px_add(glyph.dest[1], origin_y);
+            built.glyphs.push(glyph);
+            built.needs_draw = true;
+        }
+        false
     }
 
     /// Phase 3 (CTX-0474): build the retryable combined leaf primitive pass.
@@ -1205,10 +1298,13 @@ impl Runtime {
         // the same pass), so the whole leaf set is rebuilt when a reset is
         // observed, bounded by [`ATLAS_REBUILD_LIMIT`].
         let mut attempt = 0u8;
-        // Issue #1349: the in-grid status bar text for this frame (owned:
-        // the leaf loop below takes `&mut self`). `None` when opted out
-        // via `workspace.show_bar`.
-        let status_bar = self.status_bar_text();
+        // CTX-0873 (#1431): the workspace bar band for this frame (owned:
+        // the leaf loop below takes `&mut self`). `None` when no band is
+        // reserved (opted out, a lone workspace, or a too-small window).
+        let status_bar = basis
+            .bar_text
+            .as_deref()
+            .and_then(|text| self.status_bar_band().map(|band| (band, text.to_owned())));
         let built = loop {
             attempt += 1;
             let mut built = CombinedLeaves::default();
@@ -1392,7 +1488,7 @@ impl Runtime {
                     .unwrap_or(snapshot);
                 // Determine viewport snapshot: when view scroll_offset !=0,
                 // visible_cells composites scrollback.
-                let mut view_snapshot = if let Some(v) = view {
+                let view_snapshot = if let Some(v) = view {
                     // #1338 fail-closed: the alternate screen owns no
                     // scrollback view — a stale offset (scrolled on primary,
                     // then entered alt) must not composite primary history
@@ -1422,20 +1518,6 @@ impl Runtime {
                 } else {
                     viewport_snapshot(base_snap, frame.cols, frame.rows)
                 };
-
-                // Issue #1349: the in-grid status bar row overlays the last
-                // content row of this owned present copy — grid truth is
-                // never mutated. Skipped on the alternate screen (a
-                // fullscreen app owns every row there).
-                if let Some(bar) = status_bar.as_deref() {
-                    let leaf_on_alt = match self.pane_sessions.get(&view_id) {
-                        Some(sess) => sess.state.alt_screen_active(),
-                        None => self.state.alt_screen_active(),
-                    };
-                    if !leaf_on_alt {
-                        overlay_status_bar(&mut view_snapshot, bar);
-                    }
-                }
 
                 // A re-rendered leaf is redrawn in full. Sub-pane partial
                 // merges are deliberately not attempted: retained glyphs can
@@ -1520,6 +1602,21 @@ impl Runtime {
                 );
                 built.fills.extend(fills);
                 built.glyphs.extend(glyphs);
+            }
+
+            // CTX-0873 (#1431): the workspace bar paints into its own
+            // Core-reserved band, outside every leaf frame, so no terminal
+            // cell is ever occluded. Rendered inside the attempt so its
+            // glyph slots share the frame's atlas epoch (#1409). Not
+            // retained: the band is one short row and every change to its
+            // text or geometry already forces a full frame.
+            if !stale_epoch {
+                if let Some((band, text)) = status_bar.as_ref() {
+                    if self.push_status_bar_band(*band, text, snapshot, pad_px, attempt, &mut built)
+                    {
+                        stale_epoch = true;
+                    }
+                }
             }
 
             if stale_epoch {
@@ -2249,6 +2346,7 @@ impl Runtime {
             current_gen,
             cells_before,
             glyphs_before,
+            bar_text,
             ..
         } = basis;
         self.pending_full_redraw = false;
@@ -2266,7 +2364,7 @@ impl Runtime {
             self.mark_frame_presented(snapshot.generation);
             self.last_presented_allocations = allocations;
             self.last_presented_focus = focused;
-            self.last_presented_bar = self.status_bar_text();
+            self.last_presented_bar = bar_text;
             return None;
         }
 
@@ -2382,7 +2480,7 @@ impl Runtime {
             self.mark_frame_presented(snapshot.generation);
             self.last_presented_allocations = allocations;
             self.last_presented_focus = focused;
-            self.last_presented_bar = self.status_bar_text();
+            self.last_presented_bar = bar_text;
             return None;
         }
 
@@ -2417,7 +2515,7 @@ impl Runtime {
         self.mark_frame_presented(snapshot.generation);
         self.last_presented_allocations = allocations;
         self.last_presented_focus = focused;
-        self.last_presented_bar = self.status_bar_text();
+        self.last_presented_bar = bar_text;
         self.kitty_last_frame_images = kitty_blits;
         // CTX-0244: publish the presented headless frame for `frameHash`
         // digesting — only while a digest grant is live (zero clone cost
@@ -2493,6 +2591,9 @@ struct TickBasis {
     cells_before: u64,
     /// Renderer glyphs-emitted counter baseline for the stats delta.
     glyphs_before: u64,
+    /// Workspace bar text for this frame, formatted once per tick
+    /// (CTX-0873); `None` when the bar does not present.
+    bar_text: Option<String>,
 }
 
 /// Combined draw layers assembled by the present phases (CTX-0474).

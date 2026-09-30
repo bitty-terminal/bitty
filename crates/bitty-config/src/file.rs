@@ -1959,12 +1959,29 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
     // raw provider name; spelling is validated fail-closed via
     // `WorkspaceConfig::validate` (called by `plan.validate()` below),
     // and unknown provider names fail at apply time in `bitty-runtime`.
+    // CTX-0873: `bar.edge` is an exact lowercase spelling; unknown values
+    // fail closed with the field path, like `scrollbar.mode`.
     let workspace = match data.workspace {
         None => None,
-        Some(w) => Some(crate::types::WorkspaceConfig {
-            layout: w.layout,
-            show_bar: w.show_bar,
-        }),
+        Some(w) => {
+            let bar_edge = match w.bar_edge {
+                None => None,
+                Some(raw) => match crate::types::WorkspaceBarEdge::parse(raw.trim()) {
+                    Some(edge) => Some(edge),
+                    None => {
+                        return Err(ConfigError::validation(
+                            "workspace.bar.edge",
+                            "must be one of \"top\", \"bottom\"",
+                        ));
+                    }
+                },
+            };
+            Some(crate::types::WorkspaceConfig {
+                layout: w.layout,
+                show_bar: w.show_bar,
+                bar_edge,
+            })
+        }
     };
 
     let plan = ConfigPlan {
@@ -2509,6 +2526,47 @@ mod tests {
     }
 
     #[test]
+    fn lua_workspace_bar_edge_parse_and_validate() {
+        // CTX-0873: `workspace.bar.edge` accepts exactly "top"/"bottom";
+        // unknown spellings, wrong types, and unknown sub-keys fail closed
+        // naming the field.
+        use crate::types::WorkspaceBarEdge;
+        for (src, want) in [
+            (
+                r#"return { workspace = { bar = { edge = "top" } } }"#,
+                Some(WorkspaceBarEdge::Top),
+            ),
+            (
+                r#"return { workspace = { bar = { edge = "bottom" } } }"#,
+                Some(WorkspaceBarEdge::Bottom),
+            ),
+            (r#"return { workspace = { bar = {} } }"#, None),
+            (
+                r#"return { workspace = { show_bar = true, bar = { edge = "top" } } }"#,
+                Some(WorkspaceBarEdge::Top),
+            ),
+        ] {
+            let plan = parse_lua_config(src, &test_source()).expect(src);
+            assert_eq!(plan.workspace.expect("workspace").bar_edge, want, "{src}");
+        }
+        for bad in [
+            r#"return { workspace = { bar = { edge = "left" } } }"#,
+            r#"return { workspace = { bar = { edge = "TOP" } } }"#,
+            r#"return { workspace = { bar = { edge = 1 } } }"#,
+            r#"return { workspace = { bar = "top" } }"#,
+            r#"return { workspace = { bar = { size = 2 } } }"#,
+        ] {
+            let err = parse_lua_config(bad, &test_source()).expect_err(bad);
+            let msg = err.to_string();
+            assert!(msg.contains("workspace.bar"), "{bad}: {msg}");
+        }
+        assert_eq!(WorkspaceBarEdge::default(), WorkspaceBarEdge::Bottom);
+        for edge in [WorkspaceBarEdge::Top, WorkspaceBarEdge::Bottom] {
+            assert_eq!(WorkspaceBarEdge::parse(edge.as_str()), Some(edge));
+        }
+    }
+
+    #[test]
     fn lua_workspace_layout_parse_and_validate() {
         // CW-07: `workspace = { layout = "dwindle" }` parses to the plan;
         // absent table means "says nothing" (plan.workspace None so merge
@@ -2565,6 +2623,7 @@ mod tests {
             .expect("empty workspace parses");
         let ws = plan.workspace.expect("workspace present");
         assert!(ws.layout.is_none());
+        assert!(ws.bar_edge.is_none(), "absent bar says nothing");
         let plan = parse_lua_config(
             r#"return { terminal = { scrollback = 10000 } }"#,
             &test_source(),

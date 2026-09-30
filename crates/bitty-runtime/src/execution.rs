@@ -55,13 +55,18 @@
 //!   `JobEvent::CancelResolved` with a typed [`CancelOutcome`].
 //! - OOM evidence (CTX-0880, #1537): on Linux, a registry built with
 //!   [`JobRegistry::with_job_cgroups`] runs each job in its own cgroup v2
-//!   leaf under a delegated, dedicated job base ([`JobCgroups`], discovered
-//!   from `/proc/self/cgroup` plus the verified cgroup2 mount, or
-//!   injected). The leaf's `memory.events` `oom_kill` counter is read
-//!   before the spawn and after the tree is gone; only an advanced counter
-//!   plus a `SIGKILL` death yields `OomKilled`. The leader is placed right
-//!   after the spawn (no `pre_exec`: `bitty-pty` forbids `unsafe`), so
-//!   descendants forked before the placement are not accounted. Every
+//!   leaf under a dedicated job base inside a cgroup delegated to this
+//!   process ([`JobCgroups`]: discovered only as its own cgroup when that is
+//!   the cgroup-namespace root or carries systemd's `user.delegate` /
+//!   `trusted.delegate` marker, never an ancestor; or configured
+//!   explicitly with [`JobCgroups::under`]). The leaf's `memory.events`
+//!   `oom_kill` counter is read before the spawn and after the tree is
+//!   gone; only an advanced counter plus a `SIGKILL` death the host did not
+//!   cause yields `OomKilled` (after a host kill the outcome stays
+//!   `Signaled(9)` and the counter survives as evidence). The leader is
+//!   placed right after the spawn (no `pre_exec`: `bitty-pty` forbids
+//!   `unsafe`), so descendants forked before the placement are not
+//!   accounted. Every
 //!   snapshot reports [`OomEvidence`]; hosts without delegation, macOS,
 //!   and Windows record [`OomEvidence::Missing`] with a typed
 //!   [`OomEvidenceGap`] and keep [`OomVerdict::Unknown`]. A signal number
@@ -147,7 +152,7 @@ use std::process::{Command, Stdio};
 
 use bitty_ipc::execution::EnvPolicy;
 
-pub use cgroup::{CgroupUnavailable, JobCgroups, MAX_JOB_CGROUP_LEAVES};
+pub use cgroup::{CgroupUnavailable, JobCgroups, MAX_JOB_CGROUP_LEAVES, MAX_STALE_BASE_SWEEP};
 pub use command_risk::{HardDeny, OperationIntent, RiskTier, RiskVerdict, classify_argv};
 pub use delivery::{
     DeliveryState, EventClass, EventReplay, MAX_EVENT_REPLAY, MAX_STORED_CRITICAL_EVENTS,

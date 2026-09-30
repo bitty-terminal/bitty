@@ -3,11 +3,30 @@
 //! - Hosts without delegation (or registries built without cgroups) keep
 //!   `Unknown` evidence with a typed gap, and a SIGKILL death stays
 //!   `Signaled(9)`. These run everywhere.
-//! - With a real delegated subtree (Linux, discovered from this process's
-//!   own cgroup) a memory-limited job that allocates past its limit ends
-//!   `OomKilled`, a plain SIGKILL stays `Signaled(9)` with `NotOom`, and
-//!   every leaf is removed after its job. These skip with a printed reason
-//!   when no delegation exists (CI runners typically have none).
+//! - With a real delegated cgroup (Linux) a memory-limited job that
+//!   allocates past its limit ends `OomKilled`, a plain SIGKILL stays
+//!   `Signaled(9)` with `NotOom`, a host kill of an OOM-evidenced job stays
+//!   `Signaled(9)`, and every leaf is removed after its job. The delegated
+//!   cgroup comes from the test-only [`DELEGATED_CGROUP_ENV`] variable
+//!   (explicit configuration through `JobCgroups::under`) or, without it,
+//!   from `JobCgroups::discover` (a cgroup-namespace root or a cgroup with a
+//!   delegation marker). Nothing is ever created in a cgroup that was not
+//!   delegated. These skip with a printed reason otherwise (CI runners
+//!   typically have no delegation).
+//!
+//! Live run on a systemd host (the scope is delegated to the test; its
+//! processes move into a `runner` child so the scope may enable `memory`
+//! for the job base; `--expand-environment=no` keeps systemd-run from
+//! expanding `$$` itself):
+//!
+//! ```text
+//! systemd-run --user --scope -p Delegate=yes --expand-environment=no --quiet -- bash -c \
+//!   'cg="$(findmnt -n -t cgroup2 -o TARGET | head -n1)$(sed -n "s/^0:://p" /proc/self/cgroup)";
+//!    mkdir "$cg/runner" && echo $$ > "$cg/runner/cgroup.procs" &&
+//!    echo +memory > "$cg/cgroup.subtree_control" &&
+//!    BITTY_TEST_DELEGATED_CGROUP="$cg" exec cargo test -p bitty-runtime \
+//!      --test execution_job_cgroup_oom --locked -- --nocapture'
+//! ```
 //!
 //! Setting `memory.max` / `memory.swap.max` on a leaf is test-only: the
 //! runtime never sets job limits (CTX-0519 owns them). Children are this
@@ -24,6 +43,11 @@ use bitty_runtime::{
 };
 
 const HELPER_ENV: &str = "__BITTY_CGROUP_OOM_HELPER";
+
+/// Test-only: path of a cgroup delegated to this test run whose
+/// `cgroup.subtree_control` enables `memory` (see the module docs).
+#[cfg(target_os = "linux")]
+const DELEGATED_CGROUP_ENV: &str = "BITTY_TEST_DELEGATED_CGROUP";
 
 /// Marker the memory hog waits for before allocating (the test creates it
 /// once the leaf's limit is set).
@@ -243,17 +267,24 @@ fn a_base_without_kernel_counters_records_the_gap_and_still_spawns() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// The live, delegated half. Returns `None` (after printing why) when this
-/// host has no usable delegated cgroup v2 subtree.
+/// The live, delegated half. Returns `None` (after printing why) when no
+/// delegated cgroup is configured or discoverable.
 #[cfg(target_os = "linux")]
 fn delegated_registry(test: &str) -> Option<JobRegistry> {
-    match JobCgroups::discover() {
+    let cgroups = match std::env::var_os(DELEGATED_CGROUP_ENV) {
+        Some(parent) => JobCgroups::under(std::path::PathBuf::from(parent)),
+        None => JobCgroups::discover(),
+    };
+    match cgroups {
         Ok(cgroups) => {
             eprintln!("{test}: ran against delegated base {:?}", cgroups.base());
             Some(JobRegistry::with_job_cgroups(4, Ok(cgroups)))
         }
         Err(reason) => {
-            eprintln!("{test}: skipped, no delegated cgroup v2 subtree ({reason})");
+            eprintln!(
+                "{test}: skipped, no delegated cgroup ({reason}); set {DELEGATED_CGROUP_ENV} \
+                 inside a delegated scope to run it"
+            );
             None
         }
     }

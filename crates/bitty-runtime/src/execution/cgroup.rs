@@ -12,19 +12,40 @@
 //!
 //! # Delegated subtree discovery
 //!
-//! [`JobCgroups::discover`] derives the subtree from this process's own
-//! cgroup: the `0::` line of `/proc/self/cgroup` joined onto the cgroup2
+//! [`JobCgroups::discover`] only ever uses this process's own cgroup, and
+//! only when that cgroup was delegated to it. Writable is not delegated:
+//! systemd-managed slices are often owned by the user, yet moving processes
+//! out of the scope systemd placed them in breaks its bookkeeping. The own
+//! cgroup is the `0::` line of `/proc/self/cgroup` joined onto the cgroup2
 //! mount point found in `/proc/self/mountinfo` (the mount is verified, never
-//! assumed). Because of the cgroup v2 no-internal-processes rule, the
-//! process's own (populated) cgroup cannot host job leaves itself, so the
-//! parent that hosts them is the nearest of {own cgroup, its parent} whose
-//! `cgroup.subtree_control` enables `memory` and where a directory can be
-//! created. There a dedicated, empty job base (`bitty-jobs-<pid>-<seq>`) is
-//! created with `+memory` in its own `cgroup.subtree_control`, and one leaf
-//! per job (`job-<id>-<generation>`) is created under that base.
-//! [`JobCgroups::under`] injects the hosting parent directly. Hosts without
-//! a usable subtree get a typed [`CgroupUnavailable`] and run jobs without
-//! leaves.
+//! assumed), and it qualifies only when
+//!
+//! - it is the root of this process's cgroup namespace (`0::/`, the
+//!   container case), or
+//! - it carries the `user.delegate` or `trusted.delegate` extended attribute
+//!   with value `1` (the marker systemd writes on `Delegate=yes` units it
+//!   delegates; read through `rustix`'s safe `getxattr`).
+//!
+//! There is no fallback to the parent or any other ancestor. The qualifying
+//! cgroup must also already enable `memory` in its `cgroup.subtree_control`,
+//! which the cgroup v2 no-internal-processes rule allows only when its own
+//! processes live in a child cgroup; the delegator arranges that, this
+//! module never moves a process it did not spawn. A dedicated, empty job
+//! base (`bitty-jobs-<pid>-<seq>`) is created there with `+memory` in its
+//! own `cgroup.subtree_control`, and one leaf per job
+//! (`job-<id>-<generation>`) under that base.
+//!
+//! [`JobCgroups::under`] is the explicit-configuration path: the caller
+//! names a cgroup it knows is delegated (for example a `Delegate=yes`
+//! scope whose processes were moved into a child), and no marker is
+//! checked. Hosts without a usable subtree get a typed
+//! [`CgroupUnavailable`] and run jobs without leaves.
+//!
+//! Before creating its base, discovery (and [`JobCgroups::under`]) sweeps
+//! stale sibling bases left by a crashed process: only directories named
+//! exactly `bitty-jobs-<pid>-<seq>`, whose pid is not alive and whose
+//! `cgroup.events` reports `populated 0`, each with a single `rmdir`, and
+//! at most [`MAX_STALE_BASE_SWEEP`] entries examined.
 //!
 //! # Placement window (documented residual)
 //!
@@ -94,11 +115,27 @@ const RMDIR_ATTEMPTS: u32 = 50;
 /// asynchronously; the total bound is `RMDIR_ATTEMPTS * RMDIR_BACKOFF`).
 const RMDIR_BACKOFF: Duration = Duration::from_millis(10);
 
+/// Most directory entries one stale-base sweep examines (sibling entries
+/// of the hosting cgroup plus leaves inside stale bases), so a crowded
+/// cgroup never turns base creation into unbounded work.
+pub const MAX_STALE_BASE_SWEEP: usize = 256;
+
+/// Process table root used to tell whether a base's creator is alive
+/// (kernel ABI path).
+#[cfg(target_os = "linux")]
+const PROC_ROOT: &str = "/proc";
+
+/// Cgroup state file holding `populated 0|1`.
+const EVENTS_FILE: &str = "cgroup.events";
+
 /// Name prefix of the dedicated job base (`<prefix>-<pid>-<seq>`).
 const JOB_BASE_PREFIX: &str = "bitty-jobs";
 
 /// Name prefix of one job's leaf (`<prefix>-<id>-<generation>`).
 const LEAF_PREFIX: &str = "job";
+
+/// Hex digits of the generation in a leaf name (a zero-padded `u64`).
+const LEAF_GENERATION_HEX_DIGITS: usize = 16;
 
 /// The controller whose `memory.events` carries the evidence.
 const MEMORY_CONTROLLER: &str = "memory";
@@ -136,6 +173,9 @@ pub enum CgroupUnavailable {
     UnsupportedPlatform,
     /// No unified (`0::`) membership or no verified cgroup2 mount.
     NoUnifiedHierarchy,
+    /// This process's own cgroup was not delegated to it (not the cgroup
+    /// namespace root and no `user.delegate`/`trusted.delegate` marker).
+    NotDelegated,
     /// No candidate parent enables the `memory` controller for children.
     NoMemoryController,
     /// The job base could not be created (subtree not delegated to us).
@@ -149,6 +189,7 @@ impl CgroupUnavailable {
         match self {
             Self::UnsupportedPlatform => "unsupported_platform",
             Self::NoUnifiedHierarchy => "no_unified_hierarchy",
+            Self::NotDelegated => "not_delegated",
             Self::NoMemoryController => "no_memory_controller",
             Self::NotWritable => "not_writable",
         }
@@ -256,25 +297,17 @@ impl JobCgroups {
         self.lock_book().unremoved.len()
     }
 
-    /// Tries `own` and then its parent (inside `mount`) as the hosting
-    /// parent of the job base.
+    /// Uses the own cgroup `mount/relative` as the hosting parent when it
+    /// was delegated to this process (see the module docs); never an
+    /// ancestor.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn discover_from(mount: &Path, relative: &Path) -> Result<Self, CgroupUnavailable> {
         let own = mount.join(relative);
-        let mut candidates = vec![own.clone()];
-        if let Some(parent) = own.parent() {
-            if parent.starts_with(mount) {
-                candidates.push(parent.to_path_buf());
-            }
+        let namespace_root = relative.as_os_str().is_empty();
+        if !namespace_root && !carries_delegation_marker(&own) {
+            return Err(CgroupUnavailable::NotDelegated);
         }
-        let mut last = CgroupUnavailable::NoMemoryController;
-        for candidate in candidates {
-            match Self::create_base(candidate, MAX_JOB_CGROUP_LEAVES) {
-                Ok(cgroups) => return Ok(cgroups),
-                Err(reason) => last = reason,
-            }
-        }
-        Err(last)
+        Self::create_base(own, MAX_JOB_CGROUP_LEAVES)
     }
 
     /// Creates `<parent>/bitty-jobs-<pid>-<seq>` with `+memory` enabled for
@@ -284,6 +317,9 @@ impl JobCgroups {
     fn create_base(parent: PathBuf, max_leaves: usize) -> Result<Self, CgroupUnavailable> {
         if !delegates_memory(&parent) {
             return Err(CgroupUnavailable::NoMemoryController);
+        }
+        for stale in stale_bases(&parent) {
+            remove_stale_base(&stale);
         }
         let sequence = BASE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let base = parent.join(format!(
@@ -352,6 +388,91 @@ impl Drop for JobCgroups {
     }
 }
 
+/// Parses a job base name `bitty-jobs-<pid>-<seq>` exactly (no leading
+/// zeros, signs, or trailing text), returning the creator pid.
+fn parse_base_name(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix(JOB_BASE_PREFIX)?.strip_prefix('-')?;
+    let (pid, sequence) = rest.split_once('-')?;
+    let pid_value: u32 = pid.parse().ok()?;
+    let sequence_value: u64 = sequence.parse().ok()?;
+    (pid_value.to_string() == pid && sequence_value.to_string() == sequence).then_some(pid_value)
+}
+
+/// Whether `name` is exactly a job leaf name (`job-<id>-<16 hex digits>`).
+fn is_leaf_name(name: &str) -> bool {
+    let Some((id, generation)) = name
+        .strip_prefix(LEAF_PREFIX)
+        .and_then(|rest| rest.strip_prefix('-'))
+        .and_then(|rest| rest.split_once('-'))
+    else {
+        return false;
+    };
+    id.parse::<u64>().is_ok_and(|value| value.to_string() == id)
+        && generation.len() == LEAF_GENERATION_HEX_DIGITS
+        && generation
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Whether process `pid` exists in this process's pid namespace.
+#[cfg(target_os = "linux")]
+fn process_alive(pid: u32) -> bool {
+    Path::new(PROC_ROOT).join(pid.to_string()).exists()
+}
+
+/// Off Linux no base is ever created, so nothing is ever stale.
+#[cfg(not(target_os = "linux"))]
+fn process_alive(_pid: u32) -> bool {
+    true
+}
+
+/// Whether the cgroup `dir` reports `populated 0` (no process in it or
+/// any descendant). An unreadable file is "populated" (fail closed).
+fn cgroup_unpopulated(dir: &Path) -> bool {
+    read_bounded(&dir.join(EVENTS_FILE), MAX_CONTROL_FILE_BYTES).is_ok_and(|text| {
+        text.lines()
+            .any(|line| line.split_ascii_whitespace().eq(["populated", "0"]))
+    })
+}
+
+/// Stale sibling job bases under `parent`: named exactly like ours, created
+/// by a pid that is neither this process nor alive, and unpopulated.
+/// Examines at most [`MAX_STALE_BASE_SWEEP`] entries.
+fn stale_bases(parent: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    let own = std::process::id();
+    entries
+        .take(MAX_STALE_BASE_SWEEP)
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .and_then(parse_base_name)
+                .is_some_and(|pid| pid != own && !process_alive(pid))
+        })
+        .map(|entry| entry.path())
+        .filter(|dir| dir.is_dir() && cgroup_unpopulated(dir))
+        .collect()
+}
+
+/// Removes one stale base: a single `rmdir` per exactly-named leaf inside
+/// it (bounded by [`MAX_STALE_BASE_SWEEP`]), then a single `rmdir` of the
+/// base. Anything else inside keeps the base in place.
+fn remove_stale_base(base: &Path) {
+    if let Ok(entries) = fs::read_dir(base) {
+        for entry in entries.take(MAX_STALE_BASE_SWEEP).filter_map(Result::ok) {
+            let is_leaf = entry.file_name().to_str().is_some_and(is_leaf_name);
+            if is_leaf && entry.path().is_dir() {
+                let _ = fs::remove_dir(entry.path());
+            }
+        }
+    }
+    let _ = fs::remove_dir(base);
+}
+
 /// `rmdir` with [`RMDIR_ATTEMPTS`] bounded attempts; a missing directory
 /// counts as removed.
 fn remove_dir_bounded(dir: &Path) -> bool {
@@ -380,6 +501,37 @@ fn read_bounded(path: &Path, max: usize) -> io::Result<String> {
         ));
     }
     Ok(text)
+}
+
+/// Extended attributes systemd writes on cgroups it delegates.
+#[cfg(target_os = "linux")]
+const DELEGATION_XATTRS: [&str; 2] = ["user.delegate", "trusted.delegate"];
+
+/// Value of a set delegation marker.
+#[cfg(target_os = "linux")]
+const DELEGATION_MARKER_VALUE: &[u8] = b"1";
+
+/// Largest delegation marker value read (the real value is one byte).
+#[cfg(target_os = "linux")]
+const MAX_XATTR_VALUE_BYTES: usize = 16;
+
+/// Whether `dir` carries a delegation marker (`user.delegate` or
+/// `trusted.delegate` = `1`). Read through `rustix`'s safe `getxattr`;
+/// any error (absent attribute, unsupported filesystem, over-long value)
+/// is "not delegated".
+#[cfg(target_os = "linux")]
+fn carries_delegation_marker(dir: &Path) -> bool {
+    DELEGATION_XATTRS.iter().any(|name| {
+        let mut value = [0u8; MAX_XATTR_VALUE_BYTES];
+        rustix::fs::getxattr(dir, *name, &mut value[..])
+            .is_ok_and(|len| value.get(..len) == Some(DELEGATION_MARKER_VALUE))
+    })
+}
+
+/// No extended-attribute delegation marker off Linux.
+#[cfg(not(target_os = "linux"))]
+fn carries_delegation_marker(_dir: &Path) -> bool {
+    false
 }
 
 /// Whether `dir`'s `cgroup.subtree_control` enables `memory`.
@@ -634,6 +786,14 @@ mod tests {
         dir
     }
 
+    /// Drops a fake-cgroupfs `JobCgroups` quickly: a real cgroupfs has no
+    /// removable files, but the fake base holds the control file
+    /// `create_base` wrote, which would keep its `rmdir` failing.
+    fn drop_fake(cgroups: JobCgroups) {
+        let _ = fs::remove_file(cgroups.base().join(SUBTREE_CONTROL_FILE));
+        drop(cgroups);
+    }
+
     fn fake_cgroups(tag: &str, subtree: &str, max_leaves: usize) -> (PathBuf, JobCgroups) {
         let root = fake_root(tag);
         fs::write(root.join(SUBTREE_CONTROL_FILE), subtree).expect("subtree_control");
@@ -678,6 +838,87 @@ mod tests {
     fn leaf_names_derive_from_ids() {
         assert_eq!(leaf_name(7, 0xab), "job-7-00000000000000ab");
         assert_ne!(leaf_name(1, 2), leaf_name(1, 3));
+        assert!(is_leaf_name(&leaf_name(7, u64::MAX)));
+        for other in [
+            "job-7-ab",
+            "job-07-00000000000000ab",
+            "job-7-00000000000000AB",
+            "jobs",
+        ] {
+            assert!(!is_leaf_name(other), "{other}");
+        }
+    }
+
+    /// A pid above the kernel's `PID_MAX_LIMIT` (2^22): never alive.
+    const NEVER_ALIVE_PID: u32 = (1 << 22) + 1;
+
+    #[test]
+    fn base_names_parse_exactly() {
+        assert_eq!(parse_base_name("bitty-jobs-42-0"), Some(42));
+        for other in [
+            "bitty-jobs-042-0",
+            "bitty-jobs-42-00",
+            "bitty-jobs-+42-0",
+            "bitty-jobs-42",
+            "bitty-jobs-42-0-x",
+            "bitty-jobsx-42-0",
+            "other-42-0",
+        ] {
+            assert_eq!(parse_base_name(other), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn the_sweep_selects_only_dead_unpopulated_bases_of_our_naming() {
+        let parent = fake_root("sweep");
+        let make = |name: &str, populated: Option<&str>| {
+            let dir = parent.join(name);
+            fs::create_dir(&dir).expect("fake base");
+            if let Some(populated) = populated {
+                fs::write(
+                    dir.join(EVENTS_FILE),
+                    format!("populated {populated}\nfrozen 0\n"),
+                )
+                .expect("events");
+            }
+            dir
+        };
+        let stale = make(&format!("bitty-jobs-{NEVER_ALIVE_PID}-3"), Some("0"));
+        make(&format!("bitty-jobs-{NEVER_ALIVE_PID}-4"), Some("1"));
+        make(&format!("bitty-jobs-{NEVER_ALIVE_PID}-5"), None);
+        make(&format!("bitty-jobs-{}-0", std::process::id()), Some("0"));
+        make(&format!("bitty-jobs-0{NEVER_ALIVE_PID}-0"), Some("0"));
+        make("unrelated.scope", Some("0"));
+        #[cfg(target_os = "linux")]
+        {
+            // Pid 1 always exists in this pid namespace.
+            make("bitty-jobs-1-0", Some("0"));
+            assert_eq!(stale_bases(&parent), vec![stale.clone()]);
+        }
+        // A real cgroupfs base holds only kernel files and removes with a
+        // single rmdir; the fake one keeps its events file, so the removal
+        // leaves it in place (the leaf inside is still removed).
+        let leaf = stale.join(leaf_name(9, 9));
+        fs::create_dir(&leaf).expect("stale leaf");
+        let foreign = stale.join("not-a-leaf");
+        fs::create_dir(&foreign).expect("foreign dir");
+        remove_stale_base(&stale);
+        assert!(!leaf.exists(), "exactly-named leaves are removed");
+        assert!(foreign.exists(), "other directories are never touched");
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn the_sweep_is_bounded() {
+        let parent = fake_root("sweep-bound");
+        for sequence in 0..MAX_STALE_BASE_SWEEP + 8 {
+            let dir = parent.join(format!("bitty-jobs-{NEVER_ALIVE_PID}-{sequence}"));
+            fs::create_dir(&dir).expect("fake base");
+            fs::write(dir.join(EVENTS_FILE), "populated 0\n").expect("events");
+        }
+        #[cfg(target_os = "linux")]
+        assert!(stale_bases(&parent).len() <= MAX_STALE_BASE_SWEEP);
+        let _ = fs::remove_dir_all(parent);
     }
 
     #[test]
@@ -697,32 +938,94 @@ mod tests {
     }
 
     #[test]
-    fn discovery_tries_the_own_cgroup_then_its_parent() {
+    fn discovery_refuses_an_undelegated_own_cgroup_and_never_uses_the_parent() {
         let mount = fake_root("discover");
         let own = mount.join("slice").join("own.scope");
         fs::create_dir_all(&own).expect("own cgroup");
-        // Only the parent delegates memory (the own cgroup holds processes).
+        // Both the parent and the own cgroup look writable with memory, but
+        // neither carries a delegation marker.
         fs::write(
             mount.join("slice").join(SUBTREE_CONTROL_FILE),
             "memory pids",
         )
         .expect("parent subtree_control");
-        let cgroups = JobCgroups::discover_from(&mount, Path::new("slice/own.scope"))
-            .expect("parent hosts the base");
-        assert_eq!(cgroups.base().parent(), Some(mount.join("slice").as_path()));
+        fs::write(own.join(SUBTREE_CONTROL_FILE), "memory").expect("own subtree_control");
+        assert_eq!(
+            JobCgroups::discover_from(&mount, Path::new("slice/own.scope")).map(drop),
+            Err(CgroupUnavailable::NotDelegated)
+        );
+        let created = fs::read_dir(mount.join("slice"))
+            .expect("parent readable")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(JOB_BASE_PREFIX)
+            })
+            .count();
+        assert_eq!(created, 0, "nothing is created in an undelegated parent");
+        assert_eq!(
+            fs::read_dir(&own)
+                .expect("own readable")
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().is_dir())
+                .count(),
+            0,
+            "nothing is created in an undelegated own cgroup"
+        );
+        let _ = fs::remove_dir_all(mount);
+    }
+
+    #[test]
+    fn discovery_accepts_the_namespace_root() {
+        let mount = fake_root("nsroot");
+        fs::write(mount.join(SUBTREE_CONTROL_FILE), "memory").expect("root subtree_control");
+        let cgroups = JobCgroups::discover_from(&mount, Path::new("")).expect("namespace root");
+        assert_eq!(cgroups.base().parent(), Some(mount.as_path()));
         assert_eq!(
             fs::read_to_string(cgroups.base().join(SUBTREE_CONTROL_FILE)).expect("enabled"),
             "+memory"
         );
-        drop(cgroups);
-        let none = fake_root("discover-none");
-        fs::create_dir_all(none.join("a")).expect("own cgroup");
+        drop_fake(cgroups);
+        let _ = fs::remove_dir_all(mount);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn discovery_accepts_an_own_cgroup_with_a_delegation_marker() {
+        let mount = fake_root("marked");
+        let own = mount.join("app.slice").join("delegated.scope");
+        fs::create_dir_all(&own).expect("own cgroup");
+        fs::write(own.join(SUBTREE_CONTROL_FILE), "memory").expect("own subtree_control");
+        let marked = rustix::fs::setxattr(
+            &own,
+            DELEGATION_XATTRS[0],
+            DELEGATION_MARKER_VALUE,
+            rustix::fs::XattrFlags::empty(),
+        );
+        if marked.is_err() {
+            eprintln!("delegation marker test skipped: temp filesystem has no user xattrs");
+            let _ = fs::remove_dir_all(mount);
+            return;
+        }
+        let cgroups = JobCgroups::discover_from(&mount, Path::new("app.slice/delegated.scope"))
+            .expect("a marked own cgroup is delegated");
+        assert_eq!(cgroups.base().parent(), Some(own.as_path()));
+        drop_fake(cgroups);
+        // A marker with any other value is not a delegation.
+        rustix::fs::setxattr(
+            &own,
+            DELEGATION_XATTRS[0],
+            b"0",
+            rustix::fs::XattrFlags::empty(),
+        )
+        .expect("rewrite marker");
         assert_eq!(
-            JobCgroups::discover_from(&none, Path::new("a")).map(drop),
-            Err(CgroupUnavailable::NoMemoryController)
+            JobCgroups::discover_from(&mount, Path::new("app.slice/delegated.scope")).map(drop),
+            Err(CgroupUnavailable::NotDelegated)
         );
         let _ = fs::remove_dir_all(mount);
-        let _ = fs::remove_dir_all(none);
     }
 
     #[test]

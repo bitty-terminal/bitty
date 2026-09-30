@@ -10,11 +10,13 @@
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use bitty_lua::LuaValue;
 use bitty_plugin_host::manifest::PluginId;
 use bitty_runtime::plugin_runtime::{
-    LifecycleState, PluginRuntime, PluginRuntimeConfig, SettingsSource, SnapshotSource,
+    FileSystem, LifecycleState, NativeFileSystem, PluginRuntime, PluginRuntimeConfig, PluginStore,
+    SettingsSource, SnapshotSource,
 };
 use std::collections::BTreeMap;
 
@@ -483,5 +485,110 @@ return {}
             .with_store(|store| store.get("opt_nil")),
         Some(LuaValue::Bool(true))
     );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Injected commit latency for the disk-backed regression (bitty #1518).
+///
+/// Past the 50 ms RC-1 wall-clock budget on its own, so a callback that is
+/// still charged for its store commit always fails.
+const SLOW_COMMIT_MS: u64 = 60;
+
+/// Native filesystem whose atomic rename (the store commit point) is slow,
+/// standing in for a scanned Windows CI filesystem without real slow disks.
+#[derive(Debug)]
+struct SlowCommitFs;
+
+impl FileSystem for SlowCommitFs {
+    fn create_dir_all(&self, path: &Path) -> std::io::Result<()> {
+        NativeFileSystem.create_dir_all(path)
+    }
+    fn write_file(&self, path: &Path, data: &[u8]) -> std::io::Result<()> {
+        NativeFileSystem.write_file(path, data)
+    }
+    fn sync_file(&self, path: &Path) -> std::io::Result<()> {
+        NativeFileSystem.sync_file(path)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        std::thread::sleep(std::time::Duration::from_millis(SLOW_COMMIT_MS));
+        NativeFileSystem.rename(from, to)
+    }
+    fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+        NativeFileSystem.remove_file(path)
+    }
+    fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+        NativeFileSystem.read_to_string(path)
+    }
+    fn metadata_len(&self, path: &Path) -> std::io::Result<u64> {
+        NativeFileSystem.metadata_len(path)
+    }
+    fn exists(&self, path: &Path) -> bool {
+        NativeFileSystem.exists(path)
+    }
+}
+
+#[test]
+fn slow_disk_store_commit_does_not_fail_cross_vm_service_call() {
+    // bitty #1518: the provider's `bitty.store.set` commits to a disk-backed
+    // store slower than the RC-1 wall-clock budget. The committed write is
+    // credited out of both callbacks' wall clocks, so the consumer still
+    // receives the value and nothing reports the error sentinel.
+    let root = temp_dir("slow-disk");
+    let third = root.join("third");
+    let state = root.join("state");
+    write_service_plugin(
+        &third,
+        "xuepoo.calc",
+        &calc_manifest(),
+        &["xuepoo.calc:ping"],
+        CALC_INIT,
+    );
+    write_service_plugin(
+        &third,
+        "xuepoo.broken",
+        BROKEN_MANIFEST,
+        &["xuepoo.broken:ping"],
+        BROKEN_INIT,
+    );
+    write_service_plugin(
+        &third,
+        "xuepoo.shop",
+        SHOP_MANIFEST,
+        &["xuepoo.shop:total"],
+        SHOP_INIT,
+    );
+    let mut rt = PluginRuntime::new(PluginRuntimeConfig {
+        safe_mode: false,
+        data_dir: Some(state.clone()),
+        store_root: None,
+        bundled_roots: Vec::new(),
+        third_party_roots: vec![third],
+        settings: Rc::new(MapSettings::default()),
+        snapshot: Rc::new(StaticSnapshot),
+    });
+    rt.set_store_filesystem(Arc::new(SlowCommitFs));
+    rt.discover();
+    rt.activate(&calc_id()).expect("provider activates");
+    rt.activate(&broken_id())
+        .expect("broken provider activates");
+    rt.activate(&shop_id()).expect("consumer activates");
+
+    assert_eq!(store_int(&rt, &shop_id(), "sum"), Some(5));
+    assert_eq!(
+        store_string(&rt, &shop_id(), "code"),
+        Some("NONE".to_string())
+    );
+    assert_eq!(
+        rt.dispatch_command(&shop_id(), "total", &[])
+            .expect("dispatch"),
+        LuaValue::Integer(30)
+    );
+    assert_eq!(store_int(&rt, &calc_id(), "calls"), Some(2));
+
+    // The committed provider value is persisted and readable from disk.
+    let reloaded =
+        PluginStore::load(state.join("xuepoo.calc").join("store.json")).expect("reload store");
+    assert_eq!(reloaded.get("calls"), Some(LuaValue::Integer(2)));
+
     let _ = std::fs::remove_dir_all(&root);
 }

@@ -8,6 +8,7 @@ use std::time::Duration;
 use bitty_lua::gate::{VmBudgets, build_plugin_vm};
 use bitty_lua::{
     BoundedExecution, BridgeError, HostServices, LuaValue, LuaVm, MarshallingLimits, ServiceRoute,
+    SuspendReason,
 };
 
 /// Gate-built VM with default RC budgets (replaces deprecated `LuaVm::new`).
@@ -1464,4 +1465,207 @@ fn services_call_propagates_provider_failure() {
         "E_SERVICE_GONE",
     );
     assert_eq!(services.calls.borrow().len(), 1);
+}
+
+/// Margin past a budget so a charged delay is over it on any scheduler.
+const BUDGET_MARGIN_MS: u64 = 10;
+
+/// Store backend with injected commit latency (bitty #1518).
+///
+/// `store_delay_ms` is spent inside the write before it commits (or fails,
+/// when `fail_writes` is set); `notify_delay_ms` is non-store host work on a
+/// mutating path that is never credited.
+#[derive(Default)]
+struct LatencyServices {
+    store: RefCell<BTreeMap<String, LuaValue>>,
+    store_delay_ms: u64,
+    fail_writes: bool,
+    notify_delay_ms: u64,
+}
+
+impl HostServices for LatencyServices {
+    fn store_get(&self, key: &str) -> Result<Option<LuaValue>, BridgeError> {
+        Ok(self.store.borrow().get(key).cloned())
+    }
+
+    fn store_set(&self, key: &str, value: LuaValue) -> Result<(), BridgeError> {
+        if key.starts_with("slow") {
+            std::thread::sleep(Duration::from_millis(self.store_delay_ms));
+            if self.fail_writes {
+                return Err(BridgeError::new(
+                    "runtime",
+                    "E_STORE_IO",
+                    "could not commit the plugin state file",
+                ));
+            }
+        }
+        self.store.borrow_mut().insert(key.to_string(), value);
+        Ok(())
+    }
+
+    fn settings_get(&self, _key: &str) -> Result<Option<LuaValue>, BridgeError> {
+        Ok(None)
+    }
+
+    fn terminal_snapshot(&self, _scope: &str) -> Result<LuaValue, BridgeError> {
+        Err(BridgeError::capability_denied("terminal.semantic-read"))
+    }
+
+    fn notify_show(&self, _payload: &LuaValue) -> Result<bool, BridgeError> {
+        std::thread::sleep(Duration::from_millis(self.notify_delay_ms));
+        Ok(true)
+    }
+}
+
+/// Lua work after a delay that crosses several `SLICE_FUEL` slice
+/// boundaries, so the RC-1 wall check runs before the chunk completes.
+const CROSS_SLICES: &str = "local n = 0 for i = 1, 20000 do n = n + i end";
+
+fn latency_vm(tag: &str, services: &Rc<LatencyServices>) -> LuaVm {
+    let mut vm = gate_vm(tag);
+    let services: Rc<dyn HostServices> = services.clone();
+    vm.install_host_module(
+        services,
+        MarshallingLimits::default(),
+        bitty_lua::RC1_WALL_CLOCK_BUDGET_MS,
+    )
+    .expect("install");
+    vm
+}
+
+/// Run `chunk` with every `CROSS_SLICES` placeholder expanded.
+fn run_latency(vm: &mut LuaVm, chunk: &str) -> BoundedExecution {
+    vm.execute_bounded(&chunk.replace("CROSS_SLICES", CROSS_SLICES))
+        .expect("execute")
+}
+
+fn stored(services: &LatencyServices, key: &str) -> Option<LuaValue> {
+    services.store.borrow().get(key).cloned()
+}
+
+#[test]
+fn committed_store_write_slower_than_rc1_does_not_suspend_callback() {
+    // bitty #1518: one committed write longer than the whole RC-1 wall
+    // budget. Its time is credited, so the callback keeps running, and the
+    // value is committed and readable.
+    let services = Rc::new(LatencyServices {
+        store_delay_ms: bitty_lua::RC1_WALL_CLOCK_BUDGET_MS + BUDGET_MARGIN_MS,
+        ..LatencyServices::default()
+    });
+    let mut vm = latency_vm("slow-commit", &services);
+    let outcome = run_latency(
+        &mut vm,
+        r#"
+            local ok = pcall(bitty.store.set, "slow", "v")
+            CROSS_SLICES
+            bitty.store.set("after", ok and "OK" or "ERR")
+            bitty.store.set("read", bitty.store.get("slow"))
+        "#,
+    );
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        stored(&services, "slow"),
+        Some(LuaValue::String("v".into()))
+    );
+    assert_eq!(
+        stored(&services, "after"),
+        Some(LuaValue::String("OK".into()))
+    );
+    assert_eq!(
+        stored(&services, "read"),
+        Some(LuaValue::String("v".into()))
+    );
+}
+
+#[test]
+fn non_store_host_work_still_hits_rc1_wall_clock() {
+    // The credit covers committed store writes only: the same latency on a
+    // non-store host call is charged and the callback suspends.
+    let services = Rc::new(LatencyServices {
+        notify_delay_ms: bitty_lua::RC1_WALL_CLOCK_BUDGET_MS + BUDGET_MARGIN_MS,
+        ..LatencyServices::default()
+    });
+    let mut vm = latency_vm("slow-notify", &services);
+    let outcome = run_latency(
+        &mut vm,
+        r#"
+            bitty.store.set("before", true)
+            bitty.notify.show({ title = "t", body = "b" })
+            CROSS_SLICES
+            bitty.store.set("after", true)
+        "#,
+    );
+    assert!(
+        matches!(
+            outcome,
+            BoundedExecution::Suspended(SuspendReason::WallClockExceeded { .. })
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(stored(&services, "before"), Some(LuaValue::Bool(true)));
+    assert_eq!(stored(&services, "after"), None);
+}
+
+#[test]
+fn failed_slow_store_write_is_charged() {
+    // A write that commits nothing earns no credit: its latency is charged.
+    let services = Rc::new(LatencyServices {
+        store_delay_ms: bitty_lua::RC1_WALL_CLOCK_BUDGET_MS + BUDGET_MARGIN_MS,
+        fail_writes: true,
+        ..LatencyServices::default()
+    });
+    let mut vm = latency_vm("slow-fail", &services);
+    let outcome = run_latency(
+        &mut vm,
+        r#"
+            pcall(bitty.store.set, "slow", "v")
+            CROSS_SLICES
+            bitty.store.set("after", true)
+        "#,
+    );
+    assert!(
+        matches!(
+            outcome,
+            BoundedExecution::Suspended(SuspendReason::WallClockExceeded { .. })
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(stored(&services, "slow"), None);
+    assert_eq!(stored(&services, "after"), None);
+}
+
+#[test]
+fn store_commit_credit_is_capped_per_callback() {
+    // A commit past the credit cap plus the RC-1 budget still suspends the
+    // callback after it returns; the committed value stays committed.
+    let services = Rc::new(LatencyServices {
+        store_delay_ms: bitty_lua::STORE_COMMIT_CREDIT_MAX_MS
+            + bitty_lua::RC1_WALL_CLOCK_BUDGET_MS
+            + BUDGET_MARGIN_MS,
+        ..LatencyServices::default()
+    });
+    let mut vm = latency_vm("credit-cap", &services);
+    let outcome = run_latency(
+        &mut vm,
+        r#"
+            bitty.store.set("slow", "v")
+            CROSS_SLICES
+            bitty.store.set("after", true)
+        "#,
+    );
+    assert!(
+        matches!(
+            outcome,
+            BoundedExecution::Suspended(SuspendReason::WallClockExceeded { .. })
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        stored(&services, "slow"),
+        Some(LuaValue::String("v".into()))
+    );
+    assert_eq!(stored(&services, "after"), None);
 }

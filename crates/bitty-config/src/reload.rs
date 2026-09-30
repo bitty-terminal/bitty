@@ -111,6 +111,8 @@ impl std::fmt::Display for ReloadClass {
 /// | `leader_timeout_ms`       | Live               |
 /// | `hints_enabled`           | Live               |
 /// | `keymaps`                 | Live               |
+/// | `workspace.show_bar`      | Live               |
+/// | `workspace.bar.edge`      | Live               |
 /// | `terminal.scrollback`     | RestartRequired    |
 /// | `terminal.shell`          | RestartRequired    |
 /// | `terminal.scroll_lines_per_notch` | RestartRequired |
@@ -179,7 +181,11 @@ pub fn classify_field(field: &str) -> ReloadClass {
         | "leader_key"
         | "leader_timeout_ms"
         | "hints_enabled"
-        | "keymaps" => ReloadClass::Live,
+        | "keymaps"
+        // CTX-0873: the bar band is presentation chrome; the runtime
+        // re-solves the band and reflows in place (no PTY recreation).
+        | "workspace.show_bar"
+        | "workspace.bar.edge" => ReloadClass::Live,
         "terminal.scrollback"
         | "terminal.shell"
         | "terminal.scroll_lines_per_notch"
@@ -454,6 +460,27 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
         "workspace.layout",
         old.workspace.layout.clone().unwrap_or_default(),
         new.workspace.layout.clone().unwrap_or_default(),
+    );
+    // CTX-0873: bar visibility and edge are adopted live
+    // (`Runtime::set_workspaceline_visible` / `set_workspace_bar_edge`
+    // re-solve the chrome band and reflow).
+    push_if_changed(
+        "workspace.show_bar",
+        old.workspace.show_bar.unwrap_or(true).to_string(),
+        new.workspace.show_bar.unwrap_or(true).to_string(),
+    );
+    push_if_changed(
+        "workspace.bar.edge",
+        old.workspace
+            .bar_edge
+            .unwrap_or_default()
+            .as_str()
+            .to_string(),
+        new.workspace
+            .bar_edge
+            .unwrap_or_default()
+            .as_str()
+            .to_string(),
     );
     // CTX-0181: scrollbar chrome is adopted at startup (RuntimeConfig is
     // built once from the effective config), so changes are
@@ -862,6 +889,24 @@ mod tests {
     }
 
     #[test]
+    fn diff_workspace_bar_edge_and_show_bar_are_live() {
+        use crate::types::WorkspaceBarEdge;
+        let old = EffectiveConfig::default();
+        let mut new = old.clone();
+        new.workspace.bar_edge = Some(WorkspaceBarEdge::Top);
+        new.workspace.show_bar = Some(false);
+        let report = diff(&old, &new);
+        assert!(report.is_live(), "{report:?}");
+        let fields: Vec<&str> = report.diffs.iter().map(|d| d.field.as_str()).collect();
+        assert_eq!(fields, ["workspace.show_bar", "workspace.bar.edge"]);
+        // Explicit values equal to the defaults are no diff.
+        let mut same = old.clone();
+        same.workspace.bar_edge = Some(WorkspaceBarEdge::Bottom);
+        same.workspace.show_bar = Some(true);
+        assert!(diff(&old, &same).diffs.is_empty());
+    }
+
+    #[test]
     fn fallback_forces_safe_decoration() {
         // CTX-0292/CTX-0333: safe mode inverts decoration to 0/0/1/0/0
         // regardless of the (non-zero) built-in defaults; every other field
@@ -951,6 +996,9 @@ mod tests {
             ReloadClass::RestartRequired
         );
         assert_eq!(classify_field("workspace"), ReloadClass::RestartRequired);
+        // CTX-0873: bar visibility and edge re-solve the chrome band live.
+        assert_eq!(classify_field("workspace.show_bar"), ReloadClass::Live);
+        assert_eq!(classify_field("workspace.bar.edge"), ReloadClass::Live);
         // CTX-0223: padding/opacity are Live — the running instance adopts
         // them without restart (`Runtime::set_window_padding` re-derives the
         // grid in place; `WindowHandle::set_opacity` retoggles the winit

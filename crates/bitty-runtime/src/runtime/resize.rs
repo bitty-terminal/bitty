@@ -211,7 +211,7 @@ impl Runtime {
         Ok(())
     }
 
-    /// Pixel extent the combined frame's plan covers: container cells at the
+    /// Pixel extent the combined frame's plan covers: window cells at the
     /// live (DPI-scaled) cell metrics, plus the window padding inset on
     /// every side (CTX-0223).
     ///
@@ -223,9 +223,11 @@ impl Runtime {
     /// #232 alongside the unscaled surface/grid/atlas). Tick translates all
     /// content by the padding origin, so the plan spans the window extent.
     pub fn present_plan_extent(&self) -> bitty_render::geometry::ExtentPx {
+        // CTX-0873: the plan spans the whole window grid, chrome band
+        // included (the band paints inside the plan, outside the container).
         let grid = self.live_cell_metrics().extent_for(
-            usize::from(self.container.width),
-            usize::from(self.container.height),
+            usize::from(self.window_cells.width),
+            usize::from(self.window_cells.height),
         );
         let inset = u64::from(self.window_padding_physical()).saturating_mul(2);
         let width = u64::from(grid.width)
@@ -418,7 +420,38 @@ impl Runtime {
         // inside the Window. The container is set first so `present_frames`
         // can derive the decorated content frame; resizing state to it emits
         // full damage (grid + scrollback reflow) with a new generation.
-        self.container = default_container(cols, rows);
+        //
+        // CTX-0873 (#1431): the window grid is recorded as `window_cells`;
+        // the layout container is that grid minus the Core-owned chrome
+        // band (workspace bar), so every leaf, the primary grid, and every
+        // PTY winsize exclude the band through this one reflow path.
+        self.window_cells = default_container(cols, rows);
+        self.reflow_content_to_chrome();
+        // Surface resize: real GPU path when attached, else headless
+        if let Some(gpu) = self.gpu.as_ref() {
+            self.surface
+                .resize(gpu, surface_extent)
+                .map_err(RuntimeError::from)?;
+        } else {
+            self.surface
+                .headless_resize(surface_extent)
+                .map_err(RuntimeError::from)?;
+        }
+        self.resize_primary_pty()?;
+        self.pending_full_redraw = true;
+        Ok(())
+    }
+
+    /// Re-derives the layout container from `window_cells` minus the
+    /// chrome band and reflows primary grid, leaves, pane sessions,
+    /// selection, and search to it (CTX-0873). Infallible: surface and
+    /// primary PTY resizes stay with the callers.
+    pub(super) fn reflow_content_to_chrome(&mut self) {
+        self.container = self.chrome_layout().container;
+        let fallback = (
+            usize::from(self.container.width).max(1),
+            usize::from(self.container.height).max(1),
+        );
         let (cols, rows) = {
             let frames = self.present_frames();
             self.primary_view
@@ -429,7 +462,7 @@ impl Runtime {
                         usize::from(frame.rows.max(1)),
                     )
                 })
-                .unwrap_or((cols.max(1), rows.max(1)))
+                .unwrap_or(fallback)
         };
         let _damage = self.state.resize(cols, rows);
         self.cols = cols;
@@ -453,6 +486,12 @@ impl Runtime {
         // CTX-0176: the container moved, so every pane session's grid +
         // PTY winsize follows its leaf (primary state/PTY handled below).
         self.sync_pane_geometry();
+        self.clamp_view_bindings_to_geometry();
+    }
+
+    /// Re-clamps the live selection and search matches after a geometry
+    /// change (shared by the window reflow and the chrome-band refresh).
+    pub(super) fn clamp_view_bindings_to_geometry(&mut self) {
         // Clamp selection to the owner's new snapshot bounds (keeps
         // invariants after reflow; wide-char snapping is preserved). Headless
         // so deterministic. CTX-0803 (#1476): the bound is the *owner's* grid,
@@ -485,22 +524,15 @@ impl Runtime {
         if self.search_state.is_active() {
             self.search_refresh();
         }
-        // Surface resize: real GPU path when attached, else headless
-        if let Some(gpu) = self.gpu.as_ref() {
-            self.surface
-                .resize(gpu, surface_extent)
-                .map_err(RuntimeError::from)?;
-        } else {
-            self.surface
-                .headless_resize(surface_extent)
-                .map_err(RuntimeError::from)?;
-        }
+    }
+
+    /// Resizes the primary PTY winsize to the primary grid (`cols`/`rows`).
+    pub(super) fn resize_primary_pty(&mut self) -> Result<(), RuntimeError> {
         if let Some(pty) = self.pty.as_mut() {
             let pty_cols = self.cols.min(u16::MAX as usize) as u16;
             let pty_rows = self.rows.min(u16::MAX as usize) as u16;
             pty.resize(pty_cols, pty_rows).map_err(RuntimeError::from)?;
         }
-        self.pending_full_redraw = true;
         Ok(())
     }
 

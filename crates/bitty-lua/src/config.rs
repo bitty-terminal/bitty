@@ -232,6 +232,9 @@ pub struct WorkspaceData {
     /// `workspace = { show_bar = false }` opts out of the default-on
     /// workspaceline bar (issue #1333); absent means "says nothing".
     pub show_bar: Option<bool>,
+    /// Workspace bar band edge (CTX-0873 `workspace = { bar = { edge =
+    /// "top" } }`; raw string, spelling validated in `bitty-config`).
+    pub bar_edge: Option<String>,
 }
 
 /// Core-owned workspace decoration overrides, plain data (CTX-0292; unified
@@ -1229,7 +1232,7 @@ impl ConfigData {
                     // `bitty-config`; unknown provider names fail at apply
                     // time in `bitty-runtime`.
                     let nested = expect_table(key, val)?;
-                    check_nested_keys(key, nested, &["layout", "show_bar"])?;
+                    check_nested_keys(key, nested, &["layout", "show_bar", "bar"])?;
                     let layout = match get_field(nested, "layout") {
                         Some(v) => Some(expect_string("workspace.layout", v)?),
                         None => None,
@@ -1238,7 +1241,24 @@ impl ConfigData {
                         Some(v) => Some(expect_bool("workspace.show_bar", v)?),
                         None => None,
                     };
-                    out.workspace = Some(WorkspaceData { layout, show_bar });
+                    // CTX-0873: `bar = { edge = "top" }` places the Core
+                    // chrome band; unknown sub-keys fail closed.
+                    let bar_edge = match get_field(nested, "bar") {
+                        Some(v) => {
+                            let bar = expect_table("workspace.bar", v)?;
+                            check_nested_keys("workspace.bar", bar, &["edge"])?;
+                            match get_field(bar, "edge") {
+                                Some(e) => Some(expect_string("workspace.bar.edge", e)?),
+                                None => None,
+                            }
+                        }
+                        None => None,
+                    };
+                    out.workspace = Some(WorkspaceData {
+                        layout,
+                        show_bar,
+                        bar_edge,
+                    });
                 }
                 "decoration" => {
                     // CTX-0292/CTX-0333: `decoration = { gaps_in = 6,

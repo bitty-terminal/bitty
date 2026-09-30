@@ -97,10 +97,11 @@ fn tile_bytes(rt: &Runtime, id: ViewId) -> Vec<u8> {
     out
 }
 
-/// Bytes of one leaf tile minus the in-grid status bar band (#1349): the
-/// bar text legitimately changes across a workspace round trip (one
-/// workspace becomes two), so chrome pixels are masked and only pane
-/// content is compared.
+/// Bytes of one leaf tile minus its last cell row. Since CTX-0873 (#1431)
+/// the workspace bar lives in a Core-reserved band outside every tile, but
+/// crossing from one workspace to two reserves that band and the tile
+/// loses its last row; masking the last row keeps the round-trip comparison
+/// about pane content, not the band-driven geometry change.
 ///
 /// The band is the last snapshot row as the renderer paints it: top at
 /// `(rows - 1) * cell_h`, one cell row high, `cols * cell_w` wide. The
@@ -278,7 +279,7 @@ fn hidden_pane_output_paints_when_visible_again() {
 
     // Visible again: the committed output must paint, the owner marker must
     // survive the round trip, and no retained list may resurrect stale bytes.
-    // (#1349: chrome masked — the bar text changed with the workspace count.)
+    // (CTX-0873: last row masked — the band reservation shrank the tile.)
     assert!(rt.workspace_switch(0), "switch back to the split workspace");
     assert!(rt.tick().is_some(), "switch back must present");
     let frame = rt

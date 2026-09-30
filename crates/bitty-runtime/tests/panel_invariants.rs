@@ -403,20 +403,32 @@ fn random_op(
                     .workspace_close_at(target)
                     .expect("inactive workspace must close");
                 assert_eq!(killed, 0, "headless runtimes own no sessions");
-                assert_eq!(
-                    rt.layout(),
-                    &layout_before,
-                    "inactive close keeps the live layout"
-                );
+                // CTX-0873: dropping to one workspace releases the bar band,
+                // which legitimately reflows the live geometry; the tree
+                // shape and focus must still survive.
+                if rt.workspace_count() >= 2 {
+                    assert_eq!(
+                        rt.layout(),
+                        &layout_before,
+                        "inactive close keeps the live layout"
+                    );
+                    assert_eq!(
+                        rt.present_frames(),
+                        frames_before,
+                        "inactive close keeps frames"
+                    );
+                } else {
+                    assert_eq!(
+                        rt.layout().leaf_ids(),
+                        layout_before.leaf_ids(),
+                        "inactive close keeps the live tree"
+                    );
+                    assert_eq!(rt.container(), rt.window_cells(), "band released");
+                }
                 assert_eq!(
                     rt.focused_view(),
                     focus_before,
                     "inactive close keeps focus"
-                );
-                assert_eq!(
-                    rt.present_frames(),
-                    frames_before,
-                    "inactive close keeps frames"
                 );
                 match primary_before {
                     Some(owner) if removed.contains(&owner) => assert_eq!(
@@ -612,8 +624,11 @@ fn inactive_workspace_close_preserves_active_layout_focus_and_owner() {
     assert_eq!(killed, 0);
     assert_eq!(rt.workspace_count(), 1);
     assert_eq!(rt.active_workspace_index(), 0);
-    assert_eq!(rt.layout(), &layout_before);
-    assert_eq!(rt.present_frames(), frames_before);
+    // CTX-0873: the lone workspace releases the bar band, so geometry
+    // reflows to the full window; the tree itself is preserved.
+    assert_eq!(rt.layout().leaf_ids(), layout_before.leaf_ids());
+    assert_eq!(rt.container(), rt.window_cells(), "band released");
+    assert_eq!(rt.present_frames().len(), frames_before.len());
     assert_eq!(rt.focused_view(), Some(focus));
     assert_eq!(rt.primary_view(), Some(owner));
     check_invariants(&mut rt, "after inactive closes");

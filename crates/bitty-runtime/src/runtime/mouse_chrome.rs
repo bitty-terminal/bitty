@@ -107,16 +107,21 @@ impl Runtime {
         // space `update_alt_drag` measures its deltas in, so it resolves the
         // leaf from that cell rather than through `cursor_to_leaf_cell`.
         let anchor = self.cursor_to_cell(cursor);
+        // CTX-0873: allocations are container-absolute; a top chrome band
+        // shifts the container origin, so lift the grid-local anchor into
+        // container space for the leaf lookup (deltas stay grid-local).
+        let probe_col = u32::from(anchor.col) + u32::from(self.container.x);
+        let probe_row = u32::from(anchor.row) + u32::from(self.container.y);
         let leaf = self
             .layout_allocations()
             .into_iter()
             .rev()
             .find(|(_, rect)| {
                 !rect.is_empty()
-                    && u32::from(anchor.col) >= u32::from(rect.x)
-                    && u32::from(anchor.row) >= u32::from(rect.y)
-                    && u32::from(anchor.col) < rect.right()
-                    && u32::from(anchor.row) < rect.bottom()
+                    && probe_col >= u32::from(rect.x)
+                    && probe_row >= u32::from(rect.y)
+                    && probe_col < rect.right()
+                    && probe_row < rect.bottom()
             })
             .map(|(id, _)| id);
         let Some(leaf) = leaf else {

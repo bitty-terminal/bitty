@@ -2226,6 +2226,61 @@ fn runtime_config_inherits_workspace_show_bar_opt_out() {
 }
 
 #[test]
+fn runtime_config_inherits_workspace_bar_edge() {
+    // CTX-0873: `workspace.bar.edge` flows file -> effective -> runtime;
+    // absent keeps the bottom default.
+    use bitty_config::file::{parse_lua_config, resolve_effective};
+    use bitty_config::plan::{ConfigSource, LayerKind, LayeredPlan};
+    use bitty_runtime::config::BarEdge;
+    for (lua, want) in [
+        (
+            r#"return { terminal = { scrollback = 10000 } }"#,
+            BarEdge::Bottom,
+        ),
+        (
+            r#"return { workspace = { bar = { edge = "top" } } }"#,
+            BarEdge::Top,
+        ),
+        (
+            r#"return { workspace = { bar = { edge = "bottom" } } }"#,
+            BarEdge::Bottom,
+        ),
+    ] {
+        let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+        let plan = parse_lua_config(lua, &src).expect(lua);
+        let merged = resolve_effective(Some(LayeredPlan::new(src, plan)), None).expect("merge");
+        let cfg = runtime_config_from_effective(&merged.effective).expect("builds");
+        assert_eq!(cfg.workspace_bar_edge, want, "{lua}");
+        let rt = bitty_runtime::Runtime::new(cfg).expect("runtime builds");
+        assert_eq!(rt.workspace_bar_edge(), want);
+    }
+}
+
+#[test]
+fn bar_edge_mapping_round_trips_by_spelling() {
+    // CTX-0873: `bitty-config` and `bitty-runtime` share no dependency
+    // edge, so the one mapping (`runtime_bar_edge`) is pinned here: every
+    // config spelling parses, maps to the runtime variant of the same
+    // name, and the canonical spelling round-trips.
+    use bitty_config::types::WorkspaceBarEdge;
+    use bitty_runtime::config::BarEdge;
+    for (spelling, config, runtime) in [
+        ("top", WorkspaceBarEdge::Top, BarEdge::Top),
+        ("bottom", WorkspaceBarEdge::Bottom, BarEdge::Bottom),
+    ] {
+        assert_eq!(WorkspaceBarEdge::parse(spelling), Some(config));
+        assert_eq!(config.as_str(), spelling);
+        assert_eq!(crate::config_cli::runtime_bar_edge(config), runtime);
+    }
+    assert_eq!(
+        crate::config_cli::runtime_bar_edge(WorkspaceBarEdge::default()),
+        BarEdge::default(),
+        "defaults agree across crates"
+    );
+    assert_eq!(WorkspaceBarEdge::parse("Top"), None, "fail-closed spelling");
+}
+
+#[test]
 fn runtime_config_inherits_file_layout_gaps() {
     // CTX-0177: `layout.gaps_in`/`gaps_out` flow file -> effective ->
     // runtime; crate defaults stay equal (bitty-runtime must not depend
@@ -3035,6 +3090,9 @@ fn starter_init_lua_is_valid_config() {
     assert!(plan.mouse.is_none());
     assert!(starter_init_lua().contains("focus_follows_mouse"));
     assert!(starter_init_lua().contains("focus_follows_mouse_delay_ms"));
+    // CTX-0873: starter documents the bar edge as a commented example only.
+    assert!(plan.workspace.is_none());
+    assert!(starter_init_lua().contains(r#"workspace = { bar = { edge = "top" } }"#));
 }
 
 // -- `bitty init` wizard (CTX-0149, #243) --------------------------------

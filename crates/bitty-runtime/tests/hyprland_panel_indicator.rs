@@ -89,7 +89,7 @@ fn lone_workspace_hides_the_merged_indicator() {
         rt.status_bar_text(),
         "merged single source must agree"
     );
-    assert_eq!(rt.status_bar_row(24), None, "no reserved row when hidden");
+    assert_eq!(rt.status_bar_band(), None, "no reserved row when hidden");
     assert_eq!(rt.workspaceline_hit_test(0), None, "no bar to click");
 }
 
@@ -108,7 +108,17 @@ fn two_workspaces_present_the_merged_indicator() {
         Some("1:ws1 2:ws2* (2)"),
         "merged single source must agree"
     );
-    assert_eq!(rt.status_bar_row(24), Some(23));
+    let window = rt.window_cells();
+    assert_eq!(
+        rt.status_bar_band(),
+        Some(bitty_runtime::UiRect::new(
+            0,
+            window.height - 1,
+            window.width,
+            1
+        )),
+        "bottom band reserved (CTX-0873)"
+    );
     assert_eq!(rt.workspaceline_hit_test(0), Some(0));
     // Closing back to one hides again.
     assert!(rt.workspace_switch(0));

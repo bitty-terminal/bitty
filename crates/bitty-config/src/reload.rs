@@ -113,6 +113,8 @@ impl std::fmt::Display for ReloadClass {
 /// | `keymaps`                 | Live               |
 /// | `workspace.show_bar`      | Live               |
 /// | `workspace.bar.edge`      | Live               |
+/// | `workspace.bar.colors.active`   | RestartRequired |
+/// | `workspace.bar.colors.inactive` | RestartRequired |
 /// | `terminal.scrollback`     | RestartRequired    |
 /// | `terminal.shell`          | RestartRequired    |
 /// | `terminal.scroll_lines_per_notch` | RestartRequired |
@@ -186,7 +188,11 @@ pub fn classify_field(field: &str) -> ReloadClass {
         // re-solves the band and reflows in place (no PTY recreation).
         | "workspace.show_bar"
         | "workspace.bar.edge" => ReloadClass::Live,
-        "terminal.scrollback"
+        // CTX-0874: bar pill colors are resolved when the runtime is built;
+        // live adoption lands with the runtime wiring follow-up.
+        "workspace.bar.colors.active"
+        | "workspace.bar.colors.inactive"
+        | "terminal.scrollback"
         | "terminal.shell"
         | "terminal.scroll_lines_per_notch"
         | "terminal.scroll_pixels_per_notch"
@@ -481,6 +487,19 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
             .unwrap_or_default()
             .as_str()
             .to_string(),
+    );
+    // CTX-0874: bar pill color tokens (restart-required, see classify_field).
+    let colors =
+        |c: &crate::types::EffectiveConfig| c.workspace.bar_colors.clone().unwrap_or_default();
+    push_if_changed(
+        "workspace.bar.colors.active",
+        colors(old).active.unwrap_or_default(),
+        colors(new).active.unwrap_or_default(),
+    );
+    push_if_changed(
+        "workspace.bar.colors.inactive",
+        colors(old).inactive.unwrap_or_default(),
+        colors(new).inactive.unwrap_or_default(),
     );
     // CTX-0181: scrollbar chrome is adopted at startup (RuntimeConfig is
     // built once from the effective config), so changes are
@@ -886,6 +905,27 @@ mod tests {
         let r = reconcile_live(&mut cur, &new).expect("live must reconcile");
         assert_eq!(r.overall, ReloadClass::Live);
         assert_eq!(cur.font.family, "Mono");
+    }
+
+    #[test]
+    fn diff_workspace_bar_colors_is_restart_required() {
+        // CTX-0874: runtime wiring of the pill colors is a follow-up, so a
+        // change is reported upfront instead of silently not applying.
+        use crate::types::WorkspaceBarColors;
+        let old = EffectiveConfig::default();
+        let mut new = old.clone();
+        new.workspace.bar_colors = Some(WorkspaceBarColors {
+            active: Some("muted".into()),
+            inactive: None,
+        });
+        let report = diff(&old, &new);
+        assert!(report.needs_restart);
+        let fields: Vec<&str> = report.diffs.iter().map(|d| d.field.as_str()).collect();
+        assert_eq!(fields, ["workspace.bar.colors.active"]);
+        assert_eq!(
+            classify_field("workspace.bar.colors.inactive"),
+            ReloadClass::RestartRequired
+        );
     }
 
     #[test]

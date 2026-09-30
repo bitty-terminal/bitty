@@ -64,6 +64,35 @@ pub const WORKSPACELINE_MAX_CHARS: usize = 1024;
 /// truth is never mutated.
 pub const STATUS_BAR_ROWS: usize = 1;
 
+/// One workspace pill in the bar band (CTX-0874, issue #1431 C).
+///
+/// Geometry is in band columns: the pill's background covers
+/// `start..start + width`, and a press anywhere in that span (padding
+/// included) focuses workspace `index`. Produced by
+/// [`Runtime::bar_pills`], which the band renderer and the band hit-test
+/// share, so the painted pill and its click target never drift apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BarPill {
+    /// Workspace slot index.
+    pub index: usize,
+    /// First band column the pill covers.
+    pub start: u16,
+    /// Pill width in cells (label plus padding on both sides).
+    pub width: u16,
+    /// Label: the workspace name, plus ` (N)` when it holds N > 1 panels.
+    pub label: String,
+    /// Whether this is the active workspace.
+    pub active: bool,
+}
+
+/// Cell width of a pill label as the band paints it: control scalars keep
+/// one column, zero-width scalars take none (mirrors the band overlay).
+fn label_cell_width(label: &str) -> u16 {
+    label.chars().fold(0u16, |acc, ch| {
+        acc.saturating_add(u16::from(char_cell_width(ch)))
+    })
+}
+
 /// One workspace: name plus stashed layout + focus.
 #[derive(Debug, Clone)]
 pub struct WorkspaceSlot {
@@ -389,6 +418,99 @@ impl Runtime {
         None
     }
 
+    /// Workspace pills for the reserved band (CTX-0874), left-aligned in
+    /// the band's left region (see [`chrome_band::layout_pills`]); empty
+    /// when no band is reserved. Pills that do not fit whole are dropped.
+    #[must_use]
+    pub fn bar_pills(&self) -> Vec<BarPill> {
+        let Some(band) = self.status_bar_band() else {
+            return Vec::new();
+        };
+        let labels: Vec<String> = (0..self.workspaces.len())
+            .map(|index| self.pill_label(index))
+            .collect();
+        let widths: Vec<u16> = labels.iter().map(|l| label_cell_width(l)).collect();
+
+        // Parse pill alignment from config (CTX-0874)
+        let align = self
+            .workspace_bar_pill_align
+            .as_deref()
+            .and_then(|s| match s {
+                "left" => Some(chrome_band::PillAlign::Left),
+                "center" => Some(chrome_band::PillAlign::Center),
+                _ => None,
+            })
+            .unwrap_or(chrome_band::PillAlign::Left);
+
+        chrome_band::layout_pills(band.width, &widths, align)
+            .into_iter()
+            .zip(labels)
+            .enumerate()
+            .map(|(index, ((start, width), label))| BarPill {
+                index,
+                start,
+                width,
+                label,
+                active: index == self.active_workspace,
+            })
+            .collect()
+    }
+
+    /// Builds the bar palette from configured color tokens (CTX-0874).
+    #[must_use]
+    pub fn bar_palette(&self) -> chrome_band::BarPalette {
+        let (active, inactive) = self.workspace_bar_colors.as_ref()
+            .map(|(a, i)| (a.as_deref(), i.as_deref()))
+            .unwrap_or((None, None));
+        chrome_band::BarPalette::from_tokens(active, inactive)
+    }
+
+    /// Pill label for slot `index`: the (bounded) name, plus the panel
+    /// count when the workspace holds more than one panel. No display
+    /// number: position is not identity (CTX-0874).
+    fn pill_label(&self, index: usize) -> String {
+        let Some(slot) = self.workspaces.get(index) else {
+            return String::new();
+        };
+        let panels = if index == self.active_workspace {
+            self.layout.leaf_count()
+        } else {
+            slot.layout.leaf_count()
+        };
+        let name = truncate_ws_name(&slot.name);
+        if panels > 1 {
+            format!("{name} ({panels})")
+        } else {
+            name
+        }
+    }
+
+    /// Maps a band column to the workspace whose pill covers it
+    /// (CTX-0874). `None` on the margin, gaps, the reserved center/right
+    /// regions, or when no band is reserved: every miss fails closed.
+    #[must_use]
+    pub fn bar_pill_hit_test(&self, column: usize) -> Option<usize> {
+        self.bar_pills()
+            .into_iter()
+            .find(|pill| {
+                let start = usize::from(pill.start);
+                column >= start && column < start + usize::from(pill.width)
+            })
+            .map(|pill| pill.index)
+    }
+
+    /// A click at band `column` focuses the hit pill's workspace
+    /// (CTX-0874). `false` (no state change) on a miss or the active pill.
+    pub fn bar_click(&mut self, column: usize) -> bool {
+        let Some(target) = self.bar_pill_hit_test(column) else {
+            return false;
+        };
+        if target == self.active_workspace {
+            return false;
+        }
+        self.workspace_switch(target)
+    }
+
     /// Mouse switching (issue #1333): a click at bar `column` switches to
     /// the hit workspace. Returns `false` (no state change) when the bar is
     /// hidden, the column hits no workspace, or the column names the
@@ -414,8 +536,8 @@ impl Runtime {
     /// focus never moves, and no selection starts. A consumed press arms the
     /// one-shot `bar_release_swallow` so the paired release never reaches a
     /// capturing app as an orphan report. The click itself still fails
-    /// closed through [`Self::workspaceline_click`] (separators, the count
-    /// suffix, and the active workspace switch nothing).
+    /// closed through [`Self::bar_click`] (margin, gaps, the reserved
+    /// regions, and the active pill switch nothing).
     ///
     /// CTX-0873: the band no longer lives inside a leaf, so the old
     /// alternate-screen skip is gone — a fullscreen app owns every row of
@@ -428,7 +550,9 @@ impl Runtime {
         let Some(col) = self.status_bar_hit(pos) else {
             return false;
         };
-        self.workspaceline_click(col);
+        // CTX-0874: the band paints pills, so the press hit-tests pill
+        // geometry (padding included), not the text columns.
+        self.bar_click(col);
         self.bar_release_swallow = true;
         true
     }
@@ -2079,5 +2203,63 @@ mod tests {
         assert!(rt.has_pane_session(&moved_id));
         assert!(rt.layout().leaf_ids().contains(&moved_id));
         assert_eq!(rt.focused_view(), Some(moved_id));
+    }
+
+    // CTX-0874: pill geometry, labels, and hit-testing.
+    #[test]
+    fn bar_pills_show_names_without_numbers_and_panel_counts() {
+        let mut rt = fresh();
+        assert!(rt.bar_pills().is_empty(), "lone workspace reserves no band");
+        rt.workspace_new().expect("ws2");
+        let focused = rt.focused_view().expect("focus");
+        let leaf = rt.layout().find_leaf(focused).cloned().expect("leaf");
+        let extra = View::new(
+            ViewId::new(99),
+            usize::from(leaf.cols()),
+            usize::from(leaf.rows()),
+        );
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(leaf),
+            LayoutNode::leaf(extra),
+        ));
+        let pills = rt.bar_pills();
+        let labels: Vec<&str> = pills.iter().map(|p| p.label.as_str()).collect();
+        assert_eq!(labels, ["ws1", "ws2 (2)"]);
+        assert_eq!(
+            pills.iter().map(|p| (p.start, p.width)).collect::<Vec<_>>(),
+            [(1, 5), (7, 9)]
+        );
+        assert_eq!(
+            pills.iter().map(|p| p.active).collect::<Vec<_>>(),
+            [false, true]
+        );
+        // The ctl/tabline text contract is unchanged.
+        assert_eq!(rt.workspaceline_text(), "1:ws1 2:ws2* (2)");
+    }
+
+    #[test]
+    fn bar_click_hits_pill_padding_and_misses_gaps() {
+        let mut rt = fresh();
+        rt.workspace_new().expect("ws2");
+        rt.workspace_new().expect("ws3");
+        // Pills: ws1 1..6, ws2 7..12, ws3 13..18.
+        assert_eq!(rt.bar_pill_hit_test(0), None, "left margin");
+        assert_eq!(rt.bar_pill_hit_test(1), Some(0), "leading pad");
+        assert_eq!(rt.bar_pill_hit_test(5), Some(0), "trailing pad");
+        assert_eq!(rt.bar_pill_hit_test(6), None, "gap");
+        assert_eq!(rt.bar_pill_hit_test(7), Some(1));
+        assert_eq!(rt.bar_pill_hit_test(17), Some(2));
+        assert_eq!(rt.bar_pill_hit_test(18), None, "reserved region");
+        assert!(rt.bar_click(1));
+        assert_eq!(rt.active_workspace_index(), 0);
+        assert!(!rt.bar_click(3), "active pill is a no-op");
+        assert!(!rt.bar_click(6), "gap switches nothing");
+        assert!(rt.bar_click(11));
+        assert_eq!(rt.active_workspace_index(), 1);
+        rt.set_workspaceline_visible(false);
+        assert!(!rt.bar_click(1), "hidden bar never switches");
+        assert!(rt.bar_pills().is_empty());
     }
 }

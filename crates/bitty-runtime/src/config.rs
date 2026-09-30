@@ -643,6 +643,16 @@ pub struct RuntimeConfig {
     /// post-construction by the app layer like `workspaceline_visible`;
     /// live changes go through [`crate::Runtime::set_workspace_bar_edge`].
     pub workspace_bar_edge: BarEdge,
+    /// Workspace pill horizontal alignment (CTX-0874
+    /// `workspace.bar.pill_align`; default "left"). Assigned
+    /// post-construction by the app layer; parsed by
+    /// [`crate::runtime::chrome_band::PillAlign::from_config`].
+    pub workspace_bar_pill_align: Option<String>,
+    /// Workspace bar active/inactive pill colors (CTX-0874
+    /// `workspace.bar.colors.*`; theme token names). Assigned
+    /// post-construction by the app layer; resolved by
+    /// [`crate::runtime::chrome_band::BarPalette::from_tokens`].
+    pub workspace_bar_colors: Option<(Option<String>, Option<String>)>,
     /// Spacing between sibling panes in cells (CTX-0177 `layout.gaps_in`).
     /// `0..=MAX_LAYOUT_GAP_CELLS`; default `0` = edge-to-edge tiling.
     /// The gap band shows the window background; per-leaf rendering and
@@ -823,6 +833,8 @@ impl Default for RuntimeConfig {
             )),
             workspaceline_visible: DEFAULT_WORKSPACELINE_VISIBLE,
             workspace_bar_edge: DEFAULT_WORKSPACE_BAR_EDGE,
+            workspace_bar_pill_align: None,
+            workspace_bar_colors: None,
             gaps_in: DEFAULT_LAYOUT_GAPS_IN,
             gaps_out: DEFAULT_LAYOUT_GAPS_OUT,
             decoration: bitty_ui::Decoration::default(),
@@ -911,6 +923,8 @@ impl RuntimeConfig {
             )),
             workspaceline_visible: DEFAULT_WORKSPACELINE_VISIBLE,
             workspace_bar_edge: DEFAULT_WORKSPACE_BAR_EDGE,
+            workspace_bar_pill_align: None,
+            workspace_bar_colors: None,
             gaps_in,
             gaps_out,
             decoration: bitty_ui::Decoration::default(),

@@ -29,6 +29,7 @@ use crate::error::ConfigError;
 use crate::plan::{ConfigPlan, ConfigSource, LayerKind, LayeredPlan};
 use crate::types::{
     EffectiveConfig, KeymapEntry, PluginSpec, ViewAppearanceOverride, ViewOverride,
+    WorkspaceBarColors,
 };
 
 /// Declared merge class for a single schema field.
@@ -80,6 +81,8 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "workspace.layout"
         | "workspace.show_bar"
         | "workspace.bar.edge"
+        | "workspace.bar.colors.active"
+        | "workspace.bar.colors.inactive"
         | "decoration.gaps_in"
         | "decoration.gaps_out"
         | "decoration.border"
@@ -557,6 +560,8 @@ const ATTRIBUTED_FIELDS: &[&str] = &[
     "workspace.layout",
     "workspace.show_bar",
     "workspace.bar.edge",
+    "workspace.bar.colors.active",
+    "workspace.bar.colors.inactive",
     "workspace",
     "decoration.gaps_in",
     "decoration.gaps_out",
@@ -1080,6 +1085,146 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
                         &mut attribution,
                         &mut conflicts,
                         edge_field,
+                        prev,
+                        src,
+                        MergeClass::ScalarReplace,
+                    );
+                }
+            }
+            // CTX-0874: `workspace.bar.colors.active` and
+            // `workspace.bar.colors.inactive` are scalar-replace with the same
+            // present-key-only rule.
+            if let Some(bar_colors) = &ws.bar_colors {
+                if let Some(active) = &bar_colors.active {
+                    let active_field = "workspace.bar.colors.active";
+                    if is_policy {
+                        policy_fields.insert(active_field.to_string(), src.clone());
+                        effective
+                            .workspace
+                            .bar_colors
+                            .get_or_insert_with(WorkspaceBarColors::default)
+                            .active = Some(active.clone());
+                        let prev = attribution.get(active_field).cloned();
+                        record_attribution(
+                            &mut attribution,
+                            &mut conflicts,
+                            active_field,
+                            prev,
+                            src,
+                            MergeClass::ScalarReplace,
+                        );
+                    } else if let Some(policy_src) = policy_fields.get(active_field) {
+                        policy_violations.push(ConfigError::NonOverridable {
+                            field: active_field.to_string(),
+                            policy_source: policy_src.describe(),
+                            attempted_source: src.describe(),
+                        });
+                        conflicts.push(MergeConflict {
+                            field: active_field.to_string(),
+                            previous_source: policy_src.clone(),
+                            new_source: src.clone(),
+                            merge_class: MergeClass::ScalarReplace,
+                        });
+                    } else {
+                        let prev = attribution.get(active_field).cloned();
+                        effective
+                            .workspace
+                            .bar_colors
+                            .get_or_insert_with(WorkspaceBarColors::default)
+                            .active = Some(active.clone());
+                        record_attribution(
+                            &mut attribution,
+                            &mut conflicts,
+                            active_field,
+                            prev,
+                            src,
+                            MergeClass::ScalarReplace,
+                        );
+                    }
+                }
+                if let Some(inactive) = &bar_colors.inactive {
+                    let inactive_field = "workspace.bar.colors.inactive";
+                    if is_policy {
+                        policy_fields.insert(inactive_field.to_string(), src.clone());
+                        effective
+                            .workspace
+                            .bar_colors
+                            .get_or_insert_with(WorkspaceBarColors::default)
+                            .inactive = Some(inactive.clone());
+                        let prev = attribution.get(inactive_field).cloned();
+                        record_attribution(
+                            &mut attribution,
+                            &mut conflicts,
+                            inactive_field,
+                            prev,
+                            src,
+                            MergeClass::ScalarReplace,
+                        );
+                    } else if let Some(policy_src) = policy_fields.get(inactive_field) {
+                        policy_violations.push(ConfigError::NonOverridable {
+                            field: inactive_field.to_string(),
+                            policy_source: policy_src.describe(),
+                            attempted_source: src.describe(),
+                        });
+                        conflicts.push(MergeConflict {
+                            field: inactive_field.to_string(),
+                            previous_source: policy_src.clone(),
+                            new_source: src.clone(),
+                            merge_class: MergeClass::ScalarReplace,
+                        });
+                    } else {
+                        let prev = attribution.get(inactive_field).cloned();
+                        effective
+                            .workspace
+                            .bar_colors
+                            .get_or_insert_with(WorkspaceBarColors::default)
+                            .inactive = Some(inactive.clone());
+                        record_attribution(
+                            &mut attribution,
+                            &mut conflicts,
+                            inactive_field,
+                            prev,
+                            src,
+                            MergeClass::ScalarReplace,
+                        );
+                    }
+                }
+            }
+            // CTX-0874: `workspace.bar.pill_align` is scalar-replace with the same
+            // present-key-only rule.
+            if let Some(pill_align) = &ws.bar_pill_align {
+                let pill_align_field = "workspace.bar.pill_align";
+                if is_policy {
+                    policy_fields.insert(pill_align_field.to_string(), src.clone());
+                    effective.workspace.bar_pill_align = Some(pill_align.clone());
+                    let prev = attribution.get(pill_align_field).cloned();
+                    record_attribution(
+                        &mut attribution,
+                        &mut conflicts,
+                        pill_align_field,
+                        prev,
+                        src,
+                        MergeClass::ScalarReplace,
+                    );
+                } else if let Some(policy_src) = policy_fields.get(pill_align_field) {
+                    policy_violations.push(ConfigError::NonOverridable {
+                        field: pill_align_field.to_string(),
+                        policy_source: policy_src.describe(),
+                        attempted_source: src.describe(),
+                    });
+                    conflicts.push(MergeConflict {
+                        field: pill_align_field.to_string(),
+                        previous_source: policy_src.clone(),
+                        new_source: src.clone(),
+                        merge_class: MergeClass::ScalarReplace,
+                    });
+                } else {
+                    let prev = attribution.get(pill_align_field).cloned();
+                    effective.workspace.bar_pill_align = Some(pill_align.clone());
+                    record_attribution(
+                        &mut attribution,
+                        &mut conflicts,
+                        pill_align_field,
                         prev,
                         src,
                         MergeClass::ScalarReplace,
@@ -2286,6 +2431,148 @@ fn merge_layers_allow_policy_violations(
                         &mut attribution,
                         &mut conflicts,
                         edge_field,
+                        prev,
+                        src,
+                        MergeClass::ScalarReplace,
+                    );
+                }
+            }
+            // CTX-0874: `workspace.bar.colors.active` and
+            // `workspace.bar.colors.inactive` are scalar-replace with the same
+            // present-key-only rule. (Second merge path: allow-policy-violations
+            // variant for diagnostics.)
+            if let Some(bar_colors) = &ws.bar_colors {
+                if let Some(active) = &bar_colors.active {
+                    let active_field = "workspace.bar.colors.active";
+                    if is_policy {
+                        policy_fields.insert(active_field.to_string(), src.clone());
+                        effective
+                            .workspace
+                            .bar_colors
+                            .get_or_insert_with(WorkspaceBarColors::default)
+                            .active = Some(active.clone());
+                        let prev = attribution.get(active_field).cloned();
+                        record_attribution(
+                            &mut attribution,
+                            &mut conflicts,
+                            active_field,
+                            prev,
+                            src,
+                            MergeClass::ScalarReplace,
+                        );
+                    } else if let Some(policy_src) = policy_fields.get(active_field) {
+                        policy_violations.push(ConfigError::NonOverridable {
+                            field: active_field.to_string(),
+                            policy_source: policy_src.describe(),
+                            attempted_source: src.describe(),
+                        });
+                        conflicts.push(MergeConflict {
+                            field: active_field.to_string(),
+                            previous_source: policy_src.clone(),
+                            new_source: src.clone(),
+                            merge_class: MergeClass::ScalarReplace,
+                        });
+                    } else {
+                        let prev = attribution.get(active_field).cloned();
+                        effective
+                            .workspace
+                            .bar_colors
+                            .get_or_insert_with(WorkspaceBarColors::default)
+                            .active = Some(active.clone());
+                        record_attribution(
+                            &mut attribution,
+                            &mut conflicts,
+                            active_field,
+                            prev,
+                            src,
+                            MergeClass::ScalarReplace,
+                        );
+                    }
+                }
+                if let Some(inactive) = &bar_colors.inactive {
+                    let inactive_field = "workspace.bar.colors.inactive";
+                    if is_policy {
+                        policy_fields.insert(inactive_field.to_string(), src.clone());
+                        effective
+                            .workspace
+                            .bar_colors
+                            .get_or_insert_with(WorkspaceBarColors::default)
+                            .inactive = Some(inactive.clone());
+                        let prev = attribution.get(inactive_field).cloned();
+                        record_attribution(
+                            &mut attribution,
+                            &mut conflicts,
+                            inactive_field,
+                            prev,
+                            src,
+                            MergeClass::ScalarReplace,
+                        );
+                    } else if let Some(policy_src) = policy_fields.get(inactive_field) {
+                        policy_violations.push(ConfigError::NonOverridable {
+                            field: inactive_field.to_string(),
+                            policy_source: policy_src.describe(),
+                            attempted_source: src.describe(),
+                        });
+                        conflicts.push(MergeConflict {
+                            field: inactive_field.to_string(),
+                            previous_source: policy_src.clone(),
+                            new_source: src.clone(),
+                            merge_class: MergeClass::ScalarReplace,
+                        });
+                    } else {
+                        let prev = attribution.get(inactive_field).cloned();
+                        effective
+                            .workspace
+                            .bar_colors
+                            .get_or_insert_with(WorkspaceBarColors::default)
+                            .inactive = Some(inactive.clone());
+                        record_attribution(
+                            &mut attribution,
+                            &mut conflicts,
+                            inactive_field,
+                            prev,
+                            src,
+                            MergeClass::ScalarReplace,
+                        );
+                    }
+                }
+            }
+            // CTX-0874: `workspace.bar.pill_align` is scalar-replace with the same
+            // present-key-only rule. (Second merge path: allow-policy-violations
+            // variant for diagnostics.)
+            if let Some(pill_align) = &ws.bar_pill_align {
+                let pill_align_field = "workspace.bar.pill_align";
+                if is_policy {
+                    policy_fields.insert(pill_align_field.to_string(), src.clone());
+                    effective.workspace.bar_pill_align = Some(pill_align.clone());
+                    let prev = attribution.get(pill_align_field).cloned();
+                    record_attribution(
+                        &mut attribution,
+                        &mut conflicts,
+                        pill_align_field,
+                        prev,
+                        src,
+                        MergeClass::ScalarReplace,
+                    );
+                } else if let Some(policy_src) = policy_fields.get(pill_align_field) {
+                    policy_violations.push(ConfigError::NonOverridable {
+                        field: pill_align_field.to_string(),
+                        policy_source: policy_src.describe(),
+                        attempted_source: src.describe(),
+                    });
+                    conflicts.push(MergeConflict {
+                        field: pill_align_field.to_string(),
+                        previous_source: policy_src.clone(),
+                        new_source: src.clone(),
+                        merge_class: MergeClass::ScalarReplace,
+                    });
+                } else {
+                    let prev = attribution.get(pill_align_field).cloned();
+                    effective.workspace.bar_pill_align = Some(pill_align.clone());
+                    record_attribution(
+                        &mut attribution,
+                        &mut conflicts,
+                        pill_align_field,
                         prev,
                         src,
                         MergeClass::ScalarReplace,
@@ -4002,6 +4289,8 @@ mod tests {
                     layout: Some("dwindle".to_string()),
                     show_bar: None,
                     bar_edge: None,
+                    bar_colors: None,
+                    bar_pill_align: None,
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -4023,6 +4312,8 @@ mod tests {
                     layout: Some("grid".to_string()),
                     show_bar: None,
                     bar_edge: None,
+                    bar_colors: None,
+                    bar_pill_align: None,
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -4035,6 +4326,8 @@ mod tests {
                     layout: Some("dwindle".to_string()),
                     show_bar: None,
                     bar_edge: None,
+                    bar_colors: None,
+                    bar_pill_align: None,
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -4074,6 +4367,8 @@ mod tests {
                     layout: None,
                     show_bar: Some(false),
                     bar_edge: None,
+                    bar_colors: None,
+                    bar_pill_align: None,
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -4094,6 +4389,8 @@ mod tests {
                     layout: Some("grid".to_string()),
                     show_bar: None,
                     bar_edge: None,
+                    bar_colors: None,
+                    bar_pill_align: None,
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -4106,6 +4403,8 @@ mod tests {
                     layout: None,
                     show_bar: Some(false),
                     bar_edge: None,
+                    bar_colors: None,
+                    bar_pill_align: None,
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -4125,6 +4424,73 @@ mod tests {
     }
 
     #[test]
+    fn workspace_bar_colors_merge_per_leaf_with_attribution() {
+        // CTX-0874: each color leaf is scalar-replace; a higher layer that
+        // sets only one leaf keeps the lower layer's other leaf.
+        use crate::types::{WorkspaceBarColors, WorkspaceConfig};
+        let layer = |kind, name, active: Option<&str>, inactive: Option<&str>| {
+            LayeredPlan::new(
+                ConfigSource::new(kind, Some(name)),
+                ConfigPlan {
+                    workspace: Some(WorkspaceConfig {
+                        bar_colors: Some(WorkspaceBarColors {
+                            active: active.map(str::to_string),
+                            inactive: inactive.map(str::to_string),
+                        }),
+                        ..Default::default()
+                    }),
+                    schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                    ..Default::default()
+                },
+            )
+        };
+        let merged = merge_layers(vec![
+            layer(
+                LayerKind::User,
+                "user.lua",
+                Some("accent"),
+                Some("surface.2"),
+            ),
+            layer(LayerKind::Cli, "cli", Some("muted"), None),
+        ])
+        .expect("merge");
+        let colors = merged
+            .effective
+            .workspace
+            .bar_colors
+            .clone()
+            .expect("colors");
+        assert_eq!(colors.active.as_deref(), Some("muted"));
+        assert_eq!(colors.inactive.as_deref(), Some("surface.2"));
+        assert_eq!(
+            merged
+                .source_of("workspace.bar.colors.active")
+                .unwrap()
+                .layer,
+            LayerKind::Cli
+        );
+        assert_eq!(
+            merged
+                .source_of("workspace.bar.colors.inactive")
+                .unwrap()
+                .layer,
+            LayerKind::User
+        );
+        let empty = merge_layers(vec![]).expect("empty");
+        assert!(empty.effective.workspace.bar_colors.is_none());
+        for field in [
+            "workspace.bar.colors.active",
+            "workspace.bar.colors.inactive",
+        ] {
+            assert_eq!(merge_class_for(field), Some(MergeClass::ScalarReplace));
+            assert_eq!(
+                empty.source_of(field).unwrap().layer,
+                LayerKind::CoreDefaults
+            );
+        }
+    }
+
+    #[test]
     fn workspace_bar_edge_merges_scalar_replace_with_attribution() {
         // CTX-0873: `workspace.bar.edge` lands in effective with its layer's
         // attribution; a higher layer wins; a higher layer without the key
@@ -4135,11 +4501,13 @@ mod tests {
             LayeredPlan::new(
                 ConfigSource::new(kind, Some(name)),
                 ConfigPlan {
-                    workspace: Some(WorkspaceConfig {
-                        layout: None,
-                        show_bar: None,
-                        bar_edge: edge,
-                    }),
+                workspace: Some(WorkspaceConfig {
+                    layout: Some("dwindle".to_string()),
+                    show_bar: None,
+                    bar_edge: edge,
+                    bar_colors: None,
+                    bar_pill_align: None,
+                }),
                     schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                     ..Default::default()
                 },
@@ -4570,6 +4938,7 @@ mod tests {
     fn window_radius_merges_scalar_replace_with_attribution() {
         // CTX-0241 S0: user radius lands in effective with user attribution;
         // later layers win; empty stack keeps 0 with core-defaults source.
+        use crate::types::WorkspaceConfig;
         let user = LayeredPlan::new(
             ConfigSource::new(LayerKind::User, Some("user.lua")),
             ConfigPlan {
@@ -4592,11 +4961,12 @@ mod tests {
         let cli = LayeredPlan::new(
             ConfigSource::new(LayerKind::Cli, Some("cli")),
             ConfigPlan {
-                window: Some(WindowConfig {
-                    opacity: 1.0,
-                    padding: 8,
-                    radius_px: 6,
-                    blur_radius: 0,
+                workspace: Some(WorkspaceConfig {
+                    layout: Some("grid".to_string()),
+                    show_bar: None,
+                    bar_edge: None,
+                    bar_colors: None,
+                    bar_pill_align: None,
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()

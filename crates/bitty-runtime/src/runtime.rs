@@ -500,6 +500,12 @@ pub struct Runtime {
     /// [`RuntimeConfig::workspace_bar_edge`]; live changes go through
     /// [`Runtime::set_workspace_bar_edge`] and reflow.
     workspace_bar_edge: crate::config::BarEdge,
+    /// Workspace pill horizontal alignment (CTX-0874). Seeded from
+    /// [`RuntimeConfig::workspace_bar_pill_align`]; default "left".
+    workspace_bar_pill_align: Option<String>,
+    /// Workspace bar colors (CTX-0874). Seeded from
+    /// [`RuntimeConfig::workspace_bar_colors`]; theme token names.
+    workspace_bar_colors: Option<(Option<String>, Option<String>)>,
     /// Full window grid in cells (CTX-0873). The layout `container` is this
     /// rect minus the reserved chrome band
     /// ([`chrome_band::solve`]); resize and the `set_window_cells` seam set it.
@@ -1399,6 +1405,8 @@ impl Runtime {
             pending_ws_close: None,
             workspaceline_visible: config.workspaceline_visible,
             workspace_bar_edge: config.workspace_bar_edge,
+            workspace_bar_pill_align: config.workspace_bar_pill_align.clone(),
+            workspace_bar_colors: config.workspace_bar_colors.clone(),
             window_cells: container,
             last_presented_bar: None,
             help_visible: false,
@@ -1614,6 +1622,8 @@ impl Runtime {
             pending_ws_close: None,
             workspaceline_visible: config.workspaceline_visible,
             workspace_bar_edge: config.workspace_bar_edge,
+            workspace_bar_pill_align: config.workspace_bar_pill_align.clone(),
+            workspace_bar_colors: config.workspace_bar_colors.clone(),
             window_cells: container,
             last_presented_bar: None,
             help_visible: false,

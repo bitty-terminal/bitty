@@ -14,6 +14,7 @@
 //! zero or negative content extent.
 
 use crate::config::BarEdge;
+use bitty_term_state::Rgb;
 use bitty_ui::Rect as UiRect;
 
 /// Minimum terminal content rows a leaf must keep once a band is reserved,
@@ -166,6 +167,196 @@ pub fn solve(
     }
 }
 
+/// Cells left empty before the first workspace pill (CTX-0874).
+pub const BAR_LEFT_MARGIN: u16 = 1;
+
+/// Blank cells between two adjacent workspace pills (CTX-0874).
+pub const PILL_GAP: u16 = 1;
+
+/// Background-filled cells on each side of a pill label (CTX-0874).
+pub const PILL_PAD: u16 = 1;
+
+/// Theme token the active pill uses when `workspace.bar.colors.active` is
+/// unset (CTX-0874).
+pub const DEFAULT_ACTIVE_TOKEN: &str = "accent";
+
+/// Theme token inactive pills use when `workspace.bar.colors.inactive` is
+/// unset (CTX-0874).
+pub const DEFAULT_INACTIVE_TOKEN: &str = "surface.1";
+
+/// Placeholder RGB for the theme tokens the bar accepts (CTX-0874).
+///
+/// Theme token resolution against the active theme is a follow-up; until
+/// it lands these fixed values (matching the default dark palette) stand
+/// in. Unknown tokens resolve to `None` and the caller falls back to the
+/// default token.
+const PLACEHOLDER_TOKENS: &[(&str, [u8; 3])] = &[
+    ("accent", [0x89, 0xB4, 0xFA]),
+    ("surface.0", [0x31, 0x32, 0x44]),
+    ("surface.1", [0x45, 0x47, 0x5A]),
+    ("surface.2", [0x58, 0x5B, 0x70]),
+    ("muted", [0x6C, 0x70, 0x86]),
+];
+
+/// Dark label color used on light pill backgrounds.
+const LABEL_DARK: [u8; 3] = [0x1E, 0x1E, 0x2E];
+
+/// Light label color used on dark pill backgrounds.
+const LABEL_LIGHT: [u8; 3] = [0xCD, 0xD6, 0xF4];
+
+/// Perceived-brightness threshold (0..=255) above which a pill background
+/// takes the dark label color.
+const LIGHT_BG_THRESHOLD: u32 = 128;
+
+const fn rgb(c: [u8; 3]) -> Rgb {
+    Rgb {
+        r: c[0],
+        g: c[1],
+        b: c[2],
+    }
+}
+
+/// Placeholder RGB for a bar theme token, or `None` when unknown.
+#[must_use]
+pub fn resolve_bar_token(token: &str) -> Option<Rgb> {
+    PLACEHOLDER_TOKENS
+        .iter()
+        .find(|(name, _)| *name == token)
+        .map(|(_, c)| rgb(*c))
+}
+
+/// Label color that contrasts with `bg` (dark text on light fills).
+#[must_use]
+pub fn contrasting_label(bg: Rgb) -> Rgb {
+    let brightness = (u32::from(bg.r) * 299 + u32::from(bg.g) * 587 + u32::from(bg.b) * 114) / 1000;
+    if brightness >= LIGHT_BG_THRESHOLD {
+        rgb(LABEL_DARK)
+    } else {
+        rgb(LABEL_LIGHT)
+    }
+}
+
+/// Resolved workspace pill colors (CTX-0874).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BarPalette {
+    /// Active pill background.
+    pub active_bg: Rgb,
+    /// Active pill label.
+    pub active_fg: Rgb,
+    /// Inactive pill background.
+    pub inactive_bg: Rgb,
+    /// Inactive pill label.
+    pub inactive_fg: Rgb,
+}
+
+impl BarPalette {
+    /// Resolves the configured tokens (`workspace.bar.colors.*`); an unset
+    /// or unknown token falls back to its default token.
+    #[must_use]
+    pub fn from_tokens(active: Option<&str>, inactive: Option<&str>) -> Self {
+        let pick = |token: Option<&str>, default: &str| {
+            token
+                .and_then(resolve_bar_token)
+                .or_else(|| resolve_bar_token(default))
+                .unwrap_or(rgb(LABEL_LIGHT))
+        };
+        let active_bg = pick(active, DEFAULT_ACTIVE_TOKEN);
+        let inactive_bg = pick(inactive, DEFAULT_INACTIVE_TOKEN);
+        Self {
+            active_bg,
+            active_fg: contrasting_label(active_bg),
+            inactive_bg,
+            inactive_fg: contrasting_label(inactive_bg),
+        }
+    }
+}
+
+impl Default for BarPalette {
+    fn default() -> Self {
+        Self::from_tokens(None, None)
+    }
+}
+
+/// Pill horizontal alignment (CTX-0874).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PillAlign {
+    /// Pills start at [`BAR_LEFT_MARGIN`].
+    Left,
+    /// Pills are centered in the band width.
+    Center,
+}
+
+impl PillAlign {
+    /// Parses from config string (`workspace.bar.pill_align`).
+    #[must_use]
+    pub fn from_config(s: Option<&str>) -> Self {
+        match s {
+            Some("center") => Self::Center,
+            _ => Self::Left,
+        }
+    }
+}
+
+/// Lays out workspace pills in the band's left region (CTX-0874).
+///
+/// Pill `i` is `label_widths[i] + 2 * PILL_PAD` cells wide. Alignment:
+/// - [`PillAlign::Left`]: first pill starts at [`BAR_LEFT_MARGIN`].
+/// - [`PillAlign::Center`]: pills are centered as a group in `band_width`.
+///
+/// Each pill is [`PILL_GAP`] cells after the previous. The same layout serves
+/// top and bottom bands (only the band origin differs). Pills that do not fit
+/// whole in `band_width` are dropped together with every pill after them, so
+/// painted pills and click targets always agree. Returns `(start, width)` in
+/// band columns. The center and right regions are reserved for status-system
+/// slots and stay empty.
+#[must_use]
+pub fn layout_pills(band_width: u16, label_widths: &[u16], align: PillAlign) -> Vec<(u16, u16)> {
+    // First pass: measure total width of pills that fit.
+    let mut total_width = 0u32;
+    let mut count = 0usize;
+    for &label in label_widths {
+        let pill_width = u32::from(label) + 2 * u32::from(PILL_PAD);
+        let gap = if count > 0 { u32::from(PILL_GAP) } else { 0 };
+        let needed = total_width + gap + pill_width;
+        let margin = if align == PillAlign::Left {
+            u32::from(BAR_LEFT_MARGIN)
+        } else {
+            0
+        };
+        if margin + needed > u32::from(band_width) {
+            break;
+        }
+        total_width = needed;
+        count += 1;
+    }
+
+    if count == 0 {
+        return Vec::new();
+    }
+
+    // Second pass: place pills at the computed start offset.
+    let start_col = match align {
+        PillAlign::Left => u32::from(BAR_LEFT_MARGIN),
+        PillAlign::Center => {
+            let available = u32::from(band_width);
+            if total_width >= available {
+                0
+            } else {
+                (available - total_width) / 2
+            }
+        }
+    };
+
+    let mut out = Vec::with_capacity(count);
+    let mut col = start_col;
+    for &label in &label_widths[..count] {
+        let width = u32::from(label) + 2 * u32::from(PILL_PAD);
+        out.push((saturate_u16(col), saturate_u16(width)));
+        col += width + u32::from(PILL_GAP);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,5 +442,62 @@ mod tests {
         let solved = solve(fits, BarEdge::Bottom, 1, true, floor);
         assert_eq!(solved.container.height, floor);
         assert!(solved.bar.is_some());
+    }
+
+    #[test]
+    fn pills_left_align_with_margin_padding_and_gaps() {
+        // Labels "ws1" and "ws2 (2)": widths 3 and 7.
+        let pills = layout_pills(80, &[3, 7], PillAlign::Left);
+        assert_eq!(pills, vec![(1, 5), (7, 9)]);
+    }
+
+    #[test]
+    fn pills_center_align_as_a_group() {
+        // Two pills: 5 + 1 gap + 9 = 15 total width.
+        // Band width 80: (80 - 15) / 2 = 32.5 -> 32 start.
+        let pills = layout_pills(80, &[3, 7], PillAlign::Center);
+        assert_eq!(pills, vec![(32, 5), (38, 9)]);
+        // Single pill: width 5, centered in 20 = (20-5)/2 = 7.
+        assert_eq!(layout_pills(20, &[3], PillAlign::Center), vec![(7, 5)]);
+        // Tight fit: no room to center, starts at 0.
+        assert_eq!(layout_pills(5, &[3], PillAlign::Center), vec![(0, 5)]);
+    }
+
+    #[test]
+    fn pills_that_do_not_fit_are_dropped_whole() {
+        // Margin 1 + pill 5 = 6 fits exactly; the second pill would end at 12.
+        assert_eq!(layout_pills(6, &[3, 3], PillAlign::Left), vec![(1, 5)]);
+        assert_eq!(layout_pills(5, &[3], PillAlign::Left), Vec::new());
+        assert_eq!(layout_pills(0, &[0], PillAlign::Left), Vec::new());
+        // A huge label saturates instead of wrapping.
+        assert_eq!(
+            layout_pills(u16::MAX, &[u16::MAX], PillAlign::Left),
+            Vec::new()
+        );
+        // Center alignment still drops pills that don't fit.
+        assert_eq!(layout_pills(5, &[3], PillAlign::Center), vec![(0, 5)]);
+        assert_eq!(layout_pills(4, &[3], PillAlign::Center), Vec::new());
+    }
+
+    #[test]
+    fn palette_defaults_and_token_resolution() {
+        let palette = BarPalette::default();
+        assert_eq!(
+            Some(palette.active_bg),
+            resolve_bar_token(DEFAULT_ACTIVE_TOKEN)
+        );
+        assert_eq!(
+            Some(palette.inactive_bg),
+            resolve_bar_token(DEFAULT_INACTIVE_TOKEN)
+        );
+        assert_ne!(palette.active_bg, palette.inactive_bg, "active is distinct");
+        // Light accent gets dark text, dark surface gets light text.
+        assert_eq!(palette.active_fg, rgb(LABEL_DARK));
+        assert_eq!(palette.inactive_fg, rgb(LABEL_LIGHT));
+        let custom = BarPalette::from_tokens(Some("muted"), Some("surface.2"));
+        assert_eq!(Some(custom.active_bg), resolve_bar_token("muted"));
+        assert_eq!(Some(custom.inactive_bg), resolve_bar_token("surface.2"));
+        // Unknown tokens fall back to the defaults.
+        assert_eq!(BarPalette::from_tokens(Some("nope"), Some("x.9")), palette);
     }
 }

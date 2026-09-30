@@ -359,19 +359,18 @@ fn band_press_switches_workspace_and_is_consumed_as_chrome() {
     let _ = rt.tick();
     rt.workspace_new().expect("ws2");
     assert_eq!(rt.active_workspace_index(), 1);
-    // Bar reads `1:ws1 2:ws2* (2)`: column 0 names ws1.
-    rt.handle_cursor_moved(band_pixels(&rt, 0));
+    // CTX-0874 pills: ws1 covers columns 1..6, ws2 covers 7..12.
+    rt.handle_cursor_moved(band_pixels(&rt, 1));
     rt.handle_mouse_input(press());
     rt.handle_mouse_input(release());
-    assert_eq!(rt.active_workspace_index(), 0, "column 0 hits ws1");
+    assert_eq!(rt.active_workspace_index(), 0, "pill padding hits ws1");
     assert!(!rt.has_selection(), "the band is chrome: no selection");
-    // Bar now reads `1:ws1* 2:ws2 (2)`: column 7 names ws2.
-    rt.handle_cursor_moved(band_pixels(&rt, 7));
+    rt.handle_cursor_moved(band_pixels(&rt, 11));
     rt.handle_mouse_input(press());
     rt.handle_mouse_input(release());
     assert_eq!(rt.active_workspace_index(), 1);
-    // The ` (2)` suffix switches nothing but is still consumed.
-    rt.handle_cursor_moved(band_pixels(&rt, 13));
+    // The gap between pills switches nothing but is still consumed.
+    rt.handle_cursor_moved(band_pixels(&rt, 6));
     rt.handle_mouse_input(press());
     rt.handle_mouse_input(release());
     assert_eq!(rt.active_workspace_index(), 1);
@@ -384,9 +383,10 @@ fn top_band_press_maps_to_the_right_workspace() {
     rt.workspace_new().expect("ws2");
     rt.workspace_new().expect("ws3");
     assert_eq!(rt.workspaceline_text(), "1:ws1 2:ws2 3:ws3* (3)");
+    // CTX-0874: the ws2 pill covers band columns 7..12 on the top edge too.
     rt.handle_cursor_moved(band_pixels(&rt, 8));
     rt.handle_mouse_input(press());
-    assert_eq!(rt.active_workspace_index(), 1, "column 8 hits ws2");
+    assert_eq!(rt.active_workspace_index(), 1, "column 8 hits the ws2 pill");
 }
 
 #[test]
@@ -501,7 +501,7 @@ fn bar_stays_visible_on_the_alternate_screen() {
         window_row_painted(&rt, band.y),
         "bar paints over alt screen"
     );
-    rt.handle_cursor_moved(band_pixels(&rt, 0));
+    rt.handle_cursor_moved(band_pixels(&rt, 2));
     rt.handle_mouse_input(press());
     assert_eq!(rt.active_workspace_index(), 0, "band click works on alt");
 }
@@ -605,4 +605,46 @@ fn top_band_split_border_drag_maps_through_the_leaf_origin() {
     rt.handle_mouse_input(release());
     assert!(!rt.border_drag_active());
     assert_eq!(rect_of(&rt, view_a).y, 1, "drag keeps the band offset");
+}
+
+/// RGBA of the pixel at the center of band column `col`.
+fn band_pixel(rt: &Runtime, col: u16) -> [u8; 4] {
+    let rgba = rt.headless_rgba().expect("headless rgba after tick");
+    let width = usize::try_from(rt.surface_extent().expect("extent").width()).expect("usize");
+    let pos = band_pixels(rt, col);
+    probe(&rgba, width, pos.x as usize, pos.y as usize)
+}
+
+#[test]
+fn pills_paint_distinct_active_and_inactive_backgrounds_on_either_edge() {
+    // CTX-0874: each workspace is a filled pill; the active pill color
+    // differs from inactive ones; the margin and gaps keep the ground.
+    // Pill padding cells (no glyph) are sampled so text ink never interferes.
+    for edge in [BarEdge::Bottom, BarEdge::Top] {
+        let mut rt = runtime_with(edge, true);
+        rt.workspace_new().expect("ws2");
+        let _ = rt.tick();
+        let band = rt.status_bar_band().expect("band");
+        if edge == BarEdge::Top {
+            assert_eq!(band.y, 0, "top band on row 0");
+        }
+        let bg = bitty_render::grid::DEFAULT_BG;
+        let inactive = band_pixel(&rt, 1);
+        let active = band_pixel(&rt, 7);
+        assert_ne!(inactive, bg, "{edge:?}: inactive pill is filled");
+        assert_ne!(active, bg, "{edge:?}: active pill is filled");
+        assert_ne!(active, inactive, "{edge:?}: active pill is distinct");
+        assert_eq!(band_pixel(&rt, 0), bg, "{edge:?}: left margin");
+        assert_eq!(band_pixel(&rt, 6), bg, "{edge:?}: gap");
+        assert_eq!(
+            band_pixel(&rt, band.width - 1),
+            bg,
+            "{edge:?}: right region"
+        );
+        // Switching moves the active color to the other pill.
+        assert!(rt.workspace_switch(0));
+        let _ = rt.tick();
+        assert_eq!(band_pixel(&rt, 1), active, "{edge:?}: ws1 now active");
+        assert_eq!(band_pixel(&rt, 7), inactive, "{edge:?}: ws2 now inactive");
+    }
 }

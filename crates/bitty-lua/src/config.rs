@@ -235,6 +235,15 @@ pub struct WorkspaceData {
     /// Workspace bar band edge (CTX-0873 `workspace = { bar = { edge =
     /// "top" } }`; raw string, spelling validated in `bitty-config`).
     pub bar_edge: Option<String>,
+    /// Active workspace pill color (CTX-0874 `workspace = { bar = { colors = { active = "accent" } } }`;
+    /// raw string, theme token name, validated in `bitty-config`).
+    pub bar_colors_active: Option<String>,
+    /// Inactive workspace pill color (CTX-0874 `workspace = { bar = { colors = { inactive = "surface.2" } } }`;
+    /// raw string, theme token name, validated in `bitty-config`).
+    pub bar_colors_inactive: Option<String>,
+    /// Workspace pill alignment (CTX-0874 `workspace = { bar = { pill_align = "left" } }`;
+    /// raw string "left" or "center", validated in `bitty-config`).
+    pub bar_pill_align: Option<String>,
 }
 
 /// Core-owned workspace decoration overrides, plain data (CTX-0292; unified
@@ -1243,21 +1252,62 @@ impl ConfigData {
                     };
                     // CTX-0873: `bar = { edge = "top" }` places the Core
                     // chrome band; unknown sub-keys fail closed.
-                    let bar_edge = match get_field(nested, "bar") {
-                        Some(v) => {
-                            let bar = expect_table("workspace.bar", v)?;
-                            check_nested_keys("workspace.bar", bar, &["edge"])?;
-                            match get_field(bar, "edge") {
-                                Some(e) => Some(expect_string("workspace.bar.edge", e)?),
-                                None => None,
+                    // CTX-0874: `bar = { colors = { active = "accent", inactive = "surface.2" } }`
+                    // sets workspace pill colors; `bar = { pill_align = "left" }` sets alignment.
+                    let (bar_edge, bar_colors_active, bar_colors_inactive, bar_pill_align) =
+                        match get_field(nested, "bar") {
+                            Some(v) => {
+                                let bar = expect_table("workspace.bar", v)?;
+                                check_nested_keys(
+                                    "workspace.bar",
+                                    bar,
+                                    &["edge", "colors", "pill_align"],
+                                )?;
+                                let edge = match get_field(bar, "edge") {
+                                    Some(e) => Some(expect_string("workspace.bar.edge", e)?),
+                                    None => None,
+                                };
+                                let (active, inactive) = match get_field(bar, "colors") {
+                                    Some(c) => {
+                                        let colors = expect_table("workspace.bar.colors", c)?;
+                                        check_nested_keys(
+                                            "workspace.bar.colors",
+                                            colors,
+                                            &["active", "inactive"],
+                                        )?;
+                                        let active = match get_field(colors, "active") {
+                                            Some(a) => Some(expect_string(
+                                                "workspace.bar.colors.active",
+                                                a,
+                                            )?),
+                                            None => None,
+                                        };
+                                        let inactive = match get_field(colors, "inactive") {
+                                            Some(i) => Some(expect_string(
+                                                "workspace.bar.colors.inactive",
+                                                i,
+                                            )?),
+                                            None => None,
+                                        };
+                                        (active, inactive)
+                                    }
+                                    None => (None, None),
+                                };
+                                let pill_align = match get_field(bar, "pill_align") {
+                                    Some(p) => Some(expect_string("workspace.bar.pill_align", p)?),
+                                    None => None,
+                                };
+                                (edge, active, inactive, pill_align)
                             }
-                        }
-                        None => None,
-                    };
+                            None => (None, None, None, None),
+                        };
                     out.workspace = Some(WorkspaceData {
                         layout,
                         show_bar,
                         bar_edge,
+                        bar_colors_active,
+                        bar_colors_inactive,
+                        bar_pill_align,
                     });
                 }
                 "decoration" => {

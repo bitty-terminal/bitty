@@ -2226,6 +2226,25 @@ pub struct WorkspaceConfig {
     /// (`workspace.bar.edge`, CTX-0873). `None` means the layer says
     /// nothing; the effective default is [`WorkspaceBarEdge::Bottom`].
     pub bar_edge: Option<WorkspaceBarEdge>,
+    /// Bar pill color configuration (`workspace.bar.colors`, CTX-0874).
+    /// `None` means the layer says nothing; defaults apply.
+    pub bar_colors: Option<WorkspaceBarColors>,
+    /// Pill alignment (`workspace.bar.pill_align`, CTX-0874): "left" or "center".
+    /// `None` means the layer says nothing; effective default is "left".
+    pub bar_pill_align: Option<String>,
+}
+
+/// Workspace bar pill colors (CTX-0874, issue #1431 C).
+///
+/// Accepts theme token names (e.g., "accent", "surface.2"). Theme token
+/// resolution is deferred; runtime uses placeholder colors when tokens are
+/// not yet integrated.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorkspaceBarColors {
+    /// Active workspace pill color token name (`workspace.bar.colors.active`).
+    pub active: Option<String>,
+    /// Inactive workspace pill color token name (`workspace.bar.colors.inactive`).
+    pub inactive: Option<String>,
 }
 
 /// Window edge of the workspace bar band (CTX-0873, issue #1431).
@@ -2273,7 +2292,44 @@ impl WorkspaceConfig {
             bitty_ui::provider::ProviderName::parse(name)
                 .map_err(|e| ConfigError::validation("workspace.layout", e.to_string()))?;
         }
+        if let Some(colors) = &self.bar_colors {
+            for (field, token) in [
+                ("workspace.bar.colors.active", colors.active.as_deref()),
+                ("workspace.bar.colors.inactive", colors.inactive.as_deref()),
+            ] {
+                if let Some(token) = token {
+                    validate_theme_token(field, token)?;
+                }
+            }
+        }
         Ok(())
+    }
+}
+
+/// Maximum byte length of a theme token name (`workspace.bar.colors.*`,
+/// CTX-0874).
+pub const MAX_THEME_TOKEN_LEN: usize = 32;
+
+/// Validates a theme token name spelling fail-closed (CTX-0874): an ASCII
+/// lowercase letter followed by lowercase letters, digits, `.`, `_`, or
+/// `-`, at most [`MAX_THEME_TOKEN_LEN`] bytes (`accent`, `surface.2`).
+/// Membership in the theme's token set is resolved by the consumer; the
+/// value is never echoed in the diagnostic.
+fn validate_theme_token(field: &str, token: &str) -> Result<(), ConfigError> {
+    let mut chars = token.chars();
+    let well_formed = token.len() <= MAX_THEME_TOKEN_LEN
+        && chars.next().is_some_and(|c| c.is_ascii_lowercase())
+        && chars
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'));
+    if well_formed {
+        Ok(())
+    } else {
+        Err(ConfigError::validation(
+            field,
+            format!(
+                "must be a theme token name (lowercase letter, then [a-z0-9._-], at most {MAX_THEME_TOKEN_LEN} bytes)"
+            ),
+        ))
     }
 }
 

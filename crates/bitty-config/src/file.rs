@@ -1976,10 +1976,34 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
                     }
                 },
             };
+            let bar_colors = if w.bar_colors_active.is_some() || w.bar_colors_inactive.is_some() {
+                Some(crate::types::WorkspaceBarColors {
+                    active: w.bar_colors_active,
+                    inactive: w.bar_colors_inactive,
+                })
+            } else {
+                None
+            };
+            let bar_pill_align = match w.bar_pill_align {
+                None => None,
+                Some(raw) => {
+                    let trimmed = raw.trim();
+                    if trimmed == "left" || trimmed == "center" {
+                        Some(trimmed.to_string())
+                    } else {
+                        return Err(ConfigError::validation(
+                            "workspace.bar.pill_align",
+                            "must be one of \"left\", \"center\"",
+                        ));
+                    }
+                }
+            };
             Some(crate::types::WorkspaceConfig {
                 layout: w.layout,
                 show_bar: w.show_bar,
                 bar_edge,
+                bar_colors,
+                bar_pill_align,
             })
         }
     };
@@ -2563,6 +2587,79 @@ mod tests {
         assert_eq!(WorkspaceBarEdge::default(), WorkspaceBarEdge::Bottom);
         for edge in [WorkspaceBarEdge::Top, WorkspaceBarEdge::Bottom] {
             assert_eq!(WorkspaceBarEdge::parse(edge.as_str()), Some(edge));
+        }
+    }
+
+    #[test]
+    fn lua_workspace_bar_colors_parse_and_validate() {
+        // CTX-0874: `workspace.bar.colors.active` and `workspace.bar.colors.inactive`
+        // accept theme token names; absent means "says nothing" (None so merge keeps lower);
+        // wrong types and unknown sub-keys fail closed naming the field.
+        let plan = parse_lua_config(
+            r#"return { workspace = { bar = { colors = { active = "accent", inactive = "surface.2" } } } }"#,
+            &test_source(),
+        )
+        .expect("workspace bar colors parse");
+        let ws = plan.workspace.expect("workspace present");
+        let colors = ws.bar_colors.expect("bar_colors present");
+        assert_eq!(colors.active.as_deref(), Some("accent"));
+        assert_eq!(colors.inactive.as_deref(), Some("surface.2"));
+
+        // Only active
+        let plan = parse_lua_config(
+            r#"return { workspace = { bar = { colors = { active = "primary" } } } }"#,
+            &test_source(),
+        )
+        .expect("only active parses");
+        let ws = plan.workspace.expect("workspace present");
+        let colors = ws.bar_colors.expect("bar_colors present");
+        assert_eq!(colors.active.as_deref(), Some("primary"));
+        assert!(colors.inactive.is_none());
+
+        // Only inactive
+        let plan = parse_lua_config(
+            r#"return { workspace = { bar = { colors = { inactive = "muted" } } } }"#,
+            &test_source(),
+        )
+        .expect("only inactive parses");
+        let ws = plan.workspace.expect("workspace present");
+        let colors = ws.bar_colors.expect("bar_colors present");
+        assert!(colors.active.is_none());
+        assert_eq!(colors.inactive.as_deref(), Some("muted"));
+
+        // Empty colors table means "says nothing"
+        let plan = parse_lua_config(
+            r#"return { workspace = { bar = { colors = {} } } }"#,
+            &test_source(),
+        )
+        .expect("empty colors parses");
+        let ws = plan.workspace.expect("workspace present");
+        assert!(ws.bar_colors.is_none());
+
+        // No colors key means "says nothing"
+        let plan = parse_lua_config(
+            r#"return { workspace = { bar = { edge = "top" } } }"#,
+            &test_source(),
+        )
+        .expect("no colors parses");
+        let ws = plan.workspace.expect("workspace present");
+        assert!(ws.bar_colors.is_none());
+
+        // Wrong types fail closed
+        for bad in [
+            r#"return { workspace = { bar = { colors = { active = 123 } } } }"#,
+            r#"return { workspace = { bar = { colors = { inactive = true } } } }"#,
+            r#"return { workspace = { bar = { colors = "accent" } } }"#,
+            r#"return { workspace = { bar = { colors = { bogus = "value" } } } }"#,
+            // Token spelling is validated fail-closed.
+            r#"return { workspace = { bar = { colors = { active = "Accent" } } } }"#,
+            r##"return { workspace = { bar = { colors = { active = "#ff0000" } } } }"##,
+            r#"return { workspace = { bar = { colors = { inactive = "" } } } }"#,
+            r#"return { workspace = { bar = { colors = { inactive = "2surface" } } } }"#,
+        ] {
+            let err = parse_lua_config(bad, &test_source()).expect_err(bad);
+            let msg = err.to_string();
+            assert!(msg.contains("workspace.bar"), "{bad}: {msg}");
         }
     }
 

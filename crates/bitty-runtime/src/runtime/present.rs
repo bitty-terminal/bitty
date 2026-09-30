@@ -355,7 +355,14 @@ fn erased_snapshot(base: &Snapshot) -> Snapshot {
 /// defaults: the band never inherits a grid's screen modes (for example
 /// DECSCNM reverse video) or copies its title. Pure; never touches grid
 /// truth.
-fn band_snapshot(base: &Snapshot, cols: usize, rows: usize, text: &str) -> Snapshot {
+fn band_snapshot(
+    base: &Snapshot,
+    cols: usize,
+    rows: usize,
+    text: &str,
+    pills: &[super::workspaces::BarPill],
+    palette: &chrome_band::BarPalette,
+) -> Snapshot {
     let len = cols.saturating_mul(rows);
     let mut cursor = base.cursor.clone();
     cursor.visible = false;
@@ -369,8 +376,101 @@ fn band_snapshot(base: &Snapshot, cols: usize, rows: usize, text: &str) -> Snaps
         modes: bitty_term_state::Modes::default(),
         title: bitty_vt::BoundedString::new(""),
     };
-    overlay_status_bar(&mut snapshot, text);
+    // CTX-0874: workspace pills replace the text row; the text overlay
+    // stays as the fail-closed fallback (empty workspace list em-dash).
+    if pills.is_empty() {
+        overlay_status_bar(&mut snapshot, text);
+    } else {
+        overlay_workspace_pills(&mut snapshot, pills, palette);
+    }
     snapshot
+}
+
+/// Paints workspace pills onto the last row of an owned band snapshot
+/// (CTX-0874, issue #1431 C).
+///
+/// Each pill is a run of cells whose background is the pill color
+/// (active or inactive from `palette`) with the label drawn in the
+/// contrasting label color, starting one [`chrome_band::PILL_PAD`] in.
+/// Pills are rectangular cell blocks: rounded, pixel-level shapes belong
+/// to the renderer and are out of scope. Cells outside every pill keep
+/// the erased default style, so the band background is the theme ground.
+/// The layout comes from [`Runtime::bar_pills`], the same geometry the
+/// band hit-test uses. Labels are laid out width-aware; control scalars
+/// render as spaces, zero-width scalars attach to the previous cell, and a
+/// wide scalar that would cross the pill edge is dropped. Total: empty or
+/// mismatched snapshots and out-of-range pills paint nothing.
+fn overlay_workspace_pills(
+    snapshot: &mut Snapshot,
+    pills: &[super::workspaces::BarPill],
+    palette: &chrome_band::BarPalette,
+) {
+    if snapshot.height == 0 || snapshot.width == 0 {
+        return;
+    }
+    if snapshot.cells.len() != snapshot.width.saturating_mul(snapshot.height) {
+        return;
+    }
+    let row_start = snapshot
+        .width
+        .saturating_mul(snapshot.height.saturating_sub(1));
+    for pill in pills {
+        let start = usize::from(pill.start);
+        let end = start.saturating_add(usize::from(pill.width));
+        if end > snapshot.width {
+            continue;
+        }
+        let (bg, fg) = if pill.active {
+            (palette.active_bg, palette.active_fg)
+        } else {
+            (palette.inactive_bg, palette.inactive_fg)
+        };
+        let style = Style {
+            foreground: Some(bitty_term_state::Color::Rgb(fg)),
+            background: Some(bitty_term_state::Color::Rgb(bg)),
+            underline_color: None,
+            attributes: Attributes {
+                bold: pill.active,
+                ..Default::default()
+            },
+        };
+        for col in start..end {
+            snapshot.cells[row_start + col] = Cell::erased(style);
+        }
+        let label_end = end.saturating_sub(usize::from(chrome_band::PILL_PAD));
+        let mut col = start.saturating_add(usize::from(chrome_band::PILL_PAD));
+        for ch in pill.label.chars() {
+            if col >= label_end {
+                break;
+            }
+            if ch.is_control() {
+                col += 1;
+                continue;
+            }
+            let width = usize::from(char_cell_width(ch));
+            if width == 0 {
+                if col > start {
+                    let _ = snapshot.cells[row_start + col - 1].push_zerowidth(ch);
+                }
+                continue;
+            }
+            if col + width > label_end {
+                break;
+            }
+            snapshot.cells[row_start + col] = Cell {
+                glyph: ch,
+                style,
+                width: width as u8,
+                spacer: false,
+                hyperlink: None,
+                zerowidth: Zerowidth::new(),
+            };
+            if width == 2 {
+                snapshot.cells[row_start + col + 1] = Cell::wide_spacer(style);
+            }
+            col += width;
+        }
+    }
 }
 
 /// Paints the status bar text onto the last row of an owned band
@@ -1231,11 +1331,15 @@ impl Runtime {
         built: &mut CombinedLeaves,
     ) -> bool {
         let live = self.live_cell_metrics();
+        let pills = self.bar_pills();
+        let palette = self.bar_palette();
         let snap = band_snapshot(
             base,
             usize::from(band.width),
             usize::from(band.height),
             text,
+            &pills,
+            &palette,
         );
         let damage = Damage {
             generation: base.generation,
@@ -3003,6 +3107,114 @@ mod content_padding_tests {
         );
         assert!(rt.set_decoration(Decoration::ZERO).is_ok());
         assert_eq!(rt.decoration(), Decoration::ZERO);
+    }
+}
+
+#[cfg(test)]
+mod workspace_pill_overlay_tests {
+    use super::overlay_workspace_pills;
+    use crate::runtime::chrome_band::{BarPalette, layout_pills, PillAlign};
+    use crate::runtime::workspaces::BarPill;
+    use bitty_term_state::{Color, State};
+
+    fn blank(width: usize) -> bitty_term_state::Snapshot {
+        let mut state = State::new();
+        state.resize(width, 1);
+        state.snapshot()
+    }
+
+    fn pills(labels: &[&str], active: usize, width: u16) -> Vec<BarPill> {
+        let widths: Vec<u16> = labels.iter().map(|l| l.len() as u16).collect();
+        layout_pills(width, &widths, PillAlign::Left)
+            .into_iter()
+            .enumerate()
+            .map(|(index, (start, width))| BarPill {
+                index,
+                start,
+                width,
+                label: labels[index].to_string(),
+                active: index == active,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pill_backgrounds_span_exactly_their_cells_with_labels() {
+        let palette = BarPalette::default();
+        let mut snap = blank(20);
+        let laid = pills(&["ws1", "ws2 (2)"], 1, 20);
+        overlay_workspace_pills(&mut snap, &laid, &palette);
+        let bg = |col: usize| snap.cells[col].style.background;
+        let inactive = Some(Color::Rgb(palette.inactive_bg));
+        let active = Some(Color::Rgb(palette.active_bg));
+        // Margin, gap, and the reserved right region keep the ground.
+        assert_eq!(bg(0), None);
+        assert_eq!(bg(6), None);
+        assert!((16..20).all(|c| bg(c).is_none()));
+        // Pill 0 covers 1..6, pill 1 covers 7..16, padding included.
+        assert!((1..6).all(|c| bg(c) == inactive));
+        assert!((7..16).all(|c| bg(c) == active));
+        let text: String = snap.cells.iter().map(|c| c.glyph).collect();
+        assert_eq!(&text[1..6], " ws1 ");
+        assert_eq!(&text[7..16], " ws2 (2) ");
+        // Active label is contrasting and bold; inactive is not bold.
+        assert_eq!(
+            snap.cells[8].style.foreground,
+            Some(Color::Rgb(palette.active_fg))
+        );
+        assert!(snap.cells[8].style.attributes.bold);
+        assert!(!snap.cells[2].style.attributes.bold);
+        assert_ne!(active, inactive, "active pill color is distinct");
+    }
+
+    #[test]
+    fn pill_labels_are_width_aware_and_clipped_to_the_pill() {
+        let palette = BarPalette::default();
+        let mut snap = blank(10);
+        // One wide scalar: pill width 2 + 2 pad; spacer stays inside.
+        let pill = BarPill {
+            index: 0,
+            start: 1,
+            width: 4,
+            label: "\u{4e2d}".to_string(),
+            active: true,
+        };
+        overlay_workspace_pills(&mut snap, std::slice::from_ref(&pill), &palette);
+        assert_eq!(snap.cells[2].glyph, '\u{4e2d}');
+        assert!(snap.cells[3].spacer);
+        assert_eq!(snap.cells[4].glyph, ' ');
+        // A label longer than its pill never paints past the padding.
+        let mut short = blank(10);
+        let long = BarPill {
+            width: 4,
+            label: "abcdef".to_string(),
+            ..pill
+        };
+        overlay_workspace_pills(&mut short, std::slice::from_ref(&long), &palette);
+        let text: String = short.cells.iter().map(|c| c.glyph).collect();
+        assert_eq!(&text[1..5], " ab ");
+        assert_eq!(short.cells[5].style.background, None);
+    }
+
+    #[test]
+    fn pills_are_noop_on_degenerate_input() {
+        let palette = BarPalette::default();
+        // Out-of-range pill paints nothing.
+        let mut snap = blank(4);
+        let pill = BarPill {
+            index: 0,
+            start: 2,
+            width: 5,
+            label: "x".to_string(),
+            active: false,
+        };
+        overlay_workspace_pills(&mut snap, std::slice::from_ref(&pill), &palette);
+        assert!(snap.cells.iter().all(|c| c.style.background.is_none()));
+        // Length mismatch never indexes out of bounds.
+        let mut bad = blank(4);
+        bad.cells = bad.cells[0..2].to_vec().into_boxed_slice();
+        overlay_workspace_pills(&mut bad, std::slice::from_ref(&pill), &palette);
+        assert_eq!(bad.cells.len(), 2);
     }
 }
 

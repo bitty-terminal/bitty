@@ -949,6 +949,23 @@ impl Runtime {
                     self.drop_selection_owned_by(fed);
                 }
             }
+            // Kitty image placement clear on display erase (CTX-0883, issue #1545):
+            // When FullReset or a whole-screen erase (ED 2 All, ED 22 ScrollAndClear)
+            // occurs, active kitty image placements on this origin are cleared,
+            // matching kitty/ghostty parity so `clear` removes visible images.
+            let screen_cleared = matches!(action, TerminalAction::FullReset)
+                || matches!(
+                    action,
+                    TerminalAction::EraseInDisplay {
+                        mode: bitty_vt::EraseDisplayMode::All
+                            | bitty_vt::EraseDisplayMode::ScrollAndClear,
+                    }
+                );
+            if screen_cleared {
+                self.kitty_images.clear_origin(self.kitty_origin);
+                self.kitty_raster_cache.clear();
+            }
+
             // CTX-0146 (Issue #238): answer standard terminal queries with
             // true capabilities. The parser maps these shapes to `Unknown`
             // (inert for the grid); the runtime queues the bounded reply via

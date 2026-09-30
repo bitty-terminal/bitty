@@ -40,6 +40,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Screen clear drops active Kitty image placements (CTX-0883, #1545):** executing
+  `clear` (`ED 2` / `CSI 2 J`, `ED 22` scroll-and-clear, or `FullReset` / RIS)
+  previously cleared character cells but left active Kitty image placements in
+  `KittyImageLayer`. `clear` now clears placements for the affected PTY origin
+  and purges the raster cache, matching Kitty and Ghostty behavior.
+
 - **Text selection is View-owned (CTX-0803, #1476, #1433):** the runtime kept
   one global selection that worked only against the primary grid. The pointer
   mapped through the primary-global `cursor_to_cell`, which subtracts no leaf

@@ -736,6 +736,69 @@ pub trait HostServices {
         let _ = (provider, generation, iface, method, args);
         Err(BridgeError::not_implemented("bitty.services.get"))
     }
+
+    /// Inspect runtime state for `bitty.debug.inspect` (CTX-0894).
+    ///
+    /// Returns a table with debug information about the specified target:
+    /// - `"plugins"` → list of loaded plugin states
+    /// - `"events"` → event bus subscription state
+    /// - `"commands"` → registered command catalog
+    /// - `"panels"` → panel lifecycle state
+    /// - `"grants"` → capability grant state for calling plugin
+    ///
+    /// The default implementation always returns `E_NOT_IMPLEMENTED`. Overriding
+    /// implementations must enforce the `debug.inspect` capability grant.
+    /// Grant-gated and read-only: never mutates state, returns bounded snapshot data.
+    fn debug_inspect(&self, target: &str) -> Result<LuaValue, BridgeError> {
+        let _ = target;
+        Err(BridgeError::not_implemented("bitty.debug.inspect"))
+    }
+
+    /// Enable/disable event tracing for `bitty.debug.trace` (CTX-0894).
+    ///
+    /// Controls runtime event tracing with options:
+    /// - `enabled` (bool) → turn tracing on/off
+    /// - `filter` (string, optional) → event topic pattern (e.g., "bitty.plugin:*")
+    /// - `max_events` (integer, optional) → ring buffer size (default 1000, max 10000)
+    ///
+    /// Returns a handle (integer) for retrieving trace events via
+    /// `debug_trace_get`. The default implementation always returns
+    /// `E_NOT_IMPLEMENTED`. Overriding implementations must enforce the
+    /// `debug.trace` capability grant.
+    fn debug_trace(&self, opts: &LuaValue) -> Result<i64, BridgeError> {
+        let _ = opts;
+        Err(BridgeError::not_implemented("bitty.debug.trace"))
+    }
+
+    /// Retrieve traced events for `bitty.debug.trace` (CTX-0894).
+    ///
+    /// Returns an array of event records from the trace buffer identified by
+    /// `handle`. Each record contains:
+    /// - `topic` (string) → event topic
+    /// - `timestamp` (integer) → milliseconds since trace start
+    /// - `payload` (table) → bounded event payload
+    ///
+    /// The default implementation fails closed with `E_NOT_IMPLEMENTED`.
+    fn debug_trace_get(&self, handle: i64) -> Result<LuaValue, BridgeError> {
+        let _ = handle;
+        Err(BridgeError::not_implemented("bitty.debug.trace"))
+    }
+
+    /// Control runtime behavior for `bitty.debug.control` (CTX-0894).
+    ///
+    /// High-risk debug controls:
+    /// - `reload_plugin(id: string)` → hot-reload a plugin by id
+    /// - `suspend_plugin(id: string)` → suspend a plugin's execution
+    /// - `resume_plugin(id: string)` → resume a suspended plugin
+    /// - `clear_state(id: string)` → clear a plugin's persisted state
+    ///
+    /// The default implementation always returns `E_NOT_IMPLEMENTED`. Overriding
+    /// implementations must enforce the `debug.control` capability grant
+    /// (high-risk, requires explicit consent).
+    fn debug_control(&self, action: &str, target: &str) -> Result<LuaValue, BridgeError> {
+        let _ = (action, target);
+        Err(BridgeError::not_implemented("bitty.debug.control"))
+    }
 }
 
 /// One captured command registration from `init.lua`.
@@ -2167,6 +2230,123 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
     )
     .expect("env table accepts 'has'");
 
+    // CTX-0894: `bitty.debug.*` namespace for devtools plugin support.
+    // Default implementations always return E_NOT_IMPLEMENTED. Overriding
+    // implementations must enforce the grants: `debug.inspect` (read-only state
+    // inspection), `debug.trace` (event tracing), `debug.control` (high-risk
+    // reload/suspend, requires explicit consent).
+    let debug = Table::new(&ctx);
+    debug
+        .set(
+            ctx,
+            "inspect",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let target = match stack.get(0) {
+                        Value::String(s) => String::from_utf8_lossy(s.as_bytes()).into_owned(),
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_DEF_INVALID",
+                                "debug.inspect target must be a string",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let result = state
+                        .bounded(|_expiry| state.services.debug_inspect(&target))
+                        .map_err(|e| e.to_error(ctx))?;
+                    stack.replace(ctx, result.to_lua(ctx));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("debug table accepts 'inspect'");
+    debug
+        .set(
+            ctx,
+            "trace",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let opts = LuaValue::from_lua(stack.get(0), state.limits)
+                        .map_err(|e| e.to_error(ctx))?;
+                    let handle = state
+                        .bounded(|_expiry| state.services.debug_trace(&opts))
+                        .map_err(|e| e.to_error(ctx))?;
+                    stack.replace(ctx, Value::Integer(handle));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("debug table accepts 'trace'");
+    debug
+        .set(
+            ctx,
+            "trace_get",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let handle = match stack.get(0) {
+                        Value::Integer(h) => h,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_DEF_INVALID",
+                                "debug.trace_get handle must be an integer",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let result = state
+                        .bounded(|_expiry| state.services.debug_trace_get(handle))
+                        .map_err(|e| e.to_error(ctx))?;
+                    stack.replace(ctx, result.to_lua(ctx));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("debug table accepts 'trace_get'");
+    debug
+        .set(
+            ctx,
+            "control",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let action = match stack.get(0) {
+                        Value::String(s) => String::from_utf8_lossy(s.as_bytes()).into_owned(),
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_DEF_INVALID",
+                                "debug.control action must be a string",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let target = match stack.get(1) {
+                        Value::String(s) => String::from_utf8_lossy(s.as_bytes()).into_owned(),
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_DEF_INVALID",
+                                "debug.control target must be a string",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let result = state
+                        .bounded(|_expiry| state.services.debug_control(&action, &target))
+                        .map_err(|e| e.to_error(ctx))?;
+                    stack.replace(ctx, result.to_lua(ctx));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("debug table accepts 'control'");
+
     let ui = Table::new(&ctx);
     ui.set(
         ctx,
@@ -2267,6 +2447,8 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         .expect("root accepts tasks");
     root.set(ctx, "env", readonly_table(ctx, env))
         .expect("root accepts env");
+    root.set(ctx, "debug", readonly_table(ctx, debug))
+        .expect("root accepts debug");
     Value::Table(readonly_table(ctx, root))
 }
 

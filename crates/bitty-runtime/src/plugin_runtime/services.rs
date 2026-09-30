@@ -1133,6 +1133,37 @@ impl HostServices for PluginServices {
         }
         Ok(result)
     }
+
+    fn debug_inspect(&self, target: &str) -> Result<LuaValue, BridgeError> {
+        // CTX-0894: Inspect runtime state (plugins, terminals, panels, services)
+        // TODO: enforce debug.inspect capability grant when the backend is implemented
+        let _ = target;
+        // TODO: implement actual inspection logic when debug backend is ready
+        Err(BridgeError::not_implemented("bitty.debug.inspect"))
+    }
+
+    fn debug_trace(&self, opts: &LuaValue) -> Result<i64, BridgeError> {
+        // CTX-0894: Enable event tracing with configurable filter and buffer size
+        // TODO: enforce debug.trace capability grant when the backend is implemented
+        let _ = opts;
+        // TODO: implement tracing backend when event system is ready
+        Err(BridgeError::not_implemented("bitty.debug.trace"))
+    }
+
+    fn debug_trace_get(&self, handle: i64) -> Result<LuaValue, BridgeError> {
+        // CTX-0894: Retrieve traced events by handle
+        let _ = handle;
+        // TODO: return buffered events when tracing backend is ready
+        Err(BridgeError::not_implemented("bitty.debug.trace"))
+    }
+
+    fn debug_control(&self, action: &str, target: &str) -> Result<LuaValue, BridgeError> {
+        // CTX-0894: High-risk debug controls (reload, suspend, resume, clear_state)
+        // TODO: enforce debug.control capability grant and explicit consent when the backend is implemented
+        let _ = (action, target);
+        // TODO: implement plugin lifecycle controls when runtime supports it
+        Err(BridgeError::not_implemented("bitty.debug.control"))
+    }
 }
 
 #[cfg(test)]

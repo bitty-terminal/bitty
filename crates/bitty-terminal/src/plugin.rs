@@ -3316,45 +3316,6 @@ mod tests {
     }
 
     #[test]
-    fn revoke_cap_partial_keeps_remaining_grants() {
-        let dir = scratch_dir("revoke-partial");
-        let target = dir.join("init.lua");
-        let config = target.display().to_string();
-        let (code, out, _) = run(
-            &["install", "bitty-terminal.browser-panel", "--yes"],
-            Some(&config),
-            "",
-        );
-        assert_eq!(code, EXIT_OK, "{out}");
-        let file = state_path(&dir);
-
-        let (code, out, _) = run(
-            &[
-                "revoke",
-                "bitty-terminal.browser-panel",
-                "--cap",
-                "panel.create",
-            ],
-            Some(&config),
-            "",
-        );
-        assert_eq!(code, EXIT_OK, "{out}");
-        assert!(out.contains("revoked 'panel.create'"), "{out}");
-        let text = std::fs::read_to_string(&file).expect("state rewritten");
-        let granted_line = text
-            .lines()
-            .find(|line| line.starts_with("granted = "))
-            .expect("granted line");
-        assert!(!granted_line.contains("\"panel.create\""), "{text}");
-        assert!(text.contains("denied = [\"panel.create\"]"), "{text}");
-        // Remaining grants stay: the plugin record is not disabled by a
-        // partial revoke.
-        assert!(text.contains("enabled = true"), "{text}");
-        assert!(text.contains("\"panel.provider\""), "{text}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn revoke_rejects_unknown_plugin_and_ungranted_capability() {
         let dir = scratch_dir("revoke-reject");
         let target = dir.join("init.lua");

@@ -1606,7 +1606,7 @@ mod tests {
     #[test]
     fn plugins_lists_bundled_sorted_and_disabled() {
         let plugins = list_plugins();
-        assert_eq!(plugins.len(), 6);
+        assert_eq!(plugins.len(), 2);
         let ids: Vec<&str> = plugins.iter().map(|p| p.id.as_str()).collect();
         let mut sorted = ids.clone();
         sorted.sort();
@@ -1616,8 +1616,13 @@ mod tests {
             assert!(!p.enabled);
         }
         assert!(ids.contains(&"bitty-terminal.workspace"));
-        // Palette, statusline, git-panel, and file-manager migrated to independent
-        // packages, so they are not bundled rows.
+        assert!(ids.contains(&"bitty-terminal.shell-integration"));
+        // Removed plugins are not bundled (CTX-0886: Unix philosophy, Core mechanism only)
+        assert!(!ids.contains(&"bitty-terminal.ai-panel"));
+        assert!(!ids.contains(&"bitty-terminal.mail-panel"));
+        assert!(!ids.contains(&"bitty-terminal.browser-panel"));
+        assert!(!ids.contains(&"bitty-terminal.project"));
+        // Migrated to independent packages
         assert!(!ids.contains(&"bitty-terminal.palette"));
         assert!(!ids.contains(&"bitty-terminal.statusline"));
         assert!(!ids.contains(&"bitty-terminal.git-panel"));

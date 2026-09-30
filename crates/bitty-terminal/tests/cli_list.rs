@@ -237,16 +237,21 @@ fn list_plugins_table_contains_bundled() {
 }
 
 #[test]
-fn list_plugins_json_count_is_six() {
+fn list_plugins_json_count_is_two() {
     let output = run_bitty(&["list", "plugins", "--format", "json"], &[]);
     assert_eq!(output.status.code(), Some(0));
     let doc = parse_stdout_json(&stdout(&output));
     assert!(doc.contains("\"kind\":\"plugins\""));
-    assert!(doc.contains("\"count\":6"), "count: {:?}", doc.text());
+    assert!(doc.contains("\"count\":2"), "count: {:?}", doc.text());
+    // CTX-0886: Unix philosophy, Core mechanism only. Only workspace and shell-integration bundled.
     assert!(!doc.contains("bitty-terminal.palette"));
     assert!(!doc.contains("bitty-terminal.statusline"));
     assert!(!doc.contains("bitty-terminal.git-panel"));
     assert!(!doc.contains("bitty-terminal.file-manager"));
+    assert!(!doc.contains("bitty-terminal.ai-panel"));
+    assert!(!doc.contains("bitty-terminal.mail-panel"));
+    assert!(!doc.contains("bitty-terminal.browser-panel"));
+    assert!(!doc.contains("bitty-terminal.project"));
 }
 
 #[test]

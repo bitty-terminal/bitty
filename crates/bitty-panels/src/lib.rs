@@ -22,25 +22,15 @@
 //!
 //! # Status (staging boundary, not a shipped split)
 //!
-//! Extraction of these panels to independent first-party packages remains
-//! gated on the accepted OQ-053 verdicts:
+//! `ai_panel` and `mail_panel` have been removed per CTX-0886 (Unix philosophy:
+//! Core provides mechanism only). They will become independent crates
+//! (`bitty-ai`, `bitty-mail`) like `bitty-network`, gated on the
+//! panel-provider contract (OQ-058) and credential-source contract
+//! (OQ-054/OQ-055).
 //!
-//! - [`ai_panel`]: split later (hybrid) — gated on the panel-provider contract
-//!   (bitty-docs `CTX-0181`, OQ-058) and the `bitty-ai` surfaces
-//!   (OQ-066/OQ-080/OQ-081); owning task `CTX-0402`.
-//! - [`mail_panel`]: split later — gated on the panel-provider contract and
-//!   the credential-source contract (OQ-054/OQ-055); owning task `CTX-0403`.
-//!
-//! Until those contracts land, this crate is the in-tree home that keeps the
-//! experiences out of the microkernel crate while the bundled catalog,
-//! manifests (bitty-plugin-host `bundled.rs`), capability strings, and wire
-//! shapes stay unchanged. Panels recorded as Core or already split
-//! (`browser-panel` per `CTX-0401`; `palette`/`statusline` residual Core
-//! helpers per `CTX-0397`/`CTX-0398`; `project`, `shell-integration`, and the
-//! workspace core per the OQ-053 decision) deliberately stay in
-//! `bitty-runtime` in this phase.
+//! Panels recorded as Core or already split (`browser-panel` per `CTX-0401`;
+//! `palette`/`statusline` residual Core helpers per `CTX-0397`/`CTX-0398`;
+//! `project`, `shell-integration`, and the workspace core per the OQ-053
+//! decision) deliberately stay in `bitty-runtime` in this phase.
 
 mod scaffold;
-
-pub mod ai_panel;
-pub mod mail_panel;

@@ -2,15 +2,17 @@
 //!
 //! This module defines the **exact** accepted bundled-disabled set for `v1`
 //! per the Default Distribution RFC (`OQ-002`, accepted 2026-08-29) and the
-//! Plugin Roadmap (`bitty-terminal.shell-integration`, `workspace`,
-//! `project`, `browser-panel`). `statusline`
+//! Plugin Roadmap: two bundled plugins, `bitty-terminal.shell-integration`
+//! and `bitty-terminal.workspace` (plus the deprecated `bitty-terminal.tabs`
+//! alias that resolves to workspace). `statusline`
 //! migrated to an independent first-party package (OQ-053, `CTX-0398`),
 //! `palette` migrated to an independent first-party package (OQ-053,
 //! `CTX-0397`), `git-panel` migrated to an independent first-party
-//! package (OQ-053, `CTX-0400`), and `file-manager` migrated to an
-//! independent first-party package (OQ-053, `CTX-0399`); none is in this
-//! catalog. It
-//! exists **only** as
+//! package (OQ-053, `CTX-0400`), `file-manager` migrated to an
+//! independent first-party package (OQ-053, `CTX-0399`), `ai-panel`
+//! removed, `mail-panel` removed, `project` removed, and `browser-panel`
+//! removed (Unix philosophy: Core mechanism only, `CTX-0886`); none is in
+//! this catalog. It exists **only** as
 //! review evidence that the public Plugin API is complete enough for
 //! first-party use — it does not introduce a private channel.
 //!
@@ -48,8 +50,8 @@
 
 use crate::capability::CapabilityId;
 use crate::manifest::{
-    CapabilityRequests, Compat, FilesystemRequest, FsAccess, LazyCommand, LazyTriggers,
-    NetworkEgress, PluginId, PluginIdentity, PluginLimits, PluginManifest, QualifiedName,
+    CapabilityRequests, Compat, LazyCommand, LazyTriggers, PluginId, PluginIdentity,
+    PluginManifest, QualifiedName,
 };
 
 /// One schema-less lazy command declaration (bundled manifests are static).
@@ -61,7 +63,7 @@ fn lazy_command(id: &str) -> LazyCommand {
     }
 }
 
-/// Canonical version for the six `v1` bundled plugins (SemVer 2).
+/// Canonical version for the two `v1` bundled plugins (SemVer 2).
 const BUNDLED_VERSION: &str = "0.1.0";
 
 /// Compat range for the bundled set: `>=0.1,<1.0` with Plugin API `^1.0`.
@@ -305,295 +307,18 @@ pub fn tabs_manifest() -> PluginManifest {
     }
 }
 
-/// `bitty-terminal.project` — project discovery and session presentation.
-///
-/// Capability: `fs.read:~/projects/**` constrained via filesystem request
-/// (path-glob, real-path resolved, symlinks/devices rejected per host
-/// policy). Also `terminal.semantic-read` for cwd context.
-/// No `fs.write`, no `process.spawn`, no `network.*`.
-#[must_use]
-pub fn project_manifest() -> PluginManifest {
-    let mut caps = CapabilityRequests::default();
-    caps.ids
-        .insert(CapabilityId::parse("terminal.semantic-read").expect("known capability"));
-    caps.filesystem.push(FilesystemRequest {
-        access: FsAccess::Read,
-        paths: vec!["~/projects/**".to_string()],
-    });
-    PluginManifest {
-        identity: bundled_identity(
-            "bitty-terminal.project",
-            "Project",
-            "Project discovery and session presentation with constrained fs.read",
-        ),
-        compat: bundled_compat(),
-        dependencies: Vec::new(),
-        provided_services: Vec::new(),
-        required_services: Vec::new(),
-        capabilities: caps,
-        tools: Vec::new(),
-        network: Vec::new(),
-        limits: Default::default(),
-        lazy: LazyTriggers {
-            commands: vec![
-                lazy_command("bitty-terminal.project:open"),
-                lazy_command("bitty-terminal.project:switch"),
-            ],
-            events: vec!["terminal.cwd-changed".to_string()],
-            claims: Vec::new(),
-        },
-        raw_bytes_len: 512,
-    }
-}
-
-/// `bitty-terminal.browser-panel` — `View Browser(BrowserSurfaceId)` host surface + `Panel(PanelId)` controls.
-///
-/// Capability: `panel.provider` + `panel.create` for Panel controls plus
-/// `browser.embed` high-risk + `browser.navigation` + `browser.file-url`
-/// for `file://` + `browser.storage` for cookie/cache persistence (each a
-/// distinct gate). Host-owned `BrowserSurfaceId` per `05e8803` placement
-/// Option A, `LogicalRect` placement per `View`, host-mediated
-/// `browser.navigate` with allowlist (`https` default, `file` needs
-/// `browser.file-url` gate per R-005 `FileUrlActivation`), focus reuse
-/// (`focused View` owns keyboard/IME/wheel). Bounded `8 KiB`/`32`/`64`/
-/// `1024`/`8192` `DropOldest`, PR-1..PR-12, BA-1 `4`/BA-2 `1`/BA-3 `32`
-/// single-process `winit`, embedder under RC-3 `512 MiB` aggregate,
-/// `is_untrusted_surface = true` for web content.
-#[must_use]
-pub fn browser_panel_manifest() -> PluginManifest {
-    let mut caps = CapabilityRequests::default();
-    caps.ids
-        .insert(CapabilityId::parse("panel.provider").expect("known capability"));
-    caps.ids
-        .insert(CapabilityId::parse("panel.create").expect("known capability"));
-    caps.ids
-        .insert(CapabilityId::parse("browser.embed").expect("known capability"));
-    caps.ids
-        .insert(CapabilityId::parse("browser.navigation").expect("known capability"));
-    caps.ids
-        .insert(CapabilityId::parse("browser.file-url").expect("known capability"));
-    caps.ids
-        .insert(CapabilityId::parse("browser.storage").expect("known capability"));
-    caps.ids
-        .insert(CapabilityId::parse("terminal.semantic-read").expect("known capability"));
-    PluginManifest {
-        identity: bundled_identity(
-            "bitty-terminal.browser-panel",
-            "Browser Panel",
-            "View Browser(BrowserSurfaceId) + Panel(PanelId) tiled, browser.embed/navigation/file-url/storage allowlisted 8KiB/32 BA-1..3",
-        ),
-        compat: bundled_compat(),
-        dependencies: Vec::new(),
-        provided_services: Vec::new(),
-        required_services: Vec::new(),
-        capabilities: caps,
-        tools: Vec::new(),
-        network: Vec::new(),
-        limits: Default::default(),
-        lazy: LazyTriggers {
-            commands: vec![
-                lazy_command("bitty-terminal.browser-panel:open"),
-                lazy_command("bitty-terminal.browser-panel:navigate"),
-                lazy_command("bitty-terminal.browser-panel:back"),
-                lazy_command("bitty-terminal.browser-panel:forward"),
-                lazy_command("bitty-terminal.browser-panel:reload"),
-            ],
-            events: vec![
-                "terminal.cwd-changed".to_string(),
-                "terminal.title-changed".to_string(),
-                "focus.changed".to_string(),
-            ],
-            claims: Vec::new(),
-        },
-        raw_bytes_len: 512,
-    }
-}
-
-/// `bitty-terminal.ai-panel` — tiled `Panel(PanelId)` agent surface plus
-/// `AgentId`/`AgentWorkspace` `32 KiB` budget, `mcp.invoke`.
-///
-/// Capability: `panel.provider` + `panel.create` for Panel plus
-/// `agent.context.terminal` per `Terminal` with generation +
-/// `agent.context.workspace` per `Workspace` +
-/// `agent.memory:persist` opt-in only (`0600`, `<=7 days`, no exfiltration) +
-/// `mcp.invoke:TOOL` per-tool capability (e.g. `mcp.invoke:read_file`) +
-/// `ai.provider` + `ai.stream` (`ai.model`).
-///
-/// `AgentId` `owner.name` bounded `128` (`a.b` grammar),
-/// `AgentWorkspace` ephemeral `64` files / `2 MiB` aggregate /
-/// `256 KiB` per file, `ContextProvider` set with `32 KiB` Context Budget per
-/// turn, `AgentMemory` conversational `32` turns / `64 KiB` aggregate;
-/// Tool Bus via MCP adapter bounded framing `256 KiB` frame,
-/// `512 KiB` in-flight, depth `32`, `RC-9`/`RC-10`.
-#[must_use]
-pub fn ai_panel_manifest() -> PluginManifest {
-    let mut caps = CapabilityRequests::default();
-    caps.ids
-        .insert(CapabilityId::parse("panel.provider").expect("known capability"));
-    caps.ids
-        .insert(CapabilityId::parse("panel.create").expect("known capability"));
-    caps.ids
-        .insert(CapabilityId::parse("agent.context.terminal").expect("known capability"));
-    caps.ids
-        .insert(CapabilityId::parse("agent.context.workspace").expect("known capability"));
-    caps.ids
-        .insert(CapabilityId::parse("agent.memory:persist").expect("known capability"));
-    caps.ids
-        .insert(CapabilityId::parse("mcp.invoke:read_file").expect("known capability"));
-    caps.ids
-        .insert(CapabilityId::parse("mcp.invoke:fetch").expect("known capability"));
-    caps.ids
-        .insert(CapabilityId::parse("ai.provider").expect("known capability"));
-    caps.ids
-        .insert(CapabilityId::parse("ai.stream").expect("known capability"));
-    caps.ids
-        .insert(CapabilityId::parse("ai.model").expect("known capability"));
-    PluginManifest {
-        identity: bundled_identity(
-            "bitty-terminal.ai-panel",
-            "AI Panel",
-            "Tiled Panel ai-panel with AgentId/AgentWorkspace 32KiB budget mcp.invoke bounded Panel(PanelId) BA-7..10",
-        ),
-        compat: bundled_compat(),
-        dependencies: Vec::new(),
-        provided_services: Vec::new(),
-        required_services: Vec::new(),
-        capabilities: caps,
-        tools: Vec::new(),
-        network: Vec::new(),
-        limits: Default::default(),
-        lazy: LazyTriggers {
-            commands: vec![
-                lazy_command("bitty-terminal.ai-panel:open"),
-                lazy_command("bitty-terminal.ai-panel:send"),
-                lazy_command("bitty-terminal.ai-panel:clear"),
-                lazy_command("bitty-terminal.ai-panel:new-session"),
-                lazy_command("bitty-terminal.ai-panel:stop"),
-            ],
-            events: vec![
-                "terminal.cwd-changed".to_string(),
-                "terminal.title-changed".to_string(),
-                "focus.changed".to_string(),
-            ],
-            claims: Vec::new(),
-        },
-        raw_bytes_len: 512,
-    }
-}
-
-/// `bitty-terminal.mail-panel` — tiled `Panel(PanelId)` mail panel via
-/// helper-process backed `mcp.invoke:mail.*` + `network.connect`.
-///
-/// Capability: `panel.provider` + `panel.create` for Panel Runtime plus
-/// `mcp.invoke:mail.list` / `mail.read` / `mail.send` / `mail.search`
-/// (per-tool bounded `8 KiB` frame) + `network.connect:imap.example.com:993`
-/// and `smtp.example.com:465` (per-destination allowlist, same hardened
-/// scoping as Browser/Agent) + `fs.read:~/mail/**` local cache only +
-/// `terminal.semantic-read` for link/title observation. Strictly
-/// helper-process / out-of-process (never `dlopen`), `fs.write:~/mail/**`
-/// optional for cache write, `browser.file-url` never implied. Helper
-/// process is under RC-3 `512 MiB` aggregate and global `8192`/`2 MiB`
-/// shared envelope, `SecretField` tokens `0600` bounded retention identical to
-/// `ai-panel` minimization, `is_untrusted_surface = true` for any mail
-/// content observed via `mcp` (RC-9/RC-10 framing `8 KiB`, counted drops).
-#[must_use]
-pub fn mail_panel_manifest() -> PluginManifest {
-    let mut caps = CapabilityRequests::default();
-    caps.ids
-        .insert(CapabilityId::parse("panel.provider").expect("known capability"));
-    caps.ids
-        .insert(CapabilityId::parse("panel.create").expect("known capability"));
-    caps.ids
-        .insert(CapabilityId::parse("terminal.semantic-read").expect("known capability"));
-    caps.ids
-        .insert(CapabilityId::parse("mcp.invoke:mail.list").expect("known capability"));
-    caps.ids
-        .insert(CapabilityId::parse("mcp.invoke:mail.read").expect("known capability"));
-    caps.ids
-        .insert(CapabilityId::parse("mcp.invoke:mail.send").expect("known capability"));
-    caps.ids
-        .insert(CapabilityId::parse("mcp.invoke:mail.search").expect("known capability"));
-    caps.ids.insert(
-        CapabilityId::parse("network.connect:imap.example.com:993").expect("known capability"),
-    );
-    caps.ids.insert(
-        CapabilityId::parse("network.connect:smtp.example.com:465").expect("known capability"),
-    );
-    caps.filesystem.push(FilesystemRequest {
-        access: FsAccess::Read,
-        paths: vec!["~/mail/**".to_string()],
-    });
-    caps.filesystem.push(FilesystemRequest {
-        access: FsAccess::Write,
-        paths: vec!["~/mail/**".to_string()],
-    });
-    // Structured egress paired with the `network.connect:*` capabilities
-    // above (both directions fail closed in `PluginManifest::validate`).
-    let network = vec![
-        NetworkEgress {
-            host: "imap.example.com".to_string(),
-            ports: vec![993],
-        },
-        NetworkEgress {
-            host: "smtp.example.com".to_string(),
-            ports: vec![465],
-        },
-    ];
-    PluginManifest {
-        identity: bundled_identity(
-            "bitty-terminal.mail-panel",
-            "Mail Panel",
-            "Tiled Panel mail via mcp.invoke:mail.* + network.connect imap/smtp + fs.read:~/mail/** bounded 8KiB/32/64 PR-1..12",
-        ),
-        compat: bundled_compat(),
-        dependencies: Vec::new(),
-        provided_services: Vec::new(),
-        required_services: Vec::new(),
-        capabilities: caps,
-        tools: Vec::new(),
-        network,
-        limits: PluginLimits::default(),
-        lazy: LazyTriggers {
-            commands: vec![
-                lazy_command("bitty-terminal.mail-panel:open"),
-                lazy_command("bitty-terminal.mail-panel:list"),
-                lazy_command("bitty-terminal.mail-panel:read"),
-                lazy_command("bitty-terminal.mail-panel:compose"),
-                lazy_command("bitty-terminal.mail-panel:send"),
-            ],
-            events: vec![
-                "terminal.cwd-changed".to_string(),
-                "terminal.title-changed".to_string(),
-                "focus.changed".to_string(),
-            ],
-            claims: Vec::new(),
-        },
-        raw_bytes_len: 512,
-    }
-}
-
 // ── catalog helpers ───────────────────────────────────────────────────────
 
-/// All six bundled-disabled manifests for `v1` (fresh install: staged but
-/// not enabled). Browser-panel is P2 `View Browser` + `Panel`
-/// tiled with `browser.embed`/`navigation`/`file-url`/`storage` allowlisted
-/// `https` default, ai-panel is P2 `Panel` + `AgentId` bounded `32 KiB`,
-/// mail-panel is P3 `Panel` via `mcp.invoke:mail.*` + `network.connect`
-/// `~/mail/**`, all bounded `8 KiB`/`32`/`64`/PR-1..PR-12/BA-1..3,
-/// single-process `winit`.
+/// Both bundled-disabled manifests for `v1` (`shell-integration`,
+/// `workspace`; fresh install: staged but not enabled). ai-panel,
+/// mail-panel, project and browser-panel were removed per Unix philosophy
+/// (CTX-0886): Core provides mechanism only.
 #[must_use]
 pub fn all_bundled_manifests() -> Vec<PluginManifest> {
-    vec![
-        shell_integration_manifest(),
-        workspace_manifest(),
-        project_manifest(),
-        browser_panel_manifest(),
-        ai_panel_manifest(),
-        mail_panel_manifest(),
-    ]
+    vec![shell_integration_manifest(), workspace_manifest()]
 }
 
-/// Plugin ids of the six bundled-disabled plugins, in catalog order.
+/// Plugin ids of the two bundled-disabled plugins, in catalog order.
 #[must_use]
 pub fn bundled_ids() -> Vec<PluginId> {
     all_bundled_manifests()
@@ -610,19 +335,13 @@ pub fn bundled_ids_sorted() -> Vec<String> {
     ids
 }
 
-/// Whether `id` is one of the six bundled ids (canonical) or the deprecated
+/// Whether `id` is one of the two bundled ids (canonical) or the deprecated
 /// `bitty-terminal.tabs` alias (removal ≥ v0.2.0).
 #[must_use]
 pub fn is_bundled(id: &PluginId) -> bool {
     matches!(
         id.as_str(),
-        "bitty-terminal.shell-integration"
-            | "bitty-terminal.workspace"
-            | "bitty-terminal.tabs"
-            | "bitty-terminal.project"
-            | "bitty-terminal.browser-panel"
-            | "bitty-terminal.ai-panel"
-            | "bitty-terminal.mail-panel"
+        "bitty-terminal.shell-integration" | "bitty-terminal.workspace" | "bitty-terminal.tabs"
     )
 }
 
@@ -641,10 +360,6 @@ pub fn bundled_manifest_for(id: &str) -> Option<PluginManifest> {
         "bitty-terminal.shell-integration" => Some(shell_integration_manifest()),
         "bitty-terminal.workspace" => Some(workspace_manifest()),
         "bitty-terminal.tabs" => Some(tabs_manifest()),
-        "bitty-terminal.project" => Some(project_manifest()),
-        "bitty-terminal.browser-panel" => Some(browser_panel_manifest()),
-        "bitty-terminal.ai-panel" => Some(ai_panel_manifest()),
-        "bitty-terminal.mail-panel" => Some(mail_panel_manifest()),
         _ => None,
     }
 }
@@ -664,7 +379,7 @@ mod tests {
     #[test]
     fn bundled_manifests_validate_and_have_expected_ids() {
         let all = all_bundled_manifests();
-        assert_eq!(all.len(), 6);
+        assert_eq!(all.len(), 2);
         for m in &all {
             assert_manifest_valid(m);
         }
@@ -672,17 +387,23 @@ mod tests {
         assert_eq!(
             ids,
             vec![
-                "bitty-terminal.ai-panel",
-                "bitty-terminal.browser-panel",
-                "bitty-terminal.mail-panel",
-                "bitty-terminal.project",
                 "bitty-terminal.shell-integration",
                 "bitty-terminal.workspace",
             ]
         );
-        // Deprecated alias still resolves + is_bundled, but is not in the canonical list.
+        // CTX-0886: Unix philosophy, Core mechanism only. Removed plugins are not bundled.
         assert!(!ids.contains(&"bitty-terminal.tabs".to_string()));
         assert!(!ids.contains(&"bitty-terminal.palette".to_string()));
+        assert!(!ids.contains(&"bitty-terminal.browser-panel".to_string()));
+        assert!(!ids.contains(&"bitty-terminal.project".to_string()));
+        assert!(!is_bundled(
+            &PluginId::new("bitty-terminal.project").unwrap()
+        ));
+        assert!(!is_bundled(
+            &PluginId::new("bitty-terminal.browser-panel").unwrap()
+        ));
+        assert!(bundled_manifest_for("bitty-terminal.project").is_none());
+        assert!(bundled_manifest_for("bitty-terminal.browser-panel").is_none());
         assert!(!is_bundled(
             &PluginId::new("bitty-terminal.palette").unwrap()
         ));
@@ -760,210 +481,6 @@ mod tests {
         assert!(!is_deprecated_bundled_alias("bitty-terminal.workspace"));
         assert!(deprecated_alias_warning("bitty-terminal.tabs").is_some());
         assert!(deprecated_alias_warning("bitty-terminal.workspace").is_none());
-    }
-
-    #[test]
-    fn project_manifest_filesystem_capability() {
-        let m = project_manifest();
-        assert_eq!(m.capabilities.filesystem.len(), 1);
-        assert_eq!(m.capabilities.filesystem[0].paths, vec!["~/projects/**"]);
-        assert!(
-            m.capabilities
-                .ids
-                .contains(&CapabilityId::parse("terminal.semantic-read").unwrap())
-        );
-        // filesystem expansion must parse as valid capability
-        let expanded = CapabilityId::parse("fs.read:~/projects/**").unwrap();
-        assert_eq!(expanded.family(), crate::capability::CapabilityFamily::Fs);
-        // manifest hash must be deterministic
-        assert_eq!(m.manifest_hash(), m.clone().manifest_hash());
-    }
-
-    #[test]
-    fn browser_panel_manifest_browser_and_panel_capabilities() {
-        let m = browser_panel_manifest();
-        assert_eq!(m.capabilities.filesystem.len(), 0);
-        assert!(
-            m.capabilities
-                .ids
-                .contains(&CapabilityId::parse("panel.provider").unwrap())
-        );
-        assert!(
-            m.capabilities
-                .ids
-                .contains(&CapabilityId::parse("panel.create").unwrap())
-        );
-        assert!(
-            m.capabilities
-                .ids
-                .contains(&CapabilityId::parse("browser.embed").unwrap())
-        );
-        assert!(
-            m.capabilities
-                .ids
-                .contains(&CapabilityId::parse("browser.navigation").unwrap())
-        );
-        assert!(
-            m.capabilities
-                .ids
-                .contains(&CapabilityId::parse("browser.file-url").unwrap())
-        );
-        assert!(
-            m.capabilities
-                .ids
-                .contains(&CapabilityId::parse("browser.storage").unwrap())
-        );
-        assert!(
-            m.capabilities
-                .ids
-                .contains(&CapabilityId::parse("terminal.semantic-read").unwrap())
-        );
-        assert_eq!(m.lazy.commands.len(), 5);
-        assert!(
-            m.lazy
-                .commands
-                .iter()
-                .any(|c| c.id.as_str() == "bitty-terminal.browser-panel:open")
-        );
-        assert!(
-            m.lazy
-                .commands
-                .iter()
-                .any(|c| c.id.as_str() == "bitty-terminal.browser-panel:navigate")
-        );
-        assert!(m.lazy.events.contains(&"terminal.cwd-changed".to_string()));
-        assert!(m.lazy.events.contains(&"focus.changed".to_string()));
-        assert!(CapabilityId::parse("browser.embed").unwrap().is_high_risk());
-        assert!(
-            !CapabilityId::parse("browser.navigation")
-                .unwrap()
-                .is_high_risk()
-        );
-        assert_eq!(m.manifest_hash(), m.clone().manifest_hash());
-        assert!(
-            !m.capabilities
-                .ids
-                .contains(&CapabilityId::parse("process.spawn:git").unwrap())
-        );
-        assert!(
-            !m.capabilities.ids.contains(
-                &CapabilityId::parse("network.connect:example.com:443")
-                    .unwrap_or_else(|_| CapabilityId::parse("browser.embed").unwrap())
-            )
-        );
-    }
-
-    #[test]
-    fn mail_panel_manifest_mcp_network_and_panel_capabilities() {
-        let m = mail_panel_manifest();
-        assert_eq!(m.capabilities.filesystem.len(), 2);
-        let read = m
-            .capabilities
-            .filesystem
-            .iter()
-            .find(|r| r.access == FsAccess::Read)
-            .unwrap();
-        assert_eq!(read.paths, vec!["~/mail/**"]);
-        let write = m
-            .capabilities
-            .filesystem
-            .iter()
-            .find(|r| r.access == FsAccess::Write)
-            .unwrap();
-        assert_eq!(write.paths, vec!["~/mail/**"]);
-        assert!(
-            m.capabilities
-                .ids
-                .contains(&CapabilityId::parse("panel.provider").unwrap())
-        );
-        assert!(
-            m.capabilities
-                .ids
-                .contains(&CapabilityId::parse("panel.create").unwrap())
-        );
-        assert!(
-            m.capabilities
-                .ids
-                .contains(&CapabilityId::parse("terminal.semantic-read").unwrap())
-        );
-        assert!(
-            m.capabilities
-                .ids
-                .contains(&CapabilityId::parse("mcp.invoke:mail.list").unwrap())
-        );
-        assert!(
-            m.capabilities
-                .ids
-                .contains(&CapabilityId::parse("mcp.invoke:mail.read").unwrap())
-        );
-        assert!(
-            m.capabilities
-                .ids
-                .contains(&CapabilityId::parse("mcp.invoke:mail.send").unwrap())
-        );
-        assert!(
-            m.capabilities
-                .ids
-                .contains(&CapabilityId::parse("mcp.invoke:mail.search").unwrap())
-        );
-        assert!(
-            m.capabilities
-                .ids
-                .contains(&CapabilityId::parse("network.connect:imap.example.com:993").unwrap())
-        );
-        assert!(
-            m.capabilities
-                .ids
-                .contains(&CapabilityId::parse("network.connect:smtp.example.com:465").unwrap())
-        );
-        assert_eq!(m.lazy.commands.len(), 5);
-        assert!(
-            m.lazy
-                .commands
-                .iter()
-                .any(|c| c.id.as_str() == "bitty-terminal.mail-panel:open")
-        );
-        assert!(
-            m.lazy
-                .commands
-                .iter()
-                .any(|c| c.id.as_str() == "bitty-terminal.mail-panel:list")
-        );
-        assert!(
-            m.lazy
-                .commands
-                .iter()
-                .any(|c| c.id.as_str() == "bitty-terminal.mail-panel:send")
-        );
-        assert!(m.lazy.events.contains(&"terminal.cwd-changed".to_string()));
-        assert!(m.lazy.events.contains(&"focus.changed".to_string()));
-        let expanded_read = CapabilityId::parse("fs.read:~/mail/**").unwrap();
-        assert_eq!(
-            expanded_read.family(),
-            crate::capability::CapabilityFamily::Fs
-        );
-        let expanded_mcp = CapabilityId::parse("mcp.invoke:mail.list").unwrap();
-        assert_eq!(
-            expanded_mcp.family(),
-            crate::capability::CapabilityFamily::Mcp
-        );
-        let expanded_net = CapabilityId::parse("network.connect:imap.example.com:993").unwrap();
-        assert_eq!(
-            expanded_net.family(),
-            crate::capability::CapabilityFamily::Network
-        );
-        assert_eq!(m.manifest_hash(), m.clone().manifest_hash());
-        // tiled Panel + mcp/network/fs, no browser.embed for this helper path
-        assert!(
-            !m.capabilities
-                .ids
-                .contains(&CapabilityId::parse("browser.embed").unwrap())
-        );
-        assert!(
-            !m.capabilities
-                .ids
-                .contains(&CapabilityId::parse("process.spawn:git").unwrap())
-        );
     }
 
     #[test]

@@ -2,14 +2,19 @@
 
 //! Bundled dogfood evidence for CTX-0096 (P2, area:plugin).
 //!
-//! Verifies the six `v1` bundled-disabled first-party plugins
-//! (`bitty-terminal.shell-integration`, `tabs`,
-//! `project`, `browser-panel`, `ai-panel`, `mail-panel`) dogfood the **public** Plugin API with manifest / capability /
+//! Verifies the two `v1` bundled-disabled first-party plugins
+//! (`bitty-terminal.shell-integration`, `bitty-terminal.workspace`; the
+//! deprecated `bitty-terminal.tabs` id is an alias that resolves to
+//! workspace) dogfood the **public** Plugin API with manifest / capability /
 //! lifecycle parity to any third-party `xuepoo.*` plugin, default-disabled
 //! (no implicit enable), safe-mode compatibility, Terminal Truth protection
 //! (observation via bounded side queue, never direct `State` write), and
 //! bounded cold-path execution (`DropOldest` per-sub 64 / per-plugin 1024 /
 //! 256 KiB / global 8192 / 2 MiB, coalescing where semantics allow).
+//!
+//! Note: `ai-panel`, `mail-panel`, `project` and `browser-panel` were removed
+//! from Core (CTX-0886, issues #1554/#1556/#1557; Unix philosophy: Core
+//! provides mechanism only) and will be offered as optional extensions.
 
 use std::collections::BTreeSet;
 
@@ -17,9 +22,8 @@ use bitty_plugin_host::{
     CapabilityId, DropPolicy, Event, EventKind, EventPayload, GrantRecord, HostObservation,
     PluginHost, PluginId,
     bundled::{
-        ai_panel_manifest, all_bundled_manifests, browser_panel_manifest, bundled_ids_sorted,
-        bundled_manifest_for, deprecated_alias_warning, is_bundled, is_deprecated_bundled_alias,
-        mail_panel_manifest, project_manifest, shell_integration_manifest, workspace_manifest,
+        all_bundled_manifests, bundled_ids_sorted, bundled_manifest_for, deprecated_alias_warning,
+        is_bundled, is_deprecated_bundled_alias, shell_integration_manifest, workspace_manifest,
     },
 };
 
@@ -40,17 +44,13 @@ fn granted_set_for(manifest: &bitty_plugin_host::PluginManifest) -> BTreeSet<Cap
 #[test]
 fn bundled_manifests_validate_and_have_expected_ids() {
     let all = all_bundled_manifests();
-    assert_eq!(all.len(), 6);
+    assert_eq!(all.len(), 2);
     for m in &all {
         m.validate().expect("bundled must validate");
     }
     assert_eq!(
         bundled_ids_sorted(),
         vec![
-            "bitty-terminal.ai-panel",
-            "bitty-terminal.browser-panel",
-            "bitty-terminal.mail-panel",
-            "bitty-terminal.project",
             "bitty-terminal.shell-integration",
             "bitty-terminal.workspace",
         ]
@@ -60,6 +60,11 @@ fn bundled_manifests_validate_and_have_expected_ids() {
         assert!(bundled_manifest_for(m.id().as_str()).is_some());
     }
     assert!(!is_bundled(&PluginId::new("xuepoo.third").unwrap()));
+    // Removed from Core (CTX-0886): no longer bundled nor resolvable.
+    for removed in ["bitty-terminal.project", "bitty-terminal.browser-panel"] {
+        assert!(!is_bundled(&PluginId::new(removed).unwrap()));
+        assert!(bundled_manifest_for(removed).is_none());
+    }
     // Deprecated alias still resolves + is_bundled, with a warning; canonical does not warn.
     assert!(is_bundled(&PluginId::new("bitty-terminal.tabs").unwrap()));
     assert!(is_deprecated_bundled_alias("bitty-terminal.tabs"));
@@ -99,7 +104,7 @@ fn bundled_plugins_load_via_public_api_with_grant_checks() {
             bitty_plugin_host::PluginState::Activated
         );
     }
-    assert_eq!(host.registry().len(), 6);
+    assert_eq!(host.registry().len(), 2);
 }
 
 #[test]
@@ -211,10 +216,6 @@ fn default_disabled_safe_mode_leaves_host_functional() {
         safe.declare(bundled_manifest_for("bitty-terminal.workspace").unwrap())
             .is_err()
     );
-    assert!(safe.declare(project_manifest()).is_err());
-    assert!(safe.declare(browser_panel_manifest()).is_err());
-    assert!(safe.declare(ai_panel_manifest()).is_err());
-    assert!(safe.declare(mail_panel_manifest()).is_err());
     // `bitty.*` builtin would still be allowed in safe mode (candidate built-in
     // namespace) — prove the distinction is exactly the prefix, not a private
     // flag.
@@ -233,7 +234,7 @@ fn default_disabled_safe_mode_leaves_host_functional() {
 fn grant_revocation_and_hash_binding_for_bundled() {
     // Capability increase blocks auto-update pending diff approval; hash
     // mismatch is fail-closed; revocation detaches at next boundary.
-    let m = project_manifest();
+    let m = shell_integration_manifest();
     let id = m.id().clone();
     let hash = m.manifest_hash();
     let mut host = PluginHost::new(DropPolicy::DropOldest, 16);
@@ -249,32 +250,26 @@ fn grant_revocation_and_hash_binding_for_bundled() {
     ));
     host.activate(&id).unwrap();
 
-    // Revoke single filesystem capability -> future activate of same hash but
-    // missing grant would fail; grant store reflects revocation.
-    let fs_cap = CapabilityId::parse("fs.read:~/projects/**").unwrap();
-    assert!(
-        host.grants()
-            .is_granted(&id, &hash, &fs_cap, &m.capabilities)
-    );
-    let report = host.revoke(&id, Some(&fs_cap)).unwrap();
+    // Revoke the single declared capability -> future activate of same hash
+    // but missing grant would fail; grant store reflects revocation.
+    let cap = CapabilityId::parse("terminal.semantic-read").unwrap();
+    assert!(m.capabilities.ids.contains(&cap));
+    assert!(host.grants().is_granted(&id, &hash, &cap, &m.capabilities));
+    let report = host.revoke(&id, Some(&cap)).unwrap();
     assert_eq!(report.revoked.len(), 1);
     // CTX-0465: single-capability revoke persists an explicit denial.
-    assert!(host.grants().is_cap_denied(&id, &fs_cap));
-    assert!(
-        !host
-            .grants()
-            .is_granted(&id, &hash, &fs_cap, &m.capabilities)
-    );
+    assert!(host.grants().is_cap_denied(&id, &cap));
+    assert!(!host.grants().is_granted(&id, &hash, &cap, &m.capabilities));
 
     // Hash changed (e.g., version bump) -> grant no longer matches, deny.
-    let mut bumped = project_manifest();
+    let mut bumped = shell_integration_manifest();
     bumped.identity.version = "0.2.0".to_string();
     assert_ne!(bumped.manifest_hash(), hash);
     let bumped_hash = bumped.manifest_hash();
     assert!(
         !host
             .grants()
-            .is_granted(&id, &bumped_hash, &fs_cap, &bumped.capabilities)
+            .is_granted(&id, &bumped_hash, &cap, &bumped.capabilities)
     );
 }
 

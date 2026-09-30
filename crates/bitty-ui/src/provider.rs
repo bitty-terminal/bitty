@@ -1191,6 +1191,7 @@ mod tests {
     fn canonical_providers_cover_1_to_16_views() {
         let providers: Vec<Box<dyn LayoutProvider>> = vec![
             Box::new(DwindleProvider::new()),
+            Box::new(SpiralProvider::new()),
             Box::new(MasterProvider::new()),
             Box::new(GridProvider::new()),
         ];
@@ -1223,6 +1224,7 @@ mod tests {
         let providers: Vec<Box<dyn LayoutProvider>> = vec![
             Box::new(NoopTiler::new()),
             Box::new(DwindleProvider::new()),
+            Box::new(SpiralProvider::new()),
             Box::new(MasterProvider::new()),
             Box::new(GridProvider::new()),
         ];

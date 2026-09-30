@@ -58,6 +58,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Synchronize damage rects with wide-character expansion (CTX-0887, #1555):**
+  `Grid::erase_range_in_row` now returns `Option<(usize, usize)>` with the
+  actual inclusive column bounds after expanding outward across wide-character
+  pairs. `erase_in_line`, `erase_in_display`, and `TerminalAction::EraseChars`
+  use the expanded bounds to damage grid rectangles, preventing ghost trailing
+  glyphs from lingering on screen during backspacing or line erasures. Fixed
+  miscalculated row coordinates in wide character overwrite damage marks.
+
 - **Render Kitty images for all visible split panes (CTX-0884, #1550):** `paint_kitty_images`
   previously restricted Kitty image rendering exclusively to the single focused
   leaf origin, causing images in unfocused panes to disappear immediately on focus

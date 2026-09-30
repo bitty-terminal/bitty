@@ -1107,13 +1107,16 @@ impl State {
                     .saturating_add(effective_count(*n) as usize)
                     .saturating_sub(1);
                 let erase = self.bce_style();
-                self.screens_active_mut()
+                let actual_range = self
+                    .screens_active_mut()
                     .erase_range_in_row(row, col, end, &erase);
                 if self.screens_active_mut().repair_row(row, &erase) {
                     let last_col = self.width as u16 - 1;
-                    self.damage_grid_rect(row as u16, col as u16, row as u16, last_col);
+                    self.damage_grid_rect(row as u16, 0, row as u16, last_col);
                 }
-                self.damage_grid_rect(row as u16, col as u16, row as u16, end as u16);
+                if let Some((start, end)) = actual_range {
+                    self.damage_grid_rect(row as u16, start as u16, row as u16, end as u16);
+                }
             }
 
             TerminalAction::InsertLines { n } => self.insert_lines(effective_count(*n)),
@@ -1121,26 +1124,42 @@ impl State {
             TerminalAction::InsertChars { n } => {
                 let (row, col) = self.cursor_xy();
                 let erase = self.bce_style();
+                let damaged_col = if col > 0 && self.screens_active().get(row, col).spacer {
+                    col - 1
+                } else {
+                    col
+                };
                 self.screens_active_mut().insert_blanks_in_row(
                     row,
                     col,
                     effective_count(*n) as usize,
                     &erase,
                 );
-                self.screens_active_mut().repair_row(row, &erase);
-                self.damage_row_tail(row as u16, col as u16);
+                if self.screens_active_mut().repair_row(row, &erase) {
+                    self.damage_row_tail(row as u16, 0);
+                } else {
+                    self.damage_row_tail(row as u16, damaged_col as u16);
+                }
             }
             TerminalAction::DeleteChars { n } => {
                 let (row, col) = self.cursor_xy();
                 let erase = self.bce_style();
+                let damaged_col = if col > 0 && self.screens_active().get(row, col).spacer {
+                    col - 1
+                } else {
+                    col
+                };
                 self.screens_active_mut().delete_chars_in_row(
                     row,
                     col,
                     effective_count(*n) as usize,
                     &erase,
                 );
-                self.screens_active_mut().repair_row(row, &erase);
-                self.damage_row_tail(row as u16, col as u16);
+                if self.screens_active_mut().repair_row(row, &erase) {
+                    self.damage_row_tail(row as u16, 0);
+                } else {
+                    self.damage_row_tail(row as u16, damaged_col as u16);
+                }
             }
 
             TerminalAction::ScrollUp { n } => self.scroll_up_region(effective_count(*n)),
@@ -1341,7 +1360,7 @@ impl State {
             let cleared = Cell::erased(erase);
             self.screens_active_mut().set(row, col - 1, cleared);
             let c = (col - 1) as u16;
-            self.damage_grid_rect(c, c, c, c);
+            self.damage_grid_rect(row as u16, c, row as u16, c);
         }
         match glyph_width {
             1 => {
@@ -1349,7 +1368,7 @@ impl State {
                     let cleared = Cell::erased(erase);
                     self.screens_active_mut().set(row, col + 1, cleared);
                     let c = (col + 1) as u16;
-                    self.damage_grid_rect(c, c, c, c);
+                    self.damage_grid_rect(row as u16, c, row as u16, c);
                 }
             }
             _ => {
@@ -1361,7 +1380,7 @@ impl State {
                         let cleared = Cell::erased(erase);
                         self.screens_active_mut().set(row, col + 2, cleared);
                         let c = (col + 2) as u16;
-                        self.damage_grid_rect(c, c, c, c);
+                        self.damage_grid_rect(row as u16, c, row as u16, c);
                     }
                 }
             }
@@ -1442,13 +1461,13 @@ impl State {
             let cleared = Cell::erased(erase);
             self.screens_active_mut().set(row, col - 1, cleared);
             let c = (col - 1) as u16;
-            self.damage_grid_rect(c, c, c, c);
+            self.damage_grid_rect(row as u16, c, row as u16, c);
         }
         if old_at_col.width == 2 && !old_at_col.spacer && col < last_col_idx {
             let cleared = Cell::erased(erase);
             self.screens_active_mut().set(row, col + 1, cleared);
             let c = (col + 1) as u16;
-            self.damage_grid_rect(c, c, c, c);
+            self.damage_grid_rect(row as u16, c, row as u16, c);
         }
         if self.modes.insert {
             let insert_erase = self.bce_style();
@@ -2022,12 +2041,25 @@ impl State {
                 let last_row = self.height as u16 - 1;
                 let last_col = self.width as u16 - 1;
                 let erase = self.bce_style();
-                self.screens_active_mut()
-                    .erase_range_in_row(row, col, last_col as usize, &erase);
-                self.screens_active_mut()
-                    .fill_rect(row as u16 + 1, 0, last_row, last_col, &erase);
-                let (row_u, col_u) = (row as u16, col as u16);
-                self.damage_grid_rect(row_u, col_u, last_row, last_col);
+                let actual_range = self.screens_active_mut().erase_range_in_row(
+                    row,
+                    col,
+                    last_col as usize,
+                    &erase,
+                );
+                if let Some((start, end)) = actual_range {
+                    self.damage_grid_rect(row as u16, start as u16, row as u16, end as u16);
+                }
+                if (row as u16) < last_row {
+                    self.screens_active_mut().fill_rect(
+                        row as u16 + 1,
+                        0,
+                        last_row,
+                        last_col,
+                        &erase,
+                    );
+                    self.damage_grid_rect(row as u16 + 1, 0, last_row, last_col);
+                }
             }
             EraseDisplayMode::Above => {
                 let (row, col) = self.cursor_xy();
@@ -2036,11 +2068,14 @@ impl State {
                 if row > 0 {
                     self.screens_active_mut()
                         .fill_rect(0, 0, row as u16 - 1, last_col_u, &erase);
+                    self.damage_grid_rect(0, 0, row as u16 - 1, last_col_u);
                 }
-                self.screens_active_mut()
+                let actual_range = self
+                    .screens_active_mut()
                     .erase_range_in_row(row, 0, col, &erase);
-                let (row_u, col_u) = (row as u16, col as u16);
-                self.damage_grid_rect(0, 0, row_u, col_u);
+                if let Some((start, end)) = actual_range {
+                    self.damage_grid_rect(row as u16, start as u16, row as u16, end as u16);
+                }
             }
             EraseDisplayMode::All => {
                 let erase = self.bce_style();
@@ -2089,23 +2124,22 @@ impl State {
         let (row, col) = self.cursor_xy();
         let last_col = self.width as u16 - 1;
         let erase = self.bce_style();
-        let (row_u, col_u) = (row as u16, col as u16);
-        match mode {
+        let row_u = row as u16;
+        let actual_range = match mode {
             EraseLineMode::Right => {
                 self.screens_active_mut()
-                    .erase_range_in_row(row, col, last_col as usize, &erase);
-                self.damage_grid_rect(row_u, col_u, row_u, last_col);
+                    .erase_range_in_row(row, col, last_col as usize, &erase)
             }
-            EraseLineMode::Left => {
-                self.screens_active_mut()
-                    .erase_range_in_row(row, 0, col, &erase);
-                self.damage_grid_rect(row_u, 0, row_u, col_u);
-            }
+            EraseLineMode::Left => self
+                .screens_active_mut()
+                .erase_range_in_row(row, 0, col, &erase),
             EraseLineMode::All => {
                 self.screens_active_mut()
-                    .erase_range_in_row(row, 0, last_col as usize, &erase);
-                self.damage_grid_rect(row_u, 0, row_u, last_col);
+                    .erase_range_in_row(row, 0, last_col as usize, &erase)
             }
+        };
+        if let Some((start, end)) = actual_range {
+            self.damage_grid_rect(row_u, start as u16, row_u, end as u16);
         }
     }
 

@@ -479,7 +479,12 @@ impl std::error::Error for BridgeError {}
 /// not re-checked after success because a committed effect must never be
 /// reported as a timeout; mutating/spawn implementations must check the expiry
 /// before committing or delivering, so post-deadline effects never commit),
-/// and rejects re-entrant calls. `process.spawn` flows through the same
+/// and rejects re-entrant calls. Durable commit I/O that a disk-backed store
+/// reports through [`crate::record_store_commit_io`] during a successful
+/// `store_set_with_expiry` is credited out of the RC-1 hard wall limit of
+/// every enclosing callback, capped at [`crate::STORE_COMMIT_CREDIT_MAX_MS`]
+/// per callback (bitty #1518).
+/// `process.spawn` flows through the same
 /// bridge timeout path with its own spawn deadline
 /// ([`SPAWN_TIMEOUT_MS`]/[`SPAWN_TIMEOUT_MAX_MS`], default 5 s, maximum 30 s,
 /// CTX-0464) instead of the 50 ms cheap-call deadline. Capability gating is the
@@ -984,21 +989,54 @@ impl BridgeState {
     /// discarded as a timeout (the old applied-then-timeout bug). The new path
     /// guarantees post-deadline effects never commit when services honor the
     /// expiry (tests prove it; real read services are in-memory fast).
+    ///
+    /// The post-call check uses charged RC-1 time ([`crate::BudgetMark`]):
+    /// durable commit I/O of committed disk-backed `bitty.store.set` writes
+    /// during `f` (a cross-VM provider writing its store inside
+    /// `service_call`) is not charged to this call, up to
+    /// [`crate::STORE_COMMIT_CREDIT_MAX_MS`] (bitty #1518). Every other
+    /// delay, including store validation/encoding, a slow read, or slow
+    /// provider Lua, still times out.
     fn bounded<T>(
         &self,
         f: impl FnOnce(Instant) -> Result<T, BridgeError>,
     ) -> Result<T, BridgeError> {
         let _guard = self.enter()?;
-        let start = Instant::now();
-        let expiry = start + Duration::from_millis(self.deadline_ms);
+        let mark = crate::BudgetMark::now();
+        let deadline = Duration::from_millis(self.deadline_ms);
+        let expiry = mark.start() + deadline;
         if Instant::now() > expiry {
             return Err(BridgeError::timeout());
         }
         let out = f(expiry)?;
-        if Instant::now() > expiry {
+        if mark.read().charged > deadline {
             return Err(BridgeError::timeout());
         }
         Ok(out)
+    }
+
+    /// [`Self::bounded_mutation`] for the plugin store write
+    /// (`store_set_with_expiry`), crediting only its durable commit I/O.
+    ///
+    /// Opens a [`crate::StoreCommitWindow`] so the store backend can report
+    /// its temp-file write, fsync, and rename time through
+    /// [`crate::record_store_commit_io`]. On `Ok` the write has committed
+    /// atomically and the reported I/O (bounded by this call's measured
+    /// duration) is excluded from the RC-1 hard wall limit of every
+    /// enclosing callback on this thread (this VM's, and a consumer VM
+    /// waiting through a service call), capped per callback at
+    /// [`crate::STORE_COMMIT_CREDIT_MAX_MS`]. Validation, cloning, quota
+    /// checks, and encoding stay charged; in-memory stores report nothing;
+    /// refused or failed writes are never credited (bitty #1518).
+    fn bounded_store_commit(
+        &self,
+        f: impl FnOnce(Instant) -> Result<(), BridgeError>,
+    ) -> Result<(), BridgeError> {
+        let started = Instant::now();
+        let window = crate::StoreCommitWindow::open();
+        let out = self.bounded_mutation(f);
+        window.close(out.is_ok(), started.elapsed());
+        out
     }
 
     /// Check-then-act bridge guard for mutating host calls
@@ -1017,7 +1055,9 @@ impl BridgeState {
     /// platforms (Windows CI filesystem scanning a freshly created state
     /// file) that write can exceed the 50 ms cheap-call budget after it has
     /// already committed. Reporting a committed write as `E_TIMEOUT` would
-    /// fail the plugin callback spuriously (CTX-0477).
+    /// fail the plugin callback spuriously (CTX-0477). The store path goes
+    /// through [`Self::bounded_store_commit`], which also keeps the commit
+    /// time out of the enclosing callbacks' RC-1 wall clocks (bitty #1518).
     fn bounded_mutation<T>(
         &self,
         f: impl FnOnce(Instant) -> Result<T, BridgeError>,
@@ -1169,7 +1209,7 @@ impl LuaVm {
             ))
         });
 
-        match self.drive_stashed(stashed, Instant::now())? {
+        match self.drive_stashed(stashed, crate::BudgetMark::now())? {
             crate::DriveOutcome::Suspended { reason, .. } => Err(VmError::Suspended { reason }),
             crate::DriveOutcome::Failed { message } => Err(VmError::Load(message)),
             crate::DriveOutcome::Ready { stashed } => {
@@ -1444,7 +1484,7 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                     let value =
                         LuaValue::from_lua(raw, state.limits).map_err(|e| e.to_error(ctx))?;
                     state
-                        .bounded_mutation(|expiry| {
+                        .bounded_store_commit(|expiry| {
                             state.services.store_set_with_expiry(&key, value, expiry)
                         })
                         .map_err(|e| e.to_error(ctx))?;

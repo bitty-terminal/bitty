@@ -1835,4 +1835,53 @@ mod tests {
         let short = "boom".to_string();
         assert_eq!(truncate_service_message(short.clone()), short);
     }
+
+    #[test]
+    fn in_memory_store_writes_earn_no_rc1_credit() {
+        // bitty #1518 review: only durable commit I/O of a disk-backed store
+        // is credited. A near-quota in-memory store makes every `store.set`
+        // pay for clone, quota check, and JSON encoding of the whole store;
+        // that CPU is plugin-driven and must stay charged, so a write loop
+        // followed by slice-crossing work ends in `WallClockExceeded` with
+        // zero credit.
+        use bitty_lua::gate::{VmBudgets, build_plugin_vm};
+        use bitty_lua::{BoundedExecution, MarshallingLimits, RC1_WALL_CLOCK_BUDGET_MS};
+
+        /// Filler entries that bring the store close to its byte quota.
+        const FILL_ENTRIES: usize = 7;
+        let value_bytes = store::STORE_MAX_VALUE_BYTES - 64;
+        let services = Rc::new(services());
+        for index in 0..FILL_ENTRIES {
+            services
+                .store_set(
+                    &format!("fill{index}"),
+                    LuaValue::String("x".repeat(value_bytes)),
+                )
+                .expect("fill stays within quota");
+        }
+        let mut vm = build_plugin_vm("xuepoo.test", Some(VmBudgets::default())).expect("vm");
+        let host: Rc<dyn HostServices> = services.clone();
+        vm.install_host_module(host, MarshallingLimits::default(), RC1_WALL_CLOCK_BUDGET_MS)
+            .expect("install");
+        let outcome = vm
+            .execute_bounded(
+                r#"
+                local big = string.rep("y", 4096)
+                for i = 1, 100000 do bitty.store.set("hot", big) end
+                local n = 0
+                for i = 1, 4096 do n = n + i end
+                bitty.store.set("after", true)
+                "#,
+            )
+            .expect("execute");
+        assert!(
+            matches!(
+                outcome,
+                BoundedExecution::Suspended(bitty_lua::SuspendReason::WallClockExceeded { .. })
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(vm.budget_snapshot().store_commit_credit_ms, 0);
+        assert!(services.with_store(|store| store.get("after")).is_none());
+    }
 }

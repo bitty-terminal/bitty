@@ -10,11 +10,13 @@
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use bitty_lua::LuaValue;
 use bitty_plugin_host::manifest::PluginId;
 use bitty_runtime::plugin_runtime::{
-    LifecycleState, PluginRuntime, PluginRuntimeConfig, SettingsSource, SnapshotSource,
+    FileSystem, LifecycleState, NativeFileSystem, PluginRuntime, PluginRuntimeConfig, PluginStore,
+    SettingsSource, SnapshotSource,
 };
 use std::collections::BTreeMap;
 
@@ -65,9 +67,11 @@ fn temp_dir(tag: &str) -> PathBuf {
 /// inside a cross-VM call does an atomic temp-then-rename write; on a Windows
 /// CI runner with filesystem scanning that write alone can exceed the 50 ms
 /// RC-1 cheap-call budget, so the consumer saw the `-1` error sentinel
-/// (CTX-0854). An in-memory store keeps the property under test independent
-/// of runner filesystem latency; the disk-latency interaction itself is
-/// tracked as bitty #1518, not hidden by retries here.
+/// (CTX-0854). Committed store writes are now credited out of the RC-1 wall
+/// clock (bitty #1518); an in-memory store still keeps these routing tests
+/// independent of runner filesystem latency, and the disk-latency path is
+/// covered deterministically by
+/// `slow_disk_store_commit_does_not_fail_cross_vm_service_call`.
 fn runtime(third_party_roots: Vec<PathBuf>) -> PluginRuntime {
     PluginRuntime::new(PluginRuntimeConfig {
         safe_mode: false,
@@ -483,5 +487,145 @@ return {}
             .with_store(|store| store.get("opt_nil")),
         Some(LuaValue::Bool(true))
     );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Injected commit latency for the disk-backed regression (bitty #1518).
+///
+/// Past the 50 ms RC-1 wall-clock budget on its own, so a callback that is
+/// still charged for its store commit always fails, and well under the
+/// 200 ms per-callback credit cap for the single provider commit each
+/// consumer callback waits on.
+const SLOW_COMMIT_MS: u64 = 60;
+
+/// Plugin whose store commits are slow; every other store stays fast.
+const SLOW_STORE_PLUGIN: &str = "xuepoo.calc";
+
+/// Native filesystem whose atomic rename (the store commit point) is slow
+/// for the provider's store only, standing in for a scanned Windows CI
+/// filesystem without real slow disks.
+#[derive(Debug)]
+struct SlowCommitFs;
+
+impl FileSystem for SlowCommitFs {
+    fn create_dir_all(&self, path: &Path) -> std::io::Result<()> {
+        NativeFileSystem.create_dir_all(path)
+    }
+    fn write_file(&self, path: &Path, data: &[u8]) -> std::io::Result<()> {
+        NativeFileSystem.write_file(path, data)
+    }
+    fn sync_file(&self, path: &Path) -> std::io::Result<()> {
+        NativeFileSystem.sync_file(path)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        let provider_store = to
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|dir| dir == SLOW_STORE_PLUGIN);
+        if provider_store {
+            std::thread::sleep(std::time::Duration::from_millis(SLOW_COMMIT_MS));
+        }
+        NativeFileSystem.rename(from, to)
+    }
+    fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+        NativeFileSystem.remove_file(path)
+    }
+    fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+        NativeFileSystem.read_to_string(path)
+    }
+    fn metadata_len(&self, path: &Path) -> std::io::Result<u64> {
+        NativeFileSystem.metadata_len(path)
+    }
+    fn exists(&self, path: &Path) -> bool {
+        NativeFileSystem.exists(path)
+    }
+}
+
+/// Consumer for the slow-disk regression: every service call is followed by
+/// Lua work spanning many `SLICE_FUEL` slices, so the RC-1 wall check runs
+/// after the provider's credited commit instead of the callback finishing
+/// inside the slice that made the call.
+const SLOW_SHOP_INIT: &str = r#"
+local calc = bitty.services.get("calc.add")
+local function cross_slices()
+  local n = 0
+  for i = 1, 4096 do n = n + i end
+  return n
+end
+bitty.commands.register({
+  id = "total",
+  title = "Total",
+  run = function()
+    local ok, r = pcall(calc.add, { a = 10, b = 20 })
+    cross_slices()
+    return ok and r.sum or -1
+  end,
+})
+local ok, result = pcall(calc.add, { a = 2, b = 3 })
+cross_slices()
+bitty.store.set("sum", ok and result.sum or -1)
+bitty.store.set("code", ok and "NONE" or result.code)
+return {}
+"#;
+
+const SLOW_SHOP_MANIFEST: &str = r#"[services.required]
+"calc.add" = ">=1.0"
+"#;
+
+#[test]
+fn slow_disk_store_commit_does_not_fail_cross_vm_service_call() {
+    // bitty #1518: the provider's `bitty.store.set` commits to a disk-backed
+    // store slower than the RC-1 wall-clock budget. The committed write is
+    // credited out of both callbacks' wall clocks, so the consumer still
+    // receives the value and nothing reports the error sentinel.
+    let root = temp_dir("slow-disk");
+    let third = root.join("third");
+    let state = root.join("state");
+    write_service_plugin(
+        &third,
+        "xuepoo.calc",
+        &calc_manifest(),
+        &["xuepoo.calc:ping"],
+        CALC_INIT,
+    );
+    write_service_plugin(
+        &third,
+        "xuepoo.shop",
+        SLOW_SHOP_MANIFEST,
+        &["xuepoo.shop:total"],
+        SLOW_SHOP_INIT,
+    );
+    let mut rt = PluginRuntime::new(PluginRuntimeConfig {
+        safe_mode: false,
+        data_dir: Some(state.clone()),
+        store_root: None,
+        bundled_roots: Vec::new(),
+        third_party_roots: vec![third],
+        settings: Rc::new(MapSettings::default()),
+        snapshot: Rc::new(StaticSnapshot),
+    });
+    rt.set_store_filesystem(Arc::new(SlowCommitFs));
+    rt.discover();
+    rt.activate(&calc_id()).expect("provider activates");
+    rt.activate(&shop_id()).expect("consumer activates");
+
+    // The consumer receives the provider's real result, not the -1 sentinel.
+    assert_eq!(store_int(&rt, &shop_id(), "sum"), Some(5));
+    assert_eq!(
+        store_string(&rt, &shop_id(), "code"),
+        Some("NONE".to_string())
+    );
+    assert_eq!(
+        rt.dispatch_command(&shop_id(), "total", &[])
+            .expect("dispatch"),
+        LuaValue::Integer(30)
+    );
+    assert_eq!(store_int(&rt, &calc_id(), "calls"), Some(2));
+
+    // The committed provider value is persisted and readable from disk.
+    let reloaded =
+        PluginStore::load(state.join("xuepoo.calc").join("store.json")).expect("reload store");
+    assert_eq!(reloaded.get("calls"), Some(LuaValue::Integer(2)));
+
     let _ = std::fs::remove_dir_all(&root);
 }

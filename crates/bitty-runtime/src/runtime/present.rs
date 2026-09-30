@@ -3113,7 +3113,7 @@ mod content_padding_tests {
 #[cfg(test)]
 mod workspace_pill_overlay_tests {
     use super::overlay_workspace_pills;
-    use crate::runtime::chrome_band::{BarPalette, layout_pills, PillAlign};
+    use crate::runtime::chrome_band::{BarPalette, PillAlign, layout_pills};
     use crate::runtime::workspaces::BarPill;
     use bitty_term_state::{Color, State};
 

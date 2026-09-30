@@ -4501,13 +4501,13 @@ mod tests {
             LayeredPlan::new(
                 ConfigSource::new(kind, Some(name)),
                 ConfigPlan {
-                workspace: Some(WorkspaceConfig {
-                    layout: Some("dwindle".to_string()),
-                    show_bar: None,
-                    bar_edge: edge,
-                    bar_colors: None,
-                    bar_pill_align: None,
-                }),
+                    workspace: Some(WorkspaceConfig {
+                        layout: Some("dwindle".to_string()),
+                        show_bar: None,
+                        bar_edge: edge,
+                        bar_colors: None,
+                        bar_pill_align: None,
+                    }),
                     schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                     ..Default::default()
                 },

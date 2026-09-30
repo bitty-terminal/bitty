@@ -459,7 +459,9 @@ impl Runtime {
     /// Builds the bar palette from configured color tokens (CTX-0874).
     #[must_use]
     pub fn bar_palette(&self) -> chrome_band::BarPalette {
-        let (active, inactive) = self.workspace_bar_colors.as_ref()
+        let (active, inactive) = self
+            .workspace_bar_colors
+            .as_ref()
             .map(|(a, i)| (a.as_deref(), i.as_deref()))
             .unwrap_or((None, None));
         chrome_band::BarPalette::from_tokens(active, inactive)

@@ -1492,6 +1492,10 @@ impl HostServices for LatencyServices {
 
     fn store_set(&self, key: &str, value: LuaValue) -> Result<(), BridgeError> {
         if key.starts_with("slow") {
+            // Measure the stand-in commit like the runtime store measures
+            // its real write/sync/rename span: a scheduler that oversleeps
+            // must not leave the overshoot charged against RC-1.
+            let started = std::time::Instant::now();
             std::thread::sleep(Duration::from_millis(self.store_delay_ms));
             if self.fail_writes {
                 return Err(BridgeError::new(
@@ -1500,7 +1504,7 @@ impl HostServices for LatencyServices {
                     "could not commit the plugin state file",
                 ));
             }
-            bitty_lua::record_store_commit_io(Duration::from_millis(self.store_delay_ms));
+            bitty_lua::record_store_commit_io(started.elapsed());
         }
         self.store.borrow_mut().insert(key.to_string(), value);
         Ok(())
@@ -1560,6 +1564,7 @@ fn committed_store_write_slower_than_rc1_does_not_suspend_callback() {
         &mut vm,
         r#"
             local ok = pcall(bitty.store.set, "slow", "v")
+            CROSS_SLICES
             bitty.store.set("after", ok and "OK" or "ERR")
             bitty.store.set("read", bitty.store.get("slow"))
         "#,

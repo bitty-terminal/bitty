@@ -746,9 +746,9 @@ pub trait HostServices {
     /// - `"panels"` → panel lifecycle state
     /// - `"grants"` → capability grant state for calling plugin
     ///
-    /// The default implementation fails closed with `E_NOT_IMPLEMENTED` until
-    /// the calling generation holds `debug.inspect` grant. Grant-gated and
-    /// read-only: never mutates state, returns bounded snapshot data.
+    /// The default implementation always returns `E_NOT_IMPLEMENTED`. Overriding
+    /// implementations must enforce the `debug.inspect` capability grant.
+    /// Grant-gated and read-only: never mutates state, returns bounded snapshot data.
     fn debug_inspect(&self, target: &str) -> Result<LuaValue, BridgeError> {
         let _ = target;
         Err(BridgeError::not_implemented("bitty.debug.inspect"))
@@ -762,9 +762,9 @@ pub trait HostServices {
     /// - `max_events` (integer, optional) → ring buffer size (default 1000, max 10000)
     ///
     /// Returns a handle (integer) for retrieving trace events via
-    /// `debug_trace_get`. The default implementation fails closed with
-    /// `E_NOT_IMPLEMENTED` until the calling generation holds `debug.trace`
-    /// grant.
+    /// `debug_trace_get`. The default implementation always returns
+    /// `E_NOT_IMPLEMENTED`. Overriding implementations must enforce the
+    /// `debug.trace` capability grant.
     fn debug_trace(&self, opts: &LuaValue) -> Result<i64, BridgeError> {
         let _ = opts;
         Err(BridgeError::not_implemented("bitty.debug.trace"))
@@ -792,9 +792,9 @@ pub trait HostServices {
     /// - `resume_plugin(id: string)` → resume a suspended plugin
     /// - `clear_state(id: string)` → clear a plugin's persisted state
     ///
-    /// The default implementation fails closed with `E_NOT_IMPLEMENTED` until
-    /// the calling generation holds `debug.control` grant (high-risk,
-    /// requires explicit consent).
+    /// The default implementation always returns `E_NOT_IMPLEMENTED`. Overriding
+    /// implementations must enforce the `debug.control` capability grant
+    /// (high-risk, requires explicit consent).
     fn debug_control(&self, action: &str, target: &str) -> Result<LuaValue, BridgeError> {
         let _ = (action, target);
         Err(BridgeError::not_implemented("bitty.debug.control"))
@@ -2231,8 +2231,10 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
     .expect("env table accepts 'has'");
 
     // CTX-0894: `bitty.debug.*` namespace for devtools plugin support.
-    // Grant-gated: `debug.inspect` (read-only state inspection),
-    // `debug.trace` (event tracing), `debug.control` (high-risk reload/suspend).
+    // Default implementations always return E_NOT_IMPLEMENTED. Overriding
+    // implementations must enforce the grants: `debug.inspect` (read-only state
+    // inspection), `debug.trace` (event tracing), `debug.control` (high-risk
+    // reload/suspend, requires explicit consent).
     let debug = Table::new(&ctx);
     debug
         .set(

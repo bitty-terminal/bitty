@@ -4938,7 +4938,6 @@ mod tests {
     fn window_radius_merges_scalar_replace_with_attribution() {
         // CTX-0241 S0: user radius lands in effective with user attribution;
         // later layers win; empty stack keeps 0 with core-defaults source.
-        use crate::types::WorkspaceConfig;
         let user = LayeredPlan::new(
             ConfigSource::new(LayerKind::User, Some("user.lua")),
             ConfigPlan {
@@ -4961,12 +4960,11 @@ mod tests {
         let cli = LayeredPlan::new(
             ConfigSource::new(LayerKind::Cli, Some("cli")),
             ConfigPlan {
-                workspace: Some(WorkspaceConfig {
-                    layout: Some("grid".to_string()),
-                    show_bar: None,
-                    bar_edge: None,
-                    bar_colors: None,
-                    bar_pill_align: None,
+                window: Some(WindowConfig {
+                    opacity: 1.0,
+                    padding: 8,
+                    radius_px: 6,
+                    blur_radius: 0,
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()

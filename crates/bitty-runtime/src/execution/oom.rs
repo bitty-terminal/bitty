@@ -89,6 +89,12 @@ impl OomEvidenceGap {
     }
 }
 
+impl std::fmt::Display for OomEvidenceGap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// OOM evidence recorded on a job (reported on every snapshot).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OomEvidence {
@@ -136,6 +142,17 @@ impl OomEvidence {
             Self::OomKilled => "oom_killed",
             Self::NotOom => "not_oom",
             Self::Missing(_) => "missing",
+        }
+    }
+}
+
+impl std::fmt::Display for OomEvidence {
+    /// The stable name; a missing reading also names its gap
+    /// (`missing:<gap>`).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing(gap) => write!(f, "{}:{gap}", self.as_str()),
+            other => f.write_str(other.as_str()),
         }
     }
 }
@@ -237,6 +254,12 @@ mod tests {
         );
         assert_eq!(OomEvidenceGap::LeafLimit.as_str(), "leaf_limit");
         assert_eq!(OomEvidence::Tracked.as_str(), "tracked");
+        assert_eq!(OomEvidenceGap::Undelegated.to_string(), "undelegated");
+        assert_eq!(OomEvidence::OomKilled.to_string(), "oom_killed");
+        assert_eq!(
+            OomEvidence::Missing(OomEvidenceGap::PlacementFailed).to_string(),
+            "missing:placement_failed"
+        );
     }
 
     #[test]

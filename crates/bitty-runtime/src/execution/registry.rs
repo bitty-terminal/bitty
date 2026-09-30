@@ -161,7 +161,11 @@ impl JobRegistry {
         cgroups: Result<JobCgroups, CgroupUnavailable>,
     ) -> Self {
         let registry = Self::with_worker_spawner(capacity, spawn_worker);
-        lock_inner(&registry.shared).cgroups = CgroupSource::from_result(cgroups.map(Arc::new));
+        // The leaf bound follows the registry's capacity: every tracked job
+        // can hold a leaf, and a leak cannot exceed the table size.
+        lock_inner(&registry.shared).cgroups = CgroupSource::from_result(
+            cgroups.map(|cgroups| Arc::new(cgroups.with_max_leaves(capacity))),
+        );
         registry
     }
 
@@ -2709,6 +2713,31 @@ mod tests {
         wait_for(registry, id, "a terminal state", |snapshot| {
             snapshot.state.is_terminal()
         })
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_leaf_bound_follows_the_registry_capacity() {
+        let root = std::env::temp_dir().join(format!(
+            "bitty-ctx0880-leafbound-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("fake root");
+        std::fs::write(root.join("cgroup.subtree_control"), "memory")
+            .unwrap_or_else(|error| panic!("fake control in {root:?}: {error}"));
+        let capacity = 3;
+        let registry = JobRegistry::with_job_cgroups(capacity, JobCgroups::under(&root));
+        let bound = match &lock_inner(&registry.shared).cgroups {
+            CgroupSource::Available(cgroups) => cgroups.max_leaves(),
+            other => panic!("fake base must be available: {other:?}"),
+        };
+        assert_eq!(bound, capacity);
+        let base = registry.job_cgroup_base().expect("base");
+        let _ = std::fs::remove_file(base.join("cgroup.subtree_control"));
+        drop(registry);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

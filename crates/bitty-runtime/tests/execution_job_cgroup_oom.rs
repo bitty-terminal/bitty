@@ -230,7 +230,11 @@ fn a_base_without_kernel_counters_records_the_gap_and_still_spawns() {
         .filter(|entry| entry.path().is_dir())
         .count();
     assert_eq!(leaves, 0, "the leaf without a counter was removed");
+    // A real cgroupfs base holds only kernel files; the fake one keeps the
+    // control file `under` wrote, so remove it for an immediate rmdir.
+    let _ = std::fs::remove_file(base.join("cgroup.subtree_control"));
     drop(registry);
+    assert!(!base.exists(), "the base is removed on drop");
     let _ = std::fs::remove_dir_all(&root);
 }
 

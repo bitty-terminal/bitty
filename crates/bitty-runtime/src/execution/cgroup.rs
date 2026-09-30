@@ -41,8 +41,9 @@
 //!
 //! # Bounds and cleanup
 //!
-//! - At most [`MAX_JOB_CGROUP_LEAVES`] leaves exist per [`JobCgroups`]
-//!   (live plus not yet removed); past that a job runs without a leaf and
+//! - At most as many leaves as the owning registry's capacity exist per
+//!   [`JobCgroups`] (live plus not yet removed; [`MAX_JOB_CGROUP_LEAVES`]
+//!   before a registry adopts it); past that a job runs without a leaf and
 //!   records [`OomEvidenceGap::LeafLimit`].
 //! - Every read is bounded (`memory.events` by
 //!   [`MAX_MEMORY_EVENTS_BYTES`], the control and `/proc` files by named
@@ -51,8 +52,8 @@
 //!   killed, with a bounded number of `rmdir` attempts. A leaf that cannot
 //!   be removed yet (a member escaped the process group and still runs) is
 //!   kept on a bounded list, counted by [`JobCgroups::unremoved_leaves`],
-//!   and retried at the next leaf creation and on drop. The job base is
-//!   removed when the [`JobCgroups`] drops.
+//!   and retried at the next leaf creation and once more on drop. The job
+//!   base is removed (bounded retries) when the [`JobCgroups`] drops.
 //! - Before the `rmdir`, `cgroup.kill` ends members that left the job's
 //!   process group but stayed in its leaf (only this job's descendants can
 //!   be there).
@@ -67,9 +68,12 @@ use std::time::Duration;
 
 use super::oom::{MAX_MEMORY_EVENTS_BYTES, OomEvidence, OomEvidenceGap, parse_oom_kill_count};
 
-/// Maximum per-job leaves (live plus not yet removed) one [`JobCgroups`]
-/// holds: the registry's default tracked-job bound, so a full registry
-/// never runs out of leaves while a leaf leak cannot grow without bound.
+/// Default bound on per-job leaves (live plus not yet removed) one
+/// [`JobCgroups`] holds: the registry's default tracked-job bound. A
+/// registry built with
+/// [`JobRegistry::with_job_cgroups`](super::JobRegistry::with_job_cgroups)
+/// replaces it with its own capacity, so a full registry never runs out of
+/// leaves while a leaf leak cannot grow without bound.
 pub const MAX_JOB_CGROUP_LEAVES: usize = super::registry::DEFAULT_MAX_JOBS;
 
 /// Largest `/proc/self/cgroup` payload accepted (64 KiB).
@@ -233,6 +237,18 @@ impl JobCgroups {
         &self.base
     }
 
+    /// Leaf bound (live plus not yet removed).
+    #[must_use]
+    pub fn max_leaves(&self) -> usize {
+        self.max_leaves
+    }
+
+    /// Replaces the leaf bound (the registry passes its capacity).
+    pub(crate) fn with_max_leaves(mut self, max_leaves: usize) -> Self {
+        self.max_leaves = max_leaves;
+        self
+    }
+
     /// Leaves whose removal has not succeeded yet (a diagnostic counter:
     /// nonzero means a job's tree member outlived its kill).
     #[must_use]
@@ -324,10 +340,13 @@ impl JobCgroups {
 }
 
 impl Drop for JobCgroups {
+    /// One `rmdir` per still-unremoved leaf (they already had their bounded
+    /// retries at release), then the bounded retry for the base only, so a
+    /// drop never waits longer than one `rmdir` retry budget.
     fn drop(&mut self) {
         let unremoved = std::mem::take(&mut self.lock_book().unremoved);
         for leaf in unremoved {
-            remove_dir_bounded(&leaf);
+            let _ = fs::remove_dir(&leaf);
         }
         remove_dir_bounded(&self.base);
     }

@@ -3117,9 +3117,8 @@ mod tests {
         assert_ne!(v4, v5);
 
         // Next split wraps back to Step 0 (Right).
-        assert_eq!(
-            app.runtime.panel_split_place_new_first(),
-            false,
+        assert!(
+            !app.runtime.panel_split_place_new_first(),
             "5 -> 6 wraps back to Step 0 (place_new_first = false)"
         );
     }

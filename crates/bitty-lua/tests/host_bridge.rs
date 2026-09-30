@@ -1560,7 +1560,6 @@ fn committed_store_write_slower_than_rc1_does_not_suspend_callback() {
         &mut vm,
         r#"
             local ok = pcall(bitty.store.set, "slow", "v")
-            local n = 0 for i = 1, 512 do n = n + i end
             bitty.store.set("after", ok and "OK" or "ERR")
             bitty.store.set("read", bitty.store.get("slow"))
         "#,

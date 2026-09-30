@@ -924,12 +924,12 @@ pub struct Runtime {
     /// Latched on every successful present; idle ticks leave it unchanged.
     /// Bound by [`bitty_rich::KITTY_PRESENT_MAX_BLITS_PER_FRAME`].
     kitty_last_frame_images: usize,
-    /// Alternate-screen state at the last present (CTX-0248).
+    /// Alternate-screen origins latched at the last present (CTX-0248, #1550).
     ///
-    /// A change forces a full present even when the grid generation is
-    /// unchanged, so entering alt clears painted images (and leaving alt
-    /// repaints the restored grid) instead of idling on a stale frame.
-    kitty_alt_screen_latched: bool,
+    /// A change across any visible pane origin forces a full present even when
+    /// the grid generation is unchanged, so entering alt clears painted images
+    /// (and leaving alt repaints the restored grid) instead of idling on a stale frame.
+    kitty_alt_screens_latched: std::collections::BTreeSet<Option<u64>>,
     /// Decoded per-`View` background images (CTX-0347, RFC-0001/OQ-042).
     ///
     /// Loaded eagerly at construction from the validated config (global
@@ -1385,7 +1385,7 @@ impl Runtime {
             kitty_origin: None,
             kitty_raster_cache: bitty_rich::KittyRasterCache::new(),
             kitty_last_frame_images: 0,
-            kitty_alt_screen_latched: false,
+            kitty_alt_screens_latched: std::collections::BTreeSet::new(),
             backgrounds: bitty_rich::BackgroundStore::deny_all(),
             background_keys: std::collections::HashMap::new(),
             background_rasters: bitty_rich::BackgroundRasterCache::new(),
@@ -1600,7 +1600,7 @@ impl Runtime {
             kitty_origin: None,
             kitty_raster_cache: bitty_rich::KittyRasterCache::new(),
             kitty_last_frame_images: 0,
-            kitty_alt_screen_latched: false,
+            kitty_alt_screens_latched: std::collections::BTreeSet::new(),
             backgrounds: bitty_rich::BackgroundStore::deny_all(),
             background_keys: std::collections::HashMap::new(),
             background_rasters: bitty_rich::BackgroundRasterCache::new(),

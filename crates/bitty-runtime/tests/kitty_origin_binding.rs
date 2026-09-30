@@ -43,8 +43,29 @@ fn red_apc() -> Vec<u8> {
     .into_bytes()
 }
 
-fn has_opaque_red(rgba: &[u8]) -> bool {
-    rgba.chunks_exact(4).any(|px| px == [0xFF, 0, 0, 0xFF])
+fn view_has_opaque_red(rt: &Runtime, view: ViewId) -> bool {
+    let pad = usize::try_from(rt.window_padding_physical()).expect("pad fits");
+    let stride = usize::try_from(rt.config().window_extent().width()).expect("stride");
+    let frame = rt
+        .present_frames()
+        .into_iter()
+        .find(|f| f.view == view)
+        .expect("view frame");
+    let x0 = pad + usize::try_from(frame.content.x).unwrap();
+    let y0 = pad + usize::try_from(frame.content.y).unwrap();
+    let w = usize::try_from(frame.content.width).unwrap();
+    let h = usize::try_from(frame.content.height).unwrap();
+    let rgba = rt.headless_rgba().expect("rgba after tick");
+
+    for y in y0..(y0 + h) {
+        for x in x0..(x0 + w) {
+            let offset = (y * stride + x) * 4;
+            if offset + 4 <= rgba.len() && rgba[offset..offset + 4] == [0xFF, 0, 0, 0xFF] {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[test]
@@ -53,22 +74,26 @@ fn background_pane_image_never_paints_on_focused_pane() {
     assert!(rt.set_focus(ViewId::new(1)));
     spawn_quiet_pane(&mut rt, ViewId::new(2));
     // Pane 2's program emits a display image; routing tags it with pane 2's
-    // origin. The focused leaf (1, primary grid) must stay clean.
+    // origin. It paints on pane 2, but the focused leaf (1, primary grid)
+    // must stay clean (cross-pane spoof prevention).
     rt.handle_pane_bytes(ViewId::new(2), &red_apc());
     assert_eq!(rt.kitty_image_count(), 1);
     assert_eq!(rt.kitty_placement_count(), 1);
     rt.tick().expect("display forces a present");
-    let rgba = rt.headless_rgba().expect("rgba after tick");
     assert!(
-        !has_opaque_red(&rgba),
-        "background pane must not paint over the focused pane"
+        !view_has_opaque_red(&rt, ViewId::new(1)),
+        "focused leaf 1 must not contain background pane's image pixels"
+    );
+    assert!(
+        view_has_opaque_red(&rt, ViewId::new(2)),
+        "background pane 2 must paint its own image in its own viewport"
     );
     assert_eq!(
         rt.kitty_placement_count(),
         1,
         "placement is retained for its own leaf"
     );
-    assert_eq!(rt.kitty_last_frame_images(), 0);
+    assert_eq!(rt.kitty_last_frame_images(), 1);
 }
 
 #[test]
@@ -81,10 +106,13 @@ fn pane_image_paints_on_its_own_focused_leaf() {
     // it does not suppress.
     assert!(rt.set_focus(ViewId::new(2)));
     rt.tick().expect("focus + display force a present");
-    let rgba = rt.headless_rgba().expect("rgba after tick");
     assert!(
-        has_opaque_red(&rgba),
+        view_has_opaque_red(&rt, ViewId::new(2)),
         "own-pane image must paint on its focused leaf"
+    );
+    assert!(
+        !view_has_opaque_red(&rt, ViewId::new(1)),
+        "other leaf must stay clean"
     );
     assert_eq!(rt.kitty_last_frame_images(), 1);
 }
@@ -101,15 +129,27 @@ fn primary_image_paints_only_on_primary_leaf() {
     assert_eq!(rt.kitty_placement_count(), 1);
     rt.tick().expect("display forces a present");
     assert!(
-        !has_opaque_red(&rt.headless_rgba().expect("rgba")),
+        !view_has_opaque_red(&rt, ViewId::new(2)),
         "primary image must not paint over the session leaf"
     );
-    // The session-less leaf shows the primary grid: the image paints there.
+    // The session-less leaf shows the primary grid: the image paints there
+    // even though the session leaf is focused (#1550).
+    assert!(
+        view_has_opaque_red(&rt, ViewId::new(1)),
+        "primary image paints where the primary grid is shown"
+    );
+    assert_eq!(rt.kitty_last_frame_images(), 1);
+
+    // Focusing the primary leaf keeps the image visible.
     assert!(rt.set_focus(ViewId::new(1)));
     rt.tick().expect("focus change forces a present");
     assert!(
-        has_opaque_red(&rt.headless_rgba().expect("rgba")),
+        view_has_opaque_red(&rt, ViewId::new(1)),
         "primary image paints where the primary grid is shown"
+    );
+    assert!(
+        !view_has_opaque_red(&rt, ViewId::new(2)),
+        "primary image does not paint on session leaf"
     );
 }
 
@@ -131,16 +171,52 @@ fn pane_alt_screen_clears_only_its_origin() {
         "pane alt entry must not wipe the primary placement"
     );
     assert!(
-        !has_opaque_red(&rt.headless_rgba().expect("rgba")),
+        !view_has_opaque_red(&rt, ViewId::new(2)),
         "alt leaf carries no image pixels"
     );
     // The surviving primary placement still paints on the primary leaf.
-    assert!(rt.set_focus(ViewId::new(1)));
-    rt.tick().expect("focus change forces a present");
     assert!(
-        has_opaque_red(&rt.headless_rgba().expect("rgba")),
+        view_has_opaque_red(&rt, ViewId::new(1)),
         "primary placement survives the pane's alt entry"
     );
+}
+
+#[test]
+fn multi_pane_kitty_images_persist_across_focus_switching() {
+    let mut rt = two_pane_runtime();
+    spawn_quiet_pane(&mut rt, ViewId::new(2));
+    // Both panes emit images
+    rt.handle_pty_bytes(&red_apc());
+    rt.handle_pane_bytes(ViewId::new(2), &red_apc());
+    assert_eq!(rt.kitty_placement_count(), 2);
+
+    // Focus pane 1: both images must be rendered in their respective panes
+    assert!(rt.set_focus(ViewId::new(1)));
+    rt.tick().expect("present tick");
+    assert_eq!(rt.kitty_last_frame_images(), 2);
+    assert!(view_has_opaque_red(&rt, ViewId::new(1)));
+    assert!(view_has_opaque_red(&rt, ViewId::new(2)));
+
+    // Switch focus to pane 2: BOTH images must remain visible!
+    assert!(rt.set_focus(ViewId::new(2)));
+    rt.tick().expect("present tick after focus switch");
+    assert_eq!(rt.kitty_last_frame_images(), 2);
+    assert!(view_has_opaque_red(&rt, ViewId::new(1)));
+    assert!(view_has_opaque_red(&rt, ViewId::new(2)));
+}
+
+#[test]
+fn sessionless_unowned_leaf_never_inherits_primary_images() {
+    let mut rt = two_pane_runtime();
+    // ViewId(1) is the primary owner; ViewId(2) has no pane session and is not primary owner.
+    rt.handle_pty_bytes(&red_apc());
+    rt.tick().expect("display forces present");
+    assert!(view_has_opaque_red(&rt, ViewId::new(1)));
+    assert!(
+        !view_has_opaque_red(&rt, ViewId::new(2)),
+        "sessionless unowned leaf must never render primary Kitty images"
+    );
+    assert_eq!(rt.kitty_last_frame_images(), 1);
 }
 
 #[test]

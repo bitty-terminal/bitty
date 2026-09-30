@@ -79,6 +79,7 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "layout.gaps_out"
         | "workspace.layout"
         | "workspace.show_bar"
+        | "workspace.bar.edge"
         | "decoration.gaps_in"
         | "decoration.gaps_out"
         | "decoration.border"
@@ -555,6 +556,7 @@ const ATTRIBUTED_FIELDS: &[&str] = &[
     "layout",
     "workspace.layout",
     "workspace.show_bar",
+    "workspace.bar.edge",
     "workspace",
     "decoration.gaps_in",
     "decoration.gaps_out",
@@ -1037,6 +1039,47 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
                         &mut attribution,
                         &mut conflicts,
                         bar_field,
+                        prev,
+                        src,
+                        MergeClass::ScalarReplace,
+                    );
+                }
+            }
+            // CTX-0873: `workspace.bar.edge` is scalar-replace with the same
+            // present-key-only rule as `workspace.show_bar`.
+            if let Some(bar_edge) = ws.bar_edge {
+                let edge_field = "workspace.bar.edge";
+                if is_policy {
+                    policy_fields.insert(edge_field.to_string(), src.clone());
+                    effective.workspace.bar_edge = Some(bar_edge);
+                    let prev = attribution.get(edge_field).cloned();
+                    record_attribution(
+                        &mut attribution,
+                        &mut conflicts,
+                        edge_field,
+                        prev,
+                        src,
+                        MergeClass::ScalarReplace,
+                    );
+                } else if let Some(policy_src) = policy_fields.get(edge_field) {
+                    policy_violations.push(ConfigError::NonOverridable {
+                        field: edge_field.to_string(),
+                        policy_source: policy_src.describe(),
+                        attempted_source: src.describe(),
+                    });
+                    conflicts.push(MergeConflict {
+                        field: edge_field.to_string(),
+                        previous_source: policy_src.clone(),
+                        new_source: src.clone(),
+                        merge_class: MergeClass::ScalarReplace,
+                    });
+                } else {
+                    let prev = attribution.get(edge_field).cloned();
+                    effective.workspace.bar_edge = Some(bar_edge);
+                    record_attribution(
+                        &mut attribution,
+                        &mut conflicts,
+                        edge_field,
                         prev,
                         src,
                         MergeClass::ScalarReplace,
@@ -2202,6 +2245,47 @@ fn merge_layers_allow_policy_violations(
                         &mut attribution,
                         &mut conflicts,
                         bar_field,
+                        prev,
+                        src,
+                        MergeClass::ScalarReplace,
+                    );
+                }
+            }
+            // CTX-0873: `workspace.bar.edge` is scalar-replace with the same
+            // present-key-only rule as `workspace.show_bar`.
+            if let Some(bar_edge) = ws.bar_edge {
+                let edge_field = "workspace.bar.edge";
+                if is_policy {
+                    policy_fields.insert(edge_field.to_string(), src.clone());
+                    effective.workspace.bar_edge = Some(bar_edge);
+                    let prev = attribution.get(edge_field).cloned();
+                    record_attribution(
+                        &mut attribution,
+                        &mut conflicts,
+                        edge_field,
+                        prev,
+                        src,
+                        MergeClass::ScalarReplace,
+                    );
+                } else if let Some(policy_src) = policy_fields.get(edge_field) {
+                    policy_violations.push(ConfigError::NonOverridable {
+                        field: edge_field.to_string(),
+                        policy_source: policy_src.describe(),
+                        attempted_source: src.describe(),
+                    });
+                    conflicts.push(MergeConflict {
+                        field: edge_field.to_string(),
+                        previous_source: policy_src.clone(),
+                        new_source: src.clone(),
+                        merge_class: MergeClass::ScalarReplace,
+                    });
+                } else {
+                    let prev = attribution.get(edge_field).cloned();
+                    effective.workspace.bar_edge = Some(bar_edge);
+                    record_attribution(
+                        &mut attribution,
+                        &mut conflicts,
+                        edge_field,
                         prev,
                         src,
                         MergeClass::ScalarReplace,
@@ -3917,6 +4001,7 @@ mod tests {
                 workspace: Some(WorkspaceConfig {
                     layout: Some("dwindle".to_string()),
                     show_bar: None,
+                    bar_edge: None,
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -3937,6 +4022,7 @@ mod tests {
                 workspace: Some(WorkspaceConfig {
                     layout: Some("grid".to_string()),
                     show_bar: None,
+                    bar_edge: None,
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -3948,6 +4034,7 @@ mod tests {
                 workspace: Some(WorkspaceConfig {
                     layout: Some("dwindle".to_string()),
                     show_bar: None,
+                    bar_edge: None,
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -3986,6 +4073,7 @@ mod tests {
                 workspace: Some(WorkspaceConfig {
                     layout: None,
                     show_bar: Some(false),
+                    bar_edge: None,
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -4005,6 +4093,7 @@ mod tests {
                 workspace: Some(WorkspaceConfig {
                     layout: Some("grid".to_string()),
                     show_bar: None,
+                    bar_edge: None,
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -4016,6 +4105,7 @@ mod tests {
                 workspace: Some(WorkspaceConfig {
                     layout: None,
                     show_bar: Some(false),
+                    bar_edge: None,
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -4031,6 +4121,82 @@ mod tests {
         assert_eq!(
             merged3.source_of("workspace.show_bar").unwrap().layer,
             LayerKind::CoreDefaults
+        );
+    }
+
+    #[test]
+    fn workspace_bar_edge_merges_scalar_replace_with_attribution() {
+        // CTX-0873: `workspace.bar.edge` lands in effective with its layer's
+        // attribution; a higher layer wins; a higher layer without the key
+        // never clobbers a lower explicit edge; the empty stack says nothing
+        // (runtime default bottom) with core-defaults attribution.
+        use crate::types::{WorkspaceBarEdge, WorkspaceConfig};
+        let layer = |kind, name, edge| {
+            LayeredPlan::new(
+                ConfigSource::new(kind, Some(name)),
+                ConfigPlan {
+                    workspace: Some(WorkspaceConfig {
+                        layout: None,
+                        show_bar: None,
+                        bar_edge: edge,
+                    }),
+                    schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                    ..Default::default()
+                },
+            )
+        };
+        let merged = merge_layers(vec![layer(
+            LayerKind::User,
+            "user.lua",
+            Some(WorkspaceBarEdge::Top),
+        )])
+        .expect("merge");
+        assert_eq!(
+            merged.effective.workspace.bar_edge,
+            Some(WorkspaceBarEdge::Top)
+        );
+        assert_eq!(
+            merged.source_of("workspace.bar.edge").unwrap().layer,
+            LayerKind::User
+        );
+        let merged2 = merge_layers(vec![
+            layer(LayerKind::User, "user.lua", Some(WorkspaceBarEdge::Top)),
+            layer(LayerKind::Cli, "cli", Some(WorkspaceBarEdge::Bottom)),
+        ])
+        .expect("merge");
+        assert_eq!(
+            merged2.effective.workspace.bar_edge,
+            Some(WorkspaceBarEdge::Bottom)
+        );
+        assert_eq!(
+            merged2.source_of("workspace.bar.edge").unwrap().layer,
+            LayerKind::Cli
+        );
+        assert!(
+            merged2
+                .conflicts
+                .iter()
+                .any(|c| c.field == "workspace.bar.edge")
+        );
+        let merged3 = merge_layers(vec![
+            layer(LayerKind::User, "user.lua", Some(WorkspaceBarEdge::Top)),
+            layer(LayerKind::Cli, "cli", None),
+        ])
+        .expect("merge");
+        assert_eq!(
+            merged3.effective.workspace.bar_edge,
+            Some(WorkspaceBarEdge::Top),
+            "absent key says nothing"
+        );
+        let merged4 = merge_layers(vec![]).expect("empty layers merge");
+        assert!(merged4.effective.workspace.bar_edge.is_none());
+        assert_eq!(
+            merged4.source_of("workspace.bar.edge").unwrap().layer,
+            LayerKind::CoreDefaults
+        );
+        assert_eq!(
+            merge_class_for("workspace.bar.edge"),
+            Some(MergeClass::ScalarReplace)
         );
     }
 

@@ -13,6 +13,10 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+default = []
+network = ["dep:bitty-network-lua", "bitty-lua/network"]
+
 [dependencies]
 bitty-vt = { path = "../bitty-vt" }
 bitty-term-state = { path = "../bitty-term-state" }
@@ -35,7 +39,7 @@ bitty-rich = { path = "../bitty-rich" }
 # registers the `bitty.network` module per capability-granted plugin VM. Same
 # external pin as `bitty-lua`/`bitty-plugin-host` (rev d97c5da); do not bump
 # here independently.
-bitty-network-lua = { git = "https://github.com/bitty-terminal/bitty-network", rev = "d97c5da" }
+bitty-network-lua = { git = "https://github.com/bitty-terminal/bitty-network", rev = "d97c5da", optional = true }
 
 # CORE-RUN-003 (#1526): the supervisor claim lock is an OS-held `flock`.
 # Same workspace pins and platform split as `bitty-ipc` (no new crates).

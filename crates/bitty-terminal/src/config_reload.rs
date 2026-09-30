@@ -121,6 +121,8 @@ fn runtime_adopts(field: &str) -> bool {
             | "decoration.border_width"
             | "decoration.border_width_focused"
             | "decoration.border_width_idle"
+            | "workspace.show_bar"
+            | "workspace.bar.edge"
     ) || field.starts_with("appearance.animations")
 }
 
@@ -203,6 +205,12 @@ pub(crate) fn apply_live_presentation(
     runtime
         .set_font_size(resolved.font_size)
         .map_err(|err| format!("font.size: {err}"))?;
+    // CTX-0873: bar visibility and edge re-solve the chrome band and reflow
+    // leaves, grids, and PTYs in place. Both setters are total. The edge is
+    // set first so a simultaneous show + move reflows straight to the final
+    // placement.
+    runtime.set_workspace_bar_edge(resolved.workspace_bar_edge);
+    runtime.set_workspaceline_visible(resolved.workspaceline_visible);
     Ok(())
 }
 
@@ -583,6 +591,8 @@ mod tests {
         assert!(runtime_adopts("font.size"));
         assert!(runtime_adopts("decoration.gaps_in"));
         assert!(runtime_adopts("appearance.animations.duration_ms.open"));
+        assert!(runtime_adopts("workspace.show_bar"));
+        assert!(runtime_adopts("workspace.bar.edge"));
         for pending in [
             "font.family",
             "window.opacity",
@@ -667,6 +677,50 @@ mod tests {
         apply_live_presentation(&mut runtime, &effective).expect("adopt");
         assert!((runtime.config().font_size - 17.0).abs() < f32::EPSILON);
         assert_eq!(runtime.config().window_padding, 9);
+    }
+
+    #[test]
+    fn apply_live_presentation_moves_and_toggles_the_bar_band() {
+        // CTX-0873: a reload flipping `workspace.bar.edge` and
+        // `workspace.show_bar` re-solves the band and reflows the grid.
+        // Seed the runtime from the same effective config the engine runs,
+        // so decoration/font geometry match and only the bar fields move
+        // the row budget below.
+        let baseline = bitty_config::fallback_builtin();
+        let cfg = crate::config_cli::runtime_config_from_effective(&baseline).expect("cfg");
+        let mut runtime = bitty_runtime::Runtime::new(cfg).expect("runtime");
+        runtime.workspace_new().expect("ws2 reserves the band");
+        assert!(runtime.workspace_switch(0));
+        let mut engine = ReloadEngine::new(baseline);
+        let window = runtime.window_cells();
+        let banded = runtime.snapshot().height;
+        assert_eq!(
+            runtime.status_bar_band().map(|band| band.y),
+            Some(window.height - 1),
+            "default bottom band"
+        );
+
+        let mut top = bitty_config::fallback_builtin();
+        top.workspace.bar_edge = Some(bitty_config::types::WorkspaceBarEdge::Top);
+        let outcome = engine.reload(top);
+        assert!(matches!(outcome, ReloadOutcome::Applied(_)), "{outcome:?}");
+        apply_live_presentation(&mut runtime, engine.current()).expect("adopt edge");
+        assert_eq!(runtime.status_bar_band().map(|band| band.y), Some(0));
+        assert_eq!(runtime.container().y, 1, "content shifts below the band");
+        assert_eq!(runtime.snapshot().height, banded, "same row budget");
+
+        let mut hidden = engine.current().clone();
+        hidden.workspace.show_bar = Some(false);
+        let outcome = engine.reload(hidden);
+        assert!(matches!(outcome, ReloadOutcome::Applied(_)), "{outcome:?}");
+        apply_live_presentation(&mut runtime, engine.current()).expect("adopt hide");
+        assert_eq!(runtime.status_bar_band(), None);
+        assert_eq!(runtime.container(), window, "band released");
+        assert_eq!(
+            runtime.snapshot().height,
+            banded + 1,
+            "rows reflow to reclaim the band row"
+        );
     }
 
     #[test]

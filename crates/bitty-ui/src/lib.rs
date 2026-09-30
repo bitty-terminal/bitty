@@ -236,8 +236,8 @@ pub use gesture::{
     GesturePhase, GestureTransaction, resolve_invocation, verify_origin_equivalence,
 };
 pub use layout::{
-    LayoutNode, OverlayLayer, OverlayTier, clamp_ratio, smart_split_axis, split_rect,
-    split_rect_with_gap,
+    CELL_ASPECT_RATIO, LayoutNode, OverlayLayer, OverlayTier, clamp_ratio, smart_split_axis,
+    split_rect, split_rect_with_gap,
 };
 pub use motion::{
     MAX_MOTION_DURATION_MS, MotionConfig, MotionCurve, MotionError, MotionScope, MotionSpec,
@@ -287,7 +287,8 @@ pub use provider::{
     LAYOUT_PROVIDER_CAPABILITY, LayoutError, LayoutProvider, LogicalRect as ProviderRect,
     MASTER_PROVIDER_ID, MAX_PROVIDER_NAME_LEN, MasterProvider, NOOP_PROVIDER_ID,
     NOOP_PROVIDER_NAME, NoopTiler, ProviderId, ProviderName, ProviderRegistry,
-    RESERVED_PROVIDER_NAMES, WorkspaceSnapshot, validate_proposal,
+    RESERVED_PROVIDER_NAMES, SPIRAL_PROVIDER_ID, SpiralProvider, WorkspaceSnapshot,
+    validate_proposal,
 };
 pub use resolved_style::{ResolvedStyle, StyleCascade, StyleError, StyleOrigin};
 pub use scratchpad::{

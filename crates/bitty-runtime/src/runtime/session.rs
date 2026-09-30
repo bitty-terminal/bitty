@@ -1687,6 +1687,9 @@ impl Runtime {
                 }
             }
         }
+        // CTX-0873: a restore can change the workspace count across one,
+        // which reserves or releases the bar band.
+        self.refresh_chrome_band();
         let pending = self.session_pending.len();
         self.pending_full_redraw = true;
         Ok(SessionRestoreSummary {

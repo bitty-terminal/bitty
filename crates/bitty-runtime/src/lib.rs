@@ -213,7 +213,7 @@ pub use runtime::cw_live::HintLinkOpenError;
 pub use config::{
     BACKGROUND_FITS, CloseConfirmMode, DEFAULT_BACKGROUND_FIT, MAX_BACKGROUND_IMAGE_PATH_BYTES,
     MAX_BACKGROUND_IMAGE_ROOTS, MAX_PASTE_CONFIRM_TIMEOUT_SECS, MIN_PASTE_CONFIRM_TIMEOUT_SECS,
-    RuntimeConfig, RuntimeViewBackground, RuntimeViewOutline, RuntimeViewTarget,
+    PanelLayoutMode, RuntimeConfig, RuntimeViewBackground, RuntimeViewOutline, RuntimeViewTarget,
     ViewAppearanceRule,
 };
 pub use error::RuntimeError;

@@ -2226,6 +2226,61 @@ fn runtime_config_inherits_workspace_show_bar_opt_out() {
 }
 
 #[test]
+fn runtime_config_inherits_workspace_bar_edge() {
+    // CTX-0873: `workspace.bar.edge` flows file -> effective -> runtime;
+    // absent keeps the bottom default.
+    use bitty_config::file::{parse_lua_config, resolve_effective};
+    use bitty_config::plan::{ConfigSource, LayerKind, LayeredPlan};
+    use bitty_runtime::config::BarEdge;
+    for (lua, want) in [
+        (
+            r#"return { terminal = { scrollback = 10000 } }"#,
+            BarEdge::Bottom,
+        ),
+        (
+            r#"return { workspace = { bar = { edge = "top" } } }"#,
+            BarEdge::Top,
+        ),
+        (
+            r#"return { workspace = { bar = { edge = "bottom" } } }"#,
+            BarEdge::Bottom,
+        ),
+    ] {
+        let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+        let plan = parse_lua_config(lua, &src).expect(lua);
+        let merged = resolve_effective(Some(LayeredPlan::new(src, plan)), None).expect("merge");
+        let cfg = runtime_config_from_effective(&merged.effective).expect("builds");
+        assert_eq!(cfg.workspace_bar_edge, want, "{lua}");
+        let rt = bitty_runtime::Runtime::new(cfg).expect("runtime builds");
+        assert_eq!(rt.workspace_bar_edge(), want);
+    }
+}
+
+#[test]
+fn bar_edge_mapping_round_trips_by_spelling() {
+    // CTX-0873: `bitty-config` and `bitty-runtime` share no dependency
+    // edge, so the one mapping (`runtime_bar_edge`) is pinned here: every
+    // config spelling parses, maps to the runtime variant of the same
+    // name, and the canonical spelling round-trips.
+    use bitty_config::types::WorkspaceBarEdge;
+    use bitty_runtime::config::BarEdge;
+    for (spelling, config, runtime) in [
+        ("top", WorkspaceBarEdge::Top, BarEdge::Top),
+        ("bottom", WorkspaceBarEdge::Bottom, BarEdge::Bottom),
+    ] {
+        assert_eq!(WorkspaceBarEdge::parse(spelling), Some(config));
+        assert_eq!(config.as_str(), spelling);
+        assert_eq!(crate::config_cli::runtime_bar_edge(config), runtime);
+    }
+    assert_eq!(
+        crate::config_cli::runtime_bar_edge(WorkspaceBarEdge::default()),
+        BarEdge::default(),
+        "defaults agree across crates"
+    );
+    assert_eq!(WorkspaceBarEdge::parse("Top"), None, "fail-closed spelling");
+}
+
+#[test]
 fn runtime_config_inherits_file_layout_gaps() {
     // CTX-0177: `layout.gaps_in`/`gaps_out` flow file -> effective ->
     // runtime; crate defaults stay equal (bitty-runtime must not depend
@@ -3035,6 +3090,9 @@ fn starter_init_lua_is_valid_config() {
     assert!(plan.mouse.is_none());
     assert!(starter_init_lua().contains("focus_follows_mouse"));
     assert!(starter_init_lua().contains("focus_follows_mouse_delay_ms"));
+    // CTX-0873: starter documents the bar edge as a commented example only.
+    assert!(plan.workspace.is_none());
+    assert!(starter_init_lua().contains(r#"workspace = { bar = { edge = "top" } }"#));
 }
 
 // -- `bitty init` wizard (CTX-0149, #243) --------------------------------
@@ -5137,5 +5195,140 @@ fn external_editor_nonzero_exit_discards_and_tears_down() {
     assert!(!app.runtime.has_pane_session(&editor_view));
     assert_eq!(app.runtime.focused_view(), Some(home));
     assert!(app.runtime.cw_composer_is_open());
+    let _ = std::fs::remove_file(&script);
+}
+
+// ---------------------------------------------------------------------------
+// Shell child exit and panel auto-close regression tests (#1356, #1541, CTX-0881)
+// ---------------------------------------------------------------------------
+
+#[test]
+#[cfg(unix)]
+fn reap_exited_split_pane_closes_pane_and_promotes_sibling() {
+    require_pty!();
+    let mut app = editor_test_app();
+    assert_eq!(app.runtime.leaf_count(), 2);
+    let pane_view = ViewId::new(2);
+
+    // Spawn an immediately exiting shell script in split pane 2.
+    let script = write_fake_editor("exit-pane", "#!/bin/sh\nexit 0\n");
+    let script_arg = script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell_for_view_in(pane_view, script_arg.as_str(), &[], 80, 24, None)
+        .expect("spawn pane shell");
+    assert!(app.runtime.has_pane_session(&pane_view));
+
+    // Poll until reap_exited_shells detects exit and closes the pane.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut outcome = terminal_app::ShellExitOutcome::NoExit;
+    while std::time::Instant::now() < deadline {
+        let _ = app.poll_pty_pump();
+        outcome = app.reap_exited_shells();
+        if outcome != terminal_app::ShellExitOutcome::NoExit {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    assert_eq!(outcome, terminal_app::ShellExitOutcome::PaneClosed);
+    assert_eq!(
+        app.runtime.leaf_count(),
+        1,
+        "closed pane must reduce leaf count to 1"
+    );
+    assert!(
+        !app.runtime.has_pane_session(&pane_view),
+        "pane session must be dropped"
+    );
+    assert_eq!(
+        app.runtime.focused_view(),
+        Some(ViewId::new(1)),
+        "sibling must remain focused"
+    );
+    let _ = std::fs::remove_file(&script);
+}
+
+#[test]
+#[cfg(unix)]
+fn reap_exited_primary_with_active_pane_closes_primary_pane() {
+    require_pty!();
+    let mut app = editor_test_app();
+    assert_eq!(app.runtime.leaf_count(), 2);
+    let primary_view = ViewId::new(1);
+    let pane_view = ViewId::new(2);
+    assert_eq!(app.runtime.primary_view(), Some(primary_view));
+
+    // Spawn a long-running shell in split pane 2.
+    let pane_script = write_fake_editor("sleep-pane", "#!/bin/sh\nsleep 10\n");
+    let pane_script_arg = pane_script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell_for_view_in(pane_view, pane_script_arg.as_str(), &[], 80, 24, None)
+        .expect("spawn pane shell");
+
+    // Spawn an exiting shell in primary.
+    let primary_script = write_fake_editor("exit-primary", "#!/bin/sh\nexit 0\n");
+    let primary_script_arg = primary_script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell(primary_script_arg.as_str())
+        .expect("spawn primary shell");
+
+    // Poll until reap_exited_shells detects primary exit and closes the primary pane.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut outcome = terminal_app::ShellExitOutcome::NoExit;
+    while std::time::Instant::now() < deadline {
+        let _ = app.poll_pty_pump();
+        outcome = app.reap_exited_shells();
+        if outcome != terminal_app::ShellExitOutcome::NoExit {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    assert_eq!(outcome, terminal_app::ShellExitOutcome::PaneClosed);
+    assert_eq!(app.runtime.leaf_count(), 1);
+    assert_eq!(app.runtime.focused_view(), Some(pane_view));
+
+    // Clean up
+    app.runtime.close_pane_session(&pane_view);
+    let _ = std::fs::remove_file(&pane_script);
+    let _ = std::fs::remove_file(&primary_script);
+}
+
+#[test]
+#[cfg(unix)]
+fn reap_exited_last_remaining_shell_signals_app_exit() {
+    require_pty!();
+    let maps =
+        bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        maps,
+        SpawnSpec::default(),
+    );
+    assert_eq!(app.runtime.leaf_count(), 1);
+
+    // Spawn an exiting shell in primary.
+    let script = write_fake_editor("exit-last", "#!/bin/sh\nexit 0\n");
+    let script_arg = script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell(script_arg.as_str())
+        .expect("spawn primary shell");
+
+    // Poll until reap_exited_shells returns AppExiting.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut outcome = terminal_app::ShellExitOutcome::NoExit;
+    while std::time::Instant::now() < deadline {
+        let _ = app.poll_pty_pump();
+        outcome = app.reap_exited_shells();
+        if outcome != terminal_app::ShellExitOutcome::NoExit {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    assert_eq!(outcome, terminal_app::ShellExitOutcome::AppExiting);
     let _ = std::fs::remove_file(&script);
 }

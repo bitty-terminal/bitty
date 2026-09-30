@@ -535,3 +535,51 @@ fn first_paint_crops_overflow_instead_of_squeezing() {
     );
     let _ = origin_x;
 }
+
+#[test]
+fn erase_in_display_all_clears_active_placements() {
+    let mut rt = make_runtime();
+    rt.kitty_display_image(32, Some(2), Some(2), None, 2, 2, 0, &red_2x2(), 0)
+        .expect("display must succeed");
+    rt.tick().expect("display forces present");
+    assert_eq!(rt.kitty_image_count(), 1);
+    assert_eq!(rt.kitty_placement_count(), 1);
+
+    // ED 2 (All) must clear placements for the current origin.
+    rt.handle_pty_bytes(b"\x1b[2J");
+    rt.tick().expect("clear forces present");
+    assert_eq!(rt.kitty_image_count(), 1, "stored image survives in store");
+    assert_eq!(
+        rt.kitty_placement_count(),
+        0,
+        "active placements must be dropped on clear"
+    );
+}
+
+#[test]
+fn erase_in_display_scroll_and_clear_clears_active_placements() {
+    let mut rt = make_runtime();
+    rt.kitty_display_image(32, Some(2), Some(2), None, 2, 2, 0, &red_2x2(), 0)
+        .expect("display must succeed");
+    rt.tick().expect("display forces present");
+    assert_eq!(rt.kitty_placement_count(), 1);
+
+    // ED 22 (ScrollAndClear) must clear active placements.
+    rt.handle_pty_bytes(b"\x1b[22J");
+    rt.tick().expect("clear forces present");
+    assert_eq!(rt.kitty_placement_count(), 0);
+}
+
+#[test]
+fn full_reset_clears_active_placements() {
+    let mut rt = make_runtime();
+    rt.kitty_display_image(32, Some(2), Some(2), None, 2, 2, 0, &red_2x2(), 0)
+        .expect("display must succeed");
+    rt.tick().expect("display forces present");
+    assert_eq!(rt.kitty_placement_count(), 1);
+
+    // RIS (FullReset) must clear active placements.
+    rt.handle_pty_bytes(b"\x1bc");
+    rt.tick().expect("reset forces present");
+    assert_eq!(rt.kitty_placement_count(), 0);
+}

@@ -1,3 +1,5 @@
+#![cfg(feature = "network")]
+
 //! CTX-0846 (#1454): the optional `bitty.network` plugin module is registered
 //! only for plugin VMs whose activation grant includes a `network.connect`
 //! capability AND when a shared network runtime was installed on the host.

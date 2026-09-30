@@ -294,11 +294,15 @@ fn inactive_close_after_resize_keeps_active_geometry_coherent() {
     rt.workspace_close_at(ws2).expect("close inactive ws2");
     assert_eq!(rt.workspace_count(), 1);
     assert_eq!(rt.active_workspace_index(), 0);
+    // CTX-0873: the lone workspace releases the bar band, so the live
+    // geometry reflows to the full window; the tree itself survives and
+    // `tick_and_check` below re-proves grid/PTY coherence.
     assert_eq!(
-        rt.layout(),
-        &layout_resized,
+        rt.layout().leaf_ids(),
+        layout_resized.leaf_ids(),
         "live leaf edits survive inactive close"
     );
+    assert_eq!(rt.container(), rt.window_cells(), "band released");
     assert_eq!(
         rt.focused_view(),
         focus_before,
@@ -465,11 +469,21 @@ fn run_live_sequence(seed: u64, steps: usize) {
                         target += 1;
                     }
                     rt.workspace_close_at(target).expect("inactive close");
-                    assert_eq!(
-                        rt.layout(),
-                        &layout_before,
-                        "{context}: inactive close keeps the live layout"
-                    );
+                    // CTX-0873: closing down to one workspace releases the
+                    // bar band and reflows geometry; the tree must survive.
+                    if rt.workspace_count() >= 2 {
+                        assert_eq!(
+                            rt.layout(),
+                            &layout_before,
+                            "{context}: inactive close keeps the live layout"
+                        );
+                    } else {
+                        assert_eq!(
+                            rt.layout().leaf_ids(),
+                            layout_before.leaf_ids(),
+                            "{context}: inactive close keeps the live tree"
+                        );
+                    }
                     assert_eq!(
                         rt.focused_view(),
                         focus_before,

@@ -26,8 +26,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remaining `Live` keys (`font.family`/`line_height`/`letter_spacing`,
   `appearance.theme`/`colors`, `keymaps`/`leader`/`mod_key`, `window.opacity`)
   are follow-ups with no runtime adopter yet.
+- **Workspace bar reserves its own row (CTX-0873, #1431):** the workspace bar
+  is a Core-owned chrome band carved out of the window grid before layout, so
+  it no longer paints over the last terminal row. Every leaf, the primary
+  grid, and every PTY winsize are one band shorter while the bar presents
+  (visible and more than one workspace), and reclaim the row when it hides.
+  A window too small to keep content rows after gaps and decoration hides
+  the band instead. New key `workspace.bar.edge = "top" | "bottom"` (default
+  `bottom`) places the band; `top` shifts content down one row. Both
+  `workspace.bar.edge` and `workspace.show_bar` reload live and reflow in
+  place.
 
 ### Changed
+
+- **Workspace bar over fullscreen apps (CTX-0873, #1431):** the bar stays
+  visible and clickable on the alternate screen (vim, htop). It used to hide
+  there because it overlapped the app's grid; it now sits outside the grid.
+- **`Runtime::set_container` is an alias of `set_window_cells` (CTX-0873):**
+  the rect is now the full window grid and the layout container is derived
+  from it minus the chrome band, so `container()` reads one band smaller
+  while the bar presents. It still does not reflow; call `reflow_layout`.
 
 - **Crate renamed `bitty-app` -> `bitty-terminal` (CTX-0852, #1512):** the
   workspace already shipped a crate named `bitty-terminal` before CTX-0164
@@ -39,6 +57,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dependency chain can be published.
 
 ### Fixed
+
+- **Screen clear drops active Kitty image placements (CTX-0883, #1545):** executing
+  `clear` (`ED 2` / `CSI 2 J`, `ED 22` scroll-and-clear, or `FullReset` / RIS)
+  previously cleared character cells but left active Kitty image placements in
+  `KittyImageLayer`. `clear` now clears placements for the affected PTY origin
+  and purges the raster cache, matching Kitty and Ghostty behavior.
 
 - **Text selection is View-owned (CTX-0803, #1476, #1433):** the runtime kept
   one global selection that worked only against the primary grid. The pointer

@@ -56,11 +56,12 @@ pub const WORKSPACE_NAME_MAX_CHARS: usize = 32;
 /// Hard bound on the rendered workspaceline string.
 pub const WORKSPACELINE_MAX_CHARS: usize = 1024;
 
-/// Height of the in-grid status bar in terminal rows (issue #1349).
+/// Height of the workspace status bar band in window rows (issue #1349).
 ///
-/// The bar occupies exactly the last content row of each rendered leaf.
-/// Terminal content behind it is occluded, never mutated: the overlay
-/// applies to the owned present snapshot copy, never to grid truth.
+/// CTX-0873 (#1431): the bar owns a Core-reserved chrome band at the
+/// configured window edge ([`crate::config::BarEdge`]); the layout container
+/// excludes it, so terminal content is never painted under the bar and grid
+/// truth is never mutated.
 pub const STATUS_BAR_ROWS: usize = 1;
 
 /// One workspace: name plus stashed layout + focus.
@@ -279,9 +280,42 @@ impl Runtime {
 
     /// Live-toggle the switcher bar (opt-out path for `workspace.show_bar`).
     /// Presentation-only; always succeeds.
+    ///
+    /// CTX-0873: toggling reserves or releases the chrome band, so the
+    /// container, leaves, primary grid, and PTY winsizes reflow at once.
     pub fn set_workspaceline_visible(&mut self, visible: bool) {
         self.workspaceline_visible = visible;
+        self.refresh_chrome_band();
         self.pending_full_redraw = true;
+    }
+
+    /// Window edge of the workspace bar band (CTX-0873 `workspace.bar.edge`).
+    #[must_use]
+    pub fn workspace_bar_edge(&self) -> crate::config::BarEdge {
+        self.workspace_bar_edge
+    }
+
+    /// Live-moves the workspace bar band to `edge` (CTX-0873). Reflows the
+    /// container and every grid/PTY when the band is present; always
+    /// succeeds.
+    pub fn set_workspace_bar_edge(&mut self, edge: crate::config::BarEdge) {
+        if edge == self.workspace_bar_edge {
+            return;
+        }
+        self.workspace_bar_edge = edge;
+        self.refresh_chrome_band();
+        self.pending_full_redraw = true;
+    }
+
+    /// The reserved workspace bar band in window cells, or `None` when no
+    /// band is reserved (bar hidden, a lone workspace, or a window too small
+    /// to keep content rows — CTX-0873).
+    ///
+    /// Shared by the present path, the mouse routing, and headless tests so
+    /// the drawn band and its click geometry can never drift apart.
+    #[must_use]
+    pub fn status_bar_band(&self) -> Option<UiRect> {
+        self.chrome_layout().bar
     }
 
     /// The bar string as chrome should present it, or `None` when opted
@@ -313,35 +347,23 @@ impl Runtime {
     /// Bitty workspaces live inside one OS window, so the bar presents.
     #[must_use]
     pub fn status_bar_text(&self) -> Option<String> {
-        if !self.workspaceline_visible {
+        if !self.bar_present() {
             return None;
         }
         if self.workspaces.is_empty() {
             return Some(String::from("\u{2014}"));
         }
-        if self.workspaces.len() <= 1 {
-            return None;
-        }
         Some(self.workspaceline_text())
     }
 
-    /// In-grid bar row (0-based) inside a leaf content frame `height_rows`
-    /// tall, or `None` when the bar is hidden, when only one workspace
-    /// exists (CTX-0838 #1441: no bar, no reserved row), or the frame has
-    /// no bar row.
-    ///
-    /// Shared by the present overlay, the mouse routing, and headless
-    /// tests so the drawn row and its click geometry can never drift
-    /// apart.
+    /// Whether the bar presents (CTX-0873): exactly when
+    /// [`Self::status_bar_text`] is `Some` — visible and either more than
+    /// one workspace or the fail-closed empty-list em-dash — without
+    /// formatting the string. Used by the per-tick chrome solve and the
+    /// bar hit-tests so neither allocates.
     #[must_use]
-    pub fn status_bar_row(&self, height_rows: usize) -> Option<usize> {
-        if !self.workspaceline_visible
-            || self.workspaces.len() <= 1
-            || height_rows < STATUS_BAR_ROWS
-        {
-            return None;
-        }
-        Some(height_rows - STATUS_BAR_ROWS)
+    pub fn bar_present(&self) -> bool {
+        self.workspaceline_visible && self.workspaces.len() != 1
     }
 
     /// Maps a bar column (0-based, in characters of
@@ -352,7 +374,7 @@ impl Runtime {
     /// closed with no state change.
     #[must_use]
     pub fn workspaceline_hit_test(&self, column: usize) -> Option<usize> {
-        if !self.workspaceline_visible || self.workspaces.len() <= 1 {
+        if !self.bar_present() {
             return None;
         }
         let mut start = 0usize;
@@ -382,19 +404,23 @@ impl Runtime {
         self.workspace_switch(target)
     }
 
-    /// Routes a left press on the drawn in-grid status bar band to the
-    /// workspace hit-test (issue #1349).
+    /// Routes a left press on the workspace bar band to the workspace
+    /// hit-test (issue #1349, CTX-0808, CTX-0873).
     ///
     /// Returns `true` (consume the press) when the last-known cursor sits
-    /// inside a drawn bar band: the band geometry reuses the same
-    /// [`PresentFrame`](super::layout_focus::PresentFrame) content rects
-    /// and [`Self::status_bar_row`] the present overlay paints, so a click
-    /// can only land where the bar was drawn. The click itself still fails
+    /// inside the reserved band ([`Self::status_bar_band`]). The band is
+    /// Core chrome outside every terminal frame, so the press is consumed
+    /// before focus-follow and mouse capture: a capturing app never sees it,
+    /// focus never moves, and no selection starts. A consumed press arms the
+    /// one-shot `bar_release_swallow` so the paired release never reaches a
+    /// capturing app as an orphan report. The click itself still fails
     /// closed through [`Self::workspaceline_click`] (separators, the count
-    /// suffix, and the active workspace switch nothing); the press is
-    /// consumed regardless because the bar row is chrome — the terminal
-    /// cells underneath must not start a selection while hidden behind
-    /// the bar.
+    /// suffix, and the active workspace switch nothing).
+    ///
+    /// CTX-0873: the band no longer lives inside a leaf, so the old
+    /// alternate-screen skip is gone — a fullscreen app owns every row of
+    /// its own grid, and the bar sits outside that grid, visible and
+    /// clickable.
     pub(super) fn status_bar_press(&mut self) -> bool {
         let Some(pos) = self.last_cursor else {
             return false;
@@ -403,102 +429,38 @@ impl Runtime {
             return false;
         };
         self.workspaceline_click(col);
+        self.bar_release_swallow = true;
         true
     }
 
-    /// Routes a left press on a non-focused frame's drawn bar band to the
-    /// workspace hit-test before mouse capture (CTX-0808, #1484).
+    /// Bar column under physical `pos`, or `None` outside the band (pure
+    /// probe behind [`Self::status_bar_press`]).
     ///
-    /// Probes `last_cursor` via [`Self::status_bar_hit_frame`]: when the hit
-    /// frame is the focused view (or there is no hit) returns `false` so the
-    /// normal chrome path below stays authoritative. Otherwise calls the
-    /// existing [`Self::status_bar_press`] and, if it consumed, arms the
-    /// one-shot `bar_release_swallow` so the paired release never reaches a
-    /// capturing app as an orphan report. No selection or drag can be in
-    /// flight across it: the early return happens before any of those start.
-    pub(super) fn status_bar_press_non_focused(&mut self) -> bool {
-        let Some(pos) = self.last_cursor else {
-            return false;
-        };
-        let Some((hit_view, _)) = self.status_bar_hit_frame(pos) else {
-            return false;
-        };
-        if Some(hit_view) == self.focused_view() {
-            return false;
-        }
-        if self.status_bar_press() {
-            self.bar_release_swallow = true;
-            return true;
-        }
-        false
-    }
-
-    /// Column of the drawn status bar band under `pos`
-    /// (pure probe behind [`Self::status_bar_press`]).
-    ///
-    /// Delegates to [`Self::status_bar_hit_frame`], dropping the hit view.
-    fn status_bar_hit(&self, pos: CursorPosition) -> Option<usize> {
-        self.status_bar_hit_frame(pos).map(|(_, col)| col)
-    }
-
-    /// Topmost hit frame and bar column under `pos`
-    /// (pure probe behind [`Self::status_bar_press`]).
-    ///
-    /// Only the topmost frame under the pointer is considered, in the same
-    /// paint order as the present path and the selection press hit test: a
-    /// float painted over a base leaf's bar row hides that bar, so a press
-    /// there belongs to the float, not to the base leaf's chrome (#1481 made
-    /// floats present at their real bounds, which exposed this).
-    pub(super) fn status_bar_hit_frame(&self, pos: CursorPosition) -> Option<(ViewId, usize)> {
-        if !self.workspaceline_visible {
-            return None;
-        }
+    /// The band origin is the window padding plus the band's window-cell
+    /// origin at the live cell metrics — the same translation the present
+    /// path paints the band with.
+    pub(super) fn status_bar_hit(&self, pos: CursorPosition) -> Option<usize> {
         if !pos.x.is_finite() || !pos.y.is_finite() {
             return None;
         }
+        let band = self.status_bar_band()?;
         let live = self.live_cell_metrics();
-        if live.width == 0 || live.height == 0 {
+        if live.width == 0 || live.height == 0 || band.is_empty() {
             return None;
         }
         let pad = f64::from(self.window_padding_physical());
         let cell_w = f64::from(live.width);
         let cell_h = f64::from(live.height);
-        let frames = self.present_frames();
-        let frame = frames.iter().rev().find(|frame| {
-            let rect = frame.frame;
-            let left = pad + f64::from(rect.x);
-            let top = pad + f64::from(rect.y);
-            rect.width > 0
-                && rect.height > 0
-                && pos.x >= left
-                && pos.x < left + f64::from(rect.width)
-                && pos.y >= top
-                && pos.y < top + f64::from(rect.height)
-        })?;
-        if frame.cols == 0 || frame.rows == 0 {
-            return None;
-        }
-        // Mirror the overlay skip in present.rs: no bar is drawn on the
-        // alternate screen (a fullscreen app owns every row there), so a
-        // press there must fall through instead of hitting chrome.
-        let leaf_on_alt = match self.pane_sessions.get(&frame.view) {
-            Some(sess) => sess.state.alt_screen_active(),
-            None => self.state.alt_screen_active(),
-        };
-        if leaf_on_alt {
-            return None;
-        }
-        let bar = self.status_bar_row(usize::from(frame.rows))?;
-        let origin_x = pad + f64::from(frame.content.x.max(0));
-        let origin_y = pad + f64::from(frame.content.y.max(0)) + (bar as f64) * cell_h;
-        let band_w = f64::from(frame.cols) * cell_w;
+        let origin_x = pad + f64::from(band.x) * cell_w;
+        let origin_y = pad + f64::from(band.y) * cell_h;
+        let band_w = f64::from(band.width) * cell_w;
+        let band_h = f64::from(band.height) * cell_h;
         if pos.x >= origin_x
             && pos.x < origin_x + band_w
             && pos.y >= origin_y
-            && pos.y < origin_y + cell_h
+            && pos.y < origin_y + band_h
         {
-            let col = ((pos.x - origin_x) / cell_w).floor() as usize;
-            return Some((frame.view, col));
+            return Some(((pos.x - origin_x) / cell_w).floor() as usize);
         }
         None
     }
@@ -734,6 +696,10 @@ impl Runtime {
         // CTX-0532: a brand-new slot's leaf starts focused; attribute the
         // input-mode caches to it before any pane spawn/output path runs.
         self.sync_mode_caches_to_focus();
+        // CTX-0873: crossing from one to two workspaces reserves the bar
+        // band; reflow before the fresh shell is sized below so its first
+        // winsize already excludes the band.
+        self.refresh_chrome_band();
         // CTX-0359: give the fresh workspace leaf a real shell of its own by
         // replaying the primary attach recipe, so its first typed byte can
         // never reach the previous workspace's shell. Best-effort, startup
@@ -963,6 +929,8 @@ impl Runtime {
         self.active_workspace = active;
         self.load_slot(active);
         self.mru_front(active);
+        // CTX-0873: dropping to one workspace releases the bar band.
+        self.refresh_chrome_band();
         // CTX-0405: removing a slot destroys every leaf it owns, including a
         // primary owner moved into it earlier. Re-home the primary grid to
         // the loaded slot's focused leaf so ownership never dangles on a
@@ -1313,22 +1281,17 @@ mod tests {
     }
 
     #[test]
-    fn status_bar_composes_workspace_module_with_shared_row_geometry() {
+    fn status_bar_composes_workspace_module_with_shared_band_geometry() {
         // Issue #1349: the composer serves the workspace module and hides
-        // with the same opt-out; the row helper names the last content row
-        // so overlay, mouse, and tests agree.
+        // with the same opt-out; the band helper names the reserved window
+        // rows so present, mouse, and tests agree (CTX-0873).
         // CTX-0838 (#1441): lone-workspace hides (no bar, no reserved row);
         // the data path still renders.
         let rt = fresh();
         assert_eq!(rt.workspaceline_text(), "1:ws1* (1)");
         assert_eq!(rt.status_bar_text(), None, "lone workspace hides");
-        assert_eq!(
-            rt.status_bar_row(24),
-            None,
-            "lone workspace reserves no row"
-        );
-        assert_eq!(rt.status_bar_row(1), None);
-        assert_eq!(rt.status_bar_row(0), None, "no rows means no bar row");
+        assert_eq!(rt.status_bar_band(), None, "lone workspace reserves no row");
+        let window = rt.window_cells();
         let mut rt = fresh();
         rt.workspace_new().expect("ws2");
         assert_eq!(
@@ -1336,14 +1299,16 @@ mod tests {
             Some("1:ws1 2:ws2* (2)"),
             "workspace module minimum"
         );
-        assert_eq!(rt.status_bar_row(24), Some(23));
-        assert_eq!(rt.status_bar_row(1), Some(0));
-        assert_eq!(rt.status_bar_row(0), None, "no rows means no bar row");
+        assert_eq!(
+            rt.status_bar_band(),
+            Some(UiRect::new(0, window.height - 1, window.width, 1)),
+            "default bottom edge reserves the last window row"
+        );
         let mut hidden = fresh();
         hidden.workspace_new().expect("ws2");
         hidden.set_workspaceline_visible(false);
         assert_eq!(hidden.status_bar_text(), None);
-        assert_eq!(hidden.status_bar_row(24), None);
+        assert_eq!(hidden.status_bar_band(), None);
     }
 
     #[test]

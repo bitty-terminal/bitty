@@ -142,6 +142,25 @@ pub const DEFAULT_FOCUS_FOLLOWS_MOUSE_DELAY_MS: u32 = 0;
 /// [`crate::Runtime::set_workspaceline_visible`].
 pub const DEFAULT_WORKSPACELINE_VISIBLE: bool = true;
 
+/// Window edge the Core-owned workspace bar band reserves (CTX-0873,
+/// issue #1431; `workspace.bar.edge`).
+///
+/// The band is carved out of the window grid before layout, so terminal
+/// content is never painted under it. Only the horizontal edges exist
+/// today; the geometry ([`crate::runtime::chrome_band::ChromeInsets`]) is
+/// four-sided so `Left`/`Right` can land later without reshaping callers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BarEdge {
+    /// Band on the first window row; content starts one band lower.
+    Top,
+    /// Band on the last window row (default).
+    #[default]
+    Bottom,
+}
+
+/// Default workspace bar edge (CTX-0873): [`BarEdge::Bottom`].
+pub const DEFAULT_WORKSPACE_BAR_EDGE: BarEdge = BarEdge::Bottom;
+
 /// Maximum accepted hover-activation delay in milliseconds (CTX-0334).
 /// Mirrors `bitty-config` `MAX_MOUSE_FOCUS_FOLLOWS_MOUSE_DELAY_MS`;
 /// [`RuntimeConfig::validate`] rejects larger values fail-closed.
@@ -619,6 +638,11 @@ pub struct RuntimeConfig {
     /// path. The app layer assigns the validated effective value
     /// post-construction, following the `focus_follows_mouse` pattern.
     pub workspaceline_visible: bool,
+    /// Window edge of the workspace bar band (CTX-0873
+    /// `workspace.bar.edge`; default [`BarEdge::Bottom`]). Assigned
+    /// post-construction by the app layer like `workspaceline_visible`;
+    /// live changes go through [`crate::Runtime::set_workspace_bar_edge`].
+    pub workspace_bar_edge: BarEdge,
     /// Spacing between sibling panes in cells (CTX-0177 `layout.gaps_in`).
     /// `0..=MAX_LAYOUT_GAP_CELLS`; default `0` = edge-to-edge tiling.
     /// The gap band shows the window background; per-leaf rendering and
@@ -746,6 +770,21 @@ pub struct RuntimeConfig {
     /// Default [`crate::runtime::DEFAULT_PASTE_CONFIRM_TIMEOUT`] (30 seconds).
     /// Bounded by 1 second minimum and 300 seconds (5 minutes) maximum.
     pub paste_confirm_timeout: std::time::Duration,
+    /// Layout mode for adaptive panel creation (`NewPanel` / `Mod+N`).
+    ///
+    /// Default [`PanelLayoutMode::Spiral`] (4-way clockwise spiral: Right -> Down -> Left -> Up).
+    /// `PanelLayoutMode::Dwindle` opts into Hyprland-style dwindle (always Right or Down).
+    pub panel_layout_mode: PanelLayoutMode,
+}
+
+/// Layout mode for adaptive panel creation (`NewPanel` / `Mod+N`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PanelLayoutMode {
+    /// 4-way clockwise spiral: Right -> Down -> Left -> Up.
+    #[default]
+    Spiral,
+    /// Hyprland-style dwindle: always splits Right or Down.
+    Dwindle,
 }
 
 /// Default cell width in logical pixels (CTX-0157 breathing-room cell).
@@ -783,6 +822,7 @@ impl Default for RuntimeConfig {
                 DEFAULT_FOCUS_FOLLOWS_MOUSE_DELAY_MS,
             )),
             workspaceline_visible: DEFAULT_WORKSPACELINE_VISIBLE,
+            workspace_bar_edge: DEFAULT_WORKSPACE_BAR_EDGE,
             gaps_in: DEFAULT_LAYOUT_GAPS_IN,
             gaps_out: DEFAULT_LAYOUT_GAPS_OUT,
             decoration: bitty_ui::Decoration::default(),
@@ -804,6 +844,7 @@ impl Default for RuntimeConfig {
             cursor_style: DEFAULT_CURSOR_STYLE,
             bell_mode: DEFAULT_BELL_MODE,
             paste_confirm_timeout: crate::runtime::DEFAULT_PASTE_CONFIRM_TIMEOUT,
+            panel_layout_mode: PanelLayoutMode::Spiral,
         }
     }
 }
@@ -869,6 +910,7 @@ impl RuntimeConfig {
                 DEFAULT_FOCUS_FOLLOWS_MOUSE_DELAY_MS,
             )),
             workspaceline_visible: DEFAULT_WORKSPACELINE_VISIBLE,
+            workspace_bar_edge: DEFAULT_WORKSPACE_BAR_EDGE,
             gaps_in,
             gaps_out,
             decoration: bitty_ui::Decoration::default(),
@@ -890,6 +932,7 @@ impl RuntimeConfig {
             cursor_style: DEFAULT_CURSOR_STYLE,
             bell_mode: DEFAULT_BELL_MODE,
             paste_confirm_timeout: crate::runtime::DEFAULT_PASTE_CONFIRM_TIMEOUT,
+            panel_layout_mode: PanelLayoutMode::default(),
         };
         cfg.validate()?;
         Ok(cfg)

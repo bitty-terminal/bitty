@@ -83,6 +83,7 @@
 //!   plugin VM remain deferred. This slice only wires the host-owned data structures
 //!   and the bounded crossing.
 
+use crate::PanelLayoutMode;
 use std::collections::BTreeMap;
 
 use bitty_platform::{
@@ -126,6 +127,7 @@ use crate::queue::{ColdEvent, ColdQueue};
 pub mod animations;
 pub mod background_images;
 pub mod bell;
+pub mod chrome_band;
 pub mod click;
 pub mod close_confirm;
 pub mod copy_mode;
@@ -493,12 +495,23 @@ pub struct Runtime {
     /// [`Runtime::set_workspaceline_visible`]. Presentation-only: hiding
     /// the bar changes no workspace, focus, or session state.
     workspaceline_visible: bool,
+    /// Window edge of the Core-owned workspace bar band (CTX-0873,
+    /// `workspace.bar.edge`). Seeded from
+    /// [`RuntimeConfig::workspace_bar_edge`]; live changes go through
+    /// [`Runtime::set_workspace_bar_edge`] and reflow.
+    workspace_bar_edge: crate::config::BarEdge,
+    /// Full window grid in cells (CTX-0873). The layout `container` is this
+    /// rect minus the reserved chrome band
+    /// ([`chrome_band::solve`]); resize and the `set_window_cells` seam set it.
+    window_cells: UiRect,
     /// Whether the help popup (CTX-0265) is currently shown.
     ///
     /// Presentation-only overlay state: toggled by the `toggle_help`
     /// chrome action, dismissed by `Esc` or the same chord. Never grid
     /// truth; see `runtime::help`.
     help_visible: bool,
+    /// Adaptive panel creation mode (Spiral vs Dwindle).
+    panel_layout_mode: PanelLayoutMode,
     /// Help popup rows (CTX-0265), regenerated from the live keymap
     /// registry by the app on every show.
     ///
@@ -995,6 +1008,7 @@ impl std::fmt::Debug for Runtime {
             .field("help_visible", &self.help_visible)
             .field("help_rows", &self.help_rows.len())
             .field("container", &self.container)
+            .field("window_cells", &self.window_cells)
             .field(
                 "plugin_drop_policy",
                 &self.plugin_host.pipeline().drop_policy(),
@@ -1384,8 +1398,11 @@ impl Runtime {
             session_restored: false,
             pending_ws_close: None,
             workspaceline_visible: config.workspaceline_visible,
+            workspace_bar_edge: config.workspace_bar_edge,
+            window_cells: container,
             last_presented_bar: None,
             help_visible: false,
+            panel_layout_mode: config.panel_layout_mode,
             help_rows: Vec::new(),
             overlay_modal_active: false,
             next_workspace_seq: 2,
@@ -1596,8 +1613,11 @@ impl Runtime {
             session_restored: false,
             pending_ws_close: None,
             workspaceline_visible: config.workspaceline_visible,
+            workspace_bar_edge: config.workspace_bar_edge,
+            window_cells: container,
             last_presented_bar: None,
             help_visible: false,
+            panel_layout_mode: config.panel_layout_mode,
             help_rows: Vec::new(),
             overlay_modal_active: false,
             next_workspace_seq: 2,

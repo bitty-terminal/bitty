@@ -790,18 +790,15 @@ fn press_on_a_visible_float_selects_in_the_float() {
 }
 
 #[test]
-fn a_float_over_the_base_status_bar_owns_the_press() {
+fn a_float_never_reaches_the_bar_band_and_owns_its_own_rows() {
     bitty_test_support::require_pty!();
-    // The base leaf draws its in-grid status bar on its last content row. A
-    // float that covers that row paints over the bar, so a press there
-    // belongs to the float (topmost in paint order), not to the hidden bar's
-    // workspace chrome.
-    // CTX-0838 (#1441): the lone-workspace bar never presents, so this test
-    // needs two workspaces for the bar to exist.
+    // CTX-0873 (#1431): the bar owns a Core-reserved band outside the layout
+    // container, and overlay bounds clip to that container, so a float can
+    // never paint over (or steal presses from) the bar. A press on the
+    // float's last row, where the old in-grid bar sat, belongs to the float.
     let mut rt = Runtime::new(RuntimeConfig::default()).expect("headless build");
-    // Review (#1441): install the float layout in workspace zero first —
-    // `workspace_new` switches the active slot, so laying out after it
-    // would put the overlay in the fresh workspace instead of the primary.
+    // Install the float layout in workspace zero first: `workspace_new`
+    // switches the active slot.
     rt.set_layout(LayoutNode::overlay(
         LayoutNode::leaf(View::new(PRIMARY, 80, 24)),
         LayoutNode::leaf(View::new(PANE, 40, 14)),
@@ -814,28 +811,32 @@ fn a_float_over_the_base_status_bar_owns_the_press() {
     rt.spawn_shell_for_view(PANE, "/bin/sh", &["-c", "sleep 30"], float.cols, float.rows)
         .expect("spawn float shell");
     rt.handle_pty_bytes(PRIMARY_TEXT.as_bytes());
-    // The float runs a fullscreen app (alternate screen), which draws no bar
-    // of its own, so the only bar under the pointer is the hidden base one.
     rt.handle_pane_bytes(PANE, b"\x1b[?1049h");
     rt.handle_pane_bytes(PANE, PANE_TEXT.as_bytes());
 
-    let base_rows = usize::from(frame_of(&rt, PRIMARY).rows);
-    let base_bar = rt
-        .status_bar_row(base_rows)
-        .expect("the default config draws the in-grid status bar");
-    let pos = cell_center(&rt, PRIMARY, u16::try_from(base_bar).expect("fits"), 20);
+    let band = rt
+        .status_bar_band()
+        .expect("two workspaces reserve the band");
+    let (_, ch) = rt.live_cell_size();
+    let band_top = u32::from(band.y) * ch;
+    for frame in rt.present_frames() {
+        let bottom = u32::try_from(frame.frame.y.max(0)).expect("u32") + frame.frame.height;
+        assert!(bottom <= band_top, "frame {frame:?} stays above the band");
+    }
+
+    let float = frame_of(&rt, PANE);
+    let pos = cell_center(&rt, PANE, float.rows - 1, 1);
     assert_eq!(
         rt.cursor_to_present_cell(pos).map(|(view, _)| view),
         Some(PANE),
-        "the float covers the base leaf's bar row"
+        "the float's last row is the float's"
     );
-
     rt.handle_cursor_moved(pos);
     press(&mut rt);
     assert_eq!(
         rt.selection_owner(),
         Some(PANE),
-        "the press reaches the visible float instead of the hidden bar"
+        "the press reaches the float"
     );
     release(&mut rt);
 }

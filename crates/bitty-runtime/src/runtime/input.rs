@@ -1167,14 +1167,15 @@ impl Runtime {
         }
         // Shift override always forces selection path.
         let shift_override = self.shift_pressed;
-        // CTX-0808 (#1484): a bar press on a non-focused frame is chrome
-        // before capture — consume it before the focus-then-capture decision
-        // below so the capturing app never sees the press (and the release
-        // swallow above pairs with it). Shift still forces selection.
+        // CTX-0808 (#1484) / CTX-0873 (#1431): the workspace bar band is
+        // Core chrome outside every terminal frame — consume a press on it
+        // before the focus-then-capture decision below so no capturing app
+        // ever sees it (the release swallow above pairs with it) and focus
+        // never moves. Shift still forces selection.
         if !shift_override
             && event.button == MouseButton::Left
             && event.state == PressState::Pressed
-            && self.status_bar_press_non_focused()
+            && self.status_bar_press()
         {
             return;
         }
@@ -1232,18 +1233,6 @@ impl Runtime {
             && event.button == MouseButton::Left
             && event.state == PressState::Pressed
             && self.scrollbar_press()
-        {
-            return;
-        }
-        // Issue #1349: the in-grid status bar row is chrome. A left press
-        // on the drawn bar band routes to the workspace hit-test and
-        // consumes the event (Shift still forces the selection path
-        // above; capture returned earlier so a mouse-mode app keeps the
-        // pointer).
-        if !shift_override
-            && event.button == MouseButton::Left
-            && event.state == PressState::Pressed
-            && self.status_bar_press()
         {
             return;
         }

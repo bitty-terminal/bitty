@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use bitty_ipc::execution::{EnvPolicy, ExecutionRequest};
 
+use super::oom::OomEvidence;
 use super::outcome::{CancelOutcome, ExecutionGeneration, ExecutionHandle, ExecutionOutcome};
 use super::process_tree::KillScope;
 
@@ -560,6 +561,10 @@ pub struct JobSnapshot {
     /// owned-tree backend adopted the process, else
     /// [`KillScope::DirectChild`] (the gap is surfaced, never hidden).
     pub kill_scope: KillScope,
+    /// OOM evidence (CTX-0880): [`OomEvidence::Tracked`] while the job runs
+    /// in its own cgroup leaf, the final reading once it stopped, or
+    /// [`OomEvidence::Missing`] with the reason no evidence exists.
+    pub oom_evidence: OomEvidence,
 }
 
 impl JobSnapshot {

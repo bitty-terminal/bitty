@@ -53,13 +53,31 @@
 //!   id, the [`ExecutionGeneration`] the host checks, a [`CancelMode`], and
 //!   a grace period; the supervisor executes it and publishes one
 //!   `JobEvent::CancelResolved` with a typed [`CancelOutcome`].
+//! - OOM evidence (CTX-0880, #1537): on Linux, a registry built with
+//!   [`JobRegistry::with_job_cgroups`] runs each job in its own cgroup v2
+//!   leaf under a dedicated job base inside a cgroup delegated to this
+//!   process ([`JobCgroups`]: discovered only as its own cgroup when that is
+//!   the cgroup-namespace root or carries systemd's `user.delegate` /
+//!   `trusted.delegate` marker, never an ancestor; or configured
+//!   explicitly with [`JobCgroups::under`]). The leaf's `memory.events`
+//!   `oom_kill` counter is read before the spawn and after the tree is
+//!   gone; only an advanced counter plus a `SIGKILL` death the host did not
+//!   cause yields `OomKilled` (after a host kill the outcome stays
+//!   `Signaled(9)` and the counter survives as evidence). The leader is
+//!   placed right after the spawn (no `pre_exec`: `bitty-pty` forbids
+//!   `unsafe`), so descendants forked before the placement are not
+//!   accounted. Every
+//!   snapshot reports [`OomEvidence`]; hosts without delegation, macOS,
+//!   and Windows record [`OomEvidence::Missing`] with a typed
+//!   [`OomEvidenceGap`] and keep [`OomVerdict::Unknown`]. A signal number
+//!   is never evidence.
 //!
 //! # Deliberate non-goals (sibling tasks own them)
 //!
-//! - OOM evidence and the Windows tree backend: no per-job cgroup exists,
-//!   so the host supplies [`OomVerdict::Unknown`] and never claims
-//!   `OomKilled`; Windows has no Job Object backend yet and reports
-//!   [`KillScope::DirectChild`].
+//! - The Windows tree backend: Windows has no Job Object backend yet and
+//!   reports [`KillScope::DirectChild`].
+//! - Job resource limits (CTX-0519): the per-job cgroup leaf below is an
+//!   evidence source only; no `memory.max` or other limit is set on it.
 //! - Capability enforcement transport: this task is in-process only, with no
 //!   new IPC verbs. The existing IPC scope/auth registry plus the
 //!   consent/effect gate stays the transport boundary; these `*_as` methods
@@ -114,6 +132,7 @@
 //!   daemon code, per the accepted headless/daemon decision.
 
 mod atomic_file;
+mod cgroup;
 mod claim_lock;
 mod command_risk;
 mod delivery;
@@ -133,6 +152,7 @@ use std::process::{Command, Stdio};
 
 use bitty_ipc::execution::EnvPolicy;
 
+pub use cgroup::{CgroupUnavailable, JobCgroups, MAX_JOB_CGROUP_LEAVES, MAX_STALE_BASE_SWEEP};
 pub use command_risk::{HardDeny, OperationIntent, RiskTier, RiskVerdict, classify_argv};
 pub use delivery::{
     DeliveryState, EventClass, EventReplay, MAX_EVENT_REPLAY, MAX_STORED_CRITICAL_EVENTS,
@@ -150,7 +170,10 @@ pub use model::{
     MAX_SIGNAL_WINDOW_MS, MAX_SIGNALS_PER_WINDOW, MAX_WRITE_INPUT_BYTES, MAX_WRITE_INPUT_WINDOW_MS,
     MAX_WRITES_PER_WINDOW, SignalOutcome, TransferReceipt,
 };
-pub use oom::{MAX_MEMORY_EVENTS_BYTES, OomVerdict, classify_oom, parse_oom_kill_count};
+pub use oom::{
+    MAX_MEMORY_EVENTS_BYTES, OomEvidence, OomEvidenceGap, OomVerdict, classify_oom,
+    parse_oom_kill_count,
+};
 pub use outcome::{
     CancelEffect, CancelMode, CancelOutcome, CancelReceipt, CancelRequest, DEFAULT_CANCEL_GRACE_MS,
     DeadlineClock, ExecutionGeneration, ExecutionHandle, ExecutionOutcome, ExitObservation,

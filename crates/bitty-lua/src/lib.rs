@@ -602,6 +602,7 @@ impl LuaVm {
     ///
     /// Returns error if module registration fails (e.g., Lua errors during
     /// table creation or callback registration).
+    #[cfg(feature = "network")]
     pub fn register_network_module(
         &mut self,
         runtime: &bitty_network_lua::SharedNetworkRuntime,

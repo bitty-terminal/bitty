@@ -816,6 +816,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn cgroup2_mount_is_verified_from_mountinfo() {
         let text = "\
 22 1 0:21 / /proc rw,nosuid - proc proc rw

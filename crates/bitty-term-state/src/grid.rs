@@ -142,18 +142,24 @@ impl Grid {
     /// outward when its edges would split a wide-character pair. The pair
     /// straddling either edge is removed whole so no orphan spacer is
     /// created (RFC invariant 2).
+    ///
+    /// Returns the effective inclusive column range `(start, end)` that was
+    /// erased, or `None` if the range was empty or out of bounds.
     pub fn erase_range_in_row(
         &mut self,
         row: usize,
         start: usize,
         end: usize,
         erase_style: &Style,
-    ) {
+    ) -> Option<(usize, usize)> {
+        if self.cols == 0 || self.rows == 0 || row >= self.rows {
+            return None;
+        }
         let last = self.cols - 1;
         let mut start = start.min(last);
         let mut end = end.min(last);
         if start > end {
-            return;
+            return None;
         }
         if start > 0 && self.get(row, start).spacer {
             start -= 1;
@@ -173,6 +179,7 @@ impl Grid {
         // Incoming continuation is preserved (the previous row still flows
         // into this edited row).
         self.set_wrapped(row, false);
+        Some((start, end))
     }
 
     /// Shifts cells in one row right by `n` starting at `col`, blanking the
@@ -490,7 +497,8 @@ mod tests {
         g.set(0, 1, glyph('中'));
         g.set(0, 2, Cell::wide_spacer(Style::default()));
         g.set(0, 3, glyph('B'));
-        g.erase_range_in_row(0, 2, 2, &Style::default());
+        let erased = g.erase_range_in_row(0, 2, 2, &Style::default());
+        assert_eq!(erased, Some((1, 2)));
         // The range hit the spacer at col 2; expansion removes the leading
         // half at col 1 too.
         assert!(g.get(0, 1).is_blank());
@@ -515,7 +523,8 @@ mod tests {
             },
         );
         g.set(0, 2, Cell::wide_spacer(style));
-        g.erase_range_in_row(0, 1, 1, &Style::default());
+        let erased = g.erase_range_in_row(0, 1, 1, &Style::default());
+        assert_eq!(erased, Some((1, 2)));
         assert!(g.get(0, 1).is_blank());
         assert!(g.get(0, 2).is_blank());
     }
@@ -585,7 +594,8 @@ mod tests {
             );
             g.set(0, lead + 1, Cell::wide_spacer(style));
         }
-        g.erase_range_in_row(0, 2, 5, &Style::default());
+        let erased = g.erase_range_in_row(0, 2, 5, &Style::default());
+        assert_eq!(erased, Some((1, 6)));
         for c in [1, 2, 5, 6] {
             assert!(g.get(0, c).is_blank(), "col {c} must be erased whole");
         }

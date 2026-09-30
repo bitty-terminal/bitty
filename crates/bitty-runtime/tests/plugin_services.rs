@@ -67,9 +67,11 @@ fn temp_dir(tag: &str) -> PathBuf {
 /// inside a cross-VM call does an atomic temp-then-rename write; on a Windows
 /// CI runner with filesystem scanning that write alone can exceed the 50 ms
 /// RC-1 cheap-call budget, so the consumer saw the `-1` error sentinel
-/// (CTX-0854). An in-memory store keeps the property under test independent
-/// of runner filesystem latency; the disk-latency interaction itself is
-/// tracked as bitty #1518, not hidden by retries here.
+/// (CTX-0854). Committed store writes are now credited out of the RC-1 wall
+/// clock (bitty #1518); an in-memory store still keeps these routing tests
+/// independent of runner filesystem latency, and the disk-latency path is
+/// covered deterministically by
+/// `slow_disk_store_commit_does_not_fail_cross_vm_service_call`.
 fn runtime(third_party_roots: Vec<PathBuf>) -> PluginRuntime {
     PluginRuntime::new(PluginRuntimeConfig {
         safe_mode: false,

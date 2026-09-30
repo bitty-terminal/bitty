@@ -58,6 +58,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Render Kitty images for all visible split panes (CTX-0884, #1550):** `paint_kitty_images`
+  previously restricted Kitty image rendering exclusively to the single focused
+  leaf origin, causing images in unfocused panes to disappear immediately on focus
+  switch. The runtime now renders Kitty images for all visible allocations,
+  clipped to each pane's content rectangle and persisting across focus switches,
+  aligning with WezTerm and Ghostty behavior while preserving cross-pane spoof
+  prevention.
+
 - **Screen clear drops active Kitty image placements (CTX-0883, #1545):** executing
   `clear` (`ED 2` / `CSI 2 J`, `ED 22` scroll-and-clear, or `FullReset` / RIS)
   previously cleared character cells but left active Kitty image placements in

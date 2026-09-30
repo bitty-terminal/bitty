@@ -36,7 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `bottom`) places the band; `top` shifts content down one row. Both
   `workspace.bar.edge` and `workspace.show_bar` reload live and reflow in
   place.
-- **Plugin runtime wired into app loop (CTX-0892, #1431):** `PluginRuntime`
+- **Plugin runtime wired into app loop (CTX-0892, #1564):** `PluginRuntime`
   is now integrated into `TerminalApp` lifecycle (created at startup, ticked
   each frame). Event delivery works for `terminal.title-changed` and
   `focus.changed`, bounded to 10 events per tick to protect the hot path.

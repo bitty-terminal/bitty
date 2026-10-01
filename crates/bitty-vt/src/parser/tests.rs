@@ -2006,6 +2006,47 @@ fn apc_g_parser_continuation_accounts_for_current_header_and_peak() {
 }
 
 #[test]
+fn apc_g_parser_chafa_padded_chunk_then_empty_terminator_emits() {
+    // chafa -f kitty: empty opener, a padded `m=1` chunk, empty `m=0` end.
+    let mut parser = Parser::new();
+    let mut actions = Vec::new();
+    parser.advance(
+        b"\x1b_Ga=T,f=32,s=1,v=1,c=1,r=1,m=1,q=2;\x1b\\\x1b_Gm=1;/wAA/w==\x1b\\",
+        |action| actions.push(action),
+    );
+    assert!(actions.is_empty());
+    assert!(parser.has_pending_kitty());
+    parser.advance(b"\x1b_Gm=0;\x1b\\", |action| actions.push(action));
+    assert!(!parser.has_pending_kitty());
+    match kitty_action(&actions) {
+        TerminalAction::KittyGraphics { payload, .. } => {
+            assert_eq!(&**payload, &[0xFF, 0, 0, 0xFF]);
+        }
+        other => panic!("expected KittyGraphics, got {other:?}"),
+    }
+}
+
+#[test]
+fn apc_g_parser_raw_claim_exceeds_ledger_cap_but_compressed_does_not() {
+    // A 2x2 RGB raw claim (12 bytes) is bounded by its declared size, not by
+    // the 9-byte IMG-1 cap; the same claim marked `o=z` keeps the IMG-1 cap.
+    let cap = 9;
+    let encoded = kitty_base64(&[0x11; 12]);
+    for (header, should_emit) in [
+        (b"\x1b_Gf=24,s=2,v=2,m=0;".as_slice(), true),
+        (b"\x1b_Gf=24,o=z,s=2,v=2,m=0;".as_slice(), false),
+    ] {
+        let mut sequence = header.to_vec();
+        sequence.extend_from_slice(encoded.as_bytes());
+        sequence.extend_from_slice(b"\x1b\\");
+        let mut parser = Parser::with_ledger_cap(cap);
+        let mut actions = Vec::new();
+        parser.advance(&sequence, |action| actions.push(action));
+        assert_eq!(actions.len(), usize::from(should_emit));
+    }
+}
+
+#[test]
 fn apc_g_valid_single_shot_emits_decoded_payload() {
     // 2x2 opaque red RGBA (`f=32,s=2,v=2`), base64 `/wAA//8AAP//AAD//wAA/w==`.
     let seq = b"\x1b_Gf=32,s=2,v=2,m=0;/wAA//8AAP//AAD//wAA/w==\x1b\\";

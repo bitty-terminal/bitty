@@ -44,8 +44,8 @@
 //! Each placement records `scrollback_base` (`State::scrollback_len()` at
 //! display time). At present time the scrolled distance is
 //! `current.saturating_sub(base)`; the effective anchor row is
-//! `anchor_row - scrolled`, and placements scrolled off the top paint
-//! nothing. The image therefore moves **with** terminal content. Viewport
+//! `anchor_row - scrolled` (may be negative: the top edge is clipped), and
+//! only placements scrolled *fully* off the top paint nothing. The image therefore moves **with** terminal content. Viewport
 //! scrollback inspection (`View::scroll_offset() != 0`) is handled by the
 //! caller (skip painting: live-grid anchors do not map to the history
 //! viewport), as is alternate-screen suppression (see below).
@@ -678,16 +678,21 @@ impl KittyImageLayer {
         scrollback_now: usize,
     ) -> Option<RectPx> {
         let scrolled = scrollback_now.saturating_sub(placement.scrollback_base);
-        let row = (u64::from(placement.anchor_row)).checked_sub(scrolled as u64)?;
-        // Cell rect in pixels (u64 throughout, saturated into i32/u32 like
-        // the grid pipeline's `grid_rect_to_px`).
+        let scrolled_i64 = i64::try_from(scrolled).unwrap_or(i64::MAX);
+        let anchor_row = i64::from(placement.anchor_row);
+        let rows = i64::from(placement.rows);
+        let bottom_row = anchor_row.saturating_add(rows).saturating_sub(scrolled_i64);
+        if bottom_row <= 0 {
+            return None;
+        }
+        let row_offset = anchor_row.saturating_sub(scrolled_i64);
         let x = u64::from(placement.anchor_col) * u64::from(metrics.width);
-        let y = row * u64::from(metrics.height);
+        let y = row_offset.saturating_mul(i64::from(metrics.height));
         let w = u64::from(placement.cols) * u64::from(metrics.width);
         let h = u64::from(placement.rows) * u64::from(metrics.height);
         Some(RectPx::new(
             saturating_i32(x),
-            saturating_i32(y),
+            saturating_i64_to_i32(y),
             saturating_u32(w),
             saturating_u32(h),
         ))
@@ -697,7 +702,7 @@ impl KittyImageLayer {
     ///
     /// `viewport_cols`/`viewport_rows` are the live grid dimensions;
     /// `scrollback_now` is the current `State::scrollback_len()`. Returns
-    /// `None` when the placement scrolled off the top or lies fully
+    /// `None` when the placement scrolled fully off the top or lies fully
     /// outside the viewport (paints nothing). Otherwise returns the
     /// full rect ([`KittyImageLayer::placement_full_rect`]) intersected
     /// with the viewport. The caller must crop the scaled image to this
@@ -1122,6 +1127,16 @@ const fn saturating_i32(value: u64) -> i32 {
     }
 }
 
+const fn saturating_i64_to_i32(value: i64) -> i32 {
+    if value > i32::MAX as i64 {
+        i32::MAX
+    } else if value < i32::MIN as i64 {
+        i32::MIN
+    } else {
+        value as i32
+    }
+}
+
 const fn saturating_u32(value: u64) -> u32 {
     if value > u32::MAX as u64 {
         u32::MAX
@@ -1436,9 +1451,13 @@ mod tests {
         // Three lines scrolled: row 7.
         let rect = KittyImageLayer::placement_rect(placement, METRICS, 80, 24, 103).unwrap();
         assert_eq!(rect.y, 7 * 16);
-        // Scrolled fully off the top: nothing paints.
+        // Eleven lines scrolled: anchor row 10 moved to -1, but row 11 is at row 0 (1 row visible at top).
+        let rect = KittyImageLayer::placement_rect(placement, METRICS, 80, 24, 111).unwrap();
+        assert_eq!(rect.y, 0);
+        assert_eq!(rect.height, 16);
+        // Scrolled fully off the top (12 lines scrolled: 10 + 2 - 12 = 0): nothing paints.
         assert_eq!(
-            KittyImageLayer::placement_rect(placement, METRICS, 80, 24, 111),
+            KittyImageLayer::placement_rect(placement, METRICS, 80, 24, 112),
             None
         );
     }
@@ -1873,5 +1892,51 @@ mod tests {
         assert_eq!(cache.bytes(), 0);
         assert_eq!(cache.misses(), 1, "counters survive clear");
         assert_eq!(cache.hits(), 0);
+    }
+
+    #[test]
+    fn scroll_clips_top_edge_instead_of_premature_drop() {
+        let mut layer = KittyImageLayer::new();
+        // 4x4 px image so rasterize_clipped can operate on it.
+        let image_rgba = vec![0xCC; 4 * 4 * 4];
+        let image_id = layer.store(4, 4, image_rgba, 64).unwrap();
+        // Place image: anchor_col 0, anchor_row 5, 2 cols x 10 rows.
+        // Base scrollback = 0.
+        let pid = layer.display(image_id, 0, 5, 2, 10, METRICS, 0, 0).unwrap();
+        let placement = layer.get_placement(pid).unwrap();
+
+        // 1. Unscrolled (scrollback = 0):
+        let full = KittyImageLayer::placement_full_rect(placement, METRICS, 0).unwrap();
+        assert_eq!(full, RectPx::new(0, 5 * 16, 2 * 8, 10 * 16));
+        let visible = KittyImageLayer::placement_rect(placement, METRICS, 80, 24, 0).unwrap();
+        assert_eq!(visible, RectPx::new(0, 5 * 16, 2 * 8, 10 * 16));
+
+        // 2. Scrolled by 8 lines (scrollback = 8):
+        // anchor_row (5) - scrolled (8) = -3 rows.
+        // bottom_row is 5 + 10 - 8 = 7 rows > 0 (still visible in viewport!).
+        // Previously checked_sub(8) failed on anchor_row (5) and returned None.
+        let full_scrolled = KittyImageLayer::placement_full_rect(placement, METRICS, 8)
+            .expect("must not prematurely drop when top edge is clipped");
+        assert_eq!(full_scrolled, RectPx::new(0, -3 * 16, 2 * 8, 10 * 16));
+        let visible_scrolled = KittyImageLayer::placement_rect(placement, METRICS, 80, 24, 8)
+            .expect("visible portion must be present");
+        assert_eq!(visible_scrolled, RectPx::new(0, 0, 2 * 8, 7 * 16));
+
+        // Verify rasterize_clipped succeeds for the clipped top edge.
+        let stored_img = layer.get(image_id).unwrap();
+        let raster = rasterize_clipped(stored_img, full_scrolled, visible_scrolled);
+        assert!(raster.is_some(), "clipped top edge must rasterize cleanly");
+        assert_eq!(raster.unwrap().len(), (2 * 8 * 7 * 16 * 4) as usize);
+
+        // 3. Scrolled by 15 lines (scrollback = 15):
+        // 5 + 10 - 15 = 0 rows <= 0 (completely off the top).
+        assert_eq!(
+            KittyImageLayer::placement_full_rect(placement, METRICS, 15),
+            None
+        );
+        assert_eq!(
+            KittyImageLayer::placement_rect(placement, METRICS, 80, 24, 15),
+            None
+        );
     }
 }

@@ -169,6 +169,11 @@ pub enum EventKind {
     SelectionChanged,
     ProcessExited,
     ConfigReloaded,
+    WorkspaceCreated,
+    WorkspaceClosed,
+    WorkspaceRenamed,
+    WorkspaceFocused,
+    WorkspaceChanged,
     // Interception (exactly four for v1)
     InterceptCommandDispatch,
     InterceptTerminalSpawn,
@@ -193,6 +198,11 @@ impl EventKind {
             "selection.changed" => Ok(Self::SelectionChanged),
             "process.exited" => Ok(Self::ProcessExited),
             "config.reloaded" => Ok(Self::ConfigReloaded),
+            "workspace.created" => Ok(Self::WorkspaceCreated),
+            "workspace.closed" => Ok(Self::WorkspaceClosed),
+            "workspace.renamed" => Ok(Self::WorkspaceRenamed),
+            "workspace.focused" => Ok(Self::WorkspaceFocused),
+            "workspace.changed" => Ok(Self::WorkspaceChanged),
             "intercept.command-dispatch" => Ok(Self::InterceptCommandDispatch),
             "intercept.terminal-spawn" => Ok(Self::InterceptTerminalSpawn),
             "intercept.paste" => Ok(Self::InterceptPaste),
@@ -218,6 +228,11 @@ impl EventKind {
             Self::SelectionChanged => "selection.changed",
             Self::ProcessExited => "process.exited",
             Self::ConfigReloaded => "config.reloaded",
+            Self::WorkspaceCreated => "workspace.created",
+            Self::WorkspaceClosed => "workspace.closed",
+            Self::WorkspaceRenamed => "workspace.renamed",
+            Self::WorkspaceFocused => "workspace.focused",
+            Self::WorkspaceChanged => "workspace.changed",
             Self::InterceptCommandDispatch => "intercept.command-dispatch",
             Self::InterceptTerminalSpawn => "intercept.terminal-spawn",
             Self::InterceptPaste => "intercept.paste",
@@ -241,7 +256,12 @@ impl EventKind {
             | Self::FocusChanged
             | Self::SelectionChanged
             | Self::ProcessExited
-            | Self::ConfigReloaded => EventClass::Observation,
+            | Self::ConfigReloaded
+            | Self::WorkspaceCreated
+            | Self::WorkspaceClosed
+            | Self::WorkspaceRenamed
+            | Self::WorkspaceFocused
+            | Self::WorkspaceChanged => EventClass::Observation,
             Self::InterceptCommandDispatch
             | Self::InterceptTerminalSpawn
             | Self::InterceptPaste
@@ -269,6 +289,69 @@ impl EventKind {
     pub fn is_interception(&self) -> bool {
         self.class() == EventClass::Interception
     }
+
+    /// Recipient-grant policy for this kind's payload (CTX-0899).
+    ///
+    /// The single source of truth for which payload fields depend on the
+    /// recipient's grants. Every recipient-facing copy of a payload (Lua
+    /// subscriber fan-out, `debug.trace` records) must be filtered through
+    /// this policy for the recipient's own grant snapshot, so a holder never
+    /// observes more than its grants allow.
+    ///
+    /// The match is exhaustive on purpose: adding an [`EventKind`] forces an
+    /// explicit decision here at compile time instead of defaulting to
+    /// "ungated".
+    #[must_use]
+    pub fn payload_policy(&self) -> PayloadPolicy {
+        match self {
+            // Paste text is clipboard content: without `clipboard.read` only
+            // the action/origin classification survives (Plugin API v1 event
+            // table: "never carries paste text without `clipboard.read`").
+            Self::InterceptPaste => PayloadPolicy::Gated {
+                capability: "clipboard.read",
+                public_fields: &["action", "origin"],
+            },
+            Self::PluginActivated
+            | Self::PluginSuspended
+            | Self::PluginDisposed
+            | Self::HandlerViolation
+            | Self::TerminalOpened
+            | Self::TerminalClosed
+            | Self::TerminalTitleChanged
+            | Self::TerminalCwdChanged
+            | Self::TerminalBell
+            | Self::FocusChanged
+            | Self::SelectionChanged
+            | Self::ProcessExited
+            | Self::ConfigReloaded
+            | Self::WorkspaceCreated
+            | Self::WorkspaceClosed
+            | Self::WorkspaceRenamed
+            | Self::WorkspaceFocused
+            | Self::WorkspaceChanged
+            | Self::InterceptCommandDispatch
+            | Self::InterceptTerminalSpawn
+            | Self::InterceptOpenUrl => PayloadPolicy::Ungated,
+        }
+    }
+}
+
+/// Recipient-grant policy of one event kind's payload (see
+/// [`EventKind::payload_policy`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayloadPolicy {
+    /// The payload carries no grant-dependent field; every subscriber of the
+    /// kind receives it unchanged.
+    Ungated,
+    /// The full payload requires `capability`. A recipient without it
+    /// receives only `public_fields` (an allowlist, so a field a producer
+    /// adds later stays hidden until it is reviewed into the list).
+    Gated {
+        /// Capability id that unlocks the full payload.
+        capability: &'static str,
+        /// Top-level payload fields visible without `capability`.
+        public_fields: &'static [&'static str],
+    },
 }
 
 // ── payload ──────────────────────────────────────────────────────────────

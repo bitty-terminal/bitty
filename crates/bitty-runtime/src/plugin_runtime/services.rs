@@ -947,6 +947,20 @@ impl PluginServices {
         *self.granted_capabilities.borrow_mut() = capabilities;
     }
 
+    /// Whether this generation's activation grant snapshot holds
+    /// `capability` (exact id match, no implication). Used for per-recipient
+    /// event payload redaction (CTX-0899); the default empty snapshot holds
+    /// nothing, so a missing setter call fails closed.
+    ///
+    /// O(log g) over the sorted snapshot.
+    #[must_use]
+    pub fn has_granted_capability(&self, capability: &str) -> bool {
+        self.granted_capabilities
+            .borrow()
+            .binary_search_by(|granted| granted.as_str().cmp(capability))
+            .is_ok()
+    }
+
     /// Record this generation's manifest `lazy.events` (activation snapshot).
     ///
     /// `bitty.debug.trace` opens traces scoped to exactly this set, the same
@@ -1410,7 +1424,15 @@ impl HostServices for PluginServices {
         let mut hub = hub.borrow_mut();
         match request {
             TraceRequest::Start(spec) => {
-                hub.start(&self.plugin_id, self.declared_events.borrow().clone(), spec)
+                // Grants are fixed per generation and traces never outlive
+                // it, so snapshotting them at open cannot go stale.
+                let granted = self.granted_capabilities.borrow().iter().cloned().collect();
+                hub.start(
+                    &self.plugin_id,
+                    self.declared_events.borrow().clone(),
+                    granted,
+                    spec,
+                )
             }
             TraceRequest::Stop(handle) => {
                 // Unknown and foreign handles are indistinguishable: both

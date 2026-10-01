@@ -117,6 +117,7 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "close_confirm"
         | "extends"
         | "profile"
+        | "session.restore_on_startup"
         | "schema_version" => Some(MergeClass::ScalarReplace),
         "chrome.top.order" | "chrome.bottom.order" => Some(MergeClass::ListReplace),
         "font"
@@ -131,7 +132,8 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "scrollbar"
         | "mouse"
         | "appearance"
-        | "appearance.animations" => Some(MergeClass::DeepMerge),
+        | "appearance.animations"
+        | "session" => Some(MergeClass::DeepMerge),
         "keymaps" | "plugins" => Some(MergeClass::SetById),
         _ => None,
     }
@@ -598,6 +600,8 @@ const ATTRIBUTED_FIELDS: &[&str] = &[
     "appearance",
     "keymaps",
     "plugins",
+    "session.restore_on_startup",
+    "session",
     "schema_version",
 ];
 

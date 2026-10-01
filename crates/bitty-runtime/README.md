@@ -20,18 +20,23 @@ diagram lives in `src/lib.rs`.
 - Workspace-internal dependencies, per `Cargo.toml`: `bitty-vt`,
   `bitty-term-state`, `bitty-pty`, `bitty-render`, `bitty-platform`,
   `bitty-ui`, `bitty-lua`, `bitty-plugin-host`, `bitty-package`, and
-  `bitty-rich`; external git dependencies: `bitty-agent` and `bitty-ipc`
-  (extracted to independent repositories, CTX-1585); no network-facing
-  dependency is declared.
+  `bitty-rich`; external git dependency: `bitty-ipc` (independent
+  repository since CTX-1585), linked as Core's inbound local socket
+  mechanism. Core links no agent crate: `bitty-agent` is an independent
+  repository with its own tests (CTX-0918). The only network-facing
+  dependency is the optional `bitty-network-lua` behind the non-default
+  `network` feature; that embedding is being retired in favor of
+  out-of-process components (tracked separately).
 - No Lua, config, or plugin code enters the hot path (see `src/lib.rs`).
 - The plugin side queue never holds hot-path objects: no GPU, window, or PTY
   handles and no Lua VM.
 - Default CI verifies the headless software seam only; attaching a real GPU
   surface awaits a follow-up slice and must not be described as implemented.
 - Optional experience policy does not live here: the first-party `ai-panel`
-  and `mail-panel` implementations moved to the `bitty-panels` staging crate
-  in the `CTX-0438` extraction wave. This crate keeps the generic Panel
-  Runtime mechanism (`registry/`) plus the recorded Core slices above.
+  and `mail-panel` implementations left this crate in the `CTX-0438`
+  extraction wave, and the emptied `bitty-panels` staging crate was retired
+  by CTX-0918. This crate keeps the generic Panel Runtime mechanism
+  (`registry/`) plus the recorded Core slices above.
 
 ## Layout
 

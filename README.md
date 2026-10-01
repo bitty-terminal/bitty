@@ -218,6 +218,42 @@ Those documents are draft design contracts; where they differ from the shipped
 `init.lua` schema above, the shipped code and `bitty config check` are
 authoritative.
 
+## Workspace crates
+
+The Core workspace (`Cargo.toml` `[workspace] members`) holds only the
+terminal mechanism and its test and measurement harnesses:
+
+| Crate                | Role                                                                  |
+| -------------------- | --------------------------------------------------------------------- |
+| `bitty-terminal`     | `bitty` binary, thin composition root                                 |
+| `bitty-runtime`      | Runtime orchestration (PTY, parser, state, render, plugin side queue) |
+| `bitty-vt`           | VT parser producing terminal actions (wraps `vte`)                    |
+| `bitty-term-state`   | Terminal truth: grid, state, damage, scrollback                       |
+| `bitty-pty`          | PTY wrapper with backpressure and resize                              |
+| `bitty-render`       | GPU rendering pipeline (`wgpu` + `crossfont`)                         |
+| `bitty-platform`     | Window and event-loop adapter (wraps `winit`)                         |
+| `bitty-ui`           | View, layout, and selection primitives                                |
+| `bitty-rich`         | Rich presentation helpers (draft)                                     |
+| `bitty-config`       | Typed, validated configuration pipeline                               |
+| `bitty-lua`          | Deterministic Lua VM budgets for plugins                              |
+| `bitty-plugin-host`  | Draft plugin platform host                                            |
+| `bitty-package`      | Package lifecycle and integrity verification                          |
+| `bitty-winjob`       | Win32 Job Object adapter for owned process trees                      |
+| `bitty-perf`         | Performance baseline harness (benches; opt-in for `bitty dev trace`)  |
+| `bitty-compat-lab`   | Headless compatibility lab harness                                    |
+| `bitty-test-support` | Shared test-harness helpers                                           |
+| `bitty-test-vm`      | VM test-tier controller                                               |
+
+Extension model: `bitty-ipc` (independent repository, pulled as an exact-rev
+git dependency) stays linked as Core's inbound local socket mechanism.
+`bitty-agent`, `bitty-network`, and `bitty-observability` are independent
+repositories; Core links no agent crate. The optional embedded
+`bitty-network-lua` path behind the `bitty-runtime` `network` feature is
+being retired in favor of out-of-process components (tracked separately).
+`bitty dev trace` links `bitty-perf` only when `bitty-terminal` is built with
+the opt-in `dev-perf` cargo feature; otherwise the verb reports
+`built without dev-perf feature`.
+
 ## Build and test
 
 All checks run through the justfile (never `npm`/`npx`/`yarn`; JavaScript tools

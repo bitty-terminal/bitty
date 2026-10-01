@@ -7,9 +7,9 @@
 //! ruling of 2026-09-23 accepts `OQ-058` `SMO-1..SMO-4` including delivery
 //! semantics, with terms from `ADR-0013` (`bitty-docs` #367, `bb96efe`).
 //!
-//! Status: the in-tree `bitty-panels` scaffolding stays crate-private
-//! until this contract lands; this module plus
-//! [`routable`](super::routable) is the public surface that lifts it:
+//! Status: the former in-tree `bitty-panels` staging crate was retired by
+//! CTX-0918 (it held only empty scaffolding); this module plus
+//! [`routable`](super::routable) is the public provider surface:
 //!
 //! - [`PANEL_PROVIDER_CAPABILITY`] — the closed host capability gating
 //!   provider registration (`panel.provider`, already in the host set).

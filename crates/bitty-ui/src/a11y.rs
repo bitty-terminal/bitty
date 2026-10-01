@@ -593,7 +593,7 @@ pub fn chrome_tab_order(nodes: &[ChromeNode]) -> Vec<&ChromeNode> {
 // ---------------------------------------------------------------------------
 //
 // Ownership: the tree is owned by `bitty-ui`. Panel Scene producers
-// (`bitty-panels`, `bitty-rich`) and platform adapters (window, screen-reader
+// (`bitty-rich`, out-of-process panel providers) and platform adapters (window, screen-reader
 // bridges) are consumers — they read [`A11yTree`] snapshots and never
 // construct or mutate nodes. v1 exposes structure, names, and state only;
 // action routing, activation dispatch, and live-event streams are post-1.0.

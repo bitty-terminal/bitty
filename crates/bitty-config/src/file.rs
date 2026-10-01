@@ -171,8 +171,8 @@ use crate::types::{
     AppearanceConfig, BackgroundFit, DecorationConfig, FontConfig, KeymapEntry, LayoutConfig,
     MAX_BACKGROUND_IMAGE_PATH_BYTES, MAX_DECORATION_BORDER_WIDTH_PX, MAX_FONT_FAMILY_LEN,
     MAX_PLUGIN_ID_LEN, MouseConfig, OutlineColor, PluginSpec, ScrollbarConfig, ScrollbarMode,
-    SelectionConfig, TerminalConfig, ViewAppearanceOverride, ViewOverride, ViewSelector,
-    WindowConfig,
+    SelectionConfig, SessionConfig, TerminalConfig, ViewAppearanceOverride, ViewOverride,
+    ViewSelector, WindowConfig,
 };
 
 /// Config directory name under the XDG config root.
@@ -2063,6 +2063,17 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
         }
     };
 
+    // CTX-0908: `session` is a fully-optional table with the same
+    // absent-means-silent contract. When the table is present but
+    // `restore_on_startup` is omitted, default to `false` (opt-in session
+    // restore): selecting to restore the previous session never happens
+    // implicitly, and `session = { restore_on_startup = true }` is the
+    // explicit opt-in. Wrong types already failed closed as `ShapeError`
+    // in `bitty-lua` (never coerced, never echoed).
+    let session = data.session.map(|s| SessionConfig {
+        restore_on_startup: s.restore_on_startup,
+    });
+
     let plan = ConfigPlan {
         schema_version: None,
         font,
@@ -2073,6 +2084,7 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
         layout,
         workspace,
         chrome,
+        session,
         decoration,
         views,
         scrollbar,

@@ -1996,7 +1996,7 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
                     if ids.len() > crate::types::MAX_CHROME_ORDER_ENTRIES {
                         return Err(ConfigError::validation(
                             "chrome.top.order",
-                            &format!(
+                            format!(
                                 "list exceeds maximum {} entries",
                                 crate::types::MAX_CHROME_ORDER_ENTRIES
                             ),
@@ -2005,8 +2005,8 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
                     for (idx, id) in ids.iter().enumerate() {
                         if id.len() > crate::types::MAX_PLUGIN_ID_LEN {
                             return Err(ConfigError::validation(
-                                &format!("chrome.top.order[{}]", idx + 1),
-                                &format!(
+                                format!("chrome.top.order[{}]", idx + 1),
+                                format!(
                                     "plugin id exceeds maximum {} bytes",
                                     crate::types::MAX_PLUGIN_ID_LEN
                                 ),
@@ -2014,7 +2014,7 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
                         }
                         if id.is_empty() {
                             return Err(ConfigError::validation(
-                                &format!("chrome.top.order[{}]", idx + 1),
+                                format!("chrome.top.order[{}]", idx + 1),
                                 "plugin id must not be empty",
                             ));
                         }
@@ -2028,7 +2028,7 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
                     if ids.len() > crate::types::MAX_CHROME_ORDER_ENTRIES {
                         return Err(ConfigError::validation(
                             "chrome.bottom.order",
-                            &format!(
+                            format!(
                                 "list exceeds maximum {} entries",
                                 crate::types::MAX_CHROME_ORDER_ENTRIES
                             ),
@@ -2037,8 +2037,8 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
                     for (idx, id) in ids.iter().enumerate() {
                         if id.len() > crate::types::MAX_PLUGIN_ID_LEN {
                             return Err(ConfigError::validation(
-                                &format!("chrome.bottom.order[{}]", idx + 1),
-                                &format!(
+                                format!("chrome.bottom.order[{}]", idx + 1),
+                                format!(
                                     "plugin id exceeds maximum {} bytes",
                                     crate::types::MAX_PLUGIN_ID_LEN
                                 ),
@@ -2046,7 +2046,7 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
                         }
                         if id.is_empty() {
                             return Err(ConfigError::validation(
-                                &format!("chrome.bottom.order[{}]", idx + 1),
+                                format!("chrome.bottom.order[{}]", idx + 1),
                                 "plugin id must not be empty",
                             ));
                         }

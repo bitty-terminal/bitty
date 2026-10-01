@@ -1884,6 +1884,14 @@ impl Runtime {
         &self.config
     }
 
+    /// Chrome bands for all edges (CTX-0890).
+    ///
+    /// Returns mounted plugin UI trees per edge for compositor rendering.
+    #[must_use]
+    pub fn chrome_bands(&self) -> &ChromeBands {
+        &self.chrome_bands
+    }
+
     /// Sets the panel-overlay modal bit (CTX-0482, issue #763).
     ///
     /// The panel integration drives this from

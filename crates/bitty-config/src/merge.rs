@@ -1137,7 +1137,10 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
                 let field = "chrome.bottom.order";
                 if is_policy {
                     policy_fields.insert(field.to_string(), src.clone());
-                    effective.chrome.bottom_order.clone_from(&chrome.bottom_order);
+                    effective
+                        .chrome
+                        .bottom_order
+                        .clone_from(&chrome.bottom_order);
                     let prev = attribution.get(field).cloned();
                     record_attribution(
                         &mut attribution,
@@ -1161,7 +1164,10 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
                     });
                 } else {
                     let prev = attribution.get(field).cloned();
-                    effective.chrome.bottom_order.clone_from(&chrome.bottom_order);
+                    effective
+                        .chrome
+                        .bottom_order
+                        .clone_from(&chrome.bottom_order);
                     record_attribution(
                         &mut attribution,
                         &mut conflicts,

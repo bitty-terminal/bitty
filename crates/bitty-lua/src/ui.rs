@@ -786,7 +786,7 @@ mod tests {
         // Too many args
         let mut args_vec = Vec::new();
         for i in 0..=UI_CLICK_MAX_ARGS {
-            args_vec.push((format!("arg{i}"), LuaValue::String("val".to_string())));
+            args_vec.push((LuaValue::String(format!("arg{i}")), LuaValue::String("val".to_string())));
         }
         let value = LuaValue::table([
             ("kind", LuaValue::String("Text".to_string())),

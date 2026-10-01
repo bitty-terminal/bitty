@@ -2247,3 +2247,61 @@ fn apc_g_held_esc_bel_c1_st_is_chunk_invariant() {
         assert_eq!(whole, split, "held terminator {terminator:#x}");
     }
 }
+
+#[test]
+fn apc_g_parser_malformed_continuation_drops_open_stream() {
+    let mut parser = Parser::new();
+    let mut actions = Vec::new();
+    parser.advance(b"\x1b_Gf=32,s=2,v=2,m=1;/wAA//8A\x1b\\", |a| {
+        actions.push(a)
+    });
+    assert!(parser.has_pending_kitty());
+    // Continuation without `m=`: the open stream is dropped, not kept.
+    parser.advance(b"\x1b_Gq=2;AP//AAD/\x1b\\", |a| actions.push(a));
+    assert!(!parser.has_pending_kitty());
+    // The would-be tail is an orphan and emits nothing.
+    parser.advance(b"\x1b_Gm=0;AP//AAD//wAA/w==\x1b\\", |a| actions.push(a));
+    assert!(actions.is_empty());
+}
+
+#[test]
+fn apc_g_parser_stalled_stream_dropped_after_interleaved_text() {
+    let mut parser = Parser::new();
+    let mut actions = Vec::new();
+    parser.advance(b"\x1b_Gf=32,s=2,v=2,m=1;/wAA//8A\x1b\\", |_| {});
+    assert!(parser.has_pending_kitty());
+    let text = vec![b'x'; crate::kitty_apc::KITTY_APC_STALL_MAX_BYTES];
+    parser.advance(&text, |_| {});
+    assert!(
+        parser.has_pending_kitty(),
+        "at the bound the stream survives"
+    );
+    parser.advance(b"y", |_| {});
+    assert!(!parser.has_pending_kitty(), "past the bound it is dropped");
+    parser.advance(b"\x1b_Gm=0;AP//AAD//wAA/w==\x1b\\", |a| actions.push(a));
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, TerminalAction::KittyGraphics { .. })),
+        "a stalled stream's tail must not emit"
+    );
+}
+
+#[test]
+fn apc_g_parser_chunked_stream_survives_small_interleaving() {
+    // Stray output between chunks (well under the stall bound) is tolerated.
+    let mut parser = Parser::new();
+    let mut actions = Vec::new();
+    parser.advance(b"\x1b_Gf=32,s=2,v=2,m=1;/wAA//8A\x1b\\", |a| {
+        actions.push(a)
+    });
+    parser.advance(b"\r\n\x1b[0m", |a| actions.push(a));
+    parser.advance(b"\x1b_Gm=0;AP//AAD//wAA/w==\x1b\\", |a| actions.push(a));
+    actions.retain(|a| matches!(a, TerminalAction::KittyGraphics { .. }));
+    match kitty_action(&actions) {
+        TerminalAction::KittyGraphics { payload, .. } => {
+            assert_eq!(&**payload, &[0xFF, 0, 0, 0xFF].repeat(4));
+        }
+        other => panic!("expected KittyGraphics, got {other:?}"),
+    }
+}

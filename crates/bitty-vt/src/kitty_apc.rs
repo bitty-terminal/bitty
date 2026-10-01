@@ -46,6 +46,17 @@
 //! decode-cap violation all store nothing and paint nothing. The caller
 //! (`Parser`) emits no action on rejection. Chunked streams drop only the
 //! offending stream on oversize, mirroring `KittyGraphicsStub` semantics.
+//!
+//! An open stream never outlives a protocol violation or a stall:
+//!
+//! - A continuation chunk with a missing or malformed `m=`, or one carrying
+//!   a delete action (`a=d`, which the kitty specification says must abort a
+//!   partial upload), drops the open stream as well as the offending chunk.
+//! - Input that arrives while a stream is open but is not continuation
+//!   payload (text for the VT state machine, non-`G` or discarded `APC`
+//!   bytes) is counted; past [`KITTY_APC_STALL_MAX_BYTES`] the stream is
+//!   dropped, so a writer cannot pin its buffered payload by interleaving
+//!   other output. Every accepted continuation chunk resets the count.
 
 use crate::diag::{RejectLog, warn_rejection};
 
@@ -55,6 +66,16 @@ pub const KITTY_APC_LEDGER_CAP: usize = 4 * 1024 * 1024;
 pub(crate) const KITTY_APC_MAX_CONTROL_BYTES: usize = 4096;
 
 const KITTY_APC_CODEC_SCRATCH_BYTES: usize = 4;
+
+/// Interleaved non-continuation bytes tolerated while a chunked stream is
+/// open before the stream is dropped as stalled.
+///
+/// The kitty protocol expects a client to send every chunk of one image
+/// before any other graphics command, so well-behaved producers (chafa,
+/// `kitten icat`) interleave nothing; 64 KiB leaves ample room for stray
+/// output while keeping the window in which a stalled writer pins payload
+/// memory bounded by its own interleaved traffic.
+pub const KITTY_APC_STALL_MAX_BYTES: usize = 64 * 1024;
 
 /// Side cap mirroring `bitty-rich::kitty_decode::KITTY_DECODE_MAX_DIMENSION`.
 pub const KITTY_APC_DECODE_MAX_DIMENSION: u32 = 8192;
@@ -109,6 +130,8 @@ pub enum KittyApcReject {
     Oversize,
     /// Continuation (`m=` present, no `f=`) with no open stream.
     Orphan,
+    /// Open stream dropped: protocol violation mid-stream or stall bound.
+    Aborted,
 }
 
 impl std::fmt::Display for KittyApcReject {
@@ -123,6 +146,7 @@ impl std::fmt::Display for KittyApcReject {
             Self::OversizeClaim => write!(f, "kitty s/v claim exceeds decode caps"),
             Self::Oversize => write!(f, "kitty payload exceeds parser budget"),
             Self::Orphan => write!(f, "kitty chunk without an open stream"),
+            Self::Aborted => write!(f, "kitty chunked stream aborted"),
         }
     }
 }
@@ -176,6 +200,8 @@ struct PendingKitty {
     /// Decoded-byte bound for this stream: IMG-1 for compressed or
     /// undeclared-size payloads, the exact declared size for raw claims.
     limit: usize,
+    /// Non-continuation bytes seen since the last accepted chunk.
+    interleaved: usize,
     decoder: Base64Stream,
     payload: Vec<u8>,
 }
@@ -559,6 +585,24 @@ impl KittyApcAssembler {
         self.pending.take().is_some()
     }
 
+    /// Charges `amount` interleaved non-continuation bytes against the open
+    /// stream's stall bound ([`KITTY_APC_STALL_MAX_BYTES`]).
+    ///
+    /// Returns `true` when this call dropped the open stream. A no-op
+    /// without an open stream, so callers may charge unconditionally.
+    pub fn note_interleaved(&mut self, amount: usize) -> bool {
+        let Some(pending) = self.pending.as_mut() else {
+            return false;
+        };
+        pending.interleaved = pending.interleaved.saturating_add(amount);
+        if pending.interleaved <= KITTY_APC_STALL_MAX_BYTES {
+            return false;
+        }
+        self.abort();
+        self.warn_reject(KittyApcReject::Aborted, "stalled stream");
+        true
+    }
+
     pub fn feed(&mut self, raw: &[u8]) -> KittyFeedOutcome {
         let (control, payload) = match raw.iter().position(|&byte| byte == b';') {
             Some(semi) => (&raw[..semi], &raw[semi + 1..]),
@@ -585,21 +629,39 @@ impl KittyApcAssembler {
             return Err(reason);
         }
         let Some(after_g) = control.strip_prefix(b"G") else {
+            // Other APC commands stay inert but count against the stall
+            // bound of an open stream (header plus its introducer).
+            self.note_interleaved(control.len().saturating_add(1));
             return Err(KittyApcReject::NotGraphics);
         };
         if self.pending.is_some() {
-            let more = match more_flag(after_g) {
-                Ok(Some(more)) => more,
-                Ok(None) => {
-                    let reason = KittyApcReject::Orphan;
+            // Fail closed on a malformed continuation: the open stream is
+            // dropped with the chunk, never kept around for a later tail.
+            let more = match continuation_flags(after_g) {
+                Ok(Continuation { delete: true, .. }) => {
+                    self.abort();
+                    let reason = KittyApcReject::Aborted;
+                    self.warn_reject(reason, "delete with open stream");
+                    return Err(reason);
+                }
+                Ok(Continuation {
+                    more: Some(more), ..
+                }) => more,
+                Ok(Continuation { more: None, .. }) => {
+                    self.abort();
+                    let reason = KittyApcReject::Aborted;
                     self.warn_reject(reason, "missing m= with open stream");
                     return Err(reason);
                 }
                 Err(reason) => {
+                    self.abort();
                     self.warn_reject(reason, "continuation m=");
                     return Err(reason);
                 }
             };
+            if let Some(pending) = self.pending.as_mut() {
+                pending.interleaved = 0;
+            }
             self.current_final = Some(!more);
         } else {
             let params = match parse_control(after_g) {
@@ -626,6 +688,7 @@ impl KittyApcAssembler {
                 cursor_movement_c: params.cursor_movement_c,
                 encoded_len: 0,
                 limit,
+                interleaved: 0,
                 decoder: Base64Stream::default(),
                 payload: Vec::new(),
             });
@@ -817,24 +880,41 @@ fn parse_control(control: &[u8]) -> Result<KittyApcParams, KittyApcReject> {
 }
 
 /// Extracts the `m=` flag from a continuation buffer (`None` when absent).
-fn more_flag(control: &[u8]) -> Result<Option<bool>, KittyApcReject> {
+/// Keys of a continuation chunk that decide its fate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Continuation {
+    /// `m=` value (`None` when absent).
+    more: Option<bool>,
+    /// `a=d`: a delete command, which must abort a partial upload.
+    delete: bool,
+}
+
+/// Scans a continuation control section for `m=` and a delete action.
+///
+/// Other keys are ignored (a continuation should carry only `m` and `q`).
+fn continuation_flags(control: &[u8]) -> Result<Continuation, KittyApcReject> {
+    let mut flags = Continuation {
+        more: None,
+        delete: false,
+    };
     for piece in control.split(|&b| b == b',') {
-        if piece.is_empty() {
-            continue;
-        }
         let Some(eq) = piece.iter().position(|&b| b == b'=') else {
             continue;
         };
         let (key, value) = (&piece[..eq], &piece[eq + 1..]);
-        if key == b"m" {
-            return match value {
-                b"0" => Ok(Some(false)),
-                b"1" => Ok(Some(true)),
-                _ => Err(KittyApcReject::BadMore),
-            };
+        match key {
+            b"m" if flags.more.is_none() => {
+                flags.more = Some(match value {
+                    b"0" => false,
+                    b"1" => true,
+                    _ => return Err(KittyApcReject::BadMore),
+                });
+            }
+            b"a" if value == b"d" => flags.delete = true,
+            _ => {}
         }
     }
-    Ok(None)
+    Ok(flags)
 }
 
 /// Rejects oversize raw `s`/`v` claims before any pixel buffer could exist.
@@ -1338,25 +1418,111 @@ mod tests {
     }
 
     #[test]
-    fn missing_m_with_open_stream_keeps_stream() {
+    fn missing_m_with_open_stream_aborts_stream() {
         let mut assembler = KittyApcAssembler::new();
         match assembler.feed(b"Gf=32,s=2,v=2,m=1;/wAA//8A") {
             KittyFeedOutcome::NeedMore { .. } => {}
             other => panic!("expected NeedMore, got {other:?}"),
         }
-        // No `m=`: newcomer dropped, open stream kept.
+        // No `m=` with an open stream: protocol violation, fail closed by
+        // dropping the open stream together with the newcomer.
         match assembler.feed(b"Gf=32,s=1,v=1;/wAA/w==") {
-            KittyFeedOutcome::Rejected(KittyApcReject::Orphan) => {}
-            other => panic!("expected Orphan, got {other:?}"),
+            KittyFeedOutcome::Rejected(KittyApcReject::Aborted) => {}
+            other => panic!("expected Aborted, got {other:?}"),
         }
-        assert!(assembler.has_pending());
-        // True tail still completes exactly.
+        assert!(!assembler.has_pending());
+        assert_eq!(assembler.budget.decoded, 0);
+        // The old tail is now an orphan and paints nothing.
+        // (A bare `m=0` without `f=` and no open stream is a missing-format
+        // transmission.)
         match assembler.feed(b"Gm=0;AP//AAD//wAA/w==") {
+            KittyFeedOutcome::Rejected(KittyApcReject::MissingFormat) => {}
+            other => panic!("expected MissingFormat, got {other:?}"),
+        }
+        // A fresh stream still completes afterwards.
+        match assembler.feed(b"Gf=32,s=1,v=1;/wAA/w==") {
             KittyFeedOutcome::Completed(done) => {
-                assert_eq!(&*done.payload, &[0xFF, 0, 0, 0xFF].repeat(4));
+                assert_eq!(&*done.payload, &[0xFF, 0, 0, 0xFF]);
             }
             other => panic!("expected Completed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn malformed_continuation_m_aborts_stream() {
+        let mut assembler = KittyApcAssembler::new();
+        assert!(matches!(
+            assembler.feed(b"Gf=32,s=2,v=2,m=1;/wAA//8A"),
+            KittyFeedOutcome::NeedMore { .. }
+        ));
+        match assembler.feed(b"Gm=2;AP//AAD/") {
+            KittyFeedOutcome::Rejected(KittyApcReject::BadMore) => {}
+            other => panic!("expected BadMore, got {other:?}"),
+        }
+        assert!(!assembler.has_pending());
+        assert_eq!(assembler.budget.decoded, 0);
+        assert!(matches!(
+            assembler.feed(b"Gm=0;/wAA/w=="),
+            KittyFeedOutcome::Rejected(KittyApcReject::MissingFormat)
+        ));
+    }
+
+    #[test]
+    fn delete_with_open_stream_aborts_partial_upload() {
+        let mut assembler = KittyApcAssembler::new();
+        assert!(matches!(
+            assembler.feed(b"Gf=32,s=2,v=2,m=1;/wAA//8A"),
+            KittyFeedOutcome::NeedMore { .. }
+        ));
+        // Kitty spec: a delete received mid-upload aborts the partial upload.
+        match assembler.feed(b"Ga=d,d=A,m=0") {
+            KittyFeedOutcome::Rejected(KittyApcReject::Aborted) => {}
+            other => panic!("expected Aborted, got {other:?}"),
+        }
+        assert!(!assembler.has_pending());
+    }
+
+    #[test]
+    fn interleaved_bytes_past_stall_bound_drop_stream() {
+        let mut assembler = KittyApcAssembler::new();
+        assert!(matches!(
+            assembler.feed(b"Gf=32,s=2,v=2,m=1;/wAA//8A"),
+            KittyFeedOutcome::NeedMore { .. }
+        ));
+        // Exactly at the bound keeps the stream.
+        assert!(!assembler.note_interleaved(KITTY_APC_STALL_MAX_BYTES));
+        assert!(assembler.has_pending());
+        // An accepted continuation resets the count.
+        assert!(matches!(
+            assembler.feed(b"Gm=1;AP//AAD/"),
+            KittyFeedOutcome::NeedMore { .. }
+        ));
+        assert!(!assembler.note_interleaved(KITTY_APC_STALL_MAX_BYTES));
+        assert!(assembler.has_pending());
+        // One byte past the bound drops it and releases the payload charge.
+        assert!(assembler.note_interleaved(1));
+        assert!(!assembler.has_pending());
+        assert_eq!(assembler.budget.decoded, 0);
+        // Idle assembler: charging is a no-op.
+        assert!(!assembler.note_interleaved(usize::MAX));
+    }
+
+    #[test]
+    fn non_graphics_apc_counts_toward_stall_bound() {
+        let mut assembler = KittyApcAssembler::new();
+        assert!(matches!(
+            assembler.feed(b"Gf=32,s=2,v=2,m=1;/wAA//8A"),
+            KittyFeedOutcome::NeedMore { .. }
+        ));
+        let other = vec![b'X'; KITTY_APC_MAX_CONTROL_BYTES - 1];
+        let rounds = KITTY_APC_STALL_MAX_BYTES / KITTY_APC_MAX_CONTROL_BYTES + 1;
+        for _ in 0..rounds {
+            assert!(matches!(
+                assembler.feed(&other),
+                KittyFeedOutcome::Rejected(KittyApcReject::NotGraphics)
+            ));
+        }
+        assert!(!assembler.has_pending());
     }
 
     fn base64_encode(bytes: &[u8]) -> String {

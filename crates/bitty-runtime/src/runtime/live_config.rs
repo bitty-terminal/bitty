@@ -99,14 +99,6 @@ impl Runtime {
                 "font_family must be non-empty and at most MAX_LIVE_FONT_FAMILY_BYTES bytes",
             ));
         }
-        if !(point_size.is_finite()
-            && (crate::config::FONT_ZOOM_MIN_PT..=crate::config::FONT_ZOOM_MAX_PT)
-                .contains(&point_size))
-        {
-            return Err(RuntimeError::InvalidConfig(
-                "font_size must be finite within [FONT_ZOOM_MIN_PT, FONT_ZOOM_MAX_PT]",
-            ));
-        }
         if !(1..=MAX_LIVE_CELL_PX).contains(&cell_width)
             || !(1..=MAX_LIVE_CELL_PX).contains(&cell_height)
         {
@@ -120,6 +112,14 @@ impl Runtime {
             && cell_height == self.config.cell_height
         {
             return Ok(());
+        }
+        if !(point_size.is_finite()
+            && (crate::config::FONT_ZOOM_MIN_PT..=crate::config::FONT_ZOOM_MAX_PT)
+                .contains(&point_size))
+        {
+            return Err(RuntimeError::InvalidConfig(
+                "font_size must be finite within [FONT_ZOOM_MIN_PT, FONT_ZOOM_MAX_PT]",
+            ));
         }
         let base_cell = CellMetrics::new(cell_width, cell_height).map_err(RuntimeError::from)?;
         let query = FontQuery {

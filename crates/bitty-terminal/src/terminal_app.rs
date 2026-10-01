@@ -571,8 +571,15 @@ impl TerminalApp {
         if title == self.window.title {
             return;
         }
-        self.window.title = title;
-        if self.window.last_applied_title.is_none() {
+        let previous = std::mem::replace(&mut self.window.title, title);
+        let showing_base = match self.window.last_applied_title.as_deref() {
+            None => true,
+            Some(applied) => applied == previous,
+        };
+        if showing_base {
+            if self.window.last_applied_title.is_some() {
+                self.window.last_applied_title = Some(self.window.title.clone());
+            }
             if let Some(sink) = self.window.os_title_sink.as_ref() {
                 sink.set_os_title(&self.window.title);
             }

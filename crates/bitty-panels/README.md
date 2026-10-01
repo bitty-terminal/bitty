@@ -40,9 +40,10 @@ deliberately stay in `bitty-runtime` in this phase.
 
 ## Boundaries
 
-- Workspace-internal dependencies only, per `Cargo.toml`: `bitty-agent`,
-  `bitty-ipc`, `bitty-runtime`, and `bitty-ui`; no network-facing dependency
-  is declared.
+- Workspace-internal dependencies, per `Cargo.toml`: `bitty-runtime` and
+  `bitty-ui`; external git dependencies: `bitty-agent` and `bitty-ipc`
+  (extracted to independent repositories, CTX-1585); no network-facing
+  dependency is declared.
 - No Lua, config, or plugin host code enters the hot path.
 - Default CI verifies the headless seam only.
 

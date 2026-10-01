@@ -17,8 +17,9 @@ libraries, as stated in `src/main.rs`.
 ## Boundaries
 
 - Workspace-internal dependencies, per `Cargo.toml`: `bitty-config`,
-  `bitty-ipc`, `bitty-perf`, `bitty-platform`, `bitty-plugin-host`,
-  `bitty-render`, `bitty-runtime`, and `bitty-term-state`.
+  `bitty-perf`, `bitty-platform`, `bitty-plugin-host`, `bitty-render`,
+  `bitty-runtime`, and `bitty-term-state`; external git dependency:
+  `bitty-ipc` (extracted to an independent repository, CTX-1585).
 - Third-party dependencies, per `Cargo.toml`: `pollster` only; no
   network-facing dependency is declared.
 - Must not own business behavior: grid, parsing, rendering, plugin, and IPC

@@ -17,11 +17,12 @@ diagram lives in `src/lib.rs`.
 
 ## Boundaries
 
-- Workspace-internal dependencies only, per `Cargo.toml`: `bitty-vt`,
+- Workspace-internal dependencies, per `Cargo.toml`: `bitty-vt`,
   `bitty-term-state`, `bitty-pty`, `bitty-render`, `bitty-platform`,
-  `bitty-ui`, `bitty-lua`, `bitty-plugin-host`, `bitty-agent`, `bitty-ipc`,
-  `bitty-package`, and `bitty-rich`; no network-facing dependency is
-  declared.
+  `bitty-ui`, `bitty-lua`, `bitty-plugin-host`, `bitty-package`, and
+  `bitty-rich`; external git dependencies: `bitty-agent` and `bitty-ipc`
+  (extracted to independent repositories, CTX-1585); no network-facing
+  dependency is declared.
 - No Lua, config, or plugin code enters the hot path (see `src/lib.rs`).
 - The plugin side queue never holds hot-path objects: no GPU, window, or PTY
   handles and no Lua VM.

@@ -237,6 +237,20 @@ pub struct WorkspaceData {
     pub bar_edge: Option<String>,
 }
 
+/// Chrome band ordering per edge (CTX-0890, Issue #1431; see [`FontData`]
+/// for `Option` semantics).
+///
+/// Plugin chrome stacking order per band edge:
+/// `chrome = { top = { order = {"plugin-a", "plugin-b"} } }`. Each edge
+/// carries an array of plugin IDs. Validated downstream in `bitty-config`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ChromeData {
+    /// Top edge ordering (array of plugin IDs).
+    pub top_order: Option<Vec<String>>,
+    /// Bottom edge ordering (array of plugin IDs).
+    pub bottom_order: Option<Vec<String>>,
+}
+
 /// Core-owned workspace decoration overrides, plain data (CTX-0292; unified
 /// CTX-0333; see [`FontData`] for `Option` semantics).
 ///
@@ -430,6 +444,8 @@ pub struct ConfigData {
     pub layout: Option<LayoutData>,
     /// `workspace` table (CW-07 default layout provider).
     pub workspace: Option<WorkspaceData>,
+    /// `chrome` table (CTX-0890 band ordering per edge).
+    pub chrome: Option<ChromeData>,
     /// `decoration` table (CTX-0292 Core-owned workspace decoration).
     pub decoration: Option<DecorationData>,
     /// `views` table (RFC-0001/OQ-041 per-View appearance overrides,
@@ -491,6 +507,7 @@ impl ConfigData {
             && self.selection.is_none()
             && self.layout.is_none()
             && self.workspace.is_none()
+            && self.chrome.is_none()
             && self.decoration.is_none()
             && self.views.is_none()
             && self.scrollbar.is_none()
@@ -1260,6 +1277,68 @@ impl ConfigData {
                         bar_edge,
                     });
                 }
+                "chrome" => {
+                    // CTX-0890: `chrome = { top = { order = {"plugin-a", "plugin-b"} },
+                    // bottom = { order = {...} } }` sets plugin chrome stacking order
+                    // per edge; absent table/key means "says nothing". Plugin IDs are
+                    // strings; validation (charset, length, list bounds) is downstream
+                    // in `bitty-config`.
+                    let nested = expect_table(key, val)?;
+                    check_nested_keys(key, nested, &["top", "bottom"])?;
+
+                    let top_order = match get_field(nested, "top") {
+                        Some(top_val) => {
+                            let top_table = expect_table("chrome.top", top_val)?;
+                            check_nested_keys("chrome.top", top_table, &["order"])?;
+                            match get_field(top_table, "order") {
+                                Some(order_val) => {
+                                    let arr = expect_array("chrome.top.order", order_val)?;
+                                    let mut ids = Vec::new();
+                                    for (idx, item) in arr.iter().enumerate() {
+                                        let id = expect_bounded_string(
+                                            &format!("chrome.top.order[{}]", idx + 1),
+                                            item,
+                                            64, // MAX_PLUGIN_ID_BYTES per task spec
+                                        )?;
+                                        ids.push(id);
+                                    }
+                                    Some(ids)
+                                }
+                                None => None,
+                            }
+                        }
+                        None => None,
+                    };
+
+                    let bottom_order = match get_field(nested, "bottom") {
+                        Some(bottom_val) => {
+                            let bottom_table = expect_table("chrome.bottom", bottom_val)?;
+                            check_nested_keys("chrome.bottom", bottom_table, &["order"])?;
+                            match get_field(bottom_table, "order") {
+                                Some(order_val) => {
+                                    let arr = expect_array("chrome.bottom.order", order_val)?;
+                                    let mut ids = Vec::new();
+                                    for (idx, item) in arr.iter().enumerate() {
+                                        let id = expect_bounded_string(
+                                            &format!("chrome.bottom.order[{}]", idx + 1),
+                                            item,
+                                            64,
+                                        )?;
+                                        ids.push(id);
+                                    }
+                                    Some(ids)
+                                }
+                                None => None,
+                            }
+                        }
+                        None => None,
+                    };
+
+                    out.chrome = Some(ChromeData {
+                        top_order,
+                        bottom_order,
+                    });
+                }
                 "decoration" => {
                     // CTX-0292/CTX-0333: `decoration = { gaps_in = 6,
                     // gaps_out = 6, border = 2, radius = 6,
@@ -1707,6 +1786,25 @@ fn expect_table<'a>(
         ValueSnapshot::Table { pairs, .. } => Ok(pairs),
         ValueSnapshot::Nil => Err(format!("{path}: expected table (found nil)")),
         other => Err(format!("{path}: expected table (found {})", other.kind())),
+    }
+}
+
+/// Expect an array value and return its sequence (CTX-0890).
+fn expect_array<'a>(path: &str, val: &'a ValueSnapshot) -> Result<&'a [ValueSnapshot], String> {
+    match val {
+        ValueSnapshot::Table {
+            pairs,
+            seq,
+            has_non_string_keys,
+            ..
+        } => {
+            if !pairs.is_empty() || *has_non_string_keys {
+                return Err(format!("{path}: expected array (found map keys)"));
+            }
+            Ok(seq)
+        }
+        ValueSnapshot::Nil => Err(format!("{path}: expected array (found nil)")),
+        other => Err(format!("{path}: expected array (found {})", other.kind())),
     }
 }
 

@@ -19,10 +19,13 @@ use crate::keymap::{Chord, ModKey};
 /// (threat T-01).
 pub const MAX_FONT_FAMILY_LEN: usize = 128;
 pub const MAX_THEME_LEN: usize = 64;
-pub const MAX_PLUGIN_ID_LEN: usize = 128;
+pub const MAX_PLUGIN_ID_LEN: usize = 64;
 pub const MAX_KEYMAPS: usize = 1024;
 pub const MAX_PLUGINS: usize = 1024;
 pub const MAX_SHELL_LEN: usize = 1024;
+
+/// Maximum chrome band order list entries per edge (CTX-0890).
+pub const MAX_CHROME_ORDER_ENTRIES: usize = 32;
 
 /// Default lines scrolled per wheel notch (LineDelta unit 1.0).
 /// Matches alacritty/ghostty-class `3` lines per tick.
@@ -2277,6 +2280,60 @@ impl WorkspaceConfig {
     }
 }
 
+/// Chrome band ordering per edge (CTX-0890, Issue #1431).
+///
+/// Plugin chrome mounts to window edges via `bitty.ui.mount(slot, tree)` where
+/// slot is "top"/"bottom"/"left"/"right". When multiple plugins mount to the
+/// same edge, `chrome.<edge>.order` defines the stacking order (innermost to
+/// outermost). Missing plugins in the order list fall back to plugin id byte
+/// order.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ChromeConfig {
+    /// Top edge band order (`chrome.top.order`).
+    pub top_order: Vec<String>,
+    /// Bottom edge band order (`chrome.bottom.order`).
+    pub bottom_order: Vec<String>,
+    /// Left edge band order (`chrome.left.order`, reserved for future).
+    pub left_order: Vec<String>,
+    /// Right edge band order (`chrome.right.order`, reserved for future).
+    pub right_order: Vec<String>,
+}
+
+impl ChromeConfig {
+    /// Validate all order lists (fail-closed).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        Self::validate_order_list("chrome.top.order", &self.top_order)?;
+        Self::validate_order_list("chrome.bottom.order", &self.bottom_order)?;
+        Self::validate_order_list("chrome.left.order", &self.left_order)?;
+        Self::validate_order_list("chrome.right.order", &self.right_order)?;
+        Ok(())
+    }
+
+    fn validate_order_list(field: &str, list: &[String]) -> Result<(), ConfigError> {
+        if list.len() > MAX_CHROME_ORDER_ENTRIES {
+            return Err(ConfigError::validation(
+                field,
+                format!("must have <= {MAX_CHROME_ORDER_ENTRIES} entries"),
+            ));
+        }
+        for (i, id) in list.iter().enumerate() {
+            if id.is_empty() {
+                return Err(ConfigError::validation(
+                    field,
+                    format!("entry {i} must be non-empty"),
+                ));
+            }
+            if id.len() > MAX_PLUGIN_ID_LEN {
+                return Err(ConfigError::validation(
+                    field,
+                    format!("entry {i} must be <= {MAX_PLUGIN_ID_LEN} bytes"),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Core-owned workspace decoration in logical pixels (CTX-0292).
 ///
 /// Implements the workspace-compositor contract
@@ -2946,6 +3003,8 @@ pub struct EffectiveConfig {
     /// Default layout provider for new workspaces (CW-07
     /// `workspace.layout`; default preserves the current tree).
     pub workspace: WorkspaceConfig,
+    /// Chrome band ordering per edge (CTX-0890, Issue #1431).
+    pub chrome: ChromeConfig,
     /// Core-owned workspace decoration in logical px (CTX-0292; unified
     /// defaults `6/6/1/6/6` since #1342, spec sync tracked by #1374).
     pub decoration: DecorationConfig,
@@ -3003,6 +3062,7 @@ impl Default for EffectiveConfig {
             close_confirm: DEFAULT_CLOSE_CONFIRM,
             layout: LayoutConfig::default(),
             workspace: WorkspaceConfig::default(),
+            chrome: ChromeConfig::default(),
             decoration: DecorationConfig::default(),
             views: Vec::new(),
             scrollbar: ScrollbarConfig::default(),
@@ -5238,5 +5298,78 @@ mod tests {
         assert_eq!(resolved.outline_width_idle, SAFE_DECORATION_BORDER_WIDTH_PX);
         assert_eq!(resolved.background_image, None);
         assert_eq!(resolved.background_fit, BackgroundFit::Fill);
+    }
+
+    #[test]
+    fn chrome_order_valid_list() {
+        let config = ChromeConfig {
+            top_order: vec!["plugin-a".to_string(), "plugin-b".to_string()],
+            bottom_order: vec!["statusline".to_string()],
+            left_order: vec![],
+            right_order: vec![],
+        };
+        config.validate().expect("valid chrome order lists");
+    }
+
+    #[test]
+    fn chrome_order_rejects_oversized_list() {
+        let mut ids = Vec::new();
+        for i in 0..=MAX_CHROME_ORDER_ENTRIES {
+            ids.push(format!("plugin-{i}"));
+        }
+        let config = ChromeConfig {
+            top_order: ids,
+            bottom_order: vec![],
+            left_order: vec![],
+            right_order: vec![],
+        };
+        let err = config.validate().unwrap_err();
+        let err_str = format!("{err}");
+        assert!(
+            err_str.contains(&format!("<= {MAX_CHROME_ORDER_ENTRIES} entries")),
+            "{err_str}"
+        );
+    }
+
+    #[test]
+    fn chrome_order_rejects_oversized_plugin_id() {
+        let long_id = "a".repeat(MAX_PLUGIN_ID_LEN + 1);
+        let config = ChromeConfig {
+            top_order: vec![long_id],
+            bottom_order: vec![],
+            left_order: vec![],
+            right_order: vec![],
+        };
+        let err = config.validate().unwrap_err();
+        let err_str = format!("{err}");
+        assert!(
+            err_str.contains(&format!("<= {MAX_PLUGIN_ID_LEN} bytes")),
+            "{err_str}"
+        );
+    }
+
+    #[test]
+    fn chrome_order_rejects_empty_plugin_id() {
+        let config = ChromeConfig {
+            top_order: vec!["".to_string()],
+            bottom_order: vec![],
+            left_order: vec![],
+            right_order: vec![],
+        };
+        let err = config.validate().unwrap_err();
+        let err_str = format!("{err}");
+        assert!(err_str.contains("non-empty"), "{err_str}");
+    }
+
+    #[test]
+    fn chrome_order_accepts_max_length_plugin_id() {
+        let max_id = "a".repeat(MAX_PLUGIN_ID_LEN);
+        let config = ChromeConfig {
+            top_order: vec![max_id.clone()],
+            bottom_order: vec![max_id],
+            left_order: vec![],
+            right_order: vec![],
+        };
+        config.validate().expect("max-length plugin id accepted");
     }
 }

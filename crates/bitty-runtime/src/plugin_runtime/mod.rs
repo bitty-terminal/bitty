@@ -21,6 +21,7 @@
 //! development packages are read-only, re-digested, and visibly unverified.
 //! The numeric bounds below are the RFC's ratified defaults.
 
+pub mod debug;
 pub mod fs;
 pub mod manifest_toml;
 pub mod package;
@@ -473,6 +474,13 @@ pub struct PluginRuntime {
     entries: BTreeMap<PluginId, PluginEntry>,
     order: Vec<PluginId>,
     service_directory: Rc<RefCell<ServiceDirectory>>,
+    /// CTX-0897: sanitized lifecycle/registration snapshot shared with every
+    /// generation's services for `bitty.debug.inspect`; rebuilt by
+    /// [`PluginRuntime::sync_debug_view`] after each lifecycle transition.
+    debug_view: Rc<RefCell<debug::DebugView>>,
+    /// CTX-0897: per-owner event traces for `bitty.debug.trace`, fed by
+    /// [`PluginRuntime::deliver_event`].
+    trace_hub: Rc<RefCell<debug::TraceHub>>,
     /// CTX-0846 (#1454): optional shared network runtime. `None` (the
     /// default) means the host has no network backend, so `bitty.network`
     /// is never registered in any plugin VM. When `Some`, the same runtime
@@ -512,6 +520,8 @@ impl PluginRuntime {
             entries: BTreeMap::new(),
             order: Vec::new(),
             service_directory: Rc::new(RefCell::new(ServiceDirectory::new())),
+            debug_view: Rc::new(RefCell::new(debug::DebugView::new())),
+            trace_hub: Rc::new(RefCell::new(debug::TraceHub::new())),
             #[cfg(feature = "network")]
             network_runtime: None,
             store_fs: Arc::new(NativeFileSystem),
@@ -599,6 +609,12 @@ impl PluginRuntime {
     /// host never falls back to a different revision or to bundled content.
     /// Returns `(id, result)` pairs in discovery order.
     pub fn discover(&mut self) -> Vec<(PluginId, Result<(), PluginRuntimeError>)> {
+        let results = self.discover_inner();
+        self.sync_debug_view();
+        results
+    }
+
+    fn discover_inner(&mut self) -> Vec<(PluginId, Result<(), PluginRuntimeError>)> {
         let mut results = Vec::new();
 
         for root in self.bundled_roots.clone() {
@@ -703,6 +719,12 @@ impl PluginRuntime {
     /// capture-validation, or VM failures. Failure leaves no partial
     /// activation.
     pub fn activate(&mut self, id: &PluginId) -> Result<ActivationReport, PluginRuntimeError> {
+        let result = self.activate_inner(id);
+        self.sync_debug_view();
+        result
+    }
+
+    fn activate_inner(&mut self, id: &PluginId) -> Result<ActivationReport, PluginRuntimeError> {
         let (manifest, module_root, init_path, recorded_grant, source_class) = {
             let entry = self
                 .entries
@@ -822,6 +844,12 @@ impl PluginRuntime {
         let ui_overlay = granted
             .iter()
             .any(|capability| capability.as_str() == "ui.overlay");
+        let debug_inspect = granted
+            .iter()
+            .any(|capability| capability.as_str() == "debug.inspect");
+        let debug_trace = granted
+            .iter()
+            .any(|capability| capability.as_str() == "debug.trace");
         let plugin_services = Rc::new(PluginServices::new(
             id.as_str(),
             store,
@@ -847,6 +875,20 @@ impl PluginRuntime {
         // revokes. Without both, `services.get`/`provide` fail closed with
         // `E_NOT_IMPLEMENTED`.
         plugin_services.set_service_directory(self.service_directory.clone());
+        // CTX-0897: `bitty.debug` read-only backend. Each entry point needs
+        // its own grant (`debug.inspect` vs `debug.trace`, no implication);
+        // the `grants` target serves only this generation's own snapshot.
+        plugin_services.set_debug_inspect(debug_inspect);
+        plugin_services.set_debug_trace(debug_trace);
+        plugin_services.set_granted_capabilities(
+            granted
+                .iter()
+                .map(|capability| capability.as_str().to_string())
+                .collect(),
+        );
+        plugin_services.set_declared_events(manifest.lazy.events.iter().cloned().collect());
+        plugin_services.set_debug_view(self.debug_view.clone());
+        plugin_services.set_trace_hub(self.trace_hub.clone());
         plugin_services.set_service_manifest(
             manifest.provided_services.clone(),
             manifest.required_services.clone(),
@@ -1040,6 +1082,12 @@ impl PluginRuntime {
     ///
     /// [`PluginRuntimeError::Lifecycle`] when the transition is invalid.
     pub fn suspend(&mut self, id: &PluginId) -> Result<(), PluginRuntimeError> {
+        let result = self.suspend_inner(id);
+        self.sync_debug_view();
+        result
+    }
+
+    fn suspend_inner(&mut self, id: &PluginId) -> Result<(), PluginRuntimeError> {
         let entry = self
             .entries
             .get_mut(id)
@@ -1070,6 +1118,12 @@ impl PluginRuntime {
     ///
     /// [`PluginRuntimeError::Lifecycle`] when the transition is invalid.
     pub fn resume(&mut self, id: &PluginId) -> Result<(), PluginRuntimeError> {
+        let result = self.resume_inner(id);
+        self.sync_debug_view();
+        result
+    }
+
+    fn resume_inner(&mut self, id: &PluginId) -> Result<(), PluginRuntimeError> {
         let entry = self
             .entries
             .get_mut(id)
@@ -1102,6 +1156,12 @@ impl PluginRuntime {
     ///
     /// [`PluginRuntimeError::Lifecycle`] when the plugin is unknown.
     pub fn dispose(&mut self, id: &PluginId) -> Result<(), PluginRuntimeError> {
+        let result = self.dispose_inner(id);
+        self.sync_debug_view();
+        result
+    }
+
+    fn dispose_inner(&mut self, id: &PluginId) -> Result<(), PluginRuntimeError> {
         let entry = self
             .entries
             .get_mut(id)
@@ -1115,6 +1175,9 @@ impl PluginRuntime {
             services.clear_ui_blocks();
         }
         entry.state = LifecycleState::Disposed;
+        // CTX-0897: traces never outlive the generation (also on reload,
+        // where dispose and the next activation share one public call).
+        self.drop_traces(id);
         // LUA-OQ-8: revoke this generation's publications. The entry VM is
         // already dropped, so even a lingering record could never upgrade;
         // revocation additionally makes resolution fail closed immediately.
@@ -1145,6 +1208,12 @@ impl PluginRuntime {
     /// [`PluginRuntimeError`] when the plugin is unknown, bundled, or fails
     /// re-resolution/activation.
     pub fn reload(&mut self, id: &PluginId) -> Result<ActivationReport, PluginRuntimeError> {
+        let result = self.reload_inner(id);
+        self.sync_debug_view();
+        result
+    }
+
+    fn reload_inner(&mut self, id: &PluginId) -> Result<ActivationReport, PluginRuntimeError> {
         let (source_class, module_root) = {
             let entry = self
                 .entries
@@ -1161,7 +1230,7 @@ impl PluginRuntime {
                 detail: "bundled sources are not hot-swapped".to_string(),
             });
         }
-        self.dispose(id)?;
+        self.dispose_inner(id)?;
 
         if let Some(store_root) = self.store_root.clone() {
             let records = resolution::load_index(&store_root)?;
@@ -1179,7 +1248,7 @@ impl PluginRuntime {
             verify_module_tree(id, &module_root)?;
         }
 
-        self.activate(id)
+        self.activate_inner(id)
     }
 
     /// Dispatch one captured command, invoking its `run` function under budget.
@@ -1243,6 +1312,7 @@ impl PluginRuntime {
             ("sequence", LuaValue::Integer(self.event_sequence as i64)),
             ("payload", payload.clone()),
         ]);
+        self.record_trace(kind, payload);
         let ids: Vec<PluginId> = self
             .entries
             .iter()
@@ -1336,6 +1406,96 @@ impl PluginRuntime {
         }
     }
 
+    /// Record one delivered event into the trace hub (CTX-0897).
+    ///
+    /// Runs once per event before fan-out, whether or not any handler is
+    /// subscribed. Only traces whose owner is currently `Active` receive the
+    /// record: a suspended owner's traces are paused, and disposed/failed
+    /// owners have no traces (pruned by [`Self::sync_debug_view`]).
+    ///
+    /// Least privilege: each trace records only the kinds its owner declares
+    /// in its manifest `lazy.events` (snapshotted when the trace opens), the
+    /// same precondition `bitty.events.subscribe` enforces, so a
+    /// `debug.trace` holder never observes a topic it could not subscribe
+    /// to. Payloads are bounded by [`debug::TRACE_PAYLOAD_MAX_BYTES`].
+    fn record_trace(&mut self, kind: &str, payload: &LuaValue) {
+        if self.trace_hub.borrow().is_empty() {
+            return;
+        }
+        let active: BTreeSet<&str> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.state == LifecycleState::Active)
+            .map(|(id, _)| id.as_str())
+            .collect();
+        self.trace_hub
+            .borrow_mut()
+            .record(kind, self.event_sequence, payload, |owner| {
+                active.contains(owner)
+            });
+    }
+
+    /// Drop every trace owned by `id` (dispose and failed activation).
+    fn drop_traces(&mut self, id: &PluginId) {
+        self.trace_hub
+            .borrow_mut()
+            .retain_owners(|owner| owner != id.as_str());
+    }
+
+    /// Rebuild the shared [`debug::DebugView`] from `entries` and prune the
+    /// traces of owners that are no longer live (CTX-0897).
+    ///
+    /// Called at the end of every public lifecycle-changing method
+    /// (`discover`, `activate`, `suspend`, `resume`, `dispose`, `reload`), on
+    /// success and failure alike. Time O(p + c + e) to collect plus
+    /// O(n log n) to sort the rows (p plugins, c commands, e subscriptions),
+    /// plus O(t) over open traces; space O(p + c + e) for the new snapshot.
+    fn sync_debug_view(&mut self) {
+        let mut plugins = Vec::with_capacity(self.entries.len());
+        let mut commands = Vec::new();
+        let mut events = Vec::new();
+        for (id, entry) in &self.entries {
+            plugins.push(debug::DebugPlugin {
+                id: id.as_str().to_string(),
+                version: entry.package.manifest.identity.version.clone(),
+                state: debug::lifecycle_label(&entry.state),
+                generation: entry.generation,
+            });
+            for command in &entry.registrations.commands {
+                commands.push(debug::DebugCommand {
+                    plugin: id.as_str().to_string(),
+                    id: command.id.clone(),
+                    title: command.title.clone(),
+                });
+            }
+            for subscription in &entry.registrations.events {
+                events.push(debug::DebugEvent {
+                    plugin: id.as_str().to_string(),
+                    kind: subscription.kind.clone(),
+                });
+            }
+        }
+        self.debug_view
+            .borrow_mut()
+            .replace(plugins, commands, events);
+        // Traces survive suspend (paused) but never outlive the generation:
+        // dispose, failure, and reload drop every trace the owner held.
+        let live: BTreeSet<&str> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| {
+                matches!(
+                    entry.state,
+                    LifecycleState::Active | LifecycleState::Suspended
+                )
+            })
+            .map(|(id, _)| id.as_str())
+            .collect();
+        self.trace_hub
+            .borrow_mut()
+            .retain_owners(|owner| live.contains(owner));
+    }
+
     /// Roll back a failed activation attempt atomically.
     ///
     /// Purges the policy-host generation (identity, command ownership, and
@@ -1351,6 +1511,7 @@ impl PluginRuntime {
             entry.vm = None;
             entry.services = None;
         }
+        self.drop_traces(id);
     }
 
     /// Whether the policy host still holds a registry entry for `id`

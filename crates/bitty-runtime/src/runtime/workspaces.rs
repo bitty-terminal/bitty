@@ -47,6 +47,8 @@ use super::*;
 
 use std::collections::VecDeque;
 
+use bitty_plugin_host::{BoundedText, EventPayload};
+
 /// Maximum workspaces (mirrors `registry::MAX_WORKSPACES_PER_WINDOW`).
 pub const MAX_WORKSPACES: usize = 16;
 
@@ -529,10 +531,25 @@ impl Runtime {
         if trimmed.is_empty() {
             return Err(String::from("workspace name must not be empty"));
         }
+        let new_name = truncate_ws_name(trimmed);
         if let Some(slot) = self.workspaces.get_mut(index) {
-            slot.name = truncate_ws_name(trimmed);
+            // CTX-0907: skip if the name doesn't actually change
+            if slot.name == new_name {
+                return Ok(());
+            }
+            slot.name = new_name.clone();
         }
         self.pending_full_redraw = true;
+
+        // CTX-0907: emit workspace.renamed event
+        let seq = self.plugin_host.publish_count();
+        let event = Event::new(
+            EventKind::WorkspaceRenamed,
+            EventPayload::Text(BoundedText::new_truncated(&new_name)),
+            seq,
+        );
+        self.plugin_host.publish(event);
+
         Ok(())
     }
 
@@ -778,6 +795,26 @@ impl Runtime {
             }
         }
         self.pending_full_redraw = true;
+
+        // CTX-0907: emit workspace.created event
+        let seq = self.plugin_host.publish_count();
+        let workspace_name = self.workspaces[index].name.clone();
+        let event = Event::new(
+            EventKind::WorkspaceCreated,
+            EventPayload::Text(BoundedText::new_truncated(&workspace_name)),
+            seq,
+        );
+        self.plugin_host.publish(event);
+
+        // CTX-0907: emit workspace.focused event after activating new workspace
+        let seq = self.plugin_host.publish_count();
+        let event = Event::new(
+            EventKind::WorkspaceFocused,
+            EventPayload::Text(BoundedText::new_truncated(&workspace_name)),
+            seq,
+        );
+        self.plugin_host.publish(event);
+
         Ok(index)
     }
 
@@ -803,6 +840,17 @@ impl Runtime {
         // this function. No-op without pending leaves.
         self.spawn_session_pending_for_active();
         self.pending_full_redraw = true;
+
+        // CTX-0907: emit workspace.focused event
+        let seq = self.plugin_host.publish_count();
+        let workspace_name = self.workspaces[index].name.clone();
+        let event = Event::new(
+            EventKind::WorkspaceFocused,
+            EventPayload::Text(BoundedText::new_truncated(&workspace_name)),
+            seq,
+        );
+        self.plugin_host.publish(event);
+
         true
     }
 
@@ -922,6 +970,11 @@ impl Runtime {
         // so capture them before the removal to drop any pending restores
         // they still hold (stale entries leak and misreport session state).
         let removed_leaves = self.workspaces[index].layout.leaf_ids();
+
+        // CTX-0907: capture workspace name and whether it's active before removal
+        let workspace_name = self.workspaces[index].name.clone();
+        let removing_active = index == self.active_workspace;
+
         self.workspaces.remove(index);
         for view in removed_leaves {
             self.session_pending.remove(&view);
@@ -1009,6 +1062,28 @@ impl Runtime {
         // with empty panes, and `workspace_switch` early-returns on the
         // already-active index so no later switch could rescue them.
         self.spawn_session_pending_for_active();
+
+        // CTX-0907: emit workspace.closed event, then workspace.focused if we removed the active one
+        let seq = self.plugin_host.publish_count();
+        let event = Event::new(
+            EventKind::WorkspaceClosed,
+            EventPayload::Text(BoundedText::new_truncated(&workspace_name)),
+            seq,
+        );
+        self.plugin_host.publish(event);
+
+        // CTX-0907: when removing the active workspace, emit workspace.focused for the replacement
+        if removing_active {
+            let new_name = &self.workspaces[self.active_workspace].name;
+            let seq = self.plugin_host.publish_count();
+            let event = Event::new(
+                EventKind::WorkspaceFocused,
+                EventPayload::Text(BoundedText::new_truncated(new_name)),
+                seq,
+            );
+            self.plugin_host.publish(event);
+        }
+
         self.pending_full_redraw = true;
     }
 
@@ -1077,8 +1152,11 @@ impl Runtime {
         if index >= self.workspaces.len() {
             return Err(String::from("no such workspace"));
         }
+
         let killed = self.kill_workspace_sessions(index);
+        // CTX-0907: event emission moved into remove_workspace to avoid duplication
         self.remove_workspace(index);
+
         Ok(killed)
     }
 

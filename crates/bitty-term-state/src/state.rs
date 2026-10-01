@@ -1335,6 +1335,12 @@ impl State {
             self.cursor.position.col = 0;
         }
         self.cursor.pending_wrap = false;
+        // CTX-0910: A wide character (width=2) requires two consecutive
+        // columns. If the terminal width is only 1 column, a wide character
+        // cannot be printed anywhere, even after wrapping. Drop it.
+        if glyph_width == 2 && self.width < 2 {
+            return;
+        }
         if glyph_width == 2 && self.cursor.position.col + 1 >= cols {
             if self.modes.auto_wrap {
                 // Single documented rule for a wide character at the final

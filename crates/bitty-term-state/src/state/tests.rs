@@ -1818,3 +1818,34 @@ fn ctx_0821_placeholder_erase_and_scroll_drop_deterministically() {
     assert!(s.kitty_unicode_runs_on_row(GRID_ROWS - 1).is_empty());
     assert!(s.check_invariants().is_ok());
 }
+
+#[test]
+fn ctx_0910_wide_char_on_single_column_grid_drops_instead_of_panic() {
+    // CTX-0910: When the terminal width is only 1 column, a wide character
+    // (which requires 2 columns) cannot be printed anywhere. It must be
+    // dropped rather than causing a panic when trying to write the spacer
+    // at col+1.
+    let mut s = State::new();
+    s.resize(1, 1);
+    assert_eq!(s.width(), 1);
+    assert_eq!(s.height(), 1);
+
+    // Print a wide character (U+2AAAA '𪪪' takes 2 cells)
+    prints(&mut s, "𪪪");
+
+    // Should not panic, and the grid should remain empty since the wide
+    // character cannot fit
+    let snapshot = s.snapshot();
+    assert_eq!(snapshot.cells.len(), 1);
+    assert_eq!(snapshot.cells[0].glyph, ' ');
+    assert!(s.check_invariants().is_ok());
+
+    // Also test with auto_wrap disabled
+    let mut s = State::new();
+    s.resize(1, 1);
+    s.set_mode(bitty_vt::Mode::AutoWrap, false);
+    prints(&mut s, "𪪪");
+    let snapshot = s.snapshot();
+    assert_eq!(snapshot.cells[0].glyph, ' ');
+    assert!(s.check_invariants().is_ok());
+}

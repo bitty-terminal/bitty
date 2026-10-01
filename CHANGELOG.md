@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Workspace domain for Lua plugins (CTX-0889, #1569):** plugins can now read
+  workspace state and control workspace operations through two new capabilities:
+  `workspace.read` (query list, receive events) and `workspace.control` (focus,
+  create, close, rename, move panels). `bitty.workspace.list()` returns an array
+  of workspace summaries (id, name, active, panel_count, attention flags);
+  events `workspace.created`, `workspace.closed`, `workspace.renamed`,
+  `workspace.changed`, and `workspace.focused` are delivered to plugins with
+  `workspace.read`. Control functions `bitty.workspace.focus(id)`, `.new()`,
+  `.close(id)`, `.rename(id, name)`, and `.move_panel(id)` are gated by
+  `workspace.control` and match keybinding behavior (capacity limit, never-empty
+  last workspace, kill-confirm on live sessions). All APIs are bounded by
+  `MAX_WORKSPACES` (16) and coalesced per tick.
 - **Live configuration reload (CTX-0814, #1397):** `reconcile_live` now has a
   production caller. The composition root installs a reload context at startup
   (skipped under `--safe`), and both `bitty ctl config reload` and an automatic

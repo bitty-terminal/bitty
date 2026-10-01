@@ -260,7 +260,9 @@ pub use runtime::session::{
     SessionStartupOutcome, WorkspaceSnapshot, decode_session, encode_session, session_dir,
     session_dir_for, session_file, session_file_for, state_home, state_home_for,
 };
-pub use runtime::workspaces::{MAX_WORKSPACES, WsCloseRequest};
+pub use runtime::workspaces::{
+    MAX_WORKSPACES, WORKSPACE_NAME_MAX_CHARS, WorkspaceSummary, WsCloseRequest,
+};
 pub use runtime::{
     ActivationGesture, AnimationCurve, AnimationKind, AnimationPolicy, ClosingFrame,
     DEFAULT_PASTE_CONFIRM_TIMEOUT, DEFAULT_PLUGIN_DROP_POLICY, DEFAULT_PLUGIN_PIPELINE_CAPACITY,

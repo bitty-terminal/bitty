@@ -46,6 +46,10 @@ use bitty_plugin_host::grant::GrantRecord;
 use bitty_plugin_host::host::PluginHost;
 use bitty_plugin_host::manifest::{PluginId, PluginManifest};
 
+pub use bitty_lua::{
+    WORKSPACE_LIST_MAX_ITEMS, WORKSPACE_NAME_MAX_CHARS as WORKSPACE_INFO_NAME_MAX_CHARS,
+    WORKSPACE_RENAME_MAX_BYTES, WorkspaceAttention, WorkspaceInfo, WorkspaceRequest,
+};
 pub use fs::{FakeFileSystem, FileSystem, NativeFileSystem, write_atomic_durably};
 pub use resolution::{
     CURRENT_POINTER_FILE, PLUGIN_INDEX_STATE_VERSION, PluginRecord, content_digest, load_index,
@@ -53,8 +57,9 @@ pub use resolution::{
 };
 pub use services::{
     EmptyEnv, EmptySettings, EnvSource, MAX_ENV_GRANTS, MAX_ENV_VALUE_BYTES, MapEnv, Notification,
-    NotificationQueue, PluginServices, ProcessEnv, ServiceDirectory, ServiceRecord, SettingsSource,
-    SnapshotSource, UiAccess, UiBlock, UiBlocks, UnavailableSnapshot,
+    NotificationQueue, PluginServices, ProcessEnv, QueuedWorkspaceRequest, ServiceDirectory,
+    ServiceRecord, SettingsSource, SnapshotSource, UiAccess, UiBlock, UiBlocks,
+    UnavailableSnapshot, UnavailableWorkspaces, WorkspaceRequestQueue, WorkspaceSource,
 };
 pub use store::PluginStore;
 // Bridge value/error types the host-service traits are expressed in, so the
@@ -74,6 +79,43 @@ pub const PLUGIN_MODULE_PATH_MAX_BYTES: usize = 1024;
 pub const PLUGIN_INIT_MAX_BYTES: usize = 1024 * 1024;
 /// Notification queue capacity (`RC-8` rate governance candidate).
 pub const NOTIFICATION_QUEUE_CAPACITY: usize = 64;
+
+/// Bound on queued `bitty.workspace.*` mutation requests across all plugins
+/// between two app ticks (CTX-0889).
+///
+/// Twice [`WORKSPACE_LIST_MAX_ITEMS`]: enough for a plugin to create or
+/// close every workspace in one tick, small enough that a hostile loop
+/// cannot queue unbounded work. Overflow drops the newest request and the
+/// Lua call returns `false`.
+pub const WORKSPACE_REQUEST_QUEUE_CAPACITY: usize = 2 * WORKSPACE_LIST_MAX_ITEMS;
+
+/// Event-kind prefix of the workspace domain (CTX-0889, ADR-0014).
+///
+/// Kinds under this prefix carry workspace identity, so declaring,
+/// subscribing to, tracing, or receiving them requires `workspace.read`.
+pub const WORKSPACE_EVENT_PREFIX: &str = "workspace.";
+
+/// Workspace event kinds the host publishes (CTX-0889). Spellings are
+/// candidates pending OQ-056.
+pub const WORKSPACE_EVENT_KINDS: &[&str] = &[
+    "workspace.created",
+    "workspace.closed",
+    "workspace.renamed",
+    "workspace.focused",
+    "workspace.changed",
+];
+
+// The Lua-side workspace bounds mirror the Core slot-table bounds exactly;
+// drift would let `bitty.workspace.list()` silently drop real workspaces.
+const _: () = assert!(WORKSPACE_LIST_MAX_ITEMS == crate::MAX_WORKSPACES);
+const _: () = assert!(WORKSPACE_INFO_NAME_MAX_CHARS == crate::WORKSPACE_NAME_MAX_CHARS);
+
+/// Whether `kind` is a workspace-domain event kind (prefix match, so a
+/// future kind under the prefix is gated before it is published).
+#[must_use]
+pub fn is_workspace_event(kind: &str) -> bool {
+    kind.starts_with(WORKSPACE_EVENT_PREFIX)
+}
 
 /// Closed source-class set (RFC B.1): `bundled`, `registry`, `git`, `local-path`.
 ///
@@ -482,6 +524,12 @@ pub struct PluginRuntime {
     /// CTX-0897: per-owner event traces for `bitty.debug.trace`, fed by
     /// [`PluginRuntime::deliver_event`].
     trace_hub: Rc<RefCell<debug::TraceHub>>,
+    /// CTX-0889: optional workspace read source for `bitty.workspace.list`.
+    /// `None` leaves granted reads failing closed with `E_NOT_IMPLEMENTED`.
+    workspace_source: Option<Rc<dyn WorkspaceSource>>,
+    /// CTX-0889: bounded queue of `workspace.control` mutations, drained by
+    /// the application each tick ([`PluginRuntime::drain_workspace_requests`]).
+    workspace_requests: Rc<RefCell<WorkspaceRequestQueue>>,
     /// CTX-0846 (#1454): optional shared network runtime. `None` (the
     /// default) means the host has no network backend, so `bitty.network`
     /// is never registered in any plugin VM. When `Some`, the same runtime
@@ -523,6 +571,10 @@ impl PluginRuntime {
             service_directory: Rc::new(RefCell::new(ServiceDirectory::new())),
             debug_view: Rc::new(RefCell::new(debug::DebugView::new())),
             trace_hub: Rc::new(RefCell::new(debug::TraceHub::new())),
+            workspace_source: None,
+            workspace_requests: Rc::new(RefCell::new(WorkspaceRequestQueue::new(
+                WORKSPACE_REQUEST_QUEUE_CAPACITY,
+            ))),
             #[cfg(feature = "network")]
             network_runtime: None,
             store_fs: Arc::new(NativeFileSystem),
@@ -623,6 +675,28 @@ impl PluginRuntime {
     /// Drain accepted notifications (async hand-off side).
     pub fn drain_notifications(&mut self) -> Vec<Notification> {
         self.notifications.borrow_mut().drain()
+    }
+
+    /// Install the workspace read source for `bitty.workspace.list`
+    /// (CTX-0889). Call before activation: each generation captures the
+    /// source when its services are built.
+    pub fn set_workspace_source(&mut self, source: Rc<dyn WorkspaceSource>) {
+        self.workspace_source = Some(source);
+    }
+
+    /// Drain queued `bitty.workspace.*` mutations in FIFO order (CTX-0889).
+    ///
+    /// The application applies each request on its own thread through the
+    /// Core handlers the keybindings use. Bounded by
+    /// [`WORKSPACE_REQUEST_QUEUE_CAPACITY`].
+    pub fn drain_workspace_requests(&mut self) -> Vec<QueuedWorkspaceRequest> {
+        self.workspace_requests.borrow_mut().drain()
+    }
+
+    /// Workspace requests dropped by queue overflow since creation.
+    #[must_use]
+    pub fn workspace_requests_dropped(&self) -> u64 {
+        self.workspace_requests.borrow().dropped()
     }
 
     /// Scan the configured roots and register every valid package.
@@ -876,6 +950,33 @@ impl PluginRuntime {
         let debug_trace = granted
             .iter()
             .any(|capability| capability.as_str() == "debug.trace");
+        // CTX-0889: the workspace domain grants are independent (read never
+        // implies control, control never implies read).
+        let workspace_read = granted
+            .iter()
+            .any(|capability| capability.as_str() == "workspace.read");
+        let workspace_control = granted
+            .iter()
+            .any(|capability| capability.as_str() == "workspace.control");
+        // CTX-0889 fail-closed: declaring a `workspace.*` event kind (which
+        // admits both subscription and `debug.trace` observation) requires
+        // `workspace.read`. Reject before any VM exists instead of letting
+        // the subscription silently never fire.
+        if !workspace_read {
+            if let Some(kind) = manifest
+                .lazy
+                .events
+                .iter()
+                .find(|kind| is_workspace_event(kind))
+            {
+                let error = PluginRuntimeError::Capture {
+                    plugin: id.to_string(),
+                    detail: format!("event '{kind}' requires the 'workspace.read' capability"),
+                };
+                self.rollback(id, error.to_string());
+                return Err(error);
+            }
+        }
         let plugin_services = Rc::new(PluginServices::new(
             id.as_str(),
             store,
@@ -915,6 +1016,12 @@ impl PluginRuntime {
         plugin_services.set_declared_events(manifest.lazy.events.iter().cloned().collect());
         plugin_services.set_debug_view(self.debug_view.clone());
         plugin_services.set_trace_hub(self.trace_hub.clone());
+        // CTX-0889: workspace L1 domain gates plus the shared backend.
+        plugin_services.set_workspace_access(workspace_read, workspace_control);
+        plugin_services.set_workspace_backend(
+            self.workspace_source.clone(),
+            Some(self.workspace_requests.clone()),
+        );
         plugin_services.set_service_manifest(
             manifest.provided_services.clone(),
             manifest.required_services.clone(),
@@ -1339,10 +1446,21 @@ impl PluginRuntime {
             ("payload", payload.clone()),
         ]);
         self.record_trace(kind, payload);
+        // CTX-0889: workspace events reach only generations holding
+        // `workspace.read` (defense in depth: activation already rejects
+        // undeclared-grant workspace kinds).
+        let workspace_kind = is_workspace_event(kind);
         let ids: Vec<PluginId> = self
             .entries
             .iter()
             .filter(|(_, entry)| entry.state == LifecycleState::Active)
+            .filter(|(_, entry)| {
+                !workspace_kind
+                    || entry
+                        .services
+                        .as_ref()
+                        .is_some_and(|services| services.has_workspace_read())
+            })
             .map(|(id, _)| id.clone())
             .collect();
         let mut delivered = 0usize;

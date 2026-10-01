@@ -19,8 +19,10 @@ path = "src/main.rs"
 
 [dependencies]
 bitty-config = { path = "../bitty-config" }
-bitty-ipc = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "0bec791" }
-bitty-perf = { path = "../bitty-perf" }
+bitty-ipc = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "e9714e7" }
+# CTX-0918: developer-only PB-1/PB-4 tracing for `bitty dev trace`; opt-in
+# via the `dev-perf` feature so release builds do not link the perf harness.
+bitty-perf = { path = "../bitty-perf", optional = true }
 bitty-platform = { path = "../bitty-platform" }
 bitty-plugin-host = { path = "../bitty-plugin-host" }
 bitty-runtime = { path = "../bitty-runtime" }
@@ -30,7 +32,12 @@ bitty-term-state = { path = "../bitty-term-state" }
 bitty-vt = { path = "../bitty-vt" }
 pollster = { workspace = true }
 
+[features]
+default = []
+# Enables `bitty dev trace startup|latency` (links `bitty-perf`).
+dev-perf = ["dep:bitty-perf"]
+
 [dev-dependencies]
 # Hermetic `ServeContext` constructors and unbound bearer minters (#1519).
-bitty-ipc = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "0bec791", features = ["test-support"] }
+bitty-ipc = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "e9714e7", features = ["test-support"] }
 bitty-test-support = { path = "../bitty-test-support" }

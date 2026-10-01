@@ -109,6 +109,11 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # CTX-0918: `bitty dev trace` is compiled only with the opt-in
+      # `dev-perf` feature; lint that configuration too so it cannot rot.
+      - name: Run Clippy (bitty-terminal dev-perf feature)
+        run: cargo clippy -p bitty-terminal --features dev-perf --all-targets --locked -- -D warnings
+
       # #1519 / CTX-0855: hermetic `test-support` entry points (bitty-ipc's
       # authority-less ServeContext constructors and unbound bearer minters)
       # may be enabled only from dev-dependencies. Clippy above always builds
@@ -136,12 +141,18 @@ jobs:
         run: cargo test -p bitty-platform --test headless_run --test winit_window --locked
 
       # CTX-0847: the previous `cargo test --all-targets` also executed the
-      # bitty-perf benches and the bitty-ipc example; nextest runs neither, so
-      # keep that coverage explicitly here.
-      - name: Run benches and examples
-        run: |
-          cargo test -p bitty-perf --benches --locked
-          cargo test -p bitty-ipc --examples --locked
+      # bitty-perf benches; nextest runs none of them, so keep that coverage
+      # explicitly here. The bitty-ipc example moved with the CTX-1585
+      # extraction to the independent bitty-ipc repository (own CI) and is no
+      # longer a workspace member here.
+      - name: Run benches
+        run: cargo test -p bitty-perf --benches --locked
+
+      # CTX-0918: the default nextest run covers the compiled-out
+      # `bitty dev trace` error path; rerun the CLI suite with the opt-in
+      # `dev-perf` feature so the trace success paths stay covered.
+      - name: Run bitty dev trace tests (dev-perf feature)
+        run: cargo test -p bitty-terminal --features dev-perf --test cli_dev --locked
 
       # M1-10 / CTX-0574: pin the M1 matrix driver's reporting logic (suite
       # floors, ignored-test rejection, aggregate failure modes, step summary)
@@ -329,13 +340,12 @@ jobs:
         run: xvfb-run -a cargo test -p bitty-platform --test headless_run --test winit_window --locked
 
       # CTX-0847: the previous `--all-targets` run also executed the bitty-perf
-      # benches and the bitty-ipc example; nextest runs neither, so keep that
-      # coverage explicitly here (headless, opt-in benches exit 0 with
-      # UNMEASURED without their BITTY_PERF_* env gates).
-      - name: Run benches and examples (X11)
-        run: |
-          cargo test -p bitty-perf --benches --locked
-          cargo test -p bitty-ipc --examples --locked
+      # benches; nextest runs none of them, so keep that coverage explicitly
+      # here (headless, opt-in benches exit 0 with UNMEASURED without their
+      # BITTY_PERF_* env gates). The bitty-ipc example moved with the
+      # CTX-1585 extraction to the independent bitty-ipc repository (own CI).
+      - name: Run benches (X11)
+        run: cargo test -p bitty-perf --benches --locked
 
       # M1-10 / CTX-0574: run the M1 evidence suites by name so a
       # per-platform regression is a distinct, reported result instead of
@@ -452,12 +462,11 @@ jobs:
         run: cargo test -p bitty-platform --test headless_run --test winit_window --locked
 
       # CTX-0847: the previous `--all-targets` run also executed the bitty-perf
-      # benches and the bitty-ipc example; nextest runs neither, so keep that
-      # coverage explicitly here.
-      - name: Run benches and examples (Wayland)
-        run: |
-          cargo test -p bitty-perf --benches --locked
-          cargo test -p bitty-ipc --examples --locked
+      # benches; nextest runs none of them, so keep that coverage explicitly
+      # here. The bitty-ipc example moved with the CTX-1585 extraction to the
+      # independent bitty-ipc repository (own CI).
+      - name: Run benches (Wayland)
+        run: cargo test -p bitty-perf --benches --locked
 
       # M1-10 / CTX-0574: Wayland leg of the M1 compatibility matrix. The M1
       # suites are display-independent; the Wayland env above only proves the
@@ -548,12 +557,11 @@ jobs:
         run: cargo test -p bitty-platform --test headless_run --test winit_window --locked
 
       # CTX-0847: the previous `--all-targets` run also executed the bitty-perf
-      # benches and the bitty-ipc example; nextest runs neither, so keep that
-      # coverage explicitly here.
-      - name: Run benches and examples (macOS ARM64)
-        run: |
-          cargo test -p bitty-perf --benches --locked
-          cargo test -p bitty-ipc --examples --locked
+      # benches; nextest runs none of them, so keep that coverage explicitly
+      # here. The bitty-ipc example moved with the CTX-1585 extraction to the
+      # independent bitty-ipc repository (own CI).
+      - name: Run benches (macOS ARM64)
+        run: cargo test -p bitty-perf --benches --locked
 
       # M1-10 / CTX-0574: macOS ARM64 leg of the M1 compatibility matrix. The
       # suites are headless and free of window/font/GPU dependencies, so the

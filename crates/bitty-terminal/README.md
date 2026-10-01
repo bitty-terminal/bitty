@@ -17,8 +17,14 @@ libraries, as stated in `src/main.rs`.
 ## Boundaries
 
 - Workspace-internal dependencies, per `Cargo.toml`: `bitty-config`,
-  `bitty-ipc`, `bitty-perf`, `bitty-platform`, `bitty-plugin-host`,
-  `bitty-render`, `bitty-runtime`, and `bitty-term-state`.
+  `bitty-platform`, `bitty-plugin-host`, `bitty-render`, `bitty-rich`,
+  `bitty-runtime`, `bitty-term-state`, and `bitty-vt`; external git
+  dependency: `bitty-ipc` (independent repository since CTX-1585), linked as
+  Core's inbound local socket mechanism. No agent crate is linked.
+- Opt-in cargo feature `dev-perf` (off by default, CTX-0918) adds the
+  `bitty-perf` dependency for `bitty dev trace startup|latency`. Without it
+  the verb still validates its arguments and then fails with exit 1 and
+  `built without dev-perf feature`.
 - Third-party dependencies, per `Cargo.toml`: `pollster` only; no
   network-facing dependency is declared.
 - Must not own business behavior: grid, parsing, rendering, plugin, and IPC

@@ -16,6 +16,11 @@
 //!   - `trace latency [--iterations N]` — headless PB-4 key-to-screen tracing
 //!     via `bitty-perf::latency::measure_latency` (bounded synthetic keys,
 //!     echo model, stage breakdown, p50/p99/mean/max).
+//!   - Both `trace` subverbs link `bitty-perf` only when the binary is built
+//!     with the opt-in `dev-perf` cargo feature (off by default, CTX-0918).
+//!     Without it the arguments are still validated (usage errors exit 2)
+//!     and a valid request fails with exit 1 and
+//!     [`TRACE_DISABLED_MESSAGE`] ("built without dev-perf feature").
 //!   - `synthesize` — fixed local input trajectory plus the paste-gate
 //!     probe: [`SYNTH_TRAJECTORY_LEN`] printable keys through the headless
 //!     input path (protocol `synthesizeInput` local-class parity), then the
@@ -430,7 +435,7 @@ impl DevParseError {
 /// Short usage for stderr (fail-closed exit 2 trailer).
 #[must_use]
 pub fn dev_usage() -> String {
-    "usage: bitty dev <trace|capture|synthesize|dump|overlay> [args] [--format table|json|jsonl] [--no-color]\n       bitty dev trace <startup|latency> [--iterations N]\n       bitty dev capture [--layout single|split|stack|overlay]\n       bitty dev synthesize\n       bitty dev dump <grid|scene|atlas> [--rows N] [--cols N]\n       bitty dev overlay <list|show <damage|cells|glyphs|images|layout|banner>>\n\nverbs:\n  trace     headless PB-1 startup / PB-4 latency tracing (bitty-perf, local)\n  capture   deterministic headless frame capture (stats + RGBA hash, local)\n  synthesize  fixed local input trajectory plus paste-gate probe (receipt, local)\n  dump      grid text / scene / atlas dumps from a headless capture (local)\n  overlay   renderer-overlay catalog and headless proofs (local; GPU-bound entries deferred)"
+    "usage: bitty dev <trace|capture|synthesize|dump|overlay> [args] [--format table|json|jsonl] [--no-color]\n       bitty dev trace <startup|latency> [--iterations N]\n       bitty dev capture [--layout single|split|stack|overlay]\n       bitty dev synthesize\n       bitty dev dump <grid|scene|atlas> [--rows N] [--cols N]\n       bitty dev overlay <list|show <damage|cells|glyphs|images|layout|banner>>\n\nverbs:\n  trace     headless PB-1 startup / PB-4 latency tracing (bitty-perf, local;\n            requires a build with the `dev-perf` cargo feature)\n  capture   deterministic headless frame capture (stats + RGBA hash, local)\n  synthesize  fixed local input trajectory plus paste-gate probe (receipt, local)\n  dump      grid text / scene / atlas dumps from a headless capture (local)\n  overlay   renderer-overlay catalog and headless proofs (local; GPU-bound entries deferred)"
         .to_string()
 }
 
@@ -445,6 +450,9 @@ pub fn dev_help_text() -> String {
        trace startup                 Headless PB-1 startup phases (bitty-perf).\n  \
        trace latency [--iterations N]  Headless PB-4 key-to-screen trace\n  \
                                      (default 20, range 1..=1000).\n  \
+                                     trace requires a build with the\n  \
+                                     `dev-perf` cargo feature; without it\n  \
+                                     the verb fails with exit 1.\n  \
        capture [--layout SPEC]       Deterministic headless frame capture:\n  \
                                      SPEC = single|split|stack|overlay\n  \
                                      (default single). Reports present stats,\n  \
@@ -1216,6 +1224,30 @@ struct DevOutput {
     result_json: String,
 }
 
+/// Diagnostic returned by `bitty dev trace` when the binary was built
+/// without the opt-in `dev-perf` cargo feature (CTX-0918). Parsing still
+/// validates the arguments, so usage errors keep exiting 2.
+#[cfg_attr(feature = "dev-perf", allow(dead_code))] // Only the cfg-off path reports it.
+pub const TRACE_DISABLED_MESSAGE: &str = "bitty dev trace: built without dev-perf feature \
+     (rebuild with `cargo build -p bitty-terminal --features dev-perf`)";
+
+/// Runs a validated trace request, or reports that tracing is compiled out.
+#[cfg(feature = "dev-perf")]
+#[allow(clippy::unnecessary_wraps)] // Uniform `Result` shape with the cfg-off path.
+fn trace_output(request: &DevRequest) -> Result<DevOutput, String> {
+    match request {
+        DevRequest::TraceLatency { iterations } => Ok(trace_latency_output(*iterations)),
+        _ => Ok(trace_startup_output()),
+    }
+}
+
+/// Runs a validated trace request, or reports that tracing is compiled out.
+#[cfg(not(feature = "dev-perf"))]
+fn trace_output(_request: &DevRequest) -> Result<DevOutput, String> {
+    Err(TRACE_DISABLED_MESSAGE.to_string())
+}
+
+#[cfg(feature = "dev-perf")]
 fn trace_startup_output() -> DevOutput {
     let report = bitty_perf::startup::measure_headless_startup();
     let table = report.format_timeline();
@@ -1273,6 +1305,7 @@ fn trace_startup_output() -> DevOutput {
     }
 }
 
+#[cfg(feature = "dev-perf")]
 fn trace_latency_output(iterations: usize) -> DevOutput {
     let report = bitty_perf::latency::measure_latency(iterations);
     let table = report.format_summary();
@@ -1733,8 +1766,7 @@ fn overlay_show_output(name: OverlayName) -> Result<DevOutput, String> {
 ///   stderr-only diagnostics for table.
 pub fn run_dev(request: &DevRequest, options: &DevOptions) -> i32 {
     let outcome: Result<DevOutput, String> = match request {
-        DevRequest::TraceStartup => Ok(trace_startup_output()),
-        DevRequest::TraceLatency { iterations } => Ok(trace_latency_output(*iterations)),
+        DevRequest::TraceStartup | DevRequest::TraceLatency { .. } => trace_output(request),
         DevRequest::Capture { layout } => capture_output(*layout),
         DevRequest::Synthesize => synthesize_output(),
         DevRequest::DumpGrid { rows, cols } => dump_grid_output(*rows, *cols),

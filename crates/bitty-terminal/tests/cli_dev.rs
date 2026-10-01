@@ -140,6 +140,7 @@ fn unknown_verb_names_valid_set() {
     assert!(output.stdout.is_empty());
 }
 
+#[cfg(feature = "dev-perf")]
 #[test]
 fn trace_startup_table_reports_phases() {
     let output = spawn_dev(&["dev", "trace", "startup"], &[]);
@@ -156,6 +157,7 @@ fn trace_startup_table_reports_phases() {
     assert!(stdout.contains("verdict:"), "verdict: {stdout:?}");
 }
 
+#[cfg(feature = "dev-perf")]
 #[test]
 fn trace_startup_json_envelope() {
     let output = spawn_dev(&["dev", "trace", "startup", "--format", "json"], &[]);
@@ -166,6 +168,7 @@ fn trace_startup_json_envelope() {
     assert!(stdout.contains("\"total_ms\":"), "total: {stdout:?}");
 }
 
+#[cfg(feature = "dev-perf")]
 #[test]
 fn trace_latency_table_and_json() {
     let output = spawn_dev(&["dev", "trace", "latency", "--iterations", "3"], &[]);
@@ -196,6 +199,39 @@ fn trace_latency_table_and_json() {
     let stdout = stdout_text(&output);
     assert_dev_envelope(&stdout, "trace");
     assert!(stdout.contains("\"p50_ms\":"), "p50: {stdout:?}");
+}
+
+/// CTX-0918: without the opt-in `dev-perf` feature the trace verb stays
+/// parseable but fails closed with a clear diagnostic instead of vanishing.
+#[cfg(not(feature = "dev-perf"))]
+#[test]
+fn trace_without_dev_perf_feature_fails_with_clear_error() {
+    for args in [
+        vec!["dev", "trace", "startup"],
+        vec!["dev", "trace", "latency", "--iterations", "3"],
+    ] {
+        let output = spawn_dev(&args, &[]);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "want exit 1 for {args:?}, stderr={:?}",
+            stderr_text(&output)
+        );
+        let stderr = stderr_text(&output);
+        assert!(
+            stderr.contains("built without dev-perf feature"),
+            "stderr={stderr:?}"
+        );
+        assert!(output.stdout.is_empty(), "table mode: no stdout");
+    }
+    let output = spawn_dev(&["dev", "trace", "startup", "--format", "json"], &[]);
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = stdout_text(&output);
+    assert!(stdout.contains("\"ok\":false"), "envelope: {stdout:?}");
+    assert!(
+        stdout.contains("built without dev-perf feature"),
+        "envelope: {stdout:?}"
+    );
 }
 
 #[test]

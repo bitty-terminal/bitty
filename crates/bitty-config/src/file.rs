@@ -1984,6 +1984,85 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
         }
     };
 
+    // CTX-0890: `chrome = { top = { order = {...} }, bottom = { order = {...} } }`
+    // sets plugin chrome stacking order per edge; absent table/key means "says
+    // nothing". Plugin IDs validated below: charset, length, list bounds.
+    let chrome = match data.chrome {
+        None => None,
+        Some(c) => {
+            let top_order = match c.top_order {
+                None => Vec::new(),
+                Some(ids) => {
+                    if ids.len() > crate::types::MAX_CHROME_ORDER_ENTRIES {
+                        return Err(ConfigError::validation(
+                            "chrome.top.order",
+                            format!(
+                                "list exceeds maximum {} entries",
+                                crate::types::MAX_CHROME_ORDER_ENTRIES
+                            ),
+                        ));
+                    }
+                    for (idx, id) in ids.iter().enumerate() {
+                        if id.len() > crate::types::MAX_PLUGIN_ID_LEN {
+                            return Err(ConfigError::validation(
+                                format!("chrome.top.order[{}]", idx + 1),
+                                format!(
+                                    "plugin id exceeds maximum {} bytes",
+                                    crate::types::MAX_PLUGIN_ID_LEN
+                                ),
+                            ));
+                        }
+                        if id.is_empty() {
+                            return Err(ConfigError::validation(
+                                format!("chrome.top.order[{}]", idx + 1),
+                                "plugin id must not be empty",
+                            ));
+                        }
+                    }
+                    ids
+                }
+            };
+            let bottom_order = match c.bottom_order {
+                None => Vec::new(),
+                Some(ids) => {
+                    if ids.len() > crate::types::MAX_CHROME_ORDER_ENTRIES {
+                        return Err(ConfigError::validation(
+                            "chrome.bottom.order",
+                            format!(
+                                "list exceeds maximum {} entries",
+                                crate::types::MAX_CHROME_ORDER_ENTRIES
+                            ),
+                        ));
+                    }
+                    for (idx, id) in ids.iter().enumerate() {
+                        if id.len() > crate::types::MAX_PLUGIN_ID_LEN {
+                            return Err(ConfigError::validation(
+                                format!("chrome.bottom.order[{}]", idx + 1),
+                                format!(
+                                    "plugin id exceeds maximum {} bytes",
+                                    crate::types::MAX_PLUGIN_ID_LEN
+                                ),
+                            ));
+                        }
+                        if id.is_empty() {
+                            return Err(ConfigError::validation(
+                                format!("chrome.bottom.order[{}]", idx + 1),
+                                "plugin id must not be empty",
+                            ));
+                        }
+                    }
+                    ids
+                }
+            };
+            Some(crate::types::ChromeConfig {
+                top_order,
+                bottom_order,
+                left_order: Vec::new(),
+                right_order: Vec::new(),
+            })
+        }
+    };
+
     let plan = ConfigPlan {
         schema_version: None,
         font,
@@ -1993,6 +2072,7 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
         close_confirm,
         layout,
         workspace,
+        chrome,
         decoration,
         views,
         scrollbar,

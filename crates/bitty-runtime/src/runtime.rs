@@ -362,6 +362,37 @@ pub const SYNC_UPDATE_DEFER_TIMEOUT: std::time::Duration = std::time::Duration::
 /// confirm action; `Esc` cancels.
 pub const PASTE_BANNER_FLASH_TEXT: &str = "Paste pending (paste again to confirm, Esc cancels)";
 
+/// Plugin-mounted chrome bands per edge (CTX-0890, part of #1431).
+///
+/// Holds `UiNode` trees mounted by plugins via `bitty.ui.mount(slot, tree)`.
+/// Each edge may have multiple bands (one per plugin), stacked according to
+/// `chrome.<edge>.order` config or plugin id byte order. Bands are reserved
+/// only when a plugin mounts to that edge; empty = no band.
+#[derive(Debug, Clone, Default)]
+pub struct ChromeBands {
+    /// Top edge bands (stacked top-to-bottom).
+    pub top: Vec<BandContent>,
+    /// Bottom edge bands (stacked bottom-to-top).
+    pub bottom: Vec<BandContent>,
+    /// Left edge bands (stacked left-to-right, deferred for v0.1).
+    pub left: Vec<BandContent>,
+    /// Right edge bands (stacked right-to-left, deferred for v0.1).
+    pub right: Vec<BandContent>,
+}
+
+/// Single band content from one plugin mount (CTX-0890).
+#[derive(Debug, Clone)]
+pub struct BandContent {
+    /// Owning plugin id.
+    pub plugin_id: String,
+    /// Slot name ("top", "bottom", "left", "right").
+    pub slot: String,
+    /// Root UiNode tree.
+    pub root: bitty_lua::ui::UiNode,
+    /// Mount version (incremented on remount).
+    pub version: u32,
+}
+
 pub struct Runtime {
     config: RuntimeConfig,
     parser: Parser,
@@ -501,6 +532,15 @@ pub struct Runtime {
     /// [`RuntimeConfig::workspace_bar_edge`]; live changes go through
     /// [`Runtime::set_workspace_bar_edge`] and reflow.
     workspace_bar_edge: crate::config::BarEdge,
+    /// Plugin-mounted chrome bands per edge (CTX-0890, part of #1431).
+    ///
+    /// Populated from `PluginRuntime::ui_blocks()` each tick after plugin
+    /// runtime tick, before present. Bands are reserved for plugins that
+    /// mount `UiNode` trees to top/bottom/left/right slots via
+    /// `bitty.ui.mount(slot, tree)`. Empty edges reserve no band. The
+    /// container rect is computed from window_cells minus all reserved bands.
+    /// Presentation-only: never grid truth.
+    chrome_bands: ChromeBands,
     /// Full window grid in cells (CTX-0873). The layout `container` is this
     /// rect minus the reserved chrome band
     /// ([`chrome_band::solve`]); resize and the `set_window_cells` seam set it.
@@ -1423,6 +1463,12 @@ impl Runtime {
             cw_hint_session: bitty_rich::hints::HintSession::new(),
             cw_hint_operator: None,
             cw_hint_label: String::new(),
+            chrome_bands: ChromeBands {
+                top: Vec::new(),
+                bottom: Vec::new(),
+                left: Vec::new(),
+                right: Vec::new(),
+            },
         };
         // CTX-0355: install the resolved palette on both the renderer (cell
         // defaults, ANSI, emitted fills) and the surface (clear color).
@@ -1639,6 +1685,12 @@ impl Runtime {
             cw_hint_session: bitty_rich::hints::HintSession::new(),
             cw_hint_operator: None,
             cw_hint_label: String::new(),
+            chrome_bands: ChromeBands {
+                top: Vec::new(),
+                bottom: Vec::new(),
+                left: Vec::new(),
+                right: Vec::new(),
+            },
         };
         // CTX-0355: install the resolved palette on both the renderer (cell
         // defaults, ANSI, emitted fills) and the surface (clear color).
@@ -1830,6 +1882,14 @@ impl Runtime {
     #[must_use]
     pub fn config(&self) -> &RuntimeConfig {
         &self.config
+    }
+
+    /// Chrome bands for all edges (CTX-0890).
+    ///
+    /// Returns mounted plugin UI trees per edge for compositor rendering.
+    #[must_use]
+    pub fn chrome_bands(&self) -> &ChromeBands {
+        &self.chrome_bands
     }
 
     /// Sets the panel-overlay modal bit (CTX-0482, issue #763).

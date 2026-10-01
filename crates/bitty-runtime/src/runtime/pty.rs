@@ -698,6 +698,23 @@ impl Runtime {
     /// No cache re-attribution here: callers own it at their boundary so the
     /// pane-swap pair never caches the temporarily swapped-in grid.
     pub(super) fn handle_pty_bytes_inner(&mut self, bytes: &[u8]) {
+        // CTX-0904: IMG-4 in-flight bound (256 MiB across all parsers).
+        // Check total pending Kitty bytes before advancing; if over budget,
+        // drop the input and warn. Fail closed: no partial parse, no buffering
+        // past the cap. The budget resets once streams complete or abort.
+        let inflight = self.total_kitty_inflight_bytes();
+        if inflight > bitty_rich::KITTY_PLACE_MAX_BYTES {
+            // Rate-limited (same pattern as OSC 52 / kitty decode warnings):
+            // a hostile child can flood stalled streams; bound stderr.
+            if let Some(suppressed) = self.kitty_log.admit_now() {
+                eprintln!(
+                    "bitty: dropping input: {inflight} bytes in-flight kitty streams exceed IMG-4 cap ({} MiB){}",
+                    bitty_rich::KITTY_PLACE_MAX_BYTES / (1024 * 1024),
+                    log_throttle::suppressed_suffix(suppressed)
+                );
+            }
+            return;
+        }
         // CTX-0146: pre-scan overlap ++ new bytes for parameterized queries
         // (DECRQM mode numbers, XTGETTCAP payloads, secondary-DA request
         // forms, XTWINOPS 14/18 ops). Bounded scans; matches ending inside the overlap were
@@ -872,13 +889,15 @@ impl Runtime {
                     }
                 }
             }
-            // Kitty graphics (CTX-0256): the parser already base64-unwrapped
-            // and reassembled `m=` chunks under the ledger cap, so `payload`
-            // is decoded bytes ready for the existing intake seam. Route to
-            // `kitty_display_image`, preserving transmit-only (`a=t` stores
-            // without painting) and unknown-action (stored-not-painted)
-            // semantics from CTX-0248. Failures store nothing and paint
-            // nothing; warn loudly (parser already warned on base64/caps).
+            // Kitty graphics (CTX-0256, CTX-0904): the parser already
+            // base64-unwrapped and reassembled `m=` chunks under the ledger
+            // cap, so `payload` is decoded bytes ready for the existing intake
+            // seam. Route to `kitty_display_image_owned`, which moves the
+            // payload to avoid copying raw f=24/f=32 streams. Preserves
+            // transmit-only (`a=t` stores without painting) and unknown-action
+            // (stored-not-painted) semantics from CTX-0248. Failures store
+            // nothing and paint nothing; warn loudly (parser already warned on
+            // base64/caps).
             if let TerminalAction::KittyGraphics {
                 format_f,
                 width_s,
@@ -888,16 +907,16 @@ impl Runtime {
                 rows_r,
                 cursor_movement_c,
                 payload,
-            } = &action
+            } = action
             {
-                if let Err(err) = self.kitty_display_image(
-                    *format_f,
-                    *width_s,
-                    *height_v,
-                    *action_a,
-                    *cols_c,
-                    *rows_r,
-                    *cursor_movement_c,
+                if let Err(err) = self.kitty_display_image_owned(
+                    format_f,
+                    width_s,
+                    height_v,
+                    action_a,
+                    cols_c,
+                    rows_r,
+                    cursor_movement_c,
                     payload,
                     0,
                 ) {
@@ -910,6 +929,9 @@ impl Runtime {
                         );
                     }
                 }
+                // state.apply is a no-op for KittyGraphics (state.rs:1253),
+                // and we already moved the action, so continue to the next one.
+                continue;
             }
             let damage = self.state.apply(&action);
             if !damage.regions.is_empty() {

@@ -1892,6 +1892,16 @@ impl Runtime {
         &self.chrome_bands
     }
 
+    /// Updates chrome bands from plugin runtime (CTX-0911, issue #1570).
+    ///
+    /// Accepts a plain `ChromeBands` struct following the LiveSnapshot pattern:
+    /// TerminalApp reads `PluginRuntime::ui_blocks()`, converts to this plain
+    /// struct, and pushes it into Runtime. bitty-runtime must not depend on
+    /// plugin_runtime types directly.
+    pub fn set_chrome_bands(&mut self, bands: ChromeBands) {
+        self.chrome_bands = bands;
+    }
+
     /// Sets the panel-overlay modal bit (CTX-0482, issue #763).
     ///
     /// The panel integration drives this from

@@ -2305,3 +2305,30 @@ fn apc_g_parser_chunked_stream_survives_small_interleaving() {
         other => panic!("expected KittyGraphics, got {other:?}"),
     }
 }
+
+#[test]
+fn apc_g_parser_esc_flood_in_discarded_apc_hits_stall_bound() {
+    let mut parser = Parser::new();
+    parser.advance(b"\x1b_Gf=32,s=2,v=2,m=1;/wAA//8A\x1b\\", |_| {});
+    assert!(parser.has_pending_kitty());
+    // A discarded non-`G` APC followed by an endless ESC run.
+    parser.advance(b"\x1b_X;", |_| {});
+    let flood = vec![0x1B; crate::kitty_apc::KITTY_APC_STALL_MAX_BYTES + 1];
+    parser.advance(&flood, |_| {});
+    assert!(
+        !parser.has_pending_kitty(),
+        "ESC flood must hit the stall bound"
+    );
+
+    // Same flood split into one-byte `advance` calls (held-ESC path).
+    let mut parser = Parser::new();
+    parser.advance(b"\x1b_Gf=32,s=2,v=2,m=1;/wAA//8A\x1b\\", |_| {});
+    parser.advance(b"\x1b_X;", |_| {});
+    for _ in 0..=crate::kitty_apc::KITTY_APC_STALL_MAX_BYTES {
+        parser.advance(&[0x1B], |_| {});
+    }
+    assert!(
+        !parser.has_pending_kitty(),
+        "split ESC flood must hit the bound"
+    );
+}

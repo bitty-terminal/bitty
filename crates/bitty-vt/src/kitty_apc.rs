@@ -54,9 +54,13 @@
 //!   partial upload), drops the open stream as well as the offending chunk.
 //! - Input that arrives while a stream is open but is not continuation
 //!   payload (text for the VT state machine, non-`G` or discarded `APC`
-//!   bytes) is counted; past [`KITTY_APC_STALL_MAX_BYTES`] the stream is
-//!   dropped, so a writer cannot pin its buffered payload by interleaving
-//!   other output. Every accepted continuation chunk resets the count.
+//!   bytes, and continuation headers themselves) is counted; past
+//!   [`KITTY_APC_STALL_MAX_BYTES`] the stream is dropped, so a writer cannot
+//!   pin its buffered payload by interleaving other output or by sending
+//!   empty `m=1` chunks. Only accepted payload bytes reset the count.
+//! - The bound counts bytes, not time: a writer that opens a stream and then
+//!   goes silent keeps it until more output arrives or the pane's parser is
+//!   dropped. The pinned amount stays within the stream's own declared size.
 
 use crate::diag::{RejectLog, warn_rejection};
 
@@ -659,8 +663,11 @@ impl KittyApcAssembler {
                     return Err(reason);
                 }
             };
-            if let Some(pending) = self.pending.as_mut() {
-                pending.interleaved = 0;
+            // The continuation header itself is not progress: only decoded
+            // payload resets the stall count (see `push_payload`), so a flood
+            // of empty `m=1` chunks is bounded too.
+            if self.note_interleaved(control.len().saturating_add(1)) {
+                return Err(KittyApcReject::Aborted);
             }
             self.current_final = Some(!more);
         } else {
@@ -703,6 +710,9 @@ impl KittyApcAssembler {
         }
         let result = match self.pending.as_mut() {
             Some(pending) => {
+                if !payload.is_empty() {
+                    pending.interleaved = 0;
+                }
                 let available = pending.limit.min(self.budget.payload_limit);
                 pending.push(payload, available, &mut self.budget)
             }
@@ -879,7 +889,6 @@ fn parse_control(control: &[u8]) -> Result<KittyApcParams, KittyApcReject> {
     })
 }
 
-/// Extracts the `m=` flag from a continuation buffer (`None` when absent).
 /// Keys of a continuation chunk that decide its fate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Continuation {
@@ -903,7 +912,9 @@ fn continuation_flags(control: &[u8]) -> Result<Continuation, KittyApcReject> {
         };
         let (key, value) = (&piece[..eq], &piece[eq + 1..]);
         match key {
-            b"m" if flags.more.is_none() => {
+            // Same rule as `parse_control`: the last `m=` wins and any
+            // malformed value rejects the chunk.
+            b"m" => {
                 flags.more = Some(match value {
                     b"0" => false,
                     b"1" => true,
@@ -1489,10 +1500,11 @@ mod tests {
             assembler.feed(b"Gf=32,s=2,v=2,m=1;/wAA//8A"),
             KittyFeedOutcome::NeedMore { .. }
         ));
-        // Exactly at the bound keeps the stream.
-        assert!(!assembler.note_interleaved(KITTY_APC_STALL_MAX_BYTES));
+        // Close to the bound keeps the stream, with room for one header.
+        assert!(!assembler.note_interleaved(KITTY_APC_STALL_MAX_BYTES - 16));
         assert!(assembler.has_pending());
-        // An accepted continuation resets the count.
+        // Continuation payload resets the count (the 5-byte `Gm=1` header
+        // is charged first, then cleared by the payload).
         assert!(matches!(
             assembler.feed(b"Gm=1;AP//AAD/"),
             KittyFeedOutcome::NeedMore { .. }
@@ -1505,6 +1517,39 @@ mod tests {
         assert_eq!(assembler.budget.decoded, 0);
         // Idle assembler: charging is a no-op.
         assert!(!assembler.note_interleaved(usize::MAX));
+    }
+
+    #[test]
+    fn empty_continuation_flood_hits_stall_bound() {
+        let mut assembler = KittyApcAssembler::new();
+        assert!(matches!(
+            assembler.feed(b"Gf=32,s=2,v=2,m=1;/wAA//8A"),
+            KittyFeedOutcome::NeedMore { .. }
+        ));
+        // Each empty `Gm=1` charges its header and never resets the count.
+        let rounds = KITTY_APC_STALL_MAX_BYTES / b"Gm=1".len() + 1;
+        let mut aborted = false;
+        for _ in 0..rounds {
+            if let KittyFeedOutcome::Rejected(KittyApcReject::Aborted) = assembler.feed(b"Gm=1") {
+                aborted = true;
+                break;
+            }
+        }
+        assert!(aborted, "empty continuation flood must hit the stall bound");
+        assert!(!assembler.has_pending());
+        assert_eq!(assembler.budget.decoded, 0);
+    }
+
+    #[test]
+    fn duplicate_continuation_m_last_wins_and_malformed_rejects() {
+        assert_eq!(
+            continuation_flags(b"m=1,m=0"),
+            Ok(Continuation {
+                more: Some(false),
+                delete: false
+            })
+        );
+        assert_eq!(continuation_flags(b"m=0,m=x"), Err(KittyApcReject::BadMore));
     }
 
     #[test]

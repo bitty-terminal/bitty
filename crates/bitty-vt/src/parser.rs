@@ -191,6 +191,8 @@ impl Parser {
                     state_machine.advance(&mut bridge, &[next]);
                     i = 1;
                 } else if *apc_discarding {
+                    // Held ESC plus the byte it swallows, both discarded.
+                    kitty.note_interleaved(2);
                     i = 1;
                 } else if next == b'_' {
                     clear_apc_header(kitty, apc_buf);
@@ -240,6 +242,9 @@ impl Parser {
                             apc_discarding,
                         );
                     } else if *apc_discarding {
+                        // A discarded ESC still counts toward the stall
+                        // bound, so an ESC flood cannot evade it.
+                        kitty.note_interleaved(1);
                         i += 1;
                     } else {
                         clear_apc_header(kitty, apc_buf);

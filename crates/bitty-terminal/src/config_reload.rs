@@ -780,6 +780,37 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn watcher_detects_a_symlink_retarget_with_identical_metadata() {
+        let dir = temp_dir("retarget");
+        let first = dir.join("a.toml");
+        let second = dir.join("b.toml");
+        write_config(&first, 12.0);
+        write_config(&second, 12.0);
+        // Same length and same mtime: only the link target differs.
+        let stamp = std::fs::metadata(&first)
+            .and_then(|meta| meta.modified())
+            .expect("mtime");
+        std::fs::File::options()
+            .write(true)
+            .open(&second)
+            .and_then(|file| file.set_modified(stamp))
+            .expect("align mtime");
+        let link = dir.join("config.toml");
+        std::os::unix::fs::symlink(&first, &link).expect("symlink");
+        let mut watcher = ConfigFileWatcher::new(link.clone());
+        let start = Instant::now();
+        assert!(!watcher.poll_at(start), "unchanged link");
+        std::fs::remove_file(&link).expect("unlink");
+        std::os::unix::fs::symlink(&second, &link).expect("retarget");
+        assert!(
+            watcher.poll_at(start + CONFIG_POLL_INTERVAL),
+            "a retarget is a change even with identical target metadata"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn only_runtime_adopted_fields_are_reported_as_live() {
         assert!(runtime_adopts("font.size"));

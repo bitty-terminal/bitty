@@ -1446,7 +1446,8 @@ impl PluginRuntime {
     /// kind without a reviewed policy is withheld. The trace hub applies the
     /// same function per owner, so `debug.trace` never sees more than a
     /// subscriber with the same grants. One envelope is built per distinct
-    /// view (at most three), so the common ungated case still clones once.
+    /// view (at most three) and passed to handlers by reference, so the
+    /// common ungated case builds exactly one envelope per event.
     pub fn deliver_event(&mut self, kind: &str, payload: &LuaValue) -> usize {
         self.event_sequence = self.event_sequence.saturating_add(1);
         let sequence = self.event_sequence;
@@ -1494,21 +1495,26 @@ impl PluginRuntime {
             if handlers.is_empty() {
                 continue;
             }
-            let envelope = match envelopes.iter().find(|(seen, _)| *seen == view) {
-                Some((_, envelope)) => envelope.clone(),
+            // Build each distinct view's envelope once and hand handlers a
+            // reference to it: no per-subscriber clone.
+            let index = match envelopes.iter().position(|(seen, _)| *seen == view) {
+                Some(index) => index,
                 None => {
-                    let envelope = LuaValue::table([
-                        ("kind", LuaValue::String(kind.to_string())),
-                        (
-                            "sequence",
-                            LuaValue::Integer(i64::try_from(sequence).unwrap_or(i64::MAX)),
-                        ),
-                        ("payload", redaction::apply_view(view, payload).into_owned()),
-                    ]);
-                    envelopes.push((view, envelope.clone()));
-                    envelope
+                    envelopes.push((
+                        view,
+                        LuaValue::table([
+                            ("kind", LuaValue::String(kind.to_string())),
+                            (
+                                "sequence",
+                                LuaValue::Integer(i64::try_from(sequence).unwrap_or(i64::MAX)),
+                            ),
+                            ("payload", redaction::apply_view(view, payload).into_owned()),
+                        ]),
+                    ));
+                    envelopes.len() - 1
                 }
             };
+            let envelope = &envelopes[index].1;
             let Some(entry) = self.entries.get_mut(&id) else {
                 continue;
             };
@@ -1521,7 +1527,7 @@ impl PluginRuntime {
             let mut vm = vm.borrow_mut();
             for handler in handlers {
                 if vm
-                    .call_function(&handler, std::slice::from_ref(&envelope))
+                    .call_function(&handler, std::slice::from_ref(envelope))
                     .is_ok()
                 {
                     delivered += 1;

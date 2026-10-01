@@ -169,6 +169,11 @@ pub enum EventKind {
     SelectionChanged,
     ProcessExited,
     ConfigReloaded,
+    WorkspaceCreated,
+    WorkspaceClosed,
+    WorkspaceRenamed,
+    WorkspaceFocused,
+    WorkspaceChanged,
     // Interception (exactly four for v1)
     InterceptCommandDispatch,
     InterceptTerminalSpawn,
@@ -193,6 +198,11 @@ impl EventKind {
             "selection.changed" => Ok(Self::SelectionChanged),
             "process.exited" => Ok(Self::ProcessExited),
             "config.reloaded" => Ok(Self::ConfigReloaded),
+            "workspace.created" => Ok(Self::WorkspaceCreated),
+            "workspace.closed" => Ok(Self::WorkspaceClosed),
+            "workspace.renamed" => Ok(Self::WorkspaceRenamed),
+            "workspace.focused" => Ok(Self::WorkspaceFocused),
+            "workspace.changed" => Ok(Self::WorkspaceChanged),
             "intercept.command-dispatch" => Ok(Self::InterceptCommandDispatch),
             "intercept.terminal-spawn" => Ok(Self::InterceptTerminalSpawn),
             "intercept.paste" => Ok(Self::InterceptPaste),
@@ -218,6 +228,11 @@ impl EventKind {
             Self::SelectionChanged => "selection.changed",
             Self::ProcessExited => "process.exited",
             Self::ConfigReloaded => "config.reloaded",
+            Self::WorkspaceCreated => "workspace.created",
+            Self::WorkspaceClosed => "workspace.closed",
+            Self::WorkspaceRenamed => "workspace.renamed",
+            Self::WorkspaceFocused => "workspace.focused",
+            Self::WorkspaceChanged => "workspace.changed",
             Self::InterceptCommandDispatch => "intercept.command-dispatch",
             Self::InterceptTerminalSpawn => "intercept.terminal-spawn",
             Self::InterceptPaste => "intercept.paste",
@@ -241,7 +256,12 @@ impl EventKind {
             | Self::FocusChanged
             | Self::SelectionChanged
             | Self::ProcessExited
-            | Self::ConfigReloaded => EventClass::Observation,
+            | Self::ConfigReloaded
+            | Self::WorkspaceCreated
+            | Self::WorkspaceClosed
+            | Self::WorkspaceRenamed
+            | Self::WorkspaceFocused
+            | Self::WorkspaceChanged => EventClass::Observation,
             Self::InterceptCommandDispatch
             | Self::InterceptTerminalSpawn
             | Self::InterceptPaste
@@ -304,6 +324,11 @@ impl EventKind {
             | Self::SelectionChanged
             | Self::ProcessExited
             | Self::ConfigReloaded
+            | Self::WorkspaceCreated
+            | Self::WorkspaceClosed
+            | Self::WorkspaceRenamed
+            | Self::WorkspaceFocused
+            | Self::WorkspaceChanged
             | Self::InterceptCommandDispatch
             | Self::InterceptTerminalSpawn
             | Self::InterceptOpenUrl => PayloadPolicy::Ungated,

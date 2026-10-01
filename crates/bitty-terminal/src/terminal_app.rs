@@ -749,6 +749,10 @@ impl TerminalApp {
         // CTX-0889: apply plugin workspace mutations queued since the last
         // tick before it commits, so the presented frame reflects them.
         self.apply_plugin_workspace_requests();
+        // CTX-0911 (issue #1570): read mounted UiBlocks from plugin runtime,
+        // convert to ChromeBands, and push into Runtime before present so
+        // bands render on this frame.
+        self.update_chrome_bands();
         // CTX-0382: drain cold-path events on every tick — including
         // deferred (synchronized update) and idle ticks — because a title
         // change produces no grid damage and would otherwise sit in the
@@ -862,6 +866,42 @@ impl TerminalApp {
         for (kind, payload) in &events {
             let _delivered = plugin_runtime.deliver_event(kind, payload);
         }
+    }
+
+    /// Reads mounted UiBlocks from plugin runtime and updates Runtime chrome
+    /// bands (CTX-0911, issue #1570).
+    ///
+    /// Called once per tick after plugin runtime tick, before present. Converts
+    /// `PluginRuntime::ui_blocks()` into plain `ChromeBands` struct following
+    /// the LiveSnapshot pattern: bitty-runtime must not depend on plugin_runtime
+    /// types directly.
+    fn update_chrome_bands(&mut self) {
+        let Some(plugin_runtime) = self.plugin_runtime.as_ref() else {
+            return;
+        };
+        let blocks = plugin_runtime.ui_blocks();
+        let mut bands = bitty_runtime::ChromeBands {
+            top: Vec::new(),
+            bottom: Vec::new(),
+            left: Vec::new(),
+            right: Vec::new(),
+        };
+        for (plugin_id, slot, node, version) in blocks {
+            let content = bitty_runtime::BandContent {
+                plugin_id: plugin_id.to_string(),
+                slot: slot.clone(),
+                root: node,
+                version,
+            };
+            match slot.as_str() {
+                "top" => bands.top.push(content),
+                "bottom" => bands.bottom.push(content),
+                "left" => bands.left.push(content),
+                "right" => bands.right.push(content),
+                _ => {} // Unknown slots are silently ignored
+            }
+        }
+        self.runtime.set_chrome_bands(bands);
     }
 
     /// Applies queued `bitty.workspace.*` requests (CTX-0889, ADR-0014).

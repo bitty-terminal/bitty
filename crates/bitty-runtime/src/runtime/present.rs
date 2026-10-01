@@ -881,6 +881,7 @@ impl Runtime {
             layers.any_needs_draw |= self.paint_cursor(&paint, &mut layers.combined_overlay);
         }
         self.paint_frame_overlays(&basis, now, &mut layers);
+        self.paint_chrome_bands(basis.pad_px, &mut layers);
         self.paint_kitty_images(&basis, &mut layers);
         if self.reject_stale_atlas_frame(&layers) {
             return None;
@@ -2154,6 +2155,113 @@ impl Runtime {
             layers.combined_glyphs.extend(glyphs);
             layers.any_needs_draw = true;
         }
+    }
+
+    /// Renders plugin-mounted chrome bands (CTX-0911, issue #1570).
+    ///
+    /// Walks each mounted UiNode tree from `chrome_bands` and renders Text nodes
+    /// with theme-resolved fg/bg/bold attributes. Row nodes stack horizontally,
+    /// List/Column nodes are treated as Row (vertical stacking deferred). Bands
+    /// are rendered after overlays so they appear above terminal content.
+    fn paint_chrome_bands(&mut self, pad_px: i32, layers: &mut FrameLayers) {
+        let bands = &self.chrome_bands;
+        let live = self.live_cell_metrics();
+        if live.width == 0 || live.height == 0 {
+            return;
+        }
+
+        // Render top bands at y=0
+        let mut y_offset = 0i32;
+        for band in &bands.top {
+            let text_line = self.extract_text_from_node(&band.root);
+            if !text_line.is_empty() {
+                let origin_x = pad_px;
+                let origin_y = px_add(pad_px, y_offset);
+
+                // Default colors
+                let fg = self.config.theme.foreground;
+                let bg = self.config.theme.background;
+
+                // Render background fill for the band
+                layers.combined_overlay.push(bitty_render::grid::FillRect {
+                    rect: bitty_render::geometry::RectPx::new(
+                        origin_x,
+                        origin_y,
+                        px_span_usize(text_line.len().min(self.cols), live.width),
+                        live.height,
+                    ),
+                    color: bg,
+                });
+
+                // Render text glyphs
+                let glyphs = self.renderer.overlay_text_glyphs(
+                    &text_line,
+                    (origin_x, origin_y),
+                    text_line.len().min(self.cols),
+                    fg,
+                );
+                layers.combined_glyphs.extend(glyphs);
+                layers.any_needs_draw = true;
+            }
+            y_offset += live.height as i32;
+        }
+
+        // Render bottom bands at window bottom
+        let window_height = self.window_cells.height as i32 * live.height as i32;
+        let mut bottom_y = window_height - (bands.bottom.len() as i32 * live.height as i32);
+        for band in &bands.bottom {
+            let text_line = self.extract_text_from_node(&band.root);
+            if !text_line.is_empty() {
+                let origin_x = pad_px;
+                let origin_y = px_add(pad_px, bottom_y);
+
+                let fg = self.config.theme.foreground;
+                let bg = self.config.theme.background;
+
+                layers.combined_overlay.push(bitty_render::grid::FillRect {
+                    rect: bitty_render::geometry::RectPx::new(
+                        origin_x,
+                        origin_y,
+                        px_span_usize(text_line.len().min(self.cols), live.width),
+                        live.height,
+                    ),
+                    color: bg,
+                });
+
+                let glyphs = self.renderer.overlay_text_glyphs(
+                    &text_line,
+                    (origin_x, origin_y),
+                    text_line.len().min(self.cols),
+                    fg,
+                );
+                layers.combined_glyphs.extend(glyphs);
+                layers.any_needs_draw = true;
+            }
+            bottom_y += live.height as i32;
+        }
+    }
+
+    /// Extracts text content from a UiNode tree (CTX-0911).
+    ///
+    /// Walks Text nodes and Row/Column/List children, concatenating text.
+    /// For v1 proof-of-concept: simple depth-first walk, Row children joined
+    /// horizontally, vertical stacking deferred.
+    fn extract_text_from_node(&self, node: &bitty_lua::ui::UiNode) -> String {
+        use bitty_lua::ui::UiNode;
+        let mut result = String::new();
+        match node {
+            UiNode::Text { text, .. } => {
+                result.push_str(text);
+            }
+            UiNode::Row { children, .. }
+            | UiNode::Column { children, .. }
+            | UiNode::List { children, .. } => {
+                for child in children {
+                    result.push_str(&self.extract_text_from_node(child));
+                }
+            }
+        }
+        result
     }
 
     /// Phase 5 (CTX-0474): the CTX-0248/0252/0254 kitty image layer.

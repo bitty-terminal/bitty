@@ -9,7 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-<<<<<<< HEAD
 - **Windows owned-process-tree backend (CTX-0903, #1536):** jobs on Windows
   now run in a kill-on-close Job Object, so a cancel, timeout, or kill ends
   the whole tree (grandchildren included) and snapshots report
@@ -31,7 +30,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (it depends on `bitty-winjob` there), so `bitty-winjob` must be published
   before `bitty-pty`; the 0.0.1 "Group 1 — Leaves" list below is historical
   and no longer describes `bitty-pty`.
-=======
 - **Workspace domain for Lua plugins (CTX-0889, #1569):** plugins can now read
   workspace state and control workspace operations through two new capabilities:
   `workspace.read` (query list, receive events) and `workspace.control` (focus,
@@ -73,7 +71,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reload refreshes the window title. Font family, size, and spacing adopt in
   one atlas rebuild. `bitty-config` now exports the `LIVE_FIELDS` /
   `RESTART_REQUIRED_FIELDS` lists that drive `classify_field`.
->>>>>>> origin/main
+
+> > > > > > > origin/main
+
 - **Live configuration reload (CTX-0814, #1397):** `reconcile_live` now has a
   production caller. The composition root installs a reload context at startup
   (skipped under `--safe`), and both `bitty ctl config reload` and an automatic

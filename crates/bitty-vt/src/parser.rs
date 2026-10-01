@@ -191,7 +191,16 @@ impl Parser {
                     state_machine.advance(&mut bridge, &[next]);
                     i = 1;
                 } else if *apc_discarding {
-                    i = 1;
+                    // Held ESC is discarded. A following ESC is re-examined
+                    // by the main loop (it may start `ESC \`), matching the
+                    // in-buffer path; any other byte is discarded with it.
+                    if next == 0x1B {
+                        kitty.note_interleaved(1);
+                        i = 0;
+                    } else {
+                        kitty.note_interleaved(2);
+                        i = 1;
+                    }
                 } else if next == b'_' {
                     clear_apc_header(kitty, apc_buf);
                     *in_apc = false;
@@ -240,6 +249,9 @@ impl Parser {
                             apc_discarding,
                         );
                     } else if *apc_discarding {
+                        // A discarded ESC still counts toward the stall
+                        // bound, so an ESC flood cannot evade it.
+                        kitty.note_interleaved(1);
                         i += 1;
                     } else {
                         clear_apc_header(kitty, apc_buf);
@@ -273,6 +285,9 @@ impl Parser {
                     kitty.abort();
                     state_machine.advance(&mut bridge, &[b]);
                 } else if *apc_discarding {
+                    // Discarded APC bytes (non-`G` commands, rejected
+                    // headers) count toward an open stream's stall bound.
+                    kitty.note_interleaved(1);
                     i += 1;
                 } else if *apc_payload {
                     if kitty.push_payload(std::slice::from_ref(&b)).is_err() {
@@ -321,6 +336,7 @@ impl Parser {
                         begin_apc(kitty, apc_buf, apc_payload, in_apc, apc_discarding);
                         i += 2;
                     } else {
+                        kitty.note_interleaved(1);
                         state_machine.advance(&mut bridge, &[0x1B]);
                         i += 1;
                     }
@@ -328,6 +344,9 @@ impl Parser {
                     // Note: C1 APC (0x9F) is intentionally not intercepted:
                     // it overlaps UTF-8 continuation bytes (e.g. `🎉` contains
                     // 0x9F), and kitty/chafa always use `ESC _`.
+                    // Text interleaved with an open chunked kitty stream
+                    // counts toward its stall bound (no-op when idle).
+                    kitty.note_interleaved(1);
                     state_machine.advance(&mut bridge, &[b]);
                     i += 1;
                 }

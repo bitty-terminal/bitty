@@ -8,9 +8,11 @@
 //!
 //! - Linux: process groups plus pidfd (implemented);
 //! - macOS: process groups plus kqueue exit observation (implemented);
-//! - Windows: Job Objects plus ConPTY (reserved: the Job Object backend
-//!   needs a reviewed FFI boundary and is not implemented, so Windows
-//!   reports [`ProcessTreeBackend::Unsupported`] and direct-child scope).
+//! - Windows: kill-on-close Job Objects through the reviewed `bitty-winjob`
+//!   adapter (implemented, CTX-0903). Pipe jobs start suspended and join
+//!   their job before they run; ConPTY jobs join right after the spawn, so
+//!   a descendant created before that assignment can escape. Only kills
+//!   reach the tree: graceful signals are a typed `Unsupported`.
 //!
 //! This module names the backend and the kill scope it can honor; the
 //! supervisor reports the scope per job (`JobSnapshot::kill_scope`).
@@ -24,8 +26,8 @@ pub enum ProcessTreeBackend {
     LinuxProcessGroup,
     /// macOS process groups plus kqueue/process wait.
     MacosProcessGroup,
-    /// Windows Job Objects plus ConPTY. Reserved: never detected until the
-    /// Job Object backend exists.
+    /// Windows Job Objects (pipe and ConPTY jobs). Kill-only: graceful
+    /// signals are refused as unsupported.
     WindowsJobObject,
     /// No owned-tree backend on this platform: only the direct child can be
     /// terminated. Callers must surface the gap, never silently single-kill
@@ -47,6 +49,7 @@ impl ProcessTreeBackend {
         match backend {
             bitty_pty::TreeBackend::ProcessGroupPidfd => Self::LinuxProcessGroup,
             bitty_pty::TreeBackend::ProcessGroupKqueue => Self::MacosProcessGroup,
+            bitty_pty::TreeBackend::JobObject => Self::WindowsJobObject,
             bitty_pty::TreeBackend::Unsupported => Self::Unsupported,
         }
     }
@@ -163,13 +166,38 @@ mod tests {
         assert_eq!(backend, ProcessTreeBackend::LinuxProcessGroup);
         #[cfg(target_os = "macos")]
         assert_eq!(backend, ProcessTreeBackend::MacosProcessGroup);
-        // No Job Object backend yet: Windows honestly reports no tree.
         #[cfg(target_os = "windows")]
-        assert_eq!(backend, ProcessTreeBackend::Unsupported);
+        assert_eq!(backend, ProcessTreeBackend::WindowsJobObject);
         assert_eq!(
             backend.kills_owned_tree(),
             bitty_pty::TreeBackend::detect().kills_owned_tree()
         );
+    }
+
+    #[test]
+    fn every_tree_backend_maps_onto_this_vocabulary() {
+        for (tree, expected) in [
+            (
+                bitty_pty::TreeBackend::ProcessGroupPidfd,
+                ProcessTreeBackend::LinuxProcessGroup,
+            ),
+            (
+                bitty_pty::TreeBackend::ProcessGroupKqueue,
+                ProcessTreeBackend::MacosProcessGroup,
+            ),
+            (
+                bitty_pty::TreeBackend::JobObject,
+                ProcessTreeBackend::WindowsJobObject,
+            ),
+            (
+                bitty_pty::TreeBackend::Unsupported,
+                ProcessTreeBackend::Unsupported,
+            ),
+        ] {
+            let mapped = ProcessTreeBackend::from_tree_backend(tree);
+            assert_eq!(mapped, expected);
+            assert_eq!(mapped.kills_owned_tree(), tree.kills_owned_tree());
+        }
     }
 
     #[test]

@@ -91,6 +91,12 @@ impl Observer {
         *exited = Some(status.map_or(LeaderExit::StatusUnavailable, decode_wait_status));
         Ok(*exited)
     }
+
+    /// Signals the leader's whole process group (its pid is the group id).
+    pub(super) fn signal_tree(&self, leader: u32, signal: TreeSignal) -> io::Result<()> {
+        super::refuse_reserved_group(leader)?;
+        signal_group(leader, signal)
+    }
 }
 
 /// Decodes a raw wait status (the BSD `WIFEXITED`/`WTERMSIG` layout).

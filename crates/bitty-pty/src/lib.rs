@@ -3,9 +3,13 @@
 //!
 //! The crate implements the PTY row of the Core Workspace Topology
 //! (ADR-0003): process lifecycle (spawn/shutdown), resize, and I/O with
-//! bounded buffering. It has **no workspace-crate dependencies** by contract,
-//! and exactly one third-party dependency (`portable-pty`) by the accepted
-//! upstream decision of ADR-0004.
+//! bounded buffering. Its only third-party PTY dependency is `portable-pty`,
+//! by the accepted upstream decision of ADR-0004. The owned-tree boundary
+//! ([`OwnedTree`]) adds platform system-call wrappers: `rustix` (Linux),
+//! `nix` (macOS), and on Windows the first-party `bitty-winjob` Job Object
+//! adapter, its sole workspace-crate dependency (CTX-0903, DEC-0083), which
+//! keeps every Win32 `unsafe` block outside this `forbid(unsafe_code)`
+//! crate.
 //!
 //! # Upstream boundary (ADR-0004 "Wrap" row)
 //!

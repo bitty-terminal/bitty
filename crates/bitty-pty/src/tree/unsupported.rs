@@ -1,9 +1,9 @@
-//! No owned-tree backend on this platform (Windows, BSDs other than macOS).
+//! No owned-tree backend on this platform (BSDs other than macOS, and any
+//! other target without a backend module).
 //!
 //! Adoption fails with [`io::ErrorKind::Unsupported`], so callers keep
 //! direct-child semantics and report [`TreeBackend::Unsupported`] instead of
-//! claiming tree cleanup. The Windows Job Object backend needs a reviewed FFI
-//! boundary and is tracked separately.
+//! claiming tree cleanup.
 
 use std::io;
 
@@ -22,6 +22,11 @@ impl Observer {
 
     pub(super) fn leader_exit(&self, leader: u32) -> io::Result<Option<LeaderExit>> {
         let _ = leader;
+        Err(unsupported())
+    }
+
+    pub(super) fn signal_tree(&self, leader: u32, signal: TreeSignal) -> io::Result<()> {
+        let _ = (leader, signal);
         Err(unsupported())
     }
 }

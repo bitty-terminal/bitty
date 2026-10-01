@@ -56,3 +56,8 @@ bitty-config = { path = "../bitty-config" }
 # Hermetic `ServeContext` constructors and unbound bearer minters (#1519).
 bitty-ipc = { path = "../bitty-ipc", features = ["test-support"] }
 bitty-test-support = { path = "../bitty-test-support" }
+
+# CTX-0903: Windows liveness probes for the owned-tree tests (safe API of
+# the first-party Job Object adapter; no new third-party crate).
+[target.'cfg(windows)'.dev-dependencies]
+bitty-winjob = { path = "../bitty-winjob" }

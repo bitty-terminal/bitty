@@ -218,13 +218,13 @@ fn signal_storm_is_rate_limited_without_disturbing_other_operations() {
     let live = wait_running(&registry, &spawner, id);
 
     // The burst budget is consumed by authorized calls, then fails closed.
-    // With an owned tree every burst signal is delivered (and ignored by
-    // the target); without one delivery is refused, which still counts
-    // against the budget: the limiter guards the intent path, not just
-    // successful deliveries.
+    // With a Unix owned tree every burst signal is delivered (and ignored by
+    // the target); without one, or on a Windows Job Object (kill-only),
+    // delivery is refused, which still counts against the budget: the
+    // limiter guards the intent path, not just successful deliveries.
     for _ in 0..bitty_runtime::MAX_SIGNALS_PER_WINDOW {
         let burst = registry.signal_as(&spawner, id, JobSignal::Interrupt);
-        if live.kill_scope == KillScope::OwnedTree {
+        if cfg!(unix) && live.kill_scope == KillScope::OwnedTree {
             assert_eq!(
                 burst,
                 Ok(SignalOutcome::Delivered),
@@ -898,10 +898,19 @@ fn authorized_signal_on_a_live_job_reaches_its_owned_tree() {
     }
     assert_eq!(delivered, Ok(SignalOutcome::Delivered));
     let stopped = wait_terminal(&registry, &spawner, id);
+    // Windows has no signals: `TerminateJobObject` ends the tree with the
+    // backend's kill exit code (1, as `Child::kill`), never a signal.
+    #[cfg(unix)]
     assert!(
         matches!(stopped.state, JobState::Done(ExecutionOutcome::Signaled(_))),
         "an external kill is a signaled outcome, got {:?}",
         stopped.state
+    );
+    #[cfg(windows)]
+    assert_eq!(
+        stopped.state,
+        JobState::Done(ExecutionOutcome::ExitCode(1)),
+        "a Job Object kill is the kill exit code"
     );
     assert_eq!(
         registry.signal_as(&spawner, id, JobSignal::Kill),

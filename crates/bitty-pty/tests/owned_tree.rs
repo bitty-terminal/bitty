@@ -3,8 +3,8 @@
 //! Each probe spawns `/bin/sh` as a group leader that forks a long-lived
 //! grandchild and reports its pid, so the tests prove the property the
 //! mechanism exists for: killing the tree takes the grandchild too, never
-//! just the direct child. POSIX-only (Windows has no backend yet; see
-//! `TreeBackend::Unsupported`).
+//! just the direct child. POSIX-only: the Windows Job Object backend has
+//! its own probes in `owned_tree_windows.rs`.
 
 #![cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 
@@ -36,7 +36,8 @@ fn spawn_tree(exit_code: Option<i32>) -> (Child, OwnedTree, u32) {
         .stderr(Stdio::null());
     OwnedTree::prepare_command(&mut command);
     let mut child = command.spawn().expect("spawn sh");
-    let tree = OwnedTree::adopt(child.id()).expect("adopt the tree");
+    // `prepare_command` pairs with `adopt_prepared` (the documented rule).
+    let tree = OwnedTree::adopt_prepared(child.id()).expect("adopt the tree");
     let mut line = String::new();
     BufReader::new(child.stdout.take().expect("stdout"))
         .read_line(&mut line)

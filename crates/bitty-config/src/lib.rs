@@ -118,7 +118,8 @@ pub use project_schema::{
     parse_project_toml,
 };
 pub use reload::{
-    ReloadClass, ReloadReport, classify_field, diff, fallback_builtin, reconcile_live,
+    LIVE_FIELDS, LIVE_SECTIONS, RESTART_REQUIRED_FIELDS, RESTART_REQUIRED_SECTIONS, ReloadClass,
+    ReloadReport, VIEWS_FIELD_PREFIX, classify_field, diff, fallback_builtin, reconcile_live,
 };
 pub use theme::{
     ALL_PRESETS, BITTY_DARK, CUSTOM_PALETTE_ANSI_COUNT, CustomPalette, DARK_THEME_ALIAS,

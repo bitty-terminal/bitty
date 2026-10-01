@@ -19,12 +19,22 @@
 //!
 //! # Bounds
 //!
-//! - [`KITTY_APC_LEDGER_CAP`] is the accepted IMG-1 4 MiB payload cap.
-//!   Base64 is decoded incrementally into one bounded payload buffer, so
+//! - [`KITTY_APC_LEDGER_CAP`] is the accepted IMG-1 4 MiB cap for
+//!   compressed payloads (`f=100` PNG) and for any stream whose decoded size
+//!   is not declared up front.
+//! - Raw `f=24`/`f=32` streams with both `s`/`v` present and no `o=`
+//!   compression key are not compressed:
+//!   the payload *is* the bitmap, so their bound is the declared exact size
+//!   `s * v * channels`, validated on the first chunk against the IMG-2/IMG-3
+//!   decode caps ([`KITTY_APC_DECODE_MAX_DIMENSION`],
+//!   [`KITTY_APC_DECODE_MAX_PIXELS`], [`KITTY_APC_DECODE_MAX_BYTES`]) before
+//!   any payload byte is buffered. Full-screen HD/4K RGBA frames from `chafa
+//!   -f kitty` therefore fit, while a raw stream can never grow past its own
+//!   claim.
+//! - Base64 is decoded incrementally into one bounded payload buffer, so
 //!   pending chunks, current output, and decoder scratch never form a second
 //!   large APC allocation. The control header has a separate 4 KiB bound.
-//! - Raw `s`/`v` claims are checked before emission against the payload cap;
-//!   PNG dimensions remain governed by the downstream decoder contract.
+//! - PNG dimensions remain governed by the downstream decoder contract.
 //! - Every growth and decoded-length check runs before the corresponding
 //!   allocation or adapter hand-off.
 //!
@@ -36,15 +46,40 @@
 //! decode-cap violation all store nothing and paint nothing. The caller
 //! (`Parser`) emits no action on rejection. Chunked streams drop only the
 //! offending stream on oversize, mirroring `KittyGraphicsStub` semantics.
+//!
+//! An open stream never outlives a protocol violation or a stall:
+//!
+//! - A continuation chunk with a missing or malformed `m=`, or one carrying
+//!   a delete action (`a=d`, which the kitty specification says must abort a
+//!   partial upload), drops the open stream as well as the offending chunk.
+//! - Input that arrives while a stream is open but is not continuation
+//!   payload (text for the VT state machine, non-`G` or discarded `APC`
+//!   bytes, and continuation headers themselves) is counted; past
+//!   [`KITTY_APC_STALL_MAX_BYTES`] the stream is dropped, so a writer cannot
+//!   pin its buffered payload by interleaving other output or by sending
+//!   empty `m=1` chunks. Only accepted payload bytes reset the count.
+//! - The bound counts bytes, not time: a writer that opens a stream and then
+//!   goes silent keeps it until more output arrives or the pane's parser is
+//!   dropped. The pinned amount stays within the stream's own declared size.
 
 use crate::diag::{RejectLog, warn_rejection};
 
-/// Accepted IMG-1 parser payload cap.
+/// Accepted IMG-1 parser payload cap for compressed or undeclared-size streams.
 pub const KITTY_APC_LEDGER_CAP: usize = 4 * 1024 * 1024;
 
 pub(crate) const KITTY_APC_MAX_CONTROL_BYTES: usize = 4096;
 
 const KITTY_APC_CODEC_SCRATCH_BYTES: usize = 4;
+
+/// Interleaved non-continuation bytes tolerated while a chunked stream is
+/// open before the stream is dropped as stalled.
+///
+/// The kitty protocol expects a client to send every chunk of one image
+/// before any other graphics command, so well-behaved producers (chafa,
+/// `kitten icat`) interleave nothing; 64 KiB leaves ample room for stray
+/// output while keeping the window in which a stalled writer pins payload
+/// memory bounded by its own interleaved traffic.
+pub const KITTY_APC_STALL_MAX_BYTES: usize = 64 * 1024;
 
 /// Side cap mirroring `bitty-rich::kitty_decode::KITTY_DECODE_MAX_DIMENSION`.
 pub const KITTY_APC_DECODE_MAX_DIMENSION: u32 = 8192;
@@ -74,6 +109,8 @@ pub struct KittyApcParams {
     pub cursor_movement_c: u8,
     /// Wire `m=` more-chunks (`false` when absent, i.e. single-shot/final).
     pub more: bool,
+    /// Whether a non-empty wire `o=` compression key is present.
+    pub compressed: bool,
 }
 
 /// Why an `APC G` buffer was rejected (fail-closed, warns, emits nothing).
@@ -97,6 +134,8 @@ pub enum KittyApcReject {
     Oversize,
     /// Continuation (`m=` present, no `f=`) with no open stream.
     Orphan,
+    /// Open stream dropped: protocol violation mid-stream or stall bound.
+    Aborted,
 }
 
 impl std::fmt::Display for KittyApcReject {
@@ -111,6 +150,7 @@ impl std::fmt::Display for KittyApcReject {
             Self::OversizeClaim => write!(f, "kitty s/v claim exceeds decode caps"),
             Self::Oversize => write!(f, "kitty payload exceeds parser budget"),
             Self::Orphan => write!(f, "kitty chunk without an open stream"),
+            Self::Aborted => write!(f, "kitty chunked stream aborted"),
         }
     }
 }
@@ -161,6 +201,11 @@ struct PendingKitty {
     rows_r: u16,
     cursor_movement_c: u8,
     encoded_len: usize,
+    /// Decoded-byte bound for this stream: IMG-1 for compressed or
+    /// undeclared-size payloads, the exact declared size for raw claims.
+    limit: usize,
+    /// Non-continuation bytes seen since the last accepted chunk.
+    interleaved: usize,
     decoder: Base64Stream,
     payload: Vec<u8>,
 }
@@ -465,7 +510,10 @@ impl KittyApcAssembler {
             current_final: None,
             ledger_cap,
             decode_cap,
-            budget: IntakeBudget::new(ledger_cap.min(decode_cap)),
+            // The intake budget spans the largest stream any bound admits
+            // (raw claims up to the decode cap); each stream is further
+            // limited by its own `PendingKitty::limit`.
+            budget: IntakeBudget::new(decode_cap),
             log: RejectLog::default(),
         }
     }
@@ -480,9 +528,31 @@ impl KittyApcAssembler {
         self.decode_cap
     }
 
+    /// IMG-1 bound for compressed or undeclared-size streams.
     #[must_use]
-    fn effective_cap(&self) -> usize {
+    fn compressed_cap(&self) -> usize {
         self.ledger_cap.min(self.decode_cap)
+    }
+
+    /// Decoded-byte bound for a new stream, validated before buffering.
+    ///
+    /// Uncompressed raw formats with a non-zero `s`/`v` claim are bounded by
+    /// the exact declared size (checked against the decode caps here, so
+    /// oversize claims are refused on the first chunk). Compressed (`o=`)
+    /// and everything else keep the IMG-1 compressed cap.
+    fn stream_limit(&self, params: &KittyApcParams) -> Result<usize, KittyApcReject> {
+        if params.compressed {
+            return Ok(self.compressed_cap());
+        }
+        match raw_claim_bytes(
+            params.format_f,
+            params.width_s,
+            params.height_v,
+            self.decode_cap,
+        )? {
+            Some(bytes) => Ok(bytes),
+            None => Ok(self.compressed_cap()),
+        }
     }
 
     pub(crate) fn reserve_header_byte(&mut self) -> bool {
@@ -519,6 +589,24 @@ impl KittyApcAssembler {
         self.pending.take().is_some()
     }
 
+    /// Charges `amount` interleaved non-continuation bytes against the open
+    /// stream's stall bound ([`KITTY_APC_STALL_MAX_BYTES`]).
+    ///
+    /// Returns `true` when this call dropped the open stream. A no-op
+    /// without an open stream, so callers may charge unconditionally.
+    pub fn note_interleaved(&mut self, amount: usize) -> bool {
+        let Some(pending) = self.pending.as_mut() else {
+            return false;
+        };
+        pending.interleaved = pending.interleaved.saturating_add(amount);
+        if pending.interleaved <= KITTY_APC_STALL_MAX_BYTES {
+            return false;
+        }
+        self.abort();
+        self.warn_reject(KittyApcReject::Aborted, "stalled stream");
+        true
+    }
+
     pub fn feed(&mut self, raw: &[u8]) -> KittyFeedOutcome {
         let (control, payload) = match raw.iter().position(|&byte| byte == b';') {
             Some(semi) => (&raw[..semi], &raw[semi + 1..]),
@@ -545,25 +633,53 @@ impl KittyApcAssembler {
             return Err(reason);
         }
         let Some(after_g) = control.strip_prefix(b"G") else {
+            // Other APC commands stay inert but count against the stall
+            // bound of an open stream (header plus its introducer).
+            self.note_interleaved(control.len().saturating_add(1));
             return Err(KittyApcReject::NotGraphics);
         };
         if self.pending.is_some() {
-            let more = match more_flag(after_g) {
-                Ok(Some(more)) => more,
-                Ok(None) => {
-                    let reason = KittyApcReject::Orphan;
+            // Fail closed on a malformed continuation: the open stream is
+            // dropped with the chunk, never kept around for a later tail.
+            let more = match continuation_flags(after_g) {
+                Ok(Continuation { delete: true, .. }) => {
+                    self.abort();
+                    let reason = KittyApcReject::Aborted;
+                    self.warn_reject(reason, "delete with open stream");
+                    return Err(reason);
+                }
+                Ok(Continuation {
+                    more: Some(more), ..
+                }) => more,
+                Ok(Continuation { more: None, .. }) => {
+                    self.abort();
+                    let reason = KittyApcReject::Aborted;
                     self.warn_reject(reason, "missing m= with open stream");
                     return Err(reason);
                 }
                 Err(reason) => {
+                    self.abort();
                     self.warn_reject(reason, "continuation m=");
                     return Err(reason);
                 }
             };
+            // The continuation header itself is not progress: only decoded
+            // payload resets the stall count (see `push_payload`), so a flood
+            // of empty `m=1` chunks is bounded too.
+            if self.note_interleaved(control.len().saturating_add(1)) {
+                return Err(KittyApcReject::Aborted);
+            }
             self.current_final = Some(!more);
         } else {
             let params = match parse_control(after_g) {
                 Ok(params) => params,
+                Err(reason) => {
+                    self.warn_reject(reason, "control");
+                    return Err(reason);
+                }
+            };
+            let limit = match self.stream_limit(&params) {
+                Ok(limit) => limit,
                 Err(reason) => {
                     self.warn_reject(reason, "control");
                     return Err(reason);
@@ -578,6 +694,8 @@ impl KittyApcAssembler {
                 rows_r: params.rows_r,
                 cursor_movement_c: params.cursor_movement_c,
                 encoded_len: 0,
+                limit,
+                interleaved: 0,
                 decoder: Base64Stream::default(),
                 payload: Vec::new(),
             });
@@ -590,9 +708,14 @@ impl KittyApcAssembler {
         if self.current_final.is_none() {
             return Err(KittyApcReject::Orphan);
         }
-        let available = self.budget.payload_limit;
         let result = match self.pending.as_mut() {
-            Some(pending) => pending.push(payload, available, &mut self.budget),
+            Some(pending) => {
+                if !payload.is_empty() {
+                    pending.interleaved = 0;
+                }
+                let available = pending.limit.min(self.budget.payload_limit);
+                pending.push(payload, available, &mut self.budget)
+            }
             None => Err(KittyApcReject::Orphan),
         };
         if let Err(reason) = result {
@@ -611,17 +734,16 @@ impl KittyApcAssembler {
             return KittyFeedOutcome::Rejected(KittyApcReject::Orphan);
         };
         if !final_chunk {
-            if pending.decoder.finished {
-                self.budget.clear_retained();
-                self.warn_reject(KittyApcReject::BadBase64, "non-final chunk");
-                return KittyFeedOutcome::Rejected(KittyApcReject::BadBase64);
-            }
+            // A padded quantum may legitimately close the base64 text in an
+            // `m=1` chunk when the producer (chafa) terminates the stream with
+            // an empty `m=0` chunk. Any further payload byte after the padding
+            // still fails closed in `Base64Stream::push`.
             self.pending = Some(pending);
             return KittyFeedOutcome::NeedMore {
                 buffered_encoded: self.pending_encoded_len(),
             };
         }
-        let available = self.budget.payload_limit;
+        let available = pending.limit.min(self.budget.payload_limit);
         let result = pending
             .decoder
             .finish(&mut pending.payload, available)
@@ -633,7 +755,7 @@ impl KittyApcAssembler {
                     pending.format_f,
                     pending.width_s,
                     pending.height_v,
-                    self.effective_cap(),
+                    self.decode_cap,
                 )
             });
         if let Err(reason) = result {
@@ -693,6 +815,7 @@ fn parse_control(control: &[u8]) -> Result<KittyApcParams, KittyApcReject> {
     let mut rows_r: u16 = 0;
     let mut cursor_movement_c: u8 = 0;
     let mut more = false;
+    let mut compressed = false;
     for piece in control.split(|&b| b == b',') {
         if piece.is_empty() {
             continue;
@@ -739,8 +862,13 @@ fn parse_control(control: &[u8]) -> Result<KittyApcParams, KittyApcReject> {
                     _ => return Err(KittyApcReject::BadMore),
                 };
             }
+            b'o' => {
+                // Compressed payload (`o=z`): never the uncompressed raw
+                // bound, always the IMG-1 compressed cap.
+                compressed = !value.is_empty();
+            }
             _ => {
-                // Unknown single-letter keys (i, p, q, d, e, t, o, X, Y, w,
+                // Unknown single-letter keys (i, p, q, d, e, t, X, Y, w,
                 // h, x, y, z, R, ...): ignored for transmit/display.
             }
         }
@@ -757,28 +885,47 @@ fn parse_control(control: &[u8]) -> Result<KittyApcParams, KittyApcReject> {
         rows_r,
         cursor_movement_c,
         more,
+        compressed,
     })
 }
 
-/// Extracts the `m=` flag from a continuation buffer (`None` when absent).
-fn more_flag(control: &[u8]) -> Result<Option<bool>, KittyApcReject> {
+/// Keys of a continuation chunk that decide its fate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Continuation {
+    /// `m=` value (`None` when absent).
+    more: Option<bool>,
+    /// `a=d`: a delete command, which must abort a partial upload.
+    delete: bool,
+}
+
+/// Scans a continuation control section for `m=` and a delete action.
+///
+/// Other keys are ignored (a continuation should carry only `m` and `q`).
+fn continuation_flags(control: &[u8]) -> Result<Continuation, KittyApcReject> {
+    let mut flags = Continuation {
+        more: None,
+        delete: false,
+    };
     for piece in control.split(|&b| b == b',') {
-        if piece.is_empty() {
-            continue;
-        }
         let Some(eq) = piece.iter().position(|&b| b == b'=') else {
             continue;
         };
         let (key, value) = (&piece[..eq], &piece[eq + 1..]);
-        if key == b"m" {
-            return match value {
-                b"0" => Ok(Some(false)),
-                b"1" => Ok(Some(true)),
-                _ => Err(KittyApcReject::BadMore),
-            };
+        match key {
+            // Same rule as `parse_control`: the last `m=` wins and any
+            // malformed value rejects the chunk.
+            b"m" => {
+                flags.more = Some(match value {
+                    b"0" => false,
+                    b"1" => true,
+                    _ => return Err(KittyApcReject::BadMore),
+                });
+            }
+            b"a" if value == b"d" => flags.delete = true,
+            _ => {}
         }
     }
-    Ok(None)
+    Ok(flags)
 }
 
 /// Rejects oversize raw `s`/`v` claims before any pixel buffer could exist.
@@ -793,16 +940,30 @@ fn validate_raw_claim(
     height_v: Option<u32>,
     payload_cap: usize,
 ) -> Result<(), KittyApcReject> {
+    raw_claim_bytes(format_f, width_s, height_v, payload_cap).map(|_| ())
+}
+
+/// Exact decoded byte size of a raw `s`/`v` claim, if one is declared.
+///
+/// `Ok(None)` for PNG/unknown formats and missing or zero dimensions (the
+/// decoder fails those closed downstream); `Err(OversizeClaim)` when the
+/// claim exceeds the side, area, or `payload_cap` byte bound.
+fn raw_claim_bytes(
+    format_f: u32,
+    width_s: Option<u32>,
+    height_v: Option<u32>,
+    payload_cap: usize,
+) -> Result<Option<usize>, KittyApcReject> {
     let channels: usize = match format_f {
         24 => 3,
         32 => 4,
-        _ => return Ok(()),
+        _ => return Ok(None),
     };
     let (Some(w), Some(h)) = (width_s, height_v) else {
-        return Ok(());
+        return Ok(None);
     };
     if w == 0 || h == 0 {
-        return Ok(());
+        return Ok(None);
     }
     if w > KITTY_APC_DECODE_MAX_DIMENSION || h > KITTY_APC_DECODE_MAX_DIMENSION {
         return Err(KittyApcReject::OversizeClaim);
@@ -814,7 +975,7 @@ fn validate_raw_claim(
     (pixels as usize)
         .checked_mul(channels)
         .filter(|&n| n <= payload_cap)
-        .map(|_| ())
+        .map(Some)
         .ok_or(KittyApcReject::OversizeClaim)
 }
 
@@ -978,11 +1139,187 @@ mod tests {
     }
 
     #[test]
-    fn raw_claim_over_img1_payload_budget_is_rejected_before_emit() {
+    fn raw_claim_over_decode_caps_is_rejected_on_first_chunk() {
+        let mut assembler = KittyApcAssembler::new();
+        // 4096 x 4097 RGBA exceeds the IMG-2 pixel area: refused before any
+        // payload byte is buffered, even on an `m=1` opener.
+        assert!(matches!(
+            assembler.feed(b"Gf=32,s=4096,v=4097,m=1;AAAA"),
+            KittyFeedOutcome::Rejected(KittyApcReject::OversizeClaim)
+        ));
+        assert!(!assembler.has_pending());
+        assert_eq!(assembler.peak_memory(), 0);
+        // A custom smaller decode cap bounds raw claims too.
+        let mut assembler = KittyApcAssembler::with_caps(4096, 15);
+        assert!(matches!(
+            assembler.feed(b"Gf=32,s=2,v=2,m=1;AAAA"),
+            KittyFeedOutcome::Rejected(KittyApcReject::OversizeClaim)
+        ));
+        assert!(!assembler.has_pending());
+    }
+
+    #[test]
+    fn raw_claim_bounds_stream_to_declared_size() {
+        // f=24, 2x1 declares exactly 6 bytes; 9 decoded bytes overrun the
+        // claim and drop the stream even though IMG-1 would admit them.
         let mut assembler = KittyApcAssembler::new();
         assert!(matches!(
-            assembler.feed(b"Gf=32,s=2048,v=2048,m=0;AA=="),
-            KittyFeedOutcome::Rejected(KittyApcReject::OversizeClaim)
+            assembler.feed(b"Gf=24,s=2,v=1,m=1;AAAAAAAA"),
+            KittyFeedOutcome::NeedMore { .. }
+        ));
+        assert!(matches!(
+            assembler.feed(b"Gm=0;AAAA"),
+            KittyFeedOutcome::Rejected(KittyApcReject::Oversize)
+        ));
+        assert!(!assembler.has_pending());
+        assert!(assembler.peak_memory() <= 6);
+    }
+
+    #[test]
+    fn compressed_payload_keeps_img1_cap() {
+        // PNG (f=100) and raw streams without s/v stay bound by IMG-1.
+        let encoded = base64_encode(&vec![0x5a; KITTY_APC_LEDGER_CAP + 1]);
+        for header in [b"Gf=100,m=0;".as_slice(), b"Gf=32,m=0;".as_slice()] {
+            let mut raw = header.to_vec();
+            raw.extend_from_slice(encoded.as_bytes());
+            let mut assembler = KittyApcAssembler::new();
+            assert!(matches!(
+                assembler.feed(&raw),
+                KittyFeedOutcome::Rejected(KittyApcReject::Oversize)
+            ));
+            assert!(assembler.peak_memory() <= KITTY_APC_LEDGER_CAP);
+        }
+    }
+
+    #[test]
+    fn compressed_raw_claim_keeps_img1_cap() {
+        // `o=z` marks a compressed payload: a raw s/v claim must not lift
+        // the stream bound above IMG-1.
+        let (w, h) = (1024_u32, 1024_u32);
+        let encoded = base64_encode(&vec![0x5a; KITTY_APC_LEDGER_CAP + 1]);
+        let mut raw = format!("Gf=32,o=z,s={w},v={h},m=0;").into_bytes();
+        raw.extend_from_slice(encoded.as_bytes());
+        let mut assembler = KittyApcAssembler::new();
+        assert!(matches!(
+            assembler.feed(&raw),
+            KittyFeedOutcome::Rejected(KittyApcReject::Oversize)
+        ));
+        assert!(assembler.peak_memory() <= KITTY_APC_LEDGER_CAP);
+    }
+
+    #[test]
+    fn hd_raw_rgba_claim_beyond_img1_completes() {
+        // chafa -f kitty emits raw RGBA sized to the terminal: a 2850x1600
+        // frame is ~18 MiB, far over IMG-1 but inside IMG-2/IMG-3.
+        let (w, h) = (2850_u32, 1600_u32);
+        let len = (w * h * 4) as usize;
+        assert!(len > KITTY_APC_LEDGER_CAP);
+        let encoded = base64_encode(&vec![0x7f; len]);
+        let mut assembler = KittyApcAssembler::new();
+        let opener = format!("Ga=T,f=32,s={w},v={h},c=285,r=80,m=1,q=2;");
+        assert!(matches!(
+            assembler.feed(opener.as_bytes()),
+            KittyFeedOutcome::NeedMore { .. }
+        ));
+        // chafa chunk size: 4096 base64 chars per `m=1` chunk.
+        for chunk in encoded.as_bytes().chunks(4096) {
+            let mut raw = b"Gm=1;".to_vec();
+            raw.extend_from_slice(chunk);
+            assert!(matches!(
+                assembler.feed(&raw),
+                KittyFeedOutcome::NeedMore { .. }
+            ));
+        }
+        match assembler.feed(b"Gm=0;") {
+            KittyFeedOutcome::Completed(done) => {
+                assert_eq!(done.payload.len(), len);
+                assert_eq!((done.width_s, done.height_v), (Some(w), Some(h)));
+            }
+            other => panic!("expected HD completion, got {other:?}"),
+        }
+        assert!(assembler.peak_memory() <= KITTY_APC_DECODE_MAX_BYTES);
+    }
+
+    #[test]
+    fn padded_non_final_chunk_then_empty_terminator_completes() {
+        // chafa ends the base64 text with `==` inside an `m=1` chunk, then
+        // closes the stream with an empty `m=0` chunk.
+        let raw_payload = [0x11, 0x22, 0x33, 0x44];
+        let encoded = base64_encode(&raw_payload);
+        assert!(encoded.ends_with("=="));
+        let mut assembler = KittyApcAssembler::new();
+        let opener = format!("Gf=32,s=1,v=1,m=1;{}", &encoded[..4]);
+        assert!(matches!(
+            assembler.feed(opener.as_bytes()),
+            KittyFeedOutcome::NeedMore { .. }
+        ));
+        let padded = format!("Gm=1;{}", &encoded[4..]);
+        assert!(matches!(
+            assembler.feed(padded.as_bytes()),
+            KittyFeedOutcome::NeedMore { .. }
+        ));
+        match assembler.feed(b"Gm=0;") {
+            KittyFeedOutcome::Completed(done) => {
+                assert_eq!(&*done.payload, &raw_payload[..]);
+            }
+            other => panic!("expected completion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg_attr(target_os = "windows", ignore = "64 MiB test too slow on Windows CI")]
+    fn raw_rgba_at_exact_img3_boundary_completes() {
+        // 4096x4096 RGBA is exactly 64 MiB (IMG-3 KITTY_APC_DECODE_MAX_BYTES).
+        // This must complete without rejection.
+        let (w, h) = (4096_u32, 4096_u32);
+        let len = (w * h * 4) as usize;
+        assert_eq!(len, KITTY_APC_DECODE_MAX_BYTES);
+        let encoded = base64_encode(&vec![0x42; len]);
+        let mut assembler = KittyApcAssembler::new();
+        let opener = format!("Ga=T,f=32,s={w},v={h},m=1;");
+        assert!(matches!(
+            assembler.feed(opener.as_bytes()),
+            KittyFeedOutcome::NeedMore { .. }
+        ));
+        // Feed in 4096-byte chunks (chafa style).
+        for chunk in encoded.as_bytes().chunks(4096) {
+            let mut raw = b"Gm=1;".to_vec();
+            raw.extend_from_slice(chunk);
+            assert!(matches!(
+                assembler.feed(&raw),
+                KittyFeedOutcome::NeedMore { .. }
+            ));
+        }
+        match assembler.feed(b"Gm=0;") {
+            KittyFeedOutcome::Completed(done) => {
+                assert_eq!(done.payload.len(), len);
+                assert_eq!((done.width_s, done.height_v), (Some(w), Some(h)));
+                assert!(done.payload.iter().all(|&b| b == 0x42));
+            }
+            other => panic!("expected completion at exact IMG-3 boundary, got {other:?}"),
+        }
+        assert_eq!(assembler.peak_memory(), KITTY_APC_DECODE_MAX_BYTES);
+    }
+
+    #[test]
+    fn payload_after_padding_still_fails_closed() {
+        let mut assembler = KittyApcAssembler::new();
+        assert!(matches!(
+            assembler.feed(b"Gf=100,m=1;aGk="),
+            KittyFeedOutcome::NeedMore { .. }
+        ));
+        assert!(matches!(
+            assembler.feed(b"Gm=0;aGk="),
+            KittyFeedOutcome::Rejected(KittyApcReject::BadBase64)
+        ));
+        assert!(!assembler.has_pending());
+        assert!(matches!(
+            assembler.feed(b"Gf=100,m=1;aGk="),
+            KittyFeedOutcome::NeedMore { .. }
+        ));
+        assert!(matches!(
+            assembler.feed(b"Gm=1;AAAA"),
+            KittyFeedOutcome::Rejected(KittyApcReject::BadBase64)
         ));
         assert!(!assembler.has_pending());
     }
@@ -1118,33 +1455,154 @@ mod tests {
             other => panic!("expected Oversize, got {other:?}"),
         }
         assert!(!assembler.has_pending());
-        // Reusable afterwards: a capped lone single-shot fits.
-        match assembler.feed(b"Gf=24,s=1,v=1,m=0;AAAAAAAAAAAA") {
+        // Reusable afterwards: a capped lone single-shot fits (1x3 RGB
+        // declares exactly the 9 capped bytes).
+        match assembler.feed(b"Gf=24,s=1,v=3,m=0;AAAAAAAAAAAA") {
             KittyFeedOutcome::Completed(done) => assert_eq!(done.payload.len(), 9),
             other => panic!("expected Completed after drop, got {other:?}"),
         }
     }
 
     #[test]
-    fn missing_m_with_open_stream_keeps_stream() {
+    fn missing_m_with_open_stream_aborts_stream() {
         let mut assembler = KittyApcAssembler::new();
         match assembler.feed(b"Gf=32,s=2,v=2,m=1;/wAA//8A") {
             KittyFeedOutcome::NeedMore { .. } => {}
             other => panic!("expected NeedMore, got {other:?}"),
         }
-        // No `m=`: newcomer dropped, open stream kept.
+        // No `m=` with an open stream: protocol violation, fail closed by
+        // dropping the open stream together with the newcomer.
         match assembler.feed(b"Gf=32,s=1,v=1;/wAA/w==") {
-            KittyFeedOutcome::Rejected(KittyApcReject::Orphan) => {}
-            other => panic!("expected Orphan, got {other:?}"),
+            KittyFeedOutcome::Rejected(KittyApcReject::Aborted) => {}
+            other => panic!("expected Aborted, got {other:?}"),
         }
-        assert!(assembler.has_pending());
-        // True tail still completes exactly.
+        assert!(!assembler.has_pending());
+        assert_eq!(assembler.budget.decoded, 0);
+        // The old tail is now an orphan and paints nothing.
+        // (A bare `m=0` without `f=` and no open stream is a missing-format
+        // transmission.)
         match assembler.feed(b"Gm=0;AP//AAD//wAA/w==") {
+            KittyFeedOutcome::Rejected(KittyApcReject::MissingFormat) => {}
+            other => panic!("expected MissingFormat, got {other:?}"),
+        }
+        // A fresh stream still completes afterwards.
+        match assembler.feed(b"Gf=32,s=1,v=1;/wAA/w==") {
             KittyFeedOutcome::Completed(done) => {
-                assert_eq!(&*done.payload, &[0xFF, 0, 0, 0xFF].repeat(4));
+                assert_eq!(&*done.payload, &[0xFF, 0, 0, 0xFF]);
             }
             other => panic!("expected Completed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn malformed_continuation_m_aborts_stream() {
+        let mut assembler = KittyApcAssembler::new();
+        assert!(matches!(
+            assembler.feed(b"Gf=32,s=2,v=2,m=1;/wAA//8A"),
+            KittyFeedOutcome::NeedMore { .. }
+        ));
+        match assembler.feed(b"Gm=2;AP//AAD/") {
+            KittyFeedOutcome::Rejected(KittyApcReject::BadMore) => {}
+            other => panic!("expected BadMore, got {other:?}"),
+        }
+        assert!(!assembler.has_pending());
+        assert_eq!(assembler.budget.decoded, 0);
+        assert!(matches!(
+            assembler.feed(b"Gm=0;/wAA/w=="),
+            KittyFeedOutcome::Rejected(KittyApcReject::MissingFormat)
+        ));
+    }
+
+    #[test]
+    fn delete_with_open_stream_aborts_partial_upload() {
+        let mut assembler = KittyApcAssembler::new();
+        assert!(matches!(
+            assembler.feed(b"Gf=32,s=2,v=2,m=1;/wAA//8A"),
+            KittyFeedOutcome::NeedMore { .. }
+        ));
+        // Kitty spec: a delete received mid-upload aborts the partial upload.
+        match assembler.feed(b"Ga=d,d=A,m=0") {
+            KittyFeedOutcome::Rejected(KittyApcReject::Aborted) => {}
+            other => panic!("expected Aborted, got {other:?}"),
+        }
+        assert!(!assembler.has_pending());
+    }
+
+    #[test]
+    fn interleaved_bytes_past_stall_bound_drop_stream() {
+        let mut assembler = KittyApcAssembler::new();
+        assert!(matches!(
+            assembler.feed(b"Gf=32,s=2,v=2,m=1;/wAA//8A"),
+            KittyFeedOutcome::NeedMore { .. }
+        ));
+        // Close to the bound keeps the stream, with room for one header.
+        assert!(!assembler.note_interleaved(KITTY_APC_STALL_MAX_BYTES - 16));
+        assert!(assembler.has_pending());
+        // Continuation payload resets the count (the 5-byte `Gm=1` header
+        // is charged first, then cleared by the payload).
+        assert!(matches!(
+            assembler.feed(b"Gm=1;AP//AAD/"),
+            KittyFeedOutcome::NeedMore { .. }
+        ));
+        assert!(!assembler.note_interleaved(KITTY_APC_STALL_MAX_BYTES));
+        assert!(assembler.has_pending());
+        // One byte past the bound drops it and releases the payload charge.
+        assert!(assembler.note_interleaved(1));
+        assert!(!assembler.has_pending());
+        assert_eq!(assembler.budget.decoded, 0);
+        // Idle assembler: charging is a no-op.
+        assert!(!assembler.note_interleaved(usize::MAX));
+    }
+
+    #[test]
+    fn empty_continuation_flood_hits_stall_bound() {
+        let mut assembler = KittyApcAssembler::new();
+        assert!(matches!(
+            assembler.feed(b"Gf=32,s=2,v=2,m=1;/wAA//8A"),
+            KittyFeedOutcome::NeedMore { .. }
+        ));
+        // Each empty `Gm=1` charges its header and never resets the count.
+        let rounds = KITTY_APC_STALL_MAX_BYTES / b"Gm=1".len() + 1;
+        let mut aborted = false;
+        for _ in 0..rounds {
+            if let KittyFeedOutcome::Rejected(KittyApcReject::Aborted) = assembler.feed(b"Gm=1") {
+                aborted = true;
+                break;
+            }
+        }
+        assert!(aborted, "empty continuation flood must hit the stall bound");
+        assert!(!assembler.has_pending());
+        assert_eq!(assembler.budget.decoded, 0);
+    }
+
+    #[test]
+    fn duplicate_continuation_m_last_wins_and_malformed_rejects() {
+        assert_eq!(
+            continuation_flags(b"m=1,m=0"),
+            Ok(Continuation {
+                more: Some(false),
+                delete: false
+            })
+        );
+        assert_eq!(continuation_flags(b"m=0,m=x"), Err(KittyApcReject::BadMore));
+    }
+
+    #[test]
+    fn non_graphics_apc_counts_toward_stall_bound() {
+        let mut assembler = KittyApcAssembler::new();
+        assert!(matches!(
+            assembler.feed(b"Gf=32,s=2,v=2,m=1;/wAA//8A"),
+            KittyFeedOutcome::NeedMore { .. }
+        ));
+        let other = vec![b'X'; KITTY_APC_MAX_CONTROL_BYTES - 1];
+        let rounds = KITTY_APC_STALL_MAX_BYTES / KITTY_APC_MAX_CONTROL_BYTES + 1;
+        for _ in 0..rounds {
+            assert!(matches!(
+                assembler.feed(&other),
+                KittyFeedOutcome::Rejected(KittyApcReject::NotGraphics)
+            ));
+        }
+        assert!(!assembler.has_pending());
     }
 
     fn base64_encode(bytes: &[u8]) -> String {
@@ -1256,5 +1714,70 @@ mod tests {
         assert_eq!(KITTY_APC_DECODE_MAX_DIMENSION, 8192);
         assert_eq!(KITTY_APC_DECODE_MAX_PIXELS, 4096 * 4096);
         assert_eq!(KITTY_APC_DECODE_MAX_BYTES, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    #[cfg_attr(target_os = "windows", ignore = "64 MiB test too slow on Windows CI")]
+    fn raw_rgba_at_exact_decode_cap_completes() {
+        // CTX-0904: 4096x4096 RGBA is exactly 64 MiB (IMG-2/IMG-3 cap).
+        // The stream must complete without rejection.
+        let w = 4096_u32;
+        let h = 4096_u32;
+        let bytes = (w as usize) * (h as usize) * 4; // 67108864 = 64 MiB
+        assert_eq!(bytes, KITTY_APC_DECODE_MAX_BYTES);
+
+        let payload = vec![0xAA_u8; bytes];
+        let encoded = base64_encode(&payload);
+        let chunk_size = 4096;
+        let mut assembler = KittyApcAssembler::new();
+
+        // Feed opener with s/v
+        let opener = format!("Gf=32,s={w},v={h},m=1;");
+        assert!(matches!(
+            assembler.feed(opener.as_bytes()),
+            KittyFeedOutcome::NeedMore { .. }
+        ));
+
+        // Feed payload in 4096-char chunks
+        let encoded_bytes = encoded.as_bytes();
+        for chunk in encoded_bytes.chunks(chunk_size) {
+            let mut frame = b"Gm=1;".to_vec();
+            frame.extend_from_slice(chunk);
+            match assembler.feed(&frame) {
+                KittyFeedOutcome::NeedMore { .. } => {}
+                other => panic!("expected NeedMore mid-stream, got {other:?}"),
+            }
+        }
+
+        // Terminator
+        match assembler.feed(b"Gm=0;") {
+            KittyFeedOutcome::Completed(done) => {
+                assert_eq!(done.format_f, 32);
+                assert_eq!(done.width_s, Some(w));
+                assert_eq!(done.height_v, Some(h));
+                assert_eq!(done.payload.len(), bytes);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn raw_rgba_one_pixel_over_decode_cap_is_rejected() {
+        // CTX-0904: 4096x4096 RGBA + 1 pixel exceeds the cap and must be
+        // rejected on the first chunk (before buffering the payload).
+        let w = 4096_u32;
+        let h = 4096_u32;
+        let bytes = (w as usize) * (h as usize) * 4 + 4; // 64 MiB + 1 pixel
+        assert!(bytes > KITTY_APC_DECODE_MAX_BYTES);
+
+        let opener = format!("Gf=32,s={w},v={},m=1;", h + 1);
+        let mut assembler = KittyApcAssembler::new();
+
+        // First chunk with oversized claim is rejected immediately
+        assert!(matches!(
+            assembler.feed(opener.as_bytes()),
+            KittyFeedOutcome::Rejected(KittyApcReject::OversizeClaim)
+        ));
+        assert!(!assembler.has_pending());
     }
 }

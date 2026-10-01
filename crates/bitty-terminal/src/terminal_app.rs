@@ -8,7 +8,8 @@ use bitty_platform::{
     PhysicalSize, PlatformEvent, PressState, WindowConfig, WindowEventKind, WindowHandle, WindowId,
 };
 use bitty_render::gpu::GpuContext;
-use bitty_runtime::Runtime;
+use bitty_runtime::plugin_runtime::{LuaValue, PluginRuntime, WorkspaceRequest};
+use bitty_runtime::{Runtime, WorkspaceSummary};
 
 use crate::ctl;
 use crate::layout_cmd::spawn_demo_pty_pump_with_theme;
@@ -76,6 +77,10 @@ impl OsTitleSink for WindowHandle {
 pub(crate) struct WindowState {
     /// Window title carrying the resolved theme preset + source layer.
     pub(crate) title: String,
+    /// Source-layer label baked into [`Self::title`] at launch
+    /// (`cli`/`file`/`profile`/`default`), kept so a live theme reload can
+    /// rebuild the title with the new preset name (CTX-0898).
+    pub(crate) theme_source: String,
     /// Window opacity from the effective config (CTX-0223
     /// `window.opacity`; default `1.0` = opaque). Applied to the platform
     /// [`WindowConfig`](bitty_platform::WindowConfig) at creation and to the
@@ -112,9 +117,10 @@ pub(crate) struct WindowState {
 }
 
 impl WindowState {
-    fn new(title: String) -> Self {
+    fn new(theme_name: &str, source: &str) -> Self {
         Self {
-            title,
+            title: window_title_for_theme(theme_name, source),
+            theme_source: source.to_string(),
             opacity: 1.0,
             blur_radius: 0,
             handle: None,
@@ -124,6 +130,138 @@ impl WindowState {
             title_applies: 0,
             os_title_sink: None,
         }
+    }
+}
+
+/// Last runtime state observed by plugin event delivery (CTX-0892).
+///
+/// Delivery is coalesced: at most one event per kind fires per tick, carrying
+/// the latest value, so the per-tick bound is structural (one per tracked
+/// kind) and a burst of state changes cannot queue work for the VMs.
+///
+/// CTX-0889: workspace events are coalesced per tick as a diff of the
+/// previous and current Core workspace summaries, so each kind fires at most
+/// once per workspace per tick (bounded by `MAX_WORKSPACES`), and an
+/// intermediate state that a tick never committed is never reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EventTracker {
+    title: String,
+    window_focused: bool,
+    workspaces: Vec<WorkspaceSummary>,
+}
+
+/// Stable-id payload for a workspace event (identity only, no content).
+fn workspace_id_value(seq: u64) -> LuaValue {
+    LuaValue::Integer(i64::try_from(seq).unwrap_or(i64::MAX))
+}
+
+/// Coalesced workspace events between two committed summaries (CTX-0889).
+///
+/// Order: `closed`, `created`, `renamed`, `changed`, `focused`, each in
+/// workspace order. Payloads are identity-only: `{ id }`, plus `name` for
+/// `created`/`renamed`. `changed` means the panel list of a surviving
+/// workspace changed (count or order). Time O(w^2) over `w <= 16`
+/// workspaces; allocates only when something changed.
+fn workspace_changes(
+    previous: &[WorkspaceSummary],
+    current: &[WorkspaceSummary],
+) -> Vec<(&'static str, LuaValue)> {
+    let mut events = Vec::new();
+    // Empty previous is the first snapshot: establish baseline, emit nothing.
+    if previous.is_empty() || previous == current {
+        return events;
+    }
+    let find = |rows: &[WorkspaceSummary], seq: u64| rows.iter().position(|row| row.seq == seq);
+    for old in previous {
+        if find(current, old.seq).is_none() {
+            events.push((
+                "workspace.closed",
+                LuaValue::table([("id", workspace_id_value(old.seq))]),
+            ));
+        }
+    }
+    for new in current {
+        if find(previous, new.seq).is_none() {
+            events.push((
+                "workspace.created",
+                LuaValue::table([
+                    ("id", workspace_id_value(new.seq)),
+                    ("name", LuaValue::String(new.name.clone())),
+                ]),
+            ));
+        }
+    }
+    for new in current {
+        if let Some(old) = find(previous, new.seq).map(|index| &previous[index]) {
+            if old.name != new.name {
+                events.push((
+                    "workspace.renamed",
+                    LuaValue::table([
+                        ("id", workspace_id_value(new.seq)),
+                        ("name", LuaValue::String(new.name.clone())),
+                    ]),
+                ));
+            }
+        }
+    }
+    for new in current {
+        if let Some(old) = find(previous, new.seq).map(|index| &previous[index]) {
+            if old.panel_ids != new.panel_ids {
+                events.push((
+                    "workspace.changed",
+                    LuaValue::table([("id", workspace_id_value(new.seq))]),
+                ));
+            }
+        }
+    }
+    let active = |rows: &[WorkspaceSummary]| rows.iter().find(|row| row.active).map(|row| row.seq);
+    if let Some(seq) = active(current) {
+        if active(previous) != Some(seq) {
+            events.push((
+                "workspace.focused",
+                LuaValue::table([("id", workspace_id_value(seq))]),
+            ));
+        }
+    }
+    events
+}
+
+impl EventTracker {
+    fn from_runtime(runtime: &Runtime) -> Self {
+        Self {
+            title: runtime.state().title().to_string(),
+            window_focused: runtime.is_window_focused(),
+            workspaces: runtime.workspace_summaries(),
+        }
+    }
+
+    /// Diffs the tracker against the current state, updates it, and returns
+    /// the coalesced events to deliver in order. Allocates only on change.
+    fn take_changes(
+        &mut self,
+        title: &str,
+        window_focused: bool,
+        workspaces: &[WorkspaceSummary],
+    ) -> Vec<(&'static str, LuaValue)> {
+        let mut events = workspace_changes(&self.workspaces, workspaces);
+        if !events.is_empty() || self.workspaces.as_slice() != workspaces {
+            self.workspaces = workspaces.to_vec();
+        }
+        if self.title != title {
+            self.title = title.to_string();
+            events.push((
+                "terminal.title-changed",
+                LuaValue::table([("title", LuaValue::String(self.title.clone()))]),
+            ));
+        }
+        if self.window_focused != window_focused {
+            self.window_focused = window_focused;
+            events.push((
+                "focus.changed",
+                LuaValue::table([("focused", LuaValue::Bool(window_focused))]),
+            ));
+        }
+        events
     }
 }
 
@@ -169,6 +307,17 @@ pub(crate) struct TerminalApp {
     /// never serves the frozen generation-1 view. `None` when no plugin VM
     /// exists or a test does not exercise the bridge.
     pub(crate) live_snapshot: Option<std::rc::Rc<crate::plugin_runtime::LiveSnapshot>>,
+    /// Shared live workspace source (CTX-0889): `drive_tick` publishes
+    /// Core's workspace summaries here so `bitty.workspace.list()` serves
+    /// committed state. `None` without a plugin runtime.
+    pub(crate) live_workspaces: Option<std::rc::Rc<crate::plugin_runtime::LiveWorkspaces>>,
+    /// Plugin runtime (CTX-0892): owns all plugin VMs, delivers events,
+    /// dispatches commands. Kept alive by the app loop.
+    pub(crate) plugin_runtime: Option<PluginRuntime>,
+    /// Previous runtime state for event change detection (CTX-0892).
+    /// Updated in place by [`EventTracker::take_changes`] each tick; changes
+    /// trigger plugin events.
+    event_tracker: EventTracker,
 }
 
 /// Outcome of polling exited child processes across pane and primary sessions.
@@ -196,9 +345,10 @@ impl TerminalApp {
         keymaps: Vec<bitty_config::ResolvedKeymap>,
         spawn_spec: SpawnSpec,
     ) -> Self {
+        let event_tracker = EventTracker::from_runtime(&runtime);
         Self {
             runtime,
-            window: WindowState::new(window_title_for_theme(theme_name, source)),
+            window: WindowState::new(theme_name, source),
             pty_rx: None,
             _pty_thread: None,
             presented_frames: 0,
@@ -207,6 +357,9 @@ impl TerminalApp {
             log_level: LogLevel::default_level(),
             session_persistence: true,
             live_snapshot: None,
+            live_workspaces: None,
+            plugin_runtime: None,
+            event_tracker,
         }
     }
 
@@ -225,9 +378,10 @@ impl TerminalApp {
         spawn_spec: SpawnSpec,
     ) -> Self {
         let (pty_rx, handle) = spawn_demo_pty_pump_with_theme(theme_name, source);
+        let event_tracker = EventTracker::from_runtime(&runtime);
         Self {
             runtime,
-            window: WindowState::new(window_title_for_theme(theme_name, source)),
+            window: WindowState::new(theme_name, source),
             pty_rx: Some(pty_rx),
             _pty_thread: Some(handle),
             presented_frames: 0,
@@ -236,6 +390,9 @@ impl TerminalApp {
             log_level: LogLevel::default_level(),
             session_persistence: true,
             live_snapshot: None,
+            live_workspaces: None,
+            plugin_runtime: None,
+            event_tracker,
         }
     }
 
@@ -326,6 +483,26 @@ impl TerminalApp {
         self
     }
 
+    /// Attaches the shared live workspace source (CTX-0889). Production
+    /// startup passes the handle returned by
+    /// [`crate::plugin_runtime::discover_and_activate`]; plugin-less runs
+    /// leave it `None`.
+    pub(crate) fn with_live_workspaces(
+        mut self,
+        workspaces: Option<std::rc::Rc<crate::plugin_runtime::LiveWorkspaces>>,
+    ) -> Self {
+        self.live_workspaces = workspaces;
+        self
+    }
+
+    /// Attaches the plugin runtime (CTX-0892). Production startup passes
+    /// the runtime returned by [`crate::plugin_runtime::discover_and_activate`];
+    /// tests and plugin-less runs leave it `None`.
+    pub(crate) fn with_plugin_runtime(mut self, runtime: Option<PluginRuntime>) -> Self {
+        self.plugin_runtime = runtime;
+        self
+    }
+
     /// Injects the effective-config Leader binding (CTX-0723 #981).
     ///
     /// Resolved once at startup from `leader_key` / `leader_timeout_ms`
@@ -344,6 +521,69 @@ impl TerminalApp {
     pub(crate) fn with_hints_enabled(mut self, enabled: bool) -> Self {
         self.chrome = self.chrome.with_hints_enabled(enabled);
         self
+    }
+
+    /// Adopts the app-owned half of an accepted live reload (CTX-0898, #1522).
+    ///
+    /// Swaps the resolved keymap table (`keymaps` + `mod_key`), the Leader
+    /// binding (`leader_key` + `leader_timeout_ms`), and the hint kill switch
+    /// (`hints_enabled`), and re-applies the platform transparency hint for
+    /// `window.opacity`. A Leader window or hint session armed under the old
+    /// binding is cancelled when the binding changes or hints are disabled,
+    /// so no stale chord or armed window outlives the reload. Held-key
+    /// ownership is kept: a press consumed under the old table still owns its
+    /// release (CTX-0229).
+    pub(crate) fn adopt_live_config(&mut self, adoption: crate::config_reload::AppAdoption) {
+        let leader_changed = self.chrome.leader != adoption.leader;
+        let keymaps_changed = self.chrome.keymaps != adoption.keymaps;
+        let hints_disabled = self.chrome.hints_enabled && !adoption.hints_enabled;
+        self.chrome.keymaps = adoption.keymaps;
+        self.chrome.leader = adoption.leader;
+        self.chrome.hints_enabled = adoption.hints_enabled;
+        // An armed Leader window or hint session was opened under the old
+        // binding/table; its follow-up chord could now mean something else,
+        // so cancel it (fail-open: keys route normally again).
+        if leader_changed || keymaps_changed || hints_disabled {
+            self.chrome.leader_state = bitty_config::LeaderState::Idle;
+            self.runtime.cw_hint_disarm();
+        }
+        if (bitty_platform::sanitize_opacity(adoption.window_opacity)
+            - bitty_platform::sanitize_opacity(self.window.opacity))
+        .abs()
+            >= f32::EPSILON
+        {
+            self.window.opacity = adoption.window_opacity;
+            if let Some(handle) = self.window.handle.as_ref() {
+                let _ = handle.set_opacity(adoption.window_opacity);
+                handle.request_redraw();
+            }
+        }
+        self.refresh_theme_title(adoption.theme_name);
+    }
+
+    /// Rebuilds the base window title for a live theme change (CTX-0898).
+    ///
+    /// The base title is the fallback shown while no terminal-reported
+    /// (OSC 0/2) title is active; once an application has set its own title
+    /// that title stays on the OS window and only the fallback updates.
+    fn refresh_theme_title(&mut self, theme_name: &str) {
+        let title = window_title_for_theme(theme_name, &self.window.theme_source);
+        if title == self.window.title {
+            return;
+        }
+        let previous = std::mem::replace(&mut self.window.title, title);
+        let showing_base = match self.window.last_applied_title.as_deref() {
+            None => true,
+            Some(applied) => applied == previous,
+        };
+        if showing_base {
+            if self.window.last_applied_title.is_some() {
+                self.window.last_applied_title = Some(self.window.title.clone());
+            }
+            if let Some(sink) = self.window.os_title_sink.as_ref() {
+                sink.set_os_title(&self.window.title);
+            }
+        }
     }
 
     /// True when per-frame `bitty tick` stderr lines are emitted.
@@ -500,6 +740,15 @@ impl TerminalApp {
         // presentation values. The watcher is a per-tick poll; without an
         // installed context this is a no-op.
         let _ = crate::config_reload::poll_file(&mut self.runtime);
+        // CTX-0898 (#1522): either reload path (ctl verb drained above or the
+        // file poll) may have accepted chrome-owned fields; adopt them here
+        // on the same tick so keys typed after this frame use the new table.
+        if let Some(adoption) = crate::config_reload::take_app_adoption() {
+            self.adopt_live_config(adoption);
+        }
+        // CTX-0889: apply plugin workspace mutations queued since the last
+        // tick before it commits, so the presented frame reflects them.
+        self.apply_plugin_workspace_requests();
         // CTX-0382: drain cold-path events on every tick — including
         // deferred (synchronized update) and idle ticks — because a title
         // change produces no grid damage and would otherwise sit in the
@@ -563,6 +812,10 @@ impl TerminalApp {
                 );
             }
         }
+        // CTX-0892: deliver coalesced runtime events to plugin VMs last, after
+        // present, IME sync, and the PTY reply flush, so a slow Lua handler
+        // never delays terminal replies or the frame.
+        self.deliver_runtime_events();
         stats
     }
 
@@ -584,6 +837,129 @@ impl TerminalApp {
                 self.apply_window_title(&raw);
             }
         }
+    }
+
+    /// Delivers runtime state-change events to plugin VMs (CTX-0892).
+    ///
+    /// Runs once per tick at the end of [`Self::drive_tick`]. Coalesced per kind
+    /// (see [`EventTracker::take_changes`]); handler failures are contained
+    /// by the plugin runtime and never reach the app. No-op without plugins.
+    fn deliver_runtime_events(&mut self) {
+        let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
+            return;
+        };
+        // CTX-0889: one bounded summary pass serves both the live workspace
+        // source and the event diff.
+        let workspaces = self.runtime.workspace_summaries();
+        if let Some(live) = self.live_workspaces.as_ref() {
+            live.publish(&workspaces);
+        }
+        let events = self.event_tracker.take_changes(
+            self.runtime.state().title(),
+            self.runtime.is_window_focused(),
+            &workspaces,
+        );
+        for (kind, payload) in &events {
+            let _delivered = plugin_runtime.deliver_event(kind, payload);
+        }
+    }
+
+    /// Applies queued `bitty.workspace.*` requests (CTX-0889, ADR-0014).
+    ///
+    /// Bounded by the plugin runtime's request queue capacity. Each request
+    /// runs through the exact handler its keybinding uses
+    /// ([`Self::apply_chrome_action`]: capacity limit, never-empty last
+    /// workspace, zoom restore before a move, kill-confirm arm), so plugin
+    /// and keyboard behaviour cannot drift. Fail-closed rules:
+    /// - while a capturing modal is up (workspace/view close confirm or a
+    ///   panel overlay) every request is dropped, exactly like bound chords;
+    /// - a plugin close only ever *arms* the kill confirm for a live
+    ///   workspace; confirming stays a user gesture (repeat chord), so a
+    ///   plugin can never kill live shells on its own;
+    /// - a stable id that no longer exists drops the request.
+    pub(crate) fn apply_plugin_workspace_requests(&mut self) {
+        let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
+            return;
+        };
+        let requests = plugin_runtime.drain_workspace_requests();
+        for queued in requests {
+            if self.workspace_requests_blocked() {
+                crate::logging::warn(|| {
+                    format!(
+                        "bitty: plugin '{}' workspace request dropped (confirmation pending)",
+                        queued.plugin_id
+                    )
+                });
+                continue;
+            }
+            if !self.apply_workspace_request(&queued.request) {
+                crate::logging::warn(|| {
+                    format!(
+                        "bitty: plugin '{}' workspace request refused (unknown workspace id)",
+                        queued.plugin_id
+                    )
+                });
+            }
+        }
+    }
+
+    /// Whether a capturing modal blocks workspace mutation (CTX-0889):
+    /// the same set that swallows bound chords in `resolve_priority_for`.
+    fn workspace_requests_blocked(&self) -> bool {
+        self.runtime.has_pending_ws_close()
+            || self.runtime.has_pending_close_confirm()
+            || self.runtime.overlay_modal_active()
+    }
+
+    /// Applies one validated request; `false` when its target id is gone.
+    fn apply_workspace_request(&mut self, request: &WorkspaceRequest) -> bool {
+        use bitty_config::ChromeAction as A;
+        let one_based = |index: usize| u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
+        match request {
+            WorkspaceRequest::FocusId(seq) => {
+                let Some(index) = self.runtime.workspace_index_by_seq(*seq) else {
+                    return false;
+                };
+                self.apply_chrome_action(A::WorkspaceFocus(one_based(index)));
+            }
+            WorkspaceRequest::FocusIndex(position) => {
+                self.apply_chrome_action(A::WorkspaceFocus(*position));
+            }
+            WorkspaceRequest::New => self.apply_chrome_action(A::WorkspaceNew),
+            WorkspaceRequest::Next => self.apply_chrome_action(A::WorkspaceNext),
+            WorkspaceRequest::Close(target) => {
+                let index = match target {
+                    None => self.runtime.active_workspace_index(),
+                    Some(seq) => match self.runtime.workspace_index_by_seq(*seq) {
+                        Some(index) => index,
+                        None => return false,
+                    },
+                };
+                if index == self.runtime.active_workspace_index() {
+                    self.apply_chrome_action(A::WorkspaceClose);
+                } else {
+                    let _ = self.runtime.workspace_close_request_at(index);
+                }
+            }
+            WorkspaceRequest::Rename { id: seq, name } => {
+                let Some(index) = self.runtime.workspace_index_by_seq(*seq) else {
+                    return false;
+                };
+                // Same Core handler as `bitty ctl workspace rename`.
+                if let Err(err) = self.runtime.workspace_rename(index, name) {
+                    crate::logging::warn(|| {
+                        format!("bitty: plugin workspace rename refused ({err})")
+                    });
+                }
+            }
+            WorkspaceRequest::MovePanel(seq) => {
+                let Some(index) = self.runtime.workspace_index_by_seq(*seq) else {
+                    return false;
+                };
+                self.apply_chrome_action(A::WorkspaceMove(one_based(index)));
+            }
+        }
+        true
     }
 
     /// Checks for exited shell processes across both split pane sessions and
@@ -1155,4 +1531,159 @@ impl AppHandler for TerminalApp {
 fn _assert_channel_capacity_is_documented() {
     const EXPECTED: usize = 16;
     const { assert!(EXPECTED > 0) }
+}
+
+#[cfg(test)]
+mod event_tracker_tests {
+    use super::*;
+
+    fn tracker(title: &str, window_focused: bool) -> EventTracker {
+        EventTracker {
+            title: title.to_string(),
+            window_focused,
+            workspaces: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn unchanged_state_delivers_nothing() {
+        let mut t = tracker("same", true);
+        assert!(t.take_changes("same", true, &[]).is_empty());
+    }
+
+    #[test]
+    fn title_change_coalesces_to_latest_and_updates_tracker() {
+        let mut t = tracker("old", false);
+        let changes = t.take_changes("newest", false, &[]);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].0, "terminal.title-changed");
+        assert_eq!(
+            changes[0].1,
+            LuaValue::table([("title", LuaValue::String("newest".into()))])
+        );
+        assert_eq!(t.title, "newest");
+        assert!(t.take_changes("newest", false, &[]).is_empty());
+    }
+
+    #[test]
+    fn focus_change_carries_new_value() {
+        let mut t = tracker("x", false);
+        let changes = t.take_changes("x", true, &[]);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].0, "focus.changed");
+        assert_eq!(
+            changes[0].1,
+            LuaValue::table([("focused", LuaValue::Bool(true))])
+        );
+        assert!(t.window_focused);
+    }
+
+    #[test]
+    fn both_changes_are_bounded_to_one_event_per_kind() {
+        let mut t = tracker("a", false);
+        let kinds: Vec<_> = t
+            .take_changes("b", true, &[])
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(kinds, ["terminal.title-changed", "focus.changed"]);
+    }
+
+    #[test]
+    fn workspace_changes_coalesce_and_order_closed_created_renamed_changed_focused() {
+        use bitty_runtime::WorkspaceSummary;
+        let ws = |seq: u64, name: &str, active: bool, panels: Vec<u64>| WorkspaceSummary {
+            seq,
+            name: name.to_string(),
+            active,
+            panel_ids: panels,
+        };
+        let mut t = tracker("t", true);
+        let old = vec![ws(1, "ws1", true, vec![10]), ws(2, "ws2", false, vec![20])];
+        assert!(t.take_changes("t", true, &old).is_empty(), "first snapshot");
+        // Workspace 1 closed, 3 created, 2 renamed+changed, 2 focused.
+        let new = vec![
+            ws(2, "edited", true, vec![20, 21]),
+            ws(3, "ws3", false, vec![30]),
+        ];
+        let events = t.take_changes("t", true, &new);
+        let kinds: Vec<_> = events.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            kinds,
+            [
+                "workspace.closed",
+                "workspace.created",
+                "workspace.renamed",
+                "workspace.changed",
+                "workspace.focused"
+            ]
+        );
+        let id_of = |payload: &LuaValue| match payload {
+            LuaValue::Table(pairs) => pairs
+                .iter()
+                .find_map(|(k, v)| match (k, v) {
+                    (LuaValue::String(s), LuaValue::Integer(id)) if s == "id" => Some(*id),
+                    _ => None,
+                })
+                .expect("id not found or not an integer"),
+            _ => panic!("payload not a table"),
+        };
+        assert_eq!(id_of(&events[0].1), 1, "closed event carries seq 1");
+        assert_eq!(id_of(&events[1].1), 3, "created event carries seq 3");
+        assert_eq!(id_of(&events[2].1), 2, "renamed event carries seq 2");
+        assert_eq!(id_of(&events[3].1), 2, "changed event carries seq 2");
+        assert_eq!(id_of(&events[4].1), 2, "focused event carries seq 2");
+        assert_eq!(t.workspaces, new, "tracker holds the committed snapshot");
+    }
+
+    #[test]
+    fn workspace_events_fire_at_most_once_per_workspace_per_tick() {
+        use bitty_runtime::WorkspaceSummary;
+        let ws = |seq: u64, name: &str, active: bool, panels: Vec<u64>| WorkspaceSummary {
+            seq,
+            name: name.to_string(),
+            active,
+            panel_ids: panels,
+        };
+        let mut t = tracker("t", true);
+        let old = vec![ws(1, "ws1", true, vec![10]), ws(2, "ws2", false, vec![20])];
+        t.take_changes("t", true, &old);
+        // Two workspaces closed, two created: four events bounded by workspace count.
+        let new = vec![ws(3, "ws3", true, vec![30]), ws(4, "ws4", false, vec![40])];
+        let events = t.take_changes("t", true, &new);
+        assert_eq!(
+            events.len(),
+            5,
+            "2 closed + 2 created + 1 focused = 5 events"
+        );
+    }
+
+    #[test]
+    fn workspace_events_skip_unchanged_kinds() {
+        use bitty_runtime::WorkspaceSummary;
+        let ws = |seq: u64, name: &str, active: bool, panels: Vec<u64>| WorkspaceSummary {
+            seq,
+            name: name.to_string(),
+            active,
+            panel_ids: panels,
+        };
+        let mut t = tracker("t", true);
+        let old = vec![ws(1, "ws1", true, vec![10])];
+        t.take_changes("t", true, &old);
+        let same = vec![ws(1, "ws1", true, vec![10])];
+        assert!(
+            t.take_changes("t", true, &same).is_empty(),
+            "identical summary fires nothing"
+        );
+        // Name change only: one renamed event.
+        let renamed = vec![ws(1, "editor", true, vec![10])];
+        let events = t.take_changes("t", true, &renamed);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "workspace.renamed");
+        // Panel change only: one changed event.
+        let changed = vec![ws(1, "editor", true, vec![10, 11])];
+        let events = t.take_changes("t", true, &changed);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "workspace.changed");
+    }
 }

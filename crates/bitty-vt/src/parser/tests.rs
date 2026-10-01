@@ -2006,6 +2006,47 @@ fn apc_g_parser_continuation_accounts_for_current_header_and_peak() {
 }
 
 #[test]
+fn apc_g_parser_chafa_padded_chunk_then_empty_terminator_emits() {
+    // chafa -f kitty: empty opener, a padded `m=1` chunk, empty `m=0` end.
+    let mut parser = Parser::new();
+    let mut actions = Vec::new();
+    parser.advance(
+        b"\x1b_Ga=T,f=32,s=1,v=1,c=1,r=1,m=1,q=2;\x1b\\\x1b_Gm=1;/wAA/w==\x1b\\",
+        |action| actions.push(action),
+    );
+    assert!(actions.is_empty());
+    assert!(parser.has_pending_kitty());
+    parser.advance(b"\x1b_Gm=0;\x1b\\", |action| actions.push(action));
+    assert!(!parser.has_pending_kitty());
+    match kitty_action(&actions) {
+        TerminalAction::KittyGraphics { payload, .. } => {
+            assert_eq!(&**payload, &[0xFF, 0, 0, 0xFF]);
+        }
+        other => panic!("expected KittyGraphics, got {other:?}"),
+    }
+}
+
+#[test]
+fn apc_g_parser_raw_claim_exceeds_ledger_cap_but_compressed_does_not() {
+    // A 2x2 RGB raw claim (12 bytes) is bounded by its declared size, not by
+    // the 9-byte IMG-1 cap; the same claim marked `o=z` keeps the IMG-1 cap.
+    let cap = 9;
+    let encoded = kitty_base64(&[0x11; 12]);
+    for (header, should_emit) in [
+        (b"\x1b_Gf=24,s=2,v=2,m=0;".as_slice(), true),
+        (b"\x1b_Gf=24,o=z,s=2,v=2,m=0;".as_slice(), false),
+    ] {
+        let mut sequence = header.to_vec();
+        sequence.extend_from_slice(encoded.as_bytes());
+        sequence.extend_from_slice(b"\x1b\\");
+        let mut parser = Parser::with_ledger_cap(cap);
+        let mut actions = Vec::new();
+        parser.advance(&sequence, |action| actions.push(action));
+        assert_eq!(actions.len(), usize::from(should_emit));
+    }
+}
+
+#[test]
 fn apc_g_valid_single_shot_emits_decoded_payload() {
     // 2x2 opaque red RGBA (`f=32,s=2,v=2`), base64 `/wAA//8AAP//AAD//wAA/w==`.
     let seq = b"\x1b_Gf=32,s=2,v=2,m=0;/wAA//8AAP//AAD//wAA/w==\x1b\\";
@@ -2205,4 +2246,106 @@ fn apc_g_held_esc_bel_c1_st_is_chunk_invariant() {
         split_parser.advance(&sequence[held_end..], |action| split.push(action));
         assert_eq!(whole, split, "held terminator {terminator:#x}");
     }
+}
+
+#[test]
+fn apc_g_parser_malformed_continuation_drops_open_stream() {
+    let mut parser = Parser::new();
+    let mut actions = Vec::new();
+    parser.advance(b"\x1b_Gf=32,s=2,v=2,m=1;/wAA//8A\x1b\\", |a| {
+        actions.push(a)
+    });
+    assert!(parser.has_pending_kitty());
+    // Continuation without `m=`: the open stream is dropped, not kept.
+    parser.advance(b"\x1b_Gq=2;AP//AAD/\x1b\\", |a| actions.push(a));
+    assert!(!parser.has_pending_kitty());
+    // The would-be tail is an orphan and emits nothing.
+    parser.advance(b"\x1b_Gm=0;AP//AAD//wAA/w==\x1b\\", |a| actions.push(a));
+    assert!(actions.is_empty());
+}
+
+#[test]
+fn apc_g_parser_stalled_stream_dropped_after_interleaved_text() {
+    let mut parser = Parser::new();
+    let mut actions = Vec::new();
+    parser.advance(b"\x1b_Gf=32,s=2,v=2,m=1;/wAA//8A\x1b\\", |_| {});
+    assert!(parser.has_pending_kitty());
+    let text = vec![b'x'; crate::kitty_apc::KITTY_APC_STALL_MAX_BYTES];
+    parser.advance(&text, |_| {});
+    assert!(
+        parser.has_pending_kitty(),
+        "at the bound the stream survives"
+    );
+    parser.advance(b"y", |_| {});
+    assert!(!parser.has_pending_kitty(), "past the bound it is dropped");
+    parser.advance(b"\x1b_Gm=0;AP//AAD//wAA/w==\x1b\\", |a| actions.push(a));
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, TerminalAction::KittyGraphics { .. })),
+        "a stalled stream's tail must not emit"
+    );
+}
+
+#[test]
+fn apc_g_parser_chunked_stream_survives_small_interleaving() {
+    // Stray output between chunks (well under the stall bound) is tolerated.
+    let mut parser = Parser::new();
+    let mut actions = Vec::new();
+    parser.advance(b"\x1b_Gf=32,s=2,v=2,m=1;/wAA//8A\x1b\\", |a| {
+        actions.push(a)
+    });
+    parser.advance(b"\r\n\x1b[0m", |a| actions.push(a));
+    parser.advance(b"\x1b_Gm=0;AP//AAD//wAA/w==\x1b\\", |a| actions.push(a));
+    actions.retain(|a| matches!(a, TerminalAction::KittyGraphics { .. }));
+    match kitty_action(&actions) {
+        TerminalAction::KittyGraphics { payload, .. } => {
+            assert_eq!(&**payload, &[0xFF, 0, 0, 0xFF].repeat(4));
+        }
+        other => panic!("expected KittyGraphics, got {other:?}"),
+    }
+}
+
+#[test]
+fn apc_g_parser_esc_flood_in_discarded_apc_hits_stall_bound() {
+    let mut parser = Parser::new();
+    parser.advance(b"\x1b_Gf=32,s=2,v=2,m=1;/wAA//8A\x1b\\", |_| {});
+    assert!(parser.has_pending_kitty());
+    // A discarded non-`G` APC followed by an endless ESC run.
+    parser.advance(b"\x1b_X;", |_| {});
+    let flood = vec![0x1B; crate::kitty_apc::KITTY_APC_STALL_MAX_BYTES + 1];
+    parser.advance(&flood, |_| {});
+    assert!(
+        !parser.has_pending_kitty(),
+        "ESC flood must hit the stall bound"
+    );
+
+    // Same flood split into one-byte `advance` calls (held-ESC path).
+    let mut parser = Parser::new();
+    parser.advance(b"\x1b_Gf=32,s=2,v=2,m=1;/wAA//8A\x1b\\", |_| {});
+    parser.advance(b"\x1b_X;", |_| {});
+    for _ in 0..=crate::kitty_apc::KITTY_APC_STALL_MAX_BYTES {
+        parser.advance(&[0x1B], |_| {});
+    }
+    assert!(
+        !parser.has_pending_kitty(),
+        "split ESC flood must hit the bound"
+    );
+}
+
+#[test]
+fn apc_discarding_held_esc_then_esc_backslash_terminates() {
+    // `ESC ESC \` split after the first ESC must still find the ST.
+    let mut parser = Parser::new();
+    let mut actions = Vec::new();
+    parser.advance(b"\x1b_X;junk\x1b", |a| actions.push(a));
+    parser.advance(b"\x1b\\ok", |a| actions.push(a));
+    let printed: String = actions
+        .iter()
+        .filter_map(|a| match a {
+            TerminalAction::Print(cell) => Some(cell.clone().scalar()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(printed, "ok");
 }

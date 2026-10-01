@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+<<<<<<< HEAD
 - **Windows owned-process-tree backend (CTX-0903, #1536):** jobs on Windows
   now run in a kill-on-close Job Object, so a cancel, timeout, or kill ends
   the whole tree (grandchildren included) and snapshots report
@@ -30,6 +31,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (it depends on `bitty-winjob` there), so `bitty-winjob` must be published
   before `bitty-pty`; the 0.0.1 "Group 1 — Leaves" list below is historical
   and no longer describes `bitty-pty`.
+=======
+- **Workspace domain for Lua plugins (CTX-0889, #1569):** plugins can now read
+  workspace state and control workspace operations through two new capabilities:
+  `workspace.read` (query list, receive events) and `workspace.control` (focus,
+  create, close, rename, move panels). `bitty.workspace.list()` returns an array
+  of workspace summaries (id, name, active, panel_count, attention flags);
+  events `workspace.created`, `workspace.closed`, `workspace.renamed`,
+  `workspace.changed`, and `workspace.focused` are delivered to plugins with
+  `workspace.read`. Control functions `bitty.workspace.focus(id)`, `.new()`,
+  `.close(id)`, `.rename(id, name)`, and `.move_panel(id)` are gated by
+  `workspace.control` and match keybinding behavior (capacity limit, never-empty
+  last workspace, kill-confirm on live sessions). All APIs are bounded by
+  `MAX_WORKSPACES` (16) and coalesced per tick.
+- **Live reload adopts every `Live` config field (CTX-0898, #1522):** a reload
+  now applies the remaining `Live` keys without a restart. `appearance.theme`
+  and `appearance.colors` swap the renderer and surface palette
+  (`Runtime::set_theme_palette`) and keep live OSC 4/10/11/12 overrides.
+  `font.family`, `font.line_height`, and `font.letter_spacing` reload the face,
+  rebuild the glyph atlas at the live DPI scale, and reflow the grid
+  (`Runtime::set_font_face`). A face that fails to load keeps the running font.
+  `window.opacity` reconfigures the GPU surface alpha
+  (`Runtime::set_window_opacity`) and re-applies the window transparency hint.
+  winit only honors that hint at window creation on X11, so an X11 window that
+  started opaque can stay visually opaque until restart.
+  `decoration.background_image` / `background_fit` / `background_image_roots`
+  and `views` re-run the fail-closed background load pipeline and the RFC-0001
+  AC-1/AC-2 check against every existing View before anything is swapped
+  (`Runtime::set_background_appearance`). `keymaps`, `mod_key`, `leader_key`,
+  `leader_timeout_ms`, and `hints_enabled` re-resolve with the startup
+  resolvers, and the app adopts them on the same tick. A Leader window armed
+  under the old binding is cancelled. Any resolve or setter error rolls the
+  reload back as `apply-error`. The reload diff now reports the three global
+  `decoration.background_*` leaves; before this change a background-only edit
+  was reported as `unchanged`. No `Live` field is left in the reply's
+  `restart_required` list. The theme, outline colors, and outline ring widths
+  are installed before the per-View contrast check, so `views` rules are
+  judged against the outline the same reload adopts. A rollback swaps the
+  previously decoded background store back instead of re-reading images from
+  disk. A keymap change also cancels an armed Leader/hint session. A theme
+  reload refreshes the window title. Font family, size, and spacing adopt in
+  one atlas rebuild. `bitty-config` now exports the `LIVE_FIELDS` /
+  `RESTART_REQUIRED_FIELDS` lists that drive `classify_field`.
+>>>>>>> origin/main
 - **Live configuration reload (CTX-0814, #1397):** `reconcile_live` now has a
   production caller. The composition root installs a reload context at startup
   (skipped under `--safe`), and both `bitty ctl config reload` and an automatic
@@ -46,7 +90,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Live-adopt coverage is the presentation subset the runtime exposes; the
   remaining `Live` keys (`font.family`/`line_height`/`letter_spacing`,
   `appearance.theme`/`colors`, `keymaps`/`leader`/`mod_key`, `window.opacity`)
-  are follow-ups with no runtime adopter yet.
+  are adopted by the CTX-0898 entry above.
 - **Workspace bar reserves its own row (CTX-0873, #1431):** the workspace bar
   is a Core-owned chrome band carved out of the window grid before layout, so
   it no longer paints over the last terminal row. Every leaf, the primary
@@ -57,6 +101,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `bottom`) places the band; `top` shifts content down one row. Both
   `workspace.bar.edge` and `workspace.show_bar` reload live and reflow in
   place.
+- **Plugin runtime wired into app loop (CTX-0892, #1564):** `PluginRuntime`
+  now lives in `TerminalApp` instead of being dropped at startup. At the end
+  of each tick, after present and the PTY reply flush, the app delivers
+  `terminal.title-changed` and `focus.changed` to subscribed plugins,
+  coalesced to at most one event per kind carrying the latest value. Added the
+  read accessor `PluginRuntime::ui_blocks()` (discovery order) for later chrome
+  rendering. Routing keymap/control actions to plugin commands is deferred.
 
 ### Changed
 

@@ -333,6 +333,37 @@ pub fn decode_kitty_payload(
     }
 }
 
+/// Decodes a Kitty graphics payload from an owned byte buffer.
+///
+/// For f=32 (RGBA), the payload is moved directly into the returned image
+/// without copying. For f=24 (RGB), the buffer is expanded in place. PNG
+/// streams still require a copy (the PNG decoder needs a borrow).
+///
+/// This avoids the ~64 MiB copy that `decode_kitty_payload` incurs on large
+/// raw RGBA streams.
+pub fn decode_kitty_payload_owned(
+    format: KittyTransmitFormat,
+    width: Option<u32>,
+    height: Option<u32>,
+    payload: Box<[u8]>,
+) -> Result<KittyDecodedImage, KittyDecodeError> {
+    if payload.is_empty() {
+        return Err(KittyDecodeError::EmptyPayload);
+    }
+    // Convert Box<[u8]> to Vec<u8> for owned processing.
+    let payload = payload.into_vec();
+    match format {
+        KittyTransmitFormat::Png => decode_png(&payload),
+        KittyTransmitFormat::Rgb | KittyTransmitFormat::Rgba => {
+            let (Some(w), Some(h)) = (width, height) else {
+                return Err(KittyDecodeError::MissingDimensions);
+            };
+            let channels = format.raw_channels().unwrap_or(3);
+            decode_raw_owned(w, h, channels, payload)
+        }
+    }
+}
+
 /// Decodes raw RGB/RGBA bytes into an RGBA8 bitmap.
 ///
 /// All bounds (including the exact-length check) run before the RGBA
@@ -371,6 +402,58 @@ fn decode_raw(
     let rgba = if channels == 4 {
         payload.to_vec()
     } else {
+        let mut out = Vec::with_capacity(rgba_len);
+        for px in payload.chunks_exact(3) {
+            out.extend_from_slice(&[px[0], px[1], px[2], 0xFF]);
+        }
+        out
+    };
+    debug_assert_eq!(rgba.len(), rgba_len);
+    Ok(KittyDecodedImage {
+        width,
+        height,
+        rgba,
+    })
+}
+
+/// Decodes raw RGB/RGBA bytes from an owned buffer, avoiding copies.
+///
+/// For RGBA (channels == 4), the payload is moved directly into the result.
+/// For RGB (channels == 3), the buffer is expanded in place with alpha bytes.
+/// All bounds checks run before allocation, just like [`decode_raw`].
+fn decode_raw_owned(
+    width: u32,
+    height: u32,
+    channels: usize,
+    mut payload: Vec<u8>,
+) -> Result<KittyDecodedImage, KittyDecodeError> {
+    let pixels = checked_dimensions(width, height)?;
+    let expected = (pixels as usize)
+        .checked_mul(channels)
+        .filter(|&n| n <= KITTY_DECODE_MAX_BYTES)
+        .ok_or(KittyDecodeError::DecodedTooLarge {
+            bytes: usize::MAX,
+            cap: KITTY_DECODE_MAX_BYTES,
+        })?;
+    if payload.len() != expected {
+        return Err(KittyDecodeError::LengthMismatch {
+            expected,
+            actual: payload.len(),
+        });
+    }
+    let rgba_len = (pixels as usize)
+        .checked_mul(4)
+        .filter(|&n| n <= KITTY_DECODE_MAX_BYTES)
+        .ok_or(KittyDecodeError::DecodedTooLarge {
+            bytes: usize::MAX,
+            cap: KITTY_DECODE_MAX_BYTES,
+        })?;
+    let rgba = if channels == 4 {
+        // Zero-copy path: the payload is already RGBA, move it directly.
+        payload
+    } else {
+        // RGB -> RGBA expansion: reserve extra space and expand in place.
+        payload.reserve(rgba_len - payload.len());
         let mut out = Vec::with_capacity(rgba_len);
         for px in payload.chunks_exact(3) {
             out.extend_from_slice(&[px[0], px[1], px[2], 0xFF]);

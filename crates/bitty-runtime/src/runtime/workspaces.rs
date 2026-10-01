@@ -77,6 +77,25 @@ pub struct WorkspaceSlot {
     pub focus: Focus,
 }
 
+/// Plain-data read view of one workspace (CTX-0889, ADR-0014).
+///
+/// Built by [`Runtime::workspace_summaries`] for observers outside the
+/// runtime (the plugin workspace domain). Carries identity, order, and panel
+/// structure only — never terminal content — and no plugin types, so the
+/// runtime stays free of the plugin boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceSummary {
+    /// Stable creation sequence (`ws{seq}` identity across index shifts).
+    pub seq: u64,
+    /// Display name (bounded by [`WORKSPACE_NAME_MAX_CHARS`] on rename).
+    pub name: String,
+    /// Whether this is the active workspace.
+    pub active: bool,
+    /// Leaf (panel) view ids in layout order; the active slot reads the
+    /// live layout. Its length is the panel count.
+    pub panel_ids: Vec<u64>,
+}
+
 /// A close awaiting explicit confirmation (kill-confirm gate).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingWsClose {
@@ -222,6 +241,35 @@ impl Runtime {
     #[must_use]
     pub fn workspace_index_by_seq(&self, seq: u64) -> Option<usize> {
         self.workspaces.iter().position(|s| s.seq == seq)
+    }
+
+    /// Plain-data summaries of every workspace in index order (CTX-0889).
+    ///
+    /// Bounded by [`MAX_WORKSPACES`] (the slot-table invariant). The active
+    /// slot's panels come from the live layout (its stash is refreshed only
+    /// on switch-away), so the summary is never stale. Time O(w + l) over
+    /// `w` workspaces and `l` total leaves; space O(w + l).
+    #[must_use]
+    pub fn workspace_summaries(&self) -> Vec<WorkspaceSummary> {
+        self.workspaces
+            .iter()
+            .take(MAX_WORKSPACES)
+            .enumerate()
+            .map(|(index, slot)| {
+                let active = index == self.active_workspace;
+                let leaves = if active {
+                    self.layout.leaf_ids()
+                } else {
+                    slot.layout.leaf_ids()
+                };
+                WorkspaceSummary {
+                    seq: slot.seq,
+                    name: slot.name.clone(),
+                    active,
+                    panel_ids: leaves.into_iter().map(|id| id.0).collect(),
+                }
+            })
+            .collect()
     }
 
     /// Minimal tabline render: names + indices + focused marker + count.
@@ -972,7 +1020,24 @@ impl Runtime {
     /// a pending arm for another workspace is replaced loudly. Never a
     /// silent kill.
     pub fn workspace_close_request(&mut self) -> WsCloseRequest {
-        let index = self.active_workspace;
+        // The active index is always a valid slot (`>= 1` invariant); the
+        // fallback is unreachable and reports a no-op close.
+        self.workspace_close_request_at(self.active_workspace)
+            .unwrap_or(WsCloseRequest::Closed { killed: 0 })
+    }
+
+    /// Close workspace `index` (0-based) through the same kill-confirm gate
+    /// as [`Self::workspace_close_request`] (CTX-0889).
+    ///
+    /// The keybinding path is this call with the active index. An idle
+    /// target closes immediately; a live one arms the pending confirm for
+    /// `index` (the arm survives a switch, and switching to it and repeating
+    /// the close chord confirms). Unknown indices fail closed with `None`:
+    /// nothing is armed or closed.
+    pub fn workspace_close_request_at(&mut self, index: usize) -> Option<WsCloseRequest> {
+        if index >= self.workspaces.len() {
+            return None;
+        }
         // Repeat-to-confirm: a pending arm for THIS workspace confirms.
         if self
             .pending_ws_close
@@ -982,14 +1047,14 @@ impl Runtime {
             self.pending_ws_close = None;
             let killed = self.kill_workspace_sessions(index);
             self.remove_workspace(index);
-            return WsCloseRequest::Closed { killed };
+            return Some(WsCloseRequest::Closed { killed });
         }
         let live = self.workspace_live_count(index);
         if live == 0 {
             self.pending_ws_close = None;
             let killed = self.kill_workspace_sessions(index);
             self.remove_workspace(index);
-            return WsCloseRequest::Closed { killed };
+            return Some(WsCloseRequest::Closed { killed });
         }
         let name = self
             .workspaces
@@ -1003,7 +1068,7 @@ impl Runtime {
         );
         self.pending_ws_close = Some(PendingWsClose { index, name, live });
         self.pending_full_redraw = true;
-        WsCloseRequest::Pending { summary }
+        Some(WsCloseRequest::Pending { summary })
     }
 
     /// Close the workspace at slot `index` (0-based): immediate, no confirm
@@ -1189,6 +1254,13 @@ impl Runtime {
     #[must_use]
     pub fn has_pending_ws_close(&self) -> bool {
         self.pending_ws_close.is_some()
+    }
+
+    /// Slot index (0-based) the pending close arm targets, if any
+    /// (CTX-0889: plugin close requests must never confirm an arm).
+    #[must_use]
+    pub fn pending_ws_close_index(&self) -> Option<usize> {
+        self.pending_ws_close.as_ref().map(|pending| pending.index)
     }
 
     /// Loud one-line summary of the pending close, if any (never-silent).

@@ -21,9 +21,11 @@
 //! development packages are read-only, re-digested, and visibly unverified.
 //! The numeric bounds below are the RFC's ratified defaults.
 
+pub mod debug;
 pub mod fs;
 pub mod manifest_toml;
 pub mod package;
+pub mod redaction;
 pub mod resolution;
 pub mod services;
 pub mod spawn;
@@ -37,6 +39,7 @@ use std::sync::Arc;
 
 use bitty_lua::gate::{VmBudgets, build_plugin_vm};
 use bitty_lua::host::DEFAULT_HOST_DEADLINE_MS;
+use bitty_lua::ui::UiNode;
 use bitty_lua::{HostServices, LuaVm, MarshallingLimits, RegistrationCapture};
 use bitty_plugin_host::DropPolicy;
 use bitty_plugin_host::capability::CapabilityId;
@@ -44,6 +47,10 @@ use bitty_plugin_host::grant::GrantRecord;
 use bitty_plugin_host::host::PluginHost;
 use bitty_plugin_host::manifest::{PluginId, PluginManifest};
 
+pub use bitty_lua::{
+    WORKSPACE_LIST_MAX_ITEMS, WORKSPACE_NAME_MAX_CHARS as WORKSPACE_INFO_NAME_MAX_CHARS,
+    WORKSPACE_RENAME_MAX_BYTES, WorkspaceAttention, WorkspaceInfo, WorkspaceRequest,
+};
 pub use fs::{FakeFileSystem, FileSystem, NativeFileSystem, write_atomic_durably};
 pub use resolution::{
     CURRENT_POINTER_FILE, PLUGIN_INDEX_STATE_VERSION, PluginRecord, content_digest, load_index,
@@ -51,8 +58,9 @@ pub use resolution::{
 };
 pub use services::{
     EmptyEnv, EmptySettings, EnvSource, MAX_ENV_GRANTS, MAX_ENV_VALUE_BYTES, MapEnv, Notification,
-    NotificationQueue, PluginServices, ProcessEnv, ServiceDirectory, ServiceRecord, SettingsSource,
-    SnapshotSource, UiAccess, UiBlock, UiBlocks, UnavailableSnapshot,
+    NotificationQueue, PluginServices, ProcessEnv, QueuedWorkspaceRequest, ServiceDirectory,
+    ServiceRecord, SettingsSource, SnapshotSource, UiAccess, UiBlock, UiBlocks,
+    UnavailableSnapshot, UnavailableWorkspaces, WorkspaceRequestQueue, WorkspaceSource,
 };
 pub use store::PluginStore;
 // Bridge value/error types the host-service traits are expressed in, so the
@@ -72,6 +80,43 @@ pub const PLUGIN_MODULE_PATH_MAX_BYTES: usize = 1024;
 pub const PLUGIN_INIT_MAX_BYTES: usize = 1024 * 1024;
 /// Notification queue capacity (`RC-8` rate governance candidate).
 pub const NOTIFICATION_QUEUE_CAPACITY: usize = 64;
+
+/// Bound on queued `bitty.workspace.*` mutation requests across all plugins
+/// between two app ticks (CTX-0889).
+///
+/// Twice [`WORKSPACE_LIST_MAX_ITEMS`]: enough for a plugin to create or
+/// close every workspace in one tick, small enough that a hostile loop
+/// cannot queue unbounded work. Overflow drops the newest request and the
+/// Lua call returns `false`.
+pub const WORKSPACE_REQUEST_QUEUE_CAPACITY: usize = 2 * WORKSPACE_LIST_MAX_ITEMS;
+
+/// Event-kind prefix of the workspace domain (CTX-0889, ADR-0014).
+///
+/// Kinds under this prefix carry workspace identity, so declaring,
+/// subscribing to, tracing, or receiving them requires `workspace.read`.
+pub const WORKSPACE_EVENT_PREFIX: &str = "workspace.";
+
+/// Workspace event kinds the host publishes (CTX-0889). Spellings are
+/// candidates pending OQ-056.
+pub const WORKSPACE_EVENT_KINDS: &[&str] = &[
+    "workspace.created",
+    "workspace.closed",
+    "workspace.renamed",
+    "workspace.focused",
+    "workspace.changed",
+];
+
+// The Lua-side workspace bounds mirror the Core slot-table bounds exactly;
+// drift would let `bitty.workspace.list()` silently drop real workspaces.
+const _: () = assert!(WORKSPACE_LIST_MAX_ITEMS == crate::MAX_WORKSPACES);
+const _: () = assert!(WORKSPACE_INFO_NAME_MAX_CHARS == crate::WORKSPACE_NAME_MAX_CHARS);
+
+/// Whether `kind` is a workspace-domain event kind (prefix match, so a
+/// future kind under the prefix is gated before it is published).
+#[must_use]
+pub fn is_workspace_event(kind: &str) -> bool {
+    kind.starts_with(WORKSPACE_EVENT_PREFIX)
+}
 
 /// Closed source-class set (RFC B.1): `bundled`, `registry`, `git`, `local-path`.
 ///
@@ -473,6 +518,19 @@ pub struct PluginRuntime {
     entries: BTreeMap<PluginId, PluginEntry>,
     order: Vec<PluginId>,
     service_directory: Rc<RefCell<ServiceDirectory>>,
+    /// CTX-0897: sanitized lifecycle/registration snapshot shared with every
+    /// generation's services for `bitty.debug.inspect`; rebuilt by
+    /// [`PluginRuntime::sync_debug_view`] after each lifecycle transition.
+    debug_view: Rc<RefCell<debug::DebugView>>,
+    /// CTX-0897: per-owner event traces for `bitty.debug.trace`, fed by
+    /// [`PluginRuntime::deliver_event`].
+    trace_hub: Rc<RefCell<debug::TraceHub>>,
+    /// CTX-0889: optional workspace read source for `bitty.workspace.list`.
+    /// `None` leaves granted reads failing closed with `E_NOT_IMPLEMENTED`.
+    workspace_source: Option<Rc<dyn WorkspaceSource>>,
+    /// CTX-0889: bounded queue of `workspace.control` mutations, drained by
+    /// the application each tick ([`PluginRuntime::drain_workspace_requests`]).
+    workspace_requests: Rc<RefCell<WorkspaceRequestQueue>>,
     /// CTX-0846 (#1454): optional shared network runtime. `None` (the
     /// default) means the host has no network backend, so `bitty.network`
     /// is never registered in any plugin VM. When `Some`, the same runtime
@@ -512,6 +570,12 @@ impl PluginRuntime {
             entries: BTreeMap::new(),
             order: Vec::new(),
             service_directory: Rc::new(RefCell::new(ServiceDirectory::new())),
+            debug_view: Rc::new(RefCell::new(debug::DebugView::new())),
+            trace_hub: Rc::new(RefCell::new(debug::TraceHub::new())),
+            workspace_source: None,
+            workspace_requests: Rc::new(RefCell::new(WorkspaceRequestQueue::new(
+                WORKSPACE_REQUEST_QUEUE_CAPACITY,
+            ))),
             #[cfg(feature = "network")]
             network_runtime: None,
             store_fs: Arc::new(NativeFileSystem),
@@ -584,9 +648,56 @@ impl PluginRuntime {
             .and_then(|entry| entry.services.as_ref())
     }
 
+    /// Iterate over all mounted UI blocks across all activated plugins (CTX-0892).
+    ///
+    /// Returns (plugin_id, slot, node, version) tuples. Order is discovery
+    /// order. Rendering is deferred to the host; this is read-only access.
+    pub fn ui_blocks(&self) -> Vec<(PluginId, String, UiNode, u32)> {
+        let mut result = Vec::new();
+        for id in &self.order {
+            if let Some(entry) = self.entries.get(id) {
+                if let Some(svc) = &entry.services {
+                    svc.with_ui_blocks(|blocks| {
+                        for (_handle, block) in blocks.iter() {
+                            result.push((
+                                id.clone(),
+                                block.slot().to_string(),
+                                block.node().clone(),
+                                block.version(),
+                            ));
+                        }
+                    });
+                }
+            }
+        }
+        result
+    }
+
     /// Drain accepted notifications (async hand-off side).
     pub fn drain_notifications(&mut self) -> Vec<Notification> {
         self.notifications.borrow_mut().drain()
+    }
+
+    /// Install the workspace read source for `bitty.workspace.list`
+    /// (CTX-0889). Call before activation: each generation captures the
+    /// source when its services are built.
+    pub fn set_workspace_source(&mut self, source: Rc<dyn WorkspaceSource>) {
+        self.workspace_source = Some(source);
+    }
+
+    /// Drain queued `bitty.workspace.*` mutations in FIFO order (CTX-0889).
+    ///
+    /// The application applies each request on its own thread through the
+    /// Core handlers the keybindings use. Bounded by
+    /// [`WORKSPACE_REQUEST_QUEUE_CAPACITY`].
+    pub fn drain_workspace_requests(&mut self) -> Vec<QueuedWorkspaceRequest> {
+        self.workspace_requests.borrow_mut().drain()
+    }
+
+    /// Workspace requests dropped by queue overflow since creation.
+    #[must_use]
+    pub fn workspace_requests_dropped(&self) -> u64 {
+        self.workspace_requests.borrow().dropped()
     }
 
     /// Scan the configured roots and register every valid package.
@@ -599,6 +710,12 @@ impl PluginRuntime {
     /// host never falls back to a different revision or to bundled content.
     /// Returns `(id, result)` pairs in discovery order.
     pub fn discover(&mut self) -> Vec<(PluginId, Result<(), PluginRuntimeError>)> {
+        let results = self.discover_inner();
+        self.sync_debug_view();
+        results
+    }
+
+    fn discover_inner(&mut self) -> Vec<(PluginId, Result<(), PluginRuntimeError>)> {
         let mut results = Vec::new();
 
         for root in self.bundled_roots.clone() {
@@ -703,6 +820,12 @@ impl PluginRuntime {
     /// capture-validation, or VM failures. Failure leaves no partial
     /// activation.
     pub fn activate(&mut self, id: &PluginId) -> Result<ActivationReport, PluginRuntimeError> {
+        let result = self.activate_inner(id);
+        self.sync_debug_view();
+        result
+    }
+
+    fn activate_inner(&mut self, id: &PluginId) -> Result<ActivationReport, PluginRuntimeError> {
         let (manifest, module_root, init_path, recorded_grant, source_class) = {
             let entry = self
                 .entries
@@ -822,6 +945,39 @@ impl PluginRuntime {
         let ui_overlay = granted
             .iter()
             .any(|capability| capability.as_str() == "ui.overlay");
+        let debug_inspect = granted
+            .iter()
+            .any(|capability| capability.as_str() == "debug.inspect");
+        let debug_trace = granted
+            .iter()
+            .any(|capability| capability.as_str() == "debug.trace");
+        // CTX-0889: the workspace domain grants are independent (read never
+        // implies control, control never implies read).
+        let workspace_read = granted
+            .iter()
+            .any(|capability| capability.as_str() == "workspace.read");
+        let workspace_control = granted
+            .iter()
+            .any(|capability| capability.as_str() == "workspace.control");
+        // CTX-0889 fail-closed: declaring a `workspace.*` event kind (which
+        // admits both subscription and `debug.trace` observation) requires
+        // `workspace.read`. Reject before any VM exists instead of letting
+        // the subscription silently never fire.
+        if !workspace_read {
+            if let Some(kind) = manifest
+                .lazy
+                .events
+                .iter()
+                .find(|kind| is_workspace_event(kind))
+            {
+                let error = PluginRuntimeError::Capture {
+                    plugin: id.to_string(),
+                    detail: format!("event '{kind}' requires the 'workspace.read' capability"),
+                };
+                self.rollback(id, error.to_string());
+                return Err(error);
+            }
+        }
         let plugin_services = Rc::new(PluginServices::new(
             id.as_str(),
             store,
@@ -847,6 +1003,26 @@ impl PluginRuntime {
         // revokes. Without both, `services.get`/`provide` fail closed with
         // `E_NOT_IMPLEMENTED`.
         plugin_services.set_service_directory(self.service_directory.clone());
+        // CTX-0897: `bitty.debug` read-only backend. Each entry point needs
+        // its own grant (`debug.inspect` vs `debug.trace`, no implication);
+        // the `grants` target serves only this generation's own snapshot.
+        plugin_services.set_debug_inspect(debug_inspect);
+        plugin_services.set_debug_trace(debug_trace);
+        plugin_services.set_granted_capabilities(
+            granted
+                .iter()
+                .map(|capability| capability.as_str().to_string())
+                .collect(),
+        );
+        plugin_services.set_declared_events(manifest.lazy.events.iter().cloned().collect());
+        plugin_services.set_debug_view(self.debug_view.clone());
+        plugin_services.set_trace_hub(self.trace_hub.clone());
+        // CTX-0889: workspace L1 domain gates plus the shared backend.
+        plugin_services.set_workspace_access(workspace_read, workspace_control);
+        plugin_services.set_workspace_backend(
+            self.workspace_source.clone(),
+            Some(self.workspace_requests.clone()),
+        );
         plugin_services.set_service_manifest(
             manifest.provided_services.clone(),
             manifest.required_services.clone(),
@@ -1040,6 +1216,12 @@ impl PluginRuntime {
     ///
     /// [`PluginRuntimeError::Lifecycle`] when the transition is invalid.
     pub fn suspend(&mut self, id: &PluginId) -> Result<(), PluginRuntimeError> {
+        let result = self.suspend_inner(id);
+        self.sync_debug_view();
+        result
+    }
+
+    fn suspend_inner(&mut self, id: &PluginId) -> Result<(), PluginRuntimeError> {
         let entry = self
             .entries
             .get_mut(id)
@@ -1070,6 +1252,12 @@ impl PluginRuntime {
     ///
     /// [`PluginRuntimeError::Lifecycle`] when the transition is invalid.
     pub fn resume(&mut self, id: &PluginId) -> Result<(), PluginRuntimeError> {
+        let result = self.resume_inner(id);
+        self.sync_debug_view();
+        result
+    }
+
+    fn resume_inner(&mut self, id: &PluginId) -> Result<(), PluginRuntimeError> {
         let entry = self
             .entries
             .get_mut(id)
@@ -1102,6 +1290,12 @@ impl PluginRuntime {
     ///
     /// [`PluginRuntimeError::Lifecycle`] when the plugin is unknown.
     pub fn dispose(&mut self, id: &PluginId) -> Result<(), PluginRuntimeError> {
+        let result = self.dispose_inner(id);
+        self.sync_debug_view();
+        result
+    }
+
+    fn dispose_inner(&mut self, id: &PluginId) -> Result<(), PluginRuntimeError> {
         let entry = self
             .entries
             .get_mut(id)
@@ -1115,6 +1309,9 @@ impl PluginRuntime {
             services.clear_ui_blocks();
         }
         entry.state = LifecycleState::Disposed;
+        // CTX-0897: traces never outlive the generation (also on reload,
+        // where dispose and the next activation share one public call).
+        self.drop_traces(id);
         // LUA-OQ-8: revoke this generation's publications. The entry VM is
         // already dropped, so even a lingering record could never upgrade;
         // revocation additionally makes resolution fail closed immediately.
@@ -1145,6 +1342,12 @@ impl PluginRuntime {
     /// [`PluginRuntimeError`] when the plugin is unknown, bundled, or fails
     /// re-resolution/activation.
     pub fn reload(&mut self, id: &PluginId) -> Result<ActivationReport, PluginRuntimeError> {
+        let result = self.reload_inner(id);
+        self.sync_debug_view();
+        result
+    }
+
+    fn reload_inner(&mut self, id: &PluginId) -> Result<ActivationReport, PluginRuntimeError> {
         let (source_class, module_root) = {
             let entry = self
                 .entries
@@ -1161,7 +1364,7 @@ impl PluginRuntime {
                 detail: "bundled sources are not hot-swapped".to_string(),
             });
         }
-        self.dispose(id)?;
+        self.dispose_inner(id)?;
 
         if let Some(store_root) = self.store_root.clone() {
             let records = resolution::load_index(&store_root)?;
@@ -1179,7 +1382,7 @@ impl PluginRuntime {
             verify_module_tree(id, &module_root)?;
         }
 
-        self.activate(id)
+        self.activate_inner(id)
     }
 
     /// Dispatch one captured command, invoking its `run` function under budget.
@@ -1236,31 +1439,82 @@ impl PluginRuntime {
     ///
     /// Returns the number of handler invocations that completed. Bounded and
     /// non-blocking; per-handler failures are contained to the owning plugin.
+    ///
+    /// Each subscriber receives the payload redacted for its own activation
+    /// grant snapshot ([`redaction::recipient_view`], CTX-0899): for example
+    /// `intercept.paste` text reaches only `clipboard.read` holders, and a
+    /// kind without a reviewed policy is withheld. The trace hub applies the
+    /// same function per owner, so `debug.trace` never sees more than a
+    /// subscriber with the same grants. One envelope is built per distinct
+    /// view (at most three) and passed to handlers by reference, so the
+    /// common ungated case builds exactly one envelope per event.
     pub fn deliver_event(&mut self, kind: &str, payload: &LuaValue) -> usize {
         self.event_sequence = self.event_sequence.saturating_add(1);
-        let envelope = LuaValue::table([
-            ("kind", LuaValue::String(kind.to_string())),
-            ("sequence", LuaValue::Integer(self.event_sequence as i64)),
-            ("payload", payload.clone()),
-        ]);
+        let sequence = self.event_sequence;
+        self.record_trace(kind, payload);
+        // CTX-0889: workspace events reach only generations holding
+        // `workspace.read` (defense in depth: activation already rejects
+        // undeclared-grant workspace kinds).
+        let workspace_kind = is_workspace_event(kind);
         let ids: Vec<PluginId> = self
             .entries
             .iter()
             .filter(|(_, entry)| entry.state == LifecycleState::Active)
+            .filter(|(_, entry)| {
+                !workspace_kind
+                    || entry
+                        .services
+                        .as_ref()
+                        .is_some_and(|services| services.has_workspace_read())
+            })
             .map(|(id, _)| id.clone())
             .collect();
+        let mut envelopes: Vec<(redaction::RecipientView, LuaValue)> = Vec::new();
         let mut delivered = 0usize;
         for id in ids {
-            let handlers: Vec<_> = match self.entries.get(&id) {
-                Some(entry) => entry
-                    .registrations
-                    .events
-                    .iter()
-                    .filter(|subscription| subscription.kind == kind)
-                    .map(|subscription| subscription.handler.clone())
-                    .collect(),
+            let (handlers, view) = match self.entries.get(&id) {
+                Some(entry) => {
+                    let handlers: Vec<_> = entry
+                        .registrations
+                        .events
+                        .iter()
+                        .filter(|subscription| subscription.kind == kind)
+                        .map(|subscription| subscription.handler.clone())
+                        .collect();
+                    // No services means no grant snapshot: fail closed.
+                    let view = redaction::recipient_view(kind, |capability| {
+                        entry
+                            .services
+                            .as_ref()
+                            .is_some_and(|services| services.has_granted_capability(capability))
+                    });
+                    (handlers, view)
+                }
                 None => continue,
             };
+            if handlers.is_empty() {
+                continue;
+            }
+            // Build each distinct view's envelope once and hand handlers a
+            // reference to it: no per-subscriber clone.
+            let index = match envelopes.iter().position(|(seen, _)| *seen == view) {
+                Some(index) => index,
+                None => {
+                    envelopes.push((
+                        view,
+                        LuaValue::table([
+                            ("kind", LuaValue::String(kind.to_string())),
+                            (
+                                "sequence",
+                                LuaValue::Integer(i64::try_from(sequence).unwrap_or(i64::MAX)),
+                            ),
+                            ("payload", redaction::apply_view(view, payload).into_owned()),
+                        ]),
+                    ));
+                    envelopes.len() - 1
+                }
+            };
+            let envelope = &envelopes[index].1;
             let Some(entry) = self.entries.get_mut(&id) else {
                 continue;
             };
@@ -1273,7 +1527,7 @@ impl PluginRuntime {
             let mut vm = vm.borrow_mut();
             for handler in handlers {
                 if vm
-                    .call_function(&handler, std::slice::from_ref(&envelope))
+                    .call_function(&handler, std::slice::from_ref(envelope))
                     .is_ok()
                 {
                     delivered += 1;
@@ -1336,6 +1590,98 @@ impl PluginRuntime {
         }
     }
 
+    /// Record one delivered event into the trace hub (CTX-0897).
+    ///
+    /// Runs once per event before fan-out, whether or not any handler is
+    /// subscribed. Only traces whose owner is currently `Active` receive the
+    /// record: a suspended owner's traces are paused, and disposed/failed
+    /// owners have no traces (pruned by [`Self::sync_debug_view`]).
+    ///
+    /// Least privilege: each trace records only the kinds its owner declares
+    /// in its manifest `lazy.events` (snapshotted when the trace opens), the
+    /// same precondition `bitty.events.subscribe` enforces, so a
+    /// `debug.trace` holder never observes a topic it could not subscribe
+    /// to. Payloads are redacted per owner grant snapshot (the same
+    /// [`redaction`] policy as fan-out), then bounded by
+    /// [`debug::TRACE_PAYLOAD_MAX_BYTES`].
+    fn record_trace(&mut self, kind: &str, payload: &LuaValue) {
+        if self.trace_hub.borrow().is_empty() {
+            return;
+        }
+        let active: BTreeSet<&str> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.state == LifecycleState::Active)
+            .map(|(id, _)| id.as_str())
+            .collect();
+        self.trace_hub
+            .borrow_mut()
+            .record(kind, self.event_sequence, payload, |owner| {
+                active.contains(owner)
+            });
+    }
+
+    /// Drop every trace owned by `id` (dispose and failed activation).
+    fn drop_traces(&mut self, id: &PluginId) {
+        self.trace_hub
+            .borrow_mut()
+            .retain_owners(|owner| owner != id.as_str());
+    }
+
+    /// Rebuild the shared [`debug::DebugView`] from `entries` and prune the
+    /// traces of owners that are no longer live (CTX-0897).
+    ///
+    /// Called at the end of every public lifecycle-changing method
+    /// (`discover`, `activate`, `suspend`, `resume`, `dispose`, `reload`), on
+    /// success and failure alike. Time O(p + c + e) to collect plus
+    /// O(n log n) to sort the rows (p plugins, c commands, e subscriptions),
+    /// plus O(t) over open traces; space O(p + c + e) for the new snapshot.
+    fn sync_debug_view(&mut self) {
+        let mut plugins = Vec::with_capacity(self.entries.len());
+        let mut commands = Vec::new();
+        let mut events = Vec::new();
+        for (id, entry) in &self.entries {
+            plugins.push(debug::DebugPlugin {
+                id: id.as_str().to_string(),
+                version: entry.package.manifest.identity.version.clone(),
+                state: debug::lifecycle_label(&entry.state),
+                generation: entry.generation,
+            });
+            for command in &entry.registrations.commands {
+                commands.push(debug::DebugCommand {
+                    plugin: id.as_str().to_string(),
+                    id: command.id.clone(),
+                    title: command.title.clone(),
+                });
+            }
+            for subscription in &entry.registrations.events {
+                events.push(debug::DebugEvent {
+                    plugin: id.as_str().to_string(),
+                    kind: subscription.kind.clone(),
+                });
+            }
+        }
+        self.debug_view
+            .borrow_mut()
+            .replace(plugins, commands, events);
+        // Traces survive suspend (paused) but never outlive the generation:
+        // dispose, failure, and reload drop every trace the owner held.
+        let live: BTreeSet<&str> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| {
+                matches!(
+                    entry.state,
+                    LifecycleState::Active | LifecycleState::Suspended
+                )
+            })
+            .map(|(id, _)| id.as_str())
+            .collect();
+        self.trace_hub
+            .borrow_mut()
+            .retain_owners(|owner| live.contains(owner));
+    }
+
     /// Roll back a failed activation attempt atomically.
     ///
     /// Purges the policy-host generation (identity, command ownership, and
@@ -1351,6 +1697,7 @@ impl PluginRuntime {
             entry.vm = None;
             entry.services = None;
         }
+        self.drop_traces(id);
     }
 
     /// Whether the policy host still holds a registry entry for `id`

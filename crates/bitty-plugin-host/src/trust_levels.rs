@@ -286,7 +286,8 @@ impl CapabilityDomain {
             | CapabilityFamily::Layout
             | CapabilityFamily::Agent
             | CapabilityFamily::Mcp
-            | CapabilityFamily::Ai => &[],
+            | CapabilityFamily::Ai
+            | CapabilityFamily::Workspace => &[],
         }
     }
 }

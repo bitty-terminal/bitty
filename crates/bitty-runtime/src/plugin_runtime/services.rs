@@ -9,16 +9,19 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::{Rc, Weak};
+use std::time::Instant;
 
 use bitty_lua::ui::{UI_MAX_AGGREGATED_TEXT_BYTES, UI_MAX_BLOCKS, UiNode};
 use bitty_lua::{
     BridgeError, HostServices, LuaValue, LuaVm, SNAPSHOT_MAX_BYTES, ServiceRoute, StashedFunction,
-    env_grant_shape_ok, validate_env_key,
+    WORKSPACE_LIST_MAX_ITEMS, WorkspaceInfo, WorkspaceRequest, env_grant_shape_ok,
+    validate_env_key,
 };
 use bitty_package::Version;
 use bitty_plugin_host::bundled::{WORKSPACELINE_CLAIM, canonicalize_ui_claim};
 use bitty_plugin_host::{ProvidedService, service_version_satisfies, value_satisfies_schema};
 
+use super::debug::{self, DebugView, TraceHub, TraceRequest};
 use super::store::{self, PluginStore};
 
 /// Maximum characters of a provider failure message relayed to the consumer
@@ -67,6 +70,98 @@ pub trait SnapshotSource {
     ///
     /// Returns a typed `E_SNAPSHOT_*`/`E_CAPABILITY_DENIED` error.
     fn snapshot(&self, scope: &str) -> Result<LuaValue, BridgeError>;
+}
+
+/// Read-only workspace source for `bitty.workspace.list()` (CTX-0889).
+///
+/// The application publishes Core workspace state into its implementation
+/// once per tick (the `LiveSnapshot` pattern), so plugin reads never touch
+/// the runtime directly and never see terminal content.
+pub trait WorkspaceSource {
+    /// Current workspaces in order, bounded by
+    /// [`bitty_lua::WORKSPACE_LIST_MAX_ITEMS`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when no workspace state is available.
+    fn workspaces(&self) -> Result<Vec<WorkspaceInfo>, BridgeError>;
+}
+
+/// Workspace source for hosts without a workspace backend: fails closed
+/// with `E_NOT_IMPLEMENTED` (a granted read still observes nothing).
+#[derive(Debug, Default)]
+pub struct UnavailableWorkspaces;
+
+impl WorkspaceSource for UnavailableWorkspaces {
+    fn workspaces(&self) -> Result<Vec<WorkspaceInfo>, BridgeError> {
+        Err(BridgeError::not_implemented("bitty.workspace.list"))
+    }
+}
+
+/// One queued workspace mutation with its requesting plugin (CTX-0889).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedWorkspaceRequest {
+    /// Requesting plugin id (diagnostics only; authority was checked at
+    /// enqueue time against the plugin's `workspace.control` grant).
+    pub plugin_id: String,
+    /// Validated request.
+    pub request: WorkspaceRequest,
+}
+
+/// Bounded runtime-shared workspace request queue (CTX-0889).
+///
+/// Overflow drops the newest request and counts it (same governance as
+/// [`NotificationQueue`]); the application drains it once per tick.
+#[derive(Debug)]
+pub struct WorkspaceRequestQueue {
+    items: VecDeque<QueuedWorkspaceRequest>,
+    capacity: usize,
+    dropped: u64,
+}
+
+impl WorkspaceRequestQueue {
+    /// Create a bounded queue (capacity at least 1).
+    #[must_use]
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            items: VecDeque::new(),
+            capacity: capacity.max(1),
+            dropped: 0,
+        }
+    }
+
+    /// Push a request; returns whether it was accepted.
+    pub fn push(&mut self, request: QueuedWorkspaceRequest) -> bool {
+        if self.items.len() >= self.capacity {
+            self.dropped = self.dropped.saturating_add(1);
+            return false;
+        }
+        self.items.push_back(request);
+        true
+    }
+
+    /// Drain all queued requests in FIFO order.
+    pub fn drain(&mut self) -> Vec<QueuedWorkspaceRequest> {
+        self.items.drain(..).collect()
+    }
+
+    /// Number of queued requests.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Whether the queue is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Number dropped since creation.
+    #[must_use]
+    pub fn dropped(&self) -> u64 {
+        self.dropped
+    }
 }
 
 /// Settings source that has no settings.
@@ -588,6 +683,16 @@ pub struct PluginServices {
     service_provided: RefCell<Vec<ProvidedService>>,
     service_required: RefCell<Vec<(String, String)>>,
     service_directory: RefCell<Option<Rc<RefCell<ServiceDirectory>>>>,
+    debug_inspect: Cell<bool>,
+    debug_trace: Cell<bool>,
+    granted_capabilities: RefCell<Vec<String>>,
+    declared_events: RefCell<BTreeSet<String>>,
+    debug_view: RefCell<Option<Rc<RefCell<DebugView>>>>,
+    trace_hub: RefCell<Option<Rc<RefCell<TraceHub>>>>,
+    workspace_read: Cell<bool>,
+    workspace_control: Cell<bool>,
+    workspace_source: RefCell<Option<Rc<dyn WorkspaceSource>>>,
+    workspace_requests: RefCell<Option<Rc<RefCell<WorkspaceRequestQueue>>>>,
 }
 
 impl PluginServices {
@@ -619,7 +724,51 @@ impl PluginServices {
             service_provided: RefCell::new(Vec::new()),
             service_required: RefCell::new(Vec::new()),
             service_directory: RefCell::new(None),
+            debug_inspect: Cell::new(false),
+            debug_trace: Cell::new(false),
+            granted_capabilities: RefCell::new(Vec::new()),
+            declared_events: RefCell::new(BTreeSet::new()),
+            debug_view: RefCell::new(None),
+            trace_hub: RefCell::new(None),
+            workspace_read: Cell::new(false),
+            workspace_control: Cell::new(false),
+            workspace_source: RefCell::new(None),
+            workspace_requests: RefCell::new(None),
         }
+    }
+
+    /// Grant `workspace.read` and/or `workspace.control` from the activation
+    /// snapshot (CTX-0889). Independent: read never implies control, and
+    /// control does not imply read. Absent grants fail closed with
+    /// `E_CAPABILITY_DENIED`.
+    pub fn set_workspace_access(&self, read: bool, control: bool) {
+        self.workspace_read.set(read);
+        self.workspace_control.set(control);
+    }
+
+    /// Whether this generation holds `workspace.read` (also gates delivery
+    /// of `workspace.*` events).
+    #[must_use]
+    pub fn has_workspace_read(&self) -> bool {
+        self.workspace_read.get()
+    }
+
+    /// Whether this generation holds `workspace.control`.
+    #[must_use]
+    pub fn has_workspace_control(&self) -> bool {
+        self.workspace_control.get()
+    }
+
+    /// Attach the workspace read source and the runtime-shared request
+    /// queue (CTX-0889). Without them a granted call fails closed with
+    /// `E_NOT_IMPLEMENTED`.
+    pub fn set_workspace_backend(
+        &self,
+        source: Option<Rc<dyn WorkspaceSource>>,
+        requests: Option<Rc<RefCell<WorkspaceRequestQueue>>>,
+    ) {
+        *self.workspace_source.borrow_mut() = source;
+        *self.workspace_requests.borrow_mut() = requests;
     }
 
     /// Grant the UI surfaces for this generation from the activation snapshot.
@@ -773,6 +922,74 @@ impl PluginServices {
     /// with `E_NOT_IMPLEMENTED` (no service backend).
     pub fn set_service_directory(&self, directory: Rc<RefCell<ServiceDirectory>>) {
         *self.service_directory.borrow_mut() = Some(directory);
+    }
+
+    /// Grant (or revoke) `bitty.debug.inspect` from the activation snapshot.
+    ///
+    /// Independent of [`Self::set_debug_trace`]: neither grant implies the
+    /// other. Absent grants fail closed with `E_CAPABILITY_DENIED`.
+    pub fn set_debug_inspect(&self, granted: bool) {
+        self.debug_inspect.set(granted);
+    }
+
+    /// Grant (or revoke) `bitty.debug.trace`/`trace_get` from the activation
+    /// snapshot. Absent grants fail closed with `E_CAPABILITY_DENIED`.
+    pub fn set_debug_trace(&self, granted: bool) {
+        self.debug_trace.set(granted);
+    }
+
+    /// Record this generation's own granted capability ids (activation
+    /// snapshot) for the `grants` inspect target. Stored sorted and
+    /// de-duplicated; other plugins' grants are never reachable.
+    pub fn set_granted_capabilities(&self, mut capabilities: Vec<String>) {
+        capabilities.sort();
+        capabilities.dedup();
+        *self.granted_capabilities.borrow_mut() = capabilities;
+    }
+
+    /// Whether this generation's activation grant snapshot holds
+    /// `capability` (exact id match, no implication). Used for per-recipient
+    /// event payload redaction (CTX-0899); the default empty snapshot holds
+    /// nothing, so a missing setter call fails closed.
+    ///
+    /// O(log g) over the sorted snapshot.
+    #[must_use]
+    pub fn has_granted_capability(&self, capability: &str) -> bool {
+        self.granted_capabilities
+            .borrow()
+            .binary_search_by(|granted| granted.as_str().cmp(capability))
+            .is_ok()
+    }
+
+    /// Record this generation's manifest `lazy.events` (activation snapshot).
+    ///
+    /// `bitty.debug.trace` opens traces scoped to exactly this set, the same
+    /// precondition `bitty.events.subscribe` enforces; an empty set (the
+    /// default) means traces never record anything.
+    pub fn set_declared_events(&self, kinds: BTreeSet<String>) {
+        *self.declared_events.borrow_mut() = kinds;
+    }
+
+    /// Attach the runtime-shared sanitized debug view (`bitty.debug.inspect`).
+    ///
+    /// Without it the `plugins`/`commands`/`events` targets fail closed with
+    /// `E_NOT_IMPLEMENTED`.
+    pub fn set_debug_view(&self, view: Rc<RefCell<DebugView>>) {
+        *self.debug_view.borrow_mut() = Some(view);
+    }
+
+    /// Attach the runtime-shared trace hub (`bitty.debug.trace`).
+    ///
+    /// Without it trace calls fail closed with `E_NOT_IMPLEMENTED`.
+    pub fn set_trace_hub(&self, hub: Rc<RefCell<TraceHub>>) {
+        *self.trace_hub.borrow_mut() = Some(hub);
+    }
+
+    fn trace_hub_or_unavailable(&self) -> Result<Rc<RefCell<TraceHub>>, BridgeError> {
+        self.trace_hub
+            .borrow()
+            .clone()
+            .ok_or_else(|| BridgeError::not_implemented("bitty.debug.trace"))
     }
 }
 
@@ -1134,34 +1351,136 @@ impl HostServices for PluginServices {
         Ok(result)
     }
 
+    fn workspace_list(&self) -> Result<Vec<WorkspaceInfo>, BridgeError> {
+        if !self.workspace_read.get() {
+            return Err(BridgeError::capability_denied("workspace.read"));
+        }
+        let source = self
+            .workspace_source
+            .borrow()
+            .clone()
+            .ok_or_else(|| BridgeError::not_implemented("bitty.workspace.list"))?;
+        let mut rows = source.workspaces()?;
+        rows.truncate(WORKSPACE_LIST_MAX_ITEMS);
+        Ok(rows)
+    }
+
+    fn workspace_request(&self, request: &WorkspaceRequest) -> Result<bool, BridgeError> {
+        if !self.workspace_control.get() {
+            return Err(BridgeError::capability_denied("workspace.control"));
+        }
+        let queue = self
+            .workspace_requests
+            .borrow()
+            .clone()
+            .ok_or_else(|| BridgeError::not_implemented("bitty.workspace"))?;
+        let accepted = queue.borrow_mut().push(QueuedWorkspaceRequest {
+            plugin_id: self.plugin_id.clone(),
+            request: request.clone(),
+        });
+        Ok(accepted)
+    }
+
     fn debug_inspect(&self, target: &str) -> Result<LuaValue, BridgeError> {
-        // CTX-0894: Inspect runtime state (plugins, terminals, panels, services)
-        // TODO: enforce debug.inspect capability grant when the backend is implemented
-        let _ = target;
-        // TODO: implement actual inspection logic when debug backend is ready
-        Err(BridgeError::not_implemented("bitty.debug.inspect"))
+        if !self.debug_inspect.get() {
+            return Err(BridgeError::capability_denied("debug.inspect"));
+        }
+        match target {
+            "grants" => {
+                let items = self
+                    .granted_capabilities
+                    .borrow()
+                    .iter()
+                    .map(|capability| LuaValue::String(capability.clone()))
+                    .collect();
+                Ok(debug::inspect_result(target, items))
+            }
+            "plugins" | "commands" | "events" => {
+                let view = self
+                    .debug_view
+                    .borrow()
+                    .clone()
+                    .ok_or_else(|| BridgeError::not_implemented("bitty.debug.inspect"))?;
+                let value = view.borrow().inspect(target);
+                value.ok_or_else(|| BridgeError::not_implemented("bitty.debug.inspect"))
+            }
+            // The panel registry lives in `registry::host::PanelRuntime`,
+            // which the plugin runtime cannot reach.
+            "panels" => Err(BridgeError::not_implemented("bitty.debug.inspect panels")),
+            _ => Err(BridgeError::new(
+                "validation",
+                "E_DEF_INVALID",
+                "debug.inspect target must be one of plugins, commands, events, grants, panels",
+            )),
+        }
     }
 
     fn debug_trace(&self, opts: &LuaValue) -> Result<i64, BridgeError> {
-        // CTX-0894: Enable event tracing with configurable filter and buffer size
-        // TODO: enforce debug.trace capability grant when the backend is implemented
-        let _ = opts;
-        // TODO: implement tracing backend when event system is ready
-        Err(BridgeError::not_implemented("bitty.debug.trace"))
+        if !self.debug_trace.get() {
+            return Err(BridgeError::capability_denied("debug.trace"));
+        }
+        let request = debug::parse_trace_opts(opts)?;
+        let hub = self.trace_hub_or_unavailable()?;
+        let mut hub = hub.borrow_mut();
+        match request {
+            TraceRequest::Start(spec) => {
+                // Grants are fixed per generation and traces never outlive
+                // it, so snapshotting them at open cannot go stale.
+                let granted = self.granted_capabilities.borrow().iter().cloned().collect();
+                hub.start(
+                    &self.plugin_id,
+                    self.declared_events.borrow().clone(),
+                    granted,
+                    spec,
+                )
+            }
+            TraceRequest::Stop(handle) => {
+                // Unknown and foreign handles are indistinguishable: both
+                // are rejected with the same code and message.
+                if hub.stop(&self.plugin_id, handle) {
+                    Ok(handle)
+                } else {
+                    Err(BridgeError::new(
+                        "validation",
+                        "E_DEF_INVALID",
+                        "debug.trace handle is not an open trace of this plugin",
+                    ))
+                }
+            }
+        }
+    }
+
+    fn debug_trace_with_expiry(
+        &self,
+        opts: &LuaValue,
+        expiry: Instant,
+    ) -> Result<i64, BridgeError> {
+        if !self.debug_trace.get() {
+            return Err(BridgeError::capability_denied("debug.trace"));
+        }
+        // Validation runs first so the expiry check sits immediately before
+        // the commit (trace open/close) and an expired call never commits.
+        let _ = debug::parse_trace_opts(opts)?;
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        self.debug_trace(opts)
     }
 
     fn debug_trace_get(&self, handle: i64) -> Result<LuaValue, BridgeError> {
-        // CTX-0894: Retrieve traced events by handle
-        let _ = handle;
-        // TODO: return buffered events when tracing backend is ready
-        Err(BridgeError::not_implemented("bitty.debug.trace"))
+        if !self.debug_trace.get() {
+            return Err(BridgeError::capability_denied("debug.trace"));
+        }
+        let hub = self.trace_hub_or_unavailable()?;
+        let drained = hub.borrow_mut().drain(&self.plugin_id, handle);
+        Ok(drained.map_or(LuaValue::Nil, |drain| drain.to_value()))
     }
 
     fn debug_control(&self, action: &str, target: &str) -> Result<LuaValue, BridgeError> {
-        // CTX-0894: High-risk debug controls (reload, suspend, resume, clear_state)
-        // TODO: enforce debug.control capability grant and explicit consent when the backend is implemented
+        // High-risk lifecycle controls stay unimplemented (separate task).
+        // Fail closed before reading anything so the call leaks neither the
+        // grant state nor whether `target` exists.
         let _ = (action, target);
-        // TODO: implement plugin lifecycle controls when runtime supports it
         Err(BridgeError::not_implemented("bitty.debug.control"))
     }
 }
@@ -1172,6 +1491,7 @@ mod tests {
     use crate::plugin_runtime::store::PluginStore;
     use bitty_lua::ENV_KEY_MAX_BYTES;
     use bitty_lua::ui::UI_MAX_TEXT_BYTES;
+    use std::time::Duration;
 
     fn services() -> PluginServices {
         PluginServices::new(
@@ -1183,6 +1503,146 @@ mod tests {
             false,
             false,
         )
+    }
+
+    fn debug_services(inspect: bool, trace: bool) -> PluginServices {
+        let services = services();
+        services.set_debug_inspect(inspect);
+        services.set_debug_trace(trace);
+        services.set_debug_view(Rc::new(RefCell::new(DebugView::new())));
+        services.set_trace_hub(Rc::new(RefCell::new(TraceHub::new())));
+        services.set_declared_events(["terminal.opened".to_string()].into());
+        services
+    }
+
+    #[test]
+    fn debug_entry_points_deny_without_grant() {
+        let services = debug_services(false, false);
+        for target in ["plugins", "grants", "panels", "bogus"] {
+            let error = services.debug_inspect(target).expect_err("denied");
+            assert_eq!(error.code, "E_CAPABILITY_DENIED", "{target}");
+        }
+        let error = services.debug_trace(&LuaValue::Nil).expect_err("denied");
+        assert_eq!(error.code, "E_CAPABILITY_DENIED");
+        let error = services
+            .debug_trace_with_expiry(&LuaValue::Nil, Instant::now() + Duration::from_secs(5))
+            .expect_err("denied");
+        assert_eq!(error.code, "E_CAPABILITY_DENIED");
+        let error = services.debug_trace_get(1).expect_err("denied");
+        assert_eq!(error.code, "E_CAPABILITY_DENIED");
+    }
+
+    #[test]
+    fn debug_grants_do_not_imply_each_other() {
+        let inspect_only = debug_services(true, false);
+        assert!(inspect_only.debug_inspect("grants").is_ok());
+        assert_eq!(
+            inspect_only
+                .debug_trace(&LuaValue::Nil)
+                .expect_err("trace needs its own grant")
+                .code,
+            "E_CAPABILITY_DENIED"
+        );
+        let trace_only = debug_services(false, true);
+        assert!(trace_only.debug_trace(&LuaValue::Nil).is_ok());
+        assert_eq!(
+            trace_only
+                .debug_inspect("plugins")
+                .expect_err("inspect needs its own grant")
+                .code,
+            "E_CAPABILITY_DENIED"
+        );
+    }
+
+    #[test]
+    fn debug_inspect_grants_returns_only_own_sorted_grants() {
+        let services = debug_services(true, false);
+        services.set_granted_capabilities(vec![
+            "platform.notify".to_string(),
+            "debug.inspect".to_string(),
+            "platform.notify".to_string(),
+        ]);
+        let other = debug_services(true, false);
+        other.set_granted_capabilities(vec!["clipboard.read".to_string()]);
+        let value = services.debug_inspect("grants").expect("grants");
+        assert_eq!(
+            value.get("target"),
+            Some(&LuaValue::String("grants".into()))
+        );
+        assert_eq!(value.get("truncated"), Some(&LuaValue::Bool(false)));
+        assert_eq!(
+            value.get("items"),
+            Some(&LuaValue::array(vec![
+                LuaValue::String("debug.inspect".to_string()),
+                LuaValue::String("platform.notify".to_string()),
+            ]))
+        );
+        assert!(!store::encode_json(&value).contains("clipboard.read"));
+    }
+
+    #[test]
+    fn debug_inspect_rejects_unknown_and_reserves_panels() {
+        let services = debug_services(true, false);
+        let error = services.debug_inspect("settings").expect_err("unknown");
+        assert_eq!(error.code, "E_DEF_INVALID");
+        let error = services.debug_inspect("panels").expect_err("reserved");
+        assert_eq!(error.code, "E_NOT_IMPLEMENTED");
+        let value = services.debug_inspect("plugins").expect("empty view");
+        assert_eq!(value.get("items"), Some(&LuaValue::array(Vec::new())));
+    }
+
+    #[test]
+    fn debug_trace_expired_call_never_opens_a_trace() {
+        let services = debug_services(false, true);
+        let past = Instant::now();
+        std::thread::sleep(Duration::from_millis(2));
+        let error = services
+            .debug_trace_with_expiry(&LuaValue::Nil, past)
+            .expect_err("expired");
+        assert_eq!(error.code, "E_TIMEOUT");
+        let hub = services.trace_hub.borrow().clone().expect("hub");
+        assert_eq!(hub.borrow().trace_count("xuepoo.test"), 0);
+        // Validation still wins over the deadline (no misleading timeout).
+        let error = services
+            .debug_trace_with_expiry(&LuaValue::Integer(1), past)
+            .expect_err("invalid");
+        assert_eq!(error.code, "E_DEF_INVALID");
+    }
+
+    #[test]
+    fn debug_trace_open_drain_and_close() {
+        let services = debug_services(false, true);
+        let handle = services.debug_trace(&LuaValue::Nil).expect("open");
+        assert_eq!(handle, 1);
+        let hub = services.trace_hub.borrow().clone().expect("hub");
+        hub.borrow_mut()
+            .record("terminal.opened", 7, &LuaValue::Integer(1), |_| true);
+        // Not in the owner's declared `lazy.events`: never recorded.
+        hub.borrow_mut()
+            .record("focus.changed", 8, &LuaValue::Integer(2), |_| true);
+        let drained = services.debug_trace_get(handle).expect("drain");
+        assert_eq!(drained.get("dropped"), Some(&LuaValue::Integer(0)));
+        let encoded = store::encode_json(&drained);
+        assert!(encoded.contains("terminal.opened"), "{encoded}");
+        assert!(!encoded.contains("focus.changed"), "{encoded}");
+        assert_eq!(services.debug_trace_get(99), Ok(LuaValue::Nil));
+        let close = LuaValue::table([
+            ("enabled", LuaValue::Bool(false)),
+            ("handle", LuaValue::Integer(handle)),
+        ]);
+        assert_eq!(services.debug_trace(&close), Ok(handle));
+        assert_eq!(services.debug_trace_get(handle), Ok(LuaValue::Nil));
+        let error = services.debug_trace(&close).expect_err("already closed");
+        assert_eq!(error.code, "E_DEF_INVALID");
+    }
+
+    #[test]
+    fn debug_control_stays_unimplemented() {
+        let services = debug_services(true, true);
+        let error = services
+            .debug_control("reload_plugin", "xuepoo.test")
+            .expect_err("unimplemented");
+        assert_eq!(error.code, "E_NOT_IMPLEMENTED");
     }
 
     #[test]

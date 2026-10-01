@@ -49,6 +49,94 @@ pub const DEFAULT_MAX_NODES: usize = 1024;
 pub const DEFAULT_MAX_VALUE_BYTES: usize = 8 * 1024;
 /// Snapshot byte ceiling (`SNAPSHOT_MAX_BYTES`, RFC C.2).
 pub const SNAPSHOT_MAX_BYTES: usize = 256 * 1024;
+/// Maximum workspaces one `bitty.workspace.list()` result carries (CTX-0889).
+///
+/// Mirrors the Core slot-table bound (`bitty_runtime::MAX_WORKSPACES`, 16);
+/// a runtime test pins the two together. The bridge truncates defensively,
+/// so a misbehaving host source can never push an unbounded array into Lua.
+pub const WORKSPACE_LIST_MAX_ITEMS: usize = 16;
+
+/// Maximum characters of one workspace name crossing into Lua (CTX-0889).
+///
+/// Mirrors the Core display bound (`bitty_runtime::WORKSPACE_NAME_MAX_CHARS`,
+/// 32); names are truncated at a char boundary.
+pub const WORKSPACE_NAME_MAX_CHARS: usize = 32;
+
+/// Maximum bytes of a `bitty.workspace.rename` name argument (CTX-0889).
+///
+/// Mirrors the IPC `workspace rename` bound (`MAX_WORKSPACE_RENAME_BYTES`,
+/// 256): longer input fails closed with `E_DEF_LIMIT` before reaching the
+/// host; accepted names are truncated by Core to
+/// [`WORKSPACE_NAME_MAX_CHARS`].
+pub const WORKSPACE_RENAME_MAX_BYTES: usize = 256;
+
+/// Attention flags for one workspace in `bitty.workspace.list()` (CTX-0889).
+///
+/// Core has no per-workspace attention source yet (bell, activity, and
+/// exit state are tracked per session/runtime, not per workspace), so hosts
+/// currently report every flag `false`. The shape is fixed now so plugins
+/// do not break when a source lands.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorkspaceAttention {
+    /// A bell rang in this workspace since it was last focused.
+    pub bell: bool,
+    /// Output arrived in this workspace while it was inactive.
+    pub activity: bool,
+    /// A panel process in this workspace exited.
+    pub exited: bool,
+}
+
+/// One workspace row for `bitty.workspace.list()` (CTX-0889, ADR-0014).
+///
+/// Identity, order, and structure only: never terminal content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceInfo {
+    /// Stable workspace id (Core creation sequence; survives index shifts).
+    pub id: u64,
+    /// Display name.
+    pub name: String,
+    /// Whether this workspace is active.
+    pub active: bool,
+    /// Number of panels (layout leaves).
+    pub panel_count: usize,
+    /// Attention flags (all `false` until Core grows a source).
+    pub attention: WorkspaceAttention,
+}
+
+/// One validated workspace mutation request from Lua (CTX-0889).
+///
+/// The bridge validates argument shapes; the host gates on
+/// `workspace.control`, enqueues into a bounded queue, and the application
+/// applies it on its next tick through the same Core handlers the
+/// keybindings use. Ids are resolved at apply time; an id that no longer
+/// exists is dropped fail-closed. Spellings of the Lua entry points are
+/// candidates pending OQ-056.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceRequest {
+    /// Focus the workspace with this stable id.
+    FocusId(u64),
+    /// Focus the workspace at this 1-based position (clamped to the last
+    /// workspace, like the `Alt+N` keybinding).
+    FocusIndex(u64),
+    /// Create a workspace and switch to it (capacity-limited).
+    New,
+    /// Switch to the next workspace (wraps).
+    Next,
+    /// Close a workspace (`None` = the active one) through the kill-confirm
+    /// gate: idle closes immediately, live arms the user confirm.
+    Close(Option<u64>),
+    /// Rename the workspace with this stable id.
+    Rename {
+        /// Stable workspace id.
+        id: u64,
+        /// Validated, non-blank name (bounded by [`WORKSPACE_RENAME_MAX_BYTES`]).
+        name: String,
+    },
+    /// Move the focused panel of the active workspace into the workspace
+    /// with this stable id.
+    MovePanel(u64),
+}
+
 /// Default host-call deadline in milliseconds (reuses `RC-1`).
 pub const DEFAULT_HOST_DEADLINE_MS: u64 = crate::RC1_WALL_CLOCK_BUDGET_MS;
 
@@ -737,46 +825,103 @@ pub trait HostServices {
         Err(BridgeError::not_implemented("bitty.services.get"))
     }
 
-    /// Inspect runtime state for `bitty.debug.inspect` (CTX-0894).
+    /// Inspect runtime state for `bitty.debug.inspect` (CTX-0894, CTX-0897).
     ///
-    /// Returns a table with debug information about the specified target:
-    /// - `"plugins"` → list of loaded plugin states
-    /// - `"events"` → event bus subscription state
-    /// - `"commands"` → registered command catalog
-    /// - `"panels"` → panel lifecycle state
-    /// - `"grants"` → capability grant state for calling plugin
+    /// Grant-gated (`debug.inspect`, checked first: `E_CAPABILITY_DENIED`)
+    /// and read-only. Every target returns
+    /// `{ target = <name>, items = <array>, truncated = <bool> }`, where
+    /// `items` is capped at the host's inspect item ceiling and `truncated`
+    /// reports whether rows were cut. Targets:
+    /// - `"plugins"` → `{ id, version, state, generation }` sorted by id;
+    ///   `state` is a stable lowercase label (`unloaded`, `loading`,
+    ///   `activating`, `active`, `suspended`, `disposing`, `disposed`,
+    ///   `failed`) and never carries a failure message
+    /// - `"commands"` → `{ plugin, id, title }` sorted by plugin, id
+    /// - `"events"` → `{ plugin, kind }` sorted by plugin, kind
+    /// - `"grants"` → the calling plugin's own granted capability ids
+    ///   (sorted strings); other plugins' grants are never exposed
+    /// - `"panels"` → reserved; fails closed with `E_NOT_IMPLEMENTED`
     ///
-    /// The default implementation always returns `E_NOT_IMPLEMENTED`. Overriding
-    /// implementations must enforce the `debug.inspect` capability grant.
-    /// Grant-gated and read-only: never mutates state, returns bounded snapshot data.
+    /// Any other target is `E_DEF_INVALID`. Results never include settings
+    /// values, store contents, secrets, or terminal content.
+    ///
+    /// The default implementation always returns `E_NOT_IMPLEMENTED`.
     fn debug_inspect(&self, target: &str) -> Result<LuaValue, BridgeError> {
         let _ = target;
         Err(BridgeError::not_implemented("bitty.debug.inspect"))
     }
 
-    /// Enable/disable event tracing for `bitty.debug.trace` (CTX-0894).
+    /// Open or close an event trace for `bitty.debug.trace` (CTX-0894,
+    /// CTX-0897).
     ///
-    /// Controls runtime event tracing with options:
-    /// - `enabled` (bool) → turn tracing on/off
-    /// - `filter` (string, optional) → event topic pattern (e.g., "bitty.plugin:*")
-    /// - `max_events` (integer, optional) → ring buffer size (default 1000, max 10000)
+    /// Grant-gated (`debug.trace`, checked first: `E_CAPABILITY_DENIED`).
+    /// `opts` is `nil` (open with defaults) or a table; the bridge rejects any
+    /// other type with `E_DEF_INVALID` before calling the host. Table keys:
+    /// - `enabled` (bool, default `true`) → `true` opens a new trace,
+    ///   `false` closes the trace named by `handle`
+    /// - `filter` (string, optional) → exact topic, or a prefix when the
+    ///   pattern ends with a single `*` (e.g. `"terminal.*"`); 1..=128
+    ///   printable ASCII bytes
+    /// - `max_events` (integer, optional) → ring-buffer size, drop-oldest
+    ///   (default 1000, range 1..=10000)
+    /// - `handle` (integer) → required with `enabled = false`, rejected
+    ///   otherwise
     ///
-    /// Returns a handle (integer) for retrieving trace events via
-    /// `debug_trace_get`. The default implementation always returns
-    /// `E_NOT_IMPLEMENTED`. Overriding implementations must enforce the
-    /// `debug.trace` capability grant.
+    /// Unknown keys, wrong types, and out-of-range values are
+    /// `E_DEF_INVALID`; opening beyond the per-plugin trace limit is
+    /// `E_DEF_LIMIT`.
+    ///
+    /// Least privilege: a trace records only event kinds the calling plugin
+    /// declares in its manifest `lazy.events` (the same precondition
+    /// `bitty.events.subscribe` enforces), intersected with `filter`. A
+    /// filter that matches no declared kind, or a plugin that declares no
+    /// events, is accepted without error; the trace simply never records. Opening returns a fresh positive handle (monotonic,
+    /// never reused); closing returns the closed handle, and closing an
+    /// unknown or another plugin's handle is `E_DEF_INVALID` (the two cases
+    /// are indistinguishable). Traces are dropped when the owning plugin is
+    /// disposed, reloaded, or fails.
+    ///
+    /// The default implementation always returns `E_NOT_IMPLEMENTED`.
     fn debug_trace(&self, opts: &LuaValue) -> Result<i64, BridgeError> {
         let _ = opts;
         Err(BridgeError::not_implemented("bitty.debug.trace"))
     }
 
-    /// Retrieve traced events for `bitty.debug.trace` (CTX-0894).
+    /// Expiry-aware [`HostServices::debug_trace`] for the pre-commit timeout
+    /// path (CTX-0897).
     ///
-    /// Returns an array of event records from the trace buffer identified by
-    /// `handle`. Each record contains:
-    /// - `topic` (string) → event topic
-    /// - `timestamp` (integer) → milliseconds since trace start
-    /// - `payload` (table) → bounded event payload
+    /// Opening or closing a trace mutates host state, so the bridge routes
+    /// `bitty.debug.trace` through its mutation guard and passes the call
+    /// expiry. Same contract as [`HostServices::store_set_with_expiry`]:
+    /// check expiry before committing and fail closed with
+    /// [`BridgeError::timeout`] without opening or closing anything. The
+    /// default checks expiry before delegating (fail-fast).
+    fn debug_trace_with_expiry(
+        &self,
+        opts: &LuaValue,
+        expiry: Instant,
+    ) -> Result<i64, BridgeError> {
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        self.debug_trace(opts)
+    }
+
+    /// Drain buffered records for `bitty.debug.trace_get` (CTX-0894,
+    /// CTX-0897).
+    ///
+    /// Grant-gated (`debug.trace`, checked first: `E_CAPABILITY_DENIED`).
+    /// Returns `{ records = <array>, dropped = <n> }` and empties the buffer;
+    /// `dropped` counts records lost to drop-oldest since the previous drain
+    /// and resets after being reported. Each record is
+    /// `{ topic, sequence, timestamp, payload }`: `topic` is the event kind,
+    /// `sequence` the runtime event sequence, `timestamp` integer
+    /// milliseconds on a monotonic host clock (no wall clock), and `payload`
+    /// the event payload, replaced by `{ truncated = true, bytes = <n> }`
+    /// when its encoded size exceeds the host payload ceiling.
+    ///
+    /// An unknown handle and a handle owned by another plugin both return
+    /// `nil`, so a plugin cannot probe other plugins' traces.
     ///
     /// The default implementation fails closed with `E_NOT_IMPLEMENTED`.
     fn debug_trace_get(&self, handle: i64) -> Result<LuaValue, BridgeError> {
@@ -799,6 +944,189 @@ pub trait HostServices {
         let _ = (action, target);
         Err(BridgeError::not_implemented("bitty.debug.control"))
     }
+
+    /// Expiry-aware [`HostServices::debug_control`] for the pre-commit
+    /// timeout path (CTX-0897).
+    ///
+    /// Controls mutate runtime state, so the bridge routes
+    /// `bitty.debug.control` through its mutation guard. Same contract as
+    /// [`HostServices::store_set_with_expiry`]: check expiry before
+    /// committing; the default checks before delegating (fail-fast).
+    fn debug_control_with_expiry(
+        &self,
+        action: &str,
+        target: &str,
+        expiry: Instant,
+    ) -> Result<LuaValue, BridgeError> {
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        self.debug_control(action, target)
+    }
+
+    /// List workspaces for `bitty.workspace.list()` (CTX-0889, ADR-0014).
+    ///
+    /// Grant-gated on `workspace.read` (`E_CAPABILITY_DENIED` otherwise);
+    /// returns rows in workspace order, bounded by
+    /// [`WORKSPACE_LIST_MAX_ITEMS`]. The default denies: a host without a
+    /// workspace backend never grants ambient read authority.
+    fn workspace_list(&self) -> Result<Vec<WorkspaceInfo>, BridgeError> {
+        Err(BridgeError::capability_denied("workspace.read"))
+    }
+
+    /// Enqueue one workspace mutation (CTX-0889, ADR-0014).
+    ///
+    /// Grant-gated on `workspace.control` only (`workspace.read` never
+    /// implies it). Returns whether the bounded queue accepted the request;
+    /// acceptance means queued, not applied. The default denies.
+    fn workspace_request(&self, request: &WorkspaceRequest) -> Result<bool, BridgeError> {
+        let _ = request;
+        Err(BridgeError::capability_denied("workspace.control"))
+    }
+
+    /// Expiry-aware [`HostServices::workspace_request`] (CTX-0889).
+    ///
+    /// Enqueueing mutates host state, so the bridge routes it through the
+    /// mutation guard. Same contract as
+    /// [`HostServices::store_set_with_expiry`]: check expiry before
+    /// committing; the default checks before delegating (fail-fast).
+    fn workspace_request_with_expiry(
+        &self,
+        request: &WorkspaceRequest,
+        expiry: Instant,
+    ) -> Result<bool, BridgeError> {
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        self.workspace_request(request)
+    }
+}
+
+/// Truncate a workspace name to [`WORKSPACE_NAME_MAX_CHARS`] at a char
+/// boundary (bridge-side defense; Core applies the same bound).
+fn bounded_workspace_name(name: &str) -> String {
+    name.chars().take(WORKSPACE_NAME_MAX_CHARS).collect()
+}
+
+/// Marshal workspace rows into the bounded Lua array shape (CTX-0889).
+fn workspace_list_value(rows: &[WorkspaceInfo]) -> LuaValue {
+    LuaValue::array(
+        rows.iter()
+            .take(WORKSPACE_LIST_MAX_ITEMS)
+            .map(|row| {
+                LuaValue::table([
+                    (
+                        "id",
+                        LuaValue::Integer(i64::try_from(row.id).unwrap_or(i64::MAX)),
+                    ),
+                    ("name", LuaValue::String(bounded_workspace_name(&row.name))),
+                    ("active", LuaValue::Bool(row.active)),
+                    (
+                        "panel_count",
+                        LuaValue::Integer(i64::try_from(row.panel_count).unwrap_or(i64::MAX)),
+                    ),
+                    (
+                        "attention",
+                        LuaValue::table([
+                            ("bell", LuaValue::Bool(row.attention.bell)),
+                            ("activity", LuaValue::Bool(row.attention.activity)),
+                            ("exited", LuaValue::Bool(row.attention.exited)),
+                        ]),
+                    ),
+                ])
+            })
+            .collect(),
+    )
+}
+
+/// Validate a stable workspace id argument (positive integer) for `what`.
+fn workspace_id_arg(value: Value<'_>, what: &str) -> Result<u64, BridgeError> {
+    match value {
+        Value::Integer(id) if id >= 1 => Ok(id as u64),
+        _ => Err(BridgeError::new(
+            "validation",
+            "E_DEF_INVALID",
+            format!("{what} must be a positive integer workspace id"),
+        )),
+    }
+}
+
+/// Validate a `bitty.workspace.rename` name: string, non-blank, bounded,
+/// and free of control characters (names render in Core chrome).
+fn workspace_name_arg(value: Value<'_>) -> Result<String, BridgeError> {
+    let Value::String(raw) = value else {
+        return Err(BridgeError::new(
+            "validation",
+            "E_DEF_INVALID",
+            "workspace.rename name must be a string",
+        ));
+    };
+    if raw.as_bytes().len() > WORKSPACE_RENAME_MAX_BYTES {
+        return Err(BridgeError::new(
+            "validation",
+            "E_DEF_LIMIT",
+            format!("workspace.rename name exceeds {WORKSPACE_RENAME_MAX_BYTES} bytes"),
+        ));
+    }
+    let Ok(name) = std::str::from_utf8(raw.as_bytes()) else {
+        return Err(BridgeError::new(
+            "validation",
+            "E_DEF_INVALID",
+            "workspace.rename name must be valid UTF-8",
+        ));
+    };
+    if name.trim().is_empty() || name.chars().any(char::is_control) {
+        return Err(BridgeError::new(
+            "validation",
+            "E_DEF_INVALID",
+            "workspace.rename name must be non-blank without control characters",
+        ));
+    }
+    Ok(name.to_string())
+}
+
+/// Parse a `bitty.workspace.focus` target: an integer stable id or a table
+/// `{ index = n }` with a 1-based position.
+fn workspace_focus_arg<'gc>(
+    ctx: Context<'gc>,
+    value: Value<'gc>,
+) -> Result<WorkspaceRequest, BridgeError> {
+    match value {
+        Value::Table(table) => match table.get::<_, Value>(ctx, "index") {
+            Ok(Value::Integer(index)) if index >= 1 => {
+                Ok(WorkspaceRequest::FocusIndex(index as u64))
+            }
+            _ => Err(BridgeError::new(
+                "validation",
+                "E_DEF_INVALID",
+                "workspace.focus { index = n } needs a positive integer index",
+            )),
+        },
+        other => workspace_id_arg(other, "workspace.focus target").map(WorkspaceRequest::FocusId),
+    }
+}
+
+/// Build one `bitty.workspace.*` mutation callback: `parse` validates the
+/// Lua arguments into a request, then the bridge enqueues it through the
+/// mutation guard and returns the boolean acceptance.
+fn workspace_mutation<'gc>(
+    ctx: Context<'gc>,
+    state: &Rc<BridgeState>,
+    parse: for<'a> fn(Context<'a>, [Value<'a>; 2]) -> Result<WorkspaceRequest, BridgeError>,
+) -> Callback<'gc> {
+    let state = state.clone();
+    Callback::from_fn(&ctx, move |ctx, _exec, mut stack| {
+        let request = parse(ctx, [stack.get(0), stack.get(1)]).map_err(|e| e.to_error(ctx))?;
+        let accepted = state
+            .bounded_mutation(|expiry| {
+                state
+                    .services
+                    .workspace_request_with_expiry(&request, expiry)
+            })
+            .map_err(|e| e.to_error(ctx))?;
+        stack.replace(ctx, Value::Boolean(accepted));
+        Ok(CallbackReturn::Return)
+    })
 }
 
 /// One captured command registration from `init.lua`.
@@ -2230,11 +2558,14 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
     )
     .expect("env table accepts 'has'");
 
-    // CTX-0894: `bitty.debug.*` namespace for devtools plugin support.
-    // Default implementations always return E_NOT_IMPLEMENTED. Overriding
-    // implementations must enforce the grants: `debug.inspect` (read-only state
-    // inspection), `debug.trace` (event tracing), `debug.control` (high-risk
-    // reload/suspend, requires explicit consent).
+    // CTX-0894/CTX-0897: `bitty.debug.*` namespace for devtools plugins.
+    // Default host implementations return E_NOT_IMPLEMENTED; the runtime
+    // gates each entry point on its own grant: `debug.inspect` (read-only
+    // state inspection), `debug.trace` (`trace`/`trace_get`), `debug.control`
+    // (high-risk reload/suspend, requires explicit consent). `inspect` is a
+    // read (`bounded`); `trace` and `control` mutate host state and go
+    // through `bounded_mutation` with the pre-commit expiry; `trace_get`
+    // drains its buffer, so it also uses `bounded_mutation`.
     let debug = Table::new(&ctx);
     debug
         .set(
@@ -2270,10 +2601,23 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
             Callback::from_fn(&ctx, {
                 let state = state.clone();
                 move |ctx, _exec, mut stack| {
-                    let opts = LuaValue::from_lua(stack.get(0), state.limits)
-                        .map_err(|e| e.to_error(ctx))?;
+                    // `nil` opens a trace with defaults; any non-table value
+                    // is rejected before reaching the host.
+                    let raw = stack.get(0);
+                    if !matches!(raw, Value::Nil | Value::Table(_)) {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            "debug.trace opts must be a table or nil",
+                        )
+                        .to_error(ctx));
+                    }
+                    let opts =
+                        LuaValue::from_lua(raw, state.limits).map_err(|e| e.to_error(ctx))?;
                     let handle = state
-                        .bounded(|_expiry| state.services.debug_trace(&opts))
+                        .bounded_mutation(|expiry| {
+                            state.services.debug_trace_with_expiry(&opts, expiry)
+                        })
                         .map_err(|e| e.to_error(ctx))?;
                     stack.replace(ctx, Value::Integer(handle));
                     Ok(CallbackReturn::Return)
@@ -2299,8 +2643,11 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                             .to_error(ctx));
                         }
                     };
+                    // Draining empties the buffer, so a post-call timeout
+                    // would silently discard records: use the mutation guard
+                    // (pre-call deadline only), like the other commits.
                     let result = state
-                        .bounded(|_expiry| state.services.debug_trace_get(handle))
+                        .bounded_mutation(|_expiry| state.services.debug_trace_get(handle))
                         .map_err(|e| e.to_error(ctx))?;
                     stack.replace(ctx, result.to_lua(ctx));
                     Ok(CallbackReturn::Return)
@@ -2338,7 +2685,11 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                         }
                     };
                     let result = state
-                        .bounded(|_expiry| state.services.debug_control(&action, &target))
+                        .bounded_mutation(|expiry| {
+                            state
+                                .services
+                                .debug_control_with_expiry(&action, &target, expiry)
+                        })
                         .map_err(|e| e.to_error(ctx))?;
                     stack.replace(ctx, result.to_lua(ctx));
                     Ok(CallbackReturn::Return)
@@ -2346,6 +2697,82 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
             }),
         )
         .expect("debug table accepts 'control'");
+
+    // CTX-0889 (ADR-0014): `bitty.workspace.*` L1 domain. `list` is a
+    // `workspace.read` read (`bounded`); every mutation is gated on
+    // `workspace.control` and only enqueues a bounded request (mutation
+    // guard) that the application applies on its next tick through the
+    // keybinding handlers. Spellings are candidates pending OQ-056.
+    let workspace = Table::new(&ctx);
+    workspace
+        .set(
+            ctx,
+            "list",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let rows = state
+                        .bounded(|_expiry| state.services.workspace_list())
+                        .map_err(|e| e.to_error(ctx))?;
+                    stack.replace(ctx, workspace_list_value(&rows).to_lua(ctx));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("workspace table accepts 'list'");
+    workspace
+        .set(
+            ctx,
+            "focus",
+            workspace_mutation(ctx, state, |ctx, args| workspace_focus_arg(ctx, args[0])),
+        )
+        .expect("workspace table accepts 'focus'");
+    workspace
+        .set(
+            ctx,
+            "new",
+            workspace_mutation(ctx, state, |_ctx, _args| Ok(WorkspaceRequest::New)),
+        )
+        .expect("workspace table accepts 'new'");
+    workspace
+        .set(
+            ctx,
+            "next",
+            workspace_mutation(ctx, state, |_ctx, _args| Ok(WorkspaceRequest::Next)),
+        )
+        .expect("workspace table accepts 'next'");
+    workspace
+        .set(
+            ctx,
+            "close",
+            workspace_mutation(ctx, state, |_ctx, args| match args[0] {
+                Value::Nil => Ok(WorkspaceRequest::Close(None)),
+                other => workspace_id_arg(other, "workspace.close id")
+                    .map(|id| WorkspaceRequest::Close(Some(id))),
+            }),
+        )
+        .expect("workspace table accepts 'close'");
+    workspace
+        .set(
+            ctx,
+            "rename",
+            workspace_mutation(ctx, state, |_ctx, args| {
+                let id = workspace_id_arg(args[0], "workspace.rename id")?;
+                let name = workspace_name_arg(args[1])?;
+                Ok(WorkspaceRequest::Rename { id, name })
+            }),
+        )
+        .expect("workspace table accepts 'rename'");
+    workspace
+        .set(
+            ctx,
+            "move_panel",
+            workspace_mutation(ctx, state, |_ctx, args| {
+                workspace_id_arg(args[0], "workspace.move_panel target")
+                    .map(WorkspaceRequest::MovePanel)
+            }),
+        )
+        .expect("workspace table accepts 'move_panel'");
 
     let ui = Table::new(&ctx);
     ui.set(
@@ -2449,6 +2876,8 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         .expect("root accepts env");
     root.set(ctx, "debug", readonly_table(ctx, debug))
         .expect("root accepts debug");
+    root.set(ctx, "workspace", readonly_table(ctx, workspace))
+        .expect("root accepts workspace");
     Value::Table(readonly_table(ctx, root))
 }
 

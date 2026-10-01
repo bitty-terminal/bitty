@@ -146,7 +146,7 @@ pub use kitty::{KittyGraphicsStub, KittyPlaceholder, KittyPlaceholderId};
 pub use kitty_decode::{
     KITTY_DECODE_MAX_BYTES, KITTY_DECODE_MAX_DIMENSION, KITTY_DECODE_MAX_PIXELS, KITTY_FORMAT_PNG,
     KITTY_FORMAT_RGB, KITTY_FORMAT_RGBA, KittyDecodeError, KittyDecodedImage, KittyTransmitFormat,
-    decode_kitty_payload,
+    decode_kitty_payload, decode_kitty_payload_owned,
 };
 pub use kitty_place::{
     KITTY_PLACE_MAX_BYTES, KITTY_PLACE_MAX_IMAGES, KITTY_PLACE_MAX_ITEMS,

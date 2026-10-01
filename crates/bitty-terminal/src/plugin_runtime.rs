@@ -18,8 +18,10 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use bitty_runtime::WorkspaceSummary;
 use bitty_runtime::plugin_runtime::{
     EmptySettings, LuaValue, PluginRuntime, PluginRuntimeConfig, SnapshotSource,
+    WorkspaceAttention, WorkspaceInfo, WorkspaceSource,
 };
 
 /// Environment override for a local-path development plugin root.
@@ -176,6 +178,56 @@ impl SnapshotSource for LiveSnapshot {
     }
 }
 
+/// Live workspace source for `bitty.workspace.list()` (CTX-0889, ADR-0014).
+///
+/// Same pattern as [`LiveSnapshot`]: the tick loop publishes Core's
+/// plain-data [`WorkspaceSummary`] rows once per tick and plugin reads
+/// serve the last committed copy, so Lua never reaches the runtime and
+/// never sees terminal content. Bounded by Core's `MAX_WORKSPACES`.
+#[derive(Default)]
+pub(crate) struct LiveWorkspaces {
+    rows: RefCell<Vec<WorkspaceSummary>>,
+}
+
+impl LiveWorkspaces {
+    /// Commit the given summaries (already bounded by Core).
+    pub(crate) fn publish(&self, rows: &[WorkspaceSummary]) {
+        let mut current = self.rows.borrow_mut();
+        if current.as_slice() != rows {
+            *current = rows.to_vec();
+        }
+    }
+}
+
+impl WorkspaceSource for LiveWorkspaces {
+    /// Attention is all-`false`: Core has no per-workspace bell, activity,
+    /// or exit source yet (tracked per session), so no flag is fabricated.
+    fn workspaces(&self) -> Result<Vec<WorkspaceInfo>, bitty_runtime::plugin_runtime::BridgeError> {
+        Ok(self
+            .rows
+            .borrow()
+            .iter()
+            .map(|row| WorkspaceInfo {
+                id: row.seq,
+                name: row.name.clone(),
+                active: row.active,
+                panel_count: row.panel_ids.len(),
+                attention: WorkspaceAttention::default(),
+            })
+            .collect())
+    }
+}
+
+/// Handles the startup wiring hands to the app tick loop.
+pub(crate) struct PluginSession {
+    /// Plugin runtime owning every VM.
+    pub(crate) runtime: PluginRuntime,
+    /// Live committed-snapshot source (CTX-0481).
+    pub(crate) snapshot: Rc<LiveSnapshot>,
+    /// Live workspace source (CTX-0889).
+    pub(crate) workspaces: Rc<LiveWorkspaces>,
+}
+
 /// Resolved XDG plugin store root (`$XDG_DATA_HOME/bitty/plugins`).
 fn store_root() -> Option<PathBuf> {
     store_root_for(
@@ -226,7 +278,8 @@ fn dev_roots() -> Vec<PathBuf> {
 }
 
 /// Discover and activate installed and development plugins, returning the
-/// live runtime plus the shared live-snapshot handle (CTX-0481).
+/// live runtime plus the shared live-snapshot (CTX-0481) and live-workspace
+/// (CTX-0889) handles.
 ///
 /// Returns `None` when neither the XDG store nor a development root exists (no
 /// plugin work is attempted). The caller feeds the handle to the app tick
@@ -235,7 +288,8 @@ pub(crate) fn discover_and_activate(
     safe_mode: bool,
     cols: usize,
     rows: usize,
-) -> Option<(PluginRuntime, Rc<LiveSnapshot>)> {
+    initial_workspaces: &[WorkspaceSummary],
+) -> Option<PluginSession> {
     let store_root = store_root();
     let dev_roots = dev_roots();
     let store_present = store_root.as_deref().is_some_and(Path::is_dir);
@@ -256,6 +310,11 @@ pub(crate) fn discover_and_activate(
         settings: Rc::new(EmptySettings),
         snapshot: host_snapshot,
     });
+    // CTX-0889: seed the workspace source before activation so `init.lua`
+    // already observes the startup workspaces.
+    let workspaces = Rc::new(LiveWorkspaces::default());
+    workspaces.publish(initial_workspaces);
+    runtime.set_workspace_source(workspaces.clone());
     let _ = runtime.discover();
     for (id, result) in runtime.activate_discovered() {
         match result {
@@ -285,7 +344,11 @@ pub(crate) fn discover_and_activate(
             Err(error) => crate::logging::warn(|| format!("bitty: plugin '{id}' failed: {error}")),
         }
     }
-    Some((runtime, snapshot))
+    Some(PluginSession {
+        runtime,
+        snapshot,
+        workspaces,
+    })
 }
 
 #[cfg(test)]
@@ -337,6 +400,54 @@ mod tests {
             live,
             "snapshot_generation must track the same committed generation"
         );
+    }
+
+    #[test]
+    fn live_workspaces_serve_published_rows_without_content() {
+        // CTX-0889: rows carry identity/order/panel count only; attention
+        // stays all-false because Core has no per-workspace source.
+        let mut rt = Runtime::with_defaults().expect("must build");
+        rt.workspace_new().expect("second workspace");
+        rt.workspace_rename(0, "editor").expect("rename");
+        let source = LiveWorkspaces::default();
+        assert!(source.workspaces().expect("rows").is_empty());
+        source.publish(&rt.workspace_summaries());
+        let rows = source.workspaces().expect("rows");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, 1);
+        assert_eq!(rows[0].name, "editor");
+        assert!(!rows[0].active);
+        assert_eq!(rows[1].name, "ws2");
+        assert!(rows[1].active);
+        assert!(rows.iter().all(|row| row.panel_count == 1));
+        assert!(
+            rows.iter()
+                .all(|row| row.attention == WorkspaceAttention::default())
+        );
+    }
+
+    #[test]
+    fn live_workspaces_bounded_at_capacity_with_long_names() {
+        let mut rt = Runtime::with_defaults().expect("must build");
+        while rt.workspace_new().is_ok() {}
+        assert_eq!(rt.workspace_count(), bitty_runtime::MAX_WORKSPACES);
+        let long = "x".repeat(4 * bitty_runtime::WORKSPACE_NAME_MAX_CHARS);
+        for index in 0..rt.workspace_count() {
+            rt.workspace_rename(index, &long).expect("rename");
+        }
+        let source = LiveWorkspaces::default();
+        source.publish(&rt.workspace_summaries());
+        let rows = source.workspaces().expect("rows");
+        assert_eq!(rows.len(), bitty_runtime::MAX_WORKSPACES);
+        assert!(
+            rows.iter()
+                .all(|row| { row.name.chars().count() == bitty_runtime::WORKSPACE_NAME_MAX_CHARS })
+        );
+        let ids: Vec<u64> = rows.iter().map(|row| row.id).collect();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ids.len(), "ids must be unique");
     }
 
     #[test]

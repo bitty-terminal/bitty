@@ -686,6 +686,24 @@ impl Surface {
         self.state.lock().expect("surface state poisoned").opacity
     }
 
+    /// Stores a new requested window opacity without a GPU reconfigure
+    /// (CTX-0898 live reload).
+    ///
+    /// Sanitizes `opacity` exactly like [`Self::configure_with_opacity`] and
+    /// carries it onto the stored [`SurfaceConfig`]. This is the headless /
+    /// not-yet-configured path: the headless compositor scales its CPU
+    /// buffer by the stored value on the next present. A real surface must
+    /// use [`Self::configure_with_opacity`] instead so the swap-chain alpha
+    /// mode is re-picked for the new value.
+    pub fn set_opacity(&self, opacity: f32) {
+        let mut state = self.state.lock().expect("surface state poisoned");
+        state.opacity = bitty_platform::sanitize_opacity(opacity);
+        let sanitized = state.opacity;
+        if let Some(config) = state.config.as_mut() {
+            *config = config.with_opacity(sanitized);
+        }
+    }
+
     /// Installs the resolved terminal palette (CTX-0355).
     ///
     /// Every clear path (clear-only present, `DrawList` present, and the
@@ -738,7 +756,9 @@ impl Surface {
     /// Sanitizes `opacity` (via [`bitty_platform::sanitize_opacity`]), stores
     /// it on the surface state, and delegates to [`Self::configure`]. The
     /// stored opacity survives later reconfigurations (`resize`, swap-chain
-    /// recovery).
+    /// recovery). When the configure fails, the previous opacity is restored
+    /// (CTX-0898) so the stored value never claims an alpha the swap chain was
+    /// not configured for.
     ///
     /// # Errors
     ///
@@ -749,11 +769,29 @@ impl Surface {
         extent: PhysicalSize,
         opacity: f32,
     ) -> Result<(), RenderError> {
-        {
+        self.with_opacity_restored_on_err(opacity, || self.configure(ctx, extent))
+    }
+
+    /// Stores sanitized `opacity`, runs `configure`, and restores the
+    /// previous opacity when it fails (CTX-0898). Split out so the restore
+    /// is testable without a real GPU context.
+    fn with_opacity_restored_on_err(
+        &self,
+        opacity: f32,
+        configure: impl FnOnce() -> Result<(), RenderError>,
+    ) -> Result<(), RenderError> {
+        let previous = {
             let mut state = self.state.lock().expect("surface state poisoned");
-            state.opacity = bitty_platform::sanitize_opacity(opacity);
+            std::mem::replace(
+                &mut state.opacity,
+                bitty_platform::sanitize_opacity(opacity),
+            )
+        };
+        let result = configure();
+        if result.is_err() {
+            self.state.lock().expect("surface state poisoned").opacity = previous;
         }
-        self.configure(ctx, extent)
+        result
     }
 
     /// Configures (or reconfigures) the surface for `extent`.
@@ -1977,6 +2015,23 @@ mod tests {
             Surface::headless(PhysicalSize::new(800, 0)),
             Err(RenderError::InvalidInput { .. })
         ));
+    }
+
+    #[test]
+    fn failed_opacity_configure_restores_previous_opacity() {
+        // CTX-0898: a rejected reconfigure must not leave the surface
+        // claiming the new opacity; a successful one keeps it.
+        let surface = Surface::headless(PhysicalSize::new(64, 64)).expect("valid extent");
+        surface.set_opacity(0.8);
+        let err = surface.with_opacity_restored_on_err(0.3, || {
+            Err(RenderError::SurfaceConfigure("synthetic".into()))
+        });
+        assert!(err.is_err());
+        assert!((surface.opacity() - 0.8).abs() < f32::EPSILON, "restored");
+        surface
+            .with_opacity_restored_on_err(0.3, || Ok(()))
+            .expect("ok configure");
+        assert!((surface.opacity() - 0.3).abs() < f32::EPSILON, "adopted");
     }
 
     #[test]

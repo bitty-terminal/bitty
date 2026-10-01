@@ -209,3 +209,99 @@ fn no_image_config_opens_nothing_and_presents_no_background() {
     let (hits, misses, entries, bytes) = rt.background_raster_stats();
     assert_eq!((hits, misses, entries, bytes), (0, 0, 0, 0));
 }
+
+#[test]
+fn live_background_appearance_adopts_and_fails_closed() {
+    // CTX-0898 (#1522): `set_background_appearance` runs the construction
+    // pipeline on reload. A good image is decoded and painted; a bad one
+    // keeps the running store untouched; an unchanged set reopens nothing.
+    let root = scratch("live");
+    let path = root.join("red.png");
+    std::fs::write(&path, RED_PNG).expect("write fixture");
+    let path = path.display().to_string();
+    let roots = vec![root.display().to_string()];
+    let mut rt = Runtime::new(RuntimeConfig::default()).expect("default runtime");
+    single_leaf(&mut rt);
+    assert_eq!(rt.background_image_count(), 0);
+
+    rt.set_background_appearance(
+        Vec::new(),
+        Some(path.clone()),
+        "stretch".to_string(),
+        roots.clone(),
+    )
+    .expect("approved image adopts live");
+    assert_eq!(rt.background_image_count(), 1);
+    assert_eq!(rt.background_loads(), 1);
+    let stats = rt.tick().expect("adoption repaints");
+    assert_eq!(stats.backgrounds, 1, "the adopted image is presented");
+
+    // Unchanged: no reload, no second decode.
+    rt.set_background_appearance(
+        Vec::new(),
+        Some(path.clone()),
+        "stretch".to_string(),
+        roots.clone(),
+    )
+    .expect("unchanged set is a no-op");
+    assert_eq!(rt.background_loads(), 1, "no file reopened");
+
+    // A missing image fails closed and keeps the running image.
+    let err = rt
+        .set_background_appearance(
+            Vec::new(),
+            Some(root.join("absent.png").display().to_string()),
+            "stretch".to_string(),
+            roots.clone(),
+        )
+        .expect_err("missing image must fail closed");
+    assert!(
+        err.to_string().contains("decoration.background_image"),
+        "{err}"
+    );
+    assert_eq!(rt.config().background_image.as_deref(), Some(path.as_str()));
+    assert_eq!(rt.background_image_count(), 1, "running store untouched");
+
+    // Clearing the image releases the store.
+    rt.set_background_appearance(Vec::new(), None, "fill".to_string(), Vec::new())
+        .expect("clear adopts");
+    assert_eq!(rt.background_image_count(), 0);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn live_views_rule_is_checked_against_existing_views() {
+    // CTX-0898 (#1522): a `views` rule that would compose an AC-1 violation
+    // on a View that already exists is refused before any swap.
+    let mut rt = Runtime::new(RuntimeConfig::default()).expect("default runtime");
+    single_leaf(&mut rt);
+    let bg = rt.config().theme.background;
+    let bad = ViewAppearanceRule {
+        selector: "*".to_string(),
+        border_color_focused: Some([bg[0], bg[1], bg[2], 0xFF]),
+        ..Default::default()
+    };
+    let err = rt
+        .set_background_appearance(vec![bad], None, "fill".to_string(), Vec::new())
+        .expect_err("violating rule must fail closed");
+    assert!(
+        matches!(err, bitty_runtime::RuntimeError::ViewAppearance(_)),
+        "{err}"
+    );
+    assert!(rt.config().view_appearance.is_empty(), "nothing adopted");
+
+    let good = ViewAppearanceRule {
+        selector: "*".to_string(),
+        border_width: Some(3),
+        ..Default::default()
+    };
+    rt.set_background_appearance(vec![good.clone()], None, "fill".to_string(), Vec::new())
+        .expect("valid rule adopts");
+    assert_eq!(rt.config().view_appearance, vec![good]);
+    let outline = rt.config().resolve_view_outline(&RuntimeViewTarget {
+        content: "empty",
+        workspace_label: 1,
+        view_id: 1,
+    });
+    assert_eq!(outline.width_focused, Some(3));
+}

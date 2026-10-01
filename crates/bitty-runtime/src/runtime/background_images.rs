@@ -87,6 +87,26 @@ pub fn validate_background_images(config: &RuntimeConfig) -> Result<(), RuntimeE
     Ok(())
 }
 
+/// The config-side background/views fields one live adopt swaps as a unit
+/// (CTX-0898).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BackgroundFields {
+    view_appearance: Vec<crate::config::ViewAppearanceRule>,
+    background_image: Option<String>,
+    background_fit: String,
+    background_image_roots: Vec<String>,
+}
+
+/// One retained background generation (CTX-0898): the fields plus the
+/// decoded store and key map they produced, so a rollback restores them
+/// without touching the filesystem.
+#[derive(Debug)]
+pub(crate) struct RetainedBackgrounds {
+    fields: BackgroundFields,
+    store: bitty_rich::BackgroundStore,
+    keys: std::collections::HashMap<String, bitty_rich::BackgroundKey>,
+}
+
 impl Runtime {
     /// Number of decoded background images resident (headless-observable).
     #[must_use]
@@ -132,6 +152,129 @@ impl Runtime {
         self.backgrounds = store;
         self.background_keys = keys;
         self.background_rasters = bitty_rich::BackgroundRasterCache::new();
+        Ok(())
+    }
+
+    /// Live-adopts the background and per-`View` appearance set without
+    /// restart (CTX-0898, issue #1522).
+    ///
+    /// Covers `decoration.background_image` / `background_fit` /
+    /// `background_image_roots` and the `views` rule table. The candidate is
+    /// checked through the same gates as construction — the runtime config
+    /// bounds, the full background load pipeline (approved roots, trust,
+    /// sniff, decode, BG-4/BG-5), and the RFC-0001 AC-1/AC-2 first-match
+    /// check for every `View` that already exists in any workspace — before
+    /// anything is swapped. Any failure returns the error and leaves the
+    /// running appearance, decoded store, and caches untouched. An unchanged
+    /// set is a no-op (no file is reopened).
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError::InvalidConfig`] for out-of-bound fields,
+    /// [`RuntimeError::BackgroundImage`] for a rejected image, and
+    /// [`RuntimeError::ViewAppearance`] when a rule would compose a violating
+    /// outline pair on an existing `View`.
+    pub fn set_background_appearance(
+        &mut self,
+        view_appearance: Vec<crate::config::ViewAppearanceRule>,
+        background_image: Option<String>,
+        background_fit: String,
+        background_image_roots: Vec<String>,
+    ) -> Result<(), RuntimeError> {
+        let requested = BackgroundFields {
+            view_appearance,
+            background_image,
+            background_fit,
+            background_image_roots,
+        };
+        if self.background_fields() == requested {
+            return Ok(());
+        }
+        let mut candidate = self.config.clone();
+        candidate.view_appearance = requested.view_appearance.clone();
+        candidate.background_image = requested.background_image.clone();
+        candidate.background_fit = requested.background_fit.clone();
+        candidate.background_image_roots = requested.background_image_roots.clone();
+        candidate.validate()?;
+        self.validate_existing_views_against(&candidate)?;
+        // Rollback fast path: the request is exactly the generation the last
+        // adopt replaced, so swap the retained decoded store back instead of
+        // re-reading every image (which may have changed or vanished).
+        let (store, keys) = match self.retained_backgrounds.take() {
+            Some(retained) if retained.fields == requested => (retained.store, retained.keys),
+            other => {
+                self.retained_backgrounds = other;
+                build_background_state(&candidate)?
+            }
+        };
+        let previous = RetainedBackgrounds {
+            fields: self.background_fields(),
+            store: std::mem::replace(&mut self.backgrounds, store),
+            keys: std::mem::replace(&mut self.background_keys, keys),
+        };
+        self.retained_backgrounds = Some(previous);
+        self.config.view_appearance = requested.view_appearance;
+        self.config.background_image = requested.background_image;
+        self.config.background_fit = requested.background_fit;
+        self.config.background_image_roots = requested.background_image_roots;
+        self.background_rasters = bitty_rich::BackgroundRasterCache::new();
+        self.pending_full_redraw = true;
+        Ok(())
+    }
+
+    /// Drops the background generation retained for rollback (CTX-0898).
+    ///
+    /// The reload path calls this once a reload has committed (or finished
+    /// rolling back), so at most one extra decoded generation is resident and
+    /// only for the duration of one reload.
+    pub fn release_retained_backgrounds(&mut self) {
+        self.retained_backgrounds = None;
+    }
+
+    /// Whether a replaced background generation is retained for rollback.
+    #[must_use]
+    pub fn has_retained_backgrounds(&self) -> bool {
+        self.retained_backgrounds.is_some()
+    }
+
+    /// The live background/views fields as one comparable unit.
+    fn background_fields(&self) -> BackgroundFields {
+        BackgroundFields {
+            view_appearance: self.config.view_appearance.clone(),
+            background_image: self.config.background_image.clone(),
+            background_fit: self.config.background_fit.clone(),
+            background_image_roots: self.config.background_image_roots.clone(),
+        }
+    }
+
+    /// RFC-0001 AC-1/AC-2 check of `candidate`'s outline resolution for every
+    /// `View` already present in any workspace (CTX-0898). Inactive slots use
+    /// their own stable label so a `ws:<n>` rule is checked where it applies.
+    fn validate_existing_views_against(
+        &self,
+        candidate: &RuntimeConfig,
+    ) -> Result<(), RuntimeError> {
+        let active = self.active_workspace_index();
+        for (index, slot) in self.workspaces.iter().enumerate() {
+            let layout = if index == active {
+                &self.layout
+            } else {
+                &slot.layout
+            };
+            let label = u8::try_from(index + 1)
+                .unwrap_or(u8::MAX)
+                .clamp(1, crate::runtime::workspaces::MAX_WORKSPACES as u8);
+            for view_id in layout.leaf_ids() {
+                let target = crate::config::RuntimeViewTarget {
+                    content: self.view_content_kind(view_id),
+                    workspace_label: label,
+                    view_id: view_id.0,
+                };
+                candidate
+                    .validate_view_outline(&target)
+                    .map_err(RuntimeError::ViewAppearance)?;
+            }
+        }
         Ok(())
     }
 }

@@ -85,8 +85,9 @@ pub use host::{
     REGISTRATION_MAX_TIMERS, REGISTRATION_MAX_TITLE_BYTES, RegistrationCapture,
     SERVICE_MAX_IFACE_BYTES, SERVICE_MAX_METHOD_BYTES, SNAPSHOT_MAX_BYTES, SPAWN_TIMEOUT_MAX_MS,
     SPAWN_TIMEOUT_MS, ServiceMethod, ServiceProvision, ServiceRoute, StashedFunction,
-    TaskRegistration, TimerRegistration, env_grant_authorizes, env_grant_shape_ok,
-    env_key_shape_ok, validate_env_key,
+    TaskRegistration, TimerRegistration, WORKSPACE_LIST_MAX_ITEMS, WORKSPACE_NAME_MAX_CHARS,
+    WORKSPACE_RENAME_MAX_BYTES, WorkspaceAttention, WorkspaceInfo, WorkspaceRequest,
+    env_grant_authorizes, env_grant_shape_ok, env_key_shape_ok, validate_env_key,
 };
 pub use ui::{UI_MAX_DEPTH, UI_MAX_TEXT_BYTES, UI_SLOTS, UI_V1_NODE_KINDS, UiNode};
 

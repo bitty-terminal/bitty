@@ -4,41 +4,41 @@
   "carryctx_version": "0.11.6",
   "schema_version": 18,
   "project_id": "01M0WAMWPGZ2YDGM6M88AT3YGT",
-  "export_id": "01M3W8ZXT8XD6S86Q1AW5H1A4J",
-  "created_at": "2026-10-01T17:42:59.656230140+00:00",
+  "export_id": "01M3WDZHEQ2JGX337VQAZ4YCX7",
+  "created_at": "2026-10-01T19:10:09.879623985+00:00",
   "parents": [
-    "01M3W6Z18X36QZTXF8P5K34K24"
+    "01M3W8ZXT8XD6S86Q1AW5H1A4J"
   ],
   "sequences": {
-    "display_id_CTX": 916,
+    "display_id_CTX": 917,
     "display_id_decision": 84,
     "display_id_handoff": 51,
-    "display_id_progress": 4411
+    "display_id_progress": 4427
   },
   "source": {
-    "git_branch": "main",
-    "git_commit": "b736d32f424dbd1015d3770b86d2418e63e1c2dc",
+    "git_branch": "fix/update-bitty-ipc-rev",
+    "git_commit": "6b830fa544820f8afb4b2242fd9223d1caed55f0",
     "hostname": "unknown"
   },
   "counts": {
-    "agents": 1190,
+    "agents": 1192,
     "checkpoint_corrections": 0,
-    "checkpoints": 2636,
+    "checkpoints": 2689,
     "decisions": 83,
-    "events": 20479,
-    "graph_edges": 1293,
-    "graph_nodes": 455,
+    "events": 20575,
+    "graph_edges": 1300,
+    "graph_nodes": 456,
     "handoffs": 50,
-    "progress_items": 4410,
+    "progress_items": 4426,
     "scopes": 1080,
     "sequences": 4,
-    "sessions": 917,
+    "sessions": 919,
     "task_dependencies": 133,
-    "tasks": 915,
+    "tasks": 916,
     "team_members": 37,
     "teams": 2,
-    "tombstones": 425,
-    "worktrees": 27
+    "tombstones": 432,
+    "worktrees": 20
   },
   "redacted": true
 }

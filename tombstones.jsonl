@@ -423,3 +423,10 @@
 {"deleted_at":"2026-10-01T13:00:13.729266877+00:00","deleted_by":null,"project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","reason":"worktree.removed","row_id":"01M34043C5F8N829M0DY78DJ0H","table_name":"worktrees"}
 {"deleted_at":"2026-10-01T14:37:12.884604887+00:00","deleted_by":null,"project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","reason":"worktree.removed","row_id":"01M3VFV962153NTQ63FE1MV6CA","table_name":"worktrees"}
 {"deleted_at":"2026-10-01T15:44:04.077886023+00:00","deleted_by":null,"project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","reason":"worktree.removed","row_id":"01M3VRDPRB3DDPE6AA3E9VND9Y","table_name":"worktrees"}
+{"deleted_at":"2026-10-01T17:58:06.023218734+00:00","deleted_by":null,"project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","reason":"worktree.removed","row_id":"01M3VTKGM1X0C1M24YCPNE87WG","table_name":"worktrees"}
+{"deleted_at":"2026-10-01T17:58:06.094589524+00:00","deleted_by":null,"project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","reason":"worktree.removed","row_id":"01M3V72ZRS215MD2C5Y20W3ETF","table_name":"worktrees"}
+{"deleted_at":"2026-10-01T17:58:06.114202315+00:00","deleted_by":null,"project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","reason":"worktree.removed","row_id":"01M3W1JAWBTRJ03P9NR7X16KWK","table_name":"worktrees"}
+{"deleted_at":"2026-10-01T17:58:06.141326103+00:00","deleted_by":null,"project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","reason":"worktree.removed","row_id":"01M3W2MM1264S95F3VPKE851H7","table_name":"worktrees"}
+{"deleted_at":"2026-10-01T17:58:06.154479812+00:00","deleted_by":null,"project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","reason":"worktree.removed","row_id":"01M3VRWPSC7R4J1F3J4X7991TY","table_name":"worktrees"}
+{"deleted_at":"2026-10-01T17:58:06.167784719+00:00","deleted_by":null,"project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","reason":"worktree.removed","row_id":"01M3VZES2AR7X7CAWPP3R0MDR4","table_name":"worktrees"}
+{"deleted_at":"2026-10-01T19:10:01.040693048+00:00","deleted_by":null,"project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","reason":"worktree.removed","row_id":"01M3VRWW9KKZ3E1H389RA9RY31","table_name":"worktrees"}

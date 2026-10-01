@@ -14,7 +14,7 @@
 //! What this module records for v1 (frozen):
 //!
 //! - [`BusTopicFamily`] + [`core_topic`] + [`V1_CORE_TOPICS`] — the closed
-//!   v1 taxonomy: panel lifecycle, focus, file, git, AI, and helper-process
+//!   v1 taxonomy: panel lifecycle, focus, file, git, and helper-process
 //!   events under the Core owner [`CORE_TOPIC_OWNER`]. Provider topics use
 //!   their own `owner.name` prefix and the same [`EventTopic`] grammar.
 //! - [`CapabilityLedger`] — the v1 enforcement bound: publish and subscribe
@@ -49,14 +49,13 @@ use super::panel::{
 /// bare `bitty:topic` shape is rejected by [`EventTopic::parse`].
 pub const CORE_TOPIC_OWNER: &str = "bitty.panel";
 
-/// v1 topic families: panel lifecycle, focus, file, git, AI, helper-process.
+/// v1 topic families: panel lifecycle, focus, file, git, helper-process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BusTopicFamily {
     Lifecycle,
     Focus,
     File,
     Git,
-    Ai,
     Helper,
 }
 
@@ -69,7 +68,6 @@ impl BusTopicFamily {
             Self::Focus => "focus",
             Self::File => "file",
             Self::Git => "git",
-            Self::Ai => "ai",
             Self::Helper => "helper",
         }
     }
@@ -82,7 +80,6 @@ impl BusTopicFamily {
             "focus" => Some(Self::Focus),
             "file" => Some(Self::File),
             "git" => Some(Self::Git),
-            "ai" => Some(Self::Ai),
             "helper" => Some(Self::Helper),
             _ => None,
         }
@@ -97,7 +94,6 @@ pub const V1_CORE_TOPICS: &[&str] = &[
     "bitty.panel:focus.changed",
     "bitty.panel:file.opened",
     "bitty.panel:git.branch-changed",
-    "bitty.panel:ai.response-ready",
     "bitty.panel:helper.exited",
 ];
 
@@ -346,7 +342,7 @@ mod tests {
             "panel.bus.publish"
         );
         assert_eq!(
-            CapabilityLedger::candidate_capability(BusTopicFamily::Ai, BusDirection::Subscribe),
+            CapabilityLedger::candidate_capability(BusTopicFamily::Helper, BusDirection::Subscribe),
             "panel.bus.subscribe"
         );
     }

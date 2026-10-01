@@ -11,7 +11,7 @@ use std::sync::{Mutex, PoisonError};
 
 use nix::errno::Errno;
 use nix::libc;
-use nix::sys::event::{EventFilter, EventFlag, FilterFlag, KEvent, Kqueue};
+use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 use nix::sys::signal::{Signal, kill, killpg};
 use nix::unistd::{Pid, getpgrp};
 
@@ -45,7 +45,7 @@ impl Observer {
         let exit = KEvent::new(
             ident,
             EventFilter::EVFILT_PROC,
-            EventFlag::EV_ADD | EventFlag::EV_ONESHOT,
+            EvFlags::EV_ADD | EvFlags::EV_ONESHOT,
             FilterFlag::NOTE_EXIT | FilterFlag::NOTE_EXITSTATUS,
             0,
             0,
@@ -71,7 +71,7 @@ impl Observer {
         let mut events = [KEvent::new(
             0,
             EventFilter::EVFILT_PROC,
-            EventFlag::empty(),
+            EvFlags::empty(),
             FilterFlag::empty(),
             0,
             0,

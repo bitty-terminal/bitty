@@ -3,15 +3,6 @@ use crate::auth::PeerCredentials;
 #[cfg(unix)]
 use crate::auth::{VerifiedPeer, verify_peer_for_connection};
 use crate::error::IpcError;
-#[cfg(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd",
-    target_os = "dragonfly",
-))]
-use std::os::fd::AsRawFd;
 
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,7 +35,7 @@ pub(crate) fn stream_identity(
 pub(crate) fn stream_identity(
     stream: &std::os::unix::net::UnixStream,
 ) -> Result<StreamIdentity, IpcError> {
-    let stat = nix::sys::stat::fstat(stream.as_raw_fd()).map_err(|err| IpcError::Unavailable {
+    let stat = nix::sys::stat::fstat(stream).map_err(|err| IpcError::Unavailable {
         reason: format!("accepted-stream identity query failed: {err}"),
     })?;
     Ok(StreamIdentity {

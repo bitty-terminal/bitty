@@ -38,6 +38,7 @@ use std::sync::Arc;
 
 use bitty_lua::gate::{VmBudgets, build_plugin_vm};
 use bitty_lua::host::DEFAULT_HOST_DEADLINE_MS;
+use bitty_lua::ui::UiNode;
 use bitty_lua::{HostServices, LuaVm, MarshallingLimits, RegistrationCapture};
 use bitty_plugin_host::DropPolicy;
 use bitty_plugin_host::capability::CapabilityId;
@@ -592,6 +593,31 @@ impl PluginRuntime {
         self.entries
             .get(id)
             .and_then(|entry| entry.services.as_ref())
+    }
+
+    /// Iterate over all mounted UI blocks across all activated plugins (CTX-0892).
+    ///
+    /// Returns (plugin_id, slot, node, version) tuples. Order is discovery
+    /// order. Rendering is deferred to the host; this is read-only access.
+    pub fn ui_blocks(&self) -> Vec<(PluginId, String, UiNode, u32)> {
+        let mut result = Vec::new();
+        for id in &self.order {
+            if let Some(entry) = self.entries.get(id) {
+                if let Some(svc) = &entry.services {
+                    svc.with_ui_blocks(|blocks| {
+                        for (_handle, block) in blocks.iter() {
+                            result.push((
+                                id.clone(),
+                                block.slot().to_string(),
+                                block.node().clone(),
+                                block.version(),
+                            ));
+                        }
+                    });
+                }
+            }
+        }
+        result
     }
 
     /// Drain accepted notifications (async hand-off side).

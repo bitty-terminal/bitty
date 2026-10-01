@@ -9,6 +9,7 @@ use bitty_platform::{
 };
 use bitty_render::gpu::GpuContext;
 use bitty_runtime::Runtime;
+use bitty_runtime::plugin_runtime::{LuaValue, PluginRuntime};
 
 use crate::ctl;
 use crate::layout_cmd::spawn_demo_pty_pump_with_theme;
@@ -127,6 +128,47 @@ impl WindowState {
     }
 }
 
+/// Last runtime state observed by plugin event delivery (CTX-0892).
+///
+/// Delivery is coalesced: at most one event per kind fires per tick, carrying
+/// the latest value, so the per-tick bound is structural (one per tracked
+/// kind) and a burst of state changes cannot queue work for the VMs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EventTracker {
+    title: String,
+    window_focused: bool,
+}
+
+impl EventTracker {
+    fn from_runtime(runtime: &Runtime) -> Self {
+        Self {
+            title: runtime.state().title().to_string(),
+            window_focused: runtime.is_window_focused(),
+        }
+    }
+
+    /// Diffs the tracker against the current state, updates it, and returns
+    /// the coalesced events to deliver in order. Allocates only on change.
+    fn take_changes(&mut self, title: &str, window_focused: bool) -> Vec<(&'static str, LuaValue)> {
+        let mut events = Vec::new();
+        if self.title != title {
+            self.title = title.to_string();
+            events.push((
+                "terminal.title-changed",
+                LuaValue::table([("title", LuaValue::String(self.title.clone()))]),
+            ));
+        }
+        if self.window_focused != window_focused {
+            self.window_focused = window_focused;
+            events.push((
+                "focus.changed",
+                LuaValue::table([("focused", LuaValue::Bool(window_focused))]),
+            ));
+        }
+        events
+    }
+}
+
 /// `AppModifiers` lives in [`crate::chrome_keys`] (CTX-0233 pure move).
 /// The Correct Terminal handler: owns `Runtime`, an optional window, and the
 /// real PTY pump via `Runtime::poll_pty` (plus an opt-in synthetic demo pump
@@ -169,6 +211,13 @@ pub(crate) struct TerminalApp {
     /// never serves the frozen generation-1 view. `None` when no plugin VM
     /// exists or a test does not exercise the bridge.
     pub(crate) live_snapshot: Option<std::rc::Rc<crate::plugin_runtime::LiveSnapshot>>,
+    /// Plugin runtime (CTX-0892): owns all plugin VMs, delivers events,
+    /// dispatches commands. Kept alive by the app loop.
+    pub(crate) plugin_runtime: Option<PluginRuntime>,
+    /// Previous runtime state for event change detection (CTX-0892).
+    /// Updated in place by [`EventTracker::take_changes`] each tick; changes
+    /// trigger plugin events.
+    event_tracker: EventTracker,
 }
 
 /// Outcome of polling exited child processes across pane and primary sessions.
@@ -196,6 +245,7 @@ impl TerminalApp {
         keymaps: Vec<bitty_config::ResolvedKeymap>,
         spawn_spec: SpawnSpec,
     ) -> Self {
+        let event_tracker = EventTracker::from_runtime(&runtime);
         Self {
             runtime,
             window: WindowState::new(window_title_for_theme(theme_name, source)),
@@ -207,6 +257,8 @@ impl TerminalApp {
             log_level: LogLevel::default_level(),
             session_persistence: true,
             live_snapshot: None,
+            plugin_runtime: None,
+            event_tracker,
         }
     }
 
@@ -225,6 +277,7 @@ impl TerminalApp {
         spawn_spec: SpawnSpec,
     ) -> Self {
         let (pty_rx, handle) = spawn_demo_pty_pump_with_theme(theme_name, source);
+        let event_tracker = EventTracker::from_runtime(&runtime);
         Self {
             runtime,
             window: WindowState::new(window_title_for_theme(theme_name, source)),
@@ -236,6 +289,8 @@ impl TerminalApp {
             log_level: LogLevel::default_level(),
             session_persistence: true,
             live_snapshot: None,
+            plugin_runtime: None,
+            event_tracker,
         }
     }
 
@@ -323,6 +378,14 @@ impl TerminalApp {
         snapshot: Option<std::rc::Rc<crate::plugin_runtime::LiveSnapshot>>,
     ) -> Self {
         self.live_snapshot = snapshot;
+        self
+    }
+
+    /// Attaches the plugin runtime (CTX-0892). Production startup passes
+    /// the runtime returned by [`crate::plugin_runtime::discover_and_activate`];
+    /// tests and plugin-less runs leave it `None`.
+    pub(crate) fn with_plugin_runtime(mut self, runtime: Option<PluginRuntime>) -> Self {
+        self.plugin_runtime = runtime;
         self
     }
 
@@ -563,6 +626,10 @@ impl TerminalApp {
                 );
             }
         }
+        // CTX-0892: deliver coalesced runtime events to plugin VMs last, after
+        // present, IME sync, and the PTY reply flush, so a slow Lua handler
+        // never delays terminal replies or the frame.
+        self.deliver_runtime_events();
         stats
     }
 
@@ -583,6 +650,24 @@ impl TerminalApp {
             if let bitty_runtime::ColdEvent::TitleChanged(raw) = event {
                 self.apply_window_title(&raw);
             }
+        }
+    }
+
+    /// Delivers runtime state-change events to plugin VMs (CTX-0892).
+    ///
+    /// Runs once per tick at the end of [`Self::drive_tick`]. Coalesced per kind
+    /// (see [`EventTracker::take_changes`]); handler failures are contained
+    /// by the plugin runtime and never reach the app. No-op without plugins.
+    fn deliver_runtime_events(&mut self) {
+        let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
+            return;
+        };
+        let events = self.event_tracker.take_changes(
+            self.runtime.state().title(),
+            self.runtime.is_window_focused(),
+        );
+        for (kind, payload) in &events {
+            let _delivered = plugin_runtime.deliver_event(kind, payload);
         }
     }
 
@@ -1155,4 +1240,60 @@ impl AppHandler for TerminalApp {
 fn _assert_channel_capacity_is_documented() {
     const EXPECTED: usize = 16;
     const { assert!(EXPECTED > 0) }
+}
+
+#[cfg(test)]
+mod event_tracker_tests {
+    use super::*;
+
+    fn tracker(title: &str, window_focused: bool) -> EventTracker {
+        EventTracker {
+            title: title.to_string(),
+            window_focused,
+        }
+    }
+
+    #[test]
+    fn unchanged_state_delivers_nothing() {
+        let mut t = tracker("same", true);
+        assert!(t.take_changes("same", true).is_empty());
+    }
+
+    #[test]
+    fn title_change_coalesces_to_latest_and_updates_tracker() {
+        let mut t = tracker("old", false);
+        let changes = t.take_changes("newest", false);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].0, "terminal.title-changed");
+        assert_eq!(
+            changes[0].1,
+            LuaValue::table([("title", LuaValue::String("newest".into()))])
+        );
+        assert_eq!(t.title, "newest");
+        assert!(t.take_changes("newest", false).is_empty());
+    }
+
+    #[test]
+    fn focus_change_carries_new_value() {
+        let mut t = tracker("x", false);
+        let changes = t.take_changes("x", true);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].0, "focus.changed");
+        assert_eq!(
+            changes[0].1,
+            LuaValue::table([("focused", LuaValue::Bool(true))])
+        );
+        assert!(t.window_focused);
+    }
+
+    #[test]
+    fn both_changes_are_bounded_to_one_event_per_kind() {
+        let mut t = tracker("a", false);
+        let kinds: Vec<_> = t
+            .take_changes("b", true)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(kinds, ["terminal.title-changed", "focus.changed"]);
+    }
 }

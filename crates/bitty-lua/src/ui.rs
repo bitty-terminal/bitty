@@ -71,10 +71,10 @@ pub const UI_MAX_BLOCKS: usize = 64;
 pub const UI_MAX_AGGREGATED_TEXT_BYTES: usize = 2 * 1024 * 1024;
 
 /// Maximum click command identifier length (CTX-0890).
-pub const UI_CLICK_MAX_COMMAND_BYTES: usize = 128;
+pub const UI_CLICK_MAX_COMMAND_BYTES: usize = 64;
 
 /// Maximum click command arguments count (CTX-0890).
-pub const UI_CLICK_MAX_ARGS: usize = 8;
+pub const UI_CLICK_MAX_ARGS: usize = 16;
 
 /// Maximum click command argument value length (CTX-0890).
 pub const UI_CLICK_MAX_ARG_BYTES: usize = 256;
@@ -786,7 +786,10 @@ mod tests {
         // Too many args
         let mut args_vec = Vec::new();
         for i in 0..=UI_CLICK_MAX_ARGS {
-            args_vec.push((LuaValue::String(format!("arg{i}")), LuaValue::String("val".to_string())));
+            args_vec.push((
+                LuaValue::String(format!("arg{i}")),
+                LuaValue::String("val".to_string()),
+            ));
         }
         let value = LuaValue::table([
             ("kind", LuaValue::String("Text".to_string())),

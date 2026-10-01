@@ -1091,93 +1091,172 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
             attribution.insert("workspace".to_string(), src.clone());
         }
 
-        // CTX-0890: chrome.{top,bottom}.order are array-replace (each edge
-        // independent). Absent table says nothing.
+        // CTX-0890: chrome.{top,bottom,left,right}.order are array-replace (each edge
+        // independent). Absent table says nothing; present table replaces unconditionally
+        // (even if the array is empty, which clears the edge).
         if let Some(chrome) = &plan.chrome {
-            if !chrome.top_order.is_empty() {
-                let field = "chrome.top.order";
-                if is_policy {
-                    policy_fields.insert(field.to_string(), src.clone());
-                    effective.chrome.top_order.clone_from(&chrome.top_order);
-                    let prev = attribution.get(field).cloned();
-                    record_attribution(
-                        &mut attribution,
-                        &mut conflicts,
-                        field,
-                        prev,
-                        src,
-                        MergeClass::ListReplace,
-                    );
-                } else if let Some(policy_src) = policy_fields.get(field) {
-                    policy_violations.push(ConfigError::NonOverridable {
-                        field: field.to_string(),
-                        policy_source: policy_src.describe(),
-                        attempted_source: src.describe(),
-                    });
-                    conflicts.push(MergeConflict {
-                        field: field.to_string(),
-                        previous_source: policy_src.clone(),
-                        new_source: src.clone(),
-                        merge_class: MergeClass::ListReplace,
-                    });
-                } else {
-                    let prev = attribution.get(field).cloned();
-                    effective.chrome.top_order.clone_from(&chrome.top_order);
-                    record_attribution(
-                        &mut attribution,
-                        &mut conflicts,
-                        field,
-                        prev,
-                        src,
-                        MergeClass::ListReplace,
-                    );
-                }
+            // Top edge
+            let field = "chrome.top.order";
+            if is_policy {
+                policy_fields.insert(field.to_string(), src.clone());
+                effective.chrome.top_order.clone_from(&chrome.top_order);
+                let prev = attribution.get(field).cloned();
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ListReplace,
+                );
+            } else if let Some(policy_src) = policy_fields.get(field) {
+                policy_violations.push(ConfigError::NonOverridable {
+                    field: field.to_string(),
+                    policy_source: policy_src.describe(),
+                    attempted_source: src.describe(),
+                });
+                conflicts.push(MergeConflict {
+                    field: field.to_string(),
+                    previous_source: policy_src.clone(),
+                    new_source: src.clone(),
+                    merge_class: MergeClass::ListReplace,
+                });
+            } else {
+                let prev = attribution.get(field).cloned();
+                effective.chrome.top_order.clone_from(&chrome.top_order);
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ListReplace,
+                );
             }
-            if !chrome.bottom_order.is_empty() {
-                let field = "chrome.bottom.order";
-                if is_policy {
-                    policy_fields.insert(field.to_string(), src.clone());
-                    effective
-                        .chrome
-                        .bottom_order
-                        .clone_from(&chrome.bottom_order);
-                    let prev = attribution.get(field).cloned();
-                    record_attribution(
-                        &mut attribution,
-                        &mut conflicts,
-                        field,
-                        prev,
-                        src,
-                        MergeClass::ListReplace,
-                    );
-                } else if let Some(policy_src) = policy_fields.get(field) {
-                    policy_violations.push(ConfigError::NonOverridable {
-                        field: field.to_string(),
-                        policy_source: policy_src.describe(),
-                        attempted_source: src.describe(),
-                    });
-                    conflicts.push(MergeConflict {
-                        field: field.to_string(),
-                        previous_source: policy_src.clone(),
-                        new_source: src.clone(),
-                        merge_class: MergeClass::ListReplace,
-                    });
-                } else {
-                    let prev = attribution.get(field).cloned();
-                    effective
-                        .chrome
-                        .bottom_order
-                        .clone_from(&chrome.bottom_order);
-                    record_attribution(
-                        &mut attribution,
-                        &mut conflicts,
-                        field,
-                        prev,
-                        src,
-                        MergeClass::ListReplace,
-                    );
-                }
+
+            // Bottom edge
+            let field = "chrome.bottom.order";
+            if is_policy {
+                policy_fields.insert(field.to_string(), src.clone());
+                effective
+                    .chrome
+                    .bottom_order
+                    .clone_from(&chrome.bottom_order);
+                let prev = attribution.get(field).cloned();
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ListReplace,
+                );
+            } else if let Some(policy_src) = policy_fields.get(field) {
+                policy_violations.push(ConfigError::NonOverridable {
+                    field: field.to_string(),
+                    policy_source: policy_src.describe(),
+                    attempted_source: src.describe(),
+                });
+                conflicts.push(MergeConflict {
+                    field: field.to_string(),
+                    previous_source: policy_src.clone(),
+                    new_source: src.clone(),
+                    merge_class: MergeClass::ListReplace,
+                });
+            } else {
+                let prev = attribution.get(field).cloned();
+                effective
+                    .chrome
+                    .bottom_order
+                    .clone_from(&chrome.bottom_order);
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ListReplace,
+                );
             }
+
+            // Left edge
+            let field = "chrome.left.order";
+            if is_policy {
+                policy_fields.insert(field.to_string(), src.clone());
+                effective.chrome.left_order.clone_from(&chrome.left_order);
+                let prev = attribution.get(field).cloned();
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ListReplace,
+                );
+            } else if let Some(policy_src) = policy_fields.get(field) {
+                policy_violations.push(ConfigError::NonOverridable {
+                    field: field.to_string(),
+                    policy_source: policy_src.describe(),
+                    attempted_source: src.describe(),
+                });
+                conflicts.push(MergeConflict {
+                    field: field.to_string(),
+                    previous_source: policy_src.clone(),
+                    new_source: src.clone(),
+                    merge_class: MergeClass::ListReplace,
+                });
+            } else {
+                let prev = attribution.get(field).cloned();
+                effective.chrome.left_order.clone_from(&chrome.left_order);
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ListReplace,
+                );
+            }
+
+            // Right edge
+            let field = "chrome.right.order";
+            if is_policy {
+                policy_fields.insert(field.to_string(), src.clone());
+                effective.chrome.right_order.clone_from(&chrome.right_order);
+                let prev = attribution.get(field).cloned();
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ListReplace,
+                );
+            } else if let Some(policy_src) = policy_fields.get(field) {
+                policy_violations.push(ConfigError::NonOverridable {
+                    field: field.to_string(),
+                    policy_source: policy_src.describe(),
+                    attempted_source: src.describe(),
+                });
+                conflicts.push(MergeConflict {
+                    field: field.to_string(),
+                    previous_source: policy_src.clone(),
+                    new_source: src.clone(),
+                    merge_class: MergeClass::ListReplace,
+                });
+            } else {
+                let prev = attribution.get(field).cloned();
+                effective.chrome.right_order.clone_from(&chrome.right_order);
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ListReplace,
+                );
+            }
+
             attribution.insert("chrome".to_string(), src.clone());
         }
 
@@ -2386,6 +2465,177 @@ fn merge_layers_allow_policy_violations(
             }
             attribution.insert("workspace".to_string(), src.clone());
         }
+
+        // CTX-0890: chrome.{top,bottom,left,right}.order are array-replace (each edge
+        // independent). Absent table says nothing; present table replaces unconditionally
+        // (even if the array is empty, which clears the edge).
+        // (Second merge path: allow-policy-violations variant.)
+        if let Some(chrome) = &plan.chrome {
+            // Top edge
+            let field = "chrome.top.order";
+            if is_policy {
+                policy_fields.insert(field.to_string(), src.clone());
+                effective.chrome.top_order.clone_from(&chrome.top_order);
+                let prev = attribution.get(field).cloned();
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ListReplace,
+                );
+            } else if let Some(policy_src) = policy_fields.get(field) {
+                policy_violations.push(ConfigError::NonOverridable {
+                    field: field.to_string(),
+                    policy_source: policy_src.describe(),
+                    attempted_source: src.describe(),
+                });
+                conflicts.push(MergeConflict {
+                    field: field.to_string(),
+                    previous_source: policy_src.clone(),
+                    new_source: src.clone(),
+                    merge_class: MergeClass::ListReplace,
+                });
+            } else {
+                let prev = attribution.get(field).cloned();
+                effective.chrome.top_order.clone_from(&chrome.top_order);
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ListReplace,
+                );
+            }
+
+            // Bottom edge
+            let field = "chrome.bottom.order";
+            if is_policy {
+                policy_fields.insert(field.to_string(), src.clone());
+                effective
+                    .chrome
+                    .bottom_order
+                    .clone_from(&chrome.bottom_order);
+                let prev = attribution.get(field).cloned();
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ListReplace,
+                );
+            } else if let Some(policy_src) = policy_fields.get(field) {
+                policy_violations.push(ConfigError::NonOverridable {
+                    field: field.to_string(),
+                    policy_source: policy_src.describe(),
+                    attempted_source: src.describe(),
+                });
+                conflicts.push(MergeConflict {
+                    field: field.to_string(),
+                    previous_source: policy_src.clone(),
+                    new_source: src.clone(),
+                    merge_class: MergeClass::ListReplace,
+                });
+            } else {
+                let prev = attribution.get(field).cloned();
+                effective
+                    .chrome
+                    .bottom_order
+                    .clone_from(&chrome.bottom_order);
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ListReplace,
+                );
+            }
+
+            // Left edge
+            let field = "chrome.left.order";
+            if is_policy {
+                policy_fields.insert(field.to_string(), src.clone());
+                effective.chrome.left_order.clone_from(&chrome.left_order);
+                let prev = attribution.get(field).cloned();
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ListReplace,
+                );
+            } else if let Some(policy_src) = policy_fields.get(field) {
+                policy_violations.push(ConfigError::NonOverridable {
+                    field: field.to_string(),
+                    policy_source: policy_src.describe(),
+                    attempted_source: src.describe(),
+                });
+                conflicts.push(MergeConflict {
+                    field: field.to_string(),
+                    previous_source: policy_src.clone(),
+                    new_source: src.clone(),
+                    merge_class: MergeClass::ListReplace,
+                });
+            } else {
+                let prev = attribution.get(field).cloned();
+                effective.chrome.left_order.clone_from(&chrome.left_order);
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ListReplace,
+                );
+            }
+
+            // Right edge
+            let field = "chrome.right.order";
+            if is_policy {
+                policy_fields.insert(field.to_string(), src.clone());
+                effective.chrome.right_order.clone_from(&chrome.right_order);
+                let prev = attribution.get(field).cloned();
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ListReplace,
+                );
+            } else if let Some(policy_src) = policy_fields.get(field) {
+                policy_violations.push(ConfigError::NonOverridable {
+                    field: field.to_string(),
+                    policy_source: policy_src.describe(),
+                    attempted_source: src.describe(),
+                });
+                conflicts.push(MergeConflict {
+                    field: field.to_string(),
+                    previous_source: policy_src.clone(),
+                    new_source: src.clone(),
+                    merge_class: MergeClass::ListReplace,
+                });
+            } else {
+                let prev = attribution.get(field).cloned();
+                effective.chrome.right_order.clone_from(&chrome.right_order);
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ListReplace,
+                );
+            }
+
+            attribution.insert("chrome".to_string(), src.clone());
+        }
+
         // CTX-0292: Core-owned workspace decoration is scalar-replace like
         // `layout.gaps_in`; absent table means "says nothing".
         // (Second merge path: allow-policy-violations variant for diagnostics.)
@@ -4846,5 +5096,46 @@ mod tests {
             merged2.effective.animations.easing.open,
             AnimationEasing::Linear
         );
+    }
+
+    #[test]
+    fn chrome_order_list_replace_semantics() {
+        use crate::types::ChromeConfig;
+
+        let system = LayeredPlan::new(
+            ConfigSource::new(LayerKind::SystemDefaults, Some("defaults.lua")),
+            ConfigPlan {
+                chrome: Some(ChromeConfig {
+                    top_order: vec!["system-plugin".to_string()],
+                    bottom_order: vec!["system-status".to_string()],
+                    left_order: vec![],
+                    right_order: vec![],
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+
+        let user = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                chrome: Some(ChromeConfig {
+                    top_order: vec!["user-a".to_string(), "user-b".to_string()],
+                    bottom_order: vec![],
+                    left_order: vec![],
+                    right_order: vec![],
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+
+        let merged = try_merge_layers(vec![system, user]).unwrap();
+
+        // ListReplace: User completely replaces SystemDefaults
+        assert_eq!(merged.effective.chrome.top_order.len(), 2);
+        assert_eq!(merged.effective.chrome.top_order[0], "user-a");
+        assert_eq!(merged.effective.chrome.top_order[1], "user-b");
+        assert_eq!(merged.effective.chrome.bottom_order.len(), 0);
     }
 }

@@ -126,6 +126,16 @@ impl Parser {
         self.kitty.has_pending()
     }
 
+    /// Returns the number of encoded bytes currently buffered in a pending
+    /// Kitty graphics stream (the base64-encoded input), plus any held APC
+    /// header/payload bytes. Used by the runtime to charge in-flight streams
+    /// against IMG-4 (256 MiB total across all parsers). Returns 0 when idle.
+    pub fn pending_kitty_encoded_bytes(&self) -> usize {
+        let kitty_bytes = self.kitty.pending_encoded_len();
+        let apc_bytes = if self.in_apc { self.apc_buf.len() } else { 0 };
+        kitty_bytes + apc_bytes
+    }
+
     #[cfg(test)]
     pub(crate) fn kitty_peak_memory(&self) -> usize {
         self.kitty.peak_memory()

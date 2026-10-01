@@ -1267,6 +1267,41 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(target_os = "windows", ignore = "64 MiB test too slow on Windows CI")]
+    fn raw_rgba_at_exact_img3_boundary_completes() {
+        // 4096x4096 RGBA is exactly 64 MiB (IMG-3 KITTY_APC_DECODE_MAX_BYTES).
+        // This must complete without rejection.
+        let (w, h) = (4096_u32, 4096_u32);
+        let len = (w * h * 4) as usize;
+        assert_eq!(len, KITTY_APC_DECODE_MAX_BYTES);
+        let encoded = base64_encode(&vec![0x42; len]);
+        let mut assembler = KittyApcAssembler::new();
+        let opener = format!("Ga=T,f=32,s={w},v={h},m=1;");
+        assert!(matches!(
+            assembler.feed(opener.as_bytes()),
+            KittyFeedOutcome::NeedMore { .. }
+        ));
+        // Feed in 4096-byte chunks (chafa style).
+        for chunk in encoded.as_bytes().chunks(4096) {
+            let mut raw = b"Gm=1;".to_vec();
+            raw.extend_from_slice(chunk);
+            assert!(matches!(
+                assembler.feed(&raw),
+                KittyFeedOutcome::NeedMore { .. }
+            ));
+        }
+        match assembler.feed(b"Gm=0;") {
+            KittyFeedOutcome::Completed(done) => {
+                assert_eq!(done.payload.len(), len);
+                assert_eq!((done.width_s, done.height_v), (Some(w), Some(h)));
+                assert!(done.payload.iter().all(|&b| b == 0x42));
+            }
+            other => panic!("expected completion at exact IMG-3 boundary, got {other:?}"),
+        }
+        assert_eq!(assembler.peak_memory(), KITTY_APC_DECODE_MAX_BYTES);
+    }
+
+    #[test]
     fn payload_after_padding_still_fails_closed() {
         let mut assembler = KittyApcAssembler::new();
         assert!(matches!(
@@ -1679,5 +1714,70 @@ mod tests {
         assert_eq!(KITTY_APC_DECODE_MAX_DIMENSION, 8192);
         assert_eq!(KITTY_APC_DECODE_MAX_PIXELS, 4096 * 4096);
         assert_eq!(KITTY_APC_DECODE_MAX_BYTES, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    #[cfg_attr(target_os = "windows", ignore = "64 MiB test too slow on Windows CI")]
+    fn raw_rgba_at_exact_decode_cap_completes() {
+        // CTX-0904: 4096x4096 RGBA is exactly 64 MiB (IMG-2/IMG-3 cap).
+        // The stream must complete without rejection.
+        let w = 4096_u32;
+        let h = 4096_u32;
+        let bytes = (w as usize) * (h as usize) * 4; // 67108864 = 64 MiB
+        assert_eq!(bytes, KITTY_APC_DECODE_MAX_BYTES);
+
+        let payload = vec![0xAA_u8; bytes];
+        let encoded = base64_encode(&payload);
+        let chunk_size = 4096;
+        let mut assembler = KittyApcAssembler::new();
+
+        // Feed opener with s/v
+        let opener = format!("Gf=32,s={w},v={h},m=1;");
+        assert!(matches!(
+            assembler.feed(opener.as_bytes()),
+            KittyFeedOutcome::NeedMore { .. }
+        ));
+
+        // Feed payload in 4096-char chunks
+        let encoded_bytes = encoded.as_bytes();
+        for chunk in encoded_bytes.chunks(chunk_size) {
+            let mut frame = b"Gm=1;".to_vec();
+            frame.extend_from_slice(chunk);
+            match assembler.feed(&frame) {
+                KittyFeedOutcome::NeedMore { .. } => {}
+                other => panic!("expected NeedMore mid-stream, got {other:?}"),
+            }
+        }
+
+        // Terminator
+        match assembler.feed(b"Gm=0;") {
+            KittyFeedOutcome::Completed(done) => {
+                assert_eq!(done.format_f, 32);
+                assert_eq!(done.width_s, Some(w));
+                assert_eq!(done.height_v, Some(h));
+                assert_eq!(done.payload.len(), bytes);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn raw_rgba_one_pixel_over_decode_cap_is_rejected() {
+        // CTX-0904: 4096x4096 RGBA + 1 pixel exceeds the cap and must be
+        // rejected on the first chunk (before buffering the payload).
+        let w = 4096_u32;
+        let h = 4096_u32;
+        let bytes = (w as usize) * (h as usize) * 4 + 4; // 64 MiB + 1 pixel
+        assert!(bytes > KITTY_APC_DECODE_MAX_BYTES);
+
+        let opener = format!("Gf=32,s={w},v={},m=1;", h + 1);
+        let mut assembler = KittyApcAssembler::new();
+
+        // First chunk with oversized claim is rejected immediately
+        assert!(matches!(
+            assembler.feed(opener.as_bytes()),
+            KittyFeedOutcome::Rejected(KittyApcReject::OversizeClaim)
+        ));
+        assert!(!assembler.has_pending());
     }
 }

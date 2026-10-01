@@ -114,6 +114,21 @@ impl Runtime {
         self.kitty_raster_cache.stats()
     }
 
+    /// Total encoded bytes buffered across all in-flight Kitty graphics streams
+    /// (primary parser + all pane parsers). Used to enforce IMG-4 (256 MiB
+    /// in-flight cap) before buffering more input. Returns 0 when all parsers
+    /// are idle (CTX-0904).
+    #[must_use]
+    pub(super) fn total_kitty_inflight_bytes(&self) -> usize {
+        let primary = self.parser.pending_kitty_encoded_bytes();
+        let panes: usize = self
+            .pane_sessions
+            .values()
+            .map(|sess| sess.parser.pending_kitty_encoded_bytes())
+            .sum();
+        primary + panes
+    }
+
     /// Decodes `payload` and stores the bitmap without placing it.
     ///
     /// `format_f` is the wire `f=` value (`100` PNG, `24` RGB, `32` RGBA);
@@ -138,6 +153,29 @@ impl Runtime {
         let format = bitty_rich::KittyTransmitFormat::from_f(format_f)
             .ok_or(KittyImageError::UnknownFormat(format_f))?;
         let decoded = bitty_rich::decode_kitty_payload(format, width_s, height_v, payload)
+            .map_err(KittyImageError::Decode)?;
+        let (width, height) = decoded.dimensions();
+        self.kitty_images
+            .store(width, height, decoded.into_rgba(), compressed_len)
+            .map_err(KittyImageError::Placement)
+    }
+
+    /// Decodes and stores a Kitty image with owned payload, avoiding a copy
+    /// for raw uncompressed formats (f=24/f=32).
+    ///
+    /// Falls back to the borrowed decoder when the format is compressed or
+    /// requires dimension inference.
+    pub fn kitty_transmit_image_owned(
+        &mut self,
+        format_f: u32,
+        width_s: Option<u32>,
+        height_v: Option<u32>,
+        payload: Box<[u8]>,
+        compressed_len: usize,
+    ) -> Result<bitty_rich::KittyImageId, KittyImageError> {
+        let format = bitty_rich::KittyTransmitFormat::from_f(format_f)
+            .ok_or(KittyImageError::UnknownFormat(format_f))?;
+        let decoded = bitty_rich::decode_kitty_payload_owned(format, width_s, height_v, payload)
             .map_err(KittyImageError::Decode)?;
         let (width, height) = decoded.dimensions();
         self.kitty_images
@@ -230,6 +268,82 @@ impl Runtime {
         // may be zero when omitted.
         if cursor_movement_c != 1 {
             // Retrieve the actual placement to get effective dimensions
+            let placement = self
+                .kitty_images
+                .get_placement(placement_id)
+                .expect("placement just created must exist");
+
+            let effective_cols = if cols_c > 0 { cols_c } else { placement.cols };
+            let effective_rows = if rows_r > 0 { rows_r } else { placement.rows };
+            let new_col = cursor.col.saturating_add(effective_cols);
+            let new_row = cursor.row.saturating_add(effective_rows);
+            self.state.apply(&bitty_vt::TerminalAction::CursorPosition {
+                row: bitty_vt::Row(new_row),
+                col: bitty_vt::Col(new_col),
+            });
+        }
+
+        Ok(KittyDisplayOutcome::Displayed {
+            image,
+            placement: placement_id,
+        })
+    }
+
+    /// Decodes, stores, and places a Kitty image with owned payload,
+    /// avoiding a copy for raw uncompressed formats (f=24/f=32).
+    ///
+    /// Same behavior as [`Self::kitty_display_image`] but moves the
+    /// payload to avoid an intermediate copy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kitty_display_image_owned(
+        &mut self,
+        format_f: u32,
+        width_s: Option<u32>,
+        height_v: Option<u32>,
+        action_a: Option<char>,
+        cols_c: u16,
+        rows_r: u16,
+        cursor_movement_c: u8,
+        payload: Box<[u8]>,
+        z: i32,
+    ) -> Result<KittyDisplayOutcome, KittyImageError> {
+        let compressed_len = payload.len();
+        let image =
+            self.kitty_transmit_image_owned(format_f, width_s, height_v, payload, compressed_len)?;
+        let action = bitty_rich::KittyAction::from_a(action_a);
+        if self.state.alt_screen_active() {
+            return Ok(KittyDisplayOutcome::SuppressedAlternateScreen { image });
+        }
+        if !action.displays() {
+            return Ok(if matches!(action, bitty_rich::KittyAction::Transmit) {
+                KittyDisplayOutcome::Stored { image }
+            } else {
+                KittyDisplayOutcome::StoredNotDisplayed { image }
+            });
+        }
+        let cursor = self.state.cursor().position;
+        let metrics = self.live_cell_metrics();
+        let rich_metrics = bitty_rich::CellMetrics {
+            width: metrics.width,
+            height: metrics.height,
+        };
+        let placement_id = self
+            .kitty_images
+            .display_for_origin(
+                image,
+                cursor.col,
+                cursor.row,
+                cols_c,
+                rows_r,
+                rich_metrics,
+                self.state.scrollback_len(),
+                z,
+                self.kitty_origin,
+            )
+            .map_err(KittyImageError::Placement)?;
+        self.pending_full_redraw = true;
+
+        if cursor_movement_c != 1 {
             let placement = self
                 .kitty_images
                 .get_placement(placement_id)

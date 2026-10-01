@@ -48,7 +48,8 @@
 //!   `SpawnFailed`, `Cancelled`, `TimedOut`, `OomKilled`, `SupervisorLost`,
 //!   `Unknown`). Kills reach the owned process tree through the
 //!   `bitty-pty` boundary ([`bitty_pty::OwnedTree`]: Linux process groups
-//!   plus pidfd, macOS process groups plus kqueue) and every snapshot
+//!   plus pidfd, macOS process groups plus kqueue, Windows kill-on-close
+//!   Job Objects with kill-only delivery) and every snapshot
 //!   reports its [`KillScope`]. A [`CancelRequest`] carries the execution
 //!   id, the [`ExecutionGeneration`] the host checks, a [`CancelMode`], and
 //!   a grace period; the supervisor executes it and publishes one
@@ -74,8 +75,17 @@
 //!
 //! # Deliberate non-goals (sibling tasks own them)
 //!
-//! - The Windows tree backend: Windows has no Job Object backend yet and
-//!   reports [`KillScope::DirectChild`].
+//! - Windows graceful stop: Job Objects carry no polite stop request.
+//!   `signal_as(Interrupt | Terminate)` and a `CancelMode::Graceful` cancel
+//!   resolve to a typed `Unsupported` (never a single-pid kill); a
+//!   `CancelMode::GracefulThenKill` cancel skips both grace periods and
+//!   kills the tree at once. A ConPTY child's descendants created before
+//!   its post-spawn job assignment escape the tree (CTX-0903 residual gap).
+//! - Windows job lifetime: the kill-on-close Job Object handle belongs to
+//!   this process, so when it exits or crashes every live job tree dies
+//!   with it, `JobLifetime::Detached` and service jobs included; Unix
+//!   process groups outlive this process. The divergence is documented,
+//!   not resolved (open decision).
 //! - Job resource limits (CTX-0519): the per-job cgroup leaf below is an
 //!   evidence source only; no `memory.max` or other limit is set on it.
 //! - Capability enforcement transport: this task is in-process only, with no

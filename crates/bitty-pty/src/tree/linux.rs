@@ -52,6 +52,12 @@ impl Observer {
             }
         }))
     }
+
+    /// Signals the leader's whole process group (its pid is the group id).
+    pub(super) fn signal_tree(&self, leader: u32, signal: TreeSignal) -> io::Result<()> {
+        super::refuse_reserved_group(leader)?;
+        signal_group(leader, signal)
+    }
 }
 
 pub(super) fn signal_group(pgid: u32, signal: TreeSignal) -> io::Result<()> {

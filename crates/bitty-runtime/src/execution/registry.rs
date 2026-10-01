@@ -9,8 +9,9 @@
 //! Supervisor threads own their child handle; a cancel is a typed request
 //! the thread takes and executes (no shared `Child` behind a lock, no
 //! cross-thread kill races). Terminating a job kills its owned process tree
-//! where a backend exists ([`bitty_pty::OwnedTree`]) and reports
-//! [`KillScope::DirectChild`] where none does (CTX-0512).
+//! where a backend exists ([`bitty_pty::OwnedTree`]: process groups on
+//! Linux/macOS, Job Objects on Windows) and reports
+//! [`KillScope::DirectChild`] where none does (CTX-0512, CTX-0903).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -874,6 +875,13 @@ impl JobRegistry {
             Err(error) => match error.kind() {
                 std::io::ErrorKind::NotFound => Ok(SignalOutcome::Gone),
                 std::io::ErrorKind::PermissionDenied => Ok(SignalOutcome::PermissionDenied),
+                // The tree's backend cannot deliver this signal (graceful
+                // signals on Windows Job Objects): typed, never a fallback
+                // to a single pid.
+                std::io::ErrorKind::Unsupported => Err(JobError::unsupported(format!(
+                    "the owned-tree backend cannot deliver {}: {error}",
+                    signal.as_str()
+                ))),
                 _ => Err(JobError::Unavailable {
                     reason: format!("signal delivery failed: {error}"),
                 }),
@@ -2130,12 +2138,22 @@ impl StartFailure {
     }
 }
 
-/// Adopts the owned tree led by a fresh child, or `None` where no backend
-/// exists (the job then reports [`KillScope::DirectChild`]).
+/// Adopts the owned tree led by a fresh, already-running child (the PTY
+/// child), or `None` where no backend exists or adoption failed (the job
+/// then reports [`KillScope::DirectChild`]).
 fn adopt_tree(leader: Option<u32>) -> Option<Arc<OwnedTree>> {
     leader
         .and_then(|pid| OwnedTree::adopt(pid).ok())
         .map(Arc::new)
+}
+
+/// Adopts the owned tree led by a fresh child spawned from an
+/// [`OwnedTree::prepare_command`] command. On Windows that child starts
+/// suspended; [`OwnedTree::adopt_prepared`] resumes it on every path,
+/// including a failed adoption (which then yields `None`, direct-child
+/// scope, over a running child).
+fn adopt_prepared_tree(leader: u32) -> Option<Arc<OwnedTree>> {
+    OwnedTree::adopt_prepared(leader).ok().map(Arc::new)
 }
 
 /// Converts a reaped `std` status.
@@ -2320,8 +2338,10 @@ impl PipeJob {
         OwnedTree::prepare_command(&mut command);
         let mut child = command.spawn().map_err(StartFailure::before_spawn)?;
         let pid = child.id();
+        // Placement only writes the pid into the cgroup leaf (Linux); a
+        // Windows child is still suspended here, which placement ignores.
         accounting.place(pid);
-        let tree = adopt_tree(Some(pid));
+        let tree = adopt_prepared_tree(pid);
         let mut drains = Vec::new();
         let started = (|| -> std::io::Result<()> {
             if let Some(stdout) = child.stdout.take() {

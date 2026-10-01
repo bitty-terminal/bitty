@@ -10,9 +10,10 @@
 //! `SIGINT`/`SIGTERM` to ignored and `exec`s the helper, which inherits the
 //! ignored dispositions, so graceful requests provably do not stop it.
 //!
-//! Platforms without an owned-tree backend (Windows today) report
-//! `KillScope::DirectChild`; the tree assertions then check that honest
-//! scope instead of the grandchild.
+//! Platforms without an owned-tree backend report `KillScope::DirectChild`;
+//! the tree assertions then check that honest scope instead of the
+//! grandchild. Windows has a kill-only Job Object backend (CTX-0903): kills
+//! end the grandchild, graceful requests stay a typed `Unsupported`.
 
 use std::io::Write as _;
 use std::time::{Duration, Instant};
@@ -114,6 +115,12 @@ fn tree_backend() -> bool {
     ProcessTreeBackend::detect().kills_owned_tree()
 }
 
+/// Whether the tree backend also delivers graceful stop requests (Unix
+/// process groups do; Windows Job Objects are kill-only).
+fn graceful_backend() -> bool {
+    tree_backend() && ProcessTreeBackend::detect() != ProcessTreeBackend::WindowsJobObject
+}
+
 fn wait_for(
     registry: &JobRegistry,
     id: JobId,
@@ -192,6 +199,23 @@ fn running(pid: u32) -> bool {
     }
 }
 
+/// Whether `pid` still runs (an exited process with open handles counts
+/// as gone).
+///
+/// Pid-reuse caveat: nothing pins the grandchild's pid here, so after it
+/// dies Windows may recycle it. A recycled pid owned by another user or a
+/// protected process answers `PermissionDenied`, which therefore means
+/// "not our process": gone. A recycled pid we can open reads as running and
+/// fails the bounded wait loudly rather than passing silently.
+#[cfg(windows)]
+fn running(pid: u32) -> bool {
+    match bitty_winjob::process_is_running(pid) {
+        Ok(running) => running,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => false,
+        Err(error) => panic!("liveness probe for {pid} failed: {error}"),
+    }
+}
+
 /// Asserts the grandchild is gone when the platform kills owned trees;
 /// otherwise asserts the honest direct-child scope.
 fn assert_tree_gone(snapshot: &JobSnapshot, grandchild: u32) {
@@ -200,7 +224,7 @@ fn assert_tree_gone(snapshot: &JobSnapshot, grandchild: u32) {
         return;
     }
     assert_eq!(snapshot.kill_scope, KillScope::OwnedTree);
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         let deadline = Instant::now() + WAIT_BOUND;
         while running(grandchild) {
@@ -211,7 +235,7 @@ fn assert_tree_gone(snapshot: &JobSnapshot, grandchild: u32) {
             std::thread::sleep(POLL);
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let _ = grandchild;
 }
 
@@ -452,8 +476,10 @@ fn a_graceful_cancel_stops_a_cooperative_job() {
         .expect("request");
     assert_eq!(registry.cancel_typed(request), Ok(CancelReceipt::Accepted));
     let answer = wait_answer(&registry, id);
-    if !tree_backend() {
-        // No graceful stop exists here: nothing was sent, the job runs on.
+    if !graceful_backend() {
+        // No graceful stop exists here (no tree, or a kill-only Windows
+        // Job Object): nothing was sent, the job runs on, and the answer is
+        // typed instead of a single-pid kill.
         assert_eq!(answer, CancelOutcome::Unsupported);
         assert_eq!(registry.get(id).expect("tracked").state, JobState::Running);
         assert_eq!(registry.cancel(id), Ok(JobCancel::Requested));
@@ -467,6 +493,45 @@ fn a_graceful_cancel_stops_a_cooperative_job() {
         stopped.state,
         JobState::Done(ExecutionOutcome::Cancelled(CancelEffect::Graceful))
     );
+}
+
+/// Grace configured for the Windows escalation probe: long enough that
+/// waiting it out would be unmistakable.
+#[cfg(windows)]
+const WINDOWS_ESCALATION_GRACE: Duration = Duration::from_secs(10);
+
+/// The kill must land well inside one grace period: Job Objects have no
+/// graceful step, so both grace waits are skipped.
+#[cfg(windows)]
+const WINDOWS_ESCALATION_BOUND: Duration = Duration::from_secs(5);
+
+#[cfg(windows)]
+#[test]
+fn graceful_then_kill_on_windows_skips_grace_and_kills_the_tree() {
+    const { assert!(WINDOWS_ESCALATION_BOUND.as_millis() < WINDOWS_ESCALATION_GRACE.as_millis()) };
+    let registry = JobRegistry::new();
+    let id = registry.spawn(helper_spec("fork")).expect("tracked");
+    let grandchild = wait_grandchild(&registry, id);
+    let live = registry.get(id).expect("tracked");
+    let request = CancelRequest::new(
+        live.handle(),
+        CancelMode::GracefulThenKill,
+        WINDOWS_ESCALATION_GRACE,
+    )
+    .expect("request");
+    let started = Instant::now();
+    assert_eq!(registry.cancel_typed(request), Ok(CancelReceipt::Accepted));
+    assert_eq!(wait_answer(&registry, id), CancelOutcome::Killed);
+    let stopped = wait_terminal(&registry, id);
+    assert!(
+        started.elapsed() < WINDOWS_ESCALATION_BOUND,
+        "the graceful steps are refused on Windows, so the kill is immediate"
+    );
+    assert_eq!(
+        stopped.state,
+        JobState::Done(ExecutionOutcome::Cancelled(CancelEffect::Killed))
+    );
+    assert_tree_gone(&stopped, grandchild);
 }
 
 #[cfg(unix)]

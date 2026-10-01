@@ -136,9 +136,10 @@
 //! # Security and resource bounds
 //!
 //! - No `unsafe` is required. The workspace denies `unsafe_code`; this crate
-//!   enforces `#![forbid(unsafe_code)]` with no exception. The single
-//!   `allow(unsafe_code)` in `bitty-render`'s GPU surface creation path
-//!   stays behind that crate's boundary.
+//!   enforces `#![forbid(unsafe_code)]` with no exception. The two audited
+//!   `allow(unsafe_code)` modules — `bitty-render`'s GPU surface creation
+//!   path and `bitty-winjob`'s Win32 Job Object adapter (Windows only) —
+//!   stay behind their own crate boundaries.
 //! - Bounded parsing/state invariants are owned by `bitty-vt`/`bitty-term-state`.
 //!   Bounded rendering (atlas size, cache capacity) is owned by `bitty-render`.
 //!   The bounded cold-path queue is owned here; the bounded plugin side queue

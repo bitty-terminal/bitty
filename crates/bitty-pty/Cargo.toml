@@ -26,5 +26,11 @@ rustix = { workspace = true, features = ["process", "std"] }
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 nix = { workspace = true, features = ["event", "process", "signal"] }
 
+# CTX-0903 (DEC-0083): the Windows owned-tree backend (Job Objects). The
+# first-party `bitty-winjob` adapter holds the reviewed Win32 FFI, so this
+# crate stays `forbid(unsafe_code)` on Windows too.
+[target.'cfg(windows)'.dependencies]
+bitty-winjob = { version = "0.0.21", path = "../bitty-winjob" }
+
 [dev-dependencies]
 bitty-test-support = { path = "../bitty-test-support" }

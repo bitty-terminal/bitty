@@ -1,0 +1,26 @@
+[package]
+name = "bitty-winjob"
+description = "Narrow reviewed Win32 Job Object adapter for Bitty owned process trees"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/bitty-terminal/bitty"
+keywords = ["windows", "job-object", "process", "bitty"]
+categories = ["os::windows-apis"]
+publish = true
+
+[lints]
+workspace = true
+
+# CTX-0903 (DEC-0083): the only Windows FFI dependency. Non-Windows targets
+# compile this crate to an empty surface with no dependencies at all. The
+# feature list is exactly the Win32 API families `src/ffi.rs` calls.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_JobObjects",
+  "Win32_System_Threading",
+] }

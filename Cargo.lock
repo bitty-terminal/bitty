@@ -369,6 +369,7 @@ name = "bitty-pty"
 version = "0.0.21"
 dependencies = [
  "bitty-test-support",
+ "bitty-winjob",
  "nix 0.31.3",
  "portable-pty",
  "rustix 1.1.5",
@@ -419,6 +420,7 @@ dependencies = [
  "bitty-test-support",
  "bitty-ui",
  "bitty-vt",
+ "bitty-winjob",
  "nix 0.31.3",
  "rustix 1.1.5",
 ]
@@ -471,6 +473,13 @@ name = "bitty-vt"
 version = "0.0.21"
 dependencies = [
  "vte",
+]
+
+[[package]]
+name = "bitty-winjob"
+version = "0.0.21"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+<<<<<<< HEAD
+- **Windows owned-process-tree backend (CTX-0903, #1536):** jobs on Windows
+  now run in a kill-on-close Job Object, so a cancel, timeout, or kill ends
+  the whole tree (grandchildren included) and snapshots report
+  `KillScope::OwnedTree` (`ProcessTreeBackend::WindowsJobObject`,
+  `TreeBackend::JobObject`). Pipe jobs start suspended and join their job
+  before running; ConPTY jobs join right after the spawn, so a descendant
+  created before that assignment can escape (tracked gap). Job Objects are
+  kill-only: `signal_as(Interrupt | Terminate)` and a `CancelMode::Graceful`
+  cancel resolve to a typed `Unsupported`, never a single-pid kill; a
+  `CancelMode::GracefulThenKill` cancel skips its grace periods and kills
+  the tree immediately. Lifetime divergence: the job is kill-on-close and
+  its handle belongs to the bitty process, so on Windows every live job,
+  detached and service jobs included, dies when bitty exits or crashes,
+  while Unix process groups outlive it (documented, not changed; open
+  decision). The Win32 FFI lives in the new `bitty-winjob` crate, the
+  second audited `unsafe` allowance (`specifications/unsafe-ffi-audit.md`);
+  `bitty-pty` stays `forbid(unsafe_code)`.
+  Release order: `bitty-pty` is no longer a dependency-free leaf on Windows
+  (it depends on `bitty-winjob` there), so `bitty-winjob` must be published
+  before `bitty-pty`; the 0.0.1 "Group 1 — Leaves" list below is historical
+  and no longer describes `bitty-pty`.
+=======
 - **Workspace domain for Lua plugins (CTX-0889, #1569):** plugins can now read
   workspace state and control workspace operations through two new capabilities:
   `workspace.read` (query list, receive events) and `workspace.control` (focus,
@@ -50,6 +73,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reload refreshes the window title. Font family, size, and spacing adopt in
   one atlas rebuild. `bitty-config` now exports the `LIVE_FIELDS` /
   `RESTART_REQUIRED_FIELDS` lists that drive `classify_field`.
+>>>>>>> origin/main
 - **Live configuration reload (CTX-0814, #1397):** `reconcile_live` now has a
   production caller. The composition root installs a reload context at startup
   (skipped under `--safe`), and both `bitty ctl config reload` and an automatic

@@ -1,17 +1,22 @@
 //! Owned process trees: signal and kill every member of a job, never a
 //! single pid (CTX-0512).
 //!
-//! A job's **owned tree** is the process group its leader heads. The leader
-//! is a child of this process that has not been reaped yet: either a
+//! A job's **owned tree** is the process group its leader heads (Unix) or
+//! the Job Object it was assigned to (Windows). The leader is a child of
+//! this process that has not been reaped yet: either a
 //! `std::process::Command` child prepared with
-//! [`OwnedTree::prepare_command`] (it leads a new process group), or a PTY
-//! child (a session leader, so it already leads its own group). The
+//! [`OwnedTree::prepare_command`] and adopted with
+//! [`OwnedTree::adopt_prepared`] (it leads a new process group, or starts
+//! suspended until it joins its job), or a PTY child adopted with
+//! [`OwnedTree::adopt`] (a session leader, so it already leads its own
+//! group; on Windows the ConPTY child joins its job after the spawn). The
 //! platform split lives here so callers never branch on `target_os`:
 //!
 //! | Platform      | Backend                         | Leader exit observed by              |
 //! | ------------- | ------------------------------- | ------------------------------------ |
 //! | Linux/Android | [`TreeBackend::ProcessGroupPidfd`] | `waitid(P_PIDFD, WNOWAIT)` (pid-scoped `waitid` when the kernel has no pidfd) |
 //! | macOS/iOS     | [`TreeBackend::ProcessGroupKqueue`] | `kqueue` `EVFILT_PROC` / `NOTE_EXIT` |
+//! | Windows       | [`TreeBackend::JobObject`]      | the leader's process handle (`WaitForSingleObject`, zero timeout) |
 //! | elsewhere     | [`TreeBackend::Unsupported`]    | nothing: [`OwnedTree::adopt`] fails and callers keep direct-child semantics |
 //!
 //! # Why exit is observed without reaping
@@ -25,16 +30,44 @@
 //! later signal fail with [`std::io::ErrorKind::NotFound`] instead of
 //! reaching a recycled id.
 //!
+//! On Windows the leader's open process handle plays the same role: the
+//! process object, and so its pid, outlives the exit until the tree is
+//! dropped, and there is no zombie to reap.
+//!
+//! # Windows signal semantics
+//!
+//! Windows has no signals. [`TreeSignal::Kill`] terminates the whole Job
+//! Object; [`TreeSignal::Interrupt`] and [`TreeSignal::Terminate`] fail with
+//! [`io::ErrorKind::Unsupported`], and [`OwnedTree::signal_group`] (there
+//! are no process groups) always fails with
+//! [`io::ErrorKind::Unsupported`]. None of them falls back to a single pid.
+//!
 //! # Gaps (documented, not hidden)
 //!
-//! - A member that moves itself into another group or session (`setsid`,
-//!   `setpgid`) leaves the tree; only cgroups (Linux) or Job Objects
-//!   (Windows) would keep it, and neither is implemented here.
-//! - Windows has no backend yet: the Job Object mechanism needs a reviewed
-//!   FFI boundary this `unsafe`-free crate does not carry.
+//! - Unix: a member that moves itself into another group or session
+//!   (`setsid`, `setpgid`) leaves the tree; only cgroups (Linux) would keep
+//!   it, and they are not used for the tree here.
+//! - Windows: a child adopted with [`OwnedTree::adopt`] after it started
+//!   running (the ConPTY child, which `portable-pty` spawns without
+//!   `CREATE_SUSPENDED`) joins its job only after the spawn; a descendant it
+//!   created before the assignment is not in the job and survives a tree
+//!   kill. [`OwnedTree::adopt_prepared`] children have no such window.
+//! - Windows: the Job Object is kill-on-close and its only handle belongs
+//!   to this process, so every live tree — detached and service jobs
+//!   included — dies when this process exits or crashes. Unix process
+//!   groups outlive their parent; this lifetime divergence is documented,
+//!   not resolved, here.
 //!
-//! Nothing here uses `unsafe`: `rustix` (Linux) and `nix` (macOS) own the
-//! system-call wrappers.
+//! # Pairing rule
+//!
+//! [`OwnedTree::prepare_command`] pairs with [`OwnedTree::adopt_prepared`]
+//! and nothing else. [`OwnedTree::adopt`] is only for children that are
+//! already running (the PTY child). On Windows a prepared child handed to
+//! `adopt` is never resumed and stays suspended forever.
+//!
+//! Nothing here uses `unsafe`: `rustix` (Linux), `nix` (macOS), and the
+//! first-party `bitty-winjob` adapter (Windows) own the system-call
+//! wrappers.
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[path = "tree/linux.rs"]
@@ -44,11 +77,16 @@ mod imp;
 #[path = "tree/macos.rs"]
 mod imp;
 
+#[cfg(windows)]
+#[path = "tree/windows.rs"]
+mod imp;
+
 #[cfg(not(any(
     target_os = "linux",
     target_os = "android",
     target_os = "macos",
-    target_os = "ios"
+    target_os = "ios",
+    windows
 )))]
 #[path = "tree/unsupported.rs"]
 mod imp;
@@ -65,6 +103,9 @@ pub enum TreeBackend {
     ProcessGroupPidfd,
     /// macOS/iOS: process groups plus `kqueue` exit observation.
     ProcessGroupKqueue,
+    /// Windows: a kill-on-close Job Object plus process-handle exit
+    /// observation. Only [`TreeSignal::Kill`] is deliverable.
+    JobObject,
     /// No owned-tree backend: only the direct child can be terminated, and
     /// callers must surface that gap instead of claiming tree cleanup.
     Unsupported,
@@ -83,6 +124,7 @@ impl TreeBackend {
         match self {
             Self::ProcessGroupPidfd => "process_group_pidfd",
             Self::ProcessGroupKqueue => "process_group_kqueue",
+            Self::JobObject => "job_object",
             Self::Unsupported => "unsupported",
         }
     }
@@ -103,11 +145,11 @@ impl fmt::Display for TreeBackend {
 /// Portable signal intent delivered to every member of an owned tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TreeSignal {
-    /// Polite stop request (`SIGINT`).
+    /// Polite stop request (`SIGINT`; unsupported on Windows).
     Interrupt,
-    /// Graceful termination request (`SIGTERM`).
+    /// Graceful termination request (`SIGTERM`; unsupported on Windows).
     Terminate,
-    /// Unconditional kill (`SIGKILL`).
+    /// Unconditional kill (`SIGKILL`; `TerminateJobObject` on Windows).
     Kill,
 }
 
@@ -126,7 +168,9 @@ impl TreeSignal {
 /// How a tree's leader ended, observed without reaping it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LeaderExit {
-    /// The leader exited with this status code.
+    /// The leader exited with this status code (on Windows the `u32` exit
+    /// code reinterpreted bit-for-bit, as `std::process::ExitStatus::code`
+    /// does).
     Exited(i32),
     /// The leader was terminated by this signal number.
     Signaled(i32),
@@ -138,7 +182,8 @@ pub enum LeaderExit {
 
 /// A job's owned process tree, headed by an unreaped child of this process.
 ///
-/// Signals go to the leader's whole process group. After
+/// Signals go to the leader's whole process group (Unix) or Job Object
+/// (Windows). After
 /// [`OwnedTree::retire`] every signal fails with
 /// [`io::ErrorKind::NotFound`]: the leader was reaped, so its id may be
 /// recycled and must never be signalled again.
@@ -161,26 +206,83 @@ impl fmt::Debug for OwnedTree {
 }
 
 impl OwnedTree {
-    /// Makes the child of `command` lead a new process group, so its
-    /// descendants form an owned tree [`OwnedTree::adopt`] can take over.
-    /// A no-op where no Unix process groups exist.
+    /// Prepares `command` so its child can head an owned tree that
+    /// [`OwnedTree::adopt_prepared`] takes over.
+    ///
+    /// - Unix: the child leads a new process group.
+    /// - Windows: the child starts suspended (`CREATE_SUSPENDED`; this
+    ///   replaces any creation flags set earlier on `command`, and none are
+    ///   set anywhere in this workspace) so it joins its Job Object before
+    ///   it runs. A prepared child **must** go through
+    ///   [`OwnedTree::adopt_prepared`] right after the spawn, which resumes
+    ///   it on every path.
+    /// - Elsewhere: a no-op.
+    ///
+    /// **Pair this only with [`OwnedTree::adopt_prepared`].** Handing the
+    /// child to [`OwnedTree::adopt`] instead leaves it suspended forever on
+    /// Windows (see the module's pairing rule).
     pub fn prepare_command(command: &mut Command) {
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt as _;
             command.process_group(0);
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt as _;
+            command.creation_flags(bitty_winjob::CREATE_SUSPENDED_FLAG);
+        }
+        #[cfg(not(any(unix, windows)))]
         let _ = command;
+    }
+
+    /// Takes over the tree led by `leader`, a child spawned from a command
+    /// prepared with [`OwnedTree::prepare_command`].
+    ///
+    /// On Unix this is [`OwnedTree::adopt`]. On Windows it assigns the
+    /// still-suspended child to a new Job Object and then resumes it. The
+    /// resume happens on **every** path: when the assignment fails the
+    /// child is resumed anyway and the error returned (callers keep
+    /// direct-child semantics over a running child); when the resume itself
+    /// fails the child is terminated, since it could never run, and the
+    /// resume error returned.
+    ///
+    /// # Errors
+    ///
+    /// As [`OwnedTree::adopt`], plus the resume error on Windows.
+    pub fn adopt_prepared(leader: u32) -> io::Result<Self> {
+        #[cfg(windows)]
+        {
+            if leader == 0 {
+                return Err(zero_leader());
+            }
+            Ok(Self {
+                leader,
+                retired: Mutex::new(false),
+                observer: imp::Observer::arm_prepared(leader)?,
+            })
+        }
+        #[cfg(not(windows))]
+        Self::adopt(leader)
     }
 
     /// Takes over the tree led by `leader`.
     ///
     /// `leader` must be a child of this process that is not reaped yet and
-    /// leads its own process group (a [`OwnedTree::prepare_command`] child
-    /// or a PTY child). Call this right after the spawn, before anything
-    /// else may reap the child.
+    /// leads its own process group and is already running (a PTY child).
+    /// Call this right after the spawn, before anything else may reap the
+    /// child.
     ///
+    /// On Windows the running child is assigned to a new Job Object; see
+    /// the module docs for the residual pre-assignment window.
+    ///
+    /// # Warning: already-running children only
+    ///
+    /// Never call this for a child spawned from an
+    /// [`OwnedTree::prepare_command`] command: on Windows that child was
+    /// created suspended and `adopt` never resumes it, so it would hang
+    /// forever. Use [`OwnedTree::adopt_prepared`] for those on every
+    /// platform.
     /// # Errors
     ///
     /// Returns [`io::ErrorKind::Unsupported`] where no backend exists (see
@@ -189,10 +291,7 @@ impl OwnedTree {
     /// arming error otherwise.
     pub fn adopt(leader: u32) -> io::Result<Self> {
         if leader == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "a tree leader pid must be non-zero",
-            ));
+            return Err(zero_leader());
         }
         Ok(Self {
             leader,
@@ -201,7 +300,7 @@ impl OwnedTree {
         })
     }
 
-    /// Pid of the tree leader (also the process group id).
+    /// Pid of the tree leader (also the process group id on Unix).
     #[must_use]
     pub fn leader(&self) -> u32 {
         self.leader
@@ -232,15 +331,21 @@ impl OwnedTree {
         self.observer.leader_exit(self.leader)
     }
 
-    /// Delivers `signal` to every member of the leader's process group.
+    /// Delivers `signal` to every member of the tree: the leader's process
+    /// group on Unix, the Job Object on Windows.
     ///
     /// # Errors
     ///
-    /// Returns [`io::ErrorKind::NotFound`] when the group has no member
-    /// left or the tree is retired, [`io::ErrorKind::PermissionDenied`] when
-    /// the kernel refuses the signal, and the system error otherwise.
+    /// Returns [`io::ErrorKind::NotFound`] when the tree has no member
+    /// left or is retired, [`io::ErrorKind::PermissionDenied`] when the
+    /// kernel refuses the signal, [`io::ErrorKind::Unsupported`] for a
+    /// graceful signal on Windows, and the system error otherwise.
     pub fn signal(&self, signal: TreeSignal) -> io::Result<()> {
-        self.signal_group(self.leader, signal)
+        let retired = self.retired.lock().unwrap_or_else(PoisonError::into_inner);
+        if *retired {
+            return Err(retired_error());
+        }
+        self.observer.signal_tree(self.leader, signal)
     }
 
     /// Delivers `signal` to another process group inside this tree's
@@ -253,18 +358,14 @@ impl OwnedTree {
     /// # Errors
     ///
     /// Same as [`OwnedTree::signal`], plus [`io::ErrorKind::InvalidInput`]
-    /// for a refused group id.
+    /// for a refused group id. On Windows (no process groups) every
+    /// non-refused id fails with [`io::ErrorKind::Unsupported`].
     pub fn signal_group(&self, pgid: u32, signal: TreeSignal) -> io::Result<()> {
         let retired = self.retired.lock().unwrap_or_else(PoisonError::into_inner);
         if *retired {
             return Err(retired_error());
         }
-        if pgid <= 1 || imp::is_own_group(pgid) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "refusing to signal process group 0, 1, or this process's own group",
-            ));
-        }
+        refuse_reserved_group(pgid)?;
         imp::signal_group(pgid, signal)
     }
 
@@ -279,6 +380,24 @@ impl OwnedTree {
         *retired = true;
         reaped
     }
+}
+
+/// Refuses group ids 0 and 1 and this process's own group.
+fn refuse_reserved_group(pgid: u32) -> io::Result<()> {
+    if pgid <= 1 || imp::is_own_group(pgid) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to signal process group 0, 1, or this process's own group",
+        ));
+    }
+    Ok(())
+}
+
+fn zero_leader() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "a tree leader pid must be non-zero",
+    )
 }
 
 fn retired_error() -> io::Error {
@@ -302,6 +421,7 @@ mod tests {
             TreeBackend::ProcessGroupKqueue.as_str(),
             "process_group_kqueue"
         );
+        assert_eq!(TreeBackend::JobObject.as_str(), "job_object");
         assert_eq!(TreeBackend::Unsupported.as_str(), "unsupported");
         assert_eq!(TreeSignal::Interrupt.as_str(), "interrupt");
         assert_eq!(TreeSignal::Terminate.as_str(), "terminate");
@@ -315,11 +435,14 @@ mod tests {
         assert_eq!(backend, TreeBackend::ProcessGroupPidfd);
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         assert_eq!(backend, TreeBackend::ProcessGroupKqueue);
+        #[cfg(windows)]
+        assert_eq!(backend, TreeBackend::JobObject);
         #[cfg(not(any(
             target_os = "linux",
             target_os = "android",
             target_os = "macos",
-            target_os = "ios"
+            target_os = "ios",
+            windows
         )))]
         assert_eq!(backend, TreeBackend::Unsupported);
         assert_eq!(
@@ -331,6 +454,8 @@ mod tests {
     #[test]
     fn pid_zero_is_never_a_leader() {
         let error = OwnedTree::adopt(0).expect_err("pid 0 is refused");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let error = OwnedTree::adopt_prepared(0).expect_err("pid 0 is refused");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 }

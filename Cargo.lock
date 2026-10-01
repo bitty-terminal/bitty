@@ -204,7 +204,17 @@ dependencies = [
 
 [[package]]
 name = "bitty-agent"
-version = "0.0.21"
+version = "0.1.0"
+source = "git+https://github.com/bitty-terminal/bitty-agent?rev=0013dd6#0013dd64464be7734c5bdb6409c2f468c5df89f5"
+dependencies = [
+ "bitty-agent-api",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "bitty-agent-api"
+version = "0.1.0"
+source = "git+https://github.com/bitty-terminal/bitty-agent?rev=0013dd6#0013dd64464be7734c5bdb6409c2f468c5df89f5"
 
 [[package]]
 name = "bitty-compat-lab"
@@ -232,12 +242,58 @@ version = "0.0.21"
 
 [[package]]
 name = "bitty-ipc"
-version = "0.0.21"
+version = "0.1.0"
+source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=0bec791#0bec7910b62abe5b680217e60aa3c3fd57dba95e"
 dependencies = [
- "bitty-ipc",
+ "bitty-ipc-api",
+ "bitty-ipc-auth",
+ "bitty-ipc-core",
+ "bitty-ipc-devtools",
+ "bitty-ipc-mcp",
+]
+
+[[package]]
+name = "bitty-ipc-api"
+version = "0.1.0"
+source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=0bec791#0bec7910b62abe5b680217e60aa3c3fd57dba95e"
+
+[[package]]
+name = "bitty-ipc-auth"
+version = "0.1.0"
+source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=0bec791#0bec7910b62abe5b680217e60aa3c3fd57dba95e"
+dependencies = [
+ "bitty-ipc-api",
  "getrandom 0.4.3",
  "nix 0.31.3",
  "rustix 1.1.5",
+]
+
+[[package]]
+name = "bitty-ipc-core"
+version = "0.1.0"
+source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=0bec791#0bec7910b62abe5b680217e60aa3c3fd57dba95e"
+dependencies = [
+ "bitty-ipc-api",
+]
+
+[[package]]
+name = "bitty-ipc-devtools"
+version = "0.1.0"
+source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=0bec791#0bec7910b62abe5b680217e60aa3c3fd57dba95e"
+dependencies = [
+ "bitty-ipc-api",
+ "bitty-ipc-auth",
+ "bitty-ipc-core",
+]
+
+[[package]]
+name = "bitty-ipc-mcp"
+version = "0.1.0"
+source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=0bec791#0bec7910b62abe5b680217e60aa3c3fd57dba95e"
+dependencies = [
+ "bitty-ipc-api",
+ "bitty-ipc-auth",
+ "bitty-ipc-core",
 ]
 
 [[package]]

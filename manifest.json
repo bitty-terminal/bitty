@@ -4,10 +4,10 @@
   "carryctx_version": "0.11.6",
   "schema_version": 18,
   "project_id": "01M0WAMWPGZ2YDGM6M88AT3YGT",
-  "export_id": "01M3WDZHEQ2JGX337VQAZ4YCX7",
-  "created_at": "2026-10-01T19:10:09.879623985+00:00",
+  "export_id": "01M3WE0V383DHV9K038AHQJBA9",
+  "created_at": "2026-10-01T19:10:52.520386684+00:00",
   "parents": [
-    "01M3W8ZXT8XD6S86Q1AW5H1A4J"
+    "01M3WDZHEQ2JGX337VQAZ4YCX7"
   ],
   "sequences": {
     "display_id_CTX": 917,
@@ -17,15 +17,15 @@
   },
   "source": {
     "git_branch": "fix/update-bitty-ipc-rev",
-    "git_commit": "6b830fa544820f8afb4b2242fd9223d1caed55f0",
+    "git_commit": "a0750d08858c40355afc6e6f5d9246a4139c511e",
     "hostname": "unknown"
   },
   "counts": {
     "agents": 1192,
     "checkpoint_corrections": 0,
-    "checkpoints": 2689,
+    "checkpoints": 2690,
     "decisions": 83,
-    "events": 20575,
+    "events": 20579,
     "graph_edges": 1300,
     "graph_nodes": 456,
     "handoffs": 50,

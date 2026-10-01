@@ -15,7 +15,7 @@ workspace = true
 
 [dependencies]
 bitty-agent = { git = "https://github.com/bitty-terminal/bitty-agent", rev = "0013dd6" }
-bitty-ipc = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "0bec791" }
+bitty-ipc = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "6841646" }
 bitty-runtime = { path = "../bitty-runtime" }
 bitty-ui = { path = "../bitty-ui" }
 

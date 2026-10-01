@@ -19,7 +19,7 @@ bitty-vt = { path = "../bitty-vt" }
 bitty-platform = { path = "../bitty-platform" }
 # Fragment-to-RichBlock projection (CTX-0439) reads the bounded ingestion
 # DTOs; workspace-internal edge, no new supply-chain surface.
-bitty-ipc = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "0bec791" }
+bitty-ipc = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "6841646" }
 # 256-bit one-time clipboard-read tokens (CTX-0213). Pinned to the locked
 # 0.4.x line; no other RNG is used so token entropy is auditable in one place.
 getrandom = "0.4"

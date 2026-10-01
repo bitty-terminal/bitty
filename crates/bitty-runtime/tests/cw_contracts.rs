@@ -288,7 +288,7 @@ fn ctx0721_routable_cancel_and_expiry_are_explicit() {
 
 #[test]
 fn ctx0721_v1_surface_frozen_per_oq056_deferral() {
-    assert_eq!(V1_CORE_TOPICS.len(), 7);
+    assert_eq!(V1_CORE_TOPICS.len(), 6);
     for raw in V1_CORE_TOPICS {
         assert!(is_v1_core_topic(raw));
     }

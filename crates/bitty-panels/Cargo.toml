@@ -14,8 +14,8 @@ publish = false
 workspace = true
 
 [dependencies]
-bitty-agent = { path = "../bitty-agent" }
-bitty-ipc = { path = "../bitty-ipc" }
+bitty-agent = { git = "https://github.com/bitty-terminal/bitty-agent", rev = "0013dd6" }
+bitty-ipc = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "0bec791" }
 bitty-runtime = { path = "../bitty-runtime" }
 bitty-ui = { path = "../bitty-ui" }
 

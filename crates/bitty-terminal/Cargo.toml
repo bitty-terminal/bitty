@@ -19,7 +19,7 @@ path = "src/main.rs"
 
 [dependencies]
 bitty-config = { path = "../bitty-config" }
-bitty-ipc = { path = "../bitty-ipc" }
+bitty-ipc = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "0bec791" }
 bitty-perf = { path = "../bitty-perf" }
 bitty-platform = { path = "../bitty-platform" }
 bitty-plugin-host = { path = "../bitty-plugin-host" }
@@ -32,5 +32,5 @@ pollster = { workspace = true }
 
 [dev-dependencies]
 # Hermetic `ServeContext` constructors and unbound bearer minters (#1519).
-bitty-ipc = { path = "../bitty-ipc", features = ["test-support"] }
+bitty-ipc = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "0bec791", features = ["test-support"] }
 bitty-test-support = { path = "../bitty-test-support" }

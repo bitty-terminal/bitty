@@ -1,11 +1,9 @@
 [workspace]
 members = [
-  "crates/bitty-agent",
   "crates/bitty-terminal",
   "crates/bitty-compat-lab",
   "crates/bitty-config",
   "crates/bitty-core",
-  "crates/bitty-ipc",
   "crates/bitty-lua",
   "crates/bitty-package",
   "crates/bitty-panels",

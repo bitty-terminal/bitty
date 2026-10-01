@@ -305,6 +305,7 @@ impl ConfigPlan {
             && self.plugins.is_none()
             && self.extends.is_none()
             && self.profile_name.is_none()
+            && self.session.is_none()
     }
 }
 

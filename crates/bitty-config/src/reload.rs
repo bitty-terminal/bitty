@@ -389,6 +389,29 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
     ] {
         push_if_changed(field, before, after);
     }
+    // CTX-0898 (#1522): the global background trio is classified Live and
+    // adopted by the runtime (`set_background_appearance` re-runs the
+    // fail-closed load pipeline), so each leaf must diff; without these a
+    // background-only edit reported `unchanged` and was never adopted.
+    for (field, before, after) in [
+        (
+            "decoration.background_image",
+            format!("{:?}", old.decoration.background_image),
+            format!("{:?}", new.decoration.background_image),
+        ),
+        (
+            "decoration.background_fit",
+            format!("{:?}", old.decoration.background_fit),
+            format!("{:?}", new.decoration.background_fit),
+        ),
+        (
+            "decoration.background_image_roots",
+            format!("{:?}", old.decoration.background_image_roots),
+            format!("{:?}", new.decoration.background_image_roots),
+        ),
+    ] {
+        push_if_changed(field, before, after);
+    }
     push_if_changed(
         "terminal.scrollback",
         old.terminal.scrollback.to_string(),
@@ -809,6 +832,39 @@ mod tests {
         let mut cur = old;
         reconcile_live(&mut cur, &new).expect("hints switch reconciles live");
         assert_eq!(cur.hints_enabled, Some(false));
+    }
+
+    #[test]
+    fn diff_background_fields_are_live() {
+        // CTX-0898 (#1522): each global background leaf diffs as Live, so a
+        // background-only edit is never reported `unchanged`.
+        let old = EffectiveConfig::default();
+        let mut new = old.clone();
+        new.decoration.background_fit = Some(crate::types::BackgroundFit::Tile);
+        new.decoration.background_image_roots = Some(vec![
+            std::env::temp_dir()
+                .join("bitty-walls")
+                .display()
+                .to_string(),
+        ]);
+        let r = diff(&old, &new);
+        assert_eq!(r.overall, ReloadClass::Live, "{r:?}");
+        assert!(
+            r.diffs
+                .iter()
+                .any(|d| d.field == "decoration.background_fit")
+        );
+        assert!(
+            r.diffs
+                .iter()
+                .any(|d| d.field == "decoration.background_image_roots")
+        );
+        assert!(
+            !r.diffs
+                .iter()
+                .any(|d| d.field == "decoration.background_image"),
+            "an unchanged leaf does not diff"
+        );
     }
 
     #[test]

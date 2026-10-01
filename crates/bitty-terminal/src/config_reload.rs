@@ -21,14 +21,27 @@
 //!
 //! ## Applied subset
 //!
-//! The runtime exposes live-adopt setters for the presentation layer:
-//! decoration (gaps/border/radius/content_inset), outline colors, animation
-//! policy, window padding, window radius, and font size. Those are the fields
-//! this path adopts. The remaining `Live` inventory entries (font family /
-//! line height / letter spacing, appearance theme+colors, keymaps / leader /
-//! mod key, window opacity) have no runtime adopter yet — adopting them is a
-//! follow-up, and a reload that touches *only* those still reports success for
-//! the diff while listing them under `changed` for the caller to see.
+//! Every `Live`-class field has a runtime adopter:
+//!
+//! * runtime presentation (CTX-0814): decoration geometry, outline colors and
+//!   widths, animation policy, window padding/radius, font size, and the
+//!   workspace bar;
+//! * runtime (CTX-0898, #1522): `appearance.theme` / `appearance.colors`
+//!   (`set_theme_palette`), `font.family` / `font.line_height` /
+//!   `font.letter_spacing` (`set_font_face`: face reload + atlas rebuild +
+//!   reflow), `window.opacity` (`set_window_opacity`: GPU surface alpha), and
+//!   `decoration.background_*` plus `views` (`set_background_appearance`: the
+//!   full fail-closed load pipeline before any swap);
+//! * app chrome (CTX-0898): `keymaps`, `mod_key`, `leader_key`,
+//!   `leader_timeout_ms`, `hints_enabled`, and the platform window
+//!   transparency hint for `window.opacity`. The reload resolves them
+//!   fail-closed together with the runtime setters and stashes the result;
+//!   the app takes it on the same tick ([`take_app_adoption`]), because the
+//!   chrome state lives on `TerminalApp`, not on `Runtime`.
+//!
+//! [`runtime_adopts`] is the single list of adopted fields. A future `Live`
+//! field without an adopter stays out of it and is reported under
+//! `restart_required` until it gains one.
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -100,14 +113,24 @@ pub(crate) struct ReloadOutcomeInfo {
     pub(crate) message: Option<String>,
 }
 
-/// Whether the running runtime adopts `field` live through
-/// [`apply_live_presentation`]. Every other changed field, even when
-/// `bitty-config` classifies it `Live`, is reported under `restart_required`
-/// so a reply never claims an adoption that did not happen.
+/// Whether the running app adopts `field` live through [`apply_live`].
+/// Every other changed field, even when `bitty-config` classifies it
+/// `Live`, is reported under `restart_required` so a reply never claims an
+/// adoption that did not happen.
+///
+/// Platform caveat for `window.opacity`: the renderer half (surface alpha)
+/// always adopts, but winit can only set the window transparency hint at
+/// creation on X11, so raising transparency on an X11 window that started
+/// opaque may stay visually opaque until restart. That is a platform limit
+/// of the hint, not a missing adopter, so the field stays adopted.
 fn runtime_adopts(field: &str) -> bool {
     matches!(
         field,
-        "font.size"
+        "font.family"
+            | "font.size"
+            | "font.line_height"
+            | "font.letter_spacing"
+            | "window.opacity"
             | "window.padding"
             | "window.radius_px"
             | "decoration.gaps_in"
@@ -121,9 +144,21 @@ fn runtime_adopts(field: &str) -> bool {
             | "decoration.border_width"
             | "decoration.border_width_focused"
             | "decoration.border_width_idle"
+            | "decoration.background_image"
+            | "decoration.background_fit"
+            | "decoration.background_image_roots"
+            | "appearance.theme"
+            | "appearance.colors"
+            | "keymaps"
+            | "mod_key"
+            | "leader_key"
+            | "leader_timeout_ms"
+            | "hints_enabled"
             | "workspace.show_bar"
             | "workspace.bar.edge"
     ) || field.starts_with("appearance.animations")
+        || field == "views"
+        || field.starts_with("views[")
 }
 
 /// The reload engine: pure policy driver over the last-applied config.
@@ -180,17 +215,95 @@ impl ReloadEngine {
     }
 }
 
-/// Adopt the live presentation subset of `effective` into `runtime`.
+/// App-owned half of a live reload (CTX-0898, #1522): chrome key state and
+/// the platform window opacity hint, resolved fail-closed by [`apply_live`]
+/// and taken by the app on the same tick via [`take_app_adoption`].
+#[derive(Debug, Clone)]
+pub(crate) struct AppAdoption {
+    /// Resolved keymap table (shipped defaults under `mod_key` + overrides).
+    pub(crate) keymaps: Vec<bitty_config::ResolvedKeymap>,
+    /// Resolved Leader binding (`leader_key` / `leader_timeout_ms`).
+    pub(crate) leader: bitty_config::ResolvedLeader,
+    /// Resolved hint kill switch (`hints_enabled`).
+    pub(crate) hints_enabled: bool,
+    /// Effective `window.opacity` for the platform transparency hint.
+    pub(crate) window_opacity: f32,
+}
+
+thread_local! {
+    /// The latest successfully applied [`AppAdoption`], awaiting the app.
+    /// One slot, overwritten by each successful reload, so it is bounded and
+    /// the app always adopts the newest accepted config. Main-thread only,
+    /// like [`CONTEXT`].
+    static PENDING_APP: RefCell<Option<AppAdoption>> = const { RefCell::new(None) };
+}
+
+/// Take the pending app-side adoption, if a reload produced one since the
+/// last call.
+pub(crate) fn take_app_adoption() -> Option<AppAdoption> {
+    PENDING_APP.with(|slot| slot.borrow_mut().take())
+}
+
+/// Resolve the app-owned half of `effective` without side effects.
+///
+/// Uses the startup resolvers (`resolve_keymaps`, `resolve_leader_for`,
+/// `resolve_hint_config`) so a reload binds exactly what a fresh launch
+/// would; any error fails the whole reload before the runtime is touched.
+fn resolve_app_adoption(effective: &EffectiveConfig) -> Result<AppAdoption, String> {
+    let keymaps =
+        bitty_config::resolve_keymaps(effective).map_err(|err| format!("keymaps: {err}"))?;
+    let leader = bitty_config::resolve_leader_for(effective, bitty_config::LeaderPlatform::host())
+        .map_err(|err| format!("leader_key: {err}"))?;
+    Ok(AppAdoption {
+        keymaps,
+        leader,
+        hints_enabled: bitty_config::resolve_hint_config(effective).enabled,
+        window_opacity: effective.window.opacity,
+    })
+}
+
+/// Adopt every live field of `effective`: the runtime half directly, the app
+/// half by stashing it for [`take_app_adoption`].
+///
+/// Resolution that can fail without side effects (the startup runtime-config
+/// mapping, keymaps, leader) runs first. The runtime setters then run with
+/// the theme before backgrounds/views (their AC-1/AC-2 check reads the
+/// installed theme background) and the font face before the font size (the
+/// size reload reads the installed family). The app half is stashed only
+/// when every runtime setter succeeded. Returns the first error, formatted
+/// for the ctl reply.
+pub(crate) fn apply_live(
+    runtime: &mut bitty_runtime::Runtime,
+    effective: &EffectiveConfig,
+) -> Result<(), String> {
+    let app = resolve_app_adoption(effective)?;
+    apply_live_presentation(runtime, effective)?;
+    PENDING_APP.with(|slot| *slot.borrow_mut() = Some(app));
+    Ok(())
+}
+
+/// Adopt the runtime-owned live subset of `effective` into `runtime`.
 ///
 /// Reuses the startup mapping ([`crate::config_cli::runtime_config_from_effective`])
-/// so a reload resolves the same decoration/outline/animation/font values as a
-/// fresh launch, then drives the runtime's live-adopt setters. Returns the
-/// first setter error, formatted for the ctl reply.
+/// so a reload resolves the same theme/decoration/outline/animation/font/
+/// background values as a fresh launch, then drives the runtime's live-adopt
+/// setters. Returns the first setter error, formatted for the ctl reply.
 pub(crate) fn apply_live_presentation(
     runtime: &mut bitty_runtime::Runtime,
     effective: &EffectiveConfig,
 ) -> Result<(), String> {
     let resolved = crate::config_cli::runtime_config_from_effective(effective)?;
+    // CTX-0898: the palette first, so the background/views contrast check
+    // below runs against the theme this reload installs.
+    runtime.set_theme_palette(resolved.theme);
+    runtime
+        .set_background_appearance(
+            resolved.view_appearance,
+            resolved.background_image,
+            resolved.background_fit,
+            resolved.background_image_roots,
+        )
+        .map_err(|err| format!("decoration.background: {err}"))?;
     runtime
         .set_decoration(resolved.decoration)
         .map_err(|err| format!("decoration: {err}"))?;
@@ -202,9 +315,30 @@ pub(crate) fn apply_live_presentation(
     runtime
         .set_window_radius_px(effective.window.radius_px)
         .map_err(|err| format!("window.radius_px: {err}"))?;
+    // CTX-0898: `font.line_height` / `font.letter_spacing` arrive as the
+    // derived base cell; the face reloads before the size so the size path
+    // rasterizes the new family.
+    runtime
+        .set_font_face(
+            &resolved.font_family,
+            resolved.cell_width,
+            resolved.cell_height,
+        )
+        .map_err(|err| format!("font.family: {err}"))?;
     runtime
         .set_font_size(resolved.font_size)
         .map_err(|err| format!("font.size: {err}"))?;
+    let blendable = runtime
+        .set_window_opacity(effective.window.opacity)
+        .map_err(|err| format!("window.opacity: {err}"))?;
+    if !blendable {
+        crate::logging::warn(|| {
+            format!(
+                "bitty: window.opacity={:.3} unsupported on this GPU surface (no premultiplied alpha mode) — staying opaque",
+                bitty_platform::sanitize_opacity(effective.window.opacity)
+            )
+        });
+    }
     // CTX-0873: bar visibility and edge re-solve the chrome band and reflow
     // leaves, grids, and PTYs in place. Both setters are total. The edge is
     // set first so a simultaneous show + move reflows straight to the final
@@ -399,20 +533,29 @@ fn poll_file_at(runtime: &mut bitty_runtime::Runtime, at: Instant) -> Option<Rel
     })
 }
 
+/// Live-class fields that differ between `launched` and `current` and that
+/// `adopts` rejects: the restart-pending set (split out so the filter is
+/// testable while every current `Live` field has an adopter).
+fn pending_fields(
+    launched: &EffectiveConfig,
+    current: &EffectiveConfig,
+    adopts: fn(&str) -> bool,
+) -> Vec<String> {
+    bitty_config::diff(launched, current)
+        .diffs
+        .into_iter()
+        .filter(|diff| diff.class == bitty_config::ReloadClass::Live && !adopts(&diff.field))
+        .map(|diff| diff.field)
+        .collect()
+}
+
 impl ReloadContext {
     /// Live-class fields whose accepted value differs from the launch value
     /// but that the runtime cannot adopt live: they stay pending until restart
     /// on every later reply, including an `unchanged` one (CodeRabbit on
     /// #1516), and drop out once the file returns to the launch value.
     fn pending_restart_fields(&self) -> Vec<String> {
-        bitty_config::diff(&self.launched, self.engine.current())
-            .diffs
-            .into_iter()
-            .filter(|diff| {
-                diff.class == bitty_config::ReloadClass::Live && !runtime_adopts(&diff.field)
-            })
-            .map(|diff| diff.field)
-            .collect()
+        pending_fields(&self.launched, self.engine.current(), runtime_adopts)
     }
 
     /// Re-resolve, classify, adopt if live, and build the caller-visible info.
@@ -434,7 +577,7 @@ impl ReloadContext {
         let outcome = self.engine.reload(incoming);
         let applied = outcome.applied();
         if matches!(outcome, ReloadOutcome::Applied(_)) {
-            if let Err(message) = apply_live_presentation(runtime, self.engine.current()) {
+            if let Err(message) = apply_live(runtime, self.engine.current()) {
                 // Keep engine and runtime consistent: a failed adopt must not
                 // leave the engine claiming the new config is live. Earlier
                 // setters may already have changed the runtime, so reapply the
@@ -525,34 +668,92 @@ mod tests {
     }
 
     #[test]
-    fn unadopted_live_field_stays_pending_across_reloads() {
+    fn unadopted_live_field_is_reported_pending_until_reverted() {
+        // Every current `Live` field has an adopter (CTX-0898), so the
+        // pending filter is exercised with an adopter that refuses one field:
+        // the filter must report it while it differs from the launch value
+        // and drop it once the value returns.
+        fn all_but_family(field: &str) -> bool {
+            field != "font.family"
+        }
         let baseline = bitty_config::fallback_builtin();
         let mut edited = baseline.clone();
         edited.font.family = format!("{} Alt", baseline.font.family);
-        let desired = std::rc::Rc::new(std::cell::RefCell::new(edited));
-        let source = std::rc::Rc::clone(&desired);
-        clear();
-        install_with(
-            baseline.clone(),
-            Box::new(move || Ok(source.borrow().clone())),
-            None,
-        );
-        let mut runtime = bitty_runtime::Runtime::with_defaults().expect("runtime");
-        let first = reload_requested(&mut runtime).expect("context installed");
-        assert_eq!(first.kind, "applied");
-        assert_eq!(first.restart_required, vec![String::from("font.family")]);
-        let second = reload_requested(&mut runtime).expect("context installed");
-        assert_eq!(second.kind, "unchanged");
+        edited.font.size = 15.0;
         assert_eq!(
-            second.restart_required,
-            vec![String::from("font.family")],
-            "a pending restart is reported until it takes effect"
+            pending_fields(&baseline, &edited, all_but_family),
+            vec![String::from("font.family")]
         );
-        // Reverting the file to the launch value clears the pending field.
-        *desired.borrow_mut() = baseline;
-        let reverted = reload_requested(&mut runtime).expect("context installed");
-        assert!(reverted.restart_required.is_empty(), "{reverted:?}");
-        clear();
+        assert!(pending_fields(&baseline, &edited, runtime_adopts).is_empty());
+        assert!(pending_fields(&baseline, &baseline, all_but_family).is_empty());
+    }
+
+    #[test]
+    fn every_live_inventory_field_has_an_adopter() {
+        // CTX-0898 acceptance: each Live-class leaf `bitty-config` can diff
+        // is adopted. Diff a config that changes every leaf at once.
+        let base = bitty_config::fallback_builtin();
+        let mut all = base.clone();
+        all.font.family = format!("{} Alt", base.font.family);
+        all.font.size = base.font.size + 1.0;
+        all.font.line_height = 1.5;
+        all.font.letter_spacing = 1.0;
+        all.window.opacity = 0.5;
+        all.window.padding = base.window.padding + 1;
+        all.window.radius_px = base.window.radius_px + 1;
+        all.appearance.theme = Some(String::from("dracula"));
+        all.mod_key = bitty_config::ModKey::Super;
+        all.leader_timeout_ms = Some(2_000);
+        all.hints_enabled = Some(false);
+        all.decoration.background_fit = Some(bitty_config::types::BackgroundFit::Tile);
+        all.decoration.background_image_roots = Some(vec![
+            std::env::temp_dir()
+                .join("bitty-walls")
+                .display()
+                .to_string(),
+        ]);
+        all.views = vec![bitty_config::types::ViewOverride {
+            selector: bitty_config::types::ViewSelector::Wildcard,
+            overrides: bitty_config::types::ViewAppearanceOverride {
+                border_width: Some(2),
+                ..Default::default()
+            },
+        }];
+        let report = bitty_config::diff(&base, &all);
+        assert!(!report.has_rejected, "{report:?}");
+        let live: Vec<&str> = report
+            .diffs
+            .iter()
+            .filter(|d| d.class == ReloadClass::Live)
+            .map(|d| d.field.as_str())
+            .collect();
+        for field in [
+            "font.family",
+            "font.line_height",
+            "font.letter_spacing",
+            "window.opacity",
+            "appearance.theme",
+            "mod_key",
+            "leader_timeout_ms",
+            "hints_enabled",
+            "decoration.background_fit",
+            "decoration.background_image_roots",
+            "views[*]",
+        ] {
+            assert!(live.contains(&field), "{field} must diff as Live: {live:?}");
+        }
+        for field in &live {
+            assert!(runtime_adopts(field), "{field} has no live adopter");
+        }
+        for field in [
+            "keymaps",
+            "leader_key",
+            "appearance.colors",
+            "decoration.background_image",
+            "views",
+        ] {
+            assert!(runtime_adopts(field), "{field} has no live adopter");
+        }
     }
 
     #[cfg(unix)]
@@ -593,15 +794,123 @@ mod tests {
         assert!(runtime_adopts("appearance.animations.duration_ms.open"));
         assert!(runtime_adopts("workspace.show_bar"));
         assert!(runtime_adopts("workspace.bar.edge"));
-        for pending in [
-            "font.family",
-            "window.opacity",
-            "appearance.theme",
-            "decoration.background_image",
-            "keymaps",
+        for restart in [
+            "terminal.scrollback",
+            "terminal.shell",
+            "layout.gaps_in",
+            "plugins",
+            "close_confirm",
         ] {
-            assert!(!runtime_adopts(pending), "{pending} has no live adopter");
+            assert!(!runtime_adopts(restart), "{restart} is restart-required");
         }
+    }
+
+    fn deterministic_runtime(effective: &EffectiveConfig) -> bitty_runtime::Runtime {
+        let cfg = crate::config_cli::runtime_config_from_effective(effective).expect("cfg");
+        bitty_runtime::Runtime::with_deterministic_rasterizer(cfg).expect("runtime")
+    }
+
+    #[test]
+    fn apply_live_adopts_theme_and_custom_colors() {
+        let baseline = bitty_config::fallback_builtin();
+        let mut runtime = deterministic_runtime(&baseline);
+        let mut light = baseline.clone();
+        light.appearance.theme = Some(String::from("dracula"));
+        apply_live(&mut runtime, &light).expect("adopt theme");
+        let expected = bitty_runtime::ThemePalette::from_theme(bitty_config::theme::resolve_theme(
+            Some("dracula"),
+        ));
+        assert_eq!(runtime.config().theme.background, expected.background);
+        assert_eq!(runtime.active_background(), expected.background);
+
+        let mut custom = light.clone();
+        let preset = bitty_config::theme::resolve_theme(None);
+        let palette = bitty_config::theme::CustomPalette {
+            background: [0x10, 0x20, 0x30],
+            foreground: preset.foreground,
+            cursor: preset.cursor,
+            selection: preset.selection,
+            ansi: preset.ansi,
+        };
+        custom.appearance.colors = Some(palette);
+        apply_live(&mut runtime, &custom).expect("adopt colors");
+        assert_eq!(
+            runtime.active_background(),
+            [0x10, 0x20, 0x30, 0xFF],
+            "appearance.colors replaces the preset palette"
+        );
+        let _ = take_app_adoption();
+    }
+
+    #[test]
+    fn apply_live_adopts_font_family_and_spacing() {
+        let baseline = bitty_config::fallback_builtin();
+        let mut runtime = deterministic_runtime(&baseline);
+        let before = runtime.live_cell_size();
+        let mut edited = baseline.clone();
+        edited.font.family = String::from("Alt Mono");
+        edited.font.line_height = 1.5;
+        edited.font.letter_spacing = 2.0;
+        apply_live(&mut runtime, &edited).expect("adopt font");
+        let (width, height) = edited.font.default_effective_cell();
+        assert_eq!(runtime.config().font_family, "Alt Mono");
+        assert_eq!(
+            (runtime.config().cell_width, runtime.config().cell_height),
+            (width, height)
+        );
+        assert_ne!(runtime.live_cell_size(), before, "atlas cell rebuilt");
+        let _ = take_app_adoption();
+    }
+
+    #[test]
+    fn apply_live_adopts_window_opacity_and_stashes_it_for_the_app() {
+        let baseline = bitty_config::fallback_builtin();
+        let mut runtime = deterministic_runtime(&baseline);
+        let _ = take_app_adoption();
+        let mut edited = baseline.clone();
+        edited.window.opacity = 0.75;
+        apply_live(&mut runtime, &edited).expect("adopt opacity");
+        assert!((runtime.window_opacity() - 0.75).abs() < f32::EPSILON);
+        let app = take_app_adoption().expect("app half stashed");
+        assert!((app.window_opacity - 0.75).abs() < f32::EPSILON);
+        assert!(take_app_adoption().is_none(), "single-shot slot");
+    }
+
+    #[test]
+    fn apply_live_resolves_keymaps_leader_and_hints_for_the_app() {
+        let baseline = bitty_config::fallback_builtin();
+        let mut runtime = deterministic_runtime(&baseline);
+        let _ = take_app_adoption();
+        let mut edited = baseline.clone();
+        edited.mod_key = bitty_config::ModKey::Super;
+        edited.leader_timeout_ms = Some(2_500);
+        edited.hints_enabled = Some(false);
+        apply_live(&mut runtime, &edited).expect("adopt chrome");
+        let app = take_app_adoption().expect("app half stashed");
+        let expected = bitty_config::resolve_keymaps(&edited).expect("keymaps");
+        assert_eq!(app.keymaps, expected, "mod_key rebinds the shipped map");
+        assert_ne!(
+            app.keymaps,
+            bitty_config::resolve_keymaps(&baseline).expect("baseline"),
+        );
+        assert_eq!(app.leader.timeout_ms, 2_500);
+        assert!(!app.hints_enabled);
+    }
+
+    #[test]
+    fn apply_live_fails_closed_on_bad_background_and_stashes_nothing() {
+        let baseline = bitty_config::fallback_builtin();
+        let mut runtime = deterministic_runtime(&baseline);
+        let _ = take_app_adoption();
+        let dir = temp_dir("bg");
+        let mut edited = baseline.clone();
+        edited.decoration.background_image = Some(dir.join("absent.png").display().to_string());
+        edited.decoration.background_image_roots = Some(vec![dir.display().to_string()]);
+        let err = apply_live(&mut runtime, &edited).expect_err("missing image");
+        assert!(err.contains("decoration.background"), "{err}");
+        assert!(runtime.config().background_image.is_none());
+        assert!(take_app_adoption().is_none(), "no app half on failure");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

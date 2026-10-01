@@ -136,6 +136,7 @@ pub mod help;
 pub mod input;
 pub mod kitty_images;
 pub mod layout_focus;
+pub mod live_config;
 pub mod log_throttle;
 pub mod mouse_chrome;
 pub mod mouse_encode;

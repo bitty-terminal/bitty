@@ -518,6 +518,39 @@ impl TerminalApp {
         self
     }
 
+    /// Adopts the app-owned half of an accepted live reload (CTX-0898, #1522).
+    ///
+    /// Swaps the resolved keymap table (`keymaps` + `mod_key`), the Leader
+    /// binding (`leader_key` + `leader_timeout_ms`), and the hint kill switch
+    /// (`hints_enabled`), and re-applies the platform transparency hint for
+    /// `window.opacity`. A Leader window or hint session armed under the old
+    /// binding is cancelled when the binding changes or hints are disabled,
+    /// so no stale chord or armed window outlives the reload. Held-key
+    /// ownership is kept: a press consumed under the old table still owns its
+    /// release (CTX-0229).
+    pub(crate) fn adopt_live_config(&mut self, adoption: crate::config_reload::AppAdoption) {
+        let leader_changed = self.chrome.leader != adoption.leader;
+        let hints_disabled = self.chrome.hints_enabled && !adoption.hints_enabled;
+        self.chrome.keymaps = adoption.keymaps;
+        self.chrome.leader = adoption.leader;
+        self.chrome.hints_enabled = adoption.hints_enabled;
+        if leader_changed || hints_disabled {
+            self.chrome.leader_state = bitty_config::LeaderState::Idle;
+            self.runtime.cw_hint_disarm();
+        }
+        if (bitty_platform::sanitize_opacity(adoption.window_opacity)
+            - bitty_platform::sanitize_opacity(self.window.opacity))
+        .abs()
+            >= f32::EPSILON
+        {
+            self.window.opacity = adoption.window_opacity;
+            if let Some(handle) = self.window.handle.as_ref() {
+                let _ = handle.set_opacity(adoption.window_opacity);
+                handle.request_redraw();
+            }
+        }
+    }
+
     /// True when per-frame `bitty tick` stderr lines are emitted.
     ///
     /// Hot-path guard: a single comparison, checked before any formatting so
@@ -672,6 +705,12 @@ impl TerminalApp {
         // presentation values. The watcher is a per-tick poll; without an
         // installed context this is a no-op.
         let _ = crate::config_reload::poll_file(&mut self.runtime);
+        // CTX-0898 (#1522): either reload path (ctl verb drained above or the
+        // file poll) may have accepted chrome-owned fields; adopt them here
+        // on the same tick so keys typed after this frame use the new table.
+        if let Some(adoption) = crate::config_reload::take_app_adoption() {
+            self.adopt_live_config(adoption);
+        }
         // CTX-0889: apply plugin workspace mutations queued since the last
         // tick before it commits, so the presented frame reflects them.
         self.apply_plugin_workspace_requests();

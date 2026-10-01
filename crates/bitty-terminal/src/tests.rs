@@ -5332,3 +5332,46 @@ fn reap_exited_last_remaining_shell_signals_app_exit() {
     assert_eq!(outcome, terminal_app::ShellExitOutcome::AppExiting);
     let _ = std::fs::remove_file(&script);
 }
+
+#[test]
+fn live_reload_adopts_keymaps_leader_hints_and_opacity_on_the_app() {
+    // CTX-0898 (#1522): the app half of a live reload swaps the chrome key
+    // table, the Leader binding, and the hint switch, cancels a Leader
+    // window armed under the old binding, and records the new opacity.
+    let base = bitty_config::EffectiveConfig::default();
+    let maps = bitty_config::resolve_keymaps(&base).expect("defaults");
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        maps.clone(),
+        SpawnSpec::default(),
+    );
+    app.chrome.leader_state = bitty_config::LeaderState::Armed { deadline_ms: 0 };
+
+    let mut edited = base.clone();
+    edited.mod_key = bitty_config::ModKey::Super;
+    edited.leader_timeout_ms = Some(3_000);
+    edited.hints_enabled = Some(false);
+    let keymaps = bitty_config::resolve_keymaps(&edited).expect("super map");
+    let leader = bitty_config::resolve_leader_for(&edited, bitty_config::LeaderPlatform::host())
+        .expect("leader");
+    app.adopt_live_config(crate::config_reload::AppAdoption {
+        keymaps: keymaps.clone(),
+        leader: leader.clone(),
+        hints_enabled: false,
+        window_opacity: 0.6,
+    });
+    assert_eq!(app.chrome.keymaps, keymaps);
+    assert_ne!(app.chrome.keymaps, maps, "mod_key rebound the table");
+    assert_eq!(app.chrome.leader, leader);
+    assert_eq!(app.chrome.leader.timeout_ms, 3_000);
+    assert!(!app.chrome.hints_enabled);
+    assert_eq!(
+        app.chrome.leader_state,
+        bitty_config::LeaderState::Idle,
+        "a stale armed Leader window is cancelled"
+    );
+    assert!((app.window.opacity - 0.6).abs() < f32::EPSILON);
+}

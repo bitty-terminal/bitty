@@ -21,6 +21,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `workspace.control` and match keybinding behavior (capacity limit, never-empty
   last workspace, kill-confirm on live sessions). All APIs are bounded by
   `MAX_WORKSPACES` (16) and coalesced per tick.
+- **Live reload adopts every `Live` config field (CTX-0898, #1522):** a reload
+  now applies the remaining `Live` keys without a restart. `appearance.theme`
+  and `appearance.colors` swap the renderer and surface palette
+  (`Runtime::set_theme_palette`) and keep live OSC 4/10/11/12 overrides.
+  `font.family`, `font.line_height`, and `font.letter_spacing` reload the face,
+  rebuild the glyph atlas at the live DPI scale, and reflow the grid
+  (`Runtime::set_font_face`). A face that fails to load keeps the running font.
+  `window.opacity` reconfigures the GPU surface alpha
+  (`Runtime::set_window_opacity`) and re-applies the window transparency hint.
+  winit only honors that hint at window creation on X11, so an X11 window that
+  started opaque can stay visually opaque until restart.
+  `decoration.background_image` / `background_fit` / `background_image_roots`
+  and `views` re-run the fail-closed background load pipeline and the RFC-0001
+  AC-1/AC-2 check against every existing View before anything is swapped
+  (`Runtime::set_background_appearance`). `keymaps`, `mod_key`, `leader_key`,
+  `leader_timeout_ms`, and `hints_enabled` re-resolve with the startup
+  resolvers, and the app adopts them on the same tick. A Leader window armed
+  under the old binding is cancelled. Any resolve or setter error rolls the
+  reload back as `apply-error`. The reload diff now reports the three global
+  `decoration.background_*` leaves; before this change a background-only edit
+  was reported as `unchanged`. No `Live` field is left in the reply's
+  `restart_required` list.
 - **Live configuration reload (CTX-0814, #1397):** `reconcile_live` now has a
   production caller. The composition root installs a reload context at startup
   (skipped under `--safe`), and both `bitty ctl config reload` and an automatic
@@ -37,7 +59,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Live-adopt coverage is the presentation subset the runtime exposes; the
   remaining `Live` keys (`font.family`/`line_height`/`letter_spacing`,
   `appearance.theme`/`colors`, `keymaps`/`leader`/`mod_key`, `window.opacity`)
-  are follow-ups with no runtime adopter yet.
+  are adopted by the CTX-0898 entry above.
 - **Workspace bar reserves its own row (CTX-0873, #1431):** the workspace bar
   is a Core-owned chrome band carved out of the window grid before layout, so
   it no longer paints over the last terminal row. Every leaf, the primary

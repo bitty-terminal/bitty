@@ -686,6 +686,24 @@ impl Surface {
         self.state.lock().expect("surface state poisoned").opacity
     }
 
+    /// Stores a new requested window opacity without a GPU reconfigure
+    /// (CTX-0898 live reload).
+    ///
+    /// Sanitizes `opacity` exactly like [`Self::configure_with_opacity`] and
+    /// carries it onto the stored [`SurfaceConfig`]. This is the headless /
+    /// not-yet-configured path: the headless compositor scales its CPU
+    /// buffer by the stored value on the next present. A real surface must
+    /// use [`Self::configure_with_opacity`] instead so the swap-chain alpha
+    /// mode is re-picked for the new value.
+    pub fn set_opacity(&self, opacity: f32) {
+        let mut state = self.state.lock().expect("surface state poisoned");
+        state.opacity = bitty_platform::sanitize_opacity(opacity);
+        let sanitized = state.opacity;
+        if let Some(config) = state.config.as_mut() {
+            *config = config.with_opacity(sanitized);
+        }
+    }
+
     /// Installs the resolved terminal palette (CTX-0355).
     ///
     /// Every clear path (clear-only present, `DrawList` present, and the

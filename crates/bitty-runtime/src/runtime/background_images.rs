@@ -134,4 +134,87 @@ impl Runtime {
         self.background_rasters = bitty_rich::BackgroundRasterCache::new();
         Ok(())
     }
+
+    /// Live-adopts the background and per-`View` appearance set without
+    /// restart (CTX-0898, issue #1522).
+    ///
+    /// Covers `decoration.background_image` / `background_fit` /
+    /// `background_image_roots` and the `views` rule table. The candidate is
+    /// checked through the same gates as construction — the runtime config
+    /// bounds, the full background load pipeline (approved roots, trust,
+    /// sniff, decode, BG-4/BG-5), and the RFC-0001 AC-1/AC-2 first-match
+    /// check for every `View` that already exists in any workspace — before
+    /// anything is swapped. Any failure returns the error and leaves the
+    /// running appearance, decoded store, and caches untouched. An unchanged
+    /// set is a no-op (no file is reopened).
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError::InvalidConfig`] for out-of-bound fields,
+    /// [`RuntimeError::BackgroundImage`] for a rejected image, and
+    /// [`RuntimeError::ViewAppearance`] when a rule would compose a violating
+    /// outline pair on an existing `View`.
+    pub fn set_background_appearance(
+        &mut self,
+        view_appearance: Vec<crate::config::ViewAppearanceRule>,
+        background_image: Option<String>,
+        background_fit: String,
+        background_image_roots: Vec<String>,
+    ) -> Result<(), RuntimeError> {
+        if self.config.view_appearance == view_appearance
+            && self.config.background_image == background_image
+            && self.config.background_fit == background_fit
+            && self.config.background_image_roots == background_image_roots
+        {
+            return Ok(());
+        }
+        let mut candidate = self.config.clone();
+        candidate.view_appearance = view_appearance;
+        candidate.background_image = background_image;
+        candidate.background_fit = background_fit;
+        candidate.background_image_roots = background_image_roots;
+        candidate.validate()?;
+        self.validate_existing_views_against(&candidate)?;
+        let (store, keys) = build_background_state(&candidate)?;
+        self.config.view_appearance = candidate.view_appearance;
+        self.config.background_image = candidate.background_image;
+        self.config.background_fit = candidate.background_fit;
+        self.config.background_image_roots = candidate.background_image_roots;
+        self.backgrounds = store;
+        self.background_keys = keys;
+        self.background_rasters = bitty_rich::BackgroundRasterCache::new();
+        self.pending_full_redraw = true;
+        Ok(())
+    }
+
+    /// RFC-0001 AC-1/AC-2 check of `candidate`'s outline resolution for every
+    /// `View` already present in any workspace (CTX-0898). Inactive slots use
+    /// their own stable label so a `ws:<n>` rule is checked where it applies.
+    fn validate_existing_views_against(
+        &self,
+        candidate: &RuntimeConfig,
+    ) -> Result<(), RuntimeError> {
+        let active = self.active_workspace_index();
+        for (index, slot) in self.workspaces.iter().enumerate() {
+            let layout = if index == active {
+                &self.layout
+            } else {
+                &slot.layout
+            };
+            let label = u8::try_from(index + 1)
+                .unwrap_or(u8::MAX)
+                .clamp(1, crate::runtime::workspaces::MAX_WORKSPACES as u8);
+            for view_id in layout.leaf_ids() {
+                let target = crate::config::RuntimeViewTarget {
+                    content: self.view_content_kind(view_id),
+                    workspace_label: label,
+                    view_id: view_id.0,
+                };
+                candidate
+                    .validate_view_outline(&target)
+                    .map_err(RuntimeError::ViewAppearance)?;
+            }
+        }
+        Ok(())
+    }
 }

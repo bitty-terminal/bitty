@@ -118,6 +118,7 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "extends"
         | "profile"
         | "schema_version" => Some(MergeClass::ScalarReplace),
+        "chrome.top.order" | "chrome.bottom.order" => Some(MergeClass::ListReplace),
         "font"
         | "window"
         | "terminal"
@@ -125,6 +126,7 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "layout"
         | "workspace"
         | "decoration"
+        | "chrome"
         | "views"
         | "scrollbar"
         | "mouse"
@@ -1087,6 +1089,90 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
                 }
             }
             attribution.insert("workspace".to_string(), src.clone());
+        }
+
+        // CTX-0890: chrome.{top,bottom}.order are array-replace (each edge
+        // independent). Absent table says nothing.
+        if let Some(chrome) = &plan.chrome {
+            if !chrome.top_order.is_empty() {
+                let field = "chrome.top.order";
+                if is_policy {
+                    policy_fields.insert(field.to_string(), src.clone());
+                    effective.chrome.top_order.clone_from(&chrome.top_order);
+                    let prev = attribution.get(field).cloned();
+                    record_attribution(
+                        &mut attribution,
+                        &mut conflicts,
+                        field,
+                        prev,
+                        src,
+                        MergeClass::ListReplace,
+                    );
+                } else if let Some(policy_src) = policy_fields.get(field) {
+                    policy_violations.push(ConfigError::NonOverridable {
+                        field: field.to_string(),
+                        policy_source: policy_src.describe(),
+                        attempted_source: src.describe(),
+                    });
+                    conflicts.push(MergeConflict {
+                        field: field.to_string(),
+                        previous_source: policy_src.clone(),
+                        new_source: src.clone(),
+                        merge_class: MergeClass::ListReplace,
+                    });
+                } else {
+                    let prev = attribution.get(field).cloned();
+                    effective.chrome.top_order.clone_from(&chrome.top_order);
+                    record_attribution(
+                        &mut attribution,
+                        &mut conflicts,
+                        field,
+                        prev,
+                        src,
+                        MergeClass::ListReplace,
+                    );
+                }
+            }
+            if !chrome.bottom_order.is_empty() {
+                let field = "chrome.bottom.order";
+                if is_policy {
+                    policy_fields.insert(field.to_string(), src.clone());
+                    effective.chrome.bottom_order.clone_from(&chrome.bottom_order);
+                    let prev = attribution.get(field).cloned();
+                    record_attribution(
+                        &mut attribution,
+                        &mut conflicts,
+                        field,
+                        prev,
+                        src,
+                        MergeClass::ListReplace,
+                    );
+                } else if let Some(policy_src) = policy_fields.get(field) {
+                    policy_violations.push(ConfigError::NonOverridable {
+                        field: field.to_string(),
+                        policy_source: policy_src.describe(),
+                        attempted_source: src.describe(),
+                    });
+                    conflicts.push(MergeConflict {
+                        field: field.to_string(),
+                        previous_source: policy_src.clone(),
+                        new_source: src.clone(),
+                        merge_class: MergeClass::ListReplace,
+                    });
+                } else {
+                    let prev = attribution.get(field).cloned();
+                    effective.chrome.bottom_order.clone_from(&chrome.bottom_order);
+                    record_attribution(
+                        &mut attribution,
+                        &mut conflicts,
+                        field,
+                        prev,
+                        src,
+                        MergeClass::ListReplace,
+                    );
+                }
+            }
+            attribution.insert("chrome".to_string(), src.clone());
         }
 
         // CTX-0292: Core-owned workspace decoration (`decoration.gaps_in`,

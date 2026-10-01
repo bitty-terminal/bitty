@@ -24,6 +24,9 @@ pub const MAX_KEYMAPS: usize = 1024;
 pub const MAX_PLUGINS: usize = 1024;
 pub const MAX_SHELL_LEN: usize = 1024;
 
+/// Maximum chrome band order list entries per edge (CTX-0890).
+pub const MAX_CHROME_ORDER_ENTRIES: usize = 16;
+
 /// Default lines scrolled per wheel notch (LineDelta unit 1.0).
 /// Matches alacritty/ghostty-class `3` lines per tick.
 pub const DEFAULT_SCROLL_LINES_PER_NOTCH: u32 = 3;
@@ -2277,6 +2280,54 @@ impl WorkspaceConfig {
     }
 }
 
+/// Chrome band ordering per edge (CTX-0890, Issue #1431).
+///
+/// Plugin chrome mounts to window edges via `bitty.ui.mount(slot, tree)` where
+/// slot is "top"/"bottom"/"left"/"right". When multiple plugins mount to the
+/// same edge, `chrome.<edge>.order` defines the stacking order (innermost to
+/// outermost). Missing plugins in the order list fall back to plugin id byte
+/// order.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ChromeConfig {
+    /// Top edge band order (`chrome.top.order`).
+    pub top_order: Vec<String>,
+    /// Bottom edge band order (`chrome.bottom.order`).
+    pub bottom_order: Vec<String>,
+    /// Left edge band order (`chrome.left.order`, reserved for future).
+    pub left_order: Vec<String>,
+    /// Right edge band order (`chrome.right.order`, reserved for future).
+    pub right_order: Vec<String>,
+}
+
+impl ChromeConfig {
+    /// Validate all order lists (fail-closed).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        Self::validate_order_list("chrome.top.order", &self.top_order)?;
+        Self::validate_order_list("chrome.bottom.order", &self.bottom_order)?;
+        Self::validate_order_list("chrome.left.order", &self.left_order)?;
+        Self::validate_order_list("chrome.right.order", &self.right_order)?;
+        Ok(())
+    }
+
+    fn validate_order_list(field: &str, list: &[String]) -> Result<(), ConfigError> {
+        if list.len() > MAX_CHROME_ORDER_ENTRIES {
+            return Err(ConfigError::validation(
+                field,
+                format!("must have <= {MAX_CHROME_ORDER_ENTRIES} entries"),
+            ));
+        }
+        for (i, id) in list.iter().enumerate() {
+            if id.len() > MAX_PLUGIN_ID_LEN {
+                return Err(ConfigError::validation(
+                    field,
+                    format!("entry {i} must be <= {MAX_PLUGIN_ID_LEN} bytes"),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Core-owned workspace decoration in logical pixels (CTX-0292).
 ///
 /// Implements the workspace-compositor contract
@@ -2946,6 +2997,8 @@ pub struct EffectiveConfig {
     /// Default layout provider for new workspaces (CW-07
     /// `workspace.layout`; default preserves the current tree).
     pub workspace: WorkspaceConfig,
+    /// Chrome band ordering per edge (CTX-0890, Issue #1431).
+    pub chrome: ChromeConfig,
     /// Core-owned workspace decoration in logical px (CTX-0292; unified
     /// defaults `6/6/1/6/6` since #1342, spec sync tracked by #1374).
     pub decoration: DecorationConfig,
@@ -3003,6 +3056,7 @@ impl Default for EffectiveConfig {
             close_confirm: DEFAULT_CLOSE_CONFIRM,
             layout: LayoutConfig::default(),
             workspace: WorkspaceConfig::default(),
+            chrome: ChromeConfig::default(),
             decoration: DecorationConfig::default(),
             views: Vec::new(),
             scrollbar: ScrollbarConfig::default(),

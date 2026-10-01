@@ -70,6 +70,18 @@ pub const UI_MAX_BLOCKS: usize = 64;
 /// enforced here per generation as a strict subset).
 pub const UI_MAX_AGGREGATED_TEXT_BYTES: usize = 2 * 1024 * 1024;
 
+/// Maximum click command identifier length (CTX-0890).
+pub const UI_CLICK_MAX_COMMAND_BYTES: usize = 128;
+
+/// Maximum click command arguments count (CTX-0890).
+pub const UI_CLICK_MAX_ARGS: usize = 8;
+
+/// Maximum click command argument value length (CTX-0890).
+pub const UI_CLICK_MAX_ARG_BYTES: usize = 256;
+
+/// Maximum theme token name length (CTX-0890).
+pub const UI_MAX_THEME_TOKEN_BYTES: usize = 32;
+
 /// Marshalling bounds for one raw component value, evaluated before shape
 /// validation. Generous enough for the v1 vocabulary (the scene-node walk
 /// enforces the exact `SCN-1`/`SCN-3` numbers) and tight enough that a
@@ -81,6 +93,28 @@ pub(crate) const UI_MARSHAL_LIMITS: MarshallingLimits = MarshallingLimits {
     max_bytes: UI_MAX_TEXT_BYTES + 64 * 1024,
 };
 
+/// Click command binding for interactive UiNode elements (CTX-0890).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClickCommand {
+    /// Command identifier (max 128 bytes).
+    pub command: String,
+    /// Command arguments (max 8 args, each max 256 bytes; only scalar values).
+    pub args: Vec<(String, ClickArg)>,
+}
+
+/// Click command argument value (CTX-0890).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClickArg {
+    /// String argument.
+    String(String),
+    /// Number argument.
+    Number(f64),
+    /// Boolean argument.
+    Bool(bool),
+}
+
+impl Eq for ClickArg {}
+
 /// One validated v1 declarative node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiNode {
@@ -88,21 +122,53 @@ pub enum UiNode {
     Text {
         /// Bounded text content (`SCN-3`).
         text: String,
+        /// Foreground theme token name (e.g. "accent", "surface.2").
+        fg: Option<String>,
+        /// Background theme token name.
+        bg: Option<String>,
+        /// Bold attribute.
+        bold: Option<bool>,
+        /// Click command binding.
+        on_click: Option<ClickCommand>,
     },
     /// Horizontal composition of children.
     Row {
         /// Child nodes in declared order.
         children: Vec<UiNode>,
+        /// Foreground theme token name (e.g. "accent", "surface.2").
+        fg: Option<String>,
+        /// Background theme token name.
+        bg: Option<String>,
+        /// Bold attribute.
+        bold: Option<bool>,
+        /// Click command binding.
+        on_click: Option<ClickCommand>,
     },
     /// Vertical composition of children.
     Column {
         /// Child nodes in declared order.
         children: Vec<UiNode>,
+        /// Foreground theme token name (e.g. "accent", "surface.2").
+        fg: Option<String>,
+        /// Background theme token name.
+        bg: Option<String>,
+        /// Bold attribute.
+        bold: Option<bool>,
+        /// Click command binding.
+        on_click: Option<ClickCommand>,
     },
     /// List composition of children.
     List {
         /// Child nodes in declared order.
         children: Vec<UiNode>,
+        /// Foreground theme token name (e.g. "accent", "surface.2").
+        fg: Option<String>,
+        /// Background theme token name.
+        bg: Option<String>,
+        /// Bold attribute.
+        bold: Option<bool>,
+        /// Click command binding.
+        on_click: Option<ClickCommand>,
     },
 }
 
@@ -110,25 +176,49 @@ impl UiNode {
     /// A text leaf.
     #[must_use]
     pub fn text(text: impl Into<String>) -> Self {
-        Self::Text { text: text.into() }
+        Self::Text {
+            text: text.into(),
+            fg: None,
+            bg: None,
+            bold: None,
+            on_click: None,
+        }
     }
 
     /// A `Row` node.
     #[must_use]
     pub fn row(children: Vec<UiNode>) -> Self {
-        Self::Row { children }
+        Self::Row {
+            children,
+            fg: None,
+            bg: None,
+            bold: None,
+            on_click: None,
+        }
     }
 
     /// A `Column` node.
     #[must_use]
     pub fn column(children: Vec<UiNode>) -> Self {
-        Self::Column { children }
+        Self::Column {
+            children,
+            fg: None,
+            bg: None,
+            bold: None,
+            on_click: None,
+        }
     }
 
     /// A `List` node.
     #[must_use]
     pub fn list(children: Vec<UiNode>) -> Self {
-        Self::List { children }
+        Self::List {
+            children,
+            fg: None,
+            bg: None,
+            bold: None,
+            on_click: None,
+        }
     }
 
     /// v1 kind name.
@@ -147,7 +237,9 @@ impl UiNode {
     pub fn count_nodes(&self) -> usize {
         match self {
             Self::Text { .. } => 1,
-            Self::Row { children } | Self::Column { children } | Self::List { children } => {
+            Self::Row { children, .. }
+            | Self::Column { children, .. }
+            | Self::List { children, .. } => {
                 1 + children.iter().map(Self::count_nodes).sum::<usize>()
             }
         }
@@ -158,7 +250,9 @@ impl UiNode {
     pub fn depth(&self) -> usize {
         match self {
             Self::Text { .. } => 1,
-            Self::Row { children } | Self::Column { children } | Self::List { children } => {
+            Self::Row { children, .. }
+            | Self::Column { children, .. }
+            | Self::List { children, .. } => {
                 if children.is_empty() {
                     1
                 } else {
@@ -172,10 +266,10 @@ impl UiNode {
     #[must_use]
     pub fn text_bytes(&self) -> usize {
         match self {
-            Self::Text { text } => text.len(),
-            Self::Row { children } | Self::Column { children } | Self::List { children } => {
-                children.iter().map(Self::text_bytes).sum()
-            }
+            Self::Text { text, .. } => text.len(),
+            Self::Row { children, .. }
+            | Self::Column { children, .. }
+            | Self::List { children, .. } => children.iter().map(Self::text_bytes).sum(),
         }
     }
 
@@ -222,9 +316,22 @@ impl UiNode {
                 "node kind '{kind}' is excluded from Plugin API v1"
             )));
         }
+
+        // Parse style attributes (CTX-0890).
+        let fg = extract_theme_token(value, "fg")?;
+        let bg = extract_theme_token(value, "bg")?;
+        let bold = extract_bool_opt(value, "bold")?;
+        let on_click = extract_click_command(value)?;
+
         match kind {
             "Text" => match value.get("text") {
-                Some(LuaValue::String(text)) => Ok(Self::Text { text: text.clone() }),
+                Some(LuaValue::String(text)) => Ok(Self::Text {
+                    text: text.clone(),
+                    fg,
+                    bg,
+                    bold,
+                    on_click,
+                }),
                 _ => Err(component_invalid(
                     "Text components require a string text field",
                 )),
@@ -237,9 +344,27 @@ impl UiNode {
                 };
                 let nodes = Self::children_array(children, depth)?;
                 Ok(match kind {
-                    "Row" => Self::Row { children: nodes },
-                    "Column" => Self::Column { children: nodes },
-                    _ => Self::List { children: nodes },
+                    "Row" => Self::Row {
+                        children: nodes,
+                        fg,
+                        bg,
+                        bold,
+                        on_click,
+                    },
+                    "Column" => Self::Column {
+                        children: nodes,
+                        fg,
+                        bg,
+                        bold,
+                        on_click,
+                    },
+                    _ => Self::List {
+                        children: nodes,
+                        fg,
+                        bg,
+                        bold,
+                        on_click,
+                    },
                 })
             }
             _ => Err(component_invalid(format!("unknown node kind '{kind}'"))),
@@ -284,6 +409,120 @@ impl UiNode {
 #[must_use]
 pub fn is_ui_slot(slot: &str) -> bool {
     UI_SLOTS.contains(&slot)
+}
+
+/// Validates a theme token name (CTX-0890).
+///
+/// Valid tokens start with a lowercase letter and contain only `[a-z0-9._-]`,
+/// max 32 bytes.
+#[must_use]
+pub fn is_valid_theme_token(token: &str) -> bool {
+    if token.is_empty() || token.len() > UI_MAX_THEME_TOKEN_BYTES {
+        return false;
+    }
+    let mut chars = token.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_lowercase() {
+        return false;
+    }
+    chars.all(|ch| {
+        ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '.' || ch == '_' || ch == '-'
+    })
+}
+
+/// Extract optional theme token from a Lua table (CTX-0890).
+fn extract_theme_token(value: &LuaValue, key: &str) -> Result<Option<String>, BridgeError> {
+    match value.get(key) {
+        Some(LuaValue::String(token)) => {
+            if !is_valid_theme_token(token) {
+                return Err(component_invalid(format!(
+                    "invalid theme token '{token}': must start with lowercase letter and contain only [a-z0-9._-], max {} bytes",
+                    UI_MAX_THEME_TOKEN_BYTES
+                )));
+            }
+            Ok(Some(token.clone()))
+        }
+        Some(_) => Err(component_invalid(format!("{key} must be a string"))),
+        None => Ok(None),
+    }
+}
+
+/// Extract optional boolean from a Lua table (CTX-0890).
+fn extract_bool_opt(value: &LuaValue, key: &str) -> Result<Option<bool>, BridgeError> {
+    match value.get(key) {
+        Some(LuaValue::Bool(b)) => Ok(Some(*b)),
+        Some(_) => Err(component_invalid(format!("{key} must be a boolean"))),
+        None => Ok(None),
+    }
+}
+
+/// Extract optional click command from a Lua table (CTX-0890).
+fn extract_click_command(value: &LuaValue) -> Result<Option<ClickCommand>, BridgeError> {
+    let Some(on_click) = value.get("on_click") else {
+        return Ok(None);
+    };
+    let LuaValue::Table(_) = on_click else {
+        return Err(component_invalid("on_click must be a table"));
+    };
+
+    let command = match on_click.get("command") {
+        Some(LuaValue::String(cmd)) => {
+            if cmd.is_empty() || cmd.len() > UI_CLICK_MAX_COMMAND_BYTES {
+                return Err(component_invalid(format!(
+                    "on_click.command must be 1-{} bytes",
+                    UI_CLICK_MAX_COMMAND_BYTES
+                )));
+            }
+            cmd.clone()
+        }
+        Some(_) => return Err(component_invalid("on_click.command must be a string")),
+        None => return Err(component_invalid("on_click.command is required")),
+    };
+
+    let args = match on_click.get("args") {
+        Some(LuaValue::Table(pairs)) => {
+            if pairs.len() > UI_CLICK_MAX_ARGS {
+                return Err(component_invalid(format!(
+                    "on_click.args must have at most {} entries",
+                    UI_CLICK_MAX_ARGS
+                )));
+            }
+            let mut result = Vec::with_capacity(pairs.len());
+            for (key, val) in pairs {
+                let key_str = match key {
+                    LuaValue::String(s) => s.clone(),
+                    _ => return Err(component_invalid("on_click.args keys must be strings")),
+                };
+                let arg = match val {
+                    LuaValue::String(s) => {
+                        if s.len() > UI_CLICK_MAX_ARG_BYTES {
+                            return Err(component_invalid(format!(
+                                "on_click.args string values must be at most {} bytes",
+                                UI_CLICK_MAX_ARG_BYTES
+                            )));
+                        }
+                        ClickArg::String(s.clone())
+                    }
+                    LuaValue::Integer(i) => ClickArg::Number(*i as f64),
+                    LuaValue::Number(n) => ClickArg::Number(*n),
+                    LuaValue::Bool(b) => ClickArg::Bool(*b),
+                    _ => {
+                        return Err(component_invalid(
+                            "on_click.args values must be string, number, or boolean",
+                        ));
+                    }
+                };
+                result.push((key_str, arg));
+            }
+            result
+        }
+        Some(_) => return Err(component_invalid("on_click.args must be a table")),
+        None => Vec::new(),
+    };
+
+    Ok(Some(ClickCommand { command, args }))
 }
 
 /// Typed `E_UI_COMPONENT_INVALID` diagnostic (accepted ui.mount/update code).
@@ -425,6 +664,167 @@ mod tests {
         assert_eq!(
             UiNode::from_lua_value(&value)
                 .expect_err("mixed children keys")
+                .code,
+            "E_UI_COMPONENT_INVALID"
+        );
+    }
+
+    #[test]
+    fn theme_token_validation() {
+        // Valid tokens
+        assert!(is_valid_theme_token("accent"));
+        assert!(is_valid_theme_token("surface.2"));
+        assert!(is_valid_theme_token("bg-primary"));
+        assert!(is_valid_theme_token("text_muted"));
+        assert!(is_valid_theme_token("a1.b2-c3_d4"));
+
+        // Invalid tokens
+        assert!(!is_valid_theme_token("")); // empty
+        assert!(!is_valid_theme_token("Accent")); // uppercase start
+        assert!(!is_valid_theme_token("1accent")); // digit start
+        assert!(!is_valid_theme_token("_accent")); // underscore start
+        assert!(!is_valid_theme_token("accent!")); // invalid char
+        assert!(!is_valid_theme_token(
+            &"a".repeat(UI_MAX_THEME_TOKEN_BYTES + 1)
+        )); // too long
+    }
+
+    #[test]
+    fn style_attributes_parsed() {
+        let value = LuaValue::table([
+            ("kind", LuaValue::String("Text".to_string())),
+            ("text", LuaValue::String("styled".to_string())),
+            ("fg", LuaValue::String("accent".to_string())),
+            ("bg", LuaValue::String("surface.1".to_string())),
+            ("bold", LuaValue::Bool(true)),
+        ]);
+        let node = UiNode::from_lua_value(&value).expect("valid styled text");
+        match node {
+            UiNode::Text { fg, bg, bold, .. } => {
+                assert_eq!(fg, Some("accent".to_string()));
+                assert_eq!(bg, Some("surface.1".to_string()));
+                assert_eq!(bold, Some(true));
+            }
+            _ => panic!("expected Text node"),
+        }
+    }
+
+    #[test]
+    fn invalid_theme_token_rejected() {
+        let value = LuaValue::table([
+            ("kind", LuaValue::String("Text".to_string())),
+            ("text", LuaValue::String("text".to_string())),
+            ("fg", LuaValue::String("Invalid!Token".to_string())),
+        ]);
+        let error = UiNode::from_lua_value(&value).expect_err("invalid token");
+        assert_eq!(error.code, "E_UI_COMPONENT_INVALID");
+        assert!(error.message.contains("invalid theme token"));
+    }
+
+    #[test]
+    fn click_command_parsed() {
+        let value = LuaValue::table([
+            ("kind", LuaValue::String("Text".to_string())),
+            ("text", LuaValue::String("click me".to_string())),
+            (
+                "on_click",
+                LuaValue::table([
+                    ("command", LuaValue::String("workspace.switch".to_string())),
+                    (
+                        "args",
+                        LuaValue::table([
+                            ("id", LuaValue::String("dev".to_string())),
+                            ("focus", LuaValue::Bool(true)),
+                            ("index", LuaValue::Integer(2)),
+                        ]),
+                    ),
+                ]),
+            ),
+        ]);
+        let node = UiNode::from_lua_value(&value).expect("valid click command");
+        match node {
+            UiNode::Text { on_click, .. } => {
+                let cmd = on_click.expect("on_click present");
+                assert_eq!(cmd.command, "workspace.switch");
+                assert_eq!(cmd.args.len(), 3);
+                assert!(
+                    cmd.args
+                        .iter()
+                        .any(|(k, v)| k == "id" && matches!(v, ClickArg::String(s) if s == "dev"))
+                );
+                assert!(
+                    cmd.args
+                        .iter()
+                        .any(|(k, v)| k == "focus" && matches!(v, ClickArg::Bool(true)))
+                );
+                assert!(cmd.args.iter().any(|(k, v)| k == "index"
+                    && matches!(v, ClickArg::Number(n) if (*n - 2.0).abs() < 0.01)));
+            }
+            _ => panic!("expected Text node"),
+        }
+    }
+
+    #[test]
+    fn click_command_validation() {
+        // Command too long
+        let long_cmd = "a".repeat(UI_CLICK_MAX_COMMAND_BYTES + 1);
+        let value = LuaValue::table([
+            ("kind", LuaValue::String("Text".to_string())),
+            ("text", LuaValue::String("text".to_string())),
+            (
+                "on_click",
+                LuaValue::table([("command", LuaValue::String(long_cmd))]),
+            ),
+        ]);
+        assert_eq!(
+            UiNode::from_lua_value(&value)
+                .expect_err("command too long")
+                .code,
+            "E_UI_COMPONENT_INVALID"
+        );
+
+        // Too many args
+        let mut args_vec = Vec::new();
+        for i in 0..=UI_CLICK_MAX_ARGS {
+            args_vec.push((format!("arg{i}"), LuaValue::String("val".to_string())));
+        }
+        let value = LuaValue::table([
+            ("kind", LuaValue::String("Text".to_string())),
+            ("text", LuaValue::String("text".to_string())),
+            (
+                "on_click",
+                LuaValue::table([
+                    ("command", LuaValue::String("cmd".to_string())),
+                    ("args", LuaValue::Table(args_vec)),
+                ]),
+            ),
+        ]);
+        assert_eq!(
+            UiNode::from_lua_value(&value)
+                .expect_err("too many args")
+                .code,
+            "E_UI_COMPONENT_INVALID"
+        );
+
+        // Arg value too long
+        let long_val = "a".repeat(UI_CLICK_MAX_ARG_BYTES + 1);
+        let value = LuaValue::table([
+            ("kind", LuaValue::String("Text".to_string())),
+            ("text", LuaValue::String("text".to_string())),
+            (
+                "on_click",
+                LuaValue::table([
+                    ("command", LuaValue::String("cmd".to_string())),
+                    (
+                        "args",
+                        LuaValue::table([("key", LuaValue::String(long_val))]),
+                    ),
+                ]),
+            ),
+        ]);
+        assert_eq!(
+            UiNode::from_lua_value(&value)
+                .expect_err("arg too long")
                 .code,
             "E_UI_COMPONENT_INVALID"
         );

@@ -737,46 +737,103 @@ pub trait HostServices {
         Err(BridgeError::not_implemented("bitty.services.get"))
     }
 
-    /// Inspect runtime state for `bitty.debug.inspect` (CTX-0894).
+    /// Inspect runtime state for `bitty.debug.inspect` (CTX-0894, CTX-0897).
     ///
-    /// Returns a table with debug information about the specified target:
-    /// - `"plugins"` → list of loaded plugin states
-    /// - `"events"` → event bus subscription state
-    /// - `"commands"` → registered command catalog
-    /// - `"panels"` → panel lifecycle state
-    /// - `"grants"` → capability grant state for calling plugin
+    /// Grant-gated (`debug.inspect`, checked first: `E_CAPABILITY_DENIED`)
+    /// and read-only. Every target returns
+    /// `{ target = <name>, items = <array>, truncated = <bool> }`, where
+    /// `items` is capped at the host's inspect item ceiling and `truncated`
+    /// reports whether rows were cut. Targets:
+    /// - `"plugins"` → `{ id, version, state, generation }` sorted by id;
+    ///   `state` is a stable lowercase label (`unloaded`, `loading`,
+    ///   `activating`, `active`, `suspended`, `disposing`, `disposed`,
+    ///   `failed`) and never carries a failure message
+    /// - `"commands"` → `{ plugin, id, title }` sorted by plugin, id
+    /// - `"events"` → `{ plugin, kind }` sorted by plugin, kind
+    /// - `"grants"` → the calling plugin's own granted capability ids
+    ///   (sorted strings); other plugins' grants are never exposed
+    /// - `"panels"` → reserved; fails closed with `E_NOT_IMPLEMENTED`
     ///
-    /// The default implementation always returns `E_NOT_IMPLEMENTED`. Overriding
-    /// implementations must enforce the `debug.inspect` capability grant.
-    /// Grant-gated and read-only: never mutates state, returns bounded snapshot data.
+    /// Any other target is `E_DEF_INVALID`. Results never include settings
+    /// values, store contents, secrets, or terminal content.
+    ///
+    /// The default implementation always returns `E_NOT_IMPLEMENTED`.
     fn debug_inspect(&self, target: &str) -> Result<LuaValue, BridgeError> {
         let _ = target;
         Err(BridgeError::not_implemented("bitty.debug.inspect"))
     }
 
-    /// Enable/disable event tracing for `bitty.debug.trace` (CTX-0894).
+    /// Open or close an event trace for `bitty.debug.trace` (CTX-0894,
+    /// CTX-0897).
     ///
-    /// Controls runtime event tracing with options:
-    /// - `enabled` (bool) → turn tracing on/off
-    /// - `filter` (string, optional) → event topic pattern (e.g., "bitty.plugin:*")
-    /// - `max_events` (integer, optional) → ring buffer size (default 1000, max 10000)
+    /// Grant-gated (`debug.trace`, checked first: `E_CAPABILITY_DENIED`).
+    /// `opts` is `nil` (open with defaults) or a table; the bridge rejects any
+    /// other type with `E_DEF_INVALID` before calling the host. Table keys:
+    /// - `enabled` (bool, default `true`) → `true` opens a new trace,
+    ///   `false` closes the trace named by `handle`
+    /// - `filter` (string, optional) → exact topic, or a prefix when the
+    ///   pattern ends with a single `*` (e.g. `"terminal.*"`); 1..=128
+    ///   printable ASCII bytes
+    /// - `max_events` (integer, optional) → ring-buffer size, drop-oldest
+    ///   (default 1000, range 1..=10000)
+    /// - `handle` (integer) → required with `enabled = false`, rejected
+    ///   otherwise
     ///
-    /// Returns a handle (integer) for retrieving trace events via
-    /// `debug_trace_get`. The default implementation always returns
-    /// `E_NOT_IMPLEMENTED`. Overriding implementations must enforce the
-    /// `debug.trace` capability grant.
+    /// Unknown keys, wrong types, and out-of-range values are
+    /// `E_DEF_INVALID`; opening beyond the per-plugin trace limit is
+    /// `E_DEF_LIMIT`.
+    ///
+    /// Least privilege: a trace records only event kinds the calling plugin
+    /// declares in its manifest `lazy.events` (the same precondition
+    /// `bitty.events.subscribe` enforces), intersected with `filter`. A
+    /// filter that matches no declared kind, or a plugin that declares no
+    /// events, is accepted without error; the trace simply never records. Opening returns a fresh positive handle (monotonic,
+    /// never reused); closing returns the closed handle, and closing an
+    /// unknown or another plugin's handle is `E_DEF_INVALID` (the two cases
+    /// are indistinguishable). Traces are dropped when the owning plugin is
+    /// disposed, reloaded, or fails.
+    ///
+    /// The default implementation always returns `E_NOT_IMPLEMENTED`.
     fn debug_trace(&self, opts: &LuaValue) -> Result<i64, BridgeError> {
         let _ = opts;
         Err(BridgeError::not_implemented("bitty.debug.trace"))
     }
 
-    /// Retrieve traced events for `bitty.debug.trace` (CTX-0894).
+    /// Expiry-aware [`HostServices::debug_trace`] for the pre-commit timeout
+    /// path (CTX-0897).
     ///
-    /// Returns an array of event records from the trace buffer identified by
-    /// `handle`. Each record contains:
-    /// - `topic` (string) → event topic
-    /// - `timestamp` (integer) → milliseconds since trace start
-    /// - `payload` (table) → bounded event payload
+    /// Opening or closing a trace mutates host state, so the bridge routes
+    /// `bitty.debug.trace` through its mutation guard and passes the call
+    /// expiry. Same contract as [`HostServices::store_set_with_expiry`]:
+    /// check expiry before committing and fail closed with
+    /// [`BridgeError::timeout`] without opening or closing anything. The
+    /// default checks expiry before delegating (fail-fast).
+    fn debug_trace_with_expiry(
+        &self,
+        opts: &LuaValue,
+        expiry: Instant,
+    ) -> Result<i64, BridgeError> {
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        self.debug_trace(opts)
+    }
+
+    /// Drain buffered records for `bitty.debug.trace_get` (CTX-0894,
+    /// CTX-0897).
+    ///
+    /// Grant-gated (`debug.trace`, checked first: `E_CAPABILITY_DENIED`).
+    /// Returns `{ records = <array>, dropped = <n> }` and empties the buffer;
+    /// `dropped` counts records lost to drop-oldest since the previous drain
+    /// and resets after being reported. Each record is
+    /// `{ topic, sequence, timestamp, payload }`: `topic` is the event kind,
+    /// `sequence` the runtime event sequence, `timestamp` integer
+    /// milliseconds on a monotonic host clock (no wall clock), and `payload`
+    /// the event payload, replaced by `{ truncated = true, bytes = <n> }`
+    /// when its encoded size exceeds the host payload ceiling.
+    ///
+    /// An unknown handle and a handle owned by another plugin both return
+    /// `nil`, so a plugin cannot probe other plugins' traces.
     ///
     /// The default implementation fails closed with `E_NOT_IMPLEMENTED`.
     fn debug_trace_get(&self, handle: i64) -> Result<LuaValue, BridgeError> {
@@ -798,6 +855,25 @@ pub trait HostServices {
     fn debug_control(&self, action: &str, target: &str) -> Result<LuaValue, BridgeError> {
         let _ = (action, target);
         Err(BridgeError::not_implemented("bitty.debug.control"))
+    }
+
+    /// Expiry-aware [`HostServices::debug_control`] for the pre-commit
+    /// timeout path (CTX-0897).
+    ///
+    /// Controls mutate runtime state, so the bridge routes
+    /// `bitty.debug.control` through its mutation guard. Same contract as
+    /// [`HostServices::store_set_with_expiry`]: check expiry before
+    /// committing; the default checks before delegating (fail-fast).
+    fn debug_control_with_expiry(
+        &self,
+        action: &str,
+        target: &str,
+        expiry: Instant,
+    ) -> Result<LuaValue, BridgeError> {
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        self.debug_control(action, target)
     }
 }
 
@@ -2230,11 +2306,14 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
     )
     .expect("env table accepts 'has'");
 
-    // CTX-0894: `bitty.debug.*` namespace for devtools plugin support.
-    // Default implementations always return E_NOT_IMPLEMENTED. Overriding
-    // implementations must enforce the grants: `debug.inspect` (read-only state
-    // inspection), `debug.trace` (event tracing), `debug.control` (high-risk
-    // reload/suspend, requires explicit consent).
+    // CTX-0894/CTX-0897: `bitty.debug.*` namespace for devtools plugins.
+    // Default host implementations return E_NOT_IMPLEMENTED; the runtime
+    // gates each entry point on its own grant: `debug.inspect` (read-only
+    // state inspection), `debug.trace` (`trace`/`trace_get`), `debug.control`
+    // (high-risk reload/suspend, requires explicit consent). `inspect` is a
+    // read (`bounded`); `trace` and `control` mutate host state and go
+    // through `bounded_mutation` with the pre-commit expiry; `trace_get`
+    // drains its buffer, so it also uses `bounded_mutation`.
     let debug = Table::new(&ctx);
     debug
         .set(
@@ -2270,10 +2349,23 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
             Callback::from_fn(&ctx, {
                 let state = state.clone();
                 move |ctx, _exec, mut stack| {
-                    let opts = LuaValue::from_lua(stack.get(0), state.limits)
-                        .map_err(|e| e.to_error(ctx))?;
+                    // `nil` opens a trace with defaults; any non-table value
+                    // is rejected before reaching the host.
+                    let raw = stack.get(0);
+                    if !matches!(raw, Value::Nil | Value::Table(_)) {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            "debug.trace opts must be a table or nil",
+                        )
+                        .to_error(ctx));
+                    }
+                    let opts =
+                        LuaValue::from_lua(raw, state.limits).map_err(|e| e.to_error(ctx))?;
                     let handle = state
-                        .bounded(|_expiry| state.services.debug_trace(&opts))
+                        .bounded_mutation(|expiry| {
+                            state.services.debug_trace_with_expiry(&opts, expiry)
+                        })
                         .map_err(|e| e.to_error(ctx))?;
                     stack.replace(ctx, Value::Integer(handle));
                     Ok(CallbackReturn::Return)
@@ -2299,8 +2391,11 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                             .to_error(ctx));
                         }
                     };
+                    // Draining empties the buffer, so a post-call timeout
+                    // would silently discard records: use the mutation guard
+                    // (pre-call deadline only), like the other commits.
                     let result = state
-                        .bounded(|_expiry| state.services.debug_trace_get(handle))
+                        .bounded_mutation(|_expiry| state.services.debug_trace_get(handle))
                         .map_err(|e| e.to_error(ctx))?;
                     stack.replace(ctx, result.to_lua(ctx));
                     Ok(CallbackReturn::Return)
@@ -2338,7 +2433,11 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                         }
                     };
                     let result = state
-                        .bounded(|_expiry| state.services.debug_control(&action, &target))
+                        .bounded_mutation(|expiry| {
+                            state
+                                .services
+                                .debug_control_with_expiry(&action, &target, expiry)
+                        })
                         .map_err(|e| e.to_error(ctx))?;
                     stack.replace(ctx, result.to_lua(ctx));
                     Ok(CallbackReturn::Return)

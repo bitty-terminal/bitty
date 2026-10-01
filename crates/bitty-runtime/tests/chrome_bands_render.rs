@@ -16,7 +16,7 @@ fn empty_chrome_bands_renders_no_bands() {
     let mut rt = minimal_runtime();
     let bands = ChromeBands::default();
     rt.set_chrome_bands(bands);
-    
+
     // Tick should succeed without bands
     let stats = rt.tick().expect("tick must present");
     assert!(stats.fills > 0);
@@ -25,7 +25,7 @@ fn empty_chrome_bands_renders_no_bands() {
 #[test]
 fn single_top_band_with_text_node() {
     let mut rt = minimal_runtime();
-    
+
     // Create a simple Text node
     let text_node = UiNode::Text {
         text: "Status: Ready".to_string(),
@@ -34,22 +34,22 @@ fn single_top_band_with_text_node() {
         bold: Some(false),
         on_click: None,
     };
-    
+
     let band = BandContent {
         plugin_id: "test-plugin".to_string(),
         slot: "top".to_string(),
         root: text_node,
         version: 1,
     };
-    
+
     let bands = ChromeBands {
         top: vec![band],
         ..Default::default()
     };
-    
+
     rt.set_chrome_bands(bands);
     let stats = rt.tick().expect("tick must present");
-    
+
     // Band should render - frame advances
     assert!(stats.fills > 0);
 }
@@ -57,7 +57,7 @@ fn single_top_band_with_text_node() {
 #[test]
 fn multiple_top_bands_stack_vertically() {
     let mut rt = minimal_runtime();
-    
+
     let band1 = BandContent {
         plugin_id: "plugin-1".to_string(),
         slot: "top".to_string(),
@@ -70,7 +70,7 @@ fn multiple_top_bands_stack_vertically() {
         },
         version: 1,
     };
-    
+
     let band2 = BandContent {
         plugin_id: "plugin-2".to_string(),
         slot: "top".to_string(),
@@ -83,22 +83,22 @@ fn multiple_top_bands_stack_vertically() {
         },
         version: 1,
     };
-    
+
     let bands = ChromeBands {
         top: vec![band1, band2],
         ..Default::default()
     };
-    
+
     rt.set_chrome_bands(bands);
     let stats = rt.tick().expect("tick must present");
-    
+
     assert!(stats.fills > 0);
 }
 
 #[test]
 fn bottom_band_renders_at_window_bottom() {
     let mut rt = minimal_runtime();
-    
+
     let band = BandContent {
         plugin_id: "statusline".to_string(),
         slot: "bottom".to_string(),
@@ -111,22 +111,22 @@ fn bottom_band_renders_at_window_bottom() {
         },
         version: 1,
     };
-    
+
     let bands = ChromeBands {
         bottom: vec![band],
         ..Default::default()
     };
-    
+
     rt.set_chrome_bands(bands);
     let stats = rt.tick().expect("tick must present");
-    
+
     assert!(stats.fills > 0);
 }
 
 #[test]
 fn row_node_concatenates_children() {
     let mut rt = minimal_runtime();
-    
+
     let row_node = UiNode::Row {
         children: vec![
             UiNode::Text {
@@ -149,29 +149,29 @@ fn row_node_concatenates_children() {
         bold: None,
         on_click: None,
     };
-    
+
     let band = BandContent {
         plugin_id: "test".to_string(),
         slot: "top".to_string(),
         root: row_node,
         version: 1,
     };
-    
+
     let bands = ChromeBands {
         top: vec![band],
         ..Default::default()
     };
-    
+
     rt.set_chrome_bands(bands);
     let stats = rt.tick().expect("tick must present");
-    
+
     assert!(stats.fills > 0);
 }
 
 #[test]
 fn list_node_children_concatenate() {
     let mut rt = minimal_runtime();
-    
+
     let list_node = UiNode::List {
         children: vec![
             UiNode::Text {
@@ -194,29 +194,29 @@ fn list_node_children_concatenate() {
         bold: None,
         on_click: None,
     };
-    
+
     let band = BandContent {
         plugin_id: "test".to_string(),
         slot: "bottom".to_string(),
         root: list_node,
         version: 1,
     };
-    
+
     let bands = ChromeBands {
         bottom: vec![band],
         ..Default::default()
     };
-    
+
     rt.set_chrome_bands(bands);
     let stats = rt.tick().expect("tick must present");
-    
+
     assert!(stats.fills > 0);
 }
 
 #[test]
 fn band_version_increments_on_remount() {
     let mut rt = minimal_runtime();
-    
+
     let band_v1 = BandContent {
         plugin_id: "test".to_string(),
         slot: "top".to_string(),
@@ -229,19 +229,19 @@ fn band_version_increments_on_remount() {
         },
         version: 1,
     };
-    
+
     let bands_v1 = ChromeBands {
         top: vec![band_v1],
         ..Default::default()
     };
-    
+
     rt.set_chrome_bands(bands_v1);
     let stats_v1 = rt.tick().expect("tick must present");
     assert!(stats_v1.fills > 0);
-    
+
     // Feed PTY data to trigger state change
     rt.handle_pty_bytes(b"x");
-    
+
     // Remount with incremented version
     let band_v2 = BandContent {
         plugin_id: "test".to_string(),
@@ -255,12 +255,12 @@ fn band_version_increments_on_remount() {
         },
         version: 2,
     };
-    
+
     let bands_v2 = ChromeBands {
         top: vec![band_v2],
         ..Default::default()
     };
-    
+
     rt.set_chrome_bands(bands_v2);
     if let Some(stats_v2) = rt.tick() {
         assert!(stats_v2.fills > 0);
@@ -270,14 +270,14 @@ fn band_version_increments_on_remount() {
 #[test]
 fn no_mount_produces_empty_bands() {
     let mut rt = minimal_runtime();
-    
+
     // First tick presents initial state
     let stats = rt.tick().expect("tick must present");
     assert!(stats.fills > 0);
-    
+
     // Feed PTY data to trigger state change
     rt.handle_pty_bytes(b"test");
-    
+
     // Now add a band
     let band = BandContent {
         plugin_id: "test".to_string(),
@@ -291,12 +291,12 @@ fn no_mount_produces_empty_bands() {
         },
         version: 1,
     };
-    
+
     let bands = ChromeBands {
         top: vec![band],
         ..Default::default()
     };
-    
+
     rt.set_chrome_bands(bands);
     if let Some(stats) = rt.tick() {
         assert!(stats.fills > 0);

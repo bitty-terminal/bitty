@@ -254,8 +254,10 @@ impl WindowHandle {
     /// This only declares the surface blendable; the pixels themselves must
     /// carry the alpha. Renderer alpha scaling (CTX-0290) is configured on
     /// the GPU surface at attach (`Surface::configure_with_opacity`); the
-    /// `Live` reload wiring that would re-apply both halves at runtime is not
-    /// implemented yet, so this method currently has no production caller.
+    /// `Live` reload path (CTX-0898) re-applies both halves at runtime: the
+    /// renderer through `Runtime::set_window_opacity` and this hint from the
+    /// app. winit can only set the hint at creation on X11, so there a window
+    /// that started opaque keeps its opaque hint until restart.
     ///
     /// Returns whether transparency was requested (for logging/diagnostics).
     pub fn set_opacity(&self, opacity: f32) -> bool {

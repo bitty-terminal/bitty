@@ -77,6 +77,10 @@ impl OsTitleSink for WindowHandle {
 pub(crate) struct WindowState {
     /// Window title carrying the resolved theme preset + source layer.
     pub(crate) title: String,
+    /// Source-layer label baked into [`Self::title`] at launch
+    /// (`cli`/`file`/`profile`/`default`), kept so a live theme reload can
+    /// rebuild the title with the new preset name (CTX-0898).
+    pub(crate) theme_source: String,
     /// Window opacity from the effective config (CTX-0223
     /// `window.opacity`; default `1.0` = opaque). Applied to the platform
     /// [`WindowConfig`](bitty_platform::WindowConfig) at creation and to the
@@ -113,9 +117,10 @@ pub(crate) struct WindowState {
 }
 
 impl WindowState {
-    fn new(title: String) -> Self {
+    fn new(theme_name: &str, source: &str) -> Self {
         Self {
-            title,
+            title: window_title_for_theme(theme_name, source),
+            theme_source: source.to_string(),
             opacity: 1.0,
             blur_radius: 0,
             handle: None,
@@ -343,7 +348,7 @@ impl TerminalApp {
         let event_tracker = EventTracker::from_runtime(&runtime);
         Self {
             runtime,
-            window: WindowState::new(window_title_for_theme(theme_name, source)),
+            window: WindowState::new(theme_name, source),
             pty_rx: None,
             _pty_thread: None,
             presented_frames: 0,
@@ -376,7 +381,7 @@ impl TerminalApp {
         let event_tracker = EventTracker::from_runtime(&runtime);
         Self {
             runtime,
-            window: WindowState::new(window_title_for_theme(theme_name, source)),
+            window: WindowState::new(theme_name, source),
             pty_rx: Some(pty_rx),
             _pty_thread: Some(handle),
             presented_frames: 0,
@@ -516,6 +521,69 @@ impl TerminalApp {
     pub(crate) fn with_hints_enabled(mut self, enabled: bool) -> Self {
         self.chrome = self.chrome.with_hints_enabled(enabled);
         self
+    }
+
+    /// Adopts the app-owned half of an accepted live reload (CTX-0898, #1522).
+    ///
+    /// Swaps the resolved keymap table (`keymaps` + `mod_key`), the Leader
+    /// binding (`leader_key` + `leader_timeout_ms`), and the hint kill switch
+    /// (`hints_enabled`), and re-applies the platform transparency hint for
+    /// `window.opacity`. A Leader window or hint session armed under the old
+    /// binding is cancelled when the binding changes or hints are disabled,
+    /// so no stale chord or armed window outlives the reload. Held-key
+    /// ownership is kept: a press consumed under the old table still owns its
+    /// release (CTX-0229).
+    pub(crate) fn adopt_live_config(&mut self, adoption: crate::config_reload::AppAdoption) {
+        let leader_changed = self.chrome.leader != adoption.leader;
+        let keymaps_changed = self.chrome.keymaps != adoption.keymaps;
+        let hints_disabled = self.chrome.hints_enabled && !adoption.hints_enabled;
+        self.chrome.keymaps = adoption.keymaps;
+        self.chrome.leader = adoption.leader;
+        self.chrome.hints_enabled = adoption.hints_enabled;
+        // An armed Leader window or hint session was opened under the old
+        // binding/table; its follow-up chord could now mean something else,
+        // so cancel it (fail-open: keys route normally again).
+        if leader_changed || keymaps_changed || hints_disabled {
+            self.chrome.leader_state = bitty_config::LeaderState::Idle;
+            self.runtime.cw_hint_disarm();
+        }
+        if (bitty_platform::sanitize_opacity(adoption.window_opacity)
+            - bitty_platform::sanitize_opacity(self.window.opacity))
+        .abs()
+            >= f32::EPSILON
+        {
+            self.window.opacity = adoption.window_opacity;
+            if let Some(handle) = self.window.handle.as_ref() {
+                let _ = handle.set_opacity(adoption.window_opacity);
+                handle.request_redraw();
+            }
+        }
+        self.refresh_theme_title(adoption.theme_name);
+    }
+
+    /// Rebuilds the base window title for a live theme change (CTX-0898).
+    ///
+    /// The base title is the fallback shown while no terminal-reported
+    /// (OSC 0/2) title is active; once an application has set its own title
+    /// that title stays on the OS window and only the fallback updates.
+    fn refresh_theme_title(&mut self, theme_name: &str) {
+        let title = window_title_for_theme(theme_name, &self.window.theme_source);
+        if title == self.window.title {
+            return;
+        }
+        let previous = std::mem::replace(&mut self.window.title, title);
+        let showing_base = match self.window.last_applied_title.as_deref() {
+            None => true,
+            Some(applied) => applied == previous,
+        };
+        if showing_base {
+            if self.window.last_applied_title.is_some() {
+                self.window.last_applied_title = Some(self.window.title.clone());
+            }
+            if let Some(sink) = self.window.os_title_sink.as_ref() {
+                sink.set_os_title(&self.window.title);
+            }
+        }
     }
 
     /// True when per-frame `bitty tick` stderr lines are emitted.
@@ -672,6 +740,12 @@ impl TerminalApp {
         // presentation values. The watcher is a per-tick poll; without an
         // installed context this is a no-op.
         let _ = crate::config_reload::poll_file(&mut self.runtime);
+        // CTX-0898 (#1522): either reload path (ctl verb drained above or the
+        // file poll) may have accepted chrome-owned fields; adopt them here
+        // on the same tick so keys typed after this frame use the new table.
+        if let Some(adoption) = crate::config_reload::take_app_adoption() {
+            self.adopt_live_config(adoption);
+        }
         // CTX-0889: apply plugin workspace mutations queued since the last
         // tick before it commits, so the presented frame reflects them.
         self.apply_plugin_workspace_requests();

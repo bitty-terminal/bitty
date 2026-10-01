@@ -492,3 +492,93 @@ fn ungranted_plugin_is_denied_every_debug_read() {
     assert_eq!(rt.state(&pid(PLAIN_ID)), Some(&LifecycleState::Active));
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Paste observer: subscribes to `intercept.paste`, remembers the delivered
+/// payload, and traces the same kind. `seen`/`traced` serialize the payload
+/// fields as `action|origin|preview|redacted`.
+const PASTE_OBSERVER: &str = r#"
+local last = nil
+local handle = nil
+
+local function fields(payload)
+  if payload == nil then return "NONE" end
+  return tostring(payload.action) .. "|" .. tostring(payload.origin) .. "|"
+    .. tostring(payload.preview) .. "|" .. tostring(payload.redacted)
+end
+
+bitty.events.subscribe("intercept.paste", function(event)
+  last = event.payload
+end)
+bitty.commands.register({
+  id = "start",
+  title = "Start paste trace",
+  run = function()
+    handle = bitty.debug.trace({ filter = "intercept.*" })
+    return tostring(handle)
+  end,
+})
+bitty.commands.register({
+  id = "seen",
+  title = "Last delivered paste payload",
+  run = function() return fields(last) end,
+})
+bitty.commands.register({
+  id = "traced",
+  title = "Traced paste payloads",
+  run = function()
+    local result = bitty.debug.trace_get(handle)
+    local out = {}
+    for _, record in ipairs(result.records) do out[#out + 1] = fields(record.payload) end
+    return table.concat(out, ";")
+  end,
+})
+"#;
+
+#[test]
+fn paste_payload_is_redacted_per_recipient_grant_in_fanout_and_trace() {
+    let root = temp_dir("paste-redaction");
+    let reader = "xuepoo.paste-reader";
+    let blind = "xuepoo.paste-blind";
+    let commands = ["start", "seen", "traced"];
+    write_plugin(
+        &root,
+        reader,
+        &["debug.trace", "clipboard.read"],
+        &commands,
+        &["intercept.paste"],
+        PASTE_OBSERVER,
+    );
+    write_plugin(
+        &root,
+        blind,
+        &["debug.trace"],
+        &commands,
+        &["intercept.paste"],
+        PASTE_OBSERVER,
+    );
+    let mut rt = runtime(root.clone());
+    rt.discover();
+    for (id, result) in rt.activate_discovered() {
+        result.unwrap_or_else(|error| panic!("activate {id}: {error}"));
+    }
+    assert_eq!(run(&mut rt, reader, "start"), "1");
+    assert_eq!(run(&mut rt, blind, "start"), "2");
+
+    let payload = LuaValue::table([
+        ("action", LuaValue::String("paste".to_string())),
+        ("origin", LuaValue::String("user".to_string())),
+        ("preview", LuaValue::String("hunter2".to_string())),
+    ]);
+    assert_eq!(rt.deliver_event("intercept.paste", &payload), 2);
+
+    let full = "paste|user|hunter2|nil";
+    let redacted = "paste|user|nil|true";
+    // Fan-out: each subscriber sees exactly what its own grants allow.
+    assert_eq!(run(&mut rt, reader, "seen"), full);
+    assert_eq!(run(&mut rt, blind, "seen"), redacted);
+    // Trace: identical to what a subscriber with the same grants received.
+    assert_eq!(run(&mut rt, reader, "traced"), full);
+    assert_eq!(run(&mut rt, blind, "traced"), redacted);
+
+    let _ = std::fs::remove_dir_all(&root);
+}

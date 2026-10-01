@@ -13,8 +13,10 @@
 //!   delivered event once (before fan-out); every live trace whose owner
 //!   declares the event kind in its manifest `lazy.events` (the same
 //!   precondition `bitty.events.subscribe` enforces) and whose filter
-//!   matches receives a copy with a size-bounded payload into a drop-oldest
-//!   ring buffer.
+//!   matches receives a copy into a drop-oldest ring buffer. The copy is
+//!   redacted for the owner's own grants (the same
+//!   [`redaction`](super::redaction) policy the subscriber fan-out applies)
+//!   and then size-bounded.
 //!
 //! Capability gating (`debug.inspect`, `debug.trace`) is enforced by
 //! `PluginServices` before any of these structures are touched.
@@ -25,6 +27,7 @@ use std::time::Instant;
 use bitty_lua::{BridgeError, LuaValue};
 
 use super::LifecycleState;
+use super::redaction::{self, RecipientView};
 use super::store;
 
 /// Default ring-buffer capacity of one trace (`max_events` when omitted).
@@ -436,6 +439,10 @@ struct Trace {
     /// generation (dispose, reload, and failure drop them), so the snapshot
     /// cannot go stale.
     declared: BTreeSet<String>,
+    /// Owner's granted capability ids, snapshotted at open for payload
+    /// redaction. Same staleness argument as `declared`: grants are fixed
+    /// per generation and traces drop with it.
+    granted: BTreeSet<String>,
     filter: TraceFilter,
     max_events: usize,
     records: VecDeque<TraceRecord>,
@@ -530,7 +537,8 @@ impl TraceHub {
     ///
     /// `declared` is the owner's manifest `lazy.events` set: only those
     /// kinds are ever recorded into this trace. A filter that matches none
-    /// of them is accepted and simply never records.
+    /// of them is accepted and simply never records. `granted` is the
+    /// owner's capability snapshot; recorded payloads are redacted for it.
     ///
     /// # Errors
     ///
@@ -540,6 +548,7 @@ impl TraceHub {
         &mut self,
         owner: &str,
         declared: BTreeSet<String>,
+        granted: BTreeSet<String>,
         spec: TraceSpec,
     ) -> Result<i64, BridgeError> {
         if self.trace_count(owner) >= MAX_TRACES_PER_PLUGIN {
@@ -563,6 +572,7 @@ impl TraceHub {
             Trace {
                 owner: owner.to_string(),
                 declared,
+                granted,
                 filter: spec.filter,
                 max_events: spec.max_events,
                 records: VecDeque::new(),
@@ -607,18 +617,19 @@ impl TraceHub {
     /// manifest `lazy.events`, whose filter matches, and whose owner
     /// `is_live`.
     ///
-    /// Note on payload redaction: payloads are copied as delivered, bounded
-    /// only by size. Today no producer sends a payload whose content depends
-    /// on the recipient's grants. Once one does (for example
-    /// `intercept.paste`, whose text must be hidden from holders without
-    /// `clipboard.read`), recording must apply the same per-owner redaction
-    /// the subscriber fan-out applies, before the record is cloned into each
-    /// owner's buffer.
+    /// Redaction rule (CTX-0899): a trace owner never observes more than a
+    /// `bitty.events.subscribe` handler holding the same grants. Each
+    /// owner's copy is passed through [`redaction::recipient_view`] with the
+    /// owner's grant snapshot (taken at [`Self::start`]) before it is
+    /// bounded by [`bound_payload`], so the size marker and the byte charge
+    /// reflect the redacted payload, never the raw one. Unknown kinds are
+    /// withheld (fail closed).
     ///
-    /// O(t log k) checks over open traces (k = declared kinds per owner)
-    /// plus one payload encoding
-    /// (O(payload)) and one clone per matching trace; amortized O(1) ring
-    /// push each. No work beyond the emptiness check when no trace is open.
+    /// O(t log k) checks over open traces (k = declared kinds per owner),
+    /// then one redaction + encoding (O(payload)) per distinct recipient
+    /// view (at most three) and one clone per matching trace; amortized O(1)
+    /// ring push each. No work beyond the emptiness check when no trace is
+    /// open.
     pub fn record(
         &mut self,
         topic: &str,
@@ -629,7 +640,7 @@ impl TraceHub {
         if self.traces.is_empty() {
             return;
         }
-        let targets: Vec<i64> = self
+        let targets: Vec<(i64, RecipientView)> = self
             .traces
             .iter()
             .filter(|(_, trace)| {
@@ -637,23 +648,38 @@ impl TraceHub {
                     && trace.filter.matches(topic)
                     && is_live(&trace.owner)
             })
-            .map(|(handle, _)| *handle)
+            .map(|(handle, trace)| {
+                let view = redaction::recipient_view(topic, |capability| {
+                    trace.granted.contains(capability)
+                });
+                (*handle, view)
+            })
             .collect();
         if targets.is_empty() {
             return;
         }
-        let (bounded, payload_bytes) = bound_payload(payload);
         let timestamp_ms = u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let record = TraceRecord {
-            topic: topic.to_string(),
-            sequence,
-            timestamp_ms,
-            payload: bounded,
-            bytes: topic.len() + payload_bytes,
-        };
-        for handle in targets {
+        // One bounded record per distinct view; the view set is tiny.
+        let mut built: Vec<(RecipientView, TraceRecord)> = Vec::new();
+        for (handle, view) in targets {
+            let record = match built.iter().find(|(seen, _)| *seen == view) {
+                Some((_, record)) => record.clone(),
+                None => {
+                    let redacted = redaction::apply_view(view, payload);
+                    let (bounded, payload_bytes) = bound_payload(&redacted);
+                    let record = TraceRecord {
+                        topic: topic.to_string(),
+                        sequence,
+                        timestamp_ms,
+                        payload: bounded,
+                        bytes: topic.len() + payload_bytes,
+                    };
+                    built.push((view, record.clone()));
+                    record
+                }
+            };
             if let Some(trace) = self.traces.get_mut(&handle) {
-                trace.push(record.clone());
+                trace.push(record);
             }
         }
     }
@@ -793,7 +819,12 @@ mod tests {
     fn ring_buffer_drops_oldest_and_counts() {
         let mut hub = TraceHub::new();
         let handle = hub
-            .start("a.p", declared(), spec(TraceFilter::All, 3))
+            .start(
+                "a.p",
+                declared(),
+                BTreeSet::new(),
+                spec(TraceFilter::All, 3),
+            )
             .expect("start");
         for sequence in 1..=5 {
             hub.record("t", sequence, &LuaValue::Integer(0), live);
@@ -814,15 +845,19 @@ mod tests {
             .start(
                 "a.p",
                 declared(),
+                BTreeSet::new(),
                 spec(TraceFilter::All, TRACE_MAX_EVENTS_LIMIT),
             )
             .expect("start");
         let payload = LuaValue::String("x".repeat(TRACE_PAYLOAD_MAX_BYTES - 2));
-        let per_record = 1 + TRACE_PAYLOAD_MAX_BYTES;
+        // A known, ungated kind: unknown kinds are withheld (fail closed),
+        // which would replace the payload before the size accounting.
+        let topic = "terminal.opened";
+        let per_record = topic.len() + TRACE_PAYLOAD_MAX_BYTES;
         let fits = TRACE_BUFFER_MAX_BYTES / per_record;
         let total = fits + 10;
         for sequence in 0..total {
-            hub.record("t", sequence as u64, &payload, live);
+            hub.record(topic, sequence as u64, &payload, live);
         }
         let drain = hub.drain("a.p", handle).expect("owned");
         assert_eq!(drain.records.len(), fits);
@@ -852,6 +887,7 @@ mod tests {
             .start(
                 "a.p",
                 declared(),
+                BTreeSet::new(),
                 spec(TraceFilter::Prefix("terminal.".to_string()), 10),
             )
             .expect("start");
@@ -876,12 +912,18 @@ mod tests {
         let mut hub = TraceHub::new();
         let declared: BTreeSet<String> = ["terminal.opened".to_string()].into();
         let all = hub
-            .start("a.p", declared.clone(), TraceSpec::default())
+            .start(
+                "a.p",
+                declared.clone(),
+                BTreeSet::new(),
+                TraceSpec::default(),
+            )
             .expect("start");
         let prefix = hub
             .start(
                 "a.p",
                 declared.clone(),
+                BTreeSet::new(),
                 spec(TraceFilter::Prefix("terminal.".to_string()), 10),
             )
             .expect("start");
@@ -890,6 +932,7 @@ mod tests {
             .start(
                 "a.p",
                 declared,
+                BTreeSet::new(),
                 spec(TraceFilter::Exact("focus.changed".to_string()), 10),
             )
             .expect("unmatchable filter is not an error");
@@ -905,10 +948,111 @@ mod tests {
         assert!(hub.drain("a.p", never).expect("owned").records.is_empty());
         // An owner with no declared kinds records nothing at all.
         let empty = hub
-            .start("b.p", BTreeSet::new(), TraceSpec::default())
+            .start(
+                "b.p",
+                BTreeSet::new(),
+                BTreeSet::new(),
+                TraceSpec::default(),
+            )
             .expect("start");
         hub.record("terminal.opened", 4, &LuaValue::Nil, live);
         assert!(hub.drain("b.p", empty).expect("owned").records.is_empty());
+    }
+
+    fn paste_payload() -> LuaValue {
+        LuaValue::table([
+            ("action", LuaValue::String("paste".into())),
+            ("origin", LuaValue::String("user".into())),
+            ("preview", LuaValue::String("hunter2".into())),
+        ])
+    }
+
+    #[test]
+    fn owners_with_different_grants_get_different_payloads() {
+        let mut hub = TraceHub::new();
+        let declared: BTreeSet<String> = ["intercept.paste".to_string()].into();
+        let reader = hub
+            .start(
+                "a.p",
+                declared.clone(),
+                ["clipboard.read".to_string(), "debug.trace".to_string()].into(),
+                TraceSpec::default(),
+            )
+            .expect("start");
+        let blind = hub
+            .start(
+                "b.p",
+                declared,
+                ["debug.trace".to_string()].into(),
+                TraceSpec::default(),
+            )
+            .expect("start");
+        let payload = paste_payload();
+        hub.record("intercept.paste", 1, &payload, live);
+
+        let full = hub.drain("a.p", reader).expect("owned");
+        assert_eq!(full.records[0].payload, payload);
+
+        let redacted = hub.drain("b.p", blind).expect("owned");
+        let record = &redacted.records[0];
+        assert_eq!(record.payload.get("preview"), None);
+        assert_eq!(
+            record.payload.get("action"),
+            Some(&LuaValue::String("paste".into()))
+        );
+        assert_eq!(
+            record.payload.get(redaction::REDACTED_KEY),
+            Some(&LuaValue::Bool(true))
+        );
+        assert!(!store::encode_json(&record.to_value()).contains("hunter2"));
+        // The byte charge reflects the redacted payload, not the raw one.
+        assert_eq!(
+            record.bytes,
+            "intercept.paste".len() + store::encode_json(&record.payload).len()
+        );
+    }
+
+    #[test]
+    fn redaction_runs_before_the_size_bound() {
+        let mut hub = TraceHub::new();
+        let declared: BTreeSet<String> = ["intercept.paste".to_string()].into();
+        let blind = hub
+            .start("b.p", declared, BTreeSet::new(), TraceSpec::default())
+            .expect("start");
+        // An oversized preview must not leak even its size: the redacted
+        // payload is small, so no `truncated`/`bytes` marker appears.
+        let payload = LuaValue::table([
+            ("action", LuaValue::String("paste".into())),
+            (
+                "preview",
+                LuaValue::String("x".repeat(TRACE_PAYLOAD_MAX_BYTES * 2)),
+            ),
+        ]);
+        hub.record("intercept.paste", 1, &payload, live);
+        let drain = hub.drain("b.p", blind).expect("owned");
+        let recorded = &drain.records[0].payload;
+        assert_eq!(recorded.get("truncated"), None);
+        assert_eq!(recorded.get("bytes"), None);
+        assert_eq!(recorded.get("preview"), None);
+    }
+
+    #[test]
+    fn unknown_topics_are_withheld_in_traces() {
+        let mut hub = TraceHub::new();
+        let handle = hub
+            .start(
+                "a.p",
+                declared(),
+                ["clipboard.read".to_string()].into(),
+                TraceSpec::default(),
+            )
+            .expect("start");
+        hub.record("t", 1, &paste_payload(), live);
+        let drain = hub.drain("a.p", handle).expect("owned");
+        assert_eq!(
+            drain.records[0].payload,
+            LuaValue::table([(redaction::REDACTED_KEY, LuaValue::Bool(true))])
+        );
     }
 
     #[test]
@@ -917,23 +1061,23 @@ mod tests {
         let mut handles = Vec::new();
         for _ in 0..MAX_TRACES_PER_PLUGIN {
             handles.push(
-                hub.start("a.p", declared(), TraceSpec::default())
+                hub.start("a.p", declared(), BTreeSet::new(), TraceSpec::default())
                     .expect("start"),
             );
         }
         let error = hub
-            .start("a.p", declared(), TraceSpec::default())
+            .start("a.p", declared(), BTreeSet::new(), TraceSpec::default())
             .expect_err("limit");
         assert_eq!(error.code, "E_DEF_LIMIT");
         // The limit is per owner.
         let other = hub
-            .start("b.p", declared(), TraceSpec::default())
+            .start("b.p", declared(), BTreeSet::new(), TraceSpec::default())
             .expect("other owner");
         assert_eq!(handles, vec![1, 2, 3, 4]);
         assert_eq!(other, 5);
         assert!(hub.stop("a.p", 1));
         let reopened = hub
-            .start("a.p", declared(), TraceSpec::default())
+            .start("a.p", declared(), BTreeSet::new(), TraceSpec::default())
             .expect("slot freed");
         assert_eq!(reopened, 6, "handles are never reused");
     }
@@ -942,7 +1086,7 @@ mod tests {
     fn handles_are_owner_isolated() {
         let mut hub = TraceHub::new();
         let handle = hub
-            .start("a.p", declared(), TraceSpec::default())
+            .start("a.p", declared(), BTreeSet::new(), TraceSpec::default())
             .expect("start");
         hub.record("t", 1, &LuaValue::Nil, live);
         assert!(hub.drain("b.p", handle).is_none(), "foreign drain");
@@ -957,10 +1101,10 @@ mod tests {
     fn non_live_owners_record_nothing_and_retain_prunes() {
         let mut hub = TraceHub::new();
         let a = hub
-            .start("a.p", declared(), TraceSpec::default())
+            .start("a.p", declared(), BTreeSet::new(), TraceSpec::default())
             .expect("start");
         let b = hub
-            .start("b.p", declared(), TraceSpec::default())
+            .start("b.p", declared(), BTreeSet::new(), TraceSpec::default())
             .expect("start");
         hub.record("t", 1, &LuaValue::Nil, |owner| owner == "a.p");
         assert_eq!(hub.drain("a.p", a).expect("a").records.len(), 1);

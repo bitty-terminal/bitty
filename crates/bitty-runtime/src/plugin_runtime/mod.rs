@@ -25,6 +25,7 @@ pub mod debug;
 pub mod fs;
 pub mod manifest_toml;
 pub mod package;
+pub mod redaction;
 pub mod resolution;
 pub mod services;
 pub mod spawn;
@@ -1438,13 +1439,17 @@ impl PluginRuntime {
     ///
     /// Returns the number of handler invocations that completed. Bounded and
     /// non-blocking; per-handler failures are contained to the owning plugin.
+    ///
+    /// Each subscriber receives the payload redacted for its own activation
+    /// grant snapshot ([`redaction::recipient_view`], CTX-0899): for example
+    /// `intercept.paste` text reaches only `clipboard.read` holders, and a
+    /// kind without a reviewed policy is withheld. The trace hub applies the
+    /// same function per owner, so `debug.trace` never sees more than a
+    /// subscriber with the same grants. One envelope is built per distinct
+    /// view (at most three), so the common ungated case still clones once.
     pub fn deliver_event(&mut self, kind: &str, payload: &LuaValue) -> usize {
         self.event_sequence = self.event_sequence.saturating_add(1);
-        let envelope = LuaValue::table([
-            ("kind", LuaValue::String(kind.to_string())),
-            ("sequence", LuaValue::Integer(self.event_sequence as i64)),
-            ("payload", payload.clone()),
-        ]);
+        let sequence = self.event_sequence;
         self.record_trace(kind, payload);
         // CTX-0889: workspace events reach only generations holding
         // `workspace.read` (defense in depth: activation already rejects
@@ -1463,17 +1468,46 @@ impl PluginRuntime {
             })
             .map(|(id, _)| id.clone())
             .collect();
+        let mut envelopes: Vec<(redaction::RecipientView, LuaValue)> = Vec::new();
         let mut delivered = 0usize;
         for id in ids {
-            let handlers: Vec<_> = match self.entries.get(&id) {
-                Some(entry) => entry
-                    .registrations
-                    .events
-                    .iter()
-                    .filter(|subscription| subscription.kind == kind)
-                    .map(|subscription| subscription.handler.clone())
-                    .collect(),
+            let (handlers, view) = match self.entries.get(&id) {
+                Some(entry) => {
+                    let handlers: Vec<_> = entry
+                        .registrations
+                        .events
+                        .iter()
+                        .filter(|subscription| subscription.kind == kind)
+                        .map(|subscription| subscription.handler.clone())
+                        .collect();
+                    // No services means no grant snapshot: fail closed.
+                    let view = redaction::recipient_view(kind, |capability| {
+                        entry
+                            .services
+                            .as_ref()
+                            .is_some_and(|services| services.has_granted_capability(capability))
+                    });
+                    (handlers, view)
+                }
                 None => continue,
+            };
+            if handlers.is_empty() {
+                continue;
+            }
+            let envelope = match envelopes.iter().find(|(seen, _)| *seen == view) {
+                Some((_, envelope)) => envelope.clone(),
+                None => {
+                    let envelope = LuaValue::table([
+                        ("kind", LuaValue::String(kind.to_string())),
+                        (
+                            "sequence",
+                            LuaValue::Integer(i64::try_from(sequence).unwrap_or(i64::MAX)),
+                        ),
+                        ("payload", redaction::apply_view(view, payload).into_owned()),
+                    ]);
+                    envelopes.push((view, envelope.clone()));
+                    envelope
+                }
             };
             let Some(entry) = self.entries.get_mut(&id) else {
                 continue;
@@ -1561,7 +1595,9 @@ impl PluginRuntime {
     /// in its manifest `lazy.events` (snapshotted when the trace opens), the
     /// same precondition `bitty.events.subscribe` enforces, so a
     /// `debug.trace` holder never observes a topic it could not subscribe
-    /// to. Payloads are bounded by [`debug::TRACE_PAYLOAD_MAX_BYTES`].
+    /// to. Payloads are redacted per owner grant snapshot (the same
+    /// [`redaction`] policy as fan-out), then bounded by
+    /// [`debug::TRACE_PAYLOAD_MAX_BYTES`].
     fn record_trace(&mut self, kind: &str, payload: &LuaValue) {
         if self.trace_hub.borrow().is_empty() {
             return;

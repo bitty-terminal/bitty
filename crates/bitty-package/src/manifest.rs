@@ -303,6 +303,7 @@ pub const CAPABILITY_FAMILIES: &[&str] = &[
     "agent",
     "mcp",
     "ai",
+    "workspace",
 ];
 
 /// Every non-parameterized capability head in the closed normative set.
@@ -351,6 +352,8 @@ pub const CLOSED_CAPABILITY_HEADS: &[&str] = &[
     "ai.provider",
     "ai.stream",
     "ai.model",
+    "workspace.read",
+    "workspace.control",
 ];
 
 /// Whether a closed capability head requires a `:PARAMETER`.

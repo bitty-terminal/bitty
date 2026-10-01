@@ -49,6 +49,94 @@ pub const DEFAULT_MAX_NODES: usize = 1024;
 pub const DEFAULT_MAX_VALUE_BYTES: usize = 8 * 1024;
 /// Snapshot byte ceiling (`SNAPSHOT_MAX_BYTES`, RFC C.2).
 pub const SNAPSHOT_MAX_BYTES: usize = 256 * 1024;
+/// Maximum workspaces one `bitty.workspace.list()` result carries (CTX-0889).
+///
+/// Mirrors the Core slot-table bound (`bitty_runtime::MAX_WORKSPACES`, 16);
+/// a runtime test pins the two together. The bridge truncates defensively,
+/// so a misbehaving host source can never push an unbounded array into Lua.
+pub const WORKSPACE_LIST_MAX_ITEMS: usize = 16;
+
+/// Maximum characters of one workspace name crossing into Lua (CTX-0889).
+///
+/// Mirrors the Core display bound (`bitty_runtime::WORKSPACE_NAME_MAX_CHARS`,
+/// 32); names are truncated at a char boundary.
+pub const WORKSPACE_NAME_MAX_CHARS: usize = 32;
+
+/// Maximum bytes of a `bitty.workspace.rename` name argument (CTX-0889).
+///
+/// Mirrors the IPC `workspace rename` bound (`MAX_WORKSPACE_RENAME_BYTES`,
+/// 256): longer input fails closed with `E_DEF_LIMIT` before reaching the
+/// host; accepted names are truncated by Core to
+/// [`WORKSPACE_NAME_MAX_CHARS`].
+pub const WORKSPACE_RENAME_MAX_BYTES: usize = 256;
+
+/// Attention flags for one workspace in `bitty.workspace.list()` (CTX-0889).
+///
+/// Core has no per-workspace attention source yet (bell, activity, and
+/// exit state are tracked per session/runtime, not per workspace), so hosts
+/// currently report every flag `false`. The shape is fixed now so plugins
+/// do not break when a source lands.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorkspaceAttention {
+    /// A bell rang in this workspace since it was last focused.
+    pub bell: bool,
+    /// Output arrived in this workspace while it was inactive.
+    pub activity: bool,
+    /// A panel process in this workspace exited.
+    pub exited: bool,
+}
+
+/// One workspace row for `bitty.workspace.list()` (CTX-0889, ADR-0014).
+///
+/// Identity, order, and structure only: never terminal content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceInfo {
+    /// Stable workspace id (Core creation sequence; survives index shifts).
+    pub id: u64,
+    /// Display name.
+    pub name: String,
+    /// Whether this workspace is active.
+    pub active: bool,
+    /// Number of panels (layout leaves).
+    pub panel_count: usize,
+    /// Attention flags (all `false` until Core grows a source).
+    pub attention: WorkspaceAttention,
+}
+
+/// One validated workspace mutation request from Lua (CTX-0889).
+///
+/// The bridge validates argument shapes; the host gates on
+/// `workspace.control`, enqueues into a bounded queue, and the application
+/// applies it on its next tick through the same Core handlers the
+/// keybindings use. Ids are resolved at apply time; an id that no longer
+/// exists is dropped fail-closed. Spellings of the Lua entry points are
+/// candidates pending OQ-056.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceRequest {
+    /// Focus the workspace with this stable id.
+    FocusId(u64),
+    /// Focus the workspace at this 1-based position (clamped to the last
+    /// workspace, like the `Alt+N` keybinding).
+    FocusIndex(u64),
+    /// Create a workspace and switch to it (capacity-limited).
+    New,
+    /// Switch to the next workspace (wraps).
+    Next,
+    /// Close a workspace (`None` = the active one) through the kill-confirm
+    /// gate: idle closes immediately, live arms the user confirm.
+    Close(Option<u64>),
+    /// Rename the workspace with this stable id.
+    Rename {
+        /// Stable workspace id.
+        id: u64,
+        /// Validated, non-blank name (bounded by [`WORKSPACE_RENAME_MAX_BYTES`]).
+        name: String,
+    },
+    /// Move the focused panel of the active workspace into the workspace
+    /// with this stable id.
+    MovePanel(u64),
+}
+
 /// Default host-call deadline in milliseconds (reuses `RC-1`).
 pub const DEFAULT_HOST_DEADLINE_MS: u64 = crate::RC1_WALL_CLOCK_BUDGET_MS;
 
@@ -875,6 +963,170 @@ pub trait HostServices {
         }
         self.debug_control(action, target)
     }
+
+    /// List workspaces for `bitty.workspace.list()` (CTX-0889, ADR-0014).
+    ///
+    /// Grant-gated on `workspace.read` (`E_CAPABILITY_DENIED` otherwise);
+    /// returns rows in workspace order, bounded by
+    /// [`WORKSPACE_LIST_MAX_ITEMS`]. The default denies: a host without a
+    /// workspace backend never grants ambient read authority.
+    fn workspace_list(&self) -> Result<Vec<WorkspaceInfo>, BridgeError> {
+        Err(BridgeError::capability_denied("workspace.read"))
+    }
+
+    /// Enqueue one workspace mutation (CTX-0889, ADR-0014).
+    ///
+    /// Grant-gated on `workspace.control` only (`workspace.read` never
+    /// implies it). Returns whether the bounded queue accepted the request;
+    /// acceptance means queued, not applied. The default denies.
+    fn workspace_request(&self, request: &WorkspaceRequest) -> Result<bool, BridgeError> {
+        let _ = request;
+        Err(BridgeError::capability_denied("workspace.control"))
+    }
+
+    /// Expiry-aware [`HostServices::workspace_request`] (CTX-0889).
+    ///
+    /// Enqueueing mutates host state, so the bridge routes it through the
+    /// mutation guard. Same contract as
+    /// [`HostServices::store_set_with_expiry`]: check expiry before
+    /// committing; the default checks before delegating (fail-fast).
+    fn workspace_request_with_expiry(
+        &self,
+        request: &WorkspaceRequest,
+        expiry: Instant,
+    ) -> Result<bool, BridgeError> {
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        self.workspace_request(request)
+    }
+}
+
+/// Truncate a workspace name to [`WORKSPACE_NAME_MAX_CHARS`] at a char
+/// boundary (bridge-side defense; Core applies the same bound).
+fn bounded_workspace_name(name: &str) -> String {
+    name.chars().take(WORKSPACE_NAME_MAX_CHARS).collect()
+}
+
+/// Marshal workspace rows into the bounded Lua array shape (CTX-0889).
+fn workspace_list_value(rows: &[WorkspaceInfo]) -> LuaValue {
+    LuaValue::array(
+        rows.iter()
+            .take(WORKSPACE_LIST_MAX_ITEMS)
+            .map(|row| {
+                LuaValue::table([
+                    (
+                        "id",
+                        LuaValue::Integer(i64::try_from(row.id).unwrap_or(i64::MAX)),
+                    ),
+                    ("name", LuaValue::String(bounded_workspace_name(&row.name))),
+                    ("active", LuaValue::Bool(row.active)),
+                    (
+                        "panel_count",
+                        LuaValue::Integer(i64::try_from(row.panel_count).unwrap_or(i64::MAX)),
+                    ),
+                    (
+                        "attention",
+                        LuaValue::table([
+                            ("bell", LuaValue::Bool(row.attention.bell)),
+                            ("activity", LuaValue::Bool(row.attention.activity)),
+                            ("exited", LuaValue::Bool(row.attention.exited)),
+                        ]),
+                    ),
+                ])
+            })
+            .collect(),
+    )
+}
+
+/// Validate a stable workspace id argument (positive integer) for `what`.
+fn workspace_id_arg(value: Value<'_>, what: &str) -> Result<u64, BridgeError> {
+    match value {
+        Value::Integer(id) if id >= 1 => Ok(id as u64),
+        _ => Err(BridgeError::new(
+            "validation",
+            "E_DEF_INVALID",
+            format!("{what} must be a positive integer workspace id"),
+        )),
+    }
+}
+
+/// Validate a `bitty.workspace.rename` name: string, non-blank, bounded,
+/// and free of control characters (names render in Core chrome).
+fn workspace_name_arg(value: Value<'_>) -> Result<String, BridgeError> {
+    let Value::String(raw) = value else {
+        return Err(BridgeError::new(
+            "validation",
+            "E_DEF_INVALID",
+            "workspace.rename name must be a string",
+        ));
+    };
+    if raw.as_bytes().len() > WORKSPACE_RENAME_MAX_BYTES {
+        return Err(BridgeError::new(
+            "validation",
+            "E_DEF_LIMIT",
+            format!("workspace.rename name exceeds {WORKSPACE_RENAME_MAX_BYTES} bytes"),
+        ));
+    }
+    let Ok(name) = std::str::from_utf8(raw.as_bytes()) else {
+        return Err(BridgeError::new(
+            "validation",
+            "E_DEF_INVALID",
+            "workspace.rename name must be valid UTF-8",
+        ));
+    };
+    if name.trim().is_empty() || name.chars().any(char::is_control) {
+        return Err(BridgeError::new(
+            "validation",
+            "E_DEF_INVALID",
+            "workspace.rename name must be non-blank without control characters",
+        ));
+    }
+    Ok(name.to_string())
+}
+
+/// Parse a `bitty.workspace.focus` target: an integer stable id or a table
+/// `{ index = n }` with a 1-based position.
+fn workspace_focus_arg<'gc>(
+    ctx: Context<'gc>,
+    value: Value<'gc>,
+) -> Result<WorkspaceRequest, BridgeError> {
+    match value {
+        Value::Table(table) => match table.get::<_, Value>(ctx, "index") {
+            Ok(Value::Integer(index)) if index >= 1 => {
+                Ok(WorkspaceRequest::FocusIndex(index as u64))
+            }
+            _ => Err(BridgeError::new(
+                "validation",
+                "E_DEF_INVALID",
+                "workspace.focus { index = n } needs a positive integer index",
+            )),
+        },
+        other => workspace_id_arg(other, "workspace.focus target").map(WorkspaceRequest::FocusId),
+    }
+}
+
+/// Build one `bitty.workspace.*` mutation callback: `parse` validates the
+/// Lua arguments into a request, then the bridge enqueues it through the
+/// mutation guard and returns the boolean acceptance.
+fn workspace_mutation<'gc>(
+    ctx: Context<'gc>,
+    state: &Rc<BridgeState>,
+    parse: for<'a> fn(Context<'a>, [Value<'a>; 2]) -> Result<WorkspaceRequest, BridgeError>,
+) -> Callback<'gc> {
+    let state = state.clone();
+    Callback::from_fn(&ctx, move |ctx, _exec, mut stack| {
+        let request = parse(ctx, [stack.get(0), stack.get(1)]).map_err(|e| e.to_error(ctx))?;
+        let accepted = state
+            .bounded_mutation(|expiry| {
+                state
+                    .services
+                    .workspace_request_with_expiry(&request, expiry)
+            })
+            .map_err(|e| e.to_error(ctx))?;
+        stack.replace(ctx, Value::Boolean(accepted));
+        Ok(CallbackReturn::Return)
+    })
 }
 
 /// One captured command registration from `init.lua`.
@@ -2446,6 +2698,82 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         )
         .expect("debug table accepts 'control'");
 
+    // CTX-0889 (ADR-0014): `bitty.workspace.*` L1 domain. `list` is a
+    // `workspace.read` read (`bounded`); every mutation is gated on
+    // `workspace.control` and only enqueues a bounded request (mutation
+    // guard) that the application applies on its next tick through the
+    // keybinding handlers. Spellings are candidates pending OQ-056.
+    let workspace = Table::new(&ctx);
+    workspace
+        .set(
+            ctx,
+            "list",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let rows = state
+                        .bounded(|_expiry| state.services.workspace_list())
+                        .map_err(|e| e.to_error(ctx))?;
+                    stack.replace(ctx, workspace_list_value(&rows).to_lua(ctx));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("workspace table accepts 'list'");
+    workspace
+        .set(
+            ctx,
+            "focus",
+            workspace_mutation(ctx, state, |ctx, args| workspace_focus_arg(ctx, args[0])),
+        )
+        .expect("workspace table accepts 'focus'");
+    workspace
+        .set(
+            ctx,
+            "new",
+            workspace_mutation(ctx, state, |_ctx, _args| Ok(WorkspaceRequest::New)),
+        )
+        .expect("workspace table accepts 'new'");
+    workspace
+        .set(
+            ctx,
+            "next",
+            workspace_mutation(ctx, state, |_ctx, _args| Ok(WorkspaceRequest::Next)),
+        )
+        .expect("workspace table accepts 'next'");
+    workspace
+        .set(
+            ctx,
+            "close",
+            workspace_mutation(ctx, state, |_ctx, args| match args[0] {
+                Value::Nil => Ok(WorkspaceRequest::Close(None)),
+                other => workspace_id_arg(other, "workspace.close id")
+                    .map(|id| WorkspaceRequest::Close(Some(id))),
+            }),
+        )
+        .expect("workspace table accepts 'close'");
+    workspace
+        .set(
+            ctx,
+            "rename",
+            workspace_mutation(ctx, state, |_ctx, args| {
+                let id = workspace_id_arg(args[0], "workspace.rename id")?;
+                let name = workspace_name_arg(args[1])?;
+                Ok(WorkspaceRequest::Rename { id, name })
+            }),
+        )
+        .expect("workspace table accepts 'rename'");
+    workspace
+        .set(
+            ctx,
+            "move_panel",
+            workspace_mutation(ctx, state, |_ctx, args| {
+                workspace_id_arg(args[0], "workspace.move_panel target")
+                    .map(WorkspaceRequest::MovePanel)
+            }),
+        )
+        .expect("workspace table accepts 'move_panel'");
+
     let ui = Table::new(&ctx);
     ui.set(
         ctx,
@@ -2548,6 +2876,8 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         .expect("root accepts env");
     root.set(ctx, "debug", readonly_table(ctx, debug))
         .expect("root accepts debug");
+    root.set(ctx, "workspace", readonly_table(ctx, workspace))
+        .expect("root accepts workspace");
     Value::Table(readonly_table(ctx, root))
 }
 

@@ -39,6 +39,11 @@ pub enum CapabilityFamily {
     Mcp,
     /// AI provider/stream/model (CTX-0111, ai-panel).
     Ai,
+    /// Workspace L1 domain (ADR-0014, CTX-0889): `workspace.read` observes
+    /// workspace identity/order/attention; `workspace.control` mutates
+    /// workspaces through the same Core handlers as keybindings. Read never
+    /// implies control.
+    Workspace,
 }
 
 impl CapabilityFamily {
@@ -62,6 +67,7 @@ impl CapabilityFamily {
             "agent" => Some(Self::Agent),
             "mcp" => Some(Self::Mcp),
             "ai" => Some(Self::Ai),
+            "workspace" => Some(Self::Workspace),
             _ => None,
         }
     }
@@ -87,6 +93,7 @@ impl CapabilityFamily {
             Self::Agent => "agent",
             Self::Mcp => "mcp",
             Self::Ai => "ai",
+            Self::Workspace => "workspace",
         }
     }
 
@@ -148,6 +155,7 @@ impl CapabilityFamily {
             ],
             Self::Mcp => &["mcp.invoke"],
             Self::Ai => &["ai.provider", "ai.stream", "ai.model"],
+            Self::Workspace => &["workspace.read", "workspace.control"],
         }
     }
 }
@@ -371,6 +379,8 @@ pub fn effect_statement(id: &CapabilityId) -> &'static str {
         "ai.provider" => "Use allowlisted AI provider",
         "ai.stream" => "Stream AI responses for this agent",
         "ai.model" => "Select AI model for this agent (bounded)",
+        "workspace.read" => "List workspaces and observe workspace events (no terminal content)",
+        "workspace.control" => "Create, close, rename, and focus workspaces and move panels",
         _ => "Requested capability",
     }
 }
@@ -445,6 +455,8 @@ mod tests {
             "platform.notify",
             "protocol.register",
             "layout.provider",
+            "workspace.read",
+            "workspace.control",
         ] {
             assert!(CapabilityId::parse(id).is_ok(), "should parse {id}");
         }
@@ -475,6 +487,7 @@ mod tests {
             CapabilityFamily::Agent,
             CapabilityFamily::Mcp,
             CapabilityFamily::Ai,
+            CapabilityFamily::Workspace,
         ];
         for family in families {
             assert!(family.denied_without_grant());
@@ -606,6 +619,7 @@ mod tests {
             CapabilityFamily::Agent,
             CapabilityFamily::Mcp,
             CapabilityFamily::Ai,
+            CapabilityFamily::Workspace,
         ] {
             host_heads.extend(family.closed_identifiers().iter().copied());
         }

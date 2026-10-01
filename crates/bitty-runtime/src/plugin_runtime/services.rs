@@ -14,7 +14,8 @@ use std::time::Instant;
 use bitty_lua::ui::{UI_MAX_AGGREGATED_TEXT_BYTES, UI_MAX_BLOCKS, UiNode};
 use bitty_lua::{
     BridgeError, HostServices, LuaValue, LuaVm, SNAPSHOT_MAX_BYTES, ServiceRoute, StashedFunction,
-    env_grant_shape_ok, validate_env_key,
+    WORKSPACE_LIST_MAX_ITEMS, WorkspaceInfo, WorkspaceRequest, env_grant_shape_ok,
+    validate_env_key,
 };
 use bitty_package::Version;
 use bitty_plugin_host::bundled::{WORKSPACELINE_CLAIM, canonicalize_ui_claim};
@@ -69,6 +70,98 @@ pub trait SnapshotSource {
     ///
     /// Returns a typed `E_SNAPSHOT_*`/`E_CAPABILITY_DENIED` error.
     fn snapshot(&self, scope: &str) -> Result<LuaValue, BridgeError>;
+}
+
+/// Read-only workspace source for `bitty.workspace.list()` (CTX-0889).
+///
+/// The application publishes Core workspace state into its implementation
+/// once per tick (the `LiveSnapshot` pattern), so plugin reads never touch
+/// the runtime directly and never see terminal content.
+pub trait WorkspaceSource {
+    /// Current workspaces in order, bounded by
+    /// [`bitty_lua::WORKSPACE_LIST_MAX_ITEMS`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when no workspace state is available.
+    fn workspaces(&self) -> Result<Vec<WorkspaceInfo>, BridgeError>;
+}
+
+/// Workspace source for hosts without a workspace backend: fails closed
+/// with `E_NOT_IMPLEMENTED` (a granted read still observes nothing).
+#[derive(Debug, Default)]
+pub struct UnavailableWorkspaces;
+
+impl WorkspaceSource for UnavailableWorkspaces {
+    fn workspaces(&self) -> Result<Vec<WorkspaceInfo>, BridgeError> {
+        Err(BridgeError::not_implemented("bitty.workspace.list"))
+    }
+}
+
+/// One queued workspace mutation with its requesting plugin (CTX-0889).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedWorkspaceRequest {
+    /// Requesting plugin id (diagnostics only; authority was checked at
+    /// enqueue time against the plugin's `workspace.control` grant).
+    pub plugin_id: String,
+    /// Validated request.
+    pub request: WorkspaceRequest,
+}
+
+/// Bounded runtime-shared workspace request queue (CTX-0889).
+///
+/// Overflow drops the newest request and counts it (same governance as
+/// [`NotificationQueue`]); the application drains it once per tick.
+#[derive(Debug)]
+pub struct WorkspaceRequestQueue {
+    items: VecDeque<QueuedWorkspaceRequest>,
+    capacity: usize,
+    dropped: u64,
+}
+
+impl WorkspaceRequestQueue {
+    /// Create a bounded queue (capacity at least 1).
+    #[must_use]
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            items: VecDeque::new(),
+            capacity: capacity.max(1),
+            dropped: 0,
+        }
+    }
+
+    /// Push a request; returns whether it was accepted.
+    pub fn push(&mut self, request: QueuedWorkspaceRequest) -> bool {
+        if self.items.len() >= self.capacity {
+            self.dropped = self.dropped.saturating_add(1);
+            return false;
+        }
+        self.items.push_back(request);
+        true
+    }
+
+    /// Drain all queued requests in FIFO order.
+    pub fn drain(&mut self) -> Vec<QueuedWorkspaceRequest> {
+        self.items.drain(..).collect()
+    }
+
+    /// Number of queued requests.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Whether the queue is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Number dropped since creation.
+    #[must_use]
+    pub fn dropped(&self) -> u64 {
+        self.dropped
+    }
 }
 
 /// Settings source that has no settings.
@@ -596,6 +689,10 @@ pub struct PluginServices {
     declared_events: RefCell<BTreeSet<String>>,
     debug_view: RefCell<Option<Rc<RefCell<DebugView>>>>,
     trace_hub: RefCell<Option<Rc<RefCell<TraceHub>>>>,
+    workspace_read: Cell<bool>,
+    workspace_control: Cell<bool>,
+    workspace_source: RefCell<Option<Rc<dyn WorkspaceSource>>>,
+    workspace_requests: RefCell<Option<Rc<RefCell<WorkspaceRequestQueue>>>>,
 }
 
 impl PluginServices {
@@ -633,7 +730,45 @@ impl PluginServices {
             declared_events: RefCell::new(BTreeSet::new()),
             debug_view: RefCell::new(None),
             trace_hub: RefCell::new(None),
+            workspace_read: Cell::new(false),
+            workspace_control: Cell::new(false),
+            workspace_source: RefCell::new(None),
+            workspace_requests: RefCell::new(None),
         }
+    }
+
+    /// Grant `workspace.read` and/or `workspace.control` from the activation
+    /// snapshot (CTX-0889). Independent: read never implies control, and
+    /// control does not imply read. Absent grants fail closed with
+    /// `E_CAPABILITY_DENIED`.
+    pub fn set_workspace_access(&self, read: bool, control: bool) {
+        self.workspace_read.set(read);
+        self.workspace_control.set(control);
+    }
+
+    /// Whether this generation holds `workspace.read` (also gates delivery
+    /// of `workspace.*` events).
+    #[must_use]
+    pub fn has_workspace_read(&self) -> bool {
+        self.workspace_read.get()
+    }
+
+    /// Whether this generation holds `workspace.control`.
+    #[must_use]
+    pub fn has_workspace_control(&self) -> bool {
+        self.workspace_control.get()
+    }
+
+    /// Attach the workspace read source and the runtime-shared request
+    /// queue (CTX-0889). Without them a granted call fails closed with
+    /// `E_NOT_IMPLEMENTED`.
+    pub fn set_workspace_backend(
+        &self,
+        source: Option<Rc<dyn WorkspaceSource>>,
+        requests: Option<Rc<RefCell<WorkspaceRequestQueue>>>,
+    ) {
+        *self.workspace_source.borrow_mut() = source;
+        *self.workspace_requests.borrow_mut() = requests;
     }
 
     /// Grant the UI surfaces for this generation from the activation snapshot.
@@ -1200,6 +1335,36 @@ impl HostServices for PluginServices {
             }
         }
         Ok(result)
+    }
+
+    fn workspace_list(&self) -> Result<Vec<WorkspaceInfo>, BridgeError> {
+        if !self.workspace_read.get() {
+            return Err(BridgeError::capability_denied("workspace.read"));
+        }
+        let source = self
+            .workspace_source
+            .borrow()
+            .clone()
+            .ok_or_else(|| BridgeError::not_implemented("bitty.workspace.list"))?;
+        let mut rows = source.workspaces()?;
+        rows.truncate(WORKSPACE_LIST_MAX_ITEMS);
+        Ok(rows)
+    }
+
+    fn workspace_request(&self, request: &WorkspaceRequest) -> Result<bool, BridgeError> {
+        if !self.workspace_control.get() {
+            return Err(BridgeError::capability_denied("workspace.control"));
+        }
+        let queue = self
+            .workspace_requests
+            .borrow()
+            .clone()
+            .ok_or_else(|| BridgeError::not_implemented("bitty.workspace"))?;
+        let accepted = queue.borrow_mut().push(QueuedWorkspaceRequest {
+            plugin_id: self.plugin_id.clone(),
+            request: request.clone(),
+        });
+        Ok(accepted)
     }
 
     fn debug_inspect(&self, target: &str) -> Result<LuaValue, BridgeError> {

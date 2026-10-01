@@ -737,15 +737,21 @@ fn main() {
     // CTX-0481: the shared live-snapshot handle flows to the app tick loop
     // so `bitty.terminal.snapshot` tracks committed state instead of
     // freezing at generation 1.
+    // CTX-0889: the live workspace source is seeded from the constructed
+    // runtime and republished by the tick loop.
     let plugin_session = plugin_runtime::discover_and_activate(
         args.safe,
         runtime.config().cols,
         runtime.config().rows,
+        &runtime.workspace_summaries(),
     );
     let live_snapshot = plugin_session
         .as_ref()
-        .map(|(_, snapshot)| Rc::clone(snapshot));
-    let plugin_runtime_handle = plugin_session.map(|(runtime, _)| runtime);
+        .map(|session| Rc::clone(&session.snapshot));
+    let live_workspaces = plugin_session
+        .as_ref()
+        .map(|session| Rc::clone(&session.workspaces));
+    let plugin_runtime_handle = plugin_session.map(|session| session.runtime);
 
     // Single-window vertical slice: one PTY per leaf, one shell each.
     // Explicit program spawns verbatim (with tail args via spawn_shell_with_args);
@@ -845,6 +851,8 @@ fn main() {
     .with_blur_radius(app_config.effective.window.blur_radius)
     // CTX-0481: commit the live plugin snapshot from the tick loop.
     .with_live_snapshot(live_snapshot)
+    // CTX-0889: publish the live workspace source from the tick loop.
+    .with_live_workspaces(live_workspaces)
     // CTX-0892: wire the plugin runtime into the app loop for event delivery.
     .with_plugin_runtime(plugin_runtime_handle);
     // CTX-0167: the synthetic demo pump stays off in real sessions so

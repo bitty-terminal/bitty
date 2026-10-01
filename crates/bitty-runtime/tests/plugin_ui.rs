@@ -520,9 +520,7 @@ fn suspend_invalidates_handles_until_remount() {
         bitty.commands.register({
           id = "probe",
           title = "Probe",
-          run = function(...)
-            local args = {...}
-            local key = args[1]
+          run = function(key)
             local ok = bitty.ui.update(bitty.store.get("handle"), { kind = "Text", text = "v2" })
             bitty.store.set(key, ok)
             return ok
@@ -531,9 +529,7 @@ fn suspend_invalidates_handles_until_remount() {
         bitty.commands.register({
           id = "probe_old",
           title = "Probe old",
-          run = function(...)
-            local args = {...}
-            local key = args[1]
+          run = function(key)
             local ok = bitty.ui.update(bitty.store.get("old_handle"), { kind = "Text", text = "v2" })
             bitty.store.set(key, ok)
             return ok

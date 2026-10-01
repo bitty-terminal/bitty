@@ -290,9 +290,3 @@ pub use registry::{
     MAX_WORKSPACES_PER_WINDOW, PersistentId, RESIZE_DEBOUNCE_CAP, RegistryConfig, RegistryError,
     RuntimeId, TerminalHandle, TerminalId, TerminalRegistry, ViewHandle, Visibility, WorkspaceId,
 };
-
-// CTX-0892: plugin runtime for event delivery, command dispatch, and UI blocks.
-pub use plugin_runtime::PluginRuntime;
-
-// Re-export LuaValue for event payload construction
-pub use bitty_lua::LuaValue;

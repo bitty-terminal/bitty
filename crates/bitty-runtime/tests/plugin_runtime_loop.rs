@@ -1,7 +1,7 @@
 //! CTX-0892: PluginRuntime loop integration tests.
 //!
 //! Proves:
-//! - Event delivery: subscribed events reach Lua VMs via `deliver_event`, bounded per tick.
+//! - Event delivery: subscribed events reach Lua VMs via `deliver_event`, one call per delivery (the per-tick coalescing lives in the app).
 //! - Command dispatch: registered plugin commands are dispatched via `dispatch_command`.
 //! - UI blocks accessor: mounted UI blocks are retrievable via the read accessor.
 
@@ -129,15 +129,7 @@ return {}
     write_plugin(&plugins_root, "test.event-subscriber", init);
 
     let mut rt = runtime(vec![plugins_root.clone()], data.clone());
-    let discovered = rt.discover();
-    eprintln!("Discovered {} plugins: {:?}", discovered.len(), discovered);
-    eprintln!("Plugin dir: {}", plugins_root.display());
-    eprintln!(
-        "Plugin manifest: {}",
-        plugins_root
-            .join("test.event-subscriber/bitty-plugin.toml")
-            .display()
-    );
+    rt.discover();
     let id = PluginId::new("test.event-subscriber").expect("id");
     rt.activate(&id).expect("activate");
 
@@ -169,7 +161,7 @@ return {}
 }
 
 #[test]
-fn event_delivery_bounded_per_tick() {
+fn deliver_event_processes_each_call() {
     let data = temp_dir("event-bounded");
     let plugins_root = temp_dir("event-bounded-plugins");
 

@@ -74,8 +74,6 @@ pub const PLUGIN_MODULE_PATH_MAX_BYTES: usize = 1024;
 pub const PLUGIN_INIT_MAX_BYTES: usize = 1024 * 1024;
 /// Notification queue capacity (`RC-8` rate governance candidate).
 pub const NOTIFICATION_QUEUE_CAPACITY: usize = 64;
-/// Maximum events delivered to plugins per tick (CTX-0892).
-pub const MAX_EVENTS_PER_TICK: usize = 50;
 
 /// Closed source-class set (RFC B.1): `bundled`, `registry`, `git`, `local-path`.
 ///

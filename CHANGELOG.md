@@ -37,12 +37,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `workspace.bar.edge` and `workspace.show_bar` reload live and reflow in
   place.
 - **Plugin runtime wired into app loop (CTX-0892, #1564):** `PluginRuntime`
-  is now integrated into `TerminalApp` lifecycle (created at startup, ticked
-  each frame). Event delivery works for `terminal.title-changed` and
-  `focus.changed`, bounded to 10 events per tick to protect the hot path.
-  Added `mounted_ui_blocks()` accessor on `PluginServices` for future chrome
-  rendering integration. Command dispatch from keymap/control actions to
-  plugin handlers remains deferred (requires keymap action enum integration).
+  now lives in `TerminalApp` instead of being dropped at startup. At the end
+  of each tick, after present and the PTY reply flush, the app delivers
+  `terminal.title-changed` and `focus.changed` to subscribed plugins,
+  coalesced to at most one event per kind carrying the latest value. Added the
+  read accessor `PluginRuntime::ui_blocks()` (discovery order) for later chrome
+  rendering. Routing keymap/control actions to plugin commands is deferred.
 
 ### Changed
 

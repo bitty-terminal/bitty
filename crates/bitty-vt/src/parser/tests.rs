@@ -2332,3 +2332,20 @@ fn apc_g_parser_esc_flood_in_discarded_apc_hits_stall_bound() {
         "split ESC flood must hit the bound"
     );
 }
+
+#[test]
+fn apc_discarding_held_esc_then_esc_backslash_terminates() {
+    // `ESC ESC \` split after the first ESC must still find the ST.
+    let mut parser = Parser::new();
+    let mut actions = Vec::new();
+    parser.advance(b"\x1b_X;junk\x1b", |a| actions.push(a));
+    parser.advance(b"\x1b\\ok", |a| actions.push(a));
+    let printed: String = actions
+        .iter()
+        .filter_map(|a| match a {
+            TerminalAction::Print(cell) => Some(cell.clone().scalar()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(printed, "ok");
+}

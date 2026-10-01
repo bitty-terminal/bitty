@@ -215,7 +215,8 @@ pub(crate) struct TerminalApp {
     /// dispatches commands. Kept alive by the app loop.
     pub(crate) plugin_runtime: Option<PluginRuntime>,
     /// Previous runtime state for event change detection (CTX-0892).
-    /// Rebuilt from Runtime on every tick; changes trigger plugin events.
+    /// Updated in place by [`EventTracker::take_changes`] each tick; changes
+    /// trigger plugin events.
     event_tracker: EventTracker,
 }
 

@@ -688,7 +688,15 @@ fn main() {
     // reads session state (recovery startup). Headless smoke stays
     // deterministic and skips restore too. Any failure starts clean with a
     // one-line warning (counts only, never session contents).
-    let session_restored = if args.safe
+    // CTX-0908: session restore is now opt-in via config
+    // (`session.restore_on_startup`); default is `false` (clean start).
+    let session_restore_enabled = app_config
+        .effective
+        .session
+        .restore_on_startup
+        .unwrap_or(false);
+    let session_restored = if !session_restore_enabled
+        || args.safe
         || args.headless
         || args.split_axis.is_some()
         || args.split_ratio.is_some()

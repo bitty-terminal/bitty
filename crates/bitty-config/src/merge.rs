@@ -117,6 +117,7 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "close_confirm"
         | "extends"
         | "profile"
+        | "session.restore_on_startup"
         | "schema_version" => Some(MergeClass::ScalarReplace),
         "chrome.top.order" | "chrome.bottom.order" => Some(MergeClass::ListReplace),
         "font"
@@ -131,7 +132,8 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "scrollbar"
         | "mouse"
         | "appearance"
-        | "appearance.animations" => Some(MergeClass::DeepMerge),
+        | "appearance.animations"
+        | "session" => Some(MergeClass::DeepMerge),
         "keymaps" | "plugins" => Some(MergeClass::SetById),
         _ => None,
     }
@@ -598,6 +600,8 @@ const ATTRIBUTED_FIELDS: &[&str] = &[
     "appearance",
     "keymaps",
     "plugins",
+    "session.restore_on_startup",
+    "session",
     "schema_version",
 ];
 
@@ -1258,6 +1262,51 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
             }
 
             attribution.insert("chrome".to_string(), src.clone());
+        }
+
+        // CTX-0908: `session.restore_on_startup` is scalar-replace with the
+        // same present-key-only rule as `workspace.show_bar`.
+        if let Some(sess) = &plan.session {
+            if let Some(restore) = sess.restore_on_startup {
+                let field = "session.restore_on_startup";
+                if is_policy {
+                    policy_fields.insert(field.to_string(), src.clone());
+                    effective.session.restore_on_startup = Some(restore);
+                    let prev = attribution.get(field).cloned();
+                    record_attribution(
+                        &mut attribution,
+                        &mut conflicts,
+                        field,
+                        prev,
+                        src,
+                        MergeClass::ScalarReplace,
+                    );
+                } else if let Some(policy_src) = policy_fields.get(field) {
+                    policy_violations.push(ConfigError::NonOverridable {
+                        field: field.to_string(),
+                        policy_source: policy_src.describe(),
+                        attempted_source: src.describe(),
+                    });
+                    conflicts.push(MergeConflict {
+                        field: field.to_string(),
+                        previous_source: policy_src.clone(),
+                        new_source: src.clone(),
+                        merge_class: MergeClass::ScalarReplace,
+                    });
+                } else {
+                    let prev = attribution.get(field).cloned();
+                    effective.session.restore_on_startup = Some(restore);
+                    record_attribution(
+                        &mut attribution,
+                        &mut conflicts,
+                        field,
+                        prev,
+                        src,
+                        MergeClass::ScalarReplace,
+                    );
+                }
+            }
+            attribution.insert("session".to_string(), src.clone());
         }
 
         // CTX-0292: Core-owned workspace decoration (`decoration.gaps_in`,

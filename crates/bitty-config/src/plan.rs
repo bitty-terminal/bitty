@@ -16,8 +16,8 @@ use crate::error::ConfigError;
 use crate::keymap::ModKey;
 use crate::types::{
     AppearanceConfig, ChromeConfig, CloseConfirm, DecorationConfig, FontConfig, KeymapEntry,
-    LayoutConfig, MouseConfig, PluginSpec, ScrollbarConfig, SelectionConfig, TerminalConfig,
-    ViewOverride, WindowConfig, WorkspaceConfig,
+    LayoutConfig, MouseConfig, PluginSpec, ScrollbarConfig, SelectionConfig, SessionConfig,
+    TerminalConfig, ViewOverride, WindowConfig, WorkspaceConfig,
 };
 
 /// Current schema version is owned by [`crate::migration`].
@@ -51,6 +51,9 @@ pub struct ConfigPlan {
     /// Plugin chrome stacking order per edge (CTX-0890
     /// `chrome.top.order`/`chrome.bottom.order`; array-replace).
     pub chrome: Option<ChromeConfig>,
+    /// Session restore and persistence (CTX-0908 `session.restore_on_startup`).
+    /// `None` means "this layer says nothing".
+    pub session: Option<SessionConfig>,
     /// Core-owned workspace decoration (CTX-0292 `decoration.gaps_in`,
     /// `decoration.gaps_out`, `decoration.border`, `decoration.radius`).
     pub decoration: Option<DecorationConfig>,
@@ -302,6 +305,7 @@ impl ConfigPlan {
             && self.plugins.is_none()
             && self.extends.is_none()
             && self.profile_name.is_none()
+            && self.session.is_none()
     }
 }
 

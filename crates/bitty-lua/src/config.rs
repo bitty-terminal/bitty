@@ -251,6 +251,14 @@ pub struct ChromeData {
     pub bottom_order: Option<Vec<String>>,
 }
 
+/// Session restore and persistence config, plain data (CTX-0908, issue #1442).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionData {
+    /// Whether to restore the previous session on startup
+    /// (`session = { restore_on_startup = true }`; raw bool).
+    pub restore_on_startup: Option<bool>,
+}
+
 /// Core-owned workspace decoration overrides, plain data (CTX-0292; unified
 /// CTX-0333; see [`FontData`] for `Option` semantics).
 ///
@@ -469,6 +477,8 @@ pub struct ConfigData {
     /// switch; raw boolean, honored downstream as the default-on hint
     /// config: `false` keeps the Leader from arming a hint session).
     pub hints_enabled: Option<bool>,
+    /// `session` table (CTX-0908 session restore config, issue #1442).
+    pub session: Option<SessionData>,
     /// Top-level `close_confirm` scalar (CTX-0370 view/window close
     /// confirmation mode; raw string, parsed fail-closed downstream).
     pub close_confirm: Option<String>,
@@ -516,6 +526,7 @@ impl ConfigData {
             && self.leader_key.is_none()
             && self.leader_timeout_ms.is_none()
             && self.hints_enabled.is_none()
+            && self.session.is_none()
             && self.close_confirm.is_none()
             && self.extends.is_none()
             && self.keymaps.is_none()
@@ -1639,6 +1650,16 @@ impl ConfigData {
                 // default-on hint config).
                 "hints_enabled" => {
                     out.hints_enabled = Some(expect_bool(key, val)?);
+                }
+                // CTX-0908: `session` table (session restore config, issue #1442).
+                "session" => {
+                    let nested = expect_table(key, val)?;
+                    check_nested_keys(key, nested, &["restore_on_startup"])?;
+                    let restore_on_startup = match get_field(nested, "restore_on_startup") {
+                        Some(v) => Some(expect_bool("session.restore_on_startup", v)?),
+                        None => None,
+                    };
+                    out.session = Some(SessionData { restore_on_startup });
                 }
                 // CTX-0370: top-level `close_confirm` scalar (raw string;
                 // typed parsing and fail-closed validation live downstream

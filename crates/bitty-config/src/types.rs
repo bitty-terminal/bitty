@@ -2265,6 +2265,15 @@ impl WorkspaceBarEdge {
     }
 }
 
+/// Session restore and persistence config (CTX-0908, issue #1442).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionConfig {
+    /// Whether to restore the previous session on startup
+    /// (`session.restore_on_startup`). `None` means the layer says nothing;
+    /// the effective default is `false` (clean slate).
+    pub restore_on_startup: Option<bool>,
+}
+
 impl WorkspaceConfig {
     /// Validate the provider name spelling (fail-closed).
     ///
@@ -3042,6 +3051,8 @@ pub struct EffectiveConfig {
     /// default-on). Honored by [`crate::keymap::resolve_hint_config`];
     /// the app input path refuses to arm a hint session while disabled.
     pub hints_enabled: Option<bool>,
+    /// Session restore and persistence config (CTX-0908, issue #1442).
+    pub session: SessionConfig,
     /// Keymaps, possibly empty.
     pub keymaps: Vec<KeymapEntry>,
     /// Plugins, possibly empty.
@@ -3073,6 +3084,7 @@ impl Default for EffectiveConfig {
             leader_key: None,
             leader_timeout_ms: None,
             hints_enabled: None,
+            session: SessionConfig::default(),
             keymaps: Vec::new(),
             plugins: Vec::new(),
             profile: None,

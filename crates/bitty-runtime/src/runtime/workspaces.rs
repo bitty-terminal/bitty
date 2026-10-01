@@ -971,8 +971,9 @@ impl Runtime {
         // they still hold (stale entries leak and misreport session state).
         let removed_leaves = self.workspaces[index].layout.leaf_ids();
 
-        // CTX-0907: capture workspace name before removal for event emission
+        // CTX-0907: capture workspace name and whether it's active before removal
         let workspace_name = self.workspaces[index].name.clone();
+        let removing_active = index == self.active_workspace;
 
         self.workspaces.remove(index);
         for view in removed_leaves {
@@ -1062,7 +1063,7 @@ impl Runtime {
         // already-active index so no later switch could rescue them.
         self.spawn_session_pending_for_active();
 
-        // CTX-0907: emit workspace.closed event
+        // CTX-0907: emit workspace.closed event, then workspace.focused if we removed the active one
         let seq = self.plugin_host.publish_count();
         let event = Event::new(
             EventKind::WorkspaceClosed,
@@ -1070,6 +1071,18 @@ impl Runtime {
             seq,
         );
         self.plugin_host.publish(event);
+
+        // CTX-0907: when removing the active workspace, emit workspace.focused for the replacement
+        if removing_active {
+            let new_name = &self.workspaces[self.active_workspace].name;
+            let seq = self.plugin_host.publish_count();
+            let event = Event::new(
+                EventKind::WorkspaceFocused,
+                EventPayload::Text(BoundedText::new_truncated(new_name)),
+                seq,
+            );
+            self.plugin_host.publish(event);
+        }
 
         self.pending_full_redraw = true;
     }

@@ -446,7 +446,7 @@ jobs:
 
       # Pinned to the v1.6.0 commit (the tag is mutable).
       - name: Start FreeBSD 15.1 VM
-        uses: cross-platform-actions/action@48a7982e8230b812b030848825c2cb55a66daa4e # v1.6.0
+        uses: cross-platform-actions/action@e0b9770014ba65d5e0815f15b74031c3a635f641 # v1.6.0
         with:
           operating_system: freebsd
           version: "15.1"

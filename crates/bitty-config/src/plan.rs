@@ -16,8 +16,8 @@ use crate::error::ConfigError;
 use crate::keymap::ModKey;
 use crate::types::{
     AppearanceConfig, CloseConfirm, DecorationConfig, FontConfig, KeymapEntry, LayoutConfig,
-    MouseConfig, PluginSpec, ScrollbarConfig, SelectionConfig, TerminalConfig, ViewOverride,
-    WindowConfig, WorkspaceConfig,
+    MouseConfig, PluginSpec, ScrollbarConfig, SelectionConfig, SessionConfig, TerminalConfig,
+    ViewOverride, WindowConfig, WorkspaceConfig,
 };
 
 /// Current schema version is owned by [`crate::migration`].
@@ -48,6 +48,9 @@ pub struct ConfigPlan {
     /// Default layout provider for new workspaces (CW-07
     /// `workspace.layout`; `None` means "this layer says nothing").
     pub workspace: Option<WorkspaceConfig>,
+    /// Session restore and persistence (CTX-0908 `session.restore_on_startup`).
+    /// `None` means "this layer says nothing".
+    pub session: Option<SessionConfig>,
     /// Core-owned workspace decoration (CTX-0292 `decoration.gaps_in`,
     /// `decoration.gaps_out`, `decoration.border`, `decoration.radius`).
     pub decoration: Option<DecorationConfig>,
@@ -286,6 +289,8 @@ impl ConfigPlan {
             && self.selection.is_none()
             && self.close_confirm.is_none()
             && self.layout.is_none()
+            && self.workspace.is_none()
+            && self.session.is_none()
             && self.decoration.is_none()
             && self.views.is_none()
             && self.scrollbar.is_none()

@@ -2262,6 +2262,21 @@ impl WorkspaceBarEdge {
     }
 }
 
+/// Session restore and persistence configuration (CTX-0908, issue #1442).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SessionConfig {
+    /// Whether to restore the previous session on startup
+    /// (`session.restore_on_startup`).
+    ///
+    /// When `Some(true)`, bitty restores windows, workspaces, terminals, and
+    /// layout from the last session. When `Some(false)` or `None`, bitty
+    /// starts with a clean window.
+    ///
+    /// Bypassed by `--safe`, `--headless`, or explicit layout/focus args.
+    /// Session saving on exit is unconditional for opt-back-in workflows.
+    pub restore_on_startup: Option<bool>,
+}
+
 impl WorkspaceConfig {
     /// Validate the provider name spelling (fail-closed).
     ///

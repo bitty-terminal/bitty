@@ -167,6 +167,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "base16ct"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8b59d472eab27ade8d770dcb11da7201c11234bef9f82ce7aa517be028d462b"
+
+[[package]]
 name = "base64"
 version = "0.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -242,8 +248,8 @@ version = "0.0.21"
 
 [[package]]
 name = "bitty-ipc"
-version = "0.1.0"
-source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=0bec791#0bec7910b62abe5b680217e60aa3c3fd57dba95e"
+version = "0.0.1"
+source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=6841646#68416463e78ea622d5b39567bca711dcddace385"
 dependencies = [
  "bitty-ipc-api",
  "bitty-ipc-auth",
@@ -254,13 +260,13 @@ dependencies = [
 
 [[package]]
 name = "bitty-ipc-api"
-version = "0.1.0"
-source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=0bec791#0bec7910b62abe5b680217e60aa3c3fd57dba95e"
+version = "0.0.1"
+source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=6841646#68416463e78ea622d5b39567bca711dcddace385"
 
 [[package]]
 name = "bitty-ipc-auth"
-version = "0.1.0"
-source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=0bec791#0bec7910b62abe5b680217e60aa3c3fd57dba95e"
+version = "0.0.1"
+source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=6841646#68416463e78ea622d5b39567bca711dcddace385"
 dependencies = [
  "bitty-ipc-api",
  "getrandom 0.4.3",
@@ -270,26 +276,31 @@ dependencies = [
 
 [[package]]
 name = "bitty-ipc-core"
-version = "0.1.0"
-source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=0bec791#0bec7910b62abe5b680217e60aa3c3fd57dba95e"
+version = "0.0.1"
+source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=6841646#68416463e78ea622d5b39567bca711dcddace385"
 dependencies = [
  "bitty-ipc-api",
 ]
 
 [[package]]
 name = "bitty-ipc-devtools"
-version = "0.1.0"
-source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=0bec791#0bec7910b62abe5b680217e60aa3c3fd57dba95e"
+version = "0.0.1"
+source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=6841646#68416463e78ea622d5b39567bca711dcddace385"
 dependencies = [
+ "base16ct",
  "bitty-ipc-api",
  "bitty-ipc-auth",
  "bitty-ipc-core",
+ "getrandom 0.4.3",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
 name = "bitty-ipc-mcp"
-version = "0.1.0"
-source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=0bec791#0bec7910b62abe5b680217e60aa3c3fd57dba95e"
+version = "0.0.1"
+source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=6841646#68416463e78ea622d5b39567bca711dcddace385"
 dependencies = [
  "bitty-ipc-api",
  "bitty-ipc-auth",
@@ -716,6 +727,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "const-oid"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
+
+[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -903,6 +920,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2"
 dependencies = [
  "block-buffer",
+ "const-oid",
  "crypto-common",
 ]
 
@@ -3159,6 +3177,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_json"
+version = "1.0.151"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
+dependencies = [
+ "itoa",
+ "memchr",
+ "serde",
+ "serde_core",
+ "zmij",
+]
+
+[[package]]
 name = "serial2"
 version = "0.2.38"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4665,6 +4696,12 @@ name = "zlib-rs"
 version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
+
+[[package]]
+name = "zmij"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zune-core"

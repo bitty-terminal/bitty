@@ -93,6 +93,10 @@ impl Parser {
     }
 
     /// Creates a parser with a custom IMG-1 payload cap.
+    ///
+    /// The cap bounds compressed (`f=100`, `o=`) and undeclared-size kitty
+    /// streams. Uncompressed raw `f=24`/`f=32` streams with an `s`/`v` claim
+    /// are bounded by their declared size under the decode caps instead.
     #[must_use]
     pub fn with_ledger_cap(ledger_cap: usize) -> Self {
         Self {
@@ -109,7 +113,8 @@ impl Parser {
         }
     }
 
-    /// Kitty payload cap in effect.
+    /// Kitty IMG-1 payload cap in effect for compressed or undeclared-size
+    /// streams.
     #[must_use]
     pub const fn ledger_cap(&self) -> usize {
         self.kitty.ledger_cap()

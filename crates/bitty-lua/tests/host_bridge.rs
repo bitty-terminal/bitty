@@ -1731,3 +1731,171 @@ fn many_short_commits_accumulate_past_the_credit_cap() {
         bitty_lua::STORE_COMMIT_CREDIT_MAX_MS
     );
 }
+
+/// Records which `bitty.debug` host entry points the bridge reached
+/// (CTX-0897), so binding-level validation and guard routing are observable.
+#[derive(Default)]
+struct DebugStub {
+    store: RefCell<BTreeMap<String, LuaValue>>,
+    trace_opts: RefCell<Vec<LuaValue>>,
+    trace_with_expiry_calls: std::cell::Cell<u32>,
+    control_with_expiry_calls: std::cell::Cell<u32>,
+}
+
+impl HostServices for DebugStub {
+    fn store_get(&self, key: &str) -> Result<Option<LuaValue>, BridgeError> {
+        Ok(self.store.borrow().get(key).cloned())
+    }
+
+    fn store_set(&self, key: &str, value: LuaValue) -> Result<(), BridgeError> {
+        self.store.borrow_mut().insert(key.to_string(), value);
+        Ok(())
+    }
+
+    fn settings_get(&self, _key: &str) -> Result<Option<LuaValue>, BridgeError> {
+        Ok(None)
+    }
+
+    fn terminal_snapshot(&self, _scope: &str) -> Result<LuaValue, BridgeError> {
+        Err(BridgeError::capability_denied("terminal.semantic-read"))
+    }
+
+    fn notify_show(&self, _payload: &LuaValue) -> Result<bool, BridgeError> {
+        Err(BridgeError::capability_denied("platform.notify"))
+    }
+
+    fn debug_trace(&self, opts: &LuaValue) -> Result<i64, BridgeError> {
+        self.trace_opts.borrow_mut().push(opts.clone());
+        Ok(1)
+    }
+
+    fn debug_trace_with_expiry(
+        &self,
+        opts: &LuaValue,
+        expiry: std::time::Instant,
+    ) -> Result<i64, BridgeError> {
+        self.trace_with_expiry_calls
+            .set(self.trace_with_expiry_calls.get() + 1);
+        if std::time::Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        self.debug_trace(opts)
+    }
+
+    fn debug_control_with_expiry(
+        &self,
+        action: &str,
+        target: &str,
+        expiry: std::time::Instant,
+    ) -> Result<LuaValue, BridgeError> {
+        self.control_with_expiry_calls
+            .set(self.control_with_expiry_calls.get() + 1);
+        if std::time::Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        self.debug_control(action, target)
+    }
+}
+
+fn debug_code(services: &Rc<DebugStub>, call: &str) -> LuaValue {
+    let mut vm = gate_vm("debug-binding");
+    let services_dyn: Rc<dyn HostServices> = services.clone();
+    vm.install_host_module(services_dyn, MarshallingLimits::default(), 50)
+        .expect("install");
+    services.store.borrow_mut().remove("code");
+    let chunk = format!(
+        r#"
+        local ok, err = pcall(function() return {call} end)
+        if ok then
+            bitty.store.set("code", "OK")
+        else
+            bitty.store.set("code", err.code)
+        end
+    "#
+    );
+    let outcome = vm.execute_bounded(&chunk).expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{call}: {outcome:?}"
+    );
+    services
+        .store
+        .borrow()
+        .get("code")
+        .cloned()
+        .expect("code recorded")
+}
+
+#[test]
+fn debug_trace_rejects_non_table_opts_before_host() {
+    let services = Rc::new(DebugStub::default());
+    for call in [
+        "bitty.debug.trace(\"terminal.*\")",
+        "bitty.debug.trace(1)",
+        "bitty.debug.trace(true)",
+        "bitty.debug.trace(function() end)",
+    ] {
+        assert_eq!(
+            debug_code(&services, call),
+            LuaValue::String("E_DEF_INVALID".to_string()),
+            "{call}"
+        );
+    }
+    assert_eq!(
+        services.trace_with_expiry_calls.get(),
+        0,
+        "rejected before reaching the host"
+    );
+    assert!(services.trace_opts.borrow().is_empty());
+}
+
+#[test]
+fn debug_trace_and_control_route_through_expiry_methods() {
+    let services = Rc::new(DebugStub::default());
+    assert_eq!(
+        debug_code(&services, "bitty.debug.trace(nil)"),
+        LuaValue::String("OK".to_string())
+    );
+    assert_eq!(
+        debug_code(&services, "bitty.debug.trace({ filter = \"a.*\" })"),
+        LuaValue::String("OK".to_string())
+    );
+    assert_eq!(services.trace_with_expiry_calls.get(), 2);
+    assert_eq!(services.trace_opts.borrow()[0], LuaValue::Nil);
+    assert_eq!(
+        services.trace_opts.borrow()[1].get("filter"),
+        Some(&LuaValue::String("a.*".to_string()))
+    );
+    // `debug_control` keeps its fail-closed default behind the expiry hook.
+    assert_eq!(
+        debug_code(&services, "bitty.debug.control(\"reload_plugin\", \"x.y\")"),
+        LuaValue::String("E_NOT_IMPLEMENTED".to_string())
+    );
+    assert_eq!(services.control_with_expiry_calls.get(), 1);
+}
+
+#[test]
+fn debug_defaults_fail_closed_without_backend() {
+    let services = Rc::new(FakeServices::default());
+    let mut vm = gate_vm("debug-defaults");
+    install(&mut vm, services.clone());
+    for (call, want) in [
+        ("bitty.debug.inspect(\"plugins\")", "E_NOT_IMPLEMENTED"),
+        ("bitty.debug.trace({})", "E_NOT_IMPLEMENTED"),
+        ("bitty.debug.trace_get(1)", "E_NOT_IMPLEMENTED"),
+        (
+            "bitty.debug.control(\"suspend_plugin\", \"x.y\")",
+            "E_NOT_IMPLEMENTED",
+        ),
+    ] {
+        assert_bridge_code(
+            &mut vm,
+            &services,
+            &format!(
+                "local ok, err = pcall(function() return {call} end)\n\
+                 bitty.store.set(\"code\", ok and \"OK\" or err.code)"
+            ),
+            want,
+        );
+    }
+}

@@ -23,10 +23,27 @@ diagram lives in `src/lib.rs`.
   `bitty-rich`; external git dependency: `bitty-ipc` (independent
   repository since CTX-1585), linked as Core's inbound local socket
   mechanism. Core links no agent crate: `bitty-agent` is an independent
-  repository with its own tests (CTX-0918). The only network-facing
-  dependency is the optional `bitty-network-lua` behind the non-default
-  `network` feature; that embedding is being retired in favor of
-  out-of-process components (tracked separately).
+  repository with its own tests (CTX-0918). Core links no network code:
+  the only crate taken from the bitty-network repository is
+  `bitty-network-wire` (exact-rev git pin), the dependency-free wire
+  protocol v1 codec the component broker speaks (CTX-0906, DIR-030).
+- Native components (`src/component/`): the broker resolves
+  `<data_home>/bitty/components/<name>/current` and the version's
+  `bitty-component.toml` (developer override `BITTY_COMPONENTS_DIR`; never
+  `PATH`), validates the descriptor and the executable's SHA-256 before
+  every spawn (fail closed), runs the component as a stdio coprocess with a
+  cleared environment plus a fixed allowlist, captures stderr into a 64 KiB
+  ring, completes the `Hello`/`HelloAck` handshake, multiplexes up to 64
+  requests by id, stops the process after 60 s idle (stdin close, 2 s
+  grace, then a kill of the recorded child only), and turns a crash into
+  `component_lost` for in-flight requests with a 1 s to 30 s restart
+  backoff (5 crashes in 5 minutes make it unavailable until restart). Every
+  request carries the plugin id and the grant computed from the granted
+  `network.connect:*` capabilities intersected with the manifest
+  `[[network.egress]]` entries. The Lua-facing request surface and process
+  sandboxing are follow-ups; nothing calls the broker from Lua yet. The
+  `bitty-component-fixture` binary is a hermetic test fixture only (never
+  packaged).
 - No Lua, config, or plugin code enters the hot path (see `src/lib.rs`).
 - The plugin side queue never holds hot-path objects: no GPU, window, or PTY
   handles and no Lua VM.

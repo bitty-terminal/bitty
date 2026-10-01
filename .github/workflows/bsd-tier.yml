@@ -52,16 +52,15 @@ jobs:
         with:
           operating_system: freebsd
           version: "15.1"
-          # The workspace build plus C dependencies (aws-lc-sys) needs room;
+          # The workspace build plus C dependencies needs room;
           # CPU count keeps the emulated guest from serializing the build.
           memory: 6G
           cpu_count: 8
 
-      # FreeBSD base ships clang and a C toolchain for the aws-lc-sys build
-      # script; cmake and pkgconf are needed by that build (aws-lc-sys) and by
-      # crossfont's pkg-config probes (fontconfig/FreeType). git + ca_root_nss
-      # let `cargo --locked` fetch the pinned bitty-network/phodopus git deps
-      # over TLS.
+      # FreeBSD base ships clang and a C toolchain for C build scripts; cmake
+      # and pkgconf are needed by crossfont's pkg-config probes
+      # (fontconfig/FreeType). git + ca_root_nss let `cargo --locked` fetch
+      # the pinned git dependencies over TLS.
       - name: Install FreeBSD build prerequisites
         run: |
           set -eux

@@ -31,15 +31,14 @@ entry and every entry needs a covering capability, so the consent surface and
 the grant always tell one story (mirrors the `process.spawn:<tool>` /
 `[tools.<tool>]` rule).
 
-The runtime half lives in `bitty-runtime`: `PluginRuntime` optionally owns one
-shared `bitty-network-lua::SharedNetworkRuntime` (set via `set_network_runtime`)
-and registers the `bitty.network` module only in a plugin VM whose activation
-grant includes a `network.connect*` capability. A granted plugin on a
-network-less host activates cleanly without the module; an ungranted plugin
-never sees it even when the host has a runtime. The module surface today is
-`bitty.network.echo` / `bitty.network.info` (test backends); real
-request/resolve operations await the external `bitty-network` backend
-(<https://github.com/bitty-terminal/bitty-network/blob/main/docs/lua-integration/design.md>).
+The runtime half lives in `bitty-runtime` (DIR-030, CTX-0906): Core links no
+network code. The component broker (`bitty_runtime::component`) computes the
+per-plugin grant from the granted `network.connect:*` capabilities intersected
+with these `[[network.egress]]` declarations (`PluginGrant::compute`) and
+attaches it, with the plugin id, to every request it forwards to the
+out-of-process `net` component (`bitty-net`), which re-checks the grant and
+never widens it. No Lua-facing network module is registered yet; the
+non-blocking request handle plus response event is a follow-up.
 
 ## Boundaries
 

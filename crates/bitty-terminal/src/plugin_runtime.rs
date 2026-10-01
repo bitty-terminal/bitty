@@ -246,14 +246,11 @@ pub(crate) fn store_root_for(xdg_data_home: Option<&str>, home: Option<&str>) ->
 }
 
 /// `$XDG_DATA_HOME` or `$HOME/.local/share` from explicit environment values.
+///
+/// Delegates to [`bitty_runtime::data_home_for`], the single resolver shared
+/// with the native component root (DIR-030).
 pub(crate) fn data_home_for(xdg_data_home: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
-    if let Some(xdg) = xdg_data_home {
-        if !xdg.trim().is_empty() {
-            return Some(PathBuf::from(xdg));
-        }
-    }
-    home.filter(|home| !home.trim().is_empty())
-        .map(|home| PathBuf::from(home).join(".local").join("share"))
+    bitty_runtime::data_home_for(xdg_data_home, home)
 }
 
 /// `$XDG_DATA_HOME` or `$HOME/.local/share`.

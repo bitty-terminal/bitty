@@ -135,82 +135,114 @@ pub fn classify_field(field: &str) -> ReloadClass {
     // RFC-0001/OQ-041 (CTX-0343): value edits and selector match-set changes
     // in `views.*` are both Live; a selector edit re-resolves the affected
     // View set without recreating a View or Terminal.
-    if field == "views" || field.starts_with("views[") {
+    if field.starts_with(VIEWS_FIELD_PREFIX) {
         return ReloadClass::Live;
     }
-    match field {
-        "font.family"
-        | "font.size"
-        | "font.line_height"
-        | "font.letter_spacing"
-        | "font"
-        | "window.opacity"
-        | "window.padding"
-        | "window.radius_px"
-        | "window"
-        | "decoration.gaps_in"
-        | "decoration.gaps_out"
-        | "decoration.border"
-        | "decoration.radius"
-        | "decoration.content_inset"
-        | "decoration.border_color"
-        | "decoration.border_color_focused"
-        | "decoration.border_color_idle"
-        | "decoration.border_width"
-        | "decoration.border_width_focused"
-        | "decoration.border_width_idle"
-        | "decoration.background_image"
-        | "decoration.background_fit"
-        | "decoration.background_image_roots"
-        | "decoration"
-        | "appearance.theme"
-        | "appearance.colors"
-        | "appearance.animations.enabled"
-        | "appearance.animations.reduced_motion"
-        | "appearance.animations.duration_ms.open"
-        | "appearance.animations.duration_ms.close"
-        | "appearance.animations.duration_ms.focus"
-        | "appearance.animations.duration_ms.workspace"
-        | "appearance.animations.easing.open"
-        | "appearance.animations.easing.close"
-        | "appearance.animations.easing.focus"
-        | "appearance.animations.easing.workspace"
-        | "appearance.animations"
-        | "appearance"
-        | "mod_key"
-        | "leader_key"
-        | "leader_timeout_ms"
-        | "hints_enabled"
-        | "keymaps"
-        // CTX-0873: the bar band is presentation chrome; the runtime
-        // re-solves the band and reflows in place (no PTY recreation).
-        | "workspace.show_bar"
-        | "workspace.bar.edge" => ReloadClass::Live,
-        "terminal.scrollback"
-        | "terminal.shell"
-        | "terminal.scroll_lines_per_notch"
-        | "terminal.scroll_pixels_per_notch"
-        | "terminal.cursor_style"
-        | "terminal.bell"
-        | "terminal"
-        | "selection.auto_copy"
-        | "selection"
-        | "close_confirm"
-        | "layout.gaps_in"
-        | "layout.gaps_out"
-        | "layout"
-        | "workspace.layout"
-        | "workspace"
-        | "scrollbar.mode"
-        | "scrollbar.width"
-        | "scrollbar"
-        | "mouse.focus_follows_mouse"
-        | "mouse.focus_follows_mouse_delay_ms"
-        | "mouse"
-        | "plugins" => ReloadClass::RestartRequired,
-        _ => ReloadClass::Rejected,
+    if LIVE_FIELDS.contains(&field) || LIVE_SECTIONS.contains(&field) {
+        ReloadClass::Live
+    } else if RESTART_REQUIRED_FIELDS.contains(&field) || RESTART_REQUIRED_SECTIONS.contains(&field)
+    {
+        ReloadClass::RestartRequired
+    } else {
+        ReloadClass::Rejected
     }
 }
+
+/// Prefix of the per-selector `views[<selector>]` diff paths (CTX-0343);
+/// every such path classifies Live.
+pub const VIEWS_FIELD_PREFIX: &str = "views[";
+
+/// Every Live-class leaf path (CTX-0898, #1522).
+///
+/// Single source of truth: [`classify_field`] reads this list, and live
+/// reload adopters iterate it to prove each Live leaf has an adopter.
+/// `views` is the bare table key; per-selector paths match
+/// [`VIEWS_FIELD_PREFIX`].
+pub const LIVE_FIELDS: &[&str] = &[
+    "font.family",
+    "font.size",
+    "font.line_height",
+    "font.letter_spacing",
+    "window.opacity",
+    "window.padding",
+    "window.radius_px",
+    "decoration.gaps_in",
+    "decoration.gaps_out",
+    "decoration.border",
+    "decoration.radius",
+    "decoration.content_inset",
+    "decoration.border_color",
+    "decoration.border_color_focused",
+    "decoration.border_color_idle",
+    "decoration.border_width",
+    "decoration.border_width_focused",
+    "decoration.border_width_idle",
+    "decoration.background_image",
+    "decoration.background_fit",
+    "decoration.background_image_roots",
+    "appearance.theme",
+    "appearance.colors",
+    "appearance.animations.enabled",
+    "appearance.animations.reduced_motion",
+    "appearance.animations.duration_ms.open",
+    "appearance.animations.duration_ms.close",
+    "appearance.animations.duration_ms.focus",
+    "appearance.animations.duration_ms.workspace",
+    "appearance.animations.easing.open",
+    "appearance.animations.easing.close",
+    "appearance.animations.easing.focus",
+    "appearance.animations.easing.workspace",
+    "mod_key",
+    "leader_key",
+    "leader_timeout_ms",
+    "hints_enabled",
+    "keymaps",
+    // CTX-0873: the bar band is presentation chrome; the runtime re-solves
+    // the band and reflows in place (no PTY recreation).
+    "workspace.show_bar",
+    "workspace.bar.edge",
+    "views",
+];
+
+/// Section keys whose whole table classifies Live (no leaf is diffed under
+/// these names; they classify a section-level edit).
+pub const LIVE_SECTIONS: &[&str] = &[
+    "font",
+    "window",
+    "decoration",
+    "appearance.animations",
+    "appearance",
+];
+
+/// Every RestartRequired-class leaf path.
+pub const RESTART_REQUIRED_FIELDS: &[&str] = &[
+    "terminal.scrollback",
+    "terminal.shell",
+    "terminal.scroll_lines_per_notch",
+    "terminal.scroll_pixels_per_notch",
+    "terminal.cursor_style",
+    "terminal.bell",
+    "selection.auto_copy",
+    "close_confirm",
+    "layout.gaps_in",
+    "layout.gaps_out",
+    "workspace.layout",
+    "scrollbar.mode",
+    "scrollbar.width",
+    "mouse.focus_follows_mouse",
+    "mouse.focus_follows_mouse_delay_ms",
+    "plugins",
+];
+
+/// Section keys whose whole table classifies RestartRequired.
+pub const RESTART_REQUIRED_SECTIONS: &[&str] = &[
+    "terminal",
+    "selection",
+    "layout",
+    "workspace",
+    "scrollbar",
+    "mouse",
+];
 
 /// A single field diff between two effective configs.
 #[derive(Debug, Clone, PartialEq, Eq)]

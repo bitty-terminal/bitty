@@ -42,7 +42,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reload back as `apply-error`. The reload diff now reports the three global
   `decoration.background_*` leaves; before this change a background-only edit
   was reported as `unchanged`. No `Live` field is left in the reply's
-  `restart_required` list.
+  `restart_required` list. The theme, outline colors, and outline ring widths
+  are installed before the per-View contrast check, so `views` rules are
+  judged against the outline the same reload adopts. A rollback swaps the
+  previously decoded background store back instead of re-reading images from
+  disk. A keymap change also cancels an armed Leader/hint session. A theme
+  reload refreshes the window title. Font family, size, and spacing adopt in
+  one atlas rebuild. `bitty-config` now exports the `LIVE_FIELDS` /
+  `RESTART_REQUIRED_FIELDS` lists that drive `classify_field`.
 - **Live configuration reload (CTX-0814, #1397):** `reconcile_live` now has a
   production caller. The composition root installs a reload context at startup
   (skipped under `--safe`), and both `bitty ctl config reload` and an automatic

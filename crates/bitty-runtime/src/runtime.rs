@@ -946,6 +946,11 @@ pub struct Runtime {
     /// Scaled-background-blit cache across present frames (CTX-0347),
     /// keyed by source identity + fit + destination rect + DPI.
     background_rasters: bitty_rich::BackgroundRasterCache,
+    /// The background state a live reload replaced (CTX-0898), kept until
+    /// the reload commits so a rollback swaps it back instead of re-reading
+    /// and re-decoding every image from disk. At most one generation is
+    /// retained; [`Runtime::release_retained_backgrounds`] drops it.
+    retained_backgrounds: Option<background_images::RetainedBackgrounds>,
 }
 
 /// Opaque, runtime-issued proof of a platform input gesture.
@@ -1390,6 +1395,7 @@ impl Runtime {
             backgrounds: bitty_rich::BackgroundStore::deny_all(),
             background_keys: std::collections::HashMap::new(),
             background_rasters: bitty_rich::BackgroundRasterCache::new(),
+            retained_backgrounds: None,
             workspaces: Vec::new(),
             active_workspace: 0,
             workspace_mru: std::collections::VecDeque::new(),
@@ -1605,6 +1611,7 @@ impl Runtime {
             backgrounds: bitty_rich::BackgroundStore::deny_all(),
             background_keys: std::collections::HashMap::new(),
             background_rasters: bitty_rich::BackgroundRasterCache::new(),
+            retained_backgrounds: None,
             workspaces: Vec::new(),
             active_workspace: 0,
             workspace_mru: std::collections::VecDeque::new(),

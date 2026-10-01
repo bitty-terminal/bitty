@@ -87,6 +87,26 @@ pub fn validate_background_images(config: &RuntimeConfig) -> Result<(), RuntimeE
     Ok(())
 }
 
+/// The config-side background/views fields one live adopt swaps as a unit
+/// (CTX-0898).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BackgroundFields {
+    view_appearance: Vec<crate::config::ViewAppearanceRule>,
+    background_image: Option<String>,
+    background_fit: String,
+    background_image_roots: Vec<String>,
+}
+
+/// One retained background generation (CTX-0898): the fields plus the
+/// decoded store and key map they produced, so a rollback restores them
+/// without touching the filesystem.
+#[derive(Debug)]
+pub(crate) struct RetainedBackgrounds {
+    fields: BackgroundFields,
+    store: bitty_rich::BackgroundStore,
+    keys: std::collections::HashMap<String, bitty_rich::BackgroundKey>,
+}
+
 impl Runtime {
     /// Number of decoded background images resident (headless-observable).
     #[must_use]
@@ -161,30 +181,70 @@ impl Runtime {
         background_fit: String,
         background_image_roots: Vec<String>,
     ) -> Result<(), RuntimeError> {
-        if self.config.view_appearance == view_appearance
-            && self.config.background_image == background_image
-            && self.config.background_fit == background_fit
-            && self.config.background_image_roots == background_image_roots
-        {
+        let requested = BackgroundFields {
+            view_appearance,
+            background_image,
+            background_fit,
+            background_image_roots,
+        };
+        if self.background_fields() == requested {
             return Ok(());
         }
         let mut candidate = self.config.clone();
-        candidate.view_appearance = view_appearance;
-        candidate.background_image = background_image;
-        candidate.background_fit = background_fit;
-        candidate.background_image_roots = background_image_roots;
+        candidate.view_appearance = requested.view_appearance.clone();
+        candidate.background_image = requested.background_image.clone();
+        candidate.background_fit = requested.background_fit.clone();
+        candidate.background_image_roots = requested.background_image_roots.clone();
         candidate.validate()?;
         self.validate_existing_views_against(&candidate)?;
-        let (store, keys) = build_background_state(&candidate)?;
-        self.config.view_appearance = candidate.view_appearance;
-        self.config.background_image = candidate.background_image;
-        self.config.background_fit = candidate.background_fit;
-        self.config.background_image_roots = candidate.background_image_roots;
-        self.backgrounds = store;
-        self.background_keys = keys;
+        // Rollback fast path: the request is exactly the generation the last
+        // adopt replaced, so swap the retained decoded store back instead of
+        // re-reading every image (which may have changed or vanished).
+        let (store, keys) = match self.retained_backgrounds.take() {
+            Some(retained) if retained.fields == requested => (retained.store, retained.keys),
+            other => {
+                self.retained_backgrounds = other;
+                build_background_state(&candidate)?
+            }
+        };
+        let previous = RetainedBackgrounds {
+            fields: self.background_fields(),
+            store: std::mem::replace(&mut self.backgrounds, store),
+            keys: std::mem::replace(&mut self.background_keys, keys),
+        };
+        self.retained_backgrounds = Some(previous);
+        self.config.view_appearance = requested.view_appearance;
+        self.config.background_image = requested.background_image;
+        self.config.background_fit = requested.background_fit;
+        self.config.background_image_roots = requested.background_image_roots;
         self.background_rasters = bitty_rich::BackgroundRasterCache::new();
         self.pending_full_redraw = true;
         Ok(())
+    }
+
+    /// Drops the background generation retained for rollback (CTX-0898).
+    ///
+    /// The reload path calls this once a reload has committed (or finished
+    /// rolling back), so at most one extra decoded generation is resident and
+    /// only for the duration of one reload.
+    pub fn release_retained_backgrounds(&mut self) {
+        self.retained_backgrounds = None;
+    }
+
+    /// Whether a replaced background generation is retained for rollback.
+    #[must_use]
+    pub fn has_retained_backgrounds(&self) -> bool {
+        self.retained_backgrounds.is_some()
+    }
+
+    /// The live background/views fields as one comparable unit.
+    fn background_fields(&self) -> BackgroundFields {
+        BackgroundFields {
+            view_appearance: self.config.view_appearance.clone(),
+            background_image: self.config.background_image.clone(),
+            background_fit: self.config.background_fit.clone(),
+            background_image_roots: self.config.background_image_roots.clone(),
+        }
     }
 
     /// RFC-0001 AC-1/AC-2 check of `candidate`'s outline resolution for every

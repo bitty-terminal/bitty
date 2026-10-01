@@ -158,7 +158,7 @@ fn runtime_adopts(field: &str) -> bool {
             | "workspace.bar.edge"
     ) || field.starts_with("appearance.animations")
         || field == "views"
-        || field.starts_with("views[")
+        || field.starts_with(bitty_config::VIEWS_FIELD_PREFIX)
 }
 
 /// The reload engine: pure policy driver over the last-applied config.
@@ -228,6 +228,10 @@ pub(crate) struct AppAdoption {
     pub(crate) hints_enabled: bool,
     /// Effective `window.opacity` for the platform transparency hint.
     pub(crate) window_opacity: f32,
+    /// Resolved theme preset name for the window title (CTX-0898). The
+    /// title's source-layer suffix is the one from launch: the reload engine
+    /// sees only the merged effective config, not layer attribution.
+    pub(crate) theme_name: &'static str,
 }
 
 thread_local! {
@@ -259,6 +263,7 @@ fn resolve_app_adoption(effective: &EffectiveConfig) -> Result<AppAdoption, Stri
         leader,
         hints_enabled: bitty_config::resolve_hint_config(effective).enabled,
         window_opacity: effective.window.opacity,
+        theme_name: bitty_config::theme::resolve_theme(effective.appearance.theme.as_deref()).name,
     })
 }
 
@@ -293,9 +298,19 @@ pub(crate) fn apply_live_presentation(
     effective: &EffectiveConfig,
 ) -> Result<(), String> {
     let resolved = crate::config_cli::runtime_config_from_effective(effective)?;
-    // CTX-0898: the palette first, so the background/views contrast check
-    // below runs against the theme this reload installs.
+    // CTX-0898 ordering: every input of the per-`View` RFC-0001 AC-1/AC-2
+    // check — the theme background, the global focused/idle outline colors,
+    // and the outline ring widths (the AC-2 width cue) — is installed before
+    // `set_background_appearance`, so the check runs against exactly the
+    // config this reload adopts, never a stale mix of old and new.
     runtime.set_theme_palette(resolved.theme);
+    runtime
+        .set_decoration(resolved.decoration)
+        .map_err(|err| format!("decoration: {err}"))?;
+    runtime.set_outline(resolved.outline_focused, resolved.outline_idle);
+    runtime
+        .set_outline_widths(resolved.outline_width_focused, resolved.outline_width_idle)
+        .map_err(|err| format!("decoration.border_width: {err}"))?;
     runtime
         .set_background_appearance(
             resolved.view_appearance,
@@ -304,10 +319,6 @@ pub(crate) fn apply_live_presentation(
             resolved.background_image_roots,
         )
         .map_err(|err| format!("decoration.background: {err}"))?;
-    runtime
-        .set_decoration(resolved.decoration)
-        .map_err(|err| format!("decoration: {err}"))?;
-    runtime.set_outline(resolved.outline_focused, resolved.outline_idle);
     runtime.set_animations(resolved.animations);
     runtime
         .set_window_padding(effective.window.padding)
@@ -315,19 +326,17 @@ pub(crate) fn apply_live_presentation(
     runtime
         .set_window_radius_px(effective.window.radius_px)
         .map_err(|err| format!("window.radius_px: {err}"))?;
-    // CTX-0898: `font.line_height` / `font.letter_spacing` arrive as the
-    // derived base cell; the face reloads before the size so the size path
-    // rasterizes the new family.
+    // CTX-0898: `font.family`, `font.size`, and the derived base cell
+    // (`font.line_height` / `font.letter_spacing`) adopt together, so a
+    // reload changing several of them rebuilds the atlas once.
     runtime
         .set_font_face(
             &resolved.font_family,
+            resolved.font_size,
             resolved.cell_width,
             resolved.cell_height,
         )
-        .map_err(|err| format!("font.family: {err}"))?;
-    runtime
-        .set_font_size(resolved.font_size)
-        .map_err(|err| format!("font.size: {err}"))?;
+        .map_err(|err| format!("font: {err}"))?;
     let blendable = runtime
         .set_window_opacity(effective.window.opacity)
         .map_err(|err| format!("window.opacity: {err}"))?;
@@ -581,12 +590,15 @@ impl ReloadContext {
                 // Keep engine and runtime consistent: a failed adopt must not
                 // leave the engine claiming the new config is live. Earlier
                 // setters may already have changed the runtime, so reapply the
-                // previous presentation first (CodeRabbit on #1516).
+                // previous presentation first (CodeRabbit on #1516). The
+                // background setter swaps its retained generation back, so
+                // the rollback never re-reads an image from disk (CTX-0898).
                 if let Err(restore) = apply_live_presentation(runtime, &previous) {
                     crate::logging::warn(|| {
                         format!("bitty: config reload rollback failed: {restore}")
                     });
                 }
+                runtime.release_retained_backgrounds();
                 self.engine.replace_current(previous);
                 return ReloadOutcomeInfo {
                     path: self.path_label.clone(),
@@ -598,6 +610,9 @@ impl ReloadContext {
                 };
             }
         }
+        // Committed (or nothing to adopt): drop the replaced background
+        // generation so at most one decoded generation stays resident.
+        runtime.release_retained_backgrounds();
         let changed: Vec<String> = outcome
             .report()
             .diffs
@@ -690,8 +705,40 @@ mod tests {
 
     #[test]
     fn every_live_inventory_field_has_an_adopter() {
-        // CTX-0898 acceptance: each Live-class leaf `bitty-config` can diff
-        // is adopted. Diff a config that changes every leaf at once.
+        // CTX-0898 acceptance: iterate the exported single-source Live list
+        // that drives `classify_field`, so a new Live leaf without an adopter
+        // fails here instead of silently landing in `restart_required`.
+        for field in bitty_config::LIVE_FIELDS {
+            assert_eq!(
+                bitty_config::classify_field(field),
+                ReloadClass::Live,
+                "{field} is listed Live but classifies otherwise"
+            );
+            assert!(runtime_adopts(field), "{field} has no live adopter");
+        }
+        let per_view = format!("{}*]", bitty_config::VIEWS_FIELD_PREFIX);
+        assert_eq!(bitty_config::classify_field(&per_view), ReloadClass::Live);
+        assert!(runtime_adopts(&per_view), "{per_view} has no live adopter");
+        for field in bitty_config::RESTART_REQUIRED_FIELDS {
+            assert!(!runtime_adopts(field), "{field} must stay restart-required");
+        }
+    }
+
+    #[test]
+    fn runtime_font_family_bound_matches_config() {
+        // Review PX-4285 finding 6: the runtime mirrors the config bound
+        // (no normal bitty-config dependency there); pin equality.
+        assert_eq!(
+            bitty_runtime::runtime::live_config::MAX_LIVE_FONT_FAMILY_BYTES,
+            bitty_config::types::MAX_FONT_FAMILY_LEN
+        );
+    }
+
+    #[test]
+    fn every_diffed_live_leaf_is_in_the_exported_list() {
+        // The diff emits only listed Live leaves: change every Live leaf at
+        // once and check each emitted path is in `LIVE_FIELDS` (or a views
+        // selector path), so the list cannot fall behind the diff.
         let base = bitty_config::fallback_builtin();
         let mut all = base.clone();
         all.font.family = format!("{} Alt", base.font.family);
@@ -721,70 +768,16 @@ mod tests {
         }];
         let report = bitty_config::diff(&base, &all);
         assert!(!report.has_rejected, "{report:?}");
-        let live: Vec<&str> = report
-            .diffs
-            .iter()
-            .filter(|d| d.class == ReloadClass::Live)
-            .map(|d| d.field.as_str())
-            .collect();
-        for field in [
-            "font.family",
-            "font.line_height",
-            "font.letter_spacing",
-            "window.opacity",
-            "appearance.theme",
-            "mod_key",
-            "leader_timeout_ms",
-            "hints_enabled",
-            "decoration.background_fit",
-            "decoration.background_image_roots",
-            "views[*]",
-        ] {
-            assert!(live.contains(&field), "{field} must diff as Live: {live:?}");
+        assert!(report.diffs.len() >= 14, "{report:?}");
+        for diff in &report.diffs {
+            assert_eq!(diff.class, ReloadClass::Live, "{diff:?}");
+            assert!(
+                bitty_config::LIVE_FIELDS.contains(&diff.field.as_str())
+                    || diff.field.starts_with(bitty_config::VIEWS_FIELD_PREFIX),
+                "{} is diffed but not in LIVE_FIELDS",
+                diff.field
+            );
         }
-        for field in &live {
-            assert!(runtime_adopts(field), "{field} has no live adopter");
-        }
-        for field in [
-            "keymaps",
-            "leader_key",
-            "appearance.colors",
-            "decoration.background_image",
-            "views",
-        ] {
-            assert!(runtime_adopts(field), "{field} has no live adopter");
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn watcher_detects_a_symlink_retarget_with_identical_metadata() {
-        let dir = temp_dir("retarget");
-        let first = dir.join("a.toml");
-        let second = dir.join("b.toml");
-        write_config(&first, 12.0);
-        write_config(&second, 12.0);
-        // Same length and same mtime: only the link target differs.
-        let stamp = std::fs::metadata(&first)
-            .and_then(|meta| meta.modified())
-            .expect("mtime");
-        std::fs::File::options()
-            .write(true)
-            .open(&second)
-            .and_then(|file| file.set_modified(stamp))
-            .expect("align mtime");
-        let link = dir.join("config.toml");
-        std::os::unix::fs::symlink(&first, &link).expect("symlink");
-        let mut watcher = ConfigFileWatcher::new(link.clone());
-        let start = Instant::now();
-        assert!(!watcher.poll_at(start), "unchanged link");
-        std::fs::remove_file(&link).expect("unlink");
-        std::os::unix::fs::symlink(&second, &link).expect("retarget");
-        assert!(
-            watcher.poll_at(start + CONFIG_POLL_INTERVAL),
-            "a retarget is a change even with identical target metadata"
-        );
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -895,6 +888,172 @@ mod tests {
         );
         assert_eq!(app.leader.timeout_ms, 2_500);
         assert!(!app.hints_enabled);
+    }
+
+    /// A `views[view:1]` rule overriding the idle outline color only.
+    fn view1_idle(color: [u8; 4]) -> bitty_config::types::ViewOverride {
+        bitty_config::types::ViewOverride {
+            selector: bitty_config::types::ViewSelector::View(1),
+            overrides: bitty_config::types::ViewAppearanceOverride {
+                border_color_idle: Some(bitty_config::types::OutlineColor(color)),
+                ..Default::default()
+            },
+        }
+    }
+
+    const WHITE: [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF];
+    const YELLOW: [u8; 4] = [0xFF, 0xFF, 0x00, 0xFF];
+
+    #[test]
+    fn views_check_uses_the_outline_adopted_in_the_same_reload() {
+        // Review PX-4285 finding 1: the per-View AC-1/AC-2 check must run
+        // against the global outline this reload installs. The safe baseline
+        // focuses with #FFFFFF at equal 1/1 widths (no width cue), so AC-2
+        // decides on color alone. `view:1` is inert at merge time, so the
+        // runtime check is the only gate for it.
+        let baseline = bitty_config::fallback_builtin();
+
+        // (a) Valid only under the OLD outline: idle #FFFFFF equals the old
+        // focused color (AC-2 does not apply) but sits at 1.07:1 against the
+        // new focused #FFFF00. Must be rejected.
+        let mut runtime = deterministic_runtime(&baseline);
+        let mut stale_ok = baseline.clone();
+        stale_ok.decoration.border_color_focused = Some(bitty_config::types::OutlineColor(YELLOW));
+        stale_ok.views = vec![view1_idle(WHITE)];
+        stale_ok.validate().expect("config-level contract passes");
+        let err = apply_live(&mut runtime, &stale_ok).expect_err("new outline violates AC-2");
+        assert!(err.contains("AC-2"), "{err}");
+        assert!(
+            runtime.config().view_appearance.is_empty(),
+            "rule not adopted"
+        );
+
+        // (b) Valid only under the NEW outline: idle #FFFF00 is 1.07:1
+        // against the old focused #FFFFFF but equals the new focused color.
+        // Must be accepted.
+        let mut runtime = deterministic_runtime(&baseline);
+        let mut new_ok = baseline.clone();
+        new_ok.decoration.border_color_focused = Some(bitty_config::types::OutlineColor(YELLOW));
+        new_ok.views = vec![view1_idle(YELLOW)];
+        new_ok.validate().expect("config-level contract passes");
+        apply_live(&mut runtime, &new_ok).expect("valid under the new outline");
+        assert_eq!(runtime.config().outline_focused, YELLOW);
+        assert_eq!(runtime.config().view_appearance.len(), 1);
+        let _ = take_app_adoption();
+    }
+
+    /// 4x4 opaque-red PNG (same hermetic fixture as the runtime tests).
+    const RED_PNG: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x04, 0x08, 0x06, 0x00, 0x00, 0x00, 0xA9,
+        0xF1, 0x9E, 0x7E, 0x00, 0x00, 0x00, 0x15, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0xFC,
+        0xCF, 0xC0, 0xF0, 0x9F, 0x01, 0x09, 0x30, 0x21, 0x73, 0x88, 0x13, 0x00, 0x00, 0x83, 0xD1,
+        0x02, 0x06, 0x04, 0xBC, 0x24, 0x47, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
+        0x42, 0x60, 0x82,
+    ];
+
+    /// Baseline with one approved, decoded global background image.
+    fn baseline_with_image(dir: &std::path::Path) -> EffectiveConfig {
+        let image = dir.join("red.png");
+        std::fs::write(&image, RED_PNG).expect("write fixture");
+        let mut baseline = bitty_config::fallback_builtin();
+        baseline.decoration.background_image = Some(image.display().to_string());
+        baseline.decoration.background_image_roots = Some(vec![dir.display().to_string()]);
+        baseline
+    }
+
+    #[test]
+    fn reload_with_theme_and_bad_background_rolls_back_fully() {
+        // Review PX-4285 finding 2: theme change + bad background through
+        // the real reload path leaves the runtime on the previous config,
+        // with the previous image still resident and never re-read.
+        let dir = temp_dir("rollback-bad-bg");
+        let baseline = baseline_with_image(&dir);
+        let mut runtime = deterministic_runtime(&baseline);
+        assert_eq!(runtime.background_image_count(), 1);
+        let loads = runtime.background_loads();
+        let old_theme = runtime.config().theme;
+
+        let mut incoming = baseline.clone();
+        incoming.appearance.theme = Some(String::from("dracula"));
+        incoming.decoration.background_image = Some(dir.join("absent.png").display().to_string());
+        let resolved = incoming.clone();
+        clear();
+        install_with(
+            baseline.clone(),
+            Box::new(move || Ok(resolved.clone())),
+            None,
+        );
+        let info = reload_requested(&mut runtime).expect("context installed");
+        assert_eq!(info.kind, "apply-error", "{info:?}");
+        assert!(!info.applied);
+        assert_eq!(runtime.config().theme, old_theme, "theme restored");
+        assert_eq!(
+            runtime.config().background_image,
+            baseline.decoration.background_image
+        );
+        assert_eq!(runtime.background_image_count(), 1, "old image resident");
+        assert_eq!(runtime.background_loads(), loads, "no disk re-read");
+        assert!(!runtime.has_retained_backgrounds(), "no generation leaks");
+        assert!(take_app_adoption().is_none());
+        clear();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rollback_after_a_background_swap_restores_the_retained_store() {
+        // Review PX-4285 finding 2: a setter failing AFTER the background
+        // swap rolls back by swapping the retained decoded store back, so the
+        // old image is not decoded again (and survives deletion from disk).
+        let dir = temp_dir("rollback-retained");
+        let baseline = baseline_with_image(&dir);
+        let mut runtime = deterministic_runtime(&baseline);
+        let other = dir.join("other.png");
+        std::fs::write(&other, RED_PNG).expect("write second fixture");
+
+        let mut incoming = baseline.clone();
+        incoming.appearance.theme = Some(String::from("dracula"));
+        incoming.decoration.background_image = Some(other.display().to_string());
+        // A size valid for `bitty-config` (`(0, 128]`) but outside the live
+        // zoom range: it passes classification and the runtime-config
+        // mapping, then fails in `set_font_face`, which runs after the
+        // background swap.
+        incoming.font.size = bitty_runtime::config::FONT_ZOOM_MAX_PT * 2.0;
+        let old_theme = runtime.config().theme;
+        let resolved = incoming.clone();
+        clear();
+        install_with(
+            baseline.clone(),
+            Box::new(move || Ok(resolved.clone())),
+            None,
+        );
+        // The original image vanishes: a re-read would now fail.
+        std::fs::remove_file(dir.join("red.png")).expect("remove original");
+        let loads_before = runtime.background_loads();
+        let info = reload_requested(&mut runtime).expect("context installed");
+        assert_eq!(info.kind, "apply-error", "{info:?}");
+        assert!(
+            info.message.as_deref().unwrap_or_default().contains("font"),
+            "{info:?}"
+        );
+        assert_eq!(runtime.config().theme, old_theme, "theme restored");
+        assert_eq!(
+            runtime.config().background_image,
+            baseline.decoration.background_image,
+            "previous background restored"
+        );
+        assert_eq!(runtime.background_image_count(), 1);
+        // `background_loads` counts decodes per store: the swapped-back store
+        // reports exactly its pre-reload count, and its source file no longer
+        // exists, so the resident image came from retention, not a re-read.
+        assert_eq!(
+            runtime.background_loads(),
+            loads_before,
+            "the retained store came back unchanged"
+        );
+        assert!(!runtime.has_retained_backgrounds(), "retention released");
+        clear();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

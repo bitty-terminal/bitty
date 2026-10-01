@@ -5362,6 +5362,7 @@ fn live_reload_adopts_keymaps_leader_hints_and_opacity_on_the_app() {
         leader: leader.clone(),
         hints_enabled: false,
         window_opacity: 0.6,
+        theme_name: bitty_config::theme::DEFAULT_THEME_NAME,
     });
     assert_eq!(app.chrome.keymaps, keymaps);
     assert_ne!(app.chrome.keymaps, maps, "mod_key rebound the table");
@@ -5374,4 +5375,89 @@ fn live_reload_adopts_keymaps_leader_hints_and_opacity_on_the_app() {
         "a stale armed Leader window is cancelled"
     );
     assert!((app.window.opacity - 0.6).abs() < f32::EPSILON);
+}
+
+fn adoption_from(effective: &bitty_config::EffectiveConfig) -> crate::config_reload::AppAdoption {
+    crate::config_reload::AppAdoption {
+        keymaps: bitty_config::resolve_keymaps(effective).expect("keymaps"),
+        leader: bitty_config::resolve_leader_for(effective, bitty_config::LeaderPlatform::host())
+            .expect("leader"),
+        hints_enabled: bitty_config::resolve_hint_config(effective).enabled,
+        window_opacity: effective.window.opacity,
+        theme_name: bitty_config::theme::resolve_theme(effective.appearance.theme.as_deref()).name,
+    }
+}
+
+#[test]
+fn live_reload_keymap_change_alone_cancels_an_armed_leader() {
+    // Review PX-4285 finding 3: a keymaps-only change (same Leader, hints
+    // still on) must also cancel an armed Leader window, since its
+    // follow-up chord resolves against the new table.
+    let base = bitty_config::EffectiveConfig::default();
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        bitty_config::resolve_keymaps(&base).expect("defaults"),
+        SpawnSpec::default(),
+    );
+    // Unchanged adoption keeps an armed window.
+    app.chrome.leader_state = bitty_config::LeaderState::Armed { deadline_ms: 0 };
+    app.adopt_live_config(adoption_from(&base));
+    assert_ne!(app.chrome.leader_state, bitty_config::LeaderState::Idle);
+
+    let mut edited = base.clone();
+    edited.mod_key = bitty_config::ModKey::Super;
+    let adoption = adoption_from(&edited);
+    assert_eq!(adoption.leader, app.chrome.leader, "Leader unchanged");
+    assert!(adoption.hints_enabled, "hints unchanged");
+    app.adopt_live_config(adoption);
+    assert_eq!(app.chrome.leader_state, bitty_config::LeaderState::Idle);
+    assert!(!app.runtime.cw_hint_is_armed());
+}
+
+#[test]
+fn live_reload_theme_change_refreshes_the_window_title() {
+    // Review PX-4285 finding 7: the base title tracks the reloaded preset
+    // and keeps the launch source label; an OSC-set title is not clobbered.
+    let base = bitty_config::EffectiveConfig::default();
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "file",
+        bitty_config::resolve_keymaps(&base).expect("defaults"),
+        SpawnSpec::default(),
+    );
+    let titles = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    app.set_os_title_sink(Box::new(RecordingTitleSink {
+        titles: std::sync::Arc::clone(&titles),
+    }));
+    let mut edited = base.clone();
+    edited.appearance.theme = Some(String::from("dracula"));
+    app.adopt_live_config(adoption_from(&edited));
+    let expected = window_title_for_theme("dracula", "file");
+    assert_eq!(app.window.title, expected);
+    assert_eq!(*titles.lock().expect("poison-free"), vec![expected.clone()]);
+    // Unchanged theme: no second OS call.
+    app.adopt_live_config(adoption_from(&edited));
+    assert_eq!(titles.lock().expect("poison-free").len(), 1);
+
+    // An application-owned (OSC 0/2) title stays on the OS window; only the
+    // fallback base title updates.
+    app.apply_window_title("vim");
+    let mut back = base.clone();
+    back.appearance.theme = Some(String::from("nord"));
+    app.adopt_live_config(adoption_from(&back));
+    assert_eq!(app.window.title, window_title_for_theme("nord", "file"));
+    assert_eq!(
+        titles
+            .lock()
+            .expect("poison-free")
+            .last()
+            .map(String::as_str),
+        Some("vim"),
+        "OSC title not clobbered"
+    );
 }

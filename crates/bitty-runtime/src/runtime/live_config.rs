@@ -5,8 +5,11 @@
 //! This module adds the remaining runtime-owned `Live` fields:
 //!
 //! * [`Runtime::set_theme_palette`] — `appearance.theme` / `appearance.colors`;
-//! * [`Runtime::set_font_face`] — `font.family`, `font.line_height`, and
-//!   `font.letter_spacing` (the latter two arrive as the derived base cell);
+//! * [`Runtime::set_font_face`] — `font.family`, `font.size`,
+//!   `font.line_height`, and `font.letter_spacing` (the latter two arrive as
+//!   the derived base cell) in one atlas rebuild;
+//! * [`Runtime::set_outline_widths`] — the resolved `decoration.border_width*`
+//!   focus/idle ring pair;
 //! * [`Runtime::set_window_opacity`] — `window.opacity` on the GPU surface.
 //!
 //! Every setter validates fail-closed before mutating, is idempotent for an
@@ -26,8 +29,13 @@ use bitty_render::ThemePalette;
 /// large glyph atlas.
 pub const MAX_LIVE_CELL_PX: u32 = 256;
 
-/// Upper bound on a live-adopted font family name in bytes (CTX-0898),
-/// mirroring the `bitty-config` `font.family` bound.
+/// Upper bound on a live-adopted font family name in bytes, equal to the
+/// `bitty-config` `font.family` bound (`MAX_FONT_FAMILY_LEN`).
+///
+/// `bitty-runtime` deliberately has no normal `bitty-config` dependency, so
+/// the bound is mirrored here and equality is pinned by a cross-crate parity
+/// test in `bitty-terminal` (the crate that depends on both), like the
+/// outline-contrast floors.
 pub const MAX_LIVE_FONT_FAMILY_BYTES: usize = 128;
 
 impl Runtime {
@@ -60,39 +68,54 @@ impl Runtime {
         self.pending_full_redraw = true;
     }
 
-    /// Live-adopts a font family and base cell without restart (CTX-0898).
+    /// Live-adopts a font family, point size, and base cell without restart
+    /// (CTX-0898).
     ///
     /// `cell_width`/`cell_height` are the design (scale 1.0) cell derived
-    /// from `font.line_height` / `font.letter_spacing`. The renderer reloads
-    /// the face at the live DPI scale first; only when that succeeds is the
-    /// new family/cell committed and the grid reflowed from the current
-    /// surface extent (same path as [`Self::set_font_size`]). The window
-    /// keeps its size; the grid absorbs the new cell.
+    /// from `font.line_height` / `font.letter_spacing`. Family, size, and cell
+    /// are adopted together so a reload that changes several of them rebuilds
+    /// the glyph atlas exactly once. The renderer reloads the face at the
+    /// live DPI scale first; only when that succeeds is the new state
+    /// committed and the grid reflowed from the current surface extent (same
+    /// path as [`Self::set_font_size`]). The window keeps its size; the grid
+    /// absorbs the new cell.
     ///
     /// # Errors
     ///
-    /// [`RuntimeError::InvalidConfig`] for an empty/oversize family or a cell
-    /// outside `1..=MAX_LIVE_CELL_PX`; [`RuntimeError::Render`] when the face
-    /// fails to load. Every error leaves the runtime unchanged.
+    /// [`RuntimeError::InvalidConfig`] for an empty family or one longer than
+    /// [`MAX_LIVE_FONT_FAMILY_BYTES`], a cell outside `1..=`[`MAX_LIVE_CELL_PX`],
+    /// or a size outside the [`Self::set_font_size`] range;
+    /// [`RuntimeError::Render`] when the face fails to load. Every error
+    /// leaves the runtime unchanged.
     pub fn set_font_face(
         &mut self,
         family: &str,
+        point_size: f32,
         cell_width: u32,
         cell_height: u32,
     ) -> Result<(), RuntimeError> {
         if family.trim().is_empty() || family.len() > MAX_LIVE_FONT_FAMILY_BYTES {
             return Err(RuntimeError::InvalidConfig(
-                "font_family must be non-empty and at most 128 bytes",
+                "font_family must be non-empty and at most MAX_LIVE_FONT_FAMILY_BYTES bytes",
+            ));
+        }
+        if !(point_size.is_finite()
+            && (crate::config::FONT_ZOOM_MIN_PT..=crate::config::FONT_ZOOM_MAX_PT)
+                .contains(&point_size))
+        {
+            return Err(RuntimeError::InvalidConfig(
+                "font_size must be finite within [FONT_ZOOM_MIN_PT, FONT_ZOOM_MAX_PT]",
             ));
         }
         if !(1..=MAX_LIVE_CELL_PX).contains(&cell_width)
             || !(1..=MAX_LIVE_CELL_PX).contains(&cell_height)
         {
             return Err(RuntimeError::InvalidConfig(
-                "cell metrics must be within [1, 256] logical pixels",
+                "cell metrics must be within [1, MAX_LIVE_CELL_PX] logical pixels",
             ));
         }
         if family == self.config.font_family
+            && (point_size - self.config.font_size).abs() < f32::EPSILON
             && cell_width == self.config.cell_width
             && cell_height == self.config.cell_height
         {
@@ -102,14 +125,15 @@ impl Runtime {
         let query = FontQuery {
             family: family.to_string(),
             style: FontStyle::Normal,
-            point_size: self.config.font_size,
+            point_size,
         };
         // Load before committing: the renderer is unchanged on error, so a
-        // missing face keeps the running family and cell (fail-safe).
+        // missing face keeps the running family, size, and cell (fail-safe).
         self.renderer
             .apply_dpi_scale(base_cell, &query, self.scale_factor.get())
             .map_err(RuntimeError::from)?;
         self.config.font_family = query.family;
+        self.config.font_size = point_size;
         self.config.cell_width = cell_width;
         self.config.cell_height = cell_height;
         if let Some(extent) = self
@@ -123,6 +147,40 @@ impl Runtime {
             let _ = self.reflow_to_grid(cols, rows, extent);
         }
         self.pending_full_redraw = true;
+        Ok(())
+    }
+
+    /// Live-adopts the resolved focus/idle outline ring widths (CTX-0898).
+    ///
+    /// The pair comes from `decoration.border` -> `decoration.border_width`
+    /// -> the explicit focused/idle members (CTX-0344). Paint-only: content
+    /// geometry is owned by [`Self::set_decoration`]. Callers adopt the
+    /// widths before [`Self::set_background_appearance`] so the per-`View`
+    /// AC-2 width-cue check runs against them.
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError::InvalidConfig`] when either width exceeds
+    /// [`crate::config::MAX_OUTLINE_WIDTH_PX`]; nothing is changed.
+    pub fn set_outline_widths(
+        &mut self,
+        focused: Option<u32>,
+        idle: Option<u32>,
+    ) -> Result<(), RuntimeError> {
+        if [focused, idle]
+            .iter()
+            .flatten()
+            .any(|w| *w > crate::config::MAX_OUTLINE_WIDTH_PX)
+        {
+            return Err(RuntimeError::InvalidConfig(
+                "outline width must be within [0, MAX_OUTLINE_WIDTH_PX] logical pixels",
+            ));
+        }
+        if self.config.outline_width_focused != focused || self.config.outline_width_idle != idle {
+            self.config.outline_width_focused = focused;
+            self.config.outline_width_idle = idle;
+            self.pending_full_redraw = true;
+        }
         Ok(())
     }
 
@@ -206,7 +264,8 @@ mod tests {
         let (cols, rows) = (rt.snapshot().width, rt.snapshot().height);
         let width = rt.config().cell_width;
         let height = rt.config().cell_height;
-        rt.set_font_face("Alt Mono", width + 2, height + 4)
+        let size = rt.config().font_size;
+        rt.set_font_face("Alt Mono", size, width + 2, height + 4)
             .expect("adopt");
         assert_eq!(rt.config().font_family, "Alt Mono");
         assert_eq!(rt.live_cell_size(), (width + 2, height + 4));
@@ -224,14 +283,48 @@ mod tests {
         let mut rt =
             Runtime::with_deterministic_rasterizer(RuntimeConfig::default()).expect("runtime");
         let before = rt.config().clone();
-        assert!(rt.set_font_face("  ", 10, 22).is_err());
-        assert!(rt.set_font_face(&"x".repeat(129), 10, 22).is_err());
-        assert!(rt.set_font_face("Mono", 0, 22).is_err());
+        let size = before.font_size;
+        assert!(rt.set_font_face("  ", size, 10, 22).is_err());
+        let long = "x".repeat(super::MAX_LIVE_FONT_FAMILY_BYTES + 1);
+        assert!(rt.set_font_face(&long, size, 10, 22).is_err());
+        assert!(rt.set_font_face("Mono", size, 0, 22).is_err());
         assert!(
-            rt.set_font_face("Mono", 10, super::MAX_LIVE_CELL_PX + 1)
+            rt.set_font_face("Mono", size, 10, super::MAX_LIVE_CELL_PX + 1)
+                .is_err()
+        );
+        assert!(rt.set_font_face("Mono", f32::NAN, 10, 22).is_err());
+        assert!(
+            rt.set_font_face("Mono", crate::config::FONT_ZOOM_MAX_PT + 1.0, 10, 22)
                 .is_err()
         );
         assert_eq!(rt.config(), &before);
+    }
+
+    #[test]
+    fn font_face_adopts_size_in_the_same_rebuild() {
+        let mut rt =
+            Runtime::with_deterministic_rasterizer(RuntimeConfig::default()).expect("runtime");
+        let (width, height) = (rt.config().cell_width, rt.config().cell_height);
+        rt.set_font_face("Alt Mono", 18.0, width, height)
+            .expect("adopt");
+        assert!((rt.font_size() - 18.0).abs() < f32::EPSILON);
+        assert_eq!(rt.config().font_family, "Alt Mono");
+        // The size is already adopted, so the follow-up size setter is a
+        // no-op (no second atlas rebuild).
+        let _ = rt.tick();
+        rt.set_font_size(18.0).expect("same size");
+        assert!(rt.tick().is_none(), "no second rebuild or redraw");
+    }
+
+    #[test]
+    fn outline_widths_adopt_and_reject_out_of_bound() {
+        let mut rt = Runtime::with_defaults().expect("runtime");
+        rt.set_outline_widths(Some(3), Some(1)).expect("adopt");
+        assert_eq!(rt.config().outline_width_focused, Some(3));
+        assert_eq!(rt.config().outline_width_idle, Some(1));
+        let over = crate::config::MAX_OUTLINE_WIDTH_PX + 1;
+        assert!(rt.set_outline_widths(Some(over), None).is_err());
+        assert_eq!(rt.config().outline_width_focused, Some(3), "unchanged");
     }
 
     #[test]

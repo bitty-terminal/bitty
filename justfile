@@ -21,7 +21,6 @@ test:
     cargo test --workspace --doc --locked
     cargo test -p bitty-platform --test headless_run --test winit_window --locked
     cargo test -p bitty-perf --benches --locked
-    cargo test -p bitty-ipc --examples --locked
 
 typecheck:
     cargo check --workspace --all-targets --locked

@@ -29,9 +29,10 @@ use super::grant::PluginGrant;
 use super::policy::{CrashTracker, SpawnGate};
 use super::stderr::StderrRing;
 use super::{
-    COMPONENT_HANDSHAKE_TIMEOUT, COMPONENT_IDLE_TIMEOUT, COMPONENT_INBOUND_QUEUE_FRAMES,
-    COMPONENT_MAX_IN_FLIGHT, COMPONENT_OUTBOUND_QUEUE_BATCHES, COMPONENT_POLL_MAX_FRAMES,
-    COMPONENT_SHUTDOWN_GRACE, COMPONENT_STDERR_MAX_BYTES, COMPONENT_STDERR_READ_CHUNK,
+    COMPONENT_EXIT_RECHECK, COMPONENT_HANDSHAKE_TIMEOUT, COMPONENT_IDLE_TIMEOUT,
+    COMPONENT_INBOUND_QUEUE_FRAMES, COMPONENT_MAX_IN_FLIGHT, COMPONENT_OUTBOUND_QUEUE_BATCHES,
+    COMPONENT_POLL_MAX_FRAMES, COMPONENT_SHUTDOWN_GRACE, COMPONENT_STDERR_MAX_BYTES,
+    COMPONENT_STDERR_READ_CHUNK,
 };
 
 /// Broker-assigned request id (non-zero, unique for the broker lifetime).
@@ -488,32 +489,53 @@ impl ComponentBroker {
             }
         }
         let deadline = Instant::now() + self.config.shutdown_grace;
-        loop {
-            let running: Vec<String> = self
-                .slots
-                .iter_mut()
-                .filter_map(|(name, slot)| {
-                    let process = slot.process.as_mut()?;
-                    match process.child.try_wait() {
-                        Ok(Some(_)) | Err(_) => {
-                            reap(slot, StopOutcome::Exited);
-                            None
-                        }
-                        Ok(None) => Some(name.clone()),
-                    }
-                })
-                .collect();
+        // Phase 1 (event-driven): a child exit closes its stdout, which the
+        // reader thread reports as `Closed`.
+        let mut open: Vec<(String, u64)> = self
+            .slots
+            .iter()
+            .filter_map(|(name, slot)| Some((name.clone(), slot.process.as_ref()?.generation)))
+            .collect();
+        while !open.is_empty() {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            if running.is_empty() || remaining.is_zero() {
-                for name in running {
-                    if let Some(slot) = self.slots.get_mut(&name) {
-                        kill_and_reap(slot, StopOutcome::Killed);
-                    }
-                }
+            if remaining.is_zero() {
                 break;
             }
-            // Event-driven: a child exit closes its stdout, which wakes us.
-            let _ = self.inbound_rx.recv_timeout(remaining);
+            match self.inbound_rx.recv_timeout(remaining) {
+                Ok(Inbound {
+                    component,
+                    generation,
+                    event: InboundEvent::Closed | InboundEvent::Failed,
+                }) => open.retain(|entry| *entry != (component.clone(), generation)),
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        // Phase 2: reap exited children; stdout may close a moment before
+        // the exit status is observable, so re-check in short slices until
+        // the same deadline, then kill whatever is left (recorded PIDs only).
+        loop {
+            let mut running = 0usize;
+            for slot in self.slots.values_mut() {
+                let Some(process) = slot.process.as_mut() else {
+                    continue;
+                };
+                match process.child.try_wait() {
+                    Ok(Some(_)) | Err(_) => reap(slot, StopOutcome::Exited),
+                    Ok(None) => running += 1,
+                }
+            }
+            if running == 0 || Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(
+                COMPONENT_EXIT_RECHECK.min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+        for slot in self.slots.values_mut() {
+            if slot.process.is_some() {
+                kill_and_reap(slot, StopOutcome::Killed);
+            }
         }
         events
     }
@@ -1062,5 +1084,99 @@ fn kill_and_reap(slot: &mut Slot, outcome: StopOutcome) {
         }
         let _ = process.child.wait();
         slot.last_stop = Some(outcome);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitty_network_wire::{FRAME_HEADER_BYTES, decode};
+
+    fn offline_grant() -> PluginGrant {
+        PluginGrant::compute(
+            "acme.test",
+            std::iter::empty::<&bitty_plugin_host::capability::CapabilityId>(),
+            &[],
+        )
+        .expect("grant")
+    }
+
+    #[test]
+    fn request_body_is_chunked_with_last_flag() {
+        let mut request = ComponentRequest::new(Method::Post, "https://api.example.com/");
+        request.body = Some(vec![7u8; MAX_BODY_CHUNK_BYTES * 2 + 1]);
+        let frames = encode_request(RequestId(9), &offline_grant(), request).expect("encode");
+        assert_eq!(frames.len(), 4);
+        let messages: Vec<Message> = frames
+            .iter()
+            .map(|frame| decode(&frame[FRAME_HEADER_BYTES..]).expect("decode"))
+            .collect();
+        match &messages[0] {
+            Message::HttpRequest {
+                id,
+                plugin_id,
+                body_follows,
+                ..
+            } => {
+                assert_eq!(*id, 9);
+                assert_eq!(plugin_id, "acme.test");
+                assert!(*body_follows);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let lasts: Vec<bool> = messages[1..]
+            .iter()
+            .map(|message| match message {
+                Message::RequestBody { last, .. } => *last,
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(lasts, [false, false, true]);
+    }
+
+    #[test]
+    fn request_without_body_is_one_frame() {
+        let frames = encode_request(
+            RequestId(1),
+            &offline_grant(),
+            ComponentRequest::new(Method::Get, "https://api.example.com/"),
+        )
+        .expect("encode");
+        assert_eq!(frames.len(), 1);
+    }
+
+    #[test]
+    fn oversize_body_and_invalid_url_fail_before_sending() {
+        let mut request = ComponentRequest::new(Method::Post, "https://api.example.com/");
+        request.body = Some(vec![
+            0u8;
+            usize::try_from(MAX_REQUEST_BODY_BYTES).expect("fits")
+                + 1
+        ]);
+        assert_eq!(
+            encode_request(RequestId(1), &offline_grant(), request).err(),
+            Some(BrokerError::BodyTooLarge)
+        );
+        let long = ComponentRequest::new(
+            Method::Get,
+            "x".repeat(bitty_network_wire::MAX_URL_BYTES + 1),
+        );
+        assert!(matches!(
+            encode_request(RequestId(1), &offline_grant(), long),
+            Err(BrokerError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn invalid_component_name_is_rejected_without_spawning() {
+        let mut broker = ComponentBroker::new(BrokerConfig::new(None, ComponentEnv::empty()));
+        let result = broker.submit(
+            Instant::now(),
+            "../net",
+            &offline_grant(),
+            ComponentRequest::new(Method::Get, "https://api.example.com/"),
+        );
+        assert_eq!(result, Err(BrokerError::Resolve(ResolveError::InvalidName)));
+        assert!(broker.status("../net").is_none());
     }
 }

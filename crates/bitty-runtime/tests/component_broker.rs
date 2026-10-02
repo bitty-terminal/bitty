@@ -17,10 +17,10 @@ use bitty_network_wire::{ErrorKind, Method};
 use bitty_plugin_host::capability::CapabilityId;
 use bitty_plugin_host::manifest::NetworkEgress;
 use bitty_runtime::component::{
-    BrokerConfig, BrokerError, BrokerEvent, BrokerEventKind, COMPONENT_IDLE_TIMEOUT,
-    COMPONENT_MAX_IN_FLIGHT, COMPONENT_SHUTDOWN_GRACE, ComponentBroker, ComponentEnv,
-    ComponentRequest, ComponentState, PluginGrant, RequestId, ResolveError, StopOutcome,
-    executable_file_name,
+    BrokerConfig, BrokerError, BrokerEvent, BrokerEventKind, COMPONENT_HANDSHAKE_TIMEOUT,
+    COMPONENT_IDLE_TIMEOUT, COMPONENT_MAX_IN_FLIGHT, COMPONENT_SHUTDOWN_GRACE, ComponentBroker,
+    ComponentEnv, ComponentRequest, ComponentState, PluginGrant, RequestId, ResolveError,
+    StopOutcome, executable_file_name,
 };
 
 /// Real-time bound for any single wait on the fixture process.
@@ -398,6 +398,32 @@ fn handshake_version_mismatch_counts_as_crash() {
         .submit(now, NAME, &grant(), request())
         .expect("submit");
     let events = until_terminal(&mut broker, now, id);
+    assert_eq!(failed_kind(&events, id), Some(ErrorKind::ComponentLost));
+    assert_eq!(
+        broker.status(NAME).and_then(|s| s.last_stop),
+        Some(StopOutcome::Crashed)
+    );
+}
+
+#[test]
+fn handshake_timeout_counts_as_crash() {
+    let scratch = Scratch::new("mute");
+    install(&scratch.0, "mute");
+    let mut broker = broker(&scratch.0, ComponentEnv::empty());
+    let t0 = Instant::now();
+    let id = broker
+        .submit(t0, NAME, &grant(), request())
+        .expect("submit");
+    assert!(
+        broker
+            .poll(t0 + COMPONENT_HANDSHAKE_TIMEOUT - Duration::from_millis(1))
+            .is_empty()
+    );
+    assert_eq!(
+        broker.status(NAME).map(|s| s.state),
+        Some(ComponentState::Handshaking)
+    );
+    let events = broker.poll(t0 + COMPONENT_HANDSHAKE_TIMEOUT);
     assert_eq!(failed_kind(&events, id), Some(ErrorKind::ComponentLost));
     assert_eq!(
         broker.status(NAME).and_then(|s| s.last_stop),

@@ -14,6 +14,7 @@
 //! - `ignore-eof`: answers like `echo`, but keeps running after stdin EOF
 //!   until killed (grace-then-kill test).
 //! - `bad-ack`: answers `Hello` with an unsupported protocol version.
+//! - `mute`: never answers `Hello` (handshake timeout test).
 //! - `flood`: answers with a body larger than the request budget.
 //!
 //! Not a product binary: it is never installed or packaged.
@@ -50,6 +51,7 @@ fn main() -> ExitCode {
             Err(_) => return ExitCode::from(FAILURE_EXIT),
         };
         let replies = match message {
+            Message::Hello { .. } if mode == "mute" => Vec::new(),
             Message::Hello { component, .. } => {
                 let protocol = if mode == "bad-ack" {
                     PROTOCOL_VERSION + 1

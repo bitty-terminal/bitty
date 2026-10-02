@@ -175,5 +175,9 @@ pub const COMPONENT_OUTBOUND_QUEUE_BATCHES: usize = COMPONENT_MAX_IN_FLIGHT * 2;
 /// stays bounded even when a component floods its stdout.
 pub const COMPONENT_POLL_MAX_FRAMES: usize = 256;
 
+/// Re-check slice while reaping children during [`ComponentBroker::shutdown`]
+/// (stdout can close a moment before the exit status is observable).
+pub(crate) const COMPONENT_EXIT_RECHECK: Duration = Duration::from_millis(10);
+
 /// Stderr read chunk size for the capture thread.
 pub(crate) const COMPONENT_STDERR_READ_CHUNK: usize = 4 * 1024;

@@ -61,7 +61,8 @@ the determinism contract are documented in `src/lib.rs`.
 - `src/lib.rs` — crate docs with the role, budgets, and determinism sections.
 - `src/host.rs` — VM lifecycle, budget enforcement, and host calls.
 - `src/ui.rs` — Plugin API v1 declarative UI scenes (`bitty.ui.mount` /
-  `bitty.ui.update`) and the bounded `UiNode` model.
+  `bitty.ui.update`), the closed v1 `UiSlot` enum, and the bounded `UiNode`
+  model.
 - `src/config.rs` — configuration-chunk evaluation and table extraction.
 - `src/stdlib.rs` — restricted standard-library construction.
 - `src/gate.rs` — fail-closed plugin-VM build gate and safe-mode policy.

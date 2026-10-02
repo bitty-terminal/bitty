@@ -126,6 +126,7 @@ use crate::queue::{ColdEvent, ColdQueue};
 
 pub mod animations;
 pub mod background_images;
+pub mod band_slots;
 pub mod bell;
 pub mod chrome_band;
 pub mod click;
@@ -365,14 +366,16 @@ pub const PASTE_BANNER_FLASH_TEXT: &str = "Paste pending (paste again to confirm
 /// Plugin-mounted chrome bands per edge (CTX-0890, part of #1431).
 ///
 /// Holds `UiNode` trees mounted by plugins via `bitty.ui.mount(slot, tree)`.
-/// Each edge may have multiple bands (one per plugin), stacked according to
-/// `chrome.<edge>.order` config or plugin id byte order. Bands are reserved
+/// Each edge may have multiple bands (one per plugin), stacked from the
+/// window edge inward in plugin id byte order (index `0` outermost; see
+/// [`band_slots`] for the slot-to-edge policy, CTX-0923). Bands are reserved
 /// only when a plugin mounts to that edge; empty = no band.
 #[derive(Debug, Clone, Default)]
 pub struct ChromeBands {
-    /// Top edge bands (stacked top-to-bottom).
+    /// Top edge bands (index `0` at the window top, stacking downward).
     pub top: Vec<BandContent>,
-    /// Bottom edge bands (stacked bottom-to-top).
+    /// Bottom edge bands (index `0` at the window bottom, stacking upward;
+    /// carries both `bottom` and `statusline` mounts).
     pub bottom: Vec<BandContent>,
     /// Left edge bands (stacked left-to-right, deferred for v0.1).
     pub left: Vec<BandContent>,
@@ -385,8 +388,9 @@ pub struct ChromeBands {
 pub struct BandContent {
     /// Owning plugin id.
     pub plugin_id: String,
-    /// Slot name ("top", "bottom", "left", "right").
-    pub slot: String,
+    /// Accepted slot the block was mounted into (`top`, `bottom`,
+    /// `statusline`, `left`, or `right`; see [`band_slots`]).
+    pub slot: bitty_lua::ui::UiSlot,
     /// Root UiNode tree.
     pub root: bitty_lua::ui::UiNode,
     /// Mount version (incremented on remount).

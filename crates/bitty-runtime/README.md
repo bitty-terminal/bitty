@@ -60,7 +60,9 @@ diagram lives in `src/lib.rs`.
 - `Cargo.toml` — package metadata and workspace-internal dependencies.
 - `src/lib.rs` — crate docs with the data flow and headless seam.
 - `src/runtime.rs` and `src/runtime/` — runtime handle plus resize, input,
-  panes, present, plugin, search, selection, and workspace slices.
+  panes, present, plugin, search, selection, and workspace slices;
+  `src/runtime/band_slots.rs` is the single host placement policy for the v1
+  `bitty.ui.mount` slots (shared by the mount gate and chrome band routing).
 - `src/queue.rs` — bounded cold-path event queue.
 - `src/registry.rs` and `src/registry/` — command and panel registries.
 - `src/execution.rs` and `src/execution/` — execution supervisor

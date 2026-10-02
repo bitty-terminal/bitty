@@ -193,6 +193,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Every v1 UI slot is honoured or rejected (CTX-0923, OQ-056):** the
+  chrome band host no longer drops `bitty.ui.mount` blocks whose slot is not
+  `top`/`bottom`/`left`/`right`. A new closed `bitty_lua::ui::UiSlot` enum
+  is the only slot vocabulary, and `bitty_runtime::ui_slot_placement` is the
+  single placement policy used by both the `ui.mount` gate and band routing.
+  `statusline` mounts now render on the bottom band (the statusline plugin's
+  `ui.mount("statusline")` is visible). `tabline` (reserved for PW-10 panel
+  tabs, not a band surface), `overlay`, and `terminal` mounts fail closed with
+  the existing v1 code `E_UI_UNAVAILABLE` (`runtime` class; the message names
+  the slot and the reason) after the capability and claim gates, instead of
+  being stored and never rendered; no code is added to the OQ-056-frozen
+  error vocabulary. Bands on one edge now stack from the window edge inward
+  in plugin id byte order, independent of mount order, starting inward of the
+  Core workspaceline band on the same edge (`Runtime::plugin_band_row`, from
+  the single `status_bar_band()` reservation): with the default
+  `workspace.bar.edge = bottom` and two or more workspaces the statusline
+  band sits on the row above the workspaceline, never on it. Known gaps:
+  plugin bands reserve no exclusive zone yet, so a band overlays the terminal
+  content row it sits on (bottom band `0` covers the last content row); and
+  one plugin may keep several surfaces on one edge (for example `statusline`
+  and `bottom`), diverging from the candidate one-surface-per-edge rule.
+
 - **Synchronize damage rects with wide-character expansion (CTX-0887, #1555):**
   `Grid::erase_range_in_row` now returns `Option<(usize, usize)>` with the
   actual inclusive column bounds after expanding outward across wide-character

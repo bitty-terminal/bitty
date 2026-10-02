@@ -320,7 +320,7 @@ return {}
 
     let (plugin_id, slot, _node, version) = &blocks[0];
     assert_eq!(plugin_id.as_str(), "test.ui-mounter");
-    assert_eq!(slot, "statusline");
+    assert_eq!(*slot, bitty_lua::ui::UiSlot::Statusline);
     assert_eq!(*version, 1);
 
     let _ = std::fs::remove_dir_all(&data);

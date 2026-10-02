@@ -24,6 +24,7 @@
 pub mod debug;
 pub mod fs;
 pub mod manifest_toml;
+pub mod overlay;
 pub mod package;
 pub mod redaction;
 pub mod resolution;
@@ -36,6 +37,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Instant;
 
 use bitty_lua::gate::{VmBudgets, build_plugin_vm};
 use bitty_lua::host::DEFAULT_HOST_DEADLINE_MS;
@@ -52,6 +54,7 @@ pub use bitty_lua::{
     WORKSPACE_RENAME_MAX_BYTES, WorkspaceAttention, WorkspaceInfo, WorkspaceRequest,
 };
 pub use fs::{FakeFileSystem, FileSystem, NativeFileSystem, write_atomic_durably};
+pub use overlay::{OVERLAY_CAPTURE_TIMEOUT_MS, OverlayCapture};
 pub use resolution::{
     CURRENT_POINTER_FILE, PLUGIN_INDEX_STATE_VERSION, PluginRecord, content_digest, load_index,
     load_index_with_fs, write_index, write_index_with_fs,
@@ -531,6 +534,10 @@ pub struct PluginRuntime {
     /// CTX-0889: bounded queue of `workspace.control` mutations, drained by
     /// the application each tick ([`PluginRuntime::drain_workspace_requests`]).
     workspace_requests: Rc<RefCell<WorkspaceRequestQueue>>,
+    /// CTX-0941: runtime-shared single-owner focusable-overlay capture switch
+    /// and bounded input queue. Shared with every generation's services so the
+    /// single-owner invariant holds across plugins and reload.
+    overlay_capture: Rc<RefCell<OverlayCapture>>,
     /// Filesystem adapter behind disk-backed plugin stores (`data_dir`).
     ///
     /// Defaults to [`NativeFileSystem`]; replaceable through
@@ -565,6 +572,7 @@ impl PluginRuntime {
             workspace_requests: Rc::new(RefCell::new(WorkspaceRequestQueue::new(
                 WORKSPACE_REQUEST_QUEUE_CAPACITY,
             ))),
+            overlay_capture: Rc::new(RefCell::new(OverlayCapture::new())),
             store_fs: Arc::new(NativeFileSystem),
         }
     }
@@ -667,6 +675,56 @@ impl PluginRuntime {
     #[must_use]
     pub fn workspace_requests_dropped(&self) -> u64 {
         self.workspace_requests.borrow().dropped()
+    }
+
+    /// Runtime-shared focusable-overlay capture switch (CTX-0941).
+    ///
+    /// One owner and one bounded queue span every generation, so the
+    /// single-owner invariant holds across plugins and reload. Diagnostics and
+    /// tests read the live owner/queue through this handle.
+    #[must_use]
+    pub fn overlay_capture(&self) -> &Rc<RefCell<OverlayCapture>> {
+        &self.overlay_capture
+    }
+
+    /// Enqueue one captured input event for the active overlay capture, if any.
+    ///
+    /// This is the Core input-path entry: it appends to the capture queue and
+    /// never invokes plugin code (`P0-AC-015`). Returns `false` when no capture
+    /// is active, so input falls through to the terminal as before.
+    pub fn push_overlay_input(&mut self, kind: &str, text: &str) -> bool {
+        self.overlay_capture.borrow_mut().enqueue(kind, text)
+    }
+
+    /// Revoke the active overlay capture unconditionally (focus switch,
+    /// cancel, or an application-side release).
+    ///
+    /// Returns whether a capture was dropped. Release is guaranteed and
+    /// idempotent: a call with no active capture is a no-op `false`.
+    pub fn revoke_overlay_capture(&mut self) -> bool {
+        let owner = self
+            .overlay_capture
+            .borrow()
+            .owner_plugin()
+            .map(str::to_string);
+        match owner {
+            Some(plugin) => self.overlay_capture.borrow_mut().revoke_plugin(&plugin),
+            None => false,
+        }
+    }
+
+    /// Revoke an overlay capture that has reached its Core-side deadline at
+    /// `now`, returning whether one was dropped.
+    ///
+    /// The deterministic entry point for the transient/bounded guarantee (the
+    /// application calls [`Self::expire_overlay_captures`] each tick).
+    pub fn expire_overlay_captures_at(&mut self, now: Instant) -> bool {
+        self.overlay_capture.borrow_mut().revoke_expired_at(now)
+    }
+
+    /// Revoke any overlay capture past its deadline at the current instant.
+    pub fn expire_overlay_captures(&mut self) -> bool {
+        self.expire_overlay_captures_at(Instant::now())
     }
 
     /// Scan the configured roots and register every valid package.
@@ -965,6 +1023,10 @@ impl PluginRuntime {
             overlay: ui_overlay,
             claims: manifest.lazy.claims.clone(),
         });
+        // CTX-0941: the one runtime-shared focusable-overlay capture switch,
+        // so the single-owner invariant spans every plugin and survives
+        // reload; suspend/dispose revoke this generation's capture.
+        plugin_services.set_overlay_capture(self.overlay_capture.clone());
         // LUA-OQ-8: service backend wiring. The verified manifest's
         // `services.provided`/`services.required` become this generation's
         // declaration gate and resolution fallback; the runtime-shared
@@ -1177,6 +1239,10 @@ impl PluginRuntime {
         if let Some(services) = entry.services.as_ref() {
             services.clear_ui_blocks();
         }
+        // CTX-0941: suspend is a release; a suspended generation must never
+        // keep the transient input capture (honored even when the VM is
+        // parked rather than disposed).
+        self.overlay_capture.borrow_mut().revoke_plugin(id.as_str());
         // LUA-OQ-8: park this generation's publications in place. Records
         // stay keyed for resume but resolve and serve nothing while parked,
         // so live consumer handles fail closed with `E_SERVICE_GONE`.
@@ -1249,6 +1315,9 @@ impl PluginRuntime {
         if let Some(services) = entry.services.as_ref() {
             services.clear_ui_blocks();
         }
+        // CTX-0941: unload/crash/dispose is a release. Core drops the capture
+        // so a faulty or dead generation can never pin input.
+        self.overlay_capture.borrow_mut().revoke_plugin(id.as_str());
         entry.state = LifecycleState::Disposed;
         // CTX-0897: traces never outlive the generation (also on reload,
         // where dispose and the next activation share one public call).
@@ -1638,6 +1707,11 @@ impl PluginRuntime {
             entry.vm = None;
             entry.services = None;
         }
+        // CTX-0941: a failed activation is a release. A generation that
+        // acquired the transient capture during `init.lua` must never keep it
+        // after the activation rolls back, or a dead/failed plugin would pin
+        // input forever.
+        self.overlay_capture.borrow_mut().revoke_plugin(id.as_str());
         self.drop_traces(id);
     }
 

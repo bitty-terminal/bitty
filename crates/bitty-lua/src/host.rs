@@ -477,6 +477,48 @@ impl MarshalBudget {
 /// accepted v1 slot that a concrete host does not render (CTX-0923).
 pub const E_UI_UNAVAILABLE: &str = "E_UI_UNAVAILABLE";
 
+/// Stable `runtime`-class code for a focusable-overlay capture request while
+/// another capture is already active (CTX-0941, OQ-056 v2 scope). Core owns a
+/// single capture switch, so only one overlay may hold transient input focus
+/// at a time; a second `acquire` fails closed instead of silently stealing or
+/// queueing behind the owner.
+pub const E_UI_ALREADY_CAPTURED: &str = "E_UI_ALREADY_CAPTURED";
+
+/// Stable `runtime`-class code for an overlay capture call by a generation
+/// that does not own the active capture (or names a handle that is not one of
+/// its own mounted overlay blocks) (CTX-0941, OQ-056 v2 scope). Release is the
+/// exception: a foreign release is an idempotent no-op, never an error.
+pub const E_UI_NOT_OWNER: &str = "E_UI_NOT_OWNER";
+
+/// Maximum captured input events a single overlay capture session retains.
+///
+/// The Core-side capture queue is bounded fail-safe: overflow drops the oldest
+/// event and counts it, so a slow or crashed plugin can never grow the queue
+/// without bound or stall the input path.
+pub const OVERLAY_CAPTURE_QUEUE_MAX: usize = 256;
+
+/// Maximum UTF-8 bytes of one captured text/IME/pointer event's text.
+pub const OVERLAY_CAPTURE_TEXT_MAX_BYTES: usize = 4096;
+
+/// Maximum number of captured events one `bitty.ui.overlay.poll` call returns.
+pub const OVERLAY_CAPTURE_POLL_MAX: usize = OVERLAY_CAPTURE_QUEUE_MAX;
+
+/// One bounded transient input event captured for a focusable overlay
+/// (CTX-0941).
+///
+/// The plugin observes captured input only through the `bitty.ui.overlay.poll`
+/// host call: Core enqueues events on the input path and never invokes a plugin
+/// in that path (`P0-AC-015`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlayInput {
+    /// Monotonic per-capture sequence number (diagnostics for dropped gaps).
+    pub sequence: u64,
+    /// Event class: `key`, `text`, `ime`, or `pointer`.
+    pub kind: String,
+    /// Bounded UTF-8 payload.
+    pub text: String,
+}
+
 /// Typed, bounded bridge/diagnostic error.
 ///
 /// `class` is one of the accepted diagnostic classes (`runtime`, `validation`,
@@ -779,6 +821,69 @@ pub trait HostServices {
         }
         self.ui_update(handle, component)
     }
+    /// Claim the Core-owned exclusive focusable-overlay input capture for one
+    /// transient interaction (CTX-0941, v2 scope of OQ-056).
+    ///
+    /// `handle` is a block handle this generation mounted into the `overlay`
+    /// slot. The implementation owns capability gating (`ui.overlay`,
+    /// deny-by-default), the single-owner switch (fail closed with
+    /// [`E_UI_ALREADY_CAPTURED`] while another capture is active), and the
+    /// bounded capture queue. The default fails closed with
+    /// [`E_UI_UNAVAILABLE`], so a host without a capture surface can never
+    /// gain ambient authority.
+    fn ui_overlay_acquire(&self, _handle: i64) -> Result<(), BridgeError> {
+        Err(BridgeError::new(
+            "runtime",
+            E_UI_UNAVAILABLE,
+            "host has no ui overlay capture surface",
+        ))
+    }
+    /// Expiry-aware `ui_overlay_acquire` for the pre-commit timeout path
+    /// (CTX-0464/CTX-0941).
+    ///
+    /// Acquiring grants exclusive input capture, so the bridge uses the
+    /// check-then-act mutating path: implementations must check
+    /// `Instant::now() > expiry` before granting and fail-closed with
+    /// [`BridgeError::timeout`] without transferring authority when expired.
+    /// The default checks expiry before delegating (fail-fast).
+    fn ui_overlay_acquire_with_expiry(
+        &self,
+        handle: i64,
+        expiry: Instant,
+    ) -> Result<(), BridgeError> {
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        self.ui_overlay_acquire(handle)
+    }
+    /// Release the active focusable-overlay capture held by `handle`.
+    ///
+    /// Release is idempotent and Core-owned: `Ok(false)` means this generation
+    /// owns no capture for `handle` (including a second release), never an
+    /// error, so a plugin crash or a duplicate cancel can never wedge input.
+    /// The default fails closed with [`E_UI_UNAVAILABLE`].
+    fn ui_overlay_release(&self, _handle: i64) -> Result<bool, BridgeError> {
+        Err(BridgeError::new(
+            "runtime",
+            E_UI_UNAVAILABLE,
+            "host has no ui overlay capture surface",
+        ))
+    }
+    /// Drain up to `max` captured input events for the active capture owned by
+    /// `handle`, oldest first.
+    ///
+    /// This is the only plugin-visible observation path for captured input;
+    /// Core never calls a plugin callback on the input hot path
+    /// (`P0-AC-015`). A call by a generation that does not own the capture for
+    /// `handle` fails closed with [`E_UI_NOT_OWNER`]; the default fails closed
+    /// with [`E_UI_UNAVAILABLE`].
+    fn ui_overlay_poll(&self, _handle: i64, _max: usize) -> Result<Vec<OverlayInput>, BridgeError> {
+        Err(BridgeError::new(
+            "runtime",
+            E_UI_UNAVAILABLE,
+            "host has no ui overlay capture surface",
+        ))
+    }
 
     /// Gate one `bitty.services.provide(iface)` declaration (LUA-OQ-8).
     ///
@@ -1041,6 +1146,27 @@ fn workspace_list_value(rows: &[WorkspaceInfo]) -> LuaValue {
                             ("exited", LuaValue::Bool(row.attention.exited)),
                         ]),
                     ),
+                ])
+            })
+            .collect(),
+    )
+}
+
+/// Marshal captured overlay input events into the bounded Lua array shape
+/// (CTX-0941). The host already drained at most [`OVERLAY_CAPTURE_POLL_MAX`]
+/// events and bounded each text payload.
+fn overlay_events_value(events: &[OverlayInput]) -> LuaValue {
+    LuaValue::array(
+        events
+            .iter()
+            .map(|event| {
+                LuaValue::table([
+                    (
+                        "sequence",
+                        LuaValue::Integer(i64::try_from(event.sequence).unwrap_or(i64::MAX)),
+                    ),
+                    ("kind", LuaValue::String(event.kind.clone())),
+                    ("text", LuaValue::String(event.text.clone())),
                 ])
             })
             .collect(),
@@ -2847,6 +2973,107 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         }),
     )
     .expect("ui table accepts 'update'");
+
+    // CTX-0941 (OQ-056 v2 scope): Core-owned focusable-overlay transient input
+    // capture. Provisional spellings (`bitty.ui.overlay.acquire/release/poll`)
+    // pending the accepted W-01 host contract; the surface gates on
+    // `ui.overlay` and fails closed with `E_UI_UNAVAILABLE` on a host without a
+    // capture backend. No plugin callback runs on the input path: Core queues
+    // captured input and the plugin reads it through `poll`.
+    let overlay = Table::new(&ctx);
+    overlay
+        .set(
+            ctx,
+            "acquire",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let handle = match stack.get(0) {
+                        Value::Integer(handle) => handle,
+                        _ => {
+                            return Err(component_invalid(
+                                "ui.overlay.acquire handle must be an integer block handle",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    state
+                        .bounded_mutation(|expiry| {
+                            state
+                                .services
+                                .ui_overlay_acquire_with_expiry(handle, expiry)
+                        })
+                        .map_err(|e| e.to_error(ctx))?;
+                    stack.replace(ctx, Value::Boolean(true));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("overlay table accepts 'acquire'");
+    overlay
+        .set(
+            ctx,
+            "release",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let handle = match stack.get(0) {
+                        Value::Integer(handle) => handle,
+                        _ => {
+                            return Err(component_invalid(
+                                "ui.overlay.release handle must be an integer block handle",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let released = state
+                        .bounded_mutation(|_expiry| state.services.ui_overlay_release(handle))
+                        .map_err(|e| e.to_error(ctx))?;
+                    stack.replace(ctx, Value::Boolean(released));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("overlay table accepts 'release'");
+    overlay
+        .set(
+            ctx,
+            "poll",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let handle = match stack.get(0) {
+                        Value::Integer(handle) => handle,
+                        _ => {
+                            return Err(component_invalid(
+                                "ui.overlay.poll handle must be an integer block handle",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let max = match stack.get(1) {
+                        Value::Nil => OVERLAY_CAPTURE_POLL_MAX,
+                        Value::Integer(max) if max >= 1 => usize::try_from(max)
+                            .unwrap_or(usize::MAX)
+                            .min(OVERLAY_CAPTURE_POLL_MAX),
+                        _ => {
+                            return Err(component_invalid(
+                                "ui.overlay.poll max must be a positive integer",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let events = state
+                        .bounded_mutation(|_expiry| state.services.ui_overlay_poll(handle, max))
+                        .map_err(|e| e.to_error(ctx))?;
+                    stack.replace(ctx, overlay_events_value(&events).to_lua(ctx));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("overlay table accepts 'poll'");
+    ui.set(ctx, "overlay", readonly_table(ctx, overlay))
+        .expect("ui table accepts 'overlay'");
 
     let root = Table::new(&ctx);
     root.set(ctx, "api_version", API_VERSION)

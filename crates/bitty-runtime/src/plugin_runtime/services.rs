@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::{Rc, Weak};
 use std::time::Instant;
 
+use bitty_lua::ui::UiSlot;
 use bitty_lua::ui::{UI_MAX_AGGREGATED_TEXT_BYTES, UI_MAX_BLOCKS, UiNode};
 use bitty_lua::{
     BridgeError, HostServices, LuaValue, LuaVm, SNAPSHOT_MAX_BYTES, ServiceRoute, StashedFunction,
@@ -19,6 +20,8 @@ use bitty_lua::{
 };
 use bitty_package::Version;
 use bitty_plugin_host::bundled::{WORKSPACELINE_CLAIM, canonicalize_ui_claim};
+
+use crate::runtime::band_slots::{UiSlotPlacement, ui_slot_placement, unsupported_slot_error};
 use bitty_plugin_host::{ProvidedService, service_version_satisfies, value_satisfies_schema};
 
 use super::debug::{self, DebugView, TraceHub, TraceRequest};
@@ -322,16 +325,22 @@ pub struct UiAccess {
 /// One mounted, generation-owned declarative block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UiBlock {
-    slot: String,
+    slot: UiSlot,
     node: UiNode,
     version: u32,
 }
 
 impl UiBlock {
-    /// Accepted slot this block was mounted into.
+    /// Accepted slot this block was mounted into (canonical spelling).
     #[must_use]
-    pub fn slot(&self) -> &str {
-        &self.slot
+    pub fn slot(&self) -> &'static str {
+        self.slot.as_str()
+    }
+
+    /// Accepted slot this block was mounted into (typed).
+    #[must_use]
+    pub fn ui_slot(&self) -> UiSlot {
+        self.slot
     }
 
     /// Current validated scene subtree.
@@ -453,7 +462,7 @@ impl UiBlocks {
     }
 
     /// Retain one validated component, returning its generation-owned handle.
-    fn mount(&mut self, slot: &str, node: UiNode) -> Result<i64, BridgeError> {
+    fn mount(&mut self, slot: UiSlot, node: UiNode) -> Result<i64, BridgeError> {
         if self.blocks.len() >= UI_MAX_BLOCKS {
             return Err(BridgeError::new(
                 "budget",
@@ -476,7 +485,7 @@ impl UiBlocks {
         self.blocks.push((
             handle,
             UiBlock {
-                slot: slot.to_string(),
+                slot,
                 node,
                 version: 1,
             },
@@ -1133,17 +1142,17 @@ impl HostServices for PluginServices {
     fn ui_mount(&self, slot: &str, component: &UiNode) -> Result<i64, BridgeError> {
         // The bridge already rejected unknown slots; re-check at the host
         // boundary so a direct caller can never reach the registry with one.
-        if !bitty_lua::ui::is_ui_slot(slot) {
+        let Some(ui_slot) = UiSlot::parse(slot) else {
             return Err(bitty_lua::ui::component_invalid(format!(
                 "unknown UI slot '{slot}'"
             )));
-        }
+        };
         {
             let access = self.ui_access.borrow();
             if !access.rich {
                 return Err(BridgeError::capability_denied("ui.rich"));
             }
-            if slot == "overlay" && !access.overlay {
+            if ui_slot == UiSlot::Overlay && !access.overlay {
                 return Err(BridgeError::capability_denied("ui.overlay"));
             }
             // Accepted: `tabline` is an exclusive claim (ADR-0009 `LUA-OQ-7`
@@ -1156,7 +1165,7 @@ impl HostServices for PluginServices {
                 .claims
                 .iter()
                 .any(|claim| canonicalize_ui_claim(claim) == Some(WORKSPACELINE_CLAIM));
-            if slot == "tabline" && !tabline_claimed {
+            if ui_slot == UiSlot::Tabline && !tabline_claimed {
                 return Err(BridgeError::new(
                     "validation",
                     "E_UI_CLAIM_REQUIRED",
@@ -1164,7 +1173,16 @@ impl HostServices for PluginServices {
                 ));
             }
         }
-        self.ui_blocks.borrow_mut().mount(slot, component.clone())
+        // CTX-0923: an accepted slot this host does not present fails closed
+        // here, after the capability and claim gates, through the same
+        // placement policy the band routing uses, so nothing is admitted and
+        // then silently dropped at render time.
+        if let UiSlotPlacement::Unsupported(reason) = ui_slot_placement(ui_slot) {
+            return Err(unsupported_slot_error(ui_slot, reason));
+        }
+        self.ui_blocks
+            .borrow_mut()
+            .mount(ui_slot, component.clone())
     }
 
     fn ui_update(&self, handle: i64, component: &UiNode) -> Result<bool, BridgeError> {
@@ -1868,10 +1886,15 @@ mod tests {
             overlay: true,
             claims: Vec::new(),
         });
-        services
-            .ui_mount("overlay", &UiNode::text("allowed"))
-            .expect("overlay mount after grant");
-        services.with_ui_blocks(|blocks| assert_eq!(blocks.len(), 2));
+        // CTX-0923: with the grant, the band host still has no overlay
+        // surface, so the mount fails closed instead of being stored and
+        // never rendered.
+        let error = services
+            .ui_mount("overlay", &UiNode::text("unhosted"))
+            .expect_err("overlay is not hosted yet");
+        assert_eq!(error.code, crate::E_UI_SLOT_UNSUPPORTED);
+        assert_eq!(error.class, "runtime");
+        services.with_ui_blocks(|blocks| assert_eq!(blocks.len(), 1));
     }
 
     #[test]
@@ -1886,17 +1909,52 @@ mod tests {
             overlay: false,
             claims: vec!["tabline".to_string()],
         });
-        services
+        // CTX-0923: the claim gate passes, but `tabline` is reserved for
+        // PW-10 panel tabs and is not a band surface, so the mount fails
+        // closed with the typed unsupported-slot error.
+        let error = services
             .ui_mount("tabline", &UiNode::text("claimed"))
-            .expect("claimed tabline mount");
+            .expect_err("claimed tabline is not hosted yet");
+        assert_eq!(error.code, crate::E_UI_SLOT_UNSUPPORTED);
         services.set_ui_access(UiAccess {
             rich: true,
             overlay: false,
             claims: vec!["workspaceline".to_string()],
         });
-        services
+        let error = services
             .ui_mount("tabline", &UiNode::text("canonical claim"))
-            .expect("canonical workspaceline claim");
+            .expect_err("canonical claim passes the gate, slot still unhosted");
+        assert_eq!(error.code, crate::E_UI_SLOT_UNSUPPORTED);
+        services.with_ui_blocks(|blocks| assert!(blocks.is_empty()));
+    }
+
+    #[test]
+    fn every_v1_slot_mounts_or_fails_closed_per_placement_policy() {
+        // CTX-0923: each accepted slot either lands in the registry (band
+        // slots) or fails closed with a typed error; none is accepted and
+        // then left unrendered.
+        let services = ui_services(UiAccess {
+            rich: true,
+            overlay: true,
+            claims: vec!["workspaceline".to_string()],
+        });
+        for slot in UiSlot::ALL {
+            let result = services.ui_mount(slot.as_str(), &UiNode::text(slot.as_str()));
+            match ui_slot_placement(slot) {
+                UiSlotPlacement::Band(_) => {
+                    let handle = result.unwrap_or_else(|e| panic!("{slot}: {e:?}"));
+                    services.with_ui_blocks(|blocks| {
+                        assert_eq!(blocks.get(handle).map(UiBlock::ui_slot), Some(slot));
+                    });
+                }
+                UiSlotPlacement::Unsupported(_) => {
+                    let error = result.expect_err("unhosted slot must fail closed");
+                    assert_eq!(error.code, crate::E_UI_SLOT_UNSUPPORTED, "{slot}");
+                }
+            }
+        }
+        // top, bottom, left, right, statusline
+        services.with_ui_blocks(|blocks| assert_eq!(blocks.len(), 5));
     }
 
     #[test]

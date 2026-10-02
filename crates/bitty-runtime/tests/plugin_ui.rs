@@ -11,12 +11,13 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use bitty_lua::ui::UI_MAX_BLOCKS;
+use bitty_lua::ui::{UI_MAX_BLOCKS, UiSlot};
 use bitty_lua::{BridgeError, LuaValue, UiNode};
 use bitty_plugin_host::manifest::PluginId;
 use bitty_runtime::plugin_runtime::{
     LifecycleState, PluginRuntime, PluginRuntimeConfig, SettingsSource, SnapshotSource,
 };
+use bitty_runtime::{BandEdge, ChromeBands, E_UI_SLOT_UNSUPPORTED};
 
 #[derive(Default)]
 struct MapSettings(BTreeMap<String, LuaValue>);
@@ -325,16 +326,96 @@ fn tabline_slot_requires_exclusive_claim() {
         &["ui.rich"],
         &["tabline"],
         r#"
-        local ok, handle = pcall(bitty.ui.mount, "tabline", { kind = "Text", text = "x" })
+        local ok, err = pcall(bitty.ui.mount, "tabline", { kind = "Text", text = "x" })
         bitty.store.set("ok", ok)
-        bitty.store.set("handle", ok and handle or -1)
+        bitty.store.set("code", ok and "NONE" or err.code)
+        return {}
+        "#,
+    );
+    // CTX-0923: the claim gate passes, but `tabline` is reserved for PW-10
+    // panel tabs and has no host surface, so the mount fails closed with a
+    // typed error instead of being stored and never rendered.
+    assert_eq!(
+        store_value(&claimed.runtime, &claimed.id, "ok"),
+        Some(LuaValue::Bool(false))
+    );
+    assert_eq!(
+        store_value(&claimed.runtime, &claimed.id, "code"),
+        Some(LuaValue::String(E_UI_SLOT_UNSUPPORTED.to_string()))
+    );
+    claimed
+        .runtime
+        .services(&claimed.id)
+        .expect("services")
+        .with_ui_blocks(|blocks| assert!(blocks.is_empty()));
+}
+
+#[test]
+fn overlay_slot_with_grant_fails_closed_as_unhosted() {
+    let fixture = Fixture::activate(
+        "overlay-granted",
+        "bitty-featured.uioverlay2",
+        &["ui.rich", "ui.overlay"],
+        &[],
+        r#"
+        local ok, err = pcall(bitty.ui.mount, "overlay", { kind = "Text", text = "x" })
+        bitty.store.set("code", ok and "NONE" or err.code)
         return {}
         "#,
     );
     assert_eq!(
-        store_value(&claimed.runtime, &claimed.id, "ok"),
-        Some(LuaValue::Bool(true))
+        store_value(&fixture.runtime, &fixture.id, "code"),
+        Some(LuaValue::String(E_UI_SLOT_UNSUPPORTED.to_string()))
     );
+}
+
+#[test]
+fn lua_band_slot_mounts_land_in_the_expected_band() {
+    // CTX-0923: the statusline plugin's `ui.mount("statusline")` must reach
+    // the bottom band, next to plain `bottom` mounts; `top` reaches the top.
+    let fixture = Fixture::activate(
+        "bands",
+        "bitty-featured.uibands",
+        &["ui.rich"],
+        &[],
+        r#"
+        bitty.ui.mount("statusline", { kind = "Text", text = "status" })
+        bitty.ui.mount("top", { kind = "Text", text = "top" })
+        bitty.ui.mount("bottom", { kind = "Text", text = "bottom" })
+        bitty.ui.mount("left", { kind = "Text", text = "left" })
+        bitty.ui.mount("right", { kind = "Text", text = "right" })
+        local ok, err = pcall(bitty.ui.mount, "nowhere", { kind = "Text", text = "x" })
+        bitty.store.set("unknown_code", ok and "NONE" or err.code)
+        return {}
+        "#,
+    );
+    assert_eq!(
+        store_value(&fixture.runtime, &fixture.id, "unknown_code"),
+        Some(LuaValue::String("E_UI_COMPONENT_INVALID".to_string()))
+    );
+    let (bands, unplaced) = ChromeBands::from_mounts(
+        fixture
+            .runtime
+            .ui_blocks()
+            .into_iter()
+            .map(|(id, slot, node, version)| (id.to_string(), slot, node, version)),
+    );
+    assert_eq!(unplaced, 0);
+    let slots = |edge| {
+        bands
+            .edge(edge)
+            .iter()
+            .map(|band| band.slot)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(slots(BandEdge::Top), [UiSlot::Top]);
+    // One plugin, two bottom-edge mounts: mount order is kept.
+    assert_eq!(
+        slots(BandEdge::Bottom),
+        [UiSlot::Statusline, UiSlot::Bottom]
+    );
+    assert_eq!(slots(BandEdge::Left), [UiSlot::Left]);
+    assert_eq!(slots(BandEdge::Right), [UiSlot::Right]);
 }
 
 #[test]

@@ -35,16 +35,87 @@ use phodopus::Value;
 
 use crate::host::{BridgeError, LuaValue, MarshallingLimits};
 
-/// Accepted closed slot set for `bitty.ui.mount` (ADR-0009 `LUA-OQ-7`).
+/// Accepted closed slot set for `bitty.ui.mount` (ADR-0009 `LUA-OQ-7`,
+/// frozen for v1 by OQ-056).
+///
+/// This enum is the single source of truth for slot names: the Lua bridge,
+/// the host `ui_mount` gate, and the host band routing all parse through
+/// [`UiSlot::parse`], so validation and rendering cannot disagree about which
+/// names exist. Whether a host actually presents a slot is host policy (see
+/// `bitty_runtime::ui_slot_placement`), never a silent drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum UiSlot {
+    /// `terminal` — content attached to a terminal view.
+    Terminal,
+    /// `top` — top edge band.
+    Top,
+    /// `bottom` — bottom edge band.
+    Bottom,
+    /// `left` — left edge band.
+    Left,
+    /// `right` — right edge band.
+    Right,
+    /// `tabline` — exclusive-claim tab strip (reserved for panel tabs).
+    Tabline,
+    /// `statusline` — composable status components.
+    Statusline,
+    /// `overlay` — non-focusable presentation overlay (needs `ui.overlay`).
+    Overlay,
+}
+
+impl UiSlot {
+    /// Every accepted slot, in the canonical declaration order.
+    pub const ALL: [Self; 8] = [
+        Self::Terminal,
+        Self::Top,
+        Self::Bottom,
+        Self::Left,
+        Self::Right,
+        Self::Tabline,
+        Self::Statusline,
+        Self::Overlay,
+    ];
+
+    /// Parse a Lua slot name; `None` for any name outside the closed set
+    /// (exact, case-sensitive match — no aliases).
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|slot| slot.as_str() == name)
+    }
+
+    /// Canonical Lua spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Terminal => "terminal",
+            Self::Top => "top",
+            Self::Bottom => "bottom",
+            Self::Left => "left",
+            Self::Right => "right",
+            Self::Tabline => "tabline",
+            Self::Statusline => "statusline",
+            Self::Overlay => "overlay",
+        }
+    }
+}
+
+impl std::fmt::Display for UiSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Accepted closed slot set for `bitty.ui.mount` as strings, in
+/// [`UiSlot::ALL`] order (kept for callers that list names).
 pub const UI_SLOTS: [&str; 8] = [
-    "terminal",
-    "top",
-    "bottom",
-    "left",
-    "right",
-    "tabline",
-    "statusline",
-    "overlay",
+    UiSlot::Terminal.as_str(),
+    UiSlot::Top.as_str(),
+    UiSlot::Bottom.as_str(),
+    UiSlot::Left.as_str(),
+    UiSlot::Right.as_str(),
+    UiSlot::Tabline.as_str(),
+    UiSlot::Statusline.as_str(),
+    UiSlot::Overlay.as_str(),
 ];
 
 /// v1 declarative node kinds accepted by the Lua bridge.
@@ -408,7 +479,7 @@ impl UiNode {
 /// Whether `slot` is a member of the accepted closed slot set.
 #[must_use]
 pub fn is_ui_slot(slot: &str) -> bool {
-    UI_SLOTS.contains(&slot)
+    UiSlot::parse(slot).is_some()
 }
 
 /// Validates a theme token name (CTX-0890).
@@ -552,6 +623,21 @@ pub fn read_component(value: Value<'_>) -> Result<UiNode, BridgeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ui_slot_enum_is_the_closed_v1_set() {
+        // CTX-0923 / OQ-056: the enum, the string list, and the predicate
+        // agree, and parsing is exact (no case folding, no aliases).
+        assert_eq!(UiSlot::ALL.map(UiSlot::as_str), UI_SLOTS);
+        for slot in UiSlot::ALL {
+            assert_eq!(UiSlot::parse(slot.as_str()), Some(slot));
+            assert!(is_ui_slot(slot.as_str()));
+        }
+        for bad in ["", "Statusline", "status", "workspaceline", "tabs", " top"] {
+            assert_eq!(UiSlot::parse(bad), None, "{bad:?}");
+            assert!(!is_ui_slot(bad));
+        }
+    }
 
     fn text(value: &str) -> LuaValue {
         LuaValue::table([

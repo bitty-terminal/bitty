@@ -2,6 +2,7 @@
 //!
 //! Split from `super` (`runtime.rs`) as a pure move under CTX-0232:
 //! byte-identical logic, only module wiring changed.
+use super::band_slots::BandEdge;
 use super::*;
 use bitty_render::gpu::PresentStats as RenderPresentStats;
 
@@ -2206,14 +2207,18 @@ impl Runtime {
             y_offset += live.height as i32;
         }
 
-        // Render bottom bands at window bottom
-        let window_height = self.window_cells.height as i32 * live.height as i32;
-        let mut bottom_y = window_height - (bands.bottom.len() as i32 * live.height as i32);
-        for band in &bands.bottom {
+        // Render bottom bands (`bottom` and `statusline` mounts, CTX-0923)
+        // from the window bottom inward: index 0 sits on the last row.
+        for (index, band) in bands.bottom.iter().enumerate() {
+            let Some(row) =
+                ChromeBands::band_row(BandEdge::Bottom, index, self.window_cells.height)
+            else {
+                break;
+            };
             let text_line = self.extract_text_from_node(&band.root);
             if !text_line.is_empty() {
                 let origin_x = pad_px;
-                let origin_y = px_add(pad_px, bottom_y);
+                let origin_y = px_add(pad_px, i32::from(row) * live.height as i32);
 
                 let fg = self.config.theme.foreground;
                 let bg = self.config.theme.background;
@@ -2237,7 +2242,6 @@ impl Runtime {
                 layers.combined_glyphs.extend(glyphs);
                 layers.any_needs_draw = true;
             }
-            bottom_y += live.height as i32;
         }
     }
 

@@ -193,6 +193,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Every v1 UI slot is honoured or rejected (CTX-0923, OQ-056):** the
+  chrome band host no longer drops `bitty.ui.mount` blocks whose slot is not
+  `top`/`bottom`/`left`/`right`. A new closed `bitty_lua::ui::UiSlot` enum
+  is the only slot vocabulary, and `bitty_runtime::ui_slot_placement` is the
+  single placement policy used by both the `ui.mount` gate and band routing.
+  `statusline` mounts now render on the bottom band (the statusline plugin's
+  `ui.mount("statusline")` is visible). `tabline` (reserved for PW-10 panel
+  tabs, not a band surface), `overlay`, and `terminal` mounts fail closed with
+  the new `E_UI_SLOT_UNSUPPORTED` (`runtime` class) after the capability and
+  claim gates, instead of being stored and never rendered. Bands on one edge
+  now stack from the window edge inward in plugin id byte order, independent
+  of mount order; the bottom band's first surface sits on the last row.
+
 - **Synchronize damage rects with wide-character expansion (CTX-0887, #1555):**
   `Grid::erase_range_in_row` now returns `Option<(usize, usize)>` with the
   actual inclusive column bounds after expanding outward across wide-character

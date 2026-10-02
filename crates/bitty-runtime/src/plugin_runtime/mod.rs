@@ -619,8 +619,9 @@ impl PluginRuntime {
     /// Iterate over all mounted UI blocks across all activated plugins (CTX-0892).
     ///
     /// Returns (plugin_id, slot, node, version) tuples. Order is discovery
-    /// order. Rendering is deferred to the host; this is read-only access.
-    pub fn ui_blocks(&self) -> Vec<(PluginId, String, UiNode, u32)> {
+    /// order; band placement and stacking are owned by
+    /// [`crate::ChromeBands::from_mounts`]. Read-only access.
+    pub fn ui_blocks(&self) -> Vec<(PluginId, bitty_lua::ui::UiSlot, UiNode, u32)> {
         let mut result = Vec::new();
         for id in &self.order {
             if let Some(entry) = self.entries.get(id) {
@@ -629,7 +630,7 @@ impl PluginRuntime {
                         for (_handle, block) in blocks.iter() {
                             result.push((
                                 id.clone(),
-                                block.slot().to_string(),
+                                block.ui_slot(),
                                 block.node().clone(),
                                 block.version(),
                             ));

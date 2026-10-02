@@ -89,7 +89,7 @@ pub use host::{
     WORKSPACE_RENAME_MAX_BYTES, WorkspaceAttention, WorkspaceInfo, WorkspaceRequest,
     env_grant_authorizes, env_grant_shape_ok, env_key_shape_ok, validate_env_key,
 };
-pub use ui::{UI_MAX_DEPTH, UI_MAX_TEXT_BYTES, UI_SLOTS, UI_V1_NODE_KINDS, UiNode};
+pub use ui::{UI_MAX_DEPTH, UI_MAX_TEXT_BYTES, UI_SLOTS, UI_V1_NODE_KINDS, UiNode, UiSlot};
 
 // ── RC budgets (aligned with bitty-plugin-host/src/event.rs) ───────────────
 

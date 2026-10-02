@@ -32,6 +32,11 @@ pub(crate) fn window_title_for_theme(theme_name: &str, source: &str) -> String {
 /// less, so the app clips here before the OS ever sees the string.
 pub(crate) const WINDOW_TITLE_MAX_CHARS: usize = 256;
 
+/// One-shot latch bounding the "UI block in an unhosted slot" diagnostic
+/// (CTX-0923) to a single line per process.
+static UNPLACED_UI_BLOCK_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Strips control characters from a terminal-reported title (CTX-0382) and
 /// bounds it to [`WINDOW_TITLE_MAX_CHARS`].
 ///
@@ -880,26 +885,23 @@ impl TerminalApp {
             return;
         };
         let blocks = plugin_runtime.ui_blocks();
-        let mut bands = bitty_runtime::ChromeBands {
-            top: Vec::new(),
-            bottom: Vec::new(),
-            left: Vec::new(),
-            right: Vec::new(),
-        };
-        for (plugin_id, slot, node, version) in blocks {
-            let content = bitty_runtime::BandContent {
-                plugin_id: plugin_id.to_string(),
-                slot: slot.clone(),
-                root: node,
-                version,
-            };
-            match slot.as_str() {
-                "top" => bands.top.push(content),
-                "bottom" => bands.bottom.push(content),
-                "left" => bands.left.push(content),
-                "right" => bands.right.push(content),
-                _ => {} // Unknown slots are silently ignored
-            }
+        // CTX-0923: slot routing and stacking live in one place
+        // (`bitty_runtime::ui_slot_placement` via `ChromeBands::from_mounts`),
+        // the same policy the `ui.mount` gate uses: `statusline` joins the
+        // bottom band, and `tabline`/`overlay`/`terminal` mounts are rejected
+        // at mount time with `E_UI_SLOT_UNSUPPORTED`, never dropped here.
+        let (bands, unplaced) =
+            bitty_runtime::ChromeBands::from_mounts(blocks.into_iter().map(
+                |(plugin_id, slot, node, version)| (plugin_id.to_string(), slot, node, version),
+            ));
+        if unplaced > 0
+            && !UNPLACED_UI_BLOCK_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            // Unreachable while the mount gate holds; keep it observable but
+            // bounded (one diagnostic per process, not one per tick).
+            crate::logging::warn(|| {
+                format!("bitty: {unplaced} mounted UI block(s) in an unhosted slot were not placed")
+            });
         }
         self.runtime.set_chrome_bands(bands);
     }

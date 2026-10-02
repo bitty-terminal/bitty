@@ -710,7 +710,9 @@ pub trait HostServices {
     /// The bridge validates the `slot`/`component` pair against the accepted
     /// v1 contract before this call; the implementation owns capability
     /// gating (`ui.rich`; `ui.overlay` for the `overlay` slot; an exclusive
-    /// claim for `tabline`) and the generation-owned block registry. Returns
+    /// claim for `tabline`) and the generation-owned block registry. A host
+    /// that does not present an accepted slot must fail closed with a typed
+    /// error rather than store a block it never renders (CTX-0923). Returns
     /// the opaque, generation-owned `block_id` handle.
     ///
     /// The default implementation fails closed: a host without a mount path

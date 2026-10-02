@@ -3,7 +3,7 @@
 //! Verifies that UiBlocks mounted by plugins render correctly as chrome bands
 //! at window edges with click-to-command routing.
 
-use bitty_lua::ui::UiNode;
+use bitty_lua::ui::{UiNode, UiSlot};
 use bitty_runtime::{BandContent, ChromeBands, Runtime};
 
 /// Helper to create a minimal runtime for band testing.
@@ -37,7 +37,7 @@ fn single_top_band_with_text_node() {
 
     let band = BandContent {
         plugin_id: "test-plugin".to_string(),
-        slot: "top".to_string(),
+        slot: UiSlot::Top,
         root: text_node,
         version: 1,
     };
@@ -60,7 +60,7 @@ fn multiple_top_bands_stack_vertically() {
 
     let band1 = BandContent {
         plugin_id: "plugin-1".to_string(),
-        slot: "top".to_string(),
+        slot: UiSlot::Top,
         root: UiNode::Text {
             text: "Band 1".to_string(),
             fg: None,
@@ -73,7 +73,7 @@ fn multiple_top_bands_stack_vertically() {
 
     let band2 = BandContent {
         plugin_id: "plugin-2".to_string(),
-        slot: "top".to_string(),
+        slot: UiSlot::Top,
         root: UiNode::Text {
             text: "Band 2".to_string(),
             fg: None,
@@ -101,7 +101,7 @@ fn bottom_band_renders_at_window_bottom() {
 
     let band = BandContent {
         plugin_id: "statusline".to_string(),
-        slot: "bottom".to_string(),
+        slot: UiSlot::Bottom,
         root: UiNode::Text {
             text: "statusline content".to_string(),
             fg: Some("foreground".to_string()),
@@ -152,7 +152,7 @@ fn row_node_concatenates_children() {
 
     let band = BandContent {
         plugin_id: "test".to_string(),
-        slot: "top".to_string(),
+        slot: UiSlot::Top,
         root: row_node,
         version: 1,
     };
@@ -197,7 +197,7 @@ fn list_node_children_concatenate() {
 
     let band = BandContent {
         plugin_id: "test".to_string(),
-        slot: "bottom".to_string(),
+        slot: UiSlot::Bottom,
         root: list_node,
         version: 1,
     };
@@ -219,7 +219,7 @@ fn band_version_increments_on_remount() {
 
     let band_v1 = BandContent {
         plugin_id: "test".to_string(),
-        slot: "top".to_string(),
+        slot: UiSlot::Top,
         root: UiNode::Text {
             text: "Version 1".to_string(),
             fg: None,
@@ -245,7 +245,7 @@ fn band_version_increments_on_remount() {
     // Remount with incremented version
     let band_v2 = BandContent {
         plugin_id: "test".to_string(),
-        slot: "top".to_string(),
+        slot: UiSlot::Top,
         root: UiNode::Text {
             text: "Version 2".to_string(),
             fg: None,
@@ -281,7 +281,7 @@ fn no_mount_produces_empty_bands() {
     // Now add a band
     let band = BandContent {
         plugin_id: "test".to_string(),
-        slot: "top".to_string(),
+        slot: UiSlot::Top,
         root: UiNode::Text {
             text: "Now mounted".to_string(),
             fg: None,

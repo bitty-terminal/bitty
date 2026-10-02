@@ -21,23 +21,42 @@
 //! | `overlay`    | rejected: no plugin overlay host in the band renderer yet |
 //! | `terminal`   | rejected: no terminal-attached block host yet          |
 //!
-//! Rejected slots fail closed at `ui.mount` with [`E_UI_SLOT_UNSUPPORTED`]
-//! (class `runtime`), after the capability and claim gates, so a plugin
-//! learns the slot is unhosted instead of rendering nothing.
+//! Rejected slots fail closed at `ui.mount` with the existing v1 code
+//! [`E_UI_UNAVAILABLE`] (class `runtime`, "host has no surface"), after the
+//! capability and claim gates, so a plugin learns the slot is unhosted
+//! instead of rendering nothing. The message names the slot and the reason.
+//! No new code is added to the OQ-056-frozen v1 error vocabulary.
 //!
 //! Stacking: within one edge, surfaces stack from the window edge inward
 //! (index `0` is outermost) in plugin id byte order; mount order never
 //! affects placement, and `statusline` and `bottom` surfaces share one
-//! ordering. Several mounts from one plugin on one edge keep mount order.
-//! The `chrome.<edge>.order` key is not yet wired into the runtime.
+//! ordering. The `chrome.<edge>.order` key is not yet wired into the runtime.
+//!
+//! Core reservation: plugin bands start inward of the rows the Core
+//! workspaceline band reserves on the same edge
+//! ([`crate::Runtime::status_bar_band`], solved once by
+//! `chrome_band::solve`), so with `workspace.bar.edge = bottom` (default) and
+//! two or more workspaces bottom band `0` sits on row `H-2`, never on the
+//! Core bar row `H-1`; the same holds for top bands with `edge = top`. See
+//! [`crate::Runtime::plugin_band_row`].
+//!
+//! Known gaps (tracked follow-ups, not implemented here):
+//!
+//! - Plugin bands reserve no exclusive zone (candidate Chrome Surface API,
+//!   L0 "Exclusive zone"): they are painted as an overlay over the layout
+//!   container, so a band covers the terminal content row it sits on (the
+//!   last content row for bottom band `0`).
+//! - Known divergence from the candidate rule "one plugin may hold at most
+//!   one surface per edge; a second mount on the same edge fails": several
+//!   mounts from one plugin on one edge (for example `statusline` and
+//!   `bottom`) are all kept and stack in mount order. Enforcing the candidate
+//!   rule later is a deliberate behavior change, not a regression.
 
 use bitty_lua::host::BridgeError;
+pub use bitty_lua::host::E_UI_UNAVAILABLE;
 use bitty_lua::ui::{UiNode, UiSlot};
 
-use super::{BandContent, ChromeBands};
-
-/// Stable code for an accepted v1 slot this host does not present.
-pub const E_UI_SLOT_UNSUPPORTED: &str = "E_UI_SLOT_UNSUPPORTED";
+use super::{BandContent, ChromeBands, Runtime};
 
 /// Window edge carrying a chrome band.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -58,7 +77,7 @@ pub enum UiSlotPlacement {
     /// Mounted content joins the band on this edge.
     Band(BandEdge),
     /// The slot is accepted by the v1 contract but not hosted; mounts fail
-    /// closed with [`E_UI_SLOT_UNSUPPORTED`] and this reason.
+    /// closed with [`E_UI_UNAVAILABLE`] and this reason.
     Unsupported(&'static str),
 }
 
@@ -82,12 +101,12 @@ pub const fn ui_slot_placement(slot: UiSlot) -> UiSlotPlacement {
     }
 }
 
-/// Typed `E_UI_SLOT_UNSUPPORTED` error for an unhosted accepted slot.
+/// Typed `E_UI_UNAVAILABLE` error for an unhosted accepted slot.
 #[must_use]
 pub fn unsupported_slot_error(slot: UiSlot, reason: &str) -> BridgeError {
     BridgeError::new(
         "runtime",
-        E_UI_SLOT_UNSUPPORTED,
+        E_UI_UNAVAILABLE,
         format!("UI slot '{slot}' {reason}"),
     )
 }
@@ -151,19 +170,56 @@ impl ChromeBands {
     }
 
     /// Window row (cells) painted by horizontal band `index` on `edge` in a
-    /// window `window_rows` tall, stacking from the edge inward; `None` for a
-    /// vertical edge or a band that does not fit.
+    /// window `window_rows` tall, stacking from the edge inward and starting
+    /// inward of the `core_reserved` rows the Core workspaceline band holds
+    /// on that edge; `None` for a vertical edge or a band that does not fit.
     #[must_use]
-    pub fn band_row(edge: BandEdge, index: usize, window_rows: u16) -> Option<u16> {
-        let index = u16::try_from(index).ok()?;
-        if index >= window_rows {
+    pub fn band_row(
+        edge: BandEdge,
+        index: usize,
+        window_rows: u16,
+        core_reserved: u16,
+    ) -> Option<u16> {
+        let offset = core_reserved.checked_add(u16::try_from(index).ok()?)?;
+        if offset >= window_rows {
             return None;
         }
         match edge {
-            BandEdge::Top => Some(index),
-            BandEdge::Bottom => Some(window_rows - 1 - index),
+            BandEdge::Top => Some(offset),
+            BandEdge::Bottom => Some(window_rows - 1 - offset),
             BandEdge::Left | BandEdge::Right => None,
         }
+    }
+}
+
+impl Runtime {
+    /// Rows the Core workspaceline band reserves on horizontal `edge`
+    /// (`0` when no band is reserved there or for a vertical edge).
+    ///
+    /// Derived from the single chrome solve ([`Self::status_bar_band`]), so
+    /// plugin band stacking can never drift from the Core reservation.
+    #[must_use]
+    pub fn core_reserved_rows(&self, edge: BandEdge) -> u16 {
+        let window = self.window_cells();
+        let Some(bar) = self.status_bar_band() else {
+            return 0;
+        };
+        let bar_end = bar.y.saturating_add(bar.height);
+        match edge {
+            BandEdge::Top if bar.y == window.y => bar.height,
+            BandEdge::Bottom if bar_end == window.y.saturating_add(window.height) => bar.height,
+            _ => 0,
+        }
+    }
+
+    /// Window row painted by plugin band `index` on `edge`, offset inward of
+    /// the Core workspaceline band on that edge (see
+    /// [`ChromeBands::band_row`]); `None` when it does not fit.
+    #[must_use]
+    pub fn plugin_band_row(&self, edge: BandEdge, index: usize) -> Option<u16> {
+        let window = self.window_cells();
+        ChromeBands::band_row(edge, index, window.height, self.core_reserved_rows(edge))
+            .map(|row| row.saturating_add(window.y))
     }
 }
 
@@ -245,12 +301,25 @@ mod tests {
 
     #[test]
     fn band_rows_stack_from_the_window_edge_inward() {
-        assert_eq!(ChromeBands::band_row(BandEdge::Top, 0, 24), Some(0));
-        assert_eq!(ChromeBands::band_row(BandEdge::Top, 1, 24), Some(1));
-        assert_eq!(ChromeBands::band_row(BandEdge::Bottom, 0, 24), Some(23));
-        assert_eq!(ChromeBands::band_row(BandEdge::Bottom, 1, 24), Some(22));
-        assert_eq!(ChromeBands::band_row(BandEdge::Bottom, 24, 24), None);
-        assert_eq!(ChromeBands::band_row(BandEdge::Left, 0, 24), None);
+        assert_eq!(ChromeBands::band_row(BandEdge::Top, 0, 24, 0), Some(0));
+        assert_eq!(ChromeBands::band_row(BandEdge::Top, 1, 24, 0), Some(1));
+        assert_eq!(ChromeBands::band_row(BandEdge::Bottom, 0, 24, 0), Some(23));
+        assert_eq!(ChromeBands::band_row(BandEdge::Bottom, 1, 24, 0), Some(22));
+        assert_eq!(ChromeBands::band_row(BandEdge::Bottom, 24, 24, 0), None);
+        assert_eq!(ChromeBands::band_row(BandEdge::Left, 0, 24, 0), None);
+    }
+
+    #[test]
+    fn band_rows_start_inward_of_the_core_reservation() {
+        assert_eq!(ChromeBands::band_row(BandEdge::Top, 0, 24, 1), Some(1));
+        assert_eq!(ChromeBands::band_row(BandEdge::Bottom, 0, 24, 1), Some(22));
+        assert_eq!(ChromeBands::band_row(BandEdge::Bottom, 1, 24, 1), Some(21));
+        assert_eq!(ChromeBands::band_row(BandEdge::Bottom, 23, 24, 1), None);
+        assert_eq!(
+            ChromeBands::band_row(BandEdge::Top, usize::MAX, 24, 1),
+            None
+        );
+        assert_eq!(ChromeBands::band_row(BandEdge::Top, 1, 24, u16::MAX), None);
     }
 
     #[test]
@@ -259,8 +328,9 @@ mod tests {
             panic!("tabline must be unsupported");
         };
         let error = unsupported_slot_error(UiSlot::Tabline, reason);
-        assert_eq!(error.code, E_UI_SLOT_UNSUPPORTED);
+        assert_eq!(error.code, E_UI_UNAVAILABLE);
         assert_eq!(error.class, "runtime");
         assert!(error.message.contains("'tabline'"));
+        assert!(error.message.contains(reason));
     }
 }

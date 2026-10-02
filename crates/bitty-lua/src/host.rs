@@ -472,6 +472,11 @@ impl MarshalBudget {
     }
 }
 
+/// Stable `runtime`-class code for a UI surface the host does not present
+/// (Plugin API v1, OQ-056): the default host's `ui.mount`/`ui.update`, and an
+/// accepted v1 slot that a concrete host does not render (CTX-0923).
+pub const E_UI_UNAVAILABLE: &str = "E_UI_UNAVAILABLE";
+
 /// Typed, bounded bridge/diagnostic error.
 ///
 /// `class` is one of the accepted diagnostic classes (`runtime`, `validation`,
@@ -711,8 +716,9 @@ pub trait HostServices {
     /// v1 contract before this call; the implementation owns capability
     /// gating (`ui.rich`; `ui.overlay` for the `overlay` slot; an exclusive
     /// claim for `tabline`) and the generation-owned block registry. A host
-    /// that does not present an accepted slot must fail closed with a typed
-    /// error rather than store a block it never renders (CTX-0923). Returns
+    /// that does not present an accepted slot must fail closed with
+    /// [`E_UI_UNAVAILABLE`] (naming the slot and reason) rather than store a
+    /// block it never renders (CTX-0923). Returns
     /// the opaque, generation-owned `block_id` handle.
     ///
     /// The default implementation fails closed: a host without a mount path
@@ -721,7 +727,7 @@ pub trait HostServices {
     fn ui_mount(&self, _slot: &str, _component: &UiNode) -> Result<i64, BridgeError> {
         Err(BridgeError::new(
             "runtime",
-            "E_UI_UNAVAILABLE",
+            E_UI_UNAVAILABLE,
             "host has no ui.mount surface",
         ))
     }
@@ -753,7 +759,7 @@ pub trait HostServices {
     fn ui_update(&self, _handle: i64, _component: &UiNode) -> Result<bool, BridgeError> {
         Err(BridgeError::new(
             "runtime",
-            "E_UI_UNAVAILABLE",
+            E_UI_UNAVAILABLE,
             "host has no ui.update surface",
         ))
     }

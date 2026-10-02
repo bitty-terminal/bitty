@@ -17,7 +17,7 @@ use bitty_plugin_host::manifest::PluginId;
 use bitty_runtime::plugin_runtime::{
     LifecycleState, PluginRuntime, PluginRuntimeConfig, SettingsSource, SnapshotSource,
 };
-use bitty_runtime::{BandEdge, ChromeBands, E_UI_SLOT_UNSUPPORTED};
+use bitty_runtime::{BandEdge, ChromeBands, E_UI_UNAVAILABLE};
 
 #[derive(Default)]
 struct MapSettings(BTreeMap<String, LuaValue>);
@@ -341,7 +341,7 @@ fn tabline_slot_requires_exclusive_claim() {
     );
     assert_eq!(
         store_value(&claimed.runtime, &claimed.id, "code"),
-        Some(LuaValue::String(E_UI_SLOT_UNSUPPORTED.to_string()))
+        Some(LuaValue::String(E_UI_UNAVAILABLE.to_string()))
     );
     claimed
         .runtime
@@ -365,7 +365,7 @@ fn overlay_slot_with_grant_fails_closed_as_unhosted() {
     );
     assert_eq!(
         store_value(&fixture.runtime, &fixture.id, "code"),
-        Some(LuaValue::String(E_UI_SLOT_UNSUPPORTED.to_string()))
+        Some(LuaValue::String(E_UI_UNAVAILABLE.to_string()))
     );
 }
 

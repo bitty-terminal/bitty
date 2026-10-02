@@ -2164,81 +2164,45 @@ impl Runtime {
     /// with theme-resolved fg/bg/bold attributes. Row nodes stack horizontally,
     /// List/Column nodes are treated as Row (vertical stacking deferred). Bands
     /// are rendered after overlays so they appear above terminal content.
+    ///
+    /// Horizontal bands stack from the window edge inward, starting inward
+    /// of the Core workspaceline band on the same edge
+    /// ([`Runtime::plugin_band_row`], CTX-0923). They reserve no exclusive
+    /// zone yet: a band overlays the layout container row it sits on.
     fn paint_chrome_bands(&mut self, pad_px: i32, layers: &mut FrameLayers) {
-        let bands = &self.chrome_bands;
         let live = self.live_cell_metrics();
         if live.width == 0 || live.height == 0 {
             return;
         }
+        let cell_h = i32::try_from(live.height).unwrap_or(i32::MAX);
+        let fg = self.config.theme.foreground;
+        let bg = self.config.theme.background;
 
-        // Render top bands at y=0
-        let mut y_offset = 0i32;
-        for band in &bands.top {
-            let text_line = self.extract_text_from_node(&band.root);
-            if !text_line.is_empty() {
+        for edge in [BandEdge::Top, BandEdge::Bottom] {
+            for (index, band) in self.chrome_bands.edge(edge).iter().enumerate() {
+                let Some(row) = self.plugin_band_row(edge, index) else {
+                    break;
+                };
+                let text_line = self.extract_text_from_node(&band.root);
+                if text_line.is_empty() {
+                    continue;
+                }
                 let origin_x = pad_px;
-                let origin_y = px_add(pad_px, y_offset);
-
-                // Default colors
-                let fg = self.config.theme.foreground;
-                let bg = self.config.theme.background;
-
-                // Render background fill for the band
-                layers.combined_overlay.push(bitty_render::grid::FillRect {
-                    rect: bitty_render::geometry::RectPx::new(
-                        origin_x,
-                        origin_y,
-                        px_span_usize(text_line.len().min(self.cols), live.width),
-                        live.height,
-                    ),
-                    color: bg,
-                });
-
-                // Render text glyphs
-                let glyphs = self.renderer.overlay_text_glyphs(
-                    &text_line,
-                    (origin_x, origin_y),
-                    text_line.len().min(self.cols),
-                    fg,
-                );
-                layers.combined_glyphs.extend(glyphs);
-                layers.any_needs_draw = true;
-            }
-            y_offset += live.height as i32;
-        }
-
-        // Render bottom bands (`bottom` and `statusline` mounts, CTX-0923)
-        // from the window bottom inward: index 0 sits on the last row.
-        for (index, band) in bands.bottom.iter().enumerate() {
-            let Some(row) =
-                ChromeBands::band_row(BandEdge::Bottom, index, self.window_cells.height)
-            else {
-                break;
-            };
-            let text_line = self.extract_text_from_node(&band.root);
-            if !text_line.is_empty() {
-                let origin_x = pad_px;
-                let origin_y = px_add(pad_px, i32::from(row) * live.height as i32);
-
-                let fg = self.config.theme.foreground;
-                let bg = self.config.theme.background;
+                let origin_y = px_add(pad_px, i32::from(row).saturating_mul(cell_h));
+                let cols = text_line.len().min(self.cols);
 
                 layers.combined_overlay.push(bitty_render::grid::FillRect {
                     rect: bitty_render::geometry::RectPx::new(
                         origin_x,
                         origin_y,
-                        px_span_usize(text_line.len().min(self.cols), live.width),
+                        px_span_usize(cols, live.width),
                         live.height,
                     ),
                     color: bg,
                 });
-
-                let glyphs = self.renderer.overlay_text_glyphs(
-                    &text_line,
-                    (origin_x, origin_y),
-                    text_line.len().min(self.cols),
-                    fg,
-                );
+                let glyphs =
+                    self.renderer
+                        .overlay_text_glyphs(&text_line, (origin_x, origin_y), cols, fg);
                 layers.combined_glyphs.extend(glyphs);
                 layers.any_needs_draw = true;
             }

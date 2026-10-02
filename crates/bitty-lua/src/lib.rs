@@ -75,9 +75,9 @@ pub use config::{
     ViewOverrideData, WindowData,
 };
 pub use host::{
-    API_VERSION, BoundedExecution, BridgeError, CommandRegistration, ENV_KEY_MAX_BYTES,
-    EventSubscription, HostServices, KeymapSuggestion, LuaValue, MarshallingLimits,
-    REGISTRATION_MAX_COMMANDS, REGISTRATION_MAX_DESCRIPTION_BYTES,
+    API_VERSION, BoundedExecution, BridgeError, CommandRegistration, E_UI_UNAVAILABLE,
+    ENV_KEY_MAX_BYTES, EventSubscription, HostServices, KeymapSuggestion, LuaValue,
+    MarshallingLimits, REGISTRATION_MAX_COMMANDS, REGISTRATION_MAX_DESCRIPTION_BYTES,
     REGISTRATION_MAX_EVENT_KIND_BYTES, REGISTRATION_MAX_EVENTS, REGISTRATION_MAX_ID_BYTES,
     REGISTRATION_MAX_KEYMAP_CHORD_BYTES, REGISTRATION_MAX_KEYMAP_COMMAND_BYTES,
     REGISTRATION_MAX_KEYMAP_SUGGESTIONS, REGISTRATION_MAX_SERVICE_METHODS,

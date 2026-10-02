@@ -201,10 +201,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `statusline` mounts now render on the bottom band (the statusline plugin's
   `ui.mount("statusline")` is visible). `tabline` (reserved for PW-10 panel
   tabs, not a band surface), `overlay`, and `terminal` mounts fail closed with
-  the new `E_UI_SLOT_UNSUPPORTED` (`runtime` class) after the capability and
-  claim gates, instead of being stored and never rendered. Bands on one edge
-  now stack from the window edge inward in plugin id byte order, independent
-  of mount order; the bottom band's first surface sits on the last row.
+  the existing v1 code `E_UI_UNAVAILABLE` (`runtime` class; the message names
+  the slot and the reason) after the capability and claim gates, instead of
+  being stored and never rendered; no code is added to the OQ-056-frozen
+  error vocabulary. Bands on one edge now stack from the window edge inward
+  in plugin id byte order, independent of mount order, starting inward of the
+  Core workspaceline band on the same edge (`Runtime::plugin_band_row`, from
+  the single `status_bar_band()` reservation): with the default
+  `workspace.bar.edge = bottom` and two or more workspaces the statusline
+  band sits on the row above the workspaceline, never on it. Known gaps:
+  plugin bands reserve no exclusive zone yet, so a band overlays the terminal
+  content row it sits on (bottom band `0` covers the last content row); and
+  one plugin may keep several surfaces on one edge (for example `statusline`
+  and `bottom`), diverging from the candidate one-surface-per-edge rule.
 
 - **Synchronize damage rects with wide-character expansion (CTX-0887, #1555):**
   `Grid::erase_range_in_row` now returns `Option<(usize, usize)>` with the

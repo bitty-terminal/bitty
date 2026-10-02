@@ -889,7 +889,7 @@ impl TerminalApp {
         // (`bitty_runtime::ui_slot_placement` via `ChromeBands::from_mounts`),
         // the same policy the `ui.mount` gate uses: `statusline` joins the
         // bottom band, and `tabline`/`overlay`/`terminal` mounts are rejected
-        // at mount time with `E_UI_SLOT_UNSUPPORTED`, never dropped here.
+        // at mount time with `E_UI_UNAVAILABLE`, never dropped here.
         let (bands, unplaced) =
             bitty_runtime::ChromeBands::from_mounts(blocks.into_iter().map(
                 |(plugin_id, slot, node, version)| (plugin_id.to_string(), slot, node, version),

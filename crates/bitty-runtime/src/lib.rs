@@ -240,7 +240,7 @@ pub use execution::{
 pub use queue::{ColdEvent, ColdQueue};
 pub use runtime::background_images::validate_background_images;
 pub use runtime::band_slots::{
-    BandEdge, E_UI_SLOT_UNSUPPORTED, UiSlotPlacement, ui_slot_placement, unsupported_slot_error,
+    BandEdge, E_UI_UNAVAILABLE, UiSlotPlacement, ui_slot_placement, unsupported_slot_error,
 };
 pub use runtime::bell::{
     BELL_FLASH_DURATION, BellMode, NOTIFICATION_BANNER_DURATION, NOTIFICATION_QUEUE_CAPACITY,

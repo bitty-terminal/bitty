@@ -1892,7 +1892,7 @@ mod tests {
         let error = services
             .ui_mount("overlay", &UiNode::text("unhosted"))
             .expect_err("overlay is not hosted yet");
-        assert_eq!(error.code, crate::E_UI_SLOT_UNSUPPORTED);
+        assert_eq!(error.code, crate::E_UI_UNAVAILABLE);
         assert_eq!(error.class, "runtime");
         services.with_ui_blocks(|blocks| assert_eq!(blocks.len(), 1));
     }
@@ -1915,7 +1915,7 @@ mod tests {
         let error = services
             .ui_mount("tabline", &UiNode::text("claimed"))
             .expect_err("claimed tabline is not hosted yet");
-        assert_eq!(error.code, crate::E_UI_SLOT_UNSUPPORTED);
+        assert_eq!(error.code, crate::E_UI_UNAVAILABLE);
         services.set_ui_access(UiAccess {
             rich: true,
             overlay: false,
@@ -1924,7 +1924,7 @@ mod tests {
         let error = services
             .ui_mount("tabline", &UiNode::text("canonical claim"))
             .expect_err("canonical claim passes the gate, slot still unhosted");
-        assert_eq!(error.code, crate::E_UI_SLOT_UNSUPPORTED);
+        assert_eq!(error.code, crate::E_UI_UNAVAILABLE);
         services.with_ui_blocks(|blocks| assert!(blocks.is_empty()));
     }
 
@@ -1949,7 +1949,7 @@ mod tests {
                 }
                 UiSlotPlacement::Unsupported(_) => {
                     let error = result.expect_err("unhosted slot must fail closed");
-                    assert_eq!(error.code, crate::E_UI_SLOT_UNSUPPORTED, "{slot}");
+                    assert_eq!(error.code, crate::E_UI_UNAVAILABLE, "{slot}");
                 }
             }
         }

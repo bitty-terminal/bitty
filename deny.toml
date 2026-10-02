@@ -30,8 +30,9 @@ skip-tree = []
 # Zlib). The extras below are permissive licenses in use by unavoidable
 # transitive dependencies and are recorded for the ADR-0004 revision:
 # Unicode-3.0 -> unicode-ident, CC0-1.0 -> hexf-parse (naga),
-# BSL-1.0 -> clipboard-win / error-code (arboard on Windows),
-# CDLA-Permissive-2.0 -> webpki-root-certs (bitty-network-lua via rustls-platform-verifier).
+# BSL-1.0 -> clipboard-win / error-code (arboard on Windows).
+# CDLA-Permissive-2.0 (webpki-root-certs) left the graph with the embedded
+# bitty-network-lua path (CTX-0906, DIR-030).
 allow = [
   "MIT",
   "Apache-2.0",
@@ -43,7 +44,6 @@ allow = [
   "Unicode-3.0",
   "CC0-1.0",
   "BSL-1.0",
-  "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
 # ADR-0004 rule 5 prohibits MPL-2.0 anywhere in the shipped dependency graph.
@@ -66,8 +66,12 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # kyren/gc-arena is phodopus's own rev-pinned transitive dep (arena backing
 # for the Lua GC), not bitty's choice — kept visible here rather than hidden
 # behind a wildcard so any new git source still fails loudly.
-# bitty-network is pinned to commit d97c5da (includes MSRV 1.85 fixes for
-# yoke-derive 0.8.3 compatibility) for network capability integration (CTX-0796).
+# bitty-network is pinned to commit c69fe57 for the `bitty-network-wire`
+# crate only (CTX-0906, DIR-030): the dependency-free native-component wire
+# protocol v1 codec the component broker speaks to out-of-process components.
+# Core never links a bitty-network implementation crate (HTTP/TLS/DNS stay
+# in the separately installed `bitty-net` component); the embedded
+# `bitty-network-lua` path at d97c5da was removed.
 # bitty-ipc is a first-party extraction target (CTX-1585, bitty#1585) and
 # stays linked as Core's inbound socket mechanism (DIR-030): pulled from the
 # independent bitty-terminal/bitty-ipc repository at an exact rev (e9714e7) by

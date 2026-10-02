@@ -531,17 +531,6 @@ pub struct PluginRuntime {
     /// CTX-0889: bounded queue of `workspace.control` mutations, drained by
     /// the application each tick ([`PluginRuntime::drain_workspace_requests`]).
     workspace_requests: Rc<RefCell<WorkspaceRequestQueue>>,
-    /// CTX-0846 (#1454): optional shared network runtime. `None` (the
-    /// default) means the host has no network backend, so `bitty.network`
-    /// is never registered in any plugin VM. When `Some`, the same runtime
-    /// is shared across every capability-granted plugin (shared DNS cache,
-    /// TLS sessions, and connection pool live in the external backend).
-    ///
-    /// Network stays an optional extension: a missing runtime never fails
-    /// activation, it only withholds the module (fail-closed, no ambient
-    /// authority).
-    #[cfg(feature = "network")]
-    network_runtime: Option<Rc<bitty_network_lua::SharedNetworkRuntime>>,
     /// Filesystem adapter behind disk-backed plugin stores (`data_dir`).
     ///
     /// Defaults to [`NativeFileSystem`]; replaceable through
@@ -576,8 +565,6 @@ impl PluginRuntime {
             workspace_requests: Rc::new(RefCell::new(WorkspaceRequestQueue::new(
                 WORKSPACE_REQUEST_QUEUE_CAPACITY,
             ))),
-            #[cfg(feature = "network")]
-            network_runtime: None,
             store_fs: Arc::new(NativeFileSystem),
         }
     }
@@ -589,25 +576,6 @@ impl PluginRuntime {
     /// temp-then-rename, and the RC-1 accounting are unchanged.
     pub fn set_store_filesystem(&mut self, fs: Arc<dyn FileSystem>) {
         self.store_fs = fs;
-    }
-
-    /// Install the optional shared network runtime (CTX-0846, #1454).
-    ///
-    /// Call once during host initialization when `bitty-network` is
-    /// available. After this, every plugin VM whose activation grant includes
-    /// a `network.connect*` capability gets the `bitty.network` module; VMs
-    /// without the grant never see it. Passing a runtime does not by itself
-    /// widen any plugin's authority — the per-plugin grant is still the gate.
-    #[cfg(feature = "network")]
-    pub fn set_network_runtime(&mut self, runtime: Rc<bitty_network_lua::SharedNetworkRuntime>) {
-        self.network_runtime = Some(runtime);
-    }
-
-    /// The shared network runtime, if one was installed (CTX-0846, #1454).
-    #[cfg(feature = "network")]
-    #[must_use]
-    pub fn network_runtime(&self) -> Option<&Rc<bitty_network_lua::SharedNetworkRuntime>> {
-        self.network_runtime.as_ref()
     }
 
     /// Whether safe mode is enabled.
@@ -1085,34 +1053,6 @@ impl PluginRuntime {
             let error = PluginRuntimeError::Vm(error.to_string());
             self.rollback(id, error.to_string());
             return Err(error);
-        }
-
-        // CTX-0846 (#1454): register the optional `bitty.network` module for
-        // this VM when (a) the plugin's activation grant includes a
-        // `network.connect` capability and (b) a shared network runtime was
-        // installed. The registration call site IS the plugin-context
-        // boundary: it runs synchronously during this plugin's activation and
-        // only ever touches this VM, so the module can never leak to a
-        // sibling plugin. When real request/resolve callbacks land, the
-        // plugin id must additionally be stashed in the VM registry so the
-        // async callbacks can attribute requests (issue #1454 Option B).
-        // Missing runtime is not an error: network is an optional extension,
-        // so a granted plugin on a network-less host simply sees no module
-        // (fail-closed, never ambient).
-        #[cfg(feature = "network")]
-        {
-            let network_granted = granted
-                .iter()
-                .any(|capability| capability.as_str().starts_with("network.connect"));
-            if network_granted {
-                if let Some(runtime) = self.network_runtime.clone() {
-                    if let Err(error) = vm.register_network_module(&runtime) {
-                        let error = PluginRuntimeError::Vm(error.to_string());
-                        self.rollback(id, error.to_string());
-                        return Err(error);
-                    }
-                }
-            }
         }
 
         {

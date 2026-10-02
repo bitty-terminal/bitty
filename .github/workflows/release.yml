@@ -453,8 +453,7 @@ jobs:
           memory: 6G
           cpu_count: 8
 
-      # clang is in the FreeBSD base image; cmake + pkgconf drive the
-      # aws-lc-sys C build (pulled in through bitty-network -> rustls) and
+      # clang is in the FreeBSD base image; cmake + pkgconf drive
       # crossfont's fontconfig/FreeType probes. git + ca_root_nss let
       # `cargo --locked` fetch the pinned git dependencies over TLS.
       - name: Install FreeBSD build prerequisites

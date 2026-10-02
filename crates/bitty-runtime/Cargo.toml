@@ -13,9 +13,15 @@ publish = false
 [lints]
 workspace = true
 
-[features]
-default = []
-network = ["dep:bitty-network-lua", "bitty-lua/network"]
+# CTX-0906: hermetic native-component test fixture. Speaks wire protocol v1
+# over stdio so the broker integration tests spawn a real coprocess without
+# any network access; never installed or packaged (publish = false, and the
+# release bundles only ship the `bitty` binary).
+[[bin]]
+name = "bitty-component-fixture"
+path = "src/bin/bitty-component-fixture.rs"
+test = false
+doc = false
 
 [dependencies]
 bitty-vt = { path = "../bitty-vt" }
@@ -34,11 +40,11 @@ bitty-package = { path = "../bitty-package" }
 # placement rects through the rich layer (moved from dev-dependencies;
 # same workspace crate, no new supply-chain surface).
 bitty-rich = { path = "../bitty-rich" }
-# CTX-0846: the plugin runtime owns the optional shared network runtime and
-# registers the `bitty.network` module per capability-granted plugin VM. Same
-# external pin as `bitty-lua`/`bitty-plugin-host` (rev d97c5da); do not bump
-# here independently.
-bitty-network-lua = { git = "https://github.com/bitty-terminal/bitty-network", rev = "d97c5da", optional = true }
+# CTX-0906 (DIR-030): the component broker speaks native-component wire
+# protocol v1 to out-of-process components (first: `bitty-net`). Core links
+# the dependency-free codec crate only, never a network implementation
+# crate; same exact-rev pin pattern as `bitty-ipc`.
+bitty-network-wire = { git = "https://github.com/bitty-terminal/bitty-network", rev = "c69fe57" }
 
 # CORE-RUN-003 (#1526): the supervisor claim lock is an OS-held `flock`.
 # Same workspace pins and platform split as `bitty-ipc` (no new crates).

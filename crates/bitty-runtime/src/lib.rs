@@ -181,6 +181,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod component;
 pub mod config;
 pub mod cw_present;
 pub mod error;
@@ -208,6 +209,7 @@ pub use bitty_rich::composer::{ComposerKey, ComposerKeyEvent};
 pub use bitty_rich::hints::{DispatchOutcome, HintFeedError, HintScope};
 pub use runtime::cw_live::HintLinkOpenError;
 
+pub use component::data_home_for;
 pub use config::{
     BACKGROUND_FITS, CloseConfirmMode, DEFAULT_BACKGROUND_FIT, MAX_BACKGROUND_IMAGE_PATH_BYTES,
     MAX_BACKGROUND_IMAGE_ROOTS, MAX_PASTE_CONFIRM_TIMEOUT_SECS, MIN_PASTE_CONFIRM_TIMEOUT_SECS,

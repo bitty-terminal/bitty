@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- **Embedded network path (CTX-0906, #1577, DIR-030):** the `network` cargo
+  features of `bitty-lua` and `bitty-runtime`, the `bitty-network-lua` git
+  dependency (rev `d97c5da`), `Vm::register_network_module`, and
+  `PluginRuntime::set_network_runtime` / `network_runtime` are gone; Core
+  links no network implementation crate (rustls, aws-lc-sys, and the
+  CDLA-Permissive-2.0 `webpki-root-certs` left the dependency graph). No
+  plugin VM gets a `bitty.network` module any more.
+
 - **Non-core crates decoupled from Core (CTX-0918, #1602):** the empty
   `bitty-core` seed and the emptied `bitty-panels` staging crate left the
   workspace, and `bitty-runtime` no longer links `bitty-agent` (its session
@@ -20,6 +28,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   socket mechanism.
 
 ### Added
+
+- **Native component broker (CTX-0906, #1577, DIR-030):**
+  `bitty_runtime::component` resolves `<data_home>/bitty/components/<name>/`
+  (developer override `BITTY_COMPONENTS_DIR`, never `PATH`), validates
+  `bitty-component.toml` (name grammar, semver, executable name, protocol
+  range) and the executable's SHA-256 before every spawn (fail closed),
+  spawns the component as a stdio coprocess (cleared environment plus
+  allowlist, version-directory cwd, 64 KiB stderr ring), and speaks wire
+  protocol v1 through the dependency-free `bitty-network-wire` codec (exact
+  rev `c69fe57`): `Hello`/`HelloAck`, request multiplexing with a 64
+  in-flight cap and a Core-side response budget, idle stop after 60 s
+  (stdin close, 2 s grace, then a kill of the recorded child only), and
+  crash handling (`component_lost`, 1 s doubling to 30 s backoff, 5 crashes
+  in 5 minutes latch unavailable). `PluginGrant::compute` intersects granted
+  `network.connect:*` capabilities with manifest `[[network.egress]]`
+  entries and binds the grant to the plugin id for attribution.
+  `bitty_runtime::data_home_for` is now the single data-directory resolver
+  shared by the plugin store and the component root. The Lua-facing request
+  surface (non-blocking handle plus response event) and per-platform
+  process sandboxing are deferred follow-ups.
 
 - **Windows owned-process-tree backend (CTX-0903, #1536):** jobs on Windows
   now run in a kill-on-close Job Object, so a cancel, timeout, or kill ends

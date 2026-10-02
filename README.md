@@ -247,9 +247,13 @@ terminal mechanism and its test and measurement harnesses:
 Extension model: `bitty-ipc` (independent repository, pulled as an exact-rev
 git dependency) stays linked as Core's inbound local socket mechanism.
 `bitty-agent`, `bitty-network`, and `bitty-observability` are independent
-repositories; Core links no agent crate. The optional embedded
-`bitty-network-lua` path behind the `bitty-runtime` `network` feature is
-being retired in favor of out-of-process components (tracked separately).
+repositories; Core links no agent crate and no network code. Native
+capabilities run as separately installed, on-demand stdio coprocesses
+(DIR-030): the `bitty-runtime` component broker resolves, verifies
+(SHA-256 before every spawn), spawns, and grants them, and links only the
+dependency-free `bitty-network-wire` codec. The first component is `net`
+(`bitty-net`, built from the bitty-network repository); the Lua-facing
+request surface is a follow-up.
 `bitty dev trace` links `bitty-perf` only when `bitty-terminal` is built with
 the opt-in `dev-perf` cargo feature; otherwise the verb reports
 `built without dev-perf feature`.

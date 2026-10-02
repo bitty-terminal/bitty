@@ -52,8 +52,8 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use bitty_rich::shell::ShellIntegration;
 use bitty_runtime::Runtime;
-use bitty_runtime::shell_integration::ShellIntegration;
 use bitty_term_state::ZoneKind;
 use bitty_test_support::require_pty;
 

@@ -973,11 +973,11 @@ impl TerminalApp {
             ),
             A::TogglePalette => {
                 // CTX-0647 / GitHub #1003 (palette user entry): the palette
-                // panel exists via the public Panel Runtime path
-                // (`bitty_runtime::palette`) but the app hosts no
-                // PanelRegistry yet, so there is no overlay to toggle and
-                // the palette stays bundled-disabled (OQ-053). Until the
-                // panel host lands, `toggle_palette` parses for forward
+                // ships as the `palette` Lua plugin after the OQ-053 split
+                // (the old bundled Rust helper was removed in CTX-0922) and
+                // the SDK has no focusable overlay/input capture yet, so
+                // there is no Core overlay to toggle. Until that host API
+                // lands, `toggle_palette` parses for forward
                 // compat but is never in defaults: unbound Ctrl+Shift+P
                 // reaches the shell, and an explicitly bound chord is
                 // consumed here as inert with a loud warning (no overlay,
@@ -4287,10 +4287,10 @@ mod tests {
 
     #[test]
     fn toggle_palette_is_inert_and_unbound_by_default() {
-        // CTX-0647 / #1003 palette entry: the panel exists via the public
-        // Panel Runtime path but the app hosts no PanelRegistry yet, so the
-        // palette stays bundled-disabled (OQ-053). Until the panel host
-        // lands, defaults stay unbound so Ctrl+Shift+P reaches the shell,
+        // CTX-0647 / #1003 palette entry: the palette is the `palette` Lua
+        // plugin after the OQ-053 split and the SDK has no focusable
+        // overlay yet, so there is no Core overlay to toggle. Until that
+        // host API lands, defaults stay unbound so Ctrl+Shift+P reaches the shell,
         // and an explicitly bound chord is inert with a warning.
         use bitty_config::{ChromeAction, KeyName, KeyRef, match_keymap, resolve_keymaps};
         let maps = resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");

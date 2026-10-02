@@ -12,10 +12,10 @@ use bitty_plugin_host::{
     CapabilityId, DropPolicy, Event, EventKind, EventPayload, GrantRecord, PluginHost,
     bundled::shell_integration_manifest,
 };
+use bitty_rich::shell::ShellIntegration;
 use bitty_runtime::{
     Runtime,
     registry::{PanelRegistry, PanelRegistryConfig, WorkspaceId},
-    shell_integration::{ShellIntegration, create_shell_panel},
 };
 use bitty_term_state::{State, TerminalAction, ZoneKind};
 use bitty_vt::BoundedString;
@@ -201,7 +201,7 @@ fn shell_observation_only_via_runtime_side_queue_not_hot_path() {
     assert_eq!(zones[3].kind, ZoneKind::OutputEnd);
     assert_eq!(zones[3].exit_code, Some(42));
     // Command regions via shell-integration helper (observation-only view).
-    let regions = bitty_rich::shell::ShellIntegration::command_regions(rt.state());
+    let regions = ShellIntegration::command_regions(rt.state());
     assert_eq!(regions.len(), 1);
     assert_eq!(regions[0].exit_code, Some(42));
     // No hot-path object leaked: Runtime hot path is parser->state->damage only.
@@ -217,21 +217,23 @@ fn shell_panel_via_panel_runtime_public_path() {
     let mut reg = PanelRegistry::new(PanelRegistryConfig::default()).expect("panel reg");
     let ws = WorkspaceId::new(1);
     let view = bitty_ui::ViewId::new(1);
-    // Create shell panel via public API (no private channel).
-    let pid = create_shell_panel(&mut reg, ws, view).expect("create shell panel");
+    // Create and mount a helper panel via the public PanelRegistry API (no
+    // private channel; the former `create_shell_panel` wrapper did exactly
+    // this and was removed in CTX-0922).
+    let handle = reg
+        .create_panel(bitty_ui::panel::PanelType::Helper, Some(ws))
+        .expect("create shell panel");
+    reg.mount_panel(handle.id, handle.generation, view)
+        .expect("mount shell panel");
+    let pid = handle.id;
     assert_eq!(reg.panel_count(), 1);
     // PanelId is distinct newtype with no From bridge.
     let _raw = pid.get();
     // Grant panel capability via public capability path (panel.provider).
     // First without grant, shell panel should still exist but not have capability.
     assert!(!reg.is_panel_capability_granted(pid, reg.generation(), "panel.provider"));
-    // Grant and verify.
-    // Need correct generation: retrieve via panel_state.
-    // For test, use current generation from handle: after creation, generation is INITIAL.next()
-    // We can fetch via reg.panel_state? Instead, grant using the generation we already have
-    // from create_shell_panel (it returns PanelId, but generation stored internally).
-    // For simplicity, test that capability deny-by-default holds: ungranted requires error.
-    // Use a fresh registry to test capability isolation.
+    // Deny-by-default holds: an ungranted require errors. Use a fresh
+    // registry to test capability isolation.
     let mut reg2 = PanelRegistry::new(PanelRegistryConfig::default()).unwrap();
     let ws2 = WorkspaceId::new(42);
     let view2 = bitty_ui::ViewId::new(42);

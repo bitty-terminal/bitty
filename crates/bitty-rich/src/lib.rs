@@ -36,6 +36,7 @@
 //! |---|---|---|
 //! | [`hyperlink::HYPERLINK_TABLE_MAX`] (via term-state) | 1024 | oldest evicted; evicted ids fail closed, new links keep working |
 //! | [`shell::SHELL_ZONE_MAX`] mirrors `ZONE_RECORDS_MAX` | 1024 | oldest dropped |
+//! | [`shell::SHELL_CWD_MAX_BYTES`] (OSC 7 cwd view) | 4096 | bounded at the parser (`BoundedString`) |
 //! | [`clipboard::CLIPBOARD_MAX_HISTORY`] | 16 | oldest dropped |
 //! | [`clipboard::CLIPBOARD_MAX_PAYLOAD_BYTES`] | 4096 | truncation at cap |
 //! | [`clipboard::CLIPBOARD_MAX_OUTSTANDING_GRANTS`] | 16 | oldest grant evicted (token dies) |

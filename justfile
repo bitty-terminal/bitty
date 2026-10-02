@@ -9,6 +9,7 @@ fmt-check:
 clippy:
     cargo clippy --workspace --all-targets --locked -- -D warnings
     cargo clippy -p bitty-terminal --features dev-perf --all-targets --locked -- -D warnings
+    cargo clippy -p bitty-terminal --features dev-tools --all-targets --locked -- -D warnings
 
 # Run the Rust test suite. cargo-nextest runs each test in its own process
 # (isolation + per-test timeouts + the `live-pty` group cap that keeps
@@ -17,15 +18,19 @@ clippy:
 # (winit needs the OS main thread), and does not run benches/examples, so those
 # run here explicitly -- keeping coverage identical to the previous
 # `cargo test --workspace --all-targets` (which executed all three).
-# `bitty dev trace` is behind the opt-in `dev-perf` feature (CTX-0918): the
-# default nextest run proves the compiled-out error path, the last line runs
-# the CLI suite again with the feature so the trace success paths stay covered.
+# `bitty dev trace` is behind the opt-in `dev-perf` feature (CTX-0918) and
+# `bitty dev capture|synthesize|dump|overlay` behind `dev-tools` (CTX-0922):
+# the default nextest run proves the compiled-out error paths, the last lines
+# rerun the CLI suite (and the `dev::` unit tests) with each feature so the
+# success paths stay covered.
 test:
     cargo nextest run --workspace --locked
     cargo test --workspace --doc --locked
     cargo test -p bitty-platform --test headless_run --test winit_window --locked
     cargo test -p bitty-perf --benches --locked
     cargo test -p bitty-terminal --features dev-perf --test cli_dev --locked
+    cargo test -p bitty-terminal --features dev-tools --test cli_dev --locked
+    cargo test -p bitty-terminal --features dev-tools --bin bitty --locked dev::
 
 typecheck:
     cargo check --workspace --all-targets --locked

@@ -73,10 +73,10 @@ diagram lives in `src/lib.rs`.
 - `src/plugin_runtime/` — plugin runtime wiring and services.
 - `src/config.rs` — runtime-side configuration application.
 - `src/workspace.rs`, `src/tabs.rs` — workspace and tab orchestration.
-- `src/panels_async.rs` — generic panel worker.
-- `src/palette.rs`, `src/statusline.rs`, `src/paste.rs`,
-  `src/shell_integration.rs`, `src/inspect.rs` —
-  experience helpers; `palette`/`statusline` are the residual Core Panel
-  Runtime helpers recorded by the `CTX-0397`/`CTX-0398` splits.
+- `src/paste.rs`, `src/inspect.rs` — paste confirmation gate and bounded
+  read-only inspection snapshots. The OSC 7/133 read view used by the IPC
+  snapshot is `bitty_rich::shell::ShellIntegration`; the residual bundled
+  palette/statusline panel helpers were removed in `CTX-0922` (they ship as
+  Lua plugins after the OQ-053 split).
 - `src/error.rs` — owned error types.
 - `tests/` — headless orchestration tests.

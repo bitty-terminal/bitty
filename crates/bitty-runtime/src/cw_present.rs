@@ -1,12 +1,12 @@
-//! CW render-path present enrichment (CTX-0687, candidate, evidence-only).
+//! CW render-path present enrichment (CTX-0687; live since CTX-0700).
 //!
-//! One headless present-path composer over the seven open CW render-path
-//! issues. It consumes the already-accepted headless models — fold, hints,
-//! composer, anchors, rich scene, non-terminal panel content — into a single
-//! bounded [`CwPresentPlan`] derived per [`PresentFrame`](crate::runtime::PresentFrame)
+//! One headless present-path composer over the CW render-path issues. It
+//! consumes the accepted headless models — fold, hints, composer, anchors,
+//! rich scene, non-terminal panel content — into a single bounded
+//! [`CwPresentPlan`] derived per [`PresentFrame`](crate::runtime::PresentFrame)
 //! at refresh, without touching grid truth, GPU, PTY, or the filesystem.
 //!
-//! # Per-issue mapping (all `Relates`, none `Closes`)
+//! # Per-issue mapping
 //!
 //! | Issue | Slice | Entry point |
 //! |---|---|---|
@@ -18,15 +18,17 @@
 //! | #985 CW-06 | consume rich scene in present | [`consume_scene_present`] + [`ScenePresent`] |
 //! | #990 CW-11 | non-terminal content beyond the grid | [`NonTerminalPresent`] + [`nonterminal_for_content`] |
 //!
-//! # Candidate status (read before relying)
+//! # Decision status and live wiring
 //!
-//! The owner decisions behind these issues are still open (`OQ-050`
-//! scrollback identity, `OQ-051` panel-is-not-terminal, `OQ-088`/`OQ-089`
-//! hint leadership). Nothing here resolves them: this module is a
-//! presentation-only integration sketch over the existing bounded models,
-//! and every verdict in the CTX-0687 PR is `EVIDENCE_ONLY` (`Relates`, never
-//! `Closes`). No keymap binding, no overlay allocation, no editor spawn, and
-//! no grid write is added.
+//! The owner decisions behind these issues are Accepted: `OQ-050`
+//! (scrollback identity), `OQ-051` (panel-is-not-terminal), and
+//! `OQ-088`/`OQ-089` (hint leadership; the hint engine is the OQ-089
+//! Beacon). The module is wired into the live path: [`Runtime`](crate::Runtime)
+//! owns the single [`CwHintEngine`] and fold/composer state
+//! (`runtime::cw_live`), and the app binds the fold, hint, and composer
+//! verbs through `bitty-terminal`'s `chrome_keys` keymap dispatch. The
+//! composer overlay (CW-03) still awaits a later policy review. No editor
+//! process is spawned and no grid write happens here.
 //!
 //! # Terminal truth
 //!

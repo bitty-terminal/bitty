@@ -823,7 +823,7 @@ fn main() {
     // reflows the LayoutNode into the container and composites per-leaf via
     // the headless software seam (deterministic RGBA) until a real
     // SurfaceTarget is attached in a future slice.
-    // CTX-0144: serve BITTY_SOCKET for bitty-devtools handshake + read-only
+    // CTX-0144: serve BITTY_SOCKET for the devtools-protocol handshake + read-only
     // round-trip. Fail-soft: socket failure never crashes the terminal.
     let ipc_serve = ipc_serve::serve_in_background(ipc_serve::ServerDescriptor {
         cols: runtime.config().cols,

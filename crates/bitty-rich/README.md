@@ -41,7 +41,8 @@ and closed `OQ-008`, `OQ-015`, and `OQ-016` at design level.
 - `src/kitty.rs`, `src/kitty_decode.rs`, `src/kitty_place.rs` — Kitty
   placeholder stub, bounded decode, and placement.
 - `src/hyperlink.rs`, `src/shell.rs`, `src/clipboard.rs` — link table, shell
-  zones, and clipboard helpers.
+  zones plus the single OSC 7/133 read view (`ShellIntegration`: cwd, zones,
+  command regions, last exit code), and clipboard helpers.
 - `src/blocks.rs`, `src/hints.rs`, `src/background.rs` — command blocks, hint
   targets, and background images.
 - `src/composer.rs` — external-editor round-trip seam.

@@ -21,6 +21,12 @@
 //!     Without it the arguments are still validated (usage errors exit 2)
 //!     and a valid request fails with exit 1 and
 //!     [`TRACE_DISABLED_MESSAGE`] ("built without dev-perf feature").
+//!   - `capture`, `synthesize`, `dump`, and `overlay` are compiled only with
+//!     the opt-in `dev-tools` cargo feature (off by default, CTX-0922), the
+//!     same pattern as `dev-perf`: arguments are still validated (usage
+//!     errors exit 2) and a valid request fails with exit 1 and
+//!     [`TOOLS_DISABLED_MESSAGE`] ("built without dev-tools feature"), plus
+//!     an `ok:false` envelope for json/jsonl.
 //!   - `synthesize` — fixed local input trajectory plus the paste-gate
 //!     probe: [`SYNTH_TRAJECTORY_LEN`] printable keys through the headless
 //!     input path (protocol `synthesizeInput` local-class parity), then the
@@ -131,6 +137,7 @@ pub const DEFAULT_DUMP_COLS: usize = 256;
 /// Maximum grid dump columns.
 pub const MAX_DUMP_COLS: usize = 256;
 
+#[cfg(feature = "dev-tools")]
 /// Deterministic synthetic VT corpus for captures and dumps.
 ///
 /// Identical to the `--headless` smoke payload so dev captures stay comparable
@@ -152,11 +159,13 @@ pub const DEV_SYNTHETIC_CORPUS: &[u8] =
     55555555555555555555555555555555555555555555555555555555555555555555555555555555\r\n\
     66666666666666666666666666666666666666666666666666666666666666666666666666666666\r\n";
 
+#[cfg(feature = "dev-tools")]
 /// Synthetic multi-line paste that trips the paste inspection gate (embedded
 /// newline) so `overlay show banner` can prove the transient banner paint
 /// pattern on a fresh headless runtime without delivering any bytes.
 pub const DEV_BANNER_PASTE: &str = "bitty overlay proof\nline2";
 
+#[cfg(feature = "dev-tools")]
 /// Fixed printable alphabet cycled by `synthesize` trajectories.
 ///
 /// Deterministic internal constant — never user input, no wall clock.
@@ -167,12 +176,14 @@ const SYNTH_ALPHABET: &[u8] = b"bitty-dev";
 /// and fast with 8).
 pub const SYNTH_TRAJECTORY_LEN: usize = 8;
 
+#[cfg(feature = "dev-tools")]
 /// Fixed multiline paste probe for the `synthesize` T-04 gate proof.
 ///
 /// Never delivered: the verb requests it, verifies the confirmation gate
 /// holds it pending, then cancels it.
 const SYNTH_PASTE_PROBE: &str = "bitty synthesize probe\nline2";
 
+#[cfg(feature = "dev-tools")]
 /// Origin label reported in `synthesize` receipts (local-harness parity
 /// with the protocol `originLabel` attribution).
 pub const SYNTH_ORIGIN_LABEL: &str = "bitty-dev-synthesize";
@@ -299,6 +310,7 @@ impl OverlayName {
         }
     }
 
+    #[cfg(feature = "dev-tools")]
     /// One-line description for the catalog.
     pub fn description(self) -> &'static str {
         match self {
@@ -311,6 +323,7 @@ impl OverlayName {
         }
     }
 
+    #[cfg(feature = "dev-tools")]
     /// Headless availability: `None` means provable headless, `Some(reason)`
     /// means explicitly deferred per `cli.md`.
     pub fn deferred_reason(self) -> Option<&'static str> {
@@ -322,6 +335,7 @@ impl OverlayName {
         }
     }
 
+    #[cfg(feature = "dev-tools")]
     /// All catalog entries in stable order.
     pub fn all() -> [Self; 6] {
         [
@@ -435,7 +449,7 @@ impl DevParseError {
 /// Short usage for stderr (fail-closed exit 2 trailer).
 #[must_use]
 pub fn dev_usage() -> String {
-    "usage: bitty dev <trace|capture|synthesize|dump|overlay> [args] [--format table|json|jsonl] [--no-color]\n       bitty dev trace <startup|latency> [--iterations N]\n       bitty dev capture [--layout single|split|stack|overlay]\n       bitty dev synthesize\n       bitty dev dump <grid|scene|atlas> [--rows N] [--cols N]\n       bitty dev overlay <list|show <damage|cells|glyphs|images|layout|banner>>\n\nverbs:\n  trace     headless PB-1 startup / PB-4 latency tracing (bitty-perf, local;\n            requires a build with the `dev-perf` cargo feature)\n  capture   deterministic headless frame capture (stats + RGBA hash, local)\n  synthesize  fixed local input trajectory plus paste-gate probe (receipt, local)\n  dump      grid text / scene / atlas dumps from a headless capture (local)\n  overlay   renderer-overlay catalog and headless proofs (local; GPU-bound entries deferred)"
+    "usage: bitty dev <trace|capture|synthesize|dump|overlay> [args] [--format table|json|jsonl] [--no-color]\n       bitty dev trace <startup|latency> [--iterations N]\n       bitty dev capture [--layout single|split|stack|overlay]\n       bitty dev synthesize\n       bitty dev dump <grid|scene|atlas> [--rows N] [--cols N]\n       bitty dev overlay <list|show <damage|cells|glyphs|images|layout|banner>>\n\nverbs:\n  trace     headless PB-1 startup / PB-4 latency tracing (bitty-perf, local;\n            requires a build with the `dev-perf` cargo feature)\n  capture   deterministic headless frame capture (stats + RGBA hash, local)\n  synthesize  fixed local input trajectory plus paste-gate probe (receipt, local)\n  dump      grid text / scene / atlas dumps from a headless capture (local)\n  overlay   renderer-overlay catalog and headless proofs (local; GPU-bound entries deferred)\n            capture/synthesize/dump/overlay require a build with the\n            `dev-tools` cargo feature"
         .to_string()
 }
 
@@ -476,7 +490,11 @@ pub fn dev_help_text() -> String {
                                      availability (GPU-bound entries deferred).\n  \
        overlay show <name>           Headless overlay proof where available\n  \
                                      (damage, banner); deferred entries report\n  \
-                                     status deferred with the reason.\n\
+                                     status deferred with the reason.\n  \
+                                     capture, synthesize, dump, and overlay\n  \
+                                     require a build with the `dev-tools`\n  \
+                                     cargo feature; without it they fail\n  \
+                                     with exit 1.\n\
      \n\
      Options:\n  \
        --format SHAPE  table (default, human, not a contract) | json | jsonl (envelope v1)\n  \
@@ -1025,6 +1043,7 @@ pub fn json_escape(raw: &str) -> String {
     out
 }
 
+#[cfg(feature = "dev-tools")]
 /// Deterministic FNV-1a 64-bit hash rendered as 16 lowercase hex digits.
 ///
 /// Used to fingerprint headless RGBA buffers so captures prove determinism
@@ -1068,6 +1087,7 @@ pub fn format_error_envelope(verb: &str, detail: &str, code: &str, message: &str
 // Headless capture helpers (reuse the `--headless` smoke pattern)
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "dev-tools")]
 /// Builds the capture layout composition (mirrors the layout proof in
 /// `main.rs`: same bytes plus same layout is deterministic).
 fn build_capture_layout(layout: CaptureLayout) -> bitty_runtime::LayoutNode {
@@ -1092,6 +1112,7 @@ fn build_capture_layout(layout: CaptureLayout) -> bitty_runtime::LayoutNode {
     }
 }
 
+#[cfg(feature = "dev-tools")]
 /// Deterministic headless capture: fresh runtime, fixed corpus, one tick.
 struct Capture {
     /// Frame counter presented.
@@ -1118,6 +1139,7 @@ struct Capture {
     headless: bool,
 }
 
+#[cfg(feature = "dev-tools")]
 /// Runs one deterministic capture with `layout` (errors only when the
 /// headless runtime fails to build, which is a generic failure).
 fn run_capture(layout: CaptureLayout) -> Result<Capture, String> {
@@ -1157,6 +1179,7 @@ fn run_capture(layout: CaptureLayout) -> Result<Capture, String> {
 // Dev-only deterministic rasterizer (atlas dumps without a font stack)
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "dev-tools")]
 /// Deterministic dev-only rasterizer for `dump atlas`.
 ///
 /// Fixed 8x6 coverage derived from the character code (never the platform
@@ -1167,6 +1190,7 @@ struct DevRasterizer {
     next_id: u64,
 }
 
+#[cfg(feature = "dev-tools")]
 impl DevRasterizer {
     fn new() -> Self {
         Self { next_id: 0 }
@@ -1195,6 +1219,7 @@ impl DevRasterizer {
     }
 }
 
+#[cfg(feature = "dev-tools")]
 impl bitty_render::GlyphRasterizer for DevRasterizer {
     fn load_font(
         &mut self,
@@ -1219,6 +1244,10 @@ impl bitty_render::GlyphRasterizer for DevRasterizer {
 // ---------------------------------------------------------------------------
 
 /// Executor output: human table plus the pre-serialized JSON result object.
+#[cfg_attr(
+    not(any(feature = "dev-perf", feature = "dev-tools")),
+    allow(dead_code) // Only the feature-gated executors construct it.
+)]
 struct DevOutput {
     table: String,
     result_json: String,
@@ -1231,20 +1260,18 @@ struct DevOutput {
 pub const TRACE_DISABLED_MESSAGE: &str = "bitty dev trace: built without dev-perf feature \
      (rebuild with `cargo build -p bitty-terminal --features dev-perf`)";
 
-/// Runs a validated trace request, or reports that tracing is compiled out.
-#[cfg(feature = "dev-perf")]
-#[allow(clippy::unnecessary_wraps)] // Uniform `Result` shape with the cfg-off path.
-fn trace_output(request: &DevRequest) -> Result<DevOutput, String> {
-    match request {
-        DevRequest::TraceLatency { iterations } => Ok(trace_latency_output(*iterations)),
-        _ => Ok(trace_startup_output()),
-    }
-}
+/// Diagnostic suffix returned by `bitty dev capture|synthesize|dump|overlay`
+/// when the binary was built without the opt-in `dev-tools` cargo feature
+/// (CTX-0922). Parsing still validates the arguments, so usage errors keep
+/// exiting 2. [`tools_disabled_message`] prefixes the verb.
+#[cfg_attr(feature = "dev-tools", allow(dead_code))] // Only the cfg-off path reports it.
+pub const TOOLS_DISABLED_MESSAGE: &str = "built without dev-tools feature \
+     (rebuild with `cargo build -p bitty-terminal --features dev-tools`)";
 
-/// Runs a validated trace request, or reports that tracing is compiled out.
-#[cfg(not(feature = "dev-perf"))]
-fn trace_output(_request: &DevRequest) -> Result<DevOutput, String> {
-    Err(TRACE_DISABLED_MESSAGE.to_string())
+/// Full diagnostic for a compiled-out tool verb (`bitty dev <verb>: ...`).
+#[cfg(not(feature = "dev-tools"))]
+fn tools_disabled_message(request: &DevRequest) -> String {
+    format!("bitty dev {}: {TOOLS_DISABLED_MESSAGE}", request.verb())
 }
 
 #[cfg(feature = "dev-perf")]
@@ -1335,6 +1362,7 @@ fn trace_latency_output(iterations: usize) -> DevOutput {
     }
 }
 
+#[cfg(feature = "dev-tools")]
 fn capture_output(layout: CaptureLayout) -> Result<DevOutput, String> {
     let capture = run_capture(layout)?;
     let table = format!(
@@ -1373,6 +1401,7 @@ fn capture_output(layout: CaptureLayout) -> Result<DevOutput, String> {
     })
 }
 
+#[cfg(feature = "dev-tools")]
 fn synth_key_event(byte: u8) -> bitty_platform::KeyEvent {
     let ch = (byte as char).to_string();
     bitty_platform::KeyEvent {
@@ -1389,10 +1418,12 @@ fn synth_key_event(byte: u8) -> bitty_platform::KeyEvent {
     }
 }
 
+#[cfg(feature = "dev-tools")]
 /// Process-wide synthetic-event sequence for `synthesize` receipts
 /// (monotonic, never reset: mirrors the protocol `syntheticSeq`).
 static SYNTH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+#[cfg(feature = "dev-tools")]
 /// Fixed local input trajectory plus the paste-gate probe (DT-09).
 ///
 /// Errors only when the headless runtime fails to build (generic
@@ -1437,6 +1468,7 @@ fn synthesize_output() -> Result<DevOutput, String> {
     })
 }
 
+#[cfg(feature = "dev-tools")]
 fn dump_grid_output(rows: usize, cols: usize) -> Result<DevOutput, String> {
     let mut runtime = bitty_runtime::Runtime::with_defaults()
         .map_err(|err| format!("bitty dev: headless runtime failed: {err}"))?;
@@ -1478,6 +1510,7 @@ fn dump_grid_output(rows: usize, cols: usize) -> Result<DevOutput, String> {
     })
 }
 
+#[cfg(feature = "dev-tools")]
 /// Formats one damage region for table and JSON output.
 fn format_region(region: &bitty_term_state::DamagedRegion) -> String {
     match region {
@@ -1494,6 +1527,7 @@ fn format_region(region: &bitty_term_state::DamagedRegion) -> String {
     }
 }
 
+#[cfg(feature = "dev-tools")]
 fn dump_scene_output() -> Result<DevOutput, String> {
     let mut runtime = bitty_runtime::Runtime::with_defaults()
         .map_err(|err| format!("bitty dev: headless runtime failed: {err}"))?;
@@ -1566,6 +1600,7 @@ fn dump_scene_output() -> Result<DevOutput, String> {
     })
 }
 
+#[cfg(feature = "dev-tools")]
 fn dump_atlas_output() -> Result<DevOutput, String> {
     use bitty_render::{CellMetrics, FontQuery, FontStyle, GridRenderer};
     let mut runtime = bitty_runtime::Runtime::with_defaults()
@@ -1625,6 +1660,7 @@ fn dump_atlas_output() -> Result<DevOutput, String> {
     })
 }
 
+#[cfg(feature = "dev-tools")]
 fn overlay_list_output() -> DevOutput {
     let mut table = String::from("bitty dev overlay list — renderer overlays\n");
     for overlay in OverlayName::all() {
@@ -1672,6 +1708,7 @@ fn overlay_list_output() -> DevOutput {
     }
 }
 
+#[cfg(feature = "dev-tools")]
 fn overlay_show_output(name: OverlayName) -> Result<DevOutput, String> {
     match name {
         OverlayName::Damage => {
@@ -1765,15 +1802,39 @@ fn overlay_show_output(name: OverlayName) -> Result<DevOutput, String> {
 /// - Post-parse failures emit ok:false envelopes for json/jsonl (exit 1) and
 ///   stderr-only diagnostics for table.
 pub fn run_dev(request: &DevRequest, options: &DevOptions) -> i32 {
+    // Every arm is explicit (no wildcard, CTX-0919): a new verb must pick its
+    // feature gate deliberately. Compiled-out verbs fail with exit 1.
     let outcome: Result<DevOutput, String> = match request {
-        DevRequest::TraceStartup | DevRequest::TraceLatency { .. } => trace_output(request),
+        #[cfg(feature = "dev-perf")]
+        DevRequest::TraceStartup => Ok(trace_startup_output()),
+        #[cfg(feature = "dev-perf")]
+        DevRequest::TraceLatency { iterations } => Ok(trace_latency_output(*iterations)),
+        #[cfg(not(feature = "dev-perf"))]
+        DevRequest::TraceStartup | DevRequest::TraceLatency { .. } => {
+            Err(TRACE_DISABLED_MESSAGE.to_string())
+        }
+        #[cfg(feature = "dev-tools")]
         DevRequest::Capture { layout } => capture_output(*layout),
+        #[cfg(feature = "dev-tools")]
         DevRequest::Synthesize => synthesize_output(),
+        #[cfg(feature = "dev-tools")]
         DevRequest::DumpGrid { rows, cols } => dump_grid_output(*rows, *cols),
+        #[cfg(feature = "dev-tools")]
         DevRequest::DumpScene => dump_scene_output(),
+        #[cfg(feature = "dev-tools")]
         DevRequest::DumpAtlas => dump_atlas_output(),
+        #[cfg(feature = "dev-tools")]
         DevRequest::OverlayList => Ok(overlay_list_output()),
+        #[cfg(feature = "dev-tools")]
         DevRequest::OverlayShow { name } => overlay_show_output(*name),
+        #[cfg(not(feature = "dev-tools"))]
+        DevRequest::Capture { .. }
+        | DevRequest::Synthesize
+        | DevRequest::DumpGrid { .. }
+        | DevRequest::DumpScene
+        | DevRequest::DumpAtlas
+        | DevRequest::OverlayList
+        | DevRequest::OverlayShow { .. } => Err(tools_disabled_message(request)),
     };
     match outcome {
         Ok(output) => {
@@ -2101,6 +2162,7 @@ mod tests {
         assert_eq!(json_escape("\u{0}\u{1f}"), "\\u0000\\u001f");
     }
 
+    #[cfg(feature = "dev-tools")]
     #[test]
     fn fnv1a_is_deterministic_and_sensitive() {
         assert_eq!(fnv1a_hex(b"abc"), fnv1a_hex(b"abc"));
@@ -2115,6 +2177,7 @@ mod tests {
         assert!(DevFormat::parse(Some("yaml")).is_err());
     }
 
+    #[cfg(feature = "dev-tools")]
     #[test]
     fn overlay_catalog_marks_gpu_entries_deferred() {
         assert!(OverlayName::Damage.deferred_reason().is_none());
@@ -2134,6 +2197,7 @@ mod tests {
         assert_eq!(OverlayName::all().len(), 6);
     }
 
+    #[cfg(feature = "dev-tools")]
     #[test]
     fn capture_layouts_build() {
         for layout in [
@@ -2145,6 +2209,16 @@ mod tests {
             let node = build_capture_layout(layout);
             assert!(!node.leaf_ids().is_empty(), "{layout:?} needs leaves");
         }
+    }
+
+    #[cfg(not(feature = "dev-tools"))]
+    #[test]
+    fn tools_disabled_message_names_verb_and_feature() {
+        let (request, _) = parse(&["dump", "grid"]).unwrap();
+        let message = tools_disabled_message(&request);
+        assert!(message.starts_with("bitty dev dump: "), "got {message:?}");
+        assert!(message.contains("built without dev-tools feature"));
+        assert!(message.contains("--features dev-tools"));
     }
 
     #[test]
@@ -2163,6 +2237,8 @@ mod tests {
         ] {
             assert!(help.contains(token), "help must name {token}");
         }
+        assert!(usage.contains("dev-tools"), "usage must name the feature");
+        assert!(help.contains("dev-tools"), "help must name the feature");
     }
 
     #[test]
@@ -2181,6 +2257,7 @@ mod tests {
         assert!(parse(&["synthesize", "--"]).is_err());
     }
 
+    #[cfg(feature = "dev-tools")]
     #[test]
     fn synthesize_output_is_deterministic_with_held_paste_gate() {
         let first = synthesize_output().expect("headless synthesize must succeed");

@@ -75,7 +75,7 @@ use crate::plugin_runtime::spawn::{
     HostToolsAuthorizer, SpawnAuthorizer, spawn_process, validate_resolved,
 };
 use crate::runtime::Runtime;
-use crate::shell_integration::ShellIntegration;
+use bitty_rich::shell::ShellIntegration;
 
 /// Map a live state zone marker to the snapshot zone vocabulary (CP-9).
 fn map_zone_kind(kind: StateZoneKind) -> bitty_ipc::ZoneKind {

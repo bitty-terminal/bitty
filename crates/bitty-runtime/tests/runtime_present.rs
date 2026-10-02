@@ -79,11 +79,6 @@ fn tick_cursor_overlay_uses_theme_cursor_hue() {
         &[153, 140, 138, 160],
         "cursor cell must carry the theme hue, not legacy white"
     );
-    // Bridge agrees with the render default (single source of truth).
-    assert_eq!(
-        bitty_runtime::palette::theme_cursor_rgba(),
-        bitty_render::grid::DEFAULT_CURSOR
-    );
 }
 
 #[test]

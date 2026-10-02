@@ -6,22 +6,21 @@
 //! mouse buttons with coordinates), the modifier/latch state, and the
 //! focus/window state.
 //!
-//! # Reference-first (DEC-0017)
+//! # Wire contract
 //!
-//! Wire behavior mirrors the sibling `bitty-devtools` repository (read-only,
-//! never modified here):
+//! Wire behavior follows the `bitty-ipc` devtools protocol
+//! (`bitty_ipc::devtools`), whose first-party client is the `devtools` Lua
+//! plugin (the former TypeScript `bitty-devtools` reference repository is
+//! archived):
 //!
-//! - Framing: length-prefixed `u32` big-endian plus payload `<= 256 KiB`, per
-//!   `bitty-devtools/src/transport.ts` (`encodeFrame` / `decodeFrame`).
+//! - Framing: length-prefixed `u32` big-endian plus payload `<= 256 KiB`.
 //! - Envelope: versioned JSON with `version: "1.0"`, numeric `id`, and
-//!   `method` starting with `bitty.debug/`, per
-//!   `bitty-devtools/src/protocol.ts` (`RequestFrame` / `ResponseFrame`).
-//! - Bounds vocabulary per `bitty-devtools/src/bounds.ts` (`BOUNDS`,
-//!   `MAX_FRAME_BYTES`, `PREVIEW_MAX_CHARS`): every list is capped and every
-//!   string field is bounded before return, fail-closed.
-//! - Inspection surface per `bitty-devtools/src/inspection.ts`
-//!   (`debug.inspect`, read-only default): connection alone grants nothing,
-//!   each query is bounded and labelled as untrusted observation data.
+//!   `method` starting with `bitty.debug/` (request/response frames).
+//! - Bounds vocabulary (`MAX_*` frame, preview, and list caps): every list is
+//!   capped and every string field is bounded before return, fail-closed.
+//! - Inspection surface (`debug.inspect`, read-only default): connection
+//!   alone grants nothing, each query is bounded and labelled as untrusted
+//!   observation data.
 //!
 //! The serving side lives in `bitty-ipc/src/devtools.rs`, which registers the
 //! four read-only queries (`bitty.debug/getGridText`,

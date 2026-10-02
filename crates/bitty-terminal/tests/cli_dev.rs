@@ -64,6 +64,7 @@ fn stderr_text(output: &Output) -> String {
 }
 
 /// Asserts a versioned `dev` success envelope on stdout (single JSON value).
+#[cfg(any(feature = "dev-perf", feature = "dev-tools"))]
 fn assert_dev_envelope(stdout: &str, verb: &str) {
     let trimmed = stdout.trim();
     assert!(
@@ -234,6 +235,55 @@ fn trace_without_dev_perf_feature_fails_with_clear_error() {
     );
 }
 
+/// CTX-0922: without the opt-in `dev-tools` feature the capture, synthesize,
+/// dump, and overlay verbs stay parseable but fail closed with a clear
+/// diagnostic (exit 1, `ok:false` envelope for json/jsonl).
+#[cfg(not(feature = "dev-tools"))]
+#[test]
+fn tools_without_dev_tools_feature_fail_with_clear_error() {
+    for (args, verb) in [
+        (vec!["dev", "capture"], "capture"),
+        (vec!["dev", "capture", "--layout", "split"], "capture"),
+        (vec!["dev", "synthesize"], "synthesize"),
+        (vec!["dev", "dump", "grid"], "dump"),
+        (vec!["dev", "dump", "scene"], "dump"),
+        (vec!["dev", "dump", "atlas"], "dump"),
+        (vec!["dev", "overlay", "list"], "overlay"),
+        (vec!["dev", "overlay", "show", "banner"], "overlay"),
+    ] {
+        let output = spawn_dev(&args, &[]);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "want exit 1 for {args:?}, stderr={:?}",
+            stderr_text(&output)
+        );
+        let stderr = stderr_text(&output);
+        assert!(
+            stderr.contains(&format!(
+                "bitty dev {verb}: built without dev-tools feature"
+            )),
+            "stderr={stderr:?}"
+        );
+        assert!(output.stdout.is_empty(), "table mode: no stdout");
+    }
+    for args in [
+        vec!["dev", "capture", "--format", "json"],
+        vec!["dev", "dump", "grid", "--format", "jsonl"],
+        vec!["--format", "json", "dev", "overlay", "list"],
+    ] {
+        let output = spawn_dev(&args, &[]);
+        assert_eq!(output.status.code(), Some(1), "want exit 1 for {args:?}");
+        let stdout = stdout_text(&output);
+        assert!(stdout.contains("\"ok\":false"), "envelope: {stdout:?}");
+        assert!(
+            stdout.contains("built without dev-tools feature"),
+            "envelope: {stdout:?}"
+        );
+        assert_eq!(stdout.trim().lines().count(), 1, "one JSON value");
+    }
+}
+
 #[test]
 fn trace_latency_bounds_fail_closed() {
     for args in [
@@ -253,6 +303,7 @@ fn trace_latency_bounds_fail_closed() {
     }
 }
 
+#[cfg(feature = "dev-tools")]
 #[test]
 fn capture_table_reports_hash() {
     for layout in ["single", "split", "stack", "overlay"] {
@@ -269,6 +320,7 @@ fn capture_table_reports_hash() {
     }
 }
 
+#[cfg(feature = "dev-tools")]
 #[test]
 fn capture_is_deterministic_for_same_layout() {
     let first = stdout_text(&spawn_dev(&["dev", "capture", "--layout", "split"], &[]));
@@ -282,6 +334,7 @@ fn capture_is_deterministic_for_same_layout() {
     assert_eq!(hash(&first), hash(&second), "same layout must hash equal");
 }
 
+#[cfg(feature = "dev-tools")]
 #[test]
 fn capture_json_envelope() {
     let output = spawn_dev(&["dev", "capture", "--format", "json"], &[]);
@@ -303,6 +356,7 @@ fn capture_bad_layout_fails_closed() {
     assert!(output.stdout.is_empty());
 }
 
+#[cfg(feature = "dev-tools")]
 #[test]
 fn synthesize_table_reports_receipt_and_held_paste_gate() {
     let output = spawn_dev(&["dev", "synthesize"], &[]);
@@ -321,8 +375,9 @@ fn synthesize_table_reports_receipt_and_held_paste_gate() {
     );
 }
 
+#[cfg(feature = "dev-tools")]
 #[test]
-fn synthesize_json_envelope_and_fail_closed_args() {
+fn synthesize_json_envelope() {
     let output = spawn_dev(&["dev", "synthesize", "--format", "json"], &[]);
     assert_eq!(output.status.code(), Some(0));
     let stdout = stdout_text(&output);
@@ -332,6 +387,10 @@ fn synthesize_json_envelope_and_fail_closed_args() {
         stdout.contains("\"paste_gate\":\"confirmation-required\""),
         "gate: {stdout:?}"
     );
+}
+
+#[test]
+fn synthesize_fail_closed_args() {
     for args in [
         vec!["dev", "synthesize", "extra"],
         vec!["dev", "synthesize", "--iterations", "5"],
@@ -349,6 +408,7 @@ fn synthesize_json_envelope_and_fail_closed_args() {
     }
 }
 
+#[cfg(feature = "dev-tools")]
 #[test]
 fn dump_grid_table_and_json() {
     let output = spawn_dev(&["dev", "dump", "grid"], &[]);
@@ -390,6 +450,7 @@ fn dump_grid_bounds_fail_closed() {
     }
 }
 
+#[cfg(feature = "dev-tools")]
 #[test]
 fn dump_scene_table_and_json() {
     let output = spawn_dev(&["dev", "dump", "scene"], &[]);
@@ -404,6 +465,7 @@ fn dump_scene_table_and_json() {
     assert!(stdout.contains("\"damage\":"), "damage: {stdout:?}");
 }
 
+#[cfg(feature = "dev-tools")]
 #[test]
 fn dump_atlas_table_and_json() {
     let output = spawn_dev(&["dev", "dump", "atlas"], &[]);
@@ -423,6 +485,7 @@ fn dump_atlas_table_and_json() {
     assert!(stdout.contains("\"placements\":"), "placements: {stdout:?}");
 }
 
+#[cfg(feature = "dev-tools")]
 #[test]
 fn overlay_list_names_catalog() {
     let output = spawn_dev(&["dev", "overlay", "list"], &[]);
@@ -439,6 +502,7 @@ fn overlay_list_names_catalog() {
     assert!(stdout.contains("\"overlays\":"), "catalog: {stdout:?}");
 }
 
+#[cfg(feature = "dev-tools")]
 #[test]
 fn overlay_show_headless_proofs() {
     for name in ["damage", "banner"] {
@@ -465,6 +529,7 @@ fn overlay_show_headless_proofs() {
     assert!(stdout.contains("\"banner\":"), "banner: {stdout:?}");
 }
 
+#[cfg(feature = "dev-tools")]
 #[test]
 fn overlay_show_deferred_is_informational() {
     let output = spawn_dev(&["dev", "overlay", "show", "glyphs"], &[]);
@@ -539,6 +604,7 @@ fn remote_target_flags_are_rejected_local_only() {
     }
 }
 
+#[cfg(feature = "dev-tools")]
 #[test]
 fn global_format_before_word_composes() {
     let output = spawn_dev(&["--format", "json", "dev", "capture"], &[]);
@@ -564,6 +630,7 @@ fn program_named_dev_needs_escape_hatch() {
     );
 }
 
+#[cfg(feature = "dev-tools")]
 #[test]
 fn jsonl_matches_json_single_line_shape() {
     let output = spawn_dev(&["dev", "capture", "--format", "jsonl"], &[]);
@@ -571,6 +638,7 @@ fn jsonl_matches_json_single_line_shape() {
     assert_dev_envelope(&stdout, "capture");
 }
 
+#[cfg(feature = "dev-tools")]
 #[test]
 fn capture_split_layout_differs_from_single_headless() {
     // CTX-0220: the `dev` surface distinguishes WM states without a seat —

@@ -36,6 +36,9 @@ pollster = { workspace = true }
 default = []
 # Enables `bitty dev trace startup|latency` (links `bitty-perf`).
 dev-perf = ["dep:bitty-perf"]
+# Enables `bitty dev capture|synthesize|dump|overlay` (CTX-0922): developer
+# headless captures, dumps, and overlay proofs stay out of release builds.
+dev-tools = []
 
 [dev-dependencies]
 # Hermetic `ServeContext` constructors and unbound bearer minters (#1519).

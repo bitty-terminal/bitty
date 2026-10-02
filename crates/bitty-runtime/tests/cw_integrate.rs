@@ -1,7 +1,7 @@
 //! CTX-0700: CW candidate live-wiring integration.
 //!
-//! Each test drives a live-path owner ([`Runtime`], [`PanelRuntime`], or
-//! [`StatuslineIntegration`]) rather than calling the candidate module
+//! Each test drives a live-path owner ([`Runtime`] or [`PanelRuntime`])
+//! rather than calling the candidate module
 //! directly, so removing the wiring fails these tests while the
 //! in-module unit tests keep passing.
 //!
@@ -12,12 +12,9 @@
 //! - #983 (CW-04): cross-panel hint API via the single live
 //!   `CwHintEngine` owned by `Runtime`.
 //! - #998 (CW-20): panel host shape via `PanelRuntime` (lifecycle plus the
-//!   live placement mirror and provider gate) and
-//!   `create_statusline_panel_via_host`.
+//!   live placement mirror and provider gate).
 //! - #1000 (CW-22): event bus v1 via `declare_core_topic` / `publish_core` /
 //!   `check_window_route` routing a real `git.branch-changed` event.
-//! - #1002 (CW-24): status system via `render_registry_slots` reading the
-//!   `status_registry` composition.
 //!
 //! Headless only: no PTY, window, GPU, wall-clock, or filesystem.
 
@@ -38,15 +35,9 @@ use bitty_runtime::registry::{
     BoundedPayload, BusTopicFamily, PanelProviderManifest, PanelRegistryConfig, PanelRuntime,
     PanelType, RoutingScope, WorkspaceId, is_v1_core_topic,
 };
-use bitty_runtime::statusline::{
-    StatuslineIntegration, create_statusline_panel_via_host, status_inputs_from_state,
-};
-use bitty_term_state::{State, TerminalAction};
 use bitty_ui::ViewId;
 use bitty_ui::panel::{BrowserSurfaceId, PanelId, ViewContent};
-use bitty_ui::status_registry::{StatusModuleId, StatusSlots};
 use bitty_ui::uitree::UiNodeId;
-use bitty_vt::BoundedString;
 
 fn workspace() -> WorkspaceId {
     WorkspaceId::new(1)
@@ -93,12 +84,6 @@ fn test_scene_block(id: u64, text: &str) -> RichBlock {
         1,
     )
     .expect("test block fits scene caps")
-}
-
-fn apply_cwd(state: &mut State, url: &str) {
-    state.apply(&TerminalAction::OscCwd {
-        url: BoundedString::new(url),
-    });
 }
 
 #[test]
@@ -284,13 +269,6 @@ fn cw998_host_lifecycle_with_placement_mirror_and_provider_gate() {
     assert_eq!(host.placement_view_of(handle.id), None);
     assert_eq!(host.placement_len(), 0);
 
-    // Statusline panel creation through the host facade (issue #998 live
-    // consumer from the statusline side).
-    let status_id =
-        create_statusline_panel_via_host(&mut host, WorkspaceId::new(2), ViewId::new(20))
-            .expect("statusline panel via host");
-    assert_eq!(host.placement_view_of(status_id), Some(ViewId::new(20)));
-
     // Dispose retires the handle and clears the mirror.
     host.dispose_panel(handle.id, handle.generation).unwrap();
     assert_eq!(host.placement_view_of(handle.id), None);
@@ -350,81 +328,6 @@ fn cw1000_v1_taxonomy_routes_real_git_event_in_process() {
         RoutingScope::InProcess
     );
     assert!(PanelRuntime::check_window_route(3, 4).is_err());
-}
-
-#[test]
-fn cw1002_statusline_renders_through_registry_slots() {
-    let mut state = State::new();
-    apply_cwd(&mut state, "file:///home/user/projects/foo");
-
-    // Snapshot bridge reads committed state only.
-    let inputs = status_inputs_from_state(&state, "12:00");
-    assert_eq!(
-        inputs.cwd.as_deref(),
-        Some("file:///home/user/projects/foo")
-    );
-    assert_eq!(inputs.clock_text, "12:00");
-
-    // Live registry composition: cwd + clock in slot order, metrics as
-    // placeholders, battery hidden without hardware.
-    let slots = StatusSlots {
-        left: ["workspace", "cwd"]
-            .iter()
-            .map(|raw| StatusModuleId::parse(raw).unwrap())
-            .collect(),
-        center: [StatusModuleId::parse("clock").unwrap()]
-            .into_iter()
-            .collect(),
-        right: ["cpu", "battery"]
-            .iter()
-            .map(|raw| StatusModuleId::parse(raw).unwrap())
-            .collect(),
-    };
-    let rendered = StatuslineIntegration::render_registry_slots(&state, &slots, "12:00").unwrap();
-    assert!(rendered.contains("file:///home/user/projects/foo"));
-    assert!(rendered.contains("12:00"));
-    assert!(rendered.contains("cpu \u{2014}"));
-    assert!(!rendered.contains("bat "));
-    assert!(rendered.chars().count() <= bitty_runtime::statusline::STATUSLINE_MAX_CHARS);
-    // Deterministic and pure: twice yields the same string.
-    let again = StatuslineIntegration::render_registry_slots(&state, &slots, "12:00").unwrap();
-    assert_eq!(rendered, again);
-
-    // Slot keys report render order left → center → right.
-    assert_eq!(
-        StatuslineIntegration::registry_slot_keys(&slots),
-        ["workspace", "cwd", "clock", "cpu", "battery"]
-            .iter()
-            .map(|name| name.to_string())
-            .collect::<Vec<_>>()
-    );
-
-    // Empty slots collapse to empty (no fallback pollution).
-    let empty = StatusSlots::default();
-    assert_eq!(
-        StatuslineIntegration::render_registry_slots(&state, &empty, "12:00").unwrap(),
-        ""
-    );
-
-    // Duplicate membership fails closed without rendering.
-    let dup = StatusSlots {
-        left: [StatusModuleId::parse("cwd").unwrap()]
-            .into_iter()
-            .collect(),
-        center: Vec::new(),
-        right: [StatusModuleId::parse("cwd").unwrap()]
-            .into_iter()
-            .collect(),
-    };
-    assert!(StatuslineIntegration::render_registry_slots(&state, &dup, "12:00").is_err());
-
-    // Scene budget input for the present plan stays bounded alongside the
-    // status composition (guards the shared present-path caps).
-    let mut scene = Scene::new();
-    for id in 1..=3u64 {
-        scene.insert(test_scene_block(id, "hello")).unwrap();
-    }
-    assert_eq!(scene.len(), 3);
 }
 
 // CTX-0736: OQ-051 scene-consumption render path (issues #985 CW-06 /

@@ -188,16 +188,12 @@ pub mod error;
 pub mod execution;
 pub mod host_bridge;
 pub mod inspect;
-pub mod palette;
-pub mod panels_async;
 pub mod paste;
 pub mod plugin_runtime;
 pub mod queries;
 pub mod queue;
 pub mod registry;
 pub mod runtime;
-pub mod shell_integration;
-pub mod statusline;
 #[deprecated(since = "0.1.0", note = "use workspace (tabs alias removal >= v0.2.0)")]
 pub mod tabs;
 pub mod workspace;

@@ -256,7 +256,9 @@ dependency-free `bitty-network-wire` codec. The first component is `net`
 request surface is a follow-up.
 `bitty dev trace` links `bitty-perf` only when `bitty-terminal` is built with
 the opt-in `dev-perf` cargo feature; otherwise the verb reports
-`built without dev-perf feature`.
+`built without dev-perf feature`. Likewise `bitty dev capture|synthesize|dump|overlay`
+are compiled only with the opt-in `dev-tools` feature and otherwise report
+`built without dev-tools feature` (exit 1).
 
 ## Build and test
 

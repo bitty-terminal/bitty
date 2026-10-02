@@ -103,7 +103,7 @@
 //! | Panes total | [`MAX_SESSION_PANES_TOTAL`] (128) | decode-CPU guard |
 //! | Scrollback lines / pane | [`MAX_SESSION_SCROLLBACK_LINES_PER_PANE`] (200) | issue: cap restored lines |
 //! | Scrollback line bytes | [`MAX_SESSION_LINE_BYTES`] (4096) | parser bound parity |
-//! | Cwd bytes | [`MAX_SESSION_CWD_BYTES`] (4096) | `SHELL_CWD_MAX_BYTES` |
+//! | Cwd bytes | [`MAX_SESSION_CWD_BYTES`] (4096) | `bitty_rich::shell::SHELL_CWD_MAX_BYTES` |
 //! | Workspace name chars | [`MAX_SESSION_NAME_CHARS`] (32) | workspaceline bound |
 //! | Layout depth | [`MAX_SESSION_LAYOUT_DEPTH`] (64) | recursion guard |
 //! | View dims | `1..=1000` per axis | `MAX_GRID_DIM` |
@@ -193,7 +193,7 @@ pub const MAX_SESSION_SCROLLBACK_LINES_PER_PANE: usize = 200;
 /// Maximum bytes of one persisted scrollback line.
 pub const MAX_SESSION_LINE_TEXT_BYTES: usize = 4096;
 
-/// Maximum bytes of a persisted cwd report (mirrors `SHELL_CWD_MAX_BYTES`).
+/// Maximum bytes of a persisted cwd report (mirrors `bitty_rich::shell::SHELL_CWD_MAX_BYTES`).
 pub const MAX_SESSION_CWD_BYTES: usize = 4096;
 
 /// Maximum workspace-name chars (mirrors `WORKSPACE_NAME_MAX_CHARS`).

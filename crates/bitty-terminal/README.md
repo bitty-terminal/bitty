@@ -25,6 +25,10 @@ libraries, as stated in `src/main.rs`.
   `bitty-perf` dependency for `bitty dev trace startup|latency`. Without it
   the verb still validates its arguments and then fails with exit 1 and
   `built without dev-perf feature`.
+- Opt-in cargo feature `dev-tools` (off by default, CTX-0922) compiles
+  `bitty dev capture|synthesize|dump|overlay`. Without it the verbs still
+  validate their arguments and then fail with exit 1 and
+  `bitty dev <verb>: built without dev-tools feature`.
 - Third-party dependencies, per `Cargo.toml`: `pollster` only; no
   network-facing dependency is declared.
 - Must not own business behavior: grid, parsing, rendering, plugin, and IPC

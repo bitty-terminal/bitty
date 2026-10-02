@@ -27,6 +27,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `bitty-ipc` pin moved to `e9714e7`; it stays linked as the inbound local
   socket mechanism.
 
+- **Dead bundled-panel helpers (CTX-0922, OQ-053, ADR-0014):**
+  `bitty_runtime::palette`, `bitty_runtime::statusline`, and
+  `bitty_runtime::panels_async` had no non-test caller after the OQ-053
+  split (palette and statusline ship as Lua plugins) and are deleted with
+  their test-only suites. `bitty_runtime::shell_integration` (and its
+  `create_shell_panel` / `validate_shell_panel_config` panel helpers) is
+  gone: the single OSC 7/133 read view is `bitty_rich::shell::ShellIntegration`,
+  which gains `cwd`, `last_exit_code`, `has_observation`, and
+  `SHELL_CWD_MAX_BYTES`; the runtime IPC snapshot (`host_bridge`) reads it
+  with identical behavior.
+
+- **`arboard` image support (CTX-0922):** `bitty-platform` builds `arboard`
+  with `default-features = false` plus `wayland-data-control`, dropping the
+  unused `image-data` feature (and with it `tiff`, `weezl`, `fax`, and the
+  `zune-jpeg`/`zune-core` 0.4 copies) from the dependency graph. Wayland
+  and X11 text clipboard behavior is unchanged.
+
 ### Added
 
 - **Native component broker (CTX-0906, #1577, DIR-030):**
@@ -147,6 +164,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rendering. Routing keymap/control actions to plugin commands is deferred.
 
 ### Changed
+
+- **`bitty dev` tool verbs are opt-in (CTX-0922):** `bitty dev capture`,
+  `synthesize`, `dump`, and `overlay` are compiled only with the new
+  non-default `dev-tools` cargo feature of `bitty-terminal`, the same
+  pattern as `dev-perf`. Without it the arguments are still validated
+  (usage errors exit 2) and a valid request fails with exit 1,
+  `bitty dev <verb>: built without dev-tools feature`, and an `ok:false`
+  envelope for `--format json|jsonl`. `just clippy`, `just test`, and the CI
+  Quality gates job lint and test the feature build.
 
 - **Workspace bar over fullscreen apps (CTX-0873, #1431):** the bar stays
   visible and clickable on the alternate screen (vim, htop). It used to hide

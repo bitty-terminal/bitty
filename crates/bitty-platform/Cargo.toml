@@ -33,7 +33,10 @@ winit = { workspace = true }
 # and falls back to X11 otherwise (see `src/clipboard.rs`). The `wl-clipboard-rs`
 # dependency reuses the `wayland-client`/`wayland-protocols` stack already
 # vendored via `winit`, so no new protocol stack is introduced.
-arboard = { version = "3.6", features = ["wayland-data-control"] }
+# CTX-0922: default features are off; Bitty uses the text API only, so the
+# default `image-data` feature (the `image` crate plus image-only
+# CoreGraphics/GDI bindings) is not linked.
+arboard = { version = "3.6", default-features = false, features = ["wayland-data-control"] }
 # ADR-0004 wrapper-rule exception: raw display/window handles are unavoidable
 # at the GPU surface boundary (wgpu 25 consumes 0.6), so the exact version is
 # pinned and re-exported; see crate-level ownership rules and src/surface.rs.

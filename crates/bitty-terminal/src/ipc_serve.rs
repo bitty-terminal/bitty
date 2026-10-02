@@ -1,7 +1,7 @@
 //! `BITTY_SOCKET` servo (CTX-0144, Issue #236).
 //!
 //! Thin Unix-socket front-end over [`bitty_ipc::devtools`]: binds the socket
-//! `bitty-devtools` expects, accepts connections on a background thread, and
+//! the devtools protocol clients (the `devtools` Lua plugin) expect, accepts connections on a background thread, and
 //! dispatches the handshake plus the minimal read-only round-trip (`ping`,
 //! `getSnapshot`). Full introspection is CTX-0159, which registers new
 //! `bitty.debug/*` handlers on the shared [`bitty_ipc::devtools::Dispatcher`]

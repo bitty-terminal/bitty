@@ -114,6 +114,11 @@ jobs:
       - name: Run Clippy (bitty-terminal dev-perf feature)
         run: cargo clippy -p bitty-terminal --features dev-perf --all-targets --locked -- -D warnings
 
+      # CTX-0922: `bitty dev capture|synthesize|dump|overlay` is compiled only
+      # with the opt-in `dev-tools` feature; lint that configuration too.
+      - name: Run Clippy (bitty-terminal dev-tools feature)
+        run: cargo clippy -p bitty-terminal --features dev-tools --all-targets --locked -- -D warnings
+
       # #1519 / CTX-0855: hermetic `test-support` entry points (bitty-ipc's
       # authority-less ServeContext constructors and unbound bearer minters)
       # may be enabled only from dev-dependencies. Clippy above always builds
@@ -153,6 +158,13 @@ jobs:
       # `dev-perf` feature so the trace success paths stay covered.
       - name: Run bitty dev trace tests (dev-perf feature)
         run: cargo test -p bitty-terminal --features dev-perf --test cli_dev --locked
+
+      # CTX-0922: same split for the opt-in `dev-tools` feature; rerun the CLI
+      # suite and the `dev::` unit tests so the tool success paths stay covered.
+      - name: Run bitty dev tool tests (dev-tools feature)
+        run: |
+          cargo test -p bitty-terminal --features dev-tools --test cli_dev --locked
+          cargo test -p bitty-terminal --features dev-tools --bin bitty --locked dev::
 
       # M1-10 / CTX-0574: pin the M1 matrix driver's reporting logic (suite
       # floors, ignored-test rejection, aggregate failure modes, step summary)

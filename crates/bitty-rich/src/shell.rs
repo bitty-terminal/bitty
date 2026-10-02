@@ -6,11 +6,22 @@
 //! [`ZONE_RECORDS_MAX`] (1024) with oldest eviction. This module interprets
 //! that ordered log as optional prompt/command/output regions without ever
 //! parsing prompt text (grep-audited: no heuristics exist here).
+//!
+//! It is also the single OSC 7/133 read view for the runtime IPC snapshot
+//! (`bitty-runtime::host_bridge`): [`ShellIntegration::cwd`],
+//! [`ShellIntegration::last_exit_code`], and
+//! [`ShellIntegration::has_observation`] read committed `State` only
+//! (CTX-0922 dedupe; the former `bitty-runtime::shell_integration` copy was
+//! removed).
 
 use bitty_term_state::{State, ZONE_RECORDS_MAX, ZoneKind, ZoneRecord};
 
 /// Re-exported bound (mirrors `bitty-term-state`).
 pub const SHELL_ZONE_MAX: usize = ZONE_RECORDS_MAX;
+
+/// Cwd payload is bounded by `BoundedString::MAX_LEN` (4096) at the parser
+/// boundary; this constant documents the shell-integration view.
+pub const SHELL_CWD_MAX_BYTES: usize = 4096;
 
 /// One logical command region derived from the ordered zone log.
 ///
@@ -68,6 +79,31 @@ impl CommandRegion {
 pub struct ShellIntegration;
 
 impl ShellIntegration {
+    /// Current working directory report (`OSC 7`), if any. Bounded
+    /// `<=` [`SHELL_CWD_MAX_BYTES`].
+    #[must_use]
+    pub fn cwd(state: &State) -> Option<&str> {
+        state.cwd_report()
+    }
+
+    /// Exit status of the most recent `OutputEnd` (`D`) marker, if any.
+    #[must_use]
+    pub fn last_exit_code(state: &State) -> Option<i32> {
+        state
+            .zones()
+            .copied()
+            .filter(|record| record.kind == ZoneKind::OutputEnd)
+            .last()
+            .and_then(|record| record.exit_code)
+    }
+
+    /// Whether shell integration has any observable data (cwd or at least
+    /// one zone).
+    #[must_use]
+    pub fn has_observation(state: &State) -> bool {
+        state.cwd_report().is_some() || state.zone_len() > 0
+    }
+
     /// Returns the ordered zone log oldest first (bounded slice).
     #[must_use]
     pub fn zones(state: &State) -> Vec<ZoneRecord> {
@@ -258,6 +294,51 @@ mod tests {
             kind: ZoneKind::OutputEnd,
             exit_code: Some(code),
         });
+    }
+
+    #[test]
+    fn cwd_exit_code_and_observation_read_committed_state() {
+        let mut state = State::new();
+        assert!(!ShellIntegration::has_observation(&state));
+        assert_eq!(ShellIntegration::cwd(&state), None);
+        assert_eq!(ShellIntegration::last_exit_code(&state), None);
+        state.apply(&TerminalAction::OscCwd {
+            url: bitty_vt::BoundedString::new("file:///home/user"),
+        });
+        assert_eq!(ShellIntegration::cwd(&state), Some("file:///home/user"));
+        assert!(ShellIntegration::has_observation(&state));
+        mark(&mut state, ZoneKind::PromptStart);
+        mark(&mut state, ZoneKind::InputStart);
+        mark(&mut state, ZoneKind::OutputStart);
+        mark_with_exit(&mut state, 0);
+        assert_eq!(ShellIntegration::zone_count(&state), 4);
+        assert_eq!(ShellIntegration::last_exit_code(&state), Some(0));
+        // A later D without a code reports no exit status (latest D wins).
+        mark(&mut state, ZoneKind::OutputEnd);
+        assert_eq!(ShellIntegration::last_exit_code(&state), None);
+        mark_with_exit(&mut state, 7);
+        assert_eq!(ShellIntegration::last_exit_code(&state), Some(7));
+    }
+
+    #[test]
+    fn exit_code_never_attaches_to_prompt_start() {
+        let mut state = State::new();
+        state.apply(&TerminalAction::OscPromptMark {
+            kind: ZoneKind::PromptStart,
+            exit_code: Some(99),
+        });
+        assert_eq!(ShellIntegration::last_zone(&state).unwrap().exit_code, None);
+        assert_eq!(ShellIntegration::last_exit_code(&state), None);
+    }
+
+    #[test]
+    fn cwd_bounded_at_parser_limit() {
+        let mut state = State::new();
+        let long = "a".repeat(SHELL_CWD_MAX_BYTES + 100);
+        state.apply(&TerminalAction::OscCwd {
+            url: bitty_vt::BoundedString::new(&long),
+        });
+        assert!(ShellIntegration::cwd(&state).unwrap().len() <= SHELL_CWD_MAX_BYTES);
     }
 
     #[test]

@@ -23,7 +23,7 @@
 
 use bitty_compat_lab::{MAX_CORPUS_BYTES, actions_to_snapshot, parse_bounded, workspace_root};
 use bitty_platform::clipboard::{CLIPBOARD_MAX_BYTES, Clipboard};
-use bitty_runtime::shell_integration::ShellIntegration;
+use bitty_rich::shell::ShellIntegration;
 use bitty_term_state::{
     GRID_COLUMNS, GRID_ROWS, SCROLLBACK_DEFAULT_LINES, Snapshot, State, ZoneKind,
 };

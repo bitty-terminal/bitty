@@ -31,3 +31,6 @@ bitty-pty = { version = "0.0.21", path = "../bitty-pty" }
 # in `bitty-ui`; dev-only edge, no product graph change (`bitty-ui` depends
 # solely on `bitty-term-state`, so this edge is acyclic).
 bitty-ui = { version = "0.0.21", path = "../bitty-ui" }
+# CTX-0922: the OSC 7/133 read view (`ShellIntegration`) lives only in
+# `bitty-rich::shell`; dev-only edge, already in the runtime graph.
+bitty-rich = { version = "0.0.21", path = "../bitty-rich" }

@@ -22,7 +22,8 @@ ADR-0004, as stated in `src/lib.rs`.
 ## Boundaries
 
 - Third-party dependencies, per `Cargo.toml`: `winit`, `arboard` for
-  clipboard, and a pinned `raw-window-handle` re-export; no workspace-crate
+  clipboard (default features off, `wayland-data-control` on; text only),
+  and a pinned `raw-window-handle` re-export; no workspace-crate
   dependency.
 - No `winit` type escapes this crate except the single
   `raw-window-handle` exception at the GPU surface boundary (see

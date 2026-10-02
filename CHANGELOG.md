@@ -356,26 +356,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Native component broker (CTX-0906, #1577, DIR-030):**
-  `bitty_runtime::component` resolves `<data_home>/bitty/components/<name>/`
-  (developer override `BITTY_COMPONENTS_DIR`, never `PATH`), validates
-  `bitty-component.toml` (name grammar, semver, executable name, protocol
-  range) and the executable's SHA-256 before every spawn (fail closed),
-  spawns the component as a stdio coprocess (cleared environment plus
-  allowlist, version-directory cwd, 64 KiB stderr ring), and speaks wire
-  protocol v1 through the dependency-free `bitty-network-wire` codec (exact
-  rev `c69fe57`): `Hello`/`HelloAck`, request multiplexing with a 64
-  in-flight cap and a Core-side response budget, idle stop after 60 s
-  (stdin close, 2 s grace, then a kill of the recorded child only), and
-  crash handling (`component_lost`, 1 s doubling to 30 s backoff, 5 crashes
-  in 5 minutes latch unavailable). `PluginGrant::compute` intersects granted
-  `network.connect:*` capabilities with manifest `[[network.egress]]`
-  entries and binds the grant to the plugin id for attribution.
-  `bitty_runtime::data_home_for` is now the single data-directory resolver
-  shared by the plugin store and the component root. The Lua-facing request
-  surface (non-blocking handle plus response event) and per-platform
-  process sandboxing are deferred follow-ups.
-
 - **CLI contract v1 gaps closed (CTX-0763, #1375):**
   new `bitty version` (table `bitty <semver> (<channel> <commit>)` plus
   `--format json`/`jsonl` envelope v1; `-V`/`--version` is an alias for the

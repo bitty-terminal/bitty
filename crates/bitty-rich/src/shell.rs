@@ -20,8 +20,9 @@ use bitty_term_state::{State, ZONE_RECORDS_MAX, ZoneKind, ZoneRecord};
 pub const SHELL_ZONE_MAX: usize = ZONE_RECORDS_MAX;
 
 /// Cwd payload is bounded by `BoundedString::MAX_LEN` (4096) at the parser
-/// boundary; this constant documents the shell-integration view.
-pub const SHELL_CWD_MAX_BYTES: usize = 4096;
+/// boundary; this constant names that bound for the shell-integration view
+/// and is derived from it so the two can never drift.
+pub const SHELL_CWD_MAX_BYTES: usize = bitty_vt::BoundedString::MAX_LEN;
 
 /// One logical command region derived from the ordered zone log.
 ///

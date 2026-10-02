@@ -568,6 +568,14 @@ jobs:
       - name: Run harness=false platform entry points (macOS ARM64)
         run: cargo test -p bitty-platform --test headless_run --test winit_window --locked
 
+      # CTX-0922: the default nextest run only covers the compiled-out
+      # `bitty dev` paths; rerun the CLI tests with the opt-in features so
+      # the dev-tool and trace success paths keep macOS coverage.
+      - name: Run bitty dev CLI tests (macOS ARM64, dev-tools and dev-perf features)
+        run: |
+          cargo test -p bitty-terminal --features dev-tools --test cli_dev --locked
+          cargo test -p bitty-terminal --features dev-perf --test cli_dev --locked
+
       # CTX-0847: the previous `--all-targets` run also executed the bitty-perf
       # benches; nextest runs none of them, so keep that coverage explicitly
       # here. The bitty-ipc example moved with the CTX-1585 extraction to the
@@ -713,6 +721,15 @@ jobs:
       - name: Run harness=false platform entry points
         shell: bash
         run: cargo test -p bitty-platform --test headless_run --test winit_window --locked
+
+      # CTX-0922: the default nextest run only covers the compiled-out
+      # `bitty dev` paths; rerun the CLI tests with the opt-in features so
+      # the dev-tool and trace success paths keep Windows coverage.
+      - name: Run bitty dev CLI tests (dev-tools and dev-perf features)
+        shell: bash
+        run: |
+          cargo test -p bitty-terminal --features dev-tools --test cli_dev --locked
+          cargo test -p bitty-terminal --features dev-perf --test cli_dev --locked
 
       # M1-10 / CTX-0574: Windows x86_64 (ConPTY) leg of the M1 compatibility
       # matrix, the third ADR-0002 Tier 1 platform. `shell: bash` selects the

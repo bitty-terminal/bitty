@@ -193,8 +193,9 @@ pub const MAX_SESSION_SCROLLBACK_LINES_PER_PANE: usize = 200;
 /// Maximum bytes of one persisted scrollback line.
 pub const MAX_SESSION_LINE_TEXT_BYTES: usize = 4096;
 
-/// Maximum bytes of a persisted cwd report (mirrors `bitty_rich::shell::SHELL_CWD_MAX_BYTES`).
-pub const MAX_SESSION_CWD_BYTES: usize = 4096;
+/// Maximum bytes of a persisted cwd report (derived from
+/// `bitty_rich::shell::SHELL_CWD_MAX_BYTES`, itself the parser bound).
+pub const MAX_SESSION_CWD_BYTES: usize = bitty_rich::shell::SHELL_CWD_MAX_BYTES;
 
 /// Maximum workspace-name chars (mirrors `WORKSPACE_NAME_MAX_CHARS`).
 pub const MAX_SESSION_NAME_CHARS: usize = 32;

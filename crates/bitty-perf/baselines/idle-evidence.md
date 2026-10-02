@@ -15,6 +15,7 @@ sidebar_order: 53
 
 ## Status and provenance
 
+- Note (2026-10-02): `panels_async.rs` (panel workers) was removed from `bitty-runtime` in PR #1611 (commit `67cdcc14`); this does not invalidate the measurements below, which remain a historical artifact.
 - Status: **draft evidence**. Repository-owned record for the PB-7 idle
   CPU/wakeup harness and its captured baseline. It does not close PB-7 and
   does not claim Verified; the accepted budgets remain arch constraints until

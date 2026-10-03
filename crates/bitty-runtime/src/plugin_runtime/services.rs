@@ -1054,14 +1054,16 @@ impl PluginServices {
     /// The Core terminal provider is empty (no scrollback blocks are sourced
     /// in this thin slice; semantic derivation from Terminal Truth stays with
     /// `bitty.terminal.snapshot`); lenses are collected in registration order.
-    /// Registration was validated at insert; a rebuild cannot fail.
+    /// Registration errors propagate with existing codes.
     fn targeting_mediator(&self) -> Result<ProviderMediator, BridgeError> {
         let lenses = self.require_target_lenses()?;
         let mut mediator = ProviderMediator::with_core(Vec::new());
         for (_, lens) in lenses.borrow().iter() {
             let rebuilt = DerivedProvider::new(lens.name(), lens.collect())
                 .map_err(map_targets_provider_error)?;
-            let _ = mediator.register(Box::new(rebuilt), true);
+            mediator
+                .register(Box::new(rebuilt), true)
+                .map_err(map_targets_provider_error)?;
         }
         Ok(mediator)
     }
@@ -1626,10 +1628,13 @@ impl HostServices for PluginServices {
     #[allow(clippy::type_complexity)]
     fn ui_targets_snapshot(&self, max: usize) -> Result<Vec<(i64, String, String)>, BridgeError> {
         self.require_targets_capability()?;
-        let registry = self.require_target_registry()?;
+        // Read-only: collect into a scratch registry, never the shared one
+        // that live sessions bind their generations against.
+        let _ = self.require_target_registry()?;
+        let mut scratch = TargetRegistry::new();
         let mediator = self.targeting_mediator()?;
         let snapshot = mediator
-            .collect(&mut registry.borrow_mut())
+            .collect(&mut scratch)
             .map_err(map_targets_provider_error)?;
         let entries = snapshot.entries();
         let take = max.min(entries.len()).min(MAX_SNAPSHOT_TARGETS);
@@ -3233,7 +3238,7 @@ mod tests {
     }
 
     #[test]
-    fn targeting_dispatch_fails_closed_on_stale_targets() {
+    fn targeting_snapshot_is_read_only_and_stale_dispatch_fails_closed() {
         let services = targeting_services(true, true);
         let handle = services
             .ui_mount("overlay", &UiNode::text("targets"))
@@ -3244,15 +3249,24 @@ mod tests {
         let labels = services
             .ui_targets_session_start(handle, 80, &targeting_anchors(2), &targeting_commands(2))
             .expect("start");
-        // A fresh read-only snapshot re-collects the registry, bumping the
-        // generations the session bound against, so its targets go stale by
-        // construction and dispatch fails closed with the existing
-        // `E_UI_NOT_OWNER` code (never a new stale code).
+        // A read-only snapshot collects into a scratch registry, so it never
+        // bumps the generations the live session bound against: dispatch
+        // keeps working after any number of snapshots.
         let _ = services.ui_targets_snapshot(16).expect("snapshot");
+        let _ = services.ui_targets_snapshot(16).expect("snapshot");
+        services
+            .ui_targets_dispatch(&labels[0])
+            .expect("dispatch after snapshot");
+        // Ending the session drops the dispatcher bindings, so dispatch
+        // fails closed with the existing `E_UI_NOT_OWNER` code (never a new
+        // stale code).
+        services
+            .ui_targets_session_cancel(handle)
+            .expect("cancel");
         assert_eq!(
             services
                 .ui_targets_dispatch(&labels[0])
-                .expect_err("stale")
+                .expect_err("ended session")
                 .code,
             E_UI_NOT_OWNER
         );

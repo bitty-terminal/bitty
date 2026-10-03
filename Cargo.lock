@@ -2019,7 +2019,7 @@ dependencies = [
 [[package]]
 name = "phodopus"
 version = "0.2.0-alpha.1"
-source = "git+https://github.com/bitty-terminal/phodopus?rev=1653c51f7fbda5e93fa99aefb0e5be58dfacfeb0#1653c51f7fbda5e93fa99aefb0e5be58dfacfeb0"
+source = "git+https://github.com/bitty-terminal/phodopus?rev=f6aa59a#f6aa59a16c0dd8d3f65f54043f8c3c2fe02b5344"
 dependencies = [
  "ahash",
  "allocator-api2",
@@ -2676,7 +2676,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.5",
  "windows-sys 0.59.0",

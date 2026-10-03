@@ -120,8 +120,8 @@ pub const EDITOR_TIMEOUT_DEFAULT: Duration = Duration::from_secs(120);
 pub const EDITOR_TIMEOUT_MAX: Duration = Duration::from_secs(300);
 /// Poll interval while waiting for the editor child.
 const EDITOR_POLL_INTERVAL: Duration = Duration::from_millis(5);
-/// Temp file name prefix (inside [`std::env::temp_dir`]).
-const TEMP_PREFIX: &str = "bitty-composer-";
+/// Temp file name prefix (inside the caller-selected temp dir).
+pub(crate) const TEMP_PREFIX: &str = "bitty-composer-";
 
 /// Editor programs admitted by [`resolve_editor`] after surrounding
 /// whitespace is trimmed, then matched exactly.
@@ -1321,7 +1321,7 @@ fn restrict_owner_only(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn truncate_err(mut s: String) -> String {
+pub(crate) fn truncate_err(mut s: String) -> String {
     if s.len() > 256 {
         s.truncate(256);
     }
@@ -1449,7 +1449,7 @@ pub fn edit_externally(
             &owned_dir
         }
     };
-    editor_round_trip(buffer, &program, timeout, dir)
+    editor_round_trip(buffer, &program, timeout, dir, run_editor)
 }
 
 /// Round-trip core with an already-resolved program: temp write, bounded
@@ -1458,15 +1458,23 @@ pub fn edit_externally(
 /// Private so only [`edit_externally`] (allowlist-enforced) reaches it in
 /// production; tests inside this module use it to execute fake editor
 /// scripts at arbitrary paths that the allowlist correctly rejects.
-fn editor_round_trip(
+///
+/// The `spawn` seam selects the child supervisor: [`run_editor`] (legacy
+/// blocking primitive, inherited stdio/env) or the hosted
+/// [`crate::host::run_editor_hosted`] (minimized env, closed stdin,
+/// owned-tree kill). Both report the same [`EditorError`] contract, so the
+/// composition (resolve-before-side-effects, read-only-on-success,
+/// RAII delete, fail-closed buffer install) is shared.
+pub(crate) fn editor_round_trip(
     buffer: &mut CommandBuffer,
     program: &str,
     timeout: Duration,
     dir: &Path,
+    spawn: fn(&str, &Path, Duration) -> Result<(), EditorError>,
 ) -> Result<String, EditorError> {
     let temp = write_composer_temp(buffer.as_str(), dir)?;
     let temp_path = temp.path().to_path_buf();
-    let run = run_editor(program, &temp_path, timeout);
+    let run = spawn(program, &temp_path, timeout);
     // Read back only when the editor succeeded; every path drops `temp`
     // (deleting the file) before returning.
     match run {
@@ -1875,7 +1883,7 @@ mod tests {
     ) -> Result<String, EditorError> {
         let mut last: Option<EditorError> = None;
         for _ in 0..20 {
-            match editor_round_trip(buf, editor, timeout, dir) {
+            match editor_round_trip(buf, editor, timeout, dir, run_editor) {
                 Ok(out) => return Ok(out),
                 Err(EditorError::SpawnFailed(msg)) if msg.contains("Text file busy") => {
                     last = Some(EditorError::SpawnFailed(msg));

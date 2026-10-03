@@ -5198,6 +5198,171 @@ fn external_editor_nonzero_exit_discards_and_tears_down() {
     let _ = std::fs::remove_file(&script);
 }
 
+#[test]
+fn external_editor_typed_open_reports_busy_and_keeps_existing() {
+    // Typed `process.editor` open (W-103 G-4): a second open while hosted
+    // reports Busy and keeps the existing session (single-session bound,
+    // T-4). Headless-safe (no spawn; the session is recorded directly).
+    use crate::editor_host::{EditorOpenOutcome, ExternalEditorSession};
+    let mut app = editor_test_app();
+    feed_text(&mut app, "hi");
+    let temp =
+        bitty_rich::composer::write_composer_temp("hi", &std::env::temp_dir()).expect("temp");
+    let path = temp.path().to_path_buf();
+    let home = app.runtime.focused_view().expect("focused leaf");
+    assert!(app.chrome.editor.begin(ExternalEditorSession {
+        view: ViewId::new(999),
+        temp,
+        return_focus: home,
+    }));
+    let outcome = app.open_external_editor_typed(
+        None,
+        None,
+        Some("/bin/true"),
+        bitty_rich::composer::EDITOR_TIMEOUT_DEFAULT,
+    );
+    assert_eq!(
+        outcome,
+        EditorOpenOutcome::Busy,
+        "second open must report Busy, not replace the session"
+    );
+    assert_eq!(app.chrome.editor.pending_view(), Some(ViewId::new(999)));
+    assert_eq!(
+        app.runtime.leaf_count(),
+        2,
+        "no leaf spawns for a Busy open"
+    );
+    // Draining the (leaf-vanished) session cancels with cleanup.
+    assert_eq!(
+        app.poll_external_editor(),
+        Some(bitty_rich::host::EditorOutcome::Cancelled)
+    );
+    assert!(!app.chrome.editor.is_hosting());
+    assert!(!path.exists(), "temp deleted on cancel");
+    assert_eq!(app.runtime.cw_composer_content(), "hi");
+    assert!(app.runtime.cw_composer_is_open());
+}
+
+#[test]
+fn external_editor_typed_denied_before_side_effects() {
+    // Typed hostile-program denial (T-3 at the hosted boundary): no leaf, no
+    // session, overlay still open, draft kept.
+    use crate::editor_host::EditorOpenOutcome;
+    let mut app = editor_test_app();
+    let focused_before = app.runtime.focused_view();
+    feed_text(&mut app, "hi");
+    let outcome = app.open_external_editor_typed(
+        Some("/tmp/evil-editor"),
+        Some("/tmp/evil-editor"),
+        None,
+        bitty_rich::composer::EDITOR_TIMEOUT_DEFAULT,
+    );
+    assert_eq!(
+        outcome,
+        EditorOpenOutcome::Denied(bitty_rich::host::EditorDeny::NotAllowed)
+    );
+    assert!(!app.chrome.editor.is_hosting());
+    assert_eq!(app.runtime.leaf_count(), 2);
+    assert_eq!(app.runtime.focused_view(), focused_before);
+    assert!(app.runtime.cw_composer_is_open());
+    assert_eq!(app.runtime.cw_composer_content(), "hi");
+}
+
+#[test]
+#[cfg(unix)]
+fn external_editor_hosted_timeout_kills_tree_and_reports() {
+    require_pty!();
+    use std::time::{Duration, Instant};
+    // Bounded hosted wait (W-103 G-3/G-4, T-6 at the hosted boundary):
+    // expiry kills the recorded owned tree and reports a typed Timeout; the
+    // leaf tears down, focus restores, the draft is kept, and the overlay
+    // reopens. The grandchild sleeper proves tree (not direct-child) kill.
+    let mut app = editor_test_app();
+    let home = app.runtime.focused_view().expect("focused leaf");
+    feed_text(&mut app, "hi");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!(
+        "bitty-editor-timeout-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("timeout workdir");
+    let pidfile = dir.join("grandchild.pid");
+    let script = write_fake_editor(
+        "timeout-tree",
+        &format!(
+            "#!/bin/sh\n( exec sleep 60 ) & \nprintf '%s' \"$!\" > \"{pid}\"\nsleep 60\n",
+            pid = pidfile.to_string_lossy()
+        ),
+    );
+    let script_arg = script.to_string_lossy().into_owned();
+    app.open_external_editor_with_timeout(
+        None,
+        None,
+        Some(script_arg.as_str()),
+        Duration::from_millis(300),
+    );
+    assert!(app.chrome.editor.is_hosting());
+    let editor_view = app.chrome.editor.pending_view().expect("pending view");
+    // Drive the editor poll directly (not via `poll_pty_pump`, which would
+    // consume the finish outcome internally) so the typed outcome is observed.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut outcome = None;
+    while app.chrome.editor.is_hosting() && Instant::now() < deadline {
+        if let Some(done) = app.poll_external_editor() {
+            outcome = Some(done);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        outcome,
+        Some(bitty_rich::host::EditorOutcome::Timeout),
+        "expiry must report a typed Timeout"
+    );
+    assert_eq!(app.runtime.cw_composer_content(), "hi");
+    assert_eq!(app.runtime.leaf_count(), 2);
+    assert!(!app.runtime.has_pane_session(&editor_view));
+    assert_eq!(app.runtime.focused_view(), Some(home));
+    assert!(app.runtime.cw_composer_is_open());
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        // Only an owned-tree kill reaches the grandchild: it must be gone
+        // (absent from /proc, or a zombie awaiting reaping).
+        let pid_text = std::fs::read_to_string(&pidfile).expect("grandchild pid recorded");
+        let grandchild: u32 = pid_text.trim().parse().expect("pid parses");
+        assert!(
+            hosted_grandchild_gone(grandchild),
+            "grandchild {grandchild} survived the timeout kill"
+        );
+    }
+    let _ = std::fs::remove_file(&script);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Whether a pid is fully gone on Linux: absent from `/proc`, or a zombie
+/// awaiting reaping (a SIGKILLed child reparents to init, which reaps
+/// promptly; poll briefly before concluding survival). Mirrors the
+/// blocking-path probe in `bitty-rich` host tests.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn hosted_grandchild_gone(pid: u32) -> bool {
+    for _ in 0..100 {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => return true,
+            Ok(stat) => {
+                let state = stat.rsplit(')').next().unwrap_or("").trim_start();
+                if !state.starts_with('Z') {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    continue;
+                }
+                return true;
+            }
+        }
+    }
+    false
+}
+
 // ---------------------------------------------------------------------------
 // Shell child exit and panel auto-close regression tests (#1356, #1541, CTX-0881)
 // ---------------------------------------------------------------------------

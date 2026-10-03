@@ -682,6 +682,41 @@ pub(crate) fn validate_resolved(resolved: &ResolvedSpawn) -> Result<(), IpcError
 
 // ── real-process provider ───────────────────────────────────────────────────
 
+/// Builds the closed-environment pipe command for the CTX-0442 synchronous
+/// provider (W-140 Core side).
+///
+/// Argv-only (no shell), ambient environment cleared, explicit variables
+/// only, stdin closed, stdout/stderr piped. Duplicated from the extracted
+/// execution supervisor's constructor so the Core surface keeps its shape
+/// without depending on `bitty-execution`; the unit test below owns the
+/// argv/closed-env drift protection.
+#[must_use]
+fn closed_pipe_command(
+    program: &str,
+    args: &[String],
+    cwd: Option<&str>,
+    env: &EnvPolicy,
+) -> std::process::Command {
+    use std::process::{Command, Stdio};
+
+    let mut command = Command::new(program);
+    command.args(args);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    command.env_clear();
+    if let EnvPolicy::Explicit { vars } = env {
+        for var in vars {
+            command.env(&var.name, &var.value);
+        }
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
 /// Real-process [`ExecutionProvider`](bitty_ipc::ExecutionProvider): argv-only
 /// spawn with concurrent bounded drain, timeout kill+reap, and closed env.
 ///
@@ -696,9 +731,10 @@ pub(crate) fn spawn_process(
 ) -> Result<bitty_ipc::execution::RawExecutionOutput, IpcError> {
     use bitty_ipc::execution::{EffectState, ExecutionStatus, RawExecutionOutput};
 
-    // CTX-0511: argv-only, closed-environment command construction is shared
-    // with the job supervisor so the two execution surfaces cannot drift.
-    let mut command = crate::execution::closed_pipe_command(
+    // CTX-0442 argv-only, closed-environment command construction lives in
+    // the Core-local `closed_pipe_command` above (W-140 duplicate of the
+    // extracted supervisor constructor).
+    let mut command = closed_pipe_command(
         &request.executable,
         &request.args,
         request.cwd.as_deref(),
@@ -2553,6 +2589,45 @@ mod tests {
             },
             (0, 0),
             "disarmed drop must not touch the child"
+        );
+    }
+
+    #[test]
+    fn closed_pipe_command_keeps_argv_and_closed_env_shape() {
+        // W-140 drift protection: the Core-local duplicate of the extracted
+        // supervisor constructor must stay argv-only with a cleared ambient
+        // environment, explicit vars only, and no shell.
+        let env =
+            EnvPolicy::explicit(vec![("SEALED".to_owned(), "1".to_owned())]).expect("explicit env");
+        let command = super::closed_pipe_command(
+            "prog",
+            &["a".to_owned(), "--flag".to_owned()],
+            Some("/tmp"),
+            &env,
+        );
+        assert_eq!(command.get_program(), "prog");
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, vec!["a".to_owned(), "--flag".to_owned()]);
+        assert_eq!(
+            command.get_current_dir(),
+            Some(std::path::Path::new("/tmp"))
+        );
+        let envs: Vec<(String, Option<String>)> = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            envs,
+            vec![("SEALED".to_owned(), Some("1".to_owned()))],
+            "ambient environment must be cleared, explicit vars only"
         );
     }
 }

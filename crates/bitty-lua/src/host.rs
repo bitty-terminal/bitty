@@ -503,6 +503,31 @@ pub const OVERLAY_CAPTURE_TEXT_MAX_BYTES: usize = 4096;
 /// Maximum number of captured events one `bitty.ui.overlay.poll` call returns.
 pub const OVERLAY_CAPTURE_POLL_MAX: usize = OVERLAY_CAPTURE_QUEUE_MAX;
 
+/// Maximum entries one `bitty.ui.targets.snapshot` read returns (W-29, CTX-0942).
+///
+/// Mirrors the Core mechanism bound (`bitty-ui` `MAX_SNAPSHOT_TARGETS`, 1024):
+/// the bridge truncates defensively, so a misbehaving host source can never
+/// push an unbounded array into Lua. Private: the accepted ceiling lives in
+/// `bitty-ui`; this is only the bridge-side defensive cap.
+const UI_TARGETS_SNAPSHOT_MAX: usize = 1024;
+
+/// Maximum target offers one `bitty.ui.targets.register` call carries (W-29).
+///
+/// Mirrors the Core snapshot bound above: a registration that would overflow
+/// a single cold-path collection fails closed before any registry insert.
+const UI_TARGETS_REGISTER_MAX: usize = 1024;
+
+/// Maximum bytes of a `bitty.ui.targets.register` provider name (W-29).
+///
+/// Mirrors the Core provider-name grammar (`bitty-ui`
+/// `MAX_TARGET_PROVIDER_NAME_LEN`, 32).
+const UI_TARGETS_PROVIDER_NAME_MAX_BYTES: usize = 32;
+
+/// Maximum anchors one `bitty.ui.labels.assign` call carries (W-29).
+///
+/// Mirrors the Core allocator cap (`bitty-ui` `MAX_BEACON_TARGETS`, 1024).
+const UI_LABELS_ASSIGN_MAX: usize = 1024;
+
 /// One bounded transient input event captured for a focusable overlay
 /// (CTX-0941).
 ///
@@ -885,6 +910,176 @@ pub trait HostServices {
         ))
     }
 
+    /// Collect a bounded, read-only target snapshot (W-29, CTX-0942, DEC-0085 thin host).
+    ///
+    /// Returns at most `max` entries of the current cold-path collection over
+    /// the Core terminal provider plus registered generic lenses, in tier
+    /// priority then registration order. The engine stages every offer before
+    /// any registry insert and fails closed with `E_DEF_LIMIT` on an oversized
+    /// collection; the snapshot is ephemeral and never published to the Event
+    /// Bus. Each entry is `(handle, kind, tier)` with `handle` an opaque
+    /// 1-based token local to this read, `kind` one of
+    /// `panel`/`workspace`/`block`/`node`/`link`, and `tier` one of
+    /// `core`/`plugin`/`derived`. Handles carry no generation wire shape and
+    /// are never transferable across sessions; dispatch revalidates against
+    /// the live registry and fails closed with [`E_UI_NOT_OWNER`] on stale.
+    /// The implementation owns capability gating (`ui.overlay`,
+    /// deny-by-default) and the Core `ProviderMediator` bounds. Safe mode is
+    /// unaffected: with zero plugins the Core provider yields an empty
+    /// snapshot. The default fails closed with [`E_UI_UNAVAILABLE`], so a host
+    /// without a targeting surface has no ambient authority. No new capability
+    /// identifier is introduced.
+    #[allow(clippy::type_complexity)]
+    fn ui_targets_snapshot(&self, _max: usize) -> Result<Vec<(i64, String, String)>, BridgeError> {
+        Err(BridgeError::new(
+            "runtime",
+            E_UI_UNAVAILABLE,
+            "host has no ui targeting surface",
+        ))
+    }
+
+    /// Register (or replace) this generation's named target lens (W-29, CTX-0942).
+    ///
+    /// `tier` is `plugin` or `derived`; the `core` tier stays host-owned and
+    /// fails closed with `E_DEF_INVALID` from Lua. `targets` are
+    /// `(kind, id)` pairs with `kind` one of
+    /// `panel`/`workspace`/`block`/`node`/`link` and `id` a non-negative
+    /// semantic id (never a raw compositor, PTY, or memory handle). The
+    /// implementation validates against the Core provider-name grammar,
+    /// rejects foreign shadowing (no duplicate names across generations),
+    /// bounds the provider count, and maps both tiers onto the existing
+    /// `DerivedProvider` lens (no `Plugin`-tier source exists in `bitty-ui`;
+    /// reuse avoids any new Beacon type). Registration grants addressability
+    /// only: a target's declared actions stay metadata and a command still
+    /// executes under its own owner's grants. Capability-gated on
+    /// `ui.overlay` (deny-by-default); no new capability identifier. The
+    /// default fails closed with [`E_UI_UNAVAILABLE`].
+    #[allow(clippy::type_complexity)]
+    fn ui_targets_register(
+        &self,
+        _name: &str,
+        _tier: &str,
+        _targets: &[(String, u64)],
+    ) -> Result<bool, BridgeError> {
+        Err(BridgeError::new(
+            "runtime",
+            E_UI_UNAVAILABLE,
+            "host has no ui targeting surface",
+        ))
+    }
+
+    /// Unregister this generation's named target lens (W-29, CTX-0942).
+    ///
+    /// Idempotent: `Ok(false)` means no lens of this generation carried
+    /// `name`, never an error, so unload/cancel cleanup can never wedge.
+    /// The default fails closed with [`E_UI_UNAVAILABLE`].
+    fn ui_targets_unregister(&self, _name: &str) -> Result<bool, BridgeError> {
+        Err(BridgeError::new(
+            "runtime",
+            E_UI_UNAVAILABLE,
+            "host has no ui targeting surface",
+        ))
+    }
+
+    /// Set the label-allocation charset policy from Lua-supplied sets (W-29, CTX-0942).
+    ///
+    /// The Core `LabelAllocator` owns the deterministic algorithm; the
+    /// character sets are policy the plugin supplies. Both sets are validated
+    /// by the Core `LabelPolicy` (non-empty, `<= 64` chars, `[a-z0-9]`,
+    /// duplicate-free) and an invalid charset fails closed with
+    /// `E_DEF_INVALID` before any session runs. Capability-gated on
+    /// `ui.overlay`; no new capability. The default fails closed with
+    /// [`E_UI_UNAVAILABLE`].
+    fn ui_labels_set_policy(&self, _home: &str, _overflow: &str) -> Result<(), BridgeError> {
+        Err(BridgeError::new(
+            "runtime",
+            E_UI_UNAVAILABLE,
+            "host has no ui labeling surface",
+        ))
+    }
+
+    /// Allocate one unique label per anchor under the active policy (W-29, CTX-0942).
+    ///
+    /// `anchors` are viewport-local `(x, y)` cells; `width` is the viewport
+    /// width for spatial left/right pooling. Deterministic for a fixed anchor
+    /// set; bounded by the Core allocator caps and fail-closed with
+    /// `E_DEF_LIMIT` on exhaustion. Capability-gated on `ui.overlay`; no new
+    /// capability. The default fails closed with [`E_UI_UNAVAILABLE`].
+    fn ui_labels_assign(
+        &self,
+        _anchors: &[(u16, u16)],
+        _width: u16,
+    ) -> Result<Vec<String>, BridgeError> {
+        Err(BridgeError::new(
+            "runtime",
+            E_UI_UNAVAILABLE,
+            "host has no ui labeling surface",
+        ))
+    }
+
+    /// Start a bounded targeting session over the W-28 overlay capture (W-29, CTX-0942).
+    ///
+    /// Collects a fresh snapshot, maps `anchors`/`commands` positionally onto
+    /// it, allocates labels through the Core allocator, binds each label to
+    /// its typed command, and acquires the W-28 transient input capture for
+    /// `overlay_handle`. `anchors`, `commands`, and the snapshot must agree in
+    /// length; any mismatch, exhausted capacity, or stale handle fails closed
+    /// with `E_DEF_INVALID`/`E_DEF_LIMIT`/`E_UI_NOT_OWNER` and releases
+    /// capture. Returns the labels in snapshot order. No new session type is
+    /// introduced: ownership is the existing overlay capture owner, and cancel
+    /// is the existing overlay release plus dispatcher clear. No target or
+    /// annotation internal is published to the Event Bus. Capability-gated on
+    /// `ui.overlay`; no new capability. The default fails closed with
+    /// [`E_UI_UNAVAILABLE`].
+    fn ui_targets_session_start(
+        &self,
+        _overlay_handle: i64,
+        _width: u16,
+        _anchors: &[(u16, u16)],
+        _commands: &[String],
+    ) -> Result<Vec<String>, BridgeError> {
+        Err(BridgeError::new(
+            "runtime",
+            E_UI_UNAVAILABLE,
+            "host has no ui targeting surface",
+        ))
+    }
+
+    /// Cancel the active targeting session and release capture (W-29, CTX-0942).
+    ///
+    /// Idempotent and Core-owned: `Ok(false)` means this generation owns no
+    /// session for `overlay_handle`, never an error, so a crash or a duplicate
+    /// cancel can never wedge input. Clears the label-to-command bindings and
+    /// releases the W-28 capture through the existing release path. The
+    /// default fails closed with [`E_UI_UNAVAILABLE`].
+    fn ui_targets_session_cancel(&self, _overlay_handle: i64) -> Result<bool, BridgeError> {
+        Err(BridgeError::new(
+            "runtime",
+            E_UI_UNAVAILABLE,
+            "host has no ui targeting surface",
+        ))
+    }
+
+    /// Resolve a selected label to a typed command id (W-29 command-dispatch bridge).
+    ///
+    /// Revalidates the bound target against the live registry before returning
+    /// the command: a stale handle fails closed with [`E_UI_NOT_OWNER`] and an
+    /// unknown/expired label with `E_DEF_INVALID`. The bridge executes
+    /// nothing; the returned id is dispatched through the accepted command
+    /// registry under its owner's grants. Ending the session (clearing
+    /// bindings and releasing capture) is the caller's `session_cancel` or a
+    /// follow-up dispatch that consumes the one-shot session; this call alone
+    /// never publishes to the Event Bus. Capability-gated on `ui.overlay`; no
+    /// new capability or privileged path. The default fails closed with
+    /// [`E_UI_UNAVAILABLE`].
+    fn ui_targets_dispatch(&self, _label: &str) -> Result<String, BridgeError> {
+        Err(BridgeError::new(
+            "runtime",
+            E_UI_UNAVAILABLE,
+            "host has no ui targeting surface",
+        ))
+    }
+
     /// Gate one `bitty.services.provide(iface)` declaration (LUA-OQ-8).
     ///
     /// The bridge validates shapes and stashes the impl functions into the
@@ -1171,6 +1366,201 @@ fn overlay_events_value(events: &[OverlayInput]) -> LuaValue {
             })
             .collect(),
     )
+}
+
+/// Validate one `bitty.ui.targets.register(def)` table (W-29, CTX-0942).
+///
+/// `def` is `{ name = <string>, tier = "plugin"|"derived",
+/// targets = { {kind = <string>, id = <integer>}, ... } }`. Shapes fail
+/// closed with `E_UI_COMPONENT_INVALID`; capacity fails with `E_DEF_LIMIT`;
+/// the reserved `core` tier fails with `E_DEF_INVALID` (host-owned).
+#[allow(clippy::type_complexity)]
+fn parse_targets_register(
+    value: &LuaValue,
+) -> Result<(String, String, Vec<(String, u64)>), BridgeError> {
+    if !matches!(value, LuaValue::Table(_)) {
+        return Err(component_invalid(
+            "ui.targets.register definition must be a table",
+        ));
+    }
+    let name = match value.get("name") {
+        Some(LuaValue::String(name)) if !name.is_empty() => name.clone(),
+        _ => {
+            return Err(component_invalid(
+                "ui.targets.register name must be a non-empty string",
+            ));
+        }
+    };
+    if name.len() > UI_TARGETS_PROVIDER_NAME_MAX_BYTES {
+        return Err(BridgeError::new(
+            "budget",
+            "E_DEF_LIMIT",
+            format!("ui.targets.register name exceeds {UI_TARGETS_PROVIDER_NAME_MAX_BYTES} bytes"),
+        ));
+    }
+    let tier = match value.get("tier") {
+        Some(LuaValue::String(raw)) => raw.clone(),
+        _ => {
+            return Err(component_invalid(
+                "ui.targets.register tier must be a string",
+            ));
+        }
+    };
+    if tier == "core" {
+        return Err(BridgeError::new(
+            "validation",
+            "E_DEF_INVALID",
+            "the 'core' provider tier is not registrable from Lua",
+        ));
+    }
+    if tier != "plugin" && tier != "derived" {
+        return Err(BridgeError::new(
+            "validation",
+            "E_DEF_INVALID",
+            format!("unknown provider tier '{tier}'"),
+        ));
+    }
+    let targets_value = value
+        .get("targets")
+        .ok_or_else(|| component_invalid("ui.targets.register targets must be an array"))?;
+    let items = dense_targets_array(targets_value)?;
+    if items.len() > UI_TARGETS_REGISTER_MAX {
+        return Err(BridgeError::new(
+            "budget",
+            "E_DEF_LIMIT",
+            format!("ui.targets.register targets exceed {UI_TARGETS_REGISTER_MAX} offers"),
+        ));
+    }
+    let mut targets = Vec::with_capacity(items.len());
+    for item in items {
+        targets.push(parse_target_offer(item)?);
+    }
+    Ok((name, tier, targets))
+}
+
+/// Validate one `targets` entry: `{ kind = <string>, id = <integer> }`.
+fn parse_target_offer(value: &LuaValue) -> Result<(String, u64), BridgeError> {
+    if !matches!(value, LuaValue::Table(_)) {
+        return Err(component_invalid(
+            "ui.targets.register target must be a table",
+        ));
+    }
+    let kind = match value.get("kind") {
+        Some(LuaValue::String(raw)) => raw.clone(),
+        _ => {
+            return Err(component_invalid(
+                "ui.targets.register target.kind must be a string",
+            ));
+        }
+    };
+    match kind.as_str() {
+        "panel" | "workspace" | "block" | "node" | "link" => {}
+        _ => {
+            return Err(BridgeError::new(
+                "validation",
+                "E_DEF_INVALID",
+                format!("unknown target kind '{kind}'"),
+            ));
+        }
+    }
+    let id = match value.get("id") {
+        Some(LuaValue::Integer(id)) if *id >= 0 => *id as u64,
+        _ => {
+            return Err(component_invalid(
+                "ui.targets.register target.id must be a non-negative integer",
+            ));
+        }
+    };
+    Ok((kind, id))
+}
+
+/// Validate an array of `{ x = <int>, y = <int> }` anchors (W-29).
+fn parse_targets_anchors(value: &LuaValue) -> Result<Vec<(u16, u16)>, BridgeError> {
+    let items = dense_targets_array(value)?;
+    if items.len() > UI_LABELS_ASSIGN_MAX {
+        return Err(BridgeError::new(
+            "budget",
+            "E_DEF_LIMIT",
+            format!("ui anchors exceed {UI_LABELS_ASSIGN_MAX}"),
+        ));
+    }
+    let mut anchors = Vec::with_capacity(items.len());
+    for item in items {
+        if !matches!(item, LuaValue::Table(_)) {
+            return Err(component_invalid("ui anchor must be a table"));
+        }
+        let x = match item.get("x") {
+            Some(LuaValue::Integer(raw)) if (0..=i64::from(u16::MAX)).contains(raw) => *raw as u16,
+            _ => {
+                return Err(component_invalid(
+                    "ui anchor.x must be an integer in 0..=65535",
+                ));
+            }
+        };
+        let y = match item.get("y") {
+            Some(LuaValue::Integer(raw)) if (0..=i64::from(u16::MAX)).contains(raw) => *raw as u16,
+            _ => {
+                return Err(component_invalid(
+                    "ui anchor.y must be an integer in 0..=65535",
+                ));
+            }
+        };
+        anchors.push((x, y));
+    }
+    Ok(anchors)
+}
+
+/// Validate an array of command-id strings (W-29).
+fn parse_targets_commands(value: &LuaValue) -> Result<Vec<String>, BridgeError> {
+    let items = dense_targets_array(value)?;
+    if items.len() > UI_LABELS_ASSIGN_MAX {
+        return Err(BridgeError::new(
+            "budget",
+            "E_DEF_LIMIT",
+            format!("ui commands exceed {UI_LABELS_ASSIGN_MAX}"),
+        ));
+    }
+    let mut commands = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            LuaValue::String(command) => {
+                if command.is_empty() {
+                    return Err(component_invalid(
+                        "ui command binding must be a non-empty string",
+                    ));
+                }
+                commands.push(command.clone());
+            }
+            _ => {
+                return Err(component_invalid("ui command binding must be a string"));
+            }
+        }
+    }
+    Ok(commands)
+}
+
+/// Dense 1-based array items of `value`, failing closed on any non-integer
+/// or non-consecutive key.
+fn dense_targets_array(value: &LuaValue) -> Result<Vec<&LuaValue>, BridgeError> {
+    let LuaValue::Table(pairs) = value else {
+        return Err(component_invalid("ui array must be a dense 1-based array"));
+    };
+    let mut indexed: Vec<(i64, &LuaValue)> = Vec::with_capacity(pairs.len());
+    for (key, item) in pairs {
+        match key {
+            LuaValue::Integer(index) if *index >= 1 => indexed.push((*index, item)),
+            _ => {
+                return Err(component_invalid("ui array must be a dense 1-based array"));
+            }
+        }
+    }
+    indexed.sort_by_key(|(index, _)| *index);
+    for (position, (index, _)) in indexed.iter().enumerate() {
+        if *index != position as i64 + 1 {
+            return Err(component_invalid("ui array must be a dense 1-based array"));
+        }
+    }
+    Ok(indexed.into_iter().map(|(_, item)| item).collect())
 }
 
 /// Validate a stable workspace id argument (positive integer) for `what`.
@@ -3074,6 +3464,304 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         .expect("overlay table accepts 'poll'");
     ui.set(ctx, "overlay", readonly_table(ctx, overlay))
         .expect("ui table accepts 'overlay'");
+
+    // W-29 (CTX-0942, DEC-0085 thin host): read-only targeting mechanism over
+    // the existing `bitty-ui` beacon types, exposed under the existing
+    // `bitty.ui` namespace (no `bitty.beacon.*` namespace, no new capability,
+    // no new error codes). All calls gate on the accepted `ui.overlay`
+    // identifier (deny-by-default) because a targeting session consumes the
+    // W-28 focusable overlay / transient-input-capture mechanism. No target
+    // or annotation internal is published to the Event Bus, and no plugin
+    // callback runs on the input hot path: labels resolve through the Core
+    // dispatcher only. Session ownership is the existing overlay capture
+    // owner (no new session type); dispatch returns a typed command id for
+    // the accepted registry (no new privileged path). Safe mode is
+    // unaffected: with zero plugins the Core provider yields an empty
+    // snapshot and every call fails closed typed.
+    let targets = Table::new(&ctx);
+    targets
+        .set(
+            ctx,
+            "snapshot",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let max = match stack.get(0) {
+                        Value::Nil => UI_TARGETS_SNAPSHOT_MAX,
+                        Value::Integer(max) if max >= 0 => usize::try_from(max)
+                            .unwrap_or(usize::MAX)
+                            .min(UI_TARGETS_SNAPSHOT_MAX),
+                        _ => {
+                            return Err(component_invalid(
+                                "ui.targets.snapshot max must be a non-negative integer",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let entries = state
+                        .bounded(|_expiry| state.services.ui_targets_snapshot(max))
+                        .map_err(|e| e.to_error(ctx))?;
+                    let items = entries
+                        .into_iter()
+                        .map(|(handle, kind, tier)| {
+                            LuaValue::table([
+                                ("handle", LuaValue::Integer(handle)),
+                                ("kind", LuaValue::String(kind)),
+                                ("tier", LuaValue::String(tier)),
+                            ])
+                        })
+                        .collect();
+                    stack.replace(ctx, LuaValue::array(items).to_lua(ctx));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("targets table accepts 'snapshot'");
+    targets
+        .set(
+            ctx,
+            "register",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let raw = stack.get(0);
+                    let value =
+                        LuaValue::from_lua(raw, state.limits).map_err(|e| e.to_error(ctx))?;
+                    let (name, tier, offers) =
+                        parse_targets_register(&value).map_err(|e| e.to_error(ctx))?;
+                    let registered = state
+                        .bounded_mutation(|_expiry| {
+                            state.services.ui_targets_register(&name, &tier, &offers)
+                        })
+                        .map_err(|e| e.to_error(ctx))?;
+                    stack.replace(ctx, Value::Boolean(registered));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("targets table accepts 'register'");
+    targets
+        .set(
+            ctx,
+            "unregister",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let name = match stack.get(0) {
+                        Value::String(raw) => String::from_utf8_lossy(raw.as_bytes()).into_owned(),
+                        _ => {
+                            return Err(component_invalid(
+                                "ui.targets.unregister name must be a string",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let removed = state
+                        .bounded_mutation(|_expiry| state.services.ui_targets_unregister(&name))
+                        .map_err(|e| e.to_error(ctx))?;
+                    stack.replace(ctx, Value::Boolean(removed));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("targets table accepts 'unregister'");
+    targets
+        .set(
+            ctx,
+            "session_start",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let overlay_handle = match stack.get(0) {
+                        Value::Integer(handle) if handle > 0 => handle,
+                        _ => {
+                            return Err(component_invalid(
+                                "ui.targets.session_start handle must be a positive integer block handle",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let width = match stack.get(1) {
+                        Value::Integer(width)
+                            if (0..=i64::from(u16::MAX)).contains(&width) =>
+                        {
+                            width as u16
+                        }
+                        _ => {
+                            return Err(component_invalid(
+                                "ui.targets.session_start width must be an integer in 0..=65535",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let anchors_raw = stack.get(2);
+                    let anchors_value =
+                        LuaValue::from_lua(anchors_raw, state.limits).map_err(|e| e.to_error(ctx))?;
+                    let anchors =
+                        parse_targets_anchors(&anchors_value).map_err(|e| e.to_error(ctx))?;
+                    let commands_raw = stack.get(3);
+                    let commands_value =
+                        LuaValue::from_lua(commands_raw, state.limits).map_err(|e| e.to_error(ctx))?;
+                    let commands =
+                        parse_targets_commands(&commands_value).map_err(|e| e.to_error(ctx))?;
+                    if anchors.len() != commands.len() {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            "ui.targets.session_start anchors and commands must agree in length",
+                        )
+                        .to_error(ctx));
+                    }
+                    let labels = state
+                        .bounded_mutation(|_expiry| {
+                            state.services.ui_targets_session_start(
+                                overlay_handle,
+                                width,
+                                &anchors,
+                                &commands,
+                            )
+                        })
+                        .map_err(|e| e.to_error(ctx))?;
+                    let items = labels.into_iter().map(LuaValue::String).collect();
+                    stack.replace(ctx, LuaValue::array(items).to_lua(ctx));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("targets table accepts 'session_start'");
+    targets
+        .set(
+            ctx,
+            "session_cancel",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let overlay_handle = match stack.get(0) {
+                        Value::Integer(handle) if handle > 0 => handle,
+                        _ => {
+                            return Err(component_invalid(
+                                "ui.targets.session_cancel handle must be a positive integer block handle",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let cancelled = state
+                        .bounded_mutation(|_expiry| {
+                            state.services.ui_targets_session_cancel(overlay_handle)
+                        })
+                        .map_err(|e| e.to_error(ctx))?;
+                    stack.replace(ctx, Value::Boolean(cancelled));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("targets table accepts 'session_cancel'");
+    targets
+        .set(
+            ctx,
+            "dispatch",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let label = match stack.get(0) {
+                        Value::String(raw) => String::from_utf8_lossy(raw.as_bytes()).into_owned(),
+                        _ => {
+                            return Err(component_invalid(
+                                "ui.targets.dispatch label must be a string",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    if label.is_empty() {
+                        return Err(component_invalid(
+                            "ui.targets.dispatch label must be non-empty",
+                        )
+                        .to_error(ctx));
+                    }
+                    let command = state
+                        .bounded(|_expiry| state.services.ui_targets_dispatch(&label))
+                        .map_err(|e| e.to_error(ctx))?;
+                    stack.replace(ctx, Value::String(ctx.intern(command.as_bytes())));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("targets table accepts 'dispatch'");
+    ui.set(ctx, "targets", readonly_table(ctx, targets))
+        .expect("ui table accepts 'targets'");
+
+    let labels = Table::new(&ctx);
+    labels
+        .set(
+            ctx,
+            "set_policy",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let home = match stack.get(0) {
+                        Value::String(raw) => String::from_utf8_lossy(raw.as_bytes()).into_owned(),
+                        _ => {
+                            return Err(component_invalid(
+                                "ui.labels.set_policy home must be a string",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let overflow = match stack.get(1) {
+                        Value::String(raw) => String::from_utf8_lossy(raw.as_bytes()).into_owned(),
+                        _ => {
+                            return Err(component_invalid(
+                                "ui.labels.set_policy overflow must be a string",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    state
+                        .bounded_mutation(|_expiry| {
+                            state.services.ui_labels_set_policy(&home, &overflow)
+                        })
+                        .map_err(|e| e.to_error(ctx))?;
+                    stack.replace(ctx, Value::Boolean(true));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("labels table accepts 'set_policy'");
+    labels
+        .set(
+            ctx,
+            "assign",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let anchors_raw = stack.get(0);
+                    let anchors_value = LuaValue::from_lua(anchors_raw, state.limits)
+                        .map_err(|e| e.to_error(ctx))?;
+                    let anchors =
+                        parse_targets_anchors(&anchors_value).map_err(|e| e.to_error(ctx))?;
+                    let width = match stack.get(1) {
+                        Value::Integer(width) if (0..=i64::from(u16::MAX)).contains(&width) => {
+                            width as u16
+                        }
+                        _ => {
+                            return Err(component_invalid(
+                                "ui.labels.assign width must be an integer in 0..=65535",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let assigned = state
+                        .bounded(|_expiry| state.services.ui_labels_assign(&anchors, width))
+                        .map_err(|e| e.to_error(ctx))?;
+                    let items = assigned.into_iter().map(LuaValue::String).collect();
+                    stack.replace(ctx, LuaValue::array(items).to_lua(ctx));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("labels table accepts 'assign'");
+    ui.set(ctx, "labels", readonly_table(ctx, labels))
+        .expect("ui table accepts 'labels'");
 
     let root = Table::new(&ctx);
     root.set(ctx, "api_version", API_VERSION)

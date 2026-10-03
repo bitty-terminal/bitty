@@ -426,13 +426,13 @@ pub const ROWS: &[Row] = &[
     },
     Row {
         area: "graphics-protocols",
-        scenario: "runtime image placement and paint (headless)",
+        scenario: "runtime image placement seam fails closed pending decoder wiring (W-141)",
         status: Status::Ci,
         method: Method::Test {
             file: "crates/bitty-runtime/tests/kitty_images_present.rs",
-            name: "display_paints_image_pixels_topmost",
+            name: "admissible_payload_fails_closed_until_wiring",
         },
-        note: "headless compositor paint; no GPU/display required",
+        note: "pre-check admits, decode fails closed DecoderUnavailable; pixel paint proof returns with wiring",
     },
     Row {
         area: "graphics-protocols",

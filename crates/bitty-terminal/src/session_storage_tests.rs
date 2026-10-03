@@ -871,7 +871,7 @@ fn failed_save_never_clobbers_last_good_session() {
         .expect("read dir")
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.contains(".tmp."))
+        .filter(|n| n.contains(".tmp.") || n.contains(".tmp-"))
         .collect();
     assert!(
         leftovers.is_empty(),

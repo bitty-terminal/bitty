@@ -1,6 +1,9 @@
 //! Direct, non-shell URL launching.
-
-use std::process::Command;
+//!
+//! W-145 reduction (CTX-0938, Issue #1623): the crate-private dead-code spawn
+//! seed (`open_url` / `open_file_url` / `spawn_url_handler`) is removed. The
+//! live spawn site is `Runtime::spawn_validated_url` in `bitty-runtime`
+//! (`UrlOpener` / `SystemUrlOpener`); validation below stays untouched in Core.
 
 use crate::error::PlatformError;
 
@@ -95,33 +98,6 @@ pub fn validate_file_url(uri: &str) -> Result<ValidatedUrl, PlatformError> {
     }
 }
 
-/// Opens a validated URI using the platform's default handler.
-///
-/// The URI is passed as one argument to an executable; no shell or command
-/// interpolation is involved. The child is not waited on, so the caller does
-/// not block on an external handler.
-///
-/// Crate-private: external crates must go through the runtime's
-/// `ActivationGesture` + `intercept_open_url` gate.
-#[allow(dead_code)]
-pub(crate) fn open_url(url: &ValidatedUrl) -> Result<(), PlatformError> {
-    if url.as_str().starts_with("file:") {
-        return Err(PlatformError::UrlActivationDenied);
-    }
-    spawn_url_handler(url)
-}
-
-/// Opens a validated local-file URI after a distinct file capability check.
-///
-/// Crate-private: file URLs require the distinct `FileUrlActivation` path.
-#[allow(dead_code)]
-pub(crate) fn open_file_url(url: &ValidatedUrl) -> Result<(), PlatformError> {
-    if !is_local_file_url(url.as_str()) {
-        return Err(PlatformError::InvalidUrl);
-    }
-    spawn_url_handler(url)
-}
-
 /// Accept only the local, authority-free form `file:///absolute/path`.
 /// Remote authorities and encoded separators/traversal are rejected because
 /// this boundary does not canonicalize paths or establish a filesystem sandbox.
@@ -148,25 +124,6 @@ fn is_local_file_url(uri: &str) -> bool {
             && matches!(window[1].to_ascii_lowercase(), b'2' | b'5')
             && matches!(window[2].to_ascii_lowercase(), b'e' | b'f' | b'c')
     })
-}
-
-#[allow(dead_code)]
-fn spawn_url_handler(url: &ValidatedUrl) -> Result<(), PlatformError> {
-    let (program, prefix) = url_dispatch();
-    if cfg!(target_os = "linux") && !handler_available(program) {
-        return Err(PlatformError::UrlLaunch(format!(
-            "URL handler is unavailable: {program}"
-        )));
-    }
-    let mut command = Command::new(program);
-    if let Some(argument) = prefix {
-        command.arg(argument);
-    }
-    command.arg(url.as_str());
-    command
-        .spawn()
-        .map(|_| ())
-        .map_err(|error| PlatformError::UrlLaunch(error.to_string()))
 }
 
 #[allow(dead_code)]

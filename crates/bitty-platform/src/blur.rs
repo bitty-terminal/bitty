@@ -24,66 +24,21 @@ use winit::window::Window;
 /// - **Windows/X11**: No-op (unsupported)
 ///
 /// Unsupported platforms silently ignore the request.
+///
+/// W-145 reduction (CTX-0938, Issue #1623): the Wayland/macOS `eprintln!`
+/// placeholder backends had no platform effect and are removed. Compositor
+/// application lives in the platform-service adapter per accepted W-136;
+/// Core retains only this entry shape (bounded radius in, no handle out).
+/// No behavior change on any platform (stubs performed no window effect).
 pub fn apply_blur(window: &Window, radius: u32) {
     if radius == 0 {
         return; // No blur requested
     }
 
-    #[cfg(target_os = "linux")]
-    apply_blur_wayland(window, radius);
-
-    #[cfg(target_os = "macos")]
-    apply_blur_macos(window, radius);
-
-    // Windows and other platforms: no-op
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    // Adapter stub seam: no platform effect in Core. The bounded radius
+    // attribute (`0..=128`, clamped at `WindowConfig::with_blur_radius`)
+    // is the surviving contract; the adapter applies it when present.
     let _ = (window, radius);
-}
-
-/// Wayland blur implementation (KDE Plasma, Hyprland).
-///
-/// On Wayland, background blur is compositor-specific:
-/// - KDE Plasma: Uses org_kde_kwin_blur_manager protocol
-/// - Hyprland: Uses hyprland blur hints
-///
-/// Since winit 0.30.13 doesn't expose these protocols directly, we need to
-/// access the raw Wayland surface. For now, this is a placeholder that logs
-/// the request. Full implementation requires:
-/// 1. Raw window handle access via raw-window-handle
-/// 2. Wayland protocol bindings (wayland-client, wayland-protocols)
-/// 3. Compositor detection and protocol negotiation
-#[cfg(target_os = "linux")]
-fn apply_blur_wayland(_window: &Window, radius: u32) {
-    // TODO(CTX-0832): Implement Wayland blur protocol
-    // - Detect compositor (KDE/Hyprland)
-    // - Access raw wl_surface via raw_window_handle
-    // - Apply org_kde_kwin_blur or Hyprland blur hints
-    eprintln!(
-        "CTX-0832: Wayland blur requested (radius={}), not yet implemented",
-        radius
-    );
-}
-
-/// macOS blur implementation using NSVisualEffectView.
-///
-/// On macOS, background blur is achieved by:
-/// 1. Getting the NSWindow from the raw window handle
-/// 2. Creating an NSVisualEffectView with behind-window material
-/// 3. Setting it as the window's contentView
-///
-/// The blur radius parameter is ignored on macOS since NSVisualEffectView
-/// uses predefined material types rather than custom radius values.
-#[cfg(target_os = "macos")]
-fn apply_blur_macos(_window: &Window, radius: u32) {
-    // TODO(CTX-0832): Implement macOS NSVisualEffectView blur
-    // - Access NSWindow via raw_window_handle
-    // - Create NSVisualEffectView with NSVisualEffectMaterialBehindWindow
-    // - Set blendingMode to NSVisualEffectBlendingModeBehindWindow
-    // - Install as contentView
-    eprintln!(
-        "CTX-0832: macOS blur requested (radius={}), not yet implemented",
-        radius
-    );
 }
 
 #[cfg(test)]

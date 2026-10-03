@@ -44,6 +44,18 @@
 //!   advisory and prerelease opt-in per follow-up RFC (see `version`,
 //!   `requirement`, `resolver`).
 //!
+//! # Package-manager boundary (W-101 / CTX-0927)
+//!
+//! The crate is both the install-time package lifecycle and the retained
+//! read-only boundary artifact. [`boundary`] records the audit that classifies
+//! every consumer and operation as Core-retained (bounded manifest/lock
+//! parsing and integrity primitives, startup re-verification, runtime loading)
+//! or external-manager-owned (resolution, source fetch, install, activation,
+//! rollback, update, uninstall, list). [`startup::validate_installed_generation`]
+//! is the explicit pure entry point for Core's read-only re-verification of an
+//! already-installed generation: it never fetches, resolves, installs, or
+//! mutates the store, and fails closed on any integrity or grant mismatch.
+//!
 //! # What this crate does NOT do
 //!
 //! - No file I/O, no network, no process spawning, no plugin VM contact.
@@ -117,6 +129,7 @@
 #![forbid(unsafe_code)]
 
 pub mod activation;
+pub mod boundary;
 pub mod error;
 pub mod integrity;
 pub mod lifecycle;
@@ -125,6 +138,7 @@ pub mod manifest;
 pub mod requirement;
 pub mod resolver;
 pub mod source;
+pub mod startup;
 pub mod trust;
 pub mod version;
 
@@ -132,6 +146,7 @@ pub use activation::{
     ActivationPhase, ActivationReport, Environment, Generation, RetentionPolicy, activate,
     rollback_full, rollback_per_plugin,
 };
+pub use boundary::{OperationOwner, PackageOperation};
 pub use error::{ErrorClass, PackageError};
 pub use integrity::{
     MAX_ARTIFACT_BYTES, VerificationInputs, VerificationReport, VerificationStage, capability_diff,
@@ -156,6 +171,9 @@ pub use resolver::{
 };
 pub use source::{
     PackageSource, check_local_path_drift, digest_local_content, ensure_no_promotion_without_chain,
+};
+pub use startup::{
+    InstalledGenerationInputs, STARTUP_GRANT_SNAPSHOT_STAGE, validate_installed_generation,
 };
 pub use trust::{
     KeyRecord, KeyStore, SIGNING_DOMAIN, SignatureRecord, TrustMode, TrustPin, TrustStore,

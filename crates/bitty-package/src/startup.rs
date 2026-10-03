@@ -1,0 +1,258 @@
+//! Core read-only startup validation of an already-installed generation.
+//!
+//! This is the `W-101` / `CTX-0927` first slice: an explicit, pure entry point
+//! for the read-only half of the package boundary. It re-derives the verdict
+//! Core needs before the plugin host instantiates a VM, using only the
+//! retained primitives in this crate — never fetching, resolving, installing,
+//! activating, or mutating the store.
+//!
+//! # What Core re-verifies
+//!
+//! 1. **Parse/validate.** The installed manifest was parsed with the bounded
+//!    parser; [`PackageManifest::validate`] re-checks the schema, limits, and
+//!    the closed capability set (`P0-AC-027`).
+//! 2. **Artifact integrity (`H-A`).** The staged bytes are re-digested and
+//!    compared with the lock record.
+//! 3. **Manifest binding (`H-B`).** The canonical manifest digest is
+//!    re-derived and compared with the lock record (`P0-AC-028`).
+//! 4. **Grant snapshot.** Every recorded grant must parse as a capability in
+//!    the closed set and must be declared by the manifest; an over-broad or
+//!    underivable grant fails closed and the plugin is not loaded
+//!    (`P0-AC-012`, deny-by-default).
+//!
+//! Compatibility and content-root checks stay with the runtime load path that
+//! owns the staged module tree; this function is the pure integrity and
+//! capability half.
+//!
+//! # Core-never-network
+//!
+//! No function here opens a socket, resolves a name, or reads remote
+//! metadata. The only inputs are already-installed bytes and recorded data.
+//! This is the `DIR-016`/`DIR-017` invariant: Core never fetches.
+//!
+//! # Wiring status
+//!
+//! The current runtime load path (`bitty-runtime` `resolve_record`) digests
+//! the staged Lua module tree rather than a single artifact blob, so it does
+//! not call this entry point yet. Reconciling the tree digest with the `H-A`
+//! artifact digest is the remaining `W-101` work recorded in
+//! [`crate::boundary`]. This module is the retained, tested target for that
+//! wiring.
+
+#![forbid(unsafe_code)]
+
+use std::collections::BTreeSet;
+
+use crate::error::PackageError;
+use crate::integrity::{verify_artifact_checksum, verify_manifest, verify_manifest_hash_binding};
+use crate::manifest::{CapabilityId, PackageManifest};
+
+/// Label used for grant-snapshot failures in diagnostics.
+pub const STARTUP_GRANT_SNAPSHOT_STAGE: &str = "startup_grant_snapshot";
+
+/// Inputs for the read-only startup re-verification of one installed
+/// generation (pure data, no I/O).
+#[derive(Debug, Clone)]
+pub struct InstalledGenerationInputs<'a> {
+    /// Already-parsed installed manifest (bounded parser output).
+    pub manifest: &'a PackageManifest,
+    /// Already-installed artifact bytes read read-only from the store.
+    pub artifact_bytes: &'a [u8],
+    /// Expected artifact digest `H-A` from the lock record (64 hex).
+    pub expected_artifact_digest: &'a str,
+    /// Expected canonical manifest digest `H-B` from the lock record (64 hex).
+    pub expected_manifest_digest: &'a str,
+    /// Recorded capability grant snapshot for this exact manifest hash.
+    pub granted_capabilities: &'a [String],
+}
+
+/// Re-derive Core's read-only verdict over an installed generation.
+///
+/// Fails closed on the first mismatch: a tampered artifact or manifest, an
+/// invalid manifest, or a grant snapshot that is not a subset of the
+/// manifest's closed capability set all return an owned [`PackageError`] and
+/// the caller must not load the plugin. No network access and no store
+/// mutation occurs.
+///
+/// # Errors
+///
+/// [`PackageError::Integrity`], [`PackageError::DigestMismatch`], or
+/// [`PackageError::ManifestHashMismatch`] as produced by the retained
+/// integrity primitives, plus [`PackageError::Integrity`] with stage
+/// [`STARTUP_GRANT_SNAPSHOT_STAGE`] for a grant that cannot be re-derived.
+pub fn validate_installed_generation(
+    inputs: &InstalledGenerationInputs<'_>,
+) -> Result<(), PackageError> {
+    // Step 2 (parse/validate): bounded schema, limits, closed capabilities.
+    verify_manifest(inputs.manifest)?;
+    // Step 3 (H-A): staged bytes match the lock artifact digest.
+    verify_artifact_checksum(inputs.artifact_bytes, inputs.expected_artifact_digest)?;
+    // Step 4 (H-B): canonical manifest digest matches the lock record.
+    verify_manifest_hash_binding(inputs.manifest, inputs.expected_manifest_digest)?;
+    // Step 5: recorded grant snapshot re-derivation, deny-by-default.
+    validate_grant_snapshot(inputs.manifest, inputs.granted_capabilities)?;
+    Ok(())
+}
+
+/// Re-derive the recorded grant snapshot against the manifest's closed set.
+///
+/// Every recorded grant must be a valid closed-set capability and must be
+/// declared by the manifest; a grant that a plugin did not declare (or that
+/// the closed set does not contain) fails closed. A narrowed grant is
+/// accepted: missing authority denies at call time, never widens here.
+fn validate_grant_snapshot(
+    manifest: &PackageManifest,
+    granted_capabilities: &[String],
+) -> Result<(), PackageError> {
+    let declared: BTreeSet<&str> = manifest
+        .capabilities
+        .iter()
+        .map(CapabilityId::as_str)
+        .collect();
+    for raw in granted_capabilities {
+        let capability = CapabilityId::new(raw).map_err(|error| {
+            PackageError::integrity(
+                STARTUP_GRANT_SNAPSHOT_STAGE,
+                format!("recorded grant '{raw}' is not a closed capability: {error}"),
+            )
+        })?;
+        if !declared.contains(capability.as_str()) {
+            return Err(PackageError::integrity(
+                STARTUP_GRANT_SNAPSHOT_STAGE,
+                format!(
+                    "recorded grant '{}' is not declared by the installed manifest",
+                    capability.as_str()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::integrity::sha256_hex;
+    use crate::manifest::{Compat, PackageId, PackageIdentity};
+
+    const ARTIFACT: &[u8] = b"installed plugin artifact bytes";
+
+    fn manifest() -> PackageManifest {
+        PackageManifest {
+            identity: PackageIdentity {
+                id: PackageId::new("xuepoo.installed").expect("valid package id"),
+                name: "Installed".to_string(),
+                version: "0.1.0".to_string(),
+                description: "installed fixture".to_string(),
+                license: Some("MIT".to_string()),
+            },
+            compat: Compat {
+                bitty: Some(">=0.5.0,<1.0.0".to_string()),
+                plugin_api: Some("^1.0".to_string()),
+            },
+            dependencies: Vec::new(),
+            capabilities: vec![CapabilityId::new("terminal.semantic-read").unwrap()],
+            raw_bytes_len: 256,
+            undeclared_fields: Vec::new(),
+        }
+    }
+
+    /// Owns the digest strings so `InstalledGenerationInputs` can borrow them.
+    struct Fixture {
+        manifest: PackageManifest,
+        artifact_digest: String,
+        manifest_digest: String,
+    }
+
+    impl Fixture {
+        fn new(manifest: PackageManifest) -> Self {
+            let artifact_digest = sha256_hex(ARTIFACT);
+            let manifest_digest = manifest.canonical_digest();
+            Self {
+                manifest,
+                artifact_digest,
+                manifest_digest,
+            }
+        }
+
+        fn inputs<'a>(
+            &'a self,
+            artifact_bytes: &'a [u8],
+            granted: &'a [String],
+        ) -> InstalledGenerationInputs<'a> {
+            InstalledGenerationInputs {
+                manifest: &self.manifest,
+                artifact_bytes,
+                expected_artifact_digest: &self.artifact_digest,
+                expected_manifest_digest: &self.manifest_digest,
+                granted_capabilities: granted,
+            }
+        }
+    }
+
+    #[test]
+    fn valid_installed_generation_passes() {
+        let fixture = Fixture::new(manifest());
+        let granted = vec!["terminal.semantic-read".to_string()];
+        assert!(validate_installed_generation(&fixture.inputs(ARTIFACT, &granted)).is_ok());
+    }
+
+    #[test]
+    fn tampered_artifact_fails_closed() {
+        let fixture = Fixture::new(manifest());
+        let granted = vec!["terminal.semantic-read".to_string()];
+        assert!(
+            validate_installed_generation(&fixture.inputs(b"tampered bytes", &granted)).is_err()
+        );
+    }
+
+    #[test]
+    fn tampered_manifest_digest_fails_closed() {
+        let fixture = Fixture::new(manifest());
+        let granted = vec!["terminal.semantic-read".to_string()];
+        let inputs = InstalledGenerationInputs {
+            manifest: &fixture.manifest,
+            artifact_bytes: ARTIFACT,
+            expected_artifact_digest: &fixture.artifact_digest,
+            expected_manifest_digest: &"00".repeat(32),
+            granted_capabilities: &granted,
+        };
+        assert!(validate_installed_generation(&inputs).is_err());
+    }
+
+    #[test]
+    fn undeclared_grant_fails_closed() {
+        let fixture = Fixture::new(manifest());
+        let granted = vec!["platform.notify".to_string()];
+        assert!(validate_installed_generation(&fixture.inputs(ARTIFACT, &granted)).is_err());
+    }
+
+    #[test]
+    fn unknown_capability_grant_fails_closed() {
+        let fixture = Fixture::new(manifest());
+        // A closed-set capability the manifest never declared.
+        let undeclared = vec!["network.connect:evil.example".to_string()];
+        assert!(validate_installed_generation(&fixture.inputs(ARTIFACT, &undeclared)).is_err());
+        // A grant outside the closed set cannot be re-derived at all.
+        let bogus = vec!["totally.not-a-capability".to_string()];
+        assert!(validate_installed_generation(&fixture.inputs(ARTIFACT, &bogus)).is_err());
+    }
+
+    #[test]
+    fn narrowed_grant_is_accepted_because_calls_deny_at_use() {
+        let mut manifest = manifest();
+        manifest.capabilities = Vec::new();
+        let fixture = Fixture::new(manifest);
+        let granted: Vec<String> = Vec::new();
+        assert!(validate_installed_generation(&fixture.inputs(ARTIFACT, &granted)).is_ok());
+    }
+
+    #[test]
+    fn oversized_manifest_fails_closed() {
+        let mut manifest = manifest();
+        manifest.raw_bytes_len = crate::manifest::MANIFEST_MAX_BYTES + 1;
+        let fixture = Fixture::new(manifest);
+        let granted = vec!["terminal.semantic-read".to_string()];
+        assert!(validate_installed_generation(&fixture.inputs(ARTIFACT, &granted)).is_err());
+    }
+}

@@ -37,6 +37,20 @@ behavior, stable formats, or settled publisher-trust policy.
   OQ-029): `verify_signature` checks the record against the enrolled key
   directory fail-closed. `V-A`/`V-B` are unaffected.
 
+## Package-manager boundary (W-101 / CTX-0927)
+
+`src/boundary.rs` records the accepted `package-manager-boundary.md` audit as
+code: every public package operation and every `bitty-package` consumer is
+classified as Core-retained (bounded manifest/lock parsing, integrity
+primitives, startup re-verification, runtime loading) or external-manager-owned
+(resolution, source fetch, install, activation, rollback, update, uninstall,
+list). `src/startup.rs` exposes `validate_installed_generation`, the pure
+read-only entry point Core uses to re-derive integrity, manifest binding, and
+the grant snapshot of an already-installed generation without fetching,
+installing, or mutating the store. The install-time resolver, activation, and
+trust modules stay in place until `bitty-plugin-manager` replaces them; the
+boundary doc string records the remaining `W-101` wiring blocker.
+
 ## Layout
 
 - `Cargo.toml` — package metadata; sole dependency is `ed25519-dalek` for V-C.
@@ -50,4 +64,7 @@ behavior, stable formats, or settled publisher-trust policy.
   grammar and deterministic resolution.
 - `src/source.rs` — source declarations.
 - `src/error.rs` — owned error types.
+- `src/boundary.rs` — W-101 package-manager boundary audit (operation/consumer
+  classification, Core-never-network).
+- `src/startup.rs` — Core read-only installed-generation validation.
 - `tests/` — lifecycle and verification tests.

@@ -177,6 +177,21 @@ fn core_package_crates_link_no_network_implementation_crate() {
     // lock without being linked by these crates). `--offline --locked` keeps
     // the check hermetic and reproducible.
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    // Populate the complete dependency closure first: running this test alone
+    // (`cargo test -p bitty-plugin-host`) does not fetch `bitty-runtime` or
+    // its dependencies, and the `--offline` tree below would then fail during
+    // resolution on a clean cache. Fetch failures fail the test rather than
+    // skipping, so the boundary check is never silently dropped.
+    let fetch = std::process::Command::new(&cargo)
+        .args(["fetch", "--locked"])
+        .current_dir(workspace_root())
+        .output()
+        .unwrap_or_else(|error| panic!("run `{cargo} fetch`: {error}"));
+    assert!(
+        fetch.status.success(),
+        "`{cargo} fetch --locked` failed: {}",
+        String::from_utf8_lossy(&fetch.stderr)
+    );
     let output = std::process::Command::new(&cargo)
         .args([
             "tree",

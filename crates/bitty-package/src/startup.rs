@@ -190,7 +190,7 @@ fn verify_manifest_bytes_binding(
 /// mutation occurs.
 #[derive(Debug, Clone)]
 pub struct StagedTreeInputs<'a> {
-    /// Canonical tree buffer (`path || 0x00 || bytes || 0x0A`, sorted).
+    /// Canonical tree buffer (length-delimited `len || path || len || content`, sorted).
     pub tree_bytes: &'a [u8],
     /// Expected tree digest `H-A` from the record (64 hex).
     pub expected_tree_digest: &'a str,

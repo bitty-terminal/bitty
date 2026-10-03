@@ -480,7 +480,7 @@ pub fn store_package_root(store_root: &Path, record: &PluginRecord) -> Option<Pa
 ///
 /// The scheme is owned by `bitty-package::source::canonical_tree_bytes`
 /// (W-101 CTX-0944, ONE place): files sorted by their normalized
-/// `/`-separated relative path, each entry as `path || 0x00 || bytes || 0x0a`,
+/// `/`-separated relative path, each entry as `len:u64LE || path || len:u64LE || content`,
 /// hashed with the shared SHA-256. A `local-path` record written by the
 /// package manager verifies here because both sides hash the same buffer.
 ///
@@ -1145,7 +1145,7 @@ mod tests {
     fn staged_tree_digest_uses_the_shared_package_scheme() {
         // W-101 CTX-0944 old/new equivalence on the staged tree: the runtime
         // digest must equal `bitty-package`'s canonical digest over the same
-        // entries, and the buffer must be the shared `path || 0x00 || bytes`
+        // entries, and the buffer must be the shared length-delimited encoding
         // encoding (ONE place). The tree is non-empty so the assertion is not
         // vacuous.
         let entries = vec![
@@ -1170,16 +1170,16 @@ mod tests {
         );
         let buffer = canonical_tree_buffer(&entries);
         assert!(!buffer.is_empty(), "staged tree buffer must be non-empty");
-        // Sorted `a.lua` first: exact shared encoding.
+        // Sorted `a.lua` first: exact shared length-delimited encoding.
         let mut expected = Vec::new();
+        expected.extend_from_slice(&5u64.to_le_bytes());
         expected.extend_from_slice(b"a.lua");
-        expected.push(0);
+        expected.extend_from_slice(&5u64.to_le_bytes());
         expected.extend_from_slice(b"first");
-        expected.push(b'\n');
+        expected.extend_from_slice(&5u64.to_le_bytes());
         expected.extend_from_slice(b"b.lua");
-        expected.push(0);
+        expected.extend_from_slice(&6u64.to_le_bytes());
         expected.extend_from_slice(b"second");
-        expected.push(b'\n');
         assert_eq!(buffer, expected);
     }
 

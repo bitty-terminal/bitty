@@ -325,7 +325,7 @@ fn validate_git_rev(rev: &str) -> Result<(), PackageError> {
 ///
 /// The canonical encoding of a staged module tree is owned here: files sorted
 /// by their `/`-separated relative path, each entry as
-/// `path || 0x00 || bytes || 0x0A`. Both the install-time
+/// `path_len:u64LE || path || content_len:u64LE || content`. Both the install-time
 /// [`digest_local_content`] and the runtime staged-tree scan
 /// (`bitty-runtime` `resolution`) hash this exact buffer, so `H-A` for a
 /// staged tree equals the tree digest without a second scheme. Changing the
@@ -333,18 +333,21 @@ fn validate_git_rev(rev: &str) -> Result<(), PackageError> {
 /// [`sha256_hex`].
 /// Canonical bytes of a staged module tree (deterministic, cross-platform).
 ///
-/// Sorts by path, then concatenates `path || 0x00 || bytes || 0x0A` per file.
-/// Pure, headless, no I/O.
+/// Sorts by path, then concatenates per file `path_len:u64LE || path ||
+/// content_len:u64LE || content`. Length-delimited fields (never bare
+/// separators): a path may legally contain `\n`, so a `path || NUL || bytes
+/// || newline` encoding would admit a second preimage (`carrier.txt\nex…`
+/// colliding with `carrier.txt` + `ex…`). Pure, headless, no I/O.
 #[must_use]
 pub fn canonical_tree_bytes(files: &[(&str, &[u8])]) -> Vec<u8> {
     let mut sorted: Vec<(&str, &[u8])> = files.to_vec();
     sorted.sort_by(|a, b| a.0.cmp(b.0));
     let mut all = Vec::new();
     for (path, bytes) in sorted {
+        all.extend_from_slice(&(path.len() as u64).to_le_bytes());
         all.extend_from_slice(path.as_bytes());
-        all.push(b'\0');
+        all.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
         all.extend_from_slice(bytes);
-        all.push(b'\n');
     }
     all
 }
@@ -461,14 +464,26 @@ mod tests {
         assert_eq!(canonical_tree_bytes(&shuffled), canonical);
         // Empty tree has a defined digest (hash of empty buffer), not a panic.
         assert_eq!(digest_tree_files(&[]), sha256_hex(&[]));
-        // Byte-level scheme: `path || 0x00 || bytes || 0x0A` per sorted file.
+        // Byte-level scheme: `len:u64LE || path || len:u64LE || bytes` per file.
         let single = vec![("a.txt", b"hi" as &[u8])];
         let mut expected = Vec::new();
+        expected.extend_from_slice(&5u64.to_le_bytes());
         expected.extend_from_slice(b"a.txt");
-        expected.push(0);
+        expected.extend_from_slice(&2u64.to_le_bytes());
         expected.extend_from_slice(b"hi");
-        expected.push(b'\n');
         assert_eq!(canonical_tree_bytes(&single), expected);
+        // Second-preimage resistance: a newline-bearing path must not collide
+        // with a two-file tree (`carrier.txt\nex…` vs `carrier.txt` + `ex…`).
+        let tricky = vec![("carrier.txt\nextra.lua", b"<module>" as &[u8])];
+        let split = vec![
+            ("carrier.txt", b"" as &[u8]),
+            ("extra.lua", b"<module>" as &[u8]),
+        ];
+        assert_ne!(
+            canonical_tree_bytes(&tricky),
+            canonical_tree_bytes(&split),
+            "newline-bearing path must not collide with a split tree"
+        );
     }
 
     #[test]

@@ -38,6 +38,7 @@ use bitty_platform::{
 use bitty_runtime::{
     LayoutNode, PresentFrame, Runtime, RuntimeConfig, SplitAxis, UiRect, View, ViewId,
 };
+use bitty_term_state::search::SearchOptions;
 use bitty_ui::{CellPos, Selection, SelectionKind};
 
 const PRIMARY: ViewId = ViewId::new(1);
@@ -559,28 +560,27 @@ fn switching_workspace_clears_the_selection() {
 }
 
 #[test]
-fn switching_workspace_ends_copy_mode_and_search_bound_to_a_hidden_view() {
+fn switching_workspace_ends_search_bound_to_a_hidden_view() {
+    // W-144 (CTX-0937): the modal halves of this test retired with the Core
+    // policy; the binding-lifecycle half stays, armed through the mechanism
+    // (`search_set`) instead of the overlay. The plugins re-prove modal
+    // teardown (CTX-0004).
     bitty_test_support::require_pty!();
     let mut rt = split_runtime(SplitAxis::Horizontal);
     assert!(rt.set_focus(PANE));
-    rt.enter_copy_mode();
-    assert!(rt.is_copy_mode());
+    rt.search_set("gamma", SearchOptions::default());
+    assert_eq!(rt.search_view(), Some(PANE));
+    assert_eq!(rt.search_match_count(), 1);
 
     rt.workspace_new().expect("a second workspace");
-    assert!(
-        !rt.is_copy_mode(),
-        "copy mode cannot keep the keyboard for a View the slot hides"
+    assert_eq!(
+        rt.search_view(),
+        None,
+        "a bound search cannot keep addressing a View the slot hides"
     );
-
-    assert!(rt.workspace_switch(0));
-    assert!(rt.set_focus(PANE));
-    rt.enter_search_mode();
-    rt.search_set_overlay_query("gamma");
-    assert_eq!(rt.search_match_count(), 1);
-    rt.workspace_new().expect("a third workspace");
     assert!(
-        !rt.is_search_mode(),
-        "the search overlay closes when its View is hidden"
+        !rt.search_is_active(),
+        "the search ends when its View is hidden"
     );
 }
 

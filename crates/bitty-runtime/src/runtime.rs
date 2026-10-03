@@ -624,12 +624,14 @@ pub struct Runtime {
     /// they read the gesture kind via [`crate::Runtime::selection_kind`]
     /// and this count without touching the tracker.
     last_click_count: u8,
-    /// Keyboard copy-mode state (CTX-0384, issue #640).
+    /// Keyboard copy-mode state (CTX-0384, issue #640; policy retired by
+    /// W-144, CTX-0937).
     ///
-    /// `None` in normal operation; `Some` while the vi-style modal copy
-    /// cursor owns keyboard input (no PTY bytes, visual selection via the
-    /// CTX-0385 `SelectionKind` seams, yank to clipboard plus primary).
-    /// Bounded `O(1)` state; see `runtime::copy_mode`.
+    /// W-144 parked (owner: W-01): `None` in normal operation (copy mode can
+    /// no longer activate; entry retired with the policy). The flag, the
+    /// transient readouts, and the release hook stay so `input.rs` modal
+    /// routing plus the `selection` lifecycle funnels keep working until
+    /// input capture lands. Bounded `O(1)` state; see `runtime::copy_mode`.
     copy_mode: Option<crate::runtime::copy_mode::CopyModeState>,
     /// View whose grid the active copy mode walks (CTX-0805, #1478).
     ///
@@ -638,20 +640,21 @@ pub struct Runtime {
     /// `Some` exactly while `copy_mode` is `Some`; a bound View that loses
     /// its live grid ends copy mode (fail closed).
     copy_mode_view: Option<ViewId>,
-    /// Scrollback search overlay open flag (CTX-0383, issue #639).
+    /// Scrollback search overlay open flag (CTX-0383, issue #639; policy
+    /// retired by W-144, CTX-0937).
     ///
-    /// `false` in normal operation; `true` while the keyboard-first modal
-    /// search overlay owns keyboard input (no PTY bytes, query editing over
-    /// the bounded `search_state` seams, viewport reveal plus live-selection
-    /// sync via `search_apply_selection`). Bounded `O(1)` flag; the query
-    /// heap stays `<=256` bytes and matches `<=1000`. See
-    /// `runtime::search_mode`.
+    /// W-144 parked (owner: W-01): `false` in normal operation (the overlay
+    /// can no longer open; entry retired with the policy). The flag, the
+    /// transient readout, and the release hook stay so `input.rs` modal
+    /// routing plus the `selection` lifecycle funnels keep working until
+    /// input capture lands. Bounded `O(1)` flag; the query heap stays
+    /// `<=256` bytes and matches `<=1000`. See `runtime::search_mode`.
     search_mode: bool,
     /// View whose grid `search_state` was computed against (CTX-0805,
     /// #1478).
     ///
-    /// Set to the focused View when a search starts (`search_set`, the
-    /// overlay's first query) and cleared with the search. Matches are
+    /// Set to the focused View when a search starts (`search_set`) and
+    /// cleared with the search. Matches are
     /// buffer rows of exactly this grid, so refresh, reveal, highlights, and
     /// the live selection they drive all address it, even if focus moves.
     search_view: Option<ViewId>,

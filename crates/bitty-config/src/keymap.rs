@@ -67,11 +67,10 @@
 //!   `alt+w` close workspace with kill-confirm,
 //!   `alt+-`/`alt+=` prev/next (`=` is the unshifted DEC `+`), `alt+tab`
 //!   last-used, `alt+1..=9` jump to workspace N,
-//!   `shift+alt+1..=9` move focused window to workspace N),
-//!   `enter_copy_mode` (alias `copy_mode`; CTX-0384 / #640: vi-style modal
-//!   scrollback copy cursor, default `ctrl+shift+space`, `global` only),
-//!   `open_search` (alias `search`; CTX-0383 / #639: keyboard-first
-//!   scrollback search overlay, default `ctrl+shift+f`, `global` only).
+//!   `shift+alt+1..=9` move focused window to workspace N).
+//!   W-144 (CTX-0937): the search/copy-mode policy actions retired with
+//!   the Core policy; their namespace moves to W-138 with the plugins
+//!   (CTX-0003), so the retired spellings fail closed as unknown here.
 //!   Anything else fails closed with the known-action list.
 //! - `context`: only `"global"` is supported today; anything else fails
 //!   closed so a future context cannot silently never-match.
@@ -753,44 +752,6 @@ pub enum ChromeAction {
     /// never removes a workspace (last-workspace `>= 1` holds), and never
     /// touches the runtime-global primary PTY.
     WorkspaceMove(u64),
-    /// Enter keyboard copy mode (`enter_copy_mode`, CTX-0384 issue #640).
-    ///
-    /// Vi-style modal scrollback navigation with visual selection plus yank
-    /// (`hjkl`/arrows/`PgUp`/`PgDn`/`g`/`G` move, `v`/`V`/`Ctrl+V` select
-    /// over the CTX-0385 `SelectionKind` ranges, `y` yanks to clipboard plus
-    /// primary, `Esc` exits). Modal: no PTY input while active.
-    EnterCopyMode,
-    /// Open the scrollback search overlay (`open_search`, CTX-0383 issue #639).
-    ///
-    /// Keyboard-first modal overlay over the bounded CTX-0060/0061 search
-    /// seams (`State::search`, `SearchState`): typing edits the bounded
-    /// query (`<=256` bytes), `Enter` advances with viewport reveal plus
-    /// live-selection sync, `Shift+Enter` goes back, `Esc` exits and
-    /// clears (typing always edits the query; `n`/`N` are query text,
-    /// not navigation). Modal: no PTY input while active. Default `ctrl+shift+f`
-    /// (kitty parity; carries no `alt` slot so a Super flip leaves it).
-    OpenSearch,
-    /// Advance to the next search match (`search_next`, CTX-0383).
-    ///
-    /// No default binding: driven from the overlay (`Enter`) or via an
-    /// explicit user bind. Fail-closed no-op when search is inactive.
-    SearchNext,
-    /// Go back to the previous search match (`search_prev`, CTX-0383).
-    ///
-    /// No default binding: driven from the overlay (`Shift+Enter`) or
-    /// via an explicit user bind. Fail-closed no-op when search is inactive.
-    SearchPrev,
-    /// Close the search overlay (`close_search`, CTX-0383).
-    ///
-    /// No default binding: `Esc` already exits via the runtime modal path;
-    /// this action lets users bind an explicit closer. Fail-closed no-op
-    /// when search is inactive.
-    CloseSearch,
-    /// Toggle search case sensitivity (`search_toggle_case`, M1-14 CTX-0665).
-    ///
-    /// No default binding: driven from the overlay (`Ctrl+T`) or via an
-    /// explicit user bind. Fail-closed no-op when search is inactive.
-    SearchToggleCase,
     /// Toggle the command palette overlay (`toggle_palette`, CTX-0647 issue #1003).
     ///
     /// Manual open only: this action is never in [`DEFAULT_KEYMAPS`], so a
@@ -942,30 +903,6 @@ impl ChromeAction {
                 let n = require_workspace_index(arg, trimmed)?;
                 Ok(Self::WorkspaceMove(n))
             }
-            "enter_copy_mode" | "copy_mode" => {
-                reject_arg(arg, trimmed)?;
-                Ok(Self::EnterCopyMode)
-            }
-            "open_search" | "search" => {
-                reject_arg(arg, trimmed)?;
-                Ok(Self::OpenSearch)
-            }
-            "search_next" | "search_down" => {
-                reject_arg(arg, trimmed)?;
-                Ok(Self::SearchNext)
-            }
-            "search_prev" | "search_previous" | "search_up" => {
-                reject_arg(arg, trimmed)?;
-                Ok(Self::SearchPrev)
-            }
-            "close_search" | "search_close" => {
-                reject_arg(arg, trimmed)?;
-                Ok(Self::CloseSearch)
-            }
-            "search_toggle_case" | "toggle_search_case" => {
-                reject_arg(arg, trimmed)?;
-                Ok(Self::SearchToggleCase)
-            }
             "toggle_palette" | "open_palette" | "palette_toggle" => {
                 reject_arg(arg, trimmed)?;
                 Ok(Self::TogglePalette)
@@ -1009,19 +946,17 @@ impl ChromeAction {
             Self::WorkspaceLast => "workspace_last".to_string(),
             Self::WorkspaceFocus(n) => format!("workspace_focus:{n}"),
             Self::WorkspaceMove(n) => format!("workspace_move:{n}"),
-            Self::EnterCopyMode => "enter_copy_mode".to_string(),
-            Self::OpenSearch => "open_search".to_string(),
-            Self::SearchNext => "search_next".to_string(),
-            Self::SearchPrev => "search_prev".to_string(),
-            Self::CloseSearch => "close_search".to_string(),
-            Self::SearchToggleCase => "search_toggle_case".to_string(),
             Self::TogglePalette => "toggle_palette".to_string(),
         }
     }
 }
 
 /// Hint listing the accepted action vocabulary.
-const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, new_panel, resize_split:<left|right|up|down>, close_view, toggle_zoom, toggle_help, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, fold_toggle, fold_expand, fold_collapse, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_focus:<1..=16>, workspace_move:<1..=16>, enter_copy_mode, open_search, search_next, search_prev, close_search, search_toggle_case, toggle_palette";
+///
+/// W-144 (CTX-0937): the search/copy-mode policy actions retired with the
+/// Core policy; their namespace moves to W-138 with the plugins (CTX-0003),
+/// so the retired spellings fail closed as unknown here.
+const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, new_panel, resize_split:<left|right|up|down>, close_view, toggle_zoom, toggle_help, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, fold_toggle, fold_expand, fold_collapse, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_focus:<1..=16>, workspace_move:<1..=16>, toggle_palette";
 
 /// Require a `<head>:<dir>` argument.
 fn require_dir_arg(arg: Option<&str>, raw: &str) -> Result<SplitDir, ConfigError> {
@@ -1338,15 +1273,10 @@ pub const DEFAULT_KEYMAPS: &[(&str, &str)] = &[
     ("alt+?", "toggle_help"),
     ("alt+shift+?", "toggle_help"),
     ("alt+shift+/", "toggle_help"),
-    // CTX-0384 keyboard copy mode (issue #640): `ctrl+shift+space` enters the
-    // vi-style modal copy cursor (bare `space` stays shell input; the chord
-    // carries no `alt` slot so a Super flip leaves it unchanged).
-    ("ctrl+shift+space", "enter_copy_mode"),
-    // CTX-0383 scrollback search overlay (issue #639): `ctrl+shift+f` opens
-    // the keyboard-first search overlay (kitty parity; bare `f` stays shell
-    // input; no `alt` slot so a Super flip leaves it unchanged).
-    // Next/prev/close are overlay keys plus explicit-bind actions.
-    ("ctrl+shift+f", "open_search"),
+    // W-144 (CTX-0937): the search/copy-mode policy defaults retired with
+    // the Core policy (`ctrl+shift+space` entered copy mode, `ctrl+shift+f`
+    // opened search). Both chords are shell input again until the plugins
+    // (CTX-0003, W-138 namespace) rebind them.
 ];
 
 /// Build the shipped defaults against one [`ModKey`] (CTX-0236).
@@ -1497,8 +1427,8 @@ pub fn validate_entry(entry: &KeymapEntry) -> Result<(), ConfigError> {
 
 /// Default Leader chord (OQ-088 adopted): `Alt+Space`.
 ///
-/// Free in [`DEFAULT_KEYMAPS`] (only `ctrl+shift+space` is bound, for copy
-/// mode), so the default never shadows a shipped chrome chord.
+/// Free in [`DEFAULT_KEYMAPS`] (no shipped default binds it), so the default
+/// never shadows a shipped chrome chord.
 pub const LEADER_DEFAULT_CHORD_RAW: &str = "alt+space";
 
 /// Windows fallback Leader chords (OQ-088): `Alt+Space` is OS-reserved on
@@ -2543,20 +2473,19 @@ mod tests {
         // Mod-aware resize) = 59, plus CTX-0263's 7 mod-independent font-zoom
         // chords = 66, plus CTX-0259's 9 Mod+Shift+Number move chords
         // (shift+alt+1..=9) = 75, plus CTX-0265's 4 help chords (alt+backtick
-        // + 3 alt+? shifted-symbol spellings) = 79 total, plus CTX-0384's 1
-        // copy-mode chord (ctrl+shift+space) = 80 total, plus CTX-0383's 1
-        // search chord (ctrl+shift+f) = 81 total, plus CTX-0766's 1 new
-        // workspace chord (alt+t; alt+n becomes new-panel) = 82 total,
-        // plus issue #1444's 1 close-view chord (alt+d) = 83 total,
-        // and the full DEC
+        // + 3 alt+? shifted-symbol spellings) = 79 total (W-144 retired the
+        // CTX-0384 copy-mode chord and the CTX-0383 search chord), plus
+        // CTX-0766's 1 new workspace chord (alt+t; alt+n becomes new-panel)
+        // = 80 total, plus issue #1444's 1 close-view chord (alt+d) = 81
+        // total, and the full DEC
         // set resolves. Zoom chords carry
         // no `alt`, so they must stay unique under Alt and Super alike.
         for mod_key in [ModKey::Alt, ModKey::Super] {
             let maps = default_keymaps_with_mod(mod_key).expect("defaults valid");
             assert_eq!(
                 maps.len(),
-                83,
-                "35 shipped + 4 workspace-entry chords + 4 resize chords + 16 arrow aliases + 7 zoom chords + 9 move chords + 4 help chords + 1 copy-mode chord + 1 search chord + 1 CTX-0766 rechord + 1 issue-1444 close-view"
+                81,
+                "35 shipped + 4 workspace-entry chords + 4 resize chords + 16 arrow aliases + 7 zoom chords + 9 move chords + 4 help chords + 1 CTX-0766 rechord + 1 issue-1444 close-view"
             );
             let mut seen = std::collections::HashSet::new();
             for m in &maps {
@@ -3261,9 +3190,10 @@ mod tests {
         // owns exactly one action, no identity collides (with each other or
         // with the shipped defaults), and the Super rebound keeps the
         // explicit Alt spellings intact while the Super spellings stay free.
-        // The default count is 83 under Alt mod (35 shipped + 4 workspace
-        // + 4 resize + 16 arrow + 9 move + 7 zoom + 4 help + 1 copy-mode
-        // + 1 search + 1 CTX-0766 rechord + 1 issue-1444 close-view).
+        // The default count is 81 under Alt mod (35 shipped + 4 workspace
+        // + 4 resize + 16 arrow + 9 move + 7 zoom + 4 help
+        // + 1 CTX-0766 rechord + 1 issue-1444 close-view; W-144 retired the
+        // copy-mode and search chords).
         // Under Super mod, alt+d becomes super+d (still counted).
         let entries: &[(&str, &str)] = &[
             ("alt+f1", "goto_split:left"),
@@ -3292,14 +3222,14 @@ mod tests {
             let defaults = default_keymaps_with_mod(mod_key).expect("defaults valid");
             assert_eq!(
                 defaults.len(),
-                83,
+                81,
                 "no new shipped defaults under mod {:?}",
                 mod_key
             );
             let maps = resolve_keymaps(&mk_effective(mod_key)).expect("resolves");
             assert_eq!(
                 maps.len(),
-                83 + entries.len(),
+                81 + entries.len(),
                 "explicit binds append, never shadow, under mod {:?}",
                 mod_key
             );

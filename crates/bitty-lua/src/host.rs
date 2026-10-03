@@ -503,6 +503,20 @@ pub const OVERLAY_CAPTURE_TEXT_MAX_BYTES: usize = 4096;
 /// Maximum number of captured events one `bitty.ui.overlay.poll` call returns.
 pub const OVERLAY_CAPTURE_POLL_MAX: usize = OVERLAY_CAPTURE_QUEUE_MAX;
 
+/// Maximum bytes of the `title` hint in `bitty.ui.overlay.acquire(spec)`.
+///
+/// Presentation hint only; over-bound specs fail closed with `E_VALUE_BYTES`
+/// and no session is created.
+pub const OVERLAY_SPEC_TITLE_MAX_BYTES: usize = 1024;
+
+/// Maximum bytes of the `placeholder` hint in `bitty.ui.overlay.acquire(spec)`.
+pub const OVERLAY_SPEC_PLACEHOLDER_MAX_BYTES: usize = 1024;
+
+/// Maximum serialized bytes of one acquire/update call envelope (spec plus
+/// reason hints). Over-bound calls fail closed with the existing
+/// value-shape errors and previous state is kept.
+pub const OVERLAY_CALL_MAX_BYTES: usize = 4096;
+
 /// Maximum entries one `bitty.ui.targets.snapshot` read returns (W-29, CTX-0942).
 ///
 /// Mirrors the Core mechanism bound (`bitty-ui` `MAX_SNAPSHOT_TARGETS`, 1024):
@@ -542,6 +556,27 @@ pub struct OverlayInput {
     pub kind: String,
     /// Bounded UTF-8 payload.
     pub text: String,
+}
+
+/// Detailed overlay poll result per the accepted W-01 contract (CTX-0941).
+///
+/// `active` selects the `status` field (`"active"` while the session holds
+/// capture, `"released"` after any terminal cause). `seq` is the monotonic
+/// sequence of the last event delivered in this session. `events` holds
+/// drained input in order. `overflowed` is sticky once queue overflow has
+/// dropped an older event. `reason` is present only with `"released"`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlayPoll {
+    /// Whether the session still holds capture.
+    pub active: bool,
+    /// Last delivered sequence in this session.
+    pub seq: u64,
+    /// Drained events (empty for a released session).
+    pub events: Vec<OverlayInput>,
+    /// Sticky overflow flag for this session.
+    pub overflowed: bool,
+    /// Terminal reason, present only when not active.
+    pub reason: Option<String>,
 }
 
 /// Typed, bounded bridge/diagnostic error.
@@ -903,6 +938,119 @@ pub trait HostServices {
     /// `handle` fails closed with [`E_UI_NOT_OWNER`]; the default fails closed
     /// with [`E_UI_UNAVAILABLE`].
     fn ui_overlay_poll(&self, _handle: i64, _max: usize) -> Result<Vec<OverlayInput>, BridgeError> {
+        Err(BridgeError::new(
+            "runtime",
+            E_UI_UNAVAILABLE,
+            "host has no ui overlay capture surface",
+        ))
+    }
+
+    /// Detailed poll per the accepted W-01 contract (CTX-0941, v2 scope).
+    ///
+    /// While the caller owns the session the result is active with drained
+    /// events; after any terminal cause the owner's next poll reports
+    /// released with the exact reason. A non-owner or stale handle fails
+    /// with [`E_UI_NOT_OWNER`]. The default fails closed with
+    /// [`E_UI_UNAVAILABLE`].
+    fn ui_overlay_poll_detailed(
+        &self,
+        _handle: i64,
+        _max: usize,
+    ) -> Result<OverlayPoll, BridgeError> {
+        Err(BridgeError::new(
+            "runtime",
+            E_UI_UNAVAILABLE,
+            "host has no ui overlay capture surface",
+        ))
+    }
+
+    /// Replace the overlay content for a session the caller owns (accepted
+    /// W-01 `bitty.ui.overlay.update`, CTX-0941).
+    ///
+    /// The scene uses the accepted v1 node set under the v1 scene budgets;
+    /// the bridge validates the component before this call. An update on a
+    /// handle the caller does not own, or on a released handle, fails with
+    /// [`E_UI_NOT_OWNER`] and keeps the previous content. Returns `Ok(true)`
+    /// when content was replaced. The default fails closed with
+    /// [`E_UI_UNAVAILABLE`].
+    fn ui_overlay_update(&self, _handle: i64, _component: &UiNode) -> Result<bool, BridgeError> {
+        Err(BridgeError::new(
+            "runtime",
+            E_UI_UNAVAILABLE,
+            "host has no ui overlay capture surface",
+        ))
+    }
+
+    /// Expiry-aware `ui_overlay_update` for the pre-commit timeout path.
+    ///
+    /// An update commits a replacement subtree, so an expired call returns
+    /// [`BridgeError::timeout`] and leaves the last-known-good content
+    /// intact. The default checks expiry before delegating.
+    fn ui_overlay_update_with_expiry(
+        &self,
+        handle: i64,
+        component: &UiNode,
+        expiry: Instant,
+    ) -> Result<bool, BridgeError> {
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        self.ui_overlay_update(handle, component)
+    }
+
+    /// Acquire a focusable overlay and its capture session from a
+    /// presentation-hint spec (accepted W-01 `bitty.ui.overlay.acquire`,
+    /// CTX-0941).
+    ///
+    /// `title` and `placeholder` are bounded text hints; unknown spec fields
+    /// are ignored by the caller. On success Core mounts the surface and
+    /// starts capture in one Core-owned switch and returns the opaque
+    /// session handle bound to the calling generation. A failed call changes
+    /// nothing. The default fails closed with [`E_UI_UNAVAILABLE`].
+    fn ui_overlay_acquire_with_spec(
+        &self,
+        _title: &str,
+        _placeholder: &str,
+    ) -> Result<i64, BridgeError> {
+        Err(BridgeError::new(
+            "runtime",
+            E_UI_UNAVAILABLE,
+            "host has no ui overlay capture surface",
+        ))
+    }
+
+    /// Expiry-aware spec acquire for the pre-commit timeout path.
+    ///
+    /// Acquiring grants exclusive input capture, so an expired call returns
+    /// [`BridgeError::timeout`] without transferring authority. The default
+    /// checks expiry before delegating.
+    fn ui_overlay_acquire_with_spec_and_expiry(
+        &self,
+        title: &str,
+        placeholder: &str,
+        expiry: Instant,
+    ) -> Result<i64, BridgeError> {
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        self.ui_overlay_acquire_with_spec(title, placeholder)
+    }
+
+    /// Release a session with an owner-supplied disposition (accepted W-01
+    /// `bitty.ui.overlay.release`, CTX-0941).
+    ///
+    /// `reason` is `None` (defaults to `"released"`) or one of
+    /// `"submitted"` / `"cancelled"`; any other value is a validation error
+    /// and the session is unchanged. Release is idempotent: releasing an
+    /// already-released handle of the owning generation succeeds. A
+    /// non-owner or stale handle fails with [`E_UI_NOT_OWNER`]. Release is
+    /// deliberately ungated by capability or safe mode so cleanup can never
+    /// wedge. The default fails closed with [`E_UI_UNAVAILABLE`].
+    fn ui_overlay_release_with_reason(
+        &self,
+        _handle: i64,
+        _reason: Option<&str>,
+    ) -> Result<bool, BridgeError> {
         Err(BridgeError::new(
             "runtime",
             E_UI_UNAVAILABLE,
@@ -1418,8 +1566,11 @@ fn workspace_list_value(rows: &[WorkspaceInfo]) -> LuaValue {
 }
 
 /// Marshal captured overlay input events into the bounded Lua array shape
-/// (CTX-0941). The host already drained at most [`OVERLAY_CAPTURE_POLL_MAX`]
-/// events and bounded each text payload.
+/// (CTX-0941, accepted W-01 envelope). Each event is `{ seq, type, text }`
+/// with the decided `key`, `text`, `pointer`, and `paste` tags (plus the
+/// mechanism-internal `ime` class, observed as committed text). The host
+/// already drained at most [`OVERLAY_CAPTURE_POLL_MAX`] events and bounded
+/// each text payload.
 fn overlay_events_value(events: &[OverlayInput]) -> LuaValue {
     LuaValue::array(
         events
@@ -1427,15 +1578,104 @@ fn overlay_events_value(events: &[OverlayInput]) -> LuaValue {
             .map(|event| {
                 LuaValue::table([
                     (
-                        "sequence",
+                        "seq",
                         LuaValue::Integer(i64::try_from(event.sequence).unwrap_or(i64::MAX)),
                     ),
-                    ("kind", LuaValue::String(event.kind.clone())),
+                    ("type", LuaValue::String(event.kind.clone())),
                     ("text", LuaValue::String(event.text.clone())),
                 ])
             })
             .collect(),
     )
+}
+
+/// Parse an overlay acquire spec into bounded `(title, placeholder)` hints.
+///
+/// The spec carries presentation hints only; every field is optional and
+/// unknown fields are ignored. A missing or nil spec means no hints.
+/// Over-bound or misshaped specs fail closed with the existing value-shape
+/// errors and no session is created.
+fn parse_overlay_spec<'gc>(value: Value<'gc>) -> Result<(String, String), BridgeError> {
+    if matches!(value, Value::Nil) {
+        return Ok((String::new(), String::new()));
+    }
+    let limits = MarshallingLimits {
+        max_depth: 4,
+        max_nodes: 32,
+        max_bytes: OVERLAY_CALL_MAX_BYTES,
+    };
+    let parsed = LuaValue::from_lua(value, limits)?;
+    let table = match parsed {
+        LuaValue::Table(_) => parsed,
+        _ => {
+            return Err(BridgeError::value(
+                "E_VALUE_TYPE",
+                "ui.overlay.acquire spec must be a table",
+            ));
+        }
+    };
+    let field = |name: &str| -> Result<String, BridgeError> {
+        match table.get(name) {
+            None | Some(LuaValue::Nil) => Ok(String::new()),
+            Some(LuaValue::String(text)) => Ok(text.clone()),
+            Some(_) => Err(BridgeError::value(
+                "E_VALUE_TYPE",
+                "ui.overlay.acquire spec fields must be strings",
+            )),
+        }
+    };
+    let title = field("title")?;
+    let placeholder = field("placeholder")?;
+    if title.len() > OVERLAY_SPEC_TITLE_MAX_BYTES {
+        return Err(BridgeError::value(
+            "E_VALUE_BYTES",
+            "ui.overlay.acquire title exceeds size limit",
+        ));
+    }
+    if placeholder.len() > OVERLAY_SPEC_PLACEHOLDER_MAX_BYTES {
+        return Err(BridgeError::value(
+            "E_VALUE_BYTES",
+            "ui.overlay.acquire placeholder exceeds size limit",
+        ));
+    }
+    if title.len() + placeholder.len() > OVERLAY_CALL_MAX_BYTES {
+        return Err(BridgeError::value(
+            "E_VALUE_BYTES",
+            "ui.overlay.acquire spec exceeds size limit",
+        ));
+    }
+    Ok((title, placeholder))
+}
+/// Marshal a detailed overlay poll result into the accepted W-01 table shape
+/// (CTX-0941): `{ status, seq, events, overflowed, reason? }` with exactly
+/// these fields. `reason` is present only with `"released"`.
+fn overlay_poll_value(poll: &OverlayPoll) -> LuaValue {
+    let status = if poll.active { "active" } else { "released" };
+    let mut pairs = vec![
+        (
+            LuaValue::String("status".to_string()),
+            LuaValue::String(status.to_string()),
+        ),
+        (
+            LuaValue::String("seq".to_string()),
+            LuaValue::Integer(i64::try_from(poll.seq).unwrap_or(i64::MAX)),
+        ),
+        (
+            LuaValue::String("events".to_string()),
+            overlay_events_value(&poll.events),
+        ),
+        (
+            LuaValue::String("overflowed".to_string()),
+            LuaValue::Bool(poll.overflowed),
+        ),
+    ];
+    if let Some(reason) = poll.reason.as_ref() {
+        pairs.push((
+            LuaValue::String("reason".to_string()),
+            LuaValue::String(reason.clone()),
+        ));
+    }
+    LuaValue::Table(pairs)
 }
 
 /// Validate one `bitty.ui.targets.register(def)` table (W-29, CTX-0942).
@@ -3689,12 +3929,13 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
     )
     .expect("ui table accepts 'update'");
 
-    // CTX-0941 (OQ-056 v2 scope): Core-owned focusable-overlay transient input
-    // capture. Provisional spellings (`bitty.ui.overlay.acquire/release/poll`)
-    // pending the accepted W-01 host contract; the surface gates on
-    // `ui.overlay` and fails closed with `E_UI_UNAVAILABLE` on a host without a
-    // capture backend. No plugin callback runs on the input path: Core queues
-    // captured input and the plugin reads it through `poll`.
+    // CTX-0941 (accepted W-01 host contract, v2 scope of OQ-056):
+    // Core-owned focusable-overlay transient input capture under the decided
+    // `bitty.ui.overlay.*` spellings. The surface gates on the v2
+    // `ui.overlay.focus` capability (deny-by-default, naming the capability)
+    // and fails closed with `E_UI_UNAVAILABLE` on a host without a capture
+    // backend or in safe mode. No plugin callback runs on the input path:
+    // Core queues captured input and the owner reads it through `poll`.
     let overlay = Table::new(&ctx);
     overlay
         .set(
@@ -3703,28 +3944,78 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
             Callback::from_fn(&ctx, {
                 let state = state.clone();
                 move |ctx, _exec, mut stack| {
-                    let handle = match stack.get(0) {
-                        Value::Integer(handle) => handle,
-                        _ => {
-                            return Err(component_invalid(
-                                "ui.overlay.acquire handle must be an integer block handle",
-                            )
-                            .to_error(ctx));
-                        }
-                    };
-                    state
-                        .bounded_mutation(|expiry| {
+                    match stack.get(0) {
+                        Value::Integer(handle) => {
+                            // Mechanism path: claim capture for a block this
+                            // generation mounted into the `overlay` slot.
                             state
-                                .services
-                                .ui_overlay_acquire_with_expiry(handle, expiry)
-                        })
-                        .map_err(|e| e.to_error(ctx))?;
-                    stack.replace(ctx, Value::Boolean(true));
-                    Ok(CallbackReturn::Return)
+                                .bounded_mutation(|expiry| {
+                                    state
+                                        .services
+                                        .ui_overlay_acquire_with_expiry(handle, expiry)
+                                })
+                                .map_err(|e| e.to_error(ctx))?;
+                            stack.replace(ctx, Value::Integer(handle));
+                            Ok(CallbackReturn::Return)
+                        }
+                        Value::Nil | Value::Table(_) => {
+                            // Accepted path: presentation-hint spec; Core
+                            // mounts the surface and starts capture in one
+                            // Core-owned switch and returns the session
+                            // handle. Unknown fields are ignored.
+                            let (title, placeholder) = parse_overlay_spec(stack.get(0))
+                                .map_err(|e| e.to_error(ctx))?;
+                            let handle = state
+                                .bounded_mutation(|expiry| {
+                                    state.services.ui_overlay_acquire_with_spec_and_expiry(
+                                        &title,
+                                        &placeholder,
+                                        expiry,
+                                    )
+                                })
+                                .map_err(|e| e.to_error(ctx))?;
+                            stack.replace(ctx, Value::Integer(handle));
+                            Ok(CallbackReturn::Return)
+                        }
+                        _ => Err(component_invalid(
+                            "ui.overlay.acquire expects a mounted overlay block handle or a spec table",
+                        )
+                        .to_error(ctx)),
+                    }
                 }
             }),
         )
         .expect("overlay table accepts 'acquire'");
+    overlay
+        .set(
+            ctx,
+            "update",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let handle = match stack.get(0) {
+                        Value::Integer(handle) => handle,
+                        _ => {
+                            return Err(component_invalid(
+                                "ui.overlay.update handle must be an integer block handle",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let component = read_component(stack.get(1)).map_err(|e| e.to_error(ctx))?;
+                    let updated = state
+                        .bounded_mutation(|expiry| {
+                            state
+                                .services
+                                .ui_overlay_update_with_expiry(handle, &component, expiry)
+                        })
+                        .map_err(|e| e.to_error(ctx))?;
+                    stack.replace(ctx, Value::Boolean(updated));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("overlay table accepts 'update'");
     overlay
         .set(
             ctx,
@@ -3741,8 +4032,24 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                             .to_error(ctx));
                         }
                     };
+                    let reason = match stack.get(1) {
+                        Value::Nil => None,
+                        Value::String(s) => {
+                            Some(String::from_utf8_lossy(s.as_bytes()).into_owned())
+                        }
+                        _ => {
+                            return Err(component_invalid(
+                                "ui.overlay.release reason must be 'submitted' or 'cancelled'",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
                     let released = state
-                        .bounded_mutation(|_expiry| state.services.ui_overlay_release(handle))
+                        .bounded_mutation(|_expiry| {
+                            state
+                                .services
+                                .ui_overlay_release_with_reason(handle, reason.as_deref())
+                        })
                         .map_err(|e| e.to_error(ctx))?;
                     stack.replace(ctx, Value::Boolean(released));
                     Ok(CallbackReturn::Return)
@@ -3778,10 +4085,12 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                             .to_error(ctx));
                         }
                     };
-                    let events = state
-                        .bounded_mutation(|_expiry| state.services.ui_overlay_poll(handle, max))
+                    let poll = state
+                        .bounded_mutation(|_expiry| {
+                            state.services.ui_overlay_poll_detailed(handle, max)
+                        })
                         .map_err(|e| e.to_error(ctx))?;
-                    stack.replace(ctx, overlay_events_value(&events).to_lua(ctx));
+                    stack.replace(ctx, overlay_poll_value(&poll).to_lua(ctx));
                     Ok(CallbackReturn::Return)
                 }
             }),

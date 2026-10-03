@@ -821,7 +821,7 @@ fn overlay_capture_is_single_owner_and_release_is_idempotent() {
     let mut fixture = Fixture::activate_with_commands_and_events(
         "overlay-capture",
         "bitty-featured.uiocapture",
-        &["ui.rich", "ui.overlay"],
+        &["ui.rich", "ui.overlay", "ui.overlay.focus"],
         &[],
         &["probe"],
         &["key"],
@@ -927,7 +927,8 @@ fn overlay_capture_is_single_owner_and_release_is_idempotent() {
     );
     assert_eq!(
         store_value(&fixture.runtime, &fixture.id, "x_r2"),
-        Some(LuaValue::Bool(false))
+        Some(LuaValue::Bool(false)),
+        "release is idempotent: a repeated release succeeds without effect"
     );
     assert_eq!(
         store_value(&fixture.runtime, &fixture.id, "x_a3"),
@@ -994,7 +995,7 @@ fn overlay_capture_is_revoked_when_activation_rolls_back() {
     write_plugin_with_events(
         &root,
         id,
-        &["ui.rich", "ui.overlay"],
+        &["ui.rich", "ui.overlay", "ui.overlay.focus"],
         &[],
         &[],
         &[],

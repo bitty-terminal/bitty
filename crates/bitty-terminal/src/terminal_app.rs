@@ -780,6 +780,10 @@ impl TerminalApp {
         // present so a timed-out session clears on this frame. Both are
         // no-ops without a plugin runtime or an active capture.
         self.expire_overlay_captures();
+        // CTX-0941 (accepted W-01): deliver pending `overlay.released`
+        // observations on the cold tick path so session end is observable
+        // without polling.
+        self.deliver_overlay_released();
         self.update_plugin_overlay();
         // CTX-0382: drain cold-path events on every tick — including
         // deferred (synchronized update) and idle ticks — because a title
@@ -976,11 +980,41 @@ impl TerminalApp {
 
     /// Revoke the active overlay capture unconditionally (user focus-switch
     /// or cancel path). Idempotent no-op `false` with no active capture.
+    /// Records the `focus_switched` reason for the owner's next poll.
     pub(crate) fn revoke_overlay_capture(&mut self) -> bool {
+        self.revoke_overlay_capture_with_reason(
+            bitty_runtime::plugin_runtime::FOCUS_SWITCHED_RELEASE_REASON,
+        )
+    }
+    /// Revoke the active overlay capture with an explicit terminal reason
+    /// (accepted W-01 vocabulary). The `cancelled` disposition is used for
+    /// user cancel (bare `Esc`); focus moves use the default above.
+    pub(crate) fn revoke_overlay_capture_with_reason(&mut self, reason: &str) -> bool {
         let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
             return false;
         };
-        plugin_runtime.revoke_overlay_capture()
+        plugin_runtime.revoke_overlay_capture_with_reason(reason)
+    }
+
+    /// Deliver pending `overlay.released` bus observations (CTX-0941).
+    ///
+    /// Called on the application tick after expiry handling: each ended
+    /// session is observable without polling through one observation-only
+    /// event with payload `{ owner, reason }`. Delivery runs on the cold
+    /// tick path, never on the input hot path. No-op without a plugin
+    /// runtime or with no ended sessions.
+    fn deliver_overlay_released(&mut self) {
+        let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
+            return;
+        };
+        let ended = plugin_runtime.drain_overlay_released();
+        for event in ended {
+            let payload = LuaValue::table([
+                ("owner", LuaValue::String(event.owner)),
+                ("reason", LuaValue::String(event.reason)),
+            ]);
+            plugin_runtime.deliver_event("overlay.released", &payload);
+        }
     }
 
     /// Enforce the 30s transient timeout (contract idle timeout). No-op

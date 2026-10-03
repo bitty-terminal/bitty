@@ -5540,6 +5540,7 @@ plugin-api = "^1.0"
 [capabilities]
 ui.rich = true
 ui.overlay = true
+ui.overlay.focus = true
 
 [lazy]
 commands = ["{id}:reacquire"]

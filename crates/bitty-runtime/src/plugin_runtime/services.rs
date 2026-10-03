@@ -14,9 +14,11 @@ use std::time::{Duration, Instant};
 use bitty_lua::ui::UiSlot;
 use bitty_lua::ui::{UI_MAX_AGGREGATED_TEXT_BYTES, UI_MAX_BLOCKS, UiNode};
 use bitty_lua::{
-    BridgeError, E_UI_NOT_OWNER, E_UI_UNAVAILABLE, HostServices, LuaValue, LuaVm, OverlayInput,
-    SNAPSHOT_MAX_BYTES, ServiceRoute, StashedFunction, WORKSPACE_LIST_MAX_ITEMS, WorkspaceInfo,
-    WorkspaceRequest, env_grant_shape_ok, validate_env_key,
+    BridgeError, E_UI_NOT_OWNER, E_UI_UNAVAILABLE, HostServices, LuaValue, LuaVm,
+    OVERLAY_CALL_MAX_BYTES, OVERLAY_SPEC_PLACEHOLDER_MAX_BYTES, OVERLAY_SPEC_TITLE_MAX_BYTES,
+    OverlayInput, OverlayPoll, SNAPSHOT_MAX_BYTES, ServiceRoute, StashedFunction,
+    WORKSPACE_LIST_MAX_ITEMS, WorkspaceInfo, WorkspaceRequest, env_grant_shape_ok,
+    validate_env_key,
 };
 use bitty_package::Version;
 use bitty_plugin_host::bundled::{WORKSPACELINE_CLAIM, canonicalize_ui_claim};
@@ -34,7 +36,9 @@ use crate::runtime::band_slots::{UiSlotPlacement, ui_slot_placement, unsupported
 use bitty_plugin_host::{ProvidedService, service_version_satisfies, value_satisfies_schema};
 
 use super::debug::{self, DebugView, TraceHub, TraceRequest};
-use super::overlay::{OVERLAY_CAPTURE_TIMEOUT_MS, OverlayCapture};
+use super::overlay::{
+    DEFAULT_RELEASE_REASON, OVERLAY_CAPTURE_TIMEOUT_MS, OverlayCapture, is_owner_release_reason,
+};
 use super::store::{self, PluginStore};
 
 /// Maximum characters of a provider failure message relayed to the consumer
@@ -328,6 +332,11 @@ pub struct UiAccess {
     pub rich: bool,
     /// `ui.overlay` granted — the `overlay` slot additionally requires it.
     pub overlay: bool,
+    /// `ui.overlay.focus` granted (accepted W-01 v2) — the focusable overlay
+    /// and transient input-capture surface additionally requires it. Distinct
+    /// from v1 `ui.overlay` (presentation-only, non-focusable); no
+    /// implication either way.
+    pub overlay_focus: bool,
     /// Manifest `[lazy].claims` (exclusive slot claims; `tabline` only).
     pub claims: Vec<String>,
 }
@@ -529,6 +538,27 @@ impl UiBlocks {
         block.node = node;
         block.version = block.version.saturating_add(1);
         Ok(true)
+    }
+
+    /// Drop one block by handle, releasing its text budget.
+    ///
+    /// Used to roll back a spec-acquired surface when capture acquisition
+    /// fails, so a denied acquire leaves no orphan block behind. Returns
+    /// whether a block was removed. The epoch and monotonic counter are
+    /// kept, so removed handles never alias later ones.
+    fn remove(&mut self, handle: i64) -> bool {
+        let Some(position) = self
+            .blocks
+            .iter()
+            .position(|(candidate, _)| *candidate == handle)
+        else {
+            return false;
+        };
+        let (_, block) = self.blocks.remove(position);
+        self.aggregated_text_bytes = self
+            .aggregated_text_bytes
+            .saturating_sub(block.node.text_bytes());
+        true
     }
 }
 
@@ -792,6 +822,16 @@ pub struct PluginServices {
     ui_access: RefCell<UiAccess>,
     ui_blocks: RefCell<UiBlocks>,
     overlay_capture: RefCell<Option<Rc<RefCell<OverlayCapture>>>>,
+    /// Handles this generation mounted through spec acquire (CTX-0941).
+    ///
+    /// A spec acquire mounts its transient surface directly into the
+    /// generation registry; the surface must be unmounted when its session
+    /// ends (release, expiry, unload, crash) or the next session would
+    /// present the previous session's content and every cycle would leak
+    /// one `UI_MAX_BLOCKS` slot. Mechanism-path blocks (mounted through
+    /// `ui.mount`) are never recorded here and survive release as the
+    /// plugin's retained content.
+    spec_overlay_handles: RefCell<BTreeSet<i64>>,
     /// Runtime-shared target registry (W-29, CTX-0942, existing `TargetRegistry`).
     ///
     /// One registry spans every generation so generations bump and stale
@@ -821,6 +861,13 @@ pub struct PluginServices {
     target_session_overlay: RefCell<Option<i64>>,
     env_grants: RefCell<BTreeSet<String>>,
     env_source: RefCell<Rc<dyn EnvSource>>,
+    /// Safe-mode flag for this generation (CTX-0941, W-28 host API).
+    ///
+    /// Wired once at activation from the runtime config. While set, every
+    /// focusable-overlay capture call fails closed with `E_UI_UNAVAILABLE`:
+    /// safe mode never presents a focusable overlay and never starts a
+    /// capture session. Release stays grant-free so cleanup can never wedge.
+    safe_mode: Cell<bool>,
     service_provided: RefCell<Vec<ProvidedService>>,
     service_required: RefCell<Vec<(String, String)>>,
     service_directory: RefCell<Option<Rc<RefCell<ServiceDirectory>>>>,
@@ -863,6 +910,7 @@ impl PluginServices {
             ui_access: RefCell::new(UiAccess::default()),
             ui_blocks: RefCell::new(UiBlocks::new()),
             overlay_capture: RefCell::new(None),
+            spec_overlay_handles: RefCell::new(BTreeSet::new()),
             target_registry: RefCell::new(None),
             target_lenses: RefCell::new(None),
             label_allocator: RefCell::new(None),
@@ -870,6 +918,7 @@ impl PluginServices {
             target_session_overlay: RefCell::new(None),
             env_grants: RefCell::new(BTreeSet::new()),
             env_source: RefCell::new(Rc::new(EmptyEnv)),
+            safe_mode: Cell::new(false),
             service_provided: RefCell::new(Vec::new()),
             service_required: RefCell::new(Vec::new()),
             service_directory: RefCell::new(None),
@@ -967,6 +1016,51 @@ impl PluginServices {
     /// The shared capture manager, if one was wired.
     fn overlay_capture(&self) -> Option<Rc<RefCell<OverlayCapture>>> {
         self.overlay_capture.borrow().clone()
+    }
+
+    /// Wire the safe-mode flag for this generation (CTX-0941).
+    ///
+    /// Called once at activation from the runtime config. Safe mode never
+    /// presents a focusable overlay: acquire, update, and poll fail closed
+    /// with `E_UI_UNAVAILABLE` while set.
+    pub fn set_safe_mode(&self, safe_mode: bool) {
+        self.safe_mode.set(safe_mode);
+    }
+
+    /// Whether this generation runs in safe mode.
+    #[must_use]
+    pub fn is_safe_mode(&self) -> bool {
+        self.safe_mode.get()
+    }
+
+    /// The focusable-overlay capability gate (accepted W-01 v2, CTX-0941).
+    ///
+    /// Deny-by-default on `ui.overlay.focus`: without the grant every
+    /// acquire, update, and poll fails with `E_CAPABILITY_DENIED` naming the
+    /// capability. Release is deliberately ungated (like the target-session
+    /// cancel path): a revoked grant must still free input.
+    fn require_overlay_focus(&self) -> Result<(), BridgeError> {
+        if !self.ui_access.borrow().overlay_focus {
+            return Err(BridgeError::capability_denied("ui.overlay.focus"));
+        }
+        Ok(())
+    }
+
+    /// The safe-mode gate for the focusable surface (CTX-0941).
+    ///
+    /// Safe mode never presents a focusable overlay and never starts a
+    /// capture session: acquire, update, and poll fail with
+    /// `E_UI_UNAVAILABLE`. Release stays available so cleanup can never
+    /// wedge.
+    fn require_overlay_available(&self) -> Result<(), BridgeError> {
+        if self.safe_mode.get() {
+            return Err(BridgeError::new(
+                "runtime",
+                E_UI_UNAVAILABLE,
+                "focusable overlay is unavailable in safe mode",
+            ));
+        }
+        Ok(())
     }
 
     /// Attach the runtime-shared targeting mechanism state (W-29, CTX-0942).
@@ -1179,9 +1273,61 @@ impl PluginServices {
     ///
     /// The registry is host-side state: clearing it makes `bitty.ui.update`
     /// on a pre-suspend handle fail closed (`false`) after suspend and after
-    /// resume until the plugin mounts again.
+    /// resume until the plugin mounts again. Spec-acquired surfaces are
+    /// covered: the whole registry (including every recorded spec handle)
+    /// is dropped, so no orphan survives unload or crash.
     pub fn clear_ui_blocks(&self) {
         self.ui_blocks.borrow_mut().clear();
+        self.spec_overlay_handles.borrow_mut().clear();
+    }
+
+    /// Drop one block by handle, releasing its text budget.
+    ///
+    /// Rolls back a spec-acquired surface when capture acquisition fails, so
+    /// a denied acquire leaves no orphan block behind.
+    fn remove_ui_block(&self, handle: i64) -> bool {
+        self.ui_blocks.borrow_mut().remove(handle)
+    }
+
+    /// Record a spec-acquired surface, dropping any stale spec surface of
+    /// this generation.
+    ///
+    /// Stale entries arise only when a session ended without a
+    /// services-mediated release: the runtime-driven paths (expiry, revoke)
+    /// dispose the ended handle through [`Self::remove_spec_overlay_block`],
+    /// and this is the backstop for the lazy-expiry-inside-acquire path,
+    /// where the previous session ends synchronously within the new acquire.
+    /// At most one spec surface per generation survives: a previous session's
+    /// content can never shadow the new session.
+    fn remember_spec_overlay(&self, handle: i64) {
+        let stale: Vec<i64> = self
+            .spec_overlay_handles
+            .borrow()
+            .iter()
+            .copied()
+            .filter(|candidate| *candidate != handle)
+            .collect();
+        for orphan in stale {
+            self.remove_ui_block(orphan);
+        }
+        let mut spec = self.spec_overlay_handles.borrow_mut();
+        spec.clear();
+        spec.insert(handle);
+    }
+
+    /// Dispose a spec-acquired surface by handle (session end).
+    ///
+    /// No-op unless `handle` is a surface this generation mounted through
+    /// spec acquire: mechanism-path blocks (mounted through `ui.mount`)
+    /// survive release as the plugin's retained content. Returns whether a
+    /// surface was unmounted. The runtime calls this for sessions that end
+    /// on runtime-driven paths (expiry, focus-switch/cancel revoke); the
+    /// services release path calls it for owner releases.
+    pub fn remove_spec_overlay_block(&self, handle: i64) -> bool {
+        if !self.spec_overlay_handles.borrow_mut().remove(&handle) {
+            return false;
+        }
+        self.remove_ui_block(handle)
     }
 
     /// Read-only mounted-block view (tests, diagnostics, presentation wiring).
@@ -1576,6 +1722,7 @@ impl HostServices for PluginServices {
         if Instant::now() > expiry {
             return Err(BridgeError::timeout());
         }
+        self.require_overlay_available()?;
         let Some(capture) = self.overlay_capture() else {
             return Err(BridgeError::new(
                 "runtime",
@@ -1583,9 +1730,12 @@ impl HostServices for PluginServices {
                 "host has no ui overlay capture surface",
             ));
         };
-        if !self.ui_access.borrow().overlay {
-            return Err(BridgeError::capability_denied("ui.overlay"));
-        }
+        // Accepted W-01 v2 gate: the focusable surface requires
+        // `ui.overlay.focus` (deny-by-default, naming the capability). The
+        // block itself was mounted through the v1 `overlay` slot, so the
+        // mechanism path needs both grants; the spec path below needs only
+        // the focus grant.
+        self.require_overlay_focus()?;
         // Only a block this generation mounted into the focusable `overlay`
         // slot can own capture; a foreign or non-overlay handle is typed.
         let is_overlay = self
@@ -1613,10 +1763,18 @@ impl HostServices for PluginServices {
         )
     }
 
-    fn ui_overlay_release(&self, handle: i64) -> Result<bool, BridgeError> {
-        // Release never checks the grant: a capture whose grant was revoked
-        // mid-session must still be releasable, and a foreign/repeated release
-        // is an idempotent `false` (never an error) so input can never wedge.
+    fn ui_overlay_acquire_with_spec_and_expiry(
+        &self,
+        title: &str,
+        placeholder: &str,
+        expiry: Instant,
+    ) -> Result<i64, BridgeError> {
+        // Check-then-act: never transfer capture authority after the call
+        // deadline.
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        self.require_overlay_available()?;
         let Some(capture) = self.overlay_capture() else {
             return Err(BridgeError::new(
                 "runtime",
@@ -1624,7 +1782,182 @@ impl HostServices for PluginServices {
                 "host has no ui overlay capture surface",
             ));
         };
-        Ok(capture.borrow_mut().release(&self.plugin_id, handle))
+        // Single-grant path: only `ui.overlay.focus` is required. The
+        // surface is mounted directly into the generation registry (same
+        // v1 scene budgets as `ui.mount`) without passing the v1
+        // `ui.overlay` slot gate.
+        self.require_overlay_focus()?;
+        if title.len() > OVERLAY_SPEC_TITLE_MAX_BYTES {
+            return Err(BridgeError::value(
+                "E_VALUE_BYTES",
+                "ui.overlay.acquire title exceeds size limit",
+            ));
+        }
+        if placeholder.len() > OVERLAY_SPEC_PLACEHOLDER_MAX_BYTES {
+            return Err(BridgeError::value(
+                "E_VALUE_BYTES",
+                "ui.overlay.acquire placeholder exceeds size limit",
+            ));
+        }
+        if title.len() + placeholder.len() > OVERLAY_CALL_MAX_BYTES {
+            return Err(BridgeError::value(
+                "E_VALUE_BYTES",
+                "ui.overlay.acquire spec exceeds size limit",
+            ));
+        }
+        let mut children = Vec::new();
+        if !title.is_empty() {
+            children.push(UiNode::text(title.to_string()));
+        }
+        if !placeholder.is_empty() {
+            children.push(UiNode::text(placeholder.to_string()));
+        }
+        if children.is_empty() {
+            children.push(UiNode::text(String::new()));
+        }
+        let node = UiNode::column(children);
+        let handle = self.ui_blocks.borrow_mut().mount(UiSlot::Overlay, node)?;
+        let session_expiry = Instant::now() + Duration::from_millis(OVERLAY_CAPTURE_TIMEOUT_MS);
+        if let Err(error) = capture
+            .borrow_mut()
+            .acquire(&self.plugin_id, handle, session_expiry)
+        {
+            // A second session cannot start while one is active: drop the
+            // freshly mounted surface so a denied acquire leaves no orphan
+            // block behind.
+            self.remove_ui_block(handle);
+            return Err(error);
+        }
+        self.remember_spec_overlay(handle);
+        Ok(handle)
+    }
+
+    fn ui_overlay_acquire_with_spec(
+        &self,
+        title: &str,
+        placeholder: &str,
+    ) -> Result<i64, BridgeError> {
+        self.ui_overlay_acquire_with_spec_and_expiry(
+            title,
+            placeholder,
+            Instant::now() + Duration::from_millis(OVERLAY_CAPTURE_TIMEOUT_MS),
+        )
+    }
+
+    fn ui_overlay_update_with_expiry(
+        &self,
+        handle: i64,
+        component: &UiNode,
+        expiry: Instant,
+    ) -> Result<bool, BridgeError> {
+        // Check-then-act: an expired call leaves last-known-good content.
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        self.require_overlay_available()?;
+        let Some(capture) = self.overlay_capture() else {
+            return Err(BridgeError::new(
+                "runtime",
+                E_UI_UNAVAILABLE,
+                "host has no ui overlay capture surface",
+            ));
+        };
+        self.require_overlay_focus()?;
+        // Only the live owner may replace content; a foreign, released, or
+        // stale handle fails with `E_UI_NOT_OWNER` and keeps previous
+        // content. The block must also be this generation's overlay block.
+        if !capture.borrow().is_owner(&self.plugin_id, handle) {
+            return Err(BridgeError::new(
+                "runtime",
+                E_UI_NOT_OWNER,
+                "no focusable-overlay input capture is held for this handle",
+            ));
+        }
+        let is_overlay = self
+            .ui_blocks
+            .borrow()
+            .get(handle)
+            .is_some_and(|block| block.ui_slot() == UiSlot::Overlay);
+        if !is_overlay {
+            return Err(BridgeError::new(
+                "runtime",
+                E_UI_NOT_OWNER,
+                "handle is not a mounted overlay block of this generation",
+            ));
+        }
+        let updated = self
+            .ui_blocks
+            .borrow_mut()
+            .update(handle, component.clone())?;
+        if updated {
+            // Content replacement proves the session is live: extend the
+            // idle deadline like a poll does.
+            capture.borrow_mut().refresh_owner(&self.plugin_id, handle);
+        }
+        Ok(updated)
+    }
+
+    fn ui_overlay_update(&self, handle: i64, component: &UiNode) -> Result<bool, BridgeError> {
+        self.ui_overlay_update_with_expiry(
+            handle,
+            component,
+            Instant::now() + Duration::from_millis(OVERLAY_CAPTURE_TIMEOUT_MS),
+        )
+    }
+
+    fn ui_overlay_release(&self, handle: i64) -> Result<bool, BridgeError> {
+        self.ui_overlay_release_with_reason(handle, None)
+    }
+
+    fn ui_overlay_release_with_reason(
+        &self,
+        handle: i64,
+        reason: Option<&str>,
+    ) -> Result<bool, BridgeError> {
+        // Release never checks the grant or safe mode: a capture whose grant
+        // was revoked mid-session must still be releasable, and cleanup can
+        // never wedge input.
+        let Some(capture) = self.overlay_capture() else {
+            return Err(BridgeError::new(
+                "runtime",
+                E_UI_UNAVAILABLE,
+                "host has no ui overlay capture surface",
+            ));
+        };
+        let disposition = match reason {
+            None => DEFAULT_RELEASE_REASON.to_string(),
+            Some(text) if is_owner_release_reason(text) => text.to_string(),
+            Some(_) => {
+                return Err(BridgeError::new(
+                    "validation",
+                    "E_DEF_INVALID",
+                    "ui.overlay.release reason must be 'submitted' or 'cancelled'",
+                ));
+            }
+        };
+        // Pre-change idempotent contract: releasing anything but the live
+        // session is a success-without-effect `Ok(false)` — an already-ended
+        // session of this generation, a handle never acquired, or a stale
+        // handle from before another session started — so cleanup in
+        // cancel/unload handlers never throws. Only ending somebody else's
+        // *live* session denies with `E_UI_NOT_OWNER`.
+        let mut guard = capture.borrow_mut();
+        if guard.is_owner(&self.plugin_id, handle) {
+            guard.release_with_reason(&self.plugin_id, handle, &disposition);
+            drop(guard);
+            // The ended session's transient surface leaves with it; a
+            // retained mechanism-path block is untouched (never spec-created).
+            self.remove_spec_overlay_block(handle);
+            return Ok(true);
+        }
+        if guard.is_live_handle(handle) {
+            return Err(BridgeError::new(
+                "runtime",
+                E_UI_NOT_OWNER,
+                "no focusable-overlay input capture is held for this handle",
+            ));
+        }
+        Ok(false)
     }
 
     fn ui_overlay_poll(&self, handle: i64, max: usize) -> Result<Vec<OverlayInput>, BridgeError> {
@@ -1636,6 +1969,32 @@ impl HostServices for PluginServices {
             ));
         };
         capture.borrow_mut().poll(&self.plugin_id, handle, max)
+    }
+
+    fn ui_overlay_poll_detailed(
+        &self,
+        handle: i64,
+        max: usize,
+    ) -> Result<OverlayPoll, BridgeError> {
+        self.require_overlay_available()?;
+        let Some(capture) = self.overlay_capture() else {
+            return Err(BridgeError::new(
+                "runtime",
+                E_UI_UNAVAILABLE,
+                "host has no ui overlay capture surface",
+            ));
+        };
+        self.require_overlay_focus()?;
+        let detailed = capture
+            .borrow_mut()
+            .poll_detailed(&self.plugin_id, handle, max)?;
+        Ok(OverlayPoll {
+            active: detailed.status == "active",
+            seq: detailed.seq,
+            events: detailed.events,
+            overflowed: detailed.overflowed,
+            reason: detailed.reason,
+        })
     }
 
     #[allow(clippy::type_complexity)]
@@ -2198,6 +2557,7 @@ impl HostServices for PluginServices {
 mod tests {
     use super::*;
     use crate::plugin_runtime::store::PluginStore;
+    use bitty_lua::E_UI_ALREADY_CAPTURED;
     use bitty_lua::ENV_KEY_MAX_BYTES;
     use bitty_lua::ui::UI_MAX_TEXT_BYTES;
     use std::time::Duration;
@@ -2602,8 +2962,59 @@ mod tests {
         UiAccess {
             rich: true,
             overlay: false,
+            overlay_focus: false,
             claims: Vec::new(),
         }
+    }
+
+    /// Services with the focusable-overlay grants and a wired capture switch.
+    fn focus_services() -> PluginServices {
+        let services = ui_services(UiAccess {
+            rich: true,
+            overlay: true,
+            overlay_focus: true,
+            claims: Vec::new(),
+        });
+        services.set_overlay_capture(Rc::new(RefCell::new(OverlayCapture::new())));
+        services
+    }
+
+    /// Mount one overlay block and acquire capture for it; returns the handle.
+    fn mount_and_acquire(services: &PluginServices) -> i64 {
+        let handle = services
+            .ui_mount("overlay", &UiNode::text("modal"))
+            .expect("overlay mount");
+        services
+            .ui_overlay_acquire(handle)
+            .expect("capture acquire");
+        handle
+    }
+
+    /// One generation of `id` sharing `capture`, with its own handle epoch
+    /// so handles never alias across generations.
+    fn generation_services(
+        id: &str,
+        epoch: u32,
+        capture: &Rc<RefCell<OverlayCapture>>,
+    ) -> PluginServices {
+        let services = PluginServices::new(
+            id,
+            PluginStore::in_memory(),
+            Rc::new(EmptySettings),
+            Rc::new(UnavailableSnapshot),
+            Rc::new(RefCell::new(NotificationQueue::new(8))),
+            false,
+            false,
+        );
+        services.set_ui_access(UiAccess {
+            rich: true,
+            overlay: true,
+            overlay_focus: true,
+            claims: Vec::new(),
+        });
+        services.set_overlay_capture(Rc::clone(capture));
+        services.set_ui_epoch(epoch);
+        services
     }
 
     #[test]
@@ -2638,6 +3049,7 @@ mod tests {
         services.set_ui_access(UiAccess {
             rich: true,
             overlay: true,
+            overlay_focus: false,
             claims: Vec::new(),
         });
         // CTX-0941: with the grant, the Core hosts the focusable overlay and
@@ -2655,6 +3067,350 @@ mod tests {
     }
 
     #[test]
+    fn overlay_focus_gate_denies_without_grant_and_names_capability() {
+        // Accepted W-01 v2: without `ui.overlay.focus` every capture call
+        // fails with `E_CAPABILITY_DENIED` naming the capability.
+        let services = ui_services(UiAccess {
+            rich: true,
+            overlay: true,
+            overlay_focus: false,
+            claims: Vec::new(),
+        });
+        services.set_overlay_capture(Rc::new(RefCell::new(OverlayCapture::new())));
+        let handle = services
+            .ui_mount("overlay", &UiNode::text("modal"))
+            .expect("v1 mount needs only ui.overlay");
+        for error in [
+            services.ui_overlay_acquire(handle).expect_err("acquire"),
+            services
+                .ui_overlay_acquire_with_spec("t", "p")
+                .expect_err("spec acquire"),
+            services
+                .ui_overlay_update(handle, &UiNode::text("x"))
+                .expect_err("update"),
+            services
+                .ui_overlay_poll_detailed(handle, 4)
+                .expect_err("poll"),
+        ] {
+            assert_eq!(error.code, "E_CAPABILITY_DENIED");
+            assert!(
+                error.message.contains("ui.overlay.focus"),
+                "denial names the capability: {}",
+                error.message
+            );
+        }
+        // Release is grant-free so cleanup can never wedge: with no live
+        // session it is an ok-noop `false`, never a denial.
+        assert!(
+            !services
+                .ui_overlay_release_with_reason(handle, None)
+                .expect("release without a session is an ok-noop"),
+            "no live session releases nothing"
+        );
+    }
+
+    #[test]
+    fn overlay_update_replaces_content_for_owner_only() {
+        let services = focus_services();
+        let handle = mount_and_acquire(&services);
+        assert!(
+            services
+                .ui_overlay_update(handle, &UiNode::text("results"))
+                .expect("owner update"),
+            "owner update replaces content"
+        );
+        services.with_ui_blocks(|blocks| {
+            assert_eq!(
+                blocks.get(handle).map(|block| block.node().clone()),
+                Some(UiNode::text("results"))
+            );
+            assert_eq!(
+                blocks.get(handle).map(UiBlock::version),
+                Some(2),
+                "update bumps the version"
+            );
+        });
+        // A foreign handle fails with `E_UI_NOT_OWNER` and keeps content.
+        let other = services
+            .ui_mount("overlay", &UiNode::text("other"))
+            .expect("second block");
+        let error = services
+            .ui_overlay_update(other, &UiNode::text("hijack"))
+            .expect_err("non-owner update must fail");
+        assert_eq!(error.code, E_UI_NOT_OWNER);
+        services.with_ui_blocks(|blocks| {
+            assert_eq!(
+                blocks.get(other).map(|block| block.node().clone()),
+                Some(UiNode::text("other")),
+                "previous content is kept"
+            );
+        });
+        // After release the handle is dead: update fails, content kept.
+        assert!(
+            services
+                .ui_overlay_release_with_reason(handle, None)
+                .expect("release")
+        );
+        let error = services
+            .ui_overlay_update(handle, &UiNode::text("stale"))
+            .expect_err("released handle must fail");
+        assert_eq!(error.code, E_UI_NOT_OWNER);
+    }
+
+    #[test]
+    fn overlay_release_reason_is_validated_and_remembered() {
+        let services = focus_services();
+        let handle = mount_and_acquire(&services);
+        // An invalid reason is a validation error and the session is
+        // unchanged (still active).
+        let error = services
+            .ui_overlay_release_with_reason(handle, Some("bogus"))
+            .expect_err("invalid reason must fail");
+        assert_eq!(error.code, "E_DEF_INVALID");
+        let live = services
+            .ui_overlay_poll_detailed(handle, 4)
+            .expect("session survives invalid reason");
+        assert!(live.active);
+        // A submitted disposition ends the session and is reported on the
+        // next poll with no events.
+        assert!(
+            services
+                .ui_overlay_release_with_reason(handle, Some("submitted"))
+                .expect("submitted release")
+        );
+        let after = services
+            .ui_overlay_poll_detailed(handle, 4)
+            .expect("poll after release");
+        assert!(!after.active);
+        assert_eq!(after.reason.as_deref(), Some("submitted"));
+        assert!(after.events.is_empty());
+        // Idempotent: releasing the ended session again is a
+        // success-without-effect `false`, never an error.
+        assert!(
+            !services
+                .ui_overlay_release_with_reason(handle, None)
+                .expect("idempotent release"),
+            "an already-ended session releases nothing"
+        );
+    }
+
+    #[test]
+    fn overlay_safe_mode_denies_capture_but_not_release() {
+        let services = focus_services();
+        services.set_safe_mode(true);
+        let handle = services
+            .ui_mount("overlay", &UiNode::text("modal"))
+            .expect("v1 mount itself is not the focusable surface");
+        let error = services
+            .ui_overlay_acquire(handle)
+            .expect_err("acquire in safe mode");
+        assert_eq!(error.code, E_UI_UNAVAILABLE);
+        let error = services
+            .ui_overlay_acquire_with_spec("t", "p")
+            .expect_err("spec acquire in safe mode");
+        assert_eq!(error.code, E_UI_UNAVAILABLE);
+        let error = services
+            .ui_overlay_update(handle, &UiNode::text("x"))
+            .expect_err("update in safe mode");
+        assert_eq!(error.code, E_UI_UNAVAILABLE);
+        let error = services
+            .ui_overlay_poll_detailed(handle, 4)
+            .expect_err("poll in safe mode");
+        assert_eq!(error.code, E_UI_UNAVAILABLE);
+        // Cleanup is never gated: a session acquired before safe mode still
+        // releases.
+        services.set_safe_mode(false);
+        let live = mount_and_acquire(&services);
+        services.set_safe_mode(true);
+        assert!(
+            services
+                .ui_overlay_release_with_reason(live, Some("cancelled"))
+                .expect("release in safe mode"),
+            "release stays available so cleanup can never wedge"
+        );
+    }
+
+    #[test]
+    fn overlay_spec_acquire_mounts_surface_and_denies_second_owner() {
+        let services = focus_services();
+        let handle = services
+            .ui_overlay_acquire_with_spec("Palette", "Type…")
+            .expect("spec acquire");
+        services.with_ui_blocks(|blocks| {
+            assert_eq!(
+                blocks.get(handle).map(UiBlock::ui_slot),
+                Some(UiSlot::Overlay),
+                "spec acquire mounts the focusable surface"
+            );
+        });
+        let error = services
+            .ui_overlay_acquire_with_spec("Other", "")
+            .expect_err("second acquire must fail");
+        assert_eq!(error.code, E_UI_ALREADY_CAPTURED);
+        services.with_ui_blocks(|blocks| {
+            assert_eq!(blocks.len(), 1, "denied acquire leaves no orphan block");
+        });
+    }
+
+    #[test]
+    fn overlay_spec_acquire_unmounts_surface_on_session_end() {
+        // A spec session's transient surface leaves with the session:
+        // release unmounts it, so the next session presents only new content
+        // and repeated open/close cycles leak no block slots.
+        let services = focus_services();
+        let first = services
+            .ui_overlay_acquire_with_spec("A", "")
+            .expect("first spec acquire");
+        assert!(
+            services
+                .ui_overlay_release_with_reason(first, None)
+                .expect("release"),
+            "owner release ends the session"
+        );
+        services.with_ui_blocks(|blocks| {
+            assert!(
+                blocks.get(first).is_none(),
+                "the released surface is unmounted"
+            );
+            assert!(blocks.is_empty(), "no orphan block survives release");
+        });
+        let second = services
+            .ui_overlay_acquire_with_spec("B", "")
+            .expect("second spec acquire");
+        assert_ne!(first, second, "sessions mint distinct handles");
+        services.with_ui_blocks(|blocks| {
+            assert_eq!(blocks.len(), 1, "only the live surface is retained");
+            assert!(
+                blocks.get(second).is_some(),
+                "the live surface presents the new session"
+            );
+        });
+        assert!(
+            services
+                .ui_overlay_update(second, &UiNode::text("B"))
+                .expect("owner update"),
+            "update routes to the live surface only"
+        );
+        services.with_ui_blocks(|blocks| {
+            assert_eq!(
+                blocks.get(second).map(|block| block.node().clone()),
+                Some(UiNode::text("B")),
+                "new content only, no stale block"
+            );
+        });
+    }
+
+    #[test]
+    fn overlay_spec_reacquire_after_idle_timeout_drops_stale_surface() {
+        // Backstop for the lazy-expiry-inside-acquire path: when the previous
+        // session ends synchronously within the new acquire (no runtime tick
+        // disposed it), the stale surface still leaves with it.
+        let services = focus_services();
+        let first = services
+            .ui_overlay_acquire_with_spec("A", "")
+            .expect("first spec acquire");
+        assert!(
+            services
+                .overlay_capture()
+                .expect("capture")
+                .borrow_mut()
+                .force_expire("xuepoo.test", first),
+            "the live session is rewound past its deadline"
+        );
+        let second = services
+            .ui_overlay_acquire_with_spec("B", "")
+            .expect("second spec acquire");
+        services.with_ui_blocks(|blocks| {
+            assert!(
+                blocks.get(first).is_none(),
+                "the timed-out surface is unmounted"
+            );
+            assert_eq!(blocks.len(), 1, "only the live surface is retained");
+            assert!(blocks.get(second).is_some());
+        });
+    }
+
+    #[test]
+    fn overlay_mechanism_block_survives_release() {
+        // Only the transient spec surface is disposed on session end: a
+        // mechanism-path block (mounted through `ui.mount`) is the plugin's
+        // retained content and stays mounted after release.
+        let services = focus_services();
+        let handle = mount_and_acquire(&services);
+        assert!(
+            services
+                .ui_overlay_release_with_reason(handle, None)
+                .expect("release")
+        );
+        services.with_ui_blocks(|blocks| {
+            assert!(
+                blocks.get(handle).is_some(),
+                "mechanism content is retained after release"
+            );
+        });
+    }
+
+    #[test]
+    fn overlay_release_is_noop_unless_live_and_denies_live_foreign() {
+        // Pre-change contract with live-session enforcement: anything but
+        // the live session is an ok-noop `false` (already-ended, never
+        // acquired, or stale from before another session started), while
+        // ending somebody else's live session denies with `E_UI_NOT_OWNER`.
+        let capture = Rc::new(RefCell::new(OverlayCapture::new()));
+        let first = generation_services("xuepoo.alpha", 1, &capture);
+        let second = generation_services("xuepoo.beta", 2, &capture);
+
+        // No live session: every handle is an ok-noop, never an error.
+        assert!(
+            !first.ui_overlay_release(999).expect("foreign noop"),
+            "unowned handle with no live session releases nothing"
+        );
+        assert!(
+            !second.ui_overlay_release(999).expect("never-acquired noop"),
+            "never-acquired handle releases nothing"
+        );
+
+        // Live session: the owner releases; ending the live handle as a
+        // foreign generation denies and the session survives.
+        let owned = first
+            .ui_mount("overlay", &UiNode::text("modal"))
+            .expect("mount");
+        first.ui_overlay_acquire(owned).expect("acquire");
+        let foreign = second
+            .ui_mount("overlay", &UiNode::text("other"))
+            .expect("mount");
+        let error = second
+            .ui_overlay_release(owned)
+            .expect_err("ending a foreign live session must deny");
+        assert_eq!(error.code, E_UI_NOT_OWNER);
+        assert!(
+            capture.borrow().is_owner("xuepoo.alpha", owned),
+            "the denied release leaves the live session undisturbed"
+        );
+        assert!(first.ui_overlay_release(owned).expect("owner release"));
+
+        // Ended session: the owner's repeat is an ok-noop even after another
+        // generation acquired in between — idempotency never depends on
+        // global state.
+        let next = second
+            .ui_mount("overlay", &UiNode::text("next"))
+            .expect("mount");
+        second.ui_overlay_acquire(next).expect("re-acquire");
+        assert!(
+            !first.ui_overlay_release(owned).expect("stale repeat"),
+            "a stale handle releases nothing once its session ended"
+        );
+        assert!(
+            !second.ui_overlay_release(foreign).expect("foreign stale"),
+            "a foreign handle that is not the live session releases nothing"
+        );
+        assert!(
+            capture.borrow().is_owner("xuepoo.beta", next),
+            "stale releases leave the live session undisturbed"
+        );
+    }
+
+    #[test]
     fn tabline_slot_requires_exclusive_claim() {
         let services = ui_services(rich_only());
         let error = services
@@ -2664,6 +3420,7 @@ mod tests {
         services.set_ui_access(UiAccess {
             rich: true,
             overlay: false,
+            overlay_focus: false,
             claims: vec!["tabline".to_string()],
         });
         // CTX-0923: the claim gate passes, but `tabline` is reserved for
@@ -2676,6 +3433,7 @@ mod tests {
         services.set_ui_access(UiAccess {
             rich: true,
             overlay: false,
+            overlay_focus: false,
             claims: vec!["workspaceline".to_string()],
         });
         let error = services
@@ -2693,6 +3451,7 @@ mod tests {
         let services = ui_services(UiAccess {
             rich: true,
             overlay: true,
+            overlay_focus: false,
             claims: vec!["workspaceline".to_string()],
         });
         for slot in UiSlot::ALL {
@@ -3199,6 +3958,7 @@ mod tests {
         let services = ui_services(UiAccess {
             rich: true,
             overlay,
+            overlay_focus: overlay,
             claims: Vec::new(),
         });
         if wire_state {
@@ -3337,7 +4097,8 @@ mod tests {
         assert!(
             !services
                 .ui_targets_session_cancel(handle)
-                .expect("idempotent")
+                .expect("idempotent"),
+            "cancel is idempotent: a second cancel succeeds without effect"
         );
         assert_eq!(
             services

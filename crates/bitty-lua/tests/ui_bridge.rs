@@ -15,7 +15,7 @@ use bitty_lua::gate::{PluginVmBuilder, VmBudgets, build_plugin_vm};
 use bitty_lua::ui::{UI_MAX_NODES, UI_MAX_TEXT_BYTES};
 use bitty_lua::{
     BoundedExecution, BridgeError, HostServices, LuaValue, LuaVm, MarshallingLimits, OverlayInput,
-    UiNode,
+    OverlayPoll, UiNode,
 };
 
 /// Gate-built VM with default RC budgets (replaces deprecated `LuaVm::new`).
@@ -32,7 +32,9 @@ struct UiServices {
     slow_ms: u64,
     overlay_deny: Option<&'static str>,
     overlay_acquires: RefCell<Vec<i64>>,
-    overlay_releases: RefCell<Vec<i64>>,
+    overlay_spec_acquires: RefCell<Vec<(String, String)>>,
+    overlay_updates: RefCell<Vec<i64>>,
+    overlay_releases: RefCell<Vec<(i64, Option<String>)>>,
     overlay_polls: RefCell<Vec<(i64, usize)>>,
     overlay_events: RefCell<Vec<OverlayInput>>,
 }
@@ -100,8 +102,42 @@ impl HostServices for UiServices {
         Ok(())
     }
 
+    fn ui_overlay_acquire_with_spec(
+        &self,
+        title: &str,
+        placeholder: &str,
+    ) -> Result<i64, BridgeError> {
+        if let Some(capability) = self.overlay_deny {
+            return Err(BridgeError::capability_denied(capability));
+        }
+        self.overlay_spec_acquires
+            .borrow_mut()
+            .push((title.to_string(), placeholder.to_string()));
+        Ok(12)
+    }
+
+    fn ui_overlay_update(&self, handle: i64, component: &UiNode) -> Result<bool, BridgeError> {
+        if let Some(capability) = self.overlay_deny {
+            return Err(BridgeError::capability_denied(capability));
+        }
+        self.overlay_updates.borrow_mut().push(handle);
+        let _ = component;
+        Ok(true)
+    }
+
     fn ui_overlay_release(&self, handle: i64) -> Result<bool, BridgeError> {
-        self.overlay_releases.borrow_mut().push(handle);
+        self.overlay_releases.borrow_mut().push((handle, None));
+        Ok(true)
+    }
+
+    fn ui_overlay_release_with_reason(
+        &self,
+        handle: i64,
+        reason: Option<&str>,
+    ) -> Result<bool, BridgeError> {
+        self.overlay_releases
+            .borrow_mut()
+            .push((handle, reason.map(str::to_string)));
         Ok(true)
     }
 
@@ -109,6 +145,24 @@ impl HostServices for UiServices {
         self.overlay_polls.borrow_mut().push((handle, max));
         let take = max.min(self.overlay_events.borrow().len());
         Ok(self.overlay_events.borrow_mut().drain(..take).collect())
+    }
+
+    fn ui_overlay_poll_detailed(
+        &self,
+        handle: i64,
+        max: usize,
+    ) -> Result<OverlayPoll, BridgeError> {
+        self.overlay_polls.borrow_mut().push((handle, max));
+        let take = max.min(self.overlay_events.borrow().len());
+        let events: Vec<OverlayInput> = self.overlay_events.borrow_mut().drain(..take).collect();
+        let seq = events.last().map(|event| event.sequence).unwrap_or(0);
+        Ok(OverlayPoll {
+            active: true,
+            seq,
+            events,
+            overflowed: false,
+            reason: None,
+        })
     }
 }
 
@@ -579,9 +633,10 @@ fn expired_mount_returns_timeout_without_commit() {
 }
 
 /// CTX-0941: the focusable-overlay capture surface is present, read-only, and
-/// routes acquire/release/poll through the shared host boundary. The plugin
-/// observes captured input only through `poll`; no callback is registered on
-/// the input path.
+/// routes acquire/update/poll/release through the shared host boundary. The
+/// plugin observes captured input only through `poll`; no callback is
+/// registered on the input path. Acquire returns the session handle; poll
+/// returns the `{ status, seq, events, overflowed }` table.
 #[test]
 fn overlay_capture_surface_round_trips_through_host() {
     let services = Rc::new(UiServices::default());
@@ -591,26 +646,71 @@ fn overlay_capture_surface_round_trips_through_host() {
         &mut vm,
         r#"
         bitty.store.set("overlay_type", type(bitty.ui.overlay))
-        local acquire_ok, acquire_err = pcall(bitty.ui.overlay.acquire, 11)
-        local release_ok, release_err = pcall(bitty.ui.overlay.release, 11)
-        local events = bitty.ui.overlay.poll(11, 4)
-        bitty.store.set("acquire_ok", acquire_ok)
-        bitty.store.set("release_ok", release_ok)
-        bitty.store.set("poll_count", #events)
-        bitty.store.set("acquire_code", acquire_ok and "NONE" or acquire_err.code)
-        bitty.store.set("release_code", release_ok and "NONE" or release_err.code)
+        local handle = bitty.ui.overlay.acquire(11)
+        local updated = bitty.ui.overlay.update(11, { kind = "Text", text = "modal" })
+        local released = bitty.ui.overlay.release(11, "submitted")
+        local poll = bitty.ui.overlay.poll(11, 4)
+        bitty.store.set("acquire_handle", handle)
+        bitty.store.set("updated", updated)
+        bitty.store.set("released", released)
+        bitty.store.set("poll_status", poll.status)
+        bitty.store.set("poll_count", #poll.events)
+        bitty.store.set("poll_overflowed", poll.overflowed)
     "#,
     );
     assert_eq!(
         stored(&services, "overlay_type"),
         Some(LuaValue::String("table".to_string()))
     );
-    assert_eq!(stored(&services, "acquire_ok"), Some(LuaValue::Bool(true)));
-    assert_eq!(stored(&services, "release_ok"), Some(LuaValue::Bool(true)));
+    assert_eq!(
+        stored(&services, "acquire_handle"),
+        Some(LuaValue::Integer(11))
+    );
+    assert_eq!(stored(&services, "updated"), Some(LuaValue::Bool(true)));
+    assert_eq!(stored(&services, "released"), Some(LuaValue::Bool(true)));
+    assert_eq!(
+        stored(&services, "poll_status"),
+        Some(LuaValue::String("active".to_string()))
+    );
     assert_eq!(stored(&services, "poll_count"), Some(LuaValue::Integer(0)));
+    assert_eq!(
+        stored(&services, "poll_overflowed"),
+        Some(LuaValue::Bool(false))
+    );
     assert_eq!(services.overlay_acquires.borrow().as_slice(), &[11]);
-    assert_eq!(services.overlay_releases.borrow().as_slice(), &[11]);
+    assert_eq!(services.overlay_updates.borrow().as_slice(), &[11]);
+    assert_eq!(
+        services.overlay_releases.borrow().as_slice(),
+        &[(11, Some("submitted".to_string()))]
+    );
     assert_eq!(services.overlay_polls.borrow().as_slice(), &[(11, 4)]);
+}
+
+/// CTX-0941: spec acquire mounts the surface from presentation hints and
+/// returns the session handle; unknown fields are ignored.
+#[test]
+fn overlay_acquire_spec_returns_handle() {
+    let services = Rc::new(UiServices::default());
+    let mut vm = gate_vm("overlay-spec");
+    install(&mut vm, services.clone(), 50);
+    run(
+        &mut vm,
+        r#"
+        local handle = bitty.ui.overlay.acquire({ title = "Palette", placeholder = "Type…", future = 1 })
+        bitty.store.set("handle", handle)
+        local bare = bitty.ui.overlay.acquire()
+        bitty.store.set("bare", bare)
+    "#,
+    );
+    assert_eq!(stored(&services, "handle"), Some(LuaValue::Integer(12)));
+    assert_eq!(stored(&services, "bare"), Some(LuaValue::Integer(12)));
+    assert_eq!(
+        services.overlay_spec_acquires.borrow().as_slice(),
+        &[
+            ("Palette".to_string(), "Type…".to_string()),
+            (String::new(), String::new()),
+        ]
+    );
 }
 
 /// CTX-0941: `bitty.ui.overlay` is nested in the read-only `bitty.ui` table.
@@ -622,6 +722,7 @@ fn overlay_capture_table_is_read_only() {
     for chunk in [
         "bitty.ui.overlay = {}",
         "bitty.ui.overlay.acquire = function() end",
+        "bitty.ui.overlay.update = function() end",
     ] {
         let outcome = vm.execute_bounded(chunk).expect("execute");
         assert!(
@@ -631,7 +732,8 @@ fn overlay_capture_table_is_read_only() {
     }
 }
 
-/// CTX-0941: captured input arrives as bounded `{sequence, kind, text}` rows.
+/// CTX-0941: captured input arrives as `{ seq, type, text }` rows inside the
+/// `{ status, seq, events, overflowed }` poll table.
 #[test]
 fn overlay_poll_returns_bounded_events() {
     let services = Rc::new(UiServices::default());
@@ -652,16 +754,23 @@ fn overlay_poll_returns_bounded_events() {
     run(
         &mut vm,
         r#"
-        local first = bitty.ui.overlay.poll(11)
-        bitty.store.set("n", #first)
-        bitty.store.set("kind1", first[1].kind)
-        bitty.store.set("text1", first[1].text)
-        bitty.store.set("seq1", first[1].sequence)
+        local poll = bitty.ui.overlay.poll(11)
+        bitty.store.set("status", poll.status)
+        bitty.store.set("n", #poll.events)
+        bitty.store.set("type1", poll.events[1].type)
+        bitty.store.set("text1", poll.events[1].text)
+        bitty.store.set("seq1", poll.events[1].seq)
+        bitty.store.set("seq", poll.seq)
+        bitty.store.set("overflowed", poll.overflowed)
     "#,
+    );
+    assert_eq!(
+        stored(&services, "status"),
+        Some(LuaValue::String("active".to_string()))
     );
     assert_eq!(stored(&services, "n"), Some(LuaValue::Integer(2)));
     assert_eq!(
-        stored(&services, "kind1"),
+        stored(&services, "type1"),
         Some(LuaValue::String("text".to_string()))
     );
     assert_eq!(
@@ -669,6 +778,8 @@ fn overlay_poll_returns_bounded_events() {
         Some(LuaValue::String("hello".to_string()))
     );
     assert_eq!(stored(&services, "seq1"), Some(LuaValue::Integer(1)));
+    assert_eq!(stored(&services, "seq"), Some(LuaValue::Integer(2)));
+    assert_eq!(stored(&services, "overflowed"), Some(LuaValue::Bool(false)));
 }
 
 /// CTX-0941: a non-integer overlay handle is a typed component error before
@@ -693,11 +804,11 @@ fn overlay_rejects_non_integer_handle() {
 }
 
 /// CTX-0941: a host without a capture backend fails closed typed, and the
-/// capture grant denial propagates typed.
+/// capture grant denial propagates typed naming `ui.overlay.focus`.
 #[test]
 fn overlay_capture_fails_closed_without_grant_or_backend() {
     let denied = Rc::new(UiServices {
-        overlay_deny: Some("ui.overlay"),
+        overlay_deny: Some("ui.overlay.focus"),
         ..UiServices::default()
     });
     let mut vm = gate_vm("overlay-denied");

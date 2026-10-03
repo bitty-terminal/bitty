@@ -1069,6 +1069,9 @@ impl Runtime {
             && (self.search_view.is_none() || self.search_view == self.fed_grid_view())
         {
             self.search_state.refresh(&self.state);
+            // CTX-0936 (W-143c): output replaced the result set, so prior
+            // handles stale even though the binding survives.
+            self.bump_search_result_generation();
         }
     }
 

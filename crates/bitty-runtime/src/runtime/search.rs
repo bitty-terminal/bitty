@@ -33,13 +33,18 @@ impl Runtime {
     /// Recomputes matches for `pattern` over the bound grid without
     /// rebinding (CTX-0805). A bound View that lost its grid ends the
     /// search (fail closed).
+    ///
+    /// CTX-0936 (W-143b dogfood): delegates to the
+    /// [`Self::search_host_set_query`] host op so overlay query edits drive
+    /// the same fenced primitive a future extension uses. A lost grid ends
+    /// the search, exactly as before.
     pub(super) fn search_set_bound(&mut self, pattern: &str, options: SearchOptions) {
-        let grid = self
-            .search_view
-            .filter(|view| self.layout.find_leaf(*view).is_some())
-            .and_then(|view| grid_of(&self.pane_sessions, self.primary_view, &self.state, view));
-        match grid {
-            Some(grid) => self.search_state.set_search(grid, pattern, options),
+        match self.search_view {
+            Some(view) => {
+                if self.search_host_set_query(view, pattern, options).is_err() {
+                    self.search_clear();
+                }
+            }
             None => self.search_clear(),
         }
     }
@@ -203,9 +208,13 @@ impl Runtime {
 
     /// Clears the search UI (pattern empty, matches cleared, inactive) and
     /// releases its View binding.
+    ///
+    /// Bumps the result generation so handles minted before the clear fail
+    /// closed with `Stale` (CTX-0936, W-143c).
     pub fn search_clear(&mut self) {
         self.search_state.clear();
         self.search_view = None;
+        self.bump_search_result_generation();
     }
 
     /// Refreshes the current search against the live state after scrollback
@@ -215,44 +224,56 @@ impl Runtime {
     /// CTX-0805: refreshes against the bound grid; a bound View that lost
     /// its grid ends the search. An unbound search (test seam) keeps the
     /// historic primary-grid refresh.
+    ///
+    /// CTX-0936 (W-143b dogfood): the bound path delegates to the
+    /// [`Self::search_host_refresh`] host op (replace semantics plus a
+    /// generation bump that stales prior handles). The unbound test seam
+    /// keeps its historic behavior and still bumps the generation so no
+    /// handle outlives a replacement.
     pub fn search_refresh(&mut self) {
-        let Some(view) = self.search_view else {
-            // Unbound (test seam): refresh against the same keyboard grid the
-            // other unbound readers use (`search_grid`).
-            let grid = self
-                .keyboard_view()
-                .filter(|view| self.layout.find_leaf(*view).is_some())
-                .and_then(|view| {
-                    grid_of(&self.pane_sessions, self.primary_view, &self.state, view)
-                });
-            if let Some(grid) = grid {
-                self.search_state.refresh(grid);
-            }
+        if let Some(handle) = self.search_host_handle() {
+            let _ = self.search_host_refresh(&handle);
             return;
-        };
-        let grid = self
-            .layout
-            .find_leaf(view)
-            .and_then(|_| grid_of(&self.pane_sessions, self.primary_view, &self.state, view));
-        match grid {
-            Some(grid) => self.search_state.refresh(grid),
-            None => self.search_clear(),
         }
+        // Unbound (test seam): refresh against the same keyboard grid the
+        // other unbound readers use (`search_grid`).
+        let grid = self
+            .keyboard_view()
+            .filter(|view| self.layout.find_leaf(*view).is_some())
+            .and_then(|view| grid_of(&self.pane_sessions, self.primary_view, &self.state, view));
+        if let Some(grid) = grid {
+            self.search_state.refresh(grid);
+        }
+        self.bump_search_result_generation();
     }
 
     /// Advances to the next match (wraps deterministically).
+    ///
+    /// CTX-0936 (W-143b dogfood): the bound path delegates to the
+    /// [`Self::search_host_advance`] host op; the unbound test seam keeps
+    /// its direct behavior.
     pub fn search_next(&mut self) {
-        self.search_state.next();
+        self.search_advance(1);
     }
 
     /// Advances to the previous match (wraps deterministically).
+    ///
+    /// CTX-0936 (W-143b dogfood): same delegation as [`Self::search_next`].
     pub fn search_prev(&mut self) {
-        self.search_state.prev();
+        self.search_advance(-1);
     }
 
     /// Advances the search by `delta` with wrapping.
+    ///
+    /// CTX-0936 (W-143b dogfood): the bound path delegates to the
+    /// [`Self::search_host_advance`] host op (which preserves the result-set
+    /// generation); the unbound test seam advances directly.
     pub fn search_advance(&mut self, delta: isize) {
-        self.search_state.advance(delta);
+        if let Some(handle) = self.search_host_handle() {
+            let _ = self.search_host_advance(&handle, delta);
+        } else {
+            self.search_state.advance(delta);
+        }
     }
 
     /// Number of matches for the current query (≤ [`bitty_term_state::search::SEARCH_MAX_RESULTS`]).
@@ -386,25 +407,41 @@ impl Runtime {
     /// Headless: `selection_text` will then equal `matched_text` for live matches.
     ///
     /// CTX-0805: the selection is owned by the View the search is bound to.
+    ///
+    /// CTX-0936 (W-143b dogfood): the bound path delegates to the
+    /// [`Self::search_host_apply_selection`] host op and maps
+    /// `SelectionDriveOutcome::Selected` to `true` (all other outcomes,
+    /// including fenced `Stale`, to `false`), preserving this seam's
+    /// boolean contract. The unbound test seam (retired in W-144) keeps the
+    /// historic keyboard-grid behavior verbatim.
     pub fn search_apply_selection(&mut self) -> bool {
-        let Some(view) = self.search_view.or_else(|| self.keyboard_view()) else {
-            return false;
-        };
-        let Some(grid) = self.search_grid() else {
-            return false;
-        };
-        let Some(pers) = self.search_state.current_persistent_selection(grid) else {
-            return false;
-        };
-        // Try to restore as live-grid selection.
-        if let Some(sel) = pers.to_grid_selection(grid) {
-            let pin = if sel.active { Some(sel.anchor) } else { None };
-            self.install_selection(view, sel, pin, sel.active);
-            true
+        if let Some(handle) = self.search_host_handle() {
+            match self.search_host_apply_selection(&handle) {
+                Ok(outcome) => {
+                    matches!(outcome, super::search_host::SelectionDriveOutcome::Selected)
+                }
+                Err(_) => false,
+            }
         } else {
-            // In history or pruned: leave a history highlight but clear live selection.
-            self.drop_selection();
-            false
+            let Some(view) = self.search_view.or_else(|| self.keyboard_view()) else {
+                return false;
+            };
+            let Some(grid) = self.search_grid() else {
+                return false;
+            };
+            let Some(pers) = self.search_state.current_persistent_selection(grid) else {
+                return false;
+            };
+            // Try to restore as live-grid selection.
+            if let Some(sel) = pers.to_grid_selection(grid) {
+                let pin = if sel.active { Some(sel.anchor) } else { None };
+                self.install_selection(view, sel, pin, sel.active);
+                true
+            } else {
+                // In history or pruned: leave a history highlight but clear live selection.
+                self.drop_selection();
+                false
+            }
         }
     }
 }

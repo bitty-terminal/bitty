@@ -148,6 +148,7 @@ pub mod pty;
 pub mod resize;
 pub mod scrollbar;
 pub mod search;
+pub mod search_host;
 pub mod search_mode;
 pub mod selection;
 pub mod session;
@@ -160,6 +161,10 @@ pub use self::animations::{
 };
 pub use self::kitty_images::{KittyDisplayOutcome, KittyImageError};
 pub use self::present::{ImeCursorArea, PresentStats};
+pub use self::search_host::{
+    ClipboardCaller, HostOpError, SearchHostQuery, SearchResultHandle, SelectionDriveOutcome,
+    SelectionHandle, YankOutcome,
+};
 
 // Re-exported so the IME contract tests share the one definition of the
 // post-commit echo bound rather than restating its value (CTX-0783).
@@ -650,6 +655,16 @@ pub struct Runtime {
     /// buffer rows of exactly this grid, so refresh, reveal, highlights, and
     /// the live selection they drive all address it, even if focus moves.
     search_view: Option<ViewId>,
+    /// Result-set generation for the View-bound search (CTX-0936, W-143c).
+    ///
+    /// Bumped on every result-set replacement (`search_set`, `search_refresh`,
+    /// `search_clear`, and the PTY-driven auto-refresh). [`SearchResultHandle`]
+    /// captures this counter; a handle whose generation no longer matches
+    /// fails closed with a typed `Stale` outcome instead of addressing a
+    /// replaced result set. Navigation (`next`/`prev`/`advance`) does not bump
+    /// it: moving the current index preserves the set. `O(1)` state; wrap is
+    /// practically unreachable and still fail-safe (equality fencing only).
+    search_result_generation: u64,
     /// Active overlay-scrollbar thumb drag (CTX-0181).
     ///
     /// Press+move on the painted thumb scrolls the focused view through the
@@ -1342,6 +1357,7 @@ impl Runtime {
             copy_mode_view: None,
             search_mode: false,
             search_view: None,
+            search_result_generation: 0,
             scrollbar_drag: None,
             scrollbar_cursor_left: false,
             scrollbar_visible: false,
@@ -1563,6 +1579,7 @@ impl Runtime {
             copy_mode_view: None,
             search_mode: false,
             search_view: None,
+            search_result_generation: 0,
             scrollbar_drag: None,
             scrollbar_cursor_left: false,
             scrollbar_visible: false,

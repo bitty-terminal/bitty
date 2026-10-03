@@ -108,9 +108,22 @@ impl Runtime {
 
     /// Installs a copy-mode visual as the live selection, owned by the View
     /// copy mode walks (CTX-0805).
+    ///
+    /// CTX-0936 (W-143b dogfood): installs through the selection-drive
+    /// bridge host op. Fail-closed on a lost grid (the live selection is
+    /// dropped rather than installed against a dead owner); unreachable in
+    /// practice because the lifecycle funnels end copy mode when its grid
+    /// dies.
     fn set_copy_selection(&mut self, selection: Selection) {
         match self.copy_mode_view {
-            Some(view) => self.install_selection(view, selection, None, false),
+            Some(view) => {
+                if self
+                    .search_host_install_selection(view, selection, None, false)
+                    .is_err()
+                {
+                    self.drop_selection();
+                }
+            }
             None => self.drop_selection(),
         }
     }
@@ -250,10 +263,11 @@ impl Runtime {
     /// Yanks the current copy-mode visual selection to the clipboard plus
     /// the primary selection, then exits copy mode.
     ///
-    /// Reuses the existing fail-soft clipboard paths
-    /// ([`Self::copy_selection_to_clipboard`] plus
-    /// [`Self::copy_selection_to_primary`]) so headless determinism and
-    /// error recording stay identical to the mouse path. While the view
+    /// CTX-0936 (W-143b dogfood): yanks through the gated
+    /// [`Self::search_host_yank_selection`] host op as the trusted user
+    /// (clipboard plus primary, same fail-soft recording). Over-limit
+    /// payloads are now char-boundary truncated with a flag per the W-135
+    /// clipboard rule; everything else is unchanged. While the view
     /// is scrolled into history the visual lives in viewport coordinates
     /// and is materialized through the composited viewport instead
     /// ([`Self::copy_mode_yank_viewport`]). Returns the yanked
@@ -269,11 +283,12 @@ impl Runtime {
         if self.is_copy_space_scrolled() {
             return self.copy_mode_yank_viewport();
         }
-        let text = self.selection_text()?;
-        let _ = self.copy_selection_to_clipboard();
-        let _ = self.copy_selection_to_primary();
+        let outcome = match self.search_host_yank_selection(ClipboardCaller::TrustedUser) {
+            Ok(outcome) => outcome?,
+            Err(_) => return None,
+        };
         self.exit_copy_mode();
-        Some(text)
+        Some(outcome.text)
     }
 
     /// Yanks the copy-mode visual from the scrolled viewport (M1-15).
@@ -281,8 +296,12 @@ impl Runtime {
     /// Materializes the cursor-space visual (focused-viewport coordinates)
     /// against the current composited viewport through the same CTX-0385
     /// text algebra as the live path (`text`/`block_text` dispatch, edge
-    /// trim, wide-pair safety), then copies through the same clipboard
-    /// plus primary paths. Fail-soft and bounded like the live yank.
+    /// trim, wide-pair safety), then copies through the gated clipboard
+    /// host op plus the primary path. Fail-soft and bounded like the live
+    /// yank. CTX-0936 (W-143b dogfood): the clipboard write goes through
+    /// [`Self::search_host_copy_to_clipboard`] as the trusted user;
+    /// over-limit payloads truncate per the W-135 rule instead of being
+    /// rejected.
     fn copy_mode_yank_viewport(&mut self) -> Option<String> {
         let mode = self.copy_mode?;
         let (anchor, kind) = mode.anchor.zip(mode.visual_kind)?;
@@ -304,10 +323,14 @@ impl Runtime {
         if text.is_empty() {
             return None;
         }
-        let _ = self.clipboard.set_text(text.clone());
-        self.set_primary_text(text.clone());
+        let outcome = match self.search_host_copy_to_clipboard(ClipboardCaller::TrustedUser, &text)
+        {
+            Ok(outcome) => outcome,
+            Err(_) => return None,
+        };
+        self.set_primary_text(outcome.text.clone());
         self.exit_copy_mode();
-        Some(text)
+        Some(outcome.text)
     }
 
     /// Handles one key event while copy mode is active.

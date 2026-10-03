@@ -233,9 +233,8 @@ pub use runtime::session::{
     MAX_SESSION_SCROLLBACK_LINES_PER_PANE, MAX_SESSION_WORKSPACES, PaneAttachment, PaneRoute,
     PaneSnapshot, PendingPaneRestore, SESSION_APP_DIR_NAME, SESSION_FILE_NAME,
     SESSION_FORMAT_VERSION, SESSION_MIN_DECODE_VERSION, SESSIONS_DIR_NAME, SessionError,
-    SessionExitSaveOutcome, SessionRestoreSummary, SessionSaveSummary, SessionSnapshot,
-    SessionStartupOutcome, WorkspaceSnapshot, decode_session, encode_session, session_dir,
-    session_dir_for, session_file, session_file_for, state_home, state_home_for,
+    SessionExitSaveOutcome, SessionFileBackend, SessionRestoreSummary, SessionSaveSummary,
+    SessionSnapshot, SessionStartupOutcome, WorkspaceSnapshot,
 };
 pub use runtime::workspaces::{
     MAX_WORKSPACES, WORKSPACE_NAME_MAX_CHARS, WorkspaceSummary, WsCloseRequest,

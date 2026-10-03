@@ -372,6 +372,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "bitty-storage"
+version = "0.0.1"
+source = "git+https://github.com/bitty-terminal/bitty-storage?rev=5e720b4#5e720b4c6932e7991577dacff629d1b618bec609"
+
+[[package]]
 name = "bitty-term-state"
 version = "0.0.21"
 dependencies = [
@@ -385,12 +390,14 @@ version = "0.0.21"
 dependencies = [
  "bitty-config",
  "bitty-ipc",
+ "bitty-lua",
  "bitty-perf",
  "bitty-platform",
  "bitty-plugin-host",
  "bitty-render",
  "bitty-rich",
  "bitty-runtime",
+ "bitty-storage",
  "bitty-term-state",
  "bitty-test-support",
  "bitty-vt",

@@ -65,7 +65,7 @@ pub use services::{
     ServiceRecord, SettingsSource, SnapshotSource, UiAccess, UiBlock, UiBlocks,
     UnavailableSnapshot, UnavailableWorkspaces, WorkspaceRequestQueue, WorkspaceSource,
 };
-pub use store::PluginStore;
+pub use store::{KvCommitBackend, KvCommitError, PluginStore, STORE_FILE_MAX_BYTES};
 // Bridge value/error types the host-service traits are expressed in, so the
 // application can implement `SettingsSource`/`SnapshotSource` without taking a
 // direct `bitty-lua` dependency.
@@ -549,12 +549,13 @@ pub struct PluginRuntime {
     target_lenses: Rc<RefCell<Vec<(String, bitty_ui::DerivedProvider)>>>,
     /// W-29: runtime-shared label allocator (existing `LabelAllocator`).
     label_allocator: Rc<RefCell<bitty_ui::LabelAllocator>>,
-    /// Filesystem adapter behind disk-backed plugin stores (`data_dir`).
+    /// Durable-commit backend behind disk-backed plugin stores (`data_dir`).
     ///
-    /// Defaults to [`NativeFileSystem`]; replaceable through
-    /// [`PluginRuntime::set_store_filesystem`] so latency and failure can be
-    /// injected deterministically (bitty #1518).
-    store_fs: Arc<dyn FileSystem>,
+    /// `None` by default (no durable store configured): stores opened while
+    /// no backend is installed fail closed on write and load clean and
+    /// empty. Replaceable through [`PluginRuntime::set_store_backend`] so
+    /// latency and failure can be injected deterministically (bitty #1518).
+    store_backend: Option<Arc<dyn store::KvCommitBackend>>,
 }
 
 impl PluginRuntime {
@@ -587,17 +588,17 @@ impl PluginRuntime {
             target_registry: Rc::new(RefCell::new(bitty_ui::TargetRegistry::new())),
             target_lenses: Rc::new(RefCell::new(Vec::new())),
             label_allocator: Rc::new(RefCell::new(bitty_ui::LabelAllocator::default())),
-            store_fs: Arc::new(NativeFileSystem),
+            store_backend: None,
         }
     }
 
-    /// Replace the filesystem adapter used by disk-backed plugin stores.
+    /// Replace the durable-commit backend used by disk-backed plugin stores.
     ///
-    /// Applies to stores opened by later activations. The adapter only
-    /// changes how `store.json` is read and committed; quotas, atomic
-    /// temp-then-rename, and the RC-1 accounting are unchanged.
-    pub fn set_store_filesystem(&mut self, fs: Arc<dyn FileSystem>) {
-        self.store_fs = fs;
+    /// Applies to stores opened by later activations. The backend only
+    /// changes how `store.json` is read and committed; quotas, validation,
+    /// and the RC-1 accounting stay in Core.
+    pub fn set_store_backend(&mut self, backend: Option<Arc<dyn store::KvCommitBackend>>) {
+        self.store_backend = backend;
     }
 
     /// Whether safe mode is enabled.
@@ -1617,7 +1618,7 @@ impl PluginRuntime {
         match &self.data_dir {
             Some(root) => {
                 let path = root.join(id.as_str()).join("store.json");
-                PluginStore::load_with_fs(path, self.store_fs.clone())
+                PluginStore::load_with_backend(path, self.store_backend.clone())
                     .map_err(PluginRuntimeError::Io)
             }
             None => Ok(PluginStore::in_memory()),

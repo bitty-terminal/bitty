@@ -80,17 +80,17 @@
 //!
 //! # Atomicity
 //!
-//! Saves write a temp sibling (`<file>.tmp.<pid>`), `write_all` +
-//! [`File::sync_all`](std::fs::File::sync_all), then atomically rename onto
-//! the final name and best-effort sync the parent dir. A crash can only
+//! The injected [`SessionFileBackend`] owns the commit mechanics: a
+//! per-writer unique temp sibling, `write_all` +
+//! [`File::sync_all`](std::fs::File::sync_all), then an atomic rename onto
+//! the final name plus a best-effort parent-dir sync. A crash can only
 //! leave a temp file behind: temps are never read, so a partial write is
 //! always ignored (the previous complete session stays authoritative).
 //! Concurrent savers are last-writer-wins; each rename is still atomic, so
-//! the file is never partial. Stale `<file>.tmp.*` siblings are swept
-//! best-effort *before* writing — never after the rename, so a concurrent
-//! saver's live temp is never deleted. Oversize snapshots fail closed
-//! *before* touching the filesystem, so a failed save never truncates a
-//! good session.
+//! the file is never partial. Crashed-save litter is swept best-effort
+//! *before* writing — never after the rename, so a concurrent saver's live
+//! temp is never deleted. Oversize snapshots fail closed *before* touching
+//! the filesystem, so a failed save never truncates a good session.
 //!
 //! # Bounds (fail-closed: any violation rejects the whole file)
 //!
@@ -116,9 +116,11 @@
 //! # Paths (no hardcoded hosts)
 //!
 //! Sessions live under `$XDG_STATE_HOME/bitty/sessions/session` with the
-//! XDG fallback `$HOME/.local/state/...`; every helper takes injected
-//! environment values so tests stay hermetic. Resolution returns `None`
-//! (fail-closed, never a panic) when neither root is usable.
+//! XDG fallback `$HOME/.local/state/...`; resolution runs inside the
+//! injected [`SessionFileBackend`] from injected environment values so
+//! tests stay hermetic. Resolution returns `None` (fail-closed, never a
+//! panic) when neither root is usable, and with no backend injected every
+//! durable path fails closed without touching the filesystem.
 //!
 //! # Trust posture (read before changing)
 //!
@@ -148,8 +150,9 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use bitty_ui::{Focus, LayoutNode, PresentationMode, SplitAxis, View, ViewId};
+use bitty_ui::{Focus, LayoutNode, PresentationMode, View, ViewId};
 
 use super::panes::osc7_cwd_path;
 use super::workspaces::WorkspaceSlot;
@@ -212,9 +215,6 @@ pub const SESSION_APP_DIR_NAME: &str = "bitty";
 pub const SESSIONS_DIR_NAME: &str = "sessions";
 /// Session file name (version lives inside the file).
 pub const SESSION_FILE_NAME: &str = "session";
-
-/// Session magic line prefix.
-const SESSION_MAGIC: &str = "bitty-session v";
 
 /// Everything that can go wrong across session save/restore.
 ///
@@ -470,97 +470,74 @@ pub struct PendingPaneRestore {
 }
 
 // ---------------------------------------------------------------------------
-// XDG state paths (pure, hermetic; no hardcoded hosts)
+// Durable-commit seam (DEC-W146-2: Core-owned backend trait)
 // ---------------------------------------------------------------------------
 
-/// `$XDG_STATE_HOME`, else `$HOME/.local/state`, else `None` (fail-closed).
-#[must_use]
-pub fn state_home_for(xdg_state_home: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
-    if let Some(xdg) = xdg_state_home {
-        if !xdg.trim().is_empty() {
-            return Some(PathBuf::from(xdg));
-        }
-    }
-    home.filter(|h| !h.trim().is_empty())
-        .map(|h| PathBuf::from(h).join(".local").join("state"))
-}
+/// Core-owned session persistence backend (W-146 integration seam).
+///
+/// Validation-before-mutation stays in Core: [`Runtime::save_session_to_path`]
+/// validates the captured snapshot before any backend call, and
+/// [`Runtime::apply_session_snapshot`] re-validates before any mutation.
+/// The backend implements only the byte mechanics (file codec, atomic
+/// temp-plus-rename commit, capped load, XDG path resolution) behind that
+/// gate, preserving every [`MAX_SESSION_*`](MAX_SESSION_FILE_BYTES) ceiling,
+/// user-only file permissions, and content-free errors.
+///
+/// The dependency is one-way: Core defines this trait and never imports the
+/// extension crate. The application wiring crate implements it with the
+/// extracted storage mechanics and injects it via
+/// [`Runtime::set_session_backend`]. With no backend injected every path
+/// fails closed: saves report a content-free error, loads behave as a
+/// missing file (clean start), and the previous on-disk state is untouched.
+pub trait SessionFileBackend: Send + Sync + std::fmt::Debug {
+    /// Encodes a Core-validated snapshot to file bytes (fails closed).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError`] (kinds and counts only) when the snapshot
+    /// violates a bound or cannot be represented.
+    fn encode_snapshot(&self, snap: &SessionSnapshot) -> Result<Vec<u8>, SessionError>;
 
-/// Live-environment state home.
-#[must_use]
-pub fn state_home() -> Option<PathBuf> {
-    state_home_for(
-        std::env::var("XDG_STATE_HOME").ok().as_deref(),
-        std::env::var("HOME").ok().as_deref(),
-    )
-}
+    /// Decodes file bytes to a snapshot; any violation rejects the whole file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError`] (kinds and counts only) on corrupt,
+    /// oversize, or version-mismatched input. Callers validate again via
+    /// [`Runtime::apply_session_snapshot`] before mutating anything.
+    fn decode_snapshot(&self, bytes: &[u8]) -> Result<SessionSnapshot, SessionError>;
 
-/// Session directory (`<state>/bitty/sessions`) from injected env values.
-#[must_use]
-pub fn session_dir_for(xdg_state_home: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
-    state_home_for(xdg_state_home, home)
-        .map(|base| base.join(SESSION_APP_DIR_NAME).join(SESSIONS_DIR_NAME))
-}
+    /// Atomically commits `bytes` to `path` (temp write, fsync, rename).
+    ///
+    /// A failed commit leaves the previous destination untouched; partial
+    /// writes are never observable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError`] (kinds and counts only) on over-ceiling
+    /// payloads or filesystem failures.
+    fn commit_session_bytes(&self, path: &Path, bytes: &[u8]) -> Result<(), SessionError>;
 
-/// Live-environment session directory.
-#[must_use]
-pub fn session_dir() -> Option<PathBuf> {
-    session_dir_for(
-        std::env::var("XDG_STATE_HOME").ok().as_deref(),
-        std::env::var("HOME").ok().as_deref(),
-    )
-}
+    /// Reads a session file with a hard size cap.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] when no file exists (quiet clean
+    /// start); over-ceiling or unreadable files fail closed.
+    fn load_session_bytes(&self, path: &Path) -> Result<Vec<u8>, SessionError>;
 
-/// Session file path from injected env values.
-#[must_use]
-pub fn session_file_for(xdg_state_home: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
-    session_dir_for(xdg_state_home, home).map(|dir| dir.join(SESSION_FILE_NAME))
-}
+    /// Session file path from injected env values (`None` fails closed).
+    fn session_file_for(&self, xdg_state_home: Option<&str>, home: Option<&str>)
+    -> Option<PathBuf>;
 
-/// Live-environment session file path.
-#[must_use]
-pub fn session_file() -> Option<PathBuf> {
-    session_file_for(
-        std::env::var("XDG_STATE_HOME").ok().as_deref(),
-        std::env::var("HOME").ok().as_deref(),
-    )
+    /// Live-environment session file path (`None` fails closed).
+    fn session_file(&self) -> Option<PathBuf>;
 }
 
 // ---------------------------------------------------------------------------
-// Field escaping (backslash-only; whole-line fields may contain spaces)
+// Capture helpers (bounds live here; the file codec lives behind
+// [`SessionFileBackend`])
 // ---------------------------------------------------------------------------
-
-/// Escapes one whole-line field (`\` → `\\`, LF → `\n`, CR → `\r`).
-fn escape_field(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    for c in raw.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
-/// Unescapes one whole-line field; rejects dangling/unknown escapes.
-fn unescape_field(raw: &str) -> Result<String, SessionError> {
-    let mut out = String::with_capacity(raw.len());
-    let mut chars = raw.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('\\') => out.push('\\'),
-            Some('n') => out.push('\n'),
-            Some('r') => out.push('\r'),
-            _ => return Err(SessionError::Corrupt("bad escape")),
-        }
-    }
-    Ok(out)
-}
 
 /// Truncates to at most `limit` bytes at a char boundary.
 fn truncate_bytes(text: &str, limit: usize) -> &str {
@@ -572,202 +549,6 @@ fn truncate_bytes(text: &str, limit: usize) -> &str {
         end -= 1;
     }
     &text[..end]
-}
-
-// ---------------------------------------------------------------------------
-// Layout S-expression codec (single line per workspace)
-// ---------------------------------------------------------------------------
-
-/// Encodes a layout tree as one S-expression line; transient overlays are
-/// stripped to their base (never session truth).
-fn encode_layout(node: &LayoutNode) -> String {
-    match node {
-        LayoutNode::Leaf(view) => {
-            format!("(leaf {} {} {})", view.id().0, view.cols(), view.rows())
-        }
-        LayoutNode::Split {
-            axis,
-            ratio,
-            first,
-            second,
-        } => {
-            let axis = match axis {
-                SplitAxis::Horizontal => "h",
-                SplitAxis::Vertical => "v",
-            };
-            format!(
-                "(split {axis} {} {} {})",
-                ratio.to_bits(),
-                encode_layout(first),
-                encode_layout(second)
-            )
-        }
-        LayoutNode::Stack(children) => {
-            let mut out = String::from("(stack");
-            for child in children {
-                out.push(' ');
-                out.push_str(&encode_layout(child));
-            }
-            out.push(')');
-            out
-        }
-        LayoutNode::Overlay { base, .. } => encode_layout(base),
-    }
-}
-
-/// Tokenizes one layout line into atoms and parens.
-fn tokenize_layout(line: &str) -> Vec<&str> {
-    let mut tokens = Vec::new();
-    let mut start: Option<usize> = None;
-    for (i, b) in line.bytes().enumerate() {
-        match b {
-            b'(' | b')' => {
-                if let Some(s) = start.take() {
-                    tokens.push(&line[s..i]);
-                }
-                tokens.push(&line[i..i + 1]);
-            }
-            b' ' | b'\t' => {
-                if let Some(s) = start.take() {
-                    tokens.push(&line[s..i]);
-                }
-            }
-            _ => {
-                if start.is_none() {
-                    start = Some(i);
-                }
-            }
-        }
-    }
-    if let Some(s) = start.take() {
-        tokens.push(&line[s..]);
-    }
-    tokens
-}
-
-/// Recursive-descent layout parser with depth and leaf guards.
-struct LayoutParser<'a> {
-    tokens: Vec<&'a str>,
-    pos: usize,
-    leaves: usize,
-}
-
-impl<'a> LayoutParser<'a> {
-    fn parse_node(&mut self, depth: usize) -> Result<LayoutNode, SessionError> {
-        if depth > MAX_SESSION_LAYOUT_DEPTH {
-            return Err(SessionError::Corrupt("layout too deep"));
-        }
-        let open = self
-            .next()
-            .ok_or(SessionError::Corrupt("layout truncated"))?;
-        if open != "(" {
-            return Err(SessionError::Corrupt("layout shape"));
-        }
-        let kind = self
-            .next()
-            .ok_or(SessionError::Corrupt("layout truncated"))?;
-        let node = match kind {
-            "leaf" => {
-                let id: u64 = self
-                    .next()
-                    .and_then(|t| t.parse().ok())
-                    .ok_or(SessionError::Corrupt("leaf id"))?;
-                let cols: usize = self
-                    .next()
-                    .and_then(|t| t.parse().ok())
-                    .ok_or(SessionError::Corrupt("leaf dims"))?;
-                let rows: usize = self
-                    .next()
-                    .and_then(|t| t.parse().ok())
-                    .ok_or(SessionError::Corrupt("leaf dims"))?;
-                if !(1..=MAX_SESSION_GRID_DIM).contains(&cols)
-                    || !(1..=MAX_SESSION_GRID_DIM).contains(&rows)
-                {
-                    return Err(SessionError::Corrupt("leaf dims range"));
-                }
-                self.leaves += 1;
-                if self.leaves > MAX_SESSION_PANES_PER_WORKSPACE {
-                    return Err(SessionError::Corrupt("too many panes"));
-                }
-                self.expect_close()?;
-                LayoutNode::leaf(View::new(ViewId::new(id), cols, rows))
-            }
-            "split" => {
-                let axis = match self.next() {
-                    Some("h") => SplitAxis::Horizontal,
-                    Some("v") => SplitAxis::Vertical,
-                    _ => return Err(SessionError::Corrupt("split axis")),
-                };
-                let bits: u32 = self
-                    .next()
-                    .and_then(|t| t.parse().ok())
-                    .ok_or(SessionError::Corrupt("split ratio"))?;
-                let ratio = f32::from_bits(bits);
-                let ratio = if ratio.is_finite() { ratio } else { 0.5 };
-                let first = self.parse_node(depth + 1)?;
-                let second = self.parse_node(depth + 1)?;
-                self.expect_close()?;
-                LayoutNode::split(axis, ratio, first, second)
-            }
-            "stack" => {
-                let mut children = Vec::new();
-                loop {
-                    match self.peek() {
-                        None => return Err(SessionError::Corrupt("layout truncated")),
-                        Some(")") => {
-                            self.pos += 1;
-                            break;
-                        }
-                        _ => {
-                            if children.len() >= MAX_SESSION_PANES_PER_WORKSPACE {
-                                return Err(SessionError::Corrupt("too many panes"));
-                            }
-                            children.push(self.parse_node(depth + 1)?);
-                        }
-                    }
-                }
-                LayoutNode::stack(children)
-            }
-            _ => return Err(SessionError::Corrupt("layout node")),
-        };
-        Ok(node)
-    }
-
-    fn next(&mut self) -> Option<&'a str> {
-        let token = self.tokens.get(self.pos).copied();
-        if token.is_some() {
-            self.pos += 1;
-        }
-        token
-    }
-
-    fn peek(&self) -> Option<&'a str> {
-        self.tokens.get(self.pos).copied()
-    }
-
-    fn expect_close(&mut self) -> Result<(), SessionError> {
-        match self.next() {
-            Some(")") => Ok(()),
-            _ => Err(SessionError::Corrupt("layout shape")),
-        }
-    }
-}
-
-/// Decodes one layout expression line into a tree.
-fn decode_layout(line: &str) -> Result<LayoutNode, SessionError> {
-    let mut parser = LayoutParser {
-        tokens: tokenize_layout(line),
-        pos: 0,
-        leaves: 0,
-    };
-    if parser.tokens.is_empty() {
-        return Err(SessionError::Corrupt("empty layout"));
-    }
-    let node = parser.parse_node(0)?;
-    if parser.pos != parser.tokens.len() {
-        return Err(SessionError::Corrupt("layout trailing"));
-    }
-    Ok(node)
 }
 
 // ---------------------------------------------------------------------------
@@ -922,400 +703,6 @@ fn resolve_attachment(
 }
 
 // ---------------------------------------------------------------------------
-// Text codec (pure, bounded, content-free errors)
-// ---------------------------------------------------------------------------
-
-/// Encodes a validated snapshot to file bytes (fails closed before I/O).
-pub fn encode_session(snap: &SessionSnapshot) -> Result<Vec<u8>, SessionError> {
-    validate_snapshot(snap)?;
-    // Unspecified (v1-legacy) attachments resolve through the same
-    // startup-owner derivation apply uses, so hand-built snapshots encode
-    // to the v2 record apply would have restored them through.
-    let owner = derive_startup_owner(snap);
-    let mut out = String::new();
-    out.push_str(SESSION_MAGIC);
-    out.push_str(&SESSION_FORMAT_VERSION.to_string());
-    out.push('\n');
-    let mru = snap
-        .mru
-        .iter()
-        .map(|i| i.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    out.push_str(&format!(
-        "workspaces {} active {} mru {mru}\n",
-        snap.workspaces.len(),
-        snap.active
-    ));
-    for ws in &snap.workspaces {
-        let focus = ws
-            .focus
-            .map_or_else(|| "none".to_string(), |id| id.0.to_string());
-        out.push_str(&format!("workspace {} {focus}\n", ws.seq));
-        out.push_str(&format!("name {}\n", escape_field(&ws.name)));
-        out.push_str(&format!("layout {}\n", encode_layout(&ws.layout)));
-        for pane in &ws.panes {
-            let leaf = ws
-                .layout
-                .find_leaf(pane.view)
-                .ok_or(SessionError::Corrupt("pane coverage"))?;
-            let cwd_flag = u8::from(pane.cwd.is_some());
-            // CW-16 v2 record: attachment map, content route, and
-            // presentation mode ride the pane header. Fixed tokens, still
-            // one line per pane, still covered by the line-bytes cap below.
-            let attach = resolve_attachment(pane.attach, pane.view, owner);
-            out.push_str(&format!(
-                "pane {} {} {} {} {cwd_flag} {attach} {} {}\n",
-                pane.view.0,
-                leaf.cols(),
-                leaf.rows(),
-                pane.scrollback.len(),
-                pane.route,
-                pane.mode,
-            ));
-            if let Some(cwd) = &pane.cwd {
-                out.push_str(&escape_field(cwd));
-                out.push('\n');
-            }
-            for line in &pane.scrollback {
-                out.push_str(&escape_field(line));
-                out.push('\n');
-            }
-            out.push_str("end-pane\n");
-        }
-        out.push_str("end-workspace\n");
-    }
-    out.push_str("end-session\n");
-    // P3-9 self-compatibility: escaped whole-line fields (cwd, scrollback)
-    // can exceed the decode line cap while the raw text stays within its
-    // own bound (e.g. 3000 backslashes escape to 6000 bytes). Reject here,
-    // fail-closed before any I/O, so accepted output always decodes.
-    for line in out.split('\n') {
-        if line.len() > MAX_SESSION_LINE_BYTES {
-            return Err(SessionError::TooLarge {
-                what: "session line",
-                actual: line.len(),
-                limit: MAX_SESSION_LINE_BYTES,
-            });
-        }
-    }
-    let bytes = out.into_bytes();
-    if bytes.len() > MAX_SESSION_FILE_BYTES {
-        return Err(SessionError::TooLarge {
-            what: "session file",
-            actual: bytes.len(),
-            limit: MAX_SESSION_FILE_BYTES,
-        });
-    }
-    Ok(bytes)
-}
-
-/// Cursor parser over session-file lines (content-free errors throughout).
-struct SessionParser<'a> {
-    lines: Vec<&'a str>,
-    pos: usize,
-}
-
-impl<'a> SessionParser<'a> {
-    fn next(&mut self) -> Result<&'a str, SessionError> {
-        let line = self
-            .lines
-            .get(self.pos)
-            .copied()
-            .ok_or(SessionError::Corrupt("truncated"))?;
-        self.pos += 1;
-        Ok(line)
-    }
-
-    fn expect(&mut self, marker: &'static str) -> Result<(), SessionError> {
-        match self.next()? {
-            line if line == marker => Ok(()),
-            _ => Err(SessionError::Corrupt("marker")),
-        }
-    }
-}
-
-/// Decodes file bytes to a snapshot; any violation rejects the whole file.
-///
-/// Versioning (CW-16): v1 files migrate in memory — pane records gain an
-/// unspecified attachment (resolved through [`derive_startup_owner`] like
-/// the pre-v2 restore), [`PaneRoute::Terminal`], and
-/// [`PresentationMode::Tiled`]. The returned snapshot always carries
-/// [`SESSION_FORMAT_VERSION`]; anything outside
-/// `SESSION_MIN_DECODE_VERSION..=SESSION_FORMAT_VERSION` is
-/// [`SessionError::UnsupportedVersion`] before any other parsing.
-pub fn decode_session(bytes: &[u8]) -> Result<SessionSnapshot, SessionError> {
-    if bytes.len() > MAX_SESSION_FILE_BYTES {
-        return Err(SessionError::TooLarge {
-            what: "session file",
-            actual: bytes.len(),
-            limit: MAX_SESSION_FILE_BYTES,
-        });
-    }
-    let text = std::str::from_utf8(bytes).map_err(|_| SessionError::Corrupt("utf-8"))?;
-    let mut lines: Vec<&str> = text.split('\n').collect();
-    if lines.last() == Some(&"") {
-        lines.pop();
-    }
-    for line in &lines {
-        if line.len() > MAX_SESSION_LINE_BYTES {
-            return Err(SessionError::TooLarge {
-                what: "session line",
-                actual: line.len(),
-                limit: MAX_SESSION_LINE_BYTES,
-            });
-        }
-    }
-    let mut parser = SessionParser { lines, pos: 0 };
-    let magic = parser.next()?;
-    let version: u32 = magic
-        .strip_prefix(SESSION_MAGIC)
-        .and_then(|v| v.parse().ok())
-        .ok_or(SessionError::Corrupt("magic"))?;
-    if !(SESSION_MIN_DECODE_VERSION..=SESSION_FORMAT_VERSION).contains(&version) {
-        return Err(SessionError::UnsupportedVersion(version));
-    }
-    let header = parser.next()?;
-    let (count, active, mru) = parse_workspaces_header(header)?;
-    if count == 0 || count > MAX_SESSION_WORKSPACES {
-        return Err(SessionError::Corrupt("workspace count"));
-    }
-    let mut workspaces = Vec::with_capacity(count);
-    let mut total_panes = 0usize;
-    for _ in 0..count {
-        let ws = parse_workspace(&mut parser, &mut total_panes, version)?;
-        workspaces.push(ws);
-    }
-    parser.expect("end-session")?;
-    if parser.pos != parser.lines.len() {
-        return Err(SessionError::Corrupt("trailing"));
-    }
-    // Migration normalizes here: downstream (validate, apply, re-encode)
-    // only ever sees the current model version.
-    let snap = SessionSnapshot {
-        version: SESSION_FORMAT_VERSION,
-        workspaces,
-        active,
-        mru,
-    };
-    validate_snapshot(&snap)?;
-    Ok(snap)
-}
-
-/// Parses `workspaces <n> active <a> mru <m0,m1,...>`.
-fn parse_workspaces_header(line: &str) -> Result<(usize, usize, Vec<usize>), SessionError> {
-    let rest = line
-        .strip_prefix("workspaces ")
-        .ok_or(SessionError::Corrupt("header"))?;
-    let (count_raw, rest) = rest
-        .split_once(" active ")
-        .ok_or(SessionError::Corrupt("header"))?;
-    let (active_raw, mru_raw) = rest
-        .split_once(" mru ")
-        .ok_or(SessionError::Corrupt("header"))?;
-    let count: usize = count_raw
-        .parse()
-        .map_err(|_| SessionError::Corrupt("header"))?;
-    let active: usize = active_raw
-        .parse()
-        .map_err(|_| SessionError::Corrupt("header"))?;
-    if mru_raw.is_empty() {
-        return Err(SessionError::Corrupt("mru order"));
-    }
-    let mut mru = Vec::new();
-    for part in mru_raw.split(',') {
-        mru.push(
-            part.parse()
-                .map_err(|_| SessionError::Corrupt("mru order"))?,
-        );
-    }
-    Ok((count, active, mru))
-}
-
-/// Parses one `workspace ... end-workspace` block.
-fn parse_workspace(
-    parser: &mut SessionParser<'_>,
-    total_panes: &mut usize,
-    version: u32,
-) -> Result<WorkspaceSnapshot, SessionError> {
-    let head = parser.next()?;
-    let head = head
-        .strip_prefix("workspace ")
-        .ok_or(SessionError::Corrupt("workspace"))?;
-    let (seq_raw, focus_raw) = head
-        .split_once(' ')
-        .ok_or(SessionError::Corrupt("workspace"))?;
-    let seq: u64 = seq_raw
-        .parse()
-        .map_err(|_| SessionError::Corrupt("workspace seq"))?;
-    let focus = match focus_raw {
-        "none" => None,
-        raw => Some(ViewId::new(
-            raw.parse().map_err(|_| SessionError::Corrupt("focus"))?,
-        )),
-    };
-    let name_line = parser.next()?;
-    let name = unescape_field(
-        name_line
-            .strip_prefix("name ")
-            .ok_or(SessionError::Corrupt("name"))?,
-    )?;
-    let layout_line = parser.next()?;
-    let mut layout = decode_layout(
-        layout_line
-            .strip_prefix("layout ")
-            .ok_or(SessionError::Corrupt("layout"))?,
-    )?;
-    let leaves = layout.leaf_ids();
-    let mut panes = Vec::new();
-    loop {
-        let line = parser.next()?;
-        if line == "end-workspace" {
-            break;
-        }
-        let pane = parse_pane(parser, line, &layout, version)?;
-        // CW-16: the layout S-expression carries identity plus geometry
-        // only; the v2 mode token stamps the restored leaf so the live
-        // tree keeps the requested display mode (the solver ignores it,
-        // transitions stay gated by `can_transition`).
-        if let Some(leaf) = layout.find_leaf_mut(pane.view) {
-            leaf.set_presentation(pane.mode);
-        }
-        panes.push(pane);
-        *total_panes += 1;
-        if *total_panes > MAX_SESSION_PANES_TOTAL {
-            return Err(SessionError::Corrupt("too many panes"));
-        }
-    }
-    if panes.len() != leaves.len() {
-        return Err(SessionError::Corrupt("pane coverage"));
-    }
-    Ok(WorkspaceSnapshot {
-        seq,
-        name,
-        layout,
-        focus,
-        panes,
-    })
-}
-
-/// Parses one `pane ... end-pane` block; `head` is the already-read header.
-///
-/// v1 headers carry five fields (`pane <id> <cols> <rows> <k> <cwd:0|1>`)
-/// and migrate with an unspecified attachment, the terminal route, and a
-/// tiled mode. v2 headers append `<attach> <route> <mode>`; the token
-/// count is exact per version so a v2 record can never hide inside a v1
-/// file (or vice versa).
-fn parse_pane(
-    parser: &mut SessionParser<'_>,
-    head: &str,
-    layout: &LayoutNode,
-    version: u32,
-) -> Result<PaneSnapshot, SessionError> {
-    let head = head
-        .strip_prefix("pane ")
-        .ok_or(SessionError::Corrupt("pane"))?;
-    let parts: Vec<&str> = head.split(' ').collect();
-    let (id_raw, cols_raw, rows_raw, count_raw, cwd_raw, attach, route, mode) = match version {
-        1 => {
-            let [id_raw, cols_raw, rows_raw, count_raw, cwd_raw] = parts.as_slice() else {
-                return Err(SessionError::Corrupt("pane"));
-            };
-            (
-                *id_raw,
-                *cols_raw,
-                *rows_raw,
-                *count_raw,
-                *cwd_raw,
-                None,
-                PaneRoute::Terminal,
-                PresentationMode::Tiled,
-            )
-        }
-        _ => {
-            let [
-                id_raw,
-                cols_raw,
-                rows_raw,
-                count_raw,
-                cwd_raw,
-                attach_raw,
-                route_raw,
-                mode_raw,
-            ] = parts.as_slice()
-            else {
-                return Err(SessionError::Corrupt("pane"));
-            };
-            (
-                *id_raw,
-                *cols_raw,
-                *rows_raw,
-                *count_raw,
-                *cwd_raw,
-                Some(PaneAttachment::parse(attach_raw).ok_or(SessionError::Corrupt("attach"))?),
-                PaneRoute::parse(route_raw).ok_or(SessionError::Corrupt("route"))?,
-                PresentationMode::parse(mode_raw).ok_or(SessionError::Corrupt("mode"))?,
-            )
-        }
-    };
-    let id: u64 = id_raw
-        .parse()
-        .map_err(|_| SessionError::Corrupt("pane id"))?;
-    let cols: usize = cols_raw
-        .parse()
-        .map_err(|_| SessionError::Corrupt("pane dims"))?;
-    let rows: usize = rows_raw
-        .parse()
-        .map_err(|_| SessionError::Corrupt("pane dims"))?;
-    if !(1..=MAX_SESSION_GRID_DIM).contains(&cols) || !(1..=MAX_SESSION_GRID_DIM).contains(&rows) {
-        return Err(SessionError::Corrupt("pane dims range"));
-    }
-    let view = ViewId::new(id);
-    let leaf = layout
-        .find_leaf(view)
-        .ok_or(SessionError::Corrupt("pane coverage"))?;
-    if usize::from(leaf.cols()) != cols || usize::from(leaf.rows()) != rows {
-        return Err(SessionError::Corrupt("pane dims mismatch"));
-    }
-    let count: usize = count_raw
-        .parse()
-        .map_err(|_| SessionError::Corrupt("pane lines"))?;
-    if count > MAX_SESSION_SCROLLBACK_LINES_PER_PANE {
-        return Err(SessionError::Corrupt("scrollback bound"));
-    }
-    let cwd = match cwd_raw {
-        "0" => None,
-        "1" => {
-            let raw = parser.next()?;
-            let decoded = unescape_field(raw)?;
-            if decoded.len() > MAX_SESSION_CWD_BYTES {
-                return Err(SessionError::Corrupt("cwd bound"));
-            }
-            Some(decoded)
-        }
-        _ => return Err(SessionError::Corrupt("pane")),
-    };
-    let mut scrollback = Vec::with_capacity(count);
-    for _ in 0..count {
-        let raw = parser.next()?;
-        let decoded = unescape_field(raw)?;
-        if decoded.len() > MAX_SESSION_LINE_TEXT_BYTES {
-            return Err(SessionError::Corrupt("scrollback line bound"));
-        }
-        scrollback.push(decoded);
-    }
-    parser.expect("end-pane")?;
-    Ok(PaneSnapshot {
-        view,
-        cwd,
-        scrollback,
-        attach,
-        route,
-        mode,
-    })
-}
-
-// ---------------------------------------------------------------------------
 // Scrollback text projection (capture side; restore via State API)
 // ---------------------------------------------------------------------------
 
@@ -1374,140 +761,11 @@ fn strip_overlays(node: &LayoutNode) -> LayoutNode {
 }
 
 // ---------------------------------------------------------------------------
-// Atomic file I/O (write-temp + fsync + rename; temps never read)
-// ---------------------------------------------------------------------------
-
-/// Temp sibling for an atomic save (`<file>.tmp.<pid>`).
-fn temp_sibling_for(path: &Path) -> PathBuf {
-    let name = path.file_name().map_or_else(
-        || SESSION_FILE_NAME.into(),
-        |n| n.to_string_lossy().into_owned(),
-    );
-    path.with_file_name(format!("{name}.tmp.{}", std::process::id()))
-}
-
-/// Removes stale `<file>.tmp.*` siblings best-effort (crashed-save litter).
-fn clean_temp_siblings(path: &Path) {
-    let Some(parent) = path.parent() else { return };
-    let prefix = path.file_name().map_or_else(
-        || SESSION_FILE_NAME.into(),
-        |n| format!("{}.tmp.", n.to_string_lossy()),
-    );
-    let Ok(entries) = std::fs::read_dir(parent) else {
-        return;
-    };
-    for entry in entries.filter_map(|e| e.ok()) {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with(&prefix) {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
-}
-
-fn io_error(context: &'static str, err: std::io::Error) -> SessionError {
-    SessionError::Io(format!("{context}: {err}"))
-}
-
-/// Writes `bytes` atomically to `path` (temp + fsync + rename + 0600).
-///
-/// P2-1: the temp file is `0600` from the first byte — create-time mode
-/// plus an immediate pre-write chmod — so the single `sync_all` covers
-/// data and mode together and no crash window exposes the secret-capable
-/// file at `0644`. A mode failure aborts the save.
-fn save_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), SessionError> {
-    if bytes.len() > MAX_SESSION_FILE_BYTES {
-        return Err(SessionError::TooLarge {
-            what: "session file",
-            actual: bytes.len(),
-            limit: MAX_SESSION_FILE_BYTES,
-        });
-    }
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).map_err(|e| io_error("create session dir", e))?;
-        }
-    }
-    // P3-3: sweep crashed-save litter BEFORE writing, never after the
-    // rename — a post-rename sweep would delete a concurrent saver's live
-    // temp sibling in another process.
-    clean_temp_siblings(path);
-    let temp = temp_sibling_for(path);
-    let _ = std::fs::remove_file(&temp);
-    let write_result = (|| -> Result<(), std::io::Error> {
-        use std::io::Write as _;
-        #[cfg(unix)]
-        let mut file = {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&temp)?
-        };
-        #[cfg(not(unix))]
-        let mut file = std::fs::File::create(&temp)?;
-        #[cfg(unix)]
-        {
-            // Defense in depth: the mode is already 0600 from create;
-            // re-assert before the first byte so the sync below covers both.
-            use std::os::unix::fs::PermissionsExt as _;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&temp, path)?;
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                if let Ok(dir) = std::fs::File::open(parent) {
-                    let _ = dir.sync_all();
-                }
-            }
-        }
-        Ok(())
-    })();
-    if let Err(err) = write_result {
-        let _ = std::fs::remove_file(&temp);
-        return Err(io_error("write session file", err));
-    }
-    Ok(())
-}
-
-/// Reads a session file with a hard size cap (missing → [`SessionError::NotFound`]).
-///
-/// P3-4: a `symlink_metadata` pre-check avoids an unbounded allocation
-/// against a hostile file; the post-read length check stays as the TOCTOU
-/// backstop (the file may grow between the check and the read).
-fn load_bytes_capped(path: &Path) -> Result<Vec<u8>, SessionError> {
-    if let Ok(meta) = std::fs::symlink_metadata(path) {
-        if meta.len() > MAX_SESSION_FILE_BYTES as u64 {
-            return Err(SessionError::TooLarge {
-                what: "session file",
-                actual: usize::try_from(meta.len()).unwrap_or(usize::MAX),
-                limit: MAX_SESSION_FILE_BYTES,
-            });
-        }
-    }
-    let bytes = std::fs::read(path).map_err(|err| {
-        if err.kind() == std::io::ErrorKind::NotFound {
-            SessionError::NotFound
-        } else {
-            io_error("read session file", err)
-        }
-    })?;
-    if bytes.len() > MAX_SESSION_FILE_BYTES {
-        return Err(SessionError::TooLarge {
-            what: "session file",
-            actual: bytes.len(),
-            limit: MAX_SESSION_FILE_BYTES,
-        });
-    }
-    Ok(bytes)
-}
-
-// ---------------------------------------------------------------------------
 // Runtime integration (capture / apply / startup / exit)
+//
+// Durable byte mechanics (codec, atomic commit, capped load, path
+// resolution) live behind the injected [`SessionFileBackend`]; every method
+// below validates in Core before any backend call and fails closed.
 // ---------------------------------------------------------------------------
 
 /// Maps a session-load result to a startup outcome (pure, for tests).
@@ -1850,11 +1108,31 @@ impl Runtime {
         }
     }
 
-    /// Captures, encodes, and atomically persists the session to `path`.
+    /// Installs (or clears with `None`) the durable-commit backend.
+    ///
+    /// The application wiring injects the storage-backed implementation at
+    /// startup; tests inject a stub or leave it absent to prove fail-closed
+    /// behavior. With no backend every durable path fails closed (saves
+    /// report a content-free error, loads behave as a missing file) and the
+    /// previous on-disk state is untouched.
+    pub fn set_session_backend(&mut self, backend: Option<Arc<dyn SessionFileBackend>>) {
+        self.session_backend = backend;
+    }
+
+    /// Captures, validates, encodes, and atomically persists the session.
+    ///
+    /// Core validation runs before any backend call, so an invalid snapshot
+    /// never reaches the filesystem; the backend enforces the byte ceilings
+    /// again on the way through.
     pub fn save_session_to_path(&self, path: &Path) -> Result<SessionSaveSummary, SessionError> {
+        let backend = self
+            .session_backend
+            .clone()
+            .ok_or_else(|| SessionError::Io(String::from("no session backend")))?;
         let snap = self.capture_session_snapshot();
-        let bytes = encode_session(&snap)?;
-        save_bytes_atomic(path, &bytes)?;
+        validate_snapshot(&snap)?;
+        let bytes = backend.encode_snapshot(&snap)?;
+        backend.commit_session_bytes(path, &bytes)?;
         Ok(SessionSaveSummary {
             workspaces: snap.workspaces.len(),
             panes: snap.workspaces.iter().map(|ws| ws.panes.len()).sum(),
@@ -1868,28 +1146,42 @@ impl Runtime {
     }
 
     /// Atomically persists the session to the default XDG state path.
+    ///
+    /// With no backend injected (or no usable state root) this resolves to
+    /// [`SessionError::NoStateDir`]: no durable store is configured, so there
+    /// is nothing to write and the previous state stays intact.
     pub fn save_session_to_default_path(&self) -> Result<SessionSaveSummary, SessionError> {
-        let path = session_file().ok_or(SessionError::NoStateDir)?;
+        let path = self
+            .session_backend
+            .clone()
+            .and_then(|backend| backend.session_file())
+            .ok_or(SessionError::NoStateDir)?;
         self.save_session_to_path(&path)
     }
 
     /// Loads, decodes, and applies the session at `path` (fail-closed: any
     /// error leaves the runtime untouched).
+    ///
+    /// With no backend injected this behaves as a missing file (quiet clean
+    /// start); the whole snapshot is validated again by
+    /// [`Runtime::apply_session_snapshot`] before any mutation.
     pub fn load_session_from_path(
         &mut self,
         path: &Path,
     ) -> Result<SessionRestoreSummary, SessionError> {
-        let bytes = load_bytes_capped(path)?;
-        let snap = decode_session(&bytes)?;
+        let backend = self.session_backend.clone().ok_or(SessionError::NotFound)?;
+        let bytes = backend.load_session_bytes(path)?;
+        let snap = backend.decode_snapshot(&bytes)?;
         self.apply_session_snapshot(&snap)
     }
 
     /// Startup restore with injected environment roots (hermetic twin for
     /// tests; production uses [`Runtime::restore_session_on_startup`]).
     ///
-    /// `safe_mode` short-circuits before any filesystem access: recovery
-    /// startup never reads session state. A missing file is a quiet clean
-    /// start ([`SessionStartupOutcome::Fresh`]); any other failure keeps
+    /// `safe_mode` short-circuits before any filesystem or backend access:
+    /// recovery startup never reads session state. A missing backend, a
+    /// missing state root, or a missing file is a quiet clean start
+    /// ([`SessionStartupOutcome::Fresh`]); any other failure keeps
     /// the clean runtime and reports a content-free warning.
     pub fn restore_session_on_startup_with_env(
         &mut self,
@@ -1900,7 +1192,11 @@ impl Runtime {
         if safe_mode {
             return SessionStartupOutcome::SkippedSafeMode;
         }
-        let Some(path) = session_file_for(xdg_state_home, home) else {
+        let Some(path) = self
+            .session_backend
+            .clone()
+            .and_then(|backend| backend.session_file_for(xdg_state_home, home))
+        else {
             return SessionStartupOutcome::Fresh;
         };
         if !path.exists() {
@@ -1936,36 +1232,76 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitty_ui::SplitAxis;
+    use std::sync::{Arc, Mutex};
+
+    /// Recording stub: proves Core validates before any backend call.
+    #[derive(Debug, Default)]
+    struct RecordingBackend {
+        calls: Mutex<Vec<&'static str>>,
+    }
+
+    impl SessionFileBackend for RecordingBackend {
+        fn encode_snapshot(&self, _snap: &SessionSnapshot) -> Result<Vec<u8>, SessionError> {
+            self.calls.lock().expect("stub lock").push("encode");
+            Ok(Vec::new())
+        }
+
+        fn decode_snapshot(&self, _bytes: &[u8]) -> Result<SessionSnapshot, SessionError> {
+            self.calls.lock().expect("stub lock").push("decode");
+            Err(SessionError::Corrupt("stub"))
+        }
+
+        fn commit_session_bytes(&self, _path: &Path, _bytes: &[u8]) -> Result<(), SessionError> {
+            self.calls.lock().expect("stub lock").push("commit");
+            Ok(())
+        }
+
+        fn load_session_bytes(&self, _path: &Path) -> Result<Vec<u8>, SessionError> {
+            self.calls.lock().expect("stub lock").push("load");
+            Err(SessionError::NotFound)
+        }
+
+        fn session_file_for(
+            &self,
+            _xdg_state_home: Option<&str>,
+            _home: Option<&str>,
+        ) -> Option<PathBuf> {
+            self.calls.lock().expect("stub lock").push("paths");
+            None
+        }
+
+        fn session_file(&self) -> Option<PathBuf> {
+            self.calls.lock().expect("stub lock").push("paths");
+            None
+        }
+    }
+
+    #[test]
+    fn save_validates_before_touching_backend() {
+        let backend = Arc::new(RecordingBackend::default());
+        let mut rt = Runtime::with_defaults().expect("defaults build");
+        // Reach an invalid snapshot only through module-visible state: no
+        // public API can empty the workspace list, so any production capture
+        // is valid and this path exercises the fail-closed order, never a
+        // reachable state.
+        rt.workspaces.clear();
+        rt.set_session_backend(Some(backend.clone()));
+        let err = rt
+            .save_session_to_path(Path::new("/tmp/should-never-be-touched"))
+            .expect_err("empty workspace list must fail validation");
+        assert!(
+            matches!(err, SessionError::Corrupt(_)),
+            "validation rejects before the backend: {err}"
+        );
+        assert!(
+            backend.calls.lock().expect("stub lock").is_empty(),
+            "no backend call may precede validation"
+        );
+    }
 
     fn leaf(id: u64) -> LayoutNode {
         LayoutNode::leaf(View::new(ViewId::new(id), 80, 24))
-    }
-
-    #[test]
-    fn field_escaping_round_trips_backslash_and_newline() {
-        for raw in [
-            "plain",
-            "back\\slash",
-            "line\nbreak",
-            "cr\rhere",
-            "  spaces  ",
-        ] {
-            assert_eq!(unescape_field(&escape_field(raw)).unwrap(), raw);
-        }
-        assert!(unescape_field("dangling\\").is_err());
-        assert!(unescape_field("bad\\escape").is_err());
-    }
-
-    #[test]
-    fn layout_codec_round_trips_split_and_stack() {
-        let tree = LayoutNode::split(
-            SplitAxis::Vertical,
-            0.3,
-            LayoutNode::stack(vec![leaf(1), leaf(2)]),
-            leaf(3),
-        );
-        let back = decode_layout(&encode_layout(&tree)).expect("decode own encoding");
-        assert_eq!(tree, back);
     }
 
     #[test]
@@ -1993,15 +1329,6 @@ mod tests {
             panic!("leaf must stay a leaf");
         };
         assert_eq!(kept.presentation(), PresentationMode::Floating);
-    }
-
-    #[test]
-    fn layout_decode_rejects_unknown_nodes_and_trailing_tokens() {
-        assert!(decode_layout("(leaf 1 80 24) (leaf 2 80 24)").is_err());
-        assert!(decode_layout("(workspace 1 80 24)").is_err());
-        assert!(decode_layout("(leaf 1 0 24)").is_err());
-        assert!(decode_layout("(split x 1 (leaf 1 80 24) (leaf 2 80 24))").is_err());
-        assert!(decode_layout("").is_err());
     }
 
     #[test]
@@ -2176,100 +1503,6 @@ mod tests {
         assert_eq!(PaneRoute::parse("terminal"), Some(PaneRoute::Terminal));
         assert_eq!(PaneRoute::parse("panel"), None);
         assert_eq!(PaneRoute::parse(""), None);
-    }
-
-    #[test]
-    fn v2_encode_decode_preserves_attach_route_mode() {
-        let snap = two_pane_snapshot(Some(PaneAttachment::Primary));
-        let bytes = encode_session(&snap).expect("v2 snapshot encodes");
-        assert!(
-            bytes.starts_with(b"bitty-session v2\n"),
-            "encoder writes the v2 magic"
-        );
-        let back = decode_session(&bytes).expect("decode own v2 encoding");
-        assert_eq!(snap, back, "v2 round trip must preserve everything");
-        assert_eq!(
-            back.workspaces[0].layout.leaf_ids(),
-            vec![ViewId::new(1), ViewId::new(2)]
-        );
-        let mode = back.workspaces[0]
-            .layout
-            .find_leaf(ViewId::new(1))
-            .expect("leaf present")
-            .presentation();
-        assert_eq!(mode, PresentationMode::Floating);
-    }
-
-    #[test]
-    fn v1_file_migrates_with_legacy_defaults() {
-        let raw = concat!(
-            "bitty-session v1\n",
-            "workspaces 1 active 0 mru 0\n",
-            "workspace 1 7\n",
-            "name ws1\n",
-            "layout (leaf 7 80 24)\n",
-            "pane 7 80 24 1 0\n",
-            "migrated line\n",
-            "end-pane\n",
-            "end-workspace\n",
-            "end-session\n",
-        );
-        let snap = decode_session(raw.as_bytes()).expect("v1 must migrate");
-        assert_eq!(snap.version, SESSION_FORMAT_VERSION);
-        let pane = &snap.workspaces[0].panes[0];
-        assert_eq!(pane.attach, None, "v1 carries no attachment record");
-        assert_eq!(pane.route, PaneRoute::Terminal);
-        assert_eq!(pane.mode, PresentationMode::Tiled);
-        assert_eq!(pane.scrollback, vec!["migrated line".to_string()]);
-        // The migrated snapshot re-encodes as v2 and decodes back.
-        let bytes = encode_session(&snap).expect("migrated snapshot encodes");
-        assert!(bytes.starts_with(b"bitty-session v2\n"));
-        let back = decode_session(&bytes).expect("v2 re-decode works");
-        assert_eq!(
-            back.workspaces[0].panes[0].attach,
-            Some(PaneAttachment::Primary),
-            "unspecified attachment resolves through the startup-owner derivation"
-        );
-    }
-
-    #[test]
-    fn v1_record_cannot_hide_v2_tokens() {
-        // An 8-token pane header in a v1 file is corrupt (exact token
-        // count per version), not a silent upgrade.
-        let raw = concat!(
-            "bitty-session v1\n",
-            "workspaces 1 active 0 mru 0\n",
-            "workspace 1 7\n",
-            "name ws1\n",
-            "layout (leaf 7 80 24)\n",
-            "pane 7 80 24 0 0 primary terminal tiled\n",
-            "end-pane\n",
-            "end-workspace\n",
-            "end-session\n",
-        );
-        assert!(decode_session(raw.as_bytes()).is_err());
-    }
-
-    #[test]
-    fn v2_rejects_unknown_attach_route_mode() {
-        let pane_with = |header: &str| {
-            format!(
-                "bitty-session v2\nworkspaces 1 active 0 mru 0\nworkspace 1 7\nname ws1\nlayout (leaf 7 80 24)\n{header}\nend-pane\nend-workspace\nend-session\n"
-            )
-        };
-        for (label, header) in [
-            ("attach", "pane 7 80 24 0 0 floating terminal tiled"),
-            ("route", "pane 7 80 24 0 0 session panel tiled"),
-            ("mode", "pane 7 80 24 0 0 session terminal zoomed"),
-            ("short", "pane 7 80 24 0 0"),
-        ] {
-            let err = decode_session(pane_with(header).as_bytes())
-                .expect_err(&format!("bad {label} must fail"));
-            assert!(
-                !format!("{err}").contains("ws1"),
-                "errors must never echo session contents"
-            );
-        }
     }
 
     #[test]

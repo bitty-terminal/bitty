@@ -220,6 +220,7 @@
 #![forbid(unsafe_code)]
 
 use std::rc::Rc;
+use std::sync::Arc;
 
 use bitty_platform::{App, PlatformError};
 use bitty_runtime::Runtime;
@@ -241,6 +242,7 @@ mod layout_cmd;
 mod logging;
 mod observability;
 mod plugin_runtime;
+mod storage_backends;
 mod version;
 
 mod list;
@@ -674,6 +676,13 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // CTX-0939 (W-146): install the storage-backed durable-commit backend
+    // before any save/restore path runs. Core owns validation and gates;
+    // this wiring owns the byte mechanics (one-way dependency: the
+    // extension crate is named only here, never in Core library code).
+    runtime.set_session_backend(Some(Arc::new(
+        storage_backends::StorageSessionBackend::new(),
+    )));
     // CTX-0754 (issue #1361): OS delivery for bells/notifications is an
     // embedder capability, fail-closed by default (no sink: counted, silent).
     // Real runs install the best-effort OS sinks; headless/test-mode runs
@@ -1061,5 +1070,7 @@ pub(crate) fn spawn_startup_shells(
     }
 }
 
+#[cfg(test)]
+mod session_storage_tests;
 #[cfg(test)]
 mod tests;

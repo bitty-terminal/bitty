@@ -1,23 +1,32 @@
-//! CTX-0393: session save/restore — atomic persistence, bounded restore,
+//! CTX-0393 / CTX-0939 (W-146): session save/restore parity through the
+//! injected storage backend — atomic persistence, bounded restore,
 //! fail-closed fallback, safe-mode skip.
 //!
-//! TDD red slice: exercises the planned `bitty_runtime::runtime::session`
-//! API (capture/encode/decode/apply, atomic file save, XDG state helpers).
-//! These tests fail closed (clean start, warning, never panic) on corrupt or
-//! oversize input and never log session contents.
+//! Moved from `bitty-runtime/tests/session_save_restore.rs` when the file
+//! codec, atomic commit, and path mechanics moved to `bitty-storage`: every
+//! test here installs the real storage-backed seam
+//! ([`StorageSessionBackend`]) and proves the integrated path preserves the
+//! accepted behavior byte-for-byte. These tests fail closed (clean start,
+//! warning, never panic) on corrupt or oversize input and never log session
+//! contents.
 
 #![forbid(unsafe_code)]
 
 use std::path::PathBuf;
+use std::sync::Arc;
 #[cfg(unix)]
 use std::time::Duration;
 
 use bitty_runtime::runtime::session::{
     MAX_SESSION_CWD_BYTES, MAX_SESSION_FILE_BYTES, MAX_SESSION_SCROLLBACK_LINES_PER_PANE,
     PaneAttachment, PaneRoute, PaneSnapshot, SESSION_FORMAT_VERSION, SessionError, SessionSnapshot,
-    WorkspaceSnapshot, decode_session, encode_session, session_file_for, state_home_for,
+    WorkspaceSnapshot,
 };
-use bitty_runtime::{Focus, LayoutNode, PresentationMode, Runtime, SplitAxis, View, ViewId};
+use bitty_runtime::{
+    Focus, LayoutNode, PresentationMode, Runtime, SessionFileBackend, SplitAxis, View, ViewId,
+};
+
+use crate::storage_backends::StorageSessionBackend;
 
 /// Unique scratch dir per test (parallel-safe: pid + tag).
 fn scratch_dir(tag: &str) -> PathBuf {
@@ -36,6 +45,20 @@ fn feed_lines(rt: &mut Runtime, lines: usize) {
     for i in 0..lines {
         rt.handle_pty_bytes(format!("line {i:03}\r\n").as_bytes());
     }
+}
+
+/// Storage-backed seam for every test in this module (backend-present
+/// configuration): the real `bitty-storage` mechanics behind the Core-owned
+/// trait.
+fn backend() -> StorageSessionBackend {
+    StorageSessionBackend::new()
+}
+
+/// Runtime with the storage backend installed (backend-present).
+fn present_runtime() -> Runtime {
+    let mut rt = Runtime::with_defaults().expect("defaults build");
+    rt.set_session_backend(Some(Arc::new(backend())));
+    rt
 }
 
 /// One-leaf workspace snapshot carrying a captured cwd (hermetic, no PTY).
@@ -65,7 +88,7 @@ fn single_leaf_snapshot(id: u64, cwd: Option<String>, history: &str) -> SessionS
 
 #[test]
 fn snapshot_encode_decode_round_trip_preserves_layout_scrollback_cwd() {
-    let mut rt = Runtime::with_defaults().expect("defaults build");
+    let mut rt = present_runtime();
     feed_lines(&mut rt, 40);
     assert!(rt.state().scrollback_len() > 0, "must have scrollback");
     rt.handle_pty_bytes(b"\x1b]7;file:///tmp\x1b\\");
@@ -81,15 +104,19 @@ fn snapshot_encode_decode_round_trip_preserves_layout_scrollback_cwd() {
     rt.focus_mut().set(ViewId::new(2));
 
     let snap = rt.capture_session_snapshot();
-    let bytes = encode_session(&snap).expect("encode bounded snapshot");
+    let bytes = backend()
+        .encode_snapshot(&snap)
+        .expect("encode bounded snapshot");
     assert!(bytes.len() <= MAX_SESSION_FILE_BYTES);
-    let back = decode_session(&bytes).expect("decode own encoding");
+    let back = backend()
+        .decode_snapshot(&bytes)
+        .expect("decode own encoding");
     assert_eq!(snap, back, "round trip must preserve everything");
 }
 
 #[test]
 fn apply_restores_layout_focus_and_primary_scrollback() {
-    let mut rt = Runtime::with_defaults().expect("defaults build");
+    let mut rt = present_runtime();
     feed_lines(&mut rt, 30);
     let before: Vec<String> = rt
         .state()
@@ -107,10 +134,10 @@ fn apply_restores_layout_focus_and_primary_scrollback() {
     assert!(!before.is_empty());
 
     let snap = rt.capture_session_snapshot();
-    let bytes = encode_session(&snap).expect("encode");
-    let back = decode_session(&bytes).expect("decode");
+    let bytes = backend().encode_snapshot(&snap).expect("encode");
+    let back = backend().decode_snapshot(&bytes).expect("decode");
 
-    let mut fresh = Runtime::with_defaults().expect("defaults build");
+    let mut fresh = present_runtime();
     let summary = fresh.apply_session_snapshot(&back).expect("apply valid");
     assert_eq!(summary.workspaces, 1);
     assert_eq!(fresh.layout().leaf_ids(), vec![ViewId::new(1)]);
@@ -141,7 +168,7 @@ fn corrupt_file_falls_back_to_clean_start() {
     std::fs::create_dir_all(&dir).expect("scratch dir");
     std::fs::write(&path, b"definitely not a session file\xff\xfe\n").expect("write garbage");
 
-    let mut rt = Runtime::with_defaults().expect("defaults build");
+    let mut rt = present_runtime();
     let before = rt.layout().clone();
     let err = rt
         .load_session_from_path(&path)
@@ -159,29 +186,43 @@ fn corrupt_file_falls_back_to_clean_start() {
 }
 
 #[test]
-fn partial_temp_write_is_ignored_and_save_cleans_temp() {
+fn partial_temp_write_is_ignored_and_save_sweeps_only_stale_temp() {
     let dir = scratch_dir("atomic");
     let path = dir.join("session");
-    let mut rt = Runtime::with_defaults().expect("defaults build");
+    let mut rt = present_runtime();
     feed_lines(&mut rt, 10);
     rt.save_session_to_path(&path).expect("save works");
 
     // Simulate a crashed save: temp file present, final untouched.
-    std::fs::write(dir.join("session.tmp.12345"), b"partial garbage").expect("temp write");
-    let mut loaded = Runtime::with_defaults().expect("defaults build");
+    let litter = dir.join("session.tmp.12345");
+    std::fs::write(&litter, b"partial garbage").expect("temp write");
+    let mut loaded = present_runtime();
     loaded
         .load_session_from_path(&path)
         .expect("temp files must be ignored");
 
-    // No temp files may survive a save.
+    // W-146 sweep rule (CTX-0003): the pre-write sweep is age-gated, so a
+    // fresh temp — possibly a concurrent saver's live file — is never
+    // deleted. Only crashed-save litter older than the stale age is swept.
+    rt.save_session_to_path(&path).expect("re-save works");
+    assert!(litter.exists(), "fresh temp must survive the sweep");
+
+    // Age the litter past the stale horizon: the next save sweeps it.
+    let aged = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+    std::fs::File::options()
+        .write(true)
+        .open(&litter)
+        .expect("open litter")
+        .set_modified(aged)
+        .expect("age litter");
     rt.save_session_to_path(&path).expect("re-save works");
     let leftovers: Vec<_> = std::fs::read_dir(&dir)
         .expect("read dir")
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.contains(".tmp."))
+        .filter(|n| n.contains(".tmp.") || n.contains(".tmp-"))
         .collect();
-    assert!(leftovers.is_empty(), "save must clean temp files");
+    assert!(leftovers.is_empty(), "save must sweep stale temp files");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -189,8 +230,10 @@ fn partial_temp_write_is_ignored_and_save_cleans_temp() {
 fn safe_mode_never_reads_session_state() {
     let dir = scratch_dir("safe");
     let dir_str = dir.to_string_lossy().into_owned();
-    let path = session_file_for(Some(dir_str.as_str()), None).expect("path resolves");
-    let mut rt = Runtime::with_defaults().expect("defaults build");
+    let path = backend()
+        .session_file_for(Some(dir_str.as_str()), None)
+        .expect("path resolves");
+    let mut rt = present_runtime();
     feed_lines(&mut rt, 10);
     rt.save_session_to_path(&path).expect("save works");
 
@@ -201,10 +244,12 @@ fn safe_mode_never_reads_session_state() {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod");
     }
     // Point the default-path lookup at the scratch dir via XDG env injection.
-    let probed = session_file_for(Some(dir_str.as_str()), None).expect("path resolves");
+    let probed = backend()
+        .session_file_for(Some(dir_str.as_str()), None)
+        .expect("path resolves");
     assert_eq!(probed, path);
 
-    let mut fresh = Runtime::with_defaults().expect("defaults build");
+    let mut fresh = present_runtime();
     let outcome = fresh.restore_session_on_startup_with_env(true, Some(dir_str.as_str()), None);
     assert!(
         matches!(
@@ -230,7 +275,7 @@ fn oversize_file_is_rejected_fail_closed() {
     let big = vec![b'x'; MAX_SESSION_FILE_BYTES + 1];
     std::fs::write(&path, &big).expect("write big");
 
-    let mut rt = Runtime::with_defaults().expect("defaults build");
+    let mut rt = present_runtime();
     let before = rt.layout().clone();
     let err = rt
         .load_session_from_path(&path)
@@ -259,7 +304,9 @@ fn pane_scrollback_beyond_cap_is_rejected_on_decode() {
         raw.push_str(&format!("overflow line {i}\n"));
     }
     raw.push_str("end-pane\nend-workspace\nend-session\n");
-    let err = decode_session(raw.as_bytes()).expect_err("over-cap lines must fail");
+    let err = backend()
+        .decode_snapshot(raw.as_bytes())
+        .expect_err("over-cap lines must fail");
     assert!(
         !format!("{err}").contains("overflow"),
         "errors must never echo session contents"
@@ -270,20 +317,27 @@ fn pane_scrollback_beyond_cap_is_rejected_on_decode() {
 fn xdg_state_helpers_derive_session_paths_without_hardcoded_hosts() {
     // Explicit XDG root wins.
     assert_eq!(
-        state_home_for(Some("/tmp/xdg-state"), Some("/home/user")),
-        Some(PathBuf::from("/tmp/xdg-state"))
+        backend().session_file_for(Some("/example/xdg-state"), Some("/example/place/home-dir")),
+        Some(PathBuf::from("/example/xdg-state/bitty/sessions/session"))
     );
     // Empty XDG falls back to HOME (XDG base-dir spec).
     assert_eq!(
-        state_home_for(Some("  "), Some("/home/user")),
-        Some(PathBuf::from("/home/user/.local/state"))
+        backend().session_file_for(Some("  "), Some("/example/place/home-dir")),
+        Some(PathBuf::from(
+            "/example/place/home-dir/.local/state/bitty/sessions/session"
+        ))
     );
     // Nothing usable yields None (fail-closed, no panic).
-    assert_eq!(state_home_for(None, None), None);
-    assert_eq!(state_home_for(Some(""), Some(" ")), None);
+    assert_eq!(backend().session_file_for(None, None), None);
+    assert_eq!(backend().session_file_for(Some(""), Some(" ")), None);
 
-    let file = session_file_for(Some("/tmp/xdg-state"), None).expect("file resolves");
-    assert_eq!(file, PathBuf::from("/tmp/xdg-state/bitty/sessions/session"));
+    let file = backend()
+        .session_file_for(Some("/example/xdg-state"), None)
+        .expect("file resolves");
+    assert_eq!(
+        file,
+        PathBuf::from("/example/xdg-state/bitty/sessions/session")
+    );
 }
 
 /// P2-1: the secret-capable session file must be owner-only from the first
@@ -294,7 +348,7 @@ fn saved_file_is_created_mode_0600() {
     use std::os::unix::fs::PermissionsExt as _;
     let dir = scratch_dir("mode");
     let path = dir.join("session");
-    let rt = Runtime::with_defaults().expect("defaults build");
+    let rt = present_runtime();
     rt.save_session_to_path(&path).expect("save works");
     let mode = std::fs::metadata(&path)
         .expect("stat saved file")
@@ -326,7 +380,9 @@ fn duplicate_view_id_across_workspaces_is_rejected() {
         "end-workspace\n",
         "end-session\n",
     );
-    let err = decode_session(raw.as_bytes()).expect_err("duplicate pane must fail");
+    let err = backend()
+        .decode_snapshot(raw.as_bytes())
+        .expect_err("duplicate pane must fail");
     assert!(
         format!("{err}").contains("duplicate pane"),
         "unexpected error: {err}"
@@ -345,7 +401,9 @@ fn empty_stack_workspace_is_rejected() {
         "end-workspace\n",
         "end-session\n",
     );
-    let err = decode_session(raw.as_bytes()).expect_err("empty workspace must fail");
+    let err = backend()
+        .decode_snapshot(raw.as_bytes())
+        .expect_err("empty workspace must fail");
     assert!(
         format!("{err}").contains("empty workspace"),
         "unexpected error: {err}"
@@ -378,7 +436,9 @@ fn hostile_cwd_that_escapes_past_line_cap_fails_closed_pre_io() {
         active: 0,
         mru: vec![0],
     };
-    let err = encode_session(&snap).expect_err("hostile cwd must fail closed");
+    let err = backend()
+        .encode_snapshot(&snap)
+        .expect_err("hostile cwd must fail closed");
     assert!(
         matches!(
             err,
@@ -393,8 +453,12 @@ fn hostile_cwd_that_escapes_past_line_cap_fails_closed_pre_io() {
     // accepted output always decodes.
     let mut ok_snap = snap.clone();
     ok_snap.workspaces[0].panes[0].cwd = Some("a".repeat(MAX_SESSION_CWD_BYTES));
-    let bytes = encode_session(&ok_snap).expect("max raw cwd still encodes");
-    decode_session(&bytes).expect("encode output must always decode");
+    let bytes = backend()
+        .encode_snapshot(&ok_snap)
+        .expect("max raw cwd still encodes");
+    backend()
+        .decode_snapshot(&bytes)
+        .expect("encode output must always decode");
 }
 
 /// P3-7 companion: no file at all is a quiet clean start. The load-side
@@ -406,7 +470,7 @@ fn missing_session_file_is_quiet_fresh_start() {
     let dir = scratch_dir("missing");
     std::fs::create_dir_all(&dir).expect("scratch dir");
     let dir_str = dir.to_string_lossy().into_owned();
-    let mut rt = Runtime::with_defaults().expect("defaults build");
+    let mut rt = present_runtime();
     let outcome = rt.restore_session_on_startup_with_env(false, Some(dir_str.as_str()), None);
     assert!(
         matches!(
@@ -426,7 +490,7 @@ fn missing_session_file_is_quiet_fresh_start() {
 #[cfg(unix)]
 fn inactive_workspace_respawns_pending_panes_on_first_switch() {
     bitty_test_support::require_pty!();
-    let mut rt = Runtime::with_defaults().expect("defaults build");
+    let mut rt = present_runtime();
     rt.spawn_shell("/bin/sh")
         .expect("primary shell records recipe");
 
@@ -485,7 +549,7 @@ fn inactive_workspace_respawns_pending_panes_on_first_switch() {
 #[cfg(unix)]
 fn workspace_close_respawns_loaded_pending_panes_and_purges_removed() {
     bitty_test_support::require_pty!();
-    let mut rt = Runtime::with_defaults().expect("defaults build");
+    let mut rt = present_runtime();
     rt.spawn_shell("/bin/sh")
         .expect("primary shell records recipe");
 
@@ -574,7 +638,7 @@ fn workspace_close_respawns_loaded_pending_panes_and_purges_removed() {
 #[cfg(unix)]
 fn workspace_close_rehomes_primary_onto_pending_leaf_and_drains_restore() {
     bitty_test_support::require_pty!();
-    let mut rt = Runtime::with_defaults().expect("defaults build");
+    let mut rt = present_runtime();
     rt.spawn_shell("/bin/sh")
         .expect("primary shell records recipe");
 
@@ -660,7 +724,7 @@ fn primary_restore_spawns_with_captured_cwd() {
     let report = format!("file://{}", dir.display());
     let snap = single_leaf_snapshot(100, Some(report), "primary-history");
 
-    let mut rt = Runtime::with_defaults().expect("defaults build");
+    let mut rt = present_runtime();
     rt.apply_session_snapshot(&snap).expect("apply valid");
     // The lone leaf becomes the primary owner: its history hydrates straight
     // into the grid, so it has no pending-map entry — but the captured cwd
@@ -700,7 +764,7 @@ fn primary_restore_stale_cwd_falls_back_and_still_hydrates() {
     std::fs::remove_dir_all(&dir).expect("delete scratch dir");
     let snap = single_leaf_snapshot(100, Some(report), "stale-history");
 
-    let mut rt = Runtime::with_defaults().expect("defaults build");
+    let mut rt = present_runtime();
     rt.apply_session_snapshot(&snap).expect("apply valid");
     rt.spawn_shell_with_args("/bin/sh", &["-c", "pwd -P; exec sleep 30"])
         .expect("primary shell spawn");
@@ -735,14 +799,16 @@ fn future_version_is_rejected_before_any_mutation() {
         "end-workspace\n",
         "end-session\n",
     );
-    let err = decode_session(raw.as_bytes()).expect_err("v3 must be rejected");
+    let err = backend()
+        .decode_snapshot(raw.as_bytes())
+        .expect_err("v3 must be rejected");
     assert_eq!(err, SessionError::UnsupportedVersion(3));
 
     let dir = scratch_dir("version");
     std::fs::create_dir_all(&dir).expect("scratch dir");
     let path = dir.join("session");
     std::fs::write(&path, raw).expect("write v3 file");
-    let mut rt = Runtime::with_defaults().expect("defaults build");
+    let mut rt = present_runtime();
     let before = rt.layout().clone();
     let err = rt
         .load_session_from_path(&path)
@@ -767,11 +833,13 @@ fn failed_save_never_clobbers_last_good_session() {
     let good = dir.join("good-session");
     std::fs::create_dir_all(&dir).expect("scratch dir");
 
-    let mut rt = Runtime::with_defaults().expect("defaults build");
+    let mut rt = present_runtime();
     feed_lines(&mut rt, 12);
     rt.save_session_to_path(&good).expect("first save works");
     let first = std::fs::read(&good).expect("read good session");
-    let snap_first = decode_session(&first).expect("good session decodes");
+    let snap_first = backend()
+        .decode_snapshot(&first)
+        .expect("good session decodes");
 
     // A path whose rename target is an existing directory fails the atomic
     // rename after the temp write; the save must report the error and leave
@@ -793,7 +861,7 @@ fn failed_save_never_clobbers_last_good_session() {
         "failed save must not touch the last-good file"
     );
     assert_eq!(
-        decode_session(&after).expect("still decodes"),
+        backend().decode_snapshot(&after).expect("still decodes"),
         snap_first,
         "last-good snapshot must survive a failed save"
     );
@@ -820,13 +888,15 @@ fn failed_save_never_clobbers_last_good_session() {
 fn corrupt_store_at_startup_warns_and_starts_clean() {
     let dir = scratch_dir("startup-corrupt");
     let dir_str = dir.to_string_lossy().into_owned();
-    let path = session_file_for(Some(dir_str.as_str()), None).expect("path resolves");
+    let path = backend()
+        .session_file_for(Some(dir_str.as_str()), None)
+        .expect("path resolves");
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).expect("session dir");
     }
     std::fs::write(&path, b"\x00\x01not a session").expect("write garbage");
 
-    let mut rt = Runtime::with_defaults().expect("defaults build");
+    let mut rt = present_runtime();
     let before = rt.layout().clone();
     let outcome = rt.restore_session_on_startup_with_env(false, Some(dir_str.as_str()), None);
     match &outcome {
@@ -854,14 +924,17 @@ fn corrupt_store_at_startup_warns_and_starts_clean() {
 fn safe_mode_does_not_apply_a_valid_store() {
     let dir = scratch_dir("safe-valid");
     let dir_str = dir.to_string_lossy().into_owned();
-    let path = session_file_for(Some(dir_str.as_str()), None).expect("path resolves");
+    let path = backend()
+        .session_file_for(Some(dir_str.as_str()), None)
+        .expect("path resolves");
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).expect("session dir");
     }
     let snap = single_leaf_snapshot(4242, None, "must-not-restore");
-    std::fs::write(&path, encode_session(&snap).expect("encode")).expect("write valid store");
+    std::fs::write(&path, backend().encode_snapshot(&snap).expect("encode"))
+        .expect("write valid store");
 
-    let mut rt = Runtime::with_defaults().expect("defaults build");
+    let mut rt = present_runtime();
     let before_layout = rt.layout().leaf_ids();
     let outcome = rt.restore_session_on_startup_with_env(true, Some(dir_str.as_str()), None);
     assert!(
@@ -929,7 +1002,7 @@ fn wait_for_primary_text(rt: &mut Runtime, needle: &str) -> bool {
 #[cfg(unix)]
 fn capture_records_live_attachment_map() {
     bitty_test_support::require_pty!();
-    let mut rt = Runtime::with_defaults().expect("defaults build");
+    let mut rt = present_runtime();
     rt.set_layout(LayoutNode::split(
         SplitAxis::Vertical,
         0.5,
@@ -966,8 +1039,10 @@ fn capture_records_live_attachment_map() {
     }
 
     // The captured map round-trips through the v2 file byte-identically.
-    let bytes = encode_session(&snap).expect("capture encodes");
-    let back = decode_session(&bytes).expect("decode own encoding");
+    let bytes = backend().encode_snapshot(&snap).expect("capture encodes");
+    let back = backend()
+        .decode_snapshot(&bytes)
+        .expect("decode own encoding");
     assert_eq!(snap, back);
 }
 
@@ -978,7 +1053,7 @@ fn capture_records_live_attachment_map() {
 #[cfg(unix)]
 fn apply_rejects_snapshot_claiming_live_session() {
     bitty_test_support::require_pty!();
-    let mut rt = Runtime::with_defaults().expect("defaults build");
+    let mut rt = present_runtime();
     rt.set_layout(LayoutNode::split(
         SplitAxis::Vertical,
         0.5,
@@ -1062,11 +1137,13 @@ fn apply_routes_panes_by_recorded_attachment() {
         mru: vec![0, 1],
     };
     // Through the file: pins the v2 record end to end, not just structs.
-    let bytes = encode_session(&snap).expect("v2 snapshot encodes");
-    let back = decode_session(&bytes).expect("v2 file decodes");
+    let bytes = backend()
+        .encode_snapshot(&snap)
+        .expect("v2 snapshot encodes");
+    let back = backend().decode_snapshot(&bytes).expect("v2 file decodes");
     assert_eq!(snap, back);
 
-    let mut rt = Runtime::with_defaults().expect("defaults build");
+    let mut rt = present_runtime();
     assert!(!rt.session_restored());
     let summary = rt.apply_session_snapshot(&back).expect("apply valid");
     assert_eq!(summary.workspaces, 2);
@@ -1136,10 +1213,12 @@ fn recorded_primary_elsewhere_downgrades_to_pending() {
         active: 0,
         mru: vec![0],
     };
-    let bytes = encode_session(&snap).expect("v2 snapshot encodes");
-    let back = decode_session(&bytes).expect("v2 file decodes");
+    let bytes = backend()
+        .encode_snapshot(&snap)
+        .expect("v2 snapshot encodes");
+    let back = backend().decode_snapshot(&bytes).expect("v2 file decodes");
 
-    let mut rt = Runtime::with_defaults().expect("defaults build");
+    let mut rt = present_runtime();
     let summary = rt.apply_session_snapshot(&back).expect("apply valid");
     assert_eq!(summary.scrollback_lines, 0, "no grid write on downgrade");
     assert_eq!(summary.pending, 2, "both panes wait for fresh shells");
@@ -1176,15 +1255,17 @@ fn v2_modes_survive_file_round_trip_into_live_layout() {
         active: 0,
         mru: vec![0],
     };
-    let bytes = encode_session(&snap).expect("v2 snapshot encodes");
+    let bytes = backend()
+        .encode_snapshot(&snap)
+        .expect("v2 snapshot encodes");
     assert!(
         String::from_utf8_lossy(&bytes).contains("pane 7 80 24 1 0 primary terminal floating"),
         "v2 header carries attach, route, and mode tokens"
     );
-    let back = decode_session(&bytes).expect("v2 file decodes");
+    let back = backend().decode_snapshot(&bytes).expect("v2 file decodes");
     assert_eq!(back.workspaces[0].panes[0].mode, PresentationMode::Floating);
 
-    let mut rt = Runtime::with_defaults().expect("defaults build");
+    let mut rt = present_runtime();
     rt.apply_session_snapshot(&back).expect("apply valid");
     let mode = rt
         .layout()
@@ -1201,7 +1282,7 @@ fn v2_modes_survive_file_round_trip_into_live_layout() {
 #[cfg(unix)]
 fn detached_leaf_never_respawns_on_first_switch() {
     bitty_test_support::require_pty!();
-    let mut rt = Runtime::with_defaults().expect("defaults build");
+    let mut rt = present_runtime();
     rt.spawn_shell("/bin/sh")
         .expect("primary shell records recipe");
 

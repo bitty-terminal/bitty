@@ -20,6 +20,13 @@ path = "src/main.rs"
 [dependencies]
 bitty-config = { path = "../bitty-config" }
 bitty-ipc = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "e9714e7" }
+# CTX-0939 (W-146): the composition root owns the extracted storage
+# mechanics. This is the ONLY crate in the workspace that may depend on
+# `bitty-storage`: Core library crates consume persistence exclusively
+# through Core-owned traits (`SessionFileBackend`, `KvCommitBackend`), so
+# the dependency direction stays one-way (extension mechanics behind the
+# Core gate, never Core importing the extension).
+bitty-storage = { git = "https://github.com/bitty-terminal/bitty-storage", rev = "5e720b4" }
 # CTX-0918: developer-only PB-1/PB-4 tracing for `bitty dev trace`; opt-in
 # via the `dev-perf` feature so release builds do not link the perf harness.
 bitty-perf = { path = "../bitty-perf", optional = true }
@@ -43,4 +50,7 @@ dev-tools = []
 [dev-dependencies]
 # Hermetic `ServeContext` constructors and unbound bearer minters (#1519).
 bitty-ipc = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "e9714e7", features = ["test-support"] }
+# CTX-0939: storage-parity tests build plugin-store values through the same
+# `LuaValue` type Core validates; test-only, never linked into the binary.
+bitty-lua = { path = "../bitty-lua" }
 bitty-test-support = { path = "../bitty-test-support" }

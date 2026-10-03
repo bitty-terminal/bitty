@@ -46,6 +46,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Bounded storage seam (CTX-0939, #1622, W-146):** session and plugin-KV
+  durable-commit mechanics now live behind Core-owned traits
+  (`SessionFileBackend`, `KvCommitBackend`): Core keeps capture, restore
+  re-derivation, whole-snapshot validation, permission gates, budgets,
+  fencing, ceilings, and quota rules, and validates before any backend
+  call. The application wiring crate (`bitty-terminal`) is the only crate
+  linking the extracted `bitty-storage` mechanics (exact rev `5e720b4`),
+  injected at startup for session save/restore and plugin-store commits;
+  with no backend every durable path fails closed (clean start, previous
+  state intact, no panic). Session files and plugin `store.json` commits
+  stay atomic with user-only permissions; committed bytes are unchanged
+  (golden fixtures pin pre-rewire output). Follow-ups stay open: the
+  `validate_snapshot` attachment-counting edge (preserved as-is), and the
+  dated ADR-0004/ADR-0012 revision recording the new `bitty-storage` git
+  source (see `deny.toml`).
+
 - **Native component broker (CTX-0906, #1577, DIR-030):**
   `bitty_runtime::component` resolves `<data_home>/bitty/components/<name>/`
   (developer override `BITTY_COMPONENTS_DIR`, never `PATH`), validates

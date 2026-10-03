@@ -8,6 +8,8 @@
 //! suspend/resume/dispose and declaration violations. Headless and
 //! Windows-safe (temp dirs only, no processes or sockets).
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -15,8 +17,7 @@ use std::sync::Arc;
 use bitty_lua::LuaValue;
 use bitty_plugin_host::manifest::PluginId;
 use bitty_runtime::plugin_runtime::{
-    FileSystem, LifecycleState, NativeFileSystem, PluginRuntime, PluginRuntimeConfig, PluginStore,
-    SettingsSource, SnapshotSource,
+    LifecycleState, PluginRuntime, PluginRuntimeConfig, PluginStore, SettingsSource, SnapshotSource,
 };
 use std::collections::BTreeMap;
 
@@ -501,43 +502,43 @@ const SLOW_COMMIT_MS: u64 = 60;
 /// Plugin whose store commits are slow; every other store stays fast.
 const SLOW_STORE_PLUGIN: &str = "xuepoo.calc";
 
-/// Native filesystem whose atomic rename (the store commit point) is slow
-/// for the provider's store only, standing in for a scanned Windows CI
+/// Slow-commit stub backend: the provider store commit point sleeps for
+/// the provider store only, standing in for a scanned Windows CI
 /// filesystem without real slow disks.
-#[derive(Debug)]
-struct SlowCommitFs;
+#[derive(Debug, Clone)]
+struct SlowCommitBackend {
+    inner: common::MemoryKvBackend,
+}
 
-impl FileSystem for SlowCommitFs {
-    fn create_dir_all(&self, path: &Path) -> std::io::Result<()> {
-        NativeFileSystem.create_dir_all(path)
+impl SlowCommitBackend {
+    fn new() -> Self {
+        Self {
+            inner: common::MemoryKvBackend::new(),
+        }
     }
-    fn write_file(&self, path: &Path, data: &[u8]) -> std::io::Result<()> {
-        NativeFileSystem.write_file(path, data)
-    }
-    fn sync_file(&self, path: &Path) -> std::io::Result<()> {
-        NativeFileSystem.sync_file(path)
-    }
-    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
-        let provider_store = to
+}
+
+impl bitty_runtime::plugin_runtime::KvCommitBackend for SlowCommitBackend {
+    fn commit_store_bytes(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+    ) -> Result<(), bitty_runtime::plugin_runtime::KvCommitError> {
+        let provider_store = path
             .parent()
             .and_then(Path::file_name)
             .is_some_and(|dir| dir == SLOW_STORE_PLUGIN);
         if provider_store {
             std::thread::sleep(std::time::Duration::from_millis(SLOW_COMMIT_MS));
         }
-        NativeFileSystem.rename(from, to)
+        self.inner.commit_store_bytes(path, bytes)
     }
-    fn remove_file(&self, path: &Path) -> std::io::Result<()> {
-        NativeFileSystem.remove_file(path)
-    }
-    fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
-        NativeFileSystem.read_to_string(path)
-    }
-    fn metadata_len(&self, path: &Path) -> std::io::Result<u64> {
-        NativeFileSystem.metadata_len(path)
-    }
-    fn exists(&self, path: &Path) -> bool {
-        NativeFileSystem.exists(path)
+
+    fn load_store_bytes(
+        &self,
+        path: &Path,
+    ) -> Result<Option<Vec<u8>>, bitty_runtime::plugin_runtime::KvCommitError> {
+        self.inner.load_store_bytes(path)
     }
 }
 
@@ -604,7 +605,10 @@ fn slow_disk_store_commit_does_not_fail_cross_vm_service_call() {
         settings: Rc::new(MapSettings::default()),
         snapshot: Rc::new(StaticSnapshot),
     });
-    rt.set_store_filesystem(Arc::new(SlowCommitFs));
+    let commit_backend = Arc::new(SlowCommitBackend::new());
+    rt.set_store_backend(Some(
+        commit_backend.clone() as Arc<dyn bitty_runtime::plugin_runtime::KvCommitBackend>
+    ));
     rt.discover();
     rt.activate(&calc_id()).expect("provider activates");
     rt.activate(&shop_id()).expect("consumer activates");
@@ -622,9 +626,14 @@ fn slow_disk_store_commit_does_not_fail_cross_vm_service_call() {
     );
     assert_eq!(store_int(&rt, &calc_id(), "calls"), Some(2));
 
-    // The committed provider value is persisted and readable from disk.
-    let reloaded =
-        PluginStore::load(state.join("xuepoo.calc").join("store.json")).expect("reload store");
+    // The committed provider value is persisted and readable back through
+    // the backend (on-disk durability rides the real backend in the wiring
+    // crate; the stub proves the commit/read round trip through the seam).
+    let reloaded = PluginStore::load_with_backend(
+        state.join("xuepoo.calc").join("store.json"),
+        Some(commit_backend.clone() as Arc<dyn bitty_runtime::plugin_runtime::KvCommitBackend>),
+    )
+    .expect("reload store");
     assert_eq!(reloaded.get("calls"), Some(LuaValue::Integer(2)));
 
     let _ = std::fs::remove_dir_all(&root);

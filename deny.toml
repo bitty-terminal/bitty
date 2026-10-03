@@ -81,9 +81,20 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # Time bound (CTX-0634, P0-AC-034 exception policy): re-audit all pins
 # (rev freshness, source trust) no later than 2027-03-31; any new git source
 # needs a dated ADR-0004/ADR-0012 revision, never a silent allowlist edit.
+# bitty-storage is a first-party extraction target (W-146, CTX-0939, bitty
+# #1622): the bounded isolated storage mechanics behind the Core-owned
+# durable-commit seam. Linked ONLY by the application wiring crate
+# (bitty-terminal) at an exact rev (5e720b4, post-merge main: session codec,
+# atomic IO, KV backend); no Core library crate links it (Core consumes
+# persistence exclusively through Core-owned traits). std-only API (no
+# database, serialization, PTY, or Core dependency). The approving boundary
+# decisions are DEC-W146-1..4 (W-131/W-137 accepted); a dated ADR-0004/
+# ADR-0012 revision recording this source is tracked as a CTX-0939
+# follow-up. Falls under the same 2027-03-31 re-audit bound above.
 allow-git = [
     "https://github.com/bitty-terminal/phodopus",
     "https://github.com/kyren/gc-arena",
     "https://github.com/bitty-terminal/bitty-network",
     "https://github.com/bitty-terminal/bitty-ipc",
+    "https://github.com/bitty-terminal/bitty-storage",
 ]

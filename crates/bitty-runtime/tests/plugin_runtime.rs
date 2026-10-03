@@ -1,9 +1,12 @@
 //! Gap A + C-minimal runtime tests: discovery, activation, lifecycle, host
 //! services, capture validation, atomic rollback, provenance-based safe mode.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use bitty_lua::{BridgeError, LuaValue};
 use bitty_plugin_host::manifest::PluginId;
@@ -57,7 +60,7 @@ fn runtime(
     settings
         .0
         .insert("retention_days".to_string(), LuaValue::Integer(7));
-    PluginRuntime::new(PluginRuntimeConfig {
+    let mut rt = PluginRuntime::new(PluginRuntimeConfig {
         safe_mode,
         data_dir: Some(data_dir),
         store_root: None,
@@ -75,7 +78,10 @@ fn runtime(
                 ]),
             ),
         ]))),
-    })
+    });
+    // W-146: disk-backed stores commit through an injected backend.
+    common::install_stub_backend(&mut rt);
+    rt
 }
 
 /// Write a minimal plugin package under `root/<id>/`.
@@ -114,10 +120,67 @@ fn sample_id() -> PluginId {
     PluginId::new("bitty-featured.sample").expect("id")
 }
 
+/// Test-only file-backed commit backend: commits through real temp-plus-
+/// rename files so disk-persistence tests prove on-disk atomicity through
+/// the seam without duplicating production mechanics elsewhere.
+#[derive(Debug, Default)]
+struct AtomicFileBackend;
+
+impl bitty_runtime::plugin_runtime::KvCommitBackend for AtomicFileBackend {
+    fn commit_store_bytes(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+    ) -> Result<(), bitty_runtime::plugin_runtime::KvCommitError> {
+        use bitty_runtime::plugin_runtime::KvCommitError;
+        if bytes.len() > bitty_runtime::plugin_runtime::STORE_FILE_MAX_BYTES {
+            return Err(KvCommitError::new("stub payload exceeds ceiling"));
+        }
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|_| KvCommitError::new("stub mkdir refused"))?;
+            }
+        }
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let temp = path.with_extension(format!(
+            "tmp-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::write(&temp, bytes).map_err(|_| KvCommitError::new("stub write refused"))?;
+        std::fs::rename(&temp, path).map_err(|_| KvCommitError::new("stub rename refused"))?;
+        Ok(())
+    }
+
+    fn load_store_bytes(
+        &self,
+        path: &Path,
+    ) -> Result<Option<Vec<u8>>, bitty_runtime::plugin_runtime::KvCommitError> {
+        use bitty_runtime::plugin_runtime::KvCommitError;
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                if bytes.len() > bitty_runtime::plugin_runtime::STORE_FILE_MAX_BYTES {
+                    return Err(KvCommitError::new("stub image exceeds ceiling"));
+                }
+                Ok(Some(bytes))
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(KvCommitError::new("stub read refused")),
+        }
+    }
+}
+
 #[test]
 fn discovers_activates_and_dispatches_bundled_plugin() {
     let data = temp_dir("activate");
     let mut rt = runtime(Vec::new(), vec![fixtures_root()], data.clone(), false);
+    // This test proves on-disk atomic persistence, so it swaps the memory
+    // stub for a test-only file-backed backend (production durability rides
+    // the real backend in the wiring crate).
+    rt.set_store_backend(Some(
+        Arc::new(AtomicFileBackend) as Arc<dyn bitty_runtime::plugin_runtime::KvCommitBackend>
+    ));
     let discovered = rt.discover();
     assert_eq!(discovered.len(), 1, "{discovered:?}");
     assert_eq!(rt.package_count(), 1);

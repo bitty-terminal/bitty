@@ -5590,6 +5590,10 @@ claims = []
         settings: std::rc::Rc::new(EmptySettings),
         snapshot: std::rc::Rc::new(StaticSnapshot),
     });
+    // CTX-0939: disk-backed stores commit through the injected backend.
+    plugin_runtime.set_store_backend(Some(std::sync::Arc::new(
+        crate::storage_backends::StorageKvBackend::new(),
+    )));
     plugin_runtime.discover();
     let pid = bitty_plugin_host::manifest::PluginId::new(id).expect("valid id");
     let report = plugin_runtime.activate(&pid).expect("activate");

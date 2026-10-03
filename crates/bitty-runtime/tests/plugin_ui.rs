@@ -7,6 +7,8 @@
 //! `tabline` claim, bounded block registries, stale handles, and
 //! generation-owned handles across reload.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -54,7 +56,7 @@ fn temp_dir(tag: &str) -> PathBuf {
 }
 
 fn runtime(roots: Vec<PathBuf>, data_dir: PathBuf) -> PluginRuntime {
-    PluginRuntime::new(PluginRuntimeConfig {
+    let mut rt = PluginRuntime::new(PluginRuntimeConfig {
         safe_mode: false,
         data_dir: Some(data_dir),
         store_root: None,
@@ -65,7 +67,10 @@ fn runtime(roots: Vec<PathBuf>, data_dir: PathBuf) -> PluginRuntime {
             ("version", LuaValue::Integer(1)),
             ("zones", LuaValue::array(vec![])),
         ]))),
-    })
+    });
+    // W-146: disk-backed stores commit through an injected backend.
+    common::install_stub_backend(&mut rt);
+    rt
 }
 
 /// Write a plugin with explicit capability, claim, reserved-command, and

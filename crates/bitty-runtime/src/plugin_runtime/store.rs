@@ -1,23 +1,79 @@
 //! Bounded, atomic, quota-enforced plugin store (`bitty.store.*`, RFC Gap C).
 //!
 //! The store is plugin-scoped and survives suspension, reload, and generation
-//! disposal. It is persisted as JSON under the platform data directory
-//! (`$XDG_DATA_HOME/bitty/plugins-state/<plugin-id>/store.json`), written
-//! temp-then-rename so a partial write is never observable. The quota and
-//! value bounds are enforced before any mutation; overflow fails closed with
-//! `E_STORE_QUOTA` and there is no eviction and no partial write.
+//! disposal. Entries persist as JSON under the platform data directory
+//! (`$XDG_DATA_HOME/bitty/plugins-state/<plugin-id>/store.json`); the
+//! durable commit behind [`PluginStore::set`] is owned by the injected
+//! [`KvCommitBackend`] (W-146 seam). The quota and value bounds are enforced
+//! before any mutation; overflow fails closed with `E_STORE_QUOTA` and there
+//! is no eviction and no partial write.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use bitty_lua::{BridgeError, LuaValue};
 
-use super::fs::{FileSystem, NativeFileSystem, write_atomic_durably};
+/// Content-free durable-commit failure: kinds only, safe for logs.
+///
+/// Validation denials keep their typed `E_STORE_*` codes at the call site;
+/// every backend failure surfaces here and maps to `E_STORE_IO`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvCommitError {
+    message: String,
+}
 
-static STORE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+impl KvCommitError {
+    /// Builds an I/O denial with a bounded, content-free message.
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for KvCommitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "store commit: {}", self.message)
+    }
+}
+
+impl std::error::Error for KvCommitError {}
+
+/// Core-owned KV durable-commit backend (W-146 integration seam).
+///
+/// Quota and key/value validation run in Core before any backend call, and
+/// the candidate image is fully encoded before the commit, so a denied or
+/// failed commit leaves both the in-memory state and the previously
+/// committed file untouched (no eviction, no partial write).
+///
+/// The dependency is one-way: Core defines this trait and never imports the
+/// extension crate. The application wiring crate implements it with the
+/// extracted storage mechanics and injects it via
+/// [`PluginStore::with_backend`] / [`PluginStore::load_with_backend`].
+/// With no backend injected, path-backed writes fail closed with
+/// `E_STORE_IO` and loads start clean and empty.
+pub trait KvCommitBackend: Send + Sync + std::fmt::Debug {
+    /// Atomically commits the whole store image; failure leaves the
+    /// previous destination untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KvCommitError`] (content-free) on over-ceiling payloads or
+    /// filesystem failures.
+    fn commit_store_bytes(&self, path: &Path, bytes: &[u8]) -> Result<(), KvCommitError>;
+
+    /// Reads the whole store image with a hard size cap; `None` is a
+    /// missing file (quiet clean start, never an error).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KvCommitError`] (content-free) on over-ceiling or
+    /// unreadable files.
+    fn load_store_bytes(&self, path: &Path) -> Result<Option<Vec<u8>>, KvCommitError>;
+}
 
 /// Maximum stored value bytes per entry.
 pub const STORE_MAX_VALUE_BYTES: usize = 8 * 1024;
@@ -38,7 +94,7 @@ pub const JSON_MAX_DEPTH: usize = 16;
 pub struct PluginStore {
     path: Option<PathBuf>,
     entries: BTreeMap<String, LuaValue>,
-    fs: Arc<dyn FileSystem>,
+    backend: Option<Arc<dyn KvCommitBackend>>,
 }
 
 impl PluginStore {
@@ -48,54 +104,55 @@ impl PluginStore {
         Self {
             path: None,
             entries: BTreeMap::new(),
-            fs: Arc::new(NativeFileSystem),
+            backend: None,
         }
     }
 
-    /// Create an empty store configured with an explicit path and filesystem adapter.
+    /// Create an empty store that commits to `path` through `backend`.
+    ///
+    /// `path: None` disables persistence (in-memory behavior); a store with
+    /// a path but no backend (`backend: None`) fails every write closed
+    /// with `E_STORE_IO` and loads clean and empty.
     #[must_use]
-    pub fn with_filesystem(path: Option<PathBuf>, fs: Arc<dyn FileSystem>) -> Self {
+    pub fn with_backend(path: Option<PathBuf>, backend: Option<Arc<dyn KvCommitBackend>>) -> Self {
         Self {
             path,
             entries: BTreeMap::new(),
-            fs,
+            backend,
         }
     }
 
-    /// Load a store from `path`, or start empty when the file is absent.
+    /// Load a store from `path` through `backend`, or start empty when the
+    /// file is absent.
     ///
     /// # Errors
     ///
-    /// Returns a bounded message when the file exists but is unreadable,
-    /// over the file ceiling, or not the JSON subset this module writes.
-    pub fn load(path: PathBuf) -> Result<Self, String> {
-        Self::load_with_fs(path, Arc::new(NativeFileSystem))
-    }
-
-    /// Load a store from `path` using the specified filesystem adapter.
-    ///
-    /// # Errors
-    ///
-    /// Returns a bounded message when the file exists but is unreadable,
-    /// over the file ceiling, or not the JSON subset this module writes.
-    pub fn load_with_fs(path: PathBuf, fs: Arc<dyn FileSystem>) -> Result<Self, String> {
-        if !fs.exists(&path) {
+    /// Returns a bounded message when the backend is missing, the file
+    /// exists but is unreadable, over the file ceiling, or not the JSON
+    /// subset this module writes.
+    pub fn load_with_backend(
+        path: PathBuf,
+        backend: Option<Arc<dyn KvCommitBackend>>,
+    ) -> Result<Self, String> {
+        let bytes = match &backend {
+            None => None,
+            Some(commits) => commits
+                .load_store_bytes(&path)
+                .map_err(|e| format!("store read: {e}"))?,
+        };
+        let Some(bytes) = bytes else {
             return Ok(Self {
                 path: Some(path),
                 entries: BTreeMap::new(),
-                fs,
+                backend,
             });
-        }
-        let len = fs
-            .metadata_len(&path)
-            .map_err(|e| format!("store metadata: {e}"))?;
-        if len as usize > STORE_FILE_MAX_BYTES {
+        };
+        if bytes.len() > STORE_FILE_MAX_BYTES {
             return Err("plugin store exceeds the file ceiling".to_string());
         }
-        let text = fs
-            .read_to_string(&path)
-            .map_err(|e| format!("store read: {e}"))?;
-        let value = parse_json(&text).map_err(|e| format!("store parse: {e}"))?;
+        let text =
+            std::str::from_utf8(&bytes).map_err(|_| "store image is not UTF-8".to_string())?;
+        let value = parse_json(text).map_err(|e| format!("store parse: {e}"))?;
         let mut entries = BTreeMap::new();
         if let LuaValue::Table(pairs) = value {
             for (key, entry) in pairs {
@@ -115,7 +172,7 @@ impl PluginStore {
         Ok(Self {
             path: Some(path),
             entries,
-            fs,
+            backend,
         })
     }
 
@@ -176,11 +233,11 @@ impl PluginStore {
         let Some(path) = &self.path else {
             return Ok(());
         };
-        let Some(parent) = path.parent() else {
+        let Some(backend) = &self.backend else {
             return Err(BridgeError::new(
                 "runtime",
                 "E_STORE_IO",
-                "invalid plugin state path",
+                "no commit backend for the plugin state file",
             ));
         };
         let mut buffer = String::from("{");
@@ -193,29 +250,20 @@ impl PluginStore {
             buffer.push_str(&encode_json(value));
         }
         buffer.push('}');
-        let file_name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("store.json");
-        let temp = parent.join(format!(
-            "{}.tmp-{}-{}",
-            file_name,
-            std::process::id(),
-            STORE_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        // Only the durable commit I/O (temp write, fsync, atomic rename) is
-        // reported to the RC-1 budget clock; the validation, clone, quota
-        // check, and JSON encoding above stay charged to the callback. The
-        // bridge credits the report only when this `store.set` succeeds
-        // (bitty #1518).
+        // Only the durable commit I/O is reported to the RC-1 budget clock;
+        // the validation, clone, quota check, and JSON encoding above stay
+        // charged to the callback. The bridge credits the report only when
+        // this `store.set` succeeds (bitty #1518).
         let commit_started = Instant::now();
-        write_atomic_durably(&*self.fs, path, buffer.as_bytes(), &temp).map_err(|_| {
-            BridgeError::new(
-                "runtime",
-                "E_STORE_IO",
-                "could not commit the plugin state file",
-            )
-        })?;
+        backend
+            .commit_store_bytes(path, buffer.as_bytes())
+            .map_err(|_| {
+                BridgeError::new(
+                    "runtime",
+                    "E_STORE_IO",
+                    "could not commit the plugin state file",
+                )
+            })?;
         bitty_lua::record_store_commit_io(commit_started.elapsed());
         Ok(())
     }
@@ -635,7 +683,84 @@ fn utf8_width(first: u8) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugin_runtime::fs::FakeFileSystem;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    /// In-memory [`KvCommitBackend`] stub: proves seam discipline (ordering,
+    /// fail-closed intactness) without duplicating commit mechanics. Byte
+    /// parity rides the real backend in the wiring crate.
+    #[derive(Debug, Default)]
+    struct StubBackend {
+        state: Mutex<StubState>,
+    }
+
+    #[derive(Debug, Default)]
+    struct StubState {
+        files: HashMap<PathBuf, Vec<u8>>,
+        fail_commits: bool,
+        commits: u64,
+    }
+
+    impl StubBackend {
+        fn stored(&self, path: &Path) -> Option<Vec<u8>> {
+            self.state
+                .lock()
+                .expect("stub lock")
+                .files
+                .get(path)
+                .cloned()
+        }
+
+        fn commits(&self) -> u64 {
+            self.state.lock().expect("stub lock").commits
+        }
+
+        /// Test-only seeding helper: writes raw bytes as the stored image.
+        fn seed(&self, path: &Path, bytes: Vec<u8>) {
+            self.state
+                .lock()
+                .expect("stub lock")
+                .files
+                .insert(path.to_path_buf(), bytes);
+        }
+    }
+
+    impl KvCommitBackend for StubBackend {
+        fn commit_store_bytes(&self, path: &Path, bytes: &[u8]) -> Result<(), KvCommitError> {
+            let mut state = self.state.lock().expect("stub lock");
+            if state.fail_commits {
+                return Err(KvCommitError::new("stub commit refused"));
+            }
+            state.commits += 1;
+            state.files.insert(path.to_path_buf(), bytes.to_vec());
+            Ok(())
+        }
+
+        fn load_store_bytes(&self, path: &Path) -> Result<Option<Vec<u8>>, KvCommitError> {
+            Ok(self
+                .state
+                .lock()
+                .expect("stub lock")
+                .files
+                .get(path)
+                .cloned())
+        }
+    }
+
+    fn stub() -> Arc<StubBackend> {
+        Arc::new(StubBackend::default())
+    }
+
+    fn with_stub(path: PathBuf, backend: &Arc<StubBackend>) -> PluginStore {
+        PluginStore::with_backend(
+            Some(path),
+            Some(backend.clone() as Arc<dyn KvCommitBackend>),
+        )
+    }
+
+    fn load_with_stub(path: PathBuf, backend: &Arc<StubBackend>) -> Result<PluginStore, String> {
+        PluginStore::load_with_backend(path, Some(backend.clone() as Arc<dyn KvCommitBackend>))
+    }
 
     #[test]
     fn in_memory_store_operations() {
@@ -660,10 +785,28 @@ mod tests {
     }
 
     #[test]
-    fn candidate_persisted_before_in_memory_publish_on_rejected_write() {
-        let fake_fs = Arc::new(FakeFileSystem::new());
+    fn backend_absent_path_store_fails_closed() {
         let path = PathBuf::from("/plugins-state/my-plugin/store.json");
-        let mut store = PluginStore::with_filesystem(Some(path.clone()), fake_fs.clone());
+        let mut store = PluginStore::with_backend(Some(path.clone()), None);
+
+        // Writes fail closed with E_STORE_IO; nothing is published.
+        let err = store
+            .set("alpha", LuaValue::String("val1".to_string()))
+            .expect_err("absent backend must fail");
+        assert_eq!(err.code, "E_STORE_IO");
+        assert!(store.is_empty());
+
+        // Loads start clean and empty.
+        let loaded =
+            PluginStore::load_with_backend(path, None).expect("absent backend loads empty");
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn candidate_persisted_before_in_memory_publish_on_rejected_write() {
+        let backend = stub();
+        let path = PathBuf::from("/plugins-state/my-plugin/store.json");
+        let mut store = with_stub(path.clone(), &backend);
 
         // First write succeeds
         store
@@ -675,7 +818,7 @@ mod tests {
         );
 
         // Inject write failure
-        fake_fs.set_fail_writes(true);
+        backend.state.lock().expect("stub lock").fail_commits = true;
         let err = store.set("theme", LuaValue::String("dark".to_string()));
         assert!(err.is_err());
 
@@ -685,50 +828,48 @@ mod tests {
             Some(LuaValue::String("light".to_string()))
         );
 
-        // Persisted state in fake fs remains "light"
-        let persisted = fake_fs.read_to_string(&path).expect("read store");
+        // Persisted state in the backend remains "light"
+        let persisted =
+            String::from_utf8(backend.stored(&path).expect("read store")).expect("store is UTF-8");
         assert!(persisted.contains("light"));
         assert!(!persisted.contains("dark"));
     }
 
     #[test]
     fn store_preserves_committed_settings_on_rejected_replacement() {
-        let fake_fs = Arc::new(FakeFileSystem::new());
+        let backend = stub();
         let path = PathBuf::from("/plugins-state/my-plugin/store.json");
-        let mut store = PluginStore::with_filesystem(Some(path.clone()), fake_fs.clone());
+        let mut store = with_stub(path.clone(), &backend);
 
         store
             .set("setting.a", LuaValue::Integer(42))
             .expect("initial commit");
         assert_eq!(store.get("setting.a"), Some(LuaValue::Integer(42)));
+        let committed = backend.commits();
 
-        // Inject rename/replacement failure
-        fake_fs.set_fail_renames(true);
+        // Inject replacement failure
+        backend.state.lock().expect("stub lock").fail_commits = true;
 
         let err = store.set("setting.a", LuaValue::Integer(100));
         assert!(err.is_err(), "replacement failure must fail closed");
+        assert_eq!(err.unwrap_err().code, "E_STORE_IO");
 
         // In-memory state was NOT mutated to candidate
         assert_eq!(store.get("setting.a"), Some(LuaValue::Integer(42)));
 
-        // Destination was NOT deleted and still contains prior setting
-        assert!(fake_fs.exists(&path));
-        let disk_text = fake_fs.read_to_string(&path).expect("read store");
+        // Committed image was NOT replaced and still contains the prior setting
+        assert_eq!(backend.commits(), committed);
+        let disk_text =
+            String::from_utf8(backend.stored(&path).expect("read store")).expect("store is UTF-8");
         assert!(disk_text.contains("42"));
         assert!(!disk_text.contains("100"));
-
-        // Temporary file was cleaned up
-        let temp_exists = fake_fs
-            .get_file("/plugins-state/my-plugin/store.json.tmp")
-            .is_some();
-        assert!(!temp_exists);
     }
 
     #[test]
     fn store_preserves_committed_settings_on_rejected_deletion_transaction() {
-        let fake_fs = Arc::new(FakeFileSystem::new());
+        let backend = stub();
         let path = PathBuf::from("/plugins-state/my-plugin/store.json");
-        let mut store = PluginStore::with_filesystem(Some(path.clone()), fake_fs.clone());
+        let mut store = with_stub(path.clone(), &backend);
 
         store
             .set("key1", LuaValue::String("preserved".to_string()))
@@ -739,7 +880,7 @@ mod tests {
         );
 
         // Fail replacement during deletion
-        fake_fs.set_fail_renames(true);
+        backend.state.lock().expect("stub lock").fail_commits = true;
         let err = store.set("key1", LuaValue::Nil);
         assert!(err.is_err());
 
@@ -749,52 +890,50 @@ mod tests {
             Some(LuaValue::String("preserved".to_string()))
         );
 
-        // On-disk file must still contain the key
-        let text = fake_fs.read_to_string(&path).expect("read store");
+        // Committed image must still contain the key
+        let text =
+            String::from_utf8(backend.stored(&path).expect("read store")).expect("store is UTF-8");
         assert!(text.contains("preserved"));
 
         // Unblock and retry deletion
-        fake_fs.set_fail_renames(false);
+        backend.state.lock().expect("stub lock").fail_commits = false;
         store.set("key1", LuaValue::Nil).expect("deletion succeeds");
         assert_eq!(store.get("key1"), None);
-        let updated = fake_fs.read_to_string(&path).expect("read store");
+        let updated =
+            String::from_utf8(backend.stored(&path).expect("read store")).expect("store is UTF-8");
         assert!(!updated.contains("preserved"));
     }
 
     #[test]
-    fn distinguish_atomicity_from_durability() {
-        let fake_fs = Arc::new(FakeFileSystem::new());
+    fn failed_commit_leaves_no_committed_image() {
+        let backend = stub();
         let path = PathBuf::from("/plugins-state/my-plugin/store.json");
-        let mut store = PluginStore::with_filesystem(Some(path.clone()), fake_fs.clone());
+        let mut store = with_stub(path.clone(), &backend);
 
-        // Inject durability (sync) failure
-        fake_fs.set_fail_syncs(true);
+        // Inject commit failure before anything is committed.
+        backend.state.lock().expect("stub lock").fail_commits = true;
         let err = store.set("alpha", LuaValue::Integer(1));
         assert!(err.is_err());
 
-        // Atomicity preserved: destination not created, in-memory empty
-        assert!(!fake_fs.exists(&path));
+        // Nothing committed, in-memory empty.
+        assert!(backend.stored(&path).is_none());
         assert!(store.is_empty());
 
-        // Restore durability and check order
-        fake_fs.set_fail_syncs(false);
+        // Restored backend commits normally.
+        backend.state.lock().expect("stub lock").fail_commits = false;
         store
             .set("alpha", LuaValue::Integer(1))
-            .expect("sync and rename succeed");
-        assert!(fake_fs.exists(&path));
+            .expect("commit succeeds");
+        assert!(backend.stored(&path).is_some());
         assert_eq!(store.get("alpha"), Some(LuaValue::Integer(1)));
     }
 
     #[test]
-    fn native_fs_atomic_store_replacement_and_reload() {
-        let dir = std::env::temp_dir().join(format!(
-            "bitty-test-native-store-{}-{}",
-            std::process::id(),
-            STORE_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        let path = dir.join("store.json");
+    fn stub_backed_store_replacement_and_reload() {
+        let backend = stub();
+        let path = PathBuf::from("/plugins-state/my-plugin/store.json");
 
-        let mut store = PluginStore::load(path.clone()).expect("load empty");
+        let mut store = with_stub(path.clone(), &backend);
         assert!(store.is_empty());
 
         store
@@ -804,84 +943,106 @@ mod tests {
             .set("session.count", LuaValue::Integer(7))
             .expect("second set");
 
-        // Reload from disk in a fresh store instance
-        let reloaded = PluginStore::load(path.clone()).expect("reload from disk");
+        // Reload from the backend in a fresh store instance
+        let reloaded = load_with_stub(path, &backend).expect("reload from backend");
         assert_eq!(
             reloaded.get("session.id"),
             Some(LuaValue::String("s-123".to_string()))
         );
         assert_eq!(reloaded.get("session.count"), Some(LuaValue::Integer(7)));
+    }
 
-        let _ = std::fs::remove_dir_all(&dir);
+    #[test]
+    fn quota_denial_never_reaches_the_backend() {
+        let backend = stub();
+        let path = PathBuf::from("/plugins-state/my-plugin/store.json");
+        let mut store = with_stub(path.clone(), &backend);
+
+        // Fill to the entry ceiling through successful commits.
+        for i in 0..STORE_MAX_ENTRIES {
+            store
+                .set(&format!("k{i}"), LuaValue::Integer(i as i64))
+                .expect("fill entry");
+        }
+        let committed = backend.commits();
+
+        // One more entry trips the quota before any backend call.
+        let err = store
+            .set("overflow", LuaValue::Integer(-1))
+            .expect_err("quota must fail");
+        assert_eq!(err.code, "E_STORE_QUOTA");
+        assert_eq!(
+            backend.commits(),
+            committed,
+            "denied writes never reach the backend"
+        );
+        assert!(store.get("overflow").is_none());
     }
 
     #[test]
     fn load_rejects_invalid_keys() {
-        let fake_fs = Arc::new(FakeFileSystem::new());
+        let backend = stub();
         let path = PathBuf::from("/plugins-state/my-plugin/store.json");
 
         // Key starting with invalid char
-        fake_fs.set_file(path.clone(), b"{\"_bad\": 1}".to_vec());
-        let err = PluginStore::load_with_fs(path.clone(), fake_fs.clone());
+        backend.seed(&path, b"{\"_bad\": 1}".to_vec());
+        let err = load_with_stub(path.clone(), &backend);
         assert!(err.is_err());
         assert!(err.unwrap_err().contains("violates invariants"));
 
         // Key with uppercase
-        fake_fs.set_file(path.clone(), b"{\"BadKey\": 1}".to_vec());
-        let err = PluginStore::load_with_fs(path.clone(), fake_fs.clone());
+        backend.seed(&path, b"{\"BadKey\": 1}".to_vec());
+        let err = load_with_stub(path.clone(), &backend);
         assert!(err.is_err());
         assert!(err.unwrap_err().contains("violates invariants"));
 
         // Key with empty dot segments
-        fake_fs.set_file(path.clone(), b"{\"a..b\": 1}".to_vec());
-        let err = PluginStore::load_with_fs(path.clone(), fake_fs.clone());
+        backend.seed(&path, b"{\"a..b\": 1}".to_vec());
+        let err = load_with_stub(path.clone(), &backend);
         assert!(err.is_err());
         assert!(err.unwrap_err().contains("violates invariants"));
 
         // Oversized key (> 128 bytes)
         let long_key = "a".repeat(129);
-        fake_fs.set_file(path.clone(), format!("{{\"{long_key}\": 1}}").into_bytes());
-        let err = PluginStore::load_with_fs(path.clone(), fake_fs.clone());
+        backend.seed(&path, format!("{{\"{long_key}\": 1}}").into_bytes());
+        let err = load_with_stub(path.clone(), &backend);
         assert!(err.is_err());
         assert!(err.unwrap_err().contains("violates invariants"));
     }
 
     #[test]
     fn load_rejects_oversized_value() {
-        let fake_fs = Arc::new(FakeFileSystem::new());
+        let backend = stub();
         let path = PathBuf::from("/plugins-state/my-plugin/store.json");
 
         let big_str = "x".repeat(STORE_MAX_VALUE_BYTES + 1);
-        fake_fs.set_file(
-            path.clone(),
-            format!("{{\"k\": \"{big_str}\"}}").into_bytes(),
-        );
-        let err = PluginStore::load_with_fs(path.clone(), fake_fs.clone());
+        backend.seed(&path, format!("{{\"k\": \"{big_str}\"}}").into_bytes());
+        let err = load_with_stub(path.clone(), &backend);
         assert!(err.is_err());
         assert!(err.unwrap_err().contains("violates invariants"));
     }
 
     #[test]
     fn load_rejects_non_finite_and_invalid_values() {
-        let fake_fs = Arc::new(FakeFileSystem::new());
+        let backend = stub();
         let path = PathBuf::from("/plugins-state/my-plugin/store.json");
 
         // Non-object root (string)
-        fake_fs.set_file(path.clone(), b"\"just a string\"".to_vec());
-        let err = PluginStore::load_with_fs(path.clone(), fake_fs.clone());
+        backend.seed(&path, b"\"just a string\"".to_vec());
+        let err = load_with_stub(path.clone(), &backend);
         assert!(err.is_err());
         assert!(err.unwrap_err().contains("store root must be an object"));
 
         // Non-object root (array)
-        fake_fs.set_file(path.clone(), b"[1, 2, 3]".to_vec());
-        let err = PluginStore::load_with_fs(path.clone(), fake_fs.clone());
+        backend.seed(&path, b"[1, 2, 3]".to_vec());
+        let err = load_with_stub(path.clone(), &backend);
         assert!(err.is_err());
         assert!(err.unwrap_err().contains("store keys must be strings"));
     }
 
     #[test]
     fn load_rejects_quota_violations() {
-        let fake_fs = Arc::new(FakeFileSystem::new());
+        let backend = stub();
         let path = PathBuf::from("/plugins-state/my-plugin/store.json");
 
         // Too many entries (> STORE_MAX_ENTRIES)
@@ -893,17 +1054,17 @@ mod tests {
             text.push_str(&format!("\"k{i}\": {i}"));
         }
         text.push('}');
-        fake_fs.set_file(path.clone(), text.into_bytes());
-        let err = PluginStore::load_with_fs(path.clone(), fake_fs.clone());
+        backend.seed(&path, text.into_bytes());
+        let err = load_with_stub(path.clone(), &backend);
         assert!(err.is_err());
         assert!(err.unwrap_err().contains("store quota violated"));
     }
 
     #[test]
     fn nesting_depth_enforced_across_set_and_load() {
-        let fake_fs = Arc::new(FakeFileSystem::new());
+        let backend = stub();
         let path = PathBuf::from("/plugins-state/my-plugin/store.json");
-        let mut store = PluginStore::with_filesystem(Some(path.clone()), fake_fs.clone());
+        let mut store = with_stub(path.clone(), &backend);
 
         // Construct 13 levels of nested tables with leaf scalar (leaf depth = 2 + 13 + 1 = 16 <= 16, passes)
         let mut ok_val = LuaValue::Table(vec![(
@@ -930,16 +1091,15 @@ mod tests {
         assert_eq!(err.unwrap_err().code, "E_STORE_VALUE_INVALID");
 
         // Loading the valid store must succeed
-        let loaded =
-            PluginStore::load_with_fs(path.clone(), fake_fs.clone()).expect("valid store loads");
+        let loaded = load_with_stub(path.clone(), &backend).expect("valid store loads");
         assert!(loaded.get("nested.ok").is_some());
     }
 
     #[test]
     fn load_failure_preserves_last_good_state() {
-        let fake_fs = Arc::new(FakeFileSystem::new());
+        let backend = stub();
         let path = PathBuf::from("/plugins-state/my-plugin/store.json");
-        let mut store = PluginStore::with_filesystem(Some(path.clone()), fake_fs.clone());
+        let mut store = with_stub(path.clone(), &backend);
 
         store
             .set("good.key", LuaValue::String("good.val".to_string()))
@@ -950,15 +1110,15 @@ mod tests {
         );
 
         // Verify valid load
-        let loaded = PluginStore::load_with_fs(path.clone(), fake_fs.clone()).expect("load valid");
+        let loaded = load_with_stub(path.clone(), &backend).expect("load valid");
         assert_eq!(
             loaded.get("good.key"),
             Some(LuaValue::String("good.val".to_string()))
         );
 
-        // Corrupt on disk with invalid key
-        fake_fs.set_file(path.clone(), b"{\"INVALID_KEY\": 123}".to_vec());
-        let failed_load = PluginStore::load_with_fs(path.clone(), fake_fs.clone());
+        // Corrupt the image with an invalid key
+        backend.seed(&path, b"{\"INVALID_KEY\": 123}".to_vec());
+        let failed_load = load_with_stub(path.clone(), &backend);
         assert!(failed_load.is_err());
 
         // In-memory `store` was unaffected and still holds good state

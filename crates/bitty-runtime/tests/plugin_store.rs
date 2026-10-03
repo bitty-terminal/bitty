@@ -2,6 +2,8 @@
 //! re-verification, native artifact rejection, local-path unverified marking,
 //! bounds, and provenance-ordered discovery.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -100,7 +102,7 @@ fn installed_record(relative_root: &str, package_root: &Path) -> PluginRecord {
 
 fn runtime(store_root: Option<PathBuf>, safe_mode: bool, tag: &str) -> PluginRuntime {
     let data = temp_dir(&format!("state-{tag}"));
-    PluginRuntime::new(PluginRuntimeConfig {
+    let mut rt = PluginRuntime::new(PluginRuntimeConfig {
         safe_mode,
         data_dir: Some(data),
         store_root,
@@ -111,7 +113,12 @@ fn runtime(store_root: Option<PathBuf>, safe_mode: bool, tag: &str) -> PluginRun
             "version",
             LuaValue::Integer(1),
         )]))),
-    })
+    });
+    // W-146: disk-backed stores commit through an injected backend. The
+    // memory stub keeps these tests hermetic; byte parity rides the real
+    // backend in the wiring crate.
+    common::install_stub_backend(&mut rt);
+    rt
 }
 
 const INIT: &str = r#"

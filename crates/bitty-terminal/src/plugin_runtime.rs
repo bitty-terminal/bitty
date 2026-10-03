@@ -307,6 +307,12 @@ pub(crate) fn discover_and_activate(
         settings: Rc::new(EmptySettings),
         snapshot: host_snapshot,
     });
+    // CTX-0939 (W-146): disk-backed plugin stores commit through the
+    // extracted storage mechanics. Core keeps quotas, validation, and the
+    // RC-1 accounting; only the atomic-commit bytes flow through here.
+    runtime.set_store_backend(Some(std::sync::Arc::new(
+        crate::storage_backends::StorageKvBackend::new(),
+    )));
     // CTX-0889: seed the workspace source before activation so `init.lua`
     // already observes the startup workspaces.
     let workspaces = Rc::new(LiveWorkspaces::default());

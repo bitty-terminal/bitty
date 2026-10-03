@@ -528,6 +528,11 @@ pub struct Runtime {
     /// successful `apply_session_snapshot`, read by startup pane spawn to
     /// respawn only attached leaves. Count-only in logs.
     session_restored: bool,
+    /// Injected durable-commit backend for session save/restore (W-146):
+    /// the application wiring installs the storage-backed implementation;
+    /// `None` (tests, backend-absent runs) fails every durable path closed
+    /// without touching the filesystem.
+    session_backend: Option<std::sync::Arc<dyn session::SessionFileBackend>>,
     /// Pending kill-confirm close arm, if any (never silent kill).
     pending_ws_close: Option<PendingWsClose>,
     /// Whether the workspace switcher bar presents (issue #1333). Seeded
@@ -1072,6 +1077,7 @@ impl std::fmt::Debug for Runtime {
             .field("session_pending", &self.session_pending.len())
             .field("session_primary_cwd", &self.session_primary_cwd.is_some())
             .field("session_restored", &self.session_restored)
+            .field("has_session_backend", &self.session_backend.is_some())
             .field("has_pending_ws_close", &self.pending_ws_close.is_some())
             .field("help_visible", &self.help_visible)
             .field("help_rows", &self.help_rows.len())
@@ -1465,6 +1471,7 @@ impl Runtime {
             session_pending: BTreeMap::new(),
             session_primary_cwd: None,
             session_restored: false,
+            session_backend: None,
             pending_ws_close: None,
             workspaceline_visible: config.workspaceline_visible,
             workspace_bar_edge: config.workspace_bar_edge,
@@ -1688,6 +1695,7 @@ impl Runtime {
             session_pending: BTreeMap::new(),
             session_primary_cwd: None,
             session_restored: false,
+            session_backend: None,
             pending_ws_close: None,
             workspaceline_visible: config.workspaceline_visible,
             workspace_bar_edge: config.workspace_bar_edge,

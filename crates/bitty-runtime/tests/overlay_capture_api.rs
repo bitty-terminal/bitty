@@ -243,8 +243,8 @@ fn overlay_lifecycle_spec_acquire_update_poll_release() {
     );
     assert_eq!(
         store_value(&fixture.runtime, &fixture.id, "x_again"),
-        Some(LuaValue::Bool(true)),
-        "idempotent release succeeds without state change"
+        Some(LuaValue::Bool(false)),
+        "idempotent release is a success-without-effect, never an error"
     );
     assert!(
         !fixture.runtime.overlay_capture().borrow().is_active(),
@@ -613,6 +613,89 @@ fn capture_guaranteed_release_matrix_restores_input() {
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].reason, "timeout");
     }
+}
+
+/// A session that ends on the Core-side idle timeout unmounts its
+/// spec-acquired surface: no orphan block survives expiry, and the next
+/// session presents only the new surface.
+#[test]
+fn overlay_spec_surface_unmounted_on_expiry() {
+    let mut fixture = Fixture::activate_full(
+        "expire-surface",
+        "bitty-featured.uiexpsurface",
+        FOCUS_GRANTS,
+        &["probe"],
+        &[],
+        r#"
+        bitty.commands.register({
+          id = "probe",
+          title = "Probe",
+          run = function(key)
+            local h = bitty.ui.overlay.acquire({ title = key })
+            bitty.store.set(key .. "_handle", h)
+            return true
+          end,
+        })
+        return {}
+        "#,
+    );
+    fixture
+        .runtime
+        .dispatch_command(&fixture.id, "probe", &[LuaValue::String("x".to_string())])
+        .expect("dispatch");
+    let handle = match store_value(&fixture.runtime, &fixture.id, "x_handle") {
+        Some(LuaValue::Integer(handle)) => handle,
+        other => panic!("acquire must return a handle, got {other:?}"),
+    };
+    assert!(
+        fixture
+            .runtime
+            .overlay_capture()
+            .borrow_mut()
+            .force_expire(fixture.id.as_str(), handle),
+        "live capture is rewound"
+    );
+    assert!(
+        fixture.runtime.expire_overlay_captures(),
+        "the Core tick revokes the expired capture"
+    );
+    assert!(
+        fixture
+            .runtime
+            .ui_blocks()
+            .iter()
+            .all(|(id, _, _, _)| id.as_str() != fixture.id.as_str()),
+        "expiry unmounts the spec surface: no orphan block survives"
+    );
+    // The next session starts clean with only its own surface retained.
+    fixture
+        .runtime
+        .dispatch_command(&fixture.id, "probe", &[LuaValue::String("y".to_string())])
+        .expect("dispatch");
+    let retained: Vec<_> = fixture
+        .runtime
+        .ui_blocks()
+        .into_iter()
+        .filter(|(id, _, _, _)| id.as_str() == fixture.id.as_str())
+        .collect();
+    assert_eq!(retained.len(), 1, "only the live surface is retained");
+    let services = fixture
+        .runtime
+        .services(&fixture.id)
+        .expect("services")
+        .clone();
+    let live = match store_value(&fixture.runtime, &fixture.id, "y_handle") {
+        Some(LuaValue::Integer(handle)) => handle,
+        other => panic!("re-acquire must return a handle, got {other:?}"),
+    };
+    assert_ne!(handle, live, "sessions mint distinct handles");
+    assert!(
+        services
+            .ui_overlay_poll_detailed(live, 8)
+            .expect("poll")
+            .active,
+        "the new session holds the capture"
+    );
 }
 
 /// Session end is observable without polling: a subscriber of

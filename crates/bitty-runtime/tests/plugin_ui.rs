@@ -927,8 +927,8 @@ fn overlay_capture_is_single_owner_and_release_is_idempotent() {
     );
     assert_eq!(
         store_value(&fixture.runtime, &fixture.id, "x_r2"),
-        Some(LuaValue::Bool(true)),
-        "release is idempotent: a repeated release by the owning generation succeeds"
+        Some(LuaValue::Bool(false)),
+        "release is idempotent: a repeated release succeeds without effect"
     );
     assert_eq!(
         store_value(&fixture.runtime, &fixture.id, "x_a3"),

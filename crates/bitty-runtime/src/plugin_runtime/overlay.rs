@@ -42,6 +42,17 @@ use bitty_lua::{
 /// a blocked or silent plugin cannot pin terminal input.
 pub const OVERLAY_CAPTURE_TIMEOUT_MS: u64 = 30_000;
 
+/// Maximum pending `overlay.released` observations buffered between ticks.
+///
+/// `finish_session` queues one observation per ended session while the
+/// application drains them only on its tick. An acquire/release loop inside a
+/// single command callback would otherwise grow the buffer without bound
+/// (the mechanism path reuses one mounted block, so no block budget stops
+/// the loop) and burst every `overlay.released` subscriber on the next tick.
+/// Overflow drops the oldest observation and counts it, mirroring the
+/// drop-oldest capture-queue idiom.
+pub const PENDING_RELEASED_MAX: usize = 64;
+
 /// Full terminal release-reason vocabulary (accepted W-01 contract).
 ///
 /// Only `submitted` and `cancelled` are owner-suppliable; the rest are
@@ -160,6 +171,8 @@ pub struct OverlayCapture {
     last_release: Option<ReleaseRecord>,
     /// Pending `overlay.released` observations for the application tick.
     pending_released: Vec<ReleasedEvent>,
+    /// Observations dropped by `pending_released` overflow since creation.
+    released_dropped: u64,
 }
 
 impl OverlayCapture {
@@ -303,16 +316,15 @@ impl OverlayCapture {
                 reason: None,
             });
         }
-        if let Some(record) = self.last_release.as_ref() {
-            if record.plugin_id == plugin_id && record.handle == handle {
-                return Ok(CapturePoll {
-                    status: "released",
-                    seq: record.seq,
-                    events: Vec::new(),
-                    overflowed: record.overflowed,
-                    reason: Some(record.reason.clone()),
-                });
-            }
+        if self.owns_release(plugin_id, handle) {
+            let record = self.last_release.as_ref().expect("checked release");
+            return Ok(CapturePoll {
+                status: "released",
+                seq: record.seq,
+                events: Vec::new(),
+                overflowed: record.overflowed,
+                reason: Some(record.reason.clone()),
+            });
         }
         Err(BridgeError::new(
             "runtime",
@@ -463,11 +475,24 @@ impl OverlayCapture {
             .is_some_and(|owner| owner.plugin_id == plugin_id && owner.handle == handle)
     }
 
+    /// Whether `handle` is the live session's handle, regardless of owner.
+    ///
+    /// Release uses this to deny ending somebody else's live session while
+    /// keeping every other non-owned handle an ok-noop (already-ended,
+    /// never-acquired, or stale from before another session started).
+    #[must_use]
+    pub fn is_live_handle(&self, handle: i64) -> bool {
+        self.owner
+            .as_ref()
+            .is_some_and(|owner| owner.handle == handle)
+    }
+
     /// Whether (`plugin_id`, `handle`) owns the remembered terminal release.
     ///
-    /// Used for idempotent release: an already-released handle of the owning
-    /// generation succeeds without state change, while anything else is a
-    /// non-owner or stale handle.
+    /// Used by detailed poll: only the owning generation observes the
+    /// terminal record of its ended session. (Release idempotency intentionally
+    /// does not consult the remembered release: with no live session a
+    /// release is an ok-noop, while a live foreign session denies.)
     #[must_use]
     pub fn owns_release(&self, plugin_id: &str, handle: i64) -> bool {
         self.last_release
@@ -485,6 +510,16 @@ impl OverlayCapture {
     #[must_use]
     pub fn owner_plugin(&self) -> Option<&str> {
         self.owner.as_ref().map(|owner| owner.plugin_id.as_str())
+    }
+
+    /// Handle of the active capture, if any (block-lifetime wiring).
+    ///
+    /// Paired with [`OverlayCapture::owner_plugin`]: the runtime uses both
+    /// to dispose a spec-acquired surface when its session ends on a
+    /// runtime-driven path (expiry, focus-switch/cancel revoke).
+    #[must_use]
+    pub fn owner_handle(&self) -> Option<i64> {
+        self.owner.as_ref().map(|owner| owner.handle)
     }
 
     /// Number of queued, undrained events.
@@ -511,6 +546,13 @@ impl OverlayCapture {
         self.pending_released.len()
     }
 
+    /// Number of `overlay.released` observations dropped by buffer overflow
+    /// since creation (drop-oldest past [`PENDING_RELEASED_MAX`]).
+    #[must_use]
+    pub fn released_dropped(&self) -> u64 {
+        self.released_dropped
+    }
+
     /// Drop the owner and every queued event (transient session end).
     fn clear(&mut self) {
         self.owner = None;
@@ -518,8 +560,9 @@ impl OverlayCapture {
     }
 
     /// End the live session with `reason`: remember the terminal record for
-    /// the owner's next detailed poll, queue the bus observation, and drop
-    /// the owner and every queued event.
+    /// the owner's next detailed poll, queue the bus observation (dropping
+    /// the oldest past [`PENDING_RELEASED_MAX`]), and drop the owner and
+    /// every queued event.
     fn finish_session(&mut self, reason: &str) {
         if let Some(owner) = self.owner.as_ref() {
             let record = ReleaseRecord {
@@ -529,6 +572,10 @@ impl OverlayCapture {
                 seq: self.last_delivered,
                 overflowed: self.overflowed,
             };
+            if self.pending_released.len() >= PENDING_RELEASED_MAX {
+                self.pending_released.remove(0);
+                self.released_dropped = self.released_dropped.saturating_add(1);
+            }
             self.pending_released.push(ReleasedEvent {
                 owner: owner.plugin_id.clone(),
                 reason: reason.to_string(),
@@ -783,6 +830,31 @@ mod tests {
                 .map(|event| (event.owner.as_str(), event.reason.as_str()))
                 .collect::<Vec<_>>(),
             [("a", "cancelled"), ("b", "unloaded"), ("c", "timeout")]
+        );
+        assert!(capture.drain_released_events().is_empty());
+    }
+
+    #[test]
+    fn pending_released_is_bounded_with_drop_oldest() {
+        // An acquire/release loop inside one tick (no drain between
+        // sessions) must stay bounded: the oldest observations drop and are
+        // counted, and the newest survive for the next tick's delivery.
+        let mut capture = OverlayCapture::new();
+        let rounds = PENDING_RELEASED_MAX + 32;
+        for _ in 0..rounds {
+            capture.acquire("a", 1, future(60_000)).expect("acquire");
+            assert!(capture.release("a", 1));
+        }
+        assert_eq!(capture.pending_released_len(), PENDING_RELEASED_MAX);
+        assert_eq!(
+            capture.released_dropped(),
+            u64::try_from(rounds - PENDING_RELEASED_MAX).expect("count fits")
+        );
+        let events = capture.drain_released_events();
+        assert_eq!(events.len(), PENDING_RELEASED_MAX);
+        assert!(
+            events.iter().all(|event| event.owner == "a"),
+            "newest observations survive the bound"
         );
         assert!(capture.drain_released_events().is_empty());
     }

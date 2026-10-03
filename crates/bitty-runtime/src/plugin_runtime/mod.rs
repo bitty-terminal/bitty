@@ -769,17 +769,40 @@ impl PluginRuntime {
     /// for focus moves, `cancelled` for user cancel. Returns whether a
     /// capture was dropped.
     pub fn revoke_overlay_capture_with_reason(&mut self, reason: &str) -> bool {
-        let owner = self
+        let Some((plugin, handle)) = self.live_capture_session() else {
+            return false;
+        };
+        let revoked = self
             .overlay_capture
-            .borrow()
-            .owner_plugin()
-            .map(str::to_string);
-        match owner {
-            Some(plugin) => self
-                .overlay_capture
-                .borrow_mut()
-                .revoke_plugin_with_reason(&plugin, reason),
-            None => false,
+            .borrow_mut()
+            .revoke_plugin_with_reason(&plugin, reason);
+        if revoked {
+            self.drop_ended_spec_overlay(&plugin, handle);
+        }
+        revoked
+    }
+
+    /// Live capture session as `(owner plugin, handle)`, if any.
+    fn live_capture_session(&self) -> Option<(String, i64)> {
+        let capture = self.overlay_capture.borrow();
+        Some((capture.owner_plugin()?.to_string(), capture.owner_handle()?))
+    }
+
+    /// Dispose the spec-acquired surface of an ended session (CTX-0941).
+    ///
+    /// Runtime-driven session ends (expiry, focus-switch/cancel revoke) drop
+    /// the capture without passing through the owning generation's release
+    /// path; the transient surface must still leave with the session or the
+    /// next session would present stale content and every cycle would leak
+    /// one block slot. Unload/crash/suspend need no handling here: those
+    /// paths invalidate the whole generation registry. Best-effort: a
+    /// generation gone by cleanup time simply has nothing to dispose.
+    fn drop_ended_spec_overlay(&self, plugin: &str, handle: i64) {
+        let Ok(id) = PluginId::new(plugin) else {
+            return;
+        };
+        if let Some(services) = self.services(&id) {
+            services.remove_spec_overlay_block(handle);
         }
     }
 
@@ -798,7 +821,14 @@ impl PluginRuntime {
     /// The deterministic entry point for the transient/bounded guarantee (the
     /// application calls [`Self::expire_overlay_captures`] each tick).
     pub fn expire_overlay_captures_at(&mut self, now: Instant) -> bool {
-        self.overlay_capture.borrow_mut().revoke_expired_at(now)
+        let session = self.live_capture_session();
+        let expired = self.overlay_capture.borrow_mut().revoke_expired_at(now);
+        if expired {
+            if let Some((plugin, handle)) = session {
+                self.drop_ended_spec_overlay(&plugin, handle);
+            }
+        }
+        expired
     }
 
     /// Revoke any overlay capture past its deadline at the current instant.

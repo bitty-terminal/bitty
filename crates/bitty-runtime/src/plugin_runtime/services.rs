@@ -9,14 +9,14 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::{Rc, Weak};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bitty_lua::ui::UiSlot;
 use bitty_lua::ui::{UI_MAX_AGGREGATED_TEXT_BYTES, UI_MAX_BLOCKS, UiNode};
 use bitty_lua::{
-    BridgeError, HostServices, LuaValue, LuaVm, SNAPSHOT_MAX_BYTES, ServiceRoute, StashedFunction,
-    WORKSPACE_LIST_MAX_ITEMS, WorkspaceInfo, WorkspaceRequest, env_grant_shape_ok,
-    validate_env_key,
+    BridgeError, E_UI_NOT_OWNER, E_UI_UNAVAILABLE, HostServices, LuaValue, LuaVm, OverlayInput,
+    SNAPSHOT_MAX_BYTES, ServiceRoute, StashedFunction, WORKSPACE_LIST_MAX_ITEMS, WorkspaceInfo,
+    WorkspaceRequest, env_grant_shape_ok, validate_env_key,
 };
 use bitty_package::Version;
 use bitty_plugin_host::bundled::{WORKSPACELINE_CLAIM, canonicalize_ui_claim};
@@ -25,6 +25,7 @@ use crate::runtime::band_slots::{UiSlotPlacement, ui_slot_placement, unsupported
 use bitty_plugin_host::{ProvidedService, service_version_satisfies, value_satisfies_schema};
 
 use super::debug::{self, DebugView, TraceHub, TraceRequest};
+use super::overlay::{OVERLAY_CAPTURE_TIMEOUT_MS, OverlayCapture};
 use super::store::{self, PluginStore};
 
 /// Maximum characters of a provider failure message relayed to the consumer
@@ -687,6 +688,7 @@ pub struct PluginServices {
     spawn_backend: RefCell<Option<SpawnHandler>>,
     ui_access: RefCell<UiAccess>,
     ui_blocks: RefCell<UiBlocks>,
+    overlay_capture: RefCell<Option<Rc<RefCell<OverlayCapture>>>>,
     env_grants: RefCell<BTreeSet<String>>,
     env_source: RefCell<Rc<dyn EnvSource>>,
     service_provided: RefCell<Vec<ProvidedService>>,
@@ -728,6 +730,7 @@ impl PluginServices {
             spawn_backend: RefCell::new(None),
             ui_access: RefCell::new(UiAccess::default()),
             ui_blocks: RefCell::new(UiBlocks::new()),
+            overlay_capture: RefCell::new(None),
             env_grants: RefCell::new(BTreeSet::new()),
             env_source: RefCell::new(Rc::new(EmptyEnv)),
             service_provided: RefCell::new(Vec::new()),
@@ -801,6 +804,21 @@ impl PluginServices {
     /// generations never collide.
     pub fn set_ui_epoch(&self, epoch: u32) {
         self.ui_blocks.borrow_mut().set_epoch(epoch);
+    }
+
+    /// Attach the runtime-shared focusable-overlay capture switch (CTX-0941).
+    ///
+    /// The runtime wires one manager across every generation so the
+    /// single-owner invariant holds across plugins and reload. A generation
+    /// whose services were built without wiring keeps `None` and every overlay
+    /// capture call fails closed with `E_UI_UNAVAILABLE`.
+    pub fn set_overlay_capture(&self, capture: Rc<RefCell<OverlayCapture>>) {
+        *self.overlay_capture.borrow_mut() = Some(capture);
+    }
+
+    /// The shared capture manager, if one was wired.
+    fn overlay_capture(&self) -> Option<Rc<RefCell<OverlayCapture>>> {
+        self.overlay_capture.borrow().clone()
     }
 
     /// Invalidate every block handle this generation minted (suspend/dispose).
@@ -1192,6 +1210,78 @@ impl HostServices for PluginServices {
         self.ui_blocks
             .borrow_mut()
             .update(handle, component.clone())
+    }
+
+    fn ui_overlay_acquire_with_expiry(
+        &self,
+        handle: i64,
+        expiry: Instant,
+    ) -> Result<(), BridgeError> {
+        // Check-then-act: never transfer capture authority after the call
+        // deadline (CTX-0464 path, CTX-0941).
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        let Some(capture) = self.overlay_capture() else {
+            return Err(BridgeError::new(
+                "runtime",
+                E_UI_UNAVAILABLE,
+                "host has no ui overlay capture surface",
+            ));
+        };
+        if !self.ui_access.borrow().overlay {
+            return Err(BridgeError::capability_denied("ui.overlay"));
+        }
+        // Only a block this generation mounted into the focusable `overlay`
+        // slot can own capture; a foreign or non-overlay handle is typed.
+        let is_overlay = self
+            .ui_blocks
+            .borrow()
+            .get(handle)
+            .is_some_and(|block| block.ui_slot() == UiSlot::Overlay);
+        if !is_overlay {
+            return Err(BridgeError::new(
+                "runtime",
+                E_UI_NOT_OWNER,
+                "handle is not a mounted overlay block of this generation",
+            ));
+        }
+        let session_expiry = Instant::now() + Duration::from_millis(OVERLAY_CAPTURE_TIMEOUT_MS);
+        capture
+            .borrow_mut()
+            .acquire(&self.plugin_id, handle, session_expiry)
+    }
+
+    fn ui_overlay_acquire(&self, handle: i64) -> Result<(), BridgeError> {
+        self.ui_overlay_acquire_with_expiry(
+            handle,
+            Instant::now() + Duration::from_millis(OVERLAY_CAPTURE_TIMEOUT_MS),
+        )
+    }
+
+    fn ui_overlay_release(&self, handle: i64) -> Result<bool, BridgeError> {
+        // Release never checks the grant: a capture whose grant was revoked
+        // mid-session must still be releasable, and a foreign/repeated release
+        // is an idempotent `false` (never an error) so input can never wedge.
+        let Some(capture) = self.overlay_capture() else {
+            return Err(BridgeError::new(
+                "runtime",
+                E_UI_UNAVAILABLE,
+                "host has no ui overlay capture surface",
+            ));
+        };
+        Ok(capture.borrow_mut().release(&self.plugin_id, handle))
+    }
+
+    fn ui_overlay_poll(&self, handle: i64, max: usize) -> Result<Vec<OverlayInput>, BridgeError> {
+        let Some(capture) = self.overlay_capture() else {
+            return Err(BridgeError::new(
+                "runtime",
+                E_UI_UNAVAILABLE,
+                "host has no ui overlay capture surface",
+            ));
+        };
+        capture.borrow_mut().poll(&self.plugin_id, handle, max)
     }
 
     fn service_provide_check(&self, iface: &str) -> Result<(), BridgeError> {
@@ -1886,15 +1976,18 @@ mod tests {
             overlay: true,
             claims: Vec::new(),
         });
-        // CTX-0923: with the grant, the band host still has no overlay
-        // surface, so the mount fails closed instead of being stored and
-        // never rendered.
-        let error = services
-            .ui_mount("overlay", &UiNode::text("unhosted"))
-            .expect_err("overlay is not hosted yet");
-        assert_eq!(error.code, crate::E_UI_UNAVAILABLE);
-        assert_eq!(error.class, "runtime");
-        services.with_ui_blocks(|blocks| assert_eq!(blocks.len(), 1));
+        // CTX-0941: with the grant, the Core hosts the focusable overlay and
+        // retains the block (not a band) so it can own the transient capture.
+        let handle = services
+            .ui_mount("overlay", &UiNode::text("hosted"))
+            .expect("overlay is hosted");
+        services.with_ui_blocks(|blocks| {
+            assert_eq!(blocks.len(), 2);
+            assert_eq!(
+                blocks.get(handle).map(UiBlock::ui_slot),
+                Some(UiSlot::Overlay)
+            );
+        });
     }
 
     #[test]
@@ -1941,7 +2034,7 @@ mod tests {
         for slot in UiSlot::ALL {
             let result = services.ui_mount(slot.as_str(), &UiNode::text(slot.as_str()));
             match ui_slot_placement(slot) {
-                UiSlotPlacement::Band(_) => {
+                UiSlotPlacement::Band(_) | UiSlotPlacement::Overlay => {
                     let handle = result.unwrap_or_else(|e| panic!("{slot}: {e:?}"));
                     services.with_ui_blocks(|blocks| {
                         assert_eq!(blocks.get(handle).map(UiBlock::ui_slot), Some(slot));
@@ -1953,8 +2046,8 @@ mod tests {
                 }
             }
         }
-        // top, bottom, left, right, statusline
-        services.with_ui_blocks(|blocks| assert_eq!(blocks.len(), 5));
+        // top, bottom, left, right, statusline, overlay
+        services.with_ui_blocks(|blocks| assert_eq!(blocks.len(), 6));
     }
 
     #[test]

@@ -59,7 +59,11 @@ pub enum UiSlot {
     Tabline,
     /// `statusline` — composable status components.
     Statusline,
-    /// `overlay` — non-focusable presentation overlay (needs `ui.overlay`).
+    /// `overlay` — Core-hosted focusable overlay (needs `ui.overlay`).
+    ///
+    /// The v1 slot was presentation-only; the Core host now retains the block
+    /// as a focusable-overlay surface that can own the transient input capture
+    /// through `bitty.ui.overlay.*` (CTX-0941, OQ-056 v2 scope).
     Overlay,
 }
 

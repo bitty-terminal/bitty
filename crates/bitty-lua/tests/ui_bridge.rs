@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 use bitty_lua::gate::{PluginVmBuilder, VmBudgets, build_plugin_vm};
 use bitty_lua::ui::{UI_MAX_NODES, UI_MAX_TEXT_BYTES};
 use bitty_lua::{
-    BoundedExecution, BridgeError, HostServices, LuaValue, LuaVm, MarshallingLimits, UiNode,
+    BoundedExecution, BridgeError, HostServices, LuaValue, LuaVm, MarshallingLimits, OverlayInput,
+    UiNode,
 };
 
 /// Gate-built VM with default RC budgets (replaces deprecated `LuaVm::new`).
@@ -29,6 +30,11 @@ struct UiServices {
     updates: RefCell<Vec<(i64, UiNode)>>,
     deny: Option<&'static str>,
     slow_ms: u64,
+    overlay_deny: Option<&'static str>,
+    overlay_acquires: RefCell<Vec<i64>>,
+    overlay_releases: RefCell<Vec<i64>>,
+    overlay_polls: RefCell<Vec<(i64, usize)>>,
+    overlay_events: RefCell<Vec<OverlayInput>>,
 }
 
 impl HostServices for UiServices {
@@ -84,6 +90,25 @@ impl HostServices for UiServices {
         }
         self.updates.borrow_mut().push((handle, component.clone()));
         Ok(handle == 11)
+    }
+
+    fn ui_overlay_acquire(&self, handle: i64) -> Result<(), BridgeError> {
+        if let Some(capability) = self.overlay_deny {
+            return Err(BridgeError::capability_denied(capability));
+        }
+        self.overlay_acquires.borrow_mut().push(handle);
+        Ok(())
+    }
+
+    fn ui_overlay_release(&self, handle: i64) -> Result<bool, BridgeError> {
+        self.overlay_releases.borrow_mut().push(handle);
+        Ok(true)
+    }
+
+    fn ui_overlay_poll(&self, handle: i64, max: usize) -> Result<Vec<OverlayInput>, BridgeError> {
+        self.overlay_polls.borrow_mut().push((handle, max));
+        let take = max.min(self.overlay_events.borrow().len());
+        Ok(self.overlay_events.borrow_mut().drain(..take).collect())
     }
 }
 
@@ -551,4 +576,187 @@ fn expired_mount_returns_timeout_without_commit() {
         services.mounts.borrow().is_empty(),
         "an expired mount must not commit a block"
     );
+}
+
+/// CTX-0941: the focusable-overlay capture surface is present, read-only, and
+/// routes acquire/release/poll through the shared host boundary. The plugin
+/// observes captured input only through `poll`; no callback is registered on
+/// the input path.
+#[test]
+fn overlay_capture_surface_round_trips_through_host() {
+    let services = Rc::new(UiServices::default());
+    let mut vm = gate_vm("overlay-capture");
+    install(&mut vm, services.clone(), 50);
+    run(
+        &mut vm,
+        r#"
+        bitty.store.set("overlay_type", type(bitty.ui.overlay))
+        local acquire_ok, acquire_err = pcall(bitty.ui.overlay.acquire, 11)
+        local release_ok, release_err = pcall(bitty.ui.overlay.release, 11)
+        local events = bitty.ui.overlay.poll(11, 4)
+        bitty.store.set("acquire_ok", acquire_ok)
+        bitty.store.set("release_ok", release_ok)
+        bitty.store.set("poll_count", #events)
+        bitty.store.set("acquire_code", acquire_ok and "NONE" or acquire_err.code)
+        bitty.store.set("release_code", release_ok and "NONE" or release_err.code)
+    "#,
+    );
+    assert_eq!(
+        stored(&services, "overlay_type"),
+        Some(LuaValue::String("table".to_string()))
+    );
+    assert_eq!(stored(&services, "acquire_ok"), Some(LuaValue::Bool(true)));
+    assert_eq!(stored(&services, "release_ok"), Some(LuaValue::Bool(true)));
+    assert_eq!(stored(&services, "poll_count"), Some(LuaValue::Integer(0)));
+    assert_eq!(services.overlay_acquires.borrow().as_slice(), &[11]);
+    assert_eq!(services.overlay_releases.borrow().as_slice(), &[11]);
+    assert_eq!(services.overlay_polls.borrow().as_slice(), &[(11, 4)]);
+}
+
+/// CTX-0941: `bitty.ui.overlay` is nested in the read-only `bitty.ui` table.
+#[test]
+fn overlay_capture_table_is_read_only() {
+    let services = Rc::new(UiServices::default());
+    let mut vm = gate_vm("overlay-readonly");
+    install(&mut vm, services, 50);
+    for chunk in [
+        "bitty.ui.overlay = {}",
+        "bitty.ui.overlay.acquire = function() end",
+    ] {
+        let outcome = vm.execute_bounded(chunk).expect("execute");
+        assert!(
+            matches!(outcome, BoundedExecution::RuntimeError(_)),
+            "{chunk}: assignment must fail: {outcome:?}"
+        );
+    }
+}
+
+/// CTX-0941: captured input arrives as bounded `{sequence, kind, text}` rows.
+#[test]
+fn overlay_poll_returns_bounded_events() {
+    let services = Rc::new(UiServices::default());
+    services.overlay_events.borrow_mut().extend([
+        OverlayInput {
+            sequence: 1,
+            kind: "text".to_string(),
+            text: "hello".to_string(),
+        },
+        OverlayInput {
+            sequence: 2,
+            kind: "key".to_string(),
+            text: "enter".to_string(),
+        },
+    ]);
+    let mut vm = gate_vm("overlay-events");
+    install(&mut vm, services.clone(), 50);
+    run(
+        &mut vm,
+        r#"
+        local first = bitty.ui.overlay.poll(11)
+        bitty.store.set("n", #first)
+        bitty.store.set("kind1", first[1].kind)
+        bitty.store.set("text1", first[1].text)
+        bitty.store.set("seq1", first[1].sequence)
+    "#,
+    );
+    assert_eq!(stored(&services, "n"), Some(LuaValue::Integer(2)));
+    assert_eq!(
+        stored(&services, "kind1"),
+        Some(LuaValue::String("text".to_string()))
+    );
+    assert_eq!(
+        stored(&services, "text1"),
+        Some(LuaValue::String("hello".to_string()))
+    );
+    assert_eq!(stored(&services, "seq1"), Some(LuaValue::Integer(1)));
+}
+
+/// CTX-0941: a non-integer overlay handle is a typed component error before
+/// any host call.
+#[test]
+fn overlay_rejects_non_integer_handle() {
+    let services = Rc::new(UiServices::default());
+    let mut vm = gate_vm("overlay-handle");
+    install(&mut vm, services.clone(), 50);
+    run(
+        &mut vm,
+        r#"
+        local ok, err = pcall(bitty.ui.overlay.acquire, "11")
+        bitty.store.set("code", ok and "NONE" or err.code)
+    "#,
+    );
+    assert_eq!(
+        stored(&services, "code"),
+        Some(LuaValue::String("E_UI_COMPONENT_INVALID".to_string()))
+    );
+    assert!(services.overlay_acquires.borrow().is_empty());
+}
+
+/// CTX-0941: a host without a capture backend fails closed typed, and the
+/// capture grant denial propagates typed.
+#[test]
+fn overlay_capture_fails_closed_without_grant_or_backend() {
+    let denied = Rc::new(UiServices {
+        overlay_deny: Some("ui.overlay"),
+        ..UiServices::default()
+    });
+    let mut vm = gate_vm("overlay-denied");
+    install(&mut vm, denied.clone(), 50);
+    run(
+        &mut vm,
+        r#"
+        local ok, err = pcall(bitty.ui.overlay.acquire, 11)
+        bitty.store.set("code", ok and "NONE" or err.code)
+    "#,
+    );
+    assert_eq!(
+        stored(&denied, "code"),
+        Some(LuaValue::String("E_CAPABILITY_DENIED".to_string()))
+    );
+
+    #[derive(Default)]
+    struct Bare {
+        store: RefCell<BTreeMap<String, LuaValue>>,
+    }
+    impl HostServices for Bare {
+        fn store_get(&self, key: &str) -> Result<Option<LuaValue>, BridgeError> {
+            Ok(self.store.borrow().get(key).cloned())
+        }
+        fn store_set(&self, key: &str, value: LuaValue) -> Result<(), BridgeError> {
+            self.store.borrow_mut().insert(key.to_string(), value);
+            Ok(())
+        }
+        fn settings_get(&self, _key: &str) -> Result<Option<LuaValue>, BridgeError> {
+            Ok(None)
+        }
+        fn terminal_snapshot(&self, _scope: &str) -> Result<LuaValue, BridgeError> {
+            Err(BridgeError::capability_denied("terminal.semantic-read"))
+        }
+        fn notify_show(&self, _payload: &LuaValue) -> Result<bool, BridgeError> {
+            Err(BridgeError::capability_denied("platform.notify"))
+        }
+    }
+    let services = Rc::new(Bare::default());
+    let services_dyn: Rc<dyn HostServices> = services.clone();
+    let mut vm = gate_vm("overlay-bare");
+    vm.install_host_module(services_dyn, MarshallingLimits::default(), 50)
+        .expect("install");
+    run(
+        &mut vm,
+        r#"
+        local acquire_ok, acquire_err = pcall(bitty.ui.overlay.acquire, 11)
+        local release_ok, release_err = pcall(bitty.ui.overlay.release, 11)
+        local poll_ok, poll_err = pcall(bitty.ui.overlay.poll, 11)
+        bitty.store.set("acquire_code", acquire_ok and "NONE" or acquire_err.code)
+        bitty.store.set("release_code", release_ok and "NONE" or release_err.code)
+        bitty.store.set("poll_code", poll_ok and "NONE" or poll_err.code)
+    "#,
+    );
+    for key in ["acquire_code", "release_code", "poll_code"] {
+        assert_eq!(
+            services.store.borrow().get(key),
+            Some(&LuaValue::String("E_UI_UNAVAILABLE".to_string())),
+            "{key}"
+        );
+    }
 }

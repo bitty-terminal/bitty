@@ -18,7 +18,7 @@
 //! | `left`       | left edge band — stored, not painted until vertical bands ship |
 //! | `right`      | right edge band — stored, not painted until vertical bands ship |
 //! | `tabline`    | rejected: reserved for PW-10 panel tabs, not a band surface |
-//! | `overlay`    | rejected: no plugin overlay host in the band renderer yet |
+//! | `overlay`    | Core focusable-overlay host (CTX-0941): retained, not a band surface |
 //! | `terminal`   | rejected: no terminal-attached block host yet          |
 //!
 //! Rejected slots fail closed at `ui.mount` with the existing v1 code
@@ -76,6 +76,11 @@ pub enum BandEdge {
 pub enum UiSlotPlacement {
     /// Mounted content joins the band on this edge.
     Band(BandEdge),
+    /// The slot is served by the Core focusable-overlay surface (CTX-0941):
+    /// the block is retained in the generation registry and may own the
+    /// transient input capture, but it is not routed to a chrome band. The
+    /// overlay presentation host (not this band renderer) consumes it.
+    Overlay,
     /// The slot is accepted by the v1 contract but not hosted; mounts fail
     /// closed with [`E_UI_UNAVAILABLE`] and this reason.
     Unsupported(&'static str),
@@ -92,9 +97,10 @@ pub const fn ui_slot_placement(slot: UiSlot) -> UiSlotPlacement {
         UiSlot::Tabline => UiSlotPlacement::Unsupported(
             "is reserved for panel tabs (PW-10) and has no host surface yet",
         ),
-        UiSlot::Overlay => {
-            UiSlotPlacement::Unsupported("has no plugin overlay host in this build yet")
-        }
+        // CTX-0941: the `overlay` slot is a Core-hosted focusable overlay. The
+        // block is retained (not a band) and may own the transient input
+        // capture through `bitty.ui.overlay.*`.
+        UiSlot::Overlay => UiSlotPlacement::Overlay,
         UiSlot::Terminal => {
             UiSlotPlacement::Unsupported("has no terminal-attached block host in this build yet")
         }
@@ -153,6 +159,9 @@ impl ChromeBands {
                     root,
                     version,
                 }),
+                // Hosted by the focusable-overlay surface, not by a band;
+                // skipping it here is a placement, not a silent drop.
+                UiSlotPlacement::Overlay => {}
                 UiSlotPlacement::Unsupported(_) => unplaced = unplaced.saturating_add(1),
             }
         }
@@ -239,7 +248,8 @@ mod tests {
                 UiSlot::Bottom | UiSlot::Statusline => UiSlotPlacement::Band(BandEdge::Bottom),
                 UiSlot::Left => UiSlotPlacement::Band(BandEdge::Left),
                 UiSlot::Right => UiSlotPlacement::Band(BandEdge::Right),
-                UiSlot::Tabline | UiSlot::Overlay | UiSlot::Terminal => {
+                UiSlot::Overlay => UiSlotPlacement::Overlay,
+                UiSlot::Tabline | UiSlot::Terminal => {
                     assert!(matches!(
                         ui_slot_placement(slot),
                         UiSlotPlacement::Unsupported(_)
@@ -279,12 +289,18 @@ mod tests {
 
     #[test]
     fn from_mounts_counts_unsupported_slots_instead_of_dropping_silently() {
-        let (bands, unplaced) = ChromeBands::from_mounts([
-            block("t", UiSlot::Tabline),
-            block("o", UiSlot::Overlay),
-            block("x", UiSlot::Terminal),
-        ]);
-        assert_eq!(unplaced, 3);
+        let (bands, unplaced) =
+            ChromeBands::from_mounts([block("t", UiSlot::Tabline), block("x", UiSlot::Terminal)]);
+        assert_eq!(unplaced, 2);
+        assert!(bands.top.is_empty() && bands.bottom.is_empty());
+    }
+
+    #[test]
+    fn from_mounts_places_the_focusable_overlay_without_a_band() {
+        // CTX-0941: the overlay is a hosted placement, so it is neither a
+        // band nor counted as unplaced.
+        let (bands, unplaced) = ChromeBands::from_mounts([block("o", UiSlot::Overlay)]);
+        assert_eq!(unplaced, 0);
         assert!(bands.top.is_empty() && bands.bottom.is_empty());
     }
 

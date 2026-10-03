@@ -1029,6 +1029,12 @@ impl PluginRuntime {
         let debug_trace = granted
             .iter()
             .any(|capability| capability.as_str() == "debug.trace");
+        let panel_create = granted
+            .iter()
+            .any(|capability| capability.as_str() == "panel.create");
+        let panel_focus = granted
+            .iter()
+            .any(|capability| capability.as_str() == "panel.focus");
         // CTX-0889: the workspace domain grants are independent (read never
         // implies control, control never implies read).
         let workspace_read = granted
@@ -1099,6 +1105,7 @@ impl PluginRuntime {
         // the `grants` target serves only this generation's own snapshot.
         plugin_services.set_debug_inspect(debug_inspect);
         plugin_services.set_debug_trace(debug_trace);
+        plugin_services.set_panel_access(panel_create, panel_focus);
         plugin_services.set_granted_capabilities(
             granted
                 .iter()

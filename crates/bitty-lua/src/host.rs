@@ -1272,6 +1272,76 @@ pub trait HostServices {
         self.debug_control(action, target)
     }
 
+    /// Create a new panel for `bitty.panel.create` (CTX-0915, Issue #1596).
+    ///
+    /// Grant-gated on `panel.create`; returns `(id, generation)` tuple for the
+    /// newly created panel. `panel_type` is one of `"terminal"`, `"rich"`,
+    /// `"browser"`, `"helper"`, or `"canvas"`. The default denies: a host
+    /// without a panel backend never grants ambient panel creation.
+    fn panel_create(&self, panel_type: &str) -> Result<(u64, u64), BridgeError> {
+        let _ = panel_type;
+        Err(BridgeError::capability_denied("panel.create"))
+    }
+
+    /// Close a panel for `bitty.panel.close` (CTX-0915).
+    ///
+    /// Grant-gated on `panel.focus`; returns whether the panel was closed.
+    /// The default denies.
+    fn panel_close(&self, panel_id: u64) -> Result<bool, BridgeError> {
+        let _ = panel_id;
+        Err(BridgeError::capability_denied("panel.focus"))
+    }
+
+    /// Destroy a panel for `bitty.panel.destroy` (CTX-0915).
+    ///
+    /// Grant-gated on `panel.focus`; returns whether the panel was destroyed.
+    /// The default denies.
+    fn panel_destroy(&self, panel_id: u64) -> Result<bool, BridgeError> {
+        let _ = panel_id;
+        Err(BridgeError::capability_denied("panel.focus"))
+    }
+
+    /// Get panel presentation mode for `bitty.panel.get_presentation` (CTX-0915).
+    ///
+    /// Grant-gated on `panel.focus`; returns the presentation mode string
+    /// (`"tiled"`, `"floating"`, `"fullscreen"`, `"scratchpad"`) or `None`
+    /// if the panel does not exist. The default denies.
+    fn panel_get_presentation(&self, panel_id: u64) -> Result<Option<String>, BridgeError> {
+        let _ = panel_id;
+        Err(BridgeError::capability_denied("panel.focus"))
+    }
+
+    /// Set panel presentation mode for `bitty.panel.set_presentation` (CTX-0915).
+    ///
+    /// Grant-gated on `panel.focus`; returns whether the mode was set.
+    /// The default denies.
+    fn panel_set_presentation(
+        &self,
+        panel_id: u64,
+        presentation: &str,
+    ) -> Result<bool, BridgeError> {
+        let _ = (panel_id, presentation);
+        Err(BridgeError::capability_denied("panel.focus"))
+    }
+
+    /// Toggle floating mode for `bitty.panel.toggle_floating` (CTX-0915).
+    ///
+    /// Grant-gated on `panel.focus`; returns whether the toggle succeeded.
+    /// The default denies.
+    fn panel_toggle_floating(&self, panel_id: u64) -> Result<bool, BridgeError> {
+        let _ = panel_id;
+        Err(BridgeError::capability_denied("panel.focus"))
+    }
+
+    /// Get panel state for `bitty.panel.get_state` (CTX-0915).
+    ///
+    /// Grant-gated on `panel.focus`; returns a table with panel state fields
+    /// or `None` if the panel does not exist. The default denies.
+    fn panel_get_state(&self, panel_id: u64) -> Result<Option<LuaValue>, BridgeError> {
+        let _ = panel_id;
+        Err(BridgeError::capability_denied("panel.focus"))
+    }
+
     /// List workspaces for `bitty.workspace.list()` (CTX-0889, ADR-0014).
     ///
     /// Grant-gated on `workspace.read` (`E_CAPABILITY_DENIED` otherwise);
@@ -3222,6 +3292,261 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         )
         .expect("debug table accepts 'control'");
 
+    // CTX-0915: `bitty.panel` API for panel lifecycle and presentation control
+    // (Issue #1596). Grant-gated on `panel.create` (creation) and `panel.focus`
+    // (manipulation/queries). Backend wiring to PanelRegistry is deferred.
+    let panel = Table::new(&ctx);
+    panel
+        .set(
+            ctx,
+            "create",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let args = match stack.get(0) {
+                        Value::Table(t) => t,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_DEF_INVALID",
+                                "panel.create requires a table argument { type = \"...\" }",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let panel_type = match args.get(ctx, "type") {
+                        Ok(Value::String(s)) => {
+                            let type_str = String::from_utf8_lossy(s.as_bytes()).into_owned();
+                            // Validate against documented panel types
+                            match type_str.as_str() {
+                                "terminal" | "rich" | "browser" | "helper" | "canvas" => type_str,
+                                _ => {
+                                    return Err(BridgeError::new(
+                                        "validation",
+                                        "E_DEF_INVALID",
+                                        "panel.create type must be terminal, rich, browser, helper, or canvas",
+                                    )
+                                    .to_error(ctx));
+                                }
+                            }
+                        }
+                        Ok(_) => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_DEF_INVALID",
+                                "panel.create type field must be a string",
+                            )
+                            .to_error(ctx));
+                        }
+                        Err(_) => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_DEF_INVALID",
+                                "panel.create requires a 'type' field in the argument table",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let (id, generation) = state
+                        .bounded_mutation(|_expiry| state.services.panel_create(&panel_type))
+                        .map_err(|e| e.to_error(ctx))?;
+                    let result = Table::new(&ctx);
+                    result.set(ctx, "id", id as i64).expect("result accepts id");
+                    result
+                        .set(ctx, "generation", generation as i64)
+                        .expect("result accepts generation");
+                    stack.replace(ctx, Value::Table(result));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("panel table accepts 'create'");
+    panel
+        .set(
+            ctx,
+            "close",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let panel_id = match stack.get(0) {
+                        Value::Integer(id) => id as u64,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_DEF_INVALID",
+                                "panel.close id must be an integer",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let closed = state
+                        .bounded_mutation(|_expiry| state.services.panel_close(panel_id))
+                        .map_err(|e| e.to_error(ctx))?;
+                    stack.replace(ctx, Value::Boolean(closed));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("panel table accepts 'close'");
+    panel
+        .set(
+            ctx,
+            "destroy",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let panel_id = match stack.get(0) {
+                        Value::Integer(id) => id as u64,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_DEF_INVALID",
+                                "panel.destroy id must be an integer",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let destroyed = state
+                        .bounded_mutation(|_expiry| state.services.panel_destroy(panel_id))
+                        .map_err(|e| e.to_error(ctx))?;
+                    stack.replace(ctx, Value::Boolean(destroyed));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("panel table accepts 'destroy'");
+    panel
+        .set(
+            ctx,
+            "get_presentation",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let panel_id = match stack.get(0) {
+                        Value::Integer(id) => id as u64,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_DEF_INVALID",
+                                "panel.get_presentation id must be an integer",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let presentation = state
+                        .bounded(|_expiry| state.services.panel_get_presentation(panel_id))
+                        .map_err(|e| e.to_error(ctx))?;
+                    match presentation {
+                        Some(mode) => {
+                            stack.replace(ctx, Value::String(ctx.intern(mode.as_bytes())));
+                        }
+                        None => stack.replace(ctx, Value::Nil),
+                    }
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("panel table accepts 'get_presentation'");
+    panel
+        .set(
+            ctx,
+            "set_presentation",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let panel_id = match stack.get(0) {
+                        Value::Integer(id) => id as u64,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_DEF_INVALID",
+                                "panel.set_presentation id must be an integer",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let presentation = match stack.get(1) {
+                        Value::String(s) => String::from_utf8_lossy(s.as_bytes()).into_owned(),
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_DEF_INVALID",
+                                "panel.set_presentation mode must be a string",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let set = state
+                        .bounded_mutation(|_expiry| {
+                            state
+                                .services
+                                .panel_set_presentation(panel_id, &presentation)
+                        })
+                        .map_err(|e| e.to_error(ctx))?;
+                    stack.replace(ctx, Value::Boolean(set));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("panel table accepts 'set_presentation'");
+    panel
+        .set(
+            ctx,
+            "toggle_floating",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let panel_id = match stack.get(0) {
+                        Value::Integer(id) => id as u64,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_DEF_INVALID",
+                                "panel.toggle_floating id must be an integer",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let toggled = state
+                        .bounded_mutation(|_expiry| state.services.panel_toggle_floating(panel_id))
+                        .map_err(|e| e.to_error(ctx))?;
+                    stack.replace(ctx, Value::Boolean(toggled));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("panel table accepts 'toggle_floating'");
+    panel
+        .set(
+            ctx,
+            "get_state",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let panel_id = match stack.get(0) {
+                        Value::Integer(id) => id as u64,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_DEF_INVALID",
+                                "panel.get_state id must be an integer",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let panel_state = state
+                        .bounded(|_expiry| state.services.panel_get_state(panel_id))
+                        .map_err(|e| e.to_error(ctx))?;
+                    match panel_state {
+                        Some(state_value) => stack.replace(ctx, state_value.to_lua(ctx)),
+                        None => stack.replace(ctx, Value::Nil),
+                    }
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("panel table accepts 'get_state'");
+
     // CTX-0889 (ADR-0014): `bitty.workspace.*` L1 domain. `list` is a
     // `workspace.read` read (`bounded`); every mutation is gated on
     // `workspace.control` and only enqueues a bounded request (mutation
@@ -3799,6 +4124,8 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         .expect("root accepts env");
     root.set(ctx, "debug", readonly_table(ctx, debug))
         .expect("root accepts debug");
+    root.set(ctx, "panel", readonly_table(ctx, panel))
+        .expect("root accepts panel");
     root.set(ctx, "workspace", readonly_table(ctx, workspace))
         .expect("root accepts workspace");
     Value::Table(readonly_table(ctx, root))

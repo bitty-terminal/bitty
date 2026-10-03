@@ -46,6 +46,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Panel Lua API (CTX-0915, #1596):** plugins can now control panel lifecycle
+  and presentation through `bitty.panel`. `panel.create({ type })` creates panels
+  (types: "terminal", "rich", "browser", "helper", "canvas"); `panel.close(id)`
+  and `panel.destroy(id)` manage lifecycle. Presentation mode queries and updates:
+  `panel.get_presentation(id)` / `panel.set_presentation(id, mode)` for
+  "tiled"/"floating"/"fullscreen"/"scratchpad" modes; `panel.toggle_floating(id)`
+  shortcuts tiled↔floating. `panel.get_state(id)` queries lifecycle state
+  (Declared/Created/Mounted/Focused/Suspended/Disposed). Gated by `panel.create`
+  (creation) and `panel.focus` (manipulation/queries). Backend wiring to
+  `PanelRegistry` is deferred; methods currently return placeholder values.
+
 - **Bounded storage seam (CTX-0939, #1622, W-146):** session and plugin-KV
   durable-commit mechanics now live behind Core-owned traits
   (`SessionFileBackend`, `KvCommitBackend`): Core keeps capture, restore

@@ -1063,6 +1063,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     fn is_env_name(s: &str) -> bool {
         let mut chars = s.chars();
         match chars.next() {

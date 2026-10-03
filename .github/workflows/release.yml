@@ -109,11 +109,11 @@ jobs:
             target: aarch64-pc-windows-msvc
             arch: arm64
             packagers: ""
-          - os: macos-14
+          - os: macos-15
             target: x86_64-apple-darwin
             arch: amd64
             packagers: ""
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             arch: arm64
             packagers: ""
@@ -567,7 +567,7 @@ jobs:
   macos-universal:
     name: macOS Universal 2 DMG
     needs: build
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

@@ -734,6 +734,18 @@ impl PluginRuntime {
         self.overlay_capture.borrow_mut().enqueue(kind, text)
     }
 
+    /// Enqueue a pointer-motion event with trailing-motion coalescing (see
+    /// [`OverlayCapture::enqueue_move`]).
+    pub fn push_overlay_move(&mut self, text: &str) -> bool {
+        self.overlay_capture.borrow_mut().enqueue_move(text)
+    }
+
+    /// Absolute monotonic deadline of the active overlay capture, if any
+    /// (application idle-wake arming; CodeRabbit PR #1643).
+    pub fn overlay_capture_deadline(&self) -> Option<std::time::Instant> {
+        self.overlay_capture.borrow().expiry_deadline()
+    }
+
     /// Revoke the active overlay capture unconditionally (focus switch,
     /// cancel, or an application-side release).
     ///

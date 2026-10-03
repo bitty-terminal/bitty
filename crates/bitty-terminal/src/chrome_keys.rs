@@ -896,6 +896,13 @@ impl TerminalApp {
     /// refusals warn and keep the current layout.
     pub(crate) fn apply_chrome_action(&mut self, action: bitty_config::ChromeAction) {
         use bitty_config::ChromeAction as A;
+        // CTX-0943: a user focus-switch ends the transient input capture
+        // (contract `focus_switched`), wherever the action originates
+        // (key chord, plugin workspace request, ctl verb). Idempotent
+        // no-op with no capture active.
+        if Self::is_overlay_focus_switch(action) {
+            self.revoke_overlay_capture();
+        }
         match action {
             A::GotoSplit(dir) => {
                 let focus = split_dir_to_focus(dir);
@@ -1831,6 +1838,50 @@ impl TerminalApp {
                         return true;
                     }
                     let matched = match_chrome_keymap(&self.chrome.keymaps, keyref);
+                    // CTX-0943: the transient input capture owns the
+                    // keyboard while active — below the copy/search
+                    // modals above, above the user keymap below. Bare
+                    // `Esc` cancels (revoke + consume, never forwarded,
+                    // so no captured event reaches the terminal);
+                    // focus-move chords revoke and fall through so focus
+                    // actually moves; every other press is queued and
+                    // swallowed (no action runs, no PTY bytes).
+                    if self.overlay_capture_active() {
+                        use bitty_config::KeyName as OverlayKey;
+                        if key.is_synthetic {
+                            return false;
+                        }
+                        if keyref.key == OverlayKey::Escape
+                            && !keyref.ctrl
+                            && !keyref.alt
+                            && !keyref.super_held
+                        {
+                            self.revoke_overlay_capture();
+                            if let Some(win) = self.window.handle.as_ref() {
+                                win.request_redraw();
+                            }
+                            return true;
+                        }
+                        match matched {
+                            Some(action) if Self::is_overlay_focus_switch(action) => {
+                                self.revoke_overlay_capture();
+                            }
+                            _ => {
+                                let text = key
+                                    .text
+                                    .clone()
+                                    .unwrap_or_else(|| super::terminal_app::overlay_key_text(key));
+                                self.push_overlay_input("key", &text);
+                                if let Some(win) = self.window.handle.as_ref() {
+                                    win.request_redraw();
+                                }
+                                return true;
+                            }
+                        }
+                        // Focus-switch falls through to normal dispatch
+                        // below, which runs the action through
+                        // `apply_chrome_action` (revoke is idempotent).
+                    }
                     // CTX-0384: copy mode is modal for chrome chords too.
                     // `Esc` routes to the runtime so copy mode exits there
                     // (never the paste/close emergency path while modal);
@@ -1972,6 +2023,12 @@ impl TerminalApp {
                 // CTX-0229: a missed key release while unfocused must not
                 // leave a stale ownership entry swallowing future typing.
                 self.chrome.held.clear();
+                // CTX-0943: losing window focus ends the transient capture
+                // (contract focus-switch release). Idempotent no-op with no
+                // capture; the event still routes so Runtime records focus.
+                if !focused {
+                    self.revoke_overlay_capture();
+                }
                 false
             }
             _ => false,

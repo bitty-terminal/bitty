@@ -550,6 +550,13 @@ pub struct Runtime {
     /// container rect is computed from window_cells minus all reserved bands.
     /// Presentation-only: never grid truth.
     chrome_bands: ChromeBands,
+    /// Core-hosted focusable-overlay surface (CTX-0943, W-28 follow-up).
+    ///
+    /// Populated from `PluginRuntime::ui_blocks()` each tick while the
+    /// transient input capture holds (the owner's `overlay`-slot block).
+    /// `None` with no capture, so the present path is byte-identical to the
+    /// pre-overlay frame. Presentation-only: never grid truth.
+    plugin_overlay: Option<BandContent>,
     /// Full window grid in cells (CTX-0873). The layout `container` is this
     /// rect minus the reserved chrome band
     /// ([`chrome_band::solve`]); resize and the `set_window_cells` seam set it.
@@ -1484,6 +1491,7 @@ impl Runtime {
                 left: Vec::new(),
                 right: Vec::new(),
             },
+            plugin_overlay: None,
         };
         // CTX-0355: install the resolved palette on both the renderer (cell
         // defaults, ANSI, emitted fills) and the surface (clear color).
@@ -1706,6 +1714,7 @@ impl Runtime {
                 left: Vec::new(),
                 right: Vec::new(),
             },
+            plugin_overlay: None,
         };
         // CTX-0355: install the resolved palette on both the renderer (cell
         // defaults, ANSI, emitted fills) and the surface (clear color).
@@ -1915,6 +1924,39 @@ impl Runtime {
     /// plugin_runtime types directly.
     pub fn set_chrome_bands(&mut self, bands: ChromeBands) {
         self.chrome_bands = bands;
+    }
+
+    /// Core-hosted focusable-overlay surface (CTX-0943, W-28 follow-up).
+    ///
+    /// The owner's `overlay`-slot block while the transient input capture
+    /// holds; `None` otherwise. Follows the `ChromeBands` LiveSnapshot
+    /// pattern: TerminalApp reads `PluginRuntime::ui_blocks()`, converts to
+    /// the plain [`BandContent`] struct, and pushes it here.
+    #[must_use]
+    pub fn plugin_overlay(&self) -> Option<&BandContent> {
+        self.plugin_overlay.as_ref()
+    }
+
+    /// Updates the focusable-overlay surface (CTX-0943).
+    ///
+    /// Marks a full redraw only when the surface actually changes (appears,
+    /// clears, or the retained block's version/content moves), so ticks stay
+    /// idle while an unchanged overlay is up. `None` clears the surface.
+    pub fn set_plugin_overlay(&mut self, overlay: Option<BandContent>) {
+        let changed = match (&self.plugin_overlay, &overlay) {
+            (None, None) => false,
+            (None, Some(_)) | (Some(_), None) => true,
+            (Some(current), Some(next)) => {
+                current.plugin_id != next.plugin_id
+                    || current.slot != next.slot
+                    || current.version != next.version
+                    || current.root != next.root
+            }
+        };
+        self.plugin_overlay = overlay;
+        if changed {
+            self.pending_full_redraw = true;
+        }
     }
 
     /// Sets the panel-overlay modal bit (CTX-0482, issue #763).

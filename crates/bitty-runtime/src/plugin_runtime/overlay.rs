@@ -169,6 +169,37 @@ impl OverlayCapture {
         true
     }
 
+    /// Enqueue a pointer-motion event, coalescing with the trailing queued
+    /// motion instead of appending.
+    ///
+    /// A mouse wiggle produces dozens of motion events; appending each one
+    /// would evict key/text entries via drop-oldest before the plugin drains
+    /// them (CodeRabbit PR #1643). Coalescing keeps the latest position while
+    /// consuming exactly one queue slot. Returns `false` when no capture is
+    /// active.
+    pub fn enqueue_move(&mut self, text: &str) -> bool {
+        if self.owner.is_none() {
+            return false;
+        }
+        if let Some(back) = self.queue.back_mut() {
+            if back.kind == "pointer" && back.text.starts_with("move:") {
+                self.next_sequence = self.next_sequence.saturating_add(1);
+                back.sequence = self.next_sequence;
+                back.text = bounded_text(text);
+                return true;
+            }
+        }
+        self.enqueue("pointer", text)
+    }
+
+    /// Absolute monotonic deadline of the active capture, if any.
+    ///
+    /// The application arms its idle wake on this instant so an idle window
+    /// still ticks (and expires the capture) at the deadline instead of
+    /// holding it until unrelated activity (CodeRabbit PR #1643).
+    pub fn expiry_deadline(&self) -> Option<Instant> {
+        self.owner.as_ref().map(|owner| owner.expires_at)
+    }
     /// Revoke the capture if `plugin_id` owns it (suspend, dispose, unload,
     /// disable, crash). Returns whether a capture was dropped.
     pub fn revoke_plugin(&mut self, plugin_id: &str) -> bool {
@@ -392,5 +423,32 @@ mod tests {
             .acquire("b", 2, future(1000))
             .expect("an expired owner must not block a new acquire");
         assert!(capture.is_owner("b", 2));
+    }
+
+    #[test]
+    fn motion_coalesces_into_one_slot() {
+        let mut capture = OverlayCapture::new();
+        assert!(!capture.enqueue_move("move:1,1"), "no owner queues nothing");
+        capture.acquire("a", 1, future(1000)).expect("acquire");
+        assert!(capture.enqueue("key", "x"));
+        for (x, y) in [(1, 1), (2, 2), (3, 3)] {
+            assert!(capture.enqueue_move(&format!("move:{x},{y}")));
+        }
+        assert_eq!(capture.queued_len(), 2, "key + one coalesced move");
+        // A non-move pointer entry breaks the run: the next move appends.
+        assert!(capture.enqueue("pointer", "Left:Pressed"));
+        assert!(capture.enqueue_move("move:4,4"));
+        assert_eq!(capture.queued_len(), 4);
+    }
+
+    #[test]
+    fn deadline_tracks_the_active_owner() {
+        let mut capture = OverlayCapture::new();
+        assert_eq!(capture.expiry_deadline(), None);
+        let deadline = future(1000);
+        capture.acquire("a", 1, deadline).expect("acquire");
+        assert_eq!(capture.expiry_deadline(), Some(deadline));
+        assert!(capture.release("a", 1));
+        assert_eq!(capture.expiry_deadline(), None);
     }
 }

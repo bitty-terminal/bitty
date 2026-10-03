@@ -20,6 +20,15 @@ use bitty_lua::{
 };
 use bitty_package::Version;
 use bitty_plugin_host::bundled::{WORKSPACELINE_CLAIM, canonicalize_ui_claim};
+use bitty_ui::{
+    BeaconAnnotationLayer, BeaconDispatcher, CommandBlockId, DerivedProvider, DispatchError,
+    LabelAllocator, LabelPolicy, LinkId, ProviderError, ProviderMediator, ProviderTarget,
+    QualifiedCommand, Rect, TargetProvider, TargetRef, TargetRegistry,
+};
+use bitty_ui::{
+    MAX_BEACON_BINDINGS, MAX_BEACON_TARGETS, MAX_SNAPSHOT_TARGETS, MAX_TARGET_PROVIDERS,
+};
+use bitty_ui::{PanelId, Point, UiNodeId, WorkspaceId};
 
 use crate::runtime::band_slots::{UiSlotPlacement, ui_slot_placement, unsupported_slot_error};
 use bitty_plugin_host::{ProvidedService, service_version_satisfies, value_satisfies_schema};
@@ -675,7 +684,101 @@ fn service_gone_error(detail: String) -> BridgeError {
     BridgeError::new("runtime", "E_SERVICE_GONE", detail)
 }
 
+/// Map a Core provider failure onto existing typed bridge errors (W-29).
+///
+/// No new error code is introduced: capability stays `E_CAPABILITY_DENIED`,
+/// capacity stays `E_DEF_LIMIT`, stale stays `E_UI_NOT_OWNER`, and malformed
+/// names stay `E_DEF_INVALID`.
+fn map_targets_provider_error(error: ProviderError) -> BridgeError {
+    match error {
+        ProviderError::CapabilityDenied { name } => {
+            BridgeError::capability_denied(&format!("ui.overlay ({name})"))
+        }
+        ProviderError::TooManyProviders { max, current } => BridgeError::new(
+            "budget",
+            "E_DEF_LIMIT",
+            format!("too many target lenses: max {max}, current {current}"),
+        ),
+        ProviderError::TooManyTargets { max, current } => BridgeError::new(
+            "budget",
+            "E_DEF_LIMIT",
+            format!("too many snapshot targets: max {max}, current {current}"),
+        ),
+        ProviderError::StaleSnapshot(detail) => BridgeError::new(
+            "runtime",
+            E_UI_NOT_OWNER,
+            format!("stale snapshot: {detail}"),
+        ),
+        other => BridgeError::new("validation", "E_DEF_INVALID", other.to_string()),
+    }
+}
+
+/// Map a Core label failure onto existing typed bridge errors (W-29).
+fn map_targets_label_error(error: bitty_ui::LabelError) -> BridgeError {
+    match error {
+        bitty_ui::LabelError::TooManyTargets {
+            requested,
+            capacity,
+        } => BridgeError::new(
+            "budget",
+            "E_DEF_LIMIT",
+            format!("too many targets for labels: requested {requested}, capacity {capacity}"),
+        ),
+        other => BridgeError::new("validation", "E_DEF_INVALID", other.to_string()),
+    }
+}
+
+/// Map a Core dispatch failure onto existing typed bridge errors (W-29).
+///
+/// Unknown/expired labels are `E_DEF_INVALID`; stale targets are
+/// `E_UI_NOT_OWNER` (the handle is no longer owned by the live registry);
+/// over-capacity bindings are `E_DEF_LIMIT`.
+fn map_targets_dispatch_error(error: DispatchError) -> BridgeError {
+    match error {
+        DispatchError::UnknownLabel(detail) => {
+            BridgeError::new("validation", "E_DEF_INVALID", detail)
+        }
+        DispatchError::StaleTarget(detail) => BridgeError::new("runtime", E_UI_NOT_OWNER, detail),
+        DispatchError::TooManyBindings { max, current } => BridgeError::new(
+            "budget",
+            "E_DEF_LIMIT",
+            format!("too many bindings: max {max}, current {current}"),
+        ),
+    }
+}
+
+/// Surface kind of a resolved target as a Lua string (W-29).
+fn targets_kind_string(target: &TargetRef) -> String {
+    match target {
+        TargetRef::Panel(_) => "panel".to_string(),
+        TargetRef::Workspace(_) => "workspace".to_string(),
+        TargetRef::CommandBlock(_) => "block".to_string(),
+        TargetRef::UiNode(_) => "node".to_string(),
+        TargetRef::Link(_) => "link".to_string(),
+    }
+}
+
+/// Build one Core offer from a Lua `(kind, id)` pair (W-29).
+///
+/// Kinds are the five `TargetRef` variants; `ViewId` is deliberately absent.
+/// Malformed kinds/ids fail closed with existing `E_DEF_INVALID`.
+fn targets_offer(kind: &str, id: u64) -> Result<ProviderTarget, BridgeError> {
+    match kind {
+        "panel" => Ok(ProviderTarget::Panel(PanelId::new(id))),
+        "workspace" => Ok(ProviderTarget::Workspace(WorkspaceId::new(id))),
+        "block" => Ok(ProviderTarget::CommandBlock(CommandBlockId::new(id))),
+        "node" => Ok(ProviderTarget::UiNode(UiNodeId::new(id))),
+        "link" => Ok(ProviderTarget::Link(LinkId::new(id))),
+        _ => Err(BridgeError::new(
+            "validation",
+            "E_DEF_INVALID",
+            format!("unknown target kind '{kind}'"),
+        )),
+    }
+}
+
 /// Per-generation host services for one plugin.
+#[allow(clippy::type_complexity)]
 pub struct PluginServices {
     plugin_id: String,
     store: RefCell<PluginStore>,
@@ -689,6 +792,33 @@ pub struct PluginServices {
     ui_access: RefCell<UiAccess>,
     ui_blocks: RefCell<UiBlocks>,
     overlay_capture: RefCell<Option<Rc<RefCell<OverlayCapture>>>>,
+    /// Runtime-shared target registry (W-29, CTX-0942, existing `TargetRegistry`).
+    ///
+    /// One registry spans every generation so generations bump and stale
+    /// handles by construction. `None` until the runtime wires the shared
+    /// state; unwired calls fail closed with `E_UI_UNAVAILABLE`.
+    target_registry: RefCell<Option<Rc<RefCell<TargetRegistry>>>>,
+    /// Runtime-shared generic lenses (W-29, existing `DerivedProvider`).
+    ///
+    /// Each entry is `(plugin_id, lens)`; the mediator is rebuilt from the
+    /// Core provider plus these lenses on every cold-path collection (the
+    /// Core mediator has no removal API). Both `plugin` and `derived` tiers
+    /// map onto the existing `Derived` lens (no `Plugin`-tier source exists
+    /// in `bitty-ui`; reuse avoids any new Beacon type).
+    target_lenses: RefCell<Option<Rc<RefCell<Vec<(String, DerivedProvider)>>>>>,
+    /// Runtime-shared label allocator (W-29, existing `LabelAllocator`).
+    label_allocator: RefCell<Option<Rc<RefCell<LabelAllocator>>>>,
+    /// Per-generation label-to-command bindings (W-29, existing `BeaconDispatcher`).
+    ///
+    /// Built on session start, cleared on cancel/dispatch/unload. Never
+    /// shared across generations and never published to the Event Bus.
+    target_dispatcher: RefCell<BeaconDispatcher>,
+    /// Overlay handle of this generation's active targeting session, if any.
+    ///
+    /// Ownership is the existing W-28 overlay capture owner (no new session
+    /// type); this handle only coordinates dispatcher lifetime with capture
+    /// release. `None` means no session.
+    target_session_overlay: RefCell<Option<i64>>,
     env_grants: RefCell<BTreeSet<String>>,
     env_source: RefCell<Rc<dyn EnvSource>>,
     service_provided: RefCell<Vec<ProvidedService>>,
@@ -731,6 +861,11 @@ impl PluginServices {
             ui_access: RefCell::new(UiAccess::default()),
             ui_blocks: RefCell::new(UiBlocks::new()),
             overlay_capture: RefCell::new(None),
+            target_registry: RefCell::new(None),
+            target_lenses: RefCell::new(None),
+            label_allocator: RefCell::new(None),
+            target_dispatcher: RefCell::new(BeaconDispatcher::new()),
+            target_session_overlay: RefCell::new(None),
             env_grants: RefCell::new(BTreeSet::new()),
             env_source: RefCell::new(Rc::new(EmptyEnv)),
             service_provided: RefCell::new(Vec::new()),
@@ -819,6 +954,210 @@ impl PluginServices {
     /// The shared capture manager, if one was wired.
     fn overlay_capture(&self) -> Option<Rc<RefCell<OverlayCapture>>> {
         self.overlay_capture.borrow().clone()
+    }
+
+    /// Attach the runtime-shared targeting mechanism state (W-29, CTX-0942).
+    ///
+    /// The runtime wires one registry, lens set, and allocator across every
+    /// generation so the provider set spans plugins and survives reload. A
+    /// generation built without wiring keeps `None` and every targeting call
+    /// fails closed with `E_UI_UNAVAILABLE`. Uses only existing `bitty-ui`
+    /// types; no new Beacon type is introduced.
+    pub fn set_targeting_state(
+        &self,
+        registry: Rc<RefCell<TargetRegistry>>,
+        lenses: Rc<RefCell<Vec<(String, DerivedProvider)>>>,
+        allocator: Rc<RefCell<LabelAllocator>>,
+    ) {
+        *self.target_registry.borrow_mut() = Some(registry);
+        *self.target_lenses.borrow_mut() = Some(lenses);
+        *self.label_allocator.borrow_mut() = Some(allocator);
+    }
+
+    /// The `bitty.ui.targets`/`bitty.ui.labels` capability gate (W-29).
+    ///
+    /// Deny-by-default on the accepted `ui.overlay` identifier: a targeting
+    /// session consumes the W-28 focusable overlay / transient-input-capture
+    /// mechanism, which is itself gated there. No new capability identifier
+    /// is introduced.
+    fn require_targets_capability(&self) -> Result<(), BridgeError> {
+        if !self.ui_access.borrow().overlay {
+            return Err(BridgeError::capability_denied("ui.overlay"));
+        }
+        Ok(())
+    }
+
+    /// Shared registry or typed `E_UI_UNAVAILABLE`.
+    fn require_target_registry(&self) -> Result<Rc<RefCell<TargetRegistry>>, BridgeError> {
+        self.target_registry.borrow().clone().ok_or_else(|| {
+            BridgeError::new(
+                "runtime",
+                E_UI_UNAVAILABLE,
+                "host has no ui targeting surface",
+            )
+        })
+    }
+
+    /// Shared lens set or typed `E_UI_UNAVAILABLE`.
+    #[allow(clippy::type_complexity)]
+    fn require_target_lenses(
+        &self,
+    ) -> Result<Rc<RefCell<Vec<(String, DerivedProvider)>>>, BridgeError> {
+        self.target_lenses.borrow().clone().ok_or_else(|| {
+            BridgeError::new(
+                "runtime",
+                E_UI_UNAVAILABLE,
+                "host has no ui targeting surface",
+            )
+        })
+    }
+
+    /// Shared allocator or typed `E_UI_UNAVAILABLE`.
+    fn require_label_allocator(&self) -> Result<Rc<RefCell<LabelAllocator>>, BridgeError> {
+        self.label_allocator.borrow().clone().ok_or_else(|| {
+            BridgeError::new(
+                "runtime",
+                E_UI_UNAVAILABLE,
+                "host has no ui labeling surface",
+            )
+        })
+    }
+
+    /// Clear this generation's targeting session and bindings (suspend/dispose/rollback).
+    ///
+    /// Drops the per-generation dispatcher and session handle so no orphaned
+    /// session or dangling binding survives the generation. Shared registry,
+    /// lenses, and allocator are untouched (revocation of lenses is owned by
+    /// [`Self::revoke_targeting_lenses`]).
+    pub fn clear_targeting_session(&self) {
+        *self.target_dispatcher.borrow_mut() = BeaconDispatcher::new();
+        *self.target_session_overlay.borrow_mut() = None;
+    }
+
+    /// Drop every lens this generation registered (suspend/dispose/rollback).
+    ///
+    /// Returns whether an active session was present so the caller can release
+    /// the W-28 capture. Shared registry and allocator are untouched.
+    pub fn revoke_targeting_lenses(&self) -> bool {
+        if let Some(lenses) = self.target_lenses.borrow().clone() {
+            lenses
+                .borrow_mut()
+                .retain(|(owner, _)| owner != &self.plugin_id);
+        }
+        let had_session = self.target_session_overlay.borrow().is_some();
+        self.clear_targeting_session();
+        had_session
+    }
+
+    /// Build a fresh mediator from the Core provider plus shared lenses.
+    ///
+    /// The Core terminal provider is empty (no scrollback blocks are sourced
+    /// in this thin slice; semantic derivation from Terminal Truth stays with
+    /// `bitty.terminal.snapshot`); lenses are collected in registration order.
+    /// Registration was validated at insert; a rebuild cannot fail.
+    fn targeting_mediator(&self) -> Result<ProviderMediator, BridgeError> {
+        let lenses = self.require_target_lenses()?;
+        let mut mediator = ProviderMediator::with_core(Vec::new());
+        for (_, lens) in lenses.borrow().iter() {
+            let rebuilt = DerivedProvider::new(lens.name(), lens.collect())
+                .map_err(map_targets_provider_error)?;
+            let _ = mediator.register(Box::new(rebuilt), true);
+        }
+        Ok(mediator)
+    }
+
+    /// Inner session start after the W-28 capture was acquired (W-29).
+    ///
+    /// Collects a fresh snapshot, validates lengths, allocates labels,
+    /// builds the annotation layer, and binds the dispatcher. All failures
+    /// are typed with existing codes and leave no partial session; the caller
+    /// releases capture on error. Nothing is published to the Event Bus.
+    #[allow(clippy::type_complexity)]
+    fn targets_session_start_inner(
+        &self,
+        width: u16,
+        anchors: &[(u16, u16)],
+        commands: &[String],
+    ) -> Result<Vec<String>, BridgeError> {
+        let registry = self.require_target_registry()?;
+        let mediator = self.targeting_mediator()?;
+        let snapshot = mediator
+            .collect(&mut registry.borrow_mut())
+            .map_err(map_targets_provider_error)?;
+        let entries = snapshot.entries();
+        if anchors.len() != entries.len() || commands.len() != entries.len() {
+            return Err(BridgeError::new(
+                "validation",
+                "E_DEF_INVALID",
+                format!(
+                    "targeting session expected {} anchors and commands, got {} and {}",
+                    entries.len(),
+                    anchors.len(),
+                    commands.len()
+                ),
+            ));
+        }
+        if anchors.len() > MAX_BEACON_TARGETS {
+            return Err(BridgeError::new(
+                "budget",
+                "E_DEF_LIMIT",
+                format!("too many targets for labels: max {MAX_BEACON_TARGETS}"),
+            ));
+        }
+        let allocator = self.require_label_allocator()?;
+        let points: Vec<Point> = anchors.iter().map(|(x, y)| Point::new(*x, *y)).collect();
+        let labels = allocator
+            .borrow()
+            .assign(&points, width)
+            .map_err(map_targets_label_error)?;
+        let targets: Vec<TargetRef> = entries.iter().map(|entry| entry.target()).collect();
+        let mut parsed = Vec::with_capacity(commands.len());
+        for command in commands {
+            match QualifiedCommand::parse(command) {
+                Ok(id) => parsed.push(id),
+                Err(_) => {
+                    return Err(BridgeError::new(
+                        "validation",
+                        "E_DEF_INVALID",
+                        "targeting session command id is not a qualified command",
+                    ));
+                }
+            }
+        }
+        let height = points
+            .iter()
+            .map(|point| point.y)
+            .max()
+            .map_or(1, |y| y.saturating_add(1));
+        let layer = BeaconAnnotationLayer::build(
+            &targets,
+            &labels,
+            &points,
+            Rect::new(0, 0, width, height),
+        )
+        .map_err(|error| match error {
+            bitty_ui::AnnotationLayerError::TooManyAnnotations { requested, max } => {
+                BridgeError::new(
+                    "budget",
+                    "E_DEF_LIMIT",
+                    format!("too many annotations: requested {requested}, max {max}"),
+                )
+            }
+            other => BridgeError::new("validation", "E_DEF_INVALID", other.to_string()),
+        })?;
+        if layer.len() + self.target_dispatcher.borrow().len() > MAX_BEACON_BINDINGS {
+            return Err(BridgeError::new(
+                "budget",
+                "E_DEF_LIMIT",
+                format!("too many bindings: max {MAX_BEACON_BINDINGS}"),
+            ));
+        }
+        let mut dispatcher = BeaconDispatcher::new();
+        dispatcher
+            .bind_layer(&layer, &parsed)
+            .map_err(map_targets_dispatch_error)?;
+        *self.target_dispatcher.borrow_mut() = dispatcher;
+        Ok(labels)
     }
 
     /// Invalidate every block handle this generation minted (suspend/dispose).
@@ -1282,6 +1621,190 @@ impl HostServices for PluginServices {
             ));
         };
         capture.borrow_mut().poll(&self.plugin_id, handle, max)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn ui_targets_snapshot(&self, max: usize) -> Result<Vec<(i64, String, String)>, BridgeError> {
+        self.require_targets_capability()?;
+        let registry = self.require_target_registry()?;
+        let mediator = self.targeting_mediator()?;
+        let snapshot = mediator
+            .collect(&mut registry.borrow_mut())
+            .map_err(map_targets_provider_error)?;
+        let entries = snapshot.entries();
+        let take = max.min(entries.len()).min(MAX_SNAPSHOT_TARGETS);
+        Ok(entries
+            .iter()
+            .take(take)
+            .enumerate()
+            .map(|(index, entry)| {
+                let handle = i64::try_from(index).unwrap_or(i64::MAX).saturating_add(1);
+                (
+                    handle,
+                    targets_kind_string(&entry.target()),
+                    entry.tier().to_string(),
+                )
+            })
+            .collect())
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn ui_targets_register(
+        &self,
+        name: &str,
+        tier: &str,
+        targets: &[(String, u64)],
+    ) -> Result<bool, BridgeError> {
+        self.require_targets_capability()?;
+        if tier == "core" {
+            return Err(BridgeError::new(
+                "validation",
+                "E_DEF_INVALID",
+                "the 'core' provider tier is not registrable from Lua",
+            ));
+        }
+        if tier != "plugin" && tier != "derived" {
+            return Err(BridgeError::new(
+                "validation",
+                "E_DEF_INVALID",
+                format!("unknown provider tier '{tier}'"),
+            ));
+        }
+        if targets.len() > MAX_SNAPSHOT_TARGETS {
+            return Err(BridgeError::new(
+                "budget",
+                "E_DEF_LIMIT",
+                format!("too many snapshot targets: max {MAX_SNAPSHOT_TARGETS}"),
+            ));
+        }
+        let mut offers = Vec::with_capacity(targets.len());
+        for (kind, id) in targets {
+            offers.push(targets_offer(kind, *id)?);
+        }
+        // Both tiers map onto the existing Derived lens (no Plugin-tier source
+        // exists in `bitty-ui`; reuse avoids any new Beacon type).
+        let lens = DerivedProvider::new(name, offers).map_err(map_targets_provider_error)?;
+        let lenses = self.require_target_lenses()?;
+        let mut guard = lenses.borrow_mut();
+        if let Some(existing) = guard
+            .iter_mut()
+            .find(|(owner, lens)| owner == &self.plugin_id && lens.name() == name)
+        {
+            existing.1 = lens;
+            return Ok(true);
+        }
+        if guard.iter().any(|(_, lens)| lens.name() == name) {
+            return Err(BridgeError::new(
+                "validation",
+                "E_DEF_INVALID",
+                format!("target lens '{name}' is already registered"),
+            ));
+        }
+        if guard.len() >= MAX_TARGET_PROVIDERS {
+            return Err(BridgeError::new(
+                "budget",
+                "E_DEF_LIMIT",
+                format!("too many target lenses: max {MAX_TARGET_PROVIDERS}"),
+            ));
+        }
+        guard.push((self.plugin_id.clone(), lens));
+        Ok(true)
+    }
+
+    fn ui_targets_unregister(&self, name: &str) -> Result<bool, BridgeError> {
+        self.require_targets_capability()?;
+        let lenses = self.require_target_lenses()?;
+        let mut guard = lenses.borrow_mut();
+        let before = guard.len();
+        guard.retain(|(owner, lens)| !(owner == &self.plugin_id && lens.name() == name));
+        Ok(guard.len() != before)
+    }
+
+    fn ui_labels_set_policy(&self, home: &str, overflow: &str) -> Result<(), BridgeError> {
+        self.require_targets_capability()?;
+        let policy = LabelPolicy::new(home, overflow).map_err(map_targets_label_error)?;
+        let allocator = self.require_label_allocator()?;
+        *allocator.borrow_mut() = LabelAllocator::new(policy);
+        Ok(())
+    }
+
+    fn ui_labels_assign(
+        &self,
+        anchors: &[(u16, u16)],
+        width: u16,
+    ) -> Result<Vec<String>, BridgeError> {
+        self.require_targets_capability()?;
+        if anchors.len() > MAX_BEACON_TARGETS {
+            return Err(BridgeError::new(
+                "budget",
+                "E_DEF_LIMIT",
+                format!("too many targets for labels: max {MAX_BEACON_TARGETS}"),
+            ));
+        }
+        let allocator = self.require_label_allocator()?;
+        let points: Vec<Point> = anchors.iter().map(|(x, y)| Point::new(*x, *y)).collect();
+        allocator
+            .borrow()
+            .assign(&points, width)
+            .map_err(map_targets_label_error)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn ui_targets_session_start(
+        &self,
+        overlay_handle: i64,
+        width: u16,
+        anchors: &[(u16, u16)],
+        commands: &[String],
+    ) -> Result<Vec<String>, BridgeError> {
+        self.require_targets_capability()?;
+        // Acquire the W-28 transient capture first (no new session type).
+        self.ui_overlay_acquire(overlay_handle)?;
+        match self.targets_session_start_inner(width, anchors, commands) {
+            Ok(labels) => {
+                *self.target_session_overlay.borrow_mut() = Some(overlay_handle);
+                Ok(labels)
+            }
+            Err(error) => {
+                let _ = self.ui_overlay_release(overlay_handle);
+                self.clear_targeting_session();
+                Err(error)
+            }
+        }
+    }
+
+    fn ui_targets_session_cancel(&self, overlay_handle: i64) -> Result<bool, BridgeError> {
+        // Idempotent and never capability-gated (a revoked grant must still
+        // free input), mirroring `ui_overlay_release`.
+        let owned = self
+            .target_session_overlay
+            .borrow()
+            .is_some_and(|handle| handle == overlay_handle);
+        if owned {
+            self.clear_targeting_session();
+        }
+        let released = self.ui_overlay_release(overlay_handle)?;
+        Ok(owned || released)
+    }
+
+    fn ui_targets_dispatch(&self, label: &str) -> Result<String, BridgeError> {
+        self.require_targets_capability()?;
+        if self.target_session_overlay.borrow().is_none() {
+            return Err(BridgeError::new(
+                "runtime",
+                E_UI_NOT_OWNER,
+                "no active targeting session for this generation",
+            ));
+        }
+        let registry = self.require_target_registry()?;
+        match self
+            .target_dispatcher
+            .borrow()
+            .dispatch(label, &registry.borrow())
+        {
+            Ok(command) => Ok(command.as_str().to_string()),
+            Err(error) => Err(map_targets_dispatch_error(error)),
+        }
     }
 
     fn service_provide_check(&self, iface: &str) -> Result<(), BridgeError> {
@@ -2525,5 +3048,253 @@ mod tests {
         );
         assert_eq!(vm.budget_snapshot().store_commit_credit_ms, 0);
         assert!(services.with_store(|store| store.get("after")).is_none());
+    }
+
+    /// CTX-0942: targeting services with the accepted `ui.overlay` grant and,
+    /// optionally, the runtime-shared mechanism state wired. Uses only
+    /// existing `bitty-ui` types; no new Beacon type is introduced.
+    #[allow(clippy::type_complexity)]
+    fn targeting_services(overlay: bool, wire_state: bool) -> PluginServices {
+        let services = ui_services(UiAccess {
+            rich: true,
+            overlay,
+            claims: Vec::new(),
+        });
+        if wire_state {
+            services.set_targeting_state(
+                Rc::new(RefCell::new(TargetRegistry::new())),
+                Rc::new(RefCell::new(Vec::new())),
+                Rc::new(RefCell::new(LabelAllocator::default())),
+            );
+            services.set_overlay_capture(Rc::new(RefCell::new(OverlayCapture::new())));
+        }
+        services
+    }
+
+    fn targeting_offers(n: u64) -> Vec<(String, u64)> {
+        (1..=n).map(|id| ("link".to_string(), id)).collect()
+    }
+
+    fn targeting_anchors(n: u16) -> Vec<(u16, u16)> {
+        (0..n).map(|i| (10 + i, 0)).collect()
+    }
+
+    fn targeting_commands(n: u64) -> Vec<String> {
+        (0..n).map(|i| format!("acme.cmd:c{i}")).collect()
+    }
+
+    #[test]
+    fn targeting_surface_denies_without_overlay_grant() {
+        // Deny-by-default: with no `ui.overlay` grant every entry point fails
+        // closed before any side effect. No new capability identifier exists.
+        let services = targeting_services(false, true);
+        for code in [
+            services.ui_targets_snapshot(4).expect_err("snapshot").code,
+            services
+                .ui_targets_register("acme.links", "plugin", &targeting_offers(1))
+                .expect_err("register")
+                .code,
+            services
+                .ui_targets_unregister("acme.links")
+                .expect_err("unregister")
+                .code,
+            services
+                .ui_labels_set_policy("asdfghjkl", "hjkl")
+                .expect_err("policy")
+                .code,
+            services
+                .ui_labels_assign(&targeting_anchors(1), 80)
+                .expect_err("assign")
+                .code,
+            services
+                .ui_targets_session_start(11, 80, &targeting_anchors(1), &targeting_commands(1))
+                .expect_err("start")
+                .code,
+            services
+                .ui_targets_dispatch("a")
+                .expect_err("dispatch")
+                .code,
+        ] {
+            assert_eq!(code, "E_CAPABILITY_DENIED");
+        }
+        // Cancel is never capability-gated (it must free input even after a
+        // grant revoke), so it fails here only on the missing capture handle
+        // path via the overlay release, never on a grant check.
+        let _ = services.ui_targets_session_cancel(11);
+    }
+
+    #[test]
+    fn targeting_surface_fails_closed_without_wired_state() {
+        // A granted generation on a host without a targeting backend has no
+        // ambient surface: every call is a typed `E_UI_UNAVAILABLE`.
+        let services = targeting_services(true, false);
+        assert_eq!(
+            services.ui_targets_snapshot(4).expect_err("snapshot").code,
+            E_UI_UNAVAILABLE
+        );
+        assert_eq!(
+            services
+                .ui_targets_dispatch("a")
+                .expect_err("dispatch")
+                .code,
+            E_UI_NOT_OWNER
+        );
+    }
+
+    #[test]
+    fn targeting_session_lifecycle_over_overlay_capture() {
+        let services = targeting_services(true, true);
+        let handle = services
+            .ui_mount("overlay", &UiNode::text("targets"))
+            .expect("overlay mount");
+        services
+            .ui_labels_set_policy("asdfghjkl", "hjkl")
+            .expect("policy");
+        services
+            .ui_targets_register("acme.links", "plugin", &targeting_offers(2))
+            .expect("register");
+        let entries = services.ui_targets_snapshot(16).expect("snapshot");
+        assert_eq!(entries.len(), 2);
+        let labels = services
+            .ui_targets_session_start(handle, 80, &targeting_anchors(2), &targeting_commands(2))
+            .expect("start");
+        assert_eq!(labels.len(), 2);
+        assert_eq!(
+            services
+                .overlay_capture()
+                .expect("capture")
+                .borrow()
+                .owner_plugin(),
+            Some("xuepoo.test"),
+            "a started session owns the transient input capture"
+        );
+        let first = services.ui_targets_dispatch(&labels[0]).expect("dispatch");
+        assert_eq!(first, "acme.cmd:c0");
+        assert_eq!(
+            services
+                .ui_targets_dispatch("zz")
+                .expect_err("unknown")
+                .code,
+            "E_DEF_INVALID"
+        );
+        // No target or annotation internal is published: the lifecycle
+        // touches no notification queue.
+        assert!(
+            services.notifications.borrow().is_empty(),
+            "targeting must not publish notifications"
+        );
+        assert!(services.ui_targets_session_cancel(handle).expect("cancel"));
+        assert!(
+            services
+                .overlay_capture()
+                .expect("capture")
+                .borrow()
+                .owner_plugin()
+                .is_none(),
+            "cancel releases capture"
+        );
+        assert!(
+            !services
+                .ui_targets_session_cancel(handle)
+                .expect("idempotent")
+        );
+        assert_eq!(
+            services
+                .ui_targets_dispatch("a")
+                .expect_err("no session")
+                .code,
+            E_UI_NOT_OWNER
+        );
+    }
+
+    #[test]
+    fn targeting_start_failure_releases_capture() {
+        let services = targeting_services(true, true);
+        let handle = services
+            .ui_mount("overlay", &UiNode::text("targets"))
+            .expect("overlay mount");
+        services
+            .ui_targets_register("acme.links", "plugin", &targeting_offers(2))
+            .expect("register");
+        // One anchor for two snapshot targets: a typed failure before binding.
+        let error = services
+            .ui_targets_session_start(handle, 80, &targeting_anchors(1), &targeting_commands(1))
+            .expect_err("length mismatch");
+        assert_eq!(error.code, "E_DEF_INVALID");
+        assert!(
+            services
+                .overlay_capture()
+                .expect("capture")
+                .borrow()
+                .owner_plugin()
+                .is_none(),
+            "a failed start must never leave input captured"
+        );
+    }
+
+    #[test]
+    fn targeting_dispatch_fails_closed_on_stale_targets() {
+        let services = targeting_services(true, true);
+        let handle = services
+            .ui_mount("overlay", &UiNode::text("targets"))
+            .expect("overlay mount");
+        services
+            .ui_targets_register("acme.links", "plugin", &targeting_offers(2))
+            .expect("register");
+        let labels = services
+            .ui_targets_session_start(handle, 80, &targeting_anchors(2), &targeting_commands(2))
+            .expect("start");
+        // A fresh read-only snapshot re-collects the registry, bumping the
+        // generations the session bound against, so its targets go stale by
+        // construction and dispatch fails closed with the existing
+        // `E_UI_NOT_OWNER` code (never a new stale code).
+        let _ = services.ui_targets_snapshot(16).expect("snapshot");
+        assert_eq!(
+            services
+                .ui_targets_dispatch(&labels[0])
+                .expect_err("stale")
+                .code,
+            E_UI_NOT_OWNER
+        );
+    }
+
+    #[test]
+    fn targeting_register_rejects_foreign_shadowing_and_core_tier() {
+        let services = targeting_services(true, true);
+        services
+            .ui_targets_register("acme.links", "plugin", &targeting_offers(1))
+            .expect("register");
+        // The same generation may replace its own lens.
+        assert!(
+            services
+                .ui_targets_register("acme.links", "derived", &targeting_offers(2))
+                .expect("replace")
+        );
+        assert!(
+            services
+                .ui_targets_unregister("acme.links")
+                .expect("remove")
+        );
+        assert!(
+            !services
+                .ui_targets_unregister("acme.links")
+                .expect("idempotent")
+        );
+        // The host-owned core tier is never registrable from Lua.
+        assert_eq!(
+            services
+                .ui_targets_register("terminal", "core", &[])
+                .expect_err("core denied")
+                .code,
+            "E_DEF_INVALID"
+        );
+        // Invalid charsets fail closed with the existing definition code.
+        assert_eq!(
+            services
+                .ui_labels_set_policy("aA", "ab")
+                .expect_err("charset")
+                .code,
+            "E_DEF_INVALID"
+        );
     }
 }

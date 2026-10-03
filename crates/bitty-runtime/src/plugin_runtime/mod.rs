@@ -538,6 +538,17 @@ pub struct PluginRuntime {
     /// and bounded input queue. Shared with every generation's services so the
     /// single-owner invariant holds across plugins and reload.
     overlay_capture: Rc<RefCell<OverlayCapture>>,
+    /// W-29 (CTX-0942): runtime-shared target registry (existing
+    /// `TargetRegistry`). One registry spans every generation so generations
+    /// bump and stale handles by construction.
+    target_registry: Rc<RefCell<bitty_ui::TargetRegistry>>,
+    /// W-29: runtime-shared generic lenses (existing `DerivedProvider` as
+    /// `(plugin_id, lens)`). The provider set spans plugins and survives
+    /// reload; suspend/dispose revoke one generation's lenses.
+    #[allow(clippy::type_complexity)]
+    target_lenses: Rc<RefCell<Vec<(String, bitty_ui::DerivedProvider)>>>,
+    /// W-29: runtime-shared label allocator (existing `LabelAllocator`).
+    label_allocator: Rc<RefCell<bitty_ui::LabelAllocator>>,
     /// Filesystem adapter behind disk-backed plugin stores (`data_dir`).
     ///
     /// Defaults to [`NativeFileSystem`]; replaceable through
@@ -573,6 +584,9 @@ impl PluginRuntime {
                 WORKSPACE_REQUEST_QUEUE_CAPACITY,
             ))),
             overlay_capture: Rc::new(RefCell::new(OverlayCapture::new())),
+            target_registry: Rc::new(RefCell::new(bitty_ui::TargetRegistry::new())),
+            target_lenses: Rc::new(RefCell::new(Vec::new())),
+            label_allocator: Rc::new(RefCell::new(bitty_ui::LabelAllocator::default())),
             store_fs: Arc::new(NativeFileSystem),
         }
     }
@@ -685,6 +699,30 @@ impl PluginRuntime {
     #[must_use]
     pub fn overlay_capture(&self) -> &Rc<RefCell<OverlayCapture>> {
         &self.overlay_capture
+    }
+
+    /// Runtime-shared targeting mechanism state (W-29, CTX-0942).
+    ///
+    /// One registry, lens set, and allocator span every generation, so the
+    /// provider set survives reload and handles stale across sessions by
+    /// construction. Uses only existing `bitty-ui` types. Diagnostics and
+    /// tests read the live state through these handles.
+    #[must_use]
+    pub fn target_registry(&self) -> &Rc<RefCell<bitty_ui::TargetRegistry>> {
+        &self.target_registry
+    }
+
+    /// Runtime-shared generic lenses (W-29, existing `DerivedProvider`).
+    #[allow(clippy::type_complexity)]
+    #[must_use]
+    pub fn target_lenses(&self) -> &Rc<RefCell<Vec<(String, bitty_ui::DerivedProvider)>>> {
+        &self.target_lenses
+    }
+
+    /// Runtime-shared label allocator (W-29, existing `LabelAllocator`).
+    #[must_use]
+    pub fn label_allocator(&self) -> &Rc<RefCell<bitty_ui::LabelAllocator>> {
+        &self.label_allocator
     }
 
     /// Enqueue one captured input event for the active overlay capture, if any.
@@ -1027,6 +1065,15 @@ impl PluginRuntime {
         // so the single-owner invariant spans every plugin and survives
         // reload; suspend/dispose revoke this generation's capture.
         plugin_services.set_overlay_capture(self.overlay_capture.clone());
+        // W-29 (CTX-0942): the runtime-shared targeting mechanism state, so
+        // the provider set spans every plugin and survives reload. Without
+        // it every `bitty.ui.targets`/`bitty.ui.labels` call fails closed
+        // with `E_UI_UNAVAILABLE`. Uses only existing `bitty-ui` types.
+        plugin_services.set_targeting_state(
+            self.target_registry.clone(),
+            self.target_lenses.clone(),
+            self.label_allocator.clone(),
+        );
         // LUA-OQ-8: service backend wiring. The verified manifest's
         // `services.provided`/`services.required` become this generation's
         // declaration gate and resolution fallback; the runtime-shared
@@ -1238,6 +1285,9 @@ impl PluginRuntime {
         entry.state = LifecycleState::Suspended;
         if let Some(services) = entry.services.as_ref() {
             services.clear_ui_blocks();
+            // W-29: suspend ends this generation's targeting session and drops
+            // its lenses; outstanding handles go stale by construction.
+            services.revoke_targeting_lenses();
         }
         // CTX-0941: suspend is a release; a suspended generation must never
         // keep the transient input capture (honored even when the VM is
@@ -1314,6 +1364,10 @@ impl PluginRuntime {
         // registry so a stale handle cannot be served while the entry lingers.
         if let Some(services) = entry.services.as_ref() {
             services.clear_ui_blocks();
+            // W-29: unload/crash/dispose ends the session and drops the
+            // generation's lenses, so no orphaned session or dangling lens
+            // survives the generation.
+            services.revoke_targeting_lenses();
         }
         // CTX-0941: unload/crash/dispose is a release. Core drops the capture
         // so a faulty or dead generation can never pin input.
@@ -1712,6 +1766,12 @@ impl PluginRuntime {
         // after the activation rolls back, or a dead/failed plugin would pin
         // input forever.
         self.overlay_capture.borrow_mut().revoke_plugin(id.as_str());
+        // W-29: a failed activation also drops the generation's lenses (the
+        // entry services are dropped above, but the shared lens set must not
+        // retain a failed generation's registrations).
+        self.target_lenses
+            .borrow_mut()
+            .retain(|(owner, _)| owner != id.as_str());
         self.drop_traces(id);
     }
 

@@ -760,3 +760,147 @@ fn overlay_capture_fails_closed_without_grant_or_backend() {
         );
     }
 }
+
+/// CTX-0942: the `bitty.ui.targets`/`bitty.ui.labels` thin surface is present
+/// under the existing `bitty.ui` namespace (no `bitty.beacon.*` namespace),
+/// nested in the read-only root, and fails closed typed on a host with no
+/// targeting backend. The surface exposes no event/observe entry point.
+#[test]
+fn targets_surface_fails_closed_and_has_no_event_bus() {
+    #[derive(Default)]
+    struct Bare {
+        store: RefCell<BTreeMap<String, LuaValue>>,
+    }
+    impl HostServices for Bare {
+        fn store_get(&self, key: &str) -> Result<Option<LuaValue>, BridgeError> {
+            Ok(self.store.borrow().get(key).cloned())
+        }
+        fn store_set(&self, key: &str, value: LuaValue) -> Result<(), BridgeError> {
+            self.store.borrow_mut().insert(key.to_string(), value);
+            Ok(())
+        }
+        fn settings_get(&self, _key: &str) -> Result<Option<LuaValue>, BridgeError> {
+            Ok(None)
+        }
+        fn terminal_snapshot(&self, _scope: &str) -> Result<LuaValue, BridgeError> {
+            Err(BridgeError::capability_denied("terminal.semantic-read"))
+        }
+        fn notify_show(&self, _payload: &LuaValue) -> Result<bool, BridgeError> {
+            Err(BridgeError::capability_denied("platform.notify"))
+        }
+    }
+
+    let services = Rc::new(Bare::default());
+    let services_dyn: Rc<dyn HostServices> = services.clone();
+    let mut vm = gate_vm("targets-bare");
+    vm.install_host_module(services_dyn, MarshallingLimits::default(), 50)
+        .expect("install");
+    run(
+        &mut vm,
+        r#"
+        bitty.store.set("targets_type", type(bitty.ui.targets))
+        bitty.store.set("labels_type", type(bitty.ui.labels))
+        bitty.store.set("beacon_nil", bitty.beacon == nil)
+        local snapshot_ok, snapshot_err = pcall(bitty.ui.targets.snapshot, 4)
+        local dispatch_ok, dispatch_err = pcall(bitty.ui.targets.dispatch, "a")
+        local assign_ok, assign_err = pcall(bitty.ui.labels.assign, {}, 80)
+        bitty.store.set("snapshot_code", snapshot_ok and "NONE" or snapshot_err.code)
+        bitty.store.set("dispatch_code", dispatch_ok and "NONE" or dispatch_err.code)
+        bitty.store.set("assign_code", assign_ok and "NONE" or assign_err.code)
+        local has_event_api = bitty.ui.targets.events ~= nil
+            or bitty.ui.targets.subscribe ~= nil
+            or bitty.ui.targets.observe ~= nil
+        bitty.store.set("has_event_api", has_event_api)
+    "#,
+    );
+    assert_eq!(
+        services.store.borrow().get("targets_type"),
+        Some(&LuaValue::String("table".to_string()))
+    );
+    assert_eq!(
+        services.store.borrow().get("labels_type"),
+        Some(&LuaValue::String("table".to_string()))
+    );
+    assert_eq!(
+        services.store.borrow().get("beacon_nil"),
+        Some(&LuaValue::Bool(true))
+    );
+    for key in ["snapshot_code", "dispatch_code", "assign_code"] {
+        assert_eq!(
+            services.store.borrow().get(key),
+            Some(&LuaValue::String("E_UI_UNAVAILABLE".to_string())),
+            "{key}"
+        );
+    }
+    assert_eq!(
+        services.store.borrow().get("has_event_api"),
+        Some(&LuaValue::Bool(false))
+    );
+}
+
+/// CTX-0942: `bitty.ui.targets` and `bitty.ui.labels` are read-only.
+#[test]
+fn targets_tables_are_read_only() {
+    let services = Rc::new(UiServices::default());
+    let mut vm = gate_vm("targets-readonly");
+    install(&mut vm, services, 50);
+    for chunk in [
+        "bitty.ui.targets = {}",
+        "bitty.ui.targets.snapshot = function() end",
+        "bitty.ui.targets.dispatch = 1",
+        "bitty.ui.labels.assign = nil",
+    ] {
+        let outcome = vm.execute_bounded(chunk).expect("execute");
+        assert!(
+            matches!(outcome, BoundedExecution::RuntimeError(_)),
+            "{chunk}: assignment must fail: {outcome:?}"
+        );
+    }
+}
+
+/// CTX-0942: malformed `bitty.ui.targets` arguments are typed validation
+/// errors raised before any host call, and the reserved `core` tier is not
+/// registrable from Lua.
+#[test]
+fn targets_argument_validation_is_typed() {
+    let services = Rc::new(UiServices::default());
+    let mut vm = gate_vm("targets-validation");
+    install(&mut vm, services.clone(), 50);
+    run(
+        &mut vm,
+        r#"
+        local start_ok, start_err =
+            pcall(bitty.ui.targets.session_start, "11", 80, {}, {})
+        local dispatch_ok, dispatch_err = pcall(bitty.ui.targets.dispatch, 1)
+        local core_ok, core_err = pcall(bitty.ui.targets.register, {
+            name = "acme.links", tier = "core", targets = {},
+        })
+        local kind_ok, kind_err = pcall(bitty.ui.targets.register, {
+            name = "acme.links", tier = "plugin",
+            targets = { { kind = "view", id = 1 } },
+        })
+        bitty.store.set("start_code", start_ok and "NONE" or start_err.code)
+        bitty.store.set("dispatch_code", dispatch_ok and "NONE" or dispatch_err.code)
+        bitty.store.set("core_code", core_ok and "NONE" or core_err.code)
+        bitty.store.set("kind_code", kind_ok and "NONE" or kind_err.code)
+    "#,
+    );
+    // Shape errors use the existing UI component code; semantic tier/kind
+    // rejections use the existing definition code.
+    assert_eq!(
+        stored(&services, "start_code"),
+        Some(LuaValue::String("E_UI_COMPONENT_INVALID".to_string()))
+    );
+    assert_eq!(
+        stored(&services, "dispatch_code"),
+        Some(LuaValue::String("E_UI_COMPONENT_INVALID".to_string()))
+    );
+    assert_eq!(
+        stored(&services, "core_code"),
+        Some(LuaValue::String("E_DEF_INVALID".to_string()))
+    );
+    assert_eq!(
+        stored(&services, "kind_code"),
+        Some(LuaValue::String("E_DEF_INVALID".to_string()))
+    );
+}

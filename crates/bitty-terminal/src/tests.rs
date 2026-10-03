@@ -5681,6 +5681,36 @@ claims = []
     assert_eq!(queued_len(&app), 3);
     assert_eq!(app.runtime.pending_input_len(), 0);
 
+    // Pointer releases route to the Runtime (press-to-release ownership
+    // never desyncs); only presses enter the capture queue (CodeRabbit PR
+    // #1643 Major).
+    assert!(
+        !app.capture_fallthrough_input(&WindowEventKind::MouseInput(MouseEvent::new(
+            MouseButton::Left,
+            PressState::Released,
+        ))),
+        "releases must route, never queue"
+    );
+    assert_eq!(queued_len(&app), 3, "a release must not grow the queue");
+
+    // Pointer motion coalesces: three moves consume one slot with the latest
+    // position, so a wiggle cannot evict queued key/text entries (CodeRabbit
+    // PR #1643 Minor).
+    use bitty_platform::CursorPosition;
+    for (x, y) in [(1.0, 1.0), (2.0, 2.0), (3.0, 3.0)] {
+        assert!(
+            app.capture_fallthrough_input(&WindowEventKind::CursorMoved(CursorPosition { x, y }))
+        );
+    }
+    assert_eq!(queued_len(&app), 4, "three moves must consume one slot");
+
+    // The active capture exposes a deadline for the idle wake (CodeRabbit PR
+    // #1643 Minor).
+    assert!(
+        app.overlay_capture_deadline().is_some(),
+        "an active capture must expose its deadline"
+    );
+
     // Bare Esc through the intercept cancels the session.
     let esc = test_key(LogicalKey::Named(NamedKey::Escape), None);
     assert!(
@@ -5690,6 +5720,10 @@ claims = []
     assert!(
         !app.overlay_capture_active(),
         "cancel must release the capture"
+    );
+    assert!(
+        app.overlay_capture_deadline().is_none(),
+        "no deadline survives a released capture"
     );
     assert_eq!(queued_len(&app), 0, "cancel clears the queue");
     let _ = app.drive_tick();

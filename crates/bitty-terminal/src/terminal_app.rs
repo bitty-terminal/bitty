@@ -958,6 +958,22 @@ impl TerminalApp {
         plugin_runtime.push_overlay_input(kind, text)
     }
 
+    /// Enqueue a pointer-motion event with trailing-motion coalescing, so a
+    /// mouse wiggle cannot evict queued key/text entries (CodeRabbit PR #1643).
+    pub(crate) fn push_overlay_move(&mut self, text: &str) -> bool {
+        let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
+            return false;
+        };
+        plugin_runtime.push_overlay_move(text)
+    }
+
+    /// Absolute monotonic deadline of the active overlay capture, if any.
+    pub(crate) fn overlay_capture_deadline(&self) -> Option<std::time::Instant> {
+        self.plugin_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.overlay_capture_deadline())
+    }
+
     /// Revoke the active overlay capture unconditionally (user focus-switch
     /// or cancel path). Idempotent no-op `false` with no active capture.
     pub(crate) fn revoke_overlay_capture(&mut self) -> bool {
@@ -1080,12 +1096,19 @@ impl TerminalApp {
             // Enabled/Disabled carry no input bytes.
             WindowEventKind::Ime(_) => false,
             WindowEventKind::MouseInput(mouse) => {
+                // Route releases so press-to-release ownership never desyncs:
+                // only button presses enter the capture queue. A captured
+                // release would leave Runtime drag/selection state armed with
+                // no matching press ever arriving (CodeRabbit PR #1643).
+                if mouse.state != PressState::Pressed {
+                    return false;
+                }
                 let text = format!("{:?}:{:?}", mouse.button, mouse.state);
                 self.push_overlay_input("pointer", &text)
             }
             WindowEventKind::CursorMoved(pos) => {
                 let text = format!("move:{},{}", pos.x, pos.y);
-                self.push_overlay_input("pointer", &text)
+                self.push_overlay_move(&text)
             }
             WindowEventKind::MouseWheel(delta) => {
                 let text = format!("wheel:{delta:?}");
@@ -1460,6 +1483,11 @@ impl AppHandler for TerminalApp {
         // visible to the state machine before the tick.
         self.poll_pty_pump();
 
+        // CTX-0943 (CodeRabbit PR #1643): expire captures before routing so
+        // input arriving after the deadline falls through to the terminal
+        // instead of being queued by a stale `is_active` check.
+        self.expire_overlay_captures();
+
         // Issue #1356 / #1541: reap exited child processes across primary and
         // split pane sessions. When a split child exits, its pane is closed
         // and its sibling promoted. When the last child exits, the session
@@ -1733,7 +1761,14 @@ impl AppHandler for TerminalApp {
                 let hover = self.runtime.hover_activation_deadline();
                 let animation = self.runtime.animation_deadline();
                 let bell = self.runtime.bell_notification_deadline();
-                let wake = [hover, animation, bell].into_iter().flatten().min();
+                // CTX-0943 (CodeRabbit PR #1643): arm a wake at the capture
+                // deadline too, otherwise an idle window holds an expired
+                // capture (and its painted overlay) until unrelated activity.
+                let capture = self.overlay_capture_deadline();
+                let wake = [hover, animation, bell, capture]
+                    .into_iter()
+                    .flatten()
+                    .min();
                 match wake {
                     Some(deadline) => ctx.set_wait_until(deadline),
                     None => ctx.set_wait(),

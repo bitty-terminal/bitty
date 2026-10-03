@@ -738,7 +738,10 @@ mod tests {
             &format!("login with {seeded} done"),
             &[seeded],
         );
-        assert!(!scrubbed.contains(seeded), "{scrubbed}");
+        assert!(
+            !scrubbed.contains(seeded),
+            "scrubbed text still contains the seeded secret"
+        );
         let handled: Cow<'_, str> = redact_text_for_stderr("credential = secret://db-password");
         assert!(handled.contains("secret://db-password"), "{handled}");
         // Legit diagnostics pass through byte-identical (no behavior change).

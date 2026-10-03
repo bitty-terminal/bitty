@@ -307,10 +307,17 @@ pub fn resolve_record_with_hosts(
     check_host_compat(&manifest, host_bitty, host_api)?;
 
     let id = manifest.id().clone();
-    let digest = scan_module_tree(id.as_str(), &module_root)?;
+    // W-101 CTX-0944: read-only startup validation. The staged tree is walked
+    // once (bounds enforced above); its canonical buffer is the reconciled
+    // `H-A` — the same bytes `bitty-package` hashes — and the retained
+    // `validate_staged_tree_generation` re-derives `H-A`, `H-B`, and the grant
+    // snapshot read-only (no fetch, resolve, activate, trust, or mutation).
+    let entries = collect_tree_entries(id.as_str(), &module_root, TreeScanMode::Staged)?;
+    let tree_bytes = canonical_tree_buffer(&entries);
+    let digest = bitty_package::integrity::sha256_hex(&tree_bytes);
+    let live_dev_tree =
+        record.source_class == SourceClass::LocalPath && Path::new(&record.root).is_absolute();
     if !digest.eq_ignore_ascii_case(&record.content_digest) {
-        let live_dev_tree =
-            record.source_class == SourceClass::LocalPath && Path::new(&record.root).is_absolute();
         if live_dev_tree {
             // Drift is reported, not hidden: the package stays unverified until
             // it is re-resolved (RFC B.5 rule 3).
@@ -319,6 +326,22 @@ pub fn resolve_record_with_hosts(
             return Err(integrity(&plugin, "content digest mismatch"));
         }
     }
+    // Retained startup entry point (read-only): re-derive `H-A`/`H-B`/grants.
+    // For drifted live-dev trees `H-A` is skipped (re-digested every load per
+    // RFC B.5) by expecting the just-computed digest, while `H-B` and grants
+    // still fail closed. Staged immutable trees expect the record digest.
+    let expected_tree_digest = if unverified && live_dev_tree {
+        digest.as_str()
+    } else {
+        record.content_digest.as_str()
+    };
+    validate_staged_tree(
+        &plugin,
+        &manifest,
+        &tree_bytes,
+        expected_tree_digest,
+        record,
+    )?;
 
     Ok(PluginPackage {
         manifest,
@@ -327,6 +350,44 @@ pub fn resolve_record_with_hosts(
         unverified,
         granted: Some(record.granted.clone()),
     })
+}
+
+/// Invoke the retained read-only startup validation for a staged tree.
+///
+/// Pure read-only: the tree buffer and manifest canonical bytes were already
+/// read from the store; this re-derives `H-A` (tree digest), `H-B` (manifest
+/// binding), and the grant snapshot via
+/// `bitty_package::startup::validate_staged_tree_generation` and maps any
+/// mismatch to a fail-closed [`PluginRuntimeError::Integrity`]. No fetch,
+/// resolve, activate, trust, or mutation occurs.
+fn validate_staged_tree(
+    plugin: &str,
+    manifest: &bitty_plugin_host::manifest::PluginManifest,
+    tree_bytes: &[u8],
+    expected_tree_digest: &str,
+    record: &PluginRecord,
+) -> Result<(), PluginRuntimeError> {
+    let manifest_bytes = manifest.canonical_bytes();
+    let declared: Vec<String> = manifest
+        .capabilities
+        .all_ids()
+        .map_err(|error| PluginRuntimeError::Manifest {
+            plugin: plugin.to_string(),
+            detail: error.to_string(),
+        })?
+        .iter()
+        .map(|capability| capability.as_str().to_string())
+        .collect();
+    let inputs = bitty_package::startup::StagedTreeInputs {
+        tree_bytes,
+        expected_tree_digest,
+        manifest_canonical_bytes: &manifest_bytes,
+        expected_manifest_digest: &record.manifest_hash,
+        declared_capabilities: &declared,
+        granted_capabilities: &record.granted,
+    };
+    bitty_package::startup::validate_staged_tree_generation(&inputs)
+        .map_err(|error| integrity(plugin, format!("startup validation: {error}")))
 }
 
 /// Re-evaluate the closed compat grammar against explicit hosts.
@@ -417,11 +478,11 @@ pub fn store_package_root(store_root: &Path, record: &PluginRecord) -> Option<Pa
 
 /// Compute the canonical content digest of a package's module tree.
 ///
-/// The scheme is deterministic across platforms: files are sorted by their
-/// normalized `/`-separated relative path and hashed as
-/// `path || 0x00 || bytes || 0x0a`. It matches
-/// `bitty-package::source::digest_local_content`, so a `local-path` record
-/// written by the package manager verifies here.
+/// The scheme is owned by `bitty-package::source::canonical_tree_bytes`
+/// (W-101 CTX-0944, ONE place): files sorted by their normalized
+/// `/`-separated relative path, each entry as `len:u64LE || path || len:u64LE || content`,
+/// hashed with the shared SHA-256. A `local-path` record written by the
+/// package manager verifies here because both sides hash the same buffer.
 ///
 /// # Errors
 ///
@@ -457,6 +518,20 @@ fn scan_module_tree_mode(
     root: &Path,
     mode: TreeScanMode,
 ) -> Result<String, PluginRuntimeError> {
+    let entries = collect_tree_entries(plugin, root, mode)?;
+    Ok(canonical_tree_digest(&entries))
+}
+
+/// Walk a module tree, enforce the RFC bounds, and return sorted entries.
+///
+/// Shared by the digest and the startup-validation paths so the walked set
+/// cannot drift between the `content_digest` check and the retained
+/// `validate_staged_tree_generation` call.
+fn collect_tree_entries(
+    plugin: &str,
+    root: &Path,
+    mode: TreeScanMode,
+) -> Result<Vec<(String, Vec<u8>)>, PluginRuntimeError> {
     let canonical =
         std::fs::canonicalize(root).map_err(|error| PluginRuntimeError::ModuleTree {
             plugin: plugin.to_string(),
@@ -551,14 +626,33 @@ fn scan_module_tree_mode(
         }
     }
     entries.sort_by(|left, right| left.0.cmp(&right.0));
-    let mut buffer = Vec::new();
-    for (relative, data) in &entries {
-        buffer.extend_from_slice(relative.as_bytes());
-        buffer.push(0);
-        buffer.extend_from_slice(data);
-        buffer.push(b'\n');
-    }
-    Ok(bitty_ipc::frame_digest::sha256_hex(&buffer))
+    Ok(entries)
+}
+
+/// Digest sorted tree entries with the single shared scheme (W-101 CTX-0944).
+///
+/// The canonical buffer is owned by `bitty-package::source::canonical_tree_bytes`;
+/// the hash is the shared `bitty-package` SHA-256. This is the `H-A` half of
+/// the retained startup validation: the runtime and the package manager hash
+/// the same bytes.
+fn canonical_tree_digest(entries: &[(String, Vec<u8>)]) -> String {
+    let borrowed: Vec<(&str, &[u8])> = entries
+        .iter()
+        .map(|(path, data)| (path.as_str(), data.as_slice()))
+        .collect();
+    bitty_package::integrity::sha256_hex(&bitty_package::source::canonical_tree_bytes(&borrowed))
+}
+
+/// Canonical tree buffer for sorted entries (shared scheme, for validation).
+///
+/// Returns the exact bytes the digest hashes, so `resolve_record` can pass
+/// them to the retained `validate_staged_tree_generation` without re-walking.
+fn canonical_tree_buffer(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
+    let borrowed: Vec<(&str, &[u8])> = entries
+        .iter()
+        .map(|(path, data)| (path.as_str(), data.as_slice()))
+        .collect();
+    bitty_package::source::canonical_tree_bytes(&borrowed)
 }
 
 /// The module root a package is loaded from: `<root>/lua` when present, else
@@ -1044,6 +1138,170 @@ mod tests {
             upgraded,
             crate::plugin_runtime::PluginRuntimeError::Incompatible { .. }
         ));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn staged_tree_digest_uses_the_shared_package_scheme() {
+        // W-101 CTX-0944 old/new equivalence on the staged tree: the runtime
+        // digest must equal `bitty-package`'s canonical digest over the same
+        // entries, and the buffer must be the shared length-delimited encoding
+        // encoding (ONE place). The tree is non-empty so the assertion is not
+        // vacuous.
+        let entries = vec![
+            ("b.lua".to_string(), b"second".to_vec()),
+            ("a.lua".to_string(), b"first".to_vec()),
+        ];
+        let digest = canonical_tree_digest(&entries);
+        assert_eq!(digest.len(), 64, "tree digest must be 64 hex chars");
+        let borrowed: Vec<(&str, &[u8])> = entries
+            .iter()
+            .map(|(path, data)| (path.as_str(), data.as_slice()))
+            .collect();
+        assert_eq!(
+            digest,
+            bitty_package::source::digest_tree_files(&borrowed),
+            "runtime and package-manager digests must agree on the staged tree"
+        );
+        assert_eq!(
+            digest,
+            bitty_package::source::digest_local_content(&borrowed),
+            "install-time and runtime digests share one scheme"
+        );
+        let buffer = canonical_tree_buffer(&entries);
+        assert!(!buffer.is_empty(), "staged tree buffer must be non-empty");
+        // Sorted `a.lua` first: exact shared length-delimited encoding.
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&5u64.to_le_bytes());
+        expected.extend_from_slice(b"a.lua");
+        expected.extend_from_slice(&5u64.to_le_bytes());
+        expected.extend_from_slice(b"first");
+        expected.extend_from_slice(&5u64.to_le_bytes());
+        expected.extend_from_slice(b"b.lua");
+        expected.extend_from_slice(&6u64.to_le_bytes());
+        expected.extend_from_slice(b"second");
+        assert_eq!(buffer, expected);
+    }
+
+    fn write_startup_package(store: &Path, id: &str, capability: Option<&str>) -> PluginRecord {
+        let package_root = store.join(format!("packages/{id}/1.0.0"));
+        std::fs::create_dir_all(package_root.join("lua")).expect("package dirs");
+        let capability_block = capability
+            .map(|entry| format!("[capabilities]\n{entry} = true\n"))
+            .unwrap_or_default();
+        let body = format!(
+            "[plugin]\nid = \"{id}\"\nname = \"Startup Test\"\nversion = \"1.0.0\"\n\
+             description = \"startup validation fixture\"\n\n[compat]\nbitty = \">=0.0.1,<1.0\"\n\
+             plugin-api = \"^1.0\"\n\n{capability_block}[lazy]\ncommands = [\"{id}:summary\"]\nevents = []\n"
+        );
+        std::fs::write(package_root.join("bitty-plugin.toml"), &body).expect("manifest");
+        std::fs::write(package_root.join("lua/init.lua"), "return {}\n").expect("init");
+        let manifest = crate::plugin_runtime::manifest_toml::parse_manifest(body.as_bytes())
+            .expect("manifest parses");
+        let declared: Vec<String> = manifest
+            .capabilities
+            .all_ids()
+            .expect("declared ids")
+            .iter()
+            .map(|entry| entry.as_str().to_string())
+            .collect();
+        // The record grants exactly what the manifest declares (narrowed or full).
+        let granted = declared.clone();
+        PluginRecord {
+            source_class: SourceClass::Registry,
+            plugin_id: id.to_string(),
+            version: "1.0.0".to_string(),
+            root: format!("packages/{id}/1.0.0"),
+            manifest_hash: manifest.manifest_hash(),
+            content_digest: content_digest(&package_root).expect("digest"),
+            enabled: true,
+            granted,
+        }
+    }
+
+    #[test]
+    fn resolve_invokes_startup_validation_on_the_read_only_path() {
+        // A valid staged record resolves: the retained startup entry point ran
+        // read-only (no fetch/resolve/activate/trust/mutation) and passed.
+        let base = std::env::temp_dir().join(format!(
+            "bitty-startup-valid-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let store = base.join("store");
+        let record = write_startup_package(&store, "xuepoo.startup", None);
+        write_index(&store, std::slice::from_ref(&record)).expect("write index");
+        let loaded = load_index(&store).expect("load index");
+        let package = resolve_record(&store, &loaded[0]).expect("valid record resolves");
+        assert!(!package.unverified);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn resolve_fails_closed_on_undeclared_startup_grant() {
+        // A recorded grant the manifest never declared is store tampering: the
+        // startup validation fails closed before any VM exists.
+        let base = std::env::temp_dir().join(format!(
+            "bitty-startup-grant-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let store = base.join("store");
+        let mut record = write_startup_package(&store, "xuepoo.grant", None);
+        record.granted = vec!["terminal.semantic-read".to_string()];
+        write_index(&store, std::slice::from_ref(&record)).expect("write index");
+        let loaded = load_index(&store).expect("load index");
+        let error =
+            resolve_record(&store, &loaded[0]).expect_err("undeclared grant must fail closed");
+        assert!(
+            matches!(
+                error,
+                crate::plugin_runtime::PluginRuntimeError::Integrity { .. }
+            ),
+            "expected fail-closed integrity, got {error}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn resolve_fails_closed_on_tampered_staged_tree() {
+        // A staged tree whose bytes no longer match the record digest fails
+        // closed via the startup validation (immutable staged copy, not drift).
+        let base = std::env::temp_dir().join(format!(
+            "bitty-startup-tamper-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let store = base.join("store");
+        let record = write_startup_package(&store, "xuepoo.tamper", None);
+        write_index(&store, std::slice::from_ref(&record)).expect("write index");
+        // Tamper after the record was written: staged content no longer matches.
+        std::fs::write(
+            store.join("packages/xuepoo.tamper/1.0.0/lua/init.lua"),
+            "tampered\n",
+        )
+        .expect("tamper");
+        let loaded = load_index(&store).expect("load index");
+        let error = resolve_record(&store, &loaded[0]).expect_err("tampered tree must fail closed");
+        assert!(
+            matches!(
+                error,
+                crate::plugin_runtime::PluginRuntimeError::Integrity { .. }
+            ),
+            "expected fail-closed integrity, got {error}"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 

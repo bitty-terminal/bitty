@@ -321,6 +321,46 @@ fn validate_git_rev(rev: &str) -> Result<(), PackageError> {
     Ok(())
 }
 
+// ── staged-tree canonical encoding (W-101 CTX-0944, ONE place) ───────────
+///
+/// The canonical encoding of a staged module tree is owned here: files sorted
+/// by their `/`-separated relative path, each entry as
+/// `path_len:u64LE || path || content_len:u64LE || content`. Both the install-time
+/// [`digest_local_content`] and the runtime staged-tree scan
+/// (`bitty-runtime` `resolution`) hash this exact buffer, so `H-A` for a
+/// staged tree equals the tree digest without a second scheme. Changing the
+/// scheme happens here only; callers hash the returned buffer with
+/// [`sha256_hex`].
+/// Canonical bytes of a staged module tree (deterministic, cross-platform).
+///
+/// Sorts by path, then concatenates per file `path_len:u64LE || path ||
+/// content_len:u64LE || content`. Length-delimited fields (never bare
+/// separators): a path may legally contain `\n`, so a `path || NUL || bytes
+/// || newline` encoding would admit a second preimage (`carrier.txt\nex…`
+/// colliding with `carrier.txt` + `ex…`). Pure, headless, no I/O.
+#[must_use]
+pub fn canonical_tree_bytes(files: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut sorted: Vec<(&str, &[u8])> = files.to_vec();
+    sorted.sort_by(|a, b| a.0.cmp(b.0));
+    let mut all = Vec::new();
+    for (path, bytes) in sorted {
+        all.extend_from_slice(&(path.len() as u64).to_le_bytes());
+        all.extend_from_slice(path.as_bytes());
+        all.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        all.extend_from_slice(bytes);
+    }
+    all
+}
+
+/// Digest of a staged tree via the canonical encoding (`H-A` for trees).
+///
+/// Equivalent to `sha256_hex(canonical_tree_bytes(files))`; kept as a helper
+/// so the hash step also has a single call site next to the encoding.
+#[must_use]
+pub fn digest_tree_files(files: &[(&str, &[u8])]) -> String {
+    sha256_hex(&canonical_tree_bytes(files))
+}
+
 // ── local-path drift helpers ─────────────────────────────────────────────
 
 /// Compute a content digest for local-path packages.
@@ -328,19 +368,12 @@ fn validate_git_rev(rev: &str) -> Result<(), PackageError> {
 /// In production this hashes the directory tree; for this draft it hashes
 /// the concatenated file bytes supplied by the caller (pure, headless).
 /// Returns 64-hex SHA-256.
+///
+/// Delegates to [`canonical_tree_bytes`] so the install-time digest and the
+/// runtime staged-tree digest share one scheme (W-101 CTX-0944).
 #[must_use]
 pub fn digest_local_content(files: &[(&str, &[u8])]) -> String {
-    // Deterministic: sort by path, then hash each file's bytes with path prefix.
-    let mut sorted: Vec<(&str, &[u8])> = files.to_vec();
-    sorted.sort_by(|a, b| a.0.cmp(b.0));
-    let mut all = Vec::new();
-    for (path, bytes) in sorted {
-        all.extend_from_slice(path.as_bytes());
-        all.push(b'\0');
-        all.extend_from_slice(bytes);
-        all.push(b'\n');
-    }
-    sha256_hex(&all)
+    digest_tree_files(files)
 }
 
 /// Check whether local content has drifted since the lock was recorded.
@@ -401,6 +434,55 @@ mod tests {
         assert_eq!(
             digest_local_content(&files_a),
             digest_local_content(&files_b)
+        );
+    }
+
+    #[test]
+    fn canonical_tree_bytes_is_the_single_digest_scheme() {
+        // W-101 CTX-0944: the staged-tree scheme lives in `canonical_tree_bytes`
+        // only. `digest_local_content` (install path) must equal the new
+        // `digest_tree_files` helper on the same staged tree, and both must
+        // equal `sha256_hex` over the canonical buffer (old/new equivalence).
+        let files = vec![
+            ("lua/init.lua", b"return {}\n" as &[u8]),
+            ("lua/util.lua", b"local M = {}\n" as &[u8]),
+            ("bitty-plugin.toml", b"[plugin]\n" as &[u8]),
+        ];
+        let canonical = canonical_tree_bytes(&files);
+        assert!(
+            !canonical.is_empty(),
+            "staged tree buffer must be non-empty"
+        );
+        assert_eq!(digest_local_content(&files), digest_tree_files(&files));
+        assert_eq!(digest_tree_files(&files), sha256_hex(&canonical));
+        // Order-independent: shuffled input encodes identically.
+        let shuffled = vec![
+            ("lua/util.lua", b"local M = {}\n" as &[u8]),
+            ("bitty-plugin.toml", b"[plugin]\n" as &[u8]),
+            ("lua/init.lua", b"return {}\n" as &[u8]),
+        ];
+        assert_eq!(canonical_tree_bytes(&shuffled), canonical);
+        // Empty tree has a defined digest (hash of empty buffer), not a panic.
+        assert_eq!(digest_tree_files(&[]), sha256_hex(&[]));
+        // Byte-level scheme: `len:u64LE || path || len:u64LE || bytes` per file.
+        let single = vec![("a.txt", b"hi" as &[u8])];
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&5u64.to_le_bytes());
+        expected.extend_from_slice(b"a.txt");
+        expected.extend_from_slice(&2u64.to_le_bytes());
+        expected.extend_from_slice(b"hi");
+        assert_eq!(canonical_tree_bytes(&single), expected);
+        // Second-preimage resistance: a newline-bearing path must not collide
+        // with a two-file tree (`carrier.txt\nex…` vs `carrier.txt` + `ex…`).
+        let tricky = vec![("carrier.txt\nextra.lua", b"<module>" as &[u8])];
+        let split = vec![
+            ("carrier.txt", b"" as &[u8]),
+            ("extra.lua", b"<module>" as &[u8]),
+        ];
+        assert_ne!(
+            canonical_tree_bytes(&tricky),
+            canonical_tree_bytes(&split),
+            "newline-bearing path must not collide with a split tree"
         );
     }
 

@@ -1,14 +1,16 @@
-//! Core package-manager boundary tests (W-101 / CTX-0927, `bitty#1616`).
+//! Core package-manager boundary tests (W-101 / CTX-0927 + CTX-0944, `bitty#1616`).
 //!
 //! These are the negative and invariant tests for the accepted
 //! `package-manager-boundary.md` contract:
 //!
-//! 1. the retained Core crates (`bitty-package`, `bitty-plugin-host`) contain
-//!    no network egress API and depend on no network implementation crate —
-//!    Core never fetches (`DIR-016`/`DIR-017`);
-//! 2. the read-only installed-generation validation and the install-time
-//!    verification seam fail closed on tampered integrity and on capability
-//!    escalation (`P0-AC-012`, `P0-AC-028`, `P0-AC-030`).
+//! 1. the retained Core crates (`bitty-package`, `bitty-plugin-host`, and the
+//!    `bitty-runtime` loader at `src/plugin_runtime`) contain no network
+//!    egress API and depend on no network implementation crate — Core never
+//!    fetches (`DIR-016`/`DIR-017`);
+//! 2. the read-only installed-generation validation (blob and staged-tree
+//!    entries) and the install-time verification seam fail closed on tampered
+//!    integrity and on capability escalation
+//!    (`P0-AC-012`, `P0-AC-028`, `P0-AC-030`).
 //!
 //! Every test is offline and deterministic; no test opens a socket.
 
@@ -17,8 +19,8 @@
 use std::path::{Path, PathBuf};
 
 use bitty_package::{
-    InstalledGenerationInputs, PackageId, PackageIdentity, sha256_hex,
-    validate_installed_generation,
+    InstalledGenerationInputs, PackageId, PackageIdentity, StagedTreeInputs, sha256_hex,
+    validate_installed_generation, validate_staged_tree_generation,
 };
 use bitty_plugin_host::install::{InstallInputs, verify_install};
 
@@ -217,9 +219,24 @@ fn core_package_crates_link_no_network_implementation_crate() {
         String::from_utf8_lossy(&output.stderr)
     );
     let tree = String::from_utf8_lossy(&output.stdout);
+    // Non-vacuous closure check (review item (e)): the tree must be non-empty
+    // and must actually contain the Core package/runtime-load crates under
+    // test — a single `contains` on one crate would pass on an otherwise
+    // empty or truncated graph.
+    let trimmed = tree.trim();
     assert!(
-        tree.contains("bitty-package"),
-        "dependency tree for the Core package/runtime-load closure looks empty"
+        !trimmed.is_empty(),
+        "dependency tree for the Core package/runtime-load closure must be non-empty"
+    );
+    for expected in ["bitty-package", "bitty-plugin-host", "bitty-runtime"] {
+        assert!(
+            trimmed.contains(expected),
+            "dependency tree must contain '{expected}'; got:\n{trimmed}"
+        );
+    }
+    assert!(
+        trimmed.lines().count() >= 3,
+        "dependency tree must list at least the three Core crates; got:\n{trimmed}"
     );
     let linked: Vec<&str> = NETWORK_IMPLEMENTATION_CRATES
         .iter()
@@ -355,7 +372,7 @@ fn startup_reverification_rejects_undeclared_capability_grant() {
 }
 
 #[test]
-fn read_only_validation_rejects_tampered_artifact() {
+fn startup_reverification_rejects_tampered_artifact() {
     let fixture = InstallFixture::new(Some("terminal.semantic-read"));
     let granted = vec!["terminal.semantic-read".to_string()];
     let inputs = InstalledGenerationInputs {
@@ -366,4 +383,46 @@ fn read_only_validation_rejects_tampered_artifact() {
         granted_capabilities: &granted,
     };
     assert!(validate_installed_generation(&inputs).is_err());
+}
+
+#[test]
+fn staged_tree_reverification_rejects_tampered_tree_and_undeclared_grant() {
+    // CTX-0944: the staged-tree entry shares the `H-A` scheme
+    // (`source::canonical_tree_bytes`) and the grant rule with the blob entry.
+    let files = vec![
+        ("lua/init.lua", b"return {}\n" as &[u8]),
+        ("lua/util.lua", b"local M = {}\n" as &[u8]),
+    ];
+    let tree_bytes = bitty_package::canonical_tree_bytes(&files);
+    assert!(
+        !tree_bytes.is_empty(),
+        "staged tree buffer must be non-empty"
+    );
+    let tree_digest = sha256_hex(&tree_bytes);
+    let manifest_bytes = b"boundary staged manifest\n".to_vec();
+    let manifest_digest = sha256_hex(&manifest_bytes);
+    let declared = vec!["terminal.semantic-read".to_string()];
+    let granted = vec!["terminal.semantic-read".to_string()];
+    let valid = StagedTreeInputs {
+        tree_bytes: &tree_bytes,
+        expected_tree_digest: &tree_digest,
+        manifest_canonical_bytes: &manifest_bytes,
+        expected_manifest_digest: &manifest_digest,
+        declared_capabilities: &declared,
+        granted_capabilities: &granted,
+    };
+    assert!(validate_staged_tree_generation(&valid).is_ok());
+    // Tampered tree bytes fail closed (`H-A`).
+    let tampered = StagedTreeInputs {
+        tree_bytes: b"tampered",
+        ..valid.clone()
+    };
+    assert!(validate_staged_tree_generation(&tampered).is_err());
+    // Undeclared grant fails closed (deny-by-default).
+    let undeclared_grant = vec!["platform.notify".to_string()];
+    let undeclared = StagedTreeInputs {
+        granted_capabilities: &undeclared_grant,
+        ..valid.clone()
+    };
+    assert!(validate_staged_tree_generation(&undeclared).is_err());
 }

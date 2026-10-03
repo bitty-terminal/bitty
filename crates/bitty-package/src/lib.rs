@@ -44,17 +44,20 @@
 //!   advisory and prerelease opt-in per follow-up RFC (see `version`,
 //!   `requirement`, `resolver`).
 //!
-//! # Package-manager boundary (W-101 / CTX-0927)
+//! # Package-manager boundary (W-101 / CTX-0927 + CTX-0944)
 //!
 //! The crate is both the install-time package lifecycle and the retained
 //! read-only boundary artifact. [`boundary`] records the audit that classifies
 //! every consumer and operation as Core-retained (bounded manifest/lock
 //! parsing and integrity primitives, startup re-verification, runtime loading)
 //! or external-manager-owned (resolution, source fetch, install, activation,
-//! rollback, update, uninstall, list). [`startup::validate_installed_generation`]
-//! is the explicit pure entry point for Core's read-only re-verification of an
-//! already-installed generation: it never fetches, resolves, installs, or
-//! mutates the store, and fails closed on any integrity or grant mismatch.
+//! rollback, update, uninstall, list).
+//! [`startup::validate_installed_generation`] is the explicit pure entry point
+//! for Core's read-only re-verification of an already-installed generation,
+//! and [`startup::validate_staged_tree_generation`] is its staged-tree sibling
+//! (shared `H-A` scheme via `source::canonical_tree_bytes`, generic `H-B`):
+//! both never fetch, resolve, install, or mutate the store, and fail closed
+//! on any integrity or grant mismatch.
 //!
 //! # What this crate does NOT do
 //!
@@ -170,10 +173,12 @@ pub use resolver::{
     ResolvedPackage, resolve, resolve_preserving_locked,
 };
 pub use source::{
-    PackageSource, check_local_path_drift, digest_local_content, ensure_no_promotion_without_chain,
+    PackageSource, canonical_tree_bytes, check_local_path_drift, digest_local_content,
+    digest_tree_files, ensure_no_promotion_without_chain,
 };
 pub use startup::{
-    InstalledGenerationInputs, STARTUP_GRANT_SNAPSHOT_STAGE, validate_installed_generation,
+    InstalledGenerationInputs, STARTUP_GRANT_SNAPSHOT_STAGE, StagedTreeInputs,
+    validate_installed_generation, validate_staged_tree_generation,
 };
 pub use trust::{
     KeyRecord, KeyStore, SIGNING_DOMAIN, SignatureRecord, TrustMode, TrustPin, TrustStore,

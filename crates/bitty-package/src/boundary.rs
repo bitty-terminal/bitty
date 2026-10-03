@@ -70,7 +70,7 @@
 //! | `crates/bitty-plugin-host/src/capability.rs`                 | Closed capability check                | Core-retained    |
 //! | `crates/bitty-plugin-host/src/install.rs`                    | Install-time verification pipeline     | External-manager |
 //! | `crates/bitty-plugin-host/src/registry.rs`                   | Resolver use in tests only             | External-manager |
-//! | `crates/bitty-runtime/src/plugin_runtime/resolution.rs`      | Read-only installed-record load (doc reference; re-implements the content digest, the live wiring gap) | Core-retained |
+//! | `crates/bitty-runtime/src/plugin_runtime/resolution.rs`      | Read-only installed-record load invoking the retained `startup::validate_staged_tree_generation` (`H-A` via the shared `source::canonical_tree_bytes` scheme, `H-B` + grants re-derived; live-dev drift stays `unverified` per RFC B.5) | Core-retained |
 //! | `crates/bitty-runtime/src/plugin_runtime/package.rs`         | Compat grammar                         | Core-retained    |
 //! | `crates/bitty-runtime/src/plugin_runtime/package.rs`         | Local install / uninstall / enable     | External-manager |
 //! | `crates/bitty-runtime/src/plugin_runtime/services.rs`        | Version grammar at the call boundary   | Core-retained    |
@@ -82,13 +82,17 @@
 //! The install-time consumer (`bitty-plugin-host::install`, the
 //! `bitty-package` resolver/activation/trust modules, and the
 //! `bitty-runtime` local install path) cannot be removed until
-//! `bitty-plugin-manager` exists. The read-only runtime load path currently
-//! digests the staged Lua module tree rather than a single artifact blob, so
-//! it cannot yet call [`crate::startup::validate_installed_generation`]
-//! without reconciling the tree digest with the `H-A` artifact digest; that
-//! reconciliation is the remaining `W-101` work parked in the boundary
-//! document ("retained-parser placement"). This slice therefore adds the
-//! explicit retained entry point and its tests without rewiring the runtime.
+//! `bitty-plugin-manager` exists. The read-only runtime load path digests the
+//! staged Lua module tree; `H-A` is reconciled by sharing the single canonical
+//! tree scheme in [`crate::source::canonical_tree_bytes`], and
+//! `resolve_record` invokes the retained
+//! [`crate::startup::validate_staged_tree_generation`] (same `H-A` primitive
+//! and grant rule as [`crate::startup::validate_installed_generation`], with
+//! the runtime manifest's canonical bytes bound generically as `H-B`). The
+//! blob entry point stays for the package-manager generation model; the
+//! remaining `W-101` work parked in the boundary document is
+//! "retained-parser placement" (whether Core links `bitty-package` directly
+//! or a narrower shared crate).
 
 #![forbid(unsafe_code)]
 
@@ -157,8 +161,12 @@ pub enum PackageOperation {
 }
 
 impl PackageOperation {
+    /// Number of variants; kept as a named constant so the completeness assert
+    /// below fails on a miscount rather than silently passing review.
+    pub const COUNT: usize = 13;
+
     /// Every operation, for exhaustiveness tests and audit renderers.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; Self::COUNT] = [
         Self::ManifestParse,
         Self::DependencyResolution,
         Self::SourceFetch,
@@ -232,6 +240,21 @@ impl PackageOperation {
     }
 }
 
+/// Compile-time completeness: `ALL` must list every enum variant (review item
+/// (c)).
+///
+/// Fixed-length assert: adding a variant without listing it in `ALL` fails
+/// here (and the exhaustive `match` below fails the build until it lists the
+/// new variant), so ownership drift cannot pass review silently.
+const _: () = assert!(
+    PackageOperation::ALL.len() == PackageOperation::COUNT,
+    "PackageOperation::ALL must list every variant"
+);
+const _: () = assert!(
+    PackageOperation::COUNT == 13,
+    "PackageOperation::COUNT must match the W-72 operation table"
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,12 +262,25 @@ mod tests {
 
     #[test]
     fn every_operation_is_classified_exactly_once() {
+        // Fixed-length completeness (review item (c)): `ALL` must hold exactly
+        // `COUNT` (13) entries; a new variant missing from `ALL` fails here
+        // even if the exhaustive `match` below was updated.
+        assert_eq!(
+            PackageOperation::ALL.len(),
+            PackageOperation::COUNT,
+            "PackageOperation::ALL must list every variant"
+        );
+        assert_eq!(
+            PackageOperation::COUNT,
+            13,
+            "PackageOperation::ALL must list every variant"
+        );
         let unique: BTreeSet<PackageOperation> = PackageOperation::ALL.iter().copied().collect();
         assert_eq!(unique.len(), PackageOperation::ALL.len());
         // Exhaustiveness guard: a new variant must be added to `ALL`. The
         // `match` below is exhaustive, so the build breaks on a new variant
-        // until this test lists it; the counter then catches a variant that
-        // was added to the match but forgotten in `ALL`.
+        // until this test lists it; the counters above then catch a variant
+        // that was added to the match but forgotten in `ALL`.
         let mut listed = 0usize;
         for operation in PackageOperation::ALL {
             match operation {
@@ -265,7 +301,11 @@ mod tests {
             let _ = operation.owner();
             assert!(!operation.label().is_empty());
         }
-        assert_eq!(listed, 13, "PackageOperation::ALL must list every variant");
+        assert_eq!(
+            listed,
+            PackageOperation::COUNT,
+            "PackageOperation::ALL must list every variant"
+        );
     }
 
     #[test]

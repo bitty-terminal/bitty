@@ -1908,6 +1908,9 @@ impl TerminalApp {
                         // swallowed (no action runs, no PTY bytes).
                         if self.overlay_capture_active() {
                             use bitty_config::KeyName as OverlayKey;
+                            if key.is_synthetic {
+                                return false;
+                            }
                             if keyref.key == OverlayKey::Escape
                                 && !keyref.ctrl
                                 && !keyref.alt

@@ -3260,9 +3260,7 @@ mod tests {
         // Ending the session drops the dispatcher bindings, so dispatch
         // fails closed with the existing `E_UI_NOT_OWNER` code (never a new
         // stale code).
-        services
-            .ui_targets_session_cancel(handle)
-            .expect("cancel");
+        services.ui_targets_session_cancel(handle).expect("cancel");
         assert_eq!(
             services
                 .ui_targets_dispatch(&labels[0])

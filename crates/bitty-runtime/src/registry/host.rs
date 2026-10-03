@@ -65,7 +65,7 @@ use crate::cw_present::{
     NonTerminalPresent, ScenePresent, consume_scene_present, nonterminal_for_content,
 };
 
-use crate::execution::{
+use super::lease::{
     LeaseError, LeaseEvent, LeaseHolder, LeaseState, PanelLease, validate_description,
     validate_title,
 };

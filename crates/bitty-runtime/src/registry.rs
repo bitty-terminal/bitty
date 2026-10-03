@@ -596,6 +596,7 @@ pub struct ViewHandle {
 
 mod event_bus_v1;
 mod host;
+mod lease;
 mod panel;
 #[cfg(test)]
 mod panel_tests;
@@ -607,6 +608,7 @@ mod tests;
 
 pub use event_bus_v1::*;
 pub use host::*;
+pub use lease::*;
 pub use panel::*;
 pub use provider::*;
 pub use routable::*;

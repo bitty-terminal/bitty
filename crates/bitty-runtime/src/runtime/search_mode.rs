@@ -111,11 +111,19 @@ impl Runtime {
 
     /// Advances to the next match, reveals it, and syncs the live
     /// selection. Fail-closed no-op when the overlay is closed or empty.
+    ///
+    /// CTX-0936 (W-143b dogfood): navigation goes through the
+    /// [`Self::search_host_advance`] host op; reveal and selection sync
+    /// already route through their host ops.
     pub fn search_goto_next(&mut self) {
         if !self.search_mode || self.search_state.match_count() == 0 {
             return;
         }
-        self.search_state.next();
+        if let Some(handle) = self.search_host_handle() {
+            let _ = self.search_host_advance(&handle, 1);
+        } else {
+            self.search_state.next();
+        }
         self.search_reveal_current();
         let _ = self.search_apply_selection();
         self.pending_full_redraw = true;
@@ -123,11 +131,18 @@ impl Runtime {
 
     /// Goes back to the previous match, reveals it, and syncs the live
     /// selection. Fail-closed no-op when the overlay is closed or empty.
+    ///
+    /// CTX-0936 (W-143b dogfood): same host-op routing as
+    /// [`Self::search_goto_next`].
     pub fn search_goto_prev(&mut self) {
         if !self.search_mode || self.search_state.match_count() == 0 {
             return;
         }
-        self.search_state.prev();
+        if let Some(handle) = self.search_host_handle() {
+            let _ = self.search_host_advance(&handle, -1);
+        } else {
+            self.search_state.prev();
+        }
         self.search_reveal_current();
         let _ = self.search_apply_selection();
         self.pending_full_redraw = true;
@@ -179,6 +194,11 @@ impl Runtime {
     /// Scrolls that view minimally so the current match becomes visible
     /// (no-op when closed, empty, or already visible). Returns `true` when
     /// the viewport moved.
+    ///
+    /// CTX-0936 (W-143b dogfood): the scroll itself goes through the
+    /// [`Self::search_host_scroll_to_current`] host op. The overlay-open
+    /// requirement stays here: it is modal policy, not mechanism, and moves
+    /// with the overlay in W-144.
     pub fn search_reveal_current(&mut self) -> bool {
         if !self.search_mode || self.search_state.current_match().is_none() {
             return false;
@@ -186,23 +206,13 @@ impl Runtime {
         let Some(bound) = self.search_view else {
             return false;
         };
-        // Disjoint field borrows in a tight scope: `layout` mutably plus
-        // `search_state` and the bound grid immutably (avoids a whole-`self`
-        // borrow while the view is live).
-        let changed = {
-            let Some(state) = super::selection::grid_of(
-                &self.pane_sessions,
-                self.primary_view,
-                &self.state,
-                bound,
-            ) else {
-                return false;
-            };
-            let Some(view) = self.layout.find_leaf_mut(bound) else {
-                return false;
-            };
-            self.search_state.scroll_to_current(view, state)
+        let Some(handle) = self.search_host_handle() else {
+            return false;
         };
+        debug_assert_eq!(handle.view, bound);
+        let changed = self
+            .search_host_scroll_to_current(bound, &handle)
+            .unwrap_or(false);
         if changed {
             self.pending_full_redraw = true;
         }

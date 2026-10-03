@@ -834,6 +834,8 @@ pub struct PluginServices {
     workspace_control: Cell<bool>,
     workspace_source: RefCell<Option<Rc<dyn WorkspaceSource>>>,
     workspace_requests: RefCell<Option<Rc<RefCell<WorkspaceRequestQueue>>>>,
+    panel_create_granted: Cell<bool>,
+    panel_focus_granted: Cell<bool>,
 }
 
 impl PluginServices {
@@ -881,7 +883,18 @@ impl PluginServices {
             workspace_control: Cell::new(false),
             workspace_source: RefCell::new(None),
             workspace_requests: RefCell::new(None),
+            panel_create_granted: Cell::new(false),
+            panel_focus_granted: Cell::new(false),
         }
+    }
+
+    /// Grant `panel.create` and/or `panel.focus` from the activation snapshot
+    /// (CTX-0915, Issue #1596). Independent grants: create allows panel
+    /// creation, focus allows panel manipulation and state queries. Absent
+    /// grants fail closed with `E_CAPABILITY_DENIED`.
+    pub fn set_panel_access(&self, create: bool, focus: bool) {
+        self.panel_create_granted.set(create);
+        self.panel_focus_granted.set(focus);
     }
 
     /// Grant `workspace.read` and/or `workspace.control` from the activation
@@ -1987,6 +2000,66 @@ impl HostServices for PluginServices {
         Ok(result)
     }
 
+    fn panel_create(&self, panel_type: &str) -> Result<(u64, u64), BridgeError> {
+        if !self.panel_create_granted.get() {
+            return Err(BridgeError::capability_denied("panel.create"));
+        }
+        let _ = panel_type;
+        Err(BridgeError::not_implemented("bitty.panel.create"))
+    }
+
+    fn panel_close(&self, panel_id: u64) -> Result<bool, BridgeError> {
+        if !self.panel_focus_granted.get() {
+            return Err(BridgeError::capability_denied("panel.focus"));
+        }
+        let _ = panel_id;
+        Err(BridgeError::not_implemented("bitty.panel.close"))
+    }
+
+    fn panel_destroy(&self, panel_id: u64) -> Result<bool, BridgeError> {
+        if !self.panel_focus_granted.get() {
+            return Err(BridgeError::capability_denied("panel.focus"));
+        }
+        let _ = panel_id;
+        Err(BridgeError::not_implemented("bitty.panel.destroy"))
+    }
+
+    fn panel_get_presentation(&self, panel_id: u64) -> Result<Option<String>, BridgeError> {
+        if !self.panel_focus_granted.get() {
+            return Err(BridgeError::capability_denied("panel.focus"));
+        }
+        let _ = panel_id;
+        Err(BridgeError::not_implemented("bitty.panel.get_presentation"))
+    }
+
+    fn panel_set_presentation(
+        &self,
+        panel_id: u64,
+        presentation: &str,
+    ) -> Result<bool, BridgeError> {
+        if !self.panel_focus_granted.get() {
+            return Err(BridgeError::capability_denied("panel.focus"));
+        }
+        let _ = (panel_id, presentation);
+        Err(BridgeError::not_implemented("bitty.panel.set_presentation"))
+    }
+
+    fn panel_toggle_floating(&self, panel_id: u64) -> Result<bool, BridgeError> {
+        if !self.panel_focus_granted.get() {
+            return Err(BridgeError::capability_denied("panel.focus"));
+        }
+        let _ = panel_id;
+        Err(BridgeError::not_implemented("bitty.panel.toggle_floating"))
+    }
+
+    fn panel_get_state(&self, panel_id: u64) -> Result<Option<LuaValue>, BridgeError> {
+        if !self.panel_focus_granted.get() {
+            return Err(BridgeError::capability_denied("panel.focus"));
+        }
+        let _ = panel_id;
+        Err(BridgeError::not_implemented("bitty.panel.get_state"))
+    }
+
     fn workspace_list(&self) -> Result<Vec<WorkspaceInfo>, BridgeError> {
         if !self.workspace_read.get() {
             return Err(BridgeError::capability_denied("workspace.read"));
@@ -2149,6 +2222,69 @@ mod tests {
         services.set_trace_hub(Rc::new(RefCell::new(TraceHub::new())));
         services.set_declared_events(["terminal.opened".to_string()].into());
         services
+    }
+
+    #[test]
+    fn panel_entry_points_deny_without_grant() {
+        let services = services();
+        let error = services.panel_create("test").expect_err("denied");
+        assert_eq!(error.code, "E_CAPABILITY_DENIED");
+        assert_eq!(error.message, "capability 'panel.create' is not granted");
+
+        for (name, res) in [
+            ("close", services.panel_close(1)),
+            ("destroy", services.panel_destroy(1)),
+            (
+                "get_presentation",
+                services.panel_get_presentation(1).map(|_| false),
+            ),
+            (
+                "set_presentation",
+                services.panel_set_presentation(1, "tab"),
+            ),
+            ("toggle_floating", services.panel_toggle_floating(1)),
+            ("get_state", services.panel_get_state(1).map(|_| false)),
+        ] {
+            let error = res.expect_err("denied");
+            assert_eq!(error.code, "E_CAPABILITY_DENIED", "{name}");
+            assert_eq!(
+                error.message, "capability 'panel.focus' is not granted",
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn panel_grants_do_not_imply_each_other() {
+        let create_only = services();
+        create_only.set_panel_access(true, false);
+        let error = create_only.panel_create("test").expect_err("unimplemented");
+        assert_eq!(error.code, "E_NOT_IMPLEMENTED");
+        let error = create_only.panel_close(1).expect_err("focus denied");
+        assert_eq!(error.code, "E_CAPABILITY_DENIED");
+
+        let focus_only = services();
+        focus_only.set_panel_access(false, true);
+        let error = focus_only.panel_create("test").expect_err("create denied");
+        assert_eq!(error.code, "E_CAPABILITY_DENIED");
+        let error = focus_only.panel_close(1).expect_err("unimplemented");
+        assert_eq!(error.code, "E_NOT_IMPLEMENTED");
+        let error = focus_only.panel_destroy(1).expect_err("unimplemented");
+        assert_eq!(error.code, "E_NOT_IMPLEMENTED");
+        let error = focus_only
+            .panel_get_presentation(1)
+            .expect_err("unimplemented");
+        assert_eq!(error.code, "E_NOT_IMPLEMENTED");
+        let error = focus_only
+            .panel_set_presentation(1, "tab")
+            .expect_err("unimplemented");
+        assert_eq!(error.code, "E_NOT_IMPLEMENTED");
+        let error = focus_only
+            .panel_toggle_floating(1)
+            .expect_err("unimplemented");
+        assert_eq!(error.code, "E_NOT_IMPLEMENTED");
+        let error = focus_only.panel_get_state(1).expect_err("unimplemented");
+        assert_eq!(error.code, "E_NOT_IMPLEMENTED");
     }
 
     #[test]

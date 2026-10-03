@@ -1,4 +1,14 @@
 //! Stderr verbosity gating (`--verbose` / `--log-level` / `BITTY_LOG` / `RUST_LOG`).
+//!
+//! CTX-0926 (W-100 first slice, W-71 observability boundary): this gate is
+//! the retained always-on Core mechanism for local diagnostics — quiet
+//! [`LogLevel::Warn`] default, per-frame tick lines behind an explicit
+//! opt-in — while the `bitty-observability` implementation, exporters, and
+//! metrics pipeline stay optional policy outside Core. Every emitted line
+//! crosses the Core-to-stderr observer boundary through
+//! [`crate::observability::redact_text_for_stderr`] (redaction at emission,
+//! `P0-AC-026`); see [`crate::observability`] for the retained-vs-optional
+//! split and the transition notes.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -122,10 +132,16 @@ fn stderr_gate() -> LogLevel {
 /// Emits an info-class diagnostic when the gate allows it (CTX-0482).
 ///
 /// The closure keeps the disabled path allocation-free (same discipline as
-/// the tick-line gate).
+/// the tick-line gate). CTX-0926: the rendered line is redacted at emission
+/// via [`crate::observability::redact_text_for_stderr`] before it reaches
+/// the stderr observer, so a secret value never lands in diagnostics raw
+/// (`secret://` handles are log-safe and preserved).
 pub(crate) fn info(message: impl FnOnce() -> String) {
     if stderr_gate() >= LogLevel::Info {
-        eprintln!("{}", message());
+        eprintln!(
+            "{}",
+            crate::observability::redact_text_for_stderr(&message())
+        );
     }
 }
 
@@ -133,9 +149,14 @@ pub(crate) fn info(message: impl FnOnce() -> String) {
 ///
 /// Warnings sit at [`LogLevel::Warn`]: visible at the default and at
 /// `info`/`debug`/`trace`, silenced only by an explicit `--log-level error`.
+/// CTX-0926: same emission-time redaction as [`info`] (see
+/// [`crate::observability::redact_text_for_stderr`]).
 pub(crate) fn warn(message: impl FnOnce() -> String) {
     if stderr_gate() >= LogLevel::Warn {
-        eprintln!("{}", message());
+        eprintln!(
+            "{}",
+            crate::observability::redact_text_for_stderr(&message())
+        );
     }
 }
 

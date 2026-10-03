@@ -20,6 +20,14 @@
 //!
 //! Capability gating (`debug.inspect`, `debug.trace`) is enforced by
 //! `PluginServices` before any of these structures are touched.
+//!
+//! CTX-0926 (W-100 first slice, W-71 observability boundary) transition
+//! note: this backend is optional debug/trace *implementation* whose future
+//! owner is `bitty-observability`; it stays compiled into Core until the
+//! `W-71` removal gates pass (`W-110` conformance, default/safe parity,
+//! redaction and bounds evidence, caller audit, fail-closed version
+//! negotiation, docs sync, independent review plus green CI). This slice
+//! retires nothing and changes no behavior.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Instant;

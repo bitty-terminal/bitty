@@ -98,6 +98,20 @@
 //!   `--instance` on a local command, unknown overlay name).
 //! - `1` generic (unexpected failure after parsing, e.g. the headless runtime
 //!   or renderer failed to build; never used for the usage paths above).
+//!
+//! # Observability boundary (CTX-0926, W-100 first slice, W-71 contract)
+//!
+//! Every verb here is optional debug/trace *policy* (explicit opt-in,
+//! default off, safe-mode clean), following the `dev-perf`/`dev-tools`
+//! pattern: `trace` links `bitty-perf` only with the `dev-perf` feature,
+//! and `capture`/`synthesize`/`dump`/`overlay` compile only with the
+//! `dev-tools` feature. Without the feature the arguments are still
+//! validated (usage errors exit 2) and a valid request fails with exit 1 —
+//! no silent behavior change. All verbs are local-only (no instance, no
+//! plugin VM, no Event-Bus subscription); outputs carry counts, labels,
+//! and deterministic synthetic bytes only (no secrets, no PTY bytes); see
+//! `crate::observability` for the retained-vs-optional split and the
+//! transition notes. Behavior is preserved: this slice retires nothing.
 
 #![forbid(unsafe_code)]
 

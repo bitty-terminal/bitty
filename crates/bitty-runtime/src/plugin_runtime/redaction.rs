@@ -17,6 +17,11 @@
 //! policy, so its payload is withheld entirely and replaced by the
 //! [`REDACTED_KEY`] marker table. Known kinds are covered by an exhaustive
 //! match, so a new kind cannot silently default to "ungated".
+//!
+//! CTX-0926 (W-100 first slice, W-71 observability boundary): this module is
+//! retained Core mechanism — the redaction rules stay in Core under `W-71`
+//! and never move to `bitty-observability` with the debug/trace
+//! implementation. This slice changes no behavior.
 
 use std::borrow::Cow;
 

@@ -239,6 +239,7 @@ mod inspect;
 mod ipc_serve;
 mod layout_cmd;
 mod logging;
+mod observability;
 mod plugin_runtime;
 mod version;
 
@@ -346,6 +347,13 @@ fn main() {
     // CTX-0482 (#763): install the process-wide stderr gate once so startup
     // diagnostics obey `--log-level` instead of printing unconditionally.
     logging::install_stderr_gate(effective_log_level(&args));
+    // CTX-0926 (W-100 first slice, W-71 observability boundary): pin the
+    // default-deny posture without changing behavior — only the bounded
+    // in-memory seam is active by default, and no external observer attaches
+    // without capability plus consent plus a version intersection (`--safe`
+    // additionally denies everything external). Release builds erase this;
+    // a violation panics in debug (fail-closed development, never production).
+    debug_assert!(observability::default_posture_pins_hold(args.safe));
 
     // `bitty list --help` shows list help (never needs an instance or VM);
     // `bitty inspect --help` shows inspect help; bare `--help` shows the
@@ -865,8 +873,17 @@ fn main() {
     .with_plugin_runtime(plugin_runtime_handle);
     // CTX-0167: the synthetic demo pump stays off in real sessions so
     // startup shows only the shell. Opt-in debug only (`BITTY_DEMO_PUMP=1`).
-    if demo_pump_enabled_from_env() {
+    // CTX-0926 (W-100 first slice, W-71 observability boundary): the pump is
+    // optional debug policy (default off) and safe-mode clean — `--safe`
+    // recovery never attaches synthetic input, even when the env opt-in is
+    // set. Non-safe behavior is unchanged; a safe run that requests the pump
+    // logs one explicit warning instead of silently pumping.
+    let demo_pump_requested = demo_pump_enabled_from_env();
+    if observability::demo_pump_allowed(args.safe, demo_pump_requested) {
         app.attach_demo_pump(app_config.theme.name, app_config.source);
+    } else if demo_pump_requested {
+        // Implies `args.safe` (the only way an enabled request is refused).
+        logging::warn(|| String::from("bitty: demo pump suppressed in --safe (safe-mode clean)"));
     }
     // CTX-0190: apply the stderr verbosity gate before the event loop so
     // per-frame `bitty tick` lines stay quiet by default and appear only

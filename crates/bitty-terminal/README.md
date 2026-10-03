@@ -36,6 +36,34 @@ libraries, as stated in `src/main.rs`.
 - Flag parsing itself is pure and total; config-file loading, window and GPU
   attachment stay on the documented startup path in `src/main.rs`.
 
+## Observability boundary (CTX-0926, W-100 first slice)
+
+> Contract basis: accepted W-71 `bitty-docs/docs/development/observability-boundary.md`.
+> This crate keeps the first staged slice only: the boundary is defined and
+> behavior is preserved — no debug or trace code is retired here (removal
+> needs the W-71 gates plus `W-110` conformance first).
+
+- Retained always-on Core mechanism (compiled in, safe-mode clean):
+  the stderr verbosity gate in `src/logging.rs` (quiet `Warn` default;
+  per-frame `bitty tick` lines need `--verbose` / `--log-level debug|trace`
+  or `BITTY_LOG`/`RUST_LOG`), the bounded read-only inspect snapshots
+  served from `bitty-runtime`, and the default-deny gate plus
+  redaction-at-emission plus bounds in `src/observability.rs`
+  (every `logging::info`/`warn` line is scrubbed before `eprintln!`;
+  `secret://` handles stay log-safe).
+- Optional policy (explicit opt-in, default off, safe-mode clean):
+  `bitty dev trace` (needs the `dev-perf` feature),
+  `bitty dev capture|synthesize|dump|overlay` (needs the `dev-tools`
+  feature), the tick-line verbosity flags above, `BITTY_DEMO_PUMP=1`
+  (suppressed under `--safe` with one explicit warning), and
+  `BITTY_PERF_STARTUP_MARKER`. The `bitty-observability` implementation,
+  exporters, and metrics pipeline are not Core dependencies.
+- Transition: `bitty-runtime` `plugin_runtime::debug` (`DebugView`/`TraceHub`)
+  is staged as future `bitty-observability` implementation but stays compiled
+  in until the removal gates pass; `plugin_runtime::redaction` stays in Core
+  permanently. No Event-Bus exposure of observations, no secret capture,
+  version negotiation fails closed (pre-`0.1.0` makes no stability claim).
+
 ## Layout
 
 - `Cargo.toml` — binary target `bitty` at `src/main.rs` plus dependencies.

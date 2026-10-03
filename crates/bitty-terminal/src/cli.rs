@@ -303,10 +303,14 @@ pub(crate) struct Args {
     /// When true emit per-frame `bitty tick` stats (CTX-0190).
     /// `-v` / `--verbose` (also `BITTY_VERBOSE=1`); shorthand for
     /// `--log-level debug`. Default (unset) is quiet: no tick lines.
+    /// CTX-0926 (W-100 first slice, W-71 boundary): optional observation
+    /// policy — explicit opt-in, default off; the devtools trace path keeps
+    /// full fidelity regardless of this gate. See `crate::observability`.
     pub(crate) verbose: bool,
     /// Explicit stderr log level from `--log-level LEVEL` (CTX-0190).
     /// `None` means derive from `--verbose`/env/default in
     /// [`crate::logging::effective_log_level`]. Tick stats require `Debug`/`Trace`.
+    /// CTX-0926: optional observation policy (same boundary as `verbose`).
     pub(crate) log_level: Option<LogLevel>,
 }
 

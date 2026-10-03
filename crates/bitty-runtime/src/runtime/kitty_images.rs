@@ -1,13 +1,26 @@
-//! `Runtime` — Kitty graphics display routing (CTX-0248).
+//! `Runtime` — Kitty graphics display routing (CTX-0248, W-141).
 //!
 //! Split from `super` (`runtime.rs`) as a pure addition: the intake stub
-//! ([`bitty_rich::KittyGraphicsStub`]) and the bounded decoder
-//! ([`bitty_rich::decode_kitty_payload`]) already exist headlessly, and the
-//! VT parser still treats `APC G` as inert, so this module is the minimal
-//! routing seam that turns a completed transmission's parameters plus
-//! payload bytes into a stored image and, for display actions, a
-//! cursor-anchored placement. Full `APC G` parser wiring is follow-up work;
-//! callers pass the already-parsed `f`/`s`/`v`/`a`/`c`/`r` values.
+//! ([`bitty_rich::KittyGraphicsStub`]) holds bounded wire payloads, and the
+//! VT parser still treats `APC G` as inert until this seam, so this module
+//! is the minimal routing seam that turns a completed transmission's
+//! parameters plus payload bytes into a stored image and, for display
+//! actions, a cursor-anchored placement. Full `APC G` parser wiring is
+//! follow-up work; callers pass the already-parsed `f`/`s`/`v`/`a`/`c`/`r`
+//! values.
+//!
+//! W-141 extraction: the bounded decoder moved to the `bitty-graphics`
+//! extension crate and the Core-to-extension call shape is not wired yet
+//! (no Core-to-extension dependency allowed). Transmit entry points therefore
+//! run the Core-retained declared-size pre-check
+//! ([`bitty_rich::precheck_declared_image`], P0-AC-003: refusals before any
+//! large allocation) and then fail closed with
+//! [`bitty_rich::KittyPrecheckError::DecoderUnavailable`]: valid payloads
+//! store nothing and place nothing until the wiring task lands. Rejection
+//! behavior for hostile declarations is unchanged and tested; placement
+//! policy (admission, eviction, origin tagging, alternate-screen
+//! suppression) is untouched and stays unit-tested in `bitty-rich`.
+//!
 //!
 //! Display anchors at the drained stream's cursor cell (the primary grid,
 //! or the pane session swapped in by `handle_pane_bytes`) with that
@@ -36,8 +49,10 @@ use super::*;
 pub enum KittyImageError {
     /// Wire `f=` value maps to no supported format (never guessed).
     UnknownFormat(u32),
-    /// Bounded decode refused the payload (no bitmap, no placement).
-    Decode(bitty_rich::KittyDecodeError),
+    /// Core pre-check refused the declared payload, or the payload passed
+    /// pre-check but Core holds no codec (W-141: decoder moved to the
+    /// `bitty-graphics` extension, wiring pending). No bitmap, no placement.
+    Decode(bitty_rich::KittyPrecheckError),
     /// Placement admission refused an otherwise decoded image.
     Placement(bitty_rich::KittyPlacementError),
 }
@@ -98,20 +113,14 @@ impl Runtime {
     /// Image blits composited on the last presented frame (CTX-0252 F2).
     ///
     /// Latched on every successful present; idle ticks leave it unchanged.
-    /// Bound by [`bitty_rich::KITTY_PRESENT_MAX_BLITS_PER_FRAME`].
+    /// Bound by [`bitty_rich::KITTY_PRESENT_MAX_BLITS_PER_FRAME`]. The
+    /// raster cache that used to feed these blits moved to the
+    /// `bitty-graphics` extension (W-141), so Core latches `0` until the
+    /// wiring task lands; image and placement counts above stay
+    /// headless-observable.
     #[must_use]
     pub fn kitty_last_frame_images(&self) -> usize {
         self.kitty_last_frame_images
-    }
-
-    /// Raster-cache counters: hits, misses, entries, bytes (CTX-0252 F2).
-    ///
-    /// Headless-observable proof that static frames reuse cached blits
-    /// (hits grow, misses do not) and that scroll/geometry changes
-    /// invalidate (misses grow, no stale pixels).
-    #[must_use]
-    pub fn kitty_raster_stats(&self) -> bitty_rich::KittyRasterStats {
-        self.kitty_raster_cache.stats()
     }
 
     /// Total encoded bytes buffered across all in-flight Kitty graphics streams
@@ -129,62 +138,86 @@ impl Runtime {
         primary + panes
     }
 
-    /// Decodes `payload` and stores the bitmap without placing it.
+    /// Pre-checks a Kitty payload without storing it (W-141 stub).
     ///
     /// `format_f` is the wire `f=` value (`100` PNG, `24` RGB, `32` RGBA);
     /// `width_s`/`height_v` are the wire `s`/`v` dimensions (required for
-    /// raw formats, ignored for PNG). Bounds run before allocation in both
-    /// decode and placement admission.
+    /// raw formats, ignored for PNG). The Core-retained declared-size
+    /// pre-check ([`bitty_rich::precheck_declared_image`]) runs before any
+    /// allocation; the bounded codec itself moved to the `bitty-graphics`
+    /// extension and is not wired yet, so admissible payloads fail closed
+    /// with [`bitty_rich::KittyPrecheckError::DecoderUnavailable`] instead
+    /// of storing.
     ///
     /// # Errors
     ///
     /// [`KittyImageError::UnknownFormat`] for unsupported `f=` values,
-    /// [`KittyImageError::Decode`] for malformed or oversize payloads, and
-    /// [`KittyImageError::Placement`] when the layer refuses admission.
-    /// Failures store nothing.
+    /// [`KittyImageError::Decode`] for empty, underspecified, or oversize
+    /// declarations (before allocation) and for every admissible payload
+    /// (decoder unavailable). Failures store nothing.
     pub fn kitty_transmit_image(
         &mut self,
         format_f: u32,
         width_s: Option<u32>,
         height_v: Option<u32>,
         payload: &[u8],
-        compressed_len: usize,
+        _compressed_len: usize,
     ) -> Result<bitty_rich::KittyImageId, KittyImageError> {
-        let format = bitty_rich::KittyTransmitFormat::from_f(format_f)
-            .ok_or(KittyImageError::UnknownFormat(format_f))?;
-        let decoded = bitty_rich::decode_kitty_payload(format, width_s, height_v, payload)
-            .map_err(KittyImageError::Decode)?;
-        let (width, height) = decoded.dimensions();
-        self.kitty_images
-            .store(width, height, decoded.into_rgba(), compressed_len)
-            .map_err(KittyImageError::Placement)
+        Self::precheck_transmit(format_f, width_s, height_v, payload.len())?;
+        Err(KittyImageError::Decode(
+            bitty_rich::KittyPrecheckError::DecoderUnavailable,
+        ))
     }
 
-    /// Decodes and stores a Kitty image with owned payload, avoiding a copy
-    /// for raw uncompressed formats (f=24/f=32).
+    /// Pre-checks a Kitty image with owned payload (W-141 stub).
     ///
-    /// Falls back to the borrowed decoder when the format is compressed or
-    /// requires dimension inference.
+    /// Same behavior as [`Self::kitty_transmit_image`]; the owned buffer is
+    /// dropped undisturbed. The zero-copy fast path moved to the extension
+    /// with the decoder.
+    ///
+    /// W-141: `payload` stays boxed so the signature (and the `pty.rs` live
+    /// caller) is unchanged for the wiring task; only the length is
+    /// pre-checked today.
+    #[allow(clippy::boxed_local)]
     pub fn kitty_transmit_image_owned(
         &mut self,
         format_f: u32,
         width_s: Option<u32>,
         height_v: Option<u32>,
         payload: Box<[u8]>,
-        compressed_len: usize,
+        _compressed_len: usize,
     ) -> Result<bitty_rich::KittyImageId, KittyImageError> {
-        let format = bitty_rich::KittyTransmitFormat::from_f(format_f)
-            .ok_or(KittyImageError::UnknownFormat(format_f))?;
-        let decoded = bitty_rich::decode_kitty_payload_owned(format, width_s, height_v, payload)
-            .map_err(KittyImageError::Decode)?;
-        let (width, height) = decoded.dimensions();
-        self.kitty_images
-            .store(width, height, decoded.into_rgba(), compressed_len)
-            .map_err(KittyImageError::Placement)
+        Self::precheck_transmit(format_f, width_s, height_v, payload.len())?;
+        Err(KittyImageError::Decode(
+            bitty_rich::KittyPrecheckError::DecoderUnavailable,
+        ))
     }
 
-    /// Decodes, stores, and — for display actions outside the alternate
-    /// screen — places a Kitty image at the primary cursor cell.
+    /// Shared wire-format admission + declared-size pre-check.
+    ///
+    /// Maps `f=` without guessing, then runs the Core-retained
+    /// pre-allocation validator. No pixel buffer exists at any point.
+    fn precheck_transmit(
+        format_f: u32,
+        width_s: Option<u32>,
+        height_v: Option<u32>,
+        payload_len: usize,
+    ) -> Result<(), KittyImageError> {
+        let channels = match format_f {
+            bitty_rich::KITTY_FORMAT_PNG => None,
+            bitty_rich::KITTY_FORMAT_RGB => Some(3),
+            bitty_rich::KITTY_FORMAT_RGBA => Some(4),
+            _ => return Err(KittyImageError::UnknownFormat(format_f)),
+        };
+        bitty_rich::precheck_declared_image(channels, width_s, height_v, payload_len)
+            .map_err(KittyImageError::Decode)
+    }
+
+    /// Pre-checks, then (once wired) stores and — for display actions
+    /// outside the alternate screen — places a Kitty image at the primary
+    /// cursor cell (W-141 stub: transmit always fails closed, so the
+    /// placement policy below is currently unreachable; it stays verbatim
+    /// for the wiring task).
     ///
     /// `action_a` is the wire `a=` value (`None` when absent, which means
     /// transmit-and-display per the kitty specification); `cols_c`/`rows_r`
@@ -289,11 +322,12 @@ impl Runtime {
         })
     }
 
-    /// Decodes, stores, and places a Kitty image with owned payload,
-    /// avoiding a copy for raw uncompressed formats (f=24/f=32).
+    /// Pre-checks, then (once wired) stores and places a Kitty image with
+    /// owned payload (W-141 stub: see [`Self::kitty_display_image`]).
     ///
     /// Same behavior as [`Self::kitty_display_image`] but moves the
-    /// payload to avoid an intermediate copy.
+    /// payload to avoid an intermediate copy once the extension fast path
+    /// lands.
     #[allow(clippy::too_many_arguments)]
     pub fn kitty_display_image_owned(
         &mut self,

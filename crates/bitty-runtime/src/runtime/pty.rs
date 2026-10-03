@@ -984,8 +984,10 @@ impl Runtime {
                     }
                 );
             if screen_cleared {
+                // W-141: the raster cache moved to the extension; clearing
+                // placements is the Core-retained half (no cached blits to
+                // drop in Core anymore).
                 self.kitty_images.clear_origin(self.kitty_origin);
-                self.kitty_raster_cache.clear();
             }
 
             // CTX-0146 (Issue #238): answer standard terminal queries with

@@ -1,585 +1,117 @@
-//! Kitty placement + present-path tests (CTX-0248, headless).
+//! Kitty transmit seam fail-closed suite (CTX-0248, W-141).
 //!
-//! Placement math and rasterization live in `bitty-rich`; compositing
-//! primitives in `bitty-render`. These tests prove the runtime seam:
-//! completed transmissions route to stored images, display actions paint
-//! RGBA into the presented frame topmost (never grid truth), and scroll /
-//! alternate-screen behave as documented.
+//! W-141 extraction moved the bounded decoder to the `bitty-graphics`
+//! extension crate and the Core-to-extension call shape is not wired yet,
+//! so the runtime transmit entry points run only the Core-retained
+//! declared-size pre-check and then fail closed. These tests pin that seam:
+//! hostile declarations are refused before any allocation (P0-AC-003),
+//! unknown formats never guess, admissible payloads fail closed with
+//! `DecoderUnavailable` (storing and placing nothing), and rejected
+//! transmissions leave the grid idle. Pixel-painting parity moved with the
+//! decoder and returns with the wiring task.
 
-use bitty_runtime::{KittyDisplayOutcome, Runtime, RuntimeConfig};
+use bitty_rich::KittyPrecheckError;
+use bitty_runtime::{KittyImageError, Runtime};
 
 fn make_runtime() -> Runtime {
     Runtime::with_defaults().expect("defaults must build")
 }
 
-/// 2x2 opaque red RGBA payload (`f=32`).
+/// 2x2 opaque red RGBA payload (`f=32`): admissible, but Core holds no
+/// codec, so it must fail closed until wiring.
 fn red_2x2() -> Vec<u8> {
     [0xFF, 0x00, 0x00, 0xFF].repeat(4)
 }
 
-fn default_geometry() -> (usize, usize, usize) {
-    // Mirrors `tick_cursor_overlay_uses_theme_cursor_hue`: 9x19 cells,
-    // 8px padding inset at scale 1.0, 80x24 grid. The returned origin
-    // includes the unified CTX-0294/CTX-0333 default decoration outer gap +
-    // border + content inset (6 + 1 + 6 = 13px), where cell (0,0) content
-    // actually starts.
-    let cfg = RuntimeConfig::default();
-    assert_eq!((cfg.cell_width, cfg.cell_height), (9, 19));
-    let rt = make_runtime();
-    let pad = usize::try_from(rt.window_padding_physical()).expect("pad fits usize");
-    assert_eq!(pad, 8);
-    (9, 19, pad + 13)
-}
-
-/// Absolute content origin `(x, y)` in physical px and the derived content
-/// row count, read from the runtime's own decorated present frames so the
-/// scroll tests track the decoration config instead of hardcoding rows.
-fn red_band(rgba: &[u8], width: usize) -> Option<(usize, usize)> {
-    let mut top = None;
-    let mut bottom = 0;
-    for (i, px) in rgba.chunks_exact(4).enumerate() {
-        if px == [0xFF, 0, 0, 0xFF] {
-            let y = i / width.max(1);
-            if top.is_none() {
-                top = Some(y);
-            }
-            bottom = y;
-        }
-    }
-    top.map(|t| (t, bottom))
-}
-
-fn content_frame_geometry(rt: &Runtime) -> (usize, usize, usize) {
-    let frame = rt.present_frames();
-    assert_eq!(frame.len(), 1, "single-leaf scroll fixture");
-    let pad = usize::try_from(rt.window_padding_physical()).expect("pad fits usize");
-    (
-        pad + usize::try_from(frame[0].content.x).expect("x fits usize"),
-        pad + usize::try_from(frame[0].content.y).expect("y fits usize"),
-        usize::from(frame[0].rows),
-    )
-}
-
-fn probe(rgba: &[u8], width: usize, x: usize, y: usize) -> [u8; 4] {
-    let idx = (y * width + x) * 4;
-    [rgba[idx], rgba[idx + 1], rgba[idx + 2], rgba[idx + 3]]
-}
-
 #[test]
-fn display_paints_image_pixels_topmost() {
-    let (cw, ch, pad) = default_geometry();
-    let mut rt = make_runtime();
-    let outcome = rt
-        .kitty_display_image(32, Some(2), Some(2), None, 2, 2, 0, &red_2x2(), 0)
-        .expect("display must succeed");
-    assert!(matches!(outcome, KittyDisplayOutcome::Displayed { .. }));
-    assert_eq!(rt.kitty_image_count(), 1);
-    assert_eq!(rt.kitty_placement_count(), 1);
-    rt.tick().expect("display forces a present");
-    let rgba = rt.headless_rgba().expect("rgba after tick");
-    let cfg = RuntimeConfig::default();
-    let width = usize::try_from(cfg.window_extent().width()).expect("width fits usize");
-    // Cursor-anchored at (0,0), 2x2 cells: dest covers pad..pad+18 px.
-    // Premultiplied opaque red is identity.
-    assert_eq!(probe(&rgba, width, pad + 1, pad + 1), [0xFF, 0, 0, 0xFF]);
-    assert_eq!(
-        probe(&rgba, width, pad + 2 * cw - 1, pad + 2 * ch - 1),
-        [0xFF, 0, 0, 0xFF]
-    );
-    // Outside the rect the theme background survives.
-    let bg = bitty_render::grid::DEFAULT_BG;
-    assert_eq!(
-        probe(&rgba, width, pad + 2 * cw + 1, pad + 1),
-        [bg[0], bg[1], bg[2], 0xFF]
-    );
-    assert_eq!(rt.tick(), None, "static image idles after present");
-}
-
-#[test]
-fn image_covers_grid_text_where_they_overlap() {
-    let (_, _, pad) = default_geometry();
-    let mut rt = make_runtime();
-    rt.handle_pty_bytes(b"A");
-    // Cursor is now col 1; move back over the 'A' cell and cover it.
-    rt.handle_pty_bytes(b"\x1b[1;1H");
-    rt.kitty_display_image(32, Some(2), Some(2), None, 1, 1, 0, &red_2x2(), 0)
-        .expect("display must succeed");
-    rt.tick().expect("display forces a present");
-    let rgba = rt.headless_rgba().expect("rgba after tick");
-    let cfg = RuntimeConfig::default();
-    let width = usize::try_from(cfg.window_extent().width()).expect("width fits usize");
-    // Cell (0,0) center carries opaque red, not the 'A' glyph gray.
-    assert_eq!(probe(&rgba, width, pad + 4, pad + 9), [0xFF, 0, 0, 0xFF]);
-}
-
-#[test]
-fn transmit_only_stores_without_painting() {
-    let (_, _, pad) = default_geometry();
-    let mut rt = make_runtime();
-    let outcome = rt
-        .kitty_display_image(32, Some(2), Some(2), Some('t'), 2, 2, 0, &red_2x2(), 0)
-        .expect("transmit must succeed");
-    assert!(matches!(outcome, KittyDisplayOutcome::Stored { .. }));
-    assert_eq!(rt.kitty_image_count(), 1);
-    assert_eq!(rt.kitty_placement_count(), 0);
-    rt.tick().expect("first tick still presents the grid");
-    let rgba = rt.headless_rgba().expect("rgba after tick");
-    let cfg = RuntimeConfig::default();
-    let width = usize::try_from(cfg.window_extent().width()).expect("width fits usize");
-    // The cursor fill paints cell (0,0), so the pixel is theme-cursor, not
-    // background — the assertion that matters is "not image red".
-    assert_ne!(
-        probe(&rgba, width, pad + 1, pad + 1),
-        [0xFF, 0, 0, 0xFF],
-        "transmit-only must paint no image pixels"
-    );
-}
-
-#[test]
-fn unsupported_action_stores_without_painting() {
-    let mut rt = make_runtime();
-    for action in ['p', 'd', 'q', 'f'] {
-        let outcome = rt
-            .kitty_display_image(
-                32,
-                Some(1),
-                Some(1),
-                Some(action),
-                1,
-                1,
-                0,
-                &[9, 9, 9, 9],
-                0,
-            )
-            .expect("unsupported action must still store");
-        assert!(
-            matches!(outcome, KittyDisplayOutcome::StoredNotDisplayed { .. }),
-            "a={action}"
-        );
-    }
-    assert_eq!(rt.kitty_image_count(), 4);
-    assert_eq!(rt.kitty_placement_count(), 0);
-}
-
-#[test]
-fn unknown_format_and_oversize_fail_closed() {
+fn unknown_format_rejected_without_storing() {
     let mut rt = make_runtime();
     let err = rt
         .kitty_display_image(7, Some(2), Some(2), None, 1, 1, 0, &red_2x2(), 0)
-        .expect_err("f=7 must fail");
-    assert!(matches!(
-        err,
-        bitty_runtime::KittyImageError::UnknownFormat(7)
-    ));
-    let err = rt
-        .kitty_display_image(32, Some(9000), Some(1), None, 1, 1, 0, &[0; 4], 0)
-        .expect_err("9000px side must fail");
-    assert!(matches!(err, bitty_runtime::KittyImageError::Decode(_)));
+        .expect_err("f=7 must fail closed");
+    assert_eq!(err, KittyImageError::UnknownFormat(7));
     assert_eq!(rt.kitty_image_count(), 0);
     assert_eq!(rt.kitty_placement_count(), 0);
 }
 
 #[test]
-fn scroll_moves_image_with_content() {
+fn oversize_declaration_rejected_before_alloc() {
     let mut rt = make_runtime();
-    let (origin_x, origin_y, rows) = content_frame_geometry(&rt);
-    let bottom = rows - 1;
-    // Anchor at the last content row.
-    rt.handle_pty_bytes(format!("\x1b[{};1H", rows).as_bytes());
-    rt.kitty_display_image(32, Some(2), Some(2), None, 1, 1, 0, &red_2x2(), 0)
-        .expect("display must succeed");
-    rt.tick().expect("display forces a present");
-    let cfg = RuntimeConfig::default();
-    let width = usize::try_from(cfg.window_extent().width()).expect("width fits usize");
-    let ch = cfg.cell_height as usize;
-    let before = rt.headless_rgba().expect("rgba");
-    assert_eq!(
-        probe(&before, width, origin_x + 4, bottom * ch + origin_y + 9),
-        [0xFF, 0, 0, 0xFF]
-    );
-    // Three linefeeds scroll the anchor one content row up, and the CTX-0361
-    // cursor-follow window slides two more rows (the cursor reached the grid
-    // bottom: 24-row screen, 22-row decorated frame), so the image tracks the
-    // text upward by three presented rows.
-    rt.handle_pty_bytes(b"\n\n\n");
-    rt.tick().expect("scroll damage must present");
-    let after = rt.headless_rgba().expect("rgba");
-    assert_eq!(rt.kitty_placement_count(), 1);
-    assert_eq!(
-        red_band(&after, width),
-        Some((
-            (bottom - 3) * ch + origin_y,
-            (bottom - 3) * ch + origin_y + ch - 1
-        )),
-        "image must track the scrolled content upward"
-    );
-    // The old anchor row must no longer carry the image.
-    assert_ne!(
-        probe(&after, width, origin_x + 4, bottom * ch + origin_y + 9),
-        [0xFF, 0, 0, 0xFF],
-        "old anchor row must no longer carry the image"
-    );
-}
-
-#[test]
-fn image_scrolled_off_top_paints_nothing_but_is_retained() {
-    let (_, _, pad) = default_geometry();
-    let mut rt = make_runtime();
-    rt.handle_pty_bytes(b"\x1b[24;1H");
-    rt.kitty_display_image(32, Some(2), Some(2), None, 1, 1, 0, &red_2x2(), 0)
-        .expect("display must succeed");
-    rt.tick().expect("display forces a present");
-    // Scroll the anchor (row 23) fully off the top.
-    rt.handle_pty_bytes(&[b'\n'; 30]);
-    rt.tick().expect("scroll damage must present");
-    assert_eq!(rt.kitty_placement_count(), 1, "placement retained");
-    let rgba = rt.headless_rgba().expect("rgba");
-    assert!(
-        rgba.chunks_exact(4)
-            .all(|px| px[0] != 0xFF || px[1] != 0 || px[2] != 0),
-        "no opaque-red pixel may survive once scrolled off"
-    );
-    let _ = pad;
-}
-
-#[test]
-fn alt_screen_clears_and_suppresses() {
-    let (_, _, pad) = default_geometry();
-    let mut rt = make_runtime();
-    rt.kitty_display_image(32, Some(2), Some(2), None, 2, 2, 0, &red_2x2(), 0)
-        .expect("display must succeed");
-    rt.tick().expect("display forces a present");
-    let cfg = RuntimeConfig::default();
-    let width = usize::try_from(cfg.window_extent().width()).expect("width fits usize");
-    assert_eq!(
-        probe(&rt.headless_rgba().expect("rgba"), width, pad + 1, pad + 1),
-        [0xFF, 0, 0, 0xFF,]
-    );
-    // Enter alternate screen: the origin's placements clear and the repaint
-    // carries no image pixels even though the grid generation may not
-    // advance. CTX-0254: the clear is per-origin — the stored image survives
-    // inertly (same model as the suppressed-display path below), only the
-    // placement is dropped.
-    rt.handle_pty_bytes(b"\x1b[?1049h");
-    rt.tick().expect("alt transition forces a present");
-    assert_eq!(rt.kitty_image_count(), 1, "stored image survives inertly");
+    // 9000-wide declaration on a 4-byte payload: the side cap fires before
+    // any pixel buffer exists (P0-AC-003).
+    let err = rt
+        .kitty_display_image(32, Some(9000), Some(1), None, 1, 1, 0, &[0; 4], 0)
+        .expect_err("oversize declaration must fail closed");
+    assert!(matches!(err, KittyImageError::Decode(_)));
+    assert_eq!(rt.kitty_image_count(), 0);
     assert_eq!(rt.kitty_placement_count(), 0);
-    let rgba = rt.headless_rgba().expect("rgba");
-    // Cursor rests at (0,0): cursor fill, not background — assert non-red.
-    assert_ne!(
-        probe(&rgba, width, pad + 1, pad + 1),
-        [0xFF, 0, 0, 0xFF],
-        "alt screen must carry no image pixels"
+}
+
+#[test]
+fn empty_payload_rejected_first() {
+    let mut rt = make_runtime();
+    let err = rt
+        .kitty_transmit_image(32, Some(2), Some(2), &[], 0)
+        .expect_err("empty payload must fail closed");
+    assert_eq!(
+        err,
+        KittyImageError::Decode(KittyPrecheckError::EmptyPayload)
     );
-    // Display while alt is active stores without placing. CTX-0254: the
-    // pre-alt image is still in the store (per-origin clear), so the
-    // suppressed store brings the count to two.
-    let outcome = rt
+    assert_eq!(rt.kitty_image_count(), 0);
+}
+
+#[test]
+fn length_mismatch_rejected_before_alloc() {
+    let mut rt = make_runtime();
+    // 2x2 RGBA needs exactly 16 bytes.
+    let err = rt
+        .kitty_transmit_image(32, Some(2), Some(2), &[0; 5], 5)
+        .expect_err("short payload must fail closed");
+    assert_eq!(
+        err,
+        KittyImageError::Decode(KittyPrecheckError::LengthMismatch {
+            expected: 16,
+            actual: 5
+        })
+    );
+    assert_eq!(rt.kitty_image_count(), 0);
+}
+
+#[test]
+fn admissible_payload_fails_closed_until_wiring() {
+    let mut rt = make_runtime();
+    let err = rt
         .kitty_display_image(32, Some(2), Some(2), None, 2, 2, 0, &red_2x2(), 0)
-        .expect("alt display must store");
-    assert!(matches!(
-        outcome,
-        KittyDisplayOutcome::SuppressedAlternateScreen { .. }
-    ));
-    assert_eq!(rt.kitty_image_count(), 2);
+        .expect_err("admissible payload has no Core codec yet");
+    assert_eq!(
+        err,
+        KittyImageError::Decode(KittyPrecheckError::DecoderUnavailable)
+    );
+    assert_eq!(rt.kitty_image_count(), 0);
     assert_eq!(rt.kitty_placement_count(), 0);
-    // Leave alternate screen: both stored-but-never-placed images survive
-    // inertly (placements stay empty, nothing paints). CTX-0254: the
-    // pre-alt image is no longer wiped by the alt entry, so the count is
-    // two here (pre-alt + alt-suppressed), not one.
-    rt.handle_pty_bytes(b"\x1b[?1049l");
-    rt.tick();
-    assert_eq!(rt.kitty_image_count(), 2, "stored images survive inertly");
-    assert_eq!(rt.kitty_placement_count(), 0);
+    assert_eq!(rt.kitty_last_frame_images(), 0);
 }
 
 #[test]
-fn pathological_placement_count_is_budgeted_per_frame() {
-    // CTX-0252 F2: the layer retains up to 128 placements, but one frame
-    // composites at most KITTY_PRESENT_MAX_BLITS_PER_FRAME blits. Each
-    // `kitty_display_image` stores a fresh image, so the 64-image store cap
-    // binds first here (64 placements); the unit-level budget test covers
-    // the full 128-candidate shed.
+fn transmit_only_admissible_also_fails_closed() {
     let mut rt = make_runtime();
-    for z in 0..64 {
-        rt.kitty_display_image(32, Some(2), Some(2), None, 2, 2, 0, &red_2x2(), z)
-            .expect("display must succeed");
-    }
-    assert_eq!(rt.kitty_image_count(), 64);
-    assert_eq!(rt.kitty_placement_count(), 64);
-    rt.tick().expect("display forces a present");
+    let err = rt
+        .kitty_display_image(32, Some(2), Some(2), Some('t'), 2, 2, 0, &red_2x2(), 0)
+        .expect_err("transmit-only has no Core codec yet");
     assert_eq!(
-        rt.kitty_last_frame_images(),
-        bitty_rich::KITTY_PRESENT_MAX_BLITS_PER_FRAME,
-        "frame blits stay within the per-frame budget"
+        err,
+        KittyImageError::Decode(KittyPrecheckError::DecoderUnavailable)
     );
-    // Shed-for-frame only: every placement is retained for later frames.
-    assert_eq!(rt.kitty_placement_count(), 64);
-}
-
-#[test]
-fn static_frame_reuses_cached_raster() {
-    // CTX-0252 F2: a second present with identical placement geometry and
-    // scrollback must not re-rasterize (hit), and the pixels stay red.
-    let (_, _, pad) = default_geometry();
-    let mut rt = make_runtime();
-    rt.kitty_display_image(32, Some(2), Some(2), None, 2, 2, 0, &red_2x2(), 0)
-        .expect("display must succeed");
-    rt.tick().expect("first present rasterizes");
-    let after_first = rt.kitty_raster_stats();
-    assert_eq!(after_first.misses, 1);
-    assert_eq!(after_first.hits, 0);
-    assert_eq!(rt.kitty_last_frame_images(), 1);
-    // New grid content forces a second present with an unchanged placement.
-    rt.handle_pty_bytes(b"B");
-    rt.tick().expect("new generation must present");
-    let after_second = rt.kitty_raster_stats();
-    assert_eq!(
-        after_second.misses, 1,
-        "identical frame must not re-rasterize"
-    );
-    assert_eq!(after_second.hits, 1);
-    assert_eq!(rt.kitty_last_frame_images(), 1);
-    let rgba = rt.headless_rgba().expect("rgba after tick");
-    let cfg = RuntimeConfig::default();
-    let width = usize::try_from(cfg.window_extent().width()).expect("width fits usize");
-    assert_eq!(probe(&rgba, width, pad + 1, pad + 1), [0xFF, 0, 0, 0xFF]);
-}
-
-#[test]
-fn scroll_invalidates_cached_raster_without_stale_pixels() {
-    // CTX-0252 F2: scrolling changes the scrollback sequence, so the cached
-    // blit misses and the image repaints at its scrolled position (never
-    // stale at the old anchor).
-    let mut rt = make_runtime();
-    let (origin_x, origin_y, rows) = content_frame_geometry(&rt);
-    let bottom = rows - 1;
-    rt.handle_pty_bytes(format!("\x1b[{};1H", rows).as_bytes());
-    rt.kitty_display_image(32, Some(2), Some(2), None, 1, 1, 0, &red_2x2(), 0)
-        .expect("display must succeed");
-    rt.tick().expect("display forces a present");
-    let misses_before = rt.kitty_raster_stats().misses;
-    assert!(misses_before >= 1);
-    rt.handle_pty_bytes(b"\n\n\n");
-    rt.tick().expect("scroll damage must present");
-    assert!(
-        rt.kitty_raster_stats().misses > misses_before,
-        "scroll must invalidate the cached blit"
-    );
-    assert_eq!(rt.kitty_last_frame_images(), 1);
-    let cfg = RuntimeConfig::default();
-    let width = usize::try_from(cfg.window_extent().width()).expect("width fits usize");
-    let ch = cfg.cell_height as usize;
-    let rgba = rt.headless_rgba().expect("rgba");
-    // CTX-0361: one content scroll row plus the two-row cursor-follow window
-    // slide (cursor at the 24-row grid bottom, 22-row decorated frame).
-    assert_eq!(
-        red_band(&rgba, width),
-        Some((
-            (bottom - 3) * ch + origin_y,
-            (bottom - 3) * ch + origin_y + ch - 1
-        )),
-        "image must track the scrolled content upward"
-    );
-    assert_ne!(
-        probe(&rgba, width, origin_x + 4, bottom * ch + origin_y + 9),
-        [0xFF, 0, 0, 0xFF],
-        "old anchor row must not keep a stale blit"
-    );
-}
-
-#[test]
-fn tick_stats_report_images_drawn_not_skipped() {
-    // CTX-0291: CPU/GPU image parity is observable end to end. The
-    // headless seam blends the blit, so the tick stats must report it
-    // drawn (`images == 1`, `images_skipped == 0`); the real-GPU branch
-    // uploads and paints the same blit, reporting a skip only for
-    // malformed or over-budget blits instead of diverging silently.
-    let mut rt = make_runtime();
-    rt.kitty_display_image(32, Some(2), Some(2), None, 2, 2, 0, &red_2x2(), 0)
-        .expect("display must succeed");
-    let stats = rt.tick().expect("display forces a present");
-    assert!(stats.headless);
-    assert_eq!(stats.images, 1);
-    assert_eq!(stats.images_skipped, 0);
-    // A frame with no images reports zeroes on both counters.
-    let mut rt = make_runtime();
-    rt.handle_pty_bytes(b"A");
-    let stats = rt.tick().expect("text forces a present");
-    assert_eq!(stats.images, 0);
-    assert_eq!(stats.images_skipped, 0);
-}
-
-#[test]
-fn gpu_image_budget_mirrors_rich_present_budget() {
-    // CTX-0291: the real-GPU upload path re-derives the rich layer's
-    // per-frame present budget as compile-time caps (the render crate
-    // cannot depend on rich, so the mirror cannot be a `use`). Pin the
-    // pairs here so they can never drift silently.
-    assert_eq!(
-        bitty_render::batch::MAX_IMAGE_BLITS_PER_FRAME,
-        bitty_rich::KITTY_PRESENT_MAX_BLITS_PER_FRAME,
-    );
-    assert_eq!(
-        bitty_render::batch::MAX_IMAGE_UPLOAD_BYTES_PER_FRAME,
-        bitty_rich::KITTY_PRESENT_MAX_BYTES_PER_FRAME,
-    );
-}
-
-/// Minimal standard-alphabet base64 encoder (test-only, no new deps).
-fn b64_encode(data: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let word = (u32::from(chunk[0]) << 16)
-            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
-            | u32::from(*chunk.get(2).unwrap_or(&0));
-        out.push(ALPHABET[(word >> 18) as usize & 63] as char);
-        out.push(ALPHABET[(word >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            ALPHABET[(word >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            ALPHABET[word as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
-}
-
-/// Vertical range of opaque-blue rows in a headless frame, if any.
-fn blue_band(rgba: &[u8], width: usize) -> Option<(usize, usize)> {
-    let mut top = None;
-    let mut bottom = 0;
-    for (i, px) in rgba.chunks_exact(4).enumerate() {
-        if px == [0, 0, 0xFF, 0xFF] {
-            let y = i / width.max(1);
-            if top.is_none() {
-                top = Some(y);
-            }
-            bottom = y;
-        }
-    }
-    top.map(|t| (t, bottom))
-}
-
-#[test]
-fn first_paint_crops_overflow_instead_of_squeezing() {
-    // #1334 (CTX-0744): chafa-shaped `APC G` (`a=T`, explicit `c=`/`r=`)
-    // anchored at the grid bottom so the placement overflows the viewport.
-    // First paint must crop (correct aspect, top part visible), never
-    // squeeze the whole image into the visible rows (vertical squash that
-    // later scrolls "heal" into the right aspect).
-    let mut rt = make_runtime();
-    let cfg = RuntimeConfig::default();
-    let cw = cfg.cell_width as usize;
-    let ch = cfg.cell_height as usize;
-    let width = usize::try_from(cfg.window_extent().width()).expect("width fits usize");
-    let (origin_x, origin_y, rows) = content_frame_geometry(&rt);
-    // 2 cols x 4 rows of cells; pixels: top half red, bottom half blue.
-    let (pw, ph) = (2 * cw, 4 * ch);
-    let mut rgba = vec![0u8; pw * ph * 4];
-    for y in 0..ph {
-        let color = if y < ph / 2 {
-            [0xFF, 0, 0, 0xFF]
-        } else {
-            [0, 0, 0xFF, 0xFF]
-        };
-        for x in 0..pw {
-            rgba[(y * pw + x) * 4..(y * pw + x) * 4 + 4].copy_from_slice(&color);
-        }
-    }
-    // Anchor at the last grid row: the CTX-0361 cursor-follow window slides
-    // the effective anchor to the last content row, so exactly one cell row
-    // stays visible (robust for any decorated frame smaller than the grid).
-    rt.handle_pty_bytes(b"\x1b[24;1H");
-    let seq = format!(
-        "\x1b_Ga=T,f=32,s={},v={},c=2,r=4,m=0;{}\x1b\\",
-        pw,
-        ph,
-        b64_encode(&rgba)
-    );
-    rt.handle_pty_bytes(seq.as_bytes());
-    assert_eq!(rt.kitty_image_count(), 1);
-    assert_eq!(rt.kitty_placement_count(), 1);
-    rt.tick().expect("display forces a present");
-    let first = rt.headless_rgba().expect("rgba");
-    assert_eq!(
-        blue_band(&first, width),
-        None,
-        "first paint must show only the top (red) part at true scale, never squeezed blue"
-    );
-    assert_eq!(
-        red_band(&first, width).map(|(t, b)| b + 1 - t),
-        Some(ch),
-        "visible red band must be exactly one cell row tall"
-    );
-    // Scroll the placement fully into view: the whole image appears at the
-    // same scale (red over blue, two cell rows each).
-    rt.handle_pty_bytes(&[b'\n'; 6]);
-    rt.tick().expect("scroll damage must present");
-    let after = rt.headless_rgba().expect("rgba");
-    let top = origin_y + (rows - 7) * ch;
-    assert_eq!(
-        red_band(&after, width),
-        Some((top, top + 2 * ch - 1)),
-        "scrolled image keeps its aspect: red over blue"
-    );
-    assert_eq!(
-        blue_band(&after, width),
-        Some((top + 2 * ch, top + 4 * ch - 1)),
-        "scrolled image keeps its aspect: blue below red"
-    );
-    let _ = origin_x;
-}
-
-#[test]
-fn erase_in_display_all_clears_active_placements() {
-    let mut rt = make_runtime();
-    rt.kitty_display_image(32, Some(2), Some(2), None, 2, 2, 0, &red_2x2(), 0)
-        .expect("display must succeed");
-    rt.tick().expect("display forces present");
-    assert_eq!(rt.kitty_image_count(), 1);
-    assert_eq!(rt.kitty_placement_count(), 1);
-
-    // ED 2 (All) must clear placements for the current origin.
-    rt.handle_pty_bytes(b"\x1b[2J");
-    rt.tick().expect("clear forces present");
-    assert_eq!(rt.kitty_image_count(), 1, "stored image survives in store");
-    assert_eq!(
-        rt.kitty_placement_count(),
-        0,
-        "active placements must be dropped on clear"
-    );
-}
-
-#[test]
-fn erase_in_display_scroll_and_clear_clears_active_placements() {
-    let mut rt = make_runtime();
-    rt.kitty_display_image(32, Some(2), Some(2), None, 2, 2, 0, &red_2x2(), 0)
-        .expect("display must succeed");
-    rt.tick().expect("display forces present");
-    assert_eq!(rt.kitty_placement_count(), 1);
-
-    // ED 22 (ScrollAndClear) must clear active placements.
-    rt.handle_pty_bytes(b"\x1b[22J");
-    rt.tick().expect("clear forces present");
+    assert_eq!(rt.kitty_image_count(), 0);
     assert_eq!(rt.kitty_placement_count(), 0);
 }
 
 #[test]
-fn full_reset_clears_active_placements() {
+fn rejected_transmission_leaves_grid_idle() {
     let mut rt = make_runtime();
-    rt.kitty_display_image(32, Some(2), Some(2), None, 2, 2, 0, &red_2x2(), 0)
-        .expect("display must succeed");
-    rt.tick().expect("display forces present");
-    assert_eq!(rt.kitty_placement_count(), 1);
-
-    // RIS (FullReset) must clear active placements.
-    rt.handle_pty_bytes(b"\x1bc");
-    rt.tick().expect("reset forces present");
-    assert_eq!(rt.kitty_placement_count(), 0);
+    let _ = rt.kitty_display_image(32, Some(2), Some(2), None, 2, 2, 0, &red_2x2(), 0);
+    // Nothing stored, no redraw forced: after the initial grid present the
+    // runtime idles exactly as if no transmission had arrived.
+    assert!(rt.tick().is_some(), "first tick still presents the grid");
+    assert_eq!(rt.tick(), None, "rejected image must not force a present");
 }

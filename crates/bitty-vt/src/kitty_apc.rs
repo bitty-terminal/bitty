@@ -81,13 +81,17 @@ const KITTY_APC_CODEC_SCRATCH_BYTES: usize = 4;
 /// memory bounded by its own interleaved traffic.
 pub const KITTY_APC_STALL_MAX_BYTES: usize = 64 * 1024;
 
-/// Side cap mirroring `bitty-rich::kitty_decode::KITTY_DECODE_MAX_DIMENSION`.
+/// Side cap mirroring `bitty-rich::kitty_place::KITTY_DECODE_MAX_DIMENSION`
+/// (W-141: the decoder moved to the `bitty-graphics` extension; the
+/// Core-retained ceiling now lives in `kitty_place`).
 pub const KITTY_APC_DECODE_MAX_DIMENSION: u32 = 8192;
 
-/// Area cap mirroring `bitty-rich::kitty_decode::KITTY_DECODE_MAX_PIXELS`.
+/// Area cap mirroring `bitty-rich::kitty_place::KITTY_DECODE_MAX_PIXELS`
+/// (W-141: see [`KITTY_APC_DECODE_MAX_DIMENSION`]).
 pub const KITTY_APC_DECODE_MAX_PIXELS: u64 = 4096 * 4096;
 
-/// Byte cap mirroring `bitty-rich::kitty_decode::KITTY_DECODE_MAX_BYTES`.
+/// Byte cap mirroring `bitty-rich::kitty_place::KITTY_DECODE_MAX_BYTES`
+/// (W-141: see [`KITTY_APC_DECODE_MAX_DIMENSION`]).
 pub const KITTY_APC_DECODE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// Parsed `G` control parameters needed for routing.

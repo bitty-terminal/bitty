@@ -883,6 +883,7 @@ impl Runtime {
         }
         self.paint_frame_overlays(&basis, now, &mut layers);
         self.paint_chrome_bands(basis.pad_px, &mut layers);
+        self.paint_plugin_overlay(&basis.allocations, basis.pad_px, &mut layers);
         self.paint_kitty_images(&basis, &mut layers);
         if self.reject_stale_atlas_frame(&layers) {
             return None;
@@ -2207,6 +2208,83 @@ impl Runtime {
                 layers.any_needs_draw = true;
             }
         }
+    }
+
+    /// Core-hosted focusable-overlay surface (CTX-0943, W-28 follow-up).
+    ///
+    /// Paints the retained `overlay`-slot block the app pushed via
+    /// [`Runtime::set_plugin_overlay`](super::Runtime::set_plugin_overlay)
+    /// while the transient input capture holds. Same content the retained
+    /// block carries: the identical
+    /// [`extract_text_from_node`](Self::extract_text_from_node) walk the
+    /// band renderer uses (so the v1 scene budgets enforced at mount time
+    /// are the bounds painted here), centered over the focused frame and
+    /// clipped to it, on the same overlay layer as the banner pills (fills
+    /// plus glyphs, never grid truth). No-op with no surface or empty text,
+    /// so frames without a capture are byte-identical to before.
+    fn paint_plugin_overlay(
+        &mut self,
+        allocations: &[layout_focus::PresentFrame],
+        pad_px: i32,
+        layers: &mut FrameLayers,
+    ) {
+        let Some(overlay) = self.plugin_overlay.clone() else {
+            return;
+        };
+        let text_line = self.extract_text_from_node(&overlay.root);
+        if text_line.is_empty() {
+            return;
+        }
+        let live = self.live_cell_metrics();
+        if live.width == 0 || live.height == 0 {
+            return;
+        }
+        let frame = self
+            .focused_view()
+            .and_then(|view| allocations.iter().find(|frame| frame.view == view))
+            .or_else(|| allocations.first());
+        let Some(frame) = frame else {
+            return;
+        };
+        if frame.rows == 0 || frame.cols == 0 {
+            return;
+        }
+        // Width in cells (char count, not bytes), clipped to the frame.
+        let text_cells = text_line
+            .chars()
+            .count()
+            .min(usize::from(frame.cols))
+            .max(1);
+        let text_line: String = text_line.chars().take(text_cells).collect();
+        // Center the pill in the focused frame, middle row.
+        let full_w = px_span(frame.cols, live.width);
+        let pill_w = px_span_usize(text_cells, live.width);
+        let origin_px_x = px_add(
+            px_add(pad_px, frame.content.x),
+            px_side(full_w.saturating_sub(pill_w)) / 2,
+        );
+        let mid_row = frame.rows.saturating_sub(1) / 2;
+        let origin_px_y = px_add(
+            pad_px,
+            px_offset_cells(frame.content.y, mid_row, live.height),
+        );
+        layers.combined_overlay.push(bitty_render::grid::FillRect {
+            rect: bitty_render::geometry::RectPx::new(
+                origin_px_x,
+                origin_px_y,
+                pill_w,
+                live.height,
+            ),
+            color: self.config.theme.background,
+        });
+        let glyphs = self.renderer.overlay_text_glyphs(
+            &text_line,
+            (origin_px_x, origin_px_y),
+            text_cells,
+            self.config.theme.foreground,
+        );
+        layers.combined_glyphs.extend(glyphs);
+        layers.any_needs_draw = true;
     }
 
     /// Extracts text content from a UiNode tree (CTX-0911).

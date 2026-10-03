@@ -5461,3 +5461,311 @@ fn live_reload_theme_change_refreshes_the_window_title() {
         "OSC title not clobbered"
     );
 }
+
+#[test]
+fn overlay_capture_wiring_lifecycle_cancel_timeout_and_paint() {
+    // CTX-0943 (W-28 follow-up): end-to-end through the app input path, not
+    // direct `PluginRuntime` calls — lifecycle + cancellation + timeout +
+    // no-hot-path + overlay paint on a user-exercisable path.
+    use bitty_platform::{
+        ImeEvent, KeyEvent, KeyLocation, LogicalKey, MouseButton, MouseEvent, NamedKey, PressState,
+    };
+    use bitty_runtime::plugin_runtime::{
+        BridgeError, EmptySettings, LuaValue, PluginRuntime, PluginRuntimeConfig, SnapshotSource,
+    };
+
+    struct StaticSnapshot;
+    impl SnapshotSource for StaticSnapshot {
+        fn snapshot(&self, _scope: &str) -> Result<LuaValue, BridgeError> {
+            Ok(LuaValue::table([
+                ("version", LuaValue::Integer(1)),
+                ("zones", LuaValue::array(vec![])),
+            ]))
+        }
+    }
+
+    fn test_key(logical: LogicalKey, text: Option<&str>) -> KeyEvent {
+        KeyEvent {
+            logical_key: logical,
+            text: text.map(str::to_string),
+            location: KeyLocation::Standard,
+            state: PressState::Pressed,
+            repeat: false,
+            is_synthetic: false,
+        }
+    }
+
+    fn queued_len(app: &TerminalApp) -> usize {
+        app.plugin_runtime
+            .as_ref()
+            .expect("plugin runtime")
+            .overlay_capture()
+            .borrow()
+            .queued_len()
+    }
+
+    fn store_value(
+        app: &TerminalApp,
+        id: &bitty_plugin_host::manifest::PluginId,
+        key: &str,
+    ) -> Option<LuaValue> {
+        app.plugin_runtime
+            .as_ref()
+            .expect("plugin runtime")
+            .services(id)
+            .expect("services")
+            .with_store(|store| store.get(key))
+    }
+
+    let tag = format!("ctx0943-{}", std::process::id());
+    let root = std::env::temp_dir().join(format!("bitty-{tag}-root"));
+    let data = std::env::temp_dir().join(format!("bitty-{tag}-data"));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&data);
+    let id = "bitty-featured.ctx0943wire";
+    let plugin_dir = root.join(id);
+    std::fs::create_dir_all(plugin_dir.join("lua")).expect("dirs");
+    std::fs::write(
+        plugin_dir.join("bitty-plugin.toml"),
+        format!(
+            r#"[plugin]
+id = "{id}"
+name = "CTX-0943 wiring"
+version = "0.1.0"
+description = "overlay capture wiring test"
+
+[compat]
+plugin-api = "^1.0"
+
+[capabilities]
+ui.rich = true
+ui.overlay = true
+
+[lazy]
+commands = ["{id}:reacquire"]
+events = ["key"]
+claims = []
+"#
+        ),
+    )
+    .expect("manifest");
+    std::fs::write(
+        plugin_dir.join("lua/init.lua"),
+        r#"
+        local mount_ok, handle = pcall(bitty.ui.mount, "overlay", { kind = "Text", text = "overlay-modal" })
+        bitty.store.set("mount_ok", mount_ok)
+        bitty.store.set("handle", mount_ok and handle or -1)
+        -- Hot-path trap: if Core ever invoked a plugin on the input path,
+        -- this handler would fire and bump `callback_count`.
+        bitty.events.subscribe("key", function(envelope)
+          bitty.store.set("callback_count", (bitty.store.get("callback_count") or 0) + 1)
+        end)
+        local acquired = false
+        if mount_ok then
+          local ok, err = pcall(bitty.ui.overlay.acquire, handle)
+          acquired = ok
+        end
+        bitty.store.set("acquired", acquired)
+        bitty.commands.register({
+          id = "reacquire",
+          title = "Reacquire",
+          run = function(key)
+            local h = bitty.store.get("handle")
+            local ok, err = pcall(bitty.ui.overlay.acquire, h)
+            bitty.store.set("reacquired", ok)
+            return ok
+          end,
+        })
+        return {}
+        "#,
+    )
+    .expect("init");
+
+    let mut plugin_runtime = PluginRuntime::new(PluginRuntimeConfig {
+        safe_mode: false,
+        data_dir: Some(data.clone()),
+        store_root: None,
+        bundled_roots: Vec::new(),
+        third_party_roots: vec![root.clone()],
+        settings: std::rc::Rc::new(EmptySettings),
+        snapshot: std::rc::Rc::new(StaticSnapshot),
+    });
+    plugin_runtime.discover();
+    let pid = bitty_plugin_host::manifest::PluginId::new(id).expect("valid id");
+    let report = plugin_runtime.activate(&pid).expect("activate");
+    assert_eq!(
+        report.state,
+        bitty_runtime::plugin_runtime::LifecycleState::Active
+    );
+    let handle = match plugin_runtime
+        .services(&pid)
+        .expect("services")
+        .with_store(|store| store.get("handle"))
+    {
+        Some(LuaValue::Integer(handle)) => handle,
+        other => panic!("overlay mount must return a handle, got {other:?}"),
+    };
+    assert!(
+        plugin_runtime.overlay_capture().borrow().is_active(),
+        "init.lua must hold the capture after activation"
+    );
+
+    let maps =
+        bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        maps,
+        SpawnSpec::default(),
+    );
+    app.runtime.set_layout(two_pane_layout());
+    app = app.with_plugin_runtime(Some(plugin_runtime));
+    assert!(app.overlay_capture_active());
+
+    // The mounted overlay block paints on the tick after acquire.
+    let presented = app.drive_tick();
+    assert!(
+        presented.is_some(),
+        "the overlay surface must paint while capture holds"
+    );
+    let paint = format!(
+        "{:?}",
+        app.runtime
+            .plugin_overlay()
+            .expect("surface follows the capture owner")
+            .root
+    );
+    assert!(
+        paint.contains("overlay-modal"),
+        "the surface carries the retained block content, got {paint}"
+    );
+
+    // Key input through the chrome intercept is captured, never terminal
+    // input, and never a plugin callback (no-hot-path).
+    let key_x = test_key(LogicalKey::Character("x".to_string()), Some("x"));
+    assert!(
+        app.intercept_chrome_key(&WindowEventKind::KeyboardInput(key_x)),
+        "unbound typing must be captured while the session holds"
+    );
+    assert_eq!(queued_len(&app), 1);
+    assert_eq!(app.runtime.pending_input_len(), 0);
+    assert_eq!(
+        store_value(&app, &pid, "callback_count"),
+        None,
+        "capture must not fire a plugin callback"
+    );
+    app.plugin_runtime
+        .as_mut()
+        .expect("plugin runtime")
+        .deliver_event("key", &LuaValue::String("k".to_string()));
+    assert_eq!(
+        store_value(&app, &pid, "callback_count"),
+        Some(LuaValue::Integer(1)),
+        "the explicit subscription path still works (proving the trap is live)"
+    );
+
+    // IME commit and pointer input through the fall-through hook are
+    // captured with no terminal side effects.
+    assert!(
+        app.capture_fallthrough_input(&WindowEventKind::Ime(ImeEvent::Commit("ni".to_string())))
+    );
+    assert_eq!(queued_len(&app), 2);
+    assert!(
+        app.capture_fallthrough_input(&WindowEventKind::MouseInput(MouseEvent::new(
+            MouseButton::Left,
+            PressState::Pressed,
+        )))
+    );
+    assert_eq!(queued_len(&app), 3);
+    assert_eq!(app.runtime.pending_input_len(), 0);
+
+    // Bare Esc through the intercept cancels the session.
+    let esc = test_key(LogicalKey::Named(NamedKey::Escape), None);
+    assert!(
+        app.intercept_chrome_key(&WindowEventKind::KeyboardInput(esc)),
+        "Esc must be consumed as the overlay cancel"
+    );
+    assert!(
+        !app.overlay_capture_active(),
+        "cancel must release the capture"
+    );
+    assert_eq!(queued_len(&app), 0, "cancel clears the queue");
+    let _ = app.drive_tick();
+    assert!(
+        app.runtime.plugin_overlay().is_none(),
+        "cancel removes the surface on the next tick"
+    );
+
+    // A user focus-switch through the chrome action runner revokes.
+    app.plugin_runtime
+        .as_mut()
+        .expect("plugin runtime")
+        .dispatch_command(&pid, "reacquire", &[])
+        .expect("reacquire");
+    assert!(app.overlay_capture_active());
+    let before = app.runtime.focused_view();
+    app.apply_chrome_action(bitty_config::ChromeAction::FocusNext);
+    assert!(
+        !app.overlay_capture_active(),
+        "focus-switch must release the capture"
+    );
+    assert_ne!(
+        app.runtime.focused_view(),
+        before,
+        "focus must actually move on the two-pane layout"
+    );
+
+    // Window focus loss through the intercept revokes as well.
+    app.plugin_runtime
+        .as_mut()
+        .expect("plugin runtime")
+        .dispatch_command(&pid, "reacquire", &[])
+        .expect("reacquire");
+    assert!(!app.intercept_chrome_key(&WindowEventKind::Focused(false)));
+    assert!(!app.overlay_capture_active());
+
+    // The 30s idle timeout is enforced on the runtime tick.
+    app.plugin_runtime
+        .as_mut()
+        .expect("plugin runtime")
+        .dispatch_command(&pid, "reacquire", &[])
+        .expect("reacquire");
+    assert!(app.overlay_capture_active());
+    assert!(
+        app.plugin_runtime
+            .as_ref()
+            .expect("plugin runtime")
+            .overlay_capture()
+            .borrow_mut()
+            .force_expire(pid.as_str(), handle),
+        "the live capture must rewind past its deadline"
+    );
+    let _ = app.drive_tick();
+    assert!(
+        !app.overlay_capture_active(),
+        "the tick must revoke a capture past its deadline"
+    );
+    assert!(
+        app.runtime.plugin_overlay().is_none(),
+        "timeout removes the surface on the same tick"
+    );
+
+    // With no capture active nothing diverts: keys fall through to the
+    // terminal exactly as before.
+    let key_y = test_key(LogicalKey::Character("y".to_string()), Some("y"));
+    assert!(!app.intercept_chrome_key(&WindowEventKind::KeyboardInput(key_y.clone())));
+    assert!(!app.capture_fallthrough_input(&WindowEventKind::KeyboardInput(key_y.clone())));
+    assert!(
+        app.runtime.handle_key_event(key_y).is_some(),
+        "terminal encoding must still serve released input"
+    );
+    assert!(
+        app.runtime.pending_input_len() > 0,
+        "released input must reach the PTY queue"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&data);
+}

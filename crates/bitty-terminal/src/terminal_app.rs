@@ -52,6 +52,23 @@ pub(crate) fn sanitize_window_title(raw: &str) -> String {
         .collect()
 }
 
+/// Bounded label for a captured key without produced text (CTX-0943).
+///
+/// Mirrors the runtime inspect label shape (`key:<name>`, text preferred):
+/// the capture queue already bounds kind/text, so this only keeps the label
+/// short and printable. Field-level key encodings stay parked with the
+/// input-pointer contract owner.
+pub(crate) fn overlay_key_text(key: &bitty_platform::KeyEvent) -> String {
+    match &key.logical_key {
+        LogicalKey::Character(s) => {
+            let short: String = s.chars().take(8).collect();
+            format!("key:{short}")
+        }
+        LogicalKey::Named(named) => format!("key:{named:?}"),
+        _ => String::from("key:Unidentified"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // App handler
 // ---------------------------------------------------------------------------
@@ -758,6 +775,12 @@ impl TerminalApp {
         // convert to ChromeBands, and push into Runtime before present so
         // bands render on this frame.
         self.update_chrome_bands();
+        // CTX-0943 (W-28 follow-up): enforce the 30s transient timeout, then
+        // sync the overlay surface to the (possibly revoked) owner before
+        // present so a timed-out session clears on this frame. Both are
+        // no-ops without a plugin runtime or an active capture.
+        self.expire_overlay_captures();
+        self.update_plugin_overlay();
         // CTX-0382: drain cold-path events on every tick — including
         // deferred (synchronized update) and idle ticks — because a title
         // change produces no grid damage and would otherwise sit in the
@@ -905,6 +928,175 @@ impl TerminalApp {
             });
         }
         self.runtime.set_chrome_bands(bands);
+    }
+
+    /// Focusable-overlay transient input-capture application wiring (CTX-0943,
+    /// W-28 follow-up; lifecycle/timeout/release per the accepted W-01
+    /// `overlay-input-capture-contract.md`).
+    ///
+    /// The mechanism (`push_overlay_input`, `expire_overlay_captures`,
+    /// `revoke_overlay_capture` on `PluginRuntime`) landed in CTX-0941; this
+    /// is the application side only: no new Lua namespace, no new capability
+    /// identifier, no Event-Bus exposure, safe-mode behavior unchanged. Every
+    /// helper is a no-op without a plugin runtime or an active capture, so
+    /// frames and input without a capture are byte-identical to before.
+    pub(crate) fn overlay_capture_active(&self) -> bool {
+        self.plugin_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.overlay_capture().borrow().is_active())
+    }
+
+    /// Enqueue one captured input event for the active overlay capture.
+    ///
+    /// Core input-path entry: appends to the bounded queue, never invokes
+    /// plugin code (`P0-AC-015`). Returns `false` with no capture active, so
+    /// the caller falls through to normal routing.
+    pub(crate) fn push_overlay_input(&mut self, kind: &str, text: &str) -> bool {
+        let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
+            return false;
+        };
+        plugin_runtime.push_overlay_input(kind, text)
+    }
+
+    /// Revoke the active overlay capture unconditionally (user focus-switch
+    /// or cancel path). Idempotent no-op `false` with no active capture.
+    pub(crate) fn revoke_overlay_capture(&mut self) -> bool {
+        let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
+            return false;
+        };
+        plugin_runtime.revoke_overlay_capture()
+    }
+
+    /// Enforce the 30s transient timeout (contract idle timeout). No-op
+    /// without a plugin runtime or with no expired capture.
+    fn expire_overlay_captures(&mut self) -> bool {
+        let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
+            return false;
+        };
+        plugin_runtime.expire_overlay_captures()
+    }
+
+    /// Whether a chrome action moves focus (CTX-0943).
+    ///
+    /// Pane/view/workspace focus moves end the transient capture per the
+    /// contract focus-switch release (`focus_switched`); layout mutations
+    /// (splits, closes, zoom, search, composer, palette) stay swallowed
+    /// while the modal holds so no state mutates behind it. A broader
+    /// taxonomy (panel focus, overlay-to-overlay) stays parked with its
+    /// owner; this predicate covers the user focus chords that exist today.
+    pub(crate) fn is_overlay_focus_switch(action: bitty_config::ChromeAction) -> bool {
+        use bitty_config::ChromeAction as A;
+        matches!(
+            action,
+            A::GotoSplit(_)
+                | A::FocusNext
+                | A::FocusPrev
+                | A::FocusId(_)
+                | A::WorkspacePrev
+                | A::WorkspaceNext
+                | A::WorkspaceLast
+                | A::WorkspaceFocus(_)
+                | A::WorkspaceMove(_)
+        )
+    }
+
+    /// Sync the Core-hosted overlay surface to the capture owner (CTX-0943).
+    ///
+    /// Reads the retained `overlay`-slot blocks, keeps the single global
+    /// owner's first block in discovery order as the surface (one session
+    /// per plugin; the acquire gate already required the handle to be such
+    /// a block), and clears the surface otherwise — capture end removes the
+    /// surface per the contract. The [`Runtime`](bitty_runtime::Runtime)
+    /// setter only marks redraw on actual change, so capture-less ticks
+    /// stay idle.
+    fn update_plugin_overlay(&mut self) {
+        let Some(plugin_runtime) = self.plugin_runtime.as_ref() else {
+            if self.runtime.plugin_overlay().is_some() {
+                self.runtime.set_plugin_overlay(None);
+            }
+            return;
+        };
+        let owner = plugin_runtime
+            .overlay_capture()
+            .borrow()
+            .owner_plugin()
+            .map(str::to_string);
+        let Some(owner) = owner else {
+            if self.runtime.plugin_overlay().is_some() {
+                self.runtime.set_plugin_overlay(None);
+            }
+            return;
+        };
+        let surface = plugin_runtime
+            .ui_blocks()
+            .into_iter()
+            .filter(|(id, slot, _, _)| {
+                id.as_str() == owner
+                    && bitty_runtime::ui_slot_placement(*slot)
+                        == bitty_runtime::UiSlotPlacement::Overlay
+            })
+            .map(|(id, slot, node, version)| bitty_runtime::BandContent {
+                plugin_id: id.to_string(),
+                slot,
+                root: node,
+                version,
+            })
+            .next();
+        self.runtime.set_plugin_overlay(surface);
+    }
+
+    /// Route post-intercept fall-through input into the capture queue
+    /// (CTX-0943). Called by [`Self::handle_event`] after
+    /// [`Self::intercept_chrome_key`](crate::chrome_keys::ChromeState)
+    /// returns fall-through and before `Runtime::handle_platform_event`.
+    ///
+    /// Returns `true` when the event was captured (the caller must not route
+    /// it further: no PTY bytes, no selection, no mouse capture). Releases,
+    /// synthetic, and modifier-only keys keep routing so modifier mirrors
+    /// and press-to-release ownership never desync; window focus loss
+    /// revokes and still routes so `Runtime` records the unfocused state.
+    /// `false` with no capture active (zero behavior change) or for event
+    /// kinds without capture semantics. Paste-derived delivery stays parked
+    /// to the paste path owner (needs the Core inspection decision).
+    pub(crate) fn capture_fallthrough_input(&mut self, kind: &WindowEventKind) -> bool {
+        if !self.overlay_capture_active() {
+            return false;
+        }
+        match kind {
+            WindowEventKind::KeyboardInput(key) => {
+                if key.state != PressState::Pressed
+                    || key.is_synthetic
+                    || crate::chrome_keys::is_modifier_key(key)
+                {
+                    return false;
+                }
+                let text = key.text.clone().unwrap_or_else(|| overlay_key_text(key));
+                self.push_overlay_input("key", &text)
+            }
+            WindowEventKind::Ime(bitty_platform::ImeEvent::Commit(text)) => {
+                self.push_overlay_input("text", text)
+            }
+            // Preedit is uncommitted composition (presentation only) and
+            // Enabled/Disabled carry no input bytes.
+            WindowEventKind::Ime(_) => false,
+            WindowEventKind::MouseInput(mouse) => {
+                let text = format!("{:?}:{:?}", mouse.button, mouse.state);
+                self.push_overlay_input("pointer", &text)
+            }
+            WindowEventKind::CursorMoved(pos) => {
+                let text = format!("move:{},{}", pos.x, pos.y);
+                self.push_overlay_input("pointer", &text)
+            }
+            WindowEventKind::MouseWheel(delta) => {
+                let text = format!("wheel:{delta:?}");
+                self.push_overlay_input("pointer", &text)
+            }
+            WindowEventKind::Focused(false) => {
+                self.revoke_overlay_capture();
+                false
+            }
+            _ => false,
+        }
     }
 
     /// Applies queued `bitty.workspace.*` requests (CTX-0889, ADR-0014).
@@ -1285,6 +1477,16 @@ impl AppHandler for TerminalApp {
         // event never reaches `Runtime`.
         if let PlatformEvent::Window { window_id: _, kind } = &event {
             if self.intercept_chrome_key(kind) {
+                return;
+            }
+        }
+
+        // CTX-0943: while a transient capture holds, route key/IME/pointer
+        // fall-through into the capture queue. A captured event never
+        // reaches `Runtime`, so no PTY bytes and no terminal mutation occur;
+        // with no capture active this is a single bool check per event.
+        if let PlatformEvent::Window { window_id: _, kind } = &event {
+            if self.capture_fallthrough_input(kind) {
                 return;
             }
         }

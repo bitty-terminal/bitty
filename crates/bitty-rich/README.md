@@ -23,9 +23,10 @@ and closed `OQ-008`, `OQ-015`, and `OQ-016` at design level.
 
 - Workspace-internal dependencies, per `Cargo.toml`: `bitty-term-state`,
   `bitty-vt`, and `bitty-platform`.
-- Third-party dependencies, per `Cargo.toml`: `getrandom`, `png`, and a
+- Third-party dependencies, per `Cargo.toml`: `getrandom` and a
   narrowed `image` facade (PNG, JPEG, WebP only); no network-facing
-  dependency is declared.
+  dependency is declared. The Kitty PNG codec moved to the
+  `bitty-graphics` extension crate (W-141 extraction).
 - No GPU, no window system, no filesystem, and no `unsafe`, except the
   `composer` module: the external-editor round-trip writes a restricted temp
   file and spawns the configured editor with a bounded timeout plus kill.
@@ -38,8 +39,10 @@ and closed `OQ-008`, `OQ-015`, and `OQ-016` at design level.
 - `src/lib.rs` — crate docs with the accepted contracts and the bound table.
 - `src/image.rs` — RFC-compliant presentation image store.
 - `src/scene.rs` — versioned blocks and declarative scene composition.
-- `src/kitty.rs`, `src/kitty_decode.rs`, `src/kitty_place.rs` — Kitty
-  placeholder stub, bounded decode, and placement.
+- `src/kitty.rs`, `src/kitty_place.rs` — Kitty placeholder stub and
+  placement policy (declared-size pre-check plus admission/eviction/rect
+  geometry). Bounded decode and raster mechanics moved to the
+  `bitty-graphics` extension crate (W-141 extraction).
 - `src/hyperlink.rs`, `src/shell.rs`, `src/clipboard.rs` — link table, shell
   zones plus the single OSC 7/133 read view (`ShellIntegration`: cwd, zones,
   command regions, last exit code), and clipboard helpers.

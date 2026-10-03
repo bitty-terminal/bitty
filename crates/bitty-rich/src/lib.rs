@@ -42,13 +42,11 @@
 //! | [`clipboard::CLIPBOARD_MAX_OUTSTANDING_GRANTS`] | 16 | oldest grant evicted (token dies) |
 //! | [`kitty::KITTY_MAX_PLACEHOLDERS`] (legacy) | 64 | oldest evicted |
 //! | [`kitty::KITTY_MAX_PAYLOAD_BYTES`] (legacy) | 4096 | truncation |
-//! | [`kitty_decode::KITTY_DECODE_MAX_DIMENSION`] | 8192 px/side | typed error, no allocation |
-//! | [`kitty_decode::KITTY_DECODE_MAX_PIXELS`] (4096² area) | 16.7M px | typed error, no allocation |
-//! | [`kitty_decode::KITTY_DECODE_MAX_BYTES`] decoded RGBA | 64 MiB | typed error, no allocation |
+//! | [`kitty_place::KITTY_DECODE_MAX_DIMENSION`] | 8192 px/side | typed error, no allocation |
+//! | [`kitty_place::KITTY_DECODE_MAX_PIXELS`] (4096² area) | 16.7M px | typed error, no allocation |
+//! | [`kitty_place::KITTY_DECODE_MAX_BYTES`] declared/decoded RGBA | 64 MiB | typed error, no allocation |
 //! | [`kitty_place::KITTY_PRESENT_MAX_BLITS_PER_FRAME`] per-frame blits | 32 | skip-for-frame in paint order |
 //! | [`kitty_place::KITTY_PRESENT_MAX_BYTES_PER_FRAME`] per-frame blit bytes | 64 MiB | skip-for-frame before rasterize |
-//! | [`kitty_place::KITTY_RASTER_CACHE_MAX_ENTRIES`] cached rasters | 128 | oldest evicted |
-//! | [`kitty_place::KITTY_RASTER_CACHE_MAX_BYTES`] cached raster bytes | 64 MiB | oldest evicted |
 //! | [`image::IMAGE_STORE_MAX_COUNT`] (IMG-5) | 256 | oldest evicted on admission |
 //! | [`image::IMAGE_STORE_MAX_BYTES`] (IMG-4) | 256 MiB | oldest evicted on admission |
 //! | [`image::IMAGE_MAX_DECODED_BYTES`] (IMG-3) | 64 MiB | typed error, no placement |
@@ -71,10 +69,14 @@
 //!
 //! # Headless seam
 //!
-//! No window system, no adapter, no clipboard I/O, and no GPU presentation
-//! are performed here. The only decoding is the bounded Kitty PNG/RGB/RGBA
-//! to RGBA8 step in [`kitty_decode`] (fail-closed, allocation-checked, no
-//! renderer coupling). All tests run on GPU-less CI via pure logic on
+//! No window system, no adapter, no clipboard I/O, no GPU presentation,
+//! and no codec decoding are performed here. Bounded Kitty payload decode
+//! (PNG/RGB/RGBA to RGBA8) and texture-preparation mechanics
+//! (nearest-neighbor scaling, per-frame budget accounting, raster caching)
+//! moved to the `bitty-graphics` extension crate (W-141 extraction); Core
+//! retains only the declared-size pre-check ([`kitty_place`]) and the
+//! pre-upload re-validation on caller-supplied bitmaps. All tests run on
+//! GPU-less CI via pure logic on
 //! `State`/`Snapshot` values, except the composer external-editor round-trip
 //! (OS temp file plus an allowlisted `$VISUAL`/`$EDITOR` child process,
 //! exercised with fake editor scripts). Where rendering geometry is needed (hyperlink
@@ -93,7 +95,6 @@ pub mod hints;
 pub mod hyperlink;
 pub mod image;
 pub mod kitty;
-pub mod kitty_decode;
 pub mod kitty_place;
 pub mod kitty_unicode;
 pub mod loader;
@@ -144,18 +145,13 @@ pub use image::{
     ScrollBehavior as ImageScrollBehavior, payload_fingerprint,
 };
 pub use kitty::{KittyGraphicsStub, KittyPlaceholder, KittyPlaceholderId};
-pub use kitty_decode::{
-    KITTY_DECODE_MAX_BYTES, KITTY_DECODE_MAX_DIMENSION, KITTY_DECODE_MAX_PIXELS, KITTY_FORMAT_PNG,
-    KITTY_FORMAT_RGB, KITTY_FORMAT_RGBA, KittyDecodeError, KittyDecodedImage, KittyTransmitFormat,
-    decode_kitty_payload, decode_kitty_payload_owned,
-};
 pub use kitty_place::{
-    KITTY_PLACE_MAX_BYTES, KITTY_PLACE_MAX_IMAGES, KITTY_PLACE_MAX_ITEMS,
-    KITTY_PRESENT_MAX_BLITS_PER_FRAME, KITTY_PRESENT_MAX_BYTES_PER_FRAME,
-    KITTY_RASTER_CACHE_MAX_BYTES, KITTY_RASTER_CACHE_MAX_ENTRIES, KittyAction, KittyFrameBudget,
-    KittyImageId, KittyImageLayer, KittyPlacedImage, KittyPlacement, KittyPlacementError,
-    KittyPlacementId, KittyRasterCache, KittyRasterKey, KittyRasterStats, placement_full_rect_for,
-    placement_rect_for, rasterize, rasterize_clipped, viewport_extent,
+    KITTY_DECODE_MAX_BYTES, KITTY_DECODE_MAX_DIMENSION, KITTY_DECODE_MAX_PIXELS, KITTY_FORMAT_PNG,
+    KITTY_FORMAT_RGB, KITTY_FORMAT_RGBA, KITTY_PLACE_MAX_BYTES, KITTY_PLACE_MAX_IMAGES,
+    KITTY_PLACE_MAX_ITEMS, KITTY_PRESENT_MAX_BLITS_PER_FRAME, KITTY_PRESENT_MAX_BYTES_PER_FRAME,
+    KittyAction, KittyImageId, KittyImageLayer, KittyPlacedImage, KittyPlacement,
+    KittyPlacementError, KittyPlacementId, KittyPrecheckError, placement_full_rect_for,
+    placement_rect_for, precheck_declared_image, viewport_extent,
 };
 pub use kitty_unicode::{
     KittyUnicodeRect, KittyUnicodeVirtual, unicode_run_rect, virtual_extent_cells,

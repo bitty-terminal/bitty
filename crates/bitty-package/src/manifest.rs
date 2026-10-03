@@ -318,6 +318,7 @@ pub const CLOSED_CAPABILITY_HEADS: &[&str] = &[
     "terminal.manage",
     "ui.rich",
     "ui.overlay",
+    "ui.overlay.focus",
     "ui.protocol-register",
     "clipboard.read",
     "clipboard.write",

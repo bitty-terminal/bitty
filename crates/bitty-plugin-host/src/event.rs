@@ -174,6 +174,13 @@ pub enum EventKind {
     WorkspaceRenamed,
     WorkspaceFocused,
     WorkspaceChanged,
+    /// Focusable-overlay capture release observation (CTX-0941, W-28).
+    ///
+    /// Additive v2 growth: session end is observable without polling through
+    /// this observation-only bus event with payload `{ owner, reason }` (both
+    /// text). Any subscriber may observe it; no phase may intercept or veto
+    /// it. Acquisition needs no bus event.
+    OverlayReleased,
     // Interception (exactly four for v1)
     InterceptCommandDispatch,
     InterceptTerminalSpawn,
@@ -203,6 +210,7 @@ impl EventKind {
             "workspace.renamed" => Ok(Self::WorkspaceRenamed),
             "workspace.focused" => Ok(Self::WorkspaceFocused),
             "workspace.changed" => Ok(Self::WorkspaceChanged),
+            "overlay.released" => Ok(Self::OverlayReleased),
             "intercept.command-dispatch" => Ok(Self::InterceptCommandDispatch),
             "intercept.terminal-spawn" => Ok(Self::InterceptTerminalSpawn),
             "intercept.paste" => Ok(Self::InterceptPaste),
@@ -233,6 +241,7 @@ impl EventKind {
             Self::WorkspaceRenamed => "workspace.renamed",
             Self::WorkspaceFocused => "workspace.focused",
             Self::WorkspaceChanged => "workspace.changed",
+            Self::OverlayReleased => "overlay.released",
             Self::InterceptCommandDispatch => "intercept.command-dispatch",
             Self::InterceptTerminalSpawn => "intercept.terminal-spawn",
             Self::InterceptPaste => "intercept.paste",
@@ -261,7 +270,8 @@ impl EventKind {
             | Self::WorkspaceClosed
             | Self::WorkspaceRenamed
             | Self::WorkspaceFocused
-            | Self::WorkspaceChanged => EventClass::Observation,
+            | Self::WorkspaceChanged
+            | Self::OverlayReleased => EventClass::Observation,
             Self::InterceptCommandDispatch
             | Self::InterceptTerminalSpawn
             | Self::InterceptPaste
@@ -329,6 +339,7 @@ impl EventKind {
             | Self::WorkspaceRenamed
             | Self::WorkspaceFocused
             | Self::WorkspaceChanged
+            | Self::OverlayReleased
             | Self::InterceptCommandDispatch
             | Self::InterceptTerminalSpawn
             | Self::InterceptOpenUrl => PayloadPolicy::Ungated,

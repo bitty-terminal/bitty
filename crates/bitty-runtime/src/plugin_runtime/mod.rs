@@ -54,7 +54,12 @@ pub use bitty_lua::{
     WORKSPACE_RENAME_MAX_BYTES, WorkspaceAttention, WorkspaceInfo, WorkspaceRequest,
 };
 pub use fs::{FakeFileSystem, FileSystem, NativeFileSystem, write_atomic_durably};
-pub use overlay::{OVERLAY_CAPTURE_TIMEOUT_MS, OverlayCapture};
+pub use overlay::{
+    CRASHED_RELEASE_REASON, CapturePoll, DEFAULT_RELEASE_REASON, FOCUS_SWITCHED_RELEASE_REASON,
+    OVERLAY_CAPTURE_TIMEOUT_MS, OWNER_RELEASE_REASONS, OverlayCapture, RELEASE_REASONS,
+    ReleasedEvent, TIMEOUT_RELEASE_REASON, UNLOADED_RELEASE_REASON, is_owner_release_reason,
+    is_release_reason,
+};
 pub use resolution::{
     CURRENT_POINTER_FILE, PLUGIN_INDEX_STATE_VERSION, PluginRecord, content_digest, load_index,
     load_index_with_fs, write_index, write_index_with_fs,
@@ -752,16 +757,39 @@ impl PluginRuntime {
     ///
     /// Returns whether a capture was dropped. Release is guaranteed and
     /// idempotent: a call with no active capture is a no-op `false`.
+    /// Records the `focus_switched` reason for the owner's next poll.
     pub fn revoke_overlay_capture(&mut self) -> bool {
+        self.revoke_overlay_capture_with_reason(FOCUS_SWITCHED_RELEASE_REASON)
+    }
+
+    /// Revoke the active overlay capture with an explicit terminal reason
+    /// (one of the accepted W-01 release reasons).
+    ///
+    /// Used by the application to attribute the release path: `focus_switched`
+    /// for focus moves, `cancelled` for user cancel. Returns whether a
+    /// capture was dropped.
+    pub fn revoke_overlay_capture_with_reason(&mut self, reason: &str) -> bool {
         let owner = self
             .overlay_capture
             .borrow()
             .owner_plugin()
             .map(str::to_string);
         match owner {
-            Some(plugin) => self.overlay_capture.borrow_mut().revoke_plugin(&plugin),
+            Some(plugin) => self
+                .overlay_capture
+                .borrow_mut()
+                .revoke_plugin_with_reason(&plugin, reason),
             None => false,
         }
+    }
+
+    /// Drain pending `overlay.released` bus observations in order.
+    ///
+    /// The application delivers each entry via the event pipeline on its
+    /// cold path (never on the input hot path): any subscriber may observe
+    /// session end without polling, and no phase may intercept or veto it.
+    pub fn drain_overlay_released(&mut self) -> Vec<ReleasedEvent> {
+        self.overlay_capture.borrow_mut().drain_released_events()
     }
 
     /// Revoke an overlay capture that has reached its Core-side deadline at
@@ -1023,6 +1051,13 @@ impl PluginRuntime {
         let ui_overlay = granted
             .iter()
             .any(|capability| capability.as_str() == "ui.overlay");
+        // CTX-0941 (accepted W-01 v2): the focusable overlay and transient
+        // input-capture surface requires `ui.overlay.focus`. Distinct from
+        // v1 `ui.overlay` (presentation-only, non-focusable); no implication
+        // either way and no wildcard.
+        let ui_overlay_focus = granted
+            .iter()
+            .any(|capability| capability.as_str() == "ui.overlay.focus");
         let debug_inspect = granted
             .iter()
             .any(|capability| capability.as_str() == "debug.inspect");
@@ -1078,8 +1113,13 @@ impl PluginRuntime {
         plugin_services.set_ui_access(UiAccess {
             rich: ui_rich,
             overlay: ui_overlay,
+            overlay_focus: ui_overlay_focus,
             claims: manifest.lazy.claims.clone(),
         });
+        // CTX-0941: safe mode never presents a focusable overlay. The flag
+        // travels with the generation so every capture call fails closed
+        // with `E_UI_UNAVAILABLE` while set.
+        plugin_services.set_safe_mode(self.safe_mode);
         // CTX-0941: the one runtime-shared focusable-overlay capture switch,
         // so the single-owner invariant spans every plugin and survives
         // reload; suspend/dispose revoke this generation's capture.
@@ -1784,8 +1824,11 @@ impl PluginRuntime {
         // CTX-0941: a failed activation is a release. A generation that
         // acquired the transient capture during `init.lua` must never keep it
         // after the activation rolls back, or a dead/failed plugin would pin
-        // input forever.
-        self.overlay_capture.borrow_mut().revoke_plugin(id.as_str());
+        // input forever. The reason is `crashed`: the generation never
+        // reached a runnable state.
+        self.overlay_capture
+            .borrow_mut()
+            .revoke_plugin_with_reason(id.as_str(), CRASHED_RELEASE_REASON);
         // W-29: a failed activation also drops the generation's lenses (the
         // entry services are dropped above, but the shared lens set must not
         // retain a failed generation's registrations).

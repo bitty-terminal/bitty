@@ -1856,7 +1856,7 @@ impl TerminalApp {
                             && !keyref.alt
                             && !keyref.super_held
                         {
-                            self.revoke_overlay_capture();
+                            self.revoke_overlay_capture_with_reason("cancelled");
                             if let Some(win) = self.window.handle.as_ref() {
                                 win.request_redraw();
                             }

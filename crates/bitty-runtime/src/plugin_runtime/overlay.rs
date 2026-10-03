@@ -29,7 +29,7 @@
 //! requirement is that a finite limit exists.
 
 use std::collections::VecDeque;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bitty_lua::{
     BridgeError, E_UI_ALREADY_CAPTURED, E_UI_NOT_OWNER, OVERLAY_CAPTURE_QUEUE_MAX,
@@ -42,6 +42,52 @@ use bitty_lua::{
 /// a blocked or silent plugin cannot pin terminal input.
 pub const OVERLAY_CAPTURE_TIMEOUT_MS: u64 = 30_000;
 
+/// Full terminal release-reason vocabulary (accepted W-01 contract).
+///
+/// Only `submitted` and `cancelled` are owner-suppliable; the rest are
+/// Core-reported. Involuntary terminal causes overwrite the reason.
+pub const RELEASE_REASONS: &[&str] = &[
+    "released",
+    "submitted",
+    "cancelled",
+    "focus_switched",
+    "unloaded",
+    "crashed",
+    "timeout",
+];
+
+/// Owner-suppliable release dispositions (`release` reason argument).
+pub const OWNER_RELEASE_REASONS: &[&str] = &["submitted", "cancelled"];
+
+/// Default release reason when the owner supplies none.
+pub const DEFAULT_RELEASE_REASON: &str = "released";
+
+/// Core-reported reason for a capture revoked by plugin suspend, dispose,
+/// unload, or disable.
+pub const UNLOADED_RELEASE_REASON: &str = "unloaded";
+
+/// Core-reported reason for a capture revoked after a plugin crash or failed
+/// activation.
+pub const CRASHED_RELEASE_REASON: &str = "crashed";
+
+/// Core-reported reason for a capture revoked by a user focus switch.
+pub const FOCUS_SWITCHED_RELEASE_REASON: &str = "focus_switched";
+
+/// Core-reported reason for a capture revoked by the idle timeout.
+pub const TIMEOUT_RELEASE_REASON: &str = "timeout";
+
+/// Whether `reason` is a valid terminal release reason.
+#[must_use]
+pub fn is_release_reason(reason: &str) -> bool {
+    RELEASE_REASONS.contains(&reason)
+}
+
+/// Whether `reason` may be supplied by the owner in `release`.
+#[must_use]
+pub fn is_owner_release_reason(reason: &str) -> bool {
+    OWNER_RELEASE_REASONS.contains(&reason)
+}
+
 /// The active capture owner for one runtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CaptureOwner {
@@ -49,6 +95,50 @@ struct CaptureOwner {
     handle: i64,
     /// Absolute monotonic deadline; Core revokes at or after this instant.
     expires_at: Instant,
+}
+
+/// Terminal record of one ended session, remembered for the owner's next
+/// poll and for the `overlay.released` bus event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReleaseRecord {
+    plugin_id: String,
+    handle: i64,
+    reason: String,
+    /// Sequence of the last event delivered in the ended session.
+    seq: u64,
+    /// Whether the ended session had overflowed its queue.
+    overflowed: bool,
+}
+
+/// One pending `overlay.released` bus observation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleasedEvent {
+    /// Capture owner at release time.
+    pub owner: String,
+    /// Terminal release reason.
+    pub reason: String,
+}
+
+/// Detailed poll result per the accepted W-01 contract.
+///
+/// `status` is `"active"` while the session holds capture and `"released"`
+/// after any terminal cause. `seq` is the monotonic sequence of the last
+/// event delivered to this owner in this session. `events` holds drained
+/// input in order (empty when there is nothing new). `overflowed` is sticky
+/// once queue overflow has dropped an older event. `reason` is present only
+/// with `"released"`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturePoll {
+    /// `"active"` or `"released"`.
+    pub status: &'static str,
+    /// Last delivered sequence in this session.
+    pub seq: u64,
+    /// Drained events (empty for a released session: the queue is dropped).
+    pub events: Vec<OverlayInput>,
+    /// Sticky overflow flag for this session.
+    pub overflowed: bool,
+    /// Terminal reason, present only when `status` is `"released"`.
+    pub reason: Option<String>,
 }
 
 /// Runtime-shared single-owner overlay capture switch and bounded queue.
@@ -62,6 +152,14 @@ pub struct OverlayCapture {
     queue: VecDeque<OverlayInput>,
     next_sequence: u64,
     dropped: u64,
+    /// Sticky overflow flag for the live session (cleared on acquire).
+    overflowed: bool,
+    /// Sequence of the last event delivered to the live owner (0 when none).
+    last_delivered: u64,
+    /// Terminal record of the most recent ended session (cleared on acquire).
+    last_release: Option<ReleaseRecord>,
+    /// Pending `overlay.released` observations for the application tick.
+    pending_released: Vec<ReleasedEvent>,
 }
 
 impl OverlayCapture {
@@ -91,7 +189,7 @@ impl OverlayCapture {
             .as_ref()
             .is_some_and(|owner| owner.expires_at <= Instant::now())
         {
-            self.clear();
+            self.finish_session(TIMEOUT_RELEASE_REASON);
         }
         if self.owner.is_some() {
             return Err(BridgeError::new(
@@ -105,6 +203,11 @@ impl OverlayCapture {
             handle,
             expires_at,
         });
+        // A new session starts clean: no sticky overflow, no delivered
+        // sequence, and no remembered release for the previous handle.
+        self.overflowed = false;
+        self.last_delivered = 0;
+        self.last_release = None;
         Ok(())
     }
 
@@ -112,19 +215,33 @@ impl OverlayCapture {
     ///
     /// Idempotent: returns `true` only when it actually dropped an owned
     /// capture; a foreign or repeated release returns `false` and never errors.
+    /// Records the default `released` reason for the owner's next poll.
     pub fn release(&mut self, plugin_id: &str, handle: i64) -> bool {
+        self.release_with_reason(plugin_id, handle, DEFAULT_RELEASE_REASON)
+    }
+
+    /// Release with an explicit terminal reason.
+    ///
+    /// Same idempotence as [`OverlayCapture::release`]; the reason is
+    /// remembered for the owner's next detailed poll and for the
+    /// `overlay.released` bus event. Callers pass one of
+    /// [`RELEASE_REASONS`]; unknown reasons are recorded verbatim and never
+    /// affect the state transition.
+    pub fn release_with_reason(&mut self, plugin_id: &str, handle: i64, reason: &str) -> bool {
         let owned = self
             .owner
             .as_ref()
             .is_some_and(|owner| owner.plugin_id == plugin_id && owner.handle == handle);
         if owned {
-            self.clear();
+            self.finish_session(reason);
         }
         owned
     }
 
     /// Drain up to `max` queued events for the capture owned by
     /// (`plugin_id`, `handle`), oldest first.
+    ///
+    /// Owner-only low-level drain: refreshes the idle deadline on success.
     ///
     /// # Errors
     ///
@@ -143,8 +260,82 @@ impl OverlayCapture {
                 "no focusable-overlay input capture is held for this handle",
             ));
         }
+        self.refresh_owner(plugin_id, handle);
         let take = max.min(self.queue.len());
-        Ok(self.queue.drain(..take).collect())
+        let drained: Vec<OverlayInput> = self.queue.drain(..take).collect();
+        if let Some(last) = drained.last() {
+            self.last_delivered = last.sequence;
+        }
+        Ok(drained)
+    }
+
+    /// Detailed poll per the accepted W-01 contract.
+    ///
+    /// While the caller owns the session the result is `active` with drained
+    /// events (empty when there is nothing new) and the idle deadline is
+    /// refreshed. After any terminal cause the owner's next poll reports
+    /// `released` with the exact reason and no events. A non-owner, or a
+    /// stale-generation handle that matches no live or remembered session,
+    /// fails with [`E_UI_NOT_OWNER`] and changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`BridgeError`] with code [`E_UI_NOT_OWNER`] (class `runtime`) when the
+    /// caller owns neither the live session nor the remembered release.
+    pub fn poll_detailed(
+        &mut self,
+        plugin_id: &str,
+        handle: i64,
+        max: usize,
+    ) -> Result<CapturePoll, BridgeError> {
+        if self.is_owner(plugin_id, handle) {
+            self.refresh_owner(plugin_id, handle);
+            let take = max.min(self.queue.len());
+            let drained: Vec<OverlayInput> = self.queue.drain(..take).collect();
+            if let Some(last) = drained.last() {
+                self.last_delivered = last.sequence;
+            }
+            return Ok(CapturePoll {
+                status: "active",
+                seq: self.last_delivered,
+                events: drained,
+                overflowed: self.overflowed,
+                reason: None,
+            });
+        }
+        if let Some(record) = self.last_release.as_ref() {
+            if record.plugin_id == plugin_id && record.handle == handle {
+                return Ok(CapturePoll {
+                    status: "released",
+                    seq: record.seq,
+                    events: Vec::new(),
+                    overflowed: record.overflowed,
+                    reason: Some(record.reason.clone()),
+                });
+            }
+        }
+        Err(BridgeError::new(
+            "runtime",
+            E_UI_NOT_OWNER,
+            "no focusable-overlay input capture is held for this handle",
+        ))
+    }
+
+    /// Refresh the idle deadline of the owned session.
+    ///
+    /// The capture uses a sliding idle timeout: any input event, poll, or
+    /// update extends the deadline by [`OVERLAY_CAPTURE_TIMEOUT_MS`], so an
+    /// actively used session survives while an abandoned one is revoked.
+    /// Returns whether the caller owns the live session.
+    pub fn refresh_owner(&mut self, plugin_id: &str, handle: i64) -> bool {
+        match self.owner.as_mut() {
+            Some(owner) if owner.plugin_id == plugin_id && owner.handle == handle => {
+                owner.expires_at =
+                    Instant::now() + Duration::from_millis(OVERLAY_CAPTURE_TIMEOUT_MS);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Append one captured input event for the active owner.
@@ -159,6 +350,7 @@ impl OverlayCapture {
         if self.queue.len() >= OVERLAY_CAPTURE_QUEUE_MAX {
             self.queue.pop_front();
             self.dropped = self.dropped.saturating_add(1);
+            self.overflowed = true;
         }
         self.next_sequence = self.next_sequence.saturating_add(1);
         self.queue.push_back(OverlayInput {
@@ -166,6 +358,11 @@ impl OverlayCapture {
             kind: bounded_kind(kind),
             text: bounded_text(text),
         });
+        // Captured input proves the session is live: extend the idle
+        // deadline so fast typing never kills its own session.
+        if let Some(owner) = self.owner.as_mut() {
+            owner.expires_at = Instant::now() + Duration::from_millis(OVERLAY_CAPTURE_TIMEOUT_MS);
+        }
         true
     }
 
@@ -186,6 +383,10 @@ impl OverlayCapture {
                 self.next_sequence = self.next_sequence.saturating_add(1);
                 back.sequence = self.next_sequence;
                 back.text = bounded_text(text);
+                if let Some(owner) = self.owner.as_mut() {
+                    owner.expires_at =
+                        Instant::now() + Duration::from_millis(OVERLAY_CAPTURE_TIMEOUT_MS);
+                }
                 return true;
             }
         }
@@ -201,29 +402,41 @@ impl OverlayCapture {
         self.owner.as_ref().map(|owner| owner.expires_at)
     }
     /// Revoke the capture if `plugin_id` owns it (suspend, dispose, unload,
-    /// disable, crash). Returns whether a capture was dropped.
+    /// disable, crash). Returns whether a capture was dropped. Records the
+    /// `unloaded` reason for the owner's next poll.
     pub fn revoke_plugin(&mut self, plugin_id: &str) -> bool {
+        self.revoke_plugin_with_reason(plugin_id, UNLOADED_RELEASE_REASON)
+    }
+
+    /// Revoke with an explicit terminal reason (one of [`RELEASE_REASONS`).
+    pub fn revoke_plugin_with_reason(&mut self, plugin_id: &str, reason: &str) -> bool {
         let owned = self
             .owner
             .as_ref()
             .is_some_and(|owner| owner.plugin_id == plugin_id);
         if owned {
-            self.clear();
+            self.finish_session(reason);
         }
         owned
     }
 
     /// Revoke the capture if it has reached its deadline at `now` (Core-side
-    /// timeout). Returns whether a capture was dropped.
+    /// timeout). Returns whether a capture was dropped. Records the `timeout`
+    /// reason for the owner's next poll.
     pub fn revoke_expired_at(&mut self, now: Instant) -> bool {
         let expired = self
             .owner
             .as_ref()
             .is_some_and(|owner| owner.expires_at <= now);
         if expired {
-            self.clear();
+            self.finish_session(TIMEOUT_RELEASE_REASON);
         }
         expired
+    }
+
+    /// Drain pending `overlay.released` bus observations in order.
+    pub fn drain_released_events(&mut self) -> Vec<ReleasedEvent> {
+        std::mem::take(&mut self.pending_released)
     }
 
     /// Rewind the owned capture's deadline into the past (test-only).
@@ -250,6 +463,18 @@ impl OverlayCapture {
             .is_some_and(|owner| owner.plugin_id == plugin_id && owner.handle == handle)
     }
 
+    /// Whether (`plugin_id`, `handle`) owns the remembered terminal release.
+    ///
+    /// Used for idempotent release: an already-released handle of the owning
+    /// generation succeeds without state change, while anything else is a
+    /// non-owner or stale handle.
+    #[must_use]
+    pub fn owns_release(&self, plugin_id: &str, handle: i64) -> bool {
+        self.last_release
+            .as_ref()
+            .is_some_and(|record| record.plugin_id == plugin_id && record.handle == handle)
+    }
+
     /// Whether any capture is active.
     #[must_use]
     pub fn is_active(&self) -> bool {
@@ -274,10 +499,43 @@ impl OverlayCapture {
         self.dropped
     }
 
+    /// Whether the live session has overflowed its queue (sticky flag).
+    #[must_use]
+    pub fn overflowed(&self) -> bool {
+        self.overflowed
+    }
+
+    /// Number of pending `overlay.released` bus observations.
+    #[must_use]
+    pub fn pending_released_len(&self) -> usize {
+        self.pending_released.len()
+    }
+
     /// Drop the owner and every queued event (transient session end).
     fn clear(&mut self) {
         self.owner = None;
         self.queue.clear();
+    }
+
+    /// End the live session with `reason`: remember the terminal record for
+    /// the owner's next detailed poll, queue the bus observation, and drop
+    /// the owner and every queued event.
+    fn finish_session(&mut self, reason: &str) {
+        if let Some(owner) = self.owner.as_ref() {
+            let record = ReleaseRecord {
+                plugin_id: owner.plugin_id.clone(),
+                handle: owner.handle,
+                reason: reason.to_string(),
+                seq: self.last_delivered,
+                overflowed: self.overflowed,
+            };
+            self.pending_released.push(ReleasedEvent {
+                owner: owner.plugin_id.clone(),
+                reason: reason.to_string(),
+            });
+            self.last_release = Some(record);
+        }
+        self.clear();
     }
 }
 
@@ -450,5 +708,82 @@ mod tests {
         assert_eq!(capture.expiry_deadline(), Some(deadline));
         assert!(capture.release("a", 1));
         assert_eq!(capture.expiry_deadline(), None);
+    }
+
+    #[test]
+    fn detailed_poll_reports_active_then_released_with_reason() {
+        let mut capture = OverlayCapture::new();
+        capture.acquire("a", 1, future(60_000)).expect("acquire");
+        assert!(capture.enqueue("key", "k"));
+        let live = capture.poll_detailed("a", 1, 8).expect("active poll");
+        assert_eq!(live.status, "active");
+        assert_eq!(live.seq, 1);
+        assert_eq!(live.events.len(), 1);
+        assert!(!live.overflowed);
+        assert_eq!(live.reason, None);
+        assert!(capture.release_with_reason("a", 1, "submitted"));
+        let after = capture.poll_detailed("a", 1, 8).expect("released poll");
+        assert_eq!(after.status, "released");
+        assert_eq!(after.seq, 1);
+        assert!(after.events.is_empty());
+        assert_eq!(after.reason.as_deref(), Some("submitted"));
+        // A non-owner never observes the release: stale handles fail closed.
+        assert_eq!(
+            capture
+                .poll_detailed("b", 1, 8)
+                .expect_err("foreign poll must fail")
+                .code,
+            E_UI_NOT_OWNER
+        );
+    }
+
+    #[test]
+    fn overflow_sets_the_sticky_flag_and_keeps_the_session() {
+        let mut capture = OverlayCapture::new();
+        capture.acquire("a", 1, future(60_000)).expect("acquire");
+        for index in 0..=OVERLAY_CAPTURE_QUEUE_MAX {
+            assert!(capture.enqueue("text", &format!("{index}")));
+        }
+        assert!(capture.overflowed());
+        let live = capture
+            .poll_detailed("a", 1, OVERLAY_CAPTURE_QUEUE_MAX)
+            .expect("poll");
+        assert_eq!(live.status, "active");
+        assert!(live.overflowed);
+        assert_eq!(live.events[0].text, "1");
+    }
+
+    #[test]
+    fn activity_extends_the_idle_deadline() {
+        let mut capture = OverlayCapture::new();
+        capture.acquire("a", 1, future(1000)).expect("acquire");
+        let before = capture.expiry_deadline().expect("deadline");
+        assert!(capture.enqueue("key", "k"), "input is activity");
+        assert!(
+            capture.expiry_deadline().expect("deadline") >= before,
+            "captured input extends the deadline"
+        );
+        assert!(capture.refresh_owner("a", 1), "poll-equivalent refresh");
+        assert!(!capture.refresh_owner("b", 1), "foreign refresh is a no-op");
+    }
+
+    #[test]
+    fn every_terminal_path_queues_exactly_one_bus_event() {
+        let mut capture = OverlayCapture::new();
+        capture.acquire("a", 1, future(60_000)).expect("acquire");
+        assert!(capture.release_with_reason("a", 1, "cancelled"));
+        capture.acquire("b", 2, future(60_000)).expect("re-acquire");
+        assert!(capture.revoke_plugin_with_reason("b", "unloaded"));
+        capture.acquire("c", 3, future(60_000)).expect("re-acquire");
+        assert!(capture.revoke_expired_at(future(120_000)));
+        let events = capture.drain_released_events();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.owner.as_str(), event.reason.as_str()))
+                .collect::<Vec<_>>(),
+            [("a", "cancelled"), ("b", "unloaded"), ("c", "timeout")]
+        );
+        assert!(capture.drain_released_events().is_empty());
     }
 }

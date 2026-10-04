@@ -49,10 +49,21 @@ expect_exit 2 'unknown run option' run --platform linux-x11 --bogus
 expect_exit 2 'unknown aggregate option' aggregate --bogus
 
 # 3. `run` against a fake cargo, one case per suite outcome. The shim keys off
-#    the `--test <name>` argument and prints a `test result:` line.
-mkdir -p "$TMP/bin"
+#    the `--test <name>` argument and prints a `test result:` line. It logs
+#    every argv line so the routing assertion below can tell which suites ran
+#    through the external compat-lab checkout (`--manifest-path`) and which
+#    ran in this workspace.
+#    W-105 relocation: compat-lab suites run via `--manifest-path
+#    "$BITTY_COMPAT_LAB_DIR/Cargo.toml"`; the driver fails closed when that
+#    checkout is absent, so point it at a stub checkout here (only
+#    `Cargo.toml` presence is probed; the fake cargo answers everything).
+mkdir -p "$TMP/bin" "$TMP/compat-lab"
+: >"$TMP/compat-lab/Cargo.toml"
+: >"$TMP/argv.log"
+export BITTY_COMPAT_LAB_DIR="$TMP/compat-lab"
 cat >"$TMP/bin/cargo" <<'SH'
 #!/usr/bin/env bash
+printf '%s\n' "$*" >>"$ARGV_LOG"
 suite=""
 while (($# > 0)); do
 	case "$1" in
@@ -84,6 +95,7 @@ esac
 SH
 chmod +x "$TMP/bin/cargo"
 export PATH="$TMP/bin:$PATH"
+export ARGV_LOG="$TMP/argv.log"
 
 # 3a. All suites green -> exit 0 and a PASS table row per suite.
 if ! out="$("$SCRIPT" run --platform linux-x11 --out "$TMP/green.tsv" 2>&1)"; then
@@ -98,6 +110,29 @@ for needle in 'm1_mode_golden' 'm1_color_golden' 'm1_mode_input' 'm1_color_title
     FAIL=1
   fi
 done
+
+# 3a2. Routing: compat-lab suites run through the pinned external checkout,
+#      runtime suites run in this workspace. The roster split is the W-105
+#      contract (compat-lab suites moved out, runtime suites stayed).
+for suite in m1_mode_golden m1_color_golden; do
+  if ! grep -F -- "--test $suite" "$TMP/argv.log" | grep -qF -- "--manifest-path $TMP/compat-lab/Cargo.toml"; then
+    echo "FAIL: $suite did not route through the compat-lab checkout" >&2
+    FAIL=1
+  fi
+done
+for suite in m1_mode_input m1_color_title m1_shell_coverage; do
+  if grep -F -- "--test $suite" "$TMP/argv.log" | grep -qF -- "--manifest-path"; then
+    echo "FAIL: $suite must run in-workspace, not through --manifest-path" >&2
+    FAIL=1
+  fi
+done
+
+# 3a3. Fail-closed routing: with no compat-lab checkout the leg fails (exit
+#      non-zero) instead of silently running zero compat-lab suites.
+if BITTY_COMPAT_LAB_DIR="$TMP/absent" "$SCRIPT" run --platform linux-x11 --out "$TMP/missing.tsv" >/dev/null 2>&1; then
+  echo "FAIL: missing compat-lab checkout was accepted" >&2
+  FAIL=1
+fi
 
 # 3b. A failing suite -> exit 1 and a fail row.
 if FAKE_M1_FAIL=color-title "$SCRIPT" run --platform macos --out "$TMP/red.tsv" >/dev/null 2>&1; then

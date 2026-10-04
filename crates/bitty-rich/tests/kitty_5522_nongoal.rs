@@ -10,12 +10,14 @@
 //! clipboard controls stay deny-by-default. OSC 52 gated write already
 //! covers M1 plain-text needs; Ghostty parity is not an M1 requirement.
 //!
-//! Locked behavior: the checked-in corpus
-//! (`tests/compat/osc/corpus/04-kitty-clipboard-5522.bin`) parses to
-//! bounded inert `OscUnknown { id: 5522 }` actions only, deterministically,
-//! and every `ClipboardState` policy answers them with `Ignored` — no
-//! capture, no denial counters, no grant consumed. Revisit only through a
-//! future RFC with security review.
+//! Locked behavior: the vendored corpus
+//! (`tests/fixtures/04-kitty-clipboard-5522.bin`, copied from the
+//! `bitty-compat-lab` validation repository's
+//! `tests/compat/osc/corpus/04-kitty-clipboard-5522.bin` at the W-105
+//! relocation) parses to bounded inert `OscUnknown { id: 5522 }` actions
+//! only, deterministically, and every `ClipboardState` policy answers them
+//! with `Ignored` — no capture, no denial counters, no grant consumed.
+//! Revisit only through a future RFC with security review.
 //!
 //! Referenced as `ci` negative evidence by the compat-lab report row for
 //! `kitty clipboard extension (OSC 5522)`. Headless, bounded, no window,
@@ -33,10 +35,8 @@ const KITTY_CLIPBOARD_OSC: u32 = 5522;
 
 fn corpus_bytes() -> Vec<u8> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("tests/compat")
-        .join("osc")
-        .join("corpus")
+        .join("tests")
+        .join("fixtures")
         .join("04-kitty-clipboard-5522.bin");
     std::fs::read(&path).unwrap_or_else(|err| panic!("read {path:?}: {err}"))
 }

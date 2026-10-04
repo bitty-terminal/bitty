@@ -8,7 +8,6 @@ fmt-check:
 
 clippy:
     cargo clippy --workspace --all-targets --locked -- -D warnings
-    cargo clippy -p bitty-terminal --features dev-perf --all-targets --locked -- -D warnings
     cargo clippy -p bitty-terminal --features dev-tools --all-targets --locked -- -D warnings
 
 # Run the Rust test suite. cargo-nextest runs each test in its own process
@@ -18,17 +17,19 @@ clippy:
 # (winit needs the OS main thread), and does not run benches/examples, so those
 # run here explicitly -- keeping coverage identical to the previous
 # `cargo test --workspace --all-targets` (which executed all three).
-# `bitty dev trace` is behind the opt-in `dev-perf` feature (CTX-0918) and
-# `bitty dev capture|synthesize|dump|overlay` behind `dev-tools` (CTX-0922):
-# the default nextest run proves the compiled-out error paths, the last lines
-# rerun the CLI suite (and the `dev::` unit tests) with each feature so the
-# success paths stay covered.
+# `bitty dev capture|synthesize|dump|overlay` live behind `dev-tools`
+# (CTX-0922): the default nextest run proves the compiled-out error paths, the
+# last lines rerun the CLI suite (and the `dev::` unit tests) with the feature
+# so the success paths stay covered. (`bitty dev trace` measurement lives in
+# the external bitty-perf suite since the W-105 relocation and is never linked
+# here; its harness-side coverage runs in that repository.)
+# The perf bench gate below runs the pinned external bitty-perf checkout
+# (BITTY_PERF_DIR, default ../bitty-perf; see validation-pins.env).
 test:
     cargo nextest run --workspace --locked
     cargo test --workspace --doc --locked
     cargo test -p bitty-platform --test headless_run --test winit_window --locked
-    cargo test -p bitty-perf --benches --locked
-    cargo test -p bitty-terminal --features dev-perf --test cli_dev --locked
+    cargo test --manifest-path "${BITTY_PERF_DIR:-../bitty-perf}/Cargo.toml" --benches --locked
     cargo test -p bitty-terminal --features dev-tools --test cli_dev --locked
     cargo test -p bitty-terminal --features dev-tools --bin bitty --locked dev::
 
@@ -145,7 +146,10 @@ test-support-gate:
     ./scripts/check-test-support-gate.sh
 
 # Run the M1 evidence suites on this host and print the per-platform
-# table: `just m1-matrix`. The aggregated Tier 1 view lives in CI
+# table: `just m1-matrix`. The compat-lab suites run in the pinned external
+# checkout (BITTY_COMPAT_LAB_DIR, default $BITTY_WORKSPACE/bitty-compat-lab
+# or ../bitty-compat-lab; see validation-pins.env); the runtime suites run
+# in this workspace. The aggregated Tier 1 view lives in CI
 # (`.github/workflows/ci.yml` job `m1-matrix`); see scripts/m1-matrix.sh.
 m1-matrix *args:
     ./scripts/m1-matrix.sh run --platform local {{args}}
@@ -154,14 +158,25 @@ m1-matrix-test:
     ./scripts/tests/m1-matrix.test.sh
 
 # Run the 14 surfaces x 4 terminals release-matrix suites on this host and
-# print the per-platform table: `just compat-matrix`. The aggregated Tier 1
-# view lives in CI (`.github/workflows/ci.yml` job `compat-matrix`); see
+# print the per-platform table: `just compat-matrix`. The suites run in the
+# pinned external bitty-compat-lab checkout (same BITTY_COMPAT_LAB_DIR
+# resolution as above). The aggregated Tier 1 view lives in CI
+# (`.github/workflows/ci.yml` job `compat-matrix`); see
 # scripts/compat-matrix.sh. PERF-11 (#1065), CTX-0692.
 compat-matrix *args:
     ./scripts/compat-matrix.sh run --platform local {{args}}
 
 compat-matrix-test:
     ./scripts/tests/compat-matrix.test.sh
+
+# Vendored compat-fixture freshness gate (W-105): the external compat-lab
+# suite snapshots product test/scenario names; this fails when the snapshot
+# drifts from this workspace. See scripts/check-compat-fixture-freshness.sh.
+compat-freshness:
+    ./scripts/check-compat-fixture-freshness.sh
+
+compat-freshness-test:
+    ./scripts/tests/check-compat-fixture-freshness.test.sh
 
 scratch-paths:
     ./scripts/check-scratch-paths.sh
@@ -281,24 +296,27 @@ commit-check message:
     @cp commitlint.config.ts target/dev-tools/commitlint.config.ts
     @msg="$(realpath "{{message}}")" && cd target/dev-tools && bunx --bun commitlint --edit "$msg"
 
-check: fmt-check clippy test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate test-support-gate status-drift status-drift-test docs-pin-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test unix-bundle-test macos-dmg-test verify-unix-bundle-dispatch-test rust-channel-test binary-arch-test workflow-publish-test m1-matrix-test compat-matrix-test real-render-soak-test dogfood-session-test actionlint markdownlint
+check: fmt-check clippy test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate test-support-gate status-drift status-drift-test docs-pin-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test unix-bundle-test macos-dmg-test verify-unix-bundle-dispatch-test rust-channel-test binary-arch-test workflow-publish-test m1-matrix-test compat-matrix-test compat-freshness-test real-render-soak-test dogfood-session-test actionlint markdownlint
 
 # Parser-throughput baseline (CTX-0576, M1-11). Runs the deterministic
 # headless parser benchmark over the committed VT/escape corpora and verifies
-# the ratio gate against crates/bitty-perf/baselines/parser-throughput.json.
+# the ratio gate against the pinned bitty-perf checkout's
+# crates/bitty-perf/baselines/parser-throughput.json (W-105 relocation).
 # The release `bench` profile is used (optimized); the same gate runs bounded
-# in CI via `cargo test -p bitty-perf --test parser_throughput_regression`.
+# in CI via the external parser-throughput regression test.
+# BITTY_PERF_DIR locates the checkout (default ../bitty-perf).
 perf-parser:
-    cargo bench -p bitty-perf --bench parser_throughput -- --nocapture
+    cargo bench --manifest-path "${BITTY_PERF_DIR:-../bitty-perf}/Cargo.toml" --bench parser_throughput -- --nocapture
 
 # Re-capture the committed parser-throughput baseline artifact. Provenance is
 # taken from the environment so no host path or username enters the file:
 #   BITTY_PERF_DATE, BITTY_PERF_REVISION, BITTY_PERF_TOOLCHAIN, BITTY_PERF_OS,
-#   BITTY_PERF_MACHINE_CLASS (see benches/parser_throughput.rs).
+#   BITTY_PERF_MACHINE_CLASS (see benches/parser_throughput.rs in the bitty-perf checkout).
 # Defaults leave the artifact placeholders intact, so fill every variable
-# before committing a regenerated baseline.
+# before committing a regenerated baseline. Writes into the bitty-perf
+# checkout: baseline promotion stays an owned, reviewed change there.
 perf-parser-baseline out="crates/bitty-perf/baselines/parser-throughput.json":
-    cargo bench -p bitty-perf --bench parser_throughput -- --nocapture --write-baseline {{out}}
+    cargo bench --manifest-path "${BITTY_PERF_DIR:-../bitty-perf}/Cargo.toml" --bench parser_throughput -- --nocapture --write-baseline "${BITTY_PERF_DIR:-../bitty-perf}/{{out}}"
 
 # Real-window PB-1 startup + PB-2 idle-memory evidence (CTX-0592). Opt-in: a
 # run requires BITTY_PERF_REAL_WINDOW=1 and a built `bitty` binary (release
@@ -306,44 +324,44 @@ perf-parser-baseline out="crates/bitty-perf/baselines/parser-throughput.json":
 # never fabricates numbers. Bounds: BITTY_PERF_STARTUP_SAMPLES (<=50),
 # BITTY_PERF_IDLE_SECS (<=300), BITTY_PERF_STARTUP_TIMEOUT_SECS (<=120),
 # BITTY_PERF_BIN (explicit binary path). Runbook:
-# crates/bitty-perf/baselines/real-window-evidence.md.
+# bitty-perf checkout: crates/bitty-perf/baselines/real-window-evidence.md.
 perf-real-window:
-    BITTY_PERF_REAL_WINDOW=1 cargo bench -p bitty-perf --bench real_window -- --nocapture
+    BITTY_PERF_REAL_WINDOW=1 cargo bench --manifest-path "${BITTY_PERF_DIR:-../bitty-perf}/Cargo.toml" --bench real_window -- --nocapture
 
 # Regenerate the committed real-window evidence artifact. Provenance comes
 # from the environment so no host path or username enters the file:
 #   BITTY_PERF_DATE, BITTY_PERF_REVISION, BITTY_PERF_TOOLCHAIN,
-#   BITTY_PERF_COMMAND, BITTY_PERF_PROFILE (see benches/real_window.rs).
+#   BITTY_PERF_COMMAND, BITTY_PERF_PROFILE (see benches/real_window.rs in the bitty-perf checkout).
 # Both PB-1 and PB-2 must be measured or the bench refuses to write (exit 2).
 perf-real-window-baseline out="crates/bitty-perf/baselines/pb-real-window.json":
-    BITTY_PERF_REAL_WINDOW=1 cargo bench -p bitty-perf --bench real_window -- --nocapture --write-baseline {{out}}
+    BITTY_PERF_REAL_WINDOW=1 cargo bench --manifest-path "${BITTY_PERF_DIR:-../bitty-perf}/Cargo.toml" --bench real_window -- --nocapture --write-baseline "${BITTY_PERF_DIR:-../bitty-perf}/{{out}}"
 
 # PB-7 idle CPU/wakeup evidence (CTX-0636, PERF-08). Fast path: the
 # frame-on-demand invariant plus cost means (no extended window). Extended
 # path: `--idle-window` parks a proven-idle Runtime child and samples its
 # /proc CPU and wakeup counters (Linux-only; Unmeasured elsewhere).
-# Runbook: crates/bitty-perf/baselines/idle-evidence.md.
+# Runbook (bitty-perf checkout): crates/bitty-perf/baselines/idle-evidence.md.
 perf-idle:
-    cargo bench -p bitty-perf --bench idle_real -- --nocapture
+    cargo bench --manifest-path "${BITTY_PERF_DIR:-../bitty-perf}/Cargo.toml" --bench idle_real -- --nocapture
 
 # Regenerate the committed PB-7 idle evidence artifact. Provenance comes
 # from the environment so no host path or username enters the file:
 #   BITTY_PERF_TASK, BITTY_PERF_DATE, BITTY_PERF_REVISION,
 #   BITTY_PERF_TOOLCHAIN, BITTY_PERF_COMMAND, BITTY_PERF_PROFILE
-# (see benches/idle_real.rs). The window comes from BITTY_PERF_IDLE_SECS
+# (see benches/idle_real.rs in the bitty-perf checkout). The window comes from BITTY_PERF_IDLE_SECS
 # (default 60, max 600 = the PB-7 10-minute acceptance window); frame-on-demand must pass and the window must be
 # measured or the bench refuses to write (exit 2).
 perf-idle-baseline out="crates/bitty-perf/baselines/pb-idle.json":
-    cargo bench -p bitty-perf --bench idle_real -- --nocapture --write-baseline {{out}}
+    cargo bench --manifest-path "${BITTY_PERF_DIR:-../bitty-perf}/Cargo.toml" --bench idle_real -- --nocapture --write-baseline "${BITTY_PERF_DIR:-../bitty-perf}/{{out}}"
 # Long-duration real-render soak planner (CTX-0642, PERF-09). Headless-safe:
 # loads the clamped soak config, prints the bounded capture plan and the
 # hyprctl+grim leg status, and reports UNMEASURED without
 # BITTY_PERF_REAL_SOAK=1. Bounds: BITTY_PERF_SOAK_DURATION_SECS (60..86400),
 # BITTY_PERF_SOAK_INTERVAL_SECS (30..3600), BITTY_PERF_SOAK_WORKSPACE (1..10),
 # BITTY_PERF_SOAK_WORKLOAD (idle|mixed|input-spam). Runbook:
-# crates/bitty-perf/baselines/real-soak-evidence.md.
+# bitty-perf checkout: crates/bitty-perf/baselines/real-soak-evidence.md.
 perf-real-soak *args:
-    cargo bench -p bitty-perf --bench real_soak -- --nocapture {{args}}
+    cargo bench --manifest-path "${BITTY_PERF_DIR:-../bitty-perf}/Cargo.toml" --bench real_soak -- --nocapture {{args}}
 
 # Full automated soak chain (Tier 1: Hyprland + hyprctl/grim/jq required).
 # Evidence lands in timestamped run dirs under {{out}} (gitignored scratch):
@@ -361,9 +379,9 @@ real-render-soak-test:
 # (60..86400), BITTY_PERF_SESSION_CYCLE_SECS (60..3600),
 # BITTY_PERF_SESSION_WORKSPACE (1..10), BITTY_PERF_SESSION_APPS
 # (csv subset of shell,cargo,git,nvim,tmux,ssh). Runbook:
-# crates/bitty-perf/baselines/dogfood-session-evidence.md.
+# bitty-perf checkout: crates/bitty-perf/baselines/dogfood-session-evidence.md.
 perf-dogfood-session *args:
-    cargo bench -p bitty-perf --bench dogfood_session -- --nocapture {{args}}
+    cargo bench --manifest-path "${BITTY_PERF_DIR:-../bitty-perf}/Cargo.toml" --bench dogfood_session -- --nocapture {{args}}
 
 # Full dogfood session chain (Tier 1: Hyprland + hyprctl/grim/jq required).
 # Evidence lands in timestamped run dirs under {{out}} (gitignored scratch):

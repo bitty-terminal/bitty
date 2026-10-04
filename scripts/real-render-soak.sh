@@ -12,7 +12,8 @@
 # recording/real-soak, gitignored): captures.csv, soak-evidence.json,
 # per-capture PNG + grid JSON, and the bitty log. Screenshots are file names
 # only inside the JSON; no absolute host path is recorded. Promoting an
-# artifact to crates/bitty-perf/baselines/ is an explicit reviewed copy.
+# artifact to the bitty-perf repository's crates/bitty-perf/baselines/ is an
+# explicit reviewed copy.
 #
 # Usage:
 #   bash scripts/real-render-soak.sh --out-dir DIR [--duration-secs N]

@@ -820,7 +820,8 @@ mod tests {
     #[test]
     fn snapshot_clone_is_bounded_no_heap_thrash() {
         // Targeted timing assertion for the hot path (no criterion bench for
-        // Cell alone; benches/terminal_state.rs covers State::apply).
+        // Cell alone; the `bitty-perf` suite's benches/terminal_state.rs
+        // covers State::apply).
         // Cloning 100k cells (10k-line x 100-col scrollback is 1M; 100k keeps
         // CI fast) must stay well under a generous bound; a Vec-per-cell
         // clone with heap churn would blow this on debug builds.

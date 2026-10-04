@@ -26,6 +26,34 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # W-105 relocation (bitty CTX-0931): the compat-lab and perf suites live
+      # in independent validation repositories at pinned immutable revisions
+      # (validation-pins.env, W-75 pin discipline). The product change path
+      # keeps thin required invocations against those pins below; the suite
+      # logic itself is owned externally.
+      - name: Resolve validation pins
+        id: validation-pins
+        run: |
+          set -a
+          . ./validation-pins.env
+          set +a
+          echo "compat-lab-rev=$BITTY_COMPAT_LAB_REV" >> "$GITHUB_OUTPUT"
+          echo "perf-rev=$BITTY_PERF_REV" >> "$GITHUB_OUTPUT"
+
+      - name: Check out pinned bitty-perf suite
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: bitty-terminal/bitty-perf
+          ref: ${{ steps.validation-pins.outputs.perf-rev }}
+          path: external/bitty-perf
+
+      - name: Check out pinned bitty-compat-lab suite
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: bitty-terminal/bitty-compat-lab
+          ref: ${{ steps.validation-pins.outputs.compat-lab-rev }}
+          path: external/bitty-compat-lab
+
       # bitty-render wraps crossfont (ADR-0004), which links the platform
       # font stack on Linux (FreeType + fontconfig) via pkg-config.
       # HK-07: cache downloaded .deb archives across runs (key = OS + the
@@ -109,13 +137,11 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      # CTX-0918: `bitty dev trace` is compiled only with the opt-in
-      # `dev-perf` feature; lint that configuration too so it cannot rot.
-      - name: Run Clippy (bitty-terminal dev-perf feature)
-        run: cargo clippy -p bitty-terminal --features dev-perf --all-targets --locked -- -D warnings
-
       # CTX-0922: `bitty dev capture|synthesize|dump|overlay` is compiled only
       # with the opt-in `dev-tools` feature; lint that configuration too.
+      # (`bitty dev trace` measurement lives in the external bitty-perf suite
+      # since the W-105 relocation and is never linked here, so there is no
+      # trace feature configuration left to lint.)
       - name: Run Clippy (bitty-terminal dev-tools feature)
         run: cargo clippy -p bitty-terminal --features dev-tools --all-targets --locked -- -D warnings
 
@@ -146,21 +172,20 @@ jobs:
         run: cargo test -p bitty-platform --test headless_run --test winit_window --locked
 
       # CTX-0847: the previous `cargo test --all-targets` also executed the
-      # bitty-perf benches; nextest runs none of them, so keep that coverage
-      # explicitly here. The bitty-ipc example moved with the CTX-1585
-      # extraction to the independent bitty-ipc repository (own CI) and is no
-      # longer a workspace member here.
-      - name: Run benches
-        run: cargo test -p bitty-perf --benches --locked
+      # bitty-perf benches; nextest runs none of them, so that coverage is
+      # kept explicitly here, now executed in the pinned external bitty-perf
+      # checkout (W-105 thin gate). The bitty-ipc example moved with the
+      # CTX-1585 extraction to the independent bitty-ipc repository (own CI)
+      # and is no longer a workspace member here.
+      - name: Run benches (pinned bitty-perf suite)
+        working-directory: external/bitty-perf
+        run: cargo test --benches --locked
 
-      # CTX-0918: the default nextest run covers the compiled-out
-      # `bitty dev trace` error path; rerun the CLI suite with the opt-in
-      # `dev-perf` feature so the trace success paths stay covered.
-      - name: Run bitty dev trace tests (dev-perf feature)
-        run: cargo test -p bitty-terminal --features dev-perf --test cli_dev --locked
-
-      # CTX-0922: same split for the opt-in `dev-tools` feature; rerun the CLI
-      # suite and the `dev::` unit tests so the tool success paths stay covered.
+      # CTX-0922: the default nextest run only covers the compiled-out
+      # `bitty dev` paths; rerun the CLI suite and the `dev::` unit tests
+      # with the opt-in `dev-tools` feature so the tool success paths stay
+      # covered. (`bitty dev trace` has no enabling feature since the W-105
+      # relocation; its disabled diagnostic is covered by the default run.)
       - name: Run bitty dev tool tests (dev-tools feature)
         run: |
           cargo test -p bitty-terminal --features dev-tools --test cli_dev --locked
@@ -178,9 +203,19 @@ jobs:
       # compatibility-milestone performance requirement (no pathological
       # regression versus plain-text throughput). The check is bounded
       # (512 KiB/corpus, 3 rounds), deterministic, and headless; the ratio gate
-      # is deliberately generous so shared runners do not flake.
+      # is deliberately generous so shared runners do not flake. Executes in
+      # the pinned external bitty-perf checkout (W-105 thin gate).
       - name: Check parser throughput regression (M1-11 baseline)
-        run: cargo test -p bitty-perf --test parser_throughput_regression --locked
+        working-directory: external/bitty-perf
+        run: cargo test --test parser_throughput_regression --locked
+
+      # W-105: the external compat-lab suite vendors product test/scenario
+      # snapshots (fixtures/); this fails when they drift from this workspace.
+      - name: Check compat fixture freshness
+        run: bash scripts/check-compat-fixture-freshness.sh --lab-dir external/bitty-compat-lab
+
+      - name: Check compat fixture gate (fixture test)
+        run: bash scripts/tests/check-compat-fixture-freshness.test.sh
 
       - name: Check status drift gate (OQ/RFC/crate-count/submodule)
         run: |
@@ -277,9 +312,35 @@ jobs:
     timeout-minutes: 30
     env:
       DISPLAY: :99
+      # W-105: compat-lab suites run from this pinned checkout (see the
+      # validation-pins steps below); runtime M1 suites run in-workspace.
+      BITTY_COMPAT_LAB_DIR: external/bitty-compat-lab
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve validation pins
+        id: validation-pins
+        run: |
+          set -a
+          . ./validation-pins.env
+          set +a
+          echo "compat-lab-rev=$BITTY_COMPAT_LAB_REV" >> "$GITHUB_OUTPUT"
+          echo "perf-rev=$BITTY_PERF_REV" >> "$GITHUB_OUTPUT"
+
+      - name: Check out pinned bitty-perf suite
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: bitty-terminal/bitty-perf
+          ref: ${{ steps.validation-pins.outputs.perf-rev }}
+          path: external/bitty-perf
+
+      - name: Check out pinned bitty-compat-lab suite
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: bitty-terminal/bitty-compat-lab
+          ref: ${{ steps.validation-pins.outputs.compat-lab-rev }}
+          path: external/bitty-compat-lab
 
       # HK-07: cache downloaded .deb archives across runs (key = OS + the
       # package lists in this file). Install steps below still run
@@ -352,12 +413,15 @@ jobs:
         run: xvfb-run -a cargo test -p bitty-platform --test headless_run --test winit_window --locked
 
       # CTX-0847: the previous `--all-targets` run also executed the bitty-perf
-      # benches; nextest runs none of them, so keep that coverage explicitly
-      # here (headless, opt-in benches exit 0 with UNMEASURED without their
-      # BITTY_PERF_* env gates). The bitty-ipc example moved with the
-      # CTX-1585 extraction to the independent bitty-ipc repository (own CI).
-      - name: Run benches (X11)
-        run: cargo test -p bitty-perf --benches --locked
+      # benches; nextest runs none of them, so that coverage is kept
+      # explicitly here (headless, opt-in benches exit 0 with UNMEASURED
+      # without their BITTY_PERF_* env gates), executed in the pinned
+      # external bitty-perf checkout (W-105 thin gate). The bitty-ipc example
+      # moved with the CTX-1585 extraction to the independent bitty-ipc
+      # repository (own CI).
+      - name: Run benches (X11, pinned bitty-perf suite)
+        working-directory: external/bitty-perf
+        run: cargo test --benches --locked
 
       # M1-10 / CTX-0574: run the M1 evidence suites by name so a
       # per-platform regression is a distinct, reported result instead of
@@ -400,9 +464,35 @@ jobs:
     env:
       WAYLAND_DISPLAY: wayland-0
       XDG_SESSION_TYPE: wayland
+      # W-105: compat-lab suites run from this pinned checkout (see the
+      # validation-pins steps below); runtime M1 suites run in-workspace.
+      BITTY_COMPAT_LAB_DIR: external/bitty-compat-lab
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve validation pins
+        id: validation-pins
+        run: |
+          set -a
+          . ./validation-pins.env
+          set +a
+          echo "compat-lab-rev=$BITTY_COMPAT_LAB_REV" >> "$GITHUB_OUTPUT"
+          echo "perf-rev=$BITTY_PERF_REV" >> "$GITHUB_OUTPUT"
+
+      - name: Check out pinned bitty-perf suite
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: bitty-terminal/bitty-perf
+          ref: ${{ steps.validation-pins.outputs.perf-rev }}
+          path: external/bitty-perf
+
+      - name: Check out pinned bitty-compat-lab suite
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: bitty-terminal/bitty-compat-lab
+          ref: ${{ steps.validation-pins.outputs.compat-lab-rev }}
+          path: external/bitty-compat-lab
 
       # HK-07: cache downloaded .deb archives across runs (key = OS + the
       # package lists in this file). Install steps below still run
@@ -474,11 +564,13 @@ jobs:
         run: cargo test -p bitty-platform --test headless_run --test winit_window --locked
 
       # CTX-0847: the previous `--all-targets` run also executed the bitty-perf
-      # benches; nextest runs none of them, so keep that coverage explicitly
-      # here. The bitty-ipc example moved with the CTX-1585 extraction to the
-      # independent bitty-ipc repository (own CI).
-      - name: Run benches (Wayland)
-        run: cargo test -p bitty-perf --benches --locked
+      # benches; nextest runs none of them, so that coverage is kept
+      # explicitly here, executed in the pinned external bitty-perf checkout
+      # (W-105 thin gate). The bitty-ipc example moved with the CTX-1585
+      # extraction to the independent bitty-ipc repository (own CI).
+      - name: Run benches (Wayland, pinned bitty-perf suite)
+        working-directory: external/bitty-perf
+        run: cargo test --benches --locked
 
       # M1-10 / CTX-0574: Wayland leg of the M1 compatibility matrix. The M1
       # suites are display-independent; the Wayland env above only proves the
@@ -513,9 +605,36 @@ jobs:
     name: macOS ARM64 check and test
     runs-on: macos-15
     timeout-minutes: 30
+    env:
+      # W-105: compat-lab suites run from this pinned checkout (see the
+      # validation-pins steps below); runtime M1 suites run in-workspace.
+      BITTY_COMPAT_LAB_DIR: external/bitty-compat-lab
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve validation pins
+        id: validation-pins
+        run: |
+          set -a
+          . ./validation-pins.env
+          set +a
+          echo "compat-lab-rev=$BITTY_COMPAT_LAB_REV" >> "$GITHUB_OUTPUT"
+          echo "perf-rev=$BITTY_PERF_REV" >> "$GITHUB_OUTPUT"
+
+      - name: Check out pinned bitty-perf suite
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: bitty-terminal/bitty-perf
+          ref: ${{ steps.validation-pins.outputs.perf-rev }}
+          path: external/bitty-perf
+
+      - name: Check out pinned bitty-compat-lab suite
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: bitty-terminal/bitty-compat-lab
+          ref: ${{ steps.validation-pins.outputs.compat-lab-rev }}
+          path: external/bitty-compat-lab
 
       # The pinned channel lives in rust-toolchain.toml; resolve it instead of
       # repeating the literal so the workflow tracks the file.
@@ -569,19 +688,22 @@ jobs:
         run: cargo test -p bitty-platform --test headless_run --test winit_window --locked
 
       # CTX-0922: the default nextest run only covers the compiled-out
-      # `bitty dev` paths; rerun the CLI tests with the opt-in features so
-      # the dev-tool and trace success paths keep macOS coverage.
-      - name: Run bitty dev CLI tests (macOS ARM64, dev-tools and dev-perf features)
+      # `bitty dev` paths; rerun the CLI tests with the opt-in dev-tools
+      # feature so the dev-tool success paths keep macOS coverage.
+      # (`bitty dev trace` has no enabling feature since the W-105
+      # relocation; its disabled diagnostic is covered by the default run.)
+      - name: Run bitty dev CLI tests (macOS ARM64, dev-tools feature)
         run: |
           cargo test -p bitty-terminal --features dev-tools --test cli_dev --locked
-          cargo test -p bitty-terminal --features dev-perf --test cli_dev --locked
 
       # CTX-0847: the previous `--all-targets` run also executed the bitty-perf
-      # benches; nextest runs none of them, so keep that coverage explicitly
-      # here. The bitty-ipc example moved with the CTX-1585 extraction to the
-      # independent bitty-ipc repository (own CI).
-      - name: Run benches (macOS ARM64)
-        run: cargo test -p bitty-perf --benches --locked
+      # benches; nextest runs none of them, so that coverage is kept
+      # explicitly here, executed in the pinned external bitty-perf checkout
+      # (W-105 thin gate). The bitty-ipc example moved with the CTX-1585
+      # extraction to the independent bitty-ipc repository (own CI).
+      - name: Run benches (macOS ARM64, pinned bitty-perf suite)
+        working-directory: external/bitty-perf
+        run: cargo test --benches --locked
 
       # M1-10 / CTX-0574: macOS ARM64 leg of the M1 compatibility matrix. The
       # suites are headless and free of window/font/GPU dependencies, so the
@@ -668,9 +790,29 @@ jobs:
     name: Windows check and test
     runs-on: windows-latest
     timeout-minutes: 30
+    env:
+      # W-105: compat-lab suites run from this pinned checkout (see the
+      # validation-pins steps below); runtime M1 suites run in-workspace.
+      BITTY_COMPAT_LAB_DIR: external/bitty-compat-lab
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve validation pins
+        id: validation-pins
+        shell: bash
+        run: |
+          set -a
+          . ./validation-pins.env
+          set +a
+          echo "compat-lab-rev=$BITTY_COMPAT_LAB_REV" >> "$GITHUB_OUTPUT"
+
+      - name: Check out pinned bitty-compat-lab suite
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: bitty-terminal/bitty-compat-lab
+          ref: ${{ steps.validation-pins.outputs.compat-lab-rev }}
+          path: external/bitty-compat-lab
 
       # The pinned channel lives in rust-toolchain.toml; resolve it instead of
       # repeating the literal so the workflow tracks the file.
@@ -727,13 +869,14 @@ jobs:
         run: cargo test -p bitty-platform --test headless_run --test winit_window --locked
 
       # CTX-0922: the default nextest run only covers the compiled-out
-      # `bitty dev` paths; rerun the CLI tests with the opt-in features so
-      # the dev-tool and trace success paths keep Windows coverage.
-      - name: Run bitty dev CLI tests (dev-tools and dev-perf features)
+      # `bitty dev` paths; rerun the CLI tests with the opt-in dev-tools
+      # feature so the dev-tool success paths keep Windows coverage.
+      # (`bitty dev trace` has no enabling feature since the W-105
+      # relocation; its disabled diagnostic is covered by the default run.)
+      - name: Run bitty dev CLI tests (dev-tools feature)
         shell: bash
         run: |
           cargo test -p bitty-terminal --features dev-tools --test cli_dev --locked
-          cargo test -p bitty-terminal --features dev-perf --test cli_dev --locked
 
       # M1-10 / CTX-0574: Windows x86_64 (ConPTY) leg of the M1 compatibility
       # matrix, the third ADR-0002 Tier 1 platform. `shell: bash` selects the

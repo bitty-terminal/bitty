@@ -64,7 +64,7 @@ fn stderr_text(output: &Output) -> String {
 }
 
 /// Asserts a versioned `dev` success envelope on stdout (single JSON value).
-#[cfg(any(feature = "dev-perf", feature = "dev-tools"))]
+#[cfg(feature = "dev-tools")]
 fn assert_dev_envelope(stdout: &str, verb: &str) {
     let trimmed = stdout.trim();
     assert!(
@@ -141,72 +141,13 @@ fn unknown_verb_names_valid_set() {
     assert!(output.stdout.is_empty());
 }
 
-#[cfg(feature = "dev-perf")]
+/// W-105 relocation (bitty CTX-0931): trace measurement lives in the external
+/// `bitty-perf` validation suite and is never linked into this binary, so the
+/// trace verb stays parseable but always fails closed with a clear diagnostic
+/// instead of vanishing. Measurement success-path coverage lives with the
+/// harness (its unit tests, benches, and regression gate).
 #[test]
-fn trace_startup_table_reports_phases() {
-    let output = spawn_dev(&["dev", "trace", "startup"], &[]);
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "trace startup must exit 0, stderr={:?}",
-        stderr_text(&output)
-    );
-    let stdout = stdout_text(&output);
-    for phase in ["args_parse", "runtime_create", "first_frame_presented"] {
-        assert!(stdout.contains(phase), "missing {phase}: {stdout:?}");
-    }
-    assert!(stdout.contains("verdict:"), "verdict: {stdout:?}");
-}
-
-#[cfg(feature = "dev-perf")]
-#[test]
-fn trace_startup_json_envelope() {
-    let output = spawn_dev(&["dev", "trace", "startup", "--format", "json"], &[]);
-    assert_eq!(output.status.code(), Some(0));
-    let stdout = stdout_text(&output);
-    assert_dev_envelope(&stdout, "trace");
-    assert!(stdout.contains("\"phases\":"), "phases: {stdout:?}");
-    assert!(stdout.contains("\"total_ms\":"), "total: {stdout:?}");
-}
-
-#[cfg(feature = "dev-perf")]
-#[test]
-fn trace_latency_table_and_json() {
-    let output = spawn_dev(&["dev", "trace", "latency", "--iterations", "3"], &[]);
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "trace latency must exit 0, stderr={:?}",
-        stderr_text(&output)
-    );
-    assert!(
-        stdout_text(&output).contains("latency"),
-        "summary: {:?}",
-        stdout_text(&output)
-    );
-    let output = spawn_dev(
-        &[
-            "dev",
-            "trace",
-            "latency",
-            "--iterations",
-            "3",
-            "--format",
-            "json",
-        ],
-        &[],
-    );
-    assert_eq!(output.status.code(), Some(0));
-    let stdout = stdout_text(&output);
-    assert_dev_envelope(&stdout, "trace");
-    assert!(stdout.contains("\"p50_ms\":"), "p50: {stdout:?}");
-}
-
-/// CTX-0918: without the opt-in `dev-perf` feature the trace verb stays
-/// parseable but fails closed with a clear diagnostic instead of vanishing.
-#[cfg(not(feature = "dev-perf"))]
-#[test]
-fn trace_without_dev_perf_feature_fails_with_clear_error() {
+fn trace_without_linked_perf_suite_fails_with_clear_error() {
     for args in [
         vec!["dev", "trace", "startup"],
         vec!["dev", "trace", "latency", "--iterations", "3"],
@@ -220,7 +161,7 @@ fn trace_without_dev_perf_feature_fails_with_clear_error() {
         );
         let stderr = stderr_text(&output);
         assert!(
-            stderr.contains("built without dev-perf feature"),
+            stderr.contains("not linked into this build"),
             "stderr={stderr:?}"
         );
         assert!(output.stdout.is_empty(), "table mode: no stdout");
@@ -230,7 +171,7 @@ fn trace_without_dev_perf_feature_fails_with_clear_error() {
     let stdout = stdout_text(&output);
     assert!(stdout.contains("\"ok\":false"), "envelope: {stdout:?}");
     assert!(
-        stdout.contains("built without dev-perf feature"),
+        stdout.contains("not linked into this build"),
         "envelope: {stdout:?}"
     );
 }

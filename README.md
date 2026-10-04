@@ -221,7 +221,7 @@ authoritative.
 ## Workspace crates
 
 The Core workspace (`Cargo.toml` `[workspace] members`) holds only the
-terminal mechanism and its test and measurement harnesses:
+terminal mechanism and the retained test harnesses:
 
 | Crate                | Role                                                                  |
 | -------------------- | --------------------------------------------------------------------- |
@@ -239,10 +239,16 @@ terminal mechanism and its test and measurement harnesses:
 | `bitty-plugin-host`  | Draft plugin platform host                                            |
 | `bitty-package`      | Package lifecycle and integrity verification                          |
 | `bitty-winjob`       | Win32 Job Object adapter for owned process trees                      |
-| `bitty-perf`         | Performance baseline harness (benches; opt-in for `bitty dev trace`)  |
-| `bitty-compat-lab`   | Headless compatibility lab harness                                    |
 | `bitty-test-support` | Shared test-harness helpers                                           |
 | `bitty-test-vm`      | VM test-tier controller                                               |
+
+Validation suites (external): `bitty-compat-lab` (headless compatibility lab)
+and `bitty-perf` (performance baseline harness and benches) live in their own
+repositories since the W-105 relocation and consume a pinned `bitty` revision;
+they are not workspace members and are never linked into product artifacts.
+The product change path keeps thin required invocations against the pinned
+suite revisions (see `validation-pins.env`, `scripts/m1-matrix.sh`, and
+`scripts/compat-matrix.sh`).
 
 Extension model: `bitty-ipc` (independent repository, pulled as an exact-rev
 git dependency) stays linked as Core's inbound local socket mechanism.
@@ -254,9 +260,9 @@ capabilities run as separately installed, on-demand stdio coprocesses
 dependency-free `bitty-network-wire` codec. The first component is `net`
 (`bitty-net`, built from the bitty-network repository); the Lua-facing
 request surface is a follow-up.
-`bitty dev trace` links `bitty-perf` only when `bitty-terminal` is built with
-the opt-in `dev-perf` cargo feature; otherwise the verb reports
-`built without dev-perf feature`. Likewise `bitty dev capture|synthesize|dump|overlay`
+`bitty dev trace` measurement lives in the external `bitty-perf` validation
+suite and is never linked into this binary; the verb always reports that it
+is not linked into this build (exit 1). Likewise `bitty dev capture|synthesize|dump|overlay`
 are compiled only with the opt-in `dev-tools` feature and otherwise report
 `built without dev-tools feature` (exit 1).
 

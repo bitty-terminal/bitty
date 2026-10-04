@@ -5,3 +5,6 @@
 /target/
 /m1-results/
 /compat-results/
+# W-105: pinned validation-suite checkouts materialized by CI thin gates
+# (and local runs) at external/<suite>; never committed.
+/external/

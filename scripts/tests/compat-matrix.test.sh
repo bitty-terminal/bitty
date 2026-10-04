@@ -51,10 +51,19 @@ expect_exit 2 'unknown aggregate option' aggregate --bogus
 # 3. `run` against a fake cargo, one case per suite outcome. The shim keys off
 #    the `--test <name>` argument and prints a `test result:` line; the
 #    artifact step (`cargo run ... --bin compat_report`) writes the requested
-#    JSON paths so the driver path is exercised end to end.
-mkdir -p "$TMP/bin"
+#    JSON paths so the driver path is exercised end to end. The shim logs
+#    every argv line for the routing assertion below.
+#    W-105 relocation: every suite runs via `--manifest-path
+#    "$BITTY_COMPAT_LAB_DIR/Cargo.toml"`; the driver fails closed when that
+#    checkout is absent, so point it at a stub checkout here (only
+#    `Cargo.toml` presence is probed; the fake cargo answers everything).
+mkdir -p "$TMP/bin" "$TMP/compat-lab"
+: >"$TMP/compat-lab/Cargo.toml"
+: >"$TMP/argv.log"
+export BITTY_COMPAT_LAB_DIR="$TMP/compat-lab"
 cat >"$TMP/bin/cargo" <<'SH'
 #!/usr/bin/env bash
+printf '%s\n' "$*" >>"$ARGV_LOG"
 suite=""
 out_prev=""
 report_path=""
@@ -109,6 +118,7 @@ esac
 SH
 chmod +x "$TMP/bin/cargo"
 export PATH="$TMP/bin:$PATH"
+export ARGV_LOG="$TMP/argv.log"
 
 # 3a. All suites green -> exit 0, a PASS table row per suite, and artifacts.
 if ! out="$("$SCRIPT" run --platform linux-x11 --out "$TMP/green.tsv" --report "$TMP/green-report.json" --matrix "$TMP/green-matrix.json" 2>&1)"; then
@@ -129,6 +139,26 @@ for artifact in "$TMP/green-report.json" "$TMP/green-matrix.json"; do
     FAIL=1
   fi
 done
+
+# 3a2. Routing: every release-matrix suite (and the report binary) runs
+#      through the pinned external checkout, never in this workspace.
+for suite in compat_matrix compare oracle report harness dogfooding_corpus vertical_slice_gates live_compat; do
+  if ! grep -F -- "--test $suite" "$TMP/argv.log" | grep -qF -- "--manifest-path $TMP/compat-lab/Cargo.toml"; then
+    echo "FAIL: $suite did not route through the compat-lab checkout" >&2
+    FAIL=1
+  fi
+done
+if ! grep -F -- "--bin compat_report" "$TMP/argv.log" | grep -qF -- "--manifest-path $TMP/compat-lab/Cargo.toml"; then
+  echo "FAIL: compat_report did not route through the compat-lab checkout" >&2
+  FAIL=1
+fi
+
+# 3a3. Fail-closed routing: with no compat-lab checkout the leg fails (exit
+#      non-zero) instead of silently running zero compat-lab suites.
+if BITTY_COMPAT_LAB_DIR="$TMP/absent" "$SCRIPT" run --platform linux-x11 --out "$TMP/missing.tsv" >/dev/null 2>&1; then
+  echo "FAIL: missing compat-lab checkout was accepted" >&2
+  FAIL=1
+fi
 
 # 3b. A failing suite -> exit 1 and a fail row.
 if FAKE_COMPAT_FAIL=live "$SCRIPT" run --platform macos --out "$TMP/red.tsv" --report "$TMP/red-report.json" --matrix "$TMP/red-matrix.json" >/dev/null 2>&1; then

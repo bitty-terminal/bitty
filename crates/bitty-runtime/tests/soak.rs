@@ -23,9 +23,9 @@
 //! resource is absent, so CI stays green.
 //!
 //! The hyprctl+grim capture leg is automated by the PERF-09 soak chain
-//! (`scripts/real-render-soak.sh`, planned by
-//! `crates/bitty-perf/src/real_soak.rs` with the runbook at
-//! `crates/bitty-perf/baselines/real-soak-evidence.md`): on a Tier 1
+//! (`scripts/real-render-soak.sh`, planned by the `bitty-perf` validation
+//! repository's `crates/bitty-perf/src/real_soak.rs` with the runbook at
+//! `crates/bitty-perf/baselines/real-soak-evidence.md` there): on a Tier 1
 //! Hyprland host the script drives a real window, screenshots it with
 //! `grim`, and pairs every pixel capture with a DevTools-preferred
 //! `bitty ctl terminal text` snapshot plus an RSS sample. The headless

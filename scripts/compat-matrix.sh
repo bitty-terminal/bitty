@@ -2,7 +2,8 @@
 # compat-matrix.sh — CTX-0692 release compatibility matrix runner and Tier 1 aggregator.
 #
 # PERF-11 (#1065) automation for the 14 surfaces x 4 terminals release matrix
-# (`crates/bitty-compat-lab/src/matrix.rs`): shell/tmux/nvim/fzf/htop/ssh/
+# (owned by the `bitty-compat-lab` validation repository since the W-105
+# relocation: `crates/bitty-compat-lab/src/matrix.rs` there): shell/tmux/nvim/fzf/htop/ssh/
 # alt-screen/mouse/resize/OSC/clipboard/Kitty/IME/DPI across Ghostty/Kitty/
 # WezTerm/Alacritty differential.
 #
@@ -37,6 +38,14 @@
 #       $GITHUB_STEP_SUMMARY when set.
 #   compat-matrix.sh platforms
 #   compat-matrix.sh suites
+#
+# Environment:
+#   BITTY_COMPAT_LAB_DIR — checkout of the `bitty-compat-lab` validation
+#     repository at the pinned suite revision (W-105 relocation, bitty
+#     CTX-0931: the release-matrix suites no longer live in this workspace).
+#     Defaults to `$BITTY_WORKSPACE/bitty-compat-lab` when `BITTY_WORKSPACE`
+#     is set, else `../bitty-compat-lab` (sibling of this checkout). The
+#     driver fails closed when the directory holds no suite checkout.
 #
 # Environment (aggregate only): COMPAT_JOB_<PLATFORM> carries
 # `needs.<job>.result` from the workflow so a platform whose job failed
@@ -111,6 +120,36 @@ cmd_suites() {
 # run: execute every release-matrix suite on one platform, emit the JSON
 # artifacts, write the result TSV, and print a per-platform Markdown table
 # so the job log shows the matrix leg directly.
+#
+# Suite location (W-105 relocation): every release-matrix suite runs in the
+# validation repository checkout at the pinned suite revision (see
+# BITTY_COMPAT_LAB_DIR above) via `--manifest-path`, so the roster and
+# floors stay single-sourced here while the suite source lives outside the
+# product graph.
+compat_lab_dir() {
+  local dir="${BITTY_COMPAT_LAB_DIR:-}"
+  if [ -z "$dir" ]; then
+    if [ -n "${BITTY_WORKSPACE:-}" ]; then
+      dir="$BITTY_WORKSPACE/bitty-compat-lab"
+    else
+      dir="../bitty-compat-lab"
+    fi
+  fi
+  printf '%s' "$dir"
+}
+
+require_compat_lab() { # prints the checkout dir, or fails closed
+  local dir
+  dir="$(compat_lab_dir)"
+  if [ ! -f "$dir/Cargo.toml" ]; then
+    printf 'compat-matrix: compat-lab checkout missing (BITTY_COMPAT_LAB_DIR=%s): no %s/Cargo.toml\n' \
+      "$dir" "$dir" >&2
+    printf 'compat-matrix: set BITTY_COMPAT_LAB_DIR to the pinned bitty-compat-lab checkout (see validation-pins.env)\n' >&2
+    return 2
+  fi
+  printf '%s' "$dir"
+}
+
 cmd_run() {
   local platform="local" out="" report="" matrix="" summary="${COMPAT_SUMMARY:-${GITHUB_STEP_SUMMARY:-}}"
   while (($# > 0)); do
@@ -149,6 +188,9 @@ cmd_run() {
   mkdir -p "$(dirname "$out")" "$(dirname "$report")" "$(dirname "$matrix")"
   : >"$out"
 
+  local lab_dir
+  lab_dir="$(require_compat_lab)" || return 2
+
   local entry suite pkg min log rc passed failed ignored status
   local failures=0 table
   table="$(mktemp)"
@@ -160,7 +202,7 @@ cmd_run() {
   for entry in "${COMPAT_SUITES[@]}"; do
     IFS='|' read -r suite pkg min <<<"$entry"
     rc=0
-    log="$(cargo test -p "$pkg" --test "$suite" --locked -- --test-threads=1 2>&1)" || rc=$?
+    log="$(cargo test --manifest-path "$lab_dir/Cargo.toml" -p "$pkg" --test "$suite" --locked -- --test-threads=1 2>&1)" || rc=$?
     passed="$(printf '%s\n' "$log" | sed -n 's/^test result:.* \([0-9][0-9]*\) passed;.*/\1/p' | tail -n 1)"
     failed="$(printf '%s\n' "$log" | sed -n 's/^test result:.* \([0-9][0-9]*\) failed;.*/\1/p' | tail -n 1)"
     ignored="$(printf '%s\n' "$log" | sed -n 's/^test result:.* \([0-9][0-9]*\) ignored.*/\1/p' | tail -n 1)"
@@ -192,7 +234,7 @@ cmd_run() {
 
   # Deterministic machine-readable artifacts for this leg. The report binary
   # exits nonzero on generation failure, which fails the leg.
-  if ! cargo run -p bitty-compat-lab --bin compat_report --locked -- \
+  if ! cargo run --manifest-path "$lab_dir/Cargo.toml" -p bitty-compat-lab --bin compat_report --locked -- \
     --out "$report" --matrix-json "$matrix" >&2; then
     printf '\nartifact emission failed for `%s`\n' "$platform" >&2
     failures=$((failures + 1))

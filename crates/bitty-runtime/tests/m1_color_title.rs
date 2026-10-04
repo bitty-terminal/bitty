@@ -19,9 +19,10 @@
 //!   future change to default colors or title rendering is caught here.
 //!
 //! Oracle: accepted `compatibility-milestone-rfc.md` and
-//! `terminal-state-rfc.md`. The grid-level goldens live in
-//! `crates/bitty-compat-lab/tests/m1_color_golden.rs`; this file is the
-//! runtime/presentation leg.
+//! `terminal-state-rfc.md`. The grid-level goldens live in the
+//! `bitty-compat-lab` validation repository
+//! (`crates/bitty-compat-lab/tests/m1_color_golden.rs` there); this file is
+//! the runtime/presentation leg.
 
 use bitty_runtime::{AnimationPolicy, ColdEvent, PresentStats, Runtime, RuntimeConfig};
 

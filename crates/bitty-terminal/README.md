@@ -21,14 +21,13 @@ libraries, as stated in `src/main.rs`.
   `bitty-runtime`, `bitty-term-state`, and `bitty-vt`; external git
   dependency: `bitty-ipc` (independent repository since CTX-1585), linked as
   Core's inbound local socket mechanism. No agent crate is linked.
-- Opt-in cargo feature `dev-perf` (off by default, CTX-0918) adds the
-  `bitty-perf` dependency for `bitty dev trace startup|latency`. Without it
-  the verb still validates its arguments and then fails with exit 1 and
-  `built without dev-perf feature`.
 - Opt-in cargo feature `dev-tools` (off by default, CTX-0922) compiles
   `bitty dev capture|synthesize|dump|overlay`. Without it the verbs still
   validate their arguments and then fail with exit 1 and
   `bitty dev <verb>: built without dev-tools feature`.
+- `bitty dev trace startup|latency` measurement lives in the external
+  `bitty-perf` validation suite (W-105 relocation) and is never linked here;
+  the verb still validates its arguments and then fails with exit 1.
 - Third-party dependencies, per `Cargo.toml`: `pollster` only; no
   network-facing dependency is declared.
 - Must not own business behavior: grid, parsing, rendering, plugin, and IPC
@@ -52,7 +51,8 @@ libraries, as stated in `src/main.rs`.
   (every `logging::info`/`warn` line is scrubbed before `eprintln!`;
   `secret://` handles stay log-safe).
 - Optional policy (explicit opt-in, default off, safe-mode clean):
-  `bitty dev trace` (needs the `dev-perf` feature),
+  `bitty dev trace` (measured by the external `bitty-perf` validation suite
+  since the W-105 relocation, never linked into this binary),
   `bitty dev capture|synthesize|dump|overlay` (needs the `dev-tools`
   feature), the tick-line verbosity flags above, `BITTY_DEMO_PUMP=1`
   (suppressed under `--safe` with one explicit warning), and

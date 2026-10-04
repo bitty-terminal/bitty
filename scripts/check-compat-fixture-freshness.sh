@@ -73,7 +73,7 @@ while IFS=$'\t' read -r file testfn rest; do
     FAIL=1
     continue
   fi
-  if ! grep -qF "fn ${testfn}(" "$ROOT/$file"; then
+  if ! grep -qE "^[[:space:]]*fn ${testfn}\(" "$ROOT/$file"; then
     echo "compat-fixture-freshness: product test gone: $file::${testfn}" >&2
     FAIL=1
   fi
@@ -97,7 +97,7 @@ else
       [[ -z "$line" ]] && continue
       case "$line" in \#*) continue ;; esac
       seen=$((seen + 1))
-      if ! grep -qF "fn live_${line}_" "$clipboard_live"; then
+      if ! grep -qE "^[[:space:]]*fn live_${line}_" "$clipboard_live"; then
         echo "compat-fixture-freshness: live scenario gone: $line" >&2
         FAIL=1
       fi

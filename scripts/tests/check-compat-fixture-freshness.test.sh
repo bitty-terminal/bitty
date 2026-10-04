@@ -69,6 +69,17 @@ expect_exit 2 'missing lab checkout' --lab-dir "$TMP/absent"
 # 8. Usage errors exit 2.
 expect_exit 2 'unknown option' --bogus
 
+# 9. Declaration-anchored matching: a `fn name(` inside a comment or string
+# must not satisfy the gate (CodeRabbit: match declarations, not text).
+if printf '// fn decoy_fn(\nlet s = "fn decoy_fn("; \n' | grep -qE '^[[:space:]]*fn decoy_fn\('; then
+  echo 'FAIL: comment/string decoy satisfied the declaration pattern' >&2
+  FAIL=1
+fi
+if ! printf 'fn decoy_fn(\n    fn decoy_fn(\n' | grep -qE '^[[:space:]]*fn decoy_fn\('; then
+  echo 'FAIL: top-level and indented declarations not matched' >&2
+  FAIL=1
+fi
+
 if ((FAIL)); then
   echo "check-compat-fixture-freshness-test: FAIL" >&2
   exit 1

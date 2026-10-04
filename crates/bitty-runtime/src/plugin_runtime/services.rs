@@ -4319,10 +4319,10 @@ mod tests {
             commands.contains(&resolved),
             "dispatch resolves to the consumer's own typed command id"
         );
-        // Nothing is published: the full flow touches no notification queue.
+        // The targeting flow emits no notifications.
         assert!(
             out_of_tree.notifications.borrow().is_empty(),
-            "targeting must not publish to the Event Bus"
+            "targeting must not emit notifications"
         );
 
         // Per-generation isolation: the other generation holds no session,

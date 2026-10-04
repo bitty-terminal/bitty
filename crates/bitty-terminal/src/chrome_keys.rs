@@ -4399,9 +4399,19 @@ mod tests {
             shift: false,
             super_held: false,
         };
+        // Character events carry their text (the helper defaults to
+        // None): routing must insert into the draft, not just consume.
+        let x_key = KeyEvent {
+            text: Some("x".to_string()),
+            ..test_char_key("x")
+        };
         assert!(
-            app.route_cw_modal(&test_char_key("x"), &keyref(KeyName::Char('x'))),
+            app.route_cw_modal(&x_key, &keyref(KeyName::Char('x'))),
             "fallback session consumes typing while latched"
+        );
+        assert!(
+            app.runtime.cw_composer_content().contains('x'),
+            "typing inserts into the fallback draft"
         );
         // Esc closes the fallback and clears the latch; the plugin still
         // owns the next open.
@@ -4479,6 +4489,12 @@ mod tests {
             shift: false,
             super_held: false,
         };
+        // Character events carry their text (see the dispatch-error test
+        // above): the reopened-session check below must prove insertion.
+        let x_key = KeyEvent {
+            text: Some("x".to_string()),
+            ..test_char_key("x")
+        };
         assert!(
             !app.route_cw_modal(&test_char_key("x"), &keyref(KeyName::Char('x'))),
             "no session open while the editor hosts"
@@ -4499,8 +4515,12 @@ mod tests {
             "reopen latches fallback routing under plugin ownership"
         );
         assert!(
-            app.route_cw_modal(&test_char_key("x"), &keyref(KeyName::Char('x'))),
+            app.route_cw_modal(&x_key, &keyref(KeyName::Char('x'))),
             "reopened session consumes typing"
+        );
+        assert!(
+            app.runtime.cw_composer_content().contains('x'),
+            "typing inserts into the reopened draft"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

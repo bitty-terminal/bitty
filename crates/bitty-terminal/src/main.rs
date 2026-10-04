@@ -229,6 +229,7 @@ mod chrome_keys;
 mod cli;
 mod cmd;
 mod completion;
+mod composer_owner;
 mod config_cli;
 mod config_reload;
 mod ctl;
@@ -882,7 +883,10 @@ fn main() {
     // CTX-0889: publish the live workspace source from the tick loop.
     .with_live_workspaces(live_workspaces)
     // CTX-0892: wire the plugin runtime into the app loop for event delivery.
-    .with_plugin_runtime(plugin_runtime_handle);
+    .with_plugin_runtime(plugin_runtime_handle)
+    // W-103 S-5 (CTX-0929): latch the safe recovery flag so the composer
+    // cutover selects the retained Core path without consulting a VM.
+    .with_safe_mode(args.safe);
     // CTX-0167: the synthetic demo pump stays off in real sessions so
     // startup shows only the shell. Opt-in debug only (`BITTY_DEMO_PUMP=1`).
     // CTX-0926 (W-100 first slice, W-71 observability boundary): the pump is

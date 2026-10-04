@@ -484,7 +484,7 @@ impl TerminalApp {
             // `close_view`): drop the session — the RAII temp goes with it —
             // and reopen the overlay over the kept draft.
             drop(self.chrome.editor.take());
-            self.runtime.cw_composer_open();
+            self.open_retained_composer();
             eprintln!(
                 "warning: composer external editor pane closed — draft kept, session reopened"
             );
@@ -583,7 +583,7 @@ impl TerminalApp {
         {
             self.runtime.set_focus(session.return_focus);
         }
-        self.runtime.cw_composer_open();
+        self.open_retained_composer();
         // `session.temp` drops here: the temp file is unlinked in all cases.
         drop(session);
     }

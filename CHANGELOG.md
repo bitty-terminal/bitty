@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- **Core tab-strip projection (CTX-0930, #1620, W-104):** the candidate Core-side
+  tab order (`crates/bitty-ui/src/tab_strip.rs`: `TabStrip`, `TabScope`,
+  `TabCell`, `TabError`, `MAX_TABS_PER_STRIP`, open/close/reorder/move-to,
+  snapshot/restore) is deleted and tabs presentation is owned by the `bar`
+  plugin over Core panel/workspace mechanisms. Core draws no tab-strip
+  chrome with zero plugins or in `bitty --safe` (the grid keeps every row;
+  `status_bar_band` stays `None`; no hidden presentation remains).
+  Downstream `bitty_ui::tab_strip` imports fail at compile time with the
+  removal pointing here; the `tabs` alias shim (`crates/bitty-runtime/src/tabs.rs`,
+  `bitty-terminal.tabs` id/commands, `tabline` claim, `TABS_*`) stays
+  deprecated until the documented `>= v0.2.0` floor per ADR-0017 and is not
+  deleted ahead of the window. Retained as host mechanisms: workspace
+  lifecycle/state/commands/events, `LayoutNode::Stack` display order plus
+  identity slots (`panel_identity::tab_label`), persist snapshots, the
+  generic chrome geometry/slot mechanism with `ChromeKind::TabStrip` kept as
+  the generic accessibility classification, `chrome.tab.*` theme tokens,
+  the hidden scratchpad slot with the CTX-0954 `scratchpad_count` /
+  `scratchpad_occupied` occupancy surface under `workspace.read`, and the
+  `workspace.show_bar` / `workspace.bar.edge` settings (pending the W-26/W-27
+  migration). No keymap changes: the strip held no bindings (DEC-W144-1
+  honored, bindings stay data-driven). Tests migrated to mechanism-level
+  assertions with no coverage deleted (`pw_series` Stack order plus identity
+  joins and leaf-id round-trips; the no-plugin baseline stays pinned in
+  `statusbar_row` / `chrome_bands_render`).
+
 - **Core search and copy-mode policy (CTX-0937, #1624, W-144):** the
   built-in search UI flows, copy-mode modal policy, and Core-default
   keybindings now belong to the search (`search@e65bf83`, CTX-0004 live

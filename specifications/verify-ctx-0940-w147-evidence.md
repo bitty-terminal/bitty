@@ -9,7 +9,7 @@
 
 Scope is the verification gate only: prove the small-core program end-state.
 No product code was changed. The single added file is test evidence
-(`crates/bitty-terminal/tests/verify_w147_small_core_graph.rs`, 8 tests) plus
+(`crates/bitty-terminal/tests/verify_w147_small_core_graph.rs`, 9 tests) plus
 this report. No echte regressions were found; everything else is filed as
 tracked follow-up issues (see §6).
 
@@ -93,7 +93,7 @@ the gate revision with
   environmental measurements, not gate failures; the suite's own assertions
   pass.)
 - dev-tools slices: `cli_dev` **27 passed**; `bin bitty dev::` **22 passed**.
-- New W-147 module `verify_w147_small_core_graph`: **8/8 pass**.
+- New W-147 module `verify_w147_small_core_graph`: **9/9 pass**.
 - Pre-checks green: `cargo fmt --check` clean,
   `cargo clippy -p bitty-terminal --all-targets` clean, `actionlint` clean.
 - `just ci-local` (Quality gates via act, `bitty-act` image, per-branch cache):

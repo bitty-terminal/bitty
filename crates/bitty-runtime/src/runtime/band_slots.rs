@@ -32,19 +32,18 @@
 //! affects placement, and `statusline` and `bottom` surfaces share one
 //! ordering. The `chrome.<edge>.order` key is not yet wired into the runtime.
 //!
-//! Core reservation: plugin bands start inward of the rows the Core
-//! workspaceline band reserves on the same edge
-//! ([`crate::Runtime::status_bar_band`], solved once by
-//! `chrome_band::solve`), so with `workspace.bar.edge = bottom` (default) and
-//! two or more workspaces bottom band `0` sits on row `H-2`, never on the
-//! Core bar row `H-1`; the same holds for top bands with `edge = top`. See
-//! [`crate::Runtime::plugin_band_row`].
+//! Core reservation: the Core workspace bar is retired (W-104/CTX-0956:
+//! the `bar` plugin owns workspace/status UX), so Core reserves zero rows
+//! on every edge ([`crate::Runtime::status_bar_band`] always returns
+//! `None`, solved once by `chrome_band::solve`). Plugin bands therefore
+//! start at the window edge: with the default bottom edge, bottom band `0`
+//! sits on row `H-1`. See [`crate::Runtime::plugin_band_row`].
 //!
 //! Exclusive zone (CTX-0946 C3, closed): visible plugin bands shrink the
 //! layout container through [`Runtime::band_exclusive_container`]
 //! (see [`super::band_host`]), so no terminal cell is ever painted under a
 //! band. The reservation flows through the normal reflow path, resizing
-//! grids and PTY winsizes exactly like the Core workspaceline band.
+//! grids and PTY winsizes.
 //!
 //! Known gaps (tracked follow-ups, not implemented here):
 //!
@@ -182,8 +181,9 @@ impl ChromeBands {
 
     /// Window row (cells) painted by horizontal band `index` on `edge` in a
     /// window `window_rows` tall, stacking from the edge inward and starting
-    /// inward of the `core_reserved` rows the Core workspaceline band holds
-    /// on that edge; `None` for a vertical edge or a band that does not fit.
+    /// inward of the `core_reserved` rows Core holds on that edge (zero on
+    /// every edge since the Core bar retired); `None` for a vertical edge
+    /// or a band that does not fit.
     #[must_use]
     pub fn band_row(
         edge: BandEdge,
@@ -204,8 +204,9 @@ impl ChromeBands {
 }
 
 impl Runtime {
-    /// Rows the Core workspaceline band reserves on horizontal `edge`
-    /// (`0` when no band is reserved there or for a vertical edge).
+    /// Rows Core reserves on horizontal `edge` (`0` on every edge since the
+    /// Core workspace bar retired in W-104/CTX-0956, and `0` for a vertical
+    /// edge).
     ///
     /// Derived from the single chrome solve ([`Self::status_bar_band`]), so
     /// plugin band stacking can never drift from the Core reservation.
@@ -223,9 +224,10 @@ impl Runtime {
         }
     }
 
-    /// Window row painted by visible plugin band `index` on `edge`, offset
-    /// inward of the Core workspaceline band on that edge (see
-    /// [`ChromeBands::band_row`]); `None` when it does not fit.
+    /// Window row painted by visible plugin band `index` on `edge`,
+    /// stacking from the window edge inward (Core reserves zero rows since
+    /// the bar retired; see [`ChromeBands::band_row`]); `None` when it does
+    /// not fit.
     ///
     /// `index` counts visible (non-empty-text) bands only: hidden bands
     /// take no stacking row (CTX-0946 C3, CTX-0925 item 3), so `index >=

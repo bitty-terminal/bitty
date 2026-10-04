@@ -52,19 +52,12 @@ use bitty_plugin_host::{BoundedText, EventPayload};
 /// Maximum workspaces (mirrors `registry::MAX_WORKSPACES_PER_WINDOW`).
 pub const MAX_WORKSPACES: usize = 16;
 
-/// Maximum workspace name characters shown in the workspaceline.
+/// Maximum workspace name characters shown in the workspaceline data string.
 pub const WORKSPACE_NAME_MAX_CHARS: usize = 32;
 
-/// Hard bound on the rendered workspaceline string.
+/// Hard bound on the rendered workspaceline data string (shared by the
+/// `ctl` output and the text contract the `bar` plugin mirrors).
 pub const WORKSPACELINE_MAX_CHARS: usize = 1024;
-
-/// Height of the workspace status bar band in window rows (issue #1349).
-///
-/// CTX-0873 (#1431): the bar owns a Core-reserved chrome band at the
-/// configured window edge ([`crate::config::BarEdge`]); the layout container
-/// excludes it, so terminal content is never painted under the bar and grid
-/// truth is never mutated.
-pub const STATUS_BAR_ROWS: usize = 1;
 
 /// One workspace: name plus stashed layout + focus.
 #[derive(Debug, Clone)]
@@ -437,9 +430,9 @@ impl Runtime {
     }
 
     /// One rendered token per workspace slot (`{1-based}:{name}[*]`), in
-    /// index order. Shared by [`Self::workspaceline_text`] and
-    /// [`Self::workspaceline_hit_test`] so the bar text and its click
-    /// columns can never drift apart.
+    /// index order. Shared by [`Self::workspaceline_text`] so the data
+    /// string the `bar` plugin mirrors and the `ctl` output stay on one
+    /// token layout.
     fn workspaceline_tokens(&self) -> Vec<String> {
         self.workspaces
             .iter()
@@ -458,11 +451,10 @@ impl Runtime {
     /// Whether the workspace switcher bar is enabled (issue #1333).
     ///
     /// Default-on: seeded from [`crate::config::RuntimeConfig::workspaceline_visible`]
-    /// at construction. Presentation-only; toggling changes no workspace,
-    /// focus, or session state. Note CTX-0838 (#1441): even when enabled,
-    /// [`Self::status_bar_text`]/[`Self::workspaceline_present`] hide the
-    /// lone-workspace bar (compositor already shows it); the flag is the
-    /// opt-out gate, not a force-show.
+    /// at construction. Retained pending the W-26/W-27 settings migration
+    /// (map-to-plugin or remove): since W-104/CTX-0956 retired the Core bar,
+    /// no Core chrome reads this flag, so toggling reserves or releases no
+    /// band and changes no workspace, focus, or session state.
     #[must_use]
     pub fn workspaceline_visible(&self) -> bool {
         self.workspaceline_visible
@@ -471,23 +463,31 @@ impl Runtime {
     /// Live-toggle the switcher bar (opt-out path for `workspace.show_bar`).
     /// Presentation-only; always succeeds.
     ///
-    /// CTX-0873: toggling reserves or releases the chrome band, so the
-    /// container, leaves, primary grid, and PTY winsizes reflow at once.
+    /// Retained pending the W-26/W-27 settings migration. The Core bar is
+    /// retired (W-104/CTX-0956: the `bar` plugin owns workspace/status UX),
+    /// so this re-solves chrome (plugin exclusive zone) and flags a redraw
+    /// without reserving or releasing any Core band.
     pub fn set_workspaceline_visible(&mut self, visible: bool) {
         self.workspaceline_visible = visible;
         self.refresh_chrome_band();
         self.pending_full_redraw = true;
     }
 
-    /// Window edge of the workspace bar band (CTX-0873 `workspace.bar.edge`).
+    /// Retained window-edge setting for the retired Core bar band
+    /// (CTX-0873 `workspace.bar.edge`; migration owned by W-26/W-27).
+    ///
+    /// Since W-104/CTX-0956 retired the Core bar, no Core chrome reads
+    /// this edge; plugin bands solve their own rows from the window edge.
     #[must_use]
     pub fn workspace_bar_edge(&self) -> crate::config::BarEdge {
         self.workspace_bar_edge
     }
 
-    /// Live-moves the workspace bar band to `edge` (CTX-0873). Reflows the
-    /// container and every grid/PTY when the band is present; always
-    /// succeeds.
+    /// Live-moves the retired workspace bar band to `edge` (CTX-0873).
+    ///
+    /// Retained pending the W-26/W-27 settings migration; always succeeds
+    /// and re-solves chrome (plugin exclusive zone) without moving any
+    /// Core band.
     pub fn set_workspace_bar_edge(&mut self, edge: crate::config::BarEdge) {
         if edge == self.workspace_bar_edge {
             return;
@@ -497,162 +497,18 @@ impl Runtime {
         self.pending_full_redraw = true;
     }
 
-    /// The reserved workspace bar band in window cells, or `None` when no
-    /// band is reserved (bar hidden, a lone workspace, or a window too small
-    /// to keep content rows — CTX-0873).
+    /// Retired Core bar band query (W-104/CTX-0956).
     ///
-    /// Shared by the present path, the mouse routing, and headless tests so
-    /// the drawn band and its click geometry can never drift apart.
+    /// The Core workspace bar is deleted: the `bar` plugin owns
+    /// workspace/status UX over the generic band mechanism, so no Core band
+    /// is ever reserved and this always returns `None`. Retained as the
+    /// geometry seam so the present path, the mouse routing, the plugin
+    /// offset math ([`Runtime::core_reserved_rows`]), and headless tests
+    /// keep one reservation source: with no Core band every edge reserves
+    /// zero Core rows and plugin bands start at the window edge.
     #[must_use]
     pub fn status_bar_band(&self) -> Option<UiRect> {
         self.chrome_layout().bar
-    }
-
-    /// The bar string as chrome should present it, or `None` when opted
-    /// out or when only one workspace exists.
-    ///
-    /// CTX-0838 (#1441): legacy alias merged onto [`Self::status_bar_text`]
-    /// (single source — the redundant indicator is one string, not two).
-    /// A lone workspace never presents: the compositor (Hyprland/Waybar)
-    /// already shows it, so `1:ws1* (1)` adds no information. The data path
-    /// [`Self::workspaceline_text`] still renders for `ctl`/tabline; only
-    /// the chrome present hides. The full Ghostty-style tabs strip
-    /// (placement, drag, colors) stays in #1431.
-    #[must_use]
-    pub fn workspaceline_present(&self) -> Option<String> {
-        self.status_bar_text()
-    }
-
-    /// StatusBar text as chrome should present it, or `None` when opted
-    /// out (issue #1349) or when only one workspace exists (CTX-0838 #1441).
-    ///
-    /// v1 composes the `workspace` module only (status-system design:
-    /// event-driven, fail-closed em-dash when no workspace slot exists).
-    /// The `cwd`/`git`/`clock`/metrics slots compose here once their
-    /// snapshots exist; `--safe` needs no stripping because no
-    /// configuration-dependent module is composed yet.
-    ///
-    /// Single-workspace suppression removes the duplication with the
-    /// compositor bar where it adds no information; multi-workspace
-    /// Bitty workspaces live inside one OS window, so the bar presents.
-    #[must_use]
-    pub fn status_bar_text(&self) -> Option<String> {
-        if !self.bar_present() {
-            return None;
-        }
-        if self.workspaces.is_empty() {
-            return Some(String::from("\u{2014}"));
-        }
-        Some(self.workspaceline_text())
-    }
-
-    /// Whether the bar presents (CTX-0873): exactly when
-    /// [`Self::status_bar_text`] is `Some` — visible and either more than
-    /// one workspace or the fail-closed empty-list em-dash — without
-    /// formatting the string. Used by the per-tick chrome solve and the
-    /// bar hit-tests so neither allocates.
-    #[must_use]
-    pub fn bar_present(&self) -> bool {
-        self.workspaceline_visible && self.workspaces.len() != 1
-    }
-
-    /// Maps a bar column (0-based, in characters of
-    /// [`Self::workspaceline_text`]) to a workspace index. `None` when the
-    /// bar is hidden, when only one workspace exists (CTX-0838 #1441: no
-    /// bar to click), when the column lands on a separator or the trailing
-    /// ` (count)` suffix, or when out of range — every unknown target fails
-    /// closed with no state change.
-    #[must_use]
-    pub fn workspaceline_hit_test(&self, column: usize) -> Option<usize> {
-        if !self.bar_present() {
-            return None;
-        }
-        let mut start = 0usize;
-        for (idx, token) in self.workspaceline_tokens().iter().enumerate() {
-            let width = token.chars().count();
-            if column >= start && column < start + width {
-                return Some(idx);
-            }
-            // Single-space separator between tokens.
-            start += width + 1;
-        }
-        None
-    }
-
-    /// Mouse switching (issue #1333): a click at bar `column` switches to
-    /// the hit workspace. Returns `false` (no state change) when the bar is
-    /// hidden, the column hits no workspace, or the column names the
-    /// already-active workspace — including the single-workspace case, so a
-    /// lone workspace can never switch away from itself.
-    pub fn workspaceline_click(&mut self, column: usize) -> bool {
-        let Some(target) = self.workspaceline_hit_test(column) else {
-            return false;
-        };
-        if target == self.active_workspace {
-            return false;
-        }
-        self.workspace_switch(target)
-    }
-
-    /// Routes a left press on the workspace bar band to the workspace
-    /// hit-test (issue #1349, CTX-0808, CTX-0873).
-    ///
-    /// Returns `true` (consume the press) when the last-known cursor sits
-    /// inside the reserved band ([`Self::status_bar_band`]). The band is
-    /// Core chrome outside every terminal frame, so the press is consumed
-    /// before focus-follow and mouse capture: a capturing app never sees it,
-    /// focus never moves, and no selection starts. A consumed press arms the
-    /// one-shot `bar_release_swallow` so the paired release never reaches a
-    /// capturing app as an orphan report. The click itself still fails
-    /// closed through [`Self::workspaceline_click`] (separators, the count
-    /// suffix, and the active workspace switch nothing).
-    ///
-    /// CTX-0873: the band no longer lives inside a leaf, so the old
-    /// alternate-screen skip is gone — a fullscreen app owns every row of
-    /// its own grid, and the bar sits outside that grid, visible and
-    /// clickable.
-    pub(super) fn status_bar_press(&mut self) -> bool {
-        let Some(pos) = self.last_cursor else {
-            return false;
-        };
-        let Some(col) = self.status_bar_hit(pos) else {
-            return false;
-        };
-        self.workspaceline_click(col);
-        self.bar_release_swallow = true;
-        true
-    }
-
-    /// Bar column under physical `pos`, or `None` outside the band (pure
-    /// probe behind [`Self::status_bar_press`]).
-    ///
-    /// The band origin is the window padding plus the band's window-cell
-    /// origin at the live cell metrics — the same translation the present
-    /// path paints the band with.
-    pub(super) fn status_bar_hit(&self, pos: CursorPosition) -> Option<usize> {
-        if !pos.x.is_finite() || !pos.y.is_finite() {
-            return None;
-        }
-        let band = self.status_bar_band()?;
-        let live = self.live_cell_metrics();
-        if live.width == 0 || live.height == 0 || band.is_empty() {
-            return None;
-        }
-        let pad = f64::from(self.window_padding_physical());
-        let cell_w = f64::from(live.width);
-        let cell_h = f64::from(live.height);
-        let origin_x = pad + f64::from(band.x) * cell_w;
-        let origin_y = pad + f64::from(band.y) * cell_h;
-        let band_w = f64::from(band.width) * cell_w;
-        let band_h = f64::from(band.height) * cell_h;
-        if pos.x >= origin_x
-            && pos.x < origin_x + band_w
-            && pos.y >= origin_y
-            && pos.y < origin_y + band_h
-        {
-            return Some(((pos.x - origin_x) / cell_w).floor() as usize);
-        }
-        None
     }
 
     /// Rename workspace `index` (0-based) to `name`.
@@ -1746,78 +1602,70 @@ mod tests {
     }
 
     #[test]
-    fn switcher_bar_renders_by_default_with_opt_out() {
-        // Issue #1333: the bar is enabled on the default config.
-        // CTX-0838 (#1441): a lone workspace never presents (the compositor
-        // already shows it); the data path still renders for ctl/tabline.
+    fn no_core_bar_band_reserves_or_presents() {
+        // W-104/CTX-0956: the Core bar is retired (the `bar` plugin owns
+        // workspace/status UX), so no Core band is ever reserved or
+        // presented. Issue #1333: the switcher flag stays default-on
+        // (retained pending the W-26/W-27 settings migration) but reads
+        // nothing; the data path still renders for ctl/tabline and the
+        // text contract the plugin mirrors.
         let mut rt = fresh();
         assert!(rt.workspaceline_visible());
         assert_eq!(rt.workspaceline_text(), "1:ws1* (1)");
-        assert_eq!(rt.workspaceline_present(), None, "lone workspace hides");
-        assert_eq!(rt.status_bar_text(), None, "merged present hides too");
-        assert_eq!(rt.workspaceline_hit_test(0), None, "no bar to click");
-        // A second workspace presents the merged indicator.
+        assert_eq!(rt.status_bar_band(), None, "lone workspace: no band");
+        assert_eq!(rt.container(), rt.window_cells());
+        // A second workspace still reserves no Core band.
         rt.workspace_new().expect("ws2");
-        let presented = rt
-            .workspaceline_present()
-            .expect("bar presents with two workspaces");
-        assert_eq!(presented, "1:ws1 2:ws2* (2)");
-        assert_eq!(presented, rt.workspaceline_text());
-        assert_eq!(
-            presented,
-            rt.status_bar_text().expect("merged single source")
-        );
-        // Opt-out hides the present string and blinds hit-testing, with no
-        // workspace, focus, or session state change.
-        let mut rt = fresh();
-        rt.workspace_new().expect("ws2");
+        assert_eq!(rt.workspaceline_text(), "1:ws1 2:ws2* (2)");
+        assert_eq!(rt.status_bar_band(), None, "no Core bar with two");
+        assert_eq!(rt.container(), rt.window_cells());
+        // Opt-out changes no geometry and no workspace/focus/session
+        // state; re-enabling restores nothing (nothing was hidden).
         rt.set_workspaceline_visible(false);
         assert!(!rt.workspaceline_visible());
-        assert_eq!(rt.workspaceline_present(), None);
-        assert_eq!(rt.status_bar_text(), None);
-        assert_eq!(rt.workspaceline_hit_test(0), None);
+        assert_eq!(rt.status_bar_band(), None);
+        assert_eq!(rt.container(), rt.window_cells());
         assert_eq!(rt.workspace_count(), 2);
-        // Re-enabling restores the bar (multi-workspace).
         rt.set_workspaceline_visible(true);
-        assert_eq!(
-            rt.workspaceline_present().as_deref(),
-            Some("1:ws1 2:ws2* (2)")
-        );
+        assert_eq!(rt.status_bar_band(), None);
+        assert_eq!(rt.workspaceline_text(), "1:ws1 2:ws2* (2)");
     }
 
     #[test]
-    fn status_bar_composes_workspace_module_with_shared_band_geometry() {
-        // Issue #1349: the composer serves the workspace module and hides
-        // with the same opt-out; the band helper names the reserved window
-        // rows so present, mouse, and tests agree (CTX-0873).
-        // CTX-0838 (#1441): lone-workspace hides (no bar, no reserved row);
-        // the data path still renders.
+    fn workspace_data_path_renders_with_no_core_band() {
+        // The data path (`workspaceline_text`) still renders for
+        // ctl/tabline while Core reserves no row on any workspace count
+        // or visibility setting.
         let rt = fresh();
         assert_eq!(rt.workspaceline_text(), "1:ws1* (1)");
-        assert_eq!(rt.status_bar_text(), None, "lone workspace hides");
         assert_eq!(rt.status_bar_band(), None, "lone workspace reserves no row");
         let window = rt.window_cells();
         let mut rt = fresh();
         rt.workspace_new().expect("ws2");
         assert_eq!(
-            rt.status_bar_text().as_deref(),
-            Some("1:ws1 2:ws2* (2)"),
+            rt.workspaceline_text(),
+            "1:ws1 2:ws2* (2)",
             "workspace module minimum"
         );
         assert_eq!(
             rt.status_bar_band(),
-            Some(UiRect::new(0, window.height - 1, window.width, 1)),
-            "default bottom edge reserves the last window row"
+            None,
+            "two workspaces reserve no Core row"
         );
+        assert_eq!(rt.container(), window, "container keeps the full window");
         let mut hidden = fresh();
         hidden.workspace_new().expect("ws2");
         hidden.set_workspaceline_visible(false);
-        assert_eq!(hidden.status_bar_text(), None);
+        assert_eq!(hidden.workspaceline_text(), "1:ws1 2:ws2* (2)");
         assert_eq!(hidden.status_bar_band(), None);
     }
 
     #[test]
-    fn bar_hit_test_maps_columns_to_workspaces() {
+    fn workspaceline_text_token_layout_is_plugin_contract() {
+        // The token layout the `bar` plugin mirrors over the generic band
+        // mechanism (W-104): `{1-based}:{name}[*]` tokens joined by single
+        // spaces plus the ` (count)` suffix. Pinned here because the
+        // deleted Core hit-test derived its columns from this same layout.
         let mut rt = fresh();
         rt.workspace_new().expect("ws2");
         rt.workspace_new().expect("ws3");
@@ -1825,51 +1673,35 @@ mod tests {
         // Tokens: `1:ws1*` (0..6), sep, `2:ws2` (7..12), sep, `3:ws3`
         // (13..18), then the ` (3)` suffix.
         assert_eq!(rt.workspaceline_text(), "1:ws1* 2:ws2 3:ws3 (3)");
-        assert_eq!(rt.workspaceline_hit_test(0), Some(0));
-        assert_eq!(rt.workspaceline_hit_test(5), Some(0));
-        assert_eq!(rt.workspaceline_hit_test(6), None, "separator fails closed");
-        assert_eq!(rt.workspaceline_hit_test(7), Some(1));
-        assert_eq!(rt.workspaceline_hit_test(11), Some(1));
-        assert_eq!(
-            rt.workspaceline_hit_test(12),
-            None,
-            "separator fails closed"
-        );
-        assert_eq!(rt.workspaceline_hit_test(13), Some(2));
-        assert_eq!(rt.workspaceline_hit_test(17), Some(2));
-        assert_eq!(rt.workspaceline_hit_test(18), None, "suffix fails closed");
-        assert_eq!(
-            rt.workspaceline_hit_test(999),
-            None,
-            "out of range fails closed"
-        );
     }
 
     #[test]
-    fn bar_click_switches_and_fails_closed() {
+    fn workspace_switch_commands_stay_fail_closed() {
+        // W-104/CTX-0956: the Core bar click path
+        // (`workspaceline_click`) is deleted with the bar — clicks route
+        // through the plugin band host (C1). Switching itself stays a Core
+        // mechanism (`workspace_switch`): it works across slots and fails
+        // closed out of range, with no band involved.
         let mut rt = fresh();
         rt.workspace_new().expect("ws2");
         assert!(rt.workspace_switch(0));
-        // Click on ws2's token switches.
-        assert!(rt.workspaceline_click(7));
+        // Switch to ws2 moves the active slot and the data string follows.
+        assert!(rt.workspace_switch(1));
         assert_eq!(rt.active_workspace_index(), 1);
         assert_eq!(rt.workspaceline_text(), "1:ws1 2:ws2* (2)");
-        // Clicking the active workspace is a no-op false.
-        assert!(!rt.workspaceline_click(7));
+        // Switching to the active workspace succeeds with state untouched.
+        assert!(rt.workspace_switch(1));
         assert_eq!(rt.active_workspace_index(), 1);
-        // Separators and out-of-range columns fail closed.
-        assert!(!rt.workspaceline_click(6));
-        assert!(!rt.workspaceline_click(999));
+        // Out-of-range switches fail closed.
+        assert!(!rt.workspace_switch(2));
+        assert!(!rt.workspace_switch(999));
         assert_eq!(rt.active_workspace_index(), 1);
-        // Hidden bar never switches.
-        rt.set_workspaceline_visible(false);
-        assert!(!rt.workspaceline_click(0));
-        assert_eq!(rt.active_workspace_index(), 1);
-        // Single workspace: the only column is the active one, so a click
-        // can never switch away.
+        // Single workspace: the only slot is the active one, so switching
+        // can never leave it.
         let mut solo = fresh();
-        assert!(!solo.workspaceline_click(0));
+        assert!(solo.workspace_switch(0));
         assert_eq!(solo.active_workspace_index(), 0);
+        assert!(!solo.workspace_switch(1));
     }
 
     #[test]
@@ -1897,7 +1729,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_rename_updates_bar_and_fails_closed() {
+    fn workspace_rename_updates_data_and_fails_closed() {
         let mut rt = fresh();
         rt.workspace_new().expect("ws2");
         rt.workspace_rename(1, "editor").expect("rename");
@@ -2136,12 +1968,12 @@ mod tests {
         assert!(!rt.has_pending_ws_close());
     }
 
-    // Issue #1333 live leg: click switching, rename, and within-move
+    // Issue #1333 live leg: command switching, rename, and within-move
     // with a real shell behind the focused pane. None of the switcher ops
-    // may kill or detach the session; the bar follows every op.
+    // may kill or detach the session; the data string follows every op.
     #[test]
     #[cfg(unix)]
-    fn live_switcher_click_rename_and_move_preserve_session() {
+    fn live_switcher_switch_rename_and_move_preserve_session() {
         require_pty!();
         let mut rt = fresh();
         // Two panes in ws1; the second owns a live shell.
@@ -2164,15 +1996,15 @@ mod tests {
         assert!(rt.workspace_switch(0));
         assert!(rt.set_focus(live_id));
         assert_eq!(rt.workspaceline_text(), "1:ws1* 2:ws2 (2)");
-        // Click ws2's token (column 7) switches away; the session survives.
-        assert!(rt.workspaceline_click(7));
+        // Switch to ws2 via the Core command; the session survives.
+        assert!(rt.workspace_switch(1));
         assert_eq!(rt.active_workspace_index(), 1);
         assert!(
             rt.has_pane_session(&live_id),
-            "click must not kill the session"
+            "switch must not kill the session"
         );
-        // Click back to ws1 (column 0) and rename it.
-        assert!(rt.workspaceline_click(0));
+        // Switch back to ws1 and rename it.
+        assert!(rt.workspace_switch(0));
         assert_eq!(rt.active_workspace_index(), 0);
         rt.workspace_rename(0, "live").expect("rename");
         assert_eq!(rt.workspaceline_text(), "1:live* 2:ws2 (2)");

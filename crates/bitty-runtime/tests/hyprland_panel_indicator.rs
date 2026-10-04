@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
-//! CTX-0838 (#1441): Hyprland-style panel creation + single-workspace
-//! indicator suppression.
+//! CTX-0838 (#1441) retirement leg (W-104/CTX-0956): Hyprland-style panel
+//! creation plus the no-Core-bar default.
 //!
 //! Headless regression (no window, adapter, or display server):
 //!
@@ -11,13 +11,11 @@
 //!   `splitTop = height * split_width_multiplier > width` at the default
 //!   multiplier `1.0`. Explicit `new_split:<dir>` keeps its fixed axis;
 //!   Niri-ribbon ordering is out of scope.
-//! - The workspace indicator is a single source: `workspaceline_present`
-//!   delegates to `status_bar_text`. A lone workspace never presents
-//!   (the compositor already shows it); the data path
-//!   `workspaceline_text` still renders for ctl/tabline. Multi-workspace
-//!   presents, hides with the same opt-out, and reserves no row / blinds
-//!   hit-testing when hidden. The full Ghostty-style tabs strip stays in
-//!   #1431.
+//! - Core presents no workspace indicator at any workspace count (the Core
+//!   bar is retired; the `bar` plugin owns workspace/status UX): the data
+//!   path `workspaceline_text` still renders for ctl/tabline, no band is
+//!   ever reserved, and the container keeps the full window. A lone
+//!   workspace is simply the one-workspace case of that default.
 
 use bitty_runtime::{Runtime, SplitAxis, UiRect};
 
@@ -76,54 +74,32 @@ fn panel_axis_unknown_focus_falls_back_to_container() {
 }
 
 #[test]
-fn lone_workspace_hides_the_merged_indicator() {
+fn lone_workspace_presents_no_core_chrome() {
     let rt = fresh();
     // Data still renders for ctl/tabline ...
     assert_eq!(rt.workspaceline_text(), "1:ws1* (1)");
-    // ... but chrome presents nothing: single source, no duplication with
-    // the compositor bar.
-    assert_eq!(rt.workspaceline_present(), None);
-    assert_eq!(rt.status_bar_text(), None);
-    assert_eq!(
-        rt.workspaceline_present(),
-        rt.status_bar_text(),
-        "merged single source must agree"
-    );
-    assert_eq!(rt.status_bar_band(), None, "no reserved row when hidden");
-    assert_eq!(rt.workspaceline_hit_test(0), None, "no bar to click");
+    // ... but Core reserves and presents nothing: no band, full grid.
+    assert_eq!(rt.status_bar_band(), None, "no reserved row when alone");
+    assert_eq!(rt.container(), rt.window_cells());
 }
 
 #[test]
-fn two_workspaces_present_the_merged_indicator() {
+fn two_workspaces_present_no_core_chrome() {
     let mut rt = fresh();
     rt.workspace_new().expect("ws2");
     let text = rt.workspaceline_text();
     assert_eq!(text, "1:ws1 2:ws2* (2)");
+    assert_eq!(rt.status_bar_band(), None, "no Core band with two");
+    assert_eq!(rt.container(), rt.window_cells());
     assert_eq!(
-        rt.workspaceline_present().as_deref(),
-        Some("1:ws1 2:ws2* (2)")
+        rt.workspaceline_text(),
+        "1:ws1 2:ws2* (2)",
+        "data path follows the lifecycle"
     );
-    assert_eq!(
-        rt.status_bar_text().as_deref(),
-        Some("1:ws1 2:ws2* (2)"),
-        "merged single source must agree"
-    );
-    let window = rt.window_cells();
-    assert_eq!(
-        rt.status_bar_band(),
-        Some(bitty_runtime::UiRect::new(
-            0,
-            window.height - 1,
-            window.width,
-            1
-        )),
-        "bottom band reserved (CTX-0873)"
-    );
-    assert_eq!(rt.workspaceline_hit_test(0), Some(0));
-    // Closing back to one hides again.
+    // Closing back to one keeps the default.
     assert!(rt.workspace_switch(0));
     rt.workspace_close_index(2).expect("close ws2");
     assert_eq!(rt.workspace_count(), 1);
-    assert_eq!(rt.workspaceline_present(), None);
-    assert_eq!(rt.status_bar_text(), None);
+    assert_eq!(rt.status_bar_band(), None);
+    assert_eq!(rt.container(), rt.window_cells());
 }

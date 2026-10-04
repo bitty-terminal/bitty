@@ -2241,9 +2241,11 @@ fn runtime_config_inherits_file_focus_follows_mouse() {
 
 #[test]
 fn runtime_config_inherits_workspace_show_bar_opt_out() {
-    // Issue #1333: the switcher bar is default-on; `workspace.show_bar`
+    // Issue #1333: the switcher flag is default-on; `workspace.show_bar`
     // flows file -> effective -> runtime, and absent means the default-on
-    // bar stays (opt-out, not opt-in).
+    // flag stays (opt-out, not opt-in). The flag is retained pending the
+    // W-26/W-27 settings migration; since W-104/CTX-0956 retired the Core
+    // bar it reserves no band either way.
     const { assert!(bitty_runtime::config::DEFAULT_WORKSPACELINE_VISIBLE) }
     use bitty_config::file::{parse_lua_config, resolve_effective};
     use bitty_config::plan::{ConfigSource, LayerKind};
@@ -2259,7 +2261,9 @@ fn runtime_config_inherits_workspace_show_bar_opt_out() {
         cfg.workspaceline_visible,
         "absent key keeps the default-on bar"
     );
-    // Explicit opt-out reaches the runtime and hides the present string.
+    // Explicit opt-out reaches the runtime (settings retained pending the
+    // W-26/W-27 migration); with the Core bar retired (W-104/CTX-0956) the
+    // flag reserves no band and the grid keeps every row.
     let src2 = ConfigSource::new(LayerKind::User, Some("init.lua"));
     let plan2 = parse_lua_config(r#"return { workspace = { show_bar = false } }"#, &src2)
         .expect("opt-out parses");
@@ -2273,7 +2277,7 @@ fn runtime_config_inherits_workspace_show_bar_opt_out() {
     assert!(!cfg2.workspaceline_visible);
     let rt = bitty_runtime::Runtime::new(cfg2).expect("runtime builds");
     assert!(!rt.workspaceline_visible());
-    assert_eq!(rt.workspaceline_present(), None);
+    assert_eq!(rt.status_bar_band(), None);
     assert_eq!(
         merged2.source_of("workspace.show_bar").unwrap().layer,
         bitty_config::plan::LayerKind::User

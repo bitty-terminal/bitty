@@ -1336,18 +1336,21 @@ impl Runtime {
         )
     }
 
-    /// Solved chrome geometry for the current window grid (CTX-0873).
+    /// Solved chrome geometry for the current window grid (CTX-0873,
+    /// CTX-0956).
     ///
-    /// The bar band is reserved exactly when [`Self::bar_present`] holds
-    /// (visible and more than one workspace) and the window keeps the
-    /// effective minimum content extent (see [`chrome_band::solve`]).
+    /// The Core workspace bar is retired (W-104: the `bar` plugin owns
+    /// workspace/status UX), so Core reserves zero rows here — `present`
+    /// is always `false` and `bar` is always `None`. The solve stays as
+    /// the single geometry seam behind [`Runtime::status_bar_band`], and
+    /// plugin bands reflow through the exclusive-zone budget in
+    /// [`Runtime::band_exclusive_container`].
     pub(super) fn chrome_layout(&self) -> chrome_band::ChromeLayout {
-        let thickness = u16::try_from(workspaces::STATUS_BAR_ROWS).unwrap_or(u16::MAX);
         chrome_band::solve(
             self.window_cells,
             self.workspace_bar_edge,
-            thickness,
-            self.bar_present(),
+            0,
+            false,
             self.chrome_min_rows(),
         )
     }

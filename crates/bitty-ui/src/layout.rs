@@ -1404,6 +1404,67 @@ pub fn smart_split_axis(container: Rect, width_multiplier: f32) -> SplitAxis {
     }
 }
 
+/// Raw-aspect bisect axis (CTX-0964, #1698).
+///
+/// Returns [`SplitAxis::Horizontal`] (side-by-side, split right) when
+/// `rect.width >= rect.height`, [`SplitAxis::Vertical`] (stacked, split
+/// down) otherwise. Unlike [`smart_split_axis`] there is deliberately no
+/// [`CELL_ASPECT_RATIO`] correction: the comparison runs on raw cell counts
+/// so a square tie breaks side-by-side and the choice is stable under the
+/// caller-visible grid geometry. Total over all inputs, including empty
+/// bounds (which yield [`SplitAxis::Horizontal`]).
+#[must_use]
+pub fn bisect_split_axis(rect: Rect) -> SplitAxis {
+    if rect.width >= rect.height {
+        SplitAxis::Horizontal
+    } else {
+        SplitAxis::Vertical
+    }
+}
+
+/// Largest-area leaf in `allocations` (CTX-0964, #1698).
+///
+/// Area is `width as u32 * height as u32`; empty allocations yield `None`.
+/// Ties break to the first entry in allocation order (the solver's
+/// deterministic depth-first order), so the choice is stable for the same
+/// tree and container. Pure and total.
+#[must_use]
+pub fn largest_area_leaf(allocations: &[(ViewId, Rect)]) -> Option<(ViewId, Rect)> {
+    let mut best: Option<(ViewId, Rect, u32)> = None;
+    for (id, rect) in allocations {
+        let area = u32::from(rect.width).saturating_mul(u32::from(rect.height));
+        match best {
+            None => best = Some((*id, *rect, area)),
+            Some((_, _, best_area)) if area > best_area => {
+                best = Some((*id, *rect, area));
+            }
+            Some(_) => {}
+        }
+    }
+    best.map(|(id, rect, _)| (id, rect))
+}
+
+/// Combined bisect choice (CTX-0964, #1698): largest-area leaf plus its
+/// raw-aspect axis.
+///
+/// Returns `(Some(target), axis)` for the leaf to split (new pane goes
+/// after it: right for [`SplitAxis::Horizontal`], down for
+/// [`SplitAxis::Vertical`]) or `(None, fallback_axis)` when `allocations`
+/// is empty, where `fallback_axis` is [`bisect_split_axis`] of `fallback`
+/// (usually the container). Splitting the largest leaf in half minimizes
+/// the area delta of the two children versus splitting the whole workspace
+/// root.
+#[must_use]
+pub fn bisect_choice(
+    allocations: &[(ViewId, Rect)],
+    fallback: Rect,
+) -> (Option<ViewId>, SplitAxis) {
+    match largest_area_leaf(allocations) {
+        Some((id, rect)) => (Some(id), bisect_split_axis(rect)),
+        None => (None, bisect_split_axis(fallback)),
+    }
+}
+
 /// Helper used by `focus` for deterministic leaf adjacency.
 #[must_use]
 pub fn overlap_len(a_start: u32, a_len: u32, b_start: u32, b_len: u32) -> u32 {
@@ -1879,6 +1940,110 @@ mod tests {
         assert_eq!(smart_split_axis(bounds, f32::NAN), SplitAxis::Horizontal);
         // Empty bounds are total and deterministic.
         assert_eq!(smart_split_axis(Rect::zero(), 1.0), SplitAxis::Horizontal);
+    }
+
+    #[test]
+    fn bisect_split_axis_uses_raw_cell_aspect() {
+        // CTX-0964 (#1698): raw `width >= height` with no 2.0 correction.
+        // Wide and square tie break side-by-side (split right); tall stacks
+        // (split down). The 80x40 case differs from `smart_split_axis`
+        // on purpose: smart sees it as square (40 * 2.0 == 80, tie) while
+        // bisect sees raw 80 >= 40.
+        assert_eq!(
+            bisect_split_axis(Rect::new(0, 0, 80, 24)),
+            SplitAxis::Horizontal
+        );
+        assert_eq!(
+            bisect_split_axis(Rect::new(0, 0, 80, 40)),
+            SplitAxis::Horizontal
+        );
+        assert_eq!(
+            bisect_split_axis(Rect::new(0, 0, 40, 40)),
+            SplitAxis::Horizontal,
+            "square tie breaks side-by-side"
+        );
+        assert_eq!(
+            bisect_split_axis(Rect::new(0, 0, 24, 80)),
+            SplitAxis::Vertical
+        );
+        assert_eq!(
+            bisect_split_axis(Rect::new(0, 0, 30, 31)),
+            SplitAxis::Vertical
+        );
+        assert_eq!(
+            bisect_split_axis(Rect::zero()),
+            SplitAxis::Horizontal,
+            "empty bounds stay total"
+        );
+    }
+
+    #[test]
+    fn bisect_differs_from_smart_on_cell_aspect() {
+        // CTX-0964 (#1698): the regression that pins the distinction — a
+        // 30x24 leaf is raw-wide (bisect: right) but physically tall under
+        // the 2.0 correction (smart: down, since 24 * 2.0 = 48 > 30).
+        let rect = Rect::new(0, 0, 30, 24);
+        assert_eq!(bisect_split_axis(rect), SplitAxis::Horizontal);
+        assert_eq!(smart_split_axis(rect, 1.0), SplitAxis::Vertical);
+    }
+
+    #[test]
+    fn largest_area_leaf_picks_max_with_first_wins_ties() {
+        // CTX-0964 (#1698): largest `w * h` wins; ties break to allocation
+        // order (deterministic solver order).
+        let allocs = vec![
+            (ViewId::new(1), Rect::new(0, 0, 20, 24)),
+            (ViewId::new(2), Rect::new(20, 0, 60, 24)),
+            (ViewId::new(3), Rect::new(0, 0, 10, 10)),
+        ];
+        assert_eq!(
+            largest_area_leaf(&allocs),
+            Some((ViewId::new(2), Rect::new(20, 0, 60, 24)))
+        );
+        let tied = vec![
+            (ViewId::new(7), Rect::new(0, 0, 40, 24)),
+            (ViewId::new(8), Rect::new(40, 0, 40, 24)),
+        ];
+        assert_eq!(
+            largest_area_leaf(&tied).map(|(id, _)| id),
+            Some(ViewId::new(7)),
+            "ties keep the first allocation"
+        );
+        let empty: Vec<(ViewId, Rect)> = Vec::new();
+        assert_eq!(largest_area_leaf(&empty), None);
+    }
+
+    #[test]
+    fn bisect_choice_pairs_largest_with_raw_axis() {
+        // CTX-0964 (#1698): end-to-end choice — largest leaf plus its raw
+        // axis. 60x24 is raw-wide so the pair is (leaf 2, Horizontal).
+        let allocs = vec![
+            (ViewId::new(1), Rect::new(0, 0, 20, 24)),
+            (ViewId::new(2), Rect::new(20, 0, 60, 24)),
+        ];
+        assert_eq!(
+            bisect_choice(&allocs, Rect::new(0, 0, 80, 24)),
+            (Some(ViewId::new(2)), SplitAxis::Horizontal)
+        );
+        // Tall largest stacks: 20x50 (area 1000) beats 60x10 (area 600).
+        let tall = vec![
+            (ViewId::new(1), Rect::new(0, 0, 60, 10)),
+            (ViewId::new(2), Rect::new(0, 10, 20, 50)),
+        ];
+        assert_eq!(
+            bisect_choice(&tall, Rect::new(0, 0, 60, 60)),
+            (Some(ViewId::new(2)), SplitAxis::Vertical)
+        );
+        // Empty allocations fall back to the container axis (total).
+        let empty: Vec<(ViewId, Rect)> = Vec::new();
+        assert_eq!(
+            bisect_choice(&empty, Rect::new(0, 0, 80, 24)),
+            (None, SplitAxis::Horizontal)
+        );
+        assert_eq!(
+            bisect_choice(&empty, Rect::new(0, 0, 20, 60)),
+            (None, SplitAxis::Vertical)
+        );
     }
 
     #[test]

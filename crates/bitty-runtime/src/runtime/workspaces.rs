@@ -1231,12 +1231,24 @@ impl Runtime {
     ///   [`ViewId`](bitty_ui::ViewId), no session), so no workspace ever
     ///   strands empty and the workspace count never drops.
     /// - The target slot gains the moved leaf alongside its existing tree
-    ///   (tiling-first horizontal 50/50 wrap) and its focus moves to the
-    ///   moved window; the source focus falls back to its first remaining
-    ///   leaf. Pane sessions stay keyed globally by [`ViewId`](bitty_ui::ViewId)
+    ///   (CTX-0964, #1698: bisect-largest 50/50 — the largest-area target
+    ///   leaf splits right when `width >= height`, else down, and the moved
+    ///   leaf goes after it; an empty target becomes the moved leaf) and its
+    ///   focus moves to the moved window; the source focus falls back to its
+    ///   first remaining leaf. The bisect placement is the default for this
+    ///   move and for float-to-tiled restore reinsertions regardless of
+    ///   [`PanelLayoutMode`](crate::PanelLayoutMode) (which only controls
+    ///   `NewPanel`); it never splits the whole workspace root in half.
+    ///   Pane sessions stay keyed globally by [`ViewId`](bitty_ui::ViewId)
     ///   and are never killed here — the runtime-global primary PTY is never
     ///   touched and kill-confirm stays with close (the pending close arm,
     ///   if any, is preserved untouched).
+    ///
+    /// Float-to-tiled note: [`bitty_ui::toggle_floating`] from `Floating` to
+    /// `Tiled` stamps the mode only (the solver ignores it), so the prior
+    /// allocation restores exactly with no insertion; any out-of-tree float
+    /// reinsertion must reuse the same
+    /// [`bisect_choice`](bitty_ui::bisect_choice) default.
     pub fn workspace_move_focused_to(&mut self, index: usize) -> Result<ViewId, String> {
         if index >= self.workspaces.len() {
             return Err(format!("no such workspace ws:{}", index.saturating_add(1)));
@@ -1303,47 +1315,65 @@ impl Runtime {
         self.stash_active_slot();
         let gaps = self.gaps();
         let container = self.container;
-        let mode = self.panel_layout_mode;
+        // CTX-0964 (#1698): move-to-workspace defaults to bisect-largest
+        // placement regardless of `panel_layout_mode` (which only controls
+        // `NewPanel`). The target is the largest-area leaf in the target
+        // slot (first in solver order on ties) and the axis is raw
+        // `width >= height` ([`bitty_ui::bisect_split_axis`], no 2.0
+        // cell-aspect correction); the moved pane goes after it (right or
+        // down). The same bisect choice is the default for float-to-tiled
+        // restore reinsertions (see below): neither path ever splits the
+        // whole workspace root in half.
         // Insert into the target slot (inactive by the early return above).
         let target_slot = self
             .workspaces
             .get_mut(index)
             .ok_or_else(|| String::from("target workspace vanished"))?;
-        let target_focused = target_slot.focus.focused();
         let allocations = target_slot.layout.layout_with_gaps(container, gaps);
-        let sibling_rect = target_focused
-            .and_then(|id| {
-                allocations
-                    .iter()
-                    .find(|(leaf_id, _)| *leaf_id == id)
-                    .map(|(_, r)| *r)
-            })
-            .unwrap_or(container);
-        let axis = bitty_ui::smart_split_axis(sibling_rect, 1.0);
-        let place_new_first = match mode {
-            PanelLayoutMode::Spiral => {
-                let step = (target_slot.layout.leaf_count().saturating_sub(1)) % 4;
-                step >= 2
-            }
-            PanelLayoutMode::Dwindle => false,
-        };
-        let inserted = if let Some(sibling) = target_focused {
+        let (bisect_target, axis) = bitty_ui::bisect_choice(&allocations, container);
+        // Bisect always places the moved pane after the target (right/down).
+        let inserted = if let Some(sibling) = bisect_target {
             target_slot
                 .layout
-                .insert_beside(sibling, &moved_view, axis, 0.5, !place_new_first)
+                .insert_beside(sibling, &moved_view, axis, 0.5, true)
         } else {
             false
         };
         if !inserted {
-            let old_root = std::mem::replace(
-                &mut target_slot.layout,
-                LayoutNode::leaf(moved_view.clone()),
-            );
-            target_slot.layout = if place_new_first {
-                LayoutNode::split(axis, 0.5, LayoutNode::leaf(moved_view), old_root)
+            // Restore with no live sibling (empty target tree): no bisect
+            // target exists, so use the container bisect axis without ever
+            // splitting a live root in half. An empty tree becomes the moved
+            // leaf; a non-empty tree that rejected the largest-leaf insert
+            // (unreachable for a consistent tree) docks beside its first
+            // live leaf, falling back to a root split only when even that
+            // fails.
+            if target_slot.layout.leaf_count() == 0 {
+                target_slot.layout = LayoutNode::leaf(moved_view);
             } else {
-                LayoutNode::split(axis, 0.5, old_root, LayoutNode::leaf(moved_view))
-            };
+                let first = target_slot
+                    .layout
+                    .leaf_ids()
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| String::from("target workspace stranded empty after move"))?;
+                let first_rect = allocations
+                    .iter()
+                    .find(|(leaf_id, _)| *leaf_id == first)
+                    .map(|(_, r)| *r)
+                    .unwrap_or(container);
+                let first_axis = bitty_ui::bisect_split_axis(first_rect);
+                if !target_slot
+                    .layout
+                    .insert_beside(first, &moved_view, first_axis, 0.5, true)
+                {
+                    let old_root = std::mem::replace(
+                        &mut target_slot.layout,
+                        LayoutNode::leaf(moved_view.clone()),
+                    );
+                    target_slot.layout =
+                        LayoutNode::split(first_axis, 0.5, old_root, LayoutNode::leaf(moved_view));
+                }
+            }
         }
         target_slot.focus = Focus::with_focus(focused);
         // CTX-0405: the source promotion changed surviving leaf boundaries in
@@ -2356,6 +2386,102 @@ mod tests {
         assert_eq!(rt.layout().leaf_count(), 2);
         assert!(rt.layout().leaf_ids().contains(&sole));
         assert_eq!(rt.focused_view(), Some(sole), "target focuses moved window");
+    }
+
+    #[test]
+    fn move_bisects_largest_panel_by_default() {
+        // CTX-0964 (#1698): move-to-workspace defaults to bisect-largest
+        // regardless of `panel_layout_mode` (here the default `Spiral`): the
+        // moved pane splits the largest-area target leaf right (`w >= h`)
+        // instead of the focused leaf or the whole root.
+        let mut rt = fresh();
+        assert_eq!(rt.panel_layout_mode(), crate::PanelLayoutMode::Spiral);
+        let source = rt.focused_view().expect("source focus");
+        // Build the target (ws2): 0.25 split gives small 20x24 (id 100) and
+        // largest 60x24 (id 101, raw-wide -> Horizontal). Focus the small
+        // leaf to prove the move ignores target focus.
+        rt.workspace_new().expect("ws2");
+        let small = ViewId::new(100);
+        let largest = ViewId::new(101);
+        let probe = rt
+            .layout()
+            .find_leaf(rt.focused_view().expect("ws2 focus"))
+            .cloned()
+            .expect("ws2 leaf");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.25,
+            LayoutNode::leaf(View::new(
+                small,
+                usize::from(probe.cols()),
+                usize::from(probe.rows()),
+            )),
+            LayoutNode::leaf(View::new(
+                largest,
+                usize::from(probe.cols()),
+                usize::from(probe.rows()),
+            )),
+        ));
+        assert!(rt.set_focus(small));
+        assert!(rt.workspace_switch(0));
+        assert!(rt.set_focus(source));
+        let moved = rt.workspace_move_focused_to(1).expect("move to ws2");
+        assert_eq!(moved, source);
+        assert!(rt.workspace_switch(1));
+        assert_eq!(rt.layout().leaf_count(), 3);
+        assert!(rt.layout().leaf_ids().contains(&source));
+        assert_eq!(rt.focused_view(), Some(source));
+        // Largest (60-wide at x=20) split right into 30/30; small stays 20.
+        // Heights are not hardcoded: the workspaceline band may reserve a
+        // row with two workspaces, so only relative geometry is pinned.
+        let allocs = rt.layout_allocations();
+        let rect_of = |id: ViewId| {
+            allocs
+                .iter()
+                .find(|(leaf, _)| *leaf == id)
+                .map(|(_, r)| *r)
+                .expect("allocation present")
+        };
+        let small_rect = rect_of(small);
+        let largest_rect = rect_of(largest);
+        let moved_rect = rect_of(source);
+        assert_eq!(small_rect.width, 20);
+        assert_eq!(largest_rect.width, 30);
+        assert_eq!(moved_rect.width, 30);
+        assert_eq!(small_rect.height, largest_rect.height);
+        assert_eq!(largest_rect.height, moved_rect.height);
+        assert_eq!(largest_rect.y, moved_rect.y);
+        assert_eq!(largest_rect.x + largest_rect.width, moved_rect.x);
+        // The inner split carrying the bisected largest + moved pane is
+        // Horizontal (right); the root stays Horizontal from the setup.
+        assert_eq!(rt.layout().split_axis_at(&[]), Some(SplitAxis::Horizontal));
+        assert_eq!(rt.layout().split_axis_at(&[1]), Some(SplitAxis::Horizontal));
+    }
+
+    #[test]
+    fn move_into_single_leaf_target_bisects_without_root_split() {
+        // CTX-0964 (#1698): moving into a single-leaf target bisects that
+        // leaf (raw-wide 80-wide container -> side-by-side 40/40) instead of
+        // wrapping the whole workspace root. Heights stay relative (the
+        // workspaceline band may reserve a row).
+        let mut rt = fresh();
+        let source = rt.focused_view().expect("source focus");
+        rt.workspace_new().expect("ws2");
+        assert!(rt.workspace_switch(0));
+        assert!(rt.set_focus(source));
+        let moved = rt
+            .workspace_move_focused_to(1)
+            .expect("move to single-leaf ws2");
+        assert_eq!(moved, source);
+        assert!(rt.workspace_switch(1));
+        assert_eq!(rt.layout().leaf_count(), 2);
+        let allocs = rt.layout_allocations();
+        assert_eq!(allocs.len(), 2);
+        for (_, rect) in &allocs {
+            assert_eq!(rect.width, 40);
+        }
+        assert_eq!(allocs[0].1.height, allocs[1].1.height);
+        assert_eq!(rt.layout().split_axis_at(&[]), Some(SplitAxis::Horizontal));
     }
 
     #[test]

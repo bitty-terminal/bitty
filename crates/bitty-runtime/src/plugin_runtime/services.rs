@@ -4366,10 +4366,23 @@ mod tests {
             "first.panels:show".to_string(),
             "first.panels:hide".to_string(),
         ];
+        // Distinct right-side anchors draw from the right label pool, so the
+        // second session's labels are disjoint from the first session's
+        // left-pool labels. Dispatching the first session's label while this
+        // session is live must fail as an unknown label (not via the
+        // no-session guard asserted above).
+        let other_anchors = vec![(70u16, 0u16), (71u16, 0u16)];
         let other_labels = first_party
-            .ui_targets_session_start(other_handle, 80, &anchors, &other_commands)
+            .ui_targets_session_start(other_handle, 80, &other_anchors, &other_commands)
             .expect("second consumer session");
         assert_eq!(other_labels.len(), 2);
+        assert_eq!(
+            first_party
+                .ui_targets_dispatch(&labels[0])
+                .expect_err("foreign label in a live session")
+                .code,
+            "E_DEF_INVALID"
+        );
         let other_resolved = first_party
             .ui_targets_dispatch(&other_labels[1])
             .expect("second consumer dispatch");

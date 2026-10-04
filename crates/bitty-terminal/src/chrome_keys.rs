@@ -4359,8 +4359,8 @@ mod tests {
         // AND stays routed — no stranded visible-but-dead session. Closing
         // clears the latch, so the next open retries the plugin.
         use crate::composer_owner::{
-            COMPOSER_COMMAND_CLOSE, COMPOSER_COMMAND_OPEN, COMPOSER_PLUGIN_ID,
-            COMPOSER_REQUIRED_CAPABILITIES, ComposerOwner, fixture,
+            COMPOSER_COMMAND_CLOSE, COMPOSER_PLUGIN_ID, COMPOSER_REQUIRED_CAPABILITIES,
+            ComposerOwner, fixture,
         };
         use bitty_config::{ChromeAction, KeyName, KeyRef};
         let root = fixture::temp_dir("dispatch-error-fallback");
@@ -4436,8 +4436,8 @@ mod tests {
         // the stale latch; the vanished-leaf/finish reopen must latch
         // again while the plugin still owns the UX.
         use crate::composer_owner::{
-            COMPOSER_COMMAND_CLOSE, COMPOSER_COMMAND_OPEN, COMPOSER_PLUGIN_ID,
-            COMPOSER_REQUIRED_CAPABILITIES, ComposerOwner, fixture,
+            COMPOSER_COMMAND_CLOSE, COMPOSER_PLUGIN_ID, COMPOSER_REQUIRED_CAPABILITIES,
+            ComposerOwner, fixture,
         };
         use crate::editor_host::ExternalEditorSession;
         use bitty_config::{ChromeAction, KeyName, KeyRef};

@@ -631,6 +631,10 @@ impl CliOverrides {
                     // No `--font-fallback` CLI flag: inherit the base list
                     // like the other non-overridden siblings.
                     fallback: base.font.fallback.clone(),
+                    // No `--font-features` / `--font-disable-ligatures` CLI
+                    // flags either: inherit both like the fallback list.
+                    features: base.font.features.clone(),
+                    disable_ligatures: base.font.disable_ligatures,
                 };
                 cfg.validate()?;
                 Some(cfg)
@@ -1288,6 +1292,11 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
                     // are enforced fail-closed by typed validation below,
                     // naming `font.fallback[<index>]`.
                     fallback: f.fallback.unwrap_or_default(),
+                    // `features` / `disable_ligatures` have no Lua keys yet
+                    // (CTX-0957 follow-up); typed defaults preserve current
+                    // behavior.
+                    features: Vec::new(),
+                    disable_ligatures: crate::types::LigaturePolicy::Never,
                 };
                 // Fail closed on out-of-range spacing (same as typed validation).
                 cfg.validate().map_err(|e| {

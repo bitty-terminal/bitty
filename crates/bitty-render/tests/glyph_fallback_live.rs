@@ -14,6 +14,12 @@
 //! Deterministic coverage semantics (primary miss -> fallback hit, unknown ->
 //! tofu, bounded walk/cache) are unit-tested headlessly in `src/fallback.rs`
 //! and `src/grid/tests.rs`; this file is the live-font evidence layer.
+//!
+//! CTX-0957 additive landing (DEC-0095): this crossfont chain IS the
+//! production default path, so the CJK test below is the no-regression
+//! proof for the flagged codepoints (U+6F22/U+5B57). The shaped opt-in
+//! covers the same corpus in `tests/shaped_parity.rs`, where those two
+//! scalars stay allowlisted under CTX-0961.
 
 use bitty_render::{
     CellMetrics, CrossFontRasterizer, FallbackRasterizer, FontQuery, FontStyle, GlyphRasterizer,
@@ -162,4 +168,37 @@ fn host_chain_is_bounded_and_deterministic() {
         second.push((resolved.covered, face));
     }
     assert_eq!(first, second, "face selection must be deterministic");
+}
+
+#[test]
+fn default_path_covers_cjk_flagged_codepoints() {
+    // CTX-0957 additive landing (DEC-0095): the crossfont chain is the
+    // production default, so U+6F22/U+5B57 must render covered here — no
+    // tofu on the default path. (The shaped opt-in regresses these two to
+    // tofu via its pinned chain; that gap stays allowlisted in
+    // `tests/shaped_parity.rs` under CTX-0961.)
+    let Some(mut raster) = live_chain() else {
+        eprintln!("skipped: no host font stack or primary family");
+        return;
+    };
+    let primary = raster.fonts()[0];
+    for ch in ['\u{6F22}', '\u{5B57}'] {
+        let resolved = raster
+            .resolve(RasterKey::new(ch, primary, POINT_SIZE).unwrap())
+            .expect("resolution must not error on a live stack");
+        assert!(
+            resolved.covered,
+            "U+{:04X} must be covered on the default path",
+            ch as u32
+        );
+        let bitmap = resolved
+            .bitmap
+            .as_ref()
+            .unwrap_or_else(|| panic!("U+{:04X}: covered must carry a bitmap", ch as u32));
+        assert!(
+            !bitmap.is_blank(),
+            "U+{:04X}: CJK glyph must be non-blank",
+            ch as u32
+        );
+    }
 }

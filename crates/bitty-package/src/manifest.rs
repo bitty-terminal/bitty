@@ -304,6 +304,9 @@ pub const CAPABILITY_FAMILIES: &[&str] = &[
     "mcp",
     "ai",
     "workspace",
+    // RFC-0004 read-only history/search/selection family (CTX-0955, W-139):
+    // a NEW family beside `terminal.*`; the v1 `terminal` set stays frozen.
+    "history",
 ];
 
 /// Every non-parameterized capability head in the closed normative set.
@@ -364,6 +367,15 @@ pub const CLOSED_CAPABILITY_HEADS: &[&str] = &[
     "ai.model",
     "workspace.read",
     "workspace.control",
+    // RFC-0004 read-only history/search/selection family (CTX-0955, W-139).
+    // New family beside `terminal.*`: scoped, bounded snapshot reads over the
+    // three queryable sources (segmented transcript, command history, own
+    // per-plugin KV). Session snapshots are never a queryable source. No
+    // parameter: scope travels with the host call, never as a grant
+    // parameter (same precedent as `terminal.input.submit`).
+    "history.transcript.read",
+    "history.commands.read",
+    "history.kv.read",
 ];
 
 /// Whether a closed capability head requires a `:PARAMETER`.

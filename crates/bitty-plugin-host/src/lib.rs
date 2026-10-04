@@ -148,6 +148,7 @@ pub mod error;
 pub mod event;
 pub mod fs_authz;
 pub mod grant;
+pub mod history_read;
 pub mod host;
 pub mod identity;
 pub mod install;
@@ -203,6 +204,12 @@ pub use grant::{
     GRANTS_FILE_NAME, GRANTS_STATE_VERSION, GrantConsent, GrantOrigin, GrantRecord, GrantStore,
     MAX_GRANT_HASH_CHARS, MAX_GRANTS_CAPS, MAX_GRANTS_FILE_BYTES, MAX_GRANTS_LINES,
     MAX_GRANTS_PLUGINS, RevokeReport, grants_path_for,
+};
+pub use history_read::{
+    Attribution, Freshness, GrantKind, HISTORY_FAMILY, HISTORY_READ_VERSION, HistoryCaps,
+    HistoryDenial, HistoryDenialKind, HistoryError, HistoryGate, HistoryGrant, HistoryRecord,
+    HistoryScope, HistorySnapshot, HistorySource, MAX_NEEDLE_BYTES, MAX_SCOPE_ID_BYTES, QueryOp,
+    SnapshotPage, SnapshotQuery, StoredRow, UntrustedLabel,
 };
 pub use host::{HostObservation, PluginHost, SideQueue};
 pub use identity::{EntityKind, Lifetime, MAX_ONTOLOGY_ID_BYTES, OntologyId, Ownership};

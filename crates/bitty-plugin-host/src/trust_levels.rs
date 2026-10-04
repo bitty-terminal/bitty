@@ -249,7 +249,7 @@ impl CapabilityDomain {
             // accepted family names them, so the candidate claims none.
             Self::Credentials => &[],
             Self::TerminalInput => &[CapabilityFamily::Terminal],
-            Self::TerminalOutput => &[CapabilityFamily::Terminal],
+            Self::TerminalOutput => &[CapabilityFamily::Terminal, CapabilityFamily::History],
             // IPC transport is host-owned; no accepted family names it.
             Self::Ipc => &[],
             // No GPU capability family exists in the accepted grammar.
@@ -275,6 +275,11 @@ impl CapabilityDomain {
                 CapabilityDomain::TerminalInput,
                 CapabilityDomain::TerminalOutput,
             ],
+            // RFC-0004 history-read family (CTX-0955): reads of persisted
+            // terminal-derived content, so the `terminal output` domain only.
+            // It grants no `terminal input`, process, or other domain
+            // authority; per-grant narrowing stays with the history gate.
+            CapabilityFamily::History => &[CapabilityDomain::TerminalOutput],
             CapabilityFamily::Ui
             | CapabilityFamily::Runtime
             | CapabilityFamily::Env
@@ -498,6 +503,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn history_family_maps_to_terminal_output_only() {
+        // RFC-0004 (CTX-0955): the history-read family maps to the
+        // `terminal output` domain and grants no other domain authority.
+        assert_eq!(
+            CapabilityDomain::for_family(CapabilityFamily::History),
+            &[CapabilityDomain::TerminalOutput]
+        );
+        assert!(
+            CapabilityDomain::TerminalOutput
+                .accepted_families()
+                .contains(&CapabilityFamily::History)
+        );
+        // Admission follows the domain: L0–L3 admit `terminal output`,
+        // L4 admits nothing. Per-grant narrowing (standing vs per-request)
+        // stays with the history gate, not this coarse check.
+        for level in [
+            TrustLevel::Core,
+            TrustLevel::BundledLua,
+            TrustLevel::ThirdPartyLua,
+            TrustLevel::NativeSidecar,
+        ] {
+            assert!(
+                level.check_family(CapabilityFamily::History).is_ok(),
+                "{level} must admit the history family at the domain gate"
+            );
+        }
+        assert!(
+            TrustLevel::ExternalTool
+                .check_family(CapabilityFamily::History)
+                .is_err()
+        );
     }
 
     #[test]

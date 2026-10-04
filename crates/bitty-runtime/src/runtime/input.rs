@@ -902,9 +902,13 @@ impl Runtime {
 
     /// Pushes raw input bytes into the pending queue and, when a PTY writer
     /// is live, writes them through.
-    pub fn push_input_bytes(&mut self, bytes: &[u8]) {
+    ///
+    /// Returns whether the bytes reached a live PTY writer (`true`) or were
+    /// only buffered headless (`false`); `terminal.submit` reports
+    /// `Unavailable` (without charging the budget) for buffered frames.
+    pub fn push_input_bytes(&mut self, bytes: &[u8]) -> bool {
         if bytes.is_empty() {
-            return;
+            return false;
         }
         // CTX-0243: any input bytes snap the focused viewport to live so
         // the echo lands in the visible window (typing while scrolled must
@@ -915,7 +919,7 @@ impl Runtime {
         // former `pane_sessions.is_empty()` shortcut wrote straight to the
         // global writer), so a session-less leaf that does not own the
         // primary can never reach another view's shell.
-        self.push_input_bytes_multipane(bytes);
+        self.push_input_bytes_multipane(bytes)
     }
 
     /// Routes one encoded key frame, snapping on press/repeat only
@@ -943,11 +947,13 @@ impl Runtime {
     /// leaf's session writer wins; the shared writer serves only the primary
     /// owner leaf (CTX-0359); with no writer live, bytes fall back to the
     /// bounded headless buffer. Best-effort, never panics.
-    pub(super) fn push_input_bytes_multipane(&mut self, bytes: &[u8]) {
+    ///
+    /// Returns whether the bytes reached a live PTY writer.
+    pub(super) fn push_input_bytes_multipane(&mut self, bytes: &[u8]) -> bool {
         // CTX-0243: direct multipane sends must also snap (normally already
         // snapped by `push_input_bytes`; idempotent second snap is a no-op).
         self.snap_focused_to_live();
-        self.route_input_bytes(bytes);
+        self.route_input_bytes(bytes)
     }
 
     /// Routes already-encoded input bytes to the focused shell without the
@@ -957,13 +963,17 @@ impl Runtime {
     /// *release* frame can reuse the identical routing while skipping the
     /// snap: a release carries no new output, so it must not yank a
     /// viewport the user scrolled into history.
-    fn route_input_bytes(&mut self, bytes: &[u8]) {
+    ///
+    /// Returns whether the bytes reached a live PTY writer (`true`) or were
+    /// only buffered headless (`false`, session-less non-primary leaf or no
+    /// live writer at all).
+    fn route_input_bytes(&mut self, bytes: &[u8]) -> bool {
         match self.focus.focused() {
             Some(focused) => {
                 if let Some(sess) = self.pane_sessions.get_mut(&focused) {
                     let (dropped, flush_failed) = write_input_best_effort(&mut sess.writer, bytes);
                     self.record_input_write_loss(dropped, flush_failed);
-                    return;
+                    return true;
                 }
                 // CTX-0359: only the primary owner leaf may fall back to
                 // the runtime-global writer. A session-less non-owner
@@ -973,21 +983,22 @@ impl Runtime {
                 // primary included), so it buffers headless instead.
                 if Some(focused) != self.primary_view {
                     self.buffer_input_headless(bytes);
-                    return;
+                    return false;
                 }
             }
             // No focused view: nothing owns input; never leak to a shell.
             None => {
                 self.buffer_input_headless(bytes);
-                return;
+                return false;
             }
         }
         if let Some(writer) = self.pty_writer.as_mut() {
             let (dropped, flush_failed) = write_input_best_effort(writer, bytes);
             self.record_input_write_loss(dropped, flush_failed);
-            return;
+            return true;
         }
         self.buffer_input_headless(bytes);
+        false
     }
 
     /// Record best-effort input write loss (CTX-0473).

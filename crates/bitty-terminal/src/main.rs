@@ -676,6 +676,9 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // CTX-0929 G-1: sweep crashed-owner editor temps once per start, before
+    // session restore or any new editor use.
+    startup_maintenance();
     // CTX-0939 (W-146): install the storage-backed durable-commit backend
     // before any save/restore path runs. Core owns validation and gates;
     // this wiring owns the byte mechanics (one-way dependency: the
@@ -962,6 +965,20 @@ fn main() {
         let code = run_headless_smoke(&mut rt);
         std::process::exit(code);
     }
+}
+
+/// Sweeps crashed-owner editor temps once at startup (CTX-0929 G-1).
+///
+/// Best-effort and infallible ([`bitty_rich::host::sweep_crashed_temps`]:
+/// an unreadable root sweeps nothing). Runs before session restore so
+/// dead-owner leftovers from a crash never survive into the new session.
+/// Returns the number of files removed (separated from `main` for tests).
+pub(crate) fn startup_maintenance() -> usize {
+    let swept = bitty_rich::host::sweep_crashed_temps();
+    if swept > 0 {
+        logging::info(|| format!("bitty: swept {swept} crashed editor temp(s)"));
+    }
+    swept
 }
 
 /// Assembles startup layout and applies focus specifications (TERM-APP-003 / CTX-0553).

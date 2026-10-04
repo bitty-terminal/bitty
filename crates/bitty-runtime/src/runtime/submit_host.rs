@@ -37,12 +37,17 @@ use crate::registry::{LeaseHolder, PanelLease};
 pub enum TerminalSubmitUnavailable {
     /// No focused leaf to route the frame to.
     NoFocusedView,
+    /// The frame reached no live PTY (session-less non-primary leaf, or no
+    /// writer live at all): it was only buffered headless, so the budget
+    /// is untouched.
+    BufferedOnly,
 }
 
 impl std::fmt::Display for TerminalSubmitUnavailable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NoFocusedView => f.write_str("submit unavailable: no focused panel"),
+            Self::BufferedOnly => f.write_str("submit unavailable: no live PTY accepted the frame"),
         }
     }
 }
@@ -79,9 +84,11 @@ impl Runtime {
     /// `lease` is the focused panel's lease kernel, `holder` the submitting
     /// principal, and `now` the host tick: the lease write rule is evaluated
     /// here, fail-closed. `budget` is the submitting plugin's submit window,
-    /// charged only on success. The frame is byte-exact
+    /// charged only on PTY delivery. The frame is byte-exact
     /// (`ESC[200~` content `ESC[201~` `CR`) and written in a single router
-    /// call; any refusal emits nothing.
+    /// call; any refusal emits nothing, and a frame that only buffers
+    /// headless (session-less non-primary leaf, no live writer) reports
+    /// [`TerminalSubmitUnavailable::BufferedOnly`] without charging.
     #[must_use]
     pub fn terminal_submit(
         &mut self,
@@ -97,20 +104,32 @@ impl Runtime {
         if lease.check_write(holder, now).is_err() {
             return TerminalSubmitOutcome::Denied(SubmitDeny::LeaseDenied);
         }
-        match check_terminal_submit(text, true, budget) {
-            Ok(frame) => {
-                let bytes = frame.len();
-                self.push_input_bytes(&frame);
-                TerminalSubmitOutcome::Accepted { bytes }
-            }
-            Err(deny) => TerminalSubmitOutcome::Denied(deny),
+        // Validate (cap, framing) and price against a probe first so every
+        // denial leaves the caller's budget untouched, exactly as
+        // `check_terminal_submit` promises; the charge commits only after
+        // the router confirms PTY delivery.
+        let mut probe = budget.clone();
+        let frame = match check_terminal_submit(text, true, &mut probe) {
+            Ok(frame) => frame,
+            Err(deny) => return TerminalSubmitOutcome::Denied(deny),
+        };
+        let bytes = frame.len();
+        if !self.push_input_bytes(&frame) {
+            return TerminalSubmitOutcome::Unavailable(TerminalSubmitUnavailable::BufferedOnly);
         }
+        *budget = probe;
+        TerminalSubmitOutcome::Accepted { bytes }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{LayoutNode, SplitAxis, View, ViewId};
+    // Only the live-spawn Accepted test below uses this (all `#[cfg(unix)]`);
+    // without the gate the import is unused on Windows.
+    #[cfg(unix)]
+    use bitty_test_support::require_pty;
 
     fn test_budget(cap: u64) -> SubmitBudget {
         SubmitBudget::new("composer.test", cap)
@@ -123,10 +142,38 @@ mod tests {
         (lease, holder)
     }
 
+    fn split_with_sessionless_second_leaf(rt: &mut Runtime) -> ViewId {
+        // Second leaf has no session and is not the primary owner: focusing
+        // it reproduces the review case (buffered, never another shell).
+        let second = ViewId::new(2);
+        let focused = rt.focused_view().expect("default layout has focus");
+        let old = rt
+            .layout()
+            .find_leaf(focused)
+            .cloned()
+            .expect("focused leaf exists");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(old),
+            LayoutNode::leaf(View::new(second, 40, 24)),
+        ));
+        assert!(rt.set_focus(second));
+        second
+    }
+
+    // Live-spawn: runs a real POSIX shell (`/bin/sh` has no Windows
+    // equivalent). `#[cfg(unix)]` keeps it off Windows CI; `require_pty!()`
+    // keeps the force-no-PTY simulation path.
     #[test]
+    #[cfg(unix)]
     fn submit_accepted_writes_one_frame() {
+        require_pty!();
         let mut rt = Runtime::with_defaults().expect("headless runtime");
-        assert!(rt.focused_view().is_some(), "default layout has focus");
+        let focused = rt.focused_view().expect("default layout has focus");
+        rt.spawn_shell_for_view(focused, "/bin/sh", &[], 40, 12)
+            .expect("pane shell must spawn headless");
+        assert!(rt.set_focus(focused));
         let (lease, holder) = granted_lease();
         let mut budget = test_budget(1024 * 1024);
         let outcome = rt.terminal_submit("cargo test", &lease, holder, 1, &mut budget);
@@ -137,6 +184,45 @@ mod tests {
             }
             other => panic!("expected accepted, got {other:?}"),
         }
+        assert!(
+            rt.pending_input().is_empty(),
+            "PTY delivery must not buffer headless"
+        );
+    }
+
+    #[test]
+    fn submit_buffered_sessionless_leaf_is_unavailable_without_charge() {
+        let mut rt = Runtime::with_defaults().expect("headless runtime");
+        split_with_sessionless_second_leaf(&mut rt);
+        let (lease, holder) = granted_lease();
+        let mut budget = test_budget(1024 * 1024);
+        let outcome = rt.terminal_submit("cargo test", &lease, holder, 1, &mut budget);
+        assert_eq!(
+            outcome,
+            TerminalSubmitOutcome::Unavailable(TerminalSubmitUnavailable::BufferedOnly)
+        );
+        assert_eq!(budget.used(), 0, "buffered frame must not charge");
+        assert_eq!(
+            rt.pending_input(),
+            b"\x1b[200~cargo test\x1b[201~\r".as_slice(),
+            "frame is buffered headless, never leaked to a shell"
+        );
+    }
+
+    #[test]
+    fn submit_headless_primary_without_writer_is_unavailable() {
+        // Default headless runtime owns no writer: the primary leaf falls
+        // through to the headless buffer, so submit reports Unavailable.
+        let mut rt = Runtime::with_defaults().expect("headless runtime");
+        assert!(rt.focused_view().is_some(), "default layout has focus");
+        let (lease, holder) = granted_lease();
+        let mut budget = test_budget(1024 * 1024);
+        let outcome = rt.terminal_submit("cargo test", &lease, holder, 1, &mut budget);
+        assert_eq!(
+            outcome,
+            TerminalSubmitOutcome::Unavailable(TerminalSubmitUnavailable::BufferedOnly)
+        );
+        assert_eq!(budget.used(), 0);
     }
 
     #[test]

@@ -5341,6 +5341,26 @@ fn external_editor_hosted_timeout_kills_tree_and_reports() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn startup_maintenance_sweeps_planted_stale_temp() {
+    // Plants a provably-dead-owner temp in the real owned root, then proves
+    // the startup path sweeps it. Pid 0 never owns a file on any platform,
+    // so the name is stale everywhere (portable, no live-pid fixture).
+    // The `bitty-composer-` prefix mirrors `composer::TEMP_PREFIX`
+    // (`pub(crate)` there, so spelled out here); nanos + pid keep the name
+    // unique across parallel runs.
+    let root = bitty_rich::host::owned_temp_root().expect("owned root");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = root.join(format!("bitty-composer-0-{nanos}-{}", std::process::id()));
+    std::fs::write(&path, "stale").expect("plant stale temp");
+    let swept = startup_maintenance();
+    assert!(swept >= 1, "startup must sweep the planted stale temp");
+    assert!(!path.exists(), "planted stale temp must be gone");
+}
+
 /// Whether a pid is fully gone on Linux: absent from `/proc`, or a zombie
 /// awaiting reaping (a SIGKILLed child reparents to init, which reaps
 /// promptly; poll briefly before concluding survival). Mirrors the

@@ -57,7 +57,8 @@
 //!
 //! No I/O except the editor round trip and temp-root management, no
 //! wall-clock except the editor timeout poll loop, no randomness for content
-//! (temp names mix pid + nanos + counter only), no unsafe.
+//! (temp names mix pid + nanos + counter only; the root name adds the UID),
+//! no unsafe.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -72,13 +73,61 @@ use crate::composer::{
 // G-1: Bitty-owned 0700 temp root
 // ---------------------------------------------------------------------------
 
-/// Directory name of the Bitty-owned editor temp root inside its base.
+/// Base name of the Bitty-owned editor temp root inside its base.
+///
+/// On Unix the creator UID is appended (`bitty-composer-<uid>`, see
+/// [`owned_temp_root_name`]) so users sharing a temp base never share a
+/// root. Other platforms keep the plain name and rely on the per-user
+/// base-directory ACL (same residual as the temp file itself).
 pub const OWNED_TEMP_DIR_NAME: &str = "bitty-composer";
+
+/// Creator UID probed in `dir` (Unix only): the owner of a freshly created
+/// file is our effective UID, read back with std-only
+/// [`std::os::unix::fs::MetadataExt::uid`].
+///
+/// This keeps the crate `unsafe`-free (`forbid(unsafe_code)`, so even the
+/// one-line `libc::geteuid` is unavailable) with no new dependency. It is
+/// also self-consistent under id-mapped mounts: the probed value is exactly
+/// "the UID that owns files I create here", which is what both the root
+/// name and the ownership check need. `None` when the probe cannot be
+/// created or read (fail-closed downstream).
+#[cfg(unix)]
+fn creator_uid_in(dir: &Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt as _;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let probe = dir.join(format!(
+        ".bitty-uid-probe-{}-{nanos}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::File::create(&probe).ok()?;
+    let uid = std::fs::metadata(&probe).ok().map(|meta| meta.uid());
+    // Best-effort cleanup; a crash orphan is a hidden dotfile the sweep
+    // never matches (no [`TEMP_PREFIX`] shape) and nothing ever reads.
+    let _ = std::fs::remove_file(&probe);
+    uid
+}
+
+/// Full leaf name of the owned temp root: `bitty-composer-<uid>` when an
+/// owner UID is known (Unix), plain [`OWNED_TEMP_DIR_NAME`] otherwise.
+fn owned_temp_root_name(owner: Option<u32>) -> String {
+    match owner {
+        Some(uid) => format!("{OWNED_TEMP_DIR_NAME}-{uid}"),
+        None => OWNED_TEMP_DIR_NAME.to_owned(),
+    }
+}
 
 /// Returns the Bitty-owned editor temp root, creating it when absent.
 ///
 /// The root lives under `$XDG_RUNTIME_DIR` when that variable names an
-/// absolute directory, else under [`std::env::temp_dir`]. Creation is
+/// absolute directory, else under [`std::env::temp_dir`]. On Unix the leaf
+/// name carries the creator UID (probed std-only, no new dependency), and a
+/// root owned by another UID is refused (fail-closed, never adopted or
+/// deleted); see G-1. Creation is
 /// exclusive (`create_dir`, never `create_dir_all` on the leaf) and the
 /// result is validated before use: the path must resolve to a real directory
 /// (never a symlink), and on Unix its mode must be exactly `0700`. Any
@@ -95,16 +144,33 @@ pub fn owned_temp_root() -> Result<PathBuf, EditorError> {
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .unwrap_or_else(std::env::temp_dir);
-    owned_temp_root_under(&base)
+    #[cfg(unix)]
+    let owner = creator_uid_in(&base);
+    #[cfg(not(unix))]
+    let owner: Option<u32> = None;
+    owned_temp_root_under(&base, owner)
 }
 
 /// [`owned_temp_root`] against an explicit base (hermetic seam for tests).
 ///
+/// `owner` is the expected creator UID on Unix (`None` fails closed there;
+/// ignored elsewhere). Tests pass the probed UID, or a wrong one to prove
+/// the foreign-owner refusal without needing privilege to `chown`.
+///
 /// # Errors
 ///
 /// As [`owned_temp_root`].
-pub(crate) fn owned_temp_root_under(base: &Path) -> Result<PathBuf, EditorError> {
-    let root = base.join(OWNED_TEMP_DIR_NAME);
+pub(crate) fn owned_temp_root_under(
+    base: &Path,
+    owner: Option<u32>,
+) -> Result<PathBuf, EditorError> {
+    #[cfg(unix)]
+    if owner.is_none() {
+        return Err(EditorError::WriteFailed(String::from(
+            "owned temp root unavailable",
+        )));
+    }
+    let root = base.join(owned_temp_root_name(owner));
     match std::fs::create_dir(&root) {
         Ok(()) => {
             // Freshly created by this process: assert owner-only before use.
@@ -126,12 +192,13 @@ pub(crate) fn owned_temp_root_under(base: &Path) -> Result<PathBuf, EditorError>
             ))));
         }
     }
-    validate_owned_temp_root(&root)?;
+    validate_owned_temp_root(&root, owner)?;
     Ok(root)
 }
 
-/// Rejects symlink escapes, non-directories, and wrong modes (fail-closed).
-fn validate_owned_temp_root(root: &Path) -> Result<(), EditorError> {
+/// Rejects symlink escapes, non-directories, wrong owners, and wrong modes
+/// (fail-closed).
+fn validate_owned_temp_root(root: &Path, owner: Option<u32>) -> Result<(), EditorError> {
     let meta = std::fs::symlink_metadata(root).map_err(|e| {
         EditorError::WriteFailed(truncate_err(format!("owned temp root unreadable: {e}")))
     })?;
@@ -147,7 +214,21 @@ fn validate_owned_temp_root(root: &Path) -> Result<(), EditorError> {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let Some(expected) = owner else {
+            return Err(EditorError::WriteFailed(String::from(
+                "owned temp root unavailable",
+            )));
+        };
+        // Another user's pre-created directory at our path (shared temp
+        // base) is unusable: never adopt it, never delete it, fail closed.
+        // The per-UID root name makes this structurally unreachable in
+        // practice; the check is defense in depth.
+        if meta.uid() != expected {
+            return Err(EditorError::WriteFailed(String::from(
+                "owned temp root is not owned by the current user",
+            )));
+        }
         let mode = meta.permissions().mode() & 0o777;
         if mode != 0o700 {
             return Err(EditorError::WriteFailed(String::from(
@@ -155,6 +236,8 @@ fn validate_owned_temp_root(root: &Path) -> Result<(), EditorError> {
             )));
         }
     }
+    #[cfg(not(unix))]
+    let _ = owner;
     Ok(())
 }
 
@@ -253,8 +336,20 @@ fn temp_pid_is_dead(pid: u32) -> bool {
 /// graphics/session markers need no listing because removal is
 /// allowlist-based. `TERM`/`COLORTERM`/`TERM_PROGRAM` are (re-)applied by
 /// the spawn path defaults.
+///
+/// The Windows runtime and profile keys (`SystemRoot`, `ComSpec`, `PATHEXT`,
+/// `WINDIR`, …) stay so both editor spawn paths keep resolving and loading
+/// there; on Unix they are inert (absent from the ambient environment).
 pub const HOSTED_ENV_KEEP: &[&str] = &[
     "PATH",
+    "SystemRoot",
+    "SystemDrive",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "ComSpec",
+    "PATHEXT",
+    "WINDIR",
     "HOME",
     "TERM",
     "COLORTERM",
@@ -279,9 +374,21 @@ pub const HOSTED_ENV_KEEP: &[&str] = &[
 ];
 
 /// Whether an environment key survives minimization.
+///
+/// Windows environment keys are case-insensitive (`Path` must match `PATH`),
+/// so the comparison folds case there; Unix keeps exact-case semantics.
 #[must_use]
 pub fn hosted_env_keeps(key: &str) -> bool {
-    HOSTED_ENV_KEEP.contains(&key)
+    #[cfg(windows)]
+    {
+        HOSTED_ENV_KEEP
+            .iter()
+            .any(|kept| kept.eq_ignore_ascii_case(key))
+    }
+    #[cfg(not(windows))]
+    {
+        HOSTED_ENV_KEEP.contains(&key)
+    }
 }
 
 /// Builds the minimized environment for the blocking editor child: the
@@ -299,17 +406,28 @@ pub fn build_hosted_env() -> Vec<(OsString, OsString)> {
 /// after the graphics-fingerprint strip and before explicit overrides, so a
 /// caller-explicit entry still wins). Same policy as [`build_hosted_env`],
 /// expressed as removals for the PTY spawn path that inherits by default.
+///
+/// Keys the builder cannot accept (empty names, names containing `'='` such
+/// as Windows' hidden per-drive `=C:` variables) are never emitted as
+/// removals: `PtyBuilder::validate` rejects them and the spawn would fail.
 #[must_use]
 pub fn minimized_env_removals() -> Vec<OsString> {
     std::env::vars_os()
         .filter_map(|(key, _)| {
-            if hosted_env_keeps(&key.to_string_lossy()) {
+            if env_removal_skipped(&key.to_string_lossy()) {
                 None
             } else {
                 Some(key)
             }
         })
         .collect()
+}
+
+/// Whether an environment key must NOT appear in [`minimized_env_removals`]:
+/// kept keys stay, and builder-rejected names (empty or containing `'='`)
+/// are skipped because they cannot be inherited through the builder anyway.
+fn env_removal_skipped(key: &str) -> bool {
+    key.is_empty() || key.contains('=') || hosted_env_keeps(key)
 }
 
 // ---------------------------------------------------------------------------
@@ -724,11 +842,30 @@ mod tests {
 
     // -- G-1: owned root ------------------------------------------------------
 
+    /// Expected owner UID for hermetic-seam calls: the probed creator UID
+    /// on Unix, `None` elsewhere.
+    fn test_owner(base: &Path) -> Option<u32> {
+        #[cfg(unix)]
+        {
+            creator_uid_in(base)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = base;
+            None
+        }
+    }
+
+    #[test]
+    fn owned_root_name_without_owner_is_plain() {
+        assert_eq!(owned_temp_root_name(None), OWNED_TEMP_DIR_NAME);
+    }
+
     #[test]
     fn owned_root_is_created_owner_only_and_idempotent() {
         let base = workdir();
         // Point the root under an isolated base via the hermetic seam.
-        let root = owned_temp_root_under(&base).expect("owned root");
+        let root = owned_temp_root_under(&base, test_owner(&base)).expect("owned root");
         assert!(root.is_dir());
         assert_no_symlink(&root);
         #[cfg(unix)]
@@ -742,7 +879,7 @@ mod tests {
             assert_eq!(mode, 0o700);
         }
         // Second call reuses the validated root.
-        let again = owned_temp_root_under(&base).expect("owned root again");
+        let again = owned_temp_root_under(&base, test_owner(&base)).expect("owned root again");
         assert_eq!(root, again);
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -750,19 +887,20 @@ mod tests {
     #[test]
     fn owned_root_rejects_wrong_mode() {
         let base = workdir();
-        let root = base.join(OWNED_TEMP_DIR_NAME);
+        let owner = test_owner(&base);
+        let root = base.join(owned_temp_root_name(owner));
         std::fs::create_dir_all(&root).expect("pre-create");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
             std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755))
                 .expect("chmod 0755");
-            let err = owned_temp_root_under(&base).expect_err("wrong mode must fail");
+            let err = owned_temp_root_under(&base, owner).expect_err("wrong mode must fail");
             assert!(matches!(err, EditorError::WriteFailed(_)));
         }
         #[cfg(not(unix))]
         {
-            assert!(owned_temp_root_under(&base).is_ok());
+            assert!(owned_temp_root_under(&base, owner).is_ok());
         }
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -771,11 +909,78 @@ mod tests {
     #[test]
     fn owned_root_rejects_symlink() {
         let base = workdir();
+        let owner = creator_uid_in(&base).expect("probe creator uid");
         let target = base.join("real");
         std::fs::create_dir_all(&target).expect("target");
-        std::os::unix::fs::symlink(&target, base.join(OWNED_TEMP_DIR_NAME)).expect("symlink");
-        let err = owned_temp_root_under(&base).expect_err("symlink must fail");
+        std::os::unix::fs::symlink(&target, base.join(owned_temp_root_name(Some(owner))))
+            .expect("symlink");
+        let err = owned_temp_root_under(&base, Some(owner)).expect_err("symlink must fail");
         assert!(matches!(err, EditorError::WriteFailed(_)));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_root_name_carries_probed_uid() {
+        // The leaf name embeds the probed creator UID, so users sharing a
+        // temp base never share a root.
+        let base = workdir();
+        let owner = creator_uid_in(&base).expect("probe creator uid");
+        assert_eq!(
+            owned_temp_root_name(Some(owner)),
+            format!("{OWNED_TEMP_DIR_NAME}-{owner}")
+        );
+        let root = owned_temp_root_under(&base, Some(owner)).expect("owned root");
+        assert_eq!(root, base.join(format!("{OWNED_TEMP_DIR_NAME}-{owner}")));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_root_ignores_legacy_unsuffixed_dir() {
+        // A pre-existing plain `bitty-composer` dir (pre-per-UID layout, or
+        // another user's on a shared base) is never adopted: the
+        // UID-suffixed root is created alongside and the legacy dir is left
+        // untouched (never used, never deleted).
+        let base = workdir();
+        let owner = creator_uid_in(&base).expect("probe creator uid");
+        let legacy = base.join(OWNED_TEMP_DIR_NAME);
+        std::fs::create_dir_all(&legacy).expect("legacy dir");
+        std::fs::write(legacy.join("sentinel"), "stay").expect("sentinel");
+        let root = owned_temp_root_under(&base, Some(owner)).expect("owned root");
+        assert_eq!(root, base.join(owned_temp_root_name(Some(owner))));
+        assert_ne!(root, legacy);
+        assert_eq!(
+            std::fs::read_to_string(legacy.join("sentinel")).expect("sentinel kept"),
+            "stay"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_root_rejects_foreign_owner() {
+        // No privilege needed: the seam takes the expected UID explicitly,
+        // so a wrong UID proves the refusal (the fixture dir stays owned by
+        // this process, exactly like another user's dir would be).
+        let base = workdir();
+        let owner = creator_uid_in(&base).expect("probe creator uid");
+        let root = base.join(owned_temp_root_name(Some(owner)));
+        std::fs::create_dir_all(&root).expect("pre-create");
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+                .expect("chmod 0700");
+        }
+        // Mode is 0700, so only the owner check can fire.
+        let wrong = owner.wrapping_add(1);
+        assert_ne!(wrong, owner);
+        let err = owned_temp_root_under(&base, Some(wrong)).expect_err("foreign owner must fail");
+        assert!(matches!(err, EditorError::WriteFailed(_)));
+        assert!(root.is_dir(), "foreign-owned dir must not be deleted");
+        // The rightful owner is still accepted.
+        let ok = owned_temp_root_under(&base, Some(owner)).expect("rightful owner works");
+        assert_eq!(ok, root);
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -880,6 +1085,56 @@ mod tests {
                 !hosted_env_keeps(&removed.to_string_lossy()),
                 "removal must not name a kept key"
             );
+        }
+    }
+
+    #[test]
+    fn hosted_env_keeps_case_rules_follow_platform() {
+        // Windows reports keys in any case (`Path`); Unix stays exact-case.
+        assert!(hosted_env_keeps("PATH"));
+        for keep in ["SystemRoot", "ComSpec", "PATHEXT", "WINDIR", "USERPROFILE"] {
+            assert!(hosted_env_keeps(keep), "{keep} must survive minimization");
+        }
+        #[cfg(windows)]
+        {
+            for mixed in ["Path", "path", "systemroot", "SYSTEMROOT", "comspec"] {
+                assert!(hosted_env_keeps(mixed), "{mixed} must match on Windows");
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            for mixed in ["Path", "path", "systemroot", "comspec"] {
+                assert!(
+                    !hosted_env_keeps(mixed),
+                    "{mixed} must not match on Unix (exact-case)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn env_removal_skips_builder_rejected_names() {
+        // Portable unit test of the filter predicate: empty names and names
+        // containing '=' (Windows' hidden per-drive `=C:` variables) can
+        // never travel through `PtyBuilder`, so they are skipped rather than
+        // emitted as removals (which `validate` would reject).
+        assert!(env_removal_skipped(""));
+        assert!(env_removal_skipped("=C:"));
+        assert!(env_removal_skipped("=D:"));
+        assert!(env_removal_skipped("A=B"));
+        assert!(env_removal_skipped("PATH"));
+        assert!(!env_removal_skipped("AWS_SECRET_ACCESS_KEY"));
+        assert!(!env_removal_skipped("LD_PRELOAD"));
+    }
+
+    #[test]
+    fn minimized_removals_never_name_builder_rejected_keys() {
+        // Whatever the ambient environment holds (Windows CI carries `=C:`),
+        // no emitted removal may be empty or contain '='.
+        for removed in minimized_env_removals() {
+            let text = removed.to_string_lossy();
+            assert!(!text.is_empty(), "removal must not be empty");
+            assert!(!text.contains('='), "removal must not contain '=': {text}");
         }
     }
 

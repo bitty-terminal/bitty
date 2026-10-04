@@ -1153,6 +1153,46 @@ impl TerminalApp {
                     ),
                 }
             }
+            A::JumpToPromptPrev => {
+                // CTX-0952 (issue #1670): one prompt toward scrollback,
+                // target at viewport top. No marks: loud no-op, shell
+                // keeps the bytes (fail-closed, never a mis-jump).
+                if self
+                    .runtime
+                    .jump_to_prompt(bitty_runtime::runtime::shell_jump::PromptDirection::Prev)
+                {
+                    eprintln!("bitty: keymap jump_to_prompt:prev -> jumped");
+                } else {
+                    eprintln!(
+                        "warning: keymap jump_to_prompt:prev found no prompt above — ignoring"
+                    );
+                }
+            }
+            A::JumpToPromptNext => {
+                // CTX-0952: mirror toward live.
+                if self
+                    .runtime
+                    .jump_to_prompt(bitty_runtime::runtime::shell_jump::PromptDirection::Next)
+                {
+                    eprintln!("bitty: keymap jump_to_prompt:next -> jumped");
+                } else {
+                    eprintln!(
+                        "warning: keymap jump_to_prompt:next found no prompt below — ignoring"
+                    );
+                }
+            }
+            A::SelectCommandOutput => {
+                // CTX-0952: select exactly the last command's output rows
+                // (ghostty `selectOutput` shape). Empty/absent marks: loud
+                // no-op, live selection untouched.
+                if self.runtime.select_command_output() {
+                    eprintln!("bitty: keymap select_command_output -> selected");
+                } else {
+                    eprintln!(
+                        "warning: keymap select_command_output found no command output — ignoring"
+                    );
+                }
+            }
             A::PasteFromClipboard => {
                 // CTX-0161: explicit single-owner paste chord (ctrl+shift+v).
                 // Before this binding the chord fell through to the PTY as
@@ -2469,6 +2509,107 @@ mod tests {
         app.apply_chrome_action(ChromeAction::PasteFromClipboard);
         assert!(!app.runtime.has_pending_paste());
         assert_eq!(app.runtime.drain_pending_input(), b"clean-paste");
+    }
+
+    #[test]
+    fn chrome_prompt_nav_and_select_output_headless() {
+        // CTX-0952 end-to-end through the chrome arms (no window): full
+        // OSC133 session traffic, then jump/select dispatch moves the
+        // viewport and installs the output selection; empty marks warn and
+        // touch nothing.
+        use bitty_config::ChromeAction;
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        // The shipped defaults bind all three verbs (single-owner audit in
+        // bitty-config pins the count).
+        for action in [
+            ChromeAction::JumpToPromptPrev,
+            ChromeAction::JumpToPromptNext,
+            ChromeAction::SelectCommandOutput,
+        ] {
+            assert!(
+                maps.iter().any(|m| m.action == action),
+                "defaults must bind {}",
+                action.canonical()
+            );
+        }
+        let mut rt = Runtime::with_defaults().expect("must build");
+        rt.force_headless_clipboard();
+        let h = rt.state().height();
+        for i in 0..(h + 2) {
+            rt.handle_pty_bytes(b"\x1b]133;A\x07prompt$ \x1b]133;B\x07");
+            rt.handle_pty_bytes(format!("cmd{i:02}\r\n").as_bytes());
+            rt.handle_pty_bytes(b"\x1b]133;C\x07");
+            rt.handle_pty_bytes(format!("out{i:02}\r\n").as_bytes());
+            rt.handle_pty_bytes(b"\x1b]133;D;0\x07");
+        }
+        rt.handle_pty_bytes(b"\x1b]133;A\x07prompt$ ");
+        let mut app = TerminalApp::with_theme(
+            rt,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            maps,
+            SpawnSpec::default(),
+        );
+        // Select covers exactly the last command's output line.
+        app.apply_chrome_action(ChromeAction::SelectCommandOutput);
+        let expected = format!("out{:02}", h + 1);
+        assert_eq!(
+            app.runtime.selection_text().as_deref(),
+            Some(expected.as_str())
+        );
+        // Jump prev pages into history; jump next walks back toward live.
+        app.apply_chrome_action(ChromeAction::JumpToPromptPrev);
+        let vid = app.runtime.focused_view().expect("focused view");
+        let up = app
+            .runtime
+            .layout()
+            .find_leaf(vid)
+            .expect("leaf")
+            .scroll_offset();
+        assert!(up > 0, "prev jump pages into history");
+        app.apply_chrome_action(ChromeAction::JumpToPromptNext);
+        let down = app
+            .runtime
+            .layout()
+            .find_leaf(vid)
+            .expect("leaf")
+            .scroll_offset();
+        assert!(down < up, "next jump walks back toward live");
+        assert_eq!(app.runtime.pending_input_len(), 0, "no PTY bytes produced");
+    }
+
+    #[test]
+    fn chrome_prompt_nav_empty_marks_warn_and_touch_nothing() {
+        // CTX-0952 fail-closed dispatch: with no marks the arms warn and
+        // leave the viewport, selection, and PTY input untouched.
+        use bitty_config::ChromeAction;
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let mut rt = Runtime::with_defaults().expect("must build");
+        rt.force_headless_clipboard();
+        rt.handle_pty_bytes(b"plain output, no integration\r\n");
+        let mut app = TerminalApp::with_theme(
+            rt,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            maps,
+            SpawnSpec::default(),
+        );
+        app.apply_chrome_action(ChromeAction::JumpToPromptPrev);
+        app.apply_chrome_action(ChromeAction::JumpToPromptNext);
+        app.apply_chrome_action(ChromeAction::SelectCommandOutput);
+        let vid = app.runtime.focused_view().expect("focused view");
+        assert_eq!(
+            app.runtime
+                .layout()
+                .find_leaf(vid)
+                .expect("leaf")
+                .scroll_offset(),
+            0
+        );
+        assert!(!app.runtime.has_selection());
+        assert_eq!(app.runtime.pending_input_len(), 0);
     }
 
     // CTX-0229 headless chord driver: the same dispatch `handle_event`

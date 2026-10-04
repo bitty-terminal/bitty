@@ -438,6 +438,8 @@ pub(crate) fn starter_init_lua() -> &'static str {
      --   Alt+z / Alt+m / Alt+f          toggle single-pane zoom\n\
      --   Ctrl+Tab / Ctrl+Shift+Tab      focus next / previous\n\
      --   Ctrl+Shift+C/V                 copy/paste (fish never sees the chord);\n\
+     --   Shift+Alt+PageUp/PageDown      jump to previous / next shell prompt (OSC 133)\n\
+     --   Alt+o                          select last command output\n\
      -- uncomment to override (context + chord identity replaces the default):\n\
      --\n\
      -- Mouse select auto-copies to the clipboard by default (ghostty-class\n\

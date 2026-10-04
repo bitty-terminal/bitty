@@ -1523,6 +1523,14 @@ pub const MAX_FALLBACK_FAMILIES: usize = 8;
 /// `bitty-render::fallback` never walks more faces than the chain holds.
 pub const MAX_FALLBACK_DEPTH: usize = 12;
 
+/// Maximum user-configured font fallback entries (`font.fallback`).
+///
+/// Mirrors the RFC `MAX_FALLBACK_FAMILIES = 8` platform-tail bound so the
+/// user tier costs the same worst case as the platform tier; the merged
+/// chain ([`FontConfig::fallback_chain`]) additionally caps total depth at
+/// [`MAX_FALLBACK_DEPTH`], user entries first.
+pub const MAX_FONT_FALLBACK_ENTRIES: usize = 8;
+
 /// Braille/symbols fallback family (CTX-0163, issue #263).
 ///
 /// `fc-query` evidence on the reference host: `DejaVu Sans Mono` covers
@@ -1640,6 +1648,16 @@ pub struct FontConfig {
     pub line_height: f32,
     /// Extra advance in px, finite within `[0.0, 8.0]`.
     pub letter_spacing: f32,
+    /// User-ordered fallback families, tried after the primary and before
+    /// the platform default tail (ghostty-style repeatable `font-family`:
+    /// first covering face wins; kitty `symbol_map` intent without
+    /// per-range mapping).
+    ///
+    /// Empty by default (platform tail only). Each entry is a trimmed,
+    /// non-empty family name of `<= MAX_FONT_FAMILY_LEN` bytes; at most
+    /// `MAX_FONT_FALLBACK_ENTRIES` entries, validated fail-closed
+    /// (`font.fallback[<index>]` diagnostics).
+    pub fallback: Vec<String>,
 }
 
 impl Default for FontConfig {
@@ -1649,6 +1667,7 @@ impl Default for FontConfig {
             size: DEFAULT_FONT_SIZE,
             line_height: DEFAULT_LINE_HEIGHT,
             letter_spacing: DEFAULT_LETTER_SPACING,
+            fallback: Vec::new(),
         }
     }
 }
@@ -1687,29 +1706,72 @@ impl FontConfig {
                 "must be finite within [0.0, 8.0]",
             ));
         }
+        if self.fallback.len() > MAX_FONT_FALLBACK_ENTRIES {
+            return Err(ConfigError::validation(
+                "font.fallback",
+                format!("must contain <= {MAX_FONT_FALLBACK_ENTRIES} entries"),
+            ));
+        }
+        for (index, entry) in self.fallback.iter().enumerate() {
+            let name = entry.trim();
+            if name.is_empty() {
+                return Err(ConfigError::validation(
+                    format!("font.fallback[{index}]"),
+                    "must not be empty or whitespace",
+                ));
+            }
+            if name.len() > MAX_FONT_FAMILY_LEN {
+                return Err(ConfigError::validation(
+                    format!("font.fallback[{index}]"),
+                    format!("must be <= {MAX_FONT_FAMILY_LEN} bytes"),
+                ));
+            }
+        }
         Ok(())
     }
 
-    /// Family-level fallback attempt order, configured family first.
-    ///
-    /// Starts with `self.family` (trimmed), then the documented
+    /// Family-level fallback attempt order: configured family first, then
+    /// the user `fallback` tier in order, then the documented
     /// [`FONT_FALLBACK_CHAIN`] entries not already covered (case-insensitive
-    /// dedup), preserving order. Bounded: at most `1 + CHAIN.len()` entries,
-    /// each `<= MAX_FONT_FAMILY_LEN`.
+    /// dedup throughout), preserving order. An empty user tier reproduces
+    /// the historical primary-plus-platform-tail chain exactly.
+    ///
+    /// Bounded: at most [`MAX_FALLBACK_DEPTH`] entries total (user tier
+    /// first, so a full user list can displace platform-tail entries),
+    /// each `<= MAX_FONT_FAMILY_LEN`. Blank user entries are skipped
+    /// defensively (`validate` rejects them fail-closed first).
     #[must_use]
     pub fn fallback_chain(&self) -> Vec<String> {
-        let mut out: Vec<String> = Vec::with_capacity(1 + FONT_FALLBACK_CHAIN.len());
+        let mut out: Vec<String> =
+            Vec::with_capacity(1 + self.fallback.len() + FONT_FALLBACK_CHAIN.len());
         let primary = self.family.trim().to_string();
         out.push(primary.clone());
-        let lower = primary.to_lowercase();
-        for cand in FONT_FALLBACK_CHAIN {
-            if cand.to_lowercase() != lower
-                && !out.iter().any(|e| e.to_lowercase() == cand.to_lowercase())
-            {
-                out.push(cand.to_string());
+        let mut push_unique = |name: &str| {
+            let lower = name.to_lowercase();
+            if !name.is_empty() && !out.iter().any(|e| e.to_lowercase() == lower) {
+                out.push(name.to_string());
             }
+        };
+        for entry in &self.fallback {
+            push_unique(entry.trim());
         }
+        for cand in FONT_FALLBACK_CHAIN {
+            push_unique(cand);
+        }
+        out.truncate(MAX_FALLBACK_DEPTH);
         out
+    }
+
+    /// Tail families for `FallbackRasterizer::new`: the user tier in order
+    /// followed by the platform default tail, primary excluded.
+    ///
+    /// This is [`fallback_chain`](Self::fallback_chain) without its first
+    /// (primary) entry; empty exactly when the platform tail dedups away
+    /// (unreachable for the pinned chains: every tail differs from any
+    /// primary that is not itself a tail entry).
+    #[must_use]
+    pub fn fallback_tails(&self) -> Vec<String> {
+        self.fallback_chain().into_iter().skip(1).collect()
     }
 
     /// Effective cell `(width, height)` after breathing room.
@@ -3553,6 +3615,153 @@ mod tests {
         {
             assert!(FONT_FALLBACK_CHAIN.contains(&"Segoe UI Symbol"));
             assert_eq!(EMOJI_FALLBACK_FAMILY, "Segoe UI Emoji");
+        }
+    }
+
+    #[test]
+    fn font_fallback_defaults_empty_and_valid() {
+        let d = FontConfig::default();
+        assert!(d.fallback.is_empty());
+        d.validate().expect("default valid");
+        // Empty user tier reproduces the historical chain exactly.
+        let expected: Vec<String> = FONT_FALLBACK_CHAIN[1..]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(d.fallback_tails(), expected);
+    }
+
+    #[test]
+    fn font_fallback_validation_bounds() {
+        // Valid list passes.
+        FontConfig {
+            family: "JetBrains Mono".into(),
+            fallback: vec![
+                "Symbols Nerd Font".into(),
+                "Noto Color Emoji".into(),
+                "Noto Sans CJK SC".into(),
+            ],
+            ..Default::default()
+        }
+        .validate()
+        .expect("valid fallback list");
+        // Too many entries fail closed.
+        FontConfig {
+            family: "JetBrains Mono".into(),
+            fallback: (0..MAX_FONT_FALLBACK_ENTRIES + 1)
+                .map(|i| format!("Fallback {i}"))
+                .collect(),
+            ..Default::default()
+        }
+        .validate()
+        .unwrap_err();
+        // Exactly the bound passes.
+        FontConfig {
+            family: "JetBrains Mono".into(),
+            fallback: (0..MAX_FONT_FALLBACK_ENTRIES)
+                .map(|i| format!("Fallback {i}"))
+                .collect(),
+            ..Default::default()
+        }
+        .validate()
+        .expect("bound-count fallback list");
+        // Empty and whitespace-only entries fail closed with an indexed path.
+        for bad in ["".to_string(), "   ".to_string(), "\t".to_string()] {
+            let err = FontConfig {
+                family: "JetBrains Mono".into(),
+                fallback: vec!["Symbols Nerd Font".into(), bad],
+                ..Default::default()
+            }
+            .validate()
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("font.fallback[1]"),
+                "unexpected diagnostic: {err}"
+            );
+        }
+        // Overlong entries fail closed like `font.family`.
+        let err = FontConfig {
+            family: "JetBrains Mono".into(),
+            fallback: vec!["x".repeat(MAX_FONT_FAMILY_LEN + 1)],
+            ..Default::default()
+        }
+        .validate()
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("font.fallback[0]"),
+            "unexpected diagnostic: {err}"
+        );
+    }
+
+    #[test]
+    fn font_fallback_chain_user_tier_first() {
+        // CTX-0949 (issue #1667): user order wins ahead of the platform tail.
+        let cfg = FontConfig {
+            family: "JetBrains Mono".into(),
+            fallback: vec![
+                "Symbols Nerd Font".into(),
+                "Noto Color Emoji".into(),
+                "Noto Sans CJK SC".into(),
+            ],
+            ..Default::default()
+        };
+        let chain = cfg.fallback_chain();
+        assert_eq!(chain[0], "JetBrains Mono");
+        assert_eq!(
+            &chain[1..4],
+            &[
+                "Symbols Nerd Font".to_string(),
+                "Noto Color Emoji".to_string(),
+                "Noto Sans CJK SC".to_string(),
+            ]
+        );
+        // Platform tail still follows (emoji tail survives; symbols tail too
+        // where pinned).
+        assert!(chain.contains(&EMOJI_FALLBACK_FAMILY.to_string()));
+        assert_eq!(cfg.fallback_tails(), chain[1..].to_vec());
+        // User entries that duplicate the primary or a platform tail appear
+        // exactly once (case-insensitive, whitespace-trimmed).
+        let dupes = FontConfig {
+            family: "JetBrains Mono".into(),
+            fallback: vec![
+                "  jetbrains mono  ".into(),
+                "monospace".into(),
+                "MONOSPACE".into(),
+                "Symbols Nerd Font".into(),
+            ],
+            ..Default::default()
+        };
+        let chain = dupes.fallback_chain();
+        assert_eq!(
+            chain
+                .iter()
+                .filter(|f| f.to_lowercase() == "jetbrains mono")
+                .count(),
+            1
+        );
+        assert_eq!(
+            chain
+                .iter()
+                .filter(|f| f.to_lowercase() == "monospace")
+                .count(),
+            1
+        );
+        assert_eq!(chain[1], "monospace");
+        assert_eq!(chain[2], "Symbols Nerd Font");
+        // Total depth never exceeds MAX_FALLBACK_DEPTH, user tier first: a
+        // full user list displaces platform-tail entries from the end.
+        let full = FontConfig {
+            family: "My Mono".into(),
+            fallback: (0..MAX_FONT_FALLBACK_ENTRIES)
+                .map(|i| format!("User {i}"))
+                .collect(),
+            ..Default::default()
+        };
+        let chain = full.fallback_chain();
+        assert!(chain.len() <= MAX_FALLBACK_DEPTH);
+        assert_eq!(chain[0], "My Mono");
+        for (i, entry) in full.fallback.iter().enumerate() {
+            assert_eq!(&chain[1 + i], entry, "user tier must survive truncation");
         }
     }
 

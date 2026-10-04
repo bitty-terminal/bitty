@@ -4281,6 +4281,7 @@ mod tests {
                     size: 12.0,
                     line_height: 1.0,
                     letter_spacing: 0.0,
+                    fallback: Vec::new(),
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -4294,6 +4295,7 @@ mod tests {
                     size: 12.0,
                     line_height: DEFAULT_LINE_HEIGHT,
                     letter_spacing: DEFAULT_LETTER_SPACING,
+                    fallback: Vec::new(),
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()

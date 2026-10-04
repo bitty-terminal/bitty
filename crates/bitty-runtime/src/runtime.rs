@@ -109,7 +109,8 @@ use bitty_term_state::{
 };
 use bitty_ui::{
     CellPos, Focus, FocusDirection, Gaps, LayoutNode, OverlayTier, PersistentSelection,
-    Rect as UiRect, SearchHighlight, Selection, SelectionKind, View, ViewId, search::SearchState,
+    Rect as UiRect, ScratchpadSlot, SearchHighlight, Selection, SelectionKind, View, ViewId,
+    search::SearchState,
 };
 use bitty_vt::{
     ClipboardOp, DynamicColorOp, DynamicColorTarget, PaletteColorOp, Parser, SequenceKind,
@@ -512,6 +513,14 @@ pub struct Runtime {
     active_workspace: usize,
     /// MRU workspace indices, active fronted, each live index exactly once.
     workspace_mru: std::collections::VecDeque<usize>,
+    /// Hidden per-window scratchpad slot (CTX-0954, CW-10).
+    ///
+    /// Holds at most one parked leaf detached from the live layout; it never
+    /// enters the layout solver and survives workspace switches. Occupancy is
+    /// exposed to plugins through [`Runtime::workspace_summaries`] (count +
+    /// presence on every row, under the existing `workspace.read` grant), so
+    /// the bar renders its indicator without any panel capability.
+    scratchpad: ScratchpadSlot,
     /// Monotonic high-water mark of every [`ViewId`] ever installed in a
     /// layout (CTX-0536, issue #923).
     ///
@@ -1499,6 +1508,7 @@ impl Runtime {
             workspaces: Vec::new(),
             active_workspace: 0,
             workspace_mru: std::collections::VecDeque::new(),
+            scratchpad: ScratchpadSlot::new(),
             view_id_high_water: 0,
             session_pending: BTreeMap::new(),
             session_primary_cwd: None,
@@ -1728,6 +1738,7 @@ impl Runtime {
             workspaces: Vec::new(),
             active_workspace: 0,
             workspace_mru: std::collections::VecDeque::new(),
+            scratchpad: ScratchpadSlot::new(),
             view_id_high_water: 0,
             session_pending: BTreeMap::new(),
             session_primary_cwd: None,

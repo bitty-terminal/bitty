@@ -182,7 +182,9 @@ fn workspace_id_value(seq: u64) -> LuaValue {
 /// Order: `closed`, `created`, `renamed`, `changed`, `focused`, each in
 /// workspace order. Payloads are identity-only: `{ id }`, plus `name` for
 /// `created`/`renamed`. `changed` means the panel list of a surviving
-/// workspace changed (count or order). Time O(w^2) over `w <= 16`
+/// workspace changed (count or order) or the window scratchpad occupancy
+/// flipped (CTX-0954: occupancy rides every row, so a put/take fires
+/// `changed`; the bar re-lists for the count). Time O(w^2) over `w <= 16`
 /// workspaces; allocates only when something changed.
 fn workspace_changes(
     previous: &[WorkspaceSummary],
@@ -228,7 +230,10 @@ fn workspace_changes(
     }
     for new in current {
         if let Some(old) = find(previous, new.seq).map(|index| &previous[index]) {
-            if old.panel_ids != new.panel_ids {
+            if old.panel_ids != new.panel_ids
+                || old.scratchpad_count != new.scratchpad_count
+                || old.scratchpad_occupied != new.scratchpad_occupied
+            {
                 events.push((
                     "workspace.changed",
                     LuaValue::table([("id", workspace_id_value(new.seq))]),
@@ -2049,6 +2054,8 @@ mod event_tracker_tests {
             name: name.to_string(),
             active,
             panel_ids: panels,
+            scratchpad_count: 0,
+            scratchpad_occupied: false,
         };
         let mut t = tracker("t", true);
         let old = vec![ws(1, "ws1", true, vec![10]), ws(2, "ws2", false, vec![20])];
@@ -2096,6 +2103,8 @@ mod event_tracker_tests {
             name: name.to_string(),
             active,
             panel_ids: panels,
+            scratchpad_count: 0,
+            scratchpad_occupied: false,
         };
         let mut t = tracker("t", true);
         let old = vec![ws(1, "ws1", true, vec![10]), ws(2, "ws2", false, vec![20])];
@@ -2118,6 +2127,8 @@ mod event_tracker_tests {
             name: name.to_string(),
             active,
             panel_ids: panels,
+            scratchpad_count: 0,
+            scratchpad_occupied: false,
         };
         let mut t = tracker("t", true);
         let old = vec![ws(1, "ws1", true, vec![10])];
@@ -2137,5 +2148,38 @@ mod event_tracker_tests {
         let events = t.take_changes("t", true, &changed);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].0, "workspace.changed");
+    }
+
+    #[test]
+    fn workspace_changed_fires_on_scratchpad_put_and_take() {
+        // CTX-0954: a scratchpad put/take flips occupancy with identical
+        // panels and still fires the existing `workspace.changed` (no new
+        // event family); steady occupancy fires nothing.
+        use bitty_runtime::WorkspaceSummary;
+        let ws = |occupied: bool| WorkspaceSummary {
+            seq: 1,
+            name: "ws1".to_string(),
+            active: true,
+            panel_ids: vec![10],
+            scratchpad_count: usize::from(occupied),
+            scratchpad_occupied: occupied,
+        };
+        let mut t = tracker("t", true);
+        let empty = vec![ws(false)];
+        assert!(
+            t.take_changes("t", true, &empty).is_empty(),
+            "first snapshot"
+        );
+        // Put: identical panels, occupancy flipped -> one changed event.
+        let events = t.take_changes("t", true, &[ws(true)]);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "workspace.changed");
+        // Take: flips back -> one changed event.
+        let events = t.take_changes("t", true, &empty);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "workspace.changed");
+        // Steady occupied: nothing fires.
+        t.take_changes("t", true, &[ws(true)]);
+        assert!(t.take_changes("t", true, &[ws(true)]).is_empty());
     }
 }

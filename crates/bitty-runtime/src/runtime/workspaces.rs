@@ -85,6 +85,9 @@ pub struct WorkspaceSlot {
 /// runtime (the plugin workspace domain). Carries identity, order, and panel
 /// structure only — never terminal content — and no plugin types, so the
 /// runtime stays free of the plugin boundary.
+///
+/// CTX-0954: the scratchpad slot is window-global (one `ScratchpadSlot` per
+/// window), so every summary of one snapshot carries the same occupancy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceSummary {
     /// Stable creation sequence (`ws{seq}` identity across index shifts).
@@ -96,6 +99,10 @@ pub struct WorkspaceSummary {
     /// Leaf (panel) view ids in layout order; the active slot reads the
     /// live layout. Its length is the panel count.
     pub panel_ids: Vec<u64>,
+    /// Parked panels in the window scratchpad slot (`0` or `1`).
+    pub scratchpad_count: usize,
+    /// Whether the window scratchpad slot holds a parked panel.
+    pub scratchpad_occupied: bool,
 }
 
 /// A close awaiting explicit confirmation (kill-confirm gate).
@@ -251,8 +258,14 @@ impl Runtime {
     /// slot's panels come from the live layout (its stash is refreshed only
     /// on switch-away), so the summary is never stale. Time O(w + l) over
     /// `w` workspaces and `l` total leaves; space O(w + l).
+    ///
+    /// CTX-0954: every row carries the window-global scratchpad occupancy
+    /// (`0`/`1` + presence), so a scratchpad put/take changes every row and
+    /// the existing `workspace.changed` diff fires without a new event.
     #[must_use]
     pub fn workspace_summaries(&self) -> Vec<WorkspaceSummary> {
+        let scratchpad_count = usize::from(!self.scratchpad.is_empty());
+        let scratchpad_occupied = !self.scratchpad.is_empty();
         self.workspaces
             .iter()
             .take(MAX_WORKSPACES)
@@ -269,9 +282,111 @@ impl Runtime {
                     name: slot.name.clone(),
                     active,
                     panel_ids: leaves.into_iter().map(|id| id.0).collect(),
+                    scratchpad_count,
+                    scratchpad_occupied,
                 }
             })
             .collect()
+    }
+
+    /// Parked panels in the window scratchpad slot: `0` (empty) or `1`
+    /// (occupied) (CTX-0954).
+    ///
+    /// Structurally bounded by the single-slot invariant; identity only,
+    /// never terminal content.
+    #[must_use]
+    pub fn scratchpad_count(&self) -> usize {
+        usize::from(!self.scratchpad.is_empty())
+    }
+
+    /// Whether the window scratchpad slot holds a parked panel (CTX-0954).
+    #[must_use]
+    pub fn scratchpad_occupied(&self) -> bool {
+        !self.scratchpad.is_empty()
+    }
+
+    /// Park live leaf `id` into the window scratchpad slot (CTX-0954).
+    ///
+    /// The leaf detaches from the live (active-workspace) layout and waits in
+    /// the single hidden slot; its pane session (if any) stays keyed by
+    /// [`ViewId`] and resumes on show. Occupancy surfaces through
+    /// [`Self::workspace_summaries`] and the existing `workspace.changed`
+    /// diff — no panel capability is involved.
+    ///
+    /// Fail-closed with state untouched: occupied slot, unknown id, a
+    /// rejected mode stamp, or hiding the live layout's last leaf (an empty
+    /// live layout would strand focus and present).
+    pub fn scratchpad_hide(&mut self, id: ViewId) -> Result<(), String> {
+        if self.layout.leaf_count() <= 1 {
+            return Err(String::from("scratchpad hide would strand an empty layout"));
+        }
+        self.scratchpad
+            .hide(&mut self.layout, id)
+            .map_err(|error| error.to_string())?;
+        self.after_scratchpad_move(Some(id));
+        Ok(())
+    }
+
+    /// Restore the parked leaf beside its anchor and focus it (CTX-0954).
+    ///
+    /// Returns the restored leaf id. Fail-closed with state untouched when
+    /// nothing is parked or the mode gate rejects the restore.
+    pub fn scratchpad_show(&mut self) -> Result<ViewId, String> {
+        let id = self
+            .scratchpad
+            .show(&mut self.layout)
+            .map_err(|error| error.to_string())?;
+        self.focus = Focus::with_focus(id);
+        self.after_scratchpad_move(None);
+        Ok(id)
+    }
+
+    /// Toggle the window scratchpad slot (CTX-0954).
+    ///
+    /// Shows the parked leaf when occupied (the target is ignored), otherwise
+    /// hides `target`. Returns the restored id on show, `None` on hide.
+    /// Same fail-closed rules as [`Self::scratchpad_hide`] and
+    /// [`Self::scratchpad_show`].
+    pub fn scratchpad_toggle(&mut self, target: Option<ViewId>) -> Result<Option<ViewId>, String> {
+        if self.scratchpad.is_empty() {
+            let id = target.ok_or_else(|| String::from("scratchpad hide needs a target leaf"))?;
+            self.scratchpad_hide(id).map(|()| None)
+        } else {
+            self.scratchpad_show().map(Some)
+        }
+    }
+
+    /// Shared post-edit fixups after the live layout lost or gained a leaf
+    /// through the scratchpad slot (CTX-0954).
+    ///
+    /// `hidden` is the just-parked leaf, if any: focus moves off it onto the
+    /// first surviving leaf, and primary-grid ownership follows (a parked leaf
+    /// paints nothing). Geometry, mode caches, hover dwell, and view bindings
+    /// follow the cross-workspace move precedent.
+    fn after_scratchpad_move(&mut self, hidden: Option<ViewId>) {
+        // CTX-0334: restructuring the live tree abandons any pending hover
+        // dwell, mirroring the cross-workspace move.
+        self.clear_hover_pending();
+        if let Some(id) = hidden {
+            if self.focus.focused() == Some(id) {
+                if let Some(first) = self.layout.leaf_ids().into_iter().next() {
+                    self.focus = Focus::with_focus(first);
+                }
+            }
+            if self.primary_view == Some(id) {
+                self.primary_view = self.focus.focused();
+            }
+        }
+        // CTX-0405: boundaries moved in place; re-sync before presenting.
+        self.sync_primary_geometry();
+        self.sync_pane_geometry();
+        // CTX-0532: focus may have transitioned; attribute the input-mode
+        // caches before any input can arrive.
+        self.sync_mode_caches_to_focus();
+        // CTX-0803/CTX-0805: a leaf left the live layout directly; bindings
+        // to it are dropped instead of lingering behind the read guard.
+        self.invalidate_stale_view_bindings();
+        self.pending_full_redraw = true;
     }
 
     /// Minimal tabline render: names + indices + focused marker + count.
@@ -660,6 +775,11 @@ impl Runtime {
         let mut raws: Vec<u64> = self.layout.leaf_ids().iter().map(|id| id.0).collect();
         for slot in &self.workspaces {
             raws.extend(slot.layout.leaf_ids().iter().map(|id| id.0));
+        }
+        // CTX-0954: the parked leaf is window-owned while hidden; covering it
+        // keeps the allocator from re-handing its id before it is restored.
+        if let Some(parked) = self.scratchpad.peek() {
+            raws.push(parked.id().0);
         }
         raws
     }
@@ -2505,5 +2625,95 @@ mod tests {
         assert!(rt.has_pane_session(&moved_id));
         assert!(rt.layout().leaf_ids().contains(&moved_id));
         assert_eq!(rt.focused_view(), Some(moved_id));
+    }
+
+    #[test]
+    fn scratchpad_hide_show_tracks_occupancy_in_summaries() {
+        // CTX-0954: empty vs occupied rows; a put/take flips count + presence
+        // on every (window-global) row; the parked id is never re-handed.
+        let mut rt = fresh();
+        let only = rt.focused_view().expect("focus");
+        assert_eq!(rt.scratchpad_count(), 0);
+        assert!(!rt.scratchpad_occupied());
+        for row in rt.workspace_summaries() {
+            assert_eq!(row.scratchpad_count, 0);
+            assert!(!row.scratchpad_occupied);
+        }
+        // Sole-leaf hide is refused fail-closed: the live layout never
+        // strands empty; vacant show fails too.
+        assert!(rt.scratchpad_hide(only).is_err());
+        assert!(rt.scratchpad_show().is_err());
+        assert_eq!(rt.layout().leaf_ids(), vec![only]);
+        // A second leaf lets the focused one park.
+        let second = ViewId::new(2);
+        let leaf1 = rt.layout().find_leaf(only).cloned().expect("leaf1");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(leaf1),
+            LayoutNode::leaf(View::new(second, 40, 24)),
+        ));
+        assert!(rt.set_focus(only));
+        rt.scratchpad_hide(only).expect("hide focused leaf");
+        assert_eq!(rt.scratchpad_count(), 1);
+        assert!(rt.scratchpad_occupied());
+        assert_eq!(rt.layout().leaf_ids(), vec![second]);
+        assert_eq!(
+            rt.focused_view(),
+            Some(second),
+            "focus leaves the parked leaf"
+        );
+        let summaries = rt.workspace_summaries();
+        assert!(!summaries.is_empty());
+        for row in &summaries {
+            assert_eq!(row.scratchpad_count, 1);
+            assert!(row.scratchpad_occupied);
+        }
+        assert_ne!(
+            rt.next_view_id_global(),
+            only,
+            "parked id stays covered while hidden"
+        );
+        // Occupied hide is refused with the tree untouched.
+        let before = rt.layout().clone();
+        assert!(rt.scratchpad_hide(second).is_err());
+        assert_eq!(rt.layout(), &before);
+        // Show restores the same id beside its anchor and focuses it.
+        let restored = rt.scratchpad_show().expect("show");
+        assert_eq!(restored, only);
+        assert_eq!(rt.scratchpad_count(), 0);
+        assert!(!rt.scratchpad_occupied());
+        assert_eq!(rt.focused_view(), Some(only));
+        assert!(rt.layout().leaf_ids().contains(&only));
+        for row in rt.workspace_summaries() {
+            assert_eq!(row.scratchpad_count, 0);
+            assert!(!row.scratchpad_occupied);
+        }
+    }
+
+    #[test]
+    fn scratchpad_toggle_hides_then_shows_target_ignored_on_show() {
+        // CTX-0954: vacant toggle hides the target; occupied toggle restores
+        // the parked leaf and ignores the target.
+        let mut rt = fresh();
+        assert!(rt.scratchpad_toggle(None).is_err(), "hide needs a target");
+        let only = rt.focused_view().expect("focus");
+        let second = ViewId::new(2);
+        let leaf1 = rt.layout().find_leaf(only).cloned().expect("leaf1");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(leaf1),
+            LayoutNode::leaf(View::new(second, 40, 24)),
+        ));
+        assert!(rt.set_focus(only));
+        assert_eq!(rt.scratchpad_toggle(Some(only)).expect("hide"), None);
+        assert!(rt.scratchpad_occupied());
+        assert_eq!(
+            rt.scratchpad_toggle(Some(second)).expect("show"),
+            Some(only)
+        );
+        assert!(!rt.scratchpad_occupied());
+        assert_eq!(rt.focused_view(), Some(only));
     }
 }

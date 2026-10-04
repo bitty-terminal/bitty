@@ -927,23 +927,11 @@ impl Runtime {
             );
             self.publish_inspect_snapshot();
         }
-        // CTX-0808 (#1484, review): the release paired with a
-        // chrome-consumed status-bar press on a non-focused frame never
-        // reaches a capturing app as an orphan report. One-shot: clear and
-        // swallow. Runs ahead of the modal return so the paired release is
-        // consumed even when copy/search activates mid-gesture; the inspect
-        // trace above stays either way.
-        if event.button == MouseButton::Left
-            && event.state == PressState::Released
-            && self.bar_release_swallow
-        {
-            self.bar_release_swallow = false;
-            return;
-        }
         // CTX-0946 C1: the release paired with a plugin-band chrome-consumed
         // press resolves the click into the drain queue (or counts it
         // unclaimed/denied) and never reaches a capturing app as an orphan
-        // report. One-shot like the Core-bar pairing above.
+        // report. One-shot, ahead of the modal return so the paired release
+        // is consumed even when copy/search activates mid-gesture.
         if event.button == MouseButton::Left
             && event.state == PressState::Released
             && self.band_release()
@@ -961,24 +949,13 @@ impl Runtime {
         }
         // Shift override always forces selection path.
         let shift_override = self.shift_pressed;
-        // CTX-0808 (#1484) / CTX-0873 (#1431): the workspace bar band is
-        // Core chrome outside every terminal frame — consume a press on it
-        // before the focus-then-capture decision below so no capturing app
-        // ever sees it (the release swallow above pairs with it) and focus
-        // never moves. Shift still forces selection.
-        if !shift_override
-            && event.button == MouseButton::Left
-            && event.state == PressState::Pressed
-            && self.status_bar_press()
-        {
-            return;
-        }
         // CTX-0946 C1: a plugin edge band is Core chrome outside every
         // terminal frame — consume a press on it before the focus-then-
         // capture decision below so no capturing app ever sees it (the
         // release block above pairs with it) and focus never moves. Shift
-        // still forces selection. The Core bar keeps precedence (checked
-        // first); geometry keeps the rows disjoint.
+        // still forces selection. (W-104/CTX-0956: the retired Core bar
+        // kept precedence here; with it deleted the plugin band is the
+        // only chrome press path.)
         if !shift_override
             && event.button == MouseButton::Left
             && event.state == PressState::Pressed
@@ -1578,16 +1555,14 @@ impl Runtime {
 
     /// Sets focus state and emits focus reports when mode 1004 is enabled.
     pub fn set_focused(&mut self, focused: bool) {
-        // CTX-0808 (#1484, review): losing window focus orphans an armed
-        // bar-release swallow — the app that would receive the paired
-        // release is no longer the focused one, so the swallow must not
-        // fire. Cleared whenever the window is (or stays) unfocused, ahead
-        // of the unchanged-state return; a focus gain keeps the flag so
-        // the paired release still swallows. The plugin-band swallow
-        // (CTX-0946 C1) pairs the same way and clears with it, along with
+        // Losing window focus orphans an armed band-press swallow — the app
+        // that would receive the paired release is no longer the focused
+        // one, so the swallow must not fire. Cleared whenever the window is
+        // (or stays) unfocused, ahead of the unchanged-state return; a focus
+        // gain keeps the flag so the paired release still resolves. The
+        // plugin-band swallow (CTX-0946 C1) clears with it, along with
         // its stored press target (a focus change ends the gesture).
         if !focused {
-            self.bar_release_swallow = false;
             self.clear_band_press();
         }
         if self.focused == focused {

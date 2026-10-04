@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- **Core workspace bar presentation (CTX-0956, #1572, W-104):** the Core
+  workspaceline/status-bar chrome is deleted and the `bar` plugin is the
+  single workspace/status UX. Gone: `workspaceline_present`,
+  `status_bar_text`, `bar_present`, the Core bar paint path
+  (`push_status_bar_band` and its band snapshot/overlay), the Core bar
+  click path (`workspaceline_hit_test` / `workspaceline_click` /
+  `status_bar_press` / `status_bar_hit` plus the `bar_release_swallow`
+  pairing), the per-tick bar-text damage signal (`last_presented_bar`),
+  and `STATUS_BAR_ROWS`. Core now reserves zero bar rows on every edge, so
+  plugin bands start at the window edge and the grid keeps every row with
+  zero plugins or in `bitty --safe` (ADR-0014: safe mode has no built-in
+  bar). Retained as host mechanisms: the `workspaceline_text` data string
+  for `ctl`/tabline, the `chrome_band::solve` geometry and
+  `status_bar_band` seam, Core-owned plugin band click routing (C1), paint
+  tokens and the redraw gate (C2), the exclusive-zone budget (C3),
+  workspace lifecycle/state/commands/events, and the `workspace.show_bar` /
+  `workspace.bar.edge` settings (pending the W-26/W-27 migration).
+
 - **Embedded network path (CTX-0906, #1577, DIR-030):** the `network` cargo
   features of `bitty-lua` and `bitty-runtime`, the `bitty-network-lua` git
   dependency (rev `d97c5da`), `Vm::register_network_module`, and

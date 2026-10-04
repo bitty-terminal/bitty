@@ -8,8 +8,7 @@
 //!
 //! - **C1 — Core-owned click routing.** Pointer geometry is authoritative in
 //!   Core: a primary press on a band row is consumed as chrome (no focus
-//!   move, no selection, no capture report — the Core-bar precedent in
-//!   [`Runtime::status_bar_press`](super::workspaces)), and the paired
+//!   move, no selection, no capture report), and the paired
 //!   primary release resolves through the same band rectangles the renderer
 //!   used into the owning plugin's declared `on_click` command. The plugin
 //!   never sees raw pointer coordinates: the host queues a
@@ -18,21 +17,20 @@
 //!   `PluginRuntime::dispatch_command` path, where registration and
 //!   capability checks fail closed as usual. Clicks on unclaimed spans and
 //!   clicks outside every band row dispatch nothing. Overlapping row claims
-//!   (two bands on one row, or a band on the Core bar row) are denied with a
-//!   diagnostic — never routed to either claimant.
+//!   (two bands on one row, or a band on the retired Core bar row) are
+//!   denied with a diagnostic — never routed to either claimant.
 //! - **C2 — paint tokens and the redraw gate.** `fg`/`bg` resolve through the
 //!   minimal host token table ([`resolve_band_token`]); `bold` paints as a
 //!   synthetic double-strike. Every band paint is bounded to its granted
 //!   one-row band rectangle: text is clipped to the window width, fills and
 //!   glyphs are derived from the same flattened spans the hit-test uses, and
-//!   a geometry violation (overlap with another band, the Core bar, or the
-//!   layout container) skips the whole band — never a partial paint — and
-//!   counts [`BandHostStats::paint_violations`].
+//!   a geometry violation (overlap with another band, the retired Core bar
+//!   row, or the layout container) skips the whole band — never a partial
+//!   paint — and counts [`BandHostStats::paint_violations`].
 //! - **C3 — exclusive-zone enforcement.** Visible plugin bands shrink the
-//!   layout container through the normal reflow path (the same funnels that
-//!   carry the Core workspaceline band), so no terminal cell, cursor,
-//!   selection, or overlay region is ever painted under a band, and PTY
-//!   winsizes follow the reduced grid. Content-only band updates change
+//!   layout container through the normal reflow path, so no terminal cell,
+//!   cursor, selection, or overlay region is ever painted under a band, and
+//!   PTY winsizes follow the reduced grid. Content-only band updates change
 //!   damage only; showing, hiding, or restacking a band reflows once.
 //!
 //! Ownership direction follows the accepted W-74 disposition (Core owns
@@ -538,10 +536,12 @@ impl Runtime {
 
     /// Whether the painted band rows violate exclusive geometry.
     ///
-    /// True on any duplicate row, any band on the Core bar row, or any band
-    /// row inside the layout container. Paint and hit-test fail closed on
-    /// `true` with a diagnostic; the budget math keeps this unreachable in
-    /// practice.
+    /// True on any duplicate row, any band on the retired Core bar row, or
+    /// any band row inside the layout container. Paint and hit-test fail
+    /// closed on `true` with a diagnostic; the budget math keeps this
+    /// unreachable in practice. (W-104/CTX-0956: the Core bar is deleted so
+    /// the Core term is always `None`; it stays as a guard behind the
+    /// [`Runtime::status_bar_band`] geometry seam.)
     #[must_use]
     pub fn band_geometry_violated(&self) -> bool {
         let rows = self.painted_band_rows();
@@ -655,8 +655,7 @@ impl Runtime {
     /// arming the one-shot [`Self::band_release_swallow`] plus the stored
     /// press target so the paired release routes only onto the same band
     /// run (standard button semantics). Shift still forces the selection
-    /// path (the CTX-0181 accessibility escape). The Core bar keeps
-    /// precedence: callers run [`Self::status_bar_press`] first.
+    /// path (the CTX-0181 accessibility escape).
     pub(super) fn band_press(&mut self) -> bool {
         if self.shift_pressed {
             return false;
@@ -718,8 +717,7 @@ impl Runtime {
     }
     /// Resolves the release paired with a band-consumed press (CTX-0946 C1).
     ///
-    /// Returns `true` (consume the release) when the swallow is armed,
-    /// exactly like the Core-bar pairing. Standard button semantics: the
+    /// Returns `true` (consume the release) when the swallow is armed. Standard button semantics: the
     /// release routes only when it resolves to the same band run the press
     /// armed (band, run, and resolved request all equal, so content that
     /// changed mid-gesture cannot misroute). A drag onto another span or

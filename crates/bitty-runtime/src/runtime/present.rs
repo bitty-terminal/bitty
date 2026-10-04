@@ -306,12 +306,6 @@ pub(super) fn px_add(a: i32, b: i32) -> i32 {
     a.saturating_add(b)
 }
 
-/// Window-cell coordinate times a live cell extent in pixels, saturated to
-/// `i32` (CTX-0873 band origin).
-fn px_mul(cells: u16, cell_px: u32) -> i32 {
-    i32::try_from(u64::from(cells).saturating_mul(u64::from(cell_px))).unwrap_or(i32::MAX)
-}
-
 /// Cell-span width in pixels (`cells * cell_px`), saturated to `u32`.
 pub(super) fn px_span(cells: u16, cell_px: u32) -> u32 {
     u32::try_from(u64::from(cells).saturating_mul(u64::from(cell_px))).unwrap_or(u32::MAX)
@@ -346,115 +340,6 @@ fn erased_snapshot(base: &Snapshot) -> Snapshot {
         cursor: base.cursor.clone(),
         modes: base.modes.clone(),
         title: base.title.clone(),
-    }
-}
-
-/// Builds the owned snapshot the workspace bar band renders from
-/// (CTX-0873, issue #1431): `cols` x `rows` erased cells with the bar text
-/// painted on its last row by [`overlay_status_bar`]. The cursor is hidden
-/// (the band is chrome, never a caret target) and the modes and title are
-/// defaults: the band never inherits a grid's screen modes (for example
-/// DECSCNM reverse video) or copies its title. Pure; never touches grid
-/// truth.
-fn band_snapshot(base: &Snapshot, cols: usize, rows: usize, text: &str) -> Snapshot {
-    let len = cols.saturating_mul(rows);
-    let mut cursor = base.cursor.clone();
-    cursor.visible = false;
-    let mut snapshot = Snapshot {
-        version: base.version,
-        generation: base.generation,
-        width: cols,
-        height: rows,
-        cells: vec![Cell::erased(Style::default()); len].into_boxed_slice(),
-        cursor,
-        modes: bitty_term_state::Modes::default(),
-        title: bitty_vt::BoundedString::new(""),
-    };
-    overlay_status_bar(&mut snapshot, text);
-    snapshot
-}
-
-/// Paints the status bar text onto the last row of an owned band
-/// snapshot (issue #1349; CTX-0873 retargeted it from leaf snapshots to the
-/// dedicated band snapshot built by [`band_snapshot`]).
-///
-/// Presentation-only: the caller passes an owned copy, so grid truth is
-/// never mutated. The full row takes inverse video so it
-/// reads as a bar; `text` is laid out width-aware
-/// ([`char_cell_width`]) with wide-spacer halves, truncated at the frame
-/// edge, and the remainder padded with bar-styled spaces. Control
-/// scalars render as spaces so overlay columns stay aligned with the
-/// character columns [`Runtime::workspaceline_hit_test`] counts;
-/// zero-width scalars attach to the previous cell (dropped when full or
-/// leading). Total and fail-closed: empty/zero-size snapshots and length
-/// mismatches paint nothing and never panic.
-fn overlay_status_bar(snapshot: &mut Snapshot, text: &str) {
-    if snapshot.height == 0 || snapshot.width == 0 {
-        return;
-    }
-    if snapshot.cells.len() != snapshot.width.saturating_mul(snapshot.height) {
-        return;
-    }
-    let bar_style = Style {
-        foreground: None,
-        background: None,
-        underline_color: None,
-        attributes: Attributes {
-            inverse: true,
-            ..Default::default()
-        },
-    };
-    let bar_space = Cell {
-        glyph: ' ',
-        style: bar_style,
-        width: 1,
-        spacer: false,
-        hyperlink: None,
-        zerowidth: Zerowidth::new(),
-    };
-    let row_start = snapshot
-        .width
-        .saturating_mul(snapshot.height.saturating_sub(1));
-    for col in 0..snapshot.width {
-        snapshot.cells[row_start.saturating_add(col)] = bar_space;
-    }
-    let mut col = 0usize;
-    for ch in text.chars() {
-        if col >= snapshot.width {
-            break;
-        }
-        if ch.is_control() {
-            // Column-preserving placeholder (see above); the space cell is
-            // already painted.
-            col = col.saturating_add(1);
-            continue;
-        }
-        let width = usize::from(char_cell_width(ch));
-        if width == 0 {
-            // Zero-width scalar: attach to the previous cell when there is
-            // one, else drop. Never advances the column.
-            if col > 0 {
-                let _ = snapshot.cells[row_start.saturating_add(col.saturating_sub(1))]
-                    .push_zerowidth(ch);
-            }
-            continue;
-        }
-        if col.saturating_add(width) > snapshot.width {
-            break;
-        }
-        snapshot.cells[row_start.saturating_add(col)] = Cell {
-            glyph: ch,
-            style: bar_style,
-            width: width as u8,
-            spacer: false,
-            hyperlink: None,
-            zerowidth: Zerowidth::new(),
-        };
-        if width == 2 {
-            snapshot.cells[row_start.saturating_add(col.saturating_add(1))] =
-                Cell::wide_spacer(bar_style);
-        }
-        col = col.saturating_add(width);
     }
 }
 
@@ -1093,17 +978,6 @@ impl Runtime {
             pending_full = true;
         }
 
-        // Issue #1349 / CTX-0873: the bar band is rebuilt every frame from
-        // live text, so a workspace switch/new/close/rename with a quiet
-        // grid still needs a frame. The text comparison is the bar's damage signal;
-        // `set_workspaceline_visible` already forces via
-        // `pending_full_redraw`. Bounded (`WORKSPACELINE_MAX_CHARS`).
-        // Formatted once per tick and carried on the basis so the band
-        // render and the presented-bar bookkeeping reuse this one value.
-        let bar_text = self.status_bar_text();
-        if bar_text != self.last_presented_bar {
-            pending_full = true;
-        }
         // CTX-0946 C2: a plugin mount/update/unmount with a quiet grid
         // still needs a frame (band damage only; geometry reflows through
         // the exclusive-zone budget in `refresh_chrome_band` above).
@@ -1223,62 +1097,8 @@ impl Runtime {
             ring_ctx,
             cells_before,
             glyphs_before,
-            bar_text,
             band_versions,
         })
-    }
-
-    /// Renders the workspace bar band into `built` at its window origin
-    /// (CTX-0873). Returns `true` when the render planned against a newer
-    /// atlas epoch than the slots already collected (the caller abandons the
-    /// attempt, exactly like a stale leaf).
-    fn push_status_bar_band(
-        &mut self,
-        band: UiRect,
-        text: &str,
-        base: &Snapshot,
-        pad_px: i32,
-        attempt: u8,
-        built: &mut CombinedLeaves,
-    ) -> bool {
-        let live = self.live_cell_metrics();
-        let snap = band_snapshot(
-            base,
-            usize::from(band.width),
-            usize::from(band.height),
-            text,
-        );
-        let damage = Damage {
-            generation: base.generation,
-            regions: vec![DamagedRegion::Grid(DamageRect::full(
-                band.height,
-                band.width,
-            ))]
-            .into_boxed_slice(),
-        };
-        let Ok(list) = self.renderer.render(&snap, &damage) else {
-            return false;
-        };
-        let frame_epoch = *built.atlas_epoch.get_or_insert(list.atlas_epoch);
-        if !list.is_atlas_epoch_valid(frame_epoch) && attempt < ATLAS_REBUILD_LIMIT {
-            return true;
-        }
-        let origin_x = px_add(pad_px, px_mul(band.x, live.width));
-        let origin_y = px_add(pad_px, px_mul(band.y, live.height));
-        built.needs_draw |= list.needs_draw();
-        for mut fill in list.fills {
-            fill.rect.x = px_add(fill.rect.x, origin_x);
-            fill.rect.y = px_add(fill.rect.y, origin_y);
-            built.fills.push(fill);
-            built.needs_draw = true;
-        }
-        for mut glyph in list.glyphs {
-            glyph.dest[0] = px_add(glyph.dest[0], origin_x);
-            glyph.dest[1] = px_add(glyph.dest[1], origin_y);
-            built.glyphs.push(glyph);
-            built.needs_draw = true;
-        }
-        false
     }
 
     /// Phase 3 (CTX-0474): build the retryable combined leaf primitive pass.
@@ -1305,13 +1125,10 @@ impl Runtime {
         // the same pass), so the whole leaf set is rebuilt when a reset is
         // observed, bounded by [`ATLAS_REBUILD_LIMIT`].
         let mut attempt = 0u8;
-        // CTX-0873 (#1431): the workspace bar band for this frame (owned:
-        // the leaf loop below takes `&mut self`). `None` when no band is
-        // reserved (opted out, a lone workspace, or a too-small window).
-        let status_bar = basis
-            .bar_text
-            .as_deref()
-            .and_then(|text| self.status_bar_band().map(|band| (band, text.to_owned())));
+        // CTX-0873 (#1431) retired (W-104/CTX-0956): the Core workspace bar
+        // band is deleted — the `bar` plugin owns workspace/status UX over
+        // the generic band mechanism — so no Core band paints here. Plugin
+        // bands paint through the band-host path below.
         let built = loop {
             attempt += 1;
             let mut built = CombinedLeaves::default();
@@ -1609,21 +1426,6 @@ impl Runtime {
                 );
                 built.fills.extend(fills);
                 built.glyphs.extend(glyphs);
-            }
-
-            // CTX-0873 (#1431): the workspace bar paints into its own
-            // Core-reserved band, outside every leaf frame, so no terminal
-            // cell is ever occluded. Rendered inside the attempt so its
-            // glyph slots share the frame's atlas epoch (#1409). Not
-            // retained: the band is one short row and every change to its
-            // text or geometry already forces a full frame.
-            if !stale_epoch {
-                if let Some((band, text)) = status_bar.as_ref() {
-                    if self.push_status_bar_band(*band, text, snapshot, pad_px, attempt, &mut built)
-                    {
-                        stale_epoch = true;
-                    }
-                }
             }
 
             if stale_epoch {
@@ -2214,8 +2016,12 @@ impl Runtime {
         if plan.is_empty() {
             return;
         }
-        // Overlap fail-closed: rows claimed twice, or a band on the Core bar
-        // row, deny every claimant on the shared row (never partial paint).
+        // Overlap fail-closed: rows claimed twice, or a band on the
+        // retired Core bar row, deny every claimant on the shared row
+        // (never partial paint). The Core bar is deleted (W-104/CTX-0956),
+        // so `core_bar_row` is always `None`; the term stays as a guard
+        // behind the same [`status_bar_band`](Runtime::status_bar_band)
+        // geometry seam.
         let core_bar_row = self.status_bar_band().map(|bar| bar.y);
         let mut denied_rows: Vec<u16> = Vec::new();
         for (index, (_, row, _)) in plan.iter().enumerate() {
@@ -2601,7 +2407,6 @@ impl Runtime {
             current_gen,
             cells_before,
             glyphs_before,
-            bar_text,
             band_versions,
             ..
         } = basis;
@@ -2620,7 +2425,6 @@ impl Runtime {
             self.mark_frame_presented(snapshot.generation);
             self.last_presented_allocations = allocations;
             self.last_presented_focus = focused;
-            self.last_presented_bar = bar_text;
             self.last_presented_bands = band_versions;
             return None;
         }
@@ -2737,7 +2541,6 @@ impl Runtime {
             self.mark_frame_presented(snapshot.generation);
             self.last_presented_allocations = allocations;
             self.last_presented_focus = focused;
-            self.last_presented_bar = bar_text;
             self.last_presented_bands = band_versions;
             return None;
         }
@@ -2773,7 +2576,6 @@ impl Runtime {
         self.mark_frame_presented(snapshot.generation);
         self.last_presented_allocations = allocations;
         self.last_presented_focus = focused;
-        self.last_presented_bar = bar_text;
         self.last_presented_bands = band_versions;
         self.kitty_last_frame_images = kitty_blits;
         // CTX-0244: publish the presented headless frame for `frameHash`
@@ -2844,9 +2646,6 @@ struct TickBasis {
     cells_before: u64,
     /// Renderer glyphs-emitted counter baseline for the stats delta.
     glyphs_before: u64,
-    /// Workspace bar text for this frame, formatted once per tick
-    /// (CTX-0873); `None` when the bar does not present.
-    bar_text: Option<String>,
     /// Mounted band versions for this frame (CTX-0946 C2).
     band_versions: Vec<(String, bitty_lua::ui::UiSlot, u32)>,
 }
@@ -3288,92 +3087,6 @@ mod content_padding_tests {
         );
         assert!(rt.set_decoration(Decoration::ZERO).is_ok());
         assert_eq!(rt.decoration(), Decoration::ZERO);
-    }
-}
-
-#[cfg(test)]
-mod status_bar_overlay_tests {
-    use super::overlay_status_bar;
-    use bitty_term_state::State;
-
-    fn blank(width: usize, height: usize) -> bitty_term_state::Snapshot {
-        let mut state = State::new();
-        state.resize(width, height);
-        state.snapshot()
-    }
-
-    #[test]
-    fn bar_row_takes_inverse_video_with_text_and_padding() {
-        let mut snap = blank(8, 3);
-        overlay_status_bar(&mut snap, "1:a*");
-        // Upper rows are untouched grid truth.
-        for row in 0..2 {
-            for col in 0..8 {
-                let cell = &snap.cells[row * 8 + col];
-                assert!(!cell.style.attributes.inverse, "row {row} col {col}");
-            }
-        }
-        // Last row: text then bar-styled spaces, all inverse.
-        let row = &snap.cells[16..24];
-        assert!(row.iter().all(|c| c.style.attributes.inverse));
-        let glyphs: String = row.iter().map(|c| c.glyph).collect();
-        assert_eq!(glyphs, "1:a*    ");
-        assert!(!row.iter().any(|c| c.spacer));
-        assert!(!row.iter().any(|c| c.hyperlink.is_some()));
-    }
-
-    #[test]
-    fn bar_lays_out_wide_chars_with_spacers_and_truncates() {
-        // 'a' + U+4E2D (wide) + 'b': spacer invariant holds, no orphans.
-        let mut snap = blank(4, 1);
-        overlay_status_bar(&mut snap, "a\u{4e2d}b");
-        let row = &snap.cells[0..4];
-        assert_eq!(row[0].glyph, 'a');
-        assert_eq!(row[1].glyph, '\u{4e2d}');
-        assert_eq!(row[1].width, 2);
-        assert!(row[2].spacer, "wide trailing half must be a spacer");
-        assert_eq!(row[3].glyph, 'b');
-        // A wide scalar with one cell left is truncated, never split.
-        let mut narrow = blank(2, 1);
-        overlay_status_bar(&mut narrow, "a\u{4e2d}");
-        assert_eq!(narrow.cells[0].glyph, 'a');
-        assert_eq!(narrow.cells[1].glyph, ' ');
-        assert!(!narrow.cells[1].spacer);
-        // Plain overlong text truncates at the frame edge.
-        let mut tiny = blank(2, 1);
-        overlay_status_bar(&mut tiny, "abc");
-        assert_eq!(tiny.cells[0].glyph, 'a');
-        assert_eq!(tiny.cells[1].glyph, 'b');
-    }
-
-    #[test]
-    fn bar_folds_controls_and_zero_width_without_shifting_columns() {
-        // '\n' keeps its column as a space; the combining acute attaches
-        // to 'a' without advancing, so 'b' still lands on column 2.
-        let mut snap = blank(5, 1);
-        overlay_status_bar(&mut snap, "a\u{301}\nb ");
-        let row = &snap.cells[0..5];
-        assert_eq!(row[0].glyph, 'a');
-        assert_eq!(row[0].zerowidth.len(), 1);
-        assert_eq!(row[1].glyph, ' ');
-        assert_eq!(row[2].glyph, 'b');
-        assert_eq!(row[3].glyph, ' ');
-        assert!(row.iter().all(|c| c.style.attributes.inverse));
-    }
-
-    #[test]
-    fn bar_is_noop_on_degenerate_snapshots() {
-        // Zero height: no last row exists (State::resize clamps to >= 1,
-        // so the degenerate shape is built by direct mutation).
-        let mut flat = blank(4, 2);
-        flat.height = 0;
-        overlay_status_bar(&mut flat, "1:a*");
-        assert!(flat.cells.iter().all(|c| !c.style.attributes.inverse));
-        // Length mismatch (defensive: never index out of bounds).
-        let mut short = blank(4, 2);
-        short.cells = short.cells[0..4].to_vec().into_boxed_slice();
-        overlay_status_bar(&mut short, "1:a*");
-        assert_eq!(short.cells.len(), 4);
     }
 }
 

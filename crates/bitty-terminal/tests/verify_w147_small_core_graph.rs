@@ -1,0 +1,355 @@
+//! W-147 final verification gate: small-core dependency graph + safe startup
+//! (CTX-0940, issue #1621).
+//!
+//! These tests pin the program end-state so a later change cannot silently
+//! re-grow the retired surface:
+//!
+//! - validation suites (`bitty-compat-lab`, `bitty-perf`) live outside the
+//!   workspace (W-105, CTX-0931): no workspace member, no normal dependency
+//!   edge;
+//! - harness-only crates (`bitty-test-support`, `bitty-test-vm`) are
+//!   dev-dependencies only: no production (`[dependencies]`) edge anywhere;
+//! - extension mechanics (`bitty-storage`) link only through the composition
+//!   root (`bitty-terminal`), behind Core-owned traits; Core library sources
+//!   never name the storage implementation (`Core-never-imports-extension`,
+//!   W-146 DEC-W146-2);
+//! - `bitty --safe` starts with zero third-party plugins: the safe load
+//!   policy selects nothing hostile, and the built binary skips a hostile
+//!   dev-root plugin with no VM.
+//!
+//! Graph evidence beyond assertion: `cargo tree -e normal` (recorded in the
+//! CTX-0940 verification report) shows `bitty-storage` reachable only from
+//! `bitty-terminal`, and `cargo tree -i bitty-test-support/-test-vm -e normal`
+//! shows no normal-edge consumers.
+
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+
+/// Binary under test (fails to compile if the `[[bin]]` rename regresses).
+const BITTY_BIN: &str = env!("CARGO_BIN_EXE_bitty");
+
+/// Crates that must never appear on a production edge after W-105: the
+/// relocated validation suites plus the harness-only crates.
+const TEST_ONLY_CRATES: &[&str] = &[
+    "bitty-compat-lab",
+    "bitty-perf",
+    "bitty-test-support",
+    "bitty-test-vm",
+];
+
+/// Extension crates that must link only where the seam requires (W-140..W-146).
+/// `bitty-storage` is the single permitted production edge, owned by the
+/// composition root; execution/graphics/a11y must not appear at all.
+const EXTENSION_CRATES: &[&str] = &[
+    "bitty-storage",
+    "bitty-execution",
+    "bitty-graphics",
+    "bitty-a11y",
+];
+
+/// Workspace root derived from this crate's manifest dir (no hardcoded checkout
+/// paths): `<workspace>/crates/bitty-terminal` -> `<workspace>`.
+fn workspace_root() -> PathBuf {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    manifest
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("crates/<name> parent layout")
+        .to_path_buf()
+}
+
+/// Workspace member crate names parsed from the root `Cargo.toml` `members`
+/// array (quoted `"crates/<name>"` entries only).
+fn workspace_members(root: &Path) -> Vec<String> {
+    let text = std::fs::read_to_string(root.join("Cargo.toml")).expect("read workspace Cargo.toml");
+    let members_section = text
+        .split("members = [")
+        .nth(1)
+        .expect("workspace Cargo.toml must declare members");
+    let list = members_section
+        .split(']')
+        .next()
+        .expect("members array must close");
+    list.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim().trim_matches([',', ' ']);
+            let inner = trimmed.strip_prefix('"')?.strip_suffix('"')?;
+            inner
+                .strip_prefix("crates/")
+                .map(std::string::ToString::to_string)
+        })
+        .collect()
+}
+
+/// Raw text of one member's manifest.
+fn member_manifest(root: &Path, member: &str) -> String {
+    let path = root.join("crates").join(member).join("Cargo.toml");
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("read manifest for member {member}: {err}"))
+}
+
+/// Lines of the `[dependencies]` section only (excludes `[dev-dependencies]`,
+/// `[build-dependencies]`, and `[target.*.dependencies]` overlays, which carry
+/// no workspace-internal edges today; see the report for the `cargo tree`
+/// cross-check). Returned lines are comment-stripped so prose mentions of a
+/// crate (e.g. the W-141 note in `bitty-rich`) never read as an edge.
+fn normal_dependency_lines(manifest: &str) -> Vec<String> {
+    let mut in_normal_deps = false;
+    let mut lines = Vec::new();
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_normal_deps = trimmed == "[dependencies]";
+            continue;
+        }
+        if in_normal_deps {
+            let code = line.split('#').next().unwrap_or("").trim().to_string();
+            if !code.is_empty() {
+                lines.push(code);
+            }
+        }
+    }
+    lines
+}
+
+/// True when a comment-stripped `[dependencies]` line declares `dep`
+/// (`name = ...` shape, hyphen or underscore spelling).
+fn declares_dep(line: &str, dep: &str) -> bool {
+    [dep, &dep.replace('-', "_")].iter().any(|name| {
+        line == *name
+            || line.starts_with(&format!("{name} "))
+            || line.starts_with(&format!("{name}="))
+    })
+}
+
+/// Member names whose `[dependencies]` section names `dep` (hyphen or
+/// underscore spelling).
+fn normal_consumers_of(root: &Path, members: &[String], dep: &str) -> Vec<String> {
+    members
+        .iter()
+        .filter(|member| {
+            normal_dependency_lines(&member_manifest(root, member))
+                .iter()
+                .any(|line| declares_dep(line, dep))
+        })
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn workspace_members_exclude_validation_suites() {
+    // W-105 (CTX-0931): compat-lab and perf moved to standalone repositories
+    // pinned via `validation-pins.env`; the workspace must not re-add them.
+    let root = workspace_root();
+    let members = BTreeSet::from_iter(workspace_members(&root));
+    for suite in ["bitty-compat-lab", "bitty-perf"] {
+        assert!(
+            !members.contains(suite),
+            "workspace must not contain validation suite `{suite}` (W-105 relocation)"
+        );
+    }
+}
+
+#[test]
+fn no_normal_edge_to_test_only_crates() {
+    // Harness-only and relocated-suite crates may appear in
+    // `[dev-dependencies]` but never on a production edge. This mirrors
+    // `cargo tree -e normal`, which shows zero normal-edge consumers.
+    let root = workspace_root();
+    let members = workspace_members(&root);
+    for dep in TEST_ONLY_CRATES {
+        let consumers = normal_consumers_of(&root, &members, dep);
+        assert!(
+            consumers.is_empty(),
+            "test-only crate `{dep}` must have no `[dependencies]` edge, found in: {consumers:?}"
+        );
+    }
+}
+
+#[test]
+fn only_composition_root_links_storage_extension() {
+    // W-146 DEC-W146-2: the composition root owns the extracted storage
+    // mechanics; Core library crates consume persistence through Core-owned
+    // traits. Execution/graphics/a11y have no production edge at all.
+    let root = workspace_root();
+    let members = workspace_members(&root);
+    let (linked, unlinked) = EXTENSION_CRATES
+        .split_first()
+        .expect("EXTENSION_CRATES names the linked seam first");
+    assert_eq!(
+        *linked, "bitty-storage",
+        "test contract: EXTENSION_CRATES[0] is the composition-root seam"
+    );
+    let storage_consumers = normal_consumers_of(&root, &members, linked);
+    assert_eq!(
+        storage_consumers,
+        vec!["bitty-terminal".to_string()],
+        "only the composition root may link `bitty-storage`, got: {storage_consumers:?}"
+    );
+    for dep in unlinked {
+        let consumers = normal_consumers_of(&root, &members, dep);
+        assert!(
+            consumers.is_empty(),
+            "extension crate `{dep}` must have no `[dependencies]` edge, found in: {consumers:?}"
+        );
+    }
+}
+
+/// Collect `*.rs` files under `dir` (non-recursive walk, skips `target/`).
+fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let entries =
+        std::fs::read_dir(dir).unwrap_or_else(|err| panic!("read dir {}: {err}", dir.display()));
+    for entry in entries {
+        let path = entry.expect("dir entry").path();
+        if path.file_name().is_some_and(|name| name == "target") {
+            continue;
+        }
+        if path.is_dir() {
+            rust_files(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+#[test]
+fn core_library_sources_never_name_storage_impl() {
+    // Core-never-imports-extension at the source level: the only Rust source
+    // allowed to name `bitty_storage::` paths is the composition-root seam
+    // (`storage_backends.rs`), which implements the Core-owned backends behind
+    // Core validation. Every other crate reaches persistence through the
+    // `SessionFileBackend` / `KvCommitBackend` traits.
+    let root = workspace_root();
+    let seam = root
+        .join("crates")
+        .join("bitty-terminal")
+        .join("src")
+        .join("storage_backends.rs");
+    let mut offenders = Vec::new();
+    for member in workspace_members(&root) {
+        let src = root.join("crates").join(&member).join("src");
+        if !src.is_dir() {
+            continue;
+        }
+        let mut files = Vec::new();
+        rust_files(&src, &mut files);
+        for file in files {
+            if file == seam {
+                continue;
+            }
+            let text = std::fs::read_to_string(&file).expect("read rs file");
+            if text.contains("bitty_storage::") {
+                offenders.push(file);
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "Core library sources must not name the storage implementation: {offenders:?}"
+    );
+}
+
+#[test]
+fn safe_policy_selects_zero_third_party() {
+    // `--safe` starts with zero third-party plugins: the safe load policy
+    // drops every third-party candidate before any VM is built (the same
+    // `LoadPolicy::safe_mode` the composition root wires to `args.safe`).
+    use bitty_lua::gate::{
+        LoadPolicy, PluginCandidate, count_third_party_selected, select_candidates,
+    };
+
+    let policy = LoadPolicy::safe_mode();
+    assert!(policy.is_safe_mode());
+    assert!(!policy.allows_third_party());
+    let candidates = vec![
+        PluginCandidate::first_party("core.example"),
+        PluginCandidate::third_party("evil-exec.example"),
+        PluginCandidate::third_party("evil-io.example"),
+        PluginCandidate::third_party("evil-require.example"),
+    ];
+    let selected = select_candidates(&policy, &candidates);
+    assert_eq!(
+        selected.len(),
+        1,
+        "safe mode admits only first-party: {selected:?}"
+    );
+    assert_eq!(count_third_party_selected(&policy, &candidates), 0);
+}
+
+/// Writes one dev-root package: `<root>/<id>/bitty-plugin.toml` plus
+/// `<root>/<id>/lua/init.lua` (dev roots resolve as third-party `local-path`
+/// provenance, so `--safe` must skip them with no VM).
+fn write_dev_plugin(root: &Path, id: &str) {
+    let plugin = root.join(id);
+    std::fs::create_dir_all(plugin.join("lua")).expect("plugin dirs");
+    std::fs::write(
+        plugin.join("bitty-plugin.toml"),
+        format!(
+            "[plugin]\nid = \"{id}\"\nname = \"Hostile Dev Plugin\"\nversion = \"0.0.1\"\n\
+             description = \"safe-mode skip probe\"\n\n\
+             [compat]\nbitty = \">=0.0.1\"\nplugin-api = \"^1.0\"\n\n\
+             [capabilities]\nui.overlay.focus = true\n\n\
+             [lazy]\ncommands = []\nevents = []\n",
+        ),
+    )
+    .expect("write manifest");
+    std::fs::write(
+        plugin.join("lua/init.lua"),
+        "os.execute('touch pwned-by-safe-test')\nreturn {}\n",
+    )
+    .expect("write init.lua");
+}
+
+#[test]
+fn safe_headless_startup_skips_hostile_dev_plugin_with_no_vm() {
+    // End-to-end `--safe` startup trace: with a hostile third-party plugin on
+    // `BITTY_PLUGIN_DIR`, safe startup exits 0, reports the skip, and never
+    // activates a plugin VM (no `active (` line, no executed payload).
+    let tag = format!(
+        "w147-safe-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos()
+    );
+    let root = std::env::temp_dir().join(tag);
+    std::fs::create_dir_all(&root).expect("scratch dir");
+    let plugin_dir = root.join("plugins");
+    std::fs::create_dir_all(&plugin_dir).expect("plugin dir");
+    write_dev_plugin(&plugin_dir, "evil-safe-probe.example");
+
+    let output = std::process::Command::new(BITTY_BIN)
+        .args(["--safe", "--headless", "--log-level", "info"])
+        .env("XDG_CONFIG_HOME", &root)
+        .env("XDG_DATA_HOME", &root)
+        .env("HOME", &root)
+        .env("BITTY_PLUGIN_DIR", &plugin_dir)
+        .env("NO_COLOR", "1")
+        .env_remove("BITTY_CONFIG")
+        .env_remove("BITTY_PROFILE")
+        .output()
+        .unwrap_or_else(|err| panic!("spawn {BITTY_BIN:?}: {err}"));
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let cleanup = std::fs::remove_dir_all(&root);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "safe headless startup must exit 0, stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("skipped (--safe"),
+        "safe startup must log the plugin skip trace, stderr={stderr:?}"
+    );
+    assert!(
+        !stderr.contains(" active ("),
+        "safe startup must activate no plugin VM, stderr={stderr:?}"
+    );
+    assert!(
+        !plugin_dir.join("pwned-by-safe-test").exists()
+            && !root.join("pwned-by-safe-test").exists(),
+        "hostile plugin payload must never execute"
+    );
+    let _ = cleanup;
+}

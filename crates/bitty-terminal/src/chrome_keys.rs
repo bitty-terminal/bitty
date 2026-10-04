@@ -972,15 +972,12 @@ impl TerminalApp {
                                 eprintln!(
                                     "warning: composer plugin open failed ({diagnostic}) — retained Core composer opens"
                                 );
-                                self.runtime.cw_composer_open();
-                                // The plugin still owns the UX, but the open
-                                // Core session must stay routed: latch the
-                                // fallback so the modal guard below serves
-                                // this session instead of stranding it
-                                // visible-but-dead. The latch clears when no
-                                // Core session is open, so the next open
-                                // retries the plugin.
-                                self.composer_core_fallback_latched = true;
+                                // Latched inside: the plugin still owns the
+                                // UX, but this open session must stay routed
+                                // (no stranded visible-but-dead session).
+                                // The latch clears when the session closes,
+                                // so the next open retries the plugin.
+                                self.open_retained_composer();
                                 eprintln!(
                                     "bitty: keymap open_composer -> composer open (Enter newline, Ctrl+Enter submit, Esc close, Alt+E editor flag)"
                                 );
@@ -4427,6 +4424,83 @@ mod tests {
             app.composer_owner(),
             ComposerOwner::Plugin,
             "next open retries the plugin"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn composer_cutover_editor_round_trip_keeps_fallback_routed() {
+        // W-103 S-5 reviewer follow-up (CTX-0929): an editor round trip
+        // from a latched fallback must not re-strand the session. The
+        // hosting closes the overlay and a keypress during hosting clears
+        // the stale latch; the vanished-leaf/finish reopen must latch
+        // again while the plugin still owns the UX.
+        use crate::composer_owner::{
+            COMPOSER_COMMAND_CLOSE, COMPOSER_COMMAND_OPEN, COMPOSER_PLUGIN_ID,
+            COMPOSER_REQUIRED_CAPABILITIES, ComposerOwner, fixture,
+        };
+        use crate::editor_host::ExternalEditorSession;
+        use bitty_config::{ChromeAction, KeyName, KeyRef};
+        let root = fixture::temp_dir("editor-round-trip-fallback");
+        fixture::write_plugin(
+            &root,
+            COMPOSER_PLUGIN_ID,
+            ">=0.0.1",
+            COMPOSER_REQUIRED_CAPABILITIES,
+            &[COMPOSER_COMMAND_CLOSE],
+        );
+        let mut plugin_runtime = fixture::runtime_for(vec![root.clone()]);
+        plugin_runtime.discover();
+        let id = bitty_plugin_host::manifest::PluginId::new(COMPOSER_PLUGIN_ID).expect("id");
+        plugin_runtime.activate(&id).expect("activate");
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let mut app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        assert_eq!(app.composer_owner(), ComposerOwner::Plugin);
+        // Dispatch-error fallback opens the retained Core composer, latched.
+        app.apply_chrome_action(ChromeAction::OpenComposer);
+        assert!(app.runtime.cw_composer_is_open());
+        assert!(app.composer_core_fallback_latched);
+        // Mimic editor hosting: the overlay closes for the editor leaf,
+        // and a keypress during hosting clears the now-stale latch.
+        app.runtime.cw_composer_close();
+        let temp = bitty_rich::composer::write_composer_temp("draft", &std::env::temp_dir())
+            .expect("temp");
+        let home = app.runtime.focused_view().expect("focused leaf");
+        assert!(app.chrome.editor.begin(ExternalEditorSession {
+            view: ViewId::new(999),
+            temp,
+            return_focus: home,
+        }));
+        let keyref = |key: KeyName| KeyRef {
+            key,
+            ctrl: false,
+            alt: false,
+            shift: false,
+            super_held: false,
+        };
+        assert!(
+            !app.route_cw_modal(&test_char_key("x"), &keyref(KeyName::Char('x'))),
+            "no session open while the editor hosts"
+        );
+        assert!(
+            !app.composer_core_fallback_latched,
+            "stale latch clears with no open session"
+        );
+        // The editor leaf vanishes: the reopen must latch again while the
+        // plugin owns the UX, or the session re-strands.
+        app.poll_external_editor();
+        assert!(
+            app.runtime.cw_composer_is_open(),
+            "vanished editor leaf reopens the session"
+        );
+        assert!(
+            app.composer_core_fallback_latched,
+            "reopen latches fallback routing under plugin ownership"
+        );
+        assert!(
+            app.route_cw_modal(&test_char_key("x"), &keyref(KeyName::Char('x'))),
+            "reopened session consumes typing"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

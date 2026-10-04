@@ -566,6 +566,20 @@ impl TerminalApp {
         self.composer_owner().plugin_owns()
     }
 
+    /// Opens the retained Core composer session, latching fallback routing
+    /// when the plugin owns the UX (W-103 S-5, CTX-0929): the open session
+    /// must stay served even though ownership stays plugin, or it strands
+    /// visible-but-dead. Every retained-Core open under plugin ownership
+    /// (dispatch-error fallback, editor-exit reopen, vanished-leaf reopen)
+    /// routes through here. In retained mode the latch is a harmless no-op
+    /// (the guard serves retained sessions regardless).
+    pub(crate) fn open_retained_composer(&mut self) {
+        self.runtime.cw_composer_open();
+        if self.composer_plugin_owns() {
+            self.composer_core_fallback_latched = true;
+        }
+    }
+
     /// Dispatches one composer session verb to the ACTIVE plugin
     /// (`<id>:<verb>` via the plugin runtime).
     ///

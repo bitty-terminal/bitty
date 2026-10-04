@@ -1,30 +1,26 @@
 #![forbid(unsafe_code)]
-//! Proxy that wires the workspace `tests/compat/harness.rs` corpus into
-//! `cargo test -p bitty-vt --test harness_proxy`.
-//! The canonical harness lives at `tests/compat/harness.rs` (forbid unsafe,
-//! bounded, deterministic). This proxy reuses the same corpora via
-//! `CARGO_MANIFEST_DIR`-anchored discovery but adds zero `winit`/`wgpu`
-//! deps — it only depends on `bitty-vt` (and `bitty-term-state` via dev?)
-//! Instead we stay inside `bitty-vt` and assert `Parser` chunking identity
-//! only, keeping the full `State` check in `bitty-compat-lab::harness`.
+//! Proxy that wires the crate's own `seeds/` corpus into
+//! `cargo test -p bitty-vt --test harness`.
+//!
+//! The canonical full-corpus harness lives in the `bitty-compat-lab`
+//! validation repository (W-105 relocation, bitty CTX-0931) and checks
+//! `Parser -> State` end to end there. This proxy stays inside `bitty-vt`
+//! and asserts `Parser` chunking identity only (one batched feed versus
+//! byte-at-a-time must agree action-for-action), over the committed seeds
+//! beside this crate — no `winit`/`wgpu` deps, no external checkout.
 
 use std::path::PathBuf;
 
 const MAX_CORPUS_BYTES: usize = 8 * 1024;
 const MAX_ACTIONS: usize = 4096;
-const MAX_CORPORA_PER_CATEGORY: usize = 64;
 
-fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+/// Committed `bitty-vt` parser seeds beside this crate.
+fn seeds_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("seeds")
 }
-fn corpus_dir(category: &str) -> PathBuf {
-    workspace_root()
-        .join("tests/compat")
-        .join(category)
-        .join("corpus")
-}
-fn list_corpus(category: &str) -> Vec<PathBuf> {
-    let dir = corpus_dir(category);
+
+fn list_seeds() -> Vec<PathBuf> {
+    let dir = seeds_dir();
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
     };
@@ -37,17 +33,11 @@ fn list_corpus(category: &str) -> Vec<PathBuf> {
         if p.extension().and_then(|e| e.to_str()) != Some("bin") {
             continue;
         }
-        if out.len() >= MAX_CORPORA_PER_CATEGORY {
-            break;
-        }
         out.push(p);
     }
     out.sort();
     out
 }
-const CATS: &[&str] = &[
-    "vt", "osc", "keyboard", "mouse", "resize", "unicode", "shell", "tui",
-];
 
 fn parse_twice(bytes: &[u8]) -> Vec<bitty_vt::TerminalAction> {
     let mut p1 = bitty_vt::Parser::new();
@@ -71,16 +61,25 @@ fn parse_twice(bytes: &[u8]) -> Vec<bitty_vt::TerminalAction> {
 }
 
 #[test]
-fn vt_corpus_bounded_and_deterministic_for_bitty_vt() {
+fn vt_seeds_bounded_and_deterministic_for_bitty_vt() {
+    let seeds = list_seeds();
+    assert!(
+        !seeds.is_empty(),
+        "expected committed seeds under {}",
+        seeds_dir().display()
+    );
     let mut total = 0usize;
-    for &cat in CATS {
-        for p in list_corpus(cat) {
-            let b = std::fs::read(&p).unwrap();
-            assert!(b.len() <= MAX_CORPUS_BYTES, "{p:?} > MAX_CORPUS_BYTES");
-            let a = parse_twice(&b);
-            assert!(a.len() <= MAX_ACTIONS);
-            total += 1;
-        }
+    for p in &seeds {
+        let b = std::fs::read(p).unwrap();
+        assert!(b.len() <= MAX_CORPUS_BYTES, "{p:?} > MAX_CORPUS_BYTES");
+        let a = parse_twice(&b);
+        assert!(a.len() <= MAX_ACTIONS);
+        total += 1;
     }
-    assert!(total >= 16, "expected >=16 corpora, saw {total}");
+    assert_eq!(
+        total,
+        seeds.len(),
+        "every committed seed must be exercised, saw {total} of {}",
+        seeds.len()
+    );
 }

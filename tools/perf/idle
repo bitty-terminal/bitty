@@ -26,6 +26,8 @@ have_cargo() {
 
 main() {
 	goto_root
+	# W-105 relocation: benches live in the external bitty-perf suite.
+	perf_dir="${BITTY_PERF_DIR:-../bitty-perf}"  # sibling of this checkout; see validation-pins.env
 	echo "perf/idle — PB-7 ≤${PB7_PCT}% CPU avg over 10 min, zero wakeups when idle (CTX-0100 frame-on-demand, bounded)"
 	echo "budget: docs/specifications/performance-budget-rfc.md#pb-7 (no PTY output/animation/plugin timer → Wait loop)"
 	echo "invariant: tick == None when no damage and no pending_full_redraw → Wait → zero periodic wakeups"
@@ -33,11 +35,11 @@ main() {
 
 	if have_cargo; then
 		echo "--- benches/idle_real.rs (CTX-0100 frame-on-demand, timeout ${TIMEOUT_SECS}s) ---"
-		if timeout "${TIMEOUT_SECS}" cargo bench -p bitty-perf --bench idle_real -- --nocapture 2>&1 | tail -n 120; then
+		if timeout "${TIMEOUT_SECS}" cargo bench --manifest-path "$perf_dir/Cargo.toml" --bench idle_real -- --nocapture 2>&1 | tail -n 120; then
 			echo "idle_real bench: frame-on-demand PASS (tick None when idle, Clean when no damage)"
 		else
 			echo "idle_real bench: timeout or error — fallback to render_prepare clean check"
-			timeout "${TIMEOUT_SECS}" cargo bench -p bitty-perf --bench render_prepare -- --nocapture 2>&1 | grep -E "clean|PB-7|needs_draw|FrameMode|PASS" | head -n 20 || true
+			timeout "${TIMEOUT_SECS}" cargo bench --manifest-path "$perf_dir/Cargo.toml" --bench render_prepare -- --nocapture 2>&1 | grep -E "clean|PB-7|needs_draw|FrameMode|PASS" | head -n 20 || true
 		fi
 	else
 		echo "skip cargo render check: cargo not on PATH"

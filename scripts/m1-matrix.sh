@@ -39,6 +39,15 @@
 #   m1-matrix.sh platforms
 #   m1-matrix.sh suites
 #
+# Environment:
+#   BITTY_COMPAT_LAB_DIR — checkout of the `bitty-compat-lab` validation
+#     repository at the pinned suite revision (W-105 relocation, bitty
+#     CTX-0931: the compat-lab suites no longer live in this workspace).
+#     Defaults to `$BITTY_WORKSPACE/bitty-compat-lab` when `BITTY_WORKSPACE`
+#     is set, else `../bitty-compat-lab` (sibling of this checkout). The
+#     driver fails closed when the directory holds no suite checkout.
+#     `bitty-runtime` suites always run in this workspace.
+#
 # Environment (aggregate only): M1_JOB_<PLATFORM> carries `needs.<job>.result`
 # from the workflow so a platform whose job failed before this step still
 # yields a precise failure reason.
@@ -107,6 +116,41 @@ cmd_suites() {
 
 # run: execute every M1 suite on one platform, write the result TSV, and print
 # a per-platform Markdown table so the job log shows the matrix leg directly.
+#
+# Suite location (W-105 relocation): `bitty-runtime` suites run in this
+# workspace; `bitty-compat-lab` suites run in the validation repository
+# checkout at the pinned suite revision (see BITTY_COMPAT_LAB_DIR above) via
+# `--manifest-path`, so the roster and floors stay single-sourced here while
+# the suite source lives outside the product graph.
+compat_lab_dir() {
+  local dir="${BITTY_COMPAT_LAB_DIR:-}"
+  if [ -z "$dir" ]; then
+    if [ -n "${BITTY_WORKSPACE:-}" ]; then
+      dir="$BITTY_WORKSPACE/bitty-compat-lab"
+    else
+      dir="../bitty-compat-lab"
+    fi
+  fi
+  printf '%s' "$dir"
+}
+
+run_suite() { # <package> <suite> — run one suite, print the cargo log
+  local pkg="$1" suite="$2"
+  if [ "$pkg" = "bitty-compat-lab" ]; then
+    local dir
+    dir="$(compat_lab_dir)"
+    if [ ! -f "$dir/Cargo.toml" ]; then
+      printf 'm1-matrix: compat-lab checkout missing (BITTY_COMPAT_LAB_DIR=%s): no %s/Cargo.toml\n' \
+        "$dir" "$dir" >&2
+      printf 'm1-matrix: set BITTY_COMPAT_LAB_DIR to the pinned bitty-compat-lab checkout (see validation-pins.env)\n' >&2
+      return 2
+    fi
+    cargo test --manifest-path "$dir/Cargo.toml" -p "$pkg" --test "$suite" --locked -- --test-threads=1 2>&1
+  else
+    cargo test -p "$pkg" --test "$suite" --locked -- --test-threads=1 2>&1
+  fi
+}
+
 cmd_run() {
   local platform="local" out="" summary="${M1_SUMMARY:-${GITHUB_STEP_SUMMARY:-}}"
   while (($# > 0)); do
@@ -148,7 +192,7 @@ cmd_run() {
   for entry in "${M1_SUITES[@]}"; do
     IFS='|' read -r suite pkg min <<<"$entry"
     rc=0
-    log="$(cargo test -p "$pkg" --test "$suite" --locked -- --test-threads=1 2>&1)" || rc=$?
+    log="$(run_suite "$pkg" "$suite")" || rc=$?
     passed="$(printf '%s\n' "$log" | sed -n 's/^test result:.* \([0-9][0-9]*\) passed;.*/\1/p' | tail -n 1)"
     failed="$(printf '%s\n' "$log" | sed -n 's/^test result:.* \([0-9][0-9]*\) failed;.*/\1/p' | tail -n 1)"
     ignored="$(printf '%s\n' "$log" | sed -n 's/^test result:.* \([0-9][0-9]*\) ignored.*/\1/p' | tail -n 1)"

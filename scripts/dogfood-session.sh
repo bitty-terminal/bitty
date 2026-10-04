@@ -14,8 +14,8 @@
 # recording/dogfood-session, gitignored): cycles.csv,
 # session-evidence.json, per-cycle PNG + grid JSON, and the bitty log.
 # Screenshots are file names only inside the JSON; no absolute host path is
-# recorded. Promoting an artifact to crates/bitty-perf/baselines/ is an
-# explicit reviewed copy.
+# recorded. Promoting an artifact to the bitty-perf repository's
+# crates/bitty-perf/baselines/ is an explicit reviewed copy.
 #
 # Usage:
 #   bash scripts/dogfood-session.sh --out-dir DIR [--duration-secs N]

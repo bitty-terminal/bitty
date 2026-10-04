@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 //! M1-08 runtime input-encoding evidence (issue #1134, CTX-0571).
 //!
-//! The mode/input golden leg in `crates/bitty-compat-lab/tests/m1_mode_golden.rs`
+//! The mode/input golden leg in the `bitty-compat-lab` validation repository
+//! (`crates/bitty-compat-lab/tests/m1_mode_golden.rs` there)
 //! pins the terminal-state side of each M1 mode. This file pins the runtime
 //! *input* side through the headless `handle_pty_bytes -> handle_*` path:
 //!

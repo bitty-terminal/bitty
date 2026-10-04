@@ -13,13 +13,13 @@
 # Rule 1 — no NEW `recordings/` (plural) refs (whole tree, text files):
 #   Every `recordings/` line must match the explicit allowlist below.
 #   Allowed today (each reviewed per-hit, none may grow silently):
-#     - `crates/bitty-compat-lab/src/compare.rs`: intentional legacy-plural
-#       fallback candidates (CTX-0206 design; singular is probed first and
-#       ordering tests pin singular-before-legacy).
 #     - lines containing `recordings/compat-matrix-2026-09-01.json`:
 #       historical revision-history/CHANGELOG entries that name the v1
 #       artifact as it existed then (the artifact itself is generated into
 #       the git-ignored workspace `recording/` since CTX-0379).
+#   (W-105 relocation, bitty CTX-0931: the former
+#   `crates/bitty-compat-lab/src/compare.rs` legacy-plural fallback entry left
+#   with that crate for the `bitty-compat-lab` repository.)
 #
 # Rule 2 — no NEW hardcoded `/tmp/` or `/var/tmp/` evidence writes
 # (code + scripts only):
@@ -118,11 +118,9 @@ while IFS= read -r hit; do
 	rest="${hit#*:}"
 	line="${rest%%:*}"
 	text="${rest#*:}"
-	case "$file" in
-	crates/bitty-compat-lab/src/compare.rs)
-		continue
-		;;
-	esac
+	# (W-105: the former crates/bitty-compat-lab/src/compare.rs file entry left
+	# with that crate; no in-tree legacy-plural file remains, so only the text
+	# allowlist below applies.)
 	case "$text" in
 	*recordings/compat-matrix-2026-09-01.json* | *scratch-paths-exempt:*)
 		continue

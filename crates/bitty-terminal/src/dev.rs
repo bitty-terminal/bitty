@@ -9,24 +9,27 @@
 //!
 //! - Shape: `bitty dev <verb> [subverb] [name] [flags]` where `<verb>` is one
 //!   of `trace|capture|synthesize|dump|overlay`:
-//!   - `trace startup` — headless PB-1 startup tracing via
-//!     `bitty-perf::startup::measure_headless_startup` (args parse, config,
+//!   - `trace startup` — headless PB-1 startup tracing (args parse, config,
 //!     runtime create, layout, PTY spawn attempt, winit/wgpu/font probes,
 //!     first bytes, first frame).
 //!   - `trace latency [--iterations N]` — headless PB-4 key-to-screen tracing
-//!     via `bitty-perf::latency::measure_latency` (bounded synthetic keys,
-//!     echo model, stage breakdown, p50/p99/mean/max).
-//!   - Both `trace` subverbs link `bitty-perf` only when the binary is built
-//!     with the opt-in `dev-perf` cargo feature (off by default, CTX-0918).
-//!     Without it the arguments are still validated (usage errors exit 2)
-//!     and a valid request fails with exit 1 and
-//!     [`TRACE_DISABLED_MESSAGE`] ("built without dev-perf feature").
+//!     (bounded synthetic keys, echo model, stage breakdown, p50/p99/mean/max).
+//!   - Both `trace` subverbs are measured by the `bitty-perf` validation
+//!     suite, which lives in its own repository since the W-105 relocation
+//!     (bitty CTX-0931) and is never linked into this binary: the product
+//!     graph must not depend on the verification harness. The arguments are
+//!     still validated (usage errors exit 2) and a valid request fails with
+//!     exit 1 and [`TRACE_DISABLED_MESSAGE`]. Measurement success-path
+//!     coverage lives with the harness (its unit tests, benches, and the
+//!     parser-throughput regression gate); the command contract here
+//!     (parse, usage, disabled diagnostic) keeps its coverage in this crate.
 //!   - `capture`, `synthesize`, `dump`, and `overlay` are compiled only with
-//!     the opt-in `dev-tools` cargo feature (off by default, CTX-0922), the
-//!     same pattern as `dev-perf`: arguments are still validated (usage
-//!     errors exit 2) and a valid request fails with exit 1 and
-//!     [`TOOLS_DISABLED_MESSAGE`] ("built without dev-tools feature"), plus
-//!     an `ok:false` envelope for json/jsonl.
+//!     the opt-in `dev-tools` cargo feature (off by default, CTX-0922):
+//!     arguments are still validated (usage errors exit 2) and a valid
+//!     request fails with exit 1 and [`TOOLS_DISABLED_MESSAGE`]
+//!     ("built without dev-tools feature"), plus an `ok:false` envelope for
+//!     json/jsonl. `trace` follows the same fail-closed shape permanently
+//!     (its harness is external, so there is no enabling feature).
 //!   - `synthesize` — fixed local input trajectory plus the paste-gate
 //!     probe: [`SYNTH_TRAJECTORY_LEN`] printable keys through the headless
 //!     input path (protocol `synthesizeInput` local-class parity), then the
@@ -76,8 +79,9 @@
 //!
 //! # Read-only surface (no new authority)
 //!
-//! - Tracing reuses `bitty-perf` startup/latency modules (same budgets PB-1
-//!   `100/200 ms`, PB-4 `8/15 ms`); no new measurement code is invented.
+//! - Tracing performs no measurement in this binary: PB-1/PB-4 budgets and
+//!   their harnesses live in the `bitty-perf` validation suite (budgets PB-1
+//!   `100/200 ms`, PB-4 `8/15 ms`); no measurement code is invented here.
 //! - Captures/dumps reuse the headless smoke pattern (`Runtime::with_defaults`
 //!   plus `Surface::headless`, deterministic synthetic bytes, `tick`): no
 //!   display server, window, adapter, or font file is contacted.
@@ -102,16 +106,18 @@
 //! # Observability boundary (CTX-0926, W-100 first slice, W-71 contract)
 //!
 //! Every verb here is optional debug/trace *policy* (explicit opt-in,
-//! default off, safe-mode clean), following the `dev-perf`/`dev-tools`
-//! pattern: `trace` links `bitty-perf` only with the `dev-perf` feature,
-//! and `capture`/`synthesize`/`dump`/`overlay` compile only with the
-//! `dev-tools` feature. Without the feature the arguments are still
-//! validated (usage errors exit 2) and a valid request fails with exit 1 —
-//! no silent behavior change. All verbs are local-only (no instance, no
-//! plugin VM, no Event-Bus subscription); outputs carry counts, labels,
-//! and deterministic synthetic bytes only (no secrets, no PTY bytes); see
-//! `crate::observability` for the retained-vs-optional split and the
-//! transition notes. Behavior is preserved: this slice retires nothing.
+//! default off, safe-mode clean): `trace` measurement lives in the external
+//! `bitty-perf` validation suite since the W-105 relocation and is never
+//! linked into this binary (a valid trace request fails with exit 1 after
+//! argument validation), and `capture`/`synthesize`/`dump`/`overlay` compile
+//! only with the `dev-tools` feature. Without the feature the arguments are
+//! still validated (usage errors exit 2) and a valid request fails with
+//! exit 1 — no silent behavior change. All verbs are local-only
+//! (no instance, no plugin VM, no Event-Bus subscription); outputs carry
+//! counts, labels, and deterministic synthetic bytes only (no secrets, no
+//! PTY bytes); see `crate::observability` for the retained-vs-optional split
+//! and the transition notes. Behavior is preserved: this slice retires
+//! nothing.
 
 #![forbid(unsafe_code)]
 
@@ -463,7 +469,7 @@ impl DevParseError {
 /// Short usage for stderr (fail-closed exit 2 trailer).
 #[must_use]
 pub fn dev_usage() -> String {
-    "usage: bitty dev <trace|capture|synthesize|dump|overlay> [args] [--format table|json|jsonl] [--no-color]\n       bitty dev trace <startup|latency> [--iterations N]\n       bitty dev capture [--layout single|split|stack|overlay]\n       bitty dev synthesize\n       bitty dev dump <grid|scene|atlas> [--rows N] [--cols N]\n       bitty dev overlay <list|show <damage|cells|glyphs|images|layout|banner>>\n\nverbs:\n  trace     headless PB-1 startup / PB-4 latency tracing (bitty-perf, local;\n            requires a build with the `dev-perf` cargo feature)\n  capture   deterministic headless frame capture (stats + RGBA hash, local)\n  synthesize  fixed local input trajectory plus paste-gate probe (receipt, local)\n  dump      grid text / scene / atlas dumps from a headless capture (local)\n  overlay   renderer-overlay catalog and headless proofs (local; GPU-bound entries deferred)\n            capture/synthesize/dump/overlay require a build with the\n            `dev-tools` cargo feature"
+    "usage: bitty dev <trace|capture|synthesize|dump|overlay> [args] [--format table|json|jsonl] [--no-color]\n       bitty dev trace <startup|latency> [--iterations N]\n       bitty dev capture [--layout single|split|stack|overlay]\n       bitty dev synthesize\n       bitty dev dump <grid|scene|atlas> [--rows N] [--cols N]\n       bitty dev overlay <list|show <damage|cells|glyphs|images|layout|banner>>\n\nverbs:\n  trace     headless PB-1 startup / PB-4 latency tracing (measured by the\n            bitty-perf validation suite, never linked into this build)\n  capture   deterministic headless frame capture (stats + RGBA hash, local)\n  synthesize  fixed local input trajectory plus paste-gate probe (receipt, local)\n  dump      grid text / scene / atlas dumps from a headless capture (local)\n  overlay   renderer-overlay catalog and headless proofs (local; GPU-bound entries deferred)\n            capture/synthesize/dump/overlay require a build with the\n            `dev-tools` cargo feature"
         .to_string()
 }
 
@@ -474,13 +480,13 @@ pub fn dev_help_text() -> String {
      \n\
      Usage: bitty dev <trace|capture|synthesize|dump|overlay> [args] [--format table|json|jsonl] [--no-color]\n\
      \n\
-     Verbs (all local class: no instance, safe-mode clean, no plugin VM):\n  \
-       trace startup                 Headless PB-1 startup phases (bitty-perf).\n  \
-       trace latency [--iterations N]  Headless PB-4 key-to-screen trace\n  \
-                                     (default 20, range 1..=1000).\n  \
-                                     trace requires a build with the\n  \
-                                     `dev-perf` cargo feature; without it\n  \
-                                     the verb fails with exit 1.\n  \
+      Verbs (all local class: no instance, safe-mode clean, no plugin VM):\n  \
+        trace startup                 Headless PB-1 startup phases.\n  \
+        trace latency [--iterations N]  Headless PB-4 key-to-screen trace\n  \
+                                      (default 20, range 1..=1000).\n  \
+                                      Measurement lives in the bitty-perf\n  \
+                                      validation suite (never linked here);\n  \
+                                      the verb fails with exit 1.\n  \
        capture [--layout SPEC]       Deterministic headless frame capture:\n  \
                                      SPEC = single|split|stack|overlay\n  \
                                      (default single). Reports present stats,\n  \
@@ -1259,7 +1265,7 @@ impl bitty_render::GlyphRasterizer for DevRasterizer {
 
 /// Executor output: human table plus the pre-serialized JSON result object.
 #[cfg_attr(
-    not(any(feature = "dev-perf", feature = "dev-tools")),
+    not(feature = "dev-tools"),
     allow(dead_code) // Only the feature-gated executors construct it.
 )]
 struct DevOutput {
@@ -1267,12 +1273,14 @@ struct DevOutput {
     result_json: String,
 }
 
-/// Diagnostic returned by `bitty dev trace` when the binary was built
-/// without the opt-in `dev-perf` cargo feature (CTX-0918). Parsing still
-/// validates the arguments, so usage errors keep exiting 2.
-#[cfg_attr(feature = "dev-perf", allow(dead_code))] // Only the cfg-off path reports it.
-pub const TRACE_DISABLED_MESSAGE: &str = "bitty dev trace: built without dev-perf feature \
-     (rebuild with `cargo build -p bitty-terminal --features dev-perf`)";
+/// Diagnostic returned by `bitty dev trace`: trace measurement is owned by
+/// the `bitty-perf` validation suite (independent repository since the W-105
+/// relocation, bitty CTX-0931) and is never linked into this binary, so a
+/// valid trace request always fails here with exit 1. Parsing still
+/// validates the arguments, so usage errors keep exiting 2. Measurement
+/// success-path coverage lives with the harness, not in this crate.
+pub const TRACE_DISABLED_MESSAGE: &str = "bitty dev trace: trace measurement is owned by the bitty-perf validation suite \
+     and is not linked into this build";
 
 /// Diagnostic suffix returned by `bitty dev capture|synthesize|dump|overlay`
 /// when the binary was built without the opt-in `dev-tools` cargo feature
@@ -1286,94 +1294,6 @@ pub const TOOLS_DISABLED_MESSAGE: &str = "built without dev-tools feature \
 #[cfg(not(feature = "dev-tools"))]
 fn tools_disabled_message(request: &DevRequest) -> String {
     format!("bitty dev {}: {TOOLS_DISABLED_MESSAGE}", request.verb())
-}
-
-#[cfg(feature = "dev-perf")]
-fn trace_startup_output() -> DevOutput {
-    let report = bitty_perf::startup::measure_headless_startup();
-    let table = report.format_timeline();
-    let mut result = String::with_capacity(1024);
-    let _ = write!(
-        result,
-        "\"total_ms\":{:.3},\"budgets\":{{\"p50_ms\":{},\"p99_ms\":{}}},\"verdict\":\"{}\",\"headless_fallback\":{},\"real_window\":{},\"first_frame_presented\":{},\"phases\":[",
-        report.total_ms(),
-        bitty_perf::PB1_STARTUP_MS_P50,
-        bitty_perf::PB1_STARTUP_MS_P99,
-        if report.meets_p50() {
-            "pass_p50"
-        } else if report.meets_p99() {
-            "pass_p99"
-        } else {
-            "above_budget"
-        },
-        report.headless_fallback,
-        report.is_real_window,
-        report.first_frame_presented
-    );
-    for (i, phase) in report.phases.iter().enumerate() {
-        if i > 0 {
-            result.push(',');
-        }
-        let (status, detail) = match &phase.status {
-            bitty_perf::startup::PhaseStatus::Success => ("ok", String::new()),
-            bitty_perf::startup::PhaseStatus::Skipped(reason) => ("skipped", (*reason).to_string()),
-            bitty_perf::startup::PhaseStatus::Unavailable(detail) => {
-                ("unavailable", detail.clone())
-            }
-            bitty_perf::startup::PhaseStatus::Failed(detail) => ("failed", detail.clone()),
-        };
-        let _ = write!(
-            result,
-            "{{\"name\":\"{}\",\"elapsed_ms\":{:.3},\"since_start_ms\":{:.3},\"status\":\"{}\",\"detail\":\"{}\"}}",
-            json_escape(phase.name),
-            phase.elapsed.as_secs_f64() * 1000.0,
-            phase.since_start.as_secs_f64() * 1000.0,
-            status,
-            json_escape(&detail)
-        );
-    }
-    result.push(']');
-    if let Some(frame) = report.first_frame_stats {
-        let _ = write!(
-            result,
-            ",\"first_frame\":{{\"frame\":{},\"fills\":{},\"glyphs\":{},\"headless\":{},\"generation\":{}}}",
-            frame.frame, frame.fills, frame.glyphs, frame.headless, frame.generation
-        );
-    }
-    DevOutput {
-        table,
-        result_json: result,
-    }
-}
-
-#[cfg(feature = "dev-perf")]
-fn trace_latency_output(iterations: usize) -> DevOutput {
-    let report = bitty_perf::latency::measure_latency(iterations);
-    let table = report.format_summary();
-    let result = format!(
-        "\"iterations\":{},\"samples\":{},\"p50_ms\":{:.3},\"p99_ms\":{:.3},\"mean_ms\":{:.3},\"max_ms\":{:.3},\"budgets\":{{\"p50_ms\":{},\"p99_ms\":{}}},\"verdict\":\"{}\",\"headless\":{},\"idle_misses\":{}",
-        iterations,
-        report.samples.len(),
-        report.p50_ms,
-        report.p99_ms,
-        report.mean_ms,
-        report.max_ms,
-        bitty_perf::PB4_LATENCY_MS_P50,
-        bitty_perf::PB4_LATENCY_MS_P99,
-        if report.meets_p50() {
-            "pass_p50"
-        } else if report.meets_p99() {
-            "pass_p99"
-        } else {
-            "above_budget"
-        },
-        report.headless,
-        report.idle_misses
-    );
-    DevOutput {
-        table,
-        result_json: result,
-    }
 }
 
 #[cfg(feature = "dev-tools")]
@@ -1819,11 +1739,9 @@ pub fn run_dev(request: &DevRequest, options: &DevOptions) -> i32 {
     // Every arm is explicit (no wildcard, CTX-0919): a new verb must pick its
     // feature gate deliberately. Compiled-out verbs fail with exit 1.
     let outcome: Result<DevOutput, String> = match request {
-        #[cfg(feature = "dev-perf")]
-        DevRequest::TraceStartup => Ok(trace_startup_output()),
-        #[cfg(feature = "dev-perf")]
-        DevRequest::TraceLatency { iterations } => Ok(trace_latency_output(*iterations)),
-        #[cfg(not(feature = "dev-perf"))]
+        // W-105 relocation: trace measurement lives in the external
+        // `bitty-perf` suite and is never linked here, so valid trace
+        // requests always fail with the disabled diagnostic (exit 1).
         DevRequest::TraceStartup | DevRequest::TraceLatency { .. } => {
             Err(TRACE_DISABLED_MESSAGE.to_string())
         }

@@ -1291,7 +1291,7 @@ impl Runtime {
     /// drivers stay deterministic).
     pub fn set_window_cells(&mut self, rect: UiRect) {
         self.window_cells = rect;
-        self.container = self.chrome_layout().container;
+        self.container = self.band_exclusive_container();
         self.pending_full_redraw = true;
     }
 
@@ -1313,13 +1313,15 @@ impl Runtime {
         self.window_cells
     }
 
-    /// Solved chrome geometry for the current window grid (CTX-0873).
+    /// Effective minimum container rows before any band may be reserved
+    /// (CTX-0873, CTX-0946 C3).
     ///
-    /// The bar band is reserved exactly when [`Self::bar_present`] holds
-    /// (visible and more than one workspace) and the window keeps the
-    /// effective minimum content extent (see [`chrome_band::solve`]).
-    pub(super) fn chrome_layout(&self) -> chrome_band::ChromeLayout {
-        let thickness = u16::try_from(workspaces::STATUS_BAR_ROWS).unwrap_or(u16::MAX);
+    /// The [`MIN_CONTENT_ROWS`](super::chrome_band::MIN_CONTENT_ROWS)
+    /// content floor plus both outer cell gaps plus the vertical decoration
+    /// ring in live rows, so a reserved band never leaves a leaf with zero
+    /// content rows. Shared by the Core-bar solve and the plugin-band
+    /// exclusive-zone budget so both degrade against one floor.
+    pub(super) fn chrome_min_rows(&self) -> u16 {
         // Effective floor: content rows plus both outer cell gaps plus the
         // vertical decoration ring (both sides, live DPI) in live rows, so a
         // reserved band never leaves a leaf with zero content rows.
@@ -1327,30 +1329,40 @@ impl Runtime {
         let deco_px = 2.0
             * (f64::from(deco.gaps_out) + f64::from(deco.border) + f64::from(deco.content_inset))
             * self.dpi_scale();
-        let min_rows = chrome_band::min_container_rows(
+        chrome_band::min_container_rows(
             self.config.gaps_out,
             deco_px,
             self.live_cell_metrics().height,
-        );
+        )
+    }
+
+    /// Solved chrome geometry for the current window grid (CTX-0873).
+    ///
+    /// The bar band is reserved exactly when [`Self::bar_present`] holds
+    /// (visible and more than one workspace) and the window keeps the
+    /// effective minimum content extent (see [`chrome_band::solve`]).
+    pub(super) fn chrome_layout(&self) -> chrome_band::ChromeLayout {
+        let thickness = u16::try_from(workspaces::STATUS_BAR_ROWS).unwrap_or(u16::MAX);
         chrome_band::solve(
             self.window_cells,
             self.workspace_bar_edge,
             thickness,
             self.bar_present(),
-            min_rows,
+            self.chrome_min_rows(),
         )
     }
 
-    /// Re-derives the container from the chrome band and, when it moved,
-    /// reflows leaves, the primary grid + PTY, and every pane session
-    /// through the normal geometry sync (CTX-0873).
+    /// Re-derives the container from the chrome band and the budgeted plugin
+    /// bands, and, when it moved, reflows leaves, the primary grid + PTY,
+    /// and every pane session through the normal geometry sync
+    /// (CTX-0873, CTX-0946 C3).
     ///
     /// Called by every funnel that can change bar presence or placement
     /// (visibility toggle, workspace count crossing one, edge change,
     /// session restore) and once per tick as a safety net. Idempotent: an
     /// unchanged container touches nothing. Returns whether it reflowed.
     pub(super) fn refresh_chrome_band(&mut self) -> bool {
-        let container = self.chrome_layout().container;
+        let container = self.band_exclusive_container();
         if container == self.container {
             return false;
         }

@@ -126,6 +126,7 @@ use crate::queue::{ColdEvent, ColdQueue};
 
 pub mod animations;
 pub mod background_images;
+pub mod band_host;
 pub mod band_slots;
 pub mod bell;
 pub mod chrome_band;
@@ -493,6 +494,12 @@ pub struct Runtime {
     /// this snapshot; any difference forces a full present. Updated on
     /// every present alongside the allocations.
     last_presented_bar: Option<String>,
+    /// Mounted band versions at the last present (CTX-0946 C2).
+    ///
+    /// Compared per tick against [`band_host`](self::band_host)
+    /// versions so a plugin mount/update/unmount presents on a quiet grid.
+    /// Updated on every present alongside `last_presented_bar`.
+    last_presented_bands: Vec<(String, bitty_lua::ui::UiSlot, u32)>,
     cols: usize,
     rows: usize,
     layout: LayoutNode,
@@ -770,6 +777,21 @@ pub struct Runtime {
     /// the next left release. No selection or drag can be in flight across
     /// it: the bar press returns before any of those start.
     bar_release_swallow: bool,
+    /// One-shot swallow for the left release paired with a plugin-band
+    /// chrome-consumed press (CTX-0946 C1).
+    ///
+    /// Mirrors [`Self::bar_release_swallow`]: a band press is consumed as
+    /// Core chrome before capture, so the capturing app never saw the press
+    /// and the paired release must not reach it as an orphan report. Set
+    /// when [`band_host`](self::band_host) routing consumes a press, cleared
+    /// (resolving the click into the drain queue) on the next left release.
+    band_release_swallow: bool,
+    /// Queued Core-routed band clicks awaiting application dispatch
+    /// (CTX-0946 C1). Bounded by
+    /// [`BAND_CLICK_QUEUE_MAX`](self::band_host::BAND_CLICK_QUEUE_MAX).
+    band_click_queue: Vec<band_host::BandClickRequest>,
+    /// Headless host statistics for band routing and paint (CTX-0946).
+    band_stats: band_host::BandHostStats,
     search_state: SearchState,
     pending_paste: Option<crate::paste::PendingPaste>,
     /// Wall time when the current pending paste was gated (CTX-0192).
@@ -1385,6 +1407,9 @@ impl Runtime {
             paste_truncated_pastes: 0,
             last_cursor: None,
             bar_release_swallow: false,
+            band_release_swallow: false,
+            band_click_queue: Vec::new(),
+            band_stats: band_host::BandHostStats::default(),
             search_state: SearchState::new(),
             pending_paste: None,
             pending_paste_since: None,
@@ -1478,6 +1503,7 @@ impl Runtime {
             workspace_bar_edge: config.workspace_bar_edge,
             window_cells: container,
             last_presented_bar: None,
+            last_presented_bands: Vec::new(),
             help_visible: false,
             panel_layout_mode: config.panel_layout_mode,
             help_rows: Vec::new(),
@@ -1609,6 +1635,9 @@ impl Runtime {
             paste_truncated_pastes: 0,
             last_cursor: None,
             bar_release_swallow: false,
+            band_release_swallow: false,
+            band_click_queue: Vec::new(),
+            band_stats: band_host::BandHostStats::default(),
             search_state: SearchState::new(),
             pending_paste: None,
             pending_paste_since: None,
@@ -1702,6 +1731,7 @@ impl Runtime {
             workspace_bar_edge: config.workspace_bar_edge,
             window_cells: container,
             last_presented_bar: None,
+            last_presented_bands: Vec::new(),
             help_visible: false,
             panel_layout_mode: config.panel_layout_mode,
             help_rows: Vec::new(),

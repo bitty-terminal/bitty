@@ -214,6 +214,11 @@ pub use config::{
 pub use error::RuntimeError;
 pub use queue::{ColdEvent, ColdQueue};
 pub use runtime::background_images::validate_background_images;
+pub use runtime::band_host::{
+    BAND_ACCENT_ANSI_INDEX, BAND_CLICK_QUEUE_MAX, BandClickRequest, BandColumnOutcome, BandHit,
+    BandHostStats, BandRun, band_click_args_table, band_is_visible, band_rows_overlap,
+    flatten_band_runs, resolve_band_token, resolve_click_in_band, split_band_command,
+};
 pub use runtime::band_slots::{
     BandEdge, E_UI_UNAVAILABLE, UiSlotPlacement, ui_slot_placement, unsupported_slot_error,
 };

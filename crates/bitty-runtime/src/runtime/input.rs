@@ -1165,6 +1165,16 @@ impl Runtime {
             self.bar_release_swallow = false;
             return;
         }
+        // CTX-0946 C1: the release paired with a plugin-band chrome-consumed
+        // press resolves the click into the drain queue (or counts it
+        // unclaimed/denied) and never reaches a capturing app as an orphan
+        // report. One-shot like the Core-bar pairing above.
+        if event.button == MouseButton::Left
+            && event.state == PressState::Released
+            && self.band_release()
+        {
+            return;
+        }
         // CTX-0384: copy mode consumes mouse selection while active (the
         // keyboard cursor owns the highlight). The inspect trace above stays;
         // every selection, drag, capture, and paste path below is suppressed
@@ -1185,6 +1195,19 @@ impl Runtime {
             && event.button == MouseButton::Left
             && event.state == PressState::Pressed
             && self.status_bar_press()
+        {
+            return;
+        }
+        // CTX-0946 C1: a plugin edge band is Core chrome outside every
+        // terminal frame — consume a press on it before the focus-then-
+        // capture decision below so no capturing app ever sees it (the
+        // release block above pairs with it) and focus never moves. Shift
+        // still forces selection. The Core bar keeps precedence (checked
+        // first); geometry keeps the rows disjoint.
+        if !shift_override
+            && event.button == MouseButton::Left
+            && event.state == PressState::Pressed
+            && self.band_press()
         {
             return;
         }
@@ -1785,9 +1808,11 @@ impl Runtime {
         // release is no longer the focused one, so the swallow must not
         // fire. Cleared whenever the window is (or stays) unfocused, ahead
         // of the unchanged-state return; a focus gain keeps the flag so
-        // the paired release still swallows.
+        // the paired release still swallows. The plugin-band swallow
+        // (CTX-0946 C1) pairs the same way and clears with it.
         if !focused {
             self.bar_release_swallow = false;
+            self.band_release_swallow = false;
         }
         if self.focused == focused {
             return;

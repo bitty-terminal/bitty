@@ -2562,6 +2562,7 @@ impl State {
             u32::from(self.scroll_region_top),
             u32::from(self.scroll_region_bottom),
             u32::from(n),
+            self.alt_screen_active(),
         );
         self.damage_grid_rect(
             self.scroll_region_top,
@@ -2583,9 +2584,14 @@ impl State {
         );
         self.screens_active_mut()
             .insert_blank_lines_down(top, bottom, n as usize, &erase);
-        // Placements ride the displaced rows downward like text.
-        self.kitty_placements
-            .scroll_down(top as u32, bottom as u32, u32::from(n));
+        // Placements ride the displaced rows downward like text, gated
+        // to the active screen like scroll-up.
+        self.kitty_placements.scroll_down(
+            top as u32,
+            bottom as u32,
+            u32::from(n),
+            self.alt_screen_active(),
+        );
         let last_col = self.width as u16 - 1;
         self.damage_grid_rect(
             self.scroll_region_top,

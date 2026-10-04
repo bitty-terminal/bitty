@@ -282,8 +282,9 @@ impl KittyControlKeys {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KittyApcParams {
     /// Wire `f=` format value (`0` when absent: control-only actions
-    /// (`a=p`/`a=d`/`a=a`/`a=c`/`a=q`) omit it; data-carrying actions
-    /// (absent action, `a=T`/`a=t`, frame data `a=f`) require it).
+    /// (`a=p`/`a=d`/`a=a`/`a=c`) omit it; data-carrying actions
+    /// (absent action, `a=T`/`a=t`, frame data `a=f`, query `a=q`)
+    /// require it).
     pub format_f: u32,
     /// Wire `s=` width (`None` when absent). For `a=a` this key instead
     /// carries the animation state (`1` stop, `2` run-loading, `3` run);
@@ -369,12 +370,13 @@ impl KittyApcParams {
         self.keys.cell_y_offset
     }
 
-    /// Whether this command carries pixel data (`a` absent/`T`/`t`/`f`
-    /// with a direct or local medium) as opposed to being control-only
-    /// (`a=p`/`d`/`a`/`c`/`q`, which must arrive with an empty payload).
+    /// Whether this command carries pixel data (absent action/`T`/`t`/`f`
+    /// with a direct or local medium, plus the `a=q` support probe which
+    /// must test-load the supplied bytes) as opposed to being control-only
+    /// (`a=p`/`d`/`a`/`c`, which must arrive with an empty payload).
     #[must_use]
     pub const fn carries_data(self) -> bool {
-        matches!(self.action_a, None | Some('T' | 't' | 'f'))
+        matches!(self.action_a, None | Some('T' | 't' | 'f' | 'q'))
     }
 }
 
@@ -1274,9 +1276,9 @@ impl KittyApcAssembler {
 /// control block so newer clients keep working, and unknown semantics stay
 /// inert downstream.
 ///
-/// Data-carrying actions (absent action, `a=T`/`a=t`, frame data `a=f`)
-/// require `f=`; control-only actions (`a=p`/`a=d`/`a=a`/`a=c`/`a=q`) omit
-/// it. `i=` and `I=` together are an error (the specification mandates
+/// Data-carrying actions (absent action, `a=T`/`a=t`, frame data `a=f`,
+/// query `a=q`) require `f=`; control-only actions
+/// (`a=p`/`a=d`/`a=a`/`a=c`) omit it. `i=` and `I=` together are an error (the specification mandates
 /// `EINVAL`); `o=` accepts only `z`; `t=` accepts only `d`/`f`/`t`/`s`.
 fn parse_control(control: &[u8]) -> Result<KittyApcParams, KittyApcReject> {
     if control.is_empty() {
@@ -1433,7 +1435,10 @@ fn parse_control(control: &[u8]) -> Result<KittyApcParams, KittyApcReject> {
     if keys.image_id != 0 && keys.image_number != 0 {
         return Err(KittyApcReject::MalformedControl);
     }
-    let carries_data = matches!(action_a, None | Some('T' | 't' | 'f'));
+    // `a=q` is a query action, but the specification's support probe
+    // carries image bytes for the terminal to test-load, so it is
+    // data-carrying like transmit (and `f=` stays mandatory for it).
+    let carries_data = matches!(action_a, None | Some('T' | 't' | 'f' | 'q'));
     let format_f = match (format_f, carries_data) {
         (Some(format), _) => format,
         // Control-only actions omit `f=`; record `0` (absent) so the
@@ -2548,8 +2553,10 @@ mod tests {
 
     #[test]
     fn control_actions_complete_bodiless() {
-        // Delete, animation control, compose, and query carry keys only.
+        // Delete, animation control, and compose carry keys only.
         // `f=` is meaningless for them and must be omittable.
+        // (`a=q` is not in this list: the support probe must test-load
+        // bytes, so it is data-carrying and `f=` stays mandatory.)
         let done = completed(b"Ga=d;");
         assert_eq!((done.format_f, done.action_a), (0, Some('d')));
         let done = completed(b"Ga=d,d=i,i=10,p=7;");
@@ -2568,9 +2575,23 @@ mod tests {
         assert_eq!((done.keys.src_w, done.keys.src_h), (23, 27));
         assert_eq!(done.compose_mode(), 4);
         assert_eq!((done.keys.src_x, done.keys.src_y), (1, 3));
-        let done = completed(b"Ga=q,i=5;");
+        // A bodiless `a=q` names nothing to test-load: `f=` is mandatory
+        // for queries, so this fails closed instead of completing.
+        let mut assembler = KittyApcAssembler::new();
+        assert!(matches!(
+            assembler.feed(b"Ga=q,i=5;"),
+            KittyFeedOutcome::Rejected(KittyApcReject::MissingFormat)
+        ));
+        assert!(!assembler.has_pending());
+    }
+
+    #[test]
+    fn query_action_carries_probe_data() {
+        // The specification's support probe (`a=q` with `f=` and bytes)
+        // must complete with its payload instead of being refused.
+        let done = completed(b"Gf=24,a=q,t=d;AAAA");
         assert_eq!(done.action_a, Some('q'));
-        assert!(done.payload.is_empty());
+        assert!(!done.payload.is_empty());
     }
 
     #[test]
@@ -2619,11 +2640,14 @@ mod tests {
 
     #[test]
     fn control_action_with_payload_is_rejected() {
+        // (`a=q` is not control-only: it carries the probe bytes, so its
+        // payload case lives in `query_action_carries_probe_data`. A bare
+        // `a=q` with bytes but no `f=` is `MissingFormat`, not
+        // `UnexpectedPayload`.)
         for raw in [
             b"Ga=d;eHh4".as_slice(),
             b"Ga=p,i=1;AA==".as_slice(),
             b"Ga=a,i=1;AA==".as_slice(),
-            b"Ga=q;AA==".as_slice(),
         ] {
             let mut assembler = KittyApcAssembler::new();
             assert!(

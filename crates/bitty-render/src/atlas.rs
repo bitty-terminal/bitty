@@ -330,11 +330,14 @@ pub fn compose_image_layers(layers: &[ImageLayer], viewport: ImageRectPx) -> Vec
             ))
     });
     let mut composed = Vec::new();
-    for (paint, index) in order.iter().enumerate() {
+    // `order` counts returned images only: dropped (empty/disjoint)
+    // layers must not shift the paint indices of the survivors, so the
+    // bottom-most returned image is always index `0`.
+    for index in order.iter() {
         let layer = layers[*index];
         if let Some(rect) = layer.rect.intersect(viewport) {
             composed.push(ComposedImage {
-                order: paint,
+                order: composed.len(),
                 image_id: layer.image_id,
                 placement_id: layer.placement_id,
                 rect,
@@ -574,6 +577,7 @@ mod tests {
         let composed = compose_image_layers(&layers, viewport());
         assert_eq!(composed.len(), 1);
         assert_eq!(composed[0].image_id, 1);
+        assert_eq!(composed[0].order, 0);
         assert_eq!(
             composed[0].rect,
             ImageRectPx {
@@ -583,6 +587,21 @@ mod tests {
                 h: 100
             }
         );
+    }
+
+    #[test]
+    fn compose_dropped_layer_before_visible_keeps_dense_order() {
+        // The dropped layer sorts first (lowest z) but contributes no
+        // paint index: survivors are numbered densely from `0`.
+        let layers = [
+            // Fully outside the viewport: dropped, sorts first.
+            layer(1, 1, -1, 900, 0, 10, 10),
+            layer(2, 1, 0, 0, 0, 10, 10),
+            layer(3, 1, 5, 20, 20, 10, 10),
+        ];
+        let composed = compose_image_layers(&layers, viewport());
+        let keys: Vec<(u32, usize)> = composed.iter().map(|c| (c.image_id, c.order)).collect();
+        assert_eq!(keys, [(2, 0), (3, 1)]);
     }
 
     #[test]

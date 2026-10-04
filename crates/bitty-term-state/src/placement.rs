@@ -527,11 +527,14 @@ impl PlacementStore {
         loop {
             let mut orphan: Option<(u32, u32)> = None;
             for entry in &self.placements {
-                if let Some(parent) = entry.parent
-                    && self.get(parent.0, parent.1).is_none()
-                {
-                    orphan = Some(entry.key());
-                    break;
+                // Nested `if` (not a let-chain): MSRV 1.85 predates
+                // let-chains (stabilized 1.88); `clippy.toml` pins
+                // `msrv = "1.85"` so this form is lint-clean.
+                if let Some(parent) = entry.parent {
+                    if self.get(parent.0, parent.1).is_none() {
+                        orphan = Some(entry.key());
+                        break;
+                    }
                 }
             }
             match orphan {
@@ -703,10 +706,16 @@ impl PlacementStore {
     /// Shifts placements with a scroll-up of `n` rows over
     /// `[top, bottom]`: only placements entirely inside move; any shift
     /// that would leave the region clips the placement away (kitty rule).
-    /// Virtual prototypes have no anchor and never move.
-    pub fn scroll_up(&mut self, top: u32, bottom: u32, n: u32) {
+    /// Virtual prototypes have no anchor and never move. Only the active
+    /// screen's placements move: the hidden screen's anchors stay
+    /// untouched underneath (main-screen images survive alt-screen
+    /// scrolls and vice versa).
+    pub fn scroll_up(&mut self, top: u32, bottom: u32, n: u32, on_alt: bool) {
         self.placements.retain_mut(|entry| {
-            if entry.virtual_proto || !entry.is_entirely_within(top, bottom) {
+            if entry.virtual_proto
+                || entry.on_alt_screen != on_alt
+                || !entry.is_entirely_within(top, bottom)
+            {
                 return true;
             }
             match entry.anchor_row.checked_sub(n) {
@@ -722,9 +731,13 @@ impl PlacementStore {
 
     /// Mirrors [`Self::scroll_up`] downward: rows entering at the top push
     /// anchors down; placements shifted past `bottom` are clipped away.
-    pub fn scroll_down(&mut self, top: u32, bottom: u32, n: u32) {
+    /// Screen-gated like [`Self::scroll_up`].
+    pub fn scroll_down(&mut self, top: u32, bottom: u32, n: u32, on_alt: bool) {
         self.placements.retain_mut(|entry| {
-            if entry.virtual_proto || !entry.is_entirely_within(top, bottom) {
+            if entry.virtual_proto
+                || entry.on_alt_screen != on_alt
+                || !entry.is_entirely_within(top, bottom)
+            {
                 return true;
             }
             let row = entry.anchor_row.saturating_add(n);
@@ -899,12 +912,12 @@ mod tests {
         let mut virt = placed(3, 0, 0, 0);
         virt.virtual_proto = true;
         store.upsert(virt);
-        store.scroll_up(2, 8, 2);
+        store.scroll_up(2, 8, 2, false);
         assert_eq!(store.get(1, 1).unwrap().anchor_row, 2);
         // Straddler untouched; virtual prototype anchorless.
         assert_eq!(store.get(2, 2).unwrap().anchor_row, 7);
         // Scrolling the contained placement out clips it away.
-        store.scroll_up(2, 8, 3);
+        store.scroll_up(2, 8, 3, false);
         assert!(store.get(1, 1).is_none());
         assert!(store.get(2, 2).is_some());
     }
@@ -913,11 +926,28 @@ mod tests {
     fn scroll_down_clips_past_bottom() {
         let mut store = PlacementStore::new();
         store.upsert(placed(1, 1, 6, 0)); // rows 6..8, region 2..8
-        store.scroll_down(2, 8, 2); // rows 8..10: past bottom
+        store.scroll_down(2, 8, 2, false); // rows 8..10: past bottom
         assert!(store.get(1, 1).is_none());
         store.upsert(placed(2, 2, 2, 0));
-        store.scroll_down(2, 8, 2);
+        store.scroll_down(2, 8, 2, false);
         assert_eq!(store.get(2, 2).unwrap().anchor_row, 4);
+    }
+
+    #[test]
+    fn scroll_spares_the_hidden_screen() {
+        let mut store = PlacementStore::new();
+        store.upsert(placed(1, 1, 4, 0)); // main screen, rows 4..6
+        let mut alt = placed(2, 2, 4, 0);
+        alt.on_alt_screen = true;
+        store.upsert(alt);
+        // Alt-screen scroll moves only the alt placement.
+        store.scroll_up(2, 8, 2, true);
+        assert_eq!(store.get(1, 1).unwrap().anchor_row, 4);
+        assert_eq!(store.get(2, 2).unwrap().anchor_row, 2);
+        // Main-screen scroll moves only the main placement.
+        store.scroll_down(2, 8, 2, false);
+        assert_eq!(store.get(1, 1).unwrap().anchor_row, 6);
+        assert_eq!(store.get(2, 2).unwrap().anchor_row, 2);
     }
 
     #[test]

@@ -761,7 +761,9 @@ pub fn encode_key_event_kitty_protocol(
         } else {
             None
         };
-        let simple_encoding_ok = event_type.is_none() && shifted.is_none() && embed.is_none();
+        // The shifted alternate only decorates keys that are already
+        // escape-coded; it never selects the escape form by itself.
+        let simple_encoding_ok = event_type.is_none() && embed.is_none();
         // Numpad keys take the keypad-code form once disambiguate is
         // active, even with no modifiers held.
         let escape_for_keypad = is_keypad && disambiguate;
@@ -783,7 +785,7 @@ pub fn encode_key_event_kitty_protocol(
         // `ctrl+Space` -> `CSI 32;5u` instead of the legacy NUL). A bare or
         // shift-only Space stays text.
         if *named == NamedKey::Space {
-            if !report_all && !(disambiguate && disambiguated_chord) {
+            if event_type.is_none() && !report_all && !(disambiguate && disambiguated_chord) {
                 return None;
             }
             let embed = if report_text && report_all {
@@ -1730,6 +1732,68 @@ mod tests {
         assert_eq!(
             encode_key_event_kitty_protocol(&ev, KITTY_MOD_SHIFT, KITTY_FLAG_DISAMBIGUATE),
             None
+        );
+    }
+
+    #[test]
+    fn kitty_shift_only_text_stays_legacy_with_alternates() {
+        // The shifted alternate decorates escape-coded keys only; it never
+        // selects the escape form by itself, so Shift+a stays text even
+        // when the alternate flag is negotiated.
+        let ev = kitty_char("a", Some("A"), PressState::Pressed, false);
+        assert_eq!(
+            encode_key_event_kitty_protocol(
+                &ev,
+                KITTY_MOD_SHIFT,
+                KITTY_FLAG_DISAMBIGUATE | KITTY_FLAG_REPORT_ALTERNATES
+            ),
+            None
+        );
+        assert_eq!(
+            encode_key_event_kitty_protocol(&ev, KITTY_MOD_SHIFT, KITTY_FLAG_REPORT_ALTERNATES),
+            None,
+            "alternates alone must not escape-code a shifted text key"
+        );
+        // Under report-all-keys the escape form is selected by that flag
+        // and the shifted alternate still decorates the frame.
+        assert_eq!(
+            encode_key_event_kitty_protocol(
+                &ev,
+                KITTY_MOD_SHIFT,
+                KITTY_FLAG_REPORT_ALL_KEYS | KITTY_FLAG_REPORT_ALTERNATES
+            ),
+            Some(b"\x1b[97:65;2u".to_vec()),
+            "report-all Shift+a carries the shifted alternate"
+        );
+    }
+
+    #[test]
+    fn kitty_space_repeat_and_release_reported_under_report_events() {
+        let flags = KITTY_FLAG_DISAMBIGUATE | KITTY_FLAG_REPORT_EVENTS;
+        // A bare Space press stays on the legacy path (a plain " ").
+        let press = kitty_named(NamedKey::Space, PressState::Pressed);
+        assert_eq!(
+            encode_key_event_kitty_protocol(&press, 0, flags),
+            None,
+            "bare Space press stays text under report-events"
+        );
+        // Repeat and release carry their event types like any other key.
+        let repeat = kitty_named_located(
+            NamedKey::Space,
+            KeyLocation::Standard,
+            PressState::Pressed,
+            true,
+        );
+        assert_eq!(
+            encode_key_event_kitty_protocol(&repeat, 0, flags),
+            Some(b"\x1b[32;1:2u".to_vec()),
+            "Space repeat carries event type 2 when report-events is set"
+        );
+        let release = kitty_named(NamedKey::Space, PressState::Released);
+        assert_eq!(
+            encode_key_event_kitty_protocol(&release, 0, flags),
+            Some(b"\x1b[32;1:3u".to_vec()),
+            "Space release carries event type 3 when report-events is set"
         );
     }
 

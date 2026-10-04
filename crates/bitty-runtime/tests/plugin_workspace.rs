@@ -37,11 +37,24 @@ impl WorkspaceSource for FixedWorkspaces {
 }
 
 fn row(id: u64, name: &str, active: bool, panel_count: usize) -> WorkspaceInfo {
+    srow(id, name, active, panel_count, 0, false)
+}
+
+fn srow(
+    id: u64,
+    name: &str,
+    active: bool,
+    panel_count: usize,
+    scratchpad_count: usize,
+    scratchpad_occupied: bool,
+) -> WorkspaceInfo {
     WorkspaceInfo {
         id,
         name: name.to_string(),
         active,
         panel_count,
+        scratchpad_count,
+        scratchpad_occupied,
         attention: WorkspaceAttention::default(),
     }
 }
@@ -173,6 +186,15 @@ bitty.commands.register({
 })
 bitty.commands.register({ id = "new", title = "New", run = function()
   return call(bitty.workspace.new) end })
+bitty.commands.register({ id = "list_scratch", title = "List scratch", run = function()
+  local ok, rows = pcall(bitty.workspace.list)
+  if not ok then return "ERR:" .. rows.code end
+  local out = {}
+  for _, row in ipairs(rows) do
+    out[#out + 1] = row.scratchpad_count .. "|" .. tostring(row.scratchpad_occupied)
+  end
+  return table.concat(out, ";")
+end })
 bitty.commands.register({ id = "next", title = "Next", run = function()
   return call(bitty.workspace.next) end })
 bitty.commands.register({ id = "focus", title = "Focus", run = function()
@@ -211,6 +233,7 @@ end })
 
 const PROBE_COMMANDS: &[&str] = &[
     "list",
+    "list_scratch",
     "new",
     "next",
     "focus",
@@ -287,6 +310,19 @@ fn read_grant_lists_but_never_implies_control() {
         );
     }
     assert!(rt.drain_workspace_requests().is_empty());
+}
+
+#[test]
+fn scratchpad_occupancy_visible_under_read_only() {
+    // CTX-0954: occupancy (empty vs occupied) is present and correct through
+    // the real `bitty.workspace.list` bridge under `workspace.read` alone;
+    // the probe holds no panel grant.
+    let (mut rt, source) = probe_runtime(&["workspace.read"]);
+    *source.0.borrow_mut() = vec![
+        srow(1, "ws1", false, 2, 0, false),
+        srow(2, "ws2", true, 1, 1, true),
+    ];
+    assert_eq!(run(&mut rt, "list_scratch"), "0|false;1|true");
 }
 
 #[test]

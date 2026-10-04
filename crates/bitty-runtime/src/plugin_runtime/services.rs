@@ -2648,6 +2648,47 @@ mod tests {
     }
 
     #[test]
+    fn workspace_read_lists_scratchpad_without_panel_grants() {
+        // CTX-0954 deny-proof: scratchpad occupancy rides `workspace.read`
+        // alone; no panel grant is consulted in either direction.
+        struct OccupiedWorkspaces;
+        impl WorkspaceSource for OccupiedWorkspaces {
+            fn workspaces(&self) -> Result<Vec<WorkspaceInfo>, BridgeError> {
+                Ok(vec![WorkspaceInfo {
+                    id: 1,
+                    name: String::from("ws1"),
+                    active: true,
+                    panel_count: 2,
+                    scratchpad_count: 1,
+                    scratchpad_occupied: true,
+                    attention: bitty_lua::WorkspaceAttention::default(),
+                }])
+            }
+        }
+
+        let granted = services();
+        granted.set_workspace_access(true, false);
+        granted.set_workspace_backend(Some(Rc::new(OccupiedWorkspaces)), None);
+        // No panel grants held: the read still serves occupancy.
+        let rows = granted.workspace_list().expect("read lists occupancy");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].scratchpad_count, 1);
+        assert!(rows[0].scratchpad_occupied);
+        // Panel grants change nothing about the read path.
+        granted.set_panel_access(true, true);
+        let rows = granted.workspace_list().expect("read still lists");
+        assert!(rows[0].scratchpad_occupied);
+        // Without workspace.read the list fails closed even when every panel
+        // grant is held.
+        let denied = services();
+        denied.set_panel_access(true, true);
+        denied.set_workspace_backend(Some(Rc::new(OccupiedWorkspaces)), None);
+        let error = denied.workspace_list().expect_err("needs workspace.read");
+        assert_eq!(error.code, "E_CAPABILITY_DENIED");
+        assert_eq!(error.message, "capability 'workspace.read' is not granted");
+    }
+
+    #[test]
     fn debug_entry_points_deny_without_grant() {
         let services = debug_services(false, false);
         for target in ["plugins", "grants", "panels", "bogus"] {

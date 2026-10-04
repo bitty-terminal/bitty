@@ -109,7 +109,8 @@ use bitty_term_state::{
 };
 use bitty_ui::{
     CellPos, Focus, FocusDirection, Gaps, LayoutNode, OverlayTier, PersistentSelection,
-    Rect as UiRect, SearchHighlight, Selection, SelectionKind, View, ViewId, search::SearchState,
+    Rect as UiRect, ScratchpadSlot, SearchHighlight, Selection, SelectionKind, View, ViewId,
+    search::SearchState,
 };
 use bitty_vt::{
     ClipboardOp, DynamicColorOp, DynamicColorTarget, PaletteColorOp, Parser, SequenceKind,
@@ -126,6 +127,7 @@ use crate::queue::{ColdEvent, ColdQueue};
 
 pub mod animations;
 pub mod background_images;
+pub mod band_host;
 pub mod band_slots;
 pub mod bell;
 pub mod chrome_band;
@@ -493,6 +495,12 @@ pub struct Runtime {
     /// this snapshot; any difference forces a full present. Updated on
     /// every present alongside the allocations.
     last_presented_bar: Option<String>,
+    /// Mounted band versions at the last present (CTX-0946 C2).
+    ///
+    /// Compared per tick against [`band_host`](self::band_host)
+    /// versions so a plugin mount/update/unmount presents on a quiet grid.
+    /// Updated on every present alongside `last_presented_bar`.
+    last_presented_bands: Vec<(String, bitty_lua::ui::UiSlot, u32)>,
     cols: usize,
     rows: usize,
     layout: LayoutNode,
@@ -505,6 +513,24 @@ pub struct Runtime {
     active_workspace: usize,
     /// MRU workspace indices, active fronted, each live index exactly once.
     workspace_mru: std::collections::VecDeque<usize>,
+    /// Hidden per-window scratchpad slot (CTX-0954, CW-10).
+    ///
+    /// Holds at most one parked leaf detached from the live layout; it never
+    /// enters the layout solver and survives workspace switches. Occupancy is
+    /// exposed to plugins through [`Runtime::workspace_summaries`] (count +
+    /// presence on every row, under the existing `workspace.read` grant), so
+    /// the bar renders its indicator without any panel capability.
+    scratchpad: ScratchpadSlot,
+    /// Parked primary owner and the post-hide handoff owner (CTX-0954,
+    /// CodeRabbit #1671 follow-up).
+    ///
+    /// Set by [`Runtime::scratchpad_hide`] when the parked leaf owns the
+    /// primary shell: `(parked leaf, primary_view after the handoff)`.
+    /// [`Runtime::scratchpad_show`] restores ownership only while
+    /// `primary_view` still matches the recorded handoff (including `None`)
+    /// — a workspace close may have re-homed it elsewhere since. `None`
+    /// while the slot is empty or the parked leaf never owned the shell.
+    scratchpad_primary_owner: Option<(ViewId, Option<ViewId>)>,
     /// Monotonic high-water mark of every [`ViewId`] ever installed in a
     /// layout (CTX-0536, issue #923).
     ///
@@ -770,6 +796,26 @@ pub struct Runtime {
     /// the next left release. No selection or drag can be in flight across
     /// it: the bar press returns before any of those start.
     bar_release_swallow: bool,
+    /// One-shot swallow for the left release paired with a plugin-band
+    /// chrome-consumed press (CTX-0946 C1).
+    ///
+    /// Mirrors [`Self::bar_release_swallow`]: a band press is consumed as
+    /// Core chrome before capture, so the capturing app never saw the press
+    /// and the paired release must not reach it as an orphan report. Set
+    /// when [`band_host`](self::band_host) routing consumes a press, cleared
+    /// (resolving the click into the drain queue) on the next left release.
+    band_release_swallow: bool,
+    /// Queued Core-routed band clicks awaiting application dispatch
+    /// (CTX-0946 C1). Bounded by
+    /// [`BAND_CLICK_QUEUE_MAX`](self::band_host::BAND_CLICK_QUEUE_MAX).
+    band_click_queue: Vec<band_host::BandClickRequest>,
+    /// Press-side band target armed by the last consumed band press
+    /// (CTX-0946 C1 review: standard button semantics — the paired release
+    /// routes only onto the same band run). `None` when no band press owns
+    /// its release; cleared with the release swallow.
+    band_press_target: Option<band_host::PressedBandTarget>,
+    /// Headless host statistics for band routing and paint (CTX-0946).
+    band_stats: band_host::BandHostStats,
     search_state: SearchState,
     pending_paste: Option<crate::paste::PendingPaste>,
     /// Wall time when the current pending paste was gated (CTX-0192).
@@ -1385,6 +1431,10 @@ impl Runtime {
             paste_truncated_pastes: 0,
             last_cursor: None,
             bar_release_swallow: false,
+            band_release_swallow: false,
+            band_click_queue: Vec::new(),
+            band_press_target: None,
+            band_stats: band_host::BandHostStats::default(),
             search_state: SearchState::new(),
             pending_paste: None,
             pending_paste_since: None,
@@ -1468,6 +1518,8 @@ impl Runtime {
             workspaces: Vec::new(),
             active_workspace: 0,
             workspace_mru: std::collections::VecDeque::new(),
+            scratchpad: ScratchpadSlot::new(),
+            scratchpad_primary_owner: None,
             view_id_high_water: 0,
             session_pending: BTreeMap::new(),
             session_primary_cwd: None,
@@ -1478,6 +1530,7 @@ impl Runtime {
             workspace_bar_edge: config.workspace_bar_edge,
             window_cells: container,
             last_presented_bar: None,
+            last_presented_bands: Vec::new(),
             help_visible: false,
             panel_layout_mode: config.panel_layout_mode,
             help_rows: Vec::new(),
@@ -1609,6 +1662,10 @@ impl Runtime {
             paste_truncated_pastes: 0,
             last_cursor: None,
             bar_release_swallow: false,
+            band_release_swallow: false,
+            band_click_queue: Vec::new(),
+            band_press_target: None,
+            band_stats: band_host::BandHostStats::default(),
             search_state: SearchState::new(),
             pending_paste: None,
             pending_paste_since: None,
@@ -1692,6 +1749,8 @@ impl Runtime {
             workspaces: Vec::new(),
             active_workspace: 0,
             workspace_mru: std::collections::VecDeque::new(),
+            scratchpad: ScratchpadSlot::new(),
+            scratchpad_primary_owner: None,
             view_id_high_water: 0,
             session_pending: BTreeMap::new(),
             session_primary_cwd: None,
@@ -1702,6 +1761,7 @@ impl Runtime {
             workspace_bar_edge: config.workspace_bar_edge,
             window_cells: container,
             last_presented_bar: None,
+            last_presented_bands: Vec::new(),
             help_visible: false,
             panel_layout_mode: config.panel_layout_mode,
             help_rows: Vec::new(),

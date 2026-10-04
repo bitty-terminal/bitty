@@ -85,6 +85,9 @@ pub struct WorkspaceSlot {
 /// runtime (the plugin workspace domain). Carries identity, order, and panel
 /// structure only — never terminal content — and no plugin types, so the
 /// runtime stays free of the plugin boundary.
+///
+/// CTX-0954: the scratchpad slot is window-global (one `ScratchpadSlot` per
+/// window), so every summary of one snapshot carries the same occupancy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceSummary {
     /// Stable creation sequence (`ws{seq}` identity across index shifts).
@@ -96,6 +99,10 @@ pub struct WorkspaceSummary {
     /// Leaf (panel) view ids in layout order; the active slot reads the
     /// live layout. Its length is the panel count.
     pub panel_ids: Vec<u64>,
+    /// Parked panels in the window scratchpad slot (`0` or `1`).
+    pub scratchpad_count: usize,
+    /// Whether the window scratchpad slot holds a parked panel.
+    pub scratchpad_occupied: bool,
 }
 
 /// A close awaiting explicit confirmation (kill-confirm gate).
@@ -251,8 +258,14 @@ impl Runtime {
     /// slot's panels come from the live layout (its stash is refreshed only
     /// on switch-away), so the summary is never stale. Time O(w + l) over
     /// `w` workspaces and `l` total leaves; space O(w + l).
+    ///
+    /// CTX-0954: every row carries the window-global scratchpad occupancy
+    /// (`0`/`1` + presence), so a scratchpad put/take changes every row and
+    /// the existing `workspace.changed` diff fires without a new event.
     #[must_use]
     pub fn workspace_summaries(&self) -> Vec<WorkspaceSummary> {
+        let scratchpad_count = usize::from(!self.scratchpad.is_empty());
+        let scratchpad_occupied = !self.scratchpad.is_empty();
         self.workspaces
             .iter()
             .take(MAX_WORKSPACES)
@@ -269,9 +282,136 @@ impl Runtime {
                     name: slot.name.clone(),
                     active,
                     panel_ids: leaves.into_iter().map(|id| id.0).collect(),
+                    scratchpad_count,
+                    scratchpad_occupied,
                 }
             })
             .collect()
+    }
+
+    /// Parked panels in the window scratchpad slot: `0` (empty) or `1`
+    /// (occupied) (CTX-0954).
+    ///
+    /// Structurally bounded by the single-slot invariant; identity only,
+    /// never terminal content.
+    #[must_use]
+    pub fn scratchpad_count(&self) -> usize {
+        usize::from(!self.scratchpad.is_empty())
+    }
+
+    /// Whether the window scratchpad slot holds a parked panel (CTX-0954).
+    #[must_use]
+    pub fn scratchpad_occupied(&self) -> bool {
+        !self.scratchpad.is_empty()
+    }
+
+    /// Park live leaf `id` into the window scratchpad slot (CTX-0954).
+    ///
+    /// The leaf detaches from the live (active-workspace) layout and waits in
+    /// the single hidden slot; its pane session (if any) stays keyed by
+    /// [`ViewId`] and resumes on show. Occupancy surfaces through
+    /// [`Self::workspace_summaries`] and the existing `workspace.changed`
+    /// diff — no panel capability is involved.
+    ///
+    /// When the parked leaf owns the primary shell, ownership moves to the
+    /// surviving focus (a parked leaf paints nothing) and the `(parked,
+    /// handoff)` pair is recorded in `scratchpad_primary_owner` so
+    /// [`Self::scratchpad_show`] can hand it back only while the handoff
+    /// still holds it (CodeRabbit #1671 follow-up).
+    ///
+    /// Fail-closed with state untouched: occupied slot, unknown id, a
+    /// rejected mode stamp, or hiding the live layout's last leaf (an empty
+    /// live layout would strand focus and present).
+    pub fn scratchpad_hide(&mut self, id: ViewId) -> Result<(), String> {
+        if self.layout.leaf_count() <= 1 {
+            return Err(String::from("scratchpad hide would strand an empty layout"));
+        }
+        self.scratchpad
+            .hide(&mut self.layout, id)
+            .map_err(|error| error.to_string())?;
+        let restore_primary = self.primary_view == Some(id);
+        self.after_scratchpad_move(Some(id));
+        self.scratchpad_primary_owner = restore_primary.then_some((id, self.primary_view));
+        Ok(())
+    }
+
+    /// Restore the parked leaf beside its anchor and focus it (CTX-0954).
+    ///
+    /// When the parked leaf owned the primary shell at hide time, ownership
+    /// returns to it before the geometry sync — but only while `primary_view`
+    /// still matches the recorded handoff recipient (a workspace close may
+    /// have re-homed it elsewhere since; stealing it back would leave the new
+    /// owner erased and its input buffered). Otherwise the restored leaf
+    /// stays session-less (CodeRabbit #1671 follow-up).
+    ///
+    /// Returns the restored leaf id. Fail-closed with state untouched when
+    /// nothing is parked or the mode gate rejects the restore.
+    pub fn scratchpad_show(&mut self) -> Result<ViewId, String> {
+        let id = self
+            .scratchpad
+            .show(&mut self.layout)
+            .map_err(|error| error.to_string())?;
+        self.focus = Focus::with_focus(id);
+        if self
+            .scratchpad_primary_owner
+            .as_ref()
+            .is_some_and(|(owner, handoff)| {
+                *owner == id && self.primary_view.as_ref() == handoff.as_ref()
+            })
+        {
+            self.primary_view = Some(id);
+        }
+        self.scratchpad_primary_owner = None;
+        self.after_scratchpad_move(None);
+        Ok(id)
+    }
+
+    /// Toggle the window scratchpad slot (CTX-0954).
+    ///
+    /// Shows the parked leaf when occupied (the target is ignored), otherwise
+    /// hides `target`. Returns the restored id on show, `None` on hide.
+    /// Same fail-closed rules as [`Self::scratchpad_hide`] and
+    /// [`Self::scratchpad_show`].
+    pub fn scratchpad_toggle(&mut self, target: Option<ViewId>) -> Result<Option<ViewId>, String> {
+        if self.scratchpad.is_empty() {
+            let id = target.ok_or_else(|| String::from("scratchpad hide needs a target leaf"))?;
+            self.scratchpad_hide(id).map(|()| None)
+        } else {
+            self.scratchpad_show().map(Some)
+        }
+    }
+
+    /// Shared post-edit fixups after the live layout lost or gained a leaf
+    /// through the scratchpad slot (CTX-0954).
+    ///
+    /// `hidden` is the just-parked leaf, if any: focus moves off it onto the
+    /// first surviving leaf, and primary-grid ownership follows (a parked leaf
+    /// paints nothing). Geometry, mode caches, hover dwell, and view bindings
+    /// follow the cross-workspace move precedent.
+    fn after_scratchpad_move(&mut self, hidden: Option<ViewId>) {
+        // CTX-0334: restructuring the live tree abandons any pending hover
+        // dwell, mirroring the cross-workspace move.
+        self.clear_hover_pending();
+        if let Some(id) = hidden {
+            if self.focus.focused() == Some(id) {
+                if let Some(first) = self.layout.leaf_ids().into_iter().next() {
+                    self.focus = Focus::with_focus(first);
+                }
+            }
+            if self.primary_view == Some(id) {
+                self.primary_view = self.focus.focused();
+            }
+        }
+        // CTX-0405: boundaries moved in place; re-sync before presenting.
+        self.sync_primary_geometry();
+        self.sync_pane_geometry();
+        // CTX-0532: focus may have transitioned; attribute the input-mode
+        // caches before any input can arrive.
+        self.sync_mode_caches_to_focus();
+        // CTX-0803/CTX-0805: a leaf left the live layout directly; bindings
+        // to it are dropped instead of lingering behind the read guard.
+        self.invalidate_stale_view_bindings();
+        self.pending_full_redraw = true;
     }
 
     /// Minimal tabline render: names + indices + focused marker + count.
@@ -660,6 +800,11 @@ impl Runtime {
         let mut raws: Vec<u64> = self.layout.leaf_ids().iter().map(|id| id.0).collect();
         for slot in &self.workspaces {
             raws.extend(slot.layout.leaf_ids().iter().map(|id| id.0));
+        }
+        // CTX-0954: the parked leaf is window-owned while hidden; covering it
+        // keeps the allocator from re-handing its id before it is restored.
+        if let Some(parked) = self.scratchpad.peek() {
+            raws.push(parked.id().0);
         }
         raws
     }
@@ -1580,6 +1725,10 @@ mod tests {
     // `#[cfg(unix)]`); without the gate the import is unused on Windows.
     #[cfg(unix)]
     use bitty_test_support::require_pty;
+    // Marker glyphs for the primary-grid paint checks (same gate: only the
+    // live-shell scratchpad tests below print into the primary grid).
+    #[cfg(unix)]
+    use bitty_vt::GraphemeCell;
 
     fn fresh() -> Runtime {
         Runtime::with_defaults().expect("defaults must build headless")
@@ -2505,5 +2654,273 @@ mod tests {
         assert!(rt.has_pane_session(&moved_id));
         assert!(rt.layout().leaf_ids().contains(&moved_id));
         assert_eq!(rt.focused_view(), Some(moved_id));
+    }
+
+    #[test]
+    fn scratchpad_hide_show_tracks_occupancy_in_summaries() {
+        // CTX-0954: empty vs occupied rows; a put/take flips count + presence
+        // on every (window-global) row; the parked id is never re-handed.
+        let mut rt = fresh();
+        let only = rt.focused_view().expect("focus");
+        assert_eq!(rt.scratchpad_count(), 0);
+        assert!(!rt.scratchpad_occupied());
+        for row in rt.workspace_summaries() {
+            assert_eq!(row.scratchpad_count, 0);
+            assert!(!row.scratchpad_occupied);
+        }
+        // Sole-leaf hide is refused fail-closed: the live layout never
+        // strands empty; vacant show fails too.
+        assert!(rt.scratchpad_hide(only).is_err());
+        assert!(rt.scratchpad_show().is_err());
+        assert_eq!(rt.layout().leaf_ids(), vec![only]);
+        // A second leaf lets the focused one park.
+        let second = ViewId::new(2);
+        let leaf1 = rt.layout().find_leaf(only).cloned().expect("leaf1");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(leaf1),
+            LayoutNode::leaf(View::new(second, 40, 24)),
+        ));
+        assert!(rt.set_focus(only));
+        rt.scratchpad_hide(only).expect("hide focused leaf");
+        assert_eq!(rt.scratchpad_count(), 1);
+        assert!(rt.scratchpad_occupied());
+        assert_eq!(rt.layout().leaf_ids(), vec![second]);
+        assert_eq!(
+            rt.focused_view(),
+            Some(second),
+            "focus leaves the parked leaf"
+        );
+        let summaries = rt.workspace_summaries();
+        assert!(!summaries.is_empty());
+        for row in &summaries {
+            assert_eq!(row.scratchpad_count, 1);
+            assert!(row.scratchpad_occupied);
+        }
+        assert_ne!(
+            rt.next_view_id_global(),
+            only,
+            "parked id stays covered while hidden"
+        );
+        // Occupied hide is refused with the tree untouched.
+        let before = rt.layout().clone();
+        assert!(rt.scratchpad_hide(second).is_err());
+        assert_eq!(rt.layout(), &before);
+        // Show restores the same id beside its anchor and focuses it.
+        let restored = rt.scratchpad_show().expect("show");
+        assert_eq!(restored, only);
+        assert_eq!(rt.scratchpad_count(), 0);
+        assert!(!rt.scratchpad_occupied());
+        assert_eq!(rt.focused_view(), Some(only));
+        assert!(rt.layout().leaf_ids().contains(&only));
+        for row in rt.workspace_summaries() {
+            assert_eq!(row.scratchpad_count, 0);
+            assert!(!row.scratchpad_occupied);
+        }
+    }
+
+    #[test]
+    fn scratchpad_toggle_hides_then_shows_target_ignored_on_show() {
+        // CTX-0954: vacant toggle hides the target; occupied toggle restores
+        // the parked leaf and ignores the target.
+        let mut rt = fresh();
+        assert!(rt.scratchpad_toggle(None).is_err(), "hide needs a target");
+        let only = rt.focused_view().expect("focus");
+        let second = ViewId::new(2);
+        let leaf1 = rt.layout().find_leaf(only).cloned().expect("leaf1");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(leaf1),
+            LayoutNode::leaf(View::new(second, 40, 24)),
+        ));
+        assert!(rt.set_focus(only));
+        assert_eq!(rt.scratchpad_toggle(Some(only)).expect("hide"), None);
+        assert!(rt.scratchpad_occupied());
+        assert_eq!(
+            rt.scratchpad_toggle(Some(second)).expect("show"),
+            Some(only)
+        );
+        assert!(!rt.scratchpad_occupied());
+        assert_eq!(rt.focused_view(), Some(only));
+    }
+
+    /// Whether the first grid row of `view`'s tile carries glyph ink.
+    ///
+    /// CodeRabbit #1671 helper: scans the marker columns (grid cols 0..2 of
+    /// row 0) of the leaf content rect for non-background pixels. The two
+    /// marker prints leave the cursor at col 2, so the window excludes the
+    /// caret on either leaf.
+    #[cfg(unix)]
+    fn leaf_row_has_ink(rt: &Runtime, view: ViewId) -> bool {
+        let rgba = rt.headless_rgba().expect("headless rgba");
+        let extent = rt.present_plan_extent();
+        let (w, h) = (extent.width as usize, extent.height as usize);
+        assert_eq!(rgba.len(), w * h * 4);
+        let bg = [rgba[0], rgba[1], rgba[2], rgba[3]];
+        let frame = rt
+            .present_frames()
+            .into_iter()
+            .find(|frame| frame.view == view)
+            .expect("frame for leaf");
+        let pad = rt.window_padding_physical() as usize;
+        let cell = rt.live_cell_metrics();
+        let x0 = pad.saturating_add(frame.content.x.max(0) as usize);
+        let y0 = pad.saturating_add(frame.content.y.max(0) as usize);
+        let x1 = (x0 + 2 * cell.width as usize).min(w);
+        let y1 = (y0 + cell.height as usize).min(h);
+        (y0..y1).any(|y| (x0..x1).any(|x| rgba[(y * w + x) * 4..(y * w + x) * 4 + 4] != bg))
+    }
+
+    /// Two leaves with the primary shell attached on the focused first one.
+    ///
+    /// CodeRabbit #1671 setup: returns the runtime plus `(owner, other)`.
+    /// Prints a two-glyph marker into the primary grid for the paint checks.
+    /// Callers run [`require_pty`] first (the macro returns from `#[test]`
+    /// bodies only, so it cannot live in this tuple-returning helper).
+    #[cfg(unix)]
+    fn primary_attached_pair() -> (Runtime, ViewId, ViewId) {
+        let mut rt = fresh();
+        let owner = rt.focused_view().expect("focus");
+        let other = ViewId::new(2);
+        let leaf = rt.layout().find_leaf(owner).cloned().expect("leaf");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(leaf),
+            LayoutNode::leaf(View::new(other, 40, 24)),
+        ));
+        assert!(rt.set_focus(owner));
+        rt.spawn_shell("/bin/sh")
+            .expect("primary must attach headless");
+        assert_eq!(rt.primary_view(), Some(owner));
+        for c in ['H', 'i'] {
+            rt.state
+                .apply(&TerminalAction::Print(GraphemeCell::from(c)));
+        }
+        (rt, owner, other)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn scratchpad_show_restores_primary_ownership_to_parked_owner() {
+        // CodeRabbit #1671: hiding the primary owner moves ownership to the
+        // survivor (the shell stays reachable through it); showing hands
+        // ownership back to the returning leaf so it paints the primary grid
+        // and routes input to it instead of rendering erased and buffering
+        // headless.
+        require_pty!();
+        let (mut rt, owner, other) = primary_attached_pair();
+        // Baseline: typing on the session-less owner reaches the shell.
+        assert!(rt.push_input_bytes(b"x"), "owner routes to primary shell");
+        rt.scratchpad_hide(owner).expect("hide owner");
+        assert_eq!(rt.focused_view(), Some(other));
+        assert_eq!(rt.primary_view(), Some(other));
+        assert!(
+            rt.push_input_bytes(b"x"),
+            "survivor keeps the shell reachable"
+        );
+        let restored = rt.scratchpad_show().expect("show");
+        assert_eq!(restored, owner);
+        assert_eq!(rt.focused_view(), Some(owner));
+        assert_eq!(
+            rt.primary_view(),
+            Some(owner),
+            "ownership returns to the parked owner"
+        );
+        assert!(rt.is_primary_view(&owner));
+        assert!(
+            rt.push_input_bytes(b"x"),
+            "restored owner routes to primary shell again"
+        );
+        rt.tick().expect("headless tick presents");
+        assert!(
+            leaf_row_has_ink(&rt, owner),
+            "owner paints the primary grid"
+        );
+        assert!(
+            !leaf_row_has_ink(&rt, other),
+            "no grid is duplicated onto the survivor"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn scratchpad_show_keeps_primary_ownership_for_non_owner() {
+        // CodeRabbit #1671, other direction: parking a non-owner leaves
+        // ownership alone, and showing it must not steal ownership. Typing on
+        // the session-less non-owner buffers instead of reaching another
+        // view's shell, and only the owner's tile paints the grid.
+        require_pty!();
+        let (mut rt, owner, other) = primary_attached_pair();
+        assert!(rt.set_focus(other));
+        rt.scratchpad_hide(other).expect("hide non-owner");
+        assert_eq!(rt.primary_view(), Some(owner));
+        let restored = rt.scratchpad_show().expect("show");
+        assert_eq!(restored, other);
+        assert_eq!(rt.focused_view(), Some(other));
+        assert_eq!(
+            rt.primary_view(),
+            Some(owner),
+            "show must not steal ownership"
+        );
+        let buffered = rt.pending_input_len();
+        assert!(
+            !rt.push_input_bytes(b"x"),
+            "non-owner never reaches the shell"
+        );
+        assert_eq!(rt.pending_input_len(), buffered + 1);
+        rt.tick().expect("headless tick presents");
+        assert!(
+            leaf_row_has_ink(&rt, owner),
+            "owner paints the primary grid"
+        );
+        assert!(!leaf_row_has_ink(&rt, other), "non-owner tile stays erased");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn scratchpad_show_does_not_steal_rehomed_primary_ownership() {
+        // CodeRabbit #1671 follow-up: hiding the owner hands ownership to the
+        // survivor, but closing the survivor's workspace re-homes it to a new
+        // leaf. Showing the parked leaf must not steal it back: the restored
+        // leaf stays session-less, typing buffers, and only live grids paint.
+        require_pty!();
+        let (mut rt, owner, _survivor) = primary_attached_pair();
+        rt.workspace_new().expect("second workspace");
+        assert!(rt.workspace_switch(0));
+        assert_eq!(rt.focused_view(), Some(owner));
+        rt.scratchpad_hide(owner).expect("hide owner");
+        // Close the survivor's (active) workspace: ownership re-homes to the
+        // remaining workspace's focused leaf.
+        assert!(matches!(
+            rt.workspace_close_request(),
+            WsCloseRequest::Closed { .. }
+        ));
+        let new_owner = rt.focused_view().expect("new focus");
+        assert_ne!(new_owner, owner);
+        assert_eq!(rt.primary_view(), Some(new_owner));
+        // Show the parked leaf: focus returns, ownership must not.
+        let restored = rt.scratchpad_show().expect("show");
+        assert_eq!(restored, owner);
+        assert_eq!(rt.focused_view(), Some(owner));
+        assert_eq!(
+            rt.primary_view(),
+            Some(new_owner),
+            "show must not steal re-homed ownership"
+        );
+        assert!(!rt.is_primary_view(&owner));
+        let buffered = rt.pending_input_len();
+        assert!(!rt.push_input_bytes(b"x"), "nobody owns the input");
+        assert_eq!(rt.pending_input_len(), buffered + 1);
+        // Paint: the parked leaf stays erased (it owns no grid); the new
+        // owner's own session grid carries no primary marker either.
+        rt.tick().expect("headless tick presents");
+        assert!(!leaf_row_has_ink(&rt, owner), "parked leaf stays erased");
+        assert!(
+            !leaf_row_has_ink(&rt, new_owner),
+            "no grid is duplicated onto the new owner"
+        );
     }
 }

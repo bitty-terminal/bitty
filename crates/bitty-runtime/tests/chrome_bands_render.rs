@@ -340,7 +340,16 @@ fn text_band(plugin: &str, slot: UiSlot, text: &str) -> BandContent {
 
 #[test]
 fn bottom_bands_stack_inward_of_a_bottom_core_bar() {
-    let rt = runtime_with_core_bar(BarEdge::Bottom);
+    let mut rt = runtime_with_core_bar(BarEdge::Bottom);
+    // CTX-0946 C3: band rows belong to mounted visible bands (hidden bands
+    // take no row), so mount two bottom bands before probing geometry.
+    rt.set_chrome_bands(ChromeBands {
+        bottom: vec![
+            text_band("b0", UiSlot::Bottom, "B0"),
+            text_band("b1", UiSlot::Bottom, "B1"),
+        ],
+        ..Default::default()
+    });
     let window = rt.window_cells();
     let bar = rt.status_bar_band().expect("core bar reserved");
     assert_eq!(bar.y, window.height - 1, "core bar on the last row");
@@ -348,13 +357,23 @@ fn bottom_bands_stack_inward_of_a_bottom_core_bar() {
     assert_eq!(rt.core_reserved_rows(BandEdge::Top), 0);
     assert_eq!(rt.plugin_band_row(BandEdge::Bottom, 0), Some(bar.y - 1));
     assert_eq!(rt.plugin_band_row(BandEdge::Bottom, 1), Some(bar.y - 2));
+    // Out-of-range visible index reserves nothing.
+    assert_eq!(rt.plugin_band_row(BandEdge::Bottom, 2), None);
     // The opposite edge is unaffected.
-    assert_eq!(rt.plugin_band_row(BandEdge::Top, 0), Some(window.y));
+    assert_eq!(rt.plugin_band_row(BandEdge::Top, 0), None);
 }
 
 #[test]
 fn top_bands_stack_inward_of_a_top_core_bar() {
-    let rt = runtime_with_core_bar(BarEdge::Top);
+    let mut rt = runtime_with_core_bar(BarEdge::Top);
+    // CTX-0946 C3: mount two top bands before probing geometry (see above).
+    rt.set_chrome_bands(ChromeBands {
+        top: vec![
+            text_band("t0", UiSlot::Top, "T0"),
+            text_band("t1", UiSlot::Top, "T1"),
+        ],
+        ..Default::default()
+    });
     let window = rt.window_cells();
     let bar = rt.status_bar_band().expect("core bar reserved");
     assert_eq!(bar.y, window.y, "core bar on row 0");
@@ -362,22 +381,17 @@ fn top_bands_stack_inward_of_a_top_core_bar() {
     assert_eq!(rt.core_reserved_rows(BandEdge::Bottom), 0);
     assert_eq!(rt.plugin_band_row(BandEdge::Top, 0), Some(bar.y + 1));
     assert_eq!(rt.plugin_band_row(BandEdge::Top, 1), Some(bar.y + 2));
-    assert_eq!(
-        rt.plugin_band_row(BandEdge::Bottom, 0),
-        Some(window.height - 1)
-    );
+    assert_eq!(rt.plugin_band_row(BandEdge::Top, 2), None);
+    assert_eq!(rt.plugin_band_row(BandEdge::Bottom, 0), None);
 }
 
 #[test]
 fn lone_workspace_reserves_nothing_for_plugin_bands() {
     let rt = minimal_runtime();
     assert_eq!(rt.status_bar_band(), None);
-    let window = rt.window_cells();
-    assert_eq!(rt.core_reserved_rows(BandEdge::Bottom), 0);
-    assert_eq!(
-        rt.plugin_band_row(BandEdge::Bottom, 0),
-        Some(window.height - 1)
-    );
+    // CTX-0946 C3: with no mounted visible band no band row exists — the
+    // host reserves nothing for hypothetical bands.
+    assert_eq!(rt.plugin_band_row(BandEdge::Bottom, 0), None);
 }
 
 /// Pixels of the centre third of window cell row `row` after a tick.

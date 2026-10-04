@@ -40,12 +40,14 @@
 //! Core bar row `H-1`; the same holds for top bands with `edge = top`. See
 //! [`crate::Runtime::plugin_band_row`].
 //!
+//! Exclusive zone (CTX-0946 C3, closed): visible plugin bands shrink the
+//! layout container through [`Runtime::band_exclusive_container`]
+//! (see [`super::band_host`]), so no terminal cell is ever painted under a
+//! band. The reservation flows through the normal reflow path, resizing
+//! grids and PTY winsizes exactly like the Core workspaceline band.
+//!
 //! Known gaps (tracked follow-ups, not implemented here):
 //!
-//! - Plugin bands reserve no exclusive zone (candidate Chrome Surface API,
-//!   L0 "Exclusive zone"): they are painted as an overlay over the layout
-//!   container, so a band covers the terminal content row it sits on (the
-//!   last content row for bottom band `0`).
 //! - Known divergence from the candidate rule "one plugin may hold at most
 //!   one surface per edge; a second mount on the same edge fails": several
 //!   mounts from one plugin on one edge (for example `statusline` and
@@ -221,11 +223,18 @@ impl Runtime {
         }
     }
 
-    /// Window row painted by plugin band `index` on `edge`, offset inward of
-    /// the Core workspaceline band on that edge (see
+    /// Window row painted by visible plugin band `index` on `edge`, offset
+    /// inward of the Core workspaceline band on that edge (see
     /// [`ChromeBands::band_row`]); `None` when it does not fit.
+    ///
+    /// `index` counts visible (non-empty-text) bands only: hidden bands
+    /// take no stacking row (CTX-0946 C3, CTX-0925 item 3), so `index >=
+    /// visible count` is out of range even when more bands are mounted.
     #[must_use]
     pub fn plugin_band_row(&self, edge: BandEdge, index: usize) -> Option<u16> {
+        if u64::try_from(index).unwrap_or(u64::MAX) >= u64::from(self.visible_band_count(edge)) {
+            return None;
+        }
         let window = self.window_cells();
         ChromeBands::band_row(edge, index, window.height, self.core_reserved_rows(edge))
             .map(|row| row.saturating_add(window.y))

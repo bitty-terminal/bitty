@@ -139,6 +139,13 @@ impl<R: GlyphRasterizer> GlyphCache<R> {
         &self.rasterizer
     }
 
+    /// Mutable access to the wrapped rasterizer (the shaped grid path
+    /// uses this to reach `SwashSingle::shape_run` and its caches; the
+    /// char-keyed glyph cache itself is untouched by shaping).
+    pub fn rasterizer_mut(&mut self) -> &mut R {
+        &mut self.rasterizer
+    }
+
     /// Drops all cached entries (bitmaps and blanks) without resetting the
     /// cumulative hit/miss counters.
     ///

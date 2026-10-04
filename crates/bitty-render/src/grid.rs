@@ -87,11 +87,13 @@ use bitty_term_state::{
 use crate::atlas::{AtlasDims, AtlasLayout, AtlasSlot, DEFAULT_ATLAS_DIMENSION};
 use crate::cache::{CachedGlyph, GlyphCache};
 use crate::error::RenderError;
+use crate::fallback::FallbackRasterizer;
 use crate::frame::{DamageDescriptor, FramePlan, plan_frame};
 use crate::geometry::{ExtentPx, RectPx};
 use crate::glyph::{
     BitmapFormat, FontId, FontQuery, GlyphBitmap, GlyphMetrics, GlyphRasterizer, RasterKey,
 };
+use crate::shaped::{RunAttrs, ShapedCluster, SwashSingle, features_for_policy, form_runs_for_row};
 
 /// Straight-alpha RGBA color, `[r, g, b, a]` bytes.
 pub type Rgba8 = [u8; 4];
@@ -1490,6 +1492,11 @@ pub struct RenderCounters {
     pub decorations_emitted: u64,
     /// Glyph instances emitted.
     pub glyphs_emitted: u64,
+    /// Shaped clusters degraded to per-cell unshaped rendering after a
+    /// CJK-advance epsilon mismatch (Phase B, design 2.3). Bounded
+    /// monotone counter, no log spam; cells are never stretched or
+    /// clipped.
+    pub shaping_misaligned: u64,
 }
 
 /// One queued texture upload: coverage bytes for a freshly allocated slot.
@@ -1519,6 +1526,8 @@ pub struct AtlasUpload {
 pub struct GlyphAtlas {
     layout: AtlasLayout,
     slots: HashMap<RasterKey, AtlasSlot>,
+    /// Shaped-glyph placements by glyph-id key (Phase B ligature spans).
+    shaped_slots: HashMap<crate::shaped::ShapedGlyphKey, AtlasSlot>,
     texels: Vec<u8>,
     pending: Vec<AtlasUpload>,
     /// Generation of the current placement set, bumped by every wholesale
@@ -1568,6 +1577,7 @@ impl GlyphAtlas {
         Ok(Self {
             layout,
             slots: HashMap::new(),
+            shaped_slots: HashMap::new(),
             texels: vec![0; len],
             pending: Vec::new(),
             epoch: 0,
@@ -1625,6 +1635,7 @@ impl GlyphAtlas {
     fn reset_placements(&mut self) {
         self.layout.reset();
         self.slots.clear();
+        self.shaped_slots.clear();
         self.texels.fill(0);
         self.pending.clear();
         self.epoch = self.epoch.wrapping_add(1);
@@ -1661,13 +1672,13 @@ impl GlyphAtlas {
     /// Number of placements currently held.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.slots.len()
+        self.slots.len() + self.shaped_slots.len()
     }
 
     /// True when no placement is held.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.slots.is_empty()
+        self.slots.is_empty() && self.shaped_slots.is_empty()
     }
 
     /// Fraction of atlas texels covered by issued slots.
@@ -1751,7 +1762,7 @@ impl GlyphAtlas {
         // since we're only expanding the canvas, not changing existing slots).
         let old_stride = usize::from(current);
         let new_stride = usize::from(next);
-        for slot in self.slots.values() {
+        for slot in self.slots.values().chain(self.shaped_slots.values()) {
             let slot_w = usize::from(slot.width);
             for row in 0..usize::from(slot.height) {
                 let old_offset = (usize::from(slot.y) + row) * old_stride + usize::from(slot.x);
@@ -1772,7 +1783,7 @@ impl GlyphAtlas {
 
         // Mark all slots for re-upload since the texture changed.
         self.pending.clear();
-        for slot in self.slots.values() {
+        for slot in self.slots.values().chain(self.shaped_slots.values()) {
             let slot_w = usize::from(slot.width);
             let slot_h = usize::from(slot.height);
             let mut data = Vec::with_capacity(slot_w * slot_h);
@@ -1841,6 +1852,63 @@ impl GlyphAtlas {
             data: coverage,
         });
         self.slots.insert(key, slot);
+        GlyphSource::Atlas { slot }
+    }
+
+    /// Ensures a shaped glyph bitmap is placed for its glyph-id key
+    /// (Phase B ligature spans, design 2.5).
+    ///
+    /// Same CTX-0531 discipline as [`Self::ensure`] (no mid-pass reset,
+    /// inline fallback + exhaustion flag), but keyed by
+    /// [`crate::shaped::ShapedGlyphKey`] so distinct shaped glyphs never
+    /// collide with char-keyed slots or each other. Ligature bitmaps are
+    /// ordinary wider RGB blobs — at most two new shelf classes
+    /// (2- and 3-cell widths at one point size).
+    pub fn ensure_shaped(
+        &mut self,
+        key: crate::shaped::ShapedGlyphKey,
+        bitmap: &GlyphBitmap,
+    ) -> GlyphSource {
+        if let Some(slot) = self.shaped_slots.get(&key) {
+            self.hits += 1;
+            return GlyphSource::Atlas { slot: *slot };
+        }
+        self.misses += 1;
+
+        let width = u16::try_from(bitmap.metrics.width.max(0));
+        let height = u16::try_from(bitmap.metrics.height.max(0));
+        let (width, height) = match (width, height) {
+            (Ok(w), Ok(h)) => (w, h),
+            _ => return self.fallback_inline(bitmap),
+        };
+        if self.oversized(width, height) {
+            return self.fallback_inline(bitmap);
+        }
+
+        let Some(slot) = self.layout.allocate(width, height) else {
+            if self.try_grow() {
+                if let Some(slot) = self.layout.allocate(width, height) {
+                    let coverage = coverage_mask(bitmap);
+                    write_slot_texels(&mut self.texels, self.layout.dimensions(), slot, &coverage);
+                    self.pending.push(AtlasUpload {
+                        slot,
+                        data: coverage,
+                    });
+                    self.shaped_slots.insert(key, slot);
+                    return GlyphSource::Atlas { slot };
+                }
+            }
+            self.exhausted = true;
+            return self.fallback_inline(bitmap);
+        };
+
+        let coverage = coverage_mask(bitmap);
+        write_slot_texels(&mut self.texels, self.layout.dimensions(), slot, &coverage);
+        self.pending.push(AtlasUpload {
+            slot,
+            data: coverage,
+        });
+        self.shaped_slots.insert(key, slot);
         GlyphSource::Atlas { slot }
     }
 
@@ -2654,6 +2722,475 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         }
         self.refresh_atlas_uvs(&mut out);
         (out, self.atlas.is_exhausted())
+    }
+}
+
+impl GridRenderer<FallbackRasterizer<SwashSingle>> {
+    /// Shaped run-cache `(hits, misses)` totals from the inner shaper.
+    #[must_use]
+    pub fn shape_stats(&self) -> (u64, u64) {
+        self.cache.rasterizer().inner().shape_stats()
+    }
+
+    /// Renders one frame through the shaped run path (Phase B, opt-in).
+    ///
+    /// Dirty-row run formation groups contiguous cells with identical
+    /// style into LTR runs; each run shapes via the inner `SwashSingle`
+    /// (run/shape-plan caches, tail fallback), then clusters emit as
+    /// N-cell ligature spans, CJK double-width singles, or tofu. The
+    /// cursor policy (`Never`/`Cursor`/`Always`) selects the feature set:
+    /// `Always` forces programming ligatures off (bit-for-bit unshaped),
+    /// `Cursor` re-shapes the cursor row from cache with ligatures zeroed
+    /// when the cursor intersects a ligature span, `Never` shapes verbatim.
+    ///
+    /// Grid truth is never read from shaped output: backgrounds,
+    /// decorations, selection, and copy all keep reading `Snapshot`
+    /// `Cell`s; shaped clusters only decide which glyph bitmap covers an
+    /// already-painted cell span. Trailing cells of a ligature span paint
+    /// background only (no spacer-flag changes).
+    ///
+    /// # Errors
+    ///
+    /// Propagates rasterizer failures; a single bad run degrades that
+    /// run to per-cell unshaped rendering, never a frame error.
+    pub fn render_shaped(
+        &mut self,
+        snapshot: &Snapshot,
+        damage: &Damage,
+        policy: bitty_config::types::LigaturePolicy,
+        features: &[bitty_config::types::OpenTypeFeature],
+    ) -> Result<DrawList, RenderError> {
+        self.counters.frames_planned += 1;
+
+        let descriptor = SnapshotDamage::new(snapshot, damage, self.cell);
+        let plan = plan_frame(&descriptor);
+
+        let list = DrawList {
+            generation: snapshot.generation,
+            atlas_epoch: self.atlas.epoch(),
+            fills: Vec::new(),
+            rounded_fills: Vec::new(),
+            backgrounds: Vec::new(),
+            overlay_fills: Vec::new(),
+            glyphs: Vec::new(),
+            images: Vec::new(),
+            plan,
+        };
+        if !list.plan.needs_draw() {
+            return Ok(list);
+        }
+
+        let cols = snapshot.width;
+        let dirty_rects = list.plan.dirty_rects.clone();
+
+        let counters_before = self.counters;
+        let atlas_costs_before = self.atlas.cost_snapshot();
+        let mut pass =
+            self.place_shaped_pass(snapshot, cols, &dirty_rects, &list.plan, policy, features)?;
+        if self.atlas.is_exhausted() {
+            self.counters = counters_before;
+            self.atlas.restore_cost(atlas_costs_before);
+            self.atlas.evict_now();
+            pass =
+                self.place_shaped_pass(snapshot, cols, &dirty_rects, &list.plan, policy, features)?;
+        }
+        Ok(pass)
+    }
+
+    /// Runs one bounded shaped placement pass (CTX-0531 discipline).
+    fn place_shaped_pass(
+        &mut self,
+        snapshot: &Snapshot,
+        cols: usize,
+        dirty_rects: &[RectPx],
+        plan: &FramePlan,
+        policy: bitty_config::types::LigaturePolicy,
+        features: &[bitty_config::types::OpenTypeFeature],
+    ) -> Result<DrawList, RenderError> {
+        self.atlas.clear_exhausted();
+        let mut pass = DrawList {
+            generation: snapshot.generation,
+            atlas_epoch: self.atlas.epoch(),
+            fills: Vec::new(),
+            rounded_fills: Vec::new(),
+            backgrounds: Vec::new(),
+            overlay_fills: Vec::new(),
+            glyphs: Vec::new(),
+            images: Vec::new(),
+            plan: plan.clone(),
+        };
+        // Visible cursor column for the `Cursor` un-shape rule (pure
+        // integer grid overlap; out-of-grid or hidden cursors yield None).
+        let cursor_cell: Option<(usize, usize)> = if snapshot.cursor.visible {
+            let row = usize::from(snapshot.cursor.position.row);
+            let col = usize::from(snapshot.cursor.position.col);
+            if row < snapshot.height && col < cols {
+                Some((row, col))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let effective = features_for_policy(features, policy);
+        for dirty in dirty_rects {
+            let col_range = pixel_span_to_cells(dirty.x, dirty.width, self.cell.width);
+            let row_range = pixel_span_to_cells(dirty.y, dirty.height, self.cell.height);
+            for row in row_range {
+                let row_start = row.saturating_mul(cols);
+                let row_end = row_start.saturating_add(cols).min(snapshot.cells.len());
+                let Some(row_cells) = snapshot.cells.get(row_start..row_end) else {
+                    continue;
+                };
+                // Backgrounds + decorations for dirty cells first (same
+                // merging discipline as the unshaped path; glyphs come
+                // from shaped clusters below, never per-cell).
+                let mut background_run = BackgroundRun::default();
+                for col in col_range.clone() {
+                    let Some(term_cell) = row_cells.get(col) else {
+                        continue;
+                    };
+                    self.place_shaped_background(
+                        term_cell,
+                        row,
+                        col,
+                        cols,
+                        &mut pass,
+                        &mut background_run,
+                    );
+                }
+                // Full-row runs keep ligatures intact across dirty edges;
+                // only clusters intersecting the dirty range emit.
+                let runs = form_runs_for_row(row_cells, 0);
+                for run in runs {
+                    self.emit_shaped_run(
+                        snapshot,
+                        row,
+                        &run,
+                        &col_range,
+                        cursor_cell,
+                        policy,
+                        &effective,
+                        &mut pass,
+                    )?;
+                }
+            }
+        }
+        self.refresh_atlas_uvs(&mut pass.glyphs);
+        pass.atlas_epoch = self.atlas.epoch();
+        Ok(pass)
+    }
+
+    /// Paints background + decorations for one dirty cell on the shaped
+    /// path (glyph emission is shaped, so this never emits a glyph).
+    fn place_shaped_background(
+        &mut self,
+        term_cell: &bitty_term_state::Cell,
+        row: usize,
+        col: usize,
+        grid_width: usize,
+        list: &mut DrawList,
+        background_run: &mut BackgroundRun,
+    ) {
+        self.counters.cells_examined += 1;
+
+        let (fg, bg) = resolved_colors_in(&self.palette, &term_cell.style);
+        let left = u64::try_from(col)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(u64::from(self.cell.width));
+        let top = u64::try_from(row)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(u64::from(self.cell.height));
+
+        let span_cols = if term_cell.spacer {
+            1
+        } else {
+            usize::from(term_cell.width)
+                .max(1)
+                .min(grid_width.saturating_sub(col))
+        };
+
+        let background = FillRect {
+            rect: RectPx::new(
+                saturating_i32(left),
+                saturating_i32(top),
+                saturating_u32(
+                    u64::try_from(span_cols)
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(u64::from(self.cell.width)),
+                ),
+                self.cell.height,
+            ),
+            color: bg,
+        };
+        if background_run.merge(&mut list.fills, background) {
+            self.counters.background_fills += 1;
+        }
+
+        if term_cell.spacer {
+            self.counters.spacer_cells_skipped += 1;
+            return;
+        }
+
+        let decorations = self.emit_decorations(term_cell, row, col, span_cols, fg, list);
+        if term_cell.style.attributes.invisible {
+            self.counters.invisible_cells_skipped += 1;
+        } else if term_cell.glyph == ' ' && decorations == 0 {
+            self.counters.blank_cells_skipped += 1;
+            return;
+        }
+        self.counters.cells_drawn += 1;
+    }
+
+    /// Shapes one run and emits its clusters intersecting `dirty_cols`.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_shaped_run(
+        &mut self,
+        snapshot: &Snapshot,
+        row: usize,
+        run: &crate::shaped::ShapedRun,
+        dirty_cols: &std::ops::Range<usize>,
+        cursor_cell: Option<(usize, usize)>,
+        policy: bitty_config::types::LigaturePolicy,
+        effective: &[bitty_config::types::OpenTypeFeature],
+        list: &mut DrawList,
+    ) -> Result<(), RenderError> {
+        use bitty_config::types::LigaturePolicy;
+        // Chain + size from the live renderer (single font, single size).
+        let chain: Vec<FontId> = self.cache.rasterizer().fonts().to_vec();
+        if chain.is_empty() {
+            return Err(RenderError::UnknownFontHandle);
+        }
+        let attrs = RunAttrs {
+            features: effective.to_vec(),
+            point_size: self.point_size,
+        };
+        // A shaping failure degrades this run to per-cell unshaped
+        // rendering — never a frame error (design 2.3 validation order).
+        let clusters = match self
+            .cache
+            .rasterizer_mut()
+            .inner_mut()
+            .shape_run(&run.text, &chain, &attrs)
+        {
+            Ok(clusters) => clusters,
+            Err(_) => {
+                let fg = self.shaped_run_fg(snapshot, row, snapshot.width, run);
+                self.emit_unshaped_slice(&run.text, row, run.start_col, fg, list);
+                return Ok(());
+            }
+        };
+        // Cursor un-shaping: when policy is `Cursor` and the visible
+        // cursor sits on this row inside a ligature span, re-shape this
+        // run with programming ligatures zeroed (second cache entry) and
+        // emit the unshaped variant instead. Both variants are served
+        // from the run-shape cache (key includes features-hash).
+        let unshaped: Vec<ShapedCluster>;
+        let clusters_ref: &[ShapedCluster] = match policy {
+            LigaturePolicy::Cursor => {
+                if let Some((cursor_row, cursor_col)) = cursor_cell {
+                    if cursor_row == row
+                        && SwashSingle::cursor_intersects_ligature(&clusters, cursor_col).is_some()
+                    {
+                        let mut zeroed = effective.to_vec();
+                        for tag in crate::shaped::PROGRAMMING_LIGATURE_TAGS {
+                            if !zeroed.iter().any(|f| f.tag == tag) {
+                                zeroed.push(bitty_config::types::OpenTypeFeature { tag, value: 0 });
+                            } else {
+                                for f in zeroed.iter_mut() {
+                                    if f.tag == tag {
+                                        f.value = 0;
+                                    }
+                                }
+                            }
+                        }
+                        let zero_attrs = RunAttrs {
+                            features: zeroed,
+                            point_size: self.point_size,
+                        };
+                        unshaped = match self.cache.rasterizer_mut().inner_mut().shape_run(
+                            &run.text,
+                            &chain,
+                            &zero_attrs,
+                        ) {
+                            // Zeroed re-shape failure keeps the shaped
+                            // variant (cursor stays on a ligature rather
+                            // than failing the frame).
+                            Ok(reshaped) => reshaped,
+                            Err(_) => clusters.clone(),
+                        };
+                        &unshaped
+                    } else {
+                        &clusters
+                    }
+                } else {
+                    &clusters
+                }
+            }
+            LigaturePolicy::Never | LigaturePolicy::Always => &clusters,
+        };
+        // Median single-cell advance for the CJK epsilon gate.
+        let mut singles: Vec<f32> = clusters_ref
+            .iter()
+            .filter(|c| !c.uncovered && c.cells.1 == 1)
+            .map(|c| c.x_advance_px)
+            .collect();
+        singles.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let single_advance = if singles.is_empty() {
+            0.0
+        } else {
+            singles[singles.len() / 2]
+        };
+        let cols = snapshot.width;
+        for (idx, cluster) in clusters_ref.iter().enumerate() {
+            let (start, count) = cluster.cells;
+            let abs_start = run.start_col + start;
+            let abs_end = abs_start + count;
+            let dirty_start = dirty_cols.start.max(run.start_col);
+            let dirty_end = dirty_cols.end.min(run.start_col + run.col_count);
+            if abs_end <= dirty_start || abs_start >= dirty_end {
+                continue;
+            }
+            // Resolve the run fg for this run (runs group identical
+            // style, so the first covered cell names it).
+            let fg = self.shaped_run_fg(snapshot, row, cols, run);
+            // Cluster text slice for the CJK gate + unshaped fallback.
+            let byte_end = clusters_ref
+                .get(idx + 1)
+                .map(|next| next.byte_offset)
+                .unwrap_or(run.text.len());
+            let slice = run.text.get(cluster.byte_offset..byte_end).unwrap_or("");
+            if cluster.uncovered {
+                self.emit_missing_glyph(
+                    row,
+                    abs_start,
+                    count.min(cols.saturating_sub(abs_start)),
+                    fg,
+                    list,
+                );
+                continue;
+            }
+            if !SwashSingle::is_cjk_advance_aligned(
+                slice,
+                count,
+                cluster.x_advance_px,
+                single_advance,
+            ) {
+                self.counters.shaping_misaligned += 1;
+                self.cache.rasterizer_mut().inner_mut().note_misaligned();
+                // Degrade to per-cell unshaped rendering for this cluster.
+                self.emit_unshaped_slice(slice, row, abs_start, fg, list);
+                continue;
+            }
+            self.emit_shaped_cluster(cluster, effective, row, abs_start, count, fg, list)?;
+        }
+        Ok(())
+    }
+
+    /// Resolves the foreground tint for a shaped run (first cell's style).
+    fn shaped_run_fg(
+        &self,
+        snapshot: &Snapshot,
+        row: usize,
+        cols: usize,
+        run: &crate::shaped::ShapedRun,
+    ) -> Rgba8 {
+        let idx = row.saturating_mul(cols).saturating_add(run.start_col);
+        if let Some(cell) = snapshot.cells.get(idx) {
+            let (fg, _) = resolved_colors_in(&self.palette, &cell.style);
+            fg
+        } else {
+            DEFAULT_FG
+        }
+    }
+
+    /// Emits one shaped cluster as a single wide glyph instance.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_shaped_cluster(
+        &mut self,
+        cluster: &ShapedCluster,
+        features: &[bitty_config::types::OpenTypeFeature],
+        row: usize,
+        abs_col: usize,
+        span_cols: usize,
+        color: Rgba8,
+        list: &mut DrawList,
+    ) -> Result<(), RenderError> {
+        let bitmap = match self.cache.rasterizer_mut().inner_mut().rasterize_shaped(
+            cluster.face,
+            cluster.glyph_id,
+            self.point_size,
+            features,
+        ) {
+            // Rasterizer failure degrades this cluster to tofu — never a
+            // frame error (design 2.3 validation order).
+            Ok(Some(bitmap)) => bitmap,
+            Ok(None) | Err(_) => {
+                self.emit_missing_glyph(row, abs_col, span_cols, color, list);
+                return Ok(());
+            }
+        };
+        let metrics = bitmap.metrics;
+        let shaped_key = crate::shaped::ShapedGlyphKey::new(
+            cluster.face,
+            cluster.glyph_id,
+            self.point_size,
+            features,
+        );
+        let source = self.atlas.ensure_shaped(shaped_key, &bitmap);
+        let dest_x = abs_col as i64 * i64::from(self.cell.width) + i64::from(metrics.left);
+        let baseline = row as i64 * i64::from(self.cell.height) + self.baseline_offset;
+        let dest_y = baseline - i64::from(metrics.top);
+        let instance = match source {
+            GlyphSource::Atlas { slot } => GlyphInstance {
+                dest: [clamp_i32(dest_x), clamp_i32(dest_y)],
+                size: [
+                    saturating_u32(u64::try_from(metrics.width.max(0)).unwrap_or(u64::MAX)),
+                    saturating_u32(u64::try_from(metrics.height.max(0)).unwrap_or(u64::MAX)),
+                ],
+                uv: slot.uv(self.atlas.dims()),
+                color,
+                clip: None,
+                source: GlyphSource::Atlas { slot },
+            },
+            GlyphSource::Inline {
+                mask,
+                width,
+                height,
+            } => GlyphInstance {
+                dest: [clamp_i32(dest_x), clamp_i32(dest_y)],
+                size: [width, height],
+                uv: [0.0; 4],
+                color,
+                clip: None,
+                source: GlyphSource::Inline {
+                    mask,
+                    width,
+                    height,
+                },
+            },
+        };
+        list.glyphs.push(instance);
+        self.counters.glyphs_emitted += 1;
+        Ok(())
+    }
+
+    /// Emits one cluster's text per cell through the unshaped path
+    /// (CJK-epsilon fallback; every scalar keeps grid-true placement).
+    fn emit_unshaped_slice(
+        &mut self,
+        slice: &str,
+        row: usize,
+        abs_col: usize,
+        fg: Rgba8,
+        list: &mut DrawList,
+    ) {
+        let mut col = abs_col;
+        for ch in slice.chars() {
+            let width = usize::from(bitty_term_state::char_cell_width(ch)).max(1);
+            self.emit_glyph(ch, row, col, width, fg, list);
+            col += width;
+        }
     }
 }
 

@@ -38,7 +38,7 @@
 //! `tests/shaped_parity.rs` does). Full removal of the crossfont wrap is
 //! deferred to CTX-0961.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, OnceLock};
 
 use fontdb::{Database, Family, Query, Source, Style, Weight};
@@ -64,10 +64,37 @@ pub const MAX_FACE_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_LOADED_FACES: usize = 64;
 
 /// Maximum shape plans cached per face (cosmic-text `NUM_SHAPE_PLANS`
-/// sizing, design 5). Phase B enforces this on the retained plan cache;
-/// Phase A constructs plans per call (no production path shapes yet), so
-/// this is the documented bound the cache will honor, not a live limit.
+/// sizing, design 5). Phase B enforces this on the retained plan cache.
 pub const MAX_SHAPE_PLANS_PER_FACE: usize = 6;
+
+/// Maximum shaped runs retained in the run-shape LRU (design 5).
+///
+/// Keyed by (row-text hash, face-set id, features-hash, point-size-bits);
+/// stores owned `Vec<ShapedCluster>` length-capped by row width. Steady-state
+/// scroll of ligature-dense code converges to ~zero shapes per frame.
+pub const MAX_RUN_CACHE_ENTRIES: usize = 512;
+
+/// Maximum shaped glyph bitmaps retained (glyph-id-keyed, design 5).
+///
+/// Parallel to the char-keyed `GlyphCache` (2048): shaped glyph ids get
+/// their own bounded LRU keyed by face + glyph id + size + features,
+/// with the same negative-blank caching.
+pub const MAX_SHAPED_GLYPH_CACHE_ENTRIES: usize = 2048;
+
+/// CJK advance alignment epsilon in pixels (design 2.3).
+///
+/// A wide scalar is its own cluster; its shaped advance must reconcile
+/// with grid truth (`2 * single-cell advance`) within sub-pixel rounding.
+/// On mismatch the emitter falls back to unshaped rendering and counts
+/// `shaping_misaligned` — cells are never stretched or clipped.
+pub const CJK_ADVANCE_EPSILON_PX: f32 = 1.5;
+
+/// Programming-ligature OpenType tags covered by the cursor policy.
+///
+/// `Always` forces these four to zero regardless of `features`
+/// (design 3 precedence); `Cursor` zeroes them only for the re-shape
+/// under the cursor. General ligature control belongs to `features`.
+pub const PROGRAMMING_LIGATURE_TAGS: [[u8; 4]; 4] = [*b"calt", *b"liga", *b"clig", *b"dlig"];
 
 /// Points-to-pixels factor, mirroring `crossfont::Size::as_px` (`pt * 96/72`).
 ///
@@ -144,6 +171,24 @@ pub struct SwashSingle {
     by_db_id: HashMap<fontdb::ID, FontId>,
     scale_ctx: swash::scale::ScaleContext,
     next_font_id: u64,
+    /// Retained per-face shape plans (Phase B, design 5).
+    shape_plans: HashMap<ShapePlanKey, harfrust::ShapePlan>,
+    /// LRU order for shape plans (most-recent at back).
+    shape_plan_lru: VecDeque<ShapePlanKey>,
+    /// Retained shaped runs (Phase B, design 5).
+    run_cache: HashMap<RunCacheKey, Vec<ShapedCluster>>,
+    /// LRU order for runs (most-recent at back, single-victim eviction).
+    run_lru: VecDeque<RunCacheKey>,
+    /// Retained shaped glyph bitmaps by glyph id (Phase B, design 5).
+    shaped_glyphs: HashMap<ShapedGlyphKey, Option<GlyphBitmap>>,
+    /// LRU order for shaped glyphs (most-recent at back).
+    shaped_lru: VecDeque<ShapedGlyphKey>,
+    /// Cumulative run-cache hits (served without shaping).
+    shape_hits: u64,
+    /// Cumulative run-cache misses (shaped and inserted).
+    shape_misses: u64,
+    /// Cumulative CJK-advance misalignments degraded to unshaped.
+    shaping_misaligned: u64,
 }
 
 impl std::fmt::Debug for SwashSingle {
@@ -153,6 +198,9 @@ impl std::fmt::Debug for SwashSingle {
             .field("loaded_faces", &self.faces.len())
             .field("cached_db_ids", &self.by_db_id.len())
             .field("next_font_id", &self.next_font_id)
+            .field("shape_plans", &self.shape_plans.len())
+            .field("run_cache", &self.run_cache.len())
+            .field("shaped_glyphs", &self.shaped_glyphs.len())
             .finish()
     }
 }
@@ -179,6 +227,15 @@ impl SwashSingle {
             by_db_id: HashMap::new(),
             scale_ctx: swash::scale::ScaleContext::new(),
             next_font_id: 0,
+            shape_plans: HashMap::new(),
+            shape_plan_lru: VecDeque::new(),
+            run_cache: HashMap::new(),
+            run_lru: VecDeque::new(),
+            shaped_glyphs: HashMap::new(),
+            shaped_lru: VecDeque::new(),
+            shape_hits: 0,
+            shape_misses: 0,
+            shaping_misaligned: 0,
         })
     }
 
@@ -397,6 +454,303 @@ impl SwashSingle {
             .build();
         Ok(Self::probe_source(&mut scaler, glyph_id))
     }
+
+    /// Cumulative run-cache hits (served without shaping).
+    #[must_use]
+    pub const fn shape_hits(&self) -> u64 {
+        self.shape_hits
+    }
+
+    /// Cumulative run-cache misses (shaped and inserted).
+    #[must_use]
+    pub const fn shape_misses(&self) -> u64 {
+        self.shape_misses
+    }
+
+    /// Cumulative CJK-advance misalignments degraded to unshaped.
+    #[must_use]
+    pub const fn shaping_misaligned(&self) -> u64 {
+        self.shaping_misaligned
+    }
+
+    /// Run-cache `(hits, misses)` totals for the shape hit-rate.
+    #[must_use]
+    pub const fn shape_stats(&self) -> (u64, u64) {
+        (self.shape_hits, self.shape_misses)
+    }
+
+    /// Drops all retained shape plans, runs, and shaped glyphs without
+    /// resetting the cumulative counters.
+    ///
+    /// Call on config reload (same discipline as DPI-rescale
+    /// `GlyphCache::clear`): feature lists and sizes change, so retained
+    /// plans and runs must not survive alongside new-shape keys.
+    pub fn clear_shape_caches(&mut self) {
+        self.shape_plans.clear();
+        self.shape_plan_lru.clear();
+        self.run_cache.clear();
+        self.run_lru.clear();
+        self.shaped_glyphs.clear();
+        self.shaped_lru.clear();
+    }
+
+    /// Records one CJK-advance misalignment (emitter degraded to unshaped).
+    ///
+    /// Bounded monotone counter, no log spam — the grid truth stays
+    /// authoritative and the frame never errors.
+    pub fn note_misaligned(&mut self) {
+        self.shaping_misaligned = self.shaping_misaligned.saturating_add(1);
+    }
+
+    /// Rasterizes one shaped glyph by id (ligature spans, CJK tails).
+    ///
+    /// Glyph-id-keyed parallel to the char-keyed [`GlyphRasterizer`]
+    /// contract: the same bounded LRU discipline (2048 entries, negative
+    /// blanks cached) without overloading `RasterKey`. Every bitmap crosses
+    /// `GlyphBitmap::try_new`, so malformed upstream output is rejected.
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError::UnknownFontHandle`] for stale faces,
+    /// [`RenderError::InvalidInput`] for non-finite/non-positive sizes.
+    pub fn rasterize_shaped(
+        &mut self,
+        face: FontId,
+        glyph_id: u16,
+        point_size: f32,
+        features: &[bitty_config::types::OpenTypeFeature],
+    ) -> Result<Option<GlyphBitmap>, RenderError> {
+        if !(point_size.is_finite() && point_size > 0.0) {
+            return Err(RenderError::InvalidInput {
+                reason: "raster size must be finite and positive",
+            });
+        }
+        let key = ShapedGlyphKey::new(face, glyph_id, point_size, features);
+        if let Some(cached) = self.shaped_glyphs.get(&key).cloned() {
+            self.touch_shaped_lru(key);
+            return Ok(cached);
+        }
+        let owned = self.stored(face)?.clone();
+        let stored = self.render_glyph_checked(&owned, glyph_id, point_size)?;
+        if self.shaped_glyphs.len() >= MAX_SHAPED_GLYPH_CACHE_ENTRIES {
+            self.evict_shaped_lru();
+        }
+        self.shaped_glyphs.insert(key, stored.clone());
+        self.shaped_lru.push_back(key);
+        Ok(stored)
+    }
+
+    /// Renders one shaped glyph, mapping "no renderable source" to `None`.
+    fn render_glyph_checked(
+        &mut self,
+        face: &StoredFace,
+        glyph_id: u16,
+        point_size: f32,
+    ) -> Result<Option<GlyphBitmap>, RenderError> {
+        if glyph_id == 0 {
+            return Ok(None);
+        }
+        match self.render_glyph(face, glyph_id, Self::px(point_size)) {
+            Ok((bitmap, _)) => Ok(Some(bitmap)),
+            Err(RenderError::UpstreamRasterizer(_)) => Ok(None),
+            Err(other) => Err(other),
+        }
+    }
+
+    /// Moves a shaped-glyph key to the LRU back on hit.
+    fn touch_shaped_lru(&mut self, key: ShapedGlyphKey) {
+        if let Some(pos) = self.shaped_lru.iter().position(|k| *k == key) {
+            self.shaped_lru.remove(pos);
+            self.shaped_lru.push_back(key);
+        }
+    }
+
+    /// Evicts exactly the least-recently-used shaped glyph.
+    fn evict_shaped_lru(&mut self) {
+        if let Some(victim) = self.shaped_lru.pop_front() {
+            self.shaped_glyphs.remove(&victim);
+        }
+    }
+
+    /// Removes a plan key from the LRU order (hit path: the plan itself
+    /// was removed from the map for owned use and is reinserted after).
+    fn remove_plan_lru(&mut self, key: ShapePlanKey) {
+        if let Some(pos) = self.shape_plan_lru.iter().position(|k| *k == key) {
+            self.shape_plan_lru.remove(pos);
+        }
+    }
+
+    /// Moves a plan key to the LRU back on hit.
+    fn touch_plan_lru(&mut self, key: ShapePlanKey) {
+        self.remove_plan_lru(key);
+        self.shape_plan_lru.push_back(key);
+    }
+
+    /// Evicts the oldest plan for `face` when it already holds
+    /// [`MAX_SHAPE_PLANS_PER_FACE`] plans.
+    fn evict_plans_for_face_if_full(&mut self, face: FontId) {
+        let count = self.shape_plans.keys().filter(|k| k.face == face).count();
+        if count < MAX_SHAPE_PLANS_PER_FACE {
+            return;
+        }
+        if let Some(pos) = self.shape_plan_lru.iter().position(|k| k.face == face) {
+            let victim = self.shape_plan_lru.remove(pos);
+            if let Some(victim) = victim {
+                self.shape_plans.remove(&victim);
+            }
+        }
+    }
+
+    /// True when `cursor_col` intersects a multi-cell (ligature) cluster.
+    ///
+    /// Pure integer range overlap on grid columns — no shaped-coordinate
+    /// hit testing. Single-cell clusters never trigger un-shaping.
+    #[must_use]
+    pub fn cursor_intersects_ligature(
+        clusters: &[ShapedCluster],
+        cursor_col: usize,
+    ) -> Option<usize> {
+        clusters.iter().position(|c| {
+            !c.uncovered
+                && c.cells.1 > 1
+                && cursor_col >= c.cells.0
+                && cursor_col < c.cells.0 + c.cells.1
+        })
+    }
+
+    /// True when a single wide-char cluster's advance reconciles with grid
+    /// truth (`2 * single_advance` within [`CJK_ADVANCE_EPSILON_PX`]).
+    ///
+    /// Only single-character, two-cell clusters are checked (wide scalars
+    /// are their own cluster in practice); ligature spans skip this gate
+    /// and always emit as N-cell spans. On `false` the emitter degrades
+    /// that cluster to per-cell unshaped rendering and counts
+    /// `shaping_misaligned` — cells are never stretched or clipped.
+    #[must_use]
+    pub fn is_cjk_advance_aligned(
+        cluster_text: &str,
+        cells: usize,
+        advance_px: f32,
+        single_advance_px: f32,
+    ) -> bool {
+        let mut chars = cluster_text.chars();
+        let (Some(_), None) = (chars.next(), chars.next()) else {
+            return true;
+        };
+        if cells != 2 {
+            return true;
+        }
+        if !(single_advance_px.is_finite() && single_advance_px > 0.0) {
+            return true;
+        }
+        (advance_px - 2.0 * single_advance_px).abs() <= CJK_ADVANCE_EPSILON_PX
+    }
+}
+
+/// Collects run text from grid cells (design 2.2).
+///
+/// Concatenates `Cell::glyph` + its `zerowidth` buffer contents per cell
+/// (combining marks stay attached to their base — matches
+/// `bitty-term-state` storage). Spacers contribute nothing (they are the
+/// trailing half of a wide char, background-only by construction).
+/// Grid truth stays authoritative: this only reads `Cell`s, never shaped
+/// output.
+#[must_use]
+pub fn collect_run_text(cells: &[bitty_term_state::Cell]) -> String {
+    let mut out = String::new();
+    for cell in cells {
+        if cell.spacer {
+            continue;
+        }
+        out.push(cell.glyph);
+        for mark in cell.zerowidth.iter() {
+            out.push(*mark);
+        }
+    }
+    out
+}
+
+/// One grid row segment for shaping (design 2.2).
+///
+/// Contiguous dirty cells with identical style; the shaper sees the
+/// concatenated text, the emitter maps clusters back onto `start_col`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShapedRun {
+    /// Grid column where this run starts.
+    pub start_col: usize,
+    /// Run text (`Cell::glyph` + `zerowidth` per cell).
+    pub text: String,
+    /// Number of grid columns this run covers.
+    pub col_count: usize,
+}
+
+/// Groups one snapshot row into shapeable runs (design 2.2).
+///
+/// Groups contiguous non-spacer cells with identical `Style` into runs;
+/// spacers break runs (trailing halves paint background only). Blank
+/// (erased) cells break runs too — shaping never crosses an erased gap,
+/// so ligatures cannot bridge unrelated content. Returns runs in column
+/// order, each with its start column and text. Grid truth is only read.
+#[must_use]
+pub fn form_runs_for_row(
+    row_cells: &[bitty_term_state::Cell],
+    row_start_col: usize,
+) -> Vec<ShapedRun> {
+    let mut runs = Vec::new();
+    let mut current_style: Option<bitty_term_state::Style> = None;
+    let mut current_text = String::new();
+    let mut current_start = 0usize;
+    let mut current_cols = 0usize;
+
+    let flush = |runs: &mut Vec<ShapedRun>, text: &mut String, start: usize, cols: usize| {
+        if !text.is_empty() {
+            runs.push(ShapedRun {
+                start_col: start,
+                text: std::mem::take(text),
+                col_count: cols,
+            });
+        }
+    };
+
+    for (offset, cell) in row_cells.iter().enumerate() {
+        let col = row_start_col + offset;
+        if cell.spacer || cell.is_blank() {
+            flush(&mut runs, &mut current_text, current_start, current_cols);
+            current_style = None;
+            current_cols = 0;
+            continue;
+        }
+        match &current_style {
+            Some(style) if *style == cell.style => {
+                current_text.push(cell.glyph);
+                for mark in cell.zerowidth.iter() {
+                    current_text.push(*mark);
+                }
+                current_cols += 1;
+                // Wide cells occupy two columns but one text position;
+                // the column count tracks grid span for cluster mapping.
+                if cell.width == 2 {
+                    current_cols += 1;
+                }
+            }
+            _ => {
+                flush(&mut runs, &mut current_text, current_start, current_cols);
+                current_style = Some(cell.style);
+                current_start = col;
+                current_text = String::new();
+                current_text.push(cell.glyph);
+                for mark in cell.zerowidth.iter() {
+                    current_text.push(*mark);
+                }
+                current_cols = 1;
+                if cell.width == 2 {
+                    current_cols += 1;
+                }
+            }
+        }
+    }
+    flush(&mut runs, &mut current_text, current_start, current_cols);
+    runs
 }
 
 /// Maps the owned style vocabulary onto `fontdb` match attributes.
@@ -553,22 +907,143 @@ impl ShapePlanKey {
     /// plans are never keyed by untrusted input lengths).
     #[must_use]
     pub fn new(face: FontId, features: &[bitty_config::types::OpenTypeFeature]) -> Self {
+        Self {
+            face,
+            features_hash: features_hash(features),
+        }
+    }
+}
+
+/// FNV-1a hash over a validated feature list (deterministic, no DoS
+/// surface — shaping keys are never built from untrusted lengths).
+fn features_hash(features: &[bitty_config::types::OpenTypeFeature]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut hash = FNV_OFFSET;
+    for f in features {
+        for b in f.tag {
+            hash ^= u64::from(b);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        for b in f.value.to_le_bytes() {
+            hash ^= u64::from(b);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    }
+    hash
+}
+
+/// Cache key for one shaped run (Phase B, design 5).
+///
+/// `(row-text hash, face-set id, features-hash, point-size-bits)`.
+/// The text hash is FNV-1a over bytes (bounded by row width, so no
+/// allocation blowup); the face-set id hashes the chain handles in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RunCacheKey {
+    /// Hash of the run text bytes.
+    pub text_hash: u64,
+    /// Hash of the face chain handles in order.
+    pub chain_hash: u64,
+    /// Hash of the run feature list.
+    pub features_hash: u64,
+    /// Bit pattern of the point size (exact, no float fuzz).
+    pub size_bits: u32,
+}
+
+impl RunCacheKey {
+    /// Derives the key for one `shape_run` call.
+    #[must_use]
+    pub fn new(
+        text: &str,
+        chain: &[FontId],
+        features: &[bitty_config::types::OpenTypeFeature],
+        point_size: f32,
+    ) -> Self {
         const FNV_OFFSET: u64 = 0xcbf29ce484222325;
         const FNV_PRIME: u64 = 0x100000001b3;
-        let mut hash = FNV_OFFSET;
-        for f in features {
-            for b in f.tag {
-                hash ^= u64::from(b);
-                hash = hash.wrapping_mul(FNV_PRIME);
-            }
-            for b in f.value.to_le_bytes() {
-                hash ^= u64::from(b);
-                hash = hash.wrapping_mul(FNV_PRIME);
+        let mut text_hash = FNV_OFFSET;
+        for b in text.bytes() {
+            text_hash ^= u64::from(b);
+            text_hash = text_hash.wrapping_mul(FNV_PRIME);
+        }
+        let mut chain_hash = FNV_OFFSET;
+        for face in chain {
+            for b in face.as_u64().to_le_bytes() {
+                chain_hash ^= u64::from(b);
+                chain_hash = chain_hash.wrapping_mul(FNV_PRIME);
             }
         }
         Self {
+            text_hash,
+            chain_hash,
+            features_hash: features_hash(features),
+            size_bits: point_size.to_bits(),
+        }
+    }
+}
+
+/// Cache key for one shaped glyph bitmap (Phase B, design 5).
+///
+/// Parallel to the char-keyed `RasterKey`: shaped glyph ids get their own
+/// bounded LRU keyed by face + glyph id + size + features.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ShapedGlyphKey {
+    /// Face holding the glyph.
+    pub face: FontId,
+    /// Shaped glyph id in `face`.
+    pub glyph_id: u16,
+    /// Bit pattern of the point size.
+    pub size_bits: u32,
+    /// Hash of the run feature list (ligature on/off changes the glyph).
+    pub features_hash: u64,
+}
+
+impl ShapedGlyphKey {
+    /// Derives the key for one shaped glyph lookup.
+    #[must_use]
+    pub fn new(
+        face: FontId,
+        glyph_id: u16,
+        point_size: f32,
+        features: &[bitty_config::types::OpenTypeFeature],
+    ) -> Self {
+        Self {
             face,
-            features_hash: hash,
+            glyph_id,
+            size_bits: point_size.to_bits(),
+            features_hash: features_hash(features),
+        }
+    }
+}
+
+/// Applies the kitty three-state ligature policy to a feature list
+/// (design 3 precedence).
+///
+/// - `Never`: returns `features` verbatim (ligatures on).
+/// - `Cursor`: returns `features` verbatim (the caller un-shapes under
+///   the cursor via [`SwashSingle::cursor_intersects_ligature`]).
+/// - `Always`: forces `calt=liga=clig=dlig=0` regardless of `features`
+///   (a user list cannot re-enable programming ligatures under `Always`);
+///   other tags pass through verbatim. This is the unshaped fast path
+///   and the PB-6 kill-switch.
+#[must_use]
+pub fn features_for_policy(
+    features: &[bitty_config::types::OpenTypeFeature],
+    policy: bitty_config::types::LigaturePolicy,
+) -> Vec<bitty_config::types::OpenTypeFeature> {
+    use bitty_config::types::LigaturePolicy;
+    match policy {
+        LigaturePolicy::Never | LigaturePolicy::Cursor => features.to_vec(),
+        LigaturePolicy::Always => {
+            let mut out: Vec<bitty_config::types::OpenTypeFeature> = features
+                .iter()
+                .copied()
+                .filter(|f| !PROGRAMMING_LIGATURE_TAGS.contains(&f.tag))
+                .collect();
+            for tag in PROGRAMMING_LIGATURE_TAGS {
+                out.push(bitty_config::types::OpenTypeFeature { tag, value: 0 });
+            }
+            out
         }
     }
 }
@@ -613,6 +1088,8 @@ struct ShapeInput<'a> {
     px: f32,
     /// Validated run features as `harfrust` globals.
     features: &'a [harfrust::Feature],
+    /// Validated features for the plan-cache key.
+    validated: &'a [bitty_config::types::OpenTypeFeature],
 }
 
 impl SwashSingle {
@@ -645,6 +1122,48 @@ impl SwashSingle {
                 reason: "shape size must be finite and positive",
             });
         }
+        // Run-shape cache (design 5): steady-state scroll converges to
+        // ~zero shapes per frame. Key includes features-hash, so the
+        // cursor-unshape variant is a second cached entry, not a reshape.
+        let run_key = RunCacheKey::new(text, chain, &attrs.features, attrs.point_size);
+        if let Some(cached) = self.run_cache.get(&run_key).cloned() {
+            self.touch_run_lru(run_key);
+            self.shape_hits = self.shape_hits.saturating_add(1);
+            return Ok(cached);
+        }
+        self.shape_misses = self.shape_misses.saturating_add(1);
+        let shaped = self.shape_run_uncached(text, chain, attrs)?;
+        if self.run_cache.len() >= MAX_RUN_CACHE_ENTRIES {
+            self.evict_run_lru();
+        }
+        self.run_cache.insert(run_key, shaped.clone());
+        self.run_lru.push_back(run_key);
+        Ok(shaped)
+    }
+
+    /// Moves a run key to the LRU back on hit.
+    fn touch_run_lru(&mut self, key: RunCacheKey) {
+        if let Some(pos) = self.run_lru.iter().position(|k| *k == key) {
+            self.run_lru.remove(pos);
+            self.run_lru.push_back(key);
+        }
+    }
+
+    /// Evicts exactly the least-recently-used run (single victim, no
+    /// wholesale clear — mirrors `GlyphCache` CTX-0471 semantics).
+    fn evict_run_lru(&mut self) {
+        if let Some(victim) = self.run_lru.pop_front() {
+            self.run_cache.remove(&victim);
+        }
+    }
+
+    /// Uncached shaping body (primary + tail-gap fallback walk).
+    fn shape_run_uncached(
+        &mut self,
+        text: &str,
+        chain: &[FontId],
+        attrs: &RunAttrs,
+    ) -> Result<Vec<ShapedCluster>, RenderError> {
         let (primary, tails) = chain.split_first().ok_or(RenderError::UnknownFontHandle)?;
         let primary_face = self.stored(*primary)?.clone();
         let features = harfrust_features(&attrs.features);
@@ -657,6 +1176,7 @@ impl SwashSingle {
             col_base: 0,
             px,
             features: &features,
+            validated: &attrs.features,
         };
         let mut clusters = self.shape_with(primary_input)?;
         // Fallback reshape: maximal uncovered char ranges, tails in order.
@@ -692,6 +1212,7 @@ impl SwashSingle {
                     col_base,
                     px,
                     features: &features,
+                    validated: &attrs.features,
                 };
                 let reshaped = self.shape_with(tail_input)?;
                 if reshaped.iter().all(|c| !c.uncovered) {
@@ -724,19 +1245,37 @@ impl SwashSingle {
             col_base,
             px,
             features,
+            validated,
         } = input;
         let blob: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync> = face.data.clone();
         let font = harfrust::Font::new(blob, face.face_index)
             .ok_or_else(|| RenderError::flatten_rasterizer("face rejected by harfrust"))?;
-        // Per-call plan (Phase A): no production path shapes yet, so the
-        // retained ≤6-plan LRU of design 5 waits for Phase B traffic.
-        let plan = harfrust::ShapePlan::new(
-            &font,
-            harfrust::Direction::LeftToRight,
-            None,
-            None,
-            features,
-        );
+        // Retained plan LRU (design 5): at most MAX_SHAPE_PLANS_PER_FACE
+        // per face. Disjoint field borrows keep this `unsafe`-free: the
+        // plan owns its maps and never borrows `font`, so an immutable
+        // borrow of `shape_plans` coexists with the mutable `scale_ctx`
+        // borrow below.
+        let plan_key = ShapePlanKey::new(id, validated);
+        if !self.shape_plans.contains_key(&plan_key) {
+            let fresh = harfrust::ShapePlan::new(
+                &font,
+                harfrust::Direction::LeftToRight,
+                None,
+                None,
+                features,
+            );
+            self.evict_plans_for_face_if_full(id);
+            self.shape_plans.insert(plan_key, fresh);
+            self.shape_plan_lru.push_back(plan_key);
+        } else {
+            self.touch_plan_lru(plan_key);
+        }
+        // Immutable borrow of the retained plan; `scale_ctx` is a
+        // disjoint field, so its later mutable borrow is accepted.
+        let plan_ref: &harfrust::ShapePlan = self
+            .shape_plans
+            .get(&plan_key)
+            .ok_or_else(|| RenderError::UpstreamRasterizer("shape plan vanished".to_string()))?;
         let mut shaper = harfrust::ShaperFont::new(&font);
         const UNITS_PER_PX: f32 = 64.0;
         let scale = (px * UNITS_PER_PX).round();
@@ -752,7 +1291,7 @@ impl SwashSingle {
         harfrust::shape(
             &shaper,
             &mut buffer,
-            harfrust::ShapeOptions::new().plan(Some(&plan)),
+            harfrust::ShapeOptions::new().plan(Some(plan_ref)),
         )
         .map_err(RenderError::flatten_rasterizer)?;
         let infos = buffer.glyph_infos();

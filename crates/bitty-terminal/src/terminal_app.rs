@@ -182,7 +182,9 @@ fn workspace_id_value(seq: u64) -> LuaValue {
 /// Order: `closed`, `created`, `renamed`, `changed`, `focused`, each in
 /// workspace order. Payloads are identity-only: `{ id }`, plus `name` for
 /// `created`/`renamed`. `changed` means the panel list of a surviving
-/// workspace changed (count or order). Time O(w^2) over `w <= 16`
+/// workspace changed (count or order) or the window scratchpad occupancy
+/// flipped (CTX-0954: occupancy rides every row, so a put/take fires
+/// `changed`; the bar re-lists for the count). Time O(w^2) over `w <= 16`
 /// workspaces; allocates only when something changed.
 fn workspace_changes(
     previous: &[WorkspaceSummary],
@@ -228,7 +230,10 @@ fn workspace_changes(
     }
     for new in current {
         if let Some(old) = find(previous, new.seq).map(|index| &previous[index]) {
-            if old.panel_ids != new.panel_ids {
+            if old.panel_ids != new.panel_ids
+                || old.scratchpad_count != new.scratchpad_count
+                || old.scratchpad_occupied != new.scratchpad_occupied
+            {
                 events.push((
                     "workspace.changed",
                     LuaValue::table([("id", workspace_id_value(new.seq))]),
@@ -1180,6 +1185,46 @@ impl TerminalApp {
         self.runtime.set_plugin_overlay(surface);
     }
 
+    /// Dispatches one Core-routed plugin band click (CTX-0946 C1).
+    ///
+    /// The click carries the band owner's declared command verb plus its
+    /// declared args as one named table (`run({id = 3})`). Fail-closed with
+    /// a loud diagnostic when the plugin id is invalid, the runtime is
+    /// gone, or the dispatch itself fails (unregistered verb, faulting
+    /// handler): the click is dropped and terminal state is untouched.
+    fn dispatch_band_click(&mut self, click: bitty_runtime::BandClickRequest) {
+        let id = match bitty_plugin_host::manifest::PluginId::new(&click.plugin_id) {
+            Ok(id) => id,
+            Err(error) => {
+                crate::logging::warn(|| {
+                    format!(
+                        "bitty: band click from '{}' dropped (invalid plugin id: {error})",
+                        click.plugin_id
+                    )
+                });
+                return;
+            }
+        };
+        let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
+            crate::logging::warn(|| {
+                format!(
+                    "bitty: band click '{}:{}' dropped (plugin runtime is gone)",
+                    click.plugin_id, click.command
+                )
+            });
+            return;
+        };
+        let args = bitty_runtime::band_click_args_table(&click.args);
+        if let Err(error) = plugin_runtime.dispatch_command(&id, &click.command, &[args]) {
+            crate::logging::warn(|| {
+                format!(
+                    "bitty: band click '{}:{}' refused ({error})",
+                    click.plugin_id, click.command
+                )
+            });
+        }
+    }
+
     /// Route post-intercept fall-through input into the capture queue
     /// (CTX-0943). Called by [`Self::handle_event`] after
     /// [`Self::intercept_chrome_key`](crate::chrome_keys::ChromeState)
@@ -1688,6 +1733,15 @@ impl AppHandler for TerminalApp {
         if self.runtime.has_pending_hyperlink_activation() {
             self.activate_pending_hyperlink_now();
         }
+        // CTX-0946 C1: Core-routed plugin band clicks. The runtime owns the
+        // geometry (which band row, which declared command); the application
+        // dispatches each through the normal `PluginRuntime::dispatch_command`
+        // path, where registration and capability gates fail closed as
+        // usual. Dispatch failures are loud (user-paced gestures, never a
+        // hot loop) and never disturb terminal state.
+        for click in self.runtime.drain_band_clicks() {
+            self.dispatch_band_click(click);
+        }
         // CTX-0370: a window-close request that did not exit armed a bounded
         // confirmation (or was superseded by one); report it loudly so the
         // pending gate is never silent in the log. `AboutToWait` presents the
@@ -2000,6 +2054,8 @@ mod event_tracker_tests {
             name: name.to_string(),
             active,
             panel_ids: panels,
+            scratchpad_count: 0,
+            scratchpad_occupied: false,
         };
         let mut t = tracker("t", true);
         let old = vec![ws(1, "ws1", true, vec![10]), ws(2, "ws2", false, vec![20])];
@@ -2047,6 +2103,8 @@ mod event_tracker_tests {
             name: name.to_string(),
             active,
             panel_ids: panels,
+            scratchpad_count: 0,
+            scratchpad_occupied: false,
         };
         let mut t = tracker("t", true);
         let old = vec![ws(1, "ws1", true, vec![10]), ws(2, "ws2", false, vec![20])];
@@ -2069,6 +2127,8 @@ mod event_tracker_tests {
             name: name.to_string(),
             active,
             panel_ids: panels,
+            scratchpad_count: 0,
+            scratchpad_occupied: false,
         };
         let mut t = tracker("t", true);
         let old = vec![ws(1, "ws1", true, vec![10])];
@@ -2088,5 +2148,38 @@ mod event_tracker_tests {
         let events = t.take_changes("t", true, &changed);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].0, "workspace.changed");
+    }
+
+    #[test]
+    fn workspace_changed_fires_on_scratchpad_put_and_take() {
+        // CTX-0954: a scratchpad put/take flips occupancy with identical
+        // panels and still fires the existing `workspace.changed` (no new
+        // event family); steady occupancy fires nothing.
+        use bitty_runtime::WorkspaceSummary;
+        let ws = |occupied: bool| WorkspaceSummary {
+            seq: 1,
+            name: "ws1".to_string(),
+            active: true,
+            panel_ids: vec![10],
+            scratchpad_count: usize::from(occupied),
+            scratchpad_occupied: occupied,
+        };
+        let mut t = tracker("t", true);
+        let empty = vec![ws(false)];
+        assert!(
+            t.take_changes("t", true, &empty).is_empty(),
+            "first snapshot"
+        );
+        // Put: identical panels, occupancy flipped -> one changed event.
+        let events = t.take_changes("t", true, &[ws(true)]);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "workspace.changed");
+        // Take: flips back -> one changed event.
+        let events = t.take_changes("t", true, &empty);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "workspace.changed");
+        // Steady occupied: nothing fires.
+        t.take_changes("t", true, &[ws(true)]);
+        assert!(t.take_changes("t", true, &[ws(true)]).is_empty());
     }
 }

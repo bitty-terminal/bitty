@@ -453,7 +453,7 @@ impl Runtime {
     /// selection, and search to it (CTX-0873). Infallible: surface and
     /// primary PTY resizes stay with the callers.
     pub(super) fn reflow_content_to_chrome(&mut self) {
-        self.container = self.chrome_layout().container;
+        self.container = self.band_exclusive_container();
         let fallback = (
             usize::from(self.container.width).max(1),
             usize::from(self.container.height).max(1),

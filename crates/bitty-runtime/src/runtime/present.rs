@@ -1104,6 +1104,13 @@ impl Runtime {
         if bar_text != self.last_presented_bar {
             pending_full = true;
         }
+        // CTX-0946 C2: a plugin mount/update/unmount with a quiet grid
+        // still needs a frame (band damage only; geometry reflows through
+        // the exclusive-zone budget in `refresh_chrome_band` above).
+        let band_versions = self.chrome_band_versions();
+        if band_versions != self.last_presented_bands {
+            pending_full = true;
+        }
 
         // RFC-0002 (CTX-0341): derive open/close/focus/workspace transitions
         // from the last presented frame and arm the bounded animations. This
@@ -1217,6 +1224,7 @@ impl Runtime {
             cells_before,
             glyphs_before,
             bar_text,
+            band_versions,
         })
     }
 
@@ -2159,54 +2167,186 @@ impl Runtime {
         }
     }
 
-    /// Renders plugin-mounted chrome bands (CTX-0911, issue #1570).
+    /// Renders plugin-mounted chrome bands (CTX-0911, issue #1570; CTX-0946
+    /// C2/C3).
     ///
-    /// Walks each mounted UiNode tree from `chrome_bands` and renders Text nodes
-    /// with theme-resolved fg/bg/bold attributes. Row nodes stack horizontally,
-    /// List/Column nodes are treated as Row (vertical stacking deferred). Bands
-    /// are rendered after overlays so they appear above terminal content.
+    /// Walks each visible mounted UiNode tree and renders its flattened
+    /// spans with host-resolved `fg`/`bg` theme tokens and synthetic-bold
+    /// double-strike glyphs. `Row` children join horizontally; `List`/`Column`
+    /// nodes are treated as `Row` (vertical stacking deferred). Bands render
+    /// after overlays so they appear above terminal content.
     ///
-    /// Horizontal bands stack from the window edge inward, starting inward
-    /// of the Core workspaceline band on the same edge
-    /// ([`Runtime::plugin_band_row`], CTX-0923). They reserve no exclusive
-    /// zone yet: a band overlays the layout container row it sits on.
+    /// Horizontal bands stack from the window edge inward over visible bands
+    /// only ([`Runtime::visible_band_row`], CTX-0923/CTX-0946): hidden
+    /// (empty-text) bands take no row. Every band paints at most its granted
+    /// one-row band rectangle — text is clipped to the window width, and a
+    /// geometry violation (a band overlapping another band, the Core bar, or
+    /// the layout container) skips the whole band, never a partial paint,
+    /// and counts a diagnostic.
     fn paint_chrome_bands(&mut self, pad_px: i32, layers: &mut FrameLayers) {
+        use super::band_host::{band_is_visible, flatten_band_runs};
+
         let live = self.live_cell_metrics();
         if live.width == 0 || live.height == 0 {
             return;
         }
-        let cell_h = i32::try_from(live.height).unwrap_or(i32::MAX);
-        let fg = self.config.theme.foreground;
-        let bg = self.config.theme.background;
+        let window = self.window_cells();
+        if window.width == 0 || window.height == 0 {
+            return;
+        }
+        let band_cells = usize::from(window.width);
+        let default_fg = self.config.theme.foreground;
+        let default_bg = self.config.theme.background;
 
+        // Owned snapshot first: the renderer takes `&mut self` below.
+        let mut plan: Vec<(BandEdge, u16, super::BandContent)> = Vec::new();
         for edge in [BandEdge::Top, BandEdge::Bottom] {
-            for (index, band) in self.chrome_bands.edge(edge).iter().enumerate() {
-                let Some(row) = self.plugin_band_row(edge, index) else {
-                    break;
-                };
-                let text_line = self.extract_text_from_node(&band.root);
-                if text_line.is_empty() {
+            for (index, band) in self.visible_edge_bands(edge).into_iter().enumerate() {
+                if !band_is_visible(&band.root) {
                     continue;
                 }
-                let origin_x = pad_px;
-                let origin_y = px_add(pad_px, i32::from(row).saturating_mul(cell_h));
-                let cols = text_line.len().min(self.cols);
-
-                layers.combined_overlay.push(bitty_render::grid::FillRect {
-                    rect: bitty_render::geometry::RectPx::new(
-                        origin_x,
-                        origin_y,
-                        px_span_usize(cols, live.width),
-                        live.height,
-                    ),
-                    color: bg,
-                });
-                let glyphs =
-                    self.renderer
-                        .overlay_text_glyphs(&text_line, (origin_x, origin_y), cols, fg);
-                layers.combined_glyphs.extend(glyphs);
-                layers.any_needs_draw = true;
+                let Some(row) = self.visible_band_row(edge, index) else {
+                    continue;
+                };
+                plan.push((edge, row, band.clone()));
             }
+        }
+        if plan.is_empty() {
+            return;
+        }
+        // Overlap fail-closed: rows claimed twice, or a band on the Core bar
+        // row, deny every claimant on the shared row (never partial paint).
+        let core_bar_row = self.status_bar_band().map(|bar| bar.y);
+        let mut denied_rows: Vec<u16> = Vec::new();
+        for (index, (_, row, _)) in plan.iter().enumerate() {
+            let duplicate = plan[..index].iter().any(|(_, other, _)| other == row)
+                || plan[index + 1..].iter().any(|(_, other, _)| other == row);
+            let on_core_bar = core_bar_row.is_some_and(|bar| bar == *row);
+            if (duplicate || on_core_bar) && !denied_rows.contains(row) {
+                denied_rows.push(*row);
+            }
+        }
+        // C3 backstop: a band row inside the layout container means the
+        // exclusive zone lost a row it owns — skip the band, never paint it.
+        let container = self.container;
+        let container_end = container.y.saturating_add(container.height);
+        let in_container = |row: u16| row >= container.y && row < container_end;
+
+        for (_, row, band) in &plan {
+            if denied_rows.contains(row) || in_container(*row) {
+                self.band_stats.paint_violations =
+                    self.band_stats.paint_violations.saturating_add(1);
+                continue;
+            }
+            let (text, runs) = flatten_band_runs(&band.root);
+            if text.is_empty() {
+                continue;
+            }
+            self.paint_band_row(
+                pad_px, layers, *row, &text, &runs, band_cells, window.x, default_fg, default_bg,
+            );
+        }
+    }
+
+    /// Paints one clipped band row from flattened spans (CTX-0946 C2).
+    ///
+    /// Damage is bounded to the granted band rectangle: spans are clipped to
+    /// `band_cells` display cells, and every fill plus glyph batch derives
+    /// from the clipped spans. Unknown theme tokens substitute the span
+    /// default and count a diagnostic; bold spans gain a 1px x-offset glyph
+    /// duplicate (synthetic double-strike — the overlay rasterizer owns one
+    /// face, so emboldening stays a paint-layer concern).
+    #[allow(clippy::too_many_arguments)]
+    fn paint_band_row(
+        &mut self,
+        pad_px: i32,
+        layers: &mut FrameLayers,
+        row: u16,
+        text: &str,
+        runs: &[super::band_host::BandRun],
+        band_cells: usize,
+        band_x: u16,
+        default_fg: bitty_render::grid::Rgba8,
+        default_bg: bitty_render::grid::Rgba8,
+    ) {
+        use super::band_host::resolve_band_token;
+
+        let live = self.live_cell_metrics();
+        let cell_h = i32::try_from(live.height).unwrap_or(i32::MAX);
+        let cell_w = live.width;
+        let origin_y = px_add(pad_px, i32::from(row).saturating_mul(cell_h));
+        let chars: Vec<char> = text.chars().collect();
+        let mut painted_any = false;
+        for run in runs {
+            let start = run.start_col.min(band_cells);
+            // Clip the run's chars to the remaining band cells, counting
+            // wide cells exactly like the hit-test walk.
+            let mut span = String::new();
+            let mut cells = 0usize;
+            for ch in chars
+                .iter()
+                .skip(run.start_char)
+                .take(run.end_char.saturating_sub(run.start_char))
+            {
+                let width = usize::from(bitty_term_state::char_cell_width(*ch));
+                if start.saturating_add(cells).saturating_add(width) > band_cells {
+                    break;
+                }
+                span.push(*ch);
+                cells = cells.saturating_add(width);
+            }
+            if span.is_empty() || cells == 0 {
+                continue;
+            }
+            let fg = run.fg.as_deref().map_or(default_fg, |token| {
+                resolve_band_token(token, &self.config.theme).unwrap_or_else(|| {
+                    self.band_stats.unknown_tokens =
+                        self.band_stats.unknown_tokens.saturating_add(1);
+                    default_fg
+                })
+            });
+            let bg = run.bg.as_deref().map_or(default_bg, |token| {
+                resolve_band_token(token, &self.config.theme).unwrap_or_else(|| {
+                    self.band_stats.unknown_tokens =
+                        self.band_stats.unknown_tokens.saturating_add(1);
+                    default_bg
+                })
+            });
+            // Band-column to pixels through the window origin — the same
+            // translation the hit-test uses, so paint and routing share one
+            // geometry even for a non-zero window origin.
+            let col_offset =
+                u32::from(band_x).saturating_add(u32::try_from(start).unwrap_or(u32::MAX));
+            let origin_x = pad_px.saturating_add(
+                i32::try_from(col_offset.saturating_mul(cell_w)).unwrap_or(i32::MAX),
+            );
+            layers.combined_overlay.push(bitty_render::grid::FillRect {
+                rect: bitty_render::geometry::RectPx::new(
+                    origin_x,
+                    origin_y,
+                    px_span_usize(cells, cell_w),
+                    live.height,
+                ),
+                color: bg,
+            });
+            let mut glyphs =
+                self.renderer
+                    .overlay_text_glyphs(&span, (origin_x, origin_y), cells, fg);
+            if run.bold {
+                // Synthetic double-strike: the overlay face is single-weight,
+                // so bold repaints the same instances one pixel right. Glyph
+                // overhang past the cell is documented cell behavior.
+                let mut doubled = glyphs.clone();
+                for glyph in &mut doubled {
+                    glyph.dest[0] = glyph.dest[0].saturating_add(1);
+                }
+                glyphs.extend(doubled);
+            }
+            layers.combined_glyphs.extend(glyphs);
+            painted_any = true;
+        }
+        if painted_any {
+            layers.any_needs_draw = true;
         }
     }
 
@@ -2462,6 +2602,7 @@ impl Runtime {
             cells_before,
             glyphs_before,
             bar_text,
+            band_versions,
             ..
         } = basis;
         self.pending_full_redraw = false;
@@ -2480,6 +2621,7 @@ impl Runtime {
             self.last_presented_allocations = allocations;
             self.last_presented_focus = focused;
             self.last_presented_bar = bar_text;
+            self.last_presented_bands = band_versions;
             return None;
         }
 
@@ -2596,6 +2738,7 @@ impl Runtime {
             self.last_presented_allocations = allocations;
             self.last_presented_focus = focused;
             self.last_presented_bar = bar_text;
+            self.last_presented_bands = band_versions;
             return None;
         }
 
@@ -2631,6 +2774,7 @@ impl Runtime {
         self.last_presented_allocations = allocations;
         self.last_presented_focus = focused;
         self.last_presented_bar = bar_text;
+        self.last_presented_bands = band_versions;
         self.kitty_last_frame_images = kitty_blits;
         // CTX-0244: publish the presented headless frame for `frameHash`
         // digesting — only while a digest grant is live (zero clone cost
@@ -2703,6 +2847,8 @@ struct TickBasis {
     /// Workspace bar text for this frame, formatted once per tick
     /// (CTX-0873); `None` when the bar does not present.
     bar_text: Option<String>,
+    /// Mounted band versions for this frame (CTX-0946 C2).
+    band_versions: Vec<(String, bitty_lua::ui::UiSlot, u32)>,
 }
 
 /// Combined draw layers assembled by the present phases (CTX-0474).

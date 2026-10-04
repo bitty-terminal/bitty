@@ -202,6 +202,10 @@ impl LiveWorkspaces {
 impl WorkspaceSource for LiveWorkspaces {
     /// Attention is all-`false`: Core has no per-workspace bell, activity,
     /// or exit source yet (tracked per session), so no flag is fabricated.
+    ///
+    /// CTX-0954: scratchpad occupancy rides the same row under the same
+    /// `workspace.read` grant (window-global, identical on every row); no
+    /// panel capability is consulted.
     fn workspaces(&self) -> Result<Vec<WorkspaceInfo>, bitty_runtime::plugin_runtime::BridgeError> {
         Ok(self
             .rows
@@ -212,6 +216,8 @@ impl WorkspaceSource for LiveWorkspaces {
                 name: row.name.clone(),
                 active: row.active,
                 panel_count: row.panel_ids.len(),
+                scratchpad_count: row.scratchpad_count,
+                scratchpad_occupied: row.scratchpad_occupied,
                 attention: WorkspaceAttention::default(),
             })
             .collect())

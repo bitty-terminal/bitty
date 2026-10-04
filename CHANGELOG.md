@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- **Core search and copy-mode policy (CTX-0937, #1624, W-144):** the
+  built-in search UI flows, copy-mode modal policy, and Core-default
+  keybindings now belong to the search (`search@e65bf83`, CTX-0004 live
+  PASS) and copy-mode (`copy-mode@7410a3e`, CTX-0004 live PASS) plugins
+  over the public host API. Gone: `enter_copy_mode` / `open_search` /
+  `search_next` / `search_prev` / `close_search` / `search_toggle_case`
+  keymap actions and the `ctrl+shift+space` / `ctrl+shift+f` defaults
+  (both chords are shell input again), the runtime overlay entry points
+  (`enter_search_mode`, `enter_copy_mode`, query editing, navigation,
+  case toggle, yank motions, mode labels), the `search_state_mut` test
+  seam, and the chrome dispatch arms. Retired spellings fail closed as
+  unknown actions, never panic and never strand a modal. Retained as
+  host mechanisms: bounded search (`State::search`, `SearchState`,
+  `SEARCH_MAX_PATTERN_LEN=256`, `SEARCH_MAX_RESULTS=1000`), the
+  `search_host` query/backend ops with generation fencing and typed
+  `Denied`/`Stale`/`Unavailable` outcomes, selection semantics and the
+  view-bound lifecycle funnels, the clipboard permission gate
+  (`CLIPBOARD_MAX_BYTES=8192` with truncation flag), history_read
+  `HistoryGate`, modal containment (consume-all while open, `Esc`
+  releases), and safe-mode identical behavior (no plugin VM consulted).
+  No private first-party bypass: the first-party plugins reach Core only
+  through the same capability-gated public contract as third parties.
+
 - **Core workspace bar presentation (CTX-0956, #1572, W-104):** the Core
   workspaceline/status-bar chrome is deleted and the `bar` plugin is the
   single workspace/status UX. Gone: `workspaceline_present`,

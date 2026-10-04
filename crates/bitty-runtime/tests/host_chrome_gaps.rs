@@ -272,6 +272,78 @@ fn shift_press_on_a_band_keeps_the_selection_escape() {
 }
 
 #[test]
+fn trailing_press_is_consumed_as_chrome_not_selection() {
+    let mut rt = minimal_runtime();
+    mount_bottom_bar(
+        &mut rt,
+        UiNode::row(vec![plain("1:ws1 "), pill("2:ws2", 2.0)]),
+    );
+    rt.tick();
+    let row = bar_row(&rt);
+    // Press on the trailing region past the text (col 70 of an 11-cell
+    // line), drag into grid content, release: the band row owns the whole
+    // gesture, so no selection can start.
+    rt.handle_cursor_moved(cell_pixels(&rt, row, 70));
+    rt.handle_mouse_input(press());
+    assert!(
+        rt.band_release_armed(),
+        "trailing press arms the band swallow"
+    );
+    rt.handle_cursor_moved(content_pixels(&rt, 0, 5));
+    rt.handle_mouse_input(release());
+    assert!(
+        rt.drain_band_clicks().is_empty(),
+        "trailing release claims nothing"
+    );
+    assert!(!rt.has_selection(), "trailing press starts no selection");
+    assert_eq!(rt.band_host_stats().clicks_unclaimed, 1);
+    assert_eq!(rt.band_host_stats().clicks_routed, 0);
+}
+
+#[test]
+fn trailing_press_sends_no_capture_report() {
+    let mut rt = minimal_runtime();
+    mount_bottom_bar(
+        &mut rt,
+        UiNode::row(vec![plain("1:ws1 "), pill("2:ws2", 2.0)]),
+    );
+    rt.tick();
+    let row = bar_row(&rt);
+    rt.handle_pty_bytes(b"\x1b[?1000h");
+    rt.drain_pending_input();
+    let focused = rt.focused_view();
+    // Trailing press under mouse tracking: chrome consumes it before the
+    // capture decision, so the app never sees a report.
+    rt.handle_cursor_moved(cell_pixels(&rt, row, 70));
+    rt.handle_mouse_input(press());
+    assert_eq!(rt.focused_view(), focused, "no focus move");
+    assert!(rt.pending_input().is_empty(), "no report to the app");
+    rt.handle_mouse_input(release());
+    assert!(rt.drain_band_clicks().is_empty());
+    assert!(rt.pending_input().is_empty(), "paired release swallowed");
+}
+
+#[test]
+fn trailing_release_never_routes_the_final_span() {
+    // Caution case: the column-to-char walk saturates at the last char, so
+    // the width guard (not the walk) must own the past-text decision.
+    let mut rt = minimal_runtime();
+    mount_bottom_bar(&mut rt, UiNode::row(vec![pill("XY", 1.0)]));
+    rt.tick();
+    let row = bar_row(&rt);
+    // Sanity: a release inside the pill still routes.
+    click_at(&mut rt, row, 1);
+    assert_eq!(rt.drain_band_clicks().len(), 1);
+    // Past the 2-cell text: NoClaim, never the pill's owner.
+    click_at(&mut rt, row, 40);
+    assert!(rt.drain_band_clicks().is_empty());
+    let stats = rt.band_host_stats();
+    assert_eq!(stats.clicks_routed, 1);
+    assert_eq!(stats.clicks_unclaimed, 1);
+    assert_eq!(stats.clicks_denied, 0);
+}
+
+#[test]
 fn click_args_encode_as_one_named_table() {
     let table = band_click_args_table(&[
         ("id".to_string(), ClickArg::Number(2.0)),

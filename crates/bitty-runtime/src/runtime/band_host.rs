@@ -368,6 +368,24 @@ pub struct BandHit {
     pub char_idx: usize,
 }
 
+/// A resolved band row: which visible band row owns the pointer.
+///
+/// Row-level only — no text column. Press consumption uses this so the
+/// whole painted row (including the unclaimed trailing region past the
+/// text) is Core chrome; release resolution narrows through
+/// [`Runtime::plugin_band_hit`], whose text-width guard keeps a
+/// past-text release at `NoClaim` instead of saturating into the final
+/// span's claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BandRowHit {
+    /// Edge owning the band.
+    pub edge: BandEdge,
+    /// Visible index on the edge (hidden bands take no row).
+    pub visible_index: usize,
+    /// Window row the band paints (window cells).
+    pub row: u16,
+}
+
 impl Runtime {
     /// Visible (non-empty-text) bands on `edge`, in stacking order.
     ///
@@ -512,14 +530,17 @@ impl Runtime {
         false
     }
 
-    /// Maps physical `pos` onto a visible band row, if any (CTX-0946 C1).
+    /// Maps physical `pos` onto a painted band row, if any (CTX-0946 C1).
     ///
+    /// Row-wide: any column inside the band's window width hits, including
+    /// the unclaimed trailing region past the text. Press consumption uses
+    /// this so a band press can never fall through to selection or capture.
     /// Uses the same window-padding + live-cell translation the band paint
     /// path uses, so hit-test and paint share one geometry (no second
     /// source). Returns `None` outside every painted band row, past the
-    /// band's text width, or under any geometry violation (fail-closed).
+    /// window width, or under any geometry violation (fail-closed).
     #[must_use]
-    pub fn plugin_band_hit(&self, pos: CursorPosition) -> Option<BandHit> {
+    pub fn plugin_band_row_hit(&self, pos: CursorPosition) -> Option<BandRowHit> {
         if !pos.x.is_finite() || !pos.y.is_finite() {
             return None;
         }
@@ -542,7 +563,6 @@ impl Runtime {
         if pos.x < origin_x || pos.x >= origin_x + band_w {
             return None;
         }
-        let cell_col = ((pos.x - origin_x) / cell_w).floor() as u64;
         for edge in [BandEdge::Top, BandEdge::Bottom] {
             for index in 0..self.visible_band_count(edge) {
                 let index = usize::from(index);
@@ -553,34 +573,56 @@ impl Runtime {
                 if pos.y < origin_y || pos.y >= origin_y + cell_h {
                     continue;
                 }
-                let bands = self.visible_edge_bands(edge);
-                let Some(band) = bands.get(index) else {
-                    continue;
-                };
-                let (text, _) = flatten_band_runs(&band.root);
-                let width_cells = u64::try_from(display_cells(&text)).unwrap_or(u64::MAX);
-                let window_cells = u64::from(window.width);
-                if cell_col >= width_cells.min(window_cells) {
-                    return None;
-                }
-                let char_idx =
-                    cell_col_to_char_idx(&text, usize::try_from(cell_col).unwrap_or(usize::MAX));
-                return Some(BandHit {
+                return Some(BandRowHit {
                     edge,
                     visible_index: index,
                     row,
-                    char_idx,
                 });
             }
         }
         None
     }
 
+    /// Maps physical `pos` onto a claimed band text column, if any
+    /// (CTX-0946 C1).
+    ///
+    /// Release resolution over [`Self::plugin_band_row_hit`]: the row must
+    /// hit, and the column must land inside the painted text width (the
+    /// paint path clips text to the window width, so the guard mirrors it).
+    /// Returns `None` past the text width — the caller counts that release
+    /// as unclaimed, never as the final span's owner.
+    #[must_use]
+    pub fn plugin_band_hit(&self, pos: CursorPosition) -> Option<BandHit> {
+        let row_hit = self.plugin_band_row_hit(pos)?;
+        let live = self.live_cell_metrics();
+        let window = self.window_cells();
+        let pad = f64::from(self.window_padding_physical());
+        let cell_w = f64::from(live.width);
+        let origin_x = pad + f64::from(window.x) * cell_w;
+        let cell_col = ((pos.x - origin_x) / cell_w).floor() as u64;
+        let bands = self.visible_edge_bands(row_hit.edge);
+        let band = bands.get(row_hit.visible_index)?;
+        let (text, _) = flatten_band_runs(&band.root);
+        let width_cells = u64::try_from(display_cells(&text)).unwrap_or(u64::MAX);
+        let window_cells = u64::from(window.width);
+        if cell_col >= width_cells.min(window_cells) {
+            return None;
+        }
+        let char_idx = cell_col_to_char_idx(&text, usize::try_from(cell_col).unwrap_or(usize::MAX));
+        Some(BandHit {
+            edge: row_hit.edge,
+            visible_index: row_hit.visible_index,
+            row: row_hit.row,
+            char_idx,
+        })
+    }
+
     /// Routes a left press on a plugin band row to chrome (CTX-0946 C1).
     ///
     /// Returns `true` (consume the press: no focus move, no selection, no
-    /// capture report) when the last-known cursor sits on a painted band
-    /// row, arming the one-shot [`Self::band_release_swallow`] so the paired
+    /// capture report) when the last-known cursor sits anywhere on a painted
+    /// band row — including the unclaimed trailing region past the text —
+    /// arming the one-shot [`Self::band_release_swallow`] so the paired
     /// release resolves the click. Shift still forces the selection path
     /// (the CTX-0181 accessibility escape). The Core bar keeps precedence:
     /// callers run [`Self::status_bar_press`] first.
@@ -591,7 +633,7 @@ impl Runtime {
         let Some(pos) = self.last_cursor else {
             return false;
         };
-        if self.plugin_band_hit(pos).is_none() {
+        if self.plugin_band_row_hit(pos).is_none() {
             return false;
         }
         self.band_release_swallow = true;

@@ -26,7 +26,7 @@ pub struct FontId(u64);
 impl FontId {
     /// Issues the next sequential handle. Public so external
     /// [`GlyphRasterizer`] implementations can mint their own session
-    /// handles; the built-in crossfont backend uses the same entry point.
+    /// handles; both built-in backends use the same entry point.
     pub fn next(counter: &mut u64) -> Self {
         let id = *counter;
         *counter = counter.wrapping_add(1);
@@ -338,7 +338,9 @@ pub trait GlyphRasterizer {
 
     /// Reports font-wide metrics at `point_size`, when the backend can
     /// measure the face (CTX-0237: the crossfont backend answers from
-    /// upstream face metrics; deterministic fakes keep the default).
+    /// upstream face metrics; the shaped backend answers `Ok(None)` in
+    /// Phase A, keeping the legacy fixed-baseline rule there;
+    /// deterministic fakes keep the default).
     ///
     /// The default returns `Ok(None)` — "no measurement" — so existing
     /// implementors keep compiling and the renderer falls back to the

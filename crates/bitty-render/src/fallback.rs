@@ -1,7 +1,7 @@
 //! Per-glyph font fallback for TUI graphs (CTX-0163, issue #263).
 //!
 //! The family-level chain in `bitty-config` ([`FONT_FALLBACK_CHAIN`]) only
-//! helped when the *primary* face failed to load: the crossfont backend maps
+//! helped when the *primary* face failed to load: a single-face backend maps
 //! a missing glyph to `Ok(None)` (blank cell, not a failure), so btop CPU
 //! graphs drawn with braille patterns (`U+2800-U+28FF`) vanished while text
 //! survived. [`FallbackRasterizer`] closes that gap by walking the chain on

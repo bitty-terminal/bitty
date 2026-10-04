@@ -9,9 +9,8 @@
 //! ([`fallback::FallbackRasterizer`]).
 //! Per ADR-0003 dependency rule 3, the grid pipeline reads **only** the
 //! public `Snapshot`/`Damage` surface of `bitty-term-state`; no private
-//! structure is reached into and terminal state is never mutated. Exactly
-//! two third-party dependencies are permitted, both by the accepted rows of
-//! ADR-0004.
+//! structure is reached into and terminal state is never mutated. Upstream
+//! crates are permitted only by the accepted rows of ADR-0004.
 //!
 //! # Upstream boundary (ADR-0004 "Adopt" / "Wrap" rows)
 //!
@@ -19,23 +18,58 @@
 //!   [`gpu`]. Its types never appear anywhere in this crate's public API:
 //!   every upstream failure is flattened into the owned [`RenderError`], and
 //!   adapter facts are re-described by owned enums ([`gpu::AdapterSummary`]).
-//! - **`crossfont` is wrapped, never adopted**, behind [`glyph::GlyphRasterizer`]
-//!   via [`crossfont_backend::CrossFontRasterizer`]. Font discovery uses
+//! - **`crossfont` is wrapped, never adopted**, behind
+//!   [`glyph::GlyphRasterizer`] via
+//!   [`crossfont_backend::CrossFontRasterizer`]. Font discovery uses
 //!   crossfont defaults (CoreText on macOS, DirectWrite on Windows,
 //!   FreeType/fontconfig elsewhere); callers only ever see [`FontQuery`],
-//!   [`FontId`], and owned [`GlyphBitmap`] values.
+//!   [`FontId`], and owned [`GlyphBitmap`] values. This is the production
+//!   default backend (see `Backend selection` below).
+//! - **`harfrust` (0.14.x) is wrapped, never adopted**, behind
+//!   [`shaped::SwashSingle::shape_run`] (run shaping over `read-fonts`
+//!   faces with per-face shape plans). Font bytes stay owned by this crate;
+//!   callers only ever see [`ShapedCluster`] values.
+//! - **`swash` (0.2.x) is wrapped, never adopted**, behind
+//!   [`glyph::GlyphRasterizer`] via [`shaped::SwashSingle`]. Outline and
+//!   bitmap strikes rasterize from the same font bytes the shaper uses
+//!   (shared `skrifa`/`read-fonts` parser); callers only ever see
+//!   [`FontQuery`], [`FontId`], and owned [`GlyphBitmap`] values.
+//! - **`fontdb` (0.23.x, `memmap` off) is wrapped, never adopted**, inside
+//!   [`shaped::SwashSingle`]. Faces load as owned bytes under
+//!   [`shaped::MAX_FACE_BYTES`]; discovery uses system font directories
+//!   plus fontconfig XML on Linux.
 //! - **`skia-safe` is rejected** per ADR-0004 and must not be introduced.
-//! - Per ADR-0004's fallback rule, if either upstream becomes unmaintained
+//! - Per ADR-0004's fallback rule, if any upstream becomes unmaintained
 //!   for more than twelve months while on this hot path it must be replaced
 //!   or narrowly forked under rule 3 of that decision; only this crate's
 //!   internals would change because no caller can observe upstream today.
+//!
+//! # Backend selection (CTX-0957 additive landing, DEC-0095)
+//!
+//! Production default stays **`crossfont`**: every production construction
+//! site builds [`crossfont_backend::CrossFontRasterizer`] (wrapped in
+//! [`fallback::FallbackRasterizer::with_default_chain`] exactly as before),
+//! so the additive landing changes zero production behavior — CJK scalars
+//! such as U+6F22/U+5B57 keep the dynamic per-glyph fontconfig fallback
+//! only the crossfont path provides today.
+//!
+//! The shaped stack ([`shaped::SwashSingle`]: `fontdb` discovery +
+//! `harfrust` shaping + `swash` rasterization) is the **explicit opt-in**:
+//! construct it directly via [`shaped::SwashSingle::new`] and wrap it in
+//! [`fallback::FallbackRasterizer::with_default_chain`], exactly as
+//! `tests/shaped_parity.rs` does. There is deliberately no flag, env var,
+//! or silent default flip — callers that want shaping name it. Full removal
+//! of the crossfont wrap (backend delete, runtime rewire, `deny.toml`
+//! `dwrote` revoke replay) is deferred to **CTX-0961**, which owns the
+//! CJK/script chain policy, the dynamic-fallback strategy, and the per-OS
+//! discovery evidence that must land first.
 //!
 //! # Scope boundaries of this slice
 //!
 //! Implemented here: frame planning from pixel-domain damage
 //! ([`frame::plan_frame`]), atlas layout math ([`atlas`]), the rasterizer
-//! contract plus wrapper and cache ([`glyph`], [`crossfont_backend`],
-//! [`cache`]), GPU context creation with owned errors ([`gpu::GpuContext`]),
+//! contract plus both backends and cache ([`glyph`], [`crossfont_backend`],
+//! [`shaped`], [`cache`]), GPU context creation with owned errors ([`gpu::GpuContext`]),
 //! the owned GPU surface lifecycle ([`gpu::Surface`] created from
 //! [`bitty_platform::SurfaceTarget`] via [`gpu::GpuContext::create_surface`],
 //! with `configure`/`resize`/`present` paths), the grid pipeline
@@ -48,8 +82,9 @@
 //! pipeline headlessly (`snapshot -> RGBA`).
 //!
 //! Explicitly **out of scope** and not implemented yet: cursor visuals
-//! and scrollback viewport rendering (deferred inside [`grid`]), text
-//! shaping/HarfBuzz (deferred to the text RFC named in ADR-0004), and
+//! and scrollback viewport rendering (deferred inside [`grid`]), grid run
+//! shaping with ligature spans (Phase B extends the [`shaped`] skeleton:
+//! run caches, cluster-to-cell emission, cursor-policy un-shaping), and
 //! subpixel RGB rendering policy. Presentation pipelines and WGSL shaders
 //! **are** implemented: [`batch`] translates an owned [`DrawList`] into
 //! bounded vertex batches plus atlas-upload bookkeeping on any CPU, and the
@@ -66,8 +101,8 @@
 //! CI runs on GPU-less Linux runners. Everything in this crate except
 //! actually requesting a live adapter/device or a live window surface is pure
 //! logic and is unit-tested there: rect algebra, frame-plan decisions and
-//! coalescing, shelf-pack atlas math, bitmap conversion invariants of the
-//! crossfont wrapper, the [`glyph::GlyphRasterizer`] contract against an
+//! coalescing, shelf-pack atlas math, bitmap conversion invariants of both
+//! backend wrappers, the [`glyph::GlyphRasterizer`] contract against an
 //! in-crate fake rasterizer, the full grid pipeline including output
 //! determinism (`snapshot + damage -> DrawList`) against deterministic fake
 //! fonts, and the **headless GPU-surface seam**: [`gpu::Surface::headless`]
@@ -107,10 +142,14 @@
 //! handles into a `wgpu::Surface`; it requires `unsafe` to borrow the raw
 //! `DisplayHandle`/`WindowHandle` (see `GPU Surface Seam` in [`gpu`]). The
 //! `unsafe` is confined to `gpu::Surface` construction (two `unsafe`
-//! blocks, each with a safety comment) and does not leak. `crossfont` still requires
-//! no caller unsafe. `bytemuck` is intentionally not introduced: vertex bytes
-//! are serialized with explicit little-endian `to_le_bytes` calls, so no
-//! `Pod` bit-casting (and no further `unsafe`) is required.
+//! blocks, each with a safety comment) and does not leak. Neither font
+//! stack (`crossfont`, nor `harfrust`/`swash`/`skrifa`/`read-fonts`/
+//! `fontdb`) requires caller `unsafe`; the shaped stack's internal parsing
+//! `unsafe` (byte casting in `bytemuck` and `swash`'s table readers) is
+//! upstream-audited and recorded in the CTX-0957 implementation evidence.
+//! `bytemuck` arrives only transitively through the font stacks: vertex
+//! bytes are still serialized with explicit little-endian `to_le_bytes`
+//! calls, so no `Pod` bit-casting (and no further `unsafe`) is required.
 //!
 //! # Example
 //!
@@ -157,6 +196,7 @@ pub mod gpu;
 pub mod grid;
 pub mod hidpi;
 pub(crate) mod pipeline;
+pub mod shaped;
 pub mod window;
 
 #[cfg(feature = "sw-fallback")]
@@ -181,5 +221,9 @@ pub use hidpi::{
     MAX_DPI_SCALE, MAX_SCALED_POINT_SIZE, MIN_DPI_SCALE, grid_from_surface_extent,
     sanitize_dpi_scale, scaled_cell_metrics, scaled_cell_side, scaled_point_size,
     surface_extent_for_grid,
+};
+pub use shaped::{
+    GlyphSource, MAX_FACE_BYTES, MAX_LOADED_FACES, MAX_SHAPE_PLANS_PER_FACE, RunAttrs,
+    ShapePlanKey, ShapedCluster, SwashSingle, cells_for_range, harfrust_features,
 };
 pub use window::{MAX_WINDOW_PADDING_PX, clamp_window_padding, padded_content_rect};

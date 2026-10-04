@@ -1,6 +1,6 @@
 [package]
 name = "bitty-render"
-description = "GPU rendering pipeline for Bitty (wgpu + crossfont)"
+description = "GPU rendering pipeline for Bitty (wgpu + crossfont, with harfrust/swash opt-in)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -30,10 +30,26 @@ bitty-platform = { version = "0.0.21", path = "../bitty-platform" }
 # truth for clear color, default fg/bg, cursor, selection, and ANSI 0-15
 # (CTX-0147). bitty-config stays dependency-free (pure std), so no cycle.
 bitty-config = { version = "0.0.21", path = "../bitty-config" }
-# ADR-0004 rendering rows: ADOPT wgpu (~26.x line); WRAP crossfont.
+# ADR-0004 rendering rows: ADOPT wgpu (~26.x line); WRAP crossfont
+# (production default, CTX-0957 additive landing per DEC-0095); WRAP
+# harfrust/swash/fontdb as the explicit opt-in stack (shape with harfrust
+# 0.14, rasterize with swash 0.2 over shared skrifa/read-fonts, discover
+# with fontdb 0.23). Full removal of the crossfont wrap is deferred to
+# CTX-0961 (chain policy + dynamic fallback + per-OS evidence).
 # Neither upstream type may appear in this crate's public API.
 wgpu = "26.0"
 crossfont = "0.9"
+# HarfBuzz shaping port (MIT, rust-version 1.85 exact). Exact pin: the
+# fontations floor drifts under swash (see skrifa note below).
+harfrust = "=0.14.0"
+# Outline + bitmap rasterization (Apache-2.0 OR MIT, no declared MSRV:
+# verified on the 1.85 toolchain by the CTX-0957 implementation task).
+# Explicit std+scale+render (== upstream defaults, pinned for audit).
+swash = { version = "=0.2.10", default-features = false, features = ["std", "scale", "render"] }
+# Font discovery (MIT, rust-version 1.60). memmap stays OFF (owned Vec<u8>
+# under MAX_FACE_BYTES instead): no persistent-mmap unsafe, no lifetime
+# coupling on the hot path. fontconfig XML discovery stays ON (Linux).
+fontdb = { version = "=0.23.0", default-features = false, features = ["std", "fs", "fontconfig"] }
 
 
 [dev-dependencies]

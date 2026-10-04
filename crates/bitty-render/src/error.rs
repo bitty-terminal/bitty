@@ -1,8 +1,9 @@
 //! Owned error type for [`crate`].
 //!
 //! Errors reported by the wrapped upstream layers are flattened into owned
-//! data before they cross back into this crate's API; no `wgpu` or `crossfont`
-//! error type ever escapes the crate (ADR-0004). Failures that originate
+//! data before they cross back into this crate's API; no `wgpu`,
+//! `crossfont`, `harfrust`, `swash`, or `fontdb` error type ever escapes the
+//! crate (ADR-0004). Failures that originate
 //! inside this crate surface as dedicated variants with owned payloads only.
 
 use std::fmt;

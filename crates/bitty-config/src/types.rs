@@ -1531,6 +1531,19 @@ pub const MAX_FALLBACK_DEPTH: usize = 12;
 /// [`MAX_FALLBACK_DEPTH`], user entries first.
 pub const MAX_FONT_FALLBACK_ENTRIES: usize = 8;
 
+/// Maximum user-configured OpenType feature entries (`font.features`).
+///
+/// Mirrors the `MAX_FONT_FALLBACK_ENTRIES` platform-tail bound so the
+/// feature list costs the same worst case as the fallback tier; shaping
+/// applies entries in order (duplicates last-wins, deterministic).
+pub const MAX_FONT_FEATURES: usize = 32;
+
+/// Maximum raw bytes per `font.features` entry (threat T-01 input bound).
+///
+/// The longest accepted form (`TAG=4294967295`) is 14 bytes; 16 leaves no
+/// room for padding games while staying fail-closed on hostile input.
+pub const MAX_FONT_FEATURE_LEN: usize = 16;
+
 /// Braille/symbols fallback family (CTX-0163, issue #263).
 ///
 /// `fc-query` evidence on the reference host: `DejaVu Sans Mono` covers
@@ -1630,6 +1643,109 @@ pub const FONT_FALLBACK_CHAIN: &[&str] = &[
     EMOJI_FALLBACK_FAMILY,
 ];
 
+/// One parsed OpenType feature override (CTX-0957, issue #1666).
+///
+/// Wezterm-compatible strict syntax (ghostty's loose CSS-like syntax is not
+/// accepted): `"TAG"`, `"TAG=value"`, `"TAG on"`, `"TAG off"`, `"+TAG"`,
+/// `"-TAG"`, where `TAG` is exactly 4 ASCII alphanumeric characters
+/// (`calt`, `liga`, `clig`, `dlig`, `ss01`). Canonical examples:
+/// `["calt=0", "clig=0", "liga=0"]` disables most ligatures,
+/// `["zero"]` enables slashed-zero style. Parsed once at config load via
+/// [`OpenTypeFeature::parse`]; shaping applies entries in order so
+/// duplicates are last-wins (deterministic).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OpenTypeFeature {
+    /// Four-byte feature tag (for example `*b"calt"`).
+    pub tag: [u8; 4],
+    /// Feature value: `0` disables, `1` enables, higher values select
+    /// alternate variants (for example `ss01=2`).
+    pub value: u32,
+}
+
+impl OpenTypeFeature {
+    /// Parses one raw `font.features` entry.
+    ///
+    /// Trims surrounding whitespace first; the entry must then fit within
+    /// [`MAX_FONT_FEATURE_LEN`] bytes. Returns a `'static` reason (never the
+    /// input) so hostile entries cannot grow error allocations.
+    pub fn parse(raw: &str) -> Result<Self, &'static str> {
+        let text = raw.trim();
+        if text.is_empty() {
+            return Err("must not be empty or whitespace");
+        }
+        if text.len() > MAX_FONT_FEATURE_LEN {
+            return Err("must be <= 16 bytes");
+        }
+        let (tag_text, value) = if let Some(tag) = text.strip_prefix('+') {
+            (tag, 1)
+        } else if let Some(tag) = text.strip_prefix('-') {
+            (tag, 0)
+        } else if let Some((tag, val)) = text.split_once('=') {
+            let value: u32 = val
+                .parse()
+                .map_err(|_| "value after `=` must be a decimal u32")?;
+            (tag, value)
+        } else {
+            let mut parts = text.split_ascii_whitespace();
+            let tag = parts.next().expect("trimmed text is non-empty");
+            let value = match parts.next() {
+                None => 1,
+                Some("on") => 1,
+                Some("off") => 0,
+                Some(_) => return Err("expected `on` or `off` after the tag"),
+            };
+            if parts.next().is_some() {
+                return Err("too many words");
+            }
+            (tag, value)
+        };
+        if tag_text.len() != 4 || !tag_text.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return Err("tag must be exactly 4 ASCII alphanumeric characters");
+        }
+        let bytes = tag_text.as_bytes();
+        Ok(Self {
+            tag: [bytes[0], bytes[1], bytes[2], bytes[3]],
+            value,
+        })
+    }
+}
+
+/// Programming-ligature policy for `font.disable_ligatures` (CTX-0957).
+///
+/// Kitty three-state semantics (`never`/`cursor`/`always`, kitty integers
+/// 0/1/2 as the internal repr only): `Never` shapes per `features` verbatim
+/// (ligatures on), `Cursor` shapes per `features` then un-shapes runs under
+/// the cursor (Phase B), `Always` forces `calt=liga=clig=dlig=0` regardless
+/// of `features` (the unshaped fast path and PB-6 kill-switch). Default is
+/// `Never`, preserving current behavior. The policy covers programming
+/// ligatures (`calt` family); general ligature control belongs to
+/// `font.features`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum LigaturePolicy {
+    /// Ligatures on: shape per `features` verbatim.
+    #[default]
+    Never,
+    /// Shape per `features`, then un-shape runs under the cursor.
+    Cursor,
+    /// Ligatures off: programming-ligature features forced to zero.
+    Always,
+}
+
+impl LigaturePolicy {
+    /// Parses the Lua spelling (`never`/`cursor`/`always`, trimmed).
+    ///
+    /// Returns a `'static` reason so hostile input cannot grow error
+    /// allocations; the caller attaches the `font.disable_ligatures` field.
+    pub fn parse(raw: &str) -> Result<Self, &'static str> {
+        match raw.trim() {
+            "never" => Ok(Self::Never),
+            "cursor" => Ok(Self::Cursor),
+            "always" => Ok(Self::Always),
+            _ => Err("must be one of `never`, `cursor`, `always`"),
+        }
+    }
+}
+
 /// Font configuration.
 ///
 /// `family`/`size` match ghostty Linux defaults (`JetBrainsMono Nerd Font`
@@ -1658,6 +1774,21 @@ pub struct FontConfig {
     /// `MAX_FONT_FALLBACK_ENTRIES` entries, validated fail-closed
     /// (`font.fallback[<index>]` diagnostics).
     pub fallback: Vec<String>,
+    /// Raw OpenType feature overrides, applied in order at shaping time
+    /// (duplicates last-wins). Empty by default (no overrides — current
+    /// behavior preserved).
+    ///
+    /// Each entry follows the [`OpenTypeFeature`] strict syntax and is at
+    /// most `MAX_FONT_FEATURE_LEN` bytes; at most `MAX_FONT_FEATURES`
+    /// entries, validated fail-closed (`font.features[<index>]`
+    /// diagnostics). Lua wiring (`font.features` table) is a follow-up;
+    /// this typed surface is the validation authority.
+    pub features: Vec<String>,
+    /// Programming-ligature policy. Defaults to `Never` (ligatures on —
+    /// current behavior preserved). Lua wiring
+    /// (`font.disable_ligatures = "cursor"`) is a follow-up; the typed
+    /// surface here is the validation authority.
+    pub disable_ligatures: LigaturePolicy,
 }
 
 impl Default for FontConfig {
@@ -1668,6 +1799,8 @@ impl Default for FontConfig {
             line_height: DEFAULT_LINE_HEIGHT,
             letter_spacing: DEFAULT_LETTER_SPACING,
             fallback: Vec::new(),
+            features: Vec::new(),
+            disable_ligatures: LigaturePolicy::Never,
         }
     }
 }
@@ -1724,6 +1857,20 @@ impl FontConfig {
                 return Err(ConfigError::validation(
                     format!("font.fallback[{index}]"),
                     format!("must be <= {MAX_FONT_FAMILY_LEN} bytes"),
+                ));
+            }
+        }
+        if self.features.len() > MAX_FONT_FEATURES {
+            return Err(ConfigError::validation(
+                "font.features",
+                format!("must contain <= {MAX_FONT_FEATURES} entries"),
+            ));
+        }
+        for (index, entry) in self.features.iter().enumerate() {
+            if let Err(reason) = OpenTypeFeature::parse(entry) {
+                return Err(ConfigError::validation(
+                    format!("font.features[{index}]"),
+                    reason,
                 ));
             }
         }
@@ -3691,6 +3838,128 @@ mod tests {
             err.to_string().contains("font.fallback[0]"),
             "unexpected diagnostic: {err}"
         );
+    }
+
+    #[test]
+    fn font_features_defaults_empty_and_valid() {
+        // CTX-0957: defaults preserve current behavior (no overrides,
+        // ligatures on).
+        let d = FontConfig::default();
+        assert!(d.features.is_empty());
+        assert_eq!(d.disable_ligatures, LigaturePolicy::Never);
+        d.validate().expect("default valid");
+    }
+
+    #[test]
+    fn font_feature_syntax_table() {
+        // Wezterm-compatible strict forms.
+        for (raw, tag, value) in [
+            ("calt", *b"calt", 1),
+            ("liga=0", *b"liga", 0),
+            ("clig=0", *b"clig", 0),
+            ("ss01=2", *b"ss01", 2),
+            ("zero", *b"zero", 1),
+            ("calt on", *b"calt", 1),
+            ("liga off", *b"liga", 0),
+            ("+dlig", *b"dlig", 1),
+            ("-liga", *b"liga", 0),
+            ("  calt=1  ", *b"calt", 1),
+            ("calt=4294967295", *b"calt", u32::MAX),
+        ] {
+            let parsed = OpenTypeFeature::parse(raw).expect("valid feature form");
+            assert_eq!(parsed.tag, tag, "tag for {raw:?}");
+            assert_eq!(parsed.value, value, "value for {raw:?}");
+        }
+        // Ghostty-style loose syntax and malformed tags fail closed.
+        for bad in [
+            "",
+            "   ",
+            "cal",
+            "caltx",
+            "ca-t",
+            "ca t",
+            "liga=",
+            "liga=off",
+            "liga=1.5",
+            "liga=-1",
+            "liga=4294967296",
+            "liga on extra",
+            "liga maybe",
+            "++liga",
+            "=1",
+            "liga = 0",
+        ] {
+            OpenTypeFeature::parse(bad).unwrap_err();
+        }
+        // Over-long entries fail closed on the byte bound.
+        OpenTypeFeature::parse(&"calt=".to_string().repeat(4)).unwrap_err();
+    }
+
+    #[test]
+    fn font_features_validation_bounds() {
+        // Valid list passes.
+        FontConfig {
+            family: "JetBrains Mono".into(),
+            features: vec!["calt=0".into(), "clig=0".into(), "ss01=2".into()],
+            ..Default::default()
+        }
+        .validate()
+        .expect("valid feature list");
+        // Too many entries fail closed.
+        FontConfig {
+            family: "JetBrains Mono".into(),
+            features: (0..MAX_FONT_FEATURES + 1)
+                .map(|i| format!("ss{i:02}=1"))
+                .collect(),
+            ..Default::default()
+        }
+        .validate()
+        .unwrap_err();
+        // Exactly the bound passes.
+        FontConfig {
+            family: "JetBrains Mono".into(),
+            features: (0..MAX_FONT_FEATURES)
+                .map(|i| format!("ss{i:02}=1"))
+                .collect(),
+            ..Default::default()
+        }
+        .validate()
+        .expect("bound-count feature list");
+        // Malformed entries fail closed with an indexed path.
+        let err = FontConfig {
+            family: "JetBrains Mono".into(),
+            features: vec!["calt=0".into(), "not a tag!".into()],
+            ..Default::default()
+        }
+        .validate()
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("font.features[1]"),
+            "unexpected diagnostic: {err}"
+        );
+        // Duplicates are kept (last-wins at shaping time), not rejected.
+        FontConfig {
+            family: "JetBrains Mono".into(),
+            features: vec!["liga=1".into(), "liga=0".into()],
+            ..Default::default()
+        }
+        .validate()
+        .expect("duplicate features last-wins");
+    }
+
+    #[test]
+    fn ligature_policy_spellings() {
+        assert_eq!(LigaturePolicy::parse("never"), Ok(LigaturePolicy::Never));
+        assert_eq!(LigaturePolicy::parse("cursor"), Ok(LigaturePolicy::Cursor));
+        assert_eq!(LigaturePolicy::parse("always"), Ok(LigaturePolicy::Always));
+        assert_eq!(
+            LigaturePolicy::parse("  cursor  "),
+            Ok(LigaturePolicy::Cursor)
+        );
+        for bad in ["", "sometimes", "NEVER", "0", "2"] {
+            LigaturePolicy::parse(bad).unwrap_err();
+        }
+        assert_eq!(LigaturePolicy::default(), LigaturePolicy::Never);
     }
 
     #[test]

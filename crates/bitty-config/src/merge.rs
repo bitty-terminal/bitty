@@ -3565,6 +3565,10 @@ mod tests {
                     line_height: crate::types::DEFAULT_LINE_HEIGHT,
                     letter_spacing: crate::types::DEFAULT_LETTER_SPACING,
                     fallback,
+                    // CTX-0957: new fields default (test focuses on
+                    // fallback replace semantics, not the HarfBuzz stack).
+                    features: Vec::new(),
+                    disable_ligatures: crate::types::LigaturePolicy::Never,
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -4406,6 +4410,8 @@ mod tests {
                     line_height: 1.0,
                     letter_spacing: 0.0,
                     fallback: Vec::new(),
+                    features: Vec::new(),
+                    disable_ligatures: crate::types::LigaturePolicy::Never,
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -4420,6 +4426,8 @@ mod tests {
                     line_height: DEFAULT_LINE_HEIGHT,
                     letter_spacing: DEFAULT_LETTER_SPACING,
                     fallback: Vec::new(),
+                    features: Vec::new(),
+                    disable_ligatures: crate::types::LigaturePolicy::Never,
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()

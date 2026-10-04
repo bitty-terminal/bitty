@@ -4247,4 +4247,169 @@ mod tests {
             "E_DEF_INVALID"
         );
     }
+
+    #[test]
+    fn w29_out_of_tree_consumer_drives_targeting_with_generic_primitives() {
+        // CTX-0942 re-scoped acceptance (DEC-0085): an out-of-tree beacon
+        // plugin functions using ONLY generic primitives — provider
+        // registration, the read-only snapshot, the W-28 overlay capture,
+        // per-generation label bindings, and typed command dispatch. Two
+        // independent generations share one runtime-wired mechanism state
+        // (one registry, lens set, allocator, and capture switch, exactly as
+        // the runtime wires every loaded plugin via `set_targeting_state`).
+        // No `bitty.beacon.*` namespace exists, no new capability is gated
+        // (both generations carry the accepted `ui.overlay` grant), and Core
+        // takes no private path: the first-party generation below uses the
+        // same public host ops as the out-of-tree one.
+        let registry = Rc::new(RefCell::new(TargetRegistry::new()));
+        let lenses: Rc<RefCell<Vec<(String, DerivedProvider)>>> = Rc::new(RefCell::new(Vec::new()));
+        let allocator = Rc::new(RefCell::new(LabelAllocator::default()));
+        let capture = Rc::new(RefCell::new(OverlayCapture::new()));
+        let first_party = generation_services("bitty.first", 1, &capture);
+        let out_of_tree = generation_services("beacon.ext", 2, &capture);
+        first_party.set_targeting_state(
+            Rc::clone(&registry),
+            Rc::clone(&lenses),
+            Rc::clone(&allocator),
+        );
+        out_of_tree.set_targeting_state(
+            Rc::clone(&registry),
+            Rc::clone(&lenses),
+            Rc::clone(&allocator),
+        );
+
+        // Provider composition is generic registration: each consumer's lens
+        // joins the shared set and every snapshot derives from all of them.
+        out_of_tree
+            .ui_targets_register("beacon.links", "plugin", &[("link".to_string(), 7)])
+            .expect("out-of-tree register");
+        first_party
+            .ui_targets_register("first.panels", "plugin", &[("panel".to_string(), 3)])
+            .expect("first-party register");
+        assert_eq!(
+            out_of_tree.ui_targets_snapshot(16).expect("snapshot").len(),
+            2,
+            "snapshot derives from every registered lens"
+        );
+        assert_eq!(
+            first_party.ui_targets_snapshot(16).expect("snapshot").len(),
+            2,
+            "the first-party generation sees the out-of-tree lens too"
+        );
+
+        // The out-of-tree consumer drives a full session over the W-28
+        // capture: mount an overlay block, start the session, and resolve a
+        // label to a typed command id from the accepted registry.
+        let handle = out_of_tree
+            .ui_mount("overlay", &UiNode::text("beacon"))
+            .expect("overlay mount");
+        let anchors = vec![(10u16, 0u16), (11u16, 0u16)];
+        let commands = vec![
+            "beacon.ext:jump".to_string(),
+            "beacon.ext:focus".to_string(),
+        ];
+        let labels = out_of_tree
+            .ui_targets_session_start(handle, 80, &anchors, &commands)
+            .expect("session start");
+        assert_eq!(labels.len(), 2);
+        let resolved = out_of_tree
+            .ui_targets_dispatch(&labels[0])
+            .expect("dispatch");
+        assert!(
+            commands.contains(&resolved),
+            "dispatch resolves to the consumer's own typed command id"
+        );
+        // Nothing is published: the full flow touches no notification queue.
+        assert!(
+            out_of_tree.notifications.borrow().is_empty(),
+            "targeting must not publish to the Event Bus"
+        );
+
+        // Per-generation isolation: the other generation holds no session,
+        // so dispatching the live label from it fails closed instead of
+        // resolving a foreign binding.
+        assert_eq!(
+            first_party
+                .ui_targets_dispatch(&labels[0])
+                .expect_err("foreign dispatch")
+                .code,
+            E_UI_NOT_OWNER
+        );
+
+        // A newer collection epoch stales the bound handles: dispatch then
+        // fails closed instead of resolving to a moved target.
+        let _ = out_of_tree
+            .targeting_mediator()
+            .expect("mediator")
+            .collect(&mut registry.borrow_mut())
+            .expect("recollect bumps generations");
+        assert_eq!(
+            out_of_tree
+                .ui_targets_dispatch(&labels[0])
+                .expect_err("stale dispatch")
+                .code,
+            E_UI_NOT_OWNER
+        );
+
+        // Cancel ends the session and frees the capture; the other consumer
+        // then drives its own session with the same generic ops, proving no
+        // first-party bypass is needed for any consumer to function.
+        assert!(
+            out_of_tree
+                .ui_targets_session_cancel(handle)
+                .expect("cancel")
+        );
+        let other_handle = first_party
+            .ui_mount("overlay", &UiNode::text("first"))
+            .expect("overlay mount");
+        let other_commands = vec![
+            "first.panels:show".to_string(),
+            "first.panels:hide".to_string(),
+        ];
+        let other_labels = first_party
+            .ui_targets_session_start(other_handle, 80, &anchors, &other_commands)
+            .expect("second consumer session");
+        assert_eq!(other_labels.len(), 2);
+        let other_resolved = first_party
+            .ui_targets_dispatch(&other_labels[1])
+            .expect("second consumer dispatch");
+        assert!(
+            other_commands.contains(&other_resolved),
+            "the second consumer resolves its own commands independently"
+        );
+        assert!(
+            first_party
+                .ui_targets_session_cancel(other_handle)
+                .expect("cancel")
+        );
+    }
+
+    #[test]
+    fn w29_targeting_session_stays_unavailable_in_safe_mode() {
+        // Safe mode never presents the focusable overlay (CTX-0941): a
+        // targeting session fails with the existing `E_UI_UNAVAILABLE` and
+        // records no session, so the safe startup path is unaffected by W-29.
+        let services = targeting_services(true, true);
+        services.set_safe_mode(true);
+        services
+            .ui_targets_register("acme.links", "plugin", &targeting_offers(1))
+            .expect("register");
+        let handle = services
+            .ui_mount("overlay", &UiNode::text("targets"))
+            .expect("overlay mount");
+        assert_eq!(
+            services
+                .ui_targets_session_start(handle, 80, &targeting_anchors(1), &targeting_commands(1))
+                .expect_err("safe mode denies capture")
+                .code,
+            E_UI_UNAVAILABLE
+        );
+        assert_eq!(
+            services
+                .ui_targets_dispatch("a")
+                .expect_err("no session recorded")
+                .code,
+            E_UI_NOT_OWNER
+        );
+    }
 }

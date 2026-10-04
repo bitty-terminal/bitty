@@ -790,6 +790,11 @@ pub struct Runtime {
     /// (CTX-0946 C1). Bounded by
     /// [`BAND_CLICK_QUEUE_MAX`](self::band_host::BAND_CLICK_QUEUE_MAX).
     band_click_queue: Vec<band_host::BandClickRequest>,
+    /// Press-side band target armed by the last consumed band press
+    /// (CTX-0946 C1 review: standard button semantics — the paired release
+    /// routes only onto the same band run). `None` when no band press owns
+    /// its release; cleared with the release swallow.
+    band_press_target: Option<band_host::PressedBandTarget>,
     /// Headless host statistics for band routing and paint (CTX-0946).
     band_stats: band_host::BandHostStats,
     search_state: SearchState,
@@ -1409,6 +1414,7 @@ impl Runtime {
             bar_release_swallow: false,
             band_release_swallow: false,
             band_click_queue: Vec::new(),
+            band_press_target: None,
             band_stats: band_host::BandHostStats::default(),
             search_state: SearchState::new(),
             pending_paste: None,
@@ -1637,6 +1643,7 @@ impl Runtime {
             bar_release_swallow: false,
             band_release_swallow: false,
             band_click_queue: Vec::new(),
+            band_press_target: None,
             band_stats: band_host::BandHostStats::default(),
             search_state: SearchState::new(),
             pending_paste: None,

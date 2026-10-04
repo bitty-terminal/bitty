@@ -1809,10 +1809,11 @@ impl Runtime {
         // fire. Cleared whenever the window is (or stays) unfocused, ahead
         // of the unchanged-state return; a focus gain keeps the flag so
         // the paired release still swallows. The plugin-band swallow
-        // (CTX-0946 C1) pairs the same way and clears with it.
+        // (CTX-0946 C1) pairs the same way and clears with it, along with
+        // its stored press target (a focus change ends the gesture).
         if !focused {
             self.bar_release_swallow = false;
-            self.band_release_swallow = false;
+            self.clear_band_press();
         }
         if self.focused == focused {
             return;

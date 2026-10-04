@@ -296,10 +296,7 @@ pub enum BandColumnOutcome {
 /// geometry (which band owns the row) lives on [`Runtime::plugin_band_hit`].
 #[must_use]
 pub fn resolve_click_in_band(owner: &str, runs: &[BandRun], char_idx: usize) -> BandColumnOutcome {
-    let Some(run) = runs
-        .iter()
-        .find(|run| char_idx >= run.start_col && char_idx < run.end_col)
-    else {
+    let Some(run) = find_run_index(runs, char_idx).and_then(|index| runs.get(index)) else {
         return BandColumnOutcome::NoClaim;
     };
     let Some(click) = run.on_click.as_ref() else {
@@ -313,6 +310,39 @@ pub fn resolve_click_in_band(owner: &str, runs: &[BandRun], char_idx: usize) -> 
         command: verb,
         args: click.args.clone(),
     })
+}
+
+/// Index of the run owning a display-cell column, if any (CTX-0946 C1).
+///
+/// Pure run identity behind [`resolve_click_in_band`]: press and release
+/// compare run indices (plus band and resolved request) so a press-drag
+/// onto another span can never fire its command.
+#[must_use]
+pub fn find_run_index(runs: &[BandRun], char_idx: usize) -> Option<usize> {
+    runs.iter()
+        .position(|run| char_idx >= run.start_col && char_idx < run.end_col)
+}
+
+/// Press-side band target stored by [`Runtime::band_press`] (CTX-0946 C1).
+///
+/// Standard button semantics: a release routes only onto the same target
+/// the press armed (band, run, and resolved request all equal). Anything
+/// else — a drag onto another span or band, or content that changed
+/// mid-gesture — counts unclaimed (or denied, when the release itself is
+/// denied on the same target the press armed).
+#[derive(Debug, Clone, PartialEq)]
+pub(super) enum PressedBandTarget {
+    /// The press armed a claimed span: band, run index, resolved request.
+    Hit {
+        edge: BandEdge,
+        visible_index: usize,
+        run: usize,
+        request: BandClickRequest,
+    },
+    /// The press landed on an unclaimed span or past the text.
+    NoClaim,
+    /// The press landed on an unroutable claim (foreign qualifier, ...).
+    Denied,
 }
 
 /// Whether band rows collide: duplicates, or a band on the Core bar row.
@@ -622,10 +652,11 @@ impl Runtime {
     /// Returns `true` (consume the press: no focus move, no selection, no
     /// capture report) when the last-known cursor sits anywhere on a painted
     /// band row — including the unclaimed trailing region past the text —
-    /// arming the one-shot [`Self::band_release_swallow`] so the paired
-    /// release resolves the click. Shift still forces the selection path
-    /// (the CTX-0181 accessibility escape). The Core bar keeps precedence:
-    /// callers run [`Self::status_bar_press`] first.
+    /// arming the one-shot [`Self::band_release_swallow`] plus the stored
+    /// press target so the paired release routes only onto the same band
+    /// run (standard button semantics). Shift still forces the selection
+    /// path (the CTX-0181 accessibility escape). The Core bar keeps
+    /// precedence: callers run [`Self::status_bar_press`] first.
     pub(super) fn band_press(&mut self) -> bool {
         if self.shift_pressed {
             return false;
@@ -633,43 +664,103 @@ impl Runtime {
         let Some(pos) = self.last_cursor else {
             return false;
         };
-        if self.plugin_band_row_hit(pos).is_none() {
+        let Some(row_hit) = self.plugin_band_row_hit(pos) else {
             return false;
-        }
+        };
+        self.band_press_target = Some(self.band_target_at(pos, &row_hit));
         self.band_release_swallow = true;
         true
     }
 
+    /// Resolves a press or release position into its stored-target form.
+    ///
+    /// Shared by [`Self::band_press`] and [`Self::band_release`] so both
+    /// sides classify identically: past-text is `NoClaim` (the width guard
+    /// in [`Self::plugin_band_hit`], never the saturating tail of
+    /// [`cell_col_to_char_idx`]).
+    fn band_target_at(&self, pos: CursorPosition, row_hit: &BandRowHit) -> PressedBandTarget {
+        let bands = self.visible_edge_bands(row_hit.edge);
+        let Some(band) = bands.get(row_hit.visible_index) else {
+            return PressedBandTarget::NoClaim;
+        };
+        let owner = band.plugin_id.clone();
+        let (_, runs) = flatten_band_runs(&band.root);
+        let Some(hit) = self.plugin_band_hit(pos) else {
+            return PressedBandTarget::NoClaim;
+        };
+        if (hit.edge, hit.visible_index) != (row_hit.edge, row_hit.visible_index) {
+            // Unreachable (same geometry walk twice); fail closed.
+            return PressedBandTarget::NoClaim;
+        }
+        match resolve_click_in_band(&owner, &runs, hit.char_idx) {
+            BandColumnOutcome::Hit(request) => {
+                let Some(run) = find_run_index(&runs, hit.char_idx) else {
+                    // Unreachable (a Hit always owns a run); fail closed.
+                    return PressedBandTarget::NoClaim;
+                };
+                PressedBandTarget::Hit {
+                    edge: row_hit.edge,
+                    visible_index: row_hit.visible_index,
+                    run,
+                    request,
+                }
+            }
+            BandColumnOutcome::Denied => PressedBandTarget::Denied,
+            BandColumnOutcome::NoClaim => PressedBandTarget::NoClaim,
+        }
+    }
+
+    /// Drops an armed band press without routing (focus loss pairs with the
+    /// release-swallow clear in [`Runtime::set_focused`](super::input)).
+    pub(super) fn clear_band_press(&mut self) {
+        self.band_release_swallow = false;
+        self.band_press_target = None;
+    }
     /// Resolves the release paired with a band-consumed press (CTX-0946 C1).
     ///
     /// Returns `true` (consume the release) when the swallow is armed,
-    /// exactly like the Core-bar pairing: the click resolves at the release
-    /// cursor into the drain queue ([`Self::drain_band_clicks`]), or counts
-    /// [`BandHostStats::clicks_unclaimed`] / [`BandHostStats::clicks_denied`]
-    /// when no span claims it. A full queue drops fail-closed and counts
-    /// [`BandHostStats::queue_drops`].
+    /// exactly like the Core-bar pairing. Standard button semantics: the
+    /// release routes only when it resolves to the same band run the press
+    /// armed (band, run, and resolved request all equal, so content that
+    /// changed mid-gesture cannot misroute). A drag onto another span or
+    /// band counts [`BandHostStats::clicks_unclaimed`]; a release denied on
+    /// the same denied target the press armed counts
+    /// [`BandHostStats::clicks_denied`]. A full queue drops fail-closed and
+    /// counts [`BandHostStats::queue_drops`].
     pub(super) fn band_release(&mut self) -> bool {
         if !self.band_release_swallow {
             return false;
         }
         self.band_release_swallow = false;
+        let pressed = self.band_press_target.take();
         let Some(pos) = self.last_cursor else {
             self.band_stats.clicks_unclaimed = self.band_stats.clicks_unclaimed.saturating_add(1);
             return true;
         };
-        let Some(hit) = self.plugin_band_hit(pos) else {
+        let Some(row_hit) = self.plugin_band_row_hit(pos) else {
             self.band_stats.clicks_unclaimed = self.band_stats.clicks_unclaimed.saturating_add(1);
             return true;
         };
-        let bands = self.visible_edge_bands(hit.edge);
-        let Some(band) = bands.get(hit.visible_index) else {
-            self.band_stats.clicks_unclaimed = self.band_stats.clicks_unclaimed.saturating_add(1);
-            return true;
-        };
-        let owner = band.plugin_id.clone();
-        let (_, runs) = flatten_band_runs(&band.root);
-        match resolve_click_in_band(&owner, &runs, hit.char_idx) {
-            BandColumnOutcome::Hit(request) => {
+        let released = self.band_target_at(pos, &row_hit);
+        match (pressed, released) {
+            (
+                Some(PressedBandTarget::Hit {
+                    edge,
+                    visible_index,
+                    run,
+                    request,
+                }),
+                PressedBandTarget::Hit {
+                    edge: release_edge,
+                    visible_index: release_visible,
+                    run: release_run,
+                    request: release_request,
+                },
+            ) if edge == release_edge
+                && visible_index == release_visible
+                && run == release_run
+                && request == release_request =>
+            {
                 if self.band_click_queue.len() >= BAND_CLICK_QUEUE_MAX {
                     self.band_stats.queue_drops = self.band_stats.queue_drops.saturating_add(1);
                 } else {
@@ -677,12 +768,12 @@ impl Runtime {
                     self.band_stats.clicks_routed = self.band_stats.clicks_routed.saturating_add(1);
                 }
             }
-            BandColumnOutcome::NoClaim => {
+            (Some(PressedBandTarget::Denied), PressedBandTarget::Denied) => {
+                self.band_stats.clicks_denied = self.band_stats.clicks_denied.saturating_add(1);
+            }
+            _ => {
                 self.band_stats.clicks_unclaimed =
                     self.band_stats.clicks_unclaimed.saturating_add(1);
-            }
-            BandColumnOutcome::Denied => {
-                self.band_stats.clicks_denied = self.band_stats.clicks_denied.saturating_add(1);
             }
         }
         true

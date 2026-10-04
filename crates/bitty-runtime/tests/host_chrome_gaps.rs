@@ -344,6 +344,73 @@ fn trailing_release_never_routes_the_final_span() {
 }
 
 #[test]
+fn press_drag_across_spans_fires_nothing() {
+    // Standard button semantics: press on pill A, drag to pill B, release
+    // must not fire B's command (the press never armed it).
+    let mut rt = minimal_runtime();
+    mount_bottom_bar(
+        &mut rt,
+        UiNode::row(vec![pill("A", 1.0), plain(" "), pill("B", 2.0)]),
+    );
+    rt.tick();
+    let row = bar_row(&rt);
+    rt.handle_cursor_moved(cell_pixels(&rt, row, 0));
+    rt.handle_mouse_input(press());
+    assert!(rt.band_release_armed(), "press on A arms the swallow");
+    rt.handle_cursor_moved(cell_pixels(&rt, row, 2));
+    rt.handle_mouse_input(release());
+    assert!(
+        rt.drain_band_clicks().is_empty(),
+        "drag A->B routes neither command"
+    );
+    let stats = rt.band_host_stats();
+    assert_eq!(stats.clicks_routed, 0);
+    assert_eq!(stats.clicks_unclaimed, 1);
+    assert!(!rt.has_selection(), "the whole gesture stays chrome");
+}
+
+#[test]
+fn press_drag_across_bands_fires_nothing() {
+    // Same across band rows: press on band 0's pill, release on band 1's
+    // row — the release target differs, so nothing routes.
+    let mut rt = minimal_runtime();
+    rt.set_chrome_bands(ChromeBands {
+        bottom: vec![
+            text_band(
+                "test-bar",
+                UiSlot::Bottom,
+                UiNode::row(vec![pill("A", 1.0)]),
+            ),
+            text_band(
+                "other-bar",
+                UiSlot::Bottom,
+                UiNode::row(vec![pill("B", 2.0)]),
+            ),
+        ],
+        ..Default::default()
+    });
+    rt.tick();
+    let first = rt
+        .plugin_band_row(BandEdge::Bottom, 0)
+        .expect("first band fits");
+    let second = rt
+        .plugin_band_row(BandEdge::Bottom, 1)
+        .expect("second band fits");
+    assert_ne!(first, second);
+    rt.handle_cursor_moved(cell_pixels(&rt, first, 0));
+    rt.handle_mouse_input(press());
+    rt.handle_cursor_moved(cell_pixels(&rt, second, 0));
+    rt.handle_mouse_input(release());
+    assert!(
+        rt.drain_band_clicks().is_empty(),
+        "drag across bands routes nothing"
+    );
+    let stats = rt.band_host_stats();
+    assert_eq!(stats.clicks_routed, 0);
+    assert_eq!(stats.clicks_unclaimed, 1);
+}
+
+#[test]
 fn click_args_encode_as_one_named_table() {
     let table = band_click_args_table(&[
         ("id".to_string(), ClickArg::Number(2.0)),

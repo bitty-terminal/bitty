@@ -949,6 +949,65 @@ impl State {
             .min()
     }
 
+    /// Combined buffer rows `(start, end)` (inclusive) of the last command's
+    /// output, when a complete non-empty range still resolves.
+    ///
+    /// Select-output primitive (CTX-0952, issue #1670): the last
+    /// `OutputStart` (`OSC 133;C`) by arrival order opens the range; the
+    /// first `OutputEnd` (`OSC 133;D`) after it closes the range at the row
+    /// *before* the end mark. The end mark arrives on the row that becomes
+    /// the next prompt (proven traffic shape: `C`, output lines, `D`, `A`,
+    /// prompt text share one cursor row progression), so including that row
+    /// would swallow the next prompt line. With no end mark yet the command
+    /// is still running and the range closes at the cursor row — minus one
+    /// when the cursor sits at column zero of a later line, since that line
+    /// holds no output yet.
+    ///
+    /// Fail-closed (`None`) when no output start resolves (no marks, pruned,
+    /// cleared, resized, or another screen), when the resolved range is
+    /// empty (end before start: zero-byte output, a same-row `C`/`D` pair,
+    /// or the running-command cursor sitting above the start), or when the
+    /// end mark lands on row zero. Unresolvable marks are skipped, never
+    /// returned — like [`Self::prev_prompt_buffer_row`].
+    #[must_use]
+    pub fn last_command_output_rows(&self) -> Option<(usize, usize)> {
+        let (start_ordinal, start) = self
+            .zones
+            .iter()
+            .filter(|r| r.kind == ZoneKind::OutputStart)
+            .filter_map(|r| self.zone_buffer_row(r).map(|row| (r.ordinal, row)))
+            .max_by_key(|(ordinal, _)| *ordinal)?;
+        let end = match self
+            .zones
+            .iter()
+            .filter(|r| r.kind == ZoneKind::OutputEnd && r.ordinal > start_ordinal)
+            .filter_map(|r| self.zone_buffer_row(r).map(|row| (r.ordinal, row)))
+            .min_by_key(|(ordinal, _)| *ordinal)
+        {
+            Some((_, end_mark)) => end_mark.checked_sub(1)?,
+            None => self.live_output_end(start)?,
+        };
+        if end < start {
+            return None;
+        }
+        Some((start, end))
+    }
+
+    /// Closing row for a still-running command whose output starts at
+    /// `start` (combined buffer row): the cursor's combined row, minus one
+    /// when the cursor sits at column zero of a later line (a fresh line
+    /// with no output on it yet). `None` when the cursor is above `start`.
+    fn live_output_end(&self, start: usize) -> Option<usize> {
+        let cursor_row = (self.cursor.position.row as usize).min(self.height.saturating_sub(1));
+        let cursor_buf = self.scrollback.len() + cursor_row;
+        let end = if self.cursor.position.col == 0 && cursor_buf > start {
+            cursor_buf - 1
+        } else {
+            cursor_buf
+        };
+        if end < start { None } else { Some(end) }
+    }
+
     /// The image store; see `crate::image` for the OQ-008 status.
     ///
     /// Bounded placeholder stub (64 entries, 4096 bytes each) until the

@@ -1527,6 +1527,173 @@ fn prompt_jump_prev_next_strict_and_ordered() {
     assert!(s.check_invariants().is_ok());
 }
 
+fn mark_zone(state: &mut State, kind: ZoneKind) {
+    state.apply(&TerminalAction::OscPromptMark {
+        kind,
+        exit_code: None,
+    });
+}
+
+fn mark_output_end(state: &mut State, exit_code: i32) {
+    state.apply(&TerminalAction::OscPromptMark {
+        kind: ZoneKind::OutputEnd,
+        exit_code: Some(exit_code),
+    });
+}
+
+/// One canonical shell-traffic command block: `A` prompt, command line,
+/// `C` output start, output lines, `D` exit status, `A` next prompt.
+///
+/// Lines end with CR+LF like real shell traffic: bare LF keeps the column,
+/// so a CR is required for each new line to start at column zero.
+fn feed_shell_line(state: &mut State, text: &str) {
+    prints(state, text);
+    state.apply(&TerminalAction::PrintControl(ControlChar(0x0D)));
+    state.apply(&TerminalAction::PrintControl(ControlChar(0x0A)));
+}
+
+fn feed_command(state: &mut State, cmd: &str, output: &[&str], exit_code: i32) {
+    mark_zone(state, ZoneKind::PromptStart);
+    prints(state, cmd);
+    feed_shell_line(state, "");
+    mark_zone(state, ZoneKind::InputStart);
+    prints(state, cmd);
+    feed_shell_line(state, "");
+    mark_zone(state, ZoneKind::OutputStart);
+    for line in output {
+        feed_shell_line(state, line);
+    }
+    mark_output_end(state, exit_code);
+}
+
+fn live_line_text(state: &State, row: usize) -> String {
+    state
+        .live_grid_row(row)
+        .expect("live row")
+        .iter()
+        .filter(|c| !c.spacer)
+        .map(|c| c.glyph)
+        .collect::<String>()
+        .trim_end()
+        .to_string()
+}
+
+#[test]
+fn command_output_range_completed_command() {
+    let mut s = State::new();
+    feed_command(&mut s, "cmd-one", &["out1", "out2"], 0);
+    prints(&mut s, "next$");
+    let (start, end) = s.last_command_output_rows().expect("completed range");
+    assert_eq!(end - start + 1, 2, "exactly the two output lines");
+    assert_eq!(live_line_text(&s, start), "out1");
+    assert_eq!(live_line_text(&s, end), "out2");
+    // The closing `D` row holds the next prompt, never the output.
+    assert_eq!(live_line_text(&s, end + 1), "next$");
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn command_output_range_last_command_wins() {
+    let mut s = State::new();
+    feed_command(&mut s, "cmd-one", &["old-output"], 0);
+    prints(&mut s, "mid$");
+    feed_command(&mut s, "cmd-two", &["new-a", "new-b", "new-c"], 1);
+    prints(&mut s, "next$");
+    let (start, end) = s.last_command_output_rows().expect("latest range");
+    assert_eq!(end - start + 1, 3);
+    assert_eq!(live_line_text(&s, start), "new-a");
+    assert_eq!(live_line_text(&s, end), "new-c");
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn command_output_range_empty_output_is_none() {
+    let mut s = State::new();
+    mark_zone(&mut s, ZoneKind::PromptStart);
+    prints(&mut s, "true");
+    feed_anchor_line(&mut s, "");
+    mark_zone(&mut s, ZoneKind::OutputStart);
+    // `D` on the same row: zero-byte output, no selectable range.
+    mark_output_end(&mut s, 0);
+    prints(&mut s, "next$");
+    assert_eq!(s.last_command_output_rows(), None);
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn command_output_range_running_closes_at_cursor() {
+    let mut s = State::new();
+    mark_zone(&mut s, ZoneKind::PromptStart);
+    prints(&mut s, "sleep 9");
+    feed_shell_line(&mut s, "");
+    mark_zone(&mut s, ZoneKind::OutputStart);
+    feed_shell_line(&mut s, "partial");
+    // Cursor sits at column zero of a fresh line: that line is excluded.
+    let (start, end) = s.last_command_output_rows().expect("running range");
+    assert_eq!(live_line_text(&s, start), "partial");
+    assert_eq!(start, end);
+    // A partial line under the cursor (no trailing newline) is included.
+    prints(&mut s, "more");
+    let (start2, end2) = s.last_command_output_rows().expect("running range");
+    assert_eq!(start2, start);
+    assert_eq!(end2, start + 1);
+    assert_eq!(live_line_text(&s, end2), "more");
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn command_output_range_no_marks_is_none() {
+    let mut s = State::new();
+    feed_anchor_line(&mut s, "plain output, no integration");
+    assert_eq!(s.last_command_output_rows(), None);
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn command_output_range_end_without_start_is_none() {
+    let mut s = State::new();
+    feed_anchor_line(&mut s, "stray output");
+    mark_output_end(&mut s, 0);
+    assert_eq!(s.last_command_output_rows(), None);
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn command_output_range_tracks_output_into_scrollback() {
+    let mut s = State::new();
+    feed_command(&mut s, "cmd-one", &["kept-a", "kept-b"], 0);
+    prints(&mut s, "next$");
+    let h = s.height();
+    for i in 0..(h + 4) {
+        feed_anchor_line(&mut s, &format!("filler{i:02}"));
+    }
+    assert!(s.scrollback_len() > 0, "output must have scrolled");
+    let (start, end) = s.last_command_output_rows().expect("scrolled range");
+    assert_eq!(end - start + 1, 2);
+    assert!(end < s.scrollback_len(), "range is now history");
+    let sb = |row: usize| history_line_text(&s, row);
+    assert_eq!(sb(start), "kept-a");
+    assert_eq!(sb(end), "kept-b");
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn command_output_range_pruned_is_none() {
+    let mut s = State::with_scrollback_lines(4);
+    feed_command(&mut s, "cmd-one", &["doomed"], 0);
+    assert!(s.last_command_output_rows().is_some());
+    let h = s.height();
+    for i in 0..(h + 16) {
+        feed_anchor_line(&mut s, &format!("churn{i:02}"));
+    }
+    assert_eq!(
+        s.last_command_output_rows(),
+        None,
+        "pruned output must fail closed"
+    );
+    assert!(s.check_invariants().is_ok());
+}
+
 #[test]
 fn zone_anchor_hash_deterministic_across_identical_states() {
     let mut a = State::new();

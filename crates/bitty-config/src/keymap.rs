@@ -760,6 +760,31 @@ pub enum ChromeAction {
     // Core policy; their namespace moves to W-138 with the plugins
     // (search@e65bf83, copy-mode@7410a3e), so the retired spellings fail
     // closed as unknown here.
+    /// Jump the focused viewport to the previous shell prompt
+    /// (`jump_to_prompt:prev`, CTX-0952 issue #1670).
+    ///
+    /// One prompt per gesture over the retained `OSC 133;A` zone anchors;
+    /// the target lands at the viewport top. Fail-closed no-op with no
+    /// resolvable prompt above (never a panic, never a mis-jump).
+    /// Default `shift+alt+pageup`: the `Mod+Shift+Up/Down` shape the issue
+    /// suggests is unavailable — `shift+alt+arrows` already creates splits
+    /// and `shift+ctrl+arrows` already resizes under the single-owner rule
+    /// (ghostty's Linux `shift+ctrl+arrows` default collides here) — so the
+    /// page keys carry the gesture with the Mod slot for the Super flip.
+    JumpToPromptPrev,
+    /// Jump the focused viewport to the next shell prompt
+    /// (`jump_to_prompt:next`, CTX-0952 issue #1670).
+    ///
+    /// Mirror of [`Self::JumpToPromptPrev`] toward live. Default
+    /// `shift+alt+pagedown` (same arrow-collision rationale).
+    JumpToPromptNext,
+    /// Select exactly the last command's output (`select_command_output`,
+    /// CTX-0952 issue #1670).
+    ///
+    /// Covers the rows between the last `OSC 133;C` mark and the next
+    /// prompt (ghostty `selectOutput` shape); empty or absent marks select
+    /// nothing. Default `alt+o` (mnemonic: output; carries the Mod slot).
+    SelectCommandOutput,
     /// Toggle the command palette overlay (`toggle_palette`, CTX-0647 issue #1003).
     ///
     /// Manual open only: this action is never in [`DEFAULT_KEYMAPS`], so a
@@ -915,6 +940,26 @@ impl ChromeAction {
                 let n = require_workspace_index(arg, trimmed)?;
                 Ok(Self::WorkspaceSwap(n))
             }
+            "jump_to_prompt" => match arg {
+                Some("prev") | Some("previous") | Some("up") => Ok(Self::JumpToPromptPrev),
+                Some("next") | Some("down") => Ok(Self::JumpToPromptNext),
+                _ => Err(ConfigError::validation(
+                    "keymaps[].action",
+                    format!("action '{trimmed}' needs a direction (e.g. 'jump_to_prompt:prev')"),
+                )),
+            },
+            "jump_to_prompt_prev" | "prompt_prev" => {
+                reject_arg(arg, trimmed)?;
+                Ok(Self::JumpToPromptPrev)
+            }
+            "jump_to_prompt_next" | "prompt_next" => {
+                reject_arg(arg, trimmed)?;
+                Ok(Self::JumpToPromptNext)
+            }
+            "select_command_output" | "select_output" => {
+                reject_arg(arg, trimmed)?;
+                Ok(Self::SelectCommandOutput)
+            }
             "toggle_palette" | "open_palette" | "palette_toggle" => {
                 reject_arg(arg, trimmed)?;
                 Ok(Self::TogglePalette)
@@ -959,6 +1004,9 @@ impl ChromeAction {
             Self::WorkspaceFocus(n) => format!("workspace_focus:{n}"),
             Self::WorkspaceMove(n) => format!("workspace_move:{n}"),
             Self::WorkspaceSwap(n) => format!("workspace_swap:{n}"),
+            Self::JumpToPromptPrev => "jump_to_prompt:prev".to_string(),
+            Self::JumpToPromptNext => "jump_to_prompt:next".to_string(),
+            Self::SelectCommandOutput => "select_command_output".to_string(),
             Self::TogglePalette => "toggle_palette".to_string(),
         }
     }
@@ -969,7 +1017,7 @@ impl ChromeAction {
 /// W-144 (CTX-0937): the search/copy-mode policy actions retired with the
 /// Core policy; their namespace moves to W-138 with the plugins (CTX-0003),
 /// so the retired spellings fail closed as unknown here.
-const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, new_panel, resize_split:<left|right|up|down>, close_view, toggle_zoom, toggle_help, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, fold_toggle, fold_expand, fold_collapse, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_focus:<1..=16>, workspace_move:<1..=16>, workspace_swap:<1..=16>, toggle_palette";
+const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, new_panel, resize_split:<left|right|up|down>, close_view, toggle_zoom, toggle_help, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, fold_toggle, fold_expand, fold_collapse, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_focus:<1..=16>, workspace_move:<1..=16>, workspace_swap:<1..=16>, jump_to_prompt:<prev|next>, select_command_output, toggle_palette";
 
 /// Require a `<head>:<dir>` argument.
 fn require_dir_arg(arg: Option<&str>, raw: &str) -> Result<SplitDir, ConfigError> {
@@ -1301,6 +1349,18 @@ pub const DEFAULT_KEYMAPS: &[(&str, &str)] = &[
     // the Core policy (`ctrl+shift+space` entered copy mode, `ctrl+shift+f`
     // opened search). Both chords are shell input again until the plugins
     // (CTX-0003, W-138 namespace) rebind them.
+    // CTX-0952 semantic prompt navigation (issue #1670): `shift+alt+pageup`
+    // jumps to the previous prompt, `shift+alt+pagedown` to the next
+    // (one prompt per gesture, target at viewport top), `alt+o` selects
+    // exactly the last command's output. The issue's `Mod+Shift+Up/Down`
+    // suggestion collides under the single-owner rule (`shift+alt+arrows`
+    // create splits, `shift+ctrl+arrows` resize), so the free page keys
+    // carry the gesture; every entry carries the Mod slot so a Super flip
+    // rebinds the whole gesture. Bare arrows, `alt+o` unmodified, and
+    // `pageup`/`pagedown` alone stay shell input.
+    ("shift+alt+pageup", "jump_to_prompt:prev"),
+    ("shift+alt+pagedown", "jump_to_prompt:next"),
+    ("alt+o", "select_command_output"),
 ];
 
 /// Build the shipped defaults against one [`ModKey`] (CTX-0236).
@@ -2383,6 +2443,81 @@ mod tests {
     }
 
     #[test]
+    fn prompt_nav_actions_parse_and_ship_documented_defaults() {
+        // CTX-0952 (issue #1670): prompt-jump and select-output verbs parse
+        // (arg form plus explicit aliases), canonicalize to the arg form,
+        // and ship the documented default chords.
+        for (raw, want) in [
+            ("jump_to_prompt:prev", ChromeAction::JumpToPromptPrev),
+            ("jump_to_prompt:previous", ChromeAction::JumpToPromptPrev),
+            ("jump_to_prompt:up", ChromeAction::JumpToPromptPrev),
+            ("jump_to_prompt_prev", ChromeAction::JumpToPromptPrev),
+            ("prompt_prev", ChromeAction::JumpToPromptPrev),
+            ("jump_to_prompt:next", ChromeAction::JumpToPromptNext),
+            ("jump_to_prompt:down", ChromeAction::JumpToPromptNext),
+            ("jump_to_prompt_next", ChromeAction::JumpToPromptNext),
+            ("prompt_next", ChromeAction::JumpToPromptNext),
+            ("select_command_output", ChromeAction::SelectCommandOutput),
+            ("select_output", ChromeAction::SelectCommandOutput),
+        ] {
+            assert_eq!(ChromeAction::parse(raw).expect("parses"), want, "raw {raw}");
+        }
+        assert_eq!(
+            ChromeAction::JumpToPromptPrev.canonical(),
+            "jump_to_prompt:prev"
+        );
+        assert_eq!(
+            ChromeAction::JumpToPromptNext.canonical(),
+            "jump_to_prompt:next"
+        );
+        assert_eq!(
+            ChromeAction::SelectCommandOutput.canonical(),
+            "select_command_output"
+        );
+        // Direction is required and rejected otherwise.
+        assert!(ChromeAction::parse("jump_to_prompt").is_err());
+        assert!(ChromeAction::parse("jump_to_prompt:sideways").is_err());
+        assert!(ChromeAction::parse("jump_to_prompt_prev:1").is_err());
+        assert!(ChromeAction::parse("select_command_output:x").is_err());
+        // Shipped defaults resolve each action exactly once.
+        let maps = default_keymaps().expect("defaults valid");
+        let prev: Vec<_> = maps
+            .iter()
+            .filter(|m| m.action == ChromeAction::JumpToPromptPrev)
+            .collect();
+        let next: Vec<_> = maps
+            .iter()
+            .filter(|m| m.action == ChromeAction::JumpToPromptNext)
+            .collect();
+        let select: Vec<_> = maps
+            .iter()
+            .filter(|m| m.action == ChromeAction::SelectCommandOutput)
+            .collect();
+        assert_eq!(prev.len(), 1);
+        assert_eq!(prev[0].chord.canonical(), "alt+shift+pageup");
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].chord.canonical(), "alt+shift+pagedown");
+        assert_eq!(select.len(), 1);
+        assert_eq!(select[0].chord.canonical(), "alt+o");
+        // Bare arrows, bare page keys, and bare letters stay shell input:
+        // no shipped default binds them (chords parse, but nothing in the
+        // table claims them, so they fall through to the PTY).
+        for chord in ["up", "down", "pageup", "pagedown"] {
+            let bare = Chord::parse(chord).expect("bare named key parses");
+            assert!(
+                !maps.iter().any(|m| m.chord == bare),
+                "no default may bind bare {chord}"
+            );
+        }
+        assert!(Chord::parse("o").is_err(), "bare letters need a modifier");
+        assert!(
+            KNOWN_ACTIONS_HINT.contains("jump_to_prompt:<prev|next>"),
+            "fail-closed hint must name the prompt verbs"
+        );
+        assert!(KNOWN_ACTIONS_HINT.contains("select_command_output"));
+    }
+
+    #[test]
     fn defaults_alt_number_jump_and_page_and_zoom() {
         // CTX-0178 Alt-as-Mod: fresh config jumps, pages, and zooms.
         // CTX-0257: alt+1..=9 jumps WORKSPACES now (DEC-0034); pane-number
@@ -2542,15 +2677,17 @@ mod tests {
         // (W-144 retired the CTX-0384 copy-mode chord and the CTX-0383
         // search chord), plus CTX-0766's 1 new workspace chord (alt+t;
         // alt+n becomes new-panel) = 89 total, plus issue #1444's 1
-        // close-view chord (alt+d) = 90 total, and the full DEC
+        // close-view chord (alt+d) = 90 total, plus CTX-0952's 3 prompt
+        // chords (shift+alt+pageup/pagedown + alt+o) = 93 total,
+        // and the full DEC
         // set resolves. Zoom chords carry
         // no `alt`, so they must stay unique under Alt and Super alike.
         for mod_key in [ModKey::Alt, ModKey::Super] {
             let maps = default_keymaps_with_mod(mod_key).expect("defaults valid");
             assert_eq!(
                 maps.len(),
-                90,
-                "35 shipped + 4 workspace-entry chords + 4 resize chords + 16 arrow aliases + 7 zoom chords + 9 move chords + 9 swap chords + 4 help chords + 1 CTX-0766 rechord + 1 issue-1444 close-view (W-144 retired copy-mode + search)"
+                93,
+                "35 shipped + 4 workspace-entry chords + 4 resize chords + 16 arrow aliases + 7 zoom chords + 9 move chords + 9 swap chords + 4 help chords + 1 CTX-0766 rechord + 1 issue-1444 close-view + 3 CTX-0952 prompt chords (W-144 retired copy-mode + search)"
             );
             let mut seen = std::collections::HashSet::new();
             for m in &maps {
@@ -3287,14 +3424,14 @@ mod tests {
             let defaults = default_keymaps_with_mod(mod_key).expect("defaults valid");
             assert_eq!(
                 defaults.len(),
-                90,
-                "no new shipped defaults under mod {:?}",
+                93,
+                "no new shipped defaults under mod {:?} (90 + 3 CTX-0952 prompt chords)",
                 mod_key
             );
             let maps = resolve_keymaps(&mk_effective(mod_key)).expect("resolves");
             assert_eq!(
                 maps.len(),
-                90 + entries.len(),
+                93 + entries.len(),
                 "explicit binds append, never shadow, under mod {:?}",
                 mod_key
             );

@@ -313,6 +313,11 @@ impl Runtime {
     /// [`Self::workspace_summaries`] and the existing `workspace.changed`
     /// diff — no panel capability is involved.
     ///
+    /// When the parked leaf owns the primary shell, ownership moves to the
+    /// surviving focus (a parked leaf paints nothing) and is recorded in
+    /// `scratchpad_primary_owner` so [`Self::scratchpad_show`] can hand it
+    /// back (CodeRabbit #1671).
+    ///
     /// Fail-closed with state untouched: occupied slot, unknown id, a
     /// rejected mode stamp, or hiding the live layout's last leaf (an empty
     /// live layout would strand focus and present).
@@ -323,11 +328,17 @@ impl Runtime {
         self.scratchpad
             .hide(&mut self.layout, id)
             .map_err(|error| error.to_string())?;
+        self.scratchpad_primary_owner = (self.primary_view == Some(id)).then_some(id);
         self.after_scratchpad_move(Some(id));
         Ok(())
     }
 
     /// Restore the parked leaf beside its anchor and focus it (CTX-0954).
+    ///
+    /// When the parked leaf owned the primary shell at hide time, ownership
+    /// returns to it before the geometry sync, so it paints the primary grid
+    /// and routes input to it again instead of rendering erased and
+    /// buffering headless (CodeRabbit #1671).
     ///
     /// Returns the restored leaf id. Fail-closed with state untouched when
     /// nothing is parked or the mode gate rejects the restore.
@@ -337,6 +348,10 @@ impl Runtime {
             .show(&mut self.layout)
             .map_err(|error| error.to_string())?;
         self.focus = Focus::with_focus(id);
+        if self.scratchpad_primary_owner == Some(id) {
+            self.primary_view = Some(id);
+        }
+        self.scratchpad_primary_owner = None;
         self.after_scratchpad_move(None);
         Ok(id)
     }
@@ -1700,6 +1715,10 @@ mod tests {
     // `#[cfg(unix)]`); without the gate the import is unused on Windows.
     #[cfg(unix)]
     use bitty_test_support::require_pty;
+    // Marker glyphs for the primary-grid paint checks (same gate: only the
+    // live-shell scratchpad tests below print into the primary grid).
+    #[cfg(unix)]
+    use bitty_vt::GraphemeCell;
 
     fn fresh() -> Runtime {
         Runtime::with_defaults().expect("defaults must build headless")
@@ -2715,5 +2734,138 @@ mod tests {
         );
         assert!(!rt.scratchpad_occupied());
         assert_eq!(rt.focused_view(), Some(only));
+    }
+
+    /// Whether the first grid row of `view`'s tile carries glyph ink.
+    ///
+    /// CodeRabbit #1671 helper: scans the marker columns (grid cols 0..2 of
+    /// row 0) of the leaf content rect for non-background pixels. The two
+    /// marker prints leave the cursor at col 2, so the window excludes the
+    /// caret on either leaf.
+    #[cfg(unix)]
+    fn leaf_row_has_ink(rt: &Runtime, view: ViewId) -> bool {
+        let rgba = rt.headless_rgba().expect("headless rgba");
+        let extent = rt.present_plan_extent();
+        let (w, h) = (extent.width as usize, extent.height as usize);
+        assert_eq!(rgba.len(), w * h * 4);
+        let bg = [rgba[0], rgba[1], rgba[2], rgba[3]];
+        let frame = rt
+            .present_frames()
+            .into_iter()
+            .find(|frame| frame.view == view)
+            .expect("frame for leaf");
+        let pad = rt.window_padding_physical() as usize;
+        let cell = rt.live_cell_metrics();
+        let x0 = pad.saturating_add(frame.content.x.max(0) as usize);
+        let y0 = pad.saturating_add(frame.content.y.max(0) as usize);
+        let x1 = (x0 + 2 * cell.width as usize).min(w);
+        let y1 = (y0 + cell.height as usize).min(h);
+        (y0..y1).any(|y| (x0..x1).any(|x| rgba[(y * w + x) * 4..(y * w + x) * 4 + 4] != bg))
+    }
+
+    /// Two leaves with the primary shell attached on the focused first one.
+    ///
+    /// CodeRabbit #1671 setup: returns the runtime plus `(owner, other)`.
+    /// Prints a two-glyph marker into the primary grid for the paint checks.
+    /// Callers run [`require_pty`] first (the macro returns from `#[test]`
+    /// bodies only, so it cannot live in this tuple-returning helper).
+    #[cfg(unix)]
+    fn primary_attached_pair() -> (Runtime, ViewId, ViewId) {
+        let mut rt = fresh();
+        let owner = rt.focused_view().expect("focus");
+        let other = ViewId::new(2);
+        let leaf = rt.layout().find_leaf(owner).cloned().expect("leaf");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(leaf),
+            LayoutNode::leaf(View::new(other, 40, 24)),
+        ));
+        assert!(rt.set_focus(owner));
+        rt.spawn_shell("/bin/sh")
+            .expect("primary must attach headless");
+        assert_eq!(rt.primary_view(), Some(owner));
+        for c in ['H', 'i'] {
+            rt.state
+                .apply(&TerminalAction::Print(GraphemeCell::from(c)));
+        }
+        (rt, owner, other)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn scratchpad_show_restores_primary_ownership_to_parked_owner() {
+        // CodeRabbit #1671: hiding the primary owner moves ownership to the
+        // survivor (the shell stays reachable through it); showing hands
+        // ownership back to the returning leaf so it paints the primary grid
+        // and routes input to it instead of rendering erased and buffering
+        // headless.
+        require_pty!();
+        let (mut rt, owner, other) = primary_attached_pair();
+        // Baseline: typing on the session-less owner reaches the shell.
+        assert!(rt.push_input_bytes(b"x"), "owner routes to primary shell");
+        rt.scratchpad_hide(owner).expect("hide owner");
+        assert_eq!(rt.focused_view(), Some(other));
+        assert_eq!(rt.primary_view(), Some(other));
+        assert!(
+            rt.push_input_bytes(b"x"),
+            "survivor keeps the shell reachable"
+        );
+        let restored = rt.scratchpad_show().expect("show");
+        assert_eq!(restored, owner);
+        assert_eq!(rt.focused_view(), Some(owner));
+        assert_eq!(
+            rt.primary_view(),
+            Some(owner),
+            "ownership returns to the parked owner"
+        );
+        assert!(rt.is_primary_view(&owner));
+        assert!(
+            rt.push_input_bytes(b"x"),
+            "restored owner routes to primary shell again"
+        );
+        rt.tick().expect("headless tick presents");
+        assert!(
+            leaf_row_has_ink(&rt, owner),
+            "owner paints the primary grid"
+        );
+        assert!(
+            !leaf_row_has_ink(&rt, other),
+            "no grid is duplicated onto the survivor"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn scratchpad_show_keeps_primary_ownership_for_non_owner() {
+        // CodeRabbit #1671, other direction: parking a non-owner leaves
+        // ownership alone, and showing it must not steal ownership. Typing on
+        // the session-less non-owner buffers instead of reaching another
+        // view's shell, and only the owner's tile paints the grid.
+        require_pty!();
+        let (mut rt, owner, other) = primary_attached_pair();
+        assert!(rt.set_focus(other));
+        rt.scratchpad_hide(other).expect("hide non-owner");
+        assert_eq!(rt.primary_view(), Some(owner));
+        let restored = rt.scratchpad_show().expect("show");
+        assert_eq!(restored, other);
+        assert_eq!(rt.focused_view(), Some(other));
+        assert_eq!(
+            rt.primary_view(),
+            Some(owner),
+            "show must not steal ownership"
+        );
+        let buffered = rt.pending_input_len();
+        assert!(
+            !rt.push_input_bytes(b"x"),
+            "non-owner never reaches the shell"
+        );
+        assert_eq!(rt.pending_input_len(), buffered + 1);
+        rt.tick().expect("headless tick presents");
+        assert!(
+            leaf_row_has_ink(&rt, owner),
+            "owner paints the primary grid"
+        );
+        assert!(!leaf_row_has_ink(&rt, other), "non-owner tile stays erased");
     }
 }

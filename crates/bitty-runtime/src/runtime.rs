@@ -521,6 +521,14 @@ pub struct Runtime {
     /// presence on every row, under the existing `workspace.read` grant), so
     /// the bar renders its indicator without any panel capability.
     scratchpad: ScratchpadSlot,
+    /// Primary owner at park time, if the parked leaf owned it (CTX-0954,
+    /// CodeRabbit #1671).
+    ///
+    /// Set by [`Runtime::scratchpad_hide`] when the parked leaf is the
+    /// primary owner; consumed by [`Runtime::scratchpad_show`] to hand
+    /// ownership back to the returning leaf. `None` while the slot is empty
+    /// or the parked leaf never owned the shell.
+    scratchpad_primary_owner: Option<ViewId>,
     /// Monotonic high-water mark of every [`ViewId`] ever installed in a
     /// layout (CTX-0536, issue #923).
     ///
@@ -1509,6 +1517,7 @@ impl Runtime {
             active_workspace: 0,
             workspace_mru: std::collections::VecDeque::new(),
             scratchpad: ScratchpadSlot::new(),
+            scratchpad_primary_owner: None,
             view_id_high_water: 0,
             session_pending: BTreeMap::new(),
             session_primary_cwd: None,
@@ -1739,6 +1748,7 @@ impl Runtime {
             active_workspace: 0,
             workspace_mru: std::collections::VecDeque::new(),
             scratchpad: ScratchpadSlot::new(),
+            scratchpad_primary_owner: None,
             view_id_high_water: 0,
             session_pending: BTreeMap::new(),
             session_primary_cwd: None,

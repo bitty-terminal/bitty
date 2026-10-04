@@ -336,6 +336,12 @@ pub(crate) struct TerminalApp {
     /// Plugin runtime (CTX-0892): owns all plugin VMs, delivers events,
     /// dispatches commands. Kept alive by the app loop.
     pub(crate) plugin_runtime: Option<PluginRuntime>,
+    /// Safe recovery latch (W-103 S-5, CTX-0929): mirrors the process
+    /// `--safe` flag so the composer cutover (and any later plugin-owned
+    /// UX) selects the retained Core path without consulting a VM.
+    /// Production startup sets it from the CLI flag; tests set it
+    /// explicitly. Default false (normal startup).
+    pub(crate) safe_mode: bool,
     /// Previous runtime state for event change detection (CTX-0892).
     /// Updated in place by [`EventTracker::take_changes`] each tick; changes
     /// trigger plugin events.
@@ -381,6 +387,7 @@ impl TerminalApp {
             live_snapshot: None,
             live_workspaces: None,
             plugin_runtime: None,
+            safe_mode: false,
             event_tracker,
         }
     }
@@ -414,6 +421,7 @@ impl TerminalApp {
             live_snapshot: None,
             live_workspaces: None,
             plugin_runtime: None,
+            safe_mode: false,
             event_tracker,
         }
     }
@@ -523,6 +531,59 @@ impl TerminalApp {
     pub(crate) fn with_plugin_runtime(mut self, runtime: Option<PluginRuntime>) -> Self {
         self.plugin_runtime = runtime;
         self
+    }
+
+    /// Sets the safe recovery latch (W-103 S-5, CTX-0929). Production
+    /// startup passes the `--safe` flag; the composer cutover reads it to
+    /// select the retained Core path without consulting a VM.
+    pub(crate) fn with_safe_mode(mut self, safe_mode: bool) -> Self {
+        self.safe_mode = safe_mode;
+        self
+    }
+
+    /// Composer ownership for this input path (W-103 S-5 cutover rule).
+    ///
+    /// The ACTIVE composer plugin owns the editing UX via
+    /// overlay/capture/submit/editor; every other state (safe mode,
+    /// zero-plugin startup, uninstalled, not activated, version or
+    /// capability mismatch) keeps the retained Core edit/submit path.
+    pub(crate) fn composer_owner(&self) -> crate::composer_owner::ComposerOwner {
+        crate::composer_owner::decide_composer_owner(self.safe_mode, self.plugin_runtime.as_ref())
+    }
+
+    /// True when the ACTIVE composer plugin owns the editing UX.
+    pub(crate) fn composer_plugin_owns(&self) -> bool {
+        self.composer_owner().plugin_owns()
+    }
+
+    /// Dispatches one composer session verb to the ACTIVE plugin
+    /// (`<id>:<verb>` via the plugin runtime).
+    ///
+    /// Fails closed with a diagnostic when the plugin does not own the
+    /// editing UX or the dispatch itself fails; the caller falls back to
+    /// the retained Core path.
+    pub(crate) fn dispatch_composer_command(&mut self, verb: &str) -> Result<(), String> {
+        use crate::composer_owner::{COMPOSER_KNOWN_VERBS, COMPOSER_PLUGIN_ID, ComposerOwner};
+        if !COMPOSER_KNOWN_VERBS.contains(&verb) {
+            return Err(format!(
+                "composer verb '{verb}' is not a known composer command"
+            ));
+        }
+        if !self.composer_plugin_owns() {
+            let ComposerOwner::RetainedCore(reason) = self.composer_owner() else {
+                unreachable!("plugin_owns false implies retained");
+            };
+            return Err(reason.diagnostic());
+        }
+        let id = bitty_plugin_host::manifest::PluginId::new(COMPOSER_PLUGIN_ID)
+            .map_err(|error| format!("composer plugin id invalid: {error}"))?;
+        let Some(runtime) = self.plugin_runtime.as_mut() else {
+            return Err(String::from("composer plugin runtime is gone"));
+        };
+        runtime
+            .dispatch_command(&id, verb, &[])
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 
     /// Injects the effective-config Leader binding (CTX-0723 #981).

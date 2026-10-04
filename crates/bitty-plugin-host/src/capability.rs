@@ -115,6 +115,9 @@ impl CapabilityFamily {
                 "terminal.raw-read",
                 "terminal.input.self",
                 "terminal.input.all",
+                // W-82 additive v2 (CTX-0929 S-5): bounded PTY submission
+                // through the Core paste pipeline.
+                "terminal.input.submit",
                 "terminal.manage",
             ],
             Self::Ui => &[
@@ -126,7 +129,11 @@ impl CapabilityFamily {
             Self::Clipboard => &["clipboard.read", "clipboard.write"],
             Self::Env => &["env.read"],
             Self::Fs => &["fs.read", "fs.write"],
-            Self::Process => &["process.spawn"],
+            // W-82 additive v2 (CTX-0929 S-5): `process.editor` is the
+            // allowlisted external-editor round trip (no parameter; the
+            // editor program is allowlist-resolved by Core). It shares the
+            // Process family with the parameterized `process.spawn`.
+            Self::Process => &["process.editor", "process.spawn"],
             Self::Network => &["network.connect"],
             Self::Runtime => &[
                 "runtime.inspect",
@@ -347,6 +354,9 @@ pub fn effect_statement(id: &CapabilityId) -> &'static str {
         "terminal.raw-read" => "Read raw terminal bytes and full cell grid (high-risk)",
         "terminal.input.self" => "Observe input directed to this plugin's own terminals",
         "terminal.input.all" => "Observe all terminal input (high-risk)",
+        "terminal.input.submit" => {
+            "Submit bounded text to the focused panel through the paste pipeline"
+        }
         "terminal.manage" => "Create and manage terminals",
         "ui.rich" => "Render rich blocks in the terminal",
         "ui.overlay" => "Show overlays and popups",
@@ -358,6 +368,9 @@ pub fn effect_statement(id: &CapabilityId) -> &'static str {
         "fs.read" => "Read files matching the declared globs",
         "fs.write" => "Write files matching the declared globs",
         "process.spawn" => "Spawn the allowlisted program",
+        "process.editor" => {
+            "Edit text in the allowlisted external editor on a Core-owned temp file"
+        }
         "network.connect" => "Connect to the declared destination",
         "runtime.inspect" => "Inspect runtime state",
         "runtime.configure" => "Change runtime configuration",
@@ -498,22 +511,22 @@ mod tests {
         for family in families {
             assert!(family.denied_without_grant());
             for raw in family.closed_identifiers() {
-                let parsed = CapabilityId::parse(raw);
-                if matches!(
-                    family,
-                    CapabilityFamily::Fs
-                        | CapabilityFamily::Process
-                        | CapabilityFamily::Network
-                        | CapabilityFamily::Mcp
-                        | CapabilityFamily::Env
-                ) || *raw == "agent.memory"
+                // Bare heads parse exactly when no parameter is required;
+                // parameterized heads (for example `process.spawn`) fail
+                // bare and parse with a parameter. The Process family holds
+                // both shapes since W-82 (`process.editor` takes no
+                // parameter; the temp path never leaves Core).
+                if bitty_package::manifest::capability_requires_param(raw) || *raw == "agent.memory"
                 {
                     assert!(
-                        parsed.is_err(),
-                        "scoped family must require a parameter: {raw}"
+                        CapabilityId::parse(raw).is_err(),
+                        "scoped capability must require a parameter: {raw}"
                     );
                 } else {
-                    assert!(parsed.is_ok(), "closed identifier must parse: {raw}");
+                    assert!(
+                        CapabilityId::parse(raw).is_ok(),
+                        "closed identifier must parse: {raw}"
+                    );
                 }
             }
         }
@@ -523,6 +536,34 @@ mod tests {
     fn unknown_capability_rejected() {
         assert!(CapabilityId::parse("terminal.future-thing").is_err());
         assert!(CapabilityId::parse("ui.unknown").is_err());
+    }
+
+    #[test]
+    fn composer_v2_capabilities_parse_without_parameter() {
+        // W-82 additive v2 (CTX-0929 S-5): the composer capabilities are
+        // closed, parameter-free, family-routed, and not high-risk (both
+        // are bounded, attributed operations: lease-gated submit through
+        // the inspected paste pipeline, allowlisted editor on a
+        // Core-owned temp file).
+        for (raw, family, statement) in [
+            (
+                "terminal.input.submit",
+                CapabilityFamily::Terminal,
+                "Submit bounded text to the focused panel through the paste pipeline",
+            ),
+            (
+                "process.editor",
+                CapabilityFamily::Process,
+                "Edit text in the allowlisted external editor on a Core-owned temp file",
+            ),
+        ] {
+            let granted = CapabilityId::parse(raw).expect("v2 composer capability parses");
+            assert_eq!(granted.family(), family);
+            assert!(!granted.has_param());
+            assert!(!granted.is_high_risk());
+            assert_eq!(effect_statement(&granted), statement);
+            assert!(CapabilityId::parse(&format!("{raw}:param")).is_err());
+        }
     }
 
     #[test]

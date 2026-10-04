@@ -954,17 +954,46 @@ impl TerminalApp {
                 }
             }
             A::OpenComposer => {
-                // CTX-0723 (#982): the composer session now opens for real.
-                // Input routing while open lives in `route_cw_modal`
-                // (modal tier, above the user keymap); submit writes one
-                // bracketed frame to the focused PTY; the external-editor
-                // request stays a loud routing flag there (no terminal fd to
-                // lend `$EDITOR` in this GUI root). Still never in defaults:
-                // unbound Alt+E reaches the shell.
-                self.runtime.cw_composer_open();
-                eprintln!(
-                    "bitty: keymap open_composer -> composer open (Enter newline, Ctrl+Enter submit, Esc close, Alt+E editor flag)"
-                );
+                // W-103 S-5 cutover (CTX-0929): an ACTIVE composer plugin
+                // owns the editing UX via overlay/capture/submit/editor, so
+                // the open verb dispatches to the plugin (`<id>:open`) and
+                // typing routes through the transient input-capture client
+                // path below. Every other state (safe mode, zero-plugin
+                // startup, uninstalled, version/capability mismatch) keeps
+                // the retained Core edit/submit path, identical to before.
+                use crate::composer_owner::{COMPOSER_COMMAND_OPEN, ComposerOwner};
+                match self.composer_owner() {
+                    ComposerOwner::Plugin => {
+                        match self.dispatch_composer_command(COMPOSER_COMMAND_OPEN) {
+                            Ok(()) => eprintln!(
+                                "bitty: keymap open_composer -> composer plugin owns editing UX (overlay/capture)"
+                            ),
+                            Err(diagnostic) => {
+                                eprintln!(
+                                    "warning: composer plugin open failed ({diagnostic}) — retained Core composer opens"
+                                );
+                                self.runtime.cw_composer_open();
+                                eprintln!(
+                                    "bitty: keymap open_composer -> composer open (Enter newline, Ctrl+Enter submit, Esc close, Alt+E editor flag)"
+                                );
+                            }
+                        }
+                    }
+                    ComposerOwner::RetainedCore(reason) => {
+                        // CTX-0723 (#982): the composer session now opens for real.
+                        // Input routing while open lives in `route_cw_modal`
+                        // (modal tier, above the user keymap); submit writes one
+                        // bracketed frame to the focused PTY; the external-editor
+                        // request stays a loud routing flag there (no terminal fd to
+                        // lend `$EDITOR` in this GUI root). Still never in defaults:
+                        // unbound Alt+E reaches the shell.
+                        self.runtime.cw_composer_open();
+                        eprintln!(
+                            "bitty: keymap open_composer -> composer open (retained Core fallback: {}; Enter newline, Ctrl+Enter submit, Esc close, Alt+E editor flag)",
+                            reason.code()
+                        );
+                    }
+                }
             }
             A::FoldToggle => self.apply_fold_verb(
                 bitty_runtime::cw_present::CwFoldAction::Toggle,
@@ -1517,6 +1546,16 @@ impl TerminalApp {
             return true;
         }
         if self.runtime.cw_composer_is_open() {
+            // W-103 S-5 cutover (CTX-0929): when the ACTIVE composer plugin
+            // owns the editing UX, the Core-internal session must not shadow
+            // it: typing already routes through the transient input-capture
+            // client path, so this tier stays out of the way. (The plugin
+            // path never opens the Core session; this guard covers the
+            // transition edge.) The retained fallback keeps the existing
+            // modal routing below.
+            if self.composer_plugin_owns() {
+                return false;
+            }
             return self.route_composer_press(key);
         }
         false
@@ -4153,6 +4192,144 @@ mod tests {
         assert_eq!(app.runtime.layout().leaf_ids(), leaves, "layout unchanged");
         assert_eq!(app.runtime.focused_view(), focused, "focus unchanged");
         assert_eq!(app.runtime.help_visible(), help, "help unchanged");
+    }
+
+    #[test]
+    fn composer_cutover_zero_plugin_startup_keeps_retained_open() {
+        // W-103 S-5/E-ADD-4 (CTX-0929): zero-plugin startup keeps the
+        // retained Core edit/submit path: the owner is retained with a
+        // diagnostic, and OpenComposer opens the Core session.
+        use crate::composer_owner::{ComposerOwner, RetainedReason};
+        use bitty_config::ChromeAction;
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let mut app = help_test_app(maps);
+        assert_eq!(
+            app.composer_owner(),
+            ComposerOwner::RetainedCore(RetainedReason::NoPluginRuntime)
+        );
+        assert!(!app.composer_plugin_owns());
+        app.apply_chrome_action(ChromeAction::OpenComposer);
+        assert!(
+            app.runtime.cw_composer_is_open(),
+            "retained Core composer opens with no plugin runtime"
+        );
+    }
+
+    #[test]
+    fn composer_cutover_safe_mode_identical_to_before() {
+        // W-103 S-5/E-ADD-4 (CTX-0929): safe mode is identical to before:
+        // the owner is retained without consulting a VM, and OpenComposer
+        // opens the same Core session with the same routing.
+        use crate::composer_owner::{ComposerOwner, RetainedReason};
+        use bitty_config::ChromeAction;
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let mut app = help_test_app(maps).with_safe_mode(true);
+        assert_eq!(
+            app.composer_owner(),
+            ComposerOwner::RetainedCore(RetainedReason::SafeMode)
+        );
+        app.apply_chrome_action(ChromeAction::OpenComposer);
+        assert!(
+            app.runtime.cw_composer_is_open(),
+            "safe mode opens the retained Core composer"
+        );
+        assert_eq!(
+            app.runtime.cw_input_route(),
+            bitty_runtime::cw_present::CwInputRoute::Composer,
+            "safe-mode routing identical to the retained path"
+        );
+    }
+
+    #[test]
+    fn composer_cutover_dispatch_fails_closed_without_owner() {
+        // W-103 S-5 (CTX-0929): dispatch fails closed with a diagnostic
+        // when no ACTIVE plugin owns the UX, and unknown verbs never
+        // dispatch.
+        use crate::composer_owner::COMPOSER_COMMAND_OPEN;
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let mut app = help_test_app(maps);
+        let error = app
+            .dispatch_composer_command(COMPOSER_COMMAND_OPEN)
+            .expect_err("no owner must fail");
+        assert!(error.contains("bitty-terminal.composer"), "got {error}");
+        let error = app
+            .dispatch_composer_command("definitely-not-a-verb")
+            .expect_err("unknown verb must fail");
+        assert!(
+            error.contains("not a known composer command"),
+            "got {error}"
+        );
+        assert!(
+            !app.runtime.cw_composer_is_open(),
+            "failed dispatch opens nothing"
+        );
+    }
+
+    #[test]
+    fn composer_rollback_drill_uninstall_and_safe_mode_keep_retained_behavior() {
+        // W-103 S-7 (CTX-0929): scripted rollback drill. An ACTIVE composer
+        // plugin owns the UX and answers the open verb; uninstalling it
+        // (runtime detached) falls back to the retained Core composer; a
+        // safe-mode startup behaves identically to before.
+        use crate::composer_owner::{
+            COMPOSER_COMMAND_CLOSE, COMPOSER_COMMAND_OPEN, COMPOSER_PLUGIN_ID,
+            COMPOSER_REQUIRED_CAPABILITIES, ComposerOwner, RetainedReason, fixture,
+        };
+        use bitty_config::ChromeAction;
+        let root = fixture::temp_dir("rollback-drill");
+        fixture::write_plugin(
+            &root,
+            COMPOSER_PLUGIN_ID,
+            ">=0.0.1",
+            COMPOSER_REQUIRED_CAPABILITIES,
+            &[COMPOSER_COMMAND_OPEN, COMPOSER_COMMAND_CLOSE],
+        );
+        let mut plugin_runtime = fixture::runtime_for(vec![root.clone()]);
+        plugin_runtime.discover();
+        let id = bitty_plugin_host::manifest::PluginId::new(COMPOSER_PLUGIN_ID).expect("id");
+        plugin_runtime.activate(&id).expect("activate");
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let mut app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        assert_eq!(app.composer_owner(), ComposerOwner::Plugin);
+        // The plugin path answers the open verb and never shadows a Core
+        // session: no Core-internal modal opens while the plugin owns UX.
+        app.dispatch_composer_command(COMPOSER_COMMAND_OPEN)
+            .expect("active plugin answers open");
+        app.apply_chrome_action(ChromeAction::OpenComposer);
+        assert!(
+            !app.runtime.cw_composer_is_open(),
+            "plugin-owned open must not shadow a Core session"
+        );
+        // Rollback step 1: uninstall (runtime detached) falls back to the
+        // retained Core composer with a diagnostic.
+        app = app.with_plugin_runtime(None);
+        assert_eq!(
+            app.composer_owner(),
+            ComposerOwner::RetainedCore(RetainedReason::NoPluginRuntime)
+        );
+        app.apply_chrome_action(ChromeAction::OpenComposer);
+        assert!(
+            app.runtime.cw_composer_is_open(),
+            "uninstalled plugin falls back to the retained Core composer"
+        );
+        // Rollback step 2: safe-mode startup keeps the retained behavior.
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let mut safe_app = help_test_app(maps).with_safe_mode(true);
+        assert_eq!(
+            safe_app.composer_owner(),
+            ComposerOwner::RetainedCore(RetainedReason::SafeMode)
+        );
+        safe_app.apply_chrome_action(ChromeAction::OpenComposer);
+        assert!(
+            safe_app.runtime.cw_composer_is_open(),
+            "safe-mode startup keeps the retained Core composer"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Hold or release the platform leader modifier for the hint live

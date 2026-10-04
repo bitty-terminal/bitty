@@ -753,6 +753,10 @@ pub enum ChromeAction {
     /// never removes a workspace (last-workspace `>= 1` holds), and never
     /// touches the runtime-global primary PTY.
     WorkspaceMove(u64),
+    /// Swap the current workspace with workspace N or move to workspace N
+    /// if target does not exist (`workspace_swap:<1..=16>`, defaults
+    /// `ctrl+shift+alt+1..=9`, CTX-0945).
+    WorkspaceSwap(u64),
     /// Enter keyboard copy mode (`enter_copy_mode`, CTX-0384 issue #640).
     ///
     /// Vi-style modal scrollback navigation with visual selection plus yank
@@ -942,6 +946,10 @@ impl ChromeAction {
                 let n = require_workspace_index(arg, trimmed)?;
                 Ok(Self::WorkspaceMove(n))
             }
+            "workspace_swap" => {
+                let n = require_workspace_index(arg, trimmed)?;
+                Ok(Self::WorkspaceSwap(n))
+            }
             "enter_copy_mode" | "copy_mode" => {
                 reject_arg(arg, trimmed)?;
                 Ok(Self::EnterCopyMode)
@@ -1009,6 +1017,7 @@ impl ChromeAction {
             Self::WorkspaceLast => "workspace_last".to_string(),
             Self::WorkspaceFocus(n) => format!("workspace_focus:{n}"),
             Self::WorkspaceMove(n) => format!("workspace_move:{n}"),
+            Self::WorkspaceSwap(n) => format!("workspace_swap:{n}"),
             Self::EnterCopyMode => "enter_copy_mode".to_string(),
             Self::OpenSearch => "open_search".to_string(),
             Self::SearchNext => "search_next".to_string(),
@@ -1021,7 +1030,7 @@ impl ChromeAction {
 }
 
 /// Hint listing the accepted action vocabulary.
-const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, new_panel, resize_split:<left|right|up|down>, close_view, toggle_zoom, toggle_help, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, fold_toggle, fold_expand, fold_collapse, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_focus:<1..=16>, workspace_move:<1..=16>, enter_copy_mode, open_search, search_next, search_prev, close_search, search_toggle_case, toggle_palette";
+const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, new_panel, resize_split:<left|right|up|down>, close_view, toggle_zoom, toggle_help, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, fold_toggle, fold_expand, fold_collapse, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_focus:<1..=16>, workspace_move:<1..=16>, workspace_swap:<1..=16>, enter_copy_mode, open_search, search_next, search_prev, close_search, search_toggle_case, toggle_palette";
 
 /// Require a `<head>:<dir>` argument.
 fn require_dir_arg(arg: Option<&str>, raw: &str) -> Result<SplitDir, ConfigError> {
@@ -1256,6 +1265,17 @@ pub const DEFAULT_KEYMAPS: &[(&str, &str)] = &[
     ("shift+alt+7", "workspace_move:7"),
     ("shift+alt+8", "workspace_move:8"),
     ("shift+alt+9", "workspace_move:9"),
+    // Mod+Ctrl+Shift+Number swap workspace or move workspace to target (CTX-0945):
+    // `ctrl+shift+alt+1..=9` swaps current workspace with target N or moves to N.
+    ("ctrl+shift+alt+1", "workspace_swap:1"),
+    ("ctrl+shift+alt+2", "workspace_swap:2"),
+    ("ctrl+shift+alt+3", "workspace_swap:3"),
+    ("ctrl+shift+alt+4", "workspace_swap:4"),
+    ("ctrl+shift+alt+5", "workspace_swap:5"),
+    ("ctrl+shift+alt+6", "workspace_swap:6"),
+    ("ctrl+shift+alt+7", "workspace_swap:7"),
+    ("ctrl+shift+alt+8", "workspace_swap:8"),
+    ("ctrl+shift+alt+9", "workspace_swap:9"),
     ("alt+u", "scroll_page_down"),
     ("alt+i", "scroll_page_up"),
     ("ctrl+alt+left", "goto_split:left"),
@@ -2555,8 +2575,8 @@ mod tests {
             let maps = default_keymaps_with_mod(mod_key).expect("defaults valid");
             assert_eq!(
                 maps.len(),
-                83,
-                "35 shipped + 4 workspace-entry chords + 4 resize chords + 16 arrow aliases + 7 zoom chords + 9 move chords + 4 help chords + 1 copy-mode chord + 1 search chord + 1 CTX-0766 rechord + 1 issue-1444 close-view"
+                92,
+                "35 shipped + 4 workspace-entry chords + 4 resize chords + 16 arrow aliases + 7 zoom chords + 9 move chords + 9 swap chords + 4 help chords + 1 copy-mode chord + 1 search chord + 1 CTX-0766 rechord + 1 issue-1444 close-view"
             );
             let mut seen = std::collections::HashSet::new();
             for m in &maps {
@@ -3292,14 +3312,14 @@ mod tests {
             let defaults = default_keymaps_with_mod(mod_key).expect("defaults valid");
             assert_eq!(
                 defaults.len(),
-                83,
+                92,
                 "no new shipped defaults under mod {:?}",
                 mod_key
             );
             let maps = resolve_keymaps(&mk_effective(mod_key)).expect("resolves");
             assert_eq!(
                 maps.len(),
-                83 + entries.len(),
+                92 + entries.len(),
                 "explicit binds append, never shadow, under mod {:?}",
                 mod_key
             );

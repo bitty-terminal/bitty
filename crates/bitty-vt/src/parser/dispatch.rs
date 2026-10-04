@@ -709,6 +709,8 @@ impl<F: FnMut(TerminalAction)> Perform for Bridge<'_, F> {
                     _ => self.unknown_csi(intermediates, final_byte),
                 };
             }
+            b's' => self.emit(TerminalAction::CursorSave),
+            b'u' => self.emit(TerminalAction::CursorRestore),
             _ => self.unknown_csi(intermediates, final_byte),
         }
     }

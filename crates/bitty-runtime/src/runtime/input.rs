@@ -705,12 +705,11 @@ impl Runtime {
         // `clear_selection` so `pending_full_redraw` forces the next tick to
         // present without the highlight — never a frame late. Modifier-only
         // and synthetic events never clear; releases never clear.
-        if event.state == PressState::Pressed
-            && !event.is_synthetic
-            && !is_modifier
-            && self.selection_state.is_some()
-        {
-            self.clear_selection();
+        if event.state == PressState::Pressed && !event.is_synthetic && !is_modifier {
+            if self.selection_state.is_some() {
+                self.clear_selection();
+            }
+            self.click_tracker.reset();
         }
         // CTX-0186/CTX-0475: Esc cancels a pending confirmation gate (paste /
         // workspace close / view close) and is consumed there so the dismissal
@@ -831,12 +830,11 @@ impl Runtime {
         }
         // CTX-0166: any real non-modifier key press clears the selection
         // highlight (see owned path). Additive only; range logic untouched.
-        if event.state == PressState::Pressed
-            && !event.is_synthetic
-            && !is_modifier
-            && self.selection_state.is_some()
-        {
-            self.clear_selection();
+        if event.state == PressState::Pressed && !event.is_synthetic && !is_modifier {
+            if self.selection_state.is_some() {
+                self.clear_selection();
+            }
+            self.click_tracker.reset();
         }
         // CTX-0186/CTX-0475: scoped Esc cancel (see owned path).
         if self.cancel_pending_on_escape(event) {
@@ -962,13 +960,13 @@ impl Runtime {
     /// Split out of [`Self::push_input_bytes_multipane`] so a Kitty key
     /// *release* frame can reuse the identical routing while skipping the
     /// snap: a release carries no new output, so it must not yank a
-    /// viewport the user scrolled into history.
     ///
     /// Returns whether the bytes reached a live PTY writer (`true`) or were
     /// only buffered headless (`false`, session-less non-primary leaf or no
     /// live writer at all).
     fn route_input_bytes(&mut self, bytes: &[u8]) -> bool {
-        match self.focus.focused() {
+        let focused = self.focus.focused().or(self.primary_view);
+        match focused {
             Some(focused) => {
                 if let Some(sess) = self.pane_sessions.get_mut(&focused) {
                     let (dropped, flush_failed) = write_input_best_effort(&mut sess.writer, bytes);

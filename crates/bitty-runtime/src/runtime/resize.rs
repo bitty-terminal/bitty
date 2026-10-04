@@ -34,8 +34,14 @@ impl Runtime {
     /// changes never compound rounding (each rescale starts from the design
     /// cell instead of re-scaling the previous scaled cell).
     pub(super) fn base_cell_metrics(&self) -> CellMetrics {
-        CellMetrics::new(self.config.cell_width, self.config.cell_height)
-            .expect("validated config guarantees non-zero cell metrics")
+        let ratio = if self.base_font_size > 0.0 && self.config.font_size > 0.0 {
+            (self.config.font_size / self.base_font_size) as f64
+        } else {
+            1.0
+        };
+        let scaled_w = ((self.config.cell_width as f64 * ratio).round() as u32).max(1);
+        let scaled_h = ((self.config.cell_height as f64 * ratio).round() as u32).max(1);
+        CellMetrics::new(scaled_w, scaled_h).expect("scaled cell metrics are at least 1x1")
     }
 
     /// Base font query from the validated config.

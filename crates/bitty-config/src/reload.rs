@@ -1300,14 +1300,14 @@ mod tests {
         // CTX-0260: flipping hover-focus must surface as a restart-required
         // diff (chrome is adopted at startup into RuntimeConfig).
         let old = EffectiveConfig::default();
-        assert!(!old.mouse.focus_follows_mouse);
+        assert!(old.mouse.focus_follows_mouse);
         assert_eq!(
             classify_field("mouse.focus_follows_mouse"),
             ReloadClass::RestartRequired
         );
         assert_eq!(classify_field("mouse"), ReloadClass::RestartRequired);
         let mut new = old.clone();
-        new.mouse.focus_follows_mouse = true;
+        new.mouse.focus_follows_mouse = false;
         let r = diff(&old, &new);
         assert_eq!(r.overall, ReloadClass::RestartRequired);
         assert!(r.needs_restart);

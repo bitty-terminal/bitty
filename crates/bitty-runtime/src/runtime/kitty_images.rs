@@ -309,11 +309,25 @@ impl Runtime {
             let effective_cols = if cols_c > 0 { cols_c } else { placement.cols };
             let effective_rows = if rows_r > 0 { rows_r } else { placement.rows };
             let new_col = cursor.col.saturating_add(effective_cols);
-            let new_row = cursor.row.saturating_add(effective_rows);
-            self.state.apply(&bitty_vt::TerminalAction::CursorPosition {
-                row: bitty_vt::Row(new_row),
-                col: bitty_vt::Col(new_col),
-            });
+            let target_row = cursor.row.saturating_add(effective_rows);
+            let max_row = (self.state.height() as u16).saturating_sub(1);
+            if target_row > max_row {
+                let overflow = target_row - max_row;
+                for _ in 0..overflow {
+                    self.state.apply(&bitty_vt::TerminalAction::PrintControl(
+                        bitty_vt::ControlChar(0x0A),
+                    ));
+                }
+                self.state.apply(&bitty_vt::TerminalAction::CursorPosition {
+                    row: bitty_vt::Row(max_row),
+                    col: bitty_vt::Col(new_col),
+                });
+            } else {
+                self.state.apply(&bitty_vt::TerminalAction::CursorPosition {
+                    row: bitty_vt::Row(target_row),
+                    col: bitty_vt::Col(new_col),
+                });
+            }
         }
 
         Ok(KittyDisplayOutcome::Displayed {
@@ -386,11 +400,25 @@ impl Runtime {
             let effective_cols = if cols_c > 0 { cols_c } else { placement.cols };
             let effective_rows = if rows_r > 0 { rows_r } else { placement.rows };
             let new_col = cursor.col.saturating_add(effective_cols);
-            let new_row = cursor.row.saturating_add(effective_rows);
-            self.state.apply(&bitty_vt::TerminalAction::CursorPosition {
-                row: bitty_vt::Row(new_row),
-                col: bitty_vt::Col(new_col),
-            });
+            let target_row = cursor.row.saturating_add(effective_rows);
+            let max_row = (self.state.height() as u16).saturating_sub(1);
+            if target_row > max_row {
+                let overflow = target_row - max_row;
+                for _ in 0..overflow {
+                    self.state.apply(&bitty_vt::TerminalAction::PrintControl(
+                        bitty_vt::ControlChar(0x0A),
+                    ));
+                }
+                self.state.apply(&bitty_vt::TerminalAction::CursorPosition {
+                    row: bitty_vt::Row(max_row),
+                    col: bitty_vt::Col(new_col),
+                });
+            } else {
+                self.state.apply(&bitty_vt::TerminalAction::CursorPosition {
+                    row: bitty_vt::Row(target_row),
+                    col: bitty_vt::Col(new_col),
+                });
+            }
         }
 
         Ok(KittyDisplayOutcome::Displayed {

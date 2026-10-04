@@ -310,7 +310,7 @@ impl Runtime {
                 } else {
                     ""
                 };
-                format!("{}:{}{}", idx + 1, truncate_ws_name(&slot.name), mark)
+                format!("{}:{}{}", slot.seq, truncate_ws_name(&slot.name), mark)
             })
             .collect()
     }
@@ -708,6 +708,42 @@ impl Runtime {
         self.workspace_mru.push_front(index);
     }
 
+    /// Sort workspaces in place by their creation sequence while preserving
+    /// active workspace and MRU order.
+    pub(super) fn sort_workspaces_by_seq(&mut self) {
+        if self.workspaces.len() <= 1 {
+            return;
+        }
+        let active_seq = self.workspaces.get(self.active_workspace).map(|s| s.seq);
+        let mru_seqs: Vec<u64> = self
+            .workspace_mru
+            .iter()
+            .filter_map(|&i| self.workspaces.get(i).map(|s| s.seq))
+            .collect();
+        let pending_seq = self
+            .pending_ws_close
+            .as_ref()
+            .and_then(|p| self.workspaces.get(p.index).map(|s| s.seq));
+
+        self.workspaces.sort_by_key(|s| s.seq);
+
+        if let Some(seq) = active_seq {
+            self.active_workspace = self.workspace_index_by_seq(seq).unwrap_or(0);
+        }
+        self.workspace_mru = mru_seqs
+            .into_iter()
+            .filter_map(|seq| self.workspace_index_by_seq(seq))
+            .collect();
+        if let Some(mut pending) = self.pending_ws_close.take() {
+            if let Some(seq) = pending_seq {
+                if let Some(idx) = self.workspace_index_by_seq(seq) {
+                    pending.index = idx;
+                    self.pending_ws_close = Some(pending);
+                }
+            }
+        }
+    }
+
     /// Create a fresh workspace and switch to it.
     ///
     /// The new workspace starts as a single leaf. CTX-0359: when the primary
@@ -896,6 +932,10 @@ impl Runtime {
     pub fn workspace_focus_clamped(&mut self, one_based: u64) -> Option<usize> {
         if one_based == 0 || self.workspaces.is_empty() {
             return None;
+        }
+        if let Some(target_idx) = self.workspace_index_by_seq(one_based) {
+            self.workspace_switch(target_idx);
+            return Some(self.active_workspace);
         }
         let index = ((one_based - 1) as usize).min(self.workspaces.len() - 1);
         self.workspace_switch(index);
@@ -1131,14 +1171,17 @@ impl Runtime {
             self.remove_workspace(index);
             return Some(WsCloseRequest::Closed { killed });
         }
+        let seq = self
+            .workspaces
+            .get(index)
+            .map_or(index as u64 + 1, |s| s.seq);
         let name = self
             .workspaces
             .get(index)
             .map(|s| s.name.clone())
             .unwrap_or_default();
         let summary = format!(
-            "Close workspace {}:{} with {live} live shells? (repeat Alt+W=confirm kill Esc=cancel)",
-            index + 1,
+            "Close workspace {seq}:{} with {live} live shells? (repeat Alt+W=confirm kill Esc=cancel)",
             truncate_ws_name(&name),
         );
         self.pending_ws_close = Some(PendingWsClose { index, name, live });
@@ -1257,22 +1300,51 @@ impl Runtime {
         // Mirror the live source into its slot so stashed copies never hold
         // a duplicate of the moved id (ids stay unique across slots).
         self.stash_active_slot();
+        let gaps = self.gaps();
+        let container = self.container;
+        let mode = self.panel_layout_mode;
         // Insert into the target slot (inactive by the early return above).
-        let target_root = self
+        let target_slot = self
             .workspaces
-            .get(index)
-            .map(|s| s.layout.clone())
+            .get_mut(index)
             .ok_or_else(|| String::from("target workspace vanished"))?;
-        let wrapped = LayoutNode::split(
-            crate::SplitAxis::Horizontal,
-            0.5,
-            target_root,
-            LayoutNode::leaf(moved_view),
-        );
-        if let Some(slot) = self.workspaces.get_mut(index) {
-            slot.layout = wrapped;
-            slot.focus = Focus::with_focus(focused);
+        let target_focused = target_slot.focus.focused();
+        let allocations = target_slot.layout.layout_with_gaps(container, gaps);
+        let sibling_rect = target_focused
+            .and_then(|id| {
+                allocations
+                    .iter()
+                    .find(|(leaf_id, _)| *leaf_id == id)
+                    .map(|(_, r)| *r)
+            })
+            .unwrap_or(container);
+        let axis = bitty_ui::smart_split_axis(sibling_rect, 1.0);
+        let place_new_first = match mode {
+            PanelLayoutMode::Spiral => {
+                let step = (target_slot.layout.leaf_count().saturating_sub(1)) % 4;
+                step >= 2
+            }
+            PanelLayoutMode::Dwindle => false,
+        };
+        let inserted = if let Some(sibling) = target_focused {
+            target_slot
+                .layout
+                .insert_beside(sibling, &moved_view, axis, 0.5, !place_new_first)
+        } else {
+            false
+        };
+        if !inserted {
+            let old_root = std::mem::replace(
+                &mut target_slot.layout,
+                LayoutNode::leaf(moved_view.clone()),
+            );
+            target_slot.layout = if place_new_first {
+                LayoutNode::split(axis, 0.5, LayoutNode::leaf(moved_view), old_root)
+            } else {
+                LayoutNode::split(axis, 0.5, old_root, LayoutNode::leaf(moved_view))
+            };
         }
+        target_slot.focus = Focus::with_focus(focused);
         // CTX-0405: the source promotion changed surviving leaf boundaries in
         // place (the moved leaf's own session re-syncs when its target slot
         // is loaded), so re-sync the active source before presenting again.
@@ -1287,7 +1359,7 @@ impl Runtime {
 
     /// Move the focused window to workspace `one_based` (1-based display
     /// index, `key` + `ctl` path). Returns `(moved_id, from_1based, to_1based)`.
-    /// Unknown indices fail closed.
+    /// Auto-creates target workspace if it does not exist (CTX-0945).
     pub fn workspace_move_focused_to_one_based(
         &mut self,
         one_based: u64,
@@ -1295,13 +1367,143 @@ impl Runtime {
         if one_based == 0 {
             return Err(String::from("workspace index starts at 1 (e.g. ws:1)"));
         }
-        let index = (one_based - 1) as usize;
-        if index >= self.workspaces.len() {
-            return Err(format!("no such workspace ws:{one_based}"));
+        if one_based > MAX_WORKSPACES as u64 {
+            return Err(format!("workspace index exceeds maximum {MAX_WORKSPACES}"));
         }
-        let from = self.active_workspace.saturating_add(1);
-        let moved = self.workspace_move_focused_to(index)?;
-        Ok((moved, from, index.saturating_add(1)))
+        if let Some(target_idx) = self.workspace_index_by_seq(one_based) {
+            let from = self.workspace_seq_at(self.active_workspace).unwrap_or(1) as usize;
+            let moved = self.workspace_move_focused_to(target_idx)?;
+            return Ok((moved, from, one_based as usize));
+        }
+
+        // Target workspace does not exist: auto-create it (CTX-0945)
+        if self.workspaces.len() >= MAX_WORKSPACES {
+            return Err(format!(
+                "too many workspaces: max {MAX_WORKSPACES}, current {}",
+                self.workspaces.len()
+            ));
+        }
+
+        self.clear_hover_pending();
+        let focused = self
+            .focused_view()
+            .ok_or_else(|| String::from("no focused pane to move"))?;
+        let moved_view = self
+            .layout
+            .find_leaf(focused)
+            .cloned()
+            .ok_or_else(|| String::from("focused pane not in layout"))?;
+
+        let content = self.view_content_kind(focused);
+        let target_label = u8::try_from(one_based)
+            .unwrap_or(u8::MAX)
+            .clamp(1, MAX_WORKSPACES as u8);
+        if let Err(err) = self.validate_view_target_at(content, target_label, focused) {
+            return Err(err.to_string());
+        }
+
+        // Remove from source workspace
+        if self.layout.leaf_count() <= 1 {
+            let fresh_id = self.next_view_id_global();
+            let fresh = View::new(fresh_id, self.cols, self.rows);
+            self.layout = LayoutNode::leaf(fresh);
+            self.focus = Focus::with_focus(fresh_id);
+            self.raise_view_id_high_water();
+        } else {
+            let mut source = self.layout.clone();
+            let removed = remove_leaf_view(&mut source, focused)
+                .ok_or_else(|| String::from("focused pane not in layout"))?;
+            debug_assert_eq!(removed.id(), focused);
+            self.layout = source;
+            let first = self
+                .layout
+                .leaf_ids()
+                .into_iter()
+                .next()
+                .ok_or_else(|| String::from("source workspace stranded empty after move"))?;
+            self.focus = Focus::with_focus(first);
+        }
+        self.sync_mode_caches_to_focus();
+        self.stash_active_slot();
+
+        let from = self.workspace_seq_at(self.active_workspace).unwrap_or(1) as usize;
+        let new_slot = WorkspaceSlot {
+            seq: one_based,
+            name: format!("ws{one_based}"),
+            layout: LayoutNode::leaf(moved_view),
+            focus: Focus::with_focus(focused),
+        };
+        self.workspaces.push(new_slot);
+        if one_based >= self.next_workspace_seq {
+            self.next_workspace_seq = one_based.wrapping_add(1).max(1);
+        }
+        self.sort_workspaces_by_seq();
+        if let Some(new_idx) = self.workspace_index_by_seq(one_based) {
+            self.workspace_mru.push_back(new_idx);
+        }
+        self.refresh_chrome_band();
+        self.sync_primary_geometry();
+        self.sync_pane_geometry();
+        self.invalidate_stale_view_bindings();
+        self.pending_full_redraw = true;
+
+        let seq = self.plugin_host.publish_count();
+        let ws_name = format!("ws{one_based}");
+        let event = Event::new(
+            EventKind::WorkspaceCreated,
+            EventPayload::Text(BoundedText::new_truncated(&ws_name)),
+            seq,
+        );
+        self.plugin_host.publish(event);
+
+        Ok((focused, from, one_based as usize))
+    }
+
+    /// Swap the current workspace with workspace `target_num` or move to
+    /// `target_num` if it does not exist (CTX-0945).
+    pub fn workspace_swap_current_with(&mut self, target_num: u64) -> Result<(u64, u64), String> {
+        if target_num == 0 {
+            return Err(String::from("workspace index starts at 1 (e.g. ws:1)"));
+        }
+        if target_num > MAX_WORKSPACES as u64 {
+            return Err(format!("workspace index exceeds maximum {MAX_WORKSPACES}"));
+        }
+        let current_idx = self.active_workspace;
+        let current_seq = self.workspaces[current_idx].seq;
+        if current_seq == target_num {
+            return Ok((current_seq, current_seq));
+        }
+        self.stash_active_slot();
+        if let Some(target_idx) = self.workspace_index_by_seq(target_num) {
+            // Target exists: swap slots/positions
+            let cur_default = format!("ws{current_seq}");
+            let tgt_default = format!("ws{target_num}");
+            if self.workspaces[current_idx].name == cur_default {
+                self.workspaces[current_idx].name = tgt_default.clone();
+            }
+            if self.workspaces[target_idx].name == tgt_default {
+                self.workspaces[target_idx].name = cur_default;
+            }
+            self.workspaces[current_idx].seq = target_num;
+            self.workspaces[target_idx].seq = current_seq;
+            self.sort_workspaces_by_seq();
+            self.pending_full_redraw = true;
+            Ok((current_seq, target_num))
+        } else {
+            // Target does not exist: move current workspace to target_num
+            let cur_default = format!("ws{current_seq}");
+            let tgt_default = format!("ws{target_num}");
+            if self.workspaces[current_idx].name == cur_default {
+                self.workspaces[current_idx].name = tgt_default;
+            }
+            self.workspaces[current_idx].seq = target_num;
+            if target_num >= self.next_workspace_seq {
+                self.next_workspace_seq = target_num.wrapping_add(1).max(1);
+            }
+            self.sort_workspaces_by_seq();
+            self.pending_full_redraw = true;
+            Ok((current_seq, target_num))
+        }
     }
 
     /// Confirm a pending close (delivers the kill). `false` when none pends.
@@ -1345,10 +1547,14 @@ impl Runtime {
     #[must_use]
     pub fn pending_ws_close_summary(&self) -> Option<String> {
         let pending = self.pending_ws_close.as_ref()?;
+        let (seq, name) = self
+            .workspaces
+            .get(pending.index)
+            .map(|s| (s.seq, s.name.as_str()))
+            .unwrap_or((pending.index as u64 + 1, pending.name.as_str()));
         Some(format!(
-            "Close workspace {}:{} with {} live shells? (repeat Alt+W=confirm kill Esc=cancel)",
-            pending.index + 1,
-            truncate_ws_name(&pending.name),
+            "Close workspace {seq}:{} with {} live shells? (repeat Alt+W=confirm kill Esc=cancel)",
+            truncate_ws_name(name),
             pending.live,
         ))
     }
@@ -2173,8 +2379,8 @@ mod tests {
 
     #[test]
     fn move_single_workspace_self_is_noop_and_invalid_fails_closed() {
-        // With one workspace the only valid target is itself (no-op); any
-        // other N fails closed and the layout is untouched.
+        // With one workspace the only valid target index is 0 (no-op);
+        // out of range indices fail closed.
         let mut rt = fresh();
         let sole = rt.focused_view().expect("focus");
         let same = rt.workspace_move_focused_to(0).expect("self move no-op");
@@ -2182,10 +2388,80 @@ mod tests {
         assert_eq!(rt.workspace_count(), 1);
         assert_eq!(rt.layout().leaf_count(), 1);
         assert!(rt.workspace_move_focused_to(1).is_err());
-        assert!(rt.workspace_move_focused_to_one_based(2).is_err());
+        assert!(rt.workspace_move_focused_to_one_based(0).is_err());
+        assert!(rt.workspace_move_focused_to_one_based(99).is_err());
         assert_eq!(rt.workspace_count(), 1);
         assert_eq!(rt.layout().leaf_count(), 1);
         assert_eq!(rt.focused_view(), Some(sole));
+    }
+
+    #[test]
+    fn move_auto_creates_missing_workspace() {
+        let mut rt = fresh();
+        let sole = rt.focused_view().expect("focus");
+        // Move to ws2 auto-creates ws2 even if it did not exist before (CTX-0945)
+        let (moved, from, to) = rt
+            .workspace_move_focused_to_one_based(2)
+            .expect("auto create ws2");
+        assert_eq!(moved, sole);
+        assert_eq!(from, 1);
+        assert_eq!(to, 2);
+        assert_eq!(rt.workspace_count(), 2);
+        assert_eq!(rt.workspaceline_text(), "1:ws1* 2:ws2 (2)");
+        // ws1 has a fresh leaf, ws2 has the moved leaf
+        assert!(rt.workspace_switch(1));
+        assert_eq!(rt.focused_view(), Some(sole));
+    }
+
+    #[test]
+    fn non_consecutive_workspaces_display_and_jump() {
+        let mut rt = fresh();
+        // Move focused leaf to ws5
+        rt.workspace_move_focused_to_one_based(5)
+            .expect("move to ws5");
+        // Move focused leaf to ws9
+        rt.workspace_move_focused_to_one_based(9)
+            .expect("move to ws9");
+        // Move focused leaf to ws3
+        rt.workspace_move_focused_to_one_based(3)
+            .expect("move to ws3");
+        // Workspaces should be sorted by seq: 1, 3, 5, 9
+        assert_eq!(rt.workspace_count(), 4);
+        assert_eq!(rt.workspaceline_text(), "1:ws1* 3:ws3 5:ws5 9:ws9 (4)");
+
+        // Jump to non-consecutive workspace 5
+        let jumped = rt.workspace_focus_clamped(5);
+        assert!(jumped.is_some());
+        assert_eq!(rt.workspaces[rt.active_workspace].seq, 5);
+        assert_eq!(rt.workspaceline_text(), "1:ws1 3:ws3 5:ws5* 9:ws9 (4)");
+
+        // Jump to non-consecutive workspace 9
+        let jumped = rt.workspace_focus_clamped(9);
+        assert!(jumped.is_some());
+        assert_eq!(rt.workspaces[rt.active_workspace].seq, 9);
+        assert_eq!(rt.workspaceline_text(), "1:ws1 3:ws3 5:ws5 9:ws9* (4)");
+    }
+
+    #[test]
+    fn workspace_swap_or_move_to_target() {
+        let mut rt = fresh();
+        // Alone in ws1: swap with 3 moves current workspace to 3
+        let (from, to) = rt.workspace_swap_current_with(3).expect("move to 3");
+        assert_eq!(from, 1);
+        assert_eq!(to, 3);
+        assert_eq!(rt.workspace_count(), 1);
+        assert_eq!(rt.workspaceline_text(), "3:ws3* (1)");
+
+        // Create a new workspace, which will get next seq = 4
+        rt.workspace_new().expect("new");
+        assert_eq!(rt.workspaceline_text(), "3:ws3 4:ws4* (2)");
+
+        // With ws4 active, swap with 3
+        let (from, to) = rt.workspace_swap_current_with(3).expect("swap 4 with 3");
+        assert_eq!(from, 4);
+        assert_eq!(to, 3);
+        // Active workspace was ws4, now it has seq 3, while previous ws3 has seq 4
+        assert_eq!(rt.workspaceline_text(), "3:ws3* 4:ws4 (2)");
     }
 
     // Live-spawn: runs a real POSIX shell (`/bin/sh` has no Windows

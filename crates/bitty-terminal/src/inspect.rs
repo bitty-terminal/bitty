@@ -1517,10 +1517,10 @@ mod tests {
         let close_confirm = inspect_config("close_confirm").expect("close_confirm");
         assert_eq!(close_confirm.key, "close_confirm");
         assert_eq!(close_confirm.value, "when_busy");
-        // CTX-0260: hover-focus default (off) is inspectable.
+        // CTX-0260 / CTX-0945: hover-focus default (on) is inspectable.
         let hover = inspect_config("mouse.focus_follows_mouse").expect("mouse key");
         assert_eq!(hover.key, "mouse.focus_follows_mouse");
-        assert_eq!(hover.value, "false");
+        assert_eq!(hover.value, "true");
         // CTX-0334: the hover-activation dwell delay (0 ms) is inspectable.
         let hover_delay =
             inspect_config("mouse.focus_follows_mouse_delay_ms").expect("mouse delay key");

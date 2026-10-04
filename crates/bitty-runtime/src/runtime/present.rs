@@ -2396,15 +2396,12 @@ impl Runtime {
                 continue;
             }
 
-            let scrolled = view_map
+            let scroll_offset = view_map
                 .get(&frame.view)
-                .map(|v| v.scroll_offset() != 0)
-                .unwrap_or(false);
-            if scrolled {
-                continue;
-            }
+                .map(|v| v.scroll_offset())
+                .unwrap_or(0);
 
-            let scrollback = scrollback_len
+            let scrollback = (scrollback_len.saturating_sub(scroll_offset))
                 + cursor_follow_window_start(cursor_row, rows, usize::from(frame.rows));
 
             for placement in self.kitty_images.placements_in_paint_order_for(pane_origin) {

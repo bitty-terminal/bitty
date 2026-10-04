@@ -438,6 +438,12 @@ impl Runtime {
             return false;
         }
         let Some((id, _)) = self.cursor_to_leaf_cell(pos) else {
+            if self.focus.focused().is_none() {
+                if let Some(primary) = self.primary_view {
+                    self.set_focus(primary);
+                    return true;
+                }
+            }
             return false;
         };
         // A click is an explicit focus choice: `set_focus` also drops any
@@ -513,6 +519,14 @@ impl Runtime {
     /// deadline. Moving to a different candidate re-arms the dwell clock.
     pub(super) fn hover_focus_at_at(&mut self, pos: CursorPosition, now: Instant) {
         if !self.config.focus_follows_mouse || self.shift_pressed {
+            self.hover_pending = None;
+            return;
+        }
+        if self.should_capture_mouse() {
+            self.hover_pending = None;
+            return;
+        }
+        if self.pointer_on_split_handle(pos) {
             self.hover_pending = None;
             return;
         }

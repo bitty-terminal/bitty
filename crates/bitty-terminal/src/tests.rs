@@ -2132,7 +2132,7 @@ fn runtime_config_inherits_file_focus_follows_mouse() {
         bitty_runtime::config::MAX_FOCUS_FOLLOWS_MOUSE_DELAY_MS,
         bitty_config::types::MAX_MOUSE_FOCUS_FOLLOWS_MOUSE_DELAY_MS
     );
-    const { assert!(!bitty_runtime::config::DEFAULT_FOCUS_FOLLOWS_MOUSE) }
+    const { assert!(bitty_runtime::config::DEFAULT_FOCUS_FOLLOWS_MOUSE) }
     const { assert!(bitty_runtime::config::DEFAULT_FOCUS_FOLLOWS_MOUSE_DELAY_MS == 0) }
     use bitty_config::file::{parse_lua_config, resolve_effective};
     use bitty_config::plan::{ConfigSource, LayerKind};
@@ -2163,7 +2163,7 @@ fn runtime_config_inherits_file_focus_follows_mouse() {
         merged.source_of("mouse.focus_follows_mouse").unwrap().layer,
         bitty_config::plan::LayerKind::User
     );
-    // Absent table rides the default-off end to end.
+    // Absent table rides the default-on end to end (CTX-0945).
     let src2 = ConfigSource::new(LayerKind::User, Some("init.lua"));
     let plan2 = parse_lua_config(r#"return { terminal = { scrollback = 10000 } }"#, &src2)
         .expect("no mouse table parses");
@@ -2172,9 +2172,9 @@ fn runtime_config_inherits_file_focus_follows_mouse() {
         None,
     )
     .expect("merge");
-    assert!(!merged2.effective.mouse.focus_follows_mouse);
+    assert!(merged2.effective.mouse.focus_follows_mouse);
     let cfg2 = runtime_config_from_effective(&merged2.effective).expect("builds");
-    assert!(!cfg2.focus_follows_mouse);
+    assert!(cfg2.focus_follows_mouse);
     assert_eq!(
         merged2
             .source_of("mouse.focus_follows_mouse")
@@ -2182,6 +2182,21 @@ fn runtime_config_inherits_file_focus_follows_mouse() {
             .layer,
         bitty_config::plan::LayerKind::CoreDefaults
     );
+    // Explicit opt-out sets false.
+    let src3 = ConfigSource::new(LayerKind::User, Some("init.lua"));
+    let plan3 = parse_lua_config(
+        r#"return { mouse = { focus_follows_mouse = false } }"#,
+        &src3,
+    )
+    .expect("opt-out parses");
+    let merged3 = resolve_effective(
+        Some(bitty_config::plan::LayeredPlan::new(src3, plan3)),
+        None,
+    )
+    .expect("merge");
+    assert!(!merged3.effective.mouse.focus_follows_mouse);
+    let cfg3 = runtime_config_from_effective(&merged3.effective).expect("builds");
+    assert!(!cfg3.focus_follows_mouse);
 }
 
 #[test]

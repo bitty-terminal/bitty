@@ -1613,6 +1613,7 @@ impl AppHandler for TerminalApp {
         // closes cleanly.
         if self.reap_exited_shells() == ShellExitOutcome::AppExiting {
             self.save_session_best_effort("shell-exit");
+            self.runtime.shutdown();
             ctx.exit();
             return;
         }
@@ -1674,6 +1675,7 @@ impl AppHandler for TerminalApp {
         if should_exit {
             crate::logging::info(|| format!("bitty: exit requested ({event:?})"));
             self.save_session_best_effort("exit");
+            self.runtime.shutdown();
             ctx.exit();
             return;
         }
@@ -1858,6 +1860,7 @@ impl AppHandler for TerminalApp {
                 self.poll_pty_pump();
                 if self.reap_exited_shells() == ShellExitOutcome::AppExiting {
                     self.save_session_best_effort("shell-exit");
+                    self.runtime.shutdown();
                     ctx.exit();
                     return;
                 }
@@ -1912,6 +1915,7 @@ impl AppHandler for TerminalApp {
             // idempotent) and exits instead of silently dropping the session.
             PlatformEvent::Exiting => {
                 self.save_session_best_effort("loop-exiting");
+                self.runtime.shutdown();
                 ctx.exit();
             }
             _ => {}

@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
-//! Copy mode and search are View-bound (CTX-0805, issue #1478).
+//! View-bound search and selection (CTX-0805, issue #1478; policy retired by
+//! W-144, CTX-0937).
 //!
 //! Copy mode and scrollback search used to read the primary grid for motion,
 //! matching, and text, and consulted the focused View only for its scroll
@@ -10,19 +11,20 @@
 //!
 //! Pinned here with a real split (primary grid plus a pane session):
 //!
-//! - copy mode binds to the focused View at entry, walks and yanks that
-//!   View's grid, stays bound when focus moves, and ends when its View goes;
-//! - the search overlay and `search_set` bind to the focused View, match its
-//!   grid only, and are refreshed only by output on that grid;
+//! - `search_set` binds to the focused View, matches its grid only, and is
+//!   refreshed only by output on that grid;
 //! - a grid erase drops only a selection owned by the erased grid;
 //! - the persistent-selection API follows the keyboard View.
+//!
+//! The overlay plus copy-mode lifecycle tests retired with the Core policy
+//! (W-144, CTX-0937); the search/copy-mode plugins re-prove that behavior
+//! over the public host ops (CTX-0004).
 //!
 //! Unix-only: the second grid is a real pane session (mirrors
 //! `focused_input_modes.rs`).
 
 #![cfg(unix)]
 
-use bitty_platform::{KeyEvent, KeyLocation, LogicalKey, PressState};
 use bitty_runtime::{LayoutNode, Runtime, RuntimeConfig, SplitAxis, View, ViewId};
 use bitty_term_state::search::SearchOptions;
 use bitty_ui::{CellPos, Selection};
@@ -54,128 +56,9 @@ fn split_runtime() -> Runtime {
     rt
 }
 
-fn key(ch: &str) -> KeyEvent {
-    KeyEvent {
-        logical_key: LogicalKey::Character(ch.to_string()),
-        text: Some(ch.to_string()),
-        location: KeyLocation::Standard,
-        state: PressState::Pressed,
-        repeat: false,
-        is_synthetic: false,
-    }
-}
-
-/// Copy-mode keys: line start, visual, then `extend` steps right.
-fn visual_from_line_start(rt: &mut Runtime, extend: usize) {
-    rt.handle_key_event(key("0"));
-    rt.handle_key_event(key("v"));
-    for _ in 0..extend {
-        rt.handle_key_event(key("l"));
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Copy mode
-// ---------------------------------------------------------------------------
-
-#[test]
-fn copy_mode_walks_and_yanks_the_focused_pane() {
-    bitty_test_support::require_pty!();
-    let mut rt = split_runtime();
-    assert!(rt.set_focus(PANE));
-
-    rt.enter_copy_mode();
-    assert!(rt.is_copy_mode());
-    assert_eq!(
-        rt.copy_mode_cursor(),
-        Some(CellPos::new(
-            0,
-            u16::try_from(PANE_TEXT.len()).expect("fits")
-        )),
-        "the copy cursor starts at the pane's own terminal cursor"
-    );
-    visual_from_line_start(&mut rt, 4);
-    assert_eq!(
-        rt.selection_owner(),
-        Some(PANE),
-        "the visual is owned by the pane copy mode walks"
-    );
-    assert_eq!(
-        rt.copy_mode_yank().as_deref(),
-        Some("gamma"),
-        "yank reads the pane's grid, not the primary grid"
-    );
-    assert!(!rt.is_copy_mode(), "yank exits copy mode");
-}
-
-#[test]
-fn copy_mode_stays_bound_when_focus_moves() {
-    bitty_test_support::require_pty!();
-    let mut rt = split_runtime();
-    assert!(rt.set_focus(PANE));
-    rt.enter_copy_mode();
-
-    assert!(rt.set_focus(PRIMARY));
-    visual_from_line_start(&mut rt, 4);
-
-    assert_eq!(
-        rt.selection_owner(),
-        Some(PANE),
-        "a focus change mid-session never retargets the copy cursor"
-    );
-    assert_eq!(rt.copy_mode_yank().as_deref(), Some("gamma"));
-}
-
-#[test]
-fn copy_mode_ends_when_its_pane_closes() {
-    bitty_test_support::require_pty!();
-    let mut rt = split_runtime();
-    assert!(rt.set_focus(PANE));
-    rt.enter_copy_mode();
-    visual_from_line_start(&mut rt, 2);
-
-    assert!(rt.close_pane_session(&PANE));
-    rt.set_layout_closing(LayoutNode::leaf(View::new(PRIMARY, 80, 24)), PANE);
-
-    assert!(!rt.is_copy_mode(), "copy mode cannot outlive its grid");
-    assert_eq!(rt.selection_owner(), None);
-}
-
-#[test]
-fn copy_mode_in_the_primary_pane_is_unchanged() {
-    bitty_test_support::require_pty!();
-    let mut rt = split_runtime();
-    assert!(rt.set_focus(PRIMARY));
-    rt.enter_copy_mode();
-    visual_from_line_start(&mut rt, 4);
-    assert_eq!(rt.selection_owner(), Some(PRIMARY));
-    assert_eq!(rt.copy_mode_yank().as_deref(), Some("alpha"));
-}
-
 // ---------------------------------------------------------------------------
 // Search
 // ---------------------------------------------------------------------------
-
-#[test]
-fn search_overlay_matches_the_focused_pane_grid() {
-    bitty_test_support::require_pty!();
-    let mut rt = split_runtime();
-    assert!(rt.set_focus(PANE));
-
-    rt.enter_search_mode();
-    assert_eq!(rt.search_view(), Some(PANE), "the overlay binds on open");
-    rt.search_set_overlay_query("gamma");
-    assert_eq!(rt.search_match_count(), 1, "the pane's own text matches");
-    assert_eq!(rt.selection_owner(), Some(PANE));
-    assert_eq!(rt.selection_text().as_deref(), Some("gamma"));
-
-    rt.search_set_overlay_query("alpha");
-    assert_eq!(
-        rt.search_match_count(),
-        0,
-        "primary-grid text is not part of the pane's search"
-    );
-}
 
 #[test]
 fn search_set_binds_to_the_focused_view() {

@@ -15,8 +15,8 @@ use super::*;
 impl Runtime {
     /// Grid the current search's matches belong to (CTX-0805).
     ///
-    /// The bound View's live grid; an unbound search (only reachable through
-    /// the `search_state_mut` test seam) reads the keyboard View's grid.
+    /// The bound View's live grid; an unbound search (defensive fallback:
+    /// reachable only when no View is bound) reads the keyboard View's grid.
     /// `None` when the bound View no longer resolves to a live grid.
     fn search_grid(&self) -> Option<&State> {
         match self.search_view {
@@ -172,15 +172,14 @@ impl Runtime {
     /// headless, bounded, and deterministic: `search_set` truncates the
     /// pattern, `State::search` caps results, navigation wraps, and view
     /// highlight mapping is pure arithmetic.
+    ///
+    /// W-144 (CTX-0937): the mutable test seam retired with the Core policy.
+    /// Tests drive state through the bounded host-op-backed seams
+    /// (`search_set`, `search_refresh`, `search_advance`) instead of arming
+    /// hidden searches a capability-gated host API would refuse.
     #[must_use]
     pub fn search_state(&self) -> &SearchState {
         &self.search_state
-    }
-
-    /// Owned search UI state (mutable, for tests).
-    #[must_use]
-    pub fn search_state_mut(&mut self) -> &mut SearchState {
-        &mut self.search_state
     }
 
     /// View the current search is bound to, if any (CTX-0805).
@@ -222,12 +221,13 @@ impl Runtime {
     /// match count (or `None` when empty). No-op when search is inactive.
     ///
     /// CTX-0805: refreshes against the bound grid; a bound View that lost
-    /// its grid ends the search. An unbound search (test seam) keeps the
-    /// historic primary-grid refresh.
+    /// its grid ends the search. An unbound search (defensive fallback,
+    /// reachable only when no View is bound) keeps the historic
+    /// primary-grid refresh.
     ///
     /// CTX-0936 (W-143b dogfood): the bound path delegates to the
     /// [`Self::search_host_refresh`] host op (replace semantics plus a
-    /// generation bump that stales prior handles). The unbound test seam
+    /// generation bump that stales prior handles). The unbound fallback
     /// keeps its historic behavior and still bumps the generation so no
     /// handle outlives a replacement.
     pub fn search_refresh(&mut self) {
@@ -235,7 +235,7 @@ impl Runtime {
             let _ = self.search_host_refresh(&handle);
             return;
         }
-        // Unbound (test seam): refresh against the same keyboard grid the
+        // Unbound fallback: refresh against the same keyboard grid the
         // other unbound readers use (`search_grid`).
         let grid = self
             .keyboard_view()
@@ -250,7 +250,7 @@ impl Runtime {
     /// Advances to the next match (wraps deterministically).
     ///
     /// CTX-0936 (W-143b dogfood): the bound path delegates to the
-    /// [`Self::search_host_advance`] host op; the unbound test seam keeps
+    /// [`Self::search_host_advance`] host op; the unbound fallback keeps
     /// its direct behavior.
     pub fn search_next(&mut self) {
         self.search_advance(1);
@@ -267,7 +267,7 @@ impl Runtime {
     ///
     /// CTX-0936 (W-143b dogfood): the bound path delegates to the
     /// [`Self::search_host_advance`] host op (which preserves the result-set
-    /// generation); the unbound test seam advances directly.
+    /// generation); the unbound fallback advances directly.
     pub fn search_advance(&mut self, delta: isize) {
         if let Some(handle) = self.search_host_handle() {
             let _ = self.search_host_advance(&handle, delta);
@@ -412,8 +412,8 @@ impl Runtime {
     /// [`Self::search_host_apply_selection`] host op and maps
     /// `SelectionDriveOutcome::Selected` to `true` (all other outcomes,
     /// including fenced `Stale`, to `false`), preserving this seam's
-    /// boolean contract. The unbound test seam (retired in W-144) keeps the
-    /// historic keyboard-grid behavior verbatim.
+    /// boolean contract. The unbound fallback keeps the historic
+    /// keyboard-grid behavior verbatim.
     pub fn search_apply_selection(&mut self) -> bool {
         if let Some(handle) = self.search_host_handle() {
             match self.search_host_apply_selection(&handle) {

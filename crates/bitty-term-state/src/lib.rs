@@ -73,6 +73,7 @@ mod grid;
 pub mod image;
 pub mod kitty_unicode;
 pub mod modes;
+pub mod placement;
 pub mod replies;
 pub mod scrollback;
 pub mod search;
@@ -90,8 +91,8 @@ pub const DEFAULT_TAB_INTERVAL: usize = 8;
 
 pub use bitty_vt::{
     Attribute, AttributeChange, AttributeDiff, CharsetSlot, CharsetTable, ClipboardOp, Color,
-    CursorStyle, Hyperlink, Mode, MouseCoordinateEncoding, MouseTrackingMode, Rgb, StatusKind,
-    TerminalAction, UnderlineStyle, ZoneKind,
+    CursorStyle, Hyperlink, KittyControlKeys, KittyMedium, Mode, MouseCoordinateEncoding,
+    MouseTrackingMode, Rgb, StatusKind, TerminalAction, UnderlineStyle, ZoneKind,
 };
 pub use cell::{
     AmbiguousWidth, Attributes, Cell, HyperlinkId, MAX_ZEROWIDTH_CHARS, Style, Zerowidth,
@@ -113,6 +114,11 @@ pub use kitty_unicode::{
     is_kitty_placeholder, kitty_image_id, kitty_placement_id, run_key,
 };
 pub use modes::Modes;
+pub use placement::{
+    KITTY_ANIM_DEFAULT_GAP_MS, KITTY_ANIM_MAX_FRAMES, KITTY_ANIM_MAX_IMAGES,
+    KITTY_PLACE_MAX_PLACEMENTS, KITTY_Z_BELOW_BACKGROUND, KittyAnimState, KittyAnimation,
+    KittyDeleteSelector, KittyFrameError, KittyPlacement, PlacementStore,
+};
 pub use replies::{REPLY_CAP_BYTES, Replies};
 pub use scrollback::{SCROLLBACK_DEFAULT_LINES, SCROLLBACK_MAX_LINES, ScrollbackLine};
 pub use state::{

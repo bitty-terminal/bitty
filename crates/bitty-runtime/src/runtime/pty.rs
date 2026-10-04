@@ -898,6 +898,27 @@ impl Runtime {
             // (stored-not-painted) semantics from CTX-0248. Failures store
             // nothing and paint nothing; warn loudly (parser already warned on
             // base64/caps).
+            // Kitty state-owned commands (CTX-0950): `a=p` places,
+            // `a=d` deletes, `a=a` drives animation descriptors — all
+            // Terminal Truth recorded in `TerminalState`. Apply here and
+            // skip pixel intake, which would reject the payload-less
+            // command as a failed image decode.
+            if matches!(
+                &action,
+                TerminalAction::KittyGraphics {
+                    action_a: Some('p' | 'd' | 'a'),
+                    ..
+                }
+            ) {
+                let damage = self.state.apply(&action);
+                if !damage.regions.is_empty() {
+                    let generation = damage.generation;
+                    self.cold_queue.push(ColdEvent::Damage { generation });
+                    self.plugin_host
+                        .push_observation(HostObservation::Damage { generation });
+                }
+                continue;
+            }
             if let TerminalAction::KittyGraphics {
                 format_f,
                 width_s,
@@ -907,6 +928,9 @@ impl Runtime {
                 rows_r,
                 cursor_movement_c,
                 payload,
+                // CTX-0950 advanced keys (placement/animation/medium):
+                // not yet consumed here; state owns anchors/lifetime.
+                control: _,
             } = action
             {
                 if let Err(err) = self.kitty_display_image_owned(
@@ -929,8 +953,10 @@ impl Runtime {
                         );
                     }
                 }
-                // state.apply is a no-op for KittyGraphics (state.rs:1253),
-                // and we already moved the action, so continue to the next one.
+                // The state-owned `a=p`/`a=d`/`a=a` commands were applied
+                // above. This branch consumes the remaining KittyGraphics
+                // actions for the pixel pipeline, and we already moved
+                // the action, so continue to the next one.
                 continue;
             }
             let damage = self.state.apply(&action);
@@ -1286,6 +1312,25 @@ mod tests {
         let (mut rt, _tx) = runtime_with_queued_chunks(3);
         assert_eq!(rt.poll_pty_timeout(std::time::Duration::from_secs(1)), 3);
         assert_eq!(rt.poll_pty(), 0);
+    }
+
+    #[test]
+    fn pty_applies_state_owned_kitty_place_and_delete() {
+        // CTX-0950: `a=p`/`a=d` are Terminal Truth owned by
+        // `TerminalState`. The PTY loop must apply them instead of
+        // sending the payload-less commands to pixel intake (which
+        // would reject them as failed image decodes and warn).
+        let mut rt = Runtime::new(crate::RuntimeConfig::default()).expect("headless build");
+        rt.handle_pty_bytes(b"\x1b_Ga=p,i=7,c=2,r=2\x1b\\");
+        assert!(
+            rt.state.kitty_placements().get(7, 0).is_some(),
+            "a=p anchors an anonymous placement for image 7"
+        );
+        rt.handle_pty_bytes(b"\x1b_Ga=d,d=i,i=7\x1b\\");
+        assert!(
+            rt.state.kitty_placements().get(7, 0).is_none(),
+            "a=d by image id removes the placement"
+        );
     }
 
     /// A synthetic session: `chunks` small chunks, the last one an end

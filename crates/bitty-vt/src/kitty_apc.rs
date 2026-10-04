@@ -7,6 +7,11 @@
 //! streams, and hands assembled decoded bytes to the caller for routing to
 //! `kitty_transmit`/`kitty_display_image`.
 //!
+//! The advanced subset (CTX-0950) adds placement (`a=p`, virtual `U=1`,
+//! relative `P`/`Q`), animation (`a=f` frame data, `a=a` control, `a=c`
+//! compose), deletion (`a=d`), queries (`a=q`), and local mediums
+//! (`t=f`/`t=t` files, `t=s` shared memory) with sandbox validation.
+//!
 //! # Wire shape
 //!
 //! `ESC _ G <control> ; <base64> ST` where `ST` is `ESC \` or `BEL` (C1 `ST`
@@ -14,15 +19,18 @@
 //! intentionally not an introducer: it overlaps UTF-8 continuation bytes and
 //! kitty/chafa always emit `ESC _`. `<control>` is a comma-separated
 //! `key=value` list. Routing needs `f` (format), `s`/`v` (raw dimensions),
-//! `a` (display action), `c`/`r` (cell spans), and `m` (more-chunks). All
-//! other keys are ignored (future-proof).
+//! `a` (action), `c`/`r` (cell spans, or frame numbers for animation), and
+//! `m` (more-chunks); the advanced keys (`t`, `i`, `I`, `p`, `q`, `d`,
+//! `x`, `y`, `w`, `h`, `X`, `Y`, `z`, `U`, `P`, `Q`, `H`, `V`, `S`, `O`,
+//! `N`) ride in [`KittyControlKeys`]. `o=` accepts only `z`; `t=` accepts
+//! only `d`/`f`/`t`/`s`. Truly unknown keys stay ignored (future-proof).
 //!
 //! # Bounds
 //!
 //! - [`KITTY_APC_LEDGER_CAP`] is the accepted IMG-1 4 MiB cap for
 //!   compressed payloads (`f=100` PNG) and for any stream whose decoded size
 //!   is not declared up front.
-//! - Raw `f=24`/`f=32` streams with both `s`/`v` present and no `o=`
+//! - Raw `f=24`/`f=32` streams with both `s`/`v` present and no `o=z`
 //!   compression key are not compressed:
 //!   the payload *is* the bitmap, so their bound is the declared exact size
 //!   `s * v * channels`, validated on the first chunk against the IMG-2/IMG-3
@@ -31,6 +39,10 @@
 //!   any payload byte is buffered. Full-screen HD/4K RGBA frames from `chafa
 //!   -f kitty` therefore fit, while a raw stream can never grow past its own
 //!   claim.
+//! - Local-medium streams (`t=f`/`t=t`/`t=s`) name a path, not pixels:
+//!   their bound is [`KITTY_APC_PATH_MAX_BYTES`], and an `S=` read-size
+//!   claim above the decode cap is refused on the first chunk.
+//! - Control-only actions (`a=p`/`d`/`a`/`c`/`q`) must arrive bodiless.
 //! - Base64 is decoded incrementally into one bounded payload buffer, so
 //!   pending chunks, current output, and decoder scratch never form a second
 //!   large APC allocation. The control header has a separate 4 KiB bound.
@@ -42,16 +54,19 @@
 //!
 //! Every rejection warns via rate-limited `eprintln!` (diagnostic only, no
 //! state change) and yields no completed transmission: bad base64 alphabet,
-//! malformed control, missing `f`, oversize claim, ledger-cap overflow, or
-//! decode-cap violation all store nothing and paint nothing. The caller
+//! malformed control, missing `f`, oversize claim, ledger-cap overflow,
+//! decode-cap violation, unexpected control payload, or sandbox path
+//! rejection all store nothing and paint nothing. The caller
 //! (`Parser`) emits no action on rejection. Chunked streams drop only the
 //! offending stream on oversize, mirroring `KittyGraphicsStub` semantics.
 //!
 //! An open stream never outlives a protocol violation or a stall:
 //!
-//! - A continuation chunk with a missing or malformed `m=`, or one carrying
-//!   a delete action (`a=d`, which the kitty specification says must abort a
-//!   partial upload), drops the open stream as well as the offending chunk.
+//! - A continuation chunk with a missing or malformed `m=`, with an action
+//!   change (`a=d`, which the kitty specification says must abort a
+//!   partial upload; frame data on an image stream or any non-`a=f` action
+//!   on a frame stream), drops the open stream as well as the offending
+//!   chunk.
 //! - Input that arrives while a stream is open but is not continuation
 //!   payload (text for the VT state machine, non-`G` or discarded `APC`
 //!   bytes, and continuation headers themselves) is counted; past
@@ -94,27 +109,326 @@ pub const KITTY_APC_DECODE_MAX_PIXELS: u64 = 4096 * 4096;
 /// (W-141: see [`KITTY_APC_DECODE_MAX_DIMENSION`]).
 pub const KITTY_APC_DECODE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
+/// Decoded-byte cap for file/shm path payloads (`t=f`/`t=t`/`t=s`).
+///
+/// Paths arrive base64-encoded in the payload section like pixel data, but
+/// they name a filesystem or shm object rather than carrying bytes: 4096
+/// (`PATH_MAX` parity) bounds the decoded name. Anything longer is not a
+/// usable path and is rejected fail-closed before any open is attempted
+/// downstream.
+pub const KITTY_APC_PATH_MAX_BYTES: usize = 4096;
+
+/// Maximum accepted POSIX shared-memory name length (`NAME_MAX` parity,
+/// matching the kitty specification that shm names fit the OS limit).
+pub const KITTY_APC_SHM_NAME_MAX: usize = 255;
+
+/// Required substring of a `t=t` temporary-file path.
+///
+/// The kitty specification requires the terminal to delete the file after
+/// reading it only when the path sits in a known temporary directory and
+/// carries this marker; the parse-time half of that rule (marker presence)
+/// is enforced here, the directory half where the file is opened
+/// downstream (see [`validate_kitty_path`]).
+pub const KITTY_APC_TMP_NAME_MARKER: &str = "tty-graphics-protocol";
+
+/// Kitty graphics transmission medium (wire `t=` key).
+///
+/// Reference: kitty `graphics-protocol.rst` ("The transmission medium") and
+/// ghostty `graphics_command.zig` (`Transmission.Medium`). `Direct` is the
+/// wire default; local mediums ignore the `m=` chunking key (kitty and
+/// ghostty both complete them single-shot, which `mpv` relies on for `t=s`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KittyMedium {
+    /// `t=d` (or absent): pixel data rides base64-encoded in the escape
+    /// code itself. The only medium that supports `m=` chunking.
+    #[default]
+    Direct,
+    /// `t=f`: read pixel data from a regular file named by the payload.
+    File,
+    /// `t=t`: like [`Self::File`] but the terminal deletes the file after
+    /// reading it (only inside a known temp dir with [`KITTY_APC_TMP_NAME_MARKER`]
+    /// in the path).
+    TempFile,
+    /// `t=s`: read pixel data from a POSIX shared-memory object named by
+    /// the payload (unlinked after reading).
+    SharedMemory,
+}
+
+impl KittyMedium {
+    /// Whether pixel bytes travel inside the escape code (chunkable).
+    #[must_use]
+    pub const fn is_direct(self) -> bool {
+        matches!(self, Self::Direct)
+    }
+}
+
+/// Advanced kitty control keys carried alongside the base transmit fields.
+///
+/// The base [`KittyApcParams`] fields (`f`/`s`/`v`/`a`/`c`/`r`/`C`/`m`/`o`)
+/// already cover direct transmission; this struct carries every other key
+/// the advanced subset needs: placement (`a=p`), animation (`a=f` frame
+/// data, `a=a` control, `a=c` compose), deletion (`a=d`), queries (`a=q`),
+/// and local transmission mediums (`t=f`/`t=t`/`t=s` with `S`/`O`).
+///
+/// Several wire keys are overloaded per action (kitty control-data
+/// reference): `c`/`r` name cell spans for display but 1-based frame
+/// numbers for animation; `s`/`v` name image width/height for transmit but
+/// animation state/loop count for `a=a`; `z` names z-index for display but
+/// frame gap for animation; `X` names a cell x-offset for display but the
+/// compose/blend mode for animation; `Y` names a cell y-offset for display
+/// but the frame background color for animation. The parser stores the raw
+/// key values here (and in the base fields); the accessors below give the
+/// per-action view so each consumer reads the meaning its action defines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KittyControlKeys {
+    /// Wire `t=` transmission medium (`d` when absent).
+    pub medium: KittyMedium,
+    /// Wire `i=` image id (`0` when absent: anonymous image).
+    pub image_id: u32,
+    /// Wire `I=` image number (`0` when absent). Mutually exclusive with
+    /// a non-zero [`Self::image_id`] (the specification calls the
+    /// combination an error).
+    pub image_number: u32,
+    /// Wire `p=` placement id (`0` when absent: anonymous placement).
+    pub placement_id: u32,
+    /// Wire `q=` reply suppression (`0` replies, `1` suppresses `OK`,
+    /// `2` suppresses failures too).
+    pub quiet: u8,
+    /// Wire `d=` delete selector (`None` when absent, i.e. `a`).
+    pub delete: Option<char>,
+    /// Wire `x=`/`y=` source-rectangle left/top edge in pixels.
+    pub src_x: u32,
+    /// Wire `y=` source-rectangle top edge in pixels.
+    pub src_y: u32,
+    /// Wire `w=` source-rectangle width in pixels (`0` = full width).
+    pub src_w: u32,
+    /// Wire `h=` source-rectangle height in pixels (`0` = full height).
+    pub src_h: u32,
+    /// Wire `X=` cell x-offset in pixels (display), or compose/blend mode
+    /// (`0` alpha blend, `1` replace) for `a=f`/`a=c`.
+    pub cell_x_offset: u32,
+    /// Wire `Y=` cell y-offset in pixels (display), or 32-bit RGBA
+    /// background color for `a=f` frame creation.
+    pub cell_y_offset: u32,
+    /// Wire `z=` z-index for display (signed; negative draws under text,
+    /// below `INT32_MIN/2` draws under non-default cell backgrounds), or
+    /// frame gap in milliseconds for animation (`0` ignored, negative =
+    /// gapless skip).
+    pub z_index: i32,
+    /// Wire `U=` virtual-placement flag (`1` creates a `U+10EEEE`
+    /// prototype instead of a screen-anchored placement).
+    pub unicode_placement: u8,
+    /// Wire `P=` parent image id for relative placement (`0` = none).
+    pub parent_id: u32,
+    /// Wire `Q=` parent placement id for relative placement (`0` = none).
+    pub parent_placement_id: u32,
+    /// Wire `H=` horizontal cell offset from the parent placement origin.
+    pub parent_dx: i32,
+    /// Wire `V=` vertical cell offset from the parent placement origin.
+    pub parent_dy: i32,
+    /// Wire `S=` exact byte count to read from a file/shm object
+    /// (`0` = read to end / derive from the image claim).
+    pub data_size: u32,
+    /// Wire `O=` byte offset to start reading a file/shm object at.
+    pub data_offset: u32,
+    /// Wire `N=` client usage-hint bitmask (`1` = transient).
+    pub usage_hints: u32,
+}
+
+impl Default for KittyControlKeys {
+    fn default() -> Self {
+        Self {
+            medium: KittyMedium::Direct,
+            image_id: 0,
+            image_number: 0,
+            placement_id: 0,
+            quiet: 0,
+            delete: None,
+            src_x: 0,
+            src_y: 0,
+            src_w: 0,
+            src_h: 0,
+            cell_x_offset: 0,
+            cell_y_offset: 0,
+            z_index: 0,
+            unicode_placement: 0,
+            parent_id: 0,
+            parent_placement_id: 0,
+            parent_dx: 0,
+            parent_dy: 0,
+            data_size: 0,
+            data_offset: 0,
+            usage_hints: 0,
+        }
+    }
+}
+
+impl KittyControlKeys {
+    /// Whether this command creates a virtual (`U+10EEEE`) prototype
+    /// placement rather than a screen-anchored one.
+    #[must_use]
+    pub const fn is_virtual_placement(self) -> bool {
+        self.unicode_placement == 1
+    }
+
+    /// Whether this relative placement names a parent (`P=` non-zero).
+    #[must_use]
+    pub const fn has_parent(self) -> bool {
+        self.parent_id != 0
+    }
+}
+
 /// Parsed `G` control parameters needed for routing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KittyApcParams {
-    /// Wire `f=` format value. Required; absent is rejected.
+    /// Wire `f=` format value (`0` when absent: control-only actions
+    /// (`a=p`/`a=d`/`a=a`/`a=c`) omit it; data-carrying actions
+    /// (absent action, `a=T`/`a=t`, frame data `a=f`, query `a=q`)
+    /// require it).
     pub format_f: u32,
-    /// Wire `s=` width (`None` when absent).
+    /// Wire `s=` width (`None` when absent). For `a=a` this key instead
+    /// carries the animation state (`1` stop, `2` run-loading, `3` run);
+    /// see [`KittyApcParams::anim_state`].
     pub width_s: Option<u32>,
-    /// Wire `v=` height (`None` when absent).
+    /// Wire `v=` height (`None` when absent). For `a=a` this key instead
+    /// carries the loop count; see [`KittyApcParams::anim_loops`].
     pub height_v: Option<u32>,
     /// Wire `a=` action (`None` when absent means transmit-and-display).
     pub action_a: Option<char>,
-    /// Wire `c=` columns (`0` when absent).
+    /// Wire `c=` columns (`0` when absent). For animation commands this
+    /// key instead carries a 1-based frame number; see
+    /// [`KittyApcParams::frame_c`].
     pub cols_c: u16,
-    /// Wire `r=` rows (`0` when absent).
+    /// Wire `r=` rows (`0` when absent). For animation commands this key
+    /// instead carries a 1-based frame number; see
+    /// [`KittyApcParams::frame_r`].
     pub rows_r: u16,
     /// Wire `C=` cursor movement (`0` moves cursor, `1` keeps it, default `0`).
     pub cursor_movement_c: u8,
     /// Wire `m=` more-chunks (`false` when absent, i.e. single-shot/final).
+    /// Honored only for direct (`t=d`) transmissions; local mediums
+    /// (`t=f`/`t=t`/`t=s`) always complete single-shot (kitty/ghostty
+    /// parity: `mpv` relies on this for `t=s`).
     pub more: bool,
-    /// Whether a non-empty wire `o=` compression key is present.
+    /// Whether the wire `o=z` compression key is present.
     pub compressed: bool,
+    /// Advanced control keys (placement, animation, deletion, medium).
+    pub keys: KittyControlKeys,
+}
+
+impl KittyApcParams {
+    /// `a=a` animation state from the overloaded `s=` key (`1` stop,
+    /// `2` run-loading, `3` run). `None` when `s=` is absent or does not
+    /// fit the one-byte state value.
+    #[must_use]
+    pub fn anim_state(self) -> Option<u8> {
+        self.width_s.and_then(|s| u8::try_from(s).ok())
+    }
+
+    /// `a=a` loop count from the overloaded `v=` key (`0` ignored,
+    /// `1` infinite, `n > 1` plays `n - 1` loops). `0` when absent.
+    #[must_use]
+    pub fn anim_loops(self) -> u32 {
+        self.height_v.unwrap_or(0)
+    }
+
+    /// 1-based frame number from the overloaded `c=` key (base canvas for
+    /// `a=f` creation, edited frame for `a=c`, current frame for `a=a`).
+    /// `0` when absent.
+    #[must_use]
+    pub const fn frame_c(self) -> u32 {
+        self.cols_c as u32
+    }
+
+    /// 1-based frame number from the overloaded `r=` key (edited frame
+    /// for `a=f`, source frame for `a=c`, affected frame for `a=a`).
+    /// `0` when absent.
+    #[must_use]
+    pub const fn frame_r(self) -> u32 {
+        self.rows_r as u32
+    }
+
+    /// Frame gap in milliseconds from the overloaded `z=` key (`0`
+    /// ignored, negative = gapless skip). Defaults to the ghostty/kitty
+    /// `40ms` only downstream; the parser reports the raw value.
+    #[must_use]
+    pub const fn frame_gap_ms(self) -> i32 {
+        self.keys.z_index
+    }
+
+    /// Compose/blend mode from the overloaded `X=` key (`0` alpha blend,
+    /// `1` replace).
+    #[must_use]
+    pub const fn compose_mode(self) -> u32 {
+        self.keys.cell_x_offset
+    }
+
+    /// Frame background color from the overloaded `Y=` key (32-bit RGBA,
+    /// `0` = transparent black).
+    #[must_use]
+    pub const fn frame_background(self) -> u32 {
+        self.keys.cell_y_offset
+    }
+
+    /// Whether this command carries pixel data (absent action/`T`/`t`/`f`
+    /// with a direct or local medium, plus the `a=q` support probe which
+    /// must test-load the supplied bytes) as opposed to being control-only
+    /// (`a=p`/`d`/`a`/`c`, which must arrive with an empty payload).
+    #[must_use]
+    pub const fn carries_data(self) -> bool {
+        matches!(self.action_a, None | Some('T' | 't' | 'f' | 'q'))
+    }
+}
+
+impl KittyCompleted {
+    /// `a=a` animation state from the overloaded `s=` key. See
+    /// [`KittyApcParams::anim_state`].
+    #[must_use]
+    pub fn anim_state(&self) -> Option<u8> {
+        self.width_s.and_then(|s| u8::try_from(s).ok())
+    }
+
+    /// `a=a` loop count from the overloaded `v=` key. See
+    /// [`KittyApcParams::anim_loops`].
+    #[must_use]
+    pub fn anim_loops(&self) -> u32 {
+        self.height_v.unwrap_or(0)
+    }
+
+    /// 1-based frame number from the overloaded `c=` key. See
+    /// [`KittyApcParams::frame_c`].
+    #[must_use]
+    pub const fn frame_c(&self) -> u32 {
+        self.cols_c as u32
+    }
+
+    /// 1-based frame number from the overloaded `r=` key. See
+    /// [`KittyApcParams::frame_r`].
+    #[must_use]
+    pub const fn frame_r(&self) -> u32 {
+        self.rows_r as u32
+    }
+
+    /// Frame gap in milliseconds from the overloaded `z=` key. See
+    /// [`KittyApcParams::frame_gap_ms`].
+    #[must_use]
+    pub const fn frame_gap_ms(&self) -> i32 {
+        self.keys.z_index
+    }
+
+    /// Compose/blend mode from the overloaded `X=` key. See
+    /// [`KittyApcParams::compose_mode`].
+    #[must_use]
+    pub const fn compose_mode(&self) -> u32 {
+        self.keys.cell_x_offset
+    }
+
+    /// Frame background color from the overloaded `Y=` key. See
+    /// [`KittyApcParams::frame_background`].
+    #[must_use]
+    pub const fn frame_background(&self) -> u32 {
+        self.keys.cell_y_offset
+    }
 }
 
 /// Why an `APC G` buffer was rejected (fail-closed, warns, emits nothing).
@@ -132,6 +446,15 @@ pub enum KittyApcReject {
     BadMore,
     /// Base64 payload uses a non-alphabet byte or bad padding/length.
     BadBase64,
+    /// A control-only action (`a=p`/`d`/`a`/`c`/`q`) arrived with payload
+    /// bytes. Such commands carry no data; a body is either garbage or
+    /// smuggling, so the stream is dropped fail-closed.
+    UnexpectedPayload,
+    /// A `t=f`/`t=t`/`t=s` path or shm name failed sandbox validation:
+    /// empty, overlong, NUL-bearing, `..` traversal (file mediums),
+    /// malformed shm name, or a `t=t` path without the required
+    /// `tty-graphics-protocol` marker. No open is attempted.
+    BadPath,
     /// Raw `s`/`v` claim exceeds decode side/area/byte caps.
     OversizeClaim,
     /// Growth would exceed the parser payload budget.
@@ -151,6 +474,8 @@ impl std::fmt::Display for KittyApcReject {
             Self::BadAction => write!(f, "malformed kitty a= action"),
             Self::BadMore => write!(f, "malformed kitty m= flag"),
             Self::BadBase64 => write!(f, "invalid kitty base64 payload"),
+            Self::UnexpectedPayload => write!(f, "kitty control action with payload"),
+            Self::BadPath => write!(f, "kitty file/shm path rejected by sandbox"),
             Self::OversizeClaim => write!(f, "kitty s/v claim exceeds decode caps"),
             Self::Oversize => write!(f, "kitty payload exceeds parser budget"),
             Self::Orphan => write!(f, "kitty chunk without an open stream"),
@@ -160,9 +485,17 @@ impl std::fmt::Display for KittyApcReject {
 }
 
 /// Completed transmission: routing params plus assembled decoded bytes.
+///
+/// For direct (`t=d`) transmissions `payload` holds pixel (or
+/// zlib-compressed, already decompressed here) bytes. For local mediums
+/// (`t=f`/`t=t`/`t=s`) it holds the validated path/shm-name bytes: the
+/// terminal reads the pixels from the named object downstream (regular
+/// files only, temp-dir + marker rule for `t=t`, POSIX shm rules for
+/// `t=s`), applying `S=`/`O=` from [`KittyControlKeys`], still under the
+/// decode caps.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KittyCompleted {
-    /// Wire `f=` format value.
+    /// Wire `f=` format value (`0` for control-only actions, which omit it).
     pub format_f: u32,
     /// Wire `s=` width (`None` when absent).
     pub width_s: Option<u32>,
@@ -178,6 +511,8 @@ pub struct KittyCompleted {
     pub cursor_movement_c: u8,
     /// Assembled base64-decoded bytes across `m=` chunks.
     pub payload: Box<[u8]>,
+    /// Advanced control keys (medium, ids, rects, animation, deletion).
+    pub keys: KittyControlKeys,
 }
 
 /// Outcome of feeding one `APC G` buffer to the assembler.
@@ -205,6 +540,13 @@ struct PendingKitty {
     rows_r: u16,
     cursor_movement_c: u8,
     compressed: bool,
+    keys: KittyControlKeys,
+    /// Control-only action (`a=p`/`d`/`a`/`c`/`q`): completes single-shot
+    /// and must carry no payload bytes.
+    control_only: bool,
+    /// Animation frame stream (opened with `a=f`): continuations must
+    /// repeat `a=f` per the specification.
+    is_frame: bool,
     encoded_len: usize,
     /// Decoded-byte bound for this stream: IMG-1 for compressed or
     /// undeclared-size payloads, the exact declared size for raw claims.
@@ -541,11 +883,26 @@ impl KittyApcAssembler {
 
     /// Decoded-byte bound for a new stream, validated before buffering.
     ///
+    /// Local mediums (`t=f`/`t=t`/`t=s`) name a path rather than carrying
+    /// pixels: their bound is [`KITTY_APC_PATH_MAX_BYTES`], and an `S=`
+    /// read-size claim above the decode cap is refused up front so the
+    /// downstream read can never be tricked into an unbounded allocation.
+    /// Control-only actions carry no payload at all (bound `0`; any byte
+    /// is [`KittyApcReject::UnexpectedPayload`]).
     /// Uncompressed raw formats with a non-zero `s`/`v` claim are bounded by
     /// the exact declared size (checked against the decode caps here, so
-    /// oversize claims are refused on the first chunk). Compressed (`o=`)
+    /// oversize claims are refused on the first chunk). Compressed (`o=z`)
     /// and everything else keep the IMG-1 compressed cap.
     fn stream_limit(&self, params: &KittyApcParams) -> Result<usize, KittyApcReject> {
+        if !params.carries_data() {
+            return Ok(0);
+        }
+        if !params.keys.medium.is_direct() {
+            if usize::try_from(params.keys.data_size).unwrap_or(usize::MAX) > self.decode_cap {
+                return Err(KittyApcReject::OversizeClaim);
+            }
+            return Ok(KITTY_APC_PATH_MAX_BYTES);
+        }
         if params.compressed {
             return Ok(self.compressed_cap());
         }
@@ -646,7 +1003,7 @@ impl KittyApcAssembler {
         if self.pending.is_some() {
             // Fail closed on a malformed continuation: the open stream is
             // dropped with the chunk, never kept around for a later tail.
-            let more = match continuation_flags(after_g) {
+            let (more, action) = match continuation_flags(after_g) {
                 Ok(Continuation { delete: true, .. }) => {
                     self.abort();
                     let reason = KittyApcReject::Aborted;
@@ -654,8 +1011,10 @@ impl KittyApcAssembler {
                     return Err(reason);
                 }
                 Ok(Continuation {
-                    more: Some(more), ..
-                }) => more,
+                    more: Some(more),
+                    action,
+                    ..
+                }) => (more, action),
                 Ok(Continuation { more: None, .. }) => {
                     self.abort();
                     let reason = KittyApcReject::Aborted;
@@ -668,6 +1027,28 @@ impl KittyApcAssembler {
                     return Err(reason);
                 }
             };
+            // The action class must not change mid-stream: frame data
+            // (`a=f`) chunks must repeat `a=f` (the specification requires
+            // it on every chunk), and image-stream chunks must not smuggle
+            // frame data (or any other action) in. Anything else is a
+            // confused or hostile client; drop the stream, not just the
+            // chunk. A missing `a=` on a frame chunk is accepted leniently:
+            // payload bytes are indistinguishable, so stream binding alone
+            // decides, and strictness here would only break lenient senders.
+            let frame_stream = self.pending.as_ref().is_some_and(|p| p.is_frame);
+            let action_ok = match (frame_stream, action) {
+                (_, Some('d')) => false,
+                (true, Some('f')) | (true, None) => true,
+                (true, Some(_)) => false,
+                (false, Some('f')) => false,
+                (false, _) => action.is_none_or(|a| Some(a) == self.open_action()),
+            };
+            if !action_ok {
+                self.abort();
+                let reason = KittyApcReject::Aborted;
+                self.warn_reject(reason, "action change with open stream");
+                return Err(reason);
+            }
             // The continuation header itself is not progress: only decoded
             // payload resets the stall count (see `push_payload`), so a flood
             // of empty `m=1` chunks is bounded too.
@@ -699,15 +1080,30 @@ impl KittyApcAssembler {
                 rows_r: params.rows_r,
                 cursor_movement_c: params.cursor_movement_c,
                 compressed: params.compressed,
+                keys: params.keys,
+                control_only: !params.carries_data(),
+                is_frame: params.action_a == Some('f'),
                 encoded_len: 0,
                 limit,
                 interleaved: 0,
                 decoder: Base64Stream::default(),
                 payload: Vec::new(),
             });
-            self.current_final = Some(!params.more);
+            // Control-only actions (`a=p`/`d`/`a`/`c`/`q`) and local
+            // mediums (`t=f`/`t=t`/`t=s`) always complete single-shot:
+            // `m=` chunking is a remote-client (`t=d`) mechanism, and
+            // kitty/ghostty both ignore `m=` for local mediums (an `mpv`
+            // `t=s` reliance). A stray `m=1` on such a command completes
+            // rather than pinning an empty stream.
+            let single_shot = !params.carries_data() || !params.keys.medium.is_direct();
+            self.current_final = Some(single_shot || !params.more);
         }
         Ok(())
+    }
+
+    /// The `a=` action that opened the pending stream, if any.
+    fn open_action(&self) -> Option<char> {
+        self.pending.as_ref().and_then(|pending| pending.action_a)
     }
 
     pub(crate) fn push_payload(&mut self, payload: &[u8]) -> Result<(), KittyApcReject> {
@@ -716,11 +1112,18 @@ impl KittyApcAssembler {
         }
         let result = match self.pending.as_mut() {
             Some(pending) => {
-                if !payload.is_empty() {
-                    pending.interleaved = 0;
+                // Control-only actions must arrive bodiless: any byte is
+                // garbage or smuggling, never data. Falls into the shared
+                // abort-and-warn path below like any other payload error.
+                if pending.control_only && !payload.is_empty() {
+                    Err(KittyApcReject::UnexpectedPayload)
+                } else {
+                    if !payload.is_empty() {
+                        pending.interleaved = 0;
+                    }
+                    let available = pending.limit.min(self.budget.payload_limit);
+                    pending.push(payload, available, &mut self.budget)
                 }
-                let available = pending.limit.min(self.budget.payload_limit);
-                pending.push(payload, available, &mut self.budget)
             }
             None => Err(KittyApcReject::Orphan),
         };
@@ -755,6 +1158,36 @@ impl KittyApcAssembler {
                 .decoder
                 .finish(&mut pending.payload, available)
                 .and_then(|()| {
+                    if pending.control_only {
+                        // Belt and braces: `push_payload` already refuses
+                        // body bytes for control-only actions, so a
+                        // non-empty buffer here means an internal error —
+                        // still fail closed, never emit.
+                        if pending.payload.is_empty() {
+                            return Ok(());
+                        }
+                        return Err(KittyApcReject::UnexpectedPayload);
+                    }
+                    if !pending.keys.medium.is_direct() {
+                        // Local medium: the payload names a file/shm
+                        // object. Validate the name against the sandbox
+                        // before handing it downstream; the object itself
+                        // is opened (TOCTOU-safe, regular-file-checked)
+                        // and read under the decode caps there. Never
+                        // zlib-decompressed here: `o=z` on a local medium
+                        // describes the *stored* bytes, resolved after
+                        // the read.
+                        validate_kitty_path(pending.keys.medium, &pending.payload)?;
+                        if !self.budget.reserve_retained(pending.payload.capacity()) {
+                            return Err(KittyApcReject::Oversize);
+                        }
+                        return validate_raw_claim(
+                            pending.format_f,
+                            pending.width_s,
+                            pending.height_v,
+                            self.decode_cap,
+                        );
+                    }
                     if pending.compressed {
                         let out_cap = raw_claim_bytes(
                             pending.format_f,
@@ -807,6 +1240,7 @@ impl KittyApcAssembler {
             rows_r: pending.rows_r,
             cursor_movement_c: pending.cursor_movement_c,
             payload: pending.payload.into_boxed_slice(),
+            keys: pending.keys,
         })
     }
 }
@@ -835,8 +1269,17 @@ impl KittyApcAssembler {
 
 /// Parses the `G` control section (`key=value` pairs separated by `,`).
 ///
-/// Unknown keys are ignored. Known keys are strictly validated: any malformed
-/// known value rejects the whole transmission fail-closed.
+/// Known keys are strictly validated: any malformed known value rejects the
+/// whole transmission fail-closed. Unknown keys (including any multi-letter
+/// key) are ignored for future-proofing — a deliberate divergence from
+/// kitty, which reports unknown keys as errors: bitty parses the full
+/// control block so newer clients keep working, and unknown semantics stay
+/// inert downstream.
+///
+/// Data-carrying actions (absent action, `a=T`/`a=t`, frame data `a=f`,
+/// query `a=q`) require `f=`; control-only actions
+/// (`a=p`/`a=d`/`a=a`/`a=c`) omit it. `i=` and `I=` together are an error (the specification mandates
+/// `EINVAL`); `o=` accepts only `z`; `t=` accepts only `d`/`f`/`t`/`s`.
 fn parse_control(control: &[u8]) -> Result<KittyApcParams, KittyApcReject> {
     if control.is_empty() {
         return Err(KittyApcReject::MissingFormat);
@@ -850,6 +1293,7 @@ fn parse_control(control: &[u8]) -> Result<KittyApcParams, KittyApcReject> {
     let mut cursor_movement_c: u8 = 0;
     let mut more = false;
     let mut compressed = false;
+    let mut keys = KittyControlKeys::default();
     for piece in control.split(|&b| b == b',') {
         if piece.is_empty() {
             continue;
@@ -897,18 +1341,110 @@ fn parse_control(control: &[u8]) -> Result<KittyApcParams, KittyApcReject> {
                 };
             }
             b'o' => {
-                // Compressed payload (`o=z`): never the uncompressed raw
-                // bound, always the IMG-1 compressed cap.
-                compressed = !value.is_empty();
+                // Only `o=z` (zlib) exists. An empty value means
+                // uncompressed; anything else is a malformed claim, not
+                // a future codec to guess at.
+                match value {
+                    [] => compressed = false,
+                    b"z" => compressed = true,
+                    _ => return Err(KittyApcReject::MalformedControl),
+                }
+            }
+            b't' => {
+                keys.medium = match value {
+                    b"d" => KittyMedium::Direct,
+                    b"f" => KittyMedium::File,
+                    b"t" => KittyMedium::TempFile,
+                    b"s" => KittyMedium::SharedMemory,
+                    _ => return Err(KittyApcReject::MalformedControl),
+                };
+            }
+            b'i' => {
+                keys.image_id = parse_u32(value).ok_or(KittyApcReject::MalformedControl)?;
+            }
+            b'I' => {
+                keys.image_number = parse_u32(value).ok_or(KittyApcReject::MalformedControl)?;
+            }
+            b'p' => {
+                keys.placement_id = parse_u32(value).ok_or(KittyApcReject::MalformedControl)?;
+            }
+            b'q' => {
+                keys.quiet = parse_u8(value).ok_or(KittyApcReject::MalformedControl)?;
+            }
+            b'd' => {
+                keys.delete = match value {
+                    [] => None,
+                    [single] => Some(char::from(*single)),
+                    _ => return Err(KittyApcReject::MalformedControl),
+                };
+            }
+            b'x' => {
+                keys.src_x = parse_u32(value).ok_or(KittyApcReject::MalformedControl)?;
+            }
+            b'y' => {
+                keys.src_y = parse_u32(value).ok_or(KittyApcReject::MalformedControl)?;
+            }
+            b'w' => {
+                keys.src_w = parse_u32(value).ok_or(KittyApcReject::MalformedControl)?;
+            }
+            b'h' => {
+                keys.src_h = parse_u32(value).ok_or(KittyApcReject::MalformedControl)?;
+            }
+            b'X' => {
+                keys.cell_x_offset = parse_u32(value).ok_or(KittyApcReject::MalformedControl)?;
+            }
+            b'Y' => {
+                keys.cell_y_offset = parse_u32(value).ok_or(KittyApcReject::MalformedControl)?;
+            }
+            b'z' => {
+                keys.z_index = parse_i32(value).ok_or(KittyApcReject::MalformedControl)?;
+            }
+            b'U' => {
+                keys.unicode_placement = parse_u8(value).ok_or(KittyApcReject::MalformedControl)?;
+            }
+            b'P' => {
+                keys.parent_id = parse_u32(value).ok_or(KittyApcReject::MalformedControl)?;
+            }
+            b'Q' => {
+                keys.parent_placement_id =
+                    parse_u32(value).ok_or(KittyApcReject::MalformedControl)?;
+            }
+            b'H' => {
+                keys.parent_dx = parse_i32(value).ok_or(KittyApcReject::MalformedControl)?;
+            }
+            b'V' => {
+                keys.parent_dy = parse_i32(value).ok_or(KittyApcReject::MalformedControl)?;
+            }
+            b'S' => {
+                keys.data_size = parse_u32(value).ok_or(KittyApcReject::MalformedControl)?;
+            }
+            b'O' => {
+                keys.data_offset = parse_u32(value).ok_or(KittyApcReject::MalformedControl)?;
+            }
+            b'N' => {
+                keys.usage_hints = parse_u32(value).ok_or(KittyApcReject::MalformedControl)?;
             }
             _ => {
-                // Unknown single-letter keys (i, p, q, d, e, t, X, Y, w,
-                // h, x, y, z, R, ...): ignored for transmit/display.
+                // Unknown single-letter keys (`e`, `R`, ...): ignored for
+                // transmit/display (future-proof).
             }
         }
     }
-    let Some(format_f) = format_f else {
-        return Err(KittyApcReject::MissingFormat);
+    // `i=` and `I=` together are a specification error: fail closed
+    // rather than guessing which identity the client meant.
+    if keys.image_id != 0 && keys.image_number != 0 {
+        return Err(KittyApcReject::MalformedControl);
+    }
+    // `a=q` is a query action, but the specification's support probe
+    // carries image bytes for the terminal to test-load, so it is
+    // data-carrying like transmit (and `f=` stays mandatory for it).
+    let carries_data = matches!(action_a, None | Some('T' | 't' | 'f' | 'q'));
+    let format_f = match (format_f, carries_data) {
+        (Some(format), _) => format,
+        // Control-only actions omit `f=`; record `0` (absent) so the
+        // completed value stays a plain `u32` like the transmit path.
+        (None, false) => 0,
+        (None, true) => return Err(KittyApcReject::MissingFormat),
     };
     Ok(KittyApcParams {
         format_f,
@@ -920,6 +1456,7 @@ fn parse_control(control: &[u8]) -> Result<KittyApcParams, KittyApcReject> {
         cursor_movement_c,
         more,
         compressed,
+        keys,
     })
 }
 
@@ -930,15 +1467,22 @@ struct Continuation {
     more: Option<bool>,
     /// `a=d`: a delete command, which must abort a partial upload.
     delete: bool,
+    /// Explicit `a=` value when present (`None` when absent). Frame
+    /// streams require `a=f` here; image streams accept no action change.
+    action: Option<char>,
 }
 
-/// Scans a continuation control section for `m=` and a delete action.
+/// Scans a continuation control section for `m=`, `a=d`, and an explicit
+/// action.
 ///
-/// Other keys are ignored (a continuation should carry only `m` and `q`).
+/// A continuation should carry only `m` and `q`, except animation frame
+/// chunks which must also repeat `a=f`. Anything else is policed by the
+/// caller against the open stream's action class.
 fn continuation_flags(control: &[u8]) -> Result<Continuation, KittyApcReject> {
     let mut flags = Continuation {
         more: None,
         delete: false,
+        action: None,
     };
     for piece in control.split(|&b| b == b',') {
         let Some(eq) = piece.iter().position(|&b| b == b'=') else {
@@ -956,10 +1500,74 @@ fn continuation_flags(control: &[u8]) -> Result<Continuation, KittyApcReject> {
                 });
             }
             b"a" if value == b"d" => flags.delete = true,
+            b"a" => {
+                flags.action = match value {
+                    [] => None,
+                    [single] => Some(char::from(*single)),
+                    _ => return Err(KittyApcReject::BadAction),
+                };
+            }
             _ => {}
         }
     }
     Ok(flags)
+}
+
+/// Sandbox validation for a `t=f`/`t=t`/`t=s` name (decoded payload bytes).
+///
+/// This is the parse-time half of the sandbox: pure string-shape checks
+/// that need no I/O and therefore belong in the headless parser. The
+/// open-time half (open-before-validate against TOCTOU, regular-file
+/// check, temp-dir containment, actual read under the decode caps) runs
+/// where the object is opened downstream, following ghostty's
+/// `readFile`/`readSharedMemory` order.
+///
+/// - Every medium: non-empty, at most [`KITTY_APC_PATH_MAX_BYTES`] bytes
+///   (already bounded by the stream limit; re-checked for direct calls),
+///   no NUL bytes.
+/// - `t=s`: strict POSIX shm shape — starts with `/`, carries no other
+///   `/`, and fits [`KITTY_APC_SHM_NAME_MAX`] (ghostty
+///   `validSharedMemoryName` parity; the kitty specification mandates
+///   the same shape).
+/// - `t=t`: must contain [`KITTY_APC_TMP_NAME_MARKER`].
+/// - `t=f`/`t=t`: no `..` path component (lexical traversal can never
+///   resolve inside an allowed root, so reject it before any open).
+///
+/// Anything else — including a relative `t=f` path without `..`, which
+/// the opener resolves and contains — passes to the open-time checks.
+fn validate_kitty_path(medium: KittyMedium, name: &[u8]) -> Result<(), KittyApcReject> {
+    if name.is_empty() || name.len() > KITTY_APC_PATH_MAX_BYTES || name.contains(&0) {
+        return Err(KittyApcReject::BadPath);
+    }
+    match medium {
+        KittyMedium::Direct => Ok(()),
+        KittyMedium::SharedMemory => {
+            let valid = name.len() >= 2
+                && name.len() <= KITTY_APC_SHM_NAME_MAX
+                && name[0] == b'/'
+                && !name[1..].contains(&b'/');
+            if valid {
+                Ok(())
+            } else {
+                Err(KittyApcReject::BadPath)
+            }
+        }
+        KittyMedium::File | KittyMedium::TempFile => {
+            if medium == KittyMedium::TempFile
+                && !name
+                    .windows(KITTY_APC_TMP_NAME_MARKER.len())
+                    .any(|w| w == KITTY_APC_TMP_NAME_MARKER.as_bytes())
+            {
+                return Err(KittyApcReject::BadPath);
+            }
+            // Lexical traversal: any `..` component escapes whatever root
+            // the opener contains the path to.
+            if name.split(|&b| b == b'/').any(|c| c == b"..") {
+                return Err(KittyApcReject::BadPath);
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Rejects oversize raw `s`/`v` claims before any pixel buffer could exist.
@@ -1055,6 +1663,30 @@ fn parse_u8(value: &[u8]) -> Option<u8> {
         acc = acc.checked_mul(10)?.checked_add(b - b'0')?;
     }
     Some(acc)
+}
+
+/// Strict ASCII decimal `i32` (optional leading `-`, no `+`, no
+/// whitespace, no empty). Used for the signed wire keys `z`, `H`, `V`.
+fn parse_i32(value: &[u8]) -> Option<i32> {
+    let (negative, digits) = match value.strip_prefix(b"-") {
+        Some(rest) => (true, rest),
+        None => (false, value),
+    };
+    if digits.is_empty() || digits.len() > 10 {
+        return None;
+    }
+    // `i32::MIN` has no positive mirror: accept its exact digits.
+    if negative && digits == b"2147483648" {
+        return Some(i32::MIN);
+    }
+    let mut acc: i32 = 0;
+    for &b in digits {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        acc = acc.checked_mul(10)?.checked_add(i32::from(b - b'0'))?;
+    }
+    Some(if negative { acc.checked_neg()? } else { acc })
 }
 
 #[cfg(test)]
@@ -1659,7 +2291,8 @@ mod tests {
             continuation_flags(b"m=1,m=0"),
             Ok(Continuation {
                 more: Some(false),
-                delete: false
+                delete: false,
+                action: None,
             })
         );
         assert_eq!(continuation_flags(b"m=0,m=x"), Err(KittyApcReject::BadMore));
@@ -1857,5 +2490,472 @@ mod tests {
             KittyFeedOutcome::Rejected(KittyApcReject::OversizeClaim)
         ));
         assert!(!assembler.has_pending());
+    }
+
+    // -- Advanced subset (CTX-0950): placement, animation, local mediums.
+
+    fn path_command(header: &str, path: &[u8]) -> Vec<u8> {
+        let mut raw = header.as_bytes().to_vec();
+        raw.extend_from_slice(base64_encode(path).as_bytes());
+        raw
+    }
+
+    #[test]
+    fn place_action_completes_without_format() {
+        // `a=p` displays a previously transmitted image: no `f=`, no
+        // payload, just ids and spans.
+        let done = completed(b"Ga=p,i=42,p=7,c=20,r=10;");
+        assert_eq!(done.format_f, 0);
+        assert_eq!(done.action_a, Some('p'));
+        assert_eq!(done.keys.image_id, 42);
+        assert_eq!(done.keys.placement_id, 7);
+        assert_eq!((done.cols_c, done.rows_r), (20, 10));
+        assert_eq!(done.keys.medium, KittyMedium::Direct);
+        assert!(done.payload.is_empty());
+    }
+
+    #[test]
+    fn virtual_placement_flag_and_negative_z_index() {
+        // yazi-style virtual placement: `U=1` prototype with a negative
+        // z-index (under text).
+        let done = completed(b"Ga=p,U=1,i=9,c=4,r=2,z=-5;");
+        assert!(done.keys.is_virtual_placement());
+        assert_eq!(done.keys.z_index, -5);
+        // Below `INT32_MIN/2` draws under non-default cell backgrounds:
+        // the extreme value must still parse.
+        let done = completed(b"Ga=p,U=1,i=9,c=4,r=2,z=-1073741825;");
+        assert_eq!(done.keys.z_index, -1_073_741_825);
+        let done = completed(b"Ga=p,i=9,z=-2147483648;");
+        assert_eq!(done.keys.z_index, i32::MIN);
+    }
+
+    #[test]
+    fn signed_keys_reject_malformed_values() {
+        for raw in [
+            b"Ga=p,i=1,z=;".as_slice(),
+            b"Ga=p,i=1,z=--1;".as_slice(),
+            b"Ga=p,i=1,z=abc;".as_slice(),
+            b"Ga=p,i=1,H=+2;".as_slice(),
+            b"Ga=p,i=1,V=1.5;".as_slice(),
+            b"Ga=p,i=1,z=2147483648;".as_slice(),
+        ] {
+            let mut assembler = KittyApcAssembler::new();
+            assert!(
+                matches!(
+                    assembler.feed(raw),
+                    KittyFeedOutcome::Rejected(KittyApcReject::MalformedControl)
+                ),
+                "expected MalformedControl for {raw:?}"
+            );
+            assert!(!assembler.has_pending());
+        }
+    }
+
+    #[test]
+    fn control_actions_complete_bodiless() {
+        // Delete, animation control, and compose carry keys only.
+        // `f=` is meaningless for them and must be omittable.
+        // (`a=q` is not in this list: the support probe must test-load
+        // bytes, so it is data-carrying and `f=` stays mandatory.)
+        let done = completed(b"Ga=d;");
+        assert_eq!((done.format_f, done.action_a), (0, Some('d')));
+        let done = completed(b"Ga=d,d=i,i=10,p=7;");
+        assert_eq!(done.keys.delete, Some('i'));
+        assert_eq!(done.keys.image_id, 10);
+        assert_eq!(done.keys.placement_id, 7);
+        let done = completed(b"Ga=d,d=Z,z=-1;");
+        assert_eq!(done.keys.delete, Some('Z'));
+        assert_eq!(done.keys.z_index, -1);
+        let done = completed(b"Ga=a,i=7,r=3,z=48;");
+        assert_eq!(done.frame_r(), 3);
+        assert_eq!(done.frame_gap_ms(), 48);
+        let done = completed(b"Ga=c,i=1,r=7,c=9,w=23,h=27,X=4,Y=8,x=1,y=3;");
+        assert_eq!(done.keys.image_id, 1);
+        assert_eq!((done.frame_r(), done.frame_c()), (7, 9));
+        assert_eq!((done.keys.src_w, done.keys.src_h), (23, 27));
+        assert_eq!(done.compose_mode(), 4);
+        assert_eq!((done.keys.src_x, done.keys.src_y), (1, 3));
+        // A bodiless `a=q` names nothing to test-load: `f=` is mandatory
+        // for queries, so this fails closed instead of completing.
+        let mut assembler = KittyApcAssembler::new();
+        assert!(matches!(
+            assembler.feed(b"Ga=q,i=5;"),
+            KittyFeedOutcome::Rejected(KittyApcReject::MissingFormat)
+        ));
+        assert!(!assembler.has_pending());
+    }
+
+    #[test]
+    fn query_action_carries_probe_data() {
+        // The specification's support probe (`a=q` with `f=` and bytes)
+        // must complete with its payload instead of being refused.
+        let done = completed(b"Gf=24,a=q,t=d;AAAA");
+        assert_eq!(done.action_a, Some('q'));
+        assert!(!done.payload.is_empty());
+    }
+
+    #[test]
+    fn animation_control_state_and_loops() {
+        // The overloaded `s=`/`v=` keys carry state and loop count for
+        // `a=a` (ghostty `Animation.State`, kitty `s=`/`v=` semantics).
+        let done = completed(b"Ga=a,i=3,c=7;");
+        assert_eq!(done.frame_c(), 7);
+        assert_eq!(done.anim_state(), None);
+        let done = completed(b"Ga=a,i=7,s=3,v=1;");
+        assert_eq!(done.anim_state(), Some(3));
+        assert_eq!(done.anim_loops(), 1);
+        // Gapless frame: negative gap is skipped during playback.
+        let done = completed(b"Ga=a,i=7,r=2,z=-1;");
+        assert_eq!(done.frame_gap_ms(), -1);
+    }
+
+    #[test]
+    fn relative_placement_keys_parsed() {
+        let done = completed(b"Ga=p,i=2,p=3,P=9,Q=4,H=-1,V=2;");
+        assert!(done.keys.has_parent());
+        assert_eq!(done.keys.parent_id, 9);
+        assert_eq!(done.keys.parent_placement_id, 4);
+        assert_eq!((done.keys.parent_dx, done.keys.parent_dy), (-1, 2));
+        // Virtual prototypes cannot be relative (kitty `EINVAL`): the
+        // parser still reports both halves; the store refuses the mix.
+        let done = completed(b"Ga=p,U=1,i=2,P=9;");
+        assert!(done.keys.is_virtual_placement() && done.keys.has_parent());
+    }
+
+    #[test]
+    fn frame_data_requires_format_like_transmit() {
+        // `a=f` carries pixels: `f=` stays mandatory.
+        let mut assembler = KittyApcAssembler::new();
+        assert!(matches!(
+            assembler.feed(b"Ga=f,i=1,m=0;"),
+            KittyFeedOutcome::Rejected(KittyApcReject::MissingFormat)
+        ));
+        assert!(!assembler.has_pending());
+        // With `f=`, empty frame data completes (downstream validates
+        // the rectangle against the image).
+        let done = completed(b"Gf=32,a=f,i=1,s=2,v=2,m=0;");
+        assert_eq!(done.action_a, Some('f'));
+        assert!(done.payload.is_empty());
+    }
+
+    #[test]
+    fn control_action_with_payload_is_rejected() {
+        // (`a=q` is not control-only: it carries the probe bytes, so its
+        // payload case lives in `query_action_carries_probe_data`. A bare
+        // `a=q` with bytes but no `f=` is `MissingFormat`, not
+        // `UnexpectedPayload`.)
+        for raw in [
+            b"Ga=d;eHh4".as_slice(),
+            b"Ga=p,i=1;AA==".as_slice(),
+            b"Ga=a,i=1;AA==".as_slice(),
+        ] {
+            let mut assembler = KittyApcAssembler::new();
+            assert!(
+                matches!(
+                    assembler.feed(raw),
+                    KittyFeedOutcome::Rejected(KittyApcReject::UnexpectedPayload)
+                ),
+                "expected UnexpectedPayload for {raw:?}"
+            );
+            assert!(!assembler.has_pending());
+        }
+    }
+
+    #[test]
+    fn image_id_and_number_together_rejected() {
+        // The specification calls `i=` + `I=` an error (`EINVAL`).
+        let mut assembler = KittyApcAssembler::new();
+        assert!(matches!(
+            assembler.feed(b"Gf=32,i=1,I=2,m=0;"),
+            KittyFeedOutcome::Rejected(KittyApcReject::MalformedControl)
+        ));
+        assert!(!assembler.has_pending());
+        // Either alone is fine.
+        assert_eq!(completed(b"Gf=32,I=13,m=0;").keys.image_number, 13);
+        assert_eq!(completed(b"Gf=32,i=0,I=13,m=0;").keys.image_number, 13);
+    }
+
+    #[test]
+    fn bad_medium_and_compression_rejected() {
+        for raw in [
+            b"Gf=32,t=x,m=0;".as_slice(),
+            b"Gf=32,t=D,m=0;".as_slice(),
+            b"Gf=32,o=x,m=0;".as_slice(),
+            b"Gf=32,o=zz,m=0;".as_slice(),
+        ] {
+            let mut assembler = KittyApcAssembler::new();
+            assert!(
+                matches!(
+                    assembler.feed(raw),
+                    KittyFeedOutcome::Rejected(KittyApcReject::MalformedControl)
+                ),
+                "expected MalformedControl for {raw:?}"
+            );
+        }
+        // `o=` empty stays uncompressed; `t=d` is the explicit default.
+        let done = completed(b"Gf=32,o=,t=d,m=0;");
+        assert!(done.keys.medium.is_direct());
+    }
+
+    #[test]
+    fn shm_name_shape_enforced() {
+        // Valid POSIX shm name: completes with the name as payload.
+        let done = completed(&path_command("Gf=100,t=s,m=0;", b"/kitty-123"));
+        assert_eq!(done.keys.medium, KittyMedium::SharedMemory);
+        assert_eq!(&*done.payload, b"/kitty-123");
+        for bad in [
+            b"noslash".as_slice(),
+            b"/".as_slice(),
+            b"/a/b".as_slice(),
+            b"/trailing/".as_slice(),
+            b"".as_slice(),
+        ] {
+            let mut assembler = KittyApcAssembler::new();
+            assert!(
+                matches!(
+                    assembler.feed(&path_command("Gf=100,t=s,m=0;", bad)),
+                    KittyFeedOutcome::Rejected(KittyApcReject::BadPath)
+                ),
+                "expected BadPath for {bad:?}"
+            );
+            assert!(!assembler.has_pending());
+        }
+        // Overlong shm name (past NAME_MAX) fails closed.
+        let long = vec![b'a'; KITTY_APC_SHM_NAME_MAX + 1];
+        let mut name = b"/".to_vec();
+        name.extend_from_slice(&long);
+        let mut assembler = KittyApcAssembler::new();
+        assert!(matches!(
+            assembler.feed(&path_command("Gf=100,t=s,m=0;", &name)),
+            KittyFeedOutcome::Rejected(KittyApcReject::BadPath)
+        ));
+        // NUL bytes never name an object.
+        let mut assembler = KittyApcAssembler::new();
+        assert!(matches!(
+            assembler.feed(&path_command("Gf=100,t=s,m=0;", b"/a\x00b")),
+            KittyFeedOutcome::Rejected(KittyApcReject::BadPath)
+        ));
+    }
+
+    #[test]
+    fn local_medium_ignores_chunking_flag() {
+        // kitty/ghostty complete local mediums single-shot even with
+        // `m=1` (`mpv` relies on this for `t=s`).
+        let mut assembler = KittyApcAssembler::new();
+        match assembler.feed(&path_command("Gf=100,t=s,m=1;", b"/mpv-shm")) {
+            KittyFeedOutcome::Completed(done) => {
+                assert_eq!(&*done.payload, b"/mpv-shm");
+            }
+            other => panic!("expected single-shot completion, got {other:?}"),
+        }
+        assert!(!assembler.has_pending());
+    }
+
+    #[test]
+    fn file_medium_rejects_traversal_and_nul() {
+        let done = completed(&path_command("Gf=100,t=f,m=0;", b"/tmp/tty-ok/x.png"));
+        assert_eq!(done.keys.medium, KittyMedium::File);
+        assert_eq!(&*done.payload, b"/tmp/tty-ok/x.png");
+        for bad in [
+            b"/tmp/../etc/passwd".as_slice(),
+            b"..".as_slice(),
+            b"a/../../b".as_slice(),
+            b"/x/../y".as_slice(),
+            b"/a\x00b".as_slice(),
+            b"".as_slice(),
+        ] {
+            let mut assembler = KittyApcAssembler::new();
+            assert!(
+                matches!(
+                    assembler.feed(&path_command("Gf=100,t=f,m=0;", bad)),
+                    KittyFeedOutcome::Rejected(KittyApcReject::BadPath)
+                ),
+                "expected BadPath for {bad:?}"
+            );
+            assert!(!assembler.has_pending());
+        }
+        // A relative path without `..` passes parse-time (the opener
+        // contains it); `..`-free absolute paths always pass here.
+        let done = completed(&path_command("Gf=100,t=f,m=0;", b"relative/x.png"));
+        assert_eq!(&*done.payload, b"relative/x.png");
+    }
+
+    #[test]
+    fn temp_file_requires_protocol_marker() {
+        let done = completed(&path_command(
+            "Gf=100,t=t,m=0;",
+            b"/tmp/tty-graphics-protocol-1",
+        ));
+        assert_eq!(done.keys.medium, KittyMedium::TempFile);
+        let mut assembler = KittyApcAssembler::new();
+        assert!(matches!(
+            assembler.feed(&path_command("Gf=100,t=t,m=0;", b"/tmp/other-file")),
+            KittyFeedOutcome::Rejected(KittyApcReject::BadPath)
+        ));
+        assert!(!assembler.has_pending());
+    }
+
+    #[test]
+    fn oversize_read_size_claim_rejected_up_front() {
+        // `S=` above the decode cap can never be satisfied: refuse on the
+        // first chunk, before buffering anything.
+        let header = format!("Gf=100,t=f,S={},m=0;", KITTY_APC_DECODE_MAX_BYTES + 1);
+        let mut assembler = KittyApcAssembler::new();
+        assert!(matches!(
+            assembler.feed(&path_command(&header, b"/tmp/tty-ok/x.png")),
+            KittyFeedOutcome::Rejected(KittyApcReject::OversizeClaim)
+        ));
+        assert!(!assembler.has_pending());
+        assert_eq!(assembler.peak_memory(), 0);
+        // A satisfiable `S=`/`O=` pair rides along for the downstream read.
+        let done = completed(&path_command(
+            "Gf=100,t=f,S=80,O=10,m=0;",
+            b"/tmp/tty-ok/x.png",
+        ));
+        assert_eq!((done.keys.data_size, done.keys.data_offset), (80, 10));
+    }
+
+    #[test]
+    fn path_payload_bounded_by_path_cap() {
+        // A path stream can never grow past `PATH_MAX`: the ledger cap
+        // does not apply (and must not be reachable through `t=s`).
+        let big = vec![0x5a_u8; KITTY_APC_PATH_MAX_BYTES + 1];
+        let mut assembler = KittyApcAssembler::new();
+        assert!(matches!(
+            assembler.feed(&path_command("Gf=100,t=f,m=0;", &big)),
+            KittyFeedOutcome::Rejected(KittyApcReject::Oversize)
+        ));
+        assert!(assembler.peak_memory() <= KITTY_APC_PATH_MAX_BYTES);
+    }
+
+    #[test]
+    fn frame_stream_continuation_rules() {
+        // Frame chunks repeat `a=f` (specification MUST).
+        let mut assembler = KittyApcAssembler::new();
+        assert!(matches!(
+            assembler.feed(b"Gf=32,s=2,v=2,a=f,i=3,m=1;/wAA//8A"),
+            KittyFeedOutcome::NeedMore { .. }
+        ));
+        // 6 bytes down, 10 to go (2x2 RGBA = 16 declared).
+        let tail10 = base64_encode(&[0x41; 10]);
+        let tail = format!("Ga=f,m=0;{tail10}");
+        match assembler.feed(tail.as_bytes()) {
+            KittyFeedOutcome::Completed(done) => {
+                assert_eq!(done.payload.len(), 16);
+                assert_eq!(done.keys.image_id, 3);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        // A missing `a=` on a frame tail is accepted leniently: stream
+        // binding decides, payload bytes are indistinguishable.
+        let mut assembler = KittyApcAssembler::new();
+        assert!(matches!(
+            assembler.feed(b"Gf=32,s=1,v=1,a=f,i=3,m=1;/wAA/w=="),
+            KittyFeedOutcome::NeedMore { .. }
+        ));
+        assert!(matches!(
+            assembler.feed(b"Gm=0;"),
+            KittyFeedOutcome::Completed(_)
+        ));
+        // An explicit action change mid-frame-stream aborts the stream.
+        let mut assembler = KittyApcAssembler::new();
+        assert!(matches!(
+            assembler.feed(b"Gf=32,s=1,v=1,a=f,i=3,m=1;/wAA/w=="),
+            KittyFeedOutcome::NeedMore { .. }
+        ));
+        assert!(matches!(
+            assembler.feed(b"Ga=T,m=0;/wAA/w=="),
+            KittyFeedOutcome::Rejected(KittyApcReject::Aborted)
+        ));
+        assert!(!assembler.has_pending());
+        // Frame data can never continue an image stream.
+        let mut assembler = KittyApcAssembler::new();
+        assert!(matches!(
+            assembler.feed(b"Gf=32,s=1,v=1,m=1;/wAA/w=="),
+            KittyFeedOutcome::NeedMore { .. }
+        ));
+        assert!(matches!(
+            assembler.feed(b"Ga=f,m=0;/wAA/w=="),
+            KittyFeedOutcome::Rejected(KittyApcReject::Aborted)
+        ));
+        assert!(!assembler.has_pending());
+    }
+
+    #[test]
+    fn image_stream_rejects_explicit_action_change() {
+        // Image-stream tails carry only `m`/`q`: an explicit `a=` is a
+        // protocol violation and drops the stream (spec: finish all
+        // chunks before any other graphics command).
+        let mut assembler = KittyApcAssembler::new();
+        assert!(matches!(
+            assembler.feed(b"Gf=32,s=1,v=1,m=1;/wAA/w=="),
+            KittyFeedOutcome::NeedMore { .. }
+        ));
+        assert!(matches!(
+            assembler.feed(b"Ga=T,m=0;/wAA/w=="),
+            KittyFeedOutcome::Rejected(KittyApcReject::Aborted)
+        ));
+        assert!(!assembler.has_pending());
+    }
+
+    #[test]
+    fn frame_data_chunks_reassemble() {
+        // Multi-chunk `a=f` frame upload with the required repeats.
+        let raw = [0x11_u8, 0x22, 0x33, 0x44];
+        let encoded = base64_encode(&raw);
+        let mid = encoded.len() / 2;
+        let mut assembler = KittyApcAssembler::new();
+        let opener = format!("Gf=32,s=2,v=2,a=f,i=9,m=1;{}", &encoded[..mid]);
+        assert!(matches!(
+            assembler.feed(opener.as_bytes()),
+            KittyFeedOutcome::NeedMore { .. }
+        ));
+        let tail = format!("Ga=f,m=0;{}", &encoded[mid..]);
+        match assembler.feed(tail.as_bytes()) {
+            KittyFeedOutcome::Completed(done) => {
+                assert_eq!(done.action_a, Some('f'));
+                assert_eq!(done.keys.image_id, 9);
+                assert_eq!(&*done.payload, &raw);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pending_frame_stream_drop_clears_state() {
+        // A malformed tail drops the frame stream like an image stream.
+        let mut assembler = KittyApcAssembler::new();
+        assert!(matches!(
+            assembler.feed(b"Gf=32,s=1,v=1,a=f,i=3,m=1;/wAA/w=="),
+            KittyFeedOutcome::NeedMore { .. }
+        ));
+        assert!(matches!(
+            assembler.feed(b"Ga=f,m=x;"),
+            KittyFeedOutcome::Rejected(KittyApcReject::BadMore)
+                | KittyFeedOutcome::Rejected(KittyApcReject::Aborted)
+        ));
+        assert!(!assembler.has_pending());
+    }
+
+    #[test]
+    fn delete_selectors_and_quiet_parsed() {
+        for (raw, delete, quiet) in [
+            (b"Ga=d,d=a;".as_slice(), Some('a'), 0),
+            (b"Ga=d,d=A,q=1;".as_slice(), Some('A'), 1),
+            (b"Ga=d,d=c,q=2;".as_slice(), Some('c'), 2),
+            (b"Ga=d,d=F,i=4;".as_slice(), Some('F'), 0),
+            (b"Ga=d,d=p,x=3,y=4;".as_slice(), Some('p'), 0),
+            (b"Ga=d,d=q,x=3,y=4,z=2;".as_slice(), Some('q'), 0),
+            (b"Ga=d,d=r,x=2,y=9;".as_slice(), Some('r'), 0),
+            (b"Ga=d,d=x,x=3;".as_slice(), Some('x'), 0),
+            (b"Ga=d,d=y,y=3;".as_slice(), Some('y'), 0),
+            (b"Ga=d,d=z,z=0;".as_slice(), Some('z'), 0),
+            (b"Ga=d,d=n,I=5;".as_slice(), Some('n'), 0),
+        ] {
+            let done = completed(raw);
+            assert_eq!(done.keys.delete, delete, "for {raw:?}");
+            assert_eq!(done.keys.quiet, quiet, "for {raw:?}");
+            assert!(done.payload.is_empty());
+        }
     }
 }

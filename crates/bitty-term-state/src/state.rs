@@ -10,8 +10,8 @@ use std::collections::VecDeque;
 
 use bitty_vt::{
     AttributeChange, AttributeDiff, BoundedString, Col, Count, CursorStyle, Direction,
-    EraseDisplayMode, EraseLineMode, Mode, Row, SequenceKind, StatusKind, TabTargets,
-    TerminalAction, ZoneKind,
+    EraseDisplayMode, EraseLineMode, KittyControlKeys, Mode, Row, SequenceKind, StatusKind,
+    TabTargets, TerminalAction, ZoneKind,
 };
 
 use crate::cell::{
@@ -27,6 +27,7 @@ use crate::grid::{Grid, ScreenPair};
 use crate::image::ImageStore;
 use crate::kitty_unicode::{KittyUnicodeCell, KittyUnicodeRunCells};
 use crate::modes::{AltScreen, EnhancedKeyboardState, Modes};
+use crate::placement::{KittyAnimState, KittyDeleteSelector, KittyPlacement, PlacementStore};
 use crate::replies::Replies;
 use crate::scrollback::{ClearedRange, SCROLLBACK_DEFAULT_LINES, Scrollback, ScrollbackLine};
 use crate::tabs::TabStops;
@@ -160,6 +161,11 @@ pub struct TelemetryCounters {
     pub unknown_dcs: u64,
     /// Unmapped OSC codes.
     pub unknown_osc: u64,
+    /// Kitty graphics commands refused after parsing (unknown delete
+    /// selector, missing relative parent, virtual/relative mix,
+    /// unresolvable animation target, over-cap frames). The wire bytes
+    /// were well-formed; the request itself could not be honored.
+    pub kitty_refused: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -229,6 +235,11 @@ pub struct State {
     batch_scroll_events: Vec<(u64, u64)>,
     telemetry: TelemetryCounters,
     images: ImageStore,
+    /// Kitty graphics placements + animation descriptors (CTX-0950).
+    ///
+    /// Grid-anchored display records for `a=p`/`a=T` and virtual
+    /// (`U=1`) prototypes for `U+10EEEE` runs; pixels live downstream.
+    kitty_placements: PlacementStore,
 }
 
 impl Default for State {
@@ -283,6 +294,7 @@ impl State {
             batch_scroll_events: Vec::new(),
             telemetry: TelemetryCounters::default(),
             images: ImageStore::new(),
+            kitty_placements: PlacementStore::new(),
         }
     }
 
@@ -958,6 +970,17 @@ impl State {
         &self.images
     }
 
+    /// The kitty placement store (CTX-0950, issue #1668).
+    ///
+    /// Grid-anchored display records and virtual prototypes plus bounded
+    /// animation descriptors. The renderer composites them once decoded
+    /// pixels arrive downstream; text-erase commands other than full
+    /// clear leave them alone per the specification.
+    #[must_use]
+    pub fn kitty_placements(&self) -> &PlacementStore {
+        &self.kitty_placements
+    }
+
     #[must_use]
     pub fn telemetry(&self) -> TelemetryCounters {
         self.telemetry
@@ -1247,10 +1270,30 @@ impl State {
                 self.record_zone(*kind, *exit_code);
             }
             TerminalAction::OscUnknown { .. } => self.telemetry.unknown_osc += 1,
-            // Kitty graphics (CTX-0256): grid truth is untouched. Images live
-            // in the runtime `KittyImageLayer`, which routes this action to
-            // `kitty_display_image`; state stays inert by design.
-            TerminalAction::KittyGraphics { .. } => {}
+            // Kitty graphics (CTX-0256 base, CTX-0950 advanced): pixel
+            // decode and paint live downstream (`KittyImageLayer` routes
+            // to `kitty_display_image`), but placement, deletion,
+            // animation, and lifetime are Terminal Truth: grid anchors
+            // must scroll with text and die on clear/reset, so they are
+            // recorded here.
+            TerminalAction::KittyGraphics {
+                action_a,
+                width_s,
+                height_v,
+                cols_c,
+                rows_r,
+                cursor_movement_c,
+                control,
+                ..
+            } => self.kitty_graphics(KittyCommand {
+                action: *action_a,
+                width_s: *width_s,
+                height_v: *height_v,
+                cols: *cols_c,
+                rows: *rows_r,
+                cursor_move: *cursor_movement_c,
+                keys: *control,
+            }),
 
             // Kitty keyboard progressive-enhancement negotiation (CTX-0575).
             // The bounded register and push/pop stack live in the mode
@@ -1506,6 +1549,311 @@ impl State {
             self.cursor.pending_wrap = self.modes.auto_wrap;
         } else {
             self.cursor.position.col = advanced as u16;
+        }
+    }
+
+    /// Applies one completed Kitty graphics command (CTX-0950).
+    ///
+    /// Pixel decode, file/shm reads, and paint stay downstream; what is
+    /// recorded here is display intent that the grid owns: placement
+    /// anchors (which scroll with text and die on clear), deletion, and
+    /// animation descriptors. Well-formed wire that names nothing
+    /// actionable (unknown action, unresolvable animation target,
+    /// over-cap frame, missing relative parent) is refused with a
+    /// telemetry tick, never a panic and never grid damage.
+    fn kitty_graphics(&mut self, cmd: KittyCommand) {
+        let KittyCommand {
+            action,
+            width_s,
+            height_v,
+            cols,
+            rows,
+            cursor_move,
+            keys,
+        } = cmd;
+        match action {
+            None | Some('T') | Some('p') => {
+                self.kitty_place(cols, rows, cursor_move, keys);
+                if keys.image_number != 0 && keys.image_id != 0 {
+                    self.kitty_placements
+                        .register_number(keys.image_number, keys.image_id);
+                }
+            }
+            // Transmit-only stores without painting: no placement, no
+            // cursor motion. The number mapping still lets later `a=p`
+            // and `a=a` commands address the image by number.
+            Some('t') => {
+                if keys.image_number != 0 && keys.image_id != 0 {
+                    self.kitty_placements
+                        .register_number(keys.image_number, keys.image_id);
+                }
+            }
+            Some('d') => self.kitty_delete(keys),
+            Some('f') => self.kitty_frame_data(rows, keys),
+            Some('a') => self.kitty_anim_control(width_s, height_v, cols, rows, keys),
+            // `a=c` composes pixel rectangles between frames: a pure
+            // pixel op resolved downstream with the decode, with no
+            // grid truth of its own. `a=q` queries are answered by the
+            // runtime (which owns the PTY write path). Unknown actions
+            // stay stored-not-painted downstream.
+            Some(_) => {}
+        }
+    }
+
+    /// Records an `a=p` (or sized `a=T`) placement at the cursor.
+    ///
+    /// Virtual prototypes (`U=1`) need explicit `c=`/`r=` spans and take
+    /// no anchor; relative placements resolve the parent anchor plus the
+    /// `H=`/`V=` offset (a missing parent, or a virtual child, refuses
+    /// the placement, mirroring `ENOPARENT`/`EINVAL`). The cursor moves
+    /// past the span unless `C=1`, the placement is virtual, or it is
+    /// relative (the specification forbids cursor motion for relatives
+    /// regardless of `C=`).
+    fn kitty_place(&mut self, cols: u16, rows: u16, cursor_move: u8, keys: KittyControlKeys) {
+        let on_alt = self.alt_screen_active();
+        let virtual_proto = keys.is_virtual_placement();
+        if virtual_proto && keys.has_parent() {
+            // A virtual prototype cannot hang off a parent (kitty
+            // `EINVAL`): refuse, count, done.
+            self.telemetry.kitty_refused += 1;
+            return;
+        }
+        if cols == 0 && rows == 0 {
+            // Headless sizing needs explicit spans: pixels are unknown
+            // here, so a spanless place names nothing to anchor and no
+            // cursor advance to apply. (The decoder still stores the
+            // pixels downstream; only the grid anchor is skipped.)
+            self.telemetry.kitty_refused += 1;
+            return;
+        }
+        let (anchor_row, anchor_col) = self.cursor_xy();
+        let (anchor_row, anchor_col, relative) = if keys.has_parent() {
+            let Some(parent) = self
+                .kitty_placements
+                .resolve_parent(keys.parent_id, keys.parent_placement_id)
+            else {
+                self.telemetry.kitty_refused += 1;
+                return;
+            };
+            if parent.virtual_proto {
+                // Offsets from a prototype's nowhere-anchor are
+                // meaningless; the renderer derives virtual children
+                // from `U+10EEEE` runs instead.
+                self.telemetry.kitty_refused += 1;
+                return;
+            }
+            let row = parent.anchor_row.saturating_add_signed(keys.parent_dy);
+            let col = parent.anchor_col.saturating_add_signed(keys.parent_dx);
+            (row as usize, col as usize, true)
+        } else {
+            (anchor_row, anchor_col, false)
+        };
+        let placement = KittyPlacement {
+            image_id: keys.image_id,
+            placement_id: keys.placement_id,
+            anchor_row: anchor_row as u32,
+            anchor_col: anchor_col as u32,
+            rows,
+            cols,
+            z_index: keys.z_index,
+            virtual_proto,
+            parent: keys
+                .has_parent()
+                .then_some((keys.parent_id, keys.parent_placement_id)),
+            parent_offset: (keys.parent_dx, keys.parent_dy),
+            on_alt_screen: on_alt,
+        };
+        self.kitty_placements.upsert(placement);
+        if !virtual_proto {
+            let last_row = self.height as u16 - 1;
+            let last_col = self.width as u16 - 1;
+            let bottom = (anchor_row as u16)
+                .saturating_add(rows)
+                .saturating_sub(1)
+                .min(last_row);
+            let right = (anchor_col as u16)
+                .saturating_add(cols)
+                .saturating_sub(1)
+                .min(last_col);
+            self.damage_grid_rect(
+                anchor_row as u16,
+                anchor_col as u16,
+                bottom.max(anchor_row as u16),
+                right.max(anchor_col as u16),
+            );
+        }
+        if cursor_move != 1 && !virtual_proto && !relative {
+            // The specification leaves post-image cursor placement past
+            // the screen or scroll area undefined; clamp into the grid
+            // and let the invariant pass snap wide pairs.
+            let last_col = self.width.saturating_sub(1) as u16;
+            self.cursor.position.col = (anchor_col as u16).saturating_add(cols).min(last_col);
+            self.cursor.position.row = (anchor_row as u16)
+                .saturating_add(rows)
+                .min(self.height as u16 - 1);
+        }
+    }
+
+    /// Applies an `a=d` deletion command.
+    fn kitty_delete(&mut self, keys: KittyControlKeys) {
+        let Some(selector) = kitty_delete_selector(&keys) else {
+            self.telemetry.kitty_refused += 1;
+            return;
+        };
+        let free_data = keys.delete.is_some_and(|d| d.is_ascii_uppercase());
+        let (cursor_row, cursor_col) = self.cursor_xy();
+        let removed = self.kitty_placements.apply_delete(
+            selector,
+            (cursor_row as u32, cursor_col as u32),
+            self.alt_screen_active(),
+            free_data,
+        );
+        if removed > 0 {
+            // Removed placements may have covered anywhere; damage is
+            // coarse but total (placements are rare control-plane events,
+            // never hot-path text).
+            self.damage_grid_rect(0, 0, self.height as u16 - 1, self.width as u16 - 1);
+        }
+    }
+
+    /// Records `a=f` frame data arrival for an animation.
+    ///
+    /// A new frame (the overloaded `r=` span field is `0`) appends a gap
+    /// entry (`z=0`/absent resolves to the `40ms` default, negative is
+    /// gapless); an edit (`r>0`) adjusts that frame's gap when `z` is
+    /// given. Past [`crate::placement::KITTY_ANIM_MAX_FRAMES`] the frame
+    /// is refused instead of growing memory. Pixel composition itself is
+    /// downstream.
+    fn kitty_frame_data(&mut self, rows_r: u16, keys: KittyControlKeys) {
+        let Some(id) = self.kitty_anim_target(&keys) else {
+            self.telemetry.kitty_refused += 1;
+            return;
+        };
+        let frame_r = u32::from(rows_r);
+        if frame_r == 0 {
+            let gap = if keys.z_index == 0 {
+                crate::placement::KITTY_ANIM_DEFAULT_GAP_MS
+            } else {
+                keys.z_index.max(0) as u32
+            };
+            if self
+                .kitty_placements
+                .animation_or_insert(id)
+                .push_frame(gap)
+                .is_err()
+            {
+                self.telemetry.kitty_refused += 1;
+            }
+        } else if keys.z_index != 0 {
+            let gap = keys.z_index.max(0) as u32;
+            if self
+                .kitty_placements
+                .animation_or_insert(id)
+                .set_gap(frame_r, gap)
+                .is_err()
+            {
+                self.telemetry.kitty_refused += 1;
+            }
+        } else {
+            // Edit with no new data and no gap change: ensure the
+            // descriptor exists so later controls resolve.
+            self.kitty_placements.animation_or_insert(id);
+        }
+        self.damage_image_placements(id);
+    }
+
+    /// Applies an `a=a` animation control command.
+    ///
+    /// The overloaded span fields carry the frames (`c=` current,
+    /// `r=` affected), `s=` stops/runs, `v=` sets the loop budget, and
+    /// `z=` retargets the affected frame's gap. Partial failures
+    /// (unknown frame) apply the rest and count one refusal.
+    fn kitty_anim_control(
+        &mut self,
+        width_s: Option<u32>,
+        height_v: Option<u32>,
+        cols_c: u16,
+        rows_r: u16,
+        keys: KittyControlKeys,
+    ) {
+        let Some(id) = self.kitty_anim_target(&keys) else {
+            self.telemetry.kitty_refused += 1;
+            return;
+        };
+        let current = u32::from(cols_c);
+        let affected = u32::from(rows_r);
+        let anim = self.kitty_placements.animation_or_insert(id);
+        let mut refused = false;
+        if current != 0 && anim.set_current(current).is_err() {
+            refused = true;
+        }
+        if affected != 0 && keys.z_index != 0 {
+            let gap = keys.z_index.max(0) as u32;
+            if anim.set_gap(affected, gap).is_err() {
+                refused = true;
+            }
+        }
+        // The overloaded `s=` key is the animation state (`1` stop,
+        // `2` run-loading, `3` run); anything else is ignored.
+        if let Some(state) = width_s
+            .and_then(|s| u8::try_from(s).ok())
+            .and_then(|s| match s {
+                1 => Some(KittyAnimState::Stopped),
+                2 => Some(KittyAnimState::Loading),
+                3 => Some(KittyAnimState::Running),
+                _ => None,
+            })
+        {
+            anim.set_state(state);
+        }
+        // The overloaded `v=` key is the loop budget (`0` ignored,
+        // `1` infinite, `n > 1` plays `n - 1` loops).
+        anim.set_loops(height_v.unwrap_or(0));
+        if refused {
+            self.telemetry.kitty_refused += 1;
+        }
+        self.damage_image_placements(id);
+    }
+
+    /// Resolves the animation target image: explicit `i=`, else the
+    /// newest image under `I=`. `None` when neither names an image.
+    fn kitty_anim_target(&self, keys: &KittyControlKeys) -> Option<u32> {
+        if keys.image_id != 0 {
+            return Some(keys.image_id);
+        }
+        if keys.image_number != 0 {
+            return self.kitty_placements.newest_with_number(keys.image_number);
+        }
+        None
+    }
+
+    /// Damages every span of one image's placements (animation steps and
+    /// frame arrivals change painted pixels without moving anchors).
+    fn damage_image_placements(&mut self, image_id: u32) {
+        let last_row = self.height as u16 - 1;
+        let last_col = self.width as u16 - 1;
+        let on_alt = self.alt_screen_active();
+        let spans: Vec<(u32, u32, u16, u16)> = self
+            .kitty_placements
+            .iter()
+            .filter(|entry| entry.image_id == image_id && entry.on_alt_screen == on_alt)
+            .map(|entry| (entry.anchor_row, entry.anchor_col, entry.rows, entry.cols))
+            .collect();
+        for (row, col, rows, cols) in spans {
+            let bottom = (row as u16)
+                .saturating_add(rows)
+                .saturating_sub(1)
+                .min(last_row);
+            let right = (col as u16)
+                .saturating_add(cols)
+                .saturating_sub(1)
+                .min(last_col);
+            self.damage_grid_rect(
+                row as u16,
+                col as u16,
+                bottom.max(row as u16),
+                right.max(col as u16),
+            );
         }
     }
 
@@ -2089,6 +2437,9 @@ impl State {
                 self.screens_active_mut()
                     .fill_rect(0, 0, last_row_u, last_col_u, &erase);
                 self.damage_grid_rect(0, 0, last_row_u, last_col_u);
+                // The specification clears images on full clear (so the
+                // `clear` command works); other text erases leave them.
+                self.kitty_placements.clear_screen(self.alt_screen_active());
             }
             EraseDisplayMode::Scrollback => {
                 let cleared = self.scrollback.clear();
@@ -2122,6 +2473,10 @@ impl State {
                 self.screens_active_mut()
                     .fill_rect(0, 0, last_row_u, last_col_u, &erase);
                 self.damage_grid_rect(0, 0, last_row_u, last_col_u);
+                // The scrolled-away screen takes its placements with it:
+                // real placements are screen-anchored (virtual prototypes
+                // survive as text in the scrollback cells).
+                self.kitty_placements.clear_screen(self.alt_screen_active());
             }
         }
     }
@@ -2200,6 +2555,15 @@ impl State {
                 self.push_scroll_damage(evicted);
             }
         }
+        // Kitty placements scroll with their rows (CTX-0950): only rows
+        // entirely inside the region move; rows pushed out clip away.
+        // The region damage below covers moved and removed spans.
+        self.kitty_placements.scroll_up(
+            u32::from(self.scroll_region_top),
+            u32::from(self.scroll_region_bottom),
+            u32::from(n),
+            self.alt_screen_active(),
+        );
         self.damage_grid_rect(
             self.scroll_region_top,
             0,
@@ -2220,6 +2584,14 @@ impl State {
         );
         self.screens_active_mut()
             .insert_blank_lines_down(top, bottom, n as usize, &erase);
+        // Placements ride the displaced rows downward like text, gated
+        // to the active screen like scroll-up.
+        self.kitty_placements.scroll_down(
+            top as u32,
+            bottom as u32,
+            u32::from(n),
+            self.alt_screen_active(),
+        );
         let last_col = self.width as u16 - 1;
         self.damage_grid_rect(
             self.scroll_region_top,
@@ -2401,6 +2773,10 @@ impl State {
                 // whatever the alt grid last held.
                 let erase = self.bce_style();
                 self.screens.alt.fill_all(&erase);
+                // The specification clears alt-screen images on the 1049
+                // switch (like its text); a ?47 entry keeps the alt
+                // placements its grid still shows.
+                self.kitty_placements.clear_screen(true);
             }
             self.damage_grid_rect(0, 0, self.height as u16 - 1, self.width as u16 - 1);
         } else {
@@ -2443,6 +2819,10 @@ impl State {
             }
             self.enhanced_keyboard_stash = alt_enhanced;
             self.alt_screen = AltScreen::Off;
+            // Alt-screen placements die with the session (restoring main
+            // must never resurrect them); main-screen placements kept
+            // their anchors untouched underneath.
+            self.kitty_placements.clear_screen(true);
             self.damage_grid_rect(0, 0, self.height as u16 - 1, self.width as u16 - 1);
         }
     }
@@ -2617,6 +2997,9 @@ impl State {
         self.current_hyperlink = None;
         self.zones.clear();
         self.zone_counter = 0;
+        // Reset clears every visible image (specification): placements,
+        // prototypes, animations, and number mappings all go.
+        self.kitty_placements.clear_all();
     }
 
     // ------------------------------------------------------------------
@@ -2681,6 +3064,62 @@ fn color_option(color: bitty_vt::Color) -> Option<bitty_vt::Color> {
         bitty_vt::Color::Default => None,
         other => Some(other),
     }
+}
+
+/// Destructured `KittyGraphics` fields for [`State::kitty_graphics`].
+///
+/// Bundles the seven action fields so the handler stays under clippy's
+/// argument limit; construction sites copy them straight from the action.
+#[derive(Debug, Clone, Copy)]
+struct KittyCommand {
+    action: Option<char>,
+    width_s: Option<u32>,
+    height_v: Option<u32>,
+    cols: u16,
+    rows: u16,
+    cursor_move: u8,
+    keys: KittyControlKeys,
+}
+
+/// Maps wire `d=` + keys to a [`KittyDeleteSelector`].
+/// `None` (absent `d=`) means "all visible" per the specification.
+/// An unknown selector refuses the whole delete (`None` return):
+/// deleting anything on an unrecognized request would be guessing.
+/// `p=` pins one placement only when non-zero (anonymous placements
+/// are never singly addressable).
+fn kitty_delete_selector(keys: &KittyControlKeys) -> Option<KittyDeleteSelector> {
+    let selector = keys.delete.unwrap_or('a').to_ascii_lowercase();
+    let pin = (keys.placement_id != 0).then_some(keys.placement_id);
+    Some(match selector {
+        'a' => KittyDeleteSelector::AllVisible,
+        'i' => KittyDeleteSelector::ImageId {
+            id: keys.image_id,
+            placement: pin,
+        },
+        'n' => KittyDeleteSelector::NewestNumber {
+            number: keys.image_number,
+            placement: pin,
+        },
+        'c' => KittyDeleteSelector::AtCursor,
+        'f' => KittyDeleteSelector::FramesOf { id: keys.image_id },
+        'p' => KittyDeleteSelector::AtCell {
+            x: keys.src_x,
+            y: keys.src_y,
+        },
+        'q' => KittyDeleteSelector::AtCellZ {
+            x: keys.src_x,
+            y: keys.src_y,
+            z: keys.z_index,
+        },
+        'r' => KittyDeleteSelector::IdRange {
+            lo: keys.src_x,
+            hi: keys.src_y,
+        },
+        'x' => KittyDeleteSelector::Column { x: keys.src_x },
+        'y' => KittyDeleteSelector::Row { y: keys.src_y },
+        'z' => KittyDeleteSelector::ZIndex { z: keys.z_index },
+        _ => return None,
+    })
 }
 
 /// Collects a physical row's content as grapheme leads, trimming trailing

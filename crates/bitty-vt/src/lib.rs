@@ -68,7 +68,8 @@ pub use action::{
 pub use bounded::{BoundedBytes, BoundedString};
 pub use kitty_apc::{
     KITTY_APC_DECODE_MAX_BYTES, KITTY_APC_DECODE_MAX_DIMENSION, KITTY_APC_DECODE_MAX_PIXELS,
-    KITTY_APC_LEDGER_CAP, KITTY_APC_STALL_MAX_BYTES, KittyApcAssembler, KittyApcParams,
-    KittyApcReject, KittyCompleted, KittyFeedOutcome,
+    KITTY_APC_LEDGER_CAP, KITTY_APC_PATH_MAX_BYTES, KITTY_APC_SHM_NAME_MAX,
+    KITTY_APC_STALL_MAX_BYTES, KITTY_APC_TMP_NAME_MARKER, KittyApcAssembler, KittyApcParams,
+    KittyApcReject, KittyCompleted, KittyControlKeys, KittyFeedOutcome, KittyMedium,
 };
 pub use parser::Parser;

@@ -1849,3 +1849,260 @@ fn ctx_0910_wide_char_on_single_column_grid_drops_instead_of_panic() {
     assert_eq!(snapshot.cells[0].glyph, ' ');
     assert!(s.check_invariants().is_ok());
 }
+
+// -- CTX-0950 (issue #1668): kitty advanced placements, lifetime, animation.
+
+/// Builds a `KittyGraphics` action the way the parser emits one:
+/// base fields plus advanced control keys.
+fn kitty_graphics(
+    action: Option<char>,
+    cols: u16,
+    rows: u16,
+    cursor_move: u8,
+    keys: KittyControlKeys,
+) -> TerminalAction {
+    TerminalAction::KittyGraphics {
+        format_f: 0,
+        width_s: None,
+        height_v: None,
+        action_a: action,
+        cols_c: cols,
+        rows_r: rows,
+        cursor_movement_c: cursor_move,
+        payload: Box::default(),
+        control: keys,
+    }
+}
+
+fn place_keys(image: u32, placement: u32) -> KittyControlKeys {
+    KittyControlKeys {
+        image_id: image,
+        placement_id: placement,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn kitty_place_anchors_at_cursor_and_advances() {
+    let mut s = State::new();
+    // yazi-style `a=p,i=7,c=3,r=2` at the origin.
+    s.apply(&kitty_graphics(Some('p'), 3, 2, 0, place_keys(7, 0)));
+    let entry = s.kitty_placements().get(7, 0).expect("placed");
+    assert_eq!((entry.anchor_row, entry.anchor_col), (0, 0));
+    assert_eq!((entry.cols, entry.rows), (3, 2));
+    // Cursor moves past the span (cols right, rows down).
+    assert_eq!(s.cursor().position.col, 3);
+    assert_eq!(s.cursor().position.row, 2);
+    assert!(s.check_invariants().is_ok());
+    // `C=1` suppresses cursor motion; re-put replaces in place.
+    s.apply(&TerminalAction::CursorPosition {
+        row: Row(1),
+        col: Col(1),
+    });
+    let mut keys = place_keys(7, 9);
+    keys.quiet = 1;
+    s.apply(&kitty_graphics(Some('p'), 3, 2, 1, keys));
+    assert_eq!(s.cursor().position.col, 0);
+    assert_eq!(s.cursor().position.row, 0);
+    assert_eq!(s.kitty_placements().len(), 2);
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn kitty_virtual_prototype_mixes_with_placeholder_text() {
+    let mut s = State::new();
+    // `a=p,U=1,i=42,c=2,r=1`: prototype, no anchor, no cursor motion.
+    let mut keys = place_keys(42, 0);
+    keys.unicode_placement = 1;
+    s.apply(&kitty_graphics(Some('p'), 2, 1, 0, keys));
+    let proto = s.kitty_placements().get(42, 0).expect("prototype");
+    assert!(proto.virtual_proto);
+    assert_eq!(s.cursor().position.col, 0);
+    // The image then flows as text: two placeholders in fg 42 name tiles
+    // (0,0) and (0,1) of the same image via leftward inheritance.
+    s.apply(&TerminalAction::SetAttributes {
+        attrs: AttributeDiff {
+            changes: vec![AttributeChange::Foreground(Color::Indexed(42))].into_boxed_slice(),
+        },
+    });
+    prints(&mut s, "\u{10EEEE}\u{10EEEE}");
+    let (cells, key) = s.kitty_unicode_run_at(0, 0).expect("run decodes");
+    assert_eq!(key, (42, None));
+    assert_eq!(cells.len(), 2);
+    assert_eq!((cells[0].id.row, cells[0].id.col), (0, 0));
+    assert_eq!((cells[1].id.row, cells[1].id.col), (0, 1));
+    // ...while the same image id resolves to the stored prototype.
+    assert_eq!(s.kitty_placements().get(42, 0).unwrap().image_id, 42);
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn kitty_scroll_moves_and_clips_placements() {
+    let mut s = State::new();
+    s.apply(&TerminalAction::CursorPosition {
+        row: Row(21),
+        col: Col(1),
+    });
+    s.apply(&kitty_graphics(Some('p'), 2, 2, 1, place_keys(1, 1)));
+    assert_eq!(s.kitty_placements().get(1, 1).unwrap().anchor_row, 20);
+    // A virtual prototype has no anchor: scrolling ignores it.
+    let mut vkeys = place_keys(3, 0);
+    vkeys.unicode_placement = 1;
+    s.apply(&kitty_graphics(Some('p'), 2, 1, 1, vkeys));
+    s.apply(&TerminalAction::ScrollUp { n: Count(5) });
+    assert_eq!(s.kitty_placements().get(1, 1).unwrap().anchor_row, 15);
+    assert!(s.kitty_placements().get(3, 0).unwrap().virtual_proto);
+    // Scrolling the real placement off the top clips it away.
+    s.apply(&TerminalAction::ScrollUp { n: Count(16) });
+    assert!(s.kitty_placements().get(1, 1).is_none());
+    assert!(s.kitty_placements().get(3, 0).is_some());
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn kitty_delete_selectors_and_full_clear() {
+    let mut s = State::new();
+    s.apply(&kitty_graphics(Some('p'), 2, 2, 1, place_keys(5, 1)));
+    s.apply(&kitty_graphics(Some('p'), 2, 2, 1, place_keys(6, 2)));
+    // `a=d,d=i,i=5` removes only image 5.
+    let mut keys = KittyControlKeys {
+        delete: Some('i'),
+        ..place_keys(5, 0)
+    };
+    s.apply(&kitty_graphics(Some('d'), 0, 0, 0, keys));
+    assert!(s.kitty_placements().get(5, 1).is_none());
+    assert!(s.kitty_placements().get(6, 2).is_some());
+    // Unknown selectors refuse without deleting.
+    keys = KittyControlKeys {
+        delete: Some('~'),
+        ..Default::default()
+    };
+    let refused = s.telemetry().kitty_refused;
+    s.apply(&kitty_graphics(Some('d'), 0, 0, 0, keys));
+    assert!(s.kitty_placements().get(6, 2).is_some());
+    assert_eq!(s.telemetry().kitty_refused, refused + 1);
+    // `ED 2` full clear drops the rest; plain line erase does not.
+    s.apply(&TerminalAction::EraseInDisplay {
+        mode: EraseDisplayMode::All,
+    });
+    assert!(s.kitty_placements().is_empty());
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn kitty_relative_placement_needs_parent() {
+    let mut s = State::new();
+    // Missing parent: refused, counted, nothing stored.
+    let mut keys = place_keys(9, 2);
+    keys.parent_id = 77;
+    keys.parent_placement_id = 1;
+    let refused = s.telemetry().kitty_refused;
+    s.apply(&kitty_graphics(Some('p'), 2, 2, 0, keys));
+    assert!(s.kitty_placements().is_empty());
+    assert_eq!(s.telemetry().kitty_refused, refused + 1);
+    // Parent at the origin, 4x4: child offsets (H=1 right, V=2 down).
+    s.apply(&kitty_graphics(Some('p'), 4, 4, 0, place_keys(9, 1)));
+    let mut keys = place_keys(9, 2);
+    keys.parent_id = 9;
+    keys.parent_placement_id = 1;
+    keys.parent_dx = 1;
+    keys.parent_dy = 2;
+    s.apply(&kitty_graphics(Some('p'), 2, 2, 0, keys));
+    let child = s.kitty_placements().get(9, 2).expect("child placed");
+    assert_eq!((child.anchor_row, child.anchor_col), (2, 1));
+    // Relatives never move the cursor (parent's 4x4 put left it at 4,4).
+    assert_eq!(s.cursor().position.col, 4);
+    assert_eq!(s.cursor().position.row, 4);
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn kitty_alt_switch_scopes_placements() {
+    let mut s = State::new();
+    s.apply(&kitty_graphics(Some('p'), 2, 2, 1, place_keys(1, 1)));
+    s.apply(&TerminalAction::SetMode {
+        mode: Mode::AlternateScreenClearAndRestore,
+        enabled: true,
+    });
+    // ?1049 entry cleared the alt set (empty anyway); put on alt.
+    s.apply(&kitty_graphics(Some('p'), 2, 2, 1, place_keys(2, 2)));
+    assert_eq!(s.kitty_placements().len(), 2);
+    s.apply(&TerminalAction::SetMode {
+        mode: Mode::AlternateScreenClearAndRestore,
+        enabled: false,
+    });
+    // Alt placement died with the session; main survived underneath.
+    assert!(s.kitty_placements().get(2, 2).is_none());
+    assert!(s.kitty_placements().get(1, 1).is_some());
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn kitty_animation_control_and_frame_cap() {
+    let mut s = State::new();
+    // `a=f,i=9` with default gap appends a frame descriptor.
+    let keys = place_keys(9, 0);
+    s.apply(&kitty_graphics(Some('f'), 0, 0, 0, keys));
+    assert_eq!(
+        s.kitty_placements()
+            .animation(9)
+            .expect("anim")
+            .frame_count(),
+        2
+    );
+    // `a=a,i=9,c=2` selects frame 2; `c=9` is refused (no such frame).
+    s.apply(&TerminalAction::KittyGraphics {
+        format_f: 0,
+        width_s: None,
+        height_v: None,
+        action_a: Some('a'),
+        cols_c: 2,
+        rows_r: 0,
+        cursor_movement_c: 0,
+        payload: Box::default(),
+        control: place_keys(9, 0),
+    });
+    assert_eq!(s.kitty_placements().animation(9).unwrap().current(), 2);
+    let refused = s.telemetry().kitty_refused;
+    s.apply(&TerminalAction::KittyGraphics {
+        format_f: 0,
+        width_s: None,
+        height_v: None,
+        action_a: Some('a'),
+        cols_c: 9,
+        rows_r: 0,
+        cursor_movement_c: 0,
+        payload: Box::default(),
+        control: place_keys(9, 0),
+    });
+    assert_eq!(s.telemetry().kitty_refused, refused + 1);
+    // Frame floods fail closed at the cap instead of growing memory.
+    for _ in 0..300 {
+        s.apply(&kitty_graphics(Some('f'), 0, 0, 0, place_keys(9, 0)));
+    }
+    assert!(
+        s.kitty_placements().animation(9).unwrap().frame_count()
+            <= crate::placement::KITTY_ANIM_MAX_FRAMES as u32
+    );
+    assert!(s.telemetry().kitty_refused > refused + 1);
+    // Unknown animation target (no `i=`, no known `I=`) is refused.
+    let keys = KittyControlKeys {
+        image_number: 4242,
+        ..Default::default()
+    };
+    s.apply(&kitty_graphics(Some('a'), 1, 0, 0, keys));
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn kitty_spanless_transmit_records_nothing_headless() {
+    // Without `c=`/`r=` spans the grid anchor is unknowable headless
+    // (pixels size it downstream): counted, not stored, cursor kept.
+    let mut s = State::new();
+    let refused = s.telemetry().kitty_refused;
+    s.apply(&kitty_graphics(None, 0, 0, 0, KittyControlKeys::default()));
+    assert!(s.kitty_placements().is_empty());
+    assert_eq!(s.telemetry().kitty_refused, refused + 1);
+    assert_eq!((s.cursor().position.row, s.cursor().position.col), (0, 0));
+    assert!(s.check_invariants().is_ok());
+}

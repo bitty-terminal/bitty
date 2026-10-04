@@ -2069,6 +2069,7 @@ fn apc_g_valid_single_shot_emits_decoded_payload() {
             rows_r,
             cursor_movement_c: _,
             payload,
+            control,
         } => {
             assert_eq!(*format_f, 32);
             assert_eq!(*width_s, Some(2));
@@ -2077,6 +2078,8 @@ fn apc_g_valid_single_shot_emits_decoded_payload() {
             assert_eq!(*cols_c, 0);
             assert_eq!(*rows_r, 0);
             assert_eq!(&**payload, &[0xFF, 0, 0, 0xFF].repeat(4));
+            assert!(control.medium.is_direct());
+            assert_eq!(control.image_id, 0);
         }
         other => panic!("expected KittyGraphics, got {other:?}"),
     }
@@ -2095,6 +2098,68 @@ fn apc_g_bel_terminator_and_transmit_only() {
         }
         other => panic!("expected KittyGraphics, got {other:?}"),
     }
+}
+
+// CTX-0950: advanced subset rides the live APC framing end to end.
+#[test]
+fn apc_g_place_virtual_and_delete_emit_control_keys() {
+    // `a=p,U=1` virtual placement: no `f=`, bodiless, keys intact.
+    let seq = b"\x1b_Ga=p,U=1,i=42,c=4,r=2\x1b\\";
+    match kitty_action(&parse(seq)) {
+        TerminalAction::KittyGraphics {
+            format_f,
+            action_a,
+            cols_c,
+            rows_r,
+            payload,
+            control,
+            ..
+        } => {
+            assert_eq!(*format_f, 0);
+            assert_eq!(*action_a, Some('p'));
+            assert_eq!((*cols_c, *rows_r), (4, 2));
+            assert!(payload.is_empty());
+            assert_eq!(control.image_id, 42);
+            assert!(control.is_virtual_placement());
+        }
+        other => panic!("expected KittyGraphics, got {other:?}"),
+    }
+    // `a=d` delete selector likewise.
+    let seq = b"\x1b_Ga=d,d=i,i=10\x1b\\";
+    match kitty_action(&parse(seq)) {
+        TerminalAction::KittyGraphics {
+            action_a, control, ..
+        } => {
+            assert_eq!(*action_a, Some('d'));
+            assert_eq!(control.delete, Some('i'));
+            assert_eq!(control.image_id, 10);
+        }
+        other => panic!("expected KittyGraphics, got {other:?}"),
+    }
+    assert_eq!(parse(seq), parse(seq), "re-parse must be deterministic");
+}
+
+#[test]
+fn apc_g_shm_path_and_traversal_at_framing() {
+    // Valid shm name passes through with medium + name bytes.
+    let seq = b"\x1b_Gf=100,t=s;L2tpdHR5LXNobQ==\x1b\\"; // "/kitty-shm"
+    match kitty_action(&parse(seq)) {
+        TerminalAction::KittyGraphics {
+            payload, control, ..
+        } => {
+            assert!(!control.medium.is_direct());
+            assert_eq!(&**payload, b"/kitty-shm");
+        }
+        other => panic!("expected KittyGraphics, got {other:?}"),
+    }
+    // Traversal (`/a/../b/`) emits nothing: fail closed at the frame.
+    let seq = b"\x1b_Gf=100,t=f;L2EvLi4vYi8=\x1b\\"; // "/a/../b/"
+    assert!(
+        parse(seq)
+            .iter()
+            .all(|a| !matches!(a, TerminalAction::KittyGraphics { .. })),
+        "traversal path must emit no action"
+    );
 }
 
 #[test]

@@ -994,6 +994,7 @@ pub fn resolve_effective_with_profiles(
         "font.size",
         "font.line_height",
         "font.letter_spacing",
+        "font.fallback",
         "window.opacity",
         "window.padding",
         "window.radius_px",
@@ -4041,6 +4042,42 @@ mod tests {
                 .conflicts
                 .iter()
                 .any(|c| c.new_source.layer == LayerKind::Cli && c.field != "font.family")
+        );
+    }
+
+    #[test]
+    fn cli_font_override_keeps_fallback_source() {
+        // CTX-0953 CodeRabbit follow-up: the CLI font layer inherits
+        // `base.font.fallback`, so the restore loop must keep the base
+        // source for `font.fallback` or `config check` misreports it as cli.
+        let src = test_source();
+        let plan = parse_lua_config(
+            r#"return {
+                font = { family = "File Mono", size = 12.0, fallback = { "Noto Sans Symbols 2" } },
+            }"#,
+            &src,
+        )
+        .expect("file parses");
+        let cli = CliOverrides {
+            font_family: Some("Cli Mono".to_string()),
+            ..Default::default()
+        };
+        let merged =
+            resolve_effective_full(Some(LayeredPlan::new(src, plan)), None, &cli).expect("merge");
+        assert_eq!(merged.effective.font.family, "Cli Mono");
+        assert_eq!(
+            merged.effective.font.fallback,
+            vec!["Noto Sans Symbols 2".to_string()]
+        );
+        assert_eq!(
+            merged.source_of("font.fallback").unwrap().layer,
+            LayerKind::User
+        );
+        assert!(
+            !merged
+                .conflicts
+                .iter()
+                .any(|c| c.new_source.layer == LayerKind::Cli && c.field == "font.fallback")
         );
     }
 

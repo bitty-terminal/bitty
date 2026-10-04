@@ -1547,13 +1547,14 @@ impl Runtime {
     #[must_use]
     pub fn pending_ws_close_summary(&self) -> Option<String> {
         let pending = self.pending_ws_close.as_ref()?;
-        let seq = self
+        let (seq, name) = self
             .workspaces
             .get(pending.index)
-            .map_or(pending.index as u64 + 1, |s| s.seq);
+            .map(|s| (s.seq, s.name.as_str()))
+            .unwrap_or((pending.index as u64 + 1, pending.name.as_str()));
         Some(format!(
             "Close workspace {seq}:{} with {} live shells? (repeat Alt+W=confirm kill Esc=cancel)",
-            truncate_ws_name(&pending.name),
+            truncate_ws_name(name),
             pending.live,
         ))
     }

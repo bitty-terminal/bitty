@@ -70,6 +70,12 @@ pub const WORKSPACE_NAME_MAX_CHARS: usize = 32;
 /// [`WORKSPACE_NAME_MAX_CHARS`].
 pub const WORKSPACE_RENAME_MAX_BYTES: usize = 256;
 
+/// Maximum parked panels one `bitty.workspace.list()` row reports (CTX-0954).
+///
+/// Mirrors the Core single-slot invariant (`ScratchpadSlot` holds at most one
+/// parked leaf): occupancy is `0` (empty) or `1` (occupied), never more.
+pub const SCRATCHPAD_COUNT_MAX: usize = 1;
+
 /// Attention flags for one workspace in `bitty.workspace.list()` (CTX-0889).
 ///
 /// Core has no per-workspace attention source yet (bell, activity, and
@@ -89,6 +95,11 @@ pub struct WorkspaceAttention {
 /// One workspace row for `bitty.workspace.list()` (CTX-0889, ADR-0014).
 ///
 /// Identity, order, and structure only: never terminal content.
+///
+/// CTX-0954: scratchpad occupancy rides the same row under the same
+/// `workspace.read` grant (no panel capability is consulted): the slot is
+/// window-global (one [`bitty_ui::ScratchpadSlot`] per window), so every row
+/// of one `list()` result carries the same occupancy snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceInfo {
     /// Stable workspace id (Core creation sequence; survives index shifts).
@@ -99,6 +110,11 @@ pub struct WorkspaceInfo {
     pub active: bool,
     /// Number of panels (layout leaves).
     pub panel_count: usize,
+    /// Parked panels in the window scratchpad slot (`0` or `1`; window-global,
+    /// identical on every row of one result).
+    pub scratchpad_count: usize,
+    /// Whether the window scratchpad slot holds a parked panel.
+    pub scratchpad_occupied: bool,
     /// Attention flags (all `false` until Core grows a source).
     pub attention: WorkspaceAttention,
 }
@@ -1535,6 +1551,10 @@ fn bounded_workspace_name(name: &str) -> String {
 }
 
 /// Marshal workspace rows into the bounded Lua array shape (CTX-0889).
+///
+/// CTX-0954: each row carries `scratchpad_count` (integer `0`/`1`) and
+/// `scratchpad_occupied` (bool) under the same `workspace.read` grant as the
+/// rest of the row; no panel capability is consulted.
 fn workspace_list_value(rows: &[WorkspaceInfo]) -> LuaValue {
     LuaValue::array(
         rows.iter()
@@ -1550,6 +1570,17 @@ fn workspace_list_value(rows: &[WorkspaceInfo]) -> LuaValue {
                     (
                         "panel_count",
                         LuaValue::Integer(i64::try_from(row.panel_count).unwrap_or(i64::MAX)),
+                    ),
+                    (
+                        "scratchpad_count",
+                        LuaValue::Integer(
+                            i64::try_from(row.scratchpad_count.min(SCRATCHPAD_COUNT_MAX))
+                                .unwrap_or(i64::MAX),
+                        ),
+                    ),
+                    (
+                        "scratchpad_occupied",
+                        LuaValue::Bool(row.scratchpad_occupied),
                     ),
                     (
                         "attention",
@@ -5208,5 +5239,48 @@ mod tests {
             "{outcome:?}"
         );
         assert!(!vm.is_suspended());
+    }
+
+    #[test]
+    fn workspace_list_value_carries_scratchpad_occupancy() {
+        // CTX-0954: empty vs occupied rows marshal count + presence alongside
+        // the existing shape; over-bound counts clamp to the single-slot
+        // ceiling so a misbehaving host source stays bounded.
+        let row = |id: u64, count: usize, occupied: bool| WorkspaceInfo {
+            id,
+            name: format!("ws{id}"),
+            active: id == 1,
+            panel_count: 2,
+            scratchpad_count: count,
+            scratchpad_occupied: occupied,
+            attention: WorkspaceAttention::default(),
+        };
+        let value = workspace_list_value(&[row(1, 0, false), row(2, 99, true)]);
+        let rows_out = match &value {
+            LuaValue::Table(pairs) => pairs,
+            _ => panic!("list marshals as an array table"),
+        };
+        assert_eq!(rows_out.len(), 2);
+        let table = |index: usize| match &rows_out[index].1 {
+            LuaValue::Table(pairs) => LuaValue::Table(pairs.clone()),
+            _ => panic!("row {index} marshals as a table"),
+        };
+        let empty = table(0);
+        assert_eq!(empty.get("scratchpad_count"), Some(&LuaValue::Integer(0)));
+        assert_eq!(
+            empty.get("scratchpad_occupied"),
+            Some(&LuaValue::Bool(false))
+        );
+        assert_eq!(empty.get("panel_count"), Some(&LuaValue::Integer(2)));
+        let occupied = table(1);
+        assert_eq!(
+            occupied.get("scratchpad_count"),
+            Some(&LuaValue::Integer(1)),
+            "clamped to the single-slot ceiling"
+        );
+        assert_eq!(
+            occupied.get("scratchpad_occupied"),
+            Some(&LuaValue::Bool(true))
+        );
     }
 }

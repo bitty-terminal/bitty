@@ -16,8 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   plugin over Core panel/workspace mechanisms. Core draws no tab-strip
   chrome with zero plugins or in `bitty --safe` (the grid keeps every row;
   `status_bar_band` stays `None`; no hidden presentation remains).
-  Downstream `bitty_ui::tab_strip` imports fail at compile time with the
-  removal pointing here; the `tabs` alias shim (`crates/bitty-runtime/src/tabs.rs`,
+  Downstream `bitty_ui::tab_strip` imports fail at compile time with an
+  unresolved-import error naming the removed module (the compiler does not
+  point at this changelog); migrate tabs presentation to the `bar` plugin
+  over Core panel/workspace mechanisms. The `tabs` alias shim (`crates/bitty-runtime/src/tabs.rs`,
   `bitty-terminal.tabs` id/commands, `tabline` claim, `TABS_*`) stays
   deprecated until the documented `>= v0.2.0` floor per ADR-0017 and is not
   deleted ahead of the window. Retained as host mechanisms: workspace

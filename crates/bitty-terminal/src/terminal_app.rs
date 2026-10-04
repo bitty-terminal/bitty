@@ -1973,6 +1973,7 @@ impl AppHandler for TerminalApp {
             // there is no live config to resolve against, so this stays a
             // no-op instead of guessing.
             PlatformEvent::SystemAppearanceChanged(appearance) => {
+                crate::config_reload::record_system_appearance(appearance);
                 let Some(effective) = crate::config_reload::current_effective() else {
                     return;
                 };

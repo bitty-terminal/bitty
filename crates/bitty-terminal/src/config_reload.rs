@@ -240,6 +240,42 @@ thread_local! {
     /// the app always adopts the newest accepted config. Main-thread only,
     /// like [`CONTEXT`].
     static PENDING_APP: RefCell<Option<AppAdoption>> = const { RefCell::new(None) };
+
+    /// Last live OS appearance event (CTX-0951 CodeRabbit on #1687).
+    ///
+    /// The cold-path [`bitty_platform::query_system_appearance`] degrades to
+    /// `Unknown` on every platform today, so a reload that re-queries would
+    /// reinstall the dark half even after a live light event selected the
+    /// light half. The `SystemAppearanceChanged` handler records each known
+    /// event here; reload resolutions prefer it and keep the dark-first
+    /// fallback before the first event. Main-thread only, like [`CONTEXT`].
+    static LAST_APPEARANCE: RefCell<Option<bitty_platform::SystemAppearance>> =
+        const { RefCell::new(None) };
+}
+
+/// Record a live OS appearance event for later reload resolutions.
+///
+/// Only known signals (`Light`/`Dark`) are retained; `Unknown` never
+/// overwrites a real event. Cold-path only (one OS toggle per event).
+pub(crate) fn record_system_appearance(appearance: bitty_platform::SystemAppearance) {
+    if appearance.is_known() {
+        LAST_APPEARANCE.with(|slot| *slot.borrow_mut() = Some(appearance));
+    }
+}
+
+/// Whether a reload resolves a dual theme to its light half (CTX-0951).
+///
+/// Prefers the last live appearance event when one was recorded; otherwise
+/// falls back to the synchronous OS query (dark-first while it degrades to
+/// `Unknown`).
+fn reload_prefer_light() -> bool {
+    if let Some(appearance) = LAST_APPEARANCE.with(|slot| *slot.borrow()) {
+        return matches!(appearance, bitty_platform::SystemAppearance::Light);
+    }
+    matches!(
+        bitty_platform::query_system_appearance(),
+        bitty_platform::SystemAppearance::Light
+    )
 }
 
 /// Take the pending app-side adoption, if a reload produced one since the
@@ -257,16 +293,14 @@ pub(crate) fn take_app_adoption() -> Option<AppAdoption> {
 /// CTX-0951: the title theme resolves to the startup-active half of a dual
 /// selection (dark-first while the OS query degrades to `Unknown`), matching
 /// `load_app_config`. Live OS toggles refresh the title separately via the
-/// `SystemAppearanceChanged` handler.
+/// `SystemAppearanceChanged` handler, which also records the event so later
+/// reloads keep the live half (CodeRabbit on #1687).
 fn resolve_app_adoption(effective: &EffectiveConfig) -> Result<AppAdoption, String> {
     let keymaps =
         bitty_config::resolve_keymaps(effective).map_err(|err| format!("keymaps: {err}"))?;
     let leader = bitty_config::resolve_leader_for(effective, bitty_config::LeaderPlatform::host())
         .map_err(|err| format!("leader_key: {err}"))?;
-    let prefer_light = matches!(
-        bitty_platform::query_system_appearance(),
-        bitty_platform::SystemAppearance::Light
-    );
+    let prefer_light = reload_prefer_light();
     Ok(AppAdoption {
         keymaps,
         leader,
@@ -309,16 +343,14 @@ pub(crate) fn apply_live(
 /// runtime's live-adopt setters. Returns the first setter error, formatted
 /// for the ctl reply.
 ///
-/// CTX-0951: dual themes adopt the half matching the OS appearance at reload
+/// CTX-0951: dual themes adopt the half matching the last live OS appearance
+/// event when one was recorded, else the half matching the OS query at reload
 /// time (dark-first while the query degrades to `Unknown`).
 pub(crate) fn apply_live_presentation(
     runtime: &mut bitty_runtime::Runtime,
     effective: &EffectiveConfig,
 ) -> Result<(), String> {
-    let prefer_light = matches!(
-        bitty_platform::query_system_appearance(),
-        bitty_platform::SystemAppearance::Light
-    );
+    let prefer_light = reload_prefer_light();
     let resolved = crate::config_cli::runtime_config_from_effective_for(effective, prefer_light)?;
     // CTX-0898 ordering: every input of the per-`View` RFC-0001 AC-1/AC-2
     // check — the theme background, the global focused/idle outline colors,
@@ -501,6 +533,7 @@ pub(crate) fn install(
 #[cfg(test)]
 pub(crate) fn clear() {
     CONTEXT.with(|slot| *slot.borrow_mut() = None);
+    LAST_APPEARANCE.with(|slot| *slot.borrow_mut() = None);
 }
 
 /// Install a context with an injected resolver (tests only).
@@ -1213,6 +1246,49 @@ mod tests {
         apply_live_presentation(&mut runtime, &effective).expect("adopt");
         assert!((runtime.config().font_size - 17.0).abs() < f32::EPSILON);
         assert_eq!(runtime.config().window_padding, 9);
+    }
+
+    #[test]
+    fn reload_keeps_recorded_appearance_for_dual_theme() {
+        // CodeRabbit on #1687: the cold-path OS query degrades to Unknown,
+        // so a reload must reuse the last live appearance event instead of
+        // re-querying, else a light session snaps back to the dark half.
+        clear();
+        let baseline = bitty_config::fallback_builtin();
+        let mut dual = baseline.clone();
+        dual.appearance.theme = Some(String::from("light:github-light,dark:dracula"));
+        let mut runtime = deterministic_runtime(&baseline);
+        let dracula =
+            bitty_runtime::ThemePalette::from_theme(&bitty_config::theme::DRACULA).background;
+        let light_expected = bitty_runtime::ThemePalette::from_theme(
+            bitty_config::theme::resolve_theme(Some("github-light")),
+        )
+        .background;
+
+        // No event yet: dark-first fallback (query is Unknown everywhere).
+        apply_live_presentation(&mut runtime, &dual).expect("adopt dark-first");
+        assert_eq!(runtime.config().theme.background, dracula);
+
+        // A live light event sticks across reloads.
+        record_system_appearance(bitty_platform::SystemAppearance::Light);
+        apply_live_presentation(&mut runtime, &dual).expect("adopt light");
+        assert_eq!(runtime.config().theme.background, light_expected);
+        let app = resolve_app_adoption(&dual).expect("app adoption");
+        assert_eq!(
+            app.theme_name,
+            bitty_config::theme::resolve_theme(Some("github-light")).name
+        );
+
+        // Unknown never overwrites a real event.
+        record_system_appearance(bitty_platform::SystemAppearance::Unknown);
+        apply_live_presentation(&mut runtime, &dual).expect("adopt still light");
+        assert_eq!(runtime.config().theme.background, light_expected);
+
+        // A dark event swaps back.
+        record_system_appearance(bitty_platform::SystemAppearance::Dark);
+        apply_live_presentation(&mut runtime, &dual).expect("adopt dark");
+        assert_eq!(runtime.config().theme.background, dracula);
+        clear();
     }
 
     #[test]

@@ -1360,6 +1360,237 @@ pub fn resolve_theme(name: Option<&str>) -> &'static Theme {
     theme
 }
 
+/// Parsed `appearance.theme` selection (CTX-0951, issue #1669).
+///
+/// Two shapes, both plain strings, so the Lua extractor, CLI `--theme`,
+/// the top-level `theme` alias, merge, and reload all pass the value
+/// through unchanged (no new config syntax, no `bitty-lua` change):
+///
+/// - single: `"catppuccin-mocha"` (existing behavior; case-insensitive,
+///   surrounding whitespace ignored).
+/// - dual: `"light:<name>,dark:<name>"` (ghostty-compatible; either order,
+///   whitespace around every token ignored, both halves required). The
+///   runtime resolves the half matching the OS appearance and swaps the
+///   live palette when it toggles; an unknown OS appearance resolves to
+///   the dark half (dark-first default).
+///
+/// Names are stored normalized (trimmed, lowercased) exactly as
+/// [`normalize_theme_name`] produces them, so [`find_preset`] matches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThemeSelection {
+    /// One preset for every OS appearance.
+    Single(String),
+    /// Per-appearance presets swapped live on OS toggle.
+    Dual {
+        /// Preset used under a light OS appearance.
+        light: String,
+        /// Preset used under a dark (or unknown) OS appearance.
+        dark: String,
+    },
+}
+
+impl ThemeSelection {
+    /// Every preset name this selection references (one for [`Self::Single`],
+    /// two for [`Self::Dual`]).
+    #[must_use]
+    pub fn names(&self) -> Vec<&str> {
+        match self {
+            Self::Single(name) => vec![name.as_str()],
+            Self::Dual { light, dark } => vec![light.as_str(), dark.as_str()],
+        }
+    }
+
+    /// The preset name active under `prefer_light` (`true` = light OS
+    /// appearance; `false` = dark or unknown, the dark-first default).
+    #[must_use]
+    pub fn select(&self, prefer_light: bool) -> &str {
+        match self {
+            Self::Single(name) => name.as_str(),
+            Self::Dual { light, dark } => {
+                if prefer_light {
+                    light.as_str()
+                } else {
+                    dark.as_str()
+                }
+            }
+        }
+    }
+}
+
+/// Fail-closed parse error for [`parse_theme_selection`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThemeSelectionError {
+    message: String,
+}
+
+impl ThemeSelectionError {
+    /// Human-readable diagnostic (naming the offending value and the valid set).
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for ThemeSelectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ThemeSelectionError {}
+
+/// Parses a raw `appearance.theme` value into a [`ThemeSelection`].
+///
+/// A value containing `,` or starting with a `light:`/`dark:` side prefix
+/// parses as the dual shape: every comma-separated entry must be
+/// `light:<name>` or `dark:<name>` (side keys case-insensitive, values
+/// trimmed, duplicates rejected) and both sides must be present. Anything
+/// else parses as [`ThemeSelection::Single`]. Empty/whitespace-only input
+/// and malformed dual values fail closed with a diagnostic naming the
+/// offending value; preset membership is NOT checked here (see
+/// [`unknown_theme_diagnostic`] and `AppearanceConfig::validate`).
+pub fn parse_theme_selection(raw: &str) -> Result<ThemeSelection, ThemeSelectionError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(ThemeSelectionError {
+            message: "appearance.theme must be non-empty after trimming".to_string(),
+        });
+    }
+    let lowered_head = trimmed.to_lowercase();
+    let looks_dual = trimmed.contains(',')
+        || lowered_head.starts_with("light:")
+        || lowered_head.starts_with("dark:");
+    if !looks_dual {
+        return Ok(ThemeSelection::Single(trimmed.to_lowercase()));
+    }
+    let malformed = |detail: &str| ThemeSelectionError {
+        message: format!(
+            "malformed appearance.theme '{trimmed}': {detail}; \
+                 expected '<name>' or 'light:<name>,dark:<name>'"
+        ),
+    };
+    let mut light: Option<String> = None;
+    let mut dark: Option<String> = None;
+    for part in trimmed.split(',') {
+        let (key, value) = part
+            .split_once(':')
+            .ok_or_else(|| malformed("every entry must be 'light:<name>' or 'dark:<name>'"))?;
+        let key = key.trim().to_lowercase();
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(malformed("preset names must be non-empty"));
+        }
+        let slot = match key.as_str() {
+            "light" => &mut light,
+            "dark" => &mut dark,
+            _ => {
+                return Err(malformed("side keys must be 'light' or 'dark'"));
+            }
+        };
+        if slot.is_some() {
+            return Err(malformed("duplicate side entry"));
+        }
+        *slot = Some(value.to_lowercase());
+    }
+    match (light, dark) {
+        (Some(light), Some(dark)) => Ok(ThemeSelection::Dual { light, dark }),
+        _ => Err(malformed(
+            "both 'light:<name>' and 'dark:<name>' are required",
+        )),
+    }
+}
+
+/// Whether `raw` names a known registry preset or alias (case-insensitive,
+/// whitespace-tolerant). `false` for empty, overlong, or unknown values.
+#[must_use]
+pub fn is_known_theme_name(raw: &str) -> bool {
+    let Some(normalized) = normalize_theme_name(Some(raw)) else {
+        return false;
+    };
+    find_preset(&normalized).is_some()
+}
+
+/// Fail-closed diagnostic for an unknown preset name: names the offender
+/// and the full valid set in registry order, plus the dual-shape syntax.
+#[must_use]
+pub fn unknown_theme_diagnostic(raw: &str) -> String {
+    let mut names = String::new();
+    for (i, preset) in ALL_PRESETS.iter().enumerate() {
+        if i > 0 {
+            names.push_str(", ");
+        }
+        names.push_str(preset.name);
+    }
+    format!(
+        "unknown theme '{}'; expected one of: {names} (or 'light:<name>,dark:<name>' for OS auto-switching; run 'bitty list themes' for the catalog)",
+        raw.trim()
+    )
+}
+
+/// Resolves an `appearance.theme` value plus the OS appearance to a preset.
+///
+/// - `None`/empty/whitespace → [`BITTY_DARK`] (dark-first default).
+/// - Single → [`resolve_theme`] on the name (unknown falls back + logs).
+/// - Dual → [`resolve_theme`] on the half matching `prefer_light`
+///   (`false` covers dark and unknown OS appearances).
+///
+/// Last-resort runtime safety only: config load/reload validation
+/// (`AppearanceConfig::validate`) already rejects unknown names fail-closed,
+/// so reaching the fallback here means the value bypassed validation.
+#[must_use]
+pub fn resolve_selection(name: Option<&str>, prefer_light: bool) -> &'static Theme {
+    let raw = match name {
+        Some(raw) if !raw.trim().is_empty() => raw,
+        _ => return &BITTY_DARK,
+    };
+    match parse_theme_selection(raw) {
+        Ok(selection) => resolve_theme(Some(selection.select(prefer_light))),
+        Err(e) => {
+            eprintln!(
+                "bitty: {}; falling back to '{DEFAULT_THEME_NAME}'",
+                e.message()
+            );
+            &BITTY_DARK
+        }
+    }
+}
+
+/// Resolves an `appearance.theme` value plus the OS appearance to a preset
+/// with its [`ThemeResolution`] (CTX-0951 NEEDS-FIX, issue #1669).
+///
+/// Same selection rule as [`resolve_selection`] but status-aware for the
+/// startup/title path (`load_app_config`): `None`/empty → `Default`, a known
+/// single name or a dual with both halves known → `Named` on the active
+/// half, anything else (unknown single, either dual half unknown, malformed
+/// dual) → `FallbackUnknown` on [`BITTY_DARK`]. Pure (no logging): the
+/// caller logs the fallback like [`resolve_theme_with_status`] does.
+///
+/// Validation already rejects unknown/malformed values fail-closed, so
+/// `FallbackUnknown` here only fires for values that bypassed validation.
+#[must_use]
+pub fn resolve_selection_with_status(
+    name: Option<&str>,
+    prefer_light: bool,
+) -> (&'static Theme, ThemeResolution) {
+    let raw = match name {
+        Some(raw) if !raw.trim().is_empty() => raw,
+        _ => return (&BITTY_DARK, ThemeResolution::Default),
+    };
+    let selection = match parse_theme_selection(raw) {
+        Ok(selection) => selection,
+        Err(_) => return (&BITTY_DARK, ThemeResolution::FallbackUnknown),
+    };
+    // Both dual halves must be known (validation enforces this fail-closed);
+    // an unknown inactive half still poisons the status so a later OS toggle
+    // cannot silently land on a fallback.
+    for half in selection.names() {
+        if !is_known_theme_name(half) {
+            return (&BITTY_DARK, ThemeResolution::FallbackUnknown);
+        }
+    }
+    resolve_theme_with_status(Some(selection.select(prefer_light)))
+}
+
 /// Bounded user-supplied palette (CTX-0392, issue #648).
 ///
 /// OQ-047 conformance: OQ-047 stays `Open` (custom and third-party theme
@@ -1565,6 +1796,116 @@ mod tests {
         // The logging variant agrees on the value.
         let logged = resolve_theme(Some("definitely-not-a-theme"));
         assert_eq!(logged.background, BITTY_DARK.background);
+    }
+
+    // -- dual light/dark selection (CTX-0951) ----------------------------
+
+    #[test]
+    fn single_selection_parses_case_insensitive() {
+        let selection = parse_theme_selection("  Catppuccin-Mocha ").expect("single parses");
+        assert_eq!(
+            selection,
+            ThemeSelection::Single("catppuccin-mocha".to_string())
+        );
+        assert_eq!(selection.names(), vec!["catppuccin-mocha"]);
+        assert_eq!(selection.select(true), "catppuccin-mocha");
+        assert_eq!(selection.select(false), "catppuccin-mocha");
+    }
+
+    #[test]
+    fn dual_selection_parses_either_order_with_whitespace() {
+        for input in [
+            "light:catppuccin-latte,dark:catppuccin-mocha",
+            "dark:catppuccin-mocha,light:catppuccin-latte",
+            "  LIGHT : Catppuccin-Latte , Dark : CATPPUCCIN-MOCHA  ",
+        ] {
+            let selection = parse_theme_selection(input).expect("dual parses");
+            assert_eq!(
+                selection,
+                ThemeSelection::Dual {
+                    light: "catppuccin-latte".to_string(),
+                    dark: "catppuccin-mocha".to_string(),
+                },
+                "input: {input:?}"
+            );
+            assert_eq!(selection.select(true), "catppuccin-latte");
+            assert_eq!(selection.select(false), "catppuccin-mocha");
+        }
+    }
+
+    #[test]
+    fn malformed_dual_values_fail_closed() {
+        for input in [
+            "",
+            "   ",
+            "light:catppuccin-latte",
+            "dark:catppuccin-mocha",
+            "light:,dark:catppuccin-mocha",
+            "light:catppuccin-latte,dark:",
+            "light:catppuccin-latte,light:catppuccin-mocha",
+            "dawn:catppuccin-latte,dark:catppuccin-mocha",
+            "catppuccin-latte,catppuccin-mocha",
+            "light:catppuccin-latte,dark:catppuccin-mocha,light:github-light",
+        ] {
+            assert!(parse_theme_selection(input).is_err(), "input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn resolve_selection_picks_half_by_appearance() {
+        let dual = "light:github-light,dark:catppuccin-mocha";
+        assert_eq!(resolve_selection(Some(dual), true).name, "github-light");
+        assert_eq!(
+            resolve_selection(Some(dual), false).name,
+            "catppuccin-mocha"
+        );
+        // A single name ignores the flag; empty falls back to dark-first.
+        assert_eq!(resolve_selection(Some("dracula"), true).name, "dracula");
+        assert_eq!(resolve_selection(None, true).name, DEFAULT_THEME_NAME);
+        assert_eq!(
+            resolve_selection(Some("   "), false).name,
+            DEFAULT_THEME_NAME
+        );
+    }
+
+    #[test]
+    fn unknown_theme_diagnostic_names_valid_set() {
+        let message = unknown_theme_diagnostic("not-a-theme");
+        assert!(message.contains("not-a-theme"), "{message}");
+        assert!(message.contains("catppuccin-mocha"), "{message}");
+        assert!(message.contains("light:<name>,dark:<name>"), "{message}");
+        assert!(is_known_theme_name("catppuccin-mocha"));
+        assert!(is_known_theme_name(" Dark "));
+        assert!(!is_known_theme_name("not-a-theme"));
+        assert!(!is_known_theme_name("   "));
+    }
+
+    #[test]
+    fn selection_with_status_reports_active_half() {
+        use crate::theme::ThemeResolution;
+        // Dual resolves to the active half without falling back.
+        let (light, status) =
+            resolve_selection_with_status(Some("light:github-light,dark:dracula"), true);
+        assert_eq!(
+            (light.name, status),
+            ("github-light", ThemeResolution::Named)
+        );
+        let (dark, status) =
+            resolve_selection_with_status(Some("light:github-light,dark:dracula"), false);
+        assert_eq!((dark.name, status), ("dracula", ThemeResolution::Named));
+        // Single and default keep the existing statuses.
+        let (_, status) = resolve_selection_with_status(Some("dracula"), false);
+        assert_eq!(status, ThemeResolution::Named);
+        let (_, status) = resolve_selection_with_status(None, false);
+        assert_eq!(status, ThemeResolution::Default);
+        // Unknown halves and malformed duals stay fail-closed observers.
+        let (_, status) = resolve_selection_with_status(Some("not-a-theme"), false);
+        assert_eq!(status, ThemeResolution::FallbackUnknown);
+        let (_, status) =
+            resolve_selection_with_status(Some("light:not-a-theme,dark:dracula"), false);
+        assert_eq!(status, ThemeResolution::FallbackUnknown);
+        let (_, status) = resolve_selection_with_status(Some("light:dracula"), false);
+        assert_eq!(status, ThemeResolution::FallbackUnknown);
     }
 
     #[test]

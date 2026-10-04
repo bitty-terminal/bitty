@@ -1961,6 +1961,40 @@ impl AppHandler for TerminalApp {
                     }
                 }
             }
+            // CTX-0951 (NEEDS-FIX PX-4669): live OS light/dark toggle. The
+            // platform glue re-dispatches winit `ThemeChanged` as this
+            // app-level event (macOS/Windows natively; backends without OS
+            // theme support never emit it). Resolve against the live
+            // effective config (reload engine's committed `current`, so a
+            // file reload and an OS toggle compose) and swap via the
+            // runtime seam, which dedups, repaints once, and preserves OSC
+            // overrides; single themes and the already-active half are
+            // no-ops. Without an installed reload context (tests, `--safe`)
+            // there is no live config to resolve against, so this stays a
+            // no-op instead of guessing.
+            PlatformEvent::SystemAppearanceChanged(appearance) => {
+                crate::config_reload::record_system_appearance(appearance);
+                let Some(effective) = crate::config_reload::current_effective() else {
+                    return;
+                };
+                if self.runtime.apply_system_appearance(&effective, appearance) {
+                    let prefer_light =
+                        matches!(appearance, bitty_platform::SystemAppearance::Light);
+                    let active = effective.effective_theme_for(prefer_light);
+                    self.refresh_theme_title(active.name);
+                    crate::logging::info(|| {
+                        format!(
+                            "bitty: OS appearance -> {appearance} (theme={})",
+                            active.name
+                        )
+                    });
+                    if let Some(win) = self.window.handle.as_ref() {
+                        win.request_redraw();
+                    } else {
+                        let _ = self.drive_tick();
+                    }
+                }
+            }
             // P3-8 defense-in-depth: `PlatformEvent::Exiting` is already
             // saved-and-exited by the `should_exit` early return above
             // (`handle_platform_event` reports `true` for it), so this arm

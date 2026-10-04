@@ -599,6 +599,21 @@ impl<H: AppHandler> ApplicationHandler<WakeEvent> for Adapter<H> {
             // below is filtered out for some reason.
             self.registry.unregister(&window_id);
         }
+        // CTX-0951: OS appearance is app-global, not window-scoped.
+        // `translate_window_event` filters `ThemeChanged`; re-dispatch it
+        // here as one app-level event per reporting window (downstream
+        // apply dedups, so multi-window duplicates are no-ops). Foreign
+        // windows stay dropped like every other event: no registry entry,
+        // no dispatch.
+        if let winit::event::WindowEvent::ThemeChanged(theme) = &event {
+            if self.registry.lookup(&window_id).is_some() {
+                self.dispatch(
+                    event_loop,
+                    crate::appearance::map_appearance_changed(*theme),
+                );
+            }
+            return;
+        }
         let Some(kind) = translate_window_event(event) else {
             return;
         };

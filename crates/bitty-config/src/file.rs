@@ -3793,7 +3793,10 @@ mod tests {
         );
         // CLI wins over both.
         let cli = CliOverrides {
-            theme: Some("cli-theme".to_string()),
+            // CTX-0951: CLI theme values validate like file values
+            // (fail-closed on unknown names), so precedence tests use a
+            // real catalog name.
+            theme: Some("dracula".to_string()),
             ..Default::default()
         };
         // Overlong CLI themes fail closed at merge (same as --theme today).
@@ -3810,7 +3813,7 @@ mod tests {
         let merged = resolve_effective_full(Some(user2), Some(profile2), &cli).expect("cli wins");
         assert_eq!(
             merged.effective.appearance.theme.as_deref(),
-            Some("cli-theme")
+            Some("dracula")
         );
         assert_eq!(
             merged.source_of("appearance.theme").unwrap().layer,
@@ -3946,11 +3949,17 @@ mod tests {
         let chain =
             load_profile_chain_with_env("child", Some(root_str), None, None, None).expect("chain");
         let user_src = test_source();
-        let user_plan = parse_lua_config(r#"return { theme = "light" }"#, &user_src).expect("user");
+        // CTX-0951: theme values fail closed on unknown names, so the
+        // precedence probe uses a catalog name.
+        let user_plan =
+            parse_lua_config(r#"return { theme = "github-light" }"#, &user_src).expect("user");
         let user = LayeredPlan::new(user_src, user_plan);
         let merged = resolve_effective_with_profiles(Some(user), chain, &CliOverrides::default())
             .expect("merge");
-        assert_eq!(merged.effective.appearance.theme.as_deref(), Some("light"));
+        assert_eq!(
+            merged.effective.appearance.theme.as_deref(),
+            Some("github-light")
+        );
         assert_eq!(
             merged.source_of("appearance.theme").unwrap().layer,
             LayerKind::User
@@ -4130,17 +4139,15 @@ mod tests {
     #[test]
     fn cli_appearance_all_flags_override_together() {
         let cli = CliOverrides {
-            theme: Some("cli-theme".to_string()),
+            // CTX-0951: see above — precedence tests use catalog names.
+            theme: Some("nord".to_string()),
             font_family: Some("Cli Mono".to_string()),
             font_size: Some("14.5".to_string()),
             opacity: Some("0.85".to_string()),
         };
         let merged =
             resolve_effective_full(Some(file_layer_with_appearance()), None, &cli).expect("merge");
-        assert_eq!(
-            merged.effective.appearance.theme.as_deref(),
-            Some("cli-theme")
-        );
+        assert_eq!(merged.effective.appearance.theme.as_deref(), Some("nord"));
         assert_eq!(merged.effective.font.family, "Cli Mono");
         assert!((merged.effective.font.size - 14.5).abs() < f32::EPSILON);
         assert!((merged.effective.window.opacity - 0.85).abs() < f32::EPSILON);

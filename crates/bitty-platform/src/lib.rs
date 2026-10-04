@@ -38,6 +38,9 @@
 //!   loop resume/suspend/wait/exit phases).
 //! - [`dpi`] module: validated DPI-aware size types ([`ScaleFactor`],
 //!   [`LogicalPixel`], [`LogicalSize`], [`PhysicalSize`]).
+//! - [`appearance`] module: owned OS light/dark signal
+//!   ([`SystemAppearance`](appearance::SystemAppearance)) plus the
+//!   degrading cold-path [`query_system_appearance`](appearance::query_system_appearance).
 //! - [`surface`] module: the owned [`SurfaceTarget`] GPU-attachment seam
 //!   ([`WindowHandle::surface_target`]), the resize→surface-extent mapper
 //!   [`map_resize_to_surface_extent`], and the DPI-size refresh hook
@@ -82,14 +85,19 @@
 //!   drops is documented rather than enforced across crates; the future
 //!   renderer/GpuContext slice owns that contract.
 //! - IME, modifiers state, raw device events, touch/gesture, drag-and-drop,
-//!   theme, and occlusion events are currently filtered out (documented in
-//!   [`event`]); clipboard, monitors, and URL primitives from the ADR-0003
-//!   row land in later slices, while desktop-notification delivery and the
+//!   and occlusion events are currently filtered out (documented in
+//!   [`event`]); OS light/dark appearance arrives as the app-level
+//!   [`PlatformEvent::SystemAppearanceChanged`](event::PlatformEvent::SystemAppearanceChanged)
+//!   (CTX-0951) with a [`SystemAppearance`](appearance::SystemAppearance)
+//!   cold-path query in [`appearance`]; clipboard, monitors, and URL
+//!   primitives from the ADR-0003 row land in later slices, while
+//!   desktop-notification delivery and the
 //!   audible bell primitive live in [`notification`].
 
 #![forbid(unsafe_code)]
 
 pub mod app;
+pub mod appearance;
 mod blur;
 pub mod clipboard;
 pub mod dpi;
@@ -111,6 +119,7 @@ pub use app::{
     App, AppHandler, EventContext, EventWaker, WakeEvent, WindowConfig, WindowHandle,
     opacity_requests_transparency, sanitize_opacity,
 };
+pub use appearance::{SystemAppearance, query_system_appearance};
 pub use clipboard::Clipboard;
 pub use dpi::{LogicalPixel, LogicalSize, PhysicalSize, ScaleFactor, surface_extent_from_logical};
 pub use error::PlatformError;

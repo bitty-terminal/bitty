@@ -4,6 +4,9 @@
 
 use super::chrome_keys::two_pane_layout;
 use super::*;
+use crate::config_cli::{
+    runtime_config_from_effective, runtime_config_from_effective_with_warnings,
+};
 use bitty_platform::{PlatformEvent, WindowEventKind};
 // Only the POSIX-shell live-spawn test below uses this (`#[cfg(unix)]`);
 // without the gate the import is unused on Windows.
@@ -1835,6 +1838,45 @@ fn runtime_config_carries_selected_theme_palette() {
     let safe = bitty_config::reload::fallback_builtin();
     let safe_cfg = runtime_config_from_effective(&safe).expect("safe builds");
     assert_eq!(safe_cfg.theme, dark);
+}
+
+#[test]
+fn runtime_config_for_resolves_dual_theme_halves() {
+    // CTX-0951 NEEDS-FIX: a dual `light:<name>,dark:<name>` must resolve to
+    // the half matching `prefer_light`, not to Bitty Dark via the raw
+    // single-name path. Production passes `startup_prefer_light()`; tests
+    // pass the flag directly to stay deterministic while the OS query
+    // degrades to Unknown.
+    use crate::config_cli::runtime_config_from_effective_for;
+    use bitty_config::file::{parse_lua_config, resolve_effective};
+    use bitty_config::plan::{ConfigSource, LayerKind};
+
+    let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+    let plan = parse_lua_config(
+        r#"return { appearance = { theme = "light:github-light,dark:dracula" } }"#,
+        &src,
+    )
+    .expect("dual theme parses");
+    let merged = resolve_effective(Some(bitty_config::plan::LayeredPlan::new(src, plan)), None)
+        .expect("merge");
+    merged.effective.validate().expect("dual validates");
+
+    let light_cfg =
+        runtime_config_from_effective_for(&merged.effective, true).expect("light builds");
+    let dark_cfg =
+        runtime_config_from_effective_for(&merged.effective, false).expect("dark builds");
+    let github_light = bitty_runtime::ThemePalette::from_theme(bitty_config::theme::resolve_theme(
+        Some("github-light"),
+    ));
+    let dracula = bitty_runtime::ThemePalette::from_theme(bitty_config::theme::resolve_theme(
+        Some("dracula"),
+    ));
+    assert_eq!(light_cfg.theme.background, github_light.background);
+    assert_eq!(dark_cfg.theme.background, dracula.background);
+    assert_ne!(light_cfg.theme.background, dark_cfg.theme.background);
+    // Dark-first wrapper keeps the dark half (deterministic for tests).
+    let dark_first = runtime_config_from_effective(&merged.effective).expect("builds");
+    assert_eq!(dark_first.theme.background, dracula.background);
 }
 
 #[test]

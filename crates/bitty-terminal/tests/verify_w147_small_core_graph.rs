@@ -88,18 +88,28 @@ fn member_manifest(root: &Path, member: &str) -> String {
         .unwrap_or_else(|err| panic!("read manifest for member {member}: {err}"))
 }
 
-/// Lines of the `[dependencies]` section only (excludes `[dev-dependencies]`,
-/// `[build-dependencies]`, and `[target.*.dependencies]` overlays, which carry
-/// no workspace-internal edges today; see the report for the `cargo tree`
-/// cross-check). Returned lines are comment-stripped so prose mentions of a
-/// crate (e.g. the W-141 note in `bitty-rich`) never read as an edge.
+/// Lines of every normal (production) dependency section: `[dependencies]`,
+/// `[dependencies.<name>]` tables, and `[target.<cfg>.dependencies]` overlays
+/// (plus `[target.<cfg>.dependencies.<name>]` tables). Excludes
+/// `[dev-dependencies]`, `[build-dependencies]`, and their `target.*`
+/// counterparts, which carry no production edge. Returned lines are
+/// comment-stripped so prose mentions of a crate (e.g. the W-141 note in
+/// `bitty-rich`) never read as an edge. Table headers contribute a synthetic
+/// `name = ...` line because their bodies (`version = ...`) never name the
+/// dependency themselves.
 fn normal_dependency_lines(manifest: &str) -> Vec<String> {
     let mut in_normal_deps = false;
     let mut lines = Vec::new();
     for line in manifest.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('[') {
-            in_normal_deps = trimmed == "[dependencies]";
+            in_normal_deps = false;
+            if let Some(table_dep) = normal_dep_section(trimmed) {
+                in_normal_deps = true;
+                if let Some(name) = table_dep {
+                    lines.push(format!("{name} = {{ table header }}"));
+                }
+            }
             continue;
         }
         if in_normal_deps {
@@ -112,13 +122,52 @@ fn normal_dependency_lines(manifest: &str) -> Vec<String> {
     lines
 }
 
-/// True when a comment-stripped `[dependencies]` line declares `dep`
-/// (`name = ...` shape, hyphen or underscore spelling).
+/// Classifies a section header: `Some(None)` for a normal dependency list
+/// section, `Some(Some(name))` for a `[dependencies.<name>]`-style table
+/// header (the edge is the table name), `None` for anything else
+/// (dev/build sections, `[package]`, `[features]`, ...).
+fn normal_dep_section(header: &str) -> Option<Option<String>> {
+    let inner = header.strip_prefix('[')?.strip_suffix(']')?;
+    let parts: Vec<String> = inner
+        .split('.')
+        .map(|part| {
+            part.trim()
+                .trim_matches(|c| c == '"' || c == '\'')
+                .to_string()
+        })
+        .collect();
+    match parts
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        ["dependencies"] => Some(None),
+        ["dependencies", name] => Some(Some((*name).to_string())),
+        ["target", .., "dependencies"] => Some(None),
+        ["target", .., "dependencies", name] => Some(Some((*name).to_string())),
+        _ => None,
+    }
+}
+
+/// True when a comment-stripped normal-dependency line declares `dep`:
+/// either `name = ...` (hyphen or underscore spelling) or a renamed entry
+/// such as `alias = { package = "dep", ... }`.
 fn declares_dep(line: &str, dep: &str) -> bool {
-    [dep, &dep.replace('-', "_")].iter().any(|name| {
+    if [dep, &dep.replace('-', "_")].iter().any(|name| {
         line == *name
             || line.starts_with(&format!("{name} "))
             || line.starts_with(&format!("{name}="))
+    }) {
+        return true;
+    }
+    // Renamed entries: the line starts with the alias, the real package name
+    // hides in a `package = "dep"` value (single or double quotes, any
+    // spacing). Compare spaceless so `package="dep"` also matches.
+    let spaceless: String = line.split_whitespace().collect();
+    [dep, &dep.replace('-', "_")].iter().any(|name| {
+        spaceless.contains(&format!("package=\"{name}\""))
+            || spaceless.contains(&format!("package='{name}'"))
     })
 }
 
@@ -134,6 +183,55 @@ fn normal_consumers_of(root: &Path, members: &[String], dep: &str) -> Vec<String
         })
         .cloned()
         .collect()
+}
+
+#[test]
+fn normal_deps_detect_table_target_and_renamed_forms() {
+    // Regression for the W-147 review: production edges hide in table
+    // headers, target overlays, and `package =` renames, not just
+    // `[dependencies]` `name = ...` lines. Dev/build sections stay excluded.
+    let manifest = r#"
+[package]
+name = "probe"
+
+[dependencies.bitty-storage]
+version = "0.0.1"
+
+[dev-dependencies]
+bitty-test-support = "0.0.1"
+
+[build-dependencies]
+bitty-test-vm = "0.0.1"
+
+[target.'cfg(unix)'.dependencies]
+storage = { package = "bitty-storage", version = "0.0.1" }
+
+[target.'cfg(unix)'.dev-dependencies]
+bitty-compat-lab = "0.0.1"
+"#;
+    let lines = normal_dependency_lines(manifest);
+    assert!(
+        lines.iter().any(|line| declares_dep(line, "bitty-storage")),
+        "table-header and renamed target entries must read as edges: {lines:?}"
+    );
+    for harness in ["bitty-test-support", "bitty-test-vm", "bitty-compat-lab"] {
+        assert!(
+            !lines.iter().any(|line| declares_dep(line, harness)),
+            "dev/build-only crate `{harness}` must not read as a normal edge: {lines:?}"
+        );
+    }
+}
+
+#[test]
+fn normal_deps_detect_target_table_header() {
+    // `[target.<cfg>.dependencies.<name>]` tables carry the edge in the
+    // header, like `[dependencies.<name>]`: the body never names the crate.
+    let manifest = "[target.'cfg(unix)'.dependencies.bitty-storage]\nversion = \"0.0.1\"\n";
+    let lines = normal_dependency_lines(manifest);
+    assert!(
+        lines.iter().any(|line| declares_dep(line, "bitty-storage")),
+        "target table-header entry must read as an edge: {lines:?}"
+    );
 }
 
 #[test]
@@ -321,6 +419,7 @@ fn safe_headless_startup_skips_hostile_dev_plugin_with_no_vm() {
 
     let output = std::process::Command::new(BITTY_BIN)
         .args(["--safe", "--headless", "--log-level", "info"])
+        .current_dir(&root)
         .env("XDG_CONFIG_HOME", &root)
         .env("XDG_DATA_HOME", &root)
         .env("HOME", &root)
@@ -331,7 +430,9 @@ fn safe_headless_startup_skips_hostile_dev_plugin_with_no_vm() {
         .output()
         .unwrap_or_else(|err| panic!("spawn {BITTY_BIN:?}: {err}"));
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    let cleanup = std::fs::remove_dir_all(&root);
+    let payload_ran =
+        plugin_dir.join("pwned-by-safe-test").exists() || root.join("pwned-by-safe-test").exists();
+    let _ = std::fs::remove_dir_all(&root);
 
     assert_eq!(
         output.status.code(),
@@ -346,10 +447,5 @@ fn safe_headless_startup_skips_hostile_dev_plugin_with_no_vm() {
         !stderr.contains(" active ("),
         "safe startup must activate no plugin VM, stderr={stderr:?}"
     );
-    assert!(
-        !plugin_dir.join("pwned-by-safe-test").exists()
-            && !root.join("pwned-by-safe-test").exists(),
-        "hostile plugin payload must never execute"
-    );
-    let _ = cleanup;
+    assert!(!payload_ran, "hostile plugin payload must never execute");
 }

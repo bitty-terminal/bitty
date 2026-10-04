@@ -9,7 +9,7 @@
 
 Scope is the verification gate only: prove the small-core program end-state.
 No product code was changed. The single added file is test evidence
-(`crates/bitty-terminal/tests/verify_w147_small_core_graph.rs`, 6 tests) plus
+(`crates/bitty-terminal/tests/verify_w147_small_core_graph.rs`, 8 tests) plus
 this report. No echte regressions were found; everything else is filed as
 tracked follow-up issues (see §6).
 
@@ -69,7 +69,7 @@ Results on `03bfda5c`:
   `KvCommitBackend` traits). Core-never-imports-extension holds.
 - Workspace membership: 16 crates; `bitty-compat-lab` / `bitty-perf` absent.
 
-All six new tests pin these properties and pass.
+All eight new tests pin these properties and pass.
 
 ## 3. Regression evidence (full workspace gate)
 
@@ -93,28 +93,29 @@ the gate revision with
   environmental measurements, not gate failures; the suite's own assertions
   pass.)
 - dev-tools slices: `cli_dev` **27 passed**; `bin bitty dev::` **22 passed**.
-- New W-147 module `verify_w147_small_core_graph`: **6/6 pass**.
+- New W-147 module `verify_w147_small_core_graph`: **8/8 pass**.
 - Pre-checks green: `cargo fmt --check` clean,
   `cargo clippy -p bitty-terminal --all-targets` clean, `actionlint` clean.
 - `just ci-local` (Quality gates via act, `bitty-act` image, per-branch cache):
   **🏁 Job succeeded** — all steps green on the gate revision including the
   new test module and evidence file.
 
-## 4. Docs sync (spot-check, issues filed, not fixed here)
+## 4. Docs sync (satisfied with evidence — stale pages fixed and merged)
 
 Checked `bitty-terminal-docs` and `bitty-docs` checkouts (read-only) against
-the landed removals. Stale pages found — each filed as a tracked issue in the
-owning repo:
+the landed removals. The three stale pages identified at gate time were fixed
+by verification-only docs PRs in the owning repos and are now merged
+(verified read-only via `gh api .../pulls/<n>` showing `merged: true`):
 
-- bitty-terminal-docs#191 — `architecture/core-boundaries.md:246` still claims
-  Core draws a transitional text workspaceline; contradicts W-104 Core bar
-  deletion (bitty#1677, c246e52). The same page's line 241 already states the
-  end-state.
-- bitty-terminal-docs#192 — `development/release-mechanics.md` records
-  `bitty-compat-lab` / `bitty-perf` as workspace members; contradicts W-105
-  relocation (bitty#1684, 03bfda5c).
+- bitty-terminal-docs#191 — `architecture/core-boundaries.md:246` transitional
+  workspaceline claim → fixed by bitty-terminal-docs#193, merge commit
+  `570d82cd662189a0751f76b0a77709a7d9ceefa6` (Closes #191).
+- bitty-terminal-docs#192 — `development/release-mechanics.md` workspace-member
+  roster → fixed by bitty-terminal-docs#194, merge commit
+  `b4f79b6cdca0d0a759ef397351ba224a2e3dff62` (Closes #192).
 - bitty-docs#435 — `docs/project/repository-map.md` (+ `project-state.json`
-  evidence strings) claim an 18-crate workspace; the count is 16 after W-105.
+  evidence strings) 18-crate count → fixed by bitty-docs#436, merge commit
+  `b511fee176a44abc301d35cc24842c71bb17cda6` (Closes #435).
 
 Spot-checked clean (no issue filed): `architecture/overview.md` (target-
 architecture framing; "draws no chrome" matches the end-state),
@@ -163,7 +164,9 @@ on suite PR merges (recorded in `validation-pins.env` header).
 
 ## 7. Follow-ups filed (tracked, out of gate scope)
 
-- bitty-terminal-docs#191, #192; bitty-docs#435 (stale docs, §4).
+- bitty-terminal-docs#191, #192; bitty-docs#435 (stale docs, §4 — now fixed
+  and merged: terminal-docs #193 `570d82c` + #194 `b4f79b6`, bitty-docs #436
+  `b511fee`).
 - Pre-existing residuals restated, not re-filed: composer live-host proof +
   engine deletion (bitty#1682), compat-suite merge-commit re-pin
   (`validation-pins.env`), extension-repo metadata sync notes from the
@@ -172,10 +175,11 @@ on suite PR merges (recorded in `validation-pins.env` header).
 ## 8. Definition-of-done checklist
 
 - [x] Safe startup proven (policy + binary trace + link graph)
-- [x] Production-edge graph proven (cargo tree + 6 automatable tests)
+- [x] Production-edge graph proven (cargo tree + 8 automatable tests)
 - [x] Full `just test` green with pass counts (§3)
 - [x] `just ci-local` Quality gates green (repo-mandated pre-push)
-- [x] Docs sync spot-checked; stale pages filed, none fixed cross-repo
+- [x] Docs sync satisfied with evidence: stale pages fixed and merged
+      (terminal-docs #193 `570d82c` + #194 `b4f79b6`, bitty-docs #436 `b511fee`)
 - [x] Ownership table complete with evidence PRs
 - [x] Bypass audit clean on the four retained paths
 - [ ] PR opened (base main, chore/P1/area:architecture, milestone v0.1.0,

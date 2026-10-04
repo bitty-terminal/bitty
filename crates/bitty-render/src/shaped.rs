@@ -136,6 +136,12 @@ fn system_db() -> &'static Database {
 pub struct SwashSingle {
     db: &'static Database,
     faces: HashMap<FontId, StoredFace>,
+    /// `fontdb` face ID to session handle: reloads (for example a font-size
+    /// change) re-query the same faces, and without this map every reload
+    /// would append duplicate entries until `MAX_LOADED_FACES` is exhausted.
+    /// The [`GlyphRasterizer::load_font`](crate::glyph::GlyphRasterizer::load_font)
+    /// contract allows returning the same handle for a repeated query.
+    by_db_id: HashMap<fontdb::ID, FontId>,
     scale_ctx: swash::scale::ScaleContext,
     next_font_id: u64,
 }
@@ -145,6 +151,7 @@ impl std::fmt::Debug for SwashSingle {
         f.debug_struct("SwashSingle")
             .field("system_faces", &self.db.len())
             .field("loaded_faces", &self.faces.len())
+            .field("cached_db_ids", &self.by_db_id.len())
             .field("next_font_id", &self.next_font_id)
             .finish()
     }
@@ -169,6 +176,7 @@ impl SwashSingle {
         Ok(Self {
             db,
             faces: HashMap::new(),
+            by_db_id: HashMap::new(),
             scale_ctx: swash::scale::ScaleContext::new(),
             next_font_id: 0,
         })
@@ -409,11 +417,6 @@ fn style_attrs(style: &FontStyle) -> (Weight, Style) {
 impl GlyphRasterizer for SwashSingle {
     fn load_font(&mut self, query: &FontQuery) -> Result<FontId, RenderError> {
         query.validate()?;
-        if self.faces.len() >= MAX_LOADED_FACES {
-            return Err(RenderError::InvalidInput {
-                reason: "rasterizer session face bound exceeded",
-            });
-        }
         let (weight, style_attr) = style_attrs(&query.style);
         let families = [Family::Name(query.family.as_str())];
         let request = Query {
@@ -426,6 +429,17 @@ impl GlyphRasterizer for SwashSingle {
             .db
             .query(&request)
             .ok_or_else(|| RenderError::FontNotFound(query.family.clone()))?;
+        // Reloads re-query already-loaded faces: reuse the handle instead
+        // of appending a duplicate entry (the bound below guards genuinely
+        // new faces only).
+        if let Some(existing) = self.by_db_id.get(&id) {
+            return Ok(*existing);
+        }
+        if self.faces.len() >= MAX_LOADED_FACES {
+            return Err(RenderError::InvalidInput {
+                reason: "rasterizer session face bound exceeded",
+            });
+        }
         let (data, face_index) = self.load_bytes(id)?;
         let stored = StoredFace { data, face_index };
         // Reject bytes the parser cannot use now (fail-closed at load, not
@@ -433,6 +447,7 @@ impl GlyphRasterizer for SwashSingle {
         Self::font_ref(&stored)?;
         let font = FontId::next(&mut self.next_font_id);
         self.faces.insert(font, stored);
+        self.by_db_id.insert(id, font);
         Ok(font)
     }
 

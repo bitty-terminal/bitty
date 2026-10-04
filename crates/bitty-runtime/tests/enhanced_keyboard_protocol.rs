@@ -718,3 +718,79 @@ fn ctrl_mods() -> bitty_platform::ModifiersState {
         super_pressed: false,
     }
 }
+
+// ----------------------------------------------------------------------
+// CTX-0947 (Issue #1665): push-form (`CSI > flags u`) acceptance cases.
+// The encoding now routes through
+// `bitty_platform::keyboard::encode_key_event_kitty_protocol` whenever the
+// focused view's flags are non-zero; flags 0 keeps the byte-identical
+// legacy fallback.
+// ----------------------------------------------------------------------
+
+#[test]
+fn push_disambiguate_reports_ctrl_i_as_csi_u() {
+    // `CSI > 1 u` pushes disambiguate: Ctrl+I encodes as the `i` codepoint
+    // with the ctrl modifier, distinct from the bare Tab key.
+    let mut rt = make_runtime();
+    send(&mut rt, b"\x1b[>1u");
+    assert_eq!(rt.enhanced_keyboard_flags(), 1);
+    press_ctrl(&mut rt);
+    assert_eq!(
+        rt.handle_key_event_ref(&char_key("i", None, PressState::Pressed, false)),
+        Some(b"\x1b[105;5u".to_vec()),
+        "Ctrl+I under CSI > 1u is CSI 105;5u"
+    );
+    release_ctrl(&mut rt);
+    // Bare Tab keeps its legacy byte under disambiguate-only (spec
+    // exception so a crashed program can still type `reset`); pushing
+    // report-all-keys as well lifts the exception to `CSI 9u` (the
+    // zero-modifier `;1` field is omitted per the reference `serialize`).
+    assert_eq!(
+        rt.handle_key_event_ref(&named_key(NamedKey::Tab, PressState::Pressed)),
+        Some(b"\t".to_vec())
+    );
+    send(&mut rt, b"\x1b[>9u");
+    assert_eq!(
+        rt.handle_key_event_ref(&named_key(NamedKey::Tab, PressState::Pressed)),
+        Some(b"\x1b[9u".to_vec()),
+        "bare Tab under disambiguate|report-all is CSI 9u"
+    );
+    send(&mut rt, b"\x1b[<u");
+    assert_eq!(rt.enhanced_keyboard_flags(), 1);
+}
+
+#[test]
+fn push_report_events_reports_release_as_event_type_3() {
+    // flags&2 requested via push: key-up frames carry the `:3` event type.
+    let mut rt = make_runtime();
+    send(&mut rt, b"\x1b[>3u");
+    assert_eq!(rt.enhanced_keyboard_flags(), 3);
+    press_ctrl(&mut rt);
+    assert_eq!(
+        rt.handle_key_event_ref(&char_key("a", None, PressState::Released, false)),
+        Some(b"\x1b[97;5:3u".to_vec()),
+        "key-up carries event type 3 when flags&2 is pushed"
+    );
+    release_ctrl(&mut rt);
+}
+
+#[test]
+fn popped_to_zero_restores_legacy_bytes() {
+    // Popping back to flags 0 restores the byte-identical legacy fallback,
+    // including the Ctrl+I C0 byte the disambiguated form replaces.
+    let mut rt = make_runtime();
+    send(&mut rt, b"\x1b[>1u");
+    send(&mut rt, b"\x1b[<u");
+    assert_eq!(rt.enhanced_keyboard_flags(), 0);
+    press_ctrl(&mut rt);
+    assert_eq!(
+        rt.handle_key_event_ref(&char_key("i", None, PressState::Pressed, false)),
+        Some(b"\x09".to_vec()),
+        "flags 0 restores the legacy Ctrl+I byte"
+    );
+    assert_eq!(
+        rt.handle_key_event_ref(&named_key(NamedKey::Tab, PressState::Pressed)),
+        Some(b"\t".to_vec())
+    );
+    release_ctrl(&mut rt);
+}

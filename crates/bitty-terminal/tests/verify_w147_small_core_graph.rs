@@ -222,6 +222,14 @@ bitty-compat-lab = "0.0.1"
     }
 }
 
+/// True when Rust source names `krate` as a crate (word-boundary match):
+/// catches `krate::...` paths as well as `use krate as alias;` and
+/// `extern crate krate;` forms that never spell the `::` suffix.
+fn names_crate(text: &str, krate: &str) -> bool {
+    text.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .any(|token| token == krate)
+}
+
 #[test]
 fn normal_deps_detect_target_table_header() {
     // `[target.<cfg>.dependencies.<name>]` tables carry the edge in the
@@ -232,6 +240,24 @@ fn normal_deps_detect_target_table_header() {
         lines.iter().any(|line| declares_dep(line, "bitty-storage")),
         "target table-header entry must read as an edge: {lines:?}"
     );
+}
+
+#[test]
+fn crate_naming_detects_alias_and_extern_forms() {
+    // Regression for the W-147 review: `use krate as alias;` and
+    // `extern crate krate;` import without ever spelling `krate::`.
+    assert!(names_crate(
+        "use bitty_storage as storage;",
+        "bitty_storage"
+    ));
+    assert!(names_crate("extern crate bitty_storage;", "bitty_storage"));
+    assert!(names_crate(
+        "let x = bitty_storage::load(&p);",
+        "bitty_storage"
+    ));
+    assert!(!names_crate("let bitty_storage2 = 1;", "bitty_storage"));
+    // Comments still match: the gate errs toward flagging (fail-closed).
+    assert!(names_crate("// uses bitty_storage here", "bitty_storage"));
 }
 
 #[test]
@@ -336,7 +362,7 @@ fn core_library_sources_never_name_storage_impl() {
                 continue;
             }
             let text = std::fs::read_to_string(&file).expect("read rs file");
-            if text.contains("bitty_storage::") {
+            if names_crate(&text, "bitty_storage") {
                 offenders.push(file);
             }
         }

@@ -315,6 +315,11 @@ pub const CLOSED_CAPABILITY_HEADS: &[&str] = &[
     "terminal.raw-read",
     "terminal.input.self",
     "terminal.input.all",
+    // W-82 additive v2 (CTX-0929 S-5): bounded buffer submission to the
+    // focused panel PTY through the Core paste pipeline as one
+    // bracketed-paste frame. No parameter: the payload travels with the
+    // host call, never as a grant parameter.
+    "terminal.input.submit",
     "terminal.manage",
     "ui.rich",
     "ui.overlay",
@@ -325,6 +330,10 @@ pub const CLOSED_CAPABILITY_HEADS: &[&str] = &[
     "env.read",
     "fs.read",
     "fs.write",
+    // W-82 additive v2 (CTX-0929 S-5): the allowlisted external-editor round
+    // trip on a Core-owned temp file. No parameter: the editor program is
+    // allowlist-resolved by Core, and the temp path never leaves Core.
+    "process.editor",
     "process.spawn",
     "network.connect",
     "runtime.inspect",

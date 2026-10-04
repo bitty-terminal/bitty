@@ -44,6 +44,15 @@ pub enum CapabilityFamily {
     /// workspaces through the same Core handlers as keybindings. Read never
     /// implies control.
     Workspace,
+    /// Read-only history/search/selection family (RFC-0004, CTX-0955, W-139).
+    ///
+    /// A NEW family beside `terminal.*`, never an extension of it: scoped,
+    /// bounded snapshot reads over the three queryable sources (segmented
+    /// transcript, command history, own per-plugin KV). Session snapshots
+    /// are never a queryable source. Every member is deny-by-default with
+    /// explicit per-plugin, per-source scope; exact Lua spellings stay
+    /// parked to W-139 (SDK) under a new root, never `bitty.terminal.*`.
+    History,
 }
 
 impl CapabilityFamily {
@@ -68,6 +77,7 @@ impl CapabilityFamily {
             "mcp" => Some(Self::Mcp),
             "ai" => Some(Self::Ai),
             "workspace" => Some(Self::Workspace),
+            "history" => Some(Self::History),
             _ => None,
         }
     }
@@ -94,6 +104,7 @@ impl CapabilityFamily {
             Self::Mcp => "mcp",
             Self::Ai => "ai",
             Self::Workspace => "workspace",
+            Self::History => "history",
         }
     }
 
@@ -168,6 +179,14 @@ impl CapabilityFamily {
             Self::Mcp => &["mcp.invoke"],
             Self::Ai => &["ai.provider", "ai.stream", "ai.model"],
             Self::Workspace => &["workspace.read", "workspace.control"],
+            // RFC-0004 read-only history/search/selection family (CTX-0955).
+            // New family beside `terminal.*`; the `Terminal` table above is
+            // frozen and untouched by this family.
+            Self::History => &[
+                "history.transcript.read",
+                "history.commands.read",
+                "history.kv.read",
+            ],
         }
     }
 }
@@ -400,6 +419,11 @@ pub fn effect_statement(id: &CapabilityId) -> &'static str {
         "ai.model" => "Select AI model for this agent (bounded)",
         "workspace.read" => "List workspaces and observe workspace events (no terminal content)",
         "workspace.control" => "Create, close, rename, and focus workspaces and move panels",
+        "history.transcript.read" => {
+            "Read bounded redacted snapshots of the opt-in segmented transcript"
+        }
+        "history.commands.read" => "Read bounded redacted snapshots of command history",
+        "history.kv.read" => "Read this plugin's own key-value namespace (bounded)",
         _ => "Requested capability",
     }
 }
@@ -507,6 +531,7 @@ mod tests {
             CapabilityFamily::Mcp,
             CapabilityFamily::Ai,
             CapabilityFamily::Workspace,
+            CapabilityFamily::History,
         ];
         for family in families {
             assert!(family.denied_without_grant());
@@ -564,6 +589,45 @@ mod tests {
             assert_eq!(effect_statement(&granted), statement);
             assert!(CapabilityId::parse(&format!("{raw}:param")).is_err());
         }
+    }
+
+    #[test]
+    fn history_family_parses_without_parameter() {
+        // RFC-0004 (CTX-0955): the history-read family is new and read-only
+        // beside `terminal.*`. Scope travels with the host call, never as a
+        // grant parameter (same precedent as `terminal.input.submit`).
+        for raw in [
+            "history.transcript.read",
+            "history.commands.read",
+            "history.kv.read",
+        ] {
+            let granted = CapabilityId::parse(raw).expect("history capability parses");
+            assert_eq!(granted.family(), CapabilityFamily::History);
+            assert_eq!(granted.family().as_str(), "history");
+            assert!(!granted.has_param());
+            assert!(CapabilityId::parse(&format!("{raw}:param")).is_err());
+        }
+        // Nothing reads this family's sources under a `terminal.*` spelling.
+        assert!(CapabilityId::parse("terminal.history.read").is_err());
+        assert!(CapabilityId::parse("terminal.transcript.read").is_err());
+    }
+
+    #[test]
+    fn terminal_family_stays_frozen() {
+        // RFC-0004 non-goal: no `terminal.*` member is widened,
+        // reinterpreted, or given a read sub-scope. The v1 set is exactly
+        // the six accepted identifiers.
+        assert_eq!(
+            CapabilityFamily::Terminal.closed_identifiers(),
+            &[
+                "terminal.semantic-read",
+                "terminal.raw-read",
+                "terminal.input.self",
+                "terminal.input.all",
+                "terminal.input.submit",
+                "terminal.manage",
+            ]
+        );
     }
 
     #[test]
@@ -667,6 +731,7 @@ mod tests {
             CapabilityFamily::Mcp,
             CapabilityFamily::Ai,
             CapabilityFamily::Workspace,
+            CapabilityFamily::History,
         ] {
             host_heads.extend(family.closed_identifiers().iter().copied());
         }

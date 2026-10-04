@@ -342,6 +342,14 @@ pub(crate) struct TerminalApp {
     /// Production startup sets it from the CLI flag; tests set it
     /// explicitly. Default false (normal startup).
     pub(crate) safe_mode: bool,
+    /// Dispatch-failure fallback latch (W-103 S-5, CTX-0929): set when an
+    /// ACTIVE-plugin open dispatch fails and the retained Core composer
+    /// opens instead. While latched AND the Core session is open, key
+    /// routing serves the Core session even though the plugin still owns
+    /// the UX (prevents a stranded visible-but-dead session). The latch
+    /// clears whenever no Core session is open, so the next open retries
+    /// the plugin. Default false.
+    pub(crate) composer_core_fallback_latched: bool,
     /// Previous runtime state for event change detection (CTX-0892).
     /// Updated in place by [`EventTracker::take_changes`] each tick; changes
     /// trigger plugin events.
@@ -388,6 +396,7 @@ impl TerminalApp {
             live_workspaces: None,
             plugin_runtime: None,
             safe_mode: false,
+            composer_core_fallback_latched: false,
             event_tracker,
         }
     }
@@ -422,6 +431,7 @@ impl TerminalApp {
             live_workspaces: None,
             plugin_runtime: None,
             safe_mode: false,
+            composer_core_fallback_latched: false,
             event_tracker,
         }
     }

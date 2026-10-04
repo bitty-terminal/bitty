@@ -973,6 +973,14 @@ impl TerminalApp {
                                     "warning: composer plugin open failed ({diagnostic}) — retained Core composer opens"
                                 );
                                 self.runtime.cw_composer_open();
+                                // The plugin still owns the UX, but the open
+                                // Core session must stay routed: latch the
+                                // fallback so the modal guard below serves
+                                // this session instead of stranding it
+                                // visible-but-dead. The latch clears when no
+                                // Core session is open, so the next open
+                                // retries the plugin.
+                                self.composer_core_fallback_latched = true;
                                 eprintln!(
                                     "bitty: keymap open_composer -> composer open (Enter newline, Ctrl+Enter submit, Esc close, Alt+E editor flag)"
                                 );
@@ -1553,11 +1561,26 @@ impl TerminalApp {
             // path never opens the Core session; this guard covers the
             // transition edge.) The retained fallback keeps the existing
             // modal routing below.
-            if self.composer_plugin_owns() {
+            //
+            // Exception: a dispatch-failure fallback latch means the open
+            // session IS the retained Core composer even though the plugin
+            // still owns the UX — serve it instead of stranding it
+            // visible-but-dead.
+            if self.composer_plugin_owns() && !self.composer_core_fallback_latched {
                 return false;
             }
-            return self.route_composer_press(key);
+            let handled = self.route_composer_press(key);
+            // The press may have closed the session (submit/cancel/Esc):
+            // no open session means no fallback is active, so clear the
+            // latch and let the next open retry the plugin.
+            if !self.runtime.cw_composer_is_open() {
+                self.composer_core_fallback_latched = false;
+            }
+            return handled;
         }
+        // No Core session open: no fallback is active, so clear a stale
+        // latch. The next open retries the plugin.
+        self.composer_core_fallback_latched = false;
         false
     }
 
@@ -4328,6 +4351,82 @@ mod tests {
         assert!(
             safe_app.runtime.cw_composer_is_open(),
             "safe-mode startup keeps the retained Core composer"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn composer_cutover_dispatch_error_keeps_fallback_session_routed() {
+        // W-103 S-5 CodeRabbit follow-up (CTX-0929): when the ACTIVE
+        // plugin fails the open dispatch, the retained Core composer opens
+        // AND stays routed — no stranded visible-but-dead session. Closing
+        // clears the latch, so the next open retries the plugin.
+        use crate::composer_owner::{
+            COMPOSER_COMMAND_CLOSE, COMPOSER_COMMAND_OPEN, COMPOSER_PLUGIN_ID,
+            COMPOSER_REQUIRED_CAPABILITIES, ComposerOwner, fixture,
+        };
+        use bitty_config::{ChromeAction, KeyName, KeyRef};
+        let root = fixture::temp_dir("dispatch-error-fallback");
+        // The plugin owns the UX (active, matching) but never registered
+        // the open verb, so the open dispatch fails.
+        fixture::write_plugin(
+            &root,
+            COMPOSER_PLUGIN_ID,
+            ">=0.0.1",
+            COMPOSER_REQUIRED_CAPABILITIES,
+            &[COMPOSER_COMMAND_CLOSE],
+        );
+        let mut plugin_runtime = fixture::runtime_for(vec![root.clone()]);
+        plugin_runtime.discover();
+        let id = bitty_plugin_host::manifest::PluginId::new(COMPOSER_PLUGIN_ID).expect("id");
+        plugin_runtime.activate(&id).expect("activate");
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let mut app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        assert_eq!(app.composer_owner(), ComposerOwner::Plugin);
+        app.apply_chrome_action(ChromeAction::OpenComposer);
+        assert!(
+            app.runtime.cw_composer_is_open(),
+            "dispatch failure opens the retained Core composer"
+        );
+        assert!(
+            app.composer_core_fallback_latched,
+            "fallback latch set on dispatch-error open"
+        );
+        // Typing must reach the Core session (the guard serves the latched
+        // fallback instead of yielding to normal dispatch).
+        let keyref = |key: KeyName| KeyRef {
+            key,
+            ctrl: false,
+            alt: false,
+            shift: false,
+            super_held: false,
+        };
+        assert!(
+            app.route_cw_modal(&test_char_key("x"), &keyref(KeyName::Char('x'))),
+            "fallback session consumes typing while latched"
+        );
+        // Esc closes the fallback and clears the latch; the plugin still
+        // owns the next open.
+        assert!(
+            app.route_cw_modal(
+                &test_key(LogicalKey::Named(NamedKey::Escape)),
+                &keyref(KeyName::Escape)
+            ),
+            "esc reaches the fallback session"
+        );
+        assert!(
+            !app.runtime.cw_composer_is_open(),
+            "esc closes the fallback session"
+        );
+        assert!(
+            !app.composer_core_fallback_latched,
+            "latch clears with the session"
+        );
+        assert_eq!(
+            app.composer_owner(),
+            ComposerOwner::Plugin,
+            "next open retries the plugin"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

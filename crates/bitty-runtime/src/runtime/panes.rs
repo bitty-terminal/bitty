@@ -281,6 +281,49 @@ impl Runtime {
         rows: u16,
         cwd: Option<&std::path::Path>,
     ) -> Result<(), RuntimeError> {
+        self.spawn_shell_for_view_impl(view, program, args, cols, rows, cwd, &[])
+    }
+
+    /// [`Self::spawn_shell_for_view`] with inherited-environment removals
+    /// (minimized editor env, W-103 G-2).
+    ///
+    /// Every entry of `scrub_env` is removed from the inherited session
+    /// environment before the child starts; the builder defaults
+    /// (`TERM`/`COLORTERM`/`TERM_PROGRAM`) and any ambient key outside the
+    /// removal list still apply. The hosted editor leaf passes the
+    /// minimized-env removals here so the allowlisted editor starts without
+    /// ambient credentials.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::spawn_shell_for_view`].
+    pub fn spawn_shell_for_view_scrubbed(
+        &mut self,
+        view: ViewId,
+        program: &str,
+        args: &[&str],
+        cols: u16,
+        rows: u16,
+        scrub_env: &[std::ffi::OsString],
+    ) -> Result<(), RuntimeError> {
+        self.spawn_shell_for_view_impl(view, program, args, cols, rows, None, scrub_env)
+    }
+
+    // Leaf-spawn arity is inherent to the spawn seam (view + program + argv
+    // + geometry + cwd + env removals); the two public callers keep their
+    // stable arities and share this body so scrubbed and plain spawns cannot
+    // drift apart.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_shell_for_view_impl(
+        &mut self,
+        view: ViewId,
+        program: &str,
+        args: &[&str],
+        cols: u16,
+        rows: u16,
+        cwd: Option<&std::path::Path>,
+        scrub_env: &[std::ffi::OsString],
+    ) -> Result<(), RuntimeError> {
         if program.trim().is_empty() {
             return Err(RuntimeError::InvalidConfig("program must not be empty"));
         }
@@ -303,6 +346,12 @@ impl Runtime {
         let cols = cols.max(1);
         let rows = rows.max(1);
         let mut builder = PtyBuilder::new(program).size(cols, rows);
+        // W-103 G-2: caller-requested inherited-environment removals
+        // (minimized editor env). Removals precede the explicit overrides,
+        // so the builder defaults still win for the same key.
+        for key in scrub_env {
+            builder = builder.env_remove(key.clone());
+        }
         // CTX-0357: new panes inherit the focused pane's last `OSC 7` cwd
         // when it still names an existing directory; otherwise the builder
         // keeps the platform default (fail-open, never an error here). An
@@ -481,6 +530,29 @@ impl Runtime {
     #[must_use]
     pub fn pane_pid(&self, view: &ViewId) -> Option<u32> {
         self.pane_sessions.get(view).and_then(|sess| sess.pty.pid())
+    }
+
+    /// Signals the leaf child's recorded owned process tree (W-103 G-3).
+    ///
+    /// PTY children are session leaders heading their own process group, so
+    /// the leader pid adopts an [`OwnedTree`](bitty_pty::OwnedTree) covering
+    /// the whole tree the child grew (editors spawning shells, pagers,
+    /// background jobs). The kill signal reaches every member, not just the
+    /// direct child that [`close_pane_session`](Self::close_pane_session)
+    /// would reap alone. The tracker is dropped without retiring: the
+    /// `PaneSession` still owns the leader and reaps it on teardown, which
+    /// is the only place a reap may happen. Returns `true` when the tree
+    /// signal was delivered; `false` without a session, without a pid, on
+    /// platforms without an owned-tree backend, or when the tree is already
+    /// gone (callers still run the normal teardown, which is always safe).
+    pub fn kill_pane_tree(&self, view: &ViewId) -> bool {
+        let Some(pid) = self.pane_pid(view) else {
+            return false;
+        };
+        let Ok(tree) = bitty_pty::OwnedTree::adopt(pid) else {
+            return false;
+        };
+        tree.signal(bitty_pty::TreeSignal::Kill).is_ok()
     }
 
     /// Exit status of the leaf's child when it has already exited, without

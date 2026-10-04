@@ -236,6 +236,7 @@ pub use runtime::session::{
     SessionExitSaveOutcome, SessionFileBackend, SessionRestoreSummary, SessionSaveSummary,
     SessionSnapshot, SessionStartupOutcome, WorkspaceSnapshot,
 };
+pub use runtime::submit_host::{TerminalSubmitOutcome, TerminalSubmitUnavailable};
 pub use runtime::workspaces::{
     MAX_WORKSPACES, WORKSPACE_NAME_MAX_CHARS, WorkspaceSummary, WsCloseRequest,
 };

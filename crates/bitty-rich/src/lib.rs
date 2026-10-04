@@ -23,10 +23,14 @@
 //! `bitty-render`. The `kitty` stub is retained for compatibility and
 //! mirrors the legacy term-state bounds; new code should use `image`.
 //!
-//! The `composer` module is the only filesystem/process seam in this crate:
-//! the external-editor round-trip writes a `0600` temp file under the OS
-//! temp dir and spawns `$VISUAL`/`$EDITOR` with a bounded timeout plus
-//! kill. Everything else here is pure logic over `State`/`Snapshot` values.
+//! The `composer` and `host` modules hold the only filesystem/process seams
+//! in this crate: the external-editor round trip writes a `0600` temp file
+//! and spawns `$VISUAL`/`$EDITOR` with a bounded timeout plus kill.
+//! `composer` keeps the legacy mechanics (ambient temp dir, inherited
+//! stdio/env, direct-child kill); `host` implements the typed host-operation
+//! boundary (Bitty-owned `0700` root, minimized env, closed stdin,
+//! owned-tree kill, typed outcomes). Everything else here is pure logic over
+//! `State`/`Snapshot` values.
 //!
 //! # Bounds (threat T-01/T-02)
 //!
@@ -92,6 +96,7 @@ pub mod clipboard;
 pub mod composer;
 pub mod geometry;
 pub mod hints;
+pub mod host;
 pub mod hyperlink;
 pub mod image;
 pub mod kitty;
@@ -137,6 +142,12 @@ pub use hints::{
     OperatorConflict, TargetId, allocate_labels, check_operator_conflicts, collect_command_targets,
     collect_link_targets, collect_panel_targets, collect_view_targets, dispatch, dispatch_link,
     label_for_index, parse_hint_chord, resolve_link_uri,
+};
+pub use host::{
+    EditorDeny, EditorOutcome, HOSTED_ENV_KEEP, OWNED_TEMP_DIR_NAME, SUBMIT_PLUGIN_ID_MAX,
+    SubmitBudget, SubmitDeny, build_hosted_env, check_terminal_submit, hosted_env_keeps,
+    minimized_env_removals, owned_temp_root, process_editor_start, run_editor_hosted,
+    sweep_crashed_temps,
 };
 pub use hyperlink::{HyperlinkInfo, HyperlinkSpan};
 pub use image::{

@@ -17,6 +17,11 @@ workspace = true
 bitty-term-state = { path = "../bitty-term-state" }
 bitty-vt = { path = "../bitty-vt" }
 bitty-platform = { path = "../bitty-platform" }
+# W-103 G-3: the blocking hosted-editor spawn records and kills the whole
+# owned process tree through the execution boundary's reviewed tracker
+# (`bitty_pty::OwnedTree`); workspace-internal path edge, no new
+# supply-chain surface.
+bitty-pty = { path = "../bitty-pty" }
 # Fragment-to-RichBlock projection (CTX-0439) reads the bounded ingestion
 # DTOs; workspace-internal edge, no new supply-chain surface.
 bitty-ipc = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "e9714e7" }

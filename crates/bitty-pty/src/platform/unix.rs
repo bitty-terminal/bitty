@@ -87,6 +87,12 @@ pub(crate) fn open_pty_and_spawn(config: &SpawnConfig) -> Result<(Master, Child)
     for key in crate::builder::GRAPHICS_FINGERPRINT_EXACT_KEYS {
         command.env_remove(key);
     }
+    // Caller-requested inherited-environment removals (minimized editor env,
+    // W-103 G-2): after the fingerprint strip, before explicit overrides so
+    // an explicit builder entry for the same key still wins.
+    for key in &config.env_remove {
+        command.env_remove(key);
+    }
     // Explicit builder entries override the (sanitized) inherited environment.
     for (key, value) in &config.env {
         command.env(key, value);

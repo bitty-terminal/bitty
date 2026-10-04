@@ -31,6 +31,15 @@ use crate::error::PtyError;
 /// Maximum number of entries in the child environment allowlist.
 pub const MAX_ENV_ENTRIES: usize = 64;
 
+/// Maximum number of inherited-environment removals.
+///
+/// Removals carry keys only (no values) and name variables already resident
+/// in the spawner's own environment, so this bound is roomier than the
+/// allowlist one: a minimized-env caller removes every inherited key
+/// outside its keep list, and real session environments (cargo/nextest
+/// runners included) hold hundreds of entries.
+pub const MAX_ENV_REMOVE_ENTRIES: usize = 1024;
+
 /// Maximum byte length of a single allowlisted environment value.
 pub const MAX_ENV_VALUE_BYTES: usize = 4096;
 
@@ -129,6 +138,10 @@ pub(crate) struct SpawnConfig {
     pub(crate) program: OsString,
     pub(crate) args: Vec<OsString>,
     pub(crate) env: Vec<(OsString, OsString)>,
+    /// Caller-requested inherited-environment removals, applied after the
+    /// graphics-fingerprint strip and before the explicit [`PtyBuilder::env`]
+    /// overrides (an explicit override still wins over a removal).
+    pub(crate) env_remove: Vec<OsString>,
     pub(crate) cwd: Option<PathBuf>,
     pub(crate) cols: u16,
     pub(crate) rows: u16,
@@ -144,6 +157,7 @@ pub struct PtyBuilder {
     program: OsString,
     args: Vec<OsString>,
     env: Vec<(OsString, OsString)>,
+    env_remove: Vec<OsString>,
     cwd: Option<PathBuf>,
     cols: u16,
     rows: u16,
@@ -177,6 +191,7 @@ impl PtyBuilder {
                     OsString::from(DEFAULT_TERM_PROGRAM),
                 ),
             ],
+            env_remove: Vec::new(),
             cwd: None,
             cols: DEFAULT_COLS,
             rows: DEFAULT_ROWS,
@@ -218,6 +233,25 @@ impl PtyBuilder {
     /// Sets the child's working directory.
     pub fn cwd(mut self, path: impl Into<PathBuf>) -> Self {
         self.cwd = Some(path.into());
+        self
+    }
+
+    /// Removes one inherited environment variable from the child.
+    ///
+    /// The removal applies to the inherited session environment only: it runs
+    /// after the graphics-fingerprint strip and before the explicit
+    /// [`PtyBuilder::env`] overrides, so a caller-explicit `env` entry for
+    /// the same key still wins. Removing a key that is absent (or also added
+    /// explicitly) is a no-op, never an error. This is the minimized-env
+    /// primitive behind the hosted-editor leaf (W-103 G-2): the caller passes
+    /// every inherited key outside its keep-allowlist and the child starts
+    /// without ambient credentials. Keys must be non-empty and free of `'='`
+    /// and NUL, like [`PtyBuilder::env`].
+    pub fn env_remove(mut self, key: impl Into<OsString>) -> Self {
+        let key = key.into();
+        if !self.env_remove.contains(&key) {
+            self.env_remove.push(key);
+        }
         self
     }
 
@@ -279,6 +313,33 @@ impl PtyBuilder {
                 self.env.len()
             )));
         }
+        if self.env_remove.len() > MAX_ENV_REMOVE_ENTRIES {
+            return Err(PtyError::Upstream(format!(
+                "environment removal count {} exceeds limit {MAX_ENV_REMOVE_ENTRIES}",
+                self.env_remove.len()
+            )));
+        }
+        for key in &self.env_remove {
+            let key_text = key.to_string_lossy();
+            if key.is_empty() {
+                return Err(PtyError::InvalidEnvVar {
+                    key: key_text.into_owned(),
+                    reason: "removal key must not be empty",
+                });
+            }
+            if key_text.contains('=') {
+                return Err(PtyError::InvalidEnvVar {
+                    key: key_text.into_owned(),
+                    reason: "removal key must not contain '='",
+                });
+            }
+            if os_contains_nul(key.as_os_str()) {
+                return Err(PtyError::InvalidEnvVar {
+                    key: key_text.into_owned(),
+                    reason: "removal key must not contain NUL bytes",
+                });
+            }
+        }
         for (key, value) in &self.env {
             let key_text = key.to_string_lossy();
             if key.is_empty() {
@@ -315,6 +376,7 @@ impl PtyBuilder {
             program: self.program,
             args: self.args,
             env: self.env,
+            env_remove: self.env_remove,
             cwd: self.cwd,
             cols: self.cols,
             rows: self.rows,
@@ -539,5 +601,46 @@ mod tests {
     fn cwd_is_preserved() {
         let cfg = valid_builder().cwd("/tmp").validate().unwrap();
         assert_eq!(cfg.cwd.as_deref(), Some(std::path::Path::new("/tmp")));
+    }
+
+    #[test]
+    fn env_remove_is_stored_deduplicated() {
+        let cfg = valid_builder()
+            .env_remove("GHOSTLY_TOKEN")
+            .env_remove("AWS_SECRET_ACCESS_KEY")
+            .env_remove("GHOSTLY_TOKEN")
+            .validate()
+            .unwrap();
+        assert_eq!(
+            cfg.env_remove,
+            vec![
+                OsString::from("GHOSTLY_TOKEN"),
+                OsString::from("AWS_SECRET_ACCESS_KEY"),
+            ]
+        );
+        // Explicit allowlist entries are untouched by removals.
+        assert_eq!(cfg.env.len(), 3);
+    }
+
+    #[test]
+    fn env_remove_defaults_to_empty() {
+        let cfg = valid_builder().validate().unwrap();
+        assert!(cfg.env_remove.is_empty());
+    }
+
+    #[test]
+    fn env_remove_rejects_bad_keys() {
+        let err = valid_builder().env_remove("").validate().unwrap_err();
+        assert!(matches!(err, PtyError::InvalidEnvVar { .. }));
+        let err = valid_builder().env_remove("A=B").validate().unwrap_err();
+        assert!(matches!(err, PtyError::InvalidEnvVar { .. }));
+    }
+
+    #[test]
+    fn env_remove_over_cap_is_rejected() {
+        let builder = (0..=MAX_ENV_REMOVE_ENTRIES)
+            .fold(valid_builder(), |b, i| b.env_remove(format!("SCRUB_{i}")));
+        let err = builder.validate().unwrap_err();
+        assert!(matches!(err, PtyError::Upstream(ref msg) if msg.contains("removal count")));
     }
 }

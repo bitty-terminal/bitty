@@ -854,6 +854,30 @@ impl HistoryGate {
             .unwrap_or((0, 0))
     }
 
+    /// Whether `grant` is eligible for `level` right now: owned by
+    /// `plugin`, covering `source`, live, and of the kind the level admits
+    /// (standing for L1/L2, single-use per-request for L3/L4).
+    fn grant_is_usable(
+        &self,
+        grant: &HistoryGrant,
+        plugin: &PluginId,
+        source: HistorySource,
+        level: TrustLevel,
+    ) -> bool {
+        grant.plugin == *plugin
+            && grant.scope.source() == source
+            && grant.is_live(self.now)
+            && match level {
+                TrustLevel::BundledLua | TrustLevel::ThirdPartyLua => {
+                    matches!(grant.kind, GrantKind::Standing)
+                }
+                TrustLevel::NativeSidecar | TrustLevel::ExternalTool => {
+                    matches!(grant.kind, GrantKind::PerRequest { uses_left: 1.. })
+                }
+                TrustLevel::Core => false,
+            }
+    }
+
     /// Bounded snapshot read over already-persisted state.
     pub fn query(
         &mut self,
@@ -908,40 +932,41 @@ impl HistoryGate {
         //    live per-request/per-invocation grant. L0 (Core enforcement
         //    itself) needs no plugin grant and skips grant/scope checks;
         //    KV namespace filtering below still applies structurally.
-        let grant_idx: Option<usize> = if level == TrustLevel::Core {
-            None
-        } else {
-            let standing_idx: Option<usize> = self.grants.iter().position(|grant| {
-                grant.plugin == *plugin
-                    && grant.scope.source() == source
-                    && grant.is_live(self.now)
-                    && matches!(grant.kind, GrantKind::Standing)
-            });
-            let per_request_idx: Option<usize> = self.grants.iter().position(|grant| {
-                grant.plugin == *plugin
-                    && grant.scope.source() == source
-                    && grant.is_live(self.now)
-                    && matches!(grant.kind, GrantKind::PerRequest { uses_left: 1.. })
-            });
-            match level {
-                TrustLevel::Core => None,
-                TrustLevel::BundledLua | TrustLevel::ThirdPartyLua => standing_idx,
-                TrustLevel::NativeSidecar | TrustLevel::ExternalTool => per_request_idx,
-            }
-        };
-        // Any recorded-but-unusable grant (revoked/expired, or the wrong
-        // kind for this level) denies as revoked/expired or missing without
-        // distinguishing which — both are oracle-identical denials.
-        // L0 skips grant presence and scope intersection (Core owns every
-        // scope); capture, bounds, budgets, and namespace filtering below
-        // still apply.
+        //    A plugin may hold several grants on one source: the gate
+        //    selects a live grant of the right kind whose scope INTERSECTS
+        //    the query, and reports ScopeMismatch only when eligible live
+        //    grants exist but none of them intersects.
         let mut grant_slot: Option<usize> = None;
         if level != TrustLevel::Core {
+            let any_usable = self
+                .grants
+                .iter()
+                .any(|grant| self.grant_is_usable(grant, plugin, source, level));
+            let matching_idx = self.grants.iter().position(|grant| {
+                self.grant_is_usable(grant, plugin, source, level) && scope.intersects(&grant.scope)
+            });
+            if any_usable && matching_idx.is_none() {
+                // 5. Scope intersection (query ∩ grant, or deny). KV
+                //    additionally restricts to the caller namespace
+                //    structurally below.
+                return Err(HistoryError::denied(
+                    HistoryDenialKind::ScopeMismatch,
+                    level,
+                    "query scope outside grant scope",
+                ));
+            }
+            // Any recorded-but-unusable grant (revoked/expired, or the wrong
+            // kind for this level) denies as revoked/expired or missing
+            // without distinguishing which — both are oracle-identical
+            // denials.
+            // L0 skips grant presence and scope intersection (Core owns every
+            // scope); capture, bounds, budgets, and namespace filtering below
+            // still apply.
             let recorded = self
                 .grants
                 .iter()
                 .any(|grant| grant.plugin == *plugin && grant.scope.source() == source);
-            let Some(idx) = grant_idx else {
+            let Some(idx) = matching_idx else {
                 if recorded
                     && self.grants.iter().any(|grant| {
                         grant.plugin == *plugin
@@ -961,16 +986,6 @@ impl HistoryGate {
                     "no usable grant",
                 ));
             };
-
-            // 5. Scope intersection (query ∩ grant, or deny). KV additionally
-            //    restricts to the caller namespace structurally below.
-            if !scope.intersects(&self.grants[idx].scope) {
-                return Err(HistoryError::denied(
-                    HistoryDenialKind::ScopeMismatch,
-                    level,
-                    "query scope outside grant scope",
-                ));
-            }
             grant_slot = Some(idx);
         }
 
@@ -1047,8 +1062,14 @@ impl HistoryGate {
                 let needle = needle.unwrap_or_default();
                 let start = usize::try_from(query.row_start).unwrap_or(usize::MAX);
                 let count = usize::try_from(query.row_count).unwrap_or(usize::MAX);
+                // Purged rows are invisible to content matching: letting the
+                // needle match purged bodies would oracle purged-content
+                // existence (unavailability versus empty page). Positional
+                // list/tail selection keeps the typed-unavailability denial
+                // below; search never does.
                 in_scope
                     .into_iter()
+                    .filter(|row| !row.purged)
                     .filter(|row| row.redacted_body.contains(needle))
                     .skip(start)
                     .take(count)
@@ -1076,8 +1097,16 @@ impl HistoryGate {
         for row in live {
             let mut body = row.redacted_body.clone();
             let mut truncated = false;
-            if body.len() > self.caps.max_bytes_per_row as usize {
-                body.truncate(self.caps.max_bytes_per_row as usize);
+            let cap = self.caps.max_bytes_per_row as usize;
+            if body.len() > cap {
+                // Walk back to a UTF-8 char boundary: `truncate` panics on
+                // a mid-char split, and terminal text is routinely
+                // multi-byte (CJK, emoji, box drawing).
+                let mut end = cap;
+                while !body.is_char_boundary(end) {
+                    end -= 1;
+                }
+                body.truncate(end);
                 truncated = true;
             }
             page_bytes += body.len() as u64;
@@ -1092,6 +1121,7 @@ impl HistoryGate {
         }
         if page_bytes > u64::from(self.caps.max_bytes_per_query)
             || page_bytes > u64::from(query.max_bytes)
+            || used.bytes.saturating_add(page_bytes) > self.caps.max_bytes_per_window
         {
             return Err(HistoryError::denied(
                 HistoryDenialKind::OverBoundOrRate,
@@ -2174,5 +2204,200 @@ mod tests {
                 "version {version}"
             );
         }
+    }
+
+    // ── CodeRabbit review regressions (PR #1673) ────────────────────────
+
+    #[test]
+    fn second_grant_intersects_when_first_does_not() {
+        // Standing grants for ws-1 then ws-2: a ws-2 query must select the
+        // intersecting grant instead of denying against the first one.
+        let plugin = pid("xuepoo.search");
+        let mut gate = HistoryGate::new(caps());
+        gate.set_capture(HistorySource::Transcript, true);
+        gate.issue_grant(HistoryGrant::standing(
+            plugin.clone(),
+            ws_scope(HistorySource::Transcript, "ws-1"),
+        ));
+        gate.issue_grant(HistoryGrant::standing(
+            plugin.clone(),
+            ws_scope(HistorySource::Transcript, "ws-2"),
+        ));
+        let mut store = HistorySnapshot::new();
+        store.push(
+            HistorySource::Transcript,
+            row("pane-b", "ws-2", 0, "ws-two bytes"),
+        );
+        let page = gate
+            .query(
+                &plugin,
+                TrustLevel::ThirdPartyLua,
+                &make_query(ws_scope(HistorySource::Transcript, "ws-2"), 4),
+                &store,
+            )
+            .expect("second grant intersects the query");
+        assert_eq!(page.records.len(), 1);
+        // ... and the first grant still serves its own scope.
+        let page = gate
+            .query(
+                &plugin,
+                TrustLevel::ThirdPartyLua,
+                &make_query(ws_scope(HistorySource::Transcript, "ws-1"), 4),
+                &transcript_store(),
+            )
+            .unwrap();
+        assert_eq!(page.records.len(), 2);
+    }
+
+    #[test]
+    fn per_request_use_charges_the_matching_grant() {
+        // Two per-request grants, ws-1 then ws-2: a ws-2 query consumes the
+        // second grant's single use, leaving the first intact.
+        let plugin = pid("xuepoo.search");
+        let mut gate = HistoryGate::new(caps());
+        gate.set_capture(HistorySource::Transcript, true);
+        gate.issue_grant(HistoryGrant::per_request(
+            plugin.clone(),
+            ws_scope(HistorySource::Transcript, "ws-1"),
+        ));
+        gate.issue_grant(HistoryGrant::per_request(
+            plugin.clone(),
+            ws_scope(HistorySource::Transcript, "ws-2"),
+        ));
+        let mut store = HistorySnapshot::new();
+        store.push(
+            HistorySource::Transcript,
+            row("pane-b", "ws-2", 0, "ws-two bytes"),
+        );
+        assert!(
+            gate.query(
+                &plugin,
+                TrustLevel::NativeSidecar,
+                &make_query(ws_scope(HistorySource::Transcript, "ws-2"), 4),
+                &store,
+            )
+            .is_ok()
+        );
+        // The ws-1 grant still holds its single use.
+        assert!(
+            gate.query(
+                &plugin,
+                TrustLevel::NativeSidecar,
+                &make_query(ws_scope(HistorySource::Transcript, "ws-1"), 4),
+                &transcript_store(),
+            )
+            .is_ok()
+        );
+        // Both uses are now spent: further reads deny.
+        assert_eq!(
+            gate.query(
+                &plugin,
+                TrustLevel::NativeSidecar,
+                &make_query(ws_scope(HistorySource::Transcript, "ws-1"), 4),
+                &transcript_store(),
+            )
+            .unwrap_err()
+            .denial_kind(),
+            Some(HistoryDenialKind::MissingGrant)
+        );
+    }
+
+    #[test]
+    fn window_byte_budget_covers_the_returned_page() {
+        // Window of 100 bytes with two 60-byte rows: the first page fits
+        // the remaining budget, the second page would overshoot and denies.
+        let plugin = pid("xuepoo.search");
+        let tight = HistoryCaps::new(16, 4096, 256, 64, 100).unwrap();
+        let mut gate = HistoryGate::new(tight);
+        gate.set_capture(HistorySource::Transcript, true);
+        gate.issue_grant(HistoryGrant::standing(
+            plugin.clone(),
+            ws_scope(HistorySource::Transcript, "ws-1"),
+        ));
+        let mut store = HistorySnapshot::new();
+        store.push(
+            HistorySource::Transcript,
+            row("pane-a", "ws-1", 0, &"r".repeat(60)),
+        );
+        store.push(
+            HistorySource::Transcript,
+            row("pane-a", "ws-1", 1, &"s".repeat(60)),
+        );
+        let mut one = make_query(ws_scope(HistorySource::Transcript, "ws-1"), 1);
+        let page = gate
+            .query(&plugin, TrustLevel::ThirdPartyLua, &one, &store)
+            .unwrap();
+        assert_eq!(page.records.len(), 1);
+        one.row_start = 1;
+        assert_eq!(
+            gate.query(&plugin, TrustLevel::ThirdPartyLua, &one, &store)
+                .unwrap_err()
+                .denial_kind(),
+            Some(HistoryDenialKind::OverBoundOrRate)
+        );
+        // Attribution stops at the admitted page.
+        assert_eq!(gate.window_usage(&plugin), (1, 60));
+    }
+
+    #[test]
+    fn search_never_matches_purged_rows() {
+        // A needle matching only purged content returns an empty page —
+        // never an unavailability signal that would oracle purged-content
+        // existence, and never the purged bytes.
+        let plugin = pid("xuepoo.search");
+        let mut gate = granted_gate(&plugin);
+        let mut store = HistorySnapshot::new();
+        let mut purged_row = row("pane-a", "ws-1", 0, "purged needle-holder bytes");
+        purged_row.purged = true;
+        store.push(HistorySource::Transcript, purged_row);
+        store.push(
+            HistorySource::Transcript,
+            row("pane-a", "ws-1", 1, "live unrelated bytes"),
+        );
+        let mut search = make_query(ws_scope(HistorySource::Transcript, "ws-1"), 16);
+        search.op = QueryOp::Search {
+            needle: "needle-holder".to_string(),
+        };
+        let page = gate
+            .query(&plugin, TrustLevel::ThirdPartyLua, &search, &store)
+            .expect("purged-only matches stay invisible to search");
+        assert!(page.records.is_empty());
+        assert!(
+            !page
+                .preview_bytes()
+                .iter()
+                .any(|body| body.contains("purged"))
+        );
+    }
+
+    #[test]
+    fn truncation_stops_on_char_boundary() {
+        // Two-byte é with an odd row cap: truncating at the raw byte cap
+        // would split a char and panic; the gate walks back to the
+        // boundary instead.
+        let plugin = pid("xuepoo.search");
+        let odd = HistoryCaps::new(16, 4096, 7, 64, 65536).unwrap();
+        let mut gate = HistoryGate::new(odd);
+        gate.set_capture(HistorySource::Transcript, true);
+        gate.issue_grant(HistoryGrant::standing(
+            plugin.clone(),
+            ws_scope(HistorySource::Transcript, "ws-1"),
+        ));
+        let mut store = HistorySnapshot::new();
+        store.push(HistorySource::Transcript, row("pane-a", "ws-1", 0, "ééééé"));
+        let page = gate
+            .query(
+                &plugin,
+                TrustLevel::ThirdPartyLua,
+                &make_query(ws_scope(HistorySource::Transcript, "ws-1"), 4),
+                &store,
+            )
+            .unwrap();
+        assert_eq!(page.records.len(), 1);
+        let record = &page.records[0];
+        assert!(record.truncated);
+        assert_eq!(record.body, "ééé");
+        assert_eq!(record.body.len(), 6);
+        assert_eq!(record.label.as_str(), UntrustedLabel::VALUE);
     }
 }

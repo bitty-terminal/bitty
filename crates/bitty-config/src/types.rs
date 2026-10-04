@@ -1381,7 +1381,7 @@ pub const DEFAULT_SELECTION_AUTO_COPY: bool = false;
 /// Default focus-follows-mouse behavior (CTX-0260).
 /// `false` preserves click-to-focus: hovering never moves keyboard focus.
 /// `true` opts into hover moving keyboard focus to the hovered pane.
-pub const DEFAULT_MOUSE_FOCUS_FOLLOWS_MOUSE: bool = false;
+pub const DEFAULT_MOUSE_FOCUS_FOLLOWS_MOUSE: bool = true;
 
 /// Default hover-activation delay in milliseconds (CTX-0334).
 /// `0` activates immediately on pointer entry, matching the CTX-0260
@@ -3904,23 +3904,22 @@ mod tests {
     }
 
     #[test]
-    fn mouse_focus_follows_mouse_defaults_off_and_validates() {
-        // CTX-0260: default-off preserves click-to-focus for existing users.
-        const { assert!(!DEFAULT_MOUSE_FOCUS_FOLLOWS_MOUSE) }
+    fn mouse_focus_follows_mouse_defaults_on_and_validates() {
+        const { assert!(DEFAULT_MOUSE_FOCUS_FOLLOWS_MOUSE) }
         const { assert!(DEFAULT_MOUSE_FOCUS_FOLLOWS_MOUSE_DELAY_MS == 0) }
-        assert!(!MouseConfig::default().focus_follows_mouse);
+        assert!(MouseConfig::default().focus_follows_mouse);
         assert_eq!(
             MouseConfig::default().focus_follows_mouse_delay_ms,
             DEFAULT_MOUSE_FOCUS_FOLLOWS_MOUSE_DELAY_MS
         );
-        assert!(!EffectiveConfig::default().mouse.focus_follows_mouse);
+        assert!(EffectiveConfig::default().mouse.focus_follows_mouse);
         MouseConfig::default().validate().expect("default valid");
         MouseConfig {
-            focus_follows_mouse: true,
+            focus_follows_mouse: false,
             ..MouseConfig::default()
         }
         .validate()
-        .expect("opt-in valid");
+        .expect("opt-out valid");
         // CTX-0334: the dwell delay is bounded fail-closed.
         for good in [
             0,

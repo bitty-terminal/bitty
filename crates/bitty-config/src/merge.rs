@@ -3717,14 +3717,14 @@ mod tests {
 
     #[test]
     fn mouse_focus_follows_mouse_merges_scalar_replace_with_attribution() {
-        // CTX-0260: user opt-in wins with per-field attribution; absent
-        // table keeps the lower-precedence value (off default).
+        // CTX-0260: user opt-out wins with per-field attribution; absent
+        // table keeps the core-defaults value (default-on).
         use crate::types::MouseConfig;
         let user = LayeredPlan::new(
             ConfigSource::new(LayerKind::User, Some("user.lua")),
             ConfigPlan {
                 mouse: Some(MouseConfig {
-                    focus_follows_mouse: true,
+                    focus_follows_mouse: false,
                     ..MouseConfig::default()
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
@@ -3732,14 +3732,14 @@ mod tests {
             },
         );
         let merged = merge_layers(vec![user]).expect("merge");
-        assert!(merged.effective.mouse.focus_follows_mouse);
+        assert!(!merged.effective.mouse.focus_follows_mouse);
         assert_eq!(
             merged.source_of("mouse.focus_follows_mouse").unwrap().layer,
             LayerKind::User
         );
-        // Absent table rides the off default with core-defaults attribution.
+        // Absent table rides the on default with core-defaults attribution.
         let merged2 = merge_layers(vec![]).expect("merge");
-        assert!(!merged2.effective.mouse.focus_follows_mouse);
+        assert!(merged2.effective.mouse.focus_follows_mouse);
         assert_eq!(
             merged2
                 .source_of("mouse.focus_follows_mouse")

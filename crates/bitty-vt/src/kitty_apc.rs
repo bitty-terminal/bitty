@@ -204,6 +204,7 @@ struct PendingKitty {
     cols_c: u16,
     rows_r: u16,
     cursor_movement_c: u8,
+    compressed: bool,
     encoded_len: usize,
     /// Decoded-byte bound for this stream: IMG-1 for compressed or
     /// undeclared-size payloads, the exact declared size for raw claims.
@@ -697,6 +698,7 @@ impl KittyApcAssembler {
                 cols_c: params.cols_c,
                 rows_r: params.rows_r,
                 cursor_movement_c: params.cursor_movement_c,
+                compressed: params.compressed,
                 encoded_len: 0,
                 limit,
                 interleaved: 0,
@@ -748,20 +750,41 @@ impl KittyApcAssembler {
             };
         }
         let available = pending.limit.min(self.budget.payload_limit);
-        let result = pending
-            .decoder
-            .finish(&mut pending.payload, available)
-            .and_then(|()| {
-                if !self.budget.reserve_retained(pending.payload.capacity()) {
-                    return Err(KittyApcReject::Oversize);
-                }
-                validate_raw_claim(
-                    pending.format_f,
-                    pending.width_s,
-                    pending.height_v,
-                    self.decode_cap,
-                )
-            });
+        let result =
+            pending
+                .decoder
+                .finish(&mut pending.payload, available)
+                .and_then(|()| {
+                    if pending.compressed {
+                        let decompressed =
+                            match miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(
+                                &pending.payload,
+                                self.decode_cap,
+                            ) {
+                                Ok(mut data) => {
+                                    data.shrink_to_fit();
+                                    data
+                                }
+                                Err(miniz_oxide::inflate::DecompressError {
+                                    status: miniz_oxide::inflate::TINFLStatus::HasMoreOutput,
+                                    ..
+                                }) => {
+                                    return Err(KittyApcReject::Oversize);
+                                }
+                                Err(_) => return Err(KittyApcReject::BadBase64),
+                            };
+                        pending.payload = decompressed;
+                    }
+                    if !self.budget.reserve_retained(pending.payload.capacity()) {
+                        return Err(KittyApcReject::Oversize);
+                    }
+                    validate_raw_claim(
+                        pending.format_f,
+                        pending.width_s,
+                        pending.height_v,
+                        self.decode_cap,
+                    )
+                });
         if let Err(reason) = result {
             self.budget.clear_retained();
             self.warn_reject(reason, "final payload");
@@ -1209,6 +1232,50 @@ mod tests {
             KittyFeedOutcome::Rejected(KittyApcReject::Oversize)
         ));
         assert!(assembler.peak_memory() <= KITTY_APC_LEDGER_CAP);
+    }
+
+    #[test]
+    fn zlib_compressed_payload_decompresses_successfully() {
+        // Fastfetch sends zlib-compressed raw RGBA with o=z (CTX-0945 / #1656).
+        let raw_rgba = [0xFF, 0, 0, 0xFF].repeat(4); // 2x2 red
+        let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&raw_rgba, 6);
+        let encoded = base64_encode(&compressed);
+        let raw = format!("Gf=32,s=2,v=2,o=z,m=0;{encoded}").into_bytes();
+        let mut assembler = KittyApcAssembler::new();
+        match assembler.feed(&raw) {
+            KittyFeedOutcome::Completed(done) => {
+                assert_eq!(done.format_f, 32);
+                assert_eq!(done.width_s, Some(2));
+                assert_eq!(done.height_v, Some(2));
+                assert_eq!(&*done.payload, &raw_rgba);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zlib_chunked_payload_decompresses_successfully() {
+        let raw_rgba = [0x00, 0xFF, 0, 0xFF].repeat(8); // 4x2 green
+        let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&raw_rgba, 6);
+        let encoded = base64_encode(&compressed);
+        let mid = encoded.len() / 2;
+        let (first, second) = encoded.split_at(mid);
+
+        let chunk1 = format!("Gf=32,s=4,v=2,o=z,m=1;{first}").into_bytes();
+        let chunk2 = format!("Gm=0;{second}").into_bytes();
+
+        let mut assembler = KittyApcAssembler::new();
+        assert!(matches!(
+            assembler.feed(&chunk1),
+            KittyFeedOutcome::NeedMore { .. }
+        ));
+        match assembler.feed(&chunk2) {
+            KittyFeedOutcome::Completed(done) => {
+                assert_eq!(done.format_f, 32);
+                assert_eq!(&*done.payload, &raw_rgba);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
     }
 
     #[test]

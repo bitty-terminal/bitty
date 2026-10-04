@@ -426,6 +426,7 @@ dependencies = [
 name = "bitty-vt"
 version = "0.0.21"
 dependencies = [
+ "miniz_oxide 0.8.9",
  "vte",
 ]
 

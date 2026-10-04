@@ -128,7 +128,7 @@ impl CloseConfirmMode {
 /// `bitty-config`; `bitty-terminal` maps the effective value across at startup
 /// and the two defaults must stay equal — covered by a cross-crate test in
 /// `bitty-terminal`). `false` preserves click-to-focus.
-pub const DEFAULT_FOCUS_FOLLOWS_MOUSE: bool = false;
+pub const DEFAULT_FOCUS_FOLLOWS_MOUSE: bool = true;
 
 /// Default hover-activation delay (CTX-0334).
 /// Mirrors `bitty-config` `DEFAULT_MOUSE_FOCUS_FOLLOWS_MOUSE_DELAY_MS`;
@@ -1717,13 +1717,10 @@ mod tests {
     }
 
     #[test]
-    fn focus_follows_mouse_defaults_off_and_accepts_both() {
-        // CTX-0260: default-off preserves click-to-focus; both values are
-        // total (booleans always validate). `new()` defaults off; callers
-        // opt in post-construction.
-        const { assert!(!DEFAULT_FOCUS_FOLLOWS_MOUSE) }
+    fn focus_follows_mouse_defaults_on_and_accepts_both() {
+        const { assert!(DEFAULT_FOCUS_FOLLOWS_MOUSE) }
         const { assert!(DEFAULT_FOCUS_FOLLOWS_MOUSE_DELAY_MS == 0) }
-        assert!(!RuntimeConfig::default().focus_follows_mouse);
+        assert!(RuntimeConfig::default().focus_follows_mouse);
         assert_eq!(
             RuntimeConfig::default().focus_follows_mouse_delay,
             std::time::Duration::ZERO
@@ -1746,13 +1743,13 @@ mod tests {
             bitty_ui::ScrollbarMode::Hidden,
             DEFAULT_SCROLLBAR_WIDTH,
         )
-        .expect("new defaults hover-focus off");
-        assert!(!cfg.focus_follows_mouse);
-        let opt_in = RuntimeConfig {
-            focus_follows_mouse: true,
+        .expect("new defaults hover-focus on");
+        assert!(cfg.focus_follows_mouse);
+        let opt_out = RuntimeConfig {
+            focus_follows_mouse: false,
             ..RuntimeConfig::default()
         };
-        opt_in.validate().expect("opt-in valid");
+        opt_out.validate().expect("opt-out valid");
         let opt_out = RuntimeConfig {
             focus_follows_mouse: false,
             ..RuntimeConfig::default()

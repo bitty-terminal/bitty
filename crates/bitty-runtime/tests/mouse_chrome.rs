@@ -66,14 +66,30 @@ fn overlay_bounds(rt: &Runtime) -> UiRect {
 }
 
 #[test]
-fn focus_follows_mouse_defaults_off_and_hover_keeps_focus() {
-    // Default-off pin: hover never moves keyboard focus (click-to-focus
-    // preserved for existing users).
-    assert!(!RuntimeConfig::default().focus_follows_mouse);
+fn focus_follows_mouse_defaults_on_and_hover_moves_focus() {
+    assert!(RuntimeConfig::default().focus_follows_mouse);
     let mut rt = make_runtime();
     rt.set_layout(two_pane());
     assert_eq!(rt.focused_view(), Some(ViewId::new(1)));
     // Right pane occupies container cols 40..80: hover its middle.
+    rt.handle_cursor_moved(cell_pixels(60, 12));
+    assert_eq!(
+        rt.focused_view(),
+        Some(ViewId::new(2)),
+        "hover must move focus by default"
+    );
+}
+
+#[test]
+fn hover_keeps_focus_when_explicitly_disabled() {
+    let mut rt = Runtime::new(RuntimeConfig {
+        focus_follows_mouse: false,
+        ..RuntimeConfig::default()
+    })
+    .expect("opt-out runtime must build");
+    assert!(!rt.config().focus_follows_mouse);
+    rt.set_layout(two_pane());
+    assert_eq!(rt.focused_view(), Some(ViewId::new(1)));
     rt.handle_cursor_moved(cell_pixels(60, 12));
     assert_eq!(
         rt.focused_view(),
@@ -83,32 +99,14 @@ fn focus_follows_mouse_defaults_off_and_hover_keeps_focus() {
 }
 
 #[test]
-fn hover_moves_focus_only_when_enabled() {
-    let mut rt = Runtime::new(RuntimeConfig {
-        focus_follows_mouse: true,
+fn left_click_focuses_hit_pane_without_hover() {
+    let rt = Runtime::new(RuntimeConfig {
+        focus_follows_mouse: false,
         ..RuntimeConfig::default()
     })
-    .expect("opt-in runtime must build");
-    assert!(rt.config().focus_follows_mouse);
-    rt.set_layout(two_pane());
-    assert_eq!(rt.focused_view(), Some(ViewId::new(1)));
-    rt.handle_cursor_moved(cell_pixels(60, 12));
-    assert_eq!(rt.focused_view(), Some(ViewId::new(2)));
-    // Hover back returns focus (still gated, still deterministic).
-    rt.handle_cursor_moved(cell_pixels(10, 12));
-    assert_eq!(rt.focused_view(), Some(ViewId::new(1)));
-    // Hover over the outer gap/padding band keeps focus (no leaf there).
-    rt.handle_cursor_moved(CursorPosition { x: 2.0, y: 2.0 });
-    assert_eq!(rt.focused_view(), Some(ViewId::new(1)));
-}
-
-#[test]
-fn left_click_focuses_hit_pane_without_hover() {
-    // CTX-0339: the live-campaign regression. With the default
-    // `focus_follows_mouse = false`, hover must not move focus but a plain
-    // left press on the right pane must focus it.
-    assert!(!RuntimeConfig::default().focus_follows_mouse);
-    let mut rt = make_runtime();
+    .expect("opt-out runtime must build");
+    assert!(!rt.config().focus_follows_mouse);
+    let mut rt = rt;
     rt.set_layout(two_pane());
     assert_eq!(rt.focused_view(), Some(ViewId::new(1)));
     rt.handle_cursor_moved(cell_pixels(60, 12));
@@ -170,8 +168,8 @@ fn shift_left_click_selects_without_focus() {
     // pins the drag against a pane that really owns a grid.
     let mut rt = make_runtime();
     rt.set_layout(two_pane());
-    rt.handle_cursor_moved(cell_pixels(60, 12));
     rt.handle_key_event(named_key(NamedKey::Shift, PressState::Pressed));
+    rt.handle_cursor_moved(cell_pixels(60, 12));
     rt.handle_mouse_input(press(MouseButton::Left));
     assert_eq!(
         rt.focused_view(),
@@ -195,8 +193,8 @@ fn shift_left_click_selects_in_the_hit_pane_without_focus() {
     rt.set_layout(two_pane());
     let owner = rt.primary_view().expect("headless runtime pins a primary");
     assert!(rt.set_focus(ViewId::new(2)), "park focus on the other pane");
-    rt.handle_cursor_moved(cell_pixels(4, 6));
     rt.handle_key_event(named_key(NamedKey::Shift, PressState::Pressed));
+    rt.handle_cursor_moved(cell_pixels(4, 6));
     rt.handle_mouse_input(press(MouseButton::Left));
     assert_eq!(
         rt.focused_view(),

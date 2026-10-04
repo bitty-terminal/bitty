@@ -442,6 +442,14 @@ fn decset_1048_maps_to_cursor_save_restore() {
 }
 
 #[test]
+fn scosc_scorc_maps_to_cursor_save_restore() {
+    assert_eq!(
+        parse(b"\x1b[s\x1b[u"),
+        vec![TerminalAction::CursorSave, TerminalAction::CursorRestore]
+    );
+}
+
+#[test]
 fn decset_2026_maps_to_synchronized_update_mode() {
     assert_eq!(
         parse(b"\x1b[?2026h\x1b[?2026l"),

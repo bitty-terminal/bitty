@@ -3133,8 +3133,8 @@ mod tests {
         .expect("explicit off parses");
         assert!(!plan.mouse.expect("mouse present").focus_follows_mouse);
         let plan = parse_lua_config(r#"return { mouse = {} }"#, &test_source())
-            .expect("empty mouse defaults off");
-        assert!(!plan.mouse.expect("mouse present").focus_follows_mouse);
+            .expect("empty mouse defaults on");
+        assert!(plan.mouse.expect("mouse present").focus_follows_mouse);
         let plan = parse_lua_config(
             r#"return { terminal = { scrollback = 10000 } }"#,
             &test_source(),

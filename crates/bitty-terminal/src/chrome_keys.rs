@@ -905,6 +905,7 @@ impl TerminalApp {
         }
         match action {
             A::GotoSplit(dir) => {
+                self.restore_zoom();
                 let focus = split_dir_to_focus(dir);
                 let next = self.runtime.move_focus(focus);
                 eprintln!(
@@ -915,6 +916,7 @@ impl TerminalApp {
                 );
             }
             A::FocusNext => {
+                self.restore_zoom();
                 let next = self.runtime.move_focus(FocusDirection::Next);
                 eprintln!(
                     "bitty: keymap focus_next -> {next:?} leafs={}",
@@ -922,6 +924,7 @@ impl TerminalApp {
                 );
             }
             A::FocusPrev => {
+                self.restore_zoom();
                 let next = self.runtime.move_focus(FocusDirection::Prev);
                 eprintln!(
                     "bitty: keymap focus_prev -> {next:?} leafs={}",
@@ -929,6 +932,7 @@ impl TerminalApp {
                 );
             }
             A::FocusId(n) => {
+                self.restore_zoom();
                 let ok = self.runtime.set_focus(ViewId::new(n));
                 if ok {
                     eprintln!("bitty: keymap focus:{n} -> focused");
@@ -1328,6 +1332,19 @@ impl TerminalApp {
                     ),
                     Err(err) => eprintln!(
                         "warning: keymap workspace_move:{n} refused ({err}) ({}) — ignoring",
+                        self.runtime.workspaceline_text()
+                    ),
+                }
+            }
+            A::WorkspaceSwap(n) => {
+                self.restore_zoom();
+                match self.runtime.workspace_swap_current_with(n) {
+                    Ok((from_seq, to_seq)) => eprintln!(
+                        "bitty: keymap workspace_swap:{n} -> swapped ws:{from_seq} <-> ws:{to_seq} ({})",
+                        self.runtime.workspaceline_text()
+                    ),
+                    Err(err) => eprintln!(
+                        "warning: keymap workspace_swap:{n} refused ({err}) ({}) — ignoring",
                         self.runtime.workspaceline_text()
                     ),
                 }
@@ -2825,6 +2842,46 @@ mod tests {
     }
 
     #[test]
+    fn chrome_zoomed_navigation_unzooms_and_moves_focus() {
+        use bitty_config::{ChromeAction, SplitDir};
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let rt = Runtime::with_defaults().expect("must build");
+        let mut app = TerminalApp::with_theme(
+            rt,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            maps,
+            SpawnSpec::default(),
+        );
+        app.runtime.set_layout(two_pane_layout());
+        assert_eq!(app.runtime.leaf_count(), 2);
+        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+
+        // Zoom pane 1: collapses to 1 leaf.
+        app.apply_chrome_action(ChromeAction::ToggleZoom);
+        assert_eq!(app.runtime.leaf_count(), 1);
+        assert!(app.chrome.zoom.is_zoomed(&app.runtime));
+
+        // Navigating with GotoSplit restores zoom immediately and moves focus.
+        app.apply_chrome_action(ChromeAction::GotoSplit(SplitDir::Right));
+        assert_eq!(app.runtime.leaf_count(), 2, "must unzoom on navigation");
+        assert!(!app.chrome.zoom.is_zoomed(&app.runtime));
+        assert_eq!(
+            app.runtime.focused_view(),
+            Some(ViewId::new(2)),
+            "focus must move right"
+        );
+
+        // Zoom pane 2, then FocusPrev: unzooms and focuses pane 1.
+        app.apply_chrome_action(ChromeAction::ToggleZoom);
+        assert_eq!(app.runtime.leaf_count(), 1);
+        app.apply_chrome_action(ChromeAction::FocusPrev);
+        assert_eq!(app.runtime.leaf_count(), 2, "must unzoom on focus_prev");
+        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+    }
+
+    #[test]
     fn chrome_toggle_zoom_on_non_owner_preserves_primary_owner() {
         // CTX-0359 review defect: `ToggleZoom` funnels through
         // `Runtime::set_layout`; treating an owner-excluding layout as a
@@ -3513,11 +3570,11 @@ mod tests {
         assert!(app.runtime.workspace_switch(1));
         assert!(app.runtime.layout().leaf_ids().contains(&moved_id));
         assert_eq!(app.runtime.focused_view(), Some(moved_id));
-        // Invalid N warns fail-closed (state untouched).
-        let tabline = app.runtime.workspaceline_text();
+        // Auto-creates missing target workspace N (CTX-0945).
         app.apply_chrome_action(ChromeAction::WorkspaceMove(9));
-        assert_eq!(app.runtime.workspaceline_text(), tabline);
-        assert_eq!(app.runtime.layout().leaf_count(), 2);
+        assert_eq!(app.runtime.workspace_count(), 3);
+        assert_eq!(app.runtime.workspaceline_text(), "1:ws1 2:ws2* 9:ws9 (3)");
+        assert_eq!(app.runtime.layout().leaf_count(), 1);
     }
 
     // Live-spawn: runs a real POSIX shell (`/bin/sh` has no Windows
@@ -5054,9 +5111,8 @@ mod tests {
                 app.runtime.drain_pending_input().is_empty(),
                 "no byte leak for {symbol}"
             );
-            assert_eq!(
-                app.runtime.workspace_count(),
-                2,
+            assert!(
+                app.runtime.workspace_count() >= 2,
                 "Mod+Shift+{one_based} never removes a workspace"
             );
         }

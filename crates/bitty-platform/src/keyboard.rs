@@ -30,8 +30,9 @@
 //!   (`compatibility-milestone-rfc`): this module owns the legacy baseline
 //!   and the Kitty code tables ([`ext_functional_key`],
 //!   [`ext_modifier_key`], [`ext_keypad_named_key`],
-//!   [`ext_keypad_char_key`]); the runtime's `encode_key_enhanced` composes
-//!   them under the negotiated flags. The legacy path here is the
+//!   [`ext_keypad_char_key`]); [`encode_key_event_kitty_protocol`] composes
+//!   them under the negotiated flags (CTX-0947) for the runtime's enhanced
+//!   path. The legacy path here is the
 //!   byte-identical fallback when the protocol is off.
 //!
 //! # Kitty coverage declaration (CTX-0755, Issue #1362)
@@ -621,6 +622,286 @@ pub fn ext_keypad_char_key(logical: &str) -> Option<u32> {
         _ => return None,
     };
     Some(code)
+}
+
+/// Kitty keyboard-protocol progressive enhancement flags (CTX-0947, Issue #1665).
+///
+/// Values match `sw.kovidgoyal.net/kitty/keyboard-protocol` and mirror the
+/// runtime `EXT_KEY_FLAG_*` bits and the negotiated `enhanced_keyboard`
+/// register: bit 1 disambiguates `Esc`/modified ASCII keys, bit 2 reports
+/// repeat/release event types, bit 4 reports shifted alternates, bit 8
+/// reports all keys as escape codes, bit 16 embeds associated text.
+pub const KITTY_FLAG_DISAMBIGUATE: u32 = 1 << 0;
+/// Kitty keyboard flag: report repeat (`:2`) and release (`:3`) event types.
+pub const KITTY_FLAG_REPORT_EVENTS: u32 = 1 << 1;
+/// Kitty keyboard flag: report the shifted alternate key.
+pub const KITTY_FLAG_REPORT_ALTERNATES: u32 = 1 << 2;
+/// Kitty keyboard flag: report text-producing keys as escape codes.
+pub const KITTY_FLAG_REPORT_ALL_KEYS: u32 = 1 << 3;
+/// Kitty keyboard flag: embed associated text codepoints (only with all-keys).
+pub const KITTY_FLAG_REPORT_TEXT: u32 = 1 << 4;
+
+/// Kitty keyboard-protocol modifier bits carried in the `modifiers` argument
+/// of [`encode_key_event_kitty_protocol`] (shift `1`, alt `2`, ctrl `4`,
+/// super `8`, hyper `16`, meta `32`); the wire encodes the mask plus one.
+pub const KITTY_MOD_SHIFT: u32 = 1;
+/// Kitty modifier bit: alt.
+pub const KITTY_MOD_ALT: u32 = 1 << 1;
+/// Kitty modifier bit: control.
+pub const KITTY_MOD_CTRL: u32 = 1 << 2;
+/// Kitty modifier bit: super.
+pub const KITTY_MOD_SUPER: u32 = 1 << 3;
+/// Kitty modifier bit: hyper.
+pub const KITTY_MOD_HYPER: u32 = 1 << 4;
+/// Kitty modifier bit: meta.
+pub const KITTY_MOD_META: u32 = 1 << 5;
+
+/// Maximum bytes of one Kitty keyboard-protocol frame (CTX-0947).
+///
+/// Matches the `input-pointer-rfc.md` Kitty bound: one key yields at most 64
+/// bytes of `CSI u`; an over-bound frame is dropped (`None`), never truncated.
+pub const MAX_KITTY_FRAME_BYTES: usize = 64;
+
+/// Encodes `event` under the Kitty keyboard protocol (CTX-0947, Issue #1665).
+///
+/// Pure, headless, and deterministic: no display server, window, or OS state
+/// is consulted beyond `event`, the `modifiers` bitmask
+/// (`KITTY_MOD_*`: shift `1`, alt `2`, ctrl `4`, super `8`, hyper `16`,
+/// meta `32`), and the negotiated progressive-enhancement `flags`
+/// (`KITTY_FLAG_*`: disambiguate `1`, report-events `2`, alternates `4`,
+/// all-keys `8`, associated-text `16`).
+///
+/// Returns `Some(frame)` when a `CSI` frame applies, `None` when the caller
+/// must use the legacy encoder instead: `flags == 0`, synthetic events,
+/// releases without report-events, shift-only text keys under disambiguate,
+/// and the bare `Enter`/`Tab`/`Backspace` legacy exception (the spec keeps
+/// their legacy bytes so a crashed program can still `reset`). The encoding
+/// mirrors the reference `serialize`/`encode_key` gates
+/// (`kitty/key_encoding.c`): the key code is the un-shifted codepoint, the
+/// modifier field (`mods + 1`) is omitted when empty, repeat carries `:2`
+/// and release `:3`, and associated text is embedded only with all-keys.
+///
+/// Every emitted frame is bounded to [`MAX_KITTY_FRAME_BYTES`]; an over-bound
+/// frame yields `None` (drop) rather than a truncated sequence.
+pub fn encode_key_event_kitty_protocol(
+    event: &KeyEvent,
+    modifiers: u32,
+    flags: u32,
+) -> Option<Vec<u8>> {
+    if flags == 0 {
+        return None;
+    }
+    if event.is_synthetic {
+        return None;
+    }
+    let report_events = flags & KITTY_FLAG_REPORT_EVENTS != 0;
+    let disambiguate = flags & KITTY_FLAG_DISAMBIGUATE != 0;
+    let report_all = flags & KITTY_FLAG_REPORT_ALL_KEYS != 0;
+    let report_alternates = flags & KITTY_FLAG_REPORT_ALTERNATES != 0;
+    let report_text = flags & KITTY_FLAG_REPORT_TEXT != 0;
+
+    let pressed = event.state == PressState::Pressed;
+    if !pressed && !report_events {
+        return None;
+    }
+    // Spec legacy mode: text passes through untouched unless disambiguate,
+    // report-events, or report-all-keys is active.
+    let legacy_mode = !disambiguate && !report_events && !report_all;
+
+    let shift = modifiers & KITTY_MOD_SHIFT != 0;
+    let alt = modifiers & KITTY_MOD_ALT != 0;
+    let ctrl = modifiers & KITTY_MOD_CTRL != 0;
+    let super_held = modifiers & KITTY_MOD_SUPER != 0;
+    let hyper = modifiers & KITTY_MOD_HYPER != 0;
+    let meta = modifiers & KITTY_MOD_META != 0;
+    // A shift-only text key is *not* disambiguated (the shifted glyph is
+    // already the text); only alt/ctrl/super/hyper/meta chords are, matching
+    // the spec's Disambiguate escape codes list.
+    let disambiguated_chord = alt || ctrl || super_held || hyper || meta;
+
+    // Repeat (2) and release (3) carry `:n`; press (1) is the default.
+    let event_type = if !report_events {
+        None
+    } else if event.repeat {
+        Some(2)
+    } else if pressed {
+        None
+    } else {
+        Some(3)
+    };
+
+    // Text-producing character keys.
+    if let LogicalKey::Character(chars) = &event.logical_key {
+        let base = chars.chars().next()?;
+        // The protocol key code is always the un-shifted codepoint.
+        let plain_code = u32::from(base.to_lowercase().next().unwrap_or(base));
+        // Numpad-located character keys decode to the dedicated `KP_*`
+        // codes so applications can distinguish them from their non-keypad
+        // equivalents once enhancement is active. Keypad codes carry no
+        // shifted alternate.
+        let keypad_code = if event.location == KeyLocation::Numpad {
+            ext_keypad_char_key(chars)
+        } else {
+            None
+        };
+        let is_keypad = keypad_code.is_some();
+        let code = keypad_code.unwrap_or(plain_code);
+        let shifted = if is_keypad {
+            None
+        } else if report_alternates && shift {
+            base.to_uppercase()
+                .next()
+                .map(u32::from)
+                .filter(|value| *value != code)
+        } else {
+            None
+        };
+        let embed = if report_text && report_all {
+            event.text.as_deref().filter(|text| !text.is_empty())
+        } else {
+            None
+        };
+        let simple_encoding_ok = event_type.is_none() && shifted.is_none() && embed.is_none();
+        // Numpad keys take the keypad-code form once disambiguate is
+        // active, even with no modifiers held.
+        let escape_for_keypad = is_keypad && disambiguate;
+        if simple_encoding_ok
+            && !report_all
+            && !(disambiguate && disambiguated_chord)
+            && !escape_for_keypad
+        {
+            return None;
+        }
+        return kitty_key_frame(code, shifted, modifiers, event_type, embed, b'u');
+    }
+
+    // Named keys.
+    if let LogicalKey::Named(named) = &event.logical_key {
+        // Space is a text-producing key (code 32) rather than a functional
+        // key. It leaves the legacy path when report-all-keys asks for
+        // escape codes, or when disambiguate must report a chord (e.g.
+        // `ctrl+Space` -> `CSI 32;5u` instead of the legacy NUL). A bare or
+        // shift-only Space stays text.
+        if *named == NamedKey::Space {
+            if !report_all && !(disambiguate && disambiguated_chord) {
+                return None;
+            }
+            let embed = if report_text && report_all {
+                event.text.as_deref().filter(|text| !text.is_empty())
+            } else {
+                None
+            };
+            return kitty_key_frame(32, None, modifiers, event_type, embed, b'u');
+        }
+        if let Some(code) = ext_modifier_key(*named, event.location) {
+            if !report_all {
+                return None;
+            }
+            return kitty_key_frame(code, None, modifiers, event_type, None, b'u');
+        }
+        if let Some((code, trailer)) = ext_functional_key(*named) {
+            // Numpad-located named keys substitute the dedicated `KP_*`
+            // codes and then run the same gates below, except the bare
+            // Enter/Tab/Backspace legacy exception (typed `reset` after a
+            // crash) applies to the main keys only: a numpad key under
+            // enhancement always takes the `CSI u` form so applications can
+            // distinguish it.
+            let is_keypad =
+                event.location == KeyLocation::Numpad && ext_keypad_named_key(*named).is_some();
+            let (code, trailer) = if is_keypad {
+                ext_keypad_named_key(*named).unwrap_or((code, trailer))
+            } else {
+                (code, trailer)
+            };
+            if legacy_mode {
+                return None;
+            }
+            // Escape keeps `0x1b` unless disambiguate/report-all asks for
+            // the escape-coded form (spec: Esc-vs-sequence disambiguation).
+            if *named == NamedKey::Escape && !disambiguate && !report_all {
+                return None;
+            }
+            // Bare Enter/Tab/Backspace keep their legacy bytes under
+            // disambiguate/report-events; report-all-keys encodes them. The
+            // exception covers the main keys only, never numpad substitutes.
+            let legacy_exception = !is_keypad
+                && matches!(named, NamedKey::Enter | NamedKey::Tab | NamedKey::Backspace);
+            if legacy_exception && !report_all && modifiers == 0 {
+                return None;
+            }
+            return kitty_key_frame(code, None, modifiers, event_type, None, trailer);
+        }
+    }
+    None
+}
+
+/// Builds one Kitty `CSI` key frame per the spec's `serialize` algorithm.
+///
+/// `modifiers` is the raw modifier bitmask (shift `1`, alt `2`, ctrl `4`,
+/// ...); the wire encodes it as `modifiers + 1`. `event_type` (`:2`/`:3`) is
+/// omitted for a press. `shifted` adds the alternate shifted-key sub-field
+/// and `embed` appends the associated-text codepoint field when present.
+/// `trailer` is `u` for `CSI u` keys and `~`/`A`/`B`/`C`/`D`/`H`/`F`/`P`/
+/// `Q`/`S` for the functional-key table.
+///
+/// Returns `None` when the frame would exceed [`MAX_KITTY_FRAME_BYTES`]:
+/// associated text is truncated to the codepoints that still fit, and the
+/// frame is dropped (never truncated) past the bound.
+fn kitty_key_frame(
+    code: u32,
+    shifted: Option<u32>,
+    modifiers: u32,
+    event_type: Option<u32>,
+    embed: Option<&str>,
+    trailer: u8,
+) -> Option<Vec<u8>> {
+    // Worst case per codepoint field is 1 separator + 10 decimal digits.
+    const EMBED_CODEPOINT_MAX: usize = 11;
+    let mut out = String::with_capacity(MAX_KITTY_FRAME_BYTES);
+    out.push_str("\x1b[");
+    let second = modifiers != 0 || event_type.is_some();
+    let third = embed.is_some();
+    if code != 1 || shifted.is_some() || second || third {
+        out.push_str(&code.to_string());
+    }
+    if let Some(shifted) = shifted {
+        out.push(':');
+        out.push_str(&shifted.to_string());
+    }
+    if second || third {
+        out.push(';');
+        if second {
+            out.push_str(&(modifiers + 1).to_string());
+            if let Some(event_type) = event_type {
+                out.push(':');
+                out.push_str(&event_type.to_string());
+            }
+        }
+    }
+    if let Some(text) = embed {
+        let mut first = true;
+        for ch in text.chars() {
+            let value = ch as u32;
+            // Associated text must not contain control codes (spec).
+            if value < 0x20 || (0x7f..=0x9f).contains(&value) {
+                continue;
+            }
+            // Reserve one byte for the trailer; stop before it would overflow.
+            if out.len() + EMBED_CODEPOINT_MAX + 1 > MAX_KITTY_FRAME_BYTES {
+                break;
+            }
+            out.push(if first { ';' } else { ':' });
+            out.push_str(&value.to_string());
+            first = false;
+        }
+    }
+    out.push(char::from(trailer));
+    let frame = out.into_bytes();
+    if frame.len() <= MAX_KITTY_FRAME_BYTES {
+        Some(frame)
+    } else {
+        None
+    }
 }
 
 #[allow(dead_code)]
@@ -1260,5 +1541,239 @@ mod tests {
         assert_eq!(ext_keypad_char_key(""), None);
         assert_eq!(ext_keypad_char_key("a"), None);
         assert_eq!(ext_keypad_char_key(","), None);
+    }
+
+    // ------------------------------------------------------------------
+    // CTX-0947 (Issue #1665): Kitty progressive encoder differential tests.
+    // ------------------------------------------------------------------
+
+    fn kitty_char(logical: &str, text: Option<&str>, state: PressState, repeat: bool) -> KeyEvent {
+        KeyEvent {
+            logical_key: LogicalKey::Character(logical.to_string()),
+            text: text.map(|s| s.to_string()),
+            location: KeyLocation::Standard,
+            state,
+            repeat,
+            is_synthetic: false,
+        }
+    }
+
+    fn kitty_named_located(
+        named: NamedKey,
+        location: KeyLocation,
+        state: PressState,
+        repeat: bool,
+    ) -> KeyEvent {
+        KeyEvent {
+            logical_key: LogicalKey::Named(named),
+            text: None,
+            location,
+            state,
+            repeat,
+            is_synthetic: false,
+        }
+    }
+
+    fn kitty_named(named: NamedKey, state: PressState) -> KeyEvent {
+        kitty_named_located(named, KeyLocation::Standard, state, false)
+    }
+
+    #[test]
+    fn kitty_flags_zero_yields_no_frame() {
+        // flags 0 means the caller keeps the byte-identical legacy path.
+        let press = kitty_char("a", Some("a"), PressState::Pressed, false);
+        assert_eq!(encode_key_event_kitty_protocol(&press, 0, 0), None);
+        let release = kitty_char("a", None, PressState::Released, false);
+        assert_eq!(
+            encode_key_event_kitty_protocol(&release, KITTY_MOD_CTRL, 0),
+            None
+        );
+        let tab = kitty_named(NamedKey::Tab, PressState::Pressed);
+        assert_eq!(encode_key_event_kitty_protocol(&tab, 0, 0), None);
+    }
+
+    #[test]
+    fn kitty_synthetic_events_yield_no_frame() {
+        let mut ev = kitty_char("a", Some("a"), PressState::Pressed, false);
+        ev.is_synthetic = true;
+        assert_eq!(
+            encode_key_event_kitty_protocol(&ev, 0, KITTY_FLAG_REPORT_ALL_KEYS),
+            None
+        );
+    }
+
+    #[test]
+    fn kitty_tab_vs_ctrl_i_under_disambiguate() {
+        // Bare Tab keeps the legacy byte under disambiguate-only (spec
+        // exception so a crashed program can still type `reset`); Ctrl+I
+        // disambiguates to the `i` codepoint with the ctrl modifier.
+        let tab = kitty_named(NamedKey::Tab, PressState::Pressed);
+        assert_eq!(
+            encode_key_event_kitty_protocol(&tab, 0, KITTY_FLAG_DISAMBIGUATE),
+            None,
+            "bare Tab stays on the legacy path under disambiguate-only"
+        );
+        let ctrl_i = kitty_char("i", None, PressState::Pressed, false);
+        assert_eq!(
+            encode_key_event_kitty_protocol(&ctrl_i, KITTY_MOD_CTRL, KITTY_FLAG_DISAMBIGUATE),
+            Some(b"\x1b[105;5u".to_vec()),
+            "Ctrl+I under disambiguate is CSI 105;5u"
+        );
+    }
+
+    #[test]
+    fn kitty_report_all_encodes_bare_tab_as_csi_9u() {
+        // Report-all-keys lifts the Enter/Tab/Backspace legacy exception.
+        // The zero-modifier field is omitted per the reference `serialize`
+        // (`CSI 9u`, not `CSI 9;1u`): `;1` is mods + 1 with no mods held.
+        let tab = kitty_named(NamedKey::Tab, PressState::Pressed);
+        assert_eq!(
+            encode_key_event_kitty_protocol(
+                &tab,
+                0,
+                KITTY_FLAG_DISAMBIGUATE | KITTY_FLAG_REPORT_ALL_KEYS
+            ),
+            Some(b"\x1b[9u".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_enter_vs_ctrl_m() {
+        // Bare Enter keeps legacy `\r` under disambiguate-only; Ctrl+M
+        // disambiguates to the `m` codepoint with the ctrl modifier.
+        let enter = kitty_named(NamedKey::Enter, PressState::Pressed);
+        assert_eq!(
+            encode_key_event_kitty_protocol(&enter, 0, KITTY_FLAG_DISAMBIGUATE),
+            None,
+            "bare Enter stays on the legacy path under disambiguate-only"
+        );
+        let ctrl_m = kitty_char("m", None, PressState::Pressed, false);
+        assert_eq!(
+            encode_key_event_kitty_protocol(&ctrl_m, KITTY_MOD_CTRL, KITTY_FLAG_DISAMBIGUATE),
+            Some(b"\x1b[109;5u".to_vec()),
+            "Ctrl+M under disambiguate is CSI 109;5u"
+        );
+        // Report-all-keys encodes even the bare Enter (code 13).
+        assert_eq!(
+            encode_key_event_kitty_protocol(
+                &enter,
+                0,
+                KITTY_FLAG_DISAMBIGUATE | KITTY_FLAG_REPORT_ALL_KEYS
+            ),
+            Some(b"\x1b[13u".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_esc_vs_ctrl_open_bracket() {
+        // Bare Esc takes the escape-coded form once disambiguate is active;
+        // Ctrl+[ disambiguates to the `[` codepoint with the ctrl modifier.
+        let esc = kitty_named(NamedKey::Escape, PressState::Pressed);
+        assert_eq!(
+            encode_key_event_kitty_protocol(&esc, 0, KITTY_FLAG_DISAMBIGUATE),
+            Some(b"\x1b[27u".to_vec())
+        );
+        let ctrl_bracket = kitty_char("[", None, PressState::Pressed, false);
+        assert_eq!(
+            encode_key_event_kitty_protocol(&ctrl_bracket, KITTY_MOD_CTRL, KITTY_FLAG_DISAMBIGUATE),
+            Some(b"\x1b[91;5u".to_vec()),
+            "Ctrl+[ under disambiguate is CSI 91;5u"
+        );
+    }
+
+    #[test]
+    fn kitty_release_carries_event_type_3_when_requested() {
+        let flags = KITTY_FLAG_DISAMBIGUATE | KITTY_FLAG_REPORT_EVENTS;
+        let release = kitty_char("a", None, PressState::Released, false);
+        assert_eq!(
+            encode_key_event_kitty_protocol(&release, KITTY_MOD_CTRL, flags),
+            Some(b"\x1b[97;5:3u".to_vec()),
+            "key-up carries event type 3 when report-events is set"
+        );
+        // Without report-events the release produces no frame at all.
+        assert_eq!(
+            encode_key_event_kitty_protocol(&release, KITTY_MOD_CTRL, KITTY_FLAG_DISAMBIGUATE),
+            None
+        );
+    }
+
+    #[test]
+    fn kitty_repeat_carries_event_type_2_when_requested() {
+        let flags = KITTY_FLAG_DISAMBIGUATE | KITTY_FLAG_REPORT_EVENTS;
+        let repeat = kitty_char("a", None, PressState::Pressed, true);
+        assert_eq!(
+            encode_key_event_kitty_protocol(&repeat, KITTY_MOD_CTRL, flags),
+            Some(b"\x1b[97;5:2u".to_vec()),
+            "auto-repeat carries event type 2 when report-events is set"
+        );
+    }
+
+    #[test]
+    fn kitty_ctrl_shift_modifier_bits_combine() {
+        // shift (1) | ctrl (4) is mask 5, wired as 5 + 1.
+        let ev = kitty_char("a", None, PressState::Pressed, false);
+        assert_eq!(
+            encode_key_event_kitty_protocol(
+                &ev,
+                KITTY_MOD_CTRL | KITTY_MOD_SHIFT,
+                KITTY_FLAG_DISAMBIGUATE
+            ),
+            Some(b"\x1b[97;6u".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_shift_only_text_stays_legacy_under_disambiguate() {
+        // A shift-only text key is not disambiguated: the shifted glyph is
+        // already the text, so no frame is produced.
+        let ev = kitty_char("a", Some("A"), PressState::Pressed, false);
+        assert_eq!(
+            encode_key_event_kitty_protocol(&ev, KITTY_MOD_SHIFT, KITTY_FLAG_DISAMBIGUATE),
+            None
+        );
+    }
+
+    #[test]
+    fn kitty_keypad_codes_under_disambiguate() {
+        let digit = KeyEvent {
+            logical_key: LogicalKey::Character("1".to_string()),
+            text: Some("1".to_string()),
+            location: KeyLocation::Numpad,
+            state: PressState::Pressed,
+            repeat: false,
+            is_synthetic: false,
+        };
+        assert_eq!(
+            encode_key_event_kitty_protocol(&digit, 0, KITTY_FLAG_DISAMBIGUATE),
+            Some(b"\x1b[57400u".to_vec()),
+            "numpad 1 under disambiguate is KP_1"
+        );
+        // Numpad Enter is not covered by the bare-Enter legacy exception.
+        let enter = kitty_named_located(
+            NamedKey::Enter,
+            KeyLocation::Numpad,
+            PressState::Pressed,
+            false,
+        );
+        assert_eq!(
+            encode_key_event_kitty_protocol(&enter, 0, KITTY_FLAG_DISAMBIGUATE),
+            Some(b"\x1b[57414u".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_frame_is_hard_bounded() {
+        // A hostile-length associated text can never grow the frame past
+        // the per-key bound; over-bound frames are dropped, never truncated.
+        let long = "\u{1F600}".repeat(64);
+        let ev = kitty_char("a", Some(&long), PressState::Pressed, false);
+        let frame = encode_key_event_kitty_protocol(
+            &ev,
+            0,
+            KITTY_FLAG_REPORT_ALL_KEYS | KITTY_FLAG_REPORT_TEXT,
+        )
+        .expect("frame must be emitted");
+        assert!(frame.len() <= MAX_KITTY_FRAME_BYTES);
+        assert_eq!(*frame.last().unwrap(), b'u');
     }
 }

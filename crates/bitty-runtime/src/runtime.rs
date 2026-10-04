@@ -1357,13 +1357,18 @@ impl Runtime {
                 AnyRasterizer::try_crossfont()
             };
             let is_cf = base.is_crossfont();
-            let raster = FallbackRasterizer::with_default_chain(base);
+            // CTX-0953: the production chain carries the effective
+            // `font.fallback` tier ahead of the platform tail (empty by
+            // default, identical to the bare chain).
+            let font_config = config.font_config();
+            let raster = FallbackRasterizer::with_config(base, &font_config);
             match GridRenderer::new(raster, &query, cell) {
                 Ok(r) => (r, is_cf),
                 Err(err) if is_cf && matches!(&err, RenderError::FontNotFound(_)) => {
-                    let fallback = FallbackRasterizer::with_default_chain(AnyRasterizer::Headless(
-                        HeadlessRasterizer::new(),
-                    ));
+                    let fallback = FallbackRasterizer::with_config(
+                        AnyRasterizer::Headless(HeadlessRasterizer::new()),
+                        &font_config,
+                    );
                     let r =
                         GridRenderer::new(fallback, &query, cell).map_err(RuntimeError::from)?;
                     (r, false)
@@ -1589,13 +1594,18 @@ impl Runtime {
         let (renderer, is_crossfont) = {
             let base = AnyRasterizer::try_crossfont();
             let is_cf = base.is_crossfont();
-            let raster = FallbackRasterizer::with_default_chain(base);
+            // CTX-0953: the production chain carries the effective
+            // `font.fallback` tier ahead of the platform tail (empty by
+            // default, identical to the bare chain).
+            let font_config = config.font_config();
+            let raster = FallbackRasterizer::with_config(base, &font_config);
             match GridRenderer::new(raster, &query, cell) {
                 Ok(r) => (r, is_cf),
                 Err(err) if is_cf && matches!(&err, RenderError::FontNotFound(_)) => {
-                    let fallback = FallbackRasterizer::with_default_chain(AnyRasterizer::Headless(
-                        HeadlessRasterizer::new(),
-                    ));
+                    let fallback = FallbackRasterizer::with_config(
+                        AnyRasterizer::Headless(HeadlessRasterizer::new()),
+                        &font_config,
+                    );
                     let r =
                         GridRenderer::new(fallback, &query, cell).map_err(RuntimeError::from)?;
                     (r, false)

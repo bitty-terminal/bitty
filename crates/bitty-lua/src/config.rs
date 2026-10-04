@@ -101,6 +101,15 @@ pub const MAX_CONFIG_BACKGROUND_PATH_BYTES: usize = 4096;
 /// `MAX_BACKGROUND_IMAGE_ROOTS`).
 pub const MAX_CONFIG_BACKGROUND_IMAGE_ROOTS: usize = 32;
 
+/// Maximum `font.fallback` entries read (CTX-0953, issue #1667 follow-up;
+/// mirrors `bitty-config` `MAX_FONT_FALLBACK_ENTRIES`).
+pub const MAX_CONFIG_FONT_FALLBACK_ENTRIES: usize = 8;
+
+/// Maximum bytes per `font.fallback` entry read (CTX-0953; mirrors
+/// `bitty-config` `MAX_FONT_FAMILY_LEN` so an overlong family fails closed
+/// at extraction with its indexed key path).
+pub const MAX_CONFIG_FONT_FAMILY_BYTES: usize = 128;
+
 /// The accepted `views.<selector>` field set (RFC-0001/OQ-041).
 const VIEW_ACCEPTED_FIELDS: &[&str] = &[
     "border_color",
@@ -162,6 +171,16 @@ pub struct FontData {
     pub line_height: Option<f32>,
     /// Extra advance in px.
     pub letter_spacing: Option<f32>,
+    /// User-ordered fallback families (CTX-0953, issue #1667 follow-up):
+    /// absent key means this table says nothing at extraction (`None`);
+    /// a present array is kept in order (`Some`, possibly empty). The
+    /// `None`-vs-`Some(empty)` distinction collapses one layer down:
+    /// `bitty-config` file parsing folds both into the typed
+    /// `FontConfig.fallback` list, so at merge any layer with a present
+    /// `font` table replaces the accumulated list wholesale (an omitted
+    /// key resets it) and only a layer without a `font` table inherits.
+    /// Entry bounds are enforced fail-closed downstream in `bitty-config`.
+    pub fallback: Option<Vec<String>>,
 }
 
 /// Window overrides, plain data (see [`FontData`] for `Option` semantics).
@@ -1127,7 +1146,13 @@ impl ConfigData {
                     check_nested_keys(
                         key,
                         nested,
-                        &["family", "size", "line_height", "letter_spacing"],
+                        &[
+                            "family",
+                            "size",
+                            "line_height",
+                            "letter_spacing",
+                            "fallback",
+                        ],
                     )?;
                     let family = match get_field(nested, "family") {
                         Some(v) => Some(expect_string("font.family", v)?),
@@ -1145,11 +1170,40 @@ impl ConfigData {
                         Some(v) => Some(expect_number("font.letter_spacing", v)? as f32),
                         None => None,
                     };
+                    // CTX-0953: `font.fallback` is an array of family names
+                    // (ghostty-style repeatable `font-family`); absent key
+                    // means "says nothing", present array replaces wholesale
+                    // at merge. Bounds mirror `bitty-config`
+                    // (`MAX_FONT_FALLBACK_ENTRIES` entries,
+                    // `MAX_FONT_FAMILY_LEN` bytes each); range/grammar
+                    // validation stays fail-closed downstream.
+                    let fallback = match get_field(nested, "fallback") {
+                        Some(v) => {
+                            let arr = expect_array("font.fallback", v)?;
+                            if arr.len() > MAX_CONFIG_FONT_FALLBACK_ENTRIES {
+                                return Err(format!(
+                                    "font.fallback: exceeds {} entries",
+                                    MAX_CONFIG_FONT_FALLBACK_ENTRIES
+                                ));
+                            }
+                            let mut out = Vec::with_capacity(arr.len());
+                            for (idx, item) in arr.iter().enumerate() {
+                                out.push(expect_bounded_string(
+                                    &format!("font.fallback[{}]", idx + 1),
+                                    item,
+                                    MAX_CONFIG_FONT_FAMILY_BYTES,
+                                )?);
+                            }
+                            Some(out)
+                        }
+                        None => None,
+                    };
                     out.font = Some(FontData {
                         family,
                         size,
                         line_height,
                         letter_spacing,
+                        fallback,
                     });
                 }
                 "window" => {
@@ -2627,6 +2681,46 @@ mod tests {
         let font = data.font.unwrap();
         assert!((font.line_height.unwrap() - 1.2).abs() < f32::EPSILON);
         assert!((font.letter_spacing.unwrap() - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn font_fallback_absent_says_nothing_and_parses_in_order() {
+        let data = eval_ok(r#"return { font = { family = "Mono", size = 12 } }"#);
+        assert_eq!(data.font.unwrap().fallback, None);
+        let data = eval_ok(
+            r#"return { font = { family = "Mono", size = 12, fallback = { "Noto Sans Symbols 2", "Noto Color Emoji" } } }"#,
+        );
+        assert_eq!(
+            data.font.unwrap().fallback,
+            Some(vec![
+                "Noto Sans Symbols 2".to_string(),
+                "Noto Color Emoji".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn font_fallback_rejects_bad_shapes_fail_closed() {
+        // Too many entries.
+        let err = eval_err(
+            r#"return { font = { family = "Mono", size = 12, fallback = { "a", "b", "c", "d", "e", "f", "g", "h", "i" } } }"#,
+        );
+        assert!(err.contains("font.fallback"), "unexpected: {err}");
+        // Non-string leaf.
+        let err =
+            eval_err(r#"return { font = { family = "Mono", size = 12, fallback = { 42 } } }"#);
+        assert!(err.contains("font.fallback[1]"), "unexpected: {err}");
+        // Map keys instead of an array.
+        let err = eval_err(
+            r#"return { font = { family = "Mono", size = 12, fallback = { primary = "Mono" } } }"#,
+        );
+        assert!(err.contains("font.fallback"), "unexpected: {err}");
+        // Overlong entry (128-byte family bound).
+        let long = "x".repeat(129);
+        let err = eval_err(&format!(
+            r#"return {{ font = {{ family = "Mono", size = 12, fallback = {{ "{long}" }} }} }}"#
+        ));
+        assert!(err.contains("font.fallback[1]"), "unexpected: {err}");
     }
 
     #[test]

@@ -596,6 +596,19 @@ pub struct RuntimeConfig {
     pub font_family: String,
     /// Font point size; must be finite and within `(0, 3999]`.
     pub font_size: f32,
+    /// User-ordered font fallback families (CTX-0953, issue #1667
+    /// follow-up): tried after [`font_family`](Self::font_family) and
+    /// before the platform default tail, first covering face wins.
+    ///
+    /// Empty by default (platform tail only). Not a `new()` parameter
+    /// (adding one would churn every call site); it defaults empty here
+    /// and the app layer assigns the validated effective `font.fallback`
+    /// post-construction, following the `focus_follows_mouse` pattern.
+    /// [`Self::validate`] rejects overlong lists and blank or overlong
+    /// entries fail-closed with the same bounds as `bitty-config`
+    /// (`MAX_FONT_FALLBACK_ENTRIES` entries, `MAX_FONT_FAMILY_LEN` bytes
+    /// each).
+    pub font_fallback: Vec<String>,
     /// Lines scrolled per wheel notch, `1..=32` (CTX-0185; default 3).
     /// Applied to `Lines` deltas directly and to `Pixels` deltas via the
     /// notch equivalence (`scroll_pixels_per_notch` px = one notch).
@@ -812,6 +825,7 @@ impl Default for RuntimeConfig {
             cold_queue_capacity: 256,
             font_family: font_default_family(),
             font_size: 12.0,
+            font_fallback: Vec::new(),
             scroll_lines_per_notch: DEFAULT_SCROLL_LINES_PER_NOTCH,
             scroll_pixels_per_notch: DEFAULT_SCROLL_PIXELS_PER_NOTCH,
             scrollback: DEFAULT_SCROLLBACK_LINES,
@@ -868,6 +882,11 @@ impl RuntimeConfig {
     /// [`Self::validate`] rejects values above
     /// [`MAX_SCROLLBACK_LINES`] fail-closed.
     ///
+    /// CTX-0953: `font_fallback` follows the same pattern: it defaults
+    /// empty here and the app layer assigns the effective
+    /// `font.fallback` post-construction; [`Self::validate`] rejects
+    /// overlong lists and blank or overlong entries fail-closed.
+    ///
     /// # Errors
     ///
     /// [`RuntimeError::InvalidConfig`] when any field is outside its
@@ -900,6 +919,7 @@ impl RuntimeConfig {
             cold_queue_capacity,
             font_family,
             font_size,
+            font_fallback: Vec::new(),
             scroll_lines_per_notch,
             scroll_pixels_per_notch,
             scrollback: DEFAULT_SCROLLBACK_LINES,
@@ -962,6 +982,25 @@ impl RuntimeConfig {
             return Err(RuntimeError::InvalidConfig(
                 "font_size must be finite within (0, 3999]",
             ));
+        }
+        // CTX-0953: the fallback list carries the same bounds as
+        // `bitty-config` (`MAX_FONT_FALLBACK_ENTRIES` entries,
+        // `MAX_FONT_FAMILY_LEN` bytes each); blank or overlong entries
+        // fail closed naming the `font.fallback` key path. Messages stay
+        // `&'static str` per the `RuntimeError::InvalidConfig` contract
+        // (indexed diagnostics live in `bitty-config` validation).
+        if self.font_fallback.len() > bitty_config::types::MAX_FONT_FALLBACK_ENTRIES {
+            return Err(RuntimeError::InvalidConfig(
+                "font.fallback must contain <= MAX_FONT_FALLBACK_ENTRIES entries",
+            ));
+        }
+        for entry in &self.font_fallback {
+            let name = entry.trim();
+            if name.is_empty() || name.len() > bitty_config::types::MAX_FONT_FAMILY_LEN {
+                return Err(RuntimeError::InvalidConfig(
+                    "font.fallback entries must be non-empty and <= MAX_FONT_FAMILY_LEN bytes",
+                ));
+            }
         }
         if !(1..=MAX_SCROLL_LINES_PER_NOTCH).contains(&self.scroll_lines_per_notch) {
             return Err(RuntimeError::InvalidConfig(
@@ -1096,7 +1135,25 @@ impl RuntimeConfig {
         Ok(())
     }
 
-    /// Resolves one `View`'s focused/idle outline pair and ring widths
+    /// Builds the effective [`FontConfig`](bitty_config::types::FontConfig)
+    /// for rasterizer construction (CTX-0953, issue #1667 follow-up): the
+    /// runtime family/size plus the user-ordered fallback tier, so the
+    /// production path builds its
+    /// [`FallbackRasterizer`](bitty_render::FallbackRasterizer) with
+    /// `with_config` instead of the bare platform tail.
+    ///
+    /// Spacing uses the `bitty-config` defaults: the runtime owns cell
+    /// metrics separately (`cell_width`/`cell_height`), and only the
+    /// family-plus-fallback chain reaches the rasterizer.
+    #[must_use]
+    pub fn font_config(&self) -> bitty_config::types::FontConfig {
+        bitty_config::types::FontConfig {
+            family: self.font_family.clone(),
+            size: self.font_size,
+            fallback: self.font_fallback.clone(),
+            ..Default::default()
+        }
+    }
     /// (RFC-0001/OQ-041, CTX-0343) from the global values plus every matching
     /// per-`View` rule.
     ///
@@ -1940,6 +1997,54 @@ mod tests {
         assert_eq!((DEFAULT_CELL_WIDTH, DEFAULT_CELL_HEIGHT), (9, 19));
         assert_eq!(cfg.font_family, "JetBrainsMono Nerd Font");
         assert!((cfg.font_size - 12.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn font_fallback_defaults_empty_and_validates_bounds() {
+        // CTX-0953: empty by default (platform tail only); overlong lists
+        // and blank or overlong entries fail closed naming `font.fallback`.
+        let cfg = RuntimeConfig::default();
+        assert!(cfg.font_fallback.is_empty());
+        cfg.validate().expect("default valid");
+        let too_many = RuntimeConfig {
+            font_fallback: (0..=bitty_config::types::MAX_FONT_FALLBACK_ENTRIES)
+                .map(|i| format!("Fallback {i}"))
+                .collect(),
+            ..Default::default()
+        };
+        assert!(too_many.validate().is_err());
+        for bad in [
+            vec!["  ".to_string()],
+            vec!["x".repeat(bitty_config::types::MAX_FONT_FAMILY_LEN + 1)],
+        ] {
+            let cfg = RuntimeConfig {
+                font_fallback: bad,
+                ..Default::default()
+            };
+            assert!(cfg.validate().is_err());
+        }
+        let ok = RuntimeConfig {
+            font_fallback: vec!["Noto Sans Symbols 2".to_string()],
+            ..Default::default()
+        };
+        ok.validate().expect("single fallback valid");
+    }
+
+    #[test]
+    fn font_config_carries_fallback_tier_for_rasterizer() {
+        // CTX-0953: the live rasterizer path builds its chain from this
+        // config (`FallbackRasterizer::with_config`); the user tier leads
+        // in order ahead of the platform tail.
+        let cfg = RuntimeConfig {
+            font_fallback: vec!["Noto Sans Symbols 2".to_string()],
+            ..Default::default()
+        };
+        let font = cfg.font_config();
+        assert_eq!(font.family, cfg.font_family);
+        assert_eq!(font.fallback, vec!["Noto Sans Symbols 2".to_string()]);
+        let tails = font.fallback_tails();
+        assert_eq!(tails[0], "Noto Sans Symbols 2");
+        assert!(tails.len() > 1, "platform tail follows the user tier");
     }
 
     #[test]

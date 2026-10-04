@@ -1282,10 +1282,11 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
                     size: size as f32,
                     line_height,
                     letter_spacing,
-                    // No `fallback` key parsed yet (CTX-0949 follow-up:
-                    // `font.fallback` Lua table wiring in bitty-lua +
-                    // file.rs); the typed default keeps the layer total.
-                    fallback: Vec::new(),
+                    // CTX-0953: `font.fallback` arrives as plain Lua data;
+                    // bounds (max entries, trim/non-empty/128 per entry)
+                    // are enforced fail-closed by typed validation below,
+                    // naming `font.fallback[<index>]`.
+                    fallback: f.fallback.unwrap_or_default(),
                 };
                 // Fail closed on out-of-range spacing (same as typed validation).
                 cfg.validate().map_err(|e| {
@@ -2467,6 +2468,36 @@ mod tests {
         let maps = plan.keymaps.unwrap();
         assert_eq!(maps.len(), 1);
         assert_eq!(maps[0].chord, "alt+h");
+    }
+
+    #[test]
+    fn lua_font_fallback_parses_and_validates() {
+        // CTX-0953: `font.fallback` parses in order; absent means empty;
+        // blank or overlong entries fail closed naming `font.fallback[i]`.
+        let plan = parse_lua_config(
+            r#"return { font = { family = "Mono", size = 12.0, fallback = { "Noto Sans Symbols 2", "Noto Color Emoji" } } }"#,
+            &test_source(),
+        )
+        .expect("fallback parses");
+        assert_eq!(
+            plan.font.unwrap().fallback,
+            vec![
+                "Noto Sans Symbols 2".to_string(),
+                "Noto Color Emoji".to_string()
+            ]
+        );
+        let plan = parse_lua_config(
+            r#"return { font = { family = "Mono", size = 12.0 } }"#,
+            &test_source(),
+        )
+        .expect("absent fallback ok");
+        assert!(plan.font.unwrap().fallback.is_empty());
+        let err = parse_lua_config(
+            r#"return { font = { family = "Mono", size = 12.0, fallback = { "  " } } }"#,
+            &test_source(),
+        )
+        .expect_err("blank entry must fail");
+        assert!(err.to_string().contains("font.fallback[0]"), "{err}");
     }
 
     #[test]

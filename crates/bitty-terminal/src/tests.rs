@@ -1925,6 +1925,46 @@ fn runtime_config_inherits_file_scrollback() {
 }
 
 #[test]
+fn runtime_config_carries_effective_font_fallback() {
+    // CTX-0953 (PX-4571): effective `font.fallback` flows file ->
+    // effective -> runtime, so the production rasterizer chain
+    // (`RuntimeConfig::font_config` -> `FallbackRasterizer::with_config`)
+    // sees the user tier instead of the default empty tier.
+    use bitty_config::file::{parse_lua_config, resolve_effective};
+    use bitty_config::plan::{ConfigSource, LayerKind};
+    let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+    let plan = parse_lua_config(
+        r#"return { font = { family = "Mono", size = 12.0, fallback = { "Noto Sans Symbols 2", "Noto Color Emoji" } } }"#,
+        &src,
+    )
+    .expect("fallback parses");
+    let layer = bitty_config::plan::LayeredPlan::new(src, plan);
+    let merged = resolve_effective(Some(layer), None).expect("merge");
+    assert_eq!(
+        merged.effective.font.fallback,
+        vec![
+            "Noto Sans Symbols 2".to_string(),
+            "Noto Color Emoji".to_string()
+        ]
+    );
+    let cfg = runtime_config_from_effective(&merged.effective).expect("runtime cfg builds");
+    assert_eq!(cfg.font_fallback, merged.effective.font.fallback);
+    let font = cfg.font_config();
+    assert_eq!(font.family, cfg.font_family);
+    assert_eq!(
+        font.fallback,
+        vec![
+            "Noto Sans Symbols 2".to_string(),
+            "Noto Color Emoji".to_string()
+        ]
+    );
+    // The default tier stays empty (platform tail only).
+    let cfg_default = runtime_config_from_effective(&bitty_config::EffectiveConfig::default())
+        .expect("defaults build");
+    assert!(cfg_default.font_fallback.is_empty());
+}
+
+#[test]
 fn runtime_config_rejects_scrollback_bound_drift() {
     // CTX-0297: a future `bitty-config` bound raised past the runtime /
     // terminal-state hard cap must fail closed instead of silently

@@ -103,10 +103,7 @@ use bitty_render::{
     grid_from_surface_extent, sanitize_dpi_scale,
 };
 use bitty_term_state::search::{SearchMatch, SearchOptions};
-use bitty_term_state::{
-    Attributes, Cell, Damage, DamageRect, DamagedRegion, Snapshot, State, Style, TerminalAction,
-    Zerowidth, char_cell_width,
-};
+use bitty_term_state::{Damage, DamageRect, DamagedRegion, Snapshot, State, TerminalAction};
 use bitty_ui::{
     CellPos, Focus, FocusDirection, Gaps, LayoutNode, OverlayTier, PersistentSelection,
     Rect as UiRect, ScratchpadSlot, SearchHighlight, Selection, SelectionKind, View, ViewId,
@@ -487,19 +484,11 @@ pub struct Runtime {
     /// allocations and generations are identical, so a focus change also
     /// forces a full present. Updated alongside the allocations.
     last_presented_focus: Option<ViewId>,
-    /// Status bar text at the last present (issue #1349).
-    ///
-    /// The bar overlays owned present copies, so a workspace
-    /// switch/new/close/rename with a quiet grid still needs a frame.
-    /// `tick` compares the current [`Runtime::status_bar_text`] against
-    /// this snapshot; any difference forces a full present. Updated on
-    /// every present alongside the allocations.
-    last_presented_bar: Option<String>,
     /// Mounted band versions at the last present (CTX-0946 C2).
     ///
     /// Compared per tick against [`band_host`](self::band_host)
     /// versions so a plugin mount/update/unmount presents on a quiet grid.
-    /// Updated on every present alongside `last_presented_bar`.
+    /// Updated on every present alongside the allocations.
     last_presented_bands: Vec<(String, bitty_lua::ui::UiSlot, u32)>,
     cols: usize,
     rows: usize,
@@ -562,16 +551,19 @@ pub struct Runtime {
     session_backend: Option<std::sync::Arc<dyn session::SessionFileBackend>>,
     /// Pending kill-confirm close arm, if any (never silent kill).
     pending_ws_close: Option<PendingWsClose>,
-    /// Whether the workspace switcher bar presents (issue #1333). Seeded
-    /// from [`RuntimeConfig::workspaceline_visible`] at construction
+    /// Whether the workspace switcher bar is enabled (issue #1333).
+    ///
+    /// Seeded from [`RuntimeConfig::workspaceline_visible`] at construction
     /// (default-on); live toggles go through
-    /// [`Runtime::set_workspaceline_visible`]. Presentation-only: hiding
-    /// the bar changes no workspace, focus, or session state.
+    /// [`Runtime::set_workspaceline_visible`]. Retained pending the W-26/W-27
+    /// settings migration: since W-104/CTX-0956 retired the Core bar, no
+    /// Core chrome reads this flag.
     workspaceline_visible: bool,
-    /// Window edge of the Core-owned workspace bar band (CTX-0873,
-    /// `workspace.bar.edge`). Seeded from
-    /// [`RuntimeConfig::workspace_bar_edge`]; live changes go through
-    /// [`Runtime::set_workspace_bar_edge`] and reflow.
+    /// Retained window-edge setting for the retired Core workspace bar band
+    /// (CTX-0873, `workspace.bar.edge`; migration owned by W-26/W-27).
+    /// Seeded from [`RuntimeConfig::workspace_bar_edge`]; live changes go
+    /// through [`Runtime::set_workspace_bar_edge`]. No Core chrome reads
+    /// this edge since the retirement; plugin bands solve their own rows.
     workspace_bar_edge: crate::config::BarEdge,
     /// Plugin-mounted chrome bands per edge (CTX-0890, part of #1431).
     ///
@@ -786,21 +778,10 @@ pub struct Runtime {
     /// operation clears the slot. Bounded: at most one retained error.
     last_clipboard_error: Option<bitty_platform::PlatformError>,
     last_cursor: Option<CursorPosition>,
-    /// One-shot swallow for the left release paired with a chrome-consumed
-    /// status-bar press (#1484, CTX-0808).
-    ///
-    /// A bar press on a non-focused frame is consumed as chrome before
-    /// capture, so the capturing app never saw the press; the paired
-    /// release must not reach it as an orphan report. Set when the early
-    /// bar path consumes a press, cleared (and the release swallowed) on
-    /// the next left release. No selection or drag can be in flight across
-    /// it: the bar press returns before any of those start.
-    bar_release_swallow: bool,
     /// One-shot swallow for the left release paired with a plugin-band
     /// chrome-consumed press (CTX-0946 C1).
     ///
-    /// Mirrors [`Self::bar_release_swallow`]: a band press is consumed as
-    /// Core chrome before capture, so the capturing app never saw the press
+    /// A band press is consumed as Core chrome before capture, so the
     /// and the paired release must not reach it as an orphan report. Set
     /// when [`band_host`](self::band_host) routing consumes a press, cleared
     /// (resolving the click into the drain queue) on the next left release.
@@ -1430,7 +1411,6 @@ impl Runtime {
             last_clipboard_error: None,
             paste_truncated_pastes: 0,
             last_cursor: None,
-            bar_release_swallow: false,
             band_release_swallow: false,
             band_click_queue: Vec::new(),
             band_press_target: None,
@@ -1529,7 +1509,6 @@ impl Runtime {
             workspaceline_visible: config.workspaceline_visible,
             workspace_bar_edge: config.workspace_bar_edge,
             window_cells: container,
-            last_presented_bar: None,
             last_presented_bands: Vec::new(),
             help_visible: false,
             panel_layout_mode: config.panel_layout_mode,
@@ -1661,7 +1640,6 @@ impl Runtime {
             last_clipboard_error: None,
             paste_truncated_pastes: 0,
             last_cursor: None,
-            bar_release_swallow: false,
             band_release_swallow: false,
             band_click_queue: Vec::new(),
             band_press_target: None,
@@ -1760,7 +1738,6 @@ impl Runtime {
             workspaceline_visible: config.workspaceline_visible,
             workspace_bar_edge: config.workspace_bar_edge,
             window_cells: container,
-            last_presented_bar: None,
             last_presented_bands: Vec::new(),
             help_visible: false,
             panel_layout_mode: config.panel_layout_mode,

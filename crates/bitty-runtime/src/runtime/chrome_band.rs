@@ -1,11 +1,15 @@
-//! Core-owned window chrome band (CTX-0873, issue #1431).
+//! Window chrome band geometry (CTX-0873, issue #1431).
 //!
-//! The workspace bar used to be painted into the last row of every leaf's
-//! present snapshot, occluding terminal content. It now owns a dedicated
-//! band carved out of the window grid *before* layout: the layout container
-//! is the window minus the band, so every leaf, the primary grid, and every
-//! PTY winsize are sized by the normal reflow path and no terminal cell is
-//! ever painted under the bar.
+//! Generic edge-band reservation carved out of the window grid *before*
+//! layout: the layout container is the window minus the band, so every leaf,
+//! the primary grid, and every PTY winsize are sized by the normal reflow
+//! path and no terminal cell is ever painted under a band.
+//!
+//! The solver was first built for the Core workspace bar (W-104/CTX-0956
+//! retired it: the `bar` plugin owns workspace/status UX and Core reserves
+//! zero rows). It stays as the generic mechanism plugin bands offset
+//! against, which is why the `present` predicate and the bar-band term
+//! remain even though Core always solves them absent.
 //!
 //! The geometry is four-sided ([`ChromeInsets`]) so left/right bands can be
 //! added later without reshaping callers; only [`BarEdge::Top`] and
@@ -127,7 +131,9 @@ pub fn min_container_rows(gaps_out_cells: u16, decoration_px: f64, cell_h: u32) 
 pub struct ChromeLayout {
     /// Layout container (window minus every reserved band).
     pub container: UiRect,
-    /// The workspace bar band in window cells, when reserved.
+    /// The Core bar band in window cells, when reserved (always `None`
+    /// since the Core bar retired in W-104/CTX-0956; the field stays so
+    /// the generic solve shape is unchanged).
     pub bar: Option<UiRect>,
 }
 

@@ -303,23 +303,19 @@ fn no_mount_produces_empty_bands() {
     }
 }
 
-// CTX-0923 review fix: plugin bands start inward of the Core workspaceline
-// band on the same edge instead of painting over it.
+// W-104/CTX-0956: the Core workspaceline band is retired, so Core
+// reserves zero rows on every edge and plugin bands start at the window
+// edge instead of stacking inward of a Core bar.
 
-use bitty_runtime::config::BarEdge;
-use bitty_runtime::{BandEdge, RuntimeConfig};
+use bitty_runtime::BandEdge;
 
-/// Runtime with the Core workspaceline band on `edge` and two workspaces, so
-/// the band is reserved.
-fn runtime_with_core_bar(edge: BarEdge) -> Runtime {
-    let mut rt = Runtime::new(RuntimeConfig {
-        workspace_bar_edge: edge,
-        workspaceline_visible: true,
-        ..RuntimeConfig::default()
-    })
-    .expect("headless runtime builds");
+/// Runtime with two workspaces and no Core bar: proves plugin geometry is
+/// independent of the workspace count after the retirement.
+fn two_workspace_runtime() -> Runtime {
+    let mut rt = Runtime::with_defaults().expect("headless runtime builds");
     rt.workspace_new().expect("ws2");
     assert!(rt.workspace_switch(0));
+    assert_eq!(rt.status_bar_band(), None, "no Core bar after W-104");
     rt
 }
 
@@ -339,8 +335,8 @@ fn text_band(plugin: &str, slot: UiSlot, text: &str) -> BandContent {
 }
 
 #[test]
-fn bottom_bands_stack_inward_of_a_bottom_core_bar() {
-    let mut rt = runtime_with_core_bar(BarEdge::Bottom);
+fn bottom_bands_stack_from_the_window_edge() {
+    let mut rt = two_workspace_runtime();
     // CTX-0946 C3: band rows belong to mounted visible bands (hidden bands
     // take no row), so mount two bottom bands before probing geometry.
     rt.set_chrome_bands(ChromeBands {
@@ -351,12 +347,18 @@ fn bottom_bands_stack_inward_of_a_bottom_core_bar() {
         ..Default::default()
     });
     let window = rt.window_cells();
-    let bar = rt.status_bar_band().expect("core bar reserved");
-    assert_eq!(bar.y, window.height - 1, "core bar on the last row");
-    assert_eq!(rt.core_reserved_rows(BandEdge::Bottom), 1);
+    assert_eq!(rt.status_bar_band(), None, "no Core bar after W-104");
+    assert_eq!(rt.core_reserved_rows(BandEdge::Bottom), 0);
     assert_eq!(rt.core_reserved_rows(BandEdge::Top), 0);
-    assert_eq!(rt.plugin_band_row(BandEdge::Bottom, 0), Some(bar.y - 1));
-    assert_eq!(rt.plugin_band_row(BandEdge::Bottom, 1), Some(bar.y - 2));
+    // Plugin bands start at the window edge with no Core offset.
+    assert_eq!(
+        rt.plugin_band_row(BandEdge::Bottom, 0),
+        Some(window.height - 1)
+    );
+    assert_eq!(
+        rt.plugin_band_row(BandEdge::Bottom, 1),
+        Some(window.height - 2)
+    );
     // Out-of-range visible index reserves nothing.
     assert_eq!(rt.plugin_band_row(BandEdge::Bottom, 2), None);
     // The opposite edge is unaffected.
@@ -364,8 +366,8 @@ fn bottom_bands_stack_inward_of_a_bottom_core_bar() {
 }
 
 #[test]
-fn top_bands_stack_inward_of_a_top_core_bar() {
-    let mut rt = runtime_with_core_bar(BarEdge::Top);
+fn top_bands_stack_from_the_window_edge() {
+    let mut rt = two_workspace_runtime();
     // CTX-0946 C3: mount two top bands before probing geometry (see above).
     rt.set_chrome_bands(ChromeBands {
         top: vec![
@@ -374,13 +376,11 @@ fn top_bands_stack_inward_of_a_top_core_bar() {
         ],
         ..Default::default()
     });
-    let window = rt.window_cells();
-    let bar = rt.status_bar_band().expect("core bar reserved");
-    assert_eq!(bar.y, window.y, "core bar on row 0");
-    assert_eq!(rt.core_reserved_rows(BandEdge::Top), 1);
+    assert_eq!(rt.status_bar_band(), None, "no Core bar after W-104");
+    assert_eq!(rt.core_reserved_rows(BandEdge::Top), 0);
     assert_eq!(rt.core_reserved_rows(BandEdge::Bottom), 0);
-    assert_eq!(rt.plugin_band_row(BandEdge::Top, 0), Some(bar.y + 1));
-    assert_eq!(rt.plugin_band_row(BandEdge::Top, 1), Some(bar.y + 2));
+    assert_eq!(rt.plugin_band_row(BandEdge::Top, 0), Some(0));
+    assert_eq!(rt.plugin_band_row(BandEdge::Top, 1), Some(1));
     assert_eq!(rt.plugin_band_row(BandEdge::Top, 2), None);
     assert_eq!(rt.plugin_band_row(BandEdge::Bottom, 0), None);
 }
@@ -407,41 +407,44 @@ fn window_row_pixels(rt: &Runtime, row: u16) -> Vec<u8> {
     rgba[top * stride..bottom * stride].to_vec()
 }
 
-/// Ticks a Core-bar runtime with `bands` mounted before its first present.
-fn presented(bar_edge: BarEdge, bands: ChromeBands) -> Runtime {
-    let mut rt = runtime_with_core_bar(bar_edge);
+/// Ticks a two-workspace runtime with `bands` mounted before its first present.
+fn presented(bands: ChromeBands) -> Runtime {
+    let mut rt = two_workspace_runtime();
     rt.set_chrome_bands(bands);
     rt.tick().expect("tick must present");
     rt
 }
 
 #[test]
-fn statusline_band_paints_inward_of_the_core_bar_on_each_edge() {
-    for (bar_edge, band_edge, slot) in [
-        (BarEdge::Bottom, BandEdge::Bottom, UiSlot::Statusline),
-        (BarEdge::Top, BandEdge::Top, UiSlot::Top),
+fn statusline_band_paints_at_the_window_edge() {
+    for (band_edge, slot) in [
+        (BandEdge::Bottom, UiSlot::Statusline),
+        (BandEdge::Top, UiSlot::Top),
     ] {
         let mut bands = ChromeBands::default();
         match band_edge {
             BandEdge::Top => bands.top.push(text_band("statusline", slot, "STATUS")),
             _ => bands.bottom.push(text_band("statusline", slot, "STATUS")),
         }
-        let without = presented(bar_edge, ChromeBands::default());
-        let with = presented(bar_edge, bands);
+        let without = presented(ChromeBands::default());
+        let with = presented(bands);
 
         let row = with.plugin_band_row(band_edge, 0).expect("band fits");
-        let bar = with.status_bar_band().expect("core bar reserved");
-        assert_ne!(row, bar.y, "{bar_edge:?}: plugin band off the core bar row");
+        let window = with.window_cells();
+        let edge_row = match band_edge {
+            BandEdge::Top => window.y,
+            _ => window.y + window.height - 1,
+        };
+        assert_eq!(row, edge_row, "{band_edge:?}: plugin band on the edge row");
+        assert_eq!(
+            with.status_bar_band(),
+            None,
+            "{band_edge:?}: no Core bar row exists"
+        );
         assert_ne!(
             window_row_pixels(&without, row),
             window_row_pixels(&with, row),
-            "{bar_edge:?}: plugin band painted on row {row}"
-        );
-        assert_eq!(
-            window_row_pixels(&without, bar.y),
-            window_row_pixels(&with, bar.y),
-            "{bar_edge:?}: core bar row {} untouched by the plugin band",
-            bar.y
+            "{band_edge:?}: plugin band painted on row {row}"
         );
     }
 }

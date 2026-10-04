@@ -1179,34 +1179,32 @@ mod tests {
     }
 
     #[test]
-    fn apply_live_presentation_moves_and_toggles_the_bar_band() {
-        // CTX-0873: a reload flipping `workspace.bar.edge` and
-        // `workspace.show_bar` re-solves the band and reflows the grid.
+    fn apply_live_presentation_keeps_no_core_band() {
+        // W-104/CTX-0956: the Core bar is retired, so a reload flipping
+        // `workspace.bar.edge` and `workspace.show_bar` applies cleanly
+        // (settings retained pending the W-26/W-27 migration) while Core
+        // reserves no band and the grid keeps every row throughout.
         // Seed the runtime from the same effective config the engine runs,
-        // so decoration/font geometry match and only the bar fields move
-        // the row budget below.
+        // so decoration/font geometry match below.
         let baseline = bitty_config::fallback_builtin();
         let cfg = crate::config_cli::runtime_config_from_effective(&baseline).expect("cfg");
         let mut runtime = bitty_runtime::Runtime::new(cfg).expect("runtime");
-        runtime.workspace_new().expect("ws2 reserves the band");
+        runtime.workspace_new().expect("ws2");
         assert!(runtime.workspace_switch(0));
         let mut engine = ReloadEngine::new(baseline);
         let window = runtime.window_cells();
-        let banded = runtime.snapshot().height;
-        assert_eq!(
-            runtime.status_bar_band().map(|band| band.y),
-            Some(window.height - 1),
-            "default bottom band"
-        );
+        let full = runtime.snapshot().height;
+        assert_eq!(runtime.status_bar_band(), None, "no Core band by default");
+        assert_eq!(runtime.container(), window);
 
         let mut top = bitty_config::fallback_builtin();
         top.workspace.bar_edge = Some(bitty_config::types::WorkspaceBarEdge::Top);
         let outcome = engine.reload(top);
         assert!(matches!(outcome, ReloadOutcome::Applied(_)), "{outcome:?}");
         apply_live_presentation(&mut runtime, engine.current()).expect("adopt edge");
-        assert_eq!(runtime.status_bar_band().map(|band| band.y), Some(0));
-        assert_eq!(runtime.container().y, 1, "content shifts below the band");
-        assert_eq!(runtime.snapshot().height, banded, "same row budget");
+        assert_eq!(runtime.status_bar_band(), None, "edge moves no Core band");
+        assert_eq!(runtime.container(), window, "content keeps the window");
+        assert_eq!(runtime.snapshot().height, full, "same row budget");
 
         let mut hidden = engine.current().clone();
         hidden.workspace.show_bar = Some(false);
@@ -1214,11 +1212,11 @@ mod tests {
         assert!(matches!(outcome, ReloadOutcome::Applied(_)), "{outcome:?}");
         apply_live_presentation(&mut runtime, engine.current()).expect("adopt hide");
         assert_eq!(runtime.status_bar_band(), None);
-        assert_eq!(runtime.container(), window, "band released");
+        assert_eq!(runtime.container(), window, "nothing to release");
         assert_eq!(
             runtime.snapshot().height,
-            banded + 1,
-            "rows reflow to reclaim the band row"
+            full,
+            "rows never belonged to a Core band"
         );
     }
 

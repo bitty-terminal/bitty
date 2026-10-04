@@ -113,15 +113,18 @@
 //!   `panel` -> `panel.open/move/close`): Lua sets targets, Rust
 //!   interpolates, reduced motion is mandatory, zero wakeups at rest
 //!   (UX-23, CTX-0671, candidate).
-//! - PW panel series (UX-06/UX-07/UX-08/UX-10/UX-11/UX-12, CTX-0684,
+//! - PW panel series (UX-06/UX-07/UX-08/UX-10/UX-11, CTX-0684,
 //!   candidate): [`panel_identity`] (stable identity vs physical slots,
 //!   opaque handles, `Mod`+Number reseat — the one unblocked item),
 //!   [`panel_persist`] (restart manifest + policy, decision `RFC-OQ-9`
 //!   open), [`workspace_guard`] (never-empty close policies + focus
 //!   reconciliation, decision `OQ-058` open), [`drag_bar`] (drag-to-Bar
-//!   zones + undo, `OQ-052` open), [`panel_lua`] (Lua command/query/event
-//!   descriptors under capabilities, `OQ-056` open), and [`tab_strip`]
-//!   (tab bar as a Panel projection, `OQ-052` open).
+//!   zones + undo, `OQ-052` open), and [`panel_lua`] (Lua command/query/event
+//!   descriptors under capabilities, `OQ-056` open). Tabs presentation is
+//!   owned by the `bar` plugin (W-104/CTX-0930): the retired Core-side
+//!   `tab_strip` projection (UX-12, `OQ-052` open) is deleted, and Core
+//!   keeps the panel/workspace mechanisms the bar builds on
+//!   (`LayoutNode::Stack` order, identity slots, persist snapshots).
 
 //!
 //! # Determinism
@@ -173,7 +176,6 @@ pub mod scrollbar;
 pub mod search;
 pub mod selection;
 pub mod status_registry;
-pub mod tab_strip;
 pub mod theme;
 pub mod ui_levels;
 pub mod uitree;
@@ -303,7 +305,6 @@ pub use selection::{
     BufferPos, CellPos, PersistentSelection, Selection, SelectionKind, SelectionRange,
     is_word_char, snap_to_leading,
 };
-pub use tab_strip::{MAX_TABS_PER_STRIP, TabCell, TabError, TabScope, TabStrip};
 pub use ui_levels::{
     LevelFlowError, U3_LEVELS_CONTRACT_VERSION, UiLevel, check_flow, level_of, may_depend_on,
 };

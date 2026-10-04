@@ -253,17 +253,30 @@ pub(crate) fn take_app_adoption() -> Option<AppAdoption> {
 /// Uses the startup resolvers (`resolve_keymaps`, `resolve_leader_for`,
 /// `resolve_hint_config`) so a reload binds exactly what a fresh launch
 /// would; any error fails the whole reload before the runtime is touched.
+///
+/// CTX-0951: the title theme resolves to the startup-active half of a dual
+/// selection (dark-first while the OS query degrades to `Unknown`), matching
+/// `load_app_config`. Live OS toggles refresh the title separately via the
+/// `SystemAppearanceChanged` handler.
 fn resolve_app_adoption(effective: &EffectiveConfig) -> Result<AppAdoption, String> {
     let keymaps =
         bitty_config::resolve_keymaps(effective).map_err(|err| format!("keymaps: {err}"))?;
     let leader = bitty_config::resolve_leader_for(effective, bitty_config::LeaderPlatform::host())
         .map_err(|err| format!("leader_key: {err}"))?;
+    let prefer_light = matches!(
+        bitty_platform::query_system_appearance(),
+        bitty_platform::SystemAppearance::Light
+    );
     Ok(AppAdoption {
         keymaps,
         leader,
         hints_enabled: bitty_config::resolve_hint_config(effective).enabled,
         window_opacity: effective.window.opacity,
-        theme_name: bitty_config::theme::resolve_theme(effective.appearance.theme.as_deref()).name,
+        theme_name: bitty_config::theme::resolve_selection(
+            effective.appearance.theme.as_deref(),
+            prefer_light,
+        )
+        .name,
     })
 }
 
@@ -289,15 +302,24 @@ pub(crate) fn apply_live(
 
 /// Adopt the runtime-owned live subset of `effective` into `runtime`.
 ///
-/// Reuses the startup mapping ([`crate::config_cli::runtime_config_from_effective`])
-/// so a reload resolves the same theme/decoration/outline/animation/font/
-/// background values as a fresh launch, then drives the runtime's live-adopt
-/// setters. Returns the first setter error, formatted for the ctl reply.
+/// Reuses the startup mapping
+/// ([`crate::config_cli::runtime_config_from_effective_for`] with the current
+/// OS query) so a reload resolves the same theme/decoration/outline/
+/// animation/font/background values as a fresh launch, then drives the
+/// runtime's live-adopt setters. Returns the first setter error, formatted
+/// for the ctl reply.
+///
+/// CTX-0951: dual themes adopt the half matching the OS appearance at reload
+/// time (dark-first while the query degrades to `Unknown`).
 pub(crate) fn apply_live_presentation(
     runtime: &mut bitty_runtime::Runtime,
     effective: &EffectiveConfig,
 ) -> Result<(), String> {
-    let resolved = crate::config_cli::runtime_config_from_effective(effective)?;
+    let prefer_light = matches!(
+        bitty_platform::query_system_appearance(),
+        bitty_platform::SystemAppearance::Light
+    );
+    let resolved = crate::config_cli::runtime_config_from_effective_for(effective, prefer_light)?;
     // CTX-0898 ordering: every input of the per-`View` RFC-0001 AC-1/AC-2
     // check — the theme background, the global focused/idle outline colors,
     // and the outline ring widths (the AC-2 width cue) — is installed before
@@ -513,6 +535,21 @@ pub(crate) fn reload_requested(runtime: &mut bitty_runtime::Runtime) -> Option<R
         let mut slot = slot.borrow_mut();
         let ctx = slot.as_mut()?;
         Some(ctx.reload_into(runtime))
+    })
+}
+
+/// The live effective config the runtime currently reflects (CTX-0951).
+///
+/// Clones the reload engine's committed `current` when a context is installed
+/// (production installs it in `main` before the event loop; tests use
+/// `install_with`). Returns `None` without a context, so the
+/// `SystemAppearanceChanged` handler stays a no-op there instead of guessing.
+/// The clone is cold-path only (one OS toggle per event), never per frame.
+pub(crate) fn current_effective() -> Option<EffectiveConfig> {
+    CONTEXT.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|ctx| ctx.engine.current().clone())
     })
 }
 
@@ -1340,5 +1377,40 @@ mod tests {
             bitty_config::classify_field("terminal.scrollback"),
             ReloadClass::Live
         );
+    }
+
+    #[test]
+    fn current_effective_tracks_the_committed_config() {
+        // CTX-0951: the `SystemAppearanceChanged` handler resolves against
+        // this accessor, so it must mirror the engine's committed `current`
+        // and stay `None` without a context (handler no-ops there).
+        clear();
+        assert!(current_effective().is_none());
+        let mut baseline = bitty_config::fallback_builtin();
+        baseline.font.size = 12.0;
+        let mut live = baseline.clone();
+        live.font.size = 16.0;
+        let resolve_live = live.clone();
+        install_with(baseline, Box::new(move || Ok(resolve_live.clone())), None);
+        let before = current_effective().expect("context installed");
+        assert!((before.font.size - 12.0).abs() < f32::EPSILON);
+        let mut runtime = bitty_runtime::Runtime::with_defaults().expect("runtime");
+        let info = reload_requested(&mut runtime).expect("context installed");
+        assert_eq!(info.kind, "applied");
+        let after = current_effective().expect("context installed");
+        assert!((after.font.size - 16.0).abs() < f32::EPSILON);
+        clear();
+        assert!(current_effective().is_none());
+    }
+
+    #[test]
+    fn dual_theme_title_resolves_to_startup_active_half() {
+        // CTX-0951 NEEDS-FIX: the reload title must not fall back to Bitty
+        // Dark for a dual selection. While the OS query degrades to Unknown
+        // this is the dark half (deterministic in CI).
+        let mut effective = bitty_config::fallback_builtin();
+        effective.appearance.theme = Some(String::from("light:github-light,dark:dracula"));
+        let adoption = resolve_app_adoption(&effective).expect("adoption");
+        assert_eq!(adoption.theme_name, "dracula");
     }
 }

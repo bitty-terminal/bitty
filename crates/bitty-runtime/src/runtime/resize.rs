@@ -708,6 +708,14 @@ impl Runtime {
                 self.pending_full_redraw = true;
                 false
             }
+            // CTX-0951: the OS appearance toggle is embedder-owned. `Runtime`
+            // holds only the installed palette, not the raw
+            // `appearance.theme` selection, so it cannot re-resolve the dual
+            // half itself; the embedder (`TerminalApp`) calls
+            // `apply_system_appearance` with the live `EffectiveConfig`.
+            // Returning `false` keeps the loop alive and routes the event to
+            // that handler instead of silently dropping it in a catch-all.
+            PlatformEvent::SystemAppearanceChanged(_) => false,
             _ => false,
         }
     }

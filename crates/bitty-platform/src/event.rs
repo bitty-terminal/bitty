@@ -578,6 +578,17 @@ pub enum PlatformEvent {
     /// The loop is about to exit after an [`EventContext::exit`]
     /// (crate::app::EventContext::exit) request.
     Exiting,
+    /// The OS light/dark appearance changed (CTX-0951, issue #1669).
+    ///
+    /// Dispatched once per reporting window from winit `ThemeChanged`
+    /// (emitted natively on macOS and Windows; backends without OS theme
+    /// support never emit it, so no spurious swaps). Consumers re-resolve
+    /// dual `appearance.theme` selections (e.g. via
+    /// `Runtime::apply_system_appearance`) and swap the live palette;
+    /// single selections ignore it. The payload is never
+    /// [`SystemAppearance::Unknown`](crate::appearance::SystemAppearance::Unknown):
+    /// only real OS toggles dispatch.
+    SystemAppearanceChanged(crate::appearance::SystemAppearance),
 }
 
 // ---------------------------------------------------------------------------
@@ -631,6 +642,10 @@ pub(crate) fn translate_window_event(event: WindowEvent) -> Option<WindowEventKi
         WindowEvent::CursorLeft { .. } => Some(WindowEventKind::CursorLeft),
         WindowEvent::ModifiersChanged(mods) => Some(map_modifiers_changed(mods)),
         WindowEvent::Ime(ime) => map_ime(ime).map(WindowEventKind::Ime),
+        // CTX-0951: `ThemeChanged` is app-global, not window-scoped: it is
+        // filtered here and re-dispatched as the app-level
+        // `PlatformEvent::SystemAppearanceChanged` by the `App` glue (one
+        // dispatch per reporting window; downstream apply dedups).
         _ => None,
     }
 }
@@ -814,6 +829,28 @@ mod tests {
             None
         );
         assert_eq!(translate_window_event(WindowEvent::Occluded(true)), None);
+    }
+
+    #[test]
+    fn os_appearance_changes_translate_end_to_end() {
+        use crate::appearance::{SystemAppearance, map_appearance_changed};
+        use winit::window::Theme as WinitTheme;
+        // The upstream payload is fully constructible (plain enum), so the
+        // app-level mapping is covered headless: no display server needed.
+        // `translate_window_event` keeps filtering the window-scoped
+        // `ThemeChanged` (the `App` glue re-dispatches it app-level).
+        assert_eq!(
+            translate_window_event(WindowEvent::ThemeChanged(WinitTheme::Light)),
+            None
+        );
+        assert_eq!(
+            map_appearance_changed(WinitTheme::Light),
+            PlatformEvent::SystemAppearanceChanged(SystemAppearance::Light)
+        );
+        assert_eq!(
+            map_appearance_changed(WinitTheme::Dark),
+            PlatformEvent::SystemAppearanceChanged(SystemAppearance::Dark)
+        );
     }
 
     #[test]

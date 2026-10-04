@@ -257,7 +257,8 @@ mod x;
 
 use cli::{help_text, parse_args};
 use config_cli::{
-    config_usage, load_app_config, run_config_subcommand, runtime_config_from_effective,
+    config_usage, load_app_config, run_config_subcommand, runtime_config_from_effective_for,
+    startup_prefer_light,
 };
 use init::run_init_subcommand;
 use layout_cmd::{apply_focus, demo_pump_enabled_from_env, run_headless_smoke};
@@ -303,7 +304,7 @@ use init::{
 #[cfg(test)]
 use config_cli::{
     appearance_flag_for_field, cli_overrides_from_args, layer_source_label,
-    resolve_editor_with_env, runtime_config_from_effective_with_warnings, starter_init_lua,
+    resolve_editor_with_env, starter_init_lua,
 };
 
 // ---------------------------------------------------------------------------
@@ -663,13 +664,17 @@ fn main() {
     if !hints.enabled {
         logging::info(|| "bitty: hints disabled by config — leader never arms".to_string());
     }
-    let runtime_cfg = match runtime_config_from_effective(&app_config.effective) {
-        Ok(cfg) => cfg,
-        Err(msg) => {
-            eprintln!("{msg}");
-            std::process::exit(1);
-        }
-    };
+    // CTX-0951: dual `appearance.theme` starts on the half matching the
+    // cold-path OS query (dark-first while it degrades to Unknown); live
+    // toggles swap later via the `SystemAppearanceChanged` handler.
+    let runtime_cfg =
+        match runtime_config_from_effective_for(&app_config.effective, startup_prefer_light()) {
+            Ok(cfg) => cfg,
+            Err(msg) => {
+                eprintln!("{msg}");
+                std::process::exit(1);
+            }
+        };
     let mut runtime = match Runtime::new(runtime_cfg) {
         Ok(rt) => rt,
         Err(err) => {
@@ -942,7 +947,11 @@ fn main() {
     };
 
     if headless_fallback_needed {
-        let fallback_cfg = match runtime_config_from_effective(&app_config.effective) {
+        // CTX-0951: same startup-appearance rule as the primary path above.
+        let fallback_cfg = match runtime_config_from_effective_for(
+            &app_config.effective,
+            startup_prefer_light(),
+        ) {
             Ok(cfg) => cfg,
             Err(msg) => {
                 eprintln!("{msg}");

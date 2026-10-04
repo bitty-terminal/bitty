@@ -29,6 +29,22 @@ pub(crate) struct AppConfig {
     pub(crate) source: &'static str,
 }
 
+/// Whether the startup palette resolves a dual `appearance.theme` to its
+/// light half (CTX-0951 NEEDS-FIX, issue #1669).
+///
+/// Maps the cold-path [`bitty_platform::query_system_appearance`] signal:
+/// `Light` → `true`, `Dark`/`Unknown` → `false` (dark-first default, matching
+/// `EffectiveConfig::effective_theme`). The query degrades to `Unknown` on
+/// every platform in this slice (no native portal/AppKit/registry seam yet),
+/// so startup stays dark-first until those seams land; live `ThemeChanged`
+/// events drive later swaps via `Runtime::apply_system_appearance`.
+pub(crate) fn startup_prefer_light() -> bool {
+    matches!(
+        bitty_platform::query_system_appearance(),
+        bitty_platform::SystemAppearance::Light
+    )
+}
+
 /// Resolved configuration bundle behind startup and `config check`.
 pub(crate) struct LoadedConfig {
     /// Merged effective config.
@@ -307,8 +323,15 @@ pub(crate) fn load_app_config(args: &Args) -> Result<AppConfig, String> {
         _ => "default",
     };
     let effective = merged.effective;
-    let (theme, resolution) =
-        bitty_config::theme::resolve_theme_with_status(effective.appearance.theme.as_deref());
+    // CTX-0951: dual `light:<name>,dark:<name>` resolves to the active half
+    // via the startup OS query (dark-first while the query degrades to
+    // Unknown). Single names keep the existing status path; unknown halves
+    // stay FallbackUnknown observers (validation already failed closed).
+    let prefer_light = startup_prefer_light();
+    let (theme, resolution) = bitty_config::theme::resolve_selection_with_status(
+        effective.appearance.theme.as_deref(),
+        prefer_light,
+    );
     // Log unknown-theme fallbacks (the pure resolver stays silent for tests).
     if resolution == bitty_config::theme::ThemeResolution::FallbackUnknown {
         let raw = effective.appearance.theme.as_deref().unwrap_or_default();
@@ -796,8 +819,10 @@ pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                 // (theme token / base / explicit pair) with its source, plus
                 // the advisory AC-3 idle-contrast note when it is below the
                 // 1.5:1 floor. AC-3 never changes the exit code.
-                let theme = bitty_config::theme::resolve_theme(e.appearance.theme.as_deref());
-                let outline = e.decoration.resolve_outline(theme);
+                // CTX-0951: dual themes show the startup-active half
+                // (dark-first while the OS query degrades to Unknown).
+                let theme = e.effective_theme_for(startup_prefer_light());
+                let outline = e.decoration.resolve_outline(&theme);
                 println!(
                     "{}",
                     check_row(
@@ -842,7 +867,7 @@ pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                     };
                     println!("{}", check_row(field, value, &source));
                 }
-                if let Some(warning) = e.decoration.idle_contrast_warning(theme) {
+                if let Some(warning) = e.decoration.idle_contrast_warning(&theme) {
                     println!(
                         "{}",
                         check_row("decoration.border_color_idle.advisory", warning, "advisory")
@@ -1064,7 +1089,8 @@ pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                 // BG-4/BG-5 admission — so a missing file, an unapproved
                 // root, an animated container, or an over-limit image fails
                 // here with a source-attributed key before anything paints.
-                match runtime_config_from_effective(e) {
+                // CTX-0951: same startup-appearance rule as a fresh launch.
+                match runtime_config_from_effective_for(e, startup_prefer_light()) {
                     Ok(cfg) => {
                         if let Err(err) = bitty_runtime::validate_background_images(&cfg) {
                             eprintln!("bitty config check: {err}");
@@ -1138,8 +1164,15 @@ pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
 /// construction is expected to succeed — failures stay fail-closed).
 /// Engaged defense-in-depth clamps are collected as warnings (CTX-0482);
 /// semantic bounds (scrollback) stay fail-closed.
-pub(crate) fn runtime_config_from_effective_with_warnings(
+///
+/// CTX-0951: `prefer_light` selects the active half of a dual
+/// `appearance.theme` (`true` = light OS appearance, `false` = dark or
+/// unknown, the dark-first default). Production passes
+/// [`startup_prefer_light`]; the dark-first wrapper below keeps unit tests
+/// deterministic while the OS query degrades to `Unknown`.
+pub(crate) fn runtime_config_from_effective_for_with_warnings(
     effective: &bitty_config::EffectiveConfig,
+    prefer_light: bool,
 ) -> Result<(bitty_runtime::RuntimeConfig, Vec<String>), String> {
     let mut warnings: Vec<String> = Vec::new();
     let defaults = bitty_runtime::RuntimeConfig::default();
@@ -1349,7 +1382,10 @@ pub(crate) fn runtime_config_from_effective_with_warnings(
         // CTX-0392: the effective theme folds in `appearance.colors` when
         // present (preset tokens, custom background/ANSI), so outlines and
         // the runtime palette stay on the same ground.
-        let theme = effective.effective_theme();
+        // CTX-0951: dual themes resolve to the half matching `prefer_light`
+        // (production passes the startup OS query; dark-first while it
+        // degrades to Unknown).
+        let theme = effective.effective_theme_for(prefer_light);
         let outline = effective.decoration.resolve_outline(&theme);
         cfg.outline_focused = outline.focused.0;
         cfg.outline_idle = outline.idle.0;
@@ -1391,11 +1427,16 @@ pub(crate) fn runtime_config_from_effective_with_warnings(
         // CTX-0392: when `appearance.colors` is present the custom palette
         // replaces the preset's chrome/ANSI (same fixed shape, validated
         // hex, 16 entries); outline tokens stay preset-owned.
+        // CTX-0951: dual themes resolve to the half matching `prefer_light`
+        // (previously `resolve_theme` on the raw dual string fell back to
+        // Bitty Dark instead of the dark half).
         cfg.theme = match &effective.appearance.colors {
             Some(custom) => bitty_runtime::ThemePalette::from_custom(custom),
             None => {
-                let preset =
-                    bitty_config::theme::resolve_theme(effective.appearance.theme.as_deref());
+                let preset = bitty_config::theme::resolve_selection(
+                    effective.appearance.theme.as_deref(),
+                    prefer_light,
+                );
                 bitty_runtime::ThemePalette::from_theme(preset)
             }
         };
@@ -1452,15 +1493,43 @@ pub(crate) fn runtime_config_from_effective_with_warnings(
     .map_err(|err| format!("bitty: invalid effective config for runtime: {err}"))
 }
 
+/// Dark-first [`runtime_config_from_effective_for_with_warnings`] wrapper.
+///
+/// Test-only determinism shim (while the OS query degrades to `Unknown`):
+/// production calls the `_for` form with [`startup_prefer_light`].
+#[cfg(test)]
+pub(crate) fn runtime_config_from_effective_with_warnings(
+    effective: &bitty_config::EffectiveConfig,
+) -> Result<(bitty_runtime::RuntimeConfig, Vec<String>), String> {
+    runtime_config_from_effective_for_with_warnings(effective, false)
+}
+
 /// [`runtime_config_from_effective_with_warnings`] with engaged
 /// defense-in-depth clamps reported on stderr through the log gate
 /// (CTX-0482, issue #763). Values keep their clamp semantics, so an
 /// engaged clamp is a visible warning naming the key, never a silent
 /// normalization.
+///
+/// Test-only dark-first wrapper; production calls the `_for` form with
+/// [`startup_prefer_light`] (CTX-0951).
+#[cfg(test)]
 pub(crate) fn runtime_config_from_effective(
     effective: &bitty_config::EffectiveConfig,
 ) -> Result<bitty_runtime::RuntimeConfig, String> {
-    let (config, warnings) = runtime_config_from_effective_with_warnings(effective)?;
+    runtime_config_from_effective_for(effective, false)
+}
+
+/// Appearance-aware [`runtime_config_from_effective`] (CTX-0951).
+///
+/// Same mapping but a dual `appearance.theme` resolves to the half matching
+/// `prefer_light` (`true` = light OS appearance). Production passes
+/// [`startup_prefer_light`].
+pub(crate) fn runtime_config_from_effective_for(
+    effective: &bitty_config::EffectiveConfig,
+    prefer_light: bool,
+) -> Result<bitty_runtime::RuntimeConfig, String> {
+    let (config, warnings) =
+        runtime_config_from_effective_for_with_warnings(effective, prefer_light)?;
     for warning in warnings {
         crate::logging::warn(move || warning);
     }

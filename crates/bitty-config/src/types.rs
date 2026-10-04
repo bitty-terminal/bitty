@@ -2912,7 +2912,9 @@ impl MouseConfig {
 /// The optional theme identifier resolves through the built-in preset
 /// registry ([`crate::theme`]): `None`/empty means the designed default
 /// preset ([`crate::theme::DEFAULT_THEME_NAME`]), a known name resolves to
-/// its exact values, and an unknown name falls back to the default (logged).
+/// its exact values, and a dual `light:<name>,dark:<name>` pair resolves
+/// per OS appearance (CTX-0951). Unknown names and malformed dual values
+/// fail closed at validation with a diagnostic naming the valid set.
 /// No config-file I/O happens here; the identifier is already-parsed data.
 ///
 /// CTX-0392: the optional inline `colors` table carries a bounded custom
@@ -2952,6 +2954,26 @@ impl AppearanceConfig {
                     "appearance.theme",
                     format!("must be <= {MAX_THEME_LEN} bytes"),
                 ));
+            }
+            // CTX-0951: fail closed on unknown preset names (the single
+            // name and both dual halves) with a diagnostic naming the
+            // valid set; malformed dual values fail closed with the shape
+            // diagnostic. `resolve_theme` keeps its log-and-fallback as
+            // runtime last-resort for values that bypass validation.
+            match crate::theme::parse_theme_selection(trimmed) {
+                Err(e) => {
+                    return Err(ConfigError::validation("appearance.theme", e.message()));
+                }
+                Ok(selection) => {
+                    for name in selection.names() {
+                        if !crate::theme::is_known_theme_name(name) {
+                            return Err(ConfigError::validation(
+                                "appearance.theme",
+                                crate::theme::unknown_theme_diagnostic(name),
+                            ));
+                        }
+                    }
+                }
             }
         }
         // `colors` holds parsed bytes, so structural validation already
@@ -3165,9 +3187,25 @@ impl EffectiveConfig {
     /// keeps the accepted AC-1/AC-2 derivation (preset tokens) while
     /// validating them against the custom background, and never touches a
     /// theme file (OQ-047 stays `Open`).
+    ///
+    /// Dual selections (CTX-0951) resolve to the dark half: unknown callers
+    /// get the dark-first default; pass the OS appearance to
+    /// [`Self::effective_theme_for`] instead.
     #[must_use]
     pub fn effective_theme(&self) -> crate::theme::Theme {
-        let base = *crate::theme::resolve_theme(self.appearance.theme.as_deref());
+        self.effective_theme_for(false)
+    }
+
+    /// Effective theme under `prefer_light` (CTX-0951, issue #1669).
+    ///
+    /// Same as [`Self::effective_theme`] but a dual
+    /// `appearance.theme` (`light:<name>,dark:<name>`) resolves to the
+    /// half matching the OS appearance (`true` = light). The caller maps
+    /// its OS appearance signal; unknown appearances must pass `false`
+    /// (dark-first default). Single selections ignore the flag.
+    #[must_use]
+    pub fn effective_theme_for(&self, prefer_light: bool) -> crate::theme::Theme {
+        let base = *crate::theme::resolve_selection(self.appearance.theme.as_deref(), prefer_light);
         if let Some(custom) = &self.appearance.colors {
             crate::theme::Theme {
                 background: custom.background,
@@ -5591,5 +5629,75 @@ mod tests {
             right_order: vec![],
         };
         config.validate().expect("max-length plugin id accepted");
+    }
+
+    // ── CTX-0951 theme selection validation ──────────────────────────────
+
+    fn appearance_with_theme(theme: &str) -> AppearanceConfig {
+        AppearanceConfig {
+            theme: Some(theme.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn appearance_theme_accepts_known_single_and_dual() {
+        for theme in [
+            "catppuccin-mocha",
+            "  Dark ",
+            "light:catppuccin-latte,dark:catppuccin-mocha",
+            "dark:dracula, light:github-light",
+        ] {
+            appearance_with_theme(theme)
+                .validate()
+                .expect("known theme accepted");
+        }
+    }
+
+    #[test]
+    fn appearance_theme_rejects_unknown_names_with_valid_set() {
+        for theme in [
+            "not-a-theme",
+            "light:not-a-theme,dark:catppuccin-mocha",
+            "light:catppuccin-latte,dark:not-a-theme",
+        ] {
+            let err = appearance_with_theme(theme).validate().unwrap_err();
+            let err_str = format!("{err}");
+            assert!(err_str.contains("appearance.theme"), "{err_str}");
+            assert!(err_str.contains("not-a-theme"), "{err_str}");
+            assert!(err_str.contains("catppuccin-mocha"), "{err_str}");
+        }
+    }
+
+    #[test]
+    fn appearance_theme_rejects_malformed_dual_shape() {
+        for theme in ["light:catppuccin-latte", "light:,dark:dracula", "a,b"] {
+            let err = appearance_with_theme(theme).validate().unwrap_err();
+            assert!(
+                format!("{err}").contains("appearance.theme"),
+                "theme: {theme}"
+            );
+        }
+    }
+
+    #[test]
+    fn effective_theme_for_resolves_dual_halves() {
+        let config = EffectiveConfig {
+            appearance: appearance_with_theme("light:github-light,dark:dracula"),
+            ..Default::default()
+        };
+        assert_eq!(
+            config.effective_theme_for(true).background,
+            [0xFF, 0xFF, 0xFF]
+        );
+        assert_eq!(
+            config.effective_theme_for(false).background,
+            crate::theme::DRACULA.background
+        );
+        // The flag-blind form keeps the dark-first default.
+        assert_eq!(
+            config.effective_theme().background,
+            crate::theme::DRACULA.background
+        );
     }
 }

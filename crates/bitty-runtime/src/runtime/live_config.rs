@@ -5,6 +5,8 @@
 //! This module adds the remaining runtime-owned `Live` fields:
 //!
 //! * [`Runtime::set_theme_palette`] — `appearance.theme` / `appearance.colors`;
+//! * [`Runtime::apply_system_appearance`] — OS light/dark toggle for dual
+//!   `appearance.theme` selections (CTX-0951);
 //! * [`Runtime::set_font_face`] — `font.family`, `font.size`,
 //!   `font.line_height`, and `font.letter_spacing` (the latter two arrive as
 //!   the derived base cell) in one atlas rebuild;
@@ -69,6 +71,50 @@ impl Runtime {
         self.renderer.set_theme_palette(installed);
         self.surface.set_theme_palette(installed);
         self.pending_full_redraw = true;
+    }
+
+    /// Live-swaps the palette for an OS appearance change (CTX-0951, issue
+    /// #1669).
+    ///
+    /// `effective` is the current merged config (owns the raw
+    /// `appearance.theme` selection); `appearance` is the OS signal —
+    /// [`bitty_platform::SystemAppearance::Light`] swaps to the `light:`
+    /// half, `Dark`/`Unknown` to the `dark:` half (dark-first, matching
+    /// config resolution). Only a dual selection
+    /// (`light:<name>,dark:<name>`) can change anything: the matching half
+    /// resolves through [`EffectiveConfig::effective_theme_for`](bitty_config::types::EffectiveConfig::effective_theme_for)
+    /// (custom `appearance.colors` overlay included) and installs via
+    /// [`Self::set_theme_palette`], so dedup, one full redraw, and OSC
+    /// override preservation all apply, and a toggle to the already-active
+    /// half is a no-op. Single selections, unset themes, and malformed
+    /// values leave the runtime untouched and return `false`; a real swap
+    /// returns `true`.
+    ///
+    /// The embedder calls this from its
+    /// `PlatformEvent::SystemAppearanceChanged` handler with the live effective
+    /// config; startup and config reload keep flowing through the existing
+    /// `set_theme_palette` path.
+    pub fn apply_system_appearance(
+        &mut self,
+        effective: &bitty_config::types::EffectiveConfig,
+        appearance: bitty_platform::SystemAppearance,
+    ) -> bool {
+        let dual = matches!(
+            effective
+                .appearance
+                .theme
+                .as_deref()
+                .and_then(|raw| bitty_config::theme::parse_theme_selection(raw).ok()),
+            Some(bitty_config::theme::ThemeSelection::Dual { .. })
+        );
+        if !dual {
+            return false;
+        }
+        let prefer_light = matches!(appearance, bitty_platform::SystemAppearance::Light);
+        let theme = effective.effective_theme_for(prefer_light);
+        let before = self.config.theme;
+        self.set_theme_palette(ThemePalette::from_theme(&theme));
+        before != self.config.theme
     }
 
     /// Live-adopts a font family, point size, and base cell without restart
@@ -258,6 +304,56 @@ mod tests {
         let current = rt.config().theme;
         rt.set_theme_palette(current);
         assert!(rt.tick().is_none(), "no churn for an unchanged palette");
+    }
+
+    fn dual_effective() -> bitty_config::types::EffectiveConfig {
+        bitty_config::types::EffectiveConfig {
+            appearance: bitty_config::types::AppearanceConfig {
+                theme: Some("light:github-light,dark:dracula".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn system_appearance_swaps_dual_theme_live() {
+        use bitty_platform::SystemAppearance;
+        let mut rt = Runtime::with_defaults().expect("runtime");
+        let effective = dual_effective();
+        let _ = rt.tick();
+        // Unknown OS appearance resolves dark-first.
+        assert!(rt.apply_system_appearance(&effective, SystemAppearance::Unknown));
+        let dracula =
+            crate::ThemePalette::from_theme(bitty_config::theme::resolve_theme(Some("dracula")));
+        assert_eq!(rt.config().theme.background, dracula.background);
+        assert!(rt.tick().is_some(), "the first swap repaints");
+        // The already-active half is a no-op (set_theme_palette dedup).
+        assert!(!rt.apply_system_appearance(&effective, SystemAppearance::Dark));
+        assert!(rt.tick().is_none(), "no churn for the active half");
+        // A light toggle swaps the live palette and repaints.
+        assert!(rt.apply_system_appearance(&effective, SystemAppearance::Light));
+        assert_eq!(rt.config().theme.background, light().background);
+        assert!(rt.tick().is_some(), "an appearance swap repaints");
+    }
+
+    #[test]
+    fn system_appearance_ignores_single_and_unset_themes() {
+        use bitty_platform::SystemAppearance;
+        let mut rt = Runtime::with_defaults().expect("runtime");
+        let _ = rt.tick();
+        let before = rt.config().theme;
+        let mut single = dual_effective();
+        single.appearance.theme = Some("dracula".to_string());
+        assert!(!rt.apply_system_appearance(&single, SystemAppearance::Light));
+        let mut unset = dual_effective();
+        unset.appearance.theme = None;
+        assert!(!rt.apply_system_appearance(&unset, SystemAppearance::Light));
+        let mut malformed = dual_effective();
+        malformed.appearance.theme = Some("light:".to_string());
+        assert!(!rt.apply_system_appearance(&malformed, SystemAppearance::Light));
+        assert_eq!(rt.config().theme, before);
+        assert!(rt.tick().is_none(), "ignored toggles never repaint");
     }
 
     #[test]

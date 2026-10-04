@@ -1,22 +1,27 @@
-//! PW panel series batch (UX-06/UX-07/UX-08/UX-10/UX-11/UX-12,
-//! CTX-0684, issues #1012 #1013 #1014 #1016 #1017 #1018).
+//! PW panel series batch (UX-06/UX-07/UX-08/UX-10/UX-11,
+//! CTX-0684, issues #1012 #1013 #1014 #1016 #1017).
 //!
 //! Candidate behavior: stable identity display (`panel_identity`),
 //! restart manifests (`panel_persist`), the never-empty workspace guard
-//! (`workspace_guard`), drag-to-Bar drops (`drag_bar`), Lua API
-//! descriptors (`panel_lua`), and the tab strip projection (`tab_strip`).
+//! (`workspace_guard`), drag-to-Bar drops (`drag_bar`), and Lua API
+//! descriptors (`panel_lua`). UX-12 (#1018) retired (W-104/CTX-0930): the
+//! Core-side tab strip projection is deleted and tabs presentation is owned
+//! by the `bar` plugin over Core panel/workspace mechanisms, so the
+//! cross-module tab checks below pin the retained mechanisms the bar builds
+//! on (Stack display order plus identity slot joins, leaf-id snapshot
+//! round-trips).
 //! Cross-module checks the unit tests inside those modules do not cover
 //! alone: identity-to-tab joins, manifest restore planning, guarded
-//! last-panel closes, registry-gated Bar commits with undo, capability
-//! gating, and strip snapshot round-trips.
+//! last-panel closes, registry-gated Bar commits with undo, and capability
+//! gating.
 
 #![forbid(unsafe_code)]
 
 use bitty_ui::{
     ApiScope, BAR_MOVE_CMD, BAR_SPLIT_CMD, BarDropSession, BarError, BarOutcome, BarUndoStack,
     BarZone, CapabilityGate, CloseRequest, CloseResolution, CommandRegistry, FocusResolution,
-    GuardError, IdentityRegistry, LastPanelPolicy, LuaCapability, ManifestError, PanelId,
-    PersistedPanel, PersistencePolicy, RestartManifest, SlotNumber, TabError, TabScope, TabStrip,
+    GuardError, IdentityRegistry, LastPanelPolicy, LayoutNode, LuaCapability, ManifestError,
+    PanelId, PersistedPanel, PersistencePolicy, RestartManifest, SlotNumber, View, ViewId,
     WorkspaceGuard, classify_bar_drop, decode_manifest, encode_manifest, lookup_command,
     plan_restore, tab_label, undo_bar_drop, validate_spellings,
 };
@@ -282,55 +287,79 @@ fn lua_table_validates_and_gate_enforces_capabilities() {
 }
 
 // ---------------------------------------------------------------------------
-// UX-12 (#1018): tab strip projection, reorder, snapshot round-trip
+// UX-12 (#1018) retired (W-104/CTX-0930): the Core-side tab strip projection
+// is deleted and tabs presentation is owned by the `bar` plugin over Core
+// panel/workspace mechanisms. No Core chrome paints tabs: with zero plugins
+// or in `bitty --safe` the grid keeps every row (pinned in
+// `bitty-runtime` `statusbar_row.rs` / `chrome_bands_render.rs`). These tests
+// pin the retained mechanisms the bar builds on — Stack display order plus
+// identity slot joins, and leaf-id snapshot round-trips with duplicate
+// fail-closed — with no tab-strip chrome.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn tab_reorder_changes_slots_never_identity() {
-    let mut strip = TabStrip::new(TabScope::PerWorkspace(0));
-    for id in [11, 22, 33] {
-        strip.open_tab(PanelId::new(id)).unwrap();
-    }
-    strip.reorder(0, 3).unwrap();
+fn tab_order_is_stack_projection_identity_stable() {
+    let stack = LayoutNode::stack(vec![
+        LayoutNode::leaf(View::new(ViewId::new(11), 80, 24)),
+        LayoutNode::leaf(View::new(ViewId::new(22), 80, 24)),
+        LayoutNode::leaf(View::new(ViewId::new(33), 80, 24)),
+    ]);
     assert_eq!(
-        strip.order(),
-        &[PanelId::new(22), PanelId::new(33), PanelId::new(11)]
+        stack.leaf_ids(),
+        vec![ViewId::new(11), ViewId::new(22), ViewId::new(33)]
     );
-    let cells = strip.cells();
-    assert_eq!(cells[0].slot, 1);
+    // Reorder is a display-sequence change over the retained Stack
+    // mechanism: detach the first leaf and re-stack it at the end.
+    let mut reordered = stack.clone();
+    let detached = reordered
+        .remove_leaf(ViewId::new(11))
+        .expect("leaf present");
+    assert_eq!(detached.id(), ViewId::new(11));
+    let mut ids = reordered.leaf_ids();
+    ids.push(detached.id());
+    let reordered = LayoutNode::stack(
+        ids.iter()
+            .map(|id| LayoutNode::leaf(View::new(*id, 80, 24)))
+            .collect(),
+    );
     assert_eq!(
-        cells[2],
-        bitty_ui::TabCell {
-            panel: PanelId::new(11),
-            slot: 3
-        }
+        reordered.leaf_ids(),
+        vec![ViewId::new(22), ViewId::new(33), ViewId::new(11)]
     );
-    // Join with identity titles: the tab label follows the slot.
+    // Join with identity titles: the tab label follows the slot while panel
+    // identities stay untouched.
     let (reg, _, _) = bound_registry();
     let title = reg.title_of(PanelId::new(7)).unwrap();
     assert_eq!(tab_label(slot(1), title), "1:editor");
 }
 
 #[test]
-fn tab_snapshot_restore_round_trip_and_move_scope() {
-    let mut strip = TabStrip::new(TabScope::PerWorkspace(0));
-    strip.open_tab(PanelId::new(5)).unwrap();
-    strip.open_tab(PanelId::new(6)).unwrap();
-    let snap = strip.snapshot();
-    let mut other = TabStrip::new(TabScope::PerWindow);
-    other.restore(&snap).unwrap();
-    assert_eq!(other.order(), strip.order());
-    assert_eq!(
-        other
-            .restore(&[PanelId::new(1), PanelId::new(1)])
-            .unwrap_err(),
-        TabError::DuplicateTab {
-            panel: PanelId::new(1)
-        }
+fn tab_snapshot_is_leaf_ids_with_duplicate_fail_closed() {
+    let stack = LayoutNode::stack(vec![
+        LayoutNode::leaf(View::new(ViewId::new(5), 80, 24)),
+        LayoutNode::leaf(View::new(ViewId::new(6), 80, 24)),
+    ]);
+    // Snapshot round-trip over the retained mechanism: leaf ids rebuild the
+    // same display order.
+    let snap = stack.leaf_ids();
+    let rebuilt = LayoutNode::stack(
+        snap.iter()
+            .map(|id| LayoutNode::leaf(View::new(*id, 80, 24)))
+            .collect(),
     );
-    strip.move_to(PanelId::new(5), &mut other).unwrap_err();
-    let mut fresh = TabStrip::new(TabScope::PerWindow);
-    strip.move_to(PanelId::new(5), &mut fresh).unwrap();
-    assert_eq!(strip.order(), &[PanelId::new(6)]);
-    assert_eq!(fresh.order(), &[PanelId::new(5)]);
+    assert_eq!(rebuilt.leaf_ids(), snap);
+    // Duplicate fail-closed lives with the retained identity registry
+    // (never-duplicate panel binding), not with Core chrome.
+    let (mut reg, a, _) = bound_registry();
+    assert!(
+        reg.bind(a, slot(3), "dup").is_err(),
+        "duplicate panel bind must fail closed"
+    );
+    // Cross-scope move at mechanism level: detach from the source stack and
+    // attach to a fresh one; the source keeps its remaining order.
+    let mut source = stack.clone();
+    let moved = source.remove_leaf(ViewId::new(5)).expect("leaf present");
+    assert_eq!(source.leaf_ids(), vec![ViewId::new(6)]);
+    let target = LayoutNode::stack(vec![LayoutNode::leaf(moved)]);
+    assert_eq!(target.leaf_ids(), vec![ViewId::new(5)]);
 }

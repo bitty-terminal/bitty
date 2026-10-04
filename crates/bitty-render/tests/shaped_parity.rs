@@ -7,7 +7,8 @@
 //! `tests/capture_baseline.rs`. The crossfont backend itself stays in-tree
 //! as the production default (CTX-0957 additive landing, DEC-0095 — see the
 //! `Backend selection` section in the crate docs); these tests exercise the
-//! explicit shaped opt-in (`SwashSingle::new` + default chain).
+//! explicit shaped opt-in (`SwashSingle::new` + default chain, now with the
+//! CTX-0961 CJK tail plus dynamic fallback).
 //! They are gated behind `BITTY_RENDER_FONT_TESTS=1` like the other
 //! live-font tests and additionally skip when the primary face is missing,
 //! so default CI stays deterministic.
@@ -46,15 +47,25 @@ const PRIMARY: &str = "JetBrainsMono Nerd Font";
 const POINT_SIZE: f32 = 12.0;
 const DIM_TOLERANCE_PX: i32 = 1;
 
-/// Scalars the old stack covered through its dynamic per-glyph fontconfig
-/// fallback (`face_for_glyph` → any system face) that the pinned chain
-/// cannot reach. CTX-0961 owns the fix (CJK/script chain policy plus a
-/// dynamic-fallback strategy with per-OS evidence); this allowlist closes
-/// when that lands and must not gain new entries without a tracked task.
-/// The test asserts the divergent set is EXACTLY this: a fixed gap fails
-/// until the allowlist is updated with the fix, and any new divergence
-/// fails as a coverage mismatch.
-const KNOWN_DIVERGENT: &[u32] = &[0x6F22, 0x5B57];
+/// Former allowlist, closed by CTX-0961 (issue #1666).
+///
+/// `U+6F22`/`U+5B57` used to regress covered-to-tofu on the shaped path:
+/// the old stack covered them through its dynamic per-glyph fontconfig
+/// fallback (`face_for_glyph` → any system face) while the pinned chain
+/// had no Han tail. The fix is two-tier: a pinned CJK tail per platform
+/// ([`FONT_FALLBACK_CHAIN`](bitty_config::types::FONT_FALLBACK_CHAIN):
+/// `Noto Sans CJK SC` on Linux, `PingFang SC` on macOS, `Microsoft YaHei`
+/// on Windows) plus a bounded dynamic scan beyond the chain
+/// (`SwashSingle::dynamic_face_for`, cached per scalar). Coverage below
+/// asserts exact equality with no allowlist: any future coverage
+/// divergence fails as a mismatch and must gain a tracked task, never a
+/// silent exception. Dimensions for these two stay coverage-gated only
+/// (see `CJK_COVERAGE_ONLY`): the stacks resolve them through different
+/// typefaces by policy (pinned Noto CJK vs fontconfig MS Gothic), so
+/// hinted bitmap extents legitimately differ beyond rounding.
+///
+/// Coverage-gated CJK scalars (see above): exact dims do not apply.
+const CJK_COVERAGE_ONLY: &[u32] = &[0x6F22, 0x5B57];
 
 #[derive(Debug)]
 struct FixtureRow {
@@ -179,7 +190,6 @@ fn swash_matches_crossfont_coverage_and_dimensions() {
     let primary = raster.fonts()[0];
     let mut mismatches = 0;
     let mut color_only = 0;
-    let mut divergent = 0;
     for row in &fixture.rows {
         let Some(c) = char::from_u32(row.ch) else {
             continue;
@@ -187,18 +197,6 @@ fn swash_matches_crossfont_coverage_and_dimensions() {
         let resolved = raster
             .resolve(RasterKey::new(c, primary, POINT_SIZE).unwrap())
             .expect("resolution must not error on a live stack");
-        if KNOWN_DIVERGENT.contains(&row.ch) {
-            // Documented gap: old stack covered via dynamic fallback, the
-            // pinned chain stays tofu. Fails loudly if the gap ever closes
-            // without updating the allowlist (or widens elsewhere).
-            assert!(
-                !resolved.covered,
-                "U+{:04X}: known divergence closed — update KNOWN_DIVERGENT with the fix",
-                row.ch
-            );
-            divergent += 1;
-            continue;
-        }
         if resolved.covered != row.covered {
             eprintln!(
                 "COVERAGE DIVERGENCE U+{:04X}: fixture={} swash={}",
@@ -235,6 +233,23 @@ fn swash_matches_crossfont_coverage_and_dimensions() {
             );
             continue;
         }
+        if CJK_COVERAGE_ONLY.contains(&row.ch) {
+            // Different typefaces by policy (see above): coverage +
+            // non-blank + sane extents, not exact dims.
+            assert!(
+                !bitmap.is_blank(),
+                "U+{:04X}: CJK glyph must be non-blank",
+                row.ch
+            );
+            assert!(
+                bitmap.metrics.width > 0 && bitmap.metrics.height > 0,
+                "U+{:04X}: CJK glyph must have positive extents, got {}x{}",
+                row.ch,
+                bitmap.metrics.width,
+                bitmap.metrics.height
+            );
+            continue;
+        }
         let dw = (bitmap.metrics.width - row.w).abs();
         let dh = (bitmap.metrics.height - row.h).abs();
         assert!(
@@ -254,11 +269,6 @@ fn swash_matches_crossfont_coverage_and_dimensions() {
         );
     }
     assert_eq!(mismatches, 0, "coverage must match the baseline exactly");
-    assert_eq!(
-        divergent,
-        KNOWN_DIVERGENT.len(),
-        "divergent set must be exactly KNOWN_DIVERGENT"
-    );
     eprintln!("color-strike coverage-only glyphs: {color_only}");
 }
 
@@ -387,5 +397,72 @@ trait ClusterExt {
 impl ClusterExt for bitty_render::ShapedCluster {
     fn covered_by_tail(&self, primary: FontId) -> bool {
         !self.uncovered && self.face != primary
+    }
+}
+
+#[test]
+fn dynamic_fallback_covers_cjk_without_chain_tail() {
+    // CTX-0961: the dynamic scan covers Han even when the pinned CJK tail
+    // is absent from the chain (primary-only chain). Proves the second
+    // tier works independently of the static policy.
+    if !live_tests_enabled() {
+        eprintln!("skipped: set {ENABLE_ENV}=1 to run live font tests");
+        return;
+    }
+    let inner = SwashSingle::new().expect("host font stack");
+    let mut raster = FallbackRasterizer::new(inner, Vec::new());
+    raster.load_font(&query()).expect("primary loads");
+    let primary = raster.fonts()[0];
+    for ch in ['\u{6F22}', '\u{5B57}'] {
+        let resolved = raster
+            .resolve(RasterKey::new(ch, primary, POINT_SIZE).unwrap())
+            .expect("resolution must not error on a live stack");
+        assert!(
+            resolved.covered,
+            "U+{:04X} must be covered via dynamic fallback",
+            ch as u32
+        );
+        assert_ne!(
+            resolved.font, primary,
+            "U+{:04X} must come from a dynamic face, not the primary",
+            ch as u32
+        );
+        let bitmap = resolved.bitmap.as_ref().expect("covered carries a bitmap");
+        assert!(!bitmap.is_blank(), "U+{:04X} must be non-blank", ch as u32);
+    }
+    // The unknown scalar stays tofu even dynamically (no face covers it).
+    let unknown = raster
+        .resolve(RasterKey::new('\u{10FFFF}', primary, POINT_SIZE).unwrap())
+        .expect("unknown resolution must not error");
+    assert!(!unknown.covered);
+}
+
+#[test]
+fn shape_run_uses_dynamic_for_unchained_script() {
+    // CTX-0961: `shape_run` with a primary-only chain still covers Han
+    // through the dynamic gap fallback (not just the pinned tails).
+    if !live_tests_enabled() {
+        eprintln!("skipped: set {ENABLE_ENV}=1 to run live font tests");
+        return;
+    }
+    let inner = SwashSingle::new().expect("host font stack");
+    let mut raster = FallbackRasterizer::new(inner, Vec::new());
+    raster.load_font(&query()).expect("primary loads");
+    let chain: Vec<FontId> = raster.fonts().to_vec();
+    assert_eq!(chain.len(), 1, "primary-only chain for this probe");
+    let primary = chain[0];
+    let attrs = RunAttrs {
+        features: Vec::new(),
+        point_size: POINT_SIZE,
+    };
+    let clusters = raster
+        .inner_mut()
+        .shape_run("\u{6F22}\u{5B57}", &chain, &attrs)
+        .expect("CJK shapes via dynamic fallback");
+    assert_eq!(clusters.len(), 2);
+    for cluster in &clusters {
+        assert!(!cluster.uncovered, "CJK cluster must be covered");
+        assert_ne!(cluster.face, primary, "CJK must come from a dynamic face");
+        assert_eq!(cluster.cells.1, 2, "CJK clusters stay double-width");
     }
 }

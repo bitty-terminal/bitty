@@ -360,6 +360,23 @@ pub trait GlyphRasterizer {
         let _ = (font, point_size);
         Ok(None)
     }
+
+    /// On-demand fallback face for `c` beyond the pinned chain (CTX-0961).
+    ///
+    /// The [`FallbackRasterizer`](crate::fallback::FallbackRasterizer) walks
+    /// the pinned [`FONT_FALLBACK_CHAIN`](bitty_config::types::FONT_FALLBACK_CHAIN)
+    /// first; when every pinned face misses, it calls this for a dynamic
+    /// system-wide search (the shaped stack's answer to crossfont's
+    /// per-glyph fontconfig fallback and DirectWrite/CoreText system
+    /// fallback). The default returns `None` (pinned-only) so existing
+    /// implementors keep compiling; [`SwashSingle`](crate::shaped::SwashSingle)
+    /// overrides with a bounded, cached `fontdb` scan. Best-effort and
+    /// infallible: `None` means "no dynamic face" (the caller paints tofu),
+    /// never an error — including for non-finite sizes or an exhausted
+    /// face bound.
+    fn dynamic_face_for(&mut self, _c: char, _point_size: f32) -> Option<FontId> {
+        None
+    }
 }
 
 #[cfg(test)]

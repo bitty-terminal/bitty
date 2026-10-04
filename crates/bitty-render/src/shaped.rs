@@ -81,6 +81,17 @@ pub const MAX_RUN_CACHE_ENTRIES: usize = 512;
 /// with the same negative-blank caching.
 pub const MAX_SHAPED_GLYPH_CACHE_ENTRIES: usize = 2048;
 
+/// Maximum distinct dynamic-fallback faces loaded per session (CTX-0961).
+///
+/// The pinned chain covers the common scripts (Latin, CJK, symbols, emoji);
+/// dynamic fallback (`dynamic_face_for`) loads system faces on demand for
+/// everything beyond it (rare scripts, unusual CJK variants when the pinned
+/// CJK tail is missing). Sixteen leaves wide headroom for mixed-script rows
+/// while keeping a pathological scan loop from approaching
+/// [`MAX_LOADED_FACES`]; total faces (pinned + dynamic) stay under that
+/// bound regardless.
+pub const MAX_DYNAMIC_FALLBACK_FACES: usize = 16;
+
 /// CJK advance alignment epsilon in pixels (design 2.3).
 ///
 /// A wide scalar is its own cluster; its shaped advance must reconcile
@@ -169,6 +180,12 @@ pub struct SwashSingle {
     /// The [`GlyphRasterizer::load_font`](crate::glyph::GlyphRasterizer::load_font)
     /// contract allows returning the same handle for a repeated query.
     by_db_id: HashMap<fontdb::ID, FontId>,
+    /// Per-scalar dynamic-fallback outcome cache (CTX-0961): `Some(face)`
+    /// when a system face beyond the pinned chain covers the scalar,
+    /// `None` when no system face does (cacheable tofu). Populated on
+    /// demand by [`dynamic_face_for`](GlyphRasterizer::dynamic_face_for);
+    /// hits never rescan.
+    dynamic_cache: HashMap<char, Option<FontId>>,
     scale_ctx: swash::scale::ScaleContext,
     next_font_id: u64,
     /// Retained per-face shape plans (Phase B, design 5).
@@ -197,6 +214,7 @@ impl std::fmt::Debug for SwashSingle {
             .field("system_faces", &self.db.len())
             .field("loaded_faces", &self.faces.len())
             .field("cached_db_ids", &self.by_db_id.len())
+            .field("dynamic_cached_scalars", &self.dynamic_cache.len())
             .field("next_font_id", &self.next_font_id)
             .field("shape_plans", &self.shape_plans.len())
             .field("run_cache", &self.run_cache.len())
@@ -225,6 +243,7 @@ impl SwashSingle {
             db,
             faces: HashMap::new(),
             by_db_id: HashMap::new(),
+            dynamic_cache: HashMap::new(),
             scale_ctx: swash::scale::ScaleContext::new(),
             next_font_id: 0,
             shape_plans: HashMap::new(),
@@ -500,6 +519,83 @@ impl SwashSingle {
     /// authoritative and the frame never errors.
     pub fn note_misaligned(&mut self) {
         self.shaping_misaligned = self.shaping_misaligned.saturating_add(1);
+    }
+
+    /// Number of distinct dynamic-fallback faces loaded so far.
+    #[must_use]
+    pub fn dynamic_face_count(&self) -> usize {
+        self.dynamic_cache.values().filter(|v| v.is_some()).count()
+    }
+
+    /// Scans the system database for a face covering `c` (CTX-0961).
+    ///
+    /// Called after the pinned chain misses (see
+    /// [`GlyphRasterizer::dynamic_face_for`]): returns the first
+    /// drawable system face in deterministic order (family, post-script
+    /// name, face index), loading its bytes under [`MAX_FACE_BYTES`].
+    /// Already-loaded faces are skipped (the pinned walk missed them, so
+    /// rescanning would be pure waste). Results — hits and tofu misses —
+    /// are cached per scalar, so each distinct scalar scans at most once
+    /// per session. At most [`MAX_DYNAMIC_FALLBACK_FACES`] distinct faces
+    /// load dynamically and total faces stay under [`MAX_LOADED_FACES`];
+    /// beyond either bound this returns the cached outcome or `None`
+    /// (fail-closed to tofu, never an error).
+    fn scan_dynamic_face(&mut self, c: char, point_size: f32) -> Option<FontId> {
+        if self.dynamic_face_count() >= MAX_DYNAMIC_FALLBACK_FACES
+            || self.faces.len() >= MAX_LOADED_FACES
+        {
+            return None;
+        }
+        // Deterministic candidate order: family, post-script name, index.
+        // `db` is process-shared, so collecting IDs first keeps the later
+        // mutable loads borrow-clean.
+        let mut candidates: Vec<(String, String, u32, fontdb::ID)> = Vec::new();
+        for face in self.db.faces() {
+            if self.by_db_id.contains_key(&face.id) {
+                continue;
+            }
+            let family = face
+                .families
+                .first()
+                .map(|(name, _)| name.clone())
+                .unwrap_or_default();
+            candidates.push((family, face.post_script_name.clone(), face.index, face.id));
+        }
+        candidates.sort();
+        let px = Self::px(point_size);
+        for (_, _, _, id) in candidates {
+            if self.faces.len() >= MAX_LOADED_FACES
+                || self.dynamic_face_count() >= MAX_DYNAMIC_FALLBACK_FACES
+            {
+                break;
+            }
+            let (data, face_index) = match self.load_bytes(id) {
+                Ok(pair) => pair,
+                Err(_) => continue,
+            };
+            let stored = StoredFace { data, face_index };
+            let font_ref = match Self::font_ref(&stored) {
+                Ok(font) => font,
+                Err(_) => continue,
+            };
+            let glyph_id: u16 = swash::Charmap::from_font(&font_ref).map(c);
+            if glyph_id == 0 {
+                continue;
+            }
+            let mut scaler = self.scale_ctx.builder(font_ref).size(px).hint(true).build();
+            if Self::probe_source(&mut scaler, glyph_id).is_none() {
+                continue;
+            }
+            // Drawable coverage: retain under the session bounds.
+            if Self::font_ref(&stored).is_err() {
+                continue;
+            }
+            let font = FontId::next(&mut self.next_font_id);
+            self.faces.insert(font, stored);
+            self.by_db_id.insert(id, font);
+            return Some(font);
+        }
+        None
     }
 
     /// Rasterizes one shaped glyph by id (ligature spans, CJK tails).
@@ -846,6 +942,18 @@ impl GlyphRasterizer for SwashSingle {
         // with per-OS evidence (macOS/Windows crossfont backends did report
         // usable metrics, so this is a known Phase C verification point).
         Ok(None)
+    }
+
+    fn dynamic_face_for(&mut self, c: char, point_size: f32) -> Option<FontId> {
+        if !(point_size.is_finite() && point_size > 0.0) {
+            return None;
+        }
+        if let Some(cached) = self.dynamic_cache.get(&c) {
+            return *cached;
+        }
+        let found = self.scan_dynamic_face(c, point_size);
+        self.dynamic_cache.insert(c, found);
+        found
     }
 }
 
@@ -1202,6 +1310,7 @@ impl SwashSingle {
             // Outer-run column where the gap starts (gap clusters are
             // contiguous, so the first uncovered cluster names it).
             let col_base = clusters[index].cells.0;
+            let mut covered = false;
             for tail in tails {
                 let tail_face = self.stored(*tail)?.clone();
                 let tail_input = ShapeInput {
@@ -1219,7 +1328,42 @@ impl SwashSingle {
                     let inserted = reshaped.len();
                     clusters.splice(index..end, reshaped);
                     end = index + inserted;
+                    covered = true;
                     break;
+                }
+            }
+            // Dynamic fallback beyond the pinned chain (CTX-0961): the
+            // first gap scalar names a system face; a fully-covering
+            // reshape wins the same way a tail does. Gaps with mixed
+            // scripts may stay partially uncovered (tofu) — the pinned
+            // CJK tail keeps the common Han path off this slower scan.
+            if !covered {
+                if let Some(first) = gap.chars().next() {
+                    // Trait-qualified: `shape_run_uncached` lives in the
+                    // inherent impl, so the `GlyphRasterizer` override
+                    // needs its full path (also caches hit/miss per
+                    // scalar, so repeated gaps never rescan).
+                    if let Some(dynamic) =
+                        <Self as GlyphRasterizer>::dynamic_face_for(self, first, attrs.point_size)
+                    {
+                        let dynamic_face = self.stored(dynamic)?.clone();
+                        let dynamic_input = ShapeInput {
+                            face: &dynamic_face,
+                            id: dynamic,
+                            text: gap,
+                            base_offset: byte_start,
+                            col_base,
+                            px,
+                            features: &features,
+                            validated: &attrs.features,
+                        };
+                        let reshaped = self.shape_with(dynamic_input)?;
+                        if reshaped.iter().all(|c| !c.uncovered) {
+                            let inserted = reshaped.len();
+                            clusters.splice(index..end, reshaped);
+                            end = index + inserted;
+                        }
+                    }
                 }
             }
             index = end;

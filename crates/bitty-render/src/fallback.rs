@@ -192,19 +192,27 @@ impl<R: GlyphRasterizer> FallbackRasterizer<R> {
         self.point_size
     }
 
-    /// Resolves `key` with coverage reporting (CTX-0368).
+    /// Resolves `key` with coverage reporting (CTX-0368, CTX-0961).
     ///
     /// Walks the requested face first (normally the primary) and then every
     /// loaded chain face in load order, deduplicated. The first face that
     /// yields a bitmap wins and is reported with `covered = true`. When every
-    /// face reports a missing glyph (`Ok(None)`), the result is
-    /// `covered = false` with no bitmap; the caller paints tofu. Engine
-    /// errors are skipped during the walk; a walk that produced only errors
-    /// returns the last one so failures stay observable.
+    /// pinned face reports a missing glyph (`Ok(None)`), the inner
+    /// rasterizer's dynamic fallback
+    /// ([`GlyphRasterizer::dynamic_face_for`]) gets one chance: the shaped
+    /// stack scans the system database beyond the pinned chain (the
+    /// crossfont backend keeps its own internal fontconfig/DirectWrite
+    /// fallback and answers `None` here, preserving its behavior exactly).
+    /// When dynamic also misses, the result is `covered = false` with no
+    /// bitmap; the caller paints tofu. Engine errors are skipped during the
+    /// walk; a walk that produced only errors returns the last one so
+    /// failures stay observable.
     ///
-    /// Deterministic: the order is fixed by `load_font` and the result is a
+    /// Deterministic: the pinned order is fixed by `load_font`, the dynamic
+    /// order is fixed by family/post-script/index sort, and the result is a
     /// pure function of face coverage. Bounded: at most `1 + fonts().len()`
-    /// upstream calls per resolution.
+    /// pinned calls plus one dynamic face plus one dynamic rasterize per
+    /// resolution; the dynamic outcome is cached per scalar upstream.
     ///
     /// # Errors
     ///
@@ -240,6 +248,27 @@ impl<R: GlyphRasterizer> FallbackRasterizer<R> {
                 Err(err) => {
                     last_err = Some(err);
                     continue;
+                }
+            }
+        }
+        // Pinned chain missed: one dynamic chance beyond it (CTX-0961).
+        // Pinned errors stay observable only when dynamic also misses;
+        // a dynamic hit wins over a pinned error the same way a pinned
+        // tail hit would (first drawable bitmap wins).
+        if let Some(dynamic) = self.inner.dynamic_face_for(key.character, key.point_size) {
+            let attempt = RasterKey::new(key.character, dynamic, key.point_size)
+                .map_err(|_| RenderError::UnknownFontHandle)?;
+            match self.inner.rasterize(attempt) {
+                Ok(Some(bitmap)) => {
+                    return Ok(ResolvedGlyph {
+                        font: dynamic,
+                        covered: true,
+                        bitmap: Some(bitmap),
+                    });
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    last_err = Some(err);
                 }
             }
         }

@@ -314,9 +314,10 @@ impl Runtime {
     /// diff — no panel capability is involved.
     ///
     /// When the parked leaf owns the primary shell, ownership moves to the
-    /// surviving focus (a parked leaf paints nothing) and is recorded in
-    /// `scratchpad_primary_owner` so [`Self::scratchpad_show`] can hand it
-    /// back (CodeRabbit #1671).
+    /// surviving focus (a parked leaf paints nothing) and the `(parked,
+    /// handoff)` pair is recorded in `scratchpad_primary_owner` so
+    /// [`Self::scratchpad_show`] can hand it back only while the handoff
+    /// still holds it (CodeRabbit #1671 follow-up).
     ///
     /// Fail-closed with state untouched: occupied slot, unknown id, a
     /// rejected mode stamp, or hiding the live layout's last leaf (an empty
@@ -328,17 +329,20 @@ impl Runtime {
         self.scratchpad
             .hide(&mut self.layout, id)
             .map_err(|error| error.to_string())?;
-        self.scratchpad_primary_owner = (self.primary_view == Some(id)).then_some(id);
+        let restore_primary = self.primary_view == Some(id);
         self.after_scratchpad_move(Some(id));
+        self.scratchpad_primary_owner = restore_primary.then_some((id, self.primary_view));
         Ok(())
     }
 
     /// Restore the parked leaf beside its anchor and focus it (CTX-0954).
     ///
     /// When the parked leaf owned the primary shell at hide time, ownership
-    /// returns to it before the geometry sync, so it paints the primary grid
-    /// and routes input to it again instead of rendering erased and
-    /// buffering headless (CodeRabbit #1671).
+    /// returns to it before the geometry sync — but only while `primary_view`
+    /// still matches the recorded handoff recipient (a workspace close may
+    /// have re-homed it elsewhere since; stealing it back would leave the new
+    /// owner erased and its input buffered). Otherwise the restored leaf
+    /// stays session-less (CodeRabbit #1671 follow-up).
     ///
     /// Returns the restored leaf id. Fail-closed with state untouched when
     /// nothing is parked or the mode gate rejects the restore.
@@ -348,7 +352,13 @@ impl Runtime {
             .show(&mut self.layout)
             .map_err(|error| error.to_string())?;
         self.focus = Focus::with_focus(id);
-        if self.scratchpad_primary_owner == Some(id) {
+        if self
+            .scratchpad_primary_owner
+            .as_ref()
+            .is_some_and(|(owner, handoff)| {
+                *owner == id && self.primary_view.as_ref() == handoff.as_ref()
+            })
+        {
             self.primary_view = Some(id);
         }
         self.scratchpad_primary_owner = None;
@@ -2867,5 +2877,50 @@ mod tests {
             "owner paints the primary grid"
         );
         assert!(!leaf_row_has_ink(&rt, other), "non-owner tile stays erased");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn scratchpad_show_does_not_steal_rehomed_primary_ownership() {
+        // CodeRabbit #1671 follow-up: hiding the owner hands ownership to the
+        // survivor, but closing the survivor's workspace re-homes it to a new
+        // leaf. Showing the parked leaf must not steal it back: the restored
+        // leaf stays session-less, typing buffers, and only live grids paint.
+        require_pty!();
+        let (mut rt, owner, _survivor) = primary_attached_pair();
+        rt.workspace_new().expect("second workspace");
+        assert!(rt.workspace_switch(0));
+        assert_eq!(rt.focused_view(), Some(owner));
+        rt.scratchpad_hide(owner).expect("hide owner");
+        // Close the survivor's (active) workspace: ownership re-homes to the
+        // remaining workspace's focused leaf.
+        assert!(matches!(
+            rt.workspace_close_request(),
+            WsCloseRequest::Closed { .. }
+        ));
+        let new_owner = rt.focused_view().expect("new focus");
+        assert_ne!(new_owner, owner);
+        assert_eq!(rt.primary_view(), Some(new_owner));
+        // Show the parked leaf: focus returns, ownership must not.
+        let restored = rt.scratchpad_show().expect("show");
+        assert_eq!(restored, owner);
+        assert_eq!(rt.focused_view(), Some(owner));
+        assert_eq!(
+            rt.primary_view(),
+            Some(new_owner),
+            "show must not steal re-homed ownership"
+        );
+        assert!(!rt.is_primary_view(&owner));
+        let buffered = rt.pending_input_len();
+        assert!(!rt.push_input_bytes(b"x"), "nobody owns the input");
+        assert_eq!(rt.pending_input_len(), buffered + 1);
+        // Paint: the parked leaf stays erased (it owns no grid); the new
+        // owner's own session grid carries no primary marker either.
+        rt.tick().expect("headless tick presents");
+        assert!(!leaf_row_has_ink(&rt, owner), "parked leaf stays erased");
+        assert!(
+            !leaf_row_has_ink(&rt, new_owner),
+            "no grid is duplicated onto the new owner"
+        );
     }
 }

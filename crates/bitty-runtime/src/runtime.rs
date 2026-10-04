@@ -521,14 +521,16 @@ pub struct Runtime {
     /// presence on every row, under the existing `workspace.read` grant), so
     /// the bar renders its indicator without any panel capability.
     scratchpad: ScratchpadSlot,
-    /// Primary owner at park time, if the parked leaf owned it (CTX-0954,
-    /// CodeRabbit #1671).
+    /// Parked primary owner and the post-hide handoff owner (CTX-0954,
+    /// CodeRabbit #1671 follow-up).
     ///
-    /// Set by [`Runtime::scratchpad_hide`] when the parked leaf is the
-    /// primary owner; consumed by [`Runtime::scratchpad_show`] to hand
-    /// ownership back to the returning leaf. `None` while the slot is empty
-    /// or the parked leaf never owned the shell.
-    scratchpad_primary_owner: Option<ViewId>,
+    /// Set by [`Runtime::scratchpad_hide`] when the parked leaf owns the
+    /// primary shell: `(parked leaf, primary_view after the handoff)`.
+    /// [`Runtime::scratchpad_show`] restores ownership only while
+    /// `primary_view` still matches the recorded handoff (including `None`)
+    /// — a workspace close may have re-homed it elsewhere since. `None`
+    /// while the slot is empty or the parked leaf never owned the shell.
+    scratchpad_primary_owner: Option<(ViewId, Option<ViewId>)>,
     /// Monotonic high-water mark of every [`ViewId`] ever installed in a
     /// layout (CTX-0536, issue #923).
     ///

@@ -69,7 +69,7 @@ Results on `03bfda5c`:
   `KvCommitBackend` traits). Core-never-imports-extension holds.
 - Workspace membership: 16 crates; `bitty-compat-lab` / `bitty-perf` absent.
 
-All eight new tests pin these properties and pass.
+All nine new tests pin these properties and pass.
 
 ## 3. Regression evidence (full workspace gate)
 
@@ -175,7 +175,7 @@ on suite PR merges (recorded in `validation-pins.env` header).
 ## 8. Definition-of-done checklist
 
 - [x] Safe startup proven (policy + binary trace + link graph)
-- [x] Production-edge graph proven (cargo tree + 8 automatable tests)
+- [x] Production-edge graph proven (cargo tree + 9 automatable tests)
 - [x] Full `just test` green with pass counts (§3)
 - [x] `just ci-local` Quality gates green (repo-mandated pre-push)
 - [x] Docs sync satisfied with evidence: stale pages fixed and merged

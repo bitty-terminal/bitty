@@ -1180,6 +1180,46 @@ impl TerminalApp {
         self.runtime.set_plugin_overlay(surface);
     }
 
+    /// Dispatches one Core-routed plugin band click (CTX-0946 C1).
+    ///
+    /// The click carries the band owner's declared command verb plus its
+    /// declared args as one named table (`run({id = 3})`). Fail-closed with
+    /// a loud diagnostic when the plugin id is invalid, the runtime is
+    /// gone, or the dispatch itself fails (unregistered verb, faulting
+    /// handler): the click is dropped and terminal state is untouched.
+    fn dispatch_band_click(&mut self, click: bitty_runtime::BandClickRequest) {
+        let id = match bitty_plugin_host::manifest::PluginId::new(&click.plugin_id) {
+            Ok(id) => id,
+            Err(error) => {
+                crate::logging::warn(|| {
+                    format!(
+                        "bitty: band click from '{}' dropped (invalid plugin id: {error})",
+                        click.plugin_id
+                    )
+                });
+                return;
+            }
+        };
+        let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
+            crate::logging::warn(|| {
+                format!(
+                    "bitty: band click '{}:{}' dropped (plugin runtime is gone)",
+                    click.plugin_id, click.command
+                )
+            });
+            return;
+        };
+        let args = bitty_runtime::band_click_args_table(&click.args);
+        if let Err(error) = plugin_runtime.dispatch_command(&id, &click.command, &[args]) {
+            crate::logging::warn(|| {
+                format!(
+                    "bitty: band click '{}:{}' refused ({error})",
+                    click.plugin_id, click.command
+                )
+            });
+        }
+    }
+
     /// Route post-intercept fall-through input into the capture queue
     /// (CTX-0943). Called by [`Self::handle_event`] after
     /// [`Self::intercept_chrome_key`](crate::chrome_keys::ChromeState)
@@ -1687,6 +1727,15 @@ impl AppHandler for TerminalApp {
         // refused and counted inside the runtime.
         if self.runtime.has_pending_hyperlink_activation() {
             self.activate_pending_hyperlink_now();
+        }
+        // CTX-0946 C1: Core-routed plugin band clicks. The runtime owns the
+        // geometry (which band row, which declared command); the application
+        // dispatches each through the normal `PluginRuntime::dispatch_command`
+        // path, where registration and capability gates fail closed as
+        // usual. Dispatch failures are loud (user-paced gestures, never a
+        // hot loop) and never disturb terminal state.
+        for click in self.runtime.drain_band_clicks() {
+            self.dispatch_band_click(click);
         }
         // CTX-0370: a window-close request that did not exit armed a bounded
         // confirmation (or was superseded by one); report it loudly so the

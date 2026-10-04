@@ -25,6 +25,7 @@
 //! a variant for such a sequence requires an RFC revision first.
 
 use crate::bounded::{BoundedBytes, BoundedString};
+use crate::kitty_apc::KittyControlKeys;
 
 /// One printed cell candidate: the leading Unicode scalar of a grapheme
 /// cluster as delivered by the UTF-8 decoder.
@@ -867,8 +868,16 @@ pub enum TerminalAction {
     /// `kitty_transmit`/`kitty_display_image`, preserving transmit-only
     /// (`a=t` stores without painting) and unknown-action
     /// (stored-not-painted) semantics from CTX-0248.
+    ///
+    /// The advanced subset (CTX-0950) rides in `control`: placement
+    /// (`a=p`, ids, rects, z-index, virtual/relative flags), animation
+    /// (`a=f`/`a=a`/`a=c` frame keys), deletion (`a=d` selector),
+    /// suppression (`q=`), and local mediums (`t=f`/`t=t`/`t=s`, for which
+    /// `payload` carries the validated path/shm-name bytes and `S=`/`O`
+    /// bound the downstream read).
     KittyGraphics {
-        /// Wire `f=` format value (`100` PNG, `24` RGB, `32` RGBA).
+        /// Wire `f=` format value (`100` PNG, `24` RGB, `32` RGBA;
+        /// `0` for control-only actions, which omit it).
         format_f: u32,
         /// Wire `s=` width for raw formats (`None` when absent; ignored for PNG).
         width_s: Option<u32>,
@@ -884,6 +893,8 @@ pub enum TerminalAction {
         cursor_movement_c: u8,
         /// Base64-decoded payload bytes (assembled across `m=` chunks).
         payload: Box<[u8]>,
+        /// Advanced control keys (CTX-0950; default = direct transmission).
+        control: KittyControlKeys,
     },
 
     // Unknown escape families

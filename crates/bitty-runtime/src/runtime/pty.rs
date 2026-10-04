@@ -907,6 +907,9 @@ impl Runtime {
                 rows_r,
                 cursor_movement_c,
                 payload,
+                // CTX-0950 advanced keys (placement/animation/medium):
+                // not yet consumed here; state owns anchors/lifetime.
+                control: _,
             } = action
             {
                 if let Err(err) = self.kitty_display_image_owned(

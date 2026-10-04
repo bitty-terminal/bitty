@@ -1171,14 +1171,17 @@ impl Runtime {
             self.remove_workspace(index);
             return Some(WsCloseRequest::Closed { killed });
         }
+        let seq = self
+            .workspaces
+            .get(index)
+            .map_or(index as u64 + 1, |s| s.seq);
         let name = self
             .workspaces
             .get(index)
             .map(|s| s.name.clone())
             .unwrap_or_default();
         let summary = format!(
-            "Close workspace {}:{} with {live} live shells? (repeat Alt+W=confirm kill Esc=cancel)",
-            index + 1,
+            "Close workspace {seq}:{} with {live} live shells? (repeat Alt+W=confirm kill Esc=cancel)",
             truncate_ws_name(&name),
         );
         self.pending_ws_close = Some(PendingWsClose { index, name, live });
@@ -1544,9 +1547,12 @@ impl Runtime {
     #[must_use]
     pub fn pending_ws_close_summary(&self) -> Option<String> {
         let pending = self.pending_ws_close.as_ref()?;
+        let seq = self
+            .workspaces
+            .get(pending.index)
+            .map_or(pending.index as u64 + 1, |s| s.seq);
         Some(format!(
-            "Close workspace {}:{} with {} live shells? (repeat Alt+W=confirm kill Esc=cancel)",
-            pending.index + 1,
+            "Close workspace {seq}:{} with {} live shells? (repeat Alt+W=confirm kill Esc=cancel)",
             truncate_ws_name(&pending.name),
             pending.live,
         ))

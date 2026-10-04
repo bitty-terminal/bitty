@@ -756,10 +756,17 @@ impl KittyApcAssembler {
                 .finish(&mut pending.payload, available)
                 .and_then(|()| {
                     if pending.compressed {
+                        let out_cap = raw_claim_bytes(
+                            pending.format_f,
+                            pending.width_s,
+                            pending.height_v,
+                            self.decode_cap,
+                        )?
+                        .unwrap_or(self.decode_cap);
                         let decompressed =
                             match miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(
                                 &pending.payload,
-                                self.decode_cap,
+                                out_cap,
                             ) {
                                 Ok(mut data) => {
                                     data.shrink_to_fit();

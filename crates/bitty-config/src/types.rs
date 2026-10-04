@@ -3024,7 +3024,7 @@ pub struct EffectiveConfig {
     pub views: Vec<ViewOverride>,
     /// Scrollbar config (CTX-0181 overlay scrollbar; default auto, CTX-0362).
     pub scrollbar: ScrollbarConfig,
-    /// Mouse config (CTX-0260 focus-follows-mouse; default off).
+    /// Mouse config (CTX-0260 focus-follows-mouse; default on).
     pub mouse: MouseConfig,
     /// Appearance config (theme defaults to `None` if unset).
     pub appearance: AppearanceConfig,

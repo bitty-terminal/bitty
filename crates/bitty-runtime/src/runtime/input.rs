@@ -830,12 +830,11 @@ impl Runtime {
         }
         // CTX-0166: any real non-modifier key press clears the selection
         // highlight (see owned path). Additive only; range logic untouched.
-        if event.state == PressState::Pressed
-            && !event.is_synthetic
-            && !is_modifier
-            && self.selection_state.is_some()
-        {
-            self.clear_selection();
+        if event.state == PressState::Pressed && !event.is_synthetic && !is_modifier {
+            if self.selection_state.is_some() {
+                self.clear_selection();
+            }
+            self.click_tracker.reset();
         }
         // CTX-0186/CTX-0475: scoped Esc cancel (see owned path).
         if self.cancel_pending_on_escape(event) {
@@ -980,7 +979,7 @@ impl Runtime {
                 // primary attached) has no shell of its own; typing there
                 // must never reach another view's shell (previous workspace
                 // primary included), so it buffers headless instead.
-                if Some(focused) != self.primary_view && !self.pane_sessions.is_empty() {
+                if Some(focused) != self.primary_view {
                     self.buffer_input_headless(bytes);
                     return false;
                 }

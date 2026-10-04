@@ -628,6 +628,9 @@ impl CliOverrides {
                     size: s.unwrap_or(base.font.size),
                     line_height: base.font.line_height,
                     letter_spacing: base.font.letter_spacing,
+                    // No `--font-fallback` CLI flag: inherit the base list
+                    // like the other non-overridden siblings.
+                    fallback: base.font.fallback.clone(),
                 };
                 cfg.validate()?;
                 Some(cfg)
@@ -1279,6 +1282,10 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
                     size: size as f32,
                     line_height,
                     letter_spacing,
+                    // No `fallback` key parsed yet (CTX-0949 follow-up:
+                    // `font.fallback` Lua table wiring in bitty-lua +
+                    // file.rs); the typed default keeps the layer total.
+                    fallback: Vec::new(),
                 };
                 // Fail closed on out-of-range spacing (same as typed validation).
                 cfg.validate().map_err(|e| {

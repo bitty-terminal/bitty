@@ -123,6 +123,19 @@ impl<R: GlyphRasterizer> FallbackRasterizer<R> {
         Self::new(inner, tails)
     }
 
+    /// Wraps `inner` with the user-ordered tier from `config` ahead of the
+    /// platform default tail (CTX-0949, issue #1667): the per-glyph walk
+    /// tries the primary, then each user fallback in order, then the
+    /// platform tails — user order wins, deduplicated, primary first. An
+    /// empty user list behaves exactly like [`with_default_chain`](Self::with_default_chain).
+    ///
+    /// This is the render-side construction site for
+    /// [`FontConfig::fallback`]: production wiring passes the effective
+    /// `FontConfig` here instead of [`with_default_chain`](Self::with_default_chain).
+    pub fn with_config(inner: R, config: &FontConfig) -> Self {
+        Self::new(inner, config.fallback_tails())
+    }
+
     /// Builds the configured-first chain for `family` (primary first, then
     /// the documented tails deduplicated) — the list form of
     /// [`FontConfig::fallback_chain`] for callers that need names, not faces.
@@ -130,6 +143,19 @@ impl<R: GlyphRasterizer> FallbackRasterizer<R> {
     pub fn chain_for(family: &str) -> Vec<String> {
         FontConfig {
             family: family.to_string(),
+            ..Default::default()
+        }
+        .fallback_chain()
+    }
+
+    /// Builds the user-tier-first chain for `family` with explicit user
+    /// fallbacks — the list form of [`FontConfig::fallback_chain`] with a
+    /// non-empty user tier, for callers that need names, not faces.
+    #[must_use]
+    pub fn chain_for_user(family: &str, user_fallbacks: &[String]) -> Vec<String> {
+        FontConfig {
+            family: family.to_string(),
+            fallback: user_fallbacks.to_vec(),
             ..Default::default()
         }
         .fallback_chain()
@@ -432,6 +458,173 @@ mod tests {
         assert!(chain.iter().any(|f| f == SYMBOLS_FALLBACK_FAMILY));
         let chain = FallbackRasterizer::<Fake>::chain_for("monospace");
         assert_eq!(chain.iter().filter(|f| *f == "monospace").count(), 1);
+    }
+
+    #[test]
+    fn empty_user_config_matches_default_chain() {
+        // CTX-0949: no user tier keeps `with_default_chain` behavior exactly.
+        let config = FontConfig::default();
+        let via_config = FallbackRasterizer::with_config(Fake::default(), &config);
+        let via_default = FallbackRasterizer::with_default_chain(Fake::default());
+        assert_eq!(
+            via_config.fallback_families(),
+            via_default.fallback_families()
+        );
+        assert_eq!(
+            FallbackRasterizer::<Fake>::chain_for("My Mono"),
+            FallbackRasterizer::<Fake>::chain_for_user("My Mono", &[]),
+        );
+    }
+
+    #[test]
+    fn user_tier_walks_before_platform_tail() {
+        // CTX-0949: the user tier is attempted in order ahead of the
+        // platform tail. Only the primary misses here, so the first user
+        // face wins after exactly two upstream calls.
+        let config = FontConfig {
+            family: "JetBrains Mono".into(),
+            fallback: vec![
+                "Symbols Nerd Font".into(),
+                "Noto Color Emoji".into(),
+                "Noto Sans CJK SC".into(),
+            ],
+            ..Default::default()
+        };
+        let mut inner = Fake::default();
+        inner.blank.push(("JetBrains Mono".to_string(), '\u{E600}'));
+        let mut wrapped = FallbackRasterizer::with_config(inner, &config);
+        assert_eq!(
+            wrapped.fallback_families()[..3],
+            [
+                "Symbols Nerd Font".to_string(),
+                "Noto Color Emoji".to_string(),
+                "Noto Sans CJK SC".to_string(),
+            ]
+        );
+        let primary = wrapped.load_font(&query("JetBrains Mono", 12.0)).unwrap();
+        let key = RasterKey::new('\u{E600}', primary, 12.0).unwrap();
+        let resolved = wrapped.resolve(key).expect("user tier covers nerd PUA");
+        assert!(resolved.covered);
+        assert_eq!(wrapped.inner.family_of(resolved.font), "Symbols Nerd Font");
+        assert_eq!(wrapped.inner.rasterize_calls.get(), 2);
+    }
+
+    #[test]
+    fn user_order_wins_and_dupes_load_once() {
+        // First covering user face wins; a user entry duplicating the
+        // primary (case-insensitive) or another user entry loads once.
+        let config = FontConfig {
+            family: "JetBrains Mono".into(),
+            fallback: vec![
+                "Symbols Nerd Font".into(),
+                "symbols nerd font".into(),
+                "  JETBRAINS MONO ".into(),
+                "Noto Color Emoji".into(),
+            ],
+            ..Default::default()
+        };
+        let wrapped = FallbackRasterizer::with_config(Fake::default(), &config);
+        let nerd_count = wrapped
+            .fallback_families()
+            .iter()
+            .filter(|f| f.to_lowercase() == "symbols nerd font")
+            .count();
+        assert_eq!(nerd_count, 1, "duplicate user entries dedupe");
+        assert!(
+            !wrapped
+                .fallback_families()
+                .iter()
+                .any(|f| f.to_lowercase() == "jetbrains mono"),
+            "primary must not recur in tails"
+        );
+        let mut wrapped = wrapped;
+        let primary = wrapped.load_font(&query("JetBrains Mono", 12.0)).unwrap();
+        // Primary + Symbols Nerd Font + Noto Color Emoji + platform tails
+        // (minus the tails duplicating the primary on this platform).
+        let expected_tails = config.fallback_tails();
+        assert_eq!(wrapped.fallback_families(), expected_tails.as_slice());
+        assert_eq!(wrapped.fonts().len(), 1 + expected_tails.len());
+        // The primary misses the gear; both remaining user faces cover, so
+        // the first in user order wins (never the platform tail).
+        wrapped
+            .inner
+            .blank
+            .push(("JetBrains Mono".to_string(), '\u{2699}'));
+        let key = RasterKey::new('\u{2699}', primary, 12.0).unwrap();
+        let resolved = wrapped.resolve(key).expect("user tier covers gear");
+        assert!(resolved.covered);
+        assert_eq!(wrapped.inner.family_of(resolved.font), "Symbols Nerd Font");
+    }
+
+    #[test]
+    fn acceptance_tiers_cover_their_codepoints() {
+        // CTX-0949 acceptance shape (issue #1667): JetBrains Mono primary
+        // plus Symbols Nerd Font, Noto Color Emoji, and Noto Sans CJK tiers
+        // — each tier renders its own codepoints.
+        let config = FontConfig {
+            family: "JetBrains Mono".into(),
+            fallback: vec![
+                "Symbols Nerd Font".into(),
+                "Noto Color Emoji".into(),
+                "Noto Sans CJK SC".into(),
+            ],
+            ..Default::default()
+        };
+        let mut inner = Fake::default();
+        // Coverage matrix: each face misses everything except its tier.
+        let tiers: &[(char, &str)] = &[
+            ('A', "JetBrains Mono"),           // single-width Latin
+            ('\u{E600}', "Symbols Nerd Font"), // single-width nerd PUA
+            ('\u{2699}', "Noto Color Emoji"),  // double-width emoji
+            ('\u{6F22}', "Noto Sans CJK SC"),  // double-width CJK
+        ];
+        let faces = [
+            "JetBrains Mono",
+            "Symbols Nerd Font",
+            "Noto Color Emoji",
+            "Noto Sans CJK SC",
+        ];
+        for (ch, owner) in tiers {
+            for face in faces {
+                if face != *owner {
+                    inner.blank.push((face.to_string(), *ch));
+                }
+            }
+        }
+        // Platform tails miss the tier probes so the walk must stop in the
+        // user tier (never fall through to a platform face).
+        let platform_probe_tails: Vec<String> = FONT_FALLBACK_CHAIN
+            .iter()
+            .skip(1)
+            .map(|s| (*s).to_string())
+            .collect();
+        for (ch, _) in tiers {
+            for tail in &platform_probe_tails {
+                if !faces.contains(&tail.as_str()) {
+                    inner.blank.push((tail.clone(), *ch));
+                }
+            }
+        }
+        let mut wrapped = FallbackRasterizer::with_config(inner, &config);
+        let primary = wrapped.load_font(&query("JetBrains Mono", 12.0)).unwrap();
+        for (ch, owner) in tiers {
+            let key = RasterKey::new(*ch, primary, 12.0).unwrap();
+            let resolved = wrapped.resolve(key).expect("tier must cover");
+            assert!(resolved.covered, "{owner} must cover U+{:04X}", *ch as u32);
+            assert_eq!(
+                wrapped.inner.family_of(resolved.font),
+                *owner,
+                "U+{:04X} must resolve to {owner}",
+                *ch as u32
+            );
+        }
+        // ASCII still hits the primary with no walk (cell metrics path
+        // untouched: single-width stays single, double-width CJK/emoji keep
+        // their grid-side width — see grid `char_cell_width` tests).
+        let calls_before = wrapped.inner.rasterize_calls.get();
+        let key = RasterKey::new('Z', primary, 12.0).unwrap();
+        assert!(wrapped.rasterize(key).unwrap().is_some());
+        assert_eq!(wrapped.inner.rasterize_calls.get(), calls_before + 1);
     }
 
     #[test]

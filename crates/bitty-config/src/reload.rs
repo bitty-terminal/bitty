@@ -87,6 +87,7 @@ impl std::fmt::Display for ReloadClass {
 /// | `font.size`               | Live               |
 /// | `font.line_height`        | Live               |
 /// | `font.letter_spacing`     | Live               |
+/// | `font.fallback`           | RestartRequired    |
 /// | `window.opacity`          | Live               |
 /// | `window.padding`          | Live               |
 /// | `window.radius_px`        | Live               |
@@ -216,6 +217,13 @@ pub const LIVE_SECTIONS: &[&str] = &[
 
 /// Every RestartRequired-class leaf path.
 pub const RESTART_REQUIRED_FIELDS: &[&str] = &[
+    // CTX-0953 (PX-4571): the fallback list is adopted at startup only.
+    // `set_font_face` reloads through `apply_dpi_scale`, which replays the
+    // chain baked into `FallbackRasterizer` at construction; no live setter
+    // rebuilds that chain, so claiming Live would promise an adoption that
+    // never happens. The startup path (`runtime_config_from_effective`)
+    // carries the effective list into `RuntimeConfig::font_config`.
+    "font.fallback",
     "terminal.scrollback",
     "terminal.shell",
     "terminal.scroll_lines_per_notch",
@@ -333,6 +341,13 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
         "font.letter_spacing",
         format!("{:.3}", old.font.letter_spacing),
         format!("{:.3}", new.font.letter_spacing),
+    );
+    // CTX-0953: list comparison uses the `Debug` form like the other list
+    // leaves (`decoration.background_image_roots`, `keymaps`).
+    push_if_changed(
+        "font.fallback",
+        format!("{:?}", old.font.fallback),
+        format!("{:?}", new.font.fallback),
     );
     push_if_changed(
         "window.opacity",
@@ -912,6 +927,25 @@ mod tests {
     }
 
     #[test]
+    fn diff_font_fallback_is_restart_required() {
+        // CTX-0953 (PX-4571): a fallback-list edit diffs as
+        // RestartRequired (no live setter rebuilds the rasterizer chain)
+        // and `reconcile_live` refuses it; an unchanged list produces no
+        // diff.
+        let old = EffectiveConfig::default();
+        let mut new = old.clone();
+        new.font.fallback = vec!["Noto Sans Symbols 2".into()];
+        let r = diff(&old, &new);
+        assert_eq!(r.overall, ReloadClass::RestartRequired);
+        assert!(r.needs_restart);
+        assert!(r.diffs.iter().any(|d| d.field == "font.fallback"));
+        let mut cur = old.clone();
+        assert!(reconcile_live(&mut cur, &new).is_err());
+        let r = diff(&old, &old);
+        assert!(!r.diffs.iter().any(|d| d.field == "font.fallback"));
+    }
+
+    #[test]
     fn diff_mod_flip_is_live_and_reconciles() {
         // CTX-0236: flipping the mod rebinds the resolved chrome map like
         // an explicit keymap edit, so it is live-reconcilable, not restart.
@@ -1036,6 +1070,14 @@ mod tests {
         assert_eq!(classify_field("font.family"), ReloadClass::Live);
         assert_eq!(classify_field("font.line_height"), ReloadClass::Live);
         assert_eq!(classify_field("font.letter_spacing"), ReloadClass::Live);
+        // CTX-0953 (PX-4571): the fallback list is RestartRequired (no
+        // live setter rebuilds the rasterizer chain); the sibling leaves
+        // stay Live.
+        assert_eq!(
+            classify_field("font.fallback"),
+            ReloadClass::RestartRequired
+        );
+        assert_eq!(classify_field("font"), ReloadClass::Live);
         assert_eq!(
             classify_field("terminal.scrollback"),
             ReloadClass::RestartRequired

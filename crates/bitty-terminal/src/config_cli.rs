@@ -1414,6 +1414,12 @@ pub(crate) fn runtime_config_from_effective_with_warnings(
         // CTX-0297: effective `terminal.scrollback` is carried the same way;
         // terminal creation captures it as the retention cap.
         cfg.scrollback = scrollback;
+        // CTX-0953 (PX-4571): effective `font.fallback` rides the validated
+        // runtime config the same way (already bounded fail-closed by
+        // `bitty-config`; `RuntimeConfig::validate` mirrors the bounds).
+        // Without this the production rasterizer chain always saw the
+        // default empty tier.
+        cfg.font_fallback = effective.font.fallback.clone();
         // CTX-0756 (issue #1359): `terminal.cursor_style` flows file ->
         // effective -> runtime by value (`bitty-runtime` owns no
         // `bitty-config` dependency); the match is total with a fail-closed

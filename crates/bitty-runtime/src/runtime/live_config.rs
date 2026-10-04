@@ -32,10 +32,13 @@ pub const MAX_LIVE_CELL_PX: u32 = 256;
 /// Upper bound on a live-adopted font family name in bytes, equal to the
 /// `bitty-config` `font.family` bound (`MAX_FONT_FAMILY_LEN`).
 ///
-/// `bitty-runtime` deliberately has no normal `bitty-config` dependency, so
-/// the bound is mirrored here and equality is pinned by a cross-crate parity
-/// test in `bitty-terminal` (the crate that depends on both), like the
-/// outline-contrast floors.
+/// Kept as a mirror (rather than naming the `bitty-config` constant
+/// directly) so this live-adopt seam stays decoupled from the config
+/// crate's type surface; equality is pinned by a cross-crate parity test
+/// in `bitty-terminal` (the crate that depends on both), like the
+/// outline-contrast floors. (`bitty-runtime` gained a normal `bitty-config`
+/// dependency in CTX-0953 for `RuntimeConfig::font_fallback` validation,
+/// so the mirror is now convention, not a dependency constraint.)
 pub const MAX_LIVE_FONT_FAMILY_BYTES: usize = 128;
 
 impl Runtime {

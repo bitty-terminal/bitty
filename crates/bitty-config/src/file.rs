@@ -994,6 +994,7 @@ pub fn resolve_effective_with_profiles(
         "font.size",
         "font.line_height",
         "font.letter_spacing",
+        "font.fallback",
         "window.opacity",
         "window.padding",
         "window.radius_px",
@@ -1282,10 +1283,11 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
                     size: size as f32,
                     line_height,
                     letter_spacing,
-                    // No `fallback` key parsed yet (CTX-0949 follow-up:
-                    // `font.fallback` Lua table wiring in bitty-lua +
-                    // file.rs); the typed default keeps the layer total.
-                    fallback: Vec::new(),
+                    // CTX-0953: `font.fallback` arrives as plain Lua data;
+                    // bounds (max entries, trim/non-empty/128 per entry)
+                    // are enforced fail-closed by typed validation below,
+                    // naming `font.fallback[<index>]`.
+                    fallback: f.fallback.unwrap_or_default(),
                 };
                 // Fail closed on out-of-range spacing (same as typed validation).
                 cfg.validate().map_err(|e| {
@@ -2467,6 +2469,36 @@ mod tests {
         let maps = plan.keymaps.unwrap();
         assert_eq!(maps.len(), 1);
         assert_eq!(maps[0].chord, "alt+h");
+    }
+
+    #[test]
+    fn lua_font_fallback_parses_and_validates() {
+        // CTX-0953: `font.fallback` parses in order; absent means empty;
+        // blank or overlong entries fail closed naming `font.fallback[i]`.
+        let plan = parse_lua_config(
+            r#"return { font = { family = "Mono", size = 12.0, fallback = { "Noto Sans Symbols 2", "Noto Color Emoji" } } }"#,
+            &test_source(),
+        )
+        .expect("fallback parses");
+        assert_eq!(
+            plan.font.unwrap().fallback,
+            vec![
+                "Noto Sans Symbols 2".to_string(),
+                "Noto Color Emoji".to_string()
+            ]
+        );
+        let plan = parse_lua_config(
+            r#"return { font = { family = "Mono", size = 12.0 } }"#,
+            &test_source(),
+        )
+        .expect("absent fallback ok");
+        assert!(plan.font.unwrap().fallback.is_empty());
+        let err = parse_lua_config(
+            r#"return { font = { family = "Mono", size = 12.0, fallback = { "  " } } }"#,
+            &test_source(),
+        )
+        .expect_err("blank entry must fail");
+        assert!(err.to_string().contains("font.fallback[0]"), "{err}");
     }
 
     #[test]
@@ -4010,6 +4042,42 @@ mod tests {
                 .conflicts
                 .iter()
                 .any(|c| c.new_source.layer == LayerKind::Cli && c.field != "font.family")
+        );
+    }
+
+    #[test]
+    fn cli_font_override_keeps_fallback_source() {
+        // CTX-0953 CodeRabbit follow-up: the CLI font layer inherits
+        // `base.font.fallback`, so the restore loop must keep the base
+        // source for `font.fallback` or `config check` misreports it as cli.
+        let src = test_source();
+        let plan = parse_lua_config(
+            r#"return {
+                font = { family = "File Mono", size = 12.0, fallback = { "Noto Sans Symbols 2" } },
+            }"#,
+            &src,
+        )
+        .expect("file parses");
+        let cli = CliOverrides {
+            font_family: Some("Cli Mono".to_string()),
+            ..Default::default()
+        };
+        let merged =
+            resolve_effective_full(Some(LayeredPlan::new(src, plan)), None, &cli).expect("merge");
+        assert_eq!(merged.effective.font.family, "Cli Mono");
+        assert_eq!(
+            merged.effective.font.fallback,
+            vec!["Noto Sans Symbols 2".to_string()]
+        );
+        assert_eq!(
+            merged.source_of("font.fallback").unwrap().layer,
+            LayerKind::User
+        );
+        assert!(
+            !merged
+                .conflicts
+                .iter()
+                .any(|c| c.new_source.layer == LayerKind::Cli && c.field == "font.fallback")
         );
     }
 

@@ -65,6 +65,13 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "font.size"
         | "font.line_height"
         | "font.letter_spacing"
+        // CTX-0953: `font.fallback` is scalar-replace (later layer wins
+        // wholesale, no concatenation), matching the sibling font leaves
+        // and the other `Vec<String>` leaf
+        // (`decoration.background_image_roots`). Chrome order arrays use
+        // `ListReplace` but implement the same wholesale replace; the font
+        // section stays uniform on `ScalarReplace`.
+        | "font.fallback"
         | "window.opacity"
         | "window.padding"
         | "window.radius_px"
@@ -540,6 +547,7 @@ const ATTRIBUTED_FIELDS: &[&str] = &[
     "font.size",
     "font.line_height",
     "font.letter_spacing",
+    "font.fallback",
     "font",
     "window.opacity",
     "window.padding",
@@ -776,6 +784,47 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
                         MergeClass::ScalarReplace,
                     );
                 }
+            }
+            // CTX-0953: `font.fallback` merges scalar-replace (documented
+            // choice in `merge_class_for`): a present list replaces the
+            // earlier layer wholesale; layers without a `font` table say
+            // nothing and inherit.
+            let field_fb = "font.fallback";
+            if is_policy {
+                policy_fields.insert(field_fb.to_string(), src.clone());
+                effective.font.fallback.clone_from(&font.fallback);
+                let prev = attribution.get(field_fb).cloned();
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field_fb,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            } else if let Some(policy_src) = policy_fields.get(field_fb) {
+                policy_violations.push(ConfigError::NonOverridable {
+                    field: field_fb.to_string(),
+                    policy_source: policy_src.describe(),
+                    attempted_source: src.describe(),
+                });
+                conflicts.push(MergeConflict {
+                    field: field_fb.to_string(),
+                    previous_source: policy_src.clone(),
+                    new_source: src.clone(),
+                    merge_class: MergeClass::ScalarReplace,
+                });
+            } else {
+                let prev = attribution.get(field_fb).cloned();
+                effective.font.fallback.clone_from(&font.fallback);
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field_fb,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
             }
             attribution.insert("font".to_string(), src.clone());
         }
@@ -2144,11 +2193,14 @@ fn merge_layers_allow_policy_violations(
         let is_policy = src.layer.is_policy();
 
         if let Some(font) = &plan.font {
+            // CTX-0953: `font.fallback` (4) joins the scalar-replace font
+            // leaves; a present list replaces wholesale like its siblings.
             for (field, which) in [
                 ("font.family", 0u8),
                 ("font.size", 1u8),
                 ("font.line_height", 2u8),
                 ("font.letter_spacing", 3u8),
+                ("font.fallback", 4u8),
             ] {
                 if is_policy {
                     policy_fields.insert(field.to_string(), src.clone());
@@ -2156,7 +2208,8 @@ fn merge_layers_allow_policy_violations(
                         0 => effective.font.family.clone_from(&font.family),
                         1 => effective.font.size = font.size,
                         2 => effective.font.line_height = font.line_height,
-                        _ => effective.font.letter_spacing = font.letter_spacing,
+                        3 => effective.font.letter_spacing = font.letter_spacing,
+                        _ => effective.font.fallback.clone_from(&font.fallback),
                     }
                     let prev = attribution.get(field).cloned();
                     record_attribution(
@@ -2186,7 +2239,8 @@ fn merge_layers_allow_policy_violations(
                         0 => effective.font.family.clone_from(&font.family),
                         1 => effective.font.size = font.size,
                         2 => effective.font.line_height = font.line_height,
-                        _ => effective.font.letter_spacing = font.letter_spacing,
+                        3 => effective.font.letter_spacing = font.letter_spacing,
+                        _ => effective.font.fallback.clone_from(&font.fallback),
                     }
                     record_attribution(
                         &mut attribution,
@@ -3499,6 +3553,71 @@ mod tests {
     }
 
     #[test]
+    fn font_fallback_merges_scalar_replace_with_attribution() {
+        // CTX-0953: a present `font.fallback` list replaces the earlier
+        // layer wholesale (no concatenation); a layer without a `font`
+        // table inherits.
+        fn plan_with_fallback(fallback: Vec<String>) -> ConfigPlan {
+            ConfigPlan {
+                font: Some(FontConfig {
+                    family: "Mono".into(),
+                    size: 12.0,
+                    line_height: crate::types::DEFAULT_LINE_HEIGHT,
+                    letter_spacing: crate::types::DEFAULT_LETTER_SPACING,
+                    fallback,
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            }
+        }
+        let lower = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            plan_with_fallback(vec!["Symbols Nerd Font".into()]),
+        );
+        let upper = LayeredPlan::new(
+            ConfigSource::new(LayerKind::Cli, Some("cli")),
+            plan_with_fallback(vec![
+                "Noto Sans Symbols 2".into(),
+                "Noto Color Emoji".into(),
+            ]),
+        );
+        let merged = merge_layers(vec![lower, upper]).expect("merge");
+        assert_eq!(
+            merged.effective.font.fallback,
+            vec![
+                "Noto Sans Symbols 2".to_string(),
+                "Noto Color Emoji".to_string()
+            ]
+        );
+        assert_eq!(
+            merged.source_of("font.fallback").unwrap().layer,
+            LayerKind::Cli
+        );
+        assert!(merged.conflicts.iter().any(|c| c.field == "font.fallback"));
+        // Absent `font` table inherits the lower layer's list.
+        let lower_only = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            plan_with_fallback(vec!["Symbols Nerd Font".into()]),
+        );
+        let silent = LayeredPlan::new(
+            ConfigSource::new(LayerKind::Cli, Some("cli")),
+            ConfigPlan {
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged = merge_layers(vec![lower_only, silent]).expect("merge");
+        assert_eq!(
+            merged.effective.font.fallback,
+            vec!["Symbols Nerd Font".to_string()]
+        );
+        assert_eq!(
+            merged.source_of("font.fallback").unwrap().layer,
+            LayerKind::User
+        );
+    }
+
+    #[test]
     fn mod_key_merges_scalar_replace_with_attribution() {
         // CTX-0236: user layer wins with per-field attribution; absent
         // keeps the lower-precedence value (Alt default).
@@ -4051,6 +4170,11 @@ mod tests {
         );
         assert_eq!(
             merge_class_for("font.letter_spacing"),
+            Some(MergeClass::ScalarReplace)
+        );
+        // CTX-0953: the fallback list replaces wholesale like its siblings.
+        assert_eq!(
+            merge_class_for("font.fallback"),
             Some(MergeClass::ScalarReplace)
         );
         assert_eq!(merge_class_for("font"), Some(MergeClass::DeepMerge));

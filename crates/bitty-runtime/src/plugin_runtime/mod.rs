@@ -66,8 +66,8 @@ pub use resolution::{
 };
 pub use services::{
     EmptyEnv, EmptySettings, EnvSource, MAX_ENV_GRANTS, MAX_ENV_VALUE_BYTES, MapEnv, Notification,
-    NotificationQueue, PluginServices, ProcessEnv, QueuedWorkspaceRequest, ServiceDirectory,
-    ServiceRecord, SettingsSource, SnapshotSource, UiAccess, UiBlock, UiBlocks,
+    NotificationQueue, OverlayPeers, PluginServices, ProcessEnv, QueuedWorkspaceRequest,
+    ServiceDirectory, ServiceRecord, SettingsSource, SnapshotSource, UiAccess, UiBlock, UiBlocks,
     UnavailableSnapshot, UnavailableWorkspaces, WorkspaceRequestQueue, WorkspaceSource,
 };
 pub use store::{KvCommitBackend, KvCommitError, PluginStore, STORE_FILE_MAX_BYTES};
@@ -543,6 +543,11 @@ pub struct PluginRuntime {
     /// and bounded input queue. Shared with every generation's services so the
     /// single-owner invariant holds across plugins and reload.
     overlay_capture: Rc<RefCell<OverlayCapture>>,
+    /// CTX-0973: runtime-shared overlay peer table for lazy-expiry disposal.
+    /// Shared with every generation's services so an acquire that lazily
+    /// expires another generation's session can dispose that session's
+    /// transient spec surface synchronously.
+    overlay_peers: services::OverlayPeers,
     /// W-29 (CTX-0942): runtime-shared target registry (existing
     /// `TargetRegistry`). One registry spans every generation so generations
     /// bump and stale handles by construction.
@@ -590,6 +595,7 @@ impl PluginRuntime {
                 WORKSPACE_REQUEST_QUEUE_CAPACITY,
             ))),
             overlay_capture: Rc::new(RefCell::new(OverlayCapture::new())),
+            overlay_peers: Rc::new(RefCell::new(BTreeMap::new())),
             target_registry: Rc::new(RefCell::new(bitty_ui::TargetRegistry::new())),
             target_lenses: Rc::new(RefCell::new(Vec::new())),
             label_allocator: Rc::new(RefCell::new(bitty_ui::LabelAllocator::default())),
@@ -1154,6 +1160,22 @@ impl PluginRuntime {
         // so the single-owner invariant spans every plugin and survives
         // reload; suspend/dispose revoke this generation's capture.
         plugin_services.set_overlay_capture(self.overlay_capture.clone());
+        // CTX-0973: the runtime-shared overlay peer table, so an acquire
+        // that lazily expires another generation's session can dispose that
+        // session's transient spec surface synchronously.
+        plugin_services.set_overlay_peers(self.overlay_peers.clone());
+        {
+            use std::rc::Weak;
+            let mut peers = self.overlay_peers.borrow_mut();
+            for list in peers.values_mut() {
+                list.retain(|weak: &Weak<PluginServices>| weak.upgrade().is_some());
+            }
+            peers.retain(|_, list: &mut Vec<Weak<PluginServices>>| !list.is_empty());
+            peers
+                .entry(id.as_str().to_string())
+                .or_default()
+                .push(Rc::downgrade(&plugin_services));
+        }
         // W-29 (CTX-0942): the runtime-shared targeting mechanism state, so
         // the provider set spans every plugin and survives reload. Without
         // it every `bitty.ui.targets`/`bitty.ui.labels` call fails closed

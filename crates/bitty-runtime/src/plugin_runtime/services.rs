@@ -808,6 +808,16 @@ fn targets_offer(kind: &str, id: u64) -> Result<ProviderTarget, BridgeError> {
 }
 
 /// Per-generation host services for one plugin.
+/// Runtime-shared overlay peer table for lazy-expiry disposal (CTX-0973).
+///
+/// Holds weak handles to every live generation's services so an acquire that
+/// lazily expires another generation's session can dispose that session's
+/// transient spec surface synchronously. Entries are weak: a generation gone
+/// by disposal time simply has nothing to dispose. The table is bounded by
+/// the live generation count; dead entries are pruned on activation and on
+/// disposal.
+pub type OverlayPeers = Rc<RefCell<BTreeMap<String, Vec<Weak<PluginServices>>>>>;
+
 #[allow(clippy::type_complexity)]
 pub struct PluginServices {
     plugin_id: String,
@@ -822,6 +832,7 @@ pub struct PluginServices {
     ui_access: RefCell<UiAccess>,
     ui_blocks: RefCell<UiBlocks>,
     overlay_capture: RefCell<Option<Rc<RefCell<OverlayCapture>>>>,
+    overlay_peers: RefCell<Option<OverlayPeers>>,
     /// Handles this generation mounted through spec acquire (CTX-0941).
     ///
     /// A spec acquire mounts its transient surface directly into the
@@ -910,6 +921,7 @@ impl PluginServices {
             ui_access: RefCell::new(UiAccess::default()),
             ui_blocks: RefCell::new(UiBlocks::new()),
             overlay_capture: RefCell::new(None),
+            overlay_peers: RefCell::new(None),
             spec_overlay_handles: RefCell::new(BTreeSet::new()),
             target_registry: RefCell::new(None),
             target_lenses: RefCell::new(None),
@@ -1016,6 +1028,79 @@ impl PluginServices {
     /// The shared capture manager, if one was wired.
     fn overlay_capture(&self) -> Option<Rc<RefCell<OverlayCapture>>> {
         self.overlay_capture.borrow().clone()
+    }
+
+    /// Attach the runtime-shared overlay peer table (CTX-0973).
+    ///
+    /// The runtime wires one table across every generation so an acquire that
+    /// lazily expires another generation's session can dispose that session's
+    /// transient spec surface synchronously. A generation built without
+    /// wiring still disposes its own expired surfaces; only cross-generation
+    /// disposal needs the table.
+    pub fn set_overlay_peers(&self, peers: OverlayPeers) {
+        *self.overlay_peers.borrow_mut() = Some(peers);
+    }
+
+    /// Live capture session as `(owner plugin, handle)`, if any.
+    ///
+    /// Snapshot before `acquire`: a successful acquire implies the previous
+    /// owner (if any) was expired and lazily finished, so the caller disposes
+    /// that session's transient surface.
+    fn live_overlay_session(capture: &Rc<RefCell<OverlayCapture>>) -> Option<(String, i64)> {
+        let guard = capture.borrow();
+        Some((guard.owner_plugin()?.to_string(), guard.owner_handle()?))
+    }
+
+    /// Dispose one expired session's transient spec surface (CTX-0973).
+    ///
+    /// Same-generation sessions dispose directly (covers unwired unit paths);
+    /// cross-generation sessions dispose through the shared peer table.
+    /// Mechanism-path blocks are never recorded as spec surfaces, so
+    /// disposing a mechanism session is a safe no-op. Dead peers are pruned
+    /// so the table stays bounded by the live generation count.
+    fn dispose_expired_spec_overlay(&self, plugin: &str, handle: i64) {
+        if plugin == self.plugin_id {
+            self.remove_spec_overlay_block(handle);
+            return;
+        }
+        let peers = self.overlay_peers.borrow().clone();
+        let Some(peers) = peers else {
+            return;
+        };
+        let weaks = peers.borrow().get(plugin).cloned().unwrap_or_default();
+        for weak in weaks {
+            if let Some(peer) = weak.upgrade() {
+                if peer.remove_spec_overlay_block(handle) {
+                    break;
+                }
+            }
+        }
+        let mut table = peers.borrow_mut();
+        if let Some(list) = table.get_mut(plugin) {
+            list.retain(|weak| weak.upgrade().is_some());
+            if list.is_empty() {
+                table.remove(plugin);
+            }
+        }
+    }
+
+    /// Drop every stale spec surface of this generation except `live`.
+    ///
+    /// Mechanism acquire never mounts a spec surface, so every recorded spec
+    /// handle is stale once the new session holds capture. `live` is skipped
+    /// so re-acquiring a spec surface through the mechanism path keeps the
+    /// live block.
+    fn clear_stale_spec_overlays_except(&self, live: i64) {
+        let stale: Vec<i64> = self
+            .spec_overlay_handles
+            .borrow()
+            .iter()
+            .copied()
+            .filter(|candidate| *candidate != live)
+            .collect();
+        for orphan in stale {
+            self.remove_spec_overlay_block(orphan);
+        }
     }
 
     /// Wire the safe-mode flag for this generation (CTX-0941).
@@ -1751,9 +1836,23 @@ impl HostServices for PluginServices {
             ));
         }
         let session_expiry = Instant::now() + Duration::from_millis(OVERLAY_CAPTURE_TIMEOUT_MS);
+        let previous = Self::live_overlay_session(&capture);
         capture
             .borrow_mut()
-            .acquire(&self.plugin_id, handle, session_expiry)
+            .acquire(&self.plugin_id, handle, session_expiry)?;
+        // CTX-0973: a successful acquire implies the previous owner (if any)
+        // was expired and lazily finished inside `acquire` without a
+        // runtime-mediated disposal. Dispose its transient spec surface so no
+        // stale surface survives acquisition, then drop any remaining stale
+        // spec surface of this generation. The live handle is skipped so
+        // re-acquiring the same block keeps it.
+        if let Some((plugin, expired)) = previous {
+            if expired != handle {
+                self.dispose_expired_spec_overlay(&plugin, expired);
+            }
+        }
+        self.clear_stale_spec_overlays_except(handle);
+        Ok(())
     }
 
     fn ui_overlay_acquire(&self, handle: i64) -> Result<(), BridgeError> {
@@ -1818,6 +1917,7 @@ impl HostServices for PluginServices {
         let node = UiNode::column(children);
         let handle = self.ui_blocks.borrow_mut().mount(UiSlot::Overlay, node)?;
         let session_expiry = Instant::now() + Duration::from_millis(OVERLAY_CAPTURE_TIMEOUT_MS);
+        let previous = Self::live_overlay_session(&capture);
         if let Err(error) = capture
             .borrow_mut()
             .acquire(&self.plugin_id, handle, session_expiry)
@@ -1827,6 +1927,15 @@ impl HostServices for PluginServices {
             // block behind.
             self.remove_ui_block(handle);
             return Err(error);
+        }
+        // CTX-0973: a successful acquire implies the previous owner (if any)
+        // was expired and lazily finished inside `acquire` without a
+        // runtime-mediated disposal. The fresh handle never equals the expired
+        // one, so disposing first cannot touch the live surface.
+        if let Some((plugin, expired)) = previous {
+            if expired != handle {
+                self.dispose_expired_spec_overlay(&plugin, expired);
+            }
         }
         self.remember_spec_overlay(handle);
         Ok(handle)
@@ -3368,6 +3477,127 @@ mod tests {
             );
             assert_eq!(blocks.len(), 1, "only the live surface is retained");
             assert!(blocks.get(second).is_some());
+        });
+    }
+
+    #[test]
+    fn overlay_mechanism_acquire_disposes_expired_spec_surface() {
+        // CTX-0973: lazy expiry inside mechanism acquire must not leave the
+        // previous spec surface behind. The expired surface is disposed on
+        // the acquire path, so no stale surface survives acquisition.
+        let services = focus_services();
+        let stale = services
+            .ui_overlay_acquire_with_spec("Stale", "")
+            .expect("first spec acquire");
+        let live = services
+            .ui_mount("overlay", &UiNode::text("retained"))
+            .expect("mechanism mount while the spec session holds capture");
+        assert!(
+            services
+                .overlay_capture()
+                .expect("capture")
+                .borrow_mut()
+                .force_expire("xuepoo.test", stale),
+            "the spec session is rewound past its deadline"
+        );
+        services
+            .ui_overlay_acquire(live)
+            .expect("mechanism acquire after expiry");
+        services.with_ui_blocks(|blocks| {
+            assert!(
+                blocks.get(stale).is_none(),
+                "the expired spec surface is unmounted on mechanism acquire"
+            );
+            assert!(
+                blocks.get(live).is_some(),
+                "the mechanism session block is retained"
+            );
+            assert_eq!(blocks.len(), 1, "no stale surface survives acquisition");
+        });
+    }
+
+    #[test]
+    fn overlay_cross_generation_spec_acquire_disposes_expired_surface() {
+        // CTX-0973: lazy expiry inside spec acquire must dispose the previous
+        // owner's surface even across generations. The peer table lets the
+        // new generation reach the expired owner's registry.
+        let capture = Rc::new(RefCell::new(OverlayCapture::new()));
+        let peers: OverlayPeers = Rc::new(RefCell::new(BTreeMap::new()));
+        let first = Rc::new(generation_services("xuepoo.alpha", 11, &capture));
+        let second = Rc::new(generation_services("xuepoo.beta", 12, &capture));
+        for (services, id) in [(&first, "xuepoo.alpha"), (&second, "xuepoo.beta")] {
+            services.set_overlay_peers(peers.clone());
+            peers
+                .borrow_mut()
+                .entry(id.to_string())
+                .or_default()
+                .push(Rc::downgrade(services));
+        }
+        let stale = first
+            .ui_overlay_acquire_with_spec("A", "")
+            .expect("first generation spec acquire");
+        assert!(
+            capture.borrow_mut().force_expire("xuepoo.alpha", stale),
+            "the first session is rewound past its deadline"
+        );
+        let live = second
+            .ui_overlay_acquire_with_spec("B", "")
+            .expect("second generation spec acquire after expiry");
+        first.with_ui_blocks(|blocks| {
+            assert!(
+                blocks.get(stale).is_none(),
+                "the expired previous-owner surface is unmounted"
+            );
+            assert!(blocks.is_empty(), "no orphan survives in the old registry");
+        });
+        second.with_ui_blocks(|blocks| {
+            assert_eq!(blocks.len(), 1, "only the live surface is retained");
+            assert!(
+                blocks.get(live).is_some(),
+                "the new session presents its own surface"
+            );
+        });
+        assert!(
+            capture.borrow().is_owner("xuepoo.beta", live),
+            "the new generation holds the capture"
+        );
+    }
+
+    #[test]
+    fn overlay_mixed_same_generation_shows_session_surface() {
+        // CTX-0973: a same-generation mixed mount must present the session
+        // surface, not the first-mounted stale block. The spec surface is
+        // mounted first, the mechanism block second; after expiry the
+        // mechanism acquire disposes the stale spec surface, so iteration
+        // order (what presentation reads first) is the live session.
+        let services = focus_services();
+        let stale = services
+            .ui_overlay_acquire_with_spec("Stale", "")
+            .expect("spec surface mounted first");
+        let live = services
+            .ui_mount("overlay", &UiNode::text("retained"))
+            .expect("mechanism block mounted second");
+        assert!(
+            services
+                .overlay_capture()
+                .expect("capture")
+                .borrow_mut()
+                .force_expire("xuepoo.test", stale),
+            "the spec session is rewound past its deadline"
+        );
+        services
+            .ui_overlay_acquire(live)
+            .expect("mechanism acquire takes over");
+        services.with_ui_blocks(|blocks| {
+            assert!(
+                blocks.get(stale).is_none(),
+                "the first-mounted stale surface is gone"
+            );
+            let (first_handle, _) = blocks.iter().next().expect("one live block remains");
+            assert_eq!(
+                first_handle, live,
+                "the first block is the session surface, not stale content"
+            );
         });
     }
 

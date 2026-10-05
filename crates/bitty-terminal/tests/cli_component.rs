@@ -69,10 +69,15 @@ fn user_root(home: &Path) -> PathBuf {
 
 /// Write a source directory holding `bitty-component.toml` (no `sha256`,
 /// per D6 local-path form) plus the executable.
+///
+/// The descriptor stores the logical executable name (`bitty-<name>`); the
+/// file on disk carries the platform suffix (`bitty-<name>.exe` on Windows),
+/// mirroring the production install layout.
 fn write_source_dir(dir: &Path, name: &str, version: &str, protocol: &str) -> PathBuf {
     std::fs::create_dir_all(dir).expect("source dir");
     let executable = format!("bitty-{name}");
-    std::fs::write(dir.join(&executable), format!("{name}-{version}-bytes")).expect("executable");
+    let file_name = format!("{executable}{}", std::env::consts::EXE_SUFFIX);
+    std::fs::write(dir.join(&file_name), format!("{name}-{version}-bytes")).expect("executable");
     std::fs::write(
         dir.join("bitty-component.toml"),
         format!(
@@ -85,11 +90,15 @@ fn write_source_dir(dir: &Path, name: &str, version: &str, protocol: &str) -> Pa
 
 /// Install a component directly into a tier root (bypasses the CLI, for
 /// system-tier fixtures the CLI never writes).
+///
+/// Like `write_source_dir`, the descriptor keeps the logical executable name
+/// while the file on disk uses the platform suffix.
 fn install_into(root: &Path, name: &str, version: &str, protocol: &str) {
     let version_dir = root.join(name).join(version);
     std::fs::create_dir_all(&version_dir).expect("version dir");
     let executable = format!("bitty-{name}");
-    let executable_path = version_dir.join(&executable);
+    let file_name = format!("{executable}{}", std::env::consts::EXE_SUFFIX);
+    let executable_path = version_dir.join(&file_name);
     std::fs::write(&executable_path, format!("{name}-{version}-bytes")).expect("executable");
     let bytes = std::fs::read(&executable_path).expect("read");
     let digest = bitty_package::integrity::sha256_hex(&bytes);

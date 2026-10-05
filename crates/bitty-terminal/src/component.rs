@@ -1204,11 +1204,11 @@ mod tests {
     fn write_source_dir(dir: &Path, name: &str, version: &str, protocol: &str) -> PathBuf {
         std::fs::create_dir_all(dir).expect("source dir");
         let executable_name = format!("{COMPONENT_EXECUTABLE_PREFIX}{name}");
-        std::fs::write(
-            dir.join(&executable_name),
-            format!("{name}-{version}-bytes"),
-        )
-        .expect("executable");
+        // The descriptor stores the logical name; the file on disk carries
+        // the platform suffix (`.exe` on Windows).
+        let file_name = executable_file_name(&executable_name);
+        std::fs::write(dir.join(&file_name), format!("{name}-{version}-bytes"))
+            .expect("executable");
         std::fs::write(
             dir.join(COMPONENT_DESCRIPTOR_FILE),
             format!(

@@ -790,13 +790,12 @@ fn press_on_a_visible_float_selects_in_the_float() {
 }
 
 #[test]
-fn a_float_never_reaches_the_window_edge_and_owns_its_own_rows() {
+fn a_float_owns_its_own_rows() {
     bitty_test_support::require_pty!();
-    // The retired Core bar owned a Core-reserved band outside the layout
-    // container (CTX-0873 #1431); with it deleted (W-104/CTX-0956) the
-    // container is the full window, overlay bounds clip to that container,
-    // and a press on the float's last row, where the old in-grid bar sat,
-    // belongs to the float.
+    // CTX-0979: Core draws no workspace display, so no Core bar band
+    // exists; overlay bounds clip to the layout container (window minus
+    // plugin bands), so a float stays inside the window. A press on the
+    // float's last row belongs to the float.
     let mut rt = Runtime::new(RuntimeConfig::default()).expect("headless build");
     // Install the float layout in workspace zero first: `workspace_new`
     // switches the active slot.
@@ -805,7 +804,7 @@ fn a_float_never_reaches_the_window_edge_and_owns_its_own_rows() {
         LayoutNode::leaf(View::new(PANE, 40, 14)),
         UiRect::new(10, 10, 40, 14),
     ));
-    rt.workspace_new().expect("second workspace for coverage");
+    rt.workspace_new().expect("second workspace");
     assert!(rt.workspace_switch(0), "checks run on the primary layout");
     rt.force_headless_clipboard();
     let float = frame_of(&rt, PANE);
@@ -815,15 +814,13 @@ fn a_float_never_reaches_the_window_edge_and_owns_its_own_rows() {
     rt.handle_pane_bytes(PANE, b"\x1b[?1049h");
     rt.handle_pane_bytes(PANE, PANE_TEXT.as_bytes());
 
-    assert_eq!(rt.status_bar_band(), None, "no Core band after W-104");
     let window = rt.window_cells();
-    let (_, ch) = rt.live_cell_size();
-    let window_bottom_px = (u32::from(window.y) + u32::from(window.height)) * ch;
-    for frame in rt.present_frames() {
-        let bottom = u32::try_from(frame.frame.y.max(0)).expect("u32") + frame.frame.height;
+    let window_end = window.y.saturating_add(window.height);
+    for (_, alloc) in rt.layout_allocations() {
+        let alloc_end = alloc.y.saturating_add(alloc.height);
         assert!(
-            bottom <= window_bottom_px,
-            "frame {frame:?} stays inside the window"
+            alloc.y >= window.y && alloc_end <= window_end,
+            "allocation {alloc:?} stays inside the window {window:?}"
         );
     }
 

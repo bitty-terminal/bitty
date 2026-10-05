@@ -2282,16 +2282,15 @@ fn runtime_config_inherits_file_focus_follows_mouse() {
 }
 
 #[test]
-fn runtime_config_inherits_workspace_show_bar_opt_out() {
-    // Issue #1333: the switcher flag is default-on; `workspace.show_bar`
-    // flows file -> effective -> runtime, and absent means the default-on
-    // flag stays (opt-out, not opt-in). The flag is retained pending the
-    // W-26/W-27 settings migration; since W-104/CTX-0956 retired the Core
-    // bar it reserves no band either way.
-    const { assert!(bitty_runtime::config::DEFAULT_WORKSPACELINE_VISIBLE) }
+fn workspace_show_bar_parses_for_the_bar_plugin() {
+    // CTX-0979: Core draws no workspace display. `workspace.show_bar`
+    // stays accepted in `bitty-config` for the bar plugin to read;
+    // Core carries no visibility state. This pins the config parsing
+    // (file -> effective) and that the runtime builds with workspace
+    // queries intact.
     use bitty_config::file::{parse_lua_config, resolve_effective};
     use bitty_config::plan::{ConfigSource, LayerKind};
-    // Absent table rides the default-on end to end.
+    // Absent table parses; no show_bar key.
     let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
     let plan = parse_lua_config(r#"return { terminal = { scrollback = 10000 } }"#, &src)
         .expect("no workspace table parses");
@@ -2299,13 +2298,9 @@ fn runtime_config_inherits_workspace_show_bar_opt_out() {
         .expect("merge");
     assert!(merged.effective.workspace.show_bar.is_none());
     let cfg = runtime_config_from_effective(&merged.effective).expect("builds");
-    assert!(
-        cfg.workspaceline_visible,
-        "absent key keeps the default-on bar"
-    );
-    // Explicit opt-out reaches the runtime (settings retained pending the
-    // W-26/W-27 migration); with the Core bar retired (W-104/CTX-0956) the
-    // flag reserves no band and the grid keeps every row.
+    let rt = bitty_runtime::Runtime::new(cfg).expect("runtime builds");
+    assert_eq!(rt.workspace_names(), vec![String::from("ws1")]);
+    // Explicit opt-out still parses for the bar plugin.
     let src2 = ConfigSource::new(LayerKind::User, Some("init.lua"));
     let plan2 = parse_lua_config(r#"return { workspace = { show_bar = false } }"#, &src2)
         .expect("opt-out parses");
@@ -2316,10 +2311,8 @@ fn runtime_config_inherits_workspace_show_bar_opt_out() {
     .expect("merge");
     assert_eq!(merged2.effective.workspace.show_bar, Some(false));
     let cfg2 = runtime_config_from_effective(&merged2.effective).expect("builds");
-    assert!(!cfg2.workspaceline_visible);
-    let rt = bitty_runtime::Runtime::new(cfg2).expect("runtime builds");
-    assert!(!rt.workspaceline_visible());
-    assert_eq!(rt.status_bar_band(), None);
+    let rt2 = bitty_runtime::Runtime::new(cfg2).expect("runtime builds");
+    assert_eq!(rt2.workspace_names(), vec![String::from("ws1")]);
     assert_eq!(
         merged2.source_of("workspace.show_bar").unwrap().layer,
         bitty_config::plan::LayerKind::User
@@ -2327,56 +2320,55 @@ fn runtime_config_inherits_workspace_show_bar_opt_out() {
 }
 
 #[test]
-fn runtime_config_inherits_workspace_bar_edge() {
-    // CTX-0873: `workspace.bar.edge` flows file -> effective -> runtime;
-    // absent keeps the bottom default.
+fn workspace_bar_edge_parses_for_the_bar_plugin() {
+    // CTX-0979: Core draws no workspace display. `workspace.bar.edge`
+    // stays accepted in `bitty-config` for the bar plugin; Core carries
+    // no edge state. This pins file -> effective parsing with the runtime
+    // building and queries intact.
     use bitty_config::file::{parse_lua_config, resolve_effective};
     use bitty_config::plan::{ConfigSource, LayerKind, LayeredPlan};
-    use bitty_runtime::config::BarEdge;
+    use bitty_config::types::WorkspaceBarEdge;
     for (lua, want) in [
         (
             r#"return { terminal = { scrollback = 10000 } }"#,
-            BarEdge::Bottom,
+            WorkspaceBarEdge::Bottom,
         ),
         (
             r#"return { workspace = { bar = { edge = "top" } } }"#,
-            BarEdge::Top,
+            WorkspaceBarEdge::Top,
         ),
         (
             r#"return { workspace = { bar = { edge = "bottom" } } }"#,
-            BarEdge::Bottom,
+            WorkspaceBarEdge::Bottom,
         ),
     ] {
         let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
         let plan = parse_lua_config(lua, &src).expect(lua);
         let merged = resolve_effective(Some(LayeredPlan::new(src, plan)), None).expect("merge");
+        let edge = merged.effective.workspace.bar_edge.unwrap_or_default();
+        assert_eq!(edge, want, "{lua}");
         let cfg = runtime_config_from_effective(&merged.effective).expect("builds");
-        assert_eq!(cfg.workspace_bar_edge, want, "{lua}");
         let rt = bitty_runtime::Runtime::new(cfg).expect("runtime builds");
-        assert_eq!(rt.workspace_bar_edge(), want);
+        assert_eq!(rt.workspace_names(), vec![String::from("ws1")]);
     }
 }
 
 #[test]
-fn bar_edge_mapping_round_trips_by_spelling() {
-    // CTX-0873: `bitty-config` and `bitty-runtime` share no dependency
-    // edge, so the one mapping (`runtime_bar_edge`) is pinned here: every
-    // config spelling parses, maps to the runtime variant of the same
-    // name, and the canonical spelling round-trips.
+fn workspace_bar_edge_spelling_parses_fail_closed() {
+    // CTX-0979: the Core-side `runtime_bar_edge` mapping is deleted with
+    // the Core display. This pins the config-side spelling only.
     use bitty_config::types::WorkspaceBarEdge;
-    use bitty_runtime::config::BarEdge;
-    for (spelling, config, runtime) in [
-        ("top", WorkspaceBarEdge::Top, BarEdge::Top),
-        ("bottom", WorkspaceBarEdge::Bottom, BarEdge::Bottom),
+    for (spelling, config) in [
+        ("top", WorkspaceBarEdge::Top),
+        ("bottom", WorkspaceBarEdge::Bottom),
     ] {
         assert_eq!(WorkspaceBarEdge::parse(spelling), Some(config));
         assert_eq!(config.as_str(), spelling);
-        assert_eq!(crate::config_cli::runtime_bar_edge(config), runtime);
     }
     assert_eq!(
-        crate::config_cli::runtime_bar_edge(WorkspaceBarEdge::default()),
-        BarEdge::default(),
-        "defaults agree across crates"
+        WorkspaceBarEdge::default(),
+        WorkspaceBarEdge::Bottom,
+        "default stays bottom for the bar plugin"
     );
     assert_eq!(WorkspaceBarEdge::parse("Top"), None, "fail-closed spelling");
 }
@@ -3696,7 +3688,7 @@ fn parse_plugin_subcommand() {
         "bitty",
         "plugin",
         "install",
-        "bitty-terminal.tabs",
+        "bitty-terminal.workspace",
         "--yes",
     ]));
     assert!(p.plugin_word);
@@ -3704,7 +3696,7 @@ fn parse_plugin_subcommand() {
         p.plugin_raw,
         vec![
             "install".to_string(),
-            "bitty-terminal.tabs".to_string(),
+            "bitty-terminal.workspace".to_string(),
             "--yes".to_string()
         ]
     );

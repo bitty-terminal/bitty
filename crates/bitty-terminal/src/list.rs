@@ -1627,10 +1627,9 @@ mod tests {
         assert!(!ids.contains(&"bitty-terminal.statusline"));
         assert!(!ids.contains(&"bitty-terminal.git-panel"));
         assert!(!ids.contains(&"bitty-terminal.file-manager"));
-        // Deprecated alias is not a separate list row (canonical list only),
-        // but still resolves as bundled.
+        // CTX-0974 (DEC-0100 waiver): tabs alias purged, not listed nor bundled.
         assert!(!ids.contains(&"bitty-terminal.tabs"));
-        assert!(bitty_plugin_host::bundled::is_bundled(
+        assert!(!bitty_plugin_host::bundled::is_bundled(
             &bitty_plugin_host::PluginId::new("bitty-terminal.tabs").unwrap()
         ));
     }

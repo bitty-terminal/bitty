@@ -1336,9 +1336,10 @@ fn control_help_names_exact_elevation_verbs() {
 
 #[test]
 fn control_workspace_list_new_focus_close_headless() {
-    // CTX-0257 entry over the control plane: list pins the tabline,
+    // CTX-0257 entry over the control plane: list pins the query fields,
     // new/focus ride view.manage (no elevation), close needs elevation
     // and is immediate there (the pending-confirm gate is key UX only).
+    // CTX-0979: Core draws no display; no `tabline` string is returned.
     let mut rt = headless_runtime();
     let cli = bitty_ipc::ScopeSet::cli_default();
     let all = bitty_ipc::ScopeSet::all();
@@ -1347,20 +1348,21 @@ fn control_workspace_list_new_focus_close_headless() {
     assert!(list.ok, "workspace list must succeed: {list:?}");
     assert!(list.result_json.contains("\"count\":1"));
     assert!(
-        list.result_json.contains("1:ws1* (1)"),
-        "tabline pinned: {list:?}"
+        list.result_json.contains("\"names\":[\"ws1\"]"),
+        "names pinned: {list:?}"
     );
+    assert!(!list.result_json.contains("tabline"), "no display string");
 
     let created = apply_control_envelope(&mut rt, ipc_ctl::METHOD_NEW_WORKSPACE, None, &cli);
     assert!(created.ok, "workspace new must succeed: {created:?}");
     assert!(created.result_json.contains("\"created\":\"ws:2\""));
-    assert!(created.result_json.contains("1:ws1 2:ws2* (2)"));
+    assert!(!created.result_json.contains("tabline"));
 
     let focus = ipc_ctl::params_workspace("ws:1");
     let moved =
         apply_control_envelope(&mut rt, ipc_ctl::METHOD_FOCUS_WORKSPACE, Some(&focus), &cli);
     assert!(moved.ok, "workspace focus must succeed: {moved:?}");
-    assert!(moved.result_json.contains("1:ws1* 2:ws2 (2)"));
+    assert!(moved.result_json.contains("\"focused\":\"ws:1\""));
 
     // Unknown workspace is NotFound (no partial state).
     let bad = ipc_ctl::params_workspace("ws:9");
@@ -1370,7 +1372,7 @@ fn control_workspace_list_new_focus_close_headless() {
     assert_eq!(missing.code, "NotFound");
 
     // Close without elevation denies (kill power); with elevation it
-    // closes immediately and the tabline follows.
+    // closes immediately.
     let close = ipc_ctl::params_workspace("ws:2");
     let denied =
         apply_control_envelope(&mut rt, ipc_ctl::METHOD_CLOSE_WORKSPACE, Some(&close), &cli);
@@ -1379,7 +1381,7 @@ fn control_workspace_list_new_focus_close_headless() {
     let done = apply_control_envelope(&mut rt, ipc_ctl::METHOD_CLOSE_WORKSPACE, Some(&close), &all);
     assert!(done.ok, "elevated close must succeed: {done:?}");
     assert!(done.result_json.contains("\"closed\":\"ws:2\""));
-    assert!(done.result_json.contains("1:ws1* (1)"));
+    assert!(!done.result_json.contains("tabline"));
 
     // Closing an unknown workspace is NotFound (auth passed).
     let gone = apply_control_envelope(&mut rt, ipc_ctl::METHOD_CLOSE_WORKSPACE, Some(&bad), &all);
@@ -1413,9 +1415,10 @@ fn control_workspace_new_focuses_fresh_view() {
 #[test]
 fn control_workspace_rename_and_move_panel_headless() {
     // Issue #1333 parity: `workspace rename ws:N NAME` renames with the
-    // bar following, and `workspace move-panel N` repositions the focused
-    // panel; both ride view.manage (no elevation) and fail closed on
-    // unknown targets with no partial state.
+    // queries following, and `workspace move-panel N` repositions the
+    // focused panel; both ride view.manage (no elevation) and fail closed
+    // on unknown targets with no partial state.
+    // CTX-0979: no `tabline` display string is returned.
     use bitty_runtime::{LayoutNode, SplitAxis, View, ViewId};
     let mut rt = headless_runtime();
     let cli = bitty_ipc::ScopeSet::cli_default();
@@ -1433,7 +1436,8 @@ fn control_workspace_rename_and_move_panel_headless() {
         "workspace rename must succeed without elevation: {done:?}"
     );
     assert!(done.result_json.contains("\"renamed\":\"ws:2\""));
-    assert!(done.result_json.contains("2:editor*"));
+    assert!(done.result_json.contains("\"name\":\"editor\""));
+    assert!(!done.result_json.contains("tabline"));
     assert_eq!(rt.workspace_names()[1], "editor");
     // Unknown workspace fails closed with names untouched.
     let bad = ipc_ctl::params_workspace_rename("ws:99", "nope");
@@ -1574,7 +1578,7 @@ fn control_workspace_list_ids_roundtrip_across_sequence_gap() {
     // CTX-0338 (D2 residual): `workspace list` must emit the canonical
     // `ws:{seq}` identity that `focus`/`close`/`move` accept, so a client can
     // feed list output straight back into the write verbs. Display labels
-    // stay available separately and the human `tabline` is unchanged.
+    // stay available separately; CTX-0979 returns no `tabline` string.
     let mut rt = headless_runtime();
     let cli = bitty_ipc::ScopeSet::cli_default();
     let all = bitty_ipc::ScopeSet::all();

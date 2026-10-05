@@ -193,8 +193,6 @@ pub mod queries;
 pub mod queue;
 pub mod registry;
 pub mod runtime;
-#[deprecated(since = "0.1.0", note = "use workspace (tabs alias removal >= v0.2.0)")]
-pub mod tabs;
 pub mod workspace;
 
 // Re-export present-path interaction types for the app composition root

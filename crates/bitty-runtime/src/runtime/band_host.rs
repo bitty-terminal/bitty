@@ -17,21 +17,24 @@
 //!   `PluginRuntime::dispatch_command` path, where registration and
 //!   capability checks fail closed as usual. Clicks on unclaimed spans and
 //!   clicks outside every band row dispatch nothing. Overlapping row claims
-//!   (two bands on one row, or a band on the retired Core bar row) are
-//!   denied with a diagnostic — never routed to either claimant.
+//!   (two bands on one row) are denied with a
+//!   diagnostic — never routed to either claimant.
 //! - **C2 — paint tokens and the redraw gate.** `fg`/`bg` resolve through the
 //!   minimal host token table ([`resolve_band_token`]); `bold` paints as a
 //!   synthetic double-strike. Every band paint is bounded to its granted
 //!   one-row band rectangle: text is clipped to the window width, fills and
 //!   glyphs are derived from the same flattened spans the hit-test uses, and
-//!   a geometry violation (overlap with another band, the retired Core bar
-//!   row, or the layout container) skips the whole band — never a partial
-//!   paint — and counts [`BandHostStats::paint_violations`].
+//!   a geometry violation (overlap with another band or the
+//!   layout container) skips the whole band — never a partial paint — and
+//!   counts [`BandHostStats::paint_violations`].
 //! - **C3 — exclusive-zone enforcement.** Visible plugin bands shrink the
-//!   layout container through the normal reflow path, so no terminal cell,
-//!   cursor, selection, or overlay region is ever painted under a band, and
-//!   PTY winsizes follow the reduced grid. Content-only band updates change
+//!   layout container through the normal reflow path, so no terminal cell, cursor,
+//!   selection, or overlay region is ever painted under a band, and PTY
+//!   winsizes follow the reduced grid. Content-only band updates change
 //!   damage only; showing, hiding, or restacking a band reflows once.
+//!
+//! CTX-0979: Core draws no workspace display (Hyprland-style); there is no
+//! Core bar row to collide with or to reserve.
 //!
 //! Ownership direction follows the accepted W-74 disposition (Core owns
 //! mechanism — geometry, routing, confinement; plugins own presentation)
@@ -343,24 +346,19 @@ pub(super) enum PressedBandTarget {
     Denied,
 }
 
-/// Whether band rows collide: duplicates, or a band on the Core bar row.
+/// Whether band rows collide (duplicate rows).
 ///
 /// Backstop behind the budget math (which keeps rows disjoint by
 /// construction): paint and hit-test fail closed on `true` with a
 /// diagnostic instead of routing or painting either claimant.
+///
+/// CTX-0979: Core draws no workspace display, so there is no Core bar row
+/// to collide with; only duplicate plugin rows violate.
 #[must_use]
-pub fn band_rows_overlap(rows: &[u16], core_bar_row: Option<u16>) -> bool {
+pub fn band_rows_overlap(rows: &[u16]) -> bool {
     let mut sorted = rows.to_vec();
     sorted.sort_unstable();
-    if sorted.windows(2).any(|pair| pair[0] == pair[1]) {
-        return true;
-    }
-    if let Some(bar) = core_bar_row {
-        if sorted.contains(&bar) {
-            return true;
-        }
-    }
-    false
+    sorted.windows(2).any(|pair| pair[0] == pair[1])
 }
 
 /// Headless host statistics for band routing and paint (CTX-0946).
@@ -448,10 +446,12 @@ impl Runtime {
     /// Degraded-visible band budget per horizontal edge (CTX-0946 C3).
     ///
     /// Visible band counts, or `(0, 0)` when the window is too small for
-    /// every visible band plus the content floor (plugin-only bands hide
-    /// before content drops below the floor; the Core bar keeps its own
-    /// solve). Pure and total; every geometry consumer reads this, so
-    /// paint, hit-test, and the container can never disagree.
+    /// every visible band plus the content floor. Pure and total; every
+    /// geometry consumer reads this, so paint, hit-test, and the container
+    /// can never disagree.
+    ///
+    /// CTX-0979: Core draws no workspace display, so there is no Core bar
+    /// reservation; the budget degrades against the window rows directly.
     #[must_use]
     pub fn plugin_band_budget(&self) -> (u16, u16) {
         let count = |edge| {
@@ -469,13 +469,10 @@ impl Runtime {
             return (0, 0);
         }
         let window = self.window_cells();
-        let core = self.chrome_layout();
-        let core_rows = u32::from(core.container.height);
         let window_rows = u32::from(window.height);
-        let reserved = window_rows.saturating_sub(core_rows);
         let want = u32::from(top).saturating_add(u32::from(bottom));
         let floor = u32::from(self.chrome_min_rows());
-        if reserved.saturating_add(want).saturating_add(floor) > window_rows {
+        if want.saturating_add(floor) > window_rows {
             return (0, 0);
         }
         (top, bottom)
@@ -496,25 +493,25 @@ impl Runtime {
 
     /// Layout container minus the budgeted plugin bands (CTX-0946 C3).
     ///
-    /// The Core-bar solve ([`Self::chrome_layout`]) is unchanged; this
-    /// carves the plugin exclusive zone out of its container. Falls back to
-    /// the Core-only container when the budget hides every band, so the
-    /// no-plugin frame is byte-identical to before. Saturating and total.
+    /// CTX-0979: Core draws no workspace display, so the container starts
+    /// from the full window grid; this carves the plugin exclusive zone out
+    /// of it. Falls back to the full window when the budget hides every
+    /// band, so the no-plugin frame is byte-identical to before. Saturating
+    /// and total.
     #[must_use]
     pub fn band_exclusive_container(&self) -> bitty_ui::Rect {
-        let layout = self.chrome_layout();
+        let window = self.chrome_layout().container;
         let (top, bottom) = self.plugin_band_budget();
         if top == 0 && bottom == 0 {
-            return layout.container;
+            return window;
         }
-        let container = layout.container;
-        let y = container.y.saturating_add(top);
-        let end = container
+        let y = window.y.saturating_add(top);
+        let end = window
             .y
-            .saturating_add(container.height)
+            .saturating_add(window.height)
             .saturating_sub(bottom);
         let height = end.saturating_sub(y);
-        bitty_ui::Rect::new(container.x, y, container.width, height)
+        bitty_ui::Rect::new(window.x, y, window.width, height)
     }
 
     /// Band rows currently painted, for overlap fail-closed checks.
@@ -536,17 +533,15 @@ impl Runtime {
 
     /// Whether the painted band rows violate exclusive geometry.
     ///
-    /// True on any duplicate row, any band on the retired Core bar row, or
-    /// any band row inside the layout container. Paint and hit-test fail
-    /// closed on `true` with a diagnostic; the budget math keeps this
-    /// unreachable in practice. (W-104/CTX-0956: the Core bar is deleted so
-    /// the Core term is always `None`; it stays as a guard behind the
-    /// [`Runtime::status_bar_band`] geometry seam.)
+    /// True on any duplicate row or any band row inside the layout
+    /// container. Paint and hit-test fail closed on `true` with a
+    /// diagnostic; the budget math keeps this unreachable in practice.
+    ///
+    /// CTX-0979: no Core bar row exists to collide with.
     #[must_use]
     pub fn band_geometry_violated(&self) -> bool {
         let rows = self.painted_band_rows();
-        let core_bar = self.status_bar_band().map(|bar| bar.y);
-        if band_rows_overlap(&rows, core_bar) {
+        if band_rows_overlap(&rows) {
             return true;
         }
         let container = self.container;
@@ -717,7 +712,8 @@ impl Runtime {
     }
     /// Resolves the release paired with a band-consumed press (CTX-0946 C1).
     ///
-    /// Returns `true` (consume the release) when the swallow is armed. Standard button semantics: the
+    /// Returns `true` (consume the release) when the swallow is armed.
+    /// Standard button semantics: the
     /// release routes only when it resolves to the same band run the press
     /// armed (band, run, and resolved request all equal, so content that
     /// changed mid-gesture cannot misroute). A drag onto another span or
@@ -1005,12 +1001,11 @@ mod tests {
     }
 
     #[test]
-    fn row_overlap_backstop_denies_duplicates_and_core_bar() {
-        assert!(!band_rows_overlap(&[0, 22], Some(23)));
-        assert!(!band_rows_overlap(&[], None));
-        assert!(band_rows_overlap(&[5, 5], None));
-        assert!(band_rows_overlap(&[23], Some(23)));
-        assert!(band_rows_overlap(&[0, 1, 1, 2], Some(23)));
+    fn row_overlap_backstop_denies_duplicates() {
+        assert!(!band_rows_overlap(&[0, 22]));
+        assert!(!band_rows_overlap(&[]));
+        assert!(band_rows_overlap(&[5, 5]));
+        assert!(band_rows_overlap(&[0, 1, 1, 2]));
     }
 
     #[test]

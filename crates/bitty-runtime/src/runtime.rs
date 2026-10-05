@@ -551,20 +551,9 @@ pub struct Runtime {
     session_backend: Option<std::sync::Arc<dyn session::SessionFileBackend>>,
     /// Pending kill-confirm close arm, if any (never silent kill).
     pending_ws_close: Option<PendingWsClose>,
-    /// Whether the workspace switcher bar is enabled (issue #1333).
-    ///
-    /// Seeded from [`RuntimeConfig::workspaceline_visible`] at construction
-    /// (default-on); live toggles go through
-    /// [`Runtime::set_workspaceline_visible`]. Retained pending the W-26/W-27
-    /// settings migration: since W-104/CTX-0956 retired the Core bar, no
-    /// Core chrome reads this flag.
-    workspaceline_visible: bool,
-    /// Retained window-edge setting for the retired Core workspace bar band
-    /// (CTX-0873, `workspace.bar.edge`; migration owned by W-26/W-27).
-    /// Seeded from [`RuntimeConfig::workspace_bar_edge`]; live changes go
-    /// through [`Runtime::set_workspace_bar_edge`]. No Core chrome reads
-    /// this edge since the retirement; plugin bands solve their own rows.
-    workspace_bar_edge: crate::config::BarEdge,
+    /// CTX-0979: Core draws no workspace display (Hyprland-style). No
+    /// workspaceline visibility or bar-edge state lives here; workspace
+    /// state is memory-only and the bar plugin owns presentation.
     /// Plugin-mounted chrome bands per edge (CTX-0890, part of #1431).
     ///
     /// Populated from `PluginRuntime::ui_blocks()` each tick after plugin
@@ -581,9 +570,9 @@ pub struct Runtime {
     /// `None` with no capture, so the present path is byte-identical to the
     /// pre-overlay frame. Presentation-only: never grid truth.
     plugin_overlay: Option<BandContent>,
-    /// Full window grid in cells (CTX-0873). The layout `container` is this
-    /// rect minus the reserved chrome band
-    /// ([`chrome_band::solve`]); resize and the `set_window_cells` seam set it.
+    /// Full window grid in cells. The layout `container` is this rect minus
+    /// the budgeted plugin bands; resize and the `set_window_cells` seam
+    /// set it.
     window_cells: UiRect,
     /// Whether the help popup (CTX-0265) is currently shown.
     ///
@@ -791,8 +780,8 @@ pub struct Runtime {
     /// chrome-consumed press (CTX-0946 C1).
     ///
     /// A band press is consumed as Core chrome before capture, so the
-    /// and the paired release must not reach it as an orphan report. Set
-    /// when [`band_host`](self::band_host) routing consumes a press, cleared
+    /// capturing app never saw the press and the paired release must not
+    /// reach it as an orphan report. Set when [`band_host`](self::band_host) routing consumes a press, cleared
     /// (resolving the click into the drain queue) on the next left release.
     band_release_swallow: bool,
     /// Queued Core-routed band clicks awaiting application dispatch
@@ -1521,8 +1510,6 @@ impl Runtime {
             session_restored: false,
             session_backend: None,
             pending_ws_close: None,
-            workspaceline_visible: config.workspaceline_visible,
-            workspace_bar_edge: config.workspace_bar_edge,
             window_cells: container,
             last_presented_bands: Vec::new(),
             help_visible: false,
@@ -1755,8 +1742,6 @@ impl Runtime {
             session_restored: false,
             session_backend: None,
             pending_ws_close: None,
-            workspaceline_visible: config.workspaceline_visible,
-            workspace_bar_edge: config.workspace_bar_edge,
             window_cells: container,
             last_presented_bands: Vec::new(),
             help_visible: false,

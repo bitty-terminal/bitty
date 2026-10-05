@@ -546,10 +546,10 @@ pub fn plugin_help_text() -> String {
      examples:\n\
      \x20 bitty plugin list\n\
      \x20 bitty plugin list --format json\n\
-     \x20 bitty plugin install bitty-terminal.tabs --yes\n\
+     \x20 bitty plugin install bitty-terminal.workspace --yes\n\
      \x20 bitty plugin install ./my-plugin --yes\n\
      \x20 bitty plugin info xuepoo.hello\n\
-     \x20 bitty plugin disable bitty-terminal.tabs\n\
+     \x20 bitty plugin disable bitty-terminal.workspace\n\
      \x20 bitty plugin remove xuepoo.hello --force"
         .to_string()
 }
@@ -2717,16 +2717,16 @@ mod tests {
 
     #[test]
     fn parse_install_id_yes_and_format_pairs() {
-        let request = parse_ok(&["install", "bitty-terminal.tabs", "--yes"]);
+        let request = parse_ok(&["install", "bitty-terminal.workspace", "--yes"]);
         assert_eq!(request.verb, PluginVerb::Install);
-        assert_eq!(request.id.as_deref(), Some("bitty-terminal.tabs"));
+        assert_eq!(request.id.as_deref(), Some("bitty-terminal.workspace"));
         assert!(request.yes);
 
         let request = parse_ok(&["list", "--format", "json"]);
         assert_eq!(request.format, PluginFormat::Json);
-        let request = parse_ok(&["info", "bitty-terminal.tabs", "--format=jsonl"]);
+        let request = parse_ok(&["info", "bitty-terminal.workspace", "--format=jsonl"]);
         assert_eq!(request.format, PluginFormat::Jsonl);
-        let request = parse_ok(&["remove", "bitty-terminal.tabs", "--force"]);
+        let request = parse_ok(&["remove", "bitty-terminal.workspace", "--force"]);
         assert!(request.force);
     }
 
@@ -2785,7 +2785,7 @@ mod tests {
         granted.insert(CapabilityId::parse("terminal.semantic-read").expect("cap"));
         let mut records = BTreeMap::new();
         records.insert(
-            "bitty-terminal.tabs".to_string(),
+            "bitty-terminal.workspace".to_string(),
             PluginRecord {
                 source: "bundled".to_string(),
                 manifest_hash: "ab".repeat(32),
@@ -2804,7 +2804,7 @@ mod tests {
         assert_eq!(parsed, sample_state());
         assert_eq!(parsed.render(), rendered);
         assert!(rendered.contains("state_version = 1"));
-        assert!(rendered.contains("[plugins.\"bitty-terminal.tabs\"]"));
+        assert!(rendered.contains("[plugins.\"bitty-terminal.workspace\"]"));
         assert!(rendered.contains("granted = [\"terminal.semantic-read\"]"));
         // Empty state renders and parses.
         let empty = PluginState::new().render();
@@ -3167,30 +3167,30 @@ mod tests {
 
     #[test]
     fn parse_revoke_with_cap_pair_and_equals_forms() {
-        let request = parse_ok(&["revoke", "bitty-terminal.tabs", "--cap", "ui.rich"]);
+        let request = parse_ok(&["revoke", "bitty-terminal.workspace", "--cap", "ui.rich"]);
         assert_eq!(request.verb, PluginVerb::Revoke);
-        assert_eq!(request.id.as_deref(), Some("bitty-terminal.tabs"));
+        assert_eq!(request.id.as_deref(), Some("bitty-terminal.workspace"));
         assert_eq!(request.cap.as_deref(), Some("ui.rich"));
-        let request = parse_ok(&["revoke", "bitty-terminal.tabs", "--cap=ui.rich"]);
+        let request = parse_ok(&["revoke", "bitty-terminal.workspace", "--cap=ui.rich"]);
         assert_eq!(request.cap.as_deref(), Some("ui.rich"));
-        let request = parse_ok(&["revoke", "bitty-terminal.tabs"]);
+        let request = parse_ok(&["revoke", "bitty-terminal.workspace"]);
         assert_eq!(request.cap, None);
     }
 
     #[test]
     fn parse_cap_is_revoke_only() {
         assert!(
-            parse_error(&["install", "bitty-terminal.tabs", "--cap", "ui.rich"])
+            parse_error(&["install", "bitty-terminal.workspace", "--cap", "ui.rich"])
                 .contains("--cap only applies to `revoke`")
         );
         assert!(
-            parse_error(&["revoke", "bitty-terminal.tabs", "--cap"])
+            parse_error(&["revoke", "bitty-terminal.workspace", "--cap"])
                 .contains("--cap needs a value")
         );
         assert!(
             parse_error(&[
                 "revoke",
-                "bitty-terminal.tabs",
+                "bitty-terminal.workspace",
                 "--cap",
                 "ui.rich",
                 "--cap",

@@ -13,6 +13,12 @@
 //!   `<root>/<name>/<version>/bitty-component.toml` under the data-directory
 //!   root ([`components_root_for`], same resolver as `plugins/`, with the
 //!   developer-only [`COMPONENTS_DIR_ENV`] override). `PATH` is never read.
+//! - [`resolve_search`] applies the issue #1651 search priority (user
+//!   `$XDG_DATA_HOME/bitty/components/` over system
+//!   `/usr/lib/bitty/components/` via [`system_components_root_for`]); the
+//!   user tier wins on collision and a tampered user install fails closed
+//!   without system fallback. [`discover_components`] merges both tiers for
+//!   `bitty component list`.
 //! - [`ComponentDescriptor`] validation checks the name grammar, the semver
 //!   version, the executable name (no path separators), the protocol range,
 //!   and the SHA-256 digest of the executable. Every spawn re-runs the full
@@ -49,6 +55,7 @@ mod broker;
 mod descriptor;
 mod env;
 mod grant;
+mod inventory;
 mod policy;
 mod stderr;
 
@@ -64,6 +71,12 @@ pub use descriptor::{
 };
 pub use env::{ComponentEnv, is_allowlisted_env};
 pub use grant::{GrantError, PluginGrant};
+pub use inventory::{
+    ComponentSource, ComponentSummary, InstalledVersion, SYSTEM_COMPONENTS_DIR_DEFAULT,
+    SYSTEM_COMPONENTS_DIR_ENV, SearchedComponent, component_search_roots_for, discover_components,
+    incompatible_component_hint, missing_component_hint, resolve_search,
+    system_components_root_for, version_satisfies_caret,
+};
 pub use policy::{CrashTracker, SpawnGate};
 pub use stderr::StderrRing;
 

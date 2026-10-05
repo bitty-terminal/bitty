@@ -258,6 +258,21 @@ pub(crate) struct Args {
     pub(crate) plugin_format: Option<String>,
     /// `--no-color` for plugin table output (global or post-word).
     pub(crate) plugin_no_color: bool,
+    /// `bitty component` native binary extension management (issue #1651).
+    /// True once the first positional `component` word is seen; a program
+    /// literally named `component` needs `bitty -- component ...` (or
+    /// `bitty run -- component ...`). Tokens after the word land verbatim
+    /// in `component_raw` for [`crate::component::parse_component_request`].
+    pub(crate) component_word: bool,
+    /// Raw tokens after the `component` word (verb, operand, flags) for
+    /// [`crate::component::parse_component_request`]. Empty until
+    /// `component_word` is set.
+    pub(crate) component_raw: Vec<String>,
+    /// Global `--format` before the `component` word (fallback merged at
+    /// dispatch; a post-word `--format` wins).
+    pub(crate) component_format: Option<String>,
+    /// `--no-color` for component table output (global or post-word).
+    pub(crate) component_no_color: bool,
     /// `bitty version` version and build metadata (#1375, CTX-0763).
     /// True once the first positional `version` word is seen; a program
     /// literally named `version` needs `bitty run -- version ...` or the
@@ -422,6 +437,10 @@ impl Args {
             plugin_raw: Vec::new(),
             plugin_format: None,
             plugin_no_color: false,
+            component_word: false,
+            component_raw: Vec::new(),
+            component_format: None,
+            component_no_color: false,
             version_word: false,
             version_raw: Vec::new(),
             completion_word: false,
@@ -676,6 +695,7 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
             out.inspect_format = Some(val.to_string());
             out.dev_format = Some(val.to_string());
             out.plugin_format = Some(val.to_string());
+            out.component_format = Some(val.to_string());
             i += 1;
             continue;
         }
@@ -1062,6 +1082,7 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                     out.inspect_format = Some(raw[i + 1].clone());
                     out.dev_format = Some(raw[i + 1].clone());
                     out.plugin_format = Some(raw[i + 1].clone());
+                    out.component_format = Some(raw[i + 1].clone());
                     i += 2;
                 } else {
                     eprintln!("warning: --format needs a value (table|json|jsonl) — ignoring");
@@ -1069,6 +1090,7 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                     out.inspect_format = Some(String::new());
                     out.dev_format = Some(String::new());
                     out.plugin_format = Some(String::new());
+                    out.component_format = Some(String::new());
                     i += 1;
                 }
             }
@@ -1155,6 +1177,7 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                 out.inspect_no_color = true;
                 out.dev_no_color = true;
                 out.plugin_no_color = true;
+                out.component_no_color = true;
                 i += 1;
             }
             "--split" => {
@@ -1619,10 +1642,35 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                     && !out.list_word
                     && !out.dev_word
                     && !out.plugin_word
+                    && !out.component_word
                     && token == "plugin"
                 {
                     out.plugin_word = true;
                     out.plugin_raw.extend_from_slice(&raw[i + 1..]);
+                    break;
+                }
+                // `bitty component` native binary extension management
+                // (issue #1651). The word `component` is always this
+                // subcommand, never a program named `component`: use
+                // `bitty run -- component ...` (or legacy
+                // `bitty -- component ...`) for that program. Tokens after
+                // the word are kept verbatim for
+                // `component::parse_component_request`.
+                if !program_set
+                    && !out.config_word
+                    && !out.inspect_word
+                    && !out.init_word
+                    && !out.doctor_word
+                    && !out.run_word
+                    && !out.ctl_word
+                    && !out.list_word
+                    && !out.dev_word
+                    && !out.plugin_word
+                    && !out.component_word
+                    && token == "component"
+                {
+                    out.component_word = true;
+                    out.component_raw.extend_from_slice(&raw[i + 1..]);
                     break;
                 }
                 // `bitty version` version and build metadata (first positional
@@ -1642,6 +1690,7 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                     && !out.list_word
                     && !out.dev_word
                     && !out.plugin_word
+                    && !out.component_word
                     && !out.version_word
                     && !out.completion_word
                     && !out.cmd_word
@@ -1669,6 +1718,7 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                     && !out.list_word
                     && !out.dev_word
                     && !out.plugin_word
+                    && !out.component_word
                     && !out.version_word
                     && !out.completion_word
                     && !out.cmd_word
@@ -1696,6 +1746,7 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                     && !out.list_word
                     && !out.dev_word
                     && !out.plugin_word
+                    && !out.component_word
                     && !out.version_word
                     && !out.completion_word
                     && !out.cmd_word
@@ -1721,6 +1772,7 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                     && !out.list_word
                     && !out.dev_word
                     && !out.plugin_word
+                    && !out.component_word
                     && !out.version_word
                     && !out.completion_word
                     && !out.cmd_word
@@ -1808,12 +1860,12 @@ pub(crate) fn help_text() -> String {
                               Precedence: CLI flags > file > profile > defaults;\n  \
                               each flag overrides only its own field (siblings\n  \
                               keep file values).\n  \
-                 --format SHAPE  Doctor/ctl/list/inspect/plugin/version/cmd/x\n  \
+                 --format SHAPE  Doctor/ctl/list/inspect/plugin/component/version/cmd/x\n  \
                               output shape:\n  \
                               table|json|jsonl (default table; parsed globally,\n  \
                               consumed by `bitty doctor`, `bitty ctl`,\n  \
                               `bitty list`, `bitty inspect`,\n  \
-                              `bitty plugin list|info`, `bitty version`,\n  \
+                              `bitty plugin list|info`, `bitty component list`, `bitty version`,\n  \
                               `bitty cmd`, and `bitty x` (`bitty completion`\n  \
                               emits a script and ignores it; ignored by startup).\n\
                --socket PATH   Ctl target socket (global `bitty --socket P ctl ...`\n  \
@@ -1875,6 +1927,10 @@ pub(crate) fn help_text() -> String {
                              managed manifest (bitty-plugins.toml); install\n  \
                              requires capability consent; remove requires\n  \
                              --force; `bitty plugin --help` for detail\n  \
+            component <verb>  Native binary extension management (local, no execution):\n  \
+                              list|add|remove over user XDG (wins) and system tiers;\n  \
+                              add stages from a local path only (no download);\n  \
+                              remove only touches the user tier\n  \
             cmd <qualified-id> [--format SHAPE] [-- <args-json>]  Direct qualified\n  \
                              executable invocation for automation/diagnostics\n  \
                              (e.g. `bitty cmd core.terminal.text --format json\n  \
@@ -1950,7 +2006,7 @@ pub(crate) fn help_text() -> String {
            bitty doctor\n  \
            bitty doctor --format json\n  \
            bitty plugin list\n  \
-           bitty plugin install bitty-terminal.tabs --yes\n",
+           bitty plugin install bitty-terminal.workspace --yes\n",
         crate::version::version_semver()
     )
 }

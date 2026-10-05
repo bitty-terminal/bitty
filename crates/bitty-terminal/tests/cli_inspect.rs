@@ -278,18 +278,13 @@ fn inspect_plugin_table_names_owner() {
         text.contains("bitty-terminal.workspace") && text.contains("bitty-terminal"),
         "table must name id and owner publisher, got {text:?}"
     );
-    // Deprecated alias still resolves with a removal note.
+    // CTX-0974 (DEC-0100 waiver): purged tabs alias no longer resolves (NotFound, exit 1).
     let old = run_bitty(&["inspect", "plugin", "bitty-terminal.tabs"]);
     assert_eq!(
         old.status.code(),
-        Some(0),
-        "deprecated alias must still exit 0, stderr={:?}",
+        Some(1),
+        "purged alias must be NotFound (exit 1), stderr={:?}",
         stderr(&old)
-    );
-    let old_text = stdout(&old);
-    assert!(
-        old_text.contains("bitty-terminal.tabs") && old_text.contains("deprecated alias"),
-        "alias table must name old id + deprecation, got {old_text:?}"
     );
 }
 

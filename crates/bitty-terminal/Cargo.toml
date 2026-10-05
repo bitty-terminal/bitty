@@ -27,6 +27,7 @@ bitty-ipc = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "e9714e
 # the dependency direction stays one-way (extension mechanics behind the
 # Core gate, never Core importing the extension).
 bitty-storage = { git = "https://github.com/bitty-terminal/bitty-storage", rev = "5e720b4" }
+bitty-package = { path = "../bitty-package" }
 bitty-platform = { path = "../bitty-platform" }
 bitty-plugin-host = { path = "../bitty-plugin-host" }
 bitty-runtime = { path = "../bitty-runtime" }

@@ -229,6 +229,7 @@ mod chrome_keys;
 mod cli;
 mod cmd;
 mod completion;
+mod component;
 mod composer_owner;
 mod config_cli;
 mod config_reload;
@@ -380,6 +381,12 @@ fn main() {
     // config file, or a plugin VM).
     if args.help && args.plugin_word {
         println!("{}", plugin::plugin_help_text());
+        std::process::exit(0);
+    }
+    // `bitty component --help` shows component help (local class: no
+    // instance, no config, no component execution).
+    if args.help && args.component_word {
+        println!("{}", component::component_help_text());
         std::process::exit(0);
     }
     // `bitty version --help` shows version help (local class: no instance,
@@ -560,6 +567,32 @@ fn main() {
             &args.plugin_raw,
             &context,
             &mut input,
+            &mut output,
+        ));
+    }
+
+    // `bitty component` native binary extension management (issue #1651).
+    // Local class: file inventory only — no instance, no IPC, no component
+    // code ever loaded or executed. Runs before config load so `component`
+    // works with a missing config (safe-mode clean).
+    if args.component_word {
+        let xdg_data_home = std::env::var("XDG_DATA_HOME").ok();
+        let home = std::env::var("HOME").ok();
+        let components_dir = std::env::var("BITTY_COMPONENTS_DIR").ok();
+        let system_components_dir = std::env::var("BITTY_SYSTEM_COMPONENTS_DIR").ok();
+        let context = component::ComponentContext {
+            xdg_data_home: xdg_data_home.as_deref(),
+            home: home.as_deref(),
+            components_dir: components_dir.as_deref(),
+            system_components_dir: system_components_dir.as_deref(),
+            pre_format: args.component_format.as_deref(),
+            pre_no_color: args.component_no_color,
+        };
+        let stdout = std::io::stdout();
+        let mut output = stdout.lock();
+        std::process::exit(component::run_component_subcommand(
+            &args.component_raw,
+            &context,
             &mut output,
         ));
     }

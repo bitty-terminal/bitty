@@ -641,6 +641,8 @@ pub enum ChromeAction {
     /// scope.
     NewPanel,
     /// Nudge the enclosing split ratio (`resize_split:left`, ...).
+    /// The per-keypress delta is `layout.resize_step` (CTX-0963, issue
+    /// #1697; default `0.05`).
     ResizeSplit(SplitDir),
     /// Close the focused pane (`close_view`, alias `close_surface`).
     ///

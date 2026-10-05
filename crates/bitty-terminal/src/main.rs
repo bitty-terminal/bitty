@@ -877,6 +877,8 @@ fn main() {
     .with_leader(leader)
     // CTX-0735 (#981): the effective hint switch gates that arming.
     .with_hints_enabled(hints.enabled)
+    // CTX-0963 (#1697): the tiled resize step per keypress.
+    .with_resize_step(app_config.effective.layout.resize_step)
     // CTX-0223: `window.opacity` flows effective -> window creation
     // (sanitized by the platform config; fail-soft where unsupported).
     .with_window_opacity(app_config.effective.window.opacity)

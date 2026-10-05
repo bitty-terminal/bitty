@@ -84,6 +84,7 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "selection.auto_copy"
         | "layout.gaps_in"
         | "layout.gaps_out"
+        | "layout.resize_step"
         | "workspace.layout"
         | "workspace.show_bar"
         | "workspace.bar.edge"
@@ -565,6 +566,7 @@ const ATTRIBUTED_FIELDS: &[&str] = &[
     "close_confirm",
     "layout.gaps_in",
     "layout.gaps_out",
+    "layout.resize_step",
     "layout",
     "workspace.layout",
     "workspace.show_bar",
@@ -966,6 +968,8 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
 
         // CTX-0177: `layout.gaps_in`/`layout.gaps_out` are scalar-replace
         // like `selection.auto_copy`; absent table means "says nothing".
+        // CTX-0963: `layout.resize_step` joins them (same class; the float
+        // cannot share the u32 loop, so it merges in its own block below).
         if let Some(gaps) = &plan.layout {
             for (field, value) in [
                 ("layout.gaps_in", gaps.gaps_in),
@@ -1004,6 +1008,46 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
                         "layout.gaps_in" => effective.layout.gaps_in = value,
                         _ => effective.layout.gaps_out = value,
                     }
+                    record_attribution(
+                        &mut attribution,
+                        &mut conflicts,
+                        field,
+                        prev,
+                        src,
+                        MergeClass::ScalarReplace,
+                    );
+                }
+            }
+            {
+                let field = "layout.resize_step";
+                let value = gaps.resize_step;
+                if is_policy {
+                    policy_fields.insert(field.to_string(), src.clone());
+                    effective.layout.resize_step = value;
+                    let prev = attribution.get(field).cloned();
+                    record_attribution(
+                        &mut attribution,
+                        &mut conflicts,
+                        field,
+                        prev,
+                        src,
+                        MergeClass::ScalarReplace,
+                    );
+                } else if let Some(policy_src) = policy_fields.get(field) {
+                    policy_violations.push(ConfigError::NonOverridable {
+                        field: field.to_string(),
+                        policy_source: policy_src.describe(),
+                        attempted_source: src.describe(),
+                    });
+                    conflicts.push(MergeConflict {
+                        field: field.to_string(),
+                        previous_source: policy_src.clone(),
+                        new_source: src.clone(),
+                        merge_class: MergeClass::ScalarReplace,
+                    });
+                } else {
+                    let prev = attribution.get(field).cloned();
+                    effective.layout.resize_step = value;
                     record_attribution(
                         &mut attribution,
                         &mut conflicts,
@@ -2390,6 +2434,8 @@ fn merge_layers_allow_policy_violations(
         // CTX-0177: `layout.gaps_in`/`layout.gaps_out` are scalar-replace
         // like `selection.auto_copy`; absent table means "says nothing".
         // (Second merge path: allow-policy-violations variant for diagnostics.)
+        // CTX-0963: `layout.resize_step` joins them (same class; separate
+        // block for the f32 value).
         if let Some(gaps) = &plan.layout {
             for (field, value) in [
                 ("layout.gaps_in", gaps.gaps_in),
@@ -2428,6 +2474,46 @@ fn merge_layers_allow_policy_violations(
                         "layout.gaps_in" => effective.layout.gaps_in = value,
                         _ => effective.layout.gaps_out = value,
                     }
+                    record_attribution(
+                        &mut attribution,
+                        &mut conflicts,
+                        field,
+                        prev,
+                        src,
+                        MergeClass::ScalarReplace,
+                    );
+                }
+            }
+            {
+                let field = "layout.resize_step";
+                let value = gaps.resize_step;
+                if is_policy {
+                    policy_fields.insert(field.to_string(), src.clone());
+                    effective.layout.resize_step = value;
+                    let prev = attribution.get(field).cloned();
+                    record_attribution(
+                        &mut attribution,
+                        &mut conflicts,
+                        field,
+                        prev,
+                        src,
+                        MergeClass::ScalarReplace,
+                    );
+                } else if let Some(policy_src) = policy_fields.get(field) {
+                    policy_violations.push(ConfigError::NonOverridable {
+                        field: field.to_string(),
+                        policy_source: policy_src.describe(),
+                        attempted_source: src.describe(),
+                    });
+                    conflicts.push(MergeConflict {
+                        field: field.to_string(),
+                        previous_source: policy_src.clone(),
+                        new_source: src.clone(),
+                        merge_class: MergeClass::ScalarReplace,
+                    });
+                } else {
+                    let prev = attribution.get(field).cloned();
+                    effective.layout.resize_step = value;
                     record_attribution(
                         &mut attribution,
                         &mut conflicts,
@@ -4209,12 +4295,17 @@ mod tests {
         );
         assert_eq!(merge_class_for("selection"), Some(MergeClass::DeepMerge));
         // CTX-0177: panel gaps are scalar-replace leaves under a deep table.
+        // CTX-0963: the resize step joins them (same class).
         assert_eq!(
             merge_class_for("layout.gaps_in"),
             Some(MergeClass::ScalarReplace)
         );
         assert_eq!(
             merge_class_for("layout.gaps_out"),
+            Some(MergeClass::ScalarReplace)
+        );
+        assert_eq!(
+            merge_class_for("layout.resize_step"),
             Some(MergeClass::ScalarReplace)
         );
         assert_eq!(merge_class_for("layout"), Some(MergeClass::DeepMerge));
@@ -4455,6 +4546,7 @@ mod tests {
                 layout: Some(LayoutConfig {
                     gaps_in: 1,
                     gaps_out: 2,
+                    resize_step: crate::types::DEFAULT_LAYOUT_RESIZE_STEP,
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -4477,6 +4569,7 @@ mod tests {
                 layout: Some(LayoutConfig {
                     gaps_in: 3,
                     gaps_out: 0,
+                    resize_step: 0.08,
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -4488,6 +4581,7 @@ mod tests {
                 layout: Some(LayoutConfig {
                     gaps_in: 1,
                     gaps_out: 2,
+                    resize_step: crate::types::DEFAULT_LAYOUT_RESIZE_STEP,
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -4495,6 +4589,14 @@ mod tests {
         );
         let merged2 = merge_layers(vec![user2, cli]).expect("merge");
         assert_eq!(merged2.effective.layout.gaps_in, 3);
+        assert!(
+            (merged2.effective.layout.resize_step - 0.08).abs() < f32::EPSILON,
+            "resize_step merges scalar-replace like the gaps"
+        );
+        assert_eq!(
+            merged2.source_of("layout.resize_step").unwrap().layer,
+            LayerKind::Cli
+        );
         assert_eq!(
             merged2.source_of("layout.gaps_in").unwrap().layer,
             LayerKind::Cli

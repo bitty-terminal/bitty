@@ -43,7 +43,8 @@ pub struct ConfigPlan {
     /// Close-confirmation mode (CTX-0370 top-level `close_confirm`;
     /// scalar-replace). `None` means "this layer says nothing".
     pub close_confirm: Option<CloseConfirm>,
-    /// Layout configuration (CTX-0177 `layout.gaps_in`/`layout.gaps_out`).
+    /// Layout configuration (CTX-0177 `layout.gaps_in`/`layout.gaps_out`;
+    /// CTX-0963 `layout.resize_step`).
     pub layout: Option<LayoutConfig>,
     /// Default layout provider for new workspaces (CW-07
     /// `workspace.layout`; `None` means "this layer says nothing").

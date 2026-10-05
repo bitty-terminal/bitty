@@ -1069,6 +1069,7 @@ mod tests {
             layout: Some(LayoutConfig {
                 gaps_in: 2,
                 gaps_out: 2,
+                resize_step: crate::types::DEFAULT_LAYOUT_RESIZE_STEP,
             }),
             ..Default::default()
         };
@@ -1077,6 +1078,7 @@ mod tests {
             layout: Some(LayoutConfig {
                 gaps_in: MAX_LAYOUT_GAP_CELLS + 1,
                 gaps_out: 0,
+                resize_step: crate::types::DEFAULT_LAYOUT_RESIZE_STEP,
             }),
             ..Default::default()
         };

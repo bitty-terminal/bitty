@@ -32,7 +32,7 @@
 //!     window = { opacity = 0.95, padding = 8 },
 //!     terminal = { scrollback = 10000, shell = "/bin/fish", scroll_lines_per_notch = 3, scroll_pixels_per_notch = 16, cursor_style = "steady_bar", bell = "visual" },
 //!     selection = { auto_copy = true }, -- opt in to copy-on-select; false (default) matches kitty/ghostty (CTX-0371)
-//!     layout = { gaps_in = 1, gaps_out = 2 }, -- Hyprland-like panel gaps in cells, 0 = edge-to-edge (CTX-0177, default 0/0)
+//!     layout = { gaps_in = 1, gaps_out = 2, resize_step = 0.05 }, -- Hyprland-like panel gaps in cells, 0 = edge-to-edge (CTX-0177, default 0/0) + tiled resize step as split-ratio delta per keypress, 0.01..=0.20 (CTX-0963, default 0.05)
 //!     decoration = { gaps_in = 6, gaps_out = 6, border = 1, radius = 6, content_inset = 6 }, -- Core-owned workspace decoration in logical px; unified sibling/container gap + content padding (CTX-0292/CTX-0333)
 //!     scrollbar = { mode = "auto", width = 8 }, -- overlay scrollback thumb: auto (default) | hidden | always (CTX-0181, default auto/8)
 //!     mouse = { focus_follows_mouse = true, focus_follows_mouse_delay_ms = 0 }, -- opt-in hover focus, default false = click-to-focus (CTX-0260/CTX-0334)
@@ -108,7 +108,8 @@
 //!   `layout` follows the same fully-optional pattern: absent table/key means
 //!   "this layer says nothing"; when the table is present, omitted keys
 //!   default to [`LayoutConfig`](crate::types::LayoutConfig) defaults (`0`,
-//!   edge-to-edge), and out-of-range values fail closed with the field path.
+//!   edge-to-edge for the gaps; `0.05` for `resize_step`, CTX-0963), and
+//!   out-of-range values fail closed with the field path.
 //!   `scrollbar` follows it too: absent means "says nothing"; when present,
 //!   omitted keys default to [`ScrollbarConfig`](crate::types::ScrollbarConfig)
 //!   defaults (`auto` mode, width `8`), unknown `mode` strings and
@@ -1522,10 +1523,13 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
     // CTX-0177: `layout` follows the same fully-optional pattern: absent
     // table means "this layer says nothing" (plan.layout None so merge keeps
     // the lower-precedence value). When the table is present, omitted keys
-    // default to `LayoutConfig` defaults (0 = edge-to-edge) so
+    // default to `LayoutConfig` defaults (0 = edge-to-edge for the gaps,
+    // `DEFAULT_LAYOUT_RESIZE_STEP` for the step) so
     // `layout = { gaps_in = 1 }` keeps working without forcing `gaps_out`.
     // Present values are range-checked here (fail-closed with the field path)
     // and again by `LayoutConfig::validate` via `plan.validate()`.
+    // CTX-0963: `layout.resize_step` is a number (int or float accepted from
+    // Lua); non-finite or out-of-range values fail closed, never clamp.
     let layout = match data.layout {
         None => None,
         Some(l) => {
@@ -1560,7 +1564,32 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
                     v as u32
                 }
             };
-            Some(LayoutConfig { gaps_in, gaps_out })
+            let resize_step = match l.resize_step {
+                None => defaults.resize_step,
+                Some(v) => {
+                    let step = v as f32;
+                    if !step.is_finite()
+                        || !(crate::types::MIN_LAYOUT_RESIZE_STEP
+                            ..=crate::types::MAX_LAYOUT_RESIZE_STEP)
+                            .contains(&step)
+                    {
+                        return Err(ConfigError::validation(
+                            "layout.resize_step",
+                            format!(
+                                "must be within [{}, {}] (found {v})",
+                                crate::types::MIN_LAYOUT_RESIZE_STEP,
+                                crate::types::MAX_LAYOUT_RESIZE_STEP
+                            ),
+                        ));
+                    }
+                    step
+                }
+            };
+            Some(LayoutConfig {
+                gaps_in,
+                gaps_out,
+                resize_step,
+            })
         }
     };
     // CTX-0292/CTX-0333: `decoration` follows the same fully-optional
@@ -2641,6 +2670,10 @@ mod tests {
         let layout = plan.layout.expect("layout present");
         assert_eq!(layout.gaps_in, 0);
         assert_eq!(layout.gaps_out, 0);
+        assert!(
+            (layout.resize_step - crate::types::DEFAULT_LAYOUT_RESIZE_STEP).abs() < f32::EPSILON,
+            "omitted step inherits the default"
+        );
         let plan = parse_lua_config(
             r#"return { terminal = { scrollback = 10000 } }"#,
             &test_source(),
@@ -2655,6 +2688,12 @@ mod tests {
             r#"return { layout = { gaps_in = 1.5 } }"#,
             r#"return { layout = "wide" }"#,
             r#"return { layout = { gaps_in = 1, bogus = 2 } }"#,
+            r#"return { layout = { resize_step = 0 } }"#,
+            r#"return { layout = { resize_step = -0.05 } }"#,
+            r#"return { layout = { resize_step = 0.009 } }"#,
+            r#"return { layout = { resize_step = 0.21 } }"#,
+            r#"return { layout = { resize_step = 1 } }"#,
+            r#"return { layout = { resize_step = "0.05" } }"#,
         ] {
             let err = parse_lua_config(bad, &test_source()).unwrap_err();
             let msg = err.to_string();
@@ -2663,6 +2702,33 @@ mod tests {
                 "must name the field: {bad} -> {msg}"
             );
         }
+    }
+
+    #[test]
+    fn lua_layout_resize_step_parse_and_validate() {
+        // CTX-0963 (issue #1697): explicit steps parse (ints and floats in
+        // range); omitted inherits the default; out-of-range and wrong types
+        // fail closed naming the field.
+        let plan = parse_lua_config(
+            r#"return { layout = { resize_step = 0.02 } }"#,
+            &test_source(),
+        )
+        .expect("float step parses");
+        assert!(
+            (plan.layout.expect("present").resize_step - 0.02).abs() < 1e-6,
+            "float step survives"
+        );
+        let plan = parse_lua_config(
+            r#"return { layout = { gaps_in = 1, resize_step = 0.08 } }"#,
+            &test_source(),
+        )
+        .expect("mixed layout parses");
+        let layout = plan.layout.expect("layout present");
+        assert_eq!(layout.gaps_in, 1);
+        assert!(
+            (layout.resize_step - 0.08).abs() < 1e-6,
+            "explicit step survives alongside gaps"
+        );
     }
 
     #[test]
@@ -4549,6 +4615,31 @@ mod tests {
                 "gaps_out high",
                 r#"return { layout = { gaps_out = 17 } }"#.to_string(),
                 Some("layout.gaps_out"),
+            ),
+            (
+                "resize_step low",
+                r#"return { layout = { resize_step = 0 } }"#.to_string(),
+                Some("layout.resize_step"),
+            ),
+            (
+                "resize_step min",
+                r#"return { layout = { resize_step = 0.01 } }"#.to_string(),
+                None,
+            ),
+            (
+                "resize_step default",
+                r#"return { layout = { resize_step = 0.05 } }"#.to_string(),
+                None,
+            ),
+            (
+                "resize_step max",
+                r#"return { layout = { resize_step = 0.20 } }"#.to_string(),
+                None,
+            ),
+            (
+                "resize_step high",
+                r#"return { layout = { resize_step = 0.21 } }"#.to_string(),
+                Some("layout.resize_step"),
             ),
             (
                 "scrollbar.width low",

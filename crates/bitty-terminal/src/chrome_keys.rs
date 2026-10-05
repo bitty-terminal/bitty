@@ -80,6 +80,11 @@ pub(crate) struct ChromeState {
     /// effective config at startup (default-on). While disabled the Leader
     /// never arms — presses keep their normal owner (fail-open routing).
     pub(crate) hints_enabled: bool,
+    /// Tiled resize step as a split-ratio delta per `resize_split` keypress
+    /// (CTX-0963, issue #1697): resolved from `layout.resize_step` at
+    /// startup and adopted live on reload. Sanitized at use (fail-closed to
+    /// the default when non-finite or out of range).
+    pub(crate) resize_step: f32,
 }
 
 impl ChromeState {
@@ -104,6 +109,7 @@ impl ChromeState {
             hint_generation: 0,
             editor: crate::editor_host::ExternalEditorHost::new(),
             hints_enabled: true,
+            resize_step: bitty_config::types::DEFAULT_LAYOUT_RESIZE_STEP,
         }
     }
 
@@ -116,6 +122,15 @@ impl ChromeState {
     /// Injects the effective-config hint kill switch (startup path).
     pub(crate) fn with_hints_enabled(mut self, enabled: bool) -> Self {
         self.hints_enabled = enabled;
+        self
+    }
+
+    /// Injects the effective-config tiled resize step (CTX-0963 startup path).
+    ///
+    /// Sanitized fail-closed: non-finite or out-of-range values resolve to
+    /// [`bitty_config::types::DEFAULT_LAYOUT_RESIZE_STEP`], never clamp.
+    pub(crate) fn with_resize_step(mut self, step: f32) -> Self {
+        self.resize_step = sanitize_resize_step(step);
         self
     }
 
@@ -602,16 +617,38 @@ pub(crate) fn find_resize_target(
     }
 }
 
-/// Nudge the enclosing split ratio 0.1 in the given direction (issue
+/// Sanitizes a configured tiled resize step fail-closed (CTX-0963).
+///
+/// Returns the step when finite and within
+/// `MIN_LAYOUT_RESIZE_STEP..=MAX_LAYOUT_RESIZE_STEP`, else
+/// `DEFAULT_LAYOUT_RESIZE_STEP`. Never clamps: a misconfigured value must
+/// not silently become a boundary value.
+pub(crate) fn sanitize_resize_step(step: f32) -> f32 {
+    if step.is_finite()
+        && (bitty_config::types::MIN_LAYOUT_RESIZE_STEP
+            ..=bitty_config::types::MAX_LAYOUT_RESIZE_STEP)
+            .contains(&step)
+    {
+        step
+    } else {
+        bitty_config::types::DEFAULT_LAYOUT_RESIZE_STEP
+    }
+}
+
+/// Nudge the enclosing split ratio by `step` in the given direction (issue
 /// #1445: the divider moves left/up (-) or right/down (+), matching the
 /// border-drag geometry where a positive drag delta toward `second`
 /// grows the first pane via [`LayoutNode::resize_split_by_drag`]).
 /// `set_split_ratio_at` clamps to `0.10..=0.90`. Returns false when no
 /// matching split holds focus.
-pub(crate) fn resize_focused_pane(
+///
+/// The step is sanitized fail-closed via [`sanitize_resize_step`], so a
+/// hand-built or stale value can never stall (`0`) or jump (`huge`) a pane.
+pub(crate) fn resize_focused_pane_with_step(
     layout: &mut LayoutNode,
     focused: ViewId,
     dir: bitty_config::SplitDir,
+    step: f32,
 ) -> bool {
     use bitty_config::SplitDir as D;
     let horizontal = matches!(dir, D::Left | D::Right);
@@ -624,12 +661,37 @@ pub(crate) fn resize_focused_pane(
     };
     // Divider moves in the pressed direction regardless of which side
     // holds focus (Hyprland/Niri model): Right/Down grows the first pane
-    // (+0.1), Left/Up shrinks it (-0.1). The previous focus-dependent
+    // (+step), Left/Up shrinks it (-step). The previous focus-dependent
     // sign moved the same divider opposite ways for the same key
     // depending on focus, which read as swapped hjkl directions.
     let positive = matches!(dir, D::Right | D::Down);
-    let delta = if positive { 0.1 } else { -0.1 };
+    let delta = sanitize_resize_step(step);
+    let delta = if positive { delta } else { -delta };
     layout.set_split_ratio_at(&target, ratio + delta)
+}
+
+/// Nudge the enclosing split ratio by the default step (CTX-0963, issue
+/// #1697: [`bitty_config::types::DEFAULT_LAYOUT_RESIZE_STEP`]).
+///
+/// Thin wrapper over [`resize_focused_pane_with_step`] for callers without a
+/// configured step (tests, fallbacks). Production key dispatch reads
+/// `ChromeState::resize_step`.
+///
+/// Test-only today (production threads the configured step); the
+/// `allow(dead_code)` keeps the non-test build warning-free until a second
+/// production caller lands.
+#[allow(dead_code)]
+pub(crate) fn resize_focused_pane(
+    layout: &mut LayoutNode,
+    focused: ViewId,
+    dir: bitty_config::SplitDir,
+) -> bool {
+    resize_focused_pane_with_step(
+        layout,
+        focused,
+        dir,
+        bitty_config::types::DEFAULT_LAYOUT_RESIZE_STEP,
+    )
 }
 
 #[cfg(test)]
@@ -1125,7 +1187,8 @@ impl TerminalApp {
                     }
                 };
                 let mut layout = self.runtime.layout().clone();
-                if resize_focused_pane(&mut layout, focused, dir) {
+                if resize_focused_pane_with_step(&mut layout, focused, dir, self.chrome.resize_step)
+                {
                     self.runtime.set_layout(layout);
                     eprintln!("bitty: keymap resize_split:{} applied", dir.canonical());
                 } else {
@@ -5363,8 +5426,8 @@ mod tests {
                 "resize:left with focus {focused:?} should succeed"
             );
             assert!(
-                (ratio_of(&layout) - 0.4).abs() < 1e-6,
-                "resize:left must move divider left (0.5 -> 0.4), got {}",
+                (ratio_of(&layout) - 0.45).abs() < 1e-6,
+                "resize:left must move divider left (0.5 -> 0.45), got {}",
                 ratio_of(&layout)
             );
         }
@@ -5380,8 +5443,8 @@ mod tests {
                 "resize:right with focus {focused:?} should succeed"
             );
             assert!(
-                (ratio_of(&layout) - 0.6).abs() < 1e-6,
-                "resize:right must move divider right (0.5 -> 0.6), got {}",
+                (ratio_of(&layout) - 0.55).abs() < 1e-6,
+                "resize:right must move divider right (0.5 -> 0.55), got {}",
                 ratio_of(&layout)
             );
         }
@@ -5405,8 +5468,8 @@ mod tests {
                 "resize:up with focus {focused:?} should succeed"
             );
             assert!(
-                (ratio_of(&layout) - 0.4).abs() < 1e-6,
-                "resize:up must move divider up (0.5 -> 0.4), got {}",
+                (ratio_of(&layout) - 0.45).abs() < 1e-6,
+                "resize:up must move divider up (0.5 -> 0.45), got {}",
                 ratio_of(&layout)
             );
         }
@@ -5430,8 +5493,8 @@ mod tests {
                 "resize:down with focus {focused:?} should succeed"
             );
             assert!(
-                (ratio_of(&layout) - 0.6).abs() < 1e-6,
-                "resize:down must move divider down (0.5 -> 0.6), got {}",
+                (ratio_of(&layout) - 0.55).abs() < 1e-6,
+                "resize:down must move divider down (0.5 -> 0.55), got {}",
                 ratio_of(&layout)
             );
         }
@@ -5532,18 +5595,115 @@ mod tests {
                         let ratio = ratio_of(&layout);
                         if *increases {
                             assert!(
-                                (ratio - 0.6).abs() < 1e-6,
-                                "{label} {key_char} must increase ratio (0.5 -> 0.6), got {ratio}"
+                                (ratio - 0.55).abs() < 1e-6,
+                                "{label} {key_char} must increase ratio (0.5 -> 0.55), got {ratio}"
                             );
                         } else {
                             assert!(
-                                (ratio - 0.4).abs() < 1e-6,
-                                "{label} {key_char} must decrease ratio (0.5 -> 0.4), got {ratio}"
+                                (ratio - 0.45).abs() < 1e-6,
+                                "{label} {key_char} must decrease ratio (0.5 -> 0.45), got {ratio}"
                             );
                         }
                     }
                 }
             }
         }
+    }
+
+    // CTX-0963 (issue #1697): the tiled resize step defaults to 0.05 and is
+    // user-configurable via `layout.resize_step` (0.01..=0.20, fail-closed).
+
+    #[test]
+    fn resize_default_step_is_smaller_than_legacy_coarse_step() {
+        // The legacy hardcoded 0.10 read as too coarse; the default is now
+        // half that.
+        const { assert!(bitty_config::types::DEFAULT_LAYOUT_RESIZE_STEP == 0.05) }
+        const { assert!(bitty_config::types::DEFAULT_LAYOUT_RESIZE_STEP < 0.10) }
+    }
+
+    #[test]
+    fn resize_custom_step_moves_by_configured_delta() {
+        use bitty_config::SplitDir;
+        let mut layout = two_pane_layout();
+        assert!(resize_focused_pane_with_step(
+            &mut layout,
+            ViewId::new(1),
+            SplitDir::Right,
+            0.02
+        ));
+        assert!(
+            (ratio_of(&layout) - 0.52).abs() < 1e-6,
+            "custom 0.02 step must move 0.5 -> 0.52, got {}",
+            ratio_of(&layout)
+        );
+        let mut layout = two_pane_layout();
+        assert!(resize_focused_pane_with_step(
+            &mut layout,
+            ViewId::new(1),
+            SplitDir::Left,
+            0.20
+        ));
+        assert!(
+            (ratio_of(&layout) - 0.30).abs() < 1e-6,
+            "max 0.20 step must move 0.5 -> 0.30, got {}",
+            ratio_of(&layout)
+        );
+    }
+
+    #[test]
+    fn resize_step_sanitizes_fail_closed_to_default() {
+        // Non-finite and out-of-range steps fall back to the default (never
+        // clamp to a boundary, never stall at 0).
+        for bad in [
+            0.0,
+            -0.05,
+            0.009,
+            0.21,
+            1.0,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ] {
+            assert_eq!(
+                sanitize_resize_step(bad),
+                bitty_config::types::DEFAULT_LAYOUT_RESIZE_STEP,
+                "bad step {bad} must fall back to default"
+            );
+        }
+        assert_eq!(
+            sanitize_resize_step(0.02),
+            0.02,
+            "in-range step must pass through"
+        );
+        // The fall-back also applies at the layout level.
+        use bitty_config::SplitDir;
+        let mut layout = two_pane_layout();
+        assert!(resize_focused_pane_with_step(
+            &mut layout,
+            ViewId::new(1),
+            SplitDir::Right,
+            f32::NAN
+        ));
+        assert!(
+            (ratio_of(&layout) - 0.55).abs() < 1e-6,
+            "NaN step must apply the default 0.05, got {}",
+            ratio_of(&layout)
+        );
+    }
+
+    #[test]
+    fn chrome_state_carries_configured_resize_step() {
+        use bitty_config::ResolvedKeymap;
+        let chrome = ChromeState::new(Vec::<ResolvedKeymap>::new()).with_resize_step(0.02);
+        assert!(
+            (chrome.resize_step - 0.02).abs() < f32::EPSILON,
+            "startup must carry the configured step"
+        );
+        let fallback = ChromeState::new(Vec::<ResolvedKeymap>::new()).with_resize_step(f32::NAN);
+        assert_eq!(
+            fallback.resize_step,
+            bitty_config::types::DEFAULT_LAYOUT_RESIZE_STEP,
+            "bad startup value must fall back to default"
+        );
     }
 }

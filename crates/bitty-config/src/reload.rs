@@ -124,6 +124,7 @@ impl std::fmt::Display for ReloadClass {
 /// | `close_confirm`           | RestartRequired    |
 /// | `layout.gaps_in`          | RestartRequired    |
 /// | `layout.gaps_out`         | RestartRequired    |
+/// | `layout.resize_step`      | Live               |
 /// | `workspace.layout`        | RestartRequired    |
 /// | `scrollbar.mode`          | RestartRequired    |
 /// | `scrollbar.width`         | RestartRequired    |
@@ -198,6 +199,11 @@ pub const LIVE_FIELDS: &[&str] = &[
     "leader_timeout_ms",
     "hints_enabled",
     "keymaps",
+    // CTX-0963 (#1697): the tiled resize step is read at keypress time from
+    // the effective config (no PTY recreation, no layout rebuild), so it
+    // reconciles live like the keymaps — unlike `layout.gaps_in/out`, which
+    // are stamped into every layout call at startup.
+    "layout.resize_step",
     // CTX-0873: the bar band is presentation chrome; the runtime re-solves
     // the band and reflows in place (no PTY recreation).
     "workspace.show_bar",
@@ -522,6 +528,14 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
         "layout.gaps_out",
         old.layout.gaps_out.to_string(),
         new.layout.gaps_out.to_string(),
+    );
+    // CTX-0963 (#1697): the tiled resize step is read at keypress time, so
+    // changes reconcile live. Fixed `{:.3}` formatting keeps the diff stable
+    // across float reprs.
+    push_if_changed(
+        "layout.resize_step",
+        format!("{:.3}", old.layout.resize_step),
+        format!("{:.3}", new.layout.resize_step),
     );
     // CW-07: the default provider is stamped on workspace creation, so
     // changes apply at startup, not live. (Per-workspace live switches go
@@ -1119,6 +1133,10 @@ mod tests {
             ReloadClass::RestartRequired
         );
         assert_eq!(classify_field("layout"), ReloadClass::RestartRequired);
+        // CTX-0963 (#1697): the resize step is read at keypress time (no
+        // PTY recreation, no layout rebuild), so it is Live even though the
+        // sibling gap leaves under the same section stay RestartRequired.
+        assert_eq!(classify_field("layout.resize_step"), ReloadClass::Live);
         // CW-07: the default provider is stamped at workspace creation, so
         // changes apply at startup, not live.
         assert_eq!(
@@ -1453,6 +1471,23 @@ mod tests {
         let r2 = diff(&old, &new2);
         assert_eq!(r2.overall, ReloadClass::RestartRequired);
         assert!(r2.diffs.iter().any(|d| d.field == "layout.gaps_out"));
+    }
+
+    #[test]
+    fn diff_resize_step_is_live_and_reconciles() {
+        // CTX-0963 (#1697): changing the tiled resize step surfaces as a
+        // Live diff (read at keypress, no restart) and reconciles in place.
+        let old = EffectiveConfig::default();
+        let mut new = old.clone();
+        new.layout.resize_step = 0.02;
+        let r = diff(&old, &new);
+        assert_eq!(r.overall, ReloadClass::Live);
+        assert!(!r.needs_restart);
+        assert!(r.diffs.iter().any(|d| d.field == "layout.resize_step"));
+        let mut cur = old;
+        let applied = reconcile_live(&mut cur, &new).expect("step must reconcile live");
+        assert_eq!(applied.overall, ReloadClass::Live);
+        assert!((cur.layout.resize_step - 0.02).abs() < f32::EPSILON);
     }
 
     #[test]

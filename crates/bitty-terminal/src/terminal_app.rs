@@ -635,11 +635,21 @@ impl TerminalApp {
         self
     }
 
+    /// Injects the effective-config tiled resize step (CTX-0963 #1697).
+    ///
+    /// Resolved once at startup from `layout.resize_step`; adopted live on
+    /// reload via [`Self::adopt_live_config`].
+    pub(crate) fn with_resize_step(mut self, step: f32) -> Self {
+        self.chrome = self.chrome.with_resize_step(step);
+        self
+    }
+
     /// Adopts the app-owned half of an accepted live reload (CTX-0898, #1522).
     ///
     /// Swaps the resolved keymap table (`keymaps` + `mod_key`), the Leader
-    /// binding (`leader_key` + `leader_timeout_ms`), and the hint kill switch
-    /// (`hints_enabled`), and re-applies the platform transparency hint for
+    /// binding (`leader_key` + `leader_timeout_ms`), the hint kill switch
+    /// (`hints_enabled`), the tiled resize step (`layout.resize_step`,
+    /// CTX-0963), and re-applies the platform transparency hint for
     /// `window.opacity`. A Leader window or hint session armed under the old
     /// binding is cancelled when the binding changes or hints are disabled,
     /// so no stale chord or armed window outlives the reload. Held-key
@@ -652,6 +662,7 @@ impl TerminalApp {
         self.chrome.keymaps = adoption.keymaps;
         self.chrome.leader = adoption.leader;
         self.chrome.hints_enabled = adoption.hints_enabled;
+        self.chrome.resize_step = crate::chrome_keys::sanitize_resize_step(adoption.resize_step);
         // An armed Leader window or hint session was opened under the old
         // binding/table; its follow-up chord could now mean something else,
         // so cancel it (fail-open: keys route normally again).

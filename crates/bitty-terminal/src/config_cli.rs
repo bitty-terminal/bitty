@@ -764,6 +764,14 @@ pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                         &src("layout.gaps_out")
                     )
                 );
+                println!(
+                    "{}",
+                    check_row(
+                        "layout.resize_step",
+                        format!("{:.3}", e.layout.resize_step),
+                        &src("layout.resize_step")
+                    )
+                );
                 for (field, value) in [
                     ("decoration.gaps_in", e.decoration.gaps_in),
                     ("decoration.gaps_out", e.decoration.gaps_out),

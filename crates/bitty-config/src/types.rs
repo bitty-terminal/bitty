@@ -56,6 +56,20 @@ pub const DEFAULT_LAYOUT_GAPS_OUT: u32 = 0;
 /// values fail closed like every other config bound.
 pub const MAX_LAYOUT_GAP_CELLS: u32 = 16;
 
+/// Default tiled resize step (`layout.resize_step`), as a split-ratio delta
+/// per keypress (CTX-0963, issue #1697): `0.05` (half the legacy hardcoded
+/// `0.10`, which read as too coarse for Ctrl+Shift+h/j/k/l).
+pub const DEFAULT_LAYOUT_RESIZE_STEP: f32 = 0.05;
+
+/// Minimum tiled resize step, as a split-ratio delta (CTX-0963): `0.01`.
+/// Below one percent a keypress is noise; smaller values fail closed.
+pub const MIN_LAYOUT_RESIZE_STEP: f32 = 0.01;
+
+/// Maximum tiled resize step, as a split-ratio delta (CTX-0963): `0.20`.
+/// Above twenty percent a single keypress defeats fine tiling (drag
+/// territory); larger values fail closed, never clamp.
+pub const MAX_LAYOUT_RESIZE_STEP: f32 = 0.20;
+
 /// Default Core-owned workspace decoration sibling gap (CTX-0292; unified
 /// CTX-0333): 6 logical px. CTX-0333 raised this from the earlier `4` so the
 /// default sibling (panel-to-panel / panel-to-terminal) gap equals the
@@ -2375,18 +2389,30 @@ impl std::fmt::Display for CloseConfirm {
 /// `layout = {}` keeps edge-to-edge tiling). Both default to `0`, preserving
 /// edge-to-edge tiling for existing users.
 ///
+/// Tiled resize granularity lives here too: `resize_step` is the
+/// split-ratio delta applied per `resize_split` keypress (CTX-0963, issue
+/// #1697; default [`DEFAULT_LAYOUT_RESIZE_STEP`], bounds
+/// [`MIN_LAYOUT_RESIZE_STEP`]..=[`MAX_LAYOUT_RESIZE_STEP`], fail-closed).
+/// Set via `init.lua` `layout = { resize_step = 0.05 }`; omitted when the
+/// table is present inherits the default, so existing `layout = { ... }`
+/// tables keep working unchanged.
+///
 /// One coherent model with [`DecorationConfig`]: the px decoration is scaled
 /// by the Window DPI factor and the cell gaps convert through the live cell
 /// metrics, so `effective gap = decoration.gap * DPI_scale +
 /// layout.gap_cells * cell_axis`. Because `layout` cell gaps default to `0`,
 /// the default effective sibling and container gaps are both the `6` logical
 /// px decoration default (CTX-0333).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LayoutConfig {
     /// Spacing between sibling panes, in cells, `0..=MAX_LAYOUT_GAP_CELLS`.
     pub gaps_in: u32,
     /// Inset around the container edge, in cells, `0..=MAX_LAYOUT_GAP_CELLS`.
     pub gaps_out: u32,
+    /// Split-ratio delta per tiled `resize_split` keypress (CTX-0963, issue
+    /// #1697), `MIN_LAYOUT_RESIZE_STEP..=MAX_LAYOUT_RESIZE_STEP`.
+    /// Read at keypress time only, never on a hot path.
+    pub resize_step: f32,
 }
 
 impl Default for LayoutConfig {
@@ -2394,12 +2420,14 @@ impl Default for LayoutConfig {
         Self {
             gaps_in: DEFAULT_LAYOUT_GAPS_IN,
             gaps_out: DEFAULT_LAYOUT_GAPS_OUT,
+            resize_step: DEFAULT_LAYOUT_RESIZE_STEP,
         }
     }
 }
 
 impl LayoutConfig {
-    /// Validate layout config (fail-closed on oversized gaps).
+    /// Validate layout config (fail-closed on oversized gaps and on a
+    /// non-finite or out-of-range resize step; never clamps).
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.gaps_in > MAX_LAYOUT_GAP_CELLS {
             return Err(ConfigError::validation(
@@ -2411,6 +2439,17 @@ impl LayoutConfig {
             return Err(ConfigError::validation(
                 "layout.gaps_out",
                 format!("must be within [0, {MAX_LAYOUT_GAP_CELLS}]"),
+            ));
+        }
+        if !self.resize_step.is_finite()
+            || !(MIN_LAYOUT_RESIZE_STEP..=MAX_LAYOUT_RESIZE_STEP).contains(&self.resize_step)
+        {
+            return Err(ConfigError::validation(
+                "layout.resize_step",
+                format!(
+                    "must be within [{MIN_LAYOUT_RESIZE_STEP}, {MAX_LAYOUT_RESIZE_STEP}] (found {})",
+                    self.resize_step
+                ),
             ));
         }
         Ok(())
@@ -4492,11 +4531,16 @@ mod tests {
     #[test]
     fn layout_gaps_default_zero_and_validate_bounds() {
         // CTX-0177: defaults preserve edge-to-edge tiling; bounds fail closed.
+        // CTX-0963: the resize step defaults to 0.05 with 0.01..=0.20 bounds.
         const { assert!(DEFAULT_LAYOUT_GAPS_IN == 0) }
         const { assert!(DEFAULT_LAYOUT_GAPS_OUT == 0) }
+        const { assert!(DEFAULT_LAYOUT_RESIZE_STEP == 0.05) }
+        const { assert!(MIN_LAYOUT_RESIZE_STEP == 0.01) }
+        const { assert!(MAX_LAYOUT_RESIZE_STEP == 0.20) }
         let d = LayoutConfig::default();
         assert_eq!(d.gaps_in, 0);
         assert_eq!(d.gaps_out, 0);
+        assert!((d.resize_step - DEFAULT_LAYOUT_RESIZE_STEP).abs() < f32::EPSILON);
         d.validate().expect("default valid");
         EffectiveConfig::default()
             .validate()
@@ -4505,9 +4549,43 @@ mod tests {
             LayoutConfig {
                 gaps_in: gin,
                 gaps_out: gout,
+                resize_step: DEFAULT_LAYOUT_RESIZE_STEP,
             }
             .validate()
             .expect("boundary gaps must be valid");
+        }
+        for step in [
+            MIN_LAYOUT_RESIZE_STEP,
+            DEFAULT_LAYOUT_RESIZE_STEP,
+            MAX_LAYOUT_RESIZE_STEP,
+            0.02,
+            0.10,
+        ] {
+            LayoutConfig {
+                gaps_in: 0,
+                gaps_out: 0,
+                resize_step: step,
+            }
+            .validate()
+            .expect("in-range step must be valid");
+        }
+        for step in [
+            0.0,
+            -0.05,
+            0.009,
+            0.21,
+            1.0,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ] {
+            LayoutConfig {
+                gaps_in: 0,
+                gaps_out: 0,
+                resize_step: step,
+            }
+            .validate()
+            .expect_err("out-of-range step must fail closed");
         }
         for (gin, gout) in [
             (MAX_LAYOUT_GAP_CELLS + 1, 0),
@@ -4517,6 +4595,7 @@ mod tests {
             LayoutConfig {
                 gaps_in: gin,
                 gaps_out: gout,
+                resize_step: DEFAULT_LAYOUT_RESIZE_STEP,
             }
             .validate()
             .expect_err("oversized gaps must fail closed");

@@ -228,12 +228,18 @@ pub struct SelectionData {
 ///
 /// Hyprland-like panel gaps in cells: `gaps_in` between sibling panes,
 /// `gaps_out` around the container edge (`0` = edge-to-edge tiling).
+/// `resize_step` (CTX-0963, issue #1697) is the split-ratio delta per tiled
+/// `resize_split` keypress; range-checked downstream in `bitty-config`
+/// (fail-closed).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct LayoutData {
     /// Inner gap in cells (present only when the key is set).
     pub gaps_in: Option<i64>,
     /// Outer gap in cells (present only when the key is set).
     pub gaps_out: Option<i64>,
+    /// Tiled resize step as a split-ratio delta (present only when set; raw
+    /// number, integers and floats both accepted).
+    pub resize_step: Option<f64>,
 }
 
 /// Layout-provider selection, plain data (CW-07; see [`FontData`] for
@@ -1293,8 +1299,11 @@ impl ConfigData {
                     // table/key means "says nothing". Integers only
                     // (floats rejected like every other cell/count key);
                     // range-checked downstream in `bitty-config`.
+                    // CTX-0963: `layout.resize_step` is the split-ratio
+                    // delta per tiled resize keypress (number, int or
+                    // float); bounds-checked downstream, fail-closed.
                     let nested = expect_table(key, val)?;
-                    check_nested_keys(key, nested, &["gaps_in", "gaps_out"])?;
+                    check_nested_keys(key, nested, &["gaps_in", "gaps_out", "resize_step"])?;
                     let gaps_in = match get_field(nested, "gaps_in") {
                         Some(v) => Some(expect_integer("layout.gaps_in", v)?),
                         None => None,
@@ -1303,7 +1312,15 @@ impl ConfigData {
                         Some(v) => Some(expect_integer("layout.gaps_out", v)?),
                         None => None,
                     };
-                    out.layout = Some(LayoutData { gaps_in, gaps_out });
+                    let resize_step = match get_field(nested, "resize_step") {
+                        Some(v) => Some(expect_number("layout.resize_step", v)?),
+                        None => None,
+                    };
+                    out.layout = Some(LayoutData {
+                        gaps_in,
+                        gaps_out,
+                        resize_step,
+                    });
                 }
                 "workspace" => {
                     // CW-07: `workspace = { layout = "dwindle" }` selects
@@ -2194,26 +2211,33 @@ mod tests {
     fn layout_gaps_extract_and_absent_means_no_override() {
         // CTX-0177: explicit integers parse; absent table/key is `None` so
         // merge keeps the lower-precedence value (0 when no layer sets it).
+        // CTX-0963: `resize_step` rides the same table as a number.
         let data = eval_ok(r#"return { layout = { gaps_in = 1, gaps_out = 2 } }"#);
         let layout = data.layout.unwrap();
         assert_eq!(layout.gaps_in, Some(1));
         assert_eq!(layout.gaps_out, Some(2));
+        assert_eq!(layout.resize_step, None);
         let data = eval_ok(r#"return { layout = { gaps_in = 0 } }"#);
         let layout = data.layout.unwrap();
         assert_eq!(layout.gaps_in, Some(0));
         assert_eq!(layout.gaps_out, None);
+        let data = eval_ok(r#"return { layout = { resize_step = 0.02 } }"#);
+        let layout = data.layout.unwrap();
+        assert!((layout.resize_step.unwrap() - 0.02).abs() < 1e-9);
         let data = eval_ok(r#"return { terminal = { scrollback = 10000 } }"#);
         assert_eq!(data.layout, None);
         let data = eval_ok(r#"return { layout = {} }"#);
         let layout = data.layout.unwrap();
         assert_eq!(layout.gaps_in, None);
         assert_eq!(layout.gaps_out, None);
+        assert_eq!(layout.resize_step, None);
     }
 
     #[test]
     fn layout_gaps_wrong_type_is_shape_error_without_value() {
         // CTX-0177: fail-closed on non-integers (floats/strings/tables never
-        // coerce, values never echoed).
+        // coerce, values never echoed). CTX-0963: `resize_step` accepts
+        // numbers but rejects strings/tables/unknown keys the same way.
         let mut vm = LuaVm::new("test.layout-type");
         for code in [
             r#"return { layout = { gaps_in = 1.5 } }"#,
@@ -2221,6 +2245,9 @@ mod tests {
             r#"return { layout = { gaps_out = true } }"#,
             r#"return { layout = "wide" }"#,
             r#"return { layout = { gaps_in = 1, bogus = 2 } }"#,
+            r#"return { layout = { resize_step = "0.05" } }"#,
+            r#"return { layout = { resize_step = true } }"#,
+            r#"return { layout = { resize_step = 0.05, bogus = 1 } }"#,
         ] {
             match vm.eval_config(code).expect("no refuse") {
                 ConfigOutcome::ShapeError { message } => {

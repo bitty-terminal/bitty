@@ -91,10 +91,23 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # decisions are DEC-W146-1..4 (W-131/W-137 accepted); a dated ADR-0004/
 # ADR-0012 revision recording this source is tracked as a CTX-0939
 # follow-up. Falls under the same 2027-03-31 re-audit bound above.
+# bitty-observability is a first-party extraction target (W-110, CTX-0981,
+# bitty #1649): the canonical zero-dependency observation-seam contract
+# (record bounds, default-deny gate, fail-closed version range) behind the
+# Core-owned verification in `bitty-terminal`. Linked ONLY by the
+# application wiring crate (bitty-terminal) at an exact rev (7b3bb74,
+# post-merge main: W-110 contract alignment); no Core library crate links
+# it, and default builds link no exporters, metrics pipeline, or tracing
+# runtime (API crate has zero dependencies, no network, no filesystem).
+# The approving boundary decision is the accepted W-71 contract
+# (bitty-docs `docs/development/observability-boundary.md`); a dated
+# ADR-0004/ADR-0012 revision recording this source is tracked as a CTX-0981
+# follow-up. Falls under the same 2027-03-31 re-audit bound above.
 allow-git = [
     "https://github.com/bitty-terminal/phodopus",
     "https://github.com/kyren/gc-arena",
     "https://github.com/bitty-terminal/bitty-network",
     "https://github.com/bitty-terminal/bitty-ipc",
     "https://github.com/bitty-terminal/bitty-storage",
+    "https://github.com/bitty-terminal/bitty-observability",
 ]

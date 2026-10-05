@@ -258,6 +258,11 @@ version = "0.0.1"
 source = "git+https://github.com/bitty-terminal/bitty-network?rev=c69fe57#c69fe577e93e8ec5ef5f6a09ca49c0d733844428"
 
 [[package]]
+name = "bitty-observability-api"
+version = "0.0.1"
+source = "git+https://github.com/bitty-terminal/bitty-observability?rev=7b3bb74#7b3bb74e9b09014695210b3dfd4afb577f3f83a8"
+
+[[package]]
 name = "bitty-package"
 version = "0.0.21"
 dependencies = [
@@ -366,6 +371,7 @@ dependencies = [
  "bitty-config",
  "bitty-ipc",
  "bitty-lua",
+ "bitty-observability-api",
  "bitty-package",
  "bitty-platform",
  "bitty-plugin-host",

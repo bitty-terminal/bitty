@@ -7,7 +7,7 @@
 //! one built from the same recipe — anonymous pipes, `CreatePseudoConsole`,
 //! `STARTF_USESTDHANDLES` with invalid stdio, no handle inheritance — plus a
 //! two-entry process attribute list (pseudo-console and
-//! `PROC_THREAD_ATTRIBUTE_JOB_LIST), so the child is born inside `job` and
+//! `PROC_THREAD_ATTRIBUTE_JOB_LIST`), so the child is born inside `job` and
 //! runs zero instructions outside it.
 //!
 //! The UTF-16 builders below are pure safe functions; every `unsafe` block

@@ -372,9 +372,8 @@ end
 /// Drive one Lua snippet that stores its result under `key`, then read it.
 fn run_and_store(vm: &mut LuaVm, snippet: &str) {
     match vm.execute_bounded(snippet) {
-        Ok(bitty_lua::BoundedExecution::Completed)
-        | Ok(bitty_lua::BoundedExecution::Suspended(_)) => {}
-        Ok(other) => eprintln!("debug snippet outcome: {other:?} for: {snippet}"),
+        Ok(bitty_lua::BoundedExecution::Completed) => {}
+        Ok(other) => panic!("harness snippet must complete, got {other:?} for: {snippet}"),
         Err(error) => panic!("harness snippet must execute: {error} for: {snippet}"),
     }
 }

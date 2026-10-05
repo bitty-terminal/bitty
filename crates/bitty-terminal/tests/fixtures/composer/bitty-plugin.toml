@@ -1,0 +1,58 @@
+# Bitty plugin manifest for the Composer (bitty-terminal.composer).
+#
+# W-103 S-3 (CTX-0003) public-API policy package over the accepted W-73/W-82
+# contracts. The plugin consumes exactly three additive v2 capabilities and no
+# private surface: `ui.overlay.focus` (focusable overlay + transient input
+# capture), `terminal.input.submit` (bounded PTY submission through the Core
+# paste pipeline), and `process.editor` (allowlisted external-editor round
+# trip on a Core-owned temp file). It requests no filesystem, process-spawn,
+# network, clipboard, or terminal-input authority beyond those three grants,
+# and the editor temp path never leaves Core.
+#
+# `just manifest` validates this file with the authoritative `bitty-plugin-lint`
+# from bitty-plugin-sdk (R-SDK-2), pinned by commit in `package.json` and
+# `bun.lock`. Run `just install` once to materialize it.
+
+[plugin]
+id = "bitty-terminal.composer"
+name = "Composer"
+version = "0.0.1"
+description = "Editable command-line policy over the public overlay, submit, and editor host APIs: modal buffer, chord routing, bounded paste, and external-editor round trip. Presentation state only; never mutates Terminal Truth."
+license = "MIT"
+
+[compat]
+# Application and Plugin API ranges. Both are syntax-validated here and
+# resolved by the host at install time. The host validates compatibility
+# before activation and fails closed (disable with a diagnostic, no partial
+# activation) on mismatch.
+bitty = ">=0.5,<1.0"
+plugin-api = "^1.0"
+
+[capabilities]
+# Deny by default; each capability is requested one by one. This is the exact
+# public set the W-82 contract proposes; nothing else is declared or used.
+# - ui.overlay.focus: one focusable overlay + bounded transient input-capture
+#   session for the modal command line (W-01 host API).
+# - terminal.input.submit: bounded buffer submission to the focused panel PTY
+#   through the Core paste pipeline as one bracketed-paste frame (W-82).
+# - process.editor: the allowlisted (nvim/vim/vi) external-editor round trip
+#   on a Core-owned temp file that is always removed (W-82).
+ui.overlay.focus = true
+terminal.input.submit = true
+process.editor = true
+
+[lazy]
+# Static triggers let the host register the plugin without creating a VM.
+# Commands are plugin-qualified: `<plugin-id>:<resource>`. `open` is the
+# manual-open entry point the suggested open chord targets; `submit`,
+# `cancel`, `close`, and `editor` are the explicit session verbs.
+commands = [
+  "bitty-terminal.composer:open",
+  "bitty-terminal.composer:submit",
+  "bitty-terminal.composer:cancel",
+  "bitty-terminal.composer:close",
+  "bitty-terminal.composer:editor",
+]
+events = [
+  "overlay.released",
+]

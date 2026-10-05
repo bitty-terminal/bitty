@@ -449,8 +449,8 @@ pub fn apply_control(
         // `ws:{seq}` identity the write verbs (`focus`/`close`/`move`) accept,
         // so a client can feed list output straight back. Display labels stay
         // available under `names`; `active` keeps the 1-based positional index
-        // for tabline parity and `active_id` names the focused workspace
-        // canonically. The human `tabline` string is unchanged.
+        // and `active_id` names the focused workspace canonically.
+        // CTX-0979: Core draws no display; no `tabline` string is returned.
         let ids: Vec<String> = (0..runtime.workspace_count())
             .filter_map(|idx| runtime.workspace_seq_at(idx).map(|seq| format!("ws:{seq}")))
             .collect();
@@ -458,13 +458,12 @@ pub fn apply_control(
             .workspace_seq_at(runtime.active_workspace_index())
             .map_or_else(String::new, |seq| format!("ws:{seq}"));
         return Ok(format!(
-            "{{\"workspaces\":{},\"names\":{},\"active\":{},\"active_id\":\"{}\",\"count\":{},\"tabline\":\"{}\"}}",
+            "{{\"workspaces\":{},\"names\":{},\"active\":{},\"active_id\":\"{}\",\"count\":{}}}",
             json_string_array(&ids),
             json_string_array(&runtime.workspace_names()),
             runtime.active_workspace_index() + 1,
             json_escape(&active_id),
             runtime.workspace_count(),
-            json_escape(&runtime.workspaceline_text()),
         ));
     }
     if method == ipc_ctl::METHOD_NEW_WORKSPACE {
@@ -490,10 +489,7 @@ pub fn apply_control(
                         String::from("workspace slot vanished after create"),
                     ));
                 };
-                return Ok(format!(
-                    "{{\"created\":\"ws:{seq}\",\"tabline\":\"{}\"}}",
-                    json_escape(&runtime.workspaceline_text()),
-                ));
+                return Ok(format!("{{\"created\":\"ws:{seq}\"}}"));
             }
             Err(message) => {
                 return Err((
@@ -523,8 +519,7 @@ pub fn apply_control(
         match runtime.workspace_close_at(index) {
             Ok(killed) => {
                 return Ok(format!(
-                    "{{\"closed\":\"{workspace_id}\",\"killed\":{killed},\"tabline\":\"{}\"}}",
-                    json_escape(&runtime.workspaceline_text()),
+                    "{{\"closed\":\"{workspace_id}\",\"killed\":{killed}}}"
                 ));
             }
             Err(message) => {
@@ -540,10 +535,7 @@ pub fn apply_control(
         // CTX-0322: resolve the stable sequence id `ws:N` to the current slot.
         if let Some(index) = runtime.workspace_index_by_seq(u64::from(num)) {
             if runtime.workspace_switch(index) {
-                return Ok(format!(
-                    "{{\"focused\":\"{workspace_id}\",\"tabline\":\"{}\"}}",
-                    json_escape(&runtime.workspaceline_text()),
-                ));
+                return Ok(format!("{{\"focused\":\"{workspace_id}\"}}"));
             }
         }
         return Err((
@@ -574,9 +566,8 @@ pub fn apply_control(
         match runtime.workspace_move_focused_to(index) {
             Ok(moved) => {
                 return Ok(format!(
-                    "{{\"moved\":\"v:{}\",\"from\":\"ws:{from_seq}\",\"to\":\"{workspace_id}\",\"tabline\":\"{}\"}}",
+                    "{{\"moved\":\"v:{}\",\"from\":\"ws:{from_seq}\",\"to\":\"{workspace_id}\"}}",
                     moved.0,
-                    json_escape(&runtime.workspaceline_text()),
                 ));
             }
             Err(message) => {
@@ -606,9 +597,8 @@ pub fn apply_control(
         match runtime.workspace_rename(index, &name) {
             Ok(()) => {
                 return Ok(format!(
-                    "{{\"renamed\":\"{workspace_id}\",\"name\":\"{}\",\"tabline\":\"{}\"}}",
+                    "{{\"renamed\":\"{workspace_id}\",\"name\":\"{}\"}}",
                     json_escape(&name),
-                    json_escape(&runtime.workspaceline_text()),
                 ));
             }
             Err(message) => {
@@ -627,9 +617,8 @@ pub fn apply_control(
         match runtime.workspace_move_focused_to_position(index) {
             Ok(moved) => {
                 return Ok(format!(
-                    "{{\"moved\":\"v:{}\",\"position\":{position},\"tabline\":\"{}\"}}",
+                    "{{\"moved\":\"v:{}\",\"position\":{position}}}",
                     moved.0,
-                    json_escape(&runtime.workspaceline_text()),
                 ));
             }
             Err(message) => {

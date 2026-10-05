@@ -40,8 +40,9 @@
 //!
 //! Resize/focus-follows-mouse/Alt-drag are follow-ups, not this task.
 //! All bounds mirror the registry (`MAX_WORKSPACES_PER_WINDOW` = 16);
-//! rendering is the pure [`Runtime::workspaceline_text`] overlay string,
-//! never grid truth.
+//! CTX-0979: Core draws no workspace display (Hyprland-style); workspace
+//! state is memory-only and the bar plugin owns presentation via the query
+//! commands (`workspace_summaries`, `workspace_names`, `workspace_count`).
 
 use super::*;
 
@@ -52,12 +53,8 @@ use bitty_plugin_host::{BoundedText, EventPayload};
 /// Maximum workspaces (mirrors `registry::MAX_WORKSPACES_PER_WINDOW`).
 pub const MAX_WORKSPACES: usize = 16;
 
-/// Maximum workspace name characters shown in the workspaceline data string.
+/// Maximum workspace name characters (rename bound, char-boundary truncated).
 pub const WORKSPACE_NAME_MAX_CHARS: usize = 32;
-
-/// Hard bound on the rendered workspaceline data string (shared by the
-/// `ctl` output and the text contract the `bar` plugin mirrors).
-pub const WORKSPACELINE_MAX_CHARS: usize = 1024;
 
 /// One workspace: name plus stashed layout + focus.
 #[derive(Debug, Clone)]
@@ -407,118 +404,16 @@ impl Runtime {
         self.pending_full_redraw = true;
     }
 
-    /// Minimal tabline render: names + indices + focused marker + count.
-    ///
-    /// Pure overlay string, never grid truth: `1:ws1* 2:ws2 (2)` — each
-    /// slot renders as `{1-based}:{name}` with `*` on the active one, plus
-    /// ` ({count})`. Bounded ([`WORKSPACELINE_MAX_CHARS`]), deterministic,
-    /// headless-pinned. Updates are trivial: it reads live state, so every
-    /// switch/new/close is reflected on the next call.
-    #[must_use]
-    pub fn workspaceline_text(&self) -> String {
-        let mut out = self.workspaceline_tokens().join(" ");
-        out.push_str(&format!(" ({})", self.workspaces.len()));
-        if out.len() <= WORKSPACELINE_MAX_CHARS {
-            return out;
-        }
-        let mut end = WORKSPACELINE_MAX_CHARS;
-        while end > 0 && !out.is_char_boundary(end) {
-            end -= 1;
-        }
-        out.truncate(end);
-        out
-    }
-
-    /// One rendered token per workspace slot (`{1-based}:{name}[*]`), in
-    /// index order. Shared by [`Self::workspaceline_text`] so the data
-    /// string the `bar` plugin mirrors and the `ctl` output stay on one
-    /// token layout.
-    fn workspaceline_tokens(&self) -> Vec<String> {
-        self.workspaces
-            .iter()
-            .enumerate()
-            .map(|(idx, slot)| {
-                let mark = if idx == self.active_workspace {
-                    "*"
-                } else {
-                    ""
-                };
-                format!("{}:{}{}", slot.seq, truncate_ws_name(&slot.name), mark)
-            })
-            .collect()
-    }
-
-    /// Whether the workspace switcher bar is enabled (issue #1333).
-    ///
-    /// Default-on: seeded from [`crate::config::RuntimeConfig::workspaceline_visible`]
-    /// at construction. Retained pending the W-26/W-27 settings migration
-    /// (map-to-plugin or remove): since W-104/CTX-0956 retired the Core bar,
-    /// no Core chrome reads this flag, so toggling reserves or releases no
-    /// band and changes no workspace, focus, or session state.
-    #[must_use]
-    pub fn workspaceline_visible(&self) -> bool {
-        self.workspaceline_visible
-    }
-
-    /// Live-toggle the switcher bar (opt-out path for `workspace.show_bar`).
-    /// Presentation-only; always succeeds.
-    ///
-    /// Retained pending the W-26/W-27 settings migration. The Core bar is
-    /// retired (W-104/CTX-0956: the `bar` plugin owns workspace/status UX),
-    /// so this re-solves chrome (plugin exclusive zone) and flags a redraw
-    /// without reserving or releasing any Core band.
-    pub fn set_workspaceline_visible(&mut self, visible: bool) {
-        self.workspaceline_visible = visible;
-        self.refresh_chrome_band();
-        self.pending_full_redraw = true;
-    }
-
-    /// Retained window-edge setting for the retired Core bar band
-    /// (CTX-0873 `workspace.bar.edge`; migration owned by W-26/W-27).
-    ///
-    /// Since W-104/CTX-0956 retired the Core bar, no Core chrome reads
-    /// this edge; plugin bands solve their own rows from the window edge.
-    #[must_use]
-    pub fn workspace_bar_edge(&self) -> crate::config::BarEdge {
-        self.workspace_bar_edge
-    }
-
-    /// Live-moves the retired workspace bar band to `edge` (CTX-0873).
-    ///
-    /// Retained pending the W-26/W-27 settings migration; always succeeds
-    /// and re-solves chrome (plugin exclusive zone) without moving any
-    /// Core band.
-    pub fn set_workspace_bar_edge(&mut self, edge: crate::config::BarEdge) {
-        if edge == self.workspace_bar_edge {
-            return;
-        }
-        self.workspace_bar_edge = edge;
-        self.refresh_chrome_band();
-        self.pending_full_redraw = true;
-    }
-
-    /// Retired Core bar band query (W-104/CTX-0956).
-    ///
-    /// The Core workspace bar is deleted: the `bar` plugin owns
-    /// workspace/status UX over the generic band mechanism, so no Core band
-    /// is ever reserved and this always returns `None`. Retained as the
-    /// geometry seam so the present path, the mouse routing, the plugin
-    /// offset math ([`Runtime::core_reserved_rows`]), and headless tests
-    /// keep one reservation source: with no Core band every edge reserves
-    /// zero Core rows and plugin bands start at the window edge.
-    #[must_use]
-    pub fn status_bar_band(&self) -> Option<UiRect> {
-        self.chrome_layout().bar
-    }
-
+    /// CTX-0979: Core draws no workspace display (Hyprland-style). Query
+    /// commands (`workspace_summaries`, `workspace_names`) serve the bar
+    /// plugin and `ctl`; presentation lives outside Core.
     /// Rename workspace `index` (0-based) to `name`.
     ///
     /// Fail-closed: unknown indices and blank names are refused with state
     /// untouched; overlong names truncate at a char boundary to
-    /// [`WORKSPACE_NAME_MAX_CHARS`], mirroring the workspaceline display
-    /// bound. Names live on the slots (never stashed), so renaming the
-    /// active workspace takes effect on the next
-    /// [`Self::workspaceline_text`] call.
+    /// [`WORKSPACE_NAME_MAX_CHARS`]. Names live on the slots (never stashed),
+    /// so renaming the active workspace is visible to the next query
+    /// (`workspace_names`, `workspace_summaries`).
     pub fn workspace_rename(&mut self, index: usize, name: &str) -> Result<(), String> {
         if index >= self.workspaces.len() {
             return Err(format!("no such workspace ws:{}", index.saturating_add(1)));
@@ -1663,113 +1558,15 @@ mod tests {
         assert_eq!(rt.workspace_count(), 1);
         assert_eq!(rt.active_workspace_index(), 0);
         assert_eq!(rt.workspace_names(), vec![String::from("ws1")]);
-        assert_eq!(rt.workspaceline_text(), "1:ws1* (1)");
         assert!(!rt.has_pending_ws_close());
         assert_eq!(rt.workspace_live_count(0), 0);
     }
 
-    #[test]
-    fn no_core_bar_band_reserves_or_presents() {
-        // W-104/CTX-0956: the Core bar is retired (the `bar` plugin owns
-        // workspace/status UX), so no Core band is ever reserved or
-        // presented. Issue #1333: the switcher flag stays default-on
-        // (retained pending the W-26/W-27 settings migration) but reads
-        // nothing; the data path still renders for ctl/tabline and the
-        // text contract the plugin mirrors.
-        let mut rt = fresh();
-        assert!(rt.workspaceline_visible());
-        assert_eq!(rt.workspaceline_text(), "1:ws1* (1)");
-        assert_eq!(rt.status_bar_band(), None, "lone workspace: no band");
-        assert_eq!(rt.container(), rt.window_cells());
-        // A second workspace still reserves no Core band.
-        rt.workspace_new().expect("ws2");
-        assert_eq!(rt.workspaceline_text(), "1:ws1 2:ws2* (2)");
-        assert_eq!(rt.status_bar_band(), None, "no Core bar with two");
-        assert_eq!(rt.container(), rt.window_cells());
-        // Opt-out changes no geometry and no workspace/focus/session
-        // state; re-enabling restores nothing (nothing was hidden).
-        rt.set_workspaceline_visible(false);
-        assert!(!rt.workspaceline_visible());
-        assert_eq!(rt.status_bar_band(), None);
-        assert_eq!(rt.container(), rt.window_cells());
-        assert_eq!(rt.workspace_count(), 2);
-        rt.set_workspaceline_visible(true);
-        assert_eq!(rt.status_bar_band(), None);
-        assert_eq!(rt.workspaceline_text(), "1:ws1 2:ws2* (2)");
-    }
-
-    #[test]
-    fn workspace_data_path_renders_with_no_core_band() {
-        // The data path (`workspaceline_text`) still renders for
-        // ctl/tabline while Core reserves no row on any workspace count
-        // or visibility setting.
-        let rt = fresh();
-        assert_eq!(rt.workspaceline_text(), "1:ws1* (1)");
-        assert_eq!(rt.status_bar_band(), None, "lone workspace reserves no row");
-        let window = rt.window_cells();
-        let mut rt = fresh();
-        rt.workspace_new().expect("ws2");
-        assert_eq!(
-            rt.workspaceline_text(),
-            "1:ws1 2:ws2* (2)",
-            "workspace module minimum"
-        );
-        assert_eq!(
-            rt.status_bar_band(),
-            None,
-            "two workspaces reserve no Core row"
-        );
-        assert_eq!(rt.container(), window, "container keeps the full window");
-        let mut hidden = fresh();
-        hidden.workspace_new().expect("ws2");
-        hidden.set_workspaceline_visible(false);
-        assert_eq!(hidden.workspaceline_text(), "1:ws1 2:ws2* (2)");
-        assert_eq!(hidden.status_bar_band(), None);
-    }
-
-    #[test]
-    fn workspaceline_text_token_layout_is_plugin_contract() {
-        // The token layout the `bar` plugin mirrors over the generic band
-        // mechanism (W-104): `{1-based}:{name}[*]` tokens joined by single
-        // spaces plus the ` (count)` suffix. Pinned here because the
-        // deleted Core hit-test derived its columns from this same layout.
-        let mut rt = fresh();
-        rt.workspace_new().expect("ws2");
-        rt.workspace_new().expect("ws3");
-        assert!(rt.workspace_switch(0));
-        // Tokens: `1:ws1*` (0..6), sep, `2:ws2` (7..12), sep, `3:ws3`
-        // (13..18), then the ` (3)` suffix.
-        assert_eq!(rt.workspaceline_text(), "1:ws1* 2:ws2 3:ws3 (3)");
-    }
-
-    #[test]
-    fn workspace_switch_commands_stay_fail_closed() {
-        // W-104/CTX-0956: the Core bar click path
-        // (`workspaceline_click`) is deleted with the bar — clicks route
-        // through the plugin band host (C1). Switching itself stays a Core
-        // mechanism (`workspace_switch`): it works across slots and fails
-        // closed out of range, with no band involved.
-        let mut rt = fresh();
-        rt.workspace_new().expect("ws2");
-        assert!(rt.workspace_switch(0));
-        // Switch to ws2 moves the active slot and the data string follows.
-        assert!(rt.workspace_switch(1));
-        assert_eq!(rt.active_workspace_index(), 1);
-        assert_eq!(rt.workspaceline_text(), "1:ws1 2:ws2* (2)");
-        // Switching to the active workspace succeeds with state untouched.
-        assert!(rt.workspace_switch(1));
-        assert_eq!(rt.active_workspace_index(), 1);
-        // Out-of-range switches fail closed.
-        assert!(!rt.workspace_switch(2));
-        assert!(!rt.workspace_switch(999));
-        assert_eq!(rt.active_workspace_index(), 1);
-        // Single workspace: the only slot is the active one, so switching
-        // can never leave it.
-        let mut solo = fresh();
-        assert!(solo.workspace_switch(0));
-        assert_eq!(solo.active_workspace_index(), 0);
-        assert!(!solo.workspace_switch(1));
-    }
+    /// CTX-0979: Core draws no workspace display (Hyprland-style). The
+    /// former switcher-bar/hit-test/click/present tests are deleted; query
+    /// commands (`workspace_names`, `workspace_summaries`,
+    /// `workspace_count`, `active_workspace_index`) carry the bar plugin
+    /// and `ctl` surface.
 
     #[test]
     fn alt_n_jump_clamps_to_max_and_fails_closed_on_zero() {
@@ -1782,21 +1579,28 @@ mod tests {
         // Exact jump within range.
         assert_eq!(rt.workspace_focus_clamped(2), Some(1));
         assert_eq!(rt.active_workspace_index(), 1);
-        assert_eq!(rt.workspaceline_text(), "1:ws1 2:ws2* 3:ws3 (3)");
+        assert_eq!(
+            rt.workspace_names(),
+            vec![
+                String::from("ws1"),
+                String::from("ws2"),
+                String::from("ws3")
+            ]
+        );
         // Clamp: N beyond the count goes last.
         assert_eq!(rt.workspace_focus_clamped(6), Some(2));
         assert_eq!(rt.active_workspace_index(), 2);
-        assert_eq!(rt.workspaceline_text(), "1:ws1 2:ws2 3:ws3* (3)");
+        assert_eq!(rt.workspace_count(), 3);
         assert_eq!(rt.workspace_focus_clamped(9), Some(2));
         assert_eq!(rt.active_workspace_index(), 2);
         // Zero fails closed with state untouched.
         assert_eq!(rt.workspace_focus_clamped(0), None);
         assert_eq!(rt.active_workspace_index(), 2);
-        assert_eq!(rt.workspaceline_text(), "1:ws1 2:ws2 3:ws3* (3)");
+        assert_eq!(rt.workspace_count(), 3);
     }
 
     #[test]
-    fn workspace_rename_updates_data_and_fails_closed() {
+    fn workspace_rename_updates_queries_and_fails_closed() {
         let mut rt = fresh();
         rt.workspace_new().expect("ws2");
         rt.workspace_rename(1, "editor").expect("rename");
@@ -1804,11 +1608,13 @@ mod tests {
             rt.workspace_names(),
             vec![String::from("ws1"), String::from("editor")]
         );
-        assert_eq!(rt.workspaceline_text(), "1:ws1 2:editor* (2)");
-        // Renaming the active workspace reflects immediately.
+        // Renaming the active workspace reflects immediately in queries.
         rt.workspace_rename(1, "  docs  ").expect("trims");
-        assert_eq!(rt.workspaceline_text(), "1:ws1 2:docs* (2)");
-        // Overlong names truncate at the display bound.
+        assert_eq!(
+            rt.workspace_names(),
+            vec![String::from("ws1"), String::from("docs")]
+        );
+        // Overlong names truncate at the rename bound.
         let long = "x".repeat(WORKSPACE_NAME_MAX_CHARS + 10);
         rt.workspace_rename(0, &long).expect("truncates");
         assert_eq!(
@@ -1816,11 +1622,11 @@ mod tests {
             WORKSPACE_NAME_MAX_CHARS
         );
         // Unknown index and blank names fail closed with state untouched.
-        let before = rt.workspaceline_text();
+        let before = rt.workspace_names();
         assert!(rt.workspace_rename(9, "nope").is_err());
         assert!(rt.workspace_rename(0, "").is_err());
         assert!(rt.workspace_rename(0, "   ").is_err());
-        assert_eq!(rt.workspaceline_text(), before);
+        assert_eq!(rt.workspace_names(), before);
     }
 
     #[test]
@@ -1866,26 +1672,29 @@ mod tests {
     }
 
     #[test]
-    fn new_switch_prev_next_last_update_tabline() {
+    fn new_switch_prev_next_last_update_queries() {
         let mut rt = fresh();
         let one = rt.workspace_new().expect("new");
         assert_eq!(one, 1);
         assert_eq!(rt.workspace_count(), 2);
         assert_eq!(rt.active_workspace_index(), 1);
-        assert_eq!(rt.workspaceline_text(), "1:ws1 2:ws2* (2)");
+        assert_eq!(
+            rt.workspace_names(),
+            vec![String::from("ws1"), String::from("ws2")]
+        );
         // Prev wraps to ws1; next returns; last bounces between the two.
         assert_eq!(rt.workspace_prev(), 0);
-        assert_eq!(rt.workspaceline_text(), "1:ws1* 2:ws2 (2)");
+        assert_eq!(rt.active_workspace_index(), 0);
         assert_eq!(rt.workspace_next(), 1);
-        assert_eq!(rt.workspaceline_text(), "1:ws1 2:ws2* (2)");
+        assert_eq!(rt.active_workspace_index(), 1);
         assert_eq!(rt.workspace_last(), 0);
-        assert_eq!(rt.workspaceline_text(), "1:ws1* 2:ws2 (2)");
+        assert_eq!(rt.active_workspace_index(), 0);
         assert_eq!(rt.workspace_last(), 1);
-        assert_eq!(rt.workspaceline_text(), "1:ws1 2:ws2* (2)");
+        assert_eq!(rt.active_workspace_index(), 1);
         // Unknown index fails closed, state untouched.
         assert!(!rt.workspace_switch(9));
         assert_eq!(rt.active_workspace_index(), 1);
-        assert_eq!(rt.workspaceline_text(), "1:ws1 2:ws2* (2)");
+        assert_eq!(rt.workspace_count(), 2);
     }
 
     #[test]
@@ -1910,7 +1719,7 @@ mod tests {
         assert_eq!(rt.layout().leaf_count(), 1);
         assert!(rt.workspace_switch(0));
         assert_eq!(rt.layout().leaf_count(), 2, "stashed ws1 layout restored");
-        assert_eq!(rt.workspaceline_text(), "1:ws1* 2:ws2 (2)");
+        assert_eq!(rt.active_workspace_index(), 0);
     }
 
     #[test]
@@ -2016,13 +1825,15 @@ mod tests {
         let mut rt = fresh();
         rt.workspace_new().expect("new");
         rt.workspace_new().expect("new3");
-        assert_eq!(rt.workspaceline_text(), "1:ws1 2:ws2 3:ws3* (3)");
+        assert_eq!(rt.workspace_count(), 3);
+        assert_eq!(rt.active_workspace_index(), 2);
         // Active ws3 is idle: closes immediately, neighbor loads.
         assert_eq!(
             rt.workspace_close_request(),
             WsCloseRequest::Closed { killed: 0 }
         );
-        assert_eq!(rt.workspaceline_text(), "1:ws1 2:ws2* (2)");
+        assert_eq!(rt.workspace_count(), 2);
+        assert_eq!(rt.active_workspace_index(), 1);
         assert!(!rt.has_pending_ws_close());
         // Closing the last workspace resets to a fresh idle leaf.
         assert!(rt.workspace_switch(0));
@@ -2035,12 +1846,13 @@ mod tests {
         assert!(!rt.has_pending_ws_close());
     }
 
-    // Issue #1333 live leg: command switching, rename, and within-move
-    // with a real shell behind the focused pane. None of the switcher ops
-    // may kill or detach the session; the data string follows every op.
+    // Issue #1333 live leg: switch, rename, and within-move
+    // with a real shell behind the focused pane. None of the ops
+    // may kill or detach the session; queries follow every op.
+    // CTX-0979: Core draws no display; switching uses `workspace_switch`.
     #[test]
     #[cfg(unix)]
-    fn live_switcher_switch_rename_and_move_preserve_session() {
+    fn live_switch_rename_and_move_preserve_session() {
         require_pty!();
         let mut rt = fresh();
         // Two panes in ws1; the second owns a live shell.
@@ -2062,19 +1874,25 @@ mod tests {
         rt.workspace_new().expect("new ws2");
         assert!(rt.workspace_switch(0));
         assert!(rt.set_focus(live_id));
-        assert_eq!(rt.workspaceline_text(), "1:ws1* 2:ws2 (2)");
-        // Switch to ws2 via the Core command; the session survives.
+        assert_eq!(
+            rt.workspace_names(),
+            vec![String::from("ws1"), String::from("ws2")]
+        );
+        // Switch to ws2 via the query index; the session survives.
         assert!(rt.workspace_switch(1));
         assert_eq!(rt.active_workspace_index(), 1);
         assert!(
             rt.has_pane_session(&live_id),
             "switch must not kill the session"
         );
-        // Switch back to ws1 and rename it.
+        // Switch back to ws1 (index 0) and rename it.
         assert!(rt.workspace_switch(0));
         assert_eq!(rt.active_workspace_index(), 0);
         rt.workspace_rename(0, "live").expect("rename");
-        assert_eq!(rt.workspaceline_text(), "1:live* 2:ws2 (2)");
+        assert_eq!(
+            rt.workspace_names(),
+            vec![String::from("live"), String::from("ws2")]
+        );
         assert!(
             rt.has_pane_session(&live_id),
             "rename must not kill the session"
@@ -2200,7 +2018,8 @@ mod tests {
         let killed = rt.workspace_close_index(2).expect("close ws2");
         assert_eq!(killed, 1);
         assert!(!rt.has_pending_ws_close());
-        assert_eq!(rt.workspaceline_text(), "1:ws1* (1)");
+        assert_eq!(rt.workspace_count(), 1);
+        assert_eq!(rt.workspace_names(), vec![String::from("ws1")]);
     }
 
     #[test]
@@ -2394,11 +2213,11 @@ mod tests {
         assert_eq!(same, moved_id);
         assert_eq!(rt.layout().leaf_count(), 2);
         // Invalid targets fail closed with state untouched.
-        let tabline = rt.workspaceline_text();
+        let names = rt.workspace_names();
         assert!(rt.workspace_move_focused_to(9).is_err());
         assert!(rt.workspace_move_focused_to_one_based(0).is_err());
         assert!(rt.workspace_move_focused_to_one_based(99).is_err());
-        assert_eq!(rt.workspaceline_text(), tabline);
+        assert_eq!(rt.workspace_names(), names);
         assert_eq!(rt.layout().leaf_count(), 2);
     }
 
@@ -2551,14 +2370,17 @@ mod tests {
         assert_eq!(from, 1);
         assert_eq!(to, 2);
         assert_eq!(rt.workspace_count(), 2);
-        assert_eq!(rt.workspaceline_text(), "1:ws1* 2:ws2 (2)");
+        assert_eq!(
+            rt.workspace_names(),
+            vec![String::from("ws1"), String::from("ws2")]
+        );
         // ws1 has a fresh leaf, ws2 has the moved leaf
         assert!(rt.workspace_switch(1));
         assert_eq!(rt.focused_view(), Some(sole));
     }
 
     #[test]
-    fn non_consecutive_workspaces_display_and_jump() {
+    fn non_consecutive_workspaces_query_and_jump() {
         let mut rt = fresh();
         // Move focused leaf to ws5
         rt.workspace_move_focused_to_one_based(5)
@@ -2571,19 +2393,28 @@ mod tests {
             .expect("move to ws3");
         // Workspaces should be sorted by seq: 1, 3, 5, 9
         assert_eq!(rt.workspace_count(), 4);
-        assert_eq!(rt.workspaceline_text(), "1:ws1* 3:ws3 5:ws5 9:ws9 (4)");
+        assert_eq!(
+            rt.workspace_names(),
+            vec![
+                String::from("ws1"),
+                String::from("ws3"),
+                String::from("ws5"),
+                String::from("ws9")
+            ]
+        );
+        assert_eq!(rt.workspaces[rt.active_workspace].seq, 1);
 
         // Jump to non-consecutive workspace 5
         let jumped = rt.workspace_focus_clamped(5);
         assert!(jumped.is_some());
         assert_eq!(rt.workspaces[rt.active_workspace].seq, 5);
-        assert_eq!(rt.workspaceline_text(), "1:ws1 3:ws3 5:ws5* 9:ws9 (4)");
+        assert_eq!(rt.active_workspace_index(), 2);
 
         // Jump to non-consecutive workspace 9
         let jumped = rt.workspace_focus_clamped(9);
         assert!(jumped.is_some());
         assert_eq!(rt.workspaces[rt.active_workspace].seq, 9);
-        assert_eq!(rt.workspaceline_text(), "1:ws1 3:ws3 5:ws5 9:ws9* (4)");
+        assert_eq!(rt.active_workspace_index(), 3);
     }
 
     #[test]
@@ -2594,18 +2425,24 @@ mod tests {
         assert_eq!(from, 1);
         assert_eq!(to, 3);
         assert_eq!(rt.workspace_count(), 1);
-        assert_eq!(rt.workspaceline_text(), "3:ws3* (1)");
+        assert_eq!(rt.workspace_names(), vec![String::from("ws3")]);
 
         // Create a new workspace, which will get next seq = 4
         rt.workspace_new().expect("new");
-        assert_eq!(rt.workspaceline_text(), "3:ws3 4:ws4* (2)");
+        assert_eq!(
+            rt.workspace_names(),
+            vec![String::from("ws3"), String::from("ws4")]
+        );
 
         // With ws4 active, swap with 3
         let (from, to) = rt.workspace_swap_current_with(3).expect("swap 4 with 3");
         assert_eq!(from, 4);
         assert_eq!(to, 3);
         // Active workspace was ws4, now it has seq 3, while previous ws3 has seq 4
-        assert_eq!(rt.workspaceline_text(), "3:ws3* 4:ws4 (2)");
+        assert_eq!(
+            rt.workspace_names(),
+            vec![String::from("ws3"), String::from("ws4")]
+        );
     }
 
     // Live-spawn: runs a real POSIX shell (`/bin/sh` has no Windows

@@ -1339,26 +1339,19 @@ impl Runtime {
         )
     }
 
-    /// Solved chrome geometry for the current window grid (CTX-0873,
-    /// CTX-0956).
-    ///
-    /// The Core workspace bar is retired (W-104: the `bar` plugin owns
-    /// workspace/status UX), so Core reserves zero rows here — `present`
-    /// is always `false` and `bar` is always `None`. The solve stays as
-    /// the single geometry seam behind [`Runtime::status_bar_band`], and
-    /// plugin bands reflow through the exclusive-zone budget in
-    /// [`Runtime::band_exclusive_container`].
+    /// CTX-0979: Core draws no workspace display (Hyprland-style), so no
+    /// Core bar band is ever reserved. The layout container starts from the
+    /// full window grid; plugin bands carve their exclusive zone out of it
+    /// via `band_exclusive_container`. Kept as a constructor-free helper
+    /// for geometry callers that previously read the Core solve.
     pub(super) fn chrome_layout(&self) -> chrome_band::ChromeLayout {
-        chrome_band::solve(
-            self.window_cells,
-            self.workspace_bar_edge,
-            0,
-            false,
-            self.chrome_min_rows(),
-        )
+        chrome_band::ChromeLayout {
+            container: self.window_cells,
+            bar: None,
+        }
     }
 
-    /// Re-derives the container from the chrome band and the budgeted plugin
+    /// Re-derives the container from the budgeted plugin
     /// bands, and, when it moved, reflows leaves, the primary grid + PTY,
     /// and every pane session through the normal geometry sync
     /// (CTX-0873, CTX-0946 C3).

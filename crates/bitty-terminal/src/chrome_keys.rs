@@ -1321,7 +1321,7 @@ impl TerminalApp {
                     Ok(index) => eprintln!(
                         "bitty: keymap workspace_new -> workspace {} ({})",
                         index + 1,
-                        self.runtime.workspaceline_text()
+                        self.runtime.workspace_names().join(" ")
                     ),
                     Err(err) => {
                         eprintln!("warning: keymap workspace_new refused ({err}) — ignoring")
@@ -1335,7 +1335,7 @@ impl TerminalApp {
                 match self.runtime.workspace_close_request() {
                     WsCloseRequest::Closed { killed } => eprintln!(
                         "bitty: keymap workspace_close -> ({}) killed={killed}",
-                        self.runtime.workspaceline_text()
+                        self.runtime.workspace_names().join(" ")
                     ),
                     WsCloseRequest::Pending { summary } => {
                         eprintln!("bitty: keymap workspace_close PENDING -> {summary}")
@@ -1347,7 +1347,7 @@ impl TerminalApp {
                 eprintln!(
                     "bitty: keymap workspace_prev -> workspace {} ({})",
                     index + 1,
-                    self.runtime.workspaceline_text()
+                    self.runtime.workspace_names().join(" ")
                 );
             }
             A::WorkspaceNext => {
@@ -1355,7 +1355,7 @@ impl TerminalApp {
                 eprintln!(
                     "bitty: keymap workspace_next -> workspace {} ({})",
                     index + 1,
-                    self.runtime.workspaceline_text()
+                    self.runtime.workspace_names().join(" ")
                 );
             }
             A::WorkspaceLast => {
@@ -1363,7 +1363,7 @@ impl TerminalApp {
                 eprintln!(
                     "bitty: keymap workspace_last -> workspace {} ({})",
                     index + 1,
-                    self.runtime.workspaceline_text()
+                    self.runtime.workspace_names().join(" ")
                 );
             }
             A::WorkspaceFocus(n) => {
@@ -1375,11 +1375,11 @@ impl TerminalApp {
                     Some(index) => eprintln!(
                         "bitty: keymap workspace_focus:{n} -> workspace {} ({})",
                         index + 1,
-                        self.runtime.workspaceline_text()
+                        self.runtime.workspace_names().join(" ")
                     ),
                     None => eprintln!(
                         "warning: keymap workspace_focus:{n} has no such workspace ({}) — ignoring",
-                        self.runtime.workspaceline_text()
+                        self.runtime.workspace_names().join(" ")
                     ),
                 }
             }
@@ -1392,11 +1392,11 @@ impl TerminalApp {
                 match self.runtime.workspace_move_focused_to_one_based(n) {
                     Ok((moved, from, to)) => eprintln!(
                         "bitty: keymap workspace_move:{n} -> moved {moved:?} ws:{from} -> ws:{to} ({})",
-                        self.runtime.workspaceline_text()
+                        self.runtime.workspace_names().join(" ")
                     ),
                     Err(err) => eprintln!(
                         "warning: keymap workspace_move:{n} refused ({err}) ({}) — ignoring",
-                        self.runtime.workspaceline_text()
+                        self.runtime.workspace_names().join(" ")
                     ),
                 }
             }
@@ -1405,11 +1405,11 @@ impl TerminalApp {
                 match self.runtime.workspace_swap_current_with(n) {
                     Ok((from_seq, to_seq)) => eprintln!(
                         "bitty: keymap workspace_swap:{n} -> swapped ws:{from_seq} <-> ws:{to_seq} ({})",
-                        self.runtime.workspaceline_text()
+                        self.runtime.workspace_names().join(" ")
                     ),
                     Err(err) => eprintln!(
                         "warning: keymap workspace_swap:{n} refused ({err}) ({}) — ignoring",
-                        self.runtime.workspaceline_text()
+                        self.runtime.workspace_names().join(" ")
                     ),
                 }
             }
@@ -3931,15 +3931,18 @@ mod tests {
     }
 
     #[test]
-    fn chrome_workspace_ops_move_active_and_tabline_follows() {
+    fn chrome_workspace_ops_move_active_and_queries_follow() {
         use bitty_config::ChromeAction;
         let mut app = workspace_test_app();
-        assert_eq!(app.runtime.workspaceline_text(), "1:ws1* (1)");
+        assert_eq!(app.runtime.workspace_names(), vec![String::from("ws1")]);
         app.apply_chrome_action(ChromeAction::WorkspaceNew);
-        assert_eq!(app.runtime.workspaceline_text(), "1:ws1 2:ws2* (2)");
+        assert_eq!(
+            app.runtime.workspace_names(),
+            vec![String::from("ws1"), String::from("ws2")]
+        );
+        assert_eq!(app.runtime.active_workspace_index(), 1);
         app.apply_chrome_action(ChromeAction::WorkspaceFocus(1));
         assert_eq!(app.runtime.active_workspace_index(), 0);
-        assert_eq!(app.runtime.workspaceline_text(), "1:ws1* 2:ws2 (2)");
         app.apply_chrome_action(ChromeAction::WorkspaceNext);
         assert_eq!(app.runtime.active_workspace_index(), 1);
         app.apply_chrome_action(ChromeAction::WorkspacePrev);
@@ -3950,11 +3953,11 @@ mod tests {
         // the clamp target is already active, so state holds.
         app.apply_chrome_action(ChromeAction::WorkspaceFocus(9));
         assert_eq!(app.runtime.active_workspace_index(), 1);
-        assert_eq!(app.runtime.workspaceline_text(), "1:ws1 2:ws2* (2)");
+        assert_eq!(app.runtime.workspace_count(), 2);
         // Idle close is immediate (never pends, never kills).
         app.apply_chrome_action(ChromeAction::WorkspaceClose);
         assert!(!app.runtime.has_pending_ws_close());
-        assert_eq!(app.runtime.workspaceline_text(), "1:ws1* (1)");
+        assert_eq!(app.runtime.workspace_names(), vec![String::from("ws1")]);
     }
 
     #[test]
@@ -3971,18 +3974,18 @@ mod tests {
         // Exact jump.
         app.apply_chrome_action(ChromeAction::WorkspaceFocus(2));
         assert_eq!(app.runtime.active_workspace_index(), 1);
-        assert_eq!(app.runtime.workspaceline_text(), "1:ws1 2:ws2* 3:ws3 (3)");
+        assert_eq!(app.runtime.workspace_count(), 3);
         // Clamp: Alt+6 / Alt+9 with 3 workspaces go to workspace 3.
         app.apply_chrome_action(ChromeAction::WorkspaceFocus(6));
         assert_eq!(app.runtime.active_workspace_index(), 2);
-        assert_eq!(app.runtime.workspaceline_text(), "1:ws1 2:ws2 3:ws3* (3)");
+        assert_eq!(app.runtime.workspace_count(), 3);
         app.apply_chrome_action(ChromeAction::WorkspaceFocus(1));
         app.apply_chrome_action(ChromeAction::WorkspaceFocus(9));
         assert_eq!(app.runtime.active_workspace_index(), 2);
         // Zero fails closed with state untouched.
         app.apply_chrome_action(ChromeAction::WorkspaceFocus(0));
         assert_eq!(app.runtime.active_workspace_index(), 2);
-        assert_eq!(app.runtime.workspaceline_text(), "1:ws1 2:ws2 3:ws3* (3)");
+        assert_eq!(app.runtime.workspace_count(), 3);
     }
 
     #[test]
@@ -4018,7 +4021,14 @@ mod tests {
         // Auto-creates missing target workspace N (CTX-0945).
         app.apply_chrome_action(ChromeAction::WorkspaceMove(9));
         assert_eq!(app.runtime.workspace_count(), 3);
-        assert_eq!(app.runtime.workspaceline_text(), "1:ws1 2:ws2* 9:ws9 (3)");
+        assert_eq!(
+            app.runtime.workspace_names(),
+            vec![
+                String::from("ws1"),
+                String::from("ws2"),
+                String::from("ws9")
+            ]
+        );
         assert_eq!(app.runtime.layout().leaf_count(), 1);
     }
 
@@ -5322,7 +5332,7 @@ mod tests {
         // and still never leaks the digit.
         assert!(drive_mod_char(&mut app, "9", false, true, false, false));
         assert_eq!(app.runtime.active_workspace_index(), 2);
-        assert_eq!(app.runtime.workspaceline_text(), "1:ws1 2:ws2 3:ws3* (3)");
+        assert_eq!(app.runtime.workspace_count(), 3);
         assert!(app.runtime.drain_pending_input().is_empty());
     }
 

@@ -134,10 +134,8 @@ fn osc10_osc11_set_is_default_deny_and_pixel_inert() {
 #[test]
 fn granted_osc11_set_repaints_the_surface() {
     let mut rt = themed_deterministic();
-    // W-104/CTX-0956 retired the Core bar, so no bar row can emit glyphs
-    // into the `glyphs == 0` pin below. The retained visibility toggle is
-    // kept as the redraw arm for the baseline present.
-    rt.set_workspaceline_visible(false);
+    // CTX-0979: Core draws no workspace display, so no bar row exists to
+    // hide; the `glyphs == 0` pin is exact without chrome.
     assert!(rt.tick().is_some(), "baseline full redraw");
     let baseline = rt.headless_rgba().expect("baseline rgba");
     assert_eq!(

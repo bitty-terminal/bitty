@@ -11,11 +11,11 @@
 //!   `splitTop = height * split_width_multiplier > width` at the default
 //!   multiplier `1.0`. Explicit `new_split:<dir>` keeps its fixed axis;
 //!   Niri-ribbon ordering is out of scope.
-//! - Core presents no workspace indicator at any workspace count (the Core
-//!   bar is retired; the `bar` plugin owns workspace/status UX): the data
-//!   path `workspaceline_text` still renders for ctl/tabline, no band is
-//!   ever reserved, and the container keeps the full window. A lone
-//!   workspace is simply the one-workspace case of that default.
+//! - CTX-0979: Core draws no workspace display (Hyprland-style). Workspace
+//!   state is memory-only; the bar plugin owns presentation via the query
+//!   commands. A lone workspace and multi-workspace both reserve no Core
+//!   row; queries (`workspace_names`, `workspace_summaries`) serve the
+//!   indicator.
 
 use bitty_runtime::{Runtime, SplitAxis, UiRect};
 
@@ -74,32 +74,29 @@ fn panel_axis_unknown_focus_falls_back_to_container() {
 }
 
 #[test]
-fn lone_workspace_presents_no_core_chrome() {
+fn lone_workspace_queries_serve_the_indicator() {
     let rt = fresh();
-    // Data still renders for ctl/tabline ...
-    assert_eq!(rt.workspaceline_text(), "1:ws1* (1)");
-    // ... but Core reserves and presents nothing: no band, full grid.
-    assert_eq!(rt.status_bar_band(), None, "no reserved row when alone");
+    // Queries serve the bar plugin and ctl; Core reserves no row.
+    assert_eq!(rt.workspace_names(), vec![String::from("ws1")]);
+    assert_eq!(rt.workspace_count(), 1);
+    assert_eq!(rt.active_workspace_index(), 0);
     assert_eq!(rt.container(), rt.window_cells());
 }
 
 #[test]
-fn two_workspaces_present_no_core_chrome() {
+fn two_workspaces_queries_serve_the_indicator() {
     let mut rt = fresh();
     rt.workspace_new().expect("ws2");
-    let text = rt.workspaceline_text();
-    assert_eq!(text, "1:ws1 2:ws2* (2)");
-    assert_eq!(rt.status_bar_band(), None, "no Core band with two");
-    assert_eq!(rt.container(), rt.window_cells());
     assert_eq!(
-        rt.workspaceline_text(),
-        "1:ws1 2:ws2* (2)",
-        "data path follows the lifecycle"
+        rt.workspace_names(),
+        vec![String::from("ws1"), String::from("ws2")]
     );
-    // Closing back to one keeps the default.
+    assert_eq!(rt.active_workspace_index(), 1);
+    // CTX-0979: no Core bar is reserved even with many workspaces.
+    assert_eq!(rt.container(), rt.window_cells());
+    // Closing back to one keeps queries consistent.
     assert!(rt.workspace_switch(0));
     rt.workspace_close_index(2).expect("close ws2");
     assert_eq!(rt.workspace_count(), 1);
-    assert_eq!(rt.status_bar_band(), None);
-    assert_eq!(rt.container(), rt.window_cells());
+    assert_eq!(rt.workspace_names(), vec![String::from("ws1")]);
 }

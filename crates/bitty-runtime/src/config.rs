@@ -135,20 +135,16 @@ pub const DEFAULT_FOCUS_FOLLOWS_MOUSE: bool = true;
 /// `0` activates on pointer entry (CTX-0260 behavior).
 pub const DEFAULT_FOCUS_FOLLOWS_MOUSE_DELAY_MS: u32 = 0;
 
-/// Whether the workspace switcher bar presents by default (issue #1333).
-/// `true` renders the workspaceline present string on the default config;
-/// `false` is the opt-out (`workspace.show_bar = false`). Read once at
-/// construction; live toggles go through
-/// [`crate::Runtime::set_workspaceline_visible`].
-pub const DEFAULT_WORKSPACELINE_VISIBLE: bool = true;
-
-/// Window edge the Core-owned workspace bar band reserves (CTX-0873,
-/// issue #1431; `workspace.bar.edge`).
+/// CTX-0979: Core draws no workspace display (Hyprland-style). The former
+/// `DEFAULT_WORKSPACELINE_VISIBLE` is deleted; workspace state is memory-only
+/// and the bar plugin owns presentation via the query commands.
 ///
-/// The band is carved out of the window grid before layout, so terminal
-/// content is never painted under it. Only the horizontal edges exist
-/// today; the geometry ([`crate::runtime::chrome_band::ChromeInsets`]) is
-/// four-sided so `Left`/`Right` can land later without reshaping callers.
+/// `BarEdge`/`DEFAULT_WORKSPACE_BAR_EDGE` stay as the pure geometry edge
+/// for the `chrome_band` helper and its tests; no runtime band is reserved.
+/// Window edge for the (now unreserved) chrome band geometry helper.
+///
+/// CTX-0979: no runtime band is reserved; this stays for the pure
+/// `chrome_band` geometry helper and its tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BarEdge {
     /// Band on the first window row; content starts one band lower.
@@ -158,7 +154,7 @@ pub enum BarEdge {
     Bottom,
 }
 
-/// Default workspace bar edge (CTX-0873): [`BarEdge::Bottom`].
+/// Default chrome band edge: [`BarEdge::Bottom`].
 pub const DEFAULT_WORKSPACE_BAR_EDGE: BarEdge = BarEdge::Bottom;
 
 /// Maximum accepted hover-activation delay in milliseconds (CTX-0334).
@@ -645,17 +641,8 @@ pub struct RuntimeConfig {
     /// hovered pane for at least this long, so a transient pass-through
     /// never steals focus. Bounded by [`MAX_FOCUS_FOLLOWS_MOUSE_DELAY_MS`].
     pub focus_follows_mouse_delay: std::time::Duration,
-    /// Whether the workspace switcher bar presents (issue #1333
-    /// `workspace.show_bar`; default `true` = bar renders on the default
-    /// config). Read at view present time only, never on the input hot
-    /// path. The app layer assigns the validated effective value
-    /// post-construction, following the `focus_follows_mouse` pattern.
-    pub workspaceline_visible: bool,
-    /// Window edge of the workspace bar band (CTX-0873
-    /// `workspace.bar.edge`; default [`BarEdge::Bottom`]). Assigned
-    /// post-construction by the app layer like `workspaceline_visible`;
-    /// live changes go through [`crate::Runtime::set_workspace_bar_edge`].
-    pub workspace_bar_edge: BarEdge,
+    /// CTX-0979: Core draws no workspace display; no visibility or edge
+    /// fields live here. Workspace state is memory-only.
     /// Spacing between sibling panes in cells (CTX-0177 `layout.gaps_in`).
     /// `0..=MAX_LAYOUT_GAP_CELLS`; default `0` = edge-to-edge tiling.
     /// The gap band shows the window background; per-leaf rendering and
@@ -851,8 +838,6 @@ impl Default for RuntimeConfig {
             focus_follows_mouse_delay: std::time::Duration::from_millis(u64::from(
                 DEFAULT_FOCUS_FOLLOWS_MOUSE_DELAY_MS,
             )),
-            workspaceline_visible: DEFAULT_WORKSPACELINE_VISIBLE,
-            workspace_bar_edge: DEFAULT_WORKSPACE_BAR_EDGE,
             gaps_in: DEFAULT_LAYOUT_GAPS_IN,
             gaps_out: DEFAULT_LAYOUT_GAPS_OUT,
             decoration: bitty_ui::Decoration::default(),
@@ -945,8 +930,6 @@ impl RuntimeConfig {
             focus_follows_mouse_delay: std::time::Duration::from_millis(u64::from(
                 DEFAULT_FOCUS_FOLLOWS_MOUSE_DELAY_MS,
             )),
-            workspaceline_visible: DEFAULT_WORKSPACELINE_VISIBLE,
-            workspace_bar_edge: DEFAULT_WORKSPACE_BAR_EDGE,
             gaps_in,
             gaps_out,
             decoration: bitty_ui::Decoration::default(),

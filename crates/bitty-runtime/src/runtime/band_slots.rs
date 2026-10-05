@@ -32,12 +32,9 @@
 //! affects placement, and `statusline` and `bottom` surfaces share one
 //! ordering. The `chrome.<edge>.order` key is not yet wired into the runtime.
 //!
-//! Core reservation: the Core workspace bar is retired (W-104/CTX-0956:
-//! the `bar` plugin owns workspace/status UX), so Core reserves zero rows
-//! on every edge ([`crate::Runtime::status_bar_band`] always returns
-//! `None`, solved once by `chrome_band::solve`). Plugin bands therefore
-//! start at the window edge: with the default bottom edge, bottom band `0`
-//! sits on row `H-1`. See [`crate::Runtime::plugin_band_row`].
+//! CTX-0979: Core draws no workspace display (Hyprland-style). Plugin bands
+//! stack from the window edge inward with no Core reservation; see
+//! [`crate::Runtime::plugin_band_row`].
 //!
 //! Exclusive zone (CTX-0946 C3, closed): visible plugin bands shrink the
 //! layout container through [`Runtime::band_exclusive_container`]
@@ -181,17 +178,11 @@ impl ChromeBands {
 
     /// Window row (cells) painted by horizontal band `index` on `edge` in a
     /// window `window_rows` tall, stacking from the edge inward and starting
-    /// inward of the `core_reserved` rows Core holds on that edge (zero on
-    /// every edge since the Core bar retired); `None` for a vertical edge
-    /// or a band that does not fit.
+    /// inward of `reserved` rows already held on that edge; `None` for a
+    /// vertical edge or a band that does not fit.
     #[must_use]
-    pub fn band_row(
-        edge: BandEdge,
-        index: usize,
-        window_rows: u16,
-        core_reserved: u16,
-    ) -> Option<u16> {
-        let offset = core_reserved.checked_add(u16::try_from(index).ok()?)?;
+    pub fn band_row(edge: BandEdge, index: usize, window_rows: u16, reserved: u16) -> Option<u16> {
+        let offset = reserved.checked_add(u16::try_from(index).ok()?)?;
         if offset >= window_rows {
             return None;
         }
@@ -204,30 +195,9 @@ impl ChromeBands {
 }
 
 impl Runtime {
-    /// Rows Core reserves on horizontal `edge` (`0` on every edge since the
-    /// Core workspace bar retired in W-104/CTX-0956, and `0` for a vertical
-    /// edge).
-    ///
-    /// Derived from the single chrome solve ([`Self::status_bar_band`]), so
-    /// plugin band stacking can never drift from the Core reservation.
-    #[must_use]
-    pub fn core_reserved_rows(&self, edge: BandEdge) -> u16 {
-        let window = self.window_cells();
-        let Some(bar) = self.status_bar_band() else {
-            return 0;
-        };
-        let bar_end = bar.y.saturating_add(bar.height);
-        match edge {
-            BandEdge::Top if bar.y == window.y => bar.height,
-            BandEdge::Bottom if bar_end == window.y.saturating_add(window.height) => bar.height,
-            _ => 0,
-        }
-    }
-
-    /// Window row painted by visible plugin band `index` on `edge`,
-    /// stacking from the window edge inward (Core reserves zero rows since
-    /// the bar retired; see [`ChromeBands::band_row`]); `None` when it does
-    /// not fit.
+    /// Window row painted by visible plugin band `index` on `edge`
+    /// (CTX-0979: no Core reservation; see [`ChromeBands::band_row`]);
+    /// `None` when it does not fit.
     ///
     /// `index` counts visible (non-empty-text) bands only: hidden bands
     /// take no stacking row (CTX-0946 C3, CTX-0925 item 3), so `index >=
@@ -238,8 +208,7 @@ impl Runtime {
             return None;
         }
         let window = self.window_cells();
-        ChromeBands::band_row(edge, index, window.height, self.core_reserved_rows(edge))
-            .map(|row| row.saturating_add(window.y))
+        ChromeBands::band_row(edge, index, window.height, 0).map(|row| row.saturating_add(window.y))
     }
 }
 
@@ -337,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn band_rows_start_inward_of_the_core_reservation() {
+    fn band_rows_start_inward_of_reserved_rows() {
         assert_eq!(ChromeBands::band_row(BandEdge::Top, 0, 24, 1), Some(1));
         assert_eq!(ChromeBands::band_row(BandEdge::Bottom, 0, 24, 1), Some(22));
         assert_eq!(ChromeBands::band_row(BandEdge::Bottom, 1, 24, 1), Some(21));

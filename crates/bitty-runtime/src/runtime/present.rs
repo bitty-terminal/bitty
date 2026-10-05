@@ -343,6 +343,10 @@ fn erased_snapshot(base: &Snapshot) -> Snapshot {
     }
 }
 
+/// CTX-0979: Core draws no workspace display (Hyprland-style). The former
+/// workspace bar band snapshot helpers (`band_snapshot`,
+/// `overlay_status_bar`) are deleted; plugin bands paint through
+/// `paint_chrome_bands`/`paint_band_row`.
 /// First source row of a viewport window that keeps `cursor_row` visible.
 ///
 /// The window is `window` rows tall inside `src_len` rows. It stays at the
@@ -998,6 +1002,11 @@ impl Runtime {
             pending_full = true;
         }
 
+        // CTX-0979: Core draws no workspace display; workspace
+        // switch/new/close/rename with a quiet grid still needs a frame
+        // when plugin bands or layout changed (band damage only; geometry
+        // reflows through the exclusive-zone budget in
+        // `refresh_chrome_band` above). No Core bar text is compared.
         // CTX-0946 C2: a plugin mount/update/unmount with a quiet grid
         // still needs a frame (band damage only; geometry reflows through
         // the exclusive-zone budget in `refresh_chrome_band` above).
@@ -1123,7 +1132,6 @@ impl Runtime {
             band_versions,
         })
     }
-
     /// Phase 3 (CTX-0474): build the retryable combined leaf primitive pass.
     ///
     /// Walks every visible allocation, reusing a retained leaf whose origin
@@ -1148,10 +1156,6 @@ impl Runtime {
         // the same pass), so the whole leaf set is rebuilt when a reset is
         // observed, bounded by [`ATLAS_REBUILD_LIMIT`].
         let mut attempt = 0u8;
-        // CTX-0873 (#1431) retired (W-104/CTX-0956): the Core workspace bar
-        // band is deleted — the `bar` plugin owns workspace/status UX over
-        // the generic band mechanism — so no Core band paints here. Plugin
-        // bands paint through the band-host path below.
         let built = loop {
             attempt += 1;
             let mut built = CombinedLeaves::default();
@@ -1450,6 +1454,9 @@ impl Runtime {
                 built.fills.extend(fills);
                 built.glyphs.extend(glyphs);
             }
+
+            // CTX-0979: Core draws no workspace display; only plugin bands
+            // paint (their own pass below). No Core bar paint here.
 
             if stale_epoch {
                 // Partial attempt: every slot collected before the reset is
@@ -2039,19 +2046,14 @@ impl Runtime {
         if plan.is_empty() {
             return;
         }
-        // Overlap fail-closed: rows claimed twice, or a band on the
-        // retired Core bar row, deny every claimant on the shared row
-        // (never partial paint). The Core bar is deleted (W-104/CTX-0956),
-        // so `core_bar_row` is always `None`; the term stays as a guard
-        // behind the same [`status_bar_band`](Runtime::status_bar_band)
-        // geometry seam.
-        let core_bar_row = self.status_bar_band().map(|bar| bar.y);
+        // Overlap fail-closed: rows claimed twice deny every claimant on
+        // the shared row (never partial paint). CTX-0979: no Core bar row
+        // exists to collide with.
         let mut denied_rows: Vec<u16> = Vec::new();
         for (index, (_, row, _)) in plan.iter().enumerate() {
             let duplicate = plan[..index].iter().any(|(_, other, _)| other == row)
                 || plan[index + 1..].iter().any(|(_, other, _)| other == row);
-            let on_core_bar = core_bar_row.is_some_and(|bar| bar == *row);
-            if (duplicate || on_core_bar) && !denied_rows.contains(row) {
+            if duplicate && !denied_rows.contains(row) {
                 denied_rows.push(*row);
             }
         }
@@ -3113,6 +3115,8 @@ mod content_padding_tests {
     }
 }
 
+// CTX-0979: Core workspace bar overlay tests deleted with
+// `overlay_status_bar` (Core draws no workspace display).
 #[cfg(test)]
 mod selection_window_clip_tests {
     //! CTX-0803: the selection paint's frame-window clip is the inverse of

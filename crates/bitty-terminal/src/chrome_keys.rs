@@ -1355,12 +1355,15 @@ impl TerminalApp {
                 // through the `bitty.workspace:floating-toggle` primitive
                 // semantics (`bitty_ui::presentation::toggle_floating`):
                 // single command so the chord never desyncs from leaf state.
-                // Zoom restores first so the toggle measures the real tiled
-                // tree, not the zoom proxy. Fullscreen/Scratchpad leaves fail
-                // closed with a warning and no state change; the layout solver
-                // ignores the mode, so the round trip restores the exact prior
+                // Validate on the live tree BEFORE touching zoom: the zoom
+                // proxy clones the focused leaf, so its presentation is the
+                // real one. Fullscreen/Scratchpad leaves therefore reject
+                // here with a warning and zero state change (no zoom
+                // restore, no layout write). For a valid toggle, zoom
+                // restores next so the mutation lands on the real tiled
+                // tree, not the zoom proxy; the layout solver ignores the
+                // mode, so the round trip restores the exact prior
                 // allocation with no anchor bookkeeping.
-                self.restore_zoom();
                 let focused = match self.runtime.focused_view() {
                     Some(id) => id,
                     None => {
@@ -1368,8 +1371,7 @@ impl TerminalApp {
                         return;
                     }
                 };
-                let mut layout = self.runtime.layout().clone();
-                let current = match layout.find_leaf(focused) {
+                let current = match self.runtime.layout().find_leaf(focused) {
                     Some(leaf) => leaf.presentation(),
                     None => {
                         eprintln!(
@@ -1394,6 +1396,8 @@ impl TerminalApp {
                     );
                     return;
                 }
+                self.restore_zoom();
+                let mut layout = self.runtime.layout().clone();
                 match layout.find_leaf_mut(focused) {
                     Some(leaf) => {
                         if !PresentationMode::request_transition(leaf, next) {
@@ -3525,6 +3529,63 @@ mod tests {
                 .presentation(),
             PresentationMode::Tiled,
             "second toggle restores tiled"
+        );
+    }
+
+    #[test]
+    fn chrome_toggle_floating_rejects_zoomed_fullscreen_without_state_change() {
+        // CodeRabbit PR #1704 (CTX-0962 follow-up): the leaf validates
+        // before zoom restores. A zoomed Fullscreen/Scratchpad leaf must
+        // reject with zero state change (zoom backup intact, layout and
+        // focus untouched). A zoomed Tiled leaf still toggles: restore
+        // lands on the real tree, then the flip applies.
+        use bitty_config::ChromeAction;
+        for mode in [PresentationMode::Fullscreen, PresentationMode::Scratchpad] {
+            let mut app = workspace_test_app();
+            app.runtime.set_layout(two_pane_layout());
+            let focused = app.runtime.focused_view().expect("seed focus");
+            let mut seeded = app.runtime.layout().clone();
+            let leaf = seeded.find_leaf_mut(focused).expect("focused leaf");
+            assert!(PresentationMode::request_transition(leaf, mode));
+            app.runtime.set_layout(seeded);
+            app.apply_chrome_action(ChromeAction::ToggleZoom);
+            assert!(app.chrome.zoom.is_zoomed(&app.runtime), "zoom engaged");
+            let before = format!("{:?}", app.runtime.layout());
+            app.apply_chrome_action(ChromeAction::ToggleFloating);
+            assert_eq!(
+                format!("{:?}", app.runtime.layout()),
+                before,
+                "rejected toggle on zoomed {mode} must not touch the layout"
+            );
+            assert!(
+                app.chrome.zoom.is_zoomed(&app.runtime),
+                "rejected toggle on zoomed {mode} must keep the zoom backup"
+            );
+            assert_eq!(
+                app.runtime.focused_view(),
+                Some(focused),
+                "rejected toggle keeps focus"
+            );
+        }
+        let mut app = workspace_test_app();
+        app.runtime.set_layout(two_pane_layout());
+        let focused = app.runtime.focused_view().expect("seed focus");
+        app.apply_chrome_action(ChromeAction::ToggleZoom);
+        assert!(app.chrome.zoom.is_zoomed(&app.runtime), "zoom engaged");
+        app.apply_chrome_action(ChromeAction::ToggleFloating);
+        assert!(
+            !app.chrome.zoom.is_zoomed(&app.runtime),
+            "valid toggle consumes the zoom restore"
+        );
+        assert_eq!(app.runtime.leaf_count(), 2, "toggle lands on the real tree");
+        assert_eq!(
+            app.runtime
+                .layout()
+                .find_leaf(focused)
+                .expect("focused leaf")
+                .presentation(),
+            PresentationMode::Floating,
+            "zoomed tiled leaf floats"
         );
     }
 

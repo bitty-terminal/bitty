@@ -1231,6 +1231,82 @@ fn recorded_primary_elsewhere_downgrades_to_pending() {
     assert!(rt.session_pending_contains(&ViewId::new(101)));
 }
 
+/// CTX-0972 F4: ambiguous ownership (one explicit primary off the derived
+/// owner plus a legacy `None` on the owner) is rejected at load. Before the
+/// fix the file validated, then encoded to two primaries that the next load
+/// rejected — validate accepted files that encode into files validate
+/// rejects.
+#[test]
+fn ambiguous_resolved_ownership_rejected_at_load_not_round_trip() {
+    let pane = |id: u64, attach: Option<PaneAttachment>| PaneSnapshot {
+        view: ViewId::new(id),
+        cwd: None,
+        scrollback: Vec::new(),
+        attach,
+        route: PaneRoute::Terminal,
+        mode: PresentationMode::Tiled,
+    };
+    // Focus pins the derived owner at leaf 100; the explicit primary sits
+    // off-owner on leaf 101 while leaf 100 carries legacy `None`.
+    let ambiguous = SessionSnapshot {
+        version: SESSION_FORMAT_VERSION,
+        workspaces: vec![WorkspaceSnapshot {
+            seq: 1,
+            name: "ws1".to_string(),
+            layout: LayoutNode::split(
+                SplitAxis::Horizontal,
+                0.5,
+                LayoutNode::leaf(View::new(ViewId::new(100), 80, 24)),
+                LayoutNode::leaf(View::new(ViewId::new(101), 80, 24)),
+            ),
+            focus: Some(ViewId::new(100)),
+            panes: vec![pane(100, None), pane(101, Some(PaneAttachment::Primary))],
+        }],
+        active: 0,
+        mru: vec![0],
+    };
+    let mut rt = present_runtime();
+    let err = rt
+        .apply_session_snapshot(&ambiguous)
+        .expect_err("ambiguous ownership must fail at load");
+    assert_eq!(format!("{err}"), "session file corrupt (duplicate primary)");
+
+    // Mechanism pin: the rejected file would have encoded to two primaries.
+    let bytes = backend()
+        .encode_snapshot(&ambiguous)
+        .expect("storage-side explicit check still encodes the ambiguous file");
+    let text = String::from_utf8_lossy(&bytes);
+    assert_eq!(
+        text.match_indices(" primary ").count(),
+        2,
+        "ambiguous file must encode to two primaries: {text:?}"
+    );
+
+    // 0-explicit still loads and encodes to exactly one primary.
+    let mut legacy = ambiguous.clone();
+    legacy.workspaces[0].panes[1].attach = Some(PaneAttachment::Session);
+    let mut rt = present_runtime();
+    rt.apply_session_snapshot(&legacy)
+        .expect("legacy Nones must load");
+    let bytes = backend()
+        .encode_snapshot(&legacy)
+        .expect("legacy must encode");
+    let text = String::from_utf8_lossy(&bytes);
+    assert_eq!(
+        text.match_indices(" primary ").count(),
+        1,
+        "legacy Nones must encode to exactly one primary: {text:?}"
+    );
+
+    // 1-explicit-on-owner plus a None elsewhere loads.
+    let mut on_owner = ambiguous.clone();
+    on_owner.workspaces[0].panes[0].attach = Some(PaneAttachment::Primary);
+    on_owner.workspaces[0].panes[1].attach = None;
+    let mut rt = present_runtime();
+    rt.apply_session_snapshot(&on_owner)
+        .expect("primary on the owner must load");
+}
+
 /// CW-16 (#994): per-leaf presentation modes survive the file round trip
 /// into the live tree — the mode token stamps the restored leaf at decode
 /// and apply installs that tree live.

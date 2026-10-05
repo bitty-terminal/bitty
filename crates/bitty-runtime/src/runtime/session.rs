@@ -650,15 +650,23 @@ fn validate_snapshot(snap: &SessionSnapshot) -> Result<(), SessionError> {
         }
     }
     // CW-16: the primary grid is single — at most one leaf may claim it
-    // across the whole file. (Whether the recorded owner actually hydrates
+    // across the whole file. Count resolved attachments, not recorded ones:
+    // a `None` (v1-legacy) pane resolves through `derive_startup_owner` at
+    // encode, so one explicit primary off-owner plus a `None` on the derived
+    // owner would encode to two primaries that the next load rejects.
+    // Deriving here is total: `active` indexes a live workspace, every
+    // workspace carries a live leaf, and focus is a leaf or absent (all
+    // validated above). Resolved primaries subsume explicit ones, so this
+    // one check covers both. (Whether the recorded owner actually hydrates
     // the grid is decided at apply: the startup recipe re-pins the primary
     // shell at the focused leaf on every launch, so a recorded owner
     // elsewhere is downgraded to a pending respawn with its own history.)
+    let owner = derive_startup_owner(snap);
     let primaries = snap
         .workspaces
         .iter()
         .flat_map(|ws| ws.panes.iter())
-        .filter(|pane| pane.attach == Some(PaneAttachment::Primary))
+        .filter(|pane| resolve_attachment(pane.attach, pane.view, owner) == PaneAttachment::Primary)
         .count();
     if primaries > 1 {
         return Err(SessionError::Corrupt("duplicate primary"));
@@ -1520,6 +1528,64 @@ mod tests {
             format!("{err}"),
             "session file corrupt (detached pane state)"
         );
+    }
+
+    #[test]
+    fn validation_counts_resolved_primaries_not_just_recorded() {
+        // CTX-0972 F4 round-trip break: one explicit primary off the derived
+        // owner (leaf 2) plus a legacy `None` on the owner (leaf 1) records
+        // a single primary, but encode resolves the `None` to a second
+        // primary that the next load rejects.
+        let mut ambiguous = two_pane_snapshot(None);
+        ambiguous.workspaces[0].panes[1].attach = Some(PaneAttachment::Primary);
+        assert_eq!(
+            ambiguous.workspaces[0]
+                .panes
+                .iter()
+                .filter(|pane| pane.attach == Some(PaneAttachment::Primary))
+                .count(),
+            1,
+            "the old explicit-only check would accept this file"
+        );
+        let err = validate_snapshot(&ambiguous).expect_err("ambiguous ownership must fail");
+        assert_eq!(format!("{err}"), "session file corrupt (duplicate primary)");
+
+        // 0-explicit still loads and resolves to exactly one primary.
+        let legacy = two_pane_snapshot(None);
+        validate_snapshot(&legacy).expect("legacy Nones must validate");
+        let owner = derive_startup_owner(&legacy);
+        let resolved = legacy.workspaces[0]
+            .panes
+            .iter()
+            .filter(|pane| {
+                resolve_attachment(pane.attach, pane.view, owner) == PaneAttachment::Primary
+            })
+            .count();
+        assert_eq!(
+            resolved, 1,
+            "legacy Nones must resolve to exactly one primary"
+        );
+
+        // 1-explicit-on-owner plus Nones elsewhere loads.
+        let mut on_owner = SessionSnapshot {
+            version: SESSION_FORMAT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                seq: 1,
+                name: "ws1".to_string(),
+                layout: LayoutNode::stack(vec![leaf(1), leaf(2), leaf(3)]),
+                focus: Some(ViewId::new(1)),
+                panes: vec![
+                    v2_pane(1, Some(PaneAttachment::Primary)),
+                    v2_pane(2, None),
+                    v2_pane(3, None),
+                ],
+            }],
+            active: 0,
+            mru: vec![0],
+        };
+        validate_snapshot(&on_owner).expect("primary on the owner must validate");
+        on_owner.workspaces[0].panes[1].attach = Some(PaneAttachment::Session);
+        validate_snapshot(&on_owner).expect("explicit session off-owner must validate");
     }
 
     #[test]

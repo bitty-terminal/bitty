@@ -369,20 +369,49 @@ fn tabline_slot_requires_exclusive_claim() {
         return {}
         "#,
     );
-    // CTX-0923: the claim gate passes, but `tabline` is reserved for PW-10
-    // panel tabs and has no host surface, so the mount fails closed with a
-    // typed error instead of being stored and never rendered.
+    // CTX-0974 (DEC-0100 waiver): deprecated `tabline` claim alias purged;
+    // only `workspaceline` satisfies the gate, so the old claim fails closed
+    // at the claim gate.
     assert_eq!(
         store_value(&claimed.runtime, &claimed.id, "ok"),
         Some(LuaValue::Bool(false))
     );
     assert_eq!(
         store_value(&claimed.runtime, &claimed.id, "code"),
-        Some(LuaValue::String(E_UI_UNAVAILABLE.to_string()))
+        Some(LuaValue::String("E_UI_CLAIM_REQUIRED".to_string()))
     );
     claimed
         .runtime
         .services(&claimed.id)
+        .expect("services")
+        .with_ui_blocks(|blocks| assert!(blocks.is_empty()));
+
+    let canonical = Fixture::activate(
+        "tab-canonical",
+        "bitty-featured.uitab3",
+        &["ui.rich"],
+        &["workspaceline"],
+        r#"
+        local ok, err = pcall(bitty.ui.mount, "tabline", { kind = "Text", text = "x" })
+        bitty.store.set("ok", ok)
+        bitty.store.set("code", ok and "NONE" or err.code)
+        return {}
+        "#,
+    );
+    // CTX-0923: the canonical claim passes the gate, but `tabline` is reserved
+    // for PW-10 panel tabs and has no host surface, so the mount fails closed
+    // with a typed error instead of being stored and never rendered.
+    assert_eq!(
+        store_value(&canonical.runtime, &canonical.id, "ok"),
+        Some(LuaValue::Bool(false))
+    );
+    assert_eq!(
+        store_value(&canonical.runtime, &canonical.id, "code"),
+        Some(LuaValue::String(E_UI_UNAVAILABLE.to_string()))
+    );
+    canonical
+        .runtime
+        .services(&canonical.id)
         .expect("services")
         .with_ui_blocks(|blocks| assert!(blocks.is_empty()));
 }

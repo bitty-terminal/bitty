@@ -21,7 +21,7 @@ use bitty_lua::{
     validate_env_key,
 };
 use bitty_package::Version;
-use bitty_plugin_host::bundled::{WORKSPACELINE_CLAIM, canonicalize_ui_claim};
+use bitty_plugin_host::bundled::WORKSPACELINE_CLAIM;
 use bitty_ui::{
     BeaconAnnotationLayer, BeaconDispatcher, CommandBlockId, DerivedProvider, DispatchError,
     LabelAllocator, LabelPolicy, LinkId, ProviderError, ProviderMediator, ProviderTarget,
@@ -337,7 +337,7 @@ pub struct UiAccess {
     /// from v1 `ui.overlay` (presentation-only, non-focusable); no
     /// implication either way.
     pub overlay_focus: bool,
-    /// Manifest `[lazy].claims` (exclusive slot claims; `tabline` only).
+    /// Manifest `[lazy].claims` (exclusive slot claims; `workspaceline` for the `tabline` slot).
     pub claims: Vec<String>,
 }
 
@@ -1758,16 +1758,16 @@ impl HostServices for PluginServices {
             if ui_slot == UiSlot::Overlay && !access.overlay {
                 return Err(BridgeError::capability_denied("ui.overlay"));
             }
-            // Accepted: `tabline` is an exclusive claim (ADR-0009 `LUA-OQ-7`
-            // plus the shipped `[lazy].claims` vocabulary in
-            // `bitty-plugin-host::bundled`). Unclaimed mounts fail closed;
-            // the register/claim reservation is owned by the plugin host. The
-            // shipped claim grammar canonicalizes the deprecated `tabline`
-            // alias to `workspaceline`, so both spellings satisfy the slot.
+            // Accepted: `tabline` slot requires the canonical `workspaceline`
+            // exclusive claim (ADR-0009 `LUA-OQ-7` plus the shipped
+            // `[lazy].claims` vocabulary in `bitty-plugin-host::bundled`).
+            // Unclaimed mounts fail closed; the register/claim reservation is
+            // owned by the plugin host. CTX-0974 purged the deprecated
+            // `tabline` claim alias: only `workspaceline` satisfies the gate.
             let tabline_claimed = access
                 .claims
                 .iter()
-                .any(|claim| canonicalize_ui_claim(claim) == Some(WORKSPACELINE_CLAIM));
+                .any(|claim| claim.trim() == WORKSPACELINE_CLAIM);
             if ui_slot == UiSlot::Tabline && !tabline_claimed {
                 return Err(BridgeError::new(
                     "validation",
@@ -3688,19 +3688,18 @@ mod tests {
             .ui_mount("tabline", &UiNode::text("x"))
             .expect_err("unclaimed tabline must fail closed");
         assert_eq!(error.code, "E_UI_CLAIM_REQUIRED");
+        // CTX-0974 (DEC-0100 waiver): deprecated `tabline` claim alias purged;
+        // only the canonical `workspaceline` claim satisfies the gate.
         services.set_ui_access(UiAccess {
             rich: true,
             overlay: false,
             overlay_focus: false,
             claims: vec!["tabline".to_string()],
         });
-        // CTX-0923: the claim gate passes, but `tabline` is reserved for
-        // PW-10 panel tabs and is not a band surface, so the mount fails
-        // closed with the typed unsupported-slot error.
         let error = services
             .ui_mount("tabline", &UiNode::text("claimed"))
-            .expect_err("claimed tabline is not hosted yet");
-        assert_eq!(error.code, crate::E_UI_UNAVAILABLE);
+            .expect_err("purged tabline alias must fail the claim gate");
+        assert_eq!(error.code, "E_UI_CLAIM_REQUIRED");
         services.set_ui_access(UiAccess {
             rich: true,
             overlay: false,

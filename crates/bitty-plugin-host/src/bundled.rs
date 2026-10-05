@@ -3,8 +3,7 @@
 //! This module defines the **exact** accepted bundled-disabled set for `v1`
 //! per the Default Distribution RFC (`OQ-002`, accepted 2026-08-29) and the
 //! Plugin Roadmap: two bundled plugins, `bitty-terminal.shell-integration`
-//! and `bitty-terminal.workspace` (plus the deprecated `bitty-terminal.tabs`
-//! alias that resolves to workspace). `statusline`
+//! and `bitty-terminal.workspace`. `statusline`
 //! migrated to an independent first-party package (OQ-053, `CTX-0398`),
 //! `palette` migrated to an independent first-party package (OQ-053,
 //! `CTX-0397`), `git-panel` migrated to an independent first-party
@@ -127,14 +126,8 @@ pub fn shell_integration_manifest() -> PluginManifest {
 /// Canonical workspace plugin id (`bitty-terminal.workspace`).
 pub const WORKSPACE_PLUGIN_ID: &str = "bitty-terminal.workspace";
 
-/// Deprecated tabs plugin id (`bitty-terminal.tabs`, removal ≥ v0.2.0).
-pub const TABS_PLUGIN_ID: &str = "bitty-terminal.tabs";
-
 /// Canonical workspace claim (`workspaceline`).
 pub const WORKSPACELINE_CLAIM: &str = "workspaceline";
-
-/// Deprecated tabs claim (`tabline`, removal ≥ v0.2.0).
-pub const TABLINE_CLAIM: &str = "tabline";
 
 /// Canonical workspace commands (`bitty-terminal.workspace:*`).
 pub const WORKSPACE_COMMANDS: &[&str] = &[
@@ -143,94 +136,14 @@ pub const WORKSPACE_COMMANDS: &[&str] = &[
     "bitty-terminal.workspace:next",
 ];
 
-/// Deprecated tabs commands (`bitty-terminal.tabs:*`, removal ≥ v0.2.0).
-pub const TABS_COMMANDS: &[&str] = &[
-    "bitty-terminal.tabs:new",
-    "bitty-terminal.tabs:close",
-    "bitty-terminal.tabs:next",
-];
-
-/// Whether `id` is the deprecated `bitty-terminal.tabs` alias (removal ≥ v0.2.0).
-#[must_use]
-pub fn is_deprecated_bundled_alias(id: &str) -> bool {
-    id.trim() == TABS_PLUGIN_ID
-}
-
-/// Deprecation warning for the old `bitty-terminal.tabs` id, if applicable.
-///
-/// Returns `Some(warning)` for the old id, `None` for the canonical id and
-/// unknown ids. Callers (`inspect plugin`, `list`, CLI) display this when the
-/// old path resolves so scripts keep working with a visible nudge.
-#[must_use]
-pub fn deprecated_alias_warning(id: &str) -> Option<String> {
-    if is_deprecated_bundled_alias(id) {
-        Some(format!(
-            "deprecated: plugin id '{TABS_PLUGIN_ID}' is an alias for '{WORKSPACE_PLUGIN_ID}' (removal >= v0.2.0); use the workspace id"
-        ))
-    } else {
-        None
-    }
-}
-
-/// Canonicalize a UI claim to `workspaceline`.
-///
-/// Accepts both `workspaceline` (canonical) and `tabline` (deprecated alias).
-/// Returns `None` for unknown claims.
-#[must_use]
-pub fn canonicalize_ui_claim(claim: &str) -> Option<&'static str> {
-    match claim.trim() {
-        "workspaceline" => Some(WORKSPACELINE_CLAIM),
-        "tabline" => Some(WORKSPACELINE_CLAIM),
-        _ => None,
-    }
-}
-
-/// Whether `claim` is the deprecated `tabline` alias.
-#[must_use]
-pub fn is_deprecated_claim(claim: &str) -> bool {
-    claim.trim() == TABLINE_CLAIM
-}
-
-/// Canonicalize a workspace command to its `bitty-terminal.workspace:*` form.
-///
-/// Accepts both new (`bitty-terminal.workspace:new|close|next`) and old
-/// (`bitty-terminal.tabs:new|close|next`) forms. Returns `None` for unrelated
-/// commands.
-#[must_use]
-pub fn canonicalize_workspace_command(cmd: &str) -> Option<&'static str> {
-    match cmd.trim() {
-        "bitty-terminal.workspace:new" => Some("bitty-terminal.workspace:new"),
-        "bitty-terminal.workspace:close" => Some("bitty-terminal.workspace:close"),
-        "bitty-terminal.workspace:next" => Some("bitty-terminal.workspace:next"),
-        "bitty-terminal.tabs:new" => Some("bitty-terminal.workspace:new"),
-        "bitty-terminal.tabs:close" => Some("bitty-terminal.workspace:close"),
-        "bitty-terminal.tabs:next" => Some("bitty-terminal.workspace:next"),
-        _ => None,
-    }
-}
-
-/// Whether `cmd` is a deprecated `bitty-terminal.tabs:*` command alias.
-#[must_use]
-pub fn is_deprecated_command(cmd: &str) -> bool {
-    matches!(
-        cmd.trim(),
-        "bitty-terminal.tabs:new" | "bitty-terminal.tabs:close" | "bitty-terminal.tabs:next"
-    )
-}
-
 fn workspace_lazy_triggers() -> LazyTriggers {
     LazyTriggers {
-        commands: WORKSPACE_COMMANDS
-            .iter()
-            .chain(TABS_COMMANDS.iter())
-            .map(|c| lazy_command(c))
-            .collect(),
+        commands: WORKSPACE_COMMANDS.iter().map(|c| lazy_command(c)).collect(),
         events: vec![
             "terminal.title-changed".to_string(),
             "focus.changed".to_string(),
         ],
-        // Canonical first; deprecated alias second so both activate during the window.
-        claims: vec![WORKSPACELINE_CLAIM.to_string(), TABLINE_CLAIM.to_string()],
+        claims: vec![WORKSPACELINE_CLAIM.to_string()],
     }
 }
 
@@ -242,11 +155,9 @@ fn workspace_lazy_triggers() -> LazyTriggers {
 ///
 /// Capability: `ui.rich` (workspaceline presentation via rich primitives).
 /// Claims: `workspaceline` exclusive (register vs claim semantics, duplicate
-/// claim is diagnosed not last-wins); `tabline` remains as a deprecated alias
-/// during the compat window (removal ≥ v0.2.0).
-/// Commands reserve workspace actions at graph construction (both new
-/// `bitty-terminal.workspace:*` and deprecated `bitty-terminal.tabs:*` so old
-/// scripts dispatch identically).
+/// claim is diagnosed not last-wins).
+/// Commands reserve workspace actions at graph construction
+/// (`bitty-terminal.workspace:*`).
 #[must_use]
 pub fn workspace_manifest() -> PluginManifest {
     let mut caps = CapabilityRequests::default();
@@ -257,42 +168,6 @@ pub fn workspace_manifest() -> PluginManifest {
             WORKSPACE_PLUGIN_ID,
             "Workspace",
             "Workspace commands, workspaceline presentation, ordering and closing policy",
-        ),
-        compat: bundled_compat(),
-        dependencies: Vec::new(),
-        provided_services: Vec::new(),
-        required_services: Vec::new(),
-        capabilities: caps,
-        tools: Vec::new(),
-        network: Vec::new(),
-        limits: Default::default(),
-        lazy: workspace_lazy_triggers(),
-        raw_bytes_len: 512,
-    }
-}
-
-/// Deprecated `bitty-terminal.tabs` alias (removal ≥ v0.2.0).
-///
-/// ALIAS, not flag-day per DEC-0032. Resolves identically to
-/// [`workspace_manifest`] except for the legacy id/name/description so stored
-/// grants (`GrantRecord` binds id+hash), scripts, and third-party `tabline`
-/// claimants keep working during the window. New code must use
-/// [`workspace_manifest`]. Old id emits [`deprecated_alias_warning`]; new path
-/// does not.
-#[deprecated(
-    since = "0.1.0",
-    note = "use workspace_manifest (tabs alias removal >= v0.2.0)"
-)]
-#[must_use]
-pub fn tabs_manifest() -> PluginManifest {
-    let mut caps = CapabilityRequests::default();
-    caps.ids
-        .insert(CapabilityId::parse("ui.rich").expect("known capability"));
-    PluginManifest {
-        identity: bundled_identity(
-            TABS_PLUGIN_ID,
-            "Tabs",
-            "Tab commands, tabline presentation, ordering and closing policy (deprecated alias for bitty-terminal.workspace)",
         ),
         compat: bundled_compat(),
         dependencies: Vec::new(),
@@ -335,31 +210,25 @@ pub fn bundled_ids_sorted() -> Vec<String> {
     ids
 }
 
-/// Whether `id` is one of the two bundled ids (canonical) or the deprecated
-/// `bitty-terminal.tabs` alias (removal ≥ v0.2.0).
+/// Whether `id` is one of the two bundled ids (canonical).
 #[must_use]
 pub fn is_bundled(id: &PluginId) -> bool {
     matches!(
         id.as_str(),
-        "bitty-terminal.shell-integration" | "bitty-terminal.workspace" | "bitty-terminal.tabs"
+        "bitty-terminal.shell-integration" | "bitty-terminal.workspace"
     )
 }
 
 /// Lookup a bundled manifest by its fully qualified id string, if present.
 ///
-/// Accepts both the canonical `bitty-terminal.workspace` and the deprecated
-/// `bitty-terminal.tabs` alias (removal ≥ v0.2.0). Old path resolves via the
-/// tabs shim (same commands/claims, legacy id); pair with
-/// [`deprecated_alias_warning`] to surface the deprecation. New path does not
-/// warn. Safe-mode shape is unchanged: both ids are `bitty-terminal.*` (not
-/// `bitty.` prefix) so `--safe` still rejects both — no builtin promotion.
+/// Accepts only the canonical ids. Unknown ids return `None`.
+/// Safe-mode shape is unchanged: bundled ids are `bitty-terminal.*` (not
+/// `bitty.` prefix) so `--safe` still rejects them — no builtin promotion.
 #[must_use]
-#[allow(deprecated)]
 pub fn bundled_manifest_for(id: &str) -> Option<PluginManifest> {
     match id.trim() {
         "bitty-terminal.shell-integration" => Some(shell_integration_manifest()),
         "bitty-terminal.workspace" => Some(workspace_manifest()),
-        "bitty-terminal.tabs" => Some(tabs_manifest()),
         _ => None,
     }
 }
@@ -419,7 +288,9 @@ mod tests {
         assert!(!is_bundled(
             &PluginId::new("bitty-terminal.file-manager").unwrap()
         ));
-        assert!(is_bundled(&PluginId::new("bitty-terminal.tabs").unwrap()));
+        // CTX-0974 (DEC-0100 waiver): tabs alias purged early, no longer bundled.
+        assert!(!is_bundled(&PluginId::new("bitty-terminal.tabs").unwrap()));
+        assert!(bundled_manifest_for("bitty-terminal.tabs").is_none());
         assert!(is_bundled(
             &PluginId::new("bitty-terminal.workspace").unwrap()
         ));
@@ -446,41 +317,19 @@ mod tests {
                 .contains(&CapabilityId::parse("ui.rich").unwrap())
         );
         assert!(m.lazy.claims.contains(&"workspaceline".to_string()));
-        // Deprecated alias still present during the window.
-        assert!(m.lazy.claims.contains(&"tabline".to_string()));
-        // Both new (3) and old (3) commands dispatch identically.
-        assert_eq!(m.lazy.commands.len(), 6);
+        assert_eq!(m.lazy.claims.len(), 1);
+        // Canonical workspace commands only (tabs alias purged per CTX-0974).
+        assert_eq!(m.lazy.commands.len(), 3);
         for cmd in [
             "bitty-terminal.workspace:new",
             "bitty-terminal.workspace:close",
             "bitty-terminal.workspace:next",
-            "bitty-terminal.tabs:new",
-            "bitty-terminal.tabs:close",
-            "bitty-terminal.tabs:next",
         ] {
             assert!(
                 m.lazy.commands.iter().any(|c| c.id.as_str() == cmd),
                 "missing {cmd}"
             );
         }
-    }
-
-    #[test]
-    #[allow(deprecated)]
-    fn tabs_manifest_alias_has_same_shape_with_deprecation() {
-        let m = tabs_manifest();
-        assert!(
-            m.capabilities
-                .ids
-                .contains(&CapabilityId::parse("ui.rich").unwrap())
-        );
-        assert!(m.lazy.claims.contains(&"tabline".to_string()));
-        assert!(m.lazy.claims.contains(&"workspaceline".to_string()));
-        assert_eq!(m.lazy.commands.len(), 6);
-        assert!(is_deprecated_bundled_alias("bitty-terminal.tabs"));
-        assert!(!is_deprecated_bundled_alias("bitty-terminal.workspace"));
-        assert!(deprecated_alias_warning("bitty-terminal.tabs").is_some());
-        assert!(deprecated_alias_warning("bitty-terminal.workspace").is_none());
     }
 
     #[test]

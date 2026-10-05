@@ -3696,7 +3696,7 @@ fn parse_plugin_subcommand() {
         "bitty",
         "plugin",
         "install",
-        "bitty-terminal.tabs",
+        "bitty-terminal.workspace",
         "--yes",
     ]));
     assert!(p.plugin_word);
@@ -3704,7 +3704,7 @@ fn parse_plugin_subcommand() {
         p.plugin_raw,
         vec![
             "install".to_string(),
-            "bitty-terminal.tabs".to_string(),
+            "bitty-terminal.workspace".to_string(),
             "--yes".to_string()
         ]
     );

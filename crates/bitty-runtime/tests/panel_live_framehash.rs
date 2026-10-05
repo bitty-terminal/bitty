@@ -1,5 +1,4 @@
 #![forbid(unsafe_code)]
-#![allow(deprecated)]
 //! Panel live V1–V3 gates on `frameHash` equality (CTX-0242, CTX-0244 transport).
 //!
 //! The lossless question is equality, not transport: does the frame the IPC
@@ -21,9 +20,9 @@
 //!   below pins the same mechanism, and the primary grid stays with its
 //!   owner leaf (CTX-0359). Live ws4 V2 covers the tabline region diff
 //!   (see the ignored live-grant test at the bottom).
-//! - V3 rename parity: `WorkspaceIntegration::stack_for_workspace` and the
-//!   deprecated `TabsIntegration::stack_for_tabs` shim produce identical
-//!   layouts and identical frame digests for identical content.
+//! - V3 workspace determinism: two identical `WorkspaceIntegration::stack_for_workspace`
+//!   layouts produce identical frame digests for identical content (CTX-0974
+//!   purged the deprecated tabs shim; parity is now workspace-vs-workspace).
 //! - Socket round-trip: a real `Runtime` headless frame published via
 //!   `publish_frame_rgba` digests identically over a real Unix socket
 //!   through `bitty.debug/frameHash` (CTX-0188 harness pattern: real
@@ -46,7 +45,7 @@ use bitty_ipc::frame_digest::frame_digest_hex;
 use bitty_ipc::frame_digest::FRAME_DIGEST_ALGO;
 use bitty_runtime::{
     AnimationPolicy, LayoutNode, PresentStats, Runtime, RuntimeConfig, SplitAxis, UiRect, View,
-    ViewId, tabs::TabsIntegration, workspace::WorkspaceIntegration,
+    ViewId, workspace::WorkspaceIntegration,
 };
 
 /// RFC-0002 (CTX-0341): animations default ON and a layout change arms a
@@ -292,20 +291,21 @@ fn v2_focus_switch_changes_digest_and_switchback_restores() {
 
 #[test]
 fn v3_workspace_alias_and_tabs_shim_digests_equal() {
-    // Serialized: see V1.
+    // Serialized: see V1. CTX-0974 purged the tabs shim: V3 now pins
+    // workspace-vs-workspace determinism (identical layouts, identical digests).
     let _guard = hold_live_lock();
     let views = vec![
         View::new(ViewId::new(1), 80, 24),
         View::new(ViewId::new(2), 80, 24),
     ];
     let via_workspace = WorkspaceIntegration::stack_for_workspace(views.clone());
-    let via_tabs = TabsIntegration::stack_for_tabs(views);
-    // Layout parity first (the `tabs_compat.rs` guard, frame consequence below).
+    let via_repeat = WorkspaceIntegration::stack_for_workspace(views);
+    // Layout determinism first, frame consequence below.
     let bounds = bitty_ui::Rect::new(0, 0, 80, 24);
     assert_eq!(
         via_workspace.layout(bounds),
-        via_tabs.layout(bounds),
-        "alias and shim must allocate identically"
+        via_repeat.layout(bounds),
+        "identical workspace layouts must allocate identically"
     );
 
     let mut rt_new = Runtime::new(RuntimeConfig {
@@ -323,21 +323,21 @@ fn v3_workspace_alias_and_tabs_shim_digests_equal() {
         ..RuntimeConfig::default()
     })
     .expect("old-path runtime must build");
-    rt_old.set_layout(via_tabs);
+    rt_old.set_layout(via_repeat);
     rt_old.set_container(UiRect::new(0, 0, 80, 24));
     write_marker(&mut rt_old, 3, b'M');
-    let (w2, h2, seq_old, rgba_old) = present_frame(&mut rt_old, "tabs-shim path");
+    let (w2, h2, seq_old, rgba_old) = present_frame(&mut rt_old, "workspace repeat path");
 
     assert_eq!((w, h), (w2, h2));
     assert_eq!(seq_new, seq_old, "identical runs must reach the same seq");
     assert_eq!(
         rgba_old, rgba_new,
-        "alias vs shim must render identical pixels for identical content"
+        "identical workspace layouts must render identical pixels for identical content"
     );
     assert_eq!(
         digest_pixels(w, h, &rgba_old),
         digest_pixels(w, h, &rgba_new),
-        "V3: workspace alias vs tabs shim digests must be equal"
+        "V3: workspace repeat digests must be equal"
     );
     assert_eq!(
         frame_digest_hex(w2, h2, seq_old, &rgba_old),
@@ -527,10 +527,10 @@ fn panel_live_v1_v2_v3_manual_only() {
     // content — never passwords, tokens, clipboard, or env bytes):
     // V1: split 2 panes, set layout.gaps_in/out, frameHash before/after —
     //     digests differ; re-capture without changes reproduces the digest.
-    // V2: 3 tabs via workspace shim, focus each with frameHash per step —
+    // V2: 3 workspaces, focus each with frameHash per step —
     //     each digest differs, refocusing the first restores its digest.
-    // V3: activate the same content via bitty-terminal.tabs:new and
-    //     bitty-terminal.workspace:new — frameHash digests must be equal.
+    // V3: activate the same content via bitty-terminal.workspace:new twice —
+    //     frameHash digests must be equal.
     // Then confirm ScopeDenied after grant expiry (<= 120 s) and a digest
     // audit trail on the serving side.
     panic!("manual-only: point this at a live BITTY_SOCKET before enabling");

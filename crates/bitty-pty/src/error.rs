@@ -50,6 +50,10 @@ impl PtyError {
     /// Flattens an upstream failure into owned data. The upstream error type
     /// is intentionally unnamed; callers pass whatever the wrapped layer
     /// returned and only its `Display` output survives.
+    ///
+    /// Unix-only (plus tests): the Windows backend is native and reports
+    /// [`PtyError::Io`] directly.
+    #[cfg(any(unix, test))]
     pub(crate) fn flatten_upstream<E: fmt::Display>(err: E) -> Self {
         PtyError::Upstream(err.to_string())
     }

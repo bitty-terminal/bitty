@@ -3,8 +3,10 @@
 //!
 //! The crate implements the PTY row of the Core Workspace Topology
 //! (ADR-0003): process lifecycle (spawn/shutdown), resize, and I/O with
-//! bounded buffering. Its only third-party PTY dependency is `portable-pty`,
-//! by the accepted upstream decision of ADR-0004. The owned-tree boundary
+//! bounded buffering. The Unix backend wraps `portable-pty` by the accepted
+//! upstream decision of ADR-0004; the Windows ConPTY backend spawns natively
+//! through the first-party `bitty-winjob` adapter so the child joins its Job
+//! Object atomically at creation (CTX-0978, DEC-0101). The owned-tree boundary
 //! ([`OwnedTree`]) adds platform system-call wrappers: `rustix` (Linux),
 //! `nix` (macOS), and on Windows the first-party `bitty-winjob` Job Object
 //! adapter, its sole workspace-crate dependency (CTX-0903, DEC-0083), which
@@ -13,14 +15,15 @@
 //!
 //! # Upstream boundary (ADR-0004 "Wrap" row)
 //!
-//! `portable-pty` (~0.9) is **wrapped, never adopted**: its types never
+//! `portable-pty` (~0.9) is **wrapped, never adopted** on Unix: its types never
 //! appear anywhere in this crate's public API, and every upstream failure is
 //! flattened into the owned [`PtyError`]. Per ADR-0004's fallback rule, if
 //! `portable-pty` becomes unmaintained for more than twelve months while on
 //! this hot path it must be replaced by an owned fork extracted under rule 3
 //! of that decision (vendored under `vendor/`, named maintenance owner);
-//! only this crate's internal platform modules would need mechanical
-//! changes, because no caller can observe upstream today.
+//! Windows already left it for a native spawn (CTX-0978), so only the Unix
+//! platform module would need mechanical changes, because no caller can
+//! observe upstream today.
 //!
 //! # Security defaults
 //!

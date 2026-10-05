@@ -1,6 +1,6 @@
 [package]
 name = "bitty-pty"
-description = "PTY wrapper with backpressure and resize for Bitty (wraps portable-pty)"
+description = "PTY wrapper with backpressure and resize for Bitty (native ConPTY spawn on Windows, portable-pty on Unix)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,7 +13,10 @@ publish = true
 [lints]
 workspace = true
 
-[dependencies]
+# CTX-0978: `portable-pty` backs the Unix backend only. The Windows ConPTY
+# backend spawns natively through `bitty-winjob` (job at creation), so
+# Windows builds no longer compile the upstream crate at all.
+[target.'cfg(unix)'.dependencies]
 portable-pty = "0.9"
 
 # CTX-0512: the owned-process-tree boundary (`tree` module). Same workspace

@@ -19,6 +19,10 @@
 //! - [`resume_suspended_process`]: resumes a process created with
 //!   [`CREATE_SUSPENDED_FLAG`], so a caller can assign it to a job before
 //!   it runs a single instruction (no descendant can escape the job).
+//! - [`ConPtyMaster`] plus [`ConPtyChild`]: a ConPTY child spawned directly
+//!   into a [`JobObject`] through `PROC_THREAD_ATTRIBUTE_JOB_LIST`
+//!   (CTX-0978, DEC-0101), so it runs zero instructions outside the job —
+//!   no adopt-after-start window at all.
 //! - [`process_is_running`] and [`terminate_process`]: single-pid helpers
 //!   for liveness probes and last-resort cleanup.
 //!
@@ -35,8 +39,13 @@
 mod ffi;
 
 #[cfg(windows)]
+mod conpty;
+
+#[cfg(windows)]
 mod job;
 
+#[cfg(windows)]
+pub use conpty::{ChildSpec, ConPtyChild, ConPtyMaster};
 #[cfg(windows)]
 pub use job::{
     CREATE_SUSPENDED_FLAG, JobMember, JobObject, process_is_running, resume_suspended_process,

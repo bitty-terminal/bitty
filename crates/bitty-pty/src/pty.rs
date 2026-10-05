@@ -61,10 +61,17 @@ pub struct ForegroundJob {
 /// Created exclusively through [`crate::PtyBuilder::spawn`]. The handle owns
 /// the master end of the PTY and the child process; see the module docs for
 /// shutdown semantics.
+///
+/// The handle also owns the child's [owned process
+/// tree](crate::OwnedTree): on Windows the child is born inside its Job
+/// Object at creation, on Unix it is adopted right after the spawn, so
+/// [`tree`](Pty::tree) always observes the whole tree the child grows and
+/// callers never adopt the pid themselves.
 pub struct Pty {
     session: Session,
     reader_taken: bool,
     reaped: bool,
+    tree: Option<crate::tree::OwnedTree>,
 }
 
 impl std::fmt::Debug for Pty {
@@ -72,16 +79,18 @@ impl std::fmt::Debug for Pty {
         f.debug_struct("Pty")
             .field("pid", &self.session.pid())
             .field("reader_taken", &self.reader_taken)
+            .field("tree", &self.tree)
             .finish_non_exhaustive()
     }
 }
 
 impl Pty {
-    pub(crate) fn new(session: Session) -> Self {
+    pub(crate) fn new(session: Session, tree: Option<crate::tree::OwnedTree>) -> Self {
         Pty {
             session,
             reader_taken: false,
             reaped: false,
+            tree,
         }
     }
 
@@ -110,6 +119,13 @@ impl Pty {
     /// Process id of the child, when applicable.
     pub fn pid(&self) -> Option<u32> {
         self.session.pid()
+    }
+
+    /// The child's owned process tree, when one exists: signal it to reach
+    /// every member the child grew, not just the direct child this handle
+    /// reaps. `None` only when the platform reported no pid for the child.
+    pub fn tree(&self) -> Option<&crate::tree::OwnedTree> {
+        self.tree.as_ref()
     }
 
     /// Kernel foreground process-group leader pid, when the platform exposes
@@ -152,7 +168,7 @@ impl Pty {
         if self.reader_taken {
             return Err(PtyError::HalfAlreadyTaken("reader"));
         }
-        let raw = self.session.try_clone_reader()?;
+        let raw = self.session.take_reader()?;
         let reader = PtyReader::spawn(ReaderSource::new(raw), READ_CHUNK_SIZE)?;
         self.reader_taken = true;
         Ok(reader)

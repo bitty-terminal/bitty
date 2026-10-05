@@ -54,7 +54,9 @@ fn to_size(cols: u16, rows: u16) -> PtySize {
     }
 }
 
-pub(crate) fn open_pty_and_spawn(config: &SpawnConfig) -> Result<(Master, Child), PtyError> {
+pub(crate) fn open_pty_and_spawn(
+    config: &SpawnConfig,
+) -> Result<(Master, Child, Option<crate::tree::OwnedTree>), PtyError> {
     let pair = native_pty_system()
         .openpty(to_size(config.cols, config.rows))
         .map_err(PtyError::flatten_upstream)?;
@@ -106,13 +108,20 @@ pub(crate) fn open_pty_and_spawn(config: &SpawnConfig) -> Result<(Master, Child)
             return Err(PtyError::flatten_upstream(err));
         }
     };
+    let child = Child { inner: child };
+
+    // The child is a session leader from `fork`, so it already leads its own
+    // process group: adopting its pid observes the tree without any race.
+    // A missing pid (upstream reports none) simply means no tree.
+    let tree = child_pid(&child).and_then(|pid| crate::tree::OwnedTree::adopt(pid).ok());
 
     Ok((
         Master {
             inner: pair.master,
             writer_taken: false,
         },
-        Child { inner: child },
+        child,
+        tree,
     ))
 }
 
@@ -145,7 +154,11 @@ pub(crate) fn process_group_leader(master: &Master) -> Option<u32> {
         .and_then(|pid| u32::try_from(pid).ok())
 }
 
-pub(crate) fn try_clone_reader(master: &Master) -> Result<Box<dyn io::Read + Send>, PtyError> {
+pub(crate) fn take_reader(master: &mut Master) -> Result<Box<dyn io::Read + Send>, PtyError> {
+    try_clone_reader(master)
+}
+
+fn try_clone_reader(master: &Master) -> Result<Box<dyn io::Read + Send>, PtyError> {
     master
         .inner
         .try_clone_reader()

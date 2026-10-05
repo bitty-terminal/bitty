@@ -7,6 +7,11 @@
 //! never only the direct child. Liveness is checked through the safe
 //! `bitty-winjob` probe, so the test needs no `unsafe`.
 //!
+//! CTX-0978: ConPTY children additionally prove job-at-creation. The helper
+//! runs under a real ConPTY (`PtyBuilder::spawn`, which travels with its
+//! tree) and forks its grandchild as its first act; the tree kill must take
+//! a grandchild that predates any adopt call — there is no adopt call left.
+//!
 //! Every wait is bounded by a named constant; nothing blocks unbounded.
 
 #![cfg(windows)]
@@ -268,20 +273,92 @@ fn dropping_the_tree_kills_what_is_left() {
 }
 
 #[test]
-fn a_conpty_child_is_adopted_after_the_spawn() {
+fn a_conpty_child_travels_with_its_tree() {
     require_pty!();
     let mut pty = PtyBuilder::new("cmd.exe").spawn().expect("spawn cmd");
-    let leader = pty.pid().expect("conpty child pid");
-    let tree = OwnedTree::adopt(leader).expect("a running child joins its job");
+    let tree = pty.tree().expect("conpty children travel with their tree");
     assert_eq!(tree.backend(), TreeBackend::JobObject);
     tree.signal(TreeSignal::Kill).expect("terminate the job");
+    // The leader exit is observed without reaping: twice gives the same answer.
     assert_eq!(
-        wait_leader_exit(&tree),
+        wait_leader_exit(tree),
         LeaderExit::Exited(TREE_KILL_EXIT_CODE)
     );
-    let status = tree
-        .retire(|| pty.wait_timeout(WAIT_BOUND))
+    assert_eq!(
+        wait_leader_exit(tree),
+        LeaderExit::Exited(TREE_KILL_EXIT_CODE)
+    );
+    let status = pty
+        .wait_timeout(WAIT_BOUND)
         .expect("reap")
         .expect("the killed child exits in time");
     assert!(!status.is_success());
+}
+
+/// CTX-0978 (#1579): a ConPTY child that forks immediately on start still
+/// loses its grandchild to the tree kill. The helper's first act is the
+/// fork, so under the old adopt-after-start spawn the grandchild predated
+/// the assignment and survived; born into the job at creation, it dies with
+/// the tree. The `grandchild=<pid>;` announcement travels through the PTY
+/// master, proving the grandchild existed before the kill.
+#[test]
+fn an_immediate_fork_conpty_grandchild_dies_with_the_tree() {
+    require_pty!();
+    let helper = std::env::current_exe().expect("test binary path");
+    let mut pty = PtyBuilder::new(helper)
+        .args([HELPER_TEST, "--exact", "--nocapture"])
+        .env(HELPER_ENV, "fork")
+        .spawn()
+        .expect("spawn conpty helper");
+    let reader = pty.take_reader().expect("reader half");
+    let tree = pty.tree().expect("conpty children travel with their tree");
+    assert_eq!(tree.backend(), TreeBackend::JobObject);
+    let grandchild = read_conpty_grandchild(&reader);
+    assert!(running(grandchild), "grandchild starts alive");
+    tree.signal(TreeSignal::Kill).expect("terminate the job");
+    assert_eq!(
+        wait_leader_exit(tree),
+        LeaderExit::Exited(TREE_KILL_EXIT_CODE)
+    );
+    wait_until("the grandchild to die", || !running(grandchild));
+    let status = pty
+        .wait_timeout(WAIT_BOUND)
+        .expect("reap")
+        .expect("the killed child exits in time");
+    assert!(!status.is_success());
+    let _ = reader.join();
+}
+
+/// Reads the `grandchild=<pid>;` announcement from a ConPTY master within
+/// [`WAIT_BOUND`]. The helper is a plain console client (no cursor queries),
+/// so no DSR replies are needed; the deadline still bounds every wait.
+fn read_conpty_grandchild(reader: &bitty_pty::PtyReader) -> u32 {
+    let deadline = Instant::now() + WAIT_BOUND;
+    let mut out = Vec::new();
+    loop {
+        if let Some(pid) = parse_grandchild(&out) {
+            return pid;
+        }
+        assert!(Instant::now() < deadline, "grandchild pid never announced");
+        match reader.recv_timeout(POLL) {
+            Ok(Some(chunk)) => out.extend_from_slice(&chunk),
+            // Clean EOF or pump failure: whatever arrived is all there is.
+            Ok(None) | Err(_) => {
+                if let Some(pid) = parse_grandchild(&out) {
+                    return pid;
+                }
+                assert!(Instant::now() < deadline, "grandchild pid never announced");
+                std::thread::sleep(POLL);
+            }
+        }
+    }
+}
+
+/// Parses the first `grandchild=<pid>;` announcement in `out`, tolerating
+/// the `\r\n` line endings the console inserts.
+fn parse_grandchild(out: &[u8]) -> Option<u32> {
+    let text = String::from_utf8_lossy(out);
+    let (_, rest) = text.split_once("grandchild=")?;
+    let (digits, _) = rest.split_once(';')?;
+    digits.trim().parse::<u32>().ok()
 }

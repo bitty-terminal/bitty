@@ -2,7 +2,7 @@
 
 use std::fmt;
 use std::io;
-use std::os::windows::io::{AsHandle as _, OwnedHandle};
+use std::os::windows::io::{AsHandle as _, BorrowedHandle, OwnedHandle};
 
 use crate::ffi;
 
@@ -82,6 +82,13 @@ impl JobObject {
     pub fn active_processes(&self) -> io::Result<u32> {
         ffi::active_processes(self.handle.as_handle())
     }
+
+    /// Borrows the job handle for at-creation registration (the ConPTY
+    /// `PROC_THREAD_ATTRIBUTE_JOB_LIST` path). The borrow keeps the job
+    /// alive across the spawn call.
+    pub(crate) fn as_handle(&self) -> BorrowedHandle<'_> {
+        self.handle.as_handle()
+    }
 }
 
 /// An open handle to one job member, used to observe its exit.
@@ -107,6 +114,13 @@ impl JobMember {
     #[must_use]
     pub fn pid(&self) -> u32 {
         self.pid
+    }
+
+    /// Wraps an already-open member handle. The pid must be pinned by a
+    /// live handle the caller keeps (the ConPTY session's process handle),
+    /// so it cannot have been recycled.
+    pub(crate) fn from_spawned(pid: u32, process: OwnedHandle) -> Self {
+        Self { pid, process }
     }
 
     /// The member's exit code once it has exited, `None` while it runs.

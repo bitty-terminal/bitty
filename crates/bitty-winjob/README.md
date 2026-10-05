@@ -10,8 +10,9 @@
 `bitty-winjob` is the narrow, reviewed Win32 Job Object adapter behind the
 Windows owned-process-tree backend in `bitty-pty` (CTX-0903, DEC-0083). It
 creates kill-on-close Job Objects, assigns processes, terminates whole
-jobs, observes member exit without reaping, and resumes children created
-suspended. See `src/lib.rs` for the public surface.
+jobs, observes member exit without reaping, resumes children created
+suspended, and spawns ConPTY children directly into a job at creation
+(CTX-0978, DEC-0101). See `src/lib.rs` for the public surface.
 
 ## Boundaries
 
@@ -30,4 +31,6 @@ suspended. See `src/lib.rs` for the public surface.
   dependency with its feature list.
 - `src/lib.rs` — crate docs, lint policy, and re-exports.
 - `src/job.rs` — safe `JobObject`/`JobMember` API and Windows unit tests.
+- `src/conpty.rs` — safe ConPTY spawn (job at creation) plus pure UTF-16
+  builders with Windows unit tests.
 - `src/ffi.rs` — the audited Win32 calls.

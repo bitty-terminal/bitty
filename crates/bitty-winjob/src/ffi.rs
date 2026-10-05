@@ -11,9 +11,20 @@
 //!   `dwSize` field preset), so the kernel never writes past it.
 //! - A raw `HANDLE` never leaves this module: each one is checked for its
 //!   documented failure sentinel and wrapped into an [`OwnedHandle`]
-//!   (closed exactly once on drop) before anything else can fail.
+//!   (closed exactly once on drop) before anything else can fail. The two
+//!   exceptions own their non-`CloseHandle` cleanup instead: [`PseudoConsole`]
+//!   (closed with `ClosePseudoConsole`) and [`AttributeList`] (deleted with
+//!   `DeleteProcThreadAttributeList`); both run their cleanup exactly once
+//!   from `Drop`.
 //! - Every failure is `io::Error::last_os_error()` read immediately after
-//!   the failing call, before any other system call can overwrite it.
+//!   the failing call, before any other system call can overwrite it. The
+//!   pseudo-console calls report an `HRESULT` instead, which has no
+//!   last-error contract, so those failures carry the `HRESULT` value itself.
+//! - The ConPTY spawn path additionally takes caller-built UTF-16 buffers
+//!   (command line, environment block, working directory). They are owned
+//!   `Vec<u16>`s that outlive the `CreateProcessW` call, are `NUL`
+//!   terminated by their builders, and their lengths are never passed: the
+//!   kernel finds the terminators itself, so no length can be wrong.
 
 use std::io;
 use std::mem::size_of;
@@ -23,8 +34,12 @@ use std::os::windows::io::{
 use std::ptr;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, FALSE, HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED,
-    WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, FALSE, HANDLE, INVALID_HANDLE_VALUE, S_OK,
+    WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
+use windows_sys::Win32::System::Console::{
+    COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, PSEUDOCONSOLE_INHERIT_CURSOR,
+    ResizePseudoConsole,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
@@ -35,10 +50,15 @@ use windows_sys::Win32::System::JobObjects::{
     JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
     QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
 };
+use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
-    GetExitCodeProcess, OpenProcess, OpenThread, PROCESS_ACCESS_RIGHTS,
+    CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
+    EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList,
+    LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess, OpenThread, PROC_THREAD_ATTRIBUTE_JOB_LIST,
+    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_ACCESS_RIGHTS, PROCESS_INFORMATION,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
-    ResumeThread, THREAD_SUSPEND_RESUME, TerminateProcess, WaitForSingleObject,
+    ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, THREAD_SUSPEND_RESUME, TerminateProcess,
+    UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 /// Rights a job member handle needs: `AssignProcessToJobObject` requires
@@ -278,4 +298,344 @@ fn resume_thread(thread_id: u32) -> io::Result<()> {
 /// A `WIN32_ERROR` as the `i32` `io::Error::raw_os_error` reports.
 fn win32_code(code: u32) -> i32 {
     i32::from_ne_bytes(code.to_ne_bytes())
+}
+
+// ---------------------------------------------------------------------------
+// ConPTY spawn path (CTX-0978, DEC-0101).
+//
+// Anonymous pipes, the pseudo-console, the process attribute list carrying
+// the pseudo-console and the job list, and the `CreateProcessW` call that
+// places the child in its job atomically at creation — closing the
+// adopt-after-start window behind `OwnedTree::adopt` for ConPTY children.
+// Every function below is `pub(crate)`: the safe `conpty` module owns the
+// orchestration and the UTF-16 buffer builders, so the only values crossing
+// this boundary are owned handles, borrowed handles, and NUL-terminated
+// UTF-16 slices that outlive the call.
+// ---------------------------------------------------------------------------
+
+/// Pseudo-console flags matching the battle-tested `portable-pty` 0.9
+/// selection: inherit the cursor, apply the resize quirk, and use Win32
+/// input mode. `windows-sys` 0.61 names only the first, so the other two
+/// are spelled out from the Windows SDK (`WinConTypes.h`):
+/// `PSEUDOCONSOLE_RESIZE_QUIRK = 0x2`, `PSEUDOCONSOLE_WIN32_INPUT_MODE = 0x4`.
+const PSEUDO_CONSOLE_FLAGS: u32 = PSEUDOCONSOLE_INHERIT_CURSOR | 0x2 | 0x4;
+
+/// An open pseudo-console. Closed with `ClosePseudoConsole` on drop — never
+/// `CloseHandle`, which would leak the console object.
+pub(crate) struct PseudoConsole {
+    hpcon: HPCON,
+}
+
+impl PseudoConsole {
+    /// The raw console value for attribute-list registration. Stays valid
+    /// while this value is alive; the spawn call must complete first.
+    pub(crate) fn as_hpcon(&self) -> HPCON {
+        self.hpcon
+    }
+}
+
+impl Drop for PseudoConsole {
+    fn drop(&mut self) {
+        // SAFETY: `hpcon` came from a successful `CreatePseudoConsole` and
+        // this `Drop` runs exactly once per value; owners hold the console
+        // across the spawn made with it, so it is alive for every use.
+        unsafe { ClosePseudoConsole(self.hpcon) };
+    }
+}
+
+/// Validates a console dimension: `COORD` carries `i16` lanes, so a `u16`
+/// size that does not fit is refused instead of truncating.
+fn console_lane(value: u16, what: &'static str) -> io::Result<i16> {
+    i16::try_from(value).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("console {what} {value} exceeds the i16 COORD lane"),
+        )
+    })
+}
+
+/// Creates a pseudo-console of `cols` x `rows` cells attached to `input`
+/// (read end) and `output` (write end). The console holds its own
+/// references: like `portable-pty`, the caller drops the passed pipe ends
+/// once this returns.
+pub(crate) fn create_pseudo_console(
+    cols: u16,
+    rows: u16,
+    input: BorrowedHandle<'_>,
+    output: BorrowedHandle<'_>,
+) -> io::Result<PseudoConsole> {
+    let size = COORD {
+        X: console_lane(cols, "width")?,
+        Y: console_lane(rows, "height")?,
+    };
+    let mut hpcon: HPCON = 0;
+    // SAFETY: `input`/`output` are borrowed from live pipe handles; `hpcon`
+    // is a stack slot the kernel fills only on success; the `HRESULT` is
+    // checked before use. Pseudo-console calls have no last-error contract,
+    // so a failure carries the `HRESULT` itself.
+    let result = unsafe {
+        CreatePseudoConsole(
+            size,
+            input.as_raw_handle(),
+            output.as_raw_handle(),
+            PSEUDO_CONSOLE_FLAGS,
+            &mut hpcon,
+        )
+    };
+    if result != S_OK {
+        return Err(io::Error::other(format!(
+            "CreatePseudoConsole failed: HRESULT {result:#x}"
+        )));
+    }
+    Ok(PseudoConsole { hpcon })
+}
+
+/// Resizes the console window to `cols` x `rows` cells.
+pub(crate) fn resize_pseudo_console(
+    console: &PseudoConsole,
+    cols: u16,
+    rows: u16,
+) -> io::Result<()> {
+    let size = COORD {
+        X: console_lane(cols, "width")?,
+        Y: console_lane(rows, "height")?,
+    };
+    // SAFETY: `console` is alive (borrowed); same `HRESULT` contract as
+    // creation.
+    let result = unsafe { ResizePseudoConsole(console.as_hpcon(), size) };
+    if result != S_OK {
+        return Err(io::Error::other(format!(
+            "ResizePseudoConsole failed: HRESULT {result:#x}"
+        )));
+    }
+    Ok(())
+}
+
+/// Creates one anonymous pipe with default buffering and non-inheritable
+/// handles, returned as `(read, write)`.
+pub(crate) fn create_pipe() -> io::Result<(OwnedHandle, OwnedHandle)> {
+    let mut read: HANDLE = ptr::null_mut();
+    let mut write: HANDLE = ptr::null_mut();
+    // SAFETY: both out-parameters are stack `HANDLE` slots; NULL attributes
+    // (default descriptor, non-inheritable) and a zero buffer size are
+    // documented valid. Both handles are wrapped before any fallible step.
+    check(unsafe { CreatePipe(&mut read, &mut write, ptr::null(), 0) })?;
+    // SAFETY: success checked above, so both handles are fresh, valid, and
+    // exclusively owned; each is closed exactly once. No fallible step sits
+    // between the two wraps, so neither can leak.
+    let read = unsafe { OwnedHandle::from_raw_handle(read) };
+    let write = unsafe { OwnedHandle::from_raw_handle(write) };
+    Ok((read, write))
+}
+
+/// A process attribute list for one ConPTY spawn: exactly the pseudo-console
+/// plus, optionally, one job. Deleted on drop.
+pub(crate) struct AttributeList {
+    buffer: Vec<u8>,
+    /// Storage for the `PROC_THREAD_ATTRIBUTE_JOB_LIST` value: one job
+    /// handle owned by this list, so its address is stable from the
+    /// `UpdateProcThreadAttribute` call until `CreateProcessW` returns.
+    job_slot: [HANDLE; 1],
+}
+
+impl AttributeList {
+    /// Allocates a list for `attribute_count` attributes (1 or 2 here).
+    pub(crate) fn new(attribute_count: u32) -> io::Result<Self> {
+        if attribute_count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a process attribute list needs at least one attribute",
+            ));
+        }
+        let mut bytes = 0usize;
+        // SAFETY: a NULL list with a valid count only queries the required
+        // size (documented to fail with `ERROR_INSUFFICIENT_BUFFER` while
+        // writing it); no list exists yet, so nothing is freed. The return
+        // value is intentionally unchecked: `bytes` is validated below.
+        unsafe {
+            InitializeProcThreadAttributeList(ptr::null_mut(), attribute_count, 0, &mut bytes)
+        };
+        if bytes == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut buffer = vec![0u8; bytes];
+        // SAFETY: `buffer` is exactly the queried size and lives in `self`;
+        // the return value is checked.
+        check(unsafe {
+            InitializeProcThreadAttributeList(
+                buffer.as_mut_ptr().cast(),
+                attribute_count,
+                0,
+                &mut bytes,
+            )
+        })?;
+        Ok(Self {
+            buffer,
+            job_slot: [ptr::null_mut()],
+        })
+    }
+
+    /// Raw list pointer for the spawn call. The buffer address is stable:
+    /// nothing reallocates after `new`.
+    fn as_ptr(&self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
+        // `Vec::as_ptr` never fails and the buffer outlives every borrow of
+        // `self`, so the spawn call below cannot see a dangling pointer.
+        self.buffer.as_ptr().cast_mut().cast()
+    }
+
+    /// Registers the pseudo-console on this list.
+    pub(crate) fn set_pseudo_console(&mut self, console: &PseudoConsole) -> io::Result<()> {
+        let hpcon = console.as_hpcon();
+        // SAFETY: the list is live; per the `CreatePseudoConsole` contract
+        // (and `portable-pty` 0.9) the `HPCON` travels by value in the
+        // pointer slot with `size_of::<HPCON>()` — no dereferenceable memory
+        // is involved and nothing outlives this call.
+        check(unsafe {
+            UpdateProcThreadAttribute(
+                self.as_ptr(),
+                0,
+                PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
+                hpcon as *const core::ffi::c_void,
+                size_of::<HPCON>(),
+                ptr::null_mut(),
+                ptr::null(),
+            )
+        })
+    }
+
+    /// Registers `job` so the spawned child joins it atomically at creation:
+    /// the child runs zero instructions outside the job.
+    pub(crate) fn set_job(&mut self, job: BorrowedHandle<'_>) -> io::Result<()> {
+        self.job_slot[0] = job.as_raw_handle();
+        let list = self.as_ptr();
+        // SAFETY: `job_slot` is owned by `self` and `self` outlives the
+        // spawn call (the caller holds it across `CreateProcessW`), so the
+        // stored pointer stays valid; the size is exactly one `HANDLE` and
+        // `job` is a live job handle.
+        check(unsafe {
+            UpdateProcThreadAttribute(
+                list,
+                0,
+                PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
+                self.job_slot.as_ptr().cast(),
+                size_of::<[HANDLE; 1]>(),
+                ptr::null_mut(),
+                ptr::null(),
+            )
+        })
+    }
+}
+
+impl Drop for AttributeList {
+    fn drop(&mut self) {
+        // SAFETY: initialized by `new` and deleted exactly once here.
+        unsafe { DeleteProcThreadAttributeList(self.as_ptr()) };
+    }
+}
+
+/// A ConPTY child placed in its job at creation: the process handle that
+/// observes (and terminates) it, plus its pid.
+pub(crate) struct SpawnedConpty {
+    pub(crate) process: OwnedHandle,
+    pub(crate) pid: u32,
+}
+
+/// Spawns `command_line` attached to the pseudo-console (and job) in
+/// `attributes`, exactly like `portable-pty` 0.9 but with a caller-built
+/// attribute list: no shell, no handle inheritance, `STARTF_USESTDHANDLES`
+/// with invalid stdio (the console is the stdio), and a caller-supplied
+/// environment block. The primary thread handle is closed immediately; the
+/// process handle is returned.
+///
+/// All buffers are NUL-terminated by their builders and owned by the caller
+/// across this call; lengths are never passed (the kernel finds the
+/// terminators), so no length can be wrong.
+pub(crate) fn spawn_conpty(
+    command_line: &mut [u16],
+    environment: &[u16],
+    current_directory: Option<&[u16]>,
+    attributes: &AttributeList,
+) -> io::Result<SpawnedConpty> {
+    let mut startup = STARTUPINFOEXW::default();
+    startup.StartupInfo.cb = struct_len::<STARTUPINFOEXW>();
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup.StartupInfo.hStdInput = INVALID_HANDLE_VALUE;
+    startup.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE;
+    startup.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
+    startup.lpAttributeList = attributes.as_ptr();
+    let mut info = PROCESS_INFORMATION::default();
+    // SAFETY: `command_line` is a writable NUL-terminated buffer the caller
+    // keeps alive (the kernel may modify it while parsing); `environment`
+    // and `current_directory` are NUL-terminated slices alive across the
+    // call; `attributes` is a live two-entry list; `startup`/`info` are
+    // stack structs with exact sizes. NULL application name is documented
+    // valid (module name parsed from the command line) and disables handle
+    // inheritance alongside `FALSE`.
+    check(unsafe {
+        CreateProcessW(
+            ptr::null(),
+            command_line.as_mut_ptr(),
+            ptr::null(),
+            ptr::null(),
+            FALSE,
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+            environment.as_ptr().cast(),
+            current_directory.map_or(ptr::null(), |dir| dir.as_ptr()),
+            ptr::from_ref(&startup.StartupInfo),
+            &mut info,
+        )
+    })?;
+    if info.hProcess.is_null() || info.hThread.is_null() || info.dwProcessId == 0 {
+        // Practically unreachable (a successful `CreateProcessW` fills all
+        // three), but fail closed without leaking: wrap whatever is valid
+        // and drop it immediately.
+        if !info.hThread.is_null() {
+            // SAFETY: fresh handle from the call above, owned by nobody
+            // else, closed once by the temporary.
+            drop(unsafe { OwnedHandle::from_raw_handle(info.hThread) });
+        }
+        if !info.hProcess.is_null() {
+            // SAFETY: same ownership argument as above.
+            drop(unsafe { OwnedHandle::from_raw_handle(info.hProcess) });
+        }
+        return Err(io::Error::other(
+            "CreateProcessW succeeded without process handles",
+        ));
+    }
+    // SAFETY: success plus the NULL checks above make both handles fresh,
+    // valid, and exclusively owned; the thread is closed at once (its work
+    // is done) and the process exactly once by the returned owner.
+    let thread = unsafe { OwnedHandle::from_raw_handle(info.hThread) };
+    let process = unsafe { OwnedHandle::from_raw_handle(info.hProcess) };
+    drop(thread);
+    Ok(SpawnedConpty {
+        process,
+        pid: info.dwProcessId,
+    })
+}
+
+/// Terminates the process behind `process` with `exit_code` through its
+/// handle (no pid lookup, so no pid-reuse window).
+pub(crate) fn terminate_handle(process: BorrowedHandle<'_>, exit_code: u32) -> io::Result<()> {
+    // SAFETY: `process` is borrowed from a live full-access handle (the
+    // `CreateProcessW` return), which includes `PROCESS_TERMINATE`.
+    check(unsafe { TerminateProcess(process.as_raw_handle(), exit_code) })
+}
+
+/// Blocks until the process behind `process` exits, then reports its exit
+/// code. Wakes when another thread terminates the process.
+pub(crate) fn wait_for_exit(process: BorrowedHandle<'_>) -> io::Result<u32> {
+    // SAFETY: `process` is borrowed from a live handle with `SYNCHRONIZE`;
+    // an infinite wait ends when the process exits.
+    let result = unsafe { WaitForSingleObject(process.as_raw_handle(), INFINITE) };
+    if result == WAIT_FAILED {
+        return Err(io::Error::last_os_error());
+    }
+    debug_assert_eq!(result, WAIT_OBJECT_0);
+    let mut code = 0u32;
+    // SAFETY: same handle (full access includes query rights); `code` is a
+    // writable `u32` on this stack frame, read only after the wait above
+    // signaled.
+    check(unsafe { GetExitCodeProcess(process.as_raw_handle(), &mut code) })?;
+    Ok(code)
 }

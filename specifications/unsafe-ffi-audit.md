@@ -145,3 +145,133 @@ correction follow-up, not a code change.
   blocks above (CTX-0903). The broader `rg 'unsafe|extern "'` additionally
   hits prose comments and the Nushell `extern` string.
 - CTX-0903: `cargo clippy -p bitty-winjob -p bitty-pty -p bitty-runtime --all-targets --locked --target x86_64-pc-windows-msvc -- -D warnings`
+
+---
+
+## CTX-0978 addendum: native ConPTY job-at-creation spawn (issues #1653 + #1579)
+
+Date: 2026-10-05. Scope: `crates/bitty-winjob` ConPTY spawn path (new
+`conpty` module + 19 new `ffi.rs` blocks), `crates/bitty-pty` native
+Windows backend, `Pty`-owned trees, `bitty-runtime` stored-tree kill.
+
+### Why native (recorded, not re-litigated here)
+
+`portable-pty` 0.9 spawns ConPTY children with fixed creation flags, so a
+`OwnedTree::adopt` after the spawn leaves a window where an early
+grandchild escapes the job (issue #1579). Upstream is stale (0.9.0 since
+2025-02, past the ADR-0004 twelve-month rule), so per DEC-0101 the Windows
+backend spawns natively through `bitty-winjob` with
+`PROC_THREAD_ATTRIBUTE_JOB_LIST` at creation. The Unix backend still wraps
+`portable-pty`; `bitty-pty` no longer depends on it on Windows.
+
+### Inventory delta (verified 2026-10-05, worktree `carryctx/ctx-0978`)
+
+`bitty-pty/src` still contains **zero** `unsafe` blocks
+(`#![forbid(unsafe_code)]`, verified by `rg`). All 19 new blocks are in
+`crates/bitty-winjob/src/ffi.rs`, each carrying a `// SAFETY:` comment.
+`crates/bitty-winjob/src/conpty.rs` (safe orchestration plus the pure
+UTF-16 builders) contains no `unsafe`; the crate root still denies
+`unsafe_code` with the single `#[allow(unsafe_code)] mod ffi`.
+
+| #   | Location (`ffi.rs`)                          | Call                                          | SAFETY rationale                                                                                                                                                                                                                             | Verdict |
+| --- | -------------------------------------------- | --------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
+| 21  | `:342` (`Drop for PseudoConsole`)            | `ClosePseudoConsole`                          | Handle came from a successful `CreatePseudoConsole`; `Drop` runs exactly once per value                                                                                                                                                      | Keep    |
+| 22  | `:376` (`create_pseudo_console`)             | `CreatePseudoConsole`                         | Borrowed live pipe handles; stack `HPCON` slot; `HRESULT` checked (`S_OK`); failure carries the `HRESULT` (no last-error contract)                                                                                                           | Keep    |
+| 23  | `:405` (`resize_pseudo_console`)             | `ResizePseudoConsole`                         | Borrowed live console; same `HRESULT` contract                                                                                                                                                                                               | Keep    |
+| 24  | `:422` (`create_pipe`)                       | `CreatePipe`                                  | Stack `HANDLE` slots; NULL attributes (default, non-inheritable) and zero size documented valid; both handles wrapped before any fallible step                                                                                               | Keep    |
+| 25  | `:426` (`create_pipe`)                       | `OwnedHandle::from_raw_handle` (read)         | Success checked above; fresh, exclusively owned; closed once; no fallible step between the two wraps                                                                                                                                         | Keep    |
+| 26  | `:427` (`create_pipe`)                       | `OwnedHandle::from_raw_handle` (write)        | Same ownership argument as #25                                                                                                                                                                                                               | Keep    |
+| 27  | `:455` (`AttributeList::new`, size query)    | `InitializeProcThreadAttributeList(NULL, ..)` | NULL list with a valid count only queries the size; nothing exists to free; `bytes` validated below instead of trusting the return                                                                                                           | Keep    |
+| 28  | `:464` (`AttributeList::new`, init)          | `InitializeProcThreadAttributeList(buf, ..)`  | Buffer is exactly the queried size and lives in `self`; return value checked                                                                                                                                                                 | Keep    |
+| 29  | `:493` (`set_pseudo_console`)                | `UpdateProcThreadAttribute(PSEUDOCONSOLE)`    | Live list; the `HPCON` travels by value in the pointer slot with `size_of::<HPCON>()` (API contract, `portable-pty` 0.9 parity); nothing outlives the call                                                                                   | Keep    |
+| 30  | `:515` (`set_job`)                           | `UpdateProcThreadAttribute(JOB_LIST)`         | `job_slot` is owned by `self`, which outlives the spawn call; size is exactly one `HANDLE`; job handle is live                                                                                                                               | Keep    |
+| 31  | `:532` (`Drop for AttributeList`)            | `DeleteProcThreadAttributeList`               | Initialized by `new`, deleted exactly once here                                                                                                                                                                                              | Keep    |
+| 32  | `:574` (`spawn_conpty`)                      | `CreateProcessW`                              | Writable NUL-terminated command line (caller-owned, kernel may modify while parsing); NUL-terminated env/cwd slices alive across the call; live attr list; stack structs with exact sizes; NULL app name and no inheritance documented valid | Keep    |
+| 33  | `:595` (`spawn_conpty`, unreachable cleanup) | `OwnedHandle::from_raw_handle` (thread)       | Practically unreachable (success fills both handles); wraps whatever is valid so nothing leaks, drops at once                                                                                                                                | Keep    |
+| 34  | `:599` (`spawn_conpty`, unreachable cleanup) | `OwnedHandle::from_raw_handle` (process)      | Same fail-closed argument as #33                                                                                                                                                                                                             | Keep    |
+| 35  | `:608` (`spawn_conpty`)                      | `OwnedHandle::from_raw_handle` (thread)       | Success plus NULL checks above: fresh, valid, exclusively owned; closed at once                                                                                                                                                              | Keep    |
+| 36  | `:609` (`spawn_conpty`)                      | `OwnedHandle::from_raw_handle` (process)      | Same ownership argument as #35; closed once by the returned owner                                                                                                                                                                            | Keep    |
+| 37  | `:622` (`terminate_handle`)                  | `TerminateProcess`                            | Borrowed live full-access handle from `CreateProcessW` (includes `PROCESS_TERMINATE`); no pid lookup, so no pid-reuse window                                                                                                                 | Keep    |
+| 38  | `:630` (`wait_for_exit`)                     | `WaitForSingleObject(h, INFINITE)`            | Borrowed live handle with `SYNCHRONIZE`; the wait ends when the process exits or another thread terminates it                                                                                                                                | Keep    |
+| 39  | `:639` (`wait_for_exit`)                     | `GetExitCodeProcess`                          | Same handle (full access includes query rights); stack `u32` read only after the wait above signaled                                                                                                                                         | Keep    |
+
+Re-verified unchanged: blocks #3–#20 keep their rationales; `resume_threads`
+(#15–#20) is still used by the `CREATE_SUSPENDED` pipe-job path.
+
+### Boundary properties (spawn path)
+
+- Inputs beyond pids/handles are caller-built UTF-16 buffers (command line,
+  environment block, working directory). They are owned `Vec<u16>`s that
+  outlive the `CreateProcessW` call, NUL-terminated by pure builders in the
+  safe `conpty` module that refuse NUL (`InvalidInput`), `=` in env keys, and
+  empty keys/cwd up front. Lengths are never passed (the kernel finds the
+  terminators), so no length can be wrong.
+- Console dimensions are validated into `i16` (`COORD` lanes) instead of
+  truncating; the attribute list is fixed at two entries (pseudo-console
+  plus exactly one job — nesting a second job is not expressible).
+- The `PseudoConsole` and `AttributeList` RAII types own their non-`CloseHandle`
+  cleanup and never expose a raw `HANDLE`: `HPCON` stays inside `ffi.rs`
+  (it is `isize`, not a `HANDLE`, and `CloseHandle` on it would leak).
+- Upper layers consume only safe APIs: `bitty-pty` (`forbid`) sees
+  `ConPtyMaster`/`ConPtyChild`/`ChildSpec`/`JobObject`/`JobMember` (all
+  `OwnedHandle`-owning), and `bitty-runtime` (`forbid`) sees only
+  `Pty::tree()` plus `OwnedTree::signal`. `ffi` is crate-private.
+- Pure builders (`append_quoted` ported from `portable-pty` 0.9 via
+  rust-subprocess `ArgvQuote`, environment block, cwd) carry Windows-only
+  unit tests in `conpty.rs` (quoting, double-NUL termination, every
+  refusal); they run on the Windows CI job.
+
+### Fixes applied in this task
+
+1. `bitty-winjob`: new safe `conpty` module (`ChildSpec`, `ConPtyMaster`,
+   `ConPtyChild`) plus the `ffi` ConPTY section above; `JobObject::as_handle`
+   (crate-private borrow for the job list) and `JobMember::from_spawned`
+   (crate-private wrap of an already-open handle); `windows-sys` features
+   `Win32_System_Console` + `Win32_System_Pipes` (no new crates).
+2. `bitty-pty`: Windows backend spawns natively with the job at creation and
+   returns the tree with the session; `Pty` owns `tree: Option<OwnedTree>`
+   with a `tree()` accessor (Unix adopts the session leader right after the
+   spawn — its group is fixed at `fork`, so no window there either);
+   `portable-pty` is now a `cfg(unix)` dependency. Removed the
+   residual-race notes in `tree/windows.rs` and `tree.rs`; `adopt` is now
+   documented for already-running non-PTY children only.
+3. `bitty-runtime` `kill_pane_tree`: signals the session's stored tree
+   instead of adopting the pid at kill time (the old call site owned the
+   whole-lifetime race on Windows).
+4. Tests: replaced the adopt-after-start ConPTY test with
+   `a_conpty_child_travels_with_its_tree` plus the issue's acceptance test
+   `an_immediate_fork_conpty_grandchild_dies_with_the_tree` (helper forks
+   first thing under ConPTY; the kill must take the grandchild).
+   Windows-CI-only (`require_pty!`); compile-verified here via
+   `cargo check --target x86_64-pc-windows-gnu`.
+
+### New residual gaps (follow-ups, NOT fixed here)
+
+- G-5 Registry environment merge: `portable-pty` 0.9 merged machine-level
+  registry entries (`SystemRoot`) into the child env; the native backend
+  builds the block from the session environment only. A stripped launch
+  environment missing `SystemRoot` now fails its spawn fail-closed instead
+  of gaining machine state. Whether to restore a targeted allowlist merge
+  is a follow-up decision, not a silent fix.
+- G-6 Native-spawn runtime proof: no Windows seat on the implementing host;
+  `spawn_windows.rs` (env/echo/resize/exit) plus the two job tests above
+  are the Windows CI proof. The `cargo check`/`clippy --target
+x86_64-pc-windows-gnu` runs here are compile-only evidence.
+- G-7 `CreateProcessW` search order: a NULL application name searches the
+  application directory, system directories, and `PATH` (with `PATHEXT`),
+  slightly broader than `portable-pty`'s pre-resolution; an explicitly set
+  but nonexistent `cwd` fails instead of falling back to home. Both are
+  fail-closed divergences, documented in `platform/windows.rs`.
+- G-1..G-4 carry over unchanged.
+
+### Verification (CTX-0978)
+
+- `cargo test -p bitty-pty -p bitty-winjob -p bitty-runtime` (Linux host)
+- `cargo clippy -p bitty-winjob -p bitty-pty -p bitty-runtime --all-targets --locked -- -D warnings` (Linux host)
+- `cargo fmt --check -p bitty-winjob -p bitty-pty -p bitty-runtime`
+- `cargo check -p bitty-winjob -p bitty-pty --target x86_64-pc-windows-gnu --all-targets` (compile-only; Windows runtime is CI)
+- `cargo clippy -p bitty-winjob -p bitty-pty --target x86_64-pc-windows-gnu --all-targets --locked -- -D warnings`
+- Negative control: `rg 'unsafe \{|unsafe fn|unsafe impl|allow\(unsafe_code\)' crates/*/src`
+  matches only the allowlisted `gpu.rs` pair, the `bitty-render` and
+  `bitty-winjob` module allowances, and the 37 `bitty-winjob/src/ffi.rs`
+  blocks inventoried above.

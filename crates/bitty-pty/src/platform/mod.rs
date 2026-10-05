@@ -5,8 +5,8 @@
 //! live behind exactly one internal module per platform:
 //!
 //! - `unix`: real implementation wrapping `portable-pty`'s Unix/POSIX PTY.
-//! - `windows`: real implementation wrapping `portable-pty`'s ConPTY backend
-//!   (CTX-0268 Tier-1 slice). ConPTY exposes no device path, so `tty_name`
+//! - `windows`: native ConPTY backend spawning through `bitty-winjob`
+//!   (CTX-0978, DEC-0101). ConPTY exposes no device path, so `tty_name`
 //!   is always `None`, and exit statuses never carry a signal name.
 
 #[cfg(unix)]
@@ -60,15 +60,26 @@ pub(crate) struct Session {
 }
 
 /// Entry point used by [`crate::PtyBuilder::spawn`].
+///
+/// The session's owned process tree travels with it: on Windows the child
+/// is born inside its Job Object at creation (no adopt-after-start window),
+/// on Unix the session-leader child is adopted right after the spawn (its
+/// process group is fixed at `fork`, so no race either way). A missing tree
+/// (`None`) means the child has no observable tree (its pid is unknown);
+/// callers fall back to direct-child semantics.
 pub(crate) fn spawn_session(config: &SpawnConfig) -> Result<crate::pty::Pty, PtyError> {
-    Session::open(config).map(crate::pty::Pty::new)
+    let (session, tree) = Session::open(config)?;
+    Ok(crate::pty::Pty::new(session, tree))
 }
 
 impl Session {
-    /// Opens a fresh PTY of the configured size and spawns `config` into it.
-    pub(crate) fn open(config: &SpawnConfig) -> Result<Self, PtyError> {
-        let (master, child) = imp::open_pty_and_spawn(config)?;
-        Ok(Session { master, child })
+    /// Opens a fresh PTY of the configured size and spawns `config` into it,
+    /// returning the session plus its owned tree when one exists.
+    pub(crate) fn open(
+        config: &SpawnConfig,
+    ) -> Result<(Self, Option<crate::tree::OwnedTree>), PtyError> {
+        let (master, child, tree) = imp::open_pty_and_spawn(config)?;
+        Ok((Session { master, child }, tree))
     }
 
     /// Resizes the terminal; the kernel delivers SIGWINCH to the foreground
@@ -101,8 +112,8 @@ impl Session {
 
     /// Takes the readable master side. The returned reader may be moved to
     /// another thread; it feeds this crate's bounded pump.
-    pub(crate) fn try_clone_reader(&self) -> Result<Box<dyn std::io::Read + Send>, PtyError> {
-        imp::try_clone_reader(&self.master)
+    pub(crate) fn take_reader(&mut self) -> Result<Box<dyn std::io::Read + Send>, PtyError> {
+        imp::take_reader(&mut self.master)
     }
 
     /// Takes the writable master side (once).

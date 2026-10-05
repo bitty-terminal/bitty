@@ -16,8 +16,8 @@ use std::collections::HashSet;
 
 use bitty_platform::{KeyEvent, LogicalKey, NamedKey, PressState, WindowEventKind};
 use bitty_runtime::{
-    FocusDirection, LayoutNode, PresentationMode, Runtime, SplitAxis, View, ViewCloseRequest,
-    ViewId, WsCloseRequest,
+    FocusDirection, LayoutNode, PanelLayoutMode, PresentationMode, Runtime, SplitAxis, View,
+    ViewCloseRequest, ViewId, WsCloseRequest,
 };
 
 use crate::spawn::spawn_pane_shell;
@@ -480,19 +480,23 @@ pub(crate) fn split_dir_to_axis(dir: bitty_config::SplitDir) -> SplitAxis {
     }
 }
 
-/// Split the focused leaf along `axis`, keeping the focused view and adding a
+/// Split the target leaf along `axis`, keeping the target view and adding a
 /// fresh sibling. The new pane goes first for `Left`/`Up`, second otherwise.
-/// Returns false when the focused id is not in the tree.
+/// Returns false when the target id is not in the tree.
+///
+/// The target is usually the focused leaf (explicit `new_split:<dir>`); the
+/// adaptive `new_panel` path passes `Runtime::panel_bisect_target` in
+/// `PanelLayoutMode::BisectLargest` (CTX-0964, #1698, DEC-0099).
 pub(crate) fn split_focused_leaf(
     layout: &mut LayoutNode,
-    focused: ViewId,
+    target: ViewId,
     axis: SplitAxis,
     new_id: ViewId,
     place_new_first: bool,
 ) -> bool {
     match layout {
         LayoutNode::Leaf(v) => {
-            if v.id() != focused {
+            if v.id() != target {
                 return false;
             }
             let old = v.clone();
@@ -506,15 +510,15 @@ pub(crate) fn split_focused_leaf(
             true
         }
         LayoutNode::Split { first, second, .. } => {
-            split_focused_leaf(first, focused, axis, new_id, place_new_first)
-                || split_focused_leaf(second, focused, axis, new_id, place_new_first)
+            split_focused_leaf(first, target, axis, new_id, place_new_first)
+                || split_focused_leaf(second, target, axis, new_id, place_new_first)
         }
         LayoutNode::Stack(children) => children
             .iter_mut()
-            .any(|c| split_focused_leaf(c, focused, axis, new_id, place_new_first)),
+            .any(|c| split_focused_leaf(c, target, axis, new_id, place_new_first)),
         LayoutNode::Overlay { base, overlay, .. } => {
-            split_focused_leaf(base, focused, axis, new_id, place_new_first)
-                || split_focused_leaf(overlay, focused, axis, new_id, place_new_first)
+            split_focused_leaf(base, target, axis, new_id, place_new_first)
+                || split_focused_leaf(overlay, target, axis, new_id, place_new_first)
         }
     }
 }
@@ -892,19 +896,30 @@ impl TerminalApp {
     /// (CTX-0838 #1441).
     ///
     /// Fail-closed, headless-testable: no focused pane warns and keeps the
-    /// layout; a refused appearance keeps the layout; a missing focused leaf
-    /// in the tree warns and keeps the layout. On success the fresh leaf gets
-    /// a best-effort shell, focus follows it (Hyprland/kitty/ghostty parity),
-    /// and `label` names the action in the loud log line.
-    fn apply_new_leaf(&mut self, axis: SplitAxis, place_new_first: bool, label: &str) {
+    /// layout; a refused appearance keeps the layout; a missing `target`
+    /// leaf in the tree warns and keeps the layout. On success the fresh
+    /// leaf gets a best-effort shell, focus follows it
+    /// (Hyprland/kitty/ghostty parity), and `label` names the action in the
+    /// loud log line.
+    ///
+    /// `target` is the leaf to split: explicit `new_split:<dir>` passes the
+    /// focused leaf, while `new_panel` in `PanelLayoutMode::BisectLargest`
+    /// (CTX-0964, #1698, DEC-0099) passes `Runtime::panel_bisect_target`
+    /// (the largest-area leaf, not focus). Spawn sizing and cwd inheritance
+    /// still read the focused pane, so the fresh shell matches its
+    /// neighbors.
+    fn apply_new_leaf(
+        &mut self,
+        target: ViewId,
+        axis: SplitAxis,
+        place_new_first: bool,
+        label: &str,
+    ) {
         self.restore_zoom();
-        let focused = match self.runtime.focused_view() {
-            Some(id) => id,
-            None => {
-                eprintln!("warning: keymap {label} has no focused pane — ignoring");
-                return;
-            }
-        };
+        if self.runtime.focused_view().is_none() {
+            eprintln!("warning: keymap {label} has no focused pane — ignoring");
+            return;
+        }
         let mut layout = self.runtime.layout().clone();
         // CTX-0378: the id comes from the runtime-wide allocator
         // (every slot + the live layout), never this layout's max + 1:
@@ -919,7 +934,7 @@ impl TerminalApp {
             eprintln!("warning: keymap {label} refused: {err}");
             return;
         }
-        if split_focused_leaf(&mut layout, focused, axis, new_id, place_new_first) {
+        if split_focused_leaf(&mut layout, target, axis, new_id, place_new_first) {
             self.runtime.set_layout(layout);
             // CTX-0176: the fresh leaf gets its own shell/PTY sized
             // to its allocation — best-effort (startup parity). On
@@ -950,7 +965,7 @@ impl TerminalApp {
                 ),
             }
         } else {
-            eprintln!("warning: keymap {label} found no focused pane — ignoring");
+            eprintln!("warning: keymap {label} found no target pane — ignoring");
         }
     }
 
@@ -1085,7 +1100,14 @@ impl TerminalApp {
                     bitty_config::SplitDir::Left | bitty_config::SplitDir::Up
                 );
                 let label = format!("new_split:{}", dir.canonical());
-                self.apply_new_leaf(split_dir_to_axis(dir), place_new_first, &label);
+                // Explicit directional splits always bisect the focused
+                // leaf, independent of `PanelLayoutMode` (which only
+                // controls the adaptive `NewPanel` path below).
+                let Some(target) = self.runtime.focused_view() else {
+                    eprintln!("warning: keymap {label} has no focused pane — ignoring");
+                    return;
+                };
+                self.apply_new_leaf(target, split_dir_to_axis(dir), place_new_first, &label);
             }
             A::NewPanel => {
                 // CTX-0838 (#1441) / CTX-0881: 4-way spiral panel creation. Axis
@@ -1094,6 +1116,13 @@ impl TerminalApp {
                 // placement follows the spiral cycle (Right -> Down -> Left -> Up)
                 // and focus follows the fresh pane. Explicit `new_split:<dir>` above
                 // keeps its fixed axis for directional splits.
+                //
+                // CTX-0964 (#1698, DEC-0099): in `BisectLargest` mode the
+                // split lands on `panel_bisect_target` (largest-area leaf)
+                // with its raw `width >= height` axis instead of the focused
+                // leaf; `Spiral`/`Dwindle` keep the focused leaf. The axis
+                // already comes from `panel_split_axis` (bisect-aware); only
+                // the target needs the same switch here.
                 let focused = match self.runtime.focused_view() {
                     Some(id) => id,
                     None => {
@@ -1108,7 +1137,12 @@ impl TerminalApp {
                 self.restore_zoom();
                 let axis = self.runtime.panel_split_axis(focused);
                 let place_new_first = self.runtime.panel_split_place_new_first();
-                self.apply_new_leaf(axis, place_new_first, "new_panel");
+                let target = if self.runtime.panel_layout_mode() == PanelLayoutMode::BisectLargest {
+                    self.runtime.panel_bisect_target().unwrap_or(focused)
+                } else {
+                    focused
+                };
+                self.apply_new_leaf(target, axis, place_new_first, "new_panel");
             }
             A::CloseView => {
                 let focused = match self.runtime.focused_view() {
@@ -3581,6 +3615,121 @@ mod tests {
             Some(ChromeAction::ToggleFloating),
             "toggle_floating rebinds by explicit chord"
         );
+    }
+
+    #[test]
+    fn chrome_new_panel_bisect_largest_splits_largest_not_focused() {
+        // CTX-0964 (#1698, DEC-0099): `BisectLargest` `new_panel` splits
+        // `panel_bisect_target` (largest-area leaf) with its raw axis, not
+        // the focused leaf. Focus parks on the small 20-wide leaf; the
+        // 60-wide largest leaf must split right into 30/30 and focus must
+        // follow the fresh pane. Heights stay relative (the workspaceline
+        // band may reserve a row), so only widths and adjacency are pinned.
+        use bitty_config::ChromeAction;
+        let mut app = workspace_test_app();
+        let small = ViewId::new(100);
+        let largest = ViewId::new(101);
+        let seed = app.runtime.focused_view().expect("seed focus");
+        let probe = app
+            .runtime
+            .layout()
+            .find_leaf(seed)
+            .cloned()
+            .expect("seed leaf");
+        app.runtime.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.25,
+            LayoutNode::leaf(View::new(
+                small,
+                usize::from(probe.cols()),
+                usize::from(probe.rows()),
+            )),
+            LayoutNode::leaf(View::new(
+                largest,
+                usize::from(probe.cols()),
+                usize::from(probe.rows()),
+            )),
+        ));
+        assert!(app.runtime.set_focus(small));
+        app.runtime
+            .set_panel_layout_mode(PanelLayoutMode::BisectLargest);
+        assert_eq!(app.runtime.panel_bisect_target(), Some(largest));
+        app.apply_chrome_action(ChromeAction::NewPanel);
+        assert_eq!(app.runtime.leaf_count(), 3);
+        let fresh = app.runtime.focused_view().expect("focus follows fresh");
+        assert_ne!(fresh, small, "fresh pane takes focus");
+        assert_ne!(fresh, largest, "fresh pane is new");
+        let allocs = app.runtime.layout_allocations();
+        let rect_of = |id: ViewId| {
+            allocs
+                .iter()
+                .find(|(leaf, _)| *leaf == id)
+                .map(|(_, r)| *r)
+                .expect("allocation present")
+        };
+        let small_rect = rect_of(small);
+        let largest_rect = rect_of(largest);
+        let fresh_rect = rect_of(fresh);
+        assert_eq!(small_rect.width, 20, "small leaf stays whole");
+        assert_eq!(largest_rect.width, 30, "largest splits right");
+        assert_eq!(fresh_rect.width, 30, "fresh pane is the other half");
+        assert_eq!(small_rect.height, largest_rect.height);
+        assert_eq!(largest_rect.height, fresh_rect.height);
+        assert_eq!(largest_rect.y, fresh_rect.y);
+        assert_eq!(largest_rect.x + largest_rect.width, fresh_rect.x);
+    }
+
+    #[test]
+    fn chrome_new_split_explicit_stays_on_focused_under_bisect_mode() {
+        // CTX-0964 (#1698): explicit `new_split:<dir>` keeps focused-leaf
+        // semantics under every mode — only adaptive `NewPanel` follows the
+        // bisect target. With `BisectLargest` on and focus on the small
+        // leaf, `new_split:right` must still split it (10/10), leaving the
+        // 60-wide largest leaf whole.
+        use bitty_config::{ChromeAction, SplitDir};
+        let mut app = workspace_test_app();
+        let small = ViewId::new(100);
+        let largest = ViewId::new(101);
+        let seed = app.runtime.focused_view().expect("seed focus");
+        let probe = app
+            .runtime
+            .layout()
+            .find_leaf(seed)
+            .cloned()
+            .expect("seed leaf");
+        app.runtime.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.25,
+            LayoutNode::leaf(View::new(
+                small,
+                usize::from(probe.cols()),
+                usize::from(probe.rows()),
+            )),
+            LayoutNode::leaf(View::new(
+                largest,
+                usize::from(probe.cols()),
+                usize::from(probe.rows()),
+            )),
+        ));
+        assert!(app.runtime.set_focus(small));
+        app.runtime
+            .set_panel_layout_mode(PanelLayoutMode::BisectLargest);
+        app.apply_chrome_action(ChromeAction::NewSplit(SplitDir::Right));
+        assert_eq!(app.runtime.leaf_count(), 3);
+        let fresh = app.runtime.focused_view().expect("focus follows fresh");
+        assert_ne!(fresh, small, "fresh pane takes focus");
+        assert_ne!(fresh, largest, "fresh pane is new");
+        let allocs = app.runtime.layout_allocations();
+        let rect_of = |id: ViewId| {
+            allocs
+                .iter()
+                .find(|(leaf, _)| *leaf == id)
+                .map(|(_, r)| *r)
+                .expect("allocation present")
+        };
+        assert_eq!(rect_of(small).width, 10, "focused leaf splits");
+        assert_eq!(rect_of(fresh).width, 10, "fresh pane is the other half");
+        assert_eq!(rect_of(largest).width, 60, "largest leaf untouched");
     }
 
     #[test]

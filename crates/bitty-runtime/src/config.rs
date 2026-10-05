@@ -787,10 +787,19 @@ pub struct RuntimeConfig {
     ///
     /// Default [`PanelLayoutMode::Spiral`] (4-way clockwise spiral: Right -> Down -> Left -> Up).
     /// `PanelLayoutMode::Dwindle` opts into Hyprland-style dwindle (always Right or Down).
+    /// `PanelLayoutMode::BisectLargest` (CTX-0964, #1698) bisects the
+    /// largest-area panel with a raw `width >= height` axis (no
+    /// cell-aspect correction). Move-to-workspace uses this placement
+    /// regardless of this setting; this field only controls `NewPanel`.
     pub panel_layout_mode: PanelLayoutMode,
 }
 
 /// Layout mode for adaptive panel creation (`NewPanel` / `Mod+N`).
+///
+/// `Spiral` stays the default for `NewPanel` so existing keymap behavior is
+/// unchanged; `BisectLargest` opts into largest-panel bisection for
+/// `NewPanel`. Move-to-workspace also bisects independently of this setting
+/// (CTX-0964, #1698).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PanelLayoutMode {
     /// 4-way clockwise spiral: Right -> Down -> Left -> Up.
@@ -798,6 +807,13 @@ pub enum PanelLayoutMode {
     Spiral,
     /// Hyprland-style dwindle: always splits Right or Down.
     Dwindle,
+    /// Bisect the largest-area panel (CTX-0964, #1698): pick the leaf with
+    /// the largest `width * height` allocation (first in solver order on
+    /// ties) and split it right (`width >= height`, [`bitty_ui::SplitAxis::Horizontal`])
+    /// or down (otherwise), placing the fresh pane after it. The axis uses
+    /// raw cell counts, unlike the [`bitty_ui::smart_split_axis`] 2.0
+    /// cell-aspect correction.
+    BisectLargest,
 }
 
 /// Default cell width in logical pixels (CTX-0157 breathing-room cell).

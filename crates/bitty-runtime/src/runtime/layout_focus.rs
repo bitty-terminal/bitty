@@ -5,7 +5,7 @@
 use super::*;
 use crate::PanelLayoutMode;
 use crate::config::decoration_runtime_error;
-use bitty_ui::{SplitAxis, smart_split_axis};
+use bitty_ui::{SplitAxis, bisect_choice, largest_area_leaf, smart_split_axis};
 use core::ops::{Deref, DerefMut};
 
 pub(super) fn default_layout(cols: usize, rows: usize) -> LayoutNode {
@@ -1406,8 +1406,19 @@ impl Runtime {
     /// allocation (fail-closed: never panics, never mutates). Explicit
     /// `new_split:<dir>` keeps its fixed axis; this is only the Mod+N
     /// `new_panel` path.
+    ///
+    /// CTX-0964 (#1698): in [`PanelLayoutMode::BisectLargest`] this ignores
+    /// `focused` and returns the raw-aspect axis
+    /// ([`bitty_ui::bisect_split_axis`], no 2.0 cell-aspect correction) of
+    /// the largest-area panel (see [`Self::panel_bisect_target`]), so the
+    /// `NewPanel` opt-in and the move/restore default agree on the axis.
     #[must_use]
     pub fn panel_split_axis(&self, focused: ViewId) -> SplitAxis {
+        if self.panel_layout_mode == PanelLayoutMode::BisectLargest {
+            let allocations = self.layout_allocations();
+            let (_, axis) = bisect_choice(&allocations, self.container);
+            return axis;
+        }
         let rect = self
             .layout_allocations()
             .into_iter()
@@ -1417,7 +1428,22 @@ impl Runtime {
         smart_split_axis(rect, 1.0)
     }
 
-    /// Returns the current panel layout mode for adaptive splits (Spiral vs Dwindle).
+    /// Largest-area panel to bisect (CTX-0964, #1698).
+    ///
+    /// Pure, total, headless: returns the leaf with the largest
+    /// `width * height` allocation (first in solver order on ties), or
+    /// `None` for an empty layout. `NewPanel` callers in
+    /// [`PanelLayoutMode::BisectLargest`] split this target (not the
+    /// focused leaf); move-to-workspace uses this target regardless of
+    /// [`PanelLayoutMode`]. The axis for the target comes from
+    /// [`bitty_ui::bisect_split_axis`] (raw `width >= height`).
+    #[must_use]
+    pub fn panel_bisect_target(&self) -> Option<ViewId> {
+        let allocations = self.layout_allocations();
+        largest_area_leaf(&allocations).map(|(id, _)| id)
+    }
+
+    /// Returns the current panel layout mode for adaptive splits (Spiral vs Dwindle vs BisectLargest).
     #[must_use]
     pub fn panel_layout_mode(&self) -> PanelLayoutMode {
         self.panel_layout_mode
@@ -1435,6 +1461,10 @@ impl Runtime {
     ///   - Step 2 (3 -> 4 leaves): Left (`place_new_first = true`)
     ///   - Step 3 (4 -> 5 leaves): Top (`place_new_first = true`)
     /// - `Dwindle`: Hyprland-style dwindle (always Right or Bottom, `place_new_first = false`).
+    /// - `BisectLargest` (CTX-0964, #1698): always Right or Down
+    ///   (`place_new_first = false`); the fresh pane goes after the bisected
+    ///   largest-area panel. Move-to-workspace also uses this placement
+    ///   regardless of mode.
     #[must_use]
     pub fn panel_split_place_new_first(&self) -> bool {
         match self.panel_layout_mode {
@@ -1442,7 +1472,7 @@ impl Runtime {
                 let step = (self.layout.leaf_count().saturating_sub(1)) % 4;
                 step >= 2
             }
-            PanelLayoutMode::Dwindle => false,
+            PanelLayoutMode::Dwindle | PanelLayoutMode::BisectLargest => false,
         }
     }
 
@@ -1497,5 +1527,78 @@ mod tests {
             ViewId::new(51),
             "intermediate id 50 retired inside one layout_mut borrow must stay quarantined"
         );
+    }
+
+    /// CTX-0964 (#1698): `BisectLargest` targets the largest-area leaf with
+    /// a raw `w >= h` axis, ignoring focus; other modes keep the focused
+    /// leaf plus the 2.0-corrected smart axis.
+    #[test]
+    fn bisect_mode_targets_largest_with_raw_axis() {
+        let mut rt = Runtime::with_defaults().expect("headless runtime must build");
+        // 80x24 container, 0.25 split: leaf 1 is 20x24 (480 cells), leaf 2
+        // is 60x24 (1440 cells, largest, raw-wide).
+        let first = rt.focused_view().expect("focus");
+        let second = ViewId::new(2);
+        let old = rt.layout().find_leaf(first).cloned().expect("leaf");
+        let (cols, rows) = (usize::from(old.cols()), usize::from(old.rows()));
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.25,
+            LayoutNode::leaf(old),
+            LayoutNode::leaf(View::new(second, cols, rows)),
+        ));
+        // Focus the small leaf to prove bisect ignores focus.
+        assert!(rt.set_focus(first));
+        rt.set_panel_layout_mode(PanelLayoutMode::BisectLargest);
+        assert_eq!(rt.panel_bisect_target(), Some(second));
+        assert_eq!(
+            rt.panel_split_axis(first),
+            SplitAxis::Horizontal,
+            "60x24 is raw-wide: split right"
+        );
+        assert!(
+            !rt.panel_split_place_new_first(),
+            "bisect always places the fresh pane after (right/down)"
+        );
+    }
+
+    /// CTX-0964 (#1698): bisect pins the raw-vs-smart distinction — a
+    /// 30x24-class largest leaf is raw-wide (right) but smart-tall (down)
+    /// under the 2.0 correction, and ties break to solver order.
+    #[test]
+    fn bisect_raw_axis_differs_from_smart_on_cell_aspect() {
+        // Direct unit pin (no layout needed): 30x24 is the regression case.
+        assert_eq!(
+            bitty_ui::bisect_split_axis(UiRect::new(0, 0, 30, 24)),
+            SplitAxis::Horizontal
+        );
+        assert_eq!(
+            bitty_ui::smart_split_axis(UiRect::new(0, 0, 30, 24), 1.0),
+            SplitAxis::Vertical
+        );
+        // Tie: two equal leaves -> first in solver order.
+        let mut rt = Runtime::with_defaults().expect("headless runtime must build");
+        rt.set_panel_layout_mode(PanelLayoutMode::BisectLargest);
+        let first = rt.focused_view().expect("focus");
+        assert_eq!(rt.panel_bisect_target(), Some(first));
+    }
+
+    /// CTX-0964 (#1698): `Spiral` (default) and `Dwindle` keep their
+    /// existing focused-leaf semantics; only `BisectLargest` opts into the
+    /// largest-leaf target.
+    #[test]
+    fn spiral_and_dwindle_keep_focused_semantics() {
+        let mut rt = Runtime::with_defaults().expect("headless runtime must build");
+        let focused = rt.focused_view().expect("focus");
+        assert_eq!(rt.panel_layout_mode(), PanelLayoutMode::Spiral);
+        // Single leaf: every mode agrees on the container axis.
+        assert_eq!(
+            rt.panel_split_axis(focused),
+            bitty_ui::smart_split_axis(rt.container(), 1.0)
+        );
+        assert_eq!(rt.panel_bisect_target(), Some(focused));
+        rt.set_panel_layout_mode(PanelLayoutMode::Dwindle);
+        assert_eq!(rt.panel_layout_mode(), PanelLayoutMode::Dwindle);
+        assert!(!rt.panel_split_place_new_first());
     }
 }

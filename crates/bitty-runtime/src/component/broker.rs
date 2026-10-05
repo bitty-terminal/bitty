@@ -23,9 +23,10 @@ use bitty_network_wire::{
     MAX_REQUEST_BODY_BYTES, Message, Method, PROTOCOL_VERSION, WireError, encode_frame,
 };
 
-use super::descriptor::{ResolveError, resolve, validate_component_name};
+use super::descriptor::{ResolveError, validate_component_name};
 use super::env::ComponentEnv;
 use super::grant::PluginGrant;
+use super::inventory::resolve_search;
 use super::policy::{CrashTracker, SpawnGate};
 use super::stderr::StderrRing;
 use super::{
@@ -56,9 +57,12 @@ impl fmt::Display for RequestId {
 /// Broker construction parameters.
 #[derive(Debug, Clone)]
 pub struct BrokerConfig {
-    /// Component root (`components_root_for`); `None` means no component
-    /// can resolve.
+    /// User component root (`components_root_for`); `None` means the user
+    /// tier is absent (no-root execution still consults `system_root`).
     pub root: Option<PathBuf>,
+    /// System component root (`system_components_root_for`); `None` disables
+    /// the system tier. The user tier wins on collision.
+    pub system_root: Option<PathBuf>,
     /// Allowlisted environment forwarded to every component.
     pub env: ComponentEnv,
     /// Core version announced in `Hello`.
@@ -72,17 +76,25 @@ pub struct BrokerConfig {
 }
 
 impl BrokerConfig {
-    /// DIR-030 defaults for `root` and `env`.
+    /// DIR-030 defaults for `root` and `env` (system tier disabled).
     #[must_use]
     pub fn new(root: Option<PathBuf>, env: ComponentEnv) -> Self {
         Self {
             root,
+            system_root: None,
             env,
             core_version: env!("CARGO_PKG_VERSION").to_owned(),
             idle_timeout: COMPONENT_IDLE_TIMEOUT,
             shutdown_grace: COMPONENT_SHUTDOWN_GRACE,
             handshake_timeout: COMPONENT_HANDSHAKE_TIMEOUT,
         }
+    }
+
+    /// Enable the system tier for two-tier (issue #1651) resolution.
+    #[must_use]
+    pub fn with_system_root(mut self, system_root: Option<PathBuf>) -> Self {
+        self.system_root = system_root;
+        self
     }
 }
 
@@ -615,13 +627,15 @@ impl ComponentBroker {
             SpawnGate::Backoff { retry_after } => return Err(BrokerError::Backoff { retry_after }),
             SpawnGate::Unavailable => return Err(BrokerError::Unavailable),
         }
-        let root = self
-            .config
-            .root
-            .as_deref()
-            .ok_or(BrokerError::Resolve(ResolveError::NoRoot))?;
+        // Two-tier resolution (issue #1651): user wins on collision; a
+        // tampered user install fails closed without system fallback.
         // Full resolution and digest verification before every spawn.
-        let resolved = resolve(root, component)?;
+        let searched = resolve_search(
+            self.config.root.as_deref(),
+            self.config.system_root.as_deref(),
+            component,
+        )?;
+        let resolved = searched.resolved;
         self.next_generation += 1;
         let generation = self.next_generation;
         let process = spawn(

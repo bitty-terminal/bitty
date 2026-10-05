@@ -18,13 +18,36 @@ jobs:
   # full debug suite, measured at 11-15m on 2026-09-06/07 (CTX-0218; precedent
   # CTX-0193 raised soak 90s->120s the same way). Budget is 30m; do not reduce
   # to 15m. Fast jobs (msrv, supply-chain) stay at 15m.
+  # CTX-0971 R4: quality is sharded 2-way via matrix (nextest hash
+  # partitions) to cut the 11-15m wall toward total/2 plus setup. The matrix
+  # aggregates pass/fail: the job is green only when both shards are green.
   quality:
     name: Quality gates
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    # CTX-0971 R4: sccache with the GHA backend shares compiled dep units
+    # across the three ubuntu jobs (quality, linux-x11, linux-wayland), which
+    # otherwise cold-build in 6 isolated per-(OS,toolchain,job) rust-cache
+    # instances. rust-cache stays alongside (target-dir reuse); sccache adds
+    # compiler-output reuse. GHA cache quota is 10 GiB per repo shared with
+    # rust-cache/apt: monitor eviction warnings on the Actions cache page.
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # CTX-0971 R4: scope the sccache GHA namespace to the Cargo.lock hash so
+      # dep bumps invalidate stale dep units (mirrors the rust-cache key,
+      # which appends Cargo.lock automatically). Set after checkout via
+      # GITHUB_ENV because hashFiles in job env evaluates before checkout.
+      - name: Scope sccache namespace to Cargo.lock hash
+        run: echo "SCCACHE_GHA_VERSION=v1-$(sha256sum Cargo.lock | cut -d ' ' -f1)" >> "$GITHUB_ENV"
 
       # W-105 relocation (bitty CTX-0931): the compat-lab and perf suites live
       # in independent validation repositories at pinned immutable revisions
@@ -98,6 +121,12 @@ jobs:
           toolchain: ${{ steps.rust-channel.outputs.channel }}
           components: rustfmt, clippy
 
+      # CTX-0971 R4: sccache server on the GHA backend (shares dep units with
+      # the linux-x11/linux-wayland jobs via the same SCCACHE_GHA_VERSION
+      # namespace). Kept alongside rust-cache below; posts stats automatically.
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+
       # HK-07: compilation cache on the managed Cache backend. Scoped to
       # OS + toolchain (+ job, Cargo.lock, and rustc hashes appended by the
       # action) with prefix fallback on restore. Raw target/ stays out of
@@ -108,33 +137,42 @@ jobs:
         with:
           prefix-key: v1-rust-${{ runner.os }}-${{ steps.rust-channel.outputs.channel }}
 
+      # CTX-0971 R4 sharding: lint/check steps run once (shard 1) so the two
+      # shards do not duplicate clippy/fmt/packaging work. Test steps below
+      # are partitioned or split across both shards.
       - name: Check Rust formatting
+        if: matrix.shard == 1
         run: cargo fmt --all -- --check
 
       # Arch tooling is absent on ubuntu-latest, so this gate runs its
       # in-tree assertions and skips the makepkg --printsrcinfo probe.
       - name: Validate packaging recipes (artifact-install consistency)
+        if: matrix.shard == 1
         run: |
           bash scripts/check-pkgbuild-source.sh
           bash scripts/check-pkgbuild-bin.sh
 
       - name: Check terminfo shipping decision (034 item 6)
+        if: matrix.shard == 1
         run: |
           bash scripts/check-terminfo.sh
           bash scripts/tests/check-terminfo.test.sh
 
       - name: Install desktop/AppStream validation tools
+        if: matrix.shard == 1
         run: >-
           sudo apt-get update
           && sudo apt-get install -y --no-install-recommends
           appstream desktop-file-utils libxml2-utils
 
       - name: Check desktop integration and AppStream metadata (034 item 7)
+        if: matrix.shard == 1
         run: |
           bash scripts/check-desktop-integration.sh
           bash scripts/tests/check-desktop-integration.test.sh
 
       - name: Run Clippy
+        if: matrix.shard == 1
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       # CTX-0922: `bitty dev capture|synthesize|dump|overlay` is compiled only
@@ -143,6 +181,7 @@ jobs:
       # since the W-105 relocation and is never linked here, so there is no
       # trace feature configuration left to lint.)
       - name: Run Clippy (bitty-terminal dev-tools feature)
+        if: matrix.shard == 1
         run: cargo clippy -p bitty-terminal --features dev-tools --all-targets --locked -- -D warnings
 
       # #1519 / CTX-0855: hermetic `test-support` entry points (bitty-ipc's
@@ -150,6 +189,7 @@ jobs:
       # may be enabled only from dev-dependencies. Clippy above always builds
       # the dev graph, so this resolves the production feature graph instead.
       - name: Check test-support feature gate
+        if: matrix.shard == 1
         run: bash scripts/check-test-support-gate.sh
 
       # CTX-0847: cargo-nextest isolates every test in its own process, caps
@@ -162,13 +202,25 @@ jobs:
         with:
           tool: nextest@0.9.145
 
-      - name: Run tests (nextest, ci profile)
-        run: cargo nextest run --workspace --locked --profile ci
+      # CTX-0971 R4: hash-partition the nextest suite across 2 shards.
+      # hash:N/M is deterministic per (binary, test name): adding tests never
+      # moves an existing test to another shard, so flakes stay reproducible
+      # to their shard. Both shards must pass for the job to pass.
+      - name: Run tests (nextest, ci profile, shard ${{ matrix.shard }}/2)
+        run: cargo nextest run --workspace --locked --profile ci --partition hash:${{ matrix.shard }}/2
 
+      # CTX-0971 R4: nextest covers neither doctests nor harness=false
+      # binaries nor benches, so split them explicitly across shards to keep
+      # coverage identical without running them twice. Shard 1 takes doctests
+      # plus the two harness=false platform entry points; shard 2 takes the
+      # pinned bitty-perf benches, the dev-tools reruns, and the parser
+      # throughput baseline (all in the external checkout).
       - name: Run doctests
+        if: matrix.shard == 1
         run: cargo test --workspace --doc --locked
 
       - name: Run harness=false platform entry points
+        if: matrix.shard == 1
         run: cargo test -p bitty-platform --test headless_run --test winit_window --locked
 
       # CTX-0847: the previous `cargo test --all-targets` also executed the
@@ -178,6 +230,7 @@ jobs:
       # CTX-1585 extraction to the independent bitty-ipc repository (own CI)
       # and is no longer a workspace member here.
       - name: Run benches (pinned bitty-perf suite)
+        if: matrix.shard == 2
         working-directory: external/bitty-perf
         run: cargo test --benches --locked
 
@@ -187,6 +240,7 @@ jobs:
       # covered. (`bitty dev trace` has no enabling feature since the W-105
       # relocation; its disabled diagnostic is covered by the default run.)
       - name: Run bitty dev tool tests (dev-tools feature)
+        if: matrix.shard == 2
         run: |
           cargo test -p bitty-terminal --features dev-tools --test cli_dev --locked
           cargo test -p bitty-terminal --features dev-tools --bin bitty --locked dev::
@@ -198,6 +252,7 @@ jobs:
       # also what the mandatory local `just ci-local` run (which targets this
       # job) validates for the new wiring.
       - name: Check M1 matrix driver (fixture test)
+        if: matrix.shard == 1
         run: bash scripts/tests/m1-matrix.test.sh
       # M1-11 / CTX-0576: the committed parser-throughput baseline guards the
       # compatibility-milestone performance requirement (no pathological
@@ -206,18 +261,22 @@ jobs:
       # is deliberately generous so shared runners do not flake. Executes in
       # the pinned external bitty-perf checkout (W-105 thin gate).
       - name: Check parser throughput regression (M1-11 baseline)
+        if: matrix.shard == 2
         working-directory: external/bitty-perf
         run: cargo test --test parser_throughput_regression --locked
 
       # W-105: the external compat-lab suite vendors product test/scenario
       # snapshots (fixtures/); this fails when they drift from this workspace.
       - name: Check compat fixture freshness
+        if: matrix.shard == 1
         run: bash scripts/check-compat-fixture-freshness.sh --lab-dir external/bitty-compat-lab
 
       - name: Check compat fixture gate (fixture test)
+        if: matrix.shard == 1
         run: bash scripts/tests/check-compat-fixture-freshness.test.sh
 
       - name: Check status drift gate (OQ/RFC/crate-count/submodule)
+        if: matrix.shard == 1
         run: |
           bash scripts/check-status-drift.sh
           bash scripts/tests/check-status-drift.test.sh
@@ -229,6 +288,7 @@ jobs:
       # CTX-0697: deny rustc warnings on the workspace build so new build
       # warnings fail CI going forward (clippy already runs with -D warnings).
       - name: Check runtime dependency declarations (ldd/readelf gate)
+        if: matrix.shard == 1
         env:
           RUSTFLAGS: "-D warnings"
         run: |
@@ -240,15 +300,23 @@ jobs:
       # (package discovery, install command, --version/doctor/headless smoke)
       # without starting a container; the release workflow runs the real legs.
       - name: Check install smoke driver (fixture test)
+        if: matrix.shard == 1
         run: bash scripts/tests/install-smoke.test.sh
 
       - name: Lint GitHub Actions workflows
+        if: matrix.shard == 1
         run: >-
           docker run --rm
           --volume "${GITHUB_WORKSPACE}:/repo"
           --workdir /repo
           docker.io/rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
           -color
+
+      # CTX-0971 R4: per-shard sccache hit-rate for the expected-savings
+      # table (remote CI is the measurement; no live timing run locally).
+      - name: Show sccache stats (shard ${{ matrix.shard }}/2)
+        if: always()
+        run: ${SCCACHE_PATH} --show-stats
 
   msrv:
     name: MSRV 1.85 check
@@ -310,14 +378,23 @@ jobs:
     name: Linux X11 (xvfb)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # CTX-0971 R4: sccache shares dep units with quality/linux-wayland via
+    # the same Cargo.lock-scoped GHA namespace (see quality job comment).
     env:
       DISPLAY: :99
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
       # W-105: compat-lab suites run from this pinned checkout (see the
       # validation-pins steps below); runtime M1 suites run in-workspace.
       BITTY_COMPAT_LAB_DIR: external/bitty-compat-lab
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # CTX-0971 R4: same Cargo.lock-scoped sccache namespace as quality so
+      # the three ubuntu jobs share dep units.
+      - name: Scope sccache namespace to Cargo.lock hash
+        run: echo "SCCACHE_GHA_VERSION=v1-$(sha256sum Cargo.lock | cut -d ' ' -f1)" >> "$GITHUB_ENV"
 
       - name: Resolve validation pins
         id: validation-pins
@@ -384,6 +461,10 @@ jobs:
         with:
           toolchain: ${{ steps.rust-channel.outputs.channel }}
           components: clippy
+
+      # CTX-0971 R4: sccache on the GHA backend alongside rust-cache below.
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
 
       # HK-07: compilation cache on the managed Cache backend. Scoped to
       # OS + toolchain (+ job, Cargo.lock, and rustc hashes appended by the
@@ -457,19 +538,33 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      # CTX-0971 R4: sccache hit-rate for the expected-savings table.
+      - name: Show sccache stats (linux-x11)
+        if: always()
+        run: ${SCCACHE_PATH} --show-stats
+
   linux-wayland:
     name: Linux Wayland
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # CTX-0971 R4: sccache shares dep units with quality/linux-x11 via
+    # the same Cargo.lock-scoped GHA namespace (see quality job comment).
     env:
       WAYLAND_DISPLAY: wayland-0
       XDG_SESSION_TYPE: wayland
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
       # W-105: compat-lab suites run from this pinned checkout (see the
       # validation-pins steps below); runtime M1 suites run in-workspace.
       BITTY_COMPAT_LAB_DIR: external/bitty-compat-lab
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # CTX-0971 R4: same Cargo.lock-scoped sccache namespace as quality so
+      # the three ubuntu jobs share dep units.
+      - name: Scope sccache namespace to Cargo.lock hash
+        run: echo "SCCACHE_GHA_VERSION=v1-$(sha256sum Cargo.lock | cut -d ' ' -f1)" >> "$GITHUB_ENV"
 
       - name: Resolve validation pins
         id: validation-pins
@@ -536,6 +631,10 @@ jobs:
           toolchain: ${{ steps.rust-channel.outputs.channel }}
           components: clippy
 
+      # CTX-0971 R4: sccache on the GHA backend alongside rust-cache below.
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+
       # HK-07: compilation cache on the managed Cache backend. Scoped to
       # OS + toolchain (+ job, Cargo.lock, and rustc hashes appended by the
       # action) with prefix fallback on restore. Raw target/ stays out of
@@ -600,6 +699,11 @@ jobs:
           path: compat-results/linux-wayland*
           if-no-files-found: error
           retention-days: 7
+
+      # CTX-0971 R4: sccache hit-rate for the expected-savings table.
+      - name: Show sccache stats (linux-wayland)
+        if: always()
+        run: ${SCCACHE_PATH} --show-stats
 
   macos:
     name: macOS ARM64 check and test

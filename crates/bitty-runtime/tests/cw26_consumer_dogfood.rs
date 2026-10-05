@@ -15,8 +15,10 @@
 //! - workspace consumer: `workspace_manifest` carries the canonical
 //!   `workspaceline` claim through the public PluginHost path
 //!   (`declare -> resolve -> register -> GrantRecord -> activate`)
-//! - workspaceline presentation: `Runtime::workspaceline_text` reflects
+//! - workspace queries: `workspace_names`/`active_workspace_index` reflect
 //!   workspace lifecycle, plus `create_workspace_panel` via the public path
+//!   (CTX-0979: Core draws no display; presentation belongs to the bar
+//!   plugin)
 //! - bounded `DropOldest` event bus shared across several panels
 //!   (`64` per-sub / `8192` global, `8 KiB` payload, `32` / `8 KiB` batch)
 //! - safe-mode parity: safe `Runtime` rejects `bitty-terminal.*` without
@@ -90,11 +92,16 @@ fn workspace_consumer_workspaceline_claim_via_public_host_path() {
 }
 
 #[test]
-fn workspaceline_text_reflects_workspace_lifecycle() {
+fn workspace_queries_reflect_workspace_lifecycle() {
     let mut rt = Runtime::with_defaults().expect("runtime must build");
-    assert_eq!(rt.workspaceline_text(), "1:ws1* (1)");
+    assert_eq!(rt.workspace_names(), vec![String::from("ws1")]);
+    assert_eq!(rt.active_workspace_index(), 0);
     rt.workspace_new().expect("second workspace");
-    assert_eq!(rt.workspaceline_text(), "1:ws1 2:ws2* (2)");
+    assert_eq!(
+        rt.workspace_names(),
+        vec![String::from("ws1"), String::from("ws2")]
+    );
+    assert_eq!(rt.active_workspace_index(), 1);
 }
 
 #[test]

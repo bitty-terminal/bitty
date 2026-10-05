@@ -1283,10 +1283,10 @@ impl Runtime {
     }
 
     /// Sets the window grid directly (cell coordinates). The layout
-    /// container is derived from it minus the Core-owned chrome band
-    /// (CTX-0873), exactly as `handle_resize` derives it from the physical
-    /// extent; this setter exists for headless tests that drive layout
-    /// without a physical surface.
+    /// container is derived from it with no Core workspace bar reserved
+    /// (CTX-0979; CTX-0873 origin), exactly as `handle_resize` derives it
+    /// from the physical extent; this setter exists for headless tests
+    /// that drive layout without a physical surface.
     ///
     /// It does not reflow leaves, grids, or PTYs: callers that need the
     /// layout tree resized call [`Self::reflow_layout`] afterwards (the
@@ -1300,30 +1300,32 @@ impl Runtime {
 
     /// Alias of [`Self::set_window_cells`], kept for existing callers.
     ///
-    /// CTX-0873 changed its meaning: `rect` is now the full **window** grid
-    /// and the layout container is derived from it minus the chrome band,
-    /// so with a reserved workspace bar [`Self::container`] reads one band
-    /// smaller than `rect`. Same no-reflow contract as the new name.
+    /// CTX-0873 changed its meaning and CTX-0979 removed the Core bar:
+    /// `rect` is now the full **window** grid and the layout container is
+    /// derived from it with no Core workspace bar reserved, so with no
+    /// plugin bands [`Self::container`] equals `rect`. Same no-reflow
+    /// contract as the new name.
     #[doc(alias = "set_window_cells")]
     pub fn set_container(&mut self, rect: UiRect) {
         self.set_window_cells(rect);
     }
 
-    /// Full window grid in cells (CTX-0873): the layout [`Self::container`]
-    /// plus any reserved chrome band.
+    /// Full window grid in cells (CTX-0873, CTX-0979): no Core workspace
+    /// bar is reserved, so this equals the layout [`Self::container`]
+    /// plus any plugin-band exclusive zone.
     #[must_use]
     pub fn window_cells(&self) -> UiRect {
         self.window_cells
     }
 
-    /// Effective minimum container rows before any band may be reserved
-    /// (CTX-0873, CTX-0946 C3).
+    /// Effective minimum container rows before any plugin band may be
+    /// reserved (CTX-0873, CTX-0946 C3, CTX-0979: no Core bar exists).
     ///
     /// The [`MIN_CONTENT_ROWS`](super::chrome_band::MIN_CONTENT_ROWS)
     /// content floor plus both outer cell gaps plus the vertical decoration
-    /// ring in live rows, so a reserved band never leaves a leaf with zero
-    /// content rows. Shared by the Core-bar solve and the plugin-band
-    /// exclusive-zone budget so both degrade against one floor.
+    /// ring in live rows, so a plugin band never leaves a leaf with zero
+    /// content rows. Budgets the plugin-band exclusive zone against one
+    /// floor.
     pub(super) fn chrome_min_rows(&self) -> u16 {
         // Effective floor: content rows plus both outer cell gaps plus the
         // vertical decoration ring (both sides, live DPI) in live rows, so a
@@ -1339,33 +1341,25 @@ impl Runtime {
         )
     }
 
-    /// Solved chrome geometry for the current window grid (CTX-0873,
-    /// CTX-0956).
-    ///
-    /// The Core workspace bar is retired (W-104: the `bar` plugin owns
-    /// workspace/status UX), so Core reserves zero rows here — `present`
-    /// is always `false` and `bar` is always `None`. The solve stays as
-    /// the single geometry seam behind [`Runtime::status_bar_band`], and
-    /// plugin bands reflow through the exclusive-zone budget in
-    /// [`Runtime::band_exclusive_container`].
+    /// CTX-0979: Core draws no workspace display (Hyprland-style), so no
+    /// Core bar band is ever reserved. The layout container starts from the
+    /// full window grid; plugin bands carve their exclusive zone out of it
+    /// via `band_exclusive_container`. Kept as a constructor-free helper
+    /// for geometry callers that previously read the Core solve.
     pub(super) fn chrome_layout(&self) -> chrome_band::ChromeLayout {
-        chrome_band::solve(
-            self.window_cells,
-            self.workspace_bar_edge,
-            0,
-            false,
-            self.chrome_min_rows(),
-        )
+        chrome_band::ChromeLayout {
+            container: self.window_cells,
+            bar: None,
+        }
     }
 
-    /// Re-derives the container from the chrome band and the budgeted plugin
-    /// bands, and, when it moved, reflows leaves, the primary grid + PTY,
-    /// and every pane session through the normal geometry sync
-    /// (CTX-0873, CTX-0946 C3).
+    /// Re-derives the container from the budgeted plugin bands, and when
+    /// it moved, reflows leaves, the primary grid + PTY, and every pane
+    /// session through the normal geometry sync (CTX-0873, CTX-0946 C3,
+    /// CTX-0979: no Core bar is reserved).
     ///
-    /// Called by every funnel that can change bar presence or placement
-    /// (visibility toggle, workspace count crossing one, edge change,
-    /// session restore) and once per tick as a safety net. Idempotent: an
+    /// Called by every funnel that can change plugin-band presence or
+    /// placement and once per tick as a safety net. Idempotent: an
     /// unchanged container touches nothing. Returns whether it reflowed.
     pub(super) fn refresh_chrome_band(&mut self) -> bool {
         let container = self.band_exclusive_container();

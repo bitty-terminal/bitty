@@ -473,14 +473,10 @@ fn driver_open_acquires_overlay_through_real_plugin() {
         Some(String::from("ALREADY_OPEN")),
         "second open must fail closed ({provenance})"
     );
-    // The retained Core session stays closed while the plugin owns the UX:
-    // this harness never opens it, and the routing guard (covered by the
-    // existing composer_cutover suites) keeps the tiers disjoint.
-    let rt = bitty_runtime::Runtime::with_defaults().expect("runtime builds");
-    assert!(
-        !rt.cw_composer_is_open(),
-        "fresh headless runtime holds no Core session"
-    );
+    // The retained Core session is deleted (E-CUT, CTX-0968): no session
+    // exists to stay closed, so absence is structural (this file no longer
+    // references any Core composer-session API). Tier disjointness is
+    // covered by the composer_cutover suites.
 }
 
 // ---------------------------------------------------------------------------
@@ -777,12 +773,12 @@ fn driver_editor_round_trip_installs_bounded_content() {
 
     // Linking: the real Core allowlist denies hostile programs before any
     // side effect (same rule the host enforces for the real round trip).
-    let hostile = bitty_rich::composer::resolve_editor(Some("evil --flag"), None);
+    let hostile = bitty_rich::host::resolve_editor(Some("evil --flag"), None);
     assert!(
         hostile.is_err(),
         "hostile editor must be denied before side effects"
     );
-    let missing = bitty_rich::composer::resolve_editor(Some(""), None);
+    let missing = bitty_rich::host::resolve_editor(Some(""), None);
     assert!(
         missing.is_err(),
         "missing editor must be denied before side effects"
@@ -931,21 +927,15 @@ fn driver_uninstall_restores_retained_ux() {
     );
     assert!(runtime.host_owns_command(&format!("{id_str}:open")));
     // Uninstall: point a fresh runtime at an empty root (the store record is
-    // gone). Discovery finds nothing, so the retained Core path applies and
-    // the exact pre-plugin behavior still opens.
+    // gone). Discovery finds nothing, so no editing UX exists: the retained
+    // Core session is deleted (E-CUT, CTX-0968) and the app-level retained
+    // path is fail-closed with a diagnostic, never a session.
     let empty = ScratchRoot::new("uninstall-empty");
     let mut after = runtime_for(vec![empty.path().to_path_buf()], false);
     assert!(after.discover().is_empty(), "empty root discovers nothing");
     assert!(
         after.state(&id).is_none(),
         "uninstalled plugin has no state"
-    );
-    let mut rt = bitty_runtime::Runtime::with_defaults().expect("runtime builds");
-    assert!(!rt.cw_composer_is_open());
-    rt.cw_composer_open();
-    assert!(
-        rt.cw_composer_is_open(),
-        "retained Core composer opens after uninstall"
     );
 }
 
@@ -993,10 +983,8 @@ fn driver_safe_mode_skips_vm() {
         Some(bitty_runtime::plugin_runtime::LifecycleState::Active)
     ));
     assert!(!runtime.host_owns_command(&format!("{id_str}:open")));
-    // Retained UX is identical to before: the Core session opens.
-    let mut rt = bitty_runtime::Runtime::with_defaults().expect("runtime builds");
-    rt.cw_composer_open();
-    assert!(rt.cw_composer_is_open());
+    // Safe mode keeps no editing UX either: the retained Core session is
+    // deleted (E-CUT, CTX-0968), so neither tier opens anything.
 }
 
 // ---------------------------------------------------------------------------

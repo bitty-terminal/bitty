@@ -93,7 +93,9 @@ use crate::geometry::{ExtentPx, RectPx};
 use crate::glyph::{
     BitmapFormat, FontId, FontQuery, GlyphBitmap, GlyphMetrics, GlyphRasterizer, RasterKey,
 };
-use crate::shaped::{RunAttrs, ShapedCluster, SwashSingle, features_for_policy, form_runs_for_row};
+use crate::shaped::{
+    RunAttrs, ShapedCluster, SwashSingle, cells_for_range, features_for_policy, form_runs_for_row,
+};
 
 /// Straight-alpha RGBA color, `[r, g, b, a]` bytes.
 pub type Rgba8 = [u8; 4];
@@ -2749,6 +2751,13 @@ impl GridRenderer<FallbackRasterizer<SwashSingle>> {
     /// already-painted cell span. Trailing cells of a ligature span paint
     /// background only (no spacer-flag changes).
     ///
+    /// Phase C hardening (issue #1666): row backgrounds repaint the union
+    /// of emitted cluster spans (wide spans crossing the dirty edge never
+    /// overpaint stale texels); glyphs sharing one shaper byte offset emit
+    /// as a group over their full cluster text; GPOS mark shifts apply to
+    /// glyph destinations; invisible-attribute runs emit no glyph, tofu,
+    /// or fallback — backgrounds only.
+    ///
     /// # Errors
     ///
     /// Propagates rasterizer failures; a single bad run degrades that
@@ -2842,11 +2851,36 @@ impl GridRenderer<FallbackRasterizer<SwashSingle>> {
                 let Some(row_cells) = snapshot.cells.get(row_start..row_end) else {
                     continue;
                 };
-                // Backgrounds + decorations for dirty cells first (same
-                // merging discipline as the unshaped path; glyphs come
-                // from shaped clusters below, never per-cell).
+                // Full-row runs keep ligatures intact across dirty edges;
+                // only clusters intersecting the dirty range emit. Emission
+                // runs first so the background pass learns each row's
+                // emitted union (Phase C partial-damage hardening): a wide
+                // span crossing the dirty edge repaints its full background
+                // instead of overpainting stale texels.
+                let runs = form_runs_for_row(row_cells, 0);
+                let mut row_emitted: Vec<(usize, usize)> = Vec::new();
+                for run in &runs {
+                    row_emitted.extend(self.emit_shaped_run(
+                        snapshot,
+                        row,
+                        run,
+                        &col_range,
+                        cursor_cell,
+                        policy,
+                        &effective,
+                        &mut pass,
+                    )?);
+                }
+                // Backgrounds + decorations over dirty ∪ emitted-union in
+                // one ordered pass (same merging discipline as the unshaped
+                // path; glyphs already sit in `pass.glyphs`, fills compose
+                // underneath regardless of push order).
+                let paint_range = match union_span(&row_emitted) {
+                    Some((start, end)) => col_range.start.min(start)..col_range.end.max(end),
+                    None => col_range.clone(),
+                };
                 let mut background_run = BackgroundRun::default();
-                for col in col_range.clone() {
+                for col in paint_range {
                     let Some(term_cell) = row_cells.get(col) else {
                         continue;
                     };
@@ -2858,21 +2892,6 @@ impl GridRenderer<FallbackRasterizer<SwashSingle>> {
                         &mut pass,
                         &mut background_run,
                     );
-                }
-                // Full-row runs keep ligatures intact across dirty edges;
-                // only clusters intersecting the dirty range emit.
-                let runs = form_runs_for_row(row_cells, 0);
-                for run in runs {
-                    self.emit_shaped_run(
-                        snapshot,
-                        row,
-                        &run,
-                        &col_range,
-                        cursor_cell,
-                        policy,
-                        &effective,
-                        &mut pass,
-                    )?;
                 }
             }
         }
@@ -2943,6 +2962,14 @@ impl GridRenderer<FallbackRasterizer<SwashSingle>> {
     }
 
     /// Shapes one run and emits its clusters intersecting `dirty_cols`.
+    ///
+    /// Returns the emitted column spans for this run (Phase C): the caller
+    /// widens the row background repaint to their union so wide spans
+    /// crossing the dirty edge never overpaint stale texels. Concealed
+    /// (invisible-attribute) runs report their span without emitting any
+    /// glyph, tofu, or unshaped fallback — backgrounds stay painted, truth
+    /// stays readable via copy/search, and no concealed scalar reaches a
+    /// glyph instance.
     #[allow(clippy::too_many_arguments)]
     fn emit_shaped_run(
         &mut self,
@@ -2954,12 +2981,18 @@ impl GridRenderer<FallbackRasterizer<SwashSingle>> {
         policy: bitty_config::types::LigaturePolicy,
         effective: &[bitty_config::types::OpenTypeFeature],
         list: &mut DrawList,
-    ) -> Result<(), RenderError> {
+    ) -> Result<Vec<(usize, usize)>, RenderError> {
         use bitty_config::types::LigaturePolicy;
         // Chain + size from the live renderer (single font, single size).
         let chain: Vec<FontId> = self.cache.rasterizer().fonts().to_vec();
         if chain.is_empty() {
             return Err(RenderError::UnknownFontHandle);
+        }
+        // Concealed runs never reach the shaper output: backgrounds are
+        // painted by the caller, glyph emission stops here (all variants —
+        // shaped, tofu, and unshaped fallback alike).
+        if shaped_run_is_invisible(snapshot, row, snapshot.width, run) {
+            return Ok(vec![(run.start_col, run.col_count)]);
         }
         let attrs = RunAttrs {
             features: effective.to_vec(),
@@ -2977,7 +3010,7 @@ impl GridRenderer<FallbackRasterizer<SwashSingle>> {
             Err(_) => {
                 let fg = self.shaped_run_fg(snapshot, row, snapshot.width, run);
                 self.emit_unshaped_slice(&run.text, row, run.start_col, fg, list);
-                return Ok(());
+                return Ok(vec![(run.start_col, run.col_count)]);
             }
         };
         // Cursor un-shaping: when policy is `Cursor` and the visible
@@ -3042,25 +3075,46 @@ impl GridRenderer<FallbackRasterizer<SwashSingle>> {
             singles[singles.len() / 2]
         };
         let cols = snapshot.width;
-        for (idx, cluster) in clusters_ref.iter().enumerate() {
-            let (start, count) = cluster.cells;
-            let abs_start = run.start_col + start;
+        let mut emitted: Vec<(usize, usize)> = Vec::new();
+        // Grouped emission (Phase C): consecutive glyphs sharing one
+        // shaper byte offset (base + mark) emit as one group sharing the
+        // full cluster text. Slicing at the next *entry* would hand the
+        // first glyph an empty slice (vacuous CJK gate) and the second the
+        // whole text (a later gate failure then emits only part of the
+        // cluster) — grouping keeps the gate and the fallback whole.
+        let mut idx = 0usize;
+        while idx < clusters_ref.len() {
+            let first = &clusters_ref[idx];
+            let group_offset = first.byte_offset;
+            let mut group_end = idx + 1;
+            while group_end < clusters_ref.len()
+                && clusters_ref[group_end].byte_offset == group_offset
+            {
+                group_end += 1;
+            }
+            let group = &clusters_ref[idx..group_end];
+            let byte_end = cluster_group_end(clusters_ref, idx, run.text.len());
+            let slice = run.text.get(group_offset..byte_end).unwrap_or("");
+            // Group span from grid truth (the empty-slice member's stored
+            // count is a 1-cell placeholder, never authoritative).
+            let count = cells_for_range(slice).max(1);
+            let abs_start = run.start_col + first.cells.0;
             let abs_end = abs_start + count;
             let dirty_start = dirty_cols.start.max(run.start_col);
             let dirty_end = dirty_cols.end.min(run.start_col + run.col_count);
             if abs_end <= dirty_start || abs_start >= dirty_end {
+                idx = group_end;
                 continue;
             }
+            emitted.push((abs_start, count));
             // Resolve the run fg for this run (runs group identical
             // style, so the first covered cell names it).
             let fg = self.shaped_run_fg(snapshot, row, cols, run);
-            // Cluster text slice for the CJK gate + unshaped fallback.
-            let byte_end = clusters_ref
-                .get(idx + 1)
-                .map(|next| next.byte_offset)
-                .unwrap_or(run.text.len());
-            let slice = run.text.get(cluster.byte_offset..byte_end).unwrap_or("");
-            if cluster.uncovered {
+            // Coverage is per glyph: when no group member is drawable
+            // the leading position names one tofu box for the whole span,
+            // while a covered base still emits when only a trailing mark
+            // is missing (never a silent blank, never a partial split).
+            if group.iter().all(|c| c.uncovered) {
                 self.emit_missing_glyph(
                     row,
                     abs_start,
@@ -3068,23 +3122,27 @@ impl GridRenderer<FallbackRasterizer<SwashSingle>> {
                     fg,
                     list,
                 );
+                idx = group_end;
                 continue;
             }
-            if !SwashSingle::is_cjk_advance_aligned(
-                slice,
-                count,
-                cluster.x_advance_px,
-                single_advance,
-            ) {
+            let group_advance: f32 = group.iter().map(|c| c.x_advance_px).sum();
+            if !SwashSingle::is_cjk_advance_aligned(slice, count, group_advance, single_advance) {
                 self.counters.shaping_misaligned += 1;
                 self.cache.rasterizer_mut().inner_mut().note_misaligned();
-                // Degrade to per-cell unshaped rendering for this cluster.
+                // Degrade to per-cell unshaped rendering for this group.
                 self.emit_unshaped_slice(slice, row, abs_start, fg, list);
+                idx = group_end;
                 continue;
             }
-            self.emit_shaped_cluster(cluster, effective, row, abs_start, count, fg, list)?;
+            for member in group {
+                if member.uncovered {
+                    continue;
+                }
+                self.emit_shaped_cluster(member, effective, row, abs_start, count, fg, list)?;
+            }
+            idx = group_end;
         }
-        Ok(())
+        Ok(emitted)
     }
 
     /// Resolves the foreground tint for a shaped run (first cell's style).
@@ -3138,7 +3196,10 @@ impl GridRenderer<FallbackRasterizer<SwashSingle>> {
             features,
         );
         let source = self.atlas.ensure_shaped(shaped_key, &bitmap);
-        let dest_x = abs_col as i64 * i64::from(self.cell.width) + i64::from(metrics.left);
+        // Grid origin plus bearing plus the shaper's GPOS horizontal
+        // offset (Phase C): combining marks shaped as separate glyphs
+        // carry their mark shift in `x_offset_px`, previously dropped.
+        let dest_x = shaped_dest_x(abs_col, self.cell.width, metrics.left, cluster.x_offset_px);
         let baseline = row as i64 * i64::from(self.cell.height) + self.baseline_offset;
         let dest_y = baseline - i64::from(metrics.top);
         let instance = match source {
@@ -3192,6 +3253,75 @@ impl GridRenderer<FallbackRasterizer<SwashSingle>> {
             col += width;
         }
     }
+}
+
+/// Destination x for one shaped glyph instance (Phase C hardening).
+///
+/// Grid origin plus bearing plus the shaper's GPOS horizontal offset
+/// (`ShapedCluster::x_offset_px` — combining-mark shifts), rounded to
+/// whole pixels. Offsets may be negative (leftward mark shift); the caller
+/// clamps into `i32` range. The shaper derives the offset from integer
+/// positions, so it is always finite; the float-to-int cast saturates
+/// rather than panics on hostile input.
+fn shaped_dest_x(abs_col: usize, cell_width: u32, left_bearing: i32, x_offset_px: f32) -> i64 {
+    abs_col as i64 * i64::from(cell_width) + i64::from(left_bearing) + x_offset_px.round() as i64
+}
+
+/// End byte of the cluster group starting at `idx`: the next *distinct*
+/// byte offset in the cluster list, or `run_len` for the trailing group
+/// (Phase C grouping).
+///
+/// The shaper may emit several glyphs for one cluster (base + mark share
+/// one byte offset). Slicing a member at the next *entry* hands a
+/// same-offset follower an empty slice; slicing at the next *distinct*
+/// offset gives the whole group its full text for the CJK gate and the
+/// unshaped fallback. Only strictly-greater offsets qualify, so
+/// non-monotonic shaper output degrades to a wider (never panicking)
+/// slice via [`str::get`].
+fn cluster_group_end(clusters: &[ShapedCluster], idx: usize, run_len: usize) -> usize {
+    let start = clusters.get(idx).map_or(run_len, |c| c.byte_offset);
+    clusters
+        .get(idx + 1..)
+        .and_then(|tail| tail.iter().map(|c| c.byte_offset).find(|&off| off > start))
+        .unwrap_or(run_len)
+}
+
+/// Union of emitted column spans on one row (Phase C partial-damage).
+///
+/// Returns the minimal `(start, end)` covering every span, or `None` when
+/// nothing emitted. The background pass repaints this union so a wide span
+/// crossing the dirty edge never overpaints stale texels.
+fn union_span(spans: &[(usize, usize)]) -> Option<(usize, usize)> {
+    let mut start = usize::MAX;
+    let mut end = 0usize;
+    for &(span_start, len) in spans {
+        start = start.min(span_start);
+        end = end.max(span_start.saturating_add(len));
+    }
+    if start == usize::MAX {
+        None
+    } else {
+        Some((start, end))
+    }
+}
+
+/// True when a shaped run's first cell carries the invisible attribute
+/// (Phase C concealment hardening).
+///
+/// Runs group identical styles, so the first cell names the whole run.
+/// Concealed runs paint backgrounds only: no shaped glyph, no tofu box,
+/// and no unshaped fallback may expose their scalars.
+fn shaped_run_is_invisible(
+    snapshot: &Snapshot,
+    row: usize,
+    cols: usize,
+    run: &crate::shaped::ShapedRun,
+) -> bool {
+    let idx = row.saturating_mul(cols).saturating_add(run.start_col);
+    snapshot
+        .cells
+        .get(idx)
+        .is_some_and(|cell| cell.style.attributes.invisible)
 }
 
 /// Converts a pixel span back to the half-open range of cells it covers.

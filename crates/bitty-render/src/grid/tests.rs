@@ -2214,3 +2214,79 @@ fn render_maintains_single_epoch_under_eviction() {
     assert_eq!(list.atlas_epoch, grid.atlas_epoch());
     assert!(list.is_atlas_epoch_valid(grid.atlas_epoch()));
 }
+
+// ---------------------------------------------------------------------------
+// Phase C hardening unit tests (CTX-0959, issue #1666): pure helpers for the
+// shaped emission path. No fonts needed — all cases are deterministic.
+// ---------------------------------------------------------------------------
+
+use super::{cluster_group_end, shaped_dest_x, union_span};
+use crate::shaped::ShapedCluster;
+
+fn phase_c_cluster(byte_offset: usize, col: usize, count: usize) -> ShapedCluster {
+    ShapedCluster {
+        cells: (col, count),
+        glyph_id: 7,
+        face: FontId::next(&mut 0),
+        x_advance_px: 10.0,
+        x_offset_px: 0.0,
+        uncovered: false,
+        byte_offset,
+    }
+}
+
+#[test]
+fn shaped_dest_x_applies_gpos_offset() {
+    // Plain origin + bearing, no mark shift.
+    assert_eq!(shaped_dest_x(3, 10, 1, 0.0), 31);
+    // Positive GPOS shift rounds to whole pixels.
+    assert_eq!(shaped_dest_x(3, 10, 1, 1.6), 33);
+    assert_eq!(shaped_dest_x(3, 10, 1, 1.4), 32);
+    // Negative shifts (leftward marks) and negative bearings hold.
+    assert_eq!(shaped_dest_x(3, 10, 1, -1.6), 29);
+    assert_eq!(shaped_dest_x(0, 10, -2, -1.0), -3);
+    // NaN degrades to zero through the saturating cast, never a panic.
+    assert_eq!(shaped_dest_x(2, 10, 1, f32::NAN), 21);
+}
+
+#[test]
+fn cluster_group_end_uses_next_distinct_offset() {
+    // One glyph per cluster: each group ends at the next offset.
+    let solo = vec![
+        phase_c_cluster(0, 0, 1),
+        phase_c_cluster(1, 1, 1),
+        phase_c_cluster(2, 2, 1),
+    ];
+    assert_eq!(cluster_group_end(&solo, 0, 3), 1);
+    assert_eq!(cluster_group_end(&solo, 2, 3), 3);
+    // Base + mark sharing offset 1: the group ending at 0 spans to 3.
+    let grouped = vec![
+        phase_c_cluster(0, 0, 1),
+        phase_c_cluster(1, 1, 1),
+        phase_c_cluster(1, 1, 1),
+        phase_c_cluster(3, 2, 1),
+    ];
+    assert_eq!(cluster_group_end(&grouped, 0, 4), 1);
+    assert_eq!(cluster_group_end(&grouped, 1, 4), 3);
+    assert_eq!(cluster_group_end(&grouped, 2, 4), 3);
+    assert_eq!(cluster_group_end(&grouped, 3, 4), 4);
+    // Trailing group ends at the run length.
+    assert_eq!(cluster_group_end(&solo, 2, 99), 99);
+    // Non-monotonic shaper output degrades to a wider slice, never a panic.
+    let ragged = vec![phase_c_cluster(0, 0, 1), phase_c_cluster(5, 1, 1)];
+    assert_eq!(cluster_group_end(&ragged, 0, 6), 5);
+    assert_eq!(cluster_group_end(&ragged, 1, 6), 6);
+    // Empty list and out-of-range index read as the run length.
+    assert_eq!(cluster_group_end(&[], 0, 7), 7);
+    assert_eq!(cluster_group_end(&solo, 9, 7), 7);
+}
+
+#[test]
+fn union_span_covers_emitted_spans() {
+    assert_eq!(union_span(&[]), None);
+    assert_eq!(union_span(&[(2, 3)]), Some((2, 5)));
+    // Overlapping and disjoint spans merge to one minimal range.
+    assert_eq!(union_span(&[(0, 2), (1, 2), (7, 1)]), Some((0, 8)));
+    // Adjacent spans join; zero-length spans still name their position.
+    assert_eq!(union_span(&[(4, 0), (4, 2)]), Some((4, 6)));
+}

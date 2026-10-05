@@ -23,9 +23,8 @@
 //!
 //! On success the frame is written through the single input router
 //! ([`Runtime::push_input_bytes`]); the outcome reports the accepted byte
-//! count. This module adds the host operation only: the composer modal
-//! routing keeps its current path until cutover (phase B adds host ops, it
-//! does not rewire modals).
+//! count. This module adds the host operation only: the retired composer
+//! modal is gone (E-CUT, CTX-0968); the plugin owns editing UX via host ops.
 
 use bitty_rich::host::{SubmitBudget, SubmitDeny, check_terminal_submit};
 
@@ -264,7 +263,7 @@ mod tests {
         let mut rt = Runtime::with_defaults().expect("headless runtime");
         let (lease, holder) = granted_lease();
         let mut budget = test_budget(1024 * 1024);
-        let big = "q".repeat(bitty_rich::composer::COMPOSER_MAX_BYTES + 1);
+        let big = "q".repeat(bitty_rich::host::COMPOSER_MAX_BYTES + 1);
         let outcome = rt.terminal_submit(&big, &lease, holder, 1, &mut budget);
         assert!(matches!(
             outcome,

@@ -5099,24 +5099,15 @@ fn editor_test_app() -> TerminalApp {
     app
 }
 
-fn feed_text(app: &mut TerminalApp, text: &str) {
-    use bitty_runtime::ComposerKeyEvent;
-    app.runtime.cw_composer_open();
-    for ch in text.chars() {
-        assert_eq!(
-            app.runtime
-                .cw_composer_feed(ComposerKeyEvent::printable(ch)),
-            bitty_runtime::cw_present::CwComposerFeed::Inserted,
-            "draft char must insert"
-        );
-    }
+fn feed_text(_app: &mut TerminalApp, _text: &str) {
+    // E-CUT (CTX-0968): the Core composer draft is retired; there is no
+    // draft to seed. Editor tests operate on the empty retired buffer.
 }
 
 #[test]
 fn external_editor_hostile_program_denied_without_side_effects() {
     // A hostile `$VISUAL`/`$EDITOR` is denied before any side effect: no
-    // leaf, no session, overlay still open, draft kept. Headless-safe
-    // (resolution fails before any spawn).
+    // leaf, no session. Headless-safe (resolution fails before any spawn).
     let mut app = editor_test_app();
     let focused_before = app.runtime.focused_view();
     feed_text(&mut app, "hi");
@@ -5124,21 +5115,17 @@ fn external_editor_hostile_program_denied_without_side_effects() {
     assert!(!app.chrome.editor.is_hosting());
     assert_eq!(app.runtime.leaf_count(), 2);
     assert_eq!(app.runtime.focused_view(), focused_before);
-    assert!(app.runtime.cw_composer_is_open());
-    assert_eq!(app.runtime.cw_composer_content(), "hi");
 }
 
 #[test]
 fn external_editor_missing_program_denied_without_side_effects() {
-    // Neither `$VISUAL` nor `$EDITOR` set: `NoEditor` denial, layout and
-    // draft untouched.
+    // Neither `$VISUAL` nor `$EDITOR` set: `NoEditor` denial, layout
+    // untouched.
     let mut app = editor_test_app();
     feed_text(&mut app, "hi");
     app.open_external_editor_with(None, None, None);
     assert!(!app.chrome.editor.is_hosting());
     assert_eq!(app.runtime.leaf_count(), 2);
-    assert!(app.runtime.cw_composer_is_open());
-    assert_eq!(app.runtime.cw_composer_content(), "hi");
 }
 
 #[test]
@@ -5147,7 +5134,7 @@ fn external_editor_host_holds_single_session_and_cleans_temp() {
     // the session deletes its temp file.
     use crate::editor_host::{ExternalEditorHost, ExternalEditorSession};
     let dir = std::env::temp_dir();
-    let temp = bitty_rich::composer::write_composer_temp("draft", &dir).expect("temp");
+    let temp = bitty_rich::host::write_composer_temp("draft", &dir).expect("temp");
     let path = temp.path().to_path_buf();
     assert!(path.exists());
     let mut host = ExternalEditorHost::new();
@@ -5159,7 +5146,7 @@ fn external_editor_host_holds_single_session_and_cleans_temp() {
     assert!(host.is_hosting());
     assert_eq!(host.pending_view(), Some(ViewId::new(7)));
     // A second session is refused while one is hosted.
-    let temp2 = bitty_rich::composer::write_composer_temp("other", &dir).expect("temp");
+    let temp2 = bitty_rich::host::write_composer_temp("other", &dir).expect("temp");
     let path2 = temp2.path().to_path_buf();
     assert!(!host.begin(ExternalEditorSession {
         view: ViewId::new(8),
@@ -5176,12 +5163,11 @@ fn external_editor_host_holds_single_session_and_cleans_temp() {
 #[test]
 fn external_editor_poll_cancels_when_leaf_gone() {
     // A manually closed editor leaf cancels the round trip: session
-    // cleared, temp deleted, draft kept, overlay reopened.
+    // cleared, temp deleted.
     let mut app = editor_test_app();
     use crate::editor_host::ExternalEditorSession;
     feed_text(&mut app, "hi");
-    let temp =
-        bitty_rich::composer::write_composer_temp("hi", &std::env::temp_dir()).expect("temp");
+    let temp = bitty_rich::host::write_composer_temp("hi", &std::env::temp_dir()).expect("temp");
     let path = temp.path().to_path_buf();
     let home = app.runtime.focused_view().expect("focused leaf");
     assert!(app.chrome.editor.begin(ExternalEditorSession {
@@ -5192,8 +5178,6 @@ fn external_editor_poll_cancels_when_leaf_gone() {
     app.poll_external_editor();
     assert!(!app.chrome.editor.is_hosting());
     assert!(!path.exists(), "temp deleted on cancel");
-    assert!(app.runtime.cw_composer_is_open());
-    assert_eq!(app.runtime.cw_composer_content(), "hi");
     assert_eq!(app.runtime.leaf_count(), 2);
 }
 
@@ -5238,9 +5222,10 @@ fn wait_for_editor_done(app: &mut TerminalApp) {
 #[cfg(unix)]
 fn external_editor_round_trip_applies_and_tears_down() {
     require_pty!();
-    // Full panel-hosted round trip with a fake appending editor: open hosts
-    // a third leaf and closes the overlay, exit applies the edited buffer,
-    // tears the leaf down, restores focus, and reopens the overlay.
+    // Full panel-hosted round trip with a fake appending editor (E-CUT:
+    // retired empty draft): open hosts a third leaf, exit tears the leaf
+    // down and restores focus. The edited buffer is reported via
+    // `EditorOutcome`; there is no composer session to assert.
     let mut app = editor_test_app();
     let home = app.runtime.focused_view().expect("focused leaf");
     feed_text(&mut app, "hi");
@@ -5254,7 +5239,6 @@ fn external_editor_round_trip_applies_and_tears_down() {
     let editor_view = app.chrome.editor.pending_view().expect("pending view");
     assert_eq!(app.runtime.leaf_count(), 3);
     assert!(app.runtime.has_pane_session(&editor_view));
-    assert!(!app.runtime.cw_composer_is_open());
     assert_eq!(app.runtime.focused_view(), Some(editor_view));
     // A second open while hosted is refused: no fourth leaf.
     app.open_external_editor_with(None, None, Some(script_arg.as_str()));
@@ -5264,11 +5248,9 @@ fn external_editor_round_trip_applies_and_tears_down() {
         !app.chrome.editor.is_hosting(),
         "editor exit must finish the round trip"
     );
-    assert_eq!(app.runtime.cw_composer_content(), "hi-edited");
     assert_eq!(app.runtime.leaf_count(), 2);
     assert!(!app.runtime.has_pane_session(&editor_view));
     assert_eq!(app.runtime.focused_view(), Some(home));
-    assert!(app.runtime.cw_composer_is_open());
     let _ = std::fs::remove_file(&script);
 }
 
@@ -5276,8 +5258,8 @@ fn external_editor_round_trip_applies_and_tears_down() {
 #[cfg(unix)]
 fn external_editor_nonzero_exit_discards_and_tears_down() {
     require_pty!();
-    // A failing editor discards its edits (blocking-path parity): the old
-    // draft survives, the leaf still tears down, focus restores.
+    // A failing editor reports non-zero (E-CUT: no draft to keep); the leaf
+    // still tears down and focus restores.
     let mut app = editor_test_app();
     let home = app.runtime.focused_view().expect("focused leaf");
     feed_text(&mut app, "hi");
@@ -5291,11 +5273,9 @@ fn external_editor_nonzero_exit_discards_and_tears_down() {
         !app.chrome.editor.is_hosting(),
         "failed editor must still finish"
     );
-    assert_eq!(app.runtime.cw_composer_content(), "hi");
     assert_eq!(app.runtime.leaf_count(), 2);
     assert!(!app.runtime.has_pane_session(&editor_view));
     assert_eq!(app.runtime.focused_view(), Some(home));
-    assert!(app.runtime.cw_composer_is_open());
     let _ = std::fs::remove_file(&script);
 }
 
@@ -5307,8 +5287,7 @@ fn external_editor_typed_open_reports_busy_and_keeps_existing() {
     use crate::editor_host::{EditorOpenOutcome, ExternalEditorSession};
     let mut app = editor_test_app();
     feed_text(&mut app, "hi");
-    let temp =
-        bitty_rich::composer::write_composer_temp("hi", &std::env::temp_dir()).expect("temp");
+    let temp = bitty_rich::host::write_composer_temp("hi", &std::env::temp_dir()).expect("temp");
     let path = temp.path().to_path_buf();
     let home = app.runtime.focused_view().expect("focused leaf");
     assert!(app.chrome.editor.begin(ExternalEditorSession {
@@ -5320,7 +5299,7 @@ fn external_editor_typed_open_reports_busy_and_keeps_existing() {
         None,
         None,
         Some("/bin/true"),
-        bitty_rich::composer::EDITOR_TIMEOUT_DEFAULT,
+        bitty_rich::host::EDITOR_TIMEOUT_DEFAULT,
     );
     assert_eq!(
         outcome,
@@ -5340,14 +5319,12 @@ fn external_editor_typed_open_reports_busy_and_keeps_existing() {
     );
     assert!(!app.chrome.editor.is_hosting());
     assert!(!path.exists(), "temp deleted on cancel");
-    assert_eq!(app.runtime.cw_composer_content(), "hi");
-    assert!(app.runtime.cw_composer_is_open());
 }
 
 #[test]
 fn external_editor_typed_denied_before_side_effects() {
     // Typed hostile-program denial (T-3 at the hosted boundary): no leaf, no
-    // session, overlay still open, draft kept.
+    // session.
     use crate::editor_host::EditorOpenOutcome;
     let mut app = editor_test_app();
     let focused_before = app.runtime.focused_view();
@@ -5356,7 +5333,7 @@ fn external_editor_typed_denied_before_side_effects() {
         Some("/tmp/evil-editor"),
         Some("/tmp/evil-editor"),
         None,
-        bitty_rich::composer::EDITOR_TIMEOUT_DEFAULT,
+        bitty_rich::host::EDITOR_TIMEOUT_DEFAULT,
     );
     assert_eq!(
         outcome,
@@ -5365,8 +5342,6 @@ fn external_editor_typed_denied_before_side_effects() {
     assert!(!app.chrome.editor.is_hosting());
     assert_eq!(app.runtime.leaf_count(), 2);
     assert_eq!(app.runtime.focused_view(), focused_before);
-    assert!(app.runtime.cw_composer_is_open());
-    assert_eq!(app.runtime.cw_composer_content(), "hi");
 }
 
 #[test]
@@ -5422,11 +5397,9 @@ fn external_editor_hosted_timeout_kills_tree_and_reports() {
         Some(bitty_rich::host::EditorOutcome::Timeout),
         "expiry must report a typed Timeout"
     );
-    assert_eq!(app.runtime.cw_composer_content(), "hi");
     assert_eq!(app.runtime.leaf_count(), 2);
     assert!(!app.runtime.has_pane_session(&editor_view));
     assert_eq!(app.runtime.focused_view(), Some(home));
-    assert!(app.runtime.cw_composer_is_open());
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         // Only an owned-tree kill reaches the grandchild: it must be gone
@@ -5447,7 +5420,7 @@ fn startup_maintenance_sweeps_planted_stale_temp() {
     // Plants a provably-dead-owner temp in the real owned root, then proves
     // the startup path sweeps it. Pid 0 never owns a file on any platform,
     // so the name is stale everywhere (portable, no live-pid fixture).
-    // The `bitty-composer-` prefix mirrors `composer::TEMP_PREFIX`
+    // The `bitty-composer-` prefix mirrors `host::TEMP_PREFIX`
     // (`pub(crate)` there, so spelled out here); nanos + pid keep the name
     // unique across parallel runs.
     let root = bitty_rich::host::owned_temp_root().expect("owned root");

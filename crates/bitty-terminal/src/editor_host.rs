@@ -1,12 +1,12 @@
-//! Panel-hosted external-editor session (CTX-0731, issue #982).
+//! Panel-hosted external-editor session (CTX-0731, issue #982; retired PTY-leaf path, E-CUT CTX-0968).
 //!
-//! [`ExternalEditorHost`] owns at most one pending `$EDITOR` round trip:
-//! opening resolves the allowlisted editor, snapshots the live composer
-//! draft into a `0600` temp file, hosts the editor as a plain PTY grid leaf
-//! (a `new_split`-shaped leaf plus
-//! [`Runtime::spawn_shell_for_view`](bitty_runtime::Runtime::spawn_shell_for_view)),
-//! and polling finishes the round trip once the child exits (bounded
-//! read-back, draft apply, leaf teardown, focus restore).
+//! [`ExternalEditorHost`] owns at most one pending `$EDITOR` round trip.
+//! The Core composer engine is retired: there is no live composer draft and
+//! no composer overlay to close/reopen. Retained behavior is fail-closed
+//! (diagnostic, no session) unless the caller supplies a draft via the host
+//! `process.editor` operation; the PTY-leaf flow below is kept only to tear
+//! down leaves safely and is otherwise retired. New editor work goes through
+//! the plugin-owned `process.editor` host operation.
 //!
 //! A hosted editor is an ordinary terminal leaf, not a non-terminal panel:
 //! it needs no compositor sub-surface or Scene path, so the OQ-051 placed
@@ -16,7 +16,7 @@
 //! `bitty-terminal-docs/specifications/composer-architecture.md`, W-82):
 //!
 //! - the environment-driven program always resolves through
-//!   [`resolve_editor`](bitty_rich::composer::resolve_editor): only the bare
+//!   [`resolve_editor`](bitty_rich::host::resolve_editor): only the bare
 //!   `nvim`/`vim`/`vi` names run, a hostile `$VISUAL`/`$EDITOR` is denied
 //!   before any side effect, and denied values are never echoed;
 //! - `program_override` bypasses that allowlist so tests can host
@@ -25,10 +25,10 @@
 //!   reaches real sessions;
 //! - the draft travels through the Bitty-owned `0700` root
 //!   ([`owned_temp_root`](bitty_rich::host::owned_temp_root)) via
-//!   [`write_composer_temp`](bitty_rich::composer::write_composer_temp)
+//!   [`write_composer_temp`](bitty_rich::host::write_composer_temp)
 //!   (`0600`, bounded) and
-//!   [`read_composer_back`](bitty_rich::composer::read_composer_back)
-//!   (bounded, UTF-8); the [`TempComposerFile`](bitty_rich::composer::TempComposerFile)
+//!   [`read_composer_back`](bitty_rich::host::read_composer_back)
+//!   (bounded, UTF-8); the [`TempComposerFile`](bitty_rich::host::TempComposerFile)
 //!   guard deletes it on every path, including panic past the frame;
 //! - the editor leaf spawns with the minimized environment
 //!   ([`minimized_env_removals`](bitty_rich::host::minimized_env_removals)):
@@ -48,15 +48,14 @@
 //! - the event loop never blocks: exit is polled once per pump tick via
 //!   [`Runtime::pane_try_wait`](bitty_runtime::Runtime::pane_try_wait).
 //!
-//! While hosted, the composer overlay stays closed (draft preserved) so its
-//! modal input routing cannot steal keystrokes from the editor leaf; every
-//! finish path reopens it.
+//! While hosted, there is no composer overlay to close (retired); every
+//! finish path tears the leaf down and restores focus.
 
 #![forbid(unsafe_code)]
 
 use std::time::{Duration, Instant};
 
-use bitty_rich::composer::{
+use bitty_rich::host::{
     EDITOR_TIMEOUT_DEFAULT, EDITOR_TIMEOUT_MAX, EditorError, TempComposerFile, read_composer_back,
     resolve_editor, write_composer_temp,
 };
@@ -79,11 +78,9 @@ pub(crate) struct ExternalEditorSession {
 }
 
 /// Typed `process.editor` open outcome (W-82 G-4 at the editor boundary).
-///
-/// Denials name the rule, never the payload or path; unavailability names
-/// the missing precondition. The loud-warning open wrappers map each
-/// variant back to the existing messages, so current callers observe no
-/// behavior change.
+/// Retired PTY-leaf path (E-CUT, CTX-0968): kept for tests; production
+/// editor work goes through the plugin-owned `process.editor` host operation.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum EditorOpenOutcome {
     /// The editor leaf owns the session.
@@ -107,10 +104,8 @@ pub(crate) enum EditorOpenOutcome {
 
 /// Why a typed open failed.
 ///
-/// The `warning` carries the exact loud message current callers observe
-/// (byte-for-byte preserved from the pre-typed implementation); the typed
-/// API maps `outcome` and never surfaces temp paths or denied program
-/// values beyond what the existing messages already contain.
+/// Retired path (E-CUT): kept for tests.
+#[allow(dead_code)]
 #[derive(Debug)]
 struct OpenError {
     // Read by the typed cutover seam (`open_external_editor_typed`, test-
@@ -122,6 +117,7 @@ struct OpenError {
 }
 
 impl OpenError {
+    #[allow(dead_code)]
     fn warn(outcome: EditorOpenOutcome, warning: String) -> Self {
         let mut warning = warning;
         if warning.len() > 512 {
@@ -151,6 +147,7 @@ impl ExternalEditorHost {
     }
 
     /// Whether an editor leaf is currently hosted.
+    #[allow(dead_code)]
     pub(crate) fn is_hosting(&self) -> bool {
         self.pending.is_some()
     }
@@ -172,6 +169,10 @@ impl ExternalEditorHost {
     /// Records a freshly spawned editor leaf with an explicit bounded wait
     /// (clamped to [`EDITOR_TIMEOUT_MAX`]). Returns `false` (session
     /// untouched) when one is already hosted.
+    ///
+    /// Retired PTY-leaf path (E-CUT): production no longer opens leaves;
+    /// kept for tests.
+    #[allow(dead_code)]
     pub(crate) fn begin_with_timeout(
         &mut self,
         session: ExternalEditorSession,
@@ -207,12 +208,15 @@ impl Default for ExternalEditorHost {
 }
 
 impl TerminalApp {
-    /// Opens the `$VISUAL`/`$EDITOR` program on the live composer draft in
-    /// a new PTY leaf (the `EditorRequested` arm).
+    /// Opens the `$VISUAL`/`$EDITOR` program on an empty draft in
+    /// a new PTY leaf (retired path, E-CUT CTX-0968).
     ///
-    /// Every failure warns loudly and leaves the layout, focus, and draft
-    /// untouched; the composer overlay stays open on failure and closes
-    /// (draft preserved) only once the editor leaf owns the session.
+    /// The Core composer draft is gone; the leaf edits an empty buffer and
+    /// reports the result via [`EditorOutcome`]. Every failure warns loudly
+    /// and leaves the layout and focus untouched.
+    ///
+    /// Retired: no production caller (plugin owns editor UX); kept for tests.
+    #[allow(dead_code)]
     pub(crate) fn open_external_editor(&mut self) {
         let visual = std::env::var("VISUAL").ok();
         let editor = std::env::var("EDITOR").ok();
@@ -224,6 +228,9 @@ impl TerminalApp {
     /// `program_override` names the editor program directly, bypassing the
     /// allowlist; it exists so tests can host short-lived fake editors
     /// (`/bin/true`, marker scripts). Production always passes `None`.
+    ///
+    /// Retired (E-CUT): kept for tests.
+    #[allow(dead_code)]
     pub(crate) fn open_external_editor_with(
         &mut self,
         visual: Option<&str>,
@@ -240,6 +247,9 @@ impl TerminalApp {
 
     /// [`Self::open_external_editor_with`] with an explicit bounded wait
     /// (clamped to [`EDITOR_TIMEOUT_MAX`]).
+    ///
+    /// Retired (E-CUT): kept for tests.
+    #[allow(dead_code)]
     pub(crate) fn open_external_editor_with_timeout(
         &mut self,
         visual: Option<&str>,
@@ -252,11 +262,10 @@ impl TerminalApp {
 
     /// Typed `process.editor` open: the same policy as
     /// [`Self::open_external_editor_with`], reporting [`EditorOpenOutcome`]
-    /// instead of warning loudly. No modal is rewired; the overlay still
-    /// closes (draft preserved) only once the editor leaf owns the session.
+    /// instead of warning loudly.
     ///
     /// Test and cutover seam: the production open path stays on the
-    /// loud-warning wrapper until cutover rewires the modal to this outcome.
+    /// loud-warning wrapper.
     #[cfg(test)]
     pub(crate) fn open_external_editor_typed(
         &mut self,
@@ -273,6 +282,9 @@ impl TerminalApp {
 
     /// Loud-warning open wrapper: preserves the existing messages for
     /// current callers (byte-for-byte).
+    ///
+    /// Retired (E-CUT): kept for tests.
+    #[allow(dead_code)]
     fn open_external_editor_full(
         &mut self,
         visual: Option<&str>,
@@ -286,7 +298,7 @@ impl TerminalApp {
                     unreachable!("open_inner reports Hosted on success");
                 };
                 eprintln!(
-                    "bitty: external editor '{}' opened in pane {:?} — exit the editor to apply its buffer to the composer draft",
+                    "bitty: external editor '{}' opened in pane {:?} — exit the editor to apply its buffer",
                     opened.program, view
                 );
             }
@@ -295,7 +307,11 @@ impl TerminalApp {
     }
 
     /// Shared open implementation: allowlist resolve, owned-root temp
-    /// snapshot, PTY-leaf spawn with minimized env, single-session record.
+    /// snapshot (empty draft, composer retired), PTY-leaf spawn with
+    /// minimized env, single-session record.
+    ///
+    /// Retired (E-CUT): kept for tests.
+    #[allow(dead_code)]
     fn open_inner(
         &mut self,
         visual: Option<&str>,
@@ -341,7 +357,10 @@ impl TerminalApp {
                 }
             },
         };
-        let draft = self.runtime.cw_composer_content().to_owned();
+        // E-CUT (CTX-0968): the Core composer draft is retired; the leaf
+        // edits an empty buffer. The result is reported via EditorOutcome;
+        // there is no composer session to snapshot or apply to.
+        let draft = String::new();
         // G-1: the draft snapshot lives in the Bitty-owned 0700 root, never
         // the ambient temp dir.
         let root = owned_temp_root().map_err(|err| {
@@ -455,10 +474,9 @@ impl TerminalApp {
                 ),
             ));
         }
-        // Only now: close the overlay (draft preserved) so its modal routing
-        // cannot steal keystrokes from the editor leaf. Every finish path in
-        // `poll_external_editor` reopens it.
-        self.runtime.cw_composer_close();
+        // E-CUT: no composer overlay to close (retired). The leaf owns the
+        // session from here; every finish path in `poll_external_editor`
+        // tears it down and restores focus.
         Ok(OpenedEditor {
             outcome: EditorOpenOutcome::Hosted { view: new_id },
             program,
@@ -471,23 +489,19 @@ impl TerminalApp {
     ///
     /// Still running (and within its bounded wait): no-op, returns `None`.
     /// Otherwise the round trip finishes with a typed [`EditorOutcome`]: on
-    /// a zero exit the edited file is read back bounded and applied to the
-    /// draft (fail-closed past the cap, old content kept); a non-zero exit,
-    /// a signal death, a vanished leaf, a read-back failure, or an expired
-    /// bounded wait (recorded tree killed) keeps the old draft. Every
-    /// terminal path tears the editor leaf down, restores the prior focus
-    /// when it still exists, and reopens the composer overlay.
+    /// a zero exit the edited file is read back bounded (fail-closed past
+    /// the cap); a non-zero exit, a signal death, a vanished leaf, a
+    /// read-back failure, or an expired bounded wait (recorded tree killed)
+    /// reports the corresponding outcome. Every terminal path tears the
+    /// editor leaf down and restores the prior focus when it still exists.
     pub(crate) fn poll_external_editor(&mut self) -> Option<EditorOutcome> {
         let view = self.chrome.editor.pending_view()?;
         if !self.runtime.layout().leaf_ids().contains(&view) {
             // The editor leaf went away without us (e.g. a manual
-            // `close_view`): drop the session — the RAII temp goes with it —
-            // and reopen the overlay over the kept draft.
+            // `close_view`): drop the session — the RAII temp goes with it.
             drop(self.chrome.editor.take());
             self.open_retained_composer();
-            eprintln!(
-                "warning: composer external editor pane closed — draft kept, session reopened"
-            );
+            eprintln!("warning: composer external editor pane closed — session dropped");
             return Some(EditorOutcome::Cancelled);
         }
         let status = match self.runtime.pane_try_wait(&view) {
@@ -513,26 +527,13 @@ impl TerminalApp {
             match read_composer_back(session.temp.path()) {
                 Ok(content) => {
                     let bytes = content.len();
-                    match self.runtime.cw_composer_apply_external(&content) {
-                        Ok(()) => {
-                            eprintln!(
-                                "bitty: external editor applied {bytes} bytes to the composer draft"
-                            );
-                            self.finish_external_editor(session);
-                            Some(EditorOutcome::Edited(content))
-                        }
-                        Err(err) => {
-                            eprintln!(
-                                "warning: composer external editor result refused ({err}) — draft kept"
-                            );
-                            self.finish_external_editor(session);
-                            Some(EditorOutcome::Unavailable("draft apply refused"))
-                        }
-                    }
+                    eprintln!("bitty: external editor applied {bytes} bytes");
+                    self.finish_external_editor(session);
+                    Some(EditorOutcome::Edited(content))
                 }
                 Err(err) => {
                     eprintln!(
-                        "warning: composer external editor read-back failed ({err}) — draft kept"
+                        "warning: composer external editor read-back failed ({err}) — edits discarded"
                     );
                     let outcome = EditorOutcome::from(err);
                     self.finish_external_editor(session);
@@ -558,8 +559,10 @@ impl TerminalApp {
         }
     }
 
-    /// Tears the finished editor leaf down, restores focus, and reopens the
-    /// composer overlay over the (kept or applied) draft.
+    /// Tears the finished editor leaf down and restores focus.
+    ///
+    /// E-CUT: no composer overlay to reopen (retired); the temp file is
+    /// unlinked in all cases via RAII.
     fn finish_external_editor(&mut self, session: ExternalEditorSession) {
         // No `view_close_request` confirm gate here: the child already
         // exited, so there is no running foreground job left to protect.
@@ -591,6 +594,9 @@ impl TerminalApp {
 
 /// A successfully opened editor leaf: its typed success outcome plus the
 /// program name for the loud open notice.
+///
+/// Retired (E-CUT): kept for tests.
+#[allow(dead_code)]
 struct OpenedEditor {
     outcome: EditorOpenOutcome,
     program: String,

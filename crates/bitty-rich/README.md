@@ -28,7 +28,7 @@ and closed `OQ-008`, `OQ-015`, and `OQ-016` at design level.
   dependency is declared. The Kitty PNG codec moved to the
   `bitty-graphics` extension crate (W-141 extraction).
 - No GPU, no window system, no filesystem, and no `unsafe`, except the
-  `composer` module: the external-editor round-trip writes a restricted temp
+  `host` module: the external-editor round-trip writes a restricted temp
   file and spawns the configured editor with a bounded timeout plus kill.
 - The legacy terminal-truth image seam stays in `bitty-term-state`; new code
   uses the `image` module here.
@@ -48,7 +48,7 @@ and closed `OQ-008`, `OQ-015`, and `OQ-016` at design level.
   command regions, last exit code), and clipboard helpers.
 - `src/blocks.rs`, `src/hints.rs`, `src/background.rs` — command blocks, hint
   targets, and background images.
-- `src/composer.rs` — external-editor round-trip seam.
+- `src/host.rs` — external-editor round-trip seam (retained host mechanism).
 - `src/geometry.rs`, `src/loader.rs`, `src/presentation.rs` — rect helpers,
   loading, and presentation assembly.
 - `tests/` — headless presentation tests.

@@ -1,9 +1,10 @@
-//! CTX-0723: present-path live wiring integration (issues #980-#984).
+//! CTX-0723: present-path live wiring integration (issues #980-#984,
+//! composer retired E-CUT-4 CTX-0968).
 //!
 //! Each test drives the live [`Runtime`] owner — Leader-armed hint
-//! sessions, latest-block fold verbs, composer submit-to-PTY, provider
-//! unregister symmetry, and fold-ordinal persistence — rather than the
-//! candidate modules directly, so removing the wiring fails these tests.
+//! sessions, latest-block fold verbs, provider unregister symmetry, and
+//! fold-ordinal persistence — rather than the candidate modules directly,
+//! so removing the wiring fails these tests.
 //!
 //! - #980 (CW-01): `cw_latest_command_id` / `cw_fold_latest` resolve the
 //!   focused view's latest `OSC 133` command block for the
@@ -14,9 +15,8 @@
 //!   `cw_hint_dispatch_armed` dispatches against the armed batch only (no
 //!   caller-supplied batch), and `cw_present_plan` carries the live batch
 //!   as a single zero-slot overlay payload.
-//! - #982 (CW-03): submit frames from `cw_composer_feed` reach the focused
-//!   PTY through the single input router; the external-editor request
-//!   stays a routing flag.
+//! - #982 (CW-03): retired (E-CUT-4): submit flows through the
+//!   `terminal.submit` host operation; there is no Core composer session.
 //! - #983 (CW-04): `cw_hint_unregister` is the dispose symmetric of
 //!   `cw_hint_register` on the single live engine.
 //! - #984 (CW-05): `cw_fold_snapshot_ordinals` /
@@ -24,10 +24,8 @@
 //!
 //! Headless only: no PTY, window, GPU, wall-clock, or filesystem.
 
-use bitty_rich::composer::{ComposerKeyEvent, frame_submit};
-use bitty_runtime::cw_present::{
-    CwComposerFeed, CwFoldAction, CwHintProvider, CwInputRoute, HintKeyOutcome,
-};
+use bitty_rich::host::frame_submit;
+use bitty_runtime::cw_present::{CwFoldAction, CwHintProvider, HintKeyOutcome};
 use bitty_runtime::{DispatchOutcome, HintScope, Runtime, RuntimeConfig};
 
 fn runtime() -> Runtime {
@@ -276,44 +274,15 @@ fn cw981_present_plan_carries_hint_overlay() {
 }
 
 #[test]
-fn cw982_composer_submit_writes_single_frame_to_pty() {
+fn cw982_composer_submit_retired_frame_helper_still_frames() {
+    // E-CUT (CTX-0968): the Core composer session is retired; the retained
+    // host framing helper still frames byte-exactly behind
+    // `terminal.submit`. The single input router carries the frame headless.
     let mut rt = runtime();
-    rt.cw_composer_open();
-    assert_eq!(rt.cw_input_route(), CwInputRoute::Composer);
-    assert_eq!(
-        rt.cw_composer_feed(ComposerKeyEvent::printable('h')),
-        CwComposerFeed::Inserted
-    );
-    assert_eq!(
-        rt.cw_composer_feed(ComposerKeyEvent::printable('i')),
-        CwComposerFeed::Inserted
-    );
-    let frame = match rt.cw_composer_feed(ComposerKeyEvent::ctrl_enter()) {
-        CwComposerFeed::Submitted(frame) => frame,
-        other => panic!("submit must frame, got {other:?}"),
-    };
-    assert_eq!(frame, frame_submit("hi").expect("fits composer cap"));
-    assert!(!rt.cw_composer_is_open(), "submit auto-closes");
-    assert_eq!(rt.cw_input_route(), CwInputRoute::Pty);
-
-    // The single input router carries the frame headless (no writer live).
+    let frame = frame_submit("hi").expect("fits cap");
+    assert_eq!(frame, b"\x1b[200~hi\x1b[201~\r");
     rt.push_input_bytes(&frame);
     assert_eq!(rt.drain_pending_input(), frame);
-}
-
-#[test]
-fn cw982_editor_request_stays_a_routing_flag() {
-    let mut rt = runtime();
-    rt.cw_composer_open();
-    assert_eq!(
-        rt.cw_composer_feed(ComposerKeyEvent::alt_e()),
-        CwComposerFeed::EditorRequested
-    );
-    assert!(
-        rt.cw_composer_is_open(),
-        "editor request preserves the draft session"
-    );
-    assert_eq!(rt.cw_input_route(), CwInputRoute::Composer);
 }
 
 // -- #983: provider unregister symmetry ---------------------------------------

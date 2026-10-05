@@ -6,6 +6,7 @@
 
 use std::collections::BTreeSet;
 
+use crate::catalog::CapabilityCatalog;
 use crate::error::PackageError;
 use crate::integrity::{is_valid_hex_digest, sha256_hex};
 
@@ -259,6 +260,18 @@ impl CapabilityId {
         Ok(Self(raw.to_string()))
     }
 
+    /// Parse and validate against an explicit catalog (CTX-0916 S1, DEC-0102).
+    ///
+    /// Shape rules (segments, lengths, character classes) are Core-owned and
+    /// identical to [`Self::new`]; only closed-set membership and parameter
+    /// presence come from `catalog`, so extensions validate contributed
+    /// families without changing the Core seed. With
+    /// [`CapabilityCatalog::core`] the result equals [`Self::new`].
+    pub fn parse_with(catalog: &CapabilityCatalog, raw: &str) -> Result<Self, PackageError> {
+        validate_capability_with(catalog, raw)?;
+        Ok(Self(raw.to_string()))
+    }
+
     /// Raw string.
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -416,16 +429,10 @@ pub fn check_closed_capability(
     head: &str,
     has_param: bool,
 ) -> Result<(), ClosedCapabilityViolation> {
-    if !CLOSED_CAPABILITY_HEADS.contains(&head) {
-        return Err(ClosedCapabilityViolation::UnknownHead);
-    }
-    if capability_requires_param(head) && !has_param {
-        return Err(ClosedCapabilityViolation::ParamRequired);
-    }
-    if !capability_requires_param(head) && has_param {
-        return Err(ClosedCapabilityViolation::ParamForbidden);
-    }
-    Ok(())
+    // CTX-0916 S1 (DEC-0102): the closed set delegates to the Core catalog
+    // seed so lock-time and grant-time validation share one source. The seed
+    // holds exactly the tables below; behavior is unchanged.
+    CapabilityCatalog::core().check(head, has_param)
 }
 
 /// Canonical closed-set validation producing package errors.
@@ -434,7 +441,16 @@ pub fn check_closed_capability(
 /// exactly the host install-time set: divergent identifiers fail here instead
 /// of locking successfully and failing at install.
 pub fn validate_closed_capability(head: &str, has_param: bool) -> Result<(), PackageError> {
-    check_closed_capability(head, has_param).map_err(|violation| match violation {
+    check_closed_capability(head, has_param)
+        .map_err(|violation| closed_violation_error(head, violation))
+}
+
+/// Map a closed-set violation to the manifest error vocabulary.
+///
+/// Shared by [`validate_closed_capability`] and catalog-scoped validation so
+/// both paths report identical messages.
+fn closed_violation_error(head: &str, violation: ClosedCapabilityViolation) -> PackageError {
+    match violation {
         ClosedCapabilityViolation::UnknownHead => PackageError::manifest(
             "capabilities",
             format!(
@@ -449,10 +465,18 @@ pub fn validate_closed_capability(head: &str, has_param: bool) -> Result<(), Pac
             "capabilities",
             format!("capability '{head}' must not have a ':PARAMETER'"),
         ),
-    })
+    }
 }
 
 fn validate_capability(raw: &str) -> Result<(), PackageError> {
+    validate_capability_with(&CapabilityCatalog::core(), raw)
+}
+
+/// Shape validation shared by [`CapabilityId::new`] and
+/// [`CapabilityId::parse_with`]: segment, length, and character rules are
+/// Core-owned and identical on both paths; only the closed-set check reads
+/// `catalog`.
+fn validate_capability_with(catalog: &CapabilityCatalog, raw: &str) -> Result<(), PackageError> {
     if raw.is_empty() {
         return Err(PackageError::manifest(
             "capabilities",
@@ -538,7 +562,9 @@ fn validate_capability(raw: &str) -> Result<(), PackageError> {
     // Closed normative set shared with the plugin host (CR-PKG-03): family
     // membership alone is never authority — unknown heads fail here instead
     // of locking successfully and failing at install.
-    validate_closed_capability(head, param.is_some())?;
+    catalog
+        .check(head, param.is_some())
+        .map_err(|violation| closed_violation_error(head, violation))?;
     Ok(())
 }
 

@@ -133,6 +133,7 @@
 
 pub mod activation;
 pub mod boundary;
+pub mod catalog;
 pub mod error;
 pub mod integrity;
 pub mod lifecycle;
@@ -150,6 +151,7 @@ pub use activation::{
     rollback_full, rollback_per_plugin,
 };
 pub use boundary::{OperationOwner, PackageOperation};
+pub use catalog::{CapabilityCatalog, MAX_CATALOG_HEADS, MAX_REGISTER_HEADS_PER_CALL};
 pub use error::{ErrorClass, PackageError};
 pub use integrity::{
     MAX_ARTIFACT_BYTES, VerificationInputs, VerificationReport, VerificationStage, capability_diff,

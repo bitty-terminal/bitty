@@ -5,6 +5,8 @@
 //! `family.resource:parameter` for path and destination constraints.
 //! Identifiers are closed symbols; plugins cannot invent families.
 
+pub use bitty_package::catalog::CapabilityCatalog;
+
 use crate::error::PluginError;
 
 /// All capability families proposed for v1.
@@ -211,6 +213,27 @@ pub struct CapabilityId {
 impl CapabilityId {
     /// Parse and validate a capability identifier string.
     pub fn parse(raw: &str) -> Result<Self, PluginError> {
+        // CTX-0916 S1 (DEC-0102): the static entry point delegates to the
+        // Core catalog seed; behavior is unchanged.
+        Self::parse_with(&CapabilityCatalog::core(), raw)
+    }
+
+    /// Parse and validate against an explicit catalog (CTX-0916 S1, DEC-0102).
+    ///
+    /// Shape rules and the [`CapabilityFamily`] vocabulary are Core-owned and
+    /// identical to [`Self::parse`]; only closed-set membership and parameter
+    /// presence come from `catalog`. S1 limitation: families outside the
+    /// closed [`CapabilityFamily`] enum still fail closed here even when the
+    /// catalog knows them (package-side `parse_with` already accepts them);
+    /// opening the family vocabulary is a later slice. With
+    /// [`CapabilityCatalog::core`] the result equals [`Self::parse`].
+    pub fn parse_with(catalog: &CapabilityCatalog, raw: &str) -> Result<Self, PluginError> {
+        Self::parse_impl(catalog, raw)
+    }
+
+    /// Shared parse implementation behind [`Self::parse`] and
+    /// [`Self::parse_with`]; only the closed-set source varies.
+    fn parse_impl(catalog: &CapabilityCatalog, raw: &str) -> Result<Self, PluginError> {
         if raw.is_empty() {
             return Err(PluginError::capability(raw, "capability must not be empty"));
         }
@@ -274,7 +297,7 @@ impl CapabilityId {
         })?;
 
         // Check closed identifier set: only known combos are accepted.
-        let known = is_known_capability(head, param.is_some(), raw)?;
+        let known = is_known_capability_with(catalog, head, param.is_some(), raw)?;
         let high_risk = is_high_risk(head);
 
         Ok(Self {
@@ -442,7 +465,18 @@ pub fn validate_closed_capability(
     has_param: bool,
     raw: &str,
 ) -> Result<(), PluginError> {
-    bitty_package::manifest::check_closed_capability(head, has_param).map_err(|violation| {
+    validate_closed_capability_with(&CapabilityCatalog::core(), head, has_param, raw)
+}
+
+/// Catalog-scoped closed-identifier validation sharing the host error
+/// vocabulary with [`validate_closed_capability`].
+fn validate_closed_capability_with(
+    catalog: &CapabilityCatalog,
+    head: &str,
+    has_param: bool,
+    raw: &str,
+) -> Result<(), PluginError> {
+    catalog.check(head, has_param).map_err(|violation| {
         match violation {
             bitty_package::manifest::ClosedCapabilityViolation::UnknownHead => {
                 PluginError::capability(
@@ -468,12 +502,17 @@ pub fn validate_closed_capability(
     })
 }
 
-/// Closed identifier validation.
+/// Closed identifier validation against a catalog.
 ///
 /// Returns error if the head is not a known capability; otherwise returns true
 /// for known identifiers (used to avoid silent escalation).
-fn is_known_capability(head: &str, has_param: bool, raw: &str) -> Result<bool, PluginError> {
-    validate_closed_capability(head, has_param, raw)?;
+fn is_known_capability_with(
+    catalog: &CapabilityCatalog,
+    head: &str,
+    has_param: bool,
+    raw: &str,
+) -> Result<bool, PluginError> {
+    validate_closed_capability_with(catalog, head, has_param, raw)?;
     // For fs/process/network, param content could be further validated (glob / host / program)
     // but the draft keeps it as bounded opaque string validated above (length, no colon/space).
     Ok(true)
@@ -762,5 +801,79 @@ mod tests {
             assert!(CapabilityId::parse(raw).is_err());
             assert!(bitty_package::CapabilityId::new(raw).is_err());
         }
+    }
+
+    #[test]
+    fn parse_matches_parse_with_on_core_seed() {
+        // CTX-0916 S1 (DEC-0102): the static entry point delegates to the
+        // Core catalog seed, so both paths must agree on every identifier.
+        use bitty_package::manifest as package_manifest;
+
+        let core = CapabilityCatalog::core();
+        for head in package_manifest::CLOSED_CAPABILITY_HEADS {
+            let raw = if package_manifest::capability_requires_param(head) {
+                format!("{head}:param")
+            } else {
+                (*head).to_string()
+            };
+            let old = CapabilityId::parse(&raw);
+            let new = CapabilityId::parse_with(&core, &raw);
+            assert_eq!(
+                old.is_ok(),
+                new.is_ok(),
+                "old/new parse disagree on '{raw}'"
+            );
+            if let (Ok(a), Ok(b)) = (old, new) {
+                assert_eq!(a, b, "old/new parse differ on '{raw}'");
+            }
+        }
+
+        for raw in [
+            "terminal.unknown-thing",
+            "ui.unknown",
+            "agent.evil",
+            "fs.read",
+            "env.read",
+            "network.connect",
+            "mcp.invoke",
+            "terminal.semantic-read:extra",
+            "ui.rich:something",
+            "ai.provider:extra",
+        ] {
+            assert!(
+                CapabilityId::parse(raw).is_err(),
+                "static path must reject '{raw}'"
+            );
+            assert!(
+                CapabilityId::parse_with(&core, raw).is_err(),
+                "catalog path must reject '{raw}'"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_with_accepts_catalog_extension_heads_in_known_families() {
+        // Extensions contribute heads through the catalog; the static path
+        // still fails closed on them.
+        let mut catalog = CapabilityCatalog::core();
+        catalog
+            .register("panel", &[("panel.custom-view", false)])
+            .expect("extension head registers");
+        let granted = CapabilityId::parse_with(&catalog, "panel.custom-view")
+            .expect("catalog-registered head parses");
+        assert_eq!(granted.family(), CapabilityFamily::Panel);
+        assert!(!granted.has_param());
+        assert!(CapabilityId::parse("panel.custom-view").is_err());
+
+        // S1 limitation, pinned: families outside the closed
+        // `CapabilityFamily` enum still fail closed host-side even when the
+        // catalog knows them (package-side `parse_with` already accepts
+        // them); opening the family vocabulary is a later slice.
+        let mut catalog = CapabilityCatalog::core();
+        catalog
+            .register("acme", &[("acme.widget", false)])
+            .expect("extension family registers");
+        assert!(CapabilityId::parse_with(&catalog, "acme.widget").is_err());
+        assert!(bitty_package::CapabilityId::parse_with(&catalog, "acme.widget").is_ok());
     }
 }

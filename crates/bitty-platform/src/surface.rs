@@ -3,26 +3,34 @@
 //!
 //! # Why this module exists
 //!
-//! ADR-0004 adopts `wgpu` (~25.x) in `bitty-render` and keeps OS integration
-//! in `bitty-platform`. Creating a `wgpu::Surface` necessarily consumes raw
-//! display/window handles (`raw-window-handle` 0.6). This module is the single
+//! ADR-0004 adopts `wgpu` (~26.x) in `bitty-render` and keeps OS integration
+//! in `bitty-platform`. Creating a `wgpu::Surface` consumes window handles
+//! (`raw-window-handle` 0.6). This module is the single
 //! seam where that happens:
 //!
 //! - [`SurfaceTarget`] is Bitty-owned; no winit type appears in any public
 //!   signature. The underlying window is kept alive by an internal shared
 //!   handle, so cloning a target shares the same live window.
-//! - [`SurfaceTarget::with_raw_handles`] lends the raw display/window handles
-//!   to a caller-supplied closure. `raw-window-handle` itself cannot be
-//!   avoided at this boundary (the handles *are* the payload wgpu consumes),
-//!   so the exact version is pinned and re-exported as
-//!   [`crate::raw_window_handle`] — see the crate-level ownership rules.
+//! - [`SurfaceTarget`] implements [`HasWindowHandle`] and [`HasDisplayHandle`]
+//!   (from the pinned [`crate::raw_window_handle`] re-export), so renderers
+//!   call the safe `wgpu::Instance::create_surface(target.clone())` and
+//!   receive a `wgpu::Surface<'static>` with no `unsafe`. The owned clone
+//!   keeps the window alive inside the wgpu surface (`_handle_source`).
+//! - [`SurfaceTarget::with_raw_handles`] remains as a low-level escape hatch
+//!   that lends the raw display/window handles to a caller-supplied closure.
+//!   Prefer the safe `create_surface` path; the raw path exists for
+//!   diagnostics and tests only.
+//!
+//! [`HasWindowHandle`]: crate::raw_window_handle::HasWindowHandle
+//! [`HasDisplayHandle`]: crate::raw_window_handle::HasDisplayHandle
 //!
 //! # Renderer flow (resize -> surface extent)
 //!
 //! 1. Attach once: obtain a [`SurfaceTarget`] from
 //!    [`WindowHandle::surface_target`](crate::WindowHandle::surface_target)
 //!    (typically on [`PlatformEvent::Resumed`](crate::PlatformEvent::Resumed))
-//!    and build the GPU surface inside `with_raw_handles`.
+//!    and build the GPU surface with safe `wgpu::Instance::create_surface`
+//!    from an owned `SurfaceTarget` clone.
 //! 2. On
 //!    [`WindowEventKind::Resized`](crate::WindowEventKind::Resized), pass the
 //!    payload through [`map_resize_to_surface_extent`] and reconfigure the
@@ -56,7 +64,8 @@ use crate::dpi::{LogicalSize, PhysicalSize, ScaleFactor};
 use crate::error::PlatformError;
 use crate::event::WindowId;
 use crate::raw_window_handle::{
-    HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle,
+    DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, RawDisplayHandle,
+    RawWindowHandle, WindowHandle as BorrowedWindowHandle,
 };
 
 /// Internal provider of the platform data behind a [`SurfaceTarget`].
@@ -81,6 +90,20 @@ trait SurfaceSource: Send + Sync + fmt::Debug {
     /// Returns [`PlatformError::SurfaceHandle`] when the platform refuses or
     /// cannot produce the handle.
     fn window_handle(&self) -> Result<RawWindowHandle, PlatformError>;
+
+    /// Borrowed display handle for safe `wgpu::Instance::create_surface`.
+    ///
+    /// Delegates to the live window; test fakes return
+    /// [`HandleError::Unavailable`]. No `unsafe` is required: the borrow is
+    /// tied to `&self`, and the caller keeps an owned `SurfaceTarget` clone
+    /// alive inside the wgpu surface.
+    fn display_handle_borrowed(&self) -> Result<DisplayHandle<'_>, HandleError>;
+
+    /// Borrowed window handle for safe `wgpu::Instance::create_surface`.
+    ///
+    /// See [`SurfaceSource::display_handle_borrowed`] for the lifetime and
+    /// error contract.
+    fn window_handle_borrowed(&self) -> Result<BorrowedWindowHandle<'_>, HandleError>;
 
     /// Current inner size in physical pixels.
     fn inner_size(&self) -> PhysicalSize;
@@ -109,6 +132,14 @@ impl SurfaceSource for WindowSurfaceSource {
             .map_err(|error| PlatformError::SurfaceHandle(error.to_string()))
     }
 
+    fn display_handle_borrowed(&self) -> Result<DisplayHandle<'_>, HandleError> {
+        self.window.display_handle()
+    }
+
+    fn window_handle_borrowed(&self) -> Result<BorrowedWindowHandle<'_>, HandleError> {
+        self.window.window_handle()
+    }
+
     fn inner_size(&self) -> PhysicalSize {
         let size = self.window.inner_size();
         PhysicalSize::new(size.width, size.height)
@@ -125,10 +156,27 @@ impl SurfaceSource for WindowSurfaceSource {
 /// [`WindowHandle::surface_target`](crate::WindowHandle::surface_target).
 /// Cloning shares the same underlying window; see the module-level lifetime
 /// contract before creating surfaces from it.
+///
+/// Implements [`HasWindowHandle`] and [`HasDisplayHandle`] so renderers use
+/// the safe `wgpu::Instance::create_surface(target.clone())` path, which
+/// yields a `wgpu::Surface<'static>` with the window kept alive inside the
+/// surface. No winit type appears in the public signature.
 #[derive(Clone, Debug)]
 pub struct SurfaceTarget {
     id: WindowId,
     source: Arc<dyn SurfaceSource>,
+}
+
+impl HasDisplayHandle for SurfaceTarget {
+    fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
+        self.source.display_handle_borrowed()
+    }
+}
+
+impl HasWindowHandle for SurfaceTarget {
+    fn window_handle(&self) -> Result<BorrowedWindowHandle<'_>, HandleError> {
+        self.source.window_handle_borrowed()
+    }
 }
 
 impl SurfaceTarget {
@@ -154,10 +202,12 @@ impl SurfaceTarget {
 
     /// Lends the raw display/window handles of this window to `configure`.
     ///
-    /// This is the only place where `wgpu`
-    /// (`Surface::create_surface_unsafe`) receives what it needs; both handle
-    /// types come from the pinned [`crate::raw_window_handle`] re-export, so
-    /// consumers never add their own version of that dependency.
+    /// Low-level escape hatch for diagnostics and tests. Prefer the safe
+    /// `wgpu::Instance::create_surface(target.clone())` path, which consumes
+    /// this target's [`HasWindowHandle`]/[`HasDisplayHandle`] impls with no
+    /// `unsafe`. Both handle types come from the pinned
+    /// [`crate::raw_window_handle`] re-export, so consumers never add their
+    /// own version of that dependency.
     ///
     /// The window is kept alive for the duration of the call; the returned
     /// value passes through unchanged. Handles remain valid afterwards only
@@ -230,7 +280,9 @@ pub fn map_resize_to_surface_extent(size: PhysicalSize) -> Option<PhysicalSize> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raw_window_handle::{WebDisplayHandle, WebWindowHandle};
+    use crate::raw_window_handle::{
+        HasDisplayHandle, HasWindowHandle, WebDisplayHandle, WebWindowHandle,
+    };
 
     /// Cross-platform fixture handles: every `Raw*Handle` variant exists on
     /// every target, and the Web variants are plain ids constructible without
@@ -277,6 +329,16 @@ mod tests {
             } else {
                 Ok(fixture_window())
             }
+        }
+
+        fn display_handle_borrowed(&self) -> Result<DisplayHandle<'_>, HandleError> {
+            // Test fakes carry no live window; the safe wgpu path reports
+            // unavailable without any `unsafe` handle synthesis.
+            Err(HandleError::Unavailable)
+        }
+
+        fn window_handle_borrowed(&self) -> Result<BorrowedWindowHandle<'_>, HandleError> {
+            Err(HandleError::Unavailable)
         }
 
         fn inner_size(&self) -> PhysicalSize {
@@ -421,5 +483,21 @@ mod tests {
         });
         let zero = LogicalSize::new(0.0, 935.0).expect("valid");
         assert_eq!(attached.scale_change_extent(zero), None);
+    }
+
+    #[test]
+    fn safe_handle_traits_report_unavailable_for_test_fakes() {
+        // Test fakes carry no live window: the safe `create_surface` path
+        // must fail closed with `HandleError::Unavailable` (no `unsafe`
+        // synthesis), while the raw escape hatch still yields fixtures.
+        let attached = target(FakeSource::ok());
+        assert!(matches!(
+            HasDisplayHandle::display_handle(&attached),
+            Err(HandleError::Unavailable)
+        ));
+        assert!(matches!(
+            HasWindowHandle::window_handle(&attached),
+            Err(HandleError::Unavailable)
+        ));
     }
 }

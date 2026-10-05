@@ -1089,7 +1089,7 @@ pub struct LazyTriggers {
     pub commands: Vec<LazyCommand>,
     /// Event types that load the plugin.
     pub events: Vec<String>,
-    /// UI claim names that load the plugin (e.g. `workspaceline`; `tabline` is a deprecated alias).
+    /// UI claim names that load the plugin (e.g. `workspaceline`).
     pub claims: Vec<String>,
 }
 

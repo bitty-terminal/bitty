@@ -306,19 +306,16 @@ pub fn inspect_help_text() -> String {
                         (bitty-terminal.workspace:new) compare equivalently.\n  \
                         Core ids come from the ctl/list registry surface; plugin\n  \
                         commands come from static manifests (no VM loaded).\n  \
-                        Workspace commands list both bitty-terminal.workspace:*\n  \
-                        and deprecated bitty-terminal.tabs:* aliases.\n  \
+                        Workspace commands are bitty-terminal.workspace:*.\n  \
         key <chord>     Shipped keymap owner for a chord (e.g. ctrl+shift+m).\n  \
                         Bound chords name action, context, and layer; unbound\n  \
                         chords succeed with bound:false (single-owner rule:\n  \
                         unbound keys reach the PTY/shell, never chrome).\n  \
         plugin <id>     Static bundled-catalog entry (no VM): owner publisher,\n  \
                         version, commands, staged-disabled state.\n  \
-                        Canonical id is bitty-terminal.workspace; the old\n  \
-                        bitty-terminal.tabs id still resolves with a deprecation\n  \
-                        note (removal >= v0.2.0). A bitty workspace is a tab\n  \
-                        group within a window (wezterm inverts this: workspace\n  \
-                        > window > tab > pane).\n  \
+                        Canonical id is bitty-terminal.workspace. A bitty\n  \
+                        workspace is a tab group within a window (wezterm\n  \
+                        inverts this: workspace > window > tab > pane).\n  \
        config <key>    Built-in default value and owning layer (default) plus\n  \
                        the CLI > file > profile > defaults precedence note.\n  \
                        Effective file values: `bitty config check`.\n  \
@@ -606,7 +603,7 @@ pub fn inspect_key(query: &str) -> KeyInfo {
 /// Static plugin entry surfaced by `inspect plugin`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InspectedPlugin {
-    /// Fully qualified id (`bitty-terminal.workspace`; old `bitty-terminal.tabs` still resolves).
+    /// Fully qualified id (`bitty-terminal.workspace`).
     pub id: String,
     /// Human name.
     pub name: String,
@@ -626,15 +623,12 @@ pub struct InspectedPlugin {
 
 /// Look up a plugin by id (case-insensitive, trimmed).
 ///
-/// Accepts both the canonical `bitty-terminal.workspace` and the deprecated
-/// `bitty-terminal.tabs` alias (removal ≥ v0.2.0) via
-/// `bundled::bundled_manifest_for`. Old path resolves to the tabs shim with
-/// the same commands/claims; pair with `bundled::deprecated_alias_warning`
-/// to surface the deprecation.
+/// Accepts only the canonical `bitty-terminal.workspace` via
+/// `bundled::bundled_manifest_for`.
 #[must_use]
 pub fn inspect_plugin(query: &str) -> Option<InspectedPlugin> {
     let want = query.trim().to_ascii_lowercase();
-    // Alias-aware lookup: canonical list holds workspace, but old id still resolves.
+    // Canonical lookup only (CTX-0974 purged the tabs alias).
     // `bundled_manifest_for` is exact-case; also try lowercased for CLI case-insensitivity.
     let manifest = bitty_plugin_host::bundled::bundled_manifest_for(query.trim())
         .or_else(|| bitty_plugin_host::bundled::bundled_manifest_for(&want))
@@ -1094,13 +1088,7 @@ pub fn format_plugin_table(query: &str, plugin: &InspectedPlugin) -> String {
         plugin.owner,
         commands
     );
-    if bitty_plugin_host::bundled::is_deprecated_bundled_alias(query.trim())
-        || bitty_plugin_host::bundled::is_deprecated_bundled_alias(&plugin.id)
-    {
-        format!("{base}  note: deprecated alias for bitty-terminal.workspace (removal >= v0.2.0)\n")
-    } else {
-        base
-    }
+    base
 }
 
 /// Render a config value as a human table.
@@ -1492,27 +1480,20 @@ mod tests {
         assert!(plugin.bundled);
         assert!(!plugin.enabled);
         assert!(!plugin.commands.is_empty());
-        // Canonical lists both new and deprecated old commands.
+        // Canonical workspace commands only (CTX-0974 purged the tabs alias).
         assert!(
             plugin
                 .commands
                 .iter()
                 .any(|c| c == "bitty-terminal.workspace:new")
         );
-        assert!(
-            plugin
-                .commands
-                .iter()
-                .any(|c| c == "bitty-terminal.tabs:new")
-        );
+        assert_eq!(plugin.commands.len(), 3);
         assert!(plugin.id == "bitty-terminal.workspace");
         let upper = inspect_plugin("BITTY-TERMINAL.WORKSPACE").expect("case-insensitive");
         assert_eq!(upper.id, plugin.id);
-        // Deprecated alias still resolves.
-        let old = inspect_plugin("bitty-terminal.tabs").expect("deprecated alias resolves");
-        assert_eq!(old.commands, plugin.commands);
-        let old_upper = inspect_plugin("BITTY-TERMINAL.TABS").expect("alias case-insensitive");
-        assert_eq!(old_upper.id, "bitty-terminal.tabs");
+        // Purged alias no longer resolves.
+        assert!(inspect_plugin("bitty-terminal.tabs").is_none());
+        assert!(inspect_plugin("BITTY-TERMINAL.TABS").is_none());
         assert!(inspect_plugin("nope.nope").is_none());
     }
 
@@ -1673,12 +1654,9 @@ mod tests {
         let table = format_plugin_table("bitty-terminal.workspace", &plugin);
         assert!(table.contains("bitty-terminal.workspace"));
         assert!(table.contains("bitty-terminal"));
-        // Deprecated alias shows a removal note; canonical does not.
-        let old = inspect_plugin("bitty-terminal.tabs").unwrap();
-        let old_table = format_plugin_table("bitty-terminal.tabs", &old);
-        assert!(old_table.contains("bitty-terminal.tabs"));
-        assert!(old_table.contains("deprecated alias"));
+        // CTX-0974: tabs alias purged, canonical carries no deprecation note.
         assert!(!table.contains("deprecated alias"));
+        assert!(inspect_plugin("bitty-terminal.tabs").is_none());
         let config = inspect_config("font.size").unwrap();
         let table = format_config_table("font.size", &config);
         assert!(table.contains("font.size"));

@@ -1825,7 +1825,7 @@ mod tests {
     fn bundled_id_is_reserved() {
         let scratch = scratch("bundled");
         let store = scratch.join("store");
-        let source = write_plugin(&scratch, "bitty-terminal.tabs", "1.0.0", None);
+        let source = write_plugin(&scratch, "bitty-terminal.workspace", "1.0.0", None);
         let error = install_local_dir(
             &store,
             &source,

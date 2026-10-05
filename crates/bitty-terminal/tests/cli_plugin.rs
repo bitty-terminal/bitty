@@ -481,8 +481,13 @@ fn plugin_external_remote_source_fails_closed() {
 #[test]
 fn plugin_external_bundled_id_is_rejected() {
     let home = scratch_dir("external-bundled");
-    let source =
-        write_external_fixture_with_id(&home, "source", "bitty-terminal.tabs", "1.0.0", "hello");
+    let source = write_external_fixture_with_id(
+        &home,
+        "source",
+        "bitty-terminal.workspace",
+        "1.0.0",
+        "hello",
+    );
     let output = run_in(
         &home,
         &["plugin", "install", &source.display().to_string(), "--yes"],

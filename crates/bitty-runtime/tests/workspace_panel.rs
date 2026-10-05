@@ -72,9 +72,9 @@ fn workspace_via_public_plugin_host_path() {
     let hash = manifest.manifest_hash();
     let granted = granted_set_for(&manifest);
     assert!(granted.contains(&CapabilityId::parse("ui.rich").unwrap()));
-    // Claim workspaceline is declared via lazy claims (tabline remains as deprecated alias).
+    // Claim workspaceline is declared via lazy claims (CTX-0974: tabline alias purged).
     assert!(manifest.lazy.claims.contains(&"workspaceline".to_string()));
-    assert!(manifest.lazy.claims.contains(&"tabline".to_string()));
+    assert_eq!(manifest.lazy.claims.len(), 1);
 
     let mut host = PluginHost::new(DropPolicy::DropOldest, 16);
     // Public path: declare → resolve → register.

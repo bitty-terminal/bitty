@@ -3,9 +3,7 @@
 //! Bundled dogfood evidence for CTX-0096 (P2, area:plugin).
 //!
 //! Verifies the two `v1` bundled-disabled first-party plugins
-//! (`bitty-terminal.shell-integration`, `bitty-terminal.workspace`; the
-//! deprecated `bitty-terminal.tabs` id is an alias that resolves to
-//! workspace) dogfood the **public** Plugin API with manifest / capability /
+//! (`bitty-terminal.shell-integration`, `bitty-terminal.workspace`) dogfood the **public** Plugin API with manifest / capability /
 //! lifecycle parity to any third-party `xuepoo.*` plugin, default-disabled
 //! (no implicit enable), safe-mode compatibility, Terminal Truth protection
 //! (observation via bounded side queue, never direct `State` write), and
@@ -22,8 +20,8 @@ use bitty_plugin_host::{
     CapabilityId, DropPolicy, Event, EventKind, EventPayload, GrantRecord, HostObservation,
     PluginHost, PluginId,
     bundled::{
-        all_bundled_manifests, bundled_ids_sorted, bundled_manifest_for, deprecated_alias_warning,
-        is_bundled, is_deprecated_bundled_alias, shell_integration_manifest, workspace_manifest,
+        all_bundled_manifests, bundled_ids_sorted, bundled_manifest_for, is_bundled,
+        shell_integration_manifest, workspace_manifest,
     },
 };
 
@@ -65,13 +63,9 @@ fn bundled_manifests_validate_and_have_expected_ids() {
         assert!(!is_bundled(&PluginId::new(removed).unwrap()));
         assert!(bundled_manifest_for(removed).is_none());
     }
-    // Deprecated alias still resolves + is_bundled, with a warning; canonical does not warn.
-    assert!(is_bundled(&PluginId::new("bitty-terminal.tabs").unwrap()));
-    assert!(is_deprecated_bundled_alias("bitty-terminal.tabs"));
-    assert!(!is_deprecated_bundled_alias("bitty-terminal.workspace"));
-    assert!(deprecated_alias_warning("bitty-terminal.tabs").is_some());
-    assert!(deprecated_alias_warning("bitty-terminal.workspace").is_none());
-    assert!(bundled_manifest_for("bitty-terminal.tabs").is_some());
+    // CTX-0974 (DEC-0100 waiver): tabs alias purged, no longer bundled nor resolvable.
+    assert!(!is_bundled(&PluginId::new("bitty-terminal.tabs").unwrap()));
+    assert!(bundled_manifest_for("bitty-terminal.tabs").is_none());
     assert!(bundled_manifest_for("bitty-terminal.workspace").is_some());
 }
 
@@ -206,12 +200,8 @@ fn default_disabled_safe_mode_leaves_host_functional() {
     safe.set_safe_mode(true);
     assert!(safe.declare(shell_integration_manifest()).is_err());
     assert!(safe.declare(workspace_manifest()).is_err());
-    // Deprecated alias preserves the reject-shape: still rejected, still tickable
-    // after rejection (no builtin promotion for the new id).
-    assert!(
-        safe.declare(bundled_manifest_for("bitty-terminal.tabs").unwrap())
-            .is_err()
-    );
+    // CTX-0974: purged tabs alias is not bundled, so no manifest to declare.
+    assert!(bundled_manifest_for("bitty-terminal.tabs").is_none());
     assert!(
         safe.declare(bundled_manifest_for("bitty-terminal.workspace").unwrap())
             .is_err()

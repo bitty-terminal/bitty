@@ -1,4 +1,5 @@
-//! Windows owned-tree backend: Job Objects (CTX-0903, DEC-0083).
+//! Windows owned-tree backend: Job Objects (CTX-0903, DEC-0083; CTX-0978,
+//! DEC-0101).
 //!
 //! Adoption creates an anonymous kill-on-close Job Object through the
 //! reviewed `bitty-winjob` adapter and assigns the leader to it. Every
@@ -7,15 +8,18 @@
 //! cannot take a descendant out: the job, not a process group, is the
 //! owned tree.
 //!
+//! - **PTY children** ([`crate::Pty`]) are born inside their job: the
+//!   platform spawn assembles the tree at creation through
+//!   `PROC_THREAD_ATTRIBUTE_JOB_LIST`, so the child runs zero instructions
+//!   outside it and there is no adopt-after-start window.
 //! - **Prepared children** ([`super::OwnedTree::prepare_command`]) start
 //!   with `CREATE_SUSPENDED`; [`Observer::arm_prepared`] assigns them before
 //!   their first instruction and then resumes them on every path, so no
 //!   descendant can escape and no child is ever left suspended.
-//! - **Already-running children** (the ConPTY child) are assigned after the
-//!   spawn. Residual race: a descendant the child creates before the
-//!   assignment lands is not in the job and survives a tree kill.
-//!   `portable-pty` spawns ConPTY children itself with fixed creation
-//!   flags, so `CREATE_SUSPENDED` cannot be requested there today.
+//! - **Already-running non-PTY children** ([`super::OwnedTree::adopt`]) are
+//!   assigned after the spawn: correct only because the caller spawns them
+//!   suspended or joins them before they can fork. Never adopt a PTY child
+//!   here; its tree travels with the [`crate::Pty`] handle.
 //!
 //! The leader's exit is observed through the process handle kept from the
 //! assignment (`WaitForSingleObject` with a zero timeout plus
@@ -66,8 +70,15 @@ pub(super) struct Observer {
 }
 
 impl Observer {
-    /// Assigns an already-running `leader` to a new job. Never pass a
-    /// `CREATE_SUSPENDED` child here: nothing would resume it.
+    /// Wraps a job the spawn already placed the leader in (the ConPTY
+    /// at-creation path). No assignment, no window.
+    pub(super) fn from_spawned(job: JobObject, leader: JobMember) -> Self {
+        Self { job, leader }
+    }
+
+    /// Assigns an already-running non-PTY `leader` to a new job. Never pass
+    /// a `CREATE_SUSPENDED` child here: nothing would resume it. Never pass
+    /// a PTY child either: its tree travels with the `Pty` handle.
     pub(super) fn arm(leader: u32) -> io::Result<Self> {
         let job = JobObject::new()?;
         let leader = job.assign_pid(leader)?;

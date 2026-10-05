@@ -13,14 +13,19 @@ publish = true
 [lints]
 workspace = true
 
-# CTX-0903 (DEC-0083): the only Windows FFI dependency. Non-Windows targets
-# compile this crate to an empty surface with no dependencies at all. The
-# feature list is exactly the Win32 API families `src/ffi.rs` calls.
+# CTX-0903 (DEC-0083, CTX-0978/DEC-0101): the only Windows FFI dependency.
+# Non-Windows targets compile this crate to an empty surface with no
+# dependencies at all. The feature list is exactly the Win32 API families
+# `src/ffi.rs` calls: Job Objects and thread/process primitives (CTX-0903)
+# plus the ConPTY spawn path (CTX-0978: Console for the pseudo-console,
+# Pipes for its anonymous pipes).
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
   "Win32_Foundation",
   "Win32_Security",
+  "Win32_System_Console",
   "Win32_System_Diagnostics_ToolHelp",
   "Win32_System_JobObjects",
+  "Win32_System_Pipes",
   "Win32_System_Threading",
 ] }

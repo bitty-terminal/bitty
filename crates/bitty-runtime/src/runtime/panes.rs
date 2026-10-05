@@ -534,22 +534,24 @@ impl Runtime {
 
     /// Signals the leaf child's recorded owned process tree (W-103 G-3).
     ///
-    /// PTY children are session leaders heading their own process group, so
-    /// the leader pid adopts an [`OwnedTree`](bitty_pty::OwnedTree) covering
-    /// the whole tree the child grew (editors spawning shells, pagers,
-    /// background jobs). The kill signal reaches every member, not just the
-    /// direct child that [`close_pane_session`](Self::close_pane_session)
-    /// would reap alone. The tracker is dropped without retiring: the
-    /// `PaneSession` still owns the leader and reaps it on teardown, which
-    /// is the only place a reap may happen. Returns `true` when the tree
-    /// signal was delivered; `false` without a session, without a pid, on
-    /// platforms without an owned-tree backend, or when the tree is already
-    /// gone (callers still run the normal teardown, which is always safe).
+    /// Every PTY child travels with the tree assembled at its spawn (see
+    /// [`bitty_pty::Pty::tree`]): on Unix it heads its own process group,
+    /// on Windows it is born inside its Job Object, so the tree covers the
+    /// whole tree the child grew (editors spawning shells, pagers,
+    /// background jobs) with no adopt-after-start window (CTX-0978). The
+    /// kill signal reaches every member, not just the direct child that
+    /// [`close_pane_session`](Self::close_pane_session) would reap alone.
+    /// The tracker is dropped without retiring: the `PaneSession` still owns
+    /// the leader and reaps it on teardown, which is the only place a reap
+    /// may happen. Returns `true` when the tree signal was delivered;
+    /// `false` without a session, without a stored tree, on platforms
+    /// without an owned-tree backend, or when the tree is already gone
+    /// (callers still run the normal teardown, which is always safe).
     pub fn kill_pane_tree(&self, view: &ViewId) -> bool {
-        let Some(pid) = self.pane_pid(view) else {
+        let Some(sess) = self.pane_sessions.get(view) else {
             return false;
         };
-        let Ok(tree) = bitty_pty::OwnedTree::adopt(pid) else {
+        let Some(tree) = sess.pty.tree() else {
             return false;
         };
         tree.signal(bitty_pty::TreeSignal::Kill).is_ok()

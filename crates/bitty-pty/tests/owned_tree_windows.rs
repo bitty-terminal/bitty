@@ -7,6 +7,11 @@
 //! never only the direct child. Liveness is checked through the safe
 //! `bitty-winjob` probe, so the test needs no `unsafe`.
 //!
+//! CTX-0978: ConPTY children additionally prove job-at-creation. The helper
+//! runs under a real ConPTY (`PtyBuilder::spawn`, which travels with its
+//! tree) and forks its grandchild as its first act; the tree kill must take
+//! a grandchild that predates any adopt call — there is no adopt call left.
+//!
 //! Every wait is bounded by a named constant; nothing blocks unbounded.
 
 #![cfg(windows)]
@@ -268,20 +273,152 @@ fn dropping_the_tree_kills_what_is_left() {
 }
 
 #[test]
-fn a_conpty_child_is_adopted_after_the_spawn() {
+fn a_conpty_child_travels_with_its_tree() {
     require_pty!();
     let mut pty = PtyBuilder::new("cmd.exe").spawn().expect("spawn cmd");
-    let leader = pty.pid().expect("conpty child pid");
-    let tree = OwnedTree::adopt(leader).expect("a running child joins its job");
+    let tree = pty.tree().expect("conpty children travel with their tree");
     assert_eq!(tree.backend(), TreeBackend::JobObject);
     tree.signal(TreeSignal::Kill).expect("terminate the job");
+    // The leader exit is observed without reaping: twice gives the same answer.
     assert_eq!(
-        wait_leader_exit(&tree),
+        wait_leader_exit(tree),
         LeaderExit::Exited(TREE_KILL_EXIT_CODE)
     );
-    let status = tree
-        .retire(|| pty.wait_timeout(WAIT_BOUND))
+    assert_eq!(
+        wait_leader_exit(tree),
+        LeaderExit::Exited(TREE_KILL_EXIT_CODE)
+    );
+    let status = pty
+        .wait_timeout(WAIT_BOUND)
         .expect("reap")
         .expect("the killed child exits in time");
     assert!(!status.is_success());
+}
+
+/// CTX-0978 (#1579): a ConPTY child that forks immediately on start still
+/// loses its grandchild to the tree kill. The helper's first act is the
+/// fork, so under the old adopt-after-start spawn the grandchild predated
+/// the assignment and survived; born into the job at creation, it dies with
+/// the tree. The `grandchild=<pid>;` announcement travels through the PTY
+/// master, proving the grandchild existed before the kill.
+///
+/// The read loop answers conhost DSR requests (see [`reply_to_dsrs`]): a
+/// byte-collecting harness that never answers leaves the console client
+/// frozen before it prints, so the announcement would never arrive.
+#[test]
+fn an_immediate_fork_conpty_grandchild_dies_with_the_tree() {
+    require_pty!();
+    let helper = std::env::current_exe().expect("test binary path");
+    let mut pty = PtyBuilder::new(helper)
+        .args([HELPER_TEST, "--exact", "--nocapture"])
+        .env(HELPER_ENV, "fork")
+        .spawn()
+        .expect("spawn conpty helper");
+    let reader = pty.take_reader().expect("reader half");
+    let mut writer = pty.take_writer().expect("writer half");
+    let tree = pty.tree().expect("conpty children travel with their tree");
+    assert_eq!(tree.backend(), TreeBackend::JobObject);
+    let grandchild = read_conpty_grandchild(&reader, &mut writer);
+    assert!(running(grandchild), "grandchild starts alive");
+    tree.signal(TreeSignal::Kill).expect("terminate the job");
+    assert_eq!(
+        wait_leader_exit(tree),
+        LeaderExit::Exited(TREE_KILL_EXIT_CODE)
+    );
+    wait_until("the grandchild to die", || !running(grandchild));
+    let status = pty
+        .wait_timeout(WAIT_BOUND)
+        .expect("reap")
+        .expect("the killed child exits in time");
+    assert!(!status.is_success());
+    // Tear the console down before joining the pump: the pump sits in a
+    // kernel read conhost owns, and only console teardown unblocks it.
+    drop(pty);
+    let _ = reader.join();
+}
+
+/// ConPTY cursor-query request: conhost emits this when the console client
+/// needs cursor state, and blocks the client until the terminal answers
+/// with [`CPR_REPLY`] on the input pipe.
+const DSR_REQUEST: &[u8] = b"\x1b[6n";
+/// Stub cursor-position report answering [`DSR_REQUEST`]: row 1, column 1.
+/// A real terminal reports its live cursor; this probe only needs client
+/// progress, so the origin stub suffices.
+const CPR_REPLY: &[u8] = b"\x1b[1;1R";
+
+/// Answers every not-yet-answered [`DSR_REQUEST`] occurrence in `buf` by
+/// writing [`CPR_REPLY`] once per occurrence. `answered` counts replies
+/// already sent for this buffer, so split or repeated requests each get
+/// exactly one reply. Write failures are ignored: the child may have
+/// exited, in which case there is nobody left to unblock and the caller
+/// asserts on bytes already collected.
+fn reply_to_dsrs(writer: &mut bitty_pty::PtyWriter, buf: &[u8], answered: &mut usize) {
+    use std::io::Write as _;
+    let mut occurrences = 0;
+    for window in buf.windows(DSR_REQUEST.len()) {
+        if window == DSR_REQUEST {
+            occurrences += 1;
+        }
+    }
+    while *answered < occurrences {
+        let _ = writer.write_all(CPR_REPLY);
+        let _ = writer.flush();
+        *answered += 1;
+    }
+}
+
+/// Reads the `grandchild=<pid>;` announcement from a ConPTY master within
+/// [`WAIT_BOUND`]. The helper is a plain console client (no cursor queries
+/// of its own), but conhost still gates client progress behind answered
+/// DSRs, so every chunk is scanned for requests via [`reply_to_dsrs`].
+/// Every wait is bounded: clean EOF or a dead pump fails fast with the
+/// bytes that did arrive (byte count plus lossy text), and only a quiet
+/// but live child polls out the deadline.
+fn read_conpty_grandchild(reader: &bitty_pty::PtyReader, writer: &mut bitty_pty::PtyWriter) -> u32 {
+    let deadline = Instant::now() + WAIT_BOUND;
+    let mut out = Vec::new();
+    let mut dsrs_answered = 0;
+    loop {
+        if let Some(pid) = parse_grandchild(&out) {
+            return pid;
+        }
+        match reader.recv_timeout(POLL) {
+            Ok(Some(chunk)) => {
+                out.extend_from_slice(&chunk);
+                reply_to_dsrs(writer, &out, &mut dsrs_answered);
+            }
+            // Clean EOF after the queue drained: whatever arrived is all
+            // there is, so the announcement will never arrive.
+            Ok(None) => panic!(
+                "grandchild pid never announced: child gone after {} bytes: {:?}",
+                out.len(),
+                String::from_utf8_lossy(&out),
+            ),
+            // Dead pump: no more bytes will ever arrive either.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!(
+                "grandchild pid never announced: output pump failed after {} bytes: {:?} (pump: {:?})",
+                out.len(),
+                String::from_utf8_lossy(&out),
+                reader.pump_error(),
+            ),
+            // Tick elapsed with no data: loop around until the deadline.
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "grandchild pid never announced ({} bytes: {:?})",
+                    out.len(),
+                    String::from_utf8_lossy(&out),
+                );
+            }
+        }
+    }
+}
+
+/// Parses the first `grandchild=<pid>;` announcement in `out`, tolerating
+/// the `\r\n` line endings the console inserts.
+fn parse_grandchild(out: &[u8]) -> Option<u32> {
+    let text = String::from_utf8_lossy(out);
+    let (_, rest) = text.split_once("grandchild=")?;
+    let (digits, _) = rest.split_once(';')?;
+    digits.trim().parse::<u32>().ok()
 }

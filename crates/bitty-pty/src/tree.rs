@@ -7,9 +7,10 @@
 //! `std::process::Command` child prepared with
 //! [`OwnedTree::prepare_command`] and adopted with
 //! [`OwnedTree::adopt_prepared`] (it leads a new process group, or starts
-//! suspended until it joins its job), or a PTY child adopted with
-//! [`OwnedTree::adopt`] (a session leader, so it already leads its own
-//! group; on Windows the ConPTY child joins its job after the spawn). The
+//! suspended until it joins its job), or a PTY child travelling with the
+//! tree assembled at its spawn (see [`crate::Pty::tree`]: a session leader
+//! on Unix, so it already leads its own group; a ConPTY child born inside
+//! its job on Windows). The
 //! platform split lives here so callers never branch on `target_os`:
 //!
 //! | Platform      | Backend                         | Leader exit observed by              |
@@ -47,11 +48,6 @@
 //! - Unix: a member that moves itself into another group or session
 //!   (`setsid`, `setpgid`) leaves the tree; only cgroups (Linux) would keep
 //!   it, and they are not used for the tree here.
-//! - Windows: a child adopted with [`OwnedTree::adopt`] after it started
-//!   running (the ConPTY child, which `portable-pty` spawns without
-//!   `CREATE_SUSPENDED`) joins its job only after the spawn; a descendant it
-//!   created before the assignment is not in the job and survives a tree
-//!   kill. [`OwnedTree::adopt_prepared`] children have no such window.
 //! - Windows: the Job Object is kill-on-close and its only handle belongs
 //!   to this process, so every live tree — detached and service jobs
 //!   included — dies when this process exits or crashes. Unix process
@@ -62,8 +58,11 @@
 //!
 //! [`OwnedTree::prepare_command`] pairs with [`OwnedTree::adopt_prepared`]
 //! and nothing else. [`OwnedTree::adopt`] is only for children that are
-//! already running (the PTY child). On Windows a prepared child handed to
-//! `adopt` is never resumed and stays suspended forever.
+//! already running and were not spawned through [`crate::PtyBuilder`]: PTY
+//! children travel with their tree (see [`crate::Pty::tree`]), which on
+//! Windows is assembled at creation with no adopt-after-start window. On
+//! Windows a prepared child handed to `adopt` is never resumed and stays
+//! suspended forever.
 //!
 //! Nothing here uses `unsafe`: `rustix` (Linux), `nix` (macOS), and the
 //! first-party `bitty-winjob` adapter (Windows) own the system-call
@@ -266,15 +265,30 @@ impl OwnedTree {
         Self::adopt(leader)
     }
 
+    /// Assembles the tree for a ConPTY child born inside `job` at creation
+    /// (Windows only): `member` observes the leader `pid`, which the spawn
+    /// placed in the job atomically. There is no adopt-after-start window.
+    #[cfg(windows)]
+    pub(crate) fn adopt_spawned(
+        pid: u32,
+        job: bitty_winjob::JobObject,
+        member: bitty_winjob::JobMember,
+    ) -> Self {
+        Self {
+            leader: pid,
+            retired: Mutex::new(false),
+            observer: imp::Observer::from_spawned(job, member),
+        }
+    }
+
     /// Takes over the tree led by `leader`.
     ///
     /// `leader` must be a child of this process that is not reaped yet and
-    /// leads its own process group and is already running (a PTY child).
-    /// Call this right after the spawn, before anything else may reap the
-    /// child.
-    ///
-    /// On Windows the running child is assigned to a new Job Object; see
-    /// the module docs for the residual pre-assignment window.
+    /// leads its own process group and is already running (a non-PTY child
+    /// such as a helper spawned outside [`crate::PtyBuilder`]). PTY children
+    /// travel with their tree (see [`crate::Pty::tree`]) and must not be
+    /// adopted here. Call this right after the spawn, before anything else
+    /// may reap the child.
     ///
     /// # Warning: already-running children only
     ///

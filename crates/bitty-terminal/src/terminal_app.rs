@@ -556,12 +556,14 @@ impl TerminalApp {
         self
     }
 
-    /// Composer ownership for this input path (W-103 S-5 cutover rule).
+    /// Composer ownership for this input path (W-103 S-5 cutover rule,
+    /// retained through E-CUT retirement CTX-0968).
     ///
     /// The ACTIVE composer plugin owns the editing UX via
     /// overlay/capture/submit/editor; every other state (safe mode,
     /// zero-plugin startup, uninstalled, not activated, version or
-    /// capability mismatch) keeps the retained Core edit/submit path.
+    /// capability mismatch) is retained-deleted: fail-closed with a
+    /// diagnostic, no Core composer session (E-CUT-1/2/4 retired it).
     pub(crate) fn composer_owner(&self) -> crate::composer_owner::ComposerOwner {
         crate::composer_owner::decide_composer_owner(self.safe_mode, self.plugin_runtime.as_ref())
     }
@@ -571,26 +573,27 @@ impl TerminalApp {
         self.composer_owner().plugin_owns()
     }
 
-    /// Opens the retained Core composer session, latching fallback routing
-    /// when the plugin owns the UX (W-103 S-5, CTX-0929): the open session
-    /// must stay served even though ownership stays plugin, or it strands
-    /// visible-but-dead. Every retained-Core open under plugin ownership
-    /// (dispatch-error fallback, editor-exit reopen, vanished-leaf reopen)
-    /// routes through here. In retained mode the latch is a harmless no-op
-    /// (the guard serves retained sessions regardless).
+    /// Retired-core open (E-CUT, CTX-0968): fail-closed, no session.
+    ///
+    /// The Core composer engine is deleted; the plugin owns editing UX.
+    /// Retained callers (dispatch-error fallback, editor-exit paths) land
+    /// here and receive a diagnostic only. The fallback latch is retained
+    /// for dispatch observability but no session is ever opened.
     pub(crate) fn open_retained_composer(&mut self) {
-        self.runtime.cw_composer_open();
         if self.composer_plugin_owns() {
             self.composer_core_fallback_latched = true;
         }
+        eprintln!(
+            "bitty: composer retired (E-CUT): no retained Core session; plugin owns editing UX"
+        );
     }
 
     /// Dispatches one composer session verb to the ACTIVE plugin
     /// (`<id>:<verb>` via the plugin runtime).
     ///
     /// Fails closed with a diagnostic when the plugin does not own the
-    /// editing UX or the dispatch itself fails; the caller falls back to
-    /// the retained Core path.
+    /// editing UX or the dispatch itself fails; there is no retained Core
+    /// fallback after E-CUT (retained-deleted, fail-closed).
     pub(crate) fn dispatch_composer_command(&mut self, verb: &str) -> Result<(), String> {
         use crate::composer_owner::{COMPOSER_KNOWN_VERBS, COMPOSER_PLUGIN_ID, ComposerOwner};
         if !COMPOSER_KNOWN_VERBS.contains(&verb) {

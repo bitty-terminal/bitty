@@ -1,7 +1,7 @@
 //! CW render-path present enrichment (CTX-0687; live since CTX-0700).
 //!
-//! One headless present-path composer over the CW render-path issues. It
-//! consumes the accepted headless models — fold, hints, composer, anchors,
+//! Headless present-path enrichment over the CW render-path issues. It
+//! consumes the accepted headless models — fold, hints, anchors,
 //! rich scene, non-terminal panel content — into a single bounded
 //! [`CwPresentPlan`] derived per [`PresentFrame`](crate::runtime::PresentFrame)
 //! at refresh, without touching grid truth, GPU, PTY, or the filesystem.
@@ -12,7 +12,7 @@
 //! |---|---|---|
 //! | #980 CW-01 | fold toggle/expand/collapse into present | [`CwFoldAction`] + [`apply_fold_action`] + [`fold_present`] |
 //! | #981 CW-02 | hint overlay + dispatch | [`present_hint_batch`] + [`present_overlay_cost`] + [`hint_overlay_present`] + [`dispatch_present`] |
-//! | #982 CW-03 | composer overlay + input routing + editor flag | [`CwInputRoute`] + [`feed_present`] + [`composer_present`] |
+//! | #982 CW-03 | retired (E-CUT-4, CTX-0968): composer overlay deleted, plugin owns editing UX | — |
 //! | #983 CW-04 | cross-panel hint API, one engine | [`CwHintEngine`] + [`CwHintProvider`] |
 //! | #984 CW-05 | semantic anchor identity + fold persistence | [`SemanticAnchor`] + [`anchor_for_command`] + [`persist_fold_ordinals`] |
 //! | #985 CW-06 | consume rich scene in present | [`consume_scene_present`] + [`ScenePresent`] |
@@ -24,19 +24,18 @@
 //! (scrollback identity), `OQ-051` (panel-is-not-terminal), and
 //! `OQ-088`/`OQ-089` (hint leadership; the hint engine is the OQ-089
 //! Beacon). The module is wired into the live path: [`Runtime`](crate::Runtime)
-//! owns the single [`CwHintEngine`] and fold/composer state
-//! (`runtime::cw_live`), and the app binds the fold, hint, and composer
+//! owns the single [`CwHintEngine`] and fold state
+//! (`runtime::cw_live`), and the app binds the fold and hint
 //! verbs through `bitty-terminal`'s `chrome_keys` keymap dispatch. The
-//! composer overlay (CW-03) still awaits a later policy review. No editor
+//! composer overlay (CW-03) is retired (E-CUT-4, CTX-0968): the plugin owns
+//! editing UX via overlay/capture/submit/editor host operations. No editor
 //! process is spawned and no grid write happens here.
 //!
 //! # Terminal truth
 //!
 //! The only mutation in the system is the caller's [`FoldState`](bitty_rich::blocks::FoldState)
 //! via [`apply_fold_action`] / [`dispatch_present`]. Grid, scrollback,
-//! zones, clipboard, and snapshots are never written. The composer editor is
-//! represented as a routing flag ([`CwComposerFeed::EditorRequested`]); no
-//! process is spawned here.
+//! zones, clipboard, and snapshots are never written.
 //!
 //! # Bounds
 //!
@@ -54,7 +53,6 @@
 //! No I/O, no wall-clock, no randomness, no unsafe.
 
 use bitty_rich::blocks::{CommandBlock, CommandId, FoldState, hidden_blocks, visible_blocks};
-use bitty_rich::composer::{ComposerKeyEvent, ComposerSession, frame_submit};
 use bitty_rich::hints::{
     DispatchError, DispatchOutcome, HintAction, HintAnchor, HintBatch, HintKind, HintRegistry,
     HintScope, collect_command_targets, collect_link_targets, collect_panel_targets,
@@ -419,125 +417,6 @@ pub enum HintKeyOutcome {
 }
 
 // ---------------------------------------------------------------------------
-// CW-03 (#982): composer overlay + input routing + editor flag
-// ---------------------------------------------------------------------------
-
-/// Where one input event routes while the present frame is live (CW-03).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum CwInputRoute {
-    /// Composer is closed: bytes reach the PTY unchanged.
-    Pty,
-    /// Composer is open: the press feeds [`feed_present`], never the PTY.
-    Composer,
-}
-
-/// Routes input for the current present frame around the composer session.
-///
-/// Closed (the default) routes to the PTY byte-identically; open routes to
-/// the composer. There is no auto-enter path: opening is always explicit via
-/// [`ComposerSession::open`].
-#[must_use]
-pub fn route_present_input(session: &ComposerSession) -> CwInputRoute {
-    if session.is_open() {
-        CwInputRoute::Composer
-    } else {
-        CwInputRoute::Pty
-    }
-}
-
-/// Headless composer snapshot carried by the present frame.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ComposerPresent {
-    /// Whether the composer overlay paints this frame.
-    pub open: bool,
-    /// Draft bytes held in the buffer (≤ `COMPOSER_MAX_BYTES`).
-    pub draft_bytes: usize,
-}
-
-impl ComposerPresent {
-    /// Whether the modal composer overlay paints.
-    #[must_use]
-    pub const fn is_open(&self) -> bool {
-        self.open
-    }
-}
-
-/// Snapshots the composer overlay state for one present frame.
-#[must_use]
-pub fn composer_present(session: &ComposerSession) -> ComposerPresent {
-    ComposerPresent {
-        open: session.is_open(),
-        draft_bytes: session.content().len(),
-    }
-}
-
-/// Owned outcome of feeding one press through the present path (CW-03).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CwComposerFeed {
-    /// Session closed: the caller must write the bytes to the PTY unchanged.
-    PtyPassthrough,
-    /// Printable text appended to the draft.
-    Inserted,
-    /// Newline appended to the draft.
-    Newline,
-    /// Submit frame ready for a single PTY write (session auto-closed).
-    Submitted(Vec<u8>),
-    /// Composer closed, draft preserved for reopen.
-    Closed,
-    /// Caller should run the external-editor round trip, then feed the result
-    /// back via [`ComposerSession::apply_external_result`]. No process is
-    /// spawned here: the present path records the request only.
-    EditorRequested,
-    /// Press matched no composer role; swallowed, draft untouched.
-    Ignored,
-    /// Draft cap hit; buffer and open-state untouched.
-    TooLarge {
-        /// Bytes the content would have had.
-        wanted: usize,
-    },
-}
-
-/// Feeds one key press through the present-path composer.
-///
-/// Closed sessions return [`CwComposerFeed::PtyPassthrough`] (the hard
-/// boundary: normal-mode input is PTY byte-identical). Open sessions map the
-/// [`ComposerSession`] outcome 1:1, including the submit frame
-/// (`ESC[200~ + content + ESC[201~ + CR`) and the external-editor request
-/// flag.
-pub fn feed_present(session: &mut ComposerSession, ev: ComposerKeyEvent) -> CwComposerFeed {
-    if !session.is_open() {
-        return CwComposerFeed::PtyPassthrough;
-    }
-    match session.feed(ev) {
-        Ok(outcome) => match outcome {
-            bitty_rich::composer::ComposerFeedOutcome::Inserted => CwComposerFeed::Inserted,
-            bitty_rich::composer::ComposerFeedOutcome::Newline => CwComposerFeed::Newline,
-            bitty_rich::composer::ComposerFeedOutcome::Submitted(frame) => {
-                CwComposerFeed::Submitted(frame)
-            }
-            bitty_rich::composer::ComposerFeedOutcome::Closed => CwComposerFeed::Closed,
-            bitty_rich::composer::ComposerFeedOutcome::ExternalEditorRequested => {
-                CwComposerFeed::EditorRequested
-            }
-            bitty_rich::composer::ComposerFeedOutcome::Ignored => CwComposerFeed::Ignored,
-        },
-        Err(bitty_rich::composer::ComposerFeedError::NotOpen) => CwComposerFeed::PtyPassthrough,
-        Err(bitty_rich::composer::ComposerFeedError::TooLarge { wanted }) => {
-            CwComposerFeed::TooLarge { wanted }
-        }
-    }
-}
-
-/// Frames draft content for submit without a session (PTY write helper).
-///
-/// Returns `None` (fail-closed, nothing emitted) when the content exceeds the
-/// composer cap. See [`frame_submit`] for the byte-exact contract.
-#[must_use]
-pub fn submit_present(content: &str) -> Option<Vec<u8>> {
-    frame_submit(content).ok()
-}
-
-// ---------------------------------------------------------------------------
 // CW-04 (#983): cross-panel hint API — one engine owns labels/overlay/dispatch
 // ---------------------------------------------------------------------------
 
@@ -818,8 +697,6 @@ pub struct CwPresentInputs<'a> {
     pub fold: &'a FoldState,
     /// Pre-collected hint batch for this generation.
     pub hints: &'a HintBatch,
-    /// Composer session (overlay + routing source).
-    pub composer: &'a ComposerSession,
     /// Rich scene (paint-budget source).
     pub scene: &'a Scene,
     /// Leaf content (terminal vs non-terminal split).
@@ -828,7 +705,8 @@ pub struct CwPresentInputs<'a> {
     pub node: UiNodeId,
 }
 
-/// One frame's CW present enrichment: all seven slices composed.
+/// One frame's CW present enrichment: fold, hints, scene, non-terminal
+/// composed (composer retired, E-CUT-4).
 ///
 /// Derived once per [`PresentFrame`](crate::runtime::PresentFrame) at refresh
 /// from headless inputs. Pure (except the caller's fold, which this function
@@ -855,12 +733,6 @@ pub struct CwPresentPlan {
     /// One-frame hint overlay paint payload (CTX-0735, #981): the batch
     /// labels as a single annotation pass (zero overlay slots).
     pub hint_overlay: HintOverlayPresent,
-    /// Whether the composer overlay paints.
-    pub composer_open: bool,
-    /// Composer draft bytes.
-    pub composer_draft_bytes: usize,
-    /// Where input routes this frame.
-    pub input_route: CwInputRoute,
     /// Rich-scene paint budget.
     pub scene: ScenePresent,
     /// Non-terminal payload (`None` for grid-owned leaves).
@@ -881,9 +753,6 @@ pub fn plan_present(inputs: &CwPresentInputs<'_>) -> CwPresentPlan {
         hint_shed: inputs.hints.shed,
         hint_overlay_cost: present_overlay_cost(inputs.hints),
         hint_overlay: hint_overlay_present(inputs.hints),
-        composer_open: inputs.composer.is_open(),
-        composer_draft_bytes: inputs.composer.content().len(),
-        input_route: route_present_input(inputs.composer),
         scene: consume_scene_present(inputs.scene, CW_PRESENT_MAX_SCENE_BLOCKS),
         nonterminal: nonterminal_for_content(inputs.content, inputs.node, 0),
     }
@@ -893,7 +762,6 @@ pub fn plan_present(inputs: &CwPresentInputs<'_>) -> CwPresentPlan {
 mod tests {
     use super::*;
     use bitty_rich::blocks::{CommandState, SemanticRange};
-    use bitty_rich::composer::ComposerFeedError;
     use bitty_rich::hints::{HintActions, HintAnchor, HintKind};
     use bitty_rich::scene::{BlockAnchor, RichBlock, SceneNode, ScrollBehavior, StyledSpan};
     use bitty_rich::shell::CommandRegion;
@@ -1121,60 +989,6 @@ mod tests {
     }
 
     #[test]
-    fn composer_closed_routes_to_pty_passthrough() {
-        let mut session = ComposerSession::new();
-        assert_eq!(route_present_input(&session), CwInputRoute::Pty);
-        assert_eq!(
-            feed_present(&mut session, ComposerKeyEvent::printable('x')),
-            CwComposerFeed::PtyPassthrough
-        );
-        let snapshot = composer_present(&session);
-        assert!(!snapshot.is_open());
-        assert_eq!(snapshot.draft_bytes, 0);
-        assert_eq!(session.content(), "");
-    }
-
-    #[test]
-    fn composer_open_submit_frames_bracketed_paste() {
-        let mut session = ComposerSession::new();
-        session.open();
-        assert_eq!(route_present_input(&session), CwInputRoute::Composer);
-        session
-            .apply_external_result("echo hi")
-            .expect("fits composer cap");
-        assert_eq!(composer_present(&session).draft_bytes, 7);
-        let outcome = feed_present(&mut session, ComposerKeyEvent::ctrl_enter());
-        match outcome {
-            CwComposerFeed::Submitted(frame) => {
-                assert!(frame.starts_with(b"\x1b[200~"));
-                assert!(frame.ends_with(b"\x1b[201~\r"));
-                assert!(frame.windows(7).any(|w| w == b"echo hi"));
-            }
-            other => panic!("expected submit frame, got {other:?}"),
-        }
-        assert_eq!(route_present_input(&session), CwInputRoute::Pty);
-        assert_eq!(
-            submit_present("echo hi").expect("fits cap").as_slice(),
-            b"\x1b[200~echo hi\x1b[201~\r",
-        );
-        assert_eq!(
-            session.feed(ComposerKeyEvent::printable('y')),
-            Err(ComposerFeedError::NotOpen)
-        );
-    }
-
-    #[test]
-    fn composer_editor_request_is_flag_only() {
-        let mut session = ComposerSession::new();
-        session.open();
-        assert_eq!(
-            feed_present(&mut session, ComposerKeyEvent::alt_e()),
-            CwComposerFeed::EditorRequested
-        );
-        assert!(session.is_open());
-    }
-
-    #[test]
     fn anchor_identity_is_ordinal_never_grid_row() {
         let block = test_block(42);
         let anchor = anchor_for_command(&block);
@@ -1255,7 +1069,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_present_composes_all_seven_slices() {
+    fn plan_present_composes_slices_without_composer() {
         let blocks = vec![test_block(1), test_block(2)];
         let mut fold = FoldState::new();
         assert!(apply_fold_action(
@@ -1264,7 +1078,6 @@ mod tests {
             CwFoldAction::Collapse
         ));
         let batch = empty_batch();
-        let composer = ComposerSession::new();
         let scene = Scene::new();
         let inputs = CwPresentInputs {
             view: ViewId::new(1),
@@ -1272,7 +1085,6 @@ mod tests {
             blocks: &blocks,
             fold: &fold,
             hints: &batch,
-            composer: &composer,
             scene: &scene,
             content: ViewContent::Panel(PanelId::new(9)),
             node: UiNodeId::new(3),
@@ -1288,8 +1100,6 @@ mod tests {
         );
         assert_eq!(plan.hint_labels, 0);
         assert_eq!(plan.hint_overlay_cost, 0);
-        assert!(!plan.composer_open);
-        assert_eq!(plan.input_route, CwInputRoute::Pty);
         assert_eq!(plan.scene.block_count(), 0);
         assert!(plan.nonterminal.is_some());
     }

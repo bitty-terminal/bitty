@@ -610,14 +610,13 @@ pub struct Runtime {
     overlay_modal_active: bool,
     /// Next workspace creation sequence (display names `ws{seq}`).
     next_workspace_seq: u64,
-    /// CW live present state (CTX-0700): caller-owned fold projection,
-    /// composer overlay session, and cross-panel hint engine.
+    /// CW live present state (CTX-0700): caller-owned fold projection
+    /// and cross-panel hint engine.
     ///
     /// Headless, bounded, presentation-only. The grid, scrollback, PTY, and
     /// GPU are never touched through these fields; they feed the
     /// [`crate::cw_present`] live path via `runtime::cw_live`.
     cw_fold: bitty_rich::blocks::FoldState,
-    cw_composer: bitty_rich::composer::ComposerSession,
     cw_hints: crate::cw_present::CwHintEngine,
     /// Live hint interaction: armed batch plus per-keystroke operator/label
     /// accumulation (CTX-0723, #981). The app arms on the Leader chord and
@@ -1524,7 +1523,6 @@ impl Runtime {
             overlay_modal_active: false,
             next_workspace_seq: 2,
             cw_fold: bitty_rich::blocks::FoldState::new(),
-            cw_composer: bitty_rich::composer::ComposerSession::new(),
             // Command targets join every live collection: fold/jump/copy
             // over shell commands is the core hint surface; panels join
             // via `cw_hint_register`. Headless-neutral (zero zones yields
@@ -1758,7 +1756,6 @@ impl Runtime {
             overlay_modal_active: false,
             next_workspace_seq: 2,
             cw_fold: bitty_rich::blocks::FoldState::new(),
-            cw_composer: bitty_rich::composer::ComposerSession::new(),
             // Command targets join every live collection: fold/jump/copy
             // over shell commands is the core hint surface; panels join
             // via `cw_hint_register`. Headless-neutral (zero zones yields

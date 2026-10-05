@@ -23,14 +23,13 @@
 //! `bitty-render`. The `kitty` stub is retained for compatibility and
 //! mirrors the legacy term-state bounds; new code should use `image`.
 //!
-//! The `composer` and `host` modules hold the only filesystem/process seams
+//! The `host` module holds the only filesystem/process seams
 //! in this crate: the external-editor round trip writes a `0600` temp file
-//! and spawns `$VISUAL`/`$EDITOR` with a bounded timeout plus kill.
-//! `composer` keeps the legacy mechanics (ambient temp dir, inherited
-//! stdio/env, direct-child kill); `host` implements the typed host-operation
-//! boundary (Bitty-owned `0700` root, minimized env, closed stdin,
-//! owned-tree kill, typed outcomes). Everything else here is pure logic over
-//! `State`/`Snapshot` values.
+//! in a Bitty-owned `0700` root and spawns `$VISUAL`/`$EDITOR` with a
+//! bounded timeout plus owned-tree kill, behind the typed host-operation
+//! boundary (minimized env, closed stdin, typed outcomes). The retired
+//! composer policy engine is gone (E-CUT-1, CTX-0968). Everything else here
+//! is pure logic over `State`/`Snapshot` values.
 //!
 //! # Bounds (threat T-01/T-02)
 //!
@@ -68,8 +67,8 @@
 //! | [`hints::HINT_TARGET_MAX`] hint targets / labels | 256 | register fails closed; batch sheds sorted tail |
 //! | hint label text per batch | [`hints::HINT_TEXT_MAX_BYTES`] (8 KiB) | allocation stops at budget, remainder shed |
 //! | hint batches as overlays | `0` slots | single annotation layer bypasses (never consumes) the `4+1` bound |
-//! | [`composer::COMPOSER_MAX_BYTES`] composer buffer / temp file | 64 KiB | insert/frame/edit fail closed, buffer kept, temp deleted |
-//! | composer editor wait | [`composer::EDITOR_TIMEOUT_MAX`] (300 s) | kill + `Timeout` error, buffer kept, temp deleted |
+//! | [`host::COMPOSER_MAX_BYTES`] buffer / temp file | 64 KiB | insert/frame/edit fail closed, buffer kept, temp deleted |
+//! | editor wait | [`host::EDITOR_TIMEOUT_MAX`] (300 s) | kill + `Timeout` error, buffer kept, temp deleted |
 //!
 //! # Headless seam
 //!
@@ -81,7 +80,7 @@
 //! retains only the declared-size pre-check ([`kitty_place`]) and the
 //! pre-upload re-validation on caller-supplied bitmaps. All tests run on
 //! GPU-less CI via pure logic on
-//! `State`/`Snapshot` values, except the composer external-editor round-trip
+//! `State`/`Snapshot` values, except the host external-editor round-trip
 //! (OS temp file plus an allowlisted `$VISUAL`/`$EDITOR` child process,
 //! exercised with fake editor scripts). Where rendering geometry is needed (hyperlink
 //! underline rects, kitty placeholder rects) the caller supplies a
@@ -93,7 +92,6 @@
 pub mod background;
 pub mod blocks;
 pub mod clipboard;
-pub mod composer;
 pub mod geometry;
 pub mod hints;
 pub mod host;
@@ -124,15 +122,6 @@ pub use blocks::{
 pub use clipboard::{
     ClipboardGrantScope, ClipboardPolicy, ClipboardReadToken, ClipboardRequest, ClipboardState,
 };
-pub use composer::{
-    BufferError, COMPOSER_MAX_BYTES, COMPOSER_OPEN_CHORD, ChordParseError, CommandBuffer,
-    ComposerChord, ComposerFeedError, ComposerFeedOutcome, ComposerKey, ComposerKeyEvent,
-    ComposerKeys, ComposerKeysError, ComposerSession, EDITOR_ALLOWLIST, EDITOR_TIMEOUT_DEFAULT,
-    EDITOR_TIMEOUT_MAX, EditorError, OpenChord, OpenChordError, PASTE_CLOSE, PASTE_OPEN,
-    SUBMIT_TERMINATOR, TempComposerFile, edit_externally, frame_submit, normal_mode_passthrough,
-    read_composer_back, resolve_editor, run_editor, should_auto_offer, validate_open_chord,
-    write_composer_temp,
-};
 pub use geometry::{CellMetrics, ExtentPx, RectPx};
 pub use hints::{
     ChordError, DispatchError, DispatchOutcome, HINT_LABEL_ALPHABET, HINT_LABEL_MAX_CHARS,
@@ -144,10 +133,13 @@ pub use hints::{
     label_for_index, parse_hint_chord, resolve_link_uri,
 };
 pub use host::{
-    EditorDeny, EditorOutcome, HOSTED_ENV_KEEP, OWNED_TEMP_DIR_NAME, SUBMIT_PLUGIN_ID_MAX,
-    SubmitBudget, SubmitDeny, build_hosted_env, check_terminal_submit, hosted_env_keeps,
-    minimized_env_removals, owned_temp_root, process_editor_start, run_editor_hosted,
-    sweep_crashed_temps,
+    BufferError, COMPOSER_MAX_BYTES, CommandBuffer, EDITOR_ALLOWLIST, EDITOR_TIMEOUT_DEFAULT,
+    EDITOR_TIMEOUT_MAX, EditorDeny, EditorError, EditorOutcome, HOSTED_ENV_KEEP,
+    OWNED_TEMP_DIR_NAME, PASTE_CLOSE, PASTE_OPEN, SUBMIT_PLUGIN_ID_MAX, SUBMIT_TERMINATOR,
+    SubmitBudget, SubmitDeny, TempComposerFile, build_hosted_env, check_terminal_submit,
+    frame_submit, hosted_env_keeps, minimized_env_removals, owned_temp_root, process_editor_start,
+    read_composer_back, resolve_editor, run_editor_hosted, sweep_crashed_temps,
+    write_composer_temp,
 };
 pub use hyperlink::{HyperlinkInfo, HyperlinkSpan};
 pub use image::{

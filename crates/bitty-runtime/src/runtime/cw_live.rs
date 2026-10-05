@@ -1,10 +1,10 @@
 #![forbid(unsafe_code)]
 //! Live CW present wiring (CTX-0700).
 //!
-//! [`Runtime`] is the live owner of the three headless CW present states:
-//! the caller-owned fold projection, the composer overlay session, and the
-//! single cross-panel hint engine. Every method below is a live-path
-//! consumer of the evidence-only [`crate::cw_present`] candidates:
+//! [`Runtime`] is the live owner of the headless CW present states:
+//! the caller-owned fold projection and the single cross-panel hint engine.
+//! Every method below is a live-path consumer of the evidence-only
+//! [`crate::cw_present`] candidates:
 //!
 //! - issue #980 (CW-01): [`Runtime::cw_fold_apply`] +
 //!   [`Runtime::cw_fold_projection`] call [`crate::cw_present::apply_fold_action`]
@@ -15,11 +15,6 @@
 //!   [`Runtime::cw_hint_push_key`] + [`Runtime::cw_hint_disarm`] own the
 //!   live [`bitty_rich::hints::HintSession`] behind the operator-conflict
 //!   gate with prefix-completion dispatch;
-//! - issue #982 (CW-03): [`Runtime::cw_input_route`] +
-//!   [`Runtime::cw_composer_feed`] + [`Runtime::cw_composer_snapshot`] call
-//!   [`crate::cw_present::route_present_input`],
-//!   [`crate::cw_present::feed_present`], and
-//!   [`crate::cw_present::composer_present`];
 //! - issue #983 (CW-04): [`Runtime::cw_hint_register`] +
 //!   [`Runtime::cw_hint_unregister`] + [`Runtime::cw_hint_collect`] +
 //!   [`Runtime::cw_hint_dispatch`] own one
@@ -45,14 +40,12 @@
 //!   [`crate::cw_present::plan_present`] once per present derivation.
 //!
 //! Headless, bounded, presentation-only: the grid, scrollback, PTY, GPU,
-//! and filesystem are never touched here. The composer editor stays a
-//! routing flag (no process is spawned); grid truth stays with `State`.
+//! and filesystem are never touched here. Grid truth stays with `State`.
 
 use super::*;
 
 use bitty_plugin_host::InterceptionDecision;
 use bitty_rich::blocks::{CommandBlock, CommandId, blocks};
-use bitty_rich::composer::{ComposerFeedError, ComposerKeyEvent};
 use bitty_rich::hints::{
     DispatchError, DispatchOutcome, HINT_LABEL_MAX_CHARS, HintAction, HintAnchor, HintBatch,
     HintFeedError, HintOperator, HintScope, OperatorConflict,
@@ -60,10 +53,9 @@ use bitty_rich::hints::{
 use bitty_rich::scene::Scene;
 
 use crate::cw_present::{
-    ComposerPresent, CwComposerFeed, CwFoldAction, CwHintProvider, CwInputRoute, CwPresentInputs,
-    CwPresentPlan, FoldPresent, HintKeyOutcome, HintOverlayCell, apply_fold_action,
-    composer_present, dispatch_link_present, dispatch_present, feed_present, fold_present,
-    hint_overlay_present, persist_fold_ordinals, plan_present, route_present_input,
+    CwFoldAction, CwHintProvider, CwPresentInputs, CwPresentPlan, FoldPresent, HintKeyOutcome,
+    HintOverlayCell, apply_fold_action, dispatch_link_present, dispatch_present, fold_present,
+    hint_overlay_present, persist_fold_ordinals, plan_present,
 };
 use crate::registry::PanelRuntime;
 
@@ -91,66 +83,6 @@ impl Runtime {
     #[must_use]
     pub fn cw_fold_projection(&self, blocks: &[CommandBlock]) -> FoldPresent {
         fold_present(blocks, &self.cw_fold)
-    }
-
-    /// Explicitly opens the composer overlay (issue #982).
-    ///
-    /// Opening is always explicit; there is no auto-enter path.
-    pub fn cw_composer_open(&mut self) {
-        self.cw_composer.open();
-    }
-
-    /// Closes the composer overlay, preserving the draft for reopen.
-    pub fn cw_composer_close(&mut self) {
-        self.cw_composer.close();
-    }
-
-    /// Whether the composer overlay paints this frame.
-    #[must_use]
-    pub fn cw_composer_is_open(&self) -> bool {
-        self.cw_composer.is_open()
-    }
-
-    /// Current composer draft content.
-    #[must_use]
-    pub fn cw_composer_content(&self) -> &str {
-        self.cw_composer.content()
-    }
-
-    /// Routes input for the current present frame around the composer
-    /// session (issue #982).
-    ///
-    /// Closed routes to the PTY byte-identically; open routes to the
-    /// composer via [`Runtime::cw_composer_feed`].
-    #[must_use]
-    pub fn cw_input_route(&self) -> CwInputRoute {
-        route_present_input(&self.cw_composer)
-    }
-
-    /// Feeds one key press through the live present-path composer.
-    ///
-    /// Closed sessions return [`CwComposerFeed::PtyPassthrough`] (normal-mode
-    /// input stays PTY byte-identical). The external-editor outcome is a
-    /// routing flag only; no process is spawned here.
-    pub fn cw_composer_feed(&mut self, ev: ComposerKeyEvent) -> CwComposerFeed {
-        feed_present(&mut self.cw_composer, ev)
-    }
-
-    /// Snapshots the live composer overlay state for one present frame.
-    #[must_use]
-    pub fn cw_composer_snapshot(&self) -> ComposerPresent {
-        composer_present(&self.cw_composer)
-    }
-
-    /// Applies an external-editor round-trip result back to the live draft.
-    ///
-    /// Fails closed past the composer cap with the old content kept.
-    ///
-    /// # Errors
-    ///
-    /// [`ComposerFeedError::TooLarge`] when `content` exceeds the cap.
-    pub fn cw_composer_apply_external(&mut self, content: &str) -> Result<(), ComposerFeedError> {
-        self.cw_composer.apply_external_result(content)
     }
 
     /// Registers one panel provider on the live cross-panel hint engine
@@ -566,7 +498,6 @@ impl Runtime {
             blocks,
             fold: &self.cw_fold,
             hints,
-            composer: &self.cw_composer,
             scene,
             content,
             node,
@@ -575,13 +506,12 @@ impl Runtime {
     }
 
     /// Derives the one-frame CW present enrichment for a live view
-    /// (issues #980/#982/#983 and the remaining present slices).
+    /// (issues #980/#983 and the remaining present slices).
     ///
     /// Composes the fold projection, semantic anchors, hint batch summary,
-    /// composer overlay + routing, rich-scene paint budget, and the
-    /// non-terminal payload from headless inputs plus the live fold and
-    /// composer states. Pure except for reading live present state; the live
-    /// fold is never mutated here (dispatch goes through
+    /// rich-scene paint budget, and the non-terminal payload from headless
+    /// inputs plus the live fold state. Pure except for reading live present
+    /// state; the live fold is never mutated here (dispatch goes through
     /// [`Runtime::cw_hint_dispatch`]).
     #[must_use]
     #[allow(clippy::too_many_arguments)]
@@ -601,7 +531,6 @@ impl Runtime {
             blocks,
             fold: &self.cw_fold,
             hints,
-            composer: &self.cw_composer,
             scene,
             content,
             node,

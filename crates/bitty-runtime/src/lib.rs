@@ -198,9 +198,10 @@ pub mod tabs;
 pub mod workspace;
 
 // Re-export present-path interaction types for the app composition root
-// (CTX-0723): the Leader/hint/composer/fold input path consumes these
+// (CTX-0723): the Leader/hint/fold input path consumes these
 // without taking a direct `bitty-rich` dependency in `bitty-terminal`.
-pub use bitty_rich::composer::{ComposerKey, ComposerKeyEvent};
+// Composer types retired with E-CUT-1/2 (CTX-0968); the plugin owns editing
+// UX via overlay/capture/submit/editor host operations.
 pub use bitty_rich::hints::{DispatchOutcome, HintFeedError, HintScope};
 pub use runtime::cw_live::HintLinkOpenError;
 

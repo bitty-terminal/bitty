@@ -7,8 +7,8 @@
 //!
 //! - #980 (CW-01): fold toggle/expand/collapse into the present path via
 //!   `Runtime::cw_fold_apply` / `cw_fold_projection` / `cw_present_plan`.
-//! - #982 (CW-03): composer overlay + input routing + editor flag via
-//!   `Runtime::cw_composer_*` / `cw_input_route` / `cw_composer_feed`.
+//! - #982 (CW-03): retired (E-CUT-4, CTX-0968): composer overlay deleted,
+//!   plugin owns editing UX via host operations.
 //! - #983 (CW-04): cross-panel hint API via the single live
 //!   `CwHintEngine` owned by `Runtime`.
 //! - #998 (CW-20): panel host shape via `PanelRuntime` (lifecycle plus the
@@ -19,7 +19,6 @@
 //! Headless only: no PTY, window, GPU, wall-clock, or filesystem.
 
 use bitty_rich::blocks::{CommandBlock, CommandId, CommandState, SemanticRange};
-use bitty_rich::composer::ComposerKeyEvent;
 use bitty_rich::hints::{
     HintAction, HintActions, HintAnchor, HintBatch, HintKind, HintRegistry, HintScope,
 };
@@ -29,7 +28,7 @@ use bitty_rich::scene::{
 use bitty_rich::shell::CommandRegion;
 use bitty_runtime::Runtime;
 use bitty_runtime::config::RuntimeConfig;
-use bitty_runtime::cw_present::{CwFoldAction, CwHintProvider, CwInputRoute};
+use bitty_runtime::cw_present::{CwFoldAction, CwHintProvider};
 use bitty_runtime::registry::{
     BUS_BATCH_MAX_BYTES, BUS_BATCH_MAX_EVENTS, BUS_PUBLISH_CAPABILITY, BUS_SUBSCRIBE_CAPABILITY,
     BoundedPayload, BusTopicFamily, PanelProviderManifest, PanelRegistryConfig, PanelRuntime,
@@ -126,57 +125,6 @@ fn cw980_fold_toggle_flows_into_live_present_plan() {
     assert_eq!(plan.hidden_command_ids, vec![CommandId(2)]);
     assert_eq!(plan.hint_overlay_cost, 0);
     assert!(plan.nonterminal.is_some());
-}
-
-#[test]
-fn cw982_composer_overlay_routing_and_editor_flag_through_runtime() {
-    let mut rt = runtime();
-
-    // Closed by default: input routes to the PTY byte-identically.
-    assert!(!rt.cw_composer_is_open());
-    assert_eq!(rt.cw_input_route(), CwInputRoute::Pty);
-    assert_eq!(
-        rt.cw_composer_feed(ComposerKeyEvent::printable('x')),
-        bitty_runtime::cw_present::CwComposerFeed::PtyPassthrough
-    );
-    assert!(!rt.cw_composer_snapshot().is_open());
-
-    // Explicit open routes to the composer; printable text inserts.
-    rt.cw_composer_open();
-    assert!(rt.cw_composer_is_open());
-    assert_eq!(rt.cw_input_route(), CwInputRoute::Composer);
-    assert_eq!(
-        rt.cw_composer_feed(ComposerKeyEvent::printable('h')),
-        bitty_runtime::cw_present::CwComposerFeed::Inserted
-    );
-    assert_eq!(rt.cw_composer_content(), "h");
-    assert_eq!(rt.cw_composer_snapshot().draft_bytes, 1);
-
-    // External-editor request is a routing flag only: no process spawns and
-    // the session stays open.
-    assert_eq!(
-        rt.cw_composer_feed(ComposerKeyEvent::alt_e()),
-        bitty_runtime::cw_present::CwComposerFeed::EditorRequested
-    );
-    assert!(rt.cw_composer_is_open());
-    rt.cw_composer_apply_external("echo hi")
-        .expect("fits composer cap");
-    assert_eq!(rt.cw_composer_content(), "echo hi");
-
-    // Submit frames the bracketed-paste PTY write and auto-closes.
-    match rt.cw_composer_feed(ComposerKeyEvent::ctrl_enter()) {
-        bitty_runtime::cw_present::CwComposerFeed::Submitted(frame) => {
-            assert!(frame.starts_with(b"\x1b[200~"));
-            assert!(frame.ends_with(b"\x1b[201~\r"));
-        }
-        other => panic!("expected submit frame, got {other:?}"),
-    }
-    assert!(!rt.cw_composer_is_open());
-    assert_eq!(rt.cw_input_route(), CwInputRoute::Pty);
-
-    // Close is idempotent and preserves the closed default.
-    rt.cw_composer_close();
-    assert!(!rt.cw_composer_is_open());
 }
 
 #[test]

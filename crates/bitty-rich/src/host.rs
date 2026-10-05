@@ -18,10 +18,10 @@
 //!
 //! Phase-B scope only: no overlay/capture API (`ui.overlay.focus` and
 //! `bitty.overlay.*` stay with CTX-0941 per DEC-W103-2), no SDK binding
-//! (`W-120`), no Lua plugin, no composer/chrome deletion, no modal rewiring
-//! (cutover is later). The legacy [`crate::composer`] mechanics and the
-//! Core-internal `CwComposerFeed` routing are untouched; this module is the
-//! typed API boundary those mechanics grow into (G-4).
+//! (`W-120`), no Lua plugin. The retired composer policy engine
+//! (`composer.rs`, E-CUT-1) is gone; this module owns the retained
+//! terminal mechanism (buffer bounds, submit framing, editor authorization,
+//! temp policy, hosted spawn) as the typed API boundary (G-4).
 //!
 //! Gaps closed (W-82 "Current implementation status", W-103 plan section 4):
 //!
@@ -49,10 +49,10 @@
 //!
 //! | Dimension | Bound | Source |
 //! |---|---|---|
-//! | buffer / temp payload | [`COMPOSER_MAX_BYTES`] (64 KiB) | `composer.rs` |
-//! | submit frame | content `+ 13` bytes, fail-closed past cap | `frame_submit` |
-//! | editor wait | 120 s default, 300 s ceiling | `EDITOR_TIMEOUT_*` |
-//! | editor program | `nvim`/`vim`/`vi` bare names | `EDITOR_ALLOWLIST` |
+//! | buffer / temp payload | [`COMPOSER_MAX_BYTES`] (64 KiB) | carried per DEC-W103-4, host-owned since E-CUT-1 |
+//! | submit frame | content `+ 13` bytes, fail-closed past cap | [`frame_submit`] |
+//! | editor wait | 120 s default, 300 s ceiling | [`EDITOR_TIMEOUT_DEFAULT`] / [`EDITOR_TIMEOUT_MAX`] |
+//! | editor program | `nvim`/`vim`/`vi` bare names | [`EDITOR_ALLOWLIST`] |
 //! | per-plugin submit window | caller-supplied cap | Isolation/Resource RFC lane (not invented here) |
 //!
 //! No I/O except the editor round trip and temp-root management, no
@@ -61,13 +61,412 @@
 //! no unsafe.
 
 use std::ffi::OsString;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::composer::{
-    COMPOSER_MAX_BYTES, CommandBuffer, EDITOR_TIMEOUT_MAX, EditorError, TEMP_PREFIX,
-    editor_round_trip, frame_submit, resolve_editor, truncate_err,
-};
+// ---------------------------------------------------------------------------
+// Retained terminal mechanism (host-owned since E-CUT-1, CTX-0968).
+//
+// Carried values per DEC-W103-4, no invented bounds. Previously lived in
+// the retired composer policy engine; now owned here so the host operations
+// (`terminal.submit`, `process.editor`) keep their bounds without a policy
+// dependency. The modal policy (chords, session feed, overlay routing) is
+// gone with the plugin cutover.
+// ---------------------------------------------------------------------------
+
+/// Maximum buffer / temp-file payload in bytes (64 KiB).
+pub const COMPOSER_MAX_BYTES: usize = 64 * 1024;
+
+/// Bracketed-paste open marker (`ESC[200~`), byte-exact.
+pub const PASTE_OPEN: &str = "\u{1b}[200~";
+/// Bracketed-paste close marker (`ESC[201~`), byte-exact.
+pub const PASTE_CLOSE: &str = "\u{1b}[201~";
+/// Final submit terminator: `CR` (`Enter` VT encoding).
+pub const SUBMIT_TERMINATOR: &str = "\r";
+
+/// Default editor wait before kill.
+pub const EDITOR_TIMEOUT_DEFAULT: Duration = Duration::from_secs(120);
+/// Maximum editor wait (fail-closed cap; larger requests are clamped).
+pub const EDITOR_TIMEOUT_MAX: Duration = Duration::from_secs(300);
+/// Temp file name prefix (inside the caller-selected temp dir).
+pub(crate) const TEMP_PREFIX: &str = "bitty-composer-";
+
+/// Editor programs admitted by [`resolve_editor`] after surrounding
+/// whitespace is trimmed, then matched exactly.
+pub const EDITOR_ALLOWLIST: &[&str] = &["nvim", "vim", "vi"];
+
+/// Why a buffer mutation failed (all fail-closed: buffer kept as-is).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BufferError {
+    /// Content would exceed [`COMPOSER_MAX_BYTES`].
+    TooLarge {
+        /// Bytes the content would have had.
+        wanted: usize,
+    },
+}
+
+impl std::fmt::Display for BufferError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooLarge { wanted } => {
+                write!(
+                    f,
+                    "composer buffer too large ({wanted} bytes, max {COMPOSER_MAX_BYTES})"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for BufferError {}
+
+/// Multiline command buffer, bounded at [`COMPOSER_MAX_BYTES`] bytes.
+#[derive(Debug, Clone, Default)]
+pub struct CommandBuffer {
+    text: String,
+}
+
+impl CommandBuffer {
+    /// Empty buffer.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            text: String::new(),
+        }
+    }
+
+    /// Buffer pre-filled with `content` (fails closed past the cap).
+    pub fn with_content(content: &str) -> Result<Self, BufferError> {
+        if content.len() > COMPOSER_MAX_BYTES {
+            return Err(BufferError::TooLarge {
+                wanted: content.len(),
+            });
+        }
+        Ok(Self {
+            text: content.to_string(),
+        })
+    }
+
+    /// Appends `s` (fails closed past the cap, buffer kept).
+    pub fn insert_str(&mut self, s: &str) -> Result<(), BufferError> {
+        let wanted = self.text.len().saturating_add(s.len());
+        if wanted > COMPOSER_MAX_BYTES {
+            return Err(BufferError::TooLarge { wanted });
+        }
+        self.text.push_str(s);
+        Ok(())
+    }
+
+    /// Appends one char (fails closed past the cap, buffer kept).
+    pub fn push_char(&mut self, c: char) -> Result<(), BufferError> {
+        let wanted = self.text.len().saturating_add(c.len_utf8());
+        if wanted > COMPOSER_MAX_BYTES {
+            return Err(BufferError::TooLarge { wanted });
+        }
+        self.text.push(c);
+        Ok(())
+    }
+
+    /// Appends `\n` (fails closed past the cap, buffer kept).
+    pub fn push_newline(&mut self) -> Result<(), BufferError> {
+        self.insert_str("\n")
+    }
+
+    /// Replaces the whole content (fails closed past the cap, kept as-is).
+    pub fn set(&mut self, content: &str) -> Result<(), BufferError> {
+        if content.len() > COMPOSER_MAX_BYTES {
+            return Err(BufferError::TooLarge {
+                wanted: content.len(),
+            });
+        }
+        self.text.clear();
+        self.text.push_str(content);
+        Ok(())
+    }
+
+    /// Clears the buffer.
+    pub fn clear(&mut self) {
+        self.text.clear();
+    }
+
+    /// Current content.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    /// Content length in bytes.
+    #[must_use]
+    pub fn len_bytes(&self) -> usize {
+        self.text.len()
+    }
+
+    /// Whether the buffer is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+}
+
+/// Turns `content` into one bracketed-paste frame
+/// `ESC[200~ + content + ESC[201~ + CR`.
+pub fn frame_submit(content: &str) -> Result<Vec<u8>, BufferError> {
+    let wanted = content
+        .len()
+        .saturating_add(PASTE_OPEN.len())
+        .saturating_add(PASTE_CLOSE.len())
+        .saturating_add(SUBMIT_TERMINATOR.len());
+    if content.len() > COMPOSER_MAX_BYTES || wanted > COMPOSER_MAX_BYTES.saturating_add(16) {
+        return Err(BufferError::TooLarge { wanted });
+    }
+    let mut out = Vec::with_capacity(wanted);
+    out.extend_from_slice(PASTE_OPEN.as_bytes());
+    out.extend_from_slice(content.as_bytes());
+    out.extend_from_slice(PASTE_CLOSE.as_bytes());
+    out.extend_from_slice(SUBMIT_TERMINATOR.as_bytes());
+    Ok(out)
+}
+
+/// Picks the editor program: `$VISUAL`, else `$EDITOR` (trimmed).
+pub fn resolve_editor(visual: Option<&str>, editor: Option<&str>) -> Result<String, EditorError> {
+    for raw in [visual, editor].into_iter().flatten() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        return if EDITOR_ALLOWLIST.contains(&trimmed) {
+            Ok(trimmed.to_string())
+        } else {
+            Err(EditorError::NotAllowed)
+        };
+    }
+    Err(EditorError::NoEditor)
+}
+
+/// Why the external-editor round-trip failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditorError {
+    /// Neither `$VISUAL` nor `$EDITOR` is set.
+    NoEditor,
+    /// The chosen program is not in [`EDITOR_ALLOWLIST`].
+    NotAllowed,
+    /// Temp file could not be created/written.
+    WriteFailed(String),
+    /// Editor could not be spawned.
+    SpawnFailed(String),
+    /// Editor did not exit within `timeout` (killed).
+    Timeout,
+    /// Editor exited non-zero (echoes the code when known).
+    NonZeroExit(Option<i32>),
+    /// Edited file could not be read back.
+    ReadFailed(String),
+    /// Edited file exceeds [`COMPOSER_MAX_BYTES`].
+    TooLarge {
+        /// Bytes observed on disk.
+        wanted: usize,
+    },
+    /// Edited file is not valid UTF-8.
+    InvalidUtf8,
+    /// Interrupted while waiting (underlying wait error).
+    WaitFailed(String),
+}
+
+impl std::fmt::Display for EditorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoEditor => f.write_str("no editor: set $VISUAL or $EDITOR"),
+            Self::NotAllowed => write!(
+                f,
+                "editor not allowed: only bare {} are accepted",
+                EDITOR_ALLOWLIST.join("/")
+            ),
+            Self::WriteFailed(e) => write!(f, "composer temp file write failed: {e}"),
+            Self::SpawnFailed(e) => write!(f, "editor spawn failed: {e}"),
+            Self::Timeout => write!(f, "editor timed out and was killed"),
+            Self::NonZeroExit(code) => match code {
+                Some(c) => write!(f, "editor exited with status {c}"),
+                None => f.write_str("editor exited with unknown failure"),
+            },
+            Self::ReadFailed(e) => write!(f, "composer temp file read failed: {e}"),
+            Self::TooLarge { wanted } => {
+                write!(
+                    f,
+                    "edited file too large ({wanted} bytes, max {COMPOSER_MAX_BYTES})"
+                )
+            }
+            Self::InvalidUtf8 => f.write_str("edited file is not valid UTF-8"),
+            Self::WaitFailed(e) => write!(f, "editor wait failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for EditorError {}
+
+/// RAII guard for the composer temp file: deleted on drop (best-effort).
+#[derive(Debug)]
+pub struct TempComposerFile {
+    path: PathBuf,
+}
+
+impl TempComposerFile {
+    /// Temp path (for the editor child arg and read-back only).
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempComposerFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn unique_temp_path(dir: &Path) -> PathBuf {
+    let seq = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    dir.join(format!(
+        "{TEMP_PREFIX}{}-{}-{seq}",
+        std::process::id(),
+        nanos
+    ))
+}
+
+/// Writes `content` to a fresh `0600` temp file under `dir`.
+pub fn write_composer_temp(content: &str, dir: &Path) -> Result<TempComposerFile, EditorError> {
+    if content.len() > COMPOSER_MAX_BYTES {
+        return Err(EditorError::TooLarge {
+            wanted: content.len(),
+        });
+    }
+    let mut last_err = String::from("no attempt");
+    for _ in 0..8 {
+        let path = unique_temp_path(dir);
+        let open = create_owner_only_new(&path);
+        match open {
+            Ok(mut file) => {
+                if let Err(e) = restrict_owner_only(&path) {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(EditorError::WriteFailed(truncate_err(e.to_string())));
+                }
+                if let Err(e) = file.write_all(content.as_bytes()) {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(EditorError::WriteFailed(truncate_err(e.to_string())));
+                }
+                if let Err(e) = file.flush() {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(EditorError::WriteFailed(truncate_err(e.to_string())));
+                }
+                drop(file);
+                if let Err(e) = restrict_owner_only(&path) {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(EditorError::WriteFailed(truncate_err(e.to_string())));
+                }
+                return Ok(TempComposerFile { path });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_err = e.to_string();
+                continue;
+            }
+            Err(e) => return Err(EditorError::WriteFailed(truncate_err(e.to_string()))),
+        }
+    }
+    Err(EditorError::WriteFailed(truncate_err(last_err)))
+}
+
+#[cfg(unix)]
+fn create_owner_only_new(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn create_owner_only_new(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+}
+
+#[cfg(unix)]
+fn restrict_owner_only(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn restrict_owner_only(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+pub(crate) fn truncate_err(mut s: String) -> String {
+    if s.len() > 256 {
+        s.truncate(256);
+    }
+    s
+}
+
+/// Reads the edited temp file back, bounded at [`COMPOSER_MAX_BYTES`].
+pub fn read_composer_back(path: &Path) -> Result<String, EditorError> {
+    use std::io::Read as _;
+    let limit = (COMPOSER_MAX_BYTES as u64).saturating_add(1);
+    let file = std::fs::File::open(path)
+        .map_err(|e| EditorError::ReadFailed(truncate_err(e.to_string())))?;
+    let mut bytes = Vec::new();
+    file.take(limit)
+        .read_to_end(&mut bytes)
+        .map_err(|e| EditorError::ReadFailed(truncate_err(e.to_string())))?;
+    if bytes.len() > COMPOSER_MAX_BYTES {
+        let wanted = std::fs::metadata(path)
+            .map(|m| usize::try_from(m.len()).unwrap_or(usize::MAX))
+            .unwrap_or(bytes.len());
+        return Err(EditorError::TooLarge { wanted });
+    }
+    String::from_utf8(bytes).map_err(|_| EditorError::InvalidUtf8)
+}
+
+/// Round-trip core with an already-resolved program: temp write, bounded
+/// spawn, bounded UTF-8 read-back, RAII delete, buffer install.
+pub(crate) fn editor_round_trip(
+    buffer: &mut CommandBuffer,
+    program: &str,
+    timeout: Duration,
+    dir: &Path,
+    spawn: fn(&str, &Path, Duration) -> Result<(), EditorError>,
+) -> Result<String, EditorError> {
+    let temp = write_composer_temp(buffer.as_str(), dir)?;
+    let temp_path = temp.path().to_path_buf();
+    let run = spawn(program, &temp_path, timeout);
+    match run {
+        Ok(()) => {
+            let content = read_composer_back(&temp_path)?;
+            match buffer.set(&content) {
+                Ok(()) => {
+                    drop(temp);
+                    Ok(content)
+                }
+                Err(BufferError::TooLarge { wanted }) => {
+                    drop(temp);
+                    Err(EditorError::TooLarge { wanted })
+                }
+            }
+        }
+        Err(e) => {
+            drop(temp);
+            Err(e)
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // G-1: Bitty-owned 0700 temp root
@@ -674,7 +1073,7 @@ const HOST_EDITOR_POLL_INTERVAL: Duration = Duration::from_millis(5);
 /// Spawns `editor` on `path` with the hosted child policy and waits up to
 /// `timeout` (clamped to [`EDITOR_TIMEOUT_MAX`]).
 ///
-/// Differences from the legacy [`crate::composer::run_editor`]:
+/// Differences from the retired legacy blocking primitive (E-CUT-1):
 /// minimized environment ([`build_hosted_env`], no ambient credentials),
 /// closed stdin (execution-boundary default; the interactive PTY leaf is the
 /// explicit exception and does not use this path), and owned-tree tracking:

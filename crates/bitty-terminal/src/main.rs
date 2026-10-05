@@ -1094,7 +1094,7 @@ pub(crate) fn spawn_startup_shells(
         Err(err) => {
             logging::warn(|| {
                 format!(
-                    "bitty: PTY spawn failed: {err} — continuing without child (headless tick still proves path)"
+                    "bitty: PTY spawn failed for {effective:?}: {err} — continuing without child (headless tick still proves path)"
                 )
             });
             true

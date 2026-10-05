@@ -237,7 +237,9 @@ fn build_command_line(program: &OsStr, args: &[OsString]) -> io::Result<Vec<u16>
 }
 
 /// Quotes one argument with backslash/doubled-quote handling per
-/// `CommandLineToArgvW` (an argument without spaces still travels verbatim).
+/// `CommandLineToArgvW`. An argument without spaces travels verbatim unless
+/// it ends in a backslash: quoting it (and doubling the trailing run below)
+/// keeps a consumer-appended closing quote from being escaped.
 fn append_quoted(arg: &OsStr, command_line: &mut Vec<u16>) -> io::Result<()> {
     let wide: Vec<u16> = arg.encode_wide().collect();
     if wide.contains(&0) {
@@ -247,8 +249,10 @@ fn append_quoted(arg: &OsStr, command_line: &mut Vec<u16>) -> io::Result<()> {
         ));
     }
     // Space, tab, newline, vertical tab, and double quote force quoting
-    // (u16 code units: patterns cannot carry `as` casts).
+    // (u16 code units: patterns cannot carry `as` casts), as does a
+    // trailing backslash (see above).
     let needs_quotes = wide.is_empty()
+        || wide.last() == Some(&(b'\\' as u16))
         || wide
             .iter()
             .any(|unit| matches!(*unit, 32 | 9 | 10 | 11 | 34));
@@ -310,6 +314,11 @@ fn build_environment_block(env: &[(OsString, OsString)]) -> io::Result<Vec<u16>>
         block.extend_from_slice(&key);
         block.push('=' as u16);
         block.extend_from_slice(&value);
+        block.push(0);
+    }
+    if block.is_empty() {
+        // No entries: the block is still one empty string, double-NUL
+        // terminated (`[0, 0]`), not a single NUL.
         block.push(0);
     }
     block.push(0);

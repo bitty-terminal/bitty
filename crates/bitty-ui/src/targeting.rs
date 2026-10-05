@@ -1,13 +1,13 @@
-//! Beacon target handles (UX-28, U-8 Beacon family).
+//! Generic targeting handles (UX-28, U-8 hint family).
 //!
-//! [`TargetRef`] is the typed generation handle the Beacon hint layer
+//! [`TargetRef`] is the typed generation handle the hint annotation layer
 //! addresses: one variant per addressable surface (`Panel`, `Workspace`,
 //! `CommandBlock`, `UiNode`, `Link`). Every handle carries a generation
 //! captured at enumeration time; [`TargetRegistry::resolve`] revalidates it
 //! against the live table and fails closed ([`TargetError::StaleTarget`])
 //! when the generation moved or the id retired. There is deliberately no
 //! `ViewId` variant and no `From<ViewId>` bridge: views are layout leaves,
-//! never beacon targets.
+//! never targets.
 //!
 //! All types are bounded ([`MAX_TARGETS_PER_KIND`] per kind),
 //! `#![forbid(unsafe_code)]`, deterministic, and headless: no I/O,
@@ -48,7 +48,7 @@ impl std::fmt::Display for WorkspaceId {
 }
 
 /// Stable handle for a command block (scrollback region promoted to a
-/// beacon-addressable unit). Distinct newtype; no `From` bridge.
+/// target-addressable unit). Distinct newtype; no `From` bridge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CommandBlockId(pub u64);
 
@@ -73,7 +73,7 @@ impl std::fmt::Display for CommandBlockId {
 }
 
 /// Stable handle for a chrome/UI-tree node: the canonical
-/// [`crate::uitree::UiNodeId`], re-exported here for beacon call sites.
+/// [`crate::uitree::UiNodeId`], re-exported here for targeting call sites.
 /// Distinct newtype; no `From` bridge.
 pub use crate::uitree::UiNodeId;
 
@@ -102,7 +102,7 @@ impl std::fmt::Display for LinkId {
     }
 }
 
-/// Generation handle for a panel beacon target.
+/// Generation handle for a panel target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PanelRef {
     /// Target panel.
@@ -111,7 +111,7 @@ pub struct PanelRef {
     pub generation: u64,
 }
 
-/// Generation handle for a workspace beacon target.
+/// Generation handle for a workspace target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct WorkspaceRef {
     /// Target workspace.
@@ -120,7 +120,7 @@ pub struct WorkspaceRef {
     pub generation: u64,
 }
 
-/// Generation handle for a command-block beacon target.
+/// Generation handle for a command-block target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CommandBlockRef {
     /// Target command block.
@@ -129,7 +129,7 @@ pub struct CommandBlockRef {
     pub generation: u64,
 }
 
-/// Generation handle for a chrome/UI-node beacon target.
+/// Generation handle for a chrome/UI-node target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct UiNodeRef {
     /// Target UI node.
@@ -138,7 +138,7 @@ pub struct UiNodeRef {
     pub generation: u64,
 }
 
-/// Generation handle for a link beacon target.
+/// Generation handle for a link target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct LinkRef {
     /// Target link.
@@ -147,8 +147,8 @@ pub struct LinkRef {
     pub generation: u64,
 }
 
-/// Typed beacon target: exactly the five addressable surfaces. `ViewId` is
-/// deliberately excluded (views are layout leaves, never beacon targets).
+/// Typed target: exactly the five addressable surfaces. `ViewId` is
+/// deliberately excluded (views are layout leaves, never targets).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TargetRef {
     /// A hosted panel.
@@ -177,7 +177,7 @@ impl std::fmt::Display for TargetRef {
     }
 }
 
-/// Beacon target resolution failure. All variants fail closed: the caller
+/// Target resolution failure. All variants fail closed: the caller
 /// must drop the hint session, never fall back to a default target.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TargetError {
@@ -197,10 +197,10 @@ pub enum TargetError {
 impl std::fmt::Display for TargetError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnknownTarget(detail) => write!(f, "unknown beacon target: {detail}"),
-            Self::StaleTarget(detail) => write!(f, "stale beacon target: {detail}"),
+            Self::UnknownTarget(detail) => write!(f, "unknown target: {detail}"),
+            Self::StaleTarget(detail) => write!(f, "stale target: {detail}"),
             Self::TooManyTargets { max, current } => {
-                write!(f, "too many beacon targets: max {max}, current {current}")
+                write!(f, "too many targets: max {max}, current {current}")
             }
         }
     }
@@ -208,7 +208,7 @@ impl std::fmt::Display for TargetError {
 
 impl std::error::Error for TargetError {}
 
-/// Live beacon-target table. Each kind maps id to its current generation;
+/// Live target table. Each kind maps id to its current generation;
 /// [`TargetRef`] handles resolve only when the captured generation matches.
 /// Registration bumps the generation so previously enumerated handles go
 /// stale; retirement removes the id (recording a bounded tombstone) so all

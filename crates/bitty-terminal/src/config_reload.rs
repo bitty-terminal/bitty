@@ -33,11 +33,12 @@
 //!   `decoration.background_*` plus `views` (`set_background_appearance`: the
 //!   full fail-closed load pipeline before any swap);
 //! * app chrome (CTX-0898): `keymaps`, `mod_key`, `leader_key`,
-//!   `leader_timeout_ms`, `hints_enabled`, and the platform window
-//!   transparency hint for `window.opacity`. The reload resolves them
-//!   fail-closed together with the runtime setters and stashes the result;
-//!   the app takes it on the same tick ([`take_app_adoption`]), because the
-//!   chrome state lives on `TerminalApp`, not on `Runtime`.
+//!   `leader_timeout_ms`, `hints_enabled`, `layout.resize_step` (CTX-0963),
+//!   and the platform window transparency hint for `window.opacity`. The
+//!   reload resolves them fail-closed together with the runtime setters and
+//!   stashes the result; the app takes it on the same tick
+//!   ([`take_app_adoption`]), because the chrome state lives on
+//!   `TerminalApp`, not on `Runtime`.
 //!
 //! [`runtime_adopts`] is the single list of adopted fields. A future `Live`
 //! field without an adopter stays out of it and is reported under
@@ -154,6 +155,7 @@ fn runtime_adopts(field: &str) -> bool {
             | "leader_key"
             | "leader_timeout_ms"
             | "hints_enabled"
+            | "layout.resize_step"
             | "workspace.show_bar"
             | "workspace.bar.edge"
     ) || field.starts_with("appearance.animations")
@@ -226,6 +228,9 @@ pub(crate) struct AppAdoption {
     pub(crate) leader: bitty_config::ResolvedLeader,
     /// Resolved hint kill switch (`hints_enabled`).
     pub(crate) hints_enabled: bool,
+    /// Tiled resize step (`layout.resize_step`, CTX-0963): read at keypress
+    /// time, adopted live like the keymaps.
+    pub(crate) resize_step: f32,
     /// Effective `window.opacity` for the platform transparency hint.
     pub(crate) window_opacity: f32,
     /// Resolved theme preset name for the window title (CTX-0898). The
@@ -305,6 +310,7 @@ fn resolve_app_adoption(effective: &EffectiveConfig) -> Result<AppAdoption, Stri
         keymaps,
         leader,
         hints_enabled: bitty_config::resolve_hint_config(effective).enabled,
+        resize_step: effective.layout.resize_step,
         window_opacity: effective.window.opacity,
         theme_name: bitty_config::theme::resolve_selection(
             effective.appearance.theme.as_deref(),
@@ -979,6 +985,7 @@ mod tests {
         edited.mod_key = bitty_config::ModKey::Super;
         edited.leader_timeout_ms = Some(2_500);
         edited.hints_enabled = Some(false);
+        edited.layout.resize_step = 0.02;
         apply_live(&mut runtime, &edited).expect("adopt chrome");
         let app = take_app_adoption().expect("app half stashed");
         let expected = bitty_config::resolve_keymaps(&edited).expect("keymaps");
@@ -989,6 +996,10 @@ mod tests {
         );
         assert_eq!(app.leader.timeout_ms, 2_500);
         assert!(!app.hints_enabled);
+        assert!(
+            (app.resize_step - 0.02).abs() < f32::EPSILON,
+            "CTX-0963: the resize step rides the app half live"
+        );
     }
 
     /// A `views[view:1]` rule overriding the idle outline color only.

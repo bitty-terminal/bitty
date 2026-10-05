@@ -723,6 +723,7 @@ pub fn inspect_config(query: &str) -> Option<ConfigInfo> {
         "selection.auto_copy" => defaults.selection.auto_copy.to_string(),
         "layout.gaps_in" => defaults.layout.gaps_in.to_string(),
         "layout.gaps_out" => defaults.layout.gaps_out.to_string(),
+        "layout.resize_step" => format!("{}", defaults.layout.resize_step),
         // CTX-0333: Core-owned decoration knobs, including the content inset.
         "decoration.gaps_in" => defaults.decoration.gaps_in.to_string(),
         "decoration.gaps_out" => defaults.decoration.gaps_out.to_string(),
@@ -1235,7 +1236,7 @@ pub fn run_inspect(request: &InspectRequest) -> i32 {
             }
             None => {
                 let message = format!(
-                    "bitty inspect: unknown config key {:?} (try font.size, font.family, appearance.theme, window.opacity, terminal.scrollback, terminal.cursor_style, terminal.bell, selection.auto_copy, layout.gaps_in, decoration.content_inset, scrollbar.mode, mouse.focus_follows_mouse, mouse.focus_follows_mouse_delay_ms, appearance.animations.enabled, appearance.animations.reduced_motion, appearance.animations.duration_ms.open, appearance.animations.easing.open, mod_key, close_confirm)",
+                    "bitty inspect: unknown config key {:?} (try font.size, font.family, appearance.theme, window.opacity, terminal.scrollback, terminal.cursor_style, terminal.bell, selection.auto_copy, layout.gaps_in, layout.resize_step, decoration.content_inset, scrollbar.mode, mouse.focus_follows_mouse, mouse.focus_follows_mouse_delay_ms, appearance.animations.enabled, appearance.animations.reduced_motion, appearance.animations.duration_ms.open, appearance.animations.easing.open, mod_key, close_confirm)",
                     request.value,
                 );
                 if emit_json {

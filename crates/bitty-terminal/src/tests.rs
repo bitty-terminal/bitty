@@ -5620,6 +5620,7 @@ fn live_reload_adopts_keymaps_leader_hints_and_opacity_on_the_app() {
         keymaps: keymaps.clone(),
         leader: leader.clone(),
         hints_enabled: false,
+        resize_step: edited.layout.resize_step,
         window_opacity: 0.6,
         theme_name: bitty_config::theme::DEFAULT_THEME_NAME,
     });
@@ -5642,6 +5643,7 @@ fn adoption_from(effective: &bitty_config::EffectiveConfig) -> crate::config_rel
         leader: bitty_config::resolve_leader_for(effective, bitty_config::LeaderPlatform::host())
             .expect("leader"),
         hints_enabled: bitty_config::resolve_hint_config(effective).enabled,
+        resize_step: effective.layout.resize_step,
         window_opacity: effective.window.opacity,
         theme_name: bitty_config::theme::resolve_theme(effective.appearance.theme.as_deref()).name,
     }

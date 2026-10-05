@@ -643,9 +643,11 @@ impl LayoutNode {
     /// Returns the detached [`View`] when found. Interior nodes collapse
     /// deterministically: a `Split` with one surviving child is replaced by
     /// that child (so ratios never dangle), an empty `Stack` stays an empty
-    /// `Stack`, and an `Overlay` whose base was removed keeps the overlay
-    /// subtree (and vice versa). Returns `None` with the tree untouched when
-    /// `id` is absent. Total and deterministic.
+    /// `Stack`, an `Overlay` whose overlay was removed collapses to its base,
+    /// and an `Overlay` whose base was removed keeps the `Overlay` with an
+    /// empty-base tombstone (G1/DEC-0099: float stays float, bounds/tier
+    /// preserved, matching Hyprland). Returns `None` with the tree untouched
+    /// when `id` is absent. Total and deterministic.
     pub fn remove_leaf(&mut self, id: ViewId) -> Option<View> {
         // A bare-leaf tree: removing its only leaf yields `Some` and leaves
         // an empty `Stack` (same tombstone path as nested removal).
@@ -687,9 +689,10 @@ impl LayoutNode {
             }
             Self::Overlay { base, overlay, .. } => {
                 if let leaf @ Some(_) = base.remove_leaf_result(id) {
-                    if base.is_gone() {
-                        *self = std::mem::replace(overlay.as_mut(), Self::Stack(Vec::new()));
-                    }
+                    // G1/DEC-0099: when the base drains, keep the Overlay
+                    // with its empty-base tombstone so the float keeps its
+                    // bounds/tier (Hyprland keeps floats floating); do NOT
+                    // promote the overlay subtree to root.
                     return leaf;
                 }
                 if let leaf @ Some(_) = overlay.remove_leaf_result(id) {
@@ -2264,6 +2267,98 @@ mod tests {
         assert_eq!(stack.remove_leaf(ViewId::new(1)), Some(view(1, 80, 24)));
         assert_eq!(stack.remove_leaf(ViewId::new(3)), Some(view(3, 80, 24)));
         assert_eq!(stack, LayoutNode::stack(Vec::new()));
+    }
+
+    #[test]
+    fn remove_leaf_base_empty_keeps_overlay_tombstone() {
+        // G1/DEC-0099: draining the base must NOT promote the overlay
+        // subtree to root (which would drop bounds/tier). The float stays
+        // a float: Overlay preserved with an empty-base tombstone.
+        let float_bounds = Rect::new(10, 5, 20, 10);
+        let mut tree = LayoutNode::overlay_tiered(
+            LayoutNode::leaf(view(1, 40, 24)),
+            LayoutNode::leaf(view(2, 10, 5)),
+            float_bounds,
+            OverlayTier::Popup,
+        );
+        assert_eq!(tree.remove_leaf(ViewId::new(1)), Some(view(1, 40, 24)));
+        // Overlay shape, bounds, and tier survive the base drain.
+        match &tree {
+            LayoutNode::Overlay {
+                base,
+                overlay,
+                bounds,
+                tier,
+            } => {
+                assert_eq!(**base, LayoutNode::stack(Vec::new()));
+                assert_eq!(**overlay, LayoutNode::leaf(view(2, 10, 5)));
+                assert_eq!(*bounds, float_bounds);
+                assert_eq!(*tier, OverlayTier::Popup);
+            }
+            other => panic!("base drain must keep Overlay, got {other:?}"),
+        }
+        assert_eq!(tree.overlay_tier(), Some(OverlayTier::Popup));
+        assert_eq!(tree.leaf_count(), 1);
+        assert_eq!(tree.leaf_ids(), vec![ViewId::new(2)]);
+        // The surviving float still lays out at its bounds; the empty base
+        // contributes no allocation.
+        let container = Rect::new(0, 0, 80, 24);
+        assert_eq!(tree.layout(container), vec![(ViewId::new(2), float_bounds)]);
+        // Unknown ids leave the tombstoned tree untouched.
+        assert_eq!(tree.remove_leaf(ViewId::new(99)), None);
+    }
+
+    #[test]
+    fn remove_leaf_overlay_empty_collapses_to_base() {
+        // Draining the float collapses the Overlay to its base (no float
+        // left, so no wrapper remains); the tiled base stays tiled.
+        let mut tree = LayoutNode::overlay_tiered(
+            LayoutNode::leaf(view(1, 40, 24)),
+            LayoutNode::leaf(view(2, 10, 5)),
+            Rect::new(10, 5, 20, 10),
+            OverlayTier::Popup,
+        );
+        assert_eq!(tree.remove_leaf(ViewId::new(2)), Some(view(2, 10, 5)));
+        assert_eq!(tree, LayoutNode::leaf(view(1, 40, 24)));
+        assert_eq!(tree.overlay_tier(), None);
+    }
+
+    #[test]
+    fn remove_leaf_overlay_base_split_partial_then_tombstone() {
+        // Partial base removal keeps the Overlay (base collapses like a
+        // plain split); draining the last base leaf leaves the tombstone.
+        let float_bounds = Rect::new(10, 5, 20, 10);
+        let base = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(view(1, 40, 24)),
+            LayoutNode::leaf(view(2, 40, 24)),
+        );
+        let mut tree = LayoutNode::overlay(base, LayoutNode::leaf(view(3, 10, 5)), float_bounds);
+        assert_eq!(tree.remove_leaf(ViewId::new(1)), Some(view(1, 40, 24)));
+        match &tree {
+            LayoutNode::Overlay {
+                base, bounds, tier, ..
+            } => {
+                assert_eq!(**base, LayoutNode::leaf(view(2, 40, 24)));
+                assert_eq!(*bounds, float_bounds);
+                assert_eq!(*tier, OverlayTier::Float);
+            }
+            other => panic!("partial base removal must keep Overlay, got {other:?}"),
+        }
+        assert_eq!(tree.remove_leaf(ViewId::new(2)), Some(view(2, 40, 24)));
+        match &tree {
+            LayoutNode::Overlay { base, overlay, .. } => {
+                assert_eq!(**base, LayoutNode::stack(Vec::new()));
+                assert_eq!(**overlay, LayoutNode::leaf(view(3, 10, 5)));
+            }
+            other => panic!("base drain must keep Overlay tombstone, got {other:?}"),
+        }
+        // Draining the last float from a tombstoned Overlay yields the
+        // empty-stack tombstone (nothing left).
+        assert_eq!(tree.remove_leaf(ViewId::new(3)), Some(view(3, 10, 5)));
+        assert_eq!(tree, LayoutNode::stack(Vec::new()));
+        assert_eq!(tree.leaf_count(), 0);
     }
 
     #[test]

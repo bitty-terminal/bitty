@@ -764,6 +764,17 @@ pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                         &src("layout.gaps_out")
                     )
                 );
+                println!(
+                    "{}",
+                    check_row(
+                        "layout.resize_step",
+                        // `{}` (shortest round-trip Display), not `{:.3}`:
+                        // the check output must report the effective value
+                        // (e.g. 0.0104), not a rounded one (CodeRabbit PR #1708).
+                        format!("{}", e.layout.resize_step),
+                        &src("layout.resize_step")
+                    )
+                );
                 for (field, value) in [
                     ("decoration.gaps_in", e.decoration.gaps_in),
                     ("decoration.gaps_out", e.decoration.gaps_out),

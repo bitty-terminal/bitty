@@ -135,21 +135,20 @@
 //!
 //! # Unsafe code policy
 //!
-//! This crate denies `unsafe_code` at the workspace and crate level. The only
-//! exception is [`gpu`]'s surface creation path: `wgpu::Instance::create_surface`
-//! consumes `raw-window-handle` 0.6 handles supplied by
-//! [`bitty_platform::SurfaceTarget::with_raw_handles`]. That call bridges raw
-//! handles into a `wgpu::Surface`; it requires `unsafe` to borrow the raw
-//! `DisplayHandle`/`WindowHandle` (see `GPU Surface Seam` in [`gpu`]). The
-//! `unsafe` is confined to `gpu::Surface` construction (two `unsafe`
-//! blocks, each with a safety comment) and does not leak. Neither font
-//! stack (`crossfont`, nor `harfrust`/`swash`/`skrifa`/`read-fonts`/
-//! `fontdb`) requires caller `unsafe`; the shaped stack's internal parsing
-//! `unsafe` (byte casting in `bytemuck` and `swash`'s table readers) is
-//! upstream-audited and recorded in the CTX-0957 implementation evidence.
-//! `bytemuck` arrives only transitively through the font stacks: vertex
-//! bytes are still serialized with explicit little-endian `to_le_bytes`
-//! calls, so no `Pod` bit-casting (and no further `unsafe`) is required.
+//! This crate forbids `unsafe_code` at the crate level (stronger than the
+//! workspace `deny`). Surface creation uses the safe
+//! `wgpu::Instance::create_surface` path: [`bitty_platform::SurfaceTarget`]
+//! implements `raw-window-handle` 0.6 `HasWindowHandle` + `HasDisplayHandle`,
+//! so an owned target clone yields a `wgpu::Surface<'static>` with no
+//! `create_surface_unsafe` and no lifetime `transmute` (see `Safety: no
+//! `unsafe`` in [`gpu`]). Neither font stack (`crossfont`, nor
+//! `harfrust`/`swash`/`skrifa`/`read-fonts`/`fontdb`) requires caller
+//! `unsafe`; the shaped stack's internal parsing `unsafe` (byte casting in
+//! `bytemuck` and `swash`'s table readers) is upstream-audited and recorded
+//! in the CTX-0957 implementation evidence. `bytemuck` arrives only
+//! transitively through the font stacks: vertex bytes are still serialized
+//! with explicit little-endian `to_le_bytes` calls, so no `Pod` bit-casting
+//! (and no further `unsafe`) is required.
 //!
 //! # Example
 //!
@@ -180,7 +179,7 @@
 //! assert_eq!(plan.dirty_rects[0], RectPx::new(0, 0, 15, 15));
 //! ```
 
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
 pub mod atlas;
 pub mod batch;
@@ -191,7 +190,6 @@ pub mod fallback;
 pub mod frame;
 pub mod geometry;
 pub mod glyph;
-#[allow(unsafe_code)]
 pub mod gpu;
 pub mod grid;
 pub mod hidpi;

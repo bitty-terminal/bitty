@@ -85,16 +85,16 @@
 //! (`WGPU_BACKEND=...`) via `InstanceDescriptor::from_env_or_default()`, so
 //! operators can pin or exclude backends without code changes.
 //!
-//! # `unsafe` scope
+//! # Safety: no `unsafe`
 //!
-//! The two `unsafe` blocks in this file are the `DisplayHandle::borrow_raw` /
-//! `WindowHandle::borrow_raw` construction for the `raw-window-handle` bridge
-//! that `wgpu::Instance::create_surface` consumes, plus the lifetime
-//! extension of the created surface to `'static` (justified by the owned
-//! `SurfaceTarget` clone below). The raw handles are
-//! obtained from `SurfaceTarget::with_raw_handles`, which guarantees they
-//! originate from a live window that the `Surface` then keeps alive via a
-//! cloned `SurfaceTarget`. No other `unsafe` exists in this crate.
+//! Surface creation uses the safe `wgpu::Instance::create_surface` path.
+//! [`bitty_platform::SurfaceTarget`] implements `raw-window-handle`
+//! `HasWindowHandle` + `HasDisplayHandle`, so an owned `SurfaceTarget` clone
+//! converts into `wgpu::SurfaceTarget::Window` and yields a
+//! `wgpu::Surface<'static>` directly: wgpu keeps the cloned target alive in
+//! `_handle_source`, and [`Surface`] keeps a second clone for its own
+//! extent queries. No `create_surface_unsafe`, no lifetime `transmute`, and
+//! no other `unsafe` exists in this crate.
 
 use std::sync::Mutex;
 
@@ -271,41 +271,24 @@ impl GpuContext {
     /// (see the `SurfaceTarget` lifetime contract). No `wgpu` type leaks:
     /// failures are flattened into [`RenderError::SurfaceCreate`].
     ///
+    /// Uses the safe `wgpu::Instance::create_surface` path: the owned
+    /// `target.clone()` converts into `wgpu::SurfaceTarget::Window`, so wgpu
+    /// keeps the window alive in `_handle_source` and returns
+    /// `Surface<'static>` with no lifetime extension.
+    ///
     /// # Errors
     ///
     /// - [`RenderError::SurfaceCreate`] when the platform refuses the handles
     ///   or `wgpu` cannot create a surface for them.
     pub fn create_surface(&self, target: &SurfaceTarget) -> Result<Surface, RenderError> {
-        // Use the `RawHandle` surface-target path: it carries the two raw
-        // handles directly and does not require `Send`/`Sync` on the handle
-        // carrier (unlike the safe `create_surface` WindowHandle path, which
-        // demands `Send`). The `unsafe` is justified because `target` is
-        // alive and `Surface` keeps a clone of it, so the window outlives
-        // the `wgpu::Surface` (see module docs).
-        let surface = target
-            .with_raw_handles(|display, window| {
-                let target_unsafe = wgpu::SurfaceTargetUnsafe::RawHandle {
-                    raw_display_handle: display,
-                    raw_window_handle: window,
-                };
-                // SAFETY: `display`/`window` originate from a live
-                // `SurfaceTarget` and the returned `Surface` keeps a clone
-                // of that target, guaranteeing the window outlives the
-                // surface as required by `SurfaceTargetUnsafe::RawHandle`.
-                unsafe { self.instance.create_surface_unsafe(target_unsafe) }
-            })
-            .map_err(|e| RenderError::SurfaceCreate(e.to_string()))?
+        let surface: wgpu::Surface<'static> = self
+            .instance
+            .create_surface(target.clone())
             .map_err(|e| RenderError::SurfaceCreate(e.to_string()))?;
-
-        // Extend lifetime to `'static` via the stored `SurfaceTarget` clone.
-        // SAFETY: the `Surface` owns a clone of `target`, so the underlying
-        // window stays alive for at least as long as the surface. This
-        // satisfies `RawHandle`'s "window must outlive surface" requirement.
-        let surface_static: wgpu::Surface<'static> = unsafe { std::mem::transmute(surface) };
 
         Ok(Surface {
             kind: SurfaceKind::Gpu {
-                surface: surface_static,
+                surface,
                 target: target.clone(),
             },
             state: Mutex::new(SurfaceState::new()),

@@ -8,14 +8,19 @@
 //!
 //! | ID    | Dimension              | Bound    | Enforcement |
 //! |-------|------------------------|----------|-------------|
-//! | RC-11 | persisted bytes total  | 256 KiB  | [`STORE_MAX_TOTAL_BYTES`] |
+//! | RC-11 | persisted bytes total  | 64 KiB   | [`STORE_MAX_TOTAL_BYTES`] |
 //! | RC-11 | bytes per value        | 8 KiB    | [`STORE_MAX_VALUE_BYTES`] |
-//! | RC-11 | depth per value        | 8        | [`STORE_MAX_DEPTH`] |
-//! | RC-11 | nodes persisted total  | 1024     | [`STORE_MAX_NODES`] |
+//! | RC-11 | depth per value        | 16       | [`STORE_MAX_DEPTH`] |
+//! | RC-11 | nodes persisted total  | 256      | [`STORE_MAX_NODES`] |
 //!
 //! Every ceiling refuses fail-closed with typed [`STORE_QUOTA_CODE`]
 //! (`E_STORE_QUOTA`, class `budget`); the previous persisted state is left
 //! intact (no partial write) and nothing is ever evicted to make room.
+//!
+//! The bounds match the runtime backend (`bitty-runtime`
+//! `plugin_runtime::store`: `STORE_MAX_TOTAL_BYTES = 64 KiB`,
+//! `STORE_MAX_ENTRIES = 256`, `JSON_MAX_DEPTH = 16`) per the W-131 erratum.
+//! Constants read identically on purpose so the two layers cannot drift.
 //!
 //! # Accounting (exact, deterministic)
 //!
@@ -24,21 +29,33 @@
 //!   contribute zero, mirroring [`crate::host::MarshallingLimits`] byte
 //!   accounting; structural bulk is bounded by the node ceiling instead.
 //! - **Entry size**: `key.len()` plus [`value_bytes`]. The top-level key is
-//!   persisted data, so it counts toward the 256 KiB total but never toward
+//!   persisted data, so it counts toward the 64 KiB total but never toward
 //!   the 8 KiB per-value ceiling.
 //! - **Nodes** ([`value_nodes`]): one per [`LuaValue`](crate::host::LuaValue)
 //!   node (scalars, tables, and every table key). Entry nodes are `1` for the
 //!   top-level key plus the value nodes. Single-value trees always carry an
 //!   odd node count (every non-root node belongs to exactly one key/value
-//!   pair), so the even 1024 total is reachable only across entries.
+//!   pair), so the even 256 total is reachable only across entries.
+//!   Unit note: this layer counts nested nodes while the runtime backend
+//!   counts top-level entries (`STORE_MAX_ENTRIES = 256`). Every entry costs
+//!   at least two nodes here (one key plus one value node), so this layer is
+//!   strictly tighter on entry count and rejects anything the backend
+//!   rejects on that dimension; structural bulk that the backend bounds via
+//!   JSON bytes is bounded here via nodes.
 //! - **Depth** ([`value_depth`]): scalars and empty tables are `0`; a
-//!   non-empty table is one plus the deepest child. A chain of 8 nested
-//!   tables has depth 8 and is accepted; 9 nested tables are refused.
+//!   non-empty table is one plus the deepest child. A chain of 16 nested
+//!   tables has depth 16 and is accepted; 17 nested tables are refused.
+//!   Unit note: the backend frames entry values at depth 2 inside the store
+//!   root (`JSON_MAX_DEPTH = 16`), so its effective per-value allowance is
+//!   two levels tighter; this layer at 16 is the identical constant and the
+//!   backend remains the final gate for framed depth.
 //!
 //! The bridge already marshals `store.set` arguments under the default
-//! [`crate::host::MarshallingLimits`] (depth 8, 1024 nodes, 8 KiB), so this
-//! module re-validates defence-in-depth and additionally owns the 256 KiB
-//! persisted total the bridge cannot see.
+//! [`crate::host::MarshallingLimits`] (depth 16, 256 nodes, 8 KiB), so this
+//! module re-validates defence-in-depth and additionally owns the 64 KiB
+//! persisted total the bridge cannot see. Byte accounting differs by layer
+//! (string payload here versus JSON encoding in the backend); the backend
+//! stays the final gate for encoding overhead.
 //!
 //! This module performs no I/O: durability reduces to the host keeping the
 //! owning [`PluginStore`] alive across generations. There is no expiry, no
@@ -48,17 +65,19 @@ use std::collections::BTreeMap;
 
 use crate::host::{BridgeError, LuaValue};
 
-/// RC-11 persisted-bytes ceiling per plugin (`256 KiB`).
-pub const STORE_MAX_TOTAL_BYTES: usize = 256 * 1024;
+/// RC-11 persisted-bytes ceiling per plugin (`64 KiB`, W-131 backend value).
+pub const STORE_MAX_TOTAL_BYTES: usize = 64 * 1024;
 
 /// RC-11 per-value byte ceiling (`8 KiB`, string payload per [`value_bytes`]).
 pub const STORE_MAX_VALUE_BYTES: usize = 8 * 1024;
 
-/// RC-11 per-value depth ceiling (see [`value_depth`]).
-pub const STORE_MAX_DEPTH: usize = 8;
+/// RC-11 per-value depth ceiling (see [`value_depth`]; W-131 backend value).
+pub const STORE_MAX_DEPTH: usize = 16;
 
-/// RC-11 persisted-node ceiling across all entries (keys included).
-pub const STORE_MAX_NODES: usize = 1024;
+/// RC-11 persisted-node ceiling across all entries (keys included; W-131
+/// backend value, backend counts entries while this layer counts nested
+/// nodes, see the module accounting notes).
+pub const STORE_MAX_NODES: usize = 256;
 
 /// Typed refusal code for every RC-11 quota denial.
 pub const STORE_QUOTA_CODE: &str = "E_STORE_QUOTA";

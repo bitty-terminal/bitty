@@ -1,7 +1,7 @@
 //! RC-11 plugin persistent store quota tests (RUN-25, CTX-0596).
 //!
-//! Exact-boundary coverage for all four ceilings (256 KiB total, 8 KiB per
-//! value, depth 8, 1024 nodes) plus denial atomicity: every over-quota write
+//! Exact-boundary coverage for all four ceilings (64 KiB total, 8 KiB per
+//! value, depth 16, 256 nodes) plus denial atomicity: every over-quota write
 //! fails with typed `E_STORE_QUOTA` and leaves the previous persisted state
 //! intact, with no eviction.
 
@@ -66,37 +66,31 @@ fn per_value_one_byte_over_denied_without_state_change() {
 }
 
 #[test]
-fn total_exactly_256kib_accepted() {
-    assert_eq!(STORE_MAX_TOTAL_BYTES, 256 * 1024);
-    // 32 entries x (1-byte key + 8191-byte value) = exactly 256 KiB.
+fn total_exactly_64kib_accepted() {
+    assert_eq!(STORE_MAX_TOTAL_BYTES, 64 * 1024);
+    // 8 entries x (1-byte key + 8191-byte value) = exactly 64 KiB.
     let mut store = PluginStore::new();
-    let keys: Vec<String> = ('a'..='z')
-        .map(|c| c.to_string())
-        .chain(('A'..='F').map(|c| c.to_string()))
-        .collect();
-    assert_eq!(keys.len(), 32);
+    let keys: Vec<String> = ('a'..='h').map(|c| c.to_string()).collect();
+    assert_eq!(keys.len(), 8);
     for key in &keys {
         store
             .set(key.clone(), string_value(8191))
             .expect("fill to exact ceiling");
     }
-    assert_eq!(store.len(), 32);
+    assert_eq!(store.len(), 8);
     assert_eq!(store.persisted_bytes(), STORE_MAX_TOTAL_BYTES);
 }
 
 #[test]
 fn total_one_entry_over_denied_without_eviction() {
     let mut store = PluginStore::new();
-    let keys: Vec<String> = ('a'..='z')
-        .map(|c| c.to_string())
-        .chain(('A'..='F').map(|c| c.to_string()))
-        .collect();
+    let keys: Vec<String> = ('a'..='h').map(|c| c.to_string()).collect();
     for key in &keys {
         store.set(key.clone(), string_value(8191)).expect("fill");
     }
     let result = store.set("overflow".to_string(), LuaValue::Bool(true));
     assert_quota_denied(result);
-    assert_eq!(store.len(), 32, "denial must not evict");
+    assert_eq!(store.len(), 8, "denial must not evict");
     assert_eq!(store.persisted_bytes(), STORE_MAX_TOTAL_BYTES);
     for key in &keys {
         assert!(store.get(key).is_some(), "entry {key} survives denial");
@@ -109,9 +103,9 @@ fn overwrite_denied_leaves_previous_value_intact() {
     store
         .set("k".to_string(), string_value(8191))
         .expect("setup");
-    // Fill the remaining budget exactly: 31 entries x (3-byte key +
-    // 8189-byte value); the store then holds exactly 256 KiB.
-    for i in 0..31 {
+    // Fill the remaining budget exactly: 7 entries x (3-byte key +
+    // 8189-byte value); the store then holds exactly 64 KiB.
+    for i in 0..7 {
         store
             .set(format!("e{i:02}"), string_value(8189))
             .expect("fill to exact ceiling");
@@ -125,27 +119,27 @@ fn overwrite_denied_leaves_previous_value_intact() {
 }
 
 #[test]
-fn depth_exactly_8_accepted_9_denied() {
-    assert_eq!(STORE_MAX_DEPTH, 8);
-    assert_eq!(value_depth(&nested(8)), 8);
-    assert_eq!(value_depth(&nested(9)), 9);
+fn depth_exactly_16_accepted_17_denied() {
+    assert_eq!(STORE_MAX_DEPTH, 16);
+    assert_eq!(value_depth(&nested(16)), 16);
+    assert_eq!(value_depth(&nested(17)), 17);
     let mut store = PluginStore::new();
     store
-        .set("d8".to_string(), nested(8))
-        .expect("depth 8 fits");
+        .set("d16".to_string(), nested(16))
+        .expect("depth 16 fits");
     let before = store.persisted_bytes();
-    assert_quota_denied(store.set("d9".to_string(), nested(9)));
-    assert!(store.get("d9").is_none());
+    assert_quota_denied(store.set("d17".to_string(), nested(17)));
+    assert!(store.get("d17").is_none());
     assert_eq!(store.persisted_bytes(), before);
 }
 
 #[test]
-fn nodes_total_exactly_1024_accepted() {
-    assert_eq!(STORE_MAX_NODES, 1024);
-    // Array of 255 integers: 1 table + 255 keys + 255 values = 511 nodes;
-    // plus the entry key = 512 nodes per entry; two entries = exactly 1024.
-    let value = int_array(255);
-    assert_eq!(value_nodes(&value), 511);
+fn nodes_total_exactly_256_accepted() {
+    assert_eq!(STORE_MAX_NODES, 256);
+    // Array of 63 integers: 1 table + 63 keys + 63 values = 127 nodes;
+    // plus the entry key = 128 nodes per entry; two entries = exactly 256.
+    let value = int_array(63);
+    assert_eq!(value_nodes(&value), 127);
     let mut store = PluginStore::new();
     store
         .set("a".to_string(), value.clone())
@@ -153,24 +147,24 @@ fn nodes_total_exactly_1024_accepted() {
     store
         .set("b".to_string(), value)
         .expect("exact node ceiling");
-    assert_eq!(store.node_count(), 1024);
+    assert_eq!(store.node_count(), 256);
 }
 
 #[test]
 fn nodes_one_entry_over_denied_without_state_change() {
-    let value = int_array(255);
+    let value = int_array(63);
     let mut store = PluginStore::new();
     store.set("a".to_string(), value.clone()).expect("setup");
     store.set("b".to_string(), value).expect("setup");
-    assert_eq!(store.node_count(), 1024);
+    assert_eq!(store.node_count(), 256);
     assert_quota_denied(store.set("c".to_string(), LuaValue::Bool(true)));
-    assert_eq!(store.node_count(), 1024);
+    assert_eq!(store.node_count(), 256);
     assert_eq!(store.len(), 2);
-    // A single 1023-node value alone still fits its per-value ceiling.
+    // A single 255-node value alone still fits its per-value ceiling.
     let mut solo = PluginStore::new();
-    solo.set("solo".to_string(), int_array(511))
-        .expect("1023 nodes fit");
-    assert_eq!(solo.node_count(), 1 + 1023);
+    solo.set("solo".to_string(), int_array(127))
+        .expect("255 nodes fit");
+    assert_eq!(solo.node_count(), 1 + 255);
 }
 
 #[test]

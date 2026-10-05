@@ -41,10 +41,12 @@ use crate::{LuaVm, SuspendReason, VmError};
 /// Version of the host bridge line exposed as `bitty.api_version`.
 pub const API_VERSION: &str = "1.0.0";
 
-/// Default marshalling depth ceiling (`RC-1`/bridge contract A.3).
-pub const DEFAULT_MAX_DEPTH: usize = 8;
-/// Default marshalling node ceiling (bridge contract A.3).
-pub const DEFAULT_MAX_NODES: usize = 1024;
+/// Default marshalling depth ceiling (W-131 backend value; was 8 under
+/// `RC-1`/bridge contract A.3, now 16 to match the store backend).
+pub const DEFAULT_MAX_DEPTH: usize = 16;
+/// Default marshalling node ceiling (W-131 backend value; was 1024 under
+/// bridge contract A.3, now 256 to match the store backend).
+pub const DEFAULT_MAX_NODES: usize = 256;
 /// Default marshalling byte ceiling for storage-shaped values (`8 KiB`).
 pub const DEFAULT_MAX_VALUE_BYTES: usize = 8 * 1024;
 /// Snapshot byte ceiling (`SNAPSHOT_MAX_BYTES`, RFC C.2).

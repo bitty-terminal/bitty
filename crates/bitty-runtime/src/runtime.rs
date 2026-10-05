@@ -174,7 +174,7 @@ use self::click::ClickTracker;
 use self::close_confirm::PendingCloseConfirm;
 use self::input::ImeKeyClaim;
 use self::layout_focus::{default_container, default_layout};
-use self::mouse_chrome::{AltDragState, BorderDragState, HoverPending};
+use self::mouse_chrome::{AltDragState, BorderDragState, HoverPending, TiledDragState};
 use self::panes::PaneSession;
 use self::present::{AnyRasterizer, HeadlessRasterizer, ImeCaret};
 use self::scrollbar::ScrollbarDrag;
@@ -721,20 +721,27 @@ pub struct Runtime {
     /// Active Alt+drag floating-pane move (CTX-0260).
     ///
     /// Alt+Left-press on a floating overlay grabs it; motion offsets the
-    /// overlay bounds (tiled layouts have no movable position, so the grab
-    /// is a fail-soft no-op there and the press falls through to
-    /// selection). `None` when no drag is active; cleared on release and
-    /// when the cursor leaves the window. Presentation-only: never grid
-    /// truth. Shift still forces the selection path (the grab never starts
-    /// while Shift is held, per the CTX-0181 precedent).
+    /// overlay bounds. Tiled leaves fail soft here (the Mod tiled-drag path
+    /// owns them, issue #1694). `None` when no drag is active; cleared on
+    /// release and when the cursor leaves the window. Presentation-only:
+    /// never grid truth. Shift still forces the selection path (the grab
+    /// never starts while Shift is held, per the CTX-0181 precedent).
     alt_drag: Option<AltDragState>,
+    /// Active Mod+drag tiled-panel move (issue #1694, CTX-0966).
+    ///
+    /// Mod(Alt/Super)+Left-press on a tiled leaf grabs it; motion tracks
+    /// the advisory preview target live, release re-parents with
+    /// Hyprland-like placement. `None` when no drag is active; committed
+    /// on release, cancelled when the cursor leaves the window.
+    /// Presentation-only: never grid truth.
+    tiled_drag: Option<TiledDragState>,
     /// Active border-drag split-divider resize (issue #1348).
     ///
     /// Plain left press on a split handle grabs the divider; motion
     /// adjusts the adjacent split ratio live (same clamped geometry as
     /// keyboard resize). `None` when no drag is active; cleared on release
-    /// and when the cursor leaves the window. Never starts while Shift or
-    /// Alt is held, and never while a mouse-mode app captures the pointer.
+    /// and when the cursor leaves the window. Never starts while Shift, Alt,
+    /// or Super is held, and never while a mouse-mode app captures the pointer.
     border_drag: Option<BorderDragState>,
     /// Pending dwell before hover activation moves focus (CTX-0334).
     ///
@@ -1411,6 +1418,7 @@ impl Runtime {
             scrollbar_cursor_left: false,
             scrollbar_visible: false,
             alt_drag: None,
+            tiled_drag: None,
             border_drag: None,
             hover_pending: None,
             animator: PanelAnimator::new(config.animations),
@@ -1645,6 +1653,7 @@ impl Runtime {
             scrollbar_cursor_left: false,
             scrollbar_visible: false,
             alt_drag: None,
+            tiled_drag: None,
             border_drag: None,
             hover_pending: None,
             animator: PanelAnimator::new(config.animations),

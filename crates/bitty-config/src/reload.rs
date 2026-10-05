@@ -189,10 +189,16 @@ pub const LIVE_FIELDS: &[&str] = &[
     "appearance.animations.duration_ms.close",
     "appearance.animations.duration_ms.focus",
     "appearance.animations.duration_ms.workspace",
+    "appearance.animations.duration_ms.move",
+    "appearance.animations.duration_ms.resize",
+    "appearance.animations.duration_ms.drag",
     "appearance.animations.easing.open",
     "appearance.animations.easing.close",
     "appearance.animations.easing.focus",
     "appearance.animations.easing.workspace",
+    "appearance.animations.easing.move",
+    "appearance.animations.easing.resize",
+    "appearance.animations.easing.drag",
     "mod_key",
     "leader_key",
     "leader_timeout_ms",
@@ -626,6 +632,21 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
             old.animations.duration_ms.workspace,
             new.animations.duration_ms.workspace,
         ),
+        (
+            "appearance.animations.duration_ms.move",
+            old.animations.duration_ms.r#move,
+            new.animations.duration_ms.r#move,
+        ),
+        (
+            "appearance.animations.duration_ms.resize",
+            old.animations.duration_ms.resize,
+            new.animations.duration_ms.resize,
+        ),
+        (
+            "appearance.animations.duration_ms.drag",
+            old.animations.duration_ms.drag,
+            new.animations.duration_ms.drag,
+        ),
     ] {
         push_if_changed(field, before.to_string(), after.to_string());
     }
@@ -649,6 +670,21 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
             "appearance.animations.easing.workspace",
             old.animations.easing.workspace,
             new.animations.easing.workspace,
+        ),
+        (
+            "appearance.animations.easing.move",
+            old.animations.easing.r#move,
+            new.animations.easing.r#move,
+        ),
+        (
+            "appearance.animations.easing.resize",
+            old.animations.easing.resize,
+            new.animations.easing.resize,
+        ),
+        (
+            "appearance.animations.easing.drag",
+            old.animations.easing.drag,
+            new.animations.easing.drag,
         ),
     ] {
         push_if_changed(

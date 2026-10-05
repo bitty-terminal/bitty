@@ -1,10 +1,15 @@
 #![forbid(unsafe_code)]
-//! Renderer-side panel animations (RFC-0002, CTX-0341).
+//! Renderer-side panel animations (RFC-0002, CTX-0341; CTX-0967 move/resize/drag).
 //!
 //! Pins the runtime wiring of the accepted contract:
 //! - a new split `View` arms a bounded open transition and presents extra
 //!   frames while active; when it completes the present path idles again
 //!   (frame-on-demand, PB-7: zero wakeups after completion);
+//! - panel move (same-workspace reposition, cross-workspace reparent),
+//!   panel resize (border-drag divider, keyboard step), and panel drag
+//!   (Alt+drag float move) arm their own bounded transitions from the
+//!   gesture paths; the layout commits immediately and only Core-owned
+//!   chrome fades (terminal content is never interpolated);
 //! - the `now`-parameterized `tick_at` seam lets tests advance virtual time
 //!   deterministically, so no wall-clock sleeps are needed;
 //! - `enabled = false`, `reduced_motion = "always"`, `safe_mode`, and `0` ms
@@ -17,9 +22,10 @@
 
 use std::time::{Duration, Instant};
 
+use bitty_platform::{CursorPosition, MouseButton, NamedKey, PressState};
 use bitty_runtime::{
     AnimationCurve, AnimationKind, AnimationPolicy, LayoutNode, ReducedMotionMode, Runtime,
-    RuntimeConfig, SplitAxis, View, ViewId,
+    RuntimeConfig, SplitAxis, UiRect, View, ViewId,
 };
 
 fn runtime_with(policy: AnimationPolicy) -> Runtime {
@@ -110,7 +116,7 @@ fn disabled_policy_is_instant_and_matches_pre_rfc_idle() {
 fn zero_duration_reduced_and_safe_are_instant() {
     // 0 ms durations.
     let policy = AnimationPolicy {
-        duration_ms: [0, 0, 0, 0],
+        duration_ms: [0; AnimationKind::COUNT],
         ..AnimationPolicy::default()
     };
     let mut rt = runtime_with(policy);
@@ -164,7 +170,7 @@ fn configured_open_duration_is_honored_not_the_default() {
     // On the buggy runtime the animator kept `AnimationPolicy::default()`
     // (open = 150 ms), so a 500 ms configured open expired 350 ms early.
     let policy = AnimationPolicy {
-        duration_ms: [500, 120, 100, 200],
+        duration_ms: [500, 120, 100, 200, 150, 120, 150],
         ..AnimationPolicy::default()
     };
     let mut rt = runtime_with(policy);
@@ -211,12 +217,15 @@ fn configured_easing_drives_the_reported_progress() {
     // Linear at half the configured duration is exactly 0.5; the default
     // EaseOut curve would report 0.75 for the same time.
     let policy = AnimationPolicy {
-        duration_ms: [500, 120, 100, 200],
+        duration_ms: [500, 120, 100, 200, 150, 120, 150],
         curves: [
             AnimationCurve::Linear,
             AnimationCurve::EaseIn,
             AnimationCurve::EaseInOut,
             AnimationCurve::EaseInOut,
+            AnimationCurve::EaseInOut,
+            AnimationCurve::EaseInOut,
+            AnimationCurve::EaseOut,
         ],
         ..AnimationPolicy::default()
     };
@@ -240,7 +249,7 @@ fn configured_easing_drives_the_reported_progress() {
 fn configured_durations_still_suppress_to_instant() {
     // CTX-0356: the 0 ms suppression paths must keep winning over positive
     // configured durations.
-    let positive = [500, 500, 500, 500];
+    let positive = [500; AnimationKind::COUNT];
     for policy in [
         AnimationPolicy {
             duration_ms: positive,
@@ -285,7 +294,7 @@ fn set_animations_reloads_the_live_policy() {
     assert!(rt.tick_at(start).is_none());
 
     rt.set_animations(AnimationPolicy {
-        duration_ms: [500, 120, 100, 200],
+        duration_ms: [500, 120, 100, 200, 150, 120, 150],
         ..AnimationPolicy::default()
     });
     rt.set_layout(two_pane_split());
@@ -479,4 +488,285 @@ fn terminal_grid_is_never_interpolated() {
         .map(|c| c.glyph)
         .collect();
     assert_eq!(row, "GRID-TRUTH", "grid content is never animated");
+}
+
+// ── CTX-0967: move/resize/drag transitions ───────────────────────────────
+
+/// Cursor pixels landing on container cell (col, row) under the default
+/// headless geometry for the overlay path (8px padding, 14px decoration
+/// inset, 9x19 cells).
+fn overlay_cell_pixels(col: u16, row: u16) -> CursorPosition {
+    CursorPosition {
+        x: 8.0 + 14.0 + f64::from(col) * 9.0 + 4.0,
+        y: 8.0 + 14.0 + f64::from(row) * 19.0 + 9.0,
+    }
+}
+
+/// Cursor pixels for the split-handle path (8px padding, 9x19 cells, zero
+/// gaps): column 40 is the zero-gap boundary line of a 40|40 split.
+fn border_cell_pixels(col: u16, row: u16) -> CursorPosition {
+    CursorPosition {
+        x: 8.0 + f64::from(col) * 9.0 + 4.0,
+        y: 8.0 + f64::from(row) * 19.0 + 9.0,
+    }
+}
+
+fn press(button: MouseButton) -> bitty_platform::MouseEvent {
+    bitty_platform::MouseEvent::new(button, PressState::Pressed)
+}
+
+fn release(button: MouseButton) -> bitty_platform::MouseEvent {
+    bitty_platform::MouseEvent::new(button, PressState::Released)
+}
+
+fn named_key(named: NamedKey, state: PressState) -> bitty_platform::KeyEvent {
+    bitty_platform::KeyEvent {
+        logical_key: bitty_platform::LogicalKey::Named(named),
+        text: None,
+        location: bitty_platform::KeyLocation::Standard,
+        state,
+        repeat: false,
+        is_synthetic: false,
+    }
+}
+
+fn overlay_tree() -> LayoutNode {
+    LayoutNode::overlay(
+        LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+        LayoutNode::leaf(View::new(ViewId::new(2), 10, 5)),
+        UiRect::new(50, 10, 10, 5),
+    )
+}
+
+#[test]
+fn same_workspace_reposition_arms_move_then_idles() {
+    // CTX-0967: reparenting the focused leaf inside its workspace arms the
+    // move transition on the moved panel, presents extra frames while
+    // active, and idles with zero wakeups after the 150 ms default.
+    let mut rt = runtime_with(AnimationPolicy::default());
+    let start = Instant::now();
+    let _ = rt.tick_at(start).expect("baseline presents");
+    rt.set_layout(two_pane_split());
+    let _ = rt.tick_at(start).expect("split presents");
+    let settled = start + Duration::from_millis(150);
+    rt.tick_at(settled);
+    assert!(rt.tick_at(settled).is_none(), "idle baseline");
+
+    let t = Instant::now();
+    let moved = rt
+        .workspace_move_focused_to_position_at(1, t)
+        .expect("reposition must succeed");
+    assert_eq!(moved, ViewId::new(1));
+    assert_eq!(
+        rt.animation_progress(AnimationKind::Move, Some(moved), t),
+        Some(0.0),
+        "move must arm at the gesture time"
+    );
+    let mid = t + Duration::from_millis(75);
+    let p = rt
+        .animation_progress(AnimationKind::Move, Some(moved), mid)
+        .expect("mid progress");
+    assert!((0.0..1.0).contains(&p), "mid move progress {p}");
+    assert!(rt.tick_at(mid).is_some(), "active move must present");
+    let end = t + Duration::from_millis(150);
+    assert!(rt.tick_at(end).is_some(), "final frame commits");
+    assert!(!rt.animations_active(), "move must complete");
+    assert!(rt.tick_at(end).is_none(), "idle after move completes");
+    assert_eq!(rt.animation_deadline(), None, "no deadline when idle");
+}
+
+#[test]
+fn cross_workspace_move_arms_move() {
+    // CTX-0967: moving the focused leaf into another workspace arms the
+    // move transition on the moved panel and expires bounded.
+    let mut rt = runtime_with(AnimationPolicy::default());
+    let start = Instant::now();
+    let _ = rt.tick_at(start).expect("baseline presents");
+    rt.workspace_new().expect("new workspace");
+    let _ = rt.tick_at(start).expect("workspace switch presents");
+    let settled = start + Duration::from_millis(200);
+    rt.tick_at(settled);
+    assert!(rt.tick_at(settled).is_none(), "idle baseline");
+
+    let t = Instant::now();
+    let moved = rt
+        .workspace_move_focused_to_at(0, t)
+        .expect("cross-workspace move must succeed");
+    assert!(
+        rt.animation_progress(AnimationKind::Move, Some(moved), t)
+            .is_some(),
+        "move must arm on the moved panel"
+    );
+    let end = t + Duration::from_millis(150);
+    rt.tick_at(end);
+    assert!(
+        rt.animation_progress(AnimationKind::Move, Some(moved), end)
+            .is_none(),
+        "move must expire by 150 ms"
+    );
+}
+
+#[test]
+fn border_drag_arms_whole_surface_resize() {
+    // CTX-0967: a live divider move arms the whole-surface resize
+    // transition (one gesture touches every adjacent panel), applies the
+    // ratio live, and idles after the 120 ms default.
+    let mut rt = runtime_with(AnimationPolicy::default());
+    rt.set_layout(two_pane_split());
+    rt.handle_cursor_moved(border_cell_pixels(40, 12));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(rt.border_drag_active(), "border press must grab");
+
+    let t = Instant::now();
+    assert!(
+        rt.update_border_drag_at(border_cell_pixels(48, 12), t),
+        "drag motion must apply"
+    );
+    let ratio = rt
+        .layout()
+        .split_ratio_at(&[])
+        .expect("root must expose a ratio");
+    assert!((ratio - 0.6).abs() < 1e-6, "ratio must move live");
+    assert!(
+        rt.animation_progress(AnimationKind::Resize, None, t)
+            .is_some(),
+        "resize must arm whole-surface at the gesture time"
+    );
+    let mid = t + Duration::from_millis(60);
+    let p = rt
+        .animation_progress(AnimationKind::Resize, None, mid)
+        .expect("mid progress");
+    assert!((0.0..1.0).contains(&p), "mid resize progress {p}");
+    assert!(rt.tick_at(mid).is_some(), "active resize must present");
+    let end = t + Duration::from_millis(120);
+    assert!(rt.tick_at(end).is_some(), "final frame commits");
+    assert!(!rt.animations_active(), "resize must complete");
+    assert!(rt.tick_at(end).is_none(), "idle after resize completes");
+    assert_eq!(rt.animation_deadline(), None, "no deadline when idle");
+    rt.handle_mouse_input(release(MouseButton::Left));
+    assert!(!rt.border_drag_active());
+}
+
+#[test]
+fn alt_drag_arms_drag_on_the_float() {
+    // CTX-0967: moving a grabbed floating overlay arms the drag transition
+    // on the dragged leaf; the bounds commit immediately and the chrome
+    // settles after the 150 ms default.
+    let mut rt = runtime_with(AnimationPolicy::default());
+    rt.set_layout(overlay_tree());
+    rt.handle_cursor_moved(overlay_cell_pixels(55, 12));
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Pressed));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(rt.alt_drag_active(), "Alt+press on float must grab");
+
+    let t = Instant::now();
+    assert!(
+        rt.update_alt_drag_at(overlay_cell_pixels(60, 14), t),
+        "drag motion must apply"
+    );
+    let bounds = match rt.layout() {
+        LayoutNode::Overlay { bounds, .. } => *bounds,
+        other => panic!("expected overlay tree, got {other:?}"),
+    };
+    assert_eq!(bounds, UiRect::new(55, 12, 10, 5));
+    let leaf = ViewId::new(2);
+    assert_eq!(
+        rt.animation_progress(AnimationKind::Drag, Some(leaf), t),
+        Some(0.0),
+        "drag must arm at the gesture time"
+    );
+    let mid = t + Duration::from_millis(75);
+    let p = rt
+        .animation_progress(AnimationKind::Drag, Some(leaf), mid)
+        .expect("mid progress");
+    assert!((0.0..1.0).contains(&p), "mid drag progress {p}");
+    assert!(rt.tick_at(mid).is_some(), "active drag must present");
+    let end = t + Duration::from_millis(150);
+    assert!(rt.tick_at(end).is_some(), "final frame commits");
+    assert!(!rt.animations_active(), "drag must complete");
+    assert!(rt.tick_at(end).is_none(), "idle after drag completes");
+    assert_eq!(rt.animation_deadline(), None, "no deadline when idle");
+    rt.handle_mouse_input(release(MouseButton::Left));
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
+}
+
+#[test]
+fn geometry_kinds_suppressed_when_instant() {
+    // CTX-0967: disabled, reduced-motion-always, and safe-mode policies arm
+    // no geometry transition, while the gestures themselves still apply.
+    for policy in [
+        AnimationPolicy {
+            enabled: false,
+            ..AnimationPolicy::default()
+        },
+        AnimationPolicy {
+            reduced_motion: ReducedMotionMode::Always,
+            ..AnimationPolicy::default()
+        },
+        AnimationPolicy {
+            safe_mode: true,
+            ..AnimationPolicy::default()
+        },
+    ] {
+        // Reparent still moves; it just does not animate.
+        let mut rt = runtime_with(policy);
+        let start = Instant::now();
+        let _ = rt.tick_at(start);
+        rt.set_layout(two_pane_split());
+        let _ = rt.tick_at(start);
+        let t = Instant::now();
+        let moved = rt
+            .workspace_move_focused_to_position_at(1, t)
+            .expect("reposition must succeed");
+        assert!(
+            rt.animation_progress(AnimationKind::Move, Some(moved), t)
+                .is_none(),
+            "suppressed move must not arm: {policy:?}"
+        );
+        // Float drag still moves; it just does not animate.
+        let mut rt = runtime_with(policy);
+        rt.set_layout(overlay_tree());
+        rt.handle_cursor_moved(overlay_cell_pixels(55, 12));
+        rt.handle_key_event(named_key(NamedKey::Alt, PressState::Pressed));
+        rt.handle_mouse_input(press(MouseButton::Left));
+        assert!(rt.alt_drag_active());
+        let t = Instant::now();
+        assert!(rt.update_alt_drag_at(overlay_cell_pixels(60, 14), t));
+        assert!(
+            rt.animation_progress(AnimationKind::Drag, Some(ViewId::new(2)), t)
+                .is_none(),
+            "suppressed drag must not arm: {policy:?}"
+        );
+        assert!(!rt.animations_active());
+        assert_eq!(rt.animation_deadline(), None);
+        rt.handle_mouse_input(release(MouseButton::Left));
+        rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
+    }
+}
+
+#[test]
+fn terminal_grid_is_never_interpolated_during_move() {
+    // CTX-0967: a grid byte written mid-move reads back verbatim — only
+    // Core-owned chrome fades, never terminal truth.
+    let mut rt = runtime_with(AnimationPolicy::default());
+    let start = Instant::now();
+    let _ = rt.tick_at(start);
+    rt.set_layout(two_pane_split());
+    let _ = rt.tick_at(start);
+    let t = Instant::now();
+    rt.workspace_move_focused_to_position_at(1, t)
+        .expect("reposition must succeed");
+    assert!(rt.animations_active(), "move must be active");
+    rt.handle_pty_bytes(b"\x1b[2;1HMOVE-TRUTH");
+    let snap = rt.snapshot();
+    let row: String = snap
+        .cells
+        .chunks(snap.width)
+        .nth(1)
+        .expect("row 2")
+        .iter()
+        .take(10)
+        .map(|c| c.glyph)
+        .collect();
+    assert_eq!(row, "MOVE-TRUTH", "grid content is never animated");
 }

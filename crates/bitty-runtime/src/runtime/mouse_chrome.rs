@@ -164,6 +164,12 @@ impl Runtime {
     /// longer owns the leaf (closed mid-drag) the drag ends fail-soft and
     /// `false` is returned so the motion falls through to normal handling.
     pub fn update_alt_drag(&mut self, pos: CursorPosition) -> bool {
+        self.update_alt_drag_at(pos, Instant::now())
+    }
+
+    /// [`Self::update_alt_drag`] with an explicit wall clock (CTX-0967
+    /// virtual-clock seam: tests arm the drag transition deterministically).
+    pub fn update_alt_drag_at(&mut self, pos: CursorPosition, now: Instant) -> bool {
         let Some(drag) = self.alt_drag else {
             return false;
         };
@@ -186,6 +192,11 @@ impl Runtime {
             anchor_row: i32::from(cell.row),
         });
         self.pending_full_redraw = true;
+        // CTX-0967: a live float move arms the drag transition on the
+        // dragged leaf. The layout commits immediately (terminal content is
+        // never interpolated); only the leaf's chrome ring fades, and repeat
+        // updates restart the bounded transition instead of accumulating.
+        self.trigger_animation(AnimationKind::Drag, Some(drag.leaf), now);
         true
     }
 
@@ -357,6 +368,12 @@ impl Runtime {
     /// Returns `true` when a drag was active (caller consumes the motion:
     /// no selection update, no hover-focus, no capture motion encoding).
     pub fn update_border_drag(&mut self, pos: CursorPosition) -> bool {
+        self.update_border_drag_at(pos, Instant::now())
+    }
+
+    /// [`Self::update_border_drag`] with an explicit wall clock (CTX-0967
+    /// virtual-clock seam: tests arm the resize transition deterministically).
+    pub fn update_border_drag_at(&mut self, pos: CursorPosition, now: Instant) -> bool {
         let Some(drag) = self.border_drag.clone() else {
             return false;
         };
@@ -399,6 +416,13 @@ impl Runtime {
 
         if any_changed {
             self.set_layout(next);
+            // CTX-0967: a live divider move arms the whole-surface resize
+            // transition. The ratios commit immediately (terminal content is
+            // never interpolated); only Core-owned chrome fades. `None`
+            // because one gesture resizes every adjacent panel at once
+            // (corner-drag touches up to four); repeat updates restart the
+            // bounded transition instead of accumulating.
+            self.trigger_animation(AnimationKind::Resize, None, now);
         }
         self.border_drag = Some(BorderDragState {
             splits: drag.splits,

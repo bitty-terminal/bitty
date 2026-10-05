@@ -113,10 +113,16 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "appearance.animations.duration_ms.close"
         | "appearance.animations.duration_ms.focus"
         | "appearance.animations.duration_ms.workspace"
+        | "appearance.animations.duration_ms.move"
+        | "appearance.animations.duration_ms.resize"
+        | "appearance.animations.duration_ms.drag"
         | "appearance.animations.easing.open"
         | "appearance.animations.easing.close"
         | "appearance.animations.easing.focus"
         | "appearance.animations.easing.workspace"
+        | "appearance.animations.easing.move"
+        | "appearance.animations.easing.resize"
+        | "appearance.animations.easing.drag"
         | "mod_key"
         | "leader_key"
         | "leader_timeout_ms"
@@ -212,7 +218,8 @@ struct MergeAccumulators<'a> {
     policy_violations: &'a mut Vec<ConfigError>,
 }
 
-/// Merges one layer's `appearance.animations` overrides (RFC-0002, CTX-0341).
+/// Merges one layer's `appearance.animations` overrides (RFC-0002, CTX-0341;
+/// CTX-0967 adds the move/resize/drag leaves under the same contract).
 ///
 /// Each present leaf is scalar-replace with its own source attribution; an
 /// absent leaf is "says nothing" and inherits the lower-precedence value.
@@ -233,7 +240,7 @@ fn merge_animations_overrides(
     } = acc;
     // Field name plus a setter for the concrete effective value. `None`
     // leaves are skipped before any policy/attribution work.
-    let leaves: [(&str, bool); 10] = [
+    let leaves: [(&str, bool); 16] = [
         ("appearance.animations.enabled", over.enabled.is_some()),
         (
             "appearance.animations.reduced_motion",
@@ -256,6 +263,18 @@ fn merge_animations_overrides(
             over.duration_workspace.is_some(),
         ),
         (
+            "appearance.animations.duration_ms.move",
+            over.duration_move.is_some(),
+        ),
+        (
+            "appearance.animations.duration_ms.resize",
+            over.duration_resize.is_some(),
+        ),
+        (
+            "appearance.animations.duration_ms.drag",
+            over.duration_drag.is_some(),
+        ),
+        (
             "appearance.animations.easing.open",
             over.easing_open.is_some(),
         ),
@@ -270,6 +289,18 @@ fn merge_animations_overrides(
         (
             "appearance.animations.easing.workspace",
             over.easing_workspace.is_some(),
+        ),
+        (
+            "appearance.animations.easing.move",
+            over.easing_move.is_some(),
+        ),
+        (
+            "appearance.animations.easing.resize",
+            over.easing_resize.is_some(),
+        ),
+        (
+            "appearance.animations.easing.drag",
+            over.easing_drag.is_some(),
         ),
     ];
     for (field, present) in leaves {
@@ -303,10 +334,20 @@ fn merge_animations_overrides(
             "appearance.animations.duration_ms.workspace" => {
                 one.duration_workspace = over.duration_workspace;
             }
+            "appearance.animations.duration_ms.move" => one.duration_move = over.duration_move,
+            "appearance.animations.duration_ms.resize" => {
+                one.duration_resize = over.duration_resize;
+            }
+            "appearance.animations.duration_ms.drag" => one.duration_drag = over.duration_drag,
             "appearance.animations.easing.open" => one.easing_open = over.easing_open,
             "appearance.animations.easing.close" => one.easing_close = over.easing_close,
             "appearance.animations.easing.focus" => one.easing_focus = over.easing_focus,
-            _ => one.easing_workspace = over.easing_workspace,
+            "appearance.animations.easing.workspace" => {
+                one.easing_workspace = over.easing_workspace;
+            }
+            "appearance.animations.easing.move" => one.easing_move = over.easing_move,
+            "appearance.animations.easing.resize" => one.easing_resize = over.easing_resize,
+            _ => one.easing_drag = over.easing_drag,
         }
         effective.animations.apply_overrides(&one);
         let prev = attribution.get(field).cloned();
@@ -5174,6 +5215,7 @@ mod tests {
                     animations: Some(AnimationsOverride {
                         duration_open: Some(250),
                         easing_open: Some(AnimationEasing::Linear),
+                        duration_move: Some(300),
                         ..Default::default()
                     }),
                 }),
@@ -5191,6 +5233,8 @@ mod tests {
                         duration_open: Some(500),
                         enabled: Some(false),
                         reduced_motion: Some(ReducedMotion::Always),
+                        duration_drag: Some(0),
+                        easing_resize: Some(AnimationEasing::Linear),
                         ..Default::default()
                     }),
                 }),
@@ -5210,6 +5254,18 @@ mod tests {
         assert_eq!(
             merged.effective.animations.easing.open,
             AnimationEasing::Linear
+        );
+        // CTX-0967: geometry leaves merge per-leaf like the RFC-0002 set —
+        // user drag wins, system move survives, untouched resize inherits.
+        assert_eq!(merged.effective.animations.duration_ms.drag, 0);
+        assert_eq!(merged.effective.animations.duration_ms.r#move, 300);
+        assert_eq!(
+            merged.effective.animations.easing.resize,
+            AnimationEasing::Linear
+        );
+        assert_eq!(
+            merged.effective.animations.duration_ms.resize,
+            crate::types::DEFAULT_ANIMATION_RESIZE_MS
         );
         // Untouched leaves keep the accepted defaults.
         assert_eq!(
@@ -5270,6 +5326,14 @@ mod tests {
         );
         assert_eq!(
             merge_class_for("appearance.animations.duration_ms.open"),
+            Some(MergeClass::ScalarReplace)
+        );
+        assert_eq!(
+            merge_class_for("appearance.animations.duration_ms.move"),
+            Some(MergeClass::ScalarReplace)
+        );
+        assert_eq!(
+            merge_class_for("appearance.animations.easing.drag"),
             Some(MergeClass::ScalarReplace)
         );
         // try_merge_layers agrees (second merge path).

@@ -612,9 +612,29 @@ impl Runtime {
                 };
                 // Panel-open fades the ring in from transparent; the final
                 // committed color is applied at animation end.
+                // CTX-0967: active move/resize/drag transitions fade the
+                // ring the same way (Hyprland-style geometry feedback).
+                // Each kind is read per-leaf with a whole-surface (`None`)
+                // fallback for multi-panel gestures (border-drag resize);
+                // co-active kinds multiply. Geometry and terminal content
+                // are never interpolated: only this Core-owned alpha moves,
+                // and every factor is the final `1.0` when its transition
+                // is instant or complete.
+                let mut motion_factor = 1.0f32;
+                for kind in [
+                    AnimationKind::Move,
+                    AnimationKind::Resize,
+                    AnimationKind::Drag,
+                ] {
+                    let per_leaf = self.animation_progress(kind, Some(view_id), ctx.now);
+                    let global = self.animation_progress(kind, None, ctx.now);
+                    if let Some(p) = per_leaf.or(global) {
+                        motion_factor *= p.clamp(0.0, 1.0);
+                    }
+                }
                 let ring_color = bitty_render::grid::scale_alpha(
                     animated_color,
-                    open_factor * ctx.workspace_factor,
+                    open_factor * ctx.workspace_factor * motion_factor,
                 );
                 combined_rounded.push(bitty_render::grid::RoundedFill {
                     frame: ring_frame,
@@ -1063,9 +1083,12 @@ impl Runtime {
         // `open_factor` scales the core-owned ring alpha during a panel open;
         // the workspace factor cross-fades Core-owned chrome on a workspace
         // switch; the focus factor (applied inside the loop) cross-fades the
-        // outline color. All default to the final value when the transition is
-        // instant or already complete. Purely presentation: no grid, cursor,
-        // scrollback, or Terminal Truth is interpolated.
+        // outline color. CTX-0967 adds the move/resize/drag factors (applied
+        // inside the loop beside `open_factor`): they fade the same ring
+        // while a geometry gesture settles. All default to the final value
+        // when the transition is instant or already complete. Purely
+        // presentation: no grid, cursor, scrollback, or Terminal Truth is
+        // interpolated.
         let workspace_factor = self
             .animation_progress(AnimationKind::Workspace, None, now)
             .map(|p| p.clamp(0.0, 1.0))

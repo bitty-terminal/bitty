@@ -1113,6 +1113,15 @@ impl TerminalApp {
                 let mut layout = self.runtime.layout().clone();
                 if resize_focused_pane(&mut layout, focused, dir) {
                     self.runtime.set_layout(layout);
+                    // CTX-0967: a committed keyboard resize arms the resize
+                    // transition on the focused panel. Ratios commit
+                    // immediately (terminal content is never interpolated);
+                    // only the resized panels' chrome rings fade.
+                    self.runtime.trigger_animation(
+                        bitty_runtime::AnimationKind::Resize,
+                        Some(focused),
+                        std::time::Instant::now(),
+                    );
                     eprintln!("bitty: keymap resize_split:{} applied", dir.canonical());
                 } else {
                     eprintln!(

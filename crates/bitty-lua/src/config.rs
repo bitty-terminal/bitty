@@ -382,6 +382,12 @@ pub struct AnimationsData {
     pub duration_focus: Option<i64>,
     /// Workspace-switch duration.
     pub duration_workspace: Option<i64>,
+    /// Panel-move duration (CTX-0967).
+    pub duration_move: Option<i64>,
+    /// Panel-resize duration (CTX-0967).
+    pub duration_resize: Option<i64>,
+    /// Panel-drag duration (CTX-0967).
+    pub duration_drag: Option<i64>,
     /// `easing` table (present only when the table is set).
     pub easing_open: Option<String>,
     /// Panel-close easing.
@@ -390,6 +396,12 @@ pub struct AnimationsData {
     pub easing_focus: Option<String>,
     /// Workspace-switch easing.
     pub easing_workspace: Option<String>,
+    /// Panel-move easing (CTX-0967).
+    pub easing_move: Option<String>,
+    /// Panel-resize easing (CTX-0967).
+    pub easing_resize: Option<String>,
+    /// Panel-drag easing (CTX-0967).
+    pub easing_drag: Option<String>,
 }
 
 /// Inline custom palette, plain data (CTX-0392, issue #648; see [`FontData`]
@@ -1073,7 +1085,15 @@ impl ConfigData {
                             check_nested_keys(
                                 "appearance.animations.duration_ms",
                                 dur_table,
-                                &["open", "close", "focus", "workspace"],
+                                &[
+                                    "open",
+                                    "close",
+                                    "focus",
+                                    "workspace",
+                                    "move",
+                                    "resize",
+                                    "drag",
+                                ],
                             )?;
                             data.duration_open = match get_field(dur_table, "open") {
                                 Some(v) => Some(expect_integer(
@@ -1103,6 +1123,27 @@ impl ConfigData {
                                 )?),
                                 None => None,
                             };
+                            data.duration_move = match get_field(dur_table, "move") {
+                                Some(v) => Some(expect_integer(
+                                    "appearance.animations.duration_ms.move",
+                                    v,
+                                )?),
+                                None => None,
+                            };
+                            data.duration_resize = match get_field(dur_table, "resize") {
+                                Some(v) => Some(expect_integer(
+                                    "appearance.animations.duration_ms.resize",
+                                    v,
+                                )?),
+                                None => None,
+                            };
+                            data.duration_drag = match get_field(dur_table, "drag") {
+                                Some(v) => Some(expect_integer(
+                                    "appearance.animations.duration_ms.drag",
+                                    v,
+                                )?),
+                                None => None,
+                            };
                         }
                         if let Some(easing) = get_field(anim_table, "easing") {
                             let easing_table =
@@ -1110,7 +1151,15 @@ impl ConfigData {
                             check_nested_keys(
                                 "appearance.animations.easing",
                                 easing_table,
-                                &["open", "close", "focus", "workspace"],
+                                &[
+                                    "open",
+                                    "close",
+                                    "focus",
+                                    "workspace",
+                                    "move",
+                                    "resize",
+                                    "drag",
+                                ],
                             )?;
                             data.easing_open = match get_field(easing_table, "open") {
                                 Some(v) => {
@@ -1135,6 +1184,24 @@ impl ConfigData {
                                     "appearance.animations.easing.workspace",
                                     v,
                                 )?),
+                                None => None,
+                            };
+                            data.easing_move = match get_field(easing_table, "move") {
+                                Some(v) => {
+                                    Some(expect_string("appearance.animations.easing.move", v)?)
+                                }
+                                None => None,
+                            };
+                            data.easing_resize = match get_field(easing_table, "resize") {
+                                Some(v) => {
+                                    Some(expect_string("appearance.animations.easing.resize", v)?)
+                                }
+                                None => None,
+                            };
+                            data.easing_drag = match get_field(easing_table, "drag") {
+                                Some(v) => {
+                                    Some(expect_string("appearance.animations.easing.drag", v)?)
+                                }
                                 None => None,
                             };
                         }
@@ -2347,12 +2414,13 @@ mod tests {
     fn animations_extract_and_absent_means_no_override() {
         // RFC-0002: the full accepted table extracts; absent table/leaf is
         // `None` so merge keeps the lower-precedence (accepted default).
+        // CTX-0967: the move/resize/drag leaves extract the same way.
         let data = eval_ok(
             r#"return { appearance = { animations = {
                 enabled = true,
                 reduced_motion = "auto",
-                duration_ms = { open = 150, close = 120, focus = 100, workspace = 200 },
-                easing = { open = "ease_out", close = "ease_in", focus = "ease_in_out", workspace = "spring" },
+                duration_ms = { open = 150, close = 120, focus = 100, workspace = 200, move = 150, resize = 120, drag = 150 },
+                easing = { open = "ease_out", close = "ease_in", focus = "ease_in_out", workspace = "spring", move = "ease_in_out", resize = "linear", drag = "spring" },
             } } }"#,
         );
         let a = data.animations.expect("animations present");
@@ -2362,18 +2430,35 @@ mod tests {
         assert_eq!(a.duration_close, Some(120));
         assert_eq!(a.duration_focus, Some(100));
         assert_eq!(a.duration_workspace, Some(200));
+        assert_eq!(a.duration_move, Some(150));
+        assert_eq!(a.duration_resize, Some(120));
+        assert_eq!(a.duration_drag, Some(150));
         assert_eq!(a.easing_open.as_deref(), Some("ease_out"));
         assert_eq!(a.easing_close.as_deref(), Some("ease_in"));
         assert_eq!(a.easing_focus.as_deref(), Some("ease_in_out"));
         assert_eq!(a.easing_workspace.as_deref(), Some("spring"));
+        assert_eq!(a.easing_move.as_deref(), Some("ease_in_out"));
+        assert_eq!(a.easing_resize.as_deref(), Some("linear"));
+        assert_eq!(a.easing_drag.as_deref(), Some("spring"));
         // A partial table leaves the other leaves absent.
         let data =
             eval_ok(r#"return { appearance = { animations = { duration_ms = { open = 0 } } } }"#);
         let a = data.animations.expect("animations present");
         assert_eq!(a.duration_open, Some(0));
         assert_eq!(a.duration_close, None);
+        assert_eq!(a.duration_move, None);
         assert_eq!(a.easing_open, None);
         assert_eq!(a.enabled, None);
+        // A geometry-only partial table extracts just its leaves.
+        let data = eval_ok(
+            r#"return { appearance = { animations = { duration_ms = { move = 0, drag = 500 }, easing = { resize = "linear" } } } }"#,
+        );
+        let a = data.animations.expect("animations present");
+        assert_eq!(a.duration_move, Some(0));
+        assert_eq!(a.duration_drag, Some(500));
+        assert_eq!(a.duration_resize, None);
+        assert_eq!(a.easing_resize.as_deref(), Some("linear"));
+        assert_eq!(a.easing_move, None);
         // Absent table is `None` (this layer says nothing).
         let data = eval_ok(r#"return { appearance = { theme = "dark" } }"#);
         assert_eq!(data.animations, None);
@@ -2418,6 +2503,8 @@ mod tests {
             r#"return { appearance = { animations = { reduced_motion = 1 } } }"#,
             r#"return { appearance = { animations = { duration_ms = { open = "150" } } } }"#,
             r#"return { appearance = { animations = { duration_ms = { open = 1.5 } } } }"#,
+            r#"return { appearance = { animations = { duration_ms = { move = "150" } } } }"#,
+            r#"return { appearance = { animations = { easing = { drag = true } } } }"#,
             r#"return { appearance = { animations = { easing = { open = true } } } }"#,
             r#"return { appearance = { animations = 5 } }"#,
             r#"return { appearance = { animations = { bogus = 1 } } }"#,

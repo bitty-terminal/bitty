@@ -185,15 +185,21 @@ pub const MAX_BACKGROUND_IMAGE_PATH_BYTES: usize = 4096;
 /// RFC-0001/OQ-042 bound (`at most 32 entries`).
 pub const MAX_BACKGROUND_IMAGE_ROOTS: usize = 32;
 
-// ── Panel animations (RFC-0002, CTX-0341) ────────────────────────────────
+// ── Panel animations (RFC-0002, CTX-0341; CTX-0967 move/resize/drag) ──────
 //
 // Accepted contract: a closed transition set (panel open/close, focus change,
-// workspace switch) with per-transition integer durations in `0..=500` ms and
+// workspace switch, panel move, panel resize, panel drag) with per-transition
+// integer durations in `0..=500` ms and
 // a closed easing enum (`linear | ease_in | ease_out | ease_in_out | spring`).
 // `spring` is a reserved leaf whose parameters are deferred, so it resolves to
 // `ease_in_out` until a follow-up RFC defines them. Durations and easings fail
 // closed; `enabled = false` and `reduced_motion = "always"` are equivalent to
 // `0` ms. Renderer-side by default; never interpolates terminal truth.
+//
+// Move/resize/drag (CTX-0967, issue #1696) are Hyprland-style geometry
+// gestures: the layout commits immediately and only Core-owned chrome fades,
+// so they share the same bounds, easing set, and reduced-motion contract as
+// the RFC-0002 transitions.
 
 /// Default panel-open duration in ms (RFC-0002).
 pub const DEFAULT_ANIMATION_OPEN_MS: u32 = 150;
@@ -207,6 +213,15 @@ pub const DEFAULT_ANIMATION_FOCUS_MS: u32 = 100;
 /// Default workspace-switch duration in ms (RFC-0002).
 pub const DEFAULT_ANIMATION_WORKSPACE_MS: u32 = 200;
 
+/// Default panel-move duration in ms (CTX-0967, Hyprland-style reposition).
+pub const DEFAULT_ANIMATION_MOVE_MS: u32 = 150;
+
+/// Default panel-resize duration in ms (CTX-0967, divider/keyboard step).
+pub const DEFAULT_ANIMATION_RESIZE_MS: u32 = 120;
+
+/// Default panel-drag duration in ms (CTX-0967, Alt+drag float move).
+pub const DEFAULT_ANIMATION_DRAG_MS: u32 = 150;
+
 /// Hard upper bound for every animation duration in ms (RFC-0002: `0..=500`).
 pub const MAX_ANIMATION_DURATION_MS: u32 = 500;
 
@@ -216,7 +231,8 @@ pub const DEFAULT_ANIMATIONS_ENABLED: bool = true;
 /// Default `appearance.animations.reduced_motion` (RFC-0002).
 pub const DEFAULT_REDUCED_MOTION: ReducedMotion = ReducedMotion::Auto;
 
-/// One animatable panel transition (RFC-0002 transition set).
+/// One animatable panel transition (RFC-0002 transition set, extended by
+/// CTX-0967 with move/resize/drag).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AnimationTransition {
     /// A `View` becomes occupied or a Panel is shown.
@@ -227,6 +243,12 @@ pub enum AnimationTransition {
     Focus,
     /// The active `Workspace` changes.
     Workspace,
+    /// A panel is repositioned (tiled reparent or cross-workspace move).
+    Move,
+    /// A panel boundary moves (border-drag divider or keyboard resize step).
+    Resize,
+    /// A floating panel is dragged (Alt+drag float move).
+    Drag,
 }
 
 impl AnimationTransition {
@@ -239,6 +261,9 @@ impl AnimationTransition {
             Self::Close => "close",
             Self::Focus => "focus",
             Self::Workspace => "workspace",
+            Self::Move => "move",
+            Self::Resize => "resize",
+            Self::Drag => "drag",
         }
     }
 }
@@ -334,7 +359,8 @@ impl ReducedMotion {
     }
 }
 
-/// Per-transition durations in milliseconds, each `0..=500` (RFC-0002).
+/// Per-transition durations in milliseconds, each `0..=500` (RFC-0002;
+/// CTX-0967 extends the set with move/resize/drag under the same bound).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AnimationDurations {
     /// Panel-open duration.
@@ -345,6 +371,13 @@ pub struct AnimationDurations {
     pub focus: u32,
     /// Workspace-switch duration.
     pub workspace: u32,
+    /// Panel-move duration (`move` is a Rust keyword, hence the raw
+    /// identifier; the config leaf stays `move`).
+    pub r#move: u32,
+    /// Panel-resize duration.
+    pub resize: u32,
+    /// Panel-drag duration.
+    pub drag: u32,
 }
 
 impl Default for AnimationDurations {
@@ -354,6 +387,9 @@ impl Default for AnimationDurations {
             close: DEFAULT_ANIMATION_CLOSE_MS,
             focus: DEFAULT_ANIMATION_FOCUS_MS,
             workspace: DEFAULT_ANIMATION_WORKSPACE_MS,
+            r#move: DEFAULT_ANIMATION_MOVE_MS,
+            resize: DEFAULT_ANIMATION_RESIZE_MS,
+            drag: DEFAULT_ANIMATION_DRAG_MS,
         }
     }
 }
@@ -367,11 +403,15 @@ impl AnimationDurations {
             AnimationTransition::Close => self.close,
             AnimationTransition::Focus => self.focus,
             AnimationTransition::Workspace => self.workspace,
+            AnimationTransition::Move => self.r#move,
+            AnimationTransition::Resize => self.resize,
+            AnimationTransition::Drag => self.drag,
         }
     }
 }
 
-/// Per-transition easings (RFC-0002).
+/// Per-transition easings (RFC-0002; CTX-0967 extends the set with
+/// move/resize/drag under the same closed enum).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AnimationEasings {
     /// Panel-open easing.
@@ -382,6 +422,12 @@ pub struct AnimationEasings {
     pub focus: AnimationEasing,
     /// Workspace-switch easing.
     pub workspace: AnimationEasing,
+    /// Panel-move easing (config leaf `move`).
+    pub r#move: AnimationEasing,
+    /// Panel-resize easing.
+    pub resize: AnimationEasing,
+    /// Panel-drag easing.
+    pub drag: AnimationEasing,
 }
 
 impl Default for AnimationEasings {
@@ -391,6 +437,9 @@ impl Default for AnimationEasings {
             close: AnimationEasing::EaseIn,
             focus: AnimationEasing::EaseInOut,
             workspace: AnimationEasing::EaseInOut,
+            r#move: AnimationEasing::EaseInOut,
+            resize: AnimationEasing::EaseInOut,
+            drag: AnimationEasing::EaseOut,
         }
     }
 }
@@ -404,6 +453,9 @@ impl AnimationEasings {
             AnimationTransition::Close => self.close,
             AnimationTransition::Focus => self.focus,
             AnimationTransition::Workspace => self.workspace,
+            AnimationTransition::Move => self.r#move,
+            AnimationTransition::Resize => self.resize,
+            AnimationTransition::Drag => self.drag,
         }
     }
 }
@@ -498,6 +550,15 @@ impl AnimationsConfig {
         if let Some(v) = over.duration_workspace {
             self.duration_ms.workspace = v;
         }
+        if let Some(v) = over.duration_move {
+            self.duration_ms.r#move = v;
+        }
+        if let Some(v) = over.duration_resize {
+            self.duration_ms.resize = v;
+        }
+        if let Some(v) = over.duration_drag {
+            self.duration_ms.drag = v;
+        }
         if let Some(v) = over.easing_open {
             self.easing.open = v;
         }
@@ -509,6 +570,15 @@ impl AnimationsConfig {
         }
         if let Some(v) = over.easing_workspace {
             self.easing.workspace = v;
+        }
+        if let Some(v) = over.easing_move {
+            self.easing.r#move = v;
+        }
+        if let Some(v) = over.easing_resize {
+            self.easing.resize = v;
+        }
+        if let Some(v) = over.easing_drag {
+            self.easing.drag = v;
         }
     }
 
@@ -531,6 +601,18 @@ impl AnimationsConfig {
                 "appearance.animations.duration_ms.workspace",
                 self.duration_ms.workspace,
             ),
+            (
+                "appearance.animations.duration_ms.move",
+                self.duration_ms.r#move,
+            ),
+            (
+                "appearance.animations.duration_ms.resize",
+                self.duration_ms.resize,
+            ),
+            (
+                "appearance.animations.duration_ms.drag",
+                self.duration_ms.drag,
+            ),
         ] {
             if value > MAX_ANIMATION_DURATION_MS {
                 return Err(ConfigError::validation(
@@ -543,12 +625,13 @@ impl AnimationsConfig {
     }
 }
 
-/// One layer's optional `appearance.animations` leaves (RFC-0002, CTX-0341).
+/// One layer's optional `appearance.animations` leaves (RFC-0002, CTX-0341;
+/// CTX-0967 adds the move/resize/drag leaves under the same contract).
 ///
 /// Every leaf is `Option` so "this layer says nothing" is distinguishable
 /// from an explicit value; merge applies each `Some` leaf by scalar replace
-/// and inherits the rest. Exactly one of the four duration leaves (and one of
-/// the four easing leaves) is expected per declared table; omitted leaves
+/// and inherits the rest. Exactly one of the seven duration leaves (and one of
+/// the seven easing leaves) is expected per declared table; omitted leaves
 /// inherit the lower-precedence value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AnimationsOverride {
@@ -564,6 +647,12 @@ pub struct AnimationsOverride {
     pub duration_focus: Option<u32>,
     /// `appearance.animations.duration_ms.workspace`.
     pub duration_workspace: Option<u32>,
+    /// `appearance.animations.duration_ms.move`.
+    pub duration_move: Option<u32>,
+    /// `appearance.animations.duration_ms.resize`.
+    pub duration_resize: Option<u32>,
+    /// `appearance.animations.duration_ms.drag`.
+    pub duration_drag: Option<u32>,
     /// `appearance.animations.easing.open`.
     pub easing_open: Option<AnimationEasing>,
     /// `appearance.animations.easing.close`.
@@ -572,6 +661,12 @@ pub struct AnimationsOverride {
     pub easing_focus: Option<AnimationEasing>,
     /// `appearance.animations.easing.workspace`.
     pub easing_workspace: Option<AnimationEasing>,
+    /// `appearance.animations.easing.move`.
+    pub easing_move: Option<AnimationEasing>,
+    /// `appearance.animations.easing.resize`.
+    pub easing_resize: Option<AnimationEasing>,
+    /// `appearance.animations.easing.drag`.
+    pub easing_drag: Option<AnimationEasing>,
 }
 
 impl AnimationsOverride {
@@ -591,6 +686,12 @@ impl AnimationsOverride {
                 "appearance.animations.duration_ms.workspace",
                 self.duration_workspace,
             ),
+            ("appearance.animations.duration_ms.move", self.duration_move),
+            (
+                "appearance.animations.duration_ms.resize",
+                self.duration_resize,
+            ),
+            ("appearance.animations.duration_ms.drag", self.duration_drag),
         ] {
             if let Some(v) = value {
                 if v > MAX_ANIMATION_DURATION_MS {
@@ -3413,6 +3514,9 @@ impl EffectiveConfig {
             close: 0,
             focus: 0,
             workspace: 0,
+            r#move: 0,
+            resize: 0,
+            drag: 0,
         };
         self
     }
@@ -5037,10 +5141,14 @@ mod tests {
     fn animations_defaults_match_rfc0002_and_validate() {
         // RFC-0002: open 150 / close 120 / focus 100 / workspace 200 ms;
         // enabled = true; reduced_motion = "auto"; ratified easings.
+        // CTX-0967: move 150 / resize 120 / drag 150 ms under the same bound.
         const { assert!(DEFAULT_ANIMATION_OPEN_MS == 150) }
         const { assert!(DEFAULT_ANIMATION_CLOSE_MS == 120) }
         const { assert!(DEFAULT_ANIMATION_FOCUS_MS == 100) }
         const { assert!(DEFAULT_ANIMATION_WORKSPACE_MS == 200) }
+        const { assert!(DEFAULT_ANIMATION_MOVE_MS == 150) }
+        const { assert!(DEFAULT_ANIMATION_RESIZE_MS == 120) }
+        const { assert!(DEFAULT_ANIMATION_DRAG_MS == 150) }
         const { assert!(MAX_ANIMATION_DURATION_MS == 500) }
         let a = AnimationsConfig::default();
         assert!(a.enabled);
@@ -5052,6 +5160,9 @@ mod tests {
                 close: 120,
                 focus: 100,
                 workspace: 200,
+                r#move: 150,
+                resize: 120,
+                drag: 150,
             }
         );
         assert_eq!(
@@ -5061,6 +5172,9 @@ mod tests {
                 close: AnimationEasing::EaseIn,
                 focus: AnimationEasing::EaseInOut,
                 workspace: AnimationEasing::EaseInOut,
+                r#move: AnimationEasing::EaseInOut,
+                resize: AnimationEasing::EaseInOut,
+                drag: AnimationEasing::EaseOut,
             }
         );
         a.validate().expect("accepted defaults valid");
@@ -5074,6 +5188,39 @@ mod tests {
             a.effective_duration_ms(AnimationTransition::Workspace, false, false),
             200
         );
+        assert_eq!(
+            a.effective_duration_ms(AnimationTransition::Move, false, false),
+            150
+        );
+        assert_eq!(
+            a.effective_duration_ms(AnimationTransition::Resize, false, false),
+            120
+        );
+        assert_eq!(
+            a.effective_duration_ms(AnimationTransition::Drag, false, false),
+            150
+        );
+        // `spring` resolves for the new leaves exactly like the RFC-0002 set.
+        let springy = AnimationsConfig {
+            easing: AnimationEasings {
+                r#move: AnimationEasing::Spring,
+                resize: AnimationEasing::Spring,
+                drag: AnimationEasing::Spring,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for t in [
+            AnimationTransition::Move,
+            AnimationTransition::Resize,
+            AnimationTransition::Drag,
+        ] {
+            assert_eq!(
+                springy.effective_easing(t),
+                AnimationEasing::EaseInOut,
+                "{t:?} spring must resolve"
+            );
+        }
         // Bound boundaries are accepted: 0 and 500 inclusive.
         for raw in [0u32, 500] {
             let b = AnimationsConfig {
@@ -5082,6 +5229,9 @@ mod tests {
                     close: raw,
                     focus: raw,
                     workspace: raw,
+                    r#move: raw,
+                    resize: raw,
+                    drag: raw,
                 },
                 ..Default::default()
             };
@@ -5093,12 +5243,18 @@ mod tests {
             ("appearance.animations.duration_ms.close", 999),
             ("appearance.animations.duration_ms.focus", 501),
             ("appearance.animations.duration_ms.workspace", 501),
+            ("appearance.animations.duration_ms.move", 501),
+            ("appearance.animations.duration_ms.resize", 501),
+            ("appearance.animations.duration_ms.drag", 501),
         ] {
             let mut b = AnimationsConfig::default();
             match field {
                 "appearance.animations.duration_ms.open" => b.duration_ms.open = bad,
                 "appearance.animations.duration_ms.close" => b.duration_ms.close = bad,
                 "appearance.animations.duration_ms.focus" => b.duration_ms.focus = bad,
+                "appearance.animations.duration_ms.move" => b.duration_ms.r#move = bad,
+                "appearance.animations.duration_ms.resize" => b.duration_ms.resize = bad,
+                "appearance.animations.duration_ms.drag" => b.duration_ms.drag = bad,
                 _ => b.duration_ms.workspace = bad,
             }
             let err = b.validate().expect_err("out-of-range must fail closed");
@@ -5134,6 +5290,27 @@ mod tests {
                     ..Default::default()
                 },
             ),
+            (
+                "appearance.animations.duration_ms.move",
+                AnimationsOverride {
+                    duration_move: Some(501),
+                    ..Default::default()
+                },
+            ),
+            (
+                "appearance.animations.duration_ms.resize",
+                AnimationsOverride {
+                    duration_resize: Some(501),
+                    ..Default::default()
+                },
+            ),
+            (
+                "appearance.animations.duration_ms.drag",
+                AnimationsOverride {
+                    duration_drag: Some(u32::MAX),
+                    ..Default::default()
+                },
+            ),
         ] {
             let err = over.validate().expect_err("override must fail closed");
             assert_eq!(err.field(), Some(field), "wrong field for {field}");
@@ -5143,6 +5320,10 @@ mod tests {
         eff.animations.duration_ms.open = MAX_ANIMATION_DURATION_MS + 1;
         eff.validate()
             .expect_err("effective must reject oversized animation duration");
+        let mut eff = EffectiveConfig::default();
+        eff.animations.duration_ms.r#move = MAX_ANIMATION_DURATION_MS + 1;
+        eff.validate()
+            .expect_err("effective must reject oversized move duration");
     }
 
     #[test]
@@ -5161,7 +5342,24 @@ mod tests {
         assert_eq!(a.duration_ms.close, DEFAULT_ANIMATION_CLOSE_MS);
         assert_eq!(a.duration_ms.focus, DEFAULT_ANIMATION_FOCUS_MS);
         assert_eq!(a.duration_ms.workspace, DEFAULT_ANIMATION_WORKSPACE_MS);
+        assert_eq!(a.duration_ms.r#move, DEFAULT_ANIMATION_MOVE_MS);
+        assert_eq!(a.duration_ms.resize, DEFAULT_ANIMATION_RESIZE_MS);
+        assert_eq!(a.duration_ms.drag, DEFAULT_ANIMATION_DRAG_MS);
         assert_eq!(a.easing.close, AnimationEasing::EaseIn);
+        // CTX-0967: a geometry-only layer replaces just its leaves.
+        a.apply_overrides(&AnimationsOverride {
+            duration_move: Some(0),
+            duration_resize: Some(500),
+            duration_drag: Some(0),
+            easing_drag: Some(AnimationEasing::Linear),
+            ..Default::default()
+        });
+        assert_eq!(a.duration_ms.r#move, 0);
+        assert_eq!(a.duration_ms.resize, 500);
+        assert_eq!(a.duration_ms.drag, 0);
+        assert_eq!(a.easing.drag, AnimationEasing::Linear);
+        assert_eq!(a.duration_ms.open, 500, "earlier override survives");
+        assert_eq!(a.easing.r#move, AnimationEasing::EaseInOut);
         // A second layer overrides a disjoint leaf and keeps the first.
         a.apply_overrides(&AnimationsOverride {
             enabled: Some(false),
@@ -5242,6 +5440,9 @@ mod tests {
             AnimationTransition::Close,
             AnimationTransition::Focus,
             AnimationTransition::Workspace,
+            AnimationTransition::Move,
+            AnimationTransition::Resize,
+            AnimationTransition::Drag,
         ] {
             assert_eq!(disabled.effective_duration_ms(t, false, false), 0);
         }

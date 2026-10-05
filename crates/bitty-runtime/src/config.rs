@@ -1460,13 +1460,15 @@ mod tests {
     fn animation_durations_are_bounded_fail_closed() {
         // RFC-0002 (CTX-0341): every resolved duration is `0..=500`; the
         // runtime repeats the bound so a direct construction cannot arm an
-        // unbounded animation.
+        // unbounded animation. CTX-0967: the move/resize/drag slots share
+        // the same bound.
+        use crate::runtime::AnimationKind;
         let mut cfg = RuntimeConfig::default();
-        cfg.animations.duration_ms = [0, 0, 0, 0];
+        cfg.animations.duration_ms = [0; AnimationKind::COUNT];
         cfg.validate().expect("0 ms boundary valid");
-        cfg.animations.duration_ms = [500, 500, 500, 500];
+        cfg.animations.duration_ms = [500; AnimationKind::COUNT];
         cfg.validate().expect("500 ms boundary valid");
-        for idx in 0..4 {
+        for idx in 0..AnimationKind::COUNT {
             let mut bad = RuntimeConfig::default();
             bad.animations.duration_ms[idx] = MAX_ANIMATION_DURATION_MS + 1;
             bad.validate()

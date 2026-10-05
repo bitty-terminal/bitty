@@ -1180,6 +1180,14 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
                 "appearance.animations.duration_ms.workspace",
                 a.duration_workspace,
             )?;
+            over.duration_move =
+                check_duration("appearance.animations.duration_ms.move", a.duration_move)?;
+            over.duration_resize = check_duration(
+                "appearance.animations.duration_ms.resize",
+                a.duration_resize,
+            )?;
+            over.duration_drag =
+                check_duration("appearance.animations.duration_ms.drag", a.duration_drag)?;
             over.easing_open = parse_easing(
                 "appearance.animations.easing.open",
                 a.easing_open.as_deref(),
@@ -1195,6 +1203,18 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
             over.easing_workspace = parse_easing(
                 "appearance.animations.easing.workspace",
                 a.easing_workspace.as_deref(),
+            )?;
+            over.easing_move = parse_easing(
+                "appearance.animations.easing.move",
+                a.easing_move.as_deref(),
+            )?;
+            over.easing_resize = parse_easing(
+                "appearance.animations.easing.resize",
+                a.easing_resize.as_deref(),
+            )?;
+            over.easing_drag = parse_easing(
+                "appearance.animations.easing.drag",
+                a.easing_drag.as_deref(),
             )?;
             Some(over)
         }
@@ -2998,8 +3018,8 @@ mod tests {
             r#"return { appearance = { animations = {
                 enabled = true,
                 reduced_motion = "auto",
-                duration_ms = { open = 150, close = 120, focus = 100, workspace = 200 },
-                easing = { open = "ease_out", close = "ease_in", focus = "ease_in_out", workspace = "spring" },
+                duration_ms = { open = 150, close = 120, focus = 100, workspace = 200, move = 150, resize = 120, drag = 150 },
+                easing = { open = "ease_out", close = "ease_in", focus = "ease_in_out", workspace = "spring", move = "ease_in_out", resize = "linear", drag = "spring" },
             } } }"#,
             &test_source(),
         )
@@ -3015,6 +3035,9 @@ mod tests {
         assert_eq!(over.duration_close, Some(120));
         assert_eq!(over.duration_focus, Some(100));
         assert_eq!(over.duration_workspace, Some(200));
+        assert_eq!(over.duration_move, Some(150));
+        assert_eq!(over.duration_resize, Some(120));
+        assert_eq!(over.duration_drag, Some(150));
         assert_eq!(
             over.easing_open,
             Some(crate::types::AnimationEasing::EaseOut)
@@ -3029,6 +3052,18 @@ mod tests {
         );
         assert_eq!(
             over.easing_workspace,
+            Some(crate::types::AnimationEasing::Spring)
+        );
+        assert_eq!(
+            over.easing_move,
+            Some(crate::types::AnimationEasing::EaseInOut)
+        );
+        assert_eq!(
+            over.easing_resize,
+            Some(crate::types::AnimationEasing::Linear)
+        );
+        assert_eq!(
+            over.easing_drag,
             Some(crate::types::AnimationEasing::Spring)
         );
         // Bounds `0` and `500` inclusive parse.
@@ -3071,6 +3106,22 @@ mod tests {
             (
                 r#"return { appearance = { animations = { duration_ms = { workspace = 999 } } } }"#,
                 "appearance.animations.duration_ms.workspace",
+            ),
+            (
+                r#"return { appearance = { animations = { duration_ms = { move = 501 } } } }"#,
+                "appearance.animations.duration_ms.move",
+            ),
+            (
+                r#"return { appearance = { animations = { duration_ms = { resize = -1 } } } }"#,
+                "appearance.animations.duration_ms.resize",
+            ),
+            (
+                r#"return { appearance = { animations = { duration_ms = { drag = 999 } } } }"#,
+                "appearance.animations.duration_ms.drag",
+            ),
+            (
+                r#"return { appearance = { animations = { easing = { move = "bounce" } } } }"#,
+                "appearance.animations.easing.move",
             ),
             (
                 r#"return { appearance = { animations = { easing = { open = "bounce" } } } }"#,

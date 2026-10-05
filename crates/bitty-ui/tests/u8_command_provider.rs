@@ -6,7 +6,7 @@
 //! registration behind the capability grant and collects in tier priority,
 //! and [`TargetSnapshot`](bitty_ui::TargetSnapshot) freezes one cold-path
 //! collection per hint-session entry with fail-closed epoch revalidation.
-//! Cross-module checks the unit tests inside `beacon_provider` do not cover
+//! Cross-module checks the unit tests inside `target_provider` do not cover
 //! alone: provenance ordering across tiers, capability gating end to end,
 //! epoch staleness against the live [`TargetRegistry`](bitty_ui::TargetRegistry),
 //! retirement fail-closed through snapshots, and atomic oversized-collection

@@ -1,30 +1,30 @@
-//! Beacon dispatch bridge (UX-32, U-8 Beacon family).
+//! Target dispatch bridge (UX-32, U-8 hint family).
 //!
-//! Selecting a hint label dispatches a typed command id; the Beacon never
-//! implements actions internally. [`BeaconDispatcher`] binds each label in
-//! a [`BeaconAnnotationLayer`](crate::beacon_layer::BeaconAnnotationLayer)
+//! Selecting a hint label dispatches a typed command id; the targeting mechanism never
+//! implements actions internally. [`TargetDispatcher`] binds each label in
+//! a [`HintAnnotationLayer`](crate::annotation_layer::HintAnnotationLayer)
 //! to a [`QualifiedCommand`](crate::panel::QualifiedCommand) owned by the
-//! workspace command registry, and [`BeaconDispatcher::dispatch`]
+//! workspace command registry, and [`TargetDispatcher::dispatch`]
 //! revalidates the bound target against the live
-//! [`TargetRegistry`](crate::beacon_target::TargetRegistry) before
+//! [`TargetRegistry`](crate::targeting::TargetRegistry) before
 //! returning the command id for the router to execute.
 //!
 //! The dispatcher executes nothing: it has no `apply`/`execute` path, takes
 //! no callbacks, and mutates neither the registry nor the layer. Unknown
 //! labels and stale targets fail closed. Bounded
-//! ([`MAX_BEACON_BINDINGS`]), deterministic, headless, and
+//! ([`MAX_TARGET_BINDINGS`]), deterministic, headless, and
 //! `#![forbid(unsafe_code)]`.
 
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
 
-use crate::beacon_layer::BeaconAnnotationLayer;
-use crate::beacon_target::{TargetError, TargetRef, TargetRegistry};
+use crate::annotation_layer::HintAnnotationLayer;
 use crate::panel::QualifiedCommand;
+use crate::targeting::{TargetError, TargetRef, TargetRegistry};
 
 /// Absolute cap on label bindings per dispatcher.
-pub const MAX_BEACON_BINDINGS: usize = 1024;
+pub const MAX_TARGET_BINDINGS: usize = 1024;
 
 /// Dispatch failure. All variants fail closed: the caller drops the hint
 /// session, never guesses a command.
@@ -34,7 +34,7 @@ pub enum DispatchError {
     UnknownLabel(String),
     /// The bound target went stale (retired or re-registered).
     StaleTarget(String),
-    /// The dispatcher is at [`MAX_BEACON_BINDINGS`].
+    /// The dispatcher is at [`MAX_TARGET_BINDINGS`].
     TooManyBindings {
         /// Enforced cap.
         max: usize,
@@ -46,10 +46,10 @@ pub enum DispatchError {
 impl std::fmt::Display for DispatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnknownLabel(label) => write!(f, "unknown beacon label: '{label}'"),
-            Self::StaleTarget(detail) => write!(f, "stale beacon target: {detail}"),
+            Self::UnknownLabel(label) => write!(f, "unknown hint label: '{label}'"),
+            Self::StaleTarget(detail) => write!(f, "stale target: {detail}"),
             Self::TooManyBindings { max, current } => {
-                write!(f, "too many beacon bindings: max {max}, current {current}")
+                write!(f, "too many target bindings: max {max}, current {current}")
             }
         }
     }
@@ -70,14 +70,14 @@ impl From<TargetError> for DispatchError {
 
 /// Label-to-command bridge for one hint session. Owns no actions: each
 /// binding pairs a label with the typed [`QualifiedCommand`] id the
-/// workspace router executes after [`BeaconDispatcher::dispatch`] returns
+/// workspace router executes after [`TargetDispatcher::dispatch`] returns
 /// it.
 #[derive(Clone, Debug, Default)]
-pub struct BeaconDispatcher {
+pub struct TargetDispatcher {
     bindings: HashMap<String, (TargetRef, QualifiedCommand)>,
 }
 
-impl BeaconDispatcher {
+impl TargetDispatcher {
     /// Creates an empty dispatcher.
     #[must_use]
     pub fn new() -> Self {
@@ -91,7 +91,7 @@ impl BeaconDispatcher {
     /// typed ids only — no validation beyond that, no execution.
     pub fn bind_layer(
         &mut self,
-        layer: &BeaconAnnotationLayer,
+        layer: &HintAnnotationLayer,
         commands: &[QualifiedCommand],
     ) -> Result<(), DispatchError> {
         if layer.len() != commands.len() {
@@ -101,9 +101,9 @@ impl BeaconDispatcher {
                 commands.len()
             )));
         }
-        if self.bindings.len() + layer.len() > MAX_BEACON_BINDINGS {
+        if self.bindings.len() + layer.len() > MAX_TARGET_BINDINGS {
             return Err(DispatchError::TooManyBindings {
-                max: MAX_BEACON_BINDINGS,
+                max: MAX_TARGET_BINDINGS,
                 current: self.bindings.len(),
             });
         }
@@ -148,19 +148,19 @@ impl BeaconDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::beacon_target::LinkId;
     use crate::geometry::{Point, Rect};
     use crate::panel::CommandRegistry;
     use crate::panel::PanelId;
+    use crate::targeting::LinkId;
 
     fn command(raw: &str) -> QualifiedCommand {
         QualifiedCommand::parse(raw).expect("command parses")
     }
 
-    fn layer_two(registry: &mut TargetRegistry) -> BeaconAnnotationLayer {
+    fn layer_two(registry: &mut TargetRegistry) -> HintAnnotationLayer {
         let first = registry.insert_link(LinkId::new(1)).expect("link");
         let second = registry.insert_panel(PanelId::new(2)).expect("panel");
-        BeaconAnnotationLayer::build(
+        HintAnnotationLayer::build(
             &[TargetRef::Link(first), TargetRef::Panel(second)],
             &["a".to_string(), "g".to_string()],
             &[Point::new(1, 0), Point::new(70, 0)],
@@ -173,7 +173,7 @@ mod tests {
     fn dispatch_returns_typed_command_id() {
         let mut registry = TargetRegistry::new();
         let layer = layer_two(&mut registry);
-        let mut dispatcher = BeaconDispatcher::new();
+        let mut dispatcher = TargetDispatcher::new();
         assert!(dispatcher.is_empty());
         dispatcher
             .bind_layer(
@@ -205,7 +205,7 @@ mod tests {
     fn unknown_label_fails_closed() {
         let mut registry = TargetRegistry::new();
         let layer = layer_two(&mut registry);
-        let mut dispatcher = BeaconDispatcher::new();
+        let mut dispatcher = TargetDispatcher::new();
         dispatcher
             .bind_layer(
                 &layer,
@@ -229,7 +229,7 @@ mod tests {
     fn stale_target_fails_closed_despite_valid_label() {
         let mut registry = TargetRegistry::new();
         let layer = layer_two(&mut registry);
-        let mut dispatcher = BeaconDispatcher::new();
+        let mut dispatcher = TargetDispatcher::new();
         dispatcher
             .bind_layer(
                 &layer,
@@ -252,7 +252,7 @@ mod tests {
     fn dispatch_executes_nothing_and_mutates_nothing() {
         let mut registry = TargetRegistry::new();
         let layer = layer_two(&mut registry);
-        let mut dispatcher = BeaconDispatcher::new();
+        let mut dispatcher = TargetDispatcher::new();
         dispatcher
             .bind_layer(
                 &layer,
@@ -280,7 +280,7 @@ mod tests {
     fn length_mismatch_rejected() {
         let mut registry = TargetRegistry::new();
         let layer = layer_two(&mut registry);
-        let mut dispatcher = BeaconDispatcher::new();
+        let mut dispatcher = TargetDispatcher::new();
         assert!(matches!(
             dispatcher.bind_layer(&layer, &[command("bitty.workspace:focus-panel")]),
             Err(DispatchError::UnknownLabel(_))

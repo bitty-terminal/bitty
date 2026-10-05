@@ -34,7 +34,7 @@
 //! contract version below is a placeholder the RFC replaces, not a stable
 //! promise.
 //!
-//! Plugin-migration follow-up: beacon (U-8) is plugin-future. If L0
+//! Plugin-migration follow-up: hint targeting (U-8) is plugin-future. If L0
 //! mechanisms later move behind a plugin boundary, this level contract and
 //! the [`crate::widget_mech`] headless mechanism state migrate as the
 //! boundary spec. This module takes no render, exec, or plugin dependency

@@ -557,7 +557,7 @@ const UI_TARGETS_PROVIDER_NAME_MAX_BYTES: usize = 32;
 
 /// Maximum anchors one `bitty.ui.labels.assign` call carries (W-29).
 ///
-/// Mirrors the Core allocator cap (`bitty-ui` `MAX_BEACON_TARGETS`, 1024).
+/// Mirrors the Core allocator cap (`bitty-ui` `MAX_HINT_TARGETS`, 1024).
 const UI_LABELS_ASSIGN_MAX: usize = 1024;
 
 /// One bounded transient input event captured for a focusable overlay
@@ -1115,7 +1115,7 @@ pub trait HostServices {
     /// rejects foreign shadowing (no duplicate names across generations),
     /// bounds the provider count, and maps both tiers onto the existing
     /// `DerivedProvider` lens (no `Plugin`-tier source exists in `bitty-ui`;
-    /// reuse avoids any new Beacon type). Registration grants addressability
+    /// reuse avoids any new targeting type). Registration grants addressability
     /// only: a target's declared actions stay metadata and a command still
     /// executes under its own owner's grants. Capability-gated on
     /// `ui.overlay` (deny-by-default); no new capability identifier. The
@@ -4133,7 +4133,7 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         .expect("ui table accepts 'overlay'");
 
     // W-29 (CTX-0942, DEC-0085 thin host): read-only targeting mechanism over
-    // the existing `bitty-ui` beacon types, exposed under the existing
+    // the existing `bitty-ui` targeting types, exposed under the existing
     // `bitty.ui` namespace (no `bitty.beacon.*` namespace, no new capability,
     // no new error codes). All calls gate on the accepted `ui.overlay`
     // identifier (deny-by-default) because a targeting session consumes the

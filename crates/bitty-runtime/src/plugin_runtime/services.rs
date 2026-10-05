@@ -23,13 +23,11 @@ use bitty_lua::{
 use bitty_package::Version;
 use bitty_plugin_host::bundled::WORKSPACELINE_CLAIM;
 use bitty_ui::{
-    BeaconAnnotationLayer, BeaconDispatcher, CommandBlockId, DerivedProvider, DispatchError,
-    LabelAllocator, LabelPolicy, LinkId, ProviderError, ProviderMediator, ProviderTarget,
-    QualifiedCommand, Rect, TargetProvider, TargetRef, TargetRegistry,
+    CommandBlockId, DerivedProvider, DispatchError, HintAnnotationLayer, LabelAllocator,
+    LabelPolicy, LinkId, ProviderError, ProviderMediator, ProviderTarget, QualifiedCommand, Rect,
+    TargetDispatcher, TargetProvider, TargetRef, TargetRegistry,
 };
-use bitty_ui::{
-    MAX_BEACON_BINDINGS, MAX_BEACON_TARGETS, MAX_SNAPSHOT_TARGETS, MAX_TARGET_PROVIDERS,
-};
+use bitty_ui::{MAX_HINT_TARGETS, MAX_SNAPSHOT_TARGETS, MAX_TARGET_BINDINGS, MAX_TARGET_PROVIDERS};
 use bitty_ui::{PanelId, Point, UiNodeId, WorkspaceId};
 
 use crate::runtime::band_slots::{UiSlotPlacement, ui_slot_placement, unsupported_slot_error};
@@ -855,15 +853,15 @@ pub struct PluginServices {
     /// Core provider plus these lenses on every cold-path collection (the
     /// Core mediator has no removal API). Both `plugin` and `derived` tiers
     /// map onto the existing `Derived` lens (no `Plugin`-tier source exists
-    /// in `bitty-ui`; reuse avoids any new Beacon type).
+    /// in `bitty-ui`; reuse avoids any new targeting type).
     target_lenses: RefCell<Option<Rc<RefCell<Vec<(String, DerivedProvider)>>>>>,
     /// Runtime-shared label allocator (W-29, existing `LabelAllocator`).
     label_allocator: RefCell<Option<Rc<RefCell<LabelAllocator>>>>,
-    /// Per-generation label-to-command bindings (W-29, existing `BeaconDispatcher`).
+    /// Per-generation label-to-command bindings (W-29, existing `TargetDispatcher`).
     ///
     /// Built on session start, cleared on cancel/dispatch/unload. Never
     /// shared across generations and never published to the Event Bus.
-    target_dispatcher: RefCell<BeaconDispatcher>,
+    target_dispatcher: RefCell<TargetDispatcher>,
     /// Overlay handle of this generation's active targeting session, if any.
     ///
     /// Ownership is the existing W-28 overlay capture owner (no new session
@@ -926,7 +924,7 @@ impl PluginServices {
             target_registry: RefCell::new(None),
             target_lenses: RefCell::new(None),
             label_allocator: RefCell::new(None),
-            target_dispatcher: RefCell::new(BeaconDispatcher::new()),
+            target_dispatcher: RefCell::new(TargetDispatcher::new()),
             target_session_overlay: RefCell::new(None),
             env_grants: RefCell::new(BTreeSet::new()),
             env_source: RefCell::new(Rc::new(EmptyEnv)),
@@ -1154,7 +1152,7 @@ impl PluginServices {
     /// generation so the provider set spans plugins and survives reload. A
     /// generation built without wiring keeps `None` and every targeting call
     /// fails closed with `E_UI_UNAVAILABLE`. Uses only existing `bitty-ui`
-    /// types; no new Beacon type is introduced.
+    /// types; no new targeting type is introduced.
     pub fn set_targeting_state(
         &self,
         registry: Rc<RefCell<TargetRegistry>>,
@@ -1222,7 +1220,7 @@ impl PluginServices {
     /// lenses, and allocator are untouched (revocation of lenses is owned by
     /// [`Self::revoke_targeting_lenses`]).
     pub fn clear_targeting_session(&self) {
-        *self.target_dispatcher.borrow_mut() = BeaconDispatcher::new();
+        *self.target_dispatcher.borrow_mut() = TargetDispatcher::new();
         *self.target_session_overlay.borrow_mut() = None;
     }
 
@@ -1291,11 +1289,11 @@ impl PluginServices {
                 ),
             ));
         }
-        if anchors.len() > MAX_BEACON_TARGETS {
+        if anchors.len() > MAX_HINT_TARGETS {
             return Err(BridgeError::new(
                 "budget",
                 "E_DEF_LIMIT",
-                format!("too many targets for labels: max {MAX_BEACON_TARGETS}"),
+                format!("too many targets for labels: max {MAX_HINT_TARGETS}"),
             ));
         }
         let allocator = self.require_label_allocator()?;
@@ -1323,30 +1321,26 @@ impl PluginServices {
             .map(|point| point.y)
             .max()
             .map_or(1, |y| y.saturating_add(1));
-        let layer = BeaconAnnotationLayer::build(
-            &targets,
-            &labels,
-            &points,
-            Rect::new(0, 0, width, height),
-        )
-        .map_err(|error| match error {
-            bitty_ui::AnnotationLayerError::TooManyAnnotations { requested, max } => {
-                BridgeError::new(
-                    "budget",
-                    "E_DEF_LIMIT",
-                    format!("too many annotations: requested {requested}, max {max}"),
-                )
-            }
-            other => BridgeError::new("validation", "E_DEF_INVALID", other.to_string()),
-        })?;
-        if layer.len() + self.target_dispatcher.borrow().len() > MAX_BEACON_BINDINGS {
+        let layer =
+            HintAnnotationLayer::build(&targets, &labels, &points, Rect::new(0, 0, width, height))
+                .map_err(|error| match error {
+                    bitty_ui::AnnotationLayerError::TooManyAnnotations { requested, max } => {
+                        BridgeError::new(
+                            "budget",
+                            "E_DEF_LIMIT",
+                            format!("too many annotations: requested {requested}, max {max}"),
+                        )
+                    }
+                    other => BridgeError::new("validation", "E_DEF_INVALID", other.to_string()),
+                })?;
+        if layer.len() + self.target_dispatcher.borrow().len() > MAX_TARGET_BINDINGS {
             return Err(BridgeError::new(
                 "budget",
                 "E_DEF_LIMIT",
-                format!("too many bindings: max {MAX_BEACON_BINDINGS}"),
+                format!("too many bindings: max {MAX_TARGET_BINDINGS}"),
             ));
         }
-        let mut dispatcher = BeaconDispatcher::new();
+        let mut dispatcher = TargetDispatcher::new();
         dispatcher
             .bind_layer(&layer, &parsed)
             .map_err(map_targets_dispatch_error)?;
@@ -2168,7 +2162,7 @@ impl HostServices for PluginServices {
             offers.push(targets_offer(kind, *id)?);
         }
         // Both tiers map onto the existing Derived lens (no Plugin-tier source
-        // exists in `bitty-ui`; reuse avoids any new Beacon type).
+        // exists in `bitty-ui`; reuse avoids any new targeting type).
         let lens = DerivedProvider::new(name, offers).map_err(map_targets_provider_error)?;
         let lenses = self.require_target_lenses()?;
         let mut guard = lenses.borrow_mut();
@@ -2220,11 +2214,11 @@ impl HostServices for PluginServices {
         width: u16,
     ) -> Result<Vec<String>, BridgeError> {
         self.require_targets_capability()?;
-        if anchors.len() > MAX_BEACON_TARGETS {
+        if anchors.len() > MAX_HINT_TARGETS {
             return Err(BridgeError::new(
                 "budget",
                 "E_DEF_LIMIT",
-                format!("too many targets for labels: max {MAX_BEACON_TARGETS}"),
+                format!("too many targets for labels: max {MAX_HINT_TARGETS}"),
             ));
         }
         let allocator = self.require_label_allocator()?;
@@ -4222,7 +4216,7 @@ mod tests {
 
     /// CTX-0942: targeting services with the accepted `ui.overlay` grant and,
     /// optionally, the runtime-shared mechanism state wired. Uses only
-    /// existing `bitty-ui` types; no new Beacon type is introduced.
+    /// existing `bitty-ui` types; no new targeting type is introduced.
     #[allow(clippy::type_complexity)]
     fn targeting_services(overlay: bool, wire_state: bool) -> PluginServices {
         let services = ui_services(UiAccess {

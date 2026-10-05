@@ -1554,6 +1554,27 @@ pub const MAX_FONT_FEATURE_LEN: usize = 16;
 /// already an `optdepend` in `packaging/PKGBUILD` — no new dependency.
 pub const SYMBOLS_FALLBACK_FAMILY: &str = "Noto Sans Symbols 2";
 
+/// CJK-capable fallback family for the running platform (CTX-0961, issue
+/// #1666).
+///
+/// The pinned chain previously had no Han coverage: `U+6F22`/`U+5B57` (and
+/// CJK Unified Ideographs generally) regressed to tofu on the shaped path
+/// while the crossfont backend covered them through its dynamic per-glyph
+/// fontconfig fallback (`face_for_glyph`). This tail restores pinned-chain
+/// coverage for Han; scripts beyond every pinned tail remain the dynamic
+/// fallback's job (`SwashSingle::dynamic_face_for`).
+#[cfg(target_os = "linux")]
+pub const CJK_FALLBACK_FAMILY: &str = "Noto Sans CJK SC";
+/// CJK fallback family on macOS (see [`CJK_FALLBACK_FAMILY`]).
+#[cfg(target_os = "macos")]
+pub const CJK_FALLBACK_FAMILY: &str = "PingFang SC";
+/// CJK fallback family on Windows (see [`CJK_FALLBACK_FAMILY`]).
+#[cfg(windows)]
+pub const CJK_FALLBACK_FAMILY: &str = "Microsoft YaHei";
+/// CJK fallback family on other targets (see [`CJK_FALLBACK_FAMILY`]).
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub const CJK_FALLBACK_FAMILY: &str = "Noto Sans CJK SC";
+
 /// Emoji-capable fallback family for the running platform (CTX-0368).
 ///
 /// The render path flattens any color bitmap to its alpha coverage in the
@@ -1578,13 +1599,15 @@ pub const EMOJI_FALLBACK_FAMILY: &str = "Noto Color Emoji";
 /// Order on Linux: configured primary (Nerd-patched by default) -> unpatched
 /// `JetBrains Mono` -> system `monospace` (fontconfig/WC) ->
 /// `DejaVu Sans Mono` (widely available, covers box drawing + block
-/// elements `U+2580-U+259F`) -> [`SYMBOLS_FALLBACK_FAMILY`] (covers braille
-/// patterns `U+2800-U+28FF` for TUI graphs such as btop) ->
-/// [`EMOJI_FALLBACK_FAMILY`] (emoji-presentation scalars the mono/symbols
-/// faces miss, for example `U+2699 GEAR`). Mirrors ghostty (embedded
-/// JetBrains Mono variable + symbols-only Nerd fallback, always present)
-/// and kitty (`font_family = "monospace"` + builtin Nerd font,
-/// `set_font_family(..., add_builtin_nerd_font=True)`).
+/// elements `U+2580-U+259F`) -> [`CJK_FALLBACK_FAMILY`] (covers CJK Unified
+/// Ideographs such as `U+6F22`/`U+5B57`; CTX-0961, issue #1666) ->
+/// [`SYMBOLS_FALLBACK_FAMILY`] (covers braille patterns `U+2800-U+28FF`
+/// for TUI graphs such as btop) -> [`EMOJI_FALLBACK_FAMILY`]
+/// (emoji-presentation scalars the mono/symbols faces miss, for example
+/// `U+2699 GEAR`). Mirrors ghostty (embedded JetBrains Mono variable +
+/// symbols-only Nerd fallback, always present) and kitty (`font_family =
+/// "monospace"` + builtin Nerd font, `set_font_family(...,
+/// add_builtin_nerd_font=True)`).
 ///
 /// macOS and Windows substitute their system equivalents (Menlo/Monaco,
 /// Apple Braille, Apple Symbols, Apple Color Emoji; Consolas/Cascadia Mono,
@@ -1607,6 +1630,7 @@ pub const FONT_FALLBACK_CHAIN: &[&str] = &[
     "JetBrains Mono",
     "monospace",
     "DejaVu Sans Mono",
+    CJK_FALLBACK_FAMILY,
     SYMBOLS_FALLBACK_FAMILY,
     EMOJI_FALLBACK_FAMILY,
 ];
@@ -1617,6 +1641,7 @@ pub const FONT_FALLBACK_CHAIN: &[&str] = &[
     DEFAULT_FONT_FAMILY,
     "Menlo",
     "Monaco",
+    CJK_FALLBACK_FAMILY,
     "Apple Braille",
     "Apple Symbols",
     EMOJI_FALLBACK_FAMILY,
@@ -1629,6 +1654,7 @@ pub const FONT_FALLBACK_CHAIN: &[&str] = &[
     DEFAULT_FONT_FAMILY,
     "Consolas",
     "Cascadia Mono",
+    CJK_FALLBACK_FAMILY,
     "Segoe UI Symbol",
     EMOJI_FALLBACK_FAMILY,
     "Arial Unicode MS",
@@ -1639,6 +1665,7 @@ pub const FONT_FALLBACK_CHAIN: &[&str] = &[
 pub const FONT_FALLBACK_CHAIN: &[&str] = &[
     DEFAULT_FONT_FAMILY,
     "DejaVu Sans Mono",
+    CJK_FALLBACK_FAMILY,
     SYMBOLS_FALLBACK_FAMILY,
     EMOJI_FALLBACK_FAMILY,
 ];
@@ -3779,6 +3806,7 @@ mod tests {
         let chain = custom.fallback_chain();
         assert_eq!(chain.len(), FONT_FALLBACK_CHAIN.len() + 1);
         assert!(chain.contains(&EMOJI_FALLBACK_FAMILY.to_string()));
+        assert!(chain.contains(&CJK_FALLBACK_FAMILY.to_string()));
         // The platform symbols/braille tail survives a custom primary.
         #[cfg(target_os = "linux")]
         assert!(chain.contains(&SYMBOLS_FALLBACK_FAMILY.to_string()));
@@ -3789,16 +3817,19 @@ mod tests {
         #[cfg(target_os = "linux")]
         {
             assert!(FONT_FALLBACK_CHAIN.contains(&"DejaVu Sans Mono"));
+            assert_eq!(CJK_FALLBACK_FAMILY, "Noto Sans CJK SC");
             assert_eq!(EMOJI_FALLBACK_FAMILY, "Noto Color Emoji");
         }
         #[cfg(target_os = "macos")]
         {
             assert!(FONT_FALLBACK_CHAIN.contains(&"Apple Braille"));
+            assert_eq!(CJK_FALLBACK_FAMILY, "PingFang SC");
             assert_eq!(EMOJI_FALLBACK_FAMILY, "Apple Color Emoji");
         }
         #[cfg(windows)]
         {
             assert!(FONT_FALLBACK_CHAIN.contains(&"Segoe UI Symbol"));
+            assert_eq!(CJK_FALLBACK_FAMILY, "Microsoft YaHei");
             assert_eq!(EMOJI_FALLBACK_FAMILY, "Segoe UI Emoji");
         }
     }

@@ -16,7 +16,8 @@ use std::collections::HashSet;
 
 use bitty_platform::{KeyEvent, LogicalKey, NamedKey, PressState, WindowEventKind};
 use bitty_runtime::{
-    FocusDirection, LayoutNode, Runtime, SplitAxis, View, ViewCloseRequest, ViewId, WsCloseRequest,
+    FocusDirection, LayoutNode, PresentationMode, Runtime, SplitAxis, View, ViewCloseRequest,
+    ViewId, WsCloseRequest,
 };
 
 use crate::spawn::spawn_pane_shell;
@@ -1333,6 +1334,73 @@ impl TerminalApp {
                         eprintln!("warning: keymap toggle_zoom found no focused pane — ignoring");
                     }
                 }
+            }
+            A::ToggleFloating => {
+                // CTX-0962 (#1695): toggle the focused leaf Tiled <-> Floating
+                // through the `bitty.workspace:floating-toggle` primitive
+                // semantics (`bitty_ui::presentation::toggle_floating`):
+                // single command so the chord never desyncs from leaf state.
+                // Validate on the live tree BEFORE touching zoom: the zoom
+                // proxy clones the focused leaf, so its presentation is the
+                // real one. Fullscreen/Scratchpad leaves therefore reject
+                // here with a warning and zero state change (no zoom
+                // restore, no layout write). For a valid toggle, zoom
+                // restores next so the mutation lands on the real tiled
+                // tree, not the zoom proxy; the layout solver ignores the
+                // mode, so the round trip restores the exact prior
+                // allocation with no anchor bookkeeping.
+                let focused = match self.runtime.focused_view() {
+                    Some(id) => id,
+                    None => {
+                        eprintln!("warning: keymap toggle_floating has no focused pane — ignoring");
+                        return;
+                    }
+                };
+                let current = match self.runtime.layout().find_leaf(focused) {
+                    Some(leaf) => leaf.presentation(),
+                    None => {
+                        eprintln!(
+                            "warning: keymap toggle_floating found no focused pane — ignoring"
+                        );
+                        return;
+                    }
+                };
+                let next = match current {
+                    PresentationMode::Tiled => PresentationMode::Floating,
+                    PresentationMode::Floating => PresentationMode::Tiled,
+                    other => {
+                        eprintln!(
+                            "warning: keymap toggle_floating needs a tiled or floating leaf, found {other} — ignoring"
+                        );
+                        return;
+                    }
+                };
+                if !PresentationMode::can_transition(current, next) {
+                    eprintln!(
+                        "warning: keymap toggle_floating transition rejected: {current} -> {next} — ignoring"
+                    );
+                    return;
+                }
+                self.restore_zoom();
+                let mut layout = self.runtime.layout().clone();
+                match layout.find_leaf_mut(focused) {
+                    Some(leaf) => {
+                        if !PresentationMode::request_transition(leaf, next) {
+                            eprintln!(
+                                "warning: keymap toggle_floating transition rejected: {current} -> {next} — ignoring"
+                            );
+                            return;
+                        }
+                    }
+                    None => {
+                        eprintln!(
+                            "warning: keymap toggle_floating found no focused pane — ignoring"
+                        );
+                        return;
+                    }
+                }
+                self.runtime.set_layout(layout);
+                eprintln!("bitty: keymap toggle_floating -> {focused:?} {current} -> {next}");
             }
             A::ToggleHelp => {
                 // CTX-0265 which-key help popup: rows regenerate from the
@@ -3230,6 +3298,225 @@ mod tests {
         assert!(
             !app.runtime.panel_split_place_new_first(),
             "5 -> 6 wraps back to Step 0 (place_new_first = false)"
+        );
+    }
+
+    #[test]
+    fn chrome_floating_toggle_default_mod_a_resolves() {
+        // CTX-0962 (#1695): Mod+a toggles floating. Both alt+a/alt+v were
+        // free; fish reserves alt+v for `$EDITOR` so Mod+v stays shell.
+        use bitty_config::{ChromeAction, EffectiveConfig, KeyName, KeyRef, ModKey};
+        let alt_maps =
+            bitty_config::resolve_keymaps(&EffectiveConfig::default()).expect("defaults");
+        let alt = |key: KeyName, ctrl: bool, alt: bool, shift: bool| KeyRef {
+            key,
+            ctrl,
+            alt,
+            shift,
+            super_held: false,
+        };
+        assert_eq!(
+            bitty_config::match_keymap(&alt_maps, alt(KeyName::Char('a'), false, true, false)),
+            Some(ChromeAction::ToggleFloating),
+            "alt+a toggles floating"
+        );
+        assert_eq!(
+            bitty_config::match_keymap(&alt_maps, alt(KeyName::Char('a'), false, false, false)),
+            None,
+            "bare a stays shell"
+        );
+        assert_eq!(
+            bitty_config::match_keymap(&alt_maps, alt(KeyName::Char('v'), false, true, false)),
+            None,
+            "alt+v stays shell (fish $EDITOR conflict)"
+        );
+        // Super flip follows the Mod slot.
+        let super_maps = bitty_config::resolve_keymaps(&EffectiveConfig {
+            mod_key: ModKey::Super,
+            ..Default::default()
+        })
+        .expect("super defaults");
+        assert_eq!(
+            bitty_config::match_keymap(
+                &super_maps,
+                KeyRef {
+                    key: KeyName::Char('a'),
+                    ctrl: false,
+                    alt: false,
+                    shift: false,
+                    super_held: true,
+                }
+            ),
+            Some(ChromeAction::ToggleFloating),
+            "super+a toggles floating under super mod"
+        );
+        assert_eq!(
+            bitty_config::match_keymap(&super_maps, alt(KeyName::Char('a'), false, true, false)),
+            None,
+            "alt+a unbound under super mod"
+        );
+    }
+
+    #[test]
+    fn chrome_toggle_floating_flips_focused_leaf_and_roundtrips() {
+        // CTX-0962 (#1695): the apply path flips the focused leaf
+        // Tiled <-> Floating with no layout surgery (leaf count and focus
+        // stable) and round-trips back to the exact prior mode.
+        use bitty_config::ChromeAction;
+        let mut app = workspace_test_app();
+        app.runtime.set_layout(two_pane_layout());
+        let focused = app.runtime.focused_view().expect("seed focus");
+        assert_eq!(
+            app.runtime
+                .layout()
+                .find_leaf(focused)
+                .expect("focused leaf")
+                .presentation(),
+            PresentationMode::Tiled
+        );
+        app.apply_chrome_action(ChromeAction::ToggleFloating);
+        assert_eq!(app.runtime.leaf_count(), 2, "toggle keeps leaf count");
+        assert_eq!(
+            app.runtime.focused_view(),
+            Some(focused),
+            "toggle keeps focus"
+        );
+        assert_eq!(
+            app.runtime
+                .layout()
+                .find_leaf(focused)
+                .expect("focused leaf")
+                .presentation(),
+            PresentationMode::Floating,
+            "first toggle floats"
+        );
+        app.apply_chrome_action(ChromeAction::ToggleFloating);
+        assert_eq!(app.runtime.leaf_count(), 2, "untoggle keeps leaf count");
+        assert_eq!(
+            app.runtime.focused_view(),
+            Some(focused),
+            "untoggle keeps focus"
+        );
+        assert_eq!(
+            app.runtime
+                .layout()
+                .find_leaf(focused)
+                .expect("focused leaf")
+                .presentation(),
+            PresentationMode::Tiled,
+            "second toggle restores tiled"
+        );
+    }
+
+    #[test]
+    fn chrome_toggle_floating_rejects_zoomed_fullscreen_without_state_change() {
+        // CodeRabbit PR #1704 (CTX-0962 follow-up): the leaf validates
+        // before zoom restores. A zoomed Fullscreen/Scratchpad leaf must
+        // reject with zero state change (zoom backup intact, layout and
+        // focus untouched). A zoomed Tiled leaf still toggles: restore
+        // lands on the real tree, then the flip applies.
+        use bitty_config::ChromeAction;
+        for mode in [PresentationMode::Fullscreen, PresentationMode::Scratchpad] {
+            let mut app = workspace_test_app();
+            app.runtime.set_layout(two_pane_layout());
+            let focused = app.runtime.focused_view().expect("seed focus");
+            let mut seeded = app.runtime.layout().clone();
+            let leaf = seeded.find_leaf_mut(focused).expect("focused leaf");
+            assert!(PresentationMode::request_transition(leaf, mode));
+            app.runtime.set_layout(seeded);
+            app.apply_chrome_action(ChromeAction::ToggleZoom);
+            assert!(app.chrome.zoom.is_zoomed(&app.runtime), "zoom engaged");
+            let before = format!("{:?}", app.runtime.layout());
+            app.apply_chrome_action(ChromeAction::ToggleFloating);
+            assert_eq!(
+                format!("{:?}", app.runtime.layout()),
+                before,
+                "rejected toggle on zoomed {mode} must not touch the layout"
+            );
+            assert!(
+                app.chrome.zoom.is_zoomed(&app.runtime),
+                "rejected toggle on zoomed {mode} must keep the zoom backup"
+            );
+            assert_eq!(
+                app.runtime.focused_view(),
+                Some(focused),
+                "rejected toggle keeps focus"
+            );
+        }
+        let mut app = workspace_test_app();
+        app.runtime.set_layout(two_pane_layout());
+        let focused = app.runtime.focused_view().expect("seed focus");
+        app.apply_chrome_action(ChromeAction::ToggleZoom);
+        assert!(app.chrome.zoom.is_zoomed(&app.runtime), "zoom engaged");
+        app.apply_chrome_action(ChromeAction::ToggleFloating);
+        assert!(
+            !app.chrome.zoom.is_zoomed(&app.runtime),
+            "valid toggle consumes the zoom restore"
+        );
+        assert_eq!(app.runtime.leaf_count(), 2, "toggle lands on the real tree");
+        assert_eq!(
+            app.runtime
+                .layout()
+                .find_leaf(focused)
+                .expect("focused leaf")
+                .presentation(),
+            PresentationMode::Floating,
+            "zoomed tiled leaf floats"
+        );
+    }
+
+    #[test]
+    fn chrome_toggle_floating_user_override_replaces_default() {
+        // CTX-0962 (#1695): Lua-overridable through the existing
+        // `context + chord` merge rule — a user `keymaps` entry with the
+        // same chord replaces the shipped Mod+a, and the action rebinds
+        // elsewhere by explicit chord.
+        use bitty_config::{ChromeAction, EffectiveConfig, KeyName, KeyRef, KeymapEntry};
+        let overridden = EffectiveConfig {
+            keymaps: vec![KeymapEntry {
+                chord: "alt+a".into(),
+                action: "focus_next".into(),
+                context: "global".into(),
+            }],
+            ..Default::default()
+        };
+        let maps = bitty_config::resolve_keymaps(&overridden).expect("resolves");
+        assert_eq!(
+            bitty_config::match_keymap(
+                &maps,
+                KeyRef {
+                    key: KeyName::Char('a'),
+                    ctrl: false,
+                    alt: true,
+                    shift: false,
+                    super_held: false,
+                }
+            ),
+            Some(ChromeAction::FocusNext),
+            "user alt+a replaces the shipped floating toggle"
+        );
+        let rebound = EffectiveConfig {
+            keymaps: vec![KeymapEntry {
+                chord: "alt+q".into(),
+                action: "toggle_floating".into(),
+                context: "global".into(),
+            }],
+            ..Default::default()
+        };
+        let maps = bitty_config::resolve_keymaps(&rebound).expect("resolves");
+        assert_eq!(
+            bitty_config::match_keymap(
+                &maps,
+                KeyRef {
+                    key: KeyName::Char('q'),
+                    ctrl: false,
+                    alt: true,
+                    shift: false,
+                    super_held: false,
+                }
+            ),
+            Some(ChromeAction::ToggleFloating),
+            "toggle_floating rebinds by explicit chord"
         );
     }
 

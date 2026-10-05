@@ -67,7 +67,9 @@
 //!   `alt+w` close workspace with kill-confirm,
 //!   `alt+-`/`alt+=` prev/next (`=` is the unshifted DEC `+`), `alt+tab`
 //!   last-used, `alt+1..=9` jump to workspace N,
-//!   `shift+alt+1..=9` move focused window to workspace N).
+//!   `shift+alt+1..=9` move focused window to workspace N),
+//!   `toggle_floating` (alias `floating_toggle`; CTX-0962 / #1695: focused
+//!   panel tiled/floating toggle, default `alt+a`, `global` only).
 //!   W-144 (CTX-0937): the search/copy-mode policy actions retired with
 //!   the Core policy; their namespace moves to W-138 with the plugins
 //!   (CTX-0003), so the retired spellings fail closed as unknown here.
@@ -91,7 +93,9 @@
 //! workspace N, `alt+-`/`alt+=` prev/next, `alt+tab` last-used, `alt+d`
 //! close pane with confirm, `alt+w` close workspace with kill-confirm,
 //! plus the Hyprland-style panel entry (CTX-0838 #1441): `alt+n`
-//! `new_panel` (adaptive dwindle axis, new-second, focus follows).
+//! `new_panel` (adaptive dwindle axis, new-second, focus follows), plus the
+//! floating-toggle entry (CTX-0962 #1695): `alt+a` `toggle_floating`
+//! (Mod-aware via the `alt` slot; fish reserves `alt+v` so `Mod+v` is out).
 //! `alt+w` and `alt+1..=9` previously drove pane ops (`close_view`,
 //! `focus:<n>`); those actions stay parseable and user-bindable but are
 //! no longer bound by default — workspace numbers won the Alt slot per
@@ -800,6 +804,18 @@ pub enum ChromeAction {
     /// (no overlay, no routing change) — the bundled-disabled decision is
     /// kept, and the entry exists as forward-compat wiring.
     TogglePalette,
+    /// Toggle the focused panel between tiled and floating
+    /// (`toggle_floating`, alias `floating_toggle`; CTX-0962 issue #1695).
+    ///
+    /// Present-path verb over the live layout: the app resolves the focused
+    /// view and flips its [`PresentationMode`](bitty_ui::PresentationMode)
+    /// through the `bitty.workspace:floating-toggle` primitive
+    /// (`bitty_ui::presentation::toggle_floating`). Default chord `alt+a`
+    /// (both `alt+a`/`alt+v` were free; fish reserves `alt+v` for `$EDITOR`
+    /// so `Mod+v` is unusable there). The chord carries the Mod slot so a
+    /// Super flip rebinds it to `super+a`. User-overridable via an explicit
+    /// `keymaps` entry with the same `context + chord` identity.
+    ToggleFloating,
 }
 
 impl ChromeAction {
@@ -964,6 +980,10 @@ impl ChromeAction {
                 reject_arg(arg, trimmed)?;
                 Ok(Self::TogglePalette)
             }
+            "toggle_floating" | "floating_toggle" => {
+                reject_arg(arg, trimmed)?;
+                Ok(Self::ToggleFloating)
+            }
             _ => Err(ConfigError::validation(
                 "keymaps[].action",
                 format!("unknown action '{trimmed}'; {KNOWN_ACTIONS_HINT}"),
@@ -1008,6 +1028,7 @@ impl ChromeAction {
             Self::JumpToPromptNext => "jump_to_prompt:next".to_string(),
             Self::SelectCommandOutput => "select_command_output".to_string(),
             Self::TogglePalette => "toggle_palette".to_string(),
+            Self::ToggleFloating => "toggle_floating".to_string(),
         }
     }
 }
@@ -1017,7 +1038,7 @@ impl ChromeAction {
 /// W-144 (CTX-0937): the search/copy-mode policy actions retired with the
 /// Core policy; their namespace moves to W-138 with the plugins (CTX-0003),
 /// so the retired spellings fail closed as unknown here.
-const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, new_panel, resize_split:<left|right|up|down>, close_view, toggle_zoom, toggle_help, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, fold_toggle, fold_expand, fold_collapse, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_focus:<1..=16>, workspace_move:<1..=16>, workspace_swap:<1..=16>, jump_to_prompt:<prev|next>, select_command_output, toggle_palette";
+const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, new_panel, resize_split:<left|right|up|down>, close_view, toggle_zoom, toggle_help, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, fold_toggle, fold_expand, fold_collapse, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_focus:<1..=16>, workspace_move:<1..=16>, workspace_swap:<1..=16>, jump_to_prompt:<prev|next>, select_command_output, toggle_palette, toggle_floating";
 
 /// Require a `<head>:<dir>` argument.
 fn require_dir_arg(arg: Option<&str>, raw: &str) -> Result<SplitDir, ConfigError> {
@@ -1217,6 +1238,8 @@ impl ResolvedKeymap {
 /// CTX-0263 adds mod-independent `ctrl+=`/`ctrl+plus` (plus shifted
 /// spellings) to grow, `ctrl+-` to shrink, and `ctrl+0` to reset the
 /// per-window font size; bare `+`/`-`/`=`/`0` stay shell input.
+/// CTX-0962 adds the Mod-aware `alt+a` floating toggle
+/// (`toggle_floating`; Super flip rebinds to `super+a`).
 /// Plain `Tab`, bare arrows, letters, and digits are deliberately unbound so
 /// they reach the shell.
 pub const DEFAULT_KEYMAPS: &[(&str, &str)] = &[
@@ -1318,6 +1341,12 @@ pub const DEFAULT_KEYMAPS: &[(&str, &str)] = &[
     // Explicit `new_split:<dir>` keeps its fixed axis for directional
     // splits. `alt+t` opens a fresh workspace (CTX-0766).
     ("alt+n", "new_panel"),
+    // CTX-0962 (issue #1695): `alt+a` toggles the focused panel between
+    // tiled and floating (`bitty.workspace:floating-toggle`). Both `alt+a`
+    // and `alt+v` were free; fish reserves `alt+v` for `$EDITOR` so `Mod+v`
+    // is unusable there. Carries the Mod slot so a Super flip rebinds to
+    // `super+a`. User-overridable via the `context + chord` merge rule.
+    ("alt+a", "toggle_floating"),
     ("alt+t", "workspace_new"),
     ("alt+-", "workspace_prev"),
     ("alt+=", "workspace_next"),
@@ -1894,6 +1923,11 @@ mod tests {
             match_keymap(&maps, key_ref_super(KeyName::Char('m'), false, false)),
             Some(ChromeAction::ToggleZoom)
         );
+        // CTX-0962 (#1695): Mod+a floating toggle follows the Mod slot.
+        assert_eq!(
+            match_keymap(&maps, key_ref_super(KeyName::Char('a'), false, false)),
+            Some(ChromeAction::ToggleFloating)
+        );
         assert_eq!(
             match_keymap(&maps, key_ref_super(KeyName::Char('1'), false, false)),
             Some(ChromeAction::WorkspaceFocus(1))
@@ -1925,6 +1959,11 @@ mod tests {
             match_keymap(&maps, key_ref(KeyName::Char('w'), false, true, false)),
             None,
             "alt+w unbound under super mod"
+        );
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('a'), false, true, false)),
+            None,
+            "alt+a unbound under super mod"
         );
         // ... and the mod-independent fixed chords are untouched.
         assert_eq!(
@@ -2267,6 +2306,8 @@ mod tests {
             key_ref(KeyName::Char('u'), false, false, false),
             key_ref(KeyName::Char('i'), false, false, false),
             key_ref(KeyName::Char('z'), false, false, false),
+            // CTX-0962: bare `a` stays shell input; only Mod+a toggles.
+            key_ref(KeyName::Char('a'), false, false, false),
             // CTX-0257: the workspace-entry keys stay shell-bound when bare
             // (only the Alt chords are chrome-owned).
             key_ref(KeyName::Char('-'), false, false, false),
@@ -2302,6 +2343,17 @@ mod tests {
         assert_eq!(
             match_keymap(&maps, key_ref(KeyName::Char('w'), false, true, false)),
             Some(ChromeAction::WorkspaceClose)
+        );
+        // CTX-0962 (#1695): Mod+a toggles floating; alt+v stays free
+        // (fish reserves it for `$EDITOR`, so Mod+v is unusable there).
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('a'), false, true, false)),
+            Some(ChromeAction::ToggleFloating)
+        );
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('v'), false, true, false)),
+            None,
+            "alt+v stays shell (fish conflict)"
         );
         // CTX-0161 copy/paste chords: single-owner intercept owns the
         // shifted chords; the unshifted C0 bytes stay shell input (above).
@@ -2679,6 +2731,7 @@ mod tests {
         // alt+n becomes new-panel) = 89 total, plus issue #1444's 1
         // close-view chord (alt+d) = 90 total, plus CTX-0952's 3 prompt
         // chords (shift+alt+pageup/pagedown + alt+o) = 93 total,
+        // plus CTX-0962's 1 floating-toggle chord (alt+a) = 94 total,
         // and the full DEC
         // set resolves. Zoom chords carry
         // no `alt`, so they must stay unique under Alt and Super alike.
@@ -2686,8 +2739,8 @@ mod tests {
             let maps = default_keymaps_with_mod(mod_key).expect("defaults valid");
             assert_eq!(
                 maps.len(),
-                93,
-                "35 shipped + 4 workspace-entry chords + 4 resize chords + 16 arrow aliases + 7 zoom chords + 9 move chords + 9 swap chords + 4 help chords + 1 CTX-0766 rechord + 1 issue-1444 close-view + 3 CTX-0952 prompt chords (W-144 retired copy-mode + search)"
+                94,
+                "35 shipped + 4 workspace-entry chords + 4 resize chords + 16 arrow aliases + 7 zoom chords + 9 move chords + 9 swap chords + 4 help chords + 1 CTX-0766 rechord + 1 issue-1444 close-view + 3 CTX-0952 prompt chords + 1 CTX-0962 floating-toggle (W-144 retired copy-mode + search)"
             );
             let mut seen = std::collections::HashSet::new();
             for m in &maps {
@@ -3031,10 +3084,16 @@ mod tests {
             match_keymap(&maps, key_ref_super(KeyName::Char('9'), false, false)),
             Some(ChromeAction::WorkspaceFocus(9))
         );
+        // CTX-0962 (#1695): the floating toggle follows the Mod slot too.
+        assert_eq!(
+            match_keymap(&maps, key_ref_super(KeyName::Char('a'), false, false)),
+            Some(ChromeAction::ToggleFloating)
+        );
         // Old Alt spellings are unbound (back to the shell) under Super.
         for key in [
             KeyName::Char('n'),
             KeyName::Char('w'),
+            KeyName::Char('a'),
             KeyName::Char('-'),
             KeyName::Char('='),
             KeyName::Tab,
@@ -3293,6 +3352,62 @@ mod tests {
     }
 
     #[test]
+    fn floating_toggle_parses_canonicalizes_and_stays_user_overridable() {
+        // CTX-0962 (#1695): the floating-toggle action parses (primary plus
+        // primitive-order alias), canonicalizes to the primary spelling,
+        // ships on Mod+a, and stays user-overridable through the existing
+        // `context + chord` merge rule (Lua `keymaps` entries).
+        assert_eq!(
+            ChromeAction::parse("toggle_floating").expect("parses"),
+            ChromeAction::ToggleFloating
+        );
+        assert_eq!(
+            ChromeAction::parse("floating_toggle").expect("alias parses"),
+            ChromeAction::ToggleFloating
+        );
+        assert_eq!(ChromeAction::ToggleFloating.canonical(), "toggle_floating");
+        // Shipped default.
+        let maps = default_keymaps().expect("defaults valid");
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('a'), false, true, false)),
+            Some(ChromeAction::ToggleFloating)
+        );
+        // User override replaces the default by chord identity ...
+        let overridden = EffectiveConfig {
+            keymaps: vec![KeymapEntry {
+                chord: "alt+a".into(),
+                action: "focus_next".into(),
+                context: "global".into(),
+            }],
+            ..Default::default()
+        };
+        let maps = resolve_keymaps(&overridden).expect("resolves");
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('a'), false, true, false)),
+            Some(ChromeAction::FocusNext)
+        );
+        // ... and the action rebinds elsewhere by explicit chord.
+        let rebound = EffectiveConfig {
+            keymaps: vec![KeymapEntry {
+                chord: "alt+q".into(),
+                action: "toggle_floating".into(),
+                context: "global".into(),
+            }],
+            ..Default::default()
+        };
+        let maps = resolve_keymaps(&rebound).expect("resolves");
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('q'), false, true, false)),
+            Some(ChromeAction::ToggleFloating)
+        );
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('a'), false, true, false)),
+            Some(ChromeAction::ToggleFloating),
+            "default survives an unrelated append"
+        );
+    }
+
+    #[test]
     fn resolve_rejects_unknown_action_and_duplicate_chords() {
         let bad = EffectiveConfig {
             keymaps: vec![KeymapEntry {
@@ -3392,10 +3507,11 @@ mod tests {
         // owns exactly one action, no identity collides (with each other or
         // with the shipped defaults), and the Super rebound keeps the
         // explicit Alt spellings intact while the Super spellings stay free.
-        // The default count is 81 under Alt mod (35 shipped + 4 workspace
-        // + 4 resize + 16 arrow + 9 move + 7 zoom + 4 help
-        // + 1 CTX-0766 rechord + 1 issue-1444 close-view; W-144 retired the
-        // copy-mode and search chords).
+        // The default count is 94 under Alt mod (35 shipped + 4 workspace
+        // + 4 resize + 16 arrow + 9 move + 9 swap + 7 zoom + 4 help
+        // + 1 CTX-0766 rechord + 1 issue-1444 close-view + 3 CTX-0952 prompt
+        // + 1 CTX-0962 floating-toggle; W-144 retired the copy-mode and
+        // search chords).
         // Under Super mod, alt+d becomes super+d (still counted).
         let entries: &[(&str, &str)] = &[
             ("alt+f1", "goto_split:left"),
@@ -3424,14 +3540,14 @@ mod tests {
             let defaults = default_keymaps_with_mod(mod_key).expect("defaults valid");
             assert_eq!(
                 defaults.len(),
-                93,
-                "no new shipped defaults under mod {:?} (90 + 3 CTX-0952 prompt chords)",
+                94,
+                "no new shipped defaults under mod {:?} (90 + 3 CTX-0952 prompt chords + 1 CTX-0962 floating-toggle)",
                 mod_key
             );
             let maps = resolve_keymaps(&mk_effective(mod_key)).expect("resolves");
             assert_eq!(
                 maps.len(),
-                93 + entries.len(),
+                94 + entries.len(),
                 "explicit binds append, never shadow, under mod {:?}",
                 mod_key
             );

@@ -723,7 +723,7 @@ pub fn inspect_config(query: &str) -> Option<ConfigInfo> {
         "selection.auto_copy" => defaults.selection.auto_copy.to_string(),
         "layout.gaps_in" => defaults.layout.gaps_in.to_string(),
         "layout.gaps_out" => defaults.layout.gaps_out.to_string(),
-        "layout.resize_step" => format!("{:.3}", defaults.layout.resize_step),
+        "layout.resize_step" => format!("{}", defaults.layout.resize_step),
         // CTX-0333: Core-owned decoration knobs, including the content inset.
         "decoration.gaps_in" => defaults.decoration.gaps_in.to_string(),
         "decoration.gaps_out" => defaults.decoration.gaps_out.to_string(),

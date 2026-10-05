@@ -285,8 +285,28 @@ fn final_headless_integration_end_to_end() {
     );
 
     // Idle tick must be frame-on-demand: no damage -> None.
+    //
+    // Issue #1711: the BEL bytes above arm the bounded 120ms visual bell
+    // flash (BELL_FLASH_DURATION) on both runtimes, and
+    // tick_time_gates::expire_bell_flash forces exactly one clear-frame on
+    // expiry. An immediate idle tick is therefore wall-clock luck: <120ms
+    // since BEL -> None (pass), >=120ms -> Some expiry frame (fail). Settle
+    // deterministically through the virtual-clock seam
+    // (bell_notification_deadline + tick_at, as in
+    // m1_bell_notification::bell_flash_expires_on_a_quiet_window...): the
+    // determinism checks above already pinned the flash pixels, this only
+    // drains the expiry frame so the None assertion is stable. No sleep,
+    // no weakened assertion; the bound covers flash + banner with room.
+    for runtime in [&mut rt, &mut rt2] {
+        for _ in 0..3 {
+            let Some(deadline) = runtime.bell_notification_deadline() else {
+                break;
+            };
+            let _ = runtime.tick_at(deadline);
+        }
+    }
     assert_eq!(rt.tick(), None, "idle tick must be None");
-    assert_eq!(rt2.tick(), None);
+    assert_eq!(rt2.tick(), None, "idle tick must be None");
 
     // 7. PluginHost event pipeline via Runtime: register, subscribe, publish,
     //    drain, and verify bounded per-subscriber drops (closed OQ-013 decision

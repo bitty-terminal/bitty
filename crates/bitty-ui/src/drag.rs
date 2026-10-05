@@ -293,6 +293,60 @@ impl DragMoveSession {
     }
 }
 
+/// Computes Hyprland-like drop placement for a Mod+drag release
+/// (issue #1694, CTX-0966).
+///
+/// Hit-tests `point` against `tree` allocations; returns `None` when the
+/// point lands on background or on `source` itself (self-drop no-op).
+/// Otherwise docks beside the hovered target with position-based sizing:
+/// the edge nearest the drop point wins (left/right dock horizontally,
+/// top/bottom vertically), and the split ratio follows the drop position
+/// within the target rect (clamped to
+/// [`LayoutNode::MIN_RATIO`](crate::layout::LayoutNode::MIN_RATIO) /
+/// [`LayoutNode::MAX_RATIO`](crate::layout::LayoutNode::MAX_RATIO)) so a
+/// small panel can grow by dropping centrally and a large one shrinks by
+/// dropping near an edge. Ties break deterministically toward horizontal
+/// (side-by-side) and toward first (left/top). Pure, total, headless;
+/// never mutates the tree.
+#[must_use]
+pub fn drop_spec_for_point(
+    tree: &LayoutNode,
+    bounds: Rect,
+    gaps: Gaps,
+    source: ViewId,
+    point: Point,
+) -> Option<DropSpec> {
+    let target = tree.hit_test_leaf(bounds, gaps, point)?;
+    if target == source {
+        return None;
+    }
+    let rect = tree
+        .layout_with_gaps(bounds, gaps)
+        .into_iter()
+        .find(|(id, _)| *id == target)
+        .map(|(_, rect)| rect)?;
+    if rect.is_empty() || rect.width == 0 || rect.height == 0 {
+        return None;
+    }
+    let fx = ((f32::from(point.x.saturating_sub(rect.x))) / f32::from(rect.width)).clamp(0.0, 1.0);
+    let fy = ((f32::from(point.y.saturating_sub(rect.y))) / f32::from(rect.height)).clamp(0.0, 1.0);
+    let dist_left = fx;
+    let dist_right = 1.0 - fx;
+    let dist_top = fy;
+    let dist_bottom = 1.0 - fy;
+    let min_h = dist_left.min(dist_right);
+    let min_v = dist_top.min(dist_bottom);
+    if min_h <= min_v {
+        let after = dist_right < dist_left;
+        let ratio = fx.clamp(LayoutNode::MIN_RATIO, LayoutNode::MAX_RATIO);
+        Some(DropSpec::new(target, SplitAxis::Horizontal, ratio, after))
+    } else {
+        let after = dist_bottom < dist_top;
+        let ratio = fy.clamp(LayoutNode::MIN_RATIO, LayoutNode::MAX_RATIO);
+        Some(DropSpec::new(target, SplitAxis::Vertical, ratio, after))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // UX-02: edge/corner free resize
 // ---------------------------------------------------------------------------
@@ -1069,5 +1123,98 @@ mod tests {
         );
         assert_eq!(src, pair());
         assert_eq!(dst.leaf_count(), MAX_VIEWS_PER_WORKSPACE_TREE);
+    }
+
+    // -- Issue #1694 (CTX-0966) position-based drop placement ---------------
+
+    #[test]
+    fn drop_spec_self_and_background_are_none() {
+        let tree = pair();
+        let bounds = Rect::new(0, 0, 80, 24);
+        assert_eq!(
+            drop_spec_for_point(
+                &tree,
+                bounds,
+                Gaps::ZERO,
+                ViewId::new(1),
+                Point::new(10, 12)
+            ),
+            None,
+            "self-drop is a no-op"
+        );
+        assert_eq!(
+            drop_spec_for_point(
+                &tree,
+                bounds,
+                Gaps::ZERO,
+                ViewId::new(1),
+                Point::new(200, 200)
+            ),
+            None,
+            "background drop is a no-op"
+        );
+    }
+
+    #[test]
+    fn drop_spec_docks_by_nearest_edge_with_position_ratio() {
+        let tree = pair();
+        let bounds = Rect::new(0, 0, 80, 24);
+        // Right pane occupies 40..80 x 0..24. Drop near its right edge:
+        // docks right with a small dragged size.
+        let spec = drop_spec_for_point(
+            &tree,
+            bounds,
+            Gaps::ZERO,
+            ViewId::new(1),
+            Point::new(70, 12),
+        )
+        .expect("right-edge drop must dock");
+        assert_eq!(spec.target, ViewId::new(2));
+        assert_eq!(spec.axis, SplitAxis::Horizontal);
+        assert!(spec.after, "right edge docks after");
+        assert!(
+            (spec.ratio - 0.75).abs() < 1e-6,
+            "ratio follows the drop x (70-40)/40 = 0.75), got {}",
+            spec.ratio
+        );
+        // Drop near its left edge: docks before with a small dragged size.
+        let spec = drop_spec_for_point(
+            &tree,
+            bounds,
+            Gaps::ZERO,
+            ViewId::new(1),
+            Point::new(45, 12),
+        )
+        .expect("left-edge drop must dock");
+        assert_eq!(spec.target, ViewId::new(2));
+        assert_eq!(spec.axis, SplitAxis::Horizontal);
+        assert!(!spec.after, "left edge docks before");
+        assert!((spec.ratio - 0.125).abs() < 1e-6);
+        // Drop near the top: docks above with position-based height.
+        let spec =
+            drop_spec_for_point(&tree, bounds, Gaps::ZERO, ViewId::new(1), Point::new(60, 2))
+                .expect("top-edge drop must dock");
+        assert_eq!(spec.target, ViewId::new(2));
+        assert_eq!(spec.axis, SplitAxis::Vertical);
+        assert!(!spec.after, "top edge docks before");
+        assert!((spec.ratio - LayoutNode::MIN_RATIO).abs() < 1e-6);
+    }
+
+    #[test]
+    fn drop_spec_center_tie_breaks_deterministically() {
+        let tree = pair();
+        let bounds = Rect::new(0, 0, 80, 24);
+        let spec = drop_spec_for_point(
+            &tree,
+            bounds,
+            Gaps::ZERO,
+            ViewId::new(1),
+            Point::new(60, 12),
+        )
+        .expect("center drop must dock");
+        assert_eq!(spec.target, ViewId::new(2));
+        assert_eq!(spec.axis, SplitAxis::Horizontal, "tie prefers side-by-side");
+        assert!(!spec.after, "tie prefers first (left)");
+        assert!((spec.ratio - 0.5).abs() < 1e-6);
     }
 }

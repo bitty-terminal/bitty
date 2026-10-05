@@ -253,16 +253,12 @@ fn alt_drag_moves_floating_overlay_without_selection() {
 }
 
 #[test]
-fn alt_press_on_tiled_layout_falls_through_to_selection() {
-    // Tiled splits have no movable position: the grab fails soft and the
-    // press selects normally ("without breaking selection").
-    //
-    // #1390: Tiled Mod+drag panel repositioning is explicitly deferred
-    // (milestone proposal: v0.2.0). The `DragMoveSession` primitive exists in
-    // bitty-ui with headless tests but has zero pointer-path callers. Clean
-    // wiring needs compositor-layer architecture (command registry, drop target
-    // presentation, tiled drag state machine). This test pins the current
-    // fail-soft behavior until that architecture lands.
+fn alt_press_on_tiled_layout_starts_tiled_drag_not_selection() {
+    // Issue #1694 (CTX-0966): Mod+Left-drag on a tiled leaf now grabs for
+    // a tiled move (Hyprland-like) instead of falling through to selection.
+    // The floating-path probe still fails soft (no float to move); the
+    // tiled path owns the gesture. Block selection is preserved for
+    // single-leaf trees, Shift, and gap bands (see `tiled_drag_move`).
     let mut rt = make_runtime();
     rt.handle_pty_bytes(b"hello world");
     rt.set_layout(two_pane());
@@ -271,12 +267,22 @@ fn alt_press_on_tiled_layout_falls_through_to_selection() {
     rt.handle_mouse_input(press(MouseButton::Left));
     assert!(
         !rt.alt_drag_active(),
-        "tiled Alt+press must not grab (no float to move)"
+        "tiled Alt+press must not grab a float (none to move)"
+    );
+    assert!(
+        rt.tiled_drag_active(),
+        "tiled Alt+press must grab for a tiled move (#1694)"
+    );
+    assert!(
+        !rt.is_selection_dragging(),
+        "grabbing press must not start selection"
     );
     rt.handle_cursor_moved(cell_pixels(4, 0));
     rt.handle_mouse_input(release(MouseButton::Left));
-    assert!(rt.has_selection(), "tiled Alt+drag still selects");
-    assert_eq!(rt.selection_text().as_deref(), Some("hello"));
+    assert!(
+        !rt.has_selection(),
+        "tiled-drag release must not commit a selection (desync guard)"
+    );
     rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
 }
 

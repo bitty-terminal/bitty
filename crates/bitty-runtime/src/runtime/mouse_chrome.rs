@@ -1,11 +1,20 @@
-//! `Runtime` — Hover-to-activate focus and Alt+drag floating-pane moves.
+//! `Runtime` — Hover-to-activate focus, Alt+drag floating moves, and
+//! Mod+drag tiled-panel moves (Hyprland-like).
 //!
 //! CTX-0260 follow-through of DEC-0034: an opt-in hover moves keyboard
 //! focus (`RuntimeConfig::focus_follows_mouse`, default off to preserve
-//! click-to-focus) plus Alt+drag to move a tiled/floating pane position
-//! where the layout model permits (floating [`LayoutNode::Overlay`] bounds
-//! move; tiled splits/stacks have no movable position, so the grab is a
-//! fail-soft no-op and the press falls through to selection).
+//! click-to-focus) plus Alt+drag to move a floating pane position
+//! ([`LayoutNode::Overlay`] bounds move).
+//!
+//! Issue #1694 (CTX-0966): Mod+Left-drag (Alt by default, the working Mod
+//! per OQ-052; Super also accepted for Hyprland muscle memory) on a tiled
+//! leaf grabs it for a tiled move via the headless
+//! [`DragMoveSession`](bitty_ui::DragMoveSession) primitive: motion tracks
+//! a live preview (advisory hovered target), release re-parents with
+//! Hyprland-like placement
+//! ([`drop_spec_for_point`](bitty_ui::drop_spec_for_point): nearest-edge
+//! docking with position-based sizing, so small panels grow by dropping
+//! centrally and large ones shrink by dropping near an edge).
 //!
 //! CTX-0334 (Hyprland-like mouse-enter activation): when
 //! `RuntimeConfig::focus_follows_mouse_delay` is non-zero, pointer entry on
@@ -23,14 +32,14 @@
 //!
 //! Lane note: pointer chrome only. Selection, capture encoding, scrollbar
 //! drags, and workspace switching belong to their owning paths; this module
-//! only grabs/moves/releases the Alt-drag and applies the gated hover step.
-//! Shift still forces the selection path (the CTX-0181 precedent): the grab
-//! never starts while Shift is held and hover-focus is suppressed under
-//! Shift.
+//! only grabs/moves/releases the Alt-drag, the Mod tiled-drag, and the
+//! border-drag, plus the gated hover step.
+//! Shift still forces the selection path (the CTX-0181 precedent): no grab
+//! starts while Shift is held and hover-focus is suppressed under Shift.
 
 use super::*;
 use bitty_platform::CursorPosition;
-use bitty_ui::{Point as UiPoint, SplitAxis};
+use bitty_ui::{DragMoveSession, Point as UiPoint, SplitAxis, drop_spec_for_point};
 use std::time::Instant;
 
 /// Pending hover activation with a positive dwell delay (CTX-0334).
@@ -57,6 +66,19 @@ pub struct AltDragState {
     pub anchor_col: i32,
     /// Anchor row (container cells) at grab or last move.
     pub anchor_row: i32,
+}
+
+/// Active Mod+drag tiled-panel move (issue #1694, CTX-0966).
+///
+/// Wraps the headless [`DragMoveSession`] primitive: press lifts the tiled
+/// leaf under the cursor, motion tracks the advisory preview target live,
+/// release commits via [`drop_spec_for_point`] + `reparent_leaf` with
+/// position-based sizing. Floating (overlay-tier) leaves never start here;
+/// the Alt+drag floating path owns them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TiledDragState {
+    /// Headless move session (source + advisory preview target).
+    pub session: DragMoveSession,
 }
 
 /// Active border-drag resize: which split divider(s) are grabbed plus the
@@ -128,16 +150,9 @@ impl Runtime {
             return false;
         };
         // Probe: a zero-delta move succeeds only where the layout model
-        // permits (an owning float exists); tiled leaves fail soft here.
-        //
-        // Tiled Mod+drag panel repositioning is deferred (#1390): the
-        // `DragMoveSession` primitive (bitty-ui/src/drag.rs) and cross-workspace
-        // drop (`move_leaf_to_workspace`, Bar surface) are headless-tested but
-        // have zero pointer-path callers. Clean wiring needs compositor-layer
-        // architecture (command registry for `bitty.workspace:drag-move`, drop
-        // target presentation, tiled drag state machine). The workspace compositor
-        // spec records Mod+drag as CANDIDATE (PW-1/PW-7), not accepted. Milestone
-        // proposal: v0.2.0 (post-compositor-architecture acceptance).
+        // permits (an owning float exists); tiled leaves fail soft here and
+        // the Mod tiled-drag path (`begin_tiled_drag`) owns them instead
+        // (issue #1694, CTX-0966).
         if !self
             .layout
             .move_overlay_containing(leaf, 0, 0, self.container)
@@ -197,6 +212,158 @@ impl Runtime {
             return false;
         }
         self.alt_drag = None;
+        true
+    }
+
+    /// Whether a Mod+drag tiled-panel move is currently active (issue #1694).
+    #[must_use]
+    pub fn tiled_drag_active(&self) -> bool {
+        self.tiled_drag.is_some()
+    }
+
+    /// Grabbed tiled leaf for the active Mod+drag, if any (test seam).
+    #[must_use]
+    pub fn tiled_drag_source(&self) -> Option<ViewId> {
+        self.tiled_drag.as_ref().map(|drag| drag.session.source())
+    }
+
+    /// Advisory preview target for the active Mod+drag, if any (test seam
+    /// and live-preview paint hook): the hovered drop anchor from the last
+    /// motion, or `None` over background.
+    #[must_use]
+    pub fn tiled_drag_preview(&self) -> Option<ViewId> {
+        self.tiled_drag
+            .as_ref()
+            .and_then(|drag| drag.session.preview_target())
+    }
+
+    /// Whether `id` is a floating (overlay-tier) leaf in the current tree.
+    fn leaf_is_floating(&self, id: ViewId) -> bool {
+        self.layout
+            .leaf_overlay_tiers()
+            .into_iter()
+            .find(|(leaf, _)| *leaf == id)
+            .is_some_and(|(_, tier)| tier.is_some())
+    }
+
+    /// Attempts to grab the tiled pane under the last known cursor for a
+    /// Mod+drag move (issue #1694, CTX-0966).
+    ///
+    /// Requires Mod held (Alt, the working Mod per OQ-052, or Super for
+    /// Hyprland muscle memory) and Shift released (Shift forces selection
+    /// per the CTX-0181 precedent), plus a known cursor over a tiled
+    /// (non-overlay) leaf. Floating leaves fail soft here; the Alt+drag
+    /// floating path owns them. Single-leaf trees fail soft too, preserving
+    /// Alt+block selection where a move would be a self-drop no-op. The
+    /// grab focuses the dragged pane (Hyprland-like). Returns `true` when
+    /// the drag started (caller consumes the press and skips selection);
+    /// `false` leaves all state untouched so the press falls through.
+    pub fn begin_tiled_drag(&mut self) -> bool {
+        if self.shift_pressed || !(self.alt_pressed || self.super_pressed) {
+            return false;
+        }
+        if self.alt_drag.is_some() || self.tiled_drag.is_some() {
+            return false;
+        }
+        let Some(cursor) = self.last_cursor else {
+            return false;
+        };
+        let Some((leaf, _)) = self.cursor_to_leaf_cell(cursor) else {
+            return false;
+        };
+        if self.leaf_is_floating(leaf) {
+            return false;
+        }
+        if self.layout.leaf_count() < 2 {
+            return false;
+        }
+        let Ok(session) = DragMoveSession::start(leaf, true) else {
+            return false;
+        };
+        self.tiled_drag = Some(TiledDragState { session });
+        self.set_focus(leaf);
+        self.clear_hover_pending();
+        true
+    }
+
+    /// Moves the active Mod+drag to `pos`, tracking the advisory preview
+    /// target live (issue #1694).
+    ///
+    /// Hit-tests `pos` against the current allocations via
+    /// [`DragMoveSession::preview`]; the tree is never mutated here. Returns
+    /// `true` when a drag was active (caller consumes the motion: no
+    /// selection update, no hover-focus, no capture motion encoding). An
+    /// unmappable position keeps the drag armed with no preview change.
+    /// When the layout no longer owns the source (closed mid-drag) the drag
+    /// ends fail-soft and `false` is returned so the motion falls through.
+    pub fn update_tiled_drag(&mut self, pos: CursorPosition) -> bool {
+        let Some(point) = self.cursor_to_layout_point(pos) else {
+            return self.tiled_drag.is_some();
+        };
+        // Disjoint-field borrow: preview against the current tree while
+        // holding the session mutably.
+        let (container, gaps) = (self.container, self.gaps());
+        let Some(drag) = self.tiled_drag.as_mut() else {
+            return false;
+        };
+        if self.layout.find_leaf(drag.session.source()).is_none() {
+            self.tiled_drag = None;
+            return false;
+        }
+        let before = drag.session.preview_target();
+        drag.session.preview(&self.layout, container, gaps, point);
+        if drag.session.preview_target() != before {
+            self.pending_full_redraw = true;
+        }
+        true
+    }
+
+    /// Ends the active Mod+drag, committing the drop when it lands on
+    /// another leaf (issue #1694).
+    ///
+    /// Computes Hyprland-like placement via [`drop_spec_for_point`]
+    /// (nearest-edge docking with position-based sizing) at the last known
+    /// cursor and re-parents through [`Runtime::set_layout`] so leaf Views,
+    /// pane sessions, and the primary grid reflow exactly like a keyboard
+    /// move. Self-drops, background drops, unmappable releases, and
+    /// mid-drag closes end the gesture with the tree untouched. Always
+    /// returns `true` when a drag was active (caller skips the
+    /// selection-release commit/copy: the grabbing press never started a
+    /// selection, so there is nothing to commit and stale highlights must
+    /// not auto-copy); `false` when no drag was active.
+    pub fn end_tiled_drag(&mut self) -> bool {
+        let Some(drag) = self.tiled_drag.take() else {
+            return false;
+        };
+        let source = drag.session.source();
+        let Some(cursor) = self.last_cursor else {
+            return true;
+        };
+        let Some(point) = self.cursor_to_layout_point(cursor) else {
+            return true;
+        };
+        let Some(drop) =
+            drop_spec_for_point(&self.layout, self.container, self.gaps(), source, point)
+        else {
+            return true;
+        };
+        let mut next = self.layout.clone();
+        if !next.reparent_leaf(source, drop.target, drop.axis, drop.ratio, drop.after) {
+            return true;
+        }
+        self.set_layout(next);
+        self.set_focus(source);
+        self.pending_full_redraw = true;
+        true
+    }
+
+    /// Cancels the active Mod+drag without committing (cursor left the
+    /// window). Returns `true` when a drag was active.
+    pub fn cancel_tiled_drag(&mut self) -> bool {
+        if self.tiled_drag.is_none() {
+            return false;
+        }
+        self.tiled_drag = None;
         true
     }
 
@@ -268,8 +435,9 @@ impl Runtime {
     /// Attempts to grab the split divider(s) under the last known cursor for
     /// a border-drag resize (issue #1348, #1445 corner-drag).
     ///
-    /// Requires a plain press: Shift and Alt released (those force the
-    /// selection and Alt+drag paths per the CTX-0181/CTX-0260 precedents)
+    /// Requires a plain press: Shift, Alt, and Super released (those force
+    /// the selection, Alt+drag, and Mod tiled-drag paths per the
+    /// CTX-0181/CTX-0260/CTX-0966 precedents)
     /// plus a known cursor over a split handle
     /// ([`LayoutNode::hit_test_split_handles`]). Callers run this after the
     /// mouse-capture and scrollbar checks, so a mouse-mode app and the
@@ -281,7 +449,7 @@ impl Runtime {
     /// perpendicular splits (e.g., 2x2 grid corner), all intersecting splits
     /// are grabbed and resized simultaneously (Hyprland/Niri model).
     pub fn begin_border_drag(&mut self) -> bool {
-        if self.alt_pressed || self.shift_pressed {
+        if self.alt_pressed || self.super_pressed || self.shift_pressed {
             return false;
         }
         let Some(cursor) = self.last_cursor else {
@@ -481,10 +649,10 @@ impl Runtime {
     /// capture against the newly focused pane, so the click reaches the
     /// pane it landed on. Nothing changes when no pane involved tracks the
     /// mouse (the selection path's own click-to-focus stays authoritative),
-    /// under Shift or Alt (selection and float-move escapes), over a gap
+    /// under Shift, Alt, or Super (selection and drag escapes), over a gap
     /// band, or on a split handle (a divider owns no leaf).
     pub(super) fn focus_pointer_pane_before_capture(&mut self) {
-        if self.shift_pressed || self.alt_pressed {
+        if self.shift_pressed || self.alt_pressed || self.super_pressed {
             return;
         }
         let Some(pos) = self.last_cursor else {

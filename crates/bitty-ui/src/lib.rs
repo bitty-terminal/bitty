@@ -223,8 +223,8 @@ pub use drag::{
     CrossWorkspaceDrop, CrossWorkspaceError, DRAG_HISTORY_CAP, DRAG_MOVE_CMD, DRAG_RESIZE_CMD,
     DragHistory, DragMoveError, DragMoveSession, DragResizeError, DropSpec,
     MAX_VIEWS_PER_WORKSPACE_TREE, RESIZE_HANDLE_CELLS, ResizeEdge, WORKSPACE_DROP_CMD,
-    apply_tiled_resize, detect_resize_edge, move_leaf_to_workspace, resize_floating_rect,
-    workspace_drop_target,
+    apply_tiled_resize, detect_resize_edge, drop_spec_for_point, move_leaf_to_workspace,
+    resize_floating_rect, workspace_drop_target,
 };
 pub use drag_bar::{
     BAR_EDGE_CELLS, BAR_MOVE_CMD, BAR_SPLIT_CMD, BarDropPreview, BarDropSession, BarError,

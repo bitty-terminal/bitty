@@ -644,6 +644,10 @@ impl Runtime {
                     // border-drag resize (deterministic teardown like the
                     // Alt+drag move above).
                     self.end_border_drag();
+                    // Issue #1694 (CTX-0966): leaving also cancels a Mod
+                    // tiled-drag without committing (no drop target outside
+                    // the window; the tree stays untouched).
+                    self.cancel_tiled_drag();
                     // CTX-0334: leaving the window also drops a pending
                     // hover dwell so a re-entry starts a fresh clock.
                     self.clear_hover_pending();

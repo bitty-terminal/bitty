@@ -35,13 +35,13 @@ inherits = "default"
 max-threads = 2
 
 [[profile.default.overrides]]
-filter = 'package(bitty-pty) | binary(/^(m1_shell_coverage|selection_view_owned|mouse_report_panes|session_save_restore|job_capability_ops|job_supervisor|pane_damage|shell_input_1356|panel_session_invariants|focused_input_modes|poll_budget_0476|copy_search_view_bound|dogfooding|shell_knob)$/)'
+filter = 'package(bitty-pty) | binary(/^(m1_shell_coverage|selection_view_owned|mouse_report_panes|session_save_restore|pane_damage|shell_input_1356|panel_session_invariants|focused_input_modes|poll_budget_0476|copy_search_view_bound|dogfooding|shell_knob)$/)'
 test-group = "live-pty"
 
 # Retries apply ONLY to the system group: a transient spawn/scheduling miss is
 # retried visibly (nextest prints RETRY), never silently. Unit tests get no
 # retries, so real bugs stay red.
 [[profile.ci.overrides]]
-filter = 'package(bitty-pty) | binary(/^(m1_shell_coverage|selection_view_owned|mouse_report_panes|session_save_restore|job_capability_ops|job_supervisor|pane_damage|shell_input_1356|panel_session_invariants|focused_input_modes|poll_budget_0476|copy_search_view_bound|dogfooding|shell_knob)$/)'
+filter = 'package(bitty-pty) | binary(/^(m1_shell_coverage|selection_view_owned|mouse_report_panes|session_save_restore|pane_damage|shell_input_1356|panel_session_invariants|focused_input_modes|poll_budget_0476|copy_search_view_bound|dogfooding|shell_knob)$/)'
 test-group = "live-pty"
 retries = 2

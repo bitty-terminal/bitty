@@ -596,9 +596,16 @@ pub fn apply_control(
         };
         match runtime.workspace_rename(index, &name) {
             Ok(()) => {
+                // CTX-0979 CodeRabbit: report the stored name so trimming or
+                // truncation applied by workspace_rename is visible to callers.
+                let stored = runtime
+                    .workspace_names()
+                    .get(index)
+                    .cloned()
+                    .unwrap_or(name);
                 return Ok(format!(
                     "{{\"renamed\":\"{workspace_id}\",\"name\":\"{}\"}}",
-                    json_escape(&name),
+                    json_escape(&stored),
                 ));
             }
             Err(message) => {

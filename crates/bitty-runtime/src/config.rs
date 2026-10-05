@@ -135,16 +135,12 @@ pub const DEFAULT_FOCUS_FOLLOWS_MOUSE: bool = true;
 /// `0` activates on pointer entry (CTX-0260 behavior).
 pub const DEFAULT_FOCUS_FOLLOWS_MOUSE_DELAY_MS: u32 = 0;
 
-/// CTX-0979: Core draws no workspace display (Hyprland-style). The former
-/// `DEFAULT_WORKSPACELINE_VISIBLE` is deleted; workspace state is memory-only
-/// and the bar plugin owns presentation via the query commands.
-///
-/// `BarEdge`/`DEFAULT_WORKSPACE_BAR_EDGE` stay as the pure geometry edge
-/// for the `chrome_band` helper and its tests; no runtime band is reserved.
-/// Window edge for the (now unreserved) chrome band geometry helper.
-///
-/// CTX-0979: no runtime band is reserved; this stays for the pure
-/// `chrome_band` geometry helper and its tests.
+// CTX-0979: Core draws no workspace display; DEFAULT_WORKSPACELINE_VISIBLE
+// is deleted, workspace state is memory-only, and the bar plugin owns
+// presentation via the query commands.
+/// Window edge for the chrome band geometry helper (CTX-0979: no runtime
+/// band is reserved; BarEdge stays as the pure geometry edge for the
+/// `chrome_band` helper and its tests).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BarEdge {
     /// Band on the first window row; content starts one band lower.

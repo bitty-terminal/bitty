@@ -505,14 +505,13 @@ impl Runtime {
         if top == 0 && bottom == 0 {
             return window;
         }
-        let container = window;
-        let y = container.y.saturating_add(top);
-        let end = container
+        let y = window.y.saturating_add(top);
+        let end = window
             .y
-            .saturating_add(container.height)
+            .saturating_add(window.height)
             .saturating_sub(bottom);
         let height = end.saturating_sub(y);
-        bitty_ui::Rect::new(container.x, y, container.width, height)
+        bitty_ui::Rect::new(window.x, y, window.width, height)
     }
 
     /// Band rows currently painted, for overlap fail-closed checks.

@@ -567,6 +567,17 @@ impl Runtime {
         &mut self,
         position: usize,
     ) -> Result<ViewId, String> {
+        self.workspace_move_focused_to_position_at(position, std::time::Instant::now())
+    }
+
+    /// [`Self::workspace_move_focused_to_position`] with an explicit wall
+    /// clock (CTX-0967 virtual-clock seam: tests arm the move transition
+    /// deterministically).
+    pub fn workspace_move_focused_to_position_at(
+        &mut self,
+        position: usize,
+        now: std::time::Instant,
+    ) -> Result<ViewId, String> {
         let ids = self.layout.leaf_ids();
         let focused = self
             .focused_view()
@@ -600,6 +611,11 @@ impl Runtime {
         self.sync_primary_geometry();
         self.sync_pane_geometry();
         self.pending_full_redraw = true;
+        // CTX-0967: a committed reparent arms the move transition on the
+        // moved panel. The tree commits immediately (terminal content is
+        // never interpolated); only the moved panel's chrome ring fades.
+        // No-ops return above, so reaching here always moved something.
+        self.trigger_animation(AnimationKind::Move, Some(focused), now);
         Ok(focused)
     }
 
@@ -1247,6 +1263,17 @@ impl Runtime {
     /// `Tiled` stamps the mode only (the solver ignores it), so the prior
     /// allocation restores exactly with no insertion or bisect placement.
     pub fn workspace_move_focused_to(&mut self, index: usize) -> Result<ViewId, String> {
+        self.workspace_move_focused_to_at(index, std::time::Instant::now())
+    }
+
+    /// [`Self::workspace_move_focused_to`] with an explicit wall clock
+    /// (CTX-0967 virtual-clock seam: tests arm the move transition
+    /// deterministically).
+    pub fn workspace_move_focused_to_at(
+        &mut self,
+        index: usize,
+        now: std::time::Instant,
+    ) -> Result<ViewId, String> {
         if index >= self.workspaces.len() {
             return Err(format!("no such workspace ws:{}", index.saturating_add(1)));
         }
@@ -1380,6 +1407,13 @@ impl Runtime {
         // bindings to it (selection, copy mode, search) are dropped.
         self.invalidate_stale_view_bindings();
         self.pending_full_redraw = true;
+        // CTX-0967: a committed cross-workspace move arms the move
+        // transition on the moved panel. The tree commits immediately
+        // (terminal content is never interpolated); the moved panel's own
+        // fade is visible on same-workspace reposition and on the target
+        // workspace when it is switched to inside the duration, while the
+        // source survivors' reflow is covered by their own present.
+        self.trigger_animation(AnimationKind::Move, Some(focused), now);
         Ok(focused)
     }
 
@@ -1472,6 +1506,14 @@ impl Runtime {
         self.sync_pane_geometry();
         self.invalidate_stale_view_bindings();
         self.pending_full_redraw = true;
+        // CTX-0967: like `workspace_move_focused_to_at`, a committed move
+        // into an auto-created workspace arms the move transition on the
+        // moved panel (same immediate-commit, chrome-only contract).
+        self.trigger_animation(
+            AnimationKind::Move,
+            Some(focused),
+            std::time::Instant::now(),
+        );
 
         let seq = self.plugin_host.publish_count();
         let ws_name = format!("ws{one_based}");

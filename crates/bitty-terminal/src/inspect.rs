@@ -751,6 +751,15 @@ pub fn inspect_config(query: &str) -> Option<ConfigInfo> {
         "appearance.animations.duration_ms.workspace" => {
             defaults.animations.duration_ms.workspace.to_string()
         }
+        "appearance.animations.duration_ms.move" => {
+            defaults.animations.duration_ms.r#move.to_string()
+        }
+        "appearance.animations.duration_ms.resize" => {
+            defaults.animations.duration_ms.resize.to_string()
+        }
+        "appearance.animations.duration_ms.drag" => {
+            defaults.animations.duration_ms.drag.to_string()
+        }
         "appearance.animations.easing.open" => defaults.animations.easing.open.as_str().to_string(),
         "appearance.animations.easing.close" => {
             defaults.animations.easing.close.as_str().to_string()
@@ -761,6 +770,13 @@ pub fn inspect_config(query: &str) -> Option<ConfigInfo> {
         "appearance.animations.easing.workspace" => {
             defaults.animations.easing.workspace.as_str().to_string()
         }
+        "appearance.animations.easing.move" => {
+            defaults.animations.easing.r#move.as_str().to_string()
+        }
+        "appearance.animations.easing.resize" => {
+            defaults.animations.easing.resize.as_str().to_string()
+        }
+        "appearance.animations.easing.drag" => defaults.animations.easing.drag.as_str().to_string(),
         "scrollbar.mode" => defaults.scrollbar.mode.as_str().to_string(),
         "scrollbar.width" => defaults.scrollbar.width.to_string(),
         // CTX-0260: hover-focus opt-in (default off = click-to-focus).

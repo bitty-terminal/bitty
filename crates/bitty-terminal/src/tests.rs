@@ -2869,8 +2869,8 @@ fn runtime_config_maps_animation_contract_end_to_end() {
         r#"return { appearance = { animations = {
             enabled = true,
             reduced_motion = "auto",
-            duration_ms = { open = 150, close = 120, focus = 100, workspace = 200 },
-            easing = { open = "spring", close = "linear", focus = "ease_in_out", workspace = "ease_in" },
+            duration_ms = { open = 150, close = 120, focus = 100, workspace = 200, move = 150, resize = 120, drag = 150 },
+            easing = { open = "spring", close = "linear", focus = "ease_in_out", workspace = "ease_in", move = "spring", resize = "linear", drag = "ease_out" },
         } } }"#,
         &src,
     )
@@ -2881,7 +2881,7 @@ fn runtime_config_maps_animation_contract_end_to_end() {
     assert!(cfg.animations.enabled);
     assert_eq!(
         cfg.animations.duration_ms,
-        [150, 120, 100, 200],
+        [150, 120, 100, 200, 150, 120, 150],
         "accepted durations map verbatim"
     );
     // `spring` resolves to `ease_in_out` at the boundary.
@@ -2893,6 +2893,20 @@ fn runtime_config_maps_animation_contract_end_to_end() {
         cfg.animations.curves[1],
         bitty_runtime::AnimationCurve::Linear
     );
+    // CTX-0967: geometry leaves map verbatim with the same resolution.
+    assert_eq!(
+        cfg.animations.curves[4],
+        bitty_runtime::AnimationCurve::EaseInOut,
+        "move spring resolves"
+    );
+    assert_eq!(
+        cfg.animations.curves[5],
+        bitty_runtime::AnimationCurve::Linear
+    );
+    assert_eq!(
+        cfg.animations.curves[6],
+        bitty_runtime::AnimationCurve::EaseOut
+    );
     assert_eq!(
         cfg.animations.reduced_motion,
         bitty_runtime::ReducedMotionMode::Auto
@@ -2900,11 +2914,13 @@ fn runtime_config_maps_animation_contract_end_to_end() {
     // Safe mode zeroes every duration and keeps the final-state contract.
     let safe = bitty_config::reload::fallback_builtin();
     let safe_cfg = runtime_config_from_effective(&safe).expect("safe builds");
-    assert_eq!(safe_cfg.animations.duration_ms, [0, 0, 0, 0]);
+    assert_eq!(safe_cfg.animations.duration_ms, [0, 0, 0, 0, 0, 0, 0]);
     // Out-of-range/unknown values fail closed before runtime.
     for bad in [
         r#"return { appearance = { animations = { duration_ms = { open = 501 } } } }"#,
+        r#"return { appearance = { animations = { duration_ms = { move = 501 } } } }"#,
         r#"return { appearance = { animations = { easing = { open = "bounce" } } } }"#,
+        r#"return { appearance = { animations = { easing = { drag = "bounce" } } } }"#,
         r#"return { appearance = { animations = { reduced_motion = "sometimes" } } }"#,
     ] {
         let src = ConfigSource::new(LayerKind::User, Some("init.lua"));

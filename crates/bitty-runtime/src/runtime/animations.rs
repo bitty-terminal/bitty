@@ -1,12 +1,21 @@
-//! Renderer-side panel animations (RFC-0002, CTX-0341).
+//! Renderer-side panel animations (RFC-0002, CTX-0341; CTX-0967 move/resize/drag).
 //!
 //! Accepted contract: a closed transition set (panel open/close, focus change,
-//! workspace switch) with per-transition integer durations in `0..=500` ms and
+//! workspace switch, panel move, panel resize, panel drag) with per-transition
+//! integer durations in `0..=500` ms and
 //! a closed easing enum. `spring` resolves to `ease_in_out` (its parameters are
 //! deferred). Animations are presentation-only chrome: never grid, cursor,
 //! scrollback, or Terminal Truth. Frame-on-demand is preserved: a frame is
 //! scheduled only while an animation is active, and a completed animation
 //! schedules no further wakeups (PB-7).
+//!
+//! Move/resize/drag (CTX-0967, issue #1696) are Hyprland-style geometry gestures:
+//! the layout commits its final state immediately (terminal content is never
+//! interpolated) and only the Core-owned decoration ring fades over the
+//! configured duration. They are triggered directly from the gesture paths
+//! (Alt-drag float move, border-drag ratio change, keyboard resize, panel
+//! reparent) rather than detected from the `View`-set delta, because a move or
+//! resize keeps the same `View` set.
 //!
 //! Hostile-config safety: every duration is bounded, at most one animation per
 //! surface and a bounded number of concurrently animating surfaces, and any
@@ -51,7 +60,8 @@ pub struct ClosingFrame {
     pub color: bitty_render::grid::Rgba8,
 }
 
-/// One animatable panel transition (RFC-0002 transition set).
+/// One animatable panel transition (RFC-0002 transition set, extended by
+/// CTX-0967 with move/resize/drag).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AnimationKind {
     /// A `View` becomes occupied or a Panel is shown.
@@ -62,6 +72,21 @@ pub enum AnimationKind {
     Focus,
     /// The active `Workspace` changes.
     Workspace,
+    /// A panel is repositioned (tiled reparent or cross-workspace move).
+    ///
+    /// Triggered directly from the reparent paths; the layout commits
+    /// immediately and only the moved panel's chrome ring fades.
+    Move,
+    /// A panel boundary moves (border-drag divider or keyboard resize step).
+    ///
+    /// Triggered directly from the resize paths; ratios commit immediately
+    /// and only the resized panels' chrome rings fade.
+    Resize,
+    /// A floating panel is dragged (Alt+drag float move).
+    ///
+    /// Triggered on every drag update; repeat updates restart the bounded
+    /// transition (never accumulate), so the ring settles after release.
+    Drag,
 }
 
 impl AnimationKind {
@@ -73,8 +98,14 @@ impl AnimationKind {
             Self::Close => 1,
             Self::Focus => 2,
             Self::Workspace => 3,
+            Self::Move => 4,
+            Self::Resize => 5,
+            Self::Drag => 6,
         }
     }
+
+    /// Number of animatable transitions (table length).
+    pub const COUNT: usize = 7;
 }
 
 /// Closed easing enum; `spring` is already mapped to `EaseInOut` by the config
@@ -130,10 +161,13 @@ pub enum ReducedMotionMode {
 pub struct AnimationPolicy {
     /// Master switch; `false` is equivalent to `0` ms durations.
     pub enabled: bool,
-    /// Per-transition durations in milliseconds.
-    pub duration_ms: [u32; 4],
-    /// Per-transition easing curves (already `spring`-resolved by config).
-    pub curves: [AnimationCurve; 4],
+    /// Per-transition durations in milliseconds, indexed by
+    /// [`AnimationKind::index`] (`[open, close, focus, workspace, move,
+    /// resize, drag]`).
+    pub duration_ms: [u32; AnimationKind::COUNT],
+    /// Per-transition easing curves (already `spring`-resolved by config),
+    /// same index order as `duration_ms`.
+    pub curves: [AnimationCurve; AnimationKind::COUNT],
     /// Reduced-motion mode.
     pub reduced_motion: ReducedMotionMode,
     /// Safe mode (`bitty --safe`); forces `0` ms.
@@ -146,12 +180,17 @@ impl Default for AnimationPolicy {
     fn default() -> Self {
         Self {
             enabled: true,
-            duration_ms: [150, 120, 100, 200],
+            // Index order: open, close, focus, workspace, move, resize, drag
+            // (Hyprland-style: moves slide, resizes track, drags settle).
+            duration_ms: [150, 120, 100, 200, 150, 120, 150],
             curves: [
                 AnimationCurve::EaseOut,
                 AnimationCurve::EaseIn,
                 AnimationCurve::EaseInOut,
                 AnimationCurve::EaseInOut,
+                AnimationCurve::EaseInOut,
+                AnimationCurve::EaseInOut,
+                AnimationCurve::EaseOut,
             ],
             reduced_motion: ReducedMotionMode::Auto,
             safe_mode: false,
@@ -415,6 +454,56 @@ mod tests {
     }
 
     #[test]
+    fn default_policy_covers_move_resize_drag() {
+        // CTX-0967: the Hyprland-style geometry kinds carry bounded defaults
+        // with the same reduced-motion contract as the RFC-0002 set.
+        assert_eq!(AnimationKind::COUNT, 7);
+        assert_eq!(AnimationKind::Move.index(), 4);
+        assert_eq!(AnimationKind::Resize.index(), 5);
+        assert_eq!(AnimationKind::Drag.index(), 6);
+        let p = AnimationPolicy::default();
+        assert_eq!(p.duration(AnimationKind::Move), Duration::from_millis(150));
+        assert_eq!(
+            p.duration(AnimationKind::Resize),
+            Duration::from_millis(120)
+        );
+        assert_eq!(p.duration(AnimationKind::Drag), Duration::from_millis(150));
+        assert_eq!(p.curve(AnimationKind::Move), AnimationCurve::EaseInOut);
+        assert_eq!(p.curve(AnimationKind::Resize), AnimationCurve::EaseInOut);
+        assert_eq!(p.curve(AnimationKind::Drag), AnimationCurve::EaseOut);
+        for kind in [
+            AnimationKind::Move,
+            AnimationKind::Resize,
+            AnimationKind::Drag,
+        ] {
+            assert!(p.animates(kind), "{kind:?} must animate by default");
+        }
+        // Reduced-motion, safe mode, and the master switch zero the geometry
+        // kinds exactly like the RFC-0002 set.
+        let reduced = AnimationPolicy {
+            reduced_motion: ReducedMotionMode::Always,
+            ..AnimationPolicy::default()
+        };
+        let safe = AnimationPolicy {
+            safe_mode: true,
+            ..AnimationPolicy::default()
+        };
+        let disabled = AnimationPolicy {
+            enabled: false,
+            ..AnimationPolicy::default()
+        };
+        for kind in [
+            AnimationKind::Move,
+            AnimationKind::Resize,
+            AnimationKind::Drag,
+        ] {
+            assert_eq!(reduced.duration(kind), Duration::ZERO);
+            assert_eq!(safe.duration(kind), Duration::ZERO);
+            assert_eq!(disabled.duration(kind), Duration::ZERO);
+        }
+    }
+
+    #[test]
     fn policy_honors_disabled_reduced_and_safe() {
         let disabled = AnimationPolicy {
             enabled: false,
@@ -449,13 +538,13 @@ mod tests {
         assert_eq!(reduced.duration(AnimationKind::Open), Duration::ZERO);
         assert!(!reduced.animates(AnimationKind::Open));
         let instant = AnimationPolicy {
-            duration_ms: [0, 0, 0, 0],
+            duration_ms: [0; AnimationKind::COUNT],
             ..AnimationPolicy::default()
         };
         assert!(!instant.animates(AnimationKind::Open));
         // Hostile duration is clamped defensively to the RFC-0002 ceiling.
         let hostile = AnimationPolicy {
-            duration_ms: [u32::MAX, u32::MAX, u32::MAX, u32::MAX],
+            duration_ms: [u32::MAX; AnimationKind::COUNT],
             ..AnimationPolicy::default()
         };
         assert_eq!(
@@ -566,5 +655,38 @@ mod tests {
         assert!(anim.next_deadline(now).is_some());
         let p = anim.progress(AnimationKind::Workspace, None, now);
         assert_eq!(p, Some(0.0));
+    }
+
+    #[test]
+    fn move_resize_drag_trigger_progress_and_complete() {
+        // CTX-0967: the geometry kinds share the bounded tracker contract —
+        // distinct slots per kind on one surface, restart on repeat, eased
+        // progress, and zero wakeups after the longest configured duration
+        // (move/drag 150 ms outlast resize 120 ms).
+        let now = t0();
+        let mut anim = PanelAnimator::new(AnimationPolicy::default());
+        let view = ViewId::new(9);
+        assert!(anim.trigger(AnimationKind::Move, Some(view), now));
+        assert!(anim.trigger(AnimationKind::Resize, Some(view), now));
+        assert!(anim.trigger(AnimationKind::Drag, Some(view), now));
+        assert_eq!(anim.active_count(now), 3);
+        // A repeat trigger restarts the same slot instead of accumulating.
+        assert!(anim.trigger(AnimationKind::Move, Some(view), now));
+        assert_eq!(anim.active_count(now), 3);
+        let mid = now + Duration::from_millis(60);
+        for kind in [
+            AnimationKind::Move,
+            AnimationKind::Resize,
+            AnimationKind::Drag,
+        ] {
+            let p = anim
+                .progress(kind, Some(view), mid)
+                .expect("mid-transition progress");
+            assert!((0.0..1.0).contains(&p), "{kind:?} mid progress {p}");
+        }
+        let end = now + Duration::from_millis(150);
+        assert!(!anim.is_active(end));
+        assert_eq!(anim.next_deadline(end), None);
+        assert!(anim.tick(end));
     }
 }

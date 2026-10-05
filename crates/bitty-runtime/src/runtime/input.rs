@@ -1251,7 +1251,9 @@ impl Runtime {
         }
         // CTX-0260: an active Alt+drag consumes motion (it moves the
         // grabbed float; selection/hover/capture-motion all stay out).
-        if self.update_alt_drag(pos) {
+        // CTX-0967: the virtual clock flows through so the armed drag
+        // transition shares the tick's time base.
+        if self.update_alt_drag_at(pos, now) {
             self.clear_hover_pending();
             return;
         }
@@ -1265,7 +1267,7 @@ impl Runtime {
         // Issue #1348: an active border drag consumes motion (it adjusts
         // the grabbed split ratio live; selection/hover/capture-motion all
         // stay out).
-        if self.update_border_drag(pos) {
+        if self.update_border_drag_at(pos, now) {
             self.clear_hover_pending();
             return;
         }

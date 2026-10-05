@@ -429,7 +429,10 @@ impl Runtime {
     /// Called once per present before the idle short-circuit. Open/close are
     /// derived from the View-set delta (a new View fades in, a removed one
     /// fades out through a retained [`ClosingFrame`]); focus from the focused
-    /// View change; workspace from the active index change. The first frame
+    /// View change; workspace from the active index change. Move/resize/drag
+    /// (CTX-0967) are NOT detected here — a move or resize keeps the same
+    /// `View` set, so those paths trigger their transition directly at the
+    /// gesture site. The first frame
     /// after startup arms nothing so a fresh window does not animate its
     /// initial layout. Presentation-only: allocates no terminal state and is
     /// bounded by the View count (itself bounded by the layout).

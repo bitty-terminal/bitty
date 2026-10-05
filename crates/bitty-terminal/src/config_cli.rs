@@ -987,6 +987,18 @@ pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                         e.animations.duration_ms.workspace.to_string(),
                     ),
                     (
+                        "appearance.animations.duration_ms.move",
+                        e.animations.duration_ms.r#move.to_string(),
+                    ),
+                    (
+                        "appearance.animations.duration_ms.resize",
+                        e.animations.duration_ms.resize.to_string(),
+                    ),
+                    (
+                        "appearance.animations.duration_ms.drag",
+                        e.animations.duration_ms.drag.to_string(),
+                    ),
+                    (
                         "appearance.animations.easing.open",
                         e.animations.easing.open.as_str().to_string(),
                     ),
@@ -1001,6 +1013,18 @@ pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                     (
                         "appearance.animations.easing.workspace",
                         e.animations.easing.workspace.as_str().to_string(),
+                    ),
+                    (
+                        "appearance.animations.easing.move",
+                        e.animations.easing.r#move.as_str().to_string(),
+                    ),
+                    (
+                        "appearance.animations.easing.resize",
+                        e.animations.easing.resize.as_str().to_string(),
+                    ),
+                    (
+                        "appearance.animations.easing.drag",
+                        e.animations.easing.drag.as_str().to_string(),
                     ),
                 ] {
                     println!("{}", check_row(field, value, &src(field)));
@@ -1570,7 +1594,7 @@ fn clamp_in_depth<T: Ord + Copy + std::fmt::Display>(
 }
 
 /// Maps the resolved `bitty-config` animation contract onto the runtime
-/// policy (RFC-0002, CTX-0341).
+/// policy (RFC-0002, CTX-0341; CTX-0967 adds the move/resize/drag leaves).
 ///
 /// Durations are clamped defensively to the accepted `0..=500` ms hard bound
 /// (already enforced fail-closed by `bitty-config`), and `spring` easings are
@@ -1602,12 +1626,18 @@ fn animation_policy_from_effective(
             clamped(effective.animations.duration_ms.close),
             clamped(effective.animations.duration_ms.focus),
             clamped(effective.animations.duration_ms.workspace),
+            clamped(effective.animations.duration_ms.r#move),
+            clamped(effective.animations.duration_ms.resize),
+            clamped(effective.animations.duration_ms.drag),
         ],
         curves: [
             map_curve(effective.animations.easing.open),
             map_curve(effective.animations.easing.close),
             map_curve(effective.animations.easing.focus),
             map_curve(effective.animations.easing.workspace),
+            map_curve(effective.animations.easing.r#move),
+            map_curve(effective.animations.easing.resize),
+            map_curve(effective.animations.easing.drag),
         ],
         reduced_motion: reduced,
         safe_mode: false,

@@ -1434,9 +1434,8 @@ impl Runtime {
     /// `width * height` allocation (first in solver order on ties), or
     /// `None` for an empty layout. `NewPanel` callers in
     /// [`PanelLayoutMode::BisectLargest`] split this target (not the
-    /// focused leaf); move-to-workspace and float-to-tiled restore always
-    /// use this target regardless of [`PanelLayoutMode`] (it is their
-    /// default). The axis for the target comes from
+    /// focused leaf); move-to-workspace uses this target regardless of
+    /// [`PanelLayoutMode`]. The axis for the target comes from
     /// [`bitty_ui::bisect_split_axis`] (raw `width >= height`).
     #[must_use]
     pub fn panel_bisect_target(&self) -> Option<ViewId> {
@@ -1464,8 +1463,8 @@ impl Runtime {
     /// - `Dwindle`: Hyprland-style dwindle (always Right or Bottom, `place_new_first = false`).
     /// - `BisectLargest` (CTX-0964, #1698): always Right or Down
     ///   (`place_new_first = false`); the fresh pane goes after the bisected
-    ///   largest-area panel. Move-to-workspace and float-to-tiled restore
-    ///   share this placement regardless of mode.
+    ///   largest-area panel. Move-to-workspace also uses this placement
+    ///   regardless of mode.
     #[must_use]
     pub fn panel_split_place_new_first(&self) -> bool {
         match self.panel_layout_mode {

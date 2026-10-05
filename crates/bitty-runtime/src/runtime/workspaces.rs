@@ -1235,8 +1235,7 @@ impl Runtime {
     ///   leaf splits right when `width >= height`, else down, and the moved
     ///   leaf goes after it; an empty target becomes the moved leaf) and its
     ///   focus moves to the moved window; the source focus falls back to its
-    ///   first remaining leaf. The bisect placement is the default for this
-    ///   move and for float-to-tiled restore reinsertions regardless of
+    ///   first remaining leaf. This move bisects regardless of
     ///   [`PanelLayoutMode`](crate::PanelLayoutMode) (which only controls
     ///   `NewPanel`); it never splits the whole workspace root in half.
     ///   Pane sessions stay keyed globally by [`ViewId`](bitty_ui::ViewId)
@@ -1246,9 +1245,7 @@ impl Runtime {
     ///
     /// Float-to-tiled note: [`bitty_ui::toggle_floating`] from `Floating` to
     /// `Tiled` stamps the mode only (the solver ignores it), so the prior
-    /// allocation restores exactly with no insertion; any out-of-tree float
-    /// reinsertion must reuse the same
-    /// [`bisect_choice`](bitty_ui::bisect_choice) default.
+    /// allocation restores exactly with no insertion or bisect placement.
     pub fn workspace_move_focused_to(&mut self, index: usize) -> Result<ViewId, String> {
         if index >= self.workspaces.len() {
             return Err(format!("no such workspace ws:{}", index.saturating_add(1)));
@@ -1321,9 +1318,7 @@ impl Runtime {
         // slot (first in solver order on ties) and the axis is raw
         // `width >= height` ([`bitty_ui::bisect_split_axis`], no 2.0
         // cell-aspect correction); the moved pane goes after it (right or
-        // down). The same bisect choice is the default for float-to-tiled
-        // restore reinsertions (see below): neither path ever splits the
-        // whole workspace root in half.
+        // down). This move never splits the whole workspace root in half.
         // Insert into the target slot (inactive by the early return above).
         let target_slot = self
             .workspaces

@@ -789,18 +789,17 @@ pub struct RuntimeConfig {
     /// `PanelLayoutMode::Dwindle` opts into Hyprland-style dwindle (always Right or Down).
     /// `PanelLayoutMode::BisectLargest` (CTX-0964, #1698) bisects the
     /// largest-area panel with a raw `width >= height` axis (no
-    /// cell-aspect correction). Move-to-workspace and float-to-tiled
-    /// restore always use this bisect placement regardless of this setting
-    /// (it is their default); this field only controls `NewPanel`.
+    /// cell-aspect correction). Move-to-workspace uses this placement
+    /// regardless of this setting; this field only controls `NewPanel`.
     pub panel_layout_mode: PanelLayoutMode,
 }
 
 /// Layout mode for adaptive panel creation (`NewPanel` / `Mod+N`).
 ///
 /// `Spiral` stays the default for `NewPanel` so existing keymap behavior is
-/// unchanged; `BisectLargest` opts into largest-panel bisection there while
-/// move-to-workspace and float-to-tiled restore always bisect (their
-/// default) independent of this setting (CTX-0964, #1698).
+/// unchanged; `BisectLargest` opts into largest-panel bisection for
+/// `NewPanel`. Move-to-workspace also bisects independently of this setting
+/// (CTX-0964, #1698).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PanelLayoutMode {
     /// 4-way clockwise spiral: Right -> Down -> Left -> Up.

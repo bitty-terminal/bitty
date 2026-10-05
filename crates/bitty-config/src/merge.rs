@@ -641,10 +641,16 @@ const ATTRIBUTED_FIELDS: &[&str] = &[
     "appearance.animations.duration_ms.close",
     "appearance.animations.duration_ms.focus",
     "appearance.animations.duration_ms.workspace",
+    "appearance.animations.duration_ms.move",
+    "appearance.animations.duration_ms.resize",
+    "appearance.animations.duration_ms.drag",
     "appearance.animations.easing.open",
     "appearance.animations.easing.close",
     "appearance.animations.easing.focus",
     "appearance.animations.easing.workspace",
+    "appearance.animations.easing.move",
+    "appearance.animations.easing.resize",
+    "appearance.animations.easing.drag",
     "appearance.animations",
     "appearance",
     "keymaps",
@@ -5302,6 +5308,23 @@ mod tests {
         assert_eq!(
             merged
                 .source_of("appearance.animations.duration_ms.close")
+                .unwrap()
+                .layer,
+            LayerKind::CoreDefaults
+        );
+        // CTX-0967 CodeRabbit PR 1709: untouched geometry leaves attribute
+        // to CoreDefaults too (resize duration / move easing are declared
+        // by nobody in this stack).
+        assert_eq!(
+            merged
+                .source_of("appearance.animations.duration_ms.resize")
+                .unwrap()
+                .layer,
+            LayerKind::CoreDefaults
+        );
+        assert_eq!(
+            merged
+                .source_of("appearance.animations.easing.move")
                 .unwrap()
                 .layer,
             LayerKind::CoreDefaults

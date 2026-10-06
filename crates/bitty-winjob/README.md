@@ -9,7 +9,9 @@
 
 `bitty-winjob` is the narrow, reviewed Win32 Job Object adapter behind the
 Windows owned-process-tree backend in `bitty-pty` (CTX-0903, DEC-0083). It
-creates kill-on-close Job Objects, assigns processes, terminates whole
+creates kill-on-close Job Objects — plus detached ones without the limit
+so detached and service trees outlive this process (CTX-0997, DEC-0102) —,
+assigns processes, terminates whole
 jobs, observes member exit without reaping, resumes children created
 suspended, and spawns ConPTY children directly into a job at creation
 (CTX-0978, DEC-0101). See `src/lib.rs` for the public surface.

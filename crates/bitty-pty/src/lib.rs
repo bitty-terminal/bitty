@@ -129,5 +129,6 @@ pub use reader::READ_CHUNK_SIZE;
 pub use tree::LeaderExit;
 pub use tree::OwnedTree;
 pub use tree::TreeBackend;
+pub use tree::TreeLifetime;
 pub use tree::TreeSignal;
 pub use writer::PtyWriter;

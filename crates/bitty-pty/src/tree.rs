@@ -48,11 +48,14 @@
 //! - Unix: a member that moves itself into another group or session
 //!   (`setsid`, `setpgid`) leaves the tree; only cgroups (Linux) would keep
 //!   it, and they are not used for the tree here.
-//! - Windows: the Job Object is kill-on-close and its only handle belongs
-//!   to this process, so every live tree — detached and service jobs
-//!   included — dies when this process exits or crashes. Unix process
-//!   groups outlive their parent; this lifetime divergence is documented,
-//!   not resolved, here.
+//! - Windows: a kill-on-close Job Object's only handle belongs to this
+//!   process, so an [`TreeLifetime::Owned`] tree dies with it. Detached and
+//!   service jobs instead adopt with [`TreeLifetime::Detached`], whose job
+//!   carries no kill-on-close limit and outlives this process exactly like
+//!   Unix process groups do (DEC-0102, #1580); an explicit tree kill still
+//!   ends either flavour. On Unix the lifetime is a mechanism no-op
+//!   (process groups always outlive their parent); the supervisor's
+//!   bookkeeping, not the mechanism, differs there.
 //!
 //! # Pairing rule
 //!
@@ -164,6 +167,40 @@ impl TreeSignal {
     }
 }
 
+/// How long a tree lives relative to this process (DEC-0102, #1580).
+///
+/// Only the Windows backend reads it: [`TreeLifetime::Owned`] selects a
+/// kill-on-close Job Object, [`TreeLifetime::Detached`] one without the
+/// limit. On Unix it is accepted and ignored — process groups outlive
+/// their parent however they were adopted — so callers pass the same value
+/// on every platform and never branch on `target_os`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum TreeLifetime {
+    /// The tree dies with this process (kill-on-close on Windows).
+    #[default]
+    Owned,
+    /// The tree outlives this process (no kill-on-close limit on Windows).
+    /// Detached-lifetime and service jobs adopt with this.
+    Detached,
+}
+
+impl TreeLifetime {
+    /// Stable lowercase wire/display name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Owned => "owned",
+            Self::Detached => "detached",
+        }
+    }
+}
+
+impl fmt::Display for TreeLifetime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// How a tree's leader ended, observed without reaping it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LeaderExit {
@@ -250,6 +287,23 @@ impl OwnedTree {
     ///
     /// As [`OwnedTree::adopt`], plus the resume error on Windows.
     pub fn adopt_prepared(leader: u32) -> io::Result<Self> {
+        Self::adopt_prepared_with_lifetime(leader, TreeLifetime::Owned)
+    }
+
+    /// Takes over the tree led by `leader`, a child spawned from a command
+    /// prepared with [`OwnedTree::prepare_command`], with the given
+    /// [`TreeLifetime`].
+    ///
+    /// Detached-lifetime and service jobs adopt with
+    /// [`TreeLifetime::Detached`] so the tree outlives this process on
+    /// Windows (DEC-0102); every other lifetime uses
+    /// [`TreeLifetime::Owned`].
+    ///
+    /// # Errors
+    ///
+    /// As [`OwnedTree::adopt_with_lifetime`], plus the resume error on
+    /// Windows.
+    pub fn adopt_prepared_with_lifetime(leader: u32, lifetime: TreeLifetime) -> io::Result<Self> {
         #[cfg(windows)]
         {
             if leader == 0 {
@@ -258,11 +312,11 @@ impl OwnedTree {
             Ok(Self {
                 leader,
                 retired: Mutex::new(false),
-                observer: imp::Observer::arm_prepared(leader)?,
+                observer: imp::Observer::arm_prepared(leader, lifetime)?,
             })
         }
         #[cfg(not(windows))]
-        Self::adopt(leader)
+        Self::adopt_with_lifetime(leader, lifetime)
     }
 
     /// Assembles the tree for a ConPTY child born inside `job` at creation
@@ -304,13 +358,27 @@ impl OwnedTree {
     /// pid 0 or a pid outside the platform range, and the observer's
     /// arming error otherwise.
     pub fn adopt(leader: u32) -> io::Result<Self> {
+        Self::adopt_with_lifetime(leader, TreeLifetime::Owned)
+    }
+
+    /// Takes over the tree led by `leader` with the given [`TreeLifetime`].
+    ///
+    /// Same contract as [`OwnedTree::adopt`], except a
+    /// [`TreeLifetime::Detached`] tree outlives this process on Windows
+    /// instead of dying with it (DEC-0102). Detached-lifetime and service
+    /// jobs adopt with `Detached`; every other lifetime uses `Owned`.
+    ///
+    /// # Errors
+    ///
+    /// As [`OwnedTree::adopt`].
+    pub fn adopt_with_lifetime(leader: u32, lifetime: TreeLifetime) -> io::Result<Self> {
         if leader == 0 {
             return Err(zero_leader());
         }
         Ok(Self {
             leader,
             retired: Mutex::new(false),
-            observer: imp::Observer::arm(leader)?,
+            observer: imp::Observer::arm(leader, lifetime)?,
         })
     }
 
@@ -440,6 +508,13 @@ mod tests {
         assert_eq!(TreeSignal::Interrupt.as_str(), "interrupt");
         assert_eq!(TreeSignal::Terminate.as_str(), "terminate");
         assert_eq!(TreeSignal::Kill.as_str(), "kill");
+        assert_eq!(TreeLifetime::Owned.as_str(), "owned");
+        assert_eq!(TreeLifetime::Detached.as_str(), "detached");
+    }
+
+    #[test]
+    fn owned_is_the_default_lifetime() {
+        assert_eq!(TreeLifetime::default(), TreeLifetime::Owned);
     }
 
     #[test]

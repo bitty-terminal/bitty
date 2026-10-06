@@ -1,5 +1,6 @@
 //! `bitty-winjob`: the narrow, reviewed Win32 Job Object adapter behind
-//! Bitty's Windows owned-process-tree backend (CTX-0903, DEC-0083).
+//! Bitty's Windows owned-process-tree backend (CTX-0903, DEC-0083;
+//! detached lifetime CTX-0997, DEC-0102).
 //!
 //! This crate is to Windows what `rustix` (Linux) and `nix` (macOS) are to
 //! `bitty-pty`'s owned-tree backends: the one place system calls are made,
@@ -10,12 +11,14 @@
 //!
 //! # Surface (Windows only)
 //!
-//! - [`JobObject`]: an anonymous job created with
-//!   `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. [`JobObject::assign_pid`] adds a
-//!   process (its later descendants join automatically) and returns a
+//! - [`JobObject`]: an anonymous job, kill-on-close by default
+//!   (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`). [`JobObject::assign_pid`] adds
+//!   a process (its later descendants join automatically) and returns a
 //!   [`JobMember`] for non-reaping exit observation;
-//!   [`JobObject::terminate`] ends every member; dropping the job closes
-//!   its only handle, which makes the kernel kill every remaining member.
+//!   [`JobObject::terminate`] ends every member; dropping a kill-on-close
+//!   job closes its only handle, which makes the kernel kill every
+//!   remaining member. [`JobObject::new_detached`] skips the limit so
+//!   detached and service trees outlive this process (DEC-0102).
 //! - [`resume_suspended_process`]: resumes a process created with
 //!   [`CREATE_SUSPENDED_FLAG`], so a caller can assign it to a job before
 //!   it runs a single instruction (no descendant can escape the job).

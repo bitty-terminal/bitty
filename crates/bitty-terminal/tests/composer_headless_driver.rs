@@ -39,7 +39,32 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use bitty_lua::gate::{VmBudgets, build_plugin_vm};
-use bitty_lua::{BridgeError, HostServices, LuaValue, LuaVm, MarshallingLimits};
+use bitty_lua::{
+    BridgeError, HostServices, LuaValue, LuaVm, MarshallingLimits, RC1_WALL_CLOCK_BUDGET_MS,
+};
+
+// ---------------------------------------------------------------------------
+// Driver wall-clock budget (bitty#1727, CTX-1000)
+// ---------------------------------------------------------------------------
+
+/// Test-local wall-clock budget for the harness VM in milliseconds.
+///
+/// Decision (bitty#1727): widen, do not retry or exempt. The driver loads the
+/// real 924-line composer `init.lua` through `execute_bounded`, which enforces
+/// the per-chunk RC-1 wall budget. Production keeps
+/// `RC1_WALL_CLOCK_BUDGET_MS` (50ms); the driver previously reused that
+/// default and suspended at 61-62ms (`WallClockExceeded`) under sharded CI
+/// load (QG2 shard 2/2). Wall time is load-sensitive, not
+/// correctness-sensitive: compile plus first execution of a large chunk
+/// deschedules under parallel `nextest` shards. Retry-on-suspend would need a
+/// fresh VM per attempt and stays flaky under sustained load; exempting the
+/// driver from sharded profiles would hide coverage. A fixed 10x headroom
+/// (500ms) keeps the chunk bounded (infinite loops still suspend via the
+/// unchanged instruction budget or this wall cap) while absorbing scheduler
+/// stalls. Budget enforcement itself stays pinned by
+/// `bitty-lua/tests/measurement_lua.rs` and `load_gate.rs`, which keep the
+/// 50ms production assertions.
+const DRIVER_WALL_BUDGET_MS: u64 = 10 * RC1_WALL_CLOCK_BUDGET_MS;
 
 // ---------------------------------------------------------------------------
 // Scratch and fixture location (no hardcoded host paths)
@@ -229,8 +254,15 @@ impl HostServices for DriverServices {
 }
 
 fn harness_vm(services: Rc<DriverServices>) -> LuaVm {
-    let mut vm = build_plugin_vm("composer-headless-driver", Some(VmBudgets::default()))
-        .expect("default budgets are valid");
+    // Load headroom only: instruction and memory stay at RC defaults so the
+    // driver still proves policy under production-adjacent budgets. Wall is
+    // the sole load-sensitive dimension (bitty#1727).
+    let budgets = VmBudgets {
+        wall_budget_ms: DRIVER_WALL_BUDGET_MS,
+        ..VmBudgets::default()
+    };
+    let mut vm = build_plugin_vm("composer-headless-driver", Some(budgets))
+        .expect("driver budgets are valid");
     let host: Rc<dyn HostServices> = services;
     vm.install_host_module(host, MarshallingLimits::default(), 50)
         .expect("install host");

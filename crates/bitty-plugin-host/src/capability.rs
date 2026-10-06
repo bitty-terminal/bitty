@@ -389,9 +389,31 @@ fn is_high_risk(head: &str) -> bool {
 }
 
 /// Human-readable effect statement for consent dialogs (plain language).
+///
+/// CTX-0916 S3 (DEC-0102): the Core-seeded default delegates to
+/// [`effect_statement_with`] with [`CapabilityCatalog::core`], so existing
+/// callers keep byte-identical behavior while extension-aware callers pass an
+/// explicit catalog.
 #[must_use]
 pub fn effect_statement(id: &CapabilityId) -> &'static str {
-    match id.as_str().split(':').next().unwrap_or(id.as_str()) {
+    effect_statement_with(&CapabilityCatalog::core(), id)
+}
+
+/// Catalog-scoped effect statement sharing the Core-owned presentation strings
+/// with [`effect_statement`] (CTX-0916 S3, DEC-0102).
+///
+/// Head membership comes from `catalog`: heads unknown to the catalog fall
+/// back to `"Requested capability"`. Presentation strings stay Core-owned, so
+/// extension heads in known families also fall back until an RFC assigns them
+/// wording. With [`CapabilityCatalog::core`] the result equals
+/// [`effect_statement`].
+#[must_use]
+pub fn effect_statement_with(catalog: &CapabilityCatalog, id: &CapabilityId) -> &'static str {
+    let head = id.as_str().split(':').next().unwrap_or(id.as_str());
+    if !catalog.contains_head(head) {
+        return "Requested capability";
+    }
+    match head {
         "terminal.semantic-read" => "Read structured terminal content (bounded snapshot)",
         "terminal.raw-read" => "Read raw terminal bytes and full cell grid (high-risk)",
         "terminal.input.self" => "Observe input directed to this plugin's own terminals",
@@ -453,12 +475,13 @@ pub fn effect_statement(id: &CapabilityId) -> &'static str {
 
 /// Canonical closed-identifier validation (CR-PKG-03 export).
 ///
-/// The closed tables live in `bitty_package::manifest` (the leaf crate; a
-/// package-to-host dependency would be a dependency cycle), so this validator
-/// delegates head membership and parameter-presence rules to
-/// [`bitty_package::manifest::check_closed_capability`] while keeping the
-/// host's error vocabulary. `bitty-package` manifest validation calls the same
-/// canonical check, so an identifier accepted at manifest (lock) time is
+/// The closed tables are Core-owned in `bitty_package` (the leaf crate; a
+/// package-to-host dependency would be a dependency cycle). CTX-0916 S3
+/// (DEC-0102): the Core-seeded default delegates to
+/// [`validate_closed_capability_with`] with [`CapabilityCatalog::core`], so
+/// existing callers keep byte-identical behavior while extension-aware callers
+/// pass an explicit catalog. `bitty-package` manifest validation calls the
+/// same Core seed, so an identifier accepted at manifest (lock) time is
 /// accepted at install (grant) time and vice versa.
 pub fn validate_closed_capability(
     head: &str,
@@ -469,8 +492,12 @@ pub fn validate_closed_capability(
 }
 
 /// Catalog-scoped closed-identifier validation sharing the host error
-/// vocabulary with [`validate_closed_capability`].
-fn validate_closed_capability_with(
+/// vocabulary with [`validate_closed_capability`] (CTX-0916 S3, DEC-0102).
+///
+/// Only closed-set membership and parameter presence come from `catalog`.
+/// With [`CapabilityCatalog::core`] the result equals
+/// [`validate_closed_capability`].
+pub fn validate_closed_capability_with(
     catalog: &CapabilityCatalog,
     head: &str,
     has_param: bool,
@@ -978,5 +1005,152 @@ mod tests {
             .expect("extension family registers");
         assert!(CapabilityId::parse_with(&catalog, "acme.widget").is_err());
         assert!(bitty_package::CapabilityId::parse_with(&catalog, "acme.widget").is_ok());
+    }
+
+    #[test]
+    fn static_paths_delegate_to_core_catalog() {
+        // CTX-0916 S3 (DEC-0102): the static entry points delegate to the
+        // Core catalog seed, so both paths must agree byte-identically on
+        // every identifier. No family additions or removals: the closed
+        // `CapabilityFamily` vocabulary is untouched.
+        use bitty_package::manifest as package_manifest;
+
+        let core = CapabilityCatalog::core();
+        for head in package_manifest::CLOSED_CAPABILITY_HEADS {
+            let requires_param = package_manifest::capability_requires_param(head);
+            let raw = if requires_param {
+                format!("{head}:param")
+            } else {
+                (*head).to_string()
+            };
+            // Closed-set validation: full Result equality (shared helper and
+            // shared host error vocabulary, not just is_ok).
+            assert_eq!(
+                validate_closed_capability(head, requires_param, &raw),
+                validate_closed_capability_with(&core, head, requires_param, &raw),
+                "validate diverged for '{raw}'"
+            );
+            // Effect statements: identical wording through the Core seed.
+            let id = CapabilityId::parse(&raw).expect("closed head must parse");
+            assert_eq!(
+                effect_statement(&id),
+                effect_statement_with(&core, &id),
+                "effect diverged for '{raw}'"
+            );
+        }
+
+        // Rejections agree with identical messages on both paths.
+        for (head, has_param, raw) in [
+            ("terminal.unknown-thing", false, "terminal.unknown-thing"),
+            ("ui.unknown", false, "ui.unknown"),
+            ("fs.read", false, "fs.read"),
+            ("env.read", false, "env.read"),
+            ("network.connect", false, "network.connect"),
+            ("mcp.invoke", false, "mcp.invoke"),
+            (
+                "terminal.semantic-read",
+                true,
+                "terminal.semantic-read:extra",
+            ),
+            ("ui.rich", true, "ui.rich:something"),
+            ("ai.provider", true, "ai.provider:extra"),
+        ] {
+            assert_eq!(
+                validate_closed_capability(head, has_param, raw),
+                validate_closed_capability_with(&core, head, has_param, raw),
+                "validate rejection diverged for '{raw}'"
+            );
+            assert!(validate_closed_capability(head, has_param, raw).is_err());
+        }
+    }
+
+    #[test]
+    fn extension_heads_route_through_catalog() {
+        // CTX-0916 S3 (DEC-0102): extension heads registered in known
+        // families validate identically through the extended catalog on the
+        // validate path, while the Core-seeded statics still fail closed and
+        // a fresh Core seed is unaffected. Effect wording for extension heads
+        // falls back until an RFC assigns it; the Core seed is byte-identical.
+        let mut extended = CapabilityCatalog::core();
+        extended
+            .register("panel", &[("panel.custom-view", false)])
+            .expect("panel extension registers");
+        extended
+            .register("fs", &[("fs.archive-read", true)])
+            .expect("fs extension registers");
+
+        // Parameter-free extension head: accepted bare, rejected with param.
+        assert!(
+            validate_closed_capability("panel.custom-view", false, "panel.custom-view").is_err()
+        );
+        assert!(
+            validate_closed_capability_with(
+                &extended,
+                "panel.custom-view",
+                false,
+                "panel.custom-view"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_closed_capability_with(
+                &extended,
+                "panel.custom-view",
+                true,
+                "panel.custom-view:param"
+            )
+            .is_err()
+        );
+        let granted =
+            CapabilityId::parse_with(&extended, "panel.custom-view").expect("extended head parses");
+        assert_eq!(
+            effect_statement_with(&extended, &granted),
+            "Requested capability"
+        );
+
+        // Parameter-requiring extension head: accepted with param, rejected bare.
+        assert!(
+            validate_closed_capability_with(
+                &extended,
+                "fs.archive-read",
+                true,
+                "fs.archive-read:scope-1"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_closed_capability_with(&extended, "fs.archive-read", false, "fs.archive-read")
+                .is_err()
+        );
+        assert!(CapabilityId::parse_with(&extended, "fs.archive-read:scope-1").is_ok());
+        assert!(CapabilityId::parse_with(&extended, "fs.archive-read").is_err());
+
+        // Core-seeded statics still fail closed on extension heads.
+        assert!(CapabilityId::parse("panel.custom-view").is_err());
+        assert!(CapabilityId::parse("fs.archive-read:scope-1").is_err());
+
+        // A fresh Core seed is unaffected by the extension.
+        let fresh = CapabilityCatalog::core();
+        assert!(
+            validate_closed_capability_with(
+                &fresh,
+                "panel.custom-view",
+                false,
+                "panel.custom-view"
+            )
+            .is_err()
+        );
+        assert!(CapabilityId::parse_with(&fresh, "panel.custom-view").is_err());
+        assert_eq!(
+            effect_statement_with(&fresh, &granted),
+            "Requested capability"
+        );
+
+        // Core heads keep their wording through both paths.
+        let core_id = CapabilityId::parse("fs.read:~/docs/*.md").expect("core head must parse");
+        assert_eq!(
+            effect_statement(&core_id),
+            effect_statement_with(&extended, &core_id)
+        );
     }
 }

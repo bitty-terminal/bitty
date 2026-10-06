@@ -239,7 +239,10 @@ impl DragMoveSession {
 
     /// Advisory live preview: hit-tests `point` against `tree` allocations
     /// and records the hovered leaf. Returns the hovered leaf, or `None`
-    /// when the point lands on background. Never mutates the tree.
+    /// when the point lands on background or over a floating overlay
+    /// (issue #1710: overlay-tier leaves are never tiled drop targets, so
+    /// hovering one clears the preview instead of tier-flipping on
+    /// release). Never mutates the tree.
     pub fn preview(
         &mut self,
         tree: &LayoutNode,
@@ -247,7 +250,7 @@ impl DragMoveSession {
         gaps: Gaps,
         point: Point,
     ) -> Option<ViewId> {
-        let hit = tree.hit_test_leaf(bounds, gaps, point);
+        let hit = tiled_drop_target(tree, bounds, gaps, point);
         self.preview = hit;
         hit
     }
@@ -293,11 +296,33 @@ impl DragMoveSession {
     }
 }
 
+/// Tiled drop target for `point`: the hit-tested leaf unless it lives on
+/// a floating overlay tier (issue #1710, CTX-0995).
+///
+/// `hit_test_leaf` can return an overlay leaf when a floating overlay
+/// covers a base-layout gap; routing that into `reparent_leaf` would insert
+/// the tiled source into the overlay subtree and tier-flip it to floating.
+/// Overlay-tier hits are background for tiled moves, so both
+/// [`DragMoveSession::preview`] and [`drop_spec_for_point`] route through
+/// here. Tiled (tier-less) targets pass through unchanged.
+fn tiled_drop_target(tree: &LayoutNode, bounds: Rect, gaps: Gaps, point: Point) -> Option<ViewId> {
+    let target = tree.hit_test_leaf(bounds, gaps, point)?;
+    let is_overlay = tree
+        .leaf_overlay_tiers()
+        .into_iter()
+        .any(|(leaf, tier)| leaf == target && tier.is_some());
+    if is_overlay {
+        return None;
+    }
+    Some(target)
+}
+
 /// Computes Hyprland-like drop placement for a Mod+drag release
-/// (issue #1694, CTX-0966).
+/// (issue #1694, CTX-0966; overlay guard issue #1710).
 ///
 /// Hit-tests `point` against `tree` allocations; returns `None` when the
-/// point lands on background or on `source` itself (self-drop no-op).
+/// point lands on background, over a floating overlay, or on `source`
+/// itself (self-drop no-op).
 /// Otherwise docks beside the hovered target with position-based sizing:
 /// the edge nearest the drop point wins (left/right dock horizontally,
 /// top/bottom vertically), and the split ratio follows the drop position
@@ -316,7 +341,7 @@ pub fn drop_spec_for_point(
     source: ViewId,
     point: Point,
 ) -> Option<DropSpec> {
-    let target = tree.hit_test_leaf(bounds, gaps, point)?;
+    let target = tiled_drop_target(tree, bounds, gaps, point)?;
     if target == source {
         return None;
     }
@@ -1216,5 +1241,52 @@ mod tests {
         assert_eq!(spec.axis, SplitAxis::Horizontal, "tie prefers side-by-side");
         assert!(!spec.after, "tie prefers first (left)");
         assert!((spec.ratio - 0.5).abs() < 1e-6);
+    }
+
+    // -- Issue #1710 (CTX-0995) overlay-tier drop guard ------------------
+
+    fn overlay_over_gap() -> (LayoutNode, Rect, Gaps) {
+        // Base two-pane split with an inner gap band; the floating overlay
+        // covers the gap so a point in the band hit-tests to the overlay
+        // leaf (3) instead of background.
+        let base = pair();
+        let overlay = LayoutNode::overlay(base, leaf(3), Rect::new(38, 0, 4, 24));
+        (overlay, Rect::new(0, 0, 80, 24), Gaps::new(2, 0))
+    }
+
+    #[test]
+    fn drop_spec_over_overlay_is_none() {
+        let (tree, bounds, gaps) = overlay_over_gap();
+        // Sanity: the gap point really hits the overlay leaf before the
+        // tiled guard runs.
+        assert_eq!(
+            tree.hit_test_leaf(bounds, gaps, Point::new(40, 12)),
+            Some(ViewId::new(3))
+        );
+        assert_eq!(
+            drop_spec_for_point(&tree, bounds, gaps, ViewId::new(1), Point::new(40, 12)),
+            None,
+            "drop over a floating overlay must not tier-flip the tiled source"
+        );
+        // Tiled targets still dock.
+        assert!(
+            drop_spec_for_point(&tree, bounds, gaps, ViewId::new(1), Point::new(60, 12)).is_some()
+        );
+    }
+
+    #[test]
+    fn preview_over_overlay_clears_instead_of_targeting_float() {
+        let (tree, bounds, gaps) = overlay_over_gap();
+        let mut session = DragMoveSession::start(ViewId::new(1), true).expect("start");
+        assert_eq!(
+            session.preview(&tree, bounds, gaps, Point::new(40, 12)),
+            None,
+            "overlay hover must clear the advisory preview"
+        );
+        assert_eq!(session.preview_target(), None);
+        assert_eq!(
+            session.preview(&tree, bounds, gaps, Point::new(60, 12)),
+            Some(ViewId::new(2))
+        );
     }
 }

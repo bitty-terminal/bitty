@@ -972,19 +972,33 @@ impl Runtime {
         // CTX-0566: any tracking mode + any encoding (X10 default, UTF-8
         // 1005, SGR 1006, urxvt 1015) captures; the encoding only frames
         // the bytes.
-        let focused_modes = self.focused_modes();
-        let capture = !shift_override
-            && focused_modes.mouse_tracking.is_some()
-            && self.should_capture_mouse();
+        let (capture_tracking, capture_encoding) = {
+            let focused_modes = self.focused_modes();
+            (
+                focused_modes.mouse_tracking.is_some(),
+                focused_modes.mouse_coordinate_encoding,
+            )
+        };
+        let capture = !shift_override && capture_tracking && self.should_capture_mouse();
 
         if capture {
+            // Issue #1710 (CTX-0995): an active Mod tiled-drag owns its
+            // terminating left release even when the focused app enabled
+            // mouse tracking mid-drag. End it here (committing the
+            // Hyprland-like drop when valid) instead of reporting the
+            // release to the app and stranding the gesture: the app never
+            // saw the grabbing press, so the release is not its event.
+            if event.button == MouseButton::Left
+                && event.state == PressState::Released
+                && self.end_tiled_drag()
+            {
+                return;
+            }
             if let Some(pos) = self.last_cursor {
                 // CTX-0804 (#1477): pane-local cell of the focused pane that
                 // receives the report, never the primary-global mapping.
                 let cell = self.mouse_report_cell(pos);
-                let format = super::mouse_encode::MouseFormat::from_encoding(
-                    focused_modes.mouse_coordinate_encoding,
-                );
+                let format = super::mouse_encode::MouseFormat::from_encoding(capture_encoding);
                 let report = super::mouse_encode::MouseReport {
                     button: mouse_button_code(event.button),
                     modifiers: self.mouse_modifier_bits(),

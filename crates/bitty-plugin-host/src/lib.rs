@@ -83,15 +83,14 @@
 //! ([`effective::authorize_with_role`]), and the credential exclusive-or
 //! order is enforced by [`credential_ref::resolve_choice`] at the call
 //! boundary where two references meet, with actual resolution on the
-//! provider-schema surface
-//! ([`provider_credential::ProviderCredentialConfig`]).
+//! provider-schema surface in `bitty-ai` (`ProviderCredentialConfig`).
 //!
 //! | Open question | Module | Adopted shape |
 //! |---------------|--------|-----------------|
 //! | OQ-085 trust levels + capability domains | `trust_levels` | [`trust_levels::TrustLevel`] levels 0–4, [`trust_levels::CapabilityDomain`] admission sets narrowing with level, mapping onto accepted [`capability::CapabilityFamily`] only; [`trust_levels::TrustLevel::check_family`] enforced by [`effective::authorize_with_trust`] |
 //! | OQ-084 ontology/identity | `identity` | [`identity::EntityKind`] ten first-class kinds, [`identity::OntologyId`] `kind:value` identifiers, [`identity::Ownership`] links plus [`identity::Lifetime`] |
 //! | OQ-055 secret-storage tiers | `secret_tiers` | [`secret_tiers::SecretTier`] four tiers with per-tier [`secret_tiers::TierPolicy`] (consent/audit/redaction); [`secret_tiers::CommandRef`] resolved by [`secret_tiers::execute_command_ref`] (shell-free, bounded); [`secret_tiers::KeyringBackend`] selection plus [`secret_tiers::RotationPolicy`]; [`secret_tiers::check_tier_access`] enforced at the resolve boundary |
-//! | OQ-054 `api_key_env` vs `api_key_cmd` | `credential_ref` + `provider_credential` | [`credential_ref::CredentialRef`] env/cmd references (names only), [`credential_ref::resolve_precedence`] exclusive-or order plus [`credential_ref::resolve_choice`] call-boundary enforcement, [`credential_ref::check_project_override`] narrow-only boundary; [`provider_credential::ProviderCredentialConfig`] schema surface with [`provider_credential::resolve_provider_credential`] (CTX-0916 S5 move; deprecated shim in `credential_ref` for one release) |
+//! | OQ-054 `api_key_env` vs `api_key_cmd` | `credential_ref` | [`credential_ref::CredentialRef`] env/cmd references (names only), [`credential_ref::resolve_precedence`] exclusive-or order plus [`credential_ref::resolve_choice`] call-boundary enforcement, [`credential_ref::check_project_override`] narrow-only boundary; provider-schema surface lives in `bitty-ai` (`ProviderCredentialConfig`, staged in Core in S5, removed in S7) |
 //! | OQ-057 role contract | `roles` | [`roles::AgentRole`] Commander/Implementer/Tester/Reviewer, [`roles::EnforcementPoint`] checks (incl. [`roles::EnforcementPoint::for_request_kind`]), per-role dispatch fan-out/depth ceilings ([`roles::AgentRole::check_dispatch`]) enforced by [`effective::delegate_with_role`], prompt-text denial ([`roles::deny_prompt_authority`]), [`roles::SandboxDecl`] posture checked against [`roles::SandboxRestrictions`] ([`roles::AgentRole::check_sandbox_exec`]), capability ceilings ([`roles::AgentRole::capability_ceiling`] Core defaults plus [`roles::RoleCeilingCatalog`] S5 contributions, intersected opt-in by [`effective::authorize_with_role_and_ceilings`]) with grants elsewhere; [`roles::AgentRole::check_request`] enforced by [`effective::authorize_with_role`] |
 //!
 //! # Drop policy — DropOldest accepted default for v1 (OQ-013 closed decision point)
@@ -157,7 +156,6 @@ pub mod install;
 pub mod lifecycle;
 pub mod manifest;
 pub mod origin;
-pub mod provider_credential;
 pub mod registry;
 pub mod roles;
 pub mod secret_tiers;
@@ -243,10 +241,6 @@ pub use manifest::{
 pub use origin::{
     DetectedOrigin, OriginOverride, OriginPolicy, OriginSignals, classify_origin,
     resolve_origin_policy,
-};
-pub use provider_credential::{
-    MAX_CREDENTIAL_CMD_OUTPUT_BYTES, ProviderCredentialConfig, check_provider_override,
-    execute_credential_cmd, resolve_provider_credential, resolve_provider_credential_live,
 };
 pub use registry::{Generation, PluginState, Registry, RegistryEntry, check_command_equivalence};
 pub use roles::{

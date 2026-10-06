@@ -9,10 +9,10 @@
 //! boundary ([`check_project_override`]).
 //!
 //! The provider-schema surface built on these references
-//! ([`crate::provider_credential::ProviderCredentialConfig`] with actual
-//! resolution) moved to [`crate::provider_credential`] in CTX-0916 S5; this
-//! module keeps a deprecated re-export shim for one release (removed in
-//! S7). New callers import from there (or the crate root), never from here.
+//! (`ProviderCredentialConfig` with actual resolution) was staged in Core
+//! in CTX-0916 S5 and moved to its canonical home in `bitty-ai` in S6
+//! (removed from Core in S7). New callers import from `bitty-ai`, never
+//! from here.
 //!
 //! A [`CredentialRef`] names *where* a credential comes from without
 //! carrying a value, and [`resolve_precedence`] decides *which*
@@ -44,60 +44,6 @@ pub const MAX_CREDENTIAL_CMD_PART_BYTES: usize = 256;
 
 /// Maximum arguments in one [`CredentialRef::Cmd`].
 pub const MAX_CREDENTIAL_CMD_ARGS: usize = 16;
-
-// ── deprecated S5 shim (CTX-0916, removed in S7) ────────────────────────────
-//
-// The provider-schema surface moved to [`crate::provider_credential`] in S5.
-// These re-exports keep the previous import path working for one release;
-// new callers import from there (or the crate root) instead.
-
-/// Deprecated shim: import [`crate::provider_credential::ProviderCredentialConfig`] instead.
-///
-/// Removed in CTX-0916 S7.
-#[deprecated(
-    note = "moved to `crate::provider_credential::ProviderCredentialConfig`; the shim is removed in CTX-0916 S7"
-)]
-pub use crate::provider_credential::ProviderCredentialConfig;
-
-/// Deprecated shim: import [`crate::provider_credential::check_provider_override`] instead.
-///
-/// Removed in CTX-0916 S7.
-#[deprecated(
-    note = "moved to `crate::provider_credential::check_provider_override`; the shim is removed in CTX-0916 S7"
-)]
-pub use crate::provider_credential::check_provider_override;
-
-/// Deprecated shim: import [`crate::provider_credential::resolve_provider_credential`] instead.
-///
-/// Removed in CTX-0916 S7.
-#[deprecated(
-    note = "moved to `crate::provider_credential::resolve_provider_credential`; the shim is removed in CTX-0916 S7"
-)]
-pub use crate::provider_credential::resolve_provider_credential;
-
-/// Deprecated shim: import [`crate::provider_credential::resolve_provider_credential_live`] instead.
-///
-/// Removed in CTX-0916 S7.
-#[deprecated(
-    note = "moved to `crate::provider_credential::resolve_provider_credential_live`; the shim is removed in CTX-0916 S7"
-)]
-pub use crate::provider_credential::resolve_provider_credential_live;
-
-/// Deprecated shim: import [`crate::provider_credential::execute_credential_cmd`] instead.
-///
-/// Removed in CTX-0916 S7.
-#[deprecated(
-    note = "moved to `crate::provider_credential::execute_credential_cmd`; the shim is removed in CTX-0916 S7"
-)]
-pub use crate::provider_credential::execute_credential_cmd;
-
-/// Deprecated shim: import [`crate::provider_credential::MAX_CREDENTIAL_CMD_OUTPUT_BYTES`] instead.
-///
-/// Removed in CTX-0916 S7.
-#[deprecated(
-    note = "moved to `crate::provider_credential::MAX_CREDENTIAL_CMD_OUTPUT_BYTES`; the shim is removed in CTX-0916 S7"
-)]
-pub use crate::provider_credential::MAX_CREDENTIAL_CMD_OUTPUT_BYTES;
 
 // ── credential reference ──────────────────────────────────────────────────
 
@@ -281,10 +227,8 @@ pub const fn resolve_precedence(env_set: bool, cmd_set: bool) -> CredentialPrece
 /// denies fail-closed with a grant error naming both references (names only —
 /// references carry no values, so there is nothing to redact), and neither
 /// present resolves to no credential. No environment is read and no command
-/// runs here; the winner's resolution is
-/// [`crate::provider_credential::resolve_provider_credential`]
-/// on the provider-schema surface
-/// ([`crate::provider_credential::ProviderCredentialConfig`]).
+/// runs here; the winner's resolution is the provider-schema surface
+/// (`ProviderCredentialConfig` in `bitty-ai`).
 pub fn resolve_choice(
     env: Option<&CredentialRef>,
     cmd: Option<&CredentialRef>,
@@ -451,37 +395,5 @@ mod tests {
                 Err(_) => assert_eq!(precedence, CredentialPrecedence::Conflict),
             }
         }
-    }
-
-    #[test]
-    #[allow(deprecated)]
-    fn deprecated_shim_matches_canonical_path() {
-        // CTX-0916 S5 (DEC-0100): the deprecated shim names exactly the
-        // canonical moved type, so old-path construction, display, and
-        // resolution behave identically until S7 removes the shim.
-        use crate::provider_credential::{
-            ProviderCredentialConfig as Canonical, resolve_provider_credential as canonical_resolve,
-        };
-        use std::collections::BTreeMap;
-
-        let env = CredentialRef::from_env("SHIM_KEY").expect("valid env");
-        let via_shim = ProviderCredentialConfig::new(Some(env.clone()), None).expect("valid");
-        let via_canonical = Canonical::new(Some(env), None).expect("valid");
-        // Same type: a shim value binds directly to a canonical binding.
-        let canonical: Canonical = via_shim.clone();
-        assert_eq!(canonical, via_canonical);
-        assert_eq!(via_shim.to_string(), via_canonical.to_string());
-        assert_eq!(via_shim.source(), via_canonical.source());
-
-        let mut vars = BTreeMap::new();
-        vars.insert("SHIM_KEY".to_string(), "shim-value".to_string());
-        assert_eq!(
-            super::resolve_provider_credential(&via_shim, |v| vars.get(v).cloned()),
-            canonical_resolve(&via_canonical, |v| vars.get(v).cloned()),
-        );
-        assert_eq!(
-            super::MAX_CREDENTIAL_CMD_OUTPUT_BYTES,
-            crate::provider_credential::MAX_CREDENTIAL_CMD_OUTPUT_BYTES
-        );
     }
 }

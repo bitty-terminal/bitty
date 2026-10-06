@@ -421,29 +421,49 @@ mod tests {
 
     #[test]
     fn register_adds_new_family_without_changing_static_paths() {
+        // CTX-0916 S4 (DEC-0102): the AI families are the canonical additive
+        // example — `ai.*`/`mcp.*`/`agent.*` validate ONLY through an
+        // explicitly extended catalog (Core-only installs reject them
+        // fail-closed; the static paths below still do).
         let mut catalog = CapabilityCatalog::core();
+        assert!(!catalog.contains_family("ai"));
         catalog
-            .register("acme", &[("acme.widget", false), ("acme.store", true)])
+            .register("ai", &[("ai.provider", false), ("ai.model", false)])
+            .unwrap();
+        catalog.register("mcp", &[("mcp.invoke", true)]).unwrap();
+        catalog
+            .register("agent", &[("agent.memory", true)])
             .unwrap();
 
-        assert!(catalog.contains_family("acme"));
-        assert!(catalog.contains_head("acme.widget"));
-        assert_eq!(catalog.requires_param("acme.store"), Some(true));
+        assert!(catalog.contains_family("ai"));
+        assert!(catalog.contains_family("mcp"));
+        assert!(catalog.contains_family("agent"));
+        assert!(catalog.contains_head("ai.provider"));
+        assert_eq!(catalog.requires_param("mcp.invoke"), Some(true));
+        assert_eq!(catalog.requires_param("agent.memory"), Some(true));
 
         // New heads validate through the extended catalog ...
-        assert!(CapabilityId::parse_with(&catalog, "acme.widget").is_ok());
-        assert!(CapabilityId::parse_with(&catalog, "acme.store:record-1").is_ok());
-        assert!(CapabilityId::parse_with(&catalog, "acme.store").is_err());
-        assert!(CapabilityId::parse_with(&catalog, "acme.widget:param").is_err());
+        assert!(CapabilityId::parse_with(&catalog, "ai.provider").is_ok());
+        assert!(CapabilityId::parse_with(&catalog, "ai.model").is_ok());
+        assert!(CapabilityId::parse_with(&catalog, "mcp.invoke:mail.list").is_ok());
+        assert!(CapabilityId::parse_with(&catalog, "agent.memory:record-1").is_ok());
+        assert!(CapabilityId::parse_with(&catalog, "mcp.invoke").is_err());
+        assert!(CapabilityId::parse_with(&catalog, "agent.memory").is_err());
+        assert!(CapabilityId::parse_with(&catalog, "ai.provider:param").is_err());
 
         // ... but the static paths still fail closed on them.
-        assert!(CapabilityId::new("acme.widget").is_err());
-        assert!(check_closed_capability("acme.widget", false).is_err());
+        assert!(CapabilityId::new("ai.provider").is_err());
+        assert!(CapabilityId::new("mcp.invoke:mail.list").is_err());
+        assert!(CapabilityId::new("agent.memory:record-1").is_err());
+        assert!(check_closed_capability("ai.provider", false).is_err());
+        assert!(check_closed_capability("mcp.invoke", true).is_err());
 
         // A fresh Core seed is unaffected by the extension.
         let fresh = CapabilityCatalog::core();
-        assert!(!fresh.contains_family("acme"));
-        assert!(!fresh.contains_head("acme.widget"));
+        assert!(!fresh.contains_family("ai"));
+        assert!(!fresh.contains_family("mcp"));
+        assert!(!fresh.contains_family("agent"));
+        assert!(!fresh.contains_head("ai.provider"));
     }
 
     #[test]
@@ -452,16 +472,12 @@ mod tests {
         let before = catalog.clone();
 
         // Re-registering a Core head is a duplicate, never an overwrite ...
-        let err = catalog
-            .register("agent", &[("agent.memory", true)])
-            .unwrap_err();
+        let err = catalog.register("fs", &[("fs.read", true)]).unwrap_err();
         assert!(matches!(err, PackageError::Duplicate { .. }));
         // ... even when the parameter rule disagrees (no silent merge).
-        let err = catalog
-            .register("agent", &[("agent.memory", false)])
-            .unwrap_err();
+        let err = catalog.register("fs", &[("fs.read", false)]).unwrap_err();
         assert!(matches!(err, PackageError::Duplicate { .. }));
-        assert_eq!(catalog.requires_param("agent.memory"), Some(true));
+        assert_eq!(catalog.requires_param("fs.read"), Some(true));
 
         // Duplicates within one call are rejected before any mutation.
         let err = catalog

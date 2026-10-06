@@ -1899,3 +1899,104 @@ fn debug_defaults_fail_closed_without_backend() {
         );
     }
 }
+
+/// Recording fs backend for the `bitty.fs` UTF-8 boundary test.
+struct FsRecordingServices {
+    store: RefCell<BTreeMap<String, LuaValue>>,
+    writes: RefCell<Vec<(String, String, bool)>>,
+}
+
+impl HostServices for FsRecordingServices {
+    fn store_get(&self, key: &str) -> Result<Option<LuaValue>, BridgeError> {
+        Ok(self.store.borrow().get(key).cloned())
+    }
+
+    fn store_set(&self, key: &str, value: LuaValue) -> Result<(), BridgeError> {
+        self.store.borrow_mut().insert(key.to_string(), value);
+        Ok(())
+    }
+
+    fn settings_get(&self, _key: &str) -> Result<Option<LuaValue>, BridgeError> {
+        Ok(None)
+    }
+
+    fn terminal_snapshot(&self, _scope: &str) -> Result<LuaValue, BridgeError> {
+        Err(BridgeError::capability_denied("terminal.semantic-read"))
+    }
+
+    fn notify_show(&self, _payload: &LuaValue) -> Result<bool, BridgeError> {
+        Err(BridgeError::capability_denied("platform.notify"))
+    }
+
+    fn fs_write(&self, path: &str, content: &str, append: bool) -> Result<LuaValue, BridgeError> {
+        self.writes
+            .borrow_mut()
+            .push((path.to_string(), content.to_string(), append));
+        Ok(LuaValue::Nil)
+    }
+}
+
+#[test]
+fn fs_bridge_rejects_non_utf8_without_touching_files() {
+    // Lua strings are byte strings: `\255` builds a non-UTF-8 byte at
+    // runtime while the chunk source stays valid UTF-8. The bridge must
+    // fail closed with `E_DEF_INVALID` before any grant check or write —
+    // never persist U+FFFD replacements under a success receipt.
+    let services = Rc::new(FsRecordingServices {
+        store: RefCell::new(BTreeMap::new()),
+        writes: RefCell::new(Vec::new()),
+    });
+    let mut vm = gate_vm("fs-utf8");
+    let services_dyn: Rc<dyn HostServices> = services.clone();
+    vm.install_host_module(services_dyn, MarshallingLimits::default(), 50)
+        .expect("install");
+    for (call, field) in [
+        (
+            "bitty.fs.write(\"~/docs/out/a.txt\", \"a\\255b\")",
+            "fs.write content",
+        ),
+        (
+            "bitty.fs.write(\"~/docs/\\255ut.txt\", \"hello\")",
+            "fs.write path",
+        ),
+        ("bitty.fs.read(\"~/docs/\\255ut.txt\")", "fs.read path"),
+        ("bitty.fs.list(\"~/docs/\\255\")", "fs.list prefix"),
+    ] {
+        services.store.borrow_mut().remove("code");
+        let chunk = format!(
+            "local ok, err = pcall(function() return {call} end)\n\
+             bitty.store.set(\"code\", ok and \"OK\" or err.code)"
+        );
+        let outcome = vm.execute_bounded(&chunk).expect("execute");
+        assert!(
+            matches!(outcome, BoundedExecution::Completed),
+            "{field}: chunk must complete via pcall: {outcome:?}"
+        );
+        assert_eq!(
+            services.store.borrow().get("code"),
+            Some(&LuaValue::String("E_DEF_INVALID".to_string())),
+            "{field}: typed denial"
+        );
+    }
+    assert!(
+        services.writes.borrow().is_empty(),
+        "denied calls must never reach the backend: {:?}",
+        services.writes.borrow()
+    );
+    // Valid UTF-8 still flows through to the backend (no over-rejection).
+    let outcome = vm
+        .execute_bounded(
+            "local ok, err = pcall(function() return bitty.fs.write(\"~/docs/out/ok.txt\", \"hello\") end)\n\
+             bitty.store.set(\"code\", ok and \"OK\" or err.code)",
+        )
+        .expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        services.store.borrow().get("code"),
+        Some(&LuaValue::String("OK".to_string()))
+    );
+    assert_eq!(services.writes.borrow().len(), 1);
+}

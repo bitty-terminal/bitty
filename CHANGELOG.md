@@ -196,11 +196,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   kill-only: `signal_as(Interrupt | Terminate)` and a `CancelMode::Graceful`
   cancel resolve to a typed `Unsupported`, never a single-pid kill; a
   `CancelMode::GracefulThenKill` cancel skips its grace periods and kills
-  the tree immediately. Lifetime divergence: the job is kill-on-close and
-  its handle belongs to the bitty process, so on Windows every live job,
-  detached and service jobs included, dies when bitty exits or crashes,
-  while Unix process groups outlive it (documented, not changed; open
-  decision). The Win32 FFI lives in the new `bitty-winjob` crate, the
+  the tree immediately. Lifetime (DEC-0102, #1580, CTX-0997): owned trees
+  stay kill-on-close, so they still die when bitty exits or crashes, while
+  detached-lifetime and service jobs adopt through `TreeLifetime::Detached`
+  (`OwnedTree::adopt_with_lifetime` / `adopt_prepared_with_lifetime`,
+  `JobObject::new_detached`) into a job without the limit, so they outlive
+  bitty exactly like Unix process groups; an explicit kill still ends
+  either flavour. The Win32 FFI lives in the new `bitty-winjob` crate, the
   second audited `unsafe` allowance (`specifications/unsafe-ffi-audit.md`);
   `bitty-pty` stays `forbid(unsafe_code)`.
   Release order: `bitty-pty` is no longer a dependency-free leaf on Windows

@@ -1,9 +1,10 @@
 //! Windows owned-tree backend: Job Objects (CTX-0903, DEC-0083; CTX-0978,
 //! DEC-0101).
 //!
-//! Adoption creates an anonymous kill-on-close Job Object through the
-//! reviewed `bitty-winjob` adapter and assigns the leader to it. Every
-//! process the leader creates afterwards joins the same job, and the job
+//! Adoption creates an anonymous Job Object through the reviewed
+//! `bitty-winjob` adapter and assigns the leader to it: kill-on-close for
+//! [`TreeLifetime::Owned`] trees, without the limit for
+//! [`TreeLifetime::Detached`] ones (DEC-0102). Every process the leader creates afterwards joins the same job, and the job
 //! never sets `JOB_OBJECT_LIMIT_BREAKAWAY_OK`, so `CREATE_BREAKAWAY_FROM_JOB`
 //! cannot take a descendant out: the job, not a process group, is the
 //! owned tree.
@@ -37,7 +38,7 @@ use std::io;
 
 use bitty_winjob::{JobMember, JobObject};
 
-use super::{LeaderExit, TreeBackend, TreeSignal};
+use super::{LeaderExit, TreeBackend, TreeLifetime, TreeSignal};
 
 pub(super) const BACKEND: TreeBackend = TreeBackend::JobObject;
 
@@ -52,18 +53,21 @@ const UNRESUMABLE_EXIT_CODE: u32 = 1;
 
 /// The job that owns the tree plus the leader's observation handle.
 ///
-/// Dropping it closes the job's only handle, which kills whatever is still
-/// in the job (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`).
+/// An [`TreeLifetime::Owned`] job is kill-on-close: dropping it closes the
+/// job's only handle, which kills whatever is still in the job
+/// (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`).
 ///
-/// # Lifetime divergence from Unix (documented, not changed here)
+/// # Lifetime (DEC-0102, #1580)
 ///
-/// The job handle is owned by this process. When this process exits or
-/// crashes, the kernel closes the handle and kill-on-close terminates every
-/// live job tree, **including jobs declared detached or service lifetime**.
-/// Unix process groups outlive their parent, so the same jobs keep running
-/// there. A Windows job therefore never outlives the process that adopted
-/// it; whether detached jobs need a different mechanism is an open
-/// decision tracked separately.
+/// Detached-lifetime and service jobs must outlive the bitty process, like
+/// Unix process groups do, so they adopt with [`TreeLifetime::Detached`]:
+/// the job carries no kill-on-close limit and dropping it leaves its
+/// members running as plain OS orphans (Phase 2 reconciliation reports them
+/// `Unknown` until reaped or adopted). An explicit [`TreeSignal::Kill`]
+/// still ends either flavour through `TerminateJobObject`. No supervisor
+/// handoff exists in v0.1 to hold the handle instead, and accepting the
+/// divergence would contradict the declared `Detached`
+/// continue-under-the-supervisor semantics.
 pub(super) struct Observer {
     job: JobObject,
     leader: JobMember,
@@ -76,24 +80,29 @@ impl Observer {
         Self { job, leader }
     }
 
-    /// Assigns an already-running non-PTY `leader` to a new job. Never pass
-    /// a `CREATE_SUSPENDED` child here: nothing would resume it. Never pass
-    /// a PTY child either: its tree travels with the `Pty` handle.
-    pub(super) fn arm(leader: u32) -> io::Result<Self> {
-        let job = JobObject::new()?;
+    /// Assigns an already-running non-PTY `leader` to a new job with the
+    /// given [`TreeLifetime`]. Never pass a `CREATE_SUSPENDED` child here:
+    /// nothing would resume it. Never pass a PTY child either: its tree
+    /// travels with the `Pty` handle.
+    pub(super) fn arm(leader: u32, lifetime: TreeLifetime) -> io::Result<Self> {
+        let job = match lifetime {
+            TreeLifetime::Owned => JobObject::new()?,
+            TreeLifetime::Detached => JobObject::new_detached()?,
+        };
         let leader = job.assign_pid(leader)?;
         Ok(Self { job, leader })
     }
 
-    /// Assigns a `CREATE_SUSPENDED` `leader` to a new job, then resumes it.
+    /// Assigns a `CREATE_SUSPENDED` `leader` to a new job with the given
+    /// [`TreeLifetime`], then resumes it.
     ///
     /// The resume runs on every path. When the assignment fails the child is
     /// still resumed and the assignment error returned, so the caller keeps
     /// direct-child semantics over a running child. When the resume fails
     /// the child can never run: it is terminated (through the job when one
     /// exists, else directly) and the resume error returned.
-    pub(super) fn arm_prepared(leader: u32) -> io::Result<Self> {
-        let armed = Self::arm(leader);
+    pub(super) fn arm_prepared(leader: u32, lifetime: TreeLifetime) -> io::Result<Self> {
+        let armed = Self::arm(leader, lifetime);
         if let Err(resume) = bitty_winjob::resume_suspended_process(leader) {
             match &armed {
                 Ok(observer) => {

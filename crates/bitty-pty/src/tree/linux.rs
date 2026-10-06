@@ -16,7 +16,7 @@ use rustix::process::{
     Pid, PidfdFlags, Signal, WaitId, WaitIdOptions, getpgrp, kill_process_group, pidfd_open, waitid,
 };
 
-use super::{LeaderExit, TreeBackend, TreeSignal};
+use super::{LeaderExit, TreeBackend, TreeLifetime, TreeSignal};
 
 pub(super) const BACKEND: TreeBackend = TreeBackend::ProcessGroupPidfd;
 
@@ -27,7 +27,10 @@ pub(super) struct Observer {
 }
 
 impl Observer {
-    pub(super) fn arm(leader: u32) -> io::Result<Self> {
+    /// Arms the observer. The [`TreeLifetime`] is a mechanism no-op here:
+    /// process groups outlive their parent however they were adopted.
+    pub(super) fn arm(leader: u32, lifetime: TreeLifetime) -> io::Result<Self> {
+        let _ = lifetime;
         let pid = to_pid(leader)?;
         // Any pidfd failure keeps the exact pid-scoped fallback: this process
         // is the leader's parent and alone decides when it is reaped.

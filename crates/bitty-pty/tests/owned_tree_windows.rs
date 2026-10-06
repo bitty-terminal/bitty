@@ -12,6 +12,9 @@
 //! tree) and forks its grandchild as its first act; the tree kill must take
 //! a grandchild that predates any adopt call — there is no adopt call left.
 //!
+//! CTX-0997 (DEC-0102): detached trees additionally prove they outlive the
+//! job handle close, while an explicit kill still ends them.
+//!
 //! Every wait is bounded by a named constant; nothing blocks unbounded.
 
 #![cfg(windows)]
@@ -21,7 +24,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use bitty_pty::{LeaderExit, OwnedTree, PtyBuilder, TreeBackend, TreeSignal};
+use bitty_pty::{LeaderExit, OwnedTree, PtyBuilder, TreeBackend, TreeLifetime, TreeSignal};
 use bitty_test_support::require_pty;
 
 const HELPER_ENV: &str = "__BITTY_OWNED_TREE_WINDOWS_HELPER";
@@ -88,6 +91,12 @@ fn helper_command(mode: &str) -> Command {
 
 /// Spawns a prepared helper leader and adopts its tree.
 fn spawn_tree(mode: &str) -> (Child, OwnedTree) {
+    spawn_tree_with_lifetime(mode, TreeLifetime::Owned)
+}
+
+/// Spawns a prepared helper leader and adopts its tree with the given
+/// [`TreeLifetime`].
+fn spawn_tree_with_lifetime(mode: &str, lifetime: TreeLifetime) -> (Child, OwnedTree) {
     let mut command = helper_command(mode);
     command
         .stdin(Stdio::null())
@@ -95,7 +104,8 @@ fn spawn_tree(mode: &str) -> (Child, OwnedTree) {
         .stderr(Stdio::null());
     OwnedTree::prepare_command(&mut command);
     let child = command.spawn().expect("spawn helper");
-    let tree = OwnedTree::adopt_prepared(child.id()).expect("adopt the prepared tree");
+    let tree = OwnedTree::adopt_prepared_with_lifetime(child.id(), lifetime)
+        .expect("adopt the prepared tree");
     (child, tree)
 }
 
@@ -270,6 +280,40 @@ fn dropping_the_tree_kills_what_is_left() {
         !running(grandchild)
     });
     let _ = child.wait();
+}
+
+/// How long a detached tree must outlive its dropped handle before the
+/// probe: kill-on-close acts on the close itself, so surviving this window
+/// proves the job carries no such limit.
+const SURVIVE_WINDOW: Duration = Duration::from_secs(2);
+
+#[test]
+fn a_detached_tree_survives_its_handle_close() {
+    let (mut child, tree) = spawn_tree_with_lifetime("fork", TreeLifetime::Detached);
+    let leader = child.id();
+    let grandchild = read_grandchild(&mut child);
+    drop(tree);
+    std::thread::sleep(SURVIVE_WINDOW);
+    assert!(
+        running(leader),
+        "the detached leader outlives the job handle"
+    );
+    assert!(
+        running(grandchild),
+        "the detached grandchild outlives the job handle"
+    );
+    // The job handle is gone by design, so cleanup is per-pid. The leader
+    // stays pinned by the unreaped `Child`; the grandchild has no pin left,
+    // so it carries the same documented recycling caveat as `running`.
+    bitty_winjob::terminate_process(leader, TREE_KILL_EXIT_CODE as u32)
+        .expect("terminate the leader");
+    bitty_winjob::terminate_process(grandchild, TREE_KILL_EXIT_CODE as u32)
+        .expect("terminate the grandchild");
+    wait_until("the detached members to die", || {
+        !running(leader) && !running(grandchild)
+    });
+    let status = child.wait().expect("reap");
+    assert_eq!(status.code(), Some(TREE_KILL_EXIT_CODE));
 }
 
 #[test]

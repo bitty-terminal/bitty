@@ -141,6 +141,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dated ADR-0004/ADR-0012 revision recording the new `bitty-storage` git
   source (see `deny.toml`).
 
+- **Canonical observability contract (CTX-0981, #1649, W-110):** the
+  transitional CTX-0926 mirrors in `crates/bitty-terminal/src/observability.rs`
+  are deleted and Core verifies over the canonical `bitty-observability-api`
+  contract instead: bound, capability, gate, and version types are imported,
+  never redefined, with Core-owned aliases pinning the exact values (literal
+  plus canonical parity asserts, so upstream drift fails tests). Core retains
+  only the minimal mechanism — `redact_text_for_stderr` emission, emission
+  bounds, capability verification (`can_attach_external_observer` plus the
+  `main` default-deny pins), and the safe-mode-clean demo-pump gate — with
+  byte-identical behavior. The application wiring crate (`bitty-terminal`)
+  is the only crate linking the extracted API (exact rev `7b3bb74`,
+  zero dependencies, no network, no filesystem); default builds link no
+  exporters, metrics pipeline, or tracing runtime. Field-level record
+  redaction lives in `bitty-observability-core` (`redact_observation` /
+  `redact_payload`) and is tested there; the staged Core record path
+  (`REDACTED_MARKER`, `is_sensitive_field_name`, `bound_text`,
+  `redact_value_for_field`) is removed with no producer depending on it.
+  Parity evidence: the ten `observability::tests` stay green (including the
+  new canonical-`subscribe` agreement pin), seeded-secret stderr redaction
+  and safe-mode pins hold, and the `main` debug asserts are unchanged.
+  Follow-ups stay open: the dated ADR-0004/ADR-0012 revision recording the
+  new `bitty-observability` git source (see `deny.toml`), and the
+  `bitty-runtime` `plugin_runtime::debug` retirement behind the remaining
+  `W-71` removal gates.
+
 - **Native component broker (CTX-0906, #1577, DIR-030):**
   `bitty_runtime::component` resolves `<data_home>/bitty/components/<name>/`
   (developer override `BITTY_COMPONENTS_DIR`, never `PATH`), validates

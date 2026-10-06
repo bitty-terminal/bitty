@@ -167,7 +167,8 @@ pub use manifest::{
     CAPABILITY_FAMILIES, CLOSED_CAPABILITY_HEADS, CapabilityId, ClosedCapabilityViolation, Compat,
     MANIFEST_MAX_BYTES, MAX_CAPABILITIES, MAX_DEPENDENCIES, PackageDependency, PackageId,
     PackageIdentity, PackageManifest, capability_requires_param, check_closed_capability,
-    validate_closed_capability,
+    check_closed_capability_with, validate_capability_with, validate_closed_capability,
+    validate_closed_capability_with,
 };
 pub use requirement::{Comparator, ComparatorOp, MAX_REQUIREMENT_LEN, VersionReq};
 pub use resolver::{

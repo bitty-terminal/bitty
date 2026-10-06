@@ -18,8 +18,12 @@
 //!   `sha256` that must match) plus the executable; a bare `bitty-<name>`
 //!   executable takes its version from required `--version` and the protocol
 //!   range Core supports. The digest is computed, ABI compat is verified
-//!   before any mutation, and the executable is copied to
-//!   `<user>/<name>/<version>/` with an installed descriptor plus `current`.
+//!   before any mutation, and the executable is published atomically to
+//!   `<user>/<name>/<version>/` with an installed descriptor plus `current`
+//!   (each destination via temp write, fsync, and rename like the
+//!   session/KV backends; `current` only after the executable and the
+//!   descriptor are in place, so a crash mid-publish never exposes a
+//!   partial component).
 //!   Re-adding an installed version with a different digest fails. No network
 //!   fetch, no registry download: URL operands fail closed.
 //! - `remove <name> [<version>]`: remove one user-installed version, or every
@@ -59,7 +63,8 @@
 #![forbid(unsafe_code)]
 
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bitty_runtime::component::{
     COMPONENT_DESCRIPTOR_FILE, COMPONENT_EXECUTABLE_PREFIX, ComponentDescriptor,
@@ -981,6 +986,99 @@ fn read_executable(path: &Path) -> Result<Vec<u8>, ComponentFailure> {
     Ok(bytes)
 }
 
+/// Monotonic suffix for atomic-publish temp siblings of one destination.
+static PUBLISH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Unique temp sibling for an atomic publish (`<file>.tmp-<pid>-<seq>`).
+///
+/// The sibling lives in the destination directory so the final rename stays
+/// on one filesystem (atomic). Process id plus a process-global counter
+/// keeps concurrent publishers of the same path from sharing a temp file.
+fn temp_sibling_for(destination: &Path) -> PathBuf {
+    let file_name = destination.file_name().map_or_else(
+        || "component".to_owned(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let temp_name = format!(
+        "{file_name}.tmp-{}-{}",
+        std::process::id(),
+        PUBLISH_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    match destination.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(temp_name),
+        _ => PathBuf::from(temp_name),
+    }
+}
+
+/// Atomically publishes `bytes` to `destination` (temp write, fsync, rename).
+///
+/// Mirrors the session/KV backends: the parent directory is created, bytes
+/// go to a unique temp sibling in the same directory, the file is fsynced,
+/// then the temp is renamed onto the destination (atomic on one filesystem)
+/// and the parent directory is synced. On unix `mode` is applied to the temp
+/// before the rename so the published file is immediately correct; `None`
+/// keeps the default creation mode (0666 masked by umask). On any failure
+/// the temp is removed and the previous destination is left untouched, so a
+/// crash mid-publish never exposes a partial file.
+fn publish_bytes_atomic(
+    destination: &Path,
+    bytes: &[u8],
+    mode: Option<u32>,
+) -> Result<(), ComponentFailure> {
+    if let Some(parent) = destination.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                ComponentFailure::generic(format!(
+                    "bitty component: cannot create '{}': {error}",
+                    parent.display()
+                ))
+            })?;
+        }
+    }
+    let temp = temp_sibling_for(destination);
+    // A pid-reusing predecessor could have left a twin under the same name;
+    // dropping it keeps our unique temp truly ours.
+    let _ = std::fs::remove_file(&temp);
+    let outcome = (|| -> std::io::Result<()> {
+        use std::io::Write as _;
+        #[cfg(unix)]
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(mode.unwrap_or(0o666))
+                .open(&temp)?
+        };
+        #[cfg(not(unix))]
+        let mut file = {
+            let _ = mode;
+            std::fs::File::create(&temp)?
+        };
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, destination)?;
+        if let Some(parent) = destination.parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Ok(dir) = std::fs::File::open(parent) {
+                    let _ = dir.sync_all();
+                }
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = outcome {
+        let _ = std::fs::remove_file(&temp);
+        return Err(ComponentFailure::generic(format!(
+            "bitty component: cannot publish '{}': {error}",
+            destination.display()
+        )));
+    }
+    Ok(())
+}
+
 fn install_staged(staged: &StagedSource, user: &Path) -> Result<String, ComponentFailure> {
     let component_dir = user.join(&staged.name);
     let version_dir = component_dir.join(&staged.version);
@@ -1069,23 +1167,11 @@ fn install_staged(staged: &StagedSource, user: &Path) -> Result<String, Componen
             version_dir.display()
         ))
     })?;
-    std::fs::write(&executable_path, &staged.bytes).map_err(|error| {
-        ComponentFailure::generic(format!(
-            "bitty component: cannot write '{}': {error}",
-            executable_path.display()
-        ))
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&executable_path, std::fs::Permissions::from_mode(0o755))
-            .map_err(|error| {
-                ComponentFailure::generic(format!(
-                    "bitty component: cannot set mode 0755 on '{}': {error}",
-                    executable_path.display()
-                ))
-            })?;
-    }
+    // Atomic publish: each destination is written through a sibling temp
+    // file and renamed into place, so a crash mid-publish never exposes a
+    // partial executable, descriptor, or `current`. `current` is published
+    // only after the executable and descriptor are in place.
+    publish_bytes_atomic(&executable_path, &staged.bytes, Some(0o755))?;
     let descriptor_text = format!(
         "[component]\nname = \"{}\"\nversion = \"{}\"\nprotocol = [{}, {}]\nexecutable = \"{}\"\nsha256 = \"{digest}\"\n",
         staged.name, staged.version, staged.protocol_min, staged.protocol_max, staged.executable,
@@ -1096,18 +1182,12 @@ fn install_staged(staged: &StagedSource, user: &Path) -> Result<String, Componen
             "bitty component: internal error: rendered descriptor invalid: {error}"
         ))
     })?;
-    std::fs::write(&descriptor_path, descriptor_text).map_err(|error| {
-        ComponentFailure::generic(format!(
-            "bitty component: cannot write '{}': {error}",
-            descriptor_path.display()
-        ))
-    })?;
-    std::fs::write(&current_path, format!("{}\n", staged.version)).map_err(|error| {
-        ComponentFailure::generic(format!(
-            "bitty component: cannot write '{}': {error}",
-            current_path.display()
-        ))
-    })?;
+    publish_bytes_atomic(&descriptor_path, descriptor_text.as_bytes(), None)?;
+    publish_bytes_atomic(
+        &current_path,
+        format!("{}\n", staged.version).as_bytes(),
+        None,
+    )?;
     Ok(format!(
         "installed component '{}' version {} to {} (active)",
         staged.name,
@@ -1562,5 +1642,135 @@ mod tests {
             system_components_root_for(None).expect("default"),
             PathBuf::from(bitty_runtime::component::SYSTEM_COMPONENTS_DIR_DEFAULT)
         );
+    }
+
+    fn has_temp_sibling(dir: &Path) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.contains(".tmp-") || name.contains(".tmp.") {
+                return true;
+            }
+            if entry.path().is_dir() && has_temp_sibling(&entry.path()) {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn publish_leaves_no_temp_siblings() {
+        let base = scratch("atomic-no-litter");
+        let (context, _, _) = context_for(&base.join("user"), &base.join("system"));
+        let source = write_source_dir(&base.join("source"), "net", "0.0.1", "[1, 1]");
+
+        let (code, stdout) = run_with(&context, &["add", &source.display().to_string()]);
+        assert_eq!(code, EXIT_OK, "{stdout}");
+
+        let user_root = Path::new(context.components_dir.expect("user"));
+        assert!(
+            !has_temp_sibling(&user_root.join("net")),
+            "atomic publish must not leave temp siblings behind"
+        );
+        // All three destinations are fully published.
+        assert!(
+            user_root
+                .join("net")
+                .join("0.0.1")
+                .join(COMPONENT_DESCRIPTOR_FILE)
+                .is_file()
+        );
+        assert_eq!(
+            std::fs::read_to_string(user_root.join("net").join("current")).expect("current"),
+            "0.0.1\n"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let executable = user_root
+                .join("net")
+                .join("0.0.1")
+                .join(executable_file_name(&format!(
+                    "{COMPONENT_EXECUTABLE_PREFIX}net"
+                )));
+            let mode = std::fs::metadata(&executable)
+                .expect("mode")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o755, "published executable must be 0755");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn stale_temp_litter_is_invisible_to_list() {
+        let base = scratch("atomic-litter-invisible");
+        let (context, _, _) = context_for(&base.join("user"), &base.join("system"));
+        let source = write_source_dir(&base.join("source"), "net", "0.0.1", "[1, 1]");
+        let (code, stdout) = run_with(&context, &["add", &source.display().to_string()]);
+        assert_eq!(code, EXIT_OK, "{stdout}");
+
+        // Simulate crashed-publish litter: temp siblings next to each
+        // destination must never become visible to discovery.
+        let user_root = Path::new(context.components_dir.expect("user"));
+        let version_dir = user_root.join("net").join("0.0.1");
+        let executable_name = executable_file_name(&format!("{COMPONENT_EXECUTABLE_PREFIX}net"));
+        std::fs::write(
+            version_dir.join(format!("{executable_name}.tmp-999-0")),
+            b"partial-bytes",
+        )
+        .expect("litter executable");
+        std::fs::write(
+            version_dir.join(format!("{COMPONENT_DESCRIPTOR_FILE}.tmp-999-1")),
+            b"partial",
+        )
+        .expect("litter descriptor");
+        std::fs::write(user_root.join("net").join("current.tmp-999-2"), b"0.")
+            .expect("litter current");
+
+        let (code, stdout) = run_with(&context, &["list"]);
+        assert_eq!(code, EXIT_OK, "{stdout}");
+        assert!(stdout.contains("net"), "{stdout}");
+        assert!(stdout.contains("0.0.1"), "{stdout}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn readd_with_different_digest_fails_without_overwrite() {
+        let base = scratch("atomic-digest");
+        let (context, _, _) = context_for(&base.join("user"), &base.join("system"));
+        let source = write_source_dir(&base.join("source"), "net", "0.0.1", "[1, 1]");
+        let (code, stdout) = run_with(&context, &["add", &source.display().to_string()]);
+        assert_eq!(code, EXIT_OK, "{stdout}");
+
+        let user_root = Path::new(context.components_dir.expect("user"));
+        let executable_name = executable_file_name(&format!("{COMPONENT_EXECUTABLE_PREFIX}net"));
+        let installed = version_dir_bytes(&user_root.join("net").join("0.0.1"), &executable_name);
+
+        // Same name/version with different bytes: must fail closed and leave
+        // the installed executable untouched (no partial overwrite).
+        let source2 = write_source_dir(&base.join("source2"), "net", "0.0.1", "[1, 1]");
+        std::fs::write(source2.join(&executable_name), b"different-bytes").expect("mutate");
+        // Failure details go to stderr (not the captured stdout buffer), so
+        // only the exit code is asserted here; the CLI integration test
+        // below covers the diagnostic text.
+        let (code, _) = run_with(&context, &["add", &source2.display().to_string()]);
+        assert_eq!(code, EXIT_COMPONENT);
+        assert_eq!(
+            version_dir_bytes(&user_root.join("net").join("0.0.1"), &executable_name),
+            installed,
+            "failed re-add must not overwrite the installed executable"
+        );
+        assert!(
+            !has_temp_sibling(&user_root.join("net")),
+            "failed publish must not leave temp siblings behind"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn version_dir_bytes(version_dir: &Path, executable_name: &str) -> Vec<u8> {
+        std::fs::read(version_dir.join(executable_name)).expect("installed executable")
     }
 }

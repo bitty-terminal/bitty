@@ -371,3 +371,82 @@ fn component_help_and_usage_have_stable_exit_codes() {
     assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn component_add_publishes_atomically_without_temp_litter() {
+    let home = scratch_dir("atomic");
+    let system = home.join("system-components");
+    std::fs::create_dir_all(&system).expect("system dir");
+    let source = write_source_dir(&home.join("source"), "net", "0.0.1", "[1, 1]");
+    let source_display = source.display().to_string();
+
+    let output = run_in(&home, &system, &["component", "add", &source_display]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+
+    // No temp siblings survive a successful publish, at any depth.
+    let mut temps = Vec::new();
+    let mut stack = vec![user_root(&home).join("net")];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.contains(".tmp-") || name.contains(".tmp.") {
+                temps.push(entry.path());
+            } else if entry.path().is_dir() {
+                stack.push(entry.path());
+            }
+        }
+    }
+    assert!(temps.is_empty(), "temp litter survived publish: {temps:?}");
+
+    // All three destinations are fully published and executable.
+    let version_dir = user_root(&home).join("net/0.0.1");
+    assert!(version_dir.join("bitty-component.toml").is_file());
+    assert_eq!(
+        std::fs::read_to_string(user_root(&home).join("net/current")).expect("current"),
+        "0.0.1\n"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let executable = version_dir.join(format!("bitty-net{}", std::env::consts::EXE_SUFFIX));
+        let mode = std::fs::metadata(&executable)
+            .expect("mode")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755, "published executable must be 0755");
+    }
+
+    // Re-adding the same version with different bytes fails closed with the
+    // digest diagnostic and leaves the installed bytes untouched.
+    let before =
+        std::fs::read(version_dir.join(format!("bitty-net{}", std::env::consts::EXE_SUFFIX)))
+            .expect("installed bytes");
+    let source2 = write_source_dir(&home.join("source2"), "net", "0.0.1", "[1, 1]");
+    std::fs::write(
+        source2.join(format!("bitty-net{}", std::env::consts::EXE_SUFFIX)),
+        b"different-bytes",
+    )
+    .expect("mutate source");
+    let output = run_in(
+        &home,
+        &system,
+        &["component", "add", &source2.display().to_string()],
+    );
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("different digest"),
+        "{}",
+        stderr(&output)
+    );
+    let after =
+        std::fs::read(version_dir.join(format!("bitty-net{}", std::env::consts::EXE_SUFFIX)))
+            .expect("installed bytes");
+    assert_eq!(
+        before, after,
+        "failed re-add must not overwrite the install"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}

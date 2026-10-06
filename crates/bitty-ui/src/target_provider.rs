@@ -1,4 +1,4 @@
-//! Beacon target providers (UX-33 + UX-29, U-8 Beacon family).
+//! Generic target providers (UX-33 + UX-29, U-8 hint family).
 //!
 //! [`CommandBlockProvider`] exposes the semantic terminal as one provider:
 //! the terminal surface enumerates its scrollback command blocks and nothing
@@ -11,7 +11,7 @@
 //! per hint-session entry into an immutable [`TargetSnapshot`]. The
 //! compositor never polls providers per frame; a new session entry collects
 //! a new snapshot. Each collection is a new epoch: inserting an id issues a
-//! fresh [`TargetRegistry`](crate::beacon_target::TargetRegistry)
+//! fresh [`TargetRegistry`](crate::targeting::TargetRegistry)
 //! generation, so handles captured by an older snapshot resolve
 //! [`ProviderError::StaleSnapshot`] — fail closed, never refreshed in place.
 //! There is deliberately no `refresh`/`poll` API on [`TargetSnapshot`].
@@ -40,10 +40,10 @@
 
 #![forbid(unsafe_code)]
 
-use crate::beacon_target::{
+use crate::panel::PanelId;
+use crate::targeting::{
     CommandBlockId, LinkId, TargetError, TargetRef, TargetRegistry, WorkspaceId,
 };
-use crate::panel::PanelId;
 use crate::uitree::UiNodeId;
 
 /// Capability that gates target-provider registration.
@@ -52,6 +52,10 @@ use crate::uitree::UiNodeId;
 /// mediator takes an explicit grant flag instead of depending on the plugin
 /// host. The Core terminal provider enters through
 /// [`ProviderMediator::with_core`], which carries the grant internally.
+///
+/// The wire value is retained verbatim for compatibility (W-29 provisional
+/// surface stays out of v1 per the plugin SDK); only the surrounding
+/// mechanism names are generic.
 pub const TARGET_PROVIDER_CAPABILITY: &str = "beacon.target-provider";
 
 /// Reserved provider name for the Core semantic-terminal provider.
@@ -64,8 +68,8 @@ pub const MAX_TARGET_PROVIDER_NAME_LEN: usize = 32;
 pub const MAX_TARGET_PROVIDERS: usize = 64;
 
 /// Maximum targets per cold-path snapshot. Aligns with
-/// [`crate::beacon_target::MAX_TARGETS_PER_KIND`] and
-/// [`crate::beacon_dispatch::MAX_BEACON_BINDINGS`]: a snapshot never feeds
+/// [`crate::targeting::MAX_TARGETS_PER_KIND`] and
+/// [`crate::target_dispatch::MAX_TARGET_BINDINGS`]: a snapshot never feeds
 /// more than the downstream tables hold.
 pub const MAX_SNAPSHOT_TARGETS: usize = 1024;
 
@@ -327,7 +331,7 @@ pub fn validate_provider_name(name: &str, tier: ProviderTier) -> Result<(), Prov
 // Provider trait
 // ---------------------------------------------------------------------------
 
-/// Pure enumeration of beacon targets for one trust tier.
+/// Pure enumeration of targets for one trust tier.
 ///
 /// `collect` is a pure function of provider state: no registry handle, no
 /// I/O, no wall-clock. Same state yields the same offers; nondeterminism is

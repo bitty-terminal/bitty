@@ -1,22 +1,22 @@
-//! Beacon annotation layer (UX-31, U-8 Beacon family).
+//! Hint annotation layer (UX-31, U-8 hint family).
 //!
-//! [`BeaconAnnotationLayer`] is the single batched GPU annotation layer for
+//! [`HintAnnotationLayer`] is the single batched GPU annotation layer for
 //! a hint session. It sits alongside the selection and IME layers at
 //! runtime composition time: the runtime draws one batch for the whole
 //! session, never one overlay per target. This module owns only the batch
 //! data (target, label, anchor, viewport); rasterization stays in
-//! `bitty-render`, dispatch in [`crate::beacon_dispatch`].
+//! `bitty-render`, dispatch in [`crate::target_dispatch`].
 //!
-//! Bounded ([`MAX_BEACON_ANNOTATIONS`]), deterministic (input order is
+//! Bounded ([`MAX_HINT_ANNOTATIONS`]), deterministic (input order is
 //! preserved), headless, and `#![forbid(unsafe_code)]`.
 
 #![forbid(unsafe_code)]
 
-use crate::beacon_target::TargetRef;
 use crate::geometry::{Point, Rect};
+use crate::targeting::TargetRef;
 
 /// Absolute cap on annotations per hint session.
-pub const MAX_BEACON_ANNOTATIONS: usize = 1024;
+pub const MAX_HINT_ANNOTATIONS: usize = 1024;
 
 /// Layer build failure.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -30,7 +30,7 @@ pub enum AnnotationLayerError {
         /// Number of anchors.
         anchors: usize,
     },
-    /// The session exceeds [`MAX_BEACON_ANNOTATIONS`].
+    /// The session exceeds [`MAX_HINT_ANNOTATIONS`].
     TooManyAnnotations {
         /// Requested annotation count.
         requested: usize,
@@ -48,11 +48,11 @@ impl std::fmt::Display for AnnotationLayerError {
                 anchors,
             } => write!(
                 f,
-                "beacon layer length mismatch: {targets} targets, {labels} labels, {anchors} anchors"
+                "annotation layer length mismatch: {targets} targets, {labels} labels, {anchors} anchors"
             ),
             Self::TooManyAnnotations { requested, max } => write!(
                 f,
-                "too many beacon annotations: requested {requested}, max {max}"
+                "too many hint annotations: requested {requested}, max {max}"
             ),
         }
     }
@@ -63,10 +63,10 @@ impl std::error::Error for AnnotationLayerError {}
 /// One batched hint entry: the target it addresses, the label drawn for
 /// it, and the viewport-local cell anchor the label is drawn at.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BeaconAnnotation {
+pub struct HintAnnotation {
     /// Addressed target (generation handle from enumeration time).
     pub target: TargetRef,
-    /// Hint label drawn at `anchor` (from [`crate::beacon_label`]).
+    /// Hint label drawn at `anchor` (from [`crate::label_allocator`]).
     pub label: String,
     /// Viewport-local cell anchor for the label.
     pub anchor: Point,
@@ -79,15 +79,15 @@ pub struct BeaconAnnotation {
 /// overlays. The runtime composes this batch with the selection and IME
 /// layers; this crate performs no drawing.
 #[derive(Clone, Debug, Default)]
-pub struct BeaconAnnotationLayer {
-    annotations: Vec<BeaconAnnotation>,
+pub struct HintAnnotationLayer {
+    annotations: Vec<HintAnnotation>,
     viewport: Rect,
 }
 
-impl BeaconAnnotationLayer {
+impl HintAnnotationLayer {
     /// Builds the session batch. `targets`, `labels`, and `anchors` must
     /// agree in length and the count must fit
-    /// [`MAX_BEACON_ANNOTATIONS`]; input order is preserved.
+    /// [`MAX_HINT_ANNOTATIONS`]; input order is preserved.
     pub fn build(
         targets: &[TargetRef],
         labels: &[String],
@@ -101,17 +101,17 @@ impl BeaconAnnotationLayer {
                 anchors: anchors.len(),
             });
         }
-        if targets.len() > MAX_BEACON_ANNOTATIONS {
+        if targets.len() > MAX_HINT_ANNOTATIONS {
             return Err(AnnotationLayerError::TooManyAnnotations {
                 requested: targets.len(),
-                max: MAX_BEACON_ANNOTATIONS,
+                max: MAX_HINT_ANNOTATIONS,
             });
         }
         let annotations = targets
             .iter()
             .zip(labels.iter())
             .zip(anchors.iter())
-            .map(|((target, label), anchor)| BeaconAnnotation {
+            .map(|((target, label), anchor)| HintAnnotation {
                 target: *target,
                 label: label.clone(),
                 anchor: *anchor,
@@ -143,13 +143,13 @@ impl BeaconAnnotationLayer {
 
     /// All annotations in build order.
     #[must_use]
-    pub fn annotations(&self) -> &[BeaconAnnotation] {
+    pub fn annotations(&self) -> &[HintAnnotation] {
         &self.annotations
     }
 
     /// Finds the annotation carrying `label`.
     #[must_use]
-    pub fn annotation_for_label(&self, label: &str) -> Option<&BeaconAnnotation> {
+    pub fn annotation_for_label(&self, label: &str) -> Option<&HintAnnotation> {
         self.annotations
             .iter()
             .find(|annotation| annotation.label == label)
@@ -164,7 +164,7 @@ impl BeaconAnnotationLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::beacon_target::{LinkId, TargetRegistry};
+    use crate::targeting::{LinkId, TargetRegistry};
 
     fn session(count: usize) -> (Vec<TargetRef>, Vec<String>, Vec<Point>) {
         let mut registry = TargetRegistry::new();
@@ -184,7 +184,7 @@ mod tests {
     fn one_layer_batches_many_targets() {
         let (targets, labels, anchors) = session(64);
         let layer =
-            BeaconAnnotationLayer::build(&targets, &labels, &anchors, Rect::new(0, 0, 80, 24))
+            HintAnnotationLayer::build(&targets, &labels, &anchors, Rect::new(0, 0, 80, 24))
                 .expect("layer");
         // Exactly one layer holds all 64 targets: no per-target overlay.
         assert_eq!(layer.len(), 64);
@@ -202,7 +202,7 @@ mod tests {
     fn input_order_preserved() {
         let (targets, labels, anchors) = session(8);
         let layer =
-            BeaconAnnotationLayer::build(&targets, &labels, &anchors, Rect::zero()).expect("layer");
+            HintAnnotationLayer::build(&targets, &labels, &anchors, Rect::zero()).expect("layer");
         for (index, annotation) in layer.annotations().iter().enumerate() {
             assert_eq!(annotation.target, targets[index]);
             assert_eq!(annotation.label, labels[index]);
@@ -213,7 +213,7 @@ mod tests {
     #[test]
     fn length_mismatch_fails_closed() {
         let (targets, labels, anchors) = session(3);
-        let err = BeaconAnnotationLayer::build(&targets[..2], &labels, &anchors, Rect::zero())
+        let err = HintAnnotationLayer::build(&targets[..2], &labels, &anchors, Rect::zero())
             .expect_err("mismatch must fail");
         assert!(matches!(err, AnnotationLayerError::LengthMismatch { .. }));
     }
@@ -221,11 +221,11 @@ mod tests {
     #[test]
     fn cap_enforced() {
         let (targets, labels, anchors) = session(8);
-        let many_targets = vec![targets[0]; MAX_BEACON_ANNOTATIONS + 1];
-        let many_labels = vec![labels[0].clone(); MAX_BEACON_ANNOTATIONS + 1];
-        let many_anchors = vec![anchors[0]; MAX_BEACON_ANNOTATIONS + 1];
+        let many_targets = vec![targets[0]; MAX_HINT_ANNOTATIONS + 1];
+        let many_labels = vec![labels[0].clone(); MAX_HINT_ANNOTATIONS + 1];
+        let many_anchors = vec![anchors[0]; MAX_HINT_ANNOTATIONS + 1];
         let err =
-            BeaconAnnotationLayer::build(&many_targets, &many_labels, &many_anchors, Rect::zero())
+            HintAnnotationLayer::build(&many_targets, &many_labels, &many_anchors, Rect::zero())
                 .expect_err("cap must hold");
         assert!(matches!(
             err,
@@ -237,7 +237,7 @@ mod tests {
     fn clear_ends_session() {
         let (targets, labels, anchors) = session(4);
         let mut layer =
-            BeaconAnnotationLayer::build(&targets, &labels, &anchors, Rect::zero()).expect("layer");
+            HintAnnotationLayer::build(&targets, &labels, &anchors, Rect::zero()).expect("layer");
         layer.clear();
         assert!(layer.is_empty());
         assert_eq!(layer.len(), 0);

@@ -1,6 +1,6 @@
-//! Beacon label allocation (UX-30, U-8 Beacon family).
+//! Hint label allocation (UX-30, U-8 hint family).
 //!
-//! [`LabelAllocator`] assigns one unique hint label per beacon target.
+//! [`LabelAllocator`] assigns one unique hint label per target.
 //! Single-character home-row labels come first; overflow spills to two
 //! characters. Targets left of the viewport center draw their leading
 //! character from the left-hand pool and targets right of center from the
@@ -13,7 +13,7 @@
 //! built-in home-row fallback used when Lua supplies no charset.
 //!
 //! Allocation is deterministic (order by `(side, row, column)`, pools in
-//! policy order) and bounded ([`MAX_BEACON_TARGETS`]); exhaustion fails
+//! policy order) and bounded ([`MAX_HINT_TARGETS`]); exhaustion fails
 //! closed with [`LabelError::TooManyTargets`]. Headless and pure: no I/O,
 //! wall-clock, or randomness.
 
@@ -22,7 +22,7 @@
 use crate::geometry::Point;
 
 /// Absolute cap on labels per hint session.
-pub const MAX_BEACON_TARGETS: usize = 1024;
+pub const MAX_HINT_TARGETS: usize = 1024;
 
 /// Maximum characters accepted in one policy charset.
 pub const MAX_CHARSET_LEN: usize = 64;
@@ -54,7 +54,7 @@ impl std::fmt::Display for LabelError {
                 capacity,
             } => write!(
                 f,
-                "too many beacon targets: requested {requested}, capacity {capacity}"
+                "too many hint targets: requested {requested}, capacity {capacity}"
             ),
         }
     }
@@ -189,13 +189,13 @@ impl LabelAllocator {
     /// targets are served in `(y, x)` order. Each side serves its pool
     /// singles first, then two-character overflow (`pool[i] + overflow[j]`,
     /// `i` outermost). Fails closed when the request exceeds
-    /// [`MAX_BEACON_TARGETS`] or the policy's generable space.
+    /// [`MAX_HINT_TARGETS`] or the policy's generable space.
     pub fn assign(
         &self,
         anchors: &[Point],
         viewport_width: u16,
     ) -> Result<Vec<String>, LabelError> {
-        if anchors.len() > MAX_BEACON_TARGETS {
+        if anchors.len() > MAX_HINT_TARGETS {
             return Err(LabelError::TooManyTargets {
                 requested: anchors.len(),
                 capacity: self.capacity(),

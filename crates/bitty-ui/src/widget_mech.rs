@@ -28,7 +28,7 @@
 //! spawns, or dispatches. The `Terminal` primitive stays a presentation
 //! attachment with no handle (see [`crate::uitree`]).
 //!
-//! Plugin-migration follow-up: beacon (U-8) is plugin-future. If complex
+//! Plugin-migration follow-up: hint targeting (U-8) is plugin-future. If complex
 //! widgets later move behind a plugin boundary, these headless mechanism
 //! structs migrate as the boundary state with no render/exec residue to
 //! untangle; appearance stays Lua-side either way.

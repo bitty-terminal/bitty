@@ -23,7 +23,7 @@
 //! The owner decisions behind these issues are Accepted: `OQ-050`
 //! (scrollback identity), `OQ-051` (panel-is-not-terminal), and
 //! `OQ-088`/`OQ-089` (hint leadership; the hint engine is the OQ-089
-//! Beacon). The module is wired into the live path: [`Runtime`](crate::Runtime)
+//! targeting mechanism). The module is wired into the live path: [`Runtime`](crate::Runtime)
 //! owns the single [`CwHintEngine`] and fold state
 //! (`runtime::cw_live`), and the app binds the fold and hint
 //! verbs through `bitty-terminal`'s `chrome_keys` keymap dispatch. The

@@ -35,18 +35,18 @@
 //!   view-aware highlight mapping, `PersistentSelection` conversion, and
 //!   scroll-to-current for the viewport.
 //! - [`geometry`] — integer `Rect`, `Point`, `Size`, `SplitAxis`.
-//! - Beacon family (U-8, CTX-0661): [`beacon_target::TargetRef`] generation
+//! - Targeting family (U-8, CTX-0661): [`targeting::TargetRef`] generation
 //!   handles (`Panel`/`Workspace`/`CommandBlock`/`UiNode`/`Link`, stale
-//!   fails closed, no `ViewId`); [`beacon_label::LabelAllocator`] home-row
+//!   fails closed, no `ViewId`); [`label_allocator::LabelAllocator`] home-row
 //!   first with two-char overflow and spatial left/right pools over a Lua
-//!   charset policy; [`beacon_layer::BeaconAnnotationLayer`] single batched
-//!   layer; [`beacon_dispatch::BeaconDispatcher`] label-to-typed-command
+//!   charset policy; [`annotation_layer::HintAnnotationLayer`] single batched
+//!   layer; [`target_dispatch::TargetDispatcher`] label-to-typed-command
 //!   bridge that executes nothing.
-//! - [`beacon_provider`] — U-8 provider tiers (UX-33, CTX-0675,
-//!   candidate): [`beacon_provider::CommandBlockProvider`] exposes the
+//! - [`target_provider`] — U-8 provider tiers (UX-33, CTX-0675,
+//!   candidate): [`target_provider::CommandBlockProvider`] exposes the
 //!   semantic terminal as the single Core-tier target source behind the
-//!   capability-gated [`beacon_provider::ProviderMediator`], and
-//!   [`beacon_provider::TargetSnapshot`] freezes one cold-path collection
+//!   capability-gated [`target_provider::ProviderMediator`], and
+//!   [`target_provider::TargetSnapshot`] freezes one cold-path collection
 //!   per hint-session entry (UX-29) with fail-closed epoch revalidation
 //!   and no per-frame polling.
 //! - [`scratchpad::ScratchpadSlot`] — single hidden per-window scratchpad
@@ -83,7 +83,7 @@
 //!   CTX-0668, candidate): Rust-owned virtualization windows, IME
 //!   composition state, scroll offsets, and canvas command budgets keyed
 //!   by the canonical [`uitree::UiNodeId`]; appearance stays Lua-side.
-//!   Headless only: no render, exec, or plugin coupling (beacon-style
+//!   Headless only: no render, exec, or plugin coupling (targeting-style
 //!   plugin migration recorded as a follow-up in the module docs).
 //! - [`gesture::GestureTransaction`] — U-5 gesture transaction
 //!   (lift/preview/commit/Esc-rollback, interactive drop targets, atomic
@@ -145,11 +145,7 @@
 #![forbid(unsafe_code)]
 
 pub mod a11y;
-pub mod beacon_dispatch;
-pub mod beacon_label;
-pub mod beacon_layer;
-pub mod beacon_provider;
-pub mod beacon_target;
+pub mod annotation_layer;
 pub mod budget;
 pub mod canvas;
 pub mod decoration;
@@ -158,6 +154,7 @@ pub mod drag_bar;
 pub mod focus;
 pub mod geometry;
 pub mod gesture;
+pub mod label_allocator;
 pub mod layout;
 pub mod motion;
 pub mod panel;
@@ -176,6 +173,9 @@ pub mod scrollbar;
 pub mod search;
 pub mod selection;
 pub mod status_registry;
+pub mod target_dispatch;
+pub mod target_provider;
+pub mod targeting;
 pub mod theme;
 pub mod ui_levels;
 pub mod uitree;
@@ -187,23 +187,8 @@ pub mod workspace_guard;
 pub mod workspace_scene;
 
 // Re-exports for ergonomic root access.
-pub use beacon_dispatch::{BeaconDispatcher, DispatchError, MAX_BEACON_BINDINGS};
-pub use beacon_label::{
-    DEFAULT_HOME_CHARSET, LabelAllocator, LabelError, LabelPolicy, MAX_BEACON_TARGETS,
-    MAX_CHARSET_LEN,
-};
-pub use beacon_layer::{
-    AnnotationLayerError, BeaconAnnotation, BeaconAnnotationLayer, MAX_BEACON_ANNOTATIONS,
-};
-pub use beacon_provider::{
-    CORE_TERMINAL_PROVIDER_NAME, CommandBlockProvider, DerivedProvider, MAX_SNAPSHOT_TARGETS,
-    MAX_TARGET_PROVIDER_NAME_LEN, MAX_TARGET_PROVIDERS, ProviderError, ProviderMediator,
-    ProviderTarget, ProviderTier, SnapshotEntry, TARGET_PROVIDER_CAPABILITY, TargetKind,
-    TargetProvider, TargetSnapshot, validate_provider_name,
-};
-pub use beacon_target::{
-    CommandBlockId, CommandBlockRef, LinkId, LinkRef, MAX_TARGETS_PER_KIND, PanelRef, TargetError,
-    TargetRef, TargetRegistry, UiNodeRef, WorkspaceId, WorkspaceRef,
+pub use annotation_layer::{
+    AnnotationLayerError, HintAnnotation, HintAnnotationLayer, MAX_HINT_ANNOTATIONS,
 };
 pub use budget::{
     Admission, BudgetDimension, BudgetTier, ESSENTIAL_TEXTURE_BYTES, Overrun, RICH_TEXTURE_BYTES,
@@ -236,6 +221,10 @@ pub use geometry::{Gaps, Point, Rect, Size, SplitAxis};
 pub use gesture::{
     CommandInvocation, CommandOrigin, DropTarget, EquivalenceError, GestureError, GestureOutcome,
     GesturePhase, GestureTransaction, resolve_invocation, verify_origin_equivalence,
+};
+pub use label_allocator::{
+    DEFAULT_HOME_CHARSET, LabelAllocator, LabelError, LabelPolicy, MAX_CHARSET_LEN,
+    MAX_HINT_TARGETS,
 };
 pub use layout::{
     CELL_ASPECT_RATIO, LayoutNode, OverlayLayer, OverlayTier, bisect_choice, bisect_split_axis,
@@ -304,6 +293,17 @@ pub use search::{SearchHighlight, SearchState, search_match_to_persistent};
 pub use selection::{
     BufferPos, CellPos, PersistentSelection, Selection, SelectionKind, SelectionRange,
     is_word_char, snap_to_leading,
+};
+pub use target_dispatch::{DispatchError, MAX_TARGET_BINDINGS, TargetDispatcher};
+pub use target_provider::{
+    CORE_TERMINAL_PROVIDER_NAME, CommandBlockProvider, DerivedProvider, MAX_SNAPSHOT_TARGETS,
+    MAX_TARGET_PROVIDER_NAME_LEN, MAX_TARGET_PROVIDERS, ProviderError, ProviderMediator,
+    ProviderTarget, ProviderTier, SnapshotEntry, TARGET_PROVIDER_CAPABILITY, TargetKind,
+    TargetProvider, TargetSnapshot, validate_provider_name,
+};
+pub use targeting::{
+    CommandBlockId, CommandBlockRef, LinkId, LinkRef, MAX_TARGETS_PER_KIND, PanelRef, TargetError,
+    TargetRef, TargetRegistry, UiNodeRef, WorkspaceId, WorkspaceRef,
 };
 pub use ui_levels::{
     LevelFlowError, U3_LEVELS_CONTRACT_VERSION, UiLevel, check_flow, level_of, may_depend_on,

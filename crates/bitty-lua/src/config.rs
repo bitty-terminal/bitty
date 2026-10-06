@@ -110,6 +110,16 @@ pub const MAX_CONFIG_FONT_FALLBACK_ENTRIES: usize = 8;
 /// at extraction with its indexed key path).
 pub const MAX_CONFIG_FONT_FAMILY_BYTES: usize = 128;
 
+/// Maximum `font.features` entries read (CTX-0985, issue #1691 follow-up;
+/// mirrors `bitty-config` `MAX_FONT_FEATURES`).
+pub const MAX_CONFIG_FONT_FEATURE_ENTRIES: usize = 32;
+
+/// Maximum bytes per `font.features` entry read (CTX-0985; mirrors
+/// `bitty-config` `MAX_FONT_FEATURE_LEN` so an overlong entry fails closed
+/// at extraction with its indexed key path; tag grammar stays fail-closed
+/// downstream in `bitty-config`).
+pub const MAX_CONFIG_FONT_FEATURE_BYTES: usize = 16;
+
 /// The accepted `views.<selector>` field set (RFC-0001/OQ-041).
 const VIEW_ACCEPTED_FIELDS: &[&str] = &[
     "border_color",
@@ -181,6 +191,19 @@ pub struct FontData {
     /// key resets it) and only a layer without a `font` table inherits.
     /// Entry bounds are enforced fail-closed downstream in `bitty-config`.
     pub fallback: Option<Vec<String>>,
+    /// Raw OpenType feature overrides (CTX-0985, issue #1691 follow-up):
+    /// same absent-vs-present array semantics as `fallback` (an omitted
+    /// key resets the accumulated list at merge). Entry bounds are
+    /// enforced fail-closed at extraction; tag grammar (`TAG`,
+    /// `TAG=value`, `TAG on/off`, `+TAG`/`-TAG`) is enforced fail-closed
+    /// downstream in `bitty-config` (`OpenTypeFeature::parse`).
+    pub features: Option<Vec<String>>,
+    /// Programming-ligature policy spelling (CTX-0985, issue #1691
+    /// follow-up): raw `never`/`cursor`/`always` string; absent key says
+    /// nothing. Grammar is enforced fail-closed downstream in
+    /// `bitty-config` (`LigaturePolicy::parse` naming
+    /// `font.disable_ligatures`).
+    pub disable_ligatures: Option<String>,
 }
 
 /// Window overrides, plain data (see [`FontData`] for `Option` semantics).
@@ -1225,6 +1248,8 @@ impl ConfigData {
                             "line_height",
                             "letter_spacing",
                             "fallback",
+                            "features",
+                            "disable_ligatures",
                         ],
                     )?;
                     let family = match get_field(nested, "family") {
@@ -1271,12 +1296,48 @@ impl ConfigData {
                         }
                         None => None,
                     };
+                    // CTX-0985: `font.features` is an array of raw OpenType
+                    // feature override strings; same absent-vs-present
+                    // semantics as `fallback`. Bounds mirror `bitty-config`
+                    // (`MAX_FONT_FEATURES` entries, `MAX_FONT_FEATURE_LEN`
+                    // bytes each); tag grammar stays fail-closed
+                    // downstream (`OpenTypeFeature::parse`).
+                    let features = match get_field(nested, "features") {
+                        Some(v) => {
+                            let arr = expect_array("font.features", v)?;
+                            if arr.len() > MAX_CONFIG_FONT_FEATURE_ENTRIES {
+                                return Err(format!(
+                                    "font.features: exceeds {} entries",
+                                    MAX_CONFIG_FONT_FEATURE_ENTRIES
+                                ));
+                            }
+                            let mut out = Vec::with_capacity(arr.len());
+                            for (idx, item) in arr.iter().enumerate() {
+                                out.push(expect_bounded_string(
+                                    &format!("font.features[{}]", idx + 1),
+                                    item,
+                                    MAX_CONFIG_FONT_FEATURE_BYTES,
+                                )?);
+                            }
+                            Some(out)
+                        }
+                        None => None,
+                    };
+                    // CTX-0985: `font.disable_ligatures` is a raw policy
+                    // spelling; grammar (`never`/`cursor`/`always`) stays
+                    // fail-closed downstream (`LigaturePolicy::parse`).
+                    let disable_ligatures = match get_field(nested, "disable_ligatures") {
+                        Some(v) => Some(expect_string("font.disable_ligatures", v)?),
+                        None => None,
+                    };
                     out.font = Some(FontData {
                         family,
                         size,
                         line_height,
                         letter_spacing,
                         fallback,
+                        features,
+                        disable_ligatures,
                     });
                 }
                 "window" => {
@@ -2835,6 +2896,59 @@ mod tests {
             r#"return {{ font = {{ family = "Mono", size = 12, fallback = {{ "{long}" }} }} }}"#
         ));
         assert!(err.contains("font.fallback[1]"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn font_features_absent_says_nothing_and_parses_in_order() {
+        // CTX-0985: absent key says nothing; a present array is kept in
+        // order (possibly empty); tag grammar is downstream's job.
+        let data = eval_ok(r#"return { font = { family = "Mono", size = 12 } }"#);
+        let font = data.font.unwrap();
+        assert_eq!(font.features, None);
+        assert_eq!(font.disable_ligatures, None);
+        let data = eval_ok(
+            r#"return { font = { family = "Mono", size = 12, features = { "calt=0", "ss01=2" }, disable_ligatures = "cursor" } }"#,
+        );
+        let font = data.font.unwrap();
+        assert_eq!(
+            font.features,
+            Some(vec!["calt=0".to_string(), "ss01=2".to_string()])
+        );
+        assert_eq!(font.disable_ligatures, Some("cursor".to_string()));
+        let data = eval_ok(r#"return { font = { family = "Mono", size = 12, features = { } } }"#);
+        assert_eq!(data.font.unwrap().features, Some(Vec::new()));
+    }
+
+    #[test]
+    fn font_features_rejects_bad_shapes_fail_closed() {
+        // CTX-0985: too many entries (32-entry bound).
+        let many = (0..33)
+            .map(|i| format!(r#""calt={i}""#))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let err = eval_err(&format!(
+            r#"return {{ font = {{ family = "Mono", size = 12, features = {{ {many} }} }} }}"#
+        ));
+        assert!(err.contains("font.features"), "unexpected: {err}");
+        // Non-string leaf.
+        let err =
+            eval_err(r#"return { font = { family = "Mono", size = 12, features = { 42 } } }"#);
+        assert!(err.contains("font.features[1]"), "unexpected: {err}");
+        // Map keys instead of an array.
+        let err = eval_err(
+            r#"return { font = { family = "Mono", size = 12, features = { tag = "calt" } } }"#,
+        );
+        assert!(err.contains("font.features"), "unexpected: {err}");
+        // Overlong entry (16-byte feature bound).
+        let long = "x".repeat(17);
+        let err = eval_err(&format!(
+            r#"return {{ font = {{ family = "Mono", size = 12, features = {{ "{long}" }} }} }}"#
+        ));
+        assert!(err.contains("font.features[1]"), "unexpected: {err}");
+        // Non-string policy spelling.
+        let err =
+            eval_err(r#"return { font = { family = "Mono", size = 12, disable_ligatures = 42 } }"#);
+        assert!(err.contains("font.disable_ligatures"), "unexpected: {err}");
     }
 
     #[test]

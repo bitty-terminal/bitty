@@ -88,6 +88,8 @@ impl std::fmt::Display for ReloadClass {
 /// | `font.line_height`        | Live               |
 /// | `font.letter_spacing`     | Live               |
 /// | `font.fallback`           | RestartRequired    |
+/// | `font.features`           | RestartRequired    |
+/// | `font.disable_ligatures`  | RestartRequired    |
 /// | `window.opacity`          | Live               |
 /// | `window.padding`          | Live               |
 /// | `window.radius_px`        | Live               |
@@ -236,6 +238,14 @@ pub const RESTART_REQUIRED_FIELDS: &[&str] = &[
     // never happens. The startup path (`runtime_config_from_effective`)
     // carries the effective list into `RuntimeConfig::font_config`.
     "font.fallback",
+    // CTX-0985 (issue #1691): the shaping inputs are adopted at startup
+    // only. `render_shaped` takes parsed features plus policy per call,
+    // but no live reconciler re-parses them from a reloaded effective
+    // config (nor evicts the run-shape/glyph caches keyed on the old
+    // feature set), so claiming Live would promise an adoption that never
+    // happens — same rationale as `font.fallback`.
+    "font.features",
+    "font.disable_ligatures",
     "terminal.scrollback",
     "terminal.shell",
     "terminal.scroll_lines_per_notch",
@@ -360,6 +370,19 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
         "font.fallback",
         format!("{:?}", old.font.fallback),
         format!("{:?}", new.font.fallback),
+    );
+    // CTX-0985: same `Debug`-form comparison for the shaping leaves; the
+    // policy enum has no `Display`, and `Debug` is stable across the three
+    // variants.
+    push_if_changed(
+        "font.features",
+        format!("{:?}", old.font.features),
+        format!("{:?}", new.font.features),
+    );
+    push_if_changed(
+        "font.disable_ligatures",
+        format!("{:?}", old.font.disable_ligatures),
+        format!("{:?}", new.font.disable_ligatures),
     );
     push_if_changed(
         "window.opacity",
@@ -996,6 +1019,29 @@ mod tests {
     }
 
     #[test]
+    fn diff_font_shaping_leaves_are_restart_required() {
+        // CTX-0985 (issue #1691): a features/policy edit diffs as
+        // RestartRequired (no live reconciler re-parses the shaping
+        // inputs) and `reconcile_live` refuses it; unchanged leaves
+        // produce no diff.
+        use crate::types::LigaturePolicy;
+        let old = EffectiveConfig::default();
+        let mut new = old.clone();
+        new.font.features = vec!["calt=0".into()];
+        new.font.disable_ligatures = LigaturePolicy::Always;
+        let r = diff(&old, &new);
+        assert_eq!(r.overall, ReloadClass::RestartRequired);
+        assert!(r.needs_restart);
+        assert!(r.diffs.iter().any(|d| d.field == "font.features"));
+        assert!(r.diffs.iter().any(|d| d.field == "font.disable_ligatures"));
+        let mut cur = old.clone();
+        assert!(reconcile_live(&mut cur, &new).is_err());
+        let r = diff(&old, &old);
+        assert!(!r.diffs.iter().any(|d| d.field == "font.features"));
+        assert!(!r.diffs.iter().any(|d| d.field == "font.disable_ligatures"));
+    }
+
+    #[test]
     fn diff_mod_flip_is_live_and_reconciles() {
         // CTX-0236: flipping the mod rebinds the resolved chrome map like
         // an explicit keymap edit, so it is live-reconcilable, not restart.
@@ -1125,6 +1171,16 @@ mod tests {
         // stay Live.
         assert_eq!(
             classify_field("font.fallback"),
+            ReloadClass::RestartRequired
+        );
+        // CTX-0985 (issue #1691): the shaping leaves are RestartRequired
+        // (no live reconciler re-parses them); other font leaves stay Live.
+        assert_eq!(
+            classify_field("font.features"),
+            ReloadClass::RestartRequired
+        );
+        assert_eq!(
+            classify_field("font.disable_ligatures"),
             ReloadClass::RestartRequired
         );
         assert_eq!(classify_field("font"), ReloadClass::Live);

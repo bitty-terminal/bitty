@@ -1923,12 +1923,12 @@ pub struct FontConfig {
     /// Each entry follows the [`OpenTypeFeature`] strict syntax and is at
     /// most `MAX_FONT_FEATURE_LEN` bytes; at most `MAX_FONT_FEATURES`
     /// entries, validated fail-closed (`font.features[<index>]`
-    /// diagnostics). Lua wiring (`font.features` table) is a follow-up;
-    /// this typed surface is the validation authority.
+    /// diagnostics). Set from init.lua `font.features` (CTX-0985, issue
+    /// #1691); this typed surface is the validation authority.
     pub features: Vec<String>,
     /// Programming-ligature policy. Defaults to `Never` (ligatures on —
-    /// current behavior preserved). Lua wiring
-    /// (`font.disable_ligatures = "cursor"`) is a follow-up; the typed
+    /// current behavior preserved). Set from init.lua
+    /// `font.disable_ligatures` (CTX-0985, issue #1691); the typed
     /// surface here is the validation authority.
     pub disable_ligatures: LigaturePolicy,
 }

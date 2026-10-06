@@ -127,8 +127,18 @@ impl State {
             h.u64(record.evicted_at_mark);
             h.u64(record.epoch_at_mark);
             h.option_tag(record.on_alt_screen);
+            // CTX-0996: the D-row flag decides select-output membership.
+            h.boolean(record.output_on_mark_row);
         }
         h.u64(self.buffer_epoch);
+        // CTX-0996 per-row output tracking: observable via select-output.
+        h.option_tag(self.last_output_print.is_some());
+        if let Some(mark) = &self.last_output_print {
+            h.u64(mark.buffer_row as u64);
+            h.u64(mark.evicted_at);
+            h.u64(mark.epoch_at);
+            h.option_tag(mark.on_alt_screen);
+        }
 
         h.u64(self.scrollback.next_line_id());
         h.u64(self.scrollback.total_written());

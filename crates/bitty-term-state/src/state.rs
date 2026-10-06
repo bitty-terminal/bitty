@@ -97,6 +97,14 @@ pub const SNAPSHOT_VERSION: u32 = 1;
 /// generation needed to resolve it later. [`State::zone_buffer_row`]
 /// validates the anchor against the current buffer and returns `None`
 /// when the marked line was pruned, cleared, reset, or reflowed.
+///
+/// CTX-0996 (issue #1688): `OutputEnd` (`D`) records carry per-row output
+/// tracking (`output_on_mark_row`): whether command output landed on the
+/// mark row itself after the last `OutputStart`. A `D` on a fresh row after
+/// a trailing CR+LF carries `false`; a `D` on the same row as a final
+/// partial line (no trailing newline) carries `true`. Resolution uses the
+/// flag instead of inferring from column zero, since a bare LF advances the
+/// row without resetting the column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ZoneRecord {
     /// Monotonic sequence number assigned when the marker arrived.
@@ -121,6 +129,32 @@ pub struct ZoneRecord {
     /// requires the same screen: alt-screen marks never resolve against
     /// the primary buffer and vice versa.
     pub on_alt_screen: bool,
+    /// CTX-0996: for `OutputEnd` only, whether command output after the
+    /// last `OutputStart` landed on this mark row. Always `false` for other
+    /// kinds. Decided at mark time from per-row print tracking, never from
+    /// column zero.
+    pub output_on_mark_row: bool,
+}
+
+/// Anchor of the last printable output since the last `OutputStart`
+/// (CTX-0996, issue #1688).
+///
+/// Per-row output tracking: every placed glyph records its combined buffer
+/// row plus the prune/epoch/screen generation needed to resolve it later,
+/// mirroring [`ZoneRecord`] anchors. [`State::output_print_on_row`] resolves
+/// the anchor against the current buffer and reports whether the given row
+/// holds command output. A bare LF advances the row without resetting the
+/// column, so column zero alone cannot answer this; the anchor can.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OutputPrintMark {
+    /// Combined buffer row where the glyph landed.
+    buffer_row: usize,
+    /// Eviction total at print time.
+    evicted_at: u64,
+    /// Buffer epoch at print time.
+    epoch_at: u64,
+    /// Whether the alternate screen was active at print time.
+    on_alt_screen: bool,
 }
 
 /// Versioned read-only view of terminal state for renderers and plugins.
@@ -221,6 +255,11 @@ pub struct State {
     current_hyperlink: Option<HyperlinkId>,
     zones: VecDeque<ZoneRecord>,
     zone_counter: u64,
+    /// Last printable output since the last `OutputStart` (CTX-0996).
+    /// Reset to `None` at each `OutputStart` so pre-command prompt text on
+    /// the same row never counts as output; set by every placed glyph.
+    /// `None` means no command output has landed since the last start.
+    last_output_print: Option<OutputPrintMark>,
     /// Buffer epoch for zone-anchor validation (M1-18, CTX-0665). Bumped
     /// on every operation that wholesale invalidates buffer-row identity:
     /// scrollback clear (`ED 3`) and resize reflow (which reassigns
@@ -287,6 +326,7 @@ impl State {
             current_hyperlink: None,
             zones: VecDeque::new(),
             zone_counter: 0,
+            last_output_print: None,
             buffer_epoch: 0,
             generation: 0,
             damage_history: VecDeque::new(),
@@ -964,23 +1004,28 @@ impl State {
     /// Combined buffer rows `(start, end)` (inclusive) of the last command's
     /// output, when a complete non-empty range still resolves.
     ///
-    /// Select-output primitive (CTX-0952, issue #1670): the last
-    /// `OutputStart` (`OSC 133;C`) by arrival order opens the range; the
-    /// first `OutputEnd` (`OSC 133;D`) after it closes the range at the row
-    /// *before* the end mark. The end mark arrives on the row that becomes
-    /// the next prompt (proven traffic shape: `C`, output lines, `D`, `A`,
-    /// prompt text share one cursor row progression), so including that row
-    /// would swallow the next prompt line. With no end mark yet the command
-    /// is still running and the range closes at the cursor row — minus one
-    /// when the cursor sits at column zero of a later line, since that line
-    /// holds no output yet.
+    /// Select-output primitive (CTX-0952, issue #1670; per-row tracking
+    /// CTX-0996, issue #1688): the last `OutputStart` (`OSC 133;C`) by
+    /// arrival order opens the range; the first `OutputEnd` (`OSC 133;D`)
+    /// after it closes the range. When the end mark row itself holds command
+    /// output (final partial line without a trailing newline) the range
+    /// includes that row; otherwise — the trailing-CR+LF shape where `D`
+    /// arrives on the fresh row that becomes the next prompt — the range
+    /// closes at the row before the end mark, so the next prompt line is
+    /// never swallowed. With no end mark yet the command is still running
+    /// and the range closes at the cursor row (see [`Self::live_output_end`]).
+    ///
+    /// The `D`-row decision uses per-row print tracking
+    /// (`output_on_mark_row`, decided at mark time), never column zero: a
+    /// bare LF advances the row without resetting the column, so a fresh
+    /// row can carry a nonzero column while holding no output.
     ///
     /// Fail-closed (`None`) when no output start resolves (no marks, pruned,
     /// cleared, resized, or another screen), when the resolved range is
-    /// empty (end before start: zero-byte output, a same-row `C`/`D` pair,
-    /// or the running-command cursor sitting above the start), or when the
-    /// end mark lands on row zero. Unresolvable marks are skipped, never
-    /// returned — like [`Self::prev_prompt_buffer_row`].
+    /// empty (end before start: zero-byte output, a same-row `C`/`D` pair
+    /// with no output on it, or the running-command cursor sitting above
+    /// the start), or when the end mark lands on row zero. Unresolvable
+    /// marks are skipped, never returned — like [`Self::prev_prompt_buffer_row`].
     #[must_use]
     pub fn last_command_output_rows(&self) -> Option<(usize, usize)> {
         let (start_ordinal, start) = self
@@ -993,10 +1038,19 @@ impl State {
             .zones
             .iter()
             .filter(|r| r.kind == ZoneKind::OutputEnd && r.ordinal > start_ordinal)
-            .filter_map(|r| self.zone_buffer_row(r).map(|row| (r.ordinal, row)))
-            .min_by_key(|(ordinal, _)| *ordinal)
+            .filter_map(|r| {
+                self.zone_buffer_row(r)
+                    .map(|row| (r.ordinal, row, r.output_on_mark_row))
+            })
+            .min_by_key(|(ordinal, _, _)| *ordinal)
         {
-            Some((_, end_mark)) => end_mark.checked_sub(1)?,
+            Some((_, end_mark, has_output)) => {
+                if has_output {
+                    end_mark
+                } else {
+                    end_mark.checked_sub(1)?
+                }
+            }
             None => self.live_output_end(start)?,
         };
         if end < start {
@@ -1005,17 +1059,59 @@ impl State {
         Some((start, end))
     }
 
+    /// Whether command output since the last `OutputStart` landed on combined
+    /// buffer `row` (CTX-0996).
+    ///
+    /// Resolves [`Self::last_output_print`] against the current buffer with
+    /// the same prune/epoch/screen rules as [`Self::zone_buffer_row`]: pruned,
+    /// cleared, reflowed, or other-screen prints never match, and a row that
+    /// never received command output reports `false` even when the cursor
+    /// column is nonzero there (bare LF shape).
+    fn output_print_on_row(&self, row: usize) -> bool {
+        let Some(mark) = self.last_output_print else {
+            return false;
+        };
+        if mark.epoch_at != self.buffer_epoch {
+            return false;
+        }
+        if mark.on_alt_screen != self.alt_screen_active() {
+            return false;
+        }
+        let Some(drift) = self
+            .scrollback_evicted_total()
+            .checked_sub(mark.evicted_at)
+            .map(|d| d as usize)
+        else {
+            return false;
+        };
+        let Some(resolved) = mark.buffer_row.checked_sub(drift) else {
+            return false;
+        };
+        if resolved >= self.scrollback.len() + self.height {
+            return false;
+        }
+        resolved == row
+    }
+
     /// Closing row for a still-running command whose output starts at
-    /// `start` (combined buffer row): the cursor's combined row, minus one
-    /// when the cursor sits at column zero of a later line (a fresh line
-    /// with no output on it yet). `None` when the cursor is above `start`.
+    /// `start` (combined buffer row): the cursor's combined row when that
+    /// row holds command output, otherwise the row before it (a fresh line
+    /// with no output on it yet). `None` when the cursor is above `start`
+    /// or on `start` with no output yet (zero-byte running output).
+    ///
+    /// CTX-0996: the fresh-vs-partial decision uses per-row print tracking
+    /// ([`Self::output_print_on_row`]), never column zero, so a fresh row
+    /// entered by a bare LF (nonzero column, no output) still closes before
+    /// it.
     fn live_output_end(&self, start: usize) -> Option<usize> {
         let cursor_row = (self.cursor.position.row as usize).min(self.height.saturating_sub(1));
         let cursor_buf = self.scrollback.len() + cursor_row;
-        let end = if self.cursor.position.col == 0 && cursor_buf > start {
+        let end = if self.output_print_on_row(cursor_buf) {
+            cursor_buf
+        } else if cursor_buf > start {
             cursor_buf - 1
         } else {
-            cursor_buf
+            return None;
         };
         if end < start { None } else { Some(end) }
     }
@@ -1531,6 +1627,10 @@ impl State {
             row as u16,
             (col + glyph_width as usize - 1) as u16,
         );
+        // CTX-0996: every placed glyph marks its row as holding command
+        // output (resolved later against the last `OutputStart`). Dropped
+        // wide chars return early above and never reach here.
+        self.note_output_print();
         let advanced = col + glyph_width as usize;
         if advanced >= self.width {
             self.cursor.position.col = cols - 1;
@@ -1602,6 +1702,8 @@ impl State {
             self.damage_grid_rect(row as u16, col as u16, row as u16, last_col);
         }
         self.damage_grid_rect(row as u16, col as u16, row as u16, col as u16);
+        // CTX-0996: placeholder cells are ordinary width-1 output.
+        self.note_output_print();
         let advanced = col + 1;
         if advanced >= self.width {
             self.cursor.position.col = cols - 1;
@@ -2930,6 +3032,22 @@ impl State {
         }
     }
 
+    /// Records the current live row as holding command output (CTX-0996).
+    ///
+    /// Called by every placed glyph. Zero-width marks are excluded: they
+    /// attach to the preceding cell without advancing, and the base glyph
+    /// already marked the row (a leading mark with no base is dropped and
+    /// marks nothing).
+    fn note_output_print(&mut self) {
+        let cursor_row = (self.cursor.position.row as usize).min(self.height.saturating_sub(1));
+        self.last_output_print = Some(OutputPrintMark {
+            buffer_row: self.scrollback.len() + cursor_row,
+            evicted_at: self.scrollback_evicted_total(),
+            epoch_at: self.buffer_epoch,
+            on_alt_screen: self.alt_screen_active(),
+        });
+    }
+
     fn record_zone(&mut self, kind: ZoneKind, exit_code: Option<i32>) {
         self.zone_counter += 1;
         let code = if kind == ZoneKind::OutputEnd {
@@ -2942,14 +3060,28 @@ impl State {
         // cursor is clamped defensively (this runs before
         // `enforce_cursor_invariants`).
         let cursor_row = (self.cursor.position.row as usize).min(self.height.saturating_sub(1));
+        let buffer_row = self.scrollback.len() + cursor_row;
+        // CTX-0996: a new output start opens a fresh command, so prompt and
+        // input text already on this row never counts as output. An output
+        // end captures whether output landed on its own row (final partial
+        // line) via live tracking, never via column zero.
+        let output_on_mark_row = if kind == ZoneKind::OutputStart {
+            self.last_output_print = None;
+            false
+        } else if kind == ZoneKind::OutputEnd {
+            self.output_print_on_row(buffer_row)
+        } else {
+            false
+        };
         self.zones.push_back(ZoneRecord {
             ordinal: self.zone_counter,
             kind,
             exit_code: code,
-            buffer_row: self.scrollback.len() + cursor_row,
+            buffer_row,
             evicted_at_mark: self.scrollback_evicted_total(),
             epoch_at_mark: self.buffer_epoch,
             on_alt_screen: self.alt_screen_active(),
+            output_on_mark_row,
         });
         while self.zones.len() > ZONE_RECORDS_MAX {
             self.zones.pop_front();
@@ -3056,6 +3188,7 @@ impl State {
         self.current_hyperlink = None;
         self.zones.clear();
         self.zone_counter = 0;
+        self.last_output_print = None;
         // Reset clears every visible image (specification): placements,
         // prototypes, animations, and number mappings all go.
         self.kitty_placements.clear_all();

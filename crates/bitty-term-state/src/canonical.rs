@@ -47,7 +47,11 @@ use crate::cell::{Attributes, Cell, Style};
 /// `evicted_at_mark`, `epoch_at_mark` per zone record plus the global
 /// `buffer_epoch`. Anchors are observable jump targets, so states differing
 /// only in them are not behaviorally identical.
-pub const CANONICAL_HASH_VERSION: u32 = 10;
+/// v11 adds OSC 133 per-row output tracking (`CTX-0996`, issue #1688):
+/// `output_on_mark_row` per zone record plus the `last_output_print`
+/// anchor. The flag decides whether a `D` row joins the select-output
+/// range, so states differing only in it select different rows.
+pub const CANONICAL_HASH_VERSION: u32 = 11;
 
 /// Incremental canonical writer backing the state hash.
 pub(crate) struct CanonicalHasher {
@@ -211,6 +215,6 @@ mod tests {
 
     #[test]
     fn version_pin_is_explicit() {
-        assert_eq!(CANONICAL_HASH_VERSION, 10);
+        assert_eq!(CANONICAL_HASH_VERSION, 11);
     }
 }

@@ -546,10 +546,10 @@ pub fn plugin_help_text() -> String {
      examples:\n\
      \x20 bitty plugin list\n\
      \x20 bitty plugin list --format json\n\
-     \x20 bitty plugin install bitty-terminal.workspace --yes\n\
+     \x20 bitty plugin install bitty-terminal.shell-integration --yes\n\
      \x20 bitty plugin install ./my-plugin --yes\n\
      \x20 bitty plugin info xuepoo.hello\n\
-     \x20 bitty plugin disable bitty-terminal.workspace\n\
+     \x20 bitty plugin disable bitty-terminal.shell-integration\n\
      \x20 bitty plugin remove xuepoo.hello --force"
         .to_string()
 }

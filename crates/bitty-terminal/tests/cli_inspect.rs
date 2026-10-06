@@ -266,7 +266,8 @@ fn inspect_key_malformed_is_usage_error() {
 
 #[test]
 fn inspect_plugin_table_names_owner() {
-    let output = run_bitty(&["inspect", "plugin", "bitty-terminal.workspace"]);
+    // #1572 / CTX-0994: shell-integration only; workspace manifest retired.
+    let output = run_bitty(&["inspect", "plugin", "bitty-terminal.shell-integration"]);
     assert_eq!(
         output.status.code(),
         Some(0),
@@ -275,8 +276,16 @@ fn inspect_plugin_table_names_owner() {
     );
     let text = stdout(&output);
     assert!(
-        text.contains("bitty-terminal.workspace") && text.contains("bitty-terminal"),
+        text.contains("bitty-terminal.shell-integration") && text.contains("bitty-terminal"),
         "table must name id and owner publisher, got {text:?}"
+    );
+    // Retired workspace manifest no longer resolves (NotFound, exit 1).
+    let retired = run_bitty(&["inspect", "plugin", "bitty-terminal.workspace"]);
+    assert_eq!(
+        retired.status.code(),
+        Some(1),
+        "retired workspace must be NotFound (exit 1), stderr={:?}",
+        stderr(&retired)
     );
     // CTX-0974 (DEC-0100 waiver): purged tabs alias no longer resolves (NotFound, exit 1).
     let old = run_bitty(&["inspect", "plugin", "bitty-terminal.tabs"]);

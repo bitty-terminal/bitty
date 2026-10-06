@@ -4,16 +4,17 @@
 //! Batch verification for the panel/chrome consumer wiring slice. The
 //! bundled palette and statusline Rust consumers were removed after the
 //! OQ-053 split (CTX-0922; they now ship as the `palette` and `statusline`
-//! Lua plugins), so the remaining first-party consumer is
-//! workspace/workspaceline (`bitty-terminal.workspace`, claim
-//! `workspaceline`), which still exercises the public `PanelRegistry` path
-//! and stays bundled-disabled by default.
+//! Lua plugins). #1572 / CTX-0994 retired the bundled `workspace` manifest
+//! too (shell-integration only), so the workspace-shaped manifest below is
+//! built locally: it still exercises the public `PanelRegistry` path with
+//! the canonical `workspaceline` claim vocabulary (valid for the future
+//! `bar` plugin).
 //!
 //! Proves in one place, via public paths only:
 //! - default disabled: fresh `EffectiveConfig` has zero plugins, a fresh
 //!   `PanelRegistry` has zero panels, `Runtime::tick` still presents
-//! - workspace consumer: `workspace_manifest` carries the canonical
-//!   `workspaceline` claim through the public PluginHost path
+//! - workspace consumer: the local workspace-shaped manifest carries the
+//!   canonical `workspaceline` claim through the public PluginHost path
 //!   (`declare -> resolve -> register -> GrantRecord -> activate`)
 //! - workspace queries: `workspace_names`/`active_workspace_index` reflect
 //!   workspace lifecycle, plus `create_workspace_panel` via the public path
@@ -28,13 +29,72 @@
 //! explicit user opt-in via `EffectiveConfig.plugins`; no auto-claim.
 //! `forbid(unsafe)`.
 
-use bitty_plugin_host::{CapabilityId, DropPolicy, GrantRecord, PluginHost, bundled};
+use bitty_plugin_host::{
+    CapabilityId, Compat, DropPolicy, GrantRecord, LazyTriggers, PluginHost, PluginIdentity,
+    PluginManifest,
+};
 use bitty_runtime::{
     Runtime,
     registry::{BoundedPayload, PanelRegistry, PanelRegistryConfig, WorkspaceId},
     workspace::{WorkspaceIntegration, create_workspace_panel},
 };
 use bitty_ui::{View, ViewId, panel::PanelType};
+
+/// Local workspace-shaped manifest for public-path coverage.
+///
+/// #1572 / CTX-0994: the bundled `bitty-terminal.workspace` manifest is
+/// retired, so this file builds the same shape locally. The `workspaceline`
+/// claim vocabulary stays valid for the future `bar` plugin.
+fn test_workspace_manifest() -> PluginManifest {
+    use bitty_plugin_host::{CapabilityRequests, LazyCommand, QualifiedName};
+    let mut caps = CapabilityRequests::default();
+    caps.ids
+        .insert(CapabilityId::parse("ui.rich").expect("known capability"));
+    let commands = [
+        "bitty-terminal.workspace:new",
+        "bitty-terminal.workspace:close",
+        "bitty-terminal.workspace:next",
+    ]
+    .iter()
+    .map(|c| LazyCommand {
+        id: QualifiedName::new(c).expect("test command id must parse"),
+        args_schema: None,
+        result_schema: None,
+    })
+    .collect();
+    PluginManifest {
+        identity: PluginIdentity {
+            id: bitty_plugin_host::PluginId::new("bitty-terminal.workspace")
+                .expect("test plugin id must be valid"),
+            name: "Workspace".to_string(),
+            version: "0.1.0".to_string(),
+            description:
+                "Workspace commands, workspaceline presentation, ordering and closing policy"
+                    .to_string(),
+            license: Some("MIT".to_string()),
+        },
+        compat: Compat {
+            bitty: Some(">=0.1,<1.0".to_string()),
+            plugin_api: Some("^1.0".to_string()),
+        },
+        dependencies: Vec::new(),
+        provided_services: Vec::new(),
+        required_services: Vec::new(),
+        capabilities: caps,
+        tools: Vec::new(),
+        network: Vec::new(),
+        limits: Default::default(),
+        lazy: LazyTriggers {
+            commands,
+            events: vec![
+                "terminal.title-changed".to_string(),
+                "focus.changed".to_string(),
+            ],
+            claims: vec!["workspaceline".to_string()],
+        },
+        raw_bytes_len: 512,
+    }
+}
 
 fn granted_set_for(
     manifest: &bitty_plugin_host::PluginManifest,
@@ -66,13 +126,8 @@ fn default_disabled_zero_consumers_and_tick_still_presents() {
 
 #[test]
 fn workspace_consumer_workspaceline_claim_via_public_host_path() {
-    let manifest = bundled::workspace_manifest();
-    assert!(
-        manifest
-            .lazy
-            .claims
-            .contains(&bundled::WORKSPACELINE_CLAIM.to_string())
-    );
+    let manifest = test_workspace_manifest();
+    assert!(manifest.lazy.claims.contains(&"workspaceline".to_string()));
     let id = manifest.id().clone();
     let hash = manifest.manifest_hash();
     let granted = granted_set_for(&manifest);
@@ -160,8 +215,8 @@ fn safe_mode_rejects_bundled_and_runtime_still_ticks() {
     let mut rt = Runtime::with_defaults().expect("runtime must build");
     rt.set_plugin_safe_mode(true);
     assert!(
-        rt.register_plugin(bundled::workspace_manifest()).is_err(),
-        "safe mode must reject bundled as non-builtin"
+        rt.register_plugin(test_workspace_manifest()).is_err(),
+        "safe mode must reject workspace-shaped manifest as non-builtin"
     );
     assert!(rt.tick().is_some());
     assert_eq!(rt.plugin_host().registry().len(), 0);

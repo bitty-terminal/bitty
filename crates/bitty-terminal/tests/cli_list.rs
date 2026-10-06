@@ -230,20 +230,27 @@ fn list_plugins_table_contains_bundled() {
         stderr(&output)
     );
     let text = stdout(&output);
+    // #1572 / CTX-0994: shell-integration only; workspace manifest retired.
     assert!(
-        text.contains("bitty-terminal.workspace"),
+        text.contains("bitty-terminal.shell-integration"),
         "plugins table must carry bundled ids, got {text:?}"
+    );
+    assert!(
+        !text.contains("bitty-terminal.workspace"),
+        "retired workspace must not list, got {text:?}"
     );
 }
 
 #[test]
-fn list_plugins_json_count_is_two() {
+fn list_plugins_json_count_is_one() {
     let output = run_bitty(&["list", "plugins", "--format", "json"], &[]);
     assert_eq!(output.status.code(), Some(0));
     let doc = parse_stdout_json(&stdout(&output));
     assert!(doc.contains("\"kind\":\"plugins\""));
-    assert!(doc.contains("\"count\":2"), "count: {:?}", doc.text());
-    // CTX-0886: Unix philosophy, Core mechanism only. Only workspace and shell-integration bundled.
+    assert!(doc.contains("\"count\":1"), "count: {:?}", doc.text());
+    assert!(doc.contains("bitty-terminal.shell-integration"));
+    assert!(!doc.contains("bitty-terminal.workspace"));
+    // CTX-0886: Unix philosophy, Core mechanism only. Only shell-integration bundled.
     assert!(!doc.contains("bitty-terminal.palette"));
     assert!(!doc.contains("bitty-terminal.statusline"));
     assert!(!doc.contains("bitty-terminal.git-panel"));

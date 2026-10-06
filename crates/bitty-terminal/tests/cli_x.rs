@@ -42,9 +42,18 @@ fn x_help_lists_installed_plugins() {
 
 #[test]
 fn x_plugin_help_shows_static_commands() {
-    let out = run_bitty(&["x", "bitty-terminal.workspace", "--help"]);
+    // #1572 / CTX-0994: shell-integration only; workspace manifest retired.
+    let out = run_bitty(&["x", "bitty-terminal.shell-integration", "--help"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
-    assert!(stdout(&out).contains("bitty-terminal.workspace"));
+    assert!(stdout(&out).contains("bitty-terminal.shell-integration"));
+    // Retired workspace id is now unknown (plugin error, exit 4).
+    let retired = run_bitty(&["x", "bitty-terminal.workspace", "--help"]);
+    assert_eq!(
+        retired.status.code(),
+        Some(4),
+        "stderr: {}",
+        stderr(&retired)
+    );
 }
 
 #[test]
@@ -62,18 +71,25 @@ fn x_unknown_plugin_is_plugin_error() {
 
 #[test]
 fn x_execution_attempt_is_plugin_error_without_vm() {
-    let out = run_bitty(&["x", "bitty-terminal.workspace", "open"]);
+    // Shell-integration declares no commands, so any command is a plugin error.
+    let out = run_bitty(&["x", "bitty-terminal.shell-integration", "open"]);
     assert_eq!(out.status.code(), Some(4), "stderr: {}", stderr(&out));
-    assert!(stderr(&out).contains("bitty-terminal.workspace"));
+    assert!(stderr(&out).contains("bitty-terminal.shell-integration"));
 }
 
 #[test]
 fn x_rejects_usage_errors() {
     for args in [
         vec!["x"],
-        vec!["x", "bitty-terminal.workspace"],
-        vec!["x", "bitty-terminal.workspace", "open", "--"],
-        vec!["x", "bitty-terminal.workspace", "open", "--format", "yaml"],
+        vec!["x", "bitty-terminal.shell-integration"],
+        vec!["x", "bitty-terminal.shell-integration", "open", "--"],
+        vec![
+            "x",
+            "bitty-terminal.shell-integration",
+            "open",
+            "--format",
+            "yaml",
+        ],
         vec!["--socket", "/tmp/x.sock", "x", "--help"],
     ] {
         let out = run_bitty(&args);

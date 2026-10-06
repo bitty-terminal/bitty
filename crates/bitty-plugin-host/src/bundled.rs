@@ -2,8 +2,11 @@
 //!
 //! This module defines the **exact** accepted bundled-disabled set for `v1`
 //! per the Default Distribution RFC (`OQ-002`, accepted 2026-08-29) and the
-//! Plugin Roadmap: two bundled plugins, `bitty-terminal.shell-integration`
-//! and `bitty-terminal.workspace`. `statusline`
+//! Plugin Roadmap: one bundled plugin, `bitty-terminal.shell-integration`
+//! (`#1572`, `CTX-0994`: the `bitty-terminal.workspace` manifest retired —
+//! workspace commands run in Core and workspace presentation belongs to the
+//! future first-party `bar` plugin, so the bundled catalog is
+//! shell-integration only). `statusline`
 //! migrated to an independent first-party package (OQ-053, `CTX-0398`),
 //! `palette` migrated to an independent first-party package (OQ-053,
 //! `CTX-0397`), `git-panel` migrated to an independent first-party
@@ -49,20 +52,10 @@
 
 use crate::capability::CapabilityId;
 use crate::manifest::{
-    CapabilityRequests, Compat, LazyCommand, LazyTriggers, PluginId, PluginIdentity,
-    PluginManifest, QualifiedName,
+    CapabilityRequests, Compat, LazyTriggers, PluginId, PluginIdentity, PluginManifest,
 };
 
-/// One schema-less lazy command declaration (bundled manifests are static).
-fn lazy_command(id: &str) -> LazyCommand {
-    LazyCommand {
-        id: QualifiedName::new(id).expect("bundled command id must parse"),
-        args_schema: None,
-        result_schema: None,
-    }
-}
-
-/// Canonical version for the two `v1` bundled plugins (SemVer 2).
+/// Canonical version for the `v1` bundled plugin (SemVer 2).
 const BUNDLED_VERSION: &str = "0.1.0";
 
 /// Compat range for the bundled set: `>=0.1,<1.0` with Plugin API `^1.0`.
@@ -123,77 +116,25 @@ pub fn shell_integration_manifest() -> PluginManifest {
     }
 }
 
-/// Canonical workspace plugin id (`bitty-terminal.workspace`).
-pub const WORKSPACE_PLUGIN_ID: &str = "bitty-terminal.workspace";
-
-/// Canonical workspace claim (`workspaceline`).
-pub const WORKSPACELINE_CLAIM: &str = "workspaceline";
-
-/// Canonical workspace commands (`bitty-terminal.workspace:*`).
-pub const WORKSPACE_COMMANDS: &[&str] = &[
-    "bitty-terminal.workspace:new",
-    "bitty-terminal.workspace:close",
-    "bitty-terminal.workspace:next",
-];
-
-fn workspace_lazy_triggers() -> LazyTriggers {
-    LazyTriggers {
-        commands: WORKSPACE_COMMANDS.iter().map(|c| lazy_command(c)).collect(),
-        events: vec![
-            "terminal.title-changed".to_string(),
-            "focus.changed".to_string(),
-        ],
-        claims: vec![WORKSPACELINE_CLAIM.to_string()],
-    }
-}
-
-/// `bitty-terminal.workspace` — workspace commands, workspaceline presentation, ordering,
-/// key bindings, and closing policy.
-///
-/// A bitty workspace is a tab group within a window (wezterm inverts this:
-/// workspace > window > tab > pane).
-///
-/// Capability: `ui.rich` (workspaceline presentation via rich primitives).
-/// Claims: `workspaceline` exclusive (register vs claim semantics, duplicate
-/// claim is diagnosed not last-wins).
-/// Commands reserve workspace actions at graph construction
-/// (`bitty-terminal.workspace:*`).
-#[must_use]
-pub fn workspace_manifest() -> PluginManifest {
-    let mut caps = CapabilityRequests::default();
-    caps.ids
-        .insert(CapabilityId::parse("ui.rich").expect("known capability"));
-    PluginManifest {
-        identity: bundled_identity(
-            WORKSPACE_PLUGIN_ID,
-            "Workspace",
-            "Workspace commands, workspaceline presentation, ordering and closing policy",
-        ),
-        compat: bundled_compat(),
-        dependencies: Vec::new(),
-        provided_services: Vec::new(),
-        required_services: Vec::new(),
-        capabilities: caps,
-        tools: Vec::new(),
-        network: Vec::new(),
-        limits: Default::default(),
-        lazy: workspace_lazy_triggers(),
-        raw_bytes_len: 512,
-    }
-}
-
 // ── catalog helpers ───────────────────────────────────────────────────────
 
-/// Both bundled-disabled manifests for `v1` (`shell-integration`,
-/// `workspace`; fresh install: staged but not enabled). ai-panel,
+/// The single bundled-disabled manifest for `v1` (`shell-integration`;
+/// #1572 / CTX-0994: the `bitty-terminal.workspace` manifest (plus
+/// `WORKSPACE_PLUGIN_ID`, `WORKSPACELINE_CLAIM`, `WORKSPACE_COMMANDS`, and
+/// the `tabs`/`tabline` canonicalizers — the latter already purged by
+/// CTX-0974) is retired. Workspace commands run in Core and workspace
+/// presentation belongs to the future first-party `bar` plugin. The
+/// `workspaceline` claim vocabulary itself stays valid for that future
+/// plugin; only the bundled manifest is gone, so no constant for it lives
+/// here anymore. Fresh install: staged but not enabled. ai-panel,
 /// mail-panel, project and browser-panel were removed per Unix philosophy
 /// (CTX-0886): Core provides mechanism only.
 #[must_use]
 pub fn all_bundled_manifests() -> Vec<PluginManifest> {
-    vec![shell_integration_manifest(), workspace_manifest()]
+    vec![shell_integration_manifest()]
 }
 
-/// Plugin ids of the two bundled-disabled plugins, in catalog order.
+/// Plugin ids of the bundled-disabled plugins, in catalog order.
 #[must_use]
 pub fn bundled_ids() -> Vec<PluginId> {
     all_bundled_manifests()
@@ -210,25 +151,21 @@ pub fn bundled_ids_sorted() -> Vec<String> {
     ids
 }
 
-/// Whether `id` is one of the two bundled ids (canonical).
+/// Whether `id` is the bundled id (canonical).
 #[must_use]
 pub fn is_bundled(id: &PluginId) -> bool {
-    matches!(
-        id.as_str(),
-        "bitty-terminal.shell-integration" | "bitty-terminal.workspace"
-    )
+    matches!(id.as_str(), "bitty-terminal.shell-integration")
 }
 
 /// Lookup a bundled manifest by its fully qualified id string, if present.
 ///
-/// Accepts only the canonical ids. Unknown ids return `None`.
+/// Accepts only the canonical id. Unknown ids return `None`.
 /// Safe-mode shape is unchanged: bundled ids are `bitty-terminal.*` (not
 /// `bitty.` prefix) so `--safe` still rejects them — no builtin promotion.
 #[must_use]
 pub fn bundled_manifest_for(id: &str) -> Option<PluginManifest> {
     match id.trim() {
         "bitty-terminal.shell-integration" => Some(shell_integration_manifest()),
-        "bitty-terminal.workspace" => Some(workspace_manifest()),
         _ => None,
     }
 }
@@ -248,18 +185,13 @@ mod tests {
     #[test]
     fn bundled_manifests_validate_and_have_expected_ids() {
         let all = all_bundled_manifests();
-        assert_eq!(all.len(), 2);
+        // #1572 / CTX-0994: shell-integration only; workspace manifest retired.
+        assert_eq!(all.len(), 1);
         for m in &all {
             assert_manifest_valid(m);
         }
         let ids = bundled_ids_sorted();
-        assert_eq!(
-            ids,
-            vec![
-                "bitty-terminal.shell-integration",
-                "bitty-terminal.workspace",
-            ]
-        );
+        assert_eq!(ids, vec!["bitty-terminal.shell-integration",]);
         // CTX-0886: Unix philosophy, Core mechanism only. Removed plugins are not bundled.
         assert!(!ids.contains(&"bitty-terminal.tabs".to_string()));
         assert!(!ids.contains(&"bitty-terminal.palette".to_string()));
@@ -291,8 +223,14 @@ mod tests {
         // CTX-0974 (DEC-0100 waiver): tabs alias purged early, no longer bundled.
         assert!(!is_bundled(&PluginId::new("bitty-terminal.tabs").unwrap()));
         assert!(bundled_manifest_for("bitty-terminal.tabs").is_none());
-        assert!(is_bundled(
+        // #1572 / CTX-0994: workspace manifest retired; not bundled nor resolvable.
+        assert!(!ids.contains(&"bitty-terminal.workspace".to_string()));
+        assert!(!is_bundled(
             &PluginId::new("bitty-terminal.workspace").unwrap()
+        ));
+        assert!(bundled_manifest_for("bitty-terminal.workspace").is_none());
+        assert!(is_bundled(
+            &PluginId::new("bitty-terminal.shell-integration").unwrap()
         ));
     }
 
@@ -306,30 +244,6 @@ mod tests {
         );
         assert_eq!(m.lazy.events.len(), 3);
         assert!(m.lazy.commands.is_empty());
-    }
-
-    #[test]
-    fn workspace_manifest_has_workspaceline_claim_and_commands() {
-        let m = workspace_manifest();
-        assert!(
-            m.capabilities
-                .ids
-                .contains(&CapabilityId::parse("ui.rich").unwrap())
-        );
-        assert!(m.lazy.claims.contains(&"workspaceline".to_string()));
-        assert_eq!(m.lazy.claims.len(), 1);
-        // Canonical workspace commands only (tabs alias purged per CTX-0974).
-        assert_eq!(m.lazy.commands.len(), 3);
-        for cmd in [
-            "bitty-terminal.workspace:new",
-            "bitty-terminal.workspace:close",
-            "bitty-terminal.workspace:next",
-        ] {
-            assert!(
-                m.lazy.commands.iter().any(|c| c.id.as_str() == cmd),
-                "missing {cmd}"
-            );
-        }
     }
 
     #[test]

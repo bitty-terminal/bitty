@@ -2600,10 +2600,24 @@ pub struct WorkspaceConfig {
     /// Switcher bar visibility (`workspace.show_bar`). `None` means the
     /// layer says nothing and the default-on bar stays; `Some(false)` opts
     /// out (issue #1333). Effective default resolves to `true`.
+    ///
+    /// #1572 / CTX-0994 decision (recorded): RETAIN as bar-plugin-owned
+    /// input. Core draws no workspace display (CTX-0979) and carries no
+    /// visibility state, so nothing in Core consumes this key — the future
+    /// first-party `bar` plugin reads it. Mapping it under
+    /// `plugins."bitty-terminal.bar"` now would dangle (that plugin has no
+    /// settings schema yet) and removal would break existing configs with
+    /// no migration path, so the `workspace.*` spelling stays.
     pub show_bar: Option<bool>,
-    /// Window edge of the Core-owned workspace bar band
+    /// Window edge of the bar-plugin-owned workspace bar band
     /// (`workspace.bar.edge`, CTX-0873). `None` means the layer says
     /// nothing; the effective default is [`WorkspaceBarEdge::Bottom`].
+    ///
+    /// #1572 / CTX-0994 decision (recorded): same retention rationale as
+    /// [`Self::show_bar`] — bar plugin input, no Core consumption, no
+    /// `plugins."bitty-terminal.bar"` mapping until that plugin exists.
+    /// The `lua-and-xdg.md` mapping record lands in the `bitty-terminal-docs`
+    /// follow-up PR (docs repos never mix into a code PR).
     pub bar_edge: Option<WorkspaceBarEdge>,
 }
 

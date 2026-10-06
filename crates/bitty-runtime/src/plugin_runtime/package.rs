@@ -1825,7 +1825,8 @@ mod tests {
     fn bundled_id_is_reserved() {
         let scratch = scratch("bundled");
         let store = scratch.join("store");
-        let source = write_plugin(&scratch, "bitty-terminal.workspace", "1.0.0", None);
+        // #1572 / CTX-0994: shell-integration is the remaining bundled id.
+        let source = write_plugin(&scratch, "bitty-terminal.shell-integration", "1.0.0", None);
         let error = install_local_dir(
             &store,
             &source,
@@ -1835,6 +1836,16 @@ mod tests {
         .expect_err("bundled ids must not be shadowed");
         assert!(matches!(error, PackageOpError::BundledIdReserved { .. }));
         assert!(!store.join("packages").exists());
+        // Retired workspace id is no longer reserved: shadowing it installs.
+        let ws_source = write_plugin(&scratch, "bitty-terminal.workspace", "1.0.0", None);
+        install_local_dir(
+            &store,
+            &ws_source,
+            &LocalInstallOptions::default(),
+            &mut |_| Ok(true),
+        )
+        .expect("retired workspace id installs as external")
+        .expect("approved");
         let _ = std::fs::remove_dir_all(&scratch);
     }
 

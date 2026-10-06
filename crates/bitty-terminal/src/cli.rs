@@ -2006,7 +2006,7 @@ pub(crate) fn help_text() -> String {
            bitty doctor\n  \
            bitty doctor --format json\n  \
            bitty plugin list\n  \
-           bitty plugin install bitty-terminal.workspace --yes\n",
+           bitty plugin install bitty-terminal.shell-integration --yes\n",
         crate::version::version_semver()
     )
 }

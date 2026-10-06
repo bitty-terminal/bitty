@@ -982,10 +982,54 @@ fn read_executable(path: &Path) -> Result<Vec<u8>, ComponentFailure> {
 }
 
 fn install_staged(staged: &StagedSource, user: &Path) -> Result<String, ComponentFailure> {
-    let version_dir = user.join(&staged.name).join(&staged.version);
+    let component_dir = user.join(&staged.name);
+    let version_dir = component_dir.join(&staged.version);
+    // Fail closed on symlinked install dirs: a symlinked component or
+    // version dir would make `create_dir_all`/`write` below escape the user
+    // component root, so a pre-existing symlink (or any non-directory)
+    // refuses the install before any mutation.
+    for path in [&component_dir, &version_dir] {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(_) => {
+                return Err(ComponentFailure::generic(format!(
+                    "bitty component: refusing symlink or non-directory '{}'",
+                    path.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(ComponentFailure::generic(format!(
+                    "bitty component: cannot inspect '{}': {error}",
+                    path.display()
+                )));
+            }
+        }
+    }
     let descriptor_path = version_dir.join(COMPONENT_DESCRIPTOR_FILE);
     let executable_path = version_dir.join(executable_file_name(&staged.executable));
-    let current_path = user.join(&staged.name).join("current");
+    let current_path = component_dir.join("current");
+    // Fail closed on symlinked install files: `write` follows symlinks, so
+    // a pre-existing symlinked executable/descriptor/`current` would escape
+    // the version dir. Missing paths are fine (fresh install).
+    for path in [&executable_path, &descriptor_path, &current_path] {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(ComponentFailure::generic(format!(
+                    "bitty component: refusing symlink install path '{}'",
+                    path.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(ComponentFailure::generic(format!(
+                    "bitty component: cannot inspect '{}': {error}",
+                    path.display()
+                )));
+            }
+        }
+    }
     let digest = bitty_package::integrity::sha256_hex(&staged.bytes);
 
     // Re-adding an installed version with a different digest fails; the
@@ -1396,6 +1440,119 @@ mod tests {
         let mut buf = Vec::new();
         let code = run_component_subcommand(&raw, &context, &mut buf);
         assert_eq!(code, EXIT_COMPONENT);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn install_rejects_non_directory_component_dir() {
+        let base = scratch("non-dir-component");
+        let user = base.join("user");
+        std::fs::create_dir_all(&user).expect("user dir");
+        // A regular file where the component dir belongs fails closed
+        // before any mutation (same guard as symlinks, portable).
+        std::fs::write(user.join("net"), "not-a-dir").expect("file");
+        let source = write_source_dir(&base.join("source"), "net", "0.0.1", "[1, 1]");
+        let mut out = Vec::new();
+        let error = op_add(&source.display().to_string(), None, Some(&user), &mut out)
+            .expect_err("non-directory component dir must fail");
+        assert_eq!(error.exit, EXIT_GENERIC, "{}", error.message);
+        assert!(
+            error.message.contains("refusing symlink or non-directory"),
+            "{}",
+            error.message
+        );
+        assert!(!user.join("net").join("0.0.1").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_rejects_symlinked_component_dir() {
+        let base = scratch("symlink-component-dir");
+        let user = base.join("user");
+        std::fs::create_dir_all(&user).expect("user dir");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        std::fs::write(outside.join("marker"), "outside").expect("marker");
+        std::os::unix::fs::symlink(&outside, user.join("net")).expect("symlink");
+        let source = write_source_dir(&base.join("source"), "net", "0.0.1", "[1, 1]");
+        let mut out = Vec::new();
+        let error = op_add(&source.display().to_string(), None, Some(&user), &mut out)
+            .expect_err("symlinked component dir must fail");
+        assert_eq!(error.exit, EXIT_GENERIC, "{}", error.message);
+        assert!(
+            error.message.contains("refusing symlink"),
+            "{}",
+            error.message
+        );
+        // Nothing escaped through the link.
+        assert!(!outside.join("0.0.1").exists());
+        assert_eq!(
+            std::fs::read_to_string(outside.join("marker")).expect("marker"),
+            "outside"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_rejects_symlinked_version_dir() {
+        let base = scratch("symlink-version-dir");
+        let user = base.join("user");
+        std::fs::create_dir_all(user.join("net")).expect("component dir");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        std::fs::write(outside.join("marker"), "outside").expect("marker");
+        std::os::unix::fs::symlink(&outside, user.join("net").join("0.0.1")).expect("symlink");
+        let source = write_source_dir(&base.join("source"), "net", "0.0.1", "[1, 1]");
+        let mut out = Vec::new();
+        let error = op_add(&source.display().to_string(), None, Some(&user), &mut out)
+            .expect_err("symlinked version dir must fail");
+        assert_eq!(error.exit, EXIT_GENERIC, "{}", error.message);
+        assert!(
+            error.message.contains("refusing symlink"),
+            "{}",
+            error.message
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.join("marker")).expect("marker"),
+            "outside"
+        );
+        assert!(!outside.join(COMPONENT_DESCRIPTOR_FILE).exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_rejects_symlinked_install_file() {
+        let base = scratch("symlink-install-file");
+        let user = base.join("user");
+        let version_dir = user.join("net").join("0.0.1");
+        std::fs::create_dir_all(&version_dir).expect("version dir");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        std::fs::write(outside.join("secret"), "secret").expect("secret");
+        let executable_name = format!("{COMPONENT_EXECUTABLE_PREFIX}net");
+        std::os::unix::fs::symlink(
+            outside.join("secret"),
+            version_dir.join(executable_file_name(&executable_name)),
+        )
+        .expect("symlink");
+        let source = write_source_dir(&base.join("source"), "net", "0.0.1", "[1, 1]");
+        let mut out = Vec::new();
+        let error = op_add(&source.display().to_string(), None, Some(&user), &mut out)
+            .expect_err("symlinked executable path must fail");
+        assert_eq!(error.exit, EXIT_GENERIC, "{}", error.message);
+        assert!(
+            error.message.contains("refusing symlink install path"),
+            "{}",
+            error.message
+        );
+        // The link target is untouched.
+        assert_eq!(
+            std::fs::read_to_string(outside.join("secret")).expect("secret"),
+            "secret"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 

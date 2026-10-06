@@ -8,7 +8,7 @@
 //! commit. Shift still forces selection; floating leaves stay on the
 //! Alt+drag path; single-leaf trees fail soft to block selection.
 use bitty_platform::{CursorPosition, MouseButton, NamedKey, PressState};
-use bitty_runtime::{LayoutNode, Runtime, SplitAxis, View, ViewId};
+use bitty_runtime::{LayoutNode, Runtime, RuntimeConfig, SplitAxis, UiRect, View, ViewId};
 
 fn make_runtime() -> Runtime {
     Runtime::with_defaults().expect("defaults must build")
@@ -244,4 +244,133 @@ fn cursor_left_cancels_without_committing() {
         alt: false,
         super_pressed: false,
     };
+}
+
+// -- Issue #1710 (CTX-0995) tiled-drag follow-ups -------------------------
+
+#[test]
+fn tracking_release_ends_drag_instead_of_stranding() {
+    // Capture-strand: the focused app enables mouse tracking mid-drag.
+    // The terminating left release must end the tiled drag (committing
+    // the drop) instead of being captured and stranding the gesture.
+    let mut rt = make_runtime();
+    rt.set_layout(two_pane());
+    rt.handle_cursor_moved(cell_pixels(10, 12));
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Pressed));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(rt.tiled_drag_active());
+    // Mid-drag the app enables tracking (1000): capture becomes active.
+    rt.handle_pty_bytes(b"\x1b[?1000h");
+    rt.drain_pending_input();
+    assert!(
+        rt.mouse_capture_active(),
+        "tracking must be active mid-drag"
+    );
+    // Motion still tracks the preview (drag owns motion before capture).
+    rt.handle_cursor_moved(cell_pixels(60, 12));
+    assert_eq!(rt.tiled_drag_preview(), Some(ViewId::new(2)));
+    // Release ends the drag and commits — it must not strand, must not
+    // report to the app (which never saw the press), and must not select.
+    rt.handle_mouse_input(release(MouseButton::Left));
+    assert!(
+        !rt.tiled_drag_active(),
+        "tracking release must end the drag, not strand it"
+    );
+    assert!(
+        rt.pending_input().is_empty(),
+        "stranded release must not report to the app"
+    );
+    assert!(!rt.has_selection());
+    // A later ordinary release must not commit the old source again.
+    let after = rt.layout().clone();
+    rt.handle_cursor_moved(cell_pixels(10, 12));
+    rt.handle_mouse_input(release(MouseButton::Left));
+    assert_eq!(*rt.layout(), after);
+    assert!(!rt.tiled_drag_active());
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
+}
+
+#[test]
+fn outer_gaps_drop_selects_correct_target() {
+    // Outer-gaps shift: with nonzero gaps_out the drop point must stay in
+    // container coordinates (the hit test applies the outer inset itself).
+    // Grab well inside the left pane, then drop on the first cols of the
+    // right pane: the shifted mapping would self-drop (None) or hit left.
+    let mut rt = Runtime::new(RuntimeConfig {
+        gaps_in: 0,
+        gaps_out: 2,
+        ..RuntimeConfig::default()
+    })
+    .expect("gapped runtime must build");
+    rt.set_layout(two_pane());
+    rt.handle_cursor_moved(cell_pixels(10, 12));
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Pressed));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(rt.tiled_drag_active());
+    assert_eq!(rt.tiled_drag_source(), Some(ViewId::new(1)));
+    // Container 80x24 with outer 2: left (2,2,38,20), right (40,2,38,20).
+    // Col 41 is the second col of the right pane.
+    rt.handle_cursor_moved(cell_pixels(41, 12));
+    assert_eq!(
+        rt.tiled_drag_preview(),
+        Some(ViewId::new(2)),
+        "outer-gaps drop must hit the right pane, not shift to left"
+    );
+    rt.handle_mouse_input(release(MouseButton::Left));
+    assert!(!rt.tiled_drag_active());
+    assert!(!rt.has_selection());
+    let ids = rt.layout().leaf_ids();
+    assert!(ids.contains(&ViewId::new(1)) && ids.contains(&ViewId::new(2)));
+    assert_ne!(
+        rt.layout().split_ratio_at(&[]),
+        Some(0.5),
+        "drop beside the target must re-parent with position sizing"
+    );
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
+}
+
+#[test]
+fn overlay_covered_drop_is_noop_without_tier_flip() {
+    // Overlay-tier drop: a floating overlay covering the base gap is never
+    // a tiled drop target. Hovering it clears the preview; release leaves
+    // the tree untouched instead of re-parenting into the overlay subtree.
+    let mut rt = Runtime::new(RuntimeConfig {
+        gaps_in: 2,
+        gaps_out: 0,
+        ..RuntimeConfig::default()
+    })
+    .expect("gapped runtime must build");
+    let overlay = LayoutNode::overlay(
+        two_pane(),
+        LayoutNode::leaf(View::new(ViewId::new(3), 10, 5)),
+        UiRect::new(38, 0, 4, 24),
+    );
+    rt.set_layout(overlay);
+    let before = rt.layout().clone();
+    rt.handle_cursor_moved(cell_pixels(10, 12));
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Pressed));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(rt.tiled_drag_active());
+    assert_eq!(rt.tiled_drag_source(), Some(ViewId::new(1)));
+    // Gap band (39..41) under the overlay: no tiled target.
+    rt.handle_cursor_moved(cell_pixels(40, 12));
+    assert_eq!(
+        rt.tiled_drag_preview(),
+        None,
+        "overlay hover must clear the preview, not target the float"
+    );
+    rt.handle_mouse_input(release(MouseButton::Left));
+    assert!(!rt.tiled_drag_active());
+    assert_eq!(
+        *rt.layout(),
+        before,
+        "overlay drop must leave the tree untouched (no tier-flip)"
+    );
+    assert!(!rt.has_selection());
+    // The overlay leaf is still floating; the source stayed tiled.
+    let tiers: std::collections::HashMap<ViewId, Option<bitty_runtime::OverlayTier>> =
+        rt.layout().leaf_overlay_tiers().into_iter().collect();
+    assert_eq!(tiers.get(&ViewId::new(1)), Some(&None));
+    assert!(tiers.get(&ViewId::new(3)).is_some_and(|t| t.is_some()));
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
 }

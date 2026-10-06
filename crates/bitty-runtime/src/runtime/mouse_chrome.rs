@@ -379,13 +379,16 @@ impl Runtime {
     }
 
     /// Maps a physical cursor position to container-cell coordinates for
-    /// split-handle hit-testing (issue #1348).
+    /// split-handle and tiled-drop hit-testing (issues #1348, #1710).
     ///
-    /// Uses the same origin mapping as [`Runtime::cursor_to_leaf_cell`]
-    /// (window padding plus the outer gap inset, live cell metrics) so a
-    /// border press and a leaf press agree on which cell owns the pointer.
-    /// Unlike the leaf variant there is no leaf lookup: gap bands and
-    /// zero-gap boundary lines own no leaf but may own a split handle.
+    /// Removes only the window padding inset and converts with live cell
+    /// metrics, keeping the point in container coordinates: layout
+    /// hit-tests (`hit_test_leaf`, `hit_test_split_handle(s)`,
+    /// `drop_spec_for_point`) apply the outer gap inset themselves via
+    /// `layout_with_gaps`, so subtracting `gaps_out` here would shift the
+    /// drop target with nonzero outer gaps. Unlike the leaf variant there
+    /// is no leaf lookup: gap bands and zero-gap boundary lines own no
+    /// leaf but may own a split handle.
     /// Returns `None` when the pointer maps outside the container origin
     /// or the cell metrics are degenerate.
     fn cursor_to_layout_point(&self, pos: CursorPosition) -> Option<UiPoint> {
@@ -396,8 +399,8 @@ impl Runtime {
             return None;
         }
         let pad_px = f64::from(self.window_padding_physical());
-        let x = pos.x - pad_px - f64::from(self.config.gaps_out) * cell_w;
-        let y = pos.y - pad_px - f64::from(self.config.gaps_out) * cell_h;
+        let x = pos.x - pad_px;
+        let y = pos.y - pad_px;
         if x < 0.0 || y < 0.0 {
             return None;
         }

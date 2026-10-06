@@ -278,6 +278,12 @@ impl AgentRole {
     ///
     /// Families without an accepted meaning for the role map to absence:
     /// the candidate never invents authority.
+    ///
+    /// CTX-0916 S4 (DEC-0102): the Agent/Mcp/Ai families left the Core seed
+    /// (zero-AI default), so no role ceiling names them anymore. AI authority
+    /// returns only through the ceiling-contribution API (S5) with an
+    /// explicitly extended catalog; until then every ceiling below is AI-free
+    /// fail-closed.
     #[must_use]
     pub const fn capability_ceiling(self) -> &'static [CapabilityFamily] {
         match self {
@@ -286,15 +292,11 @@ impl AgentRole {
                 CapabilityFamily::Process,
                 CapabilityFamily::Network,
                 CapabilityFamily::Terminal,
-                CapabilityFamily::Agent,
-                CapabilityFamily::Mcp,
-                CapabilityFamily::Ai,
             ],
             Self::Implementer => &[
                 CapabilityFamily::Fs,
                 CapabilityFamily::Process,
                 CapabilityFamily::Terminal,
-                CapabilityFamily::Agent,
             ],
             Self::Tester => &[CapabilityFamily::Fs, CapabilityFamily::Terminal],
             Self::Reviewer => &[CapabilityFamily::Terminal],
@@ -577,10 +579,25 @@ mod tests {
             AgentRole::Reviewer.capability_ceiling(),
             &[CapabilityFamily::Terminal]
         );
-        assert!(
-            AgentRole::Commander
-                .capability_ceiling()
-                .contains(&CapabilityFamily::Agent)
+        // CTX-0916 S4 (DEC-0102): no role ceiling names AI families anymore
+        // (zero-AI default, fail-closed). Commander keeps the widest Core
+        // ceiling; AI authority returns only via the S5 contribution API.
+        assert_eq!(
+            AgentRole::Commander.capability_ceiling(),
+            &[
+                CapabilityFamily::Fs,
+                CapabilityFamily::Process,
+                CapabilityFamily::Network,
+                CapabilityFamily::Terminal,
+            ]
+        );
+        assert_eq!(
+            AgentRole::Implementer.capability_ceiling(),
+            &[
+                CapabilityFamily::Fs,
+                CapabilityFamily::Process,
+                CapabilityFamily::Terminal,
+            ]
         );
         assert!(
             !AgentRole::Tester

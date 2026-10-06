@@ -289,9 +289,6 @@ impl CapabilityDomain {
             | CapabilityFamily::Panel
             | CapabilityFamily::Browser
             | CapabilityFamily::Layout
-            | CapabilityFamily::Agent
-            | CapabilityFamily::Mcp
-            | CapabilityFamily::Ai
             | CapabilityFamily::Workspace => &[],
         }
     }
@@ -405,9 +402,12 @@ mod tests {
                 CapabilityDomain::TerminalOutput
             ]
         );
-        assert!(CapabilityDomain::for_family(CapabilityFamily::Agent).is_empty());
-        assert!(CapabilityDomain::for_family(CapabilityFamily::Ai).is_empty());
         assert!(CapabilityDomain::for_family(CapabilityFamily::Ui).is_empty());
+        // CTX-0916 S4: Agent/Mcp/Ai no longer name Core families at all, so
+        // there is no variant left to assert on here (the zero-AI default is
+        // pinned by `core_seed_rejects_ai_families_fail_closed` in
+        // `capability.rs`). The unmapped passthrough below covers the
+        // remaining non-domain families.
         // `Env` reads are host-mediated per-key grants (`bitty.env`); the
         // trust matrix claims no domain for them (added with #1308).
         assert!(CapabilityDomain::for_family(CapabilityFamily::Env).is_empty());
@@ -481,13 +481,15 @@ mod tests {
 
     #[test]
     fn unmapped_families_defer_to_grants() {
-        // The adopted matrix covers no agent/AI/UI families: trust passes
-        // them through at every level and their grants decide elsewhere.
+        // The adopted matrix covers no UI/Runtime/Workspace families: trust
+        // passes them through at every level and their grants decide
+        // elsewhere. (CTX-0916 S4: Agent/Mcp/Ai no longer name Core families
+        // at all, so they cannot reach this gate; Core-only installs reject
+        // them at parse time fail-closed.)
         for family in [
-            CapabilityFamily::Agent,
-            CapabilityFamily::Mcp,
-            CapabilityFamily::Ai,
             CapabilityFamily::Ui,
+            CapabilityFamily::Runtime,
+            CapabilityFamily::Workspace,
         ] {
             for level in [
                 TrustLevel::Core,

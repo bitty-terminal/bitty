@@ -35,12 +35,10 @@ pub enum CapabilityFamily {
     Browser,
     /// Layout algorithm proposals for the workspace compositor (CW-07).
     Layout,
-    /// Agent context, memory and workspace (CTX-0111, ai-panel).
-    Agent,
-    /// MCP tool invocation per-tool (CTX-0111, ai-panel).
-    Mcp,
-    /// AI provider/stream/model (CTX-0111, ai-panel).
-    Ai,
+    // CTX-0916 S4 (DEC-0102, breaking cutover): the Agent/Mcp/Ai families
+    // left the Core seed (zero-AI default). Core-only installs reject
+    // `agent.*`/`mcp.*`/`ai.*` fail-closed; they validate only through an
+    // explicitly extended catalog (see `bitty_package::CapabilityCatalog`).
     /// Workspace L1 domain (ADR-0014, CTX-0889): `workspace.read` observes
     /// workspace identity/order/attention; `workspace.control` mutates
     /// workspaces through the same Core handlers as keybindings. Read never
@@ -75,9 +73,6 @@ impl CapabilityFamily {
             "panel" => Some(Self::Panel),
             "browser" => Some(Self::Browser),
             "layout" => Some(Self::Layout),
-            "agent" => Some(Self::Agent),
-            "mcp" => Some(Self::Mcp),
-            "ai" => Some(Self::Ai),
             "workspace" => Some(Self::Workspace),
             "history" => Some(Self::History),
             _ => None,
@@ -102,9 +97,6 @@ impl CapabilityFamily {
             Self::Panel => "panel",
             Self::Browser => "browser",
             Self::Layout => "layout",
-            Self::Agent => "agent",
-            Self::Mcp => "mcp",
-            Self::Ai => "ai",
             Self::Workspace => "workspace",
             Self::History => "history",
         }
@@ -173,13 +165,6 @@ impl CapabilityFamily {
                 "browser.storage",
             ],
             Self::Layout => &["layout.provider"],
-            Self::Agent => &[
-                "agent.context.terminal",
-                "agent.context.workspace",
-                "agent.memory",
-            ],
-            Self::Mcp => &["mcp.invoke"],
-            Self::Ai => &["ai.provider", "ai.stream", "ai.model"],
             Self::Workspace => &["workspace.read", "workspace.control"],
             // RFC-0004 read-only history/search/selection family (CTX-0955).
             // New family beside `terminal.*`; the `Terminal` table above is
@@ -455,13 +440,6 @@ pub fn effect_statement_with(catalog: &CapabilityCatalog, id: &CapabilityId) -> 
         "browser.file-url" => "Allow file:// navigation validated against project scope",
         "browser.storage" => "Persist browser cookies/cache with bounded quota",
         "layout.provider" => "Provide layout algorithms for the workspace",
-        "agent.context.terminal" => "Observe terminal context for this agent (bounded 32KiB)",
-        "agent.context.workspace" => "Observe workspace context for this agent (bounded 32KiB)",
-        "agent.memory" => "Persist agent conversational memory (opt-in, 0600, <=7 days)",
-        "mcp.invoke" => "Invoke allowlisted MCP tool (per-tool, bounded frame 256KiB)",
-        "ai.provider" => "Use allowlisted AI provider",
-        "ai.stream" => "Stream AI responses for this agent",
-        "ai.model" => "Select AI model for this agent (bounded)",
         "workspace.read" => "List workspaces and observe workspace events (no terminal content)",
         "workspace.control" => "Create, close, rename, and focus workspaces and move panels",
         "history.transcript.read" => {
@@ -593,9 +571,6 @@ mod tests {
             CapabilityFamily::Panel,
             CapabilityFamily::Browser,
             CapabilityFamily::Layout,
-            CapabilityFamily::Agent,
-            CapabilityFamily::Mcp,
-            CapabilityFamily::Ai,
             CapabilityFamily::Workspace,
             CapabilityFamily::History,
         ];
@@ -607,8 +582,7 @@ mod tests {
                 // bare and parse with a parameter. The Process family holds
                 // both shapes since W-82 (`process.editor` takes no
                 // parameter; the temp path never leaves Core).
-                if bitty_package::manifest::capability_requires_param(raw) || *raw == "agent.memory"
-                {
+                if bitty_package::manifest::capability_requires_param(raw) {
                     assert!(
                         CapabilityId::parse(raw).is_err(),
                         "scoped capability must require a parameter: {raw}"
@@ -621,6 +595,64 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn core_seed_rejects_ai_families_fail_closed() {
+        // CTX-0916 S4 (DEC-0102): the Agent/Mcp/Ai families left the Core
+        // seed (zero-AI default). Every former `agent.*`/`mcp.*`/`ai.*`
+        // acceptance path now fails closed through the Core-seeded defaults:
+        // unknown family at parse time, unknown head at validation time.
+        // They validate only through an explicitly extended catalog (see
+        // `ai_families_validate_only_via_extended_catalog`).
+        use bitty_package::manifest as package_manifest;
+
+        let core = CapabilityCatalog::core();
+        assert!(!core.contains_family("agent"));
+        assert!(!core.contains_family("mcp"));
+        assert!(!core.contains_family("ai"));
+        for raw in [
+            "agent.context.terminal",
+            "agent.context.workspace",
+            "agent.memory:record-1",
+            "mcp.invoke:mail.list",
+            "ai.provider",
+            "ai.stream",
+            "ai.model",
+        ] {
+            assert!(
+                CapabilityId::parse(raw).is_err(),
+                "'{raw}' must fail closed on the Core seed"
+            );
+            assert!(
+                CapabilityId::parse_with(&core, raw).is_err(),
+                "'{raw}' must fail closed on the Core catalog"
+            );
+            assert!(
+                bitty_package::CapabilityId::parse_with(&core, raw).is_err(),
+                "'{raw}' must fail package validation on the Core catalog"
+            );
+            assert!(
+                package_manifest::validate_capability_with(&core, raw).is_err(),
+                "'{raw}' must fail manifest validation on the Core catalog"
+            );
+            let (head, has_param) = match raw.split_once(':') {
+                Some((h, _)) => (h, true),
+                None => (raw, false),
+            };
+            assert!(
+                validate_closed_capability(head, has_param, raw).is_err(),
+                "'{raw}' must fail host validation on the Core seed"
+            );
+            assert!(
+                validate_closed_capability_with(&core, head, has_param, raw).is_err(),
+                "'{raw}' must fail host validation on the Core catalog"
+            );
+        }
+        // The family vocabulary itself no longer names them.
+        assert_eq!(CapabilityFamily::parse("agent"), None);
+        assert_eq!(CapabilityFamily::parse("mcp"), None);
+        assert_eq!(CapabilityFamily::parse("ai"), None);
     }
 
     #[test]
@@ -793,9 +825,6 @@ mod tests {
             CapabilityFamily::Panel,
             CapabilityFamily::Browser,
             CapabilityFamily::Layout,
-            CapabilityFamily::Agent,
-            CapabilityFamily::Mcp,
-            CapabilityFamily::Ai,
             CapabilityFamily::Workspace,
             CapabilityFamily::History,
         ] {
@@ -853,7 +882,19 @@ mod tests {
         }
 
         // Divergent identifiers are rejected on both sides, on both paths.
-        for raw in ["terminal.unknown-thing", "ui.unknown", "fs.read"] {
+        // CTX-0916 S4: removed AI heads fail closed here too (zero-AI
+        // default; they validate only via an explicitly extended catalog).
+        for raw in [
+            "terminal.unknown-thing",
+            "ui.unknown",
+            "fs.read",
+            "agent.context.terminal",
+            "agent.memory:record-1",
+            "mcp.invoke:mail.list",
+            "ai.provider",
+            "ai.stream",
+            "ai.model",
+        ] {
             assert!(CapabilityId::parse(raw).is_err());
             assert!(bitty_package::CapabilityId::new(raw).is_err());
             assert!(CapabilityId::parse_with(&core, raw).is_err());
@@ -931,6 +972,116 @@ mod tests {
         let fresh = CapabilityCatalog::core();
         assert!(bitty_package::CapabilityId::parse_with(&fresh, "panel.custom-view").is_err());
         assert!(CapabilityId::parse_with(&fresh, "panel.custom-view").is_err());
+    }
+
+    #[test]
+    fn ai_families_validate_only_via_extended_catalog() {
+        // CTX-0916 S4 (DEC-0102): the AI families are the canonical additive
+        // example. `ai.*`/`mcp.*`/`agent.*` validate ONLY through an
+        // explicitly extended catalog; every Core-seeded default fails closed
+        // (see `core_seed_rejects_ai_families_fail_closed`).
+        use bitty_package::manifest as package_manifest;
+
+        let mut extended = CapabilityCatalog::core();
+        extended
+            .register(
+                "ai",
+                &[
+                    ("ai.provider", false),
+                    ("ai.stream", false),
+                    ("ai.model", false),
+                ],
+            )
+            .expect("ai extension registers");
+        extended
+            .register("mcp", &[("mcp.invoke", true)])
+            .expect("mcp extension registers");
+        extended
+            .register(
+                "agent",
+                &[
+                    ("agent.context.terminal", false),
+                    ("agent.context.workspace", false),
+                    ("agent.memory", true),
+                ],
+            )
+            .expect("agent extension registers");
+
+        // Package side (catalog-open vocabulary): the extended catalog
+        // accepts every contributed head with its parameter polarity ...
+        for raw in [
+            "ai.provider",
+            "ai.stream",
+            "ai.model",
+            "mcp.invoke:mail.list",
+            "agent.context.terminal",
+            "agent.context.workspace",
+            "agent.memory:record-1",
+        ] {
+            assert!(
+                bitty_package::CapabilityId::parse_with(&extended, raw).is_ok(),
+                "package must accept '{raw}' via extended catalog"
+            );
+            assert!(
+                package_manifest::validate_capability_with(&extended, raw).is_ok(),
+                "manifest helper must accept '{raw}' via extended catalog"
+            );
+        }
+        assert!(bitty_package::CapabilityId::parse_with(&extended, "ai.provider:extra").is_err());
+        assert!(bitty_package::CapabilityId::parse_with(&extended, "mcp.invoke").is_err());
+        assert!(bitty_package::CapabilityId::parse_with(&extended, "agent.memory").is_err());
+
+        // ... and the host closed-validation path (catalog-routed, enum-free)
+        // agrees identically through the same extended catalog ...
+        for (head, has_param, raw) in [
+            ("ai.provider", false, "ai.provider"),
+            ("ai.stream", false, "ai.stream"),
+            ("ai.model", false, "ai.model"),
+            ("mcp.invoke", true, "mcp.invoke:mail.list"),
+            ("agent.context.terminal", false, "agent.context.terminal"),
+            ("agent.context.workspace", false, "agent.context.workspace"),
+            ("agent.memory", true, "agent.memory:record-1"),
+        ] {
+            assert!(
+                validate_closed_capability_with(&extended, head, has_param, raw).is_ok(),
+                "host validate path must accept '{raw}' via extended catalog"
+            );
+        }
+        assert!(
+            validate_closed_capability_with(&extended, "ai.provider", true, "ai.provider:extra")
+                .is_err()
+        );
+        assert!(
+            validate_closed_capability_with(&extended, "mcp.invoke", false, "mcp.invoke").is_err()
+        );
+
+        // ... while the host identifier parse stays enum-closed (S1
+        // limitation, still pinned): even the extended catalog cannot mint a
+        // `CapabilityFamily` the Core vocabulary no longer names. This is the
+        // intended zero-AI default for every Core-only install path (grant,
+        // CLI, runtime), all of which parse through the Core seed.
+        for raw in [
+            "ai.provider",
+            "mcp.invoke:mail.list",
+            "agent.memory:record-1",
+        ] {
+            assert!(
+                CapabilityId::parse_with(&extended, raw).is_err(),
+                "host parse must still fail closed on '{raw}' (closed enum vocabulary)"
+            );
+            assert!(
+                CapabilityId::parse(raw).is_err(),
+                "host static parse must still fail closed on '{raw}'"
+            );
+        }
+
+        // A fresh Core seed is unaffected by the extension on every path.
+        let fresh = CapabilityCatalog::core();
+        assert!(
+            validate_closed_capability_with(&fresh, "ai.provider", false, "ai.provider").is_err()
+        );
+        assert!(bitty_package::CapabilityId::parse_with(&fresh, "ai.provider").is_err());
+        assert!(package_manifest::validate_capability_with(&fresh, "ai.provider").is_err());
     }
 
     #[test]

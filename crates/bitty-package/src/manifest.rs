@@ -313,9 +313,10 @@ pub const CAPABILITY_FAMILIES: &[&str] = &[
     "panel",
     "browser",
     "layout",
-    "agent",
-    "mcp",
-    "ai",
+    // CTX-0916 S4 (DEC-0102, breaking cutover): the Agent/Mcp/Ai families
+    // left the Core seed. They validate only through an explicitly extended
+    // catalog (see `CapabilityCatalog::register`); Core-only installs reject
+    // `agent.*`/`mcp.*`/`ai.*` fail-closed (zero-AI default).
     "workspace",
     // RFC-0004 read-only history/search/selection family (CTX-0955, W-139):
     // a NEW family beside `terminal.*`; the v1 `terminal` set stays frozen.
@@ -371,13 +372,11 @@ pub const CLOSED_CAPABILITY_HEADS: &[&str] = &[
     "browser.file-url",
     "browser.storage",
     "layout.provider",
-    "agent.context.terminal",
-    "agent.context.workspace",
-    "agent.memory",
-    "mcp.invoke",
-    "ai.provider",
-    "ai.stream",
-    "ai.model",
+    // CTX-0916 S4 (DEC-0102, breaking cutover): `agent.context.terminal`,
+    // `agent.context.workspace`, `agent.memory`, `mcp.invoke`, `ai.provider`,
+    // `ai.stream`, `ai.model` left the Core seed (see above). They validate
+    // only through an explicitly extended catalog; Core-only installs reject
+    // them fail-closed.
     "workspace.read",
     "workspace.control",
     // RFC-0004 read-only history/search/selection family (CTX-0955, W-139).
@@ -399,13 +398,7 @@ pub const CLOSED_CAPABILITY_HEADS: &[&str] = &[
 pub fn capability_requires_param(head: &str) -> bool {
     matches!(
         head,
-        "fs.read"
-            | "fs.write"
-            | "process.spawn"
-            | "network.connect"
-            | "mcp.invoke"
-            | "agent.memory"
-            | "env.read"
+        "fs.read" | "fs.write" | "process.spawn" | "network.connect" | "env.read"
     )
 }
 
@@ -1069,15 +1062,53 @@ mod tests {
             "protocol.register",
             "panel.create",
             "browser.embed",
-            "agent.context.terminal",
-            "mcp.invoke:mail.list",
-            "ai.provider",
             "env.read:HOME",
         ] {
             assert!(
                 CapabilityId::new(raw).is_ok(),
                 "'{raw}' must validate at manifest time"
             );
+        }
+    }
+
+    #[test]
+    fn core_seed_rejects_ai_families_fail_closed() {
+        // CTX-0916 S4 (DEC-0102): the Agent/Mcp/Ai families left the Core
+        // seed (zero-AI default). Every former `agent.*`/`mcp.*`/`ai.*`
+        // acceptance path now fails closed through the Core-seeded defaults;
+        // they validate only through an explicitly extended catalog (see
+        // `with_variants_accept_registered_extension`).
+        let core = CapabilityCatalog::core();
+        assert!(!core.contains_family("agent"));
+        assert!(!core.contains_family("mcp"));
+        assert!(!core.contains_family("ai"));
+        for (raw, head, has_param) in [
+            ("agent.context.terminal", "agent.context.terminal", false),
+            ("agent.context.workspace", "agent.context.workspace", false),
+            ("agent.memory:record-1", "agent.memory", true),
+            ("mcp.invoke:mail.list", "mcp.invoke", true),
+            ("ai.provider", "ai.provider", false),
+            ("ai.stream", "ai.stream", false),
+            ("ai.model", "ai.model", false),
+        ] {
+            assert!(
+                CapabilityId::new(raw).is_err(),
+                "'{raw}' must fail closed on the Core seed"
+            );
+            assert!(
+                CapabilityId::parse_with(&core, raw).is_err(),
+                "'{raw}' must fail closed on the Core catalog"
+            );
+            assert!(
+                validate_capability_with(&core, raw).is_err(),
+                "'{raw}' must fail manifest validation on the Core catalog"
+            );
+            assert_eq!(
+                check_closed_capability(head, has_param),
+                core.check(head, has_param),
+                "violation kind diverged for '{raw}'"
+            );
+            assert!(check_closed_capability(head, has_param).is_err());
         }
     }
 
@@ -1147,20 +1178,76 @@ mod tests {
     fn with_variants_accept_registered_extension() {
         // CTX-0916 S2 (DEC-0102): an extension head validates through the
         // extended catalog while the Core-seeded defaults still fail closed.
+        // CTX-0916 S4: the AI families are the canonical additive example —
+        // `ai.*`/`mcp.*`/`agent.*` validate ONLY through an explicitly
+        // extended catalog (Core-only installs reject them fail-closed; see
+        // `core_seed_rejects_ai_families_fail_closed`).
         let mut extended = CapabilityCatalog::core();
         extended
-            .register("acme", &[("acme.widget", false)])
-            .expect("extension registers");
-        assert!(validate_capability_with(&extended, "acme.widget").is_ok());
-        assert!(CapabilityId::parse_with(&extended, "acme.widget").is_ok());
-        assert_eq!(
-            check_closed_capability_with(&extended, "acme.widget", false),
-            Ok(())
-        );
-        assert!(validate_closed_capability_with(&extended, "acme.widget", false).is_ok());
-        assert!(CapabilityId::new("acme.widget").is_err());
-        assert!(check_closed_capability("acme.widget", false).is_err());
-        assert!(validate_closed_capability("acme.widget", false).is_err());
-        assert!(validate_capability_with(&CapabilityCatalog::core(), "acme.widget").is_err());
+            .register(
+                "ai",
+                &[
+                    ("ai.provider", false),
+                    ("ai.stream", false),
+                    ("ai.model", false),
+                ],
+            )
+            .expect("ai extension registers");
+        extended
+            .register("mcp", &[("mcp.invoke", true)])
+            .expect("mcp extension registers");
+        extended
+            .register(
+                "agent",
+                &[
+                    ("agent.context.terminal", false),
+                    ("agent.context.workspace", false),
+                    ("agent.memory", true),
+                ],
+            )
+            .expect("agent extension registers");
+        for raw in [
+            "ai.provider",
+            "ai.stream",
+            "ai.model",
+            "mcp.invoke:mail.list",
+            "agent.context.terminal",
+            "agent.context.workspace",
+            "agent.memory:record-1",
+        ] {
+            assert!(
+                validate_capability_with(&extended, raw).is_ok(),
+                "'{raw}' must validate via the extended catalog"
+            );
+            assert!(
+                CapabilityId::parse_with(&extended, raw).is_ok(),
+                "'{raw}' must parse via the extended catalog"
+            );
+        }
+        // Parameter polarity still enforced on contributed heads.
+        assert!(validate_capability_with(&extended, "ai.provider:extra").is_err());
+        assert!(validate_capability_with(&extended, "mcp.invoke").is_err());
+        assert!(validate_capability_with(&extended, "agent.memory").is_err());
+        // Core-seeded defaults still fail closed on every contributed head.
+        for raw in [
+            "ai.provider",
+            "mcp.invoke:mail.list",
+            "agent.memory:record-1",
+        ] {
+            assert!(CapabilityId::new(raw).is_err());
+            assert!(
+                check_closed_capability(raw.split(':').next().unwrap_or(raw), raw.contains(':'))
+                    .is_err()
+            );
+            assert!(
+                validate_closed_capability(raw.split(':').next().unwrap_or(raw), raw.contains(':'))
+                    .is_err()
+            );
+            assert!(validate_capability_with(&CapabilityCatalog::core(), raw).is_err());
+        }
+        // A fresh Core seed is unaffected by the extension.
+        let fresh = CapabilityCatalog::core();
+        assert!(!fresh.contains_family("ai"));
+        assert!(CapabilityId::parse_with(&fresh, "ai.provider").is_err());
     }
 }

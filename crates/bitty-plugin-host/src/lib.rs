@@ -164,7 +164,8 @@ pub mod tools;
 pub mod trust_levels;
 
 pub use capability::{
-    CapabilityCatalog, CapabilityFamily, CapabilityId, effect_statement, validate_closed_capability,
+    CapabilityCatalog, CapabilityFamily, CapabilityId, effect_statement, effect_statement_with,
+    validate_closed_capability, validate_closed_capability_with,
 };
 pub use credential_ref::{
     CredentialPrecedence, CredentialRef, CredentialSource, MAX_CREDENTIAL_CMD_ARGS,

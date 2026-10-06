@@ -556,6 +556,57 @@ fn fs_does_not_migrate_with_terminal_in_either_direction() {
 }
 
 #[test]
+fn fs_list_oversized_max_entries_fails_with_e_def_limit() {
+    let services = Rc::new(FakeFs::with_grants(&["~/docs"], &["~/docs/out"]));
+    services
+        .files
+        .borrow_mut()
+        .insert("~/docs/notes.txt".to_string(), "hello".to_string());
+    let mut vm = gate_vm("fs-list-limit");
+    install(&mut vm, services);
+    // Oversized max_entries must fail with E_DEF_LIMIT, never clamp silently
+    // to a 1024-entry page (CodeRabbit PR #1731, 03:36 UTC thread).
+    let oversized = FS_LIST_MAX_ENTRIES + 1;
+    let outcome = run(
+        &mut vm,
+        &format!(
+            "local ok, err = pcall(bitty.fs.list, \"~/docs\", {oversized}); \
+             assert(ok == false, \"oversized max_entries must fail\"); \
+             assert(err.code == \"E_DEF_LIMIT\", \"typed limit, got \" .. tostring(err.code))"
+        ),
+    );
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{outcome:?}"
+    );
+    // A large oversized request (e.g. 5000) also fails typed, not silently.
+    let outcome = run(
+        &mut vm,
+        r#"
+        local ok, err = pcall(bitty.fs.list, "~/docs", 5000)
+        assert(ok == false, "5000 max_entries must fail")
+        assert(err.code == "E_DEF_LIMIT", "typed limit, got " .. tostring(err.code))
+        "#,
+    );
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{outcome:?}"
+    );
+    // The cap itself stays accepted.
+    let outcome = run(
+        &mut vm,
+        &format!(
+            "local entries = bitty.fs.list(\"~/docs\", {FS_LIST_MAX_ENTRIES}); \
+             assert(#entries >= 1, \"cap-sized page must list\")"
+        ),
+    );
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{outcome:?}"
+    );
+}
+
+#[test]
 fn fs_combines_argv_first_with_no_shell_string() {
     let mut vm = gate_vm("fs-argv");
     install(

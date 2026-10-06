@@ -3591,9 +3591,7 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                 validate_fs_path(&prefix).map_err(|e| e.to_error(ctx))?;
                 let max_entries = match stack.get(1) {
                     Value::Nil => FS_LIST_MAX_ENTRIES,
-                    Value::Integer(n) if n >= 1 => usize::try_from(n)
-                        .unwrap_or(usize::MAX)
-                        .min(FS_LIST_MAX_ENTRIES),
+                    Value::Integer(n) if n >= 1 => usize::try_from(n).unwrap_or(usize::MAX),
                     _ => {
                         return Err(BridgeError::new(
                             "validation",

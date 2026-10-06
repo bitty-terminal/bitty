@@ -57,7 +57,7 @@ use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
 
 use crate::capability::{CapabilityFamily, CapabilityId};
-use crate::roles::AgentRole;
+use crate::roles::{AgentRole, RoleCeilingCatalog};
 use crate::trust_levels::TrustLevel;
 
 // ── bounds ────────────────────────────────────────────────────────────────
@@ -845,6 +845,42 @@ fn check_role_gate(kind: RequestKind, role: AgentRole) -> Result<(), EffectiveDe
     Ok(())
 }
 
+/// Role-ceiling pre-check for [`authorize_with_role_and_ceilings`]: every
+/// requested capability's family must sit within `role`'s effective (Core
+/// plus contributed) ceiling in `ceilings`.
+///
+/// The first family outside the ceiling denies fail-closed with
+/// [`DenialKind::PolicyConflict`], naming the role and the family only
+/// (never a value, plan, or payload). The ceiling narrows, never grants: on
+/// success the six-layer intersection still decides. The default
+/// [`authorize_with_role`] path deliberately skips this gate (pre-S5
+/// behavior); enforcement consistency across all authorize paths is a
+/// tracked follow-up, not this slice.
+fn check_ceiling_gate(
+    request: &AgentRequest,
+    kind: RequestKind,
+    role: AgentRole,
+    ceilings: &RoleCeilingCatalog,
+) -> Result<(), EffectiveDenial> {
+    for cap in &request.scope.caps {
+        let family = cap.family().as_str();
+        if !ceilings.allows(role, family) {
+            return Err(EffectiveDenial {
+                kind: DenialKind::PolicyConflict,
+                request_kind: kind,
+                chain: vec![DenialStep {
+                    layer: None,
+                    detail: format!(
+                        "role '{}' ceiling does not admit '{family}' capabilities (OQ-057 adopted)",
+                        role.as_str(),
+                    ),
+                }],
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Authorize with the adopted trust-level admission gate first (OQ-085).
 ///
 /// Every requested capability's family must pass
@@ -873,7 +909,8 @@ pub fn authorize_with_trust(
 /// [`DenialKind::PolicyConflict`], naming the role and the point only (never
 /// a prompt, plan, or payload). The role gate never grants: on success this
 /// is exactly [`authorize`], so capability ceilings still intersect with
-/// grants elsewhere.
+/// grants elsewhere. Explicit ceiling enforcement (Core defaults plus S5
+/// contributions) is opt-in via [`authorize_with_role_and_ceilings`].
 pub fn authorize_with_role(
     stack: &EffectiveStack,
     request: &AgentRequest,
@@ -882,6 +919,31 @@ pub fn authorize_with_role(
     role: AgentRole,
 ) -> Result<EffectiveCapability, EffectiveDenial> {
     check_role_gate(kind, role)?;
+    authorize(stack, request, kind, project_trusted)
+}
+
+/// Authorize with the adopted role contract gate plus an explicitly extended
+/// role ceiling first (OQ-057, CTX-0916 S5 opt-in).
+///
+/// The role gate ([`AgentRole::check_request`]) runs first, then the
+/// ceiling gate against `ceilings` (Core defaults plus S5 contributions via
+/// [`crate::roles::RoleCeilingCatalog::register_ceiling`]), then the
+/// six-layer intersection ([`authorize`]). Either gate denies with
+/// [`DenialKind::PolicyConflict`] before the intersection runs; on success
+/// this is exactly [`authorize`] with the effective ceiling intersected, so
+/// contributed authority still narrows and never grants. The default
+/// [`authorize_with_role`] path stays gate-only (pre-S5 behavior) and skips
+/// the ceiling gate.
+pub fn authorize_with_role_and_ceilings(
+    stack: &EffectiveStack,
+    request: &AgentRequest,
+    kind: RequestKind,
+    project_trusted: bool,
+    role: AgentRole,
+    ceilings: &RoleCeilingCatalog,
+) -> Result<EffectiveCapability, EffectiveDenial> {
+    check_role_gate(kind, role)?;
+    check_ceiling_gate(request, kind, role, ceilings)?;
     authorize(stack, request, kind, project_trusted)
 }
 
@@ -1509,6 +1571,186 @@ mod tests {
             effective.caps,
             [cap("fs.read:~/docs/*.md")].into_iter().collect()
         );
+    }
+
+    #[test]
+    fn default_role_path_ignores_ceilings_pre_s5() {
+        // CTX-0916 S5 fix round (PX-5000, commander option a): the default
+        // `authorize_with_role` path stays gate-only (pre-S5 behavior) and
+        // ignores ceilings. Testers admit the sandbox point, so a fully
+        // granted out-of-ceiling request still allows here while the opt-in
+        // path with the Core seed denies it.
+        use crate::roles::RoleCeilingCatalog;
+
+        let stack = EffectiveStack {
+            host: scope_with("host", &["network.connect:example.com:443"]),
+            user: scope_with("user", &["network.connect:example.com:443"]),
+            project: None,
+            parent: scope_with("parent", &["network.connect:example.com:443"]),
+            task: scope_with("task", &["network.connect:example.com:443"]),
+        };
+        let request = AgentRequest {
+            scope: scope_with("req", &["network.connect:example.com:443"]),
+            raw_wide: Vec::new(),
+        };
+        let effective = authorize_with_role(
+            &stack,
+            &request,
+            RequestKind::ExecutionRun,
+            true,
+            AgentRole::Tester,
+        )
+        .expect("default role path stays pre-S5: no ceiling gate");
+        assert_eq!(
+            effective.caps,
+            [cap("network.connect:example.com:443")]
+                .into_iter()
+                .collect()
+        );
+        // The same request on the opt-in path with Core defaults denies.
+        let denial = authorize_with_role_and_ceilings(
+            &stack,
+            &request,
+            RequestKind::ExecutionRun,
+            true,
+            AgentRole::Tester,
+            &RoleCeilingCatalog::core(),
+        )
+        .expect_err("opt-in core ceiling admits no tester network");
+        assert_eq!(denial.kind, DenialKind::PolicyConflict);
+        assert_eq!(denial.request_kind, RequestKind::ExecutionRun);
+        let chain = denial.reason_chain().join("\n");
+        assert!(chain.contains("tester"), "{chain}");
+        assert!(chain.contains("'network'"), "{chain}");
+        // Commanders keep the widest Core ceiling: the opt-in path admits.
+        let effective = authorize_with_role_and_ceilings(
+            &stack,
+            &request,
+            RequestKind::ExecutionRun,
+            true,
+            AgentRole::Commander,
+            &RoleCeilingCatalog::core(),
+        )
+        .expect("commander ceiling admits network");
+        assert_eq!(
+            effective.caps,
+            [cap("network.connect:example.com:443")]
+                .into_iter()
+                .collect()
+        );
+    }
+
+    #[test]
+    fn ceiling_contribution_widens_only_through_extended_catalog() {
+        // An S5 contribution extends one role row; the Core-seeded path still
+        // denies and a fresh Core seed is unaffected.
+        use crate::roles::RoleCeilingCatalog;
+
+        let stack = EffectiveStack {
+            host: scope_with("host", &["network.connect:example.com:443"]),
+            user: scope_with("user", &["network.connect:example.com:443"]),
+            project: None,
+            parent: scope_with("parent", &["network.connect:example.com:443"]),
+            task: scope_with("task", &["network.connect:example.com:443"]),
+        };
+        let request = AgentRequest {
+            scope: scope_with("req", &["network.connect:example.com:443"]),
+            raw_wide: Vec::new(),
+        };
+        let mut extended = RoleCeilingCatalog::core();
+        extended
+            .register_ceiling(AgentRole::Tester, &["network"])
+            .expect("tester network contribution registers");
+        let effective = authorize_with_role_and_ceilings(
+            &stack,
+            &request,
+            RequestKind::ExecutionRun,
+            true,
+            AgentRole::Tester,
+            &extended,
+        )
+        .expect("contributed ceiling admits network for testers");
+        assert_eq!(
+            effective.caps,
+            [cap("network.connect:example.com:443")]
+                .into_iter()
+                .collect()
+        );
+        // The Core-seeded opt-in path still denies the same request ...
+        assert!(
+            authorize_with_role_and_ceilings(
+                &stack,
+                &request,
+                RequestKind::ExecutionRun,
+                true,
+                AgentRole::Tester,
+                &RoleCeilingCatalog::core(),
+            )
+            .is_err()
+        );
+        // ... and the contribution leaks to no other role.
+        assert!(
+            authorize_with_role_and_ceilings(
+                &stack,
+                &request,
+                RequestKind::ExecutionRun,
+                true,
+                AgentRole::Reviewer,
+                &extended,
+            )
+            .is_err(),
+            "reviewers deny at the role gate before any ceiling"
+        );
+    }
+
+    #[test]
+    fn static_role_path_matches_gate_only_authorize() {
+        // CTX-0916 S5 fix round (PX-5000): the default path is gate-only, so
+        // it must agree outcome-for-outcome with `authorize` itself wherever
+        // the role gate admits, even for out-of-ceiling requests. (Reviewers
+        // deny at the role gate on privileged kinds on both paths.)
+        let stack = EffectiveStack {
+            host: scope_with("host", &["fs.read:~/docs/*.md"]),
+            user: scope_with("user", &["fs.read:~/docs/*.md"]),
+            project: None,
+            parent: scope_with("parent", &["fs.read:~/docs/*.md"]),
+            task: scope_with("task", &["fs.read:~/docs/*.md"]),
+        };
+        let request = AgentRequest {
+            scope: scope_with("req", &["fs.read:~/docs/*.md"]),
+            raw_wide: Vec::new(),
+        };
+        for role in [
+            AgentRole::Commander,
+            AgentRole::Implementer,
+            AgentRole::Tester,
+            AgentRole::Reviewer,
+        ] {
+            let gated = authorize_with_role(&stack, &request, RequestKind::FsRead, true, role);
+            let bare = authorize(&stack, &request, RequestKind::FsRead, true);
+            // Commanders and implementers admit the toolcall point, so the
+            // gate-only path equals bare authorize; testers and reviewers
+            // deny at the role gate while bare authorize would allow.
+            match role {
+                AgentRole::Commander | AgentRole::Implementer => {
+                    assert_eq!(
+                        gated.is_ok(),
+                        bare.is_ok(),
+                        "gate-only role path must match bare authorize on {role}"
+                    );
+                    if let (Ok(a), Ok(b)) = (gated, bare) {
+                        assert_eq!(a, b, "gate-only role path differs on {role}");
+                    }
+                }
+                AgentRole::Tester | AgentRole::Reviewer => {
+                    assert!(
+                        gated.is_err(),
+                        "{role} must deny at the role gate on privileged kinds"
+                    );
+                    assert!(bare.is_ok(), "bare authorize admits granted fs.read");
+                }
+            }
+        }
     }
 
     #[test]

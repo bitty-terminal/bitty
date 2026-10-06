@@ -83,15 +83,16 @@
 //! ([`effective::authorize_with_role`]), and the credential exclusive-or
 //! order is enforced by [`credential_ref::resolve_choice`] at the call
 //! boundary where two references meet, with actual resolution on the
-//! provider-schema surface ([`credential_ref::ProviderCredentialConfig`]).
+//! provider-schema surface
+//! ([`provider_credential::ProviderCredentialConfig`]).
 //!
 //! | Open question | Module | Adopted shape |
 //! |---------------|--------|-----------------|
 //! | OQ-085 trust levels + capability domains | `trust_levels` | [`trust_levels::TrustLevel`] levels 0–4, [`trust_levels::CapabilityDomain`] admission sets narrowing with level, mapping onto accepted [`capability::CapabilityFamily`] only; [`trust_levels::TrustLevel::check_family`] enforced by [`effective::authorize_with_trust`] |
 //! | OQ-084 ontology/identity | `identity` | [`identity::EntityKind`] ten first-class kinds, [`identity::OntologyId`] `kind:value` identifiers, [`identity::Ownership`] links plus [`identity::Lifetime`] |
 //! | OQ-055 secret-storage tiers | `secret_tiers` | [`secret_tiers::SecretTier`] four tiers with per-tier [`secret_tiers::TierPolicy`] (consent/audit/redaction); [`secret_tiers::CommandRef`] resolved by [`secret_tiers::execute_command_ref`] (shell-free, bounded); [`secret_tiers::KeyringBackend`] selection plus [`secret_tiers::RotationPolicy`]; [`secret_tiers::check_tier_access`] enforced at the resolve boundary |
-//! | OQ-054 `api_key_env` vs `api_key_cmd` | `credential_ref` | [`credential_ref::CredentialRef`] env/cmd references (names only), [`credential_ref::resolve_precedence`] exclusive-or order plus [`credential_ref::resolve_choice`] call-boundary enforcement, [`credential_ref::check_project_override`] narrow-only boundary, [`credential_ref::ProviderCredentialConfig`] schema surface with [`credential_ref::resolve_provider_credential`] |
-//! | OQ-057 role contract | `roles` | [`roles::AgentRole`] Commander/Implementer/Tester/Reviewer, [`roles::EnforcementPoint`] checks (incl. [`roles::EnforcementPoint::for_request_kind`]), per-role dispatch fan-out/depth ceilings ([`roles::AgentRole::check_dispatch`]) enforced by [`effective::delegate_with_role`], prompt-text denial ([`roles::deny_prompt_authority`]), [`roles::SandboxDecl`] posture checked against [`roles::SandboxRestrictions`] ([`roles::AgentRole::check_sandbox_exec`]), capability ceilings intersected with grants elsewhere; [`roles::AgentRole::check_request`] enforced by [`effective::authorize_with_role`] |
+//! | OQ-054 `api_key_env` vs `api_key_cmd` | `credential_ref` + `provider_credential` | [`credential_ref::CredentialRef`] env/cmd references (names only), [`credential_ref::resolve_precedence`] exclusive-or order plus [`credential_ref::resolve_choice`] call-boundary enforcement, [`credential_ref::check_project_override`] narrow-only boundary; [`provider_credential::ProviderCredentialConfig`] schema surface with [`provider_credential::resolve_provider_credential`] (CTX-0916 S5 move; deprecated shim in `credential_ref` for one release) |
+//! | OQ-057 role contract | `roles` | [`roles::AgentRole`] Commander/Implementer/Tester/Reviewer, [`roles::EnforcementPoint`] checks (incl. [`roles::EnforcementPoint::for_request_kind`]), per-role dispatch fan-out/depth ceilings ([`roles::AgentRole::check_dispatch`]) enforced by [`effective::delegate_with_role`], prompt-text denial ([`roles::deny_prompt_authority`]), [`roles::SandboxDecl`] posture checked against [`roles::SandboxRestrictions`] ([`roles::AgentRole::check_sandbox_exec`]), capability ceilings ([`roles::AgentRole::capability_ceiling`] Core defaults plus [`roles::RoleCeilingCatalog`] S5 contributions, intersected opt-in by [`effective::authorize_with_role_and_ceilings`]) with grants elsewhere; [`roles::AgentRole::check_request`] enforced by [`effective::authorize_with_role`] |
 //!
 //! # Drop policy — DropOldest accepted default for v1 (OQ-013 closed decision point)
 //!
@@ -156,6 +157,7 @@ pub mod install;
 pub mod lifecycle;
 pub mod manifest;
 pub mod origin;
+pub mod provider_credential;
 pub mod registry;
 pub mod roles;
 pub mod secret_tiers;
@@ -169,10 +171,8 @@ pub use capability::{
 };
 pub use credential_ref::{
     CredentialPrecedence, CredentialRef, CredentialSource, MAX_CREDENTIAL_CMD_ARGS,
-    MAX_CREDENTIAL_CMD_OUTPUT_BYTES, MAX_CREDENTIAL_CMD_PART_BYTES, MAX_CREDENTIAL_ENV_NAME_BYTES,
-    ProviderCredentialConfig, check_project_override, check_provider_override,
-    execute_credential_cmd, resolve_choice, resolve_precedence, resolve_provider_credential,
-    resolve_provider_credential_live,
+    MAX_CREDENTIAL_CMD_PART_BYTES, MAX_CREDENTIAL_ENV_NAME_BYTES, check_project_override,
+    resolve_choice, resolve_precedence,
 };
 pub use effective::{
     AgentRequest, AuditDecision, AuditEntry, AuditLedger, CapabilityScope, DenialKind, DenialStep,
@@ -181,9 +181,9 @@ pub use effective::{
     MAX_AUDIT_ENTRIES, MAX_DENIAL_ITEMS, MAX_POLICY_FILE_BYTES, MAX_POLICY_FILE_LINES,
     MAX_POLICY_LINE_BYTES, MAX_RAW_DECLARATION_BYTES, MAX_RAW_DECLARATIONS, MAX_SCOPE_CAPS,
     PROJECT_POLICY_DIR_NAME, PROJECT_POLICY_FILE_NAME, PolicyProvenance, RequestKind,
-    USER_POLICY_FILE_NAME, authorize, authorize_with_role, authorize_with_trust,
-    authorize_with_trust_and_role, delegate, enforcement_class_for, parse_policy,
-    project_policy_path, user_policy_path_with_env,
+    USER_POLICY_FILE_NAME, authorize, authorize_with_role, authorize_with_role_and_ceilings,
+    authorize_with_trust, authorize_with_trust_and_role, delegate, enforcement_class_for,
+    parse_policy, project_policy_path, user_policy_path_with_env,
 };
 pub use error::{ErrorClass, PluginError};
 pub use event::{
@@ -244,10 +244,16 @@ pub use origin::{
     DetectedOrigin, OriginOverride, OriginPolicy, OriginSignals, classify_origin,
     resolve_origin_policy,
 };
+pub use provider_credential::{
+    MAX_CREDENTIAL_CMD_OUTPUT_BYTES, ProviderCredentialConfig, check_provider_override,
+    execute_credential_cmd, resolve_provider_credential, resolve_provider_credential_live,
+};
 pub use registry::{Generation, PluginState, Registry, RegistryEntry, check_command_equivalence};
 pub use roles::{
-    AgentRole, EnforcementPoint, MAX_DELEGATION_DEPTH, MAX_DISPATCH_FANOUT, MAX_ROLE_LABEL_BYTES,
-    SandboxDecl, SandboxRestrictions, deny_prompt_authority,
+    AgentRole, EnforcementPoint, MAX_CEILING_FAMILIES_PER_CALL, MAX_CEILING_FAMILY_LEN,
+    MAX_CONTRIBUTED_CEILING_FAMILIES, MAX_DELEGATION_DEPTH, MAX_DISPATCH_FANOUT,
+    MAX_ROLE_LABEL_BYTES, RoleCeilingCatalog, SandboxDecl, SandboxRestrictions,
+    deny_prompt_authority,
 };
 pub use secret_tiers::{
     CommandRef as SecretCommandRef, ConsentRule, DEFAULT_ROTATION_MAX_AGE_SECS, KeyringBackend,

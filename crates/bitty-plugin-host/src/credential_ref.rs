@@ -1,14 +1,18 @@
-//! `api_key_env` vs `api_key_cmd` credential semantics (OQ-054).
+//! `api_key_env` vs `api_key_cmd` credential references (OQ-054).
 //!
 //! `OQ-054` is adopted (MPC-1..MPC-4): `api_key_env` versus
 //! `api_key_cmd` credential references, their exclusive-or resolution
 //! order, and the project-level override boundary that cannot widen
-//! credentials. This module carries the adopted reference data as pure,
-//! bounded, fail-closed types, enforces the exclusive-or order at the
+//! credentials. This module carries the adopted reference mechanism as
+//! pure, bounded, fail-closed types, enforces the exclusive-or order at the
 //! call boundary ([`resolve_choice`]) plus the narrow-only project
-//! boundary ([`check_project_override`]), and ships the provider-schema
-//! surface ([`ProviderCredentialConfig`]) with actual resolution
-//! ([`resolve_provider_credential`]).
+//! boundary ([`check_project_override`]).
+//!
+//! The provider-schema surface built on these references
+//! ([`crate::provider_credential::ProviderCredentialConfig`] with actual
+//! resolution) moved to [`crate::provider_credential`] in CTX-0916 S5; this
+//! module keeps a deprecated re-export shim for one release (removed in
+//! S7). New callers import from there (or the crate root), never from here.
 //!
 //! A [`CredentialRef`] names *where* a credential comes from without
 //! carrying a value, and [`resolve_precedence`] decides *which*
@@ -41,11 +45,59 @@ pub const MAX_CREDENTIAL_CMD_PART_BYTES: usize = 256;
 /// Maximum arguments in one [`CredentialRef::Cmd`].
 pub const MAX_CREDENTIAL_CMD_ARGS: usize = 16;
 
-/// Maximum bytes of captured credential-command output accepted as a value.
+// ── deprecated S5 shim (CTX-0916, removed in S7) ────────────────────────────
+//
+// The provider-schema surface moved to [`crate::provider_credential`] in S5.
+// These re-exports keep the previous import path working for one release;
+// new callers import from there (or the crate root) instead.
+
+/// Deprecated shim: import [`crate::provider_credential::ProviderCredentialConfig`] instead.
 ///
-/// Mirrors the secret value bound (`4096`) so a command source can never
-/// smuggle a larger credential than the host store admits.
-pub const MAX_CREDENTIAL_CMD_OUTPUT_BYTES: usize = 4096;
+/// Removed in CTX-0916 S7.
+#[deprecated(
+    note = "moved to `crate::provider_credential::ProviderCredentialConfig`; the shim is removed in CTX-0916 S7"
+)]
+pub use crate::provider_credential::ProviderCredentialConfig;
+
+/// Deprecated shim: import [`crate::provider_credential::check_provider_override`] instead.
+///
+/// Removed in CTX-0916 S7.
+#[deprecated(
+    note = "moved to `crate::provider_credential::check_provider_override`; the shim is removed in CTX-0916 S7"
+)]
+pub use crate::provider_credential::check_provider_override;
+
+/// Deprecated shim: import [`crate::provider_credential::resolve_provider_credential`] instead.
+///
+/// Removed in CTX-0916 S7.
+#[deprecated(
+    note = "moved to `crate::provider_credential::resolve_provider_credential`; the shim is removed in CTX-0916 S7"
+)]
+pub use crate::provider_credential::resolve_provider_credential;
+
+/// Deprecated shim: import [`crate::provider_credential::resolve_provider_credential_live`] instead.
+///
+/// Removed in CTX-0916 S7.
+#[deprecated(
+    note = "moved to `crate::provider_credential::resolve_provider_credential_live`; the shim is removed in CTX-0916 S7"
+)]
+pub use crate::provider_credential::resolve_provider_credential_live;
+
+/// Deprecated shim: import [`crate::provider_credential::execute_credential_cmd`] instead.
+///
+/// Removed in CTX-0916 S7.
+#[deprecated(
+    note = "moved to `crate::provider_credential::execute_credential_cmd`; the shim is removed in CTX-0916 S7"
+)]
+pub use crate::provider_credential::execute_credential_cmd;
+
+/// Deprecated shim: import [`crate::provider_credential::MAX_CREDENTIAL_CMD_OUTPUT_BYTES`] instead.
+///
+/// Removed in CTX-0916 S7.
+#[deprecated(
+    note = "moved to `crate::provider_credential::MAX_CREDENTIAL_CMD_OUTPUT_BYTES`; the shim is removed in CTX-0916 S7"
+)]
+pub use crate::provider_credential::MAX_CREDENTIAL_CMD_OUTPUT_BYTES;
 
 // ── credential reference ──────────────────────────────────────────────────
 
@@ -229,8 +281,10 @@ pub const fn resolve_precedence(env_set: bool, cmd_set: bool) -> CredentialPrece
 /// denies fail-closed with a grant error naming both references (names only —
 /// references carry no values, so there is nothing to redact), and neither
 /// present resolves to no credential. No environment is read and no command
-/// runs here; the winner's resolution is [`resolve_provider_credential`]
-/// on the provider-schema surface ([`ProviderCredentialConfig`]).
+/// runs here; the winner's resolution is
+/// [`crate::provider_credential::resolve_provider_credential`]
+/// on the provider-schema surface
+/// ([`crate::provider_credential::ProviderCredentialConfig`]).
 pub fn resolve_choice(
     env: Option<&CredentialRef>,
     cmd: Option<&CredentialRef>,
@@ -278,217 +332,6 @@ pub fn check_project_override(
             }
         }
     }
-}
-
-// ── provider-schema surface (OQ-054 implementation) ───────────────────────
-
-/// Provider credential config: the accepted `api_key_env` /
-/// `api_key_cmd` surface (OQ-054 MPC-1..MPC-4).
-///
-/// At most one field may resolve: both set denies as conflict at
-/// resolution ([`resolve_choice`]), neither set resolves to no
-/// credential. Construction preserves both fields so the conflict stays
-/// observable (and auditable) instead of being rejected silently at
-/// parse time. `Display`/`Debug` quote reference names only — values
-/// never enter this type.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ProviderCredentialConfig {
-    /// `api_key_env` reference, if configured.
-    pub api_key_env: Option<CredentialRef>,
-    /// `api_key_cmd` reference, if configured.
-    pub api_key_cmd: Option<CredentialRef>,
-}
-
-impl ProviderCredentialConfig {
-    /// Build a config from already-validated references.
-    ///
-    /// Both-present is preserved (resolution denies as conflict); each
-    /// reference must still be the matching source kind (`Env` for
-    /// `api_key_env`, `Cmd` for `api_key_cmd`), otherwise construction
-    /// denies fail-closed.
-    pub fn new(
-        api_key_env: Option<CredentialRef>,
-        api_key_cmd: Option<CredentialRef>,
-    ) -> Result<Self, PluginError> {
-        if let Some(ref reference) = api_key_env {
-            if reference.source_kind() != CredentialSource::Env {
-                return Err(PluginError::registry(format!(
-                    "api_key_env must name an env reference, got '{reference}'"
-                )));
-            }
-        }
-        if let Some(ref reference) = api_key_cmd {
-            if reference.source_kind() != CredentialSource::Cmd {
-                return Err(PluginError::registry(format!(
-                    "api_key_cmd must name a command reference, got '{reference}'"
-                )));
-            }
-        }
-        Ok(Self {
-            api_key_env,
-            api_key_cmd,
-        })
-    }
-
-    /// Empty config (no credential).
-    #[must_use]
-    pub fn unset() -> Self {
-        Self {
-            api_key_env: None,
-            api_key_cmd: None,
-        }
-    }
-
-    /// Whether neither reference is configured.
-    #[must_use]
-    pub fn is_unset(&self) -> bool {
-        self.api_key_env.is_none() && self.api_key_cmd.is_none()
-    }
-
-    /// Which source wins under the exclusive-or order, if any.
-    ///
-    /// Both set denies fail-closed with a names-only grant error.
-    pub fn source(&self) -> Result<Option<CredentialSource>, PluginError> {
-        resolve_choice(self.api_key_env.as_ref(), self.api_key_cmd.as_ref())
-    }
-
-    /// Narrow-only project check for a whole provider config.
-    ///
-    /// Each field is checked with [`check_project_override`]: the
-    /// overlay may keep each reference identical or remove it, never
-    /// add, rename, or switch sources.
-    pub fn check_overlay(&self, overlay: &Self) -> Result<(), PluginError> {
-        check_provider_override(self, overlay)
-    }
-}
-
-impl fmt::Display for ProviderCredentialConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match (&self.api_key_env, &self.api_key_cmd) {
-            (None, None) => f.write_str("credential:unset"),
-            (Some(env), None) => write!(f, "{env}"),
-            (None, Some(cmd)) => write!(f, "{cmd}"),
-            (Some(env), Some(cmd)) => write!(f, "conflict:{env}+{cmd}"),
-        }
-    }
-}
-
-/// Provider-level project override (OQ-054 adopted narrow-only).
-///
-/// Checks the `api_key_env` and `api_key_cmd` fields independently with
-/// [`check_project_override`]; any widening on either field denies.
-pub fn check_provider_override(
-    base: &ProviderCredentialConfig,
-    overlay: &ProviderCredentialConfig,
-) -> Result<(), PluginError> {
-    check_project_override(base.api_key_env.as_ref(), overlay.api_key_env.as_ref())?;
-    check_project_override(base.api_key_cmd.as_ref(), overlay.api_key_cmd.as_ref())
-}
-
-/// Resolve a provider credential to its value, if configured.
-///
-/// Exclusive-or first ([`ProviderCredentialConfig::source`]): conflict
-/// denies before anything is read. `Env` resolves through `env_lookup`
-/// (injected so tests stay hermetic; the live wrapper below supplies
-/// `std::env`); missing or empty variables deny with a names-only
-/// error. `Cmd` resolves through the bounded shell-free runner
-/// ([`execute_credential_cmd`]). Values are returned, never logged —
-/// callers must inject them into child environments only, per ADR-0006.
-pub fn resolve_provider_credential(
-    config: &ProviderCredentialConfig,
-    env_lookup: impl Fn(&str) -> Option<String>,
-) -> Result<Option<String>, PluginError> {
-    match config.source()? {
-        None => Ok(None),
-        Some(CredentialSource::Env) => {
-            let var = match config.api_key_env.as_ref() {
-                Some(CredentialRef::Env { var }) => var.as_str(),
-                _ => {
-                    return Err(PluginError::registry(
-                        "api_key_env misconfigured (deny by default)".to_string(),
-                    ));
-                }
-            };
-            match env_lookup(var) {
-                Some(value) if !value.is_empty() => Ok(Some(value)),
-                _ => Err(PluginError::grant(format!(
-                    "credential env '{var}' is missing or empty (deny by default)"
-                ))),
-            }
-        }
-        Some(CredentialSource::Cmd) => {
-            let (program, args) = match config.api_key_cmd.as_ref() {
-                Some(CredentialRef::Cmd { program, args }) => (program.as_str(), args.as_slice()),
-                _ => {
-                    return Err(PluginError::registry(
-                        "api_key_cmd misconfigured (deny by default)".to_string(),
-                    ));
-                }
-            };
-            execute_credential_cmd(program, args).map(Some)
-        }
-    }
-}
-
-/// Live-environment resolution (`std::env` lookup).
-///
-/// Thin wrapper so the core ([`resolve_provider_credential`]) stays
-/// hermetic in tests.
-pub fn resolve_provider_credential_live(
-    config: &ProviderCredentialConfig,
-) -> Result<Option<String>, PluginError> {
-    resolve_provider_credential(config, |var| std::env::var(var).ok())
-}
-
-/// Execute a credential command and return its output value.
-///
-/// Same shell-free, bounded, names-only discipline as the secret-tier
-/// runner: direct spawn, null stdin, discarded stderr, one trailing
-/// newline stripped, empty/NUL/non-UTF-8/oversize/non-zero Spawn
-/// results deny. Errors quote `program` only.
-pub fn execute_credential_cmd(program: &str, args: &[String]) -> Result<String, PluginError> {
-    use std::process::{Command, Stdio};
-    let output = Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|err| {
-            PluginError::registry(format!("api_key_cmd '{program}' failed to spawn: {err}"))
-        })?;
-    if !output.status.success() {
-        return Err(PluginError::registry(format!(
-            "api_key_cmd '{program}' exited with {status}",
-            status = output.status
-        )));
-    }
-    let stdout = output.stdout;
-    if stdout.len() > MAX_CREDENTIAL_CMD_OUTPUT_BYTES {
-        return Err(PluginError::LimitExceeded {
-            field: "api_key_cmd.output".to_string(),
-            limit: MAX_CREDENTIAL_CMD_OUTPUT_BYTES,
-            actual: stdout.len(),
-        });
-    }
-    if stdout.contains(&0) {
-        return Err(PluginError::registry(format!(
-            "api_key_cmd '{program}' output must not contain NUL bytes"
-        )));
-    }
-    let mut text = String::from_utf8(stdout).map_err(|_| {
-        PluginError::registry(format!("api_key_cmd '{program}' output is not UTF-8"))
-    })?;
-    if text.ends_with('\n') {
-        text.pop();
-        if text.ends_with('\r') {
-            text.pop();
-        }
-    }
-    if text.is_empty() {
-        return Err(PluginError::registry(format!(
-            "api_key_cmd '{program}' produced empty output"
-        )));
-    }
-    Ok(text)
 }
 
 #[cfg(test)]
@@ -611,88 +454,34 @@ mod tests {
     }
 
     #[test]
-    fn provider_config_enforces_source_kinds() {
-        let env = CredentialRef::from_env("MY_KEY").expect("valid env");
-        let cmd = CredentialRef::from_cmd("pass", vec!["show".to_string()]).expect("valid cmd");
-        // Swapped kinds deny at construction.
-        assert!(ProviderCredentialConfig::new(Some(cmd.clone()), None).is_err());
-        assert!(ProviderCredentialConfig::new(None, Some(env.clone())).is_err());
-        let unset = ProviderCredentialConfig::unset();
-        assert!(unset.is_unset());
-        assert_eq!(unset.source(), Ok(None));
-        assert_eq!(unset.to_string(), "credential:unset");
-    }
-
-    #[test]
-    fn provider_config_resolves_unset_env_cmd_conflict() {
+    #[allow(deprecated)]
+    fn deprecated_shim_matches_canonical_path() {
+        // CTX-0916 S5 (DEC-0100): the deprecated shim names exactly the
+        // canonical moved type, so old-path construction, display, and
+        // resolution behave identically until S7 removes the shim.
+        use crate::provider_credential::{
+            ProviderCredentialConfig as Canonical, resolve_provider_credential as canonical_resolve,
+        };
         use std::collections::BTreeMap;
-        let env = CredentialRef::from_env("MY_KEY").expect("valid env");
-        let cmd = CredentialRef::from_cmd("echo", vec!["from-cmd".to_string()]).expect("valid cmd");
+
+        let env = CredentialRef::from_env("SHIM_KEY").expect("valid env");
+        let via_shim = ProviderCredentialConfig::new(Some(env.clone()), None).expect("valid");
+        let via_canonical = Canonical::new(Some(env), None).expect("valid");
+        // Same type: a shim value binds directly to a canonical binding.
+        let canonical: Canonical = via_shim.clone();
+        assert_eq!(canonical, via_canonical);
+        assert_eq!(via_shim.to_string(), via_canonical.to_string());
+        assert_eq!(via_shim.source(), via_canonical.source());
+
         let mut vars = BTreeMap::new();
-        vars.insert("MY_KEY".to_string(), "from-env".to_string());
-
-        let unset = ProviderCredentialConfig::unset();
+        vars.insert("SHIM_KEY".to_string(), "shim-value".to_string());
         assert_eq!(
-            resolve_provider_credential(&unset, |v| vars.get(v).cloned()),
-            Ok(None)
+            super::resolve_provider_credential(&via_shim, |v| vars.get(v).cloned()),
+            canonical_resolve(&via_canonical, |v| vars.get(v).cloned()),
         );
-
-        let env_only = ProviderCredentialConfig::new(Some(env.clone()), None).expect("valid");
-        assert_eq!(env_only.source(), Ok(Some(CredentialSource::Env)));
         assert_eq!(
-            resolve_provider_credential(&env_only, |v| vars.get(v).cloned()),
-            Ok(Some("from-env".to_string()))
+            super::MAX_CREDENTIAL_CMD_OUTPUT_BYTES,
+            crate::provider_credential::MAX_CREDENTIAL_CMD_OUTPUT_BYTES
         );
-        // Missing variable denies with the name (never a value).
-        let missing =
-            resolve_provider_credential(&env_only, |_| None).expect_err("missing env must deny");
-        assert!(missing.to_string().contains("MY_KEY"));
-
-        let cmd_only = ProviderCredentialConfig::new(None, Some(cmd)).expect("valid");
-        assert_eq!(cmd_only.source(), Ok(Some(CredentialSource::Cmd)));
-        assert_eq!(
-            resolve_provider_credential(&cmd_only, |v| vars.get(v).cloned()),
-            Ok(Some("from-cmd".to_string()))
-        );
-
-        // Both set denies before anything is read.
-        let both = ProviderCredentialConfig::new(Some(env), cmd_only.api_key_cmd.clone())
-            .expect("conflict preserved");
-        let error = resolve_provider_credential(&both, |v| vars.get(v).cloned())
-            .expect_err("conflict must deny");
-        let text = error.to_string();
-        assert!(text.contains("api_key_env:MY_KEY"), "{text}");
-        assert!(text.contains("api_key_cmd:echo from-cmd"), "{text}");
-    }
-
-    #[test]
-    fn provider_overlay_narrows_only() {
-        let env = CredentialRef::from_env("BASE_KEY").expect("valid env");
-        let same = CredentialRef::from_env("BASE_KEY").expect("valid env");
-        let wider = CredentialRef::from_env("OTHER_KEY").expect("valid env");
-        let cmd = CredentialRef::from_cmd("pass", vec!["x".to_string()]).expect("valid cmd");
-        let base = ProviderCredentialConfig::new(Some(env), None).expect("valid");
-        let narrow_same = ProviderCredentialConfig::new(Some(same), None).expect("valid");
-        let narrow_none = ProviderCredentialConfig::unset();
-        let widen_rename = ProviderCredentialConfig::new(Some(wider), None).expect("valid");
-        let widen_add = ProviderCredentialConfig::new(None, Some(cmd)).expect("valid");
-
-        assert!(base.check_overlay(&narrow_same).is_ok());
-        assert!(base.check_overlay(&narrow_none).is_ok());
-        assert!(base.check_overlay(&widen_rename).is_err());
-        // Removing env while adding cmd still widens (source switch).
-        assert!(base.check_overlay(&widen_add).is_err());
-        // Empty base gains nothing.
-        assert!(narrow_none.check_overlay(&base).is_err());
-        assert!(narrow_none.check_overlay(&narrow_none).is_ok());
-    }
-
-    #[test]
-    fn credential_cmd_empty_output_denies() {
-        assert!(execute_credential_cmd("true", &[]).is_err());
-        assert!(execute_credential_cmd("false", &[]).is_err());
-        let missing = execute_credential_cmd("bitty-definitely-missing-xyz", &[]);
-        let text = missing.expect_err("missing program must deny").to_string();
-        assert!(text.contains("bitty-definitely-missing-xyz"), "{text}");
     }
 }

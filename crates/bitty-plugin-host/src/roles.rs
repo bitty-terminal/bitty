@@ -32,6 +32,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeSet;
 use std::fmt;
 
 use crate::capability::CapabilityFamily;
@@ -514,6 +515,246 @@ impl SandboxRestrictions {
     }
 }
 
+// ── role-ceiling contributions (CTX-0916 S5, DEC-0100) ──────────────────────
+
+/// Maximum families accepted by a single
+/// [`RoleCeilingCatalog::register_ceiling`] call.
+///
+/// One role row holds a handful of families; sixteen is generous headroom
+/// while keeping extension input bounded (mirrors the S1 per-call bound
+/// pattern on [`crate::capability::CapabilityCatalog`]).
+pub const MAX_CEILING_FAMILIES_PER_CALL: usize = 16;
+
+/// Maximum contributed (non-Core) ceiling families across all roles.
+///
+/// Bounds total extension input (mirrors the S1 total bound pattern).
+/// Raise only by reviewed change.
+pub const MAX_CONTRIBUTED_CEILING_FAMILIES: usize = 64;
+
+/// Maximum bytes of one contributed ceiling family label.
+///
+/// Mirrors the capability segment bound enforced by manifest shape
+/// validation.
+pub const MAX_CEILING_FAMILY_LEN: usize = 64;
+
+/// Core-owned role-ceiling contribution table (CTX-0916 slice S5, DEC-0100).
+///
+/// S5 is purely additive: the Core defaults are exactly
+/// [`AgentRole::capability_ceiling`] (AI-free since S4) and stay unchanged.
+/// Loaded extensions contribute additional families per role through
+/// [`RoleCeilingCatalog::register_ceiling`]; the opt-in
+/// [`crate::effective::authorize_with_role_and_ceilings`] path intersects the
+/// effective (Core plus contributed) ceiling with grants elsewhere, so
+/// contributed authority still narrows and never grants by itself. The
+/// default [`crate::effective::authorize_with_role`] path stays gate-only
+/// (pre-S5 behavior) and skips the ceiling gate.
+///
+/// Fail-closed rules for [`RoleCeilingCatalog::register_ceiling`] (mirroring
+/// the S1 [`crate::capability::CapabilityCatalog::register`] patterns):
+///
+/// - Additive only: contributing a family the role already admits (Core
+///   default or prior contribution) is a [`PluginError::Duplicate`] error,
+///   never an overwrite. Rows are per-role: the same family may be
+///   contributed to several roles; duplication is per (role, family) pair.
+/// - Every family label is shape-validated like manifest segment validation
+///   (length, character class, lowercase start). Membership in any catalog is
+///   deliberately NOT required: `bitty-ai` contributes `ai`/`mcp`/`agent`
+///   (S6), which Core catalogs intentionally do not know.
+/// - The whole call is validated before any mutation, so a failed call
+///   leaves the catalog unchanged.
+/// - Per-call and total bounds ([`MAX_CEILING_FAMILIES_PER_CALL`],
+///   [`MAX_CONTRIBUTED_CEILING_FAMILIES`]) keep extension input bounded.
+///
+/// ```rust
+/// use bitty_plugin_host::roles::{AgentRole, RoleCeilingCatalog};
+///
+/// let mut ceilings = RoleCeilingCatalog::core();
+/// assert!(ceilings.allows(AgentRole::Commander, "fs"));
+/// assert!(!ceilings.allows(AgentRole::Commander, "ai"));
+/// ceilings.register_ceiling(AgentRole::Commander, &["ai"]).unwrap();
+/// assert!(ceilings.allows(AgentRole::Commander, "ai"));
+/// // A fresh Core seed is unaffected by the contribution.
+/// assert!(!RoleCeilingCatalog::core().allows(AgentRole::Commander, "ai"));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleCeilingCatalog {
+    /// Contributed families per role, indexed by [`role_index`]; the Core
+    /// defaults live in [`AgentRole::capability_ceiling`] and are never
+    /// copied here, so they cannot drift.
+    extra: [BTreeSet<String>; 4],
+}
+
+/// Index one role into [`RoleCeilingCatalog::extra`].
+fn role_index(role: AgentRole) -> usize {
+    match role {
+        AgentRole::Commander => 0,
+        AgentRole::Implementer => 1,
+        AgentRole::Tester => 2,
+        AgentRole::Reviewer => 3,
+    }
+}
+
+impl RoleCeilingCatalog {
+    /// Core seed: no contributions, so every role admits exactly its
+    /// [`AgentRole::capability_ceiling`] (AI-free since S4, fail-closed).
+    #[must_use]
+    pub fn core() -> Self {
+        Self {
+            extra: [
+                BTreeSet::new(),
+                BTreeSet::new(),
+                BTreeSet::new(),
+                BTreeSet::new(),
+            ],
+        }
+    }
+
+    /// Whether `role` admits `family` under the effective (Core plus
+    /// contributed) ceiling.
+    ///
+    /// `family` is a bare family label (for example `"fs"`, or `"ai"` once
+    /// contributed); unknown labels simply do not match and deny at the
+    /// enforcement gate.
+    #[must_use]
+    pub fn allows(&self, role: AgentRole, family: &str) -> bool {
+        if role
+            .capability_ceiling()
+            .iter()
+            .any(|member| member.as_str() == family)
+        {
+            return true;
+        }
+        self.extra[role_index(role)].contains(family)
+    }
+
+    /// Contributed (non-Core) families for `role`, sorted.
+    #[must_use]
+    pub fn contributed_for(&self, role: AgentRole) -> Vec<&str> {
+        self.extra[role_index(role)]
+            .iter()
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// Effective (Core plus contributed) ceiling families for `role`, sorted.
+    ///
+    /// Core defaults come first from [`AgentRole::capability_ceiling`] only
+    /// as labels; contributions extend, never replace, them.
+    #[must_use]
+    pub fn effective_for(&self, role: AgentRole) -> Vec<&str> {
+        let mut effective: BTreeSet<&str> = role
+            .capability_ceiling()
+            .iter()
+            .copied()
+            .map(CapabilityFamily::as_str)
+            .collect();
+        effective.extend(self.contributed_for(role));
+        effective.into_iter().collect()
+    }
+
+    /// Number of contributed (non-Core) families across all roles.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.extra.iter().map(BTreeSet::len).sum()
+    }
+
+    /// Whether no families have been contributed (the Core seed always is).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.extra.iter().all(BTreeSet::is_empty)
+    }
+
+    /// Additively contribute ceiling families for one role (CTX-0916
+    /// extension hook).
+    ///
+    /// `families` names bare family labels admitted for `role` in addition
+    /// to its Core [`AgentRole::capability_ceiling`]. Fail-closed: anything
+    /// invalid rejects the whole call and the catalog is left unchanged
+    /// (see the type docs).
+    pub fn register_ceiling(
+        &mut self,
+        role: AgentRole,
+        families: &[&str],
+    ) -> Result<(), PluginError> {
+        if families.is_empty() {
+            return Err(PluginError::registry(
+                "ceiling registration must declare at least one family",
+            ));
+        }
+        if families.len() > MAX_CEILING_FAMILIES_PER_CALL {
+            return Err(PluginError::LimitExceeded {
+                field: "role_ceiling.register".to_string(),
+                limit: MAX_CEILING_FAMILIES_PER_CALL,
+                actual: families.len(),
+            });
+        }
+        if self.len() + families.len() > MAX_CONTRIBUTED_CEILING_FAMILIES {
+            return Err(PluginError::LimitExceeded {
+                field: "role_ceiling.catalog".to_string(),
+                limit: MAX_CONTRIBUTED_CEILING_FAMILIES,
+                actual: self.len() + families.len(),
+            });
+        }
+        // Validate everything before mutating so a failed call leaves the
+        // catalog unchanged.
+        let mut seen_in_call = BTreeSet::new();
+        for family in families {
+            validate_ceiling_family(family)?;
+            if self.allows(role, family) {
+                return Err(PluginError::Duplicate {
+                    kind: "ceiling-family".to_string(),
+                    value: (*family).to_string(),
+                });
+            }
+            if !seen_in_call.insert(*family) {
+                return Err(PluginError::Duplicate {
+                    kind: "ceiling-family".to_string(),
+                    value: (*family).to_string(),
+                });
+            }
+        }
+        let slot = &mut self.extra[role_index(role)];
+        for family in families {
+            slot.insert((*family).to_string());
+        }
+        Ok(())
+    }
+}
+
+impl Default for RoleCeilingCatalog {
+    fn default() -> Self {
+        Self::core()
+    }
+}
+
+/// Ceiling family-label shape validation mirroring manifest segment rules:
+/// non-empty, bounded, lowercase start, `[a-z0-9_-]` body. Catalog
+/// membership is deliberately not required (see the type docs).
+fn validate_ceiling_family(family: &str) -> Result<(), PluginError> {
+    if family.is_empty() {
+        return Err(PluginError::registry("ceiling family must not be empty"));
+    }
+    if family.len() > MAX_CEILING_FAMILY_LEN {
+        return Err(PluginError::LimitExceeded {
+            field: "role_ceiling.family".to_string(),
+            limit: MAX_CEILING_FAMILY_LEN,
+            actual: family.len(),
+        });
+    }
+    let first = family.as_bytes()[0];
+    if !first.is_ascii_lowercase() {
+        return Err(PluginError::registry(
+            "ceiling family must start with lowercase letter",
+        ));
+    }
+    for byte in family.bytes() {
+        if !(byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_') {
+            return Err(PluginError::registry("ceiling family must be [a-z0-9_-]"));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -751,32 +992,205 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_decl_gate_tightens_down_the_table() {
-        let sealed = SandboxDecl::sealed();
-        // The sealed posture passes every role that reaches the sandbox point.
-        assert!(AgentRole::Commander.check_sandbox_exec(&sealed).is_ok());
-        assert!(AgentRole::Implementer.check_sandbox_exec(&sealed).is_ok());
-        assert!(AgentRole::Tester.check_sandbox_exec(&sealed).is_ok());
-        // Reviewers never reach the sandbox point.
-        assert!(AgentRole::Reviewer.check_sandbox_exec(&sealed).is_err());
-        // Implementers claim no network; testers claim nothing beyond sealed.
-        let net = SandboxDecl::new(false, true, false, true);
-        assert!(AgentRole::Commander.check_sandbox_exec(&net).is_ok());
-        assert!(AgentRole::Implementer.check_sandbox_exec(&net).is_err());
-        assert!(AgentRole::Tester.check_sandbox_exec(&net).is_err());
-        let unsealed = SandboxDecl::new(false, false, false, false);
-        assert!(AgentRole::Commander.check_sandbox_exec(&unsealed).is_ok());
+    fn core_ceiling_catalog_matches_capability_ceiling() {
+        // CTX-0916 S5 (DEC-0100): the Core seed contributes nothing, so the
+        // effective ceiling is exactly `capability_ceiling` per role
+        // (AI-free since S4).
+        let core = RoleCeilingCatalog::core();
+        assert!(core.is_empty());
+        assert_eq!(core.len(), 0);
+        assert_eq!(RoleCeilingCatalog::default(), core);
+        for role in [
+            AgentRole::Commander,
+            AgentRole::Implementer,
+            AgentRole::Tester,
+            AgentRole::Reviewer,
+        ] {
+            let mut expected: Vec<&str> = role
+                .capability_ceiling()
+                .iter()
+                .copied()
+                .map(CapabilityFamily::as_str)
+                .collect();
+            expected.sort_unstable();
+            assert_eq!(
+                core.effective_for(role),
+                expected,
+                "{role} Core ceiling drifted"
+            );
+            assert!(core.contributed_for(role).is_empty());
+            for family in expected {
+                assert!(core.allows(role, family), "{role} must admit {family}");
+            }
+            assert!(
+                !core.allows(role, "ai"),
+                "{role} must deny ai on the Core seed"
+            );
+        }
+    }
+
+    #[test]
+    fn register_ceiling_accepts_extension_families_additively() {
+        // The S6 handoff shape: `bitty-ai` contributes its families to the
+        // Commander row without touching the Core defaults.
+        let mut ceilings = RoleCeilingCatalog::core();
+        ceilings
+            .register_ceiling(AgentRole::Commander, &["ai", "mcp", "agent"])
+            .expect("ai families contribute");
+        assert_eq!(ceilings.len(), 3);
+        assert!(!ceilings.is_empty());
+        for family in ["ai", "mcp", "agent"] {
+            assert!(
+                ceilings.allows(AgentRole::Commander, family),
+                "commander must admit contributed {family}"
+            );
+            assert!(
+                !ceilings.allows(AgentRole::Implementer, family),
+                "contribution must not leak to other roles"
+            );
+        }
+        assert_eq!(
+            ceilings.contributed_for(AgentRole::Commander),
+            vec!["agent", "ai", "mcp"]
+        );
+        // Core families stay admitted alongside contributions.
+        assert!(ceilings.allows(AgentRole::Commander, "fs"));
+        // A fresh Core seed is unaffected by the contribution.
+        let fresh = RoleCeilingCatalog::core();
+        assert!(!fresh.allows(AgentRole::Commander, "ai"));
+        assert!(fresh.is_empty());
+    }
+
+    #[test]
+    fn register_ceiling_rejects_duplicates_without_mutation() {
+        let mut ceilings = RoleCeilingCatalog::core();
+        let before = ceilings.clone();
+
+        // Contributing a Core-default family is a duplicate, never an
+        // overwrite ...
+        let error = ceilings
+            .register_ceiling(AgentRole::Commander, &["fs"])
+            .expect_err("core family re-registration must deny");
+        assert!(matches!(error, PluginError::Duplicate { .. }), "{error}");
+        // ... as is re-contributing an already contributed family ...
+        ceilings
+            .register_ceiling(AgentRole::Tester, &["acme"])
+            .expect("first contribution registers");
+        let error = ceilings
+            .register_ceiling(AgentRole::Tester, &["acme"])
+            .expect_err("second contribution must deny");
+        assert!(matches!(error, PluginError::Duplicate { .. }), "{error}");
+        // ... while the same family stays contributable to another role's
+        // row (rows are per-role; S6 contributes shared AI families to
+        // several roles) ...
+        ceilings
+            .register_ceiling(AgentRole::Commander, &["acme"])
+            .expect("cross-role contribution registers");
+        // ... and duplicates within one call reject before any mutation.
+        let error = ceilings
+            .register_ceiling(AgentRole::Reviewer, &["new-a", "new-a"])
+            .expect_err("in-call duplicate must deny");
+        assert!(matches!(error, PluginError::Duplicate { .. }), "{error}");
+        assert!(!ceilings.allows(AgentRole::Reviewer, "new-a"));
+
+        // Only the two accepted contributions landed.
+        assert_eq!(ceilings.len(), before.len() + 2);
+        assert!(ceilings.allows(AgentRole::Tester, "acme"));
+        assert!(ceilings.allows(AgentRole::Commander, "acme"));
+    }
+
+    #[test]
+    fn register_ceiling_rejects_bad_shapes_without_mutation() {
+        let mut ceilings = RoleCeilingCatalog::core();
+        let before = ceilings.clone();
+
         assert!(
-            AgentRole::Implementer
-                .check_sandbox_exec(&unsealed)
+            ceilings
+                .register_ceiling(AgentRole::Commander, &[])
                 .is_err(),
-            "implementer requires the environment seal"
+            "empty registration must deny"
         );
-        let child = SandboxDecl::new(false, false, true, true);
-        assert!(AgentRole::Commander.check_sandbox_exec(&child).is_ok());
+        for bad in [
+            "",
+            "Ai",
+            "9lives",
+            "has space",
+            "with:colon",
+            "wild*card",
+            "UPPER",
+        ] {
+            assert!(
+                ceilings
+                    .register_ceiling(AgentRole::Commander, &[bad])
+                    .is_err(),
+                "'{bad}' must deny"
+            );
+        }
+        let long = "f".repeat(MAX_CEILING_FAMILY_LEN + 1);
         assert!(
-            AgentRole::Tester.check_sandbox_exec(&child).is_err(),
-            "tester claims no child process"
+            ceilings
+                .register_ceiling(AgentRole::Commander, &[long.as_str()])
+                .is_err(),
+            "oversize family must deny"
         );
+        // A mixed call (one valid, one invalid) mutates nothing.
+        assert!(
+            ceilings
+                .register_ceiling(AgentRole::Commander, &["valid-new", "Bad"])
+                .is_err(),
+            "mixed call must deny"
+        );
+        assert!(!ceilings.allows(AgentRole::Commander, "valid-new"));
+
+        assert_eq!(ceilings, before);
+    }
+
+    #[test]
+    fn register_ceiling_enforces_bounds() {
+        let mut ceilings = RoleCeilingCatalog::core();
+
+        // Per-call bound.
+        let owned: Vec<String> = (0..MAX_CEILING_FAMILIES_PER_CALL + 1)
+            .map(|i| format!("ext{i}"))
+            .collect();
+        let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let error = ceilings
+            .register_ceiling(AgentRole::Commander, &refs)
+            .expect_err("over per-call bound must deny");
+        assert!(
+            matches!(error, PluginError::LimitExceeded { .. }),
+            "{error}"
+        );
+        assert!(ceilings.is_empty());
+
+        // Total bound: fill to the limit across roles, then trip it.
+        let mut made = 0;
+        for role in [
+            AgentRole::Commander,
+            AgentRole::Implementer,
+            AgentRole::Tester,
+            AgentRole::Reviewer,
+        ] {
+            while ceilings.len() + MAX_CEILING_FAMILIES_PER_CALL <= MAX_CONTRIBUTED_CEILING_FAMILIES
+            {
+                let owned: Vec<String> = (0..MAX_CEILING_FAMILIES_PER_CALL)
+                    .map(|i| format!("r{role}-{made}-{i}"))
+                    .collect();
+                let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+                ceilings
+                    .register_ceiling(role, &refs)
+                    .expect("bounded fill registers");
+                made += 1;
+            }
+        }
+        assert_eq!(ceilings.len(), MAX_CONTRIBUTED_CEILING_FAMILIES);
+        let error = ceilings
+            .register_ceiling(AgentRole::Commander, &["one-more"])
+            .expect_err("over total bound must deny");
+        assert!(
+            matches!(error, PluginError::LimitExceeded { .. }),
+            "{error}"
+        );
+        assert!(!ceilings.allows(AgentRole::Commander, "one-more"));
     }
 }

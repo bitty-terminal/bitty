@@ -166,7 +166,8 @@ impl TrustLevel {
     /// families with a domain mapping must be admitted by this level, otherwise
     /// the request denies fail-closed with a grant error naming the level and
     /// the family only (never a value). Families without a domain mapping
-    /// (`Ui`, `Runtime`, `Agent`, `Mcp`, `Ai`, and the rest) pass here: the
+    /// (`Ui`, `Runtime`, `Env`, `Debug`, `Platform`, `Protocol`, `Panel`,
+    /// `Browser`, `Layout`, `Workspace`, and the rest) pass here: the
     /// adopted matrix says nothing about them, so their grants decide
     /// elsewhere. The check is coarse at the shared `Terminal` family: it
     /// passes when the level admits either `TerminalInput` or

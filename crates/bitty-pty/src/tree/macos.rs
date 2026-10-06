@@ -15,7 +15,7 @@ use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 use nix::sys::signal::{Signal, kill, killpg};
 use nix::unistd::{Pid, getpgrp};
 
-use super::{LeaderExit, TreeBackend, TreeSignal};
+use super::{LeaderExit, TreeBackend, TreeLifetime, TreeSignal};
 
 pub(super) const BACKEND: TreeBackend = TreeBackend::ProcessGroupKqueue;
 
@@ -38,7 +38,10 @@ pub(super) struct Observer {
 }
 
 impl Observer {
-    pub(super) fn arm(leader: u32) -> io::Result<Self> {
+    /// Arms the observer. The [`TreeLifetime`] is a mechanism no-op here:
+    /// process groups outlive their parent however they were adopted.
+    pub(super) fn arm(leader: u32, lifetime: TreeLifetime) -> io::Result<Self> {
+        let _ = lifetime;
         let ident = usize::try_from(leader)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "pid out of range"))?;
         let queue = Kqueue::new().map_err(io::Error::from)?;

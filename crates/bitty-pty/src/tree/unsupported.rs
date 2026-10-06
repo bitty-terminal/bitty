@@ -7,7 +7,7 @@
 
 use std::io;
 
-use super::{LeaderExit, TreeBackend, TreeSignal};
+use super::{LeaderExit, TreeBackend, TreeLifetime, TreeSignal};
 
 pub(super) const BACKEND: TreeBackend = TreeBackend::Unsupported;
 
@@ -15,8 +15,8 @@ pub(super) const BACKEND: TreeBackend = TreeBackend::Unsupported;
 pub(super) struct Observer;
 
 impl Observer {
-    pub(super) fn arm(leader: u32) -> io::Result<Self> {
-        let _ = leader;
+    pub(super) fn arm(leader: u32, lifetime: TreeLifetime) -> io::Result<Self> {
+        let _ = (leader, lifetime);
         Err(unsupported())
     }
 

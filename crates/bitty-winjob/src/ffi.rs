@@ -109,13 +109,19 @@ fn check(ok: windows_sys::core::BOOL) -> io::Result<()> {
     }
 }
 
-/// Creates an anonymous, non-inheritable job whose last handle close kills
-/// every member (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`).
-pub(crate) fn create_kill_on_close_job() -> io::Result<OwnedHandle> {
+/// Creates an anonymous, non-inheritable job. When `kill_on_close`, the
+/// last handle close kills every member
+/// (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`); otherwise members outlive the
+/// last close (DEC-0102: detached and service jobs). The detached path
+/// skips one kernel call and adds no new `unsafe`.
+pub(crate) fn create_job(kill_on_close: bool) -> io::Result<OwnedHandle> {
     // SAFETY: NULL security attributes (default descriptor, handle not
     // inheritable) and a NULL name (anonymous job) are documented valid
     // arguments; the returned handle is checked for NULL before use.
     let job = owned_or_null(unsafe { CreateJobObjectW(ptr::null(), ptr::null()) })?;
+    if !kill_on_close {
+        return Ok(job);
+    }
     let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
     // SAFETY: `job` is a live job handle owned above; `limits` is a fully

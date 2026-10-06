@@ -1079,7 +1079,7 @@ impl FsGate {
     }
 
     fn check_sensitive(&self, level: TrustLevel, path: &str) -> Result<(), FsBridgeError> {
-        if self.policy.is_sensitive(path) {
+        if self.policy.is_sensitive(path) && !self.consented(path) {
             // Consent is keyed by normalized path; without active consent the
             // operation denies with the sensitive-path category (oracle-tight:
             // level plus family only, never the consent state).
@@ -1090,6 +1090,17 @@ impl FsGate {
             ));
         }
         Ok(())
+    }
+
+    /// Whether active per-path user consent covers `path` right now.
+    ///
+    /// Consent is keyed by normalized path
+    /// ([`crate::fs_authz::SensitivePathPolicy::grant_consent`]); hostile or
+    /// otherwise unrepresentable paths never normalize, so they never carry
+    /// consent and stay denied.
+    fn consented(&self, path: &str) -> bool {
+        crate::fs_authz::normalize_request_path(path)
+            .is_some_and(|normalized| self.policy.consent_active(&normalized, self.now))
     }
 
     /// Bounded read of file bytes under the read grant.
@@ -1106,14 +1117,7 @@ impl FsGate {
         // above, so this denial never oracles sensitive state to them.
         // Consent-aware callers pass here only with active per-path consent;
         // the policy check below still denies without it.
-        let sensitive = self.policy.is_sensitive(&req.path);
-        if sensitive {
-            return Err(FsBridgeError::denied(
-                FsBridgeDenialKind::SensitivePath,
-                level,
-                "sensitive path without consent",
-            ));
-        }
+        self.check_sensitive(level, &req.path)?;
 
         // Static bounds: explicit byte bound must be within the cap; never
         // clamp silently.
@@ -1197,8 +1201,16 @@ impl FsGate {
 
         // Secret-shaped writes refuse fail-closed (no redacted write path):
         // persisting secret-shaped bytes without an explicit secret flow
-        // would launder them into the granted scope.
-        if content_looks_secret(&req.content) {
+        // would launder them into the granted scope. Check the bytes that
+        // will actually be stored, not only the payload, so split appends
+        // cannot assemble a secret-shaped file from innocent halves.
+        let existing = view.get(&req.path).cloned().unwrap_or_default();
+        let next = if req.append {
+            format!("{existing}{}", req.content)
+        } else {
+            req.content.clone()
+        };
+        if content_looks_secret(&next) {
             return Err(FsBridgeError::denied(
                 FsBridgeDenialKind::SecretContent,
                 level,
@@ -1215,12 +1227,6 @@ impl FsGate {
                 "over per-write byte bound",
             ));
         }
-        let existing = view.get(&req.path).cloned().unwrap_or_default();
-        let next = if req.append {
-            format!("{existing}{}", req.content)
-        } else {
-            req.content.clone()
-        };
         if next.len() > self.caps.max_bytes_per_write as usize {
             return Err(FsBridgeError::denied(
                 FsBridgeDenialKind::OverBoundOrRate,
@@ -1299,13 +1305,16 @@ impl FsGate {
                 self.grant_is_usable(grant, plugin, FsVerb::List, level)
                     && Self::scope_covers(&grant.patterns(), &child)
             });
-            if level == TrustLevel::Core && self.policy.is_sensitive(&child) {
+            if level == TrustLevel::Core
+                && self.policy.is_sensitive(&child)
+                && !self.consented(&child)
+            {
                 continue;
             }
             if level != TrustLevel::Core && !covered {
                 continue;
             }
-            if self.policy.is_sensitive(&child) {
+            if self.policy.is_sensitive(&child) && !self.consented(&child) {
                 continue;
             }
             visible.push((child, is_dir));
@@ -2230,5 +2239,177 @@ mod tests {
                 "level {level}"
             );
         }
+    }
+
+    // ── sensitive-path consent ─────────────────────────────────────────
+
+    #[test]
+    fn sensitive_consent_grants_access_until_it_lapses() {
+        let plugin = pid("xuepoo.files");
+        let mut gate = FsGate::new(caps());
+        gate.issue_grant(read_grant(&plugin, &["~/projects/app/**"]));
+        gate.issue_grant(write_grant(&plugin, &["~/projects/app/**"]));
+        let mut view = FsView::new();
+        view.insert("~/projects/app/.env", "K=v").unwrap();
+        view.insert("~/projects/app/.env.local", "K=v").unwrap();
+        view.insert("~/projects/app/notes.txt", "notes").unwrap();
+
+        // Without consent every verb denies with the sensitive-path
+        // category, and listings silently suppress the sensitive children.
+        assert_eq!(
+            gate.read(
+                &plugin,
+                TrustLevel::ThirdPartyLua,
+                &read_req("~/projects/app/.env"),
+                &view
+            )
+            .unwrap_err()
+            .denial_kind(),
+            Some(FsBridgeDenialKind::SensitivePath)
+        );
+        assert_eq!(
+            gate.write(
+                &plugin,
+                TrustLevel::ThirdPartyLua,
+                &write_req("~/projects/app/.env", "hello", false),
+                &mut view
+            )
+            .unwrap_err()
+            .denial_kind(),
+            Some(FsBridgeDenialKind::SensitivePath)
+        );
+        let page = gate
+            .list(
+                &plugin,
+                TrustLevel::ThirdPartyLua,
+                &list_req("~/projects/app"),
+                &view,
+            )
+            .unwrap();
+        let names: Vec<&str> = page.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["~/projects/app/notes.txt"]);
+
+        // Active consent opens exactly the consented path: read, overwrite,
+        // and listing all see it, while the sibling sensitive file stays
+        // denied/suppressed (consent names one path, never a subtree).
+        gate.grant_consent("~/projects/app/.env").unwrap();
+        assert!(
+            gate.read(
+                &plugin,
+                TrustLevel::ThirdPartyLua,
+                &read_req("~/projects/app/.env"),
+                &view
+            )
+            .is_ok()
+        );
+        assert!(
+            gate.write(
+                &plugin,
+                TrustLevel::ThirdPartyLua,
+                &write_req("~/projects/app/.env", "hello", false),
+                &mut view
+            )
+            .is_ok()
+        );
+        let page = gate
+            .list(
+                &plugin,
+                TrustLevel::ThirdPartyLua,
+                &list_req("~/projects/app"),
+                &view,
+            )
+            .unwrap();
+        let names: Vec<&str> = page.entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"~/projects/app/.env"), "{names:?}");
+        assert!(names.contains(&"~/projects/app/notes.txt"), "{names:?}");
+        assert!(!names.iter().any(|n| n.contains(".env.local")), "{names:?}");
+        assert_eq!(
+            gate.read(
+                &plugin,
+                TrustLevel::ThirdPartyLua,
+                &read_req("~/projects/app/.env.local"),
+                &view
+            )
+            .unwrap_err()
+            .denial_kind(),
+            Some(FsBridgeDenialKind::SensitivePath)
+        );
+
+        // Revocation closes the path again with the same category.
+        gate.revoke_consent("~/projects/app/.env");
+        assert_eq!(
+            gate.read(
+                &plugin,
+                TrustLevel::ThirdPartyLua,
+                &read_req("~/projects/app/.env"),
+                &view
+            )
+            .unwrap_err()
+            .denial_kind(),
+            Some(FsBridgeDenialKind::SensitivePath)
+        );
+
+        // A bounded grant lapses back to denial once past expiry (no
+        // absent-vs-expired signal: the category never names the cause).
+        let mut gate = FsGate::new(caps());
+        gate.issue_grant(read_grant(&plugin, &["~/projects/app/**"]));
+        gate.policy
+            .grant_consent("~/projects/app/.env", 0, Some(10))
+            .unwrap();
+        gate.advance_time(9);
+        assert!(
+            gate.read(
+                &plugin,
+                TrustLevel::ThirdPartyLua,
+                &read_req("~/projects/app/.env"),
+                &view
+            )
+            .is_ok()
+        );
+        gate.advance_time(1);
+        assert_eq!(
+            gate.read(
+                &plugin,
+                TrustLevel::ThirdPartyLua,
+                &read_req("~/projects/app/.env"),
+                &view
+            )
+            .unwrap_err()
+            .denial_kind(),
+            Some(FsBridgeDenialKind::SensitivePath)
+        );
+    }
+
+    // ── append secret assembly ─────────────────────────────────────────
+
+    #[test]
+    fn split_append_cannot_assemble_secret_shaped_file() {
+        let plugin = pid("xuepoo.files");
+        let mut gate = granted_gate(&plugin);
+        let mut view = FsView::new();
+        // Neither half is secret-shaped alone, but the assembled file is.
+        assert!(!content_looks_secret("AKIA"));
+        assert!(!content_looks_secret("IOSFODNN7EXAMPLE"));
+        assert!(content_looks_secret("AKIAIOSFODNN7EXAMPLE"));
+        gate.write(
+            &plugin,
+            TrustLevel::ThirdPartyLua,
+            &write_req("~/docs/out/k.txt", "AKIA", false),
+            &mut view,
+        )
+        .unwrap();
+        // The refused append stores nothing: the first half survives intact.
+        assert_eq!(
+            gate.write(
+                &plugin,
+                TrustLevel::ThirdPartyLua,
+                &write_req("~/docs/out/k.txt", "IOSFODNN7EXAMPLE", true),
+                &mut view
+            )
+            .unwrap_err()
+            .denial_kind(),
+            Some(FsBridgeDenialKind::SecretContent)
+        );
+        assert_eq!(view.get("~/docs/out/k.txt").unwrap(), "AKIA");
     }
 }

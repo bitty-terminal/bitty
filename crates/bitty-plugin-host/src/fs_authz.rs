@@ -607,7 +607,7 @@ impl FsConsent {
 /// verbatim so traversal stays visible to the caller (scope checks reject
 /// it). Absolute paths keep a leading empty root marker so they never
 /// collide with `~`-rooted or relative keys.
-fn normalize_request_path(path: &str) -> Option<String> {
+pub(crate) fn normalize_request_path(path: &str) -> Option<String> {
     if path.is_empty() || path.len() > MAX_FS_PATH_BYTES || path.contains('\0') {
         return None;
     }

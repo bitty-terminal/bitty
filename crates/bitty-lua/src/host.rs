@@ -3539,17 +3539,8 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         Callback::from_fn(&ctx, {
             let state = state.clone();
             move |ctx, _exec, mut stack| {
-                let path = match stack.get(0) {
-                    Value::String(s) => String::from_utf8_lossy(s.as_bytes()).into_owned(),
-                    _ => {
-                        return Err(BridgeError::new(
-                            "validation",
-                            "E_DEF_INVALID",
-                            "fs.read path must be a string",
-                        )
-                        .to_error(ctx));
-                    }
-                };
+                let path =
+                    fs_text_arg(stack.get(0), "fs.read path").map_err(|e| e.to_error(ctx))?;
                 validate_fs_path(&path).map_err(|e| e.to_error(ctx))?;
                 let result = state
                     .bounded(|_expiry| state.services.fs_read(&path))
@@ -3566,28 +3557,10 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         Callback::from_fn(&ctx, {
             let state = state.clone();
             move |ctx, _exec, mut stack| {
-                let path = match stack.get(0) {
-                    Value::String(s) => String::from_utf8_lossy(s.as_bytes()).into_owned(),
-                    _ => {
-                        return Err(BridgeError::new(
-                            "validation",
-                            "E_DEF_INVALID",
-                            "fs.write path must be a string",
-                        )
-                        .to_error(ctx));
-                    }
-                };
-                let content = match stack.get(1) {
-                    Value::String(s) => String::from_utf8_lossy(s.as_bytes()).into_owned(),
-                    _ => {
-                        return Err(BridgeError::new(
-                            "validation",
-                            "E_DEF_INVALID",
-                            "fs.write content must be a string",
-                        )
-                        .to_error(ctx));
-                    }
-                };
+                let path =
+                    fs_text_arg(stack.get(0), "fs.write path").map_err(|e| e.to_error(ctx))?;
+                let content =
+                    fs_text_arg(stack.get(1), "fs.write content").map_err(|e| e.to_error(ctx))?;
                 validate_fs_path(&path).map_err(|e| e.to_error(ctx))?;
                 validate_fs_content(&content).map_err(|e| e.to_error(ctx))?;
                 let raw_opts = stack.get(2);
@@ -3613,17 +3586,8 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         Callback::from_fn(&ctx, {
             let state = state.clone();
             move |ctx, _exec, mut stack| {
-                let prefix = match stack.get(0) {
-                    Value::String(s) => String::from_utf8_lossy(s.as_bytes()).into_owned(),
-                    _ => {
-                        return Err(BridgeError::new(
-                            "validation",
-                            "E_DEF_INVALID",
-                            "fs.list prefix must be a string",
-                        )
-                        .to_error(ctx));
-                    }
-                };
+                let prefix =
+                    fs_text_arg(stack.get(0), "fs.list prefix").map_err(|e| e.to_error(ctx))?;
                 validate_fs_path(&prefix).map_err(|e| e.to_error(ctx))?;
                 let max_entries = match stack.get(1) {
                     Value::Nil => FS_LIST_MAX_ENTRIES,
@@ -4946,6 +4910,30 @@ pub fn validate_env_key(key: &str) -> Result<(), BridgeError> {
         ));
     }
     Ok(())
+}
+
+/// Decode one `bitty.fs` Lua string argument for `what` (RFC-0005, CTX-0984).
+///
+/// Lua strings are byte strings: lossy conversion would persist U+FFFD
+/// replacements and corrupt binary/Latin-1 content under a success receipt.
+/// Fail closed with `E_DEF_INVALID` before any grant check or write so a
+/// non-UTF-8 caller gets a typed denial and no file is touched.
+fn fs_text_arg(value: Value<'_>, what: &str) -> Result<String, BridgeError> {
+    let Value::String(raw) = value else {
+        return Err(BridgeError::new(
+            "validation",
+            "E_DEF_INVALID",
+            format!("{what} must be a string"),
+        ));
+    };
+    let Ok(text) = std::str::from_utf8(raw.as_bytes()) else {
+        return Err(BridgeError::new(
+            "validation",
+            "E_DEF_INVALID",
+            format!("{what} must be valid UTF-8"),
+        ));
+    };
+    Ok(text.to_owned())
 }
 
 /// Validate a `bitty.fs` path shape (RFC-0005, CTX-0984).

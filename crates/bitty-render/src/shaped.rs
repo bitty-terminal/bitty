@@ -12,8 +12,9 @@
 //! `fontdb::Database` discovers faces for the primary + tails,
 //! `harfrust` shapes runs with per-face shape plans, and `swash` rasterizes
 //! outlines and bitmap strikes from the same font bytes (shared
-//! `skrifa`/`read-fonts` parser underneath — no second font parser beside
-//! `fontdb`'s query-time `ttf-parser`).
+//! `skrifa`/`read-fonts` parser underneath — and since fontdb 0.24 the
+//! discovery layer vendors its query-time parser subset, so no external
+//! `ttf-parser` edge remains on this path).
 //!
 //! Phase A serves the single-scalar [`GlyphRasterizer`] contract
 //! ([`SwashSingle`]); the run-shaping side ([`RunAttrs`],

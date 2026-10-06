@@ -425,14 +425,32 @@ pub enum ClosedCapabilityViolation {
 /// Validates the identifier head against [`CLOSED_CAPABILITY_HEADS`] plus the
 /// parameter presence rules; shape checks (segments, lengths, character
 /// classes) stay with the caller so each crate keeps its own error vocabulary.
+///
+/// CTX-0916 S2 (DEC-0102): the Core-seeded default delegates to
+/// [`check_closed_capability_with`] with [`CapabilityCatalog::core`], so
+/// existing callers keep byte-identical behavior while extension-aware
+/// callers pass an explicit catalog.
 pub fn check_closed_capability(
     head: &str,
     has_param: bool,
 ) -> Result<(), ClosedCapabilityViolation> {
-    // CTX-0916 S1 (DEC-0102): the closed set delegates to the Core catalog
-    // seed so lock-time and grant-time validation share one source. The seed
-    // holds exactly the tables below; behavior is unchanged.
-    CapabilityCatalog::core().check(head, has_param)
+    check_closed_capability_with(&CapabilityCatalog::core(), head, has_param)
+}
+
+/// Catalog-scoped closed-set check (CTX-0916 S2, DEC-0102).
+///
+/// Shape rules stay Core-owned with the caller; only closed-set membership
+/// and parameter presence come from `catalog`. With
+/// [`CapabilityCatalog::core`] the result equals
+/// [`check_closed_capability`].
+pub fn check_closed_capability_with(
+    catalog: &CapabilityCatalog,
+    head: &str,
+    has_param: bool,
+) -> Result<(), ClosedCapabilityViolation> {
+    // The Core seed holds exactly the tables below, so lock-time and
+    // grant-time validation share one source with zero behavior change.
+    catalog.check(head, has_param)
 }
 
 /// Canonical closed-set validation producing package errors.
@@ -440,8 +458,26 @@ pub fn check_closed_capability(
 /// Called from [`validate_capability`] so manifest-time validation enforces
 /// exactly the host install-time set: divergent identifiers fail here instead
 /// of locking successfully and failing at install.
+///
+/// CTX-0916 S2 (DEC-0102): the Core-seeded default delegates to
+/// [`validate_closed_capability_with`] with [`CapabilityCatalog::core`].
 pub fn validate_closed_capability(head: &str, has_param: bool) -> Result<(), PackageError> {
-    check_closed_capability(head, has_param)
+    validate_closed_capability_with(&CapabilityCatalog::core(), head, has_param)
+}
+
+/// Catalog-scoped closed-set validation producing package errors
+/// (CTX-0916 S2, DEC-0102).
+///
+/// Shares the manifest error vocabulary with [`validate_closed_capability`]
+/// so both paths report identical messages. With
+/// [`CapabilityCatalog::core`] the result equals
+/// [`validate_closed_capability`].
+pub fn validate_closed_capability_with(
+    catalog: &CapabilityCatalog,
+    head: &str,
+    has_param: bool,
+) -> Result<(), PackageError> {
+    check_closed_capability_with(catalog, head, has_param)
         .map_err(|violation| closed_violation_error(head, violation))
 }
 
@@ -468,6 +504,11 @@ fn closed_violation_error(head: &str, violation: ClosedCapabilityViolation) -> P
     }
 }
 
+/// Core-seeded manifest validation default (CTX-0916 S2, DEC-0102).
+///
+/// Delegates to [`validate_capability_with`] with
+/// [`CapabilityCatalog::core`], so existing callers keep byte-identical
+/// behavior.
 fn validate_capability(raw: &str) -> Result<(), PackageError> {
     validate_capability_with(&CapabilityCatalog::core(), raw)
 }
@@ -476,7 +517,13 @@ fn validate_capability(raw: &str) -> Result<(), PackageError> {
 /// [`CapabilityId::parse_with`]: segment, length, and character rules are
 /// Core-owned and identical on both paths; only the closed-set check reads
 /// `catalog`.
-fn validate_capability_with(catalog: &CapabilityCatalog, raw: &str) -> Result<(), PackageError> {
+///
+/// CTX-0916 S2 (DEC-0102): the catalog-aware entry point. With
+/// [`CapabilityCatalog::core`] the result equals the Core-seeded default.
+pub fn validate_capability_with(
+    catalog: &CapabilityCatalog,
+    raw: &str,
+) -> Result<(), PackageError> {
     if raw.is_empty() {
         return Err(PackageError::manifest(
             "capabilities",
@@ -1043,5 +1090,77 @@ mod tests {
             prerelease: false,
         });
         assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn with_variants_agree_with_core_defaults() {
+        // CTX-0916 S2 (DEC-0102): the explicit-catalog paths with the Core
+        // seed accept exactly the same set as the Core-seeded defaults, so
+        // existing callers keep byte-identical behavior.
+        let core = CapabilityCatalog::core();
+        for head in CLOSED_CAPABILITY_HEADS {
+            let raw = if capability_requires_param(head) {
+                format!("{head}:param")
+            } else {
+                (*head).to_string()
+            };
+            let (bare_head, has_param) = match raw.split_once(':') {
+                Some((h, _)) => (h, true),
+                None => (raw.as_str(), false),
+            };
+            assert_eq!(
+                check_closed_capability(bare_head, has_param),
+                check_closed_capability_with(&core, bare_head, has_param),
+                "check diverged for '{raw}'"
+            );
+            assert_eq!(
+                validate_closed_capability(bare_head, has_param).is_ok(),
+                validate_closed_capability_with(&core, bare_head, has_param).is_ok(),
+                "validate_closed diverged for '{raw}'"
+            );
+            assert_eq!(
+                CapabilityId::new(&raw).is_ok(),
+                validate_capability_with(&core, &raw).is_ok(),
+                "validate diverged for '{raw}'"
+            );
+            assert_eq!(
+                CapabilityId::new(&raw).is_ok(),
+                CapabilityId::parse_with(&core, &raw).is_ok(),
+                "CapabilityId paths diverged for '{raw}'"
+            );
+        }
+        for (head, has_param) in [
+            ("terminal.unknown-thing", false),
+            ("ui.unknown", false),
+            ("fs.read", false),
+            ("terminal.semantic-read", true),
+        ] {
+            assert_eq!(
+                check_closed_capability(head, has_param),
+                check_closed_capability_with(&core, head, has_param),
+                "check rejection diverged for '{head}'"
+            );
+        }
+    }
+
+    #[test]
+    fn with_variants_accept_registered_extension() {
+        // CTX-0916 S2 (DEC-0102): an extension head validates through the
+        // extended catalog while the Core-seeded defaults still fail closed.
+        let mut extended = CapabilityCatalog::core();
+        extended
+            .register("acme", &[("acme.widget", false)])
+            .expect("extension registers");
+        assert!(validate_capability_with(&extended, "acme.widget").is_ok());
+        assert!(CapabilityId::parse_with(&extended, "acme.widget").is_ok());
+        assert_eq!(
+            check_closed_capability_with(&extended, "acme.widget", false),
+            Ok(())
+        );
+        assert!(validate_closed_capability_with(&extended, "acme.widget", false).is_ok());
+        assert!(CapabilityId::new("acme.widget").is_err());
+        assert!(check_closed_capability("acme.widget", false).is_err());
+        assert!(validate_closed_capability("acme.widget", false).is_err());
+        assert!(validate_capability_with(&CapabilityCatalog::core(), "acme.widget").is_err());
     }
 }

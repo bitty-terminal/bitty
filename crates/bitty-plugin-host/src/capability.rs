@@ -742,14 +742,14 @@ mod tests {
     }
 
     #[test]
-    fn closed_set_matches_package_manifest_canonical_set() {
-        // CR-PKG-03: the package manifest validator and the host must enforce
-        // exactly the same closed set. The host delegates to the canonical
-        // package tables; this test pins the two sides together.
+    fn core_seed_equals_host_closed_set() {
+        // CTX-0916 S2 (DEC-0102) (a) seed-equality: the package Core seed and
+        // the host Core seed accept exactly the same set. CR-PKG-03 keeps the
+        // package manifest validator and the host enforcing one shared closed
+        // set; the host delegates to the canonical package tables.
         use bitty_package::manifest as package_manifest;
 
-        // Every host closed identifier is accepted by the package validator
-        // (with a parameter where one is required) and vice versa.
+        let core = CapabilityCatalog::core();
         let mut host_heads: Vec<&str> = Vec::new();
         for family in [
             CapabilityFamily::Terminal,
@@ -774,12 +774,29 @@ mod tests {
         ] {
             host_heads.extend(family.closed_identifiers().iter().copied());
         }
+
+        // Three-way head equality: catalog Core seed, package static tables,
+        // and host enum tables stay byte-identical.
         let mut host_sorted = host_heads.clone();
         host_sorted.sort_unstable();
         let mut package_sorted = package_manifest::CLOSED_CAPABILITY_HEADS.to_vec();
         package_sorted.sort_unstable();
+        let mut catalog_sorted = core.heads();
+        catalog_sorted.sort_unstable();
+        assert_eq!(catalog_sorted, package_sorted);
         assert_eq!(host_sorted, package_sorted);
 
+        // Parameter rules agree on every head.
+        for head in package_manifest::CLOSED_CAPABILITY_HEADS {
+            assert_eq!(
+                core.requires_param(head),
+                Some(package_manifest::capability_requires_param(head)),
+                "param rule diverged for '{head}'"
+            );
+        }
+
+        // Every closed head validates on both sides through the Core-seeded
+        // defaults and through the explicit Core catalog.
         for head in package_manifest::CLOSED_CAPABILITY_HEADS {
             let raw = if package_manifest::capability_requires_param(head) {
                 format!("{head}:param")
@@ -794,13 +811,99 @@ mod tests {
                 bitty_package::CapabilityId::new(&raw).is_ok(),
                 "host-accepted '{raw}' must validate in the package manifest"
             );
+            assert!(
+                CapabilityId::parse_with(&core, &raw).is_ok(),
+                "catalog-accepted '{raw}' must parse on the host"
+            );
+            assert!(
+                bitty_package::CapabilityId::parse_with(&core, &raw).is_ok(),
+                "catalog-accepted '{raw}' must validate in the package manifest"
+            );
+            assert!(
+                package_manifest::validate_capability_with(&core, &raw).is_ok(),
+                "catalog-accepted '{raw}' must validate via manifest helper"
+            );
         }
 
-        // Divergent identifiers are rejected on both sides.
+        // Divergent identifiers are rejected on both sides, on both paths.
         for raw in ["terminal.unknown-thing", "ui.unknown", "fs.read"] {
             assert!(CapabilityId::parse(raw).is_err());
             assert!(bitty_package::CapabilityId::new(raw).is_err());
+            assert!(CapabilityId::parse_with(&core, raw).is_err());
+            assert!(bitty_package::CapabilityId::parse_with(&core, raw).is_err());
         }
+    }
+
+    #[test]
+    fn extension_contribution_validates_identically_on_both_sides() {
+        // CTX-0916 S2 (DEC-0102) (b) additive-contribution: an extension head
+        // registered in a known family validates identically on both sides
+        // through the extended catalog, while the Core-seeded defaults on
+        // both sides still fail closed and a fresh Core seed is unaffected.
+        use bitty_package::manifest as package_manifest;
+
+        let mut extended = CapabilityCatalog::core();
+        extended
+            .register(
+                "panel",
+                &[("panel.custom-view", false), ("panel.custom-search", false)],
+            )
+            .expect("panel extension registers");
+        extended
+            .register("fs", &[("fs.archive-read", true)])
+            .expect("fs extension registers");
+
+        // Parameter-free head: accepted bare, rejected with a parameter.
+        for raw in ["panel.custom-view", "panel.custom-search"] {
+            assert!(
+                bitty_package::CapabilityId::parse_with(&extended, raw).is_ok(),
+                "package must accept '{raw}' via extended catalog"
+            );
+            assert!(
+                CapabilityId::parse_with(&extended, raw).is_ok(),
+                "host must accept '{raw}' via extended catalog"
+            );
+            assert!(
+                package_manifest::validate_capability_with(&extended, raw).is_ok(),
+                "manifest helper must accept '{raw}' via extended catalog"
+            );
+            let with_param = format!("{raw}:param");
+            assert!(
+                bitty_package::CapabilityId::parse_with(&extended, &with_param).is_err(),
+                "package must reject param on '{with_param}'"
+            );
+            assert!(
+                CapabilityId::parse_with(&extended, &with_param).is_err(),
+                "host must reject param on '{with_param}'"
+            );
+        }
+
+        // Parameter-requiring head: accepted with a parameter, rejected bare.
+        assert!(
+            bitty_package::CapabilityId::parse_with(&extended, "fs.archive-read:scope-1").is_ok()
+        );
+        assert!(CapabilityId::parse_with(&extended, "fs.archive-read:scope-1").is_ok());
+        assert!(
+            package_manifest::validate_capability_with(&extended, "fs.archive-read:scope-1")
+                .is_ok()
+        );
+        assert!(bitty_package::CapabilityId::parse_with(&extended, "fs.archive-read").is_err());
+        assert!(CapabilityId::parse_with(&extended, "fs.archive-read").is_err());
+
+        // Core-seeded defaults on both sides still fail closed.
+        for raw in [
+            "panel.custom-view",
+            "panel.custom-search",
+            "fs.archive-read:scope-1",
+        ] {
+            assert!(bitty_package::CapabilityId::new(raw).is_err());
+            assert!(CapabilityId::parse(raw).is_err());
+        }
+
+        // A fresh Core seed is unaffected by the extension.
+        let fresh = CapabilityCatalog::core();
+        assert!(bitty_package::CapabilityId::parse_with(&fresh, "panel.custom-view").is_err());
+        assert!(CapabilityId::parse_with(&fresh, "panel.custom-view").is_err());
     }
 
     #[test]

@@ -1694,6 +1694,143 @@ fn command_output_range_pruned_is_none() {
     assert!(s.check_invariants().is_ok());
 }
 
+/// Bare LF without CR: advances the row but keeps the column (CTX-0996).
+/// A fresh row entered this way can carry a nonzero column while holding no
+/// output, so per-row tracking must never infer from column zero.
+fn feed_bare_lf(state: &mut State) {
+    state.apply(&TerminalAction::PrintControl(ControlChar(0x0A)));
+}
+
+#[test]
+fn command_output_range_single_row_without_trailing_newline_is_single() {
+    // CTX-0996 (issue #1688): `D` on the same row as the only output line
+    // must preserve that row. The old unconditional `end_mark - 1` returned
+    // `None` here.
+    let mut s = State::new();
+    mark_zone(&mut s, ZoneKind::PromptStart);
+    prints(&mut s, "cmd");
+    feed_shell_line(&mut s, "");
+    mark_zone(&mut s, ZoneKind::OutputStart);
+    prints(&mut s, "solo");
+    mark_output_end(&mut s, 0);
+    let (start, end) = s.last_command_output_rows().expect("single row");
+    assert_eq!(start, end);
+    assert_eq!(live_line_text(&s, start), "solo");
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn command_output_range_final_partial_row_without_trailing_newline() {
+    // CTX-0996: CR+LF lines plus a final partial line (no trailing newline)
+    // keep the partial row. `D` arrives on the output row itself.
+    let mut s = State::new();
+    mark_zone(&mut s, ZoneKind::PromptStart);
+    prints(&mut s, "cmd");
+    feed_shell_line(&mut s, "");
+    mark_zone(&mut s, ZoneKind::OutputStart);
+    feed_shell_line(&mut s, "out1");
+    prints(&mut s, "partial");
+    mark_output_end(&mut s, 0);
+    let (start, end) = s.last_command_output_rows().expect("partial range");
+    assert_eq!(end - start + 1, 2);
+    assert_eq!(live_line_text(&s, start), "out1");
+    assert_eq!(live_line_text(&s, end), "partial");
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn command_output_range_bare_lf_fresh_d_row_is_excluded() {
+    // CTX-0996: output plus a bare LF (no CR) puts `D` on a fresh row whose
+    // column is still nonzero. The fresh row holds no output and must be
+    // excluded — column zero alone would mis-include it.
+    let mut s = State::new();
+    mark_zone(&mut s, ZoneKind::PromptStart);
+    prints(&mut s, "cmd");
+    feed_shell_line(&mut s, "");
+    mark_zone(&mut s, ZoneKind::OutputStart);
+    prints(&mut s, "out");
+    feed_bare_lf(&mut s);
+    assert_ne!(s.cursor().position.col, 0, "bare LF keeps the column");
+    mark_output_end(&mut s, 0);
+    let (start, end) = s.last_command_output_rows().expect("bare-LF range");
+    assert_eq!(start, end);
+    assert_eq!(live_line_text(&s, start), "out");
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn command_output_range_running_bare_lf_fresh_row_is_excluded() {
+    // CTX-0996 running-command mirror: after a bare LF the cursor sits on a
+    // fresh row with a nonzero column. The range must close before it.
+    let mut s = State::new();
+    mark_zone(&mut s, ZoneKind::PromptStart);
+    prints(&mut s, "sleep 9");
+    feed_shell_line(&mut s, "");
+    mark_zone(&mut s, ZoneKind::OutputStart);
+    prints(&mut s, "partial");
+    feed_bare_lf(&mut s);
+    assert_ne!(s.cursor().position.col, 0, "bare LF keeps the column");
+    let (start, end) = s.last_command_output_rows().expect("running range");
+    assert_eq!(live_line_text(&s, start), "partial");
+    assert_eq!(start, end, "fresh bare-LF row is excluded");
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn command_output_range_running_empty_is_none() {
+    // CTX-0996: a running command with no output yet (cursor still on the
+    // start row, nothing printed since `C`) selects nothing — consistent
+    // with the completed zero-byte case.
+    let mut s = State::new();
+    mark_zone(&mut s, ZoneKind::PromptStart);
+    prints(&mut s, "sleep 9");
+    feed_shell_line(&mut s, "");
+    mark_zone(&mut s, ZoneKind::OutputStart);
+    assert_eq!(s.last_command_output_rows(), None);
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn command_output_range_same_row_start_resets_precommand_text() {
+    // CTX-0996: `C` resets per-row tracking, so prompt/input text already on
+    // the row never counts as output. `C` + `D` on one row with nothing
+    // after `C` is empty even though the row is non-blank.
+    let mut s = State::new();
+    mark_zone(&mut s, ZoneKind::PromptStart);
+    prints(&mut s, "cmd");
+    mark_zone(&mut s, ZoneKind::OutputStart);
+    mark_output_end(&mut s, 0);
+    assert_eq!(s.last_command_output_rows(), None);
+    // Output printed after `C` on the same row counts: single-row range.
+    let mut t = State::new();
+    mark_zone(&mut t, ZoneKind::PromptStart);
+    prints(&mut t, "cmd");
+    mark_zone(&mut t, ZoneKind::OutputStart);
+    prints(&mut t, "out");
+    mark_output_end(&mut t, 0);
+    let (start, end) = t.last_command_output_rows().expect("same-row output");
+    assert_eq!(start, end);
+    assert_eq!(live_line_text(&t, start), "cmdout");
+    assert!(s.check_invariants().is_ok());
+    assert!(t.check_invariants().is_ok());
+}
+
+#[test]
+fn command_output_range_spaces_without_newline_is_single() {
+    // CTX-0996: whitespace-only output without a trailing newline still
+    // counts — tracking is historical (a print occurred), not a blank check.
+    let mut s = State::new();
+    mark_zone(&mut s, ZoneKind::PromptStart);
+    prints(&mut s, "cmd");
+    feed_shell_line(&mut s, "");
+    mark_zone(&mut s, ZoneKind::OutputStart);
+    prints(&mut s, "   ");
+    mark_output_end(&mut s, 0);
+    let (start, end) = s.last_command_output_rows().expect("spaces row");
+    assert_eq!(start, end);
+    assert!(s.check_invariants().is_ok());
+}
+
 #[test]
 fn zone_anchor_hash_deterministic_across_identical_states() {
     let mut a = State::new();

@@ -147,6 +147,7 @@ pub mod effective;
 pub mod error;
 pub mod event;
 pub mod fs_authz;
+pub mod fs_bridge;
 pub mod grant;
 pub mod history_read;
 pub mod host;
@@ -199,6 +200,12 @@ pub use fs_authz::{
     MAX_FS_CONTENT_LINE_BYTES, MAX_FS_CONTENT_SCAN_BYTES, MAX_FS_CONTENT_SCAN_LINES,
     MAX_FS_PATH_BYTES, SensitivePathPolicy, authorize_fs, content_looks_secret,
     is_literal_scope_pattern,
+};
+pub use fs_bridge::{
+    FS_BRIDGE_VERSION, FS_FAMILY, FS_PATTERN_MAX_BYTES, FS_VERBS, FsAttribution, FsBridgeDenial,
+    FsBridgeDenialKind, FsBridgeError, FsCaps, FsGate, FsGrant, FsGrantKind, FsLabel, FsListEntry,
+    FsListPage, FsListRequest, FsReadRequest, FsReadResult, FsVerb, FsView, FsWriteReceipt,
+    FsWriteRequest, argv_first_ok,
 };
 pub use grant::{
     GRANTS_FILE_NAME, GRANTS_STATE_VERSION, GrantConsent, GrantOrigin, GrantRecord, GrantStore,

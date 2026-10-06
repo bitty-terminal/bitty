@@ -190,6 +190,31 @@ pub const MODULE_NAME_MAX_BYTES: usize = 128;
 /// is rejected fail-closed with `E_DEF_LIMIT` before any grant check, so
 /// oversize input never reaches the allowlist.
 pub const ENV_KEY_MAX_BYTES: usize = 128;
+/// Maximum bytes of one `bitty.fs` path (RFC-0005, CTX-0984).
+///
+/// Reuses the accepted Core bound (`bitty-plugin-host` `MAX_FS_PATH_BYTES`,
+/// `4096`): over-bound paths fail closed with `E_DEF_LIMIT` before any grant
+/// check, so oversize input never reaches the scope matcher.
+pub const FS_PATH_MAX_BYTES: usize = 4096;
+/// Maximum bytes of one `bitty.fs.write` payload crossing the Lua bridge
+/// (RFC-0005, CTX-0984).
+///
+/// Bridge-side defensive cap (precedent: `DEFAULT_MAX_VALUE_BYTES`, `8 KiB`
+/// store values; the file-manager draft's `8 KiB` listing payload). Exact
+/// per-call payload caps stay parked to the Core bridge (`FsCaps`) and SDK
+/// work; the host gate enforces the authoritative ceiling.
+pub const FS_CONTENT_MAX_BYTES: usize = 8 * 1024;
+/// Maximum entries one `bitty.fs.list` call returns (RFC-0005, CTX-0984).
+///
+/// Bridge-side defensive cap (precedent: `UI_TARGETS_SNAPSHOT_MAX`, `1024`
+/// cold-path entries). Exact listing caps stay parked to the Core bridge
+/// (`FsCaps`); the host gate enforces the authoritative ceiling.
+pub const FS_LIST_MAX_ENTRIES: usize = 1024;
+/// Maximum entry-name bytes one `bitty.fs.list` call returns (RFC-0005).
+///
+/// Precedent: `DEFAULT_MAX_VALUE_BYTES` (`8 KiB`); exact caps stay parked to
+/// the Core bridge (`FsCaps`).
+pub const FS_LIST_MAX_BYTES: usize = 8 * 1024;
 /// Maximum bytes of one source module file accepted by `require`.
 pub const MODULE_FILE_MAX_BYTES: usize = 1024 * 1024;
 
@@ -760,6 +785,71 @@ pub trait HostServices {
     fn env_has(&self, key: &str) -> Result<bool, BridgeError> {
         let _ = key;
         Err(BridgeError::not_implemented("bitty.env.has"))
+    }
+    /// Read bounded file bytes for `bitty.fs.read` (RFC-0005, CTX-0984).
+    ///
+    /// Host-mediated and grant-gated: the implementation must fail closed
+    /// until the calling generation holds an `fs.read:PATTERN` grant covering
+    /// `path` (deny-by-default, no wildcard; `list` rides the same read
+    /// grant). Results are read-into-VM-only and carry the Core-attached
+    /// untrusted-observation label (`untrusted = true`); combining them with
+    /// clipboard, process, IPC, or network authority needs a separately
+    /// granted authority with argv-first invocation and no shell-string
+    /// construction. Paths are validated by the caller shape
+    /// (`1..=4096` bytes, no NUL/controls) with `E_DEF_INVALID`/`E_DEF_LIMIT`;
+    /// scope, sensitive-path, secret, bound, budget, safe-mode, and trust
+    /// denials are typed `E_FS_*` (oracle-tight: level plus family only).
+    ///
+    /// The default implementation fails closed with `E_NOT_IMPLEMENTED`: a
+    /// host without an fs backend can never gain ambient reads from the
+    /// always-present `bitty.fs` namespace.
+    fn fs_read(&self, path: &str) -> Result<LuaValue, BridgeError> {
+        let _ = path;
+        Err(BridgeError::not_implemented("bitty.fs.read"))
+    }
+    /// Write bounded file bytes for `bitty.fs.write` (RFC-0005, CTX-0984).
+    ///
+    /// Grant-gated on `fs.write:PATTERN` only (a read grant never implies
+    /// write). The disposition (create, overwrite, append-mode) is the
+    /// `append` flag candidate, not a verb: `false` creates or overwrites,
+    /// `true` appends. There is no `open` verb and no retained handle.
+    /// Mutating, so the bridge routes through the pre-commit expiry guard;
+    /// see [`HostServices::fs_write_with_expiry`]. The default fails closed
+    /// like [`HostServices::fs_read`].
+    fn fs_write(&self, path: &str, content: &str, append: bool) -> Result<LuaValue, BridgeError> {
+        let _ = (path, content, append);
+        Err(BridgeError::not_implemented("bitty.fs.write"))
+    }
+    /// Expiry-aware [`HostServices::fs_write`] for the pre-commit timeout path.
+    ///
+    /// Same contract as [`HostServices::store_set_with_expiry`]: check expiry
+    /// before committing and fail-closed with [`BridgeError::timeout`]
+    /// without mutating when expired. The default checks expiry before
+    /// delegating (fail-fast).
+    fn fs_write_with_expiry(
+        &self,
+        path: &str,
+        content: &str,
+        append: bool,
+        expiry: Instant,
+    ) -> Result<LuaValue, BridgeError> {
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        self.fs_write(path, content, append)
+    }
+    /// List bounded directory entries for `bitty.fs.list` (RFC-0005, CTX-0984).
+    ///
+    /// Read-class under the read grant over the listed prefix (never a
+    /// grant-free enumeration oracle). Returns names plus file-kind metadata,
+    /// never file bytes. Denied entries are suppressed silently (silent skip)
+    /// as the default; the page leaks no absent-versus-denied signal.
+    /// `max_entries` bounds the returned page. The default fails closed like
+    /// [`HostServices::fs_read`]. There is no watch, subscription,
+    /// tail-follow, retained handle, or cross-call cursor in this family.
+    fn fs_list(&self, prefix: &str, max_entries: usize) -> Result<LuaValue, BridgeError> {
+        let _ = (prefix, max_entries);
+        Err(BridgeError::not_implemented("bitty.fs.list"))
     }
     /// Read a bounded committed terminal snapshot for `scope`.
     fn terminal_snapshot(&self, scope: &str) -> Result<LuaValue, BridgeError>;
@@ -3425,6 +3515,141 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
     )
     .expect("env table accepts 'has'");
 
+    // CTX-0984 (RFC-0005): `bitty.fs.*` Core-owned filesystem bridge beside
+    // `terminal.*` (never under it). Decided verbs are `read`, `write`, and
+    // `list`: `open` is rejected as a verb (a retained handle is a
+    // subscription by another name), `append` is a write-disposition flag
+    // (`{ append = bool }`, default create-or-overwrite), and `list` is
+    // read-class under the read grant over the listed prefix. Paths validate
+    // `1..=4096` bytes with `E_DEF_INVALID`/`E_DEF_LIMIT` before the grant
+    // gate; scope, sensitive-path, secret, bound, budget, safe-mode, and
+    // trust denials are typed `E_FS_*` (oracle-tight). Results are
+    // read-into-VM-only with the Core-attached untrusted label
+    // (`untrusted = true`); combining them with clipboard, process, IPC, or
+    // network authority needs a separately granted authority with argv-first
+    // invocation and no shell-string construction. There is no watch,
+    // subscription, tail-follow, retained handle, or cross-call cursor in
+    // this family. Hosts without an fs backend fail closed with typed
+    // `E_NOT_IMPLEMENTED`, so the spellings stay present and misconfiguration
+    // is observable.
+    let fs = Table::new(&ctx);
+    fs.set(
+        ctx,
+        "read",
+        Callback::from_fn(&ctx, {
+            let state = state.clone();
+            move |ctx, _exec, mut stack| {
+                let path = match stack.get(0) {
+                    Value::String(s) => String::from_utf8_lossy(s.as_bytes()).into_owned(),
+                    _ => {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            "fs.read path must be a string",
+                        )
+                        .to_error(ctx));
+                    }
+                };
+                validate_fs_path(&path).map_err(|e| e.to_error(ctx))?;
+                let result = state
+                    .bounded(|_expiry| state.services.fs_read(&path))
+                    .map_err(|e| e.to_error(ctx))?;
+                stack.replace(ctx, result.to_lua(ctx));
+                Ok(CallbackReturn::Return)
+            }
+        }),
+    )
+    .expect("fs table accepts 'read'");
+    fs.set(
+        ctx,
+        "write",
+        Callback::from_fn(&ctx, {
+            let state = state.clone();
+            move |ctx, _exec, mut stack| {
+                let path = match stack.get(0) {
+                    Value::String(s) => String::from_utf8_lossy(s.as_bytes()).into_owned(),
+                    _ => {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            "fs.write path must be a string",
+                        )
+                        .to_error(ctx));
+                    }
+                };
+                let content = match stack.get(1) {
+                    Value::String(s) => String::from_utf8_lossy(s.as_bytes()).into_owned(),
+                    _ => {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            "fs.write content must be a string",
+                        )
+                        .to_error(ctx));
+                    }
+                };
+                validate_fs_path(&path).map_err(|e| e.to_error(ctx))?;
+                validate_fs_content(&content).map_err(|e| e.to_error(ctx))?;
+                let raw_opts = stack.get(2);
+                let opts =
+                    LuaValue::from_lua(raw_opts, state.limits).map_err(|e| e.to_error(ctx))?;
+                let append = parse_fs_write_append(&opts).map_err(|e| e.to_error(ctx))?;
+                let result = state
+                    .bounded_mutation(|expiry| {
+                        state
+                            .services
+                            .fs_write_with_expiry(&path, &content, append, expiry)
+                    })
+                    .map_err(|e| e.to_error(ctx))?;
+                stack.replace(ctx, result.to_lua(ctx));
+                Ok(CallbackReturn::Return)
+            }
+        }),
+    )
+    .expect("fs table accepts 'write'");
+    fs.set(
+        ctx,
+        "list",
+        Callback::from_fn(&ctx, {
+            let state = state.clone();
+            move |ctx, _exec, mut stack| {
+                let prefix = match stack.get(0) {
+                    Value::String(s) => String::from_utf8_lossy(s.as_bytes()).into_owned(),
+                    _ => {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            "fs.list prefix must be a string",
+                        )
+                        .to_error(ctx));
+                    }
+                };
+                validate_fs_path(&prefix).map_err(|e| e.to_error(ctx))?;
+                let max_entries = match stack.get(1) {
+                    Value::Nil => FS_LIST_MAX_ENTRIES,
+                    Value::Integer(n) if n >= 1 => usize::try_from(n)
+                        .unwrap_or(usize::MAX)
+                        .min(FS_LIST_MAX_ENTRIES),
+                    _ => {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            "fs.list max_entries must be a positive integer",
+                        )
+                        .to_error(ctx));
+                    }
+                };
+                validate_fs_list_max(max_entries).map_err(|e| e.to_error(ctx))?;
+                let result = state
+                    .bounded(|_expiry| state.services.fs_list(&prefix, max_entries))
+                    .map_err(|e| e.to_error(ctx))?;
+                stack.replace(ctx, result.to_lua(ctx));
+                Ok(CallbackReturn::Return)
+            }
+        }),
+    )
+    .expect("fs table accepts 'list'");
+
     // CTX-0894/CTX-0897: `bitty.debug.*` namespace for devtools plugins.
     // Default host implementations return E_NOT_IMPLEMENTED; the runtime
     // gates each entry point on its own grant: `debug.inspect` (read-only
@@ -4464,6 +4689,8 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         .expect("root accepts tasks");
     root.set(ctx, "env", readonly_table(ctx, env))
         .expect("root accepts env");
+    root.set(ctx, "fs", readonly_table(ctx, fs))
+        .expect("root accepts fs");
     root.set(ctx, "debug", readonly_table(ctx, debug))
         .expect("root accepts debug");
     root.set(ctx, "panel", readonly_table(ctx, panel))
@@ -4716,6 +4943,111 @@ pub fn validate_env_key(key: &str) -> Result<(), BridgeError> {
                 "env key '{}' must be [A-Za-z_][A-Za-z0-9_]*",
                 bounded_token(key)
             ),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a `bitty.fs` path shape (RFC-0005, CTX-0984).
+///
+/// Paths are `1..=FS_PATH_MAX_BYTES` bytes with no NUL or control
+/// characters. Shape failures are `E_DEF_INVALID`/`E_DEF_LIMIT` (validation
+/// class) and run before the grant gate; diagnostics quote the bounded path
+/// only, never file bytes. Scope, sensitive-path, secret, bound, budget,
+/// safe-mode, and trust denials are typed `E_FS_*` from the host.
+pub fn validate_fs_path(path: &str) -> Result<(), BridgeError> {
+    if path.is_empty() {
+        return Err(BridgeError::new(
+            "validation",
+            "E_DEF_INVALID",
+            "fs path must not be empty",
+        ));
+    }
+    if path.len() > FS_PATH_MAX_BYTES {
+        return Err(BridgeError::new(
+            "validation",
+            "E_DEF_LIMIT",
+            format!("fs path exceeds {FS_PATH_MAX_BYTES} bytes"),
+        ));
+    }
+    if path.contains('\0') || path.chars().any(|c| c.is_control()) {
+        return Err(BridgeError::new(
+            "validation",
+            "E_DEF_INVALID",
+            format!(
+                "fs path '{}' must not contain NUL or control characters",
+                bounded_token(path)
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate `bitty.fs.write` content shape (RFC-0005, CTX-0984).
+///
+/// Content crosses as a bounded string; over-bound payloads fail closed with
+/// `E_DEF_LIMIT` before any grant check. Secret-shaped refusal, sensitive
+/// gating, and budget enforcement stay host-side with typed `E_FS_*`.
+pub fn validate_fs_content(content: &str) -> Result<(), BridgeError> {
+    if content.len() > FS_CONTENT_MAX_BYTES {
+        return Err(BridgeError::new(
+            "validation",
+            "E_DEF_LIMIT",
+            format!("fs content exceeds {FS_CONTENT_MAX_BYTES} bytes"),
+        ));
+    }
+    if content.contains('\0') {
+        return Err(BridgeError::new(
+            "validation",
+            "E_DEF_INVALID",
+            "fs content must not contain NUL",
+        ));
+    }
+    Ok(())
+}
+
+/// Parse the `bitty.fs.write` disposition flag (RFC-0005, CTX-0984).
+///
+/// `append` is a write-disposition flag candidate, not a verb: `nil`
+/// (absent) means create-or-overwrite, a table `{ append = bool }` selects
+/// the disposition, and any other shape fails closed with `E_DEF_INVALID`.
+/// Unknown table fields are ignored.
+pub fn parse_fs_write_append(value: &LuaValue) -> Result<bool, BridgeError> {
+    match value {
+        LuaValue::Nil => Ok(false),
+        LuaValue::Table(_) => match value.get("append") {
+            None | Some(LuaValue::Nil) => Ok(false),
+            Some(LuaValue::Bool(append)) => Ok(*append),
+            Some(_) => Err(BridgeError::value(
+                "E_DEF_INVALID",
+                "fs.write append must be a boolean",
+            )),
+        },
+        _ => Err(BridgeError::value(
+            "E_DEF_INVALID",
+            "fs.write opts must be a table or nil",
+        )),
+    }
+}
+
+/// Validate a `bitty.fs.list` entry bound (RFC-0005, CTX-0984).
+///
+/// `max_entries` is an explicit page bound within the bridge defensive cap;
+/// the host gate enforces the authoritative ceiling. Failures are
+/// `E_DEF_INVALID`/`E_DEF_LIMIT` before any grant check.
+pub fn validate_fs_list_max(max_entries: usize) -> Result<(), BridgeError> {
+    if max_entries == 0 {
+        return Err(BridgeError::new(
+            "validation",
+            "E_DEF_INVALID",
+            "fs.list max_entries must be positive",
+        ));
+    }
+    if max_entries > FS_LIST_MAX_ENTRIES {
+        return Err(BridgeError::new(
+            "validation",
+            "E_DEF_LIMIT",
+            format!("fs.list max_entries exceeds {FS_LIST_MAX_ENTRIES}"),
         ));
     }
     Ok(())

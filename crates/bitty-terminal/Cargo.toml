@@ -28,6 +28,13 @@ bitty-ipc = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "e9714e
 # Core gate, never Core importing the extension).
 bitty-storage = { git = "https://github.com/bitty-terminal/bitty-storage", rev = "5e720b4" }
 bitty-package = { path = "../bitty-package" }
+# CTX-0981 (W-110): the composition root owns the extracted observability
+# contract. This is the ONLY crate in the workspace that may depend on
+# `bitty-observability-api`: Core library crates never link it (Core keeps
+# its own thin verification over these canonical zero-dependency types, so
+# the dependency direction stays one-way and default builds link no
+# exporters, metrics pipeline, or tracing runtime).
+bitty-observability-api = { git = "https://github.com/bitty-terminal/bitty-observability", rev = "7b3bb74" }
 bitty-platform = { path = "../bitty-platform" }
 bitty-plugin-host = { path = "../bitty-plugin-host" }
 bitty-runtime = { path = "../bitty-runtime" }

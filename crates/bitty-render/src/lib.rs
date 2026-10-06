@@ -34,10 +34,11 @@
 //!   bitmap strikes rasterize from the same font bytes the shaper uses
 //!   (shared `skrifa`/`read-fonts` parser); callers only ever see
 //!   [`FontQuery`], [`FontId`], and owned [`GlyphBitmap`] values.
-//! - **`fontdb` (0.23.x, `memmap` off) is wrapped, never adopted**, inside
+//! - **`fontdb` (0.24.x, `memmap` off) is wrapped, never adopted**, inside
 //!   [`shaped::SwashSingle`]. Faces load as owned bytes under
 //!   [`shaped::MAX_FACE_BYTES`]; discovery uses system font directories
-//!   plus fontconfig XML on Linux.
+//!   plus fontconfig XML on Linux. 0.24 vendors its query-time parser
+//!   subset, so the fontdb path carries no external `ttf-parser` edge.
 //! - **`skia-safe` is rejected** per ADR-0004 and must not be introduced.
 //! - Per ADR-0004's fallback rule, if any upstream becomes unmaintained
 //!   for more than twelve months while on this hot path it must be replaced

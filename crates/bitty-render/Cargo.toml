@@ -34,7 +34,9 @@ bitty-config = { version = "0.0.21", path = "../bitty-config" }
 # (production default, CTX-0957 additive landing per DEC-0095); WRAP
 # harfrust/swash/fontdb as the explicit opt-in stack (shape with harfrust
 # 0.14, rasterize with swash 0.2 over shared skrifa/read-fonts, discover
-# with fontdb 0.23). Full removal of the crossfont wrap is deferred to
+# with fontdb 0.24, which vendors its query-time parser subset instead of
+# depending on external ttf-parser, bitty#1692). Full removal of the
+# crossfont wrap is deferred to
 # CTX-0961 (chain policy + dynamic fallback + per-OS evidence).
 # Neither upstream type may appear in this crate's public API.
 wgpu = "26.0"
@@ -46,10 +48,13 @@ harfrust = "=0.14.0"
 # verified on the 1.85 toolchain by the CTX-0957 implementation task).
 # Explicit std+scale+render (== upstream defaults, pinned for audit).
 swash = { version = "=0.2.10", default-features = false, features = ["std", "scale", "render"] }
-# Font discovery (MIT, rust-version 1.60). memmap stays OFF (owned Vec<u8>
+# Font discovery (MIT, rust-version 1.71). memmap stays OFF (owned Vec<u8>
 # under MAX_FACE_BYTES instead): no persistent-mmap unsafe, no lifetime
 # coupling on the hot path. fontconfig XML discovery stays ON (Linux).
-fontdb = { version = "=0.23.0", default-features = false, features = ["std", "fs", "fontconfig"] }
+# 0.24 vendors its query-time parser subset: no external ttf-parser edge
+# on the fontdb path (bitty#1692; ttf-parser remains only via the
+# winit/sctk-adwaita/ab_glyph decoration path until CTX-0961).
+fontdb = { version = "=0.24.0", default-features = false, features = ["std", "fs", "fontconfig"] }
 
 
 [dev-dependencies]

@@ -2,8 +2,8 @@
 
 //! Bundled dogfood evidence for CTX-0096 (P2, area:plugin).
 //!
-//! Verifies the two `v1` bundled-disabled first-party plugins
-//! (`bitty-terminal.shell-integration`, `bitty-terminal.workspace`) dogfood the **public** Plugin API with manifest / capability /
+//! Verifies the `v1` bundled-disabled first-party plugin
+//! (`bitty-terminal.shell-integration`; #1572 retired `workspace`) dogfoods the **public** Plugin API with manifest / capability /
 //! lifecycle parity to any third-party `xuepoo.*` plugin, default-disabled
 //! (no implicit enable), safe-mode compatibility, Terminal Truth protection
 //! (observation via bounded side queue, never direct `State` write), and
@@ -21,7 +21,7 @@ use bitty_plugin_host::{
     PluginHost, PluginId,
     bundled::{
         all_bundled_manifests, bundled_ids_sorted, bundled_manifest_for, is_bundled,
-        shell_integration_manifest, workspace_manifest,
+        shell_integration_manifest,
     },
 };
 
@@ -42,16 +42,14 @@ fn granted_set_for(manifest: &bitty_plugin_host::PluginManifest) -> BTreeSet<Cap
 #[test]
 fn bundled_manifests_validate_and_have_expected_ids() {
     let all = all_bundled_manifests();
-    assert_eq!(all.len(), 2);
+    // #1572 / CTX-0994: shell-integration only; workspace manifest retired.
+    assert_eq!(all.len(), 1);
     for m in &all {
         m.validate().expect("bundled must validate");
     }
     assert_eq!(
         bundled_ids_sorted(),
-        vec![
-            "bitty-terminal.shell-integration",
-            "bitty-terminal.workspace",
-        ]
+        vec!["bitty-terminal.shell-integration",]
     );
     for m in all {
         assert!(is_bundled(m.id()));
@@ -66,7 +64,11 @@ fn bundled_manifests_validate_and_have_expected_ids() {
     // CTX-0974 (DEC-0100 waiver): tabs alias purged, no longer bundled nor resolvable.
     assert!(!is_bundled(&PluginId::new("bitty-terminal.tabs").unwrap()));
     assert!(bundled_manifest_for("bitty-terminal.tabs").is_none());
-    assert!(bundled_manifest_for("bitty-terminal.workspace").is_some());
+    // #1572 / CTX-0994: workspace manifest retired, not bundled nor resolvable.
+    assert!(!is_bundled(
+        &PluginId::new("bitty-terminal.workspace").unwrap()
+    ));
+    assert!(bundled_manifest_for("bitty-terminal.workspace").is_none());
 }
 
 #[test]
@@ -98,7 +100,7 @@ fn bundled_plugins_load_via_public_api_with_grant_checks() {
             bitty_plugin_host::PluginState::Activated
         );
     }
-    assert_eq!(host.registry().len(), 2);
+    assert_eq!(host.registry().len(), 1);
 }
 
 #[test]
@@ -153,9 +155,6 @@ fn bundled_plugins_are_observation_only_and_use_bounded_side_queue() {
             host.subscribe(&id, EventKind::TerminalTitleChanged)
                 .unwrap();
             host.subscribe(&id, EventKind::TerminalCwdChanged).unwrap();
-        } else if id.as_str() == "bitty-terminal.workspace" {
-            host.subscribe(&id, EventKind::TerminalTitleChanged)
-                .unwrap();
         }
     }
 
@@ -199,13 +198,10 @@ fn default_disabled_safe_mode_leaves_host_functional() {
     let mut safe = PluginHost::new(DropPolicy::DropOldest, 16);
     safe.set_safe_mode(true);
     assert!(safe.declare(shell_integration_manifest()).is_err());
-    assert!(safe.declare(workspace_manifest()).is_err());
     // CTX-0974: purged tabs alias is not bundled, so no manifest to declare.
     assert!(bundled_manifest_for("bitty-terminal.tabs").is_none());
-    assert!(
-        safe.declare(bundled_manifest_for("bitty-terminal.workspace").unwrap())
-            .is_err()
-    );
+    // #1572: retired workspace manifest is not bundled either.
+    assert!(bundled_manifest_for("bitty-terminal.workspace").is_none());
     // `bitty.*` builtin would still be allowed in safe mode (candidate built-in
     // namespace) — prove the distinction is exactly the prefix, not a private
     // flag.

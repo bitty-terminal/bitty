@@ -481,10 +481,11 @@ fn plugin_external_remote_source_fails_closed() {
 #[test]
 fn plugin_external_bundled_id_is_rejected() {
     let home = scratch_dir("external-bundled");
+    // #1572 / CTX-0994: shell-integration is the remaining bundled id.
     let source = write_external_fixture_with_id(
         &home,
         "source",
-        "bitty-terminal.workspace",
+        "bitty-terminal.shell-integration",
         "1.0.0",
         "hello",
     );

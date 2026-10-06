@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
-//! Runtime dogfood for the two bundled-disabled plugins (CTX-0096;
-//! `bitty-terminal.shell-integration` and `bitty-terminal.workspace`).
+//! Runtime dogfood for the bundled-disabled plugin (CTX-0096;
+//! `bitty-terminal.shell-integration`; #1572 retired `workspace`).
 //!
 //! Proves:
 //! - default disabled: fresh `EffectiveConfig` / `Runtime::with_defaults` has
@@ -81,7 +81,8 @@ fn bundled_plugins_load_via_public_api_through_runtime() {
         rt.activate_plugin(&id)
             .unwrap_or_else(|e| panic!("activate {}: {e}", id.as_str()));
     }
-    assert_eq!(rt.plugin_host().registry().len(), 2);
+    // #1572 / CTX-0994: shell-integration only; workspace manifest retired.
+    assert_eq!(rt.plugin_host().registry().len(), 1);
     // Each plugin's subscription (if any) can be established via public API.
     let shell_id = bitty_plugin_host::PluginId::new("bitty-terminal.shell-integration").unwrap();
     rt.subscribe_plugin_event(&shell_id, EventKind::TerminalTitleChanged)
@@ -241,14 +242,15 @@ fn bounded_cold_path_drop_oldest_and_attributable() {
 
 #[test]
 fn no_marketplace_daemon_smuggled() {
-    // Bundled catalog contains only workspace and shell-integration (CTX-0886).
+    // Bundled catalog contains only shell-integration (#1572 retired
+    // workspace; CTX-0886 removed the rest).
     // Marketplace/daemon/remote remain excluded.
     // ai-panel, mail-panel, browser-panel, file-manager, git-panel, project
     // migrated to independent packages or removed (CTX-0886).
     let ids = bundled::bundled_ids_sorted();
-    assert_eq!(ids.len(), 2);
-    assert!(ids.contains(&"bitty-terminal.workspace".to_string()));
+    assert_eq!(ids.len(), 1);
     assert!(ids.contains(&"bitty-terminal.shell-integration".to_string()));
+    assert!(!ids.contains(&"bitty-terminal.workspace".to_string()));
 
     // Verify removed plugins are not present
     assert!(!ids.iter().any(|id| id.contains("ai-panel")));

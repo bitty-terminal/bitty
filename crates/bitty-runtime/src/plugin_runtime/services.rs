@@ -21,7 +21,6 @@ use bitty_lua::{
     validate_env_key,
 };
 use bitty_package::Version;
-use bitty_plugin_host::bundled::WORKSPACELINE_CLAIM;
 use bitty_ui::{
     CommandBlockId, DerivedProvider, DispatchError, HintAnnotationLayer, LabelAllocator,
     LabelPolicy, LinkId, ProviderError, ProviderMediator, ProviderTarget, QualifiedCommand, Rect,
@@ -61,6 +60,15 @@ pub const MAX_ENV_GRANTS: usize = 64;
 /// unbounded variable (e.g. a dumped keyring) fails closed with
 /// `E_DEF_LIMIT` instead of crossing the bridge.
 pub const MAX_ENV_VALUE_BYTES: usize = 4096;
+
+/// Canonical workspace claim (`workspaceline`).
+///
+/// #1572 / CTX-0994: the bundled `bitty-terminal.workspace` manifest is
+/// retired, so this vocabulary no longer lives in
+/// `bitty-plugin-host::bundled`. The claim itself stays valid: the future
+/// first-party `bar` plugin (and any third-party presenter) declares it in
+/// `[lazy].claims` to satisfy the `tabline` slot gate below.
+pub const WORKSPACELINE_CLAIM: &str = "workspaceline";
 
 /// Injected spawn backend for one plugin generation.
 ///
@@ -1753,8 +1761,9 @@ impl HostServices for PluginServices {
                 return Err(BridgeError::capability_denied("ui.overlay"));
             }
             // Accepted: `tabline` slot requires the canonical `workspaceline`
-            // exclusive claim (ADR-0009 `LUA-OQ-7` plus the shipped
-            // `[lazy].claims` vocabulary in `bitty-plugin-host::bundled`).
+            // exclusive claim (ADR-0009 `LUA-OQ-7` plus the `[lazy].claims`
+            // vocabulary; #1572 retired the bundled workspace manifest but
+            // the claim stays valid for the future `bar` plugin).
             // Unclaimed mounts fail closed; the register/claim reservation is
             // owned by the plugin host. CTX-0974 purged the deprecated
             // `tabline` claim alias: only `workspaceline` satisfies the gate.

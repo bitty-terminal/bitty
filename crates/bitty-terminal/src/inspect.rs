@@ -14,7 +14,9 @@
 //!   - `command <id>`: registry entry (core or bundled-plugin command) with
 //!     kind, class, required scopes, owner, and summary. Accepts both the dot
 //!     form (`core.terminal.text`) and the colon form
-//!     (`bitty-terminal.workspace:new`); `:` and `.` compare equivalently.
+//!     (`publisher.name:command`); `:` and `.` compare equivalently.
+//!     (#1572: the bundled catalog is shell-integration only and declares no
+//!     commands; workspace verbs live in Core as `bitty ctl workspace`.)
 //!   - `key <chord>`: shipped keymap resolution for a chord such as
 //!     `ctrl+shift+m`. Bound chords name the owning action, context, and
 //!     layer; unbound chords succeed with `bound: false` and name the
@@ -277,7 +279,7 @@ fn example_for(target: InspectTarget) -> &'static str {
     match target {
         InspectTarget::Command => "`bitty inspect command core.terminal.text`",
         InspectTarget::Key => "`bitty inspect key ctrl+shift+m`",
-        InspectTarget::Plugin => "`bitty inspect plugin bitty-terminal.workspace`",
+        InspectTarget::Plugin => "`bitty inspect plugin bitty-terminal.shell-integration`",
         InspectTarget::Config => "`bitty inspect config font.size`",
         InspectTarget::Protocol => "`bitty inspect protocol kitty-graphics`",
     }
@@ -290,7 +292,7 @@ fn example_for(target: InspectTarget) -> &'static str {
 /// Short usage for stderr (fail-closed exit 2 trailer).
 #[must_use]
 pub fn inspect_usage() -> String {
-    "usage: bitty inspect <command|key|plugin|config|protocol> <value> [--format table|json|jsonl] [--no-color]\n\ntargets:\n  command <id>    registry entry: core.terminal.text | bitty-terminal.workspace:new\n  key <chord>     keymap owner: ctrl+shift+m (unbound chords reach the shell)\n  plugin <id>     static catalog entry: bitty-terminal.workspace (no VM loaded)\n  config <key>    built-in default: font.size (effective file values: bitty config check)\n  protocol <name> core support state: kitty-graphics".to_string()
+    "usage: bitty inspect <command|key|plugin|config|protocol> <value> [--format table|json|jsonl] [--no-color]\n\ntargets:\n  command <id>    registry entry: core.terminal.text (workspace verbs: bitty ctl workspace)\n  key <chord>     keymap owner: ctrl+shift+m (unbound chords reach the shell)\n  plugin <id>     static catalog entry: bitty-terminal.shell-integration (no VM loaded)\n  config <key>    built-in default: font.size (effective file values: bitty config check)\n  protocol <name> core support state: kitty-graphics".to_string()
 }
 
 /// Full help for `bitty inspect --help` (stdout, exit 0).
@@ -303,19 +305,21 @@ pub fn inspect_help_text() -> String {
       Targets (each value incl. missing-value errors; unknown values are NotFound, exit 1):\n  \
         command <id>    Registry entry with kind, class, scopes, owner, summary.\n  \
                         Dot form (core.terminal.text) and colon form\n  \
-                        (bitty-terminal.workspace:new) compare equivalently.\n  \
+                        (publisher.name:command) compare equivalently.\n  \
                         Core ids come from the ctl/list registry surface; plugin\n  \
                         commands come from static manifests (no VM loaded).\n  \
-                        Workspace commands are bitty-terminal.workspace:*.\n  \
+                        #1572: bundled catalog is shell-integration only\n  \
+                        (declares no commands); workspace verbs live in Core\n  \
+                        as `bitty ctl workspace`.\n  \
         key <chord>     Shipped keymap owner for a chord (e.g. ctrl+shift+m).\n  \
                         Bound chords name action, context, and layer; unbound\n  \
                         chords succeed with bound:false (single-owner rule:\n  \
                         unbound keys reach the PTY/shell, never chrome).\n  \
         plugin <id>     Static bundled-catalog entry (no VM): owner publisher,\n  \
                         version, commands, staged-disabled state.\n  \
-                        Canonical id is bitty-terminal.workspace. A bitty\n  \
-                        workspace is a tab group within a window (wezterm\n  \
-                        inverts this: workspace > window > tab > pane).\n  \
+                        Canonical id is bitty-terminal.shell-integration\n  \
+                        (#1572: workspace manifest retired; workspace verbs\n  \
+                        live in Core as `bitty ctl workspace`).\n  \
        config <key>    Built-in default value and owning layer (default) plus\n  \
                        the CLI > file > profile > defaults precedence note.\n  \
                        Effective file values: `bitty config check`.\n  \
@@ -341,10 +345,9 @@ pub fn inspect_help_text() -> String {
       Examples:\n  \
         bitty inspect command core.terminal.text\n  \
         bitty inspect key ctrl+shift+m\n  \
-        bitty inspect plugin bitty-terminal.workspace\n  \
+        bitty inspect plugin bitty-terminal.shell-integration\n  \
         bitty inspect config font.size\n  \
-        bitty inspect protocol kitty-graphics\n  \
-        bitty inspect command bitty-terminal.workspace:new --format json\n"
+        bitty inspect protocol kitty-graphics\n"
     .to_string()
 }
 
@@ -356,7 +359,7 @@ pub fn inspect_help_text() -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandInfo {
     /// Stable registry id (`core.terminal.text`, `core.list.themes`,
-    /// `bitty-terminal.workspace:new`).
+    /// `publisher.name:command`).
     pub id: &'static str,
     /// Entry kind (`command`; all surfaced entries are commands today).
     pub kind: &'static str,
@@ -603,7 +606,7 @@ pub fn inspect_key(query: &str) -> KeyInfo {
 /// Static plugin entry surfaced by `inspect plugin`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InspectedPlugin {
-    /// Fully qualified id (`bitty-terminal.workspace`).
+    /// Fully qualified id (`bitty-terminal.shell-integration`).
     pub id: String,
     /// Human name.
     pub name: String,
@@ -623,8 +626,9 @@ pub struct InspectedPlugin {
 
 /// Look up a plugin by id (case-insensitive, trimmed).
 ///
-/// Accepts only the canonical `bitty-terminal.workspace` via
-/// `bundled::bundled_manifest_for`.
+/// Resolves against the bundled catalog via `bundled::bundled_manifest_for`
+/// (#1572: shell-integration only; the retired `bitty-terminal.workspace`
+/// id is NotFound).
 #[must_use]
 pub fn inspect_plugin(query: &str) -> Option<InspectedPlugin> {
     let want = query.trim().to_ascii_lowercase();
@@ -1445,12 +1449,13 @@ mod tests {
         assert!(lookup_core_command("core.terminal:text").is_some());
         assert!(lookup_core_command("core.nope.nope").is_none());
         // Plugin commands resolve from static manifests (no VM).
+        // #1572: shell-integration declares no commands, so the catalog
+        // command list is empty; workspace verbs live in Core (`ctl`).
         let plugin_cmds = list_plugin_commands();
-        assert!(!plugin_cmds.is_empty());
-        let first = plugin_cmds[0].id.clone();
-        assert!(lookup_plugin_command(&first).is_some());
+        assert!(plugin_cmds.is_empty());
         // Unknown command is a clean miss (NotFound at dispatch, not a panic).
         assert!(lookup_plugin_command("nope.nope:nope").is_none());
+        assert!(lookup_plugin_command("bitty-terminal.workspace:new").is_none());
     }
 
     #[test]
@@ -1475,22 +1480,20 @@ mod tests {
 
     #[test]
     fn plugin_lookup_is_case_insensitive() {
-        let plugin = inspect_plugin("bitty-terminal.workspace").expect("bundled workspace");
+        // #1572 / CTX-0994: shell-integration only; workspace manifest retired.
+        let plugin =
+            inspect_plugin("bitty-terminal.shell-integration").expect("bundled shell-integration");
         assert_eq!(plugin.owner, "bitty-terminal");
         assert!(plugin.bundled);
         assert!(!plugin.enabled);
-        assert!(!plugin.commands.is_empty());
-        // Canonical workspace commands only (CTX-0974 purged the tabs alias).
-        assert!(
-            plugin
-                .commands
-                .iter()
-                .any(|c| c == "bitty-terminal.workspace:new")
-        );
-        assert_eq!(plugin.commands.len(), 3);
-        assert!(plugin.id == "bitty-terminal.workspace");
-        let upper = inspect_plugin("BITTY-TERMINAL.WORKSPACE").expect("case-insensitive");
+        // Shell-integration declares observation events, no commands.
+        assert!(plugin.commands.is_empty());
+        assert!(plugin.id == "bitty-terminal.shell-integration");
+        let upper = inspect_plugin("BITTY-TERMINAL.SHELL-INTEGRATION").expect("case-insensitive");
         assert_eq!(upper.id, plugin.id);
+        // Retired workspace manifest no longer resolves.
+        assert!(inspect_plugin("bitty-terminal.workspace").is_none());
+        assert!(inspect_plugin("BITTY-TERMINAL.WORKSPACE").is_none());
         // Purged alias no longer resolves.
         assert!(inspect_plugin("bitty-terminal.tabs").is_none());
         assert!(inspect_plugin("BITTY-TERMINAL.TABS").is_none());
@@ -1650,12 +1653,12 @@ mod tests {
             assert!(table.contains("bound: no"));
             assert!(table.contains("pty"));
         }
-        let plugin = inspect_plugin("bitty-terminal.workspace").unwrap();
-        let table = format_plugin_table("bitty-terminal.workspace", &plugin);
-        assert!(table.contains("bitty-terminal.workspace"));
+        let plugin = inspect_plugin("bitty-terminal.shell-integration").unwrap();
+        let table = format_plugin_table("bitty-terminal.shell-integration", &plugin);
+        assert!(table.contains("bitty-terminal.shell-integration"));
         assert!(table.contains("bitty-terminal"));
-        // CTX-0974: tabs alias purged, canonical carries no deprecation note.
-        assert!(!table.contains("deprecated alias"));
+        // #1572: workspace manifest retired; tabs alias purged (CTX-0974).
+        assert!(inspect_plugin("bitty-terminal.workspace").is_none());
         assert!(inspect_plugin("bitty-terminal.tabs").is_none());
         let config = inspect_config("font.size").unwrap();
         let table = format_config_table("font.size", &config);

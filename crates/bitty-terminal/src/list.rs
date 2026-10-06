@@ -442,7 +442,7 @@ pub fn list_themes() -> Vec<ThemeInfo> {
 /// One plugin row (static manifest metadata only).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginInfo {
-    /// Fully qualified id (e.g. `bitty-terminal.workspace`).
+    /// Fully qualified id (e.g. `bitty-terminal.shell-integration`).
     pub id: String,
     /// Human name.
     pub name: String,
@@ -1606,7 +1606,8 @@ mod tests {
     #[test]
     fn plugins_lists_bundled_sorted_and_disabled() {
         let plugins = list_plugins();
-        assert_eq!(plugins.len(), 2);
+        // #1572 / CTX-0994: shell-integration only; workspace manifest retired.
+        assert_eq!(plugins.len(), 1);
         let ids: Vec<&str> = plugins.iter().map(|p| p.id.as_str()).collect();
         let mut sorted = ids.clone();
         sorted.sort();
@@ -1615,8 +1616,8 @@ mod tests {
             assert!(p.bundled);
             assert!(!p.enabled);
         }
-        assert!(ids.contains(&"bitty-terminal.workspace"));
         assert!(ids.contains(&"bitty-terminal.shell-integration"));
+        assert!(!ids.contains(&"bitty-terminal.workspace"));
         // Removed plugins are not bundled (CTX-0886: Unix philosophy, Core mechanism only)
         assert!(!ids.contains(&"bitty-terminal.ai-panel"));
         assert!(!ids.contains(&"bitty-terminal.mail-panel"));

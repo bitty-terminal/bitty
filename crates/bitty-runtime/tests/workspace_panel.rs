@@ -12,7 +12,8 @@
 //! window, default disabled, safe-mode reject, `forbid(unsafe)`.
 
 use bitty_plugin_host::{
-    CapabilityId, DropPolicy, EventKind, GrantRecord, PluginHost, bundled::workspace_manifest,
+    CapabilityId, Compat, DropPolicy, EventKind, GrantRecord, LazyTriggers, PluginHost,
+    PluginIdentity, PluginManifest,
 };
 use bitty_runtime::{
     Runtime,
@@ -25,6 +26,64 @@ use bitty_runtime::{
 use bitty_term_state::{State, TerminalAction};
 use bitty_ui::{View, ViewId};
 use bitty_vt::BoundedString;
+
+/// Local workspace-shaped manifest for public-path coverage.
+///
+/// #1572 / CTX-0994: the bundled `bitty-terminal.workspace` manifest is
+/// retired (bundled catalog is shell-integration only), so these tests build
+/// the same shape locally instead of reading `bundled::workspace_manifest`.
+/// Workspace commands run in Core and presentation belongs to the future
+/// `bar` plugin; the `workspaceline` claim vocabulary stays valid.
+fn test_workspace_manifest() -> PluginManifest {
+    use bitty_plugin_host::{CapabilityRequests, LazyCommand, QualifiedName};
+    let mut caps = CapabilityRequests::default();
+    caps.ids
+        .insert(CapabilityId::parse("ui.rich").expect("known capability"));
+    let commands = [
+        "bitty-terminal.workspace:new",
+        "bitty-terminal.workspace:close",
+        "bitty-terminal.workspace:next",
+    ]
+    .iter()
+    .map(|c| LazyCommand {
+        id: QualifiedName::new(c).expect("test command id must parse"),
+        args_schema: None,
+        result_schema: None,
+    })
+    .collect();
+    PluginManifest {
+        identity: PluginIdentity {
+            id: bitty_plugin_host::PluginId::new("bitty-terminal.workspace")
+                .expect("test plugin id must be valid"),
+            name: "Workspace".to_string(),
+            version: "0.1.0".to_string(),
+            description:
+                "Workspace commands, workspaceline presentation, ordering and closing policy"
+                    .to_string(),
+            license: Some("MIT".to_string()),
+        },
+        compat: Compat {
+            bitty: Some(">=0.1,<1.0".to_string()),
+            plugin_api: Some("^1.0".to_string()),
+        },
+        dependencies: Vec::new(),
+        provided_services: Vec::new(),
+        required_services: Vec::new(),
+        capabilities: caps,
+        tools: Vec::new(),
+        network: Vec::new(),
+        limits: Default::default(),
+        lazy: LazyTriggers {
+            commands,
+            events: vec![
+                "terminal.title-changed".to_string(),
+                "focus.changed".to_string(),
+            ],
+            claims: vec!["workspaceline".to_string()],
+        },
+        raw_bytes_len: 512,
+    }
+}
 
 fn granted_set_for(
     manifest: &bitty_plugin_host::PluginManifest,
@@ -67,7 +126,7 @@ fn default_disabled_zero_panels_and_no_plugin() {
 
 #[test]
 fn workspace_via_public_plugin_host_path() {
-    let manifest = workspace_manifest();
+    let manifest = test_workspace_manifest();
     let id = manifest.id().clone();
     let hash = manifest.manifest_hash();
     let granted = granted_set_for(&manifest);
@@ -97,7 +156,7 @@ fn workspace_via_public_plugin_host_path() {
     assert_eq!(report.revoked.len(), 1);
     assert!(!host.is_granted(&id, &hash, &cap));
     // Hash changed (version bump) → grant no longer matches.
-    let mut bumped = workspace_manifest();
+    let mut bumped = test_workspace_manifest();
     bumped.identity.version = "0.2.0".to_string();
     assert_ne!(bumped.manifest_hash(), hash);
     assert!(!host.is_granted(&id, &bumped.manifest_hash(), &cap));
@@ -107,7 +166,7 @@ fn workspace_via_public_plugin_host_path() {
 
 #[test]
 fn workspace_subscribe_publish_drain_bounded_drop_oldest() {
-    let manifest = workspace_manifest();
+    let manifest = test_workspace_manifest();
     let id = manifest.id().clone();
     let hash = manifest.manifest_hash();
     let granted = granted_set_for(&manifest);
@@ -382,7 +441,7 @@ fn workspace_title_bounded_observation_only() {
 
 #[test]
 fn safe_mode_rejects_workspace_without_panic() {
-    let manifest = workspace_manifest();
+    let manifest = test_workspace_manifest();
     let mut host = PluginHost::new(DropPolicy::DropOldest, 16);
     host.set_safe_mode(true);
     // bitty-terminal.workspace is not bitty.* → treated as non-builtin, rejected.
@@ -394,7 +453,7 @@ fn safe_mode_rejects_workspace_without_panic() {
     let mut rt = Runtime::with_defaults().unwrap();
     rt.set_plugin_safe_mode(true);
     assert!(
-        rt.register_plugin(workspace_manifest()).is_err(),
+        rt.register_plugin(test_workspace_manifest()).is_err(),
         "safe mode must reject workspace"
     );
     assert!(
@@ -403,7 +462,7 @@ fn safe_mode_rejects_workspace_without_panic() {
     );
     rt.set_plugin_safe_mode(false);
     assert!(
-        rt.register_plugin(workspace_manifest()).is_ok(),
+        rt.register_plugin(test_workspace_manifest()).is_ok(),
         "after safe-mode off, registration allowed"
     );
 }
@@ -412,12 +471,14 @@ fn safe_mode_rejects_workspace_without_panic() {
 
 #[test]
 fn workspace_has_no_private_channel_parity_with_third_party() {
-    let bundled = workspace_manifest();
-    let mut third = bundled.clone();
+    // #1572: workspace shape is no longer bundled; prove a first-party-shaped
+    // manifest and a third-party mirror behave identically (no private channel).
+    let first = test_workspace_manifest();
+    let mut third = first.clone();
     third.identity.id = bitty_plugin_host::PluginId::new("xuepoo.workspace-mirror").unwrap();
     third.identity.name = "Third Party Mirror".to_string();
     // Same capabilities/lazy/compat shape must have identical validation and lifecycle.
-    for (label, manifest) in [("bundled", bundled), ("third", third)] {
+    for (label, manifest) in [("first", first), ("third", third)] {
         let id = manifest.id().clone();
         let hash = manifest.manifest_hash();
         let granted = granted_set_for(&manifest);

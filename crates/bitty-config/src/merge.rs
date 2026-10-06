@@ -72,6 +72,12 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         // `ListReplace` but implement the same wholesale replace; the font
         // section stays uniform on `ScalarReplace`.
         | "font.fallback"
+        // CTX-0985 (issue #1691): `font.features` (ordered override list)
+        // and `font.disable_ligatures` (policy scalar) join the
+        // scalar-replace font leaves; a present `font` table replaces
+        // both wholesale like `fallback`.
+        | "font.features"
+        | "font.disable_ligatures"
         | "window.opacity"
         | "window.padding"
         | "window.radius_px"
@@ -590,6 +596,8 @@ const ATTRIBUTED_FIELDS: &[&str] = &[
     "font.line_height",
     "font.letter_spacing",
     "font.fallback",
+    "font.features",
+    "font.disable_ligatures",
     "font",
     "window.opacity",
     "window.padding",
@@ -870,6 +878,87 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
                     &mut attribution,
                     &mut conflicts,
                     field_fb,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            }
+            // CTX-0985 (issue #1691): `font.features` merges
+            // scalar-replace like `font.fallback`: a present list replaces
+            // the earlier layer wholesale; layers without a `font` table
+            // say nothing and inherit.
+            let field_feat = "font.features";
+            if is_policy {
+                policy_fields.insert(field_feat.to_string(), src.clone());
+                effective.font.features.clone_from(&font.features);
+                let prev = attribution.get(field_feat).cloned();
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field_feat,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            } else if let Some(policy_src) = policy_fields.get(field_feat) {
+                policy_violations.push(ConfigError::NonOverridable {
+                    field: field_feat.to_string(),
+                    policy_source: policy_src.describe(),
+                    attempted_source: src.describe(),
+                });
+                conflicts.push(MergeConflict {
+                    field: field_feat.to_string(),
+                    previous_source: policy_src.clone(),
+                    new_source: src.clone(),
+                    merge_class: MergeClass::ScalarReplace,
+                });
+            } else {
+                let prev = attribution.get(field_feat).cloned();
+                effective.font.features.clone_from(&font.features);
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field_feat,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            }
+            // CTX-0985: `font.disable_ligatures` merges scalar-replace
+            // like its sibling font leaves (policy scalar, later layer
+            // wins).
+            let field_lig = "font.disable_ligatures";
+            if is_policy {
+                policy_fields.insert(field_lig.to_string(), src.clone());
+                effective.font.disable_ligatures = font.disable_ligatures;
+                let prev = attribution.get(field_lig).cloned();
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field_lig,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            } else if let Some(policy_src) = policy_fields.get(field_lig) {
+                policy_violations.push(ConfigError::NonOverridable {
+                    field: field_lig.to_string(),
+                    policy_source: policy_src.describe(),
+                    attempted_source: src.describe(),
+                });
+                conflicts.push(MergeConflict {
+                    field: field_lig.to_string(),
+                    previous_source: policy_src.clone(),
+                    new_source: src.clone(),
+                    merge_class: MergeClass::ScalarReplace,
+                });
+            } else {
+                let prev = attribution.get(field_lig).cloned();
+                effective.font.disable_ligatures = font.disable_ligatures;
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field_lig,
                     prev,
                     src,
                     MergeClass::ScalarReplace,
@@ -2286,12 +2375,16 @@ fn merge_layers_allow_policy_violations(
         if let Some(font) = &plan.font {
             // CTX-0953: `font.fallback` (4) joins the scalar-replace font
             // leaves; a present list replaces wholesale like its siblings.
+            // CTX-0985: `font.features` (5) and `font.disable_ligatures`
+            // (6) join the same way.
             for (field, which) in [
                 ("font.family", 0u8),
                 ("font.size", 1u8),
                 ("font.line_height", 2u8),
                 ("font.letter_spacing", 3u8),
                 ("font.fallback", 4u8),
+                ("font.features", 5u8),
+                ("font.disable_ligatures", 6u8),
             ] {
                 if is_policy {
                     policy_fields.insert(field.to_string(), src.clone());
@@ -2300,7 +2393,9 @@ fn merge_layers_allow_policy_violations(
                         1 => effective.font.size = font.size,
                         2 => effective.font.line_height = font.line_height,
                         3 => effective.font.letter_spacing = font.letter_spacing,
-                        _ => effective.font.fallback.clone_from(&font.fallback),
+                        4 => effective.font.fallback.clone_from(&font.fallback),
+                        5 => effective.font.features.clone_from(&font.features),
+                        _ => effective.font.disable_ligatures = font.disable_ligatures,
                     }
                     let prev = attribution.get(field).cloned();
                     record_attribution(
@@ -2331,7 +2426,9 @@ fn merge_layers_allow_policy_violations(
                         1 => effective.font.size = font.size,
                         2 => effective.font.line_height = font.line_height,
                         3 => effective.font.letter_spacing = font.letter_spacing,
-                        _ => effective.font.fallback.clone_from(&font.fallback),
+                        4 => effective.font.fallback.clone_from(&font.fallback),
+                        5 => effective.font.features.clone_from(&font.features),
+                        _ => effective.font.disable_ligatures = font.disable_ligatures,
                     }
                     record_attribution(
                         &mut attribution,
@@ -3755,6 +3852,93 @@ mod tests {
     }
 
     #[test]
+    fn font_features_and_policy_merge_scalar_replace_with_attribution() {
+        // CTX-0985 (issue #1691): a present `font` table replaces
+        // `font.features` / `font.disable_ligatures` wholesale (no
+        // concatenation); a layer without a `font` table inherits. Both
+        // merge paths agree.
+        fn plan_with_shaping(
+            features: Vec<String>,
+            policy: crate::types::LigaturePolicy,
+        ) -> ConfigPlan {
+            ConfigPlan {
+                font: Some(FontConfig {
+                    family: "Mono".into(),
+                    size: 12.0,
+                    line_height: crate::types::DEFAULT_LINE_HEIGHT,
+                    letter_spacing: crate::types::DEFAULT_LETTER_SPACING,
+                    fallback: Vec::new(),
+                    features,
+                    disable_ligatures: policy,
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            }
+        }
+        let lower = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            plan_with_shaping(vec!["calt=0".into()], crate::types::LigaturePolicy::Cursor),
+        );
+        let upper = LayeredPlan::new(
+            ConfigSource::new(LayerKind::Cli, Some("cli")),
+            plan_with_shaping(
+                vec!["ss01=2".into(), "liga=0".into()],
+                crate::types::LigaturePolicy::Always,
+            ),
+        );
+        for merged in [
+            merge_layers(vec![lower.clone(), upper.clone()]).expect("merge"),
+            try_merge_layers(vec![lower.clone(), upper.clone()]).expect("try merge"),
+        ] {
+            assert_eq!(
+                merged.effective.font.features,
+                vec!["ss01=2".to_string(), "liga=0".to_string()]
+            );
+            assert_eq!(
+                merged.effective.font.disable_ligatures,
+                crate::types::LigaturePolicy::Always
+            );
+            assert_eq!(
+                merged.source_of("font.features").unwrap().layer,
+                LayerKind::Cli
+            );
+            assert_eq!(
+                merged.source_of("font.disable_ligatures").unwrap().layer,
+                LayerKind::Cli
+            );
+            assert!(merged.conflicts.iter().any(|c| c.field == "font.features"));
+            assert!(
+                merged
+                    .conflicts
+                    .iter()
+                    .any(|c| c.field == "font.disable_ligatures")
+            );
+        }
+        // Absent `font` table inherits both leaves.
+        let silent = LayeredPlan::new(
+            ConfigSource::new(LayerKind::Cli, Some("cli")),
+            ConfigPlan {
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged = merge_layers(vec![lower, silent]).expect("merge");
+        assert_eq!(merged.effective.font.features, vec!["calt=0".to_string()]);
+        assert_eq!(
+            merged.effective.font.disable_ligatures,
+            crate::types::LigaturePolicy::Cursor
+        );
+        assert_eq!(
+            merged.source_of("font.features").unwrap().layer,
+            LayerKind::User
+        );
+        assert_eq!(
+            merged.source_of("font.disable_ligatures").unwrap().layer,
+            LayerKind::User
+        );
+    }
+
+    #[test]
     fn mod_key_merges_scalar_replace_with_attribution() {
         // CTX-0236: user layer wins with per-field attribution; absent
         // keeps the lower-precedence value (Alt default).
@@ -4312,6 +4496,16 @@ mod tests {
         // CTX-0953: the fallback list replaces wholesale like its siblings.
         assert_eq!(
             merge_class_for("font.fallback"),
+            Some(MergeClass::ScalarReplace)
+        );
+        // CTX-0985 (issue #1691): the shaping leaves join the
+        // scalar-replace font section.
+        assert_eq!(
+            merge_class_for("font.features"),
+            Some(MergeClass::ScalarReplace)
+        );
+        assert_eq!(
+            merge_class_for("font.disable_ligatures"),
             Some(MergeClass::ScalarReplace)
         );
         assert_eq!(merge_class_for("font"), Some(MergeClass::DeepMerge));

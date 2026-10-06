@@ -1000,6 +1000,8 @@ pub fn resolve_effective_with_profiles(
         "font.line_height",
         "font.letter_spacing",
         "font.fallback",
+        "font.features",
+        "font.disable_ligatures",
         "window.opacity",
         "window.padding",
         "window.radius_px",
@@ -1313,11 +1315,29 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
                     // are enforced fail-closed by typed validation below,
                     // naming `font.fallback[<index>]`.
                     fallback: f.fallback.unwrap_or_default(),
-                    // `features` / `disable_ligatures` have no Lua keys yet
-                    // (CTX-0957 follow-up); typed defaults preserve current
-                    // behavior.
-                    features: Vec::new(),
-                    disable_ligatures: crate::types::LigaturePolicy::Never,
+                    // CTX-0985 (issue #1691): `font.features` arrives as
+                    // plain Lua data; entry bounds were enforced at
+                    // extraction and tag grammar is enforced fail-closed
+                    // by typed validation below, naming
+                    // `font.features[<index>]`. An omitted key resets the
+                    // list at merge (scalar-replace, like `fallback`).
+                    features: f.features.unwrap_or_default(),
+                    // CTX-0985: `font.disable_ligatures` arrives as a raw
+                    // spelling; grammar (`never`/`cursor`/`always`) fails
+                    // closed here naming `font.disable_ligatures`. Absent
+                    // means the typed default (`Never`).
+                    disable_ligatures: match f.disable_ligatures.as_deref() {
+                        None => crate::types::LigaturePolicy::Never,
+                        Some(raw) => match crate::types::LigaturePolicy::parse(raw) {
+                            Ok(policy) => policy,
+                            Err(reason) => {
+                                return Err(ConfigError::validation(
+                                    "font.disable_ligatures",
+                                    reason,
+                                ));
+                            }
+                        },
+                    },
                 };
                 // Fail closed on out-of-range spacing (same as typed validation).
                 cfg.validate().map_err(|e| {
@@ -2557,6 +2577,58 @@ mod tests {
         )
         .expect_err("blank entry must fail");
         assert!(err.to_string().contains("font.fallback[0]"), "{err}");
+    }
+
+    #[test]
+    fn lua_font_features_and_ligature_policy_parse_and_validate() {
+        // CTX-0985 (issue #1691): `font.features` parses in order; absent
+        // means empty; bad tag grammar fails closed naming
+        // `font.features[i]`; `font.disable_ligatures` parses the three
+        // kitty spellings and rejects anything else naming the field.
+        let plan = parse_lua_config(
+            r#"return { font = { family = "Mono", size = 12.0, features = { "calt=0", "ss01=2" }, disable_ligatures = "cursor" } }"#,
+            &test_source(),
+        )
+        .expect("features parse");
+        let font = plan.font.unwrap();
+        assert_eq!(
+            font.features,
+            vec!["calt=0".to_string(), "ss01=2".to_string()]
+        );
+        assert_eq!(font.disable_ligatures, crate::types::LigaturePolicy::Cursor);
+        let plan = parse_lua_config(
+            r#"return { font = { family = "Mono", size = 12.0 } }"#,
+            &test_source(),
+        )
+        .expect("absent keys ok");
+        let font = plan.font.unwrap();
+        assert!(font.features.is_empty());
+        assert_eq!(font.disable_ligatures, crate::types::LigaturePolicy::Never);
+        for policy in ["never", "cursor", "always"] {
+            let plan = parse_lua_config(
+                &format!(
+                    r#"return {{ font = {{ family = "Mono", size = 12.0, disable_ligatures = "{policy}" }} }}"#
+                ),
+                &test_source(),
+            )
+            .expect("policy spelling parses");
+            assert_eq!(
+                plan.font.unwrap().disable_ligatures,
+                crate::types::LigaturePolicy::parse(policy).expect("test spelling valid")
+            );
+        }
+        let err = parse_lua_config(
+            r#"return { font = { family = "Mono", size = 12.0, features = { "calt=0", "toolongtag=1" } } }"#,
+            &test_source(),
+        )
+        .expect_err("bad tag must fail");
+        assert!(err.to_string().contains("font.features[1]"), "{err}");
+        let err = parse_lua_config(
+            r#"return { font = { family = "Mono", size = 12.0, disable_ligatures = "sometimes" } }"#,
+            &test_source(),
+        )
+        .expect_err("bad policy must fail");
+        assert!(err.to_string().contains("font.disable_ligatures"), "{err}");
     }
 
     #[test]
@@ -4214,6 +4286,47 @@ mod tests {
                 .iter()
                 .any(|c| c.new_source.layer == LayerKind::Cli && c.field == "font.fallback")
         );
+    }
+
+    #[test]
+    fn cli_font_override_keeps_features_and_policy_source() {
+        // CTX-0985: the CLI font layer inherits `base.font.features` and
+        // `base.font.disable_ligatures`, so the restore loop must keep the
+        // base source for both or `config check` misreports them as cli.
+        let src = test_source();
+        let plan = parse_lua_config(
+            r#"return {
+                font = { family = "File Mono", size = 12.0, features = { "calt=0" }, disable_ligatures = "always" },
+            }"#,
+            &src,
+        )
+        .expect("file parses");
+        let cli = CliOverrides {
+            font_family: Some("Cli Mono".to_string()),
+            ..Default::default()
+        };
+        let merged =
+            resolve_effective_full(Some(LayeredPlan::new(src, plan)), None, &cli).expect("merge");
+        assert_eq!(merged.effective.font.family, "Cli Mono");
+        assert_eq!(merged.effective.font.features, vec!["calt=0".to_string()]);
+        assert_eq!(
+            merged.effective.font.disable_ligatures,
+            crate::types::LigaturePolicy::Always
+        );
+        for field in ["font.features", "font.disable_ligatures"] {
+            assert_eq!(
+                merged.source_of(field).unwrap().layer,
+                LayerKind::User,
+                "{field}"
+            );
+            assert!(
+                !merged
+                    .conflicts
+                    .iter()
+                    .any(|c| c.new_source.layer == LayerKind::Cli && c.field == field),
+                "{field}"
+            );
+        }
     }
 
     #[test]

@@ -233,6 +233,7 @@ mod component;
 mod composer_owner;
 mod config_cli;
 mod config_reload;
+mod consent;
 mod ctl;
 mod dev;
 mod doctor;

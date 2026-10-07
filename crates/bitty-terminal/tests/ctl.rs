@@ -252,3 +252,73 @@ fn ctl_workspace_verb_without_instance_is_unavailable() {
         stderr(&output)
     );
 }
+
+#[test]
+fn ctl_consent_help_names_grant_and_revoke() {
+    let output = run_bitty(&["ctl", "--help"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "ctl --help must exit 0, stderr={:?}",
+        stderr(&output)
+    );
+    let text = stdout(&output);
+    assert!(
+        text.contains("consent grant") && text.contains("consent revoke-session"),
+        "help must name consent verbs, got {text:?}"
+    );
+}
+
+#[test]
+fn ctl_consent_parse_errors_are_usage_errors() {
+    // Issue #1520: malformed consent requests fail closed before any IPC.
+    for args in [
+        &["ctl", "consent", "grant"] as &[&str],
+        &["ctl", "consent", "grant", "--scope", "view.manage"] as &[&str],
+        &[
+            "ctl",
+            "consent",
+            "grant",
+            "--scope",
+            "debug.control",
+            "--terminal",
+            "t:1",
+        ] as &[&str],
+        &["ctl", "consent", "revoke"] as &[&str],
+        &[
+            "ctl",
+            "consent",
+            "revoke-session",
+            "--scope",
+            "debug.control",
+        ] as &[&str],
+        &["ctl", "consent", "frobnicate"] as &[&str],
+    ] {
+        let output = run_bitty(args);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{args:?} must be UsageError (exit 2), stderr={:?}",
+            stderr(&output)
+        );
+    }
+}
+
+#[test]
+fn ctl_consent_grant_without_instance_is_unavailable() {
+    // The grant resolves its target before prompting: with no live
+    // instance it fails closed with exit 6 and never prompts.
+    let output = run_bitty(&[
+        "ctl",
+        "--socket",
+        "/tmp/bitty-ctl-test-nonexistent.sock",
+        "consent",
+        "revoke-session",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(6),
+        "missing socket must be Unavailable (exit 6), stderr={:?}",
+        stderr(&output)
+    );
+}

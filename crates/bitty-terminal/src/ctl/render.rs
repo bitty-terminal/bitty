@@ -148,7 +148,43 @@ pub fn execute_ctl(request: &CtlRequest, targeting: &CtlTargeting) -> i32 {
     };
 
     let method = request.wire_method().unwrap_or("bitty.debug/ping");
-    let params = request.wire_params();
+    // Issue #1520: a consent grant is never issuable from flags,
+    // environment, configuration, or child-process inheritance. The
+    // confirmation phrase is prompted on the local terminal here and
+    // spliced into the params; `wire_params` emits an empty phrase that
+    // the server always denies, so only this path can grant.
+    let params = match request {
+        CtlRequest::ConsentGrant {
+            scope,
+            terminal_id,
+            family,
+        } => {
+            let what = match (terminal_id.as_deref(), family.as_deref()) {
+                (Some(terminal), Some(family)) => format!("{family} {terminal}"),
+                _ => scope.clone(),
+            };
+            match crate::consent::ExplicitConsent::confirm_interactive(&what) {
+                Ok(_) => Some(crate::consent::consent_grant_params(
+                    scope,
+                    terminal_id.as_deref(),
+                    family.as_deref(),
+                    &crate::consent::expected_confirm_phrase(&what),
+                )),
+                Err(err) => {
+                    if emit_json {
+                        println!(
+                            "{}",
+                            format_failure(registry, "Denied", err.code(), err.message())
+                        );
+                    } else {
+                        eprintln!("bitty ctl: consent not granted ({})", err.message());
+                    }
+                    return EXIT_PERM;
+                }
+            }
+        }
+        _ => request.wire_params(),
+    };
     match ctl_roundtrip(&target.socket_path, method, params.as_deref(), uid) {
         Err(message) => {
             if emit_json {
@@ -343,6 +379,15 @@ fn render_table(request: &CtlRequest, result_json: &str, target: &ResolvedTarget
             );
         }
         CtlRequest::InstanceList => {
+            out.push_str(result_json);
+            out.push('\n');
+        }
+        // Consent receipts are the audit trail (issue #1520): print the
+        // server receipt verbatim. A granted bearer appears here exactly
+        // once for the consenting caller and is never logged elsewhere.
+        CtlRequest::ConsentGrant { .. }
+        | CtlRequest::ConsentRevoke { .. }
+        | CtlRequest::ConsentRevokeSession => {
             out.push_str(result_json);
             out.push('\n');
         }

@@ -960,6 +960,22 @@ impl Runtime {
                 continue;
             }
             let damage = self.state.apply(&action);
+            // OSC 22 pointer shapes (issue #1762): presentation-only per-pane
+            // stacks, never terminal truth (state stays inert above). The
+            // emitting pane is the fed grid; a hidden primary grid (re-homed,
+            // `fed_grid_view() == None`) owns no visible leaf and is ignored.
+            if let TerminalAction::OscPointerShape { op } = &action {
+                if let Some(target) = self.fed_grid_view() {
+                    self.pointer_stacks.apply(target, op);
+                }
+            }
+            // RIS (`ESC c` / `FullReset`) clears the emitting pane's pointer
+            // stack alongside the grid reset.
+            if matches!(action, TerminalAction::FullReset) {
+                if let Some(target) = self.fed_grid_view() {
+                    self.pointer_stacks.clear(target);
+                }
+            }
             if !damage.regions.is_empty() {
                 let generation = damage.generation;
                 self.cold_queue.push(ColdEvent::Damage { generation });

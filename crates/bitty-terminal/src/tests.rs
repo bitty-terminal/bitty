@@ -844,6 +844,101 @@ fn osc_title_handoff_call_sequence_reaches_the_os_sink() {
     );
 }
 
+/// Recording double for the OS cursor-icon handoff (issue #1762).
+///
+/// `WindowHandle::set_cursor_icon` needs a live winit window, so the OS
+/// pointer itself cannot be read back headlessly. This double records every
+/// icon handed across [`crate::terminal_app::OsCursorSink`] in call order,
+/// which is the exact production call sequence (the trait impl for
+/// `WindowHandle` just forwards to winit). The `Mutex` keeps the double
+/// usable behind a shared handle while `TerminalApp` owns it as a boxed
+/// trait object.
+struct RecordingCursorSink {
+    icons: std::sync::Arc<std::sync::Mutex<Vec<bitty_platform::CursorIcon>>>,
+}
+
+impl crate::terminal_app::OsCursorSink for RecordingCursorSink {
+    fn set_os_cursor(&self, icon: bitty_platform::CursorIcon) {
+        self.icons.lock().expect("poison-free").push(icon);
+    }
+}
+
+#[test]
+fn osc22_cursor_handoff_call_sequence_reaches_the_os_sink() {
+    // Issue #1762 evidence: the exact sequence of OS cursor-icon
+    // applications is asserted with a test double. The OS pointer itself is
+    // not readable headlessly, so this proves the platform-handoff call
+    // sequence (focused-pane query -> change gate -> sink) rather than the
+    // painted pointer.
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        Vec::new(),
+        SpawnSpec::default(),
+    );
+    let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    app.set_os_cursor_sink(Box::new(RecordingCursorSink {
+        icons: std::sync::Arc::clone(&recorded),
+    }));
+
+    // The first tick syncs the default pointer (no override yet): one call
+    // proving the tick-time sync is wired even without PTY output.
+    app.drive_tick();
+    assert_eq!(
+        recorded.lock().expect("poison-free").as_slice(),
+        [bitty_platform::CursorIcon::Default],
+        "idle tick syncs the default pointer once"
+    );
+
+    // A fresh shape crosses the seam exactly once.
+    app.runtime.handle_pty_bytes(b"\x1b]22;pointer\x07");
+    app.drive_tick();
+    assert_eq!(
+        recorded.lock().expect("poison-free").as_slice(),
+        [
+            bitty_platform::CursorIcon::Default,
+            bitty_platform::CursorIcon::Pointer
+        ],
+        "set pointer handed to the OS sink"
+    );
+
+    // A repeat of the same shape is dropped by the change gate: no second
+    // call, so the OS pointer never churns.
+    app.runtime.handle_pty_bytes(b"\x1b]22;pointer\x07");
+    app.drive_tick();
+    assert_eq!(recorded.lock().expect("poison-free").len(), 2);
+
+    // Push, pop, and RIS reset each apply once more, in order.
+    app.runtime.handle_pty_bytes(b"\x1b]22;>wait\x07");
+    app.drive_tick();
+    app.runtime.handle_pty_bytes(b"\x1b]22;<\x07");
+    app.drive_tick();
+    app.runtime.handle_pty_bytes(b"\x1bc");
+    app.drive_tick();
+    assert_eq!(
+        recorded.lock().expect("poison-free").as_slice(),
+        [
+            bitty_platform::CursorIcon::Default,
+            bitty_platform::CursorIcon::Pointer,
+            bitty_platform::CursorIcon::Wait,
+            bitty_platform::CursorIcon::Pointer,
+            bitty_platform::CursorIcon::Default,
+        ],
+        "push/pop/RIS cross the seam once each, in arrival order"
+    );
+
+    // An empty set while already default is dropped by the change gate.
+    app.runtime.handle_pty_bytes(b"\x1b]22;\x07");
+    app.drive_tick();
+    assert_eq!(
+        recorded.lock().expect("poison-free").len(),
+        5,
+        "empty reset at default must not churn"
+    );
+}
+
 /// Recording double for the OSC 8 click-to-open live consumer (CTX-0577).
 struct RecordingUrlOpener {
     opened: std::sync::Arc<std::sync::Mutex<Vec<String>>>,

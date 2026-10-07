@@ -100,6 +100,7 @@ pub mod app;
 pub mod appearance;
 mod blur;
 pub mod clipboard;
+pub mod cursor;
 pub mod dpi;
 pub mod error;
 pub mod event;
@@ -121,6 +122,7 @@ pub use app::{
 };
 pub use appearance::{SystemAppearance, query_system_appearance};
 pub use clipboard::Clipboard;
+pub use cursor::CursorIcon;
 pub use dpi::{LogicalPixel, LogicalSize, PhysicalSize, ScaleFactor, surface_extent_from_logical};
 pub use error::PlatformError;
 pub use event::{

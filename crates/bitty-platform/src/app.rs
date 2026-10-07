@@ -208,6 +208,18 @@ impl WindowHandle {
         self.window.set_title(title);
     }
 
+    /// Sets the OS mouse-pointer cursor icon (issue #1762, `OSC 22`).
+    ///
+    /// Wraps winit's `Window::set_cursor`: the owned [`crate::CursorIcon`]
+    /// maps 1:1 to `winit::window::CursorIcon`, so untrusted PTY shape names
+    /// (already validated to the CSS keyword set by `bitty-vt`) can never
+    /// inject an invalid icon. Fail-soft by construction — winit's setter is
+    /// infallible and platforms without a distinct icon fall back to the
+    /// default pointer.
+    pub fn set_cursor_icon(&self, icon: crate::CursorIcon) {
+        self.window.set_cursor(icon.to_winit());
+    }
+
     /// Schedules a redraw request delivery for this window.
     ///
     /// The application observes it as

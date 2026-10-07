@@ -760,6 +760,13 @@ impl Runtime {
                     self.apply_notification_policy(notification, std::time::Instant::now());
                     None
                 }
+                TerminalAction::KittyNotificationChunk { chunk } => {
+                    // CTX-1008: chunked Kitty `OSC 99` assembles by `i=` in
+                    // the bounded assembler, then flows through the same
+                    // consent and RC-8 gates as `OSC 9`/`OSC 777`.
+                    self.apply_kitty_chunk_policy(chunk, std::time::Instant::now());
+                    None
+                }
                 _ => None,
             };
             if let Some(ev) = pre_event {

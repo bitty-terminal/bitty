@@ -9,10 +9,11 @@ use super::{Bridge, sub_params};
 use crate::action::{
     CharsetSlot, CharsetTable, ClipboardOp, Col, ControlChar, Count, CursorStyle, Direction,
     DynamicColorOp, DynamicColorTarget, EnhancedKeyboardOp, EnhancedKeyboardSetMode,
-    EraseDisplayMode, EraseLineMode, GraphemeCell, Hyperlink, MAX_OSC4_OPS, MAX_OSC22_SHAPES, Mode,
-    MouseCoordinateEncoding, MouseTrackingMode, Notification, NotificationSource, PaletteColorOp,
-    PaletteOp, PointerShape, PointerShapeOp, Rgb, Row, SequenceKind, StatusKind, TabTargets,
-    TerminalAction, UnrecognizedSequence, ZoneKind,
+    EraseDisplayMode, EraseLineMode, GraphemeCell, Hyperlink, KittyNotificationChunk,
+    KittyPayloadType, MAX_OSC4_OPS, MAX_OSC22_SHAPES, Mode, MouseCoordinateEncoding,
+    MouseTrackingMode, Notification, NotificationSource, PaletteColorOp, PaletteOp, PointerShape,
+    PointerShapeOp, Rgb, Row, SequenceKind, StatusKind, TabTargets, TerminalAction,
+    UnrecognizedSequence, ZoneKind,
 };
 use crate::bounded::{BoundedBytes, BoundedString};
 use vte::{Params, Perform};
@@ -323,8 +324,7 @@ fn parse_osc9_notification(rest: &[&[u8]]) -> Option<Notification> {
 /// Parses an `OSC 777` notification (CTX-0577).
 ///
 /// Accepted wire form is exactly `OSC 777 ; notify ; title ; body` (the
-/// rxvt-unicode notification form; kitty's documented protocol is `OSC 99`,
-/// which this parser does not handle). The body may contain `;` and is
+/// rxvt-unicode notification form). The body may contain `;` and is
 /// rejoined; any other sub-command or a malformed segment list returns
 /// `None` so the caller records it as inert. `OSC 777` also carries other
 /// sub-commands (`notify` is the only one defined here), so unknown
@@ -344,6 +344,205 @@ fn parse_osc777_notification(rest: &[&[u8]]) -> Option<Notification> {
         source: NotificationSource::Osc777,
         title: Some(BoundedString::new(String::from_utf8_lossy(title))),
         body: BoundedString::new(String::from_utf8_lossy(&body)),
+    })
+}
+
+/// Kitty `OSC 99` metadata value alphabet (CTX-1008).
+///
+/// Mirrors the Kitty desktop-notification specification: values are words
+/// from `a-zA-Z0-9` plus `-_/+.,(){}[]*&^%$#@!~` and `,` (for `a=` lists
+/// like `report,focus`). Anything else fails the whole sequence closed.
+fn is_kitty_metadata_value_byte(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'a'..=b'z'
+            | b'A'..=b'Z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'/'
+            | b'+'
+            | b'.'
+            | b','
+            | b'('
+            | b')'
+            | b'{'
+            | b'}'
+            | b'['
+            | b']'
+            | b'*'
+            | b'&'
+            | b'^'
+            | b'%'
+            | b'$'
+            | b'#'
+            | b'@'
+            | b'!'
+            | b'~'
+    )
+}
+
+/// Minimal standard-base64 decoder for Kitty `OSC 99` `e=1` payloads
+/// (CTX-1008, issue #1763).
+///
+/// Dependency-free (mirrors the runtime OSC 52 helper): accepts padded and
+/// unpadded input, rejects non-alphabet bytes, misplaced padding, and
+/// lengths congruent to 1 mod 4. Empty input decodes to empty.
+fn decode_kitty_base64(input: &[u8]) -> Option<Vec<u8>> {
+    fn sextet(byte: u8) -> Option<u32> {
+        match byte {
+            b'A'..=b'Z' => Some(u32::from(byte - b'A')),
+            b'a'..=b'z' => Some(u32::from(byte - b'a' + 26)),
+            b'0'..=b'9' => Some(u32::from(byte - b'0' + 52)),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    if input.is_empty() {
+        return Some(Vec::new());
+    }
+    if input.len() % 4 == 1 {
+        return None;
+    }
+    let mut pad = 0_usize;
+    for &byte in input.iter().rev() {
+        if byte == b'=' {
+            pad += 1;
+        } else {
+            break;
+        }
+    }
+    if pad > 2 {
+        return None;
+    }
+    let body_len = input.len() - pad;
+    if input[..body_len].contains(&b'=') {
+        return None;
+    }
+    let body = &input[..body_len];
+    let (full, tail) = body.split_at(body.len() / 4 * 4);
+    let mut out = Vec::with_capacity(input.len() / 4 * 3 + 3);
+    for chunk in full.chunks_exact(4) {
+        let triple = (sextet(chunk[0])? << 18)
+            | (sextet(chunk[1])? << 12)
+            | (sextet(chunk[2])? << 6)
+            | sextet(chunk[3])?;
+        out.push((triple >> 16) as u8);
+        out.push((triple >> 8) as u8);
+        out.push(triple as u8);
+    }
+    match tail.len() {
+        0 => {}
+        2 => {
+            let bits = (sextet(tail[0])? << 18) | (sextet(tail[1])? << 12);
+            out.push((bits >> 16) as u8);
+        }
+        3 => {
+            let bits =
+                (sextet(tail[0])? << 18) | (sextet(tail[1])? << 12) | (sextet(tail[2])? << 6);
+            out.push((bits >> 16) as u8);
+            out.push((bits >> 8) as u8);
+        }
+        _ => return None,
+    }
+    Some(out)
+}
+
+/// Parses one Kitty `OSC 99` chunk (CTX-1008, issue #1763).
+///
+/// Accepted wire form is `OSC 99 ; metadata ; payload` where both `;` are
+/// always present (so `rest` must hold at least metadata plus payload).
+/// `metadata` is `:`-separated `key=value` pairs (`i=` identifier, `d=`
+/// done `0`/`1`, `p=` payload type, `e=` base64 `0`/`1`; others ignored).
+/// `payload` is the bytes after the second `;` (rejoined when it contains
+/// `;`). Only `p=title` (default) and `p=body` yield a chunk; capability
+/// queries (`p=?`), `close`/`icon`/`alive`/`buttons`, unknown `p`, malformed
+/// metadata, bad `d`/`e`, and undecodable `e=1` payloads return `None` so the
+/// caller records the sequence as inert. The returned payload is already
+/// base64-decoded when `e=1` was present and length-bounded by
+/// [`BoundedString`]; it remains untrusted display data.
+fn parse_osc99_chunk(rest: &[&[u8]]) -> Option<KittyNotificationChunk> {
+    let [metadata, payload_parts @ ..] = rest else {
+        return None;
+    };
+    // Both `;` must be present: at least metadata plus one payload segment.
+    // `rest` always holds the segments after `99;`, so length 1 means the
+    // second `;` is missing.
+    if payload_parts.is_empty() {
+        return None;
+    }
+    let mut id: &[u8] = b"";
+    let mut done = true;
+    let mut payload_type = KittyPayloadType::Title;
+    let mut is_base64 = false;
+    if !metadata.is_empty() {
+        for pair in metadata.split(|&byte| byte == b':') {
+            let eq = pair.iter().position(|&byte| byte == b'=')?;
+            let (key, value) = pair.split_at(eq);
+            let value = &value[1..];
+            if key.len() != 1 || !key[0].is_ascii_alphabetic() {
+                return None;
+            }
+            if !value.iter().all(|&byte| is_kitty_metadata_value_byte(byte)) {
+                // Empty values are only meaningful for `i=` (default id);
+                // every other empty or out-of-alphabet value fails closed.
+                if !(key[0] == b'i' && value.is_empty()) {
+                    return None;
+                }
+            }
+            match key[0] {
+                b'i' => {
+                    id = value;
+                }
+                b'd' => {
+                    if value == b"0" {
+                        done = false;
+                    } else if value == b"1" {
+                        done = true;
+                    } else {
+                        return None;
+                    }
+                }
+                b'p' => {
+                    if value == b"title" {
+                        payload_type = KittyPayloadType::Title;
+                    } else if value == b"body" {
+                        payload_type = KittyPayloadType::Body;
+                    } else {
+                        // Capability queries, close/icon/alive/buttons, and
+                        // future payload types never produce a chunk.
+                        return None;
+                    }
+                }
+                b'e' => {
+                    if value == b"0" {
+                        is_base64 = false;
+                    } else if value == b"1" {
+                        is_base64 = true;
+                    } else {
+                        return None;
+                    }
+                }
+                _ => {
+                    // Urgency (`u=`), actions (`a=`), and future keys are
+                    // parsed for validity but otherwise ignored by Core.
+                }
+            }
+        }
+    }
+    let payload_bytes = join_segments(payload_parts);
+    let decoded_text = if is_base64 {
+        let decoded = decode_kitty_base64(&payload_bytes)?;
+        String::from_utf8_lossy(&decoded).into_owned()
+    } else {
+        String::from_utf8_lossy(&payload_bytes).into_owned()
+    };
+    Some(KittyNotificationChunk {
+        id: BoundedString::new(String::from_utf8_lossy(id)),
+        payload_type,
+        payload: BoundedString::new(decoded_text),
+        is_done: done,
     })
 }
 
@@ -949,6 +1148,21 @@ impl<F: FnMut(TerminalAction)> Perform for Bridge<'_, F> {
             },
             777 => match parse_osc777_notification(rest) {
                 Some(notification) => self.emit(TerminalAction::OscNotification { notification }),
+                None => {
+                    let data = join_segments(rest);
+                    self.emit(TerminalAction::OscUnknown {
+                        id,
+                        data: BoundedBytes::new(data),
+                    });
+                }
+            },
+            // Kitty `OSC 99` desktop-notification chunks (CTX-1008, #1763).
+            // The parser emits one bounded chunk per sequence; the runtime
+            // assembles same-`i=` chunks into a single `Osc99` notification
+            // under the same consent and RC-8 gates. Queries, close/icon
+            // payloads, and malformed metadata stay inert.
+            99 => match parse_osc99_chunk(rest) {
+                Some(chunk) => self.emit(TerminalAction::KittyNotificationChunk { chunk }),
                 None => {
                     let data = join_segments(rest);
                     self.emit(TerminalAction::OscUnknown {

@@ -279,6 +279,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "bitty-platform-services"
+version = "0.0.1"
+source = "git+https://github.com/bitty-terminal/bitty-platform-services?rev=2fc794a#2fc794a6dd93740ed2b9bcd1c7c663af1668b277"
+
+[[package]]
 name = "bitty-plugin-host"
 version = "0.0.21"
 dependencies = [
@@ -338,6 +343,7 @@ dependencies = [
  "bitty-network-wire",
  "bitty-package",
  "bitty-platform",
+ "bitty-platform-services",
  "bitty-plugin-host",
  "bitty-pty",
  "bitty-render",

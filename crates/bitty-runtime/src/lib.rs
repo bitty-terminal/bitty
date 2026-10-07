@@ -222,9 +222,9 @@ pub use runtime::band_slots::{
     BandEdge, E_UI_UNAVAILABLE, UiSlotPlacement, ui_slot_placement, unsupported_slot_error,
 };
 pub use runtime::bell::{
-    BELL_FLASH_DURATION, BellMode, NOTIFICATION_BANNER_DURATION, NOTIFICATION_QUEUE_CAPACITY,
-    NOTIFICATION_TEXT_MAX_CHARS, RC8_EVENTS_PER_WINDOW, RC8_WINDOW, notification_banner_text,
-    sanitize_notification_text,
+    BELL_FLASH_DURATION, BellMode, KITTY_ASSEMBLED_MAX_CHARS, KITTY_PARTIALS_CAPACITY,
+    NOTIFICATION_BANNER_DURATION, NOTIFICATION_QUEUE_CAPACITY, NOTIFICATION_TEXT_MAX_CHARS,
+    RC8_EVENTS_PER_WINDOW, RC8_WINDOW, notification_banner_text, sanitize_notification_text,
 };
 pub use runtime::close_confirm::{CLOSE_CONFIRM_BANNER_MAX_CHARS, ViewCloseRequest};
 pub use runtime::help::{HELP_MAX_ROWS, HELP_PANEL_FOOTER, HELP_PANEL_TITLE};

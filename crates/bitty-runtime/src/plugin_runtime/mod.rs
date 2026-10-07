@@ -566,6 +566,15 @@ pub struct PluginRuntime {
     /// empty. Replaceable through [`PluginRuntime::set_store_backend`] so
     /// latency and failure can be injected deterministically (bitty #1518).
     store_backend: Option<Arc<dyn store::KvCommitBackend>>,
+    /// Test-only wall-clock override for the activation VM in milliseconds.
+    ///
+    /// `None` by default (production): activation uses
+    /// [`VmBudgets::default`] (RC-1 `RC1_WALL_CLOCK_BUDGET_MS`, 50ms).
+    /// `Some(ms)` widens only the wall dimension for that activation;
+    /// instruction and memory stay at RC defaults. Used by load-sensitive
+    /// integration tests (bitty#1744, same treatment as bitty#1727);
+    /// production code never sets this.
+    vm_wall_budget_ms: Option<u64>,
 }
 
 impl PluginRuntime {
@@ -600,6 +609,7 @@ impl PluginRuntime {
             target_lenses: Rc::new(RefCell::new(Vec::new())),
             label_allocator: Rc::new(RefCell::new(bitty_ui::LabelAllocator::default())),
             store_backend: None,
+            vm_wall_budget_ms: None,
         }
     }
 
@@ -610,6 +620,17 @@ impl PluginRuntime {
     /// and the RC-1 accounting stay in Core.
     pub fn set_store_backend(&mut self, backend: Option<Arc<dyn store::KvCommitBackend>>) {
         self.store_backend = backend;
+    }
+
+    /// Override the activation VM wall-clock budget (test-only).
+    ///
+    /// `None` restores the production default (`VmBudgets::default`, 50ms
+    /// wall). `Some(ms)` widens only the wall dimension; instruction and
+    /// memory stay at RC defaults. Load-sensitive integration tests use this
+    /// to absorb scheduler stalls under sharded CI load (bitty#1744 mirrors
+    /// the bitty#1727 driver treatment); production never calls this.
+    pub fn set_vm_wall_budget_ms(&mut self, wall_budget_ms: Option<u64>) {
+        self.vm_wall_budget_ms = wall_budget_ms;
     }
 
     /// Whether safe mode is enabled.
@@ -1248,7 +1269,19 @@ impl PluginRuntime {
         }
         // RC-1/RC-2 enter through the fail-closed gate: no VM exists without
         // explicit budgets (the deprecated `LuaVm::new` default path is sealed).
-        let mut vm = match build_plugin_vm(id.as_str(), Some(VmBudgets::default())) {
+        // Production uses `VmBudgets::default` (50ms wall). Tests may widen
+        // only the wall dimension via `set_vm_wall_budget_ms` to absorb
+        // scheduler stalls under sharded CI load (bitty#1744, same treatment
+        // as bitty#1727); instruction/memory stay at RC defaults and the
+        // production budget itself is untouched.
+        let vm_budgets = match self.vm_wall_budget_ms {
+            Some(wall_budget_ms) => VmBudgets {
+                wall_budget_ms,
+                ..VmBudgets::default()
+            },
+            None => VmBudgets::default(),
+        };
+        let mut vm = match build_plugin_vm(id.as_str(), Some(vm_budgets)) {
             Ok(vm) => vm,
             Err(error) => {
                 let error = PluginRuntimeError::Vm(error.to_string());

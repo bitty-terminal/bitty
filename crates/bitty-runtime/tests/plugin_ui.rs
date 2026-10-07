@@ -15,7 +15,8 @@ use std::rc::Rc;
 
 use bitty_lua::ui::{UI_MAX_BLOCKS, UiSlot};
 use bitty_lua::{
-    BridgeError, E_UI_ALREADY_CAPTURED, E_UI_NOT_OWNER, HostServices, LuaValue, UiNode,
+    BridgeError, E_UI_ALREADY_CAPTURED, E_UI_NOT_OWNER, HostServices, LuaValue,
+    RC1_WALL_CLOCK_BUDGET_MS, UiNode,
 };
 use bitty_plugin_host::manifest::PluginId;
 use bitty_runtime::plugin_runtime::{
@@ -23,6 +24,26 @@ use bitty_runtime::plugin_runtime::{
     SnapshotSource, UiBlock,
 };
 use bitty_runtime::{BandEdge, ChromeBands, E_UI_UNAVAILABLE};
+
+// ---------------------------------------------------------------------------
+// Mount-loop wall-clock budget (bitty#1744, CTX-1001)
+// ---------------------------------------------------------------------------
+
+/// Test-local wall-clock budget for the mount-loop activation VM.
+///
+/// Decision (bitty#1744): widen, do not retry or exempt — the #1727
+/// treatment. The mount loop runs 65 `bitty.ui.mount` calls through
+/// `PluginRuntime::activate`, which enforces the per-chunk RC-1 wall budget
+/// via `execute_bounded`. Production keeps `RC1_WALL_CLOCK_BUDGET_MS`
+/// (50ms); the test previously used that default and suspended at 63ms
+/// (`WallClockExceeded`) under sharded CI load (QG2 shard 2/2 during #1741
+/// CI). Wall time is load-sensitive, not correctness-sensitive. A fixed 10x
+/// headroom (500ms, wall only; instruction/memory stay at RC defaults) keeps
+/// the chunk bounded while absorbing scheduler stalls. Budget enforcement
+/// itself stays pinned by `bitty-lua/tests/measurement_lua.rs` and
+/// `load_gate.rs`, which keep the 50ms production assertions. The block
+/// budget under test (`UI_MAX_BLOCKS`) is unchanged.
+const MOUNT_LOOP_WALL_BUDGET_MS: u64 = 10 * RC1_WALL_CLOCK_BUDGET_MS;
 
 #[derive(Default)]
 struct MapSettings(BTreeMap<String, LuaValue>);
@@ -56,6 +77,14 @@ fn temp_dir(tag: &str) -> PathBuf {
 }
 
 fn runtime(roots: Vec<PathBuf>, data_dir: PathBuf) -> PluginRuntime {
+    runtime_with_wall_budget(roots, data_dir, None)
+}
+
+fn runtime_with_wall_budget(
+    roots: Vec<PathBuf>,
+    data_dir: PathBuf,
+    wall_budget_ms: Option<u64>,
+) -> PluginRuntime {
     let mut rt = PluginRuntime::new(PluginRuntimeConfig {
         safe_mode: false,
         data_dir: Some(data_dir),
@@ -68,6 +97,10 @@ fn runtime(roots: Vec<PathBuf>, data_dir: PathBuf) -> PluginRuntime {
             ("zones", LuaValue::array(vec![])),
         ]))),
     });
+    // Load headroom only: instruction and memory stay at RC defaults so the
+    // test still proves policy under production-adjacent budgets. Wall is the
+    // sole load-sensitive dimension (bitty#1744, same as bitty#1727).
+    rt.set_vm_wall_budget_ms(wall_budget_ms);
     // W-146: disk-backed stores commit through an injected backend.
     common::install_stub_backend(&mut rt);
     rt
@@ -195,10 +228,59 @@ impl Fixture {
         events: &[&str],
         init_src: &str,
     ) -> Self {
+        Self::activate_with_commands_and_events_and_wall(
+            tag,
+            id,
+            capabilities,
+            claims,
+            commands,
+            events,
+            None,
+            init_src,
+        )
+    }
+
+    /// Activate with an explicit wall-clock override (bitty#1744).
+    ///
+    /// `Some(ms)` widens only the wall dimension; instruction/memory stay at
+    /// RC defaults. Only the load-sensitive mount-loop test uses this; every
+    /// other fixture keeps `None` (production 50ms).
+    fn activate_with_wall_budget(
+        tag: &str,
+        id: &str,
+        capabilities: &[&str],
+        claims: &[&str],
+        wall_budget_ms: u64,
+        init_src: &str,
+    ) -> Self {
+        Self::activate_with_commands_and_events_and_wall(
+            tag,
+            id,
+            capabilities,
+            claims,
+            &[],
+            &[],
+            Some(wall_budget_ms),
+            init_src,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn activate_with_commands_and_events_and_wall(
+        tag: &str,
+        id: &str,
+        capabilities: &[&str],
+        claims: &[&str],
+        commands: &[&str],
+        events: &[&str],
+        wall_budget_ms: Option<u64>,
+        init_src: &str,
+    ) -> Self {
         let root = temp_dir(&format!("{tag}-root"));
         let data = temp_dir(&format!("{tag}-data"));
         write_plugin_with_events(&root, id, capabilities, claims, commands, events, init_src);
-        let mut runtime = runtime(vec![root.clone()], data.clone());
+        let mut runtime =
+            runtime_with_wall_budget(vec![root.clone()], data.clone(), wall_budget_ms);
         runtime.discover();
         let id = plugin_id(id);
         let report = runtime.activate(&id).expect("activate");
@@ -494,11 +576,12 @@ fn lua_band_slot_mounts_land_in_the_expected_band() {
 
 #[test]
 fn mount_loop_hits_block_budget_fail_closed() {
-    let fixture = Fixture::activate(
+    let fixture = Fixture::activate_with_wall_budget(
         "budget",
         "bitty-featured.uibudget",
         &["ui.rich"],
         &[],
+        MOUNT_LOOP_WALL_BUDGET_MS,
         r#"
         local mounted = 0
         local last_code = "NONE"
@@ -871,12 +954,23 @@ fn overlay_capture_is_single_owner_and_release_is_idempotent() {
             local a2_ok, a2_err = pcall(bitty.ui.overlay.acquire, h)
             local r1 = bitty.ui.overlay.release(h)
             local r2 = bitty.ui.overlay.release(h)
-            local a3_ok = pcall(bitty.ui.overlay.acquire, h)
+            local a3_ok, a3_err = pcall(bitty.ui.overlay.acquire, h)
             bitty.store.set(key .. "_a", a_ok)
+            -- Diagnostics for load-flake triage (bitty#1746): the first and
+            -- third acquires must succeed; when they do not, the stored code
+            -- distinguishes a real single-owner regression
+            -- (`E_UI_ALREADY_CAPTURED`, `E_UI_NOT_OWNER`) from a scheduler
+            -- stall (`E_TIMEOUT`) without widening any budget. The PR's
+            -- `set_vm_wall_budget_ms` only widens the mount-loop activation
+            -- (500ms wall); this probe keeps the production 50ms default, and
+            -- a wall suspension would surface as dispatch `Err`, never as
+            -- `false`, so `false` always carries a bridge code here.
+            bitty.store.set(key .. "_a_err", a_ok and "NONE" or a_err.code)
             bitty.store.set(key .. "_a2", a2_ok and "NONE" or a2_err.code)
             bitty.store.set(key .. "_r1", r1)
             bitty.store.set(key .. "_r2", r2)
             bitty.store.set(key .. "_a3", a3_ok)
+            bitty.store.set(key .. "_a3_err", a3_ok and "NONE" or a3_err.code)
             return a_ok
           end,
         })
@@ -932,16 +1026,23 @@ fn overlay_capture_is_single_owner_and_release_is_idempotent() {
 
     // Through Lua: acquire, release twice, acquire again (single generation
     // release/acquire round trip; the cross-owner conflict is proven above).
+    // Load-flake triage (bitty#1746): a wall suspension would be dispatch
+    // `Err`, never `false`; `false` carries `x_a_err` (no budget widened,
+    // production 50ms kept, PR's mount-loop 500ms untouched).
+    let dispatched = fixture
+        .runtime
+        .dispatch_command(&fixture.id, "probe", &[LuaValue::String("x".to_string())])
+        .expect("dispatch");
+    let first_err = store_value(&fixture.runtime, &fixture.id, "x_a_err");
     assert_eq!(
-        fixture
-            .runtime
-            .dispatch_command(&fixture.id, "probe", &[LuaValue::String("x".to_string())])
-            .expect("dispatch"),
-        LuaValue::Bool(true)
+        dispatched,
+        LuaValue::Bool(true),
+        "probe first acquire must succeed, x_a_err={first_err:?}"
     );
     assert_eq!(
         store_value(&fixture.runtime, &fixture.id, "x_a"),
-        Some(LuaValue::Bool(true))
+        Some(LuaValue::Bool(true)),
+        "x_a_err={first_err:?}"
     );
     // The second acquire from the same generation fails typed with
     // `E_UI_ALREADY_CAPTURED` (single generation owns at most one capture);
@@ -961,7 +1062,9 @@ fn overlay_capture_is_single_owner_and_release_is_idempotent() {
     );
     assert_eq!(
         store_value(&fixture.runtime, &fixture.id, "x_a3"),
-        Some(LuaValue::Bool(true))
+        Some(LuaValue::Bool(true)),
+        "x_a3_err={:?}",
+        store_value(&fixture.runtime, &fixture.id, "x_a3_err")
     );
 
     // No-hot-path guarantee: pushing captured input never runs a plugin

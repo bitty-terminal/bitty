@@ -410,6 +410,12 @@ impl Runtime {
         // onto the fresh grid (same stale-pixel class the close path fixes).
         // Stored images survive inertly under the store caps.
         self.kitty_images.clear_origin(Some(view.0));
+        // Issue #1762: a respawn reuses the same `ViewId`, so drop its
+        // pointer-shape stack with the old session. Without this the fresh
+        // shell inherits the dead session's cursor (e.g. stuck `wait`) until
+        // it emits its own `OSC 22` (same staleness class as the
+        // `kitty_images` cleanup above and the close-path removal).
+        self.pointer_stacks.remove(&view);
         // CTX-0393: a restored session hydrates the fresh grid with the
         // captured scrollback (immutable history; the shell itself is new).
         // No-op without a pending restore for this leaf.

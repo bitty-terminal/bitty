@@ -193,4 +193,25 @@ mod panes {
             "RIS on one pane must not clear the other"
         );
     }
+
+    #[test]
+    fn respawn_clears_stale_shape() {
+        bitty_test_support::require_pty!();
+        let mut rt = split_runtime();
+        rt.handle_pane_bytes(PANE, b"\x1b]22;wait\x07");
+        assert_eq!(rt.cursor_icon_for(PANE), CursorIcon::Wait);
+
+        let frame = rt
+            .present_frames()
+            .into_iter()
+            .find(|frame| frame.view == PANE)
+            .expect("pane is presented");
+        rt.spawn_shell_for_view(PANE, "/bin/sh", &["-c", "sleep 30"], frame.cols, frame.rows)
+            .expect("respawn pane shell");
+        assert_eq!(
+            rt.cursor_icon_for(PANE),
+            CursorIcon::Default,
+            "respawned shell must not inherit the dead session's cursor"
+        );
+    }
 }

@@ -954,12 +954,23 @@ fn overlay_capture_is_single_owner_and_release_is_idempotent() {
             local a2_ok, a2_err = pcall(bitty.ui.overlay.acquire, h)
             local r1 = bitty.ui.overlay.release(h)
             local r2 = bitty.ui.overlay.release(h)
-            local a3_ok = pcall(bitty.ui.overlay.acquire, h)
+            local a3_ok, a3_err = pcall(bitty.ui.overlay.acquire, h)
             bitty.store.set(key .. "_a", a_ok)
+            -- Diagnostics for load-flake triage (bitty#1746): the first and
+            -- third acquires must succeed; when they do not, the stored code
+            -- distinguishes a real single-owner regression
+            -- (`E_UI_ALREADY_CAPTURED`, `E_UI_NOT_OWNER`) from a scheduler
+            -- stall (`E_TIMEOUT`) without widening any budget. The PR's
+            -- `set_vm_wall_budget_ms` only widens the mount-loop activation
+            -- (500ms wall); this probe keeps the production 50ms default, and
+            -- a wall suspension would surface as dispatch `Err`, never as
+            -- `false`, so `false` always carries a bridge code here.
+            bitty.store.set(key .. "_a_err", a_ok and "NONE" or a_err.code)
             bitty.store.set(key .. "_a2", a2_ok and "NONE" or a2_err.code)
             bitty.store.set(key .. "_r1", r1)
             bitty.store.set(key .. "_r2", r2)
             bitty.store.set(key .. "_a3", a3_ok)
+            bitty.store.set(key .. "_a3_err", a3_ok and "NONE" or a3_err.code)
             return a_ok
           end,
         })
@@ -1015,16 +1026,23 @@ fn overlay_capture_is_single_owner_and_release_is_idempotent() {
 
     // Through Lua: acquire, release twice, acquire again (single generation
     // release/acquire round trip; the cross-owner conflict is proven above).
+    // Load-flake triage (bitty#1746): a wall suspension would be dispatch
+    // `Err`, never `false`; `false` carries `x_a_err` (no budget widened,
+    // production 50ms kept, PR's mount-loop 500ms untouched).
+    let dispatched = fixture
+        .runtime
+        .dispatch_command(&fixture.id, "probe", &[LuaValue::String("x".to_string())])
+        .expect("dispatch");
+    let first_err = store_value(&fixture.runtime, &fixture.id, "x_a_err");
     assert_eq!(
-        fixture
-            .runtime
-            .dispatch_command(&fixture.id, "probe", &[LuaValue::String("x".to_string())])
-            .expect("dispatch"),
-        LuaValue::Bool(true)
+        dispatched,
+        LuaValue::Bool(true),
+        "probe first acquire must succeed, x_a_err={first_err:?}"
     );
     assert_eq!(
         store_value(&fixture.runtime, &fixture.id, "x_a"),
-        Some(LuaValue::Bool(true))
+        Some(LuaValue::Bool(true)),
+        "x_a_err={first_err:?}"
     );
     // The second acquire from the same generation fails typed with
     // `E_UI_ALREADY_CAPTURED` (single generation owns at most one capture);
@@ -1044,7 +1062,9 @@ fn overlay_capture_is_single_owner_and_release_is_idempotent() {
     );
     assert_eq!(
         store_value(&fixture.runtime, &fixture.id, "x_a3"),
-        Some(LuaValue::Bool(true))
+        Some(LuaValue::Bool(true)),
+        "x_a3_err={:?}",
+        store_value(&fixture.runtime, &fixture.id, "x_a3_err")
     );
 
     // No-hot-path guarantee: pushing captured input never runs a plugin

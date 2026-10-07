@@ -3028,14 +3028,24 @@ mod tests {
 
     #[test]
     fn env_key_shape_rejected_before_grants() {
+        // ADR 0006 normative (bitty#1751): mixed-case and over-64-byte keys
+        // are rejected with the contract denial before any grant check.
         let services = env_services(&["HOME"], &[("HOME", "x")]);
-        for key in ["", "has space", "9LIVES", "lower-ok?"] {
+        for key in [
+            "",
+            "has space",
+            "9LIVES",
+            "lower-ok?",
+            "home",
+            "Home",
+            "_x1",
+        ] {
             let error = HostServices::env_get(&services, key).expect_err("shape must deny");
-            assert_eq!(error.code, "E_DEF_INVALID", "key '{key}'");
+            assert_eq!(error.code, "E_ENV_KEY_INVALID", "key '{key}'");
         }
         let long = "A".repeat(ENV_KEY_MAX_BYTES + 1);
         let error = HostServices::env_has(&services, &long).expect_err("over-bound must deny");
-        assert_eq!(error.code, "E_DEF_LIMIT");
+        assert_eq!(error.code, "E_ENV_KEY_INVALID");
     }
 
     #[test]

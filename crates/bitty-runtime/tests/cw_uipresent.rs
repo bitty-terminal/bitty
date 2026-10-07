@@ -394,9 +394,11 @@ fn cw1395_link_open_needs_a_matching_gesture() {
         "PTY output alone mints no gesture"
     );
     // Mint a gesture by clicking the link, then open with it.
-    // CTX-0838 note: after lone-workspace bar hiding, the click lands on
+    // Issue #1759 (R-005): the mint requires Ctrl/Cmd held during the
+    // click. CTX-0838 note: after lone-workspace bar hiding, the click lands on
     // the first frame's link cell derived from public geometry (headless
     // cell metrics + present frame origin), never raw (1,1) padding.
+    use bitty_platform::ModifiersState;
     use bitty_runtime::{LayoutNode, View, ViewId};
     rt.set_layout(LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)));
     rt.workspace_new().expect("second workspace for the bar");
@@ -413,6 +415,12 @@ fn cw1395_link_open_needs_a_matching_gesture() {
         window_id: bitty_platform::WindowId::from_raw_public(1),
         kind,
     };
+    rt.handle_platform_event(window(WindowEventKind::ModifiersChanged(ModifiersState {
+        shift: false,
+        control: true,
+        alt: false,
+        super_pressed: false,
+    })));
     rt.handle_platform_event(window(WindowEventKind::CursorMoved(link_pos)));
     rt.handle_platform_event(window(WindowEventKind::MouseInput(
         bitty_platform::MouseEvent::new(MouseButton::Left, PressState::Released),

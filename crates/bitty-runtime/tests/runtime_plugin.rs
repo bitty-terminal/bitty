@@ -4,7 +4,9 @@
 //! the CTX-0232 pure-move split. Adaptations are wiring only:
 //! `super::*` became explicit imports and the private `layout` field
 //! reads became the public `layout()` getter (identical semantics).
-use bitty_platform::{CursorPosition, MouseButton, PlatformEvent, PressState, WindowEventKind};
+use bitty_platform::{
+    CursorPosition, ModifiersState, MouseButton, PlatformEvent, PressState, WindowEventKind,
+};
 use bitty_plugin_host::GrantRecord;
 use bitty_plugin_host::{
     CapabilityId, Event as HostEvent, EventKind as HostEventKind, EventPayload as HostPayload,
@@ -77,9 +79,11 @@ fn link_cell(rt: &Runtime) -> CursorPosition {
 fn foreign_gesture() -> ActivationGesture {
     // Mint a real gesture on a scratch runtime; used as a forgery
     // against the runtime under test (see CTX-0232 wiring note).
+    // Issue #1759 (R-005): the mint requires the Ctrl/Cmd modifier held.
     let mut scratch = make_runtime();
     scratch.handle_pty_bytes(b"\x1b]8;;https://example.test\x07link\x1b]8;;\x07");
     let window_id = bitty_platform::WindowId::from_raw_public(1);
+    hold_ctrl(&mut scratch, window_id);
     let pos = link_cell(&scratch);
     scratch.handle_platform_event(PlatformEvent::Window {
         window_id,
@@ -95,6 +99,20 @@ fn foreign_gesture() -> ActivationGesture {
     scratch
         .take_activation_gesture()
         .expect("scratch runtime must mint gesture")
+}
+
+fn hold_ctrl(rt: &mut Runtime, window_id: bitty_platform::WindowId) {
+    // Issue #1759 (R-005): OSC 8 activation requires Ctrl (Cmd on macOS)
+    // held during the click; without it no gesture mints.
+    rt.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::ModifiersChanged(ModifiersState {
+            shift: false,
+            control: true,
+            alt: false,
+            super_pressed: false,
+        }),
+    });
 }
 
 #[test]
@@ -365,6 +383,7 @@ fn platform_hyperlink_activation_mints_single_use_gesture() {
     let mut rt = make_runtime();
     rt.handle_pty_bytes(b"\x1b]8;;https://example.test\x07link\x1b]8;;\x07");
     let window_id = bitty_platform::WindowId::from_raw_public(1);
+    hold_ctrl(&mut rt, window_id);
     let pos = link_cell(&rt);
     rt.handle_platform_event(PlatformEvent::Window {
         window_id,
@@ -441,6 +460,7 @@ fn hostile_hyperlink_does_not_consume_gesture_slot() {
     // Hostile URI should not mint a gesture.
     rt.handle_pty_bytes(b"\x1b]8;;javascript:alert(1)\x07link\x1b]8;;\x07");
     let window_id = bitty_platform::WindowId::from_raw_public(1);
+    hold_ctrl(&mut rt, window_id);
     let pos = link_cell(&rt);
     rt.handle_platform_event(PlatformEvent::Window {
         window_id,
@@ -460,6 +480,7 @@ fn hostile_hyperlink_does_not_consume_gesture_slot() {
     // Safe hyperlink after hostile must still mint.
     let mut rt2 = make_runtime();
     rt2.handle_pty_bytes(b"\x1b]8;;https://example.test\x07link\x1b]8;;\x07");
+    hold_ctrl(&mut rt2, window_id);
     let pos2 = link_cell(&rt2);
     rt2.handle_platform_event(PlatformEvent::Window {
         window_id,
@@ -484,6 +505,7 @@ fn hostile_then_safe_in_same_runtime_preserves_gesture_for_safe() {
     let window_id = bitty_platform::WindowId::from_raw_public(2);
     // First, hostile.
     rt.handle_pty_bytes(b"\x1b]8;;javascript:alert(1)\x07x\x1b]8;;\x07");
+    hold_ctrl(&mut rt, window_id);
     let pos = link_cell(&rt);
     rt.handle_platform_event(PlatformEvent::Window {
         window_id,
@@ -498,6 +520,7 @@ fn hostile_then_safe_in_same_runtime_preserves_gesture_for_safe() {
     });
     assert!(rt.take_activation_gesture().is_none());
     // Then safe link overwriting same cell (carriage return to col 0).
+    // The Ctrl latch from above persists, so the safe click mints.
     rt.handle_pty_bytes(b"\r\x1b]8;;https://example.test\x07y\x1b]8;;\x07");
     let pos = link_cell(&rt);
     rt.handle_platform_event(PlatformEvent::Window {

@@ -898,6 +898,13 @@ pub struct Runtime {
     /// Count of hyperlink activations refused by the gate (no gesture, stale
     /// gesture, veto, or a URI outside the scheme allowlist).
     url_activation_refusals: u64,
+    /// OSC 8 hyperlink span under the pointer (issue #1759, R-005).
+    ///
+    /// Presentation-only hover state: refreshed on cursor motion, cleared
+    /// when the pointer leaves the window or the link goes stale, and read
+    /// by the cursor shape, the underline highlight, and the sanitized URL
+    /// preview. `None` when the pointer is not over a safe hyperlink.
+    hovered_hyperlink: Option<layout_focus::HoveredHyperlink>,
     /// User-visible bell behavior (CTX-0577, `OQ-076` policy input).
     ///
     /// Defaults to [`bell::BellMode::Visual`]: `BEL` paints a bounded,
@@ -1458,6 +1465,7 @@ impl Runtime {
             ),
             pending_activation_gesture: None,
             pending_activation_uri: None,
+            hovered_hyperlink: None,
             next_activation_gesture: 1,
             url_opener: Box::new(plugin::SystemUrlOpener),
             url_activations: 0,
@@ -1691,6 +1699,7 @@ impl Runtime {
             ),
             pending_activation_gesture: None,
             pending_activation_uri: None,
+            hovered_hyperlink: None,
             next_activation_gesture: 1,
             url_opener: Box::new(plugin::SystemUrlOpener),
             url_activations: 0,

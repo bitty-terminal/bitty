@@ -25,7 +25,8 @@
 #![forbid(unsafe_code)]
 
 use bitty_platform::{
-    CursorPosition, MouseButton, MouseEvent, PlatformEvent, PressState, WindowEventKind, WindowId,
+    CursorPosition, ModifiersState, MouseButton, MouseEvent, PlatformEvent, PressState,
+    WindowEventKind, WindowId,
 };
 use bitty_runtime::{
     Decoration, LayoutNode, Runtime, RuntimeConfig, ScrollbarMode, SplitAxis, View, ViewId,
@@ -441,10 +442,20 @@ fn release_over_thumb_never_activates_hyperlinks() {
     );
 
     // Validity: the same coordinates with hidden chrome DO activate.
+    // Issue #1759 (R-005): activation requires Ctrl/Cmd held for the click.
     let mut plain = runtime_with(ScrollbarMode::Hidden);
     feed_scrollback(&mut plain);
     plain.handle_pty_bytes(link.as_bytes());
     plain.tick().expect("presents");
+    plain.handle_platform_event(PlatformEvent::Window {
+        window_id: window(),
+        kind: WindowEventKind::ModifiersChanged(ModifiersState {
+            shift: false,
+            control: true,
+            alt: false,
+            super_pressed: false,
+        }),
+    });
     move_to(&mut plain, click.x, click.y);
     press(&mut plain);
     release(&mut plain);

@@ -152,6 +152,11 @@ impl Runtime {
         // Clear pending input on new shell: fresh session, no stale keystrokes.
         self.pending_input.clear();
         self.pending_input_dropped = 0;
+        // CTX-1011 (#1775): a primary (re)spawn retires the previous primary
+        // session, so its buffered Kitty `OSC 99` groups die with it. A later
+        // primary session can never complete stale primary text.
+        self.kitty_assembler
+            .discard_stream(super::bell::KittyStreamId::Primary);
         // CTX-0393: hydrate captured scrollback into the primary grid when
         // this spawn fulfils a restored session (no-op otherwise).
         if let Some(owner) = self.primary_view {
@@ -416,6 +421,12 @@ impl Runtime {
         // it emits its own `OSC 22` (same staleness class as the
         // `kitty_images` cleanup above and the close-path removal).
         self.pointer_stacks.remove(&view);
+        // CTX-1011 (#1775): a (re)spawn retires the previous session on this
+        // leaf, so its buffered Kitty `OSC 99` groups die with it. The fresh
+        // session reusing the same `ViewId` starts empty (session epoch
+        // advances) and can never complete stale text.
+        self.kitty_assembler
+            .discard_stream(super::bell::KittyStreamId::Pane(view.0));
         // CTX-0393: a restored session hydrates the fresh grid with the
         // captured scrollback (immutable history; the shell itself is new).
         // No-op without a pending restore for this leaf.
@@ -631,6 +642,11 @@ impl Runtime {
         // starts from the default pointer, and the focused icon falls back
         // to the new focus (or default) on the next tick sync.
         self.pointer_stacks.remove(view);
+        // CTX-1011 (#1775): the closed session's buffered Kitty `OSC 99`
+        // groups die with it, so a later leaf reusing the numeric id can
+        // never complete stale notification text.
+        self.kitty_assembler
+            .discard_stream(super::bell::KittyStreamId::Pane(view.0));
         // CTX-0532: the focused pane's session may have just vanished (or a
         // hidden one closed); re-attribute the mode caches. The reader paths
         // consult `focused_modes` directly and fall back to the primary

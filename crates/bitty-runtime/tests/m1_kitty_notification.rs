@@ -1,10 +1,14 @@
 //! CTX-1008 (issue #1763) Kitty `OSC 99` notifications plus RC-8 flood cover.
+//! CTX-1011 (issue #1775) session-binds assembly: cross-stream `i=`
+//! collisions stay isolated, pane close/replacement drops stale groups, and
+//! consent revocation invalidates buffered groups.
 //!
 //! Headless and deterministic; `cargo test` on CI without a display server.
 //! These tests pin the Core side of #1763: Kitty title/body parsing into
 //! `{title, body}`, chunked `i=`/`d=` reassembly, default-deny consent, the
 //! RC-8 rate ceiling on rapid output (fail-closed, bounded), and the bridge
-//! defensive-cap wiring (no shell anywhere in the path).
+//! defensive-cap wiring (no shell anywhere in the path). Pane-stream tests
+//! spawn real PTY shells and are Unix-only; the rest run everywhere.
 
 #![forbid(unsafe_code)]
 
@@ -147,4 +151,107 @@ fn kitty_denied_chunks_never_buffer_partials() {
     }
     assert_eq!(rt.kitty_partials_pending(), 0);
     assert_eq!(rt.notifications_denied(), 4);
+}
+
+#[test]
+fn kitty_consent_revocation_discards_buffered() {
+    // CTX-1011: revoking consent invalidates already-buffered groups;
+    // re-enabling starts empty so a later chunk can never complete
+    // pre-revocation text.
+    let mut rt = runtime();
+    rt.set_osc_notification_allowed(true);
+    rt.handle_pty_bytes(b"\x1b]99;i=7:d=0;BUFFERED-\x07");
+    assert_eq!(rt.kitty_partials_pending(), 1);
+    rt.set_osc_notification_allowed(false);
+    assert_eq!(rt.kitty_partials_pending(), 0);
+    assert_eq!(rt.kitty_partials_discarded(), 1);
+    rt.set_osc_notification_allowed(true);
+    rt.handle_pty_bytes(b"\x1b]99;i=7;FRESH\x07");
+    assert_eq!(rt.notification_banner().as_deref(), Some("FRESH"));
+    assert_eq!(rt.kitty_partials_pending(), 0);
+}
+
+#[cfg(unix)]
+fn two_pane_runtime() -> Runtime {
+    use bitty_runtime::{LayoutNode, SplitAxis, View, ViewId};
+    let mut rt = runtime();
+    rt.set_layout(LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.5,
+        LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+        LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+    ));
+    rt
+}
+
+#[cfg(unix)]
+#[test]
+fn kitty_cross_stream_same_id_stays_isolated() {
+    // CTX-1011: a pending `d=0` group from the primary and a `d=1` chunk
+    // with the same `i=` from a pane must not combine. The pane completion
+    // emits from its own payload alone; the primary group survives.
+    use bitty_runtime::ViewId;
+    let pane = ViewId::new(2);
+    let mut rt = two_pane_runtime();
+    rt.spawn_shell_for_view(pane, "/bin/sh", &["-c", "sleep 30"], 40, 12)
+        .expect("pane shell must spawn");
+    rt.set_osc_notification_allowed(true);
+    rt.handle_pty_bytes(b"\x1b]99;i=7:d=0;PRIMARY-\x07");
+    assert_eq!(rt.kitty_partials_pending(), 1);
+    rt.handle_pane_bytes(pane, b"\x1b]99;i=7:p=body;PANE\x07");
+    assert_eq!(rt.notification_banner().as_deref(), Some("PANE"));
+    assert_eq!(
+        rt.kitty_partials_pending(),
+        1,
+        "primary group must survive the cross-stream completion"
+    );
+    // The primary group still completes from its own later chunk.
+    rt.handle_pty_bytes(b"\x1b]99;i=7:p=body;PRIMARY-END\x07");
+    assert_eq!(rt.kitty_partials_pending(), 0);
+    assert!(rt.close_pane_session(&pane));
+}
+
+#[cfg(unix)]
+#[test]
+fn kitty_empty_id_cross_stream_stays_isolated() {
+    // The empty default `i=` is the most collision-prone key: primary and
+    // pane groups with no `i=` must also stay isolated.
+    use bitty_runtime::ViewId;
+    let pane = ViewId::new(2);
+    let mut rt = two_pane_runtime();
+    rt.spawn_shell_for_view(pane, "/bin/sh", &["-c", "sleep 30"], 40, 12)
+        .expect("pane shell must spawn");
+    rt.set_osc_notification_allowed(true);
+    rt.handle_pty_bytes(b"\x1b]99;d=0;PRIMARY-\x07");
+    assert_eq!(rt.kitty_partials_pending(), 1);
+    rt.handle_pane_bytes(pane, b"\x1b]99;p=body;PANE\x07");
+    assert_eq!(rt.notification_banner().as_deref(), Some("PANE"));
+    assert_eq!(rt.kitty_partials_pending(), 1);
+    assert!(rt.close_pane_session(&pane));
+}
+
+#[cfg(unix)]
+#[test]
+fn kitty_stale_after_pane_replace_is_rejected() {
+    // CTX-1011: pane close/replacement drops that session's pending groups;
+    // a later session reusing the same `ViewId` cannot complete stale
+    // content.
+    use bitty_runtime::ViewId;
+    let pane = ViewId::new(2);
+    let mut rt = two_pane_runtime();
+    rt.spawn_shell_for_view(pane, "/bin/sh", &["-c", "sleep 30"], 40, 12)
+        .expect("pane shell must spawn");
+    rt.set_osc_notification_allowed(true);
+    rt.handle_pane_bytes(pane, b"\x1b]99;i=7:d=0;STALE-\x07");
+    assert_eq!(rt.kitty_partials_pending(), 1);
+    assert!(rt.close_pane_session(&pane));
+    assert_eq!(rt.kitty_partials_pending(), 0);
+    assert_eq!(rt.kitty_partials_discarded(), 1);
+    // A replaced session on the same leaf starts empty.
+    rt.spawn_shell_for_view(pane, "/bin/sh", &["-c", "sleep 30"], 40, 12)
+        .expect("replacement pane shell must spawn");
+    rt.handle_pane_bytes(pane, b"\x1b]99;i=7;FRESH\x07");
+    assert_eq!(rt.notification_banner().as_deref(), Some("FRESH"));
+    assert_eq!(rt.kitty_partials_pending(), 0);
+    assert!(rt.close_pane_session(&pane));
 }

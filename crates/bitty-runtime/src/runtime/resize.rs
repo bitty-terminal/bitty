@@ -592,10 +592,11 @@ impl Runtime {
                     self.handle_mouse_input(mouse);
                     if mouse.button == MouseButton::Left && mouse.state == PressState::Released {
                         // CTX-1006 review: press/release pairing. Take (clear)
-                        // the stored press URI on every left release so a
+                        // both stored press URIs on every left release so a
                         // release alone can never arm a link; the mint below
                         // requires an exact press/release URI match.
-                        let press_uri = self.hyperlink_press_uri.take();
+                        let hyperlink_press = self.hyperlink_press_uri.take();
+                        let plaintext_press = self.plaintext_press_uri.take();
                         if let Some(pos) = self.last_cursor {
                             // CTX-0181: a release over the painted scrollbar
                             // ends a scroll gesture — it must not activate a
@@ -603,32 +604,27 @@ impl Runtime {
                             if self.scrollbar_hit_at(pos) {
                                 return false;
                             }
-                            // Issue #1759 (R-005): standardized activation —
-                            // only Ctrl+Left (Cmd+Left on macOS, via the
-                            // Super latch) over a safe OSC 8 link mints the
-                            // single-use gesture. A plain release keeps its
-                            // selection/capture meaning and never arms a
-                            // link, so ordinary clicks cannot open URLs.
-                            // CTX-0804 (#1477): resolve the link in the grid of
-                            // the View under the pointer (same target rule as a
-                            // selection press), never the primary grid at a
-                            // primary-global cell: in a split that armed a URL
-                            // from another pane than the one clicked.
+                            // Issues #1759/#1760: Ctrl-gated mint with pairing
+                            // for both OSC 8 and plaintext (OSC 8 wins where
+                            // both claim a cell). CTX-0804: resolve in the
+                            // View under the pointer, never the primary grid.
+                            // A plain release keeps selection meaning.
                             if !self.hyperlink_activation_modifier_held() {
                                 return false;
                             }
-                            let Some(uri) = self.safe_hyperlink_uri_at(pos) else {
+                            let uri = if let Some(uri) = self.safe_hyperlink_uri_at(pos) {
+                                if hyperlink_press.as_ref() != Some(&uri) {
+                                    return false;
+                                }
+                                uri
+                            } else if let Some(uri) = self.safe_plaintext_url_at(pos) {
+                                if plaintext_press.as_ref() != Some(&uri) {
+                                    return false;
+                                }
+                                uri
+                            } else {
                                 return false;
                             };
-                            // Pairing: a press on a divider (or plain text,
-                            // or another link) must never mint the link
-                            // under the release. Only an exact press/release
-                            // URI match arms the gesture; otherwise the
-                            // release already ran the normal drag-teardown
-                            // and selection paths in `handle_mouse_input`.
-                            if press_uri.as_ref() != Some(&uri) {
-                                return false;
-                            }
                             let token = ActivationGesture(self.next_activation_gesture);
                             self.next_activation_gesture =
                                 self.next_activation_gesture.wrapping_add(1).max(1);
@@ -667,10 +663,10 @@ impl Runtime {
                     // CTX-0334: leaving the window also drops a pending
                     // hover dwell so a re-entry starts a fresh clock.
                     self.clear_hover_pending();
-                    // Issue #1759 (R-005): leaving the window also drops
-                    // the hyperlink hover so no stale underline, preview,
-                    // or pointer shape survives re-entry.
+                    // Issues #1759/#1760: leaving drops both hovers so
+                    // no stale underline, preview, or pointer survives.
                     self.clear_hyperlink_hover();
+                    self.clear_plaintext_hover();
                     if self.scrollbar_visible {
                         self.pending_full_redraw = true;
                     }
@@ -700,6 +696,12 @@ impl Runtime {
                         self.alt_pressed,
                     );
                     self.publish_inspect_snapshot();
+                    // Issues #1759/#1760: the plaintext hover is Ctrl-gated,
+                    // so a latch change can arm or disarm it under a
+                    // stationary pointer. Re-resolve both now; the per-tick
+                    // revalidate covers the quiet-window case.
+                    self.revalidate_hyperlink_hover();
+                    self.revalidate_plaintext_hover();
                     false
                 }
                 WindowEventKind::Ime(ime) => {

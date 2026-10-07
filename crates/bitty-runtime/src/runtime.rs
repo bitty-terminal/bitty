@@ -141,6 +141,7 @@ pub mod log_throttle;
 pub mod mouse_chrome;
 pub mod mouse_encode;
 pub mod panes;
+pub mod plaintext_url;
 pub mod plugin;
 pub mod pointer;
 pub mod present;
@@ -892,7 +893,22 @@ pub struct Runtime {
     /// after every left release (the mint site takes it) and on any
     /// non-link left press.
     hyperlink_press_uri: Option<String>,
+    /// Safe plaintext URI under the intercepted modified left press (issue
+    /// #1760, mirroring #1759 pairing): a modified left release mints only
+    /// when its safe URI matches this press URI. Cleared after every left
+    /// release (the mint site takes it) and on any non-link left press.
+    plaintext_press_uri: Option<String>,
     next_activation_gesture: u64,
+    /// Plaintext URL span under the pointer with `Ctrl` held (issue #1760).
+    ///
+    /// Presentation-only hover state, distinct from #1759's OSC 8
+    /// `hovered_hyperlink` (PR #1771) so the two paths coordinate without
+    /// duplicating logic. Refreshed on cursor motion, cleared when the
+    /// pointer leaves the window, the modifier is released, or the link
+    /// goes stale; read by the cursor shape and the underline highlight.
+    /// `None` when the pointer is not over a safe plaintext URL with the
+    /// gesture modifier held.
+    hovered_plaintext_url: Option<plaintext_url::HoveredPlaintextUrl>,
     /// OS hand-off for a runtime-authorized URL activation (CTX-0577).
     ///
     /// The click path never spawns a handler directly; it goes through this
@@ -912,6 +928,14 @@ pub struct Runtime {
     /// by the cursor shape, the underline highlight, and the sanitized URL
     /// preview. `None` when the pointer is not over a safe hyperlink.
     hovered_hyperlink: Option<layout_focus::HoveredHyperlink>,
+    /// Suppresses hyperlink hover affordances while a focusable overlay
+    /// capture holds (CTX-0943 + issues #1759/#1760).
+    ///
+    /// Set per tick by the app from `overlay_capture_active()`: while a modal
+    /// owns input, underlying URL underlines, previews, and `Pointer` shapes
+    /// stay hidden (the modal obscures the grid), and mint-adjacent hover
+    /// re-resolves clear instead of re-arming. `false` in normal operation.
+    hover_suppressed_by_overlay: bool,
     /// User-visible bell behavior (CTX-0577, `OQ-076` policy input).
     ///
     /// Defaults to [`bell::BellMode::Visual`]: `BEL` paints a bounded,
@@ -1474,6 +1498,9 @@ impl Runtime {
             pending_activation_uri: None,
             hyperlink_press_uri: None,
             hovered_hyperlink: None,
+            hovered_plaintext_url: None,
+            plaintext_press_uri: None,
+            hover_suppressed_by_overlay: false,
             next_activation_gesture: 1,
             url_opener: Box::new(plugin::SystemUrlOpener),
             url_activations: 0,
@@ -1709,6 +1736,9 @@ impl Runtime {
             pending_activation_uri: None,
             hyperlink_press_uri: None,
             hovered_hyperlink: None,
+            hovered_plaintext_url: None,
+            plaintext_press_uri: None,
+            hover_suppressed_by_overlay: false,
             next_activation_gesture: 1,
             url_opener: Box::new(plugin::SystemUrlOpener),
             url_activations: 0,

@@ -741,7 +741,7 @@ impl Runtime {
     ///
     /// CTX-0803: lets the selection press path hit-test and read the owner's
     /// frame geometry from one solver pass instead of two.
-    fn present_cell_in(
+    pub(super) fn present_cell_in(
         &self,
         frames: &[PresentFrame],
         pos: CursorPosition,
@@ -1063,7 +1063,11 @@ impl Runtime {
     /// underline highlight, and the URL preview track the pointer; steady
     /// hover over the same span costs nothing.
     pub(super) fn update_hyperlink_hover(&mut self, pos: CursorPosition) {
-        let next = self.hovered_hyperlink_at(pos);
+        let next = if self.hover_suppressed_by_overlay {
+            None
+        } else {
+            self.hovered_hyperlink_at(pos)
+        };
         if next != self.hovered_hyperlink {
             self.hovered_hyperlink = next;
             self.pending_full_redraw = true;
@@ -1090,6 +1094,10 @@ impl Runtime {
     /// change forces a full redraw; a stable hover costs one bounded hit
     /// test per tick.
     pub(super) fn revalidate_hyperlink_hover(&mut self) {
+        if self.hover_suppressed_by_overlay {
+            self.clear_hyperlink_hover();
+            return;
+        }
         match self.last_cursor {
             Some(pos) => self.update_hyperlink_hover(pos),
             None => self.clear_hyperlink_hover(),

@@ -1122,6 +1122,314 @@ fn osc8_padding_click_never_arms_a_live_link() {
     assert!(opened.lock().expect("poison-free").is_empty());
 }
 
+/// Grid cell for a plaintext URL starting at `col` on row 0 (issue #1760).
+fn plaintext_cell(rt: &Runtime, col: usize) -> bitty_platform::CursorPosition {
+    let frame = rt.present_frames()[0];
+    let (cw, ch) = rt.live_cell_size();
+    let pad = f64::from(rt.window_padding_physical());
+    bitty_platform::CursorPosition {
+        x: pad + f64::from(frame.content.x.max(0)) + (col as f64 + 0.5) * f64::from(cw),
+        y: pad + f64::from(frame.content.y.max(0)) + 0.5 * f64::from(ch),
+    }
+}
+
+fn hold_ctrl(app: &mut TerminalApp, window_id: bitty_platform::WindowId) {
+    app.runtime.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::ModifiersChanged(bitty_platform::ModifiersState {
+            shift: false,
+            control: true,
+            alt: false,
+            super_pressed: false,
+        }),
+    });
+}
+
+#[test]
+fn plaintext_click_path_reaches_the_live_url_consumer() {
+    // Issue #1760: the app's click path must consume the plaintext gesture
+    // through the same live consumer as OSC 8 (not parse-only).
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        Vec::new(),
+        SpawnSpec::default(),
+    );
+    let opened = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    app.runtime.set_url_opener(Box::new(RecordingUrlOpener {
+        opened: std::sync::Arc::clone(&opened),
+    }));
+
+    app.runtime
+        .handle_pty_bytes(b"see https://example.test here");
+    let window_id = bitty_platform::WindowId::from_raw_public(1);
+    hold_ctrl(&mut app, window_id);
+    let pos = plaintext_cell(&app.runtime, 5);
+    app.runtime.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::CursorMoved(pos),
+    });
+    app.runtime.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
+            bitty_platform::MouseButton::Left,
+            bitty_platform::PressState::Pressed,
+        )),
+    });
+    app.runtime.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
+            bitty_platform::MouseButton::Left,
+            bitty_platform::PressState::Released,
+        )),
+    });
+    assert!(app.runtime.has_pending_hyperlink_activation());
+    app.activate_pending_hyperlink_now();
+    assert_eq!(
+        opened.lock().expect("poison-free").as_slice(),
+        ["https://example.test"],
+    );
+    assert!(!app.runtime.has_pending_hyperlink_activation());
+}
+
+#[test]
+fn plaintext_hover_syncs_the_os_pointer_shape() {
+    // Issue #1760 unified with #1759/#1762: either hover (OSC 8 or
+    // Ctrl-gated plaintext) wins `Pointer`, else the focused pane's
+    // `OSC 22` shape, else `Default`. Change-gated through
+    // `apply_cursor_icon` + `OsCursorSink`.
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        Vec::new(),
+        SpawnSpec::default(),
+    );
+    let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    app.set_os_cursor_sink(Box::new(RecordingCursorSink {
+        icons: std::sync::Arc::clone(&recorded),
+    }));
+    assert_eq!(app.window.last_applied_cursor, None);
+    app.runtime
+        .handle_pty_bytes(b"see https://example.test here");
+    let window_id = bitty_platform::WindowId::from_raw_public(1);
+    hold_ctrl(&mut app, window_id);
+    let pos = plaintext_cell(&app.runtime, 5);
+    app.runtime.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::CursorMoved(pos),
+    });
+    app.sync_cursor_icon();
+    assert_eq!(
+        app.window.last_applied_cursor,
+        Some(bitty_platform::CursorIcon::Pointer),
+        "Ctrl+hover over the URL must request the pointer shape"
+    );
+    assert_eq!(
+        recorded.lock().expect("poison-free").as_slice(),
+        [bitty_platform::CursorIcon::Pointer],
+    );
+    app.sync_cursor_icon();
+    assert_eq!(
+        app.window.last_applied_cursor,
+        Some(bitty_platform::CursorIcon::Pointer)
+    );
+    assert_eq!(recorded.lock().expect("poison-free").len(), 1);
+    app.runtime.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::CursorMoved(bitty_platform::CursorPosition { x: 1.0, y: 1.0 }),
+    });
+    app.sync_cursor_icon();
+    assert_eq!(
+        app.window.last_applied_cursor,
+        Some(bitty_platform::CursorIcon::Default),
+        "leaving the URL must restore the default shape"
+    );
+}
+
+#[test]
+fn overlay_capture_suppresses_plaintext_url_gesture_and_hover() {
+    // CTX-0943 + issues #1759/#1760: while a focusable overlay capture
+    // holds, the modal owns all input — a Ctrl+click on a URL beneath it
+    // must never mint-and-open, hover affordances stay hidden, and the
+    // capture lifecycle is undisturbed (press-to-release ownership intact).
+    // Regression for PR #1774 Quality-gates(2) interaction: per-tick cursor
+    // sync, Ctrl-gated mint, and input consume paths must not perturb the
+    // overlay session.
+    use bitty_platform::{MouseButton, MouseEvent, PressState};
+    use bitty_runtime::plugin_runtime::{
+        BridgeError, EmptySettings, LuaValue, PluginRuntime, PluginRuntimeConfig, SnapshotSource,
+    };
+
+    struct StaticSnapshot;
+    impl SnapshotSource for StaticSnapshot {
+        fn snapshot(&self, _scope: &str) -> Result<LuaValue, BridgeError> {
+            Ok(LuaValue::table([
+                ("version", LuaValue::Integer(1)),
+                ("zones", LuaValue::array(vec![])),
+            ]))
+        }
+    }
+
+    let tag = format!("ctx1009-overlay-url-{}", std::process::id());
+    let root = std::env::temp_dir().join(format!("bitty-{tag}-root"));
+    let data = std::env::temp_dir().join(format!("bitty-{tag}-data"));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&data);
+    let id = "bitty-featured.ctx1009overlayurl";
+    let plugin_dir = root.join(id);
+    std::fs::create_dir_all(plugin_dir.join("lua")).expect("dirs");
+    std::fs::write(
+        plugin_dir.join("bitty-plugin.toml"),
+        format!(
+            r#"[plugin]
+id = "{id}"
+name = "CTX-1009 overlay-url guard"
+version = "0.1.0"
+description = "overlay suppresses URL test"
+
+[compat]
+plugin-api = "^1.0"
+
+[capabilities]
+ui.rich = true
+ui.overlay = true
+ui.overlay.focus = true
+"#
+        ),
+    )
+    .expect("manifest");
+    std::fs::write(
+        plugin_dir.join("lua/init.lua"),
+        r#"
+        local mount_ok, handle = pcall(bitty.ui.mount, "overlay", { kind = "Text", text = "overlay-modal" })
+        if mount_ok then
+          pcall(bitty.ui.overlay.acquire, handle)
+        end
+        return {}
+        "#,
+    )
+    .expect("init");
+
+    let mut plugin_runtime = PluginRuntime::new(PluginRuntimeConfig {
+        safe_mode: false,
+        data_dir: Some(data.clone()),
+        store_root: None,
+        bundled_roots: Vec::new(),
+        third_party_roots: vec![root.clone()],
+        settings: std::rc::Rc::new(EmptySettings),
+        snapshot: std::rc::Rc::new(StaticSnapshot),
+    });
+    plugin_runtime.set_store_backend(Some(std::sync::Arc::new(
+        crate::storage_backends::StorageKvBackend::new(),
+    )));
+    plugin_runtime.discover();
+    let pid = bitty_plugin_host::manifest::PluginId::new(id).expect("valid id");
+    plugin_runtime.activate(&pid).expect("activate");
+    assert!(
+        plugin_runtime.overlay_capture().borrow().is_active(),
+        "setup must hold the capture"
+    );
+
+    let maps =
+        bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        maps,
+        SpawnSpec::default(),
+    );
+    app = app.with_plugin_runtime(Some(plugin_runtime));
+    assert!(app.overlay_capture_active());
+
+    let opened = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    app.runtime.set_url_opener(Box::new(RecordingUrlOpener {
+        opened: std::sync::Arc::clone(&opened),
+    }));
+    let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    app.set_os_cursor_sink(Box::new(RecordingCursorSink {
+        icons: std::sync::Arc::clone(&recorded),
+    }));
+
+    // URL text under the pointer with Ctrl held.
+    app.runtime
+        .handle_pty_bytes(b"see https://example.test here");
+    let window_id = bitty_platform::WindowId::from_raw_public(1);
+    hold_ctrl(&mut app, window_id);
+    let pos = plaintext_cell(&app.runtime, 5);
+    app.runtime.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::CursorMoved(pos),
+    });
+    // Hover arms normally at Runtime level (Ctrl-gated hit test passes).
+    assert!(
+        app.runtime.hovered_plaintext_span().is_some(),
+        "Ctrl+hover must arm the plaintext span pre-tick"
+    );
+    // The app tick suppresses it while the overlay holds: no underline
+    // state survives, and the cursor never shows Pointer for grid URLs.
+    let _ = app.drive_tick();
+    assert!(
+        app.runtime.hovered_plaintext_span().is_none(),
+        "overlay capture must clear the plaintext hover on tick"
+    );
+    app.sync_cursor_icon();
+    assert_ne!(
+        app.window.last_applied_cursor,
+        Some(bitty_platform::CursorIcon::Pointer),
+        "overlay capture must not show a URL pointer"
+    );
+
+    // Ctrl+press+release over the URL mints at Runtime level (which does
+    // not know about the overlay), but the app drops it instead of opening.
+    app.runtime.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::MouseInput(MouseEvent::new(MouseButton::Left, PressState::Pressed)),
+    });
+    app.runtime.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::MouseInput(MouseEvent::new(MouseButton::Left, PressState::Released)),
+    });
+    assert!(
+        app.runtime.has_pending_hyperlink_activation(),
+        "Runtime mints unaware of the overlay; the app guards the open"
+    );
+    // App-level guard: drop, never open, while the capture holds.
+    assert!(app.overlay_capture_active());
+    if app.overlay_capture_active() {
+        let _ = app.runtime.drop_pending_hyperlink_activation();
+    } else {
+        app.activate_pending_hyperlink_now();
+    }
+    assert!(
+        !app.runtime.has_pending_hyperlink_activation(),
+        "pending URL gesture must not survive an overlay session"
+    );
+    assert!(
+        opened.lock().expect("poison-free").is_empty(),
+        "no URL may open while the overlay modal holds capture"
+    );
+    // The capture itself is undisturbed: still active with its deadline,
+    // and a release still routes (never queues) per the overlay contract.
+    assert!(app.overlay_capture_active());
+    assert!(app.overlay_capture_deadline().is_some());
+    assert!(
+        !app.capture_fallthrough_input(&WindowEventKind::MouseInput(MouseEvent::new(
+            MouseButton::Left,
+            PressState::Released,
+        ))),
+        "releases must route, never queue, even over a URL"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&data);
+}
+
 #[test]
 fn osc8_hover_syncs_the_os_pointer_shape() {
     // Issues #1759/#1762 precedence: hover `Pointer` wins, else the focused

@@ -157,7 +157,8 @@ pub(crate) struct WindowState {
     /// install a recording double through `TerminalApp::set_os_title_sink`.
     pub(crate) os_title_sink: Option<Box<dyn OsTitleSink>>,
     /// Last OS cursor icon applied from the focused pane's `OSC 22` stack
-    /// (issue #1762) unless an OSC 8 hover wins (issue #1759, R-005).
+    /// (issue #1762) unless a hyperlink hover wins (OSC 8 in #1759 or
+    /// plaintext in #1760, R-005/OQ-004).
     /// `None` until the first icon arrives; the change gate keeps identical
     /// icons from churning the OS pointer.
     pub(crate) last_applied_cursor: Option<bitty_platform::CursorIcon>,
@@ -942,6 +943,12 @@ impl TerminalApp {
         // without polling.
         self.deliver_overlay_released();
         self.update_plugin_overlay();
+        // CTX-0943 + #1759/#1760: while a focusable overlay capture holds,
+        // suppress underlying hyperlink hover affordances (the modal owns
+        // input and obscures the grid). The runtime clears hovers on
+        // revalidate and skips hover paints while suppressed.
+        self.runtime
+            .set_hover_suppressed_by_overlay(self.overlay_capture_active());
         // CTX-0382: drain cold-path events on every tick — including
         // deferred (synchronized update) and idle ticks — because a title
         // change produces no grid damage and would otherwise sit in the
@@ -1605,17 +1612,19 @@ impl TerminalApp {
 
     /// Syncs the OS pointer with hover-vs-`OSC 22` precedence (issues #1759/#1762).
     ///
-    /// Hover wins: an OSC 8 hover forces `Pointer`. Otherwise the focused
-    /// pane's `OSC 22` icon applies, failing open to `Default` for an empty
-    /// stack, unknown focus, or a pane exit, so a focus move or `RIS`
-    /// (`FullReset`) resets the pointer on the next tick without extra
-    /// plumbing. Called once per tick after the IME sync and after mouse
-    /// events. Change-gated through [`Self::apply_cursor_icon`].
+    /// Hover wins: either hyperlink hover (OSC 8 in #1759 or Ctrl-gated
+    /// plaintext in #1760) forces `Pointer`. Otherwise the focused pane's
+    /// `OSC 22` icon applies, failing open to `Default` for an empty stack,
+    /// unknown focus, or a pane exit, so a focus move or `RIS` (`FullReset`)
+    /// resets the pointer on the next tick without extra plumbing. Called
+    /// once per tick after the IME sync and after mouse events. Change-gated
+    /// through [`Self::apply_cursor_icon`].
     pub(crate) fn sync_cursor_icon(&mut self) {
-        // `Default`/`Text`/`Pointer` map 1:1 between the pre-#1772 3-variant
-        // and the unified 34-variant `cursor::CursorIcon`; hover detection
-        // uses the runtime hover state, not the legacy `Text` fallback.
-        let hovered = self.runtime.hovered_hyperlink_span().is_some();
+        // CTX-0943: while a focusable overlay capture holds, the modal
+        // obscures the grid — never show an underlying URL pointer.
+        let hovered = !self.overlay_capture_active()
+            && (self.runtime.hovered_hyperlink_span().is_some()
+                || self.runtime.hovered_plaintext_span().is_some());
         let icon = if hovered {
             bitty_platform::CursorIcon::Pointer
         } else {
@@ -1848,17 +1857,26 @@ impl AppHandler for TerminalApp {
             ctx.exit();
             return;
         }
-        // CTX-0577 (M1-17): the live OSC 8 click-to-open consumer. A primary
-        // mouse release over a safe hyperlink cell mints a single-use
+        // CTX-0577 (M1-17): the live hyperlink click-to-open consumer
+        // (OSC 8 in #1759, plaintext in #1760 share one gesture pipeline).
+        // A primary mouse release over a safe link mints a single-use
         // gesture; consume it here through the runtime opener seam so the
         // authorized URI is actually opened (not parse-only). Fail-closed:
         // anything without a gesture, or outside the scheme allowlist, is
         // refused and counted inside the runtime.
+        // CTX-0943: while a focusable overlay capture holds, the modal owns
+        // all input — drop (never open) a minted URL gesture so a
+        // Ctrl+release over a URL beneath the modal cannot escape it.
         if self.runtime.has_pending_hyperlink_activation() {
-            self.activate_pending_hyperlink_now();
+            if self.overlay_capture_active() {
+                let _ = self.runtime.drop_pending_hyperlink_activation();
+            } else {
+                self.activate_pending_hyperlink_now();
+            }
         }
-        // Issues #1759/#1762: hover-vs-`OSC 22` precedence — hover `Pointer`
-        // wins, else the focused pane's `OSC 22` shape, else `Default`.
+        // Issues #1759/#1760/#1762: hover-vs-`OSC 22` precedence — either
+        // hyperlink hover (OSC 8 or Ctrl-gated plaintext) wins `Pointer`,
+        // else the focused pane's `OSC 22` shape, else `Default`.
         // Change-gated inside, so steady hover costs no OS call.
         self.sync_cursor_icon();
         // CTX-0946 C1: Core-routed plugin band clicks. The runtime owns the

@@ -106,6 +106,14 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # (bitty-docs `docs/development/observability-boundary.md`); a dated
 # ADR-0004/ADR-0012 revision recording this source is tracked as a CTX-0981
 # follow-up. Falls under the same 2027-03-31 re-audit bound above.
+# bitty-url-detector is a first-party extraction target (CTX-1009, bitty
+# #1760): the dependency-free plaintext URL matcher behind the Core-owned
+# `ValidatedUrl` + `ActivationGesture` pipeline (same consumer as OSC 8).
+# Linked ONLY by the runtime crate (bitty-runtime) at an exact rev (5c65773,
+# v0.0.1, `forbid(unsafe)`, std-only, MIT); no network, filesystem, or Core
+# dependency. Recorded 2026-10-07; a dated ADR-0004/ADR-0012 revision
+# recording this source is tracked as a CTX-1009 follow-up. Falls under the
+# same 2027-03-31 re-audit bound above.
 allow-git = [
     "https://github.com/bitty-terminal/phodopus",
     "https://github.com/kyren/gc-arena",
@@ -113,4 +121,5 @@ allow-git = [
     "https://github.com/bitty-terminal/bitty-ipc",
     "https://github.com/bitty-terminal/bitty-storage",
     "https://github.com/bitty-terminal/bitty-observability",
+    "https://github.com/bitty-terminal/bitty-url-detector",
 ]

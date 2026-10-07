@@ -603,23 +603,40 @@ impl Runtime {
                             // selection press), never the primary grid at a
                             // primary-global cell: in a split that armed a URL
                             // from another pane than the one clicked.
-                            let Some(uri) = self.hyperlink_uri_at(pos) else {
+                            if let Some(uri) = self.hyperlink_uri_at(pos) {
+                                let is_safe = if uri.starts_with("file:") {
+                                    bitty_platform::validate_file_url(&uri).is_ok()
+                                } else {
+                                    bitty_platform::validate_url(&uri).is_ok()
+                                };
+                                if is_safe {
+                                    let token = ActivationGesture(self.next_activation_gesture);
+                                    self.next_activation_gesture =
+                                        self.next_activation_gesture.wrapping_add(1).max(1);
+                                    self.pending_activation_gesture = Some(token);
+                                    // CTX-0577: bind the exact URI to the
+                                    // gesture so the live consumer cannot
+                                    // be handed a substitute target.
+                                    self.pending_activation_uri = Some(uri);
+                                    return false;
+                                }
                                 return false;
-                            };
-                            let is_safe = if uri.starts_with("file:") {
-                                bitty_platform::validate_file_url(&uri).is_ok()
-                            } else {
-                                bitty_platform::validate_url(&uri).is_ok()
-                            };
-                            if is_safe {
-                                let token = ActivationGesture(self.next_activation_gesture);
-                                self.next_activation_gesture =
-                                    self.next_activation_gesture.wrapping_add(1).max(1);
-                                self.pending_activation_gesture = Some(token);
-                                // CTX-0577: bind the exact URI to the
-                                // gesture so the live consumer cannot
-                                // be handed a substitute target.
-                                self.pending_activation_uri = Some(uri);
+                            }
+                            // Issue #1760 (OQ-004): plaintext URLs share the
+                            // same `ValidatedUrl` + `ActivationGesture`
+                            // pipeline, but mint only with the gesture
+                            // modifier held (`Ctrl`, `Cmd` on macOS). A plain
+                            // release keeps its selection meaning and never
+                            // arms a URL. OSC 8 above keeps its current
+                            // behavior until PR #1771 lands its Ctrl gate.
+                            if self.plaintext_activation_modifier_held() {
+                                if let Some(uri) = self.safe_plaintext_url_at(pos) {
+                                    let token = ActivationGesture(self.next_activation_gesture);
+                                    self.next_activation_gesture =
+                                        self.next_activation_gesture.wrapping_add(1).max(1);
+                                    self.pending_activation_gesture = Some(token);
+                                    self.pending_activation_uri = Some(uri);
+                                }
                             }
                         }
                     }
@@ -651,6 +668,9 @@ impl Runtime {
                     // CTX-0334: leaving the window also drops a pending
                     // hover dwell so a re-entry starts a fresh clock.
                     self.clear_hover_pending();
+                    // Issue #1760: leaving also drops the plaintext hover so
+                    // no stale underline or pointer shape survives re-entry.
+                    self.clear_plaintext_hover();
                     if self.scrollbar_visible {
                         self.pending_full_redraw = true;
                     }
@@ -675,6 +695,11 @@ impl Runtime {
                         self.alt_pressed,
                     );
                     self.publish_inspect_snapshot();
+                    // Issue #1760: the plaintext hover is Ctrl-gated, so a
+                    // latch change can arm or disarm it under a stationary
+                    // pointer. Re-resolve now; the per-tick revalidate covers
+                    // the quiet-window case.
+                    self.revalidate_plaintext_hover();
                     false
                 }
                 WindowEventKind::Ime(ime) => {

@@ -46,6 +46,12 @@ bitty-rich = { path = "../bitty-rich" }
 # the dependency-free codec crate only, never a network implementation
 # crate; same exact-rev pin pattern as `bitty-ipc`.
 bitty-network-wire = { git = "https://github.com/bitty-terminal/bitty-network", rev = "c69fe57" }
+# Issue #1760 (OQ-004): plaintext URL pattern detection wires the
+# dependency-free matcher crate (`bitty-url-detector` v0.0.1, `forbid(unsafe)`,
+# `std` only) into the same `ValidatedUrl` + `ActivationGesture` pipeline as
+# OSC 8. No crates.io release yet, so the same git-rev pin convention as
+# `bitty-ipc` / `bitty-network-wire` applies (7-char short SHA).
+bitty-url-detector = { git = "https://github.com/bitty-terminal/bitty-url-detector", rev = "5c65773" }
 
 # CORE-RUN-003 (#1526): the supervisor claim lock is an OS-held `flock`.
 # Same workspace pins and platform split as `bitty-ipc` (no new crates).

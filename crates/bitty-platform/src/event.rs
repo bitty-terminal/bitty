@@ -466,6 +466,25 @@ pub enum ScrollDelta {
     Pixels(f64, f64),
 }
 
+/// OS mouse-pointer shape requested by the terminal chrome.
+///
+/// Issues #1759 (R-005) / #1760 (OQ-004): hovering a valid hyperlink
+/// (OSC 8 via #1759, plaintext URL via #1760 with `Ctrl` held) asks for
+/// [`CursorIcon::Pointer`]; everywhere else the terminal keeps
+/// [`CursorIcon::Text`] (the I-beam over grid text). The app applies the
+/// runtime's request through [`crate::app::WindowHandle::set_cursor_icon`]
+/// with change detection, so steady hover costs no OS call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum CursorIcon {
+    /// Platform default arrow.
+    #[default]
+    Default,
+    /// I-beam over terminal grid text.
+    Text,
+    /// Pointing hand over an actionable hyperlink.
+    Pointer,
+}
+
 /// Window-scoped events, fully owned.
 ///
 /// # Renderer resize flow

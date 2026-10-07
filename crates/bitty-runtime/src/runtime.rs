@@ -141,6 +141,7 @@ pub mod log_throttle;
 pub mod mouse_chrome;
 pub mod mouse_encode;
 pub mod panes;
+pub mod plaintext_url;
 pub mod plugin;
 pub mod present;
 pub mod pty;
@@ -885,6 +886,16 @@ pub struct Runtime {
     /// accepts a substitute target.
     pending_activation_uri: Option<String>,
     next_activation_gesture: u64,
+    /// Plaintext URL span under the pointer with `Ctrl` held (issue #1760).
+    ///
+    /// Presentation-only hover state, distinct from #1759's OSC 8
+    /// `hovered_hyperlink` (PR #1771) so the two paths coordinate without
+    /// duplicating logic. Refreshed on cursor motion, cleared when the
+    /// pointer leaves the window, the modifier is released, or the link
+    /// goes stale; read by the cursor shape and the underline highlight.
+    /// `None` when the pointer is not over a safe plaintext URL with the
+    /// gesture modifier held.
+    hovered_plaintext_url: Option<plaintext_url::HoveredPlaintextUrl>,
     /// OS hand-off for a runtime-authorized URL activation (CTX-0577).
     ///
     /// The click path never spawns a handler directly; it goes through this
@@ -1450,6 +1461,7 @@ impl Runtime {
             ),
             pending_activation_gesture: None,
             pending_activation_uri: None,
+            hovered_plaintext_url: None,
             next_activation_gesture: 1,
             url_opener: Box::new(plugin::SystemUrlOpener),
             url_activations: 0,
@@ -1682,6 +1694,7 @@ impl Runtime {
             ),
             pending_activation_gesture: None,
             pending_activation_uri: None,
+            hovered_plaintext_url: None,
             next_activation_gesture: 1,
             url_opener: Box::new(plugin::SystemUrlOpener),
             url_activations: 0,

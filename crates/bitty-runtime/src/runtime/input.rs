@@ -966,6 +966,27 @@ impl Runtime {
         if event.button == MouseButton::Left && event.state == PressState::Pressed {
             self.focus_pointer_pane_before_capture();
         }
+        // Issue #1760 (OQ-004): Ctrl/Cmd+Left over a safe plaintext URL is
+        // a terminal gesture, never child input nor a new selection. Consume
+        // the press and the release here — ahead of the capture encode below
+        // — so a mouse-tracking app never sees either half. Plain presses
+        // keep their selection meaning; Shift still forces selection.
+        if !shift_override
+            && event.button == MouseButton::Left
+            && (event.state == PressState::Pressed || event.state == PressState::Released)
+            && self.plaintext_activation_modifier_held()
+        {
+            if let Some(pos) = self.last_cursor {
+                if self.safe_plaintext_url_at(pos).is_some() {
+                    // Additive clearing only: a link click dismisses any
+                    // stale highlight without touching range logic.
+                    if self.selection_state.is_some() {
+                        self.clear_selection();
+                    }
+                    return;
+                }
+            }
+        }
         // CTX-0532: capture decision reads the focused pane's modes (primary
         // fallback for session-less leaves) — a focus change with no pump
         // must never capture with the previous pane's tracking/encoding.
@@ -1314,6 +1335,10 @@ impl Runtime {
             // Bounded: drop if PTY queue full, never block
             self.push_input_bytes(bytes.as_slice());
         }
+        // Issue #1760 (OQ-004): refresh the plaintext hover on every motion
+        // (pointer shape + underline, Ctrl-gated inside). Change-gated, so
+        // steady hover costs one bounded hit test and no redraw.
+        self.update_plaintext_hover(pos);
     }
 
     /// Current modifier bits for a mouse report: shift `4`, alt `8`, ctrl

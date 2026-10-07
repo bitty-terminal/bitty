@@ -136,6 +136,11 @@ pub(crate) struct WindowState {
     /// production sets this when the window handle is created, and tests
     /// install a recording double through `TerminalApp::set_os_title_sink`.
     pub(crate) os_title_sink: Option<Box<dyn OsTitleSink>>,
+    /// Last OS pointer shape applied from the plaintext hover state
+    /// (issue #1760). Compared by [`Self::sync_plaintext_cursor`] so steady
+    /// hover costs no OS call. Named plaintext-specific to coordinate with
+    /// #1759's `last_cursor_icon` (PR #1771): when that lands the two unify.
+    pub(crate) last_plaintext_cursor_icon: bitty_platform::CursorIcon,
 }
 
 impl WindowState {
@@ -151,6 +156,7 @@ impl WindowState {
             last_applied_title: None,
             title_applies: 0,
             os_title_sink: None,
+            last_plaintext_cursor_icon: bitty_platform::CursorIcon::Text,
         }
     }
 }
@@ -853,6 +859,22 @@ impl TerminalApp {
         self.window.ime_cursor_area = area;
         if let Some(area) = area {
             window.set_ime_cursor_area(area.x, area.y, area.width, area.height);
+        }
+    }
+
+    /// Applies the runtime's plaintext hover pointer shape (issue #1760).
+    ///
+    /// Headless-safe: with no live window the request only updates the
+    /// cached shape so the first window still opens with the right pointer.
+    /// Change-gated: identical shapes never reach the OS.
+    pub(crate) fn sync_plaintext_cursor(&mut self) {
+        let icon = self.runtime.plaintext_cursor_icon();
+        if self.window.last_plaintext_cursor_icon == icon {
+            return;
+        }
+        self.window.last_plaintext_cursor_icon = icon;
+        if let Some(win) = self.window.handle.as_ref() {
+            win.set_cursor_icon(icon);
         }
     }
 
@@ -1760,10 +1782,15 @@ impl AppHandler for TerminalApp {
         // gesture; consume it here through the runtime opener seam so the
         // authorized URI is actually opened (not parse-only). Fail-closed:
         // anything without a gesture, or outside the scheme allowlist, is
-        // refused and counted inside the runtime.
+        // refused and counted inside the runtime. Issue #1760 plaintext URLs
+        // share the same pending gesture, so no second consumer is needed.
         if self.runtime.has_pending_hyperlink_activation() {
             self.activate_pending_hyperlink_now();
         }
+        // Issue #1760 (OQ-004): hover feedback — reflect the plaintext hover
+        // on the OS pointer (hand over URLs with `Ctrl` held, I-beam
+        // elsewhere). Change-gated inside, so steady hover costs no OS call.
+        self.sync_plaintext_cursor();
         // CTX-0946 C1: Core-routed plugin band clicks. The runtime owns the
         // geometry (which band row, which declared command); the application
         // dispatches each through the normal `PluginRuntime::dispatch_command`

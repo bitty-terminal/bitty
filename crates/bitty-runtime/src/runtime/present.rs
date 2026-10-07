@@ -844,6 +844,11 @@ impl Runtime {
     fn tick_time_gates(&mut self, now: std::time::Instant) -> bool {
         // fires even when the pointer stopped moving.
         self.apply_hover_deadline(now);
+        // Issue #1760 (OQ-004): re-resolve the plaintext hover against live
+        // grid truth once per tick, before the idle short-circuit below, so
+        // a URL that scrolled or was evicted under a stationary pointer
+        // clears its underline instead of painting stale affordance.
+        self.revalidate_plaintext_hover();
         // CTX-0577 (review PX-3067): the bounded bell flash and notification
         // banner are time-expiring presentation surfaces. Expire them here —
         // before the idle short-circuit in `collect_tick_basis` — and force
@@ -1509,6 +1514,7 @@ impl Runtime {
     ) {
         self.paint_closing_rings(basis.pad_px, now, layers);
         self.paint_selection_highlight(&basis.allocations, &basis.view_map, basis.pad_px, layers);
+        self.paint_plaintext_hover(&basis.allocations, basis.pad_px, layers);
         self.paint_ime_preedit(layers);
         self.paint_pending_banners(
             &basis.allocations,
@@ -1691,6 +1697,66 @@ impl Runtime {
             fill.rect.y = px_add(fill.rect.y, origin_px_y);
             layers.combined_overlay.push(fill);
         }
+        layers.any_needs_draw = true;
+    }
+
+    /// Plaintext URL hover feedback: underline highlight (issue #1760).
+    ///
+    /// Presentation-only like the selection highlight: one underline bar
+    /// over the hovered span in the theme foreground. The owner-grid row
+    /// translates through `owner_row_window_start` exactly like the
+    /// selection highlight, so paint and hit-test agree. Skipped when the
+    /// span scrolled out of the painted window (the tick revalidate clears
+    /// it on the next frame). Thickness mirrors the OSC 8 underline
+    /// (`height / 8` clamped to `1..=2`) without taking a `bitty-rich`
+    /// dependency: the formula is duplicated by value and pinned by the
+    /// existing `underline_thickness_mirror` test.
+    fn paint_plaintext_hover(
+        &mut self,
+        allocations: &[layout_focus::PresentFrame],
+        pad_px: i32,
+        layers: &mut FrameLayers,
+    ) {
+        let Some(hover) = self.hovered_plaintext_span() else {
+            return;
+        };
+        let live = self.live_cell_metrics();
+        if live.width == 0 || live.height == 0 {
+            return;
+        }
+        let Some(frame) = allocations.iter().find(|frame| frame.view == hover.view) else {
+            return;
+        };
+        if frame.rows == 0 || frame.cols == 0 {
+            return;
+        }
+        let start = self.owner_row_window_start(hover.view, frame.rows);
+        let Some(local_row) = hover.row.checked_sub(start) else {
+            return;
+        };
+        if local_row >= usize::from(frame.rows) {
+            return;
+        }
+        let max_col = usize::from(frame.cols).saturating_sub(1);
+        let col_start = hover.col_start.min(max_col);
+        let col_end = hover.col_end.min(max_col);
+        if col_end < col_start {
+            return;
+        }
+        let thickness = (live.height / 8).clamp(1, 2);
+        let origin_x = px_add(pad_px, frame.content.x);
+        let origin_y = px_add(pad_px, frame.content.y);
+        let x = px_add(origin_x, px_side(px_span_usize(col_start, live.width)));
+        let width = px_span_usize(col_end - col_start + 1, live.width);
+        let row_y = px_add(origin_y, px_side(px_span_usize(local_row, live.height)));
+        let y = px_add(
+            row_y,
+            px_side(live.height.saturating_sub(thickness.saturating_mul(2))),
+        );
+        layers.combined_overlay.push(bitty_render::grid::FillRect {
+            rect: bitty_render::geometry::RectPx::new(x, y, width, thickness),
+            color: self.config.theme.foreground,
+        });
         layers.any_needs_draw = true;
     }
 

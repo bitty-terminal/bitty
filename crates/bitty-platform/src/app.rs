@@ -242,6 +242,23 @@ impl WindowHandle {
         );
     }
 
+    /// Requests an OS mouse-pointer shape (issues #1759/#1760).
+    ///
+    /// Wraps winit's `Window::set_cursor`: [`CursorIcon::Pointer`] over a
+    /// hovered hyperlink (OSC 8, or plaintext URL with `Ctrl` held),
+    /// [`CursorIcon::Text`] over grid text. Infallible by construction
+    /// (winit queues the request); callers dedup so steady hover costs
+    /// no OS call.
+    pub fn set_cursor_icon(&self, icon: crate::event::CursorIcon) {
+        use winit::window::CursorIcon as WinitCursorIcon;
+        let mapped = match icon {
+            crate::event::CursorIcon::Default => WinitCursorIcon::Default,
+            crate::event::CursorIcon::Text => WinitCursorIcon::Text,
+            crate::event::CursorIcon::Pointer => WinitCursorIcon::Pointer,
+        };
+        self.window.set_cursor(mapped);
+    }
+
     /// Live-applies a window opacity without restart (CTX-0223).
     ///
     /// This is the `window.opacity` side of the `Live` reload class: it

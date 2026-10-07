@@ -996,6 +996,128 @@ fn osc8_padding_click_never_arms_a_live_link() {
     assert!(opened.lock().expect("poison-free").is_empty());
 }
 
+/// Grid cell for a plaintext URL starting at `col` on row 0 (issue #1760).
+fn plaintext_cell(rt: &Runtime, col: usize) -> bitty_platform::CursorPosition {
+    let frame = rt.present_frames()[0];
+    let (cw, ch) = rt.live_cell_size();
+    let pad = f64::from(rt.window_padding_physical());
+    bitty_platform::CursorPosition {
+        x: pad + f64::from(frame.content.x.max(0)) + (col as f64 + 0.5) * f64::from(cw),
+        y: pad + f64::from(frame.content.y.max(0)) + 0.5 * f64::from(ch),
+    }
+}
+
+fn hold_ctrl(app: &mut TerminalApp, window_id: bitty_platform::WindowId) {
+    app.runtime.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::ModifiersChanged(bitty_platform::ModifiersState {
+            shift: false,
+            control: true,
+            alt: false,
+            super_pressed: false,
+        }),
+    });
+}
+
+#[test]
+fn plaintext_click_path_reaches_the_live_url_consumer() {
+    // Issue #1760: the app's click path must consume the plaintext gesture
+    // through the same live consumer as OSC 8 (not parse-only).
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        Vec::new(),
+        SpawnSpec::default(),
+    );
+    let opened = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    app.runtime.set_url_opener(Box::new(RecordingUrlOpener {
+        opened: std::sync::Arc::clone(&opened),
+    }));
+
+    app.runtime
+        .handle_pty_bytes(b"see https://example.test here");
+    let window_id = bitty_platform::WindowId::from_raw_public(1);
+    hold_ctrl(&mut app, window_id);
+    let pos = plaintext_cell(&app.runtime, 5);
+    app.runtime.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::CursorMoved(pos),
+    });
+    app.runtime.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
+            bitty_platform::MouseButton::Left,
+            bitty_platform::PressState::Pressed,
+        )),
+    });
+    app.runtime.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
+            bitty_platform::MouseButton::Left,
+            bitty_platform::PressState::Released,
+        )),
+    });
+    assert!(app.runtime.has_pending_hyperlink_activation());
+    app.activate_pending_hyperlink_now();
+    assert_eq!(
+        opened.lock().expect("poison-free").as_slice(),
+        ["https://example.test"],
+    );
+    assert!(!app.runtime.has_pending_hyperlink_activation());
+}
+
+#[test]
+fn plaintext_hover_syncs_the_os_pointer_shape() {
+    // Issue #1760: hover feedback — the app reflects the Ctrl-gated
+    // plaintext hover on the OS pointer (hand over URLs, I-beam elsewhere)
+    // with change detection. Headless: no live window, so only the cached
+    // shape advances.
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        Vec::new(),
+        SpawnSpec::default(),
+    );
+    assert_eq!(
+        app.window.last_plaintext_cursor_icon,
+        bitty_platform::CursorIcon::Text
+    );
+    app.runtime
+        .handle_pty_bytes(b"see https://example.test here");
+    let window_id = bitty_platform::WindowId::from_raw_public(1);
+    hold_ctrl(&mut app, window_id);
+    let pos = plaintext_cell(&app.runtime, 5);
+    app.runtime.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::CursorMoved(pos),
+    });
+    app.sync_plaintext_cursor();
+    assert_eq!(
+        app.window.last_plaintext_cursor_icon,
+        bitty_platform::CursorIcon::Pointer,
+        "Ctrl+hover over the URL must request the pointer shape"
+    );
+    app.sync_plaintext_cursor();
+    assert_eq!(
+        app.window.last_plaintext_cursor_icon,
+        bitty_platform::CursorIcon::Pointer
+    );
+    app.runtime.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::CursorMoved(bitty_platform::CursorPosition { x: 1.0, y: 1.0 }),
+    });
+    app.sync_plaintext_cursor();
+    assert_eq!(
+        app.window.last_plaintext_cursor_icon,
+        bitty_platform::CursorIcon::Text,
+        "leaving the URL must restore the text shape"
+    );
+}
+
 #[test]
 fn default_startup_carries_no_demo_line() {
     // CTX-0167 / #269: real sessions show only the shell — the default

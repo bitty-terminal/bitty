@@ -717,7 +717,7 @@ impl Runtime {
     ///
     /// CTX-0803: lets the selection press path hit-test and read the owner's
     /// frame geometry from one solver pass instead of two.
-    fn present_cell_in(
+    pub(super) fn present_cell_in(
         &self,
         frames: &[PresentFrame],
         pos: CursorPosition,

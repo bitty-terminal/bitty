@@ -215,12 +215,15 @@ pub use glyph::{
 pub use grid::{
     AppliedDpiScale, CellMetrics, DrawList, FillRect, GlyphAtlas, GlyphInstance, GridRenderer,
     ImageBlit, RenderCounters, RoundedClip, RoundedFill, SnapshotDamage, ThemePalette,
+    curly_amplitude_px, curly_segment_offset_px, curly_sine_offset, curly_step_px,
+    curly_wavelength_px, dashed_params_px, dotted_params_px, double_gap_px, pattern_thickness,
 };
 pub use hidpi::{
     MAX_DPI_SCALE, MAX_SCALED_POINT_SIZE, MIN_DPI_SCALE, grid_from_surface_extent,
     sanitize_dpi_scale, scaled_cell_metrics, scaled_cell_side, scaled_point_size,
     surface_extent_for_grid,
 };
+pub use pipeline::UNDERLINE_WGSL;
 pub use shaped::{
     CJK_ADVANCE_EPSILON_PX, GlyphSource, MAX_FACE_BYTES, MAX_LOADED_FACES, MAX_RUN_CACHE_ENTRIES,
     MAX_SHAPE_PLANS_PER_FACE, MAX_SHAPED_GLYPH_CACHE_ENTRIES, PROGRAMMING_LIGATURE_TAGS, RunAttrs,

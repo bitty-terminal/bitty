@@ -266,7 +266,9 @@ impl Runtime {
     /// direction forces a full redraw; steady hover costs one bounded hit
     /// test and no redraw.
     pub(super) fn update_plaintext_hover(&mut self, pos: CursorPosition) {
-        let next = if self.plaintext_activation_modifier_held() {
+        let next = if self.hover_suppressed_by_overlay {
+            None
+        } else if self.plaintext_activation_modifier_held() {
             self.plaintext_hover_at_pos(pos)
         } else {
             None
@@ -291,10 +293,23 @@ impl Runtime {
     /// pointer; only a re-resolve keeps the highlight honest. Modifier-gated
     /// like [`Self::update_plaintext_hover`].
     pub(super) fn revalidate_plaintext_hover(&mut self) {
+        if self.hover_suppressed_by_overlay {
+            self.clear_plaintext_hover();
+            return;
+        }
         match self.last_cursor {
             Some(pos) => self.update_plaintext_hover(pos),
             None => self.clear_plaintext_hover(),
         }
+    }
+
+    /// Suppresses hyperlink hover affordances while an overlay capture holds.
+    ///
+    /// Set per tick by the app; while true, revalidates clear instead of
+    /// re-arming and paints skip, so a modal never shows underlying URL
+    /// affordances.
+    pub fn set_hover_suppressed_by_overlay(&mut self, suppressed: bool) {
+        self.hover_suppressed_by_overlay = suppressed;
     }
 
     /// Owner-grid span of the hovered plaintext URL, if any.

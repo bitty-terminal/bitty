@@ -591,6 +591,12 @@ impl Runtime {
                 WindowEventKind::MouseInput(mouse) => {
                     self.handle_mouse_input(mouse);
                     if mouse.button == MouseButton::Left && mouse.state == PressState::Released {
+                        // CTX-1006 review: press/release pairing. Take (clear)
+                        // both stored press URIs on every left release so a
+                        // release alone can never arm a link; the mint below
+                        // requires an exact press/release URI match.
+                        let hyperlink_press = self.hyperlink_press_uri.take();
+                        let plaintext_press = self.plaintext_press_uri.take();
                         if let Some(pos) = self.last_cursor {
                             // CTX-0181: a release over the painted scrollbar
                             // ends a scroll gesture — it must not activate a
@@ -598,46 +604,35 @@ impl Runtime {
                             if self.scrollbar_hit_at(pos) {
                                 return false;
                             }
-                            // CTX-0804 (#1477): resolve the link in the grid of
-                            // the View under the pointer (same target rule as a
-                            // selection press), never the primary grid at a
-                            // primary-global cell: in a split that armed a URL
-                            // from another pane than the one clicked.
-                            if let Some(uri) = self.hyperlink_uri_at(pos) {
-                                let is_safe = if uri.starts_with("file:") {
-                                    bitty_platform::validate_file_url(&uri).is_ok()
-                                } else {
-                                    bitty_platform::validate_url(&uri).is_ok()
-                                };
-                                if is_safe {
-                                    let token = ActivationGesture(self.next_activation_gesture);
-                                    self.next_activation_gesture =
-                                        self.next_activation_gesture.wrapping_add(1).max(1);
-                                    self.pending_activation_gesture = Some(token);
-                                    // CTX-0577: bind the exact URI to the
-                                    // gesture so the live consumer cannot
-                                    // be handed a substitute target.
-                                    self.pending_activation_uri = Some(uri);
-                                    return false;
-                                }
+                            // Issues #1759/#1760: Ctrl-gated mint with pairing
+                            // for both OSC 8 and plaintext (OSC 8 wins where
+                            // both claim a cell). CTX-0804: resolve in the
+                            // View under the pointer, never the primary grid.
+                            // A plain release keeps selection meaning.
+                            if !self.hyperlink_activation_modifier_held() {
                                 return false;
                             }
-                            // Issue #1760 (OQ-004): plaintext URLs share the
-                            // same `ValidatedUrl` + `ActivationGesture`
-                            // pipeline, but mint only with the gesture
-                            // modifier held (`Ctrl`, `Cmd` on macOS). A plain
-                            // release keeps its selection meaning and never
-                            // arms a URL. OSC 8 above keeps its current
-                            // behavior until PR #1771 lands its Ctrl gate.
-                            if self.plaintext_activation_modifier_held() {
-                                if let Some(uri) = self.safe_plaintext_url_at(pos) {
-                                    let token = ActivationGesture(self.next_activation_gesture);
-                                    self.next_activation_gesture =
-                                        self.next_activation_gesture.wrapping_add(1).max(1);
-                                    self.pending_activation_gesture = Some(token);
-                                    self.pending_activation_uri = Some(uri);
+                            let uri = if let Some(uri) = self.safe_hyperlink_uri_at(pos) {
+                                if hyperlink_press.as_ref() != Some(&uri) {
+                                    return false;
                                 }
-                            }
+                                uri
+                            } else if let Some(uri) = self.safe_plaintext_url_at(pos) {
+                                if plaintext_press.as_ref() != Some(&uri) {
+                                    return false;
+                                }
+                                uri
+                            } else {
+                                return false;
+                            };
+                            let token = ActivationGesture(self.next_activation_gesture);
+                            self.next_activation_gesture =
+                                self.next_activation_gesture.wrapping_add(1).max(1);
+                            self.pending_activation_gesture = Some(token);
+                            // CTX-0577: bind the exact URI to the
+                            // gesture so the live consumer cannot
+                            // be handed a substitute target.
+                            self.pending_activation_uri = Some(uri);
                         }
                     }
                     false
@@ -668,8 +663,9 @@ impl Runtime {
                     // CTX-0334: leaving the window also drops a pending
                     // hover dwell so a re-entry starts a fresh clock.
                     self.clear_hover_pending();
-                    // Issue #1760: leaving also drops the plaintext hover so
-                    // no stale underline or pointer shape survives re-entry.
+                    // Issues #1759/#1760: leaving drops both hovers so
+                    // no stale underline, preview, or pointer survives.
+                    self.clear_hyperlink_hover();
                     self.clear_plaintext_hover();
                     if self.scrollbar_visible {
                         self.pending_full_redraw = true;
@@ -688,6 +684,11 @@ impl Runtime {
                     self.shift_pressed = mods.shift;
                     self.control_pressed = mods.control;
                     self.alt_pressed = mods.alt;
+                    // Issue #1759 (R-005): the Super latch (macOS Cmd) is
+                    // part of the hyperlink gesture modifier. The named-key
+                    // tracker in `input` converges on the same latch; the
+                    // platform snapshot here is authoritative per event.
+                    self.super_pressed = mods.super_pressed;
                     // CTX-0159: retain modifier latch changes for probes.
                     self.inspect_ring.push_modifiers(
                         self.shift_pressed,
@@ -695,10 +696,11 @@ impl Runtime {
                         self.alt_pressed,
                     );
                     self.publish_inspect_snapshot();
-                    // Issue #1760: the plaintext hover is Ctrl-gated, so a
-                    // latch change can arm or disarm it under a stationary
-                    // pointer. Re-resolve now; the per-tick revalidate covers
-                    // the quiet-window case.
+                    // Issues #1759/#1760: the plaintext hover is Ctrl-gated,
+                    // so a latch change can arm or disarm it under a
+                    // stationary pointer. Re-resolve both now; the per-tick
+                    // revalidate covers the quiet-window case.
+                    self.revalidate_hyperlink_hover();
                     self.revalidate_plaintext_hover();
                     false
                 }

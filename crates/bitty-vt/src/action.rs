@@ -550,6 +550,238 @@ pub enum ZoneKind {
     OutputEnd,
 }
 
+/// Pointer shape name for `OSC 22` (kitty pointer-shapes, CSS cursor keywords).
+///
+/// Mirrors the `cursor-icon`/`winit` `CursorIcon` name set (kebab-case) so the
+/// platform layer maps 1:1 without re-parsing. `from_name` also accepts the
+/// legacy X11 cursor-font aliases (`left_ptr`, `hand2`, `watch`, `xterm`, …)
+/// for xterm compatibility; unknown names fail open to [`PointerShape::Default`]
+/// at the call site (presentation-only, never terminal truth).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PointerShape {
+    /// Platform default (usually an arrow).
+    Default,
+    /// Context menu available.
+    ContextMenu,
+    /// Help available.
+    Help,
+    /// Link pointer (hand).
+    Pointer,
+    /// Progress (busy but interactive).
+    Progress,
+    /// Busy, user should wait.
+    Wait,
+    /// Cell selection.
+    Cell,
+    /// Crosshair.
+    Crosshair,
+    /// Text selection (I-beam).
+    Text,
+    /// Vertical text selection.
+    VerticalText,
+    /// Alias/shortcut to be created.
+    Alias,
+    /// Something to be copied.
+    Copy,
+    /// Something to be moved.
+    Move,
+    /// Dragged item cannot be dropped here.
+    NoDrop,
+    /// Requested action will not be carried out.
+    NotAllowed,
+    /// Something can be grabbed.
+    Grab,
+    /// Something is being grabbed.
+    Grabbing,
+    /// East border resize.
+    EResize,
+    /// North border resize.
+    NResize,
+    /// North-east corner resize.
+    NeResize,
+    /// North-west corner resize.
+    NwResize,
+    /// South border resize.
+    SResize,
+    /// South-east corner resize.
+    SeResize,
+    /// South-west corner resize.
+    SwResize,
+    /// West border resize.
+    WResize,
+    /// East-west resize.
+    EwResize,
+    /// North-south resize.
+    NsResize,
+    /// North-east/south-west diagonal resize.
+    NeswResize,
+    /// North-west/south-east diagonal resize.
+    NwseResize,
+    /// Column resize (often `ew-resize` on platforms without a distinct icon).
+    ColResize,
+    /// Row resize (often `ns-resize` on platforms without a distinct icon).
+    RowResize,
+    /// Scroll in any direction.
+    AllScroll,
+    /// Zoom in.
+    ZoomIn,
+    /// Zoom out.
+    ZoomOut,
+}
+
+impl PointerShape {
+    /// Kebab-case name matching `winit`/`cursor-icon` `CursorIcon::name()`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::ContextMenu => "context-menu",
+            Self::Help => "help",
+            Self::Pointer => "pointer",
+            Self::Progress => "progress",
+            Self::Wait => "wait",
+            Self::Cell => "cell",
+            Self::Crosshair => "crosshair",
+            Self::Text => "text",
+            Self::VerticalText => "vertical-text",
+            Self::Alias => "alias",
+            Self::Copy => "copy",
+            Self::Move => "move",
+            Self::NoDrop => "no-drop",
+            Self::NotAllowed => "not-allowed",
+            Self::Grab => "grab",
+            Self::Grabbing => "grabbing",
+            Self::EResize => "e-resize",
+            Self::NResize => "n-resize",
+            Self::NeResize => "ne-resize",
+            Self::NwResize => "nw-resize",
+            Self::SResize => "s-resize",
+            Self::SeResize => "se-resize",
+            Self::SwResize => "sw-resize",
+            Self::WResize => "w-resize",
+            Self::EwResize => "ew-resize",
+            Self::NsResize => "ns-resize",
+            Self::NeswResize => "nesw-resize",
+            Self::NwseResize => "nwse-resize",
+            Self::ColResize => "col-resize",
+            Self::RowResize => "row-resize",
+            Self::AllScroll => "all-scroll",
+            Self::ZoomIn => "zoom-in",
+            Self::ZoomOut => "zoom-out",
+        }
+    }
+
+    /// Parses a CSS kebab-case name or legacy X11 cursor-font alias.
+    ///
+    /// Returns `None` for unknown names (callers fail open to
+    /// [`PointerShape::Default`]) and for empty input. Matching is exact
+    /// (case-sensitive, no whitespace trimming here; callers trim first).
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "default" => Some(Self::Default),
+            "context-menu" => Some(Self::ContextMenu),
+            "help" => Some(Self::Help),
+            "pointer" => Some(Self::Pointer),
+            "progress" => Some(Self::Progress),
+            "wait" => Some(Self::Wait),
+            "cell" => Some(Self::Cell),
+            "crosshair" => Some(Self::Crosshair),
+            "text" => Some(Self::Text),
+            "vertical-text" => Some(Self::VerticalText),
+            "alias" => Some(Self::Alias),
+            "copy" => Some(Self::Copy),
+            "move" => Some(Self::Move),
+            "no-drop" => Some(Self::NoDrop),
+            "not-allowed" => Some(Self::NotAllowed),
+            "grab" => Some(Self::Grab),
+            "grabbing" => Some(Self::Grabbing),
+            "e-resize" => Some(Self::EResize),
+            "n-resize" => Some(Self::NResize),
+            "ne-resize" => Some(Self::NeResize),
+            "nw-resize" => Some(Self::NwResize),
+            "s-resize" => Some(Self::SResize),
+            "se-resize" => Some(Self::SeResize),
+            "sw-resize" => Some(Self::SwResize),
+            "w-resize" => Some(Self::WResize),
+            "ew-resize" => Some(Self::EwResize),
+            "ns-resize" => Some(Self::NsResize),
+            "nesw-resize" => Some(Self::NeswResize),
+            "nwse-resize" => Some(Self::NwseResize),
+            "col-resize" => Some(Self::ColResize),
+            "row-resize" => Some(Self::RowResize),
+            "all-scroll" => Some(Self::AllScroll),
+            "zoom-in" => Some(Self::ZoomIn),
+            "zoom-out" => Some(Self::ZoomOut),
+            // Legacy X11 cursor-font aliases (xterm `pointerShape` compat).
+            // Sourced from `cursor-icon` `alt_names` plus the classic
+            // `xtermSetupPointer` names (`left_ptr`, `hand2`, `watch`,
+            // `xterm`); each maps to its CSS equivalent.
+            "left_ptr" | "arrow" | "top_left_arrow" | "left_arrow" => Some(Self::Default),
+            "question_arrow" | "whats_this" => Some(Self::Help),
+            "hand2" | "hand1" | "hand" | "pointing_hand" => Some(Self::Pointer),
+            "left_ptr_watch" | "half-busy" => Some(Self::Progress),
+            "watch" => Some(Self::Wait),
+            "plus" => Some(Self::Cell),
+            "cross" => Some(Self::Crosshair),
+            "xterm" | "ibeam" => Some(Self::Text),
+            "link" => Some(Self::Alias),
+            "circle" => Some(Self::NoDrop),
+            "crossed_circle" | "forbidden" => Some(Self::NotAllowed),
+            "openhand" | "fleur" => Some(Self::Grab),
+            "closedhand" => Some(Self::Grabbing),
+            "right_side" => Some(Self::EResize),
+            "top_side" => Some(Self::NResize),
+            "top_right_corner" => Some(Self::NeResize),
+            "top_left_corner" => Some(Self::NwResize),
+            "bottom_side" => Some(Self::SResize),
+            "bottom_right_corner" => Some(Self::SeResize),
+            "bottom_left_corner" => Some(Self::SwResize),
+            "left_side" => Some(Self::WResize),
+            "h_double_arrow" | "size_hor" => Some(Self::EwResize),
+            "v_double_arrow" | "size_ver" => Some(Self::NsResize),
+            "fd_double_arrow" | "size_bdiag" => Some(Self::NeswResize),
+            "bd_double_arrow" | "size_fdiag" => Some(Self::NwseResize),
+            "split_h" | "sb_h_double_arrow" => Some(Self::ColResize),
+            "split_v" | "sb_v_double_arrow" => Some(Self::RowResize),
+            "size_all" => Some(Self::AllScroll),
+            _ => None,
+        }
+    }
+}
+
+/// Operation carried by an `OSC 22` pointer-shape sequence (issue #1762).
+///
+/// The parser only classifies and bounds the payload; terminal state stays
+/// inert and the runtime owns the per-pane shape stack plus the focused-pane
+/// platform dispatch. Queries (`?`-prefixed) are deferred: the parser emits
+/// [`TerminalAction::OscUnknown`] for them so no reply is synthesized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PointerShapeOp {
+    /// `OSC 22 ; [<name>|=<name>|<empty>]`: set (`None` = empty reset to default).
+    ///
+    /// Unknown names fail open to [`PointerShape::Default`] at parse time,
+    /// so this arm never carries an invalid shape.
+    Set {
+        /// New shape, or `None` for an empty-payload reset.
+        shape: Option<PointerShape>,
+    },
+    /// `OSC 22 ; >name[,name...]`: push all names (last is the top/current).
+    Push {
+        /// Pushed shapes in wire order (at least 1, at most [`MAX_OSC22_SHAPES`]).
+        shapes: Box<[PointerShape]>,
+    },
+    /// `OSC 22 ; <[ignored>]`: pop the top of the stack (no-op when empty).
+    Pop,
+}
+
+/// Maximum `OSC 22` shape names honored per push sequence.
+///
+/// Bounds one escape sequence's work: the kitty spec requires a minimum stack
+/// of 16, so 16 names cover every conforming push while keeping the parsed
+/// payload bounded; longer pushes fail closed as inert.
+pub const MAX_OSC22_SHAPES: usize = 16;
+
 /// Kind of sequence reported by [`TerminalAction::Unknown`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SequenceKind {
@@ -846,6 +1078,17 @@ pub enum TerminalAction {
         kind: ZoneKind,
         /// Exit status for `D` (OutputEnd), `None` for other kinds or on parse failure.
         exit_code: Option<i32>,
+    },
+    /// Pointer-shape operation (`OSC 22`, issue #1762).
+    ///
+    /// The parser resolves the payload to a bounded set/push/pop op;
+    /// terminal state treats this as inert and the runtime owns the per-pane
+    /// shape stack plus the focused-pane platform dispatch. Queries
+    /// (`?`-prefixed) never reach this variant (deferred as inert
+    /// [`TerminalAction::OscUnknown`]).
+    OscPointerShape {
+        /// Classified set/push/pop operation.
+        op: PointerShapeOp,
     },
     /// An OSC code with no mapped semantic family, recorded for replay.
     ///

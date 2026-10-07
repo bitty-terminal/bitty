@@ -410,6 +410,12 @@ impl Runtime {
         // onto the fresh grid (same stale-pixel class the close path fixes).
         // Stored images survive inertly under the store caps.
         self.kitty_images.clear_origin(Some(view.0));
+        // Issue #1762: a respawn reuses the same `ViewId`, so drop its
+        // pointer-shape stack with the old session. Without this the fresh
+        // shell inherits the dead session's cursor (e.g. stuck `wait`) until
+        // it emits its own `OSC 22` (same staleness class as the
+        // `kitty_images` cleanup above and the close-path removal).
+        self.pointer_stacks.remove(&view);
         // CTX-0393: a restored session hydrates the fresh grid with the
         // captured scrollback (immutable history; the shell itself is new).
         // No-op without a pending restore for this leaf.
@@ -620,6 +626,11 @@ impl Runtime {
         // a later leaf reusing the numeric id can never inherit stale
         // image pixels (origin tokens are `ViewId.0` values).
         self.kitty_images.clear_origin(Some(view.0));
+        // Issue #1762: a pane exit resets its pointer shape. Dropping the
+        // closed leaf's stack means a later leaf reusing the numeric id
+        // starts from the default pointer, and the focused icon falls back
+        // to the new focus (or default) on the next tick sync.
+        self.pointer_stacks.remove(view);
         // CTX-0532: the focused pane's session may have just vanished (or a
         // hidden one closed); re-attribute the mode caches. The reader paths
         // consult `focused_modes` directly and fall back to the primary

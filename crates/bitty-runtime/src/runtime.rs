@@ -143,6 +143,7 @@ pub mod mouse_encode;
 pub mod panes;
 pub mod plaintext_url;
 pub mod plugin;
+pub mod pointer;
 pub mod present;
 pub mod pty;
 pub mod resize;
@@ -885,6 +886,18 @@ pub struct Runtime {
     /// (CTX-0577); consumed together with it so the live consumer never
     /// accepts a substitute target.
     pending_activation_uri: Option<String>,
+    /// Safe OSC 8 URI under the intercepted modified left press (issue
+    /// #1759, CTX-1006 review): a modified left release mints only when its
+    /// safe URI matches this press URI, so a border-drag (or selection)
+    /// press on a divider can never arm the link under the release. Cleared
+    /// after every left release (the mint site takes it) and on any
+    /// non-link left press.
+    hyperlink_press_uri: Option<String>,
+    /// Safe plaintext URI under the intercepted modified left press (issue
+    /// #1760, mirroring #1759 pairing): a modified left release mints only
+    /// when its safe URI matches this press URI. Cleared after every left
+    /// release (the mint site takes it) and on any non-link left press.
+    plaintext_press_uri: Option<String>,
     next_activation_gesture: u64,
     /// Plaintext URL span under the pointer with `Ctrl` held (issue #1760).
     ///
@@ -908,6 +921,21 @@ pub struct Runtime {
     /// Count of hyperlink activations refused by the gate (no gesture, stale
     /// gesture, veto, or a URI outside the scheme allowlist).
     url_activation_refusals: u64,
+    /// OSC 8 hyperlink span under the pointer (issue #1759, R-005).
+    ///
+    /// Presentation-only hover state: refreshed on cursor motion, cleared
+    /// when the pointer leaves the window or the link goes stale, and read
+    /// by the cursor shape, the underline highlight, and the sanitized URL
+    /// preview. `None` when the pointer is not over a safe hyperlink.
+    hovered_hyperlink: Option<layout_focus::HoveredHyperlink>,
+    /// Suppresses hyperlink hover affordances while a focusable overlay
+    /// capture holds (CTX-0943 + issues #1759/#1760).
+    ///
+    /// Set per tick by the app from `overlay_capture_active()`: while a modal
+    /// owns input, underlying URL underlines, previews, and `Pointer` shapes
+    /// stay hidden (the modal obscures the grid), and mint-adjacent hover
+    /// re-resolves clear instead of re-arming. `false` in normal operation.
+    hover_suppressed_by_overlay: bool,
     /// User-visible bell behavior (CTX-0577, `OQ-076` policy input).
     ///
     /// Defaults to [`bell::BellMode::Visual`]: `BEL` paints a bounded,
@@ -1055,6 +1083,13 @@ pub struct Runtime {
     /// and re-decoding every image from disk. At most one generation is
     /// retained; [`Runtime::release_retained_backgrounds`] drops it.
     retained_backgrounds: Option<background_images::RetainedBackgrounds>,
+    /// Per-pane `OSC 22` pointer-shape stacks (issue #1762).
+    ///
+    /// Presentation-only, never terminal truth: keyed by leaf [`ViewId`],
+    /// empty (absent) means the default pointer. Cleared on `FullReset`
+    /// (RIS) for the emitting pane and on pane exit; the app queries the
+    /// focused leaf's icon each tick.
+    pointer_stacks: pointer::PointerStacks,
 }
 
 /// Opaque, runtime-issued proof of a platform input gesture.
@@ -1461,7 +1496,11 @@ impl Runtime {
             ),
             pending_activation_gesture: None,
             pending_activation_uri: None,
+            hyperlink_press_uri: None,
+            hovered_hyperlink: None,
             hovered_plaintext_url: None,
+            plaintext_press_uri: None,
+            hover_suppressed_by_overlay: false,
             next_activation_gesture: 1,
             url_opener: Box::new(plugin::SystemUrlOpener),
             url_activations: 0,
@@ -1545,6 +1584,7 @@ impl Runtime {
                 right: Vec::new(),
             },
             plugin_overlay: None,
+            pointer_stacks: pointer::PointerStacks::new(),
         };
         // CTX-0355: install the resolved palette on both the renderer (cell
         // defaults, ANSI, emitted fills) and the surface (clear color).
@@ -1694,7 +1734,11 @@ impl Runtime {
             ),
             pending_activation_gesture: None,
             pending_activation_uri: None,
+            hyperlink_press_uri: None,
+            hovered_hyperlink: None,
             hovered_plaintext_url: None,
+            plaintext_press_uri: None,
+            hover_suppressed_by_overlay: false,
             next_activation_gesture: 1,
             url_opener: Box::new(plugin::SystemUrlOpener),
             url_activations: 0,
@@ -1778,6 +1822,7 @@ impl Runtime {
                 right: Vec::new(),
             },
             plugin_overlay: None,
+            pointer_stacks: pointer::PointerStacks::new(),
         };
         // CTX-0355: install the resolved palette on both the renderer (cell
         // defaults, ANSI, emitted fills) and the surface (clear color).
@@ -2075,6 +2120,46 @@ impl Runtime {
     #[must_use]
     pub fn state(&self) -> &State {
         &self.state
+    }
+
+    /// Current `OSC 22` pointer shape for leaf `view`, if its stack is non-empty.
+    ///
+    /// Presentation-only (issue #1762): `None` means the default pointer.
+    /// Headless test seam for the focused-window integration claim.
+    #[must_use]
+    pub fn pointer_shape_for(&self, view: ViewId) -> Option<bitty_vt::PointerShape> {
+        self.pointer_stacks.current_for(view)
+    }
+
+    /// Current `OSC 22` pointer shape for the focused leaf, if any.
+    ///
+    /// `None` means the default pointer (empty stack, unknown focus, or no
+    /// override). The app polls this each tick and applies it through
+    /// `WindowHandle::set_cursor_icon` with a change gate.
+    #[must_use]
+    pub fn focused_pointer_shape(&self) -> Option<bitty_vt::PointerShape> {
+        self.focused_view()
+            .and_then(|view| self.pointer_stacks.current_for(view))
+    }
+
+    /// Platform cursor icon for the focused leaf (issue #1762).
+    ///
+    /// Fails open to [`bitty_platform::CursorIcon::Default`] when no shape is
+    /// set: an empty stack, an unknown focus, or a pane exit all render the
+    /// default pointer.
+    #[must_use]
+    pub fn cursor_icon_for_focused(&self) -> bitty_platform::CursorIcon {
+        self.focused_pointer_shape()
+            .map(pointer::cursor_icon_for_shape)
+            .unwrap_or(bitty_platform::CursorIcon::Default)
+    }
+
+    /// Platform cursor icon for leaf `view` (per-view test seam).
+    #[must_use]
+    pub fn cursor_icon_for(&self, view: ViewId) -> bitty_platform::CursorIcon {
+        self.pointer_shape_for(view)
+            .map(pointer::cursor_icon_for_shape)
+            .unwrap_or(bitty_platform::CursorIcon::Default)
     }
 
     /// Current surface extent, if the surface has been configured.

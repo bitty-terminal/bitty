@@ -472,6 +472,23 @@ impl Runtime {
         self.pending_activation_gesture.is_some()
     }
 
+    /// Drops a pending hyperlink activation without opening (CTX-0943).
+    ///
+    /// Called by the app when a focusable overlay capture holds: a modal
+    /// owns all input while active, so a Ctrl+release over a URL beneath it
+    /// must never open a browser. Counts a refusal (fail-closed) and clears
+    /// both the gesture and the bound URI. Returns `true` when anything was
+    /// dropped.
+    pub fn drop_pending_hyperlink_activation(&mut self) -> bool {
+        let had = self.pending_activation_gesture.is_some();
+        if had {
+            self.pending_activation_gesture = None;
+            self.pending_activation_uri = None;
+            self.url_activation_refusals = self.url_activation_refusals.saturating_add(1);
+        }
+        had
+    }
+
     /// Live OSC 8 click-to-open consumer (CTX-0577, M1-17 / issue #1143).
     ///
     /// Consumes the single-use [`ActivationGesture`] *and the exact URI bound

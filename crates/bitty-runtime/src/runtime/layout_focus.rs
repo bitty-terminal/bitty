@@ -19,6 +19,30 @@ pub(super) fn default_container(cols: usize, rows: usize) -> UiRect {
     UiRect::new(0, 0, w, h)
 }
 
+/// Bound on the hovered-URL preview text (issue #1759, R-005 anti-spoofing).
+pub const HYPERLINK_PREVIEW_MAX_CHARS: usize = 96;
+
+/// OSC 8 hyperlink span under the pointer (issue #1759, R-005 hover state).
+///
+/// Presentation-only: the owner-grid span backing the pointer cursor, the
+/// underline highlight, and the sanitized URL preview. Rows/cols are
+/// owner-grid cells (translated to frame space at paint through
+/// `owner_row_window_start`, like the selection highlight); spans never
+/// cross rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HoveredHyperlink {
+    /// View owning the grid the span was resolved in.
+    pub view: ViewId,
+    /// Safe target URI (`http`/`https`/`mailto` only).
+    pub uri: String,
+    /// Owner-grid row of the span.
+    pub row: usize,
+    /// Inclusive owner-grid start column.
+    pub col_start: usize,
+    /// Inclusive owner-grid end column.
+    pub col_end: usize,
+}
+
 /// Frame-local cell index along one axis for a pixel offset, clamped to
 /// `0..=max` (CTX-0803).
 ///
@@ -967,6 +991,170 @@ impl Runtime {
             .checked_add(usize::from(cell.col))?;
         let id = snapshot.cells.get(index)?.hyperlink?;
         state.hyperlink_entry(id).map(|(_, uri)| uri.to_owned())
+    }
+
+    /// Whether the Ctrl (Linux/Windows) or Cmd (macOS) hyperlink gesture
+    /// modifier is currently held (issue #1759, R-005).
+    ///
+    /// `Cmd` arrives as [`Self::super_pressed`] (winit Super latch + named
+    /// key tracking); `Ctrl` as [`Self::control_pressed`]. Either arm
+    /// authorizes the click-to-open gesture and the TUI interception below.
+    #[must_use]
+    pub fn hyperlink_activation_modifier_held(&self) -> bool {
+        self.control_pressed || self.super_pressed
+    }
+
+    /// [`Self::hyperlink_uri_at`] plus the platform scheme gate (issue #1759).
+    ///
+    /// Shared by the TUI interception in `input` and the gesture mint in
+    /// `resize` so the two can never disagree about which URIs are clickable:
+    /// `http`/`https`/`mailto` through [`validate_url`](bitty_platform::validate_url),
+    /// local `file:` through `validate_file_url`, everything else `None`.
+    pub(super) fn safe_hyperlink_uri_at(&self, pos: CursorPosition) -> Option<String> {
+        let uri = self.hyperlink_uri_at(pos)?;
+        let is_safe = if uri.starts_with("file:") {
+            bitty_platform::validate_file_url(&uri).is_ok()
+        } else {
+            bitty_platform::validate_url(&uri).is_ok()
+        };
+        is_safe.then_some(uri)
+    }
+
+    /// Full owner-grid span of the safe OSC 8 hyperlink under `pos`
+    /// (issue #1759, R-005 hover resolution).
+    ///
+    /// Same hit-test rule as [`Self::hyperlink_uri_at`] (in-frame only,
+    /// fail-closed on history scroll), but resolves through
+    /// [`hyperlink_spans`](bitty_rich::hyperlink::hyperlink_spans) so the
+    /// span carries its row/column run for the underline highlight. Unsafe
+    /// schemes (`javascript:`, `file:`, …) never resolve to a span because
+    /// the presentation layer refuses to present them.
+    fn hovered_hyperlink_at(&self, pos: CursorPosition) -> Option<HoveredHyperlink> {
+        let frames = self.present_frames();
+        let (view, local) = self.present_cell_in(&frames, pos)?;
+        let rows = frames
+            .iter()
+            .find(|frame| frame.view == view)
+            .map_or(0, |frame| frame.rows);
+        let cell = self.frame_cell_to_owner_cell(view, rows, local)?;
+        if self.view_scroll_offset(view) != 0 {
+            return None;
+        }
+        let state = self.live_view_state(view)?;
+        let snapshot = state.snapshot();
+        let spans = bitty_rich::hyperlink::hyperlink_spans(&snapshot, state);
+        let (row, col) = (usize::from(cell.row), usize::from(cell.col));
+        spans
+            .into_iter()
+            .find(|span| span.row == row && col >= span.col_start && col <= span.col_end)
+            .map(|span| HoveredHyperlink {
+                view,
+                uri: span.uri,
+                row: span.row,
+                col_start: span.col_start,
+                col_end: span.col_end,
+            })
+    }
+
+    /// Refreshes the hover state from `pos` (issue #1759, R-005).
+    ///
+    /// Called on cursor motion. A change in either direction (landing on a
+    /// link or leaving one) forces a full redraw so the pointer shape, the
+    /// underline highlight, and the URL preview track the pointer; steady
+    /// hover over the same span costs nothing.
+    pub(super) fn update_hyperlink_hover(&mut self, pos: CursorPosition) {
+        let next = if self.hover_suppressed_by_overlay {
+            None
+        } else {
+            self.hovered_hyperlink_at(pos)
+        };
+        if next != self.hovered_hyperlink {
+            self.hovered_hyperlink = next;
+            self.pending_full_redraw = true;
+        }
+    }
+
+    /// Clears the hover state (issue #1759, R-005).
+    ///
+    /// Called when the pointer leaves the window. Forces a redraw only when
+    /// a hover was live, so a plain window-leave with no link under the
+    /// pointer costs no extra frame.
+    pub(super) fn clear_hyperlink_hover(&mut self) {
+        if self.hovered_hyperlink.is_some() {
+            self.hovered_hyperlink = None;
+            self.pending_full_redraw = true;
+        }
+    }
+
+    /// Re-resolves the hover against live grid truth (issue #1759, R-005).
+    ///
+    /// Called once per tick: terminal output can move or evict the hovered
+    /// link under a stationary pointer (scroll, reflow, table-cap eviction),
+    /// and only a re-resolve keeps the highlight and preview honest. A
+    /// change forces a full redraw; a stable hover costs one bounded hit
+    /// test per tick.
+    pub(super) fn revalidate_hyperlink_hover(&mut self) {
+        if self.hover_suppressed_by_overlay {
+            self.clear_hyperlink_hover();
+            return;
+        }
+        match self.last_cursor {
+            Some(pos) => self.update_hyperlink_hover(pos),
+            None => self.clear_hyperlink_hover(),
+        }
+    }
+
+    /// Owner-grid span of the hovered hyperlink, if any (issue #1759, R-005).
+    ///
+    /// Read by the present path (underline highlight) and by headless tests.
+    /// `None` when the pointer is not over a safe hyperlink.
+    #[must_use]
+    pub fn hovered_hyperlink_span(&self) -> Option<HoveredHyperlink> {
+        self.hovered_hyperlink.clone()
+    }
+
+    /// URI of the hovered hyperlink, if any (issue #1759, R-005).
+    #[must_use]
+    pub fn hovered_hyperlink_uri(&self) -> Option<&str> {
+        self.hovered_hyperlink
+            .as_ref()
+            .map(|hover| hover.uri.as_str())
+    }
+
+    /// Sanitized hover preview of the hovered URL (issue #1759, R-005
+    /// anti-spoofing).
+    ///
+    /// The URI already passed the scheme allowlist at hover-resolve time;
+    /// this re-validates defensively and bounds the text to
+    /// [`HYPERLINK_PREVIEW_MAX_CHARS`] characters (ellipsis when truncated)
+    /// so a hostile prefix cannot push the true host off the preview pill.
+    /// The allowlist rejects control characters and whitespace outright, so
+    /// the returned text carries no hidden direction or line-break payload.
+    #[must_use]
+    pub fn hovered_hyperlink_preview(&self) -> Option<String> {
+        let uri = self.hovered_hyperlink_uri()?;
+        if !bitty_rich::hyperlink::is_safe_hyperlink_uri(uri) {
+            return None;
+        }
+        let mut preview: String = uri.chars().take(HYPERLINK_PREVIEW_MAX_CHARS).collect();
+        if uri.chars().count() > HYPERLINK_PREVIEW_MAX_CHARS {
+            preview.push('…');
+        }
+        Some(preview)
+    }
+
+    /// OS pointer shape for the current hover state (issue #1759, R-005).
+    ///
+    /// [`CursorIcon::Pointer`](bitty_platform::CursorIcon) over a valid
+    /// hyperlink cell, [`CursorIcon::Text`](bitty_platform::CursorIcon)
+    /// everywhere else. The app applies this with change detection.
+    #[must_use]
+    pub fn hyperlink_cursor_icon(&self) -> bitty_platform::CursorIcon {
+        if self.hovered_hyperlink.is_some() {
+            bitty_platform::CursorIcon::Pointer
+        } else {
+            bitty_platform::CursorIcon::Text
+        }
     }
 
     /// Maps a physical cursor position to its leaf and leaf-local cell

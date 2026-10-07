@@ -966,26 +966,83 @@ impl Runtime {
         if event.button == MouseButton::Left && event.state == PressState::Pressed {
             self.focus_pointer_pane_before_capture();
         }
-        // Issue #1760 (OQ-004): Ctrl/Cmd+Left over a safe plaintext URL is
-        // a terminal gesture, never child input nor a new selection. Consume
-        // the press and the release here — ahead of the capture encode below
-        // — so a mouse-tracking app never sees either half. Plain presses
-        // keep their selection meaning; Shift still forces selection.
+        // Issues #1759/#1760 (R-005/OQ-004): Ctrl/Cmd+Left over a safe
+        // hyperlink is a terminal gesture, never child input. OSC 8 and
+        // plaintext share press/release pairing (CTX-1006 review): the press
+        // stores its safe URI; the release is consumed only on an exact
+        // press/release URI match. OSC 8 takes precedence where both claim a
+        // cell (explicit links own the cell). An unmatched release falls
+        // through to capture/scrollbar/drag/selection below, so a Ctrl+press
+        // on a divider can never mint the link under the release. The mint
+        // site takes (clears) both stored URIs after every left release, so
+        // a release alone can never arm a link. Shift still forces selection.
+        // A matched release ends any active drag first (fail-closed teardown)
+        // so no drag survives the consumed release.
         if !shift_override
             && event.button == MouseButton::Left
-            && (event.state == PressState::Pressed || event.state == PressState::Released)
-            && self.plaintext_activation_modifier_held()
+            && event.state == PressState::Pressed
+            && self.hyperlink_activation_modifier_held()
         {
             if let Some(pos) = self.last_cursor {
-                if self.safe_plaintext_url_at(pos).is_some() {
-                    // Additive clearing only: a link click dismisses any
-                    // stale highlight without touching range logic.
+                if let Some(uri) = self.safe_hyperlink_uri_at(pos) {
+                    self.hyperlink_press_uri = Some(uri);
+                    self.plaintext_press_uri = None;
+                    if self.selection_state.is_some() {
+                        self.clear_selection();
+                    }
+                    return;
+                }
+                if let Some(uri) = self.safe_plaintext_url_at(pos) {
+                    self.plaintext_press_uri = Some(uri);
+                    self.hyperlink_press_uri = None;
                     if self.selection_state.is_some() {
                         self.clear_selection();
                     }
                     return;
                 }
             }
+            // A modified press over no safe link starts a new pairing epoch.
+            self.hyperlink_press_uri = None;
+            self.plaintext_press_uri = None;
+        }
+        if !shift_override
+            && event.button == MouseButton::Left
+            && event.state == PressState::Released
+            && self.hyperlink_activation_modifier_held()
+        {
+            if let Some(pos) = self.last_cursor {
+                if let Some(uri) = self.safe_hyperlink_uri_at(pos) {
+                    if self.hyperlink_press_uri.as_ref() == Some(&uri) {
+                        self.scrollbar_release();
+                        self.end_alt_drag();
+                        self.end_border_drag();
+                        self.end_tiled_drag();
+                        if self.selection_state.is_some() {
+                            self.clear_selection();
+                        }
+                        return;
+                    }
+                } else if let Some(uri) = self.safe_plaintext_url_at(pos) {
+                    if self.plaintext_press_uri.as_ref() == Some(&uri) {
+                        self.scrollbar_release();
+                        self.end_alt_drag();
+                        self.end_border_drag();
+                        self.end_tiled_drag();
+                        if self.selection_state.is_some() {
+                            self.clear_selection();
+                        }
+                        return;
+                    }
+                }
+            }
+            // Unmatched: fall through; the mint site takes and clears both
+            // stored URIs after every left release.
+        }
+        // Any other left press invalidates both pairings; a stored press
+        // returned above, so any press reaching here is non-link.
+        if event.button == MouseButton::Left && event.state == PressState::Pressed {
+            self.hyperlink_press_uri = None;
+            self.plaintext_press_uri = None;
         }
         // CTX-0532: capture decision reads the focused pane's modes (primary
         // fallback for session-less leaves) — a focus change with no pump
@@ -1335,9 +1392,10 @@ impl Runtime {
             // Bounded: drop if PTY queue full, never block
             self.push_input_bytes(bytes.as_slice());
         }
-        // Issue #1760 (OQ-004): refresh the plaintext hover on every motion
-        // (pointer shape + underline, Ctrl-gated inside). Change-gated, so
-        // steady hover costs one bounded hit test and no redraw.
+        // Issues #1759/#1760: refresh both hover states on every motion
+        // (OSC 8 first; plaintext yields where OSC 8 claims the cell).
+        // Change-gated inside, so steady hover costs bounded hit tests.
+        self.update_hyperlink_hover(pos);
         self.update_plaintext_hover(pos);
     }
 

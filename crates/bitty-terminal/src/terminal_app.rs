@@ -92,6 +92,26 @@ impl OsTitleSink for WindowHandle {
     }
 }
 
+/// OS cursor-icon handoff boundary (issue #1762, `OSC 22`).
+///
+/// `WindowHandle::set_cursor_icon` needs a live winit window, so the OS
+/// pointer itself cannot be asserted headlessly. Routing every icon through
+/// this one seam means the call sequence a test double records is exactly
+/// the production call sequence: production installs the [`WindowHandle`]
+/// wrapper (done when the window is created), and tests install a recording
+/// double instead. There is no separate test-only branch in
+/// `apply_cursor_icon`.
+pub(crate) trait OsCursorSink {
+    /// Hands a cursor icon to the OS window.
+    fn set_os_cursor(&self, icon: bitty_platform::CursorIcon);
+}
+
+impl OsCursorSink for WindowHandle {
+    fn set_os_cursor(&self, icon: bitty_platform::CursorIcon) {
+        WindowHandle::set_cursor_icon(self, icon);
+    }
+}
+
 /// OS-window bookkeeping coalesced out of `TerminalApp` (CTX-0481 state
 /// slimming): the handle, its identity, the resolved static title, opacity,
 /// and the IME/title synchronization counters all move together and share
@@ -136,11 +156,20 @@ pub(crate) struct WindowState {
     /// production sets this when the window handle is created, and tests
     /// install a recording double through `TerminalApp::set_os_title_sink`.
     pub(crate) os_title_sink: Option<Box<dyn OsTitleSink>>,
-    /// Last OS pointer shape applied from the plaintext hover state
-    /// (issue #1760). Compared by [`Self::sync_plaintext_cursor`] so steady
-    /// hover costs no OS call. Named plaintext-specific to coordinate with
-    /// #1759's `last_cursor_icon` (PR #1771): when that lands the two unify.
-    pub(crate) last_plaintext_cursor_icon: bitty_platform::CursorIcon,
+    /// Last OS cursor icon applied from the focused pane's `OSC 22` stack
+    /// (issue #1762) unless a hyperlink hover wins (OSC 8 in #1759 or
+    /// plaintext in #1760, R-005/OQ-004).
+    /// `None` until the first icon arrives; the change gate keeps identical
+    /// icons from churning the OS pointer.
+    pub(crate) last_applied_cursor: Option<bitty_platform::CursorIcon>,
+    /// Count of cursor-icon applications (issue #1762 diagnostics): stays
+    /// at one per distinct icon, proving no per-frame churn.
+    pub(crate) cursor_applies: u64,
+    /// Cursor-handoff boundary (issue #1762). `None` headlessly (no window),
+    /// in which case application still records state but performs no OS call;
+    /// production sets this when the window handle is created, and tests
+    /// install a recording double through `TerminalApp::set_os_cursor_sink`.
+    pub(crate) os_cursor_sink: Option<Box<dyn OsCursorSink>>,
 }
 
 impl WindowState {
@@ -156,7 +185,9 @@ impl WindowState {
             last_applied_title: None,
             title_applies: 0,
             os_title_sink: None,
-            last_plaintext_cursor_icon: bitty_platform::CursorIcon::Text,
+            last_applied_cursor: None,
+            cursor_applies: 0,
+            os_cursor_sink: None,
         }
     }
 }
@@ -862,22 +893,6 @@ impl TerminalApp {
         }
     }
 
-    /// Applies the runtime's plaintext hover pointer shape (issue #1760).
-    ///
-    /// Headless-safe: with no live window the request only updates the
-    /// cached shape so the first window still opens with the right pointer.
-    /// Change-gated: identical shapes never reach the OS.
-    pub(crate) fn sync_plaintext_cursor(&mut self) {
-        let icon = self.runtime.plaintext_cursor_icon();
-        if self.window.last_plaintext_cursor_icon == icon {
-            return;
-        }
-        self.window.last_plaintext_cursor_icon = icon;
-        if let Some(win) = self.window.handle.as_ref() {
-            win.set_cursor_icon(icon);
-        }
-    }
-
     pub(crate) fn drive_tick(&mut self) -> Option<bitty_runtime::PresentStats> {
         // CTX-0171: drain IPC runtime-control queue before present so
         // `bitty ctl` mutations (send/split/focus/close/spawn/reload) apply
@@ -928,6 +943,12 @@ impl TerminalApp {
         // without polling.
         self.deliver_overlay_released();
         self.update_plugin_overlay();
+        // CTX-0943 + #1759/#1760: while a focusable overlay capture holds,
+        // suppress underlying hyperlink hover affordances (the modal owns
+        // input and obscures the grid). The runtime clears hovers on
+        // revalidate and skips hover paints while suppressed.
+        self.runtime
+            .set_hover_suppressed_by_overlay(self.overlay_capture_active());
         // CTX-0382: drain cold-path events on every tick — including
         // deferred (synchronized update) and idle ticks — because a title
         // change produces no grid damage and would otherwise sit in the
@@ -948,6 +969,11 @@ impl TerminalApp {
         // it to the platform so the OS IME preedit/candidate window tracks
         // the terminal cursor (DPI-correct physical pixels, change-gated).
         self.sync_ime_cursor_area();
+        // Issues #1759/#1762: hover-vs-`OSC 22` precedence syncs on every tick
+        // (change-gated), so hover `Pointer` wins, else PTY-driven sets, focus
+        // moves, pane exits, and RIS resets all converge on the OS pointer
+        // without extra plumbing.
+        self.sync_cursor_icon();
         if let Some(present) = stats {
             self.presented_frames += 1;
             // CTX-0592: emit the real-window first-frame marker exactly once
@@ -1565,6 +1591,60 @@ impl TerminalApp {
         self.window.os_title_sink = Some(sink);
     }
 
+    /// Applies a change-gated cursor icon to the OS window (issue #1762).
+    ///
+    /// Identical icons are dropped so the OS pointer never churns per frame;
+    /// `cursor_applies` counts real applications. The OS handoff goes through
+    /// [`WindowState::os_cursor_sink`]: production installs the
+    /// [`WindowHandle`] wrapper at window creation, so this method has one
+    /// production code path that a recording test double observes exactly.
+    /// Headlessly (no sink) state is still recorded but no OS call is made.
+    pub(crate) fn apply_cursor_icon(&mut self, icon: bitty_platform::CursorIcon) {
+        if self.window.last_applied_cursor == Some(icon) {
+            return;
+        }
+        self.window.last_applied_cursor = Some(icon);
+        self.window.cursor_applies += 1;
+        if let Some(sink) = self.window.os_cursor_sink.as_ref() {
+            sink.set_os_cursor(icon);
+        }
+    }
+
+    /// Syncs the OS pointer with hover-vs-`OSC 22` precedence (issues #1759/#1762).
+    ///
+    /// Hover wins: either hyperlink hover (OSC 8 in #1759 or Ctrl-gated
+    /// plaintext in #1760) forces `Pointer`. Otherwise the focused pane's
+    /// `OSC 22` icon applies, failing open to `Default` for an empty stack,
+    /// unknown focus, or a pane exit, so a focus move or `RIS` (`FullReset`)
+    /// resets the pointer on the next tick without extra plumbing. Called
+    /// once per tick after the IME sync and after mouse events. Change-gated
+    /// through [`Self::apply_cursor_icon`].
+    pub(crate) fn sync_cursor_icon(&mut self) {
+        // CTX-0943: while a focusable overlay capture holds, the modal
+        // obscures the grid — never show an underlying URL pointer.
+        let hovered = !self.overlay_capture_active()
+            && (self.runtime.hovered_hyperlink_span().is_some()
+                || self.runtime.hovered_plaintext_span().is_some());
+        let icon = if hovered {
+            bitty_platform::CursorIcon::Pointer
+        } else {
+            self.runtime.cursor_icon_for_focused()
+        };
+        self.apply_cursor_icon(icon);
+    }
+
+    /// Installs a cursor-handoff sink, replacing any previous one (issue #1762).
+    ///
+    /// Production calls this once at window creation with the live
+    /// [`WindowHandle`]; tests call it with a recording double so the exact
+    /// call sequence applied to the OS can be asserted without a window
+    /// system. Replacing is intentional: a re-created window must not leave a
+    /// stale sink behind.
+    #[cfg(test)]
+    pub(crate) fn set_os_cursor_sink(&mut self, sink: Box<dyn OsCursorSink>) {
+        self.window.os_cursor_sink = Some(sink);
+    }
+
     /// Live OSC 8 click-to-open consumer (CTX-0577, M1-17 / issue #1143).
     ///
     /// Called after a mouse event when the runtime has armed a hyperlink
@@ -1777,20 +1857,28 @@ impl AppHandler for TerminalApp {
             ctx.exit();
             return;
         }
-        // CTX-0577 (M1-17): the live OSC 8 click-to-open consumer. A primary
-        // mouse release over a safe hyperlink cell mints a single-use
+        // CTX-0577 (M1-17): the live hyperlink click-to-open consumer
+        // (OSC 8 in #1759, plaintext in #1760 share one gesture pipeline).
+        // A primary mouse release over a safe link mints a single-use
         // gesture; consume it here through the runtime opener seam so the
         // authorized URI is actually opened (not parse-only). Fail-closed:
         // anything without a gesture, or outside the scheme allowlist, is
-        // refused and counted inside the runtime. Issue #1760 plaintext URLs
-        // share the same pending gesture, so no second consumer is needed.
+        // refused and counted inside the runtime.
+        // CTX-0943: while a focusable overlay capture holds, the modal owns
+        // all input — drop (never open) a minted URL gesture so a
+        // Ctrl+release over a URL beneath the modal cannot escape it.
         if self.runtime.has_pending_hyperlink_activation() {
-            self.activate_pending_hyperlink_now();
+            if self.overlay_capture_active() {
+                let _ = self.runtime.drop_pending_hyperlink_activation();
+            } else {
+                self.activate_pending_hyperlink_now();
+            }
         }
-        // Issue #1760 (OQ-004): hover feedback — reflect the plaintext hover
-        // on the OS pointer (hand over URLs with `Ctrl` held, I-beam
-        // elsewhere). Change-gated inside, so steady hover costs no OS call.
-        self.sync_plaintext_cursor();
+        // Issues #1759/#1760/#1762: hover-vs-`OSC 22` precedence — either
+        // hyperlink hover (OSC 8 or Ctrl-gated plaintext) wins `Pointer`,
+        // else the focused pane's `OSC 22` shape, else `Default`.
+        // Change-gated inside, so steady hover costs no OS call.
+        self.sync_cursor_icon();
         // CTX-0946 C1: Core-routed plugin band clicks. The runtime owns the
         // geometry (which band row, which declared command); the application
         // dispatches each through the normal `PluginRuntime::dispatch_command`
@@ -1875,6 +1963,11 @@ impl AppHandler for TerminalApp {
                             // application flows through the same seam tests
                             // observe with a recording double.
                             self.window.os_title_sink = Some(Box::new(handle.clone()));
+                            // Issue #1762: install the cursor-handoff sink at
+                            // the same production site, so OSC 22 icon
+                            // application flows through the same seam tests
+                            // observe with a recording double.
+                            self.window.os_cursor_sink = Some(Box::new(handle.clone()));
                             self.window.handle = Some(handle);
                             // Single-window vertical slice: try real GPU attach with crossfont atlas.
                             // On headless CI this fails with NoCompatibleAdapter and we stay headless

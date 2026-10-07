@@ -208,6 +208,18 @@ impl WindowHandle {
         self.window.set_title(title);
     }
 
+    /// Sets the OS mouse-pointer cursor icon (issue #1762, `OSC 22`).
+    ///
+    /// Wraps winit's `Window::set_cursor`: the owned [`crate::CursorIcon`]
+    /// maps 1:1 to `winit::window::CursorIcon`, so untrusted PTY shape names
+    /// (already validated to the CSS keyword set by `bitty-vt`) can never
+    /// inject an invalid icon. Fail-soft by construction — winit's setter is
+    /// infallible and platforms without a distinct icon fall back to the
+    /// default pointer.
+    pub fn set_cursor_icon(&self, icon: crate::CursorIcon) {
+        self.window.set_cursor(icon.to_winit());
+    }
+
     /// Schedules a redraw request delivery for this window.
     ///
     /// The application observes it as
@@ -240,23 +252,6 @@ impl WindowHandle {
             winit::dpi::PhysicalPosition::new(x, y),
             winit::dpi::PhysicalSize::new(width, height),
         );
-    }
-
-    /// Requests an OS mouse-pointer shape (issues #1759/#1760).
-    ///
-    /// Wraps winit's `Window::set_cursor`: [`CursorIcon::Pointer`] over a
-    /// hovered hyperlink (OSC 8, or plaintext URL with `Ctrl` held),
-    /// [`CursorIcon::Text`] over grid text. Infallible by construction
-    /// (winit queues the request); callers dedup so steady hover costs
-    /// no OS call.
-    pub fn set_cursor_icon(&self, icon: crate::event::CursorIcon) {
-        use winit::window::CursorIcon as WinitCursorIcon;
-        let mapped = match icon {
-            crate::event::CursorIcon::Default => WinitCursorIcon::Default,
-            crate::event::CursorIcon::Text => WinitCursorIcon::Text,
-            crate::event::CursorIcon::Pointer => WinitCursorIcon::Pointer,
-        };
-        self.window.set_cursor(mapped);
     }
 
     /// Live-applies a window opacity without restart (CTX-0223).

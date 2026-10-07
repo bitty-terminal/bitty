@@ -71,6 +71,12 @@ pub(crate) struct ChromeState {
     /// to the state so `now_ms` stays monotonic for one app lifetime.
     pub(crate) leader_state: bitty_config::LeaderState,
     pub(crate) leader_clock: std::time::Instant,
+    /// Resolved prefix-sequence bindings (CTX-1002 / issue #1650): the
+    /// `"leader <second>"` entries of the effective `keymaps` table,
+    /// dispatched from the pending Leader window. Empty by default (no
+    /// prefix sequences configured), in which case Leader routing is
+    /// hint-only and single-chord dispatch stays byte-identical.
+    pub(crate) prefix_bindings: Vec<bitty_config::PrefixBinding>,
     /// Hint collection generation, bumped once per Leader arming (CTX-0723,
     /// #981). Fresh batches per arming keep stale labels unreachable.
     pub(crate) hint_generation: u64,
@@ -107,6 +113,7 @@ impl ChromeState {
                 }),
             leader_state: bitty_config::LeaderState::Idle,
             leader_clock: std::time::Instant::now(),
+            prefix_bindings: Vec::new(),
             hint_generation: 0,
             editor: crate::editor_host::ExternalEditorHost::new(),
             hints_enabled: true,
@@ -117,6 +124,19 @@ impl ChromeState {
     /// Injects the effective-config Leader binding (startup path).
     pub(crate) fn with_leader(mut self, leader: bitty_config::ResolvedLeader) -> Self {
         self.leader = leader;
+        self
+    }
+
+    /// Injects the resolved prefix-sequence bindings (startup path).
+    ///
+    /// Derived from the effective `keymaps` table via
+    /// [`bitty_config::resolve_prefix_bindings`]; empty when no
+    /// `"leader <second>"` entry is configured (hint-only Leader routing).
+    pub(crate) fn with_prefix_bindings(
+        mut self,
+        bindings: Vec<bitty_config::PrefixBinding>,
+    ) -> Self {
+        self.prefix_bindings = bindings;
         self
     }
 
@@ -1657,11 +1677,15 @@ impl TerminalApp {
     /// Ordering inside this tier:
     /// 1. Reap an expired Leader window first (fail-open: the press keeps
     ///    its normal owner and routes to the shell).
-    /// 2. An armed hint session owns letters (`operator + label` via
+    /// 2. A pending prefix-sequence follow-up (`"leader <second>"`, CTX-1002
+    ///    #1650) dispatches before hint letters: `Esc` cancels, the Leader
+    ///    re-arms, a bound second dispatches, anything else defers to an
+    ///    armed hint session or disarms loudly and falls through.
+    /// 3. An armed hint session owns letters (`operator + label` via
     ///    [`Runtime::cw_hint_push_key`](bitty_runtime::Runtime::cw_hint_push_key));
     ///    `Esc` cancels, the Leader re-arms, anything else disarms loudly
     ///    and falls through.
-    /// 3. A bare Leader press arms a fresh session from the live engine.
+    /// 4. A bare Leader press arms a fresh session from the live engine.
     ///
     /// Returns `true` when the press is consumed (the caller redraws and
     /// returns); `false` lets normal dispatch run. Copy/search modals sit
@@ -1681,6 +1705,10 @@ impl TerminalApp {
             }
             bitty_config::LeaderPoll::Idle | bitty_config::LeaderPoll::Armed => {}
         }
+        if !self.chrome.prefix_bindings.is_empty() && self.route_prefix_pending(key, keyref, now_ms)
+        {
+            return true;
+        }
         if self.runtime.cw_hint_is_armed() {
             return self.route_hint_armed(key, keyref);
         }
@@ -1689,6 +1717,8 @@ impl TerminalApp {
                 // CTX-0735 (#981): hints disabled — the Leader keeps its
                 // normal owner (fail-open); the press is not consumed and no
                 // session arms, so follow-up keys never route to hint code.
+                // (With prefix bindings configured the pending tier above
+                // already armed the window; this arm is hint-only.)
                 return false;
             }
             if !key.repeat {
@@ -1700,6 +1730,90 @@ impl TerminalApp {
         // latch for observability. The next open retries the plugin.
         self.composer_core_fallback_latched = false;
         false
+    }
+
+    /// Prefix-sequence pending tier (CTX-1002 / issue #1650).
+    ///
+    /// Runs inside [`route_cw_modal`](Self::route_cw_modal) while prefix
+    /// bindings exist. Returns `true` when the press is consumed (armed,
+    /// re-armed, dispatched, cancelled, or swallowed); `false` lets the
+    /// hint/normal path run — either deferred to an armed hint session
+    /// (window stays armed) or disarmed fail-open (the press keeps its
+    /// normal owner). Dispatched follow-ups run through
+    /// [`apply_chrome_action`](Self::apply_chrome_action), the same runner
+    /// as single-chord dispatch, and own their key press-to-release (the
+    /// CTX-0229 invariant: a held follow-up never leaks repeats).
+    fn route_prefix_pending(
+        &mut self,
+        key: &KeyEvent,
+        keyref: &bitty_config::KeyRef,
+        now_ms: u64,
+    ) -> bool {
+        use crate::prefix_dispatch::{PrefixPress, classify_prefix_press};
+        match classify_prefix_press(
+            &self.chrome.leader,
+            &self.chrome.prefix_bindings,
+            *keyref,
+            self.chrome.leader_state.is_armed(),
+            self.runtime.cw_hint_is_armed(),
+            key.repeat,
+        ) {
+            PrefixPress::Ignored => false,
+            PrefixPress::Arm => {
+                // Hints enabled: the shared idle arm below opens the hint
+                // session and the Leader window together. Hints disabled:
+                // arm the prefix window here (prefix dispatch is
+                // independent of the CTX-0735 kill switch).
+                if self.chrome.hints_enabled {
+                    return false;
+                }
+                self.chrome
+                    .leader_state
+                    .arm(now_ms, self.chrome.leader.timeout_ms);
+                eprintln!(
+                    "bitty: prefix armed ({} bindings, {}ms) — follow-up chord, Esc cancels",
+                    self.chrome.prefix_bindings.len(),
+                    self.chrome.leader.timeout_ms
+                );
+                true
+            }
+            PrefixPress::Rearm => {
+                if self.runtime.cw_hint_is_armed() {
+                    // Keep the hint re-arm semantics (a fresh batch per
+                    // arming); the Leader window restarts with it.
+                    self.arm_hint_session();
+                } else {
+                    self.chrome
+                        .leader_state
+                        .arm(now_ms, self.chrome.leader.timeout_ms);
+                    eprintln!("bitty: prefix re-armed — follow-up chord, Esc cancels");
+                }
+                true
+            }
+            PrefixPress::Repeat => true,
+            PrefixPress::Dispatch(action) => {
+                self.disarm_hint_session();
+                self.chrome.held.insert(keyref.key);
+                if !key.repeat {
+                    eprintln!("bitty: prefix -> {}", action.canonical());
+                    self.apply_chrome_action(action);
+                }
+                true
+            }
+            PrefixPress::Cancel => {
+                self.disarm_hint_session();
+                eprintln!("bitty: prefix session cancelled");
+                true
+            }
+            PrefixPress::DeferToHint => false,
+            PrefixPress::Fallthrough => {
+                self.disarm_hint_session();
+                eprintln!(
+                    "warning: prefix ignoring unbound follow-up — disarming, keys route normally"
+                );
+                false
+            }
+        }
     }
 
     /// Disarms both halves of the hint interaction (Leader window plus live

@@ -100,9 +100,10 @@ pub use keymap::{
     Chord, ChromeAction, HintConfig, KeyName, KeyRef, LEADER_DEFAULT_CHORD_RAW,
     LEADER_TIMEOUT_MS_DEFAULT, LEADER_TIMEOUT_MS_MAX, LEADER_TIMEOUT_MS_MIN,
     LEADER_WINDOWS_FALLBACK_CHORDS_RAW, LeaderPlatform, LeaderPoll, LeaderState, ModKey,
-    ResolvedKeymap, ResolvedLeader, SplitDir, default_keymaps, default_keymaps_with_mod,
-    match_keymap, resolve_hint_config, resolve_keymaps, resolve_leader, resolve_leader_for,
-    validate_leader_timeout_ms,
+    PREFIX_KEYWORD, PrefixBinding, ResolvedKeymap, ResolvedLeader, SplitDir, default_keymaps,
+    default_keymaps_with_mod, is_prefix_entry_shape, match_keymap, match_prefix,
+    parse_prefix_entry, parse_prefix_second, resolve_hint_config, resolve_keymaps, resolve_leader,
+    resolve_leader_for, resolve_prefix_bindings, split_prefix_chord, validate_leader_timeout_ms,
 };
 pub use merge::{
     MergeClass, MergeConflict, MergedConfig, merge_class_for, merge_layers, resolve_profile_chain,

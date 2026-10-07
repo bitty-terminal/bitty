@@ -5627,6 +5627,7 @@ fn live_reload_adopts_keymaps_leader_hints_and_opacity_on_the_app() {
     app.adopt_live_config(crate::config_reload::AppAdoption {
         keymaps: keymaps.clone(),
         leader: leader.clone(),
+        prefix_bindings: bitty_config::resolve_prefix_bindings(&edited.keymaps).expect("prefixes"),
         hints_enabled: false,
         resize_step: edited.layout.resize_step,
         window_opacity: 0.6,
@@ -5650,6 +5651,8 @@ fn adoption_from(effective: &bitty_config::EffectiveConfig) -> crate::config_rel
         keymaps: bitty_config::resolve_keymaps(effective).expect("keymaps"),
         leader: bitty_config::resolve_leader_for(effective, bitty_config::LeaderPlatform::host())
             .expect("leader"),
+        prefix_bindings: bitty_config::resolve_prefix_bindings(&effective.keymaps)
+            .expect("prefixes"),
         hints_enabled: bitty_config::resolve_hint_config(effective).enabled,
         resize_step: effective.layout.resize_step,
         window_opacity: effective.window.opacity,
@@ -5684,6 +5687,55 @@ fn live_reload_keymap_change_alone_cancels_an_armed_leader() {
     app.adopt_live_config(adoption);
     assert_eq!(app.chrome.leader_state, bitty_config::LeaderState::Idle);
     assert!(!app.runtime.cw_hint_is_armed());
+}
+
+#[test]
+fn live_reload_adopts_prefix_bindings_and_cancels_armed_window() {
+    // CTX-1002 (issue #1650): the app half of a live reload adopts the
+    // resolved `"leader <second>"` bindings; a prefix-only change cancels
+    // an armed Leader window, since its follow-up resolves against the
+    // new table.
+    let base = bitty_config::EffectiveConfig::default();
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        bitty_config::resolve_keymaps(&base).expect("defaults"),
+        SpawnSpec::default(),
+    );
+    assert!(app.chrome.prefix_bindings.is_empty());
+
+    let mut edited = base.clone();
+    edited.keymaps = vec![bitty_config::KeymapEntry {
+        chord: "leader w".into(),
+        action: "new_split:right".into(),
+        context: "global".into(),
+    }];
+    app.adopt_live_config(adoption_from(&edited));
+    assert_eq!(app.chrome.prefix_bindings.len(), 1);
+    assert_eq!(
+        app.chrome.prefix_bindings[0].second.canonical(),
+        "w",
+        "bare follow-up resolves"
+    );
+
+    // An armed window survives an identical adoption but dies on a
+    // prefix-only change (fail-open: keys route normally again).
+    app.chrome.leader_state = bitty_config::LeaderState::Armed { deadline_ms: 0 };
+    app.adopt_live_config(adoption_from(&edited));
+    assert_ne!(app.chrome.leader_state, bitty_config::LeaderState::Idle);
+
+    let mut rebound = edited.clone();
+    rebound.keymaps = vec![bitty_config::KeymapEntry {
+        chord: "leader c".into(),
+        action: "workspace_new".into(),
+        context: "global".into(),
+    }];
+    app.adopt_live_config(adoption_from(&rebound));
+    assert_eq!(app.chrome.leader_state, bitty_config::LeaderState::Idle);
+    assert_eq!(app.chrome.prefix_bindings.len(), 1);
+    assert_eq!(app.chrome.prefix_bindings[0].second.canonical(), "c");
 }
 
 #[test]

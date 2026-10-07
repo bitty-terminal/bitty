@@ -39,6 +39,7 @@
 //!     mod_key = "alt", -- leader/mod for the shipped chrome map: "alt" (default) or "super" (CTX-0236)
 //!     leader_key = "ctrl+q", -- leader chord override: any chord spelling (default Alt+Space, Ctrl+Space on Windows; CTX-0715)
 //!     leader_timeout_ms = 1500, -- leader fail-open timeout in ms, 100..=60000 (default 1000; CTX-0715)
+//!     input = { leader = "ctrl+b", timeout_len = 1000 }, -- canonical leader surface (CTX-1002 / #1650): wins over leader_key / leader_timeout_ms when both are present
 //!     hints_enabled = true, -- hint session kill switch, default true = Leader arms (CTX-0735)
 //!     close_confirm = "when_busy", -- close safety: always | when_busy (default) | never (CTX-0370)
 //!     keymaps = {
@@ -68,6 +69,14 @@
 //!   absent-means-silent contract (CTX-0715). When present it must be
 //!   `100..=60000` (default `1000`); anything else fails closed with the
 //!   `leader_timeout_ms` field path.
+//!
+//! - `input` is a fully-optional table with the same absent-means-silent
+//!   contract (CTX-1002 / issue #1650, the canonical Leader surface):
+//!   `input.leader` takes any chord spelling (same grammar as `leader_key`)
+//!   and `input.timeout_len` takes `100..=60000` (same window as
+//!   `leader_timeout_ms`, default `1000`); anything else fails closed with
+//!   the `input.leader` / `input.timeout_len` field path. Each wins over its
+//!   top-level legacy alias when both are present.
 //!
 //! - `hints_enabled` is a fully-optional top-level boolean with the same
 //!   absent-means-silent contract (CTX-0735 / OQ-089 #981). When present it
@@ -1998,9 +2007,20 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
     // shared chord grammar fail-closed (re-mapped onto the `leader_key`
     // field path so errors name the override, not `keymaps[].chord`), so
     // existing configs without it keep the platform default.
-    let leader_key = match data.leader_key.as_deref() {
-        None => None,
-        Some(raw) => Some(
+    // CTX-1002: the canonical `input.leader` (issue #1650) wins over this
+    // legacy alias when both are present (mirroring the
+    // `appearance.theme`-over-`theme` rule); errors from the canonical
+    // surface name the `input.leader` path.
+    let leader_key = match (
+        &data.leader_key,
+        data.input.as_ref().and_then(|i| i.leader.as_deref()),
+    ) {
+        (None, None) => None,
+        (_, Some(raw)) => Some(
+            crate::keymap::Chord::parse(raw)
+                .map_err(|e| ConfigError::validation("input.leader", e.to_string()))?,
+        ),
+        (Some(raw), None) => Some(
             crate::keymap::Chord::parse(raw)
                 .map_err(|e| ConfigError::validation("leader_key", e.to_string()))?,
         ),
@@ -2010,9 +2030,27 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
     // with the same absent-means-silent contract. When present it must be a
     // non-negative integer inside the fail-open window
     // (`validate_leader_timeout_ms` rejects the rest with the field path).
-    let leader_timeout_ms = match data.leader_timeout_ms {
-        None => None,
-        Some(raw) => {
+    // CTX-1002: the canonical `input.timeout_len` (issue #1650, default
+    // `1000`) wins over this legacy alias when both are present; errors
+    // from the canonical surface name the `input.timeout_len` path.
+    let leader_timeout_ms = match (
+        data.leader_timeout_ms,
+        data.input.as_ref().and_then(|i| i.timeout_len),
+    ) {
+        (None, None) => None,
+        (_, Some(raw)) => {
+            let ms = u64::try_from(raw).map_err(|_| {
+                ConfigError::validation("input.timeout_len", format!("must be >= 0 ms (got {raw})"))
+            })?;
+            crate::keymap::validate_leader_timeout_ms(ms).map_err(|e| match e {
+                ConfigError::Validation { message, .. } => {
+                    ConfigError::validation("input.timeout_len", message)
+                }
+                other => other,
+            })?;
+            Some(ms)
+        }
+        (Some(raw), None) => {
             let ms = u64::try_from(raw).map_err(|_| {
                 ConfigError::validation("leader_timeout_ms", format!("must be >= 0 ms (got {raw})"))
             })?;
@@ -3733,6 +3771,90 @@ mod tests {
         assert_eq!(
             merged.source_of("leader_timeout_ms").unwrap().layer,
             LayerKind::User
+        );
+    }
+
+    #[test]
+    fn lua_input_leader_surface_parses_and_wins_over_alias() {
+        // CTX-1002 (issue #1650): `input = { leader, timeout_len }` is the
+        // canonical surface; each wins over its top-level legacy alias when
+        // both are present; bad values fail closed on the `input.*` path.
+        let src = test_source();
+        let plan = parse_lua_config(
+            r#"return { input = { leader = "ctrl+b", timeout_len = 1500 } }"#,
+            &src,
+        )
+        .expect("input surface");
+        assert_eq!(plan.leader_key.expect("chord").canonical(), "ctrl+b");
+        assert_eq!(plan.leader_timeout_ms, Some(1500));
+
+        // Partial tables say nothing for the omitted half.
+        let plan =
+            parse_lua_config(r#"return { input = { leader = "ctrl+b" } }"#, &src).expect("half");
+        assert_eq!(plan.leader_key.expect("chord").canonical(), "ctrl+b");
+        assert!(plan.leader_timeout_ms.is_none());
+        // Canonical wins over the legacy alias on each half independently.
+        let plan = parse_lua_config(
+            r#"return { leader_key = "ctrl+q", input = { leader = "ctrl+b" } }"#,
+            &src,
+        )
+        .expect("leader precedence");
+        assert_eq!(plan.leader_key.expect("chord").canonical(), "ctrl+b");
+        let plan = parse_lua_config(
+            r#"return { leader_timeout_ms = 2500, input = { timeout_len = 1500 } }"#,
+            &src,
+        )
+        .expect("timeout precedence");
+        assert_eq!(plan.leader_timeout_ms, Some(1500));
+
+        // Bad canonical values name the `input.*` path, never the alias.
+        for content in [
+            r#"return { input = { leader = "q" } }"#,
+            r#"return { input = { leader = "ctrl" } }"#,
+            r#"return { input = { leader = 42 } }"#,
+            r#"return { input = { timeout_len = 50 } }"#,
+            r#"return { input = { timeout_len = 60001 } }"#,
+            r#"return { input = { timeout_len = -5 } }"#,
+            r#"return { input = { timeout_len = "1500" } }"#,
+            r#"return { input = { bogus = 1 } }"#,
+            r#"return { input = 42 }"#,
+        ] {
+            let err = parse_lua_config(content, &src).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("input.leader")
+                    || msg.contains("input.timeout_len")
+                    || msg.contains("undeclared field 'input.bogus'")
+                    || msg.contains("input: expected table"),
+                "must name input path for {content:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn lua_prefix_keymap_entries_validate_end_to_end() {
+        // CTX-1002: `"leader <second>"` entries ride the existing `keymaps`
+        // table through extraction, validation, and merge; the single table
+        // skips them while the prefix table resolves them.
+        let src = test_source();
+        let plan = parse_lua_config(
+            r#"return { keymaps = { { chord = "leader w", action = "new_split:right", context = "global" } } }"#,
+            &src,
+        )
+        .expect("prefix keymap parses");
+        let layer = LayeredPlan::new(src, plan);
+        let merged = resolve_effective(Some(layer), None).expect("merge");
+        let prefixes =
+            crate::keymap::resolve_prefix_bindings(&merged.effective.keymaps).expect("prefixes");
+        assert_eq!(prefixes.len(), 1);
+        assert_eq!(
+            prefixes[0].action,
+            crate::keymap::ChromeAction::NewSplit(crate::keymap::SplitDir::Right)
+        );
+        let singles = crate::keymap::resolve_keymaps(&merged.effective).expect("singles");
+        assert!(
+            singles.iter().all(|m| m.id() != "global::leader w"),
+            "prefix entries never enter the single table"
         );
     }
 

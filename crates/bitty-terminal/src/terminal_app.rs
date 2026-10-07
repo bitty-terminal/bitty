@@ -638,6 +638,19 @@ impl TerminalApp {
         self
     }
 
+    /// Injects the resolved prefix-sequence bindings (CTX-1002 #1650).
+    ///
+    /// Derived once at startup from the effective `keymaps` table via
+    /// [`bitty_config::resolve_prefix_bindings`]; empty when no
+    /// `"leader <second>"` entry is configured.
+    pub(crate) fn with_prefix_bindings(
+        mut self,
+        bindings: Vec<bitty_config::PrefixBinding>,
+    ) -> Self {
+        self.chrome = self.chrome.with_prefix_bindings(bindings);
+        self
+    }
+
     /// Injects the effective-config tiled resize step (CTX-0963 #1697).
     ///
     /// Resolved once at startup from `layout.resize_step`; adopted live on
@@ -650,7 +663,9 @@ impl TerminalApp {
     /// Adopts the app-owned half of an accepted live reload (CTX-0898, #1522).
     ///
     /// Swaps the resolved keymap table (`keymaps` + `mod_key`), the Leader
-    /// binding (`leader_key` + `leader_timeout_ms`), the hint kill switch
+    /// binding (`leader_key` + `leader_timeout_ms`, or the canonical
+    /// `input.leader` + `input.timeout_len`, CTX-1002), the prefix-sequence
+    /// bindings (`"leader <second>"` entries, CTX-1002), the hint kill switch
     /// (`hints_enabled`), the tiled resize step (`layout.resize_step`,
     /// CTX-0963), and re-applies the platform transparency hint for
     /// `window.opacity`. A Leader window or hint session armed under the old
@@ -661,15 +676,17 @@ impl TerminalApp {
     pub(crate) fn adopt_live_config(&mut self, adoption: crate::config_reload::AppAdoption) {
         let leader_changed = self.chrome.leader != adoption.leader;
         let keymaps_changed = self.chrome.keymaps != adoption.keymaps;
+        let prefixes_changed = self.chrome.prefix_bindings != adoption.prefix_bindings;
         let hints_disabled = self.chrome.hints_enabled && !adoption.hints_enabled;
         self.chrome.keymaps = adoption.keymaps;
         self.chrome.leader = adoption.leader;
+        self.chrome.prefix_bindings = adoption.prefix_bindings;
         self.chrome.hints_enabled = adoption.hints_enabled;
         self.chrome.resize_step = crate::chrome_keys::sanitize_resize_step(adoption.resize_step);
         // An armed Leader window or hint session was opened under the old
         // binding/table; its follow-up chord could now mean something else,
         // so cancel it (fail-open: keys route normally again).
-        if leader_changed || keymaps_changed || hints_disabled {
+        if leader_changed || keymaps_changed || prefixes_changed || hints_disabled {
             self.chrome.leader_state = bitty_config::LeaderState::Idle;
             self.runtime.cw_hint_disarm();
         }

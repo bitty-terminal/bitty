@@ -1449,6 +1449,12 @@ pub fn validate_context(raw: &str) -> Result<String, ConfigError> {
 /// user entries with the same `context + chord` identity (the existing merge
 /// rule), then sorted deterministically by identity.
 ///
+/// Prefix-sequence entries (`"leader <second>"`, CTX-1002 / issue #1650) do
+/// NOT enter this single-chord table: they resolve separately via
+/// [`resolve_prefix_bindings`] into [`PrefixBinding`]s dispatched from the
+/// pending Leader window. Skipping them here keeps single-chord matching
+/// byte-identical whether or not prefix bindings exist.
+///
 /// Explicit user chords keep their exact spelling: under a non-default mod
 /// they coexist with the rebound defaults (same identity replaces, anything
 /// else appends).
@@ -1459,6 +1465,9 @@ pub fn resolve_keymaps(effective: &EffectiveConfig) -> Result<Vec<ResolvedKeymap
     let mut table = default_keymaps_with_mod(effective.mod_key)?;
     let mut seen_user: std::collections::HashSet<String> = std::collections::HashSet::new();
     for entry in &effective.keymaps {
+        if is_prefix_entry_shape(&entry.chord) {
+            continue;
+        }
         let context = validate_context(&entry.context)?;
         let chord = Chord::parse(&entry.chord)?;
         let action = ChromeAction::parse(&entry.action)?;
@@ -1516,8 +1525,18 @@ pub fn help_rows_from_keymaps(maps: &[ResolvedKeymap]) -> Vec<String> {
 /// all parse. Called by [`KeymapEntry::validate`](crate::types::KeymapEntry::validate)
 /// so every pipeline stage (plan validation, merge, `config check`) fails
 /// closed on unknown actions or keys with a clear error.
+///
+/// Prefix-sequence entries (`"leader <second>"`, CTX-1002 / issue #1650)
+/// validate through [`parse_prefix_entry`]: the `leader` keyword is symbolic
+/// (it names the configured Leader from `input.leader` / `leader_key`, never
+/// a hardcoded chord) and the second chord follows [`parse_prefix_second`].
 pub fn validate_entry(entry: &KeymapEntry) -> Result<(), ConfigError> {
     validate_context(&entry.context)?;
+    if is_prefix_entry_shape(&entry.chord) {
+        parse_prefix_entry(entry).expect("shape checked above, never None")?;
+        ChromeAction::parse(&entry.action)?;
+        return Ok(());
+    }
     Chord::parse(&entry.chord)?;
     ChromeAction::parse(&entry.action)?;
     Ok(())
@@ -1823,6 +1842,199 @@ impl LeaderState {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Prefix-sequence dispatch (CTX-1002 / issue #1650, RFC OQ-056)
+// ---------------------------------------------------------------------------
+//
+// Two-step Leader sequences (`<Leader> <second>`, tmux-prefix style) resolve
+// from the SAME `keymaps` table as single chords: an entry whose chord is
+// spelled `"leader <second>"` (e.g. `{ chord = "leader w", action =
+// "new_split:right", context = "global" }`) binds the follow-up chord
+// pressed inside the pending Leader window to a chrome action.
+//
+// The `leader` keyword is symbolic: it names the configured Leader binding
+// (`input.leader` / `leader_key`, resolved via [`resolve_leader_for` for the
+// host platform), never a hardcoded chord. The shipped defaults bind no
+// prefix sequence, so a config without one keeps single-chord dispatch
+// byte-identical. Multi-step sequences (`<Leader> w v`, three presses) stay
+// deferred: a three-token chord fails closed as an invalid single chord.
+//
+// Dispatch order while the Leader window is pending (see the `bitty-terminal`
+// pending-state router): timeout expiry first (fail-open fallback), `Esc`
+// cancel, Leader re-press re-arms, a [`PrefixBinding`] second-chord match
+// dispatches, anything else falls through with its normal owner (never
+// swallowed).
+//
+// Time/Space: [`match_prefix`] is a bounded linear scan over the resolved
+// bindings (user tables cap at [`crate::types::MAX_KEYMAPS`]); dispatch
+// state itself is `O(1)` and lives with the caller.
+
+/// Symbolic keyword naming the configured Leader in a prefix-sequence chord.
+///
+/// Case-insensitive, exactly the first whitespace-separated token
+/// (`"leader w"`, `"Leader ctrl+b"`). It never spells a chord itself: the
+/// arming chord always comes from the resolved [`ResolvedLeader`].
+pub const PREFIX_KEYWORD: &str = "leader";
+
+/// One resolved prefix-sequence binding: the follow-up chord pressed inside
+/// the pending Leader window plus the chrome action it dispatches.
+///
+/// Resolved from a `keymaps` entry spelled `"leader <second>"`; the entry's
+/// context must be [`GLOBAL_CONTEXT`] (the only v1 context) and its action
+/// follows the same [`ChromeAction`] grammar as single chords. The Leader
+/// half is symbolic (see [`PREFIX_KEYWORD`]), so bindings survive a Leader
+/// re-chord untouched.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PrefixBinding {
+    /// Follow-up chord dispatched while the Leader window is pending.
+    pub second: Chord,
+    /// Chrome action dispatched on a second-chord match.
+    pub action: ChromeAction,
+    /// Activation context, always [`GLOBAL_CONTEXT`] in v1.
+    pub context: String,
+}
+
+impl PrefixBinding {
+    /// Merge/dispatch identity: `context + canonical second chord`.
+    #[must_use]
+    pub fn id(&self) -> String {
+        format!("{}::{}", self.context, self.second.canonical())
+    }
+
+    /// True when this press is the bound follow-up (exact chord equality,
+    /// the single-owner rule: no fuzzy matching).
+    #[must_use]
+    pub fn matches(&self, key: KeyRef) -> bool {
+        key.matches(&self.second)
+    }
+}
+
+/// True when a raw chord string has the prefix-sequence shape: exactly two
+/// whitespace-separated tokens with the first token [`PREFIX_KEYWORD`]
+/// (case-insensitive). Pure shape check, no parsing: non-prefix chords
+/// return false and keep their single-chord path untouched.
+#[must_use]
+pub fn is_prefix_entry_shape(raw: &str) -> bool {
+    let mut tokens = raw.split_whitespace();
+    match (tokens.next(), tokens.next(), tokens.next()) {
+        (Some(first), Some(_), None) => first.eq_ignore_ascii_case(PREFIX_KEYWORD),
+        _ => false,
+    }
+}
+
+/// Parse a prefix-sequence follow-up chord (`<second>` in `"leader <second>"`).
+///
+/// The shared [`Chord`] grammar applies, except bare single-character keys
+/// (`w`, `v`, `c`, `1`, ...) are accepted WITHOUT a modifier: the Leader
+/// half already disambiguates, so a bare follow-up can never steal shell
+/// typing (it only matches inside the pending window). Bare named keys
+/// (`escape`, `tab`, `enter`, `f5`, ...) already parse through [`Chord`];
+/// multi-character unknown tokens fail closed.
+pub fn parse_prefix_second(raw: &str) -> Result<Chord, ConfigError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(ConfigError::validation(
+            "keymaps[].chord",
+            "prefix follow-up must not be empty ('leader <second>')",
+        ));
+    }
+    if trimmed.len() > MAX_CHORD_LEN {
+        return Err(ConfigError::validation(
+            "keymaps[].chord",
+            format!("must be <= {MAX_CHORD_LEN} bytes"),
+        ));
+    }
+    if let Ok(chord) = Chord::parse(trimmed) {
+        return Ok(chord);
+    }
+    let mut chars = trimmed.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) => Ok(Chord {
+            ctrl: false,
+            alt: false,
+            shift: false,
+            super_held: false,
+            key: KeyName::Char(c.to_ascii_lowercase()),
+        }),
+        _ => Err(ConfigError::validation(
+            "keymaps[].chord",
+            format!(
+                "unknown prefix follow-up '{trimmed}'; use '<mod>+...+<key>', a named key, or a bare letter"
+            ),
+        )),
+    }
+}
+
+/// Split a raw prefix-sequence chord into its follow-up spelling.
+///
+/// Returns `Some(second)` when `raw` has the prefix shape (see
+/// [`is_prefix_entry_shape`]), else `None` (the caller keeps the
+/// single-chord path). The `leader` keyword spelling is checked
+/// case-insensitively; the second token keeps its raw spelling for
+/// [`parse_prefix_second`].
+pub fn split_prefix_chord(raw: &str) -> Option<&str> {
+    if !is_prefix_entry_shape(raw) {
+        return None;
+    }
+    raw.split_whitespace().nth(1)
+}
+
+/// Parse one `keymaps` entry with the prefix-sequence shape into its
+/// [`PrefixBinding`]. Returns `None` when the entry is a single chord (not
+/// prefix-shaped); `Some(Err)` fail-closed on an unparseable follow-up
+/// (never a panic, never a silent ignore).
+pub fn parse_prefix_entry(entry: &KeymapEntry) -> Option<Result<PrefixBinding, ConfigError>> {
+    let second_raw = split_prefix_chord(&entry.chord)?;
+    Some((|| {
+        let context = validate_context(&entry.context)?;
+        let second = parse_prefix_second(second_raw)?;
+        let action = ChromeAction::parse(&entry.action)?;
+        Ok(PrefixBinding {
+            second,
+            action,
+            context,
+        })
+    })())
+}
+
+/// Resolve the effective prefix-sequence table from the user `keymaps`
+/// entries: every `"leader <second>"` entry becomes a [`PrefixBinding`]
+/// (context plus canonical second-chord identity, sorted deterministically);
+/// single-chord entries are skipped (they resolve via [`resolve_keymaps`]).
+///
+/// Later entries with the same identity overlay earlier ones (the existing
+/// `context + chord` merge rule applied to the second chord), so a layer
+/// rebind restates the same `"leader <second>"` spelling to win.
+/// Fail-closed on unknown contexts, follow-ups, or actions.
+pub fn resolve_prefix_bindings(entries: &[KeymapEntry]) -> Result<Vec<PrefixBinding>, ConfigError> {
+    let mut table: Vec<PrefixBinding> = Vec::new();
+    for entry in entries {
+        let Some(parsed) = parse_prefix_entry(entry) else {
+            continue;
+        };
+        let binding = parsed?;
+        let id = binding.id();
+        table.retain(|b| b.id() != id);
+        table.push(binding);
+    }
+    table.sort_by_key(|b| b.id());
+    Ok(table)
+}
+
+/// Match a pressed key against the resolved prefix table while the Leader
+/// window is pending: exact second-chord equality only. Returns the bound
+/// action (the single owner) or `None` for fallback routing (the press keeps
+/// its normal owner and the pending window disarms).
+#[must_use]
+pub fn match_prefix(bindings: &[PrefixBinding], key: KeyRef) -> Option<ChromeAction> {
+    for b in bindings {
+        if b.matches(key) {
+            return Some(b.action);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -4112,6 +4324,185 @@ mod tests {
         } else {
             assert_eq!(LeaderPlatform::host(), LeaderPlatform::Other);
         }
+    }
+
+    #[test]
+    fn prefix_shape_detection_is_exact_two_tokens() {
+        // CTX-1002: the `leader` keyword is symbolic (case-insensitive) and
+        // takes exactly one follow-up token; anything else keeps the
+        // single-chord path untouched.
+        for raw in [
+            "leader w",
+            "Leader ctrl+b",
+            "LEADER  escape",
+            "  leader\tv  ",
+        ] {
+            assert!(is_prefix_entry_shape(raw), "prefix shape {raw:?}");
+        }
+        for raw in [
+            "",
+            "   ",
+            "leader",
+            "leaderw",
+            "alt+h",
+            "ctrl+b",
+            "leader w v",
+            "leader  w  v",
+            "w leader",
+        ] {
+            assert!(!is_prefix_entry_shape(raw), "single shape {raw:?}");
+        }
+        assert_eq!(split_prefix_chord("leader w"), Some("w"));
+        assert_eq!(split_prefix_chord("Leader ctrl+b"), Some("ctrl+b"));
+        assert_eq!(split_prefix_chord("alt+h"), None);
+        assert_eq!(split_prefix_chord("leader w v"), None);
+    }
+
+    #[test]
+    fn prefix_second_accepts_bare_letters_and_chords() {
+        // CTX-1002: bare follow-ups need no modifier (the Leader half
+        // disambiguates); everything else follows the shared chord grammar.
+        let w = parse_prefix_second("w").expect("bare w");
+        assert_eq!(w.key, KeyName::Char('w'));
+        assert!(!(w.ctrl || w.alt || w.shift || w.super_held));
+        let upper = parse_prefix_second("V").expect("bare V folds");
+        assert_eq!(upper.key, KeyName::Char('v'));
+        let digit = parse_prefix_second("1").expect("bare digit");
+        assert_eq!(digit.key, KeyName::Char('1'));
+        let modified = parse_prefix_second("ctrl+w").expect("modified follow-up");
+        assert!(modified.ctrl);
+        assert_eq!(modified.key, KeyName::Char('w'));
+        let named = parse_prefix_second("escape").expect("bare named");
+        assert_eq!(named.key, KeyName::Escape);
+        let tab = parse_prefix_second("ctrl+tab").expect("modified named");
+        assert_eq!(tab.key, KeyName::Tab);
+        for bad in ["", "   ", "hyper+q", "ctrl", "leader"] {
+            assert!(
+                parse_prefix_second(bad).is_err(),
+                "follow-up must reject {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_entry_resolves_and_matches_second() {
+        // CTX-1002: `<Leader> w` dispatches deterministically; unrelated
+        // follow-ups fall through (None = normal owner, never swallowed).
+        let entry = KeymapEntry {
+            chord: "leader w".into(),
+            action: "new_split:right".into(),
+            context: "global".into(),
+        };
+        validate_entry(&entry).expect("prefix entry valid");
+        let parsed = parse_prefix_entry(&entry)
+            .expect("prefix shape")
+            .expect("parses");
+        assert_eq!(parsed.second.key, KeyName::Char('w'));
+        assert_eq!(parsed.action, ChromeAction::NewSplit(SplitDir::Right));
+        assert!(parsed.matches(key_ref(KeyName::Char('w'), false, false, false)));
+        assert!(!parsed.matches(key_ref(KeyName::Char('h'), false, false, false)));
+        assert!(!parsed.matches(key_ref(KeyName::Char('w'), true, false, false)));
+
+        // Single chords never parse as prefix entries.
+        let single = KeymapEntry {
+            chord: "alt+h".into(),
+            action: "goto_split:left".into(),
+            context: "global".into(),
+        };
+        assert!(parse_prefix_entry(&single).is_none());
+        // Three-token sequences stay deferred: not a prefix shape, and not
+        // a valid single chord either (fail-closed, never silently bound).
+        let multi = KeymapEntry {
+            chord: "leader w v".into(),
+            action: "new_split:right".into(),
+            context: "global".into(),
+        };
+        assert!(parse_prefix_entry(&multi).is_none());
+        assert!(validate_entry(&multi).is_err());
+    }
+
+    #[test]
+    fn prefix_resolve_skips_singles_and_overlays_duplicates() {
+        // CTX-1002: single chords stay in `resolve_keymaps`, prefix
+        // bindings resolve separately with last-wins overlay on the
+        // `context + second` identity.
+        let effective = EffectiveConfig {
+            keymaps: vec![
+                KeymapEntry {
+                    chord: "alt+h".into(),
+                    action: "goto_split:left".into(),
+                    context: "global".into(),
+                },
+                KeymapEntry {
+                    chord: "leader w".into(),
+                    action: "new_split:right".into(),
+                    context: "global".into(),
+                },
+                KeymapEntry {
+                    chord: "leader w".into(),
+                    action: "workspace_new".into(),
+                    context: "global".into(),
+                },
+                KeymapEntry {
+                    chord: "leader c".into(),
+                    action: "workspace_new".into(),
+                    context: "global".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let singles = resolve_keymaps(&effective).expect("singles resolve");
+        assert!(
+            singles.iter().all(|m| m.chord.canonical() != "leader w"),
+            "prefix entries never enter the single table"
+        );
+        assert_eq!(
+            match_keymap(&singles, key_ref(KeyName::Char('h'), false, true, false)),
+            Some(ChromeAction::GotoSplit(SplitDir::Left))
+        );
+        let prefixes = resolve_prefix_bindings(&effective.keymaps).expect("prefixes resolve");
+        assert_eq!(
+            prefixes.len(),
+            2,
+            "duplicate second overlays, distinct kept"
+        );
+        assert_eq!(
+            match_prefix(&prefixes, key_ref(KeyName::Char('w'), false, false, false)),
+            Some(ChromeAction::WorkspaceNew),
+            "last duplicate wins"
+        );
+        assert_eq!(
+            match_prefix(&prefixes, key_ref(KeyName::Char('c'), false, false, false)),
+            Some(ChromeAction::WorkspaceNew)
+        );
+        assert_eq!(
+            match_prefix(&prefixes, key_ref(KeyName::Char('z'), false, false, false)),
+            None,
+            "unmatched follow-up falls through"
+        );
+    }
+
+    #[test]
+    fn prefix_validate_entry_rejects_bad_followup_action_context() {
+        // CTX-1002: fail-closed with a clear error, never a silent ignore.
+        let bad_followup = KeymapEntry {
+            chord: "leader hyper+q".into(),
+            action: "workspace_new".into(),
+            context: "global".into(),
+        };
+        assert!(validate_entry(&bad_followup).is_err());
+        let bad_action = KeymapEntry {
+            chord: "leader w".into(),
+            action: "nope:unknown".into(),
+            context: "global".into(),
+        };
+        assert!(validate_entry(&bad_action).is_err());
+        let bad_context = KeymapEntry {
+            chord: "leader w".into(),
+            action: "workspace_new".into(),
+            context: "overlay".into(),
+        };
+        assert!(validate_entry(&bad_context).is_err());
     }
 
     #[test]

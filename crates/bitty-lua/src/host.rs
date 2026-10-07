@@ -3046,6 +3046,14 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
     // non-empty bounded strings, `when` absent-or-`"global"`) and captures;
     // chord-grammar validation, precedence, and conflict diagnostics are
     // applied host-side after activation.
+    //
+    // CTX-1002 (issue #1650): the same spelling carries prefix-sequence
+    // suggestions: `{ chord = "leader w", command = "my-cmd" }` names the
+    // configured Leader (never a hardcoded chord) plus the follow-up chord
+    // (bare letters allowed, per `bitty-config` prefix grammar). Capture
+    // accepts the spelling today; dispatch activation rides the Core
+    // pending-window router once the plugin-binding facility lands (the
+    // `match_plugin_binding` slot stays deny-by-default until then).
     let keymaps = Table::new(&ctx);
     keymaps
         .set(

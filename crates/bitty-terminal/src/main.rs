@@ -245,6 +245,7 @@ mod layout_cmd;
 mod logging;
 mod observability;
 mod plugin_runtime;
+mod prefix_dispatch;
 mod storage_backends;
 mod version;
 
@@ -668,7 +669,8 @@ fn main() {
         }
     };
     // CTX-0723 (#981): resolve the effective Leader binding
-    // (`leader_key` / `leader_timeout_ms` overrides or the OQ-088 platform
+    // (`leader_key` / `leader_timeout_ms`, or the canonical `input.leader`
+    // / `input.timeout_len`, CTX-1002 #1650; else the OQ-088 platform
     // default). Invalid overrides fail closed here exactly as in `config
     // check`; the input path arms the hint session on these chords.
     let leader = match bitty_config::resolve_leader_for(
@@ -687,6 +689,28 @@ fn main() {
         }
         Err(err) => {
             eprintln!("bitty: invalid leader config: {err}");
+            std::process::exit(2);
+        }
+    };
+    // CTX-1002 (#1650): resolve the prefix-sequence bindings (`"leader
+    // <second>"` entries of the effective `keymaps` table). Invalid
+    // entries fail closed here exactly as in `config check`; empty means
+    // hint-only Leader routing.
+    let prefix_bindings = match bitty_config::resolve_prefix_bindings(&app_config.effective.keymaps)
+    {
+        Ok(bindings) => {
+            if !bindings.is_empty() {
+                logging::info(|| {
+                    format!(
+                        "bitty: prefix sequences resolved ({} bindings)",
+                        bindings.len()
+                    )
+                });
+            }
+            bindings
+        }
+        Err(err) => {
+            eprintln!("bitty: invalid prefix keymaps: {err}");
             std::process::exit(2);
         }
     };
@@ -909,6 +933,9 @@ fn main() {
     )
     // CTX-0723 (#981): the effective Leader binding arms the hint session.
     .with_leader(leader)
+    // CTX-1002 (#1650): the resolved prefix bindings dispatch from the
+    // pending Leader window (empty means hint-only routing).
+    .with_prefix_bindings(prefix_bindings)
     // CTX-0735 (#981): the effective hint switch gates that arming.
     .with_hints_enabled(hints.enabled)
     // CTX-0963 (#1697): the tiled resize step per keypress.

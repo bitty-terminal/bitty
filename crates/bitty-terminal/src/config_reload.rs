@@ -224,8 +224,12 @@ impl ReloadEngine {
 pub(crate) struct AppAdoption {
     /// Resolved keymap table (shipped defaults under `mod_key` + overrides).
     pub(crate) keymaps: Vec<bitty_config::ResolvedKeymap>,
-    /// Resolved Leader binding (`leader_key` / `leader_timeout_ms`).
+    /// Resolved Leader binding (`leader_key` / `leader_timeout_ms`, or the
+    /// canonical `input.leader` / `input.timeout_len`, CTX-1002).
     pub(crate) leader: bitty_config::ResolvedLeader,
+    /// Resolved prefix-sequence bindings (`"leader <second>"` entries,
+    /// CTX-1002 / issue #1650).
+    pub(crate) prefix_bindings: Vec<bitty_config::PrefixBinding>,
     /// Resolved hint kill switch (`hints_enabled`).
     pub(crate) hints_enabled: bool,
     /// Tiled resize step (`layout.resize_step`, CTX-0963): read at keypress
@@ -305,10 +309,13 @@ fn resolve_app_adoption(effective: &EffectiveConfig) -> Result<AppAdoption, Stri
         bitty_config::resolve_keymaps(effective).map_err(|err| format!("keymaps: {err}"))?;
     let leader = bitty_config::resolve_leader_for(effective, bitty_config::LeaderPlatform::host())
         .map_err(|err| format!("leader_key: {err}"))?;
+    let prefix_bindings = bitty_config::resolve_prefix_bindings(&effective.keymaps)
+        .map_err(|err| format!("keymaps: {err}"))?;
     let prefer_light = reload_prefer_light();
     Ok(AppAdoption {
         keymaps,
         leader,
+        prefix_bindings,
         hints_enabled: bitty_config::resolve_hint_config(effective).enabled,
         resize_step: effective.layout.resize_step,
         window_opacity: effective.window.opacity,

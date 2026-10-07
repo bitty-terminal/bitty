@@ -201,6 +201,33 @@ fn keymaps_suggest_captures_with_global_default() {
 }
 
 #[test]
+fn keymaps_suggest_captures_prefix_spelling() {
+    // CTX-1002 (issue #1650): the `"leader <second>"` spelling captures
+    // through the same bridge (bounds-checked here; follow-up grammar is
+    // validated host-side after activation, and dispatch rides the Core
+    // pending-window router once the plugin-binding facility lands).
+    let mut vm = gate_vm("parity-keymaps-prefix");
+    install(&mut vm, Rc::new(ParityServices::default()));
+    let outcome = vm
+        .execute_bounded(
+            r#"
+            local h = bitty.keymaps.suggest({ chord = "leader w", command = "split:vertical" })
+            bitty.store.set("h", h)
+        "#,
+        )
+        .expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{outcome:?}"
+    );
+    let capture = vm.take_registrations();
+    assert_eq!(capture.keymaps.len(), 1);
+    assert_eq!(capture.keymaps[0].chord, "leader w");
+    assert_eq!(capture.keymaps[0].command, "split:vertical");
+    assert_eq!(capture.keymaps[0].when, "global");
+}
+
+#[test]
 fn keymaps_suggest_rejects_malformed() {
     let long_chord = "k".repeat(129);
     let long_command = "c".repeat(129);

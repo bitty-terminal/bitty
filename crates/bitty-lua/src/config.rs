@@ -41,6 +41,7 @@
 //!     mod_key = "alt", -- leader/mod for the shipped chrome map: "alt" (default) or "super" (CTX-0236)
 //!     leader_key = "ctrl+q", -- leader chord override: any chord spelling (default Alt+Space, Ctrl+Space on Windows; CTX-0715)
 //!     leader_timeout_ms = 1500, -- leader fail-open timeout override in ms, 100..=60000 (default 1000; CTX-0715)
+//!     input = { leader = "ctrl+b", timeout_len = 1000 }, -- canonical leader surface (CTX-1002 / #1650): wins over leader_key / leader_timeout_ms when both are present
 //!     hints_enabled = true, -- hint session kill switch, default true = Leader arms (CTX-0735)
 //!     close_confirm = "when_busy", -- close safety: always | when_busy (default) | never (CTX-0370)
 //!     keymaps = {
@@ -486,6 +487,23 @@ pub struct ViewOverrideData {
     pub background_fit: Option<String>,
 }
 
+/// `input` table, plain data (CTX-1002 / issue #1650; see [`FontData`] for
+/// `Option` semantics).
+///
+/// Canonical Leader surface per #1650: `input.leader` names the Leader chord
+/// (e.g. `"ctrl+b"`, `"<Space>"` spelled `"space"`), `input.timeout_len`
+/// names the pending-window budget in milliseconds (default `1000`). The
+/// chord grammar and the `100..=60000` range are validated fail-closed
+/// downstream in `bitty-config`; the extractor only enforces the closed
+/// field set and the scalar leaf types, naming the offending key path.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct InputData {
+    /// Raw Leader chord string when the key is set.
+    pub leader: Option<String>,
+    /// Raw pending-window budget in milliseconds when the key is set.
+    pub timeout_len: Option<i64>,
+}
+
 /// Plain-data user configuration extracted from the Lua chunk.
 ///
 /// Every field is optional: absent means "this layer says nothing". Unknown
@@ -533,6 +551,11 @@ pub struct ConfigData {
     /// Top-level `leader_timeout_ms` scalar (CTX-0715 fail-open timeout
     /// override; raw integer, range-checked fail-closed downstream).
     pub leader_timeout_ms: Option<i64>,
+    /// `input` table (CTX-1002 / issue #1650 canonical Leader surface:
+    /// `input.leader` / `input.timeout_len`; each wins over its top-level
+    /// legacy alias `leader_key` / `leader_timeout_ms` when both are
+    /// present, mirroring the `appearance.theme`-over-`theme` rule).
+    pub input: Option<InputData>,
     /// Top-level `hints_enabled` scalar (CTX-0735 / OQ-089 #981 hint kill
     /// switch; raw boolean, honored downstream as the default-on hint
     /// config: `false` keeps the Leader from arming a hint session).
@@ -585,6 +608,7 @@ impl ConfigData {
             && self.mod_key.is_none()
             && self.leader_key.is_none()
             && self.leader_timeout_ms.is_none()
+            && self.input.is_none()
             && self.hints_enabled.is_none()
             && self.session.is_none()
             && self.close_confirm.is_none()
@@ -1844,6 +1868,29 @@ impl ConfigData {
                 "leader_timeout_ms" => {
                     out.leader_timeout_ms = Some(expect_integer(key, val)?);
                 }
+                // CTX-1002: `input = { leader = "...", timeout_len = N }`
+                // canonical Leader surface (issue #1650). Absent table/key
+                // means "says nothing"; present leaves are raw strings /
+                // integers validated fail-closed downstream in
+                // `bitty-config` (chord grammar for `leader`, the
+                // `100..=60000` window for `timeout_len`). Each wins over
+                // its top-level legacy alias when both are present.
+                "input" => {
+                    let nested = expect_table(key, val)?;
+                    check_nested_keys(key, nested, &["leader", "timeout_len"])?;
+                    let leader = match get_field(nested, "leader") {
+                        Some(v) => Some(expect_string("input.leader", v)?),
+                        None => None,
+                    };
+                    let timeout_len = match get_field(nested, "timeout_len") {
+                        Some(v) => Some(expect_integer("input.timeout_len", v)?),
+                        None => None,
+                    };
+                    out.input = Some(InputData {
+                        leader,
+                        timeout_len,
+                    });
+                }
                 // CTX-0735: top-level `hints_enabled` kill switch (raw
                 // boolean; honored downstream in `bitty-config` as the
                 // default-on hint config).
@@ -2309,6 +2356,40 @@ mod tests {
                 assert!(message.contains("mod_key"), "{message}");
             }
             other => panic!("expected shape error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn input_table_extracts_and_absent_means_no_override() {
+        // CTX-1002 (issue #1650): `input = { leader, timeout_len }`
+        // extracts as raw strings/integers (typed parsing lives
+        // downstream); absent table/key is `None` so merge keeps the
+        // lower-precedence value (platform default Leader, 1000ms).
+        let data = eval_ok(r#"return { input = { leader = "ctrl+b", timeout_len = 1500 } }"#);
+        let input = data.input.clone().expect("input present");
+        assert_eq!(input.leader.as_deref(), Some("ctrl+b"));
+        assert_eq!(input.timeout_len, Some(1500));
+        assert!(!data.is_empty());
+        let data = eval_ok(r#"return { input = { leader = "ctrl+b" } }"#);
+        let input = data.input.expect("input present");
+        assert_eq!(input.leader.as_deref(), Some("ctrl+b"));
+        assert_eq!(input.timeout_len, None);
+        let data = eval_ok(r#"return { theme = "dark" }"#);
+        assert_eq!(data.input, None);
+        // Wrong types and unknown keys are shape errors naming the path.
+        for code in [
+            r#"return { input = { leader = 42 } }"#,
+            r#"return { input = { timeout_len = "1500" } }"#,
+            r#"return { input = { bogus = 1 } }"#,
+            r#"return { input = 42 }"#,
+        ] {
+            let mut vm = LuaVm::new("test.input-type");
+            match vm.eval_config(code).expect("no refuse") {
+                ConfigOutcome::ShapeError { message } => {
+                    assert!(message.contains("input"), "{message}");
+                }
+                other => panic!("expected shape error for {code:?}, got {other:?}"),
+            }
         }
     }
 

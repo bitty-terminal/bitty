@@ -586,8 +586,9 @@ fn env_bridge_rejects_malformed_keys_before_grants() {
     });
     let mut vm = gate_vm("parity-env-shape");
     install_env(&mut vm, services.clone());
-    // Non-string, empty, bad-shape, and over-bound keys fail with validation
-    // codes before any grant check.
+    // Non-string keys fail with the argument-shape code; empty, bad-shape,
+    // mixed-case, and over-bound (ADR 0006: 64/uppercase) keys fail with the
+    // contract denial before any grant check (bitty#1751).
     let outcome = vm
         .execute_bounded(
             r#"
@@ -597,10 +598,12 @@ fn env_bridge_rejects_malformed_keys_before_grants() {
                 return err.code
             end
             assert(code_of(function() return bitty.env.get(42) end) == "E_DEF_INVALID")
-            assert(code_of(function() return bitty.env.get("") end) == "E_DEF_INVALID")
-            assert(code_of(function() return bitty.env.get("has space") end) == "E_DEF_INVALID")
-            assert(code_of(function() return bitty.env.get("9LIVES") end) == "E_DEF_INVALID")
-            assert(code_of(function() return bitty.env.has(string.rep("A", 129)) end) == "E_DEF_LIMIT")
+            assert(code_of(function() return bitty.env.get("") end) == "E_ENV_KEY_INVALID")
+            assert(code_of(function() return bitty.env.get("has space") end) == "E_ENV_KEY_INVALID")
+            assert(code_of(function() return bitty.env.get("9LIVES") end) == "E_ENV_KEY_INVALID")
+            assert(code_of(function() return bitty.env.get("home") end) == "E_ENV_KEY_INVALID")
+            assert(code_of(function() return bitty.env.get("Home") end) == "E_ENV_KEY_INVALID")
+            assert(code_of(function() return bitty.env.has(string.rep("A", 65)) end) == "E_ENV_KEY_INVALID")
         "#,
         )
         .expect("execute");

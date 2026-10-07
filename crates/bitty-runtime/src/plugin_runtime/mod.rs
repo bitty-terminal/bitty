@@ -2255,12 +2255,12 @@ fn verify_module_tree(id: &PluginId, root: &Path) -> Result<(), PluginRuntimeErr
 }
 
 /// Extract `bitty.env` grant suffixes from the activation grant snapshot
-/// (CTX-0330, CTX-0830).
+/// (CTX-0330, CTX-0830; ADR 0006 normative, bitty#1751).
 ///
 /// `env.read:<KEY>` grants contribute their exact key and
 /// `env.read:PREFIX*` grants contribute their prefix-wildcard suffix, each
 /// validated by the shared [`bitty_lua::env_grant_shape_ok`] rule
-/// (`[A-Za-z_][A-Za-z0-9_]*` prefix, `1..=ENV_KEY_MAX_BYTES` bytes, one
+/// (`^[A-Z_][A-Z0-9_]*$` prefix, `1..=ENV_KEY_MAX_BYTES` bytes, one
 /// literal trailing `*` for wildcards). The bare-star allow-all (`env.read:*`)
 /// is rejected like any other malformed recorded grant: a recorded grant with
 /// a malformed suffix fails closed as store integrity before any VM exists,

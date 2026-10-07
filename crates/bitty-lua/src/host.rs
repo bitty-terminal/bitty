@@ -184,12 +184,13 @@ pub const SPAWN_LUA_MAX_ARGS: usize = 64;
 pub const SPAWN_LUA_MAX_ARG_BYTES: usize = 4096;
 /// Maximum bytes of one module name accepted by `require`.
 pub const MODULE_NAME_MAX_BYTES: usize = 128;
-/// Maximum bytes of one `bitty.env` key (CTX-0330).
+/// Maximum bytes of one `bitty.env` key (CTX-0330, ADR 0006 normative,
+/// bitty#1751).
 ///
-/// Mirrors the credential/secret env-name ceiling (`128`): an over-bound key
-/// is rejected fail-closed with `E_DEF_LIMIT` before any grant check, so
-/// oversize input never reaches the allowlist.
-pub const ENV_KEY_MAX_BYTES: usize = 128;
+/// Accepted ADR 0006 contract (`^[A-Z_][A-Z0-9_]*$`, `1..64`): an ill-shaped
+/// or over-bound key is rejected fail-closed with `E_ENV_KEY_INVALID` before
+/// any grant check, so ungrantable input never reaches the allowlist.
+pub const ENV_KEY_MAX_BYTES: usize = 64;
 /// Maximum bytes of one `bitty.fs` path (RFC-0005, CTX-0984).
 ///
 /// Reuses the accepted Core bound (`bitty-plugin-host` `MAX_FS_PATH_BYTES`,
@@ -765,8 +766,8 @@ pub trait HostServices {
     /// indistinguishable from unimplemented ones). `Ok(None)` means the
     /// granted key is absent from the host environment
     /// (absent-unless-declared). Values cross as bounded strings; keys are
-    /// validated by the caller shape (`[A-Za-z_][A-Za-z0-9_]*`, `1..128`
-    /// bytes) with `E_DEF_INVALID`/`E_DEF_LIMIT`.
+    /// validated by the caller shape (`^[A-Z_][A-Z0-9_]*$`, `1..64` bytes,
+    /// ADR 0006) with `E_ENV_KEY_INVALID`.
     ///
     /// The default implementation fails closed with `E_NOT_IMPLEMENTED`: a
     /// host without an env backend can never gain ambient reads from the
@@ -4813,9 +4814,9 @@ fn bounded_token(token: &str) -> String {
 }
 
 /// Pure `bitty.env` key-shape predicate shared by every validation site
-/// (CTX-0727, #1315).
+/// (CTX-0727, #1315; ADR 0006 normative, bitty#1751).
 ///
-/// Single source of truth for `[A-Za-z_][A-Za-z0-9_]*` within
+/// Single source of truth for `^[A-Z_][A-Z0-9_]*$` within
 /// `1..=ENV_KEY_MAX_BYTES` bytes: the bridge [`validate_env_key`], the
 /// services boundary, and the `bitty-runtime` grant extractor all agree through this
 /// predicate instead of re-spelling the rule. Error-typed callers map `false`
@@ -4829,8 +4830,11 @@ pub fn env_key_shape_ok(key: &str) -> bool {
     let mut bytes = key.bytes();
     let first_ok = bytes
         .next()
-        .is_some_and(|first| first.is_ascii_alphabetic() || first == b'_');
-    first_ok && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        .is_some_and(|first| first.is_ascii_uppercase() || first == b'_');
+    first_ok
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
 }
 
 /// Prefix-wildcard `bitty.env` grant shape (CTX-0830, #1483).
@@ -4869,10 +4873,10 @@ pub fn env_grant_authorizes(grant: &str, key: &str) -> bool {
     grant == key
 }
 
-/// Validate a `bitty.env` key shape (CTX-0330).
+/// Validate a `bitty.env` key shape (CTX-0330; ADR 0006 normative, bitty#1751).
 ///
-/// Keys are `[A-Za-z_][A-Za-z0-9_]*` within `1..=ENV_KEY_MAX_BYTES` bytes.
-/// Shape failures are `E_DEF_INVALID`/`E_DEF_LIMIT` (validation class) and
+/// Keys are `^[A-Z_][A-Z0-9_]*$` within `1..=ENV_KEY_MAX_BYTES` bytes.
+/// Shape failures are `E_ENV_KEY_INVALID` (validation class) and
 /// run before the grant gate; diagnostics quote the bounded key only, never
 /// a value.
 ///
@@ -4882,37 +4886,34 @@ pub fn validate_env_key(key: &str) -> Result<(), BridgeError> {
     if key.is_empty() {
         return Err(BridgeError::new(
             "validation",
-            "E_DEF_INVALID",
+            "E_ENV_KEY_INVALID",
             "env key must not be empty",
         ));
     }
     if key.len() > ENV_KEY_MAX_BYTES {
         return Err(BridgeError::new(
             "validation",
-            "E_DEF_LIMIT",
+            "E_ENV_KEY_INVALID",
             format!("env key exceeds {ENV_KEY_MAX_BYTES} bytes"),
         ));
     }
     if !env_key_shape_ok(key) {
         let mut bytes = key.bytes();
         let first = bytes.next().unwrap_or(b'_');
-        if !(first.is_ascii_alphabetic() || first == b'_') {
+        if !(first.is_ascii_uppercase() || first == b'_') {
             return Err(BridgeError::new(
                 "validation",
-                "E_DEF_INVALID",
+                "E_ENV_KEY_INVALID",
                 format!(
-                    "env key '{}' must start with a letter or '_'",
+                    "env key '{}' must start with A-Z or '_'",
                     bounded_token(key)
                 ),
             ));
         }
         return Err(BridgeError::new(
             "validation",
-            "E_DEF_INVALID",
-            format!(
-                "env key '{}' must be [A-Za-z_][A-Za-z0-9_]*",
-                bounded_token(key)
-            ),
+            "E_ENV_KEY_INVALID",
+            format!("env key '{}' must be [A-Z_][A-Z0-9_]*", bounded_token(key)),
         ));
     }
     Ok(())
@@ -5356,18 +5357,24 @@ mod tests {
 
     #[test]
     fn env_key_validator_and_shape_predicate_agree() {
-        // CTX-0727 (#1315): the shared rule lives in `env_key_shape_ok`;
-        // `validate_env_key` only attaches typed errors. Pin agreement so
-        // the sites cannot drift.
+        // CTX-0727 (#1315), ADR 0006 normative (bitty#1751): the shared rule
+        // lives in `env_key_shape_ok`; `validate_env_key` only attaches typed
+        // errors. Pin agreement so the sites cannot drift.
+        let max = "A".repeat(ENV_KEY_MAX_BYTES);
         let long = "A".repeat(ENV_KEY_MAX_BYTES + 1);
         let cases: &[(&str, bool, Option<&str>)] = &[
             ("HOME", true, None),
-            ("_x1", true, None),
-            ("", false, Some("E_DEF_INVALID")),
-            ("9LIVES", false, Some("E_DEF_INVALID")),
-            ("has space", false, Some("E_DEF_INVALID")),
-            ("lower-ok?", false, Some("E_DEF_INVALID")),
-            (long.as_str(), false, Some("E_DEF_LIMIT")),
+            ("_X1", true, None),
+            ("A_B9", true, None),
+            (max.as_str(), true, None),
+            ("", false, Some("E_ENV_KEY_INVALID")),
+            ("9LIVES", false, Some("E_ENV_KEY_INVALID")),
+            ("has space", false, Some("E_ENV_KEY_INVALID")),
+            ("lower-ok?", false, Some("E_ENV_KEY_INVALID")),
+            ("home", false, Some("E_ENV_KEY_INVALID")),
+            ("Home", false, Some("E_ENV_KEY_INVALID")),
+            ("_x1", false, Some("E_ENV_KEY_INVALID")),
+            (long.as_str(), false, Some("E_ENV_KEY_INVALID")),
         ];
         for (key, ok, code) in cases {
             assert_eq!(env_key_shape_ok(key), *ok, "predicate for '{key}'");
@@ -5383,9 +5390,10 @@ mod tests {
 
     #[test]
     fn env_grant_shape_ok_accepts_exact_and_prefix_wildcard() {
-        // CTX-0830 (#1483): exact keys and `PREFIX*` are well-shaped grants;
-        // the bare star and non-trailing stars are not.
-        for grant in ["HOME", "_x1", "APP_*", "A_*"] {
+        // CTX-0830 (#1483), ADR 0006 normative (bitty#1751): exact keys and
+        // `PREFIX*` are well-shaped grants; the bare star and non-trailing
+        // stars are not. Lowercase never shapes, so it cannot grant.
+        for grant in ["HOME", "_X1", "APP_*", "A_*"] {
             assert!(env_grant_shape_ok(grant), "accept '{grant}'");
         }
         for grant in [
@@ -5398,6 +5406,11 @@ mod tests {
             "9LIVES*",
             "has space",
             "lower-ok?",
+            "home",
+            "Home",
+            "_x1",
+            "home*",
+            "APP_x*",
         ] {
             assert!(!env_grant_shape_ok(grant), "reject '{grant}'");
         }
@@ -5413,6 +5426,8 @@ mod tests {
     fn env_grant_authorizes_matches_exact_and_prefix() {
         // CTX-0830 (#1483): exact grants match only their own key, `PREFIX*`
         // matches keys carrying that prefix, everything else fails closed.
+        // ADR 0006 normative (bitty#1751): lowercase keys never shape, so
+        // they never authorize even under a matching prefix.
         assert!(env_grant_authorizes("HOME", "HOME"));
         assert!(!env_grant_authorizes("HOME", "HOMELY"));
         assert!(env_grant_authorizes("APP_*", "APP_TOKEN"));
@@ -5423,6 +5438,8 @@ mod tests {
         assert!(!env_grant_authorizes("AP*P", "APXP"));
         assert!(!env_grant_authorizes("HOME", "9LIVES"));
         assert!(!env_grant_authorizes("APP_*", ""));
+        assert!(!env_grant_authorizes("APP_*", "APP_token"));
+        assert!(!env_grant_authorizes("HOME", "home"));
     }
 
     #[test]

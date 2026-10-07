@@ -54,6 +54,15 @@
 //! pass paints last, on top of fills and glyphs, matching both CPU
 //! compositors. All pipelines composite over backgrounds; per-frame resource
 //! use is bounded (see `batch::plan_image_uploads`).
+//!
+//! CTX-1007 adds [`UNDERLINE_WGSL`]: the analytic underline-pattern library
+//! (`curly` sine/wavy, `dotted`/`dashed` masks, `double` gap, DPI-aware
+//! pattern thickness). It is not a fourth pipeline — the grid still ships
+//! patterns as bounded [`crate::grid::FillRect`] runs because every backend
+//! paints rectangles — but the WGSL functions are the fidelity reference
+//! the CPU quantizes, mirrored one-for-one by the `*_px` helpers in
+//! [`crate::grid`] (see `curly_sine_offset`, `dotted_params_px`,
+//! `dashed_params_px`, `double_gap_px`, `pattern_thickness`).
 
 use wgpu::{
     AddressMode, BindGroup, BindGroupLayout, BlendComponent, BlendFactor, BlendOperation,
@@ -302,6 +311,66 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let texel = textureSample(image_tex, image_sampler, uv);
     let alpha = texel.a * opacity.value;
     return vec4<f32>(texel.rgb * alpha, texel.a);
+}
+"#;
+
+/// Underline-pattern WGSL library (CTX-1007, issue #1761).
+///
+/// Analytic fidelity reference for curly (sine/wavy), dotted, dashed, and
+/// double-spacing underlines plus DPI-aware pattern thickness. The grid
+/// pipeline quantizes these exact formulas to thickness-aligned
+/// [`crate::grid::FillRect`] runs (CPUs and the fill shader both paint
+/// rectangles), so the CPU `*_px` helpers in [`crate::grid`] mirror each
+/// function one-for-one:
+///
+/// - `underline_curly_offset` <-> `curly_sine_offset` (+ quantized
+///   `curly_segment_offset_px` at `0, pi/2, pi, 3pi/2`);
+/// - `underline_dotted_mask` <-> `dotted_params_px` phase test;
+/// - `underline_dashed_mask` <-> `dashed_params_px` phase test;
+/// - `underline_double_gap` <-> `double_gap_px`;
+/// - `underline_pattern_thickness` <-> `pattern_thickness`.
+///
+/// All inputs are physical pixels; phases derive from absolute pixel
+/// columns so runs continue across cell boundaries, and every result stays
+/// total for hostile inputs (negative/zero sizes yield empty paint on the
+/// CPU side and zero coverage here).
+pub const UNDERLINE_WGSL: &str = r#"
+fn underline_pattern_thickness(cell_h: f32) -> f32 {
+    let scaled = cell_h / 8.0;
+    let cap = max(cell_h / 4.0, 2.0);
+    return clamp(scaled, 1.0, cap);
+}
+
+fn underline_curly_offset(phase: f32, amplitude: f32) -> f32 {
+    return amplitude * (0.5 - 0.5 * cos(phase));
+}
+
+fn underline_curly_phase(x: f32, wavelength: f32) -> f32 {
+    let safe_wavelength = max(wavelength, 1.0);
+    let cycles = x / safe_wavelength;
+    return (cycles - floor(cycles)) * 6.283185307179586;
+}
+
+fn underline_dotted_mask(x: f32, pitch: f32, dot: f32) -> f32 {
+    let safe_pitch = max(pitch, max(dot + 1.0, 1.0));
+    let local = x - floor(x / safe_pitch) * safe_pitch;
+    if (local < dot) {
+        return 1.0;
+    }
+    return 0.0;
+}
+
+fn underline_dashed_mask(x: f32, period: f32, dash: f32) -> f32 {
+    let safe_period = max(period, max(dash + 1.0, 1.0));
+    let local = x - floor(x / safe_period) * safe_period;
+    if (local < dash) {
+        return 1.0;
+    }
+    return 0.0;
+}
+
+fn underline_double_gap(cell_h: f32, thickness: f32) -> f32 {
+    return max(max(2.0 * thickness, cell_h / 8.0), 1.0);
 }
 "#;
 

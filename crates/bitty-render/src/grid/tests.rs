@@ -12,7 +12,9 @@ use bitty_term_state::{
 use bitty_vt::GraphemeCell;
 
 use super::{
-    CellMetrics, DEFAULT_BG, DEFAULT_FG, FAINT_ALPHA, palette_rgb, resolve_color, resolved_colors,
+    CellMetrics, DEFAULT_BG, DEFAULT_FG, FAINT_ALPHA, curly_amplitude_px, curly_segment_offset_px,
+    curly_sine_offset, curly_step_px, curly_wavelength_px, dashed_params_px, dotted_params_px,
+    double_gap_px, palette_rgb, pattern_thickness, resolve_color, resolved_colors,
     underline_thickness,
 };
 use crate::error::RenderError;
@@ -2289,4 +2291,270 @@ fn union_span_covers_emitted_spans() {
     assert_eq!(union_span(&[(0, 2), (1, 2), (7, 1)]), Some((0, 8)));
     // Adjacent spans join; zero-length spans still name their position.
     assert_eq!(union_span(&[(4, 0), (4, 2)]), Some((4, 6)));
+}
+
+// ---------------------------------------------------------------------------
+// CTX-1007 (issue #1761): underline shader fidelity — curly/dotted/dashed
+// WGSL routines, SGR 58/59 independent color, DPI/font-size scaling.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ctx1007_pattern_helpers_match_8x16_golden() {
+    // The representative 8x16 cell keeps its exact pre-CTX-1007 geometry:
+    // existing distinct-geometry tests above must not move.
+    assert_eq!(pattern_thickness(16), 2);
+    assert_eq!(underline_thickness(16), 2);
+    assert_eq!(dotted_params_px(8, 2), (4, 2));
+    assert_eq!(dashed_params_px(8, 2), (6, 3));
+    assert_eq!(curly_step_px(8, 2), 2);
+    assert_eq!(curly_wavelength_px(8, 2), 8);
+    assert_eq!(curly_amplitude_px(16, 2), 4);
+    assert_eq!(double_gap_px(16, 2), 4);
+    assert_eq!(
+        (0..4)
+            .map(|s| curly_segment_offset_px(s, 4))
+            .collect::<Vec<_>>(),
+        vec![0, 2, 4, 2]
+    );
+}
+
+#[test]
+fn ctx1007_pattern_thickness_scales_smoothly_with_dpi() {
+    // Pinned single-line thickness stays clamped, but patterned styles grow.
+    for (height, expected) in [(7u32, 1), (8, 1), (16, 2), (26, 3), (32, 4), (64, 8)] {
+        assert_eq!(pattern_thickness(height), expected, "height {height}");
+    }
+    // Double gap widens for tall cells instead of freezing at 4 px.
+    assert_eq!(double_gap_px(16, 2), 4);
+    assert_eq!(double_gap_px(32, 2), 4);
+    assert_eq!(double_gap_px(64, 2), 8);
+    // Dotted/dashed/curly params scale with cell width.
+    assert_eq!(dotted_params_px(13, 3), (7, 3));
+    assert_eq!(dotted_params_px(16, 2), (8, 2));
+    assert_eq!(dashed_params_px(13, 3), (8, 4));
+    assert_eq!(dashed_params_px(16, 2), (12, 6));
+    assert_eq!(curly_step_px(13, 3), 4);
+    assert_eq!(curly_wavelength_px(13, 3), 16);
+    assert_eq!(curly_amplitude_px(26, 3), 6);
+}
+
+#[test]
+fn ctx1007_curly_sine_mirrors_wgsl_phases() {
+    // `curly_sine_offset` is the Rust mirror of `underline_curly_offset` in
+    // UNDERLINE_WGSL; sampling at the four segment phases reproduces the
+    // quantized stair exactly (even amplitude).
+    let amp = 4.0f32;
+    let phases = [
+        0.0,
+        core::f32::consts::FRAC_PI_2,
+        core::f32::consts::PI,
+        3.0 * core::f32::consts::FRAC_PI_2,
+    ];
+    let expected = [0.0, 2.0, 4.0, 2.0];
+    for (phase, want) in phases.into_iter().zip(expected) {
+        let got = curly_sine_offset(phase, amp);
+        assert!(
+            (got - want).abs() < 1e-4,
+            "phase {phase}: got {got}, want {want}"
+        );
+    }
+    // Quantized helper agrees at the same phases.
+    for (segment, want) in [(0u32, 0u32), (1, 2), (2, 4), (3, 2)] {
+        assert_eq!(curly_segment_offset_px(segment, 4), want);
+    }
+}
+
+#[test]
+fn ctx1007_wgsl_underline_routines_present() {
+    let wgsl = crate::pipeline::UNDERLINE_WGSL;
+    for routine in [
+        "fn underline_pattern_thickness",
+        "fn underline_curly_offset",
+        "fn underline_curly_phase",
+        "fn underline_dotted_mask",
+        "fn underline_dashed_mask",
+        "fn underline_double_gap",
+    ] {
+        assert!(
+            wgsl.contains(routine),
+            "UNDERLINE_WGSL must define {routine}"
+        );
+    }
+}
+
+/// Renders one `character` with `foreground` + `underline_color` + `style`.
+fn render_with_underline_color(
+    foreground: Color,
+    underline_color: Color,
+    style: UnderlineStyle,
+    character: char,
+) -> (Vec<super::FillRect>, Vec<super::GlyphInstance>) {
+    let state = state_from(&[
+        sgr(&[
+            AttributeChange::Foreground(foreground),
+            AttributeChange::UnderlineColor(underline_color),
+            AttributeChange::Enable(Attribute::Underline(style)),
+        ]),
+        print(character),
+    ]);
+    let damage = damage_all(&state);
+    let mut grid = renderer();
+    let list = grid.render(&state.snapshot(), &damage).unwrap();
+    (list.fills, list.glyphs)
+}
+
+#[test]
+fn ctx1007_sgr58_underline_color_independent_on_curly() {
+    use bitty_term_state::Rgb;
+    // SGR 58:2::r:g:b custom underline color on a wavy line must not tint
+    // the cell text (acceptance criterion #2).
+    let fg = Color::Rgb(Rgb {
+        r: 10,
+        g: 20,
+        b: 30,
+    });
+    let ul = Color::Rgb(Rgb {
+        r: 200,
+        g: 40,
+        b: 60,
+    });
+    let (fills, glyphs) = render_with_underline_color(fg, ul, UnderlineStyle::Curly, 'W');
+    assert_eq!(glyphs.len(), 1);
+    assert_eq!(glyphs[0].color, [10, 20, 30, 255]);
+    // Background run first, then the curly wave rects — all in underline
+    // color, none in foreground color.
+    assert!(fills.len() > 1);
+    assert_eq!(fills[0].color, DEFAULT_BG);
+    for fill in fills.iter().skip(1) {
+        assert_eq!(fill.color, [200, 40, 60, 255]);
+    }
+}
+
+#[test]
+fn ctx1007_sgr58_indexed_and_sgr59_reset() {
+    // Indexed SGR 58:5:c applies to dotted/dashed too; SGR 59 (Default)
+    // falls back to the foreground.
+    let fg = Color::Indexed(2);
+    let ul = Color::Indexed(9);
+    for style in [UnderlineStyle::Dotted, UnderlineStyle::Dashed] {
+        let (fills, glyphs) = render_with_underline_color(fg, ul, style, 'x');
+        assert_eq!(glyphs.len(), 1);
+        let want_ul = resolve_color(Some(&Color::Indexed(9)), DEFAULT_FG);
+        for fill in fills.iter().skip(1) {
+            assert_eq!(fill.color, want_ul, "style {style:?}");
+        }
+    }
+    // Reset via SGR 59 maps to UnderlineColor(Default) -> foreground.
+    let state = state_from(&[
+        sgr(&[
+            AttributeChange::Foreground(Color::Indexed(2)),
+            AttributeChange::UnderlineColor(Color::Indexed(9)),
+            AttributeChange::Enable(Attribute::Underline(UnderlineStyle::Curly)),
+            AttributeChange::UnderlineColor(Color::Default),
+        ]),
+        print('W'),
+    ]);
+    let mut grid = renderer();
+    let list = grid.render(&state.snapshot(), &damage_all(&state)).unwrap();
+    let want_fg = resolve_color(Some(&Color::Indexed(2)), DEFAULT_FG);
+    assert_eq!(list.glyphs[0].color[0..3], want_fg[0..3]);
+    for fill in list.fills.iter().skip(1) {
+        assert_eq!(fill.color[0..3], want_fg[0..3]);
+    }
+}
+
+#[test]
+fn ctx1007_dashed_continues_across_cells_phase_aligned() {
+    // Two dashed cells must read as one phase-aligned run
+    // ([0,3), [6,9), [12,15)), with the middle dash split across the
+    // boundary — not two restarted patterns.
+    let fills = render_underlined(UnderlineStyle::Dashed, "  ");
+    let rects: Vec<_> = fills
+        .iter()
+        .skip(1)
+        .map(|fill| (fill.rect.x, fill.rect.y, fill.rect.width, fill.rect.height))
+        .collect();
+    assert_eq!(
+        rects,
+        vec![(0, 12, 3, 2), (6, 12, 2, 2), (8, 12, 1, 2), (12, 12, 3, 2)],
+        "dashed period-6 run must stay phase-aligned across the boundary"
+    );
+}
+
+#[test]
+fn ctx1007_underline_patterns_scale_with_dpi() {
+    // Same styles at 1x (8x16) vs 1.6x (13x26, Hyprland) vs 2x (16x32):
+    // bars thicken via pattern_thickness, the curly crest rises, dash/dot
+    // periods widen, everything stays inside its cell, and styles stay
+    // distinct at every scale.
+    for (w, h) in [(8u32, 16u32), (13, 26), (16, 32)] {
+        let cell = CellMetrics::new(w, h).unwrap();
+        let pt = pattern_thickness(h);
+        let single_thickness = underline_thickness(h);
+        let single_strip = h.saturating_sub(single_thickness.saturating_mul(2));
+        let geometry = |style| {
+            let mut grid = GridRenderer::new(FakeRasterizer::new(), &font_query(), cell).unwrap();
+            let state = state_from(&[
+                sgr(&[AttributeChange::Enable(Attribute::Underline(style))]),
+                print(' '),
+            ]);
+            let list = grid.render(&state.snapshot(), &damage_all(&state)).unwrap();
+            list.fills
+                .iter()
+                .skip(1)
+                .map(|fill| (fill.rect.x, fill.rect.y, fill.rect.width, fill.rect.height))
+                .collect::<Vec<_>>()
+        };
+        let single = geometry(UnderlineStyle::Single);
+        let dotted = geometry(UnderlineStyle::Dotted);
+        let dashed = geometry(UnderlineStyle::Dashed);
+        let curly = geometry(UnderlineStyle::Curly);
+        let double = geometry(UnderlineStyle::Double);
+        // Single stays one full-width bar on the strip with pinned thickness.
+        assert_eq!(
+            single,
+            vec![(0, single_strip as i32, w, single_thickness)],
+            "{w}x{h} single"
+        );
+        // Patterned bars use the DPI-aware thickness.
+        for rect in dotted.iter().chain(dashed.iter()).chain(curly.iter()) {
+            assert_eq!(rect.3, pt, "{w}x{h} patterned bar height");
+            assert!(
+                rect.1 >= 0 && rect.1 + rect.3 as i32 <= h as i32,
+                "{w}x{h} decoration leaves the cell"
+            );
+        }
+        // Double keeps two full-width bars separated by the refined gap.
+        assert_eq!(double.len(), 2, "{w}x{h} double");
+        let gap = double_gap_px(h, underline_thickness(h));
+        assert_eq!(double[0].1 - double[1].1, gap as i32, "{w}x{h} double gap");
+        // Pairwise distinctness holds at every scale.
+        assert_ne!(single, dotted, "{w}x{h}");
+        assert_ne!(single, dashed, "{w}x{h}");
+        assert_ne!(single, curly, "{w}x{h}");
+        assert_ne!(dotted, dashed, "{w}x{h}");
+        assert_ne!(dotted, curly, "{w}x{h}");
+        assert_ne!(dashed, curly, "{w}x{h}");
+    }
+    // Spot-check scaled values: 13x26 thickens to 3 px with a higher crest.
+    let curly_26: Vec<_> = {
+        let cell = CellMetrics::new(13, 26).unwrap();
+        let mut grid = GridRenderer::new(FakeRasterizer::new(), &font_query(), cell).unwrap();
+        let state = state_from(&[
+            sgr(&[AttributeChange::Enable(Attribute::Underline(
+                UnderlineStyle::Curly,
+            ))]),
+            print(' '),
+        ]);
+        let list = grid.render(&state.snapshot(), &damage_all(&state)).unwrap();
+        list.fills
+            .iter()
+            .skip(1)
+            .map(|fill| (fill.rect.x, fill.rect.y, fill.rect.width, fill.rect.height))
+            .collect()
+    };
+    assert!(
+        curly_26.iter().any(|(_, y, _, _)| *y <= 16),
+        "26px curly crest must rise above the 8x16 crest row 8, got {curly_26:?}"
+    );
 }

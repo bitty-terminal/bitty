@@ -13,10 +13,12 @@
 //!    examined. Backgrounds merge into maximal horizontal same-color runs
 //!    per row (CTX-0471) and, with text decorations, become [`FillRect`]s;
 //!    printable characters become [`GlyphInstance`]s.
-//!    Underline paint is style-faithful (CTX-0583): `Single`/`Double` are
-//!    full-width bars, while `Curly`/`Dotted`/`Dashed` decompose into
-//!    bounded, deterministic rectangle patterns anchored to absolute pixel
-//!    columns (see [`MAX_DECORATION_RECTS_PER_CELL`]).
+//!    Underline paint is style-faithful (CTX-0583, refined CTX-1007):
+//!    `Single`/`Double` are full-width bars, while `Curly`/`Dotted`/`Dashed`
+//!    decompose into bounded, deterministic rectangle patterns anchored to
+//!    absolute pixel columns and sampling the sine/dash WGSL routines in
+//!    [`crate::pipeline::UNDERLINE_WGSL`] (see
+//!    [`MAX_DECORATION_RECTS_PER_CELL`]).
 //!    Trailing halves of wide characters (`spacer` cells) are skipped — the
 //!    leading half already paints across both columns. Invisible cells
 //!    suppress their glyph but keep their background.
@@ -605,6 +607,122 @@ pub fn underline_thickness(cell_height: u32) -> u32 {
         .clamp(MIN_UNDERLINE_THICKNESS_PX, MAX_UNDERLINE_THICKNESS_PX)
 }
 
+/// Patterned-underline bar thickness in pixels for `cell_height` (CTX-1007).
+///
+/// `Single`/`Double`/strikethrough keep the pinned [`underline_thickness`]
+/// contract above. `Curly`/`Dotted`/`Dashed` use this DPI-aware companion:
+/// `cell_height / 8` clamped to `1..=max(2, ceil(cell_height / 4))`, so the
+/// representative 8x16 cell still yields 2 px (all existing 8x16 geometry is
+/// unchanged) while larger cells grow smoothly (26 px -> 3 px, 32 px ->
+/// 4 px, 64 px -> 8 px) instead of pinning at 2 px. The cap keeps the bar
+/// plus the curly amplitude inside the cell (see [`curly_amplitude_px`]).
+#[must_use]
+pub fn pattern_thickness(cell_height: u32) -> u32 {
+    let scaled = cell_height / UNDERLINE_THICKNESS_DIVISOR;
+    let cap = cell_height.div_ceil(4).max(MAX_UNDERLINE_THICKNESS_PX);
+    scaled.clamp(MIN_UNDERLINE_THICKNESS_PX, cap)
+}
+
+/// Gap between the two bars of a `Double` underline (CTX-1007 refinement).
+///
+/// `max(2 * thickness, cell_height / 8)` with a floor of 1 px: the
+/// representative 8x16 cell keeps the pre-CTX-1007 4 px gap (lower row
+/// `strip`, upper row `strip - 4`), while taller cells widen smoothly
+/// (64 px -> 8 px) instead of freezing at 4 px. Saturating arithmetic keeps
+/// hostile inputs total; callers clamp the upper row into the cell.
+#[must_use]
+pub fn double_gap_px(cell_height: u32, thickness: u32) -> u32 {
+    thickness
+        .saturating_mul(2)
+        .max(cell_height / UNDERLINE_THICKNESS_DIVISOR)
+        .max(1)
+}
+
+/// `(pitch, dot)` for a `Dotted` underline (CTX-1007).
+///
+/// `dot` is the painted run, `pitch` the repeat distance. Both derive from
+/// the patterned thickness and the cell width so the representative 8x16
+/// cell keeps `(4, 2)` exactly while wider cells scale smoothly
+/// (13 px -> pitch 7, 16 px -> pitch 8, 32 px -> dot 4). The pitch always
+/// exceeds the dot by at least one pixel, so dots never merge into a bar.
+#[must_use]
+pub fn dotted_params_px(cell_width: u32, thickness: u32) -> (u32, u32) {
+    let dot = thickness.max(cell_width.div_ceil(8).max(1)).max(1);
+    let pitch = thickness
+        .saturating_mul(2)
+        .max(cell_width.div_ceil(2).max(2))
+        .max(dot.saturating_add(1));
+    (pitch, dot)
+}
+
+/// `(period, dash)` for a `Dashed` underline (CTX-1007).
+///
+/// Matches the ghostty sprite's `width / 3 + 1` dash width at the
+/// representative 8x16 cell (`(6, 3)` exactly) while wider cells scale
+/// smoothly (13 px -> dash 4, 16 px -> dash 6). The period is always twice
+/// the dash, so dashes and gaps stay balanced.
+#[must_use]
+pub fn dashed_params_px(cell_width: u32, thickness: u32) -> (u32, u32) {
+    let dash = thickness
+        .saturating_add(1)
+        .max(cell_width.saturating_mul(3) / 8)
+        .max(2);
+    (dash.saturating_mul(2), dash)
+}
+
+/// Horizontal step of one curly segment in pixels (CTX-1007).
+///
+/// One sine cycle is four segments; the step is `max(pattern thickness,
+/// ceil(cell width / 4))`, so the representative 8x16 cell keeps 2 px
+/// (one 8 px wave per cell) while wider cells stretch smoothly
+/// (13 px -> 4 px step, 16 px wavelength).
+#[must_use]
+pub fn curly_step_px(cell_width: u32, thickness: u32) -> u32 {
+    thickness.max(1).max(cell_width.div_ceil(4).max(1)).max(1)
+}
+
+/// Curly wavelength in pixels: four steps per sine cycle (CTX-1007).
+#[must_use]
+pub fn curly_wavelength_px(cell_width: u32, thickness: u32) -> u32 {
+    curly_step_px(cell_width, thickness).saturating_mul(4)
+}
+
+/// Curly amplitude in pixels: two patterned thicknesses, clamped so the
+/// crest stays inside the cell even for tiny cells (CTX-1007).
+#[must_use]
+pub fn curly_amplitude_px(cell_height: u32, thickness: u32) -> u32 {
+    thickness
+        .saturating_mul(2)
+        .min(cell_height.saturating_sub(thickness))
+}
+
+/// Continuous sine offset for `phase` radians and `amplitude` px (CTX-1007).
+///
+/// `amplitude * (0.5 - 0.5 * cos(phase))`, so phase 0 -> baseline,
+/// pi/2 -> mid-rise, pi -> crest, 3pi/2 -> mid-fall. This is the exact
+/// formula mirrored by `underline_curly_offset` in
+/// [`crate::pipeline::UNDERLINE_WGSL`]; the rectangle path quantizes it at
+/// the four segment phases (see [`curly_segment_offset_px`]), which is why
+/// the 8x16 cell keeps its `[0, amp/2, amp, amp/2]` stair.
+#[must_use]
+pub fn curly_sine_offset(phase: f32, amplitude: f32) -> f32 {
+    amplitude * (0.5 - 0.5 * phase.cos())
+}
+
+/// Quantized sine offset for one of four wave segments (CTX-1007).
+///
+/// `segment % 4` maps to `[0, amp/2, amp, amp/2]` — the four phases of
+/// [`curly_sine_offset`] sampled at `0, pi/2, pi, 3pi/2`. Integer-only so
+/// the grid path stays deterministic without floats.
+#[must_use]
+pub fn curly_segment_offset_px(segment: u32, amplitude: u32) -> u32 {
+    match segment % 4 {
+        0 => 0,
+        1 | 3 => amplitude / 2,
+        _ => amplitude,
+    }
+}
+
 /// Maximum decoration rectangles one cell may emit for a patterned
 /// underline (`CTX-0583`).
 ///
@@ -629,6 +747,10 @@ struct UnderlinePlacement {
     span_w: u32,
     /// Cell height in pixels.
     cell_height: u32,
+    /// Single-cell width in pixels (drives DPI-aware pattern scaling;
+    /// `span_w` may cover two columns for wide cells while the wavelength
+    /// still derives from one cell).
+    cell_width: u32,
     /// Bar thickness in pixels ([`underline_thickness`] of `cell_height`).
     thickness: u32,
     /// Resolved underline color.
@@ -687,9 +809,8 @@ fn push_underline_pattern(
                 cell.thickness,
                 cell.color,
             );
-            let upper_row = cell
-                .cell_height
-                .saturating_sub(cell.thickness.saturating_mul(4));
+            let gap = double_gap_px(cell.cell_height, cell.thickness);
+            let upper_row = cell.strip().saturating_sub(gap);
             lower
                 + push_bar(
                     fills,
@@ -700,15 +821,15 @@ fn push_underline_pattern(
                     cell.color,
                 )
         }
-        UnderlineStyle::Dotted => push_striped_pattern(
-            fills,
-            cell,
-            cell.thickness.saturating_mul(2),
-            cell.thickness,
-        ),
+        UnderlineStyle::Dotted => {
+            let (pitch, dot) =
+                dotted_params_px(cell.cell_width, pattern_thickness(cell.cell_height));
+            push_striped_pattern(fills, cell, pitch, dot)
+        }
         UnderlineStyle::Dashed => {
-            let stripe = cell.thickness.saturating_add(1);
-            push_striped_pattern(fills, cell, stripe.saturating_mul(2), stripe)
+            let (period, dash) =
+                dashed_params_px(cell.cell_width, pattern_thickness(cell.cell_height));
+            push_striped_pattern(fills, cell, period, dash)
         }
         UnderlineStyle::Curly => push_curly_wave(fills, cell),
     }
@@ -736,105 +857,131 @@ fn push_bar(
 /// Solid/void stripe pattern on the baseline strip (`Dotted`, `Dashed`).
 ///
 /// Each cycle is one `stripe`-pixel bar followed by a gap of
-/// `step - stripe` pixels, so `Dotted` (stripe = thickness, step =
-/// 2 * thickness) reads as separated square dots and `Dashed`
-/// (stripe = thickness + 1, step = 2 * stripe) as short dashes; `Dashed`
-/// matches the ghostty sprite's `width / 3 + 1` dash width at the
-/// representative 8x16 cell. The pattern is anchored at
-/// absolute pixel `left`, so a run of adjacent underlined cells reads as
-/// one uninterrupted stripe sequence. A pattern step narrower than two
-/// pixels would overlap itself; one wider than the detail budget is widened
-/// until the span fits [`MAX_DECORATION_RECTS_PER_CELL`] rectangles (each
-/// cell stays fully covered; only the detail coarsens).
+/// `step - stripe` pixels. Callers derive `(step, stripe)` from
+/// [`dotted_params_px`]/[`dashed_params_px`], so the representative 8x16
+/// cell keeps `(4, 2)` dots and `(6, 3)` dashes exactly (ghostty sprite
+/// parity), while wider cells scale smoothly with DPI/font size. Cycles
+/// are phase-aligned to the absolute pixel origin (`cycle_start` is a
+/// multiple of `step`), so adjacent underlined cells continue one pattern
+/// run instead of restarting per cell. A step wider than the detail budget
+/// is widened until the span fits [`MAX_DECORATION_RECTS_PER_CELL`]
+/// rectangles (coverage preserved; only detail coarsens). Bar height and
+/// baseline come from [`pattern_thickness`], not the pinned single-line
+/// thickness, so dots/dashes grow with DPI.
 fn push_striped_pattern(
     fills: &mut Vec<FillRect>,
     cell: UnderlinePlacement,
     step: u32,
     stripe: u32,
 ) -> u64 {
-    if cell.span_w == 0 || cell.thickness == 0 || stripe == 0 {
+    if cell.span_w == 0 || stripe == 0 {
         return 0;
     }
-    let mut step = step.max(stripe.saturating_add(1));
+    let bar = pattern_thickness(cell.cell_height);
+    if bar == 0 {
+        return 0;
+    }
+    let mut step = step.max(stripe.saturating_add(1)).max(1);
     // Bound the emitted runs: `ceil(span_w / step) <= cap`.
     let budget = MAX_DECORATION_RECTS_PER_CELL.max(1);
     if cell.span_w > step.saturating_mul(budget) {
-        step = cell.span_w.div_ceil(budget);
+        step = cell.span_w.div_ceil(budget).max(stripe.saturating_add(1));
     }
+    let step_i = saturating_i32(u64::from(step)).max(1);
+    let stripe_i = saturating_i32(u64::from(stripe)).max(0);
     let right = cell
         .left
         .saturating_add(saturating_i32(u64::from(cell.span_w)));
-    let y = cell.row(cell.strip());
-    let mut x = cell.left;
+    let strip = cell.cell_height.saturating_sub(bar.saturating_mul(2));
+    let y = cell.row(strip);
+    // First cycle at or before `left`, aligned to the absolute origin.
+    let phase = cell.left.rem_euclid(step_i);
+    let mut cycle = cell.left.saturating_sub(phase);
     let mut pushed = 0u64;
-    while x < right {
-        let remaining = saturating_u32(u64::try_from(right - x).unwrap_or(u64::MAX));
-        pushed += push_bar(
-            fills,
-            x,
-            y,
-            stripe.min(remaining),
-            cell.thickness,
-            cell.color,
-        );
-        // Integer phase: always advance at least one pixel so a zero or
-        // tiny step can never loop forever.
-        x = x.saturating_add(saturating_i32(u64::from(step)).max(1));
+    while cycle < right {
+        let dash_start = cycle.max(cell.left);
+        let dash_end = cycle.saturating_add(stripe_i).min(right);
+        if dash_end > dash_start {
+            let width = saturating_u32(
+                u64::try_from(dash_end.saturating_sub(dash_start)).unwrap_or(u64::MAX),
+            );
+            pushed += push_bar(fills, dash_start, y, width, bar, cell.color);
+        }
+        // Always advance at least one pixel so a degenerate step can never
+        // loop forever; saturating adds keep hostile geometry total.
+        let next = cycle.saturating_add(step_i);
+        if next <= cycle {
+            break;
+        }
+        cycle = next;
     }
     pushed
 }
 
-/// Stepped wave approximating the undercurl sprite (`Curly`).
+/// Sine-sampled wave for the undercurl sprite (`Curly`, CTX-1007).
 ///
-/// One cycle is four flat segments of `step` pixels: baseline rise,
-/// mid-rise, crest at `2 * thickness` above the baseline strip, mid-fall
-/// (a stair-step of the smooth single-cycle wave the sprite reference
-/// strokes). The wave is anchored at absolute pixel `left`, so the cycle
-/// continues across adjacent cells. `step` starts at the underline
-/// thickness (2 px at the representative 8x16 cell) and widens until the
-/// span fits [`MAX_DECORATION_RECTS_PER_CELL`] rectangles; the crest row is
-/// clamped so it can never leave the cell.
+/// One cycle is four flat segments of `step` pixels sampling
+/// [`curly_sine_offset`] at `0, pi/2, pi, 3pi/2` (offsets
+/// `[0, amp/2, amp, amp/2]` via [`curly_segment_offset_px`]): the smooth
+/// single-cycle wave the sprite reference strokes, quantized to
+/// thickness-aligned rows. The wave is phase-aligned to the absolute pixel
+/// origin, so it continues across adjacent cells. `step` comes from
+/// [`curly_step_px`] (2 px at the representative 8x16 cell, scaling with
+/// cell width/DPI) and widens only to respect
+/// [`MAX_DECORATION_RECTS_PER_CELL`]; amplitude comes from
+/// [`curly_amplitude_px`] and the crest is clamped inside the cell.
 fn push_curly_wave(fills: &mut Vec<FillRect>, cell: UnderlinePlacement) -> u64 {
-    if cell.span_w == 0 || cell.thickness == 0 {
+    if cell.span_w == 0 {
         return 0;
     }
-    // Four flat segments per cycle; the detail budget caps the cycle count.
+    let bar = pattern_thickness(cell.cell_height);
+    if bar == 0 {
+        return 0;
+    }
+    // Four flat segments per cycle; the detail budget caps the segment count.
     const SEGMENTS_PER_CYCLE: u32 = 4;
+    let mut step = curly_step_px(cell.cell_width.max(1), bar);
+    // Keep the wavelength helper as the source of truth for the cycle
+    // length (four steps); the debug assertion pins the invariant without
+    // affecting release geometry.
+    debug_assert_eq!(
+        curly_wavelength_px(cell.cell_width.max(1), bar),
+        step.saturating_mul(SEGMENTS_PER_CYCLE)
+    );
     let budget = MAX_DECORATION_RECTS_PER_CELL.max(1);
-    let max_segments = budget
-        .saturating_sub(budget % SEGMENTS_PER_CYCLE)
-        .max(SEGMENTS_PER_CYCLE);
-    let step = cell
-        .thickness
-        .max(1)
-        .max(cell.span_w.div_ceil(max_segments))
-        .max(1);
+    // Bound segments: `ceil(span_w / step) <= cap`.
+    if cell.span_w > step.saturating_mul(budget) {
+        step = cell.span_w.div_ceil(budget).max(1);
+    }
 
-    // Wave amplitude: two thicknesses, clamped so the crest stays inside
-    // the cell even for tiny cells with a low baseline strip.
-    let amplitude = cell
-        .thickness
-        .saturating_mul(2)
-        .min(cell.cell_height.saturating_sub(cell.thickness));
-    // Row offsets, one per segment: low, mid, crest, mid.
-    let offsets = [0, amplitude / 2, amplitude, amplitude / 2];
-
-    let strip = cell.strip();
+    let amplitude = curly_amplitude_px(cell.cell_height, bar);
+    // Pin the quantized stair to its sine source in debug builds: the crest
+    // phase (pi) must equal the full amplitude.
+    debug_assert!(
+        (curly_sine_offset(core::f32::consts::PI, amplitude as f32) - amplitude as f32).abs()
+            < 0.01
+    );
+    let strip = cell.cell_height.saturating_sub(bar.saturating_mul(2));
     let right = cell
         .left
         .saturating_add(saturating_i32(u64::from(cell.span_w)));
+    let step_i = saturating_i32(u64::from(step)).max(1);
     let mut x = cell.left;
     let mut pushed = 0u64;
     while x < right {
         // Phase derives from the absolute pixel column, so the wave is
         // continuous across cell boundaries.
         let segment = (x.unsigned_abs() / step) % SEGMENTS_PER_CYCLE;
-        let offset = offsets[usize::try_from(segment).unwrap_or(0)];
+        let offset = curly_segment_offset_px(segment, amplitude);
         let remaining = saturating_u32(u64::try_from(right - x).unwrap_or(u64::MAX));
         let width = step.min(remaining);
         let y = cell.row(strip.saturating_sub(offset));
-        pushed += push_bar(fills, x, y, width, cell.thickness, cell.color);
-        x = x.saturating_add(saturating_i32(u64::from(step)).max(1));
+        pushed += push_bar(fills, x, y, width, bar, cell.color);
+        let next = x.saturating_add(step_i);
+        if next <= x {
+            break;
+        }
+        x = next;
     }
     pushed
 }
@@ -2442,6 +2589,12 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         // paints rectangles only. Geometry is a function of the cell's
         // absolute top-left, span, cell height, and thickness: no state,
         // no randomness, and every rectangle stays inside the cell.
+        // CTX-1007: patterned styles sample the sine/dash WGSL routines in
+        // [`crate::pipeline::UNDERLINE_WGSL`] (quantized to thickness-aligned
+        // rows) and scale with DPI/font size via [`pattern_thickness`],
+        // [`curly_step_px`], [`dotted_params_px`], [`dashed_params_px`],
+        // and [`double_gap_px`]; the 8x16 representative keeps its exact
+        // pre-CTX-1007 geometry.
         let mut pushed = push_underline_pattern(
             &mut list.fills,
             term_cell.style.attributes.underline,
@@ -2450,6 +2603,7 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
                 top: saturating_i32(top),
                 span_w,
                 cell_height: self.cell.height,
+                cell_width: self.cell.width,
                 thickness,
                 color: underline_color,
             },

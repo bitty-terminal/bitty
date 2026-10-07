@@ -9,7 +9,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use bitty_platform::{CursorPosition, MouseButton, PlatformEvent, PressState, WindowEventKind};
+use bitty_platform::{
+    CursorPosition, ModifiersState, MouseButton, PlatformEvent, PressState, WindowEventKind,
+};
 use bitty_plugin_host::InterceptionDecision;
 use bitty_runtime::{Runtime, UrlActivation, UrlOpener};
 
@@ -44,7 +46,16 @@ fn window_event(kind: WindowEventKind) -> PlatformEvent {
 fn click_link(rt: &mut Runtime) {
     // Land on the live link cell (grid col 0, row 0) via public geometry
     // (CTX-0808, #1484): hard-coded `(1, 1)` is window padding and must
-    // never arm a link.
+    // never arm a link. Issue #1759 (R-005): activation requires the
+    // Ctrl/Cmd gesture modifier held during the click.
+    rt.handle_platform_event(window_event(WindowEventKind::ModifiersChanged(
+        ModifiersState {
+            shift: false,
+            control: true,
+            alt: false,
+            super_pressed: false,
+        },
+    )));
     let frame = rt.present_frames()[0];
     let (cw, ch) = rt.live_cell_size();
     let pad = f64::from(rt.window_padding_physical());
@@ -52,6 +63,12 @@ fn click_link(rt: &mut Runtime) {
         x: pad + f64::from(frame.content.x.max(0)) + 0.5 * f64::from(cw),
         y: pad + f64::from(frame.content.y.max(0)) + 0.5 * f64::from(ch),
     })));
+    // CTX-1006 press/release pairing: the press must be on the same safe
+    // link as the release, otherwise no gesture mints (release-only mints
+    // are spurious and leave border-drags stuck).
+    rt.handle_platform_event(window_event(WindowEventKind::MouseInput(
+        bitty_platform::MouseEvent::new(MouseButton::Left, PressState::Pressed),
+    )));
     rt.handle_platform_event(window_event(WindowEventKind::MouseInput(
         bitty_platform::MouseEvent::new(MouseButton::Left, PressState::Released),
     )));

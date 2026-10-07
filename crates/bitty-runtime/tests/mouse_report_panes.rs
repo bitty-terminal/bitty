@@ -28,8 +28,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bitty_platform::{
-    CursorPosition, MouseButton, MouseEvent, PlatformEvent, PressState, ScrollDelta,
-    WindowEventKind, WindowId,
+    CursorPosition, ModifiersState, MouseButton, MouseEvent, PlatformEvent, PressState,
+    ScrollDelta, WindowEventKind, WindowId,
 };
 use bitty_runtime::{
     LayoutNode, PresentFrame, Runtime, RuntimeConfig, SplitAxis, UiRect, UrlActivation, UrlOpener,
@@ -362,7 +362,18 @@ impl UrlOpener for RecordingOpener {
 }
 
 fn click_release_at(rt: &mut Runtime, pos: CursorPosition) {
+    // Issue #1759 (R-005): hyperlink activation requires Ctrl/Cmd held
+    // during the click; the latch persists for both halves.
     let window_id = WindowId::from_raw_public(1);
+    rt.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::ModifiersChanged(ModifiersState {
+            shift: false,
+            control: true,
+            alt: false,
+            super_pressed: false,
+        }),
+    });
     rt.handle_platform_event(PlatformEvent::Window {
         window_id,
         kind: WindowEventKind::CursorMoved(pos),

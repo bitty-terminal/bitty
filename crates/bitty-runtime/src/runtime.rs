@@ -885,6 +885,13 @@ pub struct Runtime {
     /// (CTX-0577); consumed together with it so the live consumer never
     /// accepts a substitute target.
     pending_activation_uri: Option<String>,
+    /// Safe OSC 8 URI under the intercepted modified left press (issue
+    /// #1759, CTX-1006 review): a modified left release mints only when its
+    /// safe URI matches this press URI, so a border-drag (or selection)
+    /// press on a divider can never arm the link under the release. Cleared
+    /// after every left release (the mint site takes it) and on any
+    /// non-link left press.
+    hyperlink_press_uri: Option<String>,
     next_activation_gesture: u64,
     /// OS hand-off for a runtime-authorized URL activation (CTX-0577).
     ///
@@ -898,6 +905,13 @@ pub struct Runtime {
     /// Count of hyperlink activations refused by the gate (no gesture, stale
     /// gesture, veto, or a URI outside the scheme allowlist).
     url_activation_refusals: u64,
+    /// OSC 8 hyperlink span under the pointer (issue #1759, R-005).
+    ///
+    /// Presentation-only hover state: refreshed on cursor motion, cleared
+    /// when the pointer leaves the window or the link goes stale, and read
+    /// by the cursor shape, the underline highlight, and the sanitized URL
+    /// preview. `None` when the pointer is not over a safe hyperlink.
+    hovered_hyperlink: Option<layout_focus::HoveredHyperlink>,
     /// User-visible bell behavior (CTX-0577, `OQ-076` policy input).
     ///
     /// Defaults to [`bell::BellMode::Visual`]: `BEL` paints a bounded,
@@ -1458,6 +1472,8 @@ impl Runtime {
             ),
             pending_activation_gesture: None,
             pending_activation_uri: None,
+            hyperlink_press_uri: None,
+            hovered_hyperlink: None,
             next_activation_gesture: 1,
             url_opener: Box::new(plugin::SystemUrlOpener),
             url_activations: 0,
@@ -1691,6 +1707,8 @@ impl Runtime {
             ),
             pending_activation_gesture: None,
             pending_activation_uri: None,
+            hyperlink_press_uri: None,
+            hovered_hyperlink: None,
             next_activation_gesture: 1,
             url_opener: Box::new(plugin::SystemUrlOpener),
             url_activations: 0,

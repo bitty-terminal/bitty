@@ -972,6 +972,20 @@ fn osc8_link_cell(rt: &Runtime) -> bitty_platform::CursorPosition {
     }
 }
 
+/// Holds Ctrl for the OSC 8 click gesture (issue #1759, R-005):
+/// activation requires Ctrl (Cmd on macOS) held during the click.
+fn hold_ctrl_for_osc8(app: &mut TerminalApp, window_id: bitty_platform::WindowId) {
+    app.runtime.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::ModifiersChanged(bitty_platform::ModifiersState {
+            shift: false,
+            control: true,
+            alt: false,
+            super_pressed: false,
+        }),
+    });
+}
+
 #[test]
 fn osc8_click_path_reaches_the_live_url_consumer() {
     // M1-17 evidence (#1143): the app's click path must consume the runtime
@@ -994,9 +1008,17 @@ fn osc8_click_path_reaches_the_live_url_consumer() {
         .handle_pty_bytes(b"\x1b]8;;https://example.test\x07link\x1b]8;;\x07");
     let window_id = bitty_platform::WindowId::from_raw_public(1);
     let link_pos = osc8_link_cell(&app.runtime);
+    hold_ctrl_for_osc8(&mut app, window_id);
     app.runtime.handle_platform_event(PlatformEvent::Window {
         window_id,
         kind: WindowEventKind::CursorMoved(link_pos),
+    });
+    app.runtime.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
+            bitty_platform::MouseButton::Left,
+            bitty_platform::PressState::Pressed,
+        )),
     });
     app.runtime.handle_platform_event(PlatformEvent::Window {
         window_id,
@@ -1034,9 +1056,17 @@ fn osc8_click_path_never_opens_a_hostile_scheme() {
         .handle_pty_bytes(b"\x1b]8;;javascript:alert(1)\x07x\x1b]8;;\x07");
     let window_id = bitty_platform::WindowId::from_raw_public(1);
     let link_pos = osc8_link_cell(&app.runtime);
+    hold_ctrl_for_osc8(&mut app, window_id);
     app.runtime.handle_platform_event(PlatformEvent::Window {
         window_id,
         kind: WindowEventKind::CursorMoved(link_pos),
+    });
+    app.runtime.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
+            bitty_platform::MouseButton::Left,
+            bitty_platform::PressState::Pressed,
+        )),
     });
     app.runtime.handle_platform_event(PlatformEvent::Window {
         window_id,
@@ -1072,6 +1102,7 @@ fn osc8_padding_click_never_arms_a_live_link() {
     app.runtime
         .handle_pty_bytes(b"\x1b]8;;https://example.test\x07link\x1b]8;;\x07");
     let window_id = bitty_platform::WindowId::from_raw_public(1);
+    hold_ctrl_for_osc8(&mut app, window_id);
     app.runtime.handle_platform_event(PlatformEvent::Window {
         window_id,
         kind: WindowEventKind::CursorMoved(bitty_platform::CursorPosition { x: 1.0, y: 1.0 }),
@@ -1089,6 +1120,89 @@ fn osc8_padding_click_never_arms_a_live_link() {
     );
     app.activate_pending_hyperlink_now();
     assert!(opened.lock().expect("poison-free").is_empty());
+}
+
+#[test]
+fn osc8_hover_syncs_the_os_pointer_shape() {
+    // Issues #1759/#1762 precedence: hover `Pointer` wins, else the focused
+    // pane's `OSC 22` shape, else `Default`. Unified on the 34-variant
+    // `cursor::CursorIcon` (`Default`/`Text`/`Pointer` map 1:1). Change-gated
+    // through `apply_cursor_icon` + `OsCursorSink`, so steady hover costs no
+    // OS call.
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        Vec::new(),
+        SpawnSpec::default(),
+    );
+    let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    app.set_os_cursor_sink(Box::new(RecordingCursorSink {
+        icons: std::sync::Arc::clone(&recorded),
+    }));
+    assert_eq!(app.window.last_applied_cursor, None);
+    app.runtime
+        .handle_pty_bytes(b"\x1b]8;;https://example.test\x07link\x1b]8;;\x07");
+    let window_id = bitty_platform::WindowId::from_raw_public(1);
+    let link_pos = osc8_link_cell(&app.runtime);
+    app.runtime.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::CursorMoved(link_pos),
+    });
+    app.sync_cursor_icon();
+    assert_eq!(
+        app.window.last_applied_cursor,
+        Some(bitty_platform::CursorIcon::Pointer),
+        "hovering the link must request the pointer shape"
+    );
+    assert_eq!(
+        recorded.lock().expect("poison-free").as_slice(),
+        [bitty_platform::CursorIcon::Pointer],
+    );
+    // Steady hover re-syncs to the same shape (change gate: no OS churn).
+    app.sync_cursor_icon();
+    assert_eq!(
+        app.window.last_applied_cursor,
+        Some(bitty_platform::CursorIcon::Pointer)
+    );
+    assert_eq!(recorded.lock().expect("poison-free").len(), 1);
+    // `OSC 22` while hovered must not override the hover pointer.
+    app.runtime.handle_pty_bytes(b"\x1b]22;wait\x07");
+    app.sync_cursor_icon();
+    assert_eq!(
+        app.window.last_applied_cursor,
+        Some(bitty_platform::CursorIcon::Pointer),
+        "hover must win over OSC 22"
+    );
+    assert_eq!(
+        recorded.lock().expect("poison-free").len(),
+        1,
+        "hover-wins must not churn the OS pointer"
+    );
+    // Leaving the link falls back to the `OSC 22` shape.
+    app.runtime.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::CursorMoved(bitty_platform::CursorPosition { x: 1.0, y: 1.0 }),
+    });
+    app.sync_cursor_icon();
+    assert_eq!(
+        app.window.last_applied_cursor,
+        Some(bitty_platform::CursorIcon::Wait),
+        "leaving the link must fall back to the OSC 22 shape"
+    );
+    // Clearing the `OSC 22` stack falls back to `Default`.
+    app.runtime.handle_pty_bytes(b"\x1b]22;\x07");
+    app.runtime.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::CursorMoved(bitty_platform::CursorPosition { x: 1.0, y: 1.0 }),
+    });
+    app.sync_cursor_icon();
+    assert_eq!(
+        app.window.last_applied_cursor,
+        Some(bitty_platform::CursorIcon::Default),
+        "empty OSC 22 stack with no hover must restore default"
+    );
 }
 
 #[test]

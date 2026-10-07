@@ -157,8 +157,9 @@ pub(crate) struct WindowState {
     /// install a recording double through `TerminalApp::set_os_title_sink`.
     pub(crate) os_title_sink: Option<Box<dyn OsTitleSink>>,
     /// Last OS cursor icon applied from the focused pane's `OSC 22` stack
-    /// (issue #1762). `None` until the first non-default icon arrives; the
-    /// change gate keeps identical icons from churning the OS pointer.
+    /// (issue #1762) unless an OSC 8 hover wins (issue #1759, R-005).
+    /// `None` until the first icon arrives; the change gate keeps identical
+    /// icons from churning the OS pointer.
     pub(crate) last_applied_cursor: Option<bitty_platform::CursorIcon>,
     /// Count of cursor-icon applications (issue #1762 diagnostics): stays
     /// at one per distinct icon, proving no per-frame churn.
@@ -961,9 +962,10 @@ impl TerminalApp {
         // it to the platform so the OS IME preedit/candidate window tracks
         // the terminal cursor (DPI-correct physical pixels, change-gated).
         self.sync_ime_cursor_area();
-        // Issue #1762: the focused pane's OSC 22 icon syncs on every tick
-        // (change-gated), so PTY-driven sets, focus moves, pane exits, and
-        // RIS resets all converge on the OS pointer without extra plumbing.
+        // Issues #1759/#1762: hover-vs-`OSC 22` precedence syncs on every tick
+        // (change-gated), so hover `Pointer` wins, else PTY-driven sets, focus
+        // moves, pane exits, and RIS resets all converge on the OS pointer
+        // without extra plumbing.
         self.sync_cursor_icon();
         if let Some(present) = stats {
             self.presented_frames += 1;
@@ -1601,15 +1603,24 @@ impl TerminalApp {
         }
     }
 
-    /// Syncs the focused pane's `OSC 22` icon to the OS window (issue #1762).
+    /// Syncs the OS pointer with hover-vs-`OSC 22` precedence (issues #1759/#1762).
     ///
-    /// Called once per tick after the IME sync: the runtime's
-    /// `cursor_icon_for_focused` already fails open to `Default` for an empty
+    /// Hover wins: an OSC 8 hover forces `Pointer`. Otherwise the focused
+    /// pane's `OSC 22` icon applies, failing open to `Default` for an empty
     /// stack, unknown focus, or a pane exit, so a focus move or `RIS`
     /// (`FullReset`) resets the pointer on the next tick without extra
-    /// plumbing. Change-gated through [`Self::apply_cursor_icon`].
+    /// plumbing. Called once per tick after the IME sync and after mouse
+    /// events. Change-gated through [`Self::apply_cursor_icon`].
     pub(crate) fn sync_cursor_icon(&mut self) {
-        let icon = self.runtime.cursor_icon_for_focused();
+        // `Default`/`Text`/`Pointer` map 1:1 between the pre-#1772 3-variant
+        // and the unified 34-variant `cursor::CursorIcon`; hover detection
+        // uses the runtime hover state, not the legacy `Text` fallback.
+        let hovered = self.runtime.hovered_hyperlink_span().is_some();
+        let icon = if hovered {
+            bitty_platform::CursorIcon::Pointer
+        } else {
+            self.runtime.cursor_icon_for_focused()
+        };
         self.apply_cursor_icon(icon);
     }
 
@@ -1846,6 +1857,10 @@ impl AppHandler for TerminalApp {
         if self.runtime.has_pending_hyperlink_activation() {
             self.activate_pending_hyperlink_now();
         }
+        // Issues #1759/#1762: hover-vs-`OSC 22` precedence — hover `Pointer`
+        // wins, else the focused pane's `OSC 22` shape, else `Default`.
+        // Change-gated inside, so steady hover costs no OS call.
+        self.sync_cursor_icon();
         // CTX-0946 C1: Core-routed plugin band clicks. The runtime owns the
         // geometry (which band row, which declared command); the application
         // dispatches each through the normal `PluginRuntime::dispatch_command`

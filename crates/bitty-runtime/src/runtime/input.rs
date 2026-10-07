@@ -966,6 +966,85 @@ impl Runtime {
         if event.button == MouseButton::Left && event.state == PressState::Pressed {
             self.focus_pointer_pane_before_capture();
         }
+        // Issue #1759 (R-005): Ctrl/Cmd+Left over a safe OSC 8 hyperlink is
+        // a terminal gesture, never child input. The press stores its safe
+        // URI; the release is consumed only when its safe URI matches the
+        // stored press URI (press/release pairing, CTX-1006 review). An
+        // unmatched release (press on a divider, plain text, or another
+        // link) falls through to the capture, scrollbar, Alt/border/tiled
+        // drag teardown, and selection paths below, so a Ctrl+press on a
+        // split divider can never stick a border-drag nor mint a spurious
+        // gesture when the release lands over a link. The release mint in
+        // `handle_platform_event` runs the same pairing gate and takes
+        // (clears) the stored URI after every left release, so a
+        // release alone can never arm a link. Shift still forces the
+        // selection path above (accessibility escape wins over links too).
+        // A matched (consumed) release still ends any active drag first
+        // (fail-closed teardown before the mint) so no drag survives the
+        // consumed release.
+        if !shift_override
+            && event.button == MouseButton::Left
+            && event.state == PressState::Pressed
+            && self.hyperlink_activation_modifier_held()
+        {
+            if let Some(pos) = self.last_cursor {
+                if let Some(uri) = self.safe_hyperlink_uri_at(pos) {
+                    self.hyperlink_press_uri = Some(uri);
+                    // CTX-0166 additive clearing: a link click dismisses any
+                    // stale highlight without touching range logic.
+                    if self.selection_state.is_some() {
+                        self.clear_selection();
+                    }
+                    return;
+                }
+            }
+            // A modified press that is not over a safe link starts a new
+            // pairing epoch: drop any stale press URI (e.g. a divider grab)
+            // so a later release over a link cannot mint from it.
+            self.hyperlink_press_uri = None;
+        }
+        if !shift_override
+            && event.button == MouseButton::Left
+            && event.state == PressState::Released
+            && self.hyperlink_activation_modifier_held()
+        {
+            if let Some(pos) = self.last_cursor {
+                if let Some(uri) = self.safe_hyperlink_uri_at(pos) {
+                    if self.hyperlink_press_uri.as_ref() == Some(&uri) {
+                        // Paired link click: end any active drag before the
+                        // mint (the mint site runs next in the platform
+                        // handler) so a consumed release never strands a
+                        // border/Alt/tiled drag or a thumb drag. The stored
+                        // press URI is left for the mint site, which takes
+                        // (clears) it after every left release.
+                        self.scrollbar_release();
+                        self.end_alt_drag();
+                        self.end_border_drag();
+                        self.end_tiled_drag();
+                        // CTX-0166 additive clearing: a link click dismisses
+                        // any stale highlight without touching range logic.
+                        if self.selection_state.is_some() {
+                            self.clear_selection();
+                        }
+                        return;
+                    }
+                }
+            }
+            // Unmatched: fall through to the normal release paths below
+            // (capture, scrollbar/Alt/border/tiled teardown, selection
+            // commit). The mint site takes and clears the stored press URI
+            // after every left release, so no clearing here (the stored
+            // value must survive until the mint gate runs).
+        }
+        // Any other left press invalidates a pending link-press pairing: a
+        // new click starts a new epoch and a stale stored URI must never
+        // arm a later release. A stored link press returned above, so any
+        // press reaching here is a non-link press (plain, Shift, or a
+        // modified press with no safe link under it, already cleared
+        // above) — clearing here stays idempotent.
+        if event.button == MouseButton::Left && event.state == PressState::Pressed {
+            self.hyperlink_press_uri = None;
+        }
         // CTX-0532: capture decision reads the focused pane's modes (primary
         // fallback for session-less leaves) — a focus change with no pump
         // must never capture with the previous pane's tracking/encoding.
@@ -1314,6 +1393,10 @@ impl Runtime {
             // Bounded: drop if PTY queue full, never block
             self.push_input_bytes(bytes.as_slice());
         }
+        // Issue #1759 (R-005): refresh the OSC 8 hover state on every motion
+        // (pointer shape, underline highlight, URL preview). Change-gated
+        // inside, so steady hover costs one bounded hit test and no redraw.
+        self.update_hyperlink_hover(pos);
     }
 
     /// Current modifier bits for a mouse report: shift `4`, alt `8`, ctrl

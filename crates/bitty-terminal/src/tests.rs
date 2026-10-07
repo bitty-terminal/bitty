@@ -6594,6 +6594,38 @@ claims = []
         "focus must actually move on the two-pane layout"
     );
 
+    // Issue #1776: Mod+q (CloseView) closes the active overlay capture.
+    app.plugin_runtime
+        .as_mut()
+        .expect("plugin runtime")
+        .dispatch_command(&pid, "reacquire", &[])
+        .expect("reacquire");
+    assert!(app.overlay_capture_active());
+    app.chrome.app_mods.alt = true;
+    let key_q = test_key(LogicalKey::Character("q".to_string()), Some("q"));
+    assert!(app.intercept_chrome_key(&WindowEventKind::KeyboardInput(key_q)));
+    assert!(
+        !app.overlay_capture_active(),
+        "Mod+q (CloseView) must close and release the overlay capture"
+    );
+    app.chrome.app_mods.alt = false;
+
+    // Issue #1776: Mod+z (ToggleZoom) suspends/releases the active overlay capture.
+    app.plugin_runtime
+        .as_mut()
+        .expect("plugin runtime")
+        .dispatch_command(&pid, "reacquire", &[])
+        .expect("reacquire");
+    assert!(app.overlay_capture_active());
+    app.chrome.app_mods.alt = true;
+    let key_z = test_key(LogicalKey::Character("z".to_string()), Some("z"));
+    assert!(app.intercept_chrome_key(&WindowEventKind::KeyboardInput(key_z)));
+    assert!(
+        !app.overlay_capture_active(),
+        "Mod+z (ToggleZoom) must suspend and release the overlay capture"
+    );
+    app.chrome.app_mods.alt = false;
+
     // Window focus loss through the intercept revokes as well.
     app.plugin_runtime
         .as_mut()

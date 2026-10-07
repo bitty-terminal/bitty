@@ -43,8 +43,9 @@
 //! - `action`: one of `goto_split:<left|right|up|down>`,
 //!   `new_split:<left|right|up|down>`, `new_panel`,
 //!   `resize_split:<left|right|up|down>`,
-//!   `close_view` (alias `close_surface`), `toggle_zoom` (alias
-//!   `toggle_split_zoom`), `focus_next`, `focus_prev`, `focus:<1..=256>`,
+//!   `close_view` (aliases `close_surface`, `close_panel`, `exit_panel`),
+//!   `toggle_zoom` (aliases `toggle_split_zoom`, `suspend_panel`, `detach_panel`),
+//!   `focus_next`, `focus_prev`, `focus:<1..=256>`,
 //!   `copy_to_clipboard`, `paste_from_clipboard`,
 //!   `scroll_page_up`, `scroll_page_down`, `increase_font_size` (aliases
 //!   `zoom_in`, `font_zoom_in`), `decrease_font_size` (aliases `zoom_out`,
@@ -63,7 +64,7 @@
 //!   `workspace_last`, `workspace_focus:<1..=16>`, `workspace_move:<1..=16>`
 //!   (CTX-0257 workspace ops entry per DEC-0034 plus CTX-0259 move, rechorded
 //!   CTX-0766: `alt+n` opens a new panel, `alt+t` opens a new workspace):
-//!   `alt+n` new panel, `alt+t` new, `alt+d` close pane/view with confirm,
+//!   `alt+n` new panel, `alt+t` new, `alt+d`/`alt+q` close pane/view with confirm,
 //!   `alt+w` close workspace with kill-confirm,
 //!   `alt+-`/`alt+=` prev/next (`=` is the unshifted DEC `+`), `alt+tab`
 //!   last-used, `alt+1..=9` jump to workspace N,
@@ -90,7 +91,7 @@
 //! `ctrl+tab` cycles, `ctrl+shift+c/v` copy/paste) plus the DEC-0034
 //! workspace entry (CTX-0257, rechorded CTX-0766): `alt+t` new workspace,
 //! `alt+1..=9` jump to
-//! workspace N, `alt+-`/`alt+=` prev/next, `alt+tab` last-used, `alt+d`
+//! workspace N, `alt+-`/`alt+=` prev/next, `alt+tab` last-used, `alt+d`/`alt+q`
 //! close pane with confirm, `alt+w` close workspace with kill-confirm,
 //! plus the Hyprland-style panel entry (CTX-0838 #1441): `alt+n`
 //! `new_panel` (adaptive dwindle axis, new-second, focus follows), plus the
@@ -648,14 +649,14 @@ pub enum ChromeAction {
     /// The per-keypress delta is `layout.resize_step` (CTX-0963, issue
     /// #1697; default `0.05`).
     ResizeSplit(SplitDir),
-    /// Close the focused pane (`close_view`, alias `close_surface`).
+    /// Close the focused pane (`close_view`, aliases `close_surface`, `close_panel`, `exit_panel`).
     ///
-    /// Default binding: `alt+d` (issue #1444). Respects the `close_confirm`
+    /// Default bindings: `alt+d`, `alt+q` (issues #1444, #1776). Respects the `close_confirm`
     /// mode: `when_busy` (default) prompts when a foreground job runs,
     /// `always` prompts unconditionally, `never` closes immediately.
     /// The first gesture arms a confirmation; repeat to confirm, `Esc` to cancel.
     CloseView,
-    /// Toggle single-pane zoom (`toggle_zoom`, alias `toggle_split_zoom`).
+    /// Toggle single-pane zoom (`toggle_zoom`, aliases `toggle_split_zoom`, `suspend_panel`, `detach_panel`).
     ToggleZoom,
     /// Toggle the help popup (`toggle_help`, alias `show_help`).
     ///
@@ -858,11 +859,20 @@ impl ChromeAction {
                 let dir = require_dir_arg(arg, trimmed)?;
                 Ok(Self::ResizeSplit(dir))
             }
-            "close_view" | "close_surface" => {
+            "close_view"
+            | "close_surface"
+            | "close_panel"
+            | "exit_panel"
+            | "close_focused_panel" => {
                 reject_arg(arg, trimmed)?;
                 Ok(Self::CloseView)
             }
-            "toggle_zoom" | "toggle_split_zoom" => {
+            "toggle_zoom"
+            | "toggle_split_zoom"
+            | "suspend_panel"
+            | "detach_panel"
+            | "suspend_focused_panel"
+            | "detach_focused_panel" => {
                 reject_arg(arg, trimmed)?;
                 Ok(Self::ToggleZoom)
             }
@@ -1242,6 +1252,8 @@ impl ResolvedKeymap {
 /// per-window font size; bare `+`/`-`/`=`/`0` stay shell input.
 /// CTX-0962 adds the Mod-aware `alt+a` floating toggle
 /// (`toggle_floating`; Super flip rebinds to `super+a`).
+/// Issue #1776 adds the Mod-aware `alt+q` close view/panel
+/// (`close_view`; Super flip rebinds to `super+q`).
 /// Plain `Tab`, bare arrows, letters, and digits are deliberately unbound so
 /// they reach the shell.
 pub const DEFAULT_KEYMAPS: &[(&str, &str)] = &[
@@ -1330,6 +1342,9 @@ pub const DEFAULT_KEYMAPS: &[(&str, &str)] = &[
     ("ctrl+shift+alt+up", "resize_split:up"),
     ("ctrl+shift+alt+right", "resize_split:right"),
     ("alt+d", "close_view"),
+    // Issue #1776: default Mod+q close view/panel with confirm (rebindable
+    // via ModKey to super+q; user-overridable via keymaps).
+    ("alt+q", "close_view"),
     ("alt+w", "workspace_close"),
     ("alt+m", "toggle_zoom"),
     ("alt+f", "toggle_zoom"),
@@ -2946,6 +2961,7 @@ mod tests {
         // close-view chord (alt+d) = 90 total, plus CTX-0952's 3 prompt
         // chords (shift+alt+pageup/pagedown + alt+o) = 93 total,
         // plus CTX-0962's 1 floating-toggle chord (alt+a) = 94 total,
+        // plus issue #1776's 1 close-view chord (alt+q) = 95 total,
         // and the full DEC
         // set resolves. Zoom chords carry
         // no `alt`, so they must stay unique under Alt and Super alike.
@@ -2953,8 +2969,8 @@ mod tests {
             let maps = default_keymaps_with_mod(mod_key).expect("defaults valid");
             assert_eq!(
                 maps.len(),
-                94,
-                "35 shipped + 4 workspace-entry chords + 4 resize chords + 16 arrow aliases + 7 zoom chords + 9 move chords + 9 swap chords + 4 help chords + 1 CTX-0766 rechord + 1 issue-1444 close-view + 3 CTX-0952 prompt chords + 1 CTX-0962 floating-toggle (W-144 retired copy-mode + search)"
+                95,
+                "35 shipped + 4 workspace-entry chords + 4 resize chords + 16 arrow aliases + 7 zoom chords + 9 move chords + 9 swap chords + 4 help chords + 1 CTX-0766 rechord + 1 issue-1444 close-view + 3 CTX-0952 prompt chords + 1 CTX-0962 floating-toggle + 1 issue-1776 close-view (W-144 retired copy-mode + search)"
             );
             let mut seen = std::collections::HashSet::new();
             for m in &maps {
@@ -3721,12 +3737,12 @@ mod tests {
         // owns exactly one action, no identity collides (with each other or
         // with the shipped defaults), and the Super rebound keeps the
         // explicit Alt spellings intact while the Super spellings stay free.
-        // The default count is 94 under Alt mod (35 shipped + 4 workspace
+        // The default count is 95 under Alt mod (35 shipped + 4 workspace
         // + 4 resize + 16 arrow + 9 move + 9 swap + 7 zoom + 4 help
         // + 1 CTX-0766 rechord + 1 issue-1444 close-view + 3 CTX-0952 prompt
-        // + 1 CTX-0962 floating-toggle; W-144 retired the copy-mode and
+        // + 1 CTX-0962 floating-toggle + 1 issue-1776 close-view; W-144 retired the copy-mode and
         // search chords).
-        // Under Super mod, alt+d becomes super+d (still counted).
+        // Under Super mod, alt+d becomes super+d, alt+q becomes super+q (still counted).
         let entries: &[(&str, &str)] = &[
             ("alt+f1", "goto_split:left"),
             ("alt+f5", "goto_split:right"),
@@ -3754,14 +3770,14 @@ mod tests {
             let defaults = default_keymaps_with_mod(mod_key).expect("defaults valid");
             assert_eq!(
                 defaults.len(),
-                94,
-                "no new shipped defaults under mod {:?} (90 + 3 CTX-0952 prompt chords + 1 CTX-0962 floating-toggle)",
+                95,
+                "no new shipped defaults under mod {:?} (90 + 3 CTX-0952 prompt chords + 1 CTX-0962 floating-toggle + 1 issue-1776 close-view)",
                 mod_key
             );
             let maps = resolve_keymaps(&mk_effective(mod_key)).expect("resolves");
             assert_eq!(
                 maps.len(),
-                94 + entries.len(),
+                95 + entries.len(),
                 "explicit binds append, never shadow, under mod {:?}",
                 mod_key
             );
@@ -4543,6 +4559,122 @@ mod tests {
             match_keymap(&maps, i_key),
             Some(ChromeAction::ScrollPageUp),
             "alt+i scrolls up (into history)"
+        );
+    }
+
+    #[test]
+    fn default_mod_q_and_panel_aliases_resolve_and_rebind() {
+        // Issue #1776: Mod+q closes pane/view by default under both Alt and Super mods.
+        let alt_maps = default_keymaps_with_mod(ModKey::Alt).expect("alt defaults valid");
+        let super_maps = default_keymaps_with_mod(ModKey::Super).expect("super defaults valid");
+
+        let q_alt = KeyRef {
+            key: KeyName::Char('q'),
+            ctrl: false,
+            alt: true,
+            shift: false,
+            super_held: false,
+        };
+        let q_super = KeyRef {
+            key: KeyName::Char('q'),
+            ctrl: false,
+            alt: false,
+            shift: false,
+            super_held: true,
+        };
+        assert_eq!(
+            match_keymap(&alt_maps, q_alt),
+            Some(ChromeAction::CloseView),
+            "alt+q closes pane under Alt mod"
+        );
+        assert_eq!(
+            match_keymap(&super_maps, q_super),
+            Some(ChromeAction::CloseView),
+            "super+q closes pane under Super mod"
+        );
+
+        // Mod+z toggles zoom / suspends panel under both Alt and Super mods.
+        let z_alt = KeyRef {
+            key: KeyName::Char('z'),
+            ctrl: false,
+            alt: true,
+            shift: false,
+            super_held: false,
+        };
+        let z_super = KeyRef {
+            key: KeyName::Char('z'),
+            ctrl: false,
+            alt: false,
+            shift: false,
+            super_held: true,
+        };
+        assert_eq!(
+            match_keymap(&alt_maps, z_alt),
+            Some(ChromeAction::ToggleZoom),
+            "alt+z toggles zoom / suspends panel under Alt mod"
+        );
+        assert_eq!(
+            match_keymap(&super_maps, z_super),
+            Some(ChromeAction::ToggleZoom),
+            "super+z toggles zoom / suspends panel under Super mod"
+        );
+
+        // Action alias parsing:
+        for alias in [
+            "close_view",
+            "close_surface",
+            "close_panel",
+            "exit_panel",
+            "close_focused_panel",
+        ] {
+            assert_eq!(
+                ChromeAction::parse(alias).expect("parses"),
+                ChromeAction::CloseView,
+                "alias {alias} maps to CloseView"
+            );
+        }
+
+        for alias in [
+            "toggle_zoom",
+            "toggle_split_zoom",
+            "suspend_panel",
+            "detach_panel",
+            "suspend_focused_panel",
+            "detach_focused_panel",
+        ] {
+            assert_eq!(
+                ChromeAction::parse(alias).expect("parses"),
+                ChromeAction::ToggleZoom,
+                "alias {alias} maps to ToggleZoom"
+            );
+        }
+
+        // Custom user rebinding via EffectiveConfig keymaps:
+        let user_cfg = EffectiveConfig {
+            keymaps: vec![
+                KeymapEntry {
+                    chord: "alt+q".into(),
+                    action: "toggle_help".into(),
+                    context: "global".into(),
+                },
+                KeymapEntry {
+                    chord: "alt+z".into(),
+                    action: "new_panel".into(),
+                    context: "global".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let custom_maps = resolve_keymaps(&user_cfg).expect("resolves custom keymaps");
+        assert_eq!(
+            match_keymap(&custom_maps, q_alt),
+            Some(ChromeAction::ToggleHelp),
+            "user rebind of alt+q overrides default CloseView"
+        );
+        assert_eq!(
+            match_keymap(&custom_maps, z_alt),
+            Some(ChromeAction::NewPanel),
+            "user rebind of alt+z overrides default ToggleZoom"
         );
     }
 }

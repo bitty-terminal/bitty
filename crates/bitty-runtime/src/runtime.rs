@@ -1250,6 +1250,10 @@ impl Runtime {
         // `pane_count` reads 0, matching primary `has_pty() == false`.
         drop(self.pty.take());
         self.pane_sessions.clear();
+        // CTX-1011 (#1775): every session is gone, so no buffered Kitty
+        // `OSC 99` group has a live owner. Drop them rather than letting a
+        // later spawn complete stale text.
+        self.kitty_assembler.clear();
         let mut joined_all = true;
         if let Some(handle) = primary_handle {
             if !join_forwarder_with_timeout(handle, timeout) {
@@ -2238,12 +2242,20 @@ impl Runtime {
     }
 
     /// Allows or denies terminal-originated notifications (`OSC 9` /
-    /// `OSC 777` / Kitty `OSC 99`, CTX-0577/CTX-1008).
+    /// `OSC 777` / Kitty `OSC 99`, CTX-0577/CTX-1008; CTX-1011 revocation).
     ///
     /// Default-deny: untrusted PTY output can never surface a desktop
     /// notification unless an embedder grants this explicitly. Denied
     /// requests are counted in [`Self::notifications_denied`], never queued.
+    /// Revoking consent (setting `false`) additionally discards every
+    /// buffered Kitty `OSC 99` partial (counted in
+    /// [`Self::kitty_partials_discarded`]): already-buffered groups are
+    /// invalidated, so re-enabling starts empty and a later chunk can never
+    /// complete pre-revocation text.
     pub fn set_osc_notification_allowed(&mut self, allowed: bool) {
+        if self.osc_notification_allowed && !allowed {
+            self.kitty_assembler.clear();
+        }
         self.osc_notification_allowed = allowed;
     }
 
@@ -2285,6 +2297,13 @@ impl Runtime {
     #[must_use]
     pub const fn kitty_partials_evicted(&self) -> u64 {
         self.kitty_assembler.evicted()
+    }
+
+    /// Kitty `OSC 99` groups discarded to session close/replacement or
+    /// consent revocation (CTX-1011, issue #1775).
+    #[must_use]
+    pub const fn kitty_partials_discarded(&self) -> u64 {
+        self.kitty_assembler.discarded()
     }
 
     /// Notifications dropped to queue overflow.
@@ -2410,14 +2429,17 @@ impl Runtime {
     }
 
     /// Applies the notification policy to one Kitty `OSC 99` chunk
-    /// (CTX-1008, issue #1763). Returns `true` when the chunk completed a
-    /// group admitted into the bounded queue.
+    /// (CTX-1008, issue #1763; CTX-1011 session-binds assembly for #1775).
+    /// Returns `true` when the chunk completed a group admitted into the
+    /// bounded queue.
     ///
-    /// Intermediate (`d=0`) chunks buffer in the bounded assembler and return
-    /// `false`. Denied chunks (no consent) are counted and never buffered,
-    /// so hostile output cannot pin assembler memory without consent.
-    /// Completed groups flow through [`Self::apply_notification_policy`]
-    /// (RC-8 plus the bridge defensive cap, bounded queue, banner).
+    /// Intermediate (`d=0`) chunks buffer in the bounded assembler keyed by
+    /// the originating drain (`kitty_origin`: `None` primary, `Some` pane)
+    /// plus its session epoch and the wire `i=`, and return `false`. Denied
+    /// chunks (no consent) are counted and never buffered, so hostile output
+    /// cannot pin assembler memory without consent. Completed groups flow
+    /// through [`Self::apply_notification_policy`] (RC-8 plus the bridge
+    /// defensive cap, bounded queue, banner).
     pub(super) fn apply_kitty_chunk_policy(
         &mut self,
         chunk: &bitty_vt::KittyNotificationChunk,
@@ -2427,7 +2449,8 @@ impl Runtime {
             self.notifications_denied = self.notifications_denied.saturating_add(1);
             return false;
         }
-        let Some(notification) = self.kitty_assembler.push_chunk(chunk) else {
+        let stream = bell::KittyStreamId::from_origin(self.kitty_origin);
+        let Some(notification) = self.kitty_assembler.push_chunk(stream, chunk) else {
             return false;
         };
         self.apply_notification_policy(&notification, now)

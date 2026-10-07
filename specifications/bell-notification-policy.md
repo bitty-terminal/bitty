@@ -70,6 +70,25 @@ Rules:
 5. **Plugin observation unchanged.** The bounded plugin-visible
    `HostObservation::Bell` / `terminal.bell` bridge is independent of the
    display policy; silencing the display never silences plugins.
+6. **Session-bound Kitty assembly (CTX-1011, issue #1775).** Chunked Kitty
+   `OSC 99` groups assemble by `(originating stream, session epoch, i=)`,
+   not by `i=` alone (the empty default `i=` included). The stream is the
+   PTY drain that emitted the chunk (primary vs. pane origin token); the
+   epoch advances on every discard. A pending `d=0` group from one stream
+   can never be appended to or completed by another stream's chunk: the
+   foreign completion emits from its own payload alone and leaves the
+   pending group untouched.
+7. **Stale-group discard on close/replacement (CTX-1011).** A pane
+   close/replacement discards that pane's pending groups (counted in
+   `kitty_partials_discarded`) and advances its epoch; a primary
+   (re)spawn discards the primary's groups; shutdown discards all. A later
+   session reusing the same stream token (same `ViewId`) starts empty and
+   can never complete pre-close text.
+8. **Consent-revocation invalidates buffered groups (CTX-1011).**
+   Setting `set_osc_notification_allowed(false)` discards every buffered
+   Kitty `OSC 99` group (counted in `kitty_partials_discarded`).
+   Re-enabling starts empty: a later chunk can never complete text buffered
+   before the revocation.
 
 ## Owner-pending surfaces
 
@@ -96,8 +115,10 @@ Rules:
   plus fail-closed base64) plus `TerminalAction::OscNotification` and
   `TerminalAction::KittyNotificationChunk` in `crates/bitty-vt/src/action.rs`.
 - Policy and bounds: `crates/bitty-runtime/src/runtime/bell.rs` (RC-8 limiter,
-  bounded queue, `KittyNotificationAssembler` with `KITTY_PARTIALS_CAPACITY`
-  groups and `KITTY_ASSEMBLED_MAX_CHARS` sides).
+  bounded queue, session-bound `KittyNotificationAssembler` keyed by
+  `(stream, epoch, i=)` with `KITTY_PARTIALS_CAPACITY` groups,
+  `KITTY_ASSEMBLED_MAX_CHARS` sides, `discarded` session/revocation
+  accounting).
 - Bridge consumption: `crates/bitty-runtime/Cargo.toml`
   (`bitty-platform-services` exact-rev pin, same pattern as
   `bitty-network-wire`) and `crates/bitty-runtime/src/runtime.rs`
@@ -110,7 +131,8 @@ Rules:
   rate limit, bounded queue, sanitization, expiry) plus
   `crates/bitty-runtime/tests/m1_kitty_notification.rs` (Kitty consent,
   chunked assembly, base64, rapid-output RC-8, mixed-budget sharing,
-  hostile sanitization) and
+  hostile sanitization, plus CTX-1011 cross-stream isolation incl. empty
+  `i=`, stale-after-replace rejection, and revocation discard) and
   `crates/bitty-runtime/tests/m1_bell_os_delivery.rs` (sink seams).
 
 Terminal state treats the notification actions as inert by contract, so the

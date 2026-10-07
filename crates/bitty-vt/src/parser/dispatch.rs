@@ -9,10 +9,10 @@ use super::{Bridge, sub_params};
 use crate::action::{
     CharsetSlot, CharsetTable, ClipboardOp, Col, ControlChar, Count, CursorStyle, Direction,
     DynamicColorOp, DynamicColorTarget, EnhancedKeyboardOp, EnhancedKeyboardSetMode,
-    EraseDisplayMode, EraseLineMode, GraphemeCell, Hyperlink, MAX_OSC4_OPS, Mode,
+    EraseDisplayMode, EraseLineMode, GraphemeCell, Hyperlink, MAX_OSC4_OPS, MAX_OSC22_SHAPES, Mode,
     MouseCoordinateEncoding, MouseTrackingMode, Notification, NotificationSource, PaletteColorOp,
-    PaletteOp, Rgb, Row, SequenceKind, StatusKind, TabTargets, TerminalAction,
-    UnrecognizedSequence, ZoneKind,
+    PaletteOp, PointerShape, PointerShapeOp, Rgb, Row, SequenceKind, StatusKind, TabTargets,
+    TerminalAction, UnrecognizedSequence, ZoneKind,
 };
 use crate::bounded::{BoundedBytes, BoundedString};
 use vte::{Params, Perform};
@@ -393,6 +393,68 @@ fn parse_palette_index(raw: &[u8]) -> Option<u8> {
         value = value * 10 + u32::from(digit - b'0');
     }
     u8::try_from(value).ok()
+}
+
+/// Parses an `OSC 22` pointer-shape payload (issue #1762, kitty pointer-shapes).
+///
+/// Accepted shapes (kitty `pointer-shapes.rst`):
+/// - `<empty>` → `Set { shape: None }` (reset to default).
+/// - `[=]<name>` → `Set { shape: Some }` (unknown names fail open to `Default`).
+/// - `>name[,name...]` → `Push { shapes }` (1..=[`MAX_OSC22_SHAPES`], last is top;
+///   unknown names map per-entry to `Default`).
+/// - `<[ignored]>` → `Pop` (trailing names ignored).
+/// - `?...` → `None` (queries deferred as inert `OscUnknown`; no reply synthesized).
+///
+/// The input is already length-bounded by the parser's OSC collector. Payload
+/// bytes join with `;` (a `;` never appears in a valid shape payload, so its
+/// presence fails open to `Default` via the name lookup). Matching is exact
+/// after ASCII-whitespace trimming; non-UTF8 fails open to `Default`.
+fn parse_osc22(rest: &[&[u8]]) -> Option<PointerShapeOp> {
+    let payload = join_segments(rest);
+    let text = std::str::from_utf8(&payload).ok()?;
+    let trimmed = text.trim_matches(|c: char| c.is_ascii_whitespace());
+    if trimmed.is_empty() {
+        return Some(PointerShapeOp::Set { shape: None });
+    }
+    if let Some(_query) = trimmed.strip_prefix('?') {
+        // Queries (`?__current__`, `?name,...`) are deferred: no reply
+        // synthesis in this slice (ghostty/foot parity: no stack queries).
+        return None;
+    }
+    if trimmed.starts_with('<') {
+        // Pop: the trailing name list is ignored per spec.
+        return Some(PointerShapeOp::Pop);
+    }
+    if let Some(list) = trimmed.strip_prefix('>') {
+        let mut shapes = Vec::new();
+        for raw in list.split(',') {
+            let name = raw.trim_matches(|c: char| c.is_ascii_whitespace());
+            if name.is_empty() {
+                continue;
+            }
+            if shapes.len() >= MAX_OSC22_SHAPES {
+                return None;
+            }
+            shapes.push(PointerShape::from_name(name).unwrap_or(PointerShape::Default));
+        }
+        if shapes.is_empty() {
+            return None;
+        }
+        return Some(PointerShapeOp::Push {
+            shapes: shapes.into_boxed_slice(),
+        });
+    }
+    // Set: optional leading `=` plus a single shape name.
+    let name = trimmed.strip_prefix('=').unwrap_or(trimmed);
+    let name = name.trim_matches(|c: char| c.is_ascii_whitespace());
+    if name.is_empty() {
+        return Some(PointerShapeOp::Set { shape: None });
+    }
+    // A `,` or `;` never appears in a single-shape set; its presence means a
+    // malformed push-as-set, which fails open to the default pointer rather
+    // than guessing an entry.
+    let shape = PointerShape::from_name(name).unwrap_or(PointerShape::Default);
+    Some(PointerShapeOp::Set { shape: Some(shape) })
 }
 
 impl<F: FnMut(TerminalAction)> Perform for Bridge<'_, F> {
@@ -920,6 +982,19 @@ impl<F: FnMut(TerminalAction)> Perform for Bridge<'_, F> {
                 };
                 self.emit(TerminalAction::OscPromptMark { kind, exit_code });
             }
+            // OSC 22 pointer shapes (issue #1762, kitty pointer-shapes).
+            // Set/push/pop classify to `OscPointerShape`; queries (`?...`)
+            // and over-cap pushes stay inert `OscUnknown` (deferred, no reply).
+            22 => match parse_osc22(rest) {
+                Some(op) => self.emit(TerminalAction::OscPointerShape { op }),
+                None => {
+                    let data = join_segments(rest);
+                    self.emit(TerminalAction::OscUnknown {
+                        id,
+                        data: BoundedBytes::new(data),
+                    });
+                }
+            },
             _ => {
                 let data = join_segments(rest);
                 self.emit(TerminalAction::OscUnknown {

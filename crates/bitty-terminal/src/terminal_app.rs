@@ -92,6 +92,26 @@ impl OsTitleSink for WindowHandle {
     }
 }
 
+/// OS cursor-icon handoff boundary (issue #1762, `OSC 22`).
+///
+/// `WindowHandle::set_cursor_icon` needs a live winit window, so the OS
+/// pointer itself cannot be asserted headlessly. Routing every icon through
+/// this one seam means the call sequence a test double records is exactly
+/// the production call sequence: production installs the [`WindowHandle`]
+/// wrapper (done when the window is created), and tests install a recording
+/// double instead. There is no separate test-only branch in
+/// `apply_cursor_icon`.
+pub(crate) trait OsCursorSink {
+    /// Hands a cursor icon to the OS window.
+    fn set_os_cursor(&self, icon: bitty_platform::CursorIcon);
+}
+
+impl OsCursorSink for WindowHandle {
+    fn set_os_cursor(&self, icon: bitty_platform::CursorIcon) {
+        WindowHandle::set_cursor_icon(self, icon);
+    }
+}
+
 /// OS-window bookkeeping coalesced out of `TerminalApp` (CTX-0481 state
 /// slimming): the handle, its identity, the resolved static title, opacity,
 /// and the IME/title synchronization counters all move together and share
@@ -136,6 +156,18 @@ pub(crate) struct WindowState {
     /// production sets this when the window handle is created, and tests
     /// install a recording double through `TerminalApp::set_os_title_sink`.
     pub(crate) os_title_sink: Option<Box<dyn OsTitleSink>>,
+    /// Last OS cursor icon applied from the focused pane's `OSC 22` stack
+    /// (issue #1762). `None` until the first non-default icon arrives; the
+    /// change gate keeps identical icons from churning the OS pointer.
+    pub(crate) last_applied_cursor: Option<bitty_platform::CursorIcon>,
+    /// Count of cursor-icon applications (issue #1762 diagnostics): stays
+    /// at one per distinct icon, proving no per-frame churn.
+    pub(crate) cursor_applies: u64,
+    /// Cursor-handoff boundary (issue #1762). `None` headlessly (no window),
+    /// in which case application still records state but performs no OS call;
+    /// production sets this when the window handle is created, and tests
+    /// install a recording double through `TerminalApp::set_os_cursor_sink`.
+    pub(crate) os_cursor_sink: Option<Box<dyn OsCursorSink>>,
 }
 
 impl WindowState {
@@ -151,6 +183,9 @@ impl WindowState {
             last_applied_title: None,
             title_applies: 0,
             os_title_sink: None,
+            last_applied_cursor: None,
+            cursor_applies: 0,
+            os_cursor_sink: None,
         }
     }
 }
@@ -926,6 +961,10 @@ impl TerminalApp {
         // it to the platform so the OS IME preedit/candidate window tracks
         // the terminal cursor (DPI-correct physical pixels, change-gated).
         self.sync_ime_cursor_area();
+        // Issue #1762: the focused pane's OSC 22 icon syncs on every tick
+        // (change-gated), so PTY-driven sets, focus moves, pane exits, and
+        // RIS resets all converge on the OS pointer without extra plumbing.
+        self.sync_cursor_icon();
         if let Some(present) = stats {
             self.presented_frames += 1;
             // CTX-0592: emit the real-window first-frame marker exactly once
@@ -1543,6 +1582,49 @@ impl TerminalApp {
         self.window.os_title_sink = Some(sink);
     }
 
+    /// Applies a change-gated cursor icon to the OS window (issue #1762).
+    ///
+    /// Identical icons are dropped so the OS pointer never churns per frame;
+    /// `cursor_applies` counts real applications. The OS handoff goes through
+    /// [`WindowState::os_cursor_sink`]: production installs the
+    /// [`WindowHandle`] wrapper at window creation, so this method has one
+    /// production code path that a recording test double observes exactly.
+    /// Headlessly (no sink) state is still recorded but no OS call is made.
+    pub(crate) fn apply_cursor_icon(&mut self, icon: bitty_platform::CursorIcon) {
+        if self.window.last_applied_cursor == Some(icon) {
+            return;
+        }
+        self.window.last_applied_cursor = Some(icon);
+        self.window.cursor_applies += 1;
+        if let Some(sink) = self.window.os_cursor_sink.as_ref() {
+            sink.set_os_cursor(icon);
+        }
+    }
+
+    /// Syncs the focused pane's `OSC 22` icon to the OS window (issue #1762).
+    ///
+    /// Called once per tick after the IME sync: the runtime's
+    /// `cursor_icon_for_focused` already fails open to `Default` for an empty
+    /// stack, unknown focus, or a pane exit, so a focus move or `RIS`
+    /// (`FullReset`) resets the pointer on the next tick without extra
+    /// plumbing. Change-gated through [`Self::apply_cursor_icon`].
+    pub(crate) fn sync_cursor_icon(&mut self) {
+        let icon = self.runtime.cursor_icon_for_focused();
+        self.apply_cursor_icon(icon);
+    }
+
+    /// Installs a cursor-handoff sink, replacing any previous one (issue #1762).
+    ///
+    /// Production calls this once at window creation with the live
+    /// [`WindowHandle`]; tests call it with a recording double so the exact
+    /// call sequence applied to the OS can be asserted without a window
+    /// system. Replacing is intentional: a re-created window must not leave a
+    /// stale sink behind.
+    #[cfg(test)]
+    pub(crate) fn set_os_cursor_sink(&mut self, sink: Box<dyn OsCursorSink>) {
+        self.window.os_cursor_sink = Some(sink);
+    }
+
     /// Live OSC 8 click-to-open consumer (CTX-0577, M1-17 / issue #1143).
     ///
     /// Called after a mouse event when the runtime has armed a hyperlink
@@ -1848,6 +1930,11 @@ impl AppHandler for TerminalApp {
                             // application flows through the same seam tests
                             // observe with a recording double.
                             self.window.os_title_sink = Some(Box::new(handle.clone()));
+                            // Issue #1762: install the cursor-handoff sink at
+                            // the same production site, so OSC 22 icon
+                            // application flows through the same seam tests
+                            // observe with a recording double.
+                            self.window.os_cursor_sink = Some(Box::new(handle.clone()));
                             self.window.handle = Some(handle);
                             // Single-window vertical slice: try real GPU attach with crossfont atlas.
                             // On headless CI this fails with NoCompatibleAdapter and we stay headless

@@ -8,9 +8,10 @@ use super::*;
 use crate::action::{
     Attribute, AttributeChange, AttributeDiff, CharsetSlot, CharsetTable, ClipboardOp, Col, Color,
     ControlChar, Count, CursorStyle, Direction, DynamicColorOp, DynamicColorTarget,
-    EraseDisplayMode, EraseLineMode, GraphemeCell, Hyperlink, MAX_OSC4_OPS, Mode,
-    MouseTrackingMode, Notification, NotificationSource, PaletteColorOp, PaletteOp, Rgb, Row,
-    SequenceKind, StatusKind, TabTargets, UnderlineStyle, UnrecognizedSequence, ZoneKind,
+    EraseDisplayMode, EraseLineMode, GraphemeCell, Hyperlink, MAX_OSC4_OPS, MAX_OSC22_SHAPES, Mode,
+    MouseTrackingMode, Notification, NotificationSource, PaletteColorOp, PaletteOp, PointerShape,
+    PointerShapeOp, Rgb, Row, SequenceKind, StatusKind, TabTargets, UnderlineStyle,
+    UnrecognizedSequence, ZoneKind,
 };
 use crate::bounded::{BoundedBytes, BoundedString};
 
@@ -1256,6 +1257,202 @@ fn osc_prompt_marks_map_zone_letters() {
             id: 133,
             data: BoundedBytes::new(b"Z".to_vec()),
         }]
+    );
+}
+
+#[test]
+fn osc22_set_maps_names_and_terminators() {
+    // Issue #1762: `OSC 22 ; <name>` sets the pointer shape; both BEL and
+    // ST (`ESC \`) terminate identically.
+    for (payload, shape) in [
+        ("pointer", PointerShape::Pointer),
+        ("text", PointerShape::Text),
+        ("crosshair", PointerShape::Crosshair),
+        ("default", PointerShape::Default),
+        ("col-resize", PointerShape::ColResize),
+        ("row-resize", PointerShape::RowResize),
+        ("not-allowed", PointerShape::NotAllowed),
+        ("grab", PointerShape::Grab),
+        ("grabbing", PointerShape::Grabbing),
+        ("wait", PointerShape::Wait),
+        ("help", PointerShape::Help),
+        ("move", PointerShape::Move),
+        ("cell", PointerShape::Cell),
+        ("vertical-text", PointerShape::VerticalText),
+        ("zoom-in", PointerShape::ZoomIn),
+        ("zoom-out", PointerShape::ZoomOut),
+    ] {
+        let bel = format!("\x1b]22;{payload}\x07").into_bytes();
+        let st = format!("\x1b]22;{payload}\x1b\\").into_bytes();
+        for sequence in [&bel, &st] {
+            assert_eq!(
+                parse(sequence),
+                vec![TerminalAction::OscPointerShape {
+                    op: PointerShapeOp::Set { shape: Some(shape) }
+                }],
+                "payload {payload:?} must parse"
+            );
+        }
+    }
+    // Explicit `=` set prefix is equivalent to the bare form.
+    assert_eq!(
+        parse(b"\x1b]22;=pointer\x07"),
+        vec![TerminalAction::OscPointerShape {
+            op: PointerShapeOp::Set {
+                shape: Some(PointerShape::Pointer)
+            }
+        }]
+    );
+}
+
+#[test]
+fn osc22_empty_resets_and_unknown_fails_open_to_default() {
+    // An empty payload resets to the default pointer.
+    for sequence in [&b"\x1b]22;\x07"[..], &b"\x1b]22;\x1b\\"[..]] {
+        assert_eq!(
+            parse(sequence),
+            vec![TerminalAction::OscPointerShape {
+                op: PointerShapeOp::Set { shape: None }
+            }]
+        );
+    }
+    // Unknown names fail open to the default pointer (never inert, never a
+    // panic): the presentation bound in the kitty-family scope decision.
+    for sequence in [
+        &b"\x1b]22;no-such-cursor\x07"[..],
+        &b"\x1b]22;POINTER\x07"[..],
+        &b"\x1b]22;pointer,wait\x07"[..],
+    ] {
+        assert_eq!(
+            parse(sequence),
+            vec![TerminalAction::OscPointerShape {
+                op: PointerShapeOp::Set {
+                    shape: Some(PointerShape::Default)
+                }
+            }],
+            "unknown must fail open to Default"
+        );
+    }
+}
+
+#[test]
+fn osc22_x11_aliases_map_to_css_equivalents() {
+    // xterm `pointerShape` compat: X11 cursor-font names resolve to their CSS
+    // equivalents (the simplest `OSC 22` form stays xterm-compatible).
+    for (alias, shape) in [
+        ("left_ptr", PointerShape::Default),
+        ("hand2", PointerShape::Pointer),
+        ("watch", PointerShape::Wait),
+        ("xterm", PointerShape::Text),
+        ("ibeam", PointerShape::Text),
+        ("cross", PointerShape::Crosshair),
+        ("plus", PointerShape::Cell),
+        ("fleur", PointerShape::Grab),
+        ("size_hor", PointerShape::EwResize),
+        ("size_ver", PointerShape::NsResize),
+    ] {
+        let sequence = format!("\x1b]22;{alias}\x07").into_bytes();
+        assert_eq!(
+            parse(&sequence),
+            vec![TerminalAction::OscPointerShape {
+                op: PointerShapeOp::Set { shape: Some(shape) }
+            }],
+            "alias {alias:?} must map"
+        );
+    }
+}
+
+#[test]
+fn osc22_push_pop_classify_and_queries_stay_inert() {
+    // Push classifies a comma list (last is the top/current).
+    assert_eq!(
+        parse(b"\x1b]22;>pointer,wait\x07"),
+        vec![TerminalAction::OscPointerShape {
+            op: PointerShapeOp::Push {
+                shapes: vec![PointerShape::Pointer, PointerShape::Wait].into_boxed_slice()
+            }
+        }]
+    );
+    // Unknown entries in a push fail open per-entry to Default.
+    assert_eq!(
+        parse(b"\x1b]22;>pointer,no-such,wait\x07"),
+        vec![TerminalAction::OscPointerShape {
+            op: PointerShapeOp::Push {
+                shapes: vec![
+                    PointerShape::Pointer,
+                    PointerShape::Default,
+                    PointerShape::Wait
+                ]
+                .into_boxed_slice()
+            }
+        }]
+    );
+    // Pop ignores any trailing names.
+    for sequence in [&b"\x1b]22;<\x07"[..], &b"\x1b]22;<pointer,wait\x07"[..]] {
+        assert_eq!(
+            parse(sequence),
+            vec![TerminalAction::OscPointerShape {
+                op: PointerShapeOp::Pop
+            }]
+        );
+    }
+    // Queries are deferred: no reply is synthesized, the sequence stays inert
+    // `OscUnknown` telemetry (ghostty/foot parity: no stack queries).
+    for sequence in [
+        &b"\x1b]22;?__current__\x07"[..],
+        &b"\x1b]22;?pointer,wait\x07"[..],
+    ] {
+        assert!(
+            matches!(
+                parse(sequence).as_slice(),
+                [TerminalAction::OscUnknown { id: 22, .. }]
+            ),
+            "queries must stay inert"
+        );
+    }
+    // Over-cap pushes fail closed as inert (bounds one sequence's work).
+    let many = (0..MAX_OSC22_SHAPES + 1)
+        .map(|_| "wait")
+        .collect::<Vec<_>>()
+        .join(",");
+    let sequence = format!("\x1b]22;>{many}\x07").into_bytes();
+    assert!(
+        matches!(
+            parse(&sequence).as_slice(),
+            [TerminalAction::OscUnknown { id: 22, .. }]
+        ),
+        "over-cap push must stay inert"
+    );
+}
+
+#[test]
+fn osc22_is_chunking_invariant() {
+    // Splitting the same bytes differently yields the same actions.
+    let bytes = b"\x1b]22;pointer\x07\x1b]22;\x07\x1b]22;>wait,text\x07\x1b]22;<\x07";
+    let whole = parse(bytes);
+    for chunk_size in [1, 2, 3, 5, 7] {
+        assert_eq!(parse_split(bytes, chunk_size), whole, "chunk {chunk_size}");
+    }
+    assert_eq!(
+        whole,
+        vec![
+            TerminalAction::OscPointerShape {
+                op: PointerShapeOp::Set {
+                    shape: Some(PointerShape::Pointer)
+                }
+            },
+            TerminalAction::OscPointerShape {
+                op: PointerShapeOp::Set { shape: None }
+            },
+            TerminalAction::OscPointerShape {
+                op: PointerShapeOp::Push {
+                    shapes: vec![PointerShape::Wait, PointerShape::Text].into_boxed_slice()
+                }
+            },
+            TerminalAction::OscPointerShape {
+                op: PointerShapeOp::Pop
+            },
+        ]
     );
 }
 

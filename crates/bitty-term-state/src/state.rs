@@ -1424,6 +1424,11 @@ impl State {
             TerminalAction::OscPromptMark { kind, exit_code } => {
                 self.record_zone(*kind, *exit_code);
             }
+            // OSC 22 pointer shapes (issue #1762): presentation-only cursor
+            // icon, never terminal truth. The runtime owns the per-pane shape
+            // stack and the focused-pane platform dispatch; terminal state
+            // stays inert by contract (like OSC 10/11/4 and notifications).
+            TerminalAction::OscPointerShape { .. } => {}
             TerminalAction::OscUnknown { .. } => self.telemetry.unknown_osc += 1,
             // Kitty graphics (CTX-0256 base, CTX-0950 advanced): pixel
             // decode and paint live downstream (`KittyImageLayer` routes

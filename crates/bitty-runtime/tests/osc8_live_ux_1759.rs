@@ -15,7 +15,10 @@ use bitty_platform::{
     CursorIcon, CursorPosition, ModifiersState, MouseButton, PlatformEvent, PressState,
     WindowEventKind, WindowId,
 };
-use bitty_runtime::{HYPERLINK_PREVIEW_MAX_CHARS, Runtime, UrlActivation, UrlOpener};
+use bitty_runtime::{
+    HYPERLINK_PREVIEW_MAX_CHARS, LayoutNode, Runtime, SplitAxis, UrlActivation, UrlOpener, View,
+    ViewId,
+};
 
 #[derive(Default)]
 struct RecordingOpener {
@@ -143,6 +146,8 @@ fn ctrl_click_arms_and_opens_exactly_once() {
 #[test]
 fn super_click_arms_for_macos_cmd() {
     // macOS Cmd arrives as the Super latch and authorizes like Ctrl.
+    // Press/release pairing (CTX-1006): the press must be on the same safe
+    // link as the release, otherwise no gesture mints.
     let (mut rt, _) = runtime_with_recorder();
     rt.handle_pty_bytes(b"\x1b]8;;https://example.test\x07link\x1b]8;;\x07");
     hold_modifier(&mut rt, false, true);
@@ -152,6 +157,7 @@ fn super_click_arms_for_macos_cmd() {
     );
     let pos = link_cell(&rt);
     move_to(&mut rt, pos);
+    press(&mut rt);
     release(&mut rt);
     assert!(
         rt.has_pending_hyperlink_activation(),
@@ -331,4 +337,125 @@ fn tick_clears_a_hover_whose_link_scrolled_away() {
         "erased link cells must clear the hover on tick"
     );
     assert_eq!(rt.hyperlink_cursor_icon(), CursorIcon::Text);
+}
+
+/// Headless pixel for container cell (col, row) under the default headless
+/// geometry (8px window padding, 9x19 cells, zero gaps), matching
+/// `border_drag_resize.rs`: the inset lands inside the target cell.
+fn container_cell_pixels(col: u16, row: u16) -> CursorPosition {
+    CursorPosition {
+        x: 8.0 + f64::from(col) * 9.0 + 4.0,
+        y: 8.0 + f64::from(row) * 19.0 + 9.0,
+    }
+}
+
+fn two_pane_horizontal() -> LayoutNode {
+    LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.5,
+        LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+        LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+    )
+}
+
+#[test]
+fn release_alone_over_link_mints_no_gesture() {
+    // Press/release pairing (CTX-1006, CodeRabbit major on input.rs:991):
+    // a release over a safe link with no matching modified press must
+    // never arm the link. Release-only mints are spurious.
+    let (mut rt, _) = runtime_with_recorder();
+    rt.handle_pty_bytes(b"\x1b]8;;https://example.test\x07link\x1b]8;;\x07");
+    hold_ctrl(&mut rt);
+    let pos = link_cell(&rt);
+    move_to(&mut rt, pos);
+    release(&mut rt);
+    assert!(
+        !rt.has_pending_hyperlink_activation(),
+        "a Ctrl+release with no matching Ctrl+press must not arm the link"
+    );
+    assert!(rt.take_activation_gesture().is_none());
+}
+
+#[test]
+fn ctrl_press_on_divider_then_release_over_link_ends_drag_without_mint() {
+    // CTX-1006 regression: a Ctrl+press on a split divider starts a
+    // border-drag (`begin_border_drag` does not exclude Ctrl); a
+    // Ctrl+release over a safe link must end that drag and must NOT mint
+    // a spurious gesture (press/release URI mismatch). The drag must not
+    // stick, and no single (spurious) mint may arm.
+    let (mut rt, _) = runtime_with_recorder();
+    rt.set_layout(two_pane_horizontal());
+    // The OSC 8 link lands in the focused (left) pane at its row 0 col 0,
+    // which maps to container cell (0,0) under the default headless
+    // geometry; the divider sits at container col 40.
+    rt.handle_pty_bytes(b"\x1b]8;;https://example.test\x07link\x1b]8;;\x07");
+    hold_ctrl(&mut rt);
+
+    // Ctrl+press on the divider grabs the border drag.
+    let divider = container_cell_pixels(40, 12);
+    move_to(&mut rt, divider);
+    press(&mut rt);
+    assert!(
+        rt.border_drag_active(),
+        "Ctrl+press on the divider must grab the border drag"
+    );
+    assert!(
+        !rt.has_pending_hyperlink_activation(),
+        "the divider press must not arm a link"
+    );
+
+    // Ctrl+release over the link: the drag must end and no gesture mints.
+    let link = container_cell_pixels(1, 0);
+    move_to(&mut rt, link);
+    release(&mut rt);
+    assert!(
+        !rt.border_drag_active(),
+        "the mismatched release must end the border drag (no stuck drag)"
+    );
+    assert!(
+        !rt.has_pending_hyperlink_activation(),
+        "a divider press must not mint the link under the release"
+    );
+    assert!(
+        rt.take_activation_gesture().is_none(),
+        "no spurious gesture may arm from a mismatched press/release pair"
+    );
+}
+
+#[test]
+fn ctrl_press_and_release_on_same_link_mints_singly() {
+    // The paired path still works in a split: press and release on the
+    // same safe link mints exactly one single-use gesture and leaves no
+    // drag behind.
+    let (mut rt, opened) = runtime_with_recorder();
+    rt.set_layout(two_pane_horizontal());
+    rt.handle_pty_bytes(b"\x1b]8;;https://example.test\x07link\x1b]8;;\x07");
+    hold_ctrl(&mut rt);
+
+    let link = container_cell_pixels(1, 0);
+    move_to(&mut rt, link);
+    press(&mut rt);
+    assert!(
+        !rt.border_drag_active(),
+        "a press on the link itself must not grab the divider"
+    );
+    release(&mut rt);
+    assert!(
+        !rt.border_drag_active(),
+        "the paired release must leave no drag behind"
+    );
+    assert!(
+        rt.has_pending_hyperlink_activation(),
+        "the paired press/release must arm the link"
+    );
+    let uri = rt
+        .activate_pending_hyperlink(&[], false)
+        .expect("paired Ctrl+click must open the bound URI");
+    assert_eq!(uri, "https://example.test");
+    assert_eq!(
+        opened.lock().expect("poison-free").as_slice(),
+        ["https://example.test"],
+        "exactly one (single) mint opens exactly once"
+    );
+    assert!(!rt.has_pending_hyperlink_activation());
 }

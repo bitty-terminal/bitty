@@ -93,6 +93,13 @@ fn foreign_gesture() -> ActivationGesture {
         window_id,
         kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
             MouseButton::Left,
+            PressState::Pressed,
+        )),
+    });
+    scratch.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
+            MouseButton::Left,
             PressState::Released,
         )),
     });
@@ -393,6 +400,13 @@ fn platform_hyperlink_activation_mints_single_use_gesture() {
         window_id,
         kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
             MouseButton::Left,
+            PressState::Pressed,
+        )),
+    });
+    rt.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
+            MouseButton::Left,
             PressState::Released,
         )),
     });
@@ -470,6 +484,13 @@ fn hostile_hyperlink_does_not_consume_gesture_slot() {
         window_id,
         kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
             MouseButton::Left,
+            PressState::Pressed,
+        )),
+    });
+    rt.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
+            MouseButton::Left,
             PressState::Released,
         )),
     });
@@ -485,6 +506,13 @@ fn hostile_hyperlink_does_not_consume_gesture_slot() {
     rt2.handle_platform_event(PlatformEvent::Window {
         window_id,
         kind: WindowEventKind::CursorMoved(pos2),
+    });
+    rt2.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
+            MouseButton::Left,
+            PressState::Pressed,
+        )),
     });
     rt2.handle_platform_event(PlatformEvent::Window {
         window_id,
@@ -515,6 +543,13 @@ fn hostile_then_safe_in_same_runtime_preserves_gesture_for_safe() {
         window_id,
         kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
             MouseButton::Left,
+            PressState::Pressed,
+        )),
+    });
+    rt.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
+            MouseButton::Left,
             PressState::Released,
         )),
     });
@@ -526,6 +561,13 @@ fn hostile_then_safe_in_same_runtime_preserves_gesture_for_safe() {
     rt.handle_platform_event(PlatformEvent::Window {
         window_id,
         kind: WindowEventKind::CursorMoved(pos),
+    });
+    rt.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
+            MouseButton::Left,
+            PressState::Pressed,
+        )),
     });
     rt.handle_platform_event(PlatformEvent::Window {
         window_id,
@@ -556,6 +598,13 @@ fn hyperlink_activation_overflow_is_handled_without_panic() {
             x: f64::MAX,
             y: f64::MAX,
         }),
+    });
+    rt.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
+            MouseButton::Left,
+            PressState::Pressed,
+        )),
     });
     rt.handle_platform_event(PlatformEvent::Window {
         window_id,

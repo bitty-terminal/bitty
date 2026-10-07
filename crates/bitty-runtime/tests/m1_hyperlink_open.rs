@@ -63,6 +63,12 @@ fn click_link(rt: &mut Runtime) {
         x: pad + f64::from(frame.content.x.max(0)) + 0.5 * f64::from(cw),
         y: pad + f64::from(frame.content.y.max(0)) + 0.5 * f64::from(ch),
     })));
+    // CTX-1006 press/release pairing: the press must be on the same safe
+    // link as the release, otherwise no gesture mints (release-only mints
+    // are spurious and leave border-drags stuck).
+    rt.handle_platform_event(window_event(WindowEventKind::MouseInput(
+        bitty_platform::MouseEvent::new(MouseButton::Left, PressState::Pressed),
+    )));
     rt.handle_platform_event(window_event(WindowEventKind::MouseInput(
         bitty_platform::MouseEvent::new(MouseButton::Left, PressState::Released),
     )));

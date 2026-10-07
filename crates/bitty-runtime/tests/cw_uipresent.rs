@@ -422,6 +422,11 @@ fn cw1395_link_open_needs_a_matching_gesture() {
         super_pressed: false,
     })));
     rt.handle_platform_event(window(WindowEventKind::CursorMoved(link_pos)));
+    // CTX-1006 press/release pairing: the press must be on the same safe
+    // link as the release, otherwise no gesture mints.
+    rt.handle_platform_event(window(WindowEventKind::MouseInput(
+        bitty_platform::MouseEvent::new(MouseButton::Left, PressState::Pressed),
+    )));
     rt.handle_platform_event(window(WindowEventKind::MouseInput(
         bitty_platform::MouseEvent::new(MouseButton::Left, PressState::Released),
     )));

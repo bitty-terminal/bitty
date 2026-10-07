@@ -591,6 +591,11 @@ impl Runtime {
                 WindowEventKind::MouseInput(mouse) => {
                     self.handle_mouse_input(mouse);
                     if mouse.button == MouseButton::Left && mouse.state == PressState::Released {
+                        // CTX-1006 review: press/release pairing. Take (clear)
+                        // the stored press URI on every left release so a
+                        // release alone can never arm a link; the mint below
+                        // requires an exact press/release URI match.
+                        let press_uri = self.hyperlink_press_uri.take();
                         if let Some(pos) = self.last_cursor {
                             // CTX-0181: a release over the painted scrollbar
                             // ends a scroll gesture — it must not activate a
@@ -615,6 +620,15 @@ impl Runtime {
                             let Some(uri) = self.safe_hyperlink_uri_at(pos) else {
                                 return false;
                             };
+                            // Pairing: a press on a divider (or plain text,
+                            // or another link) must never mint the link
+                            // under the release. Only an exact press/release
+                            // URI match arms the gesture; otherwise the
+                            // release already ran the normal drag-teardown
+                            // and selection paths in `handle_mouse_input`.
+                            if press_uri.as_ref() != Some(&uri) {
+                                return false;
+                            }
                             let token = ActivationGesture(self.next_activation_gesture);
                             self.next_activation_gesture =
                                 self.next_activation_gesture.wrapping_add(1).max(1);

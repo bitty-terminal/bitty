@@ -1017,6 +1017,13 @@ fn osc8_click_path_reaches_the_live_url_consumer() {
         window_id,
         kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
             bitty_platform::MouseButton::Left,
+            bitty_platform::PressState::Pressed,
+        )),
+    });
+    app.runtime.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
+            bitty_platform::MouseButton::Left,
             bitty_platform::PressState::Released,
         )),
     });
@@ -1053,6 +1060,13 @@ fn osc8_click_path_never_opens_a_hostile_scheme() {
     app.runtime.handle_platform_event(PlatformEvent::Window {
         window_id,
         kind: WindowEventKind::CursorMoved(link_pos),
+    });
+    app.runtime.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
+            bitty_platform::MouseButton::Left,
+            bitty_platform::PressState::Pressed,
+        )),
     });
     app.runtime.handle_platform_event(PlatformEvent::Window {
         window_id,

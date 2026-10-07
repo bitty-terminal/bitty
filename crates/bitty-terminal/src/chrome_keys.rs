@@ -2070,6 +2070,7 @@ impl TerminalApp {
                             && !keyref.alt
                             && !keyref.super_held
                         {
+                            self.chrome.held.insert(keyref.key);
                             self.revoke_overlay_capture_with_reason("cancelled");
                             if let Some(win) = self.window.handle.as_ref() {
                                 win.request_redraw();
@@ -2082,6 +2083,7 @@ impl TerminalApp {
                             }
                             Some(bitty_config::ChromeAction::CloseView) => {
                                 // Issue #1776: Mod+q closes the active overlay capture.
+                                self.chrome.held.insert(keyref.key);
                                 self.revoke_overlay_capture_with_reason("cancelled");
                                 if let Some(win) = self.window.handle.as_ref() {
                                     win.request_redraw();
@@ -2090,6 +2092,7 @@ impl TerminalApp {
                             }
                             Some(bitty_config::ChromeAction::ToggleZoom) => {
                                 // Issue #1776: Mod+z temporarily suspends/releases overlay capture.
+                                self.chrome.held.insert(keyref.key);
                                 self.revoke_overlay_capture_with_reason("released");
                                 if let Some(win) = self.window.handle.as_ref() {
                                     win.request_redraw();

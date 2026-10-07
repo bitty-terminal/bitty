@@ -34,13 +34,13 @@ use crate::terminal_app::TerminalApp;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct AppModifiers {
     /// Shift held.
-    shift: bool,
+    pub(crate) shift: bool,
     /// Control held.
-    control: bool,
+    pub(crate) control: bool,
     /// Alt held.
-    alt: bool,
+    pub(crate) alt: bool,
     /// Super held.
-    super_held: bool,
+    pub(crate) super_held: bool,
 }
 
 /// Chrome-owned key state coalesced out of `TerminalApp` (CTX-0481 state
@@ -2079,6 +2079,22 @@ impl TerminalApp {
                         match matched {
                             Some(action) if Self::is_overlay_focus_switch(action) => {
                                 self.revoke_overlay_capture();
+                            }
+                            Some(bitty_config::ChromeAction::CloseView) => {
+                                // Issue #1776: Mod+q closes the active overlay capture.
+                                self.revoke_overlay_capture_with_reason("cancelled");
+                                if let Some(win) = self.window.handle.as_ref() {
+                                    win.request_redraw();
+                                }
+                                return true;
+                            }
+                            Some(bitty_config::ChromeAction::ToggleZoom) => {
+                                // Issue #1776: Mod+z temporarily suspends/releases overlay capture.
+                                self.revoke_overlay_capture_with_reason("released");
+                                if let Some(win) = self.window.handle.as_ref() {
+                                    win.request_redraw();
+                                }
+                                return true;
                             }
                             _ => {
                                 let text = key

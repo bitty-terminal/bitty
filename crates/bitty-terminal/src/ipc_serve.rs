@@ -176,11 +176,19 @@ fn unix_serve(descriptor: ServerDescriptor, env: &bitty_ipc::devtools::SocketEnv
         Ok(listen) => {
             // CTX-0506: test mode registers the E2E surface (`testInfo`,
             // `testExit`); normal instances keep the default table.
-            let dispatcher = Arc::new(if descriptor.test_mode {
+            // Issue #1520: the consent/revoke surface registers on both
+            // tables (additive-only; no existing method changes).
+            let mut dispatcher = if descriptor.test_mode {
                 bitty_ipc::devtools::Dispatcher::with_test_mode()
             } else {
                 bitty_ipc::devtools::Dispatcher::with_defaults()
-            });
+            };
+            if let Err(err) = crate::consent::register_consent_methods(&mut dispatcher) {
+                crate::logging::warn(|| {
+                    format!("bitty: consent methods unavailable: {err} (serving without them)")
+                });
+            }
+            let dispatcher = Arc::new(dispatcher);
             let server = bitty_ipc::devtools::ServerInfo::new(
                 listen.instance,
                 listen.socket_path.clone(),

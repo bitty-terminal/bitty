@@ -48,20 +48,58 @@ pub enum CtlRequest {
     WindowList,
     ViewList,
     TerminalList,
-    TerminalSpawn { cwd: Option<String> },
-    TerminalClose { terminal_id: String },
-    TerminalSend { terminal_id: String, text: String },
-    TerminalText { terminal_id: String },
-    ViewSplit { direction: ipc_ctl::SplitDirection },
-    ViewFocus { view_id: String },
+    TerminalSpawn {
+        cwd: Option<String>,
+    },
+    TerminalClose {
+        terminal_id: String,
+    },
+    TerminalSend {
+        terminal_id: String,
+        text: String,
+    },
+    TerminalText {
+        terminal_id: String,
+    },
+    ViewSplit {
+        direction: ipc_ctl::SplitDirection,
+    },
+    ViewFocus {
+        view_id: String,
+    },
     WorkspaceList,
     WorkspaceNew,
-    WorkspaceClose { workspace_id: String },
-    WorkspaceFocus { workspace_id: String },
-    WorkspaceMove { workspace_id: String },
-    WorkspaceRename { workspace_id: String, name: String },
-    WorkspaceMovePanel { position: u64 },
+    WorkspaceClose {
+        workspace_id: String,
+    },
+    WorkspaceFocus {
+        workspace_id: String,
+    },
+    WorkspaceMove {
+        workspace_id: String,
+    },
+    WorkspaceRename {
+        workspace_id: String,
+        name: String,
+    },
+    WorkspaceMovePanel {
+        position: u64,
+    },
     ConfigReload,
+    /// `consent grant --scope S [--terminal T --family F]`: explicit-gesture
+    /// grant on the calling session (issue #1520). The confirmation phrase
+    /// is prompted interactively at execute time, never a flag.
+    ConsentGrant {
+        scope: String,
+        terminal_id: Option<String>,
+        family: Option<String>,
+    },
+    /// `consent revoke --scope S`: explicit scope revoke with receipt.
+    ConsentRevoke {
+        scope: String,
+    },
+    /// `consent revoke-session`: end the calling session with receipt.
+    ConsentRevokeSession,
 }
 
 impl CtlRequest {
@@ -87,6 +125,9 @@ impl CtlRequest {
             Self::WorkspaceRename { .. } => "core.workspace.rename",
             Self::WorkspaceMovePanel { .. } => "core.workspace.move_panel",
             Self::ConfigReload => "core.config.reload",
+            Self::ConsentGrant { .. } => "core.consent.grant",
+            Self::ConsentRevoke { .. } => "core.consent.revoke_scope",
+            Self::ConsentRevokeSession => "core.consent.revoke_session",
         }
     }
 
@@ -112,6 +153,9 @@ impl CtlRequest {
             Self::WorkspaceRename { .. } => Some(ipc_ctl::METHOD_RENAME_WORKSPACE),
             Self::WorkspaceMovePanel { .. } => Some(ipc_ctl::METHOD_MOVE_PANEL),
             Self::ConfigReload => Some(ipc_ctl::METHOD_RELOAD_CONFIG),
+            Self::ConsentGrant { .. } => Some(crate::consent::METHOD_GRANT_CONSENT_SCOPE),
+            Self::ConsentRevoke { .. } => Some(crate::consent::METHOD_REVOKE_CONSENT_SCOPE),
+            Self::ConsentRevokeSession => Some(crate::consent::METHOD_REVOKE_CONSENT_SESSION),
         }
     }
 
@@ -141,6 +185,21 @@ impl CtlRequest {
                 Some(ipc_ctl::params_workspace_rename(workspace_id, name))
             }
             Self::WorkspaceMovePanel { position } => Some(ipc_ctl::params_move_panel(*position)),
+            // Consent params carry no confirmation phrase here: the phrase is
+            // prompted interactively at execute time (never a flag) and
+            // spliced in by the consent execute path (see `render.rs`).
+            Self::ConsentGrant {
+                scope,
+                terminal_id,
+                family,
+            } => Some(crate::consent::consent_grant_params(
+                scope,
+                terminal_id.as_deref(),
+                family.as_deref(),
+                "",
+            )),
+            Self::ConsentRevoke { scope } => Some(format!("{{\"scope\":\"{scope}\"}}")),
+            Self::ConsentRevokeSession => Some(String::from("{}")),
         }
     }
 }
@@ -183,6 +242,8 @@ pub fn ctl_usage() -> String {
          \x20 workspace list | workspace new | workspace close ws:N | workspace focus ws:N | workspace move ws:N\n\
          \x20 workspace rename ws:N NAME | workspace move-panel POSITION\n\
          \x20 config reload\n\
+         \x20 consent grant --scope S [--terminal T --family F] | consent revoke --scope S\n\
+         \x20 consent revoke-session\n\
          examples:\n\
          \x20 bitty ctl instance list\n\
          \x20 bitty ctl terminal send t:1 \"cargo test\"\n\
@@ -224,7 +285,11 @@ pub fn ctl_help_text() -> String {
             workspace move ws:N           core.workspace.move (view.manage; moves focused window)\n  \
             workspace rename ws:N NAME    core.workspace.rename (view.manage; renames workspace)\n  \
             workspace move-panel N        core.workspace.move_panel (view.manage; repositions focused panel)\n  \
-            config reload                 core.config.reload (config.modify, elevation)\n\
+            config reload                 core.config.reload (config.modify, elevation)\n  \
+            consent grant --scope S       core.consent.grant (explicit gesture: interactive ALLOW prompt,\n  \
+            \x20 [--terminal T --family F]  grants a debug scope, or an automation family bearer for one terminal)\n  \
+            consent revoke --scope S      core.consent.revoke_scope (explicit revoke with receipt)\n  \
+            consent revoke-session        core.consent.revoke_session (end own session with receipt)\n\
          \n\
          Elevation: only terminal spawn, terminal close (terminal.manage),\n  \
             workspace close (terminal.manage), and\n\
@@ -237,6 +302,13 @@ pub fn ctl_help_text() -> String {
          \n\
          Exit codes: 0 ok; 1 generic; 2 usage; 3 config; 5 compat; 6 unavailable;\n\
          \x20 7 permission; 8 conflict. Terminal text is untrusted observation data.\n\
+         \n\
+         Consent (issue #1520): `consent grant` prompts for an explicit\n\
+         \x20 ALLOW phrase on the local terminal and grants only to the calling\n\
+         \x20 session; issuance is never reachable from flags, environment,\n\
+         \x20 configuration, or child-process inheritance. `consent revoke`\n\
+         \x20 and `consent revoke-session` deny queued and future requests of\n\
+         \x20 the session from the next dispatch boundary, with a receipt.\n\
          \n\
          Version: {}\n",
         env!("CARGO_PKG_VERSION"),
@@ -258,6 +330,9 @@ pub fn parse_ctl_request(tokens: &[String]) -> Result<(CtlRequest, CtlTargeting)
     let mut positionals: Vec<String> = Vec::new();
     let mut split_dir: Option<ipc_ctl::SplitDirection> = None;
     let mut spawn_cwd: Option<String> = None;
+    let mut consent_scope: Option<String> = None;
+    let mut consent_terminal: Option<String> = None;
+    let mut consent_family: Option<String> = None;
 
     let mut i = 0usize;
     while i < tokens.len() {
@@ -360,6 +435,74 @@ pub fn parse_ctl_request(tokens: &[String]) -> Result<(CtlRequest, CtlTargeting)
             i += 1;
             continue;
         }
+        // Consent options (issue #1520): `--scope` names a consentable
+        // debug/terminal scope, `--terminal` a `t:N` id, `--family`
+        // `synthesize|capture`. Values validate eagerly; verbs
+        // reject them when they belong elsewhere (see below).
+        if token == "--scope" {
+            let value = tokens.get(i + 1).ok_or_else(|| CtlParseError::Usage {
+                message: String::from("bitty ctl: --scope needs a value (consent only)"),
+            })?;
+            validate_consent_scope(value)?;
+            consent_scope = Some(value.clone());
+            i += 2;
+            continue;
+        }
+        if let Some(value) = token.strip_prefix("--scope=") {
+            if value.is_empty() {
+                return Err(CtlParseError::Usage {
+                    message: String::from("bitty ctl: --scope needs a value (consent only)"),
+                });
+            }
+            validate_consent_scope(value)?;
+            consent_scope = Some(value.to_string());
+            i += 1;
+            continue;
+        }
+        if token == "--terminal" {
+            let value = tokens.get(i + 1).ok_or_else(|| CtlParseError::Usage {
+                message: String::from("bitty ctl: --terminal needs t:N (consent grant only)"),
+            })?;
+            validate_consent_terminal(value)?;
+            consent_terminal = Some(value.clone());
+            i += 2;
+            continue;
+        }
+        if let Some(value) = token.strip_prefix("--terminal=") {
+            if value.is_empty() {
+                return Err(CtlParseError::Usage {
+                    message: String::from("bitty ctl: --terminal needs t:N (consent grant only)"),
+                });
+            }
+            validate_consent_terminal(value)?;
+            consent_terminal = Some(value.to_string());
+            i += 1;
+            continue;
+        }
+        if token == "--family" {
+            let value = tokens.get(i + 1).ok_or_else(|| CtlParseError::Usage {
+                message: String::from(
+                    "bitty ctl: --family needs synthesize|capture (consent grant only)",
+                ),
+            })?;
+            validate_consent_family(value)?;
+            consent_family = Some(value.clone());
+            i += 2;
+            continue;
+        }
+        if let Some(value) = token.strip_prefix("--family=") {
+            if value.is_empty() {
+                return Err(CtlParseError::Usage {
+                    message: String::from(
+                        "bitty ctl: --family needs synthesize|capture (consent grant only)",
+                    ),
+                });
+            }
+            validate_consent_family(value)?;
+            consent_family = Some(value.to_string());
+            i += 1;
+            continue;
+        }
         if token == "--left" || token == "--right" || token == "--up" || token == "--down" {
             if split_dir.is_some() {
                 return Err(CtlParseError::Usage {
@@ -401,6 +544,17 @@ pub fn parse_ctl_request(tokens: &[String]) -> Result<(CtlRequest, CtlTargeting)
     };
 
     // Resource/verb dispatch (case-sensitive, lowercase canonical).
+    // Consent options belong to `consent` verbs only: one guard here beats
+    // repeating the rejection in every other arm.
+    if positionals.first().map(String::as_str) != Some("consent")
+        && (consent_scope.is_some() || consent_terminal.is_some() || consent_family.is_some())
+    {
+        return Err(CtlParseError::Usage {
+            message: String::from(
+                "bitty ctl: --scope/--terminal/--family belong to `consent` verbs (see `bitty ctl --help`)",
+            ),
+        });
+    }
     let resource = positionals.first().map(String::as_str);
     let verb = positionals.get(1).map(String::as_str);
     let rest = if positionals.len() > 2 {
@@ -647,6 +801,96 @@ pub fn parse_ctl_request(tokens: &[String]) -> Result<(CtlRequest, CtlTargeting)
             reject_ctl_options_for("config reload", split_dir.is_some(), spawn_cwd.is_some())?;
             Ok((CtlRequest::ConfigReload, targeting))
         }
+        (Some("consent"), Some("grant")) => {
+            reject_extra(rest, "consent grant")?;
+            reject_ctl_options_for("consent grant", split_dir.is_some(), spawn_cwd.is_some())?;
+            let scope = consent_scope
+                .as_deref()
+                .ok_or_else(|| CtlParseError::Usage {
+                    message: String::from(
+                        "bitty ctl: consent grant needs --scope S (e.g. --scope debug.control)",
+                    ),
+                })?;
+            // Family and terminal travel together: an automation grant binds
+            // one terminal and one family; a plain scope grant takes neither.
+            match (consent_terminal.as_deref(), consent_family.as_deref()) {
+                (None, None) => Ok((
+                    CtlRequest::ConsentGrant {
+                        scope: scope.to_string(),
+                        terminal_id: None,
+                        family: None,
+                    },
+                    targeting,
+                )),
+                (Some(terminal), Some(family)) => {
+                    let expected = crate::consent::ConsentFamily::parse(family)
+                        .map(|parsed| parsed.required_scopes()[0].as_str())
+                        .map_err(|_| CtlParseError::Usage {
+                            message: String::from("bitty ctl: --family needs synthesize|capture"),
+                        })?;
+                    if scope != expected {
+                        return Err(CtlParseError::Usage {
+                            message: format!(
+                                "bitty ctl: --family {family:?} needs --scope {expected:?}"
+                            ),
+                        });
+                    }
+                    Ok((
+                        CtlRequest::ConsentGrant {
+                            scope: scope.to_string(),
+                            terminal_id: Some(terminal.to_string()),
+                            family: Some(family.to_string()),
+                        },
+                        targeting,
+                    ))
+                }
+                _ => Err(CtlParseError::Usage {
+                    message: String::from(
+                        "bitty ctl: consent grant needs both --terminal T and --family F, or neither",
+                    ),
+                }),
+            }
+        }
+        (Some("consent"), Some("revoke")) => {
+            reject_extra(rest, "consent revoke")?;
+            reject_ctl_options_for("consent revoke", split_dir.is_some(), spawn_cwd.is_some())?;
+            if consent_terminal.is_some() || consent_family.is_some() {
+                return Err(CtlParseError::Usage {
+                    message: String::from(
+                        "bitty ctl: --terminal/--family belong to `consent grant`, not `consent revoke`",
+                    ),
+                });
+            }
+            let scope = consent_scope
+                .as_deref()
+                .ok_or_else(|| CtlParseError::Usage {
+                    message: String::from(
+                        "bitty ctl: consent revoke needs --scope S (e.g. --scope debug.control)",
+                    ),
+                })?;
+            Ok((
+                CtlRequest::ConsentRevoke {
+                    scope: scope.to_string(),
+                },
+                targeting,
+            ))
+        }
+        (Some("consent"), Some("revoke-session")) => {
+            reject_extra(rest, "consent revoke-session")?;
+            reject_ctl_options_for(
+                "consent revoke-session",
+                split_dir.is_some(),
+                spawn_cwd.is_some(),
+            )?;
+            if consent_scope.is_some() || consent_terminal.is_some() || consent_family.is_some() {
+                return Err(CtlParseError::Usage {
+                    message: String::from(
+                        "bitty ctl: consent revoke-session takes no --scope/--terminal/--family",
+                    ),
+                });
+            }
+            Ok((CtlRequest::ConsentRevokeSession, targeting))
+        }
         (Some(r), Some(v)) => Err(CtlParseError::Usage {
             message: format!("bitty ctl: unknown {r} {v} (see `bitty ctl --help`)"),
         }),
@@ -689,6 +933,35 @@ fn reject_ctl_options_for(what: &str, has_split: bool, has_cwd: bool) -> Result<
         });
     }
     Ok(())
+}
+
+/// Eager `--scope` validation: the consent lane only (debug/terminal halves).
+fn validate_consent_scope(value: &str) -> Result<(), CtlParseError> {
+    crate::consent::parse_consent_scope(value).map(|_| ()).map_err(|_| {
+        CtlParseError::Usage {
+            message: String::from(
+                "bitty ctl: --scope must be a consentable scope (debug.inspect|debug.trace|debug.control|terminal.inspect|terminal.input)",
+            ),
+        }
+    })
+}
+
+/// Eager `--terminal` validation (`t:N` shape).
+fn validate_consent_terminal(value: &str) -> Result<(), CtlParseError> {
+    ipc_ctl::parse_terminal_id(value)
+        .map(|_| ())
+        .map_err(|err| CtlParseError::Usage {
+            message: format!("bitty ctl: invalid --terminal: {err}"),
+        })
+}
+
+/// Eager `--family` validation (`synthesize|capture`).
+fn validate_consent_family(value: &str) -> Result<(), CtlParseError> {
+    crate::consent::ConsentFamily::parse(value)
+        .map(|_| ())
+        .map_err(|_| CtlParseError::Usage {
+            message: String::from("bitty ctl: --family must be synthesize|capture"),
+        })
 }
 
 /// Resolve a `terminal spawn --cwd` value against this client's working

@@ -256,6 +256,202 @@ fn misplaced_options_fail_closed() {
     // split dirs belong to split only.
     assert!(parse_ctl_request(&words(&["terminal", "list", "--right"])).is_err());
     assert!(parse_ctl_request(&words(&["terminal", "spawn", "--right"])).is_err());
+    // Issue #1520: consent options belong to `consent` verbs only.
+    assert!(parse_ctl_request(&words(&["terminal", "list", "--scope", "debug.control"])).is_err());
+    assert!(parse_ctl_request(&words(&["config", "reload", "--scope", "debug.control"])).is_err());
+    assert!(parse_ctl_request(&words(&["view", "split", "--family", "synthesize"])).is_err());
+}
+
+#[test]
+fn consent_verbs_parse_and_validate() {
+    // Plain scope grant (`--scope S`, `=` form too).
+    let (req, _) = parse_ctl_request(&words(&["consent", "grant", "--scope", "debug.control"]))
+        .expect("must parse");
+    assert_eq!(
+        req,
+        CtlRequest::ConsentGrant {
+            scope: String::from("debug.control"),
+            terminal_id: None,
+            family: None,
+        }
+    );
+    let (req, _) = parse_ctl_request(&words(&["consent", "grant", "--scope=debug.trace"]))
+        .expect("must parse");
+    assert_eq!(
+        req,
+        CtlRequest::ConsentGrant {
+            scope: String::from("debug.trace"),
+            terminal_id: None,
+            family: None,
+        }
+    );
+    // Automation family grant (terminal plus family travel together).
+    let (req, _) = parse_ctl_request(&words(&[
+        "consent",
+        "grant",
+        "--scope",
+        "debug.control",
+        "--terminal",
+        "t:1",
+        "--family",
+        "synthesize",
+    ]))
+    .expect("must parse");
+    assert_eq!(
+        req,
+        CtlRequest::ConsentGrant {
+            scope: String::from("debug.control"),
+            terminal_id: Some(String::from("t:1")),
+            family: Some(String::from("synthesize")),
+        }
+    );
+    // Family/scope mismatch fails closed.
+    assert!(
+        parse_ctl_request(&words(&[
+            "consent",
+            "grant",
+            "--scope",
+            "debug.trace",
+            "--terminal",
+            "t:1",
+            "--family",
+            "synthesize"
+        ]))
+        .is_err()
+    );
+    // Half a family fails closed (both or neither).
+    assert!(
+        parse_ctl_request(&words(&[
+            "consent",
+            "grant",
+            "--scope",
+            "debug.control",
+            "--terminal",
+            "t:1"
+        ]))
+        .is_err()
+    );
+    assert!(
+        parse_ctl_request(&words(&[
+            "consent",
+            "grant",
+            "--scope",
+            "debug.control",
+            "--family",
+            "synthesize"
+        ]))
+        .is_err()
+    );
+    // Only the consent lane validates.
+    assert!(parse_ctl_request(&words(&["consent", "grant", "--scope", "view.manage"])).is_err());
+    assert!(
+        parse_ctl_request(&words(&["consent", "grant", "--scope", "terminal.manage"])).is_err()
+    );
+    assert!(parse_ctl_request(&words(&["consent", "grant"])).is_err());
+    assert!(
+        parse_ctl_request(&words(&[
+            "consent",
+            "grant",
+            "--scope",
+            "debug.control",
+            "--terminal",
+            "nope",
+            "--family",
+            "synthesize"
+        ]))
+        .is_err()
+    );
+    assert!(
+        parse_ctl_request(&words(&[
+            "consent",
+            "grant",
+            "--scope",
+            "debug.control",
+            "--terminal",
+            "t:1",
+            "--family",
+            "digest"
+        ]))
+        .is_err()
+    );
+    // Scope revoke.
+    let (req, _) = parse_ctl_request(&words(&["consent", "revoke", "--scope", "debug.control"]))
+        .expect("must parse");
+    assert_eq!(
+        req,
+        CtlRequest::ConsentRevoke {
+            scope: String::from("debug.control"),
+        }
+    );
+    assert!(parse_ctl_request(&words(&["consent", "revoke"])).is_err());
+    assert!(
+        parse_ctl_request(&words(&[
+            "consent",
+            "revoke",
+            "--scope",
+            "debug.control",
+            "--terminal",
+            "t:1"
+        ]))
+        .is_err()
+    );
+    // Session revoke takes no options.
+    let (req, _) = parse_ctl_request(&words(&["consent", "revoke-session"])).expect("must parse");
+    assert_eq!(req, CtlRequest::ConsentRevokeSession);
+    assert!(
+        parse_ctl_request(&words(&[
+            "consent",
+            "revoke-session",
+            "--scope",
+            "debug.control"
+        ]))
+        .is_err()
+    );
+    assert!(parse_ctl_request(&words(&["consent", "frobnicate"])).is_err());
+}
+
+#[test]
+fn consent_registry_ids_wire_methods_and_params_are_stable() {
+    let grant = CtlRequest::ConsentGrant {
+        scope: String::from("debug.control"),
+        terminal_id: None,
+        family: None,
+    };
+    assert_eq!(grant.registry_id(), "core.consent.grant");
+    assert_eq!(
+        grant.wire_method(),
+        Some(crate::consent::METHOD_GRANT_CONSENT_SCOPE)
+    );
+    // Pre-prompt params carry an empty phrase the server always denies;
+    // only the interactive execute path splices the typed phrase in.
+    let params = grant.wire_params().expect("params");
+    assert!(params.contains("\"scope\":\"debug.control\""));
+    assert!(params.contains("\"confirm\":\"\""));
+
+    let family_grant = CtlRequest::ConsentGrant {
+        scope: String::from("debug.control"),
+        terminal_id: Some(String::from("t:1")),
+        family: Some(String::from("synthesize")),
+    };
+    let params = family_grant.wire_params().expect("params");
+    assert!(params.contains("\"terminalId\":\"t:1\""));
+    assert!(params.contains("\"family\":\"synthesize\""));
+
+    let revoke = CtlRequest::ConsentRevoke {
+        scope: String::from("debug.trace"),
+    };
+    assert_eq!(revoke.registry_id(), "core.consent.revoke_scope");
+    assert_eq!(
+        revoke.wire_method(),
+        Some(crate::consent::METHOD_REVOKE_CONSENT_SCOPE)
+    );
+
+    let revoke_session = CtlRequest::ConsentRevokeSession;
+    assert_eq!(revoke_session.registry_id(), "core.consent.revoke_session");
+    assert_eq!(
+        revoke_session.wire_method(),
+        Some(crate::consent::METHOD_REVOKE_CONSENT_SESSION)
+    );
 }
 
 #[test]
@@ -2878,6 +3074,96 @@ fn queued_control_rechecks_revoked_consent_before_mutation() {
     assert_eq!(hook_calls, 0);
     assert_eq!(rt.leaf_count(), leaves_before);
     let reply = rx.try_recv().expect("revocation reply");
+    assert!(!reply.ok);
+}
+
+/// Issue #1520: the consent revoke action (`revoke_consent_scope`) denies a
+/// queued control at the next dispatch boundary with no side effect.
+#[cfg(unix)]
+#[test]
+fn consent_revoke_scope_denies_queued_control_without_effect() {
+    let _guard = hold_wm_lock();
+    let mut rt = headless_runtime();
+    let leaves_before = rt.leaf_count();
+    let authority = ipc_ctl::ControlAuthority::new();
+    let grant = authority
+        .open_connection(
+            bitty_ipc::ScopeSet::all(),
+            ipc_ctl::TerminalCapabilities::from_scopes(&bitty_ipc::ScopeSet::all()),
+        )
+        .expect("connection grant");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let pending = ipc_ctl::PendingControl::with_connection(
+        ipc_ctl::METHOD_SPLIT_VIEW,
+        Some(&ipc_ctl::params_split(ipc_ctl::SplitDirection::Right)),
+        "1",
+        tx,
+        &grant,
+    )
+    .expect("queued control");
+    ipc_ctl::global_control_queue()
+        .lock()
+        .expect("queue lock")
+        .push_back(pending);
+    let receipt = crate::consent::revoke_consent_scope(
+        &authority,
+        grant.session_id(),
+        bitty_ipc::Scope::ViewManage,
+        1_000,
+    );
+    assert!(receipt.revoked);
+    let mut hook_calls = 0usize;
+    let drained = drain_global_control_queue_with(&mut rt, &bitty_ipc::ScopeSet::new(), |_, _| {
+        hook_calls += 1
+    });
+    assert_eq!(drained, 1);
+    assert_eq!(hook_calls, 0);
+    assert_eq!(rt.leaf_count(), leaves_before);
+    let reply = rx.try_recv().expect("consent revocation reply");
+    assert!(!reply.ok);
+}
+
+/// Issue #1520: the session revoke action (`revoke_consent_session`) ends
+/// the session so a queued control denies as unauthenticated with no effect.
+#[cfg(unix)]
+#[test]
+fn consent_revoke_session_denies_queued_control_without_effect() {
+    let _guard = hold_wm_lock();
+    let mut rt = headless_runtime();
+    let leaves_before = rt.leaf_count();
+    let authority = ipc_ctl::ControlAuthority::new();
+    let grant = authority
+        .open_connection(
+            bitty_ipc::ScopeSet::all(),
+            ipc_ctl::TerminalCapabilities::from_scopes(&bitty_ipc::ScopeSet::all()),
+        )
+        .expect("connection grant");
+    let session = grant.session_id().to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let pending = ipc_ctl::PendingControl::with_connection(
+        ipc_ctl::METHOD_SPLIT_VIEW,
+        Some(&ipc_ctl::params_split(ipc_ctl::SplitDirection::Right)),
+        "1",
+        tx,
+        &grant,
+    )
+    .expect("queued control");
+    ipc_ctl::global_control_queue()
+        .lock()
+        .expect("queue lock")
+        .push_back(pending);
+    // The explicit session revoke is the user-facing action under test
+    // (the grant's Drop revokes idempotently at scope exit).
+    let receipt = crate::consent::revoke_consent_session(&authority, &session, &[], 1_000);
+    assert!(receipt.revoked);
+    let mut hook_calls = 0usize;
+    let drained = drain_global_control_queue_with(&mut rt, &bitty_ipc::ScopeSet::new(), |_, _| {
+        hook_calls += 1
+    });
+    assert_eq!(drained, 1);
+    assert_eq!(hook_calls, 0);
+    assert_eq!(rt.leaf_count(), leaves_before);
+    let reply = rx.try_recv().expect("session revocation reply");
     assert!(!reply.ok);
 }
 

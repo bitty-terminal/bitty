@@ -470,7 +470,8 @@ pub enum DynamicColorOp {
     Set(Rgb),
 }
 
-/// Terminal-originated notification form (CTX-0577, M1-16).
+/// Terminal-originated notification form (CTX-0577, M1-16; CTX-1008 adds
+/// Kitty `OSC 99` for issue #1763).
 ///
 /// The VT parser only classifies and bounds the payload; whether a
 /// notification is shown (and how) is a runtime policy decision
@@ -480,14 +481,50 @@ pub enum NotificationSource {
     /// `OSC 9;<message>`: the xterm-style notification form (bare text; the
     /// ConEmu `OSC 9;<n>` sub-commands are not notifications).
     Osc9,
-    /// `OSC 777;notify;<title>;<body>`: the rxvt-unicode notification form
-    /// (kitty's documented notification protocol is `OSC 99`, unparsed here).
+    /// `OSC 777;notify;<title>;<body>`: the rxvt-unicode notification form.
     Osc777,
+    /// `OSC 99;metadata;payload`: Kitty desktop notifications (title/body
+    /// chunks assembled by the runtime; capability queries and close/icon
+    /// payloads never produce a notification).
+    Osc99,
+}
+
+/// Which Kitty `OSC 99` payload a chunk carries (CTX-1008, issue #1763).
+///
+/// Only title and body chunks assemble into a notification. All other
+/// `p=` values (`close`, `icon`, `?`, `alive`, `buttons`, unknown) are
+/// filtered by the parser and never reach this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KittyPayloadType {
+    /// `p=title` (or absent `p`, which defaults to title).
+    Title,
+    /// `p=body`.
+    Body,
+}
+
+/// One Kitty `OSC 99` title/body chunk (CTX-1008, issue #1763).
+///
+/// The parser emits one chunk per `OSC 99` sequence; the runtime assembles
+/// chunks sharing an `i=` identifier into a single [`Notification`] with
+/// source [`NotificationSource::Osc99`]. Payloads are already base64-decoded
+/// when `e=1` was present and length-bounded by [`BoundedString`]; they are
+/// still untrusted display data and never executed or expanded.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct KittyNotificationChunk {
+    /// Chunk group identifier from `i=` (empty when absent).
+    pub id: BoundedString,
+    /// Whether this chunk carries title or body text.
+    pub payload_type: KittyPayloadType,
+    /// Decoded chunk text (possibly empty for an intermediate chunk).
+    pub payload: BoundedString,
+    /// `d=` flag: false means more chunks follow, true completes the group.
+    pub is_done: bool,
 }
 
 /// A bounded terminal-originated desktop-notification request (CTX-0577).
 ///
-/// Emitted for the recognized notification OSC forms (`OSC 9`, `OSC 777`).
+/// Emitted for the recognized notification OSC forms (`OSC 9`, `OSC 777`,
+/// Kitty `OSC 99` assembled by the runtime).
 /// Every field is length-bounded by the parser's OSC collector; the runtime
 /// treats the strings as untrusted display data and never executes or
 /// expands them.
@@ -1054,7 +1091,8 @@ pub enum TerminalAction {
         /// File URL payload, length-bounded.
         url: BoundedString,
     },
-    /// Terminal-originated notification request (`OSC 9`, `OSC 777`, CTX-0577).
+    /// Terminal-originated notification request (`OSC 9`, `OSC 777`, Kitty
+    /// `OSC 99` assembled, CTX-0577/CTX-1008).
     ///
     /// Terminal state treats this as inert; the runtime applies the
     /// bell/notification policy (default deny) and the capability/consent and
@@ -1062,6 +1100,15 @@ pub enum TerminalAction {
     OscNotification {
         /// Recognized notification form and its bounded payload.
         notification: Notification,
+    },
+    /// One Kitty `OSC 99` title/body chunk (CTX-1008, issue #1763).
+    ///
+    /// Terminal state treats this as inert; the runtime assembles chunks by
+    /// `id` into an [`Notification`] with source [`NotificationSource::Osc99`]
+    /// and then applies the same consent and RC-8 gates as `OSC 9`/`OSC 777`.
+    KittyNotificationChunk {
+        /// Parsed chunk (identifier, title/body selector, bounded text).
+        chunk: KittyNotificationChunk,
     },
     /// Hyperlink span begin/end (`OSC 8`); `None` ends the current span.
     OscHyperlink {

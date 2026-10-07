@@ -8,10 +8,10 @@ use super::*;
 use crate::action::{
     Attribute, AttributeChange, AttributeDiff, CharsetSlot, CharsetTable, ClipboardOp, Col, Color,
     ControlChar, Count, CursorStyle, Direction, DynamicColorOp, DynamicColorTarget,
-    EraseDisplayMode, EraseLineMode, GraphemeCell, Hyperlink, MAX_OSC4_OPS, MAX_OSC22_SHAPES, Mode,
-    MouseTrackingMode, Notification, NotificationSource, PaletteColorOp, PaletteOp, PointerShape,
-    PointerShapeOp, Rgb, Row, SequenceKind, StatusKind, TabTargets, UnderlineStyle,
-    UnrecognizedSequence, ZoneKind,
+    EraseDisplayMode, EraseLineMode, GraphemeCell, Hyperlink, KittyPayloadType, MAX_OSC4_OPS,
+    MAX_OSC22_SHAPES, Mode, MouseTrackingMode, Notification, NotificationSource, PaletteColorOp,
+    PaletteOp, PointerShape, PointerShapeOp, Rgb, Row, SequenceKind, StatusKind, TabTargets,
+    UnderlineStyle, UnrecognizedSequence, ZoneKind,
 };
 use crate::bounded::{BoundedBytes, BoundedString};
 
@@ -1626,6 +1626,152 @@ fn osc_unknown_codes_record_id_and_payload() {
         vec![TerminalAction::OscUnknown {
             id: u32::MAX,
             data: BoundedBytes::new(b"data".to_vec()),
+        }]
+    );
+}
+
+#[test]
+fn osc99_single_title_chunk_maps_payload() {
+    // CTX-1008 (#1763): simplest Kitty form `OSC 99 ;; <title>`.
+    assert_eq!(
+        parse(b"\x1b]99;;Hello world\x07"),
+        vec![TerminalAction::KittyNotificationChunk {
+            chunk: crate::action::KittyNotificationChunk {
+                id: BoundedString::new(""),
+                payload_type: KittyPayloadType::Title,
+                payload: BoundedString::new("Hello world"),
+                is_done: true,
+            }
+        }]
+    );
+    // Explicit title with an identifier defaults to done.
+    assert_eq!(
+        parse(b"\x1b]99;i=42;Build finished\x07"),
+        vec![TerminalAction::KittyNotificationChunk {
+            chunk: crate::action::KittyNotificationChunk {
+                id: BoundedString::new("42"),
+                payload_type: KittyPayloadType::Title,
+                payload: BoundedString::new("Build finished"),
+                is_done: true,
+            }
+        }]
+    );
+    // Explicit body payload.
+    assert_eq!(
+        parse(b"\x1b]99;i=1:p=body;42 files compiled\x07"),
+        vec![TerminalAction::KittyNotificationChunk {
+            chunk: crate::action::KittyNotificationChunk {
+                id: BoundedString::new("1"),
+                payload_type: KittyPayloadType::Body,
+                payload: BoundedString::new("42 files compiled"),
+                is_done: true,
+            }
+        }]
+    );
+}
+
+#[test]
+fn osc99_chunked_title_then_body_buffers_by_id() {
+    // CTX-1008: `d=0` holds the group; the parser still emits one chunk per
+    // sequence (assembly lives in the runtime).
+    assert_eq!(
+        parse(b"\x1b]99;i=7:d=0;Hello\x07"),
+        vec![TerminalAction::KittyNotificationChunk {
+            chunk: crate::action::KittyNotificationChunk {
+                id: BoundedString::new("7"),
+                payload_type: KittyPayloadType::Title,
+                payload: BoundedString::new("Hello"),
+                is_done: false,
+            }
+        }]
+    );
+    assert_eq!(
+        parse(b"\x1b]99;i=7:p=body;World\x07"),
+        vec![TerminalAction::KittyNotificationChunk {
+            chunk: crate::action::KittyNotificationChunk {
+                id: BoundedString::new("7"),
+                payload_type: KittyPayloadType::Body,
+                payload: BoundedString::new("World"),
+                is_done: true,
+            }
+        }]
+    );
+    // Payloads may contain `;`: the tail after the second `;` rejoins.
+    assert_eq!(
+        parse(b"\x1b]99;i=7:p=body;one;two\x07"),
+        vec![TerminalAction::KittyNotificationChunk {
+            chunk: crate::action::KittyNotificationChunk {
+                id: BoundedString::new("7"),
+                payload_type: KittyPayloadType::Body,
+                payload: BoundedString::new("one;two"),
+                is_done: true,
+            }
+        }]
+    );
+}
+
+#[test]
+fn osc99_base64_payload_decodes_fail_closed() {
+    // `e=1` carries base64-encoded UTF-8 (`SGVsbG8=` decodes to `Hello`).
+    assert_eq!(
+        parse(b"\x1b]99;i=1:e=1;SGVsbG8=\x07"),
+        vec![TerminalAction::KittyNotificationChunk {
+            chunk: crate::action::KittyNotificationChunk {
+                id: BoundedString::new("1"),
+                payload_type: KittyPayloadType::Title,
+                payload: BoundedString::new("Hello"),
+                is_done: true,
+            }
+        }]
+    );
+    // Invalid base64 stays inert rather than surfacing garbage.
+    assert!(
+        matches!(
+            parse(b"\x1b]99;i=1:e=1;!!!\x07").as_slice(),
+            [TerminalAction::OscUnknown { id: 99, .. }]
+        ),
+        "invalid base64 must stay inert"
+    );
+}
+
+#[test]
+fn osc99_queries_and_non_text_payloads_stay_inert() {
+    for sequence in [
+        &b"\x1b]99;i=1:p=?;\x07"[..],      // capability query
+        &b"\x1b]99;i=1:p=close;x\x07"[..], // close
+        &b"\x1b]99;i=1:p=icon;x\x07"[..],  // icon
+        &b"\x1b]99;i=1:p=buttons;x\x07"[..],
+        &b"\x1b]99;i=1:p=alive;x\x07"[..],
+        &b"\x1b]99;i=1:p=nope;x\x07"[..], // unknown future type
+        &b"\x1b]99;i=1:d=2;x\x07"[..],    // bad done flag
+        &b"\x1b]99;i=1:e=2;x\x07"[..],    // bad base64 flag
+        &b"\x1b]99;no-equals;x\x07"[..],  // malformed metadata
+        &b"\x1b]99;i=1\x07"[..],          // missing second `;`
+    ] {
+        assert!(
+            matches!(
+                parse(sequence).as_slice(),
+                [TerminalAction::OscUnknown { id: 99, .. }]
+            ),
+            "Kitty non-text/malformed must stay inert, got {:?} for {:?}",
+            parse(sequence),
+            sequence
+        );
+    }
+}
+
+#[test]
+fn osc99_st_terminator_parses() {
+    // Both `BEL` and `ST` (`ESC \`) terminate the sequence.
+    assert_eq!(
+        parse(b"\x1b]99;;Hello\x1b\\"),
+        vec![TerminalAction::KittyNotificationChunk {
+            chunk: crate::action::KittyNotificationChunk {
+                id: BoundedString::new(""),
+                payload_type: KittyPayloadType::Title,
+                payload: BoundedString::new("Hello"),
+                is_done: true,
+            }
         }]
     );
 }

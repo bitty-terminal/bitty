@@ -1,9 +1,10 @@
-//! Terminal bell and notification policy (CTX-0577, M1-16 / issue #1142).
+//! Terminal bell and notification policy (CTX-0577, M1-16 / issue #1142;
+//! CTX-1008 adds Kitty `OSC 99` for issue #1763).
 //!
-//! Untrusted PTY output can emit `BEL`, `OSC 9`, and `OSC 777` at
-//! child-output rate. Without a policy those bytes would drive an unbounded,
-//! user-visible surface (or an unbounded queue). This module holds the
-//! policy, the bounds, and the rate limiter; the owning runtime applies them
+//! Untrusted PTY output can emit `BEL`, `OSC 9`, `OSC 777`, and Kitty
+//! `OSC 99` at child-output rate. Without a policy those bytes would drive an
+//! unbounded, user-visible surface (or an unbounded queue). This module holds
+//! the policy, the bounds, and the rate limiter; the owning runtime applies them
 //! on the PTY path and the present path.
 //!
 //! Policy summary (owner-pending: `OQ-076`, see
@@ -14,9 +15,9 @@
 //!   [`bitty_platform::BellSink`] (the app installs the best-effort OS
 //!   primitive for real runs); with no sink installed the request is only
 //!   counted, so headless runs stay silent.
-//! - **`OSC 9` / `OSC 777` notifications**: default **deny**; an embedder
-//!   must opt in with `Runtime::set_osc_notification_allowed`.
-//! - **Rate**: both surfaces are governed by the accepted `RC-8`
+//! - **`OSC 9` / `OSC 777` / Kitty `OSC 99` notifications**: default **deny**;
+//!   an embedder must opt in with `Runtime::set_osc_notification_allowed`.
+//! - **Rate**: all surfaces are governed by the accepted `RC-8`
 //!   notification/title/metadata ceiling (10 events/s, coalesced); excess
 //!   events are dropped and counted, never queued without bound.
 //! - **Presentation**: a single bounded banner (one notification at a time)
@@ -25,7 +26,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use bitty_vt::Notification;
+use bitty_vt::{KittyNotificationChunk, KittyPayloadType, Notification, NotificationSource};
 
 /// Accepted `RC-8` ceiling: admitted events per fixed window.
 pub const RC8_EVENTS_PER_WINDOW: u32 = 10;
@@ -54,6 +55,22 @@ pub const NOTIFICATION_TEXT_MAX_CHARS: usize = 256;
 
 /// How long one notification banner is shown before the next is presented.
 pub const NOTIFICATION_BANNER_DURATION: Duration = Duration::from_secs(4);
+
+/// Maximum Kitty `OSC 99` partial groups buffered while `d=0` chunks arrive.
+///
+/// Chunked notifications assemble by `i=` identifier; each open group pins
+/// its title/body text. Eight groups mirror the notification queue bound so
+/// a hostile writer opening many groups can never grow memory without limit;
+/// the oldest group is evicted (counted) when a ninth identifier arrives.
+pub const KITTY_PARTIALS_CAPACITY: usize = 8;
+
+/// Maximum characters retained per Kitty `OSC 99` assembled side.
+///
+/// Individual chunks are already bounded by the parser; concatenation across
+/// chunks is re-bounded here so a writer sending many `d=0` chunks cannot
+/// grow one notification without limit. The display sanitizer re-bounds to
+/// [`NOTIFICATION_TEXT_MAX_CHARS`] before painting.
+pub const KITTY_ASSEMBLED_MAX_CHARS: usize = 1024;
 
 /// User-visible bell behavior (CTX-0577 `OQ-076` policy input).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -174,6 +191,143 @@ impl TerminalNotificationQueue {
     }
 }
 
+/// One open Kitty `OSC 99` group: concatenated title/body text for an `i=`
+/// identifier with more chunks expected (`d=0` seen, completion pending).
+#[derive(Debug, Clone, Default)]
+struct KittyPartial {
+    /// Group identifier (empty when the wire omitted `i=`).
+    id: String,
+    /// Concatenated title chunks in arrival order, bounded.
+    title: String,
+    /// Concatenated body chunks in arrival order, bounded.
+    body: String,
+}
+
+impl KittyPartial {
+    /// Appends chunk text to the matching side, truncating the side to
+    /// [`KITTY_ASSEMBLED_MAX_CHARS`] characters so chunked reassembly stays
+    /// bounded. Time O(chunk), space O(bound).
+    fn append(&mut self, chunk: &KittyNotificationChunk) {
+        let side = match chunk.payload_type {
+            KittyPayloadType::Title => &mut self.title,
+            KittyPayloadType::Body => &mut self.body,
+        };
+        side.push_str(chunk.payload.as_str());
+        if side.chars().count() > KITTY_ASSEMBLED_MAX_CHARS {
+            let truncated: String = side.chars().take(KITTY_ASSEMBLED_MAX_CHARS).collect();
+            *side = truncated;
+        }
+    }
+}
+
+/// Bounded assembler for chunked Kitty `OSC 99` notifications (CTX-1008).
+///
+/// Chunks sharing an `i=` identifier concatenate (`d=0` buffers, `d=1`
+/// completes and emits). At most [`KITTY_PARTIALS_CAPACITY`] groups stay
+/// open; a ninth identifier evicts the oldest (counted). Completion with no
+/// text yields no notification (ignored, not queued). All text remains
+/// untrusted display data: the runtime sanitizes at banner time and never
+/// executes or expands it.
+#[derive(Debug, Default)]
+pub(crate) struct KittyNotificationAssembler {
+    partials: VecDeque<KittyPartial>,
+    evicted: u64,
+}
+
+impl KittyNotificationAssembler {
+    /// Empty assembler with no open groups.
+    pub(crate) fn new() -> Self {
+        Self {
+            partials: VecDeque::with_capacity(KITTY_PARTIALS_CAPACITY),
+            evicted: 0,
+        }
+    }
+
+    /// Pushes one parsed chunk; returns a completed [`Notification`] when
+    /// this chunk closes its group (`is_done`) and the group is non-empty.
+    ///
+    /// Intermediate (`!is_done`) chunks buffer and return `None`. A
+    /// single-chunk (`is_done`) notification with no prior partial emits
+    /// directly without buffering. Groups evicted to capacity are counted
+    /// in [`Self::evicted`].
+    pub(crate) fn push_chunk(&mut self, chunk: &KittyNotificationChunk) -> Option<Notification> {
+        use bitty_vt::BoundedString;
+        let key = chunk.id.as_str().to_owned();
+        let position = self.partials.iter().position(|partial| partial.id == key);
+        if !chunk.is_done {
+            match position {
+                Some(index) => {
+                    if let Some(partial) = self.partials.get_mut(index) {
+                        partial.append(chunk);
+                    }
+                }
+                None => {
+                    if self.partials.len() >= KITTY_PARTIALS_CAPACITY {
+                        self.partials.pop_front();
+                        self.evicted = self.evicted.saturating_add(1);
+                    }
+                    let mut partial = KittyPartial {
+                        id: key,
+                        title: String::new(),
+                        body: String::new(),
+                    };
+                    partial.append(chunk);
+                    self.partials.push_back(partial);
+                }
+            }
+            return None;
+        }
+        // Completing chunk: combine any buffered text with this chunk.
+        let mut title = String::new();
+        let mut body = String::new();
+        if let Some(index) = position {
+            if let Some(partial) = self.partials.remove(index) {
+                title = partial.title;
+                body = partial.body;
+            }
+        }
+        match chunk.payload_type {
+            KittyPayloadType::Title => {
+                title.push_str(chunk.payload.as_str());
+            }
+            KittyPayloadType::Body => {
+                body.push_str(chunk.payload.as_str());
+            }
+        }
+        // Re-bound the assembled sides (append already bounds partials; the
+        // final chunk can still push over).
+        if title.chars().count() > KITTY_ASSEMBLED_MAX_CHARS {
+            title = title.chars().take(KITTY_ASSEMBLED_MAX_CHARS).collect();
+        }
+        if body.chars().count() > KITTY_ASSEMBLED_MAX_CHARS {
+            body = body.chars().take(KITTY_ASSEMBLED_MAX_CHARS).collect();
+        }
+        if title.is_empty() && body.is_empty() {
+            return None;
+        }
+        let title_bounded = if title.is_empty() {
+            None
+        } else {
+            Some(BoundedString::new(title))
+        };
+        Some(Notification {
+            source: NotificationSource::Osc99,
+            title: title_bounded,
+            body: BoundedString::new(body),
+        })
+    }
+
+    /// Open groups currently buffered.
+    pub(crate) fn len(&self) -> usize {
+        self.partials.len()
+    }
+
+    /// Groups evicted to capacity since creation.
+    pub(crate) const fn evicted(&self) -> u64 {
+        self.evicted
+    }
+}
+
 /// Strips control characters and bounds the length of untrusted display text.
 ///
 /// Notification payloads are terminal-provided observation data. They are
@@ -220,6 +374,20 @@ mod tests {
             source: NotificationSource::Osc9,
             title: None,
             body: BoundedString::new(body),
+        }
+    }
+
+    fn kitty_chunk(
+        id: &str,
+        payload_type: KittyPayloadType,
+        payload: &str,
+        is_done: bool,
+    ) -> KittyNotificationChunk {
+        KittyNotificationChunk {
+            id: BoundedString::new(id),
+            payload_type,
+            payload: BoundedString::new(payload),
+            is_done,
         }
     }
 
@@ -279,6 +447,98 @@ mod tests {
         };
         assert_eq!(notification_banner_text(&titled), "Build: finished");
         assert_eq!(notification_banner_text(&osc9("plain")), "plain");
+    }
+
+    #[test]
+    fn kitty_assembler_emits_single_chunk_directly() {
+        let mut assembler = KittyNotificationAssembler::new();
+        let notification = assembler
+            .push_chunk(&kitty_chunk("", KittyPayloadType::Title, "Hello", true))
+            .expect("single done chunk must emit");
+        assert_eq!(notification.source, NotificationSource::Osc99);
+        assert_eq!(
+            notification.title.as_ref().map(|t| t.as_str()),
+            Some("Hello")
+        );
+        assert!(notification.body.is_empty());
+        assert_eq!(assembler.len(), 0);
+    }
+
+    #[test]
+    fn kitty_assembler_joins_title_and_body_by_id() {
+        let mut assembler = KittyNotificationAssembler::new();
+        assert!(
+            assembler
+                .push_chunk(&kitty_chunk("7", KittyPayloadType::Title, "Hello", false))
+                .is_none(),
+            "intermediate chunk buffers"
+        );
+        assert_eq!(assembler.len(), 1);
+        let notification = assembler
+            .push_chunk(&kitty_chunk("7", KittyPayloadType::Body, "World", true))
+            .expect("completing chunk must emit");
+        assert_eq!(notification.source, NotificationSource::Osc99);
+        assert_eq!(notification_banner_text(&notification), "Hello: World");
+        assert_eq!(assembler.len(), 0);
+    }
+
+    #[test]
+    fn kitty_assembler_empty_completion_is_ignored() {
+        let mut assembler = KittyNotificationAssembler::new();
+        assert!(
+            assembler
+                .push_chunk(&kitty_chunk("x", KittyPayloadType::Title, "", true))
+                .is_none(),
+            "empty notification must not emit"
+        );
+    }
+
+    #[test]
+    fn kitty_assembler_evicts_oldest_past_capacity() {
+        let mut assembler = KittyNotificationAssembler::new();
+        for index in 0..KITTY_PARTIALS_CAPACITY {
+            assert!(
+                assembler
+                    .push_chunk(&kitty_chunk(
+                        &format!("id{index}"),
+                        KittyPayloadType::Title,
+                        "part",
+                        false
+                    ))
+                    .is_none()
+            );
+        }
+        assert_eq!(assembler.len(), KITTY_PARTIALS_CAPACITY);
+        assert!(
+            assembler
+                .push_chunk(&kitty_chunk(
+                    "overflow",
+                    KittyPayloadType::Title,
+                    "part",
+                    false
+                ))
+                .is_none()
+        );
+        assert_eq!(assembler.len(), KITTY_PARTIALS_CAPACITY);
+        assert_eq!(assembler.evicted(), 1);
+    }
+
+    #[test]
+    fn kitty_assembler_bounds_concatenated_text() {
+        let mut assembler = KittyNotificationAssembler::new();
+        let long = "y".repeat(KITTY_ASSEMBLED_MAX_CHARS + 64);
+        assert!(
+            assembler
+                .push_chunk(&kitty_chunk("b", KittyPayloadType::Body, &long, false))
+                .is_none()
+        );
+        let notification = assembler
+            .push_chunk(&kitty_chunk("b", KittyPayloadType::Body, "tail", true))
+            .expect("must emit bounded text");
+        assert!(
+            notification.body.as_str().chars().count() <= KITTY_ASSEMBLED_MAX_CHARS,
+            "assembled body must stay bounded"
+        );
     }
 
     const NOTIFICATION_MAX_PROBE: usize = 400;

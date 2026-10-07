@@ -941,13 +941,24 @@ pub struct Runtime {
     /// Defaults to [`bell::BellMode::Visual`]: `BEL` paints a bounded,
     /// self-expiring flash. Audible/off are embedder choices.
     bell_mode: bell::BellMode,
-    /// Whether terminal-originated notifications (`OSC 9` / `OSC 777`) are
-    /// allowed (CTX-0577). Default `false`: no consent means no surface.
+    /// Whether terminal-originated notifications (`OSC 9` / `OSC 777` /
+    /// Kitty `OSC 99`) are allowed (CTX-0577, CTX-1008). Default `false`:
+    /// no consent means no surface.
     osc_notification_allowed: bool,
     /// `RC-8` rate limiter shared by the bell and notification surfaces.
     bell_limiter: bell::Rc8Limiter,
     /// Bounded queue of admitted notifications awaiting presentation.
     notifications: bell::TerminalNotificationQueue,
+    /// Bounded assembler for chunked Kitty `OSC 99` groups (CTX-1008).
+    kitty_assembler: bell::KittyNotificationAssembler,
+    /// Defensive second rate cap from the platform bridge crate (CTX-1008).
+    ///
+    /// Core enforces RC-8 in [`Self::bell_limiter`] before anything reaches
+    /// the OS; this bridge re-caps so a misbehaving caller can never flood
+    /// the backend. Over-ceiling calls surface as rate drops, never queue
+    /// without bound. Backed by `NoopBackend` for the cap-only gate: real
+    /// delivery still flows through [`Self::notification_sink`].
+    notification_bridge: bitty_platform_services::NotificationBridge,
     /// Instant the visual bell flash was last admitted (bounded display).
     bell_flash_at: Option<std::time::Instant>,
     /// Current notification banner text and when it was first shown.
@@ -1509,6 +1520,10 @@ impl Runtime {
             osc_notification_allowed: false,
             bell_limiter: bell::Rc8Limiter::new(bell::RC8_WINDOW, bell::RC8_EVENTS_PER_WINDOW),
             notifications: bell::TerminalNotificationQueue::new(bell::NOTIFICATION_QUEUE_CAPACITY),
+            kitty_assembler: bell::KittyNotificationAssembler::new(),
+            notification_bridge: bitty_platform_services::NotificationBridge::new(Box::new(
+                bitty_platform_services::NoopBackend,
+            )),
             bell_flash_at: None,
             notification_banner: None,
             notifications_denied: 0,
@@ -1747,6 +1762,10 @@ impl Runtime {
             osc_notification_allowed: false,
             bell_limiter: bell::Rc8Limiter::new(bell::RC8_WINDOW, bell::RC8_EVENTS_PER_WINDOW),
             notifications: bell::TerminalNotificationQueue::new(bell::NOTIFICATION_QUEUE_CAPACITY),
+            kitty_assembler: bell::KittyNotificationAssembler::new(),
+            notification_bridge: bitty_platform_services::NotificationBridge::new(Box::new(
+                bitty_platform_services::NoopBackend,
+            )),
             bell_flash_at: None,
             notification_banner: None,
             notifications_denied: 0,
@@ -2219,7 +2238,7 @@ impl Runtime {
     }
 
     /// Allows or denies terminal-originated notifications (`OSC 9` /
-    /// `OSC 777`, CTX-0577).
+    /// `OSC 777` / Kitty `OSC 99`, CTX-0577/CTX-1008).
     ///
     /// Default-deny: untrusted PTY output can never surface a desktop
     /// notification unless an embedder grants this explicitly. Denied
@@ -2244,6 +2263,28 @@ impl Runtime {
     #[must_use]
     pub const fn bell_rate_dropped(&self) -> u64 {
         self.bell_rate_dropped
+    }
+
+    /// Over-ceiling events dropped by the bridge defensive cap (CTX-1008).
+    ///
+    /// Core enforces RC-8 before the bridge runs, so this counter stays zero
+    /// in normal operation; it only advances when a caller bypasses RC-8 or
+    /// when both caps trip on the same flood.
+    #[must_use]
+    pub const fn notifications_bridge_dropped(&self) -> u64 {
+        self.notification_bridge.rate_dropped()
+    }
+
+    /// Kitty `OSC 99` groups currently buffered awaiting completion.
+    #[must_use]
+    pub fn kitty_partials_pending(&self) -> usize {
+        self.kitty_assembler.len()
+    }
+
+    /// Kitty `OSC 99` groups evicted to the partial bound.
+    #[must_use]
+    pub const fn kitty_partials_evicted(&self) -> u64 {
+        self.kitty_assembler.evicted()
     }
 
     /// Notifications dropped to queue overflow.
@@ -2310,9 +2351,9 @@ impl Runtime {
         }
     }
 
-    /// Applies the bell/notification policy to one `OSC 9` / `OSC 777`
-    /// request (CTX-0577). Returns `true` when the notification was admitted
-    /// into the bounded queue.
+    /// Applies the bell/notification policy to one `OSC 9` / `OSC 777` /
+    /// Kitty `OSC 99` (assembled) request (CTX-0577/CTX-1008). Returns `true`
+    /// when the notification was admitted into the bounded queue.
     ///
     /// An admitted notification is additionally handed to the installed
     /// [`bitty_platform::NotificationSink`] at admission time (CTX-0754),
@@ -2333,6 +2374,27 @@ impl Runtime {
             self.bell_rate_dropped = self.bell_rate_dropped.saturating_add(1);
             return false;
         }
+        // Defensive second cap (CTX-1008): the bridge re-caps over-ceiling
+        // callers fail-closed even if RC-8 above is bypassed in a future
+        // refactor. The bridge holds a cap-only `NoopBackend`, so admission
+        // here never touches the OS; real delivery flows through
+        // `deliver_notification_to_os` below.
+        let title = notification
+            .title
+            .as_ref()
+            .map_or("", |title| title.as_str());
+        let bridge_notification =
+            bitty_platform_services::DesktopNotification::new(title, notification.body.as_str());
+        let bridge_outcome = self.notification_bridge.notify_parsed(&bridge_notification);
+        if matches!(
+            bridge_outcome,
+            bitty_platform_services::DeliveryOutcome::Skipped(
+                bitty_platform_services::SkipReason::RateLimited
+            )
+        ) {
+            self.bell_rate_dropped = self.bell_rate_dropped.saturating_add(1);
+            return false;
+        }
         // Show immediately when no banner is live, so an admitted
         // notification is never silently parked until a frame arrives; queue
         // it otherwise (the present path advances the queue on expiry).
@@ -2345,6 +2407,30 @@ impl Runtime {
             self.deliver_notification_to_os(notification);
         }
         admitted
+    }
+
+    /// Applies the notification policy to one Kitty `OSC 99` chunk
+    /// (CTX-1008, issue #1763). Returns `true` when the chunk completed a
+    /// group admitted into the bounded queue.
+    ///
+    /// Intermediate (`d=0`) chunks buffer in the bounded assembler and return
+    /// `false`. Denied chunks (no consent) are counted and never buffered,
+    /// so hostile output cannot pin assembler memory without consent.
+    /// Completed groups flow through [`Self::apply_notification_policy`]
+    /// (RC-8 plus the bridge defensive cap, bounded queue, banner).
+    pub(super) fn apply_kitty_chunk_policy(
+        &mut self,
+        chunk: &bitty_vt::KittyNotificationChunk,
+        now: std::time::Instant,
+    ) -> bool {
+        if !self.osc_notification_allowed {
+            self.notifications_denied = self.notifications_denied.saturating_add(1);
+            return false;
+        }
+        let Some(notification) = self.kitty_assembler.push_chunk(chunk) else {
+            return false;
+        };
+        self.apply_notification_policy(&notification, now)
     }
 
     /// Hands one admitted notification to the installed OS sink (CTX-0754).

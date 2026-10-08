@@ -238,6 +238,17 @@ impl Runtime {
         }
     }
 
+    /// Whether the pending close confirmation targets the window (issue
+    /// #1783: the last-pane `close_view` chord confirms a window arm when
+    /// it is the window-close gesture; a view arm reports `false`).
+    #[must_use]
+    pub fn pending_close_is_window(&self) -> bool {
+        matches!(
+            self.pending_close_confirm.as_ref().map(|p| p.target),
+            Some(CloseTarget::Window)
+        )
+    }
+
     /// Overlay banner text for the pending close (steady while armed).
     ///
     /// Overlay-only via the present path (like the paste and workspace-close

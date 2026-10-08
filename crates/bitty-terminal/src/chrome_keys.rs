@@ -801,6 +801,11 @@ fn match_plugin_binding(_keyref: bitty_config::KeyRef) -> Option<bitty_config::C
 /// `close_confirm_pending` is any CTX-0370 close arm (view or window);
 /// `close_confirm_view` is only true when the arm targets the currently
 /// focused view, so the `close_view` chord confirms exactly that arm.
+/// `close_confirm_window` is only true when the arm targets the window;
+/// `is_last_pane` is true when the focused workspace holds a single leaf
+/// (zoom-aware). Issue #1783: the last-pane `close_view` is the window-close
+/// gesture, so it confirms a window arm only there; elsewhere a window arm
+/// stays captured (the repeated OS close request is its confirm gesture).
 ///
 /// Table (first match wins):
 /// - `Esc` with a pending confirmation -> `(Emergency, None)` (the cancel
@@ -810,7 +815,8 @@ fn match_plugin_binding(_keyref: bitty_config::KeyRef) -> Option<bitty_config::C
 /// - a capturing modal (workspace-close, view/window close, or panel
 ///   overlay) + the bound chord that confirms THAT modal (repeat the arming
 ///   chord: `workspace_close` while a workspace-close pends, `close_view`
-///   while a view-close arm on the focused view pends) -> `(User, action)`.
+///   while a view-close arm on the focused view pends, `close_view` on the
+///   last pane while a window arm pends) -> `(User, action)`.
 /// - a capturing modal + any other bound chord -> `(Modal, None)`
 ///   (captured).
 /// - a pending paste alone never captures (issue #1336): the banner is
@@ -821,6 +827,7 @@ fn match_plugin_binding(_keyref: bitty_config::KeyRef) -> Option<bitty_config::C
 /// - unbound key while a modal pends -> `(Terminal, None)` (fall-through
 ///   unchanged: the dialog captures commands, not typing).
 /// - unbound key, no modal -> `(Terminal, None)` (existing fall-through).
+#[allow(clippy::too_many_arguments)]
 fn resolve_priority_for(
     keyref: bitty_config::KeyRef,
     matched: Option<bitty_config::ChromeAction>,
@@ -829,6 +836,8 @@ fn resolve_priority_for(
     close_confirm_pending: bool,
     close_confirm_view: bool,
     panel_modal_active: bool,
+    close_confirm_window: bool,
+    is_last_pane: bool,
 ) -> (DispatchPriority, Option<bitty_config::ChromeAction>) {
     use bitty_config::{ChromeAction as A, KeyName};
     let confirm_modal_active = paste_pending || ws_close_pending || close_confirm_pending;
@@ -858,10 +867,15 @@ fn resolve_priority_for(
             let confirms_paste = paste_pending && matches!(action, A::PasteFromClipboard);
             let confirms_ws = ws_close_pending && matches!(action, A::WorkspaceClose);
             // CTX-0370: repeating the pane-close chord confirms the pane
-            // arm; a window arm has no chord (the repeated OS close request
-            // is its confirm gesture, handled by the runtime).
+            // arm. Issue #1783: the last-pane `close_view` is the window-close
+            // gesture, so it also confirms a window arm — but only on the
+            // last pane (elsewhere a window arm stays captured; the repeated
+            // OS close request is its confirm gesture, handled by the
+            // runtime).
             let confirms_view_close = close_confirm_view && matches!(action, A::CloseView);
-            if confirms_paste || confirms_ws || confirms_view_close {
+            let confirms_window_close =
+                close_confirm_window && is_last_pane && matches!(action, A::CloseView);
+            if confirms_paste || confirms_ws || confirms_view_close || confirms_window_close {
                 // The modal's own confirm gesture reuses the normal user
                 // action path (repeat Alt+W kills; a paste-again confirm
                 // behind a close/panel modal delivers through the same
@@ -992,7 +1006,11 @@ impl TerminalApp {
     /// Execute one bound chrome action (single owner: the PTY never sees the
     /// chord). All mutations go through existing `Runtime`/`LayoutNode` APIs;
     /// refusals warn and keep the current layout.
-    pub(crate) fn apply_chrome_action(&mut self, action: bitty_config::ChromeAction) {
+    ///
+    /// Returns `true` when the action confirms a window close and the event
+    /// loop must exit (issue #1783: last-pane `close_view` is the
+    /// window-close gesture). All other actions return `false`.
+    pub(crate) fn apply_chrome_action(&mut self, action: bitty_config::ChromeAction) -> bool {
         use bitty_config::ChromeAction as A;
         // CTX-0943: a user focus-switch ends the transient input capture
         // (contract `focus_switched`), wherever the action originates
@@ -1125,7 +1143,7 @@ impl TerminalApp {
                 // controls the adaptive `NewPanel` path below).
                 let Some(target) = self.runtime.focused_view() else {
                     eprintln!("warning: keymap {label} has no focused pane — ignoring");
-                    return;
+                    return false;
                 };
                 self.apply_new_leaf(target, split_dir_to_axis(dir), place_new_first, &label);
             }
@@ -1147,7 +1165,7 @@ impl TerminalApp {
                     Some(id) => id,
                     None => {
                         eprintln!("warning: keymap new_panel has no focused pane — ignoring");
-                        return;
+                        return false;
                     }
                 };
                 // Review (#1441): restore zoom before measuring — a zoomed
@@ -1169,20 +1187,34 @@ impl TerminalApp {
                     Some(id) => id,
                     None => {
                         eprintln!("warning: keymap close_view has no focused pane — ignoring");
-                        return;
+                        return false;
                     }
                 };
                 // A zoomed view collapses the live layout to one leaf, so
                 // consult the backup the restore would bring back before
-                // refusing a real multi-pane close.
+                // deciding whether this is the last-pane window-close.
                 let effective_leaf_count = self
                     .chrome
                     .zoom
                     .backup_leaf_count(&self.runtime)
                     .unwrap_or_else(|| self.runtime.leaf_count());
                 if effective_leaf_count <= 1 {
-                    eprintln!("warning: keymap close_view refused (last pane) — ignoring");
-                    return;
+                    // Issue #1783: the last pane has no sibling to promote,
+                    // so `close_view` is the window-close gesture. It passes
+                    // the `close_confirm` window gate (reuses the accepted
+                    // modal contract): idle `when_busy`/`never` exits
+                    // immediately, `always`/busy arms a bounded `Close
+                    // window?` confirmation, and repeating the same chord
+                    // confirms the quit (`Esc` cancels). Never a silent
+                    // no-op.
+                    if self.runtime.window_close_request() {
+                        eprintln!("bitty: keymap close_view -> last pane, window close confirmed");
+                        return true;
+                    }
+                    if let Some(summary) = self.runtime.close_confirm_banner_text() {
+                        eprintln!("bitty: keymap close_view PENDING -> {summary}");
+                    }
+                    return false;
                 }
                 // CTX-0370 close-confirm gate: a pane with a running
                 // foreground job never closes on one gesture (repeat the
@@ -1192,7 +1224,7 @@ impl TerminalApp {
                 match self.runtime.view_close_request(focused) {
                     ViewCloseRequest::Pending { summary } => {
                         eprintln!("bitty: keymap close_view PENDING -> {summary}");
-                        return;
+                        return false;
                     }
                     ViewCloseRequest::Proceed => {}
                 }
@@ -1223,7 +1255,7 @@ impl TerminalApp {
                     Some(id) => id,
                     None => {
                         eprintln!("warning: keymap resize_split has no focused pane — ignoring");
-                        return;
+                        return false;
                     }
                 };
                 let mut layout = self.runtime.layout().clone();
@@ -1451,7 +1483,7 @@ impl TerminalApp {
                         Some(id) => id,
                         None => {
                             eprintln!("warning: keymap toggle_zoom has no focused pane — ignoring");
-                            return;
+                            return false;
                         }
                     };
                     if self.chrome.zoom.engage(&mut self.runtime, focused) {
@@ -1479,7 +1511,7 @@ impl TerminalApp {
                     Some(id) => id,
                     None => {
                         eprintln!("warning: keymap toggle_floating has no focused pane — ignoring");
-                        return;
+                        return false;
                     }
                 };
                 let current = match self.runtime.layout().find_leaf(focused) {
@@ -1488,7 +1520,7 @@ impl TerminalApp {
                         eprintln!(
                             "warning: keymap toggle_floating found no focused pane — ignoring"
                         );
-                        return;
+                        return false;
                     }
                 };
                 let next = match current {
@@ -1498,14 +1530,14 @@ impl TerminalApp {
                         eprintln!(
                             "warning: keymap toggle_floating needs a tiled or floating leaf, found {other} — ignoring"
                         );
-                        return;
+                        return false;
                     }
                 };
                 if !PresentationMode::can_transition(current, next) {
                     eprintln!(
                         "warning: keymap toggle_floating transition rejected: {current} -> {next} — ignoring"
                     );
-                    return;
+                    return false;
                 }
                 self.restore_zoom();
                 let mut layout = self.runtime.layout().clone();
@@ -1515,14 +1547,14 @@ impl TerminalApp {
                             eprintln!(
                                 "warning: keymap toggle_floating transition rejected: {current} -> {next} — ignoring"
                             );
-                            return;
+                            return false;
                         }
                     }
                     None => {
                         eprintln!(
                             "warning: keymap toggle_floating found no focused pane — ignoring"
                         );
-                        return;
+                        return false;
                     }
                 }
                 self.runtime.set_layout(layout);
@@ -1571,6 +1603,7 @@ impl TerminalApp {
                 );
             }
         }
+        false
     }
 }
 
@@ -1612,7 +1645,18 @@ impl TerminalApp {
             close_confirm_pending,
             close_confirm_view,
             panel_modal_active,
+            close_confirm_window,
+            is_last_pane,
         ) = if self.modal_capture_active() {
+            // Issue #1783: a zoomed view collapses the live layout to one
+            // leaf, so consult the backup before deciding whether this is
+            // the last-pane window-close gesture.
+            let is_last_pane = self
+                .chrome
+                .zoom
+                .backup_leaf_count(&self.runtime)
+                .unwrap_or_else(|| self.runtime.leaf_count())
+                <= 1;
             (
                 self.runtime.has_pending_paste(),
                 self.runtime.has_pending_ws_close(),
@@ -1623,9 +1667,11 @@ impl TerminalApp {
                     .pending_close_view()
                     .is_some_and(|view| self.runtime.focused_view() == Some(view)),
                 self.runtime.overlay_modal_active(),
+                self.runtime.pending_close_is_window(),
+                is_last_pane,
             )
         } else {
-            (false, false, false, false, false)
+            (false, false, false, false, false, false, false)
         };
         resolve_priority_for(
             keyref,
@@ -1635,6 +1681,8 @@ impl TerminalApp {
             close_confirm_pending,
             close_confirm_view,
             panel_modal_active,
+            close_confirm_window,
+            is_last_pane,
         )
     }
 
@@ -1796,7 +1844,9 @@ impl TerminalApp {
                 self.chrome.held.insert(keyref.key);
                 if !key.repeat {
                     eprintln!("bitty: prefix -> {}", action.canonical());
-                    self.apply_chrome_action(action);
+                    if self.apply_chrome_action(action) {
+                        self.chrome_close_exit_requested = true;
+                    }
                 }
                 true
             }
@@ -2199,8 +2249,8 @@ impl TerminalApp {
                             self.chrome.held.insert(keyref.key);
                             // Repeats of a bound chord stay owned by chrome
                             // (no action, no PTY bytes).
-                            if !key.repeat {
-                                self.apply_chrome_action(action);
+                            if !key.repeat && self.apply_chrome_action(action) {
+                                self.chrome_close_exit_requested = true;
                             }
                             if let Some(win) = self.window.handle.as_ref() {
                                 win.request_redraw();
@@ -3075,14 +3125,80 @@ mod tests {
         app.apply_chrome_action(ChromeAction::ToggleZoom);
         assert_eq!(app.runtime.leaf_count(), 3);
         // Close removes the focused leaf and refocuses inside the tree.
-        app.apply_chrome_action(ChromeAction::CloseView);
+        assert!(!app.apply_chrome_action(ChromeAction::CloseView));
         assert_eq!(app.runtime.leaf_count(), 2);
         assert!(app.runtime.focused_view().is_some());
-        // Last pane refuses to close.
-        app.apply_chrome_action(ChromeAction::CloseView);
+        // Issue #1783: the last pane is the window-close gesture, never a
+        // silent no-op. Idle `when_busy` exits immediately.
+        assert!(!app.apply_chrome_action(ChromeAction::CloseView));
         assert_eq!(app.runtime.leaf_count(), 1);
-        app.apply_chrome_action(ChromeAction::CloseView);
+        assert!(app.apply_chrome_action(ChromeAction::CloseView));
         assert_eq!(app.runtime.leaf_count(), 1);
+        assert!(!app.runtime.has_pending_close_confirm());
+    }
+
+    fn last_pane_test_app(mode: CloseConfirmMode) -> TerminalApp {
+        use bitty_config::ChromeAction;
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let cfg = RuntimeConfig {
+            close_confirm: mode,
+            ..RuntimeConfig::default()
+        };
+        let rt = Runtime::new(cfg).expect("headless runtime builds");
+        let mut app = TerminalApp::with_theme(
+            rt,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            maps,
+            SpawnSpec::default(),
+        );
+        // Single leaf: the focused last pane.
+        app.runtime
+            .set_layout(LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)));
+        assert_eq!(app.runtime.leaf_count(), 1);
+        let _ = ChromeAction::CloseView;
+        app
+    }
+
+    #[test]
+    fn last_pane_close_view_exits_immediately_when_idle() {
+        use bitty_config::ChromeAction;
+        // Default `when_busy` with no running job: the last-pane chord is
+        // the window-close gesture and exits on the first press (issue
+        // #1783: never a silent no-op).
+        let mut app = last_pane_test_app(CloseConfirmMode::WhenBusy);
+        assert!(app.apply_chrome_action(ChromeAction::CloseView));
+        assert_eq!(app.runtime.leaf_count(), 1);
+        assert!(!app.runtime.has_pending_close_confirm());
+    }
+
+    #[test]
+    fn last_pane_close_view_exits_immediately_under_never() {
+        use bitty_config::ChromeAction;
+        let mut app = last_pane_test_app(CloseConfirmMode::Never);
+        assert!(app.apply_chrome_action(ChromeAction::CloseView));
+        assert!(!app.runtime.has_pending_close_confirm());
+    }
+
+    #[test]
+    fn last_pane_close_view_arms_then_repeat_exits_under_always() {
+        use bitty_config::ChromeAction;
+        let mut app = last_pane_test_app(CloseConfirmMode::Always);
+        // First press arms the window gate and keeps running.
+        assert!(!app.apply_chrome_action(ChromeAction::CloseView));
+        assert!(app.runtime.has_pending_close_confirm());
+        assert!(app.runtime.pending_close_is_window());
+        let banner = app
+            .runtime
+            .close_confirm_banner_text()
+            .expect("armed banner");
+        assert!(banner.contains("Close window?"), "{banner}");
+        assert!(banner.contains("close again to confirm"), "{banner}");
+        assert!(banner.contains("Esc cancels"), "{banner}");
+        // Repeat confirms the exit.
+        assert!(app.apply_chrome_action(ChromeAction::CloseView));
+        assert!(!app.runtime.has_pending_close_confirm());
     }
 
     #[test]
@@ -4257,30 +4373,50 @@ mod tests {
         };
         // Emergency beats everything, even a user `escape` remap.
         assert_eq!(
-            resolve_priority_for(esc, Some(A::CloseView), true, false, false, false, false,),
+            resolve_priority_for(
+                esc,
+                Some(A::CloseView),
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+            ),
             (DispatchPriority::Emergency, None)
         );
         assert_eq!(
-            resolve_priority_for(esc, None, false, true, false, false, false,),
+            resolve_priority_for(esc, None, false, true, false, false, false, false, false,),
             (DispatchPriority::Emergency, None)
         );
         // No modal: bound -> User, unbound -> Terminal (pre-0275 behavior).
         assert_eq!(
-            resolve_priority_for(esc, Some(A::CloseView), false, false, false, false, false,),
+            resolve_priority_for(
+                esc,
+                Some(A::CloseView),
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+            ),
             (DispatchPriority::User, Some(A::CloseView))
         );
         assert_eq!(
-            resolve_priority_for(esc, None, false, false, false, false, false,),
+            resolve_priority_for(esc, None, false, false, false, false, false, false, false,),
             (DispatchPriority::Terminal, None)
         );
         // Unbound keys fall through even with a modal up (the dialog
         // captures commands, not typing).
         assert_eq!(
-            resolve_priority_for(bare_x, None, true, false, false, false, false,),
+            resolve_priority_for(bare_x, None, true, false, false, false, false, false, false,),
             (DispatchPriority::Terminal, None)
         );
         assert_eq!(
-            resolve_priority_for(bare_x, None, true, true, false, false, false,),
+            resolve_priority_for(bare_x, None, true, true, false, false, false, false, false,),
             (DispatchPriority::Terminal, None)
         );
         // A close gate captures a bound non-confirm chord (a pending paste
@@ -4295,6 +4431,8 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
+                false,
             ),
             (DispatchPriority::User, Some(A::GotoSplit(SplitDir::Left))),
             "paste pending alone: bound chords route normally"
@@ -4305,6 +4443,8 @@ mod tests {
                 Some(A::GotoSplit(SplitDir::Left)),
                 false,
                 true,
+                false,
+                false,
                 false,
                 false,
                 false,
@@ -4324,6 +4464,8 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
+                false,
             ),
             (DispatchPriority::User, Some(A::PasteFromClipboard))
         );
@@ -4333,6 +4475,8 @@ mod tests {
                 Some(A::WorkspaceClose),
                 false,
                 true,
+                false,
+                false,
                 false,
                 false,
                 false,
@@ -4352,6 +4496,8 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
+                false,
             ),
             (DispatchPriority::User, Some(A::WorkspaceClose)),
             "paste pending alone: close chord arms normally"
@@ -4362,6 +4508,8 @@ mod tests {
                 Some(A::PasteFromClipboard),
                 false,
                 true,
+                false,
+                false,
                 false,
                 false,
                 false,
@@ -4379,21 +4527,60 @@ mod tests {
                 true,
                 false,
                 false,
+                false,
+                false,
             ),
             (DispatchPriority::Modal, None)
         );
         assert_eq!(
-            resolve_priority_for(alt_w, Some(A::CloseView), false, false, true, true, false,),
+            resolve_priority_for(
+                alt_w,
+                Some(A::CloseView),
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+            ),
             (DispatchPriority::User, Some(A::CloseView)),
             "arm on the focused view: repeat close confirms"
         );
         assert_eq!(
-            resolve_priority_for(alt_w, Some(A::CloseView), false, false, true, false, false,),
+            resolve_priority_for(
+                alt_w,
+                Some(A::CloseView),
+                false,
+                false,
+                true,
+                false,
+                false,
+                true,
+                false,
+            ),
             (DispatchPriority::Modal, None),
-            "window arm (or another view): the close chord is captured"
+            "window arm off the last pane: the close chord stays captured"
+        );
+        // Issue #1783: the last-pane `close_view` is the window-close
+        // gesture, so it confirms a window arm only there.
+        assert_eq!(
+            resolve_priority_for(
+                alt_w,
+                Some(A::CloseView),
+                false,
+                false,
+                true,
+                false,
+                false,
+                true,
+                true,
+            ),
+            (DispatchPriority::User, Some(A::CloseView)),
+            "window arm on the last pane: repeat close confirms the window"
         );
         assert_eq!(
-            resolve_priority_for(esc, None, false, false, true, true, false),
+            resolve_priority_for(esc, None, false, false, true, true, false, false, false),
             (DispatchPriority::Emergency, None),
             "Esc cancels a close-confirm arm"
         );
@@ -4406,7 +4593,9 @@ mod tests {
                 false,
                 false,
                 false,
-                true
+                true,
+                false,
+                false
             ),
             (DispatchPriority::Modal, None),
             "a panel modal captures bound non-confirm chords"
@@ -4415,13 +4604,23 @@ mod tests {
         // runtime (Terminal), never the confirm-cancel emergency arm, and a
         // remapped `Esc` action must not run behind the modal.
         assert_eq!(
-            resolve_priority_for(esc, Some(A::CloseView), false, false, false, false, true),
+            resolve_priority_for(
+                esc,
+                Some(A::CloseView),
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                false
+            ),
             (DispatchPriority::Terminal, None)
         );
         // A pending confirmation still owns `Esc` even with the panel modal
         // up: cancelling the confirmation is the emergency gesture.
         assert_eq!(
-            resolve_priority_for(esc, None, true, false, false, false, true),
+            resolve_priority_for(esc, None, true, false, false, false, true, false, false),
             (DispatchPriority::Emergency, None)
         );
         // The panel modal's confirm gestures are not exempt: only the
@@ -4435,7 +4634,9 @@ mod tests {
                 false,
                 false,
                 false,
-                true
+                true,
+                false,
+                false
             ),
             (DispatchPriority::Modal, None)
         );

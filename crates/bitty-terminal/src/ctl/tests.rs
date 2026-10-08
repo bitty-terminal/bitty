@@ -1547,6 +1547,10 @@ fn control_help_documents_windows_degradation() {
         help.contains("instance list") && help.contains("local discovery"),
         "help must scope instance list as discovery-only, got {help:?}"
     );
+    assert!(
+        help.contains("no live instance"),
+        "help must distinguish the no-target Windows case, got {help:?}"
+    );
 }
 
 #[test]

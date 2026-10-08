@@ -269,8 +269,9 @@ pub fn ctl_help_text() -> String {
           \n\
           Platform (issue #1800): IPC verbs need a live instance with IPC\n  \
             serving (Unix only; Windows serving is unavailable until a\n  \
-            named-pipe transport lands, so verbs there report unavailable\n  \
-            exit 6; `instance list` stays local discovery only).\n\
+            named-pipe transport lands. With an explicit target, verbs\n  \
+            report unavailable with exit 6; without a target, they report\n  \
+            no live instance. `instance list` stays local discovery only).\n\
           \n\
           Verbs (each maps to one registry executable; scopes enforced server-side):\n  \
             instance list                 Local discovery (no IPC; same-UID sockets only)\n  \

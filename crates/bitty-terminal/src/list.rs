@@ -1874,7 +1874,9 @@ mod tests {
     fn degraded_merge_with_empty_pipe_namespace_preserves_registry() {
         // Issue #1800 degraded shape (Windows without serving, or any
         // platform without pipes): merging registry rows with an empty
-        // pipe-namespace set is a sorted no-op, never a failure.
+        // pipe-namespace set is a sorted no-op, never a failure. The
+        // empty namespace is passed explicitly so the test never depends
+        // on the host pipe namespace (CodeRabbit, PR #1831).
         let row = |instance: &str, socket: &str| InstanceInfo {
             instance: instance.to_string(),
             socket: socket.to_string(),
@@ -1882,19 +1884,18 @@ mod tests {
             detail: "stale: pipe not present".to_string(),
         };
         let primary = vec![row("b", "b"), row("a", "a")];
-        let merged = merge_instance_rows(primary, scan_pipe_namespace());
-        #[cfg(not(windows))]
-        {
-            let sockets: Vec<&str> = merged.iter().map(|r| r.socket.as_str()).collect();
-            assert_eq!(sockets, vec!["a", "b"]);
-        }
-        #[cfg(windows)]
-        {
-            // On Windows the namespace scan is best-effort: it may
-            // contribute live rows, but the registry rows always survive.
-            assert!(merged.iter().any(|r| r.socket == "a"));
-            assert!(merged.iter().any(|r| r.socket == "b"));
-        }
+        let merged = merge_instance_rows(primary, Vec::new());
+        let sockets: Vec<&str> = merged.iter().map(|r| r.socket.as_str()).collect();
+        assert_eq!(sockets, vec!["a", "b"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_pipe_namespace_scan_stays_bounded() {
+        // Live host scan, tested separately from the degraded merge
+        // above: best-effort enumeration never exceeds the list bound,
+        // however many pipes a busy host holds.
+        assert!(scan_pipe_namespace().len() <= MAX_LIST_INSTANCES);
     }
 
     #[cfg(not(windows))]

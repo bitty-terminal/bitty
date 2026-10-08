@@ -2290,11 +2290,12 @@ fn runtime_config_inherits_file_font() {
     let defaults = bitty_runtime::RuntimeConfig::default();
     assert_eq!(cfg.cols, defaults.cols);
     assert_eq!(cfg.rows, defaults.rows);
-    // Breathing-room defaults: legacy table omits spacing, so effective
-    // 10x22 covers the measured 12pt raster truth (CTX-0237: advance
-    // 10, line 22). This intentionally differs from the headless
+    // Size-aware cell (issue #1814): the 12pt breathing-room reference is
+    // 10x22 (CTX-0237: advance 10, line 22); at 13pt it scales by
+    // 13/12 and rounds to 11x24 so the cell tracks the harfrust shaped
+    // advance. This intentionally differs from the headless
     // RuntimeConfig 9x19 compiled defaults.
-    assert_eq!((cfg.cell_width, cfg.cell_height), (10, 22));
+    assert_eq!((cfg.cell_width, cfg.cell_height), (11, 24));
 }
 
 #[test]
@@ -2310,6 +2311,40 @@ fn runtime_config_applies_font_spacing() {
     let merged = resolve_effective(Some(layer), None).expect("merge");
     let cfg = runtime_config_from_effective(&merged.effective).expect("runtime cfg builds");
     assert_eq!((cfg.cell_width, cfg.cell_height), (8, 16));
+}
+
+#[test]
+fn runtime_config_large_sizes_track_shaped_advance_issue_1814() {
+    use bitty_config::file::{parse_lua_config, resolve_effective};
+    use bitty_config::plan::{ConfigSource, LayerKind};
+    // Large-size golden (issue #1814, present profile size 20): the runtime
+    // cell must equal the scaled breathing-room cell, never the fixed
+    // 10x22, or glyphs overlap horizontally from ~16pt up.
+    let cell_for_size = |size: &str| {
+        let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+        let content = format!(
+            "return {{ font = {{ family = \"JetBrainsMono Nerd Font\", size = {size} }} }}"
+        );
+        let plan = parse_lua_config(&content, &src).expect("font parses");
+        let layer = bitty_config::plan::LayeredPlan::new(src, plan);
+        let merged = resolve_effective(Some(layer), None).expect("merge");
+        let cfg = runtime_config_from_effective(&merged.effective).expect("runtime builds");
+        (cfg.cell_width, cfg.cell_height)
+    };
+    assert_eq!(cell_for_size("12.0"), (10, 22), "12pt reference");
+    assert_eq!(cell_for_size("16.0"), (13, 29), "16pt repro floor");
+    assert_eq!(cell_for_size("20.0"), (17, 37), "present profile");
+    assert_eq!(cell_for_size("24.0"), (20, 44), "acceptance ceiling");
+    // No overlap across 12-24: cell width covers the monospace shaped
+    // advance model (`0.6 * pt * 96/72`).
+    for size in 12..=24 {
+        let (w, _) = cell_for_size(&format!("{size}.0"));
+        let shaped = ((size as f32) * 0.8).ceil() as u32;
+        assert!(
+            w >= shaped,
+            "size {size}: cell {w} must cover shaped {shaped}"
+        );
+    }
 }
 
 #[test]

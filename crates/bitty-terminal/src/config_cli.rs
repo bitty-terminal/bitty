@@ -1183,9 +1183,11 @@ pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
 }
 /// Derives a [`bitty_runtime::RuntimeConfig`] from the effective config.
 ///
-/// Cell geometry applies the configured breathing room
+/// Cell geometry applies the configured breathing room scaled with point size
 /// (`font.line_height`/`font.letter_spacing` over the legacy `8x16` base via
-/// [`bitty_config::types::FontConfig::effective_cell`], defaults `10x22`);
+/// [`bitty_config::types::FontConfig::default_effective_cell`], `10x22` at
+/// 12pt, linearly scaled at other sizes so the cell tracks the harfrust
+/// shaped advance — issue #1814);
 /// grid/queue geometry stays at compiled defaults; font family/size, scroll
 /// speed, selection auto-copy, panel gaps, and hover-focus come from the
 /// file/CLI/default chain (already validated by `bitty-config`, so

@@ -1148,9 +1148,13 @@ impl Runtime {
     ///   workspace plus `NewPanel` therefore tiles the full container with
     ///   no ghost remnant.
     /// - The target slot gains the moved leaf alongside its existing tree
-    ///   (CTX-0964, #1698: bisect-largest 50/50 — the largest-area target
-    ///   leaf splits right when `width >= height`, else down, and the moved
-    ///   leaf goes after it; an empty target becomes the moved leaf) and its
+    ///   (issue #1804 balanced tiling: bisect-largest 50/50 over the
+    ///   physically largest target leaf — [`bitty_ui::balanced_bisect_choice`]
+    ///   splits the largest-area leaf on its physical aspect (glyph-aware,
+    ///   not raw cell counts) and the moved leaf goes after it; an empty
+    ///   target becomes the moved leaf). Sequential move-ins therefore tile
+    ///   2 side-by-side, 3 with one column split, and 4 as a 2x2 quadrant;
+    ///   manual splits keep their own axis untouched) and its
     ///   focus moves to the moved window; the active workspace switches to
     ///   the target and its focus follows the moved window. This move
     ///   bisects regardless of [`PanelLayoutMode`](crate::PanelLayoutMode)
@@ -1298,13 +1302,16 @@ impl Runtime {
         }
         let gaps = self.gaps();
         let container = self.container;
-        // CTX-0964 (#1698): move-to-workspace defaults to bisect-largest
-        // placement regardless of `panel_layout_mode` (which only controls
-        // `NewPanel`). The target is the largest-area leaf in the target
-        // slot (first in solver order on ties) and the axis is raw
-        // `width >= height` ([`bitty_ui::bisect_split_axis`], no 2.0
-        // cell-aspect correction); the moved pane goes after it (right or
-        // down). This move never splits the whole workspace root in half.
+        // Issue #1804 balanced tiling: move-to-workspace defaults to
+        // bisect-largest placement regardless of `panel_layout_mode` (which
+        // only controls `NewPanel`). The target is the largest-area leaf in
+        // the target slot (first in solver order on ties) and the axis is
+        // the physical aspect ([`bitty_ui::balanced_split_axis`], glyph-aware
+        // 2.0 cell-aspect correction); the moved pane goes after it (right
+        // or down). Sequential move-ins tile 2 side-by-side, 3 with one
+        // column split, and 4 as a 2x2 quadrant. Manual splits
+        // (same-workspace reposition, explicit `new_split:<dir>`) keep their
+        // own axis. This move never splits the whole workspace root in half.
         // Insert into the target slot (inactive by the early return above;
         // after a singleton removal the live index shifted, so use the
         // adjusted slot).
@@ -1313,7 +1320,7 @@ impl Runtime {
             .get_mut(adjusted_index)
             .ok_or_else(|| String::from("target workspace vanished"))?;
         let allocations = target_slot.layout.layout_with_gaps(container, gaps);
-        let (bisect_target, axis) = bitty_ui::bisect_choice(&allocations, container);
+        let (bisect_target, axis) = bitty_ui::balanced_bisect_choice(&allocations, container);
         // Bisect always places the moved pane after the target (right/down).
         let inserted = if let Some(sibling) = bisect_target {
             target_slot
@@ -1344,7 +1351,7 @@ impl Runtime {
                     .find(|(leaf_id, _)| *leaf_id == first)
                     .map(|(_, r)| *r)
                     .unwrap_or(container);
-                let first_axis = bitty_ui::bisect_split_axis(first_rect);
+                let first_axis = bitty_ui::balanced_split_axis(first_rect);
                 if !target_slot
                     .layout
                     .insert_beside(first, &moved_view, first_axis, 0.5, true)
@@ -2526,10 +2533,11 @@ mod tests {
 
     #[test]
     fn move_bisects_largest_panel_by_default() {
-        // CTX-0964 (#1698): move-to-workspace defaults to bisect-largest
-        // regardless of `panel_layout_mode` (here the default `Spiral`): the
-        // moved pane splits the largest-area target leaf right (`w >= h`)
-        // instead of the focused leaf or the whole root.
+        // CTX-0964 (#1698) + issue #1804: move-to-workspace defaults to
+        // balanced bisect-largest regardless of `panel_layout_mode` (here
+        // the default `Spiral`): the moved pane splits the largest-area
+        // target leaf on its physical aspect (here the 60-wide leaf stays
+        // side-by-side) instead of the focused leaf or the whole root.
         let mut rt = fresh();
         assert_eq!(rt.panel_layout_mode(), crate::PanelLayoutMode::Spiral);
         let source = rt.focused_view().expect("source focus");
@@ -2599,11 +2607,12 @@ mod tests {
 
     #[test]
     fn move_into_single_leaf_target_bisects_without_root_split() {
-        // CTX-0964 (#1698): moving into a single-leaf target bisects that
-        // leaf (raw-wide 80-wide container -> side-by-side 40/40) instead of
-        // wrapping the whole workspace root. Heights stay relative (the
-        // workspaceline band may reserve a row). Issue #1803: the singleton
-        // source is removed and focus follows to the target.
+        // Issue #1804: moving into a single-leaf target bisects that leaf
+        // on its physical aspect (physically wide 80-wide container ->
+        // side-by-side 40/40) instead of wrapping the whole workspace root.
+        // Heights stay relative (the workspaceline band may reserve a row).
+        // Issue #1803: the singleton source is removed and focus follows to
+        // the target.
         let mut rt = fresh();
         let source = rt.focused_view().expect("source focus");
         rt.workspace_new().expect("ws2");
@@ -2623,6 +2632,162 @@ mod tests {
         }
         assert_eq!(allocs[0].1.height, allocs[1].1.height);
         assert_eq!(rt.layout().split_axis_at(&[]), Some(SplitAxis::Horizontal));
+    }
+
+    /// Builds a four-leaf source layout on the active workspace from fresh
+    /// ids `100..=103` (two side-by-side columns of two), returning the
+    /// probe view the dimensions were cloned from.
+    fn four_leaf_source(rt: &mut Runtime) {
+        let probe = rt
+            .layout()
+            .find_leaf(rt.focused_view().expect("focus"))
+            .cloned()
+            .expect("source leaf");
+        let mk = |id: u64| {
+            LayoutNode::leaf(View::new(
+                ViewId::new(id),
+                usize::from(probe.cols()),
+                usize::from(probe.rows()),
+            ))
+        };
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::split(SplitAxis::Horizontal, 0.5, mk(100), mk(101)),
+            LayoutNode::split(SplitAxis::Horizontal, 0.5, mk(102), mk(103)),
+        ));
+    }
+
+    /// Moves one source leaf into workspace `1`, switching back to the
+    /// source first (move follows focus to the target since #1803).
+    fn move_one_in(rt: &mut Runtime, id: ViewId) -> ViewId {
+        assert!(rt.workspace_switch(0), "back to source");
+        assert!(rt.set_focus(id), "focus source leaf");
+        let moved = rt.workspace_move_focused_to(1).expect("move in");
+        assert_eq!(moved, id);
+        assert_eq!(rt.active_workspace_index(), 1, "move follows focus");
+        assert_eq!(rt.focused_view(), Some(id), "target focuses moved leaf");
+        moved
+    }
+
+    #[test]
+    fn issue_1804_move_in_two_panels_tiles_side_by_side() {
+        // Issue #1804: one move-in beside a single-leaf target tiles the
+        // two side-by-side (balanced policy, physically wide -> right).
+        let mut rt = fresh();
+        four_leaf_source(&mut rt);
+        rt.workspace_new().expect("ws2");
+        let target_orig = rt.focused_view().expect("target leaf");
+        let moved = move_one_in(&mut rt, ViewId::new(100));
+        assert_eq!(rt.workspace_count(), 2, "source keeps survivors");
+        assert_eq!(rt.layout().leaf_count(), 2);
+        let allocs = rt.layout_allocations();
+        let rect_of = |id: ViewId| {
+            allocs
+                .iter()
+                .find(|(leaf, _)| *leaf == id)
+                .map(|(_, r)| *r)
+                .expect("allocation present")
+        };
+        let orig = rect_of(target_orig);
+        let new = rect_of(moved);
+        assert_eq!(orig.height, new.height);
+        assert_eq!(orig.y, new.y);
+        assert_eq!(orig.width, 40);
+        assert_eq!(new.width, 40);
+        assert_eq!(orig.x + orig.width, new.x);
+        assert_eq!(rt.layout().split_axis_at(&[]), Some(SplitAxis::Horizontal));
+    }
+
+    #[test]
+    fn issue_1804_move_in_three_panels_tiles_balanced_column() {
+        // Issue #1804: two move-ins into a single-leaf target tile three
+        // as one full-height column beside a column split top/bottom —
+        // never three thin horizontal columns.
+        let mut rt = fresh();
+        four_leaf_source(&mut rt);
+        rt.workspace_new().expect("ws2");
+        let target_orig = rt.focused_view().expect("target leaf");
+        let first = move_one_in(&mut rt, ViewId::new(100));
+        let second = move_one_in(&mut rt, ViewId::new(101));
+        assert_eq!(rt.workspace_count(), 2, "source keeps survivors");
+        assert_eq!(rt.layout().leaf_count(), 3);
+        let allocs = rt.layout_allocations();
+        let rect_of = |id: ViewId| {
+            allocs
+                .iter()
+                .find(|(leaf, _)| *leaf == id)
+                .map(|(_, r)| *r)
+                .expect("allocation present")
+        };
+        let orig = rect_of(target_orig);
+        let stacked = rect_of(second);
+        let full = rect_of(first);
+        // The bisected original + second move share one column (stacked).
+        assert_eq!(orig.x, stacked.x);
+        assert_eq!(orig.width, stacked.width);
+        assert_eq!(orig.y + orig.height, stacked.y);
+        // The first move keeps its full-height column beside them.
+        assert_eq!(full.y, orig.y);
+        assert_eq!(orig.height + stacked.height, full.height);
+        assert_eq!(orig.width, full.width);
+        assert_eq!(orig.x + orig.width, full.x);
+        // No thin horizontal strip: every leaf keeps a full column width.
+        for (_, rect) in &allocs {
+            assert_eq!(rect.width, 40);
+        }
+        assert_eq!(rt.layout().split_axis_at(&[]), Some(SplitAxis::Horizontal));
+        assert_eq!(rt.layout().split_axis_at(&[0]), Some(SplitAxis::Vertical));
+    }
+
+    #[test]
+    fn issue_1804_move_in_four_panels_tiles_quadrant() {
+        // Issue #1804: three move-ins into a single-leaf target tile four
+        // as a 2x2 quadrant (each panel in one corner) — never four thin
+        // horizontal columns.
+        let mut rt = fresh();
+        four_leaf_source(&mut rt);
+        rt.workspace_new().expect("ws2");
+        let target_orig = rt.focused_view().expect("target leaf");
+        let first = move_one_in(&mut rt, ViewId::new(100));
+        let second = move_one_in(&mut rt, ViewId::new(101));
+        let third = move_one_in(&mut rt, ViewId::new(102));
+        assert_eq!(rt.workspace_count(), 2, "source keeps its survivor");
+        assert_eq!(rt.layout().leaf_count(), 4);
+        let allocs = rt.layout_allocations();
+        let rect_of = |id: ViewId| {
+            allocs
+                .iter()
+                .find(|(leaf, _)| *leaf == id)
+                .map(|(_, r)| *r)
+                .expect("allocation present")
+        };
+        let top_left = rect_of(target_orig);
+        let bottom_left = rect_of(second);
+        let top_right = rect_of(first);
+        let bottom_right = rect_of(third);
+        // Left column stacks original over the second move.
+        assert_eq!(top_left.x, bottom_left.x);
+        assert_eq!(top_left.width, bottom_left.width);
+        assert_eq!(top_left.y + top_left.height, bottom_left.y);
+        // Right column stacks the first move over the third.
+        assert_eq!(top_right.x, bottom_right.x);
+        assert_eq!(top_right.width, bottom_right.width);
+        assert_eq!(top_right.y + top_right.height, bottom_right.y);
+        // The two columns sit side-by-side, rows aligned, bottoms flush.
+        assert_eq!(top_left.y, top_right.y);
+        assert_eq!(top_left.width, top_right.width);
+        assert_eq!(top_left.x + top_left.width, top_right.x);
+        assert_eq!(
+            top_left.height + bottom_left.height,
+            top_right.height + bottom_right.height
+        );
+        for (_, rect) in &allocs {
+            assert_eq!(rect.width, 40, "quadrant, not thin columns");
+        }
+        assert_eq!(rt.layout().split_axis_at(&[]), Some(SplitAxis::Horizontal));
+        assert_eq!(rt.layout().split_axis_at(&[0]), Some(SplitAxis::Vertical));
+        assert_eq!(rt.layout().split_axis_at(&[1]), Some(SplitAxis::Vertical));
     }
 
     #[test]

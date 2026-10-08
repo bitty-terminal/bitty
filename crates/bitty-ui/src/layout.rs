@@ -1468,6 +1468,55 @@ pub fn bisect_choice(
     }
 }
 
+/// Balanced move-in split axis (issue #1804).
+///
+/// Physical-aspect axis for one target rect: [`smart_split_axis`] with the
+/// neutral multiplier (`1.0`), so terminal cell geometry (glyphs roughly
+/// twice as tall as wide, [`CELL_ASPECT_RATIO`]) decides instead of raw
+/// cell counts. Wide allocations split side-by-side
+/// ([`SplitAxis::Horizontal`]), tall ones stack
+/// ([`SplitAxis::Vertical`]). Total over all inputs, including empty bounds
+/// (which yield [`SplitAxis::Horizontal`]).
+#[must_use]
+pub fn balanced_split_axis(rect: Rect) -> SplitAxis {
+    smart_split_axis(rect, 1.0)
+}
+
+/// Balanced move-in placement (issue #1804): workspace layout policy for
+/// cross-workspace move-in.
+///
+/// The target is the largest-area leaf (first in solver order on ties,
+/// same target rule as [`bisect_choice`]) and the axis is the
+/// physical-aspect [`balanced_split_axis`], not the raw cell-count
+/// [`bisect_split_axis`]. The moved pane goes after the target (right for
+/// [`SplitAxis::Horizontal`], down for [`SplitAxis::Vertical`]).
+///
+/// On a standard wide container this yields sensible splits for N:
+/// 2 panels side-by-side, 3 as one column split top/bottom beside a full
+/// column, 4 as a 2x2 quadrant, and larger N keeps bisecting the
+/// physically largest leaf. Raw-aspect bisect instead tiles 4 moved panels
+/// as four thin horizontal columns; the aspect correction is what restores
+/// the quadrant.
+///
+/// Scope: move-in placement only. Manual splits (explicit reparent /
+/// `new_split:<dir>`, same-workspace reposition) keep their fixed or
+/// caller-chosen axis untouched, as do the `NewPanel` layout modes.
+///
+/// Returns `(Some(target), axis)` for the leaf to split, or
+/// `(None, fallback_axis)` when `allocations` is empty, where
+/// `fallback_axis` is [`balanced_split_axis`] of `fallback` (usually the
+/// container).
+#[must_use]
+pub fn balanced_bisect_choice(
+    allocations: &[(ViewId, Rect)],
+    fallback: Rect,
+) -> (Option<ViewId>, SplitAxis) {
+    match largest_area_leaf(allocations) {
+        Some((id, rect)) => (Some(id), balanced_split_axis(rect)),
+        None => (None, balanced_split_axis(fallback)),
+    }
+}
+
 /// Helper used by `focus` for deterministic leaf adjacency.
 #[must_use]
 pub fn overlap_len(a_start: u32, a_len: u32, b_start: u32, b_len: u32) -> u32 {
@@ -2045,6 +2094,49 @@ mod tests {
         );
         assert_eq!(
             bisect_choice(&empty, Rect::new(0, 0, 20, 60)),
+            (None, SplitAxis::Vertical)
+        );
+    }
+
+    #[test]
+    fn balanced_choice_pairs_largest_with_physical_axis() {
+        // Issue #1804: end-to-end balanced choice — largest leaf plus its
+        // physical-aspect axis. A 40x24 leaf is raw-wide (bisect would split
+        // right) but physically tall (24 * 2.0 = 48 > 40), so the balanced
+        // pair stacks it; a 60x24 leaf stays side-by-side either way.
+        assert_eq!(
+            balanced_split_axis(Rect::new(0, 0, 40, 24)),
+            SplitAxis::Vertical
+        );
+        assert_eq!(
+            balanced_split_axis(Rect::new(0, 0, 80, 24)),
+            SplitAxis::Horizontal
+        );
+        let tied = vec![
+            (ViewId::new(7), Rect::new(0, 0, 40, 24)),
+            (ViewId::new(8), Rect::new(40, 0, 40, 24)),
+        ];
+        assert_eq!(
+            balanced_bisect_choice(&tied, Rect::new(0, 0, 80, 24)),
+            (Some(ViewId::new(7)), SplitAxis::Vertical),
+            "ties keep the first allocation, axis is physical"
+        );
+        let wide = vec![
+            (ViewId::new(1), Rect::new(0, 0, 20, 24)),
+            (ViewId::new(2), Rect::new(20, 0, 60, 24)),
+        ];
+        assert_eq!(
+            balanced_bisect_choice(&wide, Rect::new(0, 0, 80, 24)),
+            (Some(ViewId::new(2)), SplitAxis::Horizontal)
+        );
+        // Empty allocations fall back to the container physical axis.
+        let empty: Vec<(ViewId, Rect)> = Vec::new();
+        assert_eq!(
+            balanced_bisect_choice(&empty, Rect::new(0, 0, 80, 24)),
+            (None, SplitAxis::Horizontal)
+        );
+        assert_eq!(
+            balanced_bisect_choice(&empty, Rect::new(0, 0, 20, 60)),
             (None, SplitAxis::Vertical)
         );
     }

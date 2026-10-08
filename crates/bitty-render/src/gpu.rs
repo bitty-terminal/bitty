@@ -85,6 +85,20 @@
 //! (`WGPU_BACKEND=...`) via `InstanceDescriptor::from_env_or_default()`, so
 //! operators can pin or exclude backends without code changes.
 //!
+//! Windows additionally excludes the GL backend unless the operator pins
+//! backends explicitly (issue #1799): `wgpu-hal` initializes WGL on a helper
+//! thread (`wgpu-hal WGL Instance Thread`) with a hardcoded 256 KiB stack,
+//! which overflows inside driver-dependent WGL calls on some Windows
+//! machines. A stack overflow aborts the process — it is not a `Result` the
+//! caller can recover from — so the only graceful fallback is to never start
+//! WGL init: [`instance_descriptor`] drops `Backends::GL` on Windows when
+//! `WGPU_BACKEND` is unset, leaving DX12/Vulkan to be picked. The exclusion
+//! and its override are reported through [`BackendSelection`], and callers
+//! log [`BackendSelection::log_note`] so the fallback is loud, never silent.
+//! The init-thread stack size is not configurable from this crate (it is
+//! hardcoded in `wgpu-hal 26.0.6` `gles/wgl.rs`); see
+//! [`resolve_instance_backends`] for the pure, unit-tested selection rule.
+//!
 //! # Safety: no `unsafe`
 //!
 //! Surface creation uses the safe `wgpu::Instance::create_surface` path.
@@ -100,9 +114,9 @@ use std::sync::Mutex;
 
 use bitty_platform::{PhysicalSize, SurfaceTarget, map_resize_to_surface_extent};
 use wgpu::{
-    Adapter, Device, DeviceDescriptor, DeviceType as UpstreamDeviceType, Features, Instance,
-    InstanceDescriptor, Limits, MemoryHints, Queue, RequestAdapterOptions, SurfaceConfiguration,
-    TextureFormat, TextureUsages, Trace,
+    Adapter, Backends, Device, DeviceDescriptor, DeviceType as UpstreamDeviceType, Features,
+    Instance, InstanceDescriptor, Limits, MemoryHints, Queue, RequestAdapterOptions,
+    SurfaceConfiguration, TextureFormat, TextureUsages, Trace,
 };
 
 use crate::atlas::AtlasDims;
@@ -189,6 +203,106 @@ impl DeviceClass {
 }
 
 // ---------------------------------------------------------------------------
+// Windows WGL backend policy (issue #1799)
+// ---------------------------------------------------------------------------
+
+/// Why the `wgpu` instance backends were chosen.
+///
+/// Returned alongside the effective [`Backends`] by
+/// [`resolve_instance_backends`] / [`select_instance_backends`] so callers
+/// can log the fallback reason instead of failing silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BackendSelection {
+    /// Defaults kept: either not Windows, or no GL backend was enabled.
+    Defaults,
+    /// The operator pinned backends via `WGPU_BACKEND`; honored verbatim,
+    /// even when it includes GL on Windows (explicit choice wins).
+    EnvOverride,
+    /// Windows without an operator pin: GL was excluded so `wgpu-hal` never
+    /// starts its overflow-prone WGL init thread; DX12/Vulkan remain.
+    WindowsGlExcluded,
+}
+
+impl BackendSelection {
+    /// Loud-fallback note for the process log, or `None` when there is
+    /// nothing to report (defaults kept or explicit operator pin).
+    #[must_use]
+    pub const fn log_note(self) -> Option<&'static str> {
+        match self {
+            Self::WindowsGlExcluded => Some(
+                "excluded the GL/WGL backend on Windows to avoid the \
+                 `wgpu-hal WGL Instance Thread` stack overflow \
+                 (issue #1799); DX12/Vulkan remain — set WGPU_BACKEND \
+                 to override",
+            ),
+            Self::Defaults | Self::EnvOverride => None,
+        }
+    }
+}
+
+/// Pure backend-selection rule: which `wgpu` backends to enable.
+///
+/// - `defaults`: the backends that would be enabled without this policy
+///   (normally `InstanceDescriptor::from_env_or_default().backends`).
+/// - `env_override`: `Backends::from_env()` — `Some` when the operator set
+///   `WGPU_BACKEND`, in which case the pin is honored verbatim.
+/// - `on_windows`: `true` on Windows targets (pass
+///   `cfg!(target_os = "windows")` in production; a parameter here so the
+///   rule is unit-testable without a Windows runner).
+///
+/// On Windows without an operator pin, `Backends::GL` is removed so
+/// `wgpu-hal` never spawns its 256 KiB-stack WGL init thread, whose
+/// driver-dependent overflow aborts the process before any `Result` can be
+/// returned. If GL were the only enabled backend the defaults are kept
+/// (an empty set could never produce an adapter, so there is nothing to
+/// fall back to).
+#[must_use]
+pub fn resolve_instance_backends(
+    defaults: Backends,
+    env_override: Option<Backends>,
+    on_windows: bool,
+) -> (Backends, BackendSelection) {
+    if let Some(pinned) = env_override {
+        return (pinned, BackendSelection::EnvOverride);
+    }
+    if on_windows && defaults.contains(Backends::GL) {
+        let restricted = defaults.difference(Backends::GL);
+        if !restricted.is_empty() {
+            return (restricted, BackendSelection::WindowsGlExcluded);
+        }
+    }
+    (defaults, BackendSelection::Defaults)
+}
+
+/// Effective instance backends for this process: wgpu defaults honoring
+/// `WGPU_BACKEND`, filtered through [`resolve_instance_backends`] with the
+/// real platform.
+///
+/// Reads the environment exactly like [`instance_descriptor`]; callers that
+/// log the selection call this first and pass nothing anywhere (the
+/// descriptor builder applies the same rule internally).
+#[must_use]
+pub fn select_instance_backends() -> (Backends, BackendSelection) {
+    let base = InstanceDescriptor::from_env_or_default();
+    let env_override = Backends::from_env();
+    resolve_instance_backends(base.backends, env_override, cfg!(target_os = "windows"))
+}
+
+/// Builds the `wgpu` instance descriptor with the Windows WGL guard applied.
+///
+/// Starts from `InstanceDescriptor::from_env_or_default()` (so every other
+/// `WGPU_*` knob keeps working) and replaces `backends` with the
+/// [`resolve_instance_backends`] outcome for this platform.
+#[must_use]
+pub fn instance_descriptor() -> InstanceDescriptor {
+    let base = InstanceDescriptor::from_env_or_default();
+    let env_override = Backends::from_env();
+    let (backends, _) =
+        resolve_instance_backends(base.backends, env_override, cfg!(target_os = "windows"));
+    InstanceDescriptor { backends, ..base }
+}
+
+// ---------------------------------------------------------------------------
 // GpuContext
 // ---------------------------------------------------------------------------
 
@@ -210,6 +324,12 @@ impl GpuContext {
     /// Initializes instance, adapter, and logical device using wgpu's default
     /// environment-driven options.
     ///
+    /// The instance descriptor comes from [`instance_descriptor`]: every
+    /// `WGPU_*` knob keeps working, and on Windows the GL backend is excluded
+    /// unless the operator pins backends via `WGPU_BACKEND` (issue #1799 —
+    /// the `wgpu-hal` WGL init thread overflows its hardcoded 256 KiB stack
+    /// on some drivers, aborting the process before any error is returned).
+    ///
     /// On a machine without a usable graphics stack — headless CI, for
     /// example — this returns [`RenderError::NoCompatibleAdapter`] rather
     /// than panicking or falling back silently. The software fallback is a
@@ -223,7 +343,7 @@ impl GpuContext {
     ///   device request.
     /// - [`RenderError::UpstreamGraphics`] for other upstream failures.
     pub async fn initialize() -> Result<Self, RenderError> {
-        let instance = Instance::new(&InstanceDescriptor::from_env_or_default());
+        let instance = Instance::new(&instance_descriptor());
 
         let adapter = instance
             .request_adapter(&RequestAdapterOptions::default())
@@ -2015,6 +2135,69 @@ mod tests {
             .with_opacity_restored_on_err(0.3, || Ok(()))
             .expect("ok configure");
         assert!((surface.opacity() - 0.3).abs() < f32::EPSILON, "adopted");
+    }
+
+    // -----------------------------------------------------------------------
+    // Windows WGL backend policy (issue #1799): pure selection rule
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn windows_guard_excludes_gl_without_env_override() {
+        // Issue #1799: on Windows with no WGPU_BACKEND pin, GL must go so
+        // wgpu-hal never spawns its 256 KiB WGL init thread; DX12/Vulkan
+        // stay so adapter enumeration can still succeed.
+        let defaults = Backends::DX12 | Backends::VULKAN | Backends::GL;
+        let (backends, selection) = resolve_instance_backends(defaults, None, true);
+        assert_eq!(selection, BackendSelection::WindowsGlExcluded);
+        assert!(!backends.contains(Backends::GL), "GL excluded");
+        assert!(backends.contains(Backends::DX12), "DX12 kept");
+        assert!(backends.contains(Backends::VULKAN), "Vulkan kept");
+        assert!(
+            selection.log_note().is_some(),
+            "exclusion must carry a log reason"
+        );
+    }
+
+    #[test]
+    fn env_override_wins_even_for_gl_on_windows() {
+        // An explicit WGPU_BACKEND pin is the operator's choice: honored
+        // verbatim, no exclusion, nothing to log.
+        let (backends, selection) =
+            resolve_instance_backends(Backends::all(), Some(Backends::GL), true);
+        assert_eq!(selection, BackendSelection::EnvOverride);
+        assert_eq!(backends, Backends::GL);
+        assert_eq!(selection.log_note(), None);
+    }
+
+    #[test]
+    fn non_windows_keeps_gl_without_override() {
+        // The guard is Windows-only: other platforms keep probing GL (ANGLE
+        // / native) exactly as before.
+        let defaults = Backends::DX12 | Backends::VULKAN | Backends::GL;
+        let (backends, selection) = resolve_instance_backends(defaults, None, false);
+        assert_eq!(selection, BackendSelection::Defaults);
+        assert_eq!(backends, defaults);
+        assert_eq!(selection.log_note(), None);
+    }
+
+    #[test]
+    fn windows_gl_only_build_keeps_defaults_instead_of_empty() {
+        // Degenerate build with only GL compiled: excluding it would leave
+        // an empty set that can never yield an adapter, so keep defaults
+        // (there is nothing to fall back to) rather than init nothing.
+        let (backends, selection) = resolve_instance_backends(Backends::GL, None, true);
+        assert_eq!(selection, BackendSelection::Defaults);
+        assert_eq!(backends, Backends::GL);
+    }
+
+    #[test]
+    fn instance_descriptor_builds_without_touching_gpu() {
+        // Smoke: descriptor construction is pure data (reads env, contacts
+        // no driver), so it must never panic on a headless runner. The
+        // selected backends themselves are covered by the pure-rule tests
+        // above; env content is the operator's, not asserted here.
+        let _descriptor = instance_descriptor();
+        let (_backends, _selection) = select_instance_backends();
     }
 
     #[test]

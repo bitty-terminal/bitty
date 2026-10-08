@@ -460,15 +460,16 @@ fn cwd_is_applied_to_child() {
     // `shell_echo` fix, CTX-1019): `pwd` exits microseconds after writing,
     // so the slave can close before the pump's first master read and the
     // tiny output is lost. The trailing `read` gate holds the shell open
-    // until `pwd` output is observed, without changing what the test proves
+    // until output is observed, without changing what the test proves
     // (the `-c` string is still a single argv element, and `pwd` still runs
-    // in the builder-supplied cwd). Marker is the full `/tmp` path (CTX-1029
-    // hardening for #1796): the bare `tmp` substring could match unrelated
-    // output, while `/tmp` only matches the reported cwd line.
-    let (mut pty, reader, mut out) = spawn_gated(b"/tmp", || {
+    // in the builder-supplied cwd). Gating waits for a distinct DONE marker
+    // (CodeRabbit on #1830): coupling the gate to the asserted `/tmp` path
+    // would retry a genuinely wrong cwd instead of failing the assertion,
+    // and keeps the gate consistent with the env tests.
+    let (mut pty, reader, mut out) = spawn_gated(b"__BITTY_CWD_DONE__", || {
         PtyBuilder::new("/bin/sh")
             .arg("-c")
-            .arg("pwd; read dummy")
+            .arg("pwd; printf '__BITTY_CWD_DONE__\\n'; read dummy")
             .cwd("/tmp")
             .spawn()
     });

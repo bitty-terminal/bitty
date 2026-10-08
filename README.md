@@ -7,7 +7,7 @@ shell in a PTY, parses VT output into terminal truth, and renders panels with
 appearance, and panel animations — configured with Lua, with plugin extensions
 gated by consent and activation grants.
 
-Bitty is pre-1.0 and pre-alpha. The current release line is `v0.0.21`; there is
+Bitty is pre-1.0 and pre-alpha. The current release line is `v0.0.22`; there is
 no stable public API, and behavior, configuration keys, and package names can
 change between releases. Canonical platform documentation lives in
 [bitty-terminal-docs](https://github.com/bitty-terminal/bitty-terminal-docs),

@@ -867,17 +867,87 @@ impl Runtime {
             .map_or(0, |leaf| leaf.scroll_offset())
     }
 
+    /// Whether `view` currently shows a scrolled history viewport (CTX-1021,
+    /// issue #1807).
+    ///
+    /// True when the leaf exists, its scroll offset is non-zero, it owns a
+    /// live grid, and that grid is not on the alternate screen (the alt
+    /// screen owns no scrollback view — a stale offset there must not
+    /// composite history, mirroring the present leaf pass fail-closed).
+    /// When true, pointer mapping, selection, and highlight address the
+    /// `visible_cells` composite viewport (`0..view.rows-1`,
+    /// `0..view.cols-1`), not live-grid coordinates.
+    pub(super) fn is_viewport_scrolled(&self, view: ViewId) -> bool {
+        if self.view_scroll_offset(view) == 0 {
+            return false;
+        }
+        let Some(state) = self.live_view_state(view) else {
+            return false;
+        };
+        !state.alt_screen_active()
+    }
+
+    /// Viewport composite snapshot for `view` when scrolled (CTX-1021).
+    ///
+    /// Mirrors the present leaf pass scrolled branch: `visible_cells`
+    /// composited from scrollback + live grid, sized to the view, carrying
+    /// the base snapshot's cursor/modes/title/version/generation (only
+    /// cells/width/height matter for selection snapping and word/line
+    /// expansion). `None` when `view` is not scrolled or owns no grid.
+    pub(super) fn viewport_snapshot_for(&self, view: ViewId) -> Option<Snapshot> {
+        if !self.is_viewport_scrolled(view) {
+            return None;
+        }
+        let state = self.live_view_state(view)?;
+        let leaf = self.layout.find_leaf(view)?;
+        let cells = leaf.visible_cells(state);
+        let base = state.snapshot();
+        Some(Snapshot {
+            version: base.version,
+            generation: base.generation,
+            width: leaf.cols() as usize,
+            height: leaf.rows() as usize,
+            cells,
+            cursor: base.cursor.clone(),
+            modes: base.modes.clone(),
+            title: base.title.clone(),
+        })
+    }
+
     /// Translates a frame-local cell of `owner`'s content frame into a cell of
-    /// `owner`'s grid, clamped and wide-char snapped (CTX-0803).
+    /// `owner`'s grid, clamped and wide-char snapped (CTX-0803; CTX-1021
+    /// scrollback fix for issue #1807).
+    ///
+    /// When `owner` is scrolled into history
+    /// ([`Self::is_viewport_scrolled`]), the frame shows the `visible_cells`
+    /// composite, not the live grid: the returned cell is a *viewport*
+    /// coordinate (`0..view.rows-1`, `0..view.cols-1`) snapped against the
+    /// composite snapshot, so a drag addresses exactly the visible text under
+    /// the cursor at any scroll position. Callers that store the cell
+    /// (`start_view_selection`, `update_selection`, `end_selection`) and
+    /// readers (`selection_text`, `paint_selection_highlight`) all branch on
+    /// the same predicate, so hit-testing and painting can never disagree.
+    /// When live, the historic owner-grid translation applies
+    /// (`window_start + local`, snapped against the live snapshot).
     ///
     /// `None` when `owner` resolves to no live grid. Shares
-    /// [`Self::owner_row_window_start`] with the selection paint.
+    /// [`Self::owner_row_window_start`] with the live selection paint.
     pub(super) fn frame_cell_to_owner_cell(
         &self,
         owner: ViewId,
         frame_rows: u16,
         local: CellPos,
     ) -> Option<CellPos> {
+        if self.is_viewport_scrolled(owner) {
+            let viewport = self.viewport_snapshot_for(owner)?;
+            let leaf = self.layout.find_leaf(owner)?;
+            let max_row = leaf.rows().saturating_sub(1);
+            let max_col = leaf.cols().saturating_sub(1);
+            let row = local.row.min(max_row);
+            let col = local.col.min(max_col);
+            let cell = CellPos::new(row, col);
+            return Some(bitty_ui::snap_to_leading(&viewport, cell));
+        }
         let start = self.owner_row_window_start(owner, frame_rows);
         let state = self.live_view_state(owner)?;
         let snap = state.snapshot();
@@ -893,7 +963,8 @@ impl Runtime {
     }
 
     /// Maps a physical cursor position into a cell of `owner`'s grid, clamped
-    /// to `owner`'s content frame (CTX-0803, the #1433 drag fix).
+    /// to `owner`'s content frame (CTX-0803, the #1433 drag fix; CTX-1021
+    /// scrolled viewport for issue #1807).
     ///
     /// Total inside the owner like [`Self::cursor_to_cell`] is total inside
     /// the primary grid: a position anywhere on screen — over a sibling panel,
@@ -901,6 +972,11 @@ impl Runtime {
     /// clamps to the nearest cell of `owner`'s own grid and can never name a
     /// cell of another `View`. That is what confines a cross-panel drag to the
     /// panel it started in.
+    ///
+    /// When `owner` is scrolled into history, the returned cell is a
+    /// *viewport* coordinate into the `visible_cells` composite (see
+    /// [`Self::frame_cell_to_owner_cell`]), so a drag addresses the visible
+    /// text under the cursor at any scroll position.
     ///
     /// `None` only when `owner` has no present frame any more or owns no live
     /// grid; callers then end the drag and drop the selection (fail closed).
@@ -915,13 +991,16 @@ impl Runtime {
         self.frame_cell_to_owner_cell(owner, frame.rows, local)
     }
 
-    /// Owner and owner-grid cell for a selection press at `pos` (CTX-0803).
+    /// Owner and owner-grid cell for a selection press at `pos` (CTX-0803;
+    /// CTX-1021 scrolled viewport for issue #1807).
     ///
     /// The owner is the **hit** `View`, not the focused one, so `Shift`+press
     /// selects in the panel under the pointer without moving focus. A press
     /// that lands outside every frame (window padding or a gap band) falls
     /// back to the focused `View` with the clamped mapping, which preserves
-    /// today's single-pane padding-press behavior.
+    /// today's single-pane padding-press behavior. When the hit view is
+    /// scrolled into history, the cell is a viewport coordinate into the
+    /// visible composite (see [`Self::frame_cell_to_owner_cell`]).
     ///
     /// `None` when the resolved `View` owns no live grid (a session-less,
     /// non-primary leaf): such a press selects nothing instead of selecting

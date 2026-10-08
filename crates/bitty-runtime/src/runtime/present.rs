@@ -1625,7 +1625,8 @@ impl Runtime {
         }
     }
 
-    /// CTX-0158 selection highlight, painted at the owner's frame (CTX-0803).
+    /// CTX-0158 selection highlight, painted at the owner's frame (CTX-0803;
+    /// CTX-1021 scrolled viewport for issue #1807).
     fn paint_selection_highlight(
         &mut self,
         allocations: &[layout_focus::PresentFrame],
@@ -1643,10 +1644,10 @@ impl Runtime {
         // *owns* the selection, against that View's grid dimensions and
         // through the same row-window translation the pointer mapping uses
         // (`owner_row_window_start`), so hit testing and painting can never
-        // disagree. Skipped when the owner is not presented this frame or is
-        // scrolled into history (the live-grid selection does not map to the
-        // composited scrollback viewport) — the suppression is keyed to the
-        // owner now, not to focus.
+        // disagree. CTX-1021 (#1807): when the owner is scrolled into history
+        // the selection addresses the viewport composite, so it paints
+        // directly in frame-local coordinates (the inverse of the scrolled
+        // pointer mapping) instead of being suppressed.
         let Some(owner) = self.selection_owner() else {
             return;
         };
@@ -1656,15 +1657,41 @@ impl Runtime {
         if sel.is_empty() {
             return;
         }
-        if view_map
+        let scrolled = view_map
             .get(&owner)
             .is_some_and(|view| view.scroll_offset() != 0)
-        {
-            return;
-        }
+            && self.is_viewport_scrolled(owner);
         let Some(frame) = allocations.iter().find(|frame| frame.view == owner) else {
             return;
         };
+        if scrolled {
+            // Viewport selection is already frame-local: paint it directly,
+            // clipped to the frame by the fill builder below.
+            let norm = sel.normalized();
+            let start = (norm.start.row, norm.start.col);
+            let end = (norm.end.row, norm.end.col);
+            let live = self.live_cell_metrics();
+            let rects = bitty_render::grid::selection_fill_rects_in(
+                &self.config.theme,
+                start,
+                end,
+                usize::from(frame.cols),
+                usize::from(frame.rows),
+                live,
+            );
+            if rects.is_empty() {
+                return;
+            }
+            let origin_px_x = px_add(pad_px, frame.content.x);
+            let origin_px_y = px_add(pad_px, frame.content.y);
+            for mut fill in rects {
+                fill.rect.x = px_add(fill.rect.x, origin_px_x);
+                fill.rect.y = px_add(fill.rect.y, origin_px_y);
+                layers.combined_overlay.push(fill);
+            }
+            layers.any_needs_draw = true;
+            return;
+        }
         let Some(state) = self.live_view_state(owner) else {
             return;
         };

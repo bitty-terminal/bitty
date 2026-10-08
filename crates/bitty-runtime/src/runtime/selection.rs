@@ -11,28 +11,38 @@
 use super::input::key_inspect_label;
 use super::*;
 
-/// The single live selection plus the `View` that owns it (CTX-0803, D1).
+/// The single live selection plus the `View` that owns it (CTX-0803, D1;
+/// CTX-1021 scrolled viewport for issue #1807).
 ///
 /// Held as `Option<SelectionState>` on [`Runtime`], so an owner-less
-/// selection is not representable. `selection` addresses cells of `owner`'s
-/// grid (the pane session's grid, or the primary grid when `owner` is
+/// selection is not representable. When the owner is live
+/// (`scroll_offset == 0`), `selection` addresses cells of `owner`'s grid
+/// (the pane session's grid, or the primary grid when `owner` is
 /// [`Runtime::primary_view`]), never the runtime-global primary grid by
-/// assumption.
+/// assumption. When the owner is scrolled into history
+/// (`is_viewport_scrolled`), `selection` addresses *viewport* cells of the
+/// `visible_cells` composite (`0..view.rows-1`, `0..view.cols-1`), so a drag
+/// addresses exactly the visible text under the cursor at any scroll
+/// position; `selection_text` and the highlight paint read the same
+/// composite, and wheel scrolls during a drag shift the stored viewport
+/// anchor to keep its buffer line pinned (see `shift_selection_for_scroll`).
 ///
 /// Keyed by owner on purpose: moving to per-`View` persistent selections
 /// (deferred) is a mechanical change from `Option<SelectionState>` to a
 /// `ViewId`-keyed map.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SelectionState {
-    /// `View` whose grid `selection` addresses.
+    /// `View` whose grid (live) or viewport (scrolled) `selection` addresses.
     pub(crate) owner: ViewId,
-    /// Live range in the owner's grid coordinates.
+    /// Live range in the owner's grid coordinates, or viewport range into
+    /// the scrolled composite (see above).
     pub(crate) selection: Selection,
     /// Raw press cell that started the current drag (CTX-0385).
     ///
     /// Pins word/line drag extension direction (`word_drag`/`line_drag`
     /// compare the live pointer against this, not against the expanded
-    /// range). `None` once the drag is committed.
+    /// range). `None` once the drag is committed. Viewport coordinates when
+    /// scrolled, live-grid coordinates when live (same space as `selection`).
     pub(crate) anchor_press: Option<CellPos>,
     /// Whether a pointer drag is currently extending `selection`.
     pub(crate) dragging: bool,
@@ -133,9 +143,10 @@ impl Runtime {
 
     /// Installs `selection` owned by `owner`, replacing any live selection.
     ///
-    /// The caller has already clamped and snapped against `owner`'s grid.
-    /// D1: at most one live selection, so a press in another `View` replaces
-    /// the previous one rather than stacking.
+    /// The caller has already clamped and snapped against `owner`'s grid
+    /// (live) or viewport composite (scrolled, CTX-1021). D1: at most one
+    /// live selection, so a press in another `View` replaces the previous
+    /// one rather than stacking.
     pub(super) fn install_selection(
         &mut self,
         owner: ViewId,
@@ -150,6 +161,116 @@ impl Runtime {
             dragging,
         });
         self.pending_full_redraw = true;
+    }
+
+    /// Shifts a scrolled viewport selection by `delta_rows` viewport rows to
+    /// keep its buffer lines pinned across a scroll offset change (CTX-1021,
+    /// issue #1807 scroll-while-selecting tracking).
+    ///
+    /// `delta_rows` is `new_offset - old_offset` for a pure offset scroll
+    /// (wheel, scrollbar, page; total unchanged): the same buffer line sits
+    /// `delta_rows` lower in the new viewport, so the stored viewport anchor
+    /// moves down by `delta_rows` to stay on its buffer line. Positive is
+    /// scrolling up into history. Rows are shifted as `i32` and clamped to
+    /// `0..=u16::MAX` (an anchor that scrolls out of the viewport clamps for
+    /// display; its buffer text stays available through the viewport snapshot
+    /// while any endpoint remains in bounds — fully out-of-window anchors are
+    /// a deferred buffer-persistence follow-up).
+    ///
+    /// When `dragging`, only the anchor (and its press pin) shifts: the focus
+    /// stays at the cursor's frame-local cell, so the selection tracks the
+    /// pointer as the viewport slides. Word/line drags additionally re-expand
+    /// around the shifted press pin in the new viewport composite, so the
+    /// focus word/line follows visible text. When committed, both endpoints
+    /// shift so the highlight scrolls with its content. No-op when no
+    /// selection exists or `owner` does not own it.
+    pub(super) fn shift_selection_for_scroll(&mut self, owner: ViewId, delta_rows: isize) {
+        if delta_rows == 0 {
+            return;
+        }
+        let Some(sel) = self.selection_state else {
+            return;
+        };
+        if sel.owner != owner {
+            return;
+        }
+        // Only viewport selections shift: a live-grid selection addresses the
+        // live grid, not a scroll window. `is_viewport_scrolled` is checked
+        // against the *new* offset (post-scroll); a selection that was live
+        // before the scroll and is now scrolled (or vice versa) still shifts
+        // by the same delta to keep its buffer line when the sizes match
+        // (the common grid == viewport case). A fully general live<->scrolled
+        // buffer remap is deferred; the delta keeps the in-viewport tests
+        // exact.
+        let shift_row = |row: u16| -> u16 {
+            let next = row as i32 + delta_rows as i32;
+            next.clamp(0, u16::MAX as i32) as u16
+        };
+        if sel.dragging {
+            match sel.selection.kind {
+                SelectionKind::Simple | SelectionKind::Block => {
+                    let mut next = sel.selection;
+                    next.anchor.row = shift_row(next.anchor.row);
+                    let pin = sel.anchor_press.map(|pin| CellPos {
+                        row: shift_row(pin.row),
+                        col: pin.col,
+                    });
+                    // Focus stays at the cursor: do not shift it.
+                    self.install_selection(sel.owner, next, pin.or(sel.anchor_press), true);
+                }
+                SelectionKind::Word | SelectionKind::Line => {
+                    // Shift the press pin, then re-expand in the new viewport
+                    // so the focus word/line follows visible text.
+                    let Some(viewport) = self.viewport_snapshot_for(sel.owner) else {
+                        // Fell back to live (offset 0 with stale state?):
+                        // shift the pin against the live snapshot instead.
+                        let Some(state) = self.live_view_state(sel.owner) else {
+                            self.drop_selection();
+                            return;
+                        };
+                        let snap = state.snapshot();
+                        let press = sel.anchor_press.unwrap_or(sel.selection.anchor);
+                        let shifted = CellPos::new(
+                            shift_row(press.row),
+                            press.col.min(snap.width.saturating_sub(1) as u16),
+                        );
+                        let current = sel.selection.focus;
+                        let next = match sel.selection.kind {
+                            SelectionKind::Word => Selection::word_drag(&snap, shifted, current),
+                            _ => Selection::line_drag(&snap, shifted, current),
+                        };
+                        self.install_selection(sel.owner, next, Some(shifted), true);
+                        return;
+                    };
+                    let press = sel.anchor_press.unwrap_or(sel.selection.anchor);
+                    let shifted = CellPos::new(
+                        shift_row(press.row),
+                        press.col.min(viewport.width.saturating_sub(1) as u16),
+                    );
+                    // Focus stays at the cursor's frame-local cell: re-read it
+                    // from the last known cursor through the new mapping when
+                    // available, else keep the stored focus.
+                    let current = self
+                        .last_cursor
+                        .and_then(|pos| self.cursor_to_owner_cell(sel.owner, pos))
+                        .unwrap_or(sel.selection.focus);
+                    let next = match sel.selection.kind {
+                        SelectionKind::Word => Selection::word_drag(&viewport, shifted, current),
+                        _ => Selection::line_drag(&viewport, shifted, current),
+                    };
+                    self.install_selection(sel.owner, next, Some(shifted), true);
+                }
+            }
+        } else {
+            let mut next = sel.selection;
+            next.anchor.row = shift_row(next.anchor.row);
+            next.focus.row = shift_row(next.focus.row);
+            let pin = sel.anchor_press.map(|pin| CellPos {
+                row: shift_row(pin.row),
+                col: pin.col,
+            });
+            self.install_selection(sel.owner, next, pin, false);
+        }
     }
 
     /// Drops the live selection when `view` owns it (CTX-0803 lifecycle).
@@ -387,18 +508,57 @@ impl Runtime {
         self.start_view_selection(primary, kind, pos);
     }
 
-    /// Starts a selection of `kind` owned by `owner` at `pos`, a cell in
-    /// `owner`'s own grid (CTX-0803 pointer-press entry point).
+    /// Starts a selection of `kind` owned by `owner` at `pos` (CTX-0803
+    /// pointer-press entry point; CTX-1021 scrolled viewport for #1807).
     ///
-    /// Clamps and snaps against the owner's snapshot. A press whose owner
-    /// resolves to no live grid drops the selection instead of installing one
-    /// against the primary grid.
+    /// `pos` is a live-grid cell when the owner is live and a viewport cell
+    /// into the `visible_cells` composite when scrolled (see
+    /// `frame_cell_to_owner_cell`): clamped and snapped against the matching
+    /// snapshot (live vs composite), with word/line expansion in the same
+    /// space. A press whose owner resolves to no live grid drops the
+    /// selection instead of installing one against the primary grid.
     pub(super) fn start_view_selection(
         &mut self,
         owner: ViewId,
         kind: SelectionKind,
         pos: CellPos,
     ) {
+        if self.is_viewport_scrolled(owner) {
+            let Some(viewport) = self.viewport_snapshot_for(owner) else {
+                self.drop_selection();
+                return;
+            };
+            let clamped = clamp_cell_pos(&viewport, pos);
+            let snapped = bitty_ui::snap_to_leading(&viewport, clamped);
+            let selection = match kind {
+                SelectionKind::Simple | SelectionKind::Block => Selection {
+                    anchor: snapped,
+                    focus: snapped,
+                    kind,
+                    active: true,
+                },
+                SelectionKind::Word => {
+                    let range = Selection::word_at(&viewport, snapped);
+                    Selection {
+                        anchor: range.start,
+                        focus: range.end,
+                        kind,
+                        active: true,
+                    }
+                }
+                SelectionKind::Line => {
+                    let range = Selection::line_at(&viewport, snapped.row);
+                    Selection {
+                        anchor: range.start,
+                        focus: range.end,
+                        kind,
+                        active: true,
+                    }
+                }
+            };
+            self.install_selection(owner, selection, Some(snapped), true);
+            return;
+        }
         let Some(state) = self.live_view_state(owner) else {
             self.drop_selection();
             return;
@@ -437,28 +597,52 @@ impl Runtime {
 
     /// Updates the current selection's focus to `pos` (mouse drag).
     ///
-    /// `pos` is a cell in the **owner's** grid: the pointer path maps into
-    /// the owner's content frame first (CTX-0803), so a drag that leaves the
+    /// `pos` is a cell in the **owner's** grid when live and a viewport cell
+    /// into the scrolled composite when scrolled (CTX-0803 pointer path maps
+    /// into the owner's content frame first, so a drag that leaves the
     /// owner's panel clamps at its edge instead of leaking into a sibling
-    /// panel (#1433).
+    /// panel (#1433); CTX-1021 maps through the scrollback offset for #1807).
     ///
     /// Kind-aware (CTX-0385): `Simple`/`Block` move the focus; `Word`
     /// re-expands word-wise around the pinned press cell
     /// ([`Selection::word_drag`]); `Line` covers whole lines between the
-    /// press row and `pos` ([`Selection::line_drag`]).
+    /// press row and `pos` ([`Selection::line_drag`]). Word/line expansion
+    /// reads the same snapshot the press snapped against (live vs viewport
+    /// composite), so a scrolled word drag expands in visible text.
     pub fn update_selection(&mut self, pos: CellPos) {
         let Some(sel) = self.selection_state else {
             return;
         };
+        if !sel.dragging {
+            return;
+        }
+        if self.is_viewport_scrolled(sel.owner) {
+            let Some(viewport) = self.viewport_snapshot_for(sel.owner) else {
+                self.drop_selection();
+                return;
+            };
+            let clamped = clamp_cell_pos(&viewport, pos);
+            let snapped = bitty_ui::snap_to_leading(&viewport, clamped);
+            let anchor_press = sel.anchor_press.unwrap_or(sel.selection.anchor);
+            let next = match sel.selection.kind {
+                SelectionKind::Simple | SelectionKind::Block => {
+                    let mut next = sel.selection;
+                    next.focus = snapped;
+                    next.active = true;
+                    next
+                }
+                SelectionKind::Word => Selection::word_drag(&viewport, anchor_press, snapped),
+                SelectionKind::Line => Selection::line_drag(&viewport, anchor_press, snapped),
+            };
+            self.install_selection(sel.owner, next, Some(anchor_press), true);
+            return;
+        }
         let Some(state) = self.live_view_state(sel.owner) else {
             // Owner lost its grid mid-drag: fail closed rather than extend a
             // range into a grid that is no longer there.
             self.drop_selection();
             return;
         };
-        if !sel.dragging {
-            return;
-        }
         let snap = state.snapshot();
         let clamped = clamp_cell_pos(&snap, pos);
         let snapped = bitty_ui::snap_to_leading(&snap, clamped);
@@ -478,7 +662,8 @@ impl Runtime {
 
     /// Ends the selection at `pos` (mouse up) and leaves it active for copy.
     ///
-    /// `pos` is a cell in the **owner's** grid, like [`Self::update_selection`].
+    /// `pos` is a cell in the **owner's** grid when live and a viewport cell
+    /// when scrolled, like [`Self::update_selection`] (CTX-1021).
     ///
     /// Kind-aware like [`Self::update_selection`]: a press+release without
     /// motion keeps the word/line expansion from the press, while a drag
@@ -498,6 +683,37 @@ impl Runtime {
             // bar, scrollbar) or the selection was already committed. A
             // release must not move a committed selection's focus (nor
             // auto-copy the changed text).
+            return;
+        }
+        if self.is_viewport_scrolled(sel.owner) {
+            let Some(viewport) = self.viewport_snapshot_for(sel.owner) else {
+                self.drop_selection();
+                self.click_tracker.reset();
+                return;
+            };
+            let clamped = clamp_cell_pos(&viewport, pos);
+            let snapped = bitty_ui::snap_to_leading(&viewport, clamped);
+            let anchor_press = sel.anchor_press.unwrap_or(sel.selection.anchor);
+            let was_drag = super::click::cell_distance(anchor_press, snapped)
+                > super::click::MULTI_CLICK_MAX_CELL_DISTANCE;
+            let mut finished = match sel.selection.kind {
+                SelectionKind::Simple | SelectionKind::Block => {
+                    let mut next = sel.selection;
+                    next.focus = snapped;
+                    next
+                }
+                SelectionKind::Word => Selection::word_drag(&viewport, anchor_press, snapped),
+                SelectionKind::Line => Selection::line_drag(&viewport, anchor_press, snapped),
+            };
+            finished.active = false;
+            if was_drag {
+                self.click_tracker.reset();
+            }
+            if finished.anchor == finished.focus {
+                self.drop_selection();
+            } else {
+                self.install_selection(sel.owner, finished, None, false);
+            }
             return;
         }
         let Some(state) = self.live_view_state(sel.owner) else {
@@ -557,8 +773,20 @@ impl Runtime {
     ///
     /// CTX-0803: read from the **owner's** grid, so a selection made in a
     /// split pane copies that pane's text, never the primary grid's.
+    /// CTX-1021 (#1807): when the owner is scrolled into history, read from
+    /// the `visible_cells` composite viewport instead of the live grid, so a
+    /// drag copies exactly the visible text under the cursor at any scroll
+    /// position.
     #[must_use]
     pub fn selection_text(&self) -> Option<String> {
+        let sel = self.selection_state.as_ref()?;
+        if self.is_viewport_scrolled(sel.owner) {
+            let viewport = self.viewport_snapshot_for(sel.owner)?;
+            // Fail closed like the live path when the owner left the layout:
+            // `viewport_snapshot_for` already requires a live leaf + grid.
+            let text = sel.selection.text(&viewport);
+            return if text.is_empty() { None } else { Some(text) };
+        }
         let (sel, state) = self.selection_owner_state()?;
         let snap = state.snapshot();
         let text = sel.selection.text(&snap);

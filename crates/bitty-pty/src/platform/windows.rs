@@ -131,12 +131,12 @@ fn resolved_env(config: &SpawnConfig) -> Vec<(OsString, OsString)> {
     if !skipped.is_empty() {
         // Bound stderr: hostile blocks are rare, but a block could in
         // principle carry many odd keys, so only the first few are named
-        // while the count stays exact.
+        // while the count stays exact (names redacted for terminal safety).
         const MAX_NAMED_SKIPPED_KEYS: usize = 8;
         let mut named = skipped
             .iter()
             .take(MAX_NAMED_SKIPPED_KEYS)
-            .cloned()
+            .map(|name| crate::builder::redact_skipped_key_name(name))
             .collect::<Vec<_>>()
             .join(", ");
         if skipped.len() > MAX_NAMED_SKIPPED_KEYS {

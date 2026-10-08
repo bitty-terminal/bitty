@@ -159,6 +159,23 @@ pub(crate) fn inherited_env_entry_is_hostile(key: &OsStr, value: &OsStr) -> bool
     false
 }
 
+/// Maximum characters of one skipped key name in the sanitize log line.
+#[cfg(any(windows, test))]
+pub(crate) const MAX_NAMED_SKIPPED_KEY_CHARS: usize = 64;
+
+/// Redacts one skipped inherited-env key name for the stderr log line.
+///
+/// Names are lossy text from an untrusted env block: control characters
+/// (a raw ESC in a key name must not reach the terminal) become `'?'` and
+/// the name is truncated, mirroring the foreground-job name bound.
+#[cfg(any(windows, test))]
+pub(crate) fn redact_skipped_key_name(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .take(MAX_NAMED_SKIPPED_KEY_CHARS)
+        .collect()
+}
+
 /// Splits inherited environment entries into kept entries plus the lossy
 /// names of skipped hostile entries (see
 /// [`inherited_env_entry_is_hostile`]).
@@ -787,5 +804,22 @@ mod tests {
         // #1751 Lua-bridge strictness).
         let err = valid_builder().env("=C:", "v").validate().unwrap_err();
         assert!(matches!(err, PtyError::InvalidEnvVar { .. }));
+    }
+
+    #[test]
+    fn skipped_key_names_are_redacted_for_stderr() {
+        // CodeRabbit hardening on #1823: names come from an untrusted env
+        // block, so control characters (including ESC) must not reach the
+        // terminal raw, and long names are truncated while the count stays
+        // exact.
+        assert_eq!(redact_skipped_key_name("=C:"), "=C:");
+        assert_eq!(
+            redact_skipped_key_name("A\x1b]0;pwned\x07B"),
+            "A?]0;pwned?B"
+        );
+        let long = "K".repeat(MAX_NAMED_SKIPPED_KEY_CHARS + 16);
+        let redacted = redact_skipped_key_name(&long);
+        assert_eq!(redacted.len(), MAX_NAMED_SKIPPED_KEY_CHARS);
+        assert!(redacted.chars().all(|c| c == 'K'));
     }
 }

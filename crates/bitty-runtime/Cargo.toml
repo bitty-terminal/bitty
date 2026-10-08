@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/bitty-terminal/bitty"
 keywords = ["terminal", "runtime", "bitty"]
 categories = ["command-line-utilities"]
-publish = false
+publish = true
 
 [lints]
 workspace = true
@@ -24,23 +24,23 @@ test = false
 doc = false
 
 [dependencies]
-bitty-config = { path = "../bitty-config" }
-bitty-vt = { path = "../bitty-vt" }
-bitty-term-state = { path = "../bitty-term-state" }
-bitty-pty = { path = "../bitty-pty" }
-bitty-render = { path = "../bitty-render" }
-bitty-platform = { path = "../bitty-platform" }
-bitty-ui = { path = "../bitty-ui" }
-bitty-lua = { path = "../bitty-lua" }
-bitty-plugin-host = { path = "../bitty-plugin-host" }
+bitty-config = { version = "0.0.22", path = "../bitty-config" }
+bitty-vt = { version = "0.0.22", path = "../bitty-vt" }
+bitty-term-state = { version = "0.0.22", path = "../bitty-term-state" }
+bitty-pty = { version = "0.0.22", path = "../bitty-pty" }
+bitty-render = { version = "0.0.22", path = "../bitty-render" }
+bitty-platform = { version = "0.0.22", path = "../bitty-platform" }
+bitty-ui = { version = "0.0.22", path = "../bitty-ui" }
+bitty-lua = { version = "0.0.22", path = "../bitty-lua" }
+bitty-plugin-host = { version = "0.0.22", path = "../bitty-plugin-host" }
 bitty-ipc = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "e9714e7" }
 # CTX-0406: the package-manager staging path evaluates the closed compat
 # requirement grammar with the same pure implementation the plugin host uses.
-bitty-package = { path = "../bitty-package" }
+bitty-package = { version = "0.0.22", path = "../bitty-package" }
 # CTX-0248: the tick overlay path stores Kitty images and computes
 # placement rects through the rich layer (moved from dev-dependencies;
 # same workspace crate, no new supply-chain surface).
-bitty-rich = { path = "../bitty-rich" }
+bitty-rich = { version = "0.0.22", path = "../bitty-rich" }
 # CTX-0906 (DIR-030): the component broker speaks native-component wire
 # protocol v1 to out-of-process components (first: `bitty-net`). Core links
 # the dependency-free codec crate only, never a network implementation

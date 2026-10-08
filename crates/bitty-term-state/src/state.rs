@@ -788,6 +788,58 @@ impl State {
         self.scrollback.iter()
     }
 
+    /// Owned heap retained by this terminal (CTX-1026).
+    ///
+    /// Capacity-accurate sum over every owned container: both screens
+    /// (cells + wrap flags by capacity, not `width * height`), the
+    /// scrollback ring plus every boxed line, the hyperlink/zone/damage
+    /// tables, the reply/image/placement stores, tab stops, and the
+    /// title/cwd strings. A wider [`Cell`], an over-allocating grid, or a
+    /// new unbounded container trips the memory gate instead of hiding
+    /// behind constants.
+    #[must_use]
+    pub fn retained_heap_bytes(&self) -> usize {
+        let screens = self.screens.heap_bytes();
+        let scrollback = self.scrollback.heap_bytes();
+        let tabs = self.tabs.heap_bytes();
+        let replies = self.replies.heap_bytes();
+        let images = self.images.heap_bytes();
+        let placements = self.kitty_placements.heap_bytes();
+        let title = self.title.len();
+        let cwd = self.cwd_report.as_ref().map_or(0, |s| s.len());
+        let hyperlink_ring =
+            self.hyperlink_table.capacity() * std::mem::size_of::<HyperlinkEntry>();
+        let hyperlink_strings: usize = self
+            .hyperlink_table
+            .iter()
+            .map(|entry| entry.id_param.as_ref().map_or(0, |s| s.len()) + entry.uri.len())
+            .sum();
+        let zones = self.zones.capacity() * std::mem::size_of::<ZoneRecord>();
+        let damage_ring = self.damage_history.capacity() * std::mem::size_of::<Damage>();
+        let damage_regions: usize = self
+            .damage_history
+            .iter()
+            .map(|damage| damage.regions.len() * std::mem::size_of::<DamagedRegion>())
+            .sum();
+        let batch_rects = self.batch_rects.capacity() * std::mem::size_of::<DamageRect>();
+        let batch_scrolls = self.batch_scroll_events.capacity() * std::mem::size_of::<(u64, u64)>();
+        screens
+            + scrollback
+            + tabs
+            + replies
+            + images
+            + placements
+            + title
+            + cwd
+            + hyperlink_ring
+            + hyperlink_strings
+            + zones
+            + damage_ring
+            + damage_regions
+            + batch_rects
+            + batch_scrolls
+    }
+
     /// Rehydrates scrollback history from plain-text lines (CTX-0393 session
     /// restore).
     ///

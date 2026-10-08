@@ -171,6 +171,23 @@ impl Scrollback {
         }
     }
 
+    /// Owned heap retained by this buffer (CTX-1026).
+    ///
+    /// Ring-buffer capacity plus every boxed line's cells. Each
+    /// `Box<[Cell]>` heap is exactly `len * size_of::<Cell>()`, and the
+    /// `VecDeque` heap is `capacity * size_of::<ScrollbackLine>()`, so a
+    /// wider cell or an over-allocating buffer trips the gate.
+    #[must_use]
+    pub fn heap_bytes(&self) -> usize {
+        let ring = self.lines.capacity() * std::mem::size_of::<ScrollbackLine>();
+        let lines: usize = self
+            .lines
+            .iter()
+            .map(|line| line.cells.len() * std::mem::size_of::<Cell>())
+            .sum();
+        ring + lines
+    }
+
     // Note (CTX-0266): scrollback width changes happen only through
     // `State::resize` reflow (unwrap logical lines via `wrapped` flags,
     // rewrap to the new width, rebuild with fresh monotonic ids). The old

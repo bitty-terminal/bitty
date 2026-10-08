@@ -392,6 +392,12 @@ pub(crate) struct TerminalApp {
     /// clears whenever no Core session is open, so the next open retries
     /// the plugin. Default false.
     pub(crate) composer_core_fallback_latched: bool,
+    /// Issue #1783: a last-pane `close_view` that confirms the window-close
+    /// gate requests application exit. `apply_chrome_action` sets this; the
+    /// event loop consumes it via `take_chrome_exit_request` (save +
+    /// shutdown + `ctx.exit()`), so the chord path shares the single exit
+    /// owner instead of exiting inline. Default false.
+    pub(crate) chrome_close_exit_requested: bool,
     /// Previous runtime state for event change detection (CTX-0892).
     /// Updated in place by [`EventTracker::take_changes`] each tick; changes
     /// trigger plugin events.
@@ -439,6 +445,7 @@ impl TerminalApp {
             plugin_runtime: None,
             safe_mode: false,
             composer_core_fallback_latched: false,
+            chrome_close_exit_requested: false,
             event_tracker,
         }
     }
@@ -474,6 +481,7 @@ impl TerminalApp {
             plugin_runtime: None,
             safe_mode: false,
             composer_core_fallback_latched: false,
+            chrome_close_exit_requested: false,
             event_tracker,
         }
     }
@@ -503,6 +511,13 @@ impl TerminalApp {
     /// smoke runs must never overwrite the saved session.
     pub(crate) fn set_session_persistence(&mut self, enabled: bool) {
         self.session_persistence = enabled;
+    }
+
+    /// Consumes a pending chrome-requested window exit (issue #1783).
+    /// Returns `true` once when a last-pane `close_view` confirmed the
+    /// window-close gate; the event loop owns the save + shutdown + exit.
+    pub(crate) fn take_chrome_exit_request(&mut self) -> bool {
+        std::mem::take(&mut self.chrome_close_exit_requested)
     }
 
     /// Best-effort session save for exit paths (CTX-0393): one bounded
@@ -1421,13 +1436,17 @@ impl TerminalApp {
                 let Some(index) = self.runtime.workspace_index_by_seq(*seq) else {
                     return false;
                 };
-                self.apply_chrome_action(A::WorkspaceFocus(one_based(index)));
+                let _ = self.apply_chrome_action(A::WorkspaceFocus(one_based(index)));
             }
             WorkspaceRequest::FocusIndex(position) => {
-                self.apply_chrome_action(A::WorkspaceFocus(*position));
+                let _ = self.apply_chrome_action(A::WorkspaceFocus(*position));
             }
-            WorkspaceRequest::New => self.apply_chrome_action(A::WorkspaceNew),
-            WorkspaceRequest::Next => self.apply_chrome_action(A::WorkspaceNext),
+            WorkspaceRequest::New => {
+                let _ = self.apply_chrome_action(A::WorkspaceNew);
+            }
+            WorkspaceRequest::Next => {
+                let _ = self.apply_chrome_action(A::WorkspaceNext);
+            }
             WorkspaceRequest::Close(target) => {
                 let index = match target {
                     None => self.runtime.active_workspace_index(),
@@ -1437,7 +1456,7 @@ impl TerminalApp {
                     },
                 };
                 if index == self.runtime.active_workspace_index() {
-                    self.apply_chrome_action(A::WorkspaceClose);
+                    let _ = self.apply_chrome_action(A::WorkspaceClose);
                 } else {
                     let _ = self.runtime.workspace_close_request_at(index);
                 }
@@ -1457,7 +1476,7 @@ impl TerminalApp {
                 let Some(index) = self.runtime.workspace_index_by_seq(*seq) else {
                     return false;
                 };
-                self.apply_chrome_action(A::WorkspaceMove(one_based(index)));
+                let _ = self.apply_chrome_action(A::WorkspaceMove(one_based(index)));
             }
         }
         true
@@ -1803,6 +1822,17 @@ impl AppHandler for TerminalApp {
         // event never reaches `Runtime`.
         if let PlatformEvent::Window { window_id: _, kind } = &event {
             if self.intercept_chrome_key(kind) {
+                // Issue #1783: a last-pane `close_view` that confirms the
+                // window-close gate requests exit here (single exit owner:
+                // save + shutdown + `ctx.exit()`, like the OS close path).
+                if self.take_chrome_exit_request() {
+                    crate::logging::info(|| {
+                        "bitty: exit requested (last-pane close_view confirmed)".to_string()
+                    });
+                    self.save_session_best_effort("close-view");
+                    self.runtime.shutdown();
+                    ctx.exit();
+                }
                 return;
             }
         }

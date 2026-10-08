@@ -402,6 +402,12 @@ pub(crate) struct TerminalApp {
     /// Updated in place by [`EventTracker::take_changes`] each tick; changes
     /// trigger plugin events.
     event_tracker: EventTracker,
+    /// Plugin notification queue drops already reported (CTX-1033 #1827):
+    /// [`Self::drain_plugin_notifications`] warns once per tick while the
+    /// cumulative [`PluginRuntime::notifications_dropped`] counter grows
+    /// past this baseline, so a saturated `platform.notify` producer stays
+    /// observable without spamming one line per dropped notice.
+    last_plugin_queue_dropped: u64,
 }
 
 /// Outcome of polling exited child processes across pane and primary sessions.
@@ -447,6 +453,7 @@ impl TerminalApp {
             composer_core_fallback_latched: false,
             chrome_close_exit_requested: false,
             event_tracker,
+            last_plugin_queue_dropped: 0,
         }
     }
 
@@ -483,6 +490,7 @@ impl TerminalApp {
             composer_core_fallback_latched: false,
             chrome_close_exit_requested: false,
             event_tracker,
+            last_plugin_queue_dropped: 0,
         }
     }
 
@@ -664,10 +672,17 @@ impl TerminalApp {
         let Some(runtime) = self.plugin_runtime.as_mut() else {
             return Err(String::from("composer plugin runtime is gone"));
         };
-        runtime
-            .dispatch_command(&id, verb, &[])
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+        let outcome = runtime.dispatch_command(&id, verb, &[]);
+        match outcome {
+            // CTX-1033 (issue #1827): surface the dispatch result on the
+            // banner like every other command dispatch; the unit return
+            // contract is unchanged.
+            Ok(result) => {
+                self.surface_dispatch_result(COMPOSER_PLUGIN_ID, verb, &result);
+                Ok(())
+            }
+            Err(error) => Err(error.to_string()),
+        }
     }
 
     /// Injects the effective-config Leader binding (CTX-0723 #981).
@@ -948,6 +963,10 @@ impl TerminalApp {
         // convert to ChromeBands, and push into Runtime before present so
         // bands render on this frame.
         self.update_chrome_bands();
+        // CTX-1033 (issue #1827): drain grant-gated plugin notifications
+        // into the bounded banner surface before present, so a
+        // `bitty.notify.show` from this tick's window paints on this frame.
+        self.drain_plugin_notifications();
         // CTX-0943 (W-28 follow-up): enforce the 30s transient timeout, then
         // sync the overlay surface to the (possibly revoked) owner before
         // present so a timed-out session clears on this frame. Both are
@@ -1082,6 +1101,79 @@ impl TerminalApp {
         for (kind, payload) in &events {
             let _delivered = plugin_runtime.deliver_event(kind, payload);
         }
+    }
+
+    /// Drains grant-gated plugin notifications into the bounded banner
+    /// surface (CTX-1033, issue #1827).
+    ///
+    /// Runs once per tick from [`Self::drive_tick`], before present, so a
+    /// `bitty.notify.show` queued by any plugin command or event handler
+    /// (for example `devtools:plugins`) paints on this frame through the
+    /// same one-banner-at-a-time surface the terminal notifications use.
+    /// Bounded: the plugin queue holds at most
+    /// [`NOTIFICATION_QUEUE_CAPACITY`](bitty_runtime::plugin_runtime::NOTIFICATION_QUEUE_CAPACITY)
+    /// entries, so one pass touches at most 64 cheap admissions — no VM
+    /// calls, no blocking I/O — and never delays tick/present. Overflow is
+    /// counted, never silent: admission refusals (rate/queue) land in
+    /// [`Runtime::plugin_notifications_dropped`](bitty_runtime::Runtime::plugin_notifications_dropped),
+    /// and plugin-side queue drops since the last tick are reported loudly
+    /// (one line per tick while the counter grows). No-op without plugins.
+    fn drain_plugin_notifications(&mut self) {
+        let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
+            return;
+        };
+        let queued = plugin_runtime.drain_notifications();
+        let now = std::time::Instant::now();
+        let mut refused = 0u64;
+        for notice in &queued {
+            let title = if notice.title.is_empty() {
+                notice.plugin_id.as_str()
+            } else {
+                notice.title.as_str()
+            };
+            if !self
+                .runtime
+                .admit_plugin_notification(title, &notice.body, now)
+            {
+                refused = refused.saturating_add(1);
+            }
+        }
+        let queue_dropped = plugin_runtime.notifications_dropped();
+        let queue_grew = queue_dropped.saturating_sub(self.last_plugin_queue_dropped);
+        self.last_plugin_queue_dropped = queue_dropped;
+        if queue_grew > 0 || refused > 0 {
+            crate::logging::warn(|| {
+                format!(
+                    "bitty: plugin notifications dropped (queue overflow +{queue_grew}, \
+                     banner refused +{refused}; totals queue={queue_dropped} \
+                     banner={})",
+                    self.runtime.plugin_notifications_dropped(),
+                )
+            });
+        }
+    }
+
+    /// Surfaces one successful `dispatch_command` result on the bounded
+    /// banner surface (CTX-1033, issue #1827).
+    ///
+    /// Dispatch call sites (band clicks, composer verbs) previously dropped
+    /// the `Ok` value, so a command that returned its full text (for
+    /// example `devtools:plugins`) showed nothing on a real host. The
+    /// result renders through [`lua_result_summary`] (bounded, single line)
+    /// under a `plugin:command` title; failures keep their existing loud
+    /// diagnostic at the call site and never reach the banner.
+    fn surface_dispatch_result(
+        &mut self,
+        plugin_id: &str,
+        command: &str,
+        result: &bitty_runtime::plugin_runtime::LuaValue,
+    ) {
+        let summary = lua_result_summary(result);
+        let title = format!("{plugin_id}:{command}");
+        let now = std::time::Instant::now();
+        let _ = self
+            .runtime
+            .admit_plugin_notification(&title, &summary, now);
     }
 
     /// Reads mounted UiBlocks from plugin runtime and updates Runtime chrome
@@ -1286,7 +1378,9 @@ impl TerminalApp {
     /// a loud diagnostic when the plugin id is invalid, the runtime is
     /// gone, or the dispatch itself fails (unregistered verb, faulting
     /// handler): the click is dropped and terminal state is untouched.
-    fn dispatch_band_click(&mut self, click: bitty_runtime::BandClickRequest) {
+    /// CTX-1033 (issue #1827): a successful dispatch surfaces its result on
+    /// the banner via [`Self::surface_dispatch_result`].
+    pub(crate) fn dispatch_band_click(&mut self, click: bitty_runtime::BandClickRequest) {
         let id = match bitty_plugin_host::manifest::PluginId::new(&click.plugin_id) {
             Ok(id) => id,
             Err(error) => {
@@ -1309,13 +1403,22 @@ impl TerminalApp {
             return;
         };
         let args = bitty_runtime::band_click_args_table(&click.args);
-        if let Err(error) = plugin_runtime.dispatch_command(&id, &click.command, &[args]) {
-            crate::logging::warn(|| {
-                format!(
-                    "bitty: band click '{}:{}' refused ({error})",
-                    click.plugin_id, click.command
-                )
-            });
+        let outcome = plugin_runtime.dispatch_command(&id, &click.command, &[args]);
+        match outcome {
+            Ok(result) => {
+                // CTX-1033 (issue #1827): the dispatch result is user-visible
+                // output (user-paced gesture, never a hot loop); failures
+                // below stay loud and never disturb terminal state.
+                self.surface_dispatch_result(&click.plugin_id, &click.command, &result);
+            }
+            Err(error) => {
+                crate::logging::warn(|| {
+                    format!(
+                        "bitty: band click '{}:{}' refused ({error})",
+                        click.plugin_id, click.command
+                    )
+                });
+            }
         }
     }
 
@@ -2211,6 +2314,104 @@ impl AppHandler for TerminalApp {
 fn _assert_channel_capacity_is_documented() {
     const EXPECTED: usize = 16;
     const { assert!(EXPECTED > 0) }
+}
+
+/// Maximum characters [`lua_result_summary`] renders from one dispatch
+/// result (CTX-1033, issue #1827).
+///
+/// The banner surface re-bounds to 256 single-line characters at admission;
+/// this pre-bound keeps giant tables/strings from building a large
+/// intermediate on the dispatch path.
+const DISPATCH_RESULT_SUMMARY_MAX_CHARS: usize = 512;
+
+/// Maximum table entries [`lua_result_summary`] renders before collapsing
+/// the remainder into a `(+N more)` tail.
+const DISPATCH_RESULT_SUMMARY_MAX_ENTRIES: usize = 4;
+
+/// Maximum nesting depth [`lua_result_summary`] descends into tables.
+const DISPATCH_RESULT_SUMMARY_MAX_DEPTH: usize = 3;
+
+/// Renders one `dispatch_command` result as bounded display text (CTX-1033,
+/// issue #1827).
+///
+/// Scalars inline (`nil` renders empty so the banner degrades to the
+/// `plugin:command` title); tables collapse to at most
+/// [`DISPATCH_RESULT_SUMMARY_MAX_ENTRIES`] `key=value` pairs at
+/// [`DISPATCH_RESULT_SUMMARY_MAX_DEPTH`] depth with a `(+N more)` tail;
+/// the whole string truncates to [`DISPATCH_RESULT_SUMMARY_MAX_CHARS`]
+/// characters. Time O(bound), space O(bound): a hostile multi-megabyte
+/// return value cannot grow the dispatch path. Pure presentation: plugin
+/// text stays untrusted and the banner admission sanitizes again.
+pub(crate) fn lua_result_summary(value: &bitty_runtime::plugin_runtime::LuaValue) -> String {
+    use bitty_runtime::plugin_runtime::LuaValue;
+    use std::fmt::Write as _;
+
+    fn render(value: &LuaValue, depth: usize, out: &mut String) {
+        if out.chars().count() >= DISPATCH_RESULT_SUMMARY_MAX_CHARS {
+            return;
+        }
+        match value {
+            LuaValue::Nil => {}
+            LuaValue::Bool(flag) => {
+                let _ = write!(out, "{flag}");
+            }
+            LuaValue::Integer(index) => {
+                let _ = write!(out, "{index}");
+            }
+            LuaValue::Number(number) => {
+                let _ = write!(out, "{number}");
+            }
+            LuaValue::String(text) => {
+                // Newlines collapse here; the banner admission sanitizes
+                // again, so this is only a readability pre-pass.
+                for chunk in text.split_whitespace() {
+                    if out.chars().count() >= DISPATCH_RESULT_SUMMARY_MAX_CHARS {
+                        break;
+                    }
+                    if !out.is_empty() && !out.ends_with(['{', '[', ' ', '=', ',']) {
+                        out.push(' ');
+                    }
+                    for ch in chunk.chars() {
+                        if out.chars().count() >= DISPATCH_RESULT_SUMMARY_MAX_CHARS {
+                            break;
+                        }
+                        out.push(ch);
+                    }
+                }
+            }
+            LuaValue::Table(pairs) => {
+                if depth >= DISPATCH_RESULT_SUMMARY_MAX_DEPTH {
+                    out.push_str("{...}");
+                    return;
+                }
+                out.push('{');
+                for (shown, (key, item)) in pairs.iter().enumerate() {
+                    if shown >= DISPATCH_RESULT_SUMMARY_MAX_ENTRIES {
+                        out.push_str(", ");
+                        let _ = write!(out, "+{} more", pairs.len() - shown);
+                        break;
+                    }
+                    if shown > 0 {
+                        out.push_str(", ");
+                    }
+                    render(key, depth, out);
+                    out.push('=');
+                    render(item, depth + 1, out);
+                }
+                out.push('}');
+            }
+        }
+    }
+
+    let mut out = String::new();
+    render(value, 0, &mut out);
+    if out.chars().count() > DISPATCH_RESULT_SUMMARY_MAX_CHARS {
+        out = out
+            .chars()
+            .take(DISPATCH_RESULT_SUMMARY_MAX_CHARS)
+            .collect();
+    }
+    out
 }
 
 #[cfg(test)]

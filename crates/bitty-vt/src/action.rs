@@ -470,12 +470,16 @@ pub enum DynamicColorOp {
     Set(Rgb),
 }
 
-/// Terminal-originated notification form (CTX-0577, M1-16; CTX-1008 adds
-/// Kitty `OSC 99` for issue #1763).
+/// Notification form (CTX-0577, M1-16; CTX-1008 adds
+/// Kitty `OSC 99` for issue #1763; CTX-1033 adds the plugin form for issue
+/// #1827).
 ///
 /// The VT parser only classifies and bounds the payload; whether a
 /// notification is shown (and how) is a runtime policy decision
 /// (default deny, see `specifications/bell-notification-policy.md`).
+/// The [`NotificationSource::Plugin`] form is never emitted by the parser:
+/// the runtime mints it when admitting a grant-gated plugin notification
+/// (`platform.notify`) into the same bounded banner surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NotificationSource {
     /// `OSC 9;<message>`: the xterm-style notification form (bare text; the
@@ -487,6 +491,9 @@ pub enum NotificationSource {
     /// chunks assembled by the runtime; capability queries and close/icon
     /// payloads never produce a notification).
     Osc99,
+    /// Grant-gated plugin notification (`platform.notify`, CTX-1033 #1827):
+    /// minted by the runtime, never by the VT parser.
+    Plugin,
 }
 
 /// Which Kitty `OSC 99` payload a chunk carries (CTX-1008, issue #1763).
@@ -521,16 +528,19 @@ pub struct KittyNotificationChunk {
     pub is_done: bool,
 }
 
-/// A bounded terminal-originated desktop-notification request (CTX-0577).
+/// A bounded desktop-notification request (CTX-0577).
 ///
 /// Emitted for the recognized notification OSC forms (`OSC 9`, `OSC 777`,
-/// Kitty `OSC 99` assembled by the runtime).
-/// Every field is length-bounded by the parser's OSC collector; the runtime
+/// Kitty `OSC 99` assembled by the runtime) or minted by the runtime for an
+/// admitted plugin notification ([`NotificationSource::Plugin`], CTX-1033).
+/// Every field is length-bounded by the parser's OSC collector (or by
+/// [`BoundedString`] at mint time for the plugin form); the runtime
 /// treats the strings as untrusted display data and never executes or
 /// expands them.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Notification {
-    /// Which wire form produced this request.
+    /// Which wire form produced this request (`Plugin` for runtime-minted
+    /// plugin notifications).
     pub source: NotificationSource,
     /// Optional title; absent for `OSC 9`.
     pub title: Option<BoundedString>,

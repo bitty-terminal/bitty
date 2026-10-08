@@ -702,6 +702,14 @@ impl PluginRuntime {
         self.notifications.borrow_mut().drain()
     }
 
+    /// Notifications dropped by queue overflow since creation (CTX-1033,
+    /// issue #1827): the application reports the delta across ticks so a
+    /// saturated `platform.notify` producer stays observable.
+    #[must_use]
+    pub fn notifications_dropped(&self) -> u64 {
+        self.notifications.borrow().dropped()
+    }
+
     /// Install the workspace read source for `bitty.workspace.list`
     /// (CTX-0889). Call before activation: each generation captures the
     /// source when its services are built.

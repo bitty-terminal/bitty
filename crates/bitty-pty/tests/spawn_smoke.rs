@@ -442,12 +442,23 @@ fn invalid_spawn_requests_are_rejected_without_spawning() {
 
 #[test]
 fn shell_echo_via_sh_with_bounded_backpressure() {
-    // Real shell echo dogfood for 0.0.1: `sh -c 'echo …'` proves direct argv
+    // Real shell echo dogfood for 0.0.1: `sh -c '…'` proves direct argv
     // exec (no shell interpolation inside bitty-pty), the bounded channel, and
     // clean exit. Works headlessly — no window or GPU required.
+    //
+    // FreeBSD robustness (0.0.22 release leg): the shell must stay alive until
+    // the reader has observed the echo. A bare `sh -c 'echo …'` exits
+    // immediately after writing, so on FreeBSD 15.1 the slave can close
+    // before the pump's first master read and the tiny output is lost
+    // (`expected shell echo, got []` while Linux/macOS/Windows still deliver
+    // the queued bytes). The trailing `read` gate holds the slave open until
+    // the test releases it with a newline, removing the exit-vs-drain race on
+    // every platform without changing what the test proves (the `-c` string
+    // is still a single argv element: any interpolation inside bitty-pty
+    // would break the `;` sequencing).
     let mut pty = PtyBuilder::new("/bin/sh")
         .arg("-c")
-        .arg("echo hello-bitty-pty")
+        .arg("echo hello-bitty-pty; read dummy")
         .spawn()
         .expect("spawn sh -c echo");
 
@@ -459,7 +470,7 @@ fn shell_echo_via_sh_with_bounded_backpressure() {
     );
 
     let reader = pty.take_reader().expect("reader half");
-    // No writer needed; `echo` exits without input.
+    let mut writer = pty.take_writer().expect("writer half");
 
     let deadline = std::time::Instant::now() + ECHO_TIMEOUT;
     let mut out = Vec::new();
@@ -494,6 +505,12 @@ fn shell_echo_via_sh_with_bounded_backpressure() {
         "expected shell echo, got {out:?} as {}",
         String::from_utf8_lossy(&out)
     );
+
+    // Release the `read` gate: a newline completes the pending input line,
+    // `read` succeeds, and the shell exits 0 without further output.
+    writer.write_all(b"\n").expect("release read gate");
+    writer.flush().expect("flush read gate");
+    drop(writer);
 
     let status = pty.wait().expect("reap sh");
     assert!(

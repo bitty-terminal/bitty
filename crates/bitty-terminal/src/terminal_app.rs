@@ -7,7 +7,7 @@ use bitty_platform::{
     AppHandler, EventContext, EventWaker, LogicalKey, LogicalSize, MouseButton, NamedKey,
     PhysicalSize, PlatformEvent, PressState, WindowConfig, WindowEventKind, WindowHandle, WindowId,
 };
-use bitty_render::gpu::GpuContext;
+use bitty_render::gpu::{GpuContext, select_instance_backends};
 use bitty_runtime::plugin_runtime::{LuaValue, PluginRuntime, WorkspaceRequest};
 use bitty_runtime::{Runtime, WorkspaceSummary};
 
@@ -1704,6 +1704,14 @@ impl TerminalApp {
         let scale = target.scale_factor().get();
         self.runtime.apply_dpi_scale(scale, Some(inner));
         let snap = self.runtime.snapshot();
+        // Issue #1799: report the Windows WGL backend fallback reason before
+        // touching the driver — when the guard excluded GL, `GpuContext`
+        // never starts the overflow-prone `wgpu-hal` WGL init thread and
+        // falls through to DX12/Vulkan instead.
+        let (_backends, backend_selection) = select_instance_backends();
+        if let Some(note) = backend_selection.log_note() {
+            crate::logging::info(|| format!("bitty: gpu backend fallback ({note})"));
+        }
         match pollster::block_on(GpuContext::initialize()) {
             Ok(gpu) => match gpu.create_surface(&target) {
                 Ok(surface) => {

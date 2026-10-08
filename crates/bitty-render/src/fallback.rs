@@ -18,7 +18,7 @@ use bitty_config::types::SYMBOLS_FALLBACK_FAMILY;
 use bitty_config::types::{FONT_FALLBACK_CHAIN, FontConfig};
 
 use crate::error::RenderError;
-use crate::glyph::{FontId, FontQuery, GlyphBitmap, GlyphRasterizer, RasterKey};
+use crate::glyph::{FontId, FontQuery, FontStyle, GlyphBitmap, GlyphRasterizer, RasterKey};
 
 /// First braille-pattern scalar (`BRAILLE PATTERN BLANK`, used by btop for
 /// the "off" dots of its graphs — blank-looking but must still resolve to a
@@ -51,9 +51,11 @@ pub const fn is_tui_graph_scalar(c: char) -> bool {
 
 /// Per-glyph fallback decorator over any [`GlyphRasterizer`].
 ///
-/// On [`load_font`](GlyphRasterizer::load_font) the primary face loads (its
-/// error propagates, preserving today's startup contract) plus every chain
-/// tail at the same style/size; tails that fail with
+/// On [`load_font`](GlyphRasterizer::load_font) only the primary face loads
+/// (its error propagates, preserving today's startup contract); chain tails
+/// stay pending until the first fallback resolution misses the primary, so
+/// an idle ASCII panel never maps the CJK/emoji tail files into memory
+/// (CTX-1026, issue #1809). Tails that fail with
 /// [`RenderError::FontNotFound`] are skipped best-effort so bare installs
 /// without the symbols face still start. On
 /// [`rasterize`](GlyphRasterizer::rasterize) each loaded face is tried in
@@ -79,6 +81,16 @@ pub struct FallbackRasterizer<R: GlyphRasterizer> {
     fallback_families: Vec<String>,
     fonts: Vec<FontId>,
     point_size: f32,
+    /// Style of the last loaded chain (tail queries reuse it).
+    style: FontStyle,
+    /// Configured tail families not yet attempted (CTX-1026 lazy tails).
+    ///
+    /// Populated by [`load_font`](GlyphRasterizer::load_font) in chain
+    /// order (empty and primary-duplicate entries already filtered) and
+    /// drained once by the first fallback resolution that needs them, so
+    /// startup maps exactly one face. Reloading a font re-stashes the
+    /// pending list for the new size.
+    pending_tails: Vec<String>,
 }
 
 /// Outcome of one coverage-driven fallback resolution.
@@ -108,6 +120,8 @@ impl<R: GlyphRasterizer> FallbackRasterizer<R> {
             fallback_families,
             fonts: Vec::new(),
             point_size: 0.0,
+            style: FontStyle::Normal,
+            pending_tails: Vec::new(),
         }
     }
 
@@ -174,10 +188,70 @@ impl<R: GlyphRasterizer> FallbackRasterizer<R> {
     }
 
     /// Faces loaded by the last [`load_font`](GlyphRasterizer::load_font)
-    /// call, in attempt order (primary first). Empty before the first load.
+    /// call, in attempt order (primary first). Tails join on the first
+    /// fallback resolution that needs them (CTX-1026 lazy tails), so this
+    /// holds exactly the primary until a miss warms the chain. Empty before
+    /// the first load.
     #[must_use]
     pub fn fonts(&self) -> &[FontId] {
         &self.fonts
+    }
+
+    /// Configured tail families still unattempted (CTX-1026 lazy tails).
+    ///
+    /// Non-empty after [`load_font`](GlyphRasterizer::load_font) until the
+    /// first fallback resolution drains it; the memory-budget gate pins
+    /// that startup leaves tails pending instead of mapped.
+    #[must_use]
+    pub fn pending_tails(&self) -> &[String] {
+        &self.pending_tails
+    }
+
+    /// Loads every pending tail at the chain's style/size, best-effort.
+    ///
+    /// Runs once per [`load_font`](GlyphRasterizer::load_font): the first
+    /// fallback resolution that reaches the pinned walk drains the stash,
+    /// so attempt order stays primary-then-chain exactly as before, and a
+    /// missing tail is skipped the same way — only later (on first miss
+    /// instead of at startup). Idempotent: a second call is a no-op.
+    fn ensure_tails_loaded(&mut self) {
+        if self.pending_tails.is_empty() {
+            return;
+        }
+        let tails = std::mem::take(&mut self.pending_tails);
+        for family in tails {
+            let tail = FontQuery {
+                family,
+                style: self.style.clone(),
+                point_size: self.point_size,
+            };
+            match self.inner.load_font(&tail) {
+                Ok(id) => {
+                    if !self.fonts.contains(&id) {
+                        self.fonts.push(id);
+                    }
+                }
+                // Best-effort tails: a missing symbols face must not strand
+                // the primary on bare installs. Any other engine failure is
+                // skipped the same way — the primary still renders, and the
+                // miss stays observable through cache-miss counters.
+                Err(_) => continue,
+            }
+        }
+    }
+
+    /// Loaded chain faces after the requested one, in load order.
+    ///
+    /// Pure helper for the post-miss walk: `fonts` minus `skip`, so the
+    /// attempt sequence stays requested-first-then-chain exactly.
+    fn tail_order(fonts: &[FontId], skip: FontId) -> Vec<FontId> {
+        let mut order = Vec::with_capacity(fonts.len());
+        for font in fonts {
+            if *font != skip && !order.contains(font) {
+                order.push(*font);
+            }
+        }
+        order
     }
 
     /// Configured tail families (primary excluded).
@@ -194,10 +268,11 @@ impl<R: GlyphRasterizer> FallbackRasterizer<R> {
 
     /// Resolves `key` with coverage reporting (CTX-0368, CTX-0961).
     ///
-    /// Walks the requested face first (normally the primary) and then every
-    /// loaded chain face in load order, deduplicated. The first face that
-    /// yields a bitmap wins and is reported with `covered = true`. When every
-    /// pinned face reports a missing glyph (`Ok(None)`), the inner
+    /// Tries the requested face first (normally the primary) with no tail
+    /// loading, so pure-primary coverage never maps a tail file (CTX-1026
+    /// lazy tails). Only when the requested face misses (blank) or errors
+    /// does the pinned chain warm once, after which the walk continues in
+    /// load order exactly as with eager loading; then the inner
     /// rasterizer's dynamic fallback
     /// ([`GlyphRasterizer::dynamic_face_for`]) gets one chance: the shaped
     /// stack scans the system database beyond the pinned chain (the
@@ -210,7 +285,7 @@ impl<R: GlyphRasterizer> FallbackRasterizer<R> {
     ///
     /// Deterministic: the pinned order is fixed by `load_font`, the dynamic
     /// order is fixed by family/post-script/index sort, and the result is a
-    /// pure function of face coverage. Bounded: at most `1 + fonts().len()`
+    /// pure function of face coverage. Bounded: at most `1 + chain.len()`
     /// pinned calls plus one dynamic face plus one dynamic rasterize per
     /// resolution; the dynamic outcome is cached per scalar upstream.
     ///
@@ -223,17 +298,29 @@ impl<R: GlyphRasterizer> FallbackRasterizer<R> {
         if self.fonts.is_empty() {
             return Err(RenderError::UnknownFontHandle);
         }
-        // Attempt order: the requested face first (normally the primary the
-        // grid pipeline cached under), then the stored chain deduplicated.
-        let mut order: Vec<FontId> = Vec::with_capacity(self.fonts.len() + 1);
-        order.push(key.font);
-        for font in &self.fonts {
-            if !order.contains(font) {
-                order.push(*font);
+        // Fast path (CTX-1026): the requested face first, with no tail
+        // loading — the common primary-covered case stays a single call.
+        let first = RasterKey::new(key.character, key.font, key.point_size)
+            .map_err(|_| RenderError::UnknownFontHandle)?;
+        let mut last_err: Option<RenderError> = None;
+        match self.inner.rasterize(first) {
+            Ok(Some(bitmap)) => {
+                return Ok(ResolvedGlyph {
+                    font: key.font,
+                    covered: true,
+                    bitmap: Some(bitmap),
+                });
+            }
+            Ok(None) => {}
+            Err(err) => {
+                last_err = Some(err);
             }
         }
-        let mut last_err: Option<RenderError> = None;
-        for font in order {
+        // Requested face missed: warm the pinned chain once, then walk the
+        // remaining faces in load order (deduplicated). The attempt sequence
+        // matches the requested-first-then-chain order exactly.
+        self.ensure_tails_loaded();
+        for font in Self::tail_order(&self.fonts, key.font) {
             let attempt = RasterKey::new(key.character, font, key.point_size)
                 .map_err(|_| RenderError::UnknownFontHandle)?;
             match self.inner.rasterize(attempt) {
@@ -287,31 +374,19 @@ impl<R: GlyphRasterizer> GlyphRasterizer for FallbackRasterizer<R> {
     fn load_font(&mut self, query: &FontQuery) -> Result<FontId, RenderError> {
         query.validate()?;
         self.fonts.clear();
+        self.pending_tails.clear();
         let primary = self.inner.load_font(query)?;
         self.point_size = query.point_size;
+        self.style = query.style.clone();
         self.fonts.push(primary);
         let lower_primary = query.family.trim().to_lowercase();
         for family in &self.fallback_families {
             if family.trim().is_empty() || family.trim().to_lowercase() == lower_primary {
                 continue;
             }
-            let tail = FontQuery {
-                family: family.clone(),
-                style: query.style.clone(),
-                point_size: query.point_size,
-            };
-            match self.inner.load_font(&tail) {
-                Ok(id) => {
-                    if !self.fonts.contains(&id) {
-                        self.fonts.push(id);
-                    }
-                }
-                // Best-effort tails: a missing symbols face must not strand
-                // the primary on bare installs. Any other engine failure is
-                // skipped the same way — the primary still renders, and the
-                // miss stays observable through cache-miss counters.
-                Err(_) => continue,
-            }
+            // Lazy (CTX-1026): stash the tail for the first fallback miss
+            // instead of mapping its face file at startup.
+            self.pending_tails.push(family.trim().to_string());
         }
         Ok(primary)
     }
@@ -568,11 +643,13 @@ mod tests {
         );
         let mut wrapped = wrapped;
         let primary = wrapped.load_font(&query("JetBrains Mono", 12.0)).unwrap();
-        // Primary + Symbols Nerd Font + Noto Color Emoji + platform tails
-        // (minus the tails duplicating the primary on this platform).
+        // CTX-1026 lazy tails: startup maps only the primary; the user tier
+        // plus platform tails (minus the tails duplicating the primary on
+        // this platform) stay pending until the first fallback miss.
         let expected_tails = config.fallback_tails();
         assert_eq!(wrapped.fallback_families(), expected_tails.as_slice());
-        assert_eq!(wrapped.fonts().len(), 1 + expected_tails.len());
+        assert_eq!(wrapped.fonts().len(), 1, "startup maps the primary only");
+        assert_eq!(wrapped.pending_tails().len(), expected_tails.len());
         // The primary misses the gear; both remaining user faces cover, so
         // the first in user order wins (never the platform tail).
         wrapped
@@ -583,6 +660,9 @@ mod tests {
         let resolved = wrapped.resolve(key).expect("user tier covers gear");
         assert!(resolved.covered);
         assert_eq!(wrapped.inner.family_of(resolved.font), "Symbols Nerd Font");
+        // The miss warmed the chain: primary plus every configured tail.
+        assert!(wrapped.pending_tails().is_empty());
+        assert_eq!(wrapped.fonts().len(), 1 + expected_tails.len());
     }
 
     #[test]
@@ -660,10 +740,15 @@ mod tests {
     fn primary_hit_never_walks_fallbacks() {
         let mut wrapped = FallbackRasterizer::new(Fake::default(), tails());
         let primary = wrapped.load_font(&query("Primary Mono", 12.0)).unwrap();
-        assert_eq!(wrapped.fonts().len(), 5);
+        // CTX-1026 lazy tails: startup maps the primary only.
+        assert_eq!(wrapped.fonts(), &[primary]);
+        assert_eq!(wrapped.pending_tails().len(), tails().len());
         let key = RasterKey::new('A', primary, 12.0).unwrap();
         assert!(wrapped.rasterize(key).unwrap().is_some());
         assert_eq!(wrapped.inner.rasterize_calls.get(), 1);
+        // A primary hit warms nothing: the tails stay pending (unmapped).
+        assert_eq!(wrapped.fonts(), &[primary]);
+        assert_eq!(wrapped.pending_tails().len(), tails().len());
     }
 
     #[test]
@@ -858,17 +943,24 @@ mod tests {
     }
 
     #[test]
-    fn missing_tail_faces_are_skipped_on_load() {
+    fn missing_tail_faces_are_skipped_on_first_miss() {
         let mut inner = Fake::default();
         inner.fail_load.push("monospace".to_string());
         inner.fail_load.push("Noto Sans Symbols 2".to_string());
+        // The primary misses the probe so the walk warms the chain.
+        inner.blank.push(("Primary Mono".to_string(), 'z'));
         let mut wrapped = FallbackRasterizer::new(inner, tails());
         let primary = wrapped.load_font(&query("Primary Mono", 12.0)).unwrap();
         assert_eq!(wrapped.fonts()[0], primary);
-        // Two tails missing: primary + 2 surviving tails.
-        assert_eq!(wrapped.fonts().len(), 3);
+        // CTX-1026 lazy tails: load stashes every tail unattempted, even
+        // ones that will fail when warmed.
+        assert_eq!(wrapped.fonts().len(), 1);
+        assert_eq!(wrapped.pending_tails().len(), tails().len());
         let key = RasterKey::new('z', primary, 12.0).unwrap();
         assert!(wrapped.rasterize(key).unwrap().is_some());
+        // Two tails missing: primary + 2 surviving tails warmed on the miss.
+        assert!(wrapped.pending_tails().is_empty());
+        assert_eq!(wrapped.fonts().len(), 3);
     }
 
     #[test]
@@ -930,8 +1022,10 @@ mod tests {
         let second = wrapped.load_font(&query("Primary Mono", 24.0)).unwrap();
         assert_ne!(first, second);
         assert!((wrapped.point_size() - 24.0).abs() < f32::EPSILON);
-        assert_eq!(wrapped.fonts().len(), 5);
-        assert_eq!(wrapped.fonts()[0], second);
+        // CTX-1026 lazy tails: reload re-stashes the pending tails for the
+        // new size instead of remapping them.
+        assert_eq!(wrapped.fonts(), &[second]);
+        assert_eq!(wrapped.pending_tails().len(), tails().len());
     }
 
     #[test]

@@ -39,7 +39,7 @@
 //! `tests/shaped_parity.rs` does). Full removal of the crossfont wrap is
 //! deferred to CTX-0961.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, OnceLock};
 
 use fontdb::{Database, Family, Query, Source, Style, Weight};
@@ -92,6 +92,18 @@ pub const MAX_SHAPED_GLYPH_CACHE_ENTRIES: usize = 2048;
 /// [`MAX_LOADED_FACES`]; total faces (pinned + dynamic) stay under that
 /// bound regardless.
 pub const MAX_DYNAMIC_FALLBACK_FACES: usize = 16;
+
+/// Maximum distinct scalars retained in the dynamic-fallback outcome cache
+/// (CTX-1026, issue #1809).
+///
+/// Every distinct scalar the pinned chain misses inserts one entry (hit or
+/// cacheable tofu miss), so without a cap hostile input cycling the Unicode
+/// range grows this map without bound (~1.1M scalars). 4096 covers
+/// multi-script working sets (Latin + CJK + symbols + emoji stay warm) at
+/// ~160 KiB worst case; overflow wholesale-clears (deterministic, the same
+/// policy the tiny-cache fallback test pins) and re-resolves on demand —
+/// coverage never changes, only cache warmth.
+pub const MAX_DYNAMIC_CACHE_ENTRIES: usize = 4096;
 
 /// CJK advance alignment epsilon in pixels (design 2.3).
 ///
@@ -185,8 +197,20 @@ pub struct SwashSingle {
     /// when a system face beyond the pinned chain covers the scalar,
     /// `None` when no system face does (cacheable tofu). Populated on
     /// demand by [`dynamic_face_for`](GlyphRasterizer::dynamic_face_for);
-    /// hits never rescan.
+    /// hits never rescan. Bounded by [`MAX_DYNAMIC_CACHE_ENTRIES`]:
+    /// overflow wholesale-clears this map only (see
+    /// [`SwashSingle::note_dynamic_outcome`]).
     dynamic_cache: HashMap<char, Option<FontId>>,
+    /// Lifetime owners of dynamically loaded faces (CTX-1026 fix-forward).
+    ///
+    /// The evictable [`SwashSingle::dynamic_cache`] above maps scalars to
+    /// faces, but wholesale-clear on overflow must not reset the
+    /// [`MAX_DYNAMIC_FALLBACK_FACES`] quota: loaded faces stay in
+    /// `faces`/`by_db_id` after the clear. This set tracks every dynamic
+    /// face for the session lifetime, independent of cache warmth, so
+    /// adversarial scalar floods cannot reopen loading past 16 toward the
+    /// 64-total-face ceiling.
+    dynamic_faces: HashSet<FontId>,
     scale_ctx: swash::scale::ScaleContext,
     next_font_id: u64,
     /// Retained per-face shape plans (Phase B, design 5).
@@ -216,6 +240,7 @@ impl std::fmt::Debug for SwashSingle {
             .field("loaded_faces", &self.faces.len())
             .field("cached_db_ids", &self.by_db_id.len())
             .field("dynamic_cached_scalars", &self.dynamic_cache.len())
+            .field("dynamic_faces", &self.dynamic_faces.len())
             .field("next_font_id", &self.next_font_id)
             .field("shape_plans", &self.shape_plans.len())
             .field("run_cache", &self.run_cache.len())
@@ -245,6 +270,7 @@ impl SwashSingle {
             faces: HashMap::new(),
             by_db_id: HashMap::new(),
             dynamic_cache: HashMap::new(),
+            dynamic_faces: HashSet::new(),
             scale_ctx: swash::scale::ScaleContext::new(),
             next_font_id: 0,
             shape_plans: HashMap::new(),
@@ -257,6 +283,37 @@ impl SwashSingle {
             shape_misses: 0,
             shaping_misaligned: 0,
         })
+    }
+
+    /// Deterministic test constructor without a host font scan (CTX-1026).
+    ///
+    /// The outcome-cache bound test only needs `dynamic_cache` /
+    /// `dynamic_faces` bookkeeping, never real system fonts:
+    /// [`SwashSingle::new`] scans the host filesystem (seconds on
+    /// font-rich seats) and silently early-returns on bare hosts, making
+    /// the gate host-dependent. This builds the same empty session over
+    /// an empty database, so the test is hermetic and never skips.
+    #[cfg(test)]
+    fn empty_for_cache_test() -> Self {
+        let db: &'static Database = Box::leak(Box::new(Database::new()));
+        Self {
+            db,
+            faces: HashMap::new(),
+            by_db_id: HashMap::new(),
+            dynamic_cache: HashMap::new(),
+            dynamic_faces: HashSet::new(),
+            scale_ctx: swash::scale::ScaleContext::new(),
+            next_font_id: 0,
+            shape_plans: HashMap::new(),
+            shape_plan_lru: VecDeque::new(),
+            run_cache: HashMap::new(),
+            run_lru: VecDeque::new(),
+            shaped_glyphs: HashMap::new(),
+            shaped_lru: VecDeque::new(),
+            shape_hits: 0,
+            shape_misses: 0,
+            shaping_misaligned: 0,
+        }
     }
 
     /// Resolves a session handle back to its stored face.
@@ -523,9 +580,14 @@ impl SwashSingle {
     }
 
     /// Number of distinct dynamic-fallback faces loaded so far.
+    ///
+    /// Lifetime quota, independent of the evictable
+    /// [`SwashSingle::dynamic_cache`] warmth: wholesale-clear on overflow
+    /// clears the scalar map but never this set, so the
+    /// [`MAX_DYNAMIC_FALLBACK_FACES`] bound holds for the session.
     #[must_use]
     pub fn dynamic_face_count(&self) -> usize {
-        self.dynamic_cache.values().filter(|v| v.is_some()).count()
+        self.dynamic_faces.len()
     }
 
     /// Scans the system database for a face covering `c` (CTX-0961).
@@ -541,7 +603,36 @@ impl SwashSingle {
     /// load dynamically and total faces stay under [`MAX_LOADED_FACES`];
     /// beyond either bound this returns the cached outcome or `None`
     /// (fail-closed to tofu, never an error).
+    ///
+    /// Coverage recovery (CTX-1026 fix-forward): before scanning for a new
+    /// face, already-loaded dynamic faces are probed first. Cache eviction
+    /// drops the scalar-to-face mapping but never unloads the face, and
+    /// the database scan below skips loaded faces — without this probe an
+    /// evicted scalar would lose coverage (or load a duplicate-coverage
+    /// face) even though its face is still resident.
     fn scan_dynamic_face(&mut self, c: char, point_size: f32) -> Option<FontId> {
+        let px = Self::px(point_size);
+        // Already-resident dynamic faces first: preserves coverage across
+        // outcome-cache evictions without spending quota or loading bytes.
+        // Deterministic order (by handle) so repeated rescans agree.
+        let mut resident: Vec<FontId> = self.dynamic_faces.iter().copied().collect();
+        resident.sort();
+        for font in resident {
+            let Some(stored) = self.faces.get(&font) else {
+                continue;
+            };
+            let Ok(font_ref) = Self::font_ref(stored) else {
+                continue;
+            };
+            let glyph_id: u16 = swash::Charmap::from_font(&font_ref).map(c);
+            if glyph_id == 0 {
+                continue;
+            }
+            let mut scaler = self.scale_ctx.builder(font_ref).size(px).hint(true).build();
+            if Self::probe_source(&mut scaler, glyph_id).is_some() {
+                return Some(font);
+            }
+        }
         if self.dynamic_face_count() >= MAX_DYNAMIC_FALLBACK_FACES
             || self.faces.len() >= MAX_LOADED_FACES
         {
@@ -563,7 +654,6 @@ impl SwashSingle {
             candidates.push((family, face.post_script_name.clone(), face.index, face.id));
         }
         candidates.sort();
-        let px = Self::px(point_size);
         for (_, _, _, id) in candidates {
             if self.faces.len() >= MAX_LOADED_FACES
                 || self.dynamic_face_count() >= MAX_DYNAMIC_FALLBACK_FACES
@@ -594,6 +684,7 @@ impl SwashSingle {
             let font = FontId::next(&mut self.next_font_id);
             self.faces.insert(font, stored);
             self.by_db_id.insert(id, font);
+            self.dynamic_faces.insert(font);
             return Some(font);
         }
         None
@@ -953,8 +1044,31 @@ impl GlyphRasterizer for SwashSingle {
             return *cached;
         }
         let found = self.scan_dynamic_face(c, point_size);
-        self.dynamic_cache.insert(c, found);
+        self.note_dynamic_outcome(c, found);
         found
+    }
+}
+
+impl SwashSingle {
+    /// Records one dynamic-fallback outcome under the
+    /// [`MAX_DYNAMIC_CACHE_ENTRIES`] bound (CTX-1026).
+    ///
+    /// Split out so the bound is unit-testable without a system-font scan:
+    /// overflow wholesale-clears the scalar map before inserting, so length
+    /// never exceeds the cap. The clear drops warmth only: loaded faces
+    /// stay in `faces`/`by_db_id` and quota ownership stays in
+    /// `dynamic_faces`, so the [`MAX_DYNAMIC_FALLBACK_FACES`] lifetime
+    /// bound survives repeated overflows and an evicted scalar recovers
+    /// coverage from its still-resident face on rescan (see
+    /// [`SwashSingle::scan_dynamic_face`]).
+    fn note_dynamic_outcome(&mut self, c: char, outcome: Option<FontId>) {
+        if self.dynamic_cache.len() >= MAX_DYNAMIC_CACHE_ENTRIES {
+            self.dynamic_cache.clear();
+        }
+        if let Some(face) = outcome {
+            self.dynamic_faces.insert(face);
+        }
+        self.dynamic_cache.insert(c, outcome);
     }
 }
 
@@ -1570,5 +1684,61 @@ mod tests {
             assert!(MAX_LOADED_FACES >= 12, "must hold any legal chain");
         }
         assert_eq!(MAX_SHAPE_PLANS_PER_FACE, 6);
+    }
+
+    #[test]
+    fn dynamic_cache_stays_bounded_under_scalar_flood() {
+        // CTX-1026 (issue #1809): every distinct scalar the pinned chain
+        // misses inserts one outcome; hostile input cycling the Unicode
+        // range must not grow the map without bound. Hermetic: no host
+        // font scan, no early return on bare hosts.
+        let mut shaper = SwashSingle::empty_for_cache_test();
+        assert_eq!(MAX_DYNAMIC_CACHE_ENTRIES, 4096);
+        // Flood past the cap with distinct scalars (no system scan: the
+        // helper records outcomes directly).
+        for i in 0..(MAX_DYNAMIC_CACHE_ENTRIES + 64) {
+            let c = char::from_u32(0x1000 + i as u32).unwrap_or('�');
+            shaper.note_dynamic_outcome(c, None);
+        }
+        assert!(
+            shaper.dynamic_cache.len() <= MAX_DYNAMIC_CACHE_ENTRIES,
+            "dynamic outcome cache must hold the bound under flood"
+        );
+        // The cache still serves: a recorded scalar resolves without a scan.
+        // Empty test database covers nothing, so the outcome is tofu.
+        shaper.note_dynamic_outcome('A', None);
+        assert_eq!(shaper.dynamic_face_for('A', 12.0), None);
+    }
+
+    #[test]
+    fn dynamic_face_quota_survives_cache_overflow() {
+        // CTX-1026 fix-forward (arch note): wholesale-clear on overflow
+        // must not reset the 16-face lifetime quota. Loaded faces stay in
+        // `faces`/`by_db_id`; quota ownership lives in `dynamic_faces`.
+        let mut shaper = SwashSingle::empty_for_cache_test();
+        let mut counter: u64 = 0;
+        let mut faces = Vec::new();
+        for _ in 0..MAX_DYNAMIC_FALLBACK_FACES {
+            let face = FontId::next(&mut counter);
+            faces.push(face);
+            let c = char::from_u32(0x2000 + counter as u32).unwrap_or('�');
+            shaper.note_dynamic_outcome(c, Some(face));
+        }
+        assert_eq!(shaper.dynamic_face_count(), MAX_DYNAMIC_FALLBACK_FACES);
+        // Flood past the scalar cap: the map wholesale-clears, the quota
+        // must not reopen.
+        for i in 0..(MAX_DYNAMIC_CACHE_ENTRIES + 64) {
+            let c = char::from_u32(0x4000 + i as u32).unwrap_or('�');
+            shaper.note_dynamic_outcome(c, None);
+        }
+        assert!(
+            shaper.dynamic_cache.len() <= MAX_DYNAMIC_CACHE_ENTRIES,
+            "dynamic outcome cache must hold the bound under flood"
+        );
+        assert_eq!(
+            shaper.dynamic_face_count(),
+            MAX_DYNAMIC_FALLBACK_FACES,
+            "cache overflow must not reset the dynamic-face quota"
+        );
     }
 }

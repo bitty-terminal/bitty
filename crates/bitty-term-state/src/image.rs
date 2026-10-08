@@ -178,6 +178,14 @@ impl ImageStore {
     pub fn drain_ordered(&self) -> Vec<ImageId> {
         self.entries.iter().map(|e| e.id).collect()
     }
+
+    /// Owned heap retained by the store (CTX-1026).
+    #[must_use]
+    pub fn heap_bytes(&self) -> usize {
+        let ring = self.entries.capacity() * std::mem::size_of::<ImagePlaceholder>();
+        let payloads: usize = self.entries.iter().map(|entry| entry.payload.len()).sum();
+        ring + payloads
+    }
 }
 
 #[cfg(test)]

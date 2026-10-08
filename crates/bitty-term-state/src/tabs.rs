@@ -83,6 +83,12 @@ impl TabStops {
         }
         (0..col).rev().find(|&c| self.bits[c])
     }
+
+    /// Owned heap retained by the lattice (CTX-1026).
+    #[must_use]
+    pub fn heap_bytes(&self) -> usize {
+        self.bits.capacity() * std::mem::size_of::<bool>()
+    }
 }
 
 #[cfg(test)]

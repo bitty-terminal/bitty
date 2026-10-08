@@ -70,6 +70,14 @@ impl Replies {
     pub(crate) fn pending_slices(&self) -> Vec<&[u8]> {
         self.pending.iter().map(|reply| reply.as_ref()).collect()
     }
+
+    /// Owned heap retained by the queue (CTX-1026).
+    #[must_use]
+    pub fn heap_bytes(&self) -> usize {
+        let ring = self.pending.capacity() * std::mem::size_of::<Box<[u8]>>();
+        let bytes: usize = self.pending.iter().map(|reply| reply.len()).sum();
+        ring + bytes
+    }
 }
 
 #[cfg(test)]

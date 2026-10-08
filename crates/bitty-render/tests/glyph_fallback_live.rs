@@ -143,7 +143,8 @@ fn host_chain_is_bounded_and_deterministic() {
         return;
     };
     // The chain is a pinned list: primary plus at most MAX_FALLBACK_FAMILIES
-    // tails, all loaded once at startup and walked at most once per scalar.
+    // tails, warmed once on the first fallback miss and walked at most once
+    // per scalar.
     assert!(a.fonts().len() <= 1 + bitty_config::types::MAX_FALLBACK_FAMILIES);
     assert!(a.fallback_families().len() <= bitty_config::types::MAX_FALLBACK_FAMILIES);
     let scalars = ['✔', '☑', '⚙', '⣿', 'A', '\u{10FFFF}'];

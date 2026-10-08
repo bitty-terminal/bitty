@@ -425,6 +425,14 @@ impl Default for KittyAnimation {
     }
 }
 
+impl KittyAnimation {
+    /// Owned heap retained by the frame-gap vector (CTX-1026).
+    #[must_use]
+    pub fn heap_bytes(&self) -> usize {
+        self.gaps.capacity() * std::mem::size_of::<u32>()
+    }
+}
+
 /// Bounded placement + animation store for one terminal.
 #[derive(Debug, Clone, Default)]
 pub struct PlacementStore {
@@ -813,6 +821,20 @@ impl PlacementStore {
             .rev()
             .find(|(n, _)| *n == number)
             .map(|(_, id)| *id)
+    }
+
+    /// Owned heap retained by the store (CTX-1026).
+    #[must_use]
+    pub fn heap_bytes(&self) -> usize {
+        let placements = self.placements.capacity() * std::mem::size_of::<KittyPlacement>();
+        let animations = self.animations.capacity() * std::mem::size_of::<(u32, KittyAnimation)>()
+            + self
+                .animations
+                .iter()
+                .map(|(_, anim)| anim.heap_bytes())
+                .sum::<usize>();
+        let numbers = self.numbers.capacity() * std::mem::size_of::<(u32, u32)>();
+        placements + animations + numbers
     }
 }
 

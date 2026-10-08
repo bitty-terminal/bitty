@@ -38,6 +38,15 @@ impl Grid {
         }
     }
 
+    /// Owned heap retained by this grid (CTX-1026).
+    ///
+    /// Capacity-accurate: `cells.capacity()` plus `wraps.capacity()`, so
+    /// an over-allocating resize trips the gate.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.cells.capacity() * std::mem::size_of::<Cell>()
+            + self.wraps.capacity() * std::mem::size_of::<bool>()
+    }
+
     /// Whether row `row` soft-wraps onto the next row.
     #[inline]
     pub(crate) fn wrapped(&self, row: usize) -> bool {
@@ -463,6 +472,14 @@ impl ScreenPair {
             main: Grid::new(rows, cols),
             alt: Grid::new(rows, cols),
         }
+    }
+
+    /// Owned heap retained by both screens (CTX-1026).
+    ///
+    /// Capacity-accurate (not `rows * cols`): a grid that over-allocates
+    /// trips the memory gate instead of hiding behind constants.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.main.heap_bytes() + self.alt.heap_bytes()
     }
 }
 

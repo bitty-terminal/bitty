@@ -475,9 +475,14 @@ mod tests {
         // the shell's prompt fits far under the 128 KiB channel cap.
         let _keep_reader = reader;
 
-        // The shell must own the foreground before "idle" is meaningful.
+        // The shell must own the foreground before "idle" is meaningful:
+        // poll until the kernel reports the shell itself in front, not just
+        // any group. (FreeBSD, CTX-1020: `tcgetpgrp` reports the NO_PID
+        // sentinel — filtered to `None` — until the shell takes the
+        // foreground, so the first reading is not necessarily the shell.)
+        let child = pty.pid().expect("child pid");
         wait_until(Duration::from_secs(10), || {
-            pty.foreground_pgid().map(|_| ())
+            (pty.foreground_pgid() == Some(child)).then_some(())
         });
         assert_eq!(
             pty.foreground_job(),

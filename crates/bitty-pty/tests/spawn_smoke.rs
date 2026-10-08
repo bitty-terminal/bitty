@@ -373,18 +373,47 @@ fn child_graphics_fingerprint_is_sanitized() {
 
 #[test]
 fn cwd_is_applied_to_child() {
-    let mut pty = PtyBuilder::new("/bin/pwd")
+    // FreeBSD exit-vs-drain race (same family as the `shell_echo` fix,
+    // CTX-1019): a bare `/bin/pwd` exits microseconds after writing, so on
+    // FreeBSD 15.1 the slave can close before the pump's first master read
+    // and the tiny output is lost (`pwd reported ""`). The trailing `read`
+    // gate holds the shell open until the test has observed the `pwd`
+    // output, removing the race on every platform without changing what the
+    // test proves (the `-c` string is still a single argv element, and
+    // `pwd` still runs in the builder-supplied cwd).
+    let mut pty = PtyBuilder::new("/bin/sh")
+        .arg("-c")
+        .arg("pwd; read dummy")
         .cwd("/tmp")
         .spawn()
-        .expect("spawn pwd in /tmp");
+        .expect("spawn sh -c pwd in /tmp");
 
     let reader = pty.take_reader().expect("reader half");
-    let status = pty.wait().expect("pwd exits immediately");
+    let mut writer = pty.take_writer().expect("writer half");
+
+    let deadline = std::time::Instant::now() + ECHO_TIMEOUT;
+    let mut out = Vec::new();
+    while !contains(&out, b"tmp") {
+        match reader.recv_timeout(ECHO_TIMEOUT).expect("recv_timeout") {
+            Some(chunk) => out.extend_from_slice(&chunk),
+            None => break,
+        }
+        assert!(std::time::Instant::now() < deadline, "pwd output timed out");
+    }
+
+    // Release the `read` gate: a newline completes the pending input line,
+    // `read` succeeds, and the shell exits 0 without further output.
+    writer.write_all(b"\n").expect("release read gate");
+    writer.flush().expect("flush read gate");
+    drop(writer);
+
+    let status = pty.wait().expect("sh exits after read gate");
     assert!(status.is_success());
 
-    let output = drain(&reader, std::time::Instant::now() + ECHO_TIMEOUT);
+    let rest = drain(&reader, std::time::Instant::now() + ECHO_TIMEOUT);
+    out.extend_from_slice(&rest);
     reader.join().expect("pump clean");
-    let text = String::from_utf8_lossy(&output);
+    let text = String::from_utf8_lossy(&out);
     // /tmp is a symlink to /private/tmp on macOS; canonicalize both sides.
     let raw = text.trim();
     let cleaned: String = raw

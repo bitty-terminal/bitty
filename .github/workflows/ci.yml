@@ -116,7 +116,7 @@ jobs:
         shell: bash
 
       - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
           toolchain: ${{ steps.rust-channel.outputs.channel }}
           components: rustfmt, clippy
@@ -125,7 +125,7 @@ jobs:
       # the linux-x11/linux-wayland jobs via the same SCCACHE_GHA_VERSION
       # namespace). Kept alongside rust-cache below; posts stats automatically.
       - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       # HK-07: compilation cache on the managed Cache backend. Scoped to
       # OS + toolchain (+ job, Cargo.lock, and rustc hashes appended by the
@@ -198,7 +198,7 @@ jobs:
       # retries visibly. It does not run doctests and cannot list
       # `harness = false` binaries, which are run explicitly just below.
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        uses: taiki-e/install-action@183e4297cca2404691e9380e1307288dced5c82a # v2.87.25
         with:
           tool: nextest@0.9.145
 
@@ -352,7 +352,7 @@ jobs:
           libfontconfig1-dev libfreetype6-dev
 
       - name: Install MSRV toolchain 1.85
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
           # MSRV floor; must match the rust-version in Cargo.toml.
           toolchain: 1.85
@@ -457,14 +457,14 @@ jobs:
         shell: bash
 
       - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
           toolchain: ${{ steps.rust-channel.outputs.channel }}
           components: clippy
 
       # CTX-0971 R4: sccache on the GHA backend alongside rust-cache below.
       - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       # HK-07: compilation cache on the managed Cache backend. Scoped to
       # OS + toolchain (+ job, Cargo.lock, and rustc hashes appended by the
@@ -480,7 +480,7 @@ jobs:
       # real-process group) plus explicit doctests and the two harness=false
       # platform entry points that nextest cannot list.
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        uses: taiki-e/install-action@183e4297cca2404691e9380e1307288dced5c82a # v2.87.25
         with:
           tool: nextest@0.9.145
 
@@ -626,14 +626,14 @@ jobs:
         shell: bash
 
       - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
           toolchain: ${{ steps.rust-channel.outputs.channel }}
           components: clippy
 
       # CTX-0971 R4: sccache on the GHA backend alongside rust-cache below.
       - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       # HK-07: compilation cache on the managed Cache backend. Scoped to
       # OS + toolchain (+ job, Cargo.lock, and rustc hashes appended by the
@@ -649,7 +649,7 @@ jobs:
       # real-process group) plus explicit doctests and the two harness=false
       # platform entry points that nextest cannot list.
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        uses: taiki-e/install-action@183e4297cca2404691e9380e1307288dced5c82a # v2.87.25
         with:
           tool: nextest@0.9.145
 
@@ -752,7 +752,7 @@ jobs:
         shell: bash
 
       - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
           toolchain: ${{ steps.rust-channel.outputs.channel }}
           components: clippy
@@ -778,7 +778,7 @@ jobs:
       # harness=false platform entry points run explicitly since nextest
       # covers neither.
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        uses: taiki-e/install-action@183e4297cca2404691e9380e1307288dced5c82a # v2.87.25
         with:
           tool: nextest@0.9.145
 
@@ -858,17 +858,17 @@ jobs:
         shell: bash
 
       - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
           toolchain: ${{ steps.rust-channel.outputs.channel }}
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        uses: taiki-e/install-action@183e4297cca2404691e9380e1307288dced5c82a # v2.87.25
         with:
           tool: cargo-deny@0.20.2
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        uses: taiki-e/install-action@183e4297cca2404691e9380e1307288dced5c82a # v2.87.25
         with:
           tool: cargo-audit@0.22.2
 
@@ -930,7 +930,7 @@ jobs:
         shell: bash
 
       - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
           toolchain: ${{ steps.rust-channel.outputs.channel }}
           components: clippy
@@ -956,7 +956,7 @@ jobs:
       # harness=false platform entry points run explicitly since nextest
       # covers neither. `shell: bash` keeps the git-bash environment.
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        uses: taiki-e/install-action@183e4297cca2404691e9380e1307288dced5c82a # v2.87.25
         with:
           tool: nextest@0.9.145
 

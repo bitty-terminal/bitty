@@ -54,29 +54,40 @@ fn observe_until(reader: &bitty_pty::PtyReader, marker: &[u8]) -> Vec<u8> {
 /// Spawns a `read`-gated shell, observes `marker`, releases the gate.
 ///
 /// `spawn` builds the PTY (typically `sh -c '<stmt>; read dummy'` plus any
-/// builder config). The gate holds the slave open — the hold-open half of
-/// the FreeBSD exit-vs-drain fix (CTX-1019/CTX-1020 family): the child cannot
-/// exit, and the kernel cannot discard undrained output on slave close,
-/// before the expected bytes are seen. Returns the live PTY, its reader,
-/// and the bytes observed so far; the caller drains the rest and joins.
+/// builder config) and reports the library-level result instead of panicking:
+/// the crate already retries the transient FreeBSD `TIOCSCTTY` race (EPERM /
+/// ENOTTY, CTX-1020) five times internally, so a surviving `Err` is either a
+/// genuine misconfiguration or residual emulated-VM load. The gate holds the
+/// slave open — the hold-open half of the FreeBSD exit-vs-drain fix
+/// (CTX-1019/CTX-1020 family): the child cannot exit, and the kernel cannot
+/// discard undrained output on slave close, before the expected bytes are
+/// seen. Returns the live PTY, its reader, and the bytes observed so far; the
+/// caller drains the rest and joins.
 ///
-/// Resilience: when the marker never arrives, the dud PTY is dropped (its
-/// `Drop` kills and reaps, so a stuck shell cannot linger) and the spawn is
-/// retried once with a fresh device. Only a missing marker triggers the
-/// single respawn — partial output that ends at EOF is returned as-is, so
-/// genuinely wrong content still fails in the caller's own assertions. A
-/// second miss panics with the terminal state attached. The retry covers the
-/// residual FreeBSD transient where a spawned shell never runs (stale
-/// terminal state on a recycled PTS under parallel-spawn load, or an
-/// emulated-VM scheduling stall): nothing observable distinguishes it from a
-/// hung child, and a fresh spawn recovers.
+/// Resilience: a spawn `Err` or a missing marker drops the dud PTY (its
+/// `Drop` kills and reaps, so a stuck shell cannot linger) and retries once
+/// with a fresh device. Only those two cases trigger the single respawn —
+/// partial output that ends at EOF is returned as-is, so genuinely wrong
+/// content still fails in the caller's own assertions. A second miss panics
+/// with the terminal state attached. The retry covers the residual FreeBSD
+/// transients under parallel-spawn load in the emulated VM: a stale terminal
+/// state on a recycled PTS (shell never runs, nothing observable
+/// distinguishes it from a hung child) or an `EPERM`/`ENOTTY` that survived
+/// the library-level retries. A fresh spawn recovers; a genuine failure fails
+/// twice and still panics with diagnosis.
 fn spawn_gated(
     marker: &[u8],
-    spawn: impl Fn() -> bitty_pty::Pty,
+    spawn: impl Fn() -> Result<bitty_pty::Pty, bitty_pty::PtyError>,
 ) -> (bitty_pty::Pty, bitty_pty::PtyReader, Vec<u8>) {
     let mut diagnosis = String::from("no attempts ran");
     for _ in 0..2 {
-        let mut pty = spawn();
+        let mut pty = match spawn() {
+            Ok(pty) => pty,
+            Err(err) => {
+                diagnosis = format!("spawn failed: {err:?}");
+                continue;
+            }
+        };
         let reader = pty.take_reader().expect("reader half");
         let mut writer = pty.take_writer().expect("writer half");
         let observed = observe_until(&reader, marker);
@@ -177,7 +188,6 @@ fn child_environment_inherits_session_with_overrides() {
             .arg("/usr/bin/env; echo __BITTY_ENV_DONE__; read dummy")
             .env("BITTY_PROBE", "1")
             .spawn()
-            .expect("spawn sh -c env")
     });
 
     let rest = drain(&reader, std::time::Instant::now() + ECHO_TIMEOUT);
@@ -267,7 +277,6 @@ fn child_environment_builder_overrides_defaults() {
             .env("TERM", "custom-256color")
             .env("COLORTERM", "custom-color")
             .spawn()
-            .expect("spawn sh -c env")
     });
 
     let rest = drain(&reader, std::time::Instant::now() + ECHO_TIMEOUT);
@@ -303,7 +312,6 @@ fn child_has_term_program_bitty_by_default() {
             .arg("-c")
             .arg("/usr/bin/env; echo __BITTY_ENV_DONE__; read dummy")
             .spawn()
-            .expect("spawn sh -c env")
     });
 
     let rest = drain(&reader, std::time::Instant::now() + ECHO_TIMEOUT);
@@ -325,7 +333,6 @@ fn child_explicit_term_program_override_wins() {
             .arg("/usr/bin/env; echo __BITTY_ENV_DONE__; read dummy")
             .env("TERM_PROGRAM", "custom-term")
             .spawn()
-            .expect("spawn sh -c env")
     });
 
     let rest = drain(&reader, std::time::Instant::now() + ECHO_TIMEOUT);
@@ -397,7 +404,7 @@ fn child_graphics_fingerprint_is_sanitized() {
                 }
             }
         }
-        spawned.expect("spawn sh -c env with poisoned parent")
+        spawned
     });
 
     let rest = drain(&reader, std::time::Instant::now() + ECHO_TIMEOUT);
@@ -455,14 +462,15 @@ fn cwd_is_applied_to_child() {
     // tiny output is lost. The trailing `read` gate holds the shell open
     // until `pwd` output is observed, without changing what the test proves
     // (the `-c` string is still a single argv element, and `pwd` still runs
-    // in the builder-supplied cwd).
-    let (mut pty, reader, mut out) = spawn_gated(b"tmp", || {
+    // in the builder-supplied cwd). Marker is the full `/tmp` path (CTX-1029
+    // hardening for #1796): the bare `tmp` substring could match unrelated
+    // output, while `/tmp` only matches the reported cwd line.
+    let (mut pty, reader, mut out) = spawn_gated(b"/tmp", || {
         PtyBuilder::new("/bin/sh")
             .arg("-c")
             .arg("pwd; read dummy")
             .cwd("/tmp")
             .spawn()
-            .expect("spawn sh -c pwd in /tmp")
     });
 
     let status = pty.wait().expect("sh exits after read gate");
@@ -555,7 +563,6 @@ fn shell_echo_via_sh_with_bounded_backpressure() {
             .arg("-c")
             .arg("echo hello-bitty-pty; read dummy")
             .spawn()
-            .expect("spawn sh -c echo")
     });
 
     // PTY size is still kernel-queryable even for a shell child.

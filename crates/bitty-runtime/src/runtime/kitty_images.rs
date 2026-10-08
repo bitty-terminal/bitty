@@ -350,7 +350,9 @@ impl Runtime {
         let effective_rows = if rows_r > 0 { rows_r } else { placement.rows };
         let new_col = cursor_col.saturating_add(effective_cols);
         let target_row = cursor_row.saturating_add(effective_rows);
-        let max_row = (self.state.height() as u16).saturating_sub(1);
+        let max_row = u16::try_from(self.state.height())
+            .unwrap_or(u16::MAX)
+            .saturating_sub(1);
         if target_row > max_row {
             let overflow = target_row - max_row;
             for _ in 0..overflow {

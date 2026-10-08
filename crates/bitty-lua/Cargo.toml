@@ -14,4 +14,4 @@ publish = true
 workspace = true
 
 [dependencies]
-phodopus = { git = "https://github.com/bitty-terminal/phodopus", rev = "f6aa59a" }
+phodopus = { version = "0.2.0-alpha.1", git = "https://github.com/bitty-terminal/phodopus", rev = "f6aa59a" }

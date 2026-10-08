@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/bitty-terminal/bitty"
 keywords = ["terminal", "bitty"]
 categories = ["command-line-utilities"]
-publish = false
+publish = true
 
 [lints]
 workspace = true
@@ -18,7 +18,7 @@ name = "bitty"
 path = "src/main.rs"
 
 [dependencies]
-bitty-config = { path = "../bitty-config" }
+bitty-config = { version = "0.0.22", path = "../bitty-config" }
 bitty-ipc = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "e9714e7" }
 # CTX-0939 (W-146): the composition root owns the extracted storage
 # mechanics. This is the ONLY crate in the workspace that may depend on
@@ -27,7 +27,7 @@ bitty-ipc = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "e9714e
 # the dependency direction stays one-way (extension mechanics behind the
 # Core gate, never Core importing the extension).
 bitty-storage = { git = "https://github.com/bitty-terminal/bitty-storage", rev = "5e720b4" }
-bitty-package = { path = "../bitty-package" }
+bitty-package = { version = "0.0.22", path = "../bitty-package" }
 # CTX-0981 (W-110): the composition root owns the extracted observability
 # contract. This is the ONLY crate in the workspace that may depend on
 # `bitty-observability-api`: Core library crates never link it (Core keeps
@@ -35,13 +35,13 @@ bitty-package = { path = "../bitty-package" }
 # the dependency direction stays one-way and default builds link no
 # exporters, metrics pipeline, or tracing runtime).
 bitty-observability-api = { git = "https://github.com/bitty-terminal/bitty-observability", rev = "7b3bb74" }
-bitty-platform = { path = "../bitty-platform" }
-bitty-plugin-host = { path = "../bitty-plugin-host" }
-bitty-runtime = { path = "../bitty-runtime" }
-bitty-render = { path = "../bitty-render" }
-bitty-rich = { path = "../bitty-rich" }
-bitty-term-state = { path = "../bitty-term-state" }
-bitty-vt = { path = "../bitty-vt" }
+bitty-platform = { version = "0.0.22", path = "../bitty-platform" }
+bitty-plugin-host = { version = "0.0.22", path = "../bitty-plugin-host" }
+bitty-runtime = { version = "0.0.22", path = "../bitty-runtime" }
+bitty-render = { version = "0.0.22", path = "../bitty-render" }
+bitty-rich = { version = "0.0.22", path = "../bitty-rich" }
+bitty-term-state = { version = "0.0.22", path = "../bitty-term-state" }
+bitty-vt = { version = "0.0.22", path = "../bitty-vt" }
 pollster = { workspace = true }
 
 [features]

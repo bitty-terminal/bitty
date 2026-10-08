@@ -8,15 +8,15 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/bitty-terminal/bitty"
 keywords = ["plugin", "bitty"]
 categories = ["command-line-utilities"]
-publish = false
+publish = true
 
 [lints]
 workspace = true
 
 [dependencies]
-bitty-term-state = { path = "../bitty-term-state" }
-bitty-config = { path = "../bitty-config" }
-bitty-package = { path = "../bitty-package" }
+bitty-term-state = { version = "0.0.22", path = "../bitty-term-state" }
+bitty-config = { version = "0.0.22", path = "../bitty-config" }
+bitty-package = { version = "0.0.22", path = "../bitty-package" }
 
 [dev-dependencies]
 # V-C install tests mint real Ed25519 signatures (bitty#767).

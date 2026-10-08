@@ -48,6 +48,10 @@ pollster = "1.0"
 ed25519-dalek = "3"
 rustix = { version = "1.1.4", default-features = false }
 nix = { version = "0.31.3", default-features = false }
+# CTX-1020: errno constants for the Unix PTY backend's transient-spawn
+# classifier (`EPERM`/`ENOTTY` from the child `TIOCSCTTY`). Lock already
+# carries the 0.2 line via `portable-pty`; no new crate version.
+libc = { version = "0.2", default-features = false }
 # CTX-0903 (DEC-0083): Win32 bindings for the `bitty-winjob` Job Object
 # adapter only (MIT OR Apache-2.0, rust-version 1.71 <= MSRV 1.85). Reuses
 # the 0.61.2 line already in the lockfile; no new crate version.

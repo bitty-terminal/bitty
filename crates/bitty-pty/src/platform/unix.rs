@@ -27,6 +27,7 @@
 use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use portable_pty::CommandBuilder;
 use portable_pty::PtySize;
@@ -54,12 +55,72 @@ fn to_size(cols: u16, rows: u16) -> PtySize {
     }
 }
 
+/// Maximum open+spawn attempts in [`open_pty_and_spawn`]: the first try plus
+/// bounded retries of the transient race below.
+const MAX_SPAWN_ATTEMPTS: usize = 5;
+
+/// Pause between spawn attempts: lets the transient kernel state settle
+/// instead of hot-spinning. Bounded (four 5 ms pauses worst case) and paid
+/// only on the already-failing path; the success path never sleeps.
+const SPAWN_RETRY_PAUSE: Duration = Duration::from_millis(5);
+
+/// FreeBSD `NO_PID` sentinel (CTX-1020): `tcgetpgrp` succeeds — it does not
+/// fail — but reports this value when the terminal has no foreground process
+/// group (`tcgetpgrp(3)`: "If there is no foreground process group,
+/// `tcgetpgrp()` returns an invalid process ID"). The value is the kernel's
+/// `NO_PID` (100000); FreeBSD's default `kern.pid_max` is 99999, so it can
+/// never be a real process-group id. Linux and macOS report "none" as an
+/// error instead (mapped to `None` by the upstream `pid > 0` check), so this
+/// filter is FreeBSD-only: a blanket filter would misclassify real high pids
+/// elsewhere (Linux `pid_max` reaches into the millions).
+#[cfg(target_os = "freebsd")]
+const FREEBSD_NO_PID: u32 = 100_000;
+
+/// Whether a spawn-attempt `errno` is the known-transient FreeBSD
+/// controlling-terminal race (CTX-1020).
+///
+/// The upstream child's `TIOCSCTTY` transiently reports `EPERM` or `ENOTTY`
+/// under parallel-spawn load although permissions are fine: bsd-tier 10-04
+/// (`EPERM`/sh), 10-05 (`EPERM`/cat), release 37749864578 (`ENOTTY`/sh) and
+/// bsd-tier 37749059735 (`ENOTTY`/env) each failed a *different* spawn while
+/// identical spawns succeeded milliseconds apart, and no other errno was
+/// ever observed. Only bare `std::io::Error` payloads from `cmd.spawn()` are
+/// considered — upstream contextual errors (`"failed to openpty: …"`,
+/// `"Unable to spawn …"`) never match, so genuine configuration failures
+/// still fail fast.
+fn is_transient_spawn_errno(errno: Option<i32>) -> bool {
+    matches!(
+        errno,
+        Some(code) if code == libc::ENOTTY || code == libc::EPERM
+    )
+}
+
 pub(crate) fn open_pty_and_spawn(
     config: &SpawnConfig,
 ) -> Result<(Master, Child, Option<crate::tree::OwnedTree>), PtyError> {
+    let mut attempt: usize = 0;
+    loop {
+        attempt += 1;
+        match open_pty_and_spawn_once(config) {
+            Ok(output) => return Ok(output),
+            Err((_, transient)) if transient && attempt < MAX_SPAWN_ATTEMPTS => {
+                std::thread::sleep(SPAWN_RETRY_PAUSE);
+            }
+            Err((err, _)) => return Err(err),
+        }
+    }
+}
+
+/// One open+spawn attempt: a flattened [`PtyError`] plus whether the failure
+/// is the transient race described in [`is_transient_spawn_errno`] (retry)
+/// or terminal (fail fast). Every retry re-opens a fresh PTY pair, so a
+/// stale device is abandoned rather than reused.
+fn open_pty_and_spawn_once(
+    config: &SpawnConfig,
+) -> Result<(Master, Child, Option<crate::tree::OwnedTree>), (PtyError, bool)> {
     let pair = native_pty_system()
         .openpty(to_size(config.cols, config.rows))
-        .map_err(PtyError::flatten_upstream)?;
+        .map_err(|err| (PtyError::flatten_upstream(err), false))?;
 
     let mut argv: Vec<OsString> = Vec::with_capacity(config.args.len() + 1);
     argv.push(config.program.clone());
@@ -103,9 +164,18 @@ pub(crate) fn open_pty_and_spawn(
     let child = match pair.slave.spawn_command(command) {
         Ok(child) => child,
         Err(err) => {
-            // Drop the pair so no master/slave descriptor leaks on failure.
+            // Classify before flattening: the retry decision needs the raw
+            // errno behind the upstream error, which the flattened string
+            // no longer carries. `downcast_ref` is inherent on the concrete
+            // upstream error type, so no new dependency is named here.
+            let transient = is_transient_spawn_errno(
+                err.downcast_ref::<std::io::Error>()
+                    .and_then(std::io::Error::raw_os_error),
+            );
+            // Drop the pair so no master/slave descriptor leaks on failure;
+            // the whole pair is gone before any retry re-opens a fresh one.
             drop(pair.master);
-            return Err(PtyError::flatten_upstream(err));
+            return Err((PtyError::flatten_upstream(err), transient));
         }
     };
     let child = Child { inner: child };
@@ -152,6 +222,21 @@ pub(crate) fn process_group_leader(master: &Master) -> Option<u32> {
         .inner
         .process_group_leader()
         .and_then(|pid| u32::try_from(pid).ok())
+        .and_then(filter_foreground_pgid)
+}
+
+/// Drops the FreeBSD `NO_PID` sentinel (see [`FREEBSD_NO_PID`]): "no
+/// foreground group", never a job. Identity on every other platform.
+#[cfg(target_os = "freebsd")]
+fn filter_foreground_pgid(pid: u32) -> Option<u32> {
+    (pid != FREEBSD_NO_PID).then_some(pid)
+}
+
+/// FreeBSD-only companion to the function below: identity on every other
+/// platform (the `NO_PID` sentinel filter, CTX-1020, must stay FreeBSD-only).
+#[cfg(not(target_os = "freebsd"))]
+fn filter_foreground_pgid(pid: u32) -> Option<u32> {
+    Some(pid)
 }
 
 pub(crate) fn take_reader(master: &mut Master) -> Result<Box<dyn io::Read + Send>, PtyError> {
@@ -206,5 +291,41 @@ fn convert_status(status: portable_pty::ExitStatus) -> ExitStatus {
         success: status.success(),
         code: status.exit_code(),
         signal: status.signal().map(std::convert::Into::into),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transient_spawn_errno_classifier_is_exact() {
+        // CTX-1020: only the two errnos ever observed from the racy child
+        // `TIOCSCTTY` retry; nearby failures (missing program, permission on
+        // exec, no errno at all) must still fail fast.
+        assert!(is_transient_spawn_errno(Some(libc::ENOTTY)));
+        assert!(is_transient_spawn_errno(Some(libc::EPERM)));
+        assert!(!is_transient_spawn_errno(Some(libc::ENOENT)));
+        assert!(!is_transient_spawn_errno(Some(libc::EACCES)));
+        assert!(!is_transient_spawn_errno(Some(libc::EIO)));
+        assert!(!is_transient_spawn_errno(None));
+    }
+
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    fn freebsd_no_pid_sentinel_is_not_a_foreground_group() {
+        // CTX-1020: `tcgetpgrp` reports NO_PID while the shell has not taken
+        // the foreground; that reading is "idle", never a job.
+        assert_eq!(filter_foreground_pgid(FREEBSD_NO_PID), None);
+        assert_eq!(filter_foreground_pgid(1), Some(1));
+    }
+
+    #[cfg(not(target_os = "freebsd"))]
+    #[test]
+    fn non_bsd_platforms_never_filter_a_foreground_pgid() {
+        // CTX-1020: 100000 is a real pid elsewhere (Linux `pid_max` reaches
+        // the millions), so the sentinel filter must stay FreeBSD-only.
+        assert_eq!(filter_foreground_pgid(100_000), Some(100_000));
+        assert_eq!(filter_foreground_pgid(1), Some(1));
     }
 }

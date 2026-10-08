@@ -18,6 +18,9 @@ workspace = true
 # Windows builds no longer compile the upstream crate at all.
 [target.'cfg(unix)'.dependencies]
 portable-pty = "0.9"
+# CTX-1020: errno constants for the transient-spawn classifier only
+# (`EPERM`/`ENOTTY` from the child `TIOCSCTTY`); no other FFI is used.
+libc = { workspace = true }
 
 # CTX-0512: the owned-process-tree boundary (`tree` module). Same workspace
 # pins and platform split as `bitty-ipc`/`bitty-runtime` (no new crates);

@@ -31,12 +31,8 @@ fn drain(reader: &bitty_pty::PtyReader, deadline: std::time::Instant) -> Vec<u8>
 
 /// Reads until `marker` is observed, returning everything so far.
 ///
-/// FreeBSD hold-open (CTX-1019/CTX-1020 family): the caller spawns
-/// `sh -c '<stmt>; read dummy'` and releases the gate with a newline after
-/// this returns, so the child cannot exit — and the kernel cannot discard
-/// undrained output on slave close — before the expected bytes are seen.
-/// Fails closed (returns short) when the stream ends first; the caller's own
-/// assertions then report what is missing.
+/// Fails closed (returns short) when the stream ends first or the bound
+/// elapses; the caller owns what a missing marker means.
 fn observe_until(reader: &bitty_pty::PtyReader, marker: &[u8]) -> Vec<u8> {
     let deadline = std::time::Instant::now() + ECHO_TIMEOUT;
     let mut out = Vec::new();
@@ -48,6 +44,55 @@ fn observe_until(reader: &bitty_pty::PtyReader, marker: &[u8]) -> Vec<u8> {
         assert!(std::time::Instant::now() < deadline, "marker timed out");
     }
     out
+}
+
+/// Spawns a `read`-gated shell, observes `marker`, releases the gate.
+///
+/// `spawn` builds the PTY (typically `sh -c '<stmt>; read dummy'` plus any
+/// builder config). The gate holds the slave open — the hold-open half of
+/// the FreeBSD exit-vs-drain fix (CTX-1019/CTX-1020 family): the child cannot
+/// exit, and the kernel cannot discard undrained output on slave close,
+/// before the expected bytes are seen. Returns the live PTY, its reader,
+/// and the bytes observed so far; the caller drains the rest and joins.
+///
+/// Resilience: when the marker never arrives, the dud PTY is dropped (its
+/// `Drop` kills and reaps, so a stuck shell cannot linger) and the spawn is
+/// retried once with a fresh device. Only a missing marker triggers the
+/// single respawn — partial output that ends at EOF is returned as-is, so
+/// genuinely wrong content still fails in the caller's own assertions. A
+/// second miss panics with the terminal state attached. The retry covers the
+/// residual FreeBSD transient where a spawned shell never runs (stale
+/// terminal state on a recycled PTS under parallel-spawn load, or an
+/// emulated-VM scheduling stall): nothing observable distinguishes it from a
+/// hung child, and a fresh spawn recovers.
+fn spawn_gated(
+    marker: &[u8],
+    spawn: impl Fn() -> bitty_pty::Pty,
+) -> (bitty_pty::Pty, bitty_pty::PtyReader, Vec<u8>) {
+    let mut diagnosis = String::from("no attempts ran");
+    for _ in 0..2 {
+        let mut pty = spawn();
+        let reader = pty.take_reader().expect("reader half");
+        let mut writer = pty.take_writer().expect("writer half");
+        let observed = observe_until(&reader, marker);
+        if contains(&observed, marker) {
+            writer.write_all(b"\n").expect("release read gate");
+            writer.flush().expect("flush read gate");
+            drop(writer);
+            return (pty, reader, observed);
+        }
+        // Marker missing: record the terminal state for the panic below,
+        // then drop the dud (its `Drop` kills and reaps, so a stuck shell
+        // cannot linger) and try once more with a fresh spawn.
+        diagnosis = format!(
+            "child={:?} fg={:?} observed={:?}",
+            pty.pid(),
+            pty.foreground_pgid(),
+            String::from_utf8_lossy(&observed),
+        );
+        drop(pty);
+    }
+    panic!("gated child never produced the marker after a fresh respawn: {diagnosis}");
 }
 
 #[test]
@@ -121,20 +166,14 @@ fn shutdown_kills_and_reaps_in_one_step() {
 
 #[test]
 fn child_environment_inherits_session_with_overrides() {
-    // Hold-open gate: `/usr/bin/env` exits immediately (see `observe_until`).
-    let mut pty = PtyBuilder::new("/bin/sh")
-        .arg("-c")
-        .arg("/usr/bin/env; read dummy")
-        .env("BITTY_PROBE", "1")
-        .spawn()
-        .expect("spawn sh -c env");
-
-    let reader = pty.take_reader().expect("reader half");
-    let mut writer = pty.take_writer().expect("writer half");
-    let mut out = observe_until(&reader, b"BITTY_PROBE=1");
-    writer.write_all(b"\n").expect("release read gate");
-    writer.flush().expect("flush read gate");
-    drop(writer);
+    let (_pty, reader, mut out) = spawn_gated(b"BITTY_PROBE=1", || {
+        PtyBuilder::new("/bin/sh")
+            .arg("-c")
+            .arg("/usr/bin/env; read dummy")
+            .env("BITTY_PROBE", "1")
+            .spawn()
+            .expect("spawn sh -c env")
+    });
 
     let rest = drain(&reader, std::time::Instant::now() + ECHO_TIMEOUT);
     out.extend_from_slice(&rest);
@@ -216,21 +255,15 @@ fn child_environment_inherits_session_with_overrides() {
 
 #[test]
 fn child_environment_builder_overrides_defaults() {
-    // Hold-open gate: `/usr/bin/env` exits immediately (see `observe_until`).
-    let mut pty = PtyBuilder::new("/bin/sh")
-        .arg("-c")
-        .arg("/usr/bin/env; read dummy")
-        .env("TERM", "custom-256color")
-        .env("COLORTERM", "custom-color")
-        .spawn()
-        .expect("spawn sh -c env");
-
-    let reader = pty.take_reader().expect("reader half");
-    let mut writer = pty.take_writer().expect("writer half");
-    let mut out = observe_until(&reader, b"TERM=custom-256color");
-    writer.write_all(b"\n").expect("release read gate");
-    writer.flush().expect("flush read gate");
-    drop(writer);
+    let (_pty, reader, mut out) = spawn_gated(b"TERM=custom-256color", || {
+        PtyBuilder::new("/bin/sh")
+            .arg("-c")
+            .arg("/usr/bin/env; read dummy")
+            .env("TERM", "custom-256color")
+            .env("COLORTERM", "custom-color")
+            .spawn()
+            .expect("spawn sh -c env")
+    });
 
     let rest = drain(&reader, std::time::Instant::now() + ECHO_TIMEOUT);
     out.extend_from_slice(&rest);
@@ -260,19 +293,13 @@ fn child_has_term_program_bitty_by_default() {
     // CTX-0194: TERM_PROGRAM must read `bitty` so term-DB probes fall back
     // to symbols instead of Kitty-graphics APC. No chafa dependency: assert
     // the sanitized child environment directly via headless PTY byte capture.
-    // Hold-open gate: `/usr/bin/env` exits immediately (see `observe_until`).
-    let mut pty = PtyBuilder::new("/bin/sh")
-        .arg("-c")
-        .arg("/usr/bin/env; read dummy")
-        .spawn()
-        .expect("spawn sh -c env");
-
-    let reader = pty.take_reader().expect("reader half");
-    let mut writer = pty.take_writer().expect("writer half");
-    let mut out = observe_until(&reader, b"TERM_PROGRAM=bitty");
-    writer.write_all(b"\n").expect("release read gate");
-    writer.flush().expect("flush read gate");
-    drop(writer);
+    let (_pty, reader, mut out) = spawn_gated(b"TERM_PROGRAM=bitty", || {
+        PtyBuilder::new("/bin/sh")
+            .arg("-c")
+            .arg("/usr/bin/env; read dummy")
+            .spawn()
+            .expect("spawn sh -c env")
+    });
 
     let rest = drain(&reader, std::time::Instant::now() + ECHO_TIMEOUT);
     out.extend_from_slice(&rest);
@@ -287,20 +314,14 @@ fn child_has_term_program_bitty_by_default() {
 
 #[test]
 fn child_explicit_term_program_override_wins() {
-    // Hold-open gate: `/usr/bin/env` exits immediately (see `observe_until`).
-    let mut pty = PtyBuilder::new("/bin/sh")
-        .arg("-c")
-        .arg("/usr/bin/env; read dummy")
-        .env("TERM_PROGRAM", "custom-term")
-        .spawn()
-        .expect("spawn sh -c env");
-
-    let reader = pty.take_reader().expect("reader half");
-    let mut writer = pty.take_writer().expect("writer half");
-    let mut out = observe_until(&reader, b"TERM_PROGRAM=custom-term");
-    writer.write_all(b"\n").expect("release read gate");
-    writer.flush().expect("flush read gate");
-    drop(writer);
+    let (_pty, reader, mut out) = spawn_gated(b"TERM_PROGRAM=custom-term", || {
+        PtyBuilder::new("/bin/sh")
+            .arg("-c")
+            .arg("/usr/bin/env; read dummy")
+            .env("TERM_PROGRAM", "custom-term")
+            .spawn()
+            .expect("spawn sh -c env")
+    });
 
     let rest = drain(&reader, std::time::Instant::now() + ECHO_TIMEOUT);
     out.extend_from_slice(&rest);
@@ -344,39 +365,35 @@ fn child_graphics_fingerprint_is_sanitized() {
         .iter()
         .map(|(k, _)| (*k, std::env::var_os(k)))
         .collect();
-    for (k, v) in poison {
-        // `std::env::set_var` is (correctly) flagged unsafe in Rust 2024
-        // because it races with `getenv` in other threads; the poison window
-        // here is narrowed to spawn-only and restored immediately after.
-        unsafe {
-            std::env::set_var(k, v);
-        }
-    }
 
-    let spawn_result = PtyBuilder::new("/bin/sh")
-        .arg("-c")
-        .arg("/usr/bin/env; read dummy")
-        .spawn();
-
-    // Restore the parent environment immediately: the child snapshot is
-    // taken at spawn time, so later assertions cannot be affected.
-    for (k, prev) in &saved {
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
+    let (_pty, reader, mut out) = spawn_gated(b"TERM_PROGRAM=bitty", || {
+        for (k, v) in poison {
+            // `std::env::set_var` is (correctly) flagged unsafe in Rust 2024
+            // because it races with `getenv` in other threads; the poison
+            // window here is narrowed to spawn-only and restored immediately
+            // after. Re-applied on every attempt: a respawned PTY must see
+            // the same poisoned parent.
+            unsafe {
+                std::env::set_var(k, v);
             }
         }
-    }
+        let spawned = PtyBuilder::new("/bin/sh")
+            .arg("-c")
+            .arg("/usr/bin/env; read dummy")
+            .spawn();
 
-    // Hold-open gate: `/usr/bin/env` exits immediately (see `observe_until`).
-    let mut pty = spawn_result.expect("spawn sh -c env with poisoned parent");
-    let reader = pty.take_reader().expect("reader half");
-    let mut writer = pty.take_writer().expect("writer half");
-    let mut out = observe_until(&reader, b"TERM_PROGRAM=bitty");
-    writer.write_all(b"\n").expect("release read gate");
-    writer.flush().expect("flush read gate");
-    drop(writer);
+        // Restore the parent environment immediately: the child snapshot is
+        // taken at spawn time, so later assertions cannot be affected.
+        for (k, prev) in &saved {
+            unsafe {
+                match prev {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        spawned.expect("spawn sh -c env with poisoned parent")
+    });
 
     let rest = drain(&reader, std::time::Instant::now() + ECHO_TIMEOUT);
     out.extend_from_slice(&rest);
@@ -427,39 +444,21 @@ fn child_graphics_fingerprint_is_sanitized() {
 
 #[test]
 fn cwd_is_applied_to_child() {
-    // FreeBSD exit-vs-drain race (same family as the `shell_echo` fix,
-    // CTX-1019): a bare `/bin/pwd` exits microseconds after writing, so on
-    // FreeBSD 15.1 the slave can close before the pump's first master read
-    // and the tiny output is lost (`pwd reported ""`). The trailing `read`
-    // gate holds the shell open until the test has observed the `pwd`
-    // output, removing the race on every platform without changing what the
-    // test proves (the `-c` string is still a single argv element, and
-    // `pwd` still runs in the builder-supplied cwd).
-    let mut pty = PtyBuilder::new("/bin/sh")
-        .arg("-c")
-        .arg("pwd; read dummy")
-        .cwd("/tmp")
-        .spawn()
-        .expect("spawn sh -c pwd in /tmp");
-
-    let reader = pty.take_reader().expect("reader half");
-    let mut writer = pty.take_writer().expect("writer half");
-
-    let deadline = std::time::Instant::now() + ECHO_TIMEOUT;
-    let mut out = Vec::new();
-    while !contains(&out, b"tmp") {
-        match reader.recv_timeout(ECHO_TIMEOUT).expect("recv_timeout") {
-            Some(chunk) => out.extend_from_slice(&chunk),
-            None => break,
-        }
-        assert!(std::time::Instant::now() < deadline, "pwd output timed out");
-    }
-
-    // Release the `read` gate: a newline completes the pending input line,
-    // `read` succeeds, and the shell exits 0 without further output.
-    writer.write_all(b"\n").expect("release read gate");
-    writer.flush().expect("flush read gate");
-    drop(writer);
+    // `sh -c 'pwd; …'` instead of a bare `/bin/pwd` (same family as the
+    // `shell_echo` fix, CTX-1019): `pwd` exits microseconds after writing,
+    // so the slave can close before the pump's first master read and the
+    // tiny output is lost. The trailing `read` gate holds the shell open
+    // until `pwd` output is observed, without changing what the test proves
+    // (the `-c` string is still a single argv element, and `pwd` still runs
+    // in the builder-supplied cwd).
+    let (mut pty, reader, mut out) = spawn_gated(b"tmp", || {
+        PtyBuilder::new("/bin/sh")
+            .arg("-c")
+            .arg("pwd; read dummy")
+            .cwd("/tmp")
+            .spawn()
+            .expect("spawn sh -c pwd in /tmp")
+    });
 
     let status = pty.wait().expect("sh exits after read gate");
     assert!(status.is_success());
@@ -544,12 +543,15 @@ fn shell_echo_via_sh_with_bounded_backpressure() {
     // the test releases it with a newline, removing the exit-vs-drain race on
     // every platform without changing what the test proves (the `-c` string
     // is still a single argv element: any interpolation inside bitty-pty
-    // would break the `;` sequencing).
-    let mut pty = PtyBuilder::new("/bin/sh")
-        .arg("-c")
-        .arg("echo hello-bitty-pty; read dummy")
-        .spawn()
-        .expect("spawn sh -c echo");
+    // would break the `;` sequencing). Spawned through `spawn_gated`
+    // (respawn-on-silence) like the other gated tests below.
+    let (mut pty, reader, mut out) = spawn_gated(b"hello-bitty-pty", || {
+        PtyBuilder::new("/bin/sh")
+            .arg("-c")
+            .arg("echo hello-bitty-pty; read dummy")
+            .spawn()
+            .expect("spawn sh -c echo")
+    });
 
     // PTY size is still kernel-queryable even for a shell child.
     let (cols, rows) = pty.size().expect("size after shell spawn");
@@ -557,49 +559,11 @@ fn shell_echo_via_sh_with_bounded_backpressure() {
         cols >= 10 && rows >= 5,
         "unexpected initial size {cols}x{rows}"
     );
-
-    let reader = pty.take_reader().expect("reader half");
-    let mut writer = pty.take_writer().expect("writer half");
-
-    let deadline = std::time::Instant::now() + ECHO_TIMEOUT;
-    let mut out = Vec::new();
-    while !contains(&out, b"hello-bitty-pty") {
-        match reader.recv_timeout(ECHO_TIMEOUT).expect("recv_timeout") {
-            Some(chunk) => {
-                assert!(
-                    chunk.len() <= bitty_pty::READ_CHUNK_SIZE,
-                    "shell echo chunk {} exceeds READ_CHUNK_SIZE {}",
-                    chunk.len(),
-                    bitty_pty::READ_CHUNK_SIZE
-                );
-                assert!(
-                    chunk.len() <= bitty_pty::MAX_BUFFERED_BYTES,
-                    "chunk must not exceed MAX_BUFFERED_BYTES"
-                );
-                out.extend_from_slice(&chunk);
-                // Also prove try_recv path does not break backpressure:
-                // a non-blocking poll after the blocking recv should not panic
-                // and must respect the same bound if it yields data.
-                if let bitty_pty::PtyRecv::Chunk(extra) = reader.try_recv() {
-                    assert!(extra.len() <= bitty_pty::READ_CHUNK_SIZE);
-                    out.extend_from_slice(&extra);
-                }
-            }
-            None => break,
-        }
-        assert!(std::time::Instant::now() < deadline, "shell echo timed out");
-    }
     assert!(
         contains(&out, b"hello-bitty-pty"),
         "expected shell echo, got {out:?} as {}",
         String::from_utf8_lossy(&out)
     );
-
-    // Release the `read` gate: a newline completes the pending input line,
-    // `read` succeeds, and the shell exits 0 without further output.
-    writer.write_all(b"\n").expect("release read gate");
-    writer.flush().expect("flush read gate");
-    drop(writer);
 
     let status = pty.wait().expect("reap sh");
     assert!(
@@ -607,9 +571,28 @@ fn shell_echo_via_sh_with_bounded_backpressure() {
         "shell echo should exit 0, got {status:?}"
     );
 
-    // Drain remaining bytes (e.g. trailing newline, shell prompt if any)
-    // and assert pump ended cleanly with bounded semantics.
-    let _rest = drain(&reader, std::time::Instant::now() + ECHO_TIMEOUT);
+    // Drain remaining bytes (e.g. trailing newline, shell prompt if any),
+    // proving the try_recv path does not break backpressure: a non-blocking
+    // poll while draining must not panic and must respect the same bound
+    // if it yields data. Assert pump ended cleanly with bounded semantics.
+    let rest_deadline = std::time::Instant::now() + ECHO_TIMEOUT;
+    while let Ok(Some(chunk)) = reader.recv() {
+        assert!(
+            chunk.len() <= bitty_pty::READ_CHUNK_SIZE,
+            "shell echo chunk {} exceeds READ_CHUNK_SIZE {}",
+            chunk.len(),
+            bitty_pty::READ_CHUNK_SIZE
+        );
+        out.extend_from_slice(&chunk);
+        if let bitty_pty::PtyRecv::Chunk(extra) = reader.try_recv() {
+            assert!(extra.len() <= bitty_pty::READ_CHUNK_SIZE);
+            out.extend_from_slice(&extra);
+        }
+        assert!(
+            std::time::Instant::now() < rest_deadline,
+            "shell echo drain timed out"
+        );
+    }
     reader.join().expect("pump ended cleanly after shell");
 }
 

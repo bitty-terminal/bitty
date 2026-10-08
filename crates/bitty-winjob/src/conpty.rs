@@ -294,6 +294,13 @@ fn append_quoted(arg: &OsStr, command_line: &mut Vec<u16>) -> io::Result<()> {
 /// Builds the `CREATE_UNICODE_ENVIRONMENT` block (`key=value\0` entries plus
 /// a final `\0`) from the resolved environment. Keys must be non-empty and
 /// free of `=` and NUL; values free of NUL.
+///
+/// Stays fail-closed on purpose: the caller (`bitty-pty`'s Windows backend)
+/// pre-sanitizes ambient inherited entries (issue #1801: hostile keys are
+/// skipped with a logged count and the spawn proceeds with the rest), so
+/// anything still malformed here is a programming error in an explicit
+/// entry — which must fail loudly instead of silently dropping caller
+/// intent.
 fn build_environment_block(env: &[(OsString, OsString)]) -> io::Result<Vec<u16>> {
     let mut block = Vec::new();
     for (key, value) in env {

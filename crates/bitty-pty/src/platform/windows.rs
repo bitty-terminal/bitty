@@ -113,12 +113,41 @@ pub(crate) fn open_pty_and_spawn(
     ))
 }
 
-/// Final resolved environment: the session environment minus
-/// graphics-fingerprint markers (CTX-0194) and caller removals, plus the
-/// explicit builder overrides. Mirrors the `portable-pty` 0.9 policy this
-/// backend replaces, including case-insensitive key matching.
+/// Final resolved environment: the session environment minus hostile
+/// entries (issue #1801), graphics-fingerprint markers (CTX-0194) and
+/// caller removals, plus the explicit builder overrides. Mirrors the
+/// `portable-pty` 0.9 policy this backend replaces, including
+/// case-insensitive key matching.
+///
+/// Hostile inherited entries (empty keys, keys containing `'='` such as the
+/// Windows per-drive `=C:` markers, NUL in key or value) are skipped — with
+/// the skipped count logged — instead of failing the whole spawn
+/// fail-closed. Explicit builder entries stay fail-closed in
+/// [`crate::builder::PtyBuilder::validate`], so this filter only ever
+/// touches ambient inherited entries.
 fn resolved_env(config: &SpawnConfig) -> Vec<(OsString, OsString)> {
-    let mut env: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+    let inherited: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+    let (inherited, skipped) = crate::builder::sanitize_inherited_env(inherited);
+    if !skipped.is_empty() {
+        // Bound stderr: hostile blocks are rare, but a block could in
+        // principle carry many odd keys, so only the first few are named
+        // while the count stays exact.
+        const MAX_NAMED_SKIPPED_KEYS: usize = 8;
+        let mut named = skipped
+            .iter()
+            .take(MAX_NAMED_SKIPPED_KEYS)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        if skipped.len() > MAX_NAMED_SKIPPED_KEYS {
+            named.push_str(", …");
+        }
+        eprintln!(
+            "bitty: skipping {} inherited env entries with invalid keys ({named}); spawning with the rest",
+            skipped.len()
+        );
+    }
+    let mut env = inherited;
     // Fingerprint strip (prefix match stays case-sensitive, as before).
     env.retain(|(key, _)| !crate::builder::should_strip_graphics_fingerprint(key));
     // Belt-and-braces exact keys, case-insensitive like the old path.

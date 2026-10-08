@@ -29,6 +29,27 @@ fn drain(reader: &bitty_pty::PtyReader, deadline: std::time::Instant) -> Vec<u8>
     out
 }
 
+/// Reads until `marker` is observed, returning everything so far.
+///
+/// FreeBSD hold-open (CTX-1019/CTX-1020 family): the caller spawns
+/// `sh -c '<stmt>; read dummy'` and releases the gate with a newline after
+/// this returns, so the child cannot exit — and the kernel cannot discard
+/// undrained output on slave close — before the expected bytes are seen.
+/// Fails closed (returns short) when the stream ends first; the caller's own
+/// assertions then report what is missing.
+fn observe_until(reader: &bitty_pty::PtyReader, marker: &[u8]) -> Vec<u8> {
+    let deadline = std::time::Instant::now() + ECHO_TIMEOUT;
+    let mut out = Vec::new();
+    while !contains(&out, marker) {
+        match reader.recv_timeout(ECHO_TIMEOUT).expect("recv_timeout") {
+            Some(chunk) => out.extend_from_slice(&chunk),
+            None => break,
+        }
+        assert!(std::time::Instant::now() < deadline, "marker timed out");
+    }
+    out
+}
+
 #[test]
 fn cat_echo_resize_and_graceful_shutdown() {
     let mut pty = PtyBuilder::new("/bin/cat")
@@ -100,20 +121,26 @@ fn shutdown_kills_and_reaps_in_one_step() {
 
 #[test]
 fn child_environment_inherits_session_with_overrides() {
-    let mut pty = PtyBuilder::new("/usr/bin/env")
+    // Hold-open gate: `/usr/bin/env` exits immediately (see `observe_until`).
+    let mut pty = PtyBuilder::new("/bin/sh")
+        .arg("-c")
+        .arg("/usr/bin/env; read dummy")
         .env("BITTY_PROBE", "1")
         .spawn()
-        .expect("spawn env");
+        .expect("spawn sh -c env");
 
     let reader = pty.take_reader().expect("reader half");
-    let writer = pty.take_writer().expect("writer half");
-    drop(writer); // env prints its environment then exits on stdin EOF
+    let mut writer = pty.take_writer().expect("writer half");
+    let mut out = observe_until(&reader, b"BITTY_PROBE=1");
+    writer.write_all(b"\n").expect("release read gate");
+    writer.flush().expect("flush read gate");
+    drop(writer);
 
-    let deadline = std::time::Instant::now() + ECHO_TIMEOUT;
-    let output = drain(&reader, deadline);
+    let rest = drain(&reader, std::time::Instant::now() + ECHO_TIMEOUT);
+    out.extend_from_slice(&rest);
     reader.join().expect("pump clean");
 
-    let text = String::from_utf8_lossy(&output);
+    let text = String::from_utf8_lossy(&out);
     // PTY output on macOS includes CRLF, line-discipline control chars and
     // caret echo (e.g. "\r\n^D\x08\x08BITTY_PROBE=1\r\n" where ^D is 0x04
     // echoed as "^D" or raw). Normalize by stripping caret notation then
@@ -189,21 +216,27 @@ fn child_environment_inherits_session_with_overrides() {
 
 #[test]
 fn child_environment_builder_overrides_defaults() {
-    let mut pty = PtyBuilder::new("/usr/bin/env")
+    // Hold-open gate: `/usr/bin/env` exits immediately (see `observe_until`).
+    let mut pty = PtyBuilder::new("/bin/sh")
+        .arg("-c")
+        .arg("/usr/bin/env; read dummy")
         .env("TERM", "custom-256color")
         .env("COLORTERM", "custom-color")
         .spawn()
-        .expect("spawn env");
+        .expect("spawn sh -c env");
 
     let reader = pty.take_reader().expect("reader half");
-    let writer = pty.take_writer().expect("writer half");
+    let mut writer = pty.take_writer().expect("writer half");
+    let mut out = observe_until(&reader, b"TERM=custom-256color");
+    writer.write_all(b"\n").expect("release read gate");
+    writer.flush().expect("flush read gate");
     drop(writer);
 
-    let deadline = std::time::Instant::now() + ECHO_TIMEOUT;
-    let output = drain(&reader, deadline);
+    let rest = drain(&reader, std::time::Instant::now() + ECHO_TIMEOUT);
+    out.extend_from_slice(&rest);
     reader.join().expect("pump clean");
 
-    let text = String::from_utf8_lossy(&output);
+    let text = String::from_utf8_lossy(&out);
     assert!(
         text.contains("TERM=custom-256color"),
         "expected custom TERM override in {text:?}"
@@ -227,17 +260,25 @@ fn child_has_term_program_bitty_by_default() {
     // CTX-0194: TERM_PROGRAM must read `bitty` so term-DB probes fall back
     // to symbols instead of Kitty-graphics APC. No chafa dependency: assert
     // the sanitized child environment directly via headless PTY byte capture.
-    let mut pty = PtyBuilder::new("/usr/bin/env").spawn().expect("spawn env");
+    // Hold-open gate: `/usr/bin/env` exits immediately (see `observe_until`).
+    let mut pty = PtyBuilder::new("/bin/sh")
+        .arg("-c")
+        .arg("/usr/bin/env; read dummy")
+        .spawn()
+        .expect("spawn sh -c env");
 
     let reader = pty.take_reader().expect("reader half");
-    let writer = pty.take_writer().expect("writer half");
+    let mut writer = pty.take_writer().expect("writer half");
+    let mut out = observe_until(&reader, b"TERM_PROGRAM=bitty");
+    writer.write_all(b"\n").expect("release read gate");
+    writer.flush().expect("flush read gate");
     drop(writer);
 
-    let deadline = std::time::Instant::now() + ECHO_TIMEOUT;
-    let output = drain(&reader, deadline);
+    let rest = drain(&reader, std::time::Instant::now() + ECHO_TIMEOUT);
+    out.extend_from_slice(&rest);
     reader.join().expect("pump clean");
 
-    let text = String::from_utf8_lossy(&output);
+    let text = String::from_utf8_lossy(&out);
     assert!(
         text.contains("TERM_PROGRAM=bitty"),
         "expected TERM_PROGRAM=bitty in {text:?}"
@@ -246,20 +287,26 @@ fn child_has_term_program_bitty_by_default() {
 
 #[test]
 fn child_explicit_term_program_override_wins() {
-    let mut pty = PtyBuilder::new("/usr/bin/env")
+    // Hold-open gate: `/usr/bin/env` exits immediately (see `observe_until`).
+    let mut pty = PtyBuilder::new("/bin/sh")
+        .arg("-c")
+        .arg("/usr/bin/env; read dummy")
         .env("TERM_PROGRAM", "custom-term")
         .spawn()
-        .expect("spawn env");
+        .expect("spawn sh -c env");
 
     let reader = pty.take_reader().expect("reader half");
-    let writer = pty.take_writer().expect("writer half");
+    let mut writer = pty.take_writer().expect("writer half");
+    let mut out = observe_until(&reader, b"TERM_PROGRAM=custom-term");
+    writer.write_all(b"\n").expect("release read gate");
+    writer.flush().expect("flush read gate");
     drop(writer);
 
-    let deadline = std::time::Instant::now() + ECHO_TIMEOUT;
-    let output = drain(&reader, deadline);
+    let rest = drain(&reader, std::time::Instant::now() + ECHO_TIMEOUT);
+    out.extend_from_slice(&rest);
     reader.join().expect("pump clean");
 
-    let text = String::from_utf8_lossy(&output);
+    let text = String::from_utf8_lossy(&out);
     assert!(
         text.contains("TERM_PROGRAM=custom-term"),
         "explicit TERM_PROGRAM should win in {text:?}"
@@ -306,7 +353,10 @@ fn child_graphics_fingerprint_is_sanitized() {
         }
     }
 
-    let spawn_result = PtyBuilder::new("/usr/bin/env").spawn();
+    let spawn_result = PtyBuilder::new("/bin/sh")
+        .arg("-c")
+        .arg("/usr/bin/env; read dummy")
+        .spawn();
 
     // Restore the parent environment immediately: the child snapshot is
     // taken at spawn time, so later assertions cannot be affected.
@@ -319,16 +369,20 @@ fn child_graphics_fingerprint_is_sanitized() {
         }
     }
 
-    let mut pty = spawn_result.expect("spawn env with poisoned parent");
+    // Hold-open gate: `/usr/bin/env` exits immediately (see `observe_until`).
+    let mut pty = spawn_result.expect("spawn sh -c env with poisoned parent");
     let reader = pty.take_reader().expect("reader half");
-    let writer = pty.take_writer().expect("writer half");
+    let mut writer = pty.take_writer().expect("writer half");
+    let mut out = observe_until(&reader, b"TERM_PROGRAM=bitty");
+    writer.write_all(b"\n").expect("release read gate");
+    writer.flush().expect("flush read gate");
     drop(writer);
 
-    let deadline = std::time::Instant::now() + ECHO_TIMEOUT;
-    let output = drain(&reader, deadline);
+    let rest = drain(&reader, std::time::Instant::now() + ECHO_TIMEOUT);
+    out.extend_from_slice(&rest);
     reader.join().expect("pump clean");
 
-    let text = String::from_utf8_lossy(&output);
+    let text = String::from_utf8_lossy(&out);
     // Sanitized: parent fingerprints must not reach the child; TERM_PROGRAM
     // is overridden to bitty rather than removed.
     assert!(

@@ -178,7 +178,7 @@ dependencies = [
 
 [[package]]
 name = "bitty-config"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "bitty-lua",
  "bitty-ui",
@@ -247,7 +247,7 @@ dependencies = [
 
 [[package]]
 name = "bitty-lua"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "phodopus",
 ]
@@ -264,14 +264,14 @@ source = "git+https://github.com/bitty-terminal/bitty-observability?rev=7b3bb74#
 
 [[package]]
 name = "bitty-package"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "ed25519-dalek",
 ]
 
 [[package]]
 name = "bitty-platform"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "arboard",
  "raw-window-handle",
@@ -285,7 +285,7 @@ source = "git+https://github.com/bitty-terminal/bitty-platform-services?rev=2fc7
 
 [[package]]
 name = "bitty-plugin-host"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "bitty-config",
  "bitty-package",
@@ -295,7 +295,7 @@ dependencies = [
 
 [[package]]
 name = "bitty-pty"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "bitty-test-support",
  "bitty-winjob",
@@ -306,7 +306,7 @@ dependencies = [
 
 [[package]]
 name = "bitty-render"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "bitty-config",
  "bitty-platform",
@@ -321,7 +321,7 @@ dependencies = [
 
 [[package]]
 name = "bitty-rich"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "bitty-ipc",
  "bitty-platform",
@@ -335,7 +335,7 @@ dependencies = [
 
 [[package]]
 name = "bitty-runtime"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "bitty-config",
  "bitty-ipc",
@@ -365,7 +365,7 @@ source = "git+https://github.com/bitty-terminal/bitty-storage?rev=5e720b4#5e720b
 
 [[package]]
 name = "bitty-term-state"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "bitty-vt",
  "proptest",
@@ -373,7 +373,7 @@ dependencies = [
 
 [[package]]
 name = "bitty-terminal"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "bitty-config",
  "bitty-ipc",
@@ -394,15 +394,15 @@ dependencies = [
 
 [[package]]
 name = "bitty-test-support"
-version = "0.0.21"
+version = "0.0.22"
 
 [[package]]
 name = "bitty-test-vm"
-version = "0.0.21"
+version = "0.0.22"
 
 [[package]]
 name = "bitty-ui"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "bitty-rich",
  "bitty-term-state",
@@ -416,7 +416,7 @@ source = "git+https://github.com/bitty-terminal/bitty-url-detector?rev=5c65773#5
 
 [[package]]
 name = "bitty-vt"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "miniz_oxide 0.8.9",
  "vte",
@@ -424,7 +424,7 @@ dependencies = [
 
 [[package]]
 name = "bitty-winjob"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "windows-sys 0.61.2",
 ]

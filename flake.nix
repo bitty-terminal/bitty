@@ -43,7 +43,7 @@
         };
 
         cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
-        version = cargoToml.workspace.package.version or "0.0.21";
+        version = cargoToml.workspace.package.version or "0.0.22";
 
         commonArgs = {
           inherit src version;

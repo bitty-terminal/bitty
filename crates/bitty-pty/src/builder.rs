@@ -132,6 +132,76 @@ pub fn should_strip_graphics_fingerprint(key: &OsStr) -> bool {
         .any(|prefix| text.starts_with(prefix))
 }
 
+/// Whether one inherited environment entry is hostile: anything that would
+/// make the Windows environment-block builder refuse the whole spawn
+/// (issue #1801) — an empty key, a key containing `'='` (Windows per-drive
+/// entries such as `=C:` arrive this way), or NUL in the key or value.
+///
+/// The `'='` check runs against the lossy key text (ASCII `'='` survives
+/// lossy conversion on every platform) and NUL through the platform
+/// predicate, so this is testable on Unix while guarding the Windows spawn.
+///
+/// Explicit builder entries never reach this predicate: they stay
+/// fail-closed in [`PtyBuilder::validate`] (and Lua-provided keys keep the
+/// #1751 bridge bound in `bitty-lua`), so sanitizing here cannot weaken
+/// either strict surface — only ambient inherited entries are skipped.
+#[cfg(any(windows, test))]
+pub(crate) fn inherited_env_entry_is_hostile(key: &OsStr, value: &OsStr) -> bool {
+    if key.is_empty() {
+        return true;
+    }
+    if key.to_string_lossy().contains('=') {
+        return true;
+    }
+    if os_contains_nul(key) || os_contains_nul(value) {
+        return true;
+    }
+    false
+}
+
+/// Maximum characters of one skipped key name in the sanitize log line.
+#[cfg(any(windows, test))]
+pub(crate) const MAX_NAMED_SKIPPED_KEY_CHARS: usize = 64;
+
+/// Redacts one skipped inherited-env key name for the stderr log line.
+///
+/// Names are lossy text from an untrusted env block: control characters
+/// (a raw ESC in a key name must not reach the terminal) become `'?'` and
+/// the name is truncated, mirroring the foreground-job name bound.
+#[cfg(any(windows, test))]
+pub(crate) fn redact_skipped_key_name(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .take(MAX_NAMED_SKIPPED_KEY_CHARS)
+        .collect()
+}
+
+/// Splits inherited environment entries into kept entries plus the lossy
+/// names of skipped hostile entries (see
+/// [`inherited_env_entry_is_hostile`]).
+///
+/// Issue #1801: Windows processes can inherit env blocks with odd keys, and
+/// refusing the whole spawn fail-closed leaves the user without a child.
+/// The Windows backend drops the skipped entries (logging the count) and
+/// spawns with the rest; when every inherited entry is hostile the child
+/// still starts with just the explicit builder overrides (the minimal-env
+/// fallback). Order of the kept entries is preserved.
+#[cfg(any(windows, test))]
+pub(crate) fn sanitize_inherited_env(
+    inherited: Vec<(OsString, OsString)>,
+) -> (Vec<(OsString, OsString)>, Vec<String>) {
+    let mut kept = Vec::with_capacity(inherited.len());
+    let mut skipped = Vec::new();
+    for (key, value) in inherited {
+        if inherited_env_entry_is_hostile(&key, &value) {
+            skipped.push(key.to_string_lossy().into_owned());
+        } else {
+            kept.push((key, value));
+        }
+    }
+    (kept, skipped)
+}
+
 /// Validated spawn configuration handed to the platform backend.
 #[derive(Debug)]
 pub(crate) struct SpawnConfig {
@@ -642,5 +712,114 @@ mod tests {
             .fold(valid_builder(), |b, i| b.env_remove(format!("SCRUB_{i}")));
         let err = builder.validate().unwrap_err();
         assert!(matches!(err, PtyError::Upstream(ref msg) if msg.contains("removal count")));
+    }
+
+    #[test]
+    fn sanitize_keeps_valid_entries_and_reports_nothing_skipped() {
+        // Issue #1801: the common case — a clean inherited block passes
+        // through untouched with a zero skipped count.
+        let (kept, skipped) = sanitize_inherited_env(vec![
+            (OsString::from("PATH"), OsString::from("/bin")),
+            (OsString::from("HOME"), OsString::from("/home/u")),
+            (OsString::from("LANG"), OsString::from("C.UTF-8")),
+        ]);
+        assert!(skipped.is_empty());
+        assert_eq!(
+            kept,
+            vec![
+                (OsString::from("PATH"), OsString::from("/bin")),
+                (OsString::from("HOME"), OsString::from("/home/u")),
+                (OsString::from("LANG"), OsString::from("C.UTF-8")),
+            ]
+        );
+    }
+
+    #[test]
+    fn sanitize_skips_equals_and_empty_keys_with_count_and_names() {
+        // Issue #1801: Windows per-drive markers (`=C:`) and other odd
+        // inherited keys are skipped — counted and named — while the rest
+        // survive in order, so the spawn proceeds with a minimal-env
+        // fallback when everything is hostile.
+        let (kept, skipped) = sanitize_inherited_env(vec![
+            (OsString::from("PATH"), OsString::from("/bin")),
+            (OsString::from("=C:"), OsString::from("C:\\work")),
+            (OsString::from("A=B"), OsString::from("v")),
+            (OsString::from(""), OsString::from("v")),
+            (OsString::from("HOME"), OsString::from("/home/u")),
+        ]);
+        assert_eq!(kept.len(), 2, "only PATH and HOME survive");
+        assert_eq!(kept[0].0, OsString::from("PATH"));
+        assert_eq!(kept[1].0, OsString::from("HOME"));
+        assert_eq!(skipped.len(), 3, "skipped count stays exact");
+        assert!(
+            skipped.iter().any(|name| name == "=C:"),
+            "drive marker named"
+        );
+        assert!(skipped.iter().any(|name| name == "A=B"));
+    }
+
+    #[test]
+    fn sanitize_skips_nul_entries() {
+        #[cfg(unix)]
+        fn nul_os(bytes: &[u8]) -> OsString {
+            use std::os::unix::ffi::OsStringExt;
+            OsString::from_vec(bytes.to_vec())
+        }
+        #[cfg(windows)]
+        fn nul_os(units: &[u16]) -> OsString {
+            use std::os::windows::ffi::OsStringExt;
+            OsString::from_wide(units)
+        }
+        #[cfg(unix)]
+        let hostile = vec![
+            (nul_os(b"K\0"), OsString::from("v")),
+            (OsString::from("K"), nul_os(b"v\0")),
+            (OsString::from("OK"), OsString::from("ok")),
+        ];
+        #[cfg(windows)]
+        let hostile = vec![
+            (nul_os(&['K' as u16, 0]), OsString::from("v")),
+            (OsString::from("K"), nul_os(&['v' as u16, 0])),
+            (OsString::from("OK"), OsString::from("ok")),
+        ];
+        let (kept, skipped) = sanitize_inherited_env(hostile);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].0, OsString::from("OK"));
+        assert_eq!(skipped.len(), 2);
+    }
+
+    #[test]
+    fn sanitize_empty_inherited_block_is_empty() {
+        let (kept, skipped) = sanitize_inherited_env(Vec::new());
+        assert!(kept.is_empty());
+        assert!(skipped.is_empty());
+    }
+
+    #[test]
+    fn explicit_drive_style_key_stays_rejected() {
+        // Fail-closed parity for caller-provided entries: the sanitizer
+        // only ever touches ambient inherited entries, so an explicit
+        // `=C:`-shaped key is still a validation error, never a silent
+        // skip (no regression on the strict builder bound, sibling to the
+        // #1751 Lua-bridge strictness).
+        let err = valid_builder().env("=C:", "v").validate().unwrap_err();
+        assert!(matches!(err, PtyError::InvalidEnvVar { .. }));
+    }
+
+    #[test]
+    fn skipped_key_names_are_redacted_for_stderr() {
+        // CodeRabbit hardening on #1823: names come from an untrusted env
+        // block, so control characters (including ESC) must not reach the
+        // terminal raw, and long names are truncated while the count stays
+        // exact.
+        assert_eq!(redact_skipped_key_name("=C:"), "=C:");
+        assert_eq!(
+            redact_skipped_key_name("A\x1b]0;pwned\x07B"),
+            "A?]0;pwned?B"
+        );
+        let long = "K".repeat(MAX_NAMED_SKIPPED_KEY_CHARS + 16);
+        let redacted = redact_skipped_key_name(&long);
+        assert_eq!(redacted.len(), MAX_NAMED_SKIPPED_KEY_CHARS);
+        assert!(redacted.chars().all(|c| c == 'K'));
     }
 }

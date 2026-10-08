@@ -21,7 +21,10 @@
 //!   parent) and probes each socket with a `connect`; Windows scans the same
 //!   registry inputs for `<instance>.sock` markers and probes each
 //!   `\\.\pipe\bitty-<instance>` named pipe, merging live pipe-namespace
-//!   enumeration (CTX-0196). Only discovery metadata is reported
+//!   enumeration (CTX-0196). Issue #1800: Windows serving is unavailable
+//!   until a named-pipe transport lands, so those probes report stale/empty
+//!   until then; the discovery code stays ready and tested. Only discovery
+//!   metadata is reported
 //! - `--format table` (default) is human output, not a machine contract.
 //!   `--format json` / `--format jsonl` emit the versioned envelope (`v: 1`,
 //!   `command: "list"|"ls"`, `ok`, `result`, plus `error` on failure) on
@@ -345,9 +348,11 @@ pub fn list_help_text(invoked_as: &str) -> String {
                        Unix scans the socket directory and probes each socket with a connect;\n  \
                        Windows scans the instance registry and probes each named pipe, plus\n  \
                        live pipe-namespace enumeration; every platform reports discovery\n  \
-                       metadata only. Terminal content is never fetched;\n  \
-                      detailed snapshots need debug.inspect via ctl/DevTools (bearer scoping\n  \
-                      respected by not reading privileged data here).\n\
+                       metadata only. Windows serving is unavailable until a named-pipe\n  \
+                       transport lands (issue #1800), so Windows rows report stale/empty\n  \
+                       until then. Terminal content is never fetched;\n  \
+                       detailed snapshots need debug.inspect via ctl/DevTools (bearer scoping\n  \
+                       respected by not reading privileged data here).\n\
          \n\
          Options:\n  \
            --format SHAPE  table (default, human, not a contract) | json | jsonl (envelope v1)\n  \
@@ -1848,6 +1853,56 @@ mod tests {
             .collect();
         let merged = merge_instance_rows(big, vec![row("z", "z")]);
         assert_eq!(merged.len(), MAX_LIST_INSTANCES);
+    }
+
+    #[test]
+    fn list_help_documents_windows_serving_degradation() {
+        // Issue #1800: `bitty list --help` must state that Windows rows
+        // report stale/empty until the named-pipe transport lands.
+        let help = list_help_text("list");
+        assert!(
+            help.contains("Windows serving is unavailable"),
+            "list help must name the Windows degradation, got {help:?}"
+        );
+        assert!(
+            help.contains("#1800"),
+            "list help must link the degradation issue, got {help:?}"
+        );
+    }
+
+    #[test]
+    fn degraded_merge_with_empty_pipe_namespace_preserves_registry() {
+        // Issue #1800 degraded shape (Windows without serving, or any
+        // platform without pipes): merging registry rows with an empty
+        // pipe-namespace set is a sorted no-op, never a failure.
+        let row = |instance: &str, socket: &str| InstanceInfo {
+            instance: instance.to_string(),
+            socket: socket.to_string(),
+            live: false,
+            detail: "stale: pipe not present".to_string(),
+        };
+        let primary = vec![row("b", "b"), row("a", "a")];
+        let merged = merge_instance_rows(primary, scan_pipe_namespace());
+        #[cfg(not(windows))]
+        {
+            let sockets: Vec<&str> = merged.iter().map(|r| r.socket.as_str()).collect();
+            assert_eq!(sockets, vec!["a", "b"]);
+        }
+        #[cfg(windows)]
+        {
+            // On Windows the namespace scan is best-effort: it may
+            // contribute live rows, but the registry rows always survive.
+            assert!(merged.iter().any(|r| r.socket == "a"));
+            assert!(merged.iter().any(|r| r.socket == "b"));
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn scan_pipe_namespace_stays_empty_without_pipe_namespace() {
+        // Outside Windows there is no pipe namespace: the scan is empty
+        // and the registry scan stays authoritative.
+        assert!(scan_pipe_namespace().is_empty());
     }
 
     #[cfg(unix)]

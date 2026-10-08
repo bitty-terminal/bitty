@@ -22,6 +22,13 @@
 //!
 //! Unix only. Other platforms get a disabled guard (same fail-soft shape, no
 //! behavior fabricated).
+//!
+//! Windows degradation (issue #1800): no named-pipe transport exists yet, so
+//! Windows serving stays disabled with one actionable stderr line and the
+//! terminal continues normally. The disabled guard carries no failure reason,
+//! so `--fail-loud` never turns this platform shape into a fatal exit;
+//! `bitty ctl` IPC verbs report unavailable (exit 6) and `bitty list
+//! instances` reports discovery only until a pipe transport lands.
 
 #![forbid(unsafe_code)]
 
@@ -115,6 +122,43 @@ impl IpcServeGuard {
     }
 }
 
+/// Disabled guard for a platform that does not serve (issue #1800).
+///
+/// Shared production constructor so the degraded shape is built in exactly
+/// one place: disabled, no socket path, and no failure reason (the
+/// fail-soft warning path is the documented behavior there, and
+/// `--fail-loud` never aborts it).
+fn degraded_guard() -> IpcServeGuard {
+    IpcServeGuard {
+        enabled: false,
+        socket_path: String::new(),
+        failure_reason: None,
+        shutdown: Arc::new(AtomicBool::new(true)),
+        #[cfg(unix)]
+        handle: None,
+    }
+}
+
+/// Windows degradation reason (issue #1800, tested on all platforms).
+///
+/// Names the missing named-pipe future and the CLI consequence so the
+/// one-line stderr warning is detect-and-advise, not a bare
+/// unavailable notice. Kept alive on Unix builds for the Windows
+/// `-D warnings` cross-check and the all-platform unit tests.
+#[allow(dead_code)]
+pub(crate) fn windows_ipc_unavailable_reason() -> &'static str {
+    "ipc socket serving is unavailable on Windows (named-pipe transport not yet implemented; continuing without IPC: `bitty ctl` IPC verbs report unavailable (exit 6), `bitty list instances` reports discovery only)"
+}
+
+/// Non-Windows, non-Unix degradation reason (same fail-soft shape).
+///
+/// Kept alive on Unix/Windows builds for the cross-check and the
+/// all-platform unit tests.
+#[allow(dead_code)]
+pub(crate) fn generic_ipc_unavailable_reason() -> &'static str {
+    "ipc socket serving is unavailable on this platform (continuing without IPC: `bitty ctl` IPC verbs report unavailable (exit 6))"
+}
+
 impl Drop for IpcServeGuard {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
@@ -141,17 +185,19 @@ pub fn serve_in_background(descriptor: ServerDescriptor) -> IpcServeGuard {
             &bitty_ipc::devtools::SocketEnv::from_process_env(),
         )
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
         let _ = descriptor;
-        let reason = "ipc socket serving is unavailable on this platform";
-        crate::logging::warn(|| format!("bitty: {reason} (continuing without IPC)"));
-        IpcServeGuard {
-            enabled: false,
-            socket_path: String::new(),
-            failure_reason: None,
-            shutdown: Arc::new(AtomicBool::new(true)),
-        }
+        let reason = windows_ipc_unavailable_reason();
+        crate::logging::warn(|| format!("bitty: {reason}"));
+        degraded_guard()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = descriptor;
+        let reason = generic_ipc_unavailable_reason();
+        crate::logging::warn(|| format!("bitty: {reason}"));
+        degraded_guard()
     }
 }
 
@@ -164,13 +210,7 @@ fn unix_serve(descriptor: ServerDescriptor, env: &bitty_ipc::devtools::SocketEnv
         let reason =
             "accepted-stream peer attestation is unavailable; IPC surface disabled".to_string();
         crate::logging::warn(|| format!("bitty: ipc unavailable (fail-soft): {reason}"));
-        return IpcServeGuard {
-            enabled: false,
-            socket_path: String::new(),
-            failure_reason: None,
-            shutdown: Arc::new(AtomicBool::new(true)),
-            handle: None,
-        };
+        return degraded_guard();
     }
     match try_listen(env) {
         Ok(listen) => {
@@ -730,6 +770,61 @@ mod tests {
             Some("bind failed")
         );
         assert!(!IpcServeGuard::failed_for_tests("bind failed").is_enabled());
+    }
+
+    #[test]
+    fn degraded_guard_shape_is_documented() {
+        // Issue #1800: the platform-degraded shape is disabled, carries no
+        // socket path, and carries no failure reason so `--fail-loud`
+        // never aborts a platform that cannot serve.
+        let guard = degraded_guard();
+        assert!(!guard.is_enabled());
+        assert!(guard.socket_path().is_empty());
+        assert_eq!(guard.failure_reason(), None);
+    }
+
+    #[test]
+    fn windows_degradation_reason_is_actionable() {
+        // Issue #1800 detect-and-advise: the Windows warning names the
+        // missing named-pipe future and the CLI consequence (exit 6
+        // verbs, discovery-only list) instead of a bare unavailable note.
+        let reason = windows_ipc_unavailable_reason();
+        assert!(
+            reason.contains("named-pipe"),
+            "Windows reason must name the pipe future: {reason:?}"
+        );
+        assert!(
+            reason.contains("continuing without IPC"),
+            "Windows reason must state fail-soft: {reason:?}"
+        );
+        assert!(
+            reason.contains("exit 6"),
+            "Windows reason must name the ctl consequence: {reason:?}"
+        );
+        let generic = generic_ipc_unavailable_reason();
+        assert!(
+            generic.contains("continuing without IPC"),
+            "generic reason must state fail-soft: {generic:?}"
+        );
+        assert!(
+            generic.contains("exit 6"),
+            "generic reason must name the ctl consequence: {generic:?}"
+        );
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn degraded_platform_serves_nothing_with_no_failure_reason() {
+        // Runs on the Windows CI leg: serving stays disabled with an empty
+        // path and no failure reason, so `--fail-loud` stays non-fatal.
+        let guard = serve_in_background(ServerDescriptor {
+            cols: 80,
+            rows: 24,
+            test_mode: false,
+        });
+        assert!(!guard.is_enabled());
+        assert!(guard.socket_path().is_empty());
+        assert_eq!(guard.failure_reason(), None);
     }
 
     #[cfg(any(

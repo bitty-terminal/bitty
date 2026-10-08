@@ -418,7 +418,7 @@ source = "git+https://github.com/bitty-terminal/bitty-url-detector?rev=5c65773#5
 name = "bitty-vt"
 version = "0.0.21"
 dependencies = [
- "miniz_oxide 0.8.9",
+ "miniz_oxide 0.9.1",
  "vte",
 ]
 

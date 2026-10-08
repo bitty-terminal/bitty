@@ -2078,10 +2078,28 @@ impl FontConfig {
         (width, height)
     }
 
-    /// Effective cell from the legacy [`BASE_CELL_WIDTH`]/[`BASE_CELL_HEIGHT`].
+    /// Effective cell from the legacy [`BASE_CELL_WIDTH`]/[`BASE_CELL_HEIGHT`],
+    /// scaled linearly with point size (issue #1814).
+    ///
+    /// The 12pt breathing-room cell (`10x22` defaults) is the validated
+    /// reference (CTX-0237 raster truth): the harfrust shaped advance scales
+    /// linearly with `pt` (`advance = units * pt * 96/72 / UPM`), so the cell
+    /// must scale with the same ratio (`size / 12.0`, rounded) or large sizes
+    /// overlap (20pt shaped `~16px` vs a fixed `10px` cell). DPI scaling
+    /// applies the same factor to both cell and point size
+    /// (`bitty-render::hidpi`), so a size-correct base stays consistent at
+    /// any scale. Invalid sizes fall back to the unscaled cell (total).
     #[must_use]
     pub fn default_effective_cell(&self) -> (u32, u32) {
-        self.effective_cell(BASE_CELL_WIDTH, BASE_CELL_HEIGHT)
+        let (base_w, base_h) = self.effective_cell(BASE_CELL_WIDTH, BASE_CELL_HEIGHT);
+        let ratio = if self.size.is_finite() && self.size > 0.0 {
+            f64::from(self.size) / f64::from(DEFAULT_FONT_SIZE)
+        } else {
+            1.0
+        };
+        let width = ((f64::from(base_w) * ratio).round() as u32).max(1);
+        let height = ((f64::from(base_h) * ratio).round() as u32).max(1);
+        (width, height)
     }
 }
 
@@ -4273,6 +4291,45 @@ mod tests {
         // Zero base still saturates to >= 1 (width keeps the +2px
         // letter-spacing floor, height saturates from zero).
         assert_eq!(roomy.effective_cell(0, 0), (2, 1));
+    }
+
+    #[test]
+    fn font_default_effective_cell_scales_with_size_issue_1814() {
+        // Large-size golden (issue #1814): the cell must track the harfrust
+        // shaped advance linearly (`pt * 96/72` scale), or sizes >= ~16
+        // overlap (20pt shaped `~16px` vs a fixed `10px` cell). Reference is
+        // the validated 12pt `10x22`; every other size scales by
+        // `size / 12.0` and rounds (DPI applies the same factor to both
+        // cell and point size, so the base stays consistent at any scale).
+        let cell_at = |size: f32| {
+            FontConfig {
+                size,
+                ..Default::default()
+            }
+            .default_effective_cell()
+        };
+        // Golden values (rounded): 12pt reference unchanged.
+        assert_eq!(cell_at(12.0), (10, 22));
+        assert_eq!(cell_at(13.0), (11, 24));
+        assert_eq!(cell_at(16.0), (13, 29));
+        assert_eq!(cell_at(20.0), (17, 37));
+        assert_eq!(cell_at(24.0), (20, 44));
+        // No overlap across the acceptance range 12-24: the monospace
+        // advance model (`0.6 * pt * 96/72 = pt * 0.8`) must fit in the
+        // cell at every integer size (cell >= ceil(advance)).
+        for size in 12..=24 {
+            let size = size as f32;
+            let (w, _) = cell_at(size);
+            let shaped = (size * 0.8).ceil() as u32;
+            assert!(
+                w >= shaped,
+                "size {size}: cell width {w} must cover shaped advance {shaped}"
+            );
+        }
+        // Invalid sizes stay total (unscaled reference, never zero).
+        for bad in [0.0, -12.0, f32::NAN, f32::INFINITY] {
+            assert_eq!(cell_at(bad), (10, 22), "size {bad:?} must fall back");
+        }
     }
 
     #[test]

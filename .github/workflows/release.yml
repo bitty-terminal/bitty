@@ -475,7 +475,7 @@ jobs:
         run: |
           set -eux
           . "$HOME/.cargo/env"
-          cargo build --release --locked -p bitty-app
+          cargo build --release --locked -p bitty-terminal
 
       - name: Run core headless suites
         run: |

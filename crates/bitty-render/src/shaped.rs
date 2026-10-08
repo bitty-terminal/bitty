@@ -93,6 +93,18 @@ pub const MAX_SHAPED_GLYPH_CACHE_ENTRIES: usize = 2048;
 /// bound regardless.
 pub const MAX_DYNAMIC_FALLBACK_FACES: usize = 16;
 
+/// Maximum distinct scalars retained in the dynamic-fallback outcome cache
+/// (CTX-1026, issue #1809).
+///
+/// Every distinct scalar the pinned chain misses inserts one entry (hit or
+/// cacheable tofu miss), so without a cap hostile input cycling the Unicode
+/// range grows this map without bound (~1.1M scalars). 4096 covers
+/// multi-script working sets (Latin + CJK + symbols + emoji stay warm) at
+/// ~160 KiB worst case; overflow wholesale-clears (deterministic, the same
+/// policy the tiny-cache fallback test pins) and re-resolves on demand —
+/// coverage never changes, only cache warmth.
+pub const MAX_DYNAMIC_CACHE_ENTRIES: usize = 4096;
+
 /// CJK advance alignment epsilon in pixels (design 2.3).
 ///
 /// A wide scalar is its own cluster; its shaped advance must reconcile
@@ -953,8 +965,24 @@ impl GlyphRasterizer for SwashSingle {
             return *cached;
         }
         let found = self.scan_dynamic_face(c, point_size);
-        self.dynamic_cache.insert(c, found);
+        self.note_dynamic_outcome(c, found);
         found
+    }
+}
+
+impl SwashSingle {
+    /// Records one dynamic-fallback outcome under the
+    /// [`MAX_DYNAMIC_CACHE_ENTRIES`] bound (CTX-1026).
+    ///
+    /// Split out so the bound is unit-testable without a system-font scan:
+    /// overflow wholesale-clears before inserting, so length never exceeds
+    /// the cap. Coverage is unaffected — an evicted scalar simply rescans
+    /// on its next miss.
+    fn note_dynamic_outcome(&mut self, c: char, outcome: Option<FontId>) {
+        if self.dynamic_cache.len() >= MAX_DYNAMIC_CACHE_ENTRIES {
+            self.dynamic_cache.clear();
+        }
+        self.dynamic_cache.insert(c, outcome);
     }
 }
 
@@ -1570,5 +1598,30 @@ mod tests {
             assert!(MAX_LOADED_FACES >= 12, "must hold any legal chain");
         }
         assert_eq!(MAX_SHAPE_PLANS_PER_FACE, 6);
+    }
+
+    #[test]
+    fn dynamic_cache_stays_bounded_under_scalar_flood() {
+        // CTX-1026 (issue #1809): every distinct scalar the pinned chain
+        // misses inserts one outcome; hostile input cycling the Unicode
+        // range must not grow the map without bound.
+        let mut shaper = match SwashSingle::new() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        assert_eq!(MAX_DYNAMIC_CACHE_ENTRIES, 4096);
+        // Flood past the cap with distinct scalars (no system scan: the
+        // helper records outcomes directly).
+        for i in 0..(MAX_DYNAMIC_CACHE_ENTRIES + 64) {
+            let c = char::from_u32(0x1000 + i as u32).unwrap_or('�');
+            shaper.note_dynamic_outcome(c, None);
+        }
+        assert!(
+            shaper.dynamic_cache.len() <= MAX_DYNAMIC_CACHE_ENTRIES,
+            "dynamic outcome cache must hold the bound under flood"
+        );
+        // The cache still serves: a recorded scalar resolves without a scan.
+        shaper.note_dynamic_outcome('A', None);
+        assert_eq!(shaper.dynamic_face_for('A', 12.0), None);
     }
 }

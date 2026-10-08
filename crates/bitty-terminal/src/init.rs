@@ -532,19 +532,386 @@ pub(crate) fn render_init_lua(answers: &InitAnswers) -> String {
     out
 }
 
+/// Wizard line-editing escape outcome: one parsed `ESC`-led sequence mapped
+/// to an editing action. The tables mirror the terminal input encoder
+/// (`bitty-platform::keyboard`: [`encode_named_key`] legacy sequences plus
+/// the kitty [`ext_functional_key`] codes framed by
+/// [`encode_key_event_kitty_protocol`]) so every byte pattern the terminal
+/// can emit for the listed keys decodes here instead of landing in answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitEscapeAction {
+    /// Cursor one cell left.
+    Left,
+    /// Cursor one cell right.
+    Right,
+    /// Recall older history entry.
+    Up,
+    /// Recall newer history entry (or restore the saved buffer).
+    Down,
+    /// Cursor to the start of the buffer.
+    Home,
+    /// Cursor to the end of the buffer.
+    End,
+    /// Delete the cell under the cursor (DEL / `CSI 3 ~` / kitty `3 u`).
+    DeleteAt,
+    /// Delete the cell before the cursor (kitty `127 u`).
+    Backspace,
+    /// Insert one space (kitty `32 u`).
+    InsertSpace,
+    /// kitty `13 u` (Enter): submit the buffer immediately.
+    Submit,
+    /// Consumed bytes carry no editing meaning (INS, F-keys, PageUp/Down,
+    /// unknown CSI/SS3/OSC, bare ESC, Alt prefix): drop, never insert.
+    Ignore,
+}
+
+/// Parses one `ESC`-led sequence at `raw[pos]` (`raw[pos] == 0x1b`).
+/// Returns the editing action plus the number of bytes consumed.
+/// Never fails: truncated or unknown sequences consume through the line end
+/// (or their terminator) as [`InitEscapeAction::Ignore`] so raw `ESC` bytes
+/// can never leak into an answer.
+fn init_parse_escape_at(raw: &[u8], pos: usize) -> (InitEscapeAction, usize) {
+    use InitEscapeAction as A;
+    let len = raw.len();
+    if pos + 1 >= len {
+        return (A::Ignore, 1);
+    }
+    let second = raw[pos + 1];
+    // CSI: `ESC [ ... final(0x40..=0x7e)`.
+    if second == b'[' {
+        let mut end = pos + 2;
+        while end < len && !(0x40..=0x7e).contains(&raw[end]) {
+            // Bound the scan so a pasted megabyte without a final byte
+            // cannot grow the parse: past 32 parameter bytes the rest of
+            // the line is one ignored sequence.
+            if end - (pos + 2) >= 32 {
+                return (A::Ignore, len - pos);
+            }
+            end += 1;
+        }
+        if end >= len {
+            return (A::Ignore, len - pos);
+        }
+        let final_byte = raw[end];
+        let consumed = end - pos + 1;
+        match final_byte {
+            b'A' => return (A::Up, consumed),
+            b'B' => return (A::Down, consumed),
+            b'C' => return (A::Right, consumed),
+            b'D' => return (A::Left, consumed),
+            b'H' => return (A::Home, consumed),
+            b'F' => return (A::End, consumed),
+            b'P' | b'Q' | b'S' => return (A::Ignore, consumed),
+            b'~' => {
+                // `CSI <n> [;...] ~`: first number selects the key.
+                // `1`/`7` Home, `4`/`8` End, `2` INS (ignore), `3` DEL,
+                // `5`/`6` PageUp/PageDown (ignore), `11`/`12` F1/F2
+                // (ignore); anything else (including bracketed-paste
+                // `200`/`201`) is ignored.
+                let params = &raw[pos + 2..end];
+                let mut first: u32 = 0;
+                let mut has_digit = false;
+                for &b in params {
+                    if b.is_ascii_digit() {
+                        has_digit = true;
+                        first = first.saturating_mul(10).saturating_add(u32::from(b - b'0'));
+                    } else {
+                        break;
+                    }
+                }
+                if !has_digit {
+                    return (A::Ignore, consumed);
+                }
+                match first {
+                    1 | 7 => return (A::Home, consumed),
+                    4 | 8 => return (A::End, consumed),
+                    3 => return (A::DeleteAt, consumed),
+                    _ => return (A::Ignore, consumed),
+                }
+            }
+            b'u' => {
+                // Kitty `CSI <code> [;...] u`: first code selects the key
+                // (`ext_functional_key` + `encode_key_event_kitty_protocol`
+                // framing: `27` ESC, `13` Enter, `9` Tab, `127`
+                // Backspace, `32` Space, `2` INS, `3` DEL, `11`/`12`
+                // F1/F2; arrows use trailers `A`/`B`/`C`/`D` above).
+                let params = &raw[pos + 2..end];
+                let mut first: u32 = 0;
+                let mut has_digit = false;
+                for &b in params {
+                    if b.is_ascii_digit() {
+                        has_digit = true;
+                        first = first.saturating_mul(10).saturating_add(u32::from(b - b'0'));
+                    } else {
+                        break;
+                    }
+                }
+                if !has_digit {
+                    return (A::Ignore, consumed);
+                }
+                match first {
+                    13 => return (A::Submit, consumed),
+                    127 => return (A::Backspace, consumed),
+                    32 => return (A::InsertSpace, consumed),
+                    3 => return (A::DeleteAt, consumed),
+                    _ => return (A::Ignore, consumed),
+                }
+            }
+            _ => return (A::Ignore, consumed),
+        }
+    }
+    // SS3: `ESC O <letter>` (application cursor + F1-F4 legacy).
+    if second == b'O' {
+        if pos + 2 >= len {
+            // Bare `ESC O` at the end of the line is Alt+O, not SS3:
+            // drop only the `ESC` and let `O` insert normally.
+            return (A::Ignore, 1);
+        }
+        match raw[pos + 2] {
+            b'A' => return (A::Up, 3),
+            b'B' => return (A::Down, 3),
+            b'C' => return (A::Right, 3),
+            b'D' => return (A::Left, 3),
+            b'H' => return (A::Home, 3),
+            b'F' => return (A::End, 3),
+            b'P' | b'Q' | b'R' | b'S' => return (A::Ignore, 3),
+            _ => return (A::Ignore, 1),
+        }
+    }
+    // OSC / DCS / SOS / PM / APC introductions (`ESC ] P X ^ _`):
+    // consume through `BEL` or `ESC \` so a pasted OSC never leaks its
+    // payload into the answer.
+    if matches!(second, b']' | b'P' | b'X' | b'^' | b'_') {
+        let mut i = pos + 2;
+        while i < len {
+            if raw[i] == 0x07 {
+                return (A::Ignore, i - pos + 1);
+            }
+            if raw[i] == 0x1b && i + 1 < len && raw[i + 1] == b'\\' {
+                return (A::Ignore, i - pos + 2);
+            }
+            // Bound the scan: past 4 KiB the rest of the line is one
+            // ignored sequence.
+            if i - (pos + 2) >= INIT_MAX_LINE_BYTES {
+                return (A::Ignore, len - pos);
+            }
+            i += 1;
+        }
+        return (A::Ignore, len - pos);
+    }
+    // Charset / single-shift introductions (`ESC (`, `ESC )`, `ESC #`, ...):
+    // three-byte ignored sequences, never Alt prefixes.
+    if matches!(second, b'(' | b')' | b'#' | b'%') {
+        let take = (len - pos).min(3);
+        return (A::Ignore, take);
+    }
+    // Anything else (`ESC` + printable) is an Alt prefix
+    // (`metaSendsEscape`): drop only the `ESC` so the following character
+    // inserts without its modifier. Non-printable followers drop the `ESC`
+    // too; the follower itself is handled (dropped) next iteration.
+    (A::Ignore, 1)
+}
+
+/// Decodes one raw wizard line (without the trailing newline) through the
+/// terminal key tables into the final answer.
+///
+/// Editing model (headless-pure over the injected bytes, so piped-stdin
+/// tests drive it byte-identically to a canonical-mode TTY whose kernel
+/// delivered the same `ESC [` bytes for the listed keys):
+///
+/// - Printable ASCII and valid UTF-8 insert at the cursor.
+/// - `BS`/`DEL` (`0x08`/`0x7f`) delete before the cursor; `CSI 3 ~` (and
+///   kitty `3 u`) delete under the cursor.
+/// - Arrows move (`CSI A`/`B`/`C`/`D` with any modifiers, application
+///   `SS3` variants, kitty `CSI u` arrow trailers included); `Left`/`Right`
+///   at the edges stay.
+/// - `Home` (`CSI H`, `SS3 H`, `CSI 1 ~`/`7 ~`) and `End` (`CSI F`,
+///   `SS3 F`, `CSI 4 ~`/`8 ~`) jump.
+/// - `Up`/`Down` walk `history` (previous successful wizard answers in this
+///   run) with the current buffer saved across the walk; empty history or
+///   the walk ends stay gracefully.
+/// - `INS` (`CSI 2 ~`), `F1`/`F2` (`SS3 P`/`Q`, `CSI 11 ~`/`12 ~`, kitty
+///   `P`/`Q` trailers), PageUp/PageDown, bare `ESC`, unknown CSI/SS3/OSC,
+///   Alt prefixes, and every other control byte are ignored.
+///
+/// Total: raw `ESC` (`0x1b`) is never inserted, so `^[[A`-style text can
+/// never land in an answer. The result is truncated to
+/// [`INIT_MAX_LINE_BYTES`] on a character boundary.
+pub(crate) fn init_decode_line_bytes(raw: &[u8], history: &[String]) -> String {
+    let mut buffer: Vec<char> = Vec::new();
+    let mut cursor: usize = 0;
+    let mut history_index: Option<usize> = None;
+    let mut saved: Vec<char> = Vec::new();
+    let mut i = 0;
+    let len = raw.len();
+    while i < len {
+        let byte = raw[i];
+        if byte == 0x1b {
+            let (action, consumed) = init_parse_escape_at(raw, i);
+            match action {
+                InitEscapeAction::Left => {
+                    cursor = cursor.saturating_sub(1);
+                }
+                InitEscapeAction::Right => {
+                    cursor = cursor.saturating_add(1).min(buffer.len());
+                }
+                InitEscapeAction::Up => {
+                    if !history.is_empty() {
+                        match history_index {
+                            None => {
+                                saved = buffer.clone();
+                                let index = history.len() - 1;
+                                buffer = history[index].chars().collect();
+                                cursor = buffer.len();
+                                history_index = Some(index);
+                            }
+                            Some(0) => {}
+                            Some(index) => {
+                                let next = index - 1;
+                                buffer = history[next].chars().collect();
+                                cursor = buffer.len();
+                                history_index = Some(next);
+                            }
+                        }
+                    }
+                }
+                InitEscapeAction::Down => match history_index {
+                    None => {}
+                    Some(index) if index + 1 >= history.len() => {
+                        buffer = saved.clone();
+                        cursor = buffer.len();
+                        history_index = None;
+                    }
+                    Some(index) => {
+                        let next = index + 1;
+                        buffer = history[next].chars().collect();
+                        cursor = buffer.len();
+                        history_index = Some(next);
+                    }
+                },
+                InitEscapeAction::Home => cursor = 0,
+                InitEscapeAction::End => cursor = buffer.len(),
+                InitEscapeAction::DeleteAt => {
+                    if cursor < buffer.len() {
+                        buffer.remove(cursor);
+                    }
+                }
+                InitEscapeAction::Backspace => {
+                    if cursor > 0 {
+                        cursor = cursor.saturating_sub(1);
+                        buffer.remove(cursor);
+                    }
+                }
+                InitEscapeAction::InsertSpace => {
+                    buffer.insert(cursor, ' ');
+                    cursor += 1;
+                }
+                InitEscapeAction::Submit => break,
+                InitEscapeAction::Ignore => {}
+            }
+            i += consumed.max(1);
+            continue;
+        }
+        if byte == 0x7f || byte == 0x08 {
+            if cursor > 0 {
+                cursor = cursor.saturating_sub(1);
+                buffer.remove(cursor);
+            }
+            i += 1;
+            continue;
+        }
+        if byte < 0x20 {
+            // Remaining C0 controls (`\r`, `\t`, `Ctrl+letter` bytes,
+            // `BEL`, ...) carry no answer text: drop so they can never
+            // land in an answer (validators reprompt on nothing, not on
+            // garbage).
+            i += 1;
+            continue;
+        }
+        if byte < 0x80 {
+            buffer.insert(cursor, byte as char);
+            cursor += 1;
+            i += 1;
+            continue;
+        }
+        // Multi-byte UTF-8: decode one character from the leading byte.
+        let width = if byte >= 0xf0 {
+            4
+        } else if byte >= 0xe0 {
+            3
+        } else if byte >= 0xc0 {
+            2
+        } else {
+            // Stray continuation byte: drop.
+            i += 1;
+            continue;
+        };
+        if i + width > len {
+            break;
+        }
+        match std::str::from_utf8(&raw[i..i + width]) {
+            Ok(text) => {
+                if let Some(ch) = text.chars().next() {
+                    buffer.insert(cursor, ch);
+                    cursor += 1;
+                }
+                i += width;
+            }
+            Err(_) => {
+                i += 1;
+            }
+        }
+    }
+    let mut out: String = buffer.into_iter().collect();
+    if out.len() > INIT_MAX_LINE_BYTES {
+        let mut boundary = INIT_MAX_LINE_BYTES;
+        while boundary > 0 && !out.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        out.truncate(boundary);
+    }
+    out
+}
+
 /// Reads one stdin line without the trailing newline. `None` on EOF or I/O
 /// error (the wizard aborts rather than guessing). Overlong lines are
 /// truncated to [`INIT_MAX_LINE_BYTES`] so a pasted megabyte cannot grow
 /// the answer buffer.
+///
+/// Key-aware: the raw bytes (including the `ESC [` sequences a
+/// canonical-mode TTY delivers for arrows/DEL/INS/HOME/END/F-keys) run
+/// through [`init_decode_line_bytes`] with an empty history, so raw `ESC`
+/// bytes never land in the returned answer.
+#[allow(dead_code)]
 pub(crate) fn init_read_line(input: &mut dyn std::io::BufRead) -> Option<String> {
-    let mut line = String::new();
-    match input.read_line(&mut line) {
+    init_read_line_with_history(input, &[])
+}
+
+/// [`init_read_line`] with `Up`/`Down` history recall over the previous
+/// successful wizard answers in this run; empty history stays gracefully.
+/// History itself is only appended by [`init_ask`] on successful parses —
+/// reading never mutates it.
+pub(crate) fn init_read_line_with_history(
+    input: &mut dyn std::io::BufRead,
+    history: &[String],
+) -> Option<String> {
+    let mut raw: Vec<u8> = Vec::new();
+    match input.read_until(b'\n', &mut raw) {
         Ok(0) => None,
         Ok(_) => {
-            if line.len() > INIT_MAX_LINE_BYTES {
-                line.truncate(INIT_MAX_LINE_BYTES);
+            if raw.ends_with(b"\n") {
+                raw.pop();
             }
-            Some(line.trim_end_matches(['\r', '\n']).to_string())
+            if raw.ends_with(b"\r") {
+                raw.pop();
+            }
+            // Bound the raw scan: escape overhead past the answer cap is
+            // dropped before decoding (the decoded answer is capped again
+            // in `init_decode_line_bytes`).
+            if raw.len() > INIT_MAX_LINE_BYTES + 256 {
+                raw.truncate(INIT_MAX_LINE_BYTES + 256);
+            }
+            Some(init_decode_line_bytes(&raw, history))
         }
         Err(_) => None,
     }
@@ -554,18 +921,28 @@ pub(crate) fn init_read_line(input: &mut dyn std::io::BufRead) -> Option<String>
 /// Reprompts up to [`INIT_MAX_ATTEMPTS`] on parse errors, then aborts;
 /// EOF aborts immediately. Prompts go to `output` (stdout at runtime) so
 /// piped-stdin runs still show the questions.
+///
+/// `history` carries the previous successful answers in this wizard run
+/// for `Up`/`Down` recall (appended on success only; failed attempts never
+/// pollute recall).
 pub(crate) fn init_ask<T>(
     input: &mut dyn std::io::BufRead,
     output: &mut dyn std::io::Write,
     prompt: &str,
     parse: impl Fn(&str) -> Result<T, String>,
+    history: &mut Vec<String>,
 ) -> Result<T, String> {
     for attempt in 1..=INIT_MAX_ATTEMPTS {
         let _ = writeln!(output, "{prompt}");
         let _ = output.flush();
-        match init_read_line(input) {
+        match init_read_line_with_history(input, history) {
             Some(line) => match parse(&line) {
-                Ok(value) => return Ok(value),
+                Ok(value) => {
+                    if !line.is_empty() {
+                        history.push(line);
+                    }
+                    return Ok(value);
+                }
                 Err(err) => {
                     let _ = writeln!(
                         output,
@@ -609,15 +986,25 @@ pub(crate) fn run_init_interactive(
         let marker = if index == 0 { " (default)" } else { "" };
         let _ = writeln!(output, "  {}) {candidate}{marker}", index + 1);
     }
+    // Per-run recall for `Up`/`Down`: previous successful answers in this
+    // wizard invocation (failed attempts never pollute it).
+    let mut history: Vec<String> = Vec::new();
     let shell = init_ask(
         input,
         output,
         "Shell [Enter for default, number, or custom path]:",
         |line| init_parse_shell_answer(line, &candidates),
+        &mut history,
     )?;
     let theme = match &overrides.theme {
         Some(theme) => theme.clone(),
-        None => init_ask(input, output, "Theme [dark]:", init_parse_theme_answer)?,
+        None => init_ask(
+            input,
+            output,
+            "Theme [dark]:",
+            init_parse_theme_answer,
+            &mut history,
+        )?,
     };
     let font_family = match &overrides.font_family {
         Some(family) => family.clone(),
@@ -629,6 +1016,7 @@ pub(crate) fn run_init_interactive(
                 bitty_config::types::DEFAULT_FONT_FAMILY
             ),
             init_parse_font_family_answer,
+            &mut history,
         )?,
     };
     let font_size = match overrides.font_size {
@@ -641,6 +1029,7 @@ pub(crate) fn run_init_interactive(
                 bitty_config::types::DEFAULT_FONT_SIZE
             ),
             init_parse_font_size_answer,
+            &mut history,
         )?,
     };
     let _ = writeln!(
@@ -664,6 +1053,7 @@ pub(crate) fn run_init_interactive(
                     bitty_config::types::DEFAULT_DECORATION_GAPS_IN_PX,
                 )
             },
+            &mut history,
         )?,
     };
     let gaps_out = match overrides.gaps_out {
@@ -683,6 +1073,7 @@ pub(crate) fn run_init_interactive(
                     bitty_config::types::DEFAULT_DECORATION_GAPS_OUT_PX,
                 )
             },
+            &mut history,
         )?,
     };
     let border = match overrides.border {
@@ -702,6 +1093,7 @@ pub(crate) fn run_init_interactive(
                     bitty_config::types::DEFAULT_DECORATION_BORDER_PX,
                 )
             },
+            &mut history,
         )?,
     };
     let radius = match overrides.radius {
@@ -721,6 +1113,7 @@ pub(crate) fn run_init_interactive(
                     bitty_config::types::DEFAULT_DECORATION_RADIUS_PX,
                 )
             },
+            &mut history,
         )?,
     };
     let _ = writeln!(output, "\nBehavior:");
@@ -734,6 +1127,7 @@ pub(crate) fn run_init_interactive(
                 bitty_config::types::TerminalConfig::default().scrollback
             ),
             init_parse_scrollback_answer,
+            &mut history,
         )?,
     };
     let close_confirm = match overrides.close_confirm {
@@ -746,6 +1140,7 @@ pub(crate) fn run_init_interactive(
              2) always — confirm every view/window close\n  \
              3) never — never confirm:",
             init_parse_close_confirm_answer,
+            &mut history,
         )?,
     };
     let key_preset = init_ask(
@@ -753,6 +1148,7 @@ pub(crate) fn run_init_interactive(
         output,
         "Keybindings [1 default / 2 vim]:\n  1) default — shipped Alt-as-Mod map (Alt+h/j/k/l, Alt+1..9, Alt+u/i)\n  2) vim — write that map explicitly (tweakable starting point):",
         init_parse_preset_answer,
+        &mut history,
     )?;
     Ok(InitAnswers {
         shell,

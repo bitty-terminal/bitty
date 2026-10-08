@@ -4691,6 +4691,186 @@ fn init_interactive_overrides_skip_prompts() {
     assert!(printed.contains("Keybindings"));
 }
 
+// -- `bitty init` wizard key parsing (#1805) ---------------------------------
+//
+// The wizard line reader decodes the terminal key tables (legacy xterm
+// `encode_named_key` sequences plus kitty `CSI u` frames) into editing
+// actions so raw `ESC [` bytes never land in answers.
+
+fn init_decode(raw: &[u8], history: &[String]) -> String {
+    crate::init::init_decode_line_bytes(raw, history)
+}
+
+#[test]
+fn init_wizard_left_arrow_moves() {
+    // `ab`, Left, `c` inserts before `b`.
+    assert_eq!(init_decode(b"ab\x1b[Dc", &[]), "acb");
+    // Application cursor (`SS3 D`) agrees.
+    assert_eq!(init_decode(b"ab\x1bODc", &[]), "acb");
+    // CSI with modifiers still moves.
+    assert_eq!(init_decode(b"ab\x1b[1;5Dc", &[]), "acb");
+    // At the left edge Left stays.
+    assert_eq!(init_decode(b"a\x1b[D\x1b[Dc", &[]), "ca");
+}
+
+#[test]
+fn init_wizard_right_arrow_moves() {
+    // `ab`, Left, Left, Right, `c` inserts in the middle.
+    assert_eq!(init_decode(b"ab\x1b[D\x1b[D\x1b[Cc", &[]), "acb");
+    // Application cursor (`SS3 C`) agrees.
+    assert_eq!(init_decode(b"ab\x1b[D\x1b[D\x1bOCc", &[]), "acb");
+    // At the right edge Right stays.
+    assert_eq!(init_decode(b"ab\x1b[Cc", &[]), "abc");
+}
+
+#[test]
+fn init_wizard_up_recalls_history_or_ignored() {
+    // Empty history: Up is a graceful no-op.
+    assert_eq!(init_decode(b"\x1b[A", &[]), "");
+    assert_eq!(init_decode(b"ab\x1b[A", &[]), "ab");
+    // Non-empty history: Up recalls the last answer.
+    let history = vec!["hello".to_string()];
+    assert_eq!(init_decode(b"\x1b[A", &history), "hello");
+    // Application cursor and modified CSI agree.
+    assert_eq!(init_decode(b"\x1bOA", &history), "hello");
+    assert_eq!(init_decode(b"\x1b[1;5A", &history), "hello");
+    // Two Ups walk back through two entries.
+    let history = vec!["first".to_string(), "second".to_string()];
+    assert_eq!(init_decode(b"\x1b[A\x1b[A", &history), "first");
+    // Typing after recall appends to the recalled buffer.
+    assert_eq!(init_decode(b"\x1b[A!", &history), "second!");
+}
+
+#[test]
+fn init_wizard_down_restores_or_ignored() {
+    // No prior Up in this line: Down stays.
+    let history = vec!["x".to_string()];
+    assert_eq!(init_decode(b"ab\x1b[B", &history), "ab");
+    assert_eq!(init_decode(b"\x1b[B", &[]), "");
+    // Up, Up, Down lands back on the newer entry.
+    let history = vec!["first".to_string(), "second".to_string()];
+    assert_eq!(init_decode(b"\x1b[A\x1b[A\x1b[B", &history), "second");
+    // Up then Down restores the saved in-progress buffer.
+    assert_eq!(init_decode(b"ab\x1b[A\x1b[B", &history), "ab");
+}
+
+#[test]
+fn init_wizard_del_deletes_at_cursor() {
+    // `ab`, Left, DEL removes `b`.
+    assert_eq!(init_decode(b"ab\x1b[D\x1b[3~", &[]), "a");
+    // Modified `CSI 3;5 ~` (Ctrl+DEL) still deletes.
+    assert_eq!(init_decode(b"ab\x1b[D\x1b[3;5~", &[]), "a");
+    // Kitty `CSI 3 u` agrees.
+    assert_eq!(init_decode(b"ab\x1b[D\x1b[3u", &[]), "a");
+    // DEL at the end of the buffer is a no-op.
+    assert_eq!(init_decode(b"ab\x1b[3~", &[]), "ab");
+    // Legacy `0x7f`/`0x08` delete before the cursor.
+    assert_eq!(init_decode(b"ab\x7fc", &[]), "ac");
+    assert_eq!(init_decode(b"ab\x08c", &[]), "ac");
+}
+
+#[test]
+fn init_wizard_ins_ignored() {
+    // INS never toggles or inserts: the surrounding text joins up.
+    assert_eq!(init_decode(b"ab\x1b[2~c", &[]), "abc");
+    assert_eq!(init_decode(b"ab\x1b[2;5~c", &[]), "abc");
+}
+
+#[test]
+fn init_wizard_home_moves_to_start() {
+    assert_eq!(init_decode(b"ab\x1b[Hc", &[]), "cab");
+    assert_eq!(init_decode(b"ab\x1b[1~c", &[]), "cab");
+    assert_eq!(init_decode(b"ab\x1b[7~c", &[]), "cab");
+    assert_eq!(init_decode(b"ab\x1bOHc", &[]), "cab");
+}
+
+#[test]
+fn init_wizard_end_moves_to_end() {
+    // `ab`, Left, Left, End, `c` appends.
+    assert_eq!(init_decode(b"ab\x1b[D\x1b[D\x1b[Fc", &[]), "abc");
+    assert_eq!(init_decode(b"ab\x1b[D\x1b[D\x1b[4~c", &[]), "abc");
+    assert_eq!(init_decode(b"ab\x1b[D\x1b[D\x1b[8~c", &[]), "abc");
+    assert_eq!(init_decode(b"ab\x1b[D\x1b[D\x1bOFc", &[]), "abc");
+}
+
+#[test]
+fn init_wizard_f1_ignored() {
+    // Legacy SS3, `CSI 11 ~`, and kitty `P` trailers all drop.
+    assert_eq!(init_decode(b"ab\x1bOPc", &[]), "abc");
+    assert_eq!(init_decode(b"ab\x1b[11~c", &[]), "abc");
+    assert_eq!(init_decode(b"ab\x1b[11;5~c", &[]), "abc");
+    assert_eq!(init_decode(b"ab\x1b[1Pc", &[]), "abc");
+}
+
+#[test]
+fn init_wizard_f2_ignored() {
+    assert_eq!(init_decode(b"ab\x1bOQc", &[]), "abc");
+    assert_eq!(init_decode(b"ab\x1b[12~c", &[]), "abc");
+    assert_eq!(init_decode(b"ab\x1b[12;5~c", &[]), "abc");
+    assert_eq!(init_decode(b"ab\x1b[1Qc", &[]), "abc");
+}
+
+#[test]
+fn init_wizard_raw_esc_never_in_answers() {
+    // Every listed key plus truncation/unknown/OSC/Alt leftovers: no
+    // `0x1b` byte survives decoding.
+    let cases: &[&[u8]] = &[
+        b"\x1b[A\x1b[B\x1b[C\x1b[D",
+        b"\x1bOA\x1bOB\x1bOC\x1bOD",
+        b"\x1b[3~\x1b[2~\x1b[H\x1b[F",
+        b"\x1bOH\x1bOF\x1bOP\x1bOQ",
+        b"\x1b[11~\x1b[12~\x1b[3u\x1b[A",
+        b"\x1b",
+        b"ab\x1b",
+        b"ab\x1bc",
+        b"ab\x1b[",
+        b"ab\x1b[99Zc",
+        b"ab\x1b]8;;http://example\x07c",
+        b"\x1b[200~pasted\x1b[201~",
+    ];
+    for raw in cases {
+        let out = init_decode(raw, &[]);
+        assert!(!out.contains('\x1b'), "raw ESC leaked for {raw:?}: {out:?}");
+    }
+    // Bare ESC drops; the following printable still inserts (Alt stripped).
+    assert_eq!(init_decode(b"ab\x1bc", &[]), "abc");
+    // Unknown CSI drops the whole sequence.
+    assert_eq!(init_decode(b"ab\x1b[99Zc", &[]), "abc");
+}
+
+#[test]
+fn init_wizard_kitty_csi_u_variants() {
+    // Kitty backspace deletes before the cursor.
+    assert_eq!(init_decode(b"ab\x1b[127uc", &[]), "ac");
+    // Kitty space inserts.
+    assert_eq!(init_decode(b"ab\x1b[D\x1b[32uc", &[]), "a cb");
+    // Kitty Enter submits: trailing bytes are discarded.
+    assert_eq!(init_decode(b"ab\x1b[13uIGNORED", &[]), "ab");
+    // Kitty Tab / ESC / F-keys drop gracefully.
+    assert_eq!(init_decode(b"ab\x1b[9uc", &[]), "abc");
+    assert_eq!(init_decode(b"ab\x1b[27uc", &[]), "abc");
+}
+
+#[test]
+fn init_wizard_arrows_edit_in_prompt() {
+    // End-to-end through one wizard prompt (font family): `ab`, Left,
+    // `c` answers `acb`, with no escape bytes in the stored answer.
+    let (result, _) = drive_init_wizard("\n\nab\x1b[Dc\n\n\n\n\n\n\n\n\n", Some("/bin/bash"), None);
+    let answers = result.expect("edited answer accepted");
+    assert_eq!(answers.font_family, "acb");
+    assert!(!answers.font_family.contains('\x1b'));
+}
+
+#[test]
+fn init_wizard_up_history_in_prompts() {
+    // `gaps_in` answers `10`; `gaps_out` presses Up to recall it.
+    let stdin = "\n\n\n\n10\n\x1b[A\n\n\n\n\n\n";
+    let (result, _) = drive_init_wizard(stdin, Some("/bin/bash"), None);
+    let answers = result.expect("history recall accepted");
+    assert_eq!(answers.gaps_in, 10);
+    assert_eq!(answers.gaps_out, 10);
+}
+
 #[test]
 fn init_render_default_and_vim() {
     let base = init_yes_defaults(Some("/bin/bash"));

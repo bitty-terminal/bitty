@@ -1,7 +1,7 @@
 .carryctx/config.local.toml
 .worktrees/
 /.trash/
-/recording/
+recording/
 /target/
 /m1-results/
 /compat-results/

@@ -373,9 +373,17 @@ fn random_op(
                 let moved = rt
                     .workspace_move_focused_to(target)
                     .expect("moving to a live other workspace must succeed");
+                // Issue #1803: move follows focus to the target, so the live
+                // layout now contains the moved leaf focused (a singleton
+                // source is removed instead of stranding empty).
                 assert!(
-                    rt.layout().find_leaf(moved).is_none(),
-                    "moved leaf left the source"
+                    rt.layout().find_leaf(moved).is_some(),
+                    "move follows focus to the target"
+                );
+                assert_eq!(
+                    rt.focused_view(),
+                    Some(moved),
+                    "moved leaf is focused after follow"
                 );
                 format!("workspace_move {moved:?} -> {target}")
             } else {
@@ -571,12 +579,11 @@ fn close_last_leaf_refuses_and_move_replaces_source_leaf() {
     rt.workspace_switch(0);
     let moved = rt.workspace_move_focused_to(ws2).expect("move");
     assert_eq!(moved, only, "move preserves the ViewId");
-    assert_eq!(
-        rt.layout().leaf_count(),
-        1,
-        "single-leaf source gets a fresh leaf"
-    );
-    assert_ne!(focused(&rt), moved, "the moved leaf left the source layout");
+    // Issue #1803: the singleton source is removed and focus follows to
+    // the target (no ghost empty workspace, no fresh idle leaf).
+    assert_eq!(rt.workspace_count(), 1, "empty source removed");
+    assert_eq!(rt.layout().leaf_count(), 2);
+    assert_eq!(focused(&rt), moved, "move follows focus");
     check_invariants(&mut rt, "move singles");
 }
 
@@ -645,6 +652,19 @@ fn closing_workspace_rehomes_moved_primary_owner() {
         .expect("the startup leaf owns the primary grid");
     assert_eq!(focused(&rt), owner, "startup focus owns the primary grid");
 
+    // Split ws1 so the source is multi-leaf; moving the owner keeps the
+    // source (with its survivor) and follows focus to ws2.
+    let survivor = rt.next_view_id_global();
+    let mut layout = rt.layout().clone();
+    assert!(split_leaf(
+        &mut layout,
+        owner,
+        survivor,
+        SplitAxis::Horizontal,
+        false
+    ));
+    rt.set_layout(layout);
+    assert!(rt.set_focus(owner));
     // Move the owner leaf out of ws1 into ws2.
     let ws2 = rt.workspace_new().expect("ws2");
     assert!(rt.workspace_switch(0));
@@ -656,14 +676,15 @@ fn closing_workspace_rehomes_moved_primary_owner() {
         Some(owner),
         "a move never re-homes the owner"
     );
+    assert_eq!(rt.active_workspace_index(), 1, "move follows focus");
+    assert_eq!(rt.workspace_count(), 2);
 
-    // Closing ws2 destroys the moved owner: re-home to the focused
-    // survivor of the active workspace.
+    // Switch back to the source, then close ws2 (inactive, destroys the
+    // moved owner): re-home to the focused survivor of the active
+    // workspace.
+    assert!(rt.workspace_switch(0));
     assert_eq!(rt.active_workspace_index(), 0);
-    assert_eq!(
-        rt.workspace_close_at(ws2).expect("close owner workspace"),
-        0
-    );
+    assert_eq!(rt.workspace_close_at(1).expect("close owner workspace"), 0);
     let rehomed = rt
         .primary_view()
         .expect("primary owner must never dangle on a dead id");

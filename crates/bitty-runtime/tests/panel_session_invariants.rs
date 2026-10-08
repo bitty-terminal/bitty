@@ -257,17 +257,22 @@ fn pane_grid_follows_move_promoted_sibling() {
     // A target workspace, then move the primary leaf out of the two-leaf
     // source: the surviving pane leaf is promoted to the full container, so
     // its grid must follow the enlarged content frame.
-    let ws2 = rt.workspace_new().expect("ws2");
+    let _ws2 = rt.workspace_new().expect("ws2");
     assert!(rt.workspace_switch(0));
     assert!(rt.set_focus(ViewId::new(1)));
     let moved = rt
-        .workspace_move_focused_to(ws2)
+        .workspace_move_focused_to(1)
         .expect("moving the primary leaf out must succeed");
     assert_eq!(moved, ViewId::new(1));
+    // Issue #1803: move follows focus to the target, so the live pair is
+    // now ws2 (moved + its original leaf). Switch back to the source to
+    // check the promoted survivor, then return to the target.
+    assert_eq!(rt.active_workspace_index(), 1, "move follows focus");
+    assert!(rt.workspace_switch(0));
     assert_eq!(rt.layout().leaf_ids(), vec![pane], "the pane leaf survives");
     tick_and_check(&mut rt, "source after move");
 
-    assert!(rt.workspace_switch(ws2));
+    assert!(rt.workspace_switch(1));
     tick_and_check(&mut rt, "target after move");
 }
 

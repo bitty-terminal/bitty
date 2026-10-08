@@ -1436,10 +1436,12 @@ impl TerminalApp {
                 }
             }
             A::WorkspaceMove(n) => {
-                // CTX-0259 (DEC-0034 follow-through): reparent the focused
-                // leaf into workspace N. Never kills, never removes a slot;
-                // invalid N warns fail-closed. Zoom restores first so the
-                // move operates on the real tiled tree, not the zoom proxy.
+                // CTX-0259 (DEC-0034 follow-through, issue #1803): reparent
+                // the focused leaf into workspace N and follow focus to the
+                // target; a single-leaf source is removed so no empty
+                // workspace strands behind. Never kills; invalid N warns
+                // fail-closed. Zoom restores first so the move operates on
+                // the real tiled tree, not the zoom proxy.
                 self.restore_zoom();
                 match self.runtime.workspace_move_focused_to_one_based(n) {
                     Ok((moved, from, to)) => eprintln!(
@@ -4239,8 +4241,9 @@ mod tests {
 
     #[test]
     fn chrome_workspace_move_reparents_focused_leaf() {
-        // CTX-0259: Mod+Shift+Number through the chrome arms reparents the
-        // focused leaf (no kill, no switch, last-workspace guard holds).
+        // CTX-0259 + issue #1803: Mod+Shift+Number through the chrome arms
+        // reparents the focused leaf and follows focus to the target (a
+        // singleton source is removed, never kept as a ghost).
         use bitty_config::ChromeAction;
         let mut app = workspace_test_app();
         app.apply_chrome_action(ChromeAction::WorkspaceNew);
@@ -4261,13 +4264,17 @@ mod tests {
         assert!(app.runtime.set_focus(moved_id));
         app.apply_chrome_action(ChromeAction::WorkspaceMove(2));
         assert_eq!(app.runtime.workspace_count(), 2);
-        assert_eq!(app.runtime.active_workspace_index(), 0);
-        assert_eq!(app.runtime.layout().leaf_count(), 1);
+        assert_eq!(
+            app.runtime.active_workspace_index(),
+            1,
+            "move follows focus"
+        );
+        assert_eq!(app.runtime.layout().leaf_count(), 2);
         assert!(!app.runtime.has_pending_ws_close());
-        assert!(app.runtime.workspace_switch(1));
         assert!(app.runtime.layout().leaf_ids().contains(&moved_id));
         assert_eq!(app.runtime.focused_view(), Some(moved_id));
-        // Auto-creates missing target workspace N (CTX-0945).
+        // Auto-creates missing target workspace N (CTX-0945) and follows
+        // focus there too.
         app.apply_chrome_action(ChromeAction::WorkspaceMove(9));
         assert_eq!(app.runtime.workspace_count(), 3);
         assert_eq!(
@@ -5738,7 +5745,8 @@ mod tests {
         // chord `shift+alt+2`. Before the base-key fallback the press matched
         // nothing: no pane moved AND the symbol leaked to the PTY as shell
         // input. Through the real intercept the gesture now reparents the
-        // focused leaf into the target workspace without switching.
+        // focused leaf into the target workspace and follows focus there
+        // (issue #1803).
         let mut app = workspace_test_app();
         assert!(drive_mod_char(&mut app, "t", false, true, false, false));
         assert_eq!(app.runtime.workspace_count(), 2);
@@ -5772,19 +5780,25 @@ mod tests {
         assert_eq!(
             app.runtime.workspace_count(),
             2,
-            "move never removes a slot"
+            "multi-leaf move keeps the source slot"
         );
         assert_eq!(
             app.runtime.active_workspace_index(),
-            0,
-            "move reparents; it never switches the active workspace"
+            1,
+            "move follows focus to the target workspace"
         );
-        assert_eq!(app.runtime.layout().leaf_count(), 1, "ws1 promoted a leaf");
-        // The moved pane is in ws2, focused, with its id intact.
-        assert!(drive_mod_char(&mut app, "2", false, true, false, false));
-        assert_eq!(app.runtime.active_workspace_index(), 1);
+        assert_eq!(
+            app.runtime.layout().leaf_count(),
+            2,
+            "target holds moved leaf"
+        );
+        // The moved pane is in the now-active ws2, focused, with its id intact.
         assert!(app.runtime.layout().leaf_ids().contains(&moved));
         assert_eq!(app.runtime.focused_view(), Some(moved));
+        // Switching back to ws1 shows the promoted survivor.
+        assert!(drive_mod_char(&mut app, "1", false, true, false, false));
+        assert_eq!(app.runtime.active_workspace_index(), 0);
+        assert!(!app.runtime.layout().leaf_ids().contains(&moved));
         // Every digit's shifted symbol folds the same way (1..=9).
         let symbols = ["!", "@", "#", "$", "%", "^", "&", "*", "("];
         for (index, symbol) in symbols.iter().enumerate() {
@@ -5798,8 +5812,8 @@ mod tests {
                 "no byte leak for {symbol}"
             );
             assert!(
-                app.runtime.workspace_count() >= 2,
-                "Mod+Shift+{one_based} never removes a workspace"
+                app.runtime.workspace_count() >= 1,
+                "Mod+Shift+{one_based} keeps the >= 1 invariant (singleton sources are removed)"
             );
         }
         // Same gesture under the Super flip (`mod_key = "super"`).
@@ -5862,7 +5876,7 @@ mod tests {
         assert_eq!(app.runtime.active_workspace_index(), 1);
         assert_eq!(app.runtime.focused_view(), Some(ws2_leaf));
         // Physical Mod+Shift+1 (reported `!`): ws2's pane moves into ws1 with
-        // its session, without switching away from ws2.
+        // its session and follows focus to ws1 (issue #1803).
         assert!(drive_mod_char(&mut app, "!", false, true, true, false));
         assert!(
             app.runtime.drain_pending_input().is_empty(),
@@ -5870,8 +5884,8 @@ mod tests {
         );
         assert_eq!(
             app.runtime.active_workspace_index(),
-            1,
-            "the move reparents, it never switches"
+            0,
+            "the move follows focus to the target"
         );
         assert!(drive_mod_char(&mut app, "1", false, true, false, false));
         assert!(

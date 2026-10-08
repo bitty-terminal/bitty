@@ -1838,9 +1838,10 @@ fn control_workspace_list_ids_roundtrip_across_sequence_gap() {
 
 #[test]
 fn control_workspace_move_headless_no_elevation() {
-    // CTX-0259 parity: `workspace move ws:N` rides view.manage (no
-    // elevation), reparents the focused leaf, and fails closed on
-    // unknown targets with no partial state.
+    // CTX-0259 parity + issue #1803: `workspace move ws:N` rides
+    // view.manage (no elevation), reparents the focused leaf, follows focus
+    // to the target, and fails closed on unknown targets with no partial
+    // state.
     use bitty_runtime::{LayoutNode, SplitAxis, View, ViewId};
     let mut rt = headless_runtime();
     let cli = bitty_ipc::ScopeSet::cli_default();
@@ -1877,15 +1878,17 @@ fn control_workspace_move_headless_no_elevation() {
     assert!(done.result_json.contains("\"to\":\"ws:2\""));
     assert!(done.result_json.contains("\"moved\":\"v:50\""));
     assert_eq!(rt.workspace_count(), 2);
-    assert_eq!(rt.active_workspace_index(), 0);
-    assert_eq!(rt.layout().leaf_count(), 1);
+    assert_eq!(rt.active_workspace_index(), 1, "move follows focus");
+    assert_eq!(rt.layout().leaf_count(), 2);
+    assert!(rt.layout().leaf_ids().contains(&moved_id));
+    assert_eq!(rt.focused_view(), Some(moved_id));
     // Unknown target is NotFound (no partial state).
     let bad = ipc_ctl::params_workspace("ws:9");
     let missing = apply_control_envelope(&mut rt, ipc_ctl::METHOD_MOVE_WORKSPACE, Some(&bad), &cli);
     assert!(!missing.ok);
     assert_eq!(missing.code, "NotFound");
     assert_eq!(rt.workspace_count(), 2);
-    assert_eq!(rt.layout().leaf_count(), 1);
+    assert_eq!(rt.layout().leaf_count(), 2);
 }
 
 #[test]

@@ -505,24 +505,46 @@ impl Runtime {
         // that pane. A selection whose owner is no longer live is dropped by
         // the fail-closed guard.
         if let Some(sel) = self.selection_state {
-            match self.live_view_state(sel.owner) {
-                Some(state) => {
-                    let snap = state.snapshot();
-                    let clamped = sel.selection.clamped(&snap).snapped(Some(&snap));
-                    if clamped.is_empty() {
-                        self.drop_selection();
-                    } else {
-                        // Keep the drag pin in bounds for future word/line
-                        // extension.
-                        let max_row = snap.height.saturating_sub(1) as u16;
-                        let max_col = snap.width.saturating_sub(1) as u16;
-                        let pin = sel
-                            .anchor_press
-                            .map(|pin| CellPos::new(pin.row.min(max_row), pin.col.min(max_col)));
-                        self.install_selection(sel.owner, clamped, pin, sel.dragging);
+            // CTX-1021 (#1807): a scrolled owner addresses the viewport
+            // composite, so reclamp against it (not the live grid) to keep a
+            // scrolled drag inside the visible window after reflow.
+            if self.is_viewport_scrolled(sel.owner) {
+                match self.viewport_snapshot_for(sel.owner) {
+                    Some(viewport) => {
+                        let clamped = sel.selection.clamped(&viewport).snapped(Some(&viewport));
+                        if clamped.is_empty() {
+                            self.drop_selection();
+                        } else {
+                            let max_row = viewport.height.saturating_sub(1) as u16;
+                            let max_col = viewport.width.saturating_sub(1) as u16;
+                            let pin = sel.anchor_press.map(|pin| {
+                                CellPos::new(pin.row.min(max_row), pin.col.min(max_col))
+                            });
+                            self.install_selection(sel.owner, clamped, pin, sel.dragging);
+                        }
                     }
+                    None => self.drop_selection(),
                 }
-                None => self.drop_selection(),
+            } else {
+                match self.live_view_state(sel.owner) {
+                    Some(state) => {
+                        let snap = state.snapshot();
+                        let clamped = sel.selection.clamped(&snap).snapped(Some(&snap));
+                        if clamped.is_empty() {
+                            self.drop_selection();
+                        } else {
+                            // Keep the drag pin in bounds for future word/line
+                            // extension.
+                            let max_row = snap.height.saturating_sub(1) as u16;
+                            let max_col = snap.width.saturating_sub(1) as u16;
+                            let pin = sel.anchor_press.map(|pin| {
+                                CellPos::new(pin.row.min(max_row), pin.col.min(max_col))
+                            });
+                            self.install_selection(sel.owner, clamped, pin, sel.dragging);
+                        }
+                    }
+                    None => self.drop_selection(),
+                }
             }
         }
         // Search UI integration (CTX-0061): clamp matches to new geometry; refresh

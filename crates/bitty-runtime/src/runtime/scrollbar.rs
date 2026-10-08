@@ -280,9 +280,25 @@ impl Runtime {
         let thumb_y = pos.y - f64::from(track.y) - drag.grab_offset_px;
         let offset =
             bitty_ui::scrollbar::offset_for_thumb_y(thumb_y, track.height, thumb.height, sb_len);
+        let old_offset = self
+            .layout
+            .find_leaf(view)
+            .map_or(0, |leaf| leaf.scroll_offset());
         if let Some(v) = self.layout.find_leaf_mut(view) {
             let cur = v.scroll_offset();
             v.scroll_by(offset as isize - cur as isize, sb_len);
+        }
+        let new_offset = self
+            .layout
+            .find_leaf(view)
+            .map_or(old_offset, |leaf| leaf.scroll_offset());
+        // CTX-1021 (#1807): a scrollbar drag moves the viewport under a
+        // committed scrolled selection — shift its viewport rows so the
+        // highlight scrolls with its buffer content. (A selection drag cannot
+        // coexist: the press routed exclusively.)
+        let delta = new_offset as isize - old_offset as isize;
+        if delta != 0 {
+            self.shift_selection_for_scroll(view, delta);
         }
         self.pending_full_redraw = true;
         true

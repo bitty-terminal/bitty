@@ -412,7 +412,7 @@ dependencies = [
 [[package]]
 name = "bitty-url-detector"
 version = "0.0.1"
-source = "git+https://github.com/bitty-terminal/bitty-url-detector?rev=5c65773#5c6577312e311b7037b5d64ac3d2665d844fa42b"
+source = "git+https://github.com/bitty-terminal/bitty-url-detector?rev=d211490#d211490efba42276244668bb029733dbbcc56cdd"
 
 [[package]]
 name = "bitty-vt"

@@ -51,7 +51,7 @@ bitty-network-wire = { git = "https://github.com/bitty-terminal/bitty-network", 
 # `std` only) into the same `ValidatedUrl` + `ActivationGesture` pipeline as
 # OSC 8. No crates.io release yet, so the same git-rev pin convention as
 # `bitty-ipc` / `bitty-network-wire` applies (7-char short SHA).
-bitty-url-detector = { git = "https://github.com/bitty-terminal/bitty-url-detector", rev = "5c65773" }
+bitty-url-detector = { git = "https://github.com/bitty-terminal/bitty-url-detector", rev = "d211490" }
 # CTX-1008 (#1763, OQ-076): Core consumes the platform notification bridge
 # for the defensive second rate cap. Same exact-rev pin pattern as
 # `bitty-ipc` / `bitty-network-wire`: the bridge receives an already-gated

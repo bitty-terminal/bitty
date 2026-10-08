@@ -1531,6 +1531,71 @@ fn control_help_names_exact_elevation_verbs() {
 }
 
 #[test]
+fn control_help_documents_windows_degradation() {
+    // Issue #1800: `bitty ctl --help` must state the documented
+    // degradation so Windows users learn the exit-6 shape up front.
+    let help = ctl_help_text();
+    assert!(
+        help.contains("Windows serving is unavailable"),
+        "help must name the Windows degradation, got {help:?}"
+    );
+    assert!(
+        help.contains("named-pipe transport"),
+        "help must name the missing transport, got {help:?}"
+    );
+    assert!(
+        help.contains("instance list") && help.contains("local discovery"),
+        "help must scope instance list as discovery-only, got {help:?}"
+    );
+    assert!(
+        help.contains("no live instance"),
+        "help must distinguish the no-target Windows case, got {help:?}"
+    );
+}
+
+#[test]
+fn windows_ctl_degradation_message_is_actionable() {
+    // Issue #1800 detect-and-advise, tested on every platform: the
+    // Windows message names the missing transport and the surviving
+    // discovery verb; the generic message stays fail-soft.
+    let windows = super::client::windows_ctl_unavailable_message();
+    assert!(
+        windows.contains("unavailable on Windows"),
+        "Windows ctl message must name the platform: {windows:?}"
+    );
+    assert!(
+        windows.contains("named-pipe"),
+        "Windows ctl message must name the pipe future: {windows:?}"
+    );
+    assert!(
+        windows.contains("instance list"),
+        "Windows ctl message must keep discovery advice: {windows:?}"
+    );
+    let generic = super::client::generic_ctl_unavailable_message();
+    assert!(
+        generic.contains("unavailable on this platform"),
+        "generic ctl message must stay fail-soft: {generic:?}"
+    );
+}
+
+#[cfg(not(unix))]
+#[test]
+fn degraded_platform_ctl_roundtrip_reports_unavailable() {
+    // Runs on the Windows CI leg: every IPC verb fails closed with the
+    // documented degradation text (exit 6 at the caller).
+    let err = super::client::ctl_roundtrip("unused", "bitty.debug/ping", None, 0)
+        .expect_err("degraded platform never round-trips");
+    assert!(
+        err.contains("unavailable"),
+        "degraded ctl error must read unavailable: {err:?}"
+    );
+    assert!(
+        err.contains("instance list"),
+        "degraded ctl error must keep discovery advice: {err:?}"
+    );
+}
+
+#[test]
 fn control_workspace_list_new_focus_close_headless() {
     // CTX-0257 entry over the control plane: list pins the query fields,
     // new/focus ride view.manage (no elevation), close needs elevation

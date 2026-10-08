@@ -162,6 +162,10 @@ fn discover_live_sockets(xdg_runtime_dir: Option<&str>, uid: u32) -> Vec<Resolve
 }
 
 /// Non-unix: no socket discovery (single-platform servo is unix-only).
+///
+/// Issue #1800: Windows has no serving endpoint yet, so discovery is
+/// always empty there; callers surface the usual exit-6 ambiguity text
+/// and `ctl_roundtrip` reports the documented degradation below.
 #[cfg(not(unix))]
 fn discover_live_sockets(_xdg_runtime_dir: Option<&str>, _uid: u32) -> Vec<ResolvedTarget> {
     Vec::new()
@@ -192,7 +196,10 @@ pub struct CtlIpcOutcome {
 
 /// Connect, send one framed request, read one framed response.
 ///
-/// Unix-only (the servo is unix-only); non-unix returns unavailable.
+/// Unix-only (the servo is unix-only); non-unix returns unavailable (issue
+/// #1800: Windows named-pipe transport not yet implemented, so every IPC
+/// verb fails closed with exit 6 while `instance list` stays local
+/// discovery only).
 /// Time-bounded (`ipc_ctl::CTL_CLIENT_TIMEOUT` read timeout, which outlives
 /// the server-side reply wait by a fixed grace, and `ipc_ctl::CTL_TIMEOUT`
 /// write timeout) so a dead peer cannot hang the CLI.
@@ -263,17 +270,49 @@ pub fn ctl_roundtrip(
     parse_ctl_response(&payload)
 }
 
-/// Non-unix stub: the servo never serves here.
-#[cfg(not(unix))]
+/// Windows degradation message for `bitty ctl` IPC verbs (issue #1800).
+///
+/// Detect-and-advise text shared by the Windows stub below and the
+/// all-platform unit tests. Kept alive on Unix builds for the Windows
+/// `-D warnings` cross-check.
+#[allow(dead_code)]
+pub(crate) fn windows_ctl_unavailable_message() -> String {
+    String::from(
+        "bitty ctl: IPC control is unavailable on Windows (named-pipe transport not yet implemented; `bitty ctl instance list` stays local discovery only, other verbs need a Unix instance with IPC serving)",
+    )
+}
+
+/// Non-Windows, non-Unix degradation message (same fail-soft shape).
+///
+/// Kept alive on Unix/Windows builds for the cross-check and the
+/// all-platform unit tests.
+#[allow(dead_code)]
+pub(crate) fn generic_ctl_unavailable_message() -> String {
+    String::from(
+        "bitty ctl: IPC control is unavailable on this platform (serving is Unix-only; `bitty ctl instance list` stays local discovery only)",
+    )
+}
+
+/// Windows stub: the servo never serves here yet (issue #1800).
+#[cfg(windows)]
 pub fn ctl_roundtrip(
     _socket_path: &str,
     _method: &str,
     _params: Option<&str>,
     _runtime_uid: u32,
 ) -> Result<CtlIpcOutcome, String> {
-    Err(String::from(
-        "bitty ctl: IPC control requires a unix platform",
-    ))
+    Err(windows_ctl_unavailable_message())
+}
+
+/// Non-Windows, non-Unix stub: the servo never serves here.
+#[cfg(not(any(unix, windows)))]
+pub fn ctl_roundtrip(
+    _socket_path: &str,
+    _method: &str,
+    _params: Option<&str>,
+    _runtime_uid: u32,
+) -> Result<CtlIpcOutcome, String> {
+    Err(generic_ctl_unavailable_message())
 }
 
 /// Connect to `socket_path` and re-bind the live stream to the endpoint

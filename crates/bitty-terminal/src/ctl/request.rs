@@ -262,12 +262,18 @@ pub fn ctl_help_text() -> String {
          \n\
          Targeting (precedence: --socket, --instance, BITTY_SOCKET/BITTY_INSTANCE_ID,\n\
          \x20 exactly-one-live fallback, else ambiguity error exit 6):\n  \
-           --socket PATH    Explicit IPC socket; bypasses discovery\n  \
-           --instance ID    Explicit instance (1..=64 [a-z0-9_-]); resolved via discovery\n  \
-           --format SHAPE   Output shape: table|json|jsonl (default table)\n  \
-           -h, --help       Print this help and exit (never needs an instance)\n\
-         \n\
-         Verbs (each maps to one registry executable; scopes enforced server-side):\n  \
+            --socket PATH    Explicit IPC socket; bypasses discovery\n  \
+            --instance ID    Explicit instance (1..=64 [a-z0-9_-]); resolved via discovery\n  \
+            --format SHAPE   Output shape: table|json|jsonl (default table)\n  \
+            -h, --help       Print this help and exit (never needs an instance)\n\
+          \n\
+          Platform (issue #1800): IPC verbs need a live instance with IPC\n  \
+            serving (Unix only; Windows serving is unavailable until a\n  \
+            named-pipe transport lands. With an explicit target, verbs\n  \
+            report unavailable with exit 6; without a target, they report\n  \
+            no live instance. `instance list` stays local discovery only).\n\
+          \n\
+          Verbs (each maps to one registry executable; scopes enforced server-side):\n  \
             instance list                 Local discovery (no IPC; same-UID sockets only)\n  \
             window list                   core.window.list (view.inspect)\n  \
             view list                     core.view.list (view.inspect)\n  \

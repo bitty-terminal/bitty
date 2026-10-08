@@ -1,27 +1,41 @@
-//! `Runtime` — Kitty graphics display routing (CTX-0248, W-141).
+//! `Runtime` — Kitty graphics display routing (issue #1802).
 //!
-//! Split from `super` (`runtime.rs`) as a pure addition: the intake stub
-//! ([`bitty_rich::KittyGraphicsStub`]) holds bounded wire payloads, and the
-//! VT parser still treats `APC G` as inert until this seam, so this module
-//! is the minimal routing seam that turns a completed transmission's
+//! Split from `super` (`runtime.rs`) as a pure addition: the VT parser
+//! still pre-scans `APC G`, base64-unwraps, and reassembles `m=` chunks
+//! under the ledger cap, and this module turns a completed transmission's
 //! parameters plus payload bytes into a stored image and, for display
-//! actions, a cursor-anchored placement. Full `APC G` parser wiring is
-//! follow-up work; callers pass the already-parsed `f`/`s`/`v`/`a`/`c`/`r`
-//! values.
+//! actions, a cursor-anchored placement.
 //!
-//! W-141 extraction: the bounded decoder moved to the `bitty-graphics`
-//! extension crate and the Core-to-extension call shape is not wired yet
-//! (no Core-to-extension dependency allowed). Transmit entry points therefore
-//! run the Core-retained declared-size pre-check
-//! ([`bitty_rich::precheck_declared_image`], P0-AC-003: refusals before any
-//! large allocation) and then fail closed with
-//! [`bitty_rich::KittyPrecheckError::DecoderUnavailable`]: valid payloads
-//! store nothing and place nothing until the wiring task lands. Rejection
-//! behavior for hostile declarations is unchanged and tested; placement
-//! policy (admission, eviction, origin tagging, alternate-screen
-//! suppression) is untouched and stays unit-tested in `bitty-rich`.
+//! Core owns the bounded decode ([`bitty_rich::kitty_decode`]: PNG via the
+//! `image` codec edge, raw RGB/RGBA inline; 8192 px/side, 4096 x 4096 px
+//! area, 64 MiB RGBA) and the raster step ([`bitty_rich::kitty_raster`]:
+//! uncached nearest-neighbor; the `bitty-graphics` extension holds its own
+//! copies plus a raster cache, and Core never depends on extension
+//! internals). Placement policy (admission, eviction, origin tagging,
+//! alternate-screen suppression) is unchanged and unit-tested in
+//! `bitty-rich`.
 //!
+//! Display anchors at the drained stream's cursor cell (the primary grid,
+//! or the pane session swapped in by `handle_pane_bytes`) with that
+//! grid's `State::scrollback_len()` as the scroll base (images scroll with
+//! content; see [`bitty_rich::kitty_place`]). The placement keeps the
+//! stream's origin token so the present layer confines it to its own leaf
+//! (CTX-0254). While the alternate screen is active, transmissions decode
+//! and store but never place (fail closed, same shape as transmit-only).
 //!
+//! Cell reservation (issue #1802, second bug): a successful display
+//! advances the cursor past the placement span (unless `C=1`), so
+//! subsequently printed text starts after the image instead of over it;
+//! at present time images composite topmost over grid cells. Grid truth
+//! itself is never mutated for images (placement records live in the
+//! image layer, not in cells), except for app-emitted `U+10EEEE`
+//! placeholder runs, which occupy ordinary cells by design.
+//!
+//! Still deferred (blocked, recorded in the PR body): `a=p` virtual
+//! (`U=1`) store bookkeeping beyond the grid-cell runs, animation
+//! (`a=f`/`a=a`/`a=c`), queries (`a=q`), local mediums (`t=f`/`t=t`/`t=s`
+//! file reads), per-origin store quotas, the raster cache, and
+//! cursor-on-top compositing.//!
 //! Display anchors at the drained stream's cursor cell (the primary grid,
 //! or the pane session swapped in by `handle_pane_bytes`) with that
 //! grid's `State::scrollback_len()` as the scroll base (images scroll with
@@ -49,11 +63,10 @@ use super::*;
 pub enum KittyImageError {
     /// Wire `f=` value maps to no supported format (never guessed).
     UnknownFormat(u32),
-    /// Core pre-check refused the declared payload, or the payload passed
-    /// pre-check but Core holds no codec (W-141: decoder moved to the
-    /// `bitty-graphics` extension, wiring pending). No bitmap, no placement.
+    /// The Core pre-check refused the declared payload, or the Core-owned
+    /// decoder refused the bytes. No bitmap, no placement.
     Decode(bitty_rich::KittyPrecheckError),
-    /// Placement admission refused an otherwise decoded image.
+    /// Store/placement admission refused an otherwise decoded image.
     Placement(bitty_rich::KittyPlacementError),
 }
 
@@ -113,11 +126,8 @@ impl Runtime {
     /// Image blits composited on the last presented frame (CTX-0252 F2).
     ///
     /// Latched on every successful present; idle ticks leave it unchanged.
-    /// Bound by [`bitty_rich::KITTY_PRESENT_MAX_BLITS_PER_FRAME`]. The
-    /// raster cache that used to feed these blits moved to the
-    /// `bitty-graphics` extension (W-141), so Core latches `0` until the
-    /// wiring task lands; image and placement counts above stay
-    /// headless-observable.
+    /// Bound by [`bitty_rich::KITTY_PRESENT_MAX_BLITS_PER_FRAME`]. Image
+    /// and placement counts above stay headless-observable alongside it.
     #[must_use]
     pub fn kitty_last_frame_images(&self) -> usize {
         self.kitty_last_frame_images
@@ -138,23 +148,23 @@ impl Runtime {
         primary + panes
     }
 
-    /// Pre-checks a Kitty payload without storing it (W-141 stub).
+    /// Decodes and stores a Kitty payload without placing it.
     ///
     /// `format_f` is the wire `f=` value (`100` PNG, `24` RGB, `32` RGBA);
     /// `width_s`/`height_v` are the wire `s`/`v` dimensions (required for
     /// raw formats, ignored for PNG). The Core-retained declared-size
     /// pre-check ([`bitty_rich::precheck_declared_image`]) runs before any
-    /// allocation; the bounded codec itself moved to the `bitty-graphics`
-    /// extension and is not wired yet, so admissible payloads fail closed
-    /// with [`bitty_rich::KittyPrecheckError::DecoderUnavailable`] instead
-    /// of storing.
+    /// allocation; the Core-owned decoder ([`bitty_rich::kitty_decode`])
+    /// then produces the RGBA8 bitmap the image layer stores under the
+    /// store caps (FIFO eviction).
     ///
     /// # Errors
     ///
     /// [`KittyImageError::UnknownFormat`] for unsupported `f=` values,
-    /// [`KittyImageError::Decode`] for empty, underspecified, or oversize
-    /// declarations (before allocation) and for every admissible payload
-    /// (decoder unavailable). Failures store nothing.
+    /// [`KittyImageError::Decode`] for empty, underspecified, oversize,
+    /// length-mismatched, or malformed payloads (before allocation where
+    /// the bound allows), [`KittyImageError::Placement`] when the decoded
+    /// bitmap exceeds the layer caps. Failures store nothing.
     pub fn kitty_transmit_image(
         &mut self,
         format_f: u32,
@@ -164,21 +174,19 @@ impl Runtime {
         _compressed_len: usize,
     ) -> Result<bitty_rich::KittyImageId, KittyImageError> {
         Self::precheck_transmit(format_f, width_s, height_v, payload.len())?;
-        Err(KittyImageError::Decode(
-            bitty_rich::KittyPrecheckError::DecoderUnavailable,
-        ))
+        let decoded = bitty_rich::decode_kitty_payload(format_f, width_s, height_v, payload)
+            .map_err(|err| KittyImageError::Decode(bitty_rich::KittyPrecheckError::from(err)))?;
+        let compressed_len = payload.len();
+        self.kitty_images
+            .store(decoded.width, decoded.height, decoded.rgba, compressed_len)
+            .map_err(KittyImageError::Placement)
     }
 
-    /// Pre-checks a Kitty image with owned payload (W-141 stub).
+    /// Decodes and stores a Kitty image with owned payload.
     ///
-    /// Same behavior as [`Self::kitty_transmit_image`]; the owned buffer is
-    /// dropped undisturbed. The zero-copy fast path moved to the extension
-    /// with the decoder.
-    ///
-    /// W-141: `payload` stays boxed so the signature (and the `pty.rs` live
-    /// caller) is unchanged for the wiring task; only the length is
-    /// pre-checked today.
-    #[allow(clippy::boxed_local)]
+    /// Same behavior as [`Self::kitty_transmit_image`]; the owned buffer
+    /// moves into the stored bitmap without copying for `f=32` (and
+    /// expands in place for `f=24`).
     pub fn kitty_transmit_image_owned(
         &mut self,
         format_f: u32,
@@ -187,10 +195,15 @@ impl Runtime {
         payload: Box<[u8]>,
         _compressed_len: usize,
     ) -> Result<bitty_rich::KittyImageId, KittyImageError> {
-        Self::precheck_transmit(format_f, width_s, height_v, payload.len())?;
-        Err(KittyImageError::Decode(
-            bitty_rich::KittyPrecheckError::DecoderUnavailable,
-        ))
+        let wire_len = payload.len();
+        Self::precheck_transmit(format_f, width_s, height_v, wire_len)?;
+        let decoded = bitty_rich::kitty_decode::decode_kitty_payload_owned(
+            format_f, width_s, height_v, payload,
+        )
+        .map_err(|err| KittyImageError::Decode(bitty_rich::KittyPrecheckError::from(err)))?;
+        self.kitty_images
+            .store(decoded.width, decoded.height, decoded.rgba, wire_len)
+            .map_err(KittyImageError::Placement)
     }
 
     /// Shared wire-format admission + declared-size pre-check.
@@ -213,11 +226,8 @@ impl Runtime {
             .map_err(KittyImageError::Decode)
     }
 
-    /// Pre-checks, then (once wired) stores and — for display actions
-    /// outside the alternate screen — places a Kitty image at the primary
-    /// cursor cell (W-141 stub: transmit always fails closed, so the
-    /// placement policy below is currently unreachable; it stays verbatim
-    /// for the wiring task).
+    /// Decodes, stores and — for display actions outside the alternate
+    /// screen — places a Kitty image at the drained cursor cell.
     ///
     /// `action_a` is the wire `a=` value (`None` when absent, which means
     /// transmit-and-display per the kitty specification); `cols_c`/`rows_r`
@@ -300,34 +310,13 @@ impl Runtime {
         // dimensions (what was actually rendered), not the requested spans which
         // may be zero when omitted.
         if cursor_movement_c != 1 {
-            // Retrieve the actual placement to get effective dimensions
-            let placement = self
-                .kitty_images
-                .get_placement(placement_id)
-                .expect("placement just created must exist");
-
-            let effective_cols = if cols_c > 0 { cols_c } else { placement.cols };
-            let effective_rows = if rows_r > 0 { rows_r } else { placement.rows };
-            let new_col = cursor.col.saturating_add(effective_cols);
-            let target_row = cursor.row.saturating_add(effective_rows);
-            let max_row = (self.state.height() as u16).saturating_sub(1);
-            if target_row > max_row {
-                let overflow = target_row - max_row;
-                for _ in 0..overflow {
-                    self.state.apply(&bitty_vt::TerminalAction::PrintControl(
-                        bitty_vt::ControlChar(0x0A),
-                    ));
-                }
-                self.state.apply(&bitty_vt::TerminalAction::CursorPosition {
-                    row: bitty_vt::Row(max_row),
-                    col: bitty_vt::Col(new_col),
-                });
-            } else {
-                self.state.apply(&bitty_vt::TerminalAction::CursorPosition {
-                    row: bitty_vt::Row(target_row),
-                    col: bitty_vt::Col(new_col),
-                });
-            }
+            self.advance_cursor_past_placement(
+                cursor.col,
+                cursor.row,
+                cols_c,
+                rows_r,
+                placement_id,
+            );
         }
 
         Ok(KittyDisplayOutcome::Displayed {
@@ -336,12 +325,57 @@ impl Runtime {
         })
     }
 
-    /// Pre-checks, then (once wired) stores and places a Kitty image with
-    /// owned payload (W-141 stub: see [`Self::kitty_display_image`]).
+    /// Moves the cursor past the placement span after a display.
+    ///
+    /// Cell math is 0-based; the [`bitty_vt::TerminalAction::CursorPosition`]
+    /// action is 1-based `CUP`, so the targets shift up by one here
+    /// (saturating; the state machine clamps to the grid anyway). Without
+    /// the shift the cursor lands one cell too early and the next printed
+    /// text overlaps the image's last column/row (issue #1802).
+    fn advance_cursor_past_placement(
+        &mut self,
+        cursor_col: u16,
+        cursor_row: u16,
+        cols_c: u16,
+        rows_r: u16,
+        placement_id: bitty_rich::KittyPlacementId,
+    ) {
+        // Retrieve the actual placement to get effective dimensions.
+        let placement = self
+            .kitty_images
+            .get_placement(placement_id)
+            .expect("placement just created must exist");
+
+        let effective_cols = if cols_c > 0 { cols_c } else { placement.cols };
+        let effective_rows = if rows_r > 0 { rows_r } else { placement.rows };
+        let new_col = cursor_col.saturating_add(effective_cols);
+        let target_row = cursor_row.saturating_add(effective_rows);
+        let max_row = u16::try_from(self.state.height())
+            .unwrap_or(u16::MAX)
+            .saturating_sub(1);
+        if target_row > max_row {
+            let overflow = target_row - max_row;
+            for _ in 0..overflow {
+                self.state.apply(&bitty_vt::TerminalAction::PrintControl(
+                    bitty_vt::ControlChar(0x0A),
+                ));
+            }
+            self.state.apply(&bitty_vt::TerminalAction::CursorPosition {
+                row: bitty_vt::Row(max_row.saturating_add(1)),
+                col: bitty_vt::Col(new_col.saturating_add(1)),
+            });
+        } else {
+            self.state.apply(&bitty_vt::TerminalAction::CursorPosition {
+                row: bitty_vt::Row(target_row.saturating_add(1)),
+                col: bitty_vt::Col(new_col.saturating_add(1)),
+            });
+        }
+    }
+
+    /// Decodes, stores and places a Kitty image with owned payload.
     ///
     /// Same behavior as [`Self::kitty_display_image`] but moves the
-    /// payload to avoid an intermediate copy once the extension fast path
-    /// lands.
+    /// payload to avoid an intermediate copy on raw streams.
     #[allow(clippy::too_many_arguments)]
     pub fn kitty_display_image_owned(
         &mut self,
@@ -392,33 +426,13 @@ impl Runtime {
         self.pending_full_redraw = true;
 
         if cursor_movement_c != 1 {
-            let placement = self
-                .kitty_images
-                .get_placement(placement_id)
-                .expect("placement just created must exist");
-
-            let effective_cols = if cols_c > 0 { cols_c } else { placement.cols };
-            let effective_rows = if rows_r > 0 { rows_r } else { placement.rows };
-            let new_col = cursor.col.saturating_add(effective_cols);
-            let target_row = cursor.row.saturating_add(effective_rows);
-            let max_row = (self.state.height() as u16).saturating_sub(1);
-            if target_row > max_row {
-                let overflow = target_row - max_row;
-                for _ in 0..overflow {
-                    self.state.apply(&bitty_vt::TerminalAction::PrintControl(
-                        bitty_vt::ControlChar(0x0A),
-                    ));
-                }
-                self.state.apply(&bitty_vt::TerminalAction::CursorPosition {
-                    row: bitty_vt::Row(max_row),
-                    col: bitty_vt::Col(new_col),
-                });
-            } else {
-                self.state.apply(&bitty_vt::TerminalAction::CursorPosition {
-                    row: bitty_vt::Row(target_row),
-                    col: bitty_vt::Col(new_col),
-                });
-            }
+            self.advance_cursor_past_placement(
+                cursor.col,
+                cursor.row,
+                cols_c,
+                rows_r,
+                placement_id,
+            );
         }
 
         Ok(KittyDisplayOutcome::Displayed {

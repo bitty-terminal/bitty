@@ -191,9 +191,9 @@ pub const KITTY_PLACE_MAX_ITEMS: usize = crate::image::IMAGE_MAX_PLACEMENTS;
 /// Typed declared-size pre-check rejection.
 ///
 /// Returned by [`precheck_declared_image`] before any pixel buffer exists.
-/// Mirrors the moved decoder's failure taxonomy so Core-side refusal
-/// behavior (and log greps) stay stable; the actual codec step lives in
-/// the `bitty-graphics` extension.
+/// The transmit seam maps the [`crate::kitty_decode`] codec failures into
+/// this same taxonomy so refusal behavior (and log greps) stay stable
+/// across the pre-check and decode stages.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KittyPrecheckError {
     /// Empty payload carries no image.
@@ -236,9 +236,11 @@ pub enum KittyPrecheckError {
         /// Actual payload length.
         actual: usize,
     },
-    /// The payload passed every pre-check but Core holds no codec: the
-    /// decoder moved to the `bitty-graphics` extension and the
-    /// Core-to-extension call shape is not wired yet (fail closed).
+    /// The PNG stream is malformed, truncated, or undecodable; carries the
+    /// decoder diagnostic. Same bytes always produce the same message.
+    MalformedPng(String),
+    /// Legacy W-141 stub variant (kept for API stability; no longer
+    /// constructed now that Core owns decode in [`crate::kitty_decode`]).
     DecoderUnavailable,
 }
 
@@ -266,15 +268,39 @@ impl std::fmt::Display for KittyPrecheckError {
                 f,
                 "kitty raw payload of {actual} bytes does not match {expected} expected bytes"
             ),
+            Self::MalformedPng(detail) => write!(f, "kitty PNG is malformed: {detail}"),
             Self::DecoderUnavailable => write!(
                 f,
-                "kitty decoder unavailable (moved to bitty-graphics; extension wiring pending)"
+                "kitty decoder unavailable (legacy stub; Core now decodes)"
             ),
         }
     }
 }
 
 impl std::error::Error for KittyPrecheckError {}
+
+/// Maps a Core-owned decode failure into the transmit-seam taxonomy.
+///
+/// The variants mirror each other 1:1 except
+/// [`crate::kitty_decode::KittyDecodeError`] transport for unknown `f=`
+/// values, which the caller rejects as `UnknownFormat` before decoding.
+impl From<crate::kitty_decode::KittyDecodeError> for KittyPrecheckError {
+    fn from(err: crate::kitty_decode::KittyDecodeError) -> Self {
+        use crate::kitty_decode::KittyDecodeError as D;
+        match err {
+            D::EmptyPayload => Self::EmptyPayload,
+            D::MissingDimensions => Self::MissingDimensions,
+            D::ZeroDimension => Self::ZeroDimension,
+            D::DimensionsTooLarge { width, height, cap } => {
+                Self::DimensionsTooLarge { width, height, cap }
+            }
+            D::TooManyPixels { pixels, cap } => Self::TooManyPixels { pixels, cap },
+            D::DecodedTooLarge { bytes, cap } => Self::DecodedTooLarge { bytes, cap },
+            D::LengthMismatch { expected, actual } => Self::LengthMismatch { expected, actual },
+            D::MalformedPng(detail) => Self::MalformedPng(detail),
+        }
+    }
+}
 
 /// Validates declared wire dimensions with checked arithmetic before any
 /// allocation.
@@ -1616,9 +1642,9 @@ mod tests {
 
     #[test]
     fn precheck_png_ignores_declared_dimensions() {
-        // Declared `s`/`v` are meaningless for PNG: the extension validates
-        // the IHDR before allocating, so any declaration passes the Core
-        // pre-check (emptiness aside).
+        // Declared `s`/`v` are meaningless for PNG: the Core-owned decoder
+        // validates the IHDR before allocating, so any declaration passes
+        // the pre-check (emptiness aside).
         assert!(precheck_declared_image(None, Some(99), Some(99), 64).is_ok());
         assert!(precheck_declared_image(None, None, None, 64).is_ok());
     }
@@ -1674,6 +1700,33 @@ mod tests {
             KittyPrecheckError::DecoderUnavailable
                 .to_string()
                 .starts_with("kitty decoder unavailable")
+        );
+        assert_eq!(
+            KittyPrecheckError::MalformedPng("truncated".to_owned()).to_string(),
+            "kitty PNG is malformed: truncated"
+        );
+    }
+
+    #[test]
+    fn decode_error_maps_into_precheck_taxonomy() {
+        use crate::kitty_decode::KittyDecodeError as D;
+        assert_eq!(
+            KittyPrecheckError::from(D::EmptyPayload),
+            KittyPrecheckError::EmptyPayload
+        );
+        assert_eq!(
+            KittyPrecheckError::from(D::LengthMismatch {
+                expected: 6,
+                actual: 5
+            }),
+            KittyPrecheckError::LengthMismatch {
+                expected: 6,
+                actual: 5
+            }
+        );
+        assert_eq!(
+            KittyPrecheckError::from(D::MalformedPng("x".to_owned())),
+            KittyPrecheckError::MalformedPng("x".to_owned())
         );
     }
 

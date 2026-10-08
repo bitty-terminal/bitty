@@ -2450,25 +2450,21 @@ impl Runtime {
 
     /// Phase 5 (CTX-0474): the CTX-0248/0252/0254 kitty image layer.
     ///
-    /// Topmost focused-origin blits, budget-checked before rasterizing and
-    /// Phase 5 (CTX-0474, #1550): the CTX-0248/0252/0254 kitty image layer.
-    ///
     /// Topmost per-pane blits for all visible allocations, budget-checked before
     /// rasterizing and clipped to each pane's content rectangle. Placements are
     /// skipped while a view inspects scrollback. Unfocused panes retain and
     /// display their own Kitty images without disappearing on focus switch.
     /// Alternate-screen entry clears only the entering origin (`clear_origin`).
     ///
-    /// W-141 extraction: the raster source (nearest-neighbor scaling plus
-    /// the raster cache) moved to the `bitty-graphics` extension crate and
-    /// the Core-to-extension call shape is not wired yet. The policy half
-    /// below is unchanged — per-origin paint confinement, alternate-screen
-    /// clearing, paint-order iteration, viewport-clipped rect derivation,
-    /// and per-frame budget enforcement against the Core-retained
-    /// [`bitty_rich::KITTY_PRESENT_MAX_BLITS_PER_FRAME`] /
-    /// [`bitty_rich::KITTY_PRESENT_MAX_BYTES_PER_FRAME`] ceilings — but no
-    /// blits are produced until the wiring task lands (the loop admits
-    /// budget and stops where the extension raster call will go).
+    /// Raster is the Core-owned uncached nearest-neighbor step
+    /// ([`bitty_rich::rasterize_kitty_clipped`]; the extension holds its own
+    /// copy plus a cache): the image scales into the unclamped placement
+    /// extent and only the viewport-visible window is allocated, so a
+    /// partially visible placement paints at true scale instead of
+    /// squeezing into its clip. Per-frame budget enforcement uses the
+    /// Core-retained [`bitty_rich::KITTY_PRESENT_MAX_BLITS_PER_FRAME`] /
+    /// [`bitty_rich::KITTY_PRESENT_MAX_BYTES_PER_FRAME`] ceilings with
+    /// skip-and-continue in paint order.
     fn paint_kitty_images(&mut self, basis: &TickBasis, layers: &mut FrameLayers) {
         let snapshot = &basis.snapshot;
         let allocations = &basis.allocations;
@@ -2545,7 +2541,17 @@ impl Runtime {
             for placement in self.kitty_images.placements_in_paint_order_for(pane_origin) {
                 // Dangling placements (image evicted under the store caps)
                 // fail closed here, as before.
-                let Some(_) = self.kitty_images.get(placement.image) else {
+                let Some(stored) = self.kitty_images.get(placement.image) else {
+                    continue;
+                };
+                // Full (unclamped) extent for true-scale sampling plus the
+                // viewport-clipped window to emit. `None` paints nothing
+                // (scrolled fully off the top or outside the viewport).
+                let Some(full_px) = bitty_rich::KittyImageLayer::placement_full_rect(
+                    placement,
+                    rich_metrics,
+                    scrollback,
+                ) else {
                     continue;
                 };
                 let Some(rect_px) = bitty_rich::KittyImageLayer::placement_rect(
@@ -2572,10 +2578,26 @@ impl Runtime {
                 if next > bitty_rich::KITTY_PRESENT_MAX_BYTES_PER_FRAME {
                     continue;
                 }
+                let Some(rgba) = bitty_rich::rasterize_kitty_clipped(stored, full_px, rect_px)
+                else {
+                    continue;
+                };
+                // Leaf fills/glyphs translate by the pane content origin
+                // (window padding already added); image blits use the same
+                // window space so they land exactly over their cells.
+                let dest = bitty_render::geometry::RectPx::new(
+                    px_add(px_add(basis.pad_px, frame.content.x), rect_px.x),
+                    px_add(px_add(basis.pad_px, frame.content.y), rect_px.y),
+                    rect_px.width,
+                    rect_px.height,
+                );
+                let Ok(blit) = bitty_render::grid::ImageBlit::try_new(dest, rgba) else {
+                    continue;
+                };
                 blits_this_frame += 1;
                 bytes_this_frame = next;
-                // W-141: the scaled bytes came from the raster cache here;
-                // both moved to the extension. No blits until wiring.
+                layers.combined_images.push(blit);
+                layers.any_needs_draw = true;
             }
         }
         if !layers.combined_images.is_empty() {

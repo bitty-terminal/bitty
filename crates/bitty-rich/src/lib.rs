@@ -73,12 +73,13 @@
 //! # Headless seam
 //!
 //! No window system, no adapter, no clipboard I/O, no GPU presentation,
-//! and no codec decoding are performed here. Bounded Kitty payload decode
-//! (PNG/RGB/RGBA to RGBA8) and texture-preparation mechanics
-//! (nearest-neighbor scaling, per-frame budget accounting, raster caching)
-//! moved to the `bitty-graphics` extension crate (W-141 extraction); Core
-//! retains only the declared-size pre-check ([`kitty_place`]) and the
-//! pre-upload re-validation on caller-supplied bitmaps. All tests run on
+//! and no filesystem are touched here. Bounded Kitty payload decode
+//! (PNG via the `image` codec edge, raw RGB/RGBA inline) lives in
+//! [`kitty_decode`] and nearest-neighbor raster mechanics in
+//! [`kitty_raster`] (both Core-owned; the `bitty-graphics` extension
+//! crate holds its own copies plus a raster cache, and Core never depends
+//! on extension internals). Core retains the declared-size pre-check
+//! ([`kitty_place`]) and the pre-upload re-validation on decoded bitmaps. All tests run on
 //! GPU-less CI via pure logic on
 //! `State`/`Snapshot` values, except the host external-editor round-trip
 //! (OS temp file plus an allowlisted `$VISUAL`/`$EDITOR` child process,
@@ -98,7 +99,9 @@ pub mod host;
 pub mod hyperlink;
 pub mod image;
 pub mod kitty;
+pub mod kitty_decode;
 pub mod kitty_place;
+pub mod kitty_raster;
 pub mod kitty_unicode;
 pub mod loader;
 pub mod presentation;
@@ -148,6 +151,7 @@ pub use image::{
     ScrollBehavior as ImageScrollBehavior, payload_fingerprint,
 };
 pub use kitty::{KittyGraphicsStub, KittyPlaceholder, KittyPlaceholderId};
+pub use kitty_decode::{KittyDecodeError, KittyDecodedImage, decode_kitty_payload};
 pub use kitty_place::{
     KITTY_DECODE_MAX_BYTES, KITTY_DECODE_MAX_DIMENSION, KITTY_DECODE_MAX_PIXELS, KITTY_FORMAT_PNG,
     KITTY_FORMAT_RGB, KITTY_FORMAT_RGBA, KITTY_PLACE_MAX_BYTES, KITTY_PLACE_MAX_IMAGES,
@@ -156,6 +160,7 @@ pub use kitty_place::{
     KittyPlacementError, KittyPlacementId, KittyPrecheckError, placement_full_rect_for,
     placement_rect_for, precheck_declared_image, viewport_extent,
 };
+pub use kitty_raster::{rasterize_kitty, rasterize_kitty_clipped};
 pub use kitty_unicode::{
     KittyUnicodeRect, KittyUnicodeVirtual, unicode_run_rect, virtual_extent_cells,
 };

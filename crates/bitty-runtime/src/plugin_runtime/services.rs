@@ -14,10 +14,10 @@ use std::time::{Duration, Instant};
 use bitty_lua::ui::UiSlot;
 use bitty_lua::ui::{UI_MAX_AGGREGATED_TEXT_BYTES, UI_MAX_BLOCKS, UiNode};
 use bitty_lua::{
-    BridgeError, E_UI_NOT_OWNER, E_UI_UNAVAILABLE, HostServices, LuaValue, LuaVm,
-    OVERLAY_CALL_MAX_BYTES, OVERLAY_SPEC_PLACEHOLDER_MAX_BYTES, OVERLAY_SPEC_TITLE_MAX_BYTES,
-    OverlayInput, OverlayPoll, SNAPSHOT_MAX_BYTES, ServiceRoute, StashedFunction,
-    WORKSPACE_LIST_MAX_ITEMS, WorkspaceInfo, WorkspaceRequest, env_grant_shape_ok,
+    BridgeError, CommandCatalogEntry, E_UI_NOT_OWNER, E_UI_UNAVAILABLE, HostServices, LuaValue,
+    LuaVm, OVERLAY_CALL_MAX_BYTES, OVERLAY_SPEC_PLACEHOLDER_MAX_BYTES,
+    OVERLAY_SPEC_TITLE_MAX_BYTES, OverlayInput, OverlayPoll, SNAPSHOT_MAX_BYTES, ServiceRoute,
+    StashedFunction, WORKSPACE_LIST_MAX_ITEMS, WorkspaceInfo, WorkspaceRequest, env_grant_shape_ok,
     validate_env_key,
 };
 use bitty_package::Version;
@@ -720,6 +720,201 @@ fn service_gone_error(detail: String) -> BridgeError {
     BridgeError::new("runtime", "E_SERVICE_GONE", detail)
 }
 
+/// One published command record in the runtime command directory (CTX-1035).
+///
+/// Published at activation from the generation capture (stashed `run`
+/// function) plus the effective schemas (the manifest's
+/// `lazy.commands` table-form entry wins when present, otherwise the
+/// `commands.register` tables — mirroring the service version/schema
+/// precedence). The owner VM is held weakly: dispose drops the strong
+/// handle, so a stale record upgrades to nothing and fails closed with
+/// `E_COMMAND_GONE`.
+///
+/// Cloned out of the directory before any VM invocation, so the directory
+/// borrow never spans a (potentially re-entrant) callee call.
+#[derive(Debug, Clone)]
+pub struct CommandRecord {
+    /// Owning plugin id.
+    pub owner: String,
+    /// Unqualified command id.
+    pub id: String,
+    /// Qualified command name (`owner:id`).
+    pub qualified: String,
+    /// Activation generation that published the record.
+    pub generation: u32,
+    /// Bounded display title.
+    pub title: String,
+    /// Effective JSON Schema for invocation arguments (when declared).
+    pub args_schema: Option<String>,
+    /// Effective JSON Schema for invocation results (when declared).
+    pub result_schema: Option<String>,
+    /// Stashed `run` function (generation-scoped to the owner VM; functions
+    /// never cross as values).
+    pub func: StashedFunction,
+    /// Owner VM (weak: dispose invalidates without directory coordination).
+    pub vm: Weak<RefCell<LuaVm>>,
+    /// Set while the owner is suspended; suspended records list and serve
+    /// nothing until resume republishes them in place.
+    pub suspended: bool,
+}
+
+/// Live per-runtime command directory (CTX-1035).
+///
+/// Owned by [`PluginRuntime`](super::PluginRuntime) and shared with every
+/// generation's [`PluginServices`]: activation publishes, suspend parks,
+/// resume restores, dispose/reload revokes. Keyed by qualified name with one
+/// record per command (qualified names are registry-unique by construction),
+/// so any generation can invoke any active command through the host —
+/// including the palette driving `bitty-featured.devtools:plugins` — while
+/// undeclared and foreign names resolve to nothing and fail closed.
+#[derive(Debug, Default)]
+pub struct CommandDirectory {
+    records: BTreeMap<String, CommandRecord>,
+}
+
+impl CommandDirectory {
+    /// An empty directory.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Publish one activation record, replacing the same qualified name's
+    /// prior record (re-activation after revoke starts clean).
+    pub fn publish(&mut self, record: CommandRecord) {
+        self.records.insert(record.qualified.clone(), record);
+    }
+
+    /// Park every record of `owner` (suspend): listing skips them and live
+    /// invocations fail closed with `E_COMMAND_GONE` until resume.
+    pub fn suspend_owner(&mut self, owner: &str) {
+        for record in self.records.values_mut() {
+            if record.owner == owner {
+                record.suspended = true;
+            }
+        }
+    }
+
+    /// Restore every parked record of `owner` (resume).
+    pub fn resume_owner(&mut self, owner: &str) {
+        for record in self.records.values_mut() {
+            if record.owner == owner {
+                record.suspended = false;
+            }
+        }
+    }
+
+    /// Drop every record of `owner` (dispose/reload/failed activation).
+    pub fn revoke_owner(&mut self, owner: &str) {
+        self.records.retain(|_, record| record.owner != owner);
+    }
+
+    /// Cloned active (non-suspended) record for `qualified`, if published.
+    #[must_use]
+    pub fn find_active(&self, qualified: &str) -> Option<CommandRecord> {
+        self.records.get(qualified).and_then(|record| {
+            if record.suspended {
+                None
+            } else {
+                Some(record.clone())
+            }
+        })
+    }
+
+    /// Whether any record (suspended included) names `qualified`.
+    ///
+    /// Lets the invoke path distinguish "never registered" (`E_COMMAND_UNKNOWN`)
+    /// from "registered but unavailable" (`E_COMMAND_GONE`).
+    #[must_use]
+    pub fn knows(&self, qualified: &str) -> bool {
+        self.records.contains_key(qualified)
+    }
+
+    /// Cloned active records in catalog order (owner, id).
+    #[must_use]
+    pub fn active_records(&self) -> Vec<CommandRecord> {
+        let mut records: Vec<CommandRecord> = self
+            .records
+            .values()
+            .filter(|record| !record.suspended)
+            .cloned()
+            .collect();
+        records.sort_by(|a, b| (&a.owner, &a.id).cmp(&(&b.owner, &b.id)));
+        records
+    }
+
+    /// Total published records (suspended included; diagnostics and tests).
+    #[must_use]
+    pub fn published_count(&self) -> usize {
+        self.records.len()
+    }
+}
+
+/// `E_COMMAND_UNKNOWN` for a qualified name no generation ever registered.
+///
+/// Deny-by-default: undeclared and foreign-qualified names are refused here,
+/// before any callee code could run.
+fn command_unknown_error(qualified: &str) -> BridgeError {
+    BridgeError::new(
+        "validation",
+        "E_COMMAND_UNKNOWN",
+        format!("command '{qualified}' is not registered"),
+    )
+}
+
+/// `E_COMMAND_GONE` for a registered-but-unavailable command record.
+///
+/// The owner is suspended, disposed, reloaded, or failed: the name resolved
+/// once, but no live generation serves it now.
+fn command_gone_error(qualified: &str) -> BridgeError {
+    BridgeError::new(
+        "runtime",
+        "E_COMMAND_GONE",
+        format!("command '{qualified}' is unavailable"),
+    )
+}
+
+/// `E_COMMAND_INVALID` for an args/result schema violation.
+///
+/// Args violations are refused before any callee code runs; result
+/// violations contain a misbehaving callee after it ran.
+fn command_invalid_error(qualified: &str, detail: &str) -> BridgeError {
+    BridgeError::new(
+        "validation",
+        "E_COMMAND_INVALID",
+        format!("command '{qualified}' {detail}"),
+    )
+}
+
+/// `E_COMMAND_FAILED` for a callee that raised, suspended, or was busy.
+///
+/// Failures are contained to the invocation: the host never panics, and a
+/// re-entrant call into the already-executing owner VM (including a command
+/// invoking itself) fails closed here instead of aliasing the VM.
+fn command_failed_error(qualified: &str, detail: String) -> BridgeError {
+    BridgeError::new(
+        "runtime",
+        "E_COMMAND_FAILED",
+        format!("command '{qualified}' failed: {detail}"),
+    )
+}
+
+/// Encode the invocation-args document for schema validation (CTX-1035).
+///
+/// Lua has one table type, so an empty table is ambiguous: the bridge encodes
+/// it as `[]`, but every command args schema in the wild (including the
+/// devtools empty-object contract) describes an object. Canonicalize `nil`
+/// and the empty table to the empty object `{}`; every other value encodes
+/// as-is. A non-empty array stays an array and fails an object schema
+/// loudly, exactly like a mistyped table.
+pub(crate) fn command_args_document(args: &LuaValue) -> String {
+    match args {
+        LuaValue::Nil => "{}".to_string(),
+        LuaValue::Table(pairs) if pairs.is_empty() => "{}".to_string(),
+        _ => store::encode_json(args),
+    }
+}
+
 /// Map a Core provider failure onto existing typed bridge errors (W-29).
 ///
 /// No new error code is introduced: capability stays `E_CAPABILITY_DENIED`,
@@ -888,6 +1083,7 @@ pub struct PluginServices {
     service_provided: RefCell<Vec<ProvidedService>>,
     service_required: RefCell<Vec<(String, String)>>,
     service_directory: RefCell<Option<Rc<RefCell<ServiceDirectory>>>>,
+    command_directory: RefCell<Option<Rc<RefCell<CommandDirectory>>>>,
     debug_inspect: Cell<bool>,
     debug_trace: Cell<bool>,
     granted_capabilities: RefCell<Vec<String>>,
@@ -940,6 +1136,7 @@ impl PluginServices {
             service_provided: RefCell::new(Vec::new()),
             service_required: RefCell::new(Vec::new()),
             service_directory: RefCell::new(None),
+            command_directory: RefCell::new(None),
             debug_inspect: Cell::new(false),
             debug_trace: Cell::new(false),
             granted_capabilities: RefCell::new(Vec::new()),
@@ -1536,6 +1733,15 @@ impl PluginServices {
     /// with `E_NOT_IMPLEMENTED` (no service backend).
     pub fn set_service_directory(&self, directory: Rc<RefCell<ServiceDirectory>>) {
         *self.service_directory.borrow_mut() = Some(directory);
+    }
+
+    /// Attach the runtime-shared command directory for this generation
+    /// (CTX-1035).
+    ///
+    /// Without it every `bitty.commands.list`/`invoke` call fails closed
+    /// with `E_NOT_IMPLEMENTED`.
+    pub fn set_command_directory(&self, directory: Rc<RefCell<CommandDirectory>>) {
+        *self.command_directory.borrow_mut() = Some(directory);
     }
 
     /// Grant (or revoke) `bitty.debug.inspect` from the activation snapshot.
@@ -2465,6 +2671,90 @@ impl HostServices for PluginServices {
                     format!(
                         "service '{iface}.{method}' result does not satisfy the interface schema"
                     ),
+                ));
+            }
+        }
+        Ok(result)
+    }
+
+    fn command_list(&self) -> Result<Vec<CommandCatalogEntry>, BridgeError> {
+        let directory = self.command_directory.borrow().clone();
+        let Some(directory) = directory else {
+            return Err(BridgeError::not_implemented("bitty.commands.list"));
+        };
+        // Snapshot under a short borrow: entries are plain metadata, and the
+        // borrow must never span a caller callback.
+        let records = directory.borrow().active_records();
+        let entries: Vec<CommandCatalogEntry> = records
+            .into_iter()
+            .take(bitty_lua::COMMAND_LIST_MAX_ENTRIES)
+            .map(|record| CommandCatalogEntry {
+                plugin: record.owner,
+                id: record.id,
+                qualified: record.qualified,
+                title: record.title,
+            })
+            .collect();
+        Ok(entries)
+    }
+
+    fn command_invoke(&self, qualified: &str, args: &LuaValue) -> Result<LuaValue, BridgeError> {
+        let directory = self.command_directory.borrow().clone();
+        let Some(directory) = directory else {
+            return Err(BridgeError::not_implemented("bitty.commands.invoke"));
+        };
+        // Snapshot the record under a short borrow: the directory borrow
+        // must never span the (potentially re-entrant) callee VM call.
+        // Undeclared and foreign-qualified names resolve to nothing and are
+        // refused here, before any callee code could run (deny-by-default).
+        let record = directory.borrow().find_active(qualified);
+        let Some(record) = record else {
+            if directory.borrow().knows(qualified) {
+                return Err(command_gone_error(qualified));
+            }
+            return Err(command_unknown_error(qualified));
+        };
+        // Args cross as JSON and are validated before the callee runs, so
+        // a schema violation never executes callee code. `nil` and `{}` both
+        // validate as the empty object (see `command_args_document`).
+        if let Some(schema) = &record.args_schema {
+            let json = command_args_document(args);
+            if !value_satisfies_schema(schema, &json) {
+                return Err(command_invalid_error(
+                    qualified,
+                    "args do not satisfy the command schema",
+                ));
+            }
+        }
+        let vm = record
+            .vm
+            .upgrade()
+            .ok_or_else(|| command_gone_error(qualified))?;
+        let func = record.func.clone();
+        // `try_borrow_mut`: a re-entrant call into the already-executing
+        // owner VM (including a command invoking itself) fails closed
+        // instead of panicking the RefCell.
+        let result = match vm.try_borrow_mut() {
+            Ok(mut vm) => vm.call_function(&func, std::slice::from_ref(args)),
+            Err(_) => {
+                return Err(command_failed_error(
+                    qualified,
+                    format!("command owner '{}' is busy", record.owner),
+                ));
+            }
+        };
+        let result = result.map_err(|error| {
+            command_failed_error(qualified, truncate_service_message(error.to_string()))
+        })?;
+        // Results are observations, never live handles, and the effective
+        // result schema is re-checked here before crossing back, so a
+        // misbehaving callee is contained to this invocation.
+        if let Some(schema) = &record.result_schema {
+            let json = store::encode_json(&result);
+            if !value_satisfies_schema(schema, &json) {
+                return Err(command_invalid_error(
+                    qualified,
+                    "result does not satisfy the command schema",
                 ));
             }
         }

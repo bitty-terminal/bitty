@@ -75,7 +75,8 @@ pub use config::{
     ViewOverrideData, WindowData,
 };
 pub use host::{
-    API_VERSION, BoundedExecution, BridgeError, CommandRegistration, E_UI_ALREADY_CAPTURED,
+    API_VERSION, BoundedExecution, BridgeError, COMMAND_LIST_MAX_ENTRIES,
+    COMMAND_QUALIFIED_MAX_BYTES, CommandCatalogEntry, CommandRegistration, E_UI_ALREADY_CAPTURED,
     E_UI_NOT_OWNER, E_UI_UNAVAILABLE, ENV_KEY_MAX_BYTES, EventSubscription, FS_CONTENT_MAX_BYTES,
     FS_LIST_MAX_BYTES, FS_LIST_MAX_ENTRIES, FS_PATH_MAX_BYTES, HostServices, KeymapSuggestion,
     LuaValue, MarshallingLimits, OVERLAY_CALL_MAX_BYTES, OVERLAY_CAPTURE_POLL_MAX,

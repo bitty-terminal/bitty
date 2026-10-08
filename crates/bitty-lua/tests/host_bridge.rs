@@ -2000,3 +2000,193 @@ fn fs_bridge_rejects_non_utf8_without_touching_files() {
     );
     assert_eq!(services.writes.borrow().len(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// CTX-1035: host-mediated command-invocation bridge surface
+// ---------------------------------------------------------------------------
+
+#[test]
+fn command_schemas_are_captured_as_tables() {
+    let mut vm = gate_vm("invoke-schema-capture");
+    install(&mut vm, Rc::new(FakeServices::default()));
+    let outcome = vm
+        .execute_bounded(
+            r#"
+            bitty.commands.register({
+              id = "typed",
+              title = "T",
+              args_schema = { type = "object", properties = {}, additionalProperties = false },
+              result_schema = { type = "string" },
+              run = function() return "ok" end,
+            })
+            bitty.commands.register({ id = "plain", title = "P", run = function() end })
+            "#,
+        )
+        .expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{outcome:?}"
+    );
+    let capture = vm.take_registrations();
+    assert_eq!(capture.commands.len(), 2);
+    let typed = &capture.commands[0];
+    assert!(typed.args_schema.is_some(), "args schema must be captured");
+    assert!(
+        typed.result_schema.is_some(),
+        "result schema must be captured"
+    );
+    let plain = &capture.commands[1];
+    assert!(plain.args_schema.is_none(), "absent schema stays None");
+    assert!(plain.result_schema.is_none(), "absent schema stays None");
+}
+
+#[test]
+fn non_table_command_schema_is_rejected() {
+    for field in ["args_schema = \"nope\"", "result_schema = 7"] {
+        let services = Rc::new(FakeServices::default());
+        let mut vm = gate_vm("invoke-schema-reject");
+        install(&mut vm, services.clone());
+        assert_bridge_code(
+            &mut vm,
+            &services,
+            &format!(
+                "local ok, err = pcall(bitty.commands.register, {{ id = \"x\", title = \"T\", {field}, run = function() end }})\nif ok then bitty.store.set(\"code\", \"NONE\") else bitty.store.set(\"code\", err.code) end"
+            ),
+            "E_DEF_INVALID",
+        );
+        assert!(
+            vm.take_registrations().commands.is_empty(),
+            "{field}: rejected registration must not be captured"
+        );
+    }
+}
+
+#[test]
+fn invoke_rejects_malformed_names_before_the_host() {
+    // The default backend implements nothing: a well-formed name reaches it
+    // (`E_NOT_IMPLEMENTED`), while a malformed name dies at the bridge
+    // shape check (`E_DEF_INVALID`) before any host call.
+    for (target, want) in [
+        ("nope", "E_DEF_INVALID"),
+        ("owner:", "E_DEF_INVALID"),
+        (":cmd", "E_DEF_INVALID"),
+        ("a:b:c", "E_DEF_INVALID"),
+        ("owner:cmd", "E_NOT_IMPLEMENTED"),
+    ] {
+        let services = Rc::new(FakeServices::default());
+        let mut vm = gate_vm("invoke-shape");
+        install(&mut vm, services.clone());
+        assert_bridge_code(
+            &mut vm,
+            &services,
+            &format!(
+                "local ok, result = pcall(bitty.commands.invoke, \"{target}\")\nif ok then bitty.store.set(\"code\", \"NONE\") else bitty.store.set(\"code\", result.code) end"
+            ),
+            want,
+        );
+    }
+    // A non-string target and a non-table second argument are rejected too.
+    let services = Rc::new(FakeServices::default());
+    let mut vm = gate_vm("invoke-shape-types");
+    install(&mut vm, services.clone());
+    assert_bridge_code(
+        &mut vm,
+        &services,
+        "local ok, result = pcall(bitty.commands.invoke, 7)\nif ok then bitty.store.set(\"code\", \"NONE\") else bitty.store.set(\"code\", result.code) end",
+        "E_DEF_INVALID",
+    );
+}
+
+/// Recording backend proving the bridge contract: `list` rows arrive as
+/// `{plugin, id, qualified, title}` tables in order, and `invoke` forwards
+/// the qualified name plus the args value untouched (`nil` stays `nil` —
+/// the empty-object canonicalization lives runtime-side).
+struct RecordingServices {
+    inner: FakeServices,
+    invoked: RefCell<Vec<(String, LuaValue)>>,
+}
+
+impl HostServices for RecordingServices {
+    fn store_get(&self, key: &str) -> Result<Option<LuaValue>, BridgeError> {
+        self.inner.store_get(key)
+    }
+    fn store_set(&self, key: &str, value: LuaValue) -> Result<(), BridgeError> {
+        self.inner.store_set(key, value)
+    }
+    fn settings_get(&self, key: &str) -> Result<Option<LuaValue>, BridgeError> {
+        self.inner.settings_get(key)
+    }
+    fn terminal_snapshot(&self, scope: &str) -> Result<LuaValue, BridgeError> {
+        self.inner.terminal_snapshot(scope)
+    }
+    fn notify_show(&self, payload: &LuaValue) -> Result<bool, BridgeError> {
+        self.inner.notify_show(payload)
+    }
+    fn command_list(&self) -> Result<Vec<bitty_lua::CommandCatalogEntry>, BridgeError> {
+        Ok(vec![bitty_lua::CommandCatalogEntry {
+            plugin: "xuepoo.demo".to_string(),
+            id: "run".to_string(),
+            qualified: "xuepoo.demo:run".to_string(),
+            title: "Demo run".to_string(),
+        }])
+    }
+    fn command_invoke(&self, qualified: &str, args: &LuaValue) -> Result<LuaValue, BridgeError> {
+        self.invoked
+            .borrow_mut()
+            .push((qualified.to_string(), args.clone()));
+        Ok(LuaValue::String(format!("served:{qualified}")))
+    }
+}
+
+#[test]
+fn invoke_bridge_forwards_names_and_args_untouched() {
+    let services = Rc::new(RecordingServices {
+        inner: FakeServices::default(),
+        invoked: RefCell::new(Vec::new()),
+    });
+    let mut vm = gate_vm("invoke-forward");
+    let services_dyn: Rc<dyn HostServices> = services.clone();
+    vm.install_host_module(services_dyn, MarshallingLimits::default(), 50)
+        .expect("install");
+    let outcome = vm
+        .execute_bounded(
+            "bitty.store.set(\"a\", (function() local ok, r = pcall(bitty.commands.invoke, \"xuepoo.demo:run\") return ok and r or \"FAIL\" end)())\n\
+             bitty.store.set(\"b\", (function() local ok, r = pcall(bitty.commands.invoke, \"xuepoo.demo:run\", { n = 1 }) return ok and r or \"FAIL\" end)())\n\
+             local entries = bitty.commands.list()\n\
+             bitty.store.set(\"n\", #entries)\n\
+             bitty.store.set(\"q\", entries[1].qualified)\n\
+             bitty.store.set(\"t\", entries[1].title)",
+        )
+        .expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{outcome:?}"
+    );
+    let store = services.inner.store.borrow();
+    assert_eq!(
+        store.get("a"),
+        Some(&LuaValue::String("served:xuepoo.demo:run".to_string()))
+    );
+    assert_eq!(
+        store.get("b"),
+        Some(&LuaValue::String("served:xuepoo.demo:run".to_string()))
+    );
+    assert_eq!(store.get("n"), Some(&LuaValue::Integer(1)));
+    assert_eq!(
+        store.get("q"),
+        Some(&LuaValue::String("xuepoo.demo:run".to_string()))
+    );
+    assert_eq!(
+        store.get("t"),
+        Some(&LuaValue::String("Demo run".to_string()))
+    );
+    // `nil` arrives as `nil` (runtime canonicalizes to `{}` for schemas);
+    // the table arrives as-is.
+    assert_eq!(services.invoked.borrow().len(), 2);
+    assert_eq!(services.invoked.borrow()[0].0, "xuepoo.demo:run");
+    assert_eq!(services.invoked.borrow()[0].1, LuaValue::Nil);
+    assert_eq!(
+        services.invoked.borrow()[1].1,
+        LuaValue::table([("n", LuaValue::Integer(1))])
+    );
+}

@@ -1734,6 +1734,41 @@ impl TerminalApp {
         }
     }
 
+    /// Empty args value for argument-free host-mediated invocations
+    /// (CTX-1035).
+    ///
+    /// The empty table validates as the empty object `{}` against an object
+    /// args schema (see the runtime's args-document canonicalization), so
+    /// keybindings — which carry no arguments — invoke empty-args commands
+    /// such as `bitty-featured.devtools:plugins` directly.
+    pub(crate) fn empty_command_args() -> LuaValue {
+        LuaValue::Table(Vec::new())
+    }
+
+    /// Invoke one registered plugin command by qualified name
+    /// (`owner:command`, CTX-1035 #1829).
+    ///
+    /// The generic host-mediated invocation path behind palette selection
+    /// and the keybinding `command:<qualified>` action: parses the
+    /// qualified name and routes it through the plugin runtime's
+    /// deny-by-default dispatch (undeclared and foreign-qualified names
+    /// refused, args validated against the callee schema, failures
+    /// contained with codes). Fail-closed with a diagnostic string when
+    /// the runtime is gone or the invocation is refused; terminal state is
+    /// untouched either way.
+    pub(crate) fn invoke_plugin_command(
+        &mut self,
+        qualified: &str,
+        args: &LuaValue,
+    ) -> Result<LuaValue, String> {
+        let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
+            return Err(String::from("plugin runtime is gone"));
+        };
+        plugin_runtime
+            .invoke_command(qualified, args)
+            .map_err(|error| error.to_string())
+    }
+
     /// Route post-intercept fall-through input into the capture queue
     /// (CTX-0943). Called by [`Self::handle_event`] after
     /// [`Self::intercept_chrome_key`](crate::chrome_keys::ChromeState)

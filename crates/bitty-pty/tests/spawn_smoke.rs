@@ -415,7 +415,13 @@ fn cwd_is_applied_to_child() {
     reader.join().expect("pump clean");
     let text = String::from_utf8_lossy(&out);
     // /tmp is a symlink to /private/tmp on macOS; canonicalize both sides.
-    let raw = text.trim();
+    // Only the first line carries `pwd` output: releasing the `read` gate
+    // and dropping the writer echo extra newlines and caret sequences
+    // (notably macOS `^D` EOF echo), which must not pollute the comparison.
+    let raw = text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("");
     let cleaned: String = raw
         .trim_start_matches(|c: char| c.is_control())
         .trim_end_matches(|c: char| c.is_control())

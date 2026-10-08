@@ -31,17 +31,22 @@ fn drain(reader: &bitty_pty::PtyReader, deadline: std::time::Instant) -> Vec<u8>
 
 /// Reads until `marker` is observed, returning everything so far.
 ///
-/// Fails closed (returns short) when the stream ends first or the bound
-/// elapses; the caller owns what a missing marker means.
+/// Never panics: EOF, a dead pump, or a quiet stream past the bound all end
+/// the wait and return short; the caller owns what a missing marker means
+/// (the `spawn_gated` respawn, or content assertions). The total wait stays
+/// within `ECHO_TIMEOUT` via a shrinking per-recv bound.
 fn observe_until(reader: &bitty_pty::PtyReader, marker: &[u8]) -> Vec<u8> {
     let deadline = std::time::Instant::now() + ECHO_TIMEOUT;
     let mut out = Vec::new();
     while !contains(&out, marker) {
-        match reader.recv_timeout(ECHO_TIMEOUT).expect("recv_timeout") {
-            Some(chunk) => out.extend_from_slice(&chunk),
-            None => break,
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
         }
-        assert!(std::time::Instant::now() < deadline, "marker timed out");
+        match reader.recv_timeout(remaining) {
+            Ok(Some(chunk)) => out.extend_from_slice(&chunk),
+            _ => break,
+        }
     }
     out
 }
@@ -166,10 +171,10 @@ fn shutdown_kills_and_reaps_in_one_step() {
 
 #[test]
 fn child_environment_inherits_session_with_overrides() {
-    let (_pty, reader, mut out) = spawn_gated(b"BITTY_PROBE=1", || {
+    let (_pty, reader, mut out) = spawn_gated(b"__BITTY_ENV_DONE__", || {
         PtyBuilder::new("/bin/sh")
             .arg("-c")
-            .arg("/usr/bin/env; read dummy")
+            .arg("/usr/bin/env; echo __BITTY_ENV_DONE__; read dummy")
             .env("BITTY_PROBE", "1")
             .spawn()
             .expect("spawn sh -c env")
@@ -255,10 +260,10 @@ fn child_environment_inherits_session_with_overrides() {
 
 #[test]
 fn child_environment_builder_overrides_defaults() {
-    let (_pty, reader, mut out) = spawn_gated(b"TERM=custom-256color", || {
+    let (_pty, reader, mut out) = spawn_gated(b"__BITTY_ENV_DONE__", || {
         PtyBuilder::new("/bin/sh")
             .arg("-c")
-            .arg("/usr/bin/env; read dummy")
+            .arg("/usr/bin/env; echo __BITTY_ENV_DONE__; read dummy")
             .env("TERM", "custom-256color")
             .env("COLORTERM", "custom-color")
             .spawn()
@@ -293,10 +298,10 @@ fn child_has_term_program_bitty_by_default() {
     // CTX-0194: TERM_PROGRAM must read `bitty` so term-DB probes fall back
     // to symbols instead of Kitty-graphics APC. No chafa dependency: assert
     // the sanitized child environment directly via headless PTY byte capture.
-    let (_pty, reader, mut out) = spawn_gated(b"TERM_PROGRAM=bitty", || {
+    let (_pty, reader, mut out) = spawn_gated(b"__BITTY_ENV_DONE__", || {
         PtyBuilder::new("/bin/sh")
             .arg("-c")
-            .arg("/usr/bin/env; read dummy")
+            .arg("/usr/bin/env; echo __BITTY_ENV_DONE__; read dummy")
             .spawn()
             .expect("spawn sh -c env")
     });
@@ -314,10 +319,10 @@ fn child_has_term_program_bitty_by_default() {
 
 #[test]
 fn child_explicit_term_program_override_wins() {
-    let (_pty, reader, mut out) = spawn_gated(b"TERM_PROGRAM=custom-term", || {
+    let (_pty, reader, mut out) = spawn_gated(b"__BITTY_ENV_DONE__", || {
         PtyBuilder::new("/bin/sh")
             .arg("-c")
-            .arg("/usr/bin/env; read dummy")
+            .arg("/usr/bin/env; echo __BITTY_ENV_DONE__; read dummy")
             .env("TERM_PROGRAM", "custom-term")
             .spawn()
             .expect("spawn sh -c env")
@@ -366,7 +371,7 @@ fn child_graphics_fingerprint_is_sanitized() {
         .map(|(k, _)| (*k, std::env::var_os(k)))
         .collect();
 
-    let (_pty, reader, mut out) = spawn_gated(b"TERM_PROGRAM=bitty", || {
+    let (_pty, reader, mut out) = spawn_gated(b"__BITTY_ENV_DONE__", || {
         for (k, v) in poison {
             // `std::env::set_var` is (correctly) flagged unsafe in Rust 2024
             // because it races with `getenv` in other threads; the poison
@@ -379,7 +384,7 @@ fn child_graphics_fingerprint_is_sanitized() {
         }
         let spawned = PtyBuilder::new("/bin/sh")
             .arg("-c")
-            .arg("/usr/bin/env; read dummy")
+            .arg("/usr/bin/env; echo __BITTY_ENV_DONE__; read dummy")
             .spawn();
 
         // Restore the parent environment immediately: the child snapshot is

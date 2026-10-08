@@ -202,16 +202,84 @@ impl WindowState {
 /// previous and current Core workspace summaries, so each kind fires at most
 /// once per workspace per tick (bounded by `MAX_WORKSPACES`), and an
 /// intermediate state that a tick never committed is never reported.
+///
+/// Issue #1828: the same coalescing covers the remaining devtools-declared
+/// observation kinds. `terminal.opened` / `terminal.closed` diff the live
+/// PTY-backed terminal set (bounded by the leaf count, capped by
+/// [`MAX_TERMINAL_EVENTS_PER_TICK`]); `terminal.cwd-changed` diffs the
+/// per-terminal `OSC 7` reports (capped by [`MAX_CWD_EVENTS_PER_TICK`]);
+/// `terminal.bell` fires at most once per tick when the observed-`BEL`
+/// counter advances; `selection.changed` fires at most once per tick on an
+/// owner/presence change and never carries selection text (v1). Edge kinds
+/// (`process.exited`, `config.reloaded`) are queued by their producers
+/// (bounded, drop-oldest) and drained here on the same cold tick path.
+/// Every emission runs on the cold tick path (after present), never on the
+/// PTY parser hot path, and every payload is bounded (truncated at a char
+/// boundary). The declared-kinds precondition is honored by
+/// `PluginRuntime::deliver_event` itself (the trace hub records only kinds
+/// the owner declares), so this tracker emits unconditionally and the hub
+/// filters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EventTracker {
     title: String,
     window_focused: bool,
     workspaces: Vec<WorkspaceSummary>,
+    terminals: Vec<u64>,
+    cwds: Vec<(u64, String)>,
+    bell_observed: u64,
+    selection_owner: Option<u64>,
+    has_selection: bool,
 }
+
+/// Maximum `terminal.opened` / `terminal.closed` events emitted per tick
+/// (issue #1828).
+///
+/// Live terminals are bounded by the leaf count; this cap is defense-in-depth
+/// so one tick never fans out an unbounded burst to the VMs. Excess ids are
+/// still adopted into the snapshot (the next tick sees a clean diff), so the
+/// cap drops an event, never state.
+pub(crate) const MAX_TERMINAL_EVENTS_PER_TICK: usize = 32;
+/// Maximum `terminal.cwd-changed` events emitted per tick (issue #1828; same
+/// bound rationale as [`MAX_TERMINAL_EVENTS_PER_TICK`]).
+pub(crate) const MAX_CWD_EVENTS_PER_TICK: usize = 32;
+/// Maximum queued `process.exited` edge events (issue #1828).
+///
+/// Exits are rare (one per reaped child); the bound is structural. On
+/// overflow the oldest queued exit is dropped (`DropOldest`, the accepted v1
+/// default) and the snapshot still advances, so the `terminal.closed` diff on
+/// the same tick reports the teardown even when its exit code is lost.
+pub(crate) const MAX_PENDING_EXITS: usize = 16;
+/// Maximum bytes kept from a `cwd` report in a `terminal.cwd-changed`
+/// payload (issue #1828; `OSC 7` reports are parser-bounded far below this).
+pub(crate) const TERMINAL_CWD_MAX_BYTES: usize = 4096;
+/// Maximum bytes kept from a config path in a `config.reloaded` payload
+/// (issue #1828).
+pub(crate) const CONFIG_PATH_MAX_BYTES: usize = 1024;
 
 /// Stable-id payload for a workspace event (identity only, no content).
 fn workspace_id_value(seq: u64) -> LuaValue {
     LuaValue::Integer(i64::try_from(seq).unwrap_or(i64::MAX))
+}
+
+/// Stable-id payload for a terminal event (issue #1828; identity only).
+fn terminal_id_value(id: u64) -> LuaValue {
+    LuaValue::Integer(i64::try_from(id).unwrap_or(i64::MAX))
+}
+
+/// Truncates `s` to at most `max` bytes at a char boundary (issue #1828).
+///
+/// Payloads from untrusted PTY output (`OSC 7` cwd) and the filesystem
+/// (config path) are already bounded upstream; this is defense-in-depth so
+/// one envelope never exceeds its documented bound.
+fn truncate_to_bytes(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
 }
 
 /// Coalesced workspace events between two committed summaries (CTX-0889).
@@ -290,26 +358,126 @@ fn workspace_changes(
     events
 }
 
+/// One tick's snapshots for [`EventTracker::take_changes`] (issue #1828).
+///
+/// Bundles the eight diff inputs so the diff keeps two arguments under the
+/// lint bound; every field is a cold-tick read, never the PTY hot path.
+struct TrackerSnapshot<'a> {
+    title: &'a str,
+    window_focused: bool,
+    workspaces: &'a [WorkspaceSummary],
+    terminals: &'a [u64],
+    cwds: &'a [(u64, String)],
+    bell_observed: u64,
+    selection_owner: Option<u64>,
+    has_selection: bool,
+}
+
 impl EventTracker {
     fn from_runtime(runtime: &Runtime) -> Self {
         Self {
             title: runtime.state().title().to_string(),
             window_focused: runtime.is_window_focused(),
             workspaces: runtime.workspace_summaries(),
+            terminals: runtime.live_terminal_ids(),
+            cwds: runtime.terminal_cwds(),
+            bell_observed: runtime.bell_observed(),
+            selection_owner: runtime.selection_owner().map(|view| view.0),
+            has_selection: runtime.has_selection(),
         }
     }
 
     /// Diffs the tracker against the current state, updates it, and returns
     /// the coalesced events to deliver in order. Allocates only on change.
-    fn take_changes(
-        &mut self,
-        title: &str,
-        window_focused: bool,
-        workspaces: &[WorkspaceSummary],
-    ) -> Vec<(&'static str, LuaValue)> {
+    ///
+    /// Order: `workspace.*` (existing CTX-0889 order), `terminal.opened`
+    /// (ascending id), `terminal.closed` (ascending id),
+    /// `terminal.cwd-changed` (ascending id), `terminal.title-changed`,
+    /// `terminal.bell`, `focus.changed`, `selection.changed`. Terminal and
+    /// cwd diffs are capped ([`MAX_TERMINAL_EVENTS_PER_TICK`] /
+    /// [`MAX_CWD_EVENTS_PER_TICK`]); bell and selection coalesce to at most
+    /// one each per tick.
+    fn take_changes(&mut self, snap: TrackerSnapshot<'_>) -> Vec<(&'static str, LuaValue)> {
+        let TrackerSnapshot {
+            title,
+            window_focused,
+            workspaces,
+            terminals,
+            cwds,
+            bell_observed,
+            selection_owner,
+            has_selection,
+        } = snap;
         let mut events = workspace_changes(&self.workspaces, workspaces);
         if !events.is_empty() || self.workspaces.as_slice() != workspaces {
             self.workspaces = workspaces.to_vec();
+        }
+        // Terminal lifecycle: opened for new ids, closed for removed ids.
+        // Both lists arrive sorted; the snapshot always advances even when
+        // the cap drops events, so the next tick diffs clean state.
+        let mut opened: Vec<u64> = terminals
+            .iter()
+            .copied()
+            .filter(|id| !self.terminals.contains(id))
+            .collect();
+        opened.sort_unstable();
+        let mut closed: Vec<u64> = self
+            .terminals
+            .iter()
+            .copied()
+            .filter(|id| !terminals.contains(id))
+            .collect();
+        closed.sort_unstable();
+        self.terminals = terminals.to_vec();
+        for id in opened.into_iter().take(MAX_TERMINAL_EVENTS_PER_TICK) {
+            events.push((
+                "terminal.opened",
+                LuaValue::table([("terminal_id", terminal_id_value(id))]),
+            ));
+        }
+        for id in closed.into_iter().take(MAX_TERMINAL_EVENTS_PER_TICK) {
+            events.push((
+                "terminal.closed",
+                LuaValue::table([("terminal_id", terminal_id_value(id))]),
+            ));
+        }
+        // Cwd reports: one event per terminal whose report changed. Covers
+        // surviving terminals with a new report, new terminals that already
+        // report, and reports that cleared (emitted with an empty `cwd` so
+        // the clear is observable). Capped like the lifecycle diff.
+        fn cwd_of(rows: &[(u64, String)], id: u64) -> Option<&String> {
+            rows.iter()
+                .find(|(row_id, _)| *row_id == id)
+                .map(|(_, cwd)| cwd)
+        }
+        let mut cwd_events: Vec<(u64, String)> = Vec::new();
+        for (id, cwd) in cwds {
+            let changed = match cwd_of(&self.cwds, *id) {
+                Some(old) => old != cwd,
+                None => true,
+            };
+            if changed {
+                cwd_events.push((*id, cwd.clone()));
+            }
+        }
+        for (id, _) in &self.cwds {
+            if cwd_of(cwds, *id).is_none() {
+                cwd_events.push((*id, String::new()));
+            }
+        }
+        cwd_events.sort_by_key(|(id, _)| *id);
+        self.cwds = cwds.to_vec();
+        for (id, cwd) in cwd_events.into_iter().take(MAX_CWD_EVENTS_PER_TICK) {
+            events.push((
+                "terminal.cwd-changed",
+                LuaValue::table([
+                    ("terminal_id", terminal_id_value(id)),
+                    (
+                        "cwd",
+                        LuaValue::String(truncate_to_bytes(&cwd, TERMINAL_CWD_MAX_BYTES)),
+                    ),
+                ]),
+            ));
         }
         if self.title != title {
             self.title = title.to_string();
@@ -318,12 +486,37 @@ impl EventTracker {
                 LuaValue::table([("title", LuaValue::String(self.title.clone()))]),
             ));
         }
+        // Bell: any advance of the observed counter since the last tick
+        // means at least one `BEL` arrived; coalesce the burst to one event.
+        // The payload is intentionally empty (v1 carries no bell metadata).
+        if self.bell_observed != bell_observed {
+            self.bell_observed = bell_observed;
+            events.push(("terminal.bell", LuaValue::Table(Vec::new())));
+        }
         if self.window_focused != window_focused {
             self.window_focused = window_focused;
             events.push((
                 "focus.changed",
                 LuaValue::table([("focused", LuaValue::Bool(window_focused))]),
             ));
+        }
+        // Selection: owner or presence changed. The payload carries
+        // `selected` plus the owning `view_id` when one exists and never
+        // carries selection text (v1).
+        if self.selection_owner != selection_owner || self.has_selection != has_selection {
+            self.selection_owner = selection_owner;
+            self.has_selection = has_selection;
+            let mut table = vec![(
+                LuaValue::String(String::from("selected")),
+                LuaValue::Bool(has_selection),
+            )];
+            if let Some(owner) = selection_owner {
+                table.push((
+                    LuaValue::String(String::from("view_id")),
+                    terminal_id_value(owner),
+                ));
+            }
+            events.push(("selection.changed", LuaValue::Table(table)));
         }
         events
     }
@@ -408,6 +601,41 @@ pub(crate) struct TerminalApp {
     /// past this baseline, so a saturated `platform.notify` producer stays
     /// observable without spamming one line per dropped notice.
     last_plugin_queue_dropped: u64,
+    /// Queued `process.exited` edges from [`Self::reap_exited_shells`]
+    /// (issue #1828).
+    ///
+    /// Pushed on the event-loop reap path (never the PTY hot path),
+    /// drained by [`Self::deliver_runtime_events`] on the next cold tick.
+    /// Bounded ([`MAX_PENDING_EXITS`], drop-oldest); the `terminal.closed`
+    /// diff on the same tick still reports the teardown when an exit code
+    /// is dropped.
+    pending_exits: std::collections::VecDeque<PendingExit>,
+    /// Coalesced `config.reloaded` edge from `drive_tick` (issue #1828).
+    ///
+    /// Set when a file-poll or `ctl` reload applies on this tick, drained
+    /// by [`Self::deliver_runtime_events`] on the same tick. At most one
+    /// per tick; a second reload on the same tick overwrites the first.
+    pending_config: Option<PendingConfigReload>,
+}
+
+/// Queued process-exit edge (issue #1828; bounded, see
+/// [`MAX_PENDING_EXITS`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PendingExit {
+    /// `ViewId.0` of the exited terminal.
+    pub(crate) terminal_id: u64,
+    /// Raw exit code from [`bitty_pty::ExitStatus::code`].
+    pub(crate) exit_code: u32,
+}
+
+/// Coalesced config-reload edge (issue #1828; at most one per tick).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingConfigReload {
+    /// Resolved config path (or `(ctl)` for a `ctl`-triggered reload),
+    /// truncated to [`CONFIG_PATH_MAX_BYTES`].
+    pub(crate) path: String,
+    /// Machine-readable reload kind (`applied`; only applied reloads emit).
+    pub(crate) kind: String,
 }
 
 /// Outcome of polling exited child processes across pane and primary sessions.
@@ -454,6 +682,8 @@ impl TerminalApp {
             chrome_close_exit_requested: false,
             event_tracker,
             last_plugin_queue_dropped: 0,
+            pending_exits: std::collections::VecDeque::new(),
+            pending_config: None,
         }
     }
 
@@ -491,6 +721,8 @@ impl TerminalApp {
             chrome_close_exit_requested: false,
             event_tracker,
             last_plugin_queue_dropped: 0,
+            pending_exits: std::collections::VecDeque::new(),
+            pending_config: None,
         }
     }
 
@@ -949,12 +1181,33 @@ impl TerminalApp {
         // before the tick commits, so the presented frame reflects the new
         // presentation values. The watcher is a per-tick poll; without an
         // installed context this is a no-op.
-        let _ = crate::config_reload::poll_file(&mut self.runtime);
+        //
+        // Issue #1828: an applied reload also stages a coalesced
+        // `config.reloaded` edge for the plugin trace path below (at most
+        // one per tick; only `applied` reloads emit).
+        if let Some(info) = crate::config_reload::poll_file(&mut self.runtime) {
+            if info.applied && info.kind == "applied" {
+                self.pending_config = Some(PendingConfigReload {
+                    path: truncate_to_bytes(&info.path, CONFIG_PATH_MAX_BYTES),
+                    kind: info.kind.to_string(),
+                });
+            }
+        }
         // CTX-0898 (#1522): either reload path (ctl verb drained above or the
         // file poll) may have accepted chrome-owned fields; adopt them here
         // on the same tick so keys typed after this frame use the new table.
+        // A `ctl`-triggered reload stages only the app half here (the drain
+        // above consumed its reply), so an adoption without a file-poll edge
+        // above still emits one coalesced `config.reloaded`.
         if let Some(adoption) = crate::config_reload::take_app_adoption() {
+            let had_edge = self.pending_config.is_some();
             self.adopt_live_config(adoption);
+            if !had_edge {
+                self.pending_config = Some(PendingConfigReload {
+                    path: String::from("(ctl)"),
+                    kind: String::from("applied"),
+                });
+            }
         }
         // CTX-0889: apply plugin workspace mutations queued since the last
         // tick before it commits, so the presented frame reflects them.
@@ -1083,7 +1336,23 @@ impl TerminalApp {
     /// Runs once per tick at the end of [`Self::drive_tick`]. Coalesced per kind
     /// (see [`EventTracker::take_changes`]); handler failures are contained
     /// by the plugin runtime and never reach the app. No-op without plugins.
+    ///
+    /// Issue #1828: covers the remaining devtools-declared observation
+    /// kinds. State diffs (`terminal.opened` / `terminal.closed` /
+    /// `terminal.cwd-changed` / `terminal.bell` / `selection.changed`) join
+    /// the existing `workspace.*` / `terminal.title-changed` /
+    /// `focus.changed` diff here; queued edges (`process.exited` from
+    /// [`Self::reap_exited_shells`], `config.reloaded` from `drive_tick`)
+    /// drain on the same cold path. Every emission runs after present, so a
+    /// slow Lua handler never delays terminal replies or the frame. The
+    /// declared-kinds precondition is honored inside
+    /// `PluginRuntime::deliver_event` (the trace hub records only declared
+    /// kinds), so delivery here is unconditional.
     fn deliver_runtime_events(&mut self) {
+        // Edge queues always advance, even without a plugin runtime, so a
+        // trace started later never observes a stale exit or reload.
+        let exits: Vec<PendingExit> = self.pending_exits.drain(..).collect();
+        let config = self.pending_config.take();
         let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
             return;
         };
@@ -1093,14 +1362,57 @@ impl TerminalApp {
         if let Some(live) = self.live_workspaces.as_ref() {
             live.publish(&workspaces);
         }
-        let events = self.event_tracker.take_changes(
-            self.runtime.state().title(),
-            self.runtime.is_window_focused(),
-            &workspaces,
-        );
+        // One bounded snapshot pass serves the whole state diff (issue
+        // #1828): terminals, per-terminal cwds, the observed-`BEL` counter,
+        // and the selection owner/presence. All cold-tick reads, never the
+        // PTY hot path.
+        let terminals = self.runtime.live_terminal_ids();
+        let cwds = self.runtime.terminal_cwds();
+        let bell_observed = self.runtime.bell_observed();
+        let selection_owner = self.runtime.selection_owner().map(|view| view.0);
+        let has_selection = self.runtime.has_selection();
+        let events = self.event_tracker.take_changes(TrackerSnapshot {
+            title: self.runtime.state().title(),
+            window_focused: self.runtime.is_window_focused(),
+            workspaces: &workspaces,
+            terminals: &terminals,
+            cwds: &cwds,
+            bell_observed,
+            selection_owner,
+            has_selection,
+        });
         for (kind, payload) in &events {
             let _delivered = plugin_runtime.deliver_event(kind, payload);
         }
+        for exit in &exits {
+            let payload = LuaValue::table([
+                ("terminal_id", terminal_id_value(exit.terminal_id)),
+                ("exit_code", LuaValue::Integer(i64::from(exit.exit_code))),
+            ]);
+            let _delivered = plugin_runtime.deliver_event("process.exited", &payload);
+        }
+        if let Some(reload) = config {
+            let payload = LuaValue::table([
+                ("path", LuaValue::String(reload.path)),
+                ("kind", LuaValue::String(reload.kind)),
+            ]);
+            let _delivered = plugin_runtime.deliver_event("config.reloaded", &payload);
+        }
+    }
+
+    /// Queues one `process.exited` edge (issue #1828).
+    ///
+    /// Bounded ([`MAX_PENDING_EXITS`], drop-oldest): the `terminal.closed`
+    /// diff on the same tick still reports the teardown when an exit code is
+    /// dropped. Cold reap path only, never the PTY hot path.
+    fn push_pending_exit(&mut self, terminal_id: u64, exit_code: u32) {
+        if self.pending_exits.len() >= MAX_PENDING_EXITS {
+            self.pending_exits.pop_front();
+        }
+        self.pending_exits.push_back(PendingExit {
+            terminal_id,
+            exit_code,
+        });
     }
 
     /// Drains grant-gated plugin notifications into the bounded banner
@@ -1590,6 +1902,14 @@ impl TerminalApp {
     ///
     /// When the last remaining panel exits, returns [`ShellExitOutcome::AppExiting`]
     /// so the caller can save session state and signal `ctx.exit()`.
+    ///
+    /// Issue #1828: every reaped exit also queues a bounded `process.exited`
+    /// edge (`terminal_id` + `exit_code`) for the next cold-tick delivery.
+    /// Pane-level exits (`PaneClosed`) deliver on the next tick alongside
+    /// the `terminal.closed` diff. Session-ending exits (`AppExiting`) queue
+    /// the same edge but the loop shuts down without another tick, so only
+    /// a surviving session observes exits. Runs on the event-loop reap path,
+    /// never the PTY hot path.
     pub(crate) fn reap_exited_shells(&mut self) -> ShellExitOutcome {
         // 1. Split pane sessions: poll each active session's child.
         let pane_ids: Vec<bitty_runtime::ViewId> = self.runtime.pane_session_ids();
@@ -1607,6 +1927,7 @@ impl TerminalApp {
                             status.signal()
                         )
                     });
+                    self.push_pending_exit(view.0, status.code());
                     return ShellExitOutcome::AppExiting;
                 }
 
@@ -1624,6 +1945,7 @@ impl TerminalApp {
                     self.runtime.set_layout_closing(layout, view);
                 }
                 self.runtime.close_pane_session(&view);
+                self.push_pending_exit(view.0, status.code());
                 closed_any = true;
             }
         }
@@ -1639,6 +1961,8 @@ impl TerminalApp {
                         status.signal()
                     )
                 });
+                let terminal_id = self.runtime.primary_view().map(|view| view.0).unwrap_or(0);
+                self.push_pending_exit(terminal_id, status.code());
                 return ShellExitOutcome::AppExiting;
             }
 
@@ -1659,6 +1983,7 @@ impl TerminalApp {
                 if crate::chrome_keys::close_focused_leaf(&mut layout, primary_view) {
                     self.runtime.set_layout_closing(layout, primary_view);
                 }
+                self.push_pending_exit(primary_view.0, status.code());
                 closed_any = true;
             }
         }
@@ -2423,37 +2748,94 @@ mod event_tracker_tests {
             title: title.to_string(),
             window_focused,
             workspaces: Vec::new(),
+            terminals: Vec::new(),
+            cwds: Vec::new(),
+            bell_observed: 0,
+            selection_owner: None,
+            has_selection: false,
+        }
+    }
+
+    /// Full snapshot with defaults for the untouched trailing fields.
+    fn snap<'a>(
+        title: &'a str,
+        focused: bool,
+        workspaces: &'a [bitty_runtime::WorkspaceSummary],
+    ) -> TrackerSnapshot<'a> {
+        TrackerSnapshot {
+            title,
+            window_focused: focused,
+            workspaces,
+            terminals: &[],
+            cwds: &[],
+            bell_observed: 0,
+            selection_owner: None,
+            has_selection: false,
+        }
+    }
+
+    /// Default trailing snapshots: no terminals, no cwds, no bell, no selection.
+    fn tracked(
+        t: &mut EventTracker,
+        title: &str,
+        focused: bool,
+        workspaces: &[bitty_runtime::WorkspaceSummary],
+    ) -> Vec<(&'static str, LuaValue)> {
+        t.take_changes(snap(title, focused, workspaces))
+    }
+
+    /// Full snapshot overriding terminals/cwds/bell/selection.
+    #[allow(clippy::too_many_arguments)]
+    fn full<'a>(
+        title: &'a str,
+        focused: bool,
+        workspaces: &'a [bitty_runtime::WorkspaceSummary],
+        terminals: &'a [u64],
+        cwds: &'a [(u64, String)],
+        bell_observed: u64,
+        selection_owner: Option<u64>,
+        has_selection: bool,
+    ) -> TrackerSnapshot<'a> {
+        TrackerSnapshot {
+            title,
+            window_focused: focused,
+            workspaces,
+            terminals,
+            cwds,
+            bell_observed,
+            selection_owner,
+            has_selection,
         }
     }
 
     #[test]
     fn unchanged_state_delivers_nothing() {
         let mut t = tracker("same", true);
-        assert!(t.take_changes("same", true, &[]).is_empty());
+        assert!(tracked(&mut t, "same", true, &[]).is_empty());
     }
 
     #[test]
     fn title_change_coalesces_to_latest_and_updates_tracker() {
         let mut t = tracker("old", false);
-        let changes = t.take_changes("newest", false, &[]);
-        assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].0, "terminal.title-changed");
+        let out = tracked(&mut t, "newest", false, &[]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "terminal.title-changed");
         assert_eq!(
-            changes[0].1,
+            out[0].1,
             LuaValue::table([("title", LuaValue::String("newest".into()))])
         );
         assert_eq!(t.title, "newest");
-        assert!(t.take_changes("newest", false, &[]).is_empty());
+        assert!(tracked(&mut t, "newest", false, &[]).is_empty());
     }
 
     #[test]
     fn focus_change_carries_new_value() {
         let mut t = tracker("x", false);
-        let changes = t.take_changes("x", true, &[]);
-        assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].0, "focus.changed");
+        let out = tracked(&mut t, "x", true, &[]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "focus.changed");
         assert_eq!(
-            changes[0].1,
+            out[0].1,
             LuaValue::table([("focused", LuaValue::Bool(true))])
         );
         assert!(t.window_focused);
@@ -2462,8 +2844,7 @@ mod event_tracker_tests {
     #[test]
     fn both_changes_are_bounded_to_one_event_per_kind() {
         let mut t = tracker("a", false);
-        let kinds: Vec<_> = t
-            .take_changes("b", true, &[])
+        let kinds: Vec<_> = tracked(&mut t, "b", true, &[])
             .into_iter()
             .map(|(k, _)| k)
             .collect();
@@ -2483,13 +2864,16 @@ mod event_tracker_tests {
         };
         let mut t = tracker("t", true);
         let old = vec![ws(1, "ws1", true, vec![10]), ws(2, "ws2", false, vec![20])];
-        assert!(t.take_changes("t", true, &old).is_empty(), "first snapshot");
+        assert!(
+            tracked(&mut t, "t", true, &old).is_empty(),
+            "first snapshot"
+        );
         // Workspace 1 closed, 3 created, 2 renamed+changed, 2 focused.
         let new = vec![
             ws(2, "edited", true, vec![20, 21]),
             ws(3, "ws3", false, vec![30]),
         ];
-        let events = t.take_changes("t", true, &new);
+        let events = tracked(&mut t, "t", true, &new);
         let kinds: Vec<_> = events.iter().map(|(k, _)| *k).collect();
         assert_eq!(
             kinds,
@@ -2532,10 +2916,10 @@ mod event_tracker_tests {
         };
         let mut t = tracker("t", true);
         let old = vec![ws(1, "ws1", true, vec![10]), ws(2, "ws2", false, vec![20])];
-        t.take_changes("t", true, &old);
+        tracked(&mut t, "t", true, &old);
         // Two workspaces closed, two created: four events bounded by workspace count.
         let new = vec![ws(3, "ws3", true, vec![30]), ws(4, "ws4", false, vec![40])];
-        let events = t.take_changes("t", true, &new);
+        let events = tracked(&mut t, "t", true, &new);
         assert_eq!(
             events.len(),
             5,
@@ -2556,20 +2940,20 @@ mod event_tracker_tests {
         };
         let mut t = tracker("t", true);
         let old = vec![ws(1, "ws1", true, vec![10])];
-        t.take_changes("t", true, &old);
+        tracked(&mut t, "t", true, &old);
         let same = vec![ws(1, "ws1", true, vec![10])];
         assert!(
-            t.take_changes("t", true, &same).is_empty(),
+            tracked(&mut t, "t", true, &same).is_empty(),
             "identical summary fires nothing"
         );
         // Name change only: one renamed event.
         let renamed = vec![ws(1, "editor", true, vec![10])];
-        let events = t.take_changes("t", true, &renamed);
+        let events = tracked(&mut t, "t", true, &renamed);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].0, "workspace.renamed");
         // Panel change only: one changed event.
         let changed = vec![ws(1, "editor", true, vec![10, 11])];
-        let events = t.take_changes("t", true, &changed);
+        let events = tracked(&mut t, "t", true, &changed);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].0, "workspace.changed");
     }
@@ -2591,19 +2975,348 @@ mod event_tracker_tests {
         let mut t = tracker("t", true);
         let empty = vec![ws(false)];
         assert!(
-            t.take_changes("t", true, &empty).is_empty(),
+            tracked(&mut t, "t", true, &empty).is_empty(),
             "first snapshot"
         );
         // Put: identical panels, occupancy flipped -> one changed event.
-        let events = t.take_changes("t", true, &[ws(true)]);
+        let events = tracked(&mut t, "t", true, &[ws(true)]);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].0, "workspace.changed");
         // Take: flips back -> one changed event.
-        let events = t.take_changes("t", true, &empty);
+        let events = tracked(&mut t, "t", true, &empty);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].0, "workspace.changed");
         // Steady occupied: nothing fires.
-        t.take_changes("t", true, &[ws(true)]);
-        assert!(t.take_changes("t", true, &[ws(true)]).is_empty());
+        tracked(&mut t, "t", true, &[ws(true)]);
+        assert!(tracked(&mut t, "t", true, &[ws(true)]).is_empty());
+    }
+
+    /// Issue #1828: terminal lifecycle diffs emit one event per id, in
+    /// ascending order, and the snapshot advances even under the cap.
+    #[test]
+    fn terminal_opened_closed_diff_in_id_order() {
+        let mut t = tracker("t", true);
+        let events = t.take_changes(full("t", true, &[], &[1, 2], &[], 0, None, false));
+        let kinds: Vec<_> = events.iter().map(|(k, _)| *k).collect();
+        assert_eq!(kinds, ["terminal.opened", "terminal.opened"]);
+        let ids: Vec<i64> = events
+            .iter()
+            .map(|(_, payload)| match payload {
+                LuaValue::Table(pairs) => pairs
+                    .iter()
+                    .find_map(|(k, v)| match (k, v) {
+                        (LuaValue::String(s), LuaValue::Integer(id)) if s == "terminal_id" => {
+                            Some(*id)
+                        }
+                        _ => None,
+                    })
+                    .expect("terminal_id"),
+                _ => panic!("payload not a table"),
+            })
+            .collect();
+        assert_eq!(ids, [1, 2]);
+        // Steady state fires nothing.
+        assert!(
+            t.take_changes(full("t", true, &[], &[1, 2], &[], 0, None, false))
+                .is_empty()
+        );
+        // One closed, one opened on the same tick.
+        let events = t.take_changes(full("t", true, &[], &[2, 3], &[], 0, None, false));
+        let kinds: Vec<_> = events.iter().map(|(k, _)| *k).collect();
+        assert_eq!(kinds, ["terminal.opened", "terminal.closed"]);
+    }
+
+    /// Issue #1828: cwd diffs fire per changed terminal, including clears.
+    #[test]
+    fn cwd_changed_fires_per_terminal_and_on_clear() {
+        let mut t = tracker("t", true);
+        let cwds = vec![(1u64, String::from("/tmp/a"))];
+        let events = t.take_changes(full("t", true, &[], &[1], &cwds, 0, None, false));
+        // New terminal without a prior report: opened + cwd-changed.
+        let kinds: Vec<_> = events.iter().map(|(k, _)| *k).collect();
+        assert!(kinds.contains(&"terminal.opened"), "{kinds:?}");
+        assert!(kinds.contains(&"terminal.cwd-changed"), "{kinds:?}");
+        // Same cwd fires nothing.
+        assert!(
+            t.take_changes(full("t", true, &[], &[1], &cwds, 0, None, false))
+                .is_empty()
+        );
+        // Changed cwd fires once with the new value.
+        let next = vec![(1u64, String::from("/tmp/b"))];
+        let events = t.take_changes(full("t", true, &[], &[1], &next, 0, None, false));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "terminal.cwd-changed");
+        // Cleared report fires once with an empty `cwd`.
+        let events = t.take_changes(full("t", true, &[], &[1], &[], 0, None, false));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "terminal.cwd-changed");
+    }
+
+    /// Issue #1828: any `BEL` advance coalesces to exactly one `terminal.bell`.
+    #[test]
+    fn bell_coalesces_bursts_to_one_event() {
+        let mut t = tracker("t", true);
+        assert!(
+            t.take_changes(full("t", true, &[], &[], &[], 0, None, false))
+                .is_empty()
+        );
+        let events = t.take_changes(full("t", true, &[], &[], &[], 7, None, false));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "terminal.bell");
+        // Same counter fires nothing; a further advance fires once more.
+        assert!(
+            t.take_changes(full("t", true, &[], &[], &[], 7, None, false))
+                .is_empty()
+        );
+        let events = t.take_changes(full("t", true, &[], &[], &[], 8, None, false));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "terminal.bell");
+    }
+
+    /// Issue #1828: selection diffs carry `selected` + `view_id`, never text.
+    #[test]
+    fn selection_changed_carries_owner_without_text() {
+        let mut t = tracker("t", true);
+        let events = t.take_changes(full("t", true, &[], &[], &[], 0, Some(9), true));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "selection.changed");
+        match &events[0].1 {
+            LuaValue::Table(pairs) => {
+                assert!(pairs.iter().any(|(k, v)| {
+                    matches!(
+                        (k, v),
+                        (LuaValue::String(s), LuaValue::Bool(true)) if s == "selected"
+                    )
+                }));
+                assert!(pairs.iter().any(|(k, v)| {
+                    matches!(
+                        (k, v),
+                        (LuaValue::String(s), LuaValue::Integer(9)) if s == "view_id"
+                    )
+                }));
+                assert!(!format!("{pairs:?}").contains("hunter2"));
+            }
+            _ => panic!("payload not a table"),
+        }
+        // Clearing fires once with `selected = false`.
+        let events = t.take_changes(full("t", true, &[], &[], &[], 0, None, false));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "selection.changed");
+        assert!(
+            t.take_changes(full("t", true, &[], &[], &[], 0, None, false))
+                .is_empty()
+        );
+    }
+
+    /// Issue #1828: the terminal lifecycle cap drops events, never state.
+    #[test]
+    fn terminal_event_cap_adopts_state() {
+        let mut t = tracker("t", true);
+        let many: Vec<u64> =
+            (1..=u64::try_from(MAX_TERMINAL_EVENTS_PER_TICK).unwrap_or(32) + 5).collect();
+        let events = t.take_changes(full("t", true, &[], &many, &[], 0, None, false));
+        let opened = events
+            .iter()
+            .filter(|(k, _)| *k == "terminal.opened")
+            .count();
+        assert_eq!(opened, MAX_TERMINAL_EVENTS_PER_TICK);
+        assert_eq!(t.terminals, many, "snapshot advances past the cap");
+        assert!(
+            t.take_changes(full("t", true, &[], &many, &[], 0, None, false))
+                .is_empty(),
+            "next tick diffs clean state"
+        );
+    }
+
+    /// Issue #1828: `truncate_to_bytes` respects char boundaries.
+    #[test]
+    fn truncate_keeps_char_boundary() {
+        assert_eq!(truncate_to_bytes("abc", 10), "abc");
+        // `é` is two bytes: a 3-byte cut keeps one full char.
+        assert_eq!(truncate_to_bytes("aé", 3), "aé");
+        assert_eq!(truncate_to_bytes("aé", 2), "a");
+    }
+}
+
+/// Issue #1828 end to end on a real host bridge (no kernel PTY).
+///
+/// A headless app wired to a tracer plugin declaring the nine devtools
+/// kinds: synthetic PTY bytes drive the `title`/`bell` state diffs, `select_all`
+/// drives `selection.changed`, and directly staged edges stand in for the
+/// reap/config producers (covered by their own tests). One `drive_tick`
+/// delivers everything on the cold path and the trace records it, proving
+/// the declared-kinds precondition lets the seven missing kinds through.
+/// `terminal.opened` / `terminal.closed` / `terminal.cwd-changed` need a live
+/// PTY and are covered by the `#[cfg(unix)]` live session in `tests.rs`.
+#[cfg(test)]
+mod trace_kinds_1828_tests {
+    use super::*;
+    use bitty_runtime::plugin_runtime::{
+        EmptySettings, PluginRuntime, PluginRuntimeConfig, SnapshotSource,
+    };
+
+    struct NoSnapshot;
+
+    impl SnapshotSource for NoSnapshot {
+        fn snapshot(&self, _scope: &str) -> Result<LuaValue, bitty_lua::BridgeError> {
+            Err(bitty_lua::BridgeError::capability_denied(
+                "terminal.semantic-read",
+            ))
+        }
+    }
+
+    const TRACER_ID: &str = "bitty-featured.trace-1828-test";
+
+    const TRACER_LUA: &str = r#"
+local handle = nil
+bitty.commands.register({
+  id = "start",
+  title = "Start trace",
+  run = function()
+    handle = bitty.debug.trace(nil)
+    return tostring(handle)
+  end,
+})
+bitty.commands.register({
+  id = "drain",
+  title = "Drain trace",
+  run = function()
+    local result = bitty.debug.trace_get(handle)
+    if result == nil then return "NIL" end
+    local out = {}
+    for _, record in ipairs(result.records) do out[#out + 1] = record.topic end
+    return table.concat(out, ",")
+  end,
+})
+"#;
+
+    fn tracer_app() -> (TerminalApp, String, std::path::PathBuf) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tag = format!("trace1828-{}-{counter}", std::process::id());
+        let root = std::env::temp_dir().join(format!("bitty-{tag}-root"));
+        let data = std::env::temp_dir().join(format!("bitty-{tag}-data"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&data);
+        let plugin_dir = root.join(TRACER_ID);
+        std::fs::create_dir_all(plugin_dir.join("lua")).expect("dirs");
+        std::fs::write(
+            plugin_dir.join("bitty-plugin.toml"),
+            format!(
+                concat!(
+                    "[plugin]\n",
+                    "id = \"{id}\"\n",
+                    "name = \"Trace 1828\"\n",
+                    "version = \"0.1.0\"\n",
+                    "description = \"trace test\"\n",
+                    "\n",
+                    "[compat]\n",
+                    "plugin-api = \"^1.0\"\n",
+                    "\n",
+                    "[capabilities]\n",
+                    "debug.trace = true\n",
+                    "\n",
+                    "[lazy]\n",
+                    "commands = [\"{id}:start\", \"{id}:drain\"]\n",
+                    "events = [\"terminal.opened\", \"terminal.closed\", ",
+                    "\"terminal.title-changed\", \"terminal.cwd-changed\", \"terminal.bell\", ",
+                    "\"focus.changed\", \"selection.changed\", \"process.exited\", ",
+                    "\"config.reloaded\"]\n",
+                ),
+                id = TRACER_ID,
+            ),
+        )
+        .expect("manifest");
+        std::fs::write(plugin_dir.join("lua/init.lua"), TRACER_LUA).expect("init");
+        let mut plugin_runtime = PluginRuntime::new(PluginRuntimeConfig {
+            safe_mode: false,
+            data_dir: Some(data),
+            store_root: None,
+            bundled_roots: Vec::new(),
+            third_party_roots: vec![root.clone()],
+            settings: std::rc::Rc::new(EmptySettings),
+            snapshot: std::rc::Rc::new(NoSnapshot),
+        });
+        plugin_runtime.set_store_backend(Some(std::sync::Arc::new(
+            crate::storage_backends::StorageKvBackend::new(),
+        )));
+        plugin_runtime.discover();
+        let pid = bitty_plugin_host::manifest::PluginId::new(TRACER_ID).expect("valid id");
+        plugin_runtime.activate(&pid).expect("activate");
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let rt = Runtime::with_defaults().expect("must build");
+        let mut app = TerminalApp::with_theme(
+            rt,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            maps,
+            SpawnSpec::default(),
+        );
+        app = app.with_plugin_runtime(Some(plugin_runtime));
+        (app, TRACER_ID.to_string(), root)
+    }
+
+    fn dispatch(app: &mut TerminalApp, id: &str, command: &str) -> String {
+        let pid = bitty_plugin_host::manifest::PluginId::new(id).expect("valid id");
+        match app
+            .plugin_runtime
+            .as_mut()
+            .expect("plugin runtime")
+            .dispatch_command(&pid, command, &[])
+        {
+            Ok(LuaValue::String(s)) => s,
+            Ok(other) => panic!("{command}: expected string, got {other:?}"),
+            Err(error) => panic!("{command}: dispatch failed: {error:?}"),
+        }
+    }
+
+    #[test]
+    fn pending_exit_queue_drops_oldest_at_cap() {
+        let (mut app, _, root) = tracer_app();
+        for id in 0..=u64::try_from(MAX_PENDING_EXITS).unwrap_or(16) {
+            app.push_pending_exit(id, 1);
+        }
+        assert_eq!(app.pending_exits.len(), MAX_PENDING_EXITS);
+        assert_eq!(
+            app.pending_exits.front().map(|exit| exit.terminal_id),
+            Some(1)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn headless_state_and_staged_edges_record_in_trace() {
+        let (mut app, id, root) = tracer_app();
+        assert_eq!(dispatch(&mut app, &id, "start"), "1");
+        // Baseline tick establishes the tracker snapshot; nothing fires.
+        let _ = app.drive_tick();
+        assert_eq!(dispatch(&mut app, &id, "drain"), "");
+        // State diffs through the real Runtime: OSC title, BEL, selection.
+        app.runtime.handle_pty_bytes(b"\x1b]0;trace-title\x07");
+        app.runtime.handle_pty_bytes(b"\x07");
+        app.runtime.select_all();
+        // Edges staged as the reap/config producers would stage them.
+        app.push_pending_exit(7, 3);
+        app.pending_config = Some(PendingConfigReload {
+            path: String::from("bitty.toml"),
+            kind: String::from("applied"),
+        });
+        let _ = app.drive_tick();
+        let drained = dispatch(&mut app, &id, "drain");
+        for kind in [
+            "terminal.title-changed",
+            "terminal.bell",
+            "selection.changed",
+            "process.exited",
+            "config.reloaded",
+        ] {
+            assert!(
+                drained.split(',').any(|topic| topic == kind),
+                "trace must record {kind}; drained: {drained}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

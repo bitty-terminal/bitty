@@ -772,7 +772,11 @@ impl Runtime {
             if let Some(ev) = pre_event {
                 // CTX-0577: the bell policy decides the user-visible surface
                 // (bounded visual flash by default, rate-limited under RC-8).
+                // Issue #1828: count every BEL for plugin telemetry before
+                // the policy runs, so `Off` mode still observes the signal;
+                // the app emits at most one coalesced `terminal.bell` tick.
                 if matches!(ev, ColdEvent::Bell) {
+                    self.bell_observed = self.bell_observed.saturating_add(1);
                     let _ = self.apply_bell_policy(std::time::Instant::now());
                 }
                 // Cold queue: bounded, drop-oldest, never blocks.

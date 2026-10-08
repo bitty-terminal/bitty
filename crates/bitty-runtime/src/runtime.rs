@@ -110,7 +110,8 @@ use bitty_ui::{
     search::SearchState,
 };
 use bitty_vt::{
-    ClipboardOp, DynamicColorOp, DynamicColorTarget, PaletteColorOp, Parser, SequenceKind,
+    BoundedString, ClipboardOp, DynamicColorOp, DynamicColorTarget, Notification,
+    NotificationSource, PaletteColorOp, Parser, SequenceKind,
 };
 
 use bitty_plugin_host::{
@@ -992,6 +993,12 @@ pub struct Runtime {
     /// Admitted notifications not delivered (no sink installed, skipped,
     /// or failed).
     notifications_os_undelivered: u64,
+    /// Plugin-originated notifications refused at admission since creation
+    /// (CTX-1033, issue #1827): over the shared `RC-8` ceiling, queue-full,
+    /// or empty after sanitizing. Queue-full refusals additionally appear in
+    /// [`Self::notifications_queue_dropped`]; rate refusals additionally
+    /// appear in [`Self::bell_rate_dropped`].
+    plugin_notifications_dropped: u64,
     // Input/Pointer RFC (CTX-0107) state for single-window slice
     enhanced_keyboard_flags: u32,
     shift_pressed: bool,
@@ -1539,6 +1546,7 @@ impl Runtime {
             audible_bell_undelivered: 0,
             notifications_os_delivered: 0,
             notifications_os_undelivered: 0,
+            plugin_notifications_dropped: 0,
             enhanced_keyboard_flags: 0,
             shift_pressed: false,
             control_pressed: false,
@@ -1781,6 +1789,7 @@ impl Runtime {
             audible_bell_undelivered: 0,
             notifications_os_delivered: 0,
             notifications_os_undelivered: 0,
+            plugin_notifications_dropped: 0,
             enhanced_keyboard_flags: 0,
             shift_pressed: false,
             control_pressed: false,
@@ -2312,6 +2321,13 @@ impl Runtime {
         self.notifications.dropped()
     }
 
+    /// Plugin-originated notifications refused at admission since creation
+    /// (CTX-1033, issue #1827).
+    #[must_use]
+    pub const fn plugin_notifications_dropped(&self) -> u64 {
+        self.plugin_notifications_dropped
+    }
+
     /// Number of admitted notifications awaiting presentation.
     #[must_use]
     pub fn pending_notification_count(&self) -> usize {
@@ -2454,6 +2470,70 @@ impl Runtime {
             return false;
         };
         self.apply_notification_policy(&notification, now)
+    }
+
+    /// Admits one grant-gated plugin notification into the bounded banner
+    /// surface (CTX-1033, issue #1827). Returns `true` when the notification
+    /// reached the banner or the bounded queue.
+    ///
+    /// The application drains
+    /// [`crate::plugin_runtime::PluginRuntime::drain_notifications`] once per
+    /// tick and feeds each entry here, so `bitty.notify.show` output (for
+    /// example `devtools:plugins`) paints on a real host through the same
+    /// one-banner-at-a-time in-grid surface (plus the installed OS sink)
+    /// the terminal-originated notifications use. No consent gate: the
+    /// `platform.notify` grant was already enforced when the plugin queued
+    /// the entry, and safe mode never creates the originating VM.
+    ///
+    /// Bounded and non-blocking: at most one `RC-8` limiter admission plus
+    /// one bounded queue push per call. Over-ceiling calls are dropped and
+    /// counted in [`Self::plugin_notifications_dropped`] (and in the shared
+    /// [`Self::bell_rate_dropped`]); queue-full calls are dropped and
+    /// counted in [`Self::plugin_notifications_dropped`] (and in the shared
+    /// [`Self::notifications_queue_dropped`]); empty-after-sanitize calls
+    /// are refused without counting. Admitted notifications reach the OS
+    /// sink inline, counted delivered/undelivered exactly like the terminal
+    /// path and never blocking. Plugin text is untrusted display data:
+    /// sanitized and single-line bounded before painting, never executed.
+    pub fn admit_plugin_notification(
+        &mut self,
+        title: &str,
+        body: &str,
+        now: std::time::Instant,
+    ) -> bool {
+        let clean_title = bell::sanitize_notification_text(title);
+        let clean_body = bell::sanitize_notification_text(body);
+        if clean_title.is_empty() && clean_body.is_empty() {
+            return false;
+        }
+        if !self.bell_limiter.admit_at(now) {
+            self.bell_rate_dropped = self.bell_rate_dropped.saturating_add(1);
+            self.plugin_notifications_dropped = self.plugin_notifications_dropped.saturating_add(1);
+            return false;
+        }
+        let notification = Notification {
+            source: NotificationSource::Plugin,
+            title: if clean_title.is_empty() {
+                None
+            } else {
+                Some(BoundedString::new(clean_title))
+            },
+            body: BoundedString::new(clean_body),
+        };
+        // Show immediately when no banner is live, so an admitted plugin
+        // notice is never silently parked until a frame arrives; queue it
+        // otherwise (the present path advances the queue on expiry).
+        let admitted = if self.notification_banner_at(now).is_none() {
+            self.show_notification_banner(&notification, now).is_some()
+        } else {
+            self.notifications.push(notification.clone())
+        };
+        if admitted {
+            self.deliver_notification_to_os(&notification);
+        } else {
+            self.plugin_notifications_dropped = self.plugin_notifications_dropped.saturating_add(1);
+        }
+        admitted
     }
 
     /// Hands one admitted notification to the installed OS sink (CTX-0754).

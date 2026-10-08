@@ -705,3 +705,38 @@ fn legit_manifest_unaffected_by_quotas() {
     let _ = std::fs::remove_dir_all(&data);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn notification_queue_overflow_is_counted_not_silent() {
+    // CTX-1033 (issue #1827): the `platform.notify` queue is bounded by
+    // `NOTIFICATION_QUEUE_CAPACITY`; over-capacity pushes drop the newest
+    // and count the loss so the tick drain can report it.
+    use bitty_runtime::plugin_runtime::NOTIFICATION_QUEUE_CAPACITY;
+    let data = temp_dir("notify-overflow");
+    let mut rt = runtime(Vec::new(), vec![fixtures_root()], data.clone(), false);
+    rt.discover();
+    rt.activate(&sample_id()).expect("activate");
+    assert_eq!(rt.notifications_dropped(), 0);
+    let extra = 6usize;
+    for _ in 0..(NOTIFICATION_QUEUE_CAPACITY + extra) {
+        rt.dispatch_command(&sample_id(), "summary", &[])
+            .expect("dispatch");
+    }
+    assert_eq!(
+        rt.notifications_dropped(),
+        extra as u64,
+        "over-capacity pushes must be counted, never silent"
+    );
+    let drained = rt.drain_notifications();
+    assert_eq!(
+        drained.len(),
+        NOTIFICATION_QUEUE_CAPACITY,
+        "the queue holds exactly its cap"
+    );
+    assert!(
+        drained.iter().all(|notice| notice.title == "Sample"),
+        "retained entries converge to the newest burst"
+    );
+    assert!(rt.drain_notifications().is_empty());
+    let _ = std::fs::remove_dir_all(&data);
+}

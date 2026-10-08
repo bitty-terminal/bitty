@@ -6893,3 +6893,190 @@ claims = []
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&data);
 }
+
+#[test]
+fn plugin_notify_drain_and_dispatch_result_reach_banner() {
+    // CTX-1033 (issue #1827) end-to-end through the app tick path: a plugin
+    // command that notifies (`bitty.notify.show`) and returns text must
+    // become visible on a real host — the notice via the per-tick drain, the
+    // return value via dispatch-result surfacing — both on the bounded
+    // banner surface, with overflow counted and the tick never blocked.
+    use bitty_runtime::plugin_runtime::{
+        BridgeError, EmptySettings, LuaValue, PluginRuntime, PluginRuntimeConfig, SnapshotSource,
+    };
+
+    struct StaticSnapshot;
+    impl SnapshotSource for StaticSnapshot {
+        fn snapshot(&self, _scope: &str) -> Result<LuaValue, BridgeError> {
+            Ok(LuaValue::table([
+                ("version", LuaValue::Integer(1)),
+                ("zones", LuaValue::array(vec![])),
+            ]))
+        }
+    }
+
+    let tag = format!("ctx1033-{}", std::process::id());
+    let root = std::env::temp_dir().join(format!("bitty-{tag}-root"));
+    let data = std::env::temp_dir().join(format!("bitty-{tag}-data"));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&data);
+    let id = "bitty-featured.ctx1033wire";
+    let plugin_dir = root.join(id);
+    std::fs::create_dir_all(plugin_dir.join("lua")).expect("dirs");
+    std::fs::write(
+        plugin_dir.join("bitty-plugin.toml"),
+        format!(
+            r#"[plugin]
+id = "{id}"
+name = "CTX-1033 wiring"
+version = "0.1.0"
+description = "notify drain + dispatch surfacing test"
+
+[compat]
+plugin-api = "^1.0"
+
+[capabilities]
+platform.notify = true
+
+[lazy]
+commands = ["{id}:report"]
+events = []
+"#
+        ),
+    )
+    .expect("manifest");
+    std::fs::write(
+        plugin_dir.join("lua/init.lua"),
+        r#"
+        bitty.commands.register({
+          id = "report",
+          title = "Report",
+          run = function(_args)
+            bitty.notify.show({ title = "Wire", body = "notice-visible" })
+            return "result-visible-text"
+          end,
+        })
+        return {}
+        "#,
+    )
+    .expect("init");
+
+    let mut plugin_runtime = PluginRuntime::new(PluginRuntimeConfig {
+        safe_mode: false,
+        data_dir: Some(data.clone()),
+        store_root: None,
+        bundled_roots: Vec::new(),
+        third_party_roots: vec![root.clone()],
+        settings: std::rc::Rc::new(EmptySettings),
+        snapshot: std::rc::Rc::new(StaticSnapshot),
+    });
+    plugin_runtime.set_store_backend(Some(std::sync::Arc::new(
+        crate::storage_backends::StorageKvBackend::new(),
+    )));
+    plugin_runtime.discover();
+    let pid = bitty_plugin_host::manifest::PluginId::new(id).expect("valid id");
+    let report = plugin_runtime.activate(&pid).expect("activate");
+    assert_eq!(
+        report.state,
+        bitty_runtime::plugin_runtime::LifecycleState::Active
+    );
+
+    let maps =
+        bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        maps,
+        SpawnSpec::default(),
+    );
+    app = app.with_plugin_runtime(Some(plugin_runtime));
+
+    // Dispatch-result half: a band click runs the command and the returned
+    // text must paint immediately (no live banner yet). The run also queues
+    // its one-line notice for the tick drain below.
+    app.dispatch_band_click(bitty_runtime::BandClickRequest {
+        plugin_id: id.to_string(),
+        command: "report".to_string(),
+        args: Vec::<(String, bitty_lua::ui::ClickArg)>::new(),
+    });
+    assert_eq!(
+        app.runtime.notification_banner().as_deref(),
+        Some("bitty-featured.ctx1033wire:report: result-visible-text"),
+        "the dispatch result must surface on the banner"
+    );
+
+    // Notify-drain half: the tick drains the queued notice into the bounded
+    // queue behind the live banner (never blocking the frame).
+    let _ = app.drive_tick();
+    assert_eq!(
+        app.runtime.pending_notification_count(),
+        1,
+        "the drained notice must wait in the bounded queue"
+    );
+    assert_eq!(
+        app.plugin_runtime
+            .as_ref()
+            .expect("plugin runtime")
+            .notifications_dropped(),
+        0
+    );
+    assert_eq!(app.runtime.plugin_notifications_dropped(), 0);
+
+    // The queued notice rotates onto the banner once the first expires:
+    // the full notify-then-present loop is closed.
+    assert!(
+        app.runtime.advance_notification_banner_at(
+            std::time::Instant::now() + std::time::Duration::from_secs(5)
+        ),
+        "the queued notice must advance onto the banner"
+    );
+    assert_eq!(
+        app.runtime.notification_banner().as_deref(),
+        Some("Wire: notice-visible"),
+        "the drained notice must paint"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&data);
+}
+
+#[test]
+fn lua_result_summary_is_bounded_and_readable() {
+    use crate::terminal_app::lua_result_summary;
+    use bitty_runtime::plugin_runtime::LuaValue;
+
+    assert_eq!(lua_result_summary(&LuaValue::Nil), "");
+    assert_eq!(lua_result_summary(&LuaValue::Bool(true)), "true");
+    assert_eq!(lua_result_summary(&LuaValue::Integer(-7)), "-7");
+    assert_eq!(
+        lua_result_summary(&LuaValue::String("a  b\nc".to_string())),
+        "a b c"
+    );
+    // Tables collapse past four entries with a counted tail.
+    let table = LuaValue::Table(
+        (1..=6)
+            .map(|index| {
+                (
+                    LuaValue::String(format!("k{index}")),
+                    LuaValue::Integer(index),
+                )
+            })
+            .collect(),
+    );
+    assert_eq!(
+        lua_result_summary(&table),
+        "{k1=1, k2=2, k3=3, k4=4, +2 more}"
+    );
+    // Hostile sizes stay bounded: long strings truncate, deep tables cap.
+    let long = LuaValue::String("x".repeat(10_000));
+    assert!(lua_result_summary(&long).chars().count() <= 512);
+    let mut deep = LuaValue::String("leaf".to_string());
+    for _ in 0..10 {
+        deep = LuaValue::Table(vec![(LuaValue::String("n".to_string()), deep)]);
+    }
+    let rendered = lua_result_summary(&deep);
+    assert!(rendered.contains("{...}"), "depth must cap, got {rendered}");
+    assert!(rendered.chars().count() <= 512);
+}

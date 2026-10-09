@@ -535,6 +535,86 @@ fn three_consecutive_deadline_expiries_take_the_crash_path() {
 }
 
 #[test]
+fn deadline_strikes_reset_after_a_component_success() {
+    assert_eq!(COMPONENT_DEADLINE_CRASH_THRESHOLD, 3);
+    let scratch = Scratch::new("deadline-reset");
+    install(&scratch.0, "hold");
+    let mut broker = broker(&scratch.0, ComponentEnv::empty());
+    let mode_path = scratch.0.join(NAME).join(VERSION).join("fixture-mode");
+
+    // Phase 1: two expiries stay below the threshold, still Running.
+    let t0 = Instant::now();
+    let mut first = Vec::new();
+    for _ in 0..2 {
+        let mut req = request();
+        req.timeout_ms = 1;
+        first.push(broker.submit(t0, NAME, &grant(), req).expect("submit"));
+    }
+    until_state(&mut broker, t0, ComponentState::Running);
+    let past1 = t0 + effective_timeout(1) + COMPONENT_REQUEST_DEADLINE_GRACE;
+    let events = broker.poll(past1);
+    for id in &first {
+        assert_eq!(
+            failed_kind(&events, *id),
+            Some(ErrorKind::Timeout),
+            "first expiry {id}"
+        );
+    }
+    assert_eq!(
+        broker.status(NAME).map(|status| status.state),
+        Some(ComponentState::Running)
+    );
+
+    // Phase 2: a component-produced terminal frame resets the strikes. The
+    // fixture reads its mode once at spawn, so switch to echo via an
+    // idle-stop respawn; the slot (and its strike count) survives the respawn.
+    std::fs::write(&mode_path, "echo").expect("switch to echo");
+    let idle1 = t0 + COMPONENT_IDLE_TIMEOUT;
+    let _ = broker.poll(idle1);
+    until_state(&mut broker, idle1, ComponentState::Stopped);
+    let success = broker
+        .submit(idle1, NAME, &grant(), request())
+        .expect("submit");
+    let events = until_terminal(&mut broker, idle1, success);
+    assert!(
+        events.iter().any(|event| event.id == success
+            && matches!(event.kind, BrokerEventKind::Body { last: true, .. })),
+        "expected a component Body last, got {events:?}"
+    );
+    assert_eq!(
+        broker.status(NAME).map(|status| status.state),
+        Some(ComponentState::Running)
+    );
+
+    // Phase 3: two more expiries after the reset stay below the threshold.
+    // Without the reset these would be strikes 3-4 and take the crash path.
+    std::fs::write(&mode_path, "hold").expect("switch to hold");
+    let idle2 = idle1 + COMPONENT_IDLE_TIMEOUT;
+    let _ = broker.poll(idle2);
+    until_state(&mut broker, idle2, ComponentState::Stopped);
+    let mut second = Vec::new();
+    for _ in 0..2 {
+        let mut req = request();
+        req.timeout_ms = 1;
+        second.push(broker.submit(idle2, NAME, &grant(), req).expect("submit"));
+    }
+    until_state(&mut broker, idle2, ComponentState::Running);
+    let past2 = idle2 + effective_timeout(1) + COMPONENT_REQUEST_DEADLINE_GRACE;
+    let events = broker.poll(past2);
+    for id in &second {
+        assert_eq!(
+            failed_kind(&events, *id),
+            Some(ErrorKind::Timeout),
+            "second expiry {id}"
+        );
+    }
+    let status = broker.status(NAME).expect("status");
+    assert_eq!(status.state, ComponentState::Running);
+    assert_ne!(status.last_stop, Some(StopOutcome::Crashed));
+    let _ = broker.shutdown();
+}
+
+#[test]
 fn idle_stop_hands_the_stderr_tail_to_the_warn_sink() {
     let scratch = Scratch::new("idle-warn");
     install(&scratch.0, "echo");

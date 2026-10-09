@@ -723,7 +723,8 @@ mod tests {
 
     #[test]
     fn streamed_digest_matches_one_shot_and_enforces_the_limit() {
-        let dir = std::env::temp_dir().join(format!("bitty-ctx0920-digest-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("bitty-component-digest-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("scratch");
         let path = dir.join("blob");
         // Several full buffers plus a partial one.

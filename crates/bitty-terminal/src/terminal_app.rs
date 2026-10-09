@@ -2175,7 +2175,7 @@ impl TerminalApp {
         if let Some(note) = backend_selection.log_note() {
             crate::logging::info(|| format!("bitty: gpu backend fallback ({note})"));
         }
-        match pollster::block_on(GpuContext::initialize()) {
+        match pollster::block_on(GpuContext::initialize_for_surface(&target)) {
             Ok(gpu) => match gpu.create_surface(&target) {
                 Ok(surface) => {
                     let extent = PhysicalSize::new(inner.width(), inner.height());

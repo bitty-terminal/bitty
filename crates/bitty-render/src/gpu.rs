@@ -444,10 +444,50 @@ impl GpuContext {
             full.backends,
             cfg!(target_os = "windows"),
         );
-        match Self::initialize_with(&primary).await {
+        match Self::initialize_with(&primary, None).await {
             Ok(ctx) => Ok(ctx),
             Err(RenderError::NoCompatibleAdapter) if retry_allowed => {
-                Self::initialize_with(&full).await
+                Self::initialize_with(&full, None).await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Initializes the GPU context for a window surface.
+    ///
+    /// This is the recommended initialization path when a window surface is
+    /// available: the adapter is selected with the surface as
+    /// `compatible_surface`, ensuring that the chosen adapter can present to
+    /// the window. On Vulkan systems with multiple adapters, this prevents
+    /// selecting a compute-only adapter that would later fail during
+    /// `Surface::configure`.
+    ///
+    /// Uses the same backend guards and retry logic as [`Self::initialize`]:
+    /// GL is excluded on Windows (issue #1799) and Linux (CTX-1036, #1809),
+    /// and non-Windows platforms retry with full backends when no adapter is
+    /// found.
+    ///
+    /// # Errors
+    ///
+    /// - [`RenderError::SurfaceCreate`] when the temporary surface cannot be
+    ///   created for adapter selection.
+    /// - [`RenderError::NoCompatibleAdapter`] when enumeration finds nothing
+    ///   usable.
+    /// - [`RenderError::DeviceRequest`] when the adapter rejects the logical
+    ///   device request.
+    /// - [`RenderError::UpstreamGraphics`] for other upstream failures.
+    pub async fn initialize_for_surface(target: &SurfaceTarget) -> Result<Self, RenderError> {
+        let primary = instance_descriptor();
+        let full = full_backends_descriptor();
+        let retry_allowed = should_retry_with_full_backends(
+            primary.backends,
+            full.backends,
+            cfg!(target_os = "windows"),
+        );
+        match Self::initialize_with(&primary, Some(target)).await {
+            Ok(ctx) => Ok(ctx),
+            Err(RenderError::NoCompatibleAdapter) if retry_allowed => {
+                Self::initialize_with(&full, Some(target)).await
             }
             Err(err) => Err(err),
         }
@@ -457,11 +497,30 @@ impl GpuContext {
     ///
     /// Split from [`Self::initialize`] so the guarded-then-full fallback is
     /// testable without a GPU (callers never use this directly).
-    async fn initialize_with(descriptor: &InstanceDescriptor) -> Result<Self, RenderError> {
+    ///
+    /// When `target` is provided, a temporary surface is created and passed
+    /// as `compatible_surface` to `request_adapter`, ensuring the selected
+    /// adapter can present to the window (CodeRabbit PR #1837, gpu.rs:449-453).
+    async fn initialize_with(
+        descriptor: &InstanceDescriptor,
+        target: Option<&SurfaceTarget>,
+    ) -> Result<Self, RenderError> {
         let instance = Instance::new(descriptor);
 
+        // Create temporary surface for adapter selection when targeting a window
+        let temp_surface = target
+            .map(|t| {
+                instance
+                    .create_surface(t.clone())
+                    .map_err(|err| RenderError::SurfaceCreate(err.to_string()))
+            })
+            .transpose()?;
+
         let adapter = instance
-            .request_adapter(&RequestAdapterOptions::default())
+            .request_adapter(&RequestAdapterOptions {
+                compatible_surface: temp_surface.as_ref(),
+                ..Default::default()
+            })
             .await
             .map_err(|_| RenderError::NoCompatibleAdapter)?;
 

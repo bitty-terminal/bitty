@@ -2141,7 +2141,7 @@ pub(crate) fn help_text_short(color: bool) -> String {
            init [FLAGS]            Opt-in guided setup wizard (never auto-runs)\n  \
            doctor                  Diagnose installation and compatibility (local)\n  \
            list <kind>             Enumerate themes|plugins|instances (alias ls)\n  \
-           inspect <target>        Explain state and ownership (command|key|plugin|config|protocol)\n  \
+           inspect <target> <value> Explain state and ownership (command|key|plugin|config|protocol)\n  \
            dev <verb>              Developer tracing, captures, synthesis, dumps, overlays\n  \
            plugin <verb>           Plugin management: list|install|remove|enable|disable|info\n  \
            component <verb>        Native binary extension management: list|add|remove\n  \

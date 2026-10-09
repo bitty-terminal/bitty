@@ -159,7 +159,17 @@ fn shell_init_ignores_envelope_flags() {
 }
 
 #[test]
-fn bash_script_parses_cleanly() {
+fn bash_script_parses_cleanly_when_bash_exists() {
+    // Windows runners expose a WSL stub as bash that exits non-zero with
+    // no installed distributions, so probe for a working bash first.
+    let bash = Command::new("bash")
+        .args(["--version"])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    if !bash {
+        return;
+    }
     let out = run_bitty(&["shell-init", "bash"]);
     assert_eq!(out.status.code(), Some(0));
     let dir = scratch_dir("bash-parse");

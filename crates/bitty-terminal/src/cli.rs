@@ -1860,7 +1860,9 @@ pub(crate) fn help_text() -> String {
            -h, --help       Print this help and exit\n  \
             -V, --version    Print version and exit\n  \
             -v, --verbose    Emit per-frame `bitty tick` stats on stderr\n  \
-                             (shorthand for --log-level debug; default quiet)\n  \
+                             (with --help: print this full detail instead of\n  \
+                             the compact overview; shorthand for --log-level\n  \
+                             debug otherwise; default quiet)\n  \
                 --log-level LEVEL  Stderr level: error|warn|info|debug|trace\n  \
                              (default warn: startup info lines need info,\n  \
                              tick stats need debug|trace; also BITTY_LOG/RUST_LOG)\n  \
@@ -2065,6 +2067,94 @@ pub(crate) fn help_text() -> String {
            bitty doctor --format json\n  \
            bitty plugin list\n  \
            bitty plugin install bitty-terminal.shell-integration --yes\n",
+        crate::version::version_semver()
+    )
+}
+
+/// Whether ANSI emphasis is allowed in the top-level help (`--no-color`,
+/// `NO_COLOR`, `TERM=dumb`). Mirrors the table helpers in `list`/`plugin`:
+/// the pre-word `--no-color` sets every per-verb flag in lockstep, so any
+/// one of them being set means color was disabled on this invocation.
+#[must_use]
+pub(crate) fn help_color_enabled(args: &Args) -> bool {
+    if args.doctor_no_color
+        || args.list_no_color
+        || args.inspect_no_color
+        || args.dev_no_color
+        || args.plugin_no_color
+        || args.component_no_color
+    {
+        return false;
+    }
+    if std::env::var("NO_COLOR").is_ok() {
+        return false;
+    }
+    !matches!(std::env::var("TERM"), Ok(term) if term.trim().eq_ignore_ascii_case("dumb"))
+}
+
+fn help_heading(text: &str, color: bool) -> String {
+    if color {
+        format!("\u{1b}[1m{text}\u{1b}[0m")
+    } else {
+        text.to_string()
+    }
+}
+
+/// Compact default help for bare `bitty --help` (CTX-1060, issue #1808).
+///
+/// Usage + common flags + one line per subcommand; group headers are bold
+/// when `color` allows. Full flag detail stays available via
+/// `bitty --help -v` / `bitty --help --verbose` ([`help_text`]), and every
+/// subcommand keeps its own `bitty <command> --help`.
+#[must_use]
+pub(crate) fn help_text_short(color: bool) -> String {
+    let usage = help_heading("Usage:", color);
+    let options = help_heading("Options:", color);
+    let subcommands = help_heading("Subcommands (CLI-first management, DEC-0007):", color);
+    let arguments = help_heading("Arguments:", color);
+    format!(
+        "bitty {} — Correct Terminal (thin composition root)\n\
+         \n\
+         {usage} bitty [OPTIONS] [--] [PROGRAM [ARGS...]]\n\
+         \n\
+         {options}\n  \
+           -h, --help              Print this help and exit (add -v for full detail)\n  \
+           -V, --version           Print version and exit\n  \
+           -v, --verbose           Full help here; otherwise per-frame tick stats on stderr\n  \
+               --log-level LEVEL       Stderr level: error|warn|info|debug|trace (default warn)\n  \
+               --headless              Run a single headless tick smoke and exit (CI)\n  \
+               --safe                  Safe mode: no third-party plugins, built-in safe config\n  \
+               --mascot                Print the Bittie mascot art and exit\n  \
+               --no-splash             Suppress the first-run mascot splash once\n  \
+               --config PATH           Explicit user config file (init.lua)\n  \
+               --profile NAME          Named profile layered under the user file\n  \
+               --theme NAME            CLI theme override for one launch\n  \
+               --socket PATH           Control target socket (with ctl / list instances)\n  \
+               --instance ID           Control target instance (with ctl / list instances)\n  \
+               --no-color              Disable ANSI coloring (also honors NO_COLOR)\n  \
+               --                      End of flags; remaining tokens are PROGRAM argv\n\
+         \n\
+         {subcommands}\n  \
+           run -- COMMAND...       Explicit child launch (local)\n  \
+           ctl <resource> <verb>   Control a running instance (runtime)\n  \
+           config <verb>           Config path, check, or edit (alias cfg)\n  \
+           init [FLAGS]            Opt-in guided setup wizard (never auto-runs)\n  \
+           doctor                  Diagnose installation and compatibility (local)\n  \
+           list <kind>             Enumerate themes|plugins|instances (alias ls)\n  \
+           inspect <target> <value> Explain state and ownership (command|key|plugin|config|protocol)\n  \
+           dev <verb>              Developer tracing, captures, synthesis, dumps, overlays\n  \
+           plugin <verb>           Plugin management: list|install|remove|enable|disable|info\n  \
+           component <verb>        Native binary extension management: list|add|remove\n  \
+           cmd <id>                Direct qualified executable invocation for automation\n  \
+           x <id> <command>        Qualified plugin namespace (extension, no VM load)\n  \
+           completion <shell>      Emit shell completion script (alias comp)\n  \
+           shell-init <shell>      Shell integration: prompt hooks + completion wiring\n  \
+           version                 Version and build metadata\n\
+         \n\
+         {arguments}\n  \
+           PROGRAM             Program to spawn in the PTY (default $SHELL or /bin/sh)\n\
+         \n\
+         Run `bitty --help -v` for all flags, or `bitty <command> --help` for detail.\n",
         crate::version::version_semver()
     )
 }

@@ -259,7 +259,7 @@ mod terminal_app;
 mod test_mode;
 mod x;
 
-use cli::{help_text, parse_args};
+use cli::{help_color_enabled, help_text, help_text_short, parse_args};
 use config_cli::{
     config_usage, load_app_config, run_config_subcommand, runtime_config_from_effective_for,
     startup_prefer_light,
@@ -424,8 +424,15 @@ fn main() {
         print!("{}", x::x_help_text());
         std::process::exit(0);
     }
+    // Bare `--help` prints the compact overview (CTX-1060, issue #1808);
+    // `--help -v` / `--help --verbose` prints the full flag detail.
+    // Per-command `bitty <command> --help` branches above are unchanged.
     if args.help {
-        println!("{}", help_text());
+        if args.verbose {
+            println!("{}", help_text());
+        } else {
+            println!("{}", help_text_short(help_color_enabled(&args)));
+        }
         std::process::exit(0);
     }
     // `bitty version` / `-V` / `--version` (CTX-0763, #1375, local class).

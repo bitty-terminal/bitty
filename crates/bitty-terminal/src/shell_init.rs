@@ -94,7 +94,8 @@ eval "$(bitty completion bash)"
 /// Zsh integration: `precmd` hook (OSC 133 `D` status, OSC 7 cwd, OSC 133
 /// `A` prompt-start) plus `bitty completion zsh`.
 const ZSH_SCRIPT: &str = r#"# bitty shell integration for Zsh (static; generated, do not edit).
-# Enable with: eval "$(bitty shell-init zsh)" in ~/.zshrc
+# Enable with: eval "$(bitty shell-init zsh)" in ~/.zshrc (after compinit,
+# so compdef can register Tab completion).
 # - Tab completion via `bitty completion zsh` (evaled below).
 # - Prompt hooks: OSC 7 cwd report plus OSC 133 prompt-start (A) and
 #   command-done-with-status (D) marks (observation only; ignored by
@@ -115,6 +116,9 @@ if (( ! ${+_BITTY_SHELL_INIT} )); then
     fi
 fi
 eval "$(bitty completion zsh)"
+if (( $+functions[compdef] )); then
+    compdef _bitty bitty
+fi
 "#;
 
 /// Fish integration: `fish_prompt`-event hook (OSC 133 `D` status, OSC 7
@@ -482,6 +486,21 @@ mod tests {
         assert!(
             script.contains("PROMPT_COMMAND=(_bitty_prompt_hook"),
             "bash prepends the hook to array-valued PROMPT_COMMAND"
+        );
+    }
+
+    #[test]
+    fn zsh_registers_completion_via_compdef() {
+        let script = shell_init_script(CompletionShell::Zsh);
+        // Evaluating the completion body only defines _bitty; Tab
+        // completion needs compdef registration once compinit has run.
+        assert!(
+            script.contains("compdef _bitty bitty"),
+            "zsh registers _bitty via compdef"
+        );
+        assert!(
+            script.contains("$+functions[compdef]"),
+            "zsh only calls compdef when the completion system is loaded"
         );
     }
 

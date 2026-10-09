@@ -950,6 +950,10 @@ pub(crate) fn init_read_line_with_history(
 /// `history` carries the previous successful answers in this wizard run
 /// for `Up`/`Down` recall (appended on success only; failed attempts never
 /// pollute recall).
+///
+/// Retained for the bare-input contract and the output-error test; the
+/// interactive wizard now prompts through [`init_ask_option`].
+#[allow(dead_code)]
 pub(crate) fn init_ask<T>(
     input: &mut dyn std::io::BufRead,
     output: &mut dyn std::io::Write,
@@ -991,15 +995,237 @@ pub(crate) fn init_ask<T>(
     ))
 }
 
+/// One entry in an init option list (phase 1 of #1806).
+///
+/// `label` is shown verbatim (so rows stay greppable with and without
+/// color); `value_text` is the text fed to the step parser when this entry
+/// is selected via Enter or a number fast path. `style_fg`/`style_bg` carry
+/// an optional preview style from the data model (theme presets); entries
+/// without style fall back to a colored selection marker.
+pub(crate) struct InitOptionItem {
+    /// Display label (verbatim, greppable).
+    pub(crate) label: String,
+    /// Parser input selected by this entry.
+    pub(crate) value_text: String,
+    /// Optional preview foreground (theme presets).
+    pub(crate) style_fg: Option<[u8; 3]>,
+    /// Optional preview background (theme presets).
+    pub(crate) style_bg: Option<[u8; 3]>,
+}
+
+/// Pure color decision for tests: mirrors [`crate::list::color_enabled`]
+/// without touching the environment.
+pub(crate) fn init_color_enabled_impl(
+    no_color_flag: bool,
+    no_color_env: bool,
+    term_is_dumb: bool,
+) -> bool {
+    !no_color_flag && !no_color_env && !term_is_dumb
+}
+
+/// Whether ANSI emphasis is allowed in init option lists.
+///
+/// Existing convention only, no new mechanism: explicit `--no-color` (any of
+/// the shared per-verb flags, set in lockstep for a pre-word flag),
+/// `NO_COLOR`, or `TERM=dumb` disables. Mirrors
+/// [`crate::list::color_enabled`].
+pub(crate) fn init_color_enabled(no_color_flag: bool) -> bool {
+    let no_color_env = std::env::var("NO_COLOR").is_ok();
+    let term_is_dumb =
+        matches!(std::env::var("TERM"), Ok(term) if term.trim().eq_ignore_ascii_case("dumb"));
+    init_color_enabled_impl(no_color_flag, no_color_env, term_is_dumb)
+}
+
+/// Renders one option label: theme entries preview in their own style
+/// (truecolor foreground on background) when `color` allows; other selected
+/// entries render bold; everything else (including all output when `color`
+/// is false) stays plain so piped output stays byte-identical.
+fn init_style_label(item: &InitOptionItem, selected: bool, color: bool) -> String {
+    if color {
+        if let (Some(fg), Some(bg)) = (item.style_fg, item.style_bg) {
+            return format!(
+                "\u{1b}[38;2;{};{};{}m\u{1b}[48;2;{};{};{}m{}\u{1b}[0m",
+                fg[0], fg[1], fg[2], bg[0], bg[1], bg[2], item.label
+            );
+        }
+        if selected {
+            return format!("\u{1b}[1m{}\u{1b}[0m", item.label);
+        }
+    }
+    item.label.clone()
+}
+
+/// Option-list navigation direction (phase 1 of #1806).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitOptionNav {
+    /// Move the cursor one entry up (wraps).
+    Up,
+    /// Move the cursor one entry down (wraps).
+    Down,
+}
+
+/// Detects one pure navigation input for [`init_ask_option`].
+///
+/// `j`/`J` move down, `k`/`K` move up; a raw line that is exactly one
+/// `ESC`-led sequence mapping to Up/Down via [`init_parse_escape_at`]
+/// (arrows with any modifiers, application-cursor variants) navigates too.
+/// Reuses the existing escape parser instead of reimplementing it; anything
+/// else (including `h`/`l`, Left/Right, typed values) is not navigation and
+/// falls through to the normal decode/parse path.
+fn init_option_nav(raw: &[u8], trimmed: &str) -> Option<InitOptionNav> {
+    if trimmed == "j" || trimmed == "J" {
+        return Some(InitOptionNav::Down);
+    }
+    if trimmed == "k" || trimmed == "K" {
+        return Some(InitOptionNav::Up);
+    }
+    if raw.is_empty() || raw[0] != 0x1b {
+        return None;
+    }
+    let (action, consumed) = init_parse_escape_at(raw, 0);
+    if consumed != raw.len() {
+        return None;
+    }
+    match action {
+        InitEscapeAction::Up => Some(InitOptionNav::Up),
+        InitEscapeAction::Down => Some(InitOptionNav::Down),
+        _ => None,
+    }
+}
+
+/// Asks one wizard step from a visible option list (phase 1 of #1806).
+///
+/// Renders `prompt` plus every entry with a visible cursor line and
+/// selection marker (`>`; cyan when `color` allows). Interaction:
+/// - `Up`/`Down` arrows (any modifiers, application-cursor variants) and
+///   `j`/`k` move the cursor (wrapping) and re-render without consuming an
+///   attempt.
+/// - `Enter` (empty line) selects the cursor entry.
+/// - When `numbered`, `1..=N` selects directly (the shell/close-confirm/
+///   preset fast path the codebase already uses); otherwise numbers fall
+///   through to `parse` as values so numeric answers like `10` keep their
+///   meaning.
+/// - Any other text is parsed as today (custom paths, names, numbers as
+///   values), preserving each step parser, its retry messages, and the
+///   [`INIT_MAX_ATTEMPTS`] bound (navigation never counts as an attempt).
+/// - Piped/non-TTY fallback is the numbered/typed fast path itself: a single
+///   line with a number, name, or value (or empty for the default) selects
+///   in one read with no navigation required, so piped input behaves exactly
+///   as before minus the new list rendering.
+///
+/// Line decoding, history recall for non-navigation input, and the
+/// display-vs-submitted redraw ([`init_line_needs_redraw`]) behave as in
+/// [`init_ask`]: `history` is appended on successful parses only.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn init_ask_option<T>(
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
+    prompt: &str,
+    options: &[InitOptionItem],
+    default_index: usize,
+    color: bool,
+    numbered: bool,
+    parse: impl Fn(&str) -> Result<T, String>,
+    history: &mut Vec<String>,
+) -> Result<T, String> {
+    assert!(!options.is_empty(), "option list must not be empty");
+    let mut cursor = default_index.min(options.len() - 1);
+    let mut failures: usize = 0;
+    loop {
+        let _ = writeln!(output, "{prompt}");
+        for (index, item) in options.iter().enumerate() {
+            let selected = index == cursor;
+            let marker = if selected {
+                if color { "\u{1b}[36m>\u{1b}[0m" } else { ">" }
+            } else {
+                " "
+            };
+            let label = init_style_label(item, selected, color);
+            if numbered {
+                let _ = writeln!(output, "{marker} {}) {label}", index + 1);
+            } else {
+                let _ = writeln!(output, "{marker} {label}");
+            }
+        }
+        if numbered {
+            let _ = writeln!(
+                output,
+                "  (j/k or arrows move, Enter selects, number picks)"
+            );
+        } else {
+            let _ = writeln!(
+                output,
+                "  (j/k or arrows move, Enter selects, or type a value)"
+            );
+        }
+        let _ = output.flush();
+        let (raw, line) = match init_read_line_with_history(input, history) {
+            Some(pair) => pair,
+            None => return Err("bitty init: aborted (end of input)".to_string()),
+        };
+        let trimmed = line.trim();
+        if let Some(direction) = init_option_nav(&raw, trimmed) {
+            match direction {
+                InitOptionNav::Up => {
+                    cursor = (cursor + options.len() - 1) % options.len();
+                }
+                InitOptionNav::Down => {
+                    cursor = (cursor + 1) % options.len();
+                }
+            }
+            continue;
+        }
+        if init_line_needs_redraw(&raw, &line)
+            && (writeln!(output, "  (read as {line:?})").is_err() || output.flush().is_err())
+        {
+            return Err("bitty init: aborted (output error)".to_string());
+        }
+        let candidate: &str = if trimmed.is_empty() {
+            &options[cursor].value_text
+        } else if numbered {
+            match trimmed.parse::<usize>() {
+                Ok(number) if number >= 1 && number <= options.len() => {
+                    &options[number - 1].value_text
+                }
+                _ => trimmed,
+            }
+        } else {
+            trimmed
+        };
+        match parse(candidate) {
+            Ok(value) => {
+                if !line.is_empty() {
+                    history.push(line);
+                }
+                return Ok(value);
+            }
+            Err(err) => {
+                failures += 1;
+                let _ = writeln!(
+                    output,
+                    "  ({err} — try again [{failures}/{INIT_MAX_ATTEMPTS}])"
+                );
+                if failures >= INIT_MAX_ATTEMPTS {
+                    return Err(format!(
+                        "bitty init: aborted (too many invalid answers, limit {INIT_MAX_ATTEMPTS})"
+                    ));
+                }
+            }
+        }
+    }
+}
+
 /// Runs the interactive wizard: mascot greeting, then shell / theme / font
 /// (family, size) / decoration (gaps_in, gaps_out, border, radius) /
 /// scrollback / close-confirm / keybinding-preset picks. Pure over injected
-/// `input`, `output`, `shell_env`, `columns`, `shell_exists`, and
-/// `overrides`, so the whole flow is headless-testable with piped stdin.
+/// `input`, `output`, `shell_env`, `columns`, `shell_exists`,
+/// `overrides`, and `color`, so the whole flow is headless-testable with
+/// piped stdin.
 ///
 /// A step answered by a value flag ([`InitOverrides`]) is skipped entirely
-/// (no prompt, no stdin read); the remaining steps prompt with their shipped
-/// default and reprompt fail-closed on invalid input.
+/// (no prompt, no stdin read); the remaining steps prompt from a navigable
+/// option list (phase 1 of #1806) with their shipped default and reprompt
+/// fail-closed on invalid input.
 pub(crate) fn run_init_interactive(
     input: &mut dyn std::io::BufRead,
     output: &mut dyn std::io::Write,
@@ -1007,6 +1233,7 @@ pub(crate) fn run_init_interactive(
     columns: Option<u16>,
     shell_exists: &dyn Fn(&str) -> bool,
     overrides: &InitOverrides,
+    color: bool,
 ) -> Result<InitAnswers, String> {
     let _ = write!(output, "{}", init_greeting_art(columns));
     let _ = writeln!(
@@ -1014,56 +1241,173 @@ pub(crate) fn run_init_interactive(
         "Welcome to bitty! This wizard writes your init.lua. (Enter takes the default.)"
     );
     let candidates = init_shell_candidates(shell_env, shell_exists);
-    let _ = writeln!(output, "\nShell:");
-    for (index, candidate) in candidates.iter().enumerate() {
-        let marker = if index == 0 { " (default)" } else { "" };
-        let _ = writeln!(output, "  {}) {candidate}{marker}", index + 1);
-    }
-    // Per-run recall for `Up`/`Down`: previous successful answers in this
-    // wizard invocation (failed attempts never pollute it).
+    // Per-run recall for line editing: previous successful answers in this
+    // wizard invocation (failed attempts never pollute it). Pure Up/Down
+    // now moves the option cursor; typed text plus Up still recalls history
+    // through the shared decoder.
     let mut history: Vec<String> = Vec::new();
-    let shell = init_ask(
+    let _ = writeln!(output, "\nShell:");
+    let shell_options: Vec<InitOptionItem> = candidates
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| InitOptionItem {
+            label: if index == 0 {
+                format!("{candidate} (default)")
+            } else {
+                candidate.clone()
+            },
+            value_text: candidate.clone(),
+            style_fg: None,
+            style_bg: None,
+        })
+        .collect();
+    let shell = init_ask_option(
         input,
         output,
         "Shell [Enter for default, number, or custom path]:",
+        &shell_options,
+        0,
+        color,
+        true,
         |line| init_parse_shell_answer(line, &candidates),
         &mut history,
     )?;
     let theme = match &overrides.theme {
         Some(theme) => theme.clone(),
-        None => init_ask(
-            input,
-            output,
-            "Theme [dark]:",
-            init_parse_theme_answer,
-            &mut history,
-        )?,
+        None => {
+            let presets = bitty_config::theme::list_presets();
+            let theme_options: Vec<InitOptionItem> = presets
+                .iter()
+                .enumerate()
+                .map(|(index, preset)| {
+                    let label = if index == 0 {
+                        format!(
+                            "{} ({}, default)",
+                            preset.name,
+                            bitty_config::theme::DARK_THEME_ALIAS
+                        )
+                    } else if preset.aliases.is_empty() {
+                        preset.name.to_string()
+                    } else {
+                        format!("{} ({})", preset.name, preset.aliases.join(","))
+                    };
+                    // The default entry answers with the alias so stored
+                    // answers stay `dark` as before; other entries answer
+                    // with their canonical registry name.
+                    let value_text = if index == 0 {
+                        bitty_config::theme::DARK_THEME_ALIAS.to_string()
+                    } else {
+                        preset.name.to_string()
+                    };
+                    InitOptionItem {
+                        label,
+                        value_text,
+                        style_fg: Some(preset.foreground),
+                        style_bg: Some(preset.background),
+                    }
+                })
+                .collect();
+            init_ask_option(
+                input,
+                output,
+                "Theme [dark]:",
+                &theme_options,
+                0,
+                color,
+                false,
+                init_parse_theme_answer,
+                &mut history,
+            )?
+        }
     };
     let font_family = match &overrides.font_family {
         Some(family) => family.clone(),
-        None => init_ask(
-            input,
-            output,
-            &format!(
-                "Font family [{}]:",
-                bitty_config::types::DEFAULT_FONT_FAMILY
-            ),
-            init_parse_font_family_answer,
-            &mut history,
-        )?,
+        None => {
+            // Documented monospace stack only (no invented catalog): the
+            // shipped default plus its documented fallbacks; any other name
+            // is still accepted as typed custom text.
+            let families = [
+                bitty_config::types::DEFAULT_FONT_FAMILY,
+                "JetBrains Mono",
+                "monospace",
+                "DejaVu Sans Mono",
+            ];
+            let family_options: Vec<InitOptionItem> = families
+                .iter()
+                .enumerate()
+                .map(|(index, family)| InitOptionItem {
+                    label: if index == 0 {
+                        format!("{family} (default)")
+                    } else {
+                        (*family).to_string()
+                    },
+                    value_text: (*family).to_string(),
+                    style_fg: None,
+                    style_bg: None,
+                })
+                .collect();
+            init_ask_option(
+                input,
+                output,
+                &format!(
+                    "Font family [{}]:",
+                    bitty_config::types::DEFAULT_FONT_FAMILY
+                ),
+                &family_options,
+                0,
+                color,
+                false,
+                init_parse_font_family_answer,
+                &mut history,
+            )?
+        }
     };
     let font_size = match overrides.font_size {
         Some(size) => size,
-        None => init_ask(
-            input,
-            output,
-            &format!(
-                "Font size in points [{}]:",
-                bitty_config::types::DEFAULT_FONT_SIZE
-            ),
-            init_parse_font_size_answer,
-            &mut history,
-        )?,
+        None => {
+            let sizes = [
+                bitty_config::types::DEFAULT_FONT_SIZE,
+                11.0,
+                13.0,
+                14.0,
+                16.0,
+            ];
+            let size_options: Vec<InitOptionItem> = sizes
+                .iter()
+                .enumerate()
+                .map(|(index, size)| {
+                    let text = if size.fract() == 0.0 {
+                        format!("{}", *size as u32)
+                    } else {
+                        format!("{size}")
+                    };
+                    InitOptionItem {
+                        label: if index == 0 {
+                            format!("{text} (default)")
+                        } else {
+                            text.clone()
+                        },
+                        value_text: text,
+                        style_fg: None,
+                        style_bg: None,
+                    }
+                })
+                .collect();
+            init_ask_option(
+                input,
+                output,
+                &format!(
+                    "Font size in points [{}]:",
+                    bitty_config::types::DEFAULT_FONT_SIZE
+                ),
+                &size_options,
+                0,
+                color,
+                false,
+                init_parse_font_size_answer,
+                &mut history,
+            )?
+        }
     };
     let _ = writeln!(
         output,
@@ -1071,115 +1415,300 @@ pub(crate) fn run_init_interactive(
     );
     let gaps_in = match overrides.gaps_in {
         Some(value) => value,
-        None => init_ask(
-            input,
-            output,
-            &format!(
-                "gaps_in (space between panes) [{}]:",
-                bitty_config::types::DEFAULT_DECORATION_GAPS_IN_PX
-            ),
-            |line| {
-                init_parse_decoration_answer(
-                    line,
-                    "gaps_in",
-                    bitty_config::types::MAX_DECORATION_GAP_PX,
-                    bitty_config::types::DEFAULT_DECORATION_GAPS_IN_PX,
-                )
-            },
-            &mut history,
-        )?,
+        None => {
+            let values = [
+                bitty_config::types::DEFAULT_DECORATION_GAPS_IN_PX,
+                0,
+                2,
+                4,
+                8,
+                12,
+            ];
+            let items: Vec<InitOptionItem> = values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| InitOptionItem {
+                    label: if index == 0 {
+                        format!("{value} (default)")
+                    } else if *value == 0 {
+                        "0 (disabled)".to_string()
+                    } else {
+                        format!("{value}")
+                    },
+                    value_text: format!("{value}"),
+                    style_fg: None,
+                    style_bg: None,
+                })
+                .collect();
+            init_ask_option(
+                input,
+                output,
+                &format!(
+                    "gaps_in (space between panes) [{}]:",
+                    bitty_config::types::DEFAULT_DECORATION_GAPS_IN_PX
+                ),
+                &items,
+                0,
+                color,
+                false,
+                |line| {
+                    init_parse_decoration_answer(
+                        line,
+                        "gaps_in",
+                        bitty_config::types::MAX_DECORATION_GAP_PX,
+                        bitty_config::types::DEFAULT_DECORATION_GAPS_IN_PX,
+                    )
+                },
+                &mut history,
+            )?
+        }
     };
     let gaps_out = match overrides.gaps_out {
         Some(value) => value,
-        None => init_ask(
-            input,
-            output,
-            &format!(
-                "gaps_out (space around the window edge) [{}]:",
-                bitty_config::types::DEFAULT_DECORATION_GAPS_OUT_PX
-            ),
-            |line| {
-                init_parse_decoration_answer(
-                    line,
-                    "gaps_out",
-                    bitty_config::types::MAX_DECORATION_GAP_PX,
-                    bitty_config::types::DEFAULT_DECORATION_GAPS_OUT_PX,
-                )
-            },
-            &mut history,
-        )?,
+        None => {
+            let values = [
+                bitty_config::types::DEFAULT_DECORATION_GAPS_OUT_PX,
+                0,
+                2,
+                4,
+                8,
+                12,
+            ];
+            let items: Vec<InitOptionItem> = values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| InitOptionItem {
+                    label: if index == 0 {
+                        format!("{value} (default)")
+                    } else if *value == 0 {
+                        "0 (disabled)".to_string()
+                    } else {
+                        format!("{value}")
+                    },
+                    value_text: format!("{value}"),
+                    style_fg: None,
+                    style_bg: None,
+                })
+                .collect();
+            init_ask_option(
+                input,
+                output,
+                &format!(
+                    "gaps_out (space around the window edge) [{}]:",
+                    bitty_config::types::DEFAULT_DECORATION_GAPS_OUT_PX
+                ),
+                &items,
+                0,
+                color,
+                false,
+                |line| {
+                    init_parse_decoration_answer(
+                        line,
+                        "gaps_out",
+                        bitty_config::types::MAX_DECORATION_GAP_PX,
+                        bitty_config::types::DEFAULT_DECORATION_GAPS_OUT_PX,
+                    )
+                },
+                &mut history,
+            )?
+        }
     };
     let border = match overrides.border {
         Some(value) => value,
-        None => init_ask(
-            input,
-            output,
-            &format!(
-                "border (frame thickness) [{}]:",
-                bitty_config::types::DEFAULT_DECORATION_BORDER_PX
-            ),
-            |line| {
-                init_parse_decoration_answer(
-                    line,
-                    "border",
-                    bitty_config::types::MAX_DECORATION_BORDER_PX,
-                    bitty_config::types::DEFAULT_DECORATION_BORDER_PX,
-                )
-            },
-            &mut history,
-        )?,
+        None => {
+            let values = [
+                bitty_config::types::DEFAULT_DECORATION_BORDER_PX,
+                0,
+                2,
+                4,
+                8,
+            ];
+            let items: Vec<InitOptionItem> = values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| InitOptionItem {
+                    label: if index == 0 {
+                        format!("{value} (default)")
+                    } else if *value == 0 {
+                        "0 (disabled)".to_string()
+                    } else {
+                        format!("{value}")
+                    },
+                    value_text: format!("{value}"),
+                    style_fg: None,
+                    style_bg: None,
+                })
+                .collect();
+            init_ask_option(
+                input,
+                output,
+                &format!(
+                    "border (frame thickness) [{}]:",
+                    bitty_config::types::DEFAULT_DECORATION_BORDER_PX
+                ),
+                &items,
+                0,
+                color,
+                false,
+                |line| {
+                    init_parse_decoration_answer(
+                        line,
+                        "border",
+                        bitty_config::types::MAX_DECORATION_BORDER_PX,
+                        bitty_config::types::DEFAULT_DECORATION_BORDER_PX,
+                    )
+                },
+                &mut history,
+            )?
+        }
     };
     let radius = match overrides.radius {
         Some(value) => value,
-        None => init_ask(
-            input,
-            output,
-            &format!(
-                "radius (corner rounding) [{}]:",
-                bitty_config::types::DEFAULT_DECORATION_RADIUS_PX
-            ),
-            |line| {
-                init_parse_decoration_answer(
-                    line,
-                    "radius",
-                    bitty_config::types::MAX_DECORATION_RADIUS_PX,
-                    bitty_config::types::DEFAULT_DECORATION_RADIUS_PX,
-                )
-            },
-            &mut history,
-        )?,
+        None => {
+            let values = [
+                bitty_config::types::DEFAULT_DECORATION_RADIUS_PX,
+                0,
+                4,
+                8,
+                12,
+                16,
+            ];
+            let items: Vec<InitOptionItem> = values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| InitOptionItem {
+                    label: if index == 0 {
+                        format!("{value} (default)")
+                    } else if *value == 0 {
+                        "0 (disabled)".to_string()
+                    } else {
+                        format!("{value}")
+                    },
+                    value_text: format!("{value}"),
+                    style_fg: None,
+                    style_bg: None,
+                })
+                .collect();
+            init_ask_option(
+                input,
+                output,
+                &format!(
+                    "radius (corner rounding) [{}]:",
+                    bitty_config::types::DEFAULT_DECORATION_RADIUS_PX
+                ),
+                &items,
+                0,
+                color,
+                false,
+                |line| {
+                    init_parse_decoration_answer(
+                        line,
+                        "radius",
+                        bitty_config::types::MAX_DECORATION_RADIUS_PX,
+                        bitty_config::types::DEFAULT_DECORATION_RADIUS_PX,
+                    )
+                },
+                &mut history,
+            )?
+        }
     };
     let _ = writeln!(output, "\nBehavior:");
     let scrollback = match overrides.scrollback {
         Some(value) => value,
-        None => init_ask(
-            input,
-            output,
-            &format!(
-                "Scrollback lines [{}]:",
-                bitty_config::types::TerminalConfig::default().scrollback
-            ),
-            init_parse_scrollback_answer,
-            &mut history,
-        )?,
+        None => {
+            let default_scroll = bitty_config::types::TerminalConfig::default().scrollback;
+            let mut values = vec![default_scroll, 0, 5_000, 20_000, 50_000, 100_000];
+            values.dedup();
+            let items: Vec<InitOptionItem> = values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| InitOptionItem {
+                    label: if index == 0 {
+                        format!("{value} (default)")
+                    } else if *value == 0 {
+                        "0 (disabled)".to_string()
+                    } else {
+                        format!("{value}")
+                    },
+                    value_text: format!("{value}"),
+                    style_fg: None,
+                    style_bg: None,
+                })
+                .collect();
+            init_ask_option(
+                input,
+                output,
+                &format!("Scrollback lines [{default_scroll}]:"),
+                &items,
+                0,
+                color,
+                false,
+                init_parse_scrollback_answer,
+                &mut history,
+            )?
+        }
     };
     let close_confirm = match overrides.close_confirm {
         Some(mode) => mode,
-        None => init_ask(
-            input,
-            output,
-            "Close confirm [1 when_busy]:\n  \
-             1) when_busy — confirm only while a foreground job runs (default)\n  \
-             2) always — confirm every view/window close\n  \
-             3) never — never confirm:",
-            init_parse_close_confirm_answer,
-            &mut history,
-        )?,
+        None => {
+            // Value texts use the parser spellings (`1` for the default;
+            // `when_busy` is display-only and is rejected by the parser).
+            let items = vec![
+                InitOptionItem {
+                    label: "when_busy — confirm only while a foreground job runs (default)"
+                        .to_string(),
+                    value_text: "1".to_string(),
+                    style_fg: None,
+                    style_bg: None,
+                },
+                InitOptionItem {
+                    label: "always — confirm every view/window close".to_string(),
+                    value_text: "always".to_string(),
+                    style_fg: None,
+                    style_bg: None,
+                },
+                InitOptionItem {
+                    label: "never — never confirm".to_string(),
+                    value_text: "never".to_string(),
+                    style_fg: None,
+                    style_bg: None,
+                },
+            ];
+            init_ask_option(
+                input,
+                output,
+                "Close confirm [1 when_busy]:",
+                &items,
+                0,
+                color,
+                true,
+                init_parse_close_confirm_answer,
+                &mut history,
+            )?
+        }
     };
-    let key_preset = init_ask(
+    let preset_options = vec![
+        InitOptionItem {
+            label: "default — shipped Alt-as-Mod map (Alt+h/j/k/l, Alt+1..9, Alt+u/i)".to_string(),
+            value_text: "default".to_string(),
+            style_fg: None,
+            style_bg: None,
+        },
+        InitOptionItem {
+            label: "vim — write that map explicitly (tweakable starting point)".to_string(),
+            value_text: "vim".to_string(),
+            style_fg: None,
+            style_bg: None,
+        },
+    ];
+    let key_preset = init_ask_option(
         input,
         output,
-        "Keybindings [1 default / 2 vim]:\n  1) default — shipped Alt-as-Mod map (Alt+h/j/k/l, Alt+1..9, Alt+u/i)\n  2) vim — write that map explicitly (tweakable starting point):",
+        "Keybindings [1 default / 2 vim]:",
+        &preset_options,
+        0,
+        color,
+        true,
         init_parse_preset_answer,
         &mut history,
     )?;
@@ -1448,6 +1977,16 @@ pub(crate) fn run_init_subcommand_with_io(
             );
             return 2;
         }
+        // Existing color convention only (no new flag): any shared
+        // `--no-color` (set in lockstep for a pre-word flag), `NO_COLOR`,
+        // or `TERM=dumb` disables init list colors.
+        let no_color = args.doctor_no_color
+            || args.list_no_color
+            || args.inspect_no_color
+            || args.dev_no_color
+            || args.plugin_no_color
+            || args.component_no_color;
+        let color = init_color_enabled(no_color);
         match run_init_interactive(
             input,
             output,
@@ -1455,6 +1994,7 @@ pub(crate) fn run_init_subcommand_with_io(
             env.columns,
             &|path| std::path::Path::new(path).exists(),
             &overrides,
+            color,
         ) {
             Ok(answers) => answers,
             Err(message) => {

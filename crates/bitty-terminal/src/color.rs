@@ -55,16 +55,9 @@ mod tests {
         assert!(!cli_color_enabled_impl(true, true, true, false));
     }
 
-    #[test]
-    fn piped_stdout_disables_color_even_without_opt_outs() {
-        // Nextest captures stdout through a pipe, so the live gate must be
-        // off here regardless of NO_COLOR or TERM. This pins the headless
-        // contract: piped output carries no ANSI.
-        assert!(
-            !std::io::stdout().is_terminal(),
-            "test harness stdout must be piped for this assertion"
-        );
-        assert!(!cli_color_enabled(false));
-        assert!(!cli_color_enabled(true));
-    }
+    // NOTE (CodeRabbit 1874): the live `cli_color_enabled` probe reads the
+    // real process stdout, so no unit test may call it here — that would
+    // couple the suite to the runner's stdout configuration. Live-gate
+    // behavior (piped => plain) is pinned by the subprocess integration
+    // tests in tests/cli_help.rs and tests/cli_list.rs instead.
 }

@@ -300,11 +300,14 @@ sha256_of_file() {
 
 verify_sidecar() {
   local file="$1" sidecar="$2"
-  local want got
+  local want got want_lc got_lc
   want="$(cut -d' ' -f1 "$sidecar" | tr -d '\r \t\n')"
   [[ "$want" =~ ^[0-9a-fA-F]{64}$ ]] || die "sidecar $sidecar did not yield a 64-hex digest"
   got="$(sha256_of_file "$file")"
-  if [[ "${want,,}" != "${got,,}" ]]; then
+  # Portable lowercase via tr: macOS /bin/bash is 3.2 (no bash-4 case expansion).
+  want_lc="$(printf '%s' "$want" | tr 'A-F' 'a-f')"
+  got_lc="$(printf '%s' "$got" | tr 'A-F' 'a-f')"
+  if [[ "$want_lc" != "$got_lc" ]]; then
     die "checksum mismatch for $(basename "$file") (expected $want, got $got)"
   fi
 }

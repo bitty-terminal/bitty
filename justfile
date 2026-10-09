@@ -247,6 +247,9 @@ desktop-test:
 install-smoke-test:
     ./scripts/tests/install-smoke.test.sh
 
+install-scripts-test:
+    ./scripts/tests/install-scripts.test.sh
+
 unix-bundle-test:
     ./scripts/tests/make-unix-bundle.test.sh
 
@@ -296,7 +299,7 @@ commit-check message:
     @cp commitlint.config.ts target/dev-tools/commitlint.config.ts
     @msg="$(realpath "{{message}}")" && cd target/dev-tools && bunx --bun commitlint --edit "$msg"
 
-check: fmt-check clippy test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate test-support-gate status-drift status-drift-test docs-pin-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test unix-bundle-test macos-dmg-test verify-unix-bundle-dispatch-test rust-channel-test binary-arch-test workflow-publish-test m1-matrix-test compat-matrix-test compat-freshness-test real-render-soak-test dogfood-session-test actionlint markdownlint
+check: fmt-check clippy test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate test-support-gate status-drift status-drift-test docs-pin-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test install-scripts-test unix-bundle-test macos-dmg-test verify-unix-bundle-dispatch-test rust-channel-test binary-arch-test workflow-publish-test m1-matrix-test compat-matrix-test compat-freshness-test real-render-soak-test dogfood-session-test actionlint markdownlint
 
 # Parser-throughput baseline (CTX-0576, M1-11). Runs the deterministic
 # headless parser benchmark over the committed VT/escape corpora and verifies

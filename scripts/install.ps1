@@ -139,10 +139,10 @@ function Get-BittyTarget {
     $archName = "$env:PROCESSOR_ARCHITECTURE"
   }
   $archName = "$archName".Trim()
-  if ($archName -match '^(?i)(x64|amd64|x86_64)$' -or $archName -eq 'X64') {
+  if ($archName -match '^(?i)(x64|amd64|x86_64)$') {
     return 'x64'
   }
-  if ($archName -match '^(?i)(arm64|aarch64)$' -or $archName -eq 'Arm64') {
+  if ($archName -match '^(?i)(arm64|aarch64)$') {
     return 'arm64'
   }
   # RuntimeInformation returns 'X64'/'Arm64' enum names; fall back to env text.

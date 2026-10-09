@@ -165,14 +165,20 @@ fn bash_script_parses_cleanly() {
     let dir = scratch_dir("bash-parse");
     let script = dir.join("bitty-shell-init.bash");
     std::fs::write(&script, stdout(&out)).expect("write bash script");
+    // Git Bash on Windows mangles backslashes in native paths (C:\...),
+    // so pass the path with forward slashes (C:/...), which it accepts.
+    let script_arg = script.to_string_lossy().replace('\\', "/");
     let check = Command::new("bash")
         .arg("-n")
-        .arg(script.as_os_str())
+        .arg(&script_arg)
         .output()
         .expect("spawn bash -n");
     assert!(
         check.status.success(),
-        "bash -n rejects emitted script: {}",
+        "bash -n rejects emitted script {}: exit={} stdout={} stderr={}",
+        script_arg,
+        check.status,
+        String::from_utf8_lossy(&check.stdout),
         String::from_utf8_lossy(&check.stderr)
     );
 }

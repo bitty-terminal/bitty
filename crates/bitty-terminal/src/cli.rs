@@ -2071,25 +2071,20 @@ pub(crate) fn help_text() -> String {
     )
 }
 
-/// Whether ANSI emphasis is allowed in the top-level help (`--no-color`,
-/// `NO_COLOR`, `TERM=dumb`). Mirrors the table helpers in `list`/`plugin`:
+/// Whether ANSI emphasis is allowed in the top-level help (unified CLI gate:
+/// `--no-color`, `NO_COLOR`, `TERM=dumb`, stdout is a terminal). Mirrors the
+/// table helpers in `list`/`plugin`:
 /// the pre-word `--no-color` sets every per-verb flag in lockstep, so any
 /// one of them being set means color was disabled on this invocation.
 #[must_use]
 pub(crate) fn help_color_enabled(args: &Args) -> bool {
-    if args.doctor_no_color
+    let no_color = args.doctor_no_color
         || args.list_no_color
         || args.inspect_no_color
         || args.dev_no_color
         || args.plugin_no_color
-        || args.component_no_color
-    {
-        return false;
-    }
-    if std::env::var("NO_COLOR").is_ok() {
-        return false;
-    }
-    !matches!(std::env::var("TERM"), Ok(term) if term.trim().eq_ignore_ascii_case("dumb"))
+        || args.component_no_color;
+    crate::color::cli_color_enabled(no_color)
 }
 
 fn help_heading(text: &str, color: bool) -> String {

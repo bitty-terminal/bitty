@@ -89,11 +89,14 @@ fn default_help_lists_every_subcommand_on_one_line() {
 }
 
 #[test]
-fn default_help_is_colorized_but_no_color_strips_ansi() {
-    let colored = stdout(&run_bitty(&["--help"]));
+fn default_help_is_plain_when_piped_but_no_color_strips_ansi() {
+    // CTX-1065 unified gate: captured (piped) stdout is not a TTY, so even
+    // with color-capable TERM and NO_COLOR removed the help carries no ANSI.
+    // Color still renders on a real TTY (covered by unit tests).
+    let piped = stdout(&run_bitty(&["--help"]));
     assert!(
-        colored.contains("\u{1b}["),
-        "default help should carry ANSI group headers when color is supported:\n{colored}"
+        !piped.contains("\u{1b}"),
+        "piped help must carry no ANSI under the unified gate:\n{piped}"
     );
 
     // Explicit flag wins.

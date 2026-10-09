@@ -1503,15 +1503,10 @@ fn pin_label(pin_ok: Option<bool>) -> &'static str {
     }
 }
 
-/// Whether ANSI emphasis is allowed (`--no-color`, `NO_COLOR`, `TERM=dumb`).
+/// Whether ANSI emphasis is allowed (unified CLI gate: `--no-color`,
+/// `NO_COLOR`, `TERM=dumb`, stdout is a terminal).
 fn color_enabled(no_color: bool) -> bool {
-    if no_color {
-        return false;
-    }
-    if std::env::var("NO_COLOR").is_ok() {
-        return false;
-    }
-    !matches!(std::env::var("TERM"), Ok(term) if term.trim().eq_ignore_ascii_case("dumb"))
+    crate::color::cli_color_enabled(no_color)
 }
 
 fn bold(text: &str, color: bool) -> String {
@@ -3445,5 +3440,27 @@ mod tests {
         // Unknown capabilities in `denied` fail closed like `granted`.
         let hostile = rendered.replace("denied = [\"ui.rich\"]", "denied = [\"nope.everything\"]");
         assert!(PluginState::parse(&hostile).is_err());
+    }
+
+    #[test]
+    fn unified_gate_piped_plugin_tables_carry_no_ansi() {
+        // CTX-1065: piped plugin list/info tables carry no ANSI. The
+        // harness stdout is piped, so the live gate resolves to plain.
+        use std::io::IsTerminal as _;
+        assert!(
+            !std::io::stdout().is_terminal(),
+            "test harness stdout must be piped for this assertion"
+        );
+        assert!(!color_enabled(false));
+        assert!(!color_enabled(true));
+        let table = format_list_table(&[], false);
+        assert!(
+            !table.contains("\u{1b}"),
+            "piped plugin list must carry no ANSI, got {table:?}"
+        );
+        assert!(table.contains("(no plugins)"));
+        // Explicit opt-out stays plain as well.
+        let plain = format_list_table(&[], true);
+        assert!(!plain.contains("\u{1b}"));
     }
 }

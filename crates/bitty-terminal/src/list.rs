@@ -1320,17 +1320,14 @@ pub fn format_error_envelope(spelling: &str, kind: ListKind, err: &InstanceError
 // Table rendering (human, not a machine contract)
 // ---------------------------------------------------------------------------
 
-/// Whether ANSI color is enabled (explicit flag plus `NO_COLOR` honoring).
+/// Whether ANSI color is enabled (explicit flag plus unified CLI gate).
+///
+/// Delegates to [`crate::color::cli_color_enabled`]: no `--no-color`, no
+/// `NO_COLOR`, `TERM` is not `dumb`, and stdout is a terminal. Piped output
+/// stays plain so headless runs carry no ANSI.
 #[must_use]
 pub fn color_enabled(no_color: bool) -> bool {
-    if no_color {
-        return false;
-    }
-    if std::env::var("NO_COLOR").is_ok() {
-        return false;
-    }
-    // `TERM=dumb` disables color; otherwise assume color-capable.
-    !matches!(std::env::var("TERM"), Ok(term) if term.trim().eq_ignore_ascii_case("dumb"))
+    crate::color::cli_color_enabled(no_color)
 }
 
 fn bold(s: &str, color: bool) -> String {
@@ -1386,7 +1383,8 @@ pub fn swatch_fg(hex: &str) -> String {
 /// Render themes as a human table.
 ///
 /// When color is enabled (see [`color_enabled`]: no `--no-color`,
-/// no `NO_COLOR`, `TERM` is not `dumb`), the BACKGROUND column carries a
+/// no `NO_COLOR`, `TERM` is not `dumb`, stdout is a terminal), the
+/// BACKGROUND column carries a
 /// truecolor swatch block (`48;2`) plus the hex, and the FOREGROUND column
 /// carries the hex as sample text in the fg color (`38;2`). JSON output is
 /// untouched (plain hex). Sibling `plugins`/`instances` tables print no
@@ -1399,8 +1397,9 @@ pub fn format_themes_table(themes: &[ThemeInfo], no_color: bool) -> String {
 /// Test hook: render the themes table with an explicit color decision.
 ///
 /// `format_themes_table` resolves `color` via [`color_enabled`] (which reads
-/// process env); this hook takes it directly so unit tests stay
-/// deterministic without touching `NO_COLOR`/`TERM`.
+/// process env plus `stdout().is_terminal()`); this hook takes it directly
+/// so unit tests stay deterministic without touching `NO_COLOR`/`TERM` and
+/// so forced color still renders when piped.
 #[must_use]
 pub fn format_themes_table_with_color(themes: &[ThemeInfo], color: bool) -> String {
     let mut out = String::new();
@@ -1808,6 +1807,55 @@ mod tests {
         assert_eq!(
             via_flag, plain,
             "no_color=true must equal the explicit color-off rendering"
+        );
+    }
+
+    #[test]
+    fn unified_gate_piped_stdout_carries_no_ansi() {
+        // CTX-1065: headless (piped) output must carry no ANSI even with no
+        // opt-outs. The harness stdout is piped, so the live gate resolves
+        // to plain here.
+        use std::io::IsTerminal as _;
+        assert!(
+            !std::io::stdout().is_terminal(),
+            "test harness stdout must be piped for this assertion"
+        );
+        assert!(!color_enabled(false));
+        let themes = list_themes();
+        let table = format_themes_table(&themes, false);
+        assert!(
+            !table.contains("\u{1b}"),
+            "piped themes table must carry no ANSI, got {:?}",
+            &table[..table.len().min(512)]
+        );
+        let plugins = list_plugins();
+        let plugins_table = format_plugins_table(&plugins, false);
+        assert!(
+            !plugins_table.contains("\u{1b}"),
+            "piped plugins table must carry no ANSI"
+        );
+    }
+
+    #[test]
+    fn unified_gate_pure_decision_covers_dumb_and_tty() {
+        // CTX-1065: TERM=dumb disables even on a tty; a tty with no
+        // opt-outs allows color. Forced explicit color still renders via
+        // the with_color hook (covered by themes_table_color_on).
+        assert!(!crate::color::cli_color_enabled_impl(
+            false, false, true, true
+        ));
+        assert!(crate::color::cli_color_enabled_impl(
+            false, false, false, true
+        ));
+        assert!(!crate::color::cli_color_enabled_impl(
+            false, false, false, false
+        ));
+        // Forced color hook still emits ANSI even when piped.
+        let themes = list_themes();
+        let forced = format_themes_table_with_color(&themes, true);
+        assert!(
+            forced.contains("\u{1b}[48;2;"),
+            "forced color must still carry swatches"
         );
     }
 

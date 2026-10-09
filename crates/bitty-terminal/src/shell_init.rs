@@ -154,7 +154,9 @@ if (-not (Test-Path variable:global:_BittyShellInit)) {
     $global:_BittyShellInit = $true
     $global:_BittyPromptChain = (Get-Command prompt -CommandType Function -ErrorAction SilentlyContinue).ScriptBlock
     function global:prompt {
-        $status = if ($?) { 0 } else { 1 }
+        # Prefer the native exit code: $? alone collapses every native
+        # failure to 1 (a native command exiting 42 must report D;42).
+        $status = if ($?) { 0 } elseif ($LASTEXITCODE) { $LASTEXITCODE } else { 1 }
         $host_name = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { hostname }
         $cwd = (Get-Location).Path
         $esc = [char]27
@@ -501,6 +503,18 @@ mod tests {
         assert!(
             script.contains("$+functions[compdef]"),
             "zsh only calls compdef when the completion system is loaded"
+        );
+    }
+
+    #[test]
+    fn powershell_reports_native_exit_code() {
+        let script = shell_init_script(CompletionShell::Powershell);
+        // $? is boolean: a native command exiting 42 must report D;42,
+        // not D;1. A zero/unset LASTEXITCODE still falls back to 1 so a
+        // failed cmdlet after a successful native command is not masked.
+        assert!(
+            script.contains("$LASTEXITCODE"),
+            "powershell prefers the native exit code"
         );
     }
 

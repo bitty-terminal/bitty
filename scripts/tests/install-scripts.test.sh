@@ -187,6 +187,22 @@ else
   done
 fi
 
+# 8. macOS /bin/bash is 3.2: pin install.sh free of bash4-isms.
+# Only portable constructs allowed ([[ ]], local, trap, mktemp -d, pipefail
+# are 3.2-safe). Case-insensitive comparison must use tr, not ${var,,}.
+if grep -Eq -- '\$\{[^}]*,,|\$\{[^}]*\^\^}' "$SCRIPT"; then
+  echo "FAIL: install.sh uses \${,,}/\${^^} (bash 4+, breaks macOS /bin/bash 3.2)" >&2
+  FAIL=1
+fi
+if grep -Eq -- '(^|[^A-Za-z0-9_])(mapfile|readarray)([^A-Za-z0-9_]|$)' "$SCRIPT"; then
+  echo "FAIL: install.sh uses mapfile/readarray (bash 4+, breaks macOS /bin/bash 3.2)" >&2
+  FAIL=1
+fi
+if grep -Eq -- 'declare[[:space:]]+-[A-Za-z]*A' "$SCRIPT"; then
+  echo "FAIL: install.sh uses declare -A (bash 4+, breaks macOS /bin/bash 3.2)" >&2
+  FAIL=1
+fi
+
 if ((FAIL)); then
   echo "install-scripts-test: FAIL" >&2
   exit 1

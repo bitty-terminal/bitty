@@ -297,6 +297,17 @@ pub(crate) struct Args {
     /// [`crate::completion::parse_completion_request`]. Empty until
     /// `completion_word` is set.
     pub(crate) completion_raw: Vec<String>,
+    /// `bitty shell-init <shell>` shell integration (issue #1813, CTX-1054).
+    /// True once the first positional `shell-init` word is seen; a program
+    /// literally named `shell-init` needs `bitty run -- shell-init ...` or
+    /// the legacy `bitty -- shell-init ...`. Tokens after the word land
+    /// verbatim in `shell_init_raw` for
+    /// [`crate::shell_init::parse_shell_init_request`].
+    pub(crate) shell_init_word: bool,
+    /// Raw tokens after the `shell-init` word (shell, flags) for
+    /// [`crate::shell_init::parse_shell_init_request`]. Empty until
+    /// `shell_init_word` is set.
+    pub(crate) shell_init_raw: Vec<String>,
     /// `bitty cmd` direct qualified executable invocation (#1375, CTX-0763).
     /// True once the first positional `cmd` word is seen; a program
     /// literally named `cmd` needs `bitty run -- cmd ...` or the legacy
@@ -446,6 +457,8 @@ impl Args {
             completion_word: false,
             completion_spelling: String::from("completion"),
             completion_raw: Vec::new(),
+            shell_init_word: false,
+            shell_init_raw: Vec::new(),
             cmd_word: false,
             cmd_raw: Vec::new(),
             x_word: false,
@@ -503,10 +516,10 @@ fn validate_split_value(val: &str) -> Result<(Option<SplitAxis>, Option<f32>), S
     Ok((axis, ratio))
 }
 
-/// Route one token verbatim into the active `version`/`completion`/`cmd`/`x`
-/// post-word buffer (CTX-0763, #1375).
+/// Route one token verbatim into the active `version`/`completion`/`cmd`/`x`/
+/// `shell-init` post-word buffer (CTX-0763, #1375; CTX-1054, #1813).
 ///
-/// These four words consume the argv tail verbatim (like `run`/`ctl`/`dev`/
+/// These five words consume the argv tail verbatim (like `run`/`ctl`/`dev`/
 /// `plugin`): their dedicated parsers own `--format`/`--help`/separator
 /// validation there. Space-form value flags (`--format`/`--socket`/
 /// `--instance`) take their value along when the next token is not a flag.
@@ -518,6 +531,8 @@ fn push_verbatim_new_word(out: &mut Args, raw: &[String], i: usize) -> Option<us
         &mut out.version_raw
     } else if out.completion_word {
         &mut out.completion_raw
+    } else if out.shell_init_word {
+        &mut out.shell_init_raw
     } else if out.cmd_word {
         &mut out.cmd_raw
     } else if out.x_word {
@@ -606,6 +621,11 @@ fn push_verbatim_new_word(out: &mut Args, raw: &[String], i: usize) -> Option<us
 ///   needs `bitty run -- completion ...` or `bitty -- completion ...`.
 ///   Tokens after the word are kept verbatim for
 ///   `completion::parse_completion_request`.
+/// - `shell-init <shell>` → shell integration (#1813, CTX-1054): prompt
+///   hooks (OSC 7 cwd, OSC 133 prompt/status) plus completion wiring. A
+///   program literally named `shell-init` needs `bitty run -- shell-init ...`
+///   or `bitty -- shell-init ...`. Tokens after the word are kept verbatim
+///   for `shell_init::parse_shell_init_request`.
 /// - `cmd <qualified-id> [--format SHAPE] [-- <args-json>]` → direct
 ///   qualified executable invocation (#1375, CTX-0763); a program literally
 ///   named `cmd` needs `bitty run -- cmd ...` or `bitty -- cmd ...`.
@@ -1166,8 +1186,9 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
             }
             "--no-color" => {
                 // CTX-0763: post-word `--no-color` stays verbatim for the
-                // `version`/`completion`/`cmd`/`x` parsers (accepted there for
-                // parity; their output is never colorized).
+                // `version`/`completion`/`cmd`/`x`/`shell-init` parsers
+                // (accepted there for parity; their output is never
+                // colorized).
                 if let Some(next) = push_verbatim_new_word(&mut out, raw, i) {
                     i = next;
                     continue;
@@ -1695,6 +1716,7 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                     && !out.completion_word
                     && !out.cmd_word
                     && !out.x_word
+                    && !out.shell_init_word
                     && token == "version"
                 {
                     out.version_word = true;
@@ -1723,6 +1745,7 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                     && !out.completion_word
                     && !out.cmd_word
                     && !out.x_word
+                    && !out.shell_init_word
                     && (token == "completion" || token == "comp")
                 {
                     out.completion_word = true;
@@ -1751,6 +1774,7 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                     && !out.completion_word
                     && !out.cmd_word
                     && !out.x_word
+                    && !out.shell_init_word
                     && token == "cmd"
                 {
                     out.cmd_word = true;
@@ -1777,10 +1801,40 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                     && !out.completion_word
                     && !out.cmd_word
                     && !out.x_word
+                    && !out.shell_init_word
                     && token == "x"
                 {
                     out.x_word = true;
                     out.x_raw.extend_from_slice(&raw[i + 1..]);
+                    break;
+                }
+                // `bitty shell-init <shell>` shell integration (first
+                // positional only; CTX-1054, #1813). The word `shell-init` is
+                // always this subcommand, never a program named `shell-init`:
+                // use `bitty run -- shell-init ...` (or legacy
+                // `bitty -- shell-init ...`) for that program. Tokens after
+                // the word are kept verbatim for
+                // `shell_init::parse_shell_init_request`.
+                if !program_set
+                    && !out.config_word
+                    && !out.inspect_word
+                    && !out.init_word
+                    && !out.doctor_word
+                    && !out.run_word
+                    && !out.ctl_word
+                    && !out.list_word
+                    && !out.dev_word
+                    && !out.plugin_word
+                    && !out.component_word
+                    && !out.version_word
+                    && !out.completion_word
+                    && !out.cmd_word
+                    && !out.x_word
+                    && !out.shell_init_word
+                    && token == "shell-init"
+                {
+                    out.shell_init_word = true;
+                    out.shell_init_raw.extend_from_slice(&raw[i + 1..]);
                     break;
                 }
                 if !program_set {
@@ -1865,9 +1919,9 @@ pub(crate) fn help_text() -> String {
                               table|json|jsonl (default table; parsed globally,\n  \
                               consumed by `bitty doctor`, `bitty ctl`,\n  \
                               `bitty list`, `bitty inspect`,\n  \
-                              `bitty plugin list|info`, `bitty component list`, `bitty version`,\n  \
-                              `bitty cmd`, and `bitty x` (`bitty completion`\n  \
-                              emits a script and ignores it; ignored by startup).\n\
+                               `bitty plugin list|info`, `bitty component list`, `bitty version`,\n  \
+                               `bitty cmd`, and `bitty x` (`bitty completion` and\n  \
+                               `bitty shell-init` emit scripts and ignore it; ignored by startup).\n\
                --socket PATH   Ctl target socket (global `bitty --socket P ctl ...`\n  \
                               or `bitty ctl --socket P ...`; bypasses discovery).\n  \
                --instance ID   Ctl target instance (global or per-`ctl` flag).\n  \
@@ -1939,9 +1993,13 @@ pub(crate) fn help_text() -> String {
                              (extension, no VM load; `bitty x --help` lists\n  \
                              installed plugins, `bitty x <id> --help` its\n  \
                              commands)\n  \
-            completion <shell>  Emit shell completion script to stdout\n  \
-                             (bash|zsh|fish|powershell|nushell; alias `comp`;\n  \
-                             `bitty completion --help` for detail)\n  \
+             completion <shell>  Emit shell completion script to stdout\n  \
+                              (bash|zsh|fish|powershell|nushell; alias `comp`;\n  \
+                              `bitty completion --help` for detail)\n  \
+             shell-init <shell>  Emit shell integration script to stdout\n  \
+                              (bash|zsh|fish|powershell|nushell: Tab completion\n  \
+                              wiring plus OSC 7 cwd + OSC 133 prompt/status\n  \
+                              hooks; `bitty shell-init --help` for detail)\n  \
             version [--format SHAPE]  Version and build metadata:\n  \
                              `bitty <semver> (<channel> <commit>)` on stdout\n  \
                              (same fields in `--format json`; `-V`/`--version`\n  \

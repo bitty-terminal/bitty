@@ -253,6 +253,7 @@ mod list;
 mod mascot;
 mod plugin;
 mod run;
+mod shell_init;
 mod spawn;
 mod terminal_app;
 mod test_mode;
@@ -404,6 +405,12 @@ fn main() {
             "{}",
             completion::completion_help_text(&args.completion_spelling)
         );
+        std::process::exit(0);
+    }
+    // `bitty shell-init --help` shows shell-integration help (local class:
+    // no instance, no config, no plugin VM).
+    if args.help && args.shell_init_word {
+        print!("{}", shell_init::shell_init_help_text());
         std::process::exit(0);
     }
     // `bitty cmd --help` shows cmd help (local class).
@@ -605,6 +612,13 @@ fn main() {
     // (exit 2).
     if args.completion_word {
         std::process::exit(completion::run_cli(&args));
+    }
+
+    // `bitty shell-init <shell>` shell integration (CTX-1054, #1813, local
+    // class). Dispatched before config load and GUI startup: no instance, no
+    // IPC, no plugin VM. Parse failures are usage errors (exit 2).
+    if args.shell_init_word {
+        std::process::exit(shell_init::run_cli(&args));
     }
 
     // `bitty cmd <qualified-id>` direct executable invocation (CTX-0763,

@@ -1290,6 +1290,8 @@ pub(crate) fn init_usage() -> String {
      \n\
      target: --config PATH wins, else BITTY_CONFIG, else\n\
      $XDG_CONFIG_HOME/bitty/init.lua (fallback ~/.config/bitty/init.lua).\n\
+     Shell integration (Tab completion + OSC 7/133 prompt hooks) is separate:\n\
+     after init, run `bitty shell-init --help` and eval the line for your shell.\n\
      Without --force an existing file is never overwritten (exit 2).\n\
      Without a TTY on stdin, prompts are skipped only with --yes (exit 2\n\
      otherwise, never a hang). Re-runs are idempotent: same answers write\n\
@@ -1462,6 +1464,9 @@ pub(crate) fn run_init_subcommand_with_io(
                 answers.close_confirm.as_str(),
             );
             println!("bitty init: validate any time with `bitty config check`");
+            println!(
+                "bitty init: wire Tab completion + prompt hooks with `eval \"$(bitty shell-init bash)\"` (pick your shell; `bitty shell-init --help` lists all five)"
+            );
             0
         }
         Err(InitWriteError::Refused(message)) => {

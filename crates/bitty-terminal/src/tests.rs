@@ -3870,6 +3870,14 @@ fn parse_cli_v1_gap_words() {
     assert!(!p.completion_word);
     assert_eq!(p.program.as_deref(), Some("comp"));
 
+    // `shell-init` keeps its tail verbatim for the shell-init parser.
+    let p = parse_args(&args_of(&["bitty", "shell-init", "bash"]));
+    assert!(p.shell_init_word);
+    assert_eq!(p.shell_init_raw, vec!["bash".to_string()]);
+    let p = parse_args(&args_of(&["bitty", "--", "shell-init"]));
+    assert!(!p.shell_init_word);
+    assert_eq!(p.program.as_deref(), Some("shell-init"));
+
     // `cmd` keeps the separator-owned tail verbatim.
     let p = parse_args(&args_of(&[
         "bitty",

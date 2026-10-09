@@ -4539,6 +4539,19 @@ fn drive_init_wizard_with_overrides(
     columns: Option<u16>,
     overrides: &InitOverrides,
 ) -> (Result<InitAnswers, String>, String) {
+    drive_init_wizard_with_color(stdin_lines, shell_env, columns, overrides, false)
+}
+
+/// [`drive_init_wizard`] with an explicit option-list color decision.
+/// `false` keeps output plain (existing assertions stay greppable);
+/// `true` enables ANSI entries for color regression tests.
+fn drive_init_wizard_with_color(
+    stdin_lines: &str,
+    shell_env: Option<&str>,
+    columns: Option<u16>,
+    overrides: &InitOverrides,
+    color: bool,
+) -> (Result<InitAnswers, String>, String) {
     let mut input = std::io::BufReader::new(stdin_lines.as_bytes());
     let mut output = Vec::new();
     let result = run_init_interactive(
@@ -4548,6 +4561,7 @@ fn drive_init_wizard_with_overrides(
         columns,
         &|p| p == "/bin/bash" || p == "/bin/sh",
         overrides,
+        color,
     );
     let printed = String::from_utf8(output).expect("wizard output is UTF-8");
     (result, printed)
@@ -4871,8 +4885,10 @@ fn init_wizard_arrows_edit_in_prompt() {
 
 #[test]
 fn init_wizard_up_history_in_prompts() {
-    // `gaps_in` answers `10`; `gaps_out` presses Up to recall it.
-    let stdin = "\n\n\n\n10\n\x1b[A\n\n\n\n\n\n";
+    // `gaps_in` answers `10`; `gaps_out` types `1` then Up to recall it.
+    // Pure Up now moves the option cursor (phase 1 of #1806); typed text
+    // plus Up still recalls history through the shared decoder.
+    let stdin = "\n\n\n\n10\n1\x1b[A\n\n\n\n\n\n";
     let (result, _) = drive_init_wizard(stdin, Some("/bin/bash"), None);
     let answers = result.expect("history recall accepted");
     assert_eq!(answers.gaps_in, 10);
@@ -4915,9 +4931,10 @@ fn init_wizard_redraw_shows_edited_answer() {
 
 #[test]
 fn init_wizard_redraw_shows_recalled_history() {
-    // `gaps_out` recalls `10` via Up: the submitted history value was never
-    // echoed by the kernel, so the redraw must show it.
-    let stdin = "\n\n\n\n10\n\x1b[A\n\n\n\n\n\n";
+    // `gaps_out` types `1` then Up to recall `10`: the submitted history
+    // value was never echoed by the kernel, so the redraw must show it.
+    // (Pure Up now moves the option cursor instead.)
+    let stdin = "\n\n\n\n10\n1\x1b[A\n\n\n\n\n\n";
     let (result, printed) = drive_init_wizard(stdin, Some("/bin/bash"), None);
     let answers = result.expect("history recall accepted");
     assert_eq!(answers.gaps_out, 10);
@@ -4989,6 +5006,168 @@ fn init_wizard_redraw_output_error_aborts() {
         &mut history,
     );
     assert!(result.is_err(), "output failure must abort the prompt");
+}
+
+// -- `bitty init` option lists, phase 1 of #1806 ---------------------------
+//
+// Every prompt renders a navigable option list (Up/Down arrows plus j/k,
+// Enter selects, numbers where the codebase already uses them) with
+// ANSI-colored entries (theme names preview in their own style, other rows
+// carry a colored selection marker). Navigation is additive over the
+// single-line fast path: numbers, names, and values still select in one
+// read, so piped input behaves as before minus the new list rendering.
+
+#[test]
+fn init_option_list_renders_for_every_prompt() {
+    let (result, printed) = drive_init_wizard("\n\n\n\n\n\n\n\n\n\n\n", Some("/bin/bash"), None);
+    result.expect("defaults accepted");
+    assert!(printed.contains("Shell"), "shell list, got:\n{printed}");
+    assert!(printed.contains("Theme"), "theme list, got:\n{printed}");
+    assert!(
+        printed.contains("Font family"),
+        "font list, got:\n{printed}"
+    );
+    assert!(printed.contains("Font size"), "size list, got:\n{printed}");
+    assert!(
+        printed.contains("gaps_in"),
+        "decoration list, got:\n{printed}"
+    );
+    assert!(
+        printed.contains("Scrollback"),
+        "behavior list, got:\n{printed}"
+    );
+    assert!(
+        printed.contains("Close confirm"),
+        "close-confirm list, got:\n{printed}"
+    );
+    assert!(
+        printed.contains("Keybindings"),
+        "preset list, got:\n{printed}"
+    );
+    // Visible cursor line plus navigation hint on every list.
+    assert!(printed.contains('>'), "selection marker, got:\n{printed}");
+    assert!(
+        printed.contains("j/k or arrows move"),
+        "navigation hint, got:\n{printed}"
+    );
+    // Theme catalog and documented font fallbacks are listed.
+    assert!(
+        printed.contains("tokyo-night"),
+        "theme catalog, got:\n{printed}"
+    );
+    assert!(
+        printed.contains("JetBrains Mono"),
+        "font options, got:\n{printed}"
+    );
+}
+
+#[test]
+fn init_option_list_j_navigates_theme() {
+    // Shell default, theme `j` moves to tokyo-night then Enter selects it,
+    // remaining prompts take defaults.
+    let stdin = "\nj\n\n\n\n\n\n\n\n\n\n\n";
+    let (result, _) = drive_init_wizard(stdin, Some("/bin/bash"), None);
+    let answers = result.expect("navigated theme accepted");
+    assert_eq!(answers.theme, "tokyo-night");
+}
+
+#[test]
+fn init_option_list_arrow_down_navigates_theme() {
+    // Down arrow behaves like `j` for the theme list.
+    let stdin = "\n\x1b[B\n\n\n\n\n\n\n\n\n\n\n";
+    let (result, _) = drive_init_wizard(stdin, Some("/bin/bash"), None);
+    let answers = result.expect("arrow-navigated theme accepted");
+    assert_eq!(answers.theme, "tokyo-night");
+}
+
+#[test]
+fn init_option_list_k_wraps_theme_to_last() {
+    // Up/`k` from the default wraps to the last preset (github-light).
+    let stdin = "\nk\n\n\n\n\n\n\n\n\n\n\n";
+    let (result, _) = drive_init_wizard(stdin, Some("/bin/bash"), None);
+    let answers = result.expect("wrapped theme accepted");
+    assert_eq!(answers.theme, "github-light");
+}
+
+#[test]
+fn init_option_list_number_fast_path_still_selects_shell() {
+    // Numbered fast path: `2` picks the second shell candidate in one read.
+    let (result, _) = drive_init_wizard("2\n\n\n\n\n\n\n\n\n\n\n", Some("/bin/bash"), None);
+    let answers = result.expect("numbered shell accepted");
+    assert_eq!(answers.shell.as_deref(), Some("/bin/sh"));
+}
+
+#[test]
+fn init_option_list_typed_value_still_selects_size() {
+    // Typed values need no navigation: `14` answers the size step directly.
+    let stdin = "\n\n\n14\n\n\n\n\n\n\n\n";
+    let (result, _) = drive_init_wizard(stdin, Some("/bin/bash"), None);
+    let answers = result.expect("typed size accepted");
+    assert!((answers.font_size - 14.0).abs() < f32::EPSILON);
+}
+
+#[test]
+fn init_option_list_invalid_retry_then_navigation() {
+    // An unknown theme reprompts; `j` plus Enter then selects tokyo-night.
+    let stdin = "\nnope\nj\n\n\n\n\n\n\n\n\n\n\n";
+    let (result, printed) = drive_init_wizard(stdin, Some("/bin/bash"), None);
+    let answers = result.expect("retry plus navigation accepted");
+    assert_eq!(answers.theme, "tokyo-night");
+    assert!(
+        printed.contains("try again"),
+        "retry message expected, got:\n{printed}"
+    );
+}
+
+#[test]
+fn init_option_list_plain_output_has_no_escapes() {
+    // Default harness color is off: piped/plain output carries no ANSI.
+    let (result, printed) = drive_init_wizard("\n\n\n\n\n\n\n\n\n\n\n", Some("/bin/bash"), None);
+    result.expect("defaults accepted");
+    assert!(
+        !printed.contains("\u{1b}["),
+        "plain output must not colorize, got:\n{printed}"
+    );
+}
+
+#[test]
+fn init_option_list_color_previews_theme_and_marker() {
+    // With color on, theme rows preview in their own truecolor style and
+    // the selection marker is colored; labels stay greppable.
+    let (result, printed) = drive_init_wizard_with_color(
+        "\n\n\n\n\n\n\n\n\n\n\n",
+        Some("/bin/bash"),
+        None,
+        &InitOverrides::default(),
+        true,
+    );
+    result.expect("defaults accepted");
+    assert!(
+        printed.contains("\u{1b}[38;2;"),
+        "theme preview foreground, got:\n{printed}"
+    );
+    assert!(
+        printed.contains("\u{1b}[48;2;"),
+        "theme preview background, got:\n{printed}"
+    );
+    assert!(
+        printed.contains("\u{1b}[36m>"),
+        "colored selection marker, got:\n{printed}"
+    );
+    assert!(
+        printed.contains("tokyo-night"),
+        "labels stay greppable, got:\n{printed}"
+    );
+}
+
+#[test]
+fn init_color_enabled_impl_matches_convention() {
+    // Pure decision table: explicit flag, NO_COLOR, or dumb terminal
+    // disables; otherwise color is allowed.
+    assert!(!crate::init::init_color_enabled_impl(true, false, false));
+    assert!(!crate::init::init_color_enabled_impl(false, true, false));
+    assert!(!crate::init::init_color_enabled_impl(false, false, true));
+    assert!(crate::init::init_color_enabled_impl(false, false, false));
 }
 
 #[test]

@@ -1782,7 +1782,24 @@ mod tests {
             let tarball = format!("canned-tarball-{name}-{version}-{target}").into_bytes();
             let tarball_digest = bitty_package::integrity::sha256_hex(&tarball);
             let exe_digest = bitty_package::integrity::sha256_hex(exe);
-            let manifest = format!("{tarball_digest}  {target}.tar.gz\n");
+            // The stub fetch returns the same tarball bytes for any tarball
+            // URL, so the stub is host-independent: the manifest carries one
+            // line per mapped host triple (see `host_target_triple`) all
+            // pointing at that single digest, so the real host lookup always
+            // hits regardless of where the test runs.
+            const HOST_TRIPLES: [&str; 7] = [
+                "x86_64-unknown-linux-gnu",
+                "aarch64-unknown-linux-gnu",
+                "x86_64-unknown-linux-musl",
+                "aarch64-apple-darwin",
+                "x86_64-apple-darwin",
+                "x86_64-pc-windows-msvc",
+                "aarch64-pc-windows-msvc",
+            ];
+            let mut manifest = String::new();
+            for triple in HOST_TRIPLES {
+                manifest.push_str(&format!("{tarball_digest}  {triple}.tar.gz\n"));
+            }
             let descriptor = format!(
                 "[component]\nname = \"{name}\"\nversion = \"{version}\"\nprotocol = [1, 1]\nexecutable = \"bitty-{name}\"\nsha256 = \"{exe_digest}\"\n"
             )
@@ -1844,11 +1861,18 @@ mod tests {
 
     #[test]
     fn install_stages_verified_seed_payload_end_to_end() {
+        // Truly unmapped hosts (FreeBSD/musl-riscv/...) return
+        // UnsupportedHost before the stub is reached, so there is nothing
+        // end-to-end to exercise there.
+        if crate::component_seed::host_target_triple().is_none() {
+            return;
+        }
         let base = scratch("install-e2e");
         let (context, _, _) = context_for(&base.join("user"), &base.join("system"));
         let user = Path::new(context.components_dir.expect("user")).to_path_buf();
-        // Fixed triple: the stub transport is host-independent, so the test
-        // holds on unmapped hosts too (no `host_target_triple` dependency).
+        // Fixed triple keeps the canned tarball bytes stable; the manifest
+        // above covers the real host lookup, so the test holds on any mapped
+        // host.
         let target = "x86_64-unknown-linux-gnu";
         let mut stub = InstallStub::canned("net", "0.0.23", target, b"seed-net-bytes");
         let mut out = Vec::new();

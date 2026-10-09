@@ -386,7 +386,10 @@ fn list_explicit_missing_socket_is_runtime_unavailable() {
 }
 
 #[test]
-fn list_themes_table_renders_swatches_when_color_supported() {
+fn list_themes_table_omits_swatches_when_piped_but_keeps_hex() {
+    // CTX-1065 unified gate: captured (piped) stdout is not a TTY, so even
+    // with color-capable TERM and NO_COLOR removed the table carries no
+    // swatches. Forced-color rendering stays covered by unit tests.
     // Pin per child process (never the parent): TERM advertises color while
     // NO_COLOR is removed, so the assertion is deterministic regardless of
     // the ambient CI environment (same pattern as cli_help.rs).
@@ -404,12 +407,8 @@ fn list_themes_table_renders_swatches_when_color_supported() {
     );
     let text = stdout(&output);
     assert!(
-        text.contains("\u{1b}[48;2;"),
-        "themes table must carry bg swatches when color is on, got {text:?}"
-    );
-    assert!(
-        text.contains("\u{1b}[38;2;"),
-        "themes table must carry fg sample text when color is on, got {text:?}"
+        !text.contains('\u{1b}'),
+        "piped themes table must carry no swatches under the unified gate, got {text:?}"
     );
     // Hex stays greppable alongside the swatches.
     assert!(text.contains("bitty-dark"));

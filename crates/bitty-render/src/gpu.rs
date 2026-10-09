@@ -77,9 +77,10 @@
 //!   to `Bgra8UnormSrgb` (the widest-supported srgb format). This keeps
 //!   behavior stable across backends while preserving the `Srgb` preference
 //!   for correct gamma.
-//! - **Present mode:** prefer `Mailbox` (low-latency triple buffering) then
-//!   `Fifo` (guaranteed vsync); otherwise pick the first reported mode, or
-//!   `Fifo` if none. `Fifo` is the only mode the WebGPU spec guarantees.
+//! - **Present mode:** prefer `Fifo` (spec-guaranteed vsync double
+//!   buffering) over `Mailbox` (triple buffering): one fewer resident
+//!   swap-chain image (a full `width*height*4` frame plus driver-side
+//!   bookkeeping) for latency a terminal never needs (CTX-1036, #1809).
 //!
 //! Backend selection follows wgpu's own environment handling
 //! (`WGPU_BACKEND=...`) via `InstanceDescriptor::from_env_or_default()`, so
@@ -92,9 +93,15 @@
 //! machines. A stack overflow aborts the process — it is not a `Result` the
 //! caller can recover from — so the only graceful fallback is to never start
 //! WGL init: [`instance_descriptor`] drops `Backends::GL` on Windows when
-//! `WGPU_BACKEND` is unset, leaving DX12/Vulkan to be picked. The exclusion
-//! and its override are reported through [`BackendSelection`], and callers
-//! log [`BackendSelection::log_note`] so the fallback is loud, never silent.
+//! `WGPU_BACKEND` is unset, leaving DX12/Vulkan to be picked. Linux excludes
+//! GL by default for the same shape of reason at a different scale
+//! (CTX-1036, issue #1809): the GL driver stack (`libEGL_nvidia`,
+//! `libGLX_nvidia`, `libnvidia-eglcore`, gallium, ~15 MiB of resident file
+//! mappings plus its init threads) stays resident even when the negotiated
+//! surface runs on Vulkan, and the Vulkan driver arena already dominates
+//! idle RSS. [`GpuContext::initialize`] retries once with the full backend
+//! set when the restricted instance finds no adapter, so Vulkan-less hosts
+//! (old hardware, minimal VMs) still fall back to GL instead of failing.
 //! The init-thread stack size is not configurable from this crate (it is
 //! hardcoded in `wgpu-hal 26.0.6` `gles/wgl.rs`); see
 //! [`resolve_instance_backends`] for the pure, unit-tested selection rule.
@@ -221,6 +228,12 @@ pub enum BackendSelection {
     /// Windows without an operator pin: GL was excluded so `wgpu-hal` never
     /// starts its overflow-prone WGL init thread; DX12/Vulkan remain.
     WindowsGlExcluded,
+    /// Linux without an operator pin: GL was excluded so the GL driver
+    /// stack never becomes resident when the surface negotiates Vulkan
+    /// (CTX-1036, issue #1809 — ~15 MiB of file mappings plus init
+    /// threads); Vulkan remains, and [`GpuContext::initialize`] retries
+    /// with the full backend set when no adapter is found.
+    LinuxGlExcluded,
 }
 
 impl BackendSelection {
@@ -233,6 +246,12 @@ impl BackendSelection {
                 "excluded the GL/WGL backend on Windows to avoid the \
                  `wgpu-hal WGL Instance Thread` stack overflow \
                  (issue #1799); DX12/Vulkan remain — set WGPU_BACKEND \
+                 to override",
+            ),
+            Self::LinuxGlExcluded => Some(
+                "excluded the GL backend on Linux to keep the GL driver \
+                 stack out of the resident set when Vulkan serves the \
+                 surface (CTX-1036, issue #1809); set WGPU_BACKEND \
                  to override",
             ),
             Self::Defaults | Self::EnvOverride => None,
@@ -249,26 +268,34 @@ impl BackendSelection {
 /// - `on_windows`: `true` on Windows targets (pass
 ///   `cfg!(target_os = "windows")` in production; a parameter here so the
 ///   rule is unit-testable without a Windows runner).
+/// - `on_linux`: `true` on Linux targets (pass `cfg!(target_os = "linux")`
+///   in production; same testability rationale).
 ///
 /// On Windows without an operator pin, `Backends::GL` is removed so
 /// `wgpu-hal` never spawns its 256 KiB-stack WGL init thread, whose
 /// driver-dependent overflow aborts the process before any `Result` can be
-/// returned. If GL were the only enabled backend the defaults are kept
-/// (an empty set could never produce an adapter, so there is nothing to
-/// fall back to).
+/// returned. On Linux without an operator pin, `Backends::GL` is removed so
+/// the GL driver stack never becomes resident when Vulkan serves the
+/// surface (CTX-1036, issue #1809). If GL were the only enabled backend the
+/// defaults are kept (an empty set could never produce an adapter, so there
+/// is nothing to fall back to).
 #[must_use]
 pub fn resolve_instance_backends(
     defaults: Backends,
     env_override: Option<Backends>,
     on_windows: bool,
+    on_linux: bool,
 ) -> (Backends, BackendSelection) {
     if let Some(pinned) = env_override {
         return (pinned, BackendSelection::EnvOverride);
     }
-    if on_windows && defaults.contains(Backends::GL) {
+    if (on_windows || on_linux) && defaults.contains(Backends::GL) {
         let restricted = defaults.difference(Backends::GL);
         if !restricted.is_empty() {
-            return (restricted, BackendSelection::WindowsGlExcluded);
+            if on_windows {
+                return (restricted, BackendSelection::WindowsGlExcluded);
+            }
+            return (restricted, BackendSelection::LinuxGlExcluded);
         }
     }
     (defaults, BackendSelection::Defaults)
@@ -285,10 +312,15 @@ pub fn resolve_instance_backends(
 pub fn select_instance_backends() -> (Backends, BackendSelection) {
     let base = InstanceDescriptor::from_env_or_default();
     let env_override = Backends::from_env();
-    resolve_instance_backends(base.backends, env_override, cfg!(target_os = "windows"))
+    resolve_instance_backends(
+        base.backends,
+        env_override,
+        cfg!(target_os = "windows"),
+        cfg!(target_os = "linux"),
+    )
 }
 
-/// Builds the `wgpu` instance descriptor with the Windows WGL guard applied.
+/// Builds the `wgpu` instance descriptor with the platform GL guard applied.
 ///
 /// Starts from `InstanceDescriptor::from_env_or_default()` (so every other
 /// `WGPU_*` knob keeps working) and replaces `backends` with the
@@ -297,9 +329,51 @@ pub fn select_instance_backends() -> (Backends, BackendSelection) {
 pub fn instance_descriptor() -> InstanceDescriptor {
     let base = InstanceDescriptor::from_env_or_default();
     let env_override = Backends::from_env();
-    let (backends, _) =
-        resolve_instance_backends(base.backends, env_override, cfg!(target_os = "windows"));
+    let (backends, _) = resolve_instance_backends(
+        base.backends,
+        env_override,
+        cfg!(target_os = "windows"),
+        cfg!(target_os = "linux"),
+    );
     InstanceDescriptor { backends, ..base }
+}
+
+/// Builds the `wgpu` instance descriptor with every compiled backend kept.
+///
+/// This is the [`GpuContext::initialize`] fallback on non-Windows platforms
+/// when the guarded [`instance_descriptor`] finds no adapter (Vulkan-less
+/// hosts still reach GL instead of failing): it honors `WGPU_BACKEND`
+/// exactly like the base descriptor and excludes nothing. On Windows it is
+/// constructed but never used for an automatic retry — reintroducing GL
+/// there would restart the `wgpu-hal` WGL init thread whose driver-dependent
+/// overflow aborts the process before any error is returned (issue #1799).
+#[must_use]
+pub fn full_backends_descriptor() -> InstanceDescriptor {
+    InstanceDescriptor::from_env_or_default()
+}
+
+/// Whether a guarded `NoCompatibleAdapter` may retry with the full backend set.
+///
+/// Pure rule so the platform gate stays unit-testable without a GPU:
+/// retry only when the sets actually differ (otherwise the second attempt
+/// could not succeed) and never on Windows, where the retry would
+/// reintroduce the crash-contained WGL init thread (issue #1799) exactly on
+/// the path where the old code returned a graceful `Err`.
+#[must_use]
+fn should_retry_with_full_backends(primary: Backends, full: Backends, on_windows: bool) -> bool {
+    full != primary && !on_windows
+}
+
+/// Memory-allocation hint for the logical device request (CTX-1036, #1809).
+///
+/// Crate-private: `MemoryHints` is a `wgpu` type and no `wgpu` type escapes
+/// this crate's public API (ADR-0004 "Adopt" row). `MemoryUsage` tells the
+/// backend to size its sub-allocation arenas conservatively instead of the
+/// default `Performance` throughput sizing, which dominates idle RSS on
+/// discrete GPUs. A terminal's steady-state draw set (bounded fill/glyph
+/// batches, one small atlas, no render-to-texture) fits comfortably.
+fn device_memory_hints() -> MemoryHints {
+    MemoryHints::MemoryUsage
 }
 
 // ---------------------------------------------------------------------------
@@ -329,6 +403,20 @@ impl GpuContext {
     /// unless the operator pins backends via `WGPU_BACKEND` (issue #1799 —
     /// the `wgpu-hal` WGL init thread overflows its hardcoded 256 KiB stack
     /// on some drivers, aborting the process before any error is returned).
+    /// On Linux the GL backend is excluded for the same reason at resident
+    /// scale (CTX-1036, issue #1809 — the GL driver stack stays mapped even
+    /// when Vulkan serves the surface). When the guarded instance finds no
+    /// adapter, initialization retries once with [`full_backends_descriptor`]
+    /// so Vulkan-less hosts still reach GL instead of failing. The retry is
+    /// non-Windows-only: on Windows a guarded miss stays a graceful
+    /// [`RenderError::NoCompatibleAdapter`] (headless/error path) rather
+    /// than re-entering the crash-contained WGL init thread (issue #1799).
+    ///
+    /// The logical device requests [`MemoryHints::MemoryUsage`] (CTX-1036,
+    /// issue #1809): the driver's default `Performance` hint sizes its
+    /// sub-allocation arenas for throughput, which dominates idle RSS on
+    /// discrete GPUs; a terminal's steady-state draw set fits comfortably in
+    /// the conservative strategy.
     ///
     /// On a machine without a usable graphics stack — headless CI, for
     /// example — this returns [`RenderError::NoCompatibleAdapter`] rather
@@ -343,10 +431,96 @@ impl GpuContext {
     ///   device request.
     /// - [`RenderError::UpstreamGraphics`] for other upstream failures.
     pub async fn initialize() -> Result<Self, RenderError> {
-        let instance = Instance::new(&instance_descriptor());
+        let primary = instance_descriptor();
+        let full = full_backends_descriptor();
+        // The guard excluded a backend the host actually needs
+        // (Vulkan-less machine, minimal VM): retry with everything
+        // compiled in — except on Windows, where the retry would re-enter
+        // the crash-contained WGL init thread (issue #1799). Any other
+        // failure (device rejection, driver error) is real and propagates
+        // without a second attempt.
+        let retry_allowed = should_retry_with_full_backends(
+            primary.backends,
+            full.backends,
+            cfg!(target_os = "windows"),
+        );
+        match Self::initialize_with(&primary, None).await {
+            Ok(ctx) => Ok(ctx),
+            Err(RenderError::NoCompatibleAdapter) if retry_allowed => {
+                Self::initialize_with(&full, None).await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Initializes the GPU context for a window surface.
+    ///
+    /// This is the recommended initialization path when a window surface is
+    /// available: the adapter is selected with the surface as
+    /// `compatible_surface`, ensuring that the chosen adapter can present to
+    /// the window. On Vulkan systems with multiple adapters, this prevents
+    /// selecting a compute-only adapter that would later fail during
+    /// `Surface::configure`.
+    ///
+    /// Uses the same backend guards and retry logic as [`Self::initialize`]:
+    /// GL is excluded on Windows (issue #1799) and Linux (CTX-1036, #1809),
+    /// and non-Windows platforms retry with full backends when no adapter is
+    /// found.
+    ///
+    /// # Errors
+    ///
+    /// - [`RenderError::SurfaceCreate`] when the temporary surface cannot be
+    ///   created for adapter selection.
+    /// - [`RenderError::NoCompatibleAdapter`] when enumeration finds nothing
+    ///   usable.
+    /// - [`RenderError::DeviceRequest`] when the adapter rejects the logical
+    ///   device request.
+    /// - [`RenderError::UpstreamGraphics`] for other upstream failures.
+    pub async fn initialize_for_surface(target: &SurfaceTarget) -> Result<Self, RenderError> {
+        let primary = instance_descriptor();
+        let full = full_backends_descriptor();
+        let retry_allowed = should_retry_with_full_backends(
+            primary.backends,
+            full.backends,
+            cfg!(target_os = "windows"),
+        );
+        match Self::initialize_with(&primary, Some(target)).await {
+            Ok(ctx) => Ok(ctx),
+            Err(RenderError::NoCompatibleAdapter) if retry_allowed => {
+                Self::initialize_with(&full, Some(target)).await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Initializes instance, adapter, and logical device for `descriptor`.
+    ///
+    /// Split from [`Self::initialize`] so the guarded-then-full fallback is
+    /// testable without a GPU (callers never use this directly).
+    ///
+    /// When `target` is provided, a temporary surface is created and passed
+    /// as `compatible_surface` to `request_adapter`, ensuring the selected
+    /// adapter can present to the window (CodeRabbit PR #1837, gpu.rs:449-453).
+    async fn initialize_with(
+        descriptor: &InstanceDescriptor,
+        target: Option<&SurfaceTarget>,
+    ) -> Result<Self, RenderError> {
+        let instance = Instance::new(descriptor);
+
+        // Create temporary surface for adapter selection when targeting a window
+        let temp_surface = target
+            .map(|t| {
+                instance
+                    .create_surface(t.clone())
+                    .map_err(|err| RenderError::SurfaceCreate(err.to_string()))
+            })
+            .transpose()?;
 
         let adapter = instance
-            .request_adapter(&RequestAdapterOptions::default())
+            .request_adapter(&RequestAdapterOptions {
+                compatible_surface: temp_surface.as_ref(),
+                ..Default::default()
+            })
             .await
             .map_err(|_| RenderError::NoCompatibleAdapter)?;
 
@@ -355,7 +529,7 @@ impl GpuContext {
                 label: Some("bitty-render"),
                 required_features: Features::empty(),
                 required_limits: Limits::default(),
-                memory_hints: MemoryHints::default(),
+                memory_hints: device_memory_hints(),
                 trace: Trace::Off,
             })
             .await
@@ -473,7 +647,9 @@ pub enum PresentMode {
     FifoRelaxed,
     /// No vsync (`Immediate`).
     Immediate,
-    /// Triple-buffered vsync (`Mailbox`).
+    /// Triple-buffered vsync (`Mailbox`): offered but never preferred —
+    /// [`pick_present_mode`] picks [`PresentMode::Fifo`] first so idle keeps
+    /// two resident swap-chain images instead of three (CTX-1036, #1809).
     Mailbox,
 }
 
@@ -900,7 +1076,9 @@ impl Surface {
     /// Configures (or reconfigures) the surface for `extent`.
     ///
     /// For a real surface, this queries `get_capabilities`, picks a format
-    /// with `Srgb`→fallback, a present mode with `Mailbox`→`Fifo` fallback,
+    /// with `Srgb`→fallback, a present mode with `Fifo` preferred (CTX-1036,
+    /// issue #1809 — double-buffered vsync keeps one fewer resident frame
+    /// than `Mailbox` triple buffering),
     /// and an alpha mode from the surface's supported list (CTX-0290):
     /// `Auto` for fully opaque windows, `PreMultiplied` when the configured
     /// opacity is below `1.0` and the platform supports it. The
@@ -1330,8 +1508,9 @@ impl Surface {
 
                 // Resolve atlas dimensions for resource matching: when the
                 // frame needs atlas texels they must be supplied (checked
-                // above); otherwise reuse the cached dims or fall back to a
-                // 1x1 probe that keeps resource creation total. The draw
+                // above); otherwise reuse the cached dims or leave them
+                // unresolved so resource creation sizes the texture at the
+                // lazy initial dimension (CTX-1036, #1809). The draw
                 // below revalidates before sampling.
                 let atlas_dims = atlas.map(|(_, dims)| dims).or_else(|| {
                     self.state
@@ -1359,12 +1538,14 @@ impl Surface {
                     };
                     if needs_recreate {
                         // Without atlas dims there is nothing to size the
-                        // atlas texture from; use the default atlas
-                        // dimension as a total fallback (draws with no
-                        // atlas glyphs never sample it).
+                        // atlas texture from; use the lazy initial dimension
+                        // (256 KiB R8, CTX-1036 #1809) instead of the 2048
+                        // maximum (4 MiB): draws with no atlas glyphs never
+                        // sample it, and the first atlas frame recreates at
+                        // its real dims through the match check above.
                         let dims = draw_atlas_dims.unwrap_or(crate::atlas::AtlasDims {
-                            width: crate::atlas::DEFAULT_ATLAS_DIMENSION,
-                            height: crate::atlas::DEFAULT_ATLAS_DIMENSION,
+                            width: crate::atlas::INITIAL_ATLAS_DIMENSION,
+                            height: crate::atlas::INITIAL_ATLAS_DIMENSION,
                         });
                         let resources = GpuResources::create(&ctx.device, surface_format, dims)
                             .map_err(|e| RenderError::UpstreamGraphics(e.to_string()))?;
@@ -1674,12 +1855,20 @@ fn pick_format(caps: &wgpu::SurfaceCapabilities) -> SurfaceFormat {
         .unwrap_or(SurfaceFormat::Bgra8UnormSrgb)
 }
 
-fn pick_present_mode(caps: &wgpu::SurfaceCapabilities) -> PresentMode {
-    if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
-        return PresentMode::Mailbox;
-    }
+/// Picks the swap-chain present mode from the surface capabilities.
+///
+/// Pure rule (unit-tested, gated by the `#1809` memory-budget tests):
+/// `Fifo` first — it is the only mode the WebGPU spec guarantees, and as a
+/// double-buffered vsync it keeps one fewer resident frame than `Mailbox`
+/// triple buffering (CTX-1036, issue #1809); then `Mailbox` when `Fifo` is
+/// missing; otherwise the first reported mode, or `Fifo` when none is.
+#[must_use]
+pub fn pick_present_mode(caps: &wgpu::SurfaceCapabilities) -> PresentMode {
     if caps.present_modes.contains(&wgpu::PresentMode::Fifo) {
         return PresentMode::Fifo;
+    }
+    if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+        return PresentMode::Mailbox;
     }
     caps.present_modes
         .first()
@@ -2147,10 +2336,28 @@ mod tests {
         // wgpu-hal never spawns its 256 KiB WGL init thread; DX12/Vulkan
         // stay so adapter enumeration can still succeed.
         let defaults = Backends::DX12 | Backends::VULKAN | Backends::GL;
-        let (backends, selection) = resolve_instance_backends(defaults, None, true);
+        let (backends, selection) = resolve_instance_backends(defaults, None, true, false);
         assert_eq!(selection, BackendSelection::WindowsGlExcluded);
         assert!(!backends.contains(Backends::GL), "GL excluded");
         assert!(backends.contains(Backends::DX12), "DX12 kept");
+        assert!(backends.contains(Backends::VULKAN), "Vulkan kept");
+        assert!(
+            selection.log_note().is_some(),
+            "exclusion must carry a log reason"
+        );
+    }
+
+    #[test]
+    fn linux_guard_excludes_gl_without_env_override() {
+        // CTX-1036 (issue #1809): on Linux with no WGPU_BACKEND pin, GL
+        // must go so the GL driver stack (~15 MiB resident file mappings
+        // plus init threads) never loads when Vulkan serves the surface.
+        // initialize() retries with full backends when no adapter is
+        // found, so Vulkan-less hosts still reach GL.
+        let defaults = Backends::VULKAN | Backends::GL;
+        let (backends, selection) = resolve_instance_backends(defaults, None, false, true);
+        assert_eq!(selection, BackendSelection::LinuxGlExcluded);
+        assert!(!backends.contains(Backends::GL), "GL excluded");
         assert!(backends.contains(Backends::VULKAN), "Vulkan kept");
         assert!(
             selection.log_note().is_some(),
@@ -2163,18 +2370,28 @@ mod tests {
         // An explicit WGPU_BACKEND pin is the operator's choice: honored
         // verbatim, no exclusion, nothing to log.
         let (backends, selection) =
-            resolve_instance_backends(Backends::all(), Some(Backends::GL), true);
+            resolve_instance_backends(Backends::all(), Some(Backends::GL), true, false);
         assert_eq!(selection, BackendSelection::EnvOverride);
         assert_eq!(backends, Backends::GL);
         assert_eq!(selection.log_note(), None);
     }
 
     #[test]
-    fn non_windows_keeps_gl_without_override() {
-        // The guard is Windows-only: other platforms keep probing GL (ANGLE
-        // / native) exactly as before.
+    fn env_override_wins_on_linux() {
+        // Same operator-wins rule on Linux (CTX-1036): a GL pin keeps GL.
+        let (backends, selection) =
+            resolve_instance_backends(Backends::all(), Some(Backends::GL), false, true);
+        assert_eq!(selection, BackendSelection::EnvOverride);
+        assert_eq!(backends, Backends::GL);
+        assert_eq!(selection.log_note(), None);
+    }
+
+    #[test]
+    fn non_windows_non_linux_keeps_gl_without_override() {
+        // The guard is Windows/Linux-only: other platforms keep probing GL
+        // (ANGLE / native) exactly as before.
         let defaults = Backends::DX12 | Backends::VULKAN | Backends::GL;
-        let (backends, selection) = resolve_instance_backends(defaults, None, false);
+        let (backends, selection) = resolve_instance_backends(defaults, None, false, false);
         assert_eq!(selection, BackendSelection::Defaults);
         assert_eq!(backends, defaults);
         assert_eq!(selection.log_note(), None);
@@ -2185,9 +2402,55 @@ mod tests {
         // Degenerate build with only GL compiled: excluding it would leave
         // an empty set that can never yield an adapter, so keep defaults
         // (there is nothing to fall back to) rather than init nothing.
-        let (backends, selection) = resolve_instance_backends(Backends::GL, None, true);
+        let (backends, selection) = resolve_instance_backends(Backends::GL, None, true, false);
         assert_eq!(selection, BackendSelection::Defaults);
         assert_eq!(backends, Backends::GL);
+    }
+
+    #[test]
+    fn linux_gl_only_build_keeps_defaults_instead_of_empty() {
+        // Same degenerate rule on Linux (CTX-1036): a GL-only build keeps
+        // probing GL rather than initializing an empty backend set.
+        let (backends, selection) = resolve_instance_backends(Backends::GL, None, false, true);
+        assert_eq!(selection, BackendSelection::Defaults);
+        assert_eq!(backends, Backends::GL);
+    }
+
+    #[test]
+    fn guarded_retry_reaches_full_backends_off_windows() {
+        // CTX-1036: a guarded Linux miss (Vulkan kept, GL excluded) retries
+        // with the full set so Vulkan-less hosts still reach GL.
+        let primary = Backends::VULKAN;
+        let full = Backends::VULKAN | Backends::GL;
+        assert!(should_retry_with_full_backends(primary, full, false));
+    }
+
+    #[test]
+    fn guarded_retry_stays_graceful_on_windows() {
+        // Issue #1799: the retry would reintroduce the WGL init thread that
+        // can abort the process before any error is returned, so a guarded
+        // Windows miss stays `NoCompatibleAdapter` (headless/error path).
+        let primary = Backends::DX12 | Backends::VULKAN;
+        let full = primary | Backends::GL;
+        assert!(!should_retry_with_full_backends(primary, full, true));
+    }
+
+    #[test]
+    fn guarded_retry_needs_differing_backend_sets() {
+        // Identical sets cannot succeed on retry (explicit pin, GL-only
+        // build, or non-guarded platform): no second attempt anywhere.
+        let same = Backends::VULKAN | Backends::GL;
+        assert!(!should_retry_with_full_backends(same, same, false));
+        assert!(!should_retry_with_full_backends(same, same, true));
+    }
+
+    #[test]
+    fn device_prefers_memory_usage_over_performance() {
+        // CTX-1036 (issue #1809): the logical-device request must size the
+        // driver's sub-allocation arenas conservatively (MemoryUsage),
+        // never the default Performance throughput sizing that dominates
+        // idle RSS on discrete GPUs.
+        assert!(matches!(device_memory_hints(), MemoryHints::MemoryUsage));
     }
 
     #[test]
@@ -2441,14 +2704,23 @@ mod tests {
             alpha_modes: vec![wgpu::CompositeAlphaMode::Auto],
         };
         assert_eq!(pick_format(&caps), SurfaceFormat::Bgra8UnormSrgb);
-        // Mailbox preferred over Fifo.
+        // Fifo preferred over Mailbox (CTX-1036, #1809): double-buffered
+        // vsync keeps one fewer resident frame than triple buffering.
         let caps2 = wgpu::SurfaceCapabilities {
             usages: TextureUsages::RENDER_ATTACHMENT,
             formats: vec![TextureFormat::Bgra8UnormSrgb],
             present_modes: vec![wgpu::PresentMode::Fifo, wgpu::PresentMode::Mailbox],
             alpha_modes: vec![wgpu::CompositeAlphaMode::Auto],
         };
-        assert_eq!(pick_present_mode(&caps2), PresentMode::Mailbox);
+        assert_eq!(pick_present_mode(&caps2), PresentMode::Fifo);
+        // Mailbox-only caps still negotiate (degraded, never rejected).
+        let caps3 = wgpu::SurfaceCapabilities {
+            usages: TextureUsages::RENDER_ATTACHMENT,
+            formats: vec![TextureFormat::Bgra8UnormSrgb],
+            present_modes: vec![wgpu::PresentMode::Mailbox],
+            alpha_modes: vec![wgpu::CompositeAlphaMode::Auto],
+        };
+        assert_eq!(pick_present_mode(&caps3), PresentMode::Mailbox);
     }
 
     #[test]

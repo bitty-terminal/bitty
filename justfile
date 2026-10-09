@@ -392,6 +392,12 @@ perf-dogfood-session-run out *args:
 dogfood-session-test:
     bash scripts/tests/dogfood-session.test.sh
 
+# Headed idle-memory probe (CTX-1036, issue #1809). Headless-safe contract
+# test only; the live headed run needs Hyprland + grim + jq and a free
+# workspace (default 5): `bash scripts/mem-measure.sh --build`.
+mem-measure-test:
+    bash scripts/tests/mem-measure.test.sh
+
 # Publish a redacted CarryCtx snapshot inside this repo (commander merge
 # closeout only; never a git hook). `carryctx export --publication` redacts the
 # bundle, stamps manifest.redacted, and commits one snapshot to the fixed ref

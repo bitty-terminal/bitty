@@ -102,8 +102,18 @@
 //! idle RSS. [`GpuContext::initialize`] retries once with the full backend
 //! set when the restricted instance finds no adapter, so Vulkan-less hosts
 //! (old hardware, minimal VMs) still fall back to GL instead of failing.
-//! The init-thread stack size is not configurable from this crate (it is
-//! hardcoded in `wgpu-hal 26.0.6` `gles/wgl.rs`); see
+//! The init-thread stack size is not configurable from this crate. The
+//! upstream chain (verified against the pinned `wgpu-hal 26.0.6` /
+//! `wgpu-core 26.0.1` / `wgpu-types 26.0.0` sources in `Cargo.lock`) is:
+//! `gles/mod.rs` maps the GLES backend to `wgl::Instance` on Windows;
+//! `gles/wgl.rs` `Instance::init` calls `create_instance_device`, which
+//! spawns the helper thread with `.stack_size(256 * 1024)` and
+//! `.name("wgpu-hal WGL Instance Thread")`; the thread body runs hidden
+//! window creation, `GetDC`, pixel-format setup, and WGL driver calls on
+//! that stack, so driver-dependent depth overflows it and aborts the
+//! process before any `Result` is returned. `wgpu-core` `instance.rs`
+//! `try_add_hal` skips backends absent from the descriptor, so excluding
+//! `Backends::GL` keeps WGL init from ever starting; see
 //! [`resolve_instance_backends`] for the pure, unit-tested selection rule.
 //!
 //! # Safety: no `unsafe`
@@ -2442,6 +2452,36 @@ mod tests {
         let same = Backends::VULKAN | Backends::GL;
         assert!(!should_retry_with_full_backends(same, same, false));
         assert!(!should_retry_with_full_backends(same, same, true));
+    }
+
+    #[test]
+    fn windows_effective_backends_never_reach_wgl_without_override() {
+        // Issue #1799 guard composition (pure, headless): with typical
+        // Windows defaults and no operator pin, the guarded primary
+        // excludes GL and the full-backend retry — the only path that
+        // could reintroduce it — stays disallowed on Windows, so neither
+        // instance attempt can start the crash-contained WGL init thread.
+        let defaults = Backends::DX12 | Backends::VULKAN | Backends::GL;
+        let (primary, selection) = resolve_instance_backends(defaults, None, true, false);
+        assert_eq!(selection, BackendSelection::WindowsGlExcluded);
+        assert!(!primary.contains(Backends::GL), "primary excludes GL");
+        assert!(
+            !should_retry_with_full_backends(primary, defaults, true),
+            "Windows must never retry with the full set"
+        );
+    }
+
+    #[test]
+    fn linux_effective_backends_retry_only_where_wgl_cannot_run() {
+        // CTX-1036 mirror (pure, headless): the Linux guard excludes GL
+        // from the primary attempt, but the full-backend retry stays
+        // allowed off Windows — WGL init exists only on Windows, so the
+        // retry cannot re-enter the crash-contained thread there.
+        let defaults = Backends::VULKAN | Backends::GL;
+        let (primary, selection) = resolve_instance_backends(defaults, None, false, true);
+        assert_eq!(selection, BackendSelection::LinuxGlExcluded);
+        assert!(!primary.contains(Backends::GL), "primary excludes GL");
+        assert!(should_retry_with_full_backends(primary, defaults, false));
     }
 
     #[test]

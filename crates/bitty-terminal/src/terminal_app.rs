@@ -1935,8 +1935,11 @@ impl TerminalApp {
     /// Checks for exited shell processes across both split pane sessions and
     /// the primary session, reaping exited children and closing their panels.
     ///
-    /// When the last remaining panel exits, returns [`ShellExitOutcome::AppExiting`]
+    /// When the last remaining panel in the window exits, returns [`ShellExitOutcome::AppExiting`]
     /// so the caller can save session state and signal `ctx.exit()`.
+    /// CTX-1039 (#1843): "last" counts every workspace, so a shell exiting
+    /// in one workspace while others hold panels closes that panel
+    /// (`PaneClosed`) and the emptied workspace stays selected.
     ///
     /// Issue #1828: every reaped exit also queues a bounded `process.exited`
     /// edge (`terminal_id` + `exit_code`) for the next cold-tick delivery.
@@ -1952,8 +1955,11 @@ impl TerminalApp {
 
         for view in pane_ids {
             if let Some(status) = self.runtime.pane_try_wait(&view) {
-                // If there is only one leaf left, this was the last active pane.
-                if self.runtime.leaf_count() <= 1 {
+                // CTX-1039 (#1843): the session ends only when the whole
+                // window is down to its last panel. A shell exiting in one
+                // workspace while others still hold panels closes that
+                // panel, never the app.
+                if self.effective_window_leaf_count() <= 1 {
                     crate::logging::info(|| {
                         format!(
                             "bitty: last pane shell {view:?} exited (success={} code={} signal={:?}) — closing session",
@@ -1974,6 +1980,19 @@ impl TerminalApp {
                         status.signal()
                     )
                 });
+                // CTX-1039 (#1843): the last leaf of the active workspace
+                // with panels elsewhere. Keep the emptied workspace
+                // selected and leave its tile session-less instead of
+                // exiting; the layout surgery below refuses singletons.
+                if self.runtime.layout().leaf_ids().contains(&view)
+                    && self.runtime.leaf_count() <= 1
+                {
+                    self.restore_zoom();
+                    self.runtime.close_pane_session(&view);
+                    self.push_pending_exit(view.0, status.code());
+                    closed_any = true;
+                    continue;
+                }
                 self.restore_zoom();
                 let mut layout = self.runtime.layout().clone();
                 if crate::chrome_keys::close_focused_leaf(&mut layout, view) {
@@ -1986,8 +2005,13 @@ impl TerminalApp {
         }
 
         // 2. Primary shell session.
+        // CTX-1039 (#1843): the live-leaf half of this gate counts the
+        // whole window, so a primary exit with panels anywhere else closes
+        // the primary pane instead of the session. Zero pane sessions
+        // anywhere keeps the long-standing quit (the primary was the last
+        // running shell; remaining tiles are session-less and inert).
         if let Some(status) = self.runtime.primary_exit_status() {
-            if self.runtime.pane_session_count() == 0 || self.runtime.leaf_count() <= 1 {
+            if self.runtime.pane_session_count() == 0 || self.effective_window_leaf_count() <= 1 {
                 crate::logging::info(|| {
                     format!(
                         "bitty: primary shell exited (success={} code={} signal={:?}) — closing session",

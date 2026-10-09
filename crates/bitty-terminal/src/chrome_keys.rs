@@ -802,8 +802,8 @@ fn match_plugin_binding(_keyref: bitty_config::KeyRef) -> Option<bitty_config::C
 /// `close_confirm_view` is only true when the arm targets the currently
 /// focused view, so the `close_view` chord confirms exactly that arm.
 /// `close_confirm_window` is only true when the arm targets the window;
-/// `is_last_pane` is true when the focused workspace holds a single leaf
-/// (zoom-aware). Issue #1783: the last-pane `close_view` is the window-close
+/// `is_last_pane` is true when the whole window holds a single panel
+/// (zoom-aware, across all workspaces — CTX-1039 #1843). Issue #1783: the last-pane `close_view` is the window-close
 /// gesture, so it confirms a window arm only there; elsewhere a window arm
 /// stays captured (the repeated OS close request is its confirm gesture).
 ///
@@ -903,6 +903,22 @@ impl TerminalApp {
     /// (CTX-0481: staleness-checked inside [`ZoomState`]).
     pub(crate) fn restore_zoom(&mut self) -> bool {
         self.chrome.zoom.restore_for_mutation(&mut self.runtime)
+    }
+
+    /// Zoom-aware panel count across the whole window (CTX-1039, #1843).
+    ///
+    /// The live layout collapses to one leaf while zoomed, so the active
+    /// workspace counts its zoom backup when one exists; inactive
+    /// workspaces count their stashed slots. The last-pane window-close
+    /// decision uses this total — deleting one workspace's last panel
+    /// never exits while any workspace still holds a panel.
+    pub(crate) fn effective_window_leaf_count(&self) -> usize {
+        let active = self
+            .chrome
+            .zoom
+            .backup_leaf_count(&self.runtime)
+            .unwrap_or_else(|| self.runtime.leaf_count());
+        active + self.runtime.inactive_workspaces_leaf_count()
     }
 
     /// Applies one `fold_toggle`/`fold_expand`/`fold_collapse` verb to the
@@ -1209,12 +1225,13 @@ impl TerminalApp {
                 // A zoomed view collapses the live layout to one leaf, so
                 // consult the backup the restore would bring back before
                 // deciding whether this is the last-pane window-close.
-                let effective_leaf_count = self
-                    .chrome
-                    .zoom
-                    .backup_leaf_count(&self.runtime)
-                    .unwrap_or_else(|| self.runtime.leaf_count());
-                if effective_leaf_count <= 1 {
+                // CTX-1039 (#1843): the window-close gesture fires only
+                // when the whole window is down to one panel — the active
+                // workspace's real count plus every inactive workspace.
+                // The last panel of one workspace with panels elsewhere
+                // is a pane close, never an exit.
+                let window_leaf_count = self.effective_window_leaf_count();
+                if window_leaf_count <= 1 {
                     // Issue #1783: the last pane has no sibling to promote,
                     // so `close_view` is the window-close gesture. It passes
                     // the `close_confirm` window gate (reuses the accepted
@@ -1245,6 +1262,23 @@ impl TerminalApp {
                     ViewCloseRequest::Proceed => {}
                 }
                 self.restore_zoom();
+                // CTX-1039 (#1843): the active workspace is down to its
+                // last panel but other workspaces still hold panels. Never
+                // exit: keep the emptied workspace selected, tear down the
+                // closed leaf's shell, and leave the tile session-less
+                // (a session-less tile renders empty, buffers input, and
+                // splits again like any fresh workspace leaf).
+                if self.runtime.leaf_count() <= 1 {
+                    if self.runtime.close_pane_session(&focused) {
+                        eprintln!(
+                            "bitty: keymap close_view tore down last pane shell {focused:?} (workspace kept)"
+                        );
+                    }
+                    eprintln!(
+                        "bitty: keymap close_view -> last panel of workspace closed, workspace kept selected"
+                    );
+                    return false;
+                }
                 let mut layout = self.runtime.layout().clone();
                 if close_focused_leaf(&mut layout, focused) {
                     // CTX-0359: an explicit close is the only layout change
@@ -1668,13 +1702,11 @@ impl TerminalApp {
         ) = if self.modal_capture_active() {
             // Issue #1783: a zoomed view collapses the live layout to one
             // leaf, so consult the backup before deciding whether this is
-            // the last-pane window-close gesture.
-            let is_last_pane = self
-                .chrome
-                .zoom
-                .backup_leaf_count(&self.runtime)
-                .unwrap_or_else(|| self.runtime.leaf_count())
-                <= 1;
+            // the last-pane window-close gesture. CTX-1039 (#1843): the
+            // gesture means the last panel in the window, never just the
+            // active workspace — other workspaces' panels keep it a pane
+            // close, so a pending window arm stays captured there.
+            let is_last_pane = self.effective_window_leaf_count() <= 1;
             (
                 self.runtime.has_pending_paste(),
                 self.runtime.has_pending_ws_close(),
@@ -3217,6 +3249,43 @@ mod tests {
         // Repeat confirms the exit.
         assert!(app.apply_chrome_action(ChromeAction::CloseView));
         assert!(!app.runtime.has_pending_close_confirm());
+    }
+
+    #[test]
+    fn close_view_last_panel_of_workspace_never_exits_while_others_hold_panels() {
+        use bitty_config::ChromeAction;
+        // CTX-1039 (issue #1843): with 2+ workspaces open, Mod+d
+        // (`close_view`) on the current workspace's last panel must never
+        // exit the process. The emptied workspace stays selected with its
+        // tile session-less; only the last panel in the whole window is
+        // the window-close gesture (issue #1783).
+        let mut app = last_pane_test_app(CloseConfirmMode::WhenBusy);
+        app.runtime.workspace_new().expect("second workspace opens");
+        assert_eq!(app.runtime.workspace_count(), 2);
+        // The fresh active workspace holds a single panel: the repro shape.
+        assert_eq!(app.runtime.leaf_count(), 1);
+        assert_eq!(app.effective_window_leaf_count(), 2);
+        assert!(!app.apply_chrome_action(ChromeAction::CloseView));
+        assert!(
+            !app.runtime.has_pending_close_confirm(),
+            "no window arm may pend when panels survive elsewhere"
+        );
+        assert_eq!(app.runtime.workspace_count(), 2, "emptied workspace stays");
+        assert_eq!(
+            app.effective_window_leaf_count(),
+            2,
+            "no panel lost window-wide"
+        );
+        assert_eq!(app.runtime.leaf_count(), 1, "workspace keeps its tile");
+        assert!(
+            app.runtime.focused_view().is_some(),
+            "focus stays in the emptied workspace"
+        );
+        // The other workspace still holds its panel: switching back proves
+        // no unrelated workspace (or its PTY session bookkeeping) died.
+        assert!(app.runtime.workspace_switch(0));
+        assert_eq!(app.runtime.leaf_count(), 1);
+        assert!(app.runtime.focused_view().is_some());
     }
 
     #[test]

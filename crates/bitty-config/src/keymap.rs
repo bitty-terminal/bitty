@@ -669,6 +669,11 @@ pub enum ChromeAction {
     /// mode: `when_busy` (default) prompts when a foreground job runs,
     /// `always` prompts unconditionally, `never` closes immediately.
     /// The first gesture arms a confirmation; repeat to confirm, `Esc` to cancel.
+    ///
+    /// CTX-1039 (issue #1843): closing the last panel of one workspace
+    /// never exits while any workspace still holds a panel. The emptied
+    /// workspace stays selected with its tile session-less; only the last
+    /// panel in the whole window is the window-close gesture (issue #1783).
     CloseView,
     /// Toggle single-pane zoom (`toggle_zoom`, aliases `toggle_split_zoom`, `suspend_panel`, `detach_panel`).
     ToggleZoom,

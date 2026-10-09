@@ -878,6 +878,36 @@ impl Runtime {
             .count()
     }
 
+    /// Leaves held by every workspace except the active one (stashed slots).
+    ///
+    /// CTX-1039 (#1843): the window-close decision must look at the whole
+    /// window, never just the active workspace. The active slot copy is
+    /// stale by design (stashed only on switch-away), so the live layout
+    /// owns the active count and this covers exactly the inactive slots —
+    /// no double count. Bounded by `MAX_WORKSPACES` slots.
+    #[must_use]
+    pub fn inactive_workspaces_leaf_count(&self) -> usize {
+        self.workspaces
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != self.active_workspace)
+            .map(|(_, slot)| slot.layout.leaf_ids().len())
+            .sum()
+    }
+
+    /// Leaves across the whole window: the live layout (active workspace)
+    /// plus every stashed inactive slot.
+    ///
+    /// CTX-1039 (#1843): deleting the last panel of one workspace must
+    /// never exit the process while any workspace still holds a panel, so
+    /// the last-pane window-close gesture fires only when this total is 1.
+    /// Callers that are zoom-aware add the zoom backup over the live count
+    /// themselves (the zoom map lives app-side, outside the runtime).
+    #[must_use]
+    pub fn window_leaf_count(&self) -> usize {
+        self.layout.leaf_ids().len() + self.inactive_workspaces_leaf_count()
+    }
+
     /// Kill every pane session owned by workspace `index`'s leaves.
     /// Returns the number torn down.
     fn kill_workspace_sessions(&mut self, index: usize) -> usize {

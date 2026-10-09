@@ -532,25 +532,45 @@ struct ScopedDir {
 
 impl ScopedDir {
     fn create(tag: &str) -> Result<Self, SeedError> {
+        #[cfg(unix)]
+        use std::os::unix::fs::DirBuilderExt as _;
         static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "bitty-seed-{tag}-{}-{sequence}",
-            std::process::id()
-        ));
-        // A pid-reusing predecessor could have left a twin; dropping it
-        // keeps the staging directory truly ours.
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).map_err(|error| {
-            SeedError::Io(format!(
-                "bitty component: cannot create staging dir '{}': {error}",
-                path.display()
-            ))
-        })?;
-        Ok(Self {
-            path,
-            disarm: false,
-        })
+        // Each attempt names a fresh unpredictable directory (pid + sequence
+        // + nanos) and creates it exclusively: no delete/reuse, so a
+        // pre-created /tmp sibling (sticky-bit takeover) fails with
+        // AlreadyExists and the next suffix is tried instead.
+        for _ in 0..100 {
+            let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.subsec_nanos())
+                .unwrap_or(0);
+            let path = std::env::temp_dir().join(format!(
+                "bitty-seed-{tag}-{}-{sequence}-{nanos}",
+                std::process::id()
+            ));
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            builder.mode(0o700);
+            match builder.create(&path) {
+                Ok(()) => {
+                    return Ok(Self {
+                        path,
+                        disarm: false,
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(SeedError::Io(format!(
+                        "bitty component: cannot create staging dir '{}': {error}",
+                        path.display()
+                    )));
+                }
+            }
+        }
+        Err(SeedError::Io(
+            "bitty component: cannot create staging dir (no fresh name after retries)".to_string(),
+        ))
     }
 }
 
@@ -800,11 +820,20 @@ fn unpack_and_validate(
         )));
     }
     let extract_dir = stage.path.join("extract");
-    std::fs::create_dir_all(&extract_dir).map_err(|error| {
-        SeedError::Io(format!(
-            "bitty component: cannot create extract dir: {error}"
-        ))
-    })?;
+    // Exclusive create inside our own 0700 staging dir: no delete/reuse,
+    // so a pre-existing entry fails closed instead of being adopted.
+    {
+        #[cfg(unix)]
+        use std::os::unix::fs::DirBuilderExt as _;
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        builder.mode(0o700);
+        builder.create(&extract_dir).map_err(|error| {
+            SeedError::Io(format!(
+                "bitty component: cannot create extract dir: {error}"
+            ))
+        })?;
+    }
     transport.extract(&archive_path, &extract_dir, &members)?;
     let (descriptor_bytes, executable_bytes) =
         audit_extracted(&extract_dir, COMPONENT_DESCRIPTOR_FILE, &executable_name)?;
@@ -1599,6 +1628,21 @@ mod tests {
             stage.path.clone()
         };
         assert!(!path.exists(), "staging dir must be removed on drop");
+    }
+
+    #[test]
+    fn staging_dirs_are_owner_only() {
+        let stage = ScopedDir::create("mode").expect("stage");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&stage.path)
+                .expect("stage metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700, "staging dir must be owner-only");
+        }
     }
 
     // --- real-tar interop ---------------------------------------------------

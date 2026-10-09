@@ -913,6 +913,18 @@ fn op_install(
             "bitty component: no user component root (data directory unavailable; set $XDG_DATA_HOME or $HOME)".to_string(),
         ));
     };
+    // Validate name/version before probing the host: hostile input is a
+    // usage error (exit 2) on every host, even where no seed target exists.
+    if let Err(error) = validate_component_name(name) {
+        return Err(seed_failure(
+            &crate::component_seed::SeedError::InvalidName(format!("{name:?} ({error})")),
+        ));
+    }
+    if !crate::component_seed::valid_seed_version(version) {
+        return Err(seed_failure(
+            &crate::component_seed::SeedError::InvalidVersion(version.to_owned()),
+        ));
+    }
     let target = crate::component_seed::host_target_triple().ok_or_else(|| {
         seed_failure(&crate::component_seed::SeedError::UnsupportedHost(format!(
             "bitty component: unsupported host {}-{} (no prebuilt seed target; install the component from a local path with `bitty component add`)",
@@ -1835,7 +1847,9 @@ mod tests {
         let base = scratch("install-e2e");
         let (context, _, _) = context_for(&base.join("user"), &base.join("system"));
         let user = Path::new(context.components_dir.expect("user")).to_path_buf();
-        let target = crate::component_seed::host_target_triple().expect("mapped host");
+        // Fixed triple: the stub transport is host-independent, so the test
+        // holds on unmapped hosts too (no `host_target_triple` dependency).
+        let target = "x86_64-unknown-linux-gnu";
         let mut stub = InstallStub::canned("net", "0.0.23", target, b"seed-net-bytes");
         let mut out = Vec::new();
         let summary = op_install("net", Some("0.0.23"), Some(&user), &mut out, &mut stub)

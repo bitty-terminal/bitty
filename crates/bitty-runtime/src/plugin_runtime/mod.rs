@@ -42,12 +42,13 @@ use std::time::Instant;
 use bitty_lua::gate::{VmBudgets, build_plugin_vm};
 use bitty_lua::host::DEFAULT_HOST_DEADLINE_MS;
 use bitty_lua::ui::UiNode;
-use bitty_lua::{HostServices, LuaVm, MarshallingLimits, RegistrationCapture};
+use bitty_lua::{CommandRegistration, HostServices, LuaVm, MarshallingLimits, RegistrationCapture};
 use bitty_plugin_host::DropPolicy;
 use bitty_plugin_host::capability::CapabilityId;
 use bitty_plugin_host::grant::GrantRecord;
 use bitty_plugin_host::host::PluginHost;
-use bitty_plugin_host::manifest::{PluginId, PluginManifest};
+use bitty_plugin_host::manifest::{LazyCommand, PluginId, PluginManifest};
+use bitty_plugin_host::{validate_interface_schema, value_satisfies_schema};
 
 pub use bitty_lua::{
     WORKSPACE_LIST_MAX_ITEMS, WORKSPACE_NAME_MAX_CHARS as WORKSPACE_INFO_NAME_MAX_CHARS,
@@ -65,16 +66,17 @@ pub use resolution::{
     load_index_with_fs, write_index, write_index_with_fs,
 };
 pub use services::{
-    EmptyEnv, EmptySettings, EnvSource, MAX_ENV_GRANTS, MAX_ENV_VALUE_BYTES, MapEnv, Notification,
-    NotificationQueue, OverlayPeers, PluginServices, ProcessEnv, QueuedWorkspaceRequest,
-    ServiceDirectory, ServiceRecord, SettingsSource, SnapshotSource, UiAccess, UiBlock, UiBlocks,
-    UnavailableSnapshot, UnavailableWorkspaces, WorkspaceRequestQueue, WorkspaceSource,
+    CommandDirectory, CommandRecord, EmptyEnv, EmptySettings, EnvSource, MAX_ENV_GRANTS,
+    MAX_ENV_VALUE_BYTES, MapEnv, Notification, NotificationQueue, OverlayPeers, PluginServices,
+    ProcessEnv, QueuedWorkspaceRequest, ServiceDirectory, ServiceRecord, SettingsSource,
+    SnapshotSource, UiAccess, UiBlock, UiBlocks, UnavailableSnapshot, UnavailableWorkspaces,
+    WorkspaceRequestQueue, WorkspaceSource,
 };
 pub use store::{KvCommitBackend, KvCommitError, PluginStore, STORE_FILE_MAX_BYTES};
 // Bridge value/error types the host-service traits are expressed in, so the
 // application can implement `SettingsSource`/`SnapshotSource` without taking a
 // direct `bitty-lua` dependency.
-pub use bitty_lua::{BridgeError, LuaValue};
+pub use bitty_lua::{BridgeError, CommandCatalogEntry, LuaValue};
 
 /// Maximum stored manifest body bytes (RFC proposed default).
 pub const PLUGIN_MANIFEST_MAX_BYTES: usize = 256 * 1024;
@@ -526,6 +528,13 @@ pub struct PluginRuntime {
     entries: BTreeMap<PluginId, PluginEntry>,
     order: Vec<PluginId>,
     service_directory: Rc<RefCell<ServiceDirectory>>,
+    /// CTX-1035: runtime-shared command directory for the generic
+    /// host-mediated invocation path (`bitty.commands.list`/`invoke`,
+    /// keybinding `command:<qualified>`, palette selection). Shared with
+    /// every generation's services so any plugin can invoke any active
+    /// command through the host; activation publishes, suspend parks,
+    /// resume restores, dispose/reload/rollback revokes.
+    command_directory: Rc<RefCell<CommandDirectory>>,
     /// CTX-0897: sanitized lifecycle/registration snapshot shared with every
     /// generation's services for `bitty.debug.inspect`; rebuilt by
     /// [`PluginRuntime::sync_debug_view`] after each lifecycle transition.
@@ -597,6 +606,7 @@ impl PluginRuntime {
             entries: BTreeMap::new(),
             order: Vec::new(),
             service_directory: Rc::new(RefCell::new(ServiceDirectory::new())),
+            command_directory: Rc::new(RefCell::new(CommandDirectory::new())),
             debug_view: Rc::new(RefCell::new(debug::DebugView::new())),
             trace_hub: Rc::new(RefCell::new(debug::TraceHub::new())),
             workspace_source: None,
@@ -1221,6 +1231,10 @@ impl PluginRuntime {
         // revokes. Without both, `services.get`/`provide` fail closed with
         // `E_NOT_IMPLEMENTED`.
         plugin_services.set_service_directory(self.service_directory.clone());
+        // CTX-1035: command directory wiring for the generic host-mediated
+        // invocation path. Without it `commands.list`/`invoke` fail closed
+        // with `E_NOT_IMPLEMENTED`.
+        plugin_services.set_command_directory(self.command_directory.clone());
         // CTX-0897: `bitty.debug` read-only backend. Each entry point needs
         // its own grant (`debug.inspect` vs `debug.trace`, no implication);
         // the `grants` target serves only this generation's own snapshot.
@@ -1384,6 +1398,16 @@ impl PluginRuntime {
             let entry = self.entries.get(id).expect("entry exists");
             self.publish_services(id, generation, &manifest, &entry.registrations, &vm);
         }
+        // CTX-1035: publish captured commands into the live directory
+        // before committing the generation, so the palette catalog and the
+        // host-mediated invoke path serve this generation immediately.
+        // `validate_capture` already rejected undeclared/duplicate/over-limit
+        // registrations and malformed schemas, so the manifest lookup below
+        // is infallible; effective schemas resolve manifest-first.
+        {
+            let entry = self.entries.get(id).expect("entry exists");
+            self.publish_commands(id, generation, &manifest, &entry.registrations, &vm);
+        }
         Ok(ActivationReport {
             plugin: id.clone(),
             state: LifecycleState::Active,
@@ -1452,6 +1476,12 @@ impl PluginRuntime {
         self.service_directory
             .borrow_mut()
             .suspend_provider(id.as_str());
+        // CTX-1035: park this generation's commands in place. Records stay
+        // keyed for resume but list and serve nothing while parked, so
+        // invocations fail closed with `E_COMMAND_GONE`.
+        self.command_directory
+            .borrow_mut()
+            .suspend_owner(id.as_str());
         let _ = self.host.suspend(id);
         Ok(())
     }
@@ -1484,6 +1514,11 @@ impl PluginRuntime {
         self.service_directory
             .borrow_mut()
             .resume_provider(id.as_str());
+        // CTX-1035: restore the parked command publications (same
+        // generation, so the catalog and invoke path serve again).
+        self.command_directory
+            .borrow_mut()
+            .resume_owner(id.as_str());
         let _ = self.host.resume(id);
         Ok(())
     }
@@ -1535,6 +1570,11 @@ impl PluginRuntime {
         self.service_directory
             .borrow_mut()
             .revoke_provider(id.as_str());
+        // CTX-1035: revoke this generation's command publications, so no
+        // qualified name outlives its owner.
+        self.command_directory
+            .borrow_mut()
+            .revoke_owner(id.as_str());
         let _ = self.host.remove(id);
         Ok(())
     }
@@ -1604,18 +1644,38 @@ impl PluginRuntime {
 
     /// Dispatch one captured command, invoking its `run` function under budget.
     ///
+    /// The generic host-mediated invocation core behind the palette, the
+    /// keybinding `command:<qualified>` action, and
+    /// [`PluginRuntime::invoke_command`]. Deny-by-default: the command must
+    /// be registered by `id` (undeclared and foreign names are refused
+    /// before any callee code runs), positional args are validated against
+    /// the callee's effective args schema before the callee runs, and the
+    /// result is validated against the effective result schema before it
+    /// returns — failures are contained as typed errors, never a host
+    /// panic (a re-entrant call into the already-executing owner VM,
+    /// including a command invoking itself, fails closed instead of
+    /// aliasing the VM).
+    ///
+    /// Positional args carry at most one args table in v1 (the band-click
+    /// single-table and composer empty shapes): an empty slice validates as
+    /// the empty object `{}`, a one-element slice validates its element,
+    /// and a longer slice is refused while a schema is declared (schemeless
+    /// callees keep the legacy pass-through for band-click compatibility).
+    ///
     /// # Errors
     ///
     /// [`PluginRuntimeError::Lifecycle`] when the plugin is not active;
-    /// [`PluginRuntimeError::Capture`] when the command is unknown;
-    /// [`PluginRuntimeError::Vm`] when the callback fails or suspends.
+    /// [`PluginRuntimeError::Capture`] when the command is unknown or an
+    /// args/result schema is violated;
+    /// [`PluginRuntimeError::Vm`] when the callback fails, suspends, or is
+    /// re-entered while busy.
     pub fn dispatch_command(
         &mut self,
         id: &PluginId,
         command_id: &str,
         args: &[LuaValue],
     ) -> Result<LuaValue, PluginRuntimeError> {
-        let run = {
+        let (run, args_schema, result_schema) = {
             let entry = self
                 .entries
                 .get(id)
@@ -1627,29 +1687,189 @@ impl PluginRuntime {
                 return Err(lifecycle_error(id, "plugin is not active"));
             }
             let qualified = format!("{}:{}", id.as_str(), command_id);
-            entry
+            let registration = entry
                 .registrations
                 .commands
                 .iter()
                 .find(|command| format!("{}:{}", id.as_str(), command.id) == qualified)
-                .map(|command| command.run.clone())
                 .ok_or_else(|| PluginRuntimeError::Capture {
                     plugin: id.to_string(),
                     detail: format!("command '{command_id}' was not registered"),
-                })?
+                })?;
+            let declared = entry
+                .package
+                .manifest
+                .lazy
+                .commands
+                .iter()
+                .find(|command| command.id.as_str() == qualified);
+            let (args_schema, result_schema) = match declared {
+                Some(declared) => effective_command_schemas(declared, registration),
+                None => (None, None),
+            };
+            (registration.run.clone(), args_schema, result_schema)
         };
+        // Args are validated before the callee runs, so a schema violation
+        // never executes callee code.
+        if let Some(schema) = args_schema.as_deref() {
+            let document = command_positional_args_document(args).ok_or_else(|| {
+                PluginRuntimeError::Capture {
+                    plugin: id.to_string(),
+                    detail: format!(
+                        "command '{command_id}' takes at most one args table ({} passed)",
+                        args.len()
+                    ),
+                }
+            })?;
+            if !value_satisfies_schema(schema, &document) {
+                return Err(PluginRuntimeError::Capture {
+                    plugin: id.to_string(),
+                    detail: format!(
+                        "command '{command_id}' args do not satisfy the command schema"
+                    ),
+                });
+            }
+        }
         let entry = self.entries.get_mut(id).expect("entry exists");
-        // Shared VM ownership: the cell is borrowed mutably for the call so
-        // a re-entrant service invocation into this same VM fails closed
-        // (`E_SERVICE_FAILED`) instead of aliasing it.
+        // Shared VM ownership: `try_borrow_mut` fails a re-entrant command
+        // invocation into this same VM closed (busy) instead of panicking
+        // the `RefCell` — a command invoking itself can never crash the host.
         let vm = entry
             .vm
             .as_ref()
             .cloned()
             .ok_or_else(|| lifecycle_error(id, "no VM"))?;
-        vm.borrow_mut()
-            .call_function(&run, args)
-            .map_err(|error| PluginRuntimeError::Vm(error.to_string()))
+        let result = match vm.try_borrow_mut() {
+            Ok(mut vm) => vm.call_function(&run, args),
+            Err(_) => {
+                return Err(PluginRuntimeError::Vm(format!(
+                    "command '{command_id}' owner '{}' is busy",
+                    id.as_str()
+                )));
+            }
+        }
+        .map_err(|error| PluginRuntimeError::Vm(error.to_string()))?;
+        // The effective result schema is re-checked before the result
+        // returns, so a misbehaving callee is contained to this invocation.
+        if let Some(schema) = result_schema.as_deref() {
+            let json = store::encode_json(&result);
+            if !value_satisfies_schema(schema, &json) {
+                return Err(PluginRuntimeError::Capture {
+                    plugin: id.to_string(),
+                    detail: format!(
+                        "command '{command_id}' result does not satisfy the command schema"
+                    ),
+                });
+            }
+        }
+        Ok(result)
+    }
+
+    /// Invoke one command by qualified name (`owner:command`, CTX-1035).
+    ///
+    /// The application-layer entry of the generic host-mediated invocation
+    /// path: the palette selection and the keybinding
+    /// `command:<qualified>` action both land here with a single args value
+    /// (`nil`-equivalent empty table for argument-free commands such as
+    /// `bitty-featured.devtools:plugins`). The owner half of the name must
+    /// own the command half (deny-by-default: undeclared and
+    /// foreign-qualified names are refused before any callee code runs);
+    /// args validation, re-entrancy containment, and result validation ride
+    /// [`PluginRuntime::dispatch_command`].
+    ///
+    /// # Errors
+    ///
+    /// [`PluginRuntimeError::Capture`] when the name is malformed, unknown,
+    /// or foreign-qualified; otherwise the [`dispatch_command`](Self::dispatch_command)
+    /// errors.
+    pub fn invoke_command(
+        &mut self,
+        qualified: &str,
+        args: &LuaValue,
+    ) -> Result<LuaValue, PluginRuntimeError> {
+        let (owner, command) =
+            split_qualified_command(qualified).ok_or_else(|| PluginRuntimeError::Capture {
+                plugin: qualified.to_string(),
+                detail: format!("command '{qualified}' must be 'owner:command'"),
+            })?;
+        let id = PluginId::new(owner).map_err(|_| PluginRuntimeError::Capture {
+            plugin: qualified.to_string(),
+            detail: format!("command '{qualified}' names an invalid plugin id"),
+        })?;
+        // Foreign-qualified names are refused here: the owner half must be a
+        // live generation holding the command, which `dispatch_command`
+        // re-checks against the registration before running anything.
+        if self
+            .entries
+            .get(&id)
+            .is_none_or(|entry| entry.state != LifecycleState::Active)
+        {
+            // Suspended generations park their commands (list hides them);
+            // invoking one is a lifecycle refusal, not an unknown name, so
+            // the diagnosis stays joinable with suspend/resume state.
+            if self
+                .entries
+                .get(&id)
+                .is_some_and(|entry| entry.state == LifecycleState::Suspended)
+            {
+                return Err(lifecycle_error(&id, "plugin is suspended"));
+            }
+            return Err(PluginRuntimeError::Capture {
+                plugin: qualified.to_string(),
+                detail: format!("command '{qualified}' is not registered"),
+            });
+        }
+        let owned = self.entries.get(&id).is_some_and(|entry| {
+            entry
+                .registrations
+                .commands
+                .iter()
+                .any(|registration| registration.id == command)
+        });
+        if !owned {
+            return Err(PluginRuntimeError::Capture {
+                plugin: qualified.to_string(),
+                detail: format!("command '{qualified}' is not registered"),
+            });
+        }
+        // The args value crosses positionally: involutions with no arguments
+        // pass the empty table, which validates as `{}` (see
+        // `command_positional_args_document`).
+        let positional = [args.clone()];
+        let slice: &[LuaValue] = match args {
+            LuaValue::Nil => &[],
+            LuaValue::Table(pairs) if pairs.is_empty() => &[],
+            _ => &positional,
+        };
+        self.dispatch_command(&id, command, slice)
+    }
+
+    /// List the active command catalog in (`plugin`, `id`) order (CTX-1035).
+    ///
+    /// The host-side catalog behind the palette entry list and the
+    /// `bitty.commands.list` bridge: public registration metadata only
+    /// (plugin, unqualified id, qualified name, title — the same rows
+    /// `bitty.debug.inspect` serves). Suspended, disposed, and failed
+    /// generations contribute nothing, so the catalog never names a command
+    /// that would not serve.
+    #[must_use]
+    pub fn list_commands(&self) -> Vec<CommandCatalogEntry> {
+        let mut entries = Vec::new();
+        for (id, entry) in &self.entries {
+            if entry.state != LifecycleState::Active {
+                continue;
+            }
+            for command in &entry.registrations.commands {
+                entries.push(CommandCatalogEntry {
+                    plugin: id.as_str().to_string(),
+                    id: command.id.clone(),
+                    qualified: format!("{}:{}", id.as_str(), command.id),
+                    title: command.title.clone(),
+                });
+            }
+        }
+        entries.sort_by(|a, b| (&a.plugin, &a.id).cmp(&(&b.plugin, &b.id)));
+        entries
     }
 
     /// Deliver an observation/lifecycle event to every active subscriber.
@@ -1807,6 +2027,48 @@ impl PluginRuntime {
         }
     }
 
+    /// Publish a generation's captured command registrations (CTX-1035).
+    ///
+    /// Called after [`validate_capture`] and before the atomic commit, so
+    /// every registration here is declared in the manifest, uniquely named,
+    /// within bounds, and schema-valid. Effective schemas resolve
+    /// manifest-first (the manifest's `lazy.commands` table-form entry wins
+    /// when present, otherwise the `commands.register` tables — mirroring
+    /// the service version/schema precedence); the owner VM is held weakly
+    /// so dispose invalidates invocation without further coordination.
+    fn publish_commands(
+        &self,
+        id: &PluginId,
+        generation: u32,
+        manifest: &PluginManifest,
+        capture: &RegistrationCapture,
+        vm: &Rc<RefCell<LuaVm>>,
+    ) {
+        let mut directory = self.command_directory.borrow_mut();
+        for registration in &capture.commands {
+            let qualified = format!("{}:{}", id.as_str(), registration.id);
+            let declared = manifest
+                .lazy
+                .commands
+                .iter()
+                .find(|command| command.id.as_str() == qualified)
+                .expect("validate_capture guarantees declared commands");
+            let (args_schema, result_schema) = effective_command_schemas(declared, registration);
+            directory.publish(CommandRecord {
+                owner: id.as_str().to_string(),
+                id: registration.id.clone(),
+                qualified,
+                generation,
+                title: registration.title.clone(),
+                args_schema,
+                result_schema,
+                func: registration.run.clone(),
+                vm: Rc::downgrade(vm),
+                suspended: false,
+            });
+        }
+    }
+
     /// Record one delivered event into the trace hub (CTX-0897).
     ///
     /// Runs once per event before fan-out, whether or not any handler is
@@ -1928,6 +2190,14 @@ impl PluginRuntime {
         self.target_lenses
             .borrow_mut()
             .retain(|(owner, _)| owner != id.as_str());
+        // CTX-1035: a failed activation also revokes the generation's
+        // command publications. Commands are invoked by qualified name with
+        // no generation pin (unlike service routes), so a lingering record
+        // would name a dead VM; revocation makes the name unknown
+        // immediately.
+        self.command_directory
+            .borrow_mut()
+            .revoke_owner(id.as_str());
         self.drop_traces(id);
     }
 
@@ -1950,12 +2220,77 @@ impl PluginRuntime {
     pub fn service_directory(&self) -> &Rc<RefCell<ServiceDirectory>> {
         &self.service_directory
     }
+
+    /// Shared live command directory (diagnostics, tests).
+    #[must_use]
+    pub fn command_directory(&self) -> &Rc<RefCell<CommandDirectory>> {
+        &self.command_directory
+    }
 }
 
 fn lifecycle_error(id: &PluginId, detail: &str) -> PluginRuntimeError {
     PluginRuntimeError::Lifecycle {
         plugin: id.to_string(),
         detail: detail.to_string(),
+    }
+}
+
+/// Resolve the effective invocation schemas for one registered command
+/// (CTX-1035).
+///
+/// The manifest's `lazy.commands` table-form entry wins when present;
+/// otherwise the `commands.register` tables apply (mirroring the service
+/// version/schema precedence: provider-declared metadata over Lua). Lua
+/// tables encode to JSON here; malformed schemas are rejected by
+/// [`validate_capture`] before [`PluginRuntime::publish_commands`] runs, so
+/// encoding here is infallible in practice and an unparsable schema resolves
+/// to `None` (fail-open only for a record that could never have activated).
+fn effective_command_schemas(
+    declared: &LazyCommand,
+    registration: &CommandRegistration,
+) -> (Option<String>, Option<String>) {
+    let args_schema = declared
+        .args_schema
+        .clone()
+        .or_else(|| registration.args_schema.as_ref().map(store::encode_json));
+    let result_schema = declared
+        .result_schema
+        .clone()
+        .or_else(|| registration.result_schema.as_ref().map(store::encode_json));
+    (args_schema, result_schema)
+}
+
+/// Split one `owner:command` qualified name (CTX-1035).
+///
+/// Returns the (`owner`, `command`) halves when the name holds exactly one
+/// `:` with non-empty sides; otherwise `None` (malformed, never dispatched).
+fn split_qualified_command(qualified: &str) -> Option<(&str, &str)> {
+    match qualified.split_once(':') {
+        Some((owner, command))
+            if !owner.is_empty() && !command.is_empty() && !command.contains(':') =>
+        {
+            Some((owner, command))
+        }
+        _ => None,
+    }
+}
+
+/// Encode the positional dispatch slice as the single args document for
+/// schema validation (CTX-1035).
+///
+/// Commands take at most one args table in v1: an empty slice validates as
+/// the empty object `{}`, a one-element slice validates its element (with
+/// the `nil`/empty-table canonicalization of
+/// [`services::command_args_document`]), and a longer slice is `None`
+/// (refused while a schema is declared; schemeless callees keep the legacy
+/// pass-through).
+fn command_positional_args_document(args: &[LuaValue]) -> Option<String> {
+    match args {
+        [] => Some(services::command_args_document(
+            &LuaValue::Table(Vec::new()),
+        )),
+        [single] => Some(services::command_args_document(single)),
+        _ => None,
     }
 }
 
@@ -2065,6 +2400,27 @@ fn validate_capture(
                 plugin: id.to_string(),
                 detail: format!("duplicate command registration '{qualified}'"),
             });
+        }
+        // CTX-1035: the commit gate re-checks captured schema tables (a
+        // hand-built capture bypasses the bridge). Tables encode to JSON
+        // and must satisfy the interface-schema contract; manifest
+        // table-form schemas are validated at manifest parse, so only the
+        // Lua-declared side is checked here.
+        for (field, schema) in [
+            ("args_schema", command.args_schema.as_ref()),
+            ("result_schema", command.result_schema.as_ref()),
+        ] {
+            if let Some(schema) = schema {
+                let json = store::encode_json(schema);
+                if let Err(error) = validate_interface_schema(&json, field) {
+                    return Err(PluginRuntimeError::Capture {
+                        plugin: id.to_string(),
+                        detail: format!(
+                            "command '{qualified}' {field} is not a valid schema ({error})"
+                        ),
+                    });
+                }
+            }
         }
     }
     // Equivalence, second direction: every declared command must have a

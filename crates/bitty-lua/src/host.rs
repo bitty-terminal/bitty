@@ -262,6 +262,24 @@ pub const REGISTRATION_MAX_TITLE_BYTES: usize = 128;
 /// (`bitty-plugin-host` `MAX_DESCRIPTION_LEN = 1024`).
 pub const REGISTRATION_MAX_DESCRIPTION_BYTES: usize = 1024;
 
+/// Maximum bytes of one host-mediated command-invocation qualified name
+/// (`owner:command`, CTX-1035).
+///
+/// Matches the policy-layer qualified-name ceiling (plugin id at most 128
+/// bytes plus one `:` separator plus a command id of at most 128 bytes).
+/// Both the `bitty.commands.invoke` bridge shape check and the keymap
+/// `command:<qualified>` action grammar enforce this bound.
+pub const COMMAND_QUALIFIED_MAX_BYTES: usize = 257;
+
+/// Maximum catalog entries served by one `bitty.commands.list` call
+/// (CTX-1035).
+///
+/// Each generation registers at most `REGISTRATION_MAX_COMMANDS` (128)
+/// commands, so 1024 entries cover eight fully-loaded plugins; beyond that
+/// the call truncates oldest-last in catalog order (plugin, id) instead of
+/// growing the returned array without limit.
+pub const COMMAND_LIST_MAX_ENTRIES: usize = 1024;
+
 /// Maximum bytes of one captured event kind (`HOST-002` admission bound).
 ///
 /// Matches the policy-layer lazy-event ceiling (manifest `lazy.events`
@@ -1390,6 +1408,43 @@ pub trait HostServices {
         Err(BridgeError::not_implemented("bitty.services.get"))
     }
 
+    /// List the active command catalog for `bitty.commands.list` (CTX-1035).
+    ///
+    /// Host-mediated and ungated: rows are public registration metadata
+    /// (plugin, unqualified id, qualified name, title — the same rows
+    /// `bitty.debug.inspect` already serves to `debug.inspect` holders),
+    /// sorted by (`plugin`, `id`) and capped at
+    /// [`COMMAND_LIST_MAX_ENTRIES`]. Suspended, disposed, and failed
+    /// generations contribute nothing, so the catalog never names a command
+    /// that would not serve. The default fails closed with
+    /// `E_NOT_IMPLEMENTED`; the runtime overrides it with the live
+    /// directory read.
+    fn command_list(&self) -> Result<Vec<CommandCatalogEntry>, BridgeError> {
+        Err(BridgeError::not_implemented("bitty.commands.list"))
+    }
+
+    /// Invoke one registered command for `bitty.commands.invoke` (CTX-1035).
+    ///
+    /// `qualified` is `owner:command`; `args` is the single args table (the
+    /// bridge passes an empty table for a missing/`nil` second argument, so
+    /// nil and `{}` invoke identically). Deny-by-default, host-mediated:
+    /// - undeclared, foreign-qualified, suspended, or stale targets fail
+    ///   closed with `E_COMMAND_UNKNOWN` / `E_COMMAND_GONE` before any
+    ///   callee code runs;
+    /// - args that do not satisfy the callee's effective args schema fail
+    ///   closed with `E_COMMAND_INVALID` before any callee code runs;
+    /// - a raising, busy (re-entrant, including self-invocation), or
+    ///   result-schema-violating callee fails closed with
+    ///   `E_COMMAND_FAILED` / `E_COMMAND_INVALID`, never a host panic.
+    ///
+    /// The default fails closed with `E_NOT_IMPLEMENTED`; the runtime
+    /// overrides it with generation-checked schema-validated cross-VM
+    /// invocation (mirroring [`HostServices::service_call`]).
+    fn command_invoke(&self, qualified: &str, args: &LuaValue) -> Result<LuaValue, BridgeError> {
+        let _ = (qualified, args);
+        Err(BridgeError::not_implemented("bitty.commands.invoke"))
+    }
+
     /// Inspect runtime state for `bitty.debug.inspect` (CTX-0894, CTX-0897).
     ///
     /// Grant-gated (`debug.inspect`, checked first: `E_CAPABILITY_DENIED`)
@@ -2096,8 +2151,39 @@ pub struct CommandRegistration {
     pub title: String,
     /// Bounded description.
     pub description: String,
+    /// Optional argument schema as a captured Lua table (CTX-1035).
+    ///
+    /// The bridge keeps the table form; the runtime encodes it to JSON and
+    /// validates it against the interface-schema contract at the activation
+    /// commit gate (manifest table-form schemas win when present, mirroring
+    /// the service version/schema precedence). Invocation validates caller
+    /// args against the effective schema before callee code runs.
+    pub args_schema: Option<LuaValue>,
+    /// Optional result schema as a captured Lua table (CTX-1035).
+    ///
+    /// Same capture/validate precedence as [`Self::args_schema`]; checked
+    /// after the callee returns, before the result crosses back to the
+    /// caller, so a misbehaving callee is contained, never propagated.
+    pub result_schema: Option<LuaValue>,
     /// Stashed `run` function handle (generation-scoped).
     pub run: StashedFunction,
+}
+
+/// One command catalog row served by `bitty.commands.list` (CTX-1035).
+///
+/// Public registration metadata only (the same rows `bitty.debug.inspect`
+/// already serves to `debug.inspect` holders): no schemas, no functions, no
+/// settings or store content. Sorted by (`plugin`, `id`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandCatalogEntry {
+    /// Owning plugin id.
+    pub plugin: String,
+    /// Unqualified command id.
+    pub id: String,
+    /// Qualified command name (`plugin:id`).
+    pub qualified: String,
+    /// Bounded display title.
+    pub title: String,
 }
 
 /// One captured event subscription from `init.lua`.
@@ -2621,6 +2707,18 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                             .to_error(ctx));
                         }
                     };
+                    // CTX-1035: optional `args_schema` / `result_schema`
+                    // tables document the invocation contract. The bridge
+                    // keeps the table form (bounded by the marshalling
+                    // limits); the runtime encodes to JSON and validates
+                    // against the interface-schema contract at the
+                    // activation commit gate, where manifest table-form
+                    // schemas win when present. A non-table schema fails
+                    // closed here; a malformed table fails the activation.
+                    let args_schema =
+                        read_optional_schema_table(ctx, def, "args_schema", state.limits)?;
+                    let result_schema =
+                        read_optional_schema_table(ctx, def, "result_schema", state.limits)?;
                     // HOST-002 admission: count + length caps enforced at the
                     // bridge before the push, so a hostile `init.lua` fails
                     // closed with bounded memory instead of growing the Vecs
@@ -2672,6 +2770,8 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                             id,
                             title,
                             description,
+                            args_schema,
+                            result_schema,
                             run,
                         });
                     }
@@ -2681,6 +2781,75 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
             }),
         )
         .expect("commands table accepts 'register'");
+    commands
+        .set(
+            ctx,
+            "list",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let entries = state
+                        .bounded(|_expiry| state.services.command_list())
+                        .map_err(|error| error.to_error(ctx))?;
+                    let items: Vec<LuaValue> = entries
+                        .into_iter()
+                        .map(|entry| {
+                            LuaValue::table([
+                                ("plugin", LuaValue::String(entry.plugin)),
+                                ("id", LuaValue::String(entry.id)),
+                                ("qualified", LuaValue::String(entry.qualified)),
+                                ("title", LuaValue::String(entry.title)),
+                            ])
+                        })
+                        .collect();
+                    stack.replace(ctx, LuaValue::array(items).to_lua(ctx));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("commands table accepts 'list'");
+    commands
+        .set(
+            ctx,
+            "invoke",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let qualified = match stack.get(0) {
+                        Value::String(name) => {
+                            String::from_utf8_lossy(name.as_bytes()).into_owned()
+                        }
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_DEF_INVALID",
+                                "command name must be a string",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    if let Err(detail) = check_command_qualified_shape(&qualified) {
+                        return Err(
+                            BridgeError::new("validation", "E_DEF_INVALID", detail).to_error(ctx)
+                        );
+                    }
+                    // Nil and absent args invoke identically (empty table):
+                    // Lua has one table type, so `{}` and `nil` both mean
+                    // "no arguments" against an object args schema.
+                    let args = match stack.get(1) {
+                        Value::Nil => LuaValue::Nil,
+                        value => LuaValue::from_lua(value, state.limits)
+                            .map_err(|error| error.to_error(ctx))?,
+                    };
+                    let result = state
+                        .bounded(|_expiry| state.services.command_invoke(&qualified, &args))
+                        .map_err(|error| error.to_error(ctx))?;
+                    stack.replace(ctx, result.to_lua(ctx));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("commands table accepts 'invoke'");
 
     let events = Table::new(&ctx);
     events
@@ -5147,6 +5316,59 @@ fn check_service_iface_shape(iface: &str) -> Result<(), &'static str> {
         }
     }
     Ok(())
+}
+
+/// Shape-check one host-mediated command-invocation name (CTX-1035).
+///
+/// Admission only: exactly one `:` separating a non-empty owner from a
+/// non-empty command, at most [`COMMAND_QUALIFIED_MAX_BYTES`] bytes, no NUL
+/// or space. Ownership (does `owner` hold `command`?) and liveness stay
+/// host-side; the bridge rejects only malformed shapes with a static detail
+/// for the caller to wrap.
+fn check_command_qualified_shape(qualified: &str) -> Result<(), &'static str> {
+    if qualified.is_empty() || qualified.len() > COMMAND_QUALIFIED_MAX_BYTES {
+        return Err("command name must be 1..257 bytes");
+    }
+    if qualified.contains('\0') || qualified.contains(' ') {
+        return Err("command name must not contain NUL or space");
+    }
+    match qualified.split_once(':') {
+        Some((owner, command))
+            if !owner.is_empty() && !command.is_empty() && !command.contains(':') =>
+        {
+            Ok(())
+        }
+        _ => Err("command name must be 'owner:command'"),
+    }
+}
+
+/// Read one optional command-schema table from a `commands.register`
+/// definition (CTX-1035).
+///
+/// Absent (`nil`) means no schema; a table is converted to a bounded
+/// [`LuaValue`] under the marshalling limits (the runtime encodes it to JSON
+/// and enforces the interface-schema contract at activation). Any other type
+/// fails closed with `E_DEF_INVALID`.
+fn read_optional_schema_table<'gc>(
+    ctx: Context<'gc>,
+    def: Table<'gc>,
+    field: &str,
+    limits: MarshallingLimits,
+) -> Result<Option<LuaValue>, Error<'gc>> {
+    match def.get_value(ctx, field.to_string()) {
+        Value::Nil => Ok(None),
+        Value::Table(table) => {
+            let value = LuaValue::from_lua(Value::Table(table), limits)
+                .map_err(|error| error.to_error(ctx))?;
+            Ok(Some(value))
+        }
+        _ => Err(BridgeError::new(
+            "validation",
+            "E_DEF_INVALID",
+            format!("command '{field}' must be a table"),
+        )
+        .to_error(ctx)),
+    }
 }
 
 /// Read `bitty.services.get(iface, opts)` options (LUA-OQ-8).

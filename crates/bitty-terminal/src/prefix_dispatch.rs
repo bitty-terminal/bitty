@@ -38,7 +38,7 @@
 use bitty_config::{ChromeAction, KeyName, KeyRef, PrefixBinding, ResolvedLeader, match_prefix};
 
 /// Outcome of classifying one press for the prefix dispatcher.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PrefixPress {
     /// Idle and not a Leader press, or no prefix bindings configured: the
     /// caller continues with hint/normal dispatch untouched.

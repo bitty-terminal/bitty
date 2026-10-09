@@ -1015,8 +1015,10 @@ impl TerminalApp {
         // CTX-0943: a user focus-switch ends the transient input capture
         // (contract `focus_switched`), wherever the action originates
         // (key chord, plugin workspace request, ctl verb). Idempotent
-        // no-op with no capture active.
-        if Self::is_overlay_focus_switch(action) {
+        // no-op with no capture active. `InvokeCommand` is not a focus
+        // switch (invoking a command never moves focus), so it clones for
+        // the predicate and runs below.
+        if Self::is_overlay_focus_switch(action.clone()) {
             self.revoke_overlay_capture();
         }
         match action {
@@ -1131,6 +1133,20 @@ impl TerminalApp {
                 eprintln!(
                     "warning: keymap toggle_palette is not yet shipped (see #1003); chord ignored, no palette opened"
                 );
+            }
+            A::InvokeCommand(qualified) => {
+                // CTX-1035 (#1829): the generic host-mediated invocation
+                // path. The chord carries no arguments, so the invocation
+                // validates as the empty object `{}`; undeclared and
+                // foreign-qualified names, args-schema refusals, and callee
+                // failures all land here as loud diagnostics with terminal
+                // state untouched (never a host crash, never PTY bytes).
+                match self.invoke_plugin_command(&qualified, &Self::empty_command_args()) {
+                    Ok(_) => eprintln!("bitty: keymap command:{qualified} -> invoked"),
+                    Err(diagnostic) => eprintln!(
+                        "warning: keymap command:{qualified} refused ({diagnostic}) — ignoring"
+                    ),
+                }
             }
             A::NewSplit(dir) => {
                 let place_new_first = matches!(
@@ -2129,8 +2145,8 @@ impl TerminalApp {
                             }
                             return true;
                         }
-                        match matched {
-                            Some(action) if Self::is_overlay_focus_switch(action) => {
+                        match &matched {
+                            Some(action) if Self::is_overlay_focus_switch(action.clone()) => {
                                 self.revoke_overlay_capture();
                             }
                             Some(bitty_config::ChromeAction::CloseView) => {
@@ -5211,6 +5227,94 @@ mod tests {
             ComposerOwner::Plugin,
             "next open retries the plugin"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn invoke_command_keybinding_serves_registered_command_and_refuses_unknown() {
+        // CTX-1035 (issue #1829): the generic host-mediated invocation
+        // path. A keybinding `command:<owner:command>` chord (and the
+        // palette selection behind the same entry) routes through
+        // `invoke_plugin_command` into deny-by-default dispatch: the
+        // devtools-shaped empty-args string command serves, undeclared and
+        // foreign names are refused with terminal state untouched, and a
+        // detached runtime fails closed. The action never confirms a window
+        // close.
+        use crate::composer_owner::fixture;
+        use bitty_config::ChromeAction;
+        use bitty_runtime::plugin_runtime::LuaValue;
+        const OWNER: &str = "bitty-featured.devtools";
+        let root = fixture::temp_dir("invoke-command-path");
+        let plugin = root.join(OWNER);
+        std::fs::create_dir_all(plugin.join("lua")).expect("dirs");
+        std::fs::write(
+            plugin.join("bitty-plugin.toml"),
+            format!(
+                "[plugin]\nid = \"{OWNER}\"\nname = \"DevTools Test\"\nversion = \"0.1.0\"\n\
+                 description = \"invoke path test\"\n\n\
+                 [compat]\nbitty = \">=0.0.1\"\nplugin-api = \"^1.0\"\n\n\
+                 [capabilities]\n\n\
+                 [lazy]\ncommands = [\"{OWNER}:plugins\"]\nevents = []\n",
+            ),
+        )
+        .expect("manifest");
+        std::fs::write(
+            plugin.join("lua/init.lua"),
+            "bitty.commands.register({\n\
+             \x20 id = \"plugins\",\n\
+             \x20 title = \"DevTools: list plugins\",\n\
+             \x20 args_schema = { type = \"object\", properties = {}, additionalProperties = false },\n\
+             \x20 result_schema = { type = \"string\" },\n\
+             \x20 run = function(_args) return \"2 plugins active\" end,\n\
+             })\n\
+             return {}\n",
+        )
+        .expect("init");
+        let mut plugin_runtime = fixture::runtime_for(vec![root.clone()]);
+        plugin_runtime.discover();
+        let id = bitty_plugin_host::manifest::PluginId::new(OWNER).expect("id");
+        plugin_runtime.activate(&id).expect("activate");
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let mut app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        // Application entry: the empty-args command serves its string.
+        let result = app
+            .invoke_plugin_command(
+                "bitty-featured.devtools:plugins",
+                &TerminalApp::empty_command_args(),
+            )
+            .expect("registered command must serve");
+        assert_eq!(result, LuaValue::String("2 plugins active".to_string()));
+        // Keybinding action: runs the same path, never a window close.
+        assert!(!app.apply_chrome_action(ChromeAction::InvokeCommand(
+            "bitty-featured.devtools:plugins".to_string()
+        )));
+        // Undeclared and foreign-qualified names are refused, terminal
+        // state untouched.
+        for target in [
+            "bitty-featured.devtools:missing",
+            "bitty-featured.missing:plugins",
+            "bitty-terminal.palette:plugins",
+            "nope",
+        ] {
+            let error = app
+                .invoke_plugin_command(target, &TerminalApp::empty_command_args())
+                .expect_err("unknown must fail");
+            assert!(!error.is_empty(), "target {target} needs a diagnostic");
+            assert!(!app.apply_chrome_action(ChromeAction::InvokeCommand(target.to_string())));
+        }
+        // Detached runtime fails closed on both the entry and the action.
+        app = app.with_plugin_runtime(None);
+        let error = app
+            .invoke_plugin_command(
+                "bitty-featured.devtools:plugins",
+                &TerminalApp::empty_command_args(),
+            )
+            .expect_err("detached runtime must fail");
+        assert!(error.contains("gone"), "got {error}");
+        assert!(!app.apply_chrome_action(ChromeAction::InvokeCommand(
+            "bitty-featured.devtools:plugins".to_string()
+        )));
         let _ = std::fs::remove_dir_all(&root);
     }
 

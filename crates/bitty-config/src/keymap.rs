@@ -144,7 +144,18 @@ use crate::types::{EffectiveConfig, KeymapEntry};
 pub const MAX_CHORD_LEN: usize = 64;
 
 /// Maximum raw action string length in bytes (fail-closed).
-pub const MAX_ACTION_LEN: usize = 64;
+///
+/// Sized for the longest qualified invocation (`command:` plus a
+/// `owner:command` name at the host ceiling of 128 + 1 + 128 bytes, with
+/// headroom): every other action stays far below this, and anything longer
+/// is a malformed entry, never a silent truncation.
+pub const MAX_ACTION_LEN: usize = 320;
+
+/// Maximum bytes of one `command:<qualified>` invocation target (CTX-1035).
+///
+/// Mirrors the host qualified-name ceiling (plugin id at most 128 bytes
+/// plus one `:` separator plus a command id of at most 128 bytes).
+pub const MAX_INVOKE_COMMAND_LEN: usize = 257;
 
 /// Maximum focus id accepted by the `focus:<n>` action.
 pub const MAX_FOCUS_ID: u64 = 256;
@@ -627,7 +638,10 @@ impl SplitDir {
 ///
 /// Every variant maps onto existing `Runtime`/`LayoutNode` APIs (focus moves,
 /// leaf split/close, ratio nudge, zoom swap) — no new tiling primitive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// [`InvokeCommand`](Self::InvokeCommand) carries an owned qualified name, so
+/// the enum is [`Clone`] but not [`Copy`]; call sites that inspect an action
+/// and then run it clone first.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ChromeAction {
     /// Move focus spatially (`goto_split:left`, ...).
     GotoSplit(SplitDir),
@@ -819,6 +833,21 @@ pub enum ChromeAction {
     /// Super flip rebinds it to `super+a`. User-overridable via an explicit
     /// `keymaps` entry with the same `context + chord` identity.
     ToggleFloating,
+    /// Invoke one registered plugin command (`command:<owner:command>`,
+    /// alias `invoke_command:<owner:command>`; CTX-1035 issue #1829).
+    ///
+    /// The generic host-mediated invocation path behind palette selection:
+    /// the app parses the qualified name and routes it through the plugin
+    /// runtime's deny-by-default dispatch (undeclared and foreign-qualified
+    /// names refused, args validated against the callee schema, failures
+    /// contained — never a host crash). Keybindings carry no arguments, so
+    /// the invocation validates as the empty object `{}`; commands whose
+    /// args schema requires properties (e.g. a mandatory `filter`) refuse
+    /// the chord loudly. Manual bind only, never in [`DEFAULT_KEYMAPS`]
+    /// (same byte-identical discipline as [`Self::OpenComposer`]); the user
+    /// opts in with e.g.
+    /// `{ chord = "ctrl+alt+p", action = "command:bitty-featured.devtools:plugins" }`.
+    InvokeCommand(String),
 }
 
 impl ChromeAction {
@@ -996,6 +1025,10 @@ impl ChromeAction {
                 reject_arg(arg, trimmed)?;
                 Ok(Self::ToggleFloating)
             }
+            "command" | "invoke_command" | "run_command" => {
+                let target = require_invoke_command(arg, trimmed)?;
+                Ok(Self::InvokeCommand(target))
+            }
             _ => Err(ConfigError::validation(
                 "keymaps[].action",
                 format!("unknown action '{trimmed}'; {KNOWN_ACTIONS_HINT}"),
@@ -1005,7 +1038,7 @@ impl ChromeAction {
 
     /// Canonical action spelling (`goto_split:left`, `close_view`, ...).
     #[must_use]
-    pub fn canonical(self) -> String {
+    pub fn canonical(&self) -> String {
         match self {
             Self::GotoSplit(d) => format!("goto_split:{}", d.canonical()),
             Self::NewSplit(d) => format!("new_split:{}", d.canonical()),
@@ -1041,6 +1074,7 @@ impl ChromeAction {
             Self::SelectCommandOutput => "select_command_output".to_string(),
             Self::TogglePalette => "toggle_palette".to_string(),
             Self::ToggleFloating => "toggle_floating".to_string(),
+            Self::InvokeCommand(qualified) => format!("command:{qualified}"),
         }
     }
 }
@@ -1050,7 +1084,7 @@ impl ChromeAction {
 /// W-144 (CTX-0937): the search/copy-mode policy actions retired with the
 /// Core policy; their namespace moves to W-138 with the plugins (CTX-0003),
 /// so the retired spellings fail closed as unknown here.
-const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, new_panel, resize_split:<left|right|up|down>, close_view, toggle_zoom, toggle_help, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, fold_toggle, fold_expand, fold_collapse, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_focus:<1..=16>, workspace_move:<1..=16>, workspace_swap:<1..=16>, jump_to_prompt:<prev|next>, select_command_output, toggle_palette, toggle_floating";
+const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, new_panel, resize_split:<left|right|up|down>, close_view, toggle_zoom, toggle_help, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, fold_toggle, fold_expand, fold_collapse, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_focus:<1..=16>, workspace_move:<1..=16>, workspace_swap:<1..=16>, jump_to_prompt:<prev|next>, select_command_output, toggle_palette, toggle_floating, command:<owner:command>";
 
 /// Require a `<head>:<dir>` argument.
 fn require_dir_arg(arg: Option<&str>, raw: &str) -> Result<SplitDir, ConfigError> {
@@ -1107,6 +1141,40 @@ fn require_workspace_index(arg: Option<&str>, raw: &str) -> Result<u64, ConfigEr
             "keymaps[].action",
             format!("action '{raw}' needs a workspace index (e.g. 'workspace_focus:2')"),
         )),
+    }
+}
+
+/// Require a `command:<owner:command>` invocation target (CTX-1035).
+///
+/// The target after the `command:` head is itself qualified, so the raw
+/// action holds two colons (e.g. `command:bitty-featured.devtools:plugins`);
+/// the head/arg split already consumed the first one. Deny-by-default at
+/// parse: missing, empty-sided, multi-colon, over-long, or NUL/space-bearing
+/// targets fail closed with the action grammar error (ownership and liveness
+/// stay runtime checks at dispatch).
+fn require_invoke_command(arg: Option<&str>, raw: &str) -> Result<String, ConfigError> {
+    let invalid = || {
+        ConfigError::validation(
+            "keymaps[].action",
+            format!(
+                "action '{raw}' needs a qualified command 'owner:command' (e.g. 'command:bitty-featured.devtools:plugins')"
+            ),
+        )
+    };
+    let target = match arg {
+        Some(target) if !target.is_empty() => target,
+        _ => return Err(invalid()),
+    };
+    if target.len() > MAX_INVOKE_COMMAND_LEN || target.contains('\0') || target.contains(' ') {
+        return Err(invalid());
+    }
+    match target.split_once(':') {
+        Some((owner, command))
+            if !owner.is_empty() && !command.is_empty() && !command.contains(':') =>
+        {
+            Ok(target.to_string())
+        }
+        _ => Err(invalid()),
     }
 }
 
@@ -1512,7 +1580,7 @@ pub fn resolve_keymaps(effective: &EffectiveConfig) -> Result<Vec<ResolvedKeymap
 pub fn match_keymap(maps: &[ResolvedKeymap], key: KeyRef) -> Option<ChromeAction> {
     for m in maps {
         if key.matches(&m.chord) {
-            return Some(m.action);
+            return Some(m.action.clone());
         }
     }
     None
@@ -2046,7 +2114,7 @@ pub fn resolve_prefix_bindings(entries: &[KeymapEntry]) -> Result<Vec<PrefixBind
 pub fn match_prefix(bindings: &[PrefixBinding], key: KeyRef) -> Option<ChromeAction> {
     for b in bindings {
         if b.matches(key) {
-            return Some(b.action);
+            return Some(b.action.clone());
         }
     }
     None
@@ -2724,6 +2792,65 @@ mod tests {
     }
 
     #[test]
+    fn invoke_command_parses_qualified_targets_and_canonicalizes() {
+        // CTX-1035 (issue #1829): the generic host-mediated invocation
+        // path. `command:<owner:command>` (aliases `invoke_command:`,
+        // `run_command:`) parses to the qualified target and canonicalizes
+        // back to the `command:` spelling; ownership and liveness stay
+        // runtime checks at dispatch.
+        for raw in [
+            "command:bitty-featured.devtools:plugins",
+            "invoke_command:bitty-featured.devtools:plugins",
+            "run_command:bitty-featured.devtools:plugins",
+        ] {
+            let action = ChromeAction::parse(raw).expect("parses");
+            assert_eq!(
+                action,
+                ChromeAction::InvokeCommand("bitty-featured.devtools:plugins".to_string()),
+                "raw {raw:?} must parse"
+            );
+            assert_eq!(
+                action.canonical(),
+                "command:bitty-featured.devtools:plugins"
+            );
+        }
+        // The vocabulary hint names the new action.
+        let err = ChromeAction::parse("explode:now").unwrap_err();
+        assert!(err.to_string().contains("command:<owner:command>"));
+        // Deny-by-default at parse: missing, empty-sided, multi-colon,
+        // NUL/space-bearing, and over-long targets fail closed.
+        for raw in [
+            "command",
+            "command:",
+            "command::plugins",
+            "command:owner:",
+            "command::",
+            "command:a:b:c",
+            "command:has space:x",
+            "command:has\0nul:x",
+        ] {
+            assert!(ChromeAction::parse(raw).is_err(), "raw {raw:?} must fail");
+        }
+        let long_owner = "o".repeat(128);
+        let long_command = "c".repeat(128);
+        let longest = format!("command:{long_owner}:{long_command}");
+        assert_eq!(longest.len(), 8 + MAX_INVOKE_COMMAND_LEN);
+        assert!(ChromeAction::parse(&longest).is_ok());
+        let overlong = format!("command:{long_owner}:{long_command}x");
+        assert!(ChromeAction::parse(&overlong).is_err());
+        // Manual bind only, never in defaults (same byte-identical
+        // discipline as `open_composer`): a fresh config keeps Normal Mode
+        // byte-identical and no chord invokes plugin code unasked.
+        let maps = default_keymaps().expect("defaults valid");
+        assert!(
+            !maps
+                .iter()
+                .any(|m| matches!(m.action, ChromeAction::InvokeCommand(_))),
+            "defaults must not bind command: invocations"
+        );
+    }
+
+    #[test]
     fn prompt_nav_actions_parse_and_ship_documented_defaults() {
         // CTX-0952 (issue #1670): prompt-jump and select-output verbs parse
         // (arg form plus explicit aliases), canonicalize to the arg form,
@@ -3000,7 +3127,7 @@ mod tests {
             let key = KeyName::Char(key.chars().next().expect("single"));
             assert_eq!(
                 match_keymap(&maps, key_ref(key, *ctrl, true, *shift)),
-                Some(*want),
+                Some(want.clone()),
                 "DEC chord alt+{key:?}"
             );
         }
@@ -3815,7 +3942,7 @@ mod tests {
             };
             assert_eq!(
                 match_keymap(&alt_maps, keyref),
-                Some(*action),
+                Some(action.clone()),
                 "chord {chord:?}"
             );
         }

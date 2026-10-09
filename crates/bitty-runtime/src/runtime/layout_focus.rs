@@ -698,16 +698,22 @@ impl Runtime {
                         let border = dv
                             .border
                             .saturating_add(bitty_ui::presentation::FLOAT_BORDER_EXTRA);
+                        // CodeRabbit 1873: cap the insets by the float frame
+                        // so a degenerate (tiny/empty) float rect keeps the
+                        // content origin inside the frame instead of
+                        // overshooting past its far edge.
                         let inset_x = dv
                             .content
                             .x
                             .saturating_sub(dv.frame.x)
-                            .saturating_add(bitty_ui::presentation::FLOAT_BORDER_EXTRA);
+                            .saturating_add(bitty_ui::presentation::FLOAT_BORDER_EXTRA)
+                            .min(float_rect.width);
                         let inset_y = dv
                             .content
                             .y
                             .saturating_sub(dv.frame.y)
-                            .saturating_add(bitty_ui::presentation::FLOAT_BORDER_EXTRA);
+                            .saturating_add(bitty_ui::presentation::FLOAT_BORDER_EXTRA)
+                            .min(float_rect.height);
                         let content_rect = UiRect::new(
                             float_rect.x.saturating_add(inset_x),
                             float_rect.y.saturating_add(inset_y),

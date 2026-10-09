@@ -98,6 +98,33 @@ fn floating_toggle_lifts_tier_geometry_and_paint_order() {
 }
 
 #[test]
+fn floated_content_origin_stays_inside_degenerate_frame() {
+    // CodeRabbit 1873: on a degenerate (tiny) container the capped insets
+    // must keep the content origin inside the float frame instead of
+    // overshooting past its far edge.
+    let mut rt = make_runtime();
+    rt.set_layout(LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)));
+    rt.set_container(UiRect::new(0, 0, 4, 2));
+    toggle(&mut rt, ViewId::new(1));
+    let frames = rt.present_frames();
+    let floated = frames
+        .iter()
+        .find(|frame| frame.view == ViewId::new(1))
+        .expect("leaf presents");
+    assert_eq!(floated.tier, Some(OverlayTier::Float));
+    assert!(floated.content.x >= floated.frame.x);
+    assert!(floated.content.y >= floated.frame.y);
+    assert!(
+        floated.content.x <= floated.frame.x + floated.frame.width as i32,
+        "content x overshoots float frame"
+    );
+    assert!(
+        floated.content.y <= floated.frame.y + floated.frame.height as i32,
+        "content y overshoots float frame"
+    );
+}
+
+#[test]
 fn structural_tier_wins_over_mode_stamp() {
     // A leaf inside a structural overlay keeps its structural tier even when
     // stamped Floating: the overlay composition owns its paint position, so

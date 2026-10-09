@@ -77,8 +77,15 @@ if [ -z "${_BITTY_SHELL_INIT:-}" ]; then
         _bitty_osc7
         printf '\e]133;A\e\\'
     }
-    if [[ "${PROMPT_COMMAND:-}" != *"_bitty_prompt_hook"* ]]; then
-        PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND; }_bitty_prompt_hook"
+    # The hook runs first so it captures the previous command's status
+    # before existing prompt commands can overwrite $?. Both string- and
+    # array-valued PROMPT_COMMAND are preserved.
+    if [[ "$(declare -p PROMPT_COMMAND 2>/dev/null)" == "declare -a "* ]]; then
+        if [[ " ${PROMPT_COMMAND[*]} " != *" _bitty_prompt_hook "* ]]; then
+            PROMPT_COMMAND=(_bitty_prompt_hook "${PROMPT_COMMAND[@]}")
+        fi
+    elif [[ "${PROMPT_COMMAND:-}" != *"_bitty_prompt_hook"* ]]; then
+        PROMPT_COMMAND="_bitty_prompt_hook${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
     fi
 fi
 eval "$(bitty completion bash)"
@@ -446,6 +453,36 @@ mod tests {
                 "shell {shell:?} guard precedes hook wiring"
             );
         }
+    }
+
+    #[test]
+    fn bash_hook_runs_first_and_keeps_array_prompt_command() {
+        let script = shell_init_script(CompletionShell::Bash);
+        // The hook must precede existing prompt commands: anything running
+        // before it would overwrite $? and mask the previous command's
+        // real status (verified: append form captures 0 after `false`
+        // when a prior entry succeeds; prepend form captures 1).
+        assert!(
+            script.contains(
+                r#"PROMPT_COMMAND="_bitty_prompt_hook${PROMPT_COMMAND:+; $PROMPT_COMMAND}""#
+            ),
+            "bash prepends the hook before existing PROMPT_COMMAND"
+        );
+        assert!(
+            !script.contains(
+                r#"PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND; }_bitty_prompt_hook""#
+            ),
+            "bash no longer appends the hook after existing PROMPT_COMMAND"
+        );
+        // Array-valued PROMPT_COMMAND keeps every existing entry.
+        assert!(
+            script.contains("declare -a "),
+            "bash detects array-valued PROMPT_COMMAND"
+        );
+        assert!(
+            script.contains("PROMPT_COMMAND=(_bitty_prompt_hook"),
+            "bash prepends the hook to array-valued PROMPT_COMMAND"
+        );
     }
 
     #[test]

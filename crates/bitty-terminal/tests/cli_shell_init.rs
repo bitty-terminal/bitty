@@ -194,6 +194,68 @@ fn bash_script_parses_cleanly_when_bash_exists() {
 }
 
 #[test]
+fn bash_hook_runs_first_and_captures_real_status() {
+    let bash = Command::new("bash")
+        .args(["--version"])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    if !bash {
+        return;
+    }
+    let out = run_bitty(&["shell-init", "bash"]);
+    assert_eq!(out.status.code(), Some(0));
+    let dir = scratch_dir("bash-order");
+    let script = dir.join("bitty-shell-init.bash");
+    std::fs::write(&script, stdout(&out)).expect("write bash script");
+    let script_arg = script.to_string_lossy().replace('\\', "/");
+    // A stub `bitty` keeps the trailing completion eval a no-op.
+    let probe = dir.join("probe.bash");
+    std::fs::write(
+        &probe,
+        format!(
+            "bitty() {{ :; }}\nPROMPT_COMMAND=\"true\"\nsource \"{script_arg}\"\n\
+             printf 'ORDER=<%s>\\n' \"$PROMPT_COMMAND\"\nfalse\neval \"$PROMPT_COMMAND\"\n"
+        ),
+    )
+    .expect("write probe");
+    let probe_arg = probe.to_string_lossy().replace('\\', "/");
+    let check = Command::new("bash")
+        .arg(&probe_arg)
+        .output()
+        .expect("spawn bash probe");
+    assert!(check.status.success(), "probe failed: {:?}", check.status);
+    let text = String::from_utf8_lossy(&check.stdout).into_owned();
+    assert!(
+        text.contains("ORDER=<_bitty_prompt_hook;"),
+        "hook precedes existing PROMPT_COMMAND entries: {text:?}"
+    );
+    assert!(
+        text.contains("]133;D;1"),
+        "hook reports the failing command status, not the prior entry: {text:?}"
+    );
+    // Array-valued PROMPT_COMMAND keeps every entry with the hook first.
+    let array_probe = dir.join("array-probe.bash");
+    std::fs::write(
+        &array_probe,
+        format!(
+            "bitty() {{ :; }}\nPROMPT_COMMAND=(true)\nsource \"{script_arg}\"\ndeclare -p PROMPT_COMMAND\n"
+        ),
+    )
+    .expect("write array probe");
+    let array_arg = array_probe.to_string_lossy().replace('\\', "/");
+    let array_check = Command::new("bash")
+        .arg(&array_arg)
+        .output()
+        .expect("spawn bash array probe");
+    let array_text = String::from_utf8_lossy(&array_check.stdout).into_owned();
+    assert!(
+        array_text.contains("[0]=\"_bitty_prompt_hook\""),
+        "hook leads array-valued PROMPT_COMMAND: {array_text:?}"
+    );
+}
+
+#[test]
 fn fish_script_parses_cleanly_when_fish_exists() {
     let fish = Command::new("fish")
         .args(["--version"])

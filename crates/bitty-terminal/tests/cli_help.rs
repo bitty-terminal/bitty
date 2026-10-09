@@ -78,6 +78,7 @@ fn default_help_lists_every_subcommand_on_one_line() {
         "cmd",
         "x",
         "completion",
+        "shell-init",
         "version",
     ] {
         assert!(
@@ -180,6 +181,7 @@ fn every_subcommand_still_reachable_via_per_command_help() {
         ("cmd", "bitty cmd"),
         ("x", "bitty x"),
         ("completion", "bitty completion"),
+        ("shell-init", "bitty shell-init"),
         ("version", "bitty version"),
     ];
     for (sub, marker) in cases {

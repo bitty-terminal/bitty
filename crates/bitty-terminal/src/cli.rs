@@ -2148,6 +2148,7 @@ pub(crate) fn help_text_short(color: bool) -> String {
            cmd <id>                Direct qualified executable invocation for automation\n  \
            x <id> <command>        Qualified plugin namespace (extension, no VM load)\n  \
            completion <shell>      Emit shell completion script (alias comp)\n  \
+           shell-init <shell>      Shell integration: prompt hooks + completion wiring\n  \
            version                 Version and build metadata\n\
          \n\
          {arguments}\n  \

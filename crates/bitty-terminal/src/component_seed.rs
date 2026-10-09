@@ -549,7 +549,10 @@ impl ScopedDir {
                 "bitty-seed-{tag}-{}-{sequence}-{nanos}",
                 std::process::id()
             ));
+            #[cfg(unix)]
             let mut builder = std::fs::DirBuilder::new();
+            #[cfg(not(unix))]
+            let builder = std::fs::DirBuilder::new();
             #[cfg(unix)]
             builder.mode(0o700);
             match builder.create(&path) {
@@ -825,7 +828,10 @@ fn unpack_and_validate(
     {
         #[cfg(unix)]
         use std::os::unix::fs::DirBuilderExt as _;
+        #[cfg(unix)]
         let mut builder = std::fs::DirBuilder::new();
+        #[cfg(not(unix))]
+        let builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         builder.mode(0o700);
         builder.create(&extract_dir).map_err(|error| {
@@ -1632,7 +1638,10 @@ mod tests {
 
     #[test]
     fn staging_dirs_are_owner_only() {
+        #[cfg(unix)]
         let stage = ScopedDir::create("mode").expect("stage");
+        #[cfg(not(unix))]
+        let _stage = ScopedDir::create("mode").expect("stage");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;

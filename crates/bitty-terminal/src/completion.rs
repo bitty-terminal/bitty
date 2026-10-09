@@ -134,7 +134,6 @@ _bitty() {
         args) _arguments '*: :($flags)' ;;
     esac
 }
-_bitty "$@"
 "#;
 
 /// Fish completion script (static core tree).
@@ -410,6 +409,26 @@ mod tests {
         for flag in ["--format", "--socket", "--no-color"] {
             assert!(completion_flags().contains(flag), "flags missing {flag}");
         }
+    }
+
+    #[test]
+    fn zsh_completion_defines_without_invoking() {
+        // Evaluating the script must only define `_bitty` (registered via
+        // `#compdef` or the shell-init `compdef` line). A trailing
+        // `_bitty "$@"` would invoke the function at shell startup.
+        let script = completion_script(CompletionShell::Zsh);
+        assert!(
+            script.contains("_bitty() {"),
+            "zsh script defines the _bitty function"
+        );
+        assert!(
+            script.contains("#compdef bitty"),
+            "zsh script keeps the compdef header for file install"
+        );
+        assert!(
+            !script.contains("_bitty \"$@\""),
+            "zsh script must not invoke _bitty at eval time"
+        );
     }
 
     #[test]

@@ -42,8 +42,10 @@
 
 #![forbid(unsafe_code)]
 
+use std::borrow::Cow;
+
 use crate::cli::Args;
-use crate::completion::{CompletionShell, shell_list};
+use crate::completion::{CompletionShell, completion_script, shell_list};
 
 // ---------------------------------------------------------------------------
 // Exit codes (stable taxonomy, cli-contract-rfc.md)
@@ -170,12 +172,20 @@ bitty completion powershell | Out-String | Invoke-Expression
 "#;
 
 /// Nushell integration: `pre_prompt` hook (OSC 133 `D` status, OSC 7 cwd,
-/// OSC 133 `A` prompt-start; existing hooks are kept) plus
-/// `bitty completion nushell`.
-const NUSHELL_SCRIPT: &str = r#"# bitty shell integration for Nushell (static; generated, do not edit).
+/// OSC 133 `A` prompt-start; existing hooks are kept) plus the inlined
+/// `bitty completion nushell` definitions.
+///
+/// The completion definitions are inlined (shared with the
+/// `bitty completion nushell` output) because Nushell resolves `source`
+/// paths at parse time: a `save -f` then `source` roundtrip of a just-written
+/// file cannot work on first setup — the file does not exist yet when the
+/// `source` line is parsed.
+const NUSHELL_HEADER: &str = r#"# bitty shell integration for Nushell (static; generated, do not edit).
 # Enable with: bitty shell-init nushell | save -f ~/.config/nushell/bitty-shell-init.nu
 # then add `source ~/.config/nushell/bitty-shell-init.nu` to config.nu
-# - Tab completion via `bitty completion nushell` (saved and sourced below).
+# - Tab completion inlined below (same output as `bitty completion nushell`).
+#   Inlined because Nushell parses `source` paths before running `save -f`,
+#   so a save-then-source roundtrip of a just-written file cannot load.
 # - Prompt hooks: OSC 7 cwd report plus OSC 133 prompt-start (A) and
 #   command-done-with-status (D) marks (observation only; ignored by
 #   terminals without support).
@@ -187,19 +197,24 @@ if "BITTY_SHELL_INIT" not-in $env {
         print -n "\e]133;A\e\\"
     }]))
 }
-bitty completion nushell | save -f ($nu.cache-dir | path join bitty-completion.nu)
-source ($nu.cache-dir | path join bitty-completion.nu)
 "#;
 
 /// Static shell-integration script for a shell (hooks + completion wiring).
+///
+/// Nushell returns an owned script: the prompt-hook header plus the shared
+/// `bitty completion nushell` definitions inlined, so no parse-time `source`
+/// of a just-written file is needed.
 #[must_use]
-pub fn shell_init_script(shell: CompletionShell) -> &'static str {
+pub fn shell_init_script(shell: CompletionShell) -> Cow<'static, str> {
     match shell {
-        CompletionShell::Bash => BASH_SCRIPT,
-        CompletionShell::Zsh => ZSH_SCRIPT,
-        CompletionShell::Fish => FISH_SCRIPT,
-        CompletionShell::Powershell => POWERSHELL_SCRIPT,
-        CompletionShell::Nushell => NUSHELL_SCRIPT,
+        CompletionShell::Bash => Cow::Borrowed(BASH_SCRIPT),
+        CompletionShell::Zsh => Cow::Borrowed(ZSH_SCRIPT),
+        CompletionShell::Fish => Cow::Borrowed(FISH_SCRIPT),
+        CompletionShell::Powershell => Cow::Borrowed(POWERSHELL_SCRIPT),
+        CompletionShell::Nushell => Cow::Owned(format!(
+            "{NUSHELL_HEADER}{}",
+            completion_script(CompletionShell::Nushell)
+        )),
     }
 }
 
@@ -515,6 +530,39 @@ mod tests {
         assert!(
             script.contains("$LASTEXITCODE"),
             "powershell prefers the native exit code"
+        );
+    }
+
+    #[test]
+    fn nushell_inlines_completion_without_save_then_source() {
+        // Nushell parses `source` paths before running `save -f`, so a
+        // save-then-source roundtrip of a just-written file cannot load on
+        // first setup. The init script inlines the shared completion
+        // definitions instead (comment lines still name the install step).
+        let script = shell_init_script(CompletionShell::Nushell);
+        let code_lines: Vec<&str> = script
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .collect();
+        assert!(
+            !code_lines.iter().any(|line| line.contains("save -f")),
+            "nushell init must not save a completion file at runtime"
+        );
+        assert!(
+            !code_lines
+                .iter()
+                .any(|line| line.split_whitespace().any(|word| word == "source")),
+            "nushell init must not source a just-written file at runtime"
+        );
+        for marker in ["nu-complete bitty commands", "extern \"bitty\""] {
+            assert!(
+                script.contains(marker),
+                "nushell init inlines completion ({marker:?} missing)"
+            );
+        }
+        assert!(
+            script.contains(completion_script(CompletionShell::Nushell).trim()),
+            "nushell init shares the bitty completion nushell output"
         );
     }
 

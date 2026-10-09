@@ -1,4 +1,4 @@
-//! Idle memory-budget gate for issue #1809 (CTX-1026).
+//! Idle memory-budget gate for issue #1809 (CTX-1026, CTX-1036).
 //!
 //! A single idle panel reported 382 MB RSS / 1.5 GB VSZ. GPU-driver mappings
 //! own most of the VSZ floor (out of scope here); this gate pins the heap
@@ -10,7 +10,12 @@
 //! - every glyph/shape/atlas/dynamic cache keeps a named cap, each with a
 //!   byte line-item under the idle budget;
 //! - the atlas starts at the 512 px lazy dimension (256 KiB R8), never the
-//!   2048 px maximum, until glyph pressure grows it.
+//!   2048 px maximum, until glyph pressure grows it;
+//! - (CTX-1036, phase 2) the GPU surface negotiates `Fifo` first (double,
+//!   not triple, buffering), the Linux instance excludes the GL backend so
+//!   its driver stack never becomes resident under Vulkan, the logical
+//!   device requests `MemoryUsage` sizing, and atlas-less frames size their
+//!   texture at the lazy 512 px dimension.
 //!
 //! Budgets are deliberately headroom-tight (not exact): a legitimate new
 //! cache must update the named constant AND this gate together, which is
@@ -25,6 +30,7 @@ use bitty_render::{
     batch::MAX_ATLAS_DIMENSION,
     cache::DEFAULT_GLYPH_CACHE_CAPACITY,
     glyph::{BitmapFormat, GlyphMetrics},
+    gpu::{BackendSelection, PresentMode, pick_present_mode, resolve_instance_backends},
     shaped::{MAX_DYNAMIC_CACHE_ENTRIES, MAX_RUN_CACHE_ENTRIES, MAX_SHAPED_GLYPH_CACHE_ENTRIES},
 };
 
@@ -181,5 +187,64 @@ fn cache_caps_hold_named_byte_lines() {
     assert!(
         worst_owned <= RENDER_WORST_CASE_BUDGET_BYTES,
         "combined cache/atlas worst case {worst_owned} must stay under {RENDER_WORST_CASE_BUDGET_BYTES}"
+    );
+}
+
+/// Phase-2 GPU surface policy (CTX-1036, issue #1809).
+///
+/// Headed measurement on ws5 (same method as the issue: Hyprland idle 10 s,
+/// 12 pt, empty scrollback) showed the Vulkan driver arena dominating idle
+/// RSS (145 MB `RssShmem` on `/dev/nvidiactl`) with the GL stack resident
+/// beside it (~15 MB file mappings + init threads) even though the surface
+/// negotiates Vulkan. This gate pins the three policy choices that keep the
+/// driver set minimal; the numeric budget (interim headed gate: idle
+/// single-panel main-process RSS at or below 250 MB toward 150 MB) is
+/// measured headed by `tools/mem-measure.sh`, while CI pins the policy here
+/// so a default flipped back can never regress silently.
+#[test]
+fn gpu_surface_policy_stays_memory_lean() {
+    // Present mode: Fifo (double-buffered vsync) first — one fewer
+    // resident frame than Mailbox triple buffering.
+    let both = wgpu::SurfaceCapabilities {
+        usages: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        formats: vec![wgpu::TextureFormat::Bgra8UnormSrgb],
+        present_modes: vec![wgpu::PresentMode::Mailbox, wgpu::PresentMode::Fifo],
+        alpha_modes: vec![wgpu::CompositeAlphaMode::Auto],
+    };
+    assert_eq!(pick_present_mode(&both), PresentMode::Fifo);
+    // Mailbox-only surfaces still negotiate (degraded, never rejected).
+    let mailbox_only = wgpu::SurfaceCapabilities {
+        usages: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        formats: vec![wgpu::TextureFormat::Bgra8UnormSrgb],
+        present_modes: vec![wgpu::PresentMode::Mailbox],
+        alpha_modes: vec![wgpu::CompositeAlphaMode::Auto],
+    };
+    assert_eq!(pick_present_mode(&mailbox_only), PresentMode::Mailbox);
+
+    // Linux default: GL excluded so its driver stack never becomes
+    // resident when Vulkan serves the surface; Vulkan kept. (initialize()
+    // retries with full backends when no adapter is found, so Vulkan-less
+    // hosts still reach GL.)
+    let linux_defaults = wgpu::Backends::VULKAN | wgpu::Backends::GL;
+    let (backends, selection) = resolve_instance_backends(linux_defaults, None, false, true);
+    assert_eq!(selection, BackendSelection::LinuxGlExcluded);
+    assert!(!backends.contains(wgpu::Backends::GL), "GL must stay out");
+    assert!(backends.contains(wgpu::Backends::VULKAN), "Vulkan kept");
+    // Operator pin wins verbatim on every platform.
+    let (pinned, selection) =
+        resolve_instance_backends(wgpu::Backends::all(), Some(wgpu::Backends::GL), false, true);
+    assert_eq!(selection, BackendSelection::EnvOverride);
+    assert_eq!(pinned, wgpu::Backends::GL);
+
+    // Atlas-less frames size their texture at the lazy 512 px dimension
+    // (256 KiB R8), never the 2048 px maximum (4 MiB): the first atlas
+    // frame recreates at its real dims through the resource-match check.
+    assert_eq!(INITIAL_ATLAS_DIMENSION, 512);
+    let fallback_texels =
+        usize::from(INITIAL_ATLAS_DIMENSION) * usize::from(INITIAL_ATLAS_DIMENSION);
+    assert_eq!(
+        fallback_texels,
+        256 * 1024,
+        "atlas-less frames must size at 256 KiB, not 4 MiB"
     );
 }

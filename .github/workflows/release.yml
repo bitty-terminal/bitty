@@ -756,6 +756,187 @@ jobs:
             throw "version mismatch: archive $version, binary $output"
           }
 
+  # Windows x64 setup installer (CTX-1064 / #1810): Inno Setup 6 wizard
+  # compiled on windows-latest (choco install, no paid infra). Input is the
+  # x86_64 MSVC executable from `build` plus LICENSE/README.md/CHANGELOG.md
+  # (the portable-ZIP payload); the version resolves exactly like `windows-zip`
+  # (tag > workflow input > Cargo workspace version), never hardcoded. The
+  # 0.1.0 installer is intentionally unsigned (paid signing deferred past
+  # 0.2.0 per the owner decision on #1810): no SignTool is configured and the
+  # verify job asserts NotSigned. Scoop keeps shipping the bare exes on its
+  # own track; install.ps1 keeps fetching the portable ZIP.
+  windows-installer:
+    name: Windows x64 Setup installer
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download x86_64 executable
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bitty-x86_64-pc-windows-msvc
+          path: dist
+
+      - name: Resolve release version
+        id: version
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          version="${INPUT_VERSION:-}"
+          if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
+            version="${GITHUB_REF#refs/tags/v}"
+          fi
+          if [[ -z "$version" ]]; then
+            version="$(bash scripts/check-release-version.sh --print)"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release version: $version"
+        shell: bash
+
+      - name: Stage installer payload
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/wininst-stage
+          cp dist/bitty-x86_64-pc-windows-msvc.exe dist/wininst-stage/bitty.exe
+          cp LICENSE README.md CHANGELOG.md dist/wininst-stage/
+          ls -lh dist/wininst-stage/
+          bash scripts/check-windows-installer.sh
+        shell: bash
+
+      - name: Install Inno Setup 6
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          choco install innosetup --yes --no-progress
+          $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found at $iscc" }
+          & $iscc /? | Select-Object -First 5
+
+      - name: Compile setup installer
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          $stage = Join-Path $env:GITHUB_WORKSPACE 'dist\wininst-stage'
+          $outDir = Join-Path $env:GITHUB_WORKSPACE 'dist'
+          & $iscc /DMyAppVersion="$env:VERSION" "/DMySourceDir=$stage" "/O$outDir" packaging\windows\bitty.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC exited $LASTEXITCODE" }
+          Get-ChildItem dist/*setup.exe | Format-Table Name, Length
+
+      - name: Checksum setup artifact
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          SETUP="dist/bitty-${VERSION}-windows-x86_64-setup.exe"
+          if [[ ! -f "$SETUP" ]]; then
+            echo "::error::setup artifact missing: $SETUP"
+            ls -lh dist/
+            exit 1
+          fi
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$SETUP" | tee "$SETUP.sha256"
+          else
+            shasum -a 256 "$SETUP" | tee "$SETUP.sha256"
+          fi
+        shell: bash
+
+      - name: Upload setup artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bitty-x86_64-pc-windows-msvc-setup
+          path: dist/bitty-*-windows-x86_64-setup.exe*
+          if-no-files-found: error
+          retention-days: 14
+
+  # Clean-runner acceptance for the setup installer (CTX-1064): silent
+  # per-user install/uninstall round-trip asserting the Start Menu shortcut,
+  # the opt-in Desktop shortcut, the automatic registry uninstall entry, the
+  # payload, and the version match. Unsigned 0.1.0 is asserted as NotSigned
+  # so a silent signing without updating bitty.iss and packaging/README.md
+  # fails here instead of shipping quietly.
+  verify-windows-installer:
+    name: Verify Windows setup install/uninstall
+    needs: windows-installer
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download setup installer
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bitty-x86_64-pc-windows-msvc-setup
+          path: pkg
+
+      - name: Install/uninstall round-trip
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $setup = Get-ChildItem -Path pkg -Filter '*-setup.exe' | Select-Object -First 1
+          if (-not $setup) { throw 'setup artifact not found' }
+          Write-Host "setup: $($setup.Name)"
+          if ($setup.BaseName -notmatch '^bitty-(?<version>[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.]+)?)-windows-x86_64-setup$') {
+            throw "unexpected setup name: $($setup.BaseName)"
+          }
+          $version = $Matches['version']
+          $sig = Get-AuthenticodeSignature -FilePath $setup.FullName
+          Write-Host "signature status: $($sig.Status)"
+          if ("$($sig.Status)" -ne 'NotSigned') {
+            throw "expected unsigned setup (NotSigned), got $($sig.Status); update bitty.iss and packaging/README.md before shipping signed builds"
+          }
+          $installDir = Join-Path $env:RUNNER_TEMP 'bitty-setup-test'
+          if (Test-Path $installDir) { Remove-Item -Recurse -Force $installDir }
+          & $setup.FullName /SILENT /NORESTART /SUPPRESSMSGBOXES /DIR="$installDir" /TASKS="desktopicon"
+          if ($LASTEXITCODE -ne 0) { throw "setup exited $LASTEXITCODE" }
+          $exe = Join-Path $installDir 'bitty.exe'
+          if (-not (Test-Path $exe -PathType Leaf)) { throw "bitty.exe missing after install: $exe" }
+          $output = & $exe --version
+          if ($LASTEXITCODE -ne 0) { throw "bitty --version exited $LASTEXITCODE" }
+          Write-Host "bitty --version => $output"
+          if ("$output" -notmatch [regex]::Escape($version)) {
+            throw "version mismatch: setup $version, binary $output"
+          }
+          foreach ($f in @('LICENSE', 'README.md', 'CHANGELOG.md')) {
+            if (-not (Test-Path (Join-Path $installDir $f) -PathType Leaf)) { throw "payload missing after install: $f" }
+          }
+          $startMenu = Join-Path ([Environment]::GetFolderPath('Programs')) 'Bitty\Bitty.lnk'
+          if (-not (Test-Path $startMenu)) { throw "Start Menu shortcut missing: $startMenu" }
+          Write-Host "Start Menu shortcut OK: $startMenu"
+          $desktop = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Bitty.lnk'
+          if (-not (Test-Path $desktop)) { throw "Desktop shortcut missing (desktopicon task): $desktop" }
+          Write-Host "Desktop shortcut OK: $desktop"
+          $entry = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -match '^Bitty' } | Select-Object -First 1
+          if (-not $entry) {
+            $entry = Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+              Where-Object { $_.DisplayName -match '^Bitty' } | Select-Object -First 1
+          }
+          if (-not $entry) { throw 'registry uninstall entry missing (DisplayName Bitty)' }
+          Write-Host "uninstall entry OK: $($entry.DisplayName) $($entry.DisplayVersion)"
+          if ("$($entry.DisplayVersion)" -notmatch [regex]::Escape($version)) {
+            throw "uninstall version mismatch: $($entry.DisplayVersion) vs $version"
+          }
+          if (-not $entry.UninstallString) { throw 'uninstall entry missing UninstallString' }
+          $unins = "$($entry.UninstallString)"
+          if ($unins -match '"([^"]+)"') { $unins = $Matches[1] } else { $unins = ($unins -split '\s+')[0] }
+          if (-not (Test-Path $unins)) { throw "uninstaller missing: $unins" }
+          & $unins /SILENT /NORESTART /SUPPRESSMSGBOXES
+          if ($LASTEXITCODE -ne 0) { throw "uninstaller exited $LASTEXITCODE" }
+          Start-Sleep -Seconds 5
+          if (Test-Path $exe) { throw 'bitty.exe survived uninstall' }
+          if (Test-Path $startMenu) { throw 'Start Menu shortcut survived uninstall' }
+          if (Test-Path $desktop) { throw 'Desktop shortcut survived uninstall' }
+          $gone = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -match '^Bitty' } | Select-Object -First 1
+          if ($gone) { throw 'registry uninstall entry survived uninstall' }
+          Write-Host 'install/uninstall round-trip PASS'
+
   # Versioned Linux binary bundles (REL-07 / #1110):
   # `bitty-<version>-<target>.tar.zst` carrying `bin/bitty`, `share/`
   # (desktop entry, icons, metainfo), LICENSE, README.md, and CHANGELOG.md —
@@ -976,6 +1157,8 @@ jobs:
         macos-universal,
         windows-zip,
         verify-windows-zip,
+        windows-installer,
+        verify-windows-installer,
         unix-bundle,
         verify-unix-bundle,
       ]

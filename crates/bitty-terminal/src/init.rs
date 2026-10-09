@@ -966,6 +966,11 @@ pub(crate) fn init_ask<T>(
         let _ = output.flush();
         match init_read_line_with_history(input, history) {
             Some((raw, line)) => {
+                // Esc cancels here too (see `init_ask_option`): bare `ESC`
+                // aborts the prompt instead of parsing an empty answer.
+                if raw == [0x1b] {
+                    return Err("bitty init: aborted (cancelled)".to_string());
+                }
                 if init_line_needs_redraw(&raw, &line)
                     && (writeln!(output, "  (read as {line:?})").is_err()
                         || output.flush().is_err())
@@ -1163,6 +1168,13 @@ pub(crate) fn init_ask_option<T>(
             Some(pair) => pair,
             None => return Err("bitty init: aborted (end of input)".to_string()),
         };
+        // Esc cancels the wizard: a bare `ESC` byte (pressed alone, then
+        // Enter on a canonical TTY) aborts without writing anything, so the
+        // caller restores the previous config. Arrow/kitty sequences still
+        // navigate via `init_option_nav` below; only the lone byte cancels.
+        if raw == [0x1b] {
+            return Err("bitty init: aborted (cancelled)".to_string());
+        }
         let trimmed = line.trim();
         if let Some(direction) = init_option_nav(&raw, trimmed) {
             match direction {
@@ -1215,6 +1227,248 @@ pub(crate) fn init_ask_option<T>(
     }
 }
 
+/// In-memory live preview for the init wizard (phase 2 of #1806).
+///
+/// Holds the exact previous effective config (`baseline`, never mutated)
+/// plus the preview overlay (`current`) the wizard updates after every
+/// successful prompt. The user config file is never touched until confirm:
+/// selections apply to the running session in memory only, so a crash
+/// mid-wizard leaves no partial file behind and cancel/EOF rollback is a
+/// trivial discard (`current` dropped, `baseline` kept).
+///
+/// Only wizard keys are overlaid (theme, font family/size, decoration
+/// geometry, shell, scrollback, close-confirm, key preset); every other
+/// field is cloned from `baseline` untouched. Of those, the `Live` subset
+/// (`appearance.theme`, `font.family`/`font.size`, `decoration.*`,
+/// `keymaps` — see `bitty-config::ReloadClass` and the `runtime_adopts`
+/// list in `crate::config_reload`) adopts live in a running session via
+/// the reload `apply_live` path; the restart-required remainder
+/// (`terminal.shell`, `terminal.scrollback`, `close_confirm`) is staged in
+/// the same overlay and takes effect on confirm/next start. The headed
+/// wiring that calls `apply_live` from the overlay lives outside this
+/// module (it needs a `Runtime`; this file stays `Runtime`-free so the
+/// whole flow remains headless-testable); until then the overlay is the
+/// preview truth the tests assert.
+///
+/// `snapshots` records one `current` clone per successful prompted step
+/// (skipped override steps apply silently first), so headless tests prove
+/// mid-wizard preview without a TTY. `None` (no preview) is the
+/// piped/non-TTY path: nothing to see, values still land on confirm.
+/// Reuses the existing `color` convention; no new flags or env.
+#[derive(Debug, Clone)]
+pub(crate) struct InitPreview {
+    /// Exact previous effective config; never mutated after construction.
+    baseline: bitty_config::EffectiveConfig,
+    /// Preview overlay: `baseline` plus every answered wizard key so far.
+    current: bitty_config::EffectiveConfig,
+    /// One `current` clone per successful prompted step, in prompt order.
+    snapshots: Vec<bitty_config::EffectiveConfig>,
+    /// False for piped/non-TTY: every apply/rollback is a no-op.
+    enabled: bool,
+}
+
+impl InitPreview {
+    /// Disabled preview (piped/non-TTY): applies and rollbacks do nothing,
+    /// snapshots stay empty, and no file is ever touched.
+    /// (Test-only today: production passes `None` for the no-preview path.)
+    #[allow(dead_code)]
+    pub(crate) fn disabled() -> Self {
+        let baseline = bitty_config::fallback_builtin();
+        Self {
+            current: baseline.clone(),
+            baseline,
+            snapshots: Vec::new(),
+            enabled: false,
+        }
+    }
+
+    /// Enabled preview seeded from the exact previous effective config.
+    /// Tests inject `fallback_builtin` (or a tweaked clone); production TTY
+    /// seeds the same way until the headed integration seeds the loaded
+    /// effective config instead.
+    pub(crate) fn enabled(baseline: bitty_config::EffectiveConfig) -> Self {
+        Self {
+            current: baseline.clone(),
+            baseline,
+            snapshots: Vec::new(),
+            enabled: true,
+        }
+    }
+
+    /// The exact previous effective config (rollback target).
+    /// (Headless-proof accessor; the headed adopter reads `current`.)
+    #[allow(dead_code)]
+    pub(crate) fn baseline(&self) -> &bitty_config::EffectiveConfig {
+        &self.baseline
+    }
+
+    /// The current preview overlay.
+    #[allow(dead_code)]
+    pub(crate) fn current(&self) -> &bitty_config::EffectiveConfig {
+        &self.current
+    }
+
+    /// One snapshot per successful prompted step, in prompt order.
+    #[allow(dead_code)]
+    pub(crate) fn snapshots(&self) -> &[bitty_config::EffectiveConfig] {
+        &self.snapshots
+    }
+
+    /// Discard the overlay and restore the exact previous config.
+    /// Cancel/EOF paths call this before propagating the abort; the user
+    /// file was never written, so restoration is total by construction.
+    pub(crate) fn rollback(&mut self) {
+        if self.enabled {
+            self.current = self.baseline.clone();
+        }
+    }
+
+    /// Record the current overlay after one successful prompted step.
+    fn commit_step(&mut self) {
+        if self.enabled {
+            self.snapshots.push(self.current.clone());
+        }
+    }
+
+    /// Seed skipped (value-flag) steps silently: no snapshots, so snapshot
+    /// count always equals the prompted-step count.
+    pub(crate) fn apply_overrides_silent(&mut self, overrides: &InitOverrides) {
+        if !self.enabled {
+            return;
+        }
+        if let Some(theme) = &overrides.theme {
+            self.current.appearance.theme = Some(theme.clone());
+        }
+        if let Some(family) = &overrides.font_family {
+            self.current.font.family.clone_from(family);
+        }
+        if let Some(size) = overrides.font_size {
+            self.current.font.size = size;
+        }
+        if let Some(value) = overrides.gaps_in {
+            self.current.decoration.gaps_in = value;
+        }
+        if let Some(value) = overrides.gaps_out {
+            self.current.decoration.gaps_out = value;
+        }
+        if let Some(value) = overrides.border {
+            self.current.decoration.border = value;
+        }
+        if let Some(value) = overrides.radius {
+            self.current.decoration.radius = value;
+        }
+        if let Some(value) = overrides.scrollback {
+            self.current.terminal.scrollback = value;
+        }
+        if let Some(mode) = overrides.close_confirm {
+            self.current.close_confirm = mode;
+        }
+    }
+
+    pub(crate) fn apply_shell(&mut self, shell: Option<&str>) {
+        if !self.enabled {
+            return;
+        }
+        self.current.terminal.shell = shell.map(str::to_string);
+        self.commit_step();
+    }
+
+    pub(crate) fn apply_theme(&mut self, theme: &str) {
+        if !self.enabled {
+            return;
+        }
+        self.current.appearance.theme = Some(theme.to_string());
+        self.commit_step();
+    }
+
+    pub(crate) fn apply_font_family(&mut self, family: &str) {
+        if !self.enabled {
+            return;
+        }
+        self.current.font.family = family.to_string();
+        self.commit_step();
+    }
+
+    pub(crate) fn apply_font_size(&mut self, size: f32) {
+        if !self.enabled {
+            return;
+        }
+        self.current.font.size = size;
+        self.commit_step();
+    }
+
+    pub(crate) fn apply_gaps_in(&mut self, value: u32) {
+        if !self.enabled {
+            return;
+        }
+        self.current.decoration.gaps_in = value;
+        self.commit_step();
+    }
+
+    pub(crate) fn apply_gaps_out(&mut self, value: u32) {
+        if !self.enabled {
+            return;
+        }
+        self.current.decoration.gaps_out = value;
+        self.commit_step();
+    }
+
+    pub(crate) fn apply_border(&mut self, value: u32) {
+        if !self.enabled {
+            return;
+        }
+        self.current.decoration.border = value;
+        self.commit_step();
+    }
+
+    pub(crate) fn apply_radius(&mut self, value: u32) {
+        if !self.enabled {
+            return;
+        }
+        self.current.decoration.radius = value;
+        self.commit_step();
+    }
+
+    pub(crate) fn apply_scrollback(&mut self, value: u32) {
+        if !self.enabled {
+            return;
+        }
+        self.current.terminal.scrollback = value;
+        self.commit_step();
+    }
+
+    pub(crate) fn apply_close_confirm(&mut self, mode: bitty_config::CloseConfirm) {
+        if !self.enabled {
+            return;
+        }
+        self.current.close_confirm = mode;
+        self.commit_step();
+    }
+
+    /// Preview the keybinding preset: `Default` keeps the implicit shipped
+    /// map (`keymaps` empty); `Vim` stages the explicit shipped map (built
+    /// FROM `DEFAULT_KEYMAPS`, never copied) the confirm file write pins.
+    pub(crate) fn apply_key_preset(&mut self, preset: InitKeyPreset) {
+        if !self.enabled {
+            return;
+        }
+        match preset {
+            InitKeyPreset::Default => self.current.keymaps.clear(),
+            InitKeyPreset::Vim => {
+                self.current.keymaps = bitty_config::keymap::DEFAULT_KEYMAPS
+                    .iter()
+                    .map(|(chord, action)| bitty_config::KeymapEntry {
+                        chord: (*chord).to_string(),
+                        action: (*action).to_string(),
+                        context: String::from("global"),
+                    })
+                    .collect();
+            }
+        }
+        self.commit_step();
+    }
+}
+
 /// Runs the interactive wizard: mascot greeting, then shell / theme / font
 /// (family, size) / decoration (gaps_in, gaps_out, border, radius) /
 /// scrollback / close-confirm / keybinding-preset picks. Pure over injected
@@ -1226,6 +1480,53 @@ pub(crate) fn init_ask_option<T>(
 /// (no prompt, no stdin read); the remaining steps prompt from a navigable
 /// option list (phase 1 of #1806) with their shipped default and reprompt
 /// fail-closed on invalid input.
+///
+/// Live preview (phase 2 of #1806): when `preview` is `Some`, each answered
+/// step overlays its value onto the preview's in-memory config (no file
+/// writes); cancel/EOF discards the overlay and restores the baseline (see
+/// [`InitPreview`]). `None` disables preview (piped/non-TTY).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_init_interactive_with_preview(
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
+    shell_env: Option<&str>,
+    columns: Option<u16>,
+    shell_exists: &dyn Fn(&str) -> bool,
+    overrides: &InitOverrides,
+    color: bool,
+    preview: Option<&mut InitPreview>,
+) -> Result<InitAnswers, String> {
+    // Rollback guard: any abort below restores the exact previous config
+    // before the error propagates, so Esc/cancel/EOF can never leave a
+    // partial overlay behind (the user file was never written either).
+    let mut preview = preview;
+    // Reborrow the inner `&mut` for the callee; a plain move would lose
+    // the rollback handle below.
+    #[allow(clippy::needless_option_as_deref)]
+    let inner = preview.as_deref_mut();
+    let result = run_init_interactive_impl(
+        input,
+        output,
+        shell_env,
+        columns,
+        shell_exists,
+        overrides,
+        color,
+        inner,
+    );
+    if result.is_err() {
+        if let Some(active) = preview.as_mut() {
+            active.rollback();
+        }
+    }
+    result
+}
+
+/// [`run_init_interactive_with_preview`] without preview (existing
+/// piped/plain callers and the output-error contract).
+/// Retained for the no-preview contract; the TTY dispatch now previews
+/// through [`run_init_interactive_with_preview`].
+#[allow(dead_code)]
 pub(crate) fn run_init_interactive(
     input: &mut dyn std::io::BufRead,
     output: &mut dyn std::io::Write,
@@ -1234,6 +1535,32 @@ pub(crate) fn run_init_interactive(
     shell_exists: &dyn Fn(&str) -> bool,
     overrides: &InitOverrides,
     color: bool,
+) -> Result<InitAnswers, String> {
+    run_init_interactive_with_preview(
+        input,
+        output,
+        shell_env,
+        columns,
+        shell_exists,
+        overrides,
+        color,
+        None,
+    )
+}
+
+/// Wizard body shared by [`run_init_interactive`] and
+/// [`run_init_interactive_with_preview`]; `preview` overlays each answered
+/// step in memory (see [`InitPreview`]).
+#[allow(clippy::too_many_arguments)]
+fn run_init_interactive_impl(
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
+    shell_env: Option<&str>,
+    columns: Option<u16>,
+    shell_exists: &dyn Fn(&str) -> bool,
+    overrides: &InitOverrides,
+    color: bool,
+    mut preview: Option<&mut InitPreview>,
 ) -> Result<InitAnswers, String> {
     let _ = write!(output, "{}", init_greeting_art(columns));
     let _ = writeln!(
@@ -1246,6 +1573,11 @@ pub(crate) fn run_init_interactive(
     // now moves the option cursor; typed text plus Up still recalls history
     // through the shared decoder.
     let mut history: Vec<String> = Vec::new();
+    // Seed skipped (value-flag) steps silently so the overlay already
+    // carries them; prompted steps append one snapshot each below.
+    if let Some(active) = preview.as_mut() {
+        active.apply_overrides_silent(overrides);
+    }
     let _ = writeln!(output, "\nShell:");
     let shell_options: Vec<InitOptionItem> = candidates
         .iter()
@@ -1272,6 +1604,9 @@ pub(crate) fn run_init_interactive(
         |line| init_parse_shell_answer(line, &candidates),
         &mut history,
     )?;
+    if let Some(active) = preview.as_mut() {
+        active.apply_shell(shell.as_deref());
+    };
     let theme = match &overrides.theme {
         Some(theme) => theme.clone(),
         None => {
@@ -1317,7 +1652,12 @@ pub(crate) fn run_init_interactive(
                 false,
                 init_parse_theme_answer,
                 &mut history,
-            )?
+            )
+            .inspect(|theme| {
+                if let Some(active) = preview.as_mut() {
+                    active.apply_theme(theme);
+                }
+            })?
         }
     };
     let font_family = match &overrides.font_family {
@@ -1359,7 +1699,12 @@ pub(crate) fn run_init_interactive(
                 false,
                 init_parse_font_family_answer,
                 &mut history,
-            )?
+            )
+            .inspect(|family| {
+                if let Some(active) = preview.as_mut() {
+                    active.apply_font_family(family);
+                }
+            })?
         }
     };
     let font_size = match overrides.font_size {
@@ -1406,7 +1751,12 @@ pub(crate) fn run_init_interactive(
                 false,
                 init_parse_font_size_answer,
                 &mut history,
-            )?
+            )
+            .inspect(|size| {
+                if let Some(active) = preview.as_mut() {
+                    active.apply_font_size(*size);
+                }
+            })?
         }
     };
     let _ = writeln!(
@@ -1460,7 +1810,12 @@ pub(crate) fn run_init_interactive(
                     )
                 },
                 &mut history,
-            )?
+            )
+            .inspect(|value| {
+                if let Some(active) = preview.as_mut() {
+                    active.apply_gaps_in(*value);
+                }
+            })?
         }
     };
     let gaps_out = match overrides.gaps_out {
@@ -1510,7 +1865,12 @@ pub(crate) fn run_init_interactive(
                     )
                 },
                 &mut history,
-            )?
+            )
+            .inspect(|value| {
+                if let Some(active) = preview.as_mut() {
+                    active.apply_gaps_out(*value);
+                }
+            })?
         }
     };
     let border = match overrides.border {
@@ -1559,7 +1919,12 @@ pub(crate) fn run_init_interactive(
                     )
                 },
                 &mut history,
-            )?
+            )
+            .inspect(|value| {
+                if let Some(active) = preview.as_mut() {
+                    active.apply_border(*value);
+                }
+            })?
         }
     };
     let radius = match overrides.radius {
@@ -1609,7 +1974,12 @@ pub(crate) fn run_init_interactive(
                     )
                 },
                 &mut history,
-            )?
+            )
+            .inspect(|value| {
+                if let Some(active) = preview.as_mut() {
+                    active.apply_radius(*value);
+                }
+            })?
         }
     };
     let _ = writeln!(output, "\nBehavior:");
@@ -1645,7 +2015,12 @@ pub(crate) fn run_init_interactive(
                 false,
                 init_parse_scrollback_answer,
                 &mut history,
-            )?
+            )
+            .inspect(|value| {
+                if let Some(active) = preview.as_mut() {
+                    active.apply_scrollback(*value);
+                }
+            })?
         }
     };
     let close_confirm = match overrides.close_confirm {
@@ -1684,7 +2059,12 @@ pub(crate) fn run_init_interactive(
                 true,
                 init_parse_close_confirm_answer,
                 &mut history,
-            )?
+            )
+            .inspect(|mode| {
+                if let Some(active) = preview.as_mut() {
+                    active.apply_close_confirm(*mode);
+                }
+            })?
         }
     };
     let preset_options = vec![
@@ -1712,6 +2092,9 @@ pub(crate) fn run_init_interactive(
         init_parse_preset_answer,
         &mut history,
     )?;
+    if let Some(active) = preview.as_mut() {
+        active.apply_key_preset(key_preset);
+    }
     Ok(InitAnswers {
         shell,
         theme,
@@ -1987,7 +2370,15 @@ pub(crate) fn run_init_subcommand_with_io(
             || args.plugin_no_color
             || args.component_no_color;
         let color = init_color_enabled(no_color);
-        match run_init_interactive(
+        // Live preview (phase 2 of #1806): on a TTY the wizard overlays
+        // each answer onto an in-memory preview seeded from the shipped
+        // fallback (the headed follow-up seeds the loaded effective config
+        // and adopts the overlay via the reload `apply_live` path). The
+        // user file is never written until confirm below; cancel/EOF
+        // rolls the overlay back and returns 1 with nothing written.
+        // Piped/non-TTY stays preview-free (nothing to see).
+        let mut preview = InitPreview::enabled(bitty_config::fallback_builtin());
+        match run_init_interactive_with_preview(
             input,
             output,
             env.shell,
@@ -1995,6 +2386,7 @@ pub(crate) fn run_init_subcommand_with_io(
             &|path| std::path::Path::new(path).exists(),
             &overrides,
             color,
+            Some(&mut preview),
         ) {
             Ok(answers) => answers,
             Err(message) => {
@@ -2004,6 +2396,17 @@ pub(crate) fn run_init_subcommand_with_io(
         }
     };
     let content = render_init_lua(&answers);
+    // Visible preview: show the exact pending config before write.
+    // Print-only (no confirm prompt); abort paths return above, so this
+    // runs only on the commit path. Plain header (no color): the wizard
+    // `color` only styles option lists, and plain keeps piped output
+    // greppable. Skipped when the write below will refuse (existing file
+    // without --force) so the recap never reads as a write promise.
+    if !(target.exists() && !args.init_force) {
+        let _ = writeln!(output, "\n  (pending init.lua — about to be written)");
+        let _ = write!(output, "{content}");
+        let _ = output.flush();
+    }
     match write_init_config(&target, &content, args.init_force) {
         Ok(outcome) => {
             if outcome.updated {

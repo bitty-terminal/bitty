@@ -199,7 +199,7 @@ fn cache_caps_hold_named_byte_lines() {
 /// negotiates Vulkan. This gate pins the three policy choices that keep the
 /// driver set minimal; the numeric budget (interim headed gate: idle
 /// single-panel main-process RSS at or below 250 MB toward 150 MB) is
-/// measured headed by `tools/mem-measure.sh`, while CI pins the policy here
+/// measured headed by `scripts/mem-measure.sh`, while CI pins the policy here
 /// so a default flipped back can never regress silently.
 #[test]
 fn gpu_surface_policy_stays_memory_lean() {

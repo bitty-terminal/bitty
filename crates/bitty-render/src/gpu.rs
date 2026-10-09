@@ -340,13 +340,28 @@ pub fn instance_descriptor() -> InstanceDescriptor {
 
 /// Builds the `wgpu` instance descriptor with every compiled backend kept.
 ///
-/// This is the [`GpuContext::initialize`] fallback when the guarded
-/// [`instance_descriptor`] finds no adapter (Vulkan-less hosts still reach
-/// GL instead of failing): it honors `WGPU_BACKEND` exactly like the base
-/// descriptor and excludes nothing.
+/// This is the [`GpuContext::initialize`] fallback on non-Windows platforms
+/// when the guarded [`instance_descriptor`] finds no adapter (Vulkan-less
+/// hosts still reach GL instead of failing): it honors `WGPU_BACKEND`
+/// exactly like the base descriptor and excludes nothing. On Windows it is
+/// constructed but never used for an automatic retry — reintroducing GL
+/// there would restart the `wgpu-hal` WGL init thread whose driver-dependent
+/// overflow aborts the process before any error is returned (issue #1799).
 #[must_use]
 pub fn full_backends_descriptor() -> InstanceDescriptor {
     InstanceDescriptor::from_env_or_default()
+}
+
+/// Whether a guarded `NoCompatibleAdapter` may retry with the full backend set.
+///
+/// Pure rule so the platform gate stays unit-testable without a GPU:
+/// retry only when the sets actually differ (otherwise the second attempt
+/// could not succeed) and never on Windows, where the retry would
+/// reintroduce the crash-contained WGL init thread (issue #1799) exactly on
+/// the path where the old code returned a graceful `Err`.
+#[must_use]
+fn should_retry_with_full_backends(primary: Backends, full: Backends, on_windows: bool) -> bool {
+    full != primary && !on_windows
 }
 
 /// Memory-allocation hint for the logical device request (CTX-1036, #1809).
@@ -392,7 +407,10 @@ impl GpuContext {
     /// scale (CTX-1036, issue #1809 — the GL driver stack stays mapped even
     /// when Vulkan serves the surface). When the guarded instance finds no
     /// adapter, initialization retries once with [`full_backends_descriptor`]
-    /// so Vulkan-less hosts still reach GL instead of failing.
+    /// so Vulkan-less hosts still reach GL instead of failing. The retry is
+    /// non-Windows-only: on Windows a guarded miss stays a graceful
+    /// [`RenderError::NoCompatibleAdapter`] (headless/error path) rather
+    /// than re-entering the crash-contained WGL init thread (issue #1799).
     ///
     /// The logical device requests [`MemoryHints::MemoryUsage`] (CTX-1036,
     /// issue #1809): the driver's default `Performance` hint sizes its
@@ -415,13 +433,20 @@ impl GpuContext {
     pub async fn initialize() -> Result<Self, RenderError> {
         let primary = instance_descriptor();
         let full = full_backends_descriptor();
+        // The guard excluded a backend the host actually needs
+        // (Vulkan-less machine, minimal VM): retry with everything
+        // compiled in — except on Windows, where the retry would re-enter
+        // the crash-contained WGL init thread (issue #1799). Any other
+        // failure (device rejection, driver error) is real and propagates
+        // without a second attempt.
+        let retry_allowed = should_retry_with_full_backends(
+            primary.backends,
+            full.backends,
+            cfg!(target_os = "windows"),
+        );
         match Self::initialize_with(&primary).await {
             Ok(ctx) => Ok(ctx),
-            // The guard excluded a backend the host actually needs
-            // (Vulkan-less machine, minimal VM): retry with everything
-            // compiled in. Any other failure (device rejection, driver
-            // error) is real and propagates without a second attempt.
-            Err(RenderError::NoCompatibleAdapter) if full.backends != primary.backends => {
+            Err(RenderError::NoCompatibleAdapter) if retry_allowed => {
                 Self::initialize_with(&full).await
             }
             Err(err) => Err(err),
@@ -2330,6 +2355,34 @@ mod tests {
         let (backends, selection) = resolve_instance_backends(Backends::GL, None, false, true);
         assert_eq!(selection, BackendSelection::Defaults);
         assert_eq!(backends, Backends::GL);
+    }
+
+    #[test]
+    fn guarded_retry_reaches_full_backends_off_windows() {
+        // CTX-1036: a guarded Linux miss (Vulkan kept, GL excluded) retries
+        // with the full set so Vulkan-less hosts still reach GL.
+        let primary = Backends::VULKAN;
+        let full = Backends::VULKAN | Backends::GL;
+        assert!(should_retry_with_full_backends(primary, full, false));
+    }
+
+    #[test]
+    fn guarded_retry_stays_graceful_on_windows() {
+        // Issue #1799: the retry would reintroduce the WGL init thread that
+        // can abort the process before any error is returned, so a guarded
+        // Windows miss stays `NoCompatibleAdapter` (headless/error path).
+        let primary = Backends::DX12 | Backends::VULKAN;
+        let full = primary | Backends::GL;
+        assert!(!should_retry_with_full_backends(primary, full, true));
+    }
+
+    #[test]
+    fn guarded_retry_needs_differing_backend_sets() {
+        // Identical sets cannot succeed on retry (explicit pin, GL-only
+        // build, or non-guarded platform): no second attempt anywhere.
+        let same = Backends::VULKAN | Backends::GL;
+        assert!(!should_retry_with_full_backends(same, same, false));
+        assert!(!should_retry_with_full_backends(same, same, true));
     }
 
     #[test]

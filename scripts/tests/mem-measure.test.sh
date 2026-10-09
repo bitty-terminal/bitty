@@ -47,12 +47,17 @@ expect_stdout "250" "$SESSION" --help
 expect_exit 0 "$SESSION" --dry-run --binary /bin/true
 expect_stdout "mem-measure: plan" "$SESSION" --dry-run --binary /bin/true
 expect_stdout "workspace=5" "$SESSION" --dry-run --binary /bin/true
+expect_exit 0 "$SESSION" --dry-run --binary /bin/true --font-size 12.5
 
-# Refusals: unknown flag, bad workspace, bad settle, missing binary.
+# Refusals: unknown flag, bad workspace, bad settle, bad font size, missing binary.
 expect_exit 2 "$SESSION" --bogus-flag
 expect_exit 2 "$SESSION" --dry-run --binary /bin/true --workspace 11
 expect_exit 2 "$SESSION" --dry-run --binary /bin/true --settle-secs 3
 expect_exit 2 "$SESSION" --dry-run --binary /bin/true --settle-secs 61
+expect_exit 2 "$SESSION" --dry-run --binary /bin/true --font-size abc
+expect_exit 2 "$SESSION" --dry-run --binary /bin/true --font-size 0
+expect_exit 2 "$SESSION" --dry-run --binary /bin/true --font-size 129
+expect_exit 2 "$SESSION" --dry-run --binary /bin/true --font-size "12; echo pwned"
 expect_exit 2 "$SESSION" --dry-run --binary /nonexistent-bitty-mem-probe
 
 if [ "$FAIL" != "0" ]; then

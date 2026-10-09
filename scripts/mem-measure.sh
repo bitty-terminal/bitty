@@ -4,9 +4,11 @@
 # Method (matches the #1809 comments): Hyprland-headed single idle shell
 # panel, 12pt, empty scrollback; launch on workspace 5 silent; settle 10 s
 # (ONE sleep, no poll loop); read /proc/PID/status (VmRSS/VmSize/RssAnon/
-# RssFile/RssShmem/Threads) + smaps PSS/USS + pmap -x; one grim shot; kill
-# only the recorded PID (+ recorded direct children, no pkill); restore the
-# previously focused workspace.
+# RssFile/RssShmem/Threads) + smaps PSS/USS + pmap -x; focus the measure
+# workspace for one grim shot, then hand focus back; kill only the recorded
+# PID (matched window PID, else the post-snapshot launch candidate) plus
+# recorded direct children first — no pkill; restore the previously focused
+# workspace.
 #
 # Evidence stays local and uncommitted under --out-dir (default
 # recording/mem, gitignored): status.txt, pss.txt, uss.txt, pmap.txt,
@@ -102,14 +104,13 @@ case "$MEM_WS" in
 *) fail_usage "--workspace must be 1..10" ;;
 esac
 [ -n "$OUT_DIR" ] || fail_usage "--out-dir must not be empty"
-command -v jq >/dev/null 2>&1 || {
-  echo "mem-measure: jq is required" >&2
-  exit 2
-}
-command -v grim >/dev/null 2>&1 || {
-  echo "mem-measure: grim is required" >&2
-  exit 2
-}
+# Point size is interpolated into the Hyprland launch command: restrict the
+# charset first (so the awk range check below cannot break out), then the
+# range to bitty's (0, 128] override domain.
+case "$FONT_SIZE" in
+'' | *[!0-9.]* | .* | *. | *.*.*) fail_usage "--font-size must be a number in (0, 128]" ;;
+esac
+awk "BEGIN{exit !(($FONT_SIZE > 0) && ($FONT_SIZE <= 128))}" || fail_usage "--font-size must be in (0, 128]"
 
 ROOT="$(git rev-parse --show-toplevel)"
 case "$OUT_DIR" in
@@ -142,6 +143,17 @@ if [ "$DRY_RUN" = "1" ]; then
   echo "mem-measure: plan bin=$BIN workspace=$MEM_WS settle=${SETTLE_SECS}s font=${FONT_SIZE}pt out=$RUN_OUT gate_rss_kb=256000"
   exit 0
 fi
+# Headed prerequisites are live-path-only: --dry-run prints the plan on a
+# headless runner without screenshot tooling (the contract test relies on
+# this), while live measurement still refuses to run without them.
+command -v jq >/dev/null 2>&1 || {
+  echo "mem-measure: jq is required" >&2
+  exit 2
+}
+command -v grim >/dev/null 2>&1 || {
+  echo "mem-measure: grim is required" >&2
+  exit 2
+}
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN_DIR="$RUN_OUT/run-$STAMP"
 mkdir -p "$RUN_DIR"
@@ -157,22 +169,69 @@ TARGET_ADDR=""
 PREV_WS="$(hyprctl activeworkspace -j | jq -r .id)"
 echo "mem-measure: prev_ws=$PREV_WS measure_ws=$MEM_WS bin=$BIN run_dir=$RUN_DIR"
 
+# Launch-identity snapshot for the orphan fallback in cleanup(): Hyprland
+# launches detached (no PID back), so record same-basename PIDs before
+# dispatch. Compared by process name (`comm`), never the full command line,
+# so this script's own `--binary` argument cannot self-match. Best-effort
+# for a dev-tool probe: a concurrent unrelated launch inside the settle
+# window could be mistaken, but the empty-workspace refusal keeps that rare.
+BIN_BASE="$(basename "$BIN")"
+PRE_PIDS="$(ps -eo pid=,comm= 2>/dev/null | awk -v want="$BIN_BASE" '$2 == want {print $1}' || true)"
+
 cleanup() {
+  # Resolve the kill target: the matched window PID, else any same-basename
+  # process that appeared after the pre-launch snapshot. A failed window
+  # match leaves TARGET_PID empty; without this the detached launch leaks.
+  KILL_PID="$TARGET_PID"
+  if [ -z "$KILL_PID" ] && [ -n "$BIN_BASE" ]; then
+    CUR_PIDS="$(ps -eo pid=,comm= 2>/dev/null | awk -v want="$BIN_BASE" '$2 == want {print $1}' || true)"
+    # shellcheck disable=SC2086
+    for pid in $CUR_PIDS; do
+      case " $PRE_PIDS " in
+      *" $pid "*) ;;
+      *)
+        KILL_PID="$pid"
+        break
+        ;;
+      esac
+    done
+  fi
   if [ -n "$TARGET_ADDR" ]; then
     if hyprctl clients -j | jq -e --arg a "$TARGET_ADDR" 'any(.[]; .address == $a)' >/dev/null 2>&1; then
       hyprctl dispatch "hl.dsp.window.close({ window = \"address:$TARGET_ADDR\" })" >/dev/null 2>&1 || true
     fi
   fi
-  if [ -n "$TARGET_PID" ] && kill -0 "$TARGET_PID" 2>/dev/null; then
-    kill "$TARGET_PID" 2>/dev/null || true
-    sleep 2
-    if kill -0 "$TARGET_PID" 2>/dev/null; then
-      kill -9 "$TARGET_PID" 2>/dev/null || true
+  if [ -n "$KILL_PID" ]; then
+    # Children before the parent while PPIDs still resolve: prefer the
+    # recorded list (PIDs stay valid after reparenting; a post-kill
+    # `ps --ppid` query would miss survivors), else query live now.
+    CHILDREN=""
+    if [ -f "$RUN_DIR/children.txt" ]; then
+      CHILDREN="$(cat "$RUN_DIR/children.txt" 2>/dev/null || true)"
     fi
-  fi
-  if [ -n "$TARGET_PID" ]; then
-    for orphan in $(ps --ppid "$TARGET_PID" -o pid= 2>/dev/null); do
-      kill "$orphan" 2>/dev/null || true
+    if [ -z "$CHILDREN" ]; then
+      # shellcheck disable=SC2009
+      CHILDREN="$(ps --ppid "$KILL_PID" -o pid= 2>/dev/null || true)"
+    fi
+    # shellcheck disable=SC2086
+    for child in $CHILDREN; do
+      if kill -0 "$child" 2>/dev/null; then
+        kill "$child" 2>/dev/null || true
+      fi
+    done
+    if kill -0 "$KILL_PID" 2>/dev/null; then
+      kill "$KILL_PID" 2>/dev/null || true
+      sleep 2
+      if kill -0 "$KILL_PID" 2>/dev/null; then
+        kill -9 "$KILL_PID" 2>/dev/null || true
+      fi
+    fi
+    # Recorded children that survived TERM get KILL by identity (not PPID).
+    # shellcheck disable=SC2086
+    for child in $CHILDREN; do
+      if kill -0 "$child" 2>/dev/null; then
+        kill -9 "$child" 2>/dev/null || true
+      fi
     done
   fi
   if [ -n "$PREV_WS" ] && [ "$PREV_WS" != "null" ]; then
@@ -181,7 +240,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
-hyprctl dispatch "hl.dsp.exec_cmd('$BIN --font-size $FONT_SIZE', {workspace='$MEM_WS silent'})" >/dev/null
+# Shell-quote the binary for `sh -c` (Hyprland runs exec_cmd through a
+# shell), then present it as a Lua double-quoted string (embedded single
+# quotes need no Lua escape; backslashes and double quotes are escaped).
+# FONT_SIZE is charset/range-validated above and MEM_WS is 1..10, so neither
+# can break out of the Lua string.
+SHELL_QBIN="'${BIN//\'/\'\\\'\'}'"
+LUA_CMD="$(printf '%s' "$SHELL_QBIN --font-size $FONT_SIZE" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+hyprctl dispatch "hl.dsp.exec_cmd(\"$LUA_CMD\", {workspace='$MEM_WS silent'})" >/dev/null
 
 # Single settle sleep: the method. No poll loop.
 sleep "$SETTLE_SECS"
@@ -203,7 +269,13 @@ awk '/^Private_Clean:/{c+=$2} /^Private_Dirty:/{d+=$2} END{print "USS_kB="c+d}' 
 pmap -x "$TARGET_PID" >"$RUN_DIR/pmap.txt" 2>&1 || true
 sort -k3 -n -r "$RUN_DIR/pmap.txt" 2>/dev/null | head -n 25 | tee "$RUN_DIR/topmappings.txt" || true
 cp "/proc/$TARGET_PID/smaps" "$RUN_DIR/smaps.txt"
+# Evidence must show the measured window: the launch used a silent workspace,
+# so a bare grim would capture whatever workspace the operator sits on.
+# Focus the measure workspace for the shot, then hand focus back (the EXIT
+# trap restores PREV_WS again — idempotent).
+hyprctl dispatch "hl.dsp.focus({ workspace = \"$MEM_WS\" })" >/dev/null 2>&1 || true
 grim "$RUN_DIR/shot.png"
+hyprctl dispatch "hl.dsp.focus({ workspace = \"$PREV_WS\" })" >/dev/null 2>&1 || true
 
 RSS_KB="$(awk '/VmRSS:/{print $2}' "$RUN_DIR/status.txt")"
 VSZ_KB="$(awk '/VmSize:/{print $2}' "$RUN_DIR/status.txt")"

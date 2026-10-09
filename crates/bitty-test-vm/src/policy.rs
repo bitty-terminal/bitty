@@ -157,7 +157,8 @@ pub struct Guest {
 /// row). Windows runs under KVM like the other x86_64 guests; its base image
 /// additionally provisions the OpenSSH server and the QEMU guest agent under
 /// a `bitty` account (manual image-prep step; licensing stays an open item
-/// in `specifications/vm-tier-policy.md`). UEFI/OVMF and Hyper-V
+/// in the [testing-infrastructure](https://github.com/bitty-terminal/bitty-docs/blob/main/docs/development/testing-infrastructure.md)
+/// VM-tier sections). UEFI/OVMF and Hyper-V
 /// enlightenment tuning are follow-up work, recorded in the same document.
 pub const GUESTS: &[Guest] = &[
     Guest {

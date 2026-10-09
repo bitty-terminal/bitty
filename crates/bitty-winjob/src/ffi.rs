@@ -1,7 +1,7 @@
 //! Every `unsafe` block of `bitty-winjob`: the raw Win32 calls behind the
 //! safe [`crate::JobObject`] adapter (CTX-0903, DEC-0083).
 //!
-//! # Boundary rules (audited in `specifications/unsafe-ffi-audit.md`)
+//! # Boundary rules (audited in the [evidence-matrix R-018 row](https://github.com/bitty-terminal/bitty-docs/blob/main/docs/security/evidence-matrix.md))
 //!
 //! - Inputs are only pids, exit codes, and handles this module created and
 //!   owns as [`OwnedHandle`] (or borrows through [`BorrowedHandle`]); there

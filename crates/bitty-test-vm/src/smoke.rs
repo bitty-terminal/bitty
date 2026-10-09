@@ -271,7 +271,7 @@ fn overlay_stage(plan: &RunPlan, caps: &Capabilities, opts: &SmokeOptions) -> St
     if !base.is_file() {
         return StageState::Gated(format!(
             "base image not prepared: {} (manual creation from user media is far-future; see \
-             specifications/vm-tier-policy.md)",
+             https://github.com/bitty-terminal/bitty-docs/blob/main/docs/development/testing-infrastructure.md)",
             base.display()
         ));
     }

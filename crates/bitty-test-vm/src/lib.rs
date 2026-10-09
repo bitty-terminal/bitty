@@ -16,7 +16,8 @@
 //!
 //! - It never installs a guest and contains no ISO automation. Base images
 //!   are prepared manually, far-future work, from user-supplied media in
-//!   `$ISO_PATH`; see `specifications/vm-tier-policy.md` in the repository.
+//!   `$ISO_PATH`; see the [testing-infrastructure](https://github.com/bitty-terminal/bitty-docs/blob/main/docs/development/testing-infrastructure.md)
+//!   VM-tier sections.
 //! - It never fakes a live run. `smoke` executes only what the host can
 //!   honestly run (a bounded QEMU accelerator probe, qcow2 overlay
 //!   creation, and — with a prepared base image plus libvirt — the guest

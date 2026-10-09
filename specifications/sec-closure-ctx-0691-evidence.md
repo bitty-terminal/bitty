@@ -74,9 +74,9 @@ verification plus this evidence record only.
   (`Idle` / `Occupied { holder }`), `acquire` / `release` / `handoff`,
   and `LeaseEvent` / `LeaseError`
   (`crates/bitty-runtime/src/execution/lease.rs`), plus the candidate
-  analysis record `specifications/run-21-panel-lease-handoff.md`, which
-  states explicitly that nothing there authorizes write-lease
-  enforcement and that SEC-26 waits on the same OQ-083 ruling.
+  analysis behind the OQ-083 ruling ([oq-ruling-packet-2](https://github.com/bitty-terminal/bitty-docs/blob/main/specifications/oq-ruling-packet-2.md)),
+  which authorizes no write-lease enforcement: SEC-26 waits on the same
+  OQ-083 ruling.
 - Tests: `cargo test -p bitty-runtime --lib lease` gives 11 passed,
   0 failed (round trip, double-acquire refusal, non-holder
   release/handoff refusals, idle refusals, title/description bounds).

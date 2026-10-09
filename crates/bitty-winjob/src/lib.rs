@@ -5,8 +5,9 @@
 //! This crate is to Windows what `rustix` (Linux) and `nix` (macOS) are to
 //! `bitty-pty`'s owned-tree backends: the one place system calls are made,
 //! wrapped in a safe API. Every `unsafe` block lives in the private `ffi`
-//! module, each with a `SAFETY` rationale, and is inventoried in
-//! `specifications/unsafe-ffi-audit.md`. The crate root denies
+//! module, each with a `SAFETY` rationale, and is inventoried in the
+//! [evidence-matrix R-018 row](https://github.com/bitty-terminal/bitty-docs/blob/main/docs/security/evidence-matrix.md).
+//! The crate root denies
 //! `unsafe_code`; only that module is allowed it.
 //!
 //! # Surface (Windows only)

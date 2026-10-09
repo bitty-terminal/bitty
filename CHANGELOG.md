@@ -206,7 +206,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lifetime plumbing (the ConPTY path still uses `JobObject::new()`) and
   supervisor routing still default to `Owned`, so no current job survives
   bitty exit yet. The Win32 FFI lives in the new `bitty-winjob` crate, the
-  second audited `unsafe` allowance (`specifications/unsafe-ffi-audit.md`);
+  second audited `unsafe` allowance ([evidence-matrix R-018](https://github.com/bitty-terminal/bitty-docs/blob/main/docs/security/evidence-matrix.md));
   `bitty-pty` stays `forbid(unsafe_code)`.
   Release order: `bitty-pty` is no longer a dependency-free leaf on Windows
   (it depends on `bitty-winjob` there), so `bitty-winjob` must be published

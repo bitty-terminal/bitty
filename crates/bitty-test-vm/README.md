@@ -3,7 +3,9 @@
 > Part of the `bitty` workspace. Canonical platform documentation lives in
 > `bitty-terminal-docs` (mounted at `docs/`) and shared governance in
 > `bitty-docs`; this file is a crate-local map, not a canonical contract.
-> The normative VM-tier policy is `specifications/vm-tier-policy.md`.
+> The normative VM-tier policy is the VM-tier sections of
+> [testing-infrastructure](https://github.com/bitty-terminal/bitty-docs/blob/main/docs/development/testing-infrastructure.md)
+> in `bitty-docs`.
 
 ## Purpose
 

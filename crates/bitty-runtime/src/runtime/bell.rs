@@ -7,8 +7,8 @@
 //! the policy, the bounds, and the rate limiter; the owning runtime applies them
 //! on the PTY path and the present path.
 //!
-//! Policy summary (owner-pending: `OQ-076`, see
-//! `specifications/bell-notification-policy.md`):
+//! Policy summary (owner-pending: `OQ-076`; canonical notification sections in
+//! the [platform-services contract](https://github.com/bitty-terminal/bitty-terminal-docs/blob/main/specifications/platform-services-contract.md)):
 //!
 //! - **Bell (`BEL`)**: visual flash by default ([`BellMode::Visual`]), never
 //!   audible by default. An audible request rings the installed

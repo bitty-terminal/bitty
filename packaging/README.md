@@ -261,14 +261,14 @@ as the R2 path segment. `VERSION` is the same number without the leading `v`
 Bucket `bitty`. Every key keeps the `bitty/` root prefix so the one shipped
 and verified prefix never moves:
 
-| Prefix                                                             | Class                                 | State                                                    |
-| ------------------------------------------------------------------ | ------------------------------------- | -------------------------------------------------------- |
-| `bitty/releases/<TAG>/<artifact>`                                  | Immutable versioned release payload   | Shipped and verified by the `r2-mirror` job              |
-| `bitty/install/latest.txt`                                         | Mutable stable version pointer        | Published by the `r2-stable` job (new in this task)      |
-| `bitty/install/install.sh`                                         | Mutable stable script object          | Reserved; lands with CTX-1047 Phase 2, same cache policy |
-| `bitty/install/install.ps1`                                        | Mutable stable script object          | Reserved; lands with CTX-1047 Phase 2, same cache policy |
-| `bitty/components/<name>/<version>/<target>.tar.gz` + `SHA256SUMS` | Immutable versioned component payload | Reserved for #1792, not uploaded here                    |
-| `bitty/docs/<version>/<lang>.tar.gz`                               | Immutable versioned docs payload      | Reserved manual track, not uploaded here                 |
+| Prefix                                                             | Class                                 | State                                                                                               |
+| ------------------------------------------------------------------ | ------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `bitty/releases/<TAG>/<artifact>`                                  | Immutable versioned release payload   | Shipped and verified by the `r2-mirror` job                                                         |
+| `bitty/install/latest.txt`                                         | Mutable stable version pointer        | Published by the `r2-stable` job (new in this task)                                                 |
+| `bitty/install/install.sh`                                         | Mutable stable script object          | Reserved; lands with CTX-1047 Phase 2, same cache policy                                            |
+| `bitty/install/install.ps1`                                        | Mutable stable script object          | Reserved; lands with CTX-1047 Phase 2, same cache policy                                            |
+| `bitty/components/<name>/<version>/<target>.tar.gz` + `SHA256SUMS` | Immutable versioned component payload | Packed by `scripts/make-component-dist.sh` (#1792); upload lands with the first shippable component |
+| `bitty/docs/<version>/<lang>.tar.gz`                               | Immutable versioned docs payload      | Reserved manual track, not uploaded here                                                            |
 
 ### CDN key-to-URL mapping
 
@@ -399,3 +399,68 @@ job (needs `r2-mirror`) publishes `latest.txt` with the mutable cache policy
 and read-back-verifies it. `install.sh` and `install.ps1` uploads join
 `r2-stable` when CTX-1047 Phase 2 lands the scripts; their keys and cache
 policy are reserved here so Phase 2 changes no convention.
+
+### Component dist layout (CTX-1063, #1792)
+
+Prebuilt component distribution for machines without cargo and without a Rust
+network stack in `bitty` (the `component install <name>` fetch side is a
+follow-up owned by the plugin-manager two-fleet work; the minimal install
+seed that bootstraps the manager is #1791, not this task). This section ships
+the artifact side only: pack mechanics, manifest generation, and the upload
+contract. It uploads nothing.
+
+`VERSION` is the strict `X.Y.Z` component version from `bitty-component.toml`;
+pack policy takes only the `X.Y.Z` core (no leading zeros, no prerelease or
+build metadata), intentionally narrower than the full semver the installed
+component parser accepts. `TARGET` is the Rust target triple the binary was
+built for. Both segments below are literal; only `NAME`, `VERSION`, and
+`TARGET` vary:
+
+```text
+https://cdn.bitty.run/bitty/components/<name>/<version>/<target>.tar.gz
+https://cdn.bitty.run/bitty/components/<name>/<version>/SHA256SUMS
+```
+
+Worked example (`net`, `0.0.23`, Linux x86_64 glibc):
+
+```text
+https://cdn.bitty.run/bitty/components/net/0.0.23/x86_64-unknown-linux-gnu.tar.gz
+https://cdn.bitty.run/bitty/components/net/0.0.23/SHA256SUMS
+```
+
+Pack one target with `scripts/make-component-dist.sh` (needs only `tar`,
+`gzip`, and `sha256sum` (or `shasum -a 256`)):
+
+```sh
+scripts/make-component-dist.sh --source ./dist/net-stage --version 0.0.23 \
+  --target x86_64-unknown-linux-gnu --binary ./dist/bitty-net \
+  --output ./dist/components/x86_64-unknown-linux-gnu.tar.gz
+scripts/make-component-dist.sh --print-url --name net --version 0.0.23 \
+  --target x86_64-unknown-linux-gnu
+```
+
+The tarball holds exactly two members at the archive root (no wrapper
+directory): the executable `bitty-<name>` (mode 755) and
+`bitty-component.toml`. The client extracts into the version directory it
+creates (`<root>/<name>/<version>/`), so a wrapper directory would nest one
+level too deep. The source descriptor is validated against the installed
+parser rules (closed `[component]` table, `[a-z][a-z0-9-]{0,31}` name,
+descriptor version equal to `--version`, `1 <= protocol min <= max`,
+`executable` equal to `bitty-<name>`, required lowercase-hex `sha256` that
+must match the binary); anything else fails closed before any output is
+written, and the `--output` basename must be `<target>.tar.gz` so the R2 key
+name cannot drift. Each tarball gets a `<target>.tar.gz.sha256` sidecar, and
+the script regenerates the aggregate `SHA256SUMS` over every target tarball
+in the output directory. The `.github/workflows/ci.yml` quality job runs the
+fixture test (`scripts/tests/make-component-dist.test.sh`, also
+`just component-dist-test`), which pins the member list, the digest chain,
+the literal URL templates, and a hostile-URL corpus (traversal, schemes,
+lookalike hosts, non-https bases) refused before any emission.
+
+The future `r2-components` publisher uploads each `<name>/<version>/`
+directory (tarballs, sidecars, `SHA256SUMS`) under `bitty/components/` with
+the immutable cache policy (`public, max-age=31536000, immutable`) and the
+same read-back hash verification `r2-mirror` performs. Versioned component
+prefixes are immutable once published, like `releases/`. The publisher lands
+with the first shippable component; until then no workflow uploads to
+`bitty/components/`.

@@ -999,6 +999,13 @@ pub struct Runtime {
     /// [`Self::notifications_queue_dropped`]; rate refusals additionally
     /// appear in [`Self::bell_rate_dropped`].
     plugin_notifications_dropped: u64,
+    /// Observed `BEL` count for plugin telemetry (issue #1828).
+    ///
+    /// Incremented once per `BEL` on the cold-queue intake path, before the
+    /// user-visible bell policy runs, so `Off` mode still observes the
+    /// signal. Monotonic (saturating); the app diffs it per tick and emits
+    /// at most one coalesced `terminal.bell` per tick.
+    bell_observed: u64,
     // Input/Pointer RFC (CTX-0107) state for single-window slice
     enhanced_keyboard_flags: u32,
     shift_pressed: bool,
@@ -1547,6 +1554,7 @@ impl Runtime {
             notifications_os_delivered: 0,
             notifications_os_undelivered: 0,
             plugin_notifications_dropped: 0,
+            bell_observed: 0,
             enhanced_keyboard_flags: 0,
             shift_pressed: false,
             control_pressed: false,
@@ -1790,6 +1798,7 @@ impl Runtime {
             notifications_os_delivered: 0,
             notifications_os_undelivered: 0,
             plugin_notifications_dropped: 0,
+            bell_observed: 0,
             enhanced_keyboard_flags: 0,
             shift_pressed: false,
             control_pressed: false,
@@ -2613,6 +2622,82 @@ impl Runtime {
     #[must_use]
     pub const fn notifications_os_undelivered(&self) -> u64 {
         self.notifications_os_undelivered
+    }
+
+    /// Observed `BEL` count for plugin telemetry (issue #1828).
+    ///
+    /// Counts every `BEL` the cold-queue intake observes, regardless of
+    /// [`Self::bell_mode`]: `Off` still observes. The app diffs this per
+    /// tick and emits at most one coalesced `terminal.bell` per tick.
+    #[must_use]
+    pub const fn bell_observed(&self) -> u64 {
+        self.bell_observed
+    }
+
+    /// Live PTY-backed terminal identities for plugin telemetry (issue #1828).
+    ///
+    /// Sorted `ViewId.0` values: the primary view when [`Self::has_pty`]
+    /// holds plus every pane session id, deduplicated. `ViewId`s are
+    /// monotonic within a process (never reused), so a diff of two
+    /// snapshots yields stable `terminal.opened` / `terminal.closed` sets.
+    /// Bounded by the live leaf count. Cold-tick path only.
+    #[must_use]
+    pub fn live_terminal_ids(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = Vec::new();
+        if self.has_pty() {
+            if let Some(view) = self.primary_view {
+                ids.push(view.0);
+            }
+        }
+        for view in self.pane_sessions.keys() {
+            ids.push(view.0);
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    /// Current working-directory reports per live terminal (issue #1828).
+    ///
+    /// Sorted `(terminal_id, cwd)` pairs for terminals whose grid reports
+    /// one (`OSC 7`; parser-bounded). Terminals without a report are absent;
+    /// a removed pair means the report cleared or the terminal closed (the
+    /// closed set is authoritative for the latter). Cold-tick path only;
+    /// callers truncate values to their envelope bound before emitting.
+    #[must_use]
+    pub fn terminal_cwds(&self) -> Vec<(u64, String)> {
+        let mut out: Vec<(u64, String)> = Vec::new();
+        if self.has_pty() {
+            if let Some(view) = self.primary_view {
+                if !self.pane_sessions.contains_key(&view) {
+                    if let Some(cwd) = self.state.cwd_report() {
+                        out.push((view.0, cwd.to_owned()));
+                    }
+                }
+            }
+        }
+        for (view, sess) in &self.pane_sessions {
+            if let Some(cwd) = sess.state.cwd_report() {
+                out.push((view.0, cwd.to_owned()));
+            }
+        }
+        out.sort_by_key(|(id, _)| *id);
+        out
+    }
+
+    /// Current working directory of the primary grid, when reported.
+    #[must_use]
+    pub fn primary_cwd(&self) -> Option<String> {
+        self.state.cwd_report().map(str::to_owned)
+    }
+
+    /// Current working directory of one pane session, when reported.
+    #[must_use]
+    pub fn pane_cwd(&self, view: &ViewId) -> Option<String> {
+        self.pane_sessions
+            .get(view)
+            .and_then(|sess| sess.state.cwd_report())
+            .map(str::to_owned)
     }
 
     /// Promotes the next queued notification to the visible banner once the

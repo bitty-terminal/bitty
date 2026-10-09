@@ -7080,3 +7080,189 @@ fn lua_result_summary_is_bounded_and_readable() {
     assert!(rendered.contains("{...}"), "depth must cap, got {rendered}");
     assert!(rendered.chars().count() <= 512);
 }
+
+// ---------------------------------------------------------------------------
+// Issue #1828: live-PTY session records the PTY-gated trace kinds
+// ---------------------------------------------------------------------------
+
+/// Builds a two-leaf headless app wired to a tracer declaring the nine
+/// devtools kinds. The trace starts unfiltered (`nil` opts) and baselines on
+/// one tick. Returns the app, tracer id, plugin root, and data dir.
+#[cfg(unix)]
+fn trace1828_live_app() -> (TerminalApp, String, std::path::PathBuf, std::path::PathBuf) {
+    use bitty_runtime::plugin_runtime::{
+        EmptySettings, LuaValue, PluginRuntime, PluginRuntimeConfig, SnapshotSource,
+    };
+
+    struct NoSnapshot;
+    impl SnapshotSource for NoSnapshot {
+        fn snapshot(&self, _scope: &str) -> Result<LuaValue, bitty_lua::BridgeError> {
+            Err(bitty_lua::BridgeError::capability_denied(
+                "terminal.semantic-read",
+            ))
+        }
+    }
+
+    const ID: &str = "bitty-featured.trace-1828-live";
+    let tag = format!("trace1828live-{}", std::process::id());
+    let root = std::env::temp_dir().join(format!("bitty-{tag}-root"));
+    let data = std::env::temp_dir().join(format!("bitty-{tag}-data"));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&data);
+    let plugin_dir = root.join(ID);
+    std::fs::create_dir_all(plugin_dir.join("lua")).expect("dirs");
+    std::fs::write(
+        plugin_dir.join("bitty-plugin.toml"),
+        format!(
+            concat!(
+                "[plugin]\n",
+                "id = \"{id}\"\n",
+                "name = \"Trace 1828 live\"\n",
+                "version = \"0.1.0\"\n",
+                "description = \"trace test\"\n",
+                "\n",
+                "[compat]\n",
+                "plugin-api = \"^1.0\"\n",
+                "\n",
+                "[capabilities]\n",
+                "debug.trace = true\n",
+                "\n",
+                "[lazy]\n",
+                "commands = [\"{id}:start\", \"{id}:drain\"]\n",
+                "events = [\"terminal.opened\", \"terminal.closed\", ",
+                "\"terminal.title-changed\", \"terminal.cwd-changed\", \"terminal.bell\", ",
+                "\"focus.changed\", \"selection.changed\", \"process.exited\", ",
+                "\"config.reloaded\"]\n",
+            ),
+            id = ID,
+        ),
+    )
+    .expect("manifest");
+    std::fs::write(
+        plugin_dir.join("lua/init.lua"),
+        r#"
+local handle = nil
+bitty.commands.register({
+  id = "start",
+  title = "Start trace",
+  run = function()
+    handle = bitty.debug.trace(nil)
+    return tostring(handle)
+  end,
+})
+bitty.commands.register({
+  id = "drain",
+  title = "Drain trace",
+  run = function()
+    local result = bitty.debug.trace_get(handle)
+    if result == nil then return "NIL" end
+    local out = {}
+    for _, record in ipairs(result.records) do out[#out + 1] = record.topic end
+    return table.concat(out, ",")
+  end,
+})
+"#,
+    )
+    .expect("init");
+    let mut plugin_runtime = PluginRuntime::new(PluginRuntimeConfig {
+        safe_mode: false,
+        data_dir: Some(data.clone()),
+        store_root: None,
+        bundled_roots: Vec::new(),
+        third_party_roots: vec![root.clone()],
+        settings: std::rc::Rc::new(EmptySettings),
+        snapshot: std::rc::Rc::new(NoSnapshot),
+    });
+    plugin_runtime.set_store_backend(Some(std::sync::Arc::new(
+        crate::storage_backends::StorageKvBackend::new(),
+    )));
+    plugin_runtime.discover();
+    let pid = bitty_plugin_host::manifest::PluginId::new(ID).expect("valid id");
+    plugin_runtime.activate(&pid).expect("activate");
+    let mut app = editor_test_app();
+    app = app.with_plugin_runtime(Some(plugin_runtime));
+    (app, ID.to_string(), root, data)
+}
+
+#[cfg(unix)]
+fn trace1828_dispatch(app: &mut TerminalApp, id: &str, command: &str) -> String {
+    use bitty_runtime::plugin_runtime::LuaValue;
+    let pid = bitty_plugin_host::manifest::PluginId::new(id).expect("valid id");
+    match app
+        .plugin_runtime
+        .as_mut()
+        .expect("plugin runtime")
+        .dispatch_command(&pid, command, &[])
+    {
+        Ok(LuaValue::String(s)) => s,
+        Ok(other) => panic!("{command}: expected string, got {other:?}"),
+        Err(error) => panic!("{command}: dispatch failed: {error:?}"),
+    }
+}
+
+/// Issue #1828 acceptance on a real host: a scripted live-PTY session records
+/// every PTY-gated kind (`terminal.opened`, `terminal.cwd-changed`,
+/// `terminal.bell`, `selection.changed`, `process.exited`,
+/// `terminal.closed`) in a devtools-like trace. The wait for the exiting
+/// child is a bounded spin over non-blocking polls (no sleep): the `exit 3`
+/// child is short-lived and the cap fails the test instead of hanging.
+#[test]
+#[cfg(unix)]
+fn trace_kinds_live_pty_session_records() {
+    require_pty!();
+    let (mut app, id, root, data) = trace1828_live_app();
+    assert_eq!(trace1828_dispatch(&mut app, &id, "start"), "1");
+    // Baseline: no shells yet, so no terminals and nothing fires.
+    let _ = app.drive_tick();
+    assert_eq!(trace1828_dispatch(&mut app, &id, "drain"), "");
+
+    // An immediately exiting shell in split pane 2 opens a terminal.
+    let script = write_fake_editor("exit1828", "#!/bin/sh\nexit 3\n");
+    let script_arg = script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell_for_view_in(ViewId::new(2), script_arg.as_str(), &[], 80, 24, None)
+        .expect("spawn pane shell");
+    let _ = app.drive_tick();
+
+    // Pane-grid signals through the real parser path: OSC 7 cwd and BEL.
+    app.runtime
+        .handle_pane_bytes(ViewId::new(2), b"\x1b]7;file:///tmp/trace1828\x07");
+    app.runtime.handle_pty_bytes(b"\x07");
+    app.runtime.select_all();
+    let _ = app.drive_tick();
+
+    // Bounded spin (no sleep) until the reap path observes the exit and
+    // queues the `process.exited` edge while closing the pane.
+    let mut outcome = crate::terminal_app::ShellExitOutcome::NoExit;
+    for _ in 0..200_000 {
+        let _ = app.poll_pty_pump();
+        outcome = app.reap_exited_shells();
+        if outcome != crate::terminal_app::ShellExitOutcome::NoExit {
+            break;
+        }
+    }
+    assert_eq!(
+        outcome,
+        crate::terminal_app::ShellExitOutcome::PaneClosed,
+        "the exit-3 pane shell must be reaped"
+    );
+    let _ = app.drive_tick();
+
+    let drained = trace1828_dispatch(&mut app, &id, "drain");
+    for kind in [
+        "terminal.opened",
+        "terminal.cwd-changed",
+        "terminal.bell",
+        "selection.changed",
+        "process.exited",
+        "terminal.closed",
+    ] {
+        assert!(
+            drained.split(',').any(|topic| topic == kind),
+            "live trace must record {kind}; drained: {drained}"
+        );
+    }
+    let _ = std::fs::remove_file(&script);
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&data);
+}

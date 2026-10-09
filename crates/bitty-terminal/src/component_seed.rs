@@ -102,6 +102,15 @@ pub const SEED_MANIFEST_LINE_MAX_BYTES: usize = 1024;
 /// Maximum bytes of `curl` stderr kept for a fetch diagnostic.
 pub const SEED_FETCH_STDERR_MAX_BYTES: usize = 512;
 
+/// Connect timeout in seconds for seed `curl` fetches (`--connect-timeout`).
+/// Bounds TCP/TLS/proxy setup so a stalled network fails closed instead of
+/// hanging `install` silently.
+pub const SEED_CURL_CONNECT_TIMEOUT_SECS: u64 = 15;
+
+/// Total timeout in seconds for seed `curl` fetches (`--max-time`). Bounds
+/// the whole transfer so `Command::output()` always returns.
+pub const SEED_CURL_MAX_TIME_SECS: u64 = 120;
+
 /// Maximum bytes of `tar -tzf` output parsed for the member audit.
 pub const SEED_TAR_LIST_MAX_BYTES: usize = 8192;
 
@@ -368,7 +377,10 @@ impl SystemTransport {
     /// pins): `--fail` (HTTP errors are failures, never staged error
     /// pages), `--silent --show-error` (quiet unless failing), `--location`
     /// (CDN redirects), `--proto =https` (redirects stay on https even if
-    /// the URL audit were ever bypassed), `--max-filesize` (client-side
+    /// the URL audit were ever bypassed), `--connect-timeout` (bounded
+    /// TCP/TLS/proxy setup) and `--max-time` (bounded total transfer, so
+    /// `run_tool` cannot wait indefinitely on a stalled network),
+    /// `--max-filesize` (client-side
     /// bound), `--output` (no stdout pipe, no truncation surprises).
     fn curl_argv(url: &str, dest: &Path, max_bytes: u64) -> Vec<String> {
         vec![
@@ -378,6 +390,10 @@ impl SystemTransport {
             "--location".to_string(),
             "--proto".to_string(),
             "=https".to_string(),
+            "--connect-timeout".to_string(),
+            SEED_CURL_CONNECT_TIMEOUT_SECS.to_string(),
+            "--max-time".to_string(),
+            SEED_CURL_MAX_TIME_SECS.to_string(),
             "--max-filesize".to_string(),
             max_bytes.to_string(),
             "--output".to_string(),
@@ -1307,6 +1323,10 @@ mod tests {
                 "--location",
                 "--proto",
                 "=https",
+                "--connect-timeout",
+                "15",
+                "--max-time",
+                "120",
                 "--max-filesize",
                 "123",
                 "--output",
@@ -1317,6 +1337,12 @@ mod tests {
             .map(str::to_string)
             .collect::<Vec<_>>()
         );
+        // Bounded fetch: a stalled network/proxy fails closed instead of
+        // hanging `install` silently in `Command::output()`.
+        assert!(argv.contains(&"--connect-timeout".to_string()));
+        assert!(argv.contains(&SEED_CURL_CONNECT_TIMEOUT_SECS.to_string()));
+        assert!(argv.contains(&"--max-time".to_string()));
+        assert!(argv.contains(&SEED_CURL_MAX_TIME_SECS.to_string()));
         // No shell anywhere: a single argv vector with no shell program
         // or `-c` flag, the audited URL as one final element.
         assert!(

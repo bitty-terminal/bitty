@@ -89,7 +89,7 @@ pub fn shell_list() -> String {
 /// Test-only single source: [`completion_commands`] plus the per-script test
 /// keep every static script in sync with this table.
 #[cfg(test)]
-const COMPLETION_COMMANDS: &str = "run ctl config cfg plugin component list ls inspect dev doctor cmd x completion comp version init";
+const COMPLETION_COMMANDS: &str = "run ctl config cfg plugin component list ls inspect dev doctor cmd x completion comp version init shell-init";
 
 /// Static global flags completed by every script.
 #[cfg(test)]
@@ -108,7 +108,7 @@ const BASH_SCRIPT: &str = r#"# bitty completion for Bash (static v1 core tree; g
 # Install: bitty completion bash >> ~/.bash_completion
 _bitty_complete() {
     local cur cmds flags
-    cmds="run ctl config cfg plugin component list ls inspect dev doctor cmd x completion comp version init"
+    cmds="run ctl config cfg plugin component list ls inspect dev doctor cmd x completion comp version init shell-init"
     flags="--help --version --verbose --log-level --headless --test-mode --safe --fail-loud --mascot --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius"
     cur="${COMP_WORDS[COMP_CWORD]}"
     if [[ "$cur" == -* ]]; then
@@ -126,7 +126,7 @@ const ZSH_SCRIPT: &str = r#"#compdef bitty
 # Install: bitty completion zsh > ~/.zsh/completions/_bitty
 _bitty() {
     local -a cmds flags
-    cmds=(run ctl config cfg plugin component list ls inspect dev doctor cmd x completion comp version init)
+    cmds=(run ctl config cfg plugin component list ls inspect dev doctor cmd x completion comp version init shell-init)
     flags=(--help --version --verbose --log-level --headless --test-mode --safe --fail-loud --mascot --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius)
     _arguments -C '1: :->cmd' '*: :->args'
     case "$state" in
@@ -140,7 +140,7 @@ _bitty "$@"
 /// Fish completion script (static core tree).
 const FISH_SCRIPT: &str = r#"# bitty completion for Fish (static v1 core tree; generated, do not edit).
 # Install: bitty completion fish > ~/.config/fish/completions/bitty.fish
-for cmd in run ctl config cfg plugin component list ls inspect dev doctor cmd x completion comp version init
+for cmd in run ctl config cfg plugin component list ls inspect dev doctor cmd x completion comp version init shell-init
     complete -c bitty -f -n __fish_use_subcommand -a $cmd
 end
 for flag in --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --mascot --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius
@@ -153,7 +153,7 @@ const POWERSHELL_SCRIPT: &str = r#"# bitty completion for PowerShell (static v1 
 # Install: bitty completion powershell | Out-String | Invoke-Expression
 Register-ArgumentCompleter -Native -CommandName @('bitty') -ScriptBlock {
     param($wordToComplete, $commandAst, $cursorPosition)
-    $cmds = @('run','ctl','config','cfg','plugin','component','list','ls','inspect','dev','doctor','cmd','x','completion','comp','version','init')
+    $cmds = @('run','ctl','config','cfg','plugin','component','list','ls','inspect','dev','doctor','cmd','x','completion','comp','version','init','shell-init')
     $flags = @('--help','--version','--verbose','--log-level','--headless','--test-mode','--safe','--fail-loud','--mascot','--no-splash','--split','--split-ratio','--stack','--overlay','--layout','--focus','--config','--profile','--theme','--font-family','--font-size','--opacity','--format','--socket','--instance','--no-color','--yes','--force','--scrollback','--close-confirm','--gaps-in','--gaps-out','--border','--radius')
     $pool = if ($wordToComplete.StartsWith('-')) { $flags } else { $cmds }
     $pool | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
@@ -166,7 +166,7 @@ Register-ArgumentCompleter -Native -CommandName @('bitty') -ScriptBlock {
 const NUSHELL_SCRIPT: &str = r#"# bitty completion for Nushell (static v1 core tree; generated, do not edit).
 # Install: bitty completion nushell | save -f ~/.config/nushell/completions-bitty.nu
 def "nu-complete bitty commands" [] {
-    [run ctl config cfg plugin component list ls inspect dev doctor cmd x completion comp version init]
+    [run ctl config cfg plugin component list ls inspect dev doctor cmd x completion comp version init shell-init]
 }
 def "nu-complete bitty flags" [] {
     [--help --version --verbose --log-level --headless --test-mode --safe --fail-loud --mascot --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius]

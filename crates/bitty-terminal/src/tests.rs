@@ -4879,6 +4879,118 @@ fn init_wizard_up_history_in_prompts() {
     assert_eq!(answers.gaps_out, 10);
 }
 
+// -- `bitty init` wizard display-vs-submitted redraw (#1821) -----------------
+//
+// On a canonical TTY the kernel echoes the raw typed bytes (including the
+// `ESC [` sequences arrows/DEL/HOME/END emit) while the submitted answer is
+// the decoded value, so the screen can show `ab^[[Dc` while the wizard
+// accepts `acb`. Every prompt redraws the decoded value to `output` (the
+// terminal at runtime) whenever decoding changed anything, so the display
+// always carries the submitted answer. Plain input redraws nothing.
+
+#[test]
+fn init_wizard_plain_input_redraws_nothing() {
+    // Eleven Enters: no escape bytes anywhere, so no redraw marker.
+    let (result, printed) = drive_init_wizard("\n\n\n\n\n\n\n\n\n\n\n", Some("/bin/bash"), None);
+    result.expect("defaults accepted");
+    assert!(
+        !printed.contains("(read as "),
+        "plain input must not redraw, got:\n{printed}"
+    );
+}
+
+#[test]
+fn init_wizard_redraw_shows_edited_answer() {
+    // `ab`, Left, `c` submits `acb`; the redraw carries the submitted value
+    // so the display matches it instead of the raw kernel echo.
+    let (result, printed) =
+        drive_init_wizard("\n\nab\x1b[Dc\n\n\n\n\n\n\n\n\n", Some("/bin/bash"), None);
+    let answers = result.expect("edited answer accepted");
+    assert_eq!(answers.font_family, "acb");
+    assert!(
+        printed.contains("(read as \"acb\")"),
+        "redraw must show the submitted answer, got:\n{printed}"
+    );
+}
+
+#[test]
+fn init_wizard_redraw_shows_recalled_history() {
+    // `gaps_out` recalls `10` via Up: the submitted history value was never
+    // echoed by the kernel, so the redraw must show it.
+    let stdin = "\n\n\n\n10\n\x1b[A\n\n\n\n\n\n";
+    let (result, printed) = drive_init_wizard(stdin, Some("/bin/bash"), None);
+    let answers = result.expect("history recall accepted");
+    assert_eq!(answers.gaps_out, 10);
+    assert!(
+        printed.contains("(read as \"10\")"),
+        "redraw must show the recalled answer, got:\n{printed}"
+    );
+}
+
+#[test]
+fn init_wizard_redraw_precedes_validation_retry() {
+    // An edited but invalid font size redraws the decoded attempt before the
+    // retry message, so the user sees what failed validation.
+    let stdin = "\n\n\n1\x1b[Cx\n12\n\n\n\n\n\n\n\n";
+    let (result, printed) = drive_init_wizard(stdin, Some("/bin/bash"), None);
+    let answers = result.expect("retry accepted");
+    assert!((answers.font_size - 12.0).abs() < f32::EPSILON);
+    assert!(
+        printed.contains("try again"),
+        "retry message expected, got:\n{printed}"
+    );
+    assert!(
+        printed.contains("(read as \"1x\")"),
+        "redraw must show the decoded attempt, got:\n{printed}"
+    );
+}
+
+#[test]
+fn init_line_needs_redraw_flags_decoded_edits() {
+    // Untouched input needs no redraw: the kernel echo already matches.
+    assert!(!crate::init::init_line_needs_redraw(b"hello", "hello"));
+    assert!(!crate::init::init_line_needs_redraw(b"", ""));
+    assert!(!crate::init::init_line_needs_redraw(
+        "héllo".as_bytes(),
+        "héllo"
+    ));
+    // Anything the decoder changed (escape sequences, erase bytes, dropped
+    // controls, truncation) needs a redraw so the display catches up.
+    assert!(crate::init::init_line_needs_redraw(b"ab\x1b[Dc", "acb"));
+    assert!(crate::init::init_line_needs_redraw(b"ab\x7f", "a"));
+    assert!(crate::init::init_line_needs_redraw(b"a\tb", "ab"));
+    assert!(crate::init::init_line_needs_redraw(b"\x1b[A", "recalled"));
+}
+
+// A writer that always fails, standing in for broken terminal output.
+struct FailWrite;
+
+impl std::io::Write for FailWrite {
+    fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("injected output failure"))
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Err(std::io::Error::other("injected output failure"))
+    }
+}
+
+#[test]
+fn init_wizard_redraw_output_error_aborts() {
+    // Fail closed: when the decoded redraw cannot be displayed, the wizard
+    // aborts instead of accepting a value the user never saw.
+    let mut input = std::io::BufReader::new("ab\x1b[Dc\n".as_bytes());
+    let mut output = FailWrite;
+    let mut history = Vec::new();
+    let result: Result<String, String> = crate::init::init_ask(
+        &mut input,
+        &mut output,
+        "Font family [Mono]:",
+        crate::init::init_parse_font_family_answer,
+        &mut history,
+    );
+    assert!(result.is_err(), "output failure must abort the prompt");
+}
+
 #[test]
 fn init_render_default_and_vim() {
     let base = init_yes_defaults(Some("/bin/bash"));

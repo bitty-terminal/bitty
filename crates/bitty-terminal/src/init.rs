@@ -884,17 +884,35 @@ pub(crate) fn init_decode_line_bytes(raw: &[u8], history: &[String]) -> String {
 /// bytes never land in the returned answer.
 #[allow(dead_code)]
 pub(crate) fn init_read_line(input: &mut dyn std::io::BufRead) -> Option<String> {
-    init_read_line_with_history(input, &[])
+    init_read_line_with_history(input, &[]).map(|(_, line)| line)
+}
+
+/// Whether the decoded answer must be redrawn to `output` so the display
+/// matches the submitted value.
+///
+/// On a canonical-mode TTY the kernel echoes the raw typed bytes before this
+/// code ever runs: arrow/history/erase escape sequences (`ESC [ D`, ...),
+/// dropped control bytes, and silently truncated tails all stay on screen
+/// while [`init_decode_line_bytes`] submits something else. Byte-inequality
+/// between the cooked line and the decoded answer is exactly that case, so
+/// a redraw is needed; identical bytes mean the kernel echo already shows
+/// the submitted value and nothing is printed.
+pub(crate) fn init_line_needs_redraw(raw: &[u8], decoded: &str) -> bool {
+    raw != decoded.as_bytes()
 }
 
 /// [`init_read_line`] with `Up`/`Down` history recall over the previous
 /// successful wizard answers in this run; empty history stays gracefully.
 /// History itself is only appended by [`init_ask`] on successful parses —
 /// reading never mutates it.
+///
+/// Returns the cooked stdin bytes alongside the decoded answer so the caller
+/// can redraw the display when decoding changed what the kernel echoed (see
+/// [`init_line_needs_redraw`]).
 pub(crate) fn init_read_line_with_history(
     input: &mut dyn std::io::BufRead,
     history: &[String],
-) -> Option<String> {
+) -> Option<(Vec<u8>, String)> {
     let mut raw: Vec<u8> = Vec::new();
     match input.read_until(b'\n', &mut raw) {
         Ok(0) => None,
@@ -911,7 +929,8 @@ pub(crate) fn init_read_line_with_history(
             if raw.len() > INIT_MAX_LINE_BYTES + 256 {
                 raw.truncate(INIT_MAX_LINE_BYTES + 256);
             }
-            Some(init_decode_line_bytes(&raw, history))
+            let line = init_decode_line_bytes(&raw, history);
+            Some((raw, line))
         }
         Err(_) => None,
     }
@@ -921,6 +940,12 @@ pub(crate) fn init_read_line_with_history(
 /// Reprompts up to [`INIT_MAX_ATTEMPTS`] on parse errors, then aborts;
 /// EOF aborts immediately. Prompts go to `output` (stdout at runtime) so
 /// piped-stdin runs still show the questions.
+///
+/// Whenever decoding changed what the canonical-TTY kernel echoed (see
+/// [`init_line_needs_redraw`]), the decoded value is redrawn to `output`
+/// before parsing, so the display always carries the submitted answer
+/// instead of the raw echo. A redraw that cannot be written aborts the
+/// prompt fail-closed rather than accepting a value the user never saw.
 ///
 /// `history` carries the previous successful answers in this wizard run
 /// for `Up`/`Down` recall (appended on success only; failed attempts never
@@ -936,20 +961,28 @@ pub(crate) fn init_ask<T>(
         let _ = writeln!(output, "{prompt}");
         let _ = output.flush();
         match init_read_line_with_history(input, history) {
-            Some(line) => match parse(&line) {
-                Ok(value) => {
-                    if !line.is_empty() {
-                        history.push(line);
+            Some((raw, line)) => {
+                if init_line_needs_redraw(&raw, &line)
+                    && (writeln!(output, "  (read as {line:?})").is_err()
+                        || output.flush().is_err())
+                {
+                    return Err("bitty init: aborted (output error)".to_string());
+                }
+                match parse(&line) {
+                    Ok(value) => {
+                        if !line.is_empty() {
+                            history.push(line);
+                        }
+                        return Ok(value);
                     }
-                    return Ok(value);
+                    Err(err) => {
+                        let _ = writeln!(
+                            output,
+                            "  ({err} — try again [{attempt}/{INIT_MAX_ATTEMPTS}])"
+                        );
+                    }
                 }
-                Err(err) => {
-                    let _ = writeln!(
-                        output,
-                        "  ({err} — try again [{attempt}/{INIT_MAX_ATTEMPTS}])"
-                    );
-                }
-            },
+            }
             None => return Err("bitty init: aborted (end of input)".to_string()),
         }
     }

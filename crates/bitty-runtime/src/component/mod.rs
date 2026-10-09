@@ -40,6 +40,26 @@
 //!   the plugin id for attribution. The component re-checks the grant and
 //!   never widens it.
 //!
+//! DIR-030 accepted refinements (2026-10-02) implemented here:
+//!
+//! - D1: on Windows only, [`COMPONENT_ENV_WINDOWS_ALLOWLIST`] (`SystemRoot`)
+//!   is forwarded too.
+//! - D2: every request carries a Core deadline of the effective timeout
+//!   (requested or [`COMPONENT_REQUEST_DEFAULT_TIMEOUT`], clamped to
+//!   [`COMPONENT_REQUEST_MAX_TIMEOUT`]) plus
+//!   [`COMPONENT_REQUEST_DEADLINE_GRACE`]. The effective timeout is
+//!   forwarded as the wire `timeout_ms`. On expiry the request fails with
+//!   `timeout`, `Cancel` is sent, and late frames are discarded;
+//!   [`COMPONENT_DEADLINE_CRASH_THRESHOLD`] consecutive expiries on one
+//!   component take the crash path.
+//! - D3: a requested response budget is clamped to
+//!   [`COMPONENT_MAX_BODY_BYTES_CEILING`].
+//! - D4: on a crash, a handshake failure, or an idle stop, the newest
+//!   [`COMPONENT_STDERR_LOG_TAIL_BYTES`] of the stderr ring are logged at
+//!   warn level with control characters escaped ([`stderr_log_tail`]).
+//! - D5: the executable digest is streamed through a
+//!   [`COMPONENT_DIGEST_BUFFER_BYTES`] buffer.
+//!
 //! The broker is driven by its owner: [`ComponentBroker::submit`] never
 //! blocks on the component, and responses arrive as [`BrokerEvent`]s from
 //! [`ComponentBroker::poll`] / [`ComponentBroker::wait`]. Time is injected
@@ -63,7 +83,8 @@ use std::time::Duration;
 
 pub use broker::{
     BrokerConfig, BrokerError, BrokerEvent, BrokerEventKind, ComponentBroker, ComponentRequest,
-    ComponentState, ComponentStatus, RequestId, StopOutcome,
+    ComponentState, ComponentStatus, ComponentWarnSink, RequestId, StopOutcome,
+    effective_max_body_bytes, effective_timeout,
 };
 pub use descriptor::{
     ComponentDescriptor, DescriptorError, ResolveError, ResolvedComponent, components_root_for,
@@ -77,10 +98,18 @@ pub use inventory::{
     incompatible_component_hint, missing_component_hint, resolve_search,
     system_components_root_for, version_satisfies_caret,
 };
-pub use policy::{CrashTracker, SpawnGate};
-pub use stderr::StderrRing;
+pub use policy::{CrashTracker, DeadlineStrikes, SpawnGate};
+pub use stderr::{StderrRing, stderr_log_tail};
 
 /// Wire codec re-exports the broker API is expressed in.
+///
+/// Deliberate contract exception to the ADR-0004 rule against exposing
+/// upstream types in the public API (crate-level API ownership rule): the rule targets
+/// third-party layers, while `bitty-network-wire` is the first-party
+/// native-component wire contract itself (DIR-030). Re-exporting these types
+/// (and carrying [`bitty_network_wire::WireError`] in
+/// [`BrokerError::InvalidRequest`]) keeps Core and components on one
+/// definition instead of a mirrored copy that could drift.
 pub use bitty_network_wire::{ErrorKind, Grant, GrantHost, Method, PROTOCOL_VERSION};
 
 /// `$XDG_DATA_HOME` or `$HOME/.local/share` from explicit environment
@@ -146,8 +175,39 @@ pub const COMPONENT_ENV_ALLOWLIST: [&str; 10] = [
     "LC_ALL",
 ];
 
+/// Additional environment variables forwarded on Windows only (DIR-030 D1):
+/// Winsock initialization needs `SystemRoot`. `windir` is not forwarded,
+/// and `PATH` still never is. On other platforms this list is not consulted.
+pub const COMPONENT_ENV_WINDOWS_ALLOWLIST: [&str; 1] = ["SystemRoot"];
+
 /// Bounded stderr ring per component (64 KiB, newest bytes kept).
 pub const COMPONENT_STDERR_MAX_BYTES: usize = 64 * 1024;
+
+/// Newest stderr bytes logged at warn level on a crash, a handshake
+/// failure, or an idle stop (DIR-030 D4); stderr is not logged otherwise.
+pub const COMPONENT_STDERR_LOG_TAIL_BYTES: usize = 4 * 1024;
+
+/// Core deadline base when a request asks for no timeout (DIR-030 D2).
+pub const COMPONENT_REQUEST_DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Ceiling for a requested timeout (DIR-030 D2); larger requests are clamped.
+pub const COMPONENT_REQUEST_MAX_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Grace added on top of the effective timeout before Core expires a
+/// request, so the component's own deadline fires first (DIR-030 D2).
+pub const COMPONENT_REQUEST_DEADLINE_GRACE: Duration = Duration::from_secs(5);
+
+/// Consecutive Core deadline expiries on one component that count as one
+/// crash (DIR-030 D2).
+pub const COMPONENT_DEADLINE_CRASH_THRESHOLD: u32 = 3;
+
+/// Ceiling for a requested response body budget (DIR-030 D3); the default
+/// stays the wire default of 8 MiB.
+pub const COMPONENT_MAX_BODY_BYTES_CEILING: u64 = 64 * 1024 * 1024;
+
+/// Fixed read buffer the executable digest is streamed through (DIR-030
+/// D5); the executable is never read into memory as a whole.
+pub const COMPONENT_DIGEST_BUFFER_BYTES: usize = 64 * 1024;
 
 /// Idle time with nothing in flight before Core closes the component stdin.
 pub const COMPONENT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);

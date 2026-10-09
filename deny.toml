@@ -77,7 +77,7 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # `bitty-network-lua` path at d97c5da was removed.
 # bitty-ipc is a first-party extraction target (CTX-1585, bitty#1585) and
 # stays linked as Core's inbound socket mechanism (DIR-030): pulled from the
-# independent bitty-terminal/bitty-ipc repository at an exact rev (e9714e7) by
+# independent bitty-terminal/bitty-ipc repository at an exact rev (a9544ac) by
 # bitty-runtime/bitty-terminal/bitty-rich, following the same
 # adopted-as-git-dependency pattern as bitty-network (CTX-0917). bitty-agent
 # is no longer linked by Core (CTX-0918); it lives in its own repository.

@@ -266,6 +266,14 @@ verify-unix-bundle-dispatch-test:
 macos-dmg-test:
     ./scripts/tests/make-macos-dmg.test.sh
 
+# Static gate for the Windows setup track (CTX-1064 / #1810): ISCC.exe and
+# Windows never run here; the release workflow's windows-installer +
+# verify-windows-installer jobs are the live verifier. This pins the settled
+# decisions (unsigned 0.1.0, shortcuts, registry uninstall, Scoop portable).
+windows-installer-test:
+    ./scripts/check-windows-installer.sh
+    ./scripts/tests/check-windows-installer.test.sh
+
 # Install a package in a clean container and run the version/doctor/headless
 # smoke: `just install-smoke ubuntu dist/bitty-x86_64-unknown-linux-gnu.deb`
 install-smoke distro package:
@@ -299,7 +307,7 @@ commit-check message:
     @cp commitlint.config.ts target/dev-tools/commitlint.config.ts
     @msg="$(realpath "{{message}}")" && cd target/dev-tools && bunx --bun commitlint --edit "$msg"
 
-check: fmt-check clippy test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate test-support-gate status-drift status-drift-test docs-pin-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test install-scripts-test unix-bundle-test macos-dmg-test verify-unix-bundle-dispatch-test rust-channel-test binary-arch-test workflow-publish-test m1-matrix-test compat-matrix-test compat-freshness-test real-render-soak-test dogfood-session-test actionlint markdownlint
+check: fmt-check clippy test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate test-support-gate status-drift status-drift-test docs-pin-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test install-scripts-test unix-bundle-test macos-dmg-test windows-installer-test verify-unix-bundle-dispatch-test rust-channel-test binary-arch-test workflow-publish-test m1-matrix-test compat-matrix-test compat-freshness-test real-render-soak-test dogfood-session-test actionlint markdownlint
 
 # Parser-throughput baseline (CTX-0576, M1-11). Runs the deterministic
 # headless parser benchmark over the committed VT/escape corpora and verifies

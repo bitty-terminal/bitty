@@ -881,7 +881,7 @@ jobs:
           $setup = Get-ChildItem -Path pkg -Filter '*-setup.exe' | Select-Object -First 1
           if (-not $setup) { throw 'setup artifact not found' }
           Write-Host "setup: $($setup.Name)"
-          if ($setup.BaseName -notmatch '^bitty-(?<version>[0-9]+\.[0-9]+\.[0-9]+)-windows-x86_64-setup$') {
+          if ($setup.BaseName -notmatch '^bitty-(?<version>[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.]+)?)-windows-x86_64-setup$') {
             throw "unexpected setup name: $($setup.BaseName)"
           }
           $version = $Matches['version']

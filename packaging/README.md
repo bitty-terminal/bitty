@@ -185,8 +185,8 @@ registry/uninstall scripting for the same bar.
 - Unsigned 0.1.0: no `SignTool` is configured (only a commented stub for the
   post-0.2.0 Azure Trusted Signing / OV revisit per the owner decision on
   #1810). The installer must not claim trust it does not have: SmartScreen
-  shows the standard unsigned warning and the click-through guidance
-  (More info -> Run anyway) lives in the docs. The verify job asserts
+  will show the standard unsigned warning and the click-through guidance
+  (More info -> Run anyway) will live in the docs (see #1866). The verify job asserts
   `Get-AuthenticodeSignature` reports `NotSigned` so a silent signing without
   updating the script and this README fails CI instead of shipping quietly.
 - Artifact: `bitty-<VERSION>-windows-x86_64-setup.exe` plus its `.sha256`
@@ -216,7 +216,7 @@ registry/uninstall scripting for the same bar.
 - windows x64 (`x86_64-pc-windows-msvc`, windows-latest)
 - windows aarch64 (`aarch64-pc-windows-msvc`, windows-latest)
 - windows x64 portable ZIP (`bitty-<version>-windows-x86_64.zip`, `windows-zip` job)
-- windows x64 setup installer (`bitty-<VERSION>-windows-x86_64-setup.exe`, `windows-installer` job; verified by `verify-windows-installer`)
+- windows x64 setup installer (`bitty-<version>-windows-x86_64-setup.exe`, `windows-installer` job; verified by `verify-windows-installer`)
 - macos x64 (`x86_64-apple-darwin`, macos-14)
 - macos aarch64 (`aarch64-apple-darwin`, macos-14)
 - macos Universal 2 (`Bitty-<version>-universal.dmg`, `macos-universal` job)

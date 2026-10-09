@@ -410,8 +410,11 @@ the artifact side only: pack mechanics, manifest generation, and the upload
 contract. It uploads nothing.
 
 `VERSION` is the strict `X.Y.Z` component version from `bitty-component.toml`;
-`TARGET` is the Rust target triple the binary was built for. Both segments
-below are literal; only `NAME`, `VERSION`, and `TARGET` vary:
+pack policy takes only the `X.Y.Z` core (no leading zeros, no prerelease or
+build metadata), intentionally narrower than the full semver the installed
+component parser accepts. `TARGET` is the Rust target triple the binary was
+built for. Both segments below are literal; only `NAME`, `VERSION`, and
+`TARGET` vary:
 
 ```text
 https://cdn.bitty.run/bitty/components/<name>/<version>/<target>.tar.gz
@@ -426,7 +429,7 @@ https://cdn.bitty.run/bitty/components/net/0.0.23/SHA256SUMS
 ```
 
 Pack one target with `scripts/make-component-dist.sh` (needs only `tar`,
-`gzip`, and `sha256sum`):
+`gzip`, and `sha256sum` (or `shasum -a 256`)):
 
 ```sh
 scripts/make-component-dist.sh --source ./dist/net-stage --version 0.0.23 \
@@ -443,7 +446,7 @@ creates (`<root>/<name>/<version>/`), so a wrapper directory would nest one
 level too deep. The source descriptor is validated against the installed
 parser rules (closed `[component]` table, `[a-z][a-z0-9-]{0,31}` name,
 descriptor version equal to `--version`, `1 <= protocol min <= max`,
-`executable` equal to `bitty-<name>`, optional lowercase-hex `sha256` that
+`executable` equal to `bitty-<name>`, required lowercase-hex `sha256` that
 must match the binary); anything else fails closed before any output is
 written, and the `--output` basename must be `<target>.tar.gz` so the R2 key
 name cannot drift. Each tarball gets a `<target>.tar.gz.sha256` sidecar, and

@@ -34,6 +34,13 @@ if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1
   echo "SKIP: no sha256 tool found"
   exit 0
 fi
+# One detected tool for every digest call below (mirrors the script under
+# test, which accepts shasum-only hosts such as macOS).
+if command -v sha256sum >/dev/null 2>&1; then
+  SHA256SUM="sha256sum"
+else
+  SHA256SUM="shasum -a 256"
+fi
 
 TMP_BASE="$(mktemp -d "${TMPDIR:-/tmp}/make-component-dist-test.XXXXXX")"
 cleanup() {
@@ -53,17 +60,16 @@ mkdir -p "$SRC" "$OUT"
 # Fake executable: reports the fixture version when run.
 printf '#!/bin/sh\necho "bitty-net %s"\n' "$VERSION" >"$SRC/bitty-net"
 chmod +x "$SRC/bitty-net"
+BIN_DIGEST="$($SHA256SUM "$SRC/bitty-net" | cut -d' ' -f1)"
 
-write_descriptor() { # [extra lines...] — base valid descriptor plus extras
+write_descriptor() { # base valid descriptor (name/version/protocol/executable/sha256)
   {
     echo "[component]"
     echo "name = \"$NAME\""
     echo "version = \"$VERSION\""
     echo "protocol = [1, 1]"
     echo "executable = \"bitty-$NAME\""
-    for extra in "$@"; do
-      printf '%s\n' "$extra"
-    done
+    echo "sha256 = \"$BIN_DIGEST\""
   } >"$SRC/bitty-component.toml"
 }
 
@@ -101,7 +107,7 @@ $ACTUAL"
 fi
 
 # --- sidecar matches the tarball digest (GNU sha256sum format) ---
-WANT="$(sha256sum "$OUT/$TARGET.tar.gz" | cut -d' ' -f1)"
+WANT="$($SHA256SUM "$OUT/$TARGET.tar.gz" | cut -d' ' -f1)"
 GOT="$(cut -d' ' -f1 "$OUT/$TARGET.tar.gz.sha256")"
 if [[ "$WANT" == "$GOT" ]]; then
   pass "sidecar digest matches the tarball"
@@ -110,7 +116,7 @@ else
 fi
 
 # --- aggregate manifest verifies ---
-if (cd "$OUT" && sha256sum -c SHA256SUMS >/dev/null 2>&1); then
+if (cd "$OUT" && $SHA256SUM -c SHA256SUMS >/dev/null 2>&1); then
   pass "SHA256SUMS verifies"
 else
   fail "SHA256SUMS failed to verify"
@@ -118,7 +124,7 @@ fi
 
 # --- a tampered tarball breaks the manifest ---
 printf 'tamper' >>"$OUT/$TARGET.tar.gz"
-if (cd "$OUT" && sha256sum -c SHA256SUMS >/dev/null 2>&1); then
+if (cd "$OUT" && $SHA256SUM -c SHA256SUMS >/dev/null 2>&1); then
   fail "tampered tarball still verifies"
 else
   pass "tampered tarball breaks SHA256SUMS"
@@ -161,16 +167,8 @@ else
   fail "version mismatch: $BIN_OUT"
 fi
 
-# --- descriptor with a correct sha256 is accepted ---
-GOOD_DIGEST="$(sha256sum "$SRC/bitty-net" | cut -d' ' -f1)"
-write_descriptor "sha256 = \"$GOOD_DIGEST\""
-if "$SCRIPT" --source "$SRC" --version "$VERSION" --target "$TARGET" \
-  --binary "$SRC/bitty-net" --output "$OUT/$TARGET.tar.gz" >/dev/null 2>&1; then
-  pass "descriptor with matching sha256 accepted"
-else
-  fail "descriptor with matching sha256 refused"
-fi
-write_descriptor
+# The base descriptor already carries the matching sha256, so every pack
+# leg above is the positive digest case; only refusal legs remain below.
 
 # --- argument and descriptor validation failures (fail closed) ---
 expect_fail() {
@@ -228,6 +226,9 @@ expect_bad_descriptor "sha256 mismatch" \
   "[component]" "name = \"$NAME\"" "version = \"$VERSION\"" \
   "protocol = [1, 1]" "executable = \"bitty-$NAME\"" \
   "sha256 = \"0000000000000000000000000000000000000000000000000000000000000000\""
+expect_bad_descriptor "missing sha256" \
+  "[component]" "name = \"$NAME\"" "version = \"$VERSION\"" \
+  "protocol = [1, 1]" "executable = \"bitty-$NAME\""
 expect_bad_descriptor "missing protocol" \
   "[component]" "name = \"$NAME\"" "version = \"$VERSION\"" \
   "executable = \"bitty-$NAME\""
@@ -268,6 +269,8 @@ expect_bad_url "uppercase name" --name "Net" --version 0.0.23 --target "$TARGET"
 expect_bad_url "name with space" --name "ne t" --version 0.0.23 --target "$TARGET"
 expect_bad_url "empty name" --name "" --version 0.0.23 --target "$TARGET"
 expect_bad_url "v-prefixed version" --name net --version v0.0.23 --target "$TARGET"
+expect_bad_url "leading-zero version" --name net --version 01.02.03 --target "$TARGET"
+expect_bad_url "prerelease version (pack takes X.Y.Z core only)" --name net --version 1.0.0-alpha --target "$TARGET"
 expect_bad_url "version with slash" --name net --version "0.0.23/../../evil" --target "$TARGET"
 expect_bad_url "version with query" --name net --version "0.0.23?x=1" --target "$TARGET"
 expect_bad_url "target with pipe" --name net --version 0.0.23 --target "x86_64|evil"

@@ -16,13 +16,19 @@
 # level too deep. Member order is fixed (descriptor first, then the
 # executable) so the archive layout is stable.
 #
-# The source descriptor is validated against the same rules as the installed
-# parser (`crates/bitty-runtime/src/component/descriptor.rs`): closed
-# `[component]` table, `name` matching `[a-z][a-z0-9-]{0,31}`, strict semver
-# `version` equal to `--version`, `protocol = [min, max]` with
-# `1 <= min <= max`, `executable` equal to `bitty-<name>`, and an optional
-# lowercase-hex `sha256` that must match the binary when present. Anything
-# else fails closed before any output is written.
+# The source descriptor is validated against the installed parser rules
+# (`crates/bitty-runtime/src/component/descriptor.rs`): closed
+# `[component]` table, `name` matching `[a-z][a-z0-9-]{0,31}`, `version`
+# equal to `--version`, `protocol = [min, max]` with `1 <= min <= max`,
+# `executable` equal to `bitty-<name>`, and a required lowercase-hex
+# `sha256` that must match the binary. Anything else fails closed before
+# any output is written.
+#
+# Pack version policy is intentionally narrower than the installed parser:
+# only the strict `X.Y.Z` core (no leading zeros, no prerelease or build
+# metadata) is accepted here, while the parser takes full semver. A
+# prerelease descriptor the client would install is refused at pack time
+# by policy, never silently repackaged.
 #
 # `--print-url` is a pure mapping (no spawn, no filesystem writes): it
 # validates its inputs against the same allowlist and prints the tarball URL
@@ -81,8 +87,20 @@ valid_name() {
   [[ "$1" =~ ^[a-z][a-z0-9-]{0,31}$ ]]
 }
 
+# Intentional pack policy: strict X.Y.Z core only (no prerelease/build),
+# narrower than the installed parser's full semver (see header). Leading
+# zeros and out-of-u32 components are rejected like Version::parse.
 valid_version() {
-  [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+  [[ "${#1}" -le 64 ]] || return 1
+  [[ "$1" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || return 1
+  local part
+  for part in "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"; do
+    [[ "${#part}" -gt 10 ]] && return 1
+    # Ten-digit parts have no leading zero (see the regex above), so -gt
+    # is octal-safe here; u32 max is 4294967295.
+    [[ "${#part}" -eq 10 && "$part" -gt 4294967295 ]] && return 1
+  done
+  return 0
 }
 
 valid_target() {
@@ -269,15 +287,14 @@ if [[ "$DESC_PROTOCOL_MIN" -lt 1 || "$DESC_PROTOCOL_MIN" -gt 65535 || "$DESC_PRO
 fi
 [[ "$DESC_PROTOCOL_MIN" -le "$DESC_PROTOCOL_MAX" ]] || die "source descriptor protocol min exceeds max: [$DESC_PROTOCOL_MIN, $DESC_PROTOCOL_MAX]"
 [[ "$DESC_EXECUTABLE" == "$EXECUTABLE_PREFIX$DESC_NAME" ]] || die "source descriptor executable must be $EXECUTABLE_PREFIX$DESC_NAME, got: $DESC_EXECUTABLE"
-if [[ -n "$DESC_SHA256" ]]; then
-  [[ "$DESC_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "source descriptor sha256 must be 64 lowercase hex characters"
-fi
+[[ -n "$DESC_SHA256" ]] || die "source descriptor is missing 'sha256'"
+[[ "$DESC_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "source descriptor sha256 must be 64 lowercase hex characters"
 
 BIN_SIZE="$(wc -c <"$BINARY" | tr -d ' ')"
 [[ "$BIN_SIZE" -gt 0 ]] || die "--binary is empty: $BINARY"
 [[ "$BIN_SIZE" -le "$EXE_MAX_BYTES" ]] || die "--binary exceeds $EXE_MAX_BYTES bytes: $BINARY"
 BIN_DIGEST="$($SHA256SUM "$BINARY" | cut -d' ' -f1)"
-if [[ -n "$DESC_SHA256" && "$DESC_SHA256" != "$BIN_DIGEST" ]]; then
+if [[ "$DESC_SHA256" != "$BIN_DIGEST" ]]; then
   die "source descriptor sha256 $DESC_SHA256 does not match computed digest $BIN_DIGEST for $BINARY"
 fi
 

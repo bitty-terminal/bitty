@@ -153,7 +153,7 @@ pub fn guest_prereqs(plan: &RunPlan, caps: &Capabilities) -> Result<GuestTools, 
     let base = plan.base_image();
     if !base.is_file() {
         return Err(format!(
-            "base image not prepared: {} (manual creation from user media is far-future; see specifications/vm-tier-policy.md)",
+            "base image not prepared: {} (manual creation from user media is far-future; see https://github.com/bitty-terminal/bitty-docs/blob/main/docs/development/testing-infrastructure.md)",
             base.display()
         ));
     }

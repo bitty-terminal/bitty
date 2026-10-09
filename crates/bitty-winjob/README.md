@@ -19,8 +19,9 @@ suspended, and spawns ConPTY children directly into a job at creation
 ## Boundaries
 
 - Every `unsafe` block lives in the private `src/ffi.rs` module, each with a
-  `SAFETY` rationale, and is inventoried in
-  `specifications/unsafe-ffi-audit.md`; the crate root denies
+  `SAFETY` rationale, and is inventoried in the
+  [evidence-matrix R-018 row](https://github.com/bitty-terminal/bitty-docs/blob/main/docs/security/evidence-matrix.md);
+  the crate root denies
   `unsafe_code`.
 - No raw handle or pointer crosses the public API; handles are owned
   `OwnedHandle` values.

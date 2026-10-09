@@ -25,7 +25,7 @@ pub fn create_overlay(qemu_img: &Path, plan: &RunPlan) -> io::Result<PathBuf> {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!(
-                "base image {} is not prepared (manual, far-future step; see specifications/vm-tier-policy.md)",
+                "base image {} is not prepared (manual, far-future step; see https://github.com/bitty-terminal/bitty-docs/blob/main/docs/development/testing-infrastructure.md)",
                 base.display()
             ),
         ));

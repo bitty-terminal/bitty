@@ -476,7 +476,8 @@ pub enum DynamicColorOp {
 ///
 /// The VT parser only classifies and bounds the payload; whether a
 /// notification is shown (and how) is a runtime policy decision
-/// (default deny, see `specifications/bell-notification-policy.md`).
+/// (default deny, see the notification sections of the
+/// [platform-services contract](https://github.com/bitty-terminal/bitty-terminal-docs/blob/main/specifications/platform-services-contract.md)).
 /// The [`NotificationSource::Plugin`] form is never emitted by the parser:
 /// the runtime mints it when admitting a grant-gated plugin notification
 /// (`platform.notify`) into the same bounded banner surface.

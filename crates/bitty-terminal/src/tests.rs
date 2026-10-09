@@ -5170,6 +5170,333 @@ fn init_color_enabled_impl_matches_convention() {
     assert!(crate::init::init_color_enabled_impl(false, false, false));
 }
 
+// -- `bitty init` live preview + rollback (phase 2 of #1806) ------------
+//
+// The wizard overlays each answered step onto an in-memory preview of the
+// previous effective config and never touches the user file until confirm;
+// Esc/cancel/EOF discards the overlay and restores the baseline.
+
+/// [`drive_init_wizard`] with an injected preview baseline; returns answers
+/// plus the wizard output plus the preview (snapshots prove mid-wizard
+/// state headlessly).
+fn drive_init_wizard_with_preview(
+    stdin_lines: &str,
+    shell_env: Option<&str>,
+    columns: Option<u16>,
+    overrides: &InitOverrides,
+    baseline: bitty_config::EffectiveConfig,
+) -> (Result<InitAnswers, String>, String, InitPreview) {
+    let mut input = std::io::BufReader::new(stdin_lines.as_bytes());
+    let mut output = Vec::new();
+    let mut preview = InitPreview::enabled(baseline);
+    let result = run_init_interactive_with_preview(
+        &mut input,
+        &mut output,
+        shell_env,
+        columns,
+        &|p| p == "/bin/bash" || p == "/bin/sh",
+        overrides,
+        false,
+        Some(&mut preview),
+    );
+    let printed = String::from_utf8(output).expect("wizard output is UTF-8");
+    (result, printed, preview)
+}
+
+#[test]
+fn init_preview_applies_selections_mid_wizard() {
+    // Baseline carries out-of-wizard values the overlay must preserve:
+    // a non-default opacity plus a resize step no wizard step sets.
+    let mut baseline = bitty_config::fallback_builtin();
+    baseline.window.opacity = 0.75;
+    baseline.layout.resize_step = 0.02;
+    let before = baseline.clone();
+
+    // Same custom picks as `init_interactive_custom_picks`: shell #2,
+    // bitty-dark, Fira Code, 14pt, 10/12/3/8, 50000, always, vim (#2).
+    let (result, _, preview) = drive_init_wizard_with_preview(
+        "2\nbitty-dark\nFira Code\n14\n10\n12\n3\n8\n50000\nalways\n2\n",
+        Some("/bin/bash"),
+        None,
+        &InitOverrides::default(),
+        baseline,
+    );
+    let answers = result.expect("custom picks accepted");
+    assert_eq!(answers.shell.as_deref(), Some("/bin/sh"));
+
+    // One snapshot per prompted step, in prompt order: shell, theme,
+    // family, size, gaps_in, gaps_out, border, radius, scrollback,
+    // close_confirm, key preset.
+    let snapshots = preview.snapshots();
+    assert_eq!(snapshots.len(), 11, "every prompted step previews");
+    assert_eq!(
+        snapshots[0].terminal.shell.as_deref(),
+        Some("/bin/sh"),
+        "shell previews first"
+    );
+    assert_eq!(
+        snapshots[1].appearance.theme.as_deref(),
+        Some("dark"),
+        "theme previews second"
+    );
+    assert_eq!(snapshots[2].font.family, "Fira Code");
+    assert!((snapshots[3].font.size - 14.0).abs() < f32::EPSILON);
+    assert_eq!(snapshots[4].decoration.gaps_in, 10);
+    assert_eq!(snapshots[5].decoration.gaps_out, 12);
+    assert_eq!(snapshots[6].decoration.border, 3);
+    assert_eq!(snapshots[7].decoration.radius, 8);
+    assert_eq!(snapshots[8].terminal.scrollback, 50_000);
+    assert_eq!(
+        snapshots[8].close_confirm,
+        bitty_config::CloseConfirm::WhenBusy,
+        "close_confirm still baseline before its own step"
+    );
+    assert_eq!(
+        snapshots[9].close_confirm,
+        bitty_config::CloseConfirm::Always
+    );
+    assert_eq!(
+        snapshots[10].keymaps.len(),
+        bitty_config::keymap::DEFAULT_KEYMAPS.len(),
+        "vim preset stages the explicit shipped map"
+    );
+
+    // The final overlay equals the last snapshot and carries every answer.
+    assert_eq!(preview.current(), &snapshots[10]);
+    assert_eq!(
+        preview.current().appearance.theme.as_deref(),
+        Some(answers.theme.as_str())
+    );
+    assert!((preview.current().font.size - answers.font_size).abs() < f32::EPSILON);
+
+    // Out-of-wizard config is untouched throughout.
+    for (index, snapshot) in snapshots.iter().enumerate() {
+        assert!(
+            (snapshot.window.opacity - 0.75).abs() < f32::EPSILON,
+            "snapshot {index} keeps out-of-wizard opacity"
+        );
+        assert!(
+            (snapshot.layout.resize_step - 0.02).abs() < f32::EPSILON,
+            "snapshot {index} keeps out-of-wizard resize step"
+        );
+    }
+
+    // The baseline itself never mutates during preview.
+    assert_eq!(preview.baseline(), &before);
+}
+
+#[test]
+fn init_preview_cancel_restores_baseline() {
+    let baseline = bitty_config::fallback_builtin();
+
+    // EOF mid-wizard (shell + theme answered, then input ends): the wizard
+    // aborts, the overlay returns to baseline, and the two applied steps
+    // remain visible only in the discarded snapshots.
+    let (result, _, preview) = drive_init_wizard_with_preview(
+        "\n\n",
+        Some("/bin/bash"),
+        None,
+        &InitOverrides::default(),
+        baseline.clone(),
+    );
+    let err = result.expect_err("EOF aborts");
+    assert!(err.contains("end of input"), "unexpected: {err}");
+    assert_eq!(preview.snapshots().len(), 2, "shell + theme previewed");
+    assert_eq!(
+        preview.snapshots()[1].appearance.theme.as_deref(),
+        Some("dark")
+    );
+    assert_eq!(
+        preview.current(),
+        &baseline,
+        "EOF restores the exact previous config"
+    );
+    assert_eq!(preview.baseline(), &baseline);
+
+    // Bare Esc cancels too: shell takes its default, then a lone ESC byte
+    // aborts the theme step instead of selecting it.
+    let (result, _, preview) = drive_init_wizard_with_preview(
+        "\n\x1b\n",
+        Some("/bin/bash"),
+        None,
+        &InitOverrides::default(),
+        baseline.clone(),
+    );
+    let err = result.expect_err("Esc aborts");
+    assert!(err.contains("cancelled"), "unexpected: {err}");
+    assert_eq!(preview.snapshots().len(), 1, "only shell previewed");
+    assert_eq!(
+        preview.current(),
+        &baseline,
+        "Esc restores the exact previous config"
+    );
+
+    // Existing abort behavior is unchanged: too many invalid answers still
+    // aborts without a preview leak.
+    let (result, _, preview) = drive_init_wizard_with_preview(
+        "\n\n\n\n\n\n\n\n\n\nnope\nnah\nnever\n",
+        Some("/bin/bash"),
+        None,
+        &InitOverrides::default(),
+        baseline.clone(),
+    );
+    assert!(result.is_err(), "retries still exhaust the bound");
+    assert_eq!(preview.current(), &baseline);
+}
+
+#[test]
+fn init_preview_never_writes_config_file() {
+    // The interactive wizard takes no path and performs no filesystem
+    // mutation: a sentinel file beside it stays byte-identical through both
+    // confirm and cancel runs.
+    let dir = init_test_dir("preview-nowrite");
+    let sentinel = dir.join("init.lua");
+    std::fs::write(&sentinel, "-- sentinel\n").expect("sentinel");
+    let baseline = bitty_config::fallback_builtin();
+
+    let (result, _, _) = drive_init_wizard_with_preview(
+        "\n\n\n\n\n\n\n\n\n\n\n",
+        Some("/bin/bash"),
+        None,
+        &InitOverrides::default(),
+        baseline.clone(),
+    );
+    result.expect("defaults accepted");
+    assert_eq!(
+        std::fs::read_to_string(&sentinel).expect("sentinel intact"),
+        "-- sentinel\n",
+        "confirm-path preview writes no file mid-wizard"
+    );
+
+    let (result, _, _) = drive_init_wizard_with_preview(
+        "\n\x1b\n",
+        Some("/bin/bash"),
+        None,
+        &InitOverrides::default(),
+        baseline,
+    );
+    assert!(result.is_err(), "Esc cancels");
+    assert_eq!(
+        std::fs::read_to_string(&sentinel).expect("sentinel intact"),
+        "-- sentinel\n",
+        "cancel-path preview writes no file"
+    );
+
+    // Subcommand level: a TTY cancel (EOF before any answer) exits 1 and
+    // creates neither the target nor a backup.
+    let target = dir.join("fresh").join("init.lua");
+    let mut args = Args::new();
+    args.init_word = true;
+    args.config_path = Some(target.display().to_string());
+    let home = dir.display().to_string();
+    let env = init_env(None, Some("/bin/bash"), None, Some(&home), true);
+    let mut input: &[u8] = b"";
+    let mut output = Vec::new();
+    assert_eq!(
+        run_init_subcommand_with_io(&args, &env, &mut input, &mut output),
+        1,
+        "TTY EOF cancels with exit 1"
+    );
+    assert!(!target.exists(), "cancel creates no config file");
+    assert!(
+        !target.with_extension("lua.bak").exists(),
+        "cancel creates no backup"
+    );
+
+    // And an Esc cancel over an existing file leaves it (and its backup
+    // slot) untouched.
+    std::fs::create_dir_all(target.parent().expect("parent")).expect("parent dir");
+    std::fs::write(&target, "-- existing\n").expect("existing file");
+    let mut input: &[u8] = b"\n\x1b\n";
+    let mut output = Vec::new();
+    assert_eq!(
+        run_init_subcommand_with_io(&args, &env, &mut input, &mut output),
+        1,
+        "TTY Esc cancels with exit 1"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("existing intact"),
+        "-- existing\n"
+    );
+    assert!(
+        !target.with_extension("lua.bak").exists(),
+        "cancel writes no backup"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn init_pending_recap_matches_written_file() {
+    // Full TTY pass: eleven Enters take every default; the recap printed
+    // before write must equal the file subsequently written.
+    let dir = init_test_dir("pending-recap");
+    let target = dir.join("init.lua");
+    let home = dir.display().to_string();
+    let mut args = Args::new();
+    args.init_word = true;
+    args.config_path = Some(target.display().to_string());
+    let env = init_env(None, Some("/bin/bash"), None, Some(&home), true);
+    let mut input = std::io::BufReader::new("\n\n\n\n\n\n\n\n\n\n\n".as_bytes());
+    let mut output = Vec::new();
+    assert_eq!(
+        run_init_subcommand_with_io(&args, &env, &mut input, &mut output),
+        0
+    );
+    let written = std::fs::read_to_string(&target).expect("written");
+    let printed = String::from_utf8(output).expect("wizard output is UTF-8");
+    assert!(
+        printed.contains("(pending init.lua"),
+        "recap header printed before write"
+    );
+    assert!(
+        printed.ends_with(&written),
+        "recap is byte-identical to the written file"
+    );
+
+    // Cancel path prints no recap and writes nothing.
+    let cancel_target = dir.join("cancelled").join("init.lua");
+    let mut cancel_args = Args::new();
+    cancel_args.init_word = true;
+    cancel_args.config_path = Some(cancel_target.display().to_string());
+    let mut input: &[u8] = b"";
+    let mut output = Vec::new();
+    assert_eq!(
+        run_init_subcommand_with_io(&cancel_args, &env, &mut input, &mut output),
+        1,
+        "TTY EOF cancels with exit 1"
+    );
+    let printed = String::from_utf8(output).expect("wizard output is UTF-8");
+    assert!(
+        !printed.contains("(pending init.lua"),
+        "cancel prints no recap"
+    );
+    assert!(!cancel_target.exists(), "cancel writes no file");
+
+    // Refusal path (existing file, no --force) prints no recap: the header
+    // must never read as a write promise for a write that will not happen.
+    std::fs::write(&target, "-- sentinel").expect("pre-existing file");
+    let mut input = std::io::BufReader::new("\n\n\n\n\n\n\n\n\n\n\n".as_bytes());
+    let mut output = Vec::new();
+    assert_eq!(
+        run_init_subcommand_with_io(&args, &env, &mut input, &mut output),
+        2,
+        "existing file without --force refuses with exit 2"
+    );
+    let printed = String::from_utf8(output).expect("wizard output is UTF-8");
+    assert!(
+        !printed.contains("(pending init.lua"),
+        "refusal prints no recap"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("untouched"),
+        "-- sentinel",
+        "refusal leaves the existing file intact"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn init_render_default_and_vim() {
     let base = init_yes_defaults(Some("/bin/bash"));

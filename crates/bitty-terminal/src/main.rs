@@ -297,12 +297,13 @@ use mascot::{
 #[cfg(test)]
 use init::{
     INIT_MASCOT_ART, INIT_MASCOT_FALLBACK, InitAnswers, InitEnv, InitKeyPreset, InitOverrides,
-    InitWriteError, init_clean_shell, init_columns_from_env, init_greeting_art, init_lua_escape,
-    init_mascot_width, init_parse_close_confirm_answer, init_parse_decoration_answer,
-    init_parse_font_family_answer, init_parse_font_size_answer, init_parse_preset_answer,
-    init_parse_scrollback_answer, init_parse_shell_answer, init_parse_theme_answer,
-    init_shell_candidates, init_usage, init_yes_defaults, render_init_lua, run_init_interactive,
-    run_init_subcommand_with_io, write_init_config,
+    InitPreview, InitWriteError, init_clean_shell, init_columns_from_env, init_greeting_art,
+    init_lua_escape, init_mascot_width, init_parse_close_confirm_answer,
+    init_parse_decoration_answer, init_parse_font_family_answer, init_parse_font_size_answer,
+    init_parse_preset_answer, init_parse_scrollback_answer, init_parse_shell_answer,
+    init_parse_theme_answer, init_shell_candidates, init_usage, init_yes_defaults, render_init_lua,
+    run_init_interactive, run_init_interactive_with_preview, run_init_subcommand_with_io,
+    write_init_config,
 };
 
 #[cfg(test)]

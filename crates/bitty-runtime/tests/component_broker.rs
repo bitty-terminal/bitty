@@ -11,16 +11,18 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bitty_network_wire::{ErrorKind, Method};
 use bitty_plugin_host::capability::CapabilityId;
 use bitty_plugin_host::manifest::NetworkEgress;
 use bitty_runtime::component::{
-    BrokerConfig, BrokerError, BrokerEvent, BrokerEventKind, COMPONENT_HANDSHAKE_TIMEOUT,
-    COMPONENT_IDLE_TIMEOUT, COMPONENT_MAX_IN_FLIGHT, COMPONENT_SHUTDOWN_GRACE, ComponentBroker,
-    ComponentEnv, ComponentRequest, ComponentState, PluginGrant, RequestId, ResolveError,
-    StopOutcome, executable_file_name,
+    BrokerConfig, BrokerError, BrokerEvent, BrokerEventKind, COMPONENT_DEADLINE_CRASH_THRESHOLD,
+    COMPONENT_HANDSHAKE_TIMEOUT, COMPONENT_IDLE_TIMEOUT, COMPONENT_MAX_IN_FLIGHT,
+    COMPONENT_REQUEST_DEADLINE_GRACE, COMPONENT_REQUEST_MAX_TIMEOUT, COMPONENT_SHUTDOWN_GRACE,
+    ComponentBroker, ComponentEnv, ComponentRequest, ComponentState, PluginGrant, RequestId,
+    ResolveError, StopOutcome, effective_timeout, executable_file_name,
 };
 
 /// Real-time bound for any single wait on the fixture process.
@@ -91,6 +93,16 @@ fn grant() -> PluginGrant {
 
 fn request() -> ComponentRequest {
     ComponentRequest::new(Method::Get, URL)
+}
+
+/// Request with the maximum Core deadline, for tests that hold requests in
+/// flight across large policy-time jumps (DIR-030 D2 would otherwise expire
+/// them first).
+fn holdable_request() -> ComponentRequest {
+    let mut req = request();
+    req.timeout_ms =
+        u32::try_from(COMPONENT_REQUEST_MAX_TIMEOUT.as_millis()).expect("300 s fits u32");
+    req
 }
 
 /// Wait (real time, bounded) until `id` reaches a terminal event.
@@ -348,17 +360,17 @@ fn in_flight_cap_and_cancel() {
     let ids: Vec<RequestId> = (0..COMPONENT_MAX_IN_FLIGHT)
         .map(|_| {
             broker
-                .submit(now, NAME, &grant(), request())
+                .submit(now, NAME, &grant(), holdable_request())
                 .expect("submit")
         })
         .collect();
     assert_eq!(
-        broker.submit(now, NAME, &grant(), request()),
+        broker.submit(now, NAME, &grant(), holdable_request()),
         Err(BrokerError::Busy)
     );
     broker.cancel(ids[0]);
     let extra = broker
-        .submit(now, NAME, &grant(), request())
+        .submit(now, NAME, &grant(), holdable_request())
         .expect("slot freed");
     assert_ne!(extra, ids[0]);
     until_state(&mut broker, now, ComponentState::Running);
@@ -447,5 +459,109 @@ fn core_enforces_the_response_budget() {
             .iter()
             .any(|event| matches!(event.kind, BrokerEventKind::Body { .. }))
     );
+    let _ = broker.shutdown();
+}
+
+#[test]
+fn core_deadline_expires_a_silent_request_with_timeout() {
+    let scratch = Scratch::new("deadline");
+    install(&scratch.0, "hold");
+    let mut broker = broker(&scratch.0, ComponentEnv::empty());
+    let t0 = Instant::now();
+    let mut req = request();
+    req.timeout_ms = 1;
+    let id = broker.submit(t0, NAME, &grant(), req).expect("submit");
+    until_state(&mut broker, t0, ComponentState::Running);
+    // The fixture never answers; past the 1 ms timeout plus the grace the
+    // Core deadline fires with `timeout`, and one expiry is not a crash.
+    let past = t0 + effective_timeout(1) + COMPONENT_REQUEST_DEADLINE_GRACE;
+    let events = broker.poll(past);
+    assert_eq!(failed_kind(&events, id), Some(ErrorKind::Timeout));
+    assert_eq!(
+        broker.status(NAME).map(|status| status.state),
+        Some(ComponentState::Running)
+    );
+    let _ = broker.shutdown();
+}
+
+#[test]
+fn three_consecutive_deadline_expiries_take_the_crash_path() {
+    assert_eq!(COMPONENT_DEADLINE_CRASH_THRESHOLD, 3);
+    let scratch = Scratch::new("deadline-trip");
+    install(&scratch.0, "hold");
+    let warns: Arc<Mutex<Vec<(String, String, String)>>> = Arc::default();
+    let capture = Arc::clone(&warns);
+    let mut broker = ComponentBroker::new(BrokerConfig::new(
+        Some(scratch.0.clone()),
+        ComponentEnv::empty(),
+    ))
+    .with_warn_sink(move |component: &str, reason: &str, tail: &str| {
+        capture.lock().expect("warn log").push((
+            component.to_owned(),
+            reason.to_owned(),
+            tail.to_owned(),
+        ));
+    });
+    let t0 = Instant::now();
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        let mut req = request();
+        req.timeout_ms = 1;
+        ids.push(broker.submit(t0, NAME, &grant(), req).expect("submit"));
+    }
+    until_state(&mut broker, t0, ComponentState::Running);
+    let past = t0 + effective_timeout(1) + COMPONENT_REQUEST_DEADLINE_GRACE;
+    let events = broker.poll(past);
+    for id in &ids {
+        assert_eq!(
+            failed_kind(&events, *id),
+            Some(ErrorKind::Timeout),
+            "request {id}"
+        );
+    }
+    // The third consecutive expiry took the crash path.
+    assert_eq!(
+        broker.status(NAME).and_then(|status| status.last_stop),
+        Some(StopOutcome::Crashed)
+    );
+    assert!(matches!(
+        broker.submit(past, NAME, &grant(), request()),
+        Err(BrokerError::Backoff { .. })
+    ));
+    // The crash handed the stderr tail to the warn sink.
+    let warns = warns.lock().expect("warn log");
+    assert!(!warns.is_empty());
+    assert!(warns.iter().all(|(component, _, _)| component == NAME));
+}
+
+#[test]
+fn idle_stop_hands_the_stderr_tail_to_the_warn_sink() {
+    let scratch = Scratch::new("idle-warn");
+    install(&scratch.0, "echo");
+    let warns: Arc<Mutex<Vec<(String, String, String)>>> = Arc::default();
+    let capture = Arc::clone(&warns);
+    let mut broker = ComponentBroker::new(BrokerConfig::new(
+        Some(scratch.0.clone()),
+        ComponentEnv::empty(),
+    ))
+    .with_warn_sink(move |component: &str, reason: &str, tail: &str| {
+        capture.lock().expect("warn log").push((
+            component.to_owned(),
+            reason.to_owned(),
+            tail.to_owned(),
+        ));
+    });
+    let t0 = Instant::now();
+    let id = broker
+        .submit(t0, NAME, &grant(), request())
+        .expect("submit");
+    until_terminal(&mut broker, t0, id);
+    let idle = t0 + COMPONENT_IDLE_TIMEOUT;
+    let _ = broker.poll(idle);
+    until_state(&mut broker, idle, ComponentState::Stopped);
+    let warns = warns.lock().expect("warn log");
+    assert_eq!(warns.len(), 1);
+    assert_eq!(warns[0].0, NAME);
+    assert_eq!(warns[0].1, "idle stop");
     let _ = broker.shutdown();
 }

@@ -27,13 +27,14 @@ use super::descriptor::{ResolveError, validate_component_name};
 use super::env::ComponentEnv;
 use super::grant::PluginGrant;
 use super::inventory::resolve_search;
-use super::policy::{CrashTracker, SpawnGate};
-use super::stderr::StderrRing;
+use super::policy::{CrashTracker, DeadlineStrikes, SpawnGate};
+use super::stderr::{StderrRing, stderr_log_tail};
 use super::{
     COMPONENT_EXIT_RECHECK, COMPONENT_HANDSHAKE_TIMEOUT, COMPONENT_IDLE_TIMEOUT,
-    COMPONENT_INBOUND_QUEUE_FRAMES, COMPONENT_MAX_IN_FLIGHT, COMPONENT_OUTBOUND_QUEUE_BATCHES,
-    COMPONENT_POLL_MAX_FRAMES, COMPONENT_SHUTDOWN_GRACE, COMPONENT_STDERR_MAX_BYTES,
-    COMPONENT_STDERR_READ_CHUNK,
+    COMPONENT_INBOUND_QUEUE_FRAMES, COMPONENT_MAX_BODY_BYTES_CEILING, COMPONENT_MAX_IN_FLIGHT,
+    COMPONENT_OUTBOUND_QUEUE_BATCHES, COMPONENT_POLL_MAX_FRAMES, COMPONENT_REQUEST_DEADLINE_GRACE,
+    COMPONENT_REQUEST_DEFAULT_TIMEOUT, COMPONENT_REQUEST_MAX_TIMEOUT, COMPONENT_SHUTDOWN_GRACE,
+    COMPONENT_STDERR_MAX_BYTES, COMPONENT_STDERR_READ_CHUNK,
 };
 
 /// Broker-assigned request id (non-zero, unique for the broker lifetime).
@@ -51,6 +52,58 @@ impl RequestId {
 impl fmt::Display for RequestId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+/// Receives warn-level component diagnostics (DIR-030 D4).
+///
+/// Core links no logging crate, so the broker owner supplies the sink: on a
+/// crash, a handshake failure, or an idle stop the broker hands the newest
+/// bounded stderr tail (already escaped by [`stderr_log_tail`]) to
+/// [`ComponentWarnSink::warn`]. Without a sink the tails are dropped. The
+/// tail may be empty when the component wrote nothing to stderr.
+pub trait ComponentWarnSink {
+    /// Log one warn-level diagnostic for `component` (`reason` is a short
+    /// static cause; `stderr_tail` is the escaped tail).
+    fn warn(&mut self, component: &str, reason: &str, stderr_tail: &str);
+}
+
+/// Any `FnMut(&str, &str, &str)` works as a sink (tests capture into a
+/// shared log this way).
+impl<F> ComponentWarnSink for F
+where
+    F: FnMut(&str, &str, &str),
+{
+    fn warn(&mut self, component: &str, reason: &str, stderr_tail: &str) {
+        self(component, reason, stderr_tail);
+    }
+}
+
+/// Core timeout for one request (DIR-030 D2): the requested `timeout_ms`,
+/// or [`COMPONENT_REQUEST_DEFAULT_TIMEOUT`] when none was requested,
+/// clamped to [`COMPONENT_REQUEST_MAX_TIMEOUT`]. The result is forwarded
+/// as the wire `timeout_ms`, so the component's own deadline fires first
+/// and Core's grace-covered deadline only catches a silent component.
+#[must_use]
+pub fn effective_timeout(timeout_ms: u32) -> Duration {
+    let base = if timeout_ms == 0 {
+        COMPONENT_REQUEST_DEFAULT_TIMEOUT
+    } else {
+        Duration::from_millis(u64::from(timeout_ms))
+    };
+    base.min(COMPONENT_REQUEST_MAX_TIMEOUT)
+}
+
+/// Core response body budget for one request (DIR-030 D3): the requested
+/// `max_body_bytes`, or the wire default (8 MiB) when none was requested,
+/// clamped to [`COMPONENT_MAX_BODY_BYTES_CEILING`]. Core enforces the
+/// result too; the component never widens it.
+#[must_use]
+pub fn effective_max_body_bytes(max_body_bytes: u64) -> u64 {
+    if max_body_bytes == 0 {
+        DEFAULT_MAX_BODY_BYTES
+    } else {
+        max_body_bytes.min(COMPONENT_MAX_BODY_BYTES_CEILING)
     }
 }
 
@@ -107,9 +160,13 @@ pub struct ComponentRequest {
     pub url: String,
     /// Request headers.
     pub headers: Vec<(String, String)>,
-    /// Deadline in milliseconds (`0` = component default).
+    /// Requested deadline in milliseconds (`0` = Core default). The broker
+    /// forwards [`effective_timeout`] as the wire value and expires the
+    /// request past it plus the deadline grace.
     pub timeout_ms: u32,
-    /// Response body cap (`0` = wire default, 8 MiB). Core enforces it too.
+    /// Requested response body cap (`0` = wire default, 8 MiB). The broker
+    /// forwards [`effective_max_body_bytes`] as the wire value and Core
+    /// enforces it too.
     pub max_body_bytes: u64,
     /// Optional request body (at most 8 MiB), chunked by the broker.
     pub body: Option<Vec<u8>>,
@@ -204,7 +261,7 @@ pub enum BrokerEventKind {
         last: bool,
     },
     /// Terminal failure (from the component, or `component_lost` /
-    /// `budget` / `protocol` produced by Core).
+    /// `budget` / `protocol` / `timeout` produced by Core).
     Failed {
         /// Error category.
         kind: ErrorKind,
@@ -285,6 +342,9 @@ struct InFlight {
     max_body_bytes: u64,
     received_body: u64,
     head_seen: bool,
+    /// Core deadline: submit time plus [`effective_timeout`] plus
+    /// [`COMPONENT_REQUEST_DEADLINE_GRACE`].
+    deadline: Instant,
 }
 
 enum Handshake {
@@ -311,6 +371,7 @@ struct Process {
 struct Slot {
     name: String,
     tracker: CrashTracker,
+    deadline_strikes: DeadlineStrikes,
     process: Option<Process>,
     stderr: Arc<Mutex<StderrRing>>,
     spawns: u64,
@@ -335,6 +396,7 @@ pub struct ComponentBroker {
     slots: BTreeMap<String, Slot>,
     inbound_tx: SyncSender<Inbound>,
     inbound_rx: Receiver<Inbound>,
+    warn_sink: Option<Box<dyn ComponentWarnSink>>,
     next_request: u64,
     next_generation: u64,
 }
@@ -358,9 +420,19 @@ impl ComponentBroker {
             slots: BTreeMap::new(),
             inbound_tx,
             inbound_rx,
+            warn_sink: None,
             next_request: 0,
             next_generation: 0,
         }
+    }
+
+    /// Install the warn sink for D4 stderr tails (none by default; without
+    /// one the tails are dropped and only [`Self::stderr_tail`] exposes
+    /// them).
+    #[must_use]
+    pub fn with_warn_sink(mut self, sink: impl ComponentWarnSink + 'static) -> Self {
+        self.warn_sink = Some(Box::new(sink));
+        self
     }
 
     /// Submit `request` to `component` on behalf of `grant`'s plugin.
@@ -379,11 +451,16 @@ impl ComponentBroker {
         validate_component_name(component)
             .map_err(|_| BrokerError::Resolve(ResolveError::InvalidName))?;
         let id = self.peek_request_id();
-        let max_body_bytes = if request.max_body_bytes == 0 {
-            DEFAULT_MAX_BODY_BYTES
-        } else {
-            request.max_body_bytes
-        };
+        // DIR-030 D2/D3: every request carries the effective timeout and
+        // budget as its wire values; the Core deadline adds the grace.
+        let timeout = effective_timeout(request.timeout_ms);
+        let max_body_bytes = effective_max_body_bytes(request.max_body_bytes);
+        // The effective timeout always fits `u32` (clamped to 300 s);
+        // saturate defensively so the wire value can never wrap.
+        let timeout_ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+        let mut request = request;
+        request.timeout_ms = timeout_ms;
+        request.max_body_bytes = max_body_bytes;
         let frames = encode_request(id, grant, request)?;
 
         self.ensure_running(now, component)?;
@@ -417,6 +494,7 @@ impl ComponentBroker {
                 max_body_bytes,
                 received_body: 0,
                 head_seen: false,
+                deadline: now + timeout + COMPONENT_REQUEST_DEADLINE_GRACE,
             },
         );
         process.last_activity = now;
@@ -609,6 +687,7 @@ impl ComponentBroker {
             .or_insert_with(|| Slot {
                 name: component.to_owned(),
                 tracker: CrashTracker::new(),
+                deadline_strikes: DeadlineStrikes::new(),
                 process: None,
                 stderr: Arc::new(Mutex::new(StderrRing::new(COMPONENT_STDERR_MAX_BYTES))),
                 spawns: 0,
@@ -667,10 +746,12 @@ impl ComponentBroker {
         match inbound.event {
             InboundEvent::Frame(message) => {
                 if let Err(reason) = handle_frame(slot, now, message, events) {
-                    crash(slot, now, reason, events);
+                    crash(slot, now, reason, events, &mut self.warn_sink);
                 }
             }
-            InboundEvent::Failed => crash(slot, now, "undecodable frame", events),
+            InboundEvent::Failed => {
+                crash(slot, now, "undecodable frame", events, &mut self.warn_sink)
+            }
             InboundEvent::Closed => {
                 let stopping = slot
                     .process
@@ -686,7 +767,13 @@ impl ComponentBroker {
                     }
                     // Otherwise the grace deadline in `maintain` decides.
                 } else {
-                    crash(slot, now, "component closed its output", events);
+                    crash(
+                        slot,
+                        now,
+                        "component closed its output",
+                        events,
+                        &mut self.warn_sink,
+                    );
                 }
             }
         }
@@ -696,25 +783,46 @@ impl ComponentBroker {
         let idle_timeout = self.config.idle_timeout;
         let grace = self.config.shutdown_grace;
         for slot in self.slots.values_mut() {
-            let Some(process) = slot.process.as_mut() else {
-                continue;
-            };
-            if let Some(deadline) = process.stop_deadline {
-                match process.child.try_wait() {
-                    Ok(Some(_)) => reap(slot, StopOutcome::Exited),
-                    _ if now >= deadline => kill_and_reap(slot, StopOutcome::Killed),
-                    _ => {}
+            let stopping = slot
+                .process
+                .as_ref()
+                .is_some_and(|process| process.stop_deadline.is_some());
+            if stopping {
+                let Some(process) = slot.process.as_mut() else {
+                    continue;
+                };
+                if let Some(deadline) = process.stop_deadline {
+                    match process.child.try_wait() {
+                        Ok(Some(_)) => reap(slot, StopOutcome::Exited),
+                        _ if now >= deadline => kill_and_reap(slot, StopOutcome::Killed),
+                        _ => {}
+                    }
                 }
                 continue;
             }
+            // Core request deadlines (DIR-030 D2): expiries fail with
+            // `timeout`; enough consecutive ones take the crash path.
+            if sweep_deadlines(slot, now, events) {
+                crash(
+                    slot,
+                    now,
+                    "core request deadlines expiring repeatedly",
+                    events,
+                    &mut self.warn_sink,
+                );
+                continue;
+            }
+            let Some(process) = slot.process.as_mut() else {
+                continue;
+            };
             if let Handshake::Pending { deadline, .. } = process.handshake {
                 if now >= deadline {
-                    crash(slot, now, "handshake timeout", events);
+                    crash(slot, now, "handshake timeout", events, &mut self.warn_sink);
                 }
                 continue;
             }
             if matches!(process.child.try_wait(), Ok(Some(_))) {
-                crash(slot, now, "component exited", events);
+                crash(slot, now, "component exited", events, &mut self.warn_sink);
                 continue;
             }
             if process.in_flight.is_empty()
@@ -723,6 +831,8 @@ impl ComponentBroker {
                 // Idle stop: close stdin; the component exits on EOF.
                 process.stdin = None;
                 process.stop_deadline = Some(now + grace);
+                // DIR-030 D4: idle stops log the stderr tail too.
+                emit_warn(&mut self.warn_sink, slot, "idle stop");
             }
         }
     }
@@ -1010,6 +1120,9 @@ fn handle_frame(
             let plugin_id = entry.plugin_id.clone();
             if last {
                 process.in_flight.remove(&id);
+                // A component-produced terminal frame clears the deadline
+                // strike count (DIR-030 D2).
+                slot.deadline_strikes.reset();
             }
             events.push(BrokerEvent {
                 id,
@@ -1026,6 +1139,11 @@ fn handle_frame(
             let Some(entry) = process.in_flight.remove(&id) else {
                 return Ok(());
             };
+            // A component-produced terminal frame clears the deadline
+            // strike count (DIR-030 D2). Core-produced terminal failures
+            // (budget, timeout) do not: only the component clearing a
+            // request proves it responsive.
+            slot.deadline_strikes.reset();
             events.push(BrokerEvent {
                 id,
                 plugin_id: entry.plugin_id,
@@ -1063,9 +1181,83 @@ fn fail_all(
     }
 }
 
+/// Expire requests past their Core deadline (DIR-030 D2).
+///
+/// Each expired request fails with `timeout`; `Cancel` is sent only when
+/// the request had reached the component (a handshake-queued request is
+/// just dropped from the queue). A late component frame for an expired id
+/// finds no booking and is discarded, never a protocol error. Returns
+/// whether [`super::COMPONENT_DEADLINE_CRASH_THRESHOLD`] consecutive
+/// expiries tripped: the caller then takes the crash path, which fails
+/// whatever is left with `component_lost`.
+fn sweep_deadlines(slot: &mut Slot, now: Instant, events: &mut Vec<BrokerEvent>) -> bool {
+    let Some(process) = slot.process.as_mut() else {
+        return false;
+    };
+    let expired: Vec<RequestId> = process
+        .in_flight
+        .iter()
+        .filter(|(_, entry)| now >= entry.deadline)
+        .map(|(id, _)| *id)
+        .collect();
+    if expired.is_empty() {
+        return false;
+    }
+    let ready = matches!(process.handshake, Handshake::Ready { .. });
+    let mut tripped = false;
+    for id in expired {
+        let Some(entry) = process.in_flight.remove(&id) else {
+            continue;
+        };
+        if ready {
+            if let (Some(stdin), Ok(frame)) = (
+                process.stdin.as_ref(),
+                encode_frame(&Message::Cancel { id: id.0 }),
+            ) {
+                // A full queue drops the cancel; the id is already
+                // forgotten, so late frames are discarded.
+                let _ = stdin.try_send(vec![frame]);
+            }
+        } else if let Handshake::Pending { queued, .. } = &mut process.handshake {
+            queued.retain(|(queued_id, _)| *queued_id != id);
+        }
+        events.push(BrokerEvent {
+            id,
+            plugin_id: entry.plugin_id,
+            component: slot.name.clone(),
+            kind: BrokerEventKind::Failed {
+                kind: ErrorKind::Timeout,
+                message: "core request deadline expired".into(),
+            },
+        });
+        if slot.deadline_strikes.expire() {
+            tripped = true;
+        }
+    }
+    tripped
+}
+
+/// Hand the newest bounded stderr tail to the warn sink, if any (DIR-030
+/// D4). The tail is escaped by [`stderr_log_tail`]; it may be empty when
+/// the component wrote nothing.
+fn emit_warn(sink: &mut Option<Box<dyn ComponentWarnSink>>, slot: &Slot, reason: &str) {
+    let Some(sink) = sink.as_mut() else {
+        return;
+    };
+    let ring = slot.stderr.lock().unwrap_or_else(PoisonError::into_inner);
+    sink.warn(&slot.name, reason, &stderr_log_tail(&ring.snapshot()));
+}
+
 /// Crash: fail in-flight with `component_lost`, kill the recorded child,
-/// and start the backoff (or latch unavailable).
-fn crash(slot: &mut Slot, now: Instant, reason: &str, events: &mut Vec<BrokerEvent>) {
+/// and start the backoff (or latch unavailable). The stderr tail goes to
+/// the warn sink (DIR-030 D4).
+fn crash(
+    slot: &mut Slot,
+    now: Instant,
+    reason: &str,
+    events: &mut Vec<BrokerEvent>,
+    warn_sink: &mut Option<Box<dyn ComponentWarnSink>>,
+) {
     let name = slot.name.clone();
     if let Some(process) = slot.process.as_mut() {
         fail_all(
@@ -1078,6 +1270,7 @@ fn crash(slot: &mut Slot, now: Instant, reason: &str, events: &mut Vec<BrokerEve
     }
     kill_and_reap(slot, StopOutcome::Crashed);
     let _ = slot.tracker.record_crash(now);
+    emit_warn(warn_sink, slot, reason);
 }
 
 /// Forget an already-exited child (reaps it).
@@ -1180,7 +1373,6 @@ mod tests {
             Err(BrokerError::InvalidRequest(_))
         ));
     }
-
     #[test]
     fn invalid_component_name_is_rejected_without_spawning() {
         let mut broker = ComponentBroker::new(BrokerConfig::new(None, ComponentEnv::empty()));
@@ -1192,5 +1384,99 @@ mod tests {
         );
         assert_eq!(result, Err(BrokerError::Resolve(ResolveError::InvalidName)));
         assert!(broker.status("../net").is_none());
+    }
+
+    #[test]
+    fn effective_timeout_defaults_and_clamps_to_300s() {
+        assert_eq!(effective_timeout(0), COMPONENT_REQUEST_DEFAULT_TIMEOUT);
+        assert_eq!(effective_timeout(0), Duration::from_secs(30));
+        assert_eq!(effective_timeout(1), Duration::from_millis(1));
+        assert_eq!(effective_timeout(30_000), Duration::from_secs(30));
+        assert_eq!(effective_timeout(300_000), COMPONENT_REQUEST_MAX_TIMEOUT);
+        assert_eq!(
+            effective_timeout(999_000_000),
+            COMPONENT_REQUEST_MAX_TIMEOUT
+        );
+        assert_eq!(effective_timeout(u32::MAX), COMPONENT_REQUEST_MAX_TIMEOUT);
+    }
+
+    #[test]
+    fn effective_body_budget_defaults_and_clamps_to_64mib() {
+        assert_eq!(effective_max_body_bytes(0), DEFAULT_MAX_BODY_BYTES);
+        assert_eq!(effective_max_body_bytes(0), 8 * 1024 * 1024);
+        assert_eq!(effective_max_body_bytes(16), 16);
+        assert_eq!(
+            effective_max_body_bytes(COMPONENT_MAX_BODY_BYTES_CEILING),
+            COMPONENT_MAX_BODY_BYTES_CEILING
+        );
+        assert_eq!(
+            effective_max_body_bytes(u64::MAX),
+            COMPONENT_MAX_BODY_BYTES_CEILING
+        );
+    }
+
+    #[test]
+    fn encode_carries_effective_timeout_and_budget_on_the_wire() {
+        // `submit` forwards the effective values as the wire `timeout_ms` /
+        // `max_body_bytes`; this pins the encode layer of that contract.
+        let mut request = ComponentRequest::new(Method::Get, "https://api.example.com/");
+        request.timeout_ms =
+            u32::try_from(effective_timeout(0).as_millis()).expect("300 s fits u32");
+        request.max_body_bytes = effective_max_body_bytes(0);
+        let frames = encode_request(RequestId(3), &offline_grant(), request).expect("encode");
+        assert_eq!(frames.len(), 1);
+        match decode(&frames[0][FRAME_HEADER_BYTES..]).expect("decode") {
+            Message::HttpRequest {
+                timeout_ms,
+                max_body_bytes,
+                ..
+            } => {
+                assert_eq!(timeout_ms, 30_000);
+                assert_eq!(max_body_bytes, 8 * 1024 * 1024);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn warn_sink_receives_the_escaped_stderr_tail() {
+        let seen: Arc<Mutex<Vec<(String, String, String)>>> = Arc::default();
+        let capture = Arc::clone(&seen);
+        let mut sink: Option<Box<dyn ComponentWarnSink>> = Some(Box::new(
+            move |component: &str, reason: &str, tail: &str| {
+                capture
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push((component.to_owned(), reason.to_owned(), tail.to_owned()));
+            },
+        ));
+        let slot = Slot {
+            name: "net".to_owned(),
+            tracker: CrashTracker::new(),
+            deadline_strikes: DeadlineStrikes::new(),
+            process: None,
+            stderr: Arc::new(Mutex::new(StderrRing::new(64))),
+            spawns: 0,
+            last_stop: None,
+        };
+        slot.stderr
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(b"boom \x1b[0m\\\\");
+        emit_warn(&mut sink, &slot, "test crash");
+        assert_eq!(
+            seen.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_slice(),
+            [(
+                "net".to_owned(),
+                "test crash".to_owned(),
+                "boom \\u{1b}[0m\\\\\\\\".to_owned()
+            )]
+            .as_slice()
+        );
+        // No sink: nothing happens, no panic.
+        let mut none: Option<Box<dyn ComponentWarnSink>> = None;
+        emit_warn(&mut none, &slot, "test crash");
     }
 }

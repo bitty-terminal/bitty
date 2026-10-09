@@ -4,7 +4,8 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use super::{
-    COMPONENT_BACKOFF_INITIAL, COMPONENT_BACKOFF_MAX, COMPONENT_CRASH_LIMIT, COMPONENT_CRASH_WINDOW,
+    COMPONENT_BACKOFF_INITIAL, COMPONENT_BACKOFF_MAX, COMPONENT_CRASH_LIMIT,
+    COMPONENT_CRASH_WINDOW, COMPONENT_DEADLINE_CRASH_THRESHOLD,
 };
 
 /// Whether a component may be spawned now.
@@ -140,9 +141,82 @@ impl CrashTracker {
     }
 }
 
+/// Consecutive Core deadline expiries on one component (DIR-030 D2).
+///
+/// [`Self::expire`] counts one expiry and reports when
+/// [`COMPONENT_DEADLINE_CRASH_THRESHOLD`] is reached (the caller then takes
+/// the crash path); reaching it resets the count. [`Self::reset`] runs when
+/// any request on the component ends with a component-produced terminal
+/// frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeadlineStrikes {
+    count: u32,
+    threshold: u32,
+}
+
+impl Default for DeadlineStrikes {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DeadlineStrikes {
+    /// Counter with the DIR-030 threshold.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_threshold(COMPONENT_DEADLINE_CRASH_THRESHOLD)
+    }
+
+    /// Counter with an explicit threshold (tests); `0` behaves as `1`.
+    #[must_use]
+    pub fn with_threshold(threshold: u32) -> Self {
+        Self {
+            count: 0,
+            threshold: threshold.max(1),
+        }
+    }
+
+    /// Count one expiry; `true` when the threshold is reached (the counter
+    /// resets).
+    pub fn expire(&mut self) -> bool {
+        self.count = self.count.saturating_add(1);
+        if self.count >= self.threshold {
+            self.count = 0;
+            return true;
+        }
+        false
+    }
+
+    /// A component-produced terminal frame ended a request.
+    pub fn reset(&mut self) {
+        self.count = 0;
+    }
+
+    /// Consecutive expiries counted so far.
+    #[must_use]
+    pub fn count(&self) -> u32 {
+        self.count
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deadline_strikes_trip_at_threshold_and_reset() {
+        let mut strikes = DeadlineStrikes::new();
+        assert_eq!(COMPONENT_DEADLINE_CRASH_THRESHOLD, 3);
+        assert!(!strikes.expire());
+        assert!(!strikes.expire());
+        strikes.reset();
+        assert_eq!(strikes.count(), 0);
+        assert!(!strikes.expire());
+        assert!(!strikes.expire());
+        assert!(strikes.expire(), "third consecutive expiry trips");
+        assert_eq!(strikes.count(), 0, "tripping resets the counter");
+        assert!(DeadlineStrikes::with_threshold(0).expire());
+    }
 
     #[test]
     fn backoff_doubles_from_one_second_to_thirty() {

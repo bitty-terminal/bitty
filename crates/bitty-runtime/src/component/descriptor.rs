@@ -17,11 +17,12 @@ use std::path::{Path, PathBuf};
 
 use bitty_network_wire::PROTOCOL_VERSION;
 use bitty_package::Version;
+use bitty_package::integrity::Sha256Hasher;
 
 use super::{
     COMPONENT_CURRENT_FILE, COMPONENT_CURRENT_MAX_BYTES, COMPONENT_DESCRIPTOR_FILE,
-    COMPONENT_DESCRIPTOR_MAX_BYTES, COMPONENT_EXECUTABLE_MAX_BYTES, COMPONENT_EXECUTABLE_PREFIX,
-    COMPONENT_NAME_MAX_BYTES, COMPONENTS_DIR_NAME,
+    COMPONENT_DESCRIPTOR_MAX_BYTES, COMPONENT_DIGEST_BUFFER_BYTES, COMPONENT_EXECUTABLE_MAX_BYTES,
+    COMPONENT_EXECUTABLE_PREFIX, COMPONENT_NAME_MAX_BYTES, COMPONENTS_DIR_NAME,
 };
 
 /// Hex length of a SHA-256 digest.
@@ -427,8 +428,7 @@ pub fn resolve(root: &Path, name: &str) -> Result<ResolvedComponent, ResolveErro
 
     let executable_path = version_dir.join(executable_file_name(&descriptor.executable));
     require_kind(&executable_path, true)?;
-    let executable = read_bounded(&executable_path, COMPONENT_EXECUTABLE_MAX_BYTES)?;
-    let actual = bitty_package::integrity::sha256_hex(&executable);
+    let actual = digest_bounded(&executable_path, COMPONENT_EXECUTABLE_MAX_BYTES)?;
     if actual != descriptor.sha256 {
         return Err(ResolveError::DigestMismatch {
             expected: descriptor.sha256,
@@ -498,6 +498,37 @@ fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, ResolveError> {
         });
     }
     Ok(bytes)
+}
+
+/// SHA-256 hex of the file at `path`, streamed through a fixed
+/// [`COMPONENT_DIGEST_BUFFER_BYTES`] buffer (DIR-030 D5): memory stays flat
+/// whatever the file size. A file longer than `limit` fails closed.
+fn digest_bounded(path: &Path, limit: u64) -> Result<String, ResolveError> {
+    let unreadable = |error: std::io::Error| ResolveError::Unreadable {
+        path: path.to_owned(),
+        kind: error.kind(),
+    };
+    let mut file = fs::File::open(path)
+        .map_err(unreadable)?
+        .take(limit.saturating_add(1));
+    let mut hasher = Sha256Hasher::new();
+    let mut buf = vec![0u8; COMPONENT_DIGEST_BUFFER_BYTES];
+    loop {
+        let n = match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(unreadable(error)),
+        };
+        hasher.update(&buf[..n]);
+        if hasher.len() > limit {
+            return Err(ResolveError::TooLarge {
+                path: path.to_owned(),
+                limit,
+            });
+        }
+    }
+    Ok(hasher.finalize_hex())
 }
 
 /// Remove a `#` comment that is outside a basic string.
@@ -688,6 +719,28 @@ mod tests {
             Some(data.join("bitty").join("components"))
         );
         assert_eq!(components_root_for(None, None), None);
+    }
+
+    #[test]
+    fn streamed_digest_matches_one_shot_and_enforces_the_limit() {
+        let dir = std::env::temp_dir().join(format!("bitty-ctx0920-digest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let path = dir.join("blob");
+        // Several full buffers plus a partial one.
+        let size = COMPONENT_DIGEST_BUFFER_BYTES * 3 + 17;
+        let bytes: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &bytes).expect("write");
+        let streamed = digest_bounded(&path, size as u64).expect("digest");
+        assert_eq!(streamed, bitty_package::integrity::sha256_hex(&bytes));
+        assert!(matches!(
+            digest_bounded(&path, size as u64 - 1),
+            Err(ResolveError::TooLarge { .. })
+        ));
+        assert!(matches!(
+            digest_bounded(&dir.join("missing"), size as u64),
+            Err(ResolveError::Unreadable { .. })
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

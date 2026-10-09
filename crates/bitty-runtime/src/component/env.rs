@@ -2,21 +2,39 @@
 
 use std::ffi::{OsStr, OsString};
 
-use super::COMPONENT_ENV_ALLOWLIST;
+use super::{COMPONENT_ENV_ALLOWLIST, COMPONENT_ENV_WINDOWS_ALLOWLIST};
+
+/// Names forwarded on a platform: [`COMPONENT_ENV_ALLOWLIST`], plus
+/// [`COMPONENT_ENV_WINDOWS_ALLOWLIST`] when `windows` (DIR-030 D1).
+fn forwarded_names_for(windows: bool) -> impl Iterator<Item = &'static str> {
+    let extra: &'static [&'static str] = if windows {
+        &COMPONENT_ENV_WINDOWS_ALLOWLIST
+    } else {
+        &[]
+    };
+    COMPONENT_ENV_ALLOWLIST.iter().chain(extra).copied()
+}
+
+/// Names forwarded on the build platform.
+fn forwarded_names() -> impl Iterator<Item = &'static str> {
+    forwarded_names_for(cfg!(windows))
+}
 
 /// Whether `name` may be forwarded to a component process.
 ///
 /// Matching is exact and case-sensitive on every platform: the allowlist
-/// names both spellings of the proxy variables explicitly.
+/// names both spellings of the proxy variables explicitly. The Windows-only
+/// names match only on Windows.
 #[must_use]
 pub fn is_allowlisted_env(name: &str) -> bool {
-    COMPONENT_ENV_ALLOWLIST.contains(&name)
+    forwarded_names().any(|allowed| allowed == name)
 }
 
 /// The environment a component process starts with.
 ///
 /// The child's environment is cleared and only these pairs are set; the
-/// list can only ever hold [`COMPONENT_ENV_ALLOWLIST`] names.
+/// list can only ever hold [`COMPONENT_ENV_ALLOWLIST`] names (plus
+/// [`COMPONENT_ENV_WINDOWS_ALLOWLIST`] on Windows).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ComponentEnv {
     vars: Vec<(OsString, OsString)>,
@@ -38,9 +56,12 @@ impl ComponentEnv {
     /// Capture the allowlisted variables through `lookup` (hermetic tests
     /// pass a map). Names outside the allowlist are never queried.
     #[must_use]
-    pub fn capture(mut lookup: impl FnMut(&str) -> Option<OsString>) -> Self {
-        let vars = COMPONENT_ENV_ALLOWLIST
-            .iter()
+    pub fn capture(lookup: impl FnMut(&str) -> Option<OsString>) -> Self {
+        Self::capture_for(cfg!(windows), lookup)
+    }
+
+    fn capture_for(windows: bool, mut lookup: impl FnMut(&str) -> Option<OsString>) -> Self {
+        let vars = forwarded_names_for(windows)
             .filter_map(|name| lookup(name).map(|value| (OsString::from(name), value)))
             .collect();
         Self { vars }
@@ -115,5 +136,43 @@ mod tests {
     fn empty_forwards_nothing() {
         assert!(ComponentEnv::empty().is_empty());
         assert_eq!(ComponentEnv::empty().len(), 0);
+    }
+
+    fn windows_host() -> BTreeMap<&'static str, &'static str> {
+        [
+            ("SystemRoot", "fixture-system-root"),
+            ("windir", "fixture-windir"),
+            ("PATH", "fixture-path"),
+            ("LANG", "C.UTF-8"),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    #[test]
+    fn system_root_is_forwarded_only_for_windows() {
+        assert_eq!(COMPONENT_ENV_WINDOWS_ALLOWLIST, ["SystemRoot"]);
+        let host = windows_host();
+        let windows = ComponentEnv::capture_for(true, |name| host.get(name).map(OsString::from));
+        let names: Vec<&OsStr> = windows.vars().map(|(name, _)| name).collect();
+        assert_eq!(names, ["LANG", "SystemRoot"]);
+        let other = ComponentEnv::capture_for(false, |name| host.get(name).map(OsString::from));
+        let names: Vec<&OsStr> = other.vars().map(|(name, _)| name).collect();
+        assert_eq!(names, ["LANG"]);
+        for windows in [true, false] {
+            let names: Vec<&str> = forwarded_names_for(windows).collect();
+            assert!(!names.contains(&"windir"));
+            assert!(!names.iter().any(|name| name.eq_ignore_ascii_case("PATH")));
+        }
+    }
+
+    #[test]
+    fn build_platform_decides_system_root() {
+        let host = windows_host();
+        let env = ComponentEnv::capture(|name| host.get(name).map(OsString::from));
+        let forwarded = env.vars().any(|(name, _)| name == "SystemRoot");
+        assert_eq!(forwarded, cfg!(windows));
+        assert_eq!(is_allowlisted_env("SystemRoot"), cfg!(windows));
+        assert!(!is_allowlisted_env("windir"));
     }
 }

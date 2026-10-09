@@ -1,6 +1,63 @@
 //! Bounded stderr capture ring for component processes.
 
 use std::collections::VecDeque;
+use std::fmt::Write as _;
+
+use super::COMPONENT_STDERR_LOG_TAIL_BYTES;
+
+/// UTF-8 continuation bytes are `0b10xx_xxxx`.
+const UTF8_CONTINUATION_MASK: u8 = 0b1100_0000;
+const UTF8_CONTINUATION_TAG: u8 = 0b1000_0000;
+/// Longest UTF-8 sequence; at most this many orphaned bytes are skipped.
+const UTF8_MAX_SEQUENCE_BYTES: usize = 4;
+
+/// The newest [`COMPONENT_STDERR_LOG_TAIL_BYTES`] of `ring` as one log-safe
+/// line (DIR-030 D4).
+///
+/// Bytes are decoded as UTF-8 (invalid sequences become U+FFFD; a sequence
+/// cut by the tail boundary is dropped). Backslash and every control or
+/// invisible formatting character (C0, DEL, C1, zero-width, and bidi
+/// controls) are escaped (`\n`, `\r`, `\t`, `\\`, otherwise `\u{..}`), so the
+/// output can never inject terminal sequences or fake log lines.
+#[must_use]
+pub fn stderr_log_tail(ring: &[u8]) -> String {
+    let mut tail = &ring[ring.len().saturating_sub(COMPONENT_STDERR_LOG_TAIL_BYTES)..];
+    if tail.len() < ring.len() {
+        let orphans = tail
+            .iter()
+            .take(UTF8_MAX_SEQUENCE_BYTES - 1)
+            .take_while(|byte| *byte & UTF8_CONTINUATION_MASK == UTF8_CONTINUATION_TAG)
+            .count();
+        tail = &tail[orphans..];
+    }
+    let text = String::from_utf8_lossy(tail);
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if needs_escape(c) => {
+                let _ = write!(out, "\\u{{{:x}}}", u32::from(c));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Controls plus invisible format characters that can reorder or hide text.
+fn needs_escape(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{200b}'..='\u{200f}'
+                | '\u{2028}'..='\u{202e}'
+                | '\u{2060}'..='\u{2069}'
+                | '\u{feff}'
+        )
+}
 
 /// Fixed-capacity byte ring keeping the newest bytes a component wrote to
 /// stderr. Older bytes are dropped first; memory never exceeds the
@@ -78,6 +135,34 @@ impl StderrRing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_tail_escapes_controls_and_bounds_length() {
+        assert_eq!(stderr_log_tail(b""), "");
+        assert_eq!(
+            stderr_log_tail(b"ok \x1b[31mred\x07\r\n\tback\\slash\x7f"),
+            "ok \\u{1b}[31mred\\u{7}\\r\\n\\tback\\\\slash\\u{7f}"
+        );
+        // C1 controls and bidi/zero-width format characters are escaped too.
+        assert_eq!(
+            stderr_log_tail("a\u{9b}b\u{202e}c\u{200b}d\u{2066}e".as_bytes()),
+            "a\\u{9b}b\\u{202e}c\\u{200b}d\\u{2066}e"
+        );
+        // Invalid UTF-8 is replaced, never passed through raw.
+        assert_eq!(stderr_log_tail(b"x\xffy"), "x\u{fffd}y");
+        // Only the newest COMPONENT_STDERR_LOG_TAIL_BYTES are kept.
+        let mut long = vec![b'a'; COMPONENT_STDERR_LOG_TAIL_BYTES];
+        long.extend_from_slice(b"END");
+        let tail = stderr_log_tail(&long);
+        assert_eq!(tail.len(), COMPONENT_STDERR_LOG_TAIL_BYTES);
+        assert!(tail.ends_with("END"));
+        // A cut through a multi-byte character drops the orphaned bytes.
+        let mut cut = "a€".as_bytes().to_vec(); // 1 + 3 bytes
+        cut.extend(vec![b'b'; COMPONENT_STDERR_LOG_TAIL_BYTES - 2]);
+        let tail = stderr_log_tail(&cut);
+        assert!(!tail.contains('\u{fffd}'), "{tail:?}");
+        assert_eq!(tail, "b".repeat(COMPONENT_STDERR_LOG_TAIL_BYTES - 2));
+    }
 
     #[test]
     fn keeps_newest_bytes_within_capacity() {

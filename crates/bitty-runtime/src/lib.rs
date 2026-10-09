@@ -156,6 +156,10 @@
 //! the parser, the grid, the renderer cache/atlas, and the surface remain
 //! private.
 //!
+//! Deliberate contract exception: [`component`] re-exports the first-party
+//! `bitty-network-wire` codec types (the DIR-030 native-component wire
+//! contract) instead of mirroring them; see that module's docs.
+//!
 //! # Example
 //!
 //! ```

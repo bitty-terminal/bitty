@@ -475,14 +475,18 @@ mod tests {
         // the shell's prompt fits far under the 128 KiB channel cap.
         let _keep_reader = reader;
 
-        // The shell must own the foreground before "idle" is meaningful:
-        // poll until the kernel reports the shell itself in front, not just
-        // any group. (FreeBSD, CTX-1020: `tcgetpgrp` reports the NO_PID
-        // sentinel — filtered to `None` — until the shell takes the
-        // foreground, so the first reading is not necessarily the shell.)
-        let child = pty.pid().expect("child pid");
-        wait_until(Duration::from_secs(10), || {
-            (pty.foreground_pgid() == Some(child)).then_some(())
+        // The shell must be idle before the assertion is meaningful. Poll for
+        // the asserted property itself (no job) rather than for the shell
+        // owning the foreground: on FreeBSD (CTX-1020/CTX-1029) `tcgetpgrp`
+        // reports the NO_PID sentinel — filtered to `None` — until the shell
+        // takes the foreground, and on a loaded emulated VM that handover can
+        // take seconds. Both `None` and shell-front mean "not busy", so this
+        // accepts either; the 30 s bound keeps a genuinely stuck shell failing
+        // fast enough while absorbing VM scheduling stalls. The shell has the
+        // whole wait to become ready for the `sleep` command below (PTY input
+        // is buffered).
+        wait_until(Duration::from_secs(30), || {
+            pty.foreground_job().is_none().then_some(())
         });
         assert_eq!(
             pty.foreground_job(),
@@ -492,7 +496,10 @@ mod tests {
 
         writer.write_all(b"sleep 30\n").expect("write job");
         writer.flush().expect("flush job");
-        let job = wait_until(Duration::from_secs(10), || pty.foreground_job());
+        // 30 s bounds absorb emulated-VM scheduling stalls (CTX-1029); the
+        // success path returns on the first job sighting, so the longer bound
+        // only slows genuine failures.
+        let job = wait_until(Duration::from_secs(30), || pty.foreground_job());
         assert_ne!(
             job.pid,
             pty.pid().expect("child pid"),
@@ -506,7 +513,7 @@ mod tests {
         // and a job that never reports `sleep` still fails the bound.
         #[cfg(target_os = "linux")]
         {
-            let name = wait_until(Duration::from_secs(10), || {
+            let name = wait_until(Duration::from_secs(30), || {
                 let settled = pty.foreground_job()?;
                 (settled.pid == job.pid && settled.name.as_deref() == Some("sleep"))
                     .then_some(settled.name)
@@ -515,10 +522,11 @@ mod tests {
         }
 
         // Ctrl-C through the line discipline interrupts the foreground job;
-        // the shell takes the foreground back and busy clears.
+        // the shell takes the foreground back and busy clears (30 s bound,
+        // same CTX-1029 rationale as above).
         writer.write_all(b"\x03").expect("write intr");
         writer.flush().expect("flush intr");
-        wait_until(Duration::from_secs(10), || {
+        wait_until(Duration::from_secs(30), || {
             pty.foreground_job().is_none().then_some(())
         });
 

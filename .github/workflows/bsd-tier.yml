@@ -94,8 +94,14 @@ jobs:
         run: |
           set -eux
           . "$HOME/.cargo/env"
+          # CTX-1029 (#1796): cap test threads on the emulated FreeBSD VM.
+          # Thirteen PTY tests spawning at once trigger the transient child
+          # TIOCSCTTY EPERM/ENOTTY race under parallel-spawn load; the
+          # library retries five times internally and the gated integration
+          # tests respawn once, but halving concurrency lowers the trigger
+          # rate without changing what the suites prove.
           cargo test --locked \
             -p bitty-vt \
             -p bitty-term-state \
             -p bitty-ui \
-            -p bitty-pty
+            -p bitty-pty -- --test-threads=4

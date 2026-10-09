@@ -481,11 +481,15 @@ jobs:
         run: |
           set -eux
           . "$HOME/.cargo/env"
+          # CTX-1029 (#1796): cap test threads on the emulated FreeBSD VM
+          # (same rationale as the bsd-tier leg: parallel PTY spawns race
+          # TIOCSCTTY EPERM/ENOTTY; library retry + gated respawn absorb the
+          # residual, the cap lowers the trigger rate).
           cargo test --locked \
             -p bitty-vt \
             -p bitty-term-state \
             -p bitty-ui \
-            -p bitty-pty
+            -p bitty-pty -- --test-threads=4
 
       # Assemble the published artifacts inside the guest so the binary, the
       # versioned tarball, and the checksums are generated where the binary is

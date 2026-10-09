@@ -635,6 +635,12 @@ impl Runtime {
     /// construction order. Same-tier frames keep solver order. Hit-testing
     /// ([`Self::cursor_to_present_cell`]) still scans this order, matching
     /// the `overlay_stack` depth-first convention.
+    ///
+    /// CTX-1058 (#1844 P1): a leaf with no structural tier but a
+    /// `Floating`/`Scratchpad` presentation mode lifts to
+    /// [`OverlayTier::Float`] with anchored float geometry (see
+    /// `bitty_ui::presentation::float_frame`) and one extra border px, so
+    /// the toggle path is visible without moving the solver allocation.
     #[must_use]
     pub fn present_frames(&self) -> Vec<PresentFrame> {
         let live = self.live_cell_metrics();
@@ -669,25 +675,75 @@ impl Runtime {
                 self.gaps(),
             )
             .into_iter()
-            .map(|(view, dv)| PresentFrame {
-                view,
-                frame: bitty_render::geometry::RectPx::new(
-                    i32::from(dv.frame.x),
-                    i32::from(dv.frame.y),
-                    u32::from(dv.frame.width),
-                    u32::from(dv.frame.height),
-                ),
-                content: bitty_render::geometry::RectPx::new(
-                    i32::from(dv.content.x),
-                    i32::from(dv.content.y),
-                    u32::from(dv.content.width),
-                    u32::from(dv.content.height),
-                ),
-                cols: (u32::from(dv.content.width) / cw).clamp(1, max_dim) as u16,
-                rows: (u32::from(dv.content.height) / ch).clamp(1, max_dim) as u16,
-                border: dv.border,
-                radius: dv.radius,
-                tier: tiers.get(&view).copied().flatten(),
+            .map(|(view, dv)| {
+                // CTX-1058 (#1844 P1): mode-aware Float tier. The structural
+                // tier map covers `LayoutNode::Overlay` trees only; a leaf
+                // stamped `Floating` (or a shown `Scratchpad`) carries no
+                // structural tier, so honor the leaf mode here. The solver
+                // still ignores the mode (slot restore stays byte-identical);
+                // only the present tier and geometry lift.
+                let structural = tiers.get(&view).copied().flatten();
+                let mode_tier = self
+                    .layout
+                    .find_leaf(view)
+                    .and_then(|leaf| leaf.presentation().overlay_tier());
+                let tier = structural.or(mode_tier);
+                let (frame_rect, content_rect, border) =
+                    if structural.is_none() && mode_tier.is_some() {
+                        let float_rect = bitty_ui::presentation::float_frame(dv.frame, area);
+                        // Elevated float chrome: one extra border px so the
+                        // float reads distinct from tiled base; the content
+                        // inset grows with it so glyphs never sit under the
+                        // ring.
+                        let border = dv
+                            .border
+                            .saturating_add(bitty_ui::presentation::FLOAT_BORDER_EXTRA);
+                        // CodeRabbit 1873: cap the insets by the float frame
+                        // so a degenerate (tiny/empty) float rect keeps the
+                        // content origin inside the frame instead of
+                        // overshooting past its far edge.
+                        let inset_x = dv
+                            .content
+                            .x
+                            .saturating_sub(dv.frame.x)
+                            .saturating_add(bitty_ui::presentation::FLOAT_BORDER_EXTRA)
+                            .min(float_rect.width);
+                        let inset_y = dv
+                            .content
+                            .y
+                            .saturating_sub(dv.frame.y)
+                            .saturating_add(bitty_ui::presentation::FLOAT_BORDER_EXTRA)
+                            .min(float_rect.height);
+                        let content_rect = UiRect::new(
+                            float_rect.x.saturating_add(inset_x),
+                            float_rect.y.saturating_add(inset_y),
+                            float_rect.width.saturating_sub(inset_x.saturating_mul(2)),
+                            float_rect.height.saturating_sub(inset_y.saturating_mul(2)),
+                        );
+                        (float_rect, content_rect, border)
+                    } else {
+                        (dv.frame, dv.content, dv.border)
+                    };
+                PresentFrame {
+                    view,
+                    frame: bitty_render::geometry::RectPx::new(
+                        i32::from(frame_rect.x),
+                        i32::from(frame_rect.y),
+                        u32::from(frame_rect.width),
+                        u32::from(frame_rect.height),
+                    ),
+                    content: bitty_render::geometry::RectPx::new(
+                        i32::from(content_rect.x),
+                        i32::from(content_rect.y),
+                        u32::from(content_rect.width),
+                        u32::from(content_rect.height),
+                    ),
+                    cols: (u32::from(content_rect.width) / cw).clamp(1, max_dim) as u16,
+                    rows: (u32::from(content_rect.height) / ch).clamp(1, max_dim) as u16,
+                    border,
+                    radius: dv.radius,
+                    tier,
+                }
             })
             .collect();
         // CW-12: paint base content first, then tiers lowest-first.

@@ -47,6 +47,7 @@
 
 #![forbid(unsafe_code)]
 
+use crate::geometry::Rect;
 use crate::layout::OverlayTier;
 
 /// Requested per-leaf display mode on a workspace [`View`](crate::view::View).
@@ -273,6 +274,48 @@ pub fn apply_floating_toggle(
         return Err(FloatingToggleError::UnknownCommand(command.to_owned()));
     }
     toggle_floating(tree, target)
+}
+
+/// Share of the container a mode-floating leaf covers per axis (CTX-1058).
+const FLOAT_FRAME_NUM: u32 = 4;
+/// Denominator of the float-frame share (4/5 ~= 80% per axis).
+const FLOAT_FRAME_DEN: u32 = 5;
+
+/// Extra border ring px making mode-floating leaves visually distinct
+/// (CTX-1058 elevated float chrome).
+pub const FLOAT_BORDER_EXTRA: u16 = 1;
+
+/// Anchored float geometry for mode-floating leaves (CTX-1058, #1844 P1).
+///
+/// The tiling solver keeps ignoring `PresentationMode` (slot restore stays
+/// byte-identical), so a `Floating`-stamped leaf needs its present geometry
+/// from somewhere else: this helper. It returns a deterministic inset
+/// centered on `container` covering ~80% (4/5) of each axis, always clamped
+/// inside `container`. Overlap is allowed: floats over one container share
+/// the frame and paint in stable solver order.
+///
+/// Total over all inputs: an empty `container` yields an empty rect (the
+/// caller keeps the solver allocation or drops the frame); degenerate
+/// containers collapse to a 1px minimum clamped inside. `solver_allocation`
+/// documents the anchored (not free) contract and is reserved for a future
+/// cascade-offset variant; free floating rects stay a follow-up.
+#[must_use]
+pub fn float_frame(solver_allocation: Rect, container: Rect) -> Rect {
+    let _ = solver_allocation;
+    if container.is_empty() {
+        return Rect::zero();
+    }
+    let cw = u32::from(container.width);
+    let ch = u32::from(container.height);
+    let w = ((cw * FLOAT_FRAME_NUM / FLOAT_FRAME_DEN).max(1).min(cw)) as u16;
+    let h = ((ch * FLOAT_FRAME_NUM / FLOAT_FRAME_DEN).max(1).min(ch)) as u16;
+    let x = container
+        .x
+        .saturating_add(container.width.saturating_sub(w) / 2);
+    let y = container
+        .y
+        .saturating_add(container.height.saturating_sub(h) / 2);
+    Rect::new(x, y, w, h)
 }
 
 /// Error for [`apply_presentation_command`].
@@ -639,5 +682,48 @@ mod tests {
             );
             assert_eq!(tree, other);
         }
+    }
+
+    #[test]
+    fn float_frame_is_centered_eighty_percent() {
+        use crate::geometry::Rect;
+        // 100x40 container -> 80x32 frame centered at (10, 4).
+        assert_eq!(
+            float_frame(Rect::new(0, 0, 50, 40), Rect::new(0, 0, 100, 40)),
+            Rect::new(10, 4, 80, 32)
+        );
+        // Offset containers center within themselves.
+        assert_eq!(
+            float_frame(Rect::new(5, 5, 50, 20), Rect::new(5, 5, 100, 40)),
+            Rect::new(15, 9, 80, 32)
+        );
+        // The solver allocation never moves the frame (anchored, not free).
+        assert_eq!(
+            float_frame(Rect::new(60, 30, 10, 5), Rect::new(0, 0, 100, 40)),
+            float_frame(Rect::new(0, 0, 1, 1), Rect::new(0, 0, 100, 40))
+        );
+    }
+
+    #[test]
+    fn float_frame_is_total_and_clamped() {
+        use crate::geometry::Rect;
+        // Empty container: empty frame, never panics.
+        assert!(float_frame(Rect::new(0, 0, 10, 10), Rect::zero()).is_empty());
+        assert!(float_frame(Rect::zero(), Rect::new(0, 0, 0, 5)).is_empty());
+        // Degenerate containers collapse to a 1px minimum clamped inside.
+        assert_eq!(
+            float_frame(Rect::zero(), Rect::new(3, 7, 1, 1)),
+            Rect::new(3, 7, 1, 1)
+        );
+        // Small containers stay inside: 4x4 -> 3x3 centered at (0, 0).
+        let frame = float_frame(Rect::zero(), Rect::new(0, 0, 4, 4));
+        assert_eq!(frame, Rect::new(0, 0, 3, 3));
+        assert!(Rect::new(0, 0, 4, 4).contains(frame));
+        // Overlap allowed: floats over one container share the frame.
+        let container = Rect::new(0, 0, 80, 24);
+        assert_eq!(
+            float_frame(Rect::new(0, 0, 40, 24), container),
+            float_frame(Rect::new(40, 0, 40, 24), container)
+        );
     }
 }

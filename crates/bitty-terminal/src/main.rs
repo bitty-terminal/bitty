@@ -228,6 +228,7 @@ use bitty_runtime::Runtime;
 mod chrome_keys;
 mod cli;
 mod cmd;
+mod color;
 mod completion;
 mod component;
 mod composer_owner;

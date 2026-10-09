@@ -1018,27 +1018,29 @@ pub(crate) struct InitOptionItem {
     pub(crate) style_bg: Option<[u8; 3]>,
 }
 
-/// Pure color decision for tests: mirrors [`crate::list::color_enabled`]
-/// without touching the environment.
+/// Pure color decision for tests: mirrors [`crate::color::cli_color_enabled_impl`]
+/// without touching the environment or probing the terminal.
 pub(crate) fn init_color_enabled_impl(
     no_color_flag: bool,
     no_color_env: bool,
     term_is_dumb: bool,
+    stdout_is_tty: bool,
 ) -> bool {
-    !no_color_flag && !no_color_env && !term_is_dumb
+    crate::color::cli_color_enabled_impl(no_color_flag, no_color_env, term_is_dumb, stdout_is_tty)
 }
 
 /// Whether ANSI emphasis is allowed in init option lists.
 ///
-/// Existing convention only, no new mechanism: explicit `--no-color` (any of
+/// Unified CLI gate only, no new mechanism: explicit `--no-color` (any of
 /// the shared per-verb flags, set in lockstep for a pre-word flag),
-/// `NO_COLOR`, or `TERM=dumb` disables. Mirrors
-/// [`crate::list::color_enabled`].
+/// `NO_COLOR`, `TERM=dumb`, or piped stdout disables. Mirrors
+/// [`crate::color::cli_color_enabled`].
 pub(crate) fn init_color_enabled(no_color_flag: bool) -> bool {
     let no_color_env = std::env::var("NO_COLOR").is_ok();
     let term_is_dumb =
         matches!(std::env::var("TERM"), Ok(term) if term.trim().eq_ignore_ascii_case("dumb"));
-    init_color_enabled_impl(no_color_flag, no_color_env, term_is_dumb)
+    let stdout_is_tty = std::io::stdout().is_terminal();
+    init_color_enabled_impl(no_color_flag, no_color_env, term_is_dumb, stdout_is_tty)
 }
 
 /// Renders one option label: theme entries preview in their own style

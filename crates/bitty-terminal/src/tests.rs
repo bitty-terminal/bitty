@@ -5162,12 +5162,56 @@ fn init_option_list_color_previews_theme_and_marker() {
 
 #[test]
 fn init_color_enabled_impl_matches_convention() {
-    // Pure decision table: explicit flag, NO_COLOR, or dumb terminal
-    // disables; otherwise color is allowed.
-    assert!(!crate::init::init_color_enabled_impl(true, false, false));
-    assert!(!crate::init::init_color_enabled_impl(false, true, false));
-    assert!(!crate::init::init_color_enabled_impl(false, false, true));
-    assert!(crate::init::init_color_enabled_impl(false, false, false));
+    // Pure decision table: explicit flag, NO_COLOR, dumb terminal, or piped
+    // stdout disables; otherwise color is allowed.
+    assert!(!crate::init::init_color_enabled_impl(
+        true, false, false, true
+    ));
+    assert!(!crate::init::init_color_enabled_impl(
+        false, true, false, true
+    ));
+    assert!(!crate::init::init_color_enabled_impl(
+        false, false, true, true
+    ));
+    assert!(!crate::init::init_color_enabled_impl(
+        false, false, false, false
+    ));
+    assert!(crate::init::init_color_enabled_impl(
+        false, false, false, true
+    ));
+}
+
+#[test]
+fn unified_gate_help_piped_is_plain_forced_still_colors() {
+    // CTX-1065: bare help headings are bold only on a tty. The harness
+    // stdout is piped, so the live gate resolves to plain here.
+    use std::io::IsTerminal as _;
+    assert!(
+        !std::io::stdout().is_terminal(),
+        "test harness stdout must be piped for this assertion"
+    );
+    let args = parse_args(&args_of(&["bitty"]));
+    assert!(!crate::cli::help_color_enabled(&args));
+    let plain = crate::cli::help_text_short(false);
+    assert!(!plain.contains("\u{1b}"));
+    let piped = crate::cli::help_text_short(crate::cli::help_color_enabled(&args));
+    assert!(!piped.contains("\u{1b}"), "piped help must carry no ANSI");
+    // Forced color hook still renders headings bold even when piped.
+    let forced = crate::cli::help_text_short(true);
+    assert!(
+        forced.contains("\u{1b}[1mUsage:"),
+        "forced help color must carry bold headings"
+    );
+    // Explicit --no-color stays authoritative.
+    let no_color_args = parse_args(&args_of(&["bitty", "--no-color"]));
+    assert!(!crate::cli::help_color_enabled(&no_color_args));
+    // Pure gate: TERM=dumb disables even on a tty.
+    assert!(!crate::color::cli_color_enabled_impl(
+        false, false, true, true
+    ));
+    assert!(crate::color::cli_color_enabled_impl(
+        false, false, false, true
+    ));
 }
 
 // -- `bitty init` live preview + rollback (phase 2 of #1806) ------------

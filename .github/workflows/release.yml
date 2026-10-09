@@ -1413,3 +1413,88 @@ jobs:
             exit 1
           fi
           echo "All R2 objects verified against SHA256SUMS"
+
+  # CTX-1056 (#1794): publish the mutable stable version pointer after the
+  # immutable mirror verifies. latest.txt holds TAG (for example v0.0.23) with
+  # a trailing newline; install.sh/install.ps1 resolve TAG here, then derive
+  # VERSION by stripping the leading v. Short cache-control bounds staleness;
+  # scripts re-fetch every run. install.sh/install.ps1 uploads join this job
+  # when CTX-1047 Phase 2 lands the scripts; their keys and cache policy are
+  # reserved in packaging/README.md so Phase 2 changes no convention.
+  r2-stable:
+    name: Publish R2 stable pointers
+    needs: r2-mirror
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Write latest.txt
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "::error::ref name is not a version tag: $TAG" >&2
+            exit 1
+          fi
+          printf '%s\n' "$TAG" > latest.txt
+          cat latest.txt
+      - name: Install Wrangler
+        run: |
+          set -euo pipefail
+          npm install -g "wrangler@${WRANGLER_VERSION}"
+          wrangler --version
+      - name: Publish latest.txt to R2
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ]; then
+            echo "CLOUDFLARE_API_TOKEN is not set; cannot publish stable pointers" >&2
+            exit 1
+          fi
+          if [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
+            echo "CLOUDFLARE_ACCOUNT_ID is not set; cannot publish stable pointers" >&2
+            exit 1
+          fi
+          # Monotonic pointer: tag runs share one key but run in per-tag
+          # concurrency groups, so an older tag finishing later must not move
+          # latest.txt backward. Missing key means first publish and proceeds.
+          base() { printf '%s' "${1#v}" | cut -d- -f1; }
+          STORED="$(wrangler r2 object get "bitty/install/latest.txt" --remote --pipe 2>/dev/null | head -n 1 | tr -d '\r' || true)"
+          if [[ -n "${STORED:-}" && "$STORED" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]] && [ "$(printf '%s\n%s\n' "$(base "$TAG")" "$(base "$STORED")" | sort -V | head -n 1)" = "$(base "$TAG")" ] && [ "$(base "$TAG")" != "$(base "$STORED")" ]; then
+            echo "candidate $TAG older than stored $STORED; skipping stable-pointer update"
+            printf '%s\n' "$STORED" > retained.txt
+            touch stable.skip
+            if wrangler r2 object get "bitty/install/latest.txt" --remote --pipe | cmp - retained.txt; then
+              echo "verified retained pointer $STORED"
+            else
+              echo "::error::R2 content mismatch for retained pointer $STORED"
+              exit 1
+            fi
+            exit 0
+          fi
+          rm -f stable.skip
+          wrangler r2 object put "bitty/install/latest.txt" \
+            --file latest.txt --remote \
+            --cache-control "public, max-age=300, must-revalidate"
+      - name: Verify latest.txt read-back
+        run: |
+          set -euo pipefail
+          if [ -f stable.skip ]; then
+            if wrangler r2 object get "bitty/install/latest.txt" --remote --pipe | cmp - retained.txt; then
+              echo "verified retained pointer (byte-identical)"
+            else
+              echo "::error::R2 content mismatch for retained pointer"
+              exit 1
+            fi
+          elif wrangler r2 object get "bitty/install/latest.txt" --remote --pipe | cmp - latest.txt; then
+            echo "verified latest.txt (byte-identical)"
+          else
+            echo "::error::R2 content mismatch for latest.txt"
+            exit 1
+          fi

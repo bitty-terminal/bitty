@@ -190,3 +190,154 @@ expands each archive on a clean Ubuntu runner and runs `bin/bitty --version`.
 Plus nfpm packaging for linux x64/aarch64, a runtime-dependency gate (`ldd` + `readelf -d` vs the declared per-distro deps) for the x64 glibc and musl packages, clean-container install smoke jobs for Ubuntu/Fedora/Arch/Alpine, and optional AUR/Homebrew/Scoop bumps gated on secrets.
 
 All packaging keeps bounded contracts: no unbounded file lists, no unsafe, fixed version substitution, scripts are no-ops.
+
+## R2 bucket layout and CDN mapping (CTX-1056, closes #1794)
+
+Decision record for the R2/CDN publishing convention. R2 upload and CDN
+transport are owner-operated; this section decides bucket key names, the
+key-to-URL mapping, pointer classes with cache policies, checksum artifact
+names, and which artifact per OS the bootstrap scripts fetch. It uploads
+nothing. CTX-1047 Phase 2 implements `install.sh` and `install.ps1` against
+the literal URL templates below.
+
+`TAG` is the git tag with its leading `v` (for example `v0.0.23`) and doubles
+as the R2 path segment. `VERSION` is the same number without the leading `v`
+(for example `0.0.23`) and is what bundle, ZIP, and DMG file names embed.
+
+### Bucket and prefixes
+
+Bucket `bitty`. Every key keeps the `bitty/` root prefix so the one shipped
+and verified prefix never moves:
+
+| Prefix                                                             | Class                                 | State                                                    |
+| ------------------------------------------------------------------ | ------------------------------------- | -------------------------------------------------------- |
+| `bitty/releases/<TAG>/<artifact>`                                  | Immutable versioned release payload   | Shipped and verified by the `r2-mirror` job              |
+| `bitty/install/latest.txt`                                         | Mutable stable version pointer        | Published by the `r2-stable` job (new in this task)      |
+| `bitty/install/install.sh`                                         | Mutable stable script object          | Reserved; lands with CTX-1047 Phase 2, same cache policy |
+| `bitty/install/install.ps1`                                        | Mutable stable script object          | Reserved; lands with CTX-1047 Phase 2, same cache policy |
+| `bitty/components/<name>/<version>/<target>.tar.gz` + `SHA256SUMS` | Immutable versioned component payload | Reserved for #1792, not uploaded here                    |
+| `bitty/docs/<version>/<lang>.tar.gz`                               | Immutable versioned docs payload      | Reserved manual track, not uploaded here                 |
+
+### CDN key-to-URL mapping
+
+The CDN serves the bucket root one-to-one: the URL path is the full R2 key,
+including the `bitty/` prefix. Scripts must not strip it:
+
+```text
+https://cdn.bitty.run/<R2-key>
+https://cdn.bitty.run/bitty/releases/v0.0.23/SHA256SUMS
+https://cdn.bitty.run/bitty/install/latest.txt
+```
+
+### Pointer classes and cache policy
+
+| Class                                                            | Keys                                                               | `Cache-Control`                                                                                   |
+| ---------------------------------------------------------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------- |
+| Immutable versioned (`releases/`, future `components/`, `docs/`) | Every versioned artifact, sidecar, `SHA256SUMS`, `provenance.json` | `public, max-age=31536000, immutable` (already emitted by `r2-mirror`)                            |
+| Mutable stable (`install/`)                                      | `latest.txt`, `install.sh`, `install.ps1`                          | `public, max-age=300, must-revalidate` (5 minutes, bounded staleness; scripts re-fetch every run) |
+
+### Checksums and signatures
+
+Each artifact ships a `<artifact>.sha256` sidecar (one line,
+`<hex>  <filename>`, GNU `sha256sum` format) for single-file script-side
+verification, plus the aggregate `SHA256SUMS` and `provenance.json`
+(`commit`, `tag`, `date`, `toolchain`, `build_runner`) as the authoritative
+release manifest. Bootstrap scripts verify the sidecar and fail closed on
+mismatch. There are no signatures in 0.1.0: the Windows build is
+intentionally unsigned (paid signing deferred past 0.2.0 per #1810), so
+0.1.0 verifies by hash only. Sigstore or cosign stays a follow-up, not a
+silent addition.
+
+### Bootstrap artifacts per OS
+
+`install.sh` (Linux, macOS) and `install.ps1` (Windows) fetch exactly one
+artifact per OS and arch. OS and arch segments below are literal; only `TAG`
+and `VERSION` resolve at install time via `latest.txt`:
+
+| Script OS and arch         | Bootstrap artifact (literal template)                                                          |
+| -------------------------- | ---------------------------------------------------------------------------------------------- |
+| Linux x86_64 glibc         | `https://cdn.bitty.run/bitty/releases/<TAG>/bitty-<VERSION>-x86_64-unknown-linux-gnu.tar.zst`  |
+| Linux aarch64 glibc        | `https://cdn.bitty.run/bitty/releases/<TAG>/bitty-<VERSION>-aarch64-unknown-linux-gnu.tar.zst` |
+| Linux x86_64 musl (Alpine) | `https://cdn.bitty.run/bitty/releases/<TAG>/bitty-<VERSION>-x86_64-unknown-linux-musl.tar.zst` |
+| macOS arm64                | `https://cdn.bitty.run/bitty/releases/<TAG>/bitty-aarch64-apple-darwin`                        |
+| macOS x86_64               | `https://cdn.bitty.run/bitty/releases/<TAG>/bitty-x86_64-apple-darwin`                         |
+| Windows x64                | `https://cdn.bitty.run/bitty/releases/<TAG>/bitty-<VERSION>-windows-x86_64.zip`                |
+| Windows arm64              | `https://cdn.bitty.run/bitty/releases/<TAG>/bitty-aarch64-pc-windows-msvc.exe`                 |
+
+Each row has a `<artifact>.sha256` sidecar at the same URL with `.sha256`
+appended, which the script verifies before installing. Worked example at
+`TAG=v0.0.23`, `VERSION=0.0.23`:
+
+```text
+https://cdn.bitty.run/bitty/releases/v0.0.23/bitty-0.0.23-x86_64-unknown-linux-gnu.tar.zst
+https://cdn.bitty.run/bitty/releases/v0.0.23/bitty-0.0.23-aarch64-unknown-linux-gnu.tar.zst
+https://cdn.bitty.run/bitty/releases/v0.0.23/bitty-0.0.23-x86_64-unknown-linux-musl.tar.zst
+https://cdn.bitty.run/bitty/releases/v0.0.23/bitty-aarch64-apple-darwin
+https://cdn.bitty.run/bitty/releases/v0.0.23/bitty-x86_64-apple-darwin
+https://cdn.bitty.run/bitty/releases/v0.0.23/bitty-0.0.23-windows-x86_64.zip
+https://cdn.bitty.run/bitty/releases/v0.0.23/bitty-aarch64-pc-windows-msvc.exe
+```
+
+Rationale per OS:
+
+- Linux fetches the versioned `.tar.zst` bundle, not the bare triple binary.
+  The bundle (`scripts/make-unix-bundle.sh`, verified by `verify-unix-bundle`)
+  carries `bin/bitty` plus the desktop entry, icons, AppStream metainfo, and
+  `LICENSE`/`README.md`/`CHANGELOG.md` under one top-level directory; the bare
+  binary has no desktop integration. `install.sh` extracts `bin/bitty` and
+  installs `share/` alongside it. Musl/Alpine uses its own native-musl bundle,
+  never the glibc one.
+- macOS fetches the bare per-arch binary, not the Universal DMG. The DMG is an
+  interactive drag-to-install image (`hdiutil` mount plus Finder copy),
+  unsuitable for headless `curl | bash`; a bare binary is a single directly
+  executable file and is already the Homebrew fetch artifact. The DMG stays
+  the manual-download path.
+- Windows x64 fetches the portable ZIP (`scripts/make-windows-zip.sh`,
+  verified by `verify-windows-zip`): `bitty.exe` plus docs at the archive
+  root, expanded with `Expand-Archive`. Windows arm64 fetches the bare
+  `bitty-aarch64-pc-windows-msvc.exe` because the ZIP matrix builds x64 only;
+  both arches install first-class, only the container differs until the ZIP
+  matrix extends (recorded follow-up, not a parity gap).
+- FreeBSD Tier 2 is not a bootstrap target: no `install.sh` path serves the
+  `bitty-<VERSION>-x86_64-unknown-freebsd.tar.xz`; it stays manual download
+  and scripts fail closed there with guidance.
+
+### Stable entry points
+
+```sh
+curl -fsSL https://cdn.bitty.run/bitty/install/install.sh | bash
+```
+
+```powershell
+irm https://cdn.bitty.run/bitty/install/install.ps1 | iex
+```
+
+Both scripts resolve the version through one pointer:
+
+```sh
+curl -fsSL https://cdn.bitty.run/bitty/install/latest.txt
+```
+
+### latest.txt format
+
+Single line holding `TAG` with a trailing newline, for example `v0.0.23`.
+Scripts strip the leading `v` to derive `VERSION` for bundle and ZIP names.
+The `r2-stable` job writes and read-back-verifies this exact byte content on
+every tag push after `r2-mirror` succeeds.
+
+### Lifecycle and prune policy
+
+Versioned prefixes are immutable once published: re-runs only overwrite a key
+with byte-identical content (the existing `r2-mirror` convergence comment).
+Stable `install/` pointers move forward on every tag push. No prefix is
+pruned pre-0.1.0; any future retention rule needs its own decision, never a
+silent delete.
+
+### Workflow wiring
+
+`r2-mirror` keeps mirroring `dist/*` to `bitty/releases/<TAG>/` with immutable
+cache-control and read-back hash verification (unchanged). The new `r2-stable`
+job (needs `r2-mirror`) publishes `latest.txt` with the mutable cache policy
+and read-back-verifies it. `install.sh` and `install.ps1` uploads join
+`r2-stable` when CTX-1047 Phase 2 lands the scripts; their keys and cache
+policy are reserved here so Phase 2 changes no convention.

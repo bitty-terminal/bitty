@@ -243,7 +243,8 @@ Each artifact ships a `<artifact>.sha256` sidecar (one line,
 verification, plus the aggregate `SHA256SUMS` and `provenance.json`
 (`commit`, `tag`, `date`, `toolchain`, `build_runner`) as the authoritative
 release manifest. Bootstrap scripts verify the sidecar and fail closed on
-mismatch. There are no signatures in 0.1.0: the Windows build is
+mismatch. The FreeBSD binary and tarball share one
+`bitty-x86_64-unknown-freebsd.sha256` sidecar listing both files. There are no signatures in 0.1.0: the Windows build is
 intentionally unsigned (paid signing deferred past 0.2.0 per #1810), so
 0.1.0 verifies by hash only. Sigstore or cosign stays a follow-up, not a
 silent addition.
@@ -323,14 +324,19 @@ curl -fsSL https://cdn.bitty.run/bitty/install/latest.txt
 Single line holding `TAG` with a trailing newline, for example `v0.0.23`.
 Scripts strip the leading `v` to derive `VERSION` for bundle and ZIP names.
 The `r2-stable` job writes and read-back-verifies this exact byte content on
-every tag push after `r2-mirror` succeeds.
+every non-prerelease tag push after `r2-mirror` succeeds, skipping the write
+when the candidate is older than the stored pointer.
 
 ### Lifecycle and prune policy
 
 Versioned prefixes are immutable once published: re-runs only overwrite a key
 with byte-identical content (the existing `r2-mirror` convergence comment).
-Stable `install/` pointers move forward on every tag push. No prefix is
-pruned pre-0.1.0; any future retention rule needs its own decision, never a
+Stable `install/` pointers move forward only: `r2-stable` runs on
+non-prerelease version tags, compares the candidate against the stored
+`latest.txt` (a missing key means first publish and proceeds), skips the write
+when the candidate is older, and verifies the retained pointer on skip.
+Prerelease tags (any tag containing `-`) never update `latest.txt`. No prefix
+is pruned pre-0.1.0; any future retention rule needs its own decision, never a
 silent delete.
 
 ### Workflow wiring

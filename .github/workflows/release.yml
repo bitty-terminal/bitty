@@ -1426,7 +1426,7 @@ jobs:
     needs: r2-mirror
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
     env:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -1449,6 +1449,8 @@ jobs:
           npm install -g "wrangler@${WRANGLER_VERSION}"
           wrangler --version
       - name: Publish latest.txt to R2
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           if [ -z "${CLOUDFLARE_API_TOKEN:-}" ]; then
@@ -1459,13 +1461,38 @@ jobs:
             echo "CLOUDFLARE_ACCOUNT_ID is not set; cannot publish stable pointers" >&2
             exit 1
           fi
+          # Monotonic pointer: tag runs share one key but run in per-tag
+          # concurrency groups, so an older tag finishing later must not move
+          # latest.txt backward. Missing key means first publish and proceeds.
+          base() { printf '%s' "${1#v}" | cut -d- -f1; }
+          STORED="$(wrangler r2 object get "bitty/install/latest.txt" --remote --pipe 2>/dev/null | head -n 1 | tr -d '\r' || true)"
+          if [[ -n "${STORED:-}" && "$STORED" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]] && [ "$(printf '%s\n%s\n' "$(base "$TAG")" "$(base "$STORED")" | sort -V | head -n 1)" = "$(base "$TAG")" ] && [ "$(base "$TAG")" != "$(base "$STORED")" ]; then
+            echo "candidate $TAG older than stored $STORED; skipping stable-pointer update"
+            printf '%s\n' "$STORED" > retained.txt
+            touch stable.skip
+            if wrangler r2 object get "bitty/install/latest.txt" --remote --pipe | cmp - retained.txt; then
+              echo "verified retained pointer $STORED"
+            else
+              echo "::error::R2 content mismatch for retained pointer $STORED"
+              exit 1
+            fi
+            exit 0
+          fi
+          rm -f stable.skip
           wrangler r2 object put "bitty/install/latest.txt" \
             --file latest.txt --remote \
             --cache-control "public, max-age=300, must-revalidate"
       - name: Verify latest.txt read-back
         run: |
           set -euo pipefail
-          if wrangler r2 object get "bitty/install/latest.txt" --remote --pipe | cmp - latest.txt; then
+          if [ -f stable.skip ]; then
+            if wrangler r2 object get "bitty/install/latest.txt" --remote --pipe | cmp - retained.txt; then
+              echo "verified retained pointer (byte-identical)"
+            else
+              echo "::error::R2 content mismatch for retained pointer"
+              exit 1
+            fi
+          elif wrangler r2 object get "bitty/install/latest.txt" --remote --pipe | cmp - latest.txt; then
             echo "verified latest.txt (byte-identical)"
           else
             echo "::error::R2 content mismatch for latest.txt"

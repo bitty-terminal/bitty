@@ -166,12 +166,14 @@ const NUSHELL_SCRIPT: &str = r#"# bitty shell integration for Nushell (static; g
 # - Prompt hooks: OSC 7 cwd report plus OSC 133 prompt-start (A) and
 #   command-done-with-status (D) marks (observation only; ignored by
 #   terminals without support).
-$env.BITTY_SHELL_INIT = "1"
-$env.config = ($env.config | default {} hooks | upsert hooks.pre_prompt ((try { $env.config.hooks.pre_prompt } catch { [] }) ++ [{||
-    print -n $"\e]133;D;($env.LAST_EXIT_CODE)\e\\"
-    print -n $"\e]7;file://(sys host | get hostname)(pwd)\e\\"
-    print -n "\e]133;A\e\\"
-}]))
+if "BITTY_SHELL_INIT" not-in $env {
+    $env.BITTY_SHELL_INIT = "1"
+    $env.config = ($env.config | default {} hooks | upsert hooks.pre_prompt ((try { $env.config.hooks.pre_prompt } catch { [] }) ++ [{||
+        print -n $"\e]133;D;($env.LAST_EXIT_CODE)\e\\"
+        print -n $"\e]7;file://(sys host | get hostname)(pwd)\e\\"
+        print -n "\e]133;A\e\\"
+    }]))
+}
 bitty completion nushell | save -f ($nu.cache-dir | path join bitty-completion.nu)
 source ($nu.cache-dir | path join bitty-completion.nu)
 "#;
@@ -399,19 +401,49 @@ mod tests {
                 "shell {shell:?} wires Tab completion via {wire:?}"
             );
         }
-        // Every script is guarded against double-sourcing.
-        for shell in [
-            CompletionShell::Bash,
-            CompletionShell::Zsh,
-            CompletionShell::Fish,
-            CompletionShell::Powershell,
-            CompletionShell::Nushell,
-        ] {
+        // Every script guards its hook wiring with a shell-native
+        // conditional, so re-sourcing never duplicates hooks. Each guard
+        // must textually precede the hook it protects (marker presence
+        // alone is not enough: an unguarded marker would pass that check
+        // while still duplicating hooks on re-source).
+        let guards = [
+            (
+                CompletionShell::Bash,
+                r#"if [ -z "${_BITTY_SHELL_INIT:-}" ]"#,
+                "_bitty_prompt_hook",
+            ),
+            (
+                CompletionShell::Zsh,
+                "if (( ! ${+_BITTY_SHELL_INIT} ))",
+                "_bitty_prompt_hook",
+            ),
+            (
+                CompletionShell::Fish,
+                "if not set -q _BITTY_SHELL_INIT",
+                "_bitty_prompt_hook",
+            ),
+            (
+                CompletionShell::Powershell,
+                "if (-not (Test-Path variable:global:_BittyShellInit))",
+                "global:prompt",
+            ),
+            (
+                CompletionShell::Nushell,
+                r#"if "BITTY_SHELL_INIT" not-in $env"#,
+                "pre_prompt",
+            ),
+        ];
+        for (shell, guard, hook) in guards {
+            let script = shell_init_script(shell);
             assert!(
-                shell_init_script(shell).contains("_BITTY_SHELL_INIT")
-                    || shell_init_script(shell).contains("_BittyShellInit")
-                    || shell_init_script(shell).contains("BITTY_SHELL_INIT"),
-                "shell {shell:?} guards double-sourcing"
+                script.contains(guard),
+                "shell {shell:?} guards double-sourcing with {guard:?}"
+            );
+            let guard_pos = script.find(guard).unwrap_or(usize::MAX);
+            let hook_pos = script.find(hook).unwrap_or(0);
+            assert!(
+                guard_pos < hook_pos,
+                "shell {shell:?} guard precedes hook wiring"
             );
         }
     }

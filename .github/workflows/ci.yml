@@ -303,6 +303,14 @@ jobs:
         if: matrix.shard == 1
         run: bash scripts/tests/install-smoke.test.sh
 
+      # CTX-1063 (#1792): pin the R2 prebuilt component dist mechanics
+      # (per-target tarball + SHA256SUMS manifest + CDN URL templates)
+      # without network or uploads; the release-time R2 publisher lands
+      # with the first shippable component.
+      - name: Check component dist driver (fixture test)
+        if: matrix.shard == 1
+        run: bash scripts/tests/make-component-dist.test.sh
+
       - name: Lint GitHub Actions workflows
         if: matrix.shard == 1
         run: >-

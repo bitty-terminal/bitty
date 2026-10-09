@@ -175,6 +175,10 @@ fn real_init_source() -> (String, String) {
 }
 
 /// Real manifest source, same live-over-pin policy as [`real_init_source`].
+///
+/// Retained for future lifecycle flows that must drive the workspace manifest;
+/// Flow 7 intentionally bypasses it via [`pinned_manifest_source`].
+#[allow(dead_code)]
 fn real_manifest_source() -> (String, String) {
     let vendored = fixture_root().join("bitty-plugin.toml");
     let vendored_source =
@@ -192,6 +196,20 @@ fn real_manifest_source() -> (String, String) {
             }
         }
     }
+    (vendored_source, String::from("pin:composer@ef83875"))
+}
+
+/// Vendored-pin manifest source, bypassing the live-over-pin policy.
+///
+/// Flow 7 proves fail-closed `E_INCOMPATIBLE` against the pin floor
+/// (`bitty = ">=0.5,<1.0"`), so it must drive the pin hermetically: in dev
+/// workspaces the live checkout floor (`>=0.0.21`) is satisfied by the dev
+/// host and activation would fail later with `E_CAPTURE` instead. All other
+/// flows keep [`real_manifest_source`] with its drift note intact.
+fn pinned_manifest_source() -> (String, String) {
+    let vendored = fixture_root().join("bitty-plugin.toml");
+    let vendored_source =
+        std::fs::read_to_string(&vendored).expect("vendored composer manifest must exist");
     (vendored_source, String::from("pin:composer@ef83875"))
 }
 
@@ -889,9 +907,16 @@ fn write_minimal_plugin(
 fn driver_version_mismatch_disables_fail_closed() {
     use bitty_plugin_host::manifest::PluginId;
     let scratch = ScratchRoot::new("mismatch");
-    // The real manifest pins `bitty = ">=0.5,<1.0"` while the dev host
+    // The vendored pin declares `bitty = ">=0.5,<1.0"` while the dev host
     // reports `0.0.x`: activation must fail closed with E_INCOMPATIBLE.
-    let (manifest, provenance) = real_manifest_source();
+    // Hermetic by intent (bitty#1842): the pin source bypasses the
+    // live-over-pin drift policy so this holds in dev workspaces and CI
+    // alike; the live checkout floor (`>=0.0.21`) would satisfy the host.
+    let (manifest, provenance) = pinned_manifest_source();
+    assert!(
+        provenance.starts_with("pin:"),
+        "Flow 7 must drive the vendored pin, got ({provenance})"
+    );
     assert!(
         manifest.contains("bitty-terminal.composer"),
         "vendored manifest must declare the composer id ({provenance})"

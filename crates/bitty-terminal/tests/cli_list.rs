@@ -384,3 +384,86 @@ fn list_explicit_missing_socket_is_runtime_unavailable() {
         doc.text()
     );
 }
+
+#[test]
+fn list_themes_table_renders_swatches_when_color_supported() {
+    // Pin per child process (never the parent): TERM advertises color while
+    // NO_COLOR is removed, so the assertion is deterministic regardless of
+    // the ambient CI environment (same pattern as cli_help.rs).
+    let output = Command::new(BITTY_BIN)
+        .args(["list", "themes"])
+        .env("TERM", "xterm-256color")
+        .env_remove("NO_COLOR")
+        .output()
+        .expect("spawn bitty list themes with color");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "list themes must exit 0, stderr={:?}",
+        stderr(&output)
+    );
+    let text = stdout(&output);
+    assert!(
+        text.contains("\u{1b}[48;2;"),
+        "themes table must carry bg swatches when color is on, got {text:?}"
+    );
+    assert!(
+        text.contains("\u{1b}[38;2;"),
+        "themes table must carry fg sample text when color is on, got {text:?}"
+    );
+    // Hex stays greppable alongside the swatches.
+    assert!(text.contains("bitty-dark"));
+    assert!(text.contains("#1e1e2e"));
+}
+
+#[test]
+fn list_themes_no_color_flag_strips_swatches_but_keeps_hex() {
+    let output = Command::new(BITTY_BIN)
+        .args(["list", "themes", "--no-color"])
+        .env("TERM", "xterm-256color")
+        .env_remove("NO_COLOR")
+        .output()
+        .expect("spawn bitty list themes --no-color");
+    assert_eq!(output.status.code(), Some(0));
+    let text = stdout(&output);
+    assert!(
+        !text.contains('\u{1b}'),
+        "--no-color must strip swatches, got {text:?}"
+    );
+    assert!(text.contains("bitty-dark"));
+    assert!(text.contains("#1e1e2e"));
+}
+
+#[test]
+fn list_themes_no_color_env_strips_swatches() {
+    let output = Command::new(BITTY_BIN)
+        .args(["list", "themes"])
+        .env("TERM", "xterm-256color")
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("spawn bitty list themes with NO_COLOR=1");
+    assert_eq!(output.status.code(), Some(0));
+    let text = stdout(&output);
+    assert!(
+        !text.contains('\u{1b}'),
+        "NO_COLOR=1 must strip swatches, got {text:?}"
+    );
+    assert!(text.contains("#1e1e2e"));
+}
+
+#[test]
+fn list_themes_term_dumb_strips_swatches() {
+    let output = Command::new(BITTY_BIN)
+        .args(["list", "themes"])
+        .env("TERM", "dumb")
+        .env_remove("NO_COLOR")
+        .output()
+        .expect("spawn bitty list themes with TERM=dumb");
+    assert_eq!(output.status.code(), Some(0));
+    let text = stdout(&output);
+    assert!(
+        !text.contains('\u{1b}'),
+        "TERM=dumb must strip swatches, got {text:?}"
+    );
+    assert!(text.contains("#1e1e2e"));
+}

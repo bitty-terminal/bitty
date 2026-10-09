@@ -1341,10 +1341,68 @@ fn bold(s: &str, color: bool) -> String {
     }
 }
 
+/// Parse `#rrggbb` into RGB bytes.
+///
+/// Accepts exactly the shape [`rgb_to_hex`] emits (lowercase or uppercase
+/// hex, leading `#`). Returns `None` for any other shape so callers can
+/// fall back to plain hex rather than emitting a wrong swatch.
+#[must_use]
+pub fn parse_hex_rgb(hex: &str) -> Option<[u8; 3]> {
+    let digits = hex.strip_prefix('#')?;
+    if digits.len() != 6 || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let r = u8::from_str_radix(&digits[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&digits[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&digits[4..6], 16).ok()?;
+    Some([r, g, b])
+}
+
+/// Render a background cell: swatch block in the bg color plus plain hex.
+///
+/// The hex stays verbatim so the row remains greppable and existing
+/// `contains("#rrggbb")` assertions keep passing. Unparseable input falls
+/// back to the plain hex (never a wrong color).
+#[must_use]
+pub fn swatch_bg(hex: &str) -> String {
+    match parse_hex_rgb(hex) {
+        Some([r, g, b]) => format!("\u{1b}[48;2;{r};{g};{b}m  \u{1b}[0m {hex}"),
+        None => hex.to_string(),
+    }
+}
+
+/// Render a foreground cell: hex sample text in the fg color.
+///
+/// The hex stays verbatim (colored, not stripped) so the row remains
+/// greppable. Unparseable input falls back to the plain hex.
+#[must_use]
+pub fn swatch_fg(hex: &str) -> String {
+    match parse_hex_rgb(hex) {
+        Some([r, g, b]) => format!("\u{1b}[38;2;{r};{g};{b}m{hex}\u{1b}[0m"),
+        None => hex.to_string(),
+    }
+}
+
 /// Render themes as a human table.
+///
+/// When color is enabled (see [`color_enabled`]: no `--no-color`,
+/// no `NO_COLOR`, `TERM` is not `dumb`), the BACKGROUND column carries a
+/// truecolor swatch block (`48;2`) plus the hex, and the FOREGROUND column
+/// carries the hex as sample text in the fg color (`38;2`). JSON output is
+/// untouched (plain hex). Sibling `plugins`/`instances` tables print no
+/// color values, so they keep their plain-text cells unchanged.
 #[must_use]
 pub fn format_themes_table(themes: &[ThemeInfo], no_color: bool) -> String {
-    let color = color_enabled(no_color);
+    format_themes_table_with_color(themes, color_enabled(no_color))
+}
+
+/// Test hook: render the themes table with an explicit color decision.
+///
+/// `format_themes_table` resolves `color` via [`color_enabled`] (which reads
+/// process env); this hook takes it directly so unit tests stay
+/// deterministic without touching `NO_COLOR`/`TERM`.
+#[must_use]
+pub fn format_themes_table_with_color(themes: &[ThemeInfo], color: bool) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "{}\n",
@@ -1355,6 +1413,16 @@ pub fn format_themes_table(themes: &[ThemeInfo], no_color: bool) -> String {
         return out;
     }
     for t in themes {
+        let background = if color {
+            swatch_bg(&t.background)
+        } else {
+            t.background.clone()
+        };
+        let foreground = if color {
+            swatch_fg(&t.foreground)
+        } else {
+            t.foreground.clone()
+        };
         out.push_str(&format!(
             "{} {} {} {} {} {}\n",
             t.name,
@@ -1365,8 +1433,8 @@ pub fn format_themes_table(themes: &[ThemeInfo], no_color: bool) -> String {
                 t.aliases.join(",")
             },
             t.source,
-            t.background,
-            t.foreground
+            background,
+            foreground
         ));
     }
     out
@@ -1664,6 +1732,83 @@ mod tests {
         // Alias spelling propagates to the envelope command field.
         let alias = format_success_envelope("ls", ListKind::Themes, &themes, &[], &[]);
         assert!(alias.contains("\"command\":\"ls\""));
+    }
+
+    #[test]
+    fn parse_hex_rgb_accepts_rrggbb_and_rejects_other_shapes() {
+        assert_eq!(parse_hex_rgb("#1e1e2e"), Some([0x1e, 0x1e, 0x2e]));
+        assert_eq!(parse_hex_rgb("#CDD6F4"), Some([0xcd, 0xd6, 0xf4]));
+        assert_eq!(parse_hex_rgb("#000000"), Some([0, 0, 0]));
+        assert_eq!(parse_hex_rgb("#ffffff"), Some([0xff, 0xff, 0xff]));
+        assert_eq!(parse_hex_rgb("1e1e2e"), None);
+        assert_eq!(parse_hex_rgb("#1e1e2"), None);
+        assert_eq!(parse_hex_rgb("#1e1e2e00"), None);
+        assert_eq!(parse_hex_rgb("#zzzzzz"), None);
+        assert_eq!(parse_hex_rgb(""), None);
+    }
+
+    #[test]
+    fn swatch_cells_emit_truecolor_escapes_with_hex_intact() {
+        let bg = swatch_bg("#1e1e2e");
+        assert!(
+            bg.contains("\u{1b}[48;2;30;30;46m"),
+            "bg swatch must set truecolor background, got {bg:?}"
+        );
+        assert!(bg.contains("\u{1b}[0m"), "bg swatch must reset, got {bg:?}");
+        assert!(bg.contains("#1e1e2e"), "bg cell must keep hex, got {bg:?}");
+
+        let fg = swatch_fg("#cdd6f4");
+        assert!(
+            fg.contains("\u{1b}[38;2;205;214;244m"),
+            "fg swatch must set truecolor foreground, got {fg:?}"
+        );
+        assert!(fg.contains("\u{1b}[0m"), "fg swatch must reset, got {fg:?}");
+        assert!(fg.contains("#cdd6f4"), "fg cell must keep hex, got {fg:?}");
+
+        // Unparseable input never emits a wrong color.
+        assert_eq!(swatch_bg("not-a-color"), "not-a-color");
+        assert_eq!(swatch_fg("not-a-color"), "not-a-color");
+    }
+
+    #[test]
+    fn themes_table_color_on_carries_swatches_with_hex_intact() {
+        let themes = list_themes();
+        let table = format_themes_table_with_color(&themes, true);
+        assert!(
+            table.contains("\u{1b}[48;2;"),
+            "color-on table must carry bg swatches, got {:?}",
+            &table[..table.len().min(512)]
+        );
+        assert!(
+            table.contains("\u{1b}[38;2;"),
+            "color-on table must carry fg sample text, got {:?}",
+            &table[..table.len().min(512)]
+        );
+        // Hex stays greppable so existing assertions keep passing.
+        assert!(table.contains("bitty-dark"));
+        assert!(table.contains("#1e1e2e"));
+        assert!(table.contains("#cdd6f4"));
+    }
+
+    #[test]
+    fn themes_table_color_off_is_plain_hex_without_ansi() {
+        let themes = list_themes();
+        let plain = format_themes_table_with_color(&themes, false);
+        assert!(
+            !plain.contains("\u{1b}"),
+            "color-off table must carry no ANSI, got {:?}",
+            &plain[..plain.len().min(512)]
+        );
+        assert!(plain.contains("bitty-dark"));
+        assert!(plain.contains("#1e1e2e"));
+        assert!(plain.contains("#cdd6f4"));
+
+        // `no_color=true` forces the same plain shape regardless of env.
+        let via_flag = format_themes_table(&themes, true);
+        assert_eq!(
+            via_flag, plain,
+            "no_color=true must equal the explicit color-off rendering"
+        );
     }
 
     #[test]

@@ -20,6 +20,8 @@
 //! | `CSI Ps $ p` / `CSI ? Ps $ p` (DECRQM) | `CSI [?] Ps ; Pm $ y` (`Pm`: 0 unknown, 1 set, 2 reset) | [`decrqm_value`] reads live `State` |
 //! | `CSI 14 t` (XTWINOPS text area, pixels) | `CSI 4 ; height ; width t` | [`xtwinops_pixels_reply`]: focused leaf content grid × live cell metrics (exact multiples) |
 //! | `CSI 18 t` (XTWINOPS text area, cells) | `CSI 8 ; rows ; cols t` | [`xtwinops_cells_reply`]: focused leaf content grid |
+//! | `APC G f=.. a=q .. ST` (Kitty support probe) | `ESC _ G f=<f>,OK ST` or `ESC _ G f=<f>,ERROR ST` | [`kitty_probe_ok_reply`] / [`kitty_probe_err_reply`] |
+//! | `APC G a=q,i=..[p=..] ST` (Kitty image/placement status) | `ESC _ G i=<id>[,p=<pin>],s=<w>,v=<h>,OK ST` or `ESC _ G i=<id>[,p=<pin>],ERROR ST` | [`kitty_image_ok_reply`] / [`kitty_placement_ok_reply`] / [`kitty_image_err_reply`] |
 //!
 //! Values are bitty's TRUE capabilities, never borrowed prestige:
 //!
@@ -544,6 +546,84 @@ pub(crate) fn find_xtwinops(combined: &[u8], new_start: usize) -> Vec<u16> {
     out
 }
 
+/// Maximum bytes of one Kitty `a=q` answer (S2, #1849).
+///
+/// Every shape below is fixed-format with only bounded numeric fields
+/// (`u32` values are at most 10 digits), so even all-maximum digits stay
+/// two orders of magnitude under this bound. The builders `debug_assert`
+/// it; the unit tests assert it on all-maximum shapes.
+pub(crate) const KITTY_QUERY_REPLY_MAX_BYTES: usize = 1024;
+
+/// Kitty `a=q` image-status success reply (S2, #1849).
+///
+/// Bitty-defined fixed shape (no vendored Kitty response snapshot exists
+/// in the repo; mirrors the `DCS 1+r`/`0+r` accept/reject style above):
+/// `ESC _ G i=<id>,s=<w>,v=<h>,OK ESC \`, where `s=`/`v=` echo the held
+/// decoded dimensions. Always `ESC \` terminated, never `BEL`.
+#[must_use]
+pub(crate) fn kitty_image_ok_reply(image_id: u32, width: u32, height: u32) -> Vec<u8> {
+    let reply = format!("\x1b_Gi={image_id},s={width},v={height},OK\x1b\\").into_bytes();
+    debug_assert!(reply.len() < KITTY_QUERY_REPLY_MAX_BYTES);
+    reply
+}
+
+/// Kitty `a=q` placement-status success reply (S2, #1849).
+///
+/// Like [`kitty_image_ok_reply`] with the pinned placement echoed:
+/// `ESC _ G i=<id>,p=<pin>,s=<w>,v=<h>,OK ESC \`.
+#[must_use]
+pub(crate) fn kitty_placement_ok_reply(
+    image_id: u32,
+    placement_id: u32,
+    width: u32,
+    height: u32,
+) -> Vec<u8> {
+    let reply =
+        format!("\x1b_Gi={image_id},p={placement_id},s={width},v={height},OK\x1b\\").into_bytes();
+    debug_assert!(reply.len() < KITTY_QUERY_REPLY_MAX_BYTES);
+    reply
+}
+
+/// Kitty `a=q` support-probe success reply (S2, #1849).
+///
+/// The probe test-loads through the declared-size pre-check without
+/// storing; success answers `ESC _ G f=<f>,OK ESC \` (no `s=`/`v=`: the
+/// verdict is loadability, and PNG probes carry no meaningful claim).
+#[must_use]
+pub(crate) fn kitty_probe_ok_reply(format_f: u32) -> Vec<u8> {
+    let reply = format!("\x1b_Gf={format_f},OK\x1b\\").into_bytes();
+    debug_assert!(reply.len() < KITTY_QUERY_REPLY_MAX_BYTES);
+    reply
+}
+
+/// Kitty `a=q` failure reply for image/placement status (S2, #1849).
+///
+/// `ESC _ G i=<id>,ERROR ESC \` without a pin (unknown image for this
+/// origin, including unresolvable `I=` numbers reported as id `0`), or
+/// `ESC _ G i=<id>,p=<pin>,ERROR ESC \` for a named placement that is
+/// not held. Fixed `ERROR` token: the verdict is binary (held or not).
+#[must_use]
+pub(crate) fn kitty_image_err_reply(image_id: u32, placement_id: Option<u32>) -> Vec<u8> {
+    let reply = match placement_id {
+        Some(pin) => format!("\x1b_Gi={image_id},p={pin},ERROR\x1b\\"),
+        None => format!("\x1b_Gi={image_id},ERROR\x1b\\"),
+    }
+    .into_bytes();
+    debug_assert!(reply.len() < KITTY_QUERY_REPLY_MAX_BYTES);
+    reply
+}
+
+/// Kitty `a=q` support-probe failure reply (S2, #1849).
+///
+/// `ESC _ G f=<f>,ERROR ESC \`: unknown `f=`, a refused declared-size
+/// pre-check, or a store that would refuse under the quota caps.
+#[must_use]
+pub(crate) fn kitty_probe_err_reply(format_f: u32) -> Vec<u8> {
+    let reply = format!("\x1b_Gf={format_f},ERROR\x1b\\").into_bytes();
+    debug_assert!(reply.len() < KITTY_QUERY_REPLY_MAX_BYTES);
+    reply
+}
+
 // Precise [`UnrecognizedSequence`] triggers (kind/final/intermediates).
 // The parser maps every query below to `Unknown` today; matching the full
 // triple keeps unrelated sequences silent.
@@ -687,6 +767,36 @@ mod tests {
             find_decrqm(b"\x1b[?2 0$p", 0).is_empty(),
             "space fails closed"
         );
+    }
+
+    #[test]
+    fn kitty_query_replies_are_byte_exact_and_bounded() {
+        assert_eq!(kitty_image_ok_reply(7, 2, 2), b"\x1b_Gi=7,s=2,v=2,OK\x1b\\");
+        assert_eq!(
+            kitty_placement_ok_reply(7, 3, 2, 2),
+            b"\x1b_Gi=7,p=3,s=2,v=2,OK\x1b\\"
+        );
+        assert_eq!(kitty_probe_ok_reply(100), b"\x1b_Gf=100,OK\x1b\\");
+        assert_eq!(kitty_image_err_reply(99, None), b"\x1b_Gi=99,ERROR\x1b\\");
+        assert_eq!(
+            kitty_image_err_reply(7, Some(9)),
+            b"\x1b_Gi=7,p=9,ERROR\x1b\\"
+        );
+        assert_eq!(kitty_probe_err_reply(7), b"\x1b_Gf=7,ERROR\x1b\\");
+        // All-maximum digits stay far under the 1 KiB reply bound.
+        for reply in [
+            kitty_image_ok_reply(u32::MAX, u32::MAX, u32::MAX),
+            kitty_placement_ok_reply(u32::MAX, u32::MAX, u32::MAX, u32::MAX),
+            kitty_probe_ok_reply(u32::MAX),
+            kitty_image_err_reply(u32::MAX, Some(u32::MAX)),
+            kitty_probe_err_reply(u32::MAX),
+        ] {
+            assert!(
+                reply.len() < KITTY_QUERY_REPLY_MAX_BYTES,
+                "reply {} bytes exceeds bound",
+                reply.len()
+            );
+        }
     }
 
     #[test]

@@ -523,6 +523,9 @@ impl Runtime {
         // keep occupying the shared image/byte caps (S5 refuses cross-origin
         // eviction, so leaked slots would block other origins).
         self.kitty_images.retire_origin(Some(view.0));
+        // S6 (#1849): the retired origin's images and placements are gone,
+        // so their cached blits are dead budget; drop them.
+        self.invalidate_kitty_raster_cache();
         // Issue #1762: a respawn reuses the same `ViewId`, so drop its
         // pointer-shape stack with the old session. Without this the fresh
         // shell inherits the dead session's cursor (e.g. stuck `wait`) until
@@ -807,6 +810,9 @@ impl Runtime {
         // image pixels (origin tokens are `ViewId.0` values) and the dead
         // session's stored images stop occupying the shared caps.
         self.kitty_images.retire_origin(Some(view.0));
+        // S6 (#1849): the retired origin's images and placements are gone,
+        // so their cached blits are dead budget; drop them.
+        self.invalidate_kitty_raster_cache();
         // Issue #1762: a pane exit resets its pointer shape. Dropping the
         // closed leaf's stack means a later leaf reusing the numeric id
         // starts from the default pointer, and the focused icon falls back

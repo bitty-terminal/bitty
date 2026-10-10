@@ -1001,6 +1001,9 @@ impl Runtime {
                         .placement_for_origin_is_empty(self.kitty_origin)
                     {
                         self.kitty_images.clear_origin(self.kitty_origin);
+                        // S6 (#1849): placements are gone, so their cached
+                        // blits are dead budget; drop them.
+                        self.invalidate_kitty_raster_cache();
                         self.pending_full_redraw = true;
                     }
                 } else if let Some((image, pin)) = delete_wire {
@@ -1218,10 +1221,10 @@ impl Runtime {
                     }
                 );
             if screen_cleared {
-                // W-141: the raster cache moved to the extension; clearing
-                // placements is the Core-retained half (no cached blits to
-                // drop in Core anymore).
+                // S6 (#1849): placements are gone, so their cached blits
+                // are dead budget; drop them (images stay inert).
                 self.kitty_images.clear_origin(self.kitty_origin);
+                self.invalidate_kitty_raster_cache();
                 // S4 (#1849): full clears drop virtual prototypes too
                 // (terminal-truth `clear_screen` parity; grid runs die in
                 // the erase above).

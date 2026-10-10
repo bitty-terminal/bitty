@@ -3,8 +3,10 @@
 //! [`crate::kitty`] performs intake (chunked `m=` assembly, payloads held
 //! inert). The bounded Kitty payload decoder used to live here in
 //! `kitty_decode` (W-141 extraction): it now lives in the `bitty-graphics`
-//! extension crate, which also owns texture-preparation mechanics
-//! (nearest-neighbor scaling, the per-frame blit budget, the raster cache).
+//! extension crate, which mirrors texture-preparation mechanics
+//! (nearest-neighbor scaling, the per-frame blit budget, its own raster
+//! cache copy); Core owns its raster cache in [`crate::kitty_raster`]
+//! (S6, #1849).
 //! This module is the Core-retained placement-policy half: it stores
 //! caller-supplied decoded bitmaps (validated by [`checked_bitmap`]
 //! before admission), binds them to cursor-anchored cell rects, and derives
@@ -42,10 +44,9 @@
 //!   viewport; a placement fully outside the viewport paints nothing.
 //! - Z-order (documented model): grid cells (backgrounds + glyphs) and every
 //!   fill overlay (selection, cursor, banner, scrollbar) composite first;
-//!   kitty images are the **topmost** present-layer content, ordered by
-//!   ascending `z` (stable for equal `z`). They never mutate grid truth.
-//!   Known limitation: an image covering the cursor or selection cell hides
-//!   that fill where they overlap; cursor-on-top is follow-up work.
+//!   kitty images composite above cells, text, and selection fills,
+//!   ordered by ascending `z` (stable for equal `z`), but below the
+//!   focused cursor (#1849 S7 cursor-on-top). They never mutate grid truth.
 //!
 //! # Scroll (tied to grid rows)
 //!
@@ -102,12 +103,12 @@
 //!
 //! Residual posture (documented, not enforced here):
 //!
-//! - Within one origin, images stay topmost over that pane's own cursor and
-//!   selection fills (see "Placement semantics" above). Same-origin impact
+//! - Within one origin, images composite above that pane's own selection
+//!   fills but below its focused cursor (#1849 S7 cursor-on-top; see
+//!   "Placement semantics" above). Same-origin impact
 //!   is contained: the emitting program already controls every cell of its
 //!   own grid, so covering its own chrome adds no new spoof capability
-//!   beyond what PTY text already allows. Cursor-on-top remains follow-up
-//!   work.
+//!   beyond what PTY text already allows.
 //!
 //! # Bounds (threat T-01/T-02)
 //!
@@ -139,10 +140,12 @@
 //! blits / [`KITTY_PRESENT_MAX_BYTES_PER_FRAME`] bytes per frame
 //! (skip-and-continue in paint order), so the pathological 128-placement
 //! transient (128 x 64 MiB) can never materialize. The frame-budget
-//! accounting type and the scaled-blit raster cache moved to the
-//! `bitty-graphics` extension with the rest of the texture-preparation
-//! mechanics; the caps above stay Core-owned so the present layer keeps
-//! enforcing the same ceilings the parity tests pin.
+//! accounting type lives in the `bitty-graphics` extension with the rest
+//! of the texture-preparation mechanics (which keeps its own cache copy);
+//! Core owns its bounded raster cache alongside it
+//! ([`crate::kitty_raster::KittyRasterCache`], S6 #1849, same 32 / 64 MiB
+//! ceilings as here). The caps above stay Core-owned so the present layer
+//! keeps enforcing the same ceilings the parity tests pin.
 //!
 //! CTX-1087 (F11, #1891) normative declaration: this module is the ONE
 //! normative site for the Kitty present per-frame quotas (32 blits,
@@ -572,6 +575,14 @@ impl KittyPlacementId {
 pub struct KittyPlacedImage {
     /// Stable handle.
     pub id: KittyImageId,
+    /// Content generation for the raster-cache key (S6, #1849): assigned
+    /// from a monotonic store sequence at admission and never mutated
+    /// afterwards. The cache key binds `(id, generation)` instead of a
+    /// bare id so a future id reuse (counter wrap, currently only
+    /// theoretical at 2^64 stores) can never serve stale bytes: a reused
+    /// id carries a fresh generation and misses. Stored bitmaps are
+    /// otherwise immutable; a future in-place update path must bump this.
+    pub generation: u64,
     /// Origin token of the transmitting stream (S5 per-origin quotas,
     /// #1849): `None` for the primary grid, `Some(token)` for a split-pane
     /// session. The image counts against this origin's store quota and is
@@ -845,6 +856,7 @@ pub struct KittyImageLayer {
     total_bytes: usize,
     next_image_id: u64,
     next_placement_id: u64,
+    next_image_generation: u64,
 }
 
 impl KittyImageLayer {
@@ -858,6 +870,7 @@ impl KittyImageLayer {
             total_bytes: 0,
             next_image_id: 1,
             next_placement_id: 1,
+            next_image_generation: 1,
         }
     }
 
@@ -1187,8 +1200,11 @@ impl KittyImageLayer {
         }
         let id = KittyImageId(self.next_image_id);
         self.next_image_id = self.next_image_id.wrapping_add(1).max(1);
+        let generation = self.next_image_generation;
+        self.next_image_generation = self.next_image_generation.wrapping_add(1).max(1);
         self.images.push_back(KittyPlacedImage {
             id,
+            generation,
             origin,
             width,
             height,
@@ -1708,16 +1724,17 @@ pub fn placement_full_rect_for(
 }
 
 // ---------------------------------------------------------------------------
-// Texture-preparation mechanics (moved to `bitty-graphics`, W-141)
+// Texture-preparation mechanics (mirrored in `bitty-graphics`, W-141)
 // ---------------------------------------------------------------------------
 
-// Nearest-neighbor scaling (`rasterize`, `rasterize_clipped`), the
-// per-frame blit budget (`KittyFrameBudget`), and the bounded raster cache
-// (`KittyRasterKey`/`KittyRasterStats`/`KittyRasterCache` with the
-// `KITTY_RASTER_CACHE_MAX_*` caps) moved to the `bitty-graphics` extension
-// crate. The ceilings stay Core-owned above (`KITTY_PRESENT_MAX_*`) so the
-// present layer keeps enforcing identical bounds; pixel production awaits
-// the Core-to-extension call shape (not wired yet).
+// Nearest-neighbor scaling (`rasterize`, `rasterize_clipped`) and the
+// per-frame blit budget (`KittyFrameBudget`) are mirrored in the
+// `bitty-graphics` extension crate (which keeps its own cache copy).
+// Core owns its bounded raster cache in [`crate::kitty_raster`]
+// (`KittyRasterKey`/`KittyRasterCache` with the
+// `KITTY_RASTER_CACHE_MAX_*` caps, S6 #1849). The ceilings stay Core-owned
+// above (`KITTY_PRESENT_MAX_*`) so the present layer keeps enforcing
+// identical bounds.
 
 // ---------------------------------------------------------------------------
 // Small integer helpers (mirror the grid pipeline's saturating style)

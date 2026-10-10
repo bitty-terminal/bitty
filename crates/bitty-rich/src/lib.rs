@@ -165,7 +165,10 @@ pub use kitty_place::{
     KittyVirtualPrototype, placement_full_rect_for, placement_rect_for, precheck_declared_image,
     viewport_extent,
 };
-pub use kitty_raster::{rasterize_kitty, rasterize_kitty_clipped};
+pub use kitty_raster::{
+    KITTY_RASTER_CACHE_MAX_BYTES, KITTY_RASTER_CACHE_MAX_ENTRIES, KittyRasterCache, KittyRasterKey,
+    rasterize_kitty, rasterize_kitty_clipped,
+};
 pub use kitty_unicode::{
     KittyUnicodeRect, KittyUnicodeVirtual, unicode_run_rect, virtual_extent_cells,
 };

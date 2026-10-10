@@ -9,9 +9,9 @@
 //! Core owns the bounded decode ([`bitty_rich::kitty_decode`]: PNG via the
 //! `image` codec edge, raw RGB/RGBA inline; 8192 px/side, 4096 x 4096 px
 //! area, 64 MiB RGBA) and the raster step ([`bitty_rich::kitty_raster`]:
-//! uncached nearest-neighbor; the `bitty-graphics` extension holds its own
-//! copies plus a raster cache, and Core never depends on extension
-//! internals). Placement policy (admission, per-origin quotas, origin
+//! nearest-neighbor plus the Core-owned bounded raster cache, S6 #1849;
+//! the `bitty-graphics` extension holds its own copies plus its own cache,
+//! and Core never depends on extension internals). Placement policy (admission, per-origin quotas, origin
 //! tagging, alternate-screen suppression) is unchanged and unit-tested in
 //! `bitty-rich`.
 //!
@@ -50,9 +50,12 @@
 //! `i=`/`I=` stay silent like kitty's `REPORT_ERROR`-with-no-reply.
 //!
 //! Still deferred (blocked, recorded in the PR body): animation
-//! (`a=f`/`a=a`/`a=c`), local mediums (`t=f`/`t=t`/`t=s`
-//! file reads), the raster cache, and
-//! cursor-on-top compositing.//!
+//! (`a=f`/`a=a`/`a=c`) and local mediums (`t=f`/`t=t`/`t=s`
+//! file reads). The raster cache (S6, #1849) and cursor-on-top
+//! compositing (S7, #1849) are shipped: the present layer serves scaled
+//! blits from [`bitty_rich::KittyRasterCache`] (pure optimization over the
+//! uncached raster step) and the focused cursor punches through covering
+//! blits.//!
 //! Display anchors at the drained stream's cursor cell (the primary grid,
 //! or the pane session swapped in by `handle_pane_bytes`) with that
 //! grid's `State::scrollback_len()` as the scroll base (images scroll with
@@ -168,6 +171,52 @@ impl Runtime {
         self.kitty_last_frame_images
     }
 
+    /// Raster-cache hits since construction (S6, #1849, headless-observable
+    /// test seam: proves reuse across present ticks).
+    #[must_use]
+    pub fn kitty_raster_hits(&self) -> u64 {
+        self.kitty_raster_cache.hits()
+    }
+
+    /// Raster-cache misses since construction (S6, #1849, headless-observable
+    /// test seam: every miss falls back to the uncached raster path).
+    #[must_use]
+    pub fn kitty_raster_misses(&self) -> u64 {
+        self.kitty_raster_cache.misses()
+    }
+
+    /// Resident raster-cache entries (S6, #1849, headless-observable test
+    /// seam: bounded by 32, like the per-frame blit budget).
+    #[must_use]
+    pub fn kitty_raster_len(&self) -> usize {
+        self.kitty_raster_cache.len()
+    }
+
+    /// Resident raster-cache bytes (S6, #1849, headless-observable test
+    /// seam: bounded by 64 MiB, like the per-frame byte budget).
+    #[must_use]
+    pub fn kitty_raster_bytes(&self) -> usize {
+        self.kitty_raster_cache.total_bytes()
+    }
+
+    /// Enables or disables the raster cache (S6, #1849, disable-path test
+    /// seam: a disabled cache still paints via the uncached fallback, so
+    /// correctness never depends on it).
+    pub fn set_kitty_raster_enabled(&mut self, enabled: bool) {
+        self.kitty_raster_cache.set_enabled(enabled);
+    }
+
+    /// Drops every raster-cache entry (S6, #1849).
+    ///
+    /// Called after every layer mutation (store incl. eviction, protocol
+    /// delete, `clear_origin`, `retire_origin`) so no stale entry can
+    /// survive; the generation in the key is defense-in-depth for any
+    /// future mutation path. The next present re-warms from the uncached
+    /// path with byte-identical bytes.
+    pub(super) fn invalidate_kitty_raster_cache(&mut self) {
+        self.kitty_raster_cache.clear();
+    }
+
     /// Total encoded bytes buffered across all in-flight Kitty graphics streams
     /// (primary parser + all pane parsers). Used to enforce IMG-4 (256 MiB
     /// in-flight cap) before buffering more input. Returns 0 when all parsers
@@ -217,7 +266,8 @@ impl Runtime {
             .map_err(|err| KittyImageError::Decode(bitty_rich::KittyPrecheckError::from(err)))?;
         let compressed_len = payload.len();
         let origin = self.kitty_origin;
-        self.kitty_images
+        let id = self
+            .kitty_images
             .store_for_origin(
                 decoded.width,
                 decoded.height,
@@ -225,7 +275,11 @@ impl Runtime {
                 compressed_len,
                 origin,
             )
-            .map_err(KittyImageError::Placement)
+            .map_err(KittyImageError::Placement)?;
+        // S6 (#1849): a store may evict same-origin images, so drop cached
+        // blits wholesale; the next present re-warms byte-identically.
+        self.invalidate_kitty_raster_cache();
+        Ok(id)
     }
 
     /// Decodes and stores a Kitty image with owned payload.
@@ -249,7 +303,8 @@ impl Runtime {
         )
         .map_err(|err| KittyImageError::Decode(bitty_rich::KittyPrecheckError::from(err)))?;
         let origin = self.kitty_origin;
-        self.kitty_images
+        let id = self
+            .kitty_images
             .store_for_origin(
                 decoded.width,
                 decoded.height,
@@ -257,7 +312,11 @@ impl Runtime {
                 wire_len,
                 origin,
             )
-            .map_err(KittyImageError::Placement)
+            .map_err(KittyImageError::Placement)?;
+        // S6 (#1849): a store may evict same-origin images, so drop cached
+        // blits wholesale; the next present re-warms byte-identically.
+        self.invalidate_kitty_raster_cache();
+        Ok(id)
     }
 
     /// Shared wire-format admission + declared-size pre-check.
@@ -713,6 +772,9 @@ impl Runtime {
             .delete_by_wire(self.kitty_origin, image_id, placement_id);
         if removed > 0 {
             self.pending_full_redraw = true;
+            // S6 (#1849): placements are gone, so their cached blits are
+            // dead budget; drop them (images stay inert).
+            self.invalidate_kitty_raster_cache();
         }
         removed
     }

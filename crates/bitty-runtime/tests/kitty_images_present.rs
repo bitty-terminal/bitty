@@ -497,3 +497,101 @@ fn focused_cursor_wins_over_covering_image() {
         "non-cursor covered cell must stay image red"
     );
 }
+
+#[test]
+fn raster_cache_reuses_across_ticks_byte_identical() {
+    // S6 (#1849): the second present with unchanged placement geometry
+    // must serve the blit from the cache (hit) with the same composited
+    // blit count as the uncached first present.
+    let mut rt = make_runtime();
+    let _ = rt
+        .kitty_display_image(32, Some(2), Some(2), None, 2, 2, 1, &red_2x2(), 0)
+        .expect("display must succeed");
+    assert!(rt.tick().is_some(), "display forces a present");
+    assert_eq!(rt.kitty_last_frame_images(), 1);
+    assert_eq!(rt.kitty_raster_len(), 1, "first present warms one entry");
+    assert!(
+        rt.kitty_raster_misses() >= 1,
+        "first present must miss into the uncached path"
+    );
+    assert!(
+        rt.kitty_raster_bytes() <= 64 * 1024 * 1024,
+        "resident bytes stay under the 64 MiB ceiling"
+    );
+    // Grid damage without moving the placement: the image rect is
+    // unchanged, so the next present must hit.
+    rt.handle_pty_bytes(b"x");
+    assert!(rt.tick().is_some(), "grid damage must present again");
+    assert_eq!(
+        rt.kitty_last_frame_images(),
+        1,
+        "cached present must composite the same blit"
+    );
+    assert!(
+        rt.kitty_raster_hits() >= 1,
+        "second present with identical geometry must hit"
+    );
+    assert!(
+        rt.kitty_raster_len() <= 32,
+        "entries stay under the 32-entry ceiling"
+    );
+}
+
+#[test]
+fn raster_cache_disabled_still_paints_uncached() {
+    // S6 disable-path: a disabled cache still paints via the uncached
+    // fallback, so correctness never depends on it.
+    let mut rt = make_runtime();
+    rt.set_kitty_raster_enabled(false);
+    let _ = rt
+        .kitty_display_image(32, Some(2), Some(2), None, 2, 2, 1, &red_2x2(), 0)
+        .expect("display must succeed");
+    assert!(rt.tick().is_some(), "display forces a present");
+    assert_eq!(
+        rt.kitty_last_frame_images(),
+        1,
+        "disabled cache must still paint the blit uncached"
+    );
+    assert_eq!(rt.kitty_raster_hits(), 0, "disabled cache never hits");
+    assert_eq!(rt.kitty_raster_len(), 0, "disabled cache admits nothing");
+    // Re-enabling re-warms on the next present with identical bytes.
+    rt.set_kitty_raster_enabled(true);
+    rt.handle_pty_bytes(b"y");
+    assert!(rt.tick().is_some());
+    assert_eq!(rt.kitty_last_frame_images(), 1);
+    assert_eq!(
+        rt.kitty_raster_len(),
+        1,
+        "re-enabled cache re-warms from the uncached path"
+    );
+}
+
+#[test]
+fn raster_cache_invalidate_on_store_drops_stale() {
+    // S6 invalidation: a store (which may evict same-origin images) drops
+    // cached blits wholesale; the next present re-warms and still paints
+    // the live placement, never stale bytes.
+    let mut rt = make_runtime();
+    let _ = rt
+        .kitty_display_image(32, Some(2), Some(2), None, 2, 2, 1, &red_2x2(), 0)
+        .expect("display must succeed");
+    assert!(rt.tick().is_some());
+    assert_eq!(rt.kitty_raster_len(), 1, "first present warms the cache");
+    // Transmit-only store of a blue image: clears the cache, places nothing.
+    let blue = [0x00, 0x00, 0xFF, 0xFF].repeat(4);
+    rt.kitty_transmit_image(32, Some(2), Some(2), &blue, 16)
+        .expect("transmit must succeed");
+    assert_eq!(
+        rt.kitty_raster_len(),
+        0,
+        "store must invalidate cached blits"
+    );
+    assert_eq!(rt.kitty_placement_count(), 1, "red placement survives");
+    rt.handle_pty_bytes(b"z");
+    assert!(rt.tick().is_some());
+    assert_eq!(
+        rt.kitty_last_frame_images(),
+        1,
+        "live placement re-warms and still paints after invalidation"
+    );
+}

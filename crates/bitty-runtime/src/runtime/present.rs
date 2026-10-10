@@ -807,6 +807,13 @@ impl Runtime {
     /// and hostile cell metrics must never wrap the products. A zero-span
     /// cursor punches nothing. The punch window is the exact rect pushed
     /// as the overlay fill, so fill and hole can never disagree.
+    ///
+    /// Owned-buffer invariant (S6, #1849): every blit here owns its `rgba`
+    /// (`Vec<u8>`, built from an owned raster output — cache hits are
+    /// cloned before compositing, never shared). The in-place zeroing is
+    /// safe only because of that; a future cache must keep handing out
+    /// owned buffers (clone-before-write) and never alias resident bytes
+    /// into these blits.
     fn punch_cursor_from_kitty_images(
         images: &mut [bitty_render::grid::ImageBlit],
         cursor: bitty_render::geometry::RectPx,
@@ -2657,12 +2664,16 @@ impl Runtime {
     /// the cursor wins regardless of image z. The 32-blit / 64-MiB budget
     /// counts kitty blits only; the cursor overlay is never counted.
     ///
-    /// Raster is the Core-owned uncached nearest-neighbor step
+    /// Raster is the Core-owned nearest-neighbor step
     /// ([`bitty_rich::rasterize_kitty_clipped`]; the extension holds its own
-    /// copy plus a cache): the image scales into the unclamped placement
+    /// copy plus its own cache): the image scales into the unclamped placement
     /// extent and only the viewport-visible window is allocated, so a
     /// partially visible placement paints at true scale instead of
-    /// squeezing into its clip. Per-frame budget enforcement uses the
+    /// squeezing into its clip. S6 (#1849) serves repeats from the bounded
+    /// [`bitty_rich::KittyRasterCache`] (32 entries / 64 MiB, owned clones
+    /// so the S7 punch stays safe); a miss — or a disabled cache — falls
+    /// back to the uncached path with byte-identical bytes, so correctness
+    /// never depends on it. Per-frame budget enforcement uses the
     /// Core-retained [`bitty_rich::KITTY_PRESENT_MAX_BLITS_PER_FRAME`] /
     /// [`bitty_rich::KITTY_PRESENT_MAX_BYTES_PER_FRAME`] ceilings with
     /// skip-and-continue in paint order.
@@ -2723,6 +2734,9 @@ impl Runtime {
             if alt_active {
                 if !self.kitty_images.placement_for_origin_is_empty(pane_origin) {
                     self.kitty_images.clear_origin(pane_origin);
+                    // S6 (#1849): placements are gone, so their cached
+                    // blits are dead budget; drop them (images stay inert).
+                    self.invalidate_kitty_raster_cache();
                 }
                 continue;
             }
@@ -2779,9 +2793,24 @@ impl Runtime {
                 if next > bitty_rich::KITTY_PRESENT_MAX_BYTES_PER_FRAME {
                     continue;
                 }
-                let Some(rgba) = bitty_rich::rasterize_kitty_clipped(stored, full_px, rect_px)
-                else {
-                    continue;
+                // S6 (#1849): serve repeats from the bounded raster cache;
+                // a miss (or a disabled cache) falls back to the uncached
+                // path with byte-identical bytes, so correctness never
+                // depends on the cache. The key binds (id, generation) —
+                // never a bare id — plus frame 0 (S1 future) and the
+                // full/visible geometry.
+                let cache_key = bitty_rich::KittyRasterKey::for_image(stored, 0, full_px, rect_px);
+                let rgba = if let Some(hit) = self.kitty_raster_cache.get(&cache_key) {
+                    hit
+                } else {
+                    let Some(fresh) = bitty_rich::rasterize_kitty_clipped(stored, full_px, rect_px)
+                    else {
+                        continue;
+                    };
+                    // Admit an owned clone; an oversize blit is simply not
+                    // admitted yet still paints uncached this frame.
+                    let _ = self.kitty_raster_cache.insert(cache_key, fresh.clone());
+                    fresh
                 };
                 // Leaf fills/glyphs translate by the pane content origin
                 // (window padding already added); image blits use the same

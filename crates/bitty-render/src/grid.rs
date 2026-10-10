@@ -1503,8 +1503,9 @@ pub struct GlyphInstance {
 /// rich layer rasterized to the exact destination extent. `rgba` is
 /// straight-alpha RGBA8, row-major, exactly
 /// `dest.width * dest.height * 4` bytes. Paint order is after fills and
-/// glyphs: images are the topmost present-layer content (above cells,
-/// text, and fill overlays such as selection/cursor), and they never
+/// glyphs: images composite above cells, text, and fill overlays such as
+/// selection, but below the focused cursor (#1849 S7 cursor-on-top punches
+/// the cursor rect out of covering blits), and they never
 /// mutate grid truth. Both CPU compositors (`headless_present` and the
 /// `sw-fallback` `draw_list_onto`) blend every entry, and the real-GPU
 /// pipeline uploads each entry into an RGBA texture and blits it last

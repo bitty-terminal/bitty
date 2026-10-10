@@ -1101,9 +1101,18 @@ pub struct Runtime {
     /// own leaf (cross-pane spoof prevention). Always restored after
     /// the pane pump; never observed outside the drain path.
     kitty_origin: Option<u64>,
-    // W-141: the scaled-blit raster cache moved to the `bitty-graphics`
-    // extension with the rest of the texture-preparation mechanics. No
-    // Core-owned replacement: blit production awaits the extension wiring.
+    /// Scaled-blit raster cache across present frames (S6, #1849), keyed
+    /// by image identity plus content generation (never a bare id), frame
+    /// index, and full/visible geometry.
+    ///
+    /// Pure optimization over [`bitty_rich::rasterize_kitty_clipped`]: a
+    /// miss falls back to the uncached path, so correctness never depends
+    /// on it. Bounded to 32 entries / 64 MiB (the per-frame ceilings);
+    /// cleared wholesale on every layer mutation (store incl. eviction,
+    /// protocol delete, `clear_origin`, `retire_origin`) so no stale entry
+    /// can survive, with the generation in the key as defense-in-depth.
+    /// Hits hand out owned clones so the S7 cursor punch stays safe.
+    kitty_raster_cache: bitty_rich::KittyRasterCache,
     /// Image blits composited on the last presented frame (CTX-0252 F2).
     ///
     /// Latched on every successful present; idle ticks leave it unchanged.
@@ -1606,6 +1615,7 @@ impl Runtime {
             inspect_ring: crate::inspect::InputRing::new(),
             kitty_images: bitty_rich::KittyImageLayer::new(),
             kitty_origin: None,
+            kitty_raster_cache: bitty_rich::KittyRasterCache::new(),
             kitty_last_frame_images: 0,
             kitty_alt_screens_latched: std::collections::BTreeSet::new(),
             backgrounds: bitty_rich::BackgroundStore::deny_all(),
@@ -1853,6 +1863,7 @@ impl Runtime {
             inspect_ring: crate::inspect::InputRing::new(),
             kitty_images: bitty_rich::KittyImageLayer::new(),
             kitty_origin: None,
+            kitty_raster_cache: bitty_rich::KittyRasterCache::new(),
             kitty_last_frame_images: 0,
             kitty_alt_screens_latched: std::collections::BTreeSet::new(),
             backgrounds: bitty_rich::BackgroundStore::deny_all(),

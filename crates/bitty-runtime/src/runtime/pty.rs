@@ -985,6 +985,32 @@ impl Runtime {
                 }
                 continue;
             }
+            // Kitty queries (S2, #1849): `a=q` never stores or places.
+            // The parser already reassembles the (single-shot) command and
+            // validates the query shape (`f=` mandatory, `q=` 0/1/2); the
+            // answer seam test-loads spec probes (`i=` plus payload,
+            // `Gi=<id>;OK` or `;EINVAL:`/`;ENOSPC:`) without storing and
+            // resolves payload-less status lookups against the
+            // origin-scoped store (`Gi=...;OK` or `;ENOENT:`), queueing at
+            // most one bounded spec-shaped reply honoring `q=`
+            // suppression (silence when no `i=`/`I=`, like kitty). Must run
+            // before the pixel pipeline below, which would otherwise
+            // decode-and-store the probe bytes as an image.
+            if let TerminalAction::KittyGraphics {
+                action_a: Some('q'),
+                format_f,
+                width_s,
+                height_v,
+                payload,
+                control,
+                ..
+            } = action
+            {
+                self.answer_kitty_query(format_f, width_s, height_v, &payload, control);
+                // The query is answered (at most one bounded reply queued);
+                // the action is moved, so continue to the next one.
+                continue;
+            }
             if let TerminalAction::KittyGraphics {
                 format_f,
                 width_s,

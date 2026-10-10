@@ -1279,7 +1279,8 @@ impl KittyApcAssembler {
 /// Data-carrying actions (absent action, `a=T`/`a=t`, frame data `a=f`,
 /// query `a=q`) require `f=`; control-only actions
 /// (`a=p`/`a=d`/`a=a`/`a=c`) omit it. `i=` and `I=` together are an error (the specification mandates
-/// `EINVAL`); `o=` accepts only `z`; `t=` accepts only `d`/`f`/`t`/`s`.
+/// `EINVAL`); `o=` accepts only `z`; `t=` accepts only `d`/`f`/`t`/`s`;
+/// `a=q` accepts only `q=` 0/1/2 (the specified suppression levels).
 fn parse_control(control: &[u8]) -> Result<KittyApcParams, KittyApcReject> {
     if control.is_empty() {
         return Err(KittyApcReject::MissingFormat);
@@ -1433,6 +1434,15 @@ fn parse_control(control: &[u8]) -> Result<KittyApcParams, KittyApcReject> {
     // `i=` and `I=` together are a specification error: fail closed
     // rather than guessing which identity the client meant.
     if keys.image_id != 0 && keys.image_number != 0 {
+        return Err(KittyApcReject::MalformedControl);
+    }
+    // `a=q` answers are bounded single replies with three suppression
+    // levels (`q=` 0 replies, 1 suppresses `OK`, 2 suppresses failures
+    // too): only those levels exist, so anything else is a malformed
+    // query, rejected fail-closed like the other strict known keys.
+    // Other actions keep accepting any `q=` byte (their suppression is
+    // honored the same way downstream where it applies).
+    if action_a == Some('q') && keys.quiet > 2 {
         return Err(KittyApcReject::MalformedControl);
     }
     // `a=q` is a query action, but the specification's support probe
@@ -2583,6 +2593,37 @@ mod tests {
             KittyFeedOutcome::Rejected(KittyApcReject::MissingFormat)
         ));
         assert!(!assembler.has_pending());
+    }
+
+    #[test]
+    fn query_quiet_range_validated() {
+        // `q=` 0/1/2 are the specified suppression levels: they parse on
+        // `a=q` (empty probe payload completes; the runtime answers).
+        for quiet in [0u8, 1, 2] {
+            let raw = format!("Gf=32,a=q,i=5,q={quiet};");
+            let done = completed(raw.as_bytes());
+            assert_eq!(done.action_a, Some('q'));
+            assert_eq!(done.keys.quiet, quiet);
+        }
+        // Anything else on `a=q` is a malformed query: fail closed.
+        for raw in [
+            b"Gf=32,a=q,i=5,q=3;".as_slice(),
+            b"Gf=32,a=q,i=5,q=9;".as_slice(),
+            b"Gf=32,a=q,i=5,q=255;".as_slice(),
+        ] {
+            let mut assembler = KittyApcAssembler::new();
+            assert!(
+                matches!(
+                    assembler.feed(raw),
+                    KittyFeedOutcome::Rejected(KittyApcReject::MalformedControl)
+                ),
+                "expected MalformedControl for {raw:?}"
+            );
+            assert!(!assembler.has_pending());
+        }
+        // Scoped to queries: other actions keep accepting any `q=` byte.
+        let done = completed(b"Gf=32,s=1,v=1,q=9,m=0;/wAA/w==");
+        assert_eq!(done.keys.quiet, 9);
     }
 
     #[test]

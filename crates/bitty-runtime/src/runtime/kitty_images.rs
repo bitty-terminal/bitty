@@ -36,9 +36,22 @@
 //! image layer, not in cells), except for app-emitted `U+10EEEE`
 //! placeholder runs, which occupy ordinary cells by design.
 //!
+//! Queries (`a=q`) are answered here (S2, #1849) in spec-exact wire
+//! shape (`recording/references/kitty@0b12ed8`, GPL-3.0-only:
+//! `docs/graphics-protocol.rst:430,476,480,500`,
+//! `kitty/graphics.c:927-951,2540-2549`,
+//! `kitty_tests/graphics.py:40-52`): support probes (`i=` plus payload
+//! bytes) test-load through the declared-size pre-check without storing,
+//! answering `Gi=<id>;OK` or `Gi=<id>;EINVAL:<msg>`/`;ENOSPC:<msg>`;
+//! payload-less `i=`/`I=`/`p=` lookups (bitty extension, no Kitty
+//! counterpart, kept only in spec shape) answer `Gi=...;OK` or
+//! `;ENOENT:<msg>`. At most one bounded reply per query, honoring `q=`
+//! suppression (see [`Runtime::answer_kitty_query`]); queries without
+//! `i=`/`I=` stay silent like kitty's `REPORT_ERROR`-with-no-reply.
+//!
 //! Still deferred (blocked, recorded in the PR body): `a=p` virtual
 //! (`U=1`) store bookkeeping beyond the grid-cell runs, animation
-//! (`a=f`/`a=a`/`a=c`), queries (`a=q`), local mediums (`t=f`/`t=t`/`t=s`
+//! (`a=f`/`a=a`/`a=c`), local mediums (`t=f`/`t=t`/`t=s`
 //! file reads), the raster cache, and
 //! cursor-on-top compositing.//!
 //! Display anchors at the drained stream's cursor cell (the primary grid,
@@ -600,6 +613,242 @@ impl Runtime {
             self.pending_full_redraw = true;
         }
         removed
+    }
+
+    /// Answers one Kitty `a=q` query with at most one bounded reply (S2, #1849).
+    ///
+    /// Spec-exact wire shape (`recording/references/kitty@0b12ed8`,
+    /// GPL-3.0-only; see [`crate::queries`]): `;` separator, `OK` or
+    /// `CODE:msg`, identity echo (`i=`/`I=`/`p=`), never `s=`/`v=`/`f=`.
+    /// The parser already reassembles the (single-shot) command and
+    /// validates the query shape (`f=` mandatory, `q=` 0/1/2); this seam
+    /// only answers. Queries never store, place, evict, or allocate pixel
+    /// buffers:
+    ///
+    /// - Support probe, spec (`i=` non-zero plus payload bytes): the
+    ///   terminal tries to load the image and answers whether loading
+    ///   was successful, without storing or replacing
+    ///   (`docs/graphics-protocol.rst:440-442`). Test-loads the
+    ///   declaration through [`bitty_rich::precheck_declared_image`]:
+    ///   unknown `f=` and refused declarations answer
+    ///   `Gi=<id>;EINVAL:<msg>`, quota-full stores answer
+    ///   `Gi=<id>;ENOSPC:store full`, otherwise `Gi=<id>;OK`. A `p=` on a
+    ///   probe is ignored (kitty `graphics.c:2549` echoes only `q_iid`).
+    ///   Probes REQUIRE `i=` (spec-exact, decided per the open point):
+    ///   kitty `REPORT_ERROR`s with no reply when `!q_iid`
+    ///   (`graphics.c:2540-2543`), and bitty stays silent too — no
+    ///   `f=`-echo extension is kept, because it would break the client's
+    ///   `partition(';')` parser with zero interop value while native
+    ///   clients always send `i=` per the spec example.
+    /// - Payload-less status lookup, bitty extension in spec shape (no
+    ///   Kitty counterpart: kitty `a=q` always test-loads bytes):
+    ///   `i=` non-zero with empty payload, or `I=` (resolved through
+    ///   terminal truth like the `d=n` delete path; payload ignored),
+    ///   looks up the origin-scoped wire identity
+    ///   (`self.kitty_origin`: `None` primary, `Some` pane session)
+    ///   against the S5 quota-scoped store, mirroring protocol deletion
+    ///   matching — image-level without `p=`, one pinned placement with
+    ///   `p=` (`p=0` behaves as absent, as at the delete call site;
+    ///   `i=0`/unresolvable numbers name nothing held). answers
+    ///   `Gi=...;OK` or `Gi=...;ENOENT:not held`. Kitty-native clients
+    ///   always send payload plus `i=`, so they never hit this path and
+    ///   are unaffected.
+    /// - No `i=`/`I=`: silence (no reply built), matching kitty's
+    ///   `REPORT_ERROR`-with-no-reply. Suppression is irrelevant there.
+    ///
+    /// The reply (when built) is one fixed-format `APC G` answer (always
+    /// < 1 KiB) queued through the bounded `Reply` action, so the 4 KiB
+    /// reply cap (drop-whole past the cap plus overflow flag) and the
+    /// `poll_pty -> write_replies` flush path apply unchanged. Wire `q=`
+    /// suppression is honored: `0` replies, `1` suppresses `OK`, `2`
+    /// suppresses failures too (the parser admits only 0/1/2 on `a=q`;
+    /// anything else suppresses defensively like `2`). Failures are
+    /// silent protocol answers, never stderr: a probing client must not
+    /// flood diagnostics.
+    ///
+    /// Time O(placements) on a scan bounded by the layer caps; space O(1)
+    /// besides the sub-1-KiB reply.
+    pub(crate) fn answer_kitty_query(
+        &mut self,
+        format_f: u32,
+        width_s: Option<u32>,
+        height_v: Option<u32>,
+        payload: &[u8],
+        control: bitty_vt::KittyControlKeys,
+    ) {
+        let Some((reply, ok)) =
+            self.kitty_query_verdict(format_f, width_s, height_v, payload, &control)
+        else {
+            // Spec-exact silence for queries without `i=`/`I=` (kitty
+            // `REPORT_ERROR` with no reply).
+            return;
+        };
+        let suppressed = control.quiet >= 2 || (control.quiet == 1 && ok);
+        if suppressed {
+            return;
+        }
+        self.state.apply(&TerminalAction::Reply {
+            bytes: reply.into_boxed_slice(),
+        });
+    }
+
+    /// Computes one query verdict: the reply bytes plus whether it is `OK`.
+    ///
+    /// Returns `None` for spec-exact silence (no `i=`/`I=` identity).
+    /// Pure besides the terminal-truth number lookup; the caller owns
+    /// suppression and queueing (see [`Self::answer_kitty_query`]).
+    fn kitty_query_verdict(
+        &self,
+        format_f: u32,
+        width_s: Option<u32>,
+        height_v: Option<u32>,
+        payload: &[u8],
+        control: &bitty_vt::KittyControlKeys,
+    ) -> Option<(Vec<u8>, bool)> {
+        // `I=` queries (mutually exclusive with `i=` per the parser) are
+        // always payload-less status lookups (extension): the number
+        // resolves through terminal truth, the payload (if any) is
+        // ignored, and the reply echoes the queried `I=` plus the
+        // resolved `i=` (transmit echo pattern). Kitty-native clients
+        // never send `I=` on queries, so they are unaffected.
+        if control.image_id == 0 && control.image_number != 0 {
+            let queried = control.image_number;
+            // `I=` numbers resolve through terminal truth like the
+            // `d=n` delete path; unresolvable numbers resolve to `0`,
+            // which is never held (anonymous images are not
+            // addressable, as for deletion).
+            let resolved = self
+                .state
+                .kitty_placements()
+                .newest_with_number(queried)
+                .unwrap_or(0);
+            // `p=0` behaves as absent (image-level), as at the delete
+            // call site: only a non-zero pin addresses one placement.
+            let pin = if control.placement_id == 0 {
+                None
+            } else {
+                Some(control.placement_id)
+            };
+            if resolved != 0 && self.kitty_status_held(resolved, pin) {
+                return Some((
+                    crate::queries::kitty_status_ok_reply(resolved, queried, pin),
+                    true,
+                ));
+            }
+            return Some((
+                crate::queries::kitty_status_enoent_reply(resolved, queried, pin),
+                false,
+            ));
+        }
+        if control.image_id != 0 {
+            if payload.is_empty() {
+                // Payload-less `i=` status lookup (extension in spec
+                // shape; kitty-native clients always send payload).
+                let pin = if control.placement_id == 0 {
+                    None
+                } else {
+                    Some(control.placement_id)
+                };
+                if self.kitty_status_held(control.image_id, pin) {
+                    return Some((
+                        crate::queries::kitty_status_ok_reply(control.image_id, 0, pin),
+                        true,
+                    ));
+                }
+                return Some((
+                    crate::queries::kitty_status_enoent_reply(control.image_id, 0, pin),
+                    false,
+                ));
+            }
+            // Support probe, spec (`i=` plus payload): test-load without
+            // storing; `p=` (if any) is ignored per kitty `:2549`.
+            let image_id = control.image_id;
+            let channels = match format_f {
+                bitty_rich::KITTY_FORMAT_PNG => None,
+                bitty_rich::KITTY_FORMAT_RGB => Some(3),
+                bitty_rich::KITTY_FORMAT_RGBA => Some(4),
+                _ => {
+                    return Some((
+                        crate::queries::kitty_probe_einval_reply(image_id, "unknown format"),
+                        false,
+                    ));
+                }
+            };
+            if bitty_rich::precheck_declared_image(channels, width_s, height_v, payload.len())
+                .is_err()
+            {
+                return Some((
+                    crate::queries::kitty_probe_einval_reply(image_id, "bad data"),
+                    false,
+                ));
+            }
+            // The decoded RGBA size is exact for raw claims (the pre-check
+            // enforces exact length, so `s`/`v` are present here); PNG
+            // decodes to an `IHDR`-governed size the probe cannot know
+            // without allocating, so only the count quotas apply to it.
+            let decoded_bytes = channels.map(|_| {
+                let pixels = u64::from(width_s.unwrap_or(0))
+                    .saturating_mul(u64::from(height_v.unwrap_or(0)));
+                usize::try_from(pixels.saturating_mul(4))
+                    .unwrap_or(bitty_rich::KITTY_DECODE_MAX_BYTES)
+            });
+            if !self.kitty_probe_admittable(decoded_bytes) {
+                return Some((
+                    crate::queries::kitty_probe_enospc_reply(image_id, "store full"),
+                    false,
+                ));
+            }
+            return Some((crate::queries::kitty_probe_ok_reply(image_id), true));
+        }
+        // No `i=`/`I=`: spec-exact silence (kitty `REPORT_ERROR` with no
+        // reply, `graphics.c:2540-2543`). No `f=`-echo extension is kept:
+        // see [`crate::queries::kitty_probe_ok_reply`] for the rationale.
+        None
+    }
+
+    /// Whether one origin-scoped wire identity is held (S2, #1849).
+    ///
+    /// Mirrors protocol-deletion matching against the S5 quota-scoped
+    /// store: only the draining stream's origin (`self.kitty_origin`)
+    /// answers `held`, so one pane's images never leak into another pane's
+    /// status. Placements whose image was evicted fail closed (`false`,
+    /// like dangling lookups at paint time). Bounded scan over the
+    /// capped placement deque; no allocation.
+    fn kitty_status_held(&self, image_id: u32, placement: Option<u32>) -> bool {
+        if image_id == 0 {
+            return false;
+        }
+        let Some(hit) = self.kitty_images.placements().find(|entry| {
+            entry.origin == self.kitty_origin
+                && entry.wire_image == image_id
+                && placement.is_none_or(|pin| entry.wire_placement == pin)
+        }) else {
+            return false;
+        };
+        self.kitty_images.get(hit.image).is_some()
+    }
+
+    /// Whether a support-probe payload would be admittable for this origin
+    /// (S2, #1849).
+    ///
+    /// Conservative, mutation-free mirror of the store refusal: refuses
+    /// only when the global caps would overflow with no eviction at all.
+    /// Own-origin pressure is ignored on purpose — a real transmit would
+    /// FIFO-evict this origin's oldest images first, so refusing there
+    /// would answer `ERROR` where a transmit still succeeds. The fail
+    /// direction is deliberate: `OK` always implies admittable, while
+    /// `ERROR` may be conservative (never the reverse).
+    fn kitty_probe_admittable(&self, decoded_bytes: Option<usize>) -> bool {
+        let layer = &self.kitty_images;
+        if layer.len().saturating_add(1) > bitty_rich::KITTY_PLACE_MAX_IMAGES {
+            return false;
+        }
+        if let Some(decoded) = decoded_bytes {
+            if layer.total_bytes().saturating_add(decoded) > bitty_rich::KITTY_PLACE_MAX_BYTES {
+                return false;
+            }
+        }
+        true
     }
 
     /// Deletes Unicode placeholder grid cells naming `(image_id,

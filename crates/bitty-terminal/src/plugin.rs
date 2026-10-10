@@ -2066,14 +2066,17 @@ fn normalize_git_source(token: &str) -> Option<String> {
         })
     {
         // `git+https://…` only: `git+` plus any other scheme is rejected.
+        // The scheme is normalized to lowercase: git picks its transport
+        // from the literal scheme text, and a mixed-case `Https://` would
+        // make it look for a nonexistent `git-remote-Https` helper.
         if inner.to_ascii_lowercase().starts_with("https://") && is_valid_https_git_url(inner) {
-            return Some(inner.to_string());
+            return Some(format!("https://{}", &inner[8..]));
         }
         return None;
     }
     if lower.starts_with("https://") {
         if is_valid_https_git_url(token) {
-            return Some(token.to_string());
+            return Some(format!("https://{}", &token[8..]));
         }
         return None;
     }
@@ -2333,6 +2336,23 @@ fn fetch_stderr_tail(stderr: &[u8]) -> String {
         .to_string()
 }
 
+/// Repository-location variables never inherited by a spawned helper.
+///
+/// `git` (and hooks that export these, e.g. `pre-commit`) lets `GIT_DIR` /
+/// `GIT_WORK_TREE` / `GIT_INDEX_FILE` override the command line, so a clone
+/// running under such a parent could lock and overwrite the caller's index.
+/// Only these location variables are scrubbed: gitconfig, SSH-agent, proxy,
+/// and CA handling still come free from the inherited environment.
+const GIT_REPO_ENV_VARS: [&str; 7] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_PREFIX",
+];
+
 /// Run one fixed-argv helper; map every failure to a user-facing message.
 ///
 /// `tool` resolves via `PATH` (`Command::new` finds `git.exe`/`tar.exe` on
@@ -2341,21 +2361,41 @@ fn fetch_stderr_tail(stderr: &[u8]) -> String {
 /// `component_seed.rs` `SystemTransport` posture). No shell is ever
 /// constructed: every element of `argv` is inert data.
 fn run_fetch_tool(tool: &str, argv: &[String]) -> Result<std::process::Output, String> {
-    std::process::Command::new(tool)
-        .args(argv)
-        .output()
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                match tool {
-                    "git" => "bitty plugin: `git` not found (install git first, or install from a local directory or archive)".to_string(),
-                    "tar" => "bitty plugin: `tar` not found (install tar first, or install from a local directory)".to_string(),
-                    "unzip" => "bitty plugin: `unzip` not found (install unzip first, or repack as .tar.gz; .zip installs fail closed without it)".to_string(),
-                    _ => format!("bitty plugin: `{tool}` not found (install {tool} first)"),
-                }
-            } else {
-                format!("bitty plugin: cannot run `{tool}`: {error}")
+    run_fetch_tool_full(tool, argv, &[], false)
+}
+
+/// [`run_fetch_tool`] with a scoped environment override.
+///
+/// `extra_env` sets additional variables for this invocation only (the
+/// process environment is never mutated); `scrub_git_repo_env` removes the
+/// [`GIT_REPO_ENV_VARS`] location variables so a hooked parent cannot
+/// redirect the child into the caller's repository.
+fn run_fetch_tool_full(
+    tool: &str,
+    argv: &[String],
+    extra_env: &[(&str, &str)],
+    scrub_git_repo_env: bool,
+) -> Result<std::process::Output, String> {
+    let mut command = std::process::Command::new(tool);
+    command.args(argv);
+    command.envs(extra_env.iter().copied());
+    if scrub_git_repo_env {
+        for var in GIT_REPO_ENV_VARS {
+            command.env_remove(var);
+        }
+    }
+    command.output().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            match tool {
+                "git" => "bitty plugin: `git` not found (install git first, or install from a local directory or archive)".to_string(),
+                "tar" => "bitty plugin: `tar` not found (install tar first, or install from a local directory)".to_string(),
+                "unzip" => "bitty plugin: `unzip` not found (install unzip first, or repack as .tar.gz; .zip installs fail closed without it)".to_string(),
+                _ => format!("bitty plugin: `{tool}` not found (install {tool} first)"),
             }
-        })
+        } else {
+            format!("bitty plugin: cannot run `{tool}`: {error}")
+        }
+    })
 }
 
 /// Fixed-argv `git clone --filter=blob:none --depth=1 -- <url> <dest>`.
@@ -2363,7 +2403,9 @@ fn run_fetch_tool(tool: &str, argv: &[String]) -> Result<std::process::Output, S
 /// The `--` end-of-options separator plus the leading-dash rejection in
 /// [`is_valid_https_git_url`]/[`is_valid_scp_git_source`] closes
 /// `--upload-pack=`/`--config` smuggling via the URL: the URL is always one
-/// inert argv element, never a flag.
+/// inert argv element, never a flag. Repository-location variables are
+/// scrubbed ([`GIT_REPO_ENV_VARS`]) so a clone under a git hook cannot lock
+/// the caller's index; everything else is inherited.
 fn run_git_clone(url: &str, dest: &Path) -> Result<(), String> {
     let argv = vec![
         "clone".to_string(),
@@ -2373,7 +2415,7 @@ fn run_git_clone(url: &str, dest: &Path) -> Result<(), String> {
         url.to_string(),
         dest.to_string_lossy().into_owned(),
     ];
-    let output = run_fetch_tool("git", &argv)?;
+    let output = run_fetch_tool_full("git", &argv, &[], true)?;
     if !output.status.success() {
         let tail = fetch_stderr_tail(&output.stderr);
         return Err(format!(
@@ -2463,7 +2505,11 @@ fn declared_tar_unpacked_bytes(archive: &Path, kind: ArchiveKind) -> Result<(usi
             );
         }
     };
-    let output = run_fetch_tool("tar", &argv)?;
+    // `bsdtar` localizes `%b` month names via the process locale; the parser
+    // below only accepts the English `TAR_VERBOSE_MONTHS`, so this one
+    // invocation runs under the C locale. The names listing keeps the user's
+    // locale, and the process environment is never mutated.
+    let output = run_fetch_tool_full("tar", &argv, &[("LC_ALL", "C")], false)?;
     if !output.status.success() {
         let tail = fetch_stderr_tail(&output.stderr);
         return Err(format!(
@@ -2567,11 +2613,14 @@ fn parse_tar_verbose_total(bytes: &[u8]) -> Result<(usize, u64), String> {
                 count + 1
             ));
         }
-        if total > MAX_FETCH_UNPACKED_BYTES * 4 {
-            // Early stop: the total already exceeds any enforcement bound by
-            // a wide margin, so stop summing rather than walking megabytes
-            // of hostile listing output.
-            break;
+        // Immediate refusal once the running total passes the enforcement
+        // bound: returning here (instead of stopping early with a partial
+        // count) keeps the declared-size diagnostic instead of surfacing a
+        // misleading listing-count mismatch downstream.
+        if total > MAX_FETCH_UNPACKED_BYTES {
+            return Err(format!(
+                "bitty plugin: archive declares {total} unpacked bytes (limit {MAX_FETCH_UNPACKED_BYTES}; refusing hostile archive)"
+            ));
         }
     }
     Ok((count, total))
@@ -4662,6 +4711,16 @@ mod tests {
         assert!(normalize_git_source("https://example.com:8443/a/b.git").is_some());
         // scp without .git is accepted for this spelling.
         assert!(normalize_git_source("git@example.com:a/b").is_some());
+        // Mixed-case schemes normalize to a lowercase `https://` transport
+        // (git would otherwise look for a `git-remote-Https` helper).
+        assert_eq!(
+            normalize_git_source("Https://example.com/a/b.git").as_deref(),
+            Some("https://example.com/a/b.git")
+        );
+        assert_eq!(
+            normalize_git_source("GIT+HTTPS://example.com/a/b.git").as_deref(),
+            Some("https://example.com/a/b.git")
+        );
 
         // Rejected: http downgrade, file escape, ssh without git@, git://.
         for hostile in [
@@ -4754,15 +4813,7 @@ mod tests {
     /// `commit.gpgsign=true`.
     fn test_git() -> std::process::Command {
         let mut command = std::process::Command::new("git");
-        for var in [
-            "GIT_DIR",
-            "GIT_WORK_TREE",
-            "GIT_COMMON_DIR",
-            "GIT_INDEX_FILE",
-            "GIT_OBJECT_DIRECTORY",
-            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-            "GIT_PREFIX",
-        ] {
+        for var in super::GIT_REPO_ENV_VARS {
             command.env_remove(var);
         }
         command.args(["-c", "commit.gpgsign=false"]);

@@ -50,6 +50,14 @@ fn run_in(home: &Path, args: &[&str], stdin: Option<&str>) -> Output {
         .env("XDG_DATA_HOME", home)
         .env("HOME", home)
         .env("NO_COLOR", "1")
+        // The scp-like `git@…` case must never block on a host-key or
+        // password prompt against real SSH port 22: prompts are disabled and
+        // SSH is forced non-interactive onto closed port 9 (refused fast).
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env(
+            "GIT_SSH_COMMAND",
+            "ssh -o BatchMode=yes -o ConnectTimeout=2 -p 9",
+        )
         .env_remove("BITTY_CONFIG")
         .env_remove("BITTY_PLUGIN_DIR")
         .stdout(Stdio::piped())

@@ -596,6 +596,8 @@ pub fn plugin_help_text() -> String {
      \x20 zero plugin code. `git`/`tar`/`unzip` resolve via PATH (git.exe/\n\
      \x20 tar.exe on Windows); a missing helper fails closed. `unzip` may be\n\
      \x20 absent on Windows: .zip installs then fail closed with a diagnostic.\n\
+     \x20 Helpers inherit the system proxy env and the system CA store (no\n\
+     \x20 bundled certs, no custom TLS flags in Core).\n\
      \n\
      exit codes:\n\
      \x20 0 success (including idempotent no-ops).\n\

@@ -32,11 +32,11 @@
 //!   manager); a system-only component fails with an actionable diagnostic.
 //! - `install <name> --version <X.Y.Z>`: fetch one prebuilt release from R2
 //!   through the minimal install seed (`crate::component_seed`, issue
-//!   #1791 option A): fixed-argv system `curl` pinned to
-//!   `https://cdn.bitty.run`, `SHA256SUMS` hash verify fail-closed, exact
-//!   member audit, then the same atomic publish path as `add`. The version
-//!   is required and exact (no registry, no solving); the full manager
-//!   takes over after the install.
+//!   #1791 option A): fixed-argv system `curl` 7.68.0 or newer (preflighted,
+//!   pinned to `https://cdn.bitty.run`, `SHA256SUMS` hash verify
+//!   fail-closed, exact member audit, then the same atomic publish path as
+//!   `add`. The version is required and exact (no registry, no solving);
+//!   the full manager takes over after the install.
 //! - Class: local-only (no instance, no IPC, no component code is ever
 //!   loaded or executed; safe-mode clean).
 //!
@@ -571,6 +571,21 @@ pub fn component_help_text() -> String {
      \x20 `y`/`yes` approves, `n`/`no`/empty declines, EOF aborts. A\n\
      \x20 decline or EOF exits 1 with nothing staged or fetched.\n\
      \n\
+     fetch environment:\n\
+     \x20 `install` preflights `curl --version` once per invocation and needs\n\
+     \x20 curl 7.68.0 or newer (for --proto =https, --connect-timeout,\n\
+     \x20 --max-time, --max-filesize; `curl` resolves via PATH, curl.exe on\n\
+     \x20 Windows). A missing curl fails closed: install curl, or place the\n\
+     \x20 release manually under $XDG_DATA_HOME/bitty/components/<name>/\n\
+     \x20 <version>/; nothing is fetched or staged (exit 1). A too-old curl\n\
+     \x20 fails the same way naming the found version, the floor, and the\n\
+     \x20 upgrade hint (exit 1); a missing tar fails likewise (exit 1).\n\
+     \x20 Fetch uses the system CA store only (no --cacert override) and\n\
+     \x20 honors the system proxy env (https_proxy/HTTPS_PROXY/all_proxy\n\
+     \x20 plus no_proxy) by inheritance; no *_TOKEN/*_KEY/*_SECRET variable\n\
+     \x20 ever crosses into a fetch child, and Core carries no custom TLS\n\
+     \x20 flags.\n\
+     \n\
      resolution:\n\
      \x20 User $XDG_DATA_HOME/bitty/components/ wins over system\n\
      \x20 /usr/lib/bitty/components/ (or platform equivalent) on collision.\n\
@@ -584,8 +599,10 @@ pub fn component_help_text() -> String {
      \x20 the `bitty component add` command to run, and never a stack trace.\n\
      \n\
      exit codes:\n\
-     \x20 0 success | 1 declined consent, aborted prompt, or filesystem\n\
-     \x20 failure | 2 usage | 4 component error (integrity, ABI, digest)\n\
+     \x20 0 success | 1 declined consent, aborted prompt, filesystem\n\
+     \x20 failure, or fetch-environment failure (missing/too-old curl,\n\
+     \x20 missing tar) | 2 usage | 4 component error (integrity, ABI,\n\
+     \x20 digest)\n\
      \n\
      examples:\n\
      \x20 bitty component list\n\

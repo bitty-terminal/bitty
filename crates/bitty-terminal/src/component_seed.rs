@@ -25,9 +25,14 @@
 //! - Trust: unsigned 0.1.0 verifies by hash only (Windows ships unsigned per
 //!   #1810, so hash-only is the uniform story). Sigstore/cosign stays a
 //!   follow-up, not a silent addition.
-//! - Environment: `curl`/`tar` inherit the caller's environment (proxy and
-//!   TLS store discovery need it, mirroring `scripts/install.sh`). Argv is
-//!   fixed and audited; no secret material crosses the boundary.
+//! - Environment: `curl` 7.68.0 or newer (preflighted once per invocation;
+//!   absent or too-old curl fails closed with a manual-placement
+//!   diagnostic, exit `1`). `curl`/`tar` inherit the caller's environment
+//!   for proxy and TLS store discovery (mirroring `scripts/install.sh`),
+//!   minus secret-shaped variables (`*_TOKEN`/`*_KEY`/`*_SECRET`, which are
+//!   scrubbed from every child). Argv is fixed and audited; system CA store
+//!   only (no `--cacert` override), system proxy env honored, no custom TLS
+//!   flags, and no secret material crosses the boundary.
 //! - Class: local-only (no instance, no IPC, no component code is ever
 //!   loaded or executed; safe-mode clean).
 //!
@@ -35,9 +40,9 @@
 //!
 //! [`SeedError::exit_code`] maps onto the component command taxonomy: `2`
 //! for CLI-derived input failures (bad name/version), `1` for environmental
-//! failures (unsupported host, missing `curl`/`tar`, download or filesystem
-//! I/O), `4` for artifact-integrity failures (manifest, digest, member, or
-//! descriptor mismatch).
+//! failures (unsupported host, missing or too-old `curl`, missing `tar`,
+//! download or filesystem I/O), `4` for artifact-integrity failures
+//! (manifest, digest, member, or descriptor mismatch).
 //!
 //! # Bounds (fail closed before any filesystem mutation of the user tier)
 //!
@@ -246,6 +251,30 @@ pub const SEED_CURL_CONNECT_TIMEOUT_SECS: u64 = 15;
 /// the whole transfer so `Command::output()` always returns.
 pub const SEED_CURL_MAX_TIME_SECS: u64 = 120;
 
+/// Minimum supported `curl` major version (fetch-environment floor).
+pub const SEED_CURL_FLOOR_MAJOR: u64 = 7;
+
+/// Minimum supported `curl` minor version (fetch-environment floor).
+pub const SEED_CURL_FLOOR_MINOR: u64 = 68;
+
+/// Minimum supported `curl` patch version (fetch-environment floor).
+pub const SEED_CURL_FLOOR_PATCH: u64 = 0;
+
+/// Minimum supported `curl` version in `major.minor.patch` form.
+///
+/// Driver flags in [`SystemTransport::curl_argv`] and the curl release that
+/// introduced each (per `curl.se/docs/optionsall.html` and the curl
+/// changelog): `--max-time` since 4.0, `--connect-timeout` since 7.7,
+/// `--max-filesize` since 7.10.8, `--proto` (including the `=https`
+/// allow-only modifier, part of the original `--proto` design) since
+/// 7.20.2/7.21.0. The bare minimum would be 7.21.0; the floor is raised
+/// conservatively to 7.68.0 (January 2020, the Ubuntu 20.04 LTS baseline)
+/// for stable `--proto` redirect semantics and modern TLS/proxy handling on
+/// every platform bitty ships (Linux, macOS, Windows), while staying old
+/// enough not to break LTS installs gratuitously. Must stay equal to the
+/// `major.minor.patch` triple above (pinned by test).
+pub const SEED_CURL_FLOOR: &str = "7.68.0";
+
 /// Maximum bytes of `tar -tzf` output parsed for the member audit.
 pub const SEED_TAR_LIST_MAX_BYTES: usize = 8192;
 
@@ -279,6 +308,8 @@ pub enum SeedError {
     UnsupportedHost(String),
     /// A required system tool is missing (`curl` or `tar`).
     ToolMissing(String),
+    /// The system `curl` is present but older than [`SEED_CURL_FLOOR`].
+    CurlTooOld(String),
     /// The download failed (URL plus a bounded reason).
     Fetch(String),
     /// The `SHA256SUMS` manifest is missing, malformed, or has no entry.
@@ -304,6 +335,7 @@ impl SeedError {
             Self::InvalidTarget(_)
             | Self::UnsupportedHost(_)
             | Self::ToolMissing(_)
+            | Self::CurlTooOld(_)
             | Self::Fetch(_)
             | Self::Io(_) => 1,
             Self::Manifest(_)
@@ -328,6 +360,7 @@ impl SeedError {
             }
             Self::UnsupportedHost(detail) => detail.clone(),
             Self::ToolMissing(tool) => tool.clone(),
+            Self::CurlTooOld(detail) => detail.clone(),
             Self::Fetch(detail) => detail.clone(),
             Self::Manifest(detail) => detail.clone(),
             Self::DigestMismatch(detail) => detail.clone(),
@@ -502,10 +535,212 @@ pub trait SeedTransport {
 ///
 /// Metacharacters in every argument are inert data: argv arrays go directly
 /// to [`Command`] (`sh -c` is never constructed on any platform).
-/// Children inherit the caller's environment (proxy/TLS discovery, like
-/// `scripts/install.sh`); argv is fixed and audited, so no secret material
-/// crosses the boundary.
+/// Children inherit the caller's environment for system proxy
+/// (`https_proxy`/`HTTPS_PROXY`/`all_proxy` plus `no_proxy`) and system
+/// CA-store discovery (like `scripts/install.sh`), minus secret-shaped
+/// variables ([`is_secret_env_name`]); argv is fixed and audited, so no
+/// secret material crosses the boundary. `curl` resolves via `PATH`
+/// (`curl.exe` on Windows through `PATHEXT`), same for `tar`/`tar.exe`.
 pub struct SystemTransport;
+
+/// Parsed `curl --version` first-line version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CurlVersion {
+    /// Major version (before the first `.`).
+    pub major: u64,
+    /// Minor version (between the dots).
+    pub minor: u64,
+    /// Patch version (after the second `.`; `0` when absent).
+    pub patch: u64,
+}
+
+impl CurlVersion {
+    /// The enforced floor ([`SEED_CURL_FLOOR_MAJOR`]..[`SEED_CURL_FLOOR_PATCH`]).
+    #[must_use]
+    pub fn floor() -> Self {
+        Self {
+            major: SEED_CURL_FLOOR_MAJOR,
+            minor: SEED_CURL_FLOOR_MINOR,
+            patch: SEED_CURL_FLOOR_PATCH,
+        }
+    }
+
+    /// Whether this version meets the floor (lexicographic `>=`).
+    #[must_use]
+    pub fn meets_floor(self) -> bool {
+        self >= Self::floor()
+    }
+}
+
+impl std::fmt::Display for CurlVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+/// One numeric version part: leading ASCII digits, no sign, no whitespace.
+///
+/// Returns `None` for an empty digit run or an unparsable (overflowing)
+/// number, so hostile version strings fail closed upstream.
+fn parse_version_part(text: &str) -> Option<u64> {
+    let end = text.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if end == 0 {
+        return None;
+    }
+    text[..end].parse::<u64>().ok()
+}
+
+/// Parse the version from `curl --version` output.
+///
+/// Reads the first line only, expecting `curl X.Y.Z ...` where the version
+/// token is the second whitespace field. Handles the Windows suffix form
+/// (`curl 8.4.0 (Windows) ...`) because the parenthesized marker is a later
+/// field, plus trailing per-part suffixes (`8.4.0-DEV` parses the leading
+/// digits of each part). Major and minor are required; a missing patch
+/// defaults to `0`. Anything else returns `None` (fail closed upstream).
+#[must_use]
+pub fn parse_curl_version(output: &str) -> Option<CurlVersion> {
+    let first = output.lines().next()?.trim();
+    let mut fields = first.split_whitespace();
+    if fields.next() != Some("curl") {
+        return None;
+    }
+    let token = fields.next()?;
+    let mut parts = token.split('.');
+    let major = parse_version_part(parts.next()?)?;
+    let minor = parse_version_part(parts.next()?)?;
+    let patch = match parts.next() {
+        Some(text) => parse_version_part(text)?,
+        None => 0,
+    };
+    Some(CurlVersion {
+        major,
+        minor,
+        patch,
+    })
+}
+
+/// Enforce the floor against one `curl --version` output.
+///
+/// `Ok(version)` when the output parses and meets the floor; otherwise a
+/// fail-closed [`SeedError`]: a parsed-but-old version surfaces as
+/// [`SeedError::CurlTooOld`] (exit `1`) naming the found version, the floor,
+/// and the upgrade hint, while unparsable output surfaces as
+/// [`SeedError::Fetch`] (environmental, exit `1`) naming the floor.
+pub fn check_curl_version_output(output: &str) -> Result<CurlVersion, SeedError> {
+    match parse_curl_version(output) {
+        Some(version) if version.meets_floor() => Ok(version),
+        Some(version) => Err(SeedError::CurlTooOld(format!(
+            "bitty component: curl {version} is too old (need {SEED_CURL_FLOOR} or newer for --proto =https, --connect-timeout, --max-time, --max-filesize; upgrade curl and retry, or place the release manually under $XDG_DATA_HOME/bitty/components/<name>/<version>/)"
+        ))),
+        None => Err(SeedError::Fetch(format!(
+            "bitty component: cannot parse `curl --version` output (need curl {SEED_CURL_FLOOR} or newer; upgrade curl and retry)"
+        ))),
+    }
+}
+
+/// Whether an environment variable name is secret-shaped and must never
+/// cross into a fetch child.
+///
+/// Case-insensitive suffix match on `_TOKEN`, `_KEY`, `_SECRET`: covers
+/// `GITHUB_TOKEN`, `AWS_SECRET_ACCESS_KEY`, `CARGO_REGISTRY_TOKEN`, and
+/// similar without enumerating providers. Proxy variables (`https_proxy`,
+/// `HTTPS_PROXY`, `all_proxy`, `no_proxy`, ...) never match (no such
+/// suffix), so proxy inheritance is unaffected.
+#[must_use]
+pub fn is_secret_env_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper.ends_with("_TOKEN") || upper.ends_with("_KEY") || upper.ends_with("_SECRET")
+}
+
+/// Live secret-shaped variable names to scrub from one child spawn.
+///
+/// Enumerated at spawn time (the process environment can change between
+/// invocations, and tests poison it); the caller removes each from the
+/// child [`Command`] while inheriting everything else (proxy/CA discovery
+/// stays intact).
+fn secret_env_removals() -> Vec<String> {
+    secret_removals_in(std::env::vars_os().filter_map(|(key, _)| key.into_string().ok()))
+}
+
+/// Pure core of [`secret_env_removals`]: the secret-shaped names among
+/// `names`. Pure so the hostile-env audit is provable without mutating the
+/// process environment (see the `hostile_env_*` tests).
+fn secret_removals_in(names: impl Iterator<Item = String>) -> Vec<String> {
+    names.filter(|name| is_secret_env_name(name)).collect()
+}
+
+/// Child [`Command`] for one fixed-argv tool spawn.
+///
+/// Resolves `tool` via `PATH` (`curl` finds `curl.exe` on Windows through
+/// `PATHEXT`, same for `tar`/`tar.exe`); inherits the caller environment
+/// for system proxy and system CA-store discovery, minus secret-shaped
+/// variables ([`is_secret_env_name`]). The process environment is never
+/// mutated: removals apply to the child only.
+fn scrubbed_command(tool: &str) -> Command {
+    let mut command = Command::new(tool);
+    for name in secret_env_removals() {
+        command.env_remove(name);
+    }
+    command
+}
+
+/// Actionable diagnostic for absent `curl`: names the floor, the manual
+/// placement path, and that no staging was attempted (exit `1`).
+fn curl_missing_diagnostic() -> String {
+    format!(
+        "bitty component: `curl` not found (need curl {SEED_CURL_FLOOR} or newer; install curl first, or place the release manually under $XDG_DATA_HOME/bitty/components/<name>/<version>/; nothing was fetched or staged)"
+    )
+}
+
+/// Actionable diagnostic for absent `tar` (same fail-closed shape).
+fn tar_missing_diagnostic() -> String {
+    "bitty component: `tar` not found (install tar first, or place the release manually under $XDG_DATA_HOME/bitty/components/<name>/<version>/; nothing was fetched or staged)".to_string()
+}
+
+/// Result of the once-per-invocation `curl --version` preflight.
+static CURL_PREFLIGHT: std::sync::OnceLock<Result<CurlVersion, SeedError>> =
+    std::sync::OnceLock::new();
+
+/// How many times the preflight actually spawned `curl --version`
+/// (cache misses; hits never spawn). Observed by tests.
+static CURL_PREFLIGHT_SPAWNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Run the cached preflight: `curl --version` parsed against the floor.
+///
+/// The first call in the process spawns `curl --version` (via
+/// [`scrubbed_command`], so secrets are already scrubbed here) and caches
+/// the outcome; later calls return the cached result without spawning, so
+/// one CLI invocation preflights once no matter how many fetches follow.
+/// Absent curl fails closed with the manual-placement diagnostic (exit `1`);
+/// too-old curl fails closed naming found/floor/upgrade (exit `1`).
+pub fn preflight_curl() -> Result<CurlVersion, SeedError> {
+    CURL_PREFLIGHT
+        .get_or_init(|| {
+            CURL_PREFLIGHT_SPAWNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let output = scrubbed_command("curl")
+                .arg("--version")
+                .output()
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        SeedError::ToolMissing(curl_missing_diagnostic())
+                    } else {
+                        SeedError::Io(format!(
+                            "bitty component: cannot run `curl --version`: {error}"
+                        ))
+                    }
+                })?;
+            if !output.status.success() {
+                return Err(SeedError::Fetch(format!(
+                    "bitty component: `curl --version` failed ({})",
+                    output.status
+                )));
+            }
+            let text = String::from_utf8_lossy(&output.stdout);
+            check_curl_version_output(&text)
+        })
+        .clone()
+}
 
 impl SystemTransport {
     /// Fixed curl argv (mirrors `scripts/install.sh -fsSL` plus the seed
@@ -518,7 +753,7 @@ impl SystemTransport {
     /// `--max-filesize` (client-side
     /// bound), `--output` (no stdout pipe, no truncation surprises).
     fn curl_argv(url: &str, dest: &Path, max_bytes: u64) -> Vec<String> {
-        vec![
+        let argv = vec![
             "--fail".to_string(),
             "--silent".to_string(),
             "--show-error".to_string(),
@@ -534,7 +769,19 @@ impl SystemTransport {
             "--output".to_string(),
             dest.to_string_lossy().into_owned(),
             url.to_string(),
-        ]
+        ];
+        // Posture pin (issue #1907): system CA store only (no `--cacert` /
+        // `--capath` override), system proxy via inherited env (no `--proxy`
+        // flag), no custom TLS version/cipher flags. The unit test
+        // `curl_argv_pins_ca_proxy_tls_posture` audits the full argv.
+        debug_assert!(
+            !argv.iter().any(|arg| matches!(
+                arg.as_str(),
+                "--cacert" | "--capath" | "--ciphers" | "--proxy" | "--tls-max"
+            ) || arg.starts_with("--tlsv")),
+            "curl argv must not override CA, proxy, or TLS posture"
+        );
+        argv
     }
 
     /// Fixed tar argv: explicit member list only (no wildcards), extraction
@@ -557,17 +804,29 @@ impl SystemTransport {
     }
 
     /// Run one fixed-argv tool; map every failure to [`SeedError`].
+    ///
+    /// The child is spawned via [`scrubbed_command`] (secret-shaped env vars
+    /// removed, proxy/CA inheritance intact); absent tools fail closed with
+    /// the manual-placement diagnostic (exit `1`, no staging attempted).
     fn run_tool(tool: &str, argv: &[String]) -> Result<(), SeedError> {
-        let output = Command::new(tool).args(argv).output().map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                SeedError::ToolMissing(format!(
-                    "bitty component: `{tool}` not found (install {tool} first; \
-                     the seed fetches via fixed-argv system {tool})"
-                ))
-            } else {
-                SeedError::Io(format!("bitty component: cannot run `{tool}`: {error}"))
-            }
-        })?;
+        let output = scrubbed_command(tool)
+            .args(argv)
+            .output()
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    SeedError::ToolMissing(if tool == "curl" {
+                        curl_missing_diagnostic()
+                    } else if tool == "tar" {
+                        tar_missing_diagnostic()
+                    } else {
+                        format!(
+                            "bitty component: `{tool}` not found (install {tool} first; nothing was staged)"
+                        )
+                    })
+                } else {
+                    SeedError::Io(format!("bitty component: cannot run `{tool}`: {error}"))
+                }
+            })?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let tail: String = stderr
@@ -600,23 +859,25 @@ impl SystemTransport {
 
 impl SeedTransport for SystemTransport {
     fn fetch(&mut self, url: &str, dest: &Path, max_bytes: u64) -> Result<(), SeedError> {
+        // Preflight once per invocation (cached): absent or too-old curl
+        // fails here, before any fetch or staging.
+        preflight_curl()?;
         let argv = Self::curl_argv(url, dest, max_bytes);
         Self::run_tool("curl", &argv)
     }
 
     fn list_members(&mut self, archive: &Path) -> Result<Vec<String>, SeedError> {
         let argv = Self::tar_list_argv(archive);
-        let output = Command::new("tar").args(&argv).output().map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                SeedError::ToolMissing(
-                    "bitty component: `tar` not found (install tar first; \
-                     the seed extracts via fixed-argv system tar)"
-                        .to_string(),
-                )
-            } else {
-                SeedError::Io(format!("bitty component: cannot run `tar`: {error}"))
-            }
-        })?;
+        let output = scrubbed_command("tar")
+            .args(&argv)
+            .output()
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    SeedError::ToolMissing(tar_missing_diagnostic())
+                } else {
+                    SeedError::Io(format!("bitty component: cannot run `tar`: {error}"))
+                }
+            })?;
         if !output.status.success() {
             return Err(SeedError::Fetch(format!(
                 "bitty component: `tar -tzf` failed ({})",
@@ -1652,6 +1913,335 @@ mod tests {
         );
     }
 
+    // --- curl floor preflight (issue #1907) --------------------------------
+
+    #[test]
+    fn curl_floor_consts_agree() {
+        assert_eq!(
+            SEED_CURL_FLOOR,
+            format!("{SEED_CURL_FLOOR_MAJOR}.{SEED_CURL_FLOOR_MINOR}.{SEED_CURL_FLOOR_PATCH}")
+        );
+        assert_eq!(
+            CurlVersion::floor(),
+            CurlVersion {
+                major: 7,
+                minor: 68,
+                patch: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_curl_version_handles_unix_and_windows_forms() {
+        // Unix forms.
+        assert_eq!(
+            parse_curl_version("curl 8.22.0 (x86_64-pc-linux-gnu) libcurl/8.22.0 OpenSSL/3.6.4"),
+            Some(CurlVersion {
+                major: 8,
+                minor: 22,
+                patch: 0,
+            })
+        );
+        assert_eq!(
+            parse_curl_version("curl 7.68.0 (x86_64-pc-linux-gnu) libcurl/7.68.0"),
+            Some(CurlVersion {
+                major: 7,
+                minor: 68,
+                patch: 0,
+            })
+        );
+        // Windows suffix forms: the parenthesized marker is a later field.
+        assert_eq!(
+            parse_curl_version("curl 8.4.0 (Windows) libcurl/8.4.0 Schannel"),
+            Some(CurlVersion {
+                major: 8,
+                minor: 4,
+                patch: 0,
+            })
+        );
+        assert_eq!(
+            parse_curl_version("curl 7.55.1 (Windows) libcurl/7.55.1 WinSSL"),
+            Some(CurlVersion {
+                major: 7,
+                minor: 55,
+                patch: 1,
+            })
+        );
+        // Trailing per-part suffixes parse the leading digits; a missing
+        // patch defaults to zero.
+        assert_eq!(
+            parse_curl_version("curl 8.4.0-DEV (x86_64-pc-linux-gnu) libcurl/8.4.0-DEV"),
+            Some(CurlVersion {
+                major: 8,
+                minor: 4,
+                patch: 0,
+            })
+        );
+        assert_eq!(
+            parse_curl_version("curl 8.5 (x86_64-pc-linux-gnu) libcurl/8.5"),
+            Some(CurlVersion {
+                major: 8,
+                minor: 5,
+                patch: 0,
+            })
+        );
+        // Hostile or malformed output fails closed (None).
+        for bad in [
+            "",
+            "curl",
+            "curl ",
+            "wget 8.0.0 (x86_64-pc-linux-gnu)",
+            "curl abc (x86_64-pc-linux-gnu)",
+            "curl 8..0 (x86_64-pc-linux-gnu)",
+            "curl 8 (x86_64-pc-linux-gnu)",
+            "curl .8.0 (x86_64-pc-linux-gnu)",
+        ] {
+            assert!(parse_curl_version(bad).is_none(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn curl_floor_gate_accepts_floor_and_newer_rejects_older() {
+        assert!(CurlVersion::floor().meets_floor());
+        for newer in [
+            CurlVersion {
+                major: 7,
+                minor: 68,
+                patch: 1,
+            },
+            CurlVersion {
+                major: 7,
+                minor: 69,
+                patch: 0,
+            },
+            CurlVersion {
+                major: 8,
+                minor: 0,
+                patch: 0,
+            },
+        ] {
+            assert!(newer.meets_floor(), "{newer}");
+        }
+        for older in [
+            CurlVersion {
+                major: 7,
+                minor: 67,
+                patch: 9,
+            },
+            CurlVersion {
+                major: 7,
+                minor: 55,
+                patch: 1,
+            },
+            CurlVersion {
+                major: 6,
+                minor: 0,
+                patch: 0,
+            },
+        ] {
+            assert!(!older.meets_floor(), "{older}");
+        }
+    }
+
+    #[test]
+    fn check_curl_version_output_names_found_floor_and_hint() {
+        let version = check_curl_version_output("curl 8.22.0 (x86_64-pc-linux-gnu) libcurl/8.22.0")
+            .expect("floor met");
+        assert_eq!(
+            version,
+            CurlVersion {
+                major: 8,
+                minor: 22,
+                patch: 0,
+            }
+        );
+        let error = check_curl_version_output("curl 7.55.1 (Windows) libcurl/7.55.1 WinSSL")
+            .expect_err("too old must fail");
+        assert_eq!(error.exit_code(), 1);
+        let message = error.message();
+        assert!(message.contains("7.55.1"), "{message}");
+        assert!(message.contains(SEED_CURL_FLOOR), "{message}");
+        assert!(message.contains("upgrade"), "{message}");
+        assert!(
+            message.contains("$XDG_DATA_HOME/bitty/components/"),
+            "{message}"
+        );
+        let error = check_curl_version_output("not curl output").expect_err("unparsable must fail");
+        assert_eq!(error.exit_code(), 1);
+    }
+
+    #[test]
+    fn preflight_curl_runs_once_per_invocation() {
+        let before = CURL_PREFLIGHT_SPAWNS.load(std::sync::atomic::Ordering::Relaxed);
+        let first = preflight_curl();
+        let middle = CURL_PREFLIGHT_SPAWNS.load(std::sync::atomic::Ordering::Relaxed);
+        let second = preflight_curl();
+        let after = CURL_PREFLIGHT_SPAWNS.load(std::sync::atomic::Ordering::Relaxed);
+        // Both calls agree (the second is a cache hit), and at most one
+        // spawn happened here no matter how many fetches follow.
+        assert_eq!(format!("{first:?}"), format!("{second:?}"));
+        assert!(middle - before <= 1, "preflight must spawn at most once");
+        assert_eq!(middle, after, "second preflight must be a cache hit");
+    }
+
+    // --- CA + proxy posture pin (issue #1907) -------------------------------
+
+    #[test]
+    fn curl_argv_pins_ca_proxy_tls_posture() {
+        let dest = Path::new("/tmp/out.tar.gz");
+        let argv = SystemTransport::curl_argv("https://cdn.bitty.run/x", dest, 123);
+        // System CA store only: no `--cacert` / `--capath` override.
+        for banned in ["--cacert", "--capath"] {
+            assert!(
+                !argv.iter().any(|arg| arg == banned),
+                "argv must not contain {banned}"
+            );
+        }
+        // No custom TLS in Core: no `--tlsv*` / `--tls-max` / `--ciphers`.
+        assert!(
+            !argv
+                .iter()
+                .any(|arg| arg == "--ciphers" || arg == "--tls-max" || arg.starts_with("--tlsv")),
+            "argv must not carry custom TLS flags: {argv:?}"
+        );
+        // System proxy via inherited env only: no `--proxy` flag.
+        assert!(
+            !argv.iter().any(|arg| arg == "--proxy"),
+            "argv must not pin a proxy flag: {argv:?}"
+        );
+        // The floor drivers are all present.
+        for required in [
+            "--proto",
+            "=https",
+            "--connect-timeout",
+            "--max-time",
+            "--max-filesize",
+        ] {
+            assert!(
+                argv.iter().any(|arg| arg == required),
+                "argv must contain {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn secret_env_names_cover_tokens_keys_secrets_not_proxies() {
+        for secret in [
+            "GITHUB_TOKEN",
+            "github_token",
+            "AWS_SECRET_ACCESS_KEY",
+            "CARGO_REGISTRY_TOKEN",
+            "BITTY_API_KEY",
+            "DB_SECRET",
+            "A_B_C_SECRET",
+        ] {
+            assert!(is_secret_env_name(secret), "{secret}");
+        }
+        for plain in [
+            "https_proxy",
+            "HTTPS_PROXY",
+            "http_proxy",
+            "all_proxy",
+            "ALL_PROXY",
+            "no_proxy",
+            "NO_PROXY",
+            "PATH",
+            "HOME",
+            "SSL_CERT_FILE",
+            "CURL_CA_BUNDLE",
+            "TOKENIZER",
+            "KEYBOARD",
+            "SECRETARY",
+        ] {
+            assert!(!is_secret_env_name(plain), "{plain}");
+        }
+    }
+
+    #[test]
+    fn missing_tool_diagnostics_name_manual_placement_without_staging() {
+        let curl = curl_missing_diagnostic();
+        assert!(curl.contains("curl"), "{curl}");
+        assert!(curl.contains(SEED_CURL_FLOOR), "{curl}");
+        assert!(curl.contains("$XDG_DATA_HOME/bitty/components/"), "{curl}");
+        assert!(curl.contains("nothing was fetched or staged"), "{curl}");
+        let tar = tar_missing_diagnostic();
+        assert!(tar.contains("tar"), "{tar}");
+        assert!(tar.contains("$XDG_DATA_HOME/bitty/components/"), "{tar}");
+        assert!(tar.contains("nothing was fetched or staged"), "{tar}");
+        assert_eq!(SeedError::ToolMissing(curl).exit_code(), 1);
+        assert_eq!(SeedError::CurlTooOld("x".to_string()).exit_code(), 1);
+    }
+
+    /// Serializes process-env observation (the environment is process-global;
+    /// parallel tests must not race on it). This suite never mutates the
+    /// process environment (the crate forbids `unsafe_code`, and
+    /// `std::env::set_var` is `unsafe`): the live-poison proof runs in the
+    /// `fetch_env` CLI suite, which poisons the child environment through
+    /// `Command::env` instead.
+    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn hostile_env_secrets_scrubbed_while_proxy_and_fetch_survive() {
+        let _locked = ENV_TEST_LOCK.lock().expect("env lock");
+        // Hostile map: secrets that must be scrubbed, proxy/CA/ordinary
+        // vars that must survive, and a canary proving inheritance.
+        let present = [
+            "BITTY_CTX1112_GITHUB_TOKEN",
+            "BITTY_CTX1112_AWS_SECRET_ACCESS_KEY",
+            "BITTY_CTX1112_API_KEY",
+            "GITHUB_TOKEN",
+            "https_proxy",
+            "HTTPS_PROXY",
+            "all_proxy",
+            "no_proxy",
+            "PATH",
+            "SSL_CERT_FILE",
+            "BITTY_CTX1112_CANARY",
+        ];
+        let removals = secret_removals_in(present.iter().map(|name| (*name).to_string()));
+        for secret in [
+            "BITTY_CTX1112_GITHUB_TOKEN",
+            "BITTY_CTX1112_AWS_SECRET_ACCESS_KEY",
+            "BITTY_CTX1112_API_KEY",
+            "GITHUB_TOKEN",
+        ] {
+            assert!(
+                removals.iter().any(|listed| listed == secret),
+                "scrub must cover {secret}"
+            );
+        }
+        for kept in [
+            "https_proxy",
+            "HTTPS_PROXY",
+            "all_proxy",
+            "no_proxy",
+            "PATH",
+            "SSL_CERT_FILE",
+            "BITTY_CTX1112_CANARY",
+        ] {
+            assert!(
+                !removals.iter().any(|listed| listed == kept),
+                "scrub must keep {kept}"
+            );
+        }
+        // The stub pipeline is unaffected by secret-shaped names existing
+        // (scrubbing happens at the spawn layer, below).
+        let exe = b"hostile-env-bytes";
+        let (mut stub, _) = valid_stub("net", "0.0.1", "x86_64-unknown-linux-gnu", exe);
+        let payload = fetch_seed_payload("net", "0.0.1", "x86_64-unknown-linux-gnu", &mut stub)
+            .expect("fetch works with secret-shaped names present");
+        assert_eq!(payload.bytes, exe);
+        // A real scrubbed child still runs (skip when curl is absent: the
+        // fail-closed path is covered elsewhere).
+        match scrubbed_command("curl").arg("--version").output() {
+            Ok(output) => assert!(output.status.success()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("SKIP: curl not found (scrubbed-spawn proof needs curl)");
+            }
+            Err(error) => panic!("scrubbed `curl --version` failed: {error}"),
+        }
+    }
+
     // --- manifest: tamper corpus -------------------------------------------
 
     #[test]
@@ -1917,6 +2507,7 @@ mod tests {
         assert_eq!(SeedError::InvalidTarget("x".into()).exit_code(), 1);
         assert_eq!(SeedError::UnsupportedHost("x".into()).exit_code(), 1);
         assert_eq!(SeedError::ToolMissing("x".into()).exit_code(), 1);
+        assert_eq!(SeedError::CurlTooOld("x".into()).exit_code(), 1);
         assert_eq!(SeedError::Fetch("x".into()).exit_code(), 1);
         assert_eq!(SeedError::Io("x".into()).exit_code(), 1);
         assert_eq!(SeedError::Manifest("x".into()).exit_code(), 4);

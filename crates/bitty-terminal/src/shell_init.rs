@@ -244,7 +244,7 @@ if (-not (Test-Path variable:global:_BittyShellInit)) {
         $normalized = $Path -replace '\\', '/'
         $parts = $normalized.Split('/')
         for ($i = 0; $i -lt $parts.Length; $i++) {
-            if ($parts[$i] -match '^[A-Za-z]:$') {
+            if ($i -eq 0 -and $parts[$i] -match '^[A-Za-z]:$') {
                 continue
             }
             $parts[$i] = [System.Uri]::EscapeDataString($parts[$i])
@@ -691,6 +691,10 @@ mod tests {
         assert!(
             pwsh.contains("^[A-Za-z]:$"),
             "powershell preserves drive-letter colon"
+        );
+        assert!(
+            pwsh.contains("$i -eq 0 -and $parts[$i] -match '^[A-Za-z]:$'"),
+            "powershell restricts drive colon to the first segment (/tmp/C:/x keeps %3A)"
         );
         assert!(
             pwsh.contains("$host_name$uri_path"),

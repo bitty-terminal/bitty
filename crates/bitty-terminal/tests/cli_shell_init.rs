@@ -312,6 +312,10 @@ fn osc7_scripts_encode_cwd() {
         pwsh.contains(r#"-replace '\\', '/'"#),
         "powershell normalizes backslashes"
     );
+    assert!(
+        pwsh.contains("$i -eq 0 -and $parts[$i] -match '^[A-Za-z]:$'"),
+        "powershell restricts drive colon to first segment (/tmp/C:/x keeps %3A)"
+    );
     let nu = stdout(&run_bitty(&["shell-init", "nushell"]));
     assert!(nu.contains("url encode"), "nushell encodes via url encode");
     assert!(

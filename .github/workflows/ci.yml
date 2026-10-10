@@ -303,6 +303,18 @@ jobs:
         if: matrix.shard == 1
         run: bash scripts/tests/install-smoke.test.sh
 
+      # CTX-1061 (#1861): live per-OS verification for the bootstrap
+      # installers. The offline URL/arg legs live in the same fixture test;
+      # these are the live legs: latest.txt pointer fetch plus real download,
+      # sidecar verify, extract/install against a file:// fake-CDN fixture
+      # (no external network). macos/windows jobs run the same test (macOS)
+      # or the pwsh leg (Windows) below.
+      - name: Check install scripts live legs (fake-CDN fixture test)
+        if: matrix.shard == 1
+        run: |
+          command -v zstd >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y --no-install-recommends zstd; }
+          bash scripts/tests/install-scripts.test.sh
+
       # CTX-1063 (#1792): pin the R2 prebuilt component dist mechanics
       # (per-target tarball + SHA256SUMS manifest + CDN URL templates)
       # without network or uploads; the release-time R2 publisher lands
@@ -808,6 +820,15 @@ jobs:
         run: |
           cargo test -p bitty-terminal --features dev-tools --test cli_dev --locked
 
+      # CTX-1061 (#1861): macOS live leg for the bootstrap installers. Same
+      # fixture test as the quality job: latest.txt pointer fetch plus real
+      # download, sidecar verify, and install against a file:// fake-CDN
+      # (no external network). Running it here proves the script under the
+      # macOS host shell (shasum fallback, Darwin auto-detect leg); the
+      # Linux bundle legs skip here by design (GNU tar -I) and run on Linux.
+      - name: Check install scripts live legs (fake-CDN fixture test)
+        run: bash scripts/tests/install-scripts.test.sh
+
       # CTX-0847: the previous `--all-targets` run also executed the bitty-perf
       # benches; nextest runs none of them, so that coverage is kept
       # explicitly here, executed in the pinned external bitty-perf checkout
@@ -1023,6 +1044,61 @@ jobs:
           path: compat-results/windows*
           if-no-files-found: error
           retention-days: 7
+
+      # CTX-1061 (#1861): Windows live execution for install.ps1. The shell
+      # fixture test pins the URL templates statically; this leg proves the
+      # script parses and runs on Windows itself (dry-run + PrintUrl, no
+      # network: -Version bypasses the latest.txt pointer fetch). Dry-run
+      # logs via Write-Host, so only a clean exit is asserted there; the
+      # literal layout-table templates (packaging/README.md) are asserted
+      # exactly via -PrintUrl, plus prerelease rejection and static asserts.
+      - name: Verify install.ps1 dry-run and URL templates (PowerShell 7+)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $script = Join-Path $env:GITHUB_WORKSPACE 'scripts/install.ps1'
+          # Dry-run resolves the plan without downloading (a throw fails the
+          # step via $ErrorActionPreference; no native process runs, so
+          # $LASTEXITCODE is not meaningful here).
+          & $script -Version 0.0.23 -Target x64 -DryRun
+          Write-Host 'x64 dry-run OK'
+          & $script -Version 0.0.23 -Target arm64 -DryRun
+          Write-Host 'arm64 dry-run OK'
+          $urls = @( & $script -Version 0.0.23 -Target x64 -PrintUrl )
+          if ($urls[0] -ne 'https://cdn.bitty.run/bitty/releases/v0.0.23/bitty-0.0.23-windows-x86_64.zip') { throw "x64 PrintUrl mismatch: $($urls[0])" }
+          if ($urls[1] -ne 'https://cdn.bitty.run/bitty/releases/v0.0.23/bitty-0.0.23-windows-x86_64.zip.sha256') { throw "x64 sidecar mismatch: $($urls[1])" }
+          $urlsArm = @( & $script -Version 0.0.23 -Target arm64 -PrintUrl )
+          if ($urlsArm[0] -ne 'https://cdn.bitty.run/bitty/releases/v0.0.23/bitty-aarch64-pc-windows-msvc.exe') { throw "arm64 PrintUrl mismatch: $($urlsArm[0])" }
+          if ($urlsArm[1] -ne 'https://cdn.bitty.run/bitty/releases/v0.0.23/bitty-aarch64-pc-windows-msvc.exe.sha256') { throw "arm64 sidecar mismatch: $($urlsArm[1])" }
+          Write-Host 'PrintUrl templates OK'
+          try {
+            & $script -Version 0.0.23-rc1 -Target x64 -DryRun | Out-Null
+            throw 'prerelease -Version accepted but rejection was expected'
+          } catch {
+            if ("$($_.Exception.Message)" -match 'accepted but rejection') { throw }
+            Write-Host 'prerelease rejection OK'
+          }
+          $text = Get-Content -Path $script -Raw
+          foreach ($needle in @('bitty/install/latest.txt', 'Expand-Archive', 'Get-FileHash', 'irm https://cdn.bitty.run/bitty/install/install.ps1 | iex')) {
+            if ("$text" -notmatch [regex]::Escape($needle)) { throw "install.ps1 missing '$needle'" }
+          }
+          Write-Host 'install.ps1 static asserts OK'
+
+      # Same dry-run smoke under Windows PowerShell 5.1: install.ps1 must stay
+      # 5.1-clean (review-only until this leg). Reduced to the x64 plan plus
+      # its PrintUrl template; the full matrix above runs on 7+.
+      - name: Verify install.ps1 dry-run (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $script = Join-Path $env:GITHUB_WORKSPACE 'scripts/install.ps1'
+          # A throw fails the step via $ErrorActionPreference ($LASTEXITCODE
+          # is not meaningful: the dry-run path spawns no native process).
+          & $script -Version 0.0.23 -Target x64 -DryRun
+          $urls = @( & $script -Version 0.0.23 -Target x64 -PrintUrl )
+          if ($urls[0] -ne 'https://cdn.bitty.run/bitty/releases/v0.0.23/bitty-0.0.23-windows-x86_64.zip') { throw "x64 PrintUrl mismatch: $($urls[0])" }
+          if ($urls[1] -ne 'https://cdn.bitty.run/bitty/releases/v0.0.23/bitty-0.0.23-windows-x86_64.zip.sha256') { throw "x64 sidecar mismatch: $($urls[1])" }
+          Write-Host 'install.ps1 5.1 dry-run OK'
 
   # M1-10 / CTX-0574: aggregate the four ADR-0002 Tier 1 platform legs into a
   # single pass/fail view. Each platform job runs the M1 evidence suites by

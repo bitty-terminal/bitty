@@ -203,6 +203,209 @@ if grep -Eq -- 'declare[[:space:]]+-[A-Za-z]*A' "$SCRIPT"; then
   FAIL=1
 fi
 
+# 9. Live fake-CDN install legs (CTX-1061, #1861): latest.txt pointer fetch
+# plus real download, sidecar verify, extract/install — file:// only, no
+# external network. Extends the offline legs above; pointer resolution is
+# never exercised offline, so this duplicates nothing.
+FAKE_VER="0.0.99"
+FAKE_TAG="v0.0.99"
+FAKE_CDN="$TMP/fake-cdn"
+FAKE_REL="$FAKE_CDN/bitty/releases/$FAKE_TAG"
+mkdir -p "$FAKE_CDN/bitty/install" "$FAKE_REL"
+printf '%s\n' "$FAKE_TAG" >"$FAKE_CDN/bitty/install/latest.txt"
+
+write_sidecar() { # <file>: GNU sha256sum format, shasum fallback (macOS).
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" >"$1.sha256"
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" >"$1.sha256"
+  else
+    echo "FAIL: live fake-CDN legs need sha256sum or shasum" >&2
+    FAIL=1
+  fi
+}
+
+make_fake_bitty() { # <path> <version>: executable --version smoke stub.
+  printf '#!/bin/sh\necho "bitty %s"\n' "$2" >"$1"
+  chmod +x "$1"
+}
+
+# macOS bare-binary fixtures (both arches so host-native auto-detect works
+# on either runner; no tar needed on this path).
+make_fake_bitty "$FAKE_REL/bitty-aarch64-apple-darwin" "$FAKE_VER"
+make_fake_bitty "$FAKE_REL/bitty-x86_64-apple-darwin" "$FAKE_VER"
+write_sidecar "$FAKE_REL/bitty-aarch64-apple-darwin"
+write_sidecar "$FAKE_REL/bitty-x86_64-apple-darwin"
+
+# 9a. macOS live install via the pointer (no --version): fetch, verify,
+# extract-free copy, smoke.
+mac_out="$(BITTY_CDN_BASE="file://$FAKE_CDN" "$SCRIPT" --target aarch64-apple-darwin --bin-dir "$TMP/fake-mac-bin" 2>&1)" && mac_status=0 || mac_status=$?
+if ((mac_status != 0)); then
+  echo "FAIL: macOS pointer install exited $mac_status" >&2
+  printf '%s\n' "$mac_out" >&2
+  FAIL=1
+else
+  for needle in 'checksum OK' 'smoke OK'; do
+    if ! grep -qF -- "$needle" <<<"$mac_out"; then
+      echo "FAIL: macOS pointer install missing '$needle'" >&2
+      printf '%s\n' "$mac_out" >&2
+      FAIL=1
+    fi
+  done
+  if ! "$TMP/fake-mac-bin/bitty" --version 2>&1 | grep -qF -- "$FAKE_VER"; then
+    echo "FAIL: macOS pointer install binary does not report $FAKE_VER" >&2
+    FAIL=1
+  fi
+fi
+
+# 9b. Explicit --version against the fake CDN agrees with the pointer.
+mac_exp_out="$(BITTY_CDN_BASE="file://$FAKE_CDN" "$SCRIPT" --version "$FAKE_VER" --target aarch64-apple-darwin --bin-dir "$TMP/fake-mac-exp-bin" 2>&1)" && mac_exp_status=0 || mac_exp_status=$?
+if ((mac_exp_status != 0)); then
+  echo "FAIL: macOS explicit-version install exited $mac_exp_status" >&2
+  printf '%s\n' "$mac_exp_out" >&2
+  FAIL=1
+elif ! "$TMP/fake-mac-exp-bin/bitty" --version 2>&1 | grep -qF -- "$FAKE_VER"; then
+  echo "FAIL: macOS explicit-version install binary does not report $FAKE_VER" >&2
+  FAIL=1
+fi
+
+# 9c. Corrupted macOS payload fails closed on the sidecar.
+cp "$FAKE_REL/bitty-aarch64-apple-darwin" "$TMP/mac-good"
+printf 'tamper' >>"$FAKE_REL/bitty-aarch64-apple-darwin"
+corrupt_mac_out="$(BITTY_CDN_BASE="file://$FAKE_CDN" "$SCRIPT" --version "$FAKE_VER" --target aarch64-apple-darwin --bin-dir "$TMP/fake-mac-bad" 2>&1)" && corrupt_mac_status=0 || corrupt_mac_status=$?
+cp "$TMP/mac-good" "$FAKE_REL/bitty-aarch64-apple-darwin"
+if ((corrupt_mac_status == 0)); then
+  echo "FAIL: corrupted macOS payload installed but failure was expected" >&2
+  FAIL=1
+elif ! grep -qF -- 'checksum mismatch' <<<"$corrupt_mac_out"; then
+  echo "FAIL: corrupted macOS payload missing checksum-mismatch error" >&2
+  printf '%s\n' "$corrupt_mac_out" >&2
+  FAIL=1
+fi
+
+# 9d. Linux bundle fixture (minimal TOPDIR/bin/bitty + share file).
+# Linux-only: install.sh extracts with GNU tar -I zstd, which macOS bsdtar
+# rejects (its -I is an inclusion pattern), and production never extracts
+# bundles on macOS (it installs bare binaries). The macOS legs above plus
+# the native Darwin leg cover that runner; quality covers this leg on Linux.
+HAVE_BUNDLE=0
+if [[ "$(uname -s)" != "Linux" ]]; then
+  echo "SKIP: live Linux bundle legs run on Linux hosts only" >&2
+elif ! command -v tar >/dev/null 2>&1 || ! command -v zstd >/dev/null 2>&1; then
+  echo "FAIL: live Linux bundle legs need tar and zstd" >&2
+  FAIL=1
+else
+  BUNDLE_TOP="bitty-$FAKE_VER-x86_64-unknown-linux-gnu"
+  BUNDLE_STAGE="$TMP/bundle-stage"
+  mkdir -p "$BUNDLE_STAGE/$BUNDLE_TOP/bin" "$BUNDLE_STAGE/$BUNDLE_TOP/share/applications"
+  make_fake_bitty "$BUNDLE_STAGE/$BUNDLE_TOP/bin/bitty" "$FAKE_VER"
+  chmod 755 "$BUNDLE_STAGE/$BUNDLE_TOP/bin/bitty"
+  printf 'fake desktop entry\n' >"$BUNDLE_STAGE/$BUNDLE_TOP/share/applications/fake.desktop"
+  BUNDLE="$FAKE_REL/$BUNDLE_TOP.tar.zst"
+  if ! (cd "$BUNDLE_STAGE" && tar -c "$BUNDLE_TOP" | zstd -19 -o "$BUNDLE" 2>/dev/null); then
+    echo "FAIL: could not assemble the fake Linux bundle" >&2
+    FAIL=1
+  else
+    HAVE_BUNDLE=1
+    write_sidecar "$BUNDLE"
+
+    # 9e. Linux pointer install hermetic (--bin-dir: binary-only, no share).
+    linux_out="$(BITTY_CDN_BASE="file://$FAKE_CDN" "$SCRIPT" --target x86_64-unknown-linux-gnu --bin-dir "$TMP/fake-linux-bin" 2>&1)" && linux_status=0 || linux_status=$?
+    if ((linux_status != 0)); then
+      echo "FAIL: Linux pointer install exited $linux_status" >&2
+      printf '%s\n' "$linux_out" >&2
+      FAIL=1
+    else
+      for needle in 'checksum OK' 'smoke OK' 'skipping desktop integration'; do
+        if ! grep -qF -- "$needle" <<<"$linux_out"; then
+          echo "FAIL: Linux pointer install missing '$needle'" >&2
+          printf '%s\n' "$linux_out" >&2
+          FAIL=1
+        fi
+      done
+      if ! "$TMP/fake-linux-bin/bitty" --version 2>&1 | grep -qF -- "$FAKE_VER"; then
+        echo "FAIL: Linux pointer install binary does not report $FAKE_VER" >&2
+        FAIL=1
+      fi
+    fi
+
+    # 9f. Linux pointer install with --prefix carries share/ integration.
+    prefix_out="$(BITTY_CDN_BASE="file://$FAKE_CDN" "$SCRIPT" --target x86_64-unknown-linux-gnu --prefix "$TMP/fake-prefix" 2>&1)" && prefix_status=0 || prefix_status=$?
+    if ((prefix_status != 0)); then
+      echo "FAIL: Linux --prefix install exited $prefix_status" >&2
+      printf '%s\n' "$prefix_out" >&2
+      FAIL=1
+    else
+      if ! "$TMP/fake-prefix/bin/bitty" --version 2>&1 | grep -qF -- "$FAKE_VER"; then
+        echo "FAIL: Linux --prefix install binary does not report $FAKE_VER" >&2
+        FAIL=1
+      fi
+      if [[ ! -f "$TMP/fake-prefix/share/applications/fake.desktop" ]]; then
+        echo "FAIL: Linux --prefix install missing share/applications/fake.desktop" >&2
+        FAIL=1
+      fi
+      if ! grep -qF -- 'installed desktop integration' <<<"$prefix_out"; then
+        echo "FAIL: Linux --prefix install missing desktop-integration note" >&2
+        printf '%s\n' "$prefix_out" >&2
+        FAIL=1
+      fi
+    fi
+
+    # 9g. Corrupted Linux bundle fails closed on the sidecar.
+    cp "$BUNDLE" "$TMP/bundle-good.tar.zst"
+    printf 'tamper' >>"$BUNDLE"
+    corrupt_linux_out="$(BITTY_CDN_BASE="file://$FAKE_CDN" "$SCRIPT" --version "$FAKE_VER" --target x86_64-unknown-linux-gnu --bin-dir "$TMP/fake-linux-bad" 2>&1)" && corrupt_linux_status=0 || corrupt_linux_status=$?
+    cp "$TMP/bundle-good.tar.zst" "$BUNDLE"
+    if ((corrupt_linux_status == 0)); then
+      echo "FAIL: corrupted Linux bundle installed but failure was expected" >&2
+      FAIL=1
+    elif ! grep -qF -- 'checksum mismatch' <<<"$corrupt_linux_out"; then
+      echo "FAIL: corrupted Linux bundle missing checksum-mismatch error" >&2
+      printf '%s\n' "$corrupt_linux_out" >&2
+      FAIL=1
+    fi
+  fi
+fi
+
+# 9h. Host-native auto-detect live install (no --target): the uname path the
+# per-OS CI runners actually take. Darwin (either arch) resolves a fake bare
+# binary; glibc x86_64 Linux resolves the fake bundle. Other hosts select
+# targets this fixture does not carry (musl, non-x86_64 Linux), so they skip.
+host_os="$(uname -s)"
+host_arch="$(uname -m)"
+run_native=0
+native_skip=""
+if [[ "$host_os" == "Darwin" ]]; then
+  run_native=1
+elif [[ "$host_os" == "Linux" ]] && [[ "$host_arch" == "x86_64" || "$host_arch" == "amd64" ]]; then
+  # Mirror install.sh is_musl(): the fixture carries only the glibc bundle.
+  if [[ -f /etc/alpine-release ]]; then
+    native_skip="musl host selects a bundle this fixture does not carry"
+  elif command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; then
+    native_skip="musl host selects a bundle this fixture does not carry"
+  elif ((HAVE_BUNDLE == 0)); then
+    native_skip="no bundle fixture was assembled"
+  else
+    run_native=1
+  fi
+else
+  native_skip="have $host_os/$host_arch, need Darwin or glibc x86_64 Linux"
+fi
+if [[ -n "$native_skip" ]]; then
+  echo "SKIP: host-native leg ($native_skip)" >&2
+fi
+if ((run_native)); then
+  native_out="$(BITTY_CDN_BASE="file://$FAKE_CDN" "$SCRIPT" --bin-dir "$TMP/fake-native-bin" 2>&1)" && native_status=0 || native_status=$?
+  if ((native_status != 0)); then
+    echo "FAIL: host-native pointer install exited $native_status ($host_os)" >&2
+    printf '%s\n' "$native_out" >&2
+    FAIL=1
+  elif ! "$TMP/fake-native-bin/bitty" --version 2>&1 | grep -qF -- "$FAKE_VER"; then
+    echo "FAIL: host-native install binary does not report $FAKE_VER ($host_os)" >&2
+    FAIL=1
+  fi
+fi
+
 if ((FAIL)); then
   echo "install-scripts-test: FAIL" >&2
   exit 1

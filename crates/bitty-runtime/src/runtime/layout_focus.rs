@@ -22,6 +22,12 @@ pub(super) fn default_container(cols: usize, rows: usize) -> UiRect {
 /// Bound on the hovered-URL preview text (issue #1759, R-005 anti-spoofing).
 pub const HYPERLINK_PREVIEW_MAX_CHARS: usize = 96;
 
+/// Pinned-float cascade step in cells per pin depth (issue #1757, CodeRabbit
+/// 1883): stacked pins offset so each stays visible and clickable instead of
+/// fully covering the earlier pins.
+pub(crate) const PIN_CASCADE_DX: u16 = 3;
+pub(crate) const PIN_CASCADE_DY: u16 = 2;
+
 /// OSC 8 hyperlink span under the pointer (issue #1759, R-005 hover state).
 ///
 /// Presentation-only: the owner-grid span backing the pointer cursor, the
@@ -679,7 +685,8 @@ impl Runtime {
                 .ids()
                 .into_iter()
                 .filter(|id| !base_ids.contains(id))
-                .filter_map(|id| {
+                .enumerate()
+                .filter_map(|(depth, id)| {
                     let view = self.pinned.get(id)?.clone();
                     // Anchored (not free) geometry, matching the mode-float
                     // contract: `float_frame` ignores its first argument and
@@ -687,8 +694,31 @@ impl Runtime {
                     // authored in cells (the decorated solver scales them by
                     // the live cell size), so frame the cell container here
                     // rather than the pixel area above.
-                    let bounds =
-                        bitty_ui::presentation::float_frame(UiRect::zero(), self.container);
+                    let base = bitty_ui::presentation::float_frame(UiRect::zero(), self.container);
+                    // CodeRabbit 1883: cascade stacked pins so each one
+                    // stays visible and clickable instead of fully covering
+                    // the earlier pins. Offset grows with pin depth and is
+                    // clamped to the container (degenerate containers pin
+                    // at the container origin).
+                    let step = u16::try_from(depth).unwrap_or(u16::MAX);
+                    let max_x = self
+                        .container
+                        .x
+                        .saturating_add(self.container.width.saturating_sub(base.width));
+                    let max_y = self
+                        .container
+                        .y
+                        .saturating_add(self.container.height.saturating_sub(base.height));
+                    let bounds = UiRect::new(
+                        base.x
+                            .saturating_add(PIN_CASCADE_DX.saturating_mul(step))
+                            .min(max_x),
+                        base.y
+                            .saturating_add(PIN_CASCADE_DY.saturating_mul(step))
+                            .min(max_y),
+                        base.width,
+                        base.height,
+                    );
                     Some(bitty_ui::OverlayLayer::new(
                         OverlayTier::Float,
                         LayoutNode::leaf(view),

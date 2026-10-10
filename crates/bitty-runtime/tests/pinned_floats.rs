@@ -285,3 +285,35 @@ fn focus_clamps_when_pinned_leaf_unpins_elsewhere() {
     assert_eq!(frame_of(&rt, ViewId::new(1)).tier, Some(OverlayTier::Float));
     assert_eq!(rt.focused_view(), Some(ViewId::new(1)));
 }
+
+#[test]
+fn stacked_pins_cascade_so_each_stays_visible() {
+    // CodeRabbit 1883: stacked pins must not fully cover each other. Each
+    // pin offsets by pin depth (3 right, 2 down, clamped to the container).
+    let mut rt = make_runtime();
+    install(&mut rt, three_pane());
+    toggle(&mut rt, ViewId::new(1));
+    toggle(&mut rt, ViewId::new(2));
+    rt.pin_floating(ViewId::new(1)).expect("pin 1 must apply");
+    rt.pin_floating(ViewId::new(2)).expect("pin 2 must apply");
+    let first = frame_of(&rt, ViewId::new(1));
+    let second = frame_of(&rt, ViewId::new(2));
+    assert_eq!(first.tier, Some(OverlayTier::Float));
+    assert_eq!(second.tier, Some(OverlayTier::Float));
+    // Frames are physical pixels (scaled cells); assert cascade shape, not
+    // exact cells: distinct origins, down-right direction, same size.
+    assert_ne!(
+        (second.frame.x, second.frame.y),
+        (first.frame.x, first.frame.y),
+        "second pin must not fully cover the first"
+    );
+    assert!(
+        second.frame.x > first.frame.x && second.frame.y > first.frame.y,
+        "cascade runs down-right from the earlier pin"
+    );
+    assert_eq!(
+        (second.frame.width, second.frame.height),
+        (first.frame.width, first.frame.height),
+        "cascade shifts origin only, never resizes"
+    );
+}

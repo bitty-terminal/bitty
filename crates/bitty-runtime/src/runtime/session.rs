@@ -749,12 +749,19 @@ fn scrollback_tail_text(state: &State, max_lines: usize) -> Vec<String> {
 /// survives the strip.
 fn strip_overlays(node: &LayoutNode) -> LayoutNode {
     match node {
-        LayoutNode::Leaf(view) => LayoutNode::leaf(View::with_presentation(
-            view.id(),
-            usize::from(view.cols()),
-            usize::from(view.rows()),
-            view.presentation(),
-        )),
+        LayoutNode::Leaf(view) => {
+            let mut fresh = View::with_presentation(
+                view.id(),
+                usize::from(view.cols()),
+                usize::from(view.rows()),
+                view.presentation(),
+            );
+            // CTX-1079: the pseudo flag is layout truth like the mode stamp
+            // (solver ignores it, present recomputes geometry), so the strip
+            // carries it forward without a format bump.
+            fresh.set_pseudo_constraint(view.pseudo_constraint());
+            LayoutNode::leaf(fresh)
+        }
         LayoutNode::Split {
             axis,
             ratio,

@@ -1071,6 +1071,97 @@ impl Runtime {
                 // the action is moved, so continue to the next one.
                 continue;
             }
+            // Kitty animation frames (S1, #1849): `a=f` appends pixel
+            // frames to the origin-scoped wire identity's stored root
+            // (`r=0`), or edits that frame's gap in terminal truth only
+            // (`r>0`, payload dropped — pixel edits go through `a=c`).
+            // Pixels ingest before truth records (store-first): a refused
+            // frame stores nothing and records nothing, so truth gaps
+            // never outnumber stored frames and playback never names a
+            // missing frame. The action is borrowed, never moved, so
+            // continue afterwards.
+            if let TerminalAction::KittyGraphics {
+                format_f,
+                width_s,
+                height_v,
+                action_a: Some('f'),
+                rows_r,
+                payload,
+                control,
+                ..
+            } = &action
+            {
+                if let Err(err) = self.kitty_ingest_frame(
+                    *format_f, *width_s, *height_v, *rows_r, payload, *control, &action,
+                ) {
+                    // Rate-limited (CTX-0473): a hostile child can spam
+                    // refused frames; the parser's own warnings stay
+                    // bounded too.
+                    if let Some(suppressed) = self.kitty_log.admit_now() {
+                        eprintln!(
+                            "bitty: rejecting kitty animation frame ({err}): stored nothing{}",
+                            log_throttle::suppressed_suffix(suppressed)
+                        );
+                    }
+                }
+                continue;
+            }
+            // Kitty animation compose (S1, #1849): `a=c` blends or replaces
+            // a bounded rect from source frame `r=` onto destination frame
+            // `c=` of the origin-scoped wire identity's stored animation
+            // (control-only: the parser refuses payload on it). Truth owns
+            // no compose state, so there is no `state.apply` here — the
+            // compose seam damages the composed image's spans itself. The
+            // action is moved, so continue afterwards.
+            if let TerminalAction::KittyGraphics {
+                action_a: Some('c'),
+                cols_c,
+                rows_r,
+                control,
+                ..
+            } = action
+            {
+                let wire = self.kitty_wire_target(control.image_id, control.image_number);
+                match wire {
+                    Some(target) => {
+                        let composed = self.kitty_compose_frames(
+                            target,
+                            u32::from(cols_c),
+                            u32::from(rows_r),
+                            control.src_x,
+                            control.src_y,
+                            control.src_w,
+                            control.src_h,
+                            control.cell_x_offset,
+                        );
+                        match composed {
+                            Ok(()) => {
+                                let generation = self.state.generation();
+                                self.cold_queue.push(ColdEvent::Damage { generation });
+                                self.plugin_host
+                                    .push_observation(HostObservation::Damage { generation });
+                            }
+                            Err(err) => {
+                                if let Some(suppressed) = self.kitty_log.admit_now() {
+                                    eprintln!(
+                                        "bitty: rejecting kitty compose ({err}): composed nothing{}",
+                                        log_throttle::suppressed_suffix(suppressed)
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        if let Some(suppressed) = self.kitty_log.admit_now() {
+                            eprintln!(
+                                "bitty: rejecting kitty compose (no animation target): composed nothing{}",
+                                log_throttle::suppressed_suffix(suppressed)
+                            );
+                        }
+                    }
+                }
+                continue;
+            }
             // S4 (#1849): combined `a=T,U=1` (or absent action with
             // `U=1`) plus payload transmits and registers a virtual
             // prototype with one command. Terminal truth records first

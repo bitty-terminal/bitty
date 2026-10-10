@@ -155,19 +155,20 @@ pub use image::{
 pub use kitty::{KittyGraphicsStub, KittyPlaceholder, KittyPlaceholderId};
 pub use kitty_decode::{KittyDecodeError, KittyDecodedImage, decode_kitty_payload};
 pub use kitty_place::{
-    KITTY_CURSOR_MAX_SCROLL_LINES_PER_PLACEMENT, KITTY_DECODE_MAX_BYTES,
+    KITTY_ANIM_MAX_BYTES_PER_IMAGE, KITTY_ANIM_MAX_FRAMES, KITTY_COMPOSE_BLEND,
+    KITTY_COMPOSE_REPLACE, KITTY_CURSOR_MAX_SCROLL_LINES_PER_PLACEMENT, KITTY_DECODE_MAX_BYTES,
     KITTY_DECODE_MAX_DIMENSION, KITTY_DECODE_MAX_PIXELS, KITTY_FORMAT_PNG, KITTY_FORMAT_RGB,
     KITTY_FORMAT_RGBA, KITTY_PER_ORIGIN_MAX_BYTES, KITTY_PER_ORIGIN_MAX_IMAGES,
     KITTY_PER_ORIGIN_MAX_PLACEMENTS, KITTY_PLACE_MAX_BYTES, KITTY_PLACE_MAX_IMAGES,
     KITTY_PLACE_MAX_ITEMS, KITTY_PRESENT_MAX_BLITS_PER_FRAME, KITTY_PRESENT_MAX_BYTES_PER_FRAME,
-    KITTY_VIRTUAL_MAX_ITEMS, KittyAction, KittyImageId, KittyImageLayer, KittyPlacedImage,
-    KittyPlacement, KittyPlacementError, KittyPlacementId, KittyPrecheckError,
+    KITTY_VIRTUAL_MAX_ITEMS, KittyAction, KittyFrame, KittyImageId, KittyImageLayer,
+    KittyPlacedImage, KittyPlacement, KittyPlacementError, KittyPlacementId, KittyPrecheckError,
     KittyVirtualPrototype, placement_full_rect_for, placement_rect_for, precheck_declared_image,
     viewport_extent,
 };
 pub use kitty_raster::{
     KITTY_RASTER_CACHE_MAX_BYTES, KITTY_RASTER_CACHE_MAX_ENTRIES, KittyRasterCache, KittyRasterKey,
-    rasterize_kitty, rasterize_kitty_clipped,
+    rasterize_kitty, rasterize_kitty_clipped, rasterize_rgba_clipped,
 };
 pub use kitty_unicode::{
     KittyUnicodeRect, KittyUnicodeVirtual, unicode_run_rect, virtual_extent_cells,

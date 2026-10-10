@@ -23,9 +23,10 @@
 //! dependency edge exists, but it stays green when Core duplicates extension
 //! logic without declaring a dependency (audit CTX-1085 F10: kitty
 //! decode/raster, process supervisors, a11y model). The
-//! `core_library_sources_never_name_extension_impls` scan closes that gap by
-//! rejecting the `bitty_storage` / `bitty_execution` / `bitty_graphics` /
-//! `bitty_a11y` identifiers in Core library sources. To fence a fifth
+//! `core_library_sources_never_name_extension_impls` scan adds a source-reference
+//! fence by rejecting the `bitty_storage` / `bitty_execution` /
+//! `bitty_graphics` / `bitty_a11y` identifiers in Core library sources. It does
+//! not detect copied logic that contains none of these identifiers. To fence a fifth
 //! extension crate, add one entry to `EXTENSION_CRATES` (storage stays first).
 //!
 //! Graph evidence beyond assertion: `cargo tree -e normal` (recorded in the

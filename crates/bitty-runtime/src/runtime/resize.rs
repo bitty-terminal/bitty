@@ -460,15 +460,28 @@ impl Runtime {
         );
         let (cols, rows) = {
             let frames = self.present_frames();
-            self.primary_view
-                .and_then(|primary| frames.iter().find(|frame| frame.view == primary))
-                .map(|frame| {
-                    (
-                        usize::from(frame.cols.max(1)),
-                        usize::from(frame.rows.max(1)),
-                    )
-                })
-                .unwrap_or(fallback)
+            // CTX-1088: a durable fixed-size primary owner keeps its grid
+            // through window reflows; its paint dims stay slot-sized, so
+            // the frame alone would shrink the grid back.
+            if let Some(fixed) = self
+                .primary_view
+                .and_then(|primary| self.fixed_size_for_view(primary))
+            {
+                (
+                    usize::from(fixed.width.max(1)),
+                    usize::from(fixed.height.max(1)),
+                )
+            } else {
+                self.primary_view
+                    .and_then(|primary| frames.iter().find(|frame| frame.view == primary))
+                    .map(|frame| {
+                        (
+                            usize::from(frame.cols.max(1)),
+                            usize::from(frame.rows.max(1)),
+                        )
+                    })
+                    .unwrap_or(fallback)
+            }
         };
         let _damage = self.state.resize(cols, rows);
         self.cols = cols;

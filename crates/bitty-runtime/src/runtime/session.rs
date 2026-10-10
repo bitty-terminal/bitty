@@ -876,8 +876,12 @@ fn strip_overlays(node: &LayoutNode) -> LayoutNode {
             );
             // CTX-1079: the pseudo flag is layout truth like the mode stamp
             // (solver ignores it, present recomputes geometry), so the strip
-            // carries it forward without a format bump.
+            // carries it forward without a format bump. CTX-1088: the
+            // durable fixed-size flag rides the same way (in-memory only;
+            // the file codec is untouched, and a restored shell re-stamps
+            // it when its spawn rule matches).
             fresh.set_pseudo_constraint(view.pseudo_constraint());
+            fresh.set_fixed_size(view.fixed_size());
             LayoutNode::leaf(fresh)
         }
         LayoutNode::Split {
@@ -994,6 +998,7 @@ impl Runtime {
                 PresentationMode::Floating,
             );
             view.set_pseudo_constraint(stored.pseudo_constraint());
+            view.set_fixed_size(stored.fixed_size());
             let state = self.session_state_for(id);
             let (cwd, scrollback) = match state {
                 Some(state) => (

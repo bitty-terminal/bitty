@@ -29,6 +29,14 @@ use crate::geometry::{Point, Rect, Size};
 use crate::presentation::PresentationMode;
 use crate::pseudo::PseudoConstraint;
 
+/// Maximum grid dimension for a durable fixed-size constraint.
+///
+/// Mirrors `bitty-term-state::MAX_GRID_DIM` and
+/// `bitty-config::panel_rules::MAX_PANEL_RULE_DIM` by value so a fixed
+/// size can never request a grid the terminal cannot represent. Larger
+/// inputs fail closed to solver ownership (stored as `None`).
+pub const MAX_FIXED_SIZE_DIM: u16 = 1000;
+
 /// Opaque identifier for a view leaf.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ViewId(pub u64);
@@ -87,6 +95,37 @@ pub struct View {
     /// the solver slot at the preferred size. Ignored by the layout solver
     /// like `presentation`, so stamping never moves allocations.
     pseudo: Option<PseudoConstraint>,
+    /// Durable fixed-size constraint (CTX-1088, follow-up to CTX-1080).
+    /// `None` means solver-owned steady-state geometry; `Some(size)` pins
+    /// the leaf grid and its PTY winsize to `size` through every solver
+    /// sync. The solver still allocates the slot and owns the leaf size
+    /// (allocations stay byte-identical for restore); only grid and PTY
+    /// sizing is owned.
+    ///
+    /// Contract:
+    /// - Spawn-time vs durable: panel-rule `width`/`height` used to be a
+    ///   spawn-time initial-size request (solver reflowed back on the next
+    ///   sync). Stamping this flag makes them durable: the sync paths
+    ///   size grid and PTY from the flag until it is cleared, while paint
+    ///   stays slot-sized. Rule edits affect future spawns only, and a
+    ///   respawn never overwrites an existing flag (clear first to
+    ///   re-stamp).
+    /// - Vs pseudo (`set_pseudo_size`, `pseudo.rs`): deliberately NOT
+    ///   reused. Pseudo is a present-only centered viewport for tiled
+    ///   leaves that falls back to tiled fill when the slot is smaller
+    ///   and is ignored for floating leaves (the float branch wins). The
+    ///   fixed flag owns grid and PTY size even when larger than the slot
+    ///   (painted through the cursor-follow window into slot-sized paint
+    ///   dims, never overlapping neighbours) and sizes floating leaves
+    ///   too. Fixed wins over pseudo on conflict; clearing fixed restores
+    ///   pseudo (when set) else solver ownership.
+    /// - Fail-closed and bounded: only `1..=MAX_FIXED_SIZE_DIM` per axis
+    ///   is stored; empty or oversize inputs store `None` (solver
+    ///   default). An explicit zero axis in a rule stamps nothing at all.
+    ///   Presentation-safe: tiled paint stays inside the slot when the
+    ///   flag fits (gutter is window background) and clips to the slot
+    ///   window when larger; floating paint stays clamped in-container.
+    fixed_size: Option<Size>,
 }
 
 impl View {
@@ -99,8 +138,9 @@ impl View {
     ///
     /// Dimensions are clamped to at least [`View::MIN_COLS`] x [`View::MIN_ROWS`]
     /// and to `u16::MAX` (grid bounds). Scroll starts at live (0),
-    /// presentation starts at [`PresentationMode::Tiled`], and the
-    /// pseudo-tiling flag starts cleared (plain tiled fill).
+    /// presentation starts at [`PresentationMode::Tiled`], the
+    /// pseudo-tiling flag starts cleared (plain tiled fill), and the
+    /// durable fixed-size flag starts cleared (solver-owned geometry).
     #[must_use]
     pub fn new(id: ViewId, cols: usize, rows: usize) -> Self {
         let cols = clamp_dim(cols, Self::MIN_COLS);
@@ -114,6 +154,7 @@ impl View {
             origin: Point::new(0, 0),
             presentation: PresentationMode::Tiled,
             pseudo: None,
+            fixed_size: None,
         }
     }
 
@@ -210,6 +251,48 @@ impl View {
     #[must_use]
     pub fn pseudo_viewport(&self, slot: Rect) -> Rect {
         crate::pseudo::resolve_pseudo_viewport(slot, self.pseudo)
+    }
+
+    /// Durable fixed-size constraint (CTX-1088). `None` means solver-owned
+    /// steady-state geometry; `Some` pins grid and PTY to that size until
+    /// cleared. See the field contract for spawn-time vs durable, pseudo
+    /// interplay (fixed wins), and fail-closed bounds.
+    #[must_use]
+    pub fn fixed_size(&self) -> Option<Size> {
+        self.fixed_size
+    }
+
+    /// Stamps a durable fixed-size constraint on this leaf. Only
+    /// `1..=MAX_FIXED_SIZE_DIM` per axis is stored; empty or oversize
+    /// inputs store `None` (fail-closed to solver ownership) so stored
+    /// state is always valid and consumers never re-validate. The solver
+    /// still allocates the slot and owns the leaf size (byte-identical);
+    /// only grid and PTY sizing is owned. Clearing restores solver
+    /// ownership (or pseudo paint, when a pseudo flag is also set) on the
+    /// next sync.
+    pub fn set_fixed_size(&mut self, size: Option<Size>) {
+        self.fixed_size = match size {
+            Some(s)
+                if !s.is_empty()
+                    && s.width <= MAX_FIXED_SIZE_DIM
+                    && s.height <= MAX_FIXED_SIZE_DIM =>
+            {
+                Some(s)
+            }
+            _ => None,
+        };
+    }
+
+    /// Clears the durable fixed-size flag (restores solver ownership, or
+    /// pseudo when a pseudo flag is also set).
+    pub fn clear_fixed_size(&mut self) {
+        self.fixed_size = None;
+    }
+
+    /// True when a durable fixed-size constraint is stamped.
+    #[must_use]
+    pub fn is_fixed(&self) -> bool {
+        self.fixed_size.is_some()
     }
 
     /// Current scroll offset (0 = live bottom, `n` = `n` lines up into scrollback).
@@ -572,5 +655,38 @@ mod tests {
         assert_eq!(w.id(), ViewId::new(2));
         // Mode participates in leaf identity (distinct leaves compare unequal).
         assert_ne!(v, View::new(ViewId::new(1), 80, 24));
+    }
+
+    #[test]
+    fn fixed_size_defaults_to_solver_owned() {
+        let v = View::new(ViewId::new(1), 80, 24);
+        assert_eq!(v.fixed_size(), None);
+        assert!(!v.is_fixed());
+    }
+
+    #[test]
+    fn fixed_size_set_validates_fail_closed() {
+        let mut v = View::new(ViewId::new(1), 80, 24);
+        v.set_fixed_size(Some(Size::new(40, 12)));
+        assert_eq!(v.fixed_size(), Some(Size::new(40, 12)));
+        assert!(v.is_fixed());
+        // Empty axes fail closed to solver ownership.
+        v.set_fixed_size(Some(Size::new(0, 12)));
+        assert_eq!(v.fixed_size(), None);
+        v.set_fixed_size(Some(Size::new(40, 0)));
+        assert_eq!(v.fixed_size(), None);
+        // Oversize fails closed (bounded at MAX_FIXED_SIZE_DIM).
+        v.set_fixed_size(Some(Size::new(MAX_FIXED_SIZE_DIM + 1, 12)));
+        assert_eq!(v.fixed_size(), None);
+        v.set_fixed_size(Some(Size::new(40, MAX_FIXED_SIZE_DIM + 1)));
+        assert_eq!(v.fixed_size(), None);
+        // None clears; clear helper restores solver ownership.
+        v.set_fixed_size(Some(Size::new(40, 12)));
+        v.set_fixed_size(None);
+        assert_eq!(v.fixed_size(), None);
+        v.set_fixed_size(Some(Size::new(40, 12)));
+        v.clear_fixed_size();
+        assert_eq!(v.fixed_size(), None);
+        assert!(!v.is_fixed());
     }
 }

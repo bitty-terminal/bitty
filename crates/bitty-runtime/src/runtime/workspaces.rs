@@ -895,19 +895,6 @@ impl Runtime {
             .sum()
     }
 
-    /// Leaves across the whole window: the live layout (active workspace)
-    /// plus every stashed inactive slot.
-    ///
-    /// CTX-1039 (#1843): deleting the last panel of one workspace must
-    /// never exit the process while any workspace still holds a panel, so
-    /// the last-pane window-close gesture fires only when this total is 1.
-    /// Callers that are zoom-aware add the zoom backup over the live count
-    /// themselves (the zoom map lives app-side, outside the runtime).
-    #[must_use]
-    pub fn window_leaf_count(&self) -> usize {
-        self.layout.leaf_ids().len() + self.inactive_workspaces_leaf_count()
-    }
-
     /// Kill every pane session owned by workspace `index`'s leaves.
     /// Returns the number torn down.
     fn kill_workspace_sessions(&mut self, index: usize) -> usize {

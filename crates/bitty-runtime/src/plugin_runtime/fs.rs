@@ -399,13 +399,27 @@ mod tests {
 
     static SWEEP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    fn sweep_dir(tag: &str) -> PathBuf {
+    struct SweepDir(PathBuf);
+
+    impl Drop for SweepDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    impl SweepDir {
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    fn sweep_dir(tag: &str) -> SweepDir {
         let id = SWEEP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir =
             std::env::temp_dir().join(format!("bitty-fs-sweep-{tag}-{}-{id}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create sweep dir");
-        dir
+        SweepDir(dir)
     }
 
     #[test]
@@ -418,11 +432,12 @@ mod tests {
     #[test]
     fn sweep_keeps_fresh_temps_and_non_temps() {
         let dir = sweep_dir("fresh");
-        let destination = dir.join("current.json");
+        let root = dir.path();
+        let destination = root.join("current.json");
         std::fs::write(&destination, b"committed").expect("write destination");
-        let fresh_dash = dir.join("current.json.tmp-123-456");
-        let fresh_dot = dir.join("current.json.tmp.789");
-        let unrelated = dir.join("current.json.bak");
+        let fresh_dash = root.join("current.json.tmp-123-456");
+        let fresh_dot = root.join("current.json.tmp.789");
+        let unrelated = root.join("current.json.bak");
         std::fs::write(&fresh_dash, b"live").expect("write fresh dash");
         std::fs::write(&fresh_dot, b"live").expect("write fresh dot");
         std::fs::write(&unrelated, b"keep").expect("write unrelated");
@@ -436,15 +451,15 @@ mod tests {
             std::fs::read(&destination).expect("read destination"),
             b"committed"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn sweep_removes_aged_litter_both_prefixes() {
         let dir = sweep_dir("aged");
-        let destination = dir.join("current.json");
-        let stale_dash = dir.join("current.json.tmp-9-9");
-        let stale_dot = dir.join("current.json.tmp.11");
+        let root = dir.path();
+        let destination = root.join("current.json");
+        let stale_dash = root.join("current.json.tmp-9-9");
+        let stale_dot = root.join("current.json.tmp.11");
         std::fs::write(&stale_dash, b"litter").expect("write stale dash");
         std::fs::write(&stale_dot, b"litter").expect("write stale dot");
 
@@ -455,15 +470,15 @@ mod tests {
 
         assert!(!stale_dash.exists(), "aged dash litter must go");
         assert!(!stale_dot.exists(), "aged dot litter must go");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn atomic_write_sweeps_stale_before_committing() {
         let dir = sweep_dir("write");
-        let destination = dir.join("current.json");
+        let root = dir.path();
+        let destination = root.join("current.json");
         std::fs::write(&destination, b"old").expect("write old");
-        let litter = dir.join("current.json.tmp-7-7");
+        let litter = root.join("current.json.tmp-7-7");
         std::fs::write(&litter, b"litter").expect("write litter");
         // Age the litter via a pre-sweep with a future clock, then verify a
         // real `write_atomic_durably` (real clock) keeps the commit path
@@ -472,10 +487,9 @@ mod tests {
         clean_temp_siblings_with_now(&destination, future);
         assert!(!litter.exists());
 
-        let temp = dir.join("current.json.tmp-1-1");
+        let temp = root.join("current.json.tmp-1-1");
         write_atomic_durably(&NativeFileSystem, &destination, b"new", &temp).expect("atomic write");
         assert_eq!(std::fs::read(&destination).expect("read"), b"new");
         assert!(!temp.exists(), "live temp renamed away");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1612,6 +1612,75 @@ impl TerminalApp {
                 self.runtime.set_layout(layout);
                 eprintln!("bitty: keymap toggle_floating -> {focused:?} {current} -> {next}");
             }
+            A::TogglePinned => {
+                // CTX-1083 (follow-up to CTX-1077 #1757): toggle the focused
+                // panel's pinned (sticky-float) state through the
+                // `bitty.workspace:pin-toggle` string dispatch
+                // (`Runtime::apply_pin_command` into `toggle_pinned`).
+                // Pinning detaches a tiled or floating leaf into the
+                // window-global store so it presents over every workspace;
+                // toggling again returns the still floating panel to the
+                // active workspace. Validate on the live tree BEFORE touching
+                // zoom (mirroring `ToggleFloating`): Fullscreen/Scratchpad
+                // leaves and unknown ids reject with a warning and zero state
+                // change (no zoom restore, no layout write). A focused leaf
+                // that is already pinned lives outside the live layout, so it
+                // skips the mode check and unpins. For a valid toggle, zoom
+                // restores next so the mutation lands on the real tree, not
+                // the zoom proxy — except when the backed-up tree holds a
+                // single leaf (CodeRabbit PR #1903): pinning there refuses
+                // (`StrandedLayout`), so restoring first would consume the
+                // zoom backup behind a refused action. Skipping the restore
+                // on `Some(1)` keeps a refused toggle byte-identical (zoom,
+                // layout, focus); unpin never refuses on leaf count, and an
+                // unpin landing in the proxy is covered by the stale-backup
+                // discipline on disengage. (`ToggleFloating` keeps the plain
+                // restore: its post-restore mode flip has no leaf-count
+                // refusal, the mode already validated above.) No focused pane
+                // warns and keeps everything.
+                let focused = match self.runtime.focused_view() {
+                    Some(id) => id,
+                    None => {
+                        eprintln!("warning: keymap toggle_pinned has no focused pane — ignoring");
+                        return false;
+                    }
+                };
+                if !self.runtime.pinned_views().contains(&focused) {
+                    let current = match self.runtime.layout().find_leaf(focused) {
+                        Some(leaf) => leaf.presentation(),
+                        None => {
+                            eprintln!(
+                                "warning: keymap toggle_pinned found no focused pane {focused:?} — ignoring"
+                            );
+                            return false;
+                        }
+                    };
+                    if !matches!(
+                        current,
+                        PresentationMode::Tiled | PresentationMode::Floating
+                    ) {
+                        eprintln!(
+                            "warning: keymap toggle_pinned needs a tiled or floating leaf, found {current} — ignoring"
+                        );
+                        return false;
+                    }
+                }
+                if self.chrome.zoom.backup_leaf_count(&self.runtime) != Some(1) {
+                    self.restore_zoom();
+                }
+                match self
+                    .runtime
+                    .apply_pin_command(bitty_runtime::PIN_CMD_TOGGLE, Some(focused))
+                {
+                    Ok(None) => eprintln!("bitty: keymap toggle_pinned -> {focused:?} pinned"),
+                    Ok(Some(restored)) => {
+                        eprintln!("bitty: keymap toggle_pinned -> {restored:?} unpinned")
+                    }
+                    Err(err) => {
+                        eprintln!("warning: keymap toggle_pinned refused ({err}) — ignoring")
+                    }
+                }
+            }
             A::ToggleHelp => {
                 // CTX-0265 which-key help popup: rows regenerate from the
                 // live keymap table on EVERY show, so the overlay lists
@@ -3960,6 +4029,167 @@ mod tests {
             Some(ChromeAction::ToggleFloating),
             "toggle_floating rebinds by explicit chord"
         );
+    }
+
+    #[test]
+    fn chrome_toggle_pinned_pins_focused_presents_everywhere_then_unpins() {
+        // CTX-1083 (follow-up to CTX-1077 #1757): the `toggle_pinned` keymap
+        // action routes the focused leaf through the
+        // `bitty.workspace:pin-toggle` string dispatch. Pin detaches the leaf
+        // so it presents over every workspace; toggling again returns the
+        // still floating panel to the active workspace as a normal float.
+        use bitty_config::ChromeAction;
+        let mut app = workspace_test_app();
+        app.runtime.set_layout(two_pane_layout());
+        app.runtime
+            .set_container(bitty_runtime::UiRect::new(0, 0, 80, 24));
+        assert!(app.runtime.set_focus(ViewId::new(1)));
+
+        app.apply_chrome_action(ChromeAction::TogglePinned);
+        assert_eq!(app.runtime.pinned_views(), vec![ViewId::new(1)]);
+        assert_eq!(app.runtime.layout().leaf_ids(), vec![ViewId::new(2)]);
+
+        app.runtime.workspace_new().expect("second workspace opens");
+        let hits: Vec<_> = app
+            .runtime
+            .present_frames()
+            .into_iter()
+            .filter(|frame| frame.view == ViewId::new(1))
+            .collect();
+        assert_eq!(hits.len(), 1, "pinned leaf presents exactly once");
+        assert_eq!(hits[0].tier, Some(bitty_runtime::OverlayTier::Float));
+
+        // Focus the sticky float (valid outside the live layout) and toggle
+        // again: it unpins back into the active workspace as a float.
+        assert!(app.runtime.set_focus(ViewId::new(1)));
+        app.apply_chrome_action(ChromeAction::TogglePinned);
+        assert!(!app.runtime.pinned_occupied());
+        assert_eq!(
+            app.runtime
+                .layout()
+                .find_leaf(ViewId::new(1))
+                .expect("leaf back in the live tree")
+                .presentation(),
+            PresentationMode::Floating,
+            "unpin returns the floating panel, never re-tiles"
+        );
+
+        // Normal float behavior resumes: it stays in its workspace.
+        app.runtime.workspace_prev();
+        assert!(
+            app.runtime
+                .present_frames()
+                .iter()
+                .all(|frame| frame.view != ViewId::new(1)),
+            "unpinned float stays in its workspace"
+        );
+        app.runtime.workspace_next();
+        assert!(
+            app.runtime
+                .present_frames()
+                .iter()
+                .any(|frame| frame.view == ViewId::new(1)),
+            "unpinned float presents back home"
+        );
+    }
+
+    #[test]
+    fn chrome_toggle_pinned_fails_closed_without_state_change() {
+        // CTX-1083: unknown or ambiguous targets are loud no-ops, never
+        // panics. A single-leaf layout refuses the pin (it would strand an
+        // empty live layout); a Fullscreen leaf refuses the mode gate. Both
+        // leave the layout, the pinned store, and focus untouched.
+        use bitty_config::ChromeAction;
+        let mut app = workspace_test_app();
+        app.runtime
+            .set_layout(LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)));
+        assert!(app.runtime.set_focus(ViewId::new(1)));
+        let before = format!("{:?}", app.runtime.layout());
+        app.apply_chrome_action(ChromeAction::TogglePinned);
+        assert!(app.runtime.pinned_views().is_empty());
+        assert_eq!(format!("{:?}", app.runtime.layout()), before);
+        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+
+        let mut app = workspace_test_app();
+        app.runtime.set_layout(two_pane_layout());
+        assert!(app.runtime.set_focus(ViewId::new(1)));
+        let mut seeded = app.runtime.layout().clone();
+        let leaf = seeded.find_leaf_mut(ViewId::new(1)).expect("focused leaf");
+        assert!(PresentationMode::request_transition(
+            leaf,
+            PresentationMode::Fullscreen
+        ));
+        app.runtime.set_layout(seeded);
+        let before = format!("{:?}", app.runtime.layout());
+        app.apply_chrome_action(ChromeAction::TogglePinned);
+        assert!(app.runtime.pinned_views().is_empty());
+        assert_eq!(format!("{:?}", app.runtime.layout()), before);
+        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+    }
+
+    #[test]
+    fn chrome_toggle_pinned_keeps_zoom_on_refused_sole_leaf_pin() {
+        // CodeRabbit PR #1903: a zoomed single-leaf workspace refuses the pin
+        // (it would strand an empty live layout). The refusal must leave zoom
+        // state untouched: still zoomed, backup intact, layout byte-identical.
+        use bitty_config::ChromeAction;
+        let mut app = workspace_test_app();
+        app.runtime
+            .set_layout(LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)));
+        assert!(app.runtime.set_focus(ViewId::new(1)));
+        app.apply_chrome_action(ChromeAction::ToggleZoom);
+        assert!(app.chrome.zoom.is_zoomed(&app.runtime), "zoom engaged");
+        assert_eq!(
+            app.chrome.zoom.backup_leaf_count(&app.runtime),
+            Some(1),
+            "backed-up tree holds the sole leaf"
+        );
+        let before = format!("{:?}", app.runtime.layout());
+        app.apply_chrome_action(ChromeAction::TogglePinned);
+        assert!(
+            app.runtime.pinned_views().is_empty(),
+            "refused pin parks nothing"
+        );
+        assert!(
+            app.chrome.zoom.is_zoomed(&app.runtime),
+            "refusal keeps the zoom backup"
+        );
+        assert_eq!(
+            app.chrome.zoom.backup_leaf_count(&app.runtime),
+            Some(1),
+            "refusal keeps the backed-up leaf count"
+        );
+        assert_eq!(
+            format!("{:?}", app.runtime.layout()),
+            before,
+            "refusal keeps the layout byte-identical"
+        );
+        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+    }
+
+    #[test]
+    fn chrome_toggle_pinned_restores_zoom_for_multi_leaf_pin() {
+        // Companion to the sole-leaf refusal above: with 2+ backed-up leaves
+        // the restore still runs, so the pin lands on the real tree and the
+        // zoom backup is consumed.
+        use bitty_config::ChromeAction;
+        let mut app = workspace_test_app();
+        app.runtime.set_layout(two_pane_layout());
+        assert!(app.runtime.set_focus(ViewId::new(1)));
+        app.apply_chrome_action(ChromeAction::ToggleZoom);
+        assert!(app.chrome.zoom.is_zoomed(&app.runtime), "zoom engaged");
+        assert_eq!(
+            app.chrome.zoom.backup_leaf_count(&app.runtime),
+            Some(2),
+            "backed-up tree holds both leaves"
+        );
+        app.apply_chrome_action(ChromeAction::TogglePinned);
+        assert!(
+            !app.chrome.zoom.is_zoomed(&app.runtime),
+            "valid pin consumes the zoom restore"
+        );
+        assert_eq!(app.runtime.pinned_views(), vec![ViewId::new(1)]);
+        assert_eq!(app.runtime.layout().leaf_ids(), vec![ViewId::new(2)]);
     }
 
     #[test]

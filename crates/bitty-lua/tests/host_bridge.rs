@@ -2190,3 +2190,103 @@ fn invoke_bridge_forwards_names_and_args_untouched() {
         LuaValue::table([("n", LuaValue::Integer(1))])
     );
 }
+
+/// Pinned-panel Lua verb (CTX-1083, follow-up to CTX-1077 #1757):
+/// `bitty.panel.set_pinned` forwards the validated id plus desired state to
+/// the host and returns its boolean; malformed shapes fail closed with
+/// `E_DEF_INVALID` before ever reaching the host.
+#[derive(Default)]
+struct PinStub {
+    store: RefCell<BTreeMap<String, LuaValue>>,
+    calls: RefCell<Vec<(u64, bool)>>,
+}
+
+impl HostServices for PinStub {
+    fn store_get(&self, key: &str) -> Result<Option<LuaValue>, BridgeError> {
+        Ok(self.store.borrow().get(key).cloned())
+    }
+
+    fn store_set(&self, key: &str, value: LuaValue) -> Result<(), BridgeError> {
+        if matches!(value, LuaValue::Nil) {
+            self.store.borrow_mut().remove(key);
+        } else {
+            self.store.borrow_mut().insert(key.to_string(), value);
+        }
+        Ok(())
+    }
+
+    fn settings_get(&self, _key: &str) -> Result<Option<LuaValue>, BridgeError> {
+        Ok(None)
+    }
+
+    fn terminal_snapshot(&self, _scope: &str) -> Result<LuaValue, BridgeError> {
+        Err(BridgeError::capability_denied("terminal.semantic-read"))
+    }
+
+    fn notify_show(&self, _payload: &LuaValue) -> Result<bool, BridgeError> {
+        Err(BridgeError::capability_denied("platform.notify"))
+    }
+
+    fn panel_set_pinned(&self, panel_id: u64, pinned: bool) -> Result<bool, BridgeError> {
+        self.calls.borrow_mut().push((panel_id, pinned));
+        Ok(pinned)
+    }
+}
+
+#[test]
+fn panel_set_pinned_forwards_validated_id_and_state() {
+    let services = Rc::new(PinStub::default());
+    let mut vm = gate_vm("panel-set-pinned");
+    let services_dyn: Rc<dyn HostServices> = services.clone();
+    vm.install_host_module(services_dyn, MarshallingLimits::default(), 50)
+        .expect("install");
+    let outcome = vm
+        .execute_bounded(
+            "bitty.store.set(\"a\", bitty.panel.set_pinned(7, true))\n\
+             bitty.store.set(\"b\", bitty.panel.set_pinned(7, false))",
+        )
+        .expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "valid calls must complete: {outcome:?}"
+    );
+    assert_eq!(
+        services.calls.borrow().as_slice(),
+        &[(7, true), (7, false)],
+        "validated id plus desired state reaches the host in order"
+    );
+    {
+        let store = services.store.borrow();
+        assert_eq!(store.get("a"), Some(&LuaValue::Bool(true)));
+        assert_eq!(store.get("b"), Some(&LuaValue::Bool(false)));
+    }
+
+    for (tag, call) in [
+        ("non-integer-id", "bitty.panel.set_pinned(\"7\", true)"),
+        ("missing-pinned", "bitty.panel.set_pinned(7)"),
+        ("non-boolean-pinned", "bitty.panel.set_pinned(7, 1)"),
+    ] {
+        let outcome = vm
+            .execute_bounded(&format!(
+                "local ok, err = pcall(function() return {call} end)\n\
+                 if ok then bitty.store.set(\"code\", \"NONE\") \
+                 else bitty.store.set(\"code\", err.code) end"
+            ))
+            .expect("execute");
+        assert!(
+            matches!(outcome, BoundedExecution::Completed),
+            "{tag}: chunk must complete via pcall: {outcome:?}"
+        );
+    }
+    let store = services.store.borrow();
+    assert_eq!(
+        store.get("code"),
+        Some(&LuaValue::String("E_DEF_INVALID".to_string())),
+        "malformed shapes fail closed with E_DEF_INVALID"
+    );
+    assert_eq!(
+        services.calls.borrow().len(),
+        2,
+        "malformed shapes must never reach the host"
+    );
+}

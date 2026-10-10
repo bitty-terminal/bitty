@@ -187,6 +187,18 @@ impl WorkspaceRequestQueue {
     }
 }
 
+/// Synchronous pinned-float backend for one plugin generation (CTX-1083).
+///
+/// Receives the Lua-validated panel id (a `ViewId` raw value) plus the
+/// desired pinned state and returns whether that state now holds (`true`
+/// covers both an applied transition and an idempotent no-op; `false` is
+/// the fail-closed answer for an unknown or unpinnable target with state
+/// untouched). The production backend routes into the same
+/// `pin_floating`/`unpin_floating` runtime path the `toggle_pinned` keymap
+/// action uses; tests inject canned closures. `None` (no backend) fails
+/// closed with `E_NOT_IMPLEMENTED`.
+pub type PanelPinHandler = Rc<dyn Fn(u64, bool) -> Result<bool, BridgeError>>;
+
 /// Settings source that has no settings.
 #[derive(Debug, Default)]
 pub struct EmptySettings;
@@ -1096,6 +1108,7 @@ pub struct PluginServices {
     workspace_requests: RefCell<Option<Rc<RefCell<WorkspaceRequestQueue>>>>,
     panel_create_granted: Cell<bool>,
     panel_focus_granted: Cell<bool>,
+    panel_pin_backend: RefCell<Option<PanelPinHandler>>,
 }
 
 impl PluginServices {
@@ -1149,6 +1162,7 @@ impl PluginServices {
             workspace_requests: RefCell::new(None),
             panel_create_granted: Cell::new(false),
             panel_focus_granted: Cell::new(false),
+            panel_pin_backend: RefCell::new(None),
         }
     }
 
@@ -1159,6 +1173,13 @@ impl PluginServices {
     pub fn set_panel_access(&self, create: bool, focus: bool) {
         self.panel_create_granted.set(create);
         self.panel_focus_granted.set(focus);
+    }
+
+    /// Attach the synchronous pinned-float backend for `bitty.panel.set_pinned`
+    /// (CTX-1083). Without it a granted call fails closed with
+    /// `E_NOT_IMPLEMENTED`, like every other panel verb without a host.
+    pub fn set_panel_pin_backend(&self, backend: Option<PanelPinHandler>) {
+        *self.panel_pin_backend.borrow_mut() = backend;
     }
 
     /// Grant `workspace.read` and/or `workspace.control` from the activation
@@ -2813,6 +2834,18 @@ impl HostServices for PluginServices {
         Err(BridgeError::not_implemented("bitty.panel.toggle_floating"))
     }
 
+    fn panel_set_pinned(&self, panel_id: u64, pinned: bool) -> Result<bool, BridgeError> {
+        if !self.panel_focus_granted.get() {
+            return Err(BridgeError::capability_denied("panel.focus"));
+        }
+        let backend = self
+            .panel_pin_backend
+            .borrow()
+            .clone()
+            .ok_or_else(|| BridgeError::not_implemented("bitty.panel.set_pinned"))?;
+        backend(panel_id, pinned)
+    }
+
     fn panel_get_state(&self, panel_id: u64) -> Result<Option<LuaValue>, BridgeError> {
         if !self.panel_focus_granted.get() {
             return Err(BridgeError::capability_denied("panel.focus"));
@@ -3005,6 +3038,7 @@ mod tests {
                 services.panel_set_presentation(1, "tab"),
             ),
             ("toggle_floating", services.panel_toggle_floating(1)),
+            ("set_pinned", services.panel_set_pinned(1, true)),
             ("get_state", services.panel_get_state(1).map(|_| false)),
         ] {
             let error = res.expect_err("denied");
@@ -3045,8 +3079,90 @@ mod tests {
             .panel_toggle_floating(1)
             .expect_err("unimplemented");
         assert_eq!(error.code, "E_NOT_IMPLEMENTED");
+        let error = focus_only
+            .panel_set_pinned(1, true)
+            .expect_err("unimplemented");
+        assert_eq!(error.code, "E_NOT_IMPLEMENTED");
         let error = focus_only.panel_get_state(1).expect_err("unimplemented");
         assert_eq!(error.code, "E_NOT_IMPLEMENTED");
+    }
+
+    #[test]
+    fn panel_set_pinned_routes_through_the_runtime_pin_path() {
+        // CTX-1083: the `bitty.panel.set_pinned` service seam delegates to
+        // the same `pin_floating`/`unpin_floating` runtime path the
+        // `toggle_pinned` keymap action uses. The backend here closes over a
+        // live runtime; production wires its own host backend while the seam
+        // (grant gate plus fail-closed booleans) stays identical.
+        use crate::{LayoutNode, Runtime, SplitAxis, UiRect, View, ViewId};
+        let runtime = Rc::new(RefCell::new(
+            Runtime::with_defaults().expect("defaults must build"),
+        ));
+        {
+            let mut rt = runtime.borrow_mut();
+            rt.set_layout(LayoutNode::split(
+                SplitAxis::Horizontal,
+                0.5,
+                LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+                LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+            ));
+            rt.set_container(UiRect::new(0, 0, 80, 24));
+        }
+        let backend: PanelPinHandler = Rc::new(move |panel_id, pinned| {
+            let mut rt = runtime.borrow_mut();
+            let id = ViewId::new(panel_id);
+            if pinned {
+                if rt.pinned_views().contains(&id) {
+                    return Ok(true);
+                }
+                match rt.pin_floating(id) {
+                    Ok(()) => Ok(true),
+                    Err(_) => Ok(false),
+                }
+            } else {
+                if !rt.pinned_views().contains(&id) && rt.layout().leaf_ids().contains(&id) {
+                    return Ok(true);
+                }
+                match rt.unpin_floating(id) {
+                    Ok(_) => Ok(true),
+                    Err(_) => Ok(false),
+                }
+            }
+        });
+        let granted = services();
+        granted.set_panel_access(false, true);
+        granted.set_panel_pin_backend(Some(backend));
+
+        assert!(
+            granted.panel_set_pinned(1, true).expect("pin applies"),
+            "pinning a live leaf holds"
+        );
+        assert!(
+            granted.panel_set_pinned(1, true).expect("idempotent"),
+            "re-pinning an already pinned leaf still holds"
+        );
+        assert!(
+            granted.panel_set_pinned(1, false).expect("unpin applies"),
+            "unpinning returns the floating panel"
+        );
+        assert!(
+            granted.panel_set_pinned(1, false).expect("idempotent"),
+            "unpinning a live leaf still holds"
+        );
+        // Fail-closed on an unknown target: no panic, state untouched,
+        // clear false result.
+        assert!(
+            !granted
+                .panel_set_pinned(404, true)
+                .expect("unknown pin fails closed"),
+            "unknown id pins nothing"
+        );
+        assert!(
+            !granted
+                .panel_set_pinned(404, false)
+                .expect("unknown unpin fails closed"),
+            "unknown id unpins nothing"
+        );
     }
 
     #[test]

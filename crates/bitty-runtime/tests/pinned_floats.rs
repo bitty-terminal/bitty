@@ -10,9 +10,9 @@
 
 use bitty_platform::{CursorPosition, MouseButton, PressState};
 use bitty_runtime::{
-    LayoutNode, OverlayTier, PaneAttachment, PaneRoute, PaneSnapshot, PinnedSnapshot,
-    PresentationMode, Runtime, RuntimeConfig, SESSION_FORMAT_VERSION, SessionSnapshot, SplitAxis,
-    UiRect, View, ViewId, WorkspaceSnapshot,
+    LayoutNode, OverlayTier, PIN_CMD_TOGGLE, PaneAttachment, PaneRoute, PaneSnapshot,
+    PinnedSnapshot, PresentationMode, Runtime, RuntimeConfig, SESSION_FORMAT_VERSION,
+    SessionSnapshot, SplitAxis, UiRect, View, ViewId, WorkspaceSnapshot,
 };
 
 fn make_runtime() -> Runtime {
@@ -254,6 +254,49 @@ fn toggle_pinned_roundtrip_and_rejects() {
             .presentation(),
         PresentationMode::Floating
     );
+}
+
+#[test]
+fn pin_command_dispatch_routes_the_toggle_verb_and_rejects() {
+    // CTX-1083: the runtime string dispatch behind the `toggle_pinned`
+    // keymap action and the `bitty.panel.set_pinned` backend. The accepted
+    // command delegates to `toggle_pinned` (pin presents everywhere, toggle
+    // again returns a normal float); anything else fails closed with state
+    // untouched, as does a missing target.
+    let mut rt = make_runtime();
+    install(&mut rt, two_pane());
+    assert_eq!(
+        rt.apply_pin_command(PIN_CMD_TOGGLE, Some(ViewId::new(1)))
+            .expect("toggle to pin"),
+        None
+    );
+    assert_eq!(rt.pinned_views(), vec![ViewId::new(1)]);
+    assert_eq!(
+        rt.apply_pin_command(PIN_CMD_TOGGLE, Some(ViewId::new(1)))
+            .expect("toggle to unpin"),
+        Some(ViewId::new(1))
+    );
+    assert!(!rt.pinned_occupied());
+
+    let before = rt.layout().leaf_ids();
+    let error = rt
+        .apply_pin_command("bitty.workspace:nope", Some(ViewId::new(1)))
+        .expect_err("unknown command fails closed");
+    assert!(
+        error.contains("unknown pin command"),
+        "clear result, never a panic: {error}"
+    );
+    assert_eq!(rt.layout().leaf_ids(), before);
+    assert!(!rt.pinned_occupied());
+    let error = rt
+        .apply_pin_command(PIN_CMD_TOGGLE, None)
+        .expect_err("missing target fails closed");
+    assert!(
+        error.contains("needs a target"),
+        "clear result, never a panic: {error}"
+    );
+    assert_eq!(rt.layout().leaf_ids(), before);
+    assert!(!rt.pinned_occupied());
 }
 
 #[test]

@@ -5,11 +5,11 @@ This directory holds multi-distro packaging recipes and helpers for Bitty releas
 ## Support evidence
 
 A binary that CI builds for a platform is not support evidence for that
-platform. Only release-matrix-verified artifacts count as supported: the
-`verify-install` legs (Ubuntu, Fedora, Arch, Alpine) when they pass, the
-`verify-*` jobs listed under `Release Matrix` when they pass, and tag-time
-publishes that completed successfully (AUR, Homebrew, Scoop, all gated on
-secrets). Anything else is best-effort and is labeled as such below.
+platform. Support evidence is limited to passing `verify-install` legs
+(Ubuntu, Fedora, Arch, Alpine), passing `verify-*` jobs listed under
+`Release Matrix`, and tag-time publishes that completed successfully
+(AUR, Homebrew, Scoop, all gated on secrets). Anything else is best-effort
+and is labeled as such below.
 
 ## Formats
 

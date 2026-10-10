@@ -58,6 +58,20 @@
 //! (`bitty-graphics` extension, `bitty-render` atlas layers): this store
 //! records display intent the renderer can composite once data arrives,
 //! and prunes references that can never resolve.
+//!
+//! CTX-1087 (F11, #1891) ownership note: this [`PlacementStore`] is the
+//! normative terminal-grid truth for Kitty placements — anchor rows/cols,
+//! cell spans, scroll coupling, delete selectors, animation timing, and the
+//! [`KITTY_Z_BELOW_BACKGROUND`] z-order threshold. `bitty-render` consumes
+//! the threshold (its `IMAGE_Z_BELOW_BACKGROUND` is a compatibility alias,
+//! pinned equal by test) and `bitty-rich`'s `KittyImageLayer` owns the
+//! complementary presentation truth (decoded bitmaps, viewport pixel rects,
+//! paint order, per-frame budgets). The two stores are not duplicates:
+//! grid intent flows terminal-truth -> presentation, and presentation never
+//! mutates grid truth. The demoted legacy seam is [`crate::image`]'s
+//! `ImagePlaceholder` (opaque 1x1 inert record, not for new code); this
+//! store and the rich layer stay live. No restructuring here: this note
+//! declares the model, values stay unchanged.
 
 use std::collections::VecDeque;
 
@@ -86,6 +100,11 @@ pub const KITTY_ANIM_DEFAULT_GAP_MS: u32 = 40;
 
 /// `z-index` below which placements draw under non-default cell
 /// backgrounds (`INT32_MIN/2`, kitty layering rule).
+///
+/// CTX-1087 normative site for the Kitty z-order threshold (#1891):
+/// `bitty-render`'s `IMAGE_Z_BELOW_BACKGROUND` aliases this value and
+/// `bitty-rich` orders by `z` against it. Do not change this value without
+/// updating the pinned cross-crate equality test in `bitty-render`.
 pub const KITTY_Z_BELOW_BACKGROUND: i32 = -1_073_741_824;
 
 /// One image placement: a display of an image on (or under) the grid.

@@ -46,6 +46,15 @@ pub const IMAGE_MAX_DIMENSION: u32 = 4096;
 pub const IMAGE_MAX_DECODED_BYTES: usize = 64 * 1024 * 1024;
 
 /// Max total `ImageStore` bytes (IMG-4).
+///
+/// CTX-1087 (F11, #1891): this module is the ONE normative site for the
+/// stored decoded-image quotas (256 MiB total, 128 placements, 64 MiB per
+/// image). `bitty-rich::kitty_place::{KITTY_PLACE_MAX_BYTES,
+/// KITTY_PLACE_MAX_ITEMS}` alias these values for the Kitty placement layer
+/// (the 64-image Kitty ledger instead aliases the kitty placeholder ceiling,
+/// kitty-ledger parity — distinct layer, value unchanged), and `bitty-ui`'s
+/// 8/32/64 MiB tier ladder is a separate candidate UI budget, never Kitty
+/// policy. Values unchanged.
 pub const IMAGE_STORE_MAX_BYTES: usize = 256 * 1024 * 1024;
 
 /// Max image count (IMG-5).

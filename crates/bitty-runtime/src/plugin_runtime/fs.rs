@@ -3,6 +3,17 @@
 //! Provides all-or-nothing atomic replacement with distinguished durability
 //! guarantees, isolated temporary file allocation, fail-safe cleanup, and fake
 //! filesystem adapters for transactional failure injection (TERM-RUN-003, PLUG-REG-010).
+//!
+//! CTX-1087 (F5, #1891) duplication note: [`write_atomic_durably`] duplicates
+//! `bitty-storage`'s `atomic_io::write_atomic_durably` (`atomic_io.rs:136`)
+//! plus the `clean_temp_siblings` / `STALE_TEMP_AGE_SECS` stale-temp sweep.
+//! The duplication is intentional and documented: no shared-trait Core
+//! capability is introduced here, and the final dedup is owned by the
+//! post-0.0.23 extraction (the `bitty-storage` repo owns the canonical
+//! mechanics; Core keeps this parity copy until the extraction lands).
+//! Values and sweep semantics below must stay in parity with `bitty-storage`
+//! (`STALE_TEMP_AGE_SECS = 3600`, `<file>.tmp.` / `<file>.tmp-` prefixes,
+//! age-gated, fail-closed toward keeping, sweep-before-write).
 
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -79,7 +90,73 @@ impl FileSystem for NativeFileSystem {
     }
 }
 
+/// Minimum temp-sibling age before the pre-write sweep treats it as crash
+/// litter (CTX-1087 parity with `bitty-storage`'s `STALE_TEMP_AGE_SECS`).
+///
+/// Live writers hold their temps for milliseconds, so an hour keeps the sweep
+/// from ever deleting a concurrent saver's live temp while still reclaiming
+/// crashed-save litter on later saves. Must stay `3600` in parity with the
+/// extraction; the final dedup is owned post-0.0.23 by `bitty-storage`.
+pub const STALE_TEMP_AGE_SECS: u64 = 3_600;
+
+/// Removes stale `<file>.tmp.*` siblings best-effort (crashed-save litter).
+///
+/// Parity with `bitty-storage`'s `clean_temp_siblings`: age-gated so the sweep
+/// never deletes a concurrent saver's live temp. Runs over the real
+/// filesystem via `std::fs` (best-effort, errors ignored) rather than the
+/// [`FileSystem`] trait on purpose: the sweep is hygiene, not correctness,
+/// and threading directory-listing + mtime through the trait would be a new
+/// Core capability (forbidden by #1891). `FakeFileSystem` entries are
+/// in-memory and therefore never swept here; real stale files from previous
+/// native runs are still reclaimed.
+///
+/// Callers sweep BEFORE writing, never after the rename: a post-rename sweep
+/// would race a concurrent saver's live temp sibling.
+pub fn clean_temp_siblings(destination: &Path) {
+    clean_temp_siblings_with_now(destination, std::time::SystemTime::now());
+}
+
+fn clean_temp_siblings_with_now(destination: &Path, now: std::time::SystemTime) {
+    let Some(parent) = destination.parent() else {
+        return;
+    };
+    if parent.as_os_str().is_empty() {
+        return;
+    }
+    let stem = destination.file_name().map_or_else(
+        || "component".to_owned(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let dot_prefix = format!("{stem}.tmp.");
+    let dash_prefix = format!("{stem}.tmp-");
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !(name.starts_with(&dot_prefix) || name.starts_with(&dash_prefix)) {
+            continue;
+        }
+        // Fail-closed toward keeping: unknown age (missing/clocked-skewed
+        // mtime) is treated as live, never as litter.
+        let stale = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .map(|mtime| {
+                now.duration_since(mtime)
+                    .is_ok_and(|age| age.as_secs() >= STALE_TEMP_AGE_SECS)
+            })
+            .unwrap_or(false);
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Write `data` to `destination` atomically and durably via `fs`:
+/// 0. Sweeps stale `<file>.tmp.*` siblings best-effort via
+///    [`clean_temp_siblings`] (parity with `bitty-storage`; never touches
+///    the live `temp` or `destination`).
 /// 1. Ensures destination parent directory exists.
 /// 2. Writes `data` to a unique temporary file `temp` in the parent directory.
 /// 3. Flushes and syncs data to disk for durability.
@@ -94,6 +171,9 @@ pub fn write_atomic_durably(
     data: &[u8],
     temp: &Path,
 ) -> io::Result<()> {
+    // Pre-write sweep only: a post-rename sweep would race a concurrent
+    // saver's live temp. Best-effort; failures never fail the write.
+    clean_temp_siblings(destination);
     if let Some(parent) = destination.parent() {
         if !parent.as_os_str().is_empty() {
             fs.create_dir_all(parent)?;
@@ -308,5 +388,94 @@ impl FileSystem for FakeFileSystem {
 
     fn exists(&self, path: &Path) -> bool {
         self.files.read().unwrap().contains_key(path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    static SWEEP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn sweep_dir(tag: &str) -> PathBuf {
+        let id = SWEEP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("bitty-fs-sweep-{tag}-{}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create sweep dir");
+        dir
+    }
+
+    #[test]
+    fn stale_temp_age_parity_with_storage() {
+        // CTX-1087: the sweep horizon must stay `3600` in parity with
+        // `bitty-storage`'s `STALE_TEMP_AGE_SECS`.
+        assert_eq!(STALE_TEMP_AGE_SECS, 3_600);
+    }
+
+    #[test]
+    fn sweep_keeps_fresh_temps_and_non_temps() {
+        let dir = sweep_dir("fresh");
+        let destination = dir.join("current.json");
+        std::fs::write(&destination, b"committed").expect("write destination");
+        let fresh_dash = dir.join("current.json.tmp-123-456");
+        let fresh_dot = dir.join("current.json.tmp.789");
+        let unrelated = dir.join("current.json.bak");
+        std::fs::write(&fresh_dash, b"live").expect("write fresh dash");
+        std::fs::write(&fresh_dot, b"live").expect("write fresh dot");
+        std::fs::write(&unrelated, b"keep").expect("write unrelated");
+
+        clean_temp_siblings(&destination);
+
+        assert!(fresh_dash.exists(), "fresh dash temp must be kept");
+        assert!(fresh_dot.exists(), "fresh dot temp must be kept");
+        assert!(unrelated.exists(), "non-temp sibling must be kept");
+        assert_eq!(
+            std::fs::read(&destination).expect("read destination"),
+            b"committed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sweep_removes_aged_litter_both_prefixes() {
+        let dir = sweep_dir("aged");
+        let destination = dir.join("current.json");
+        let stale_dash = dir.join("current.json.tmp-9-9");
+        let stale_dot = dir.join("current.json.tmp.11");
+        std::fs::write(&stale_dash, b"litter").expect("write stale dash");
+        std::fs::write(&stale_dot, b"litter").expect("write stale dot");
+
+        // Simulate age without touching mtimes: sweep with a `now` far in
+        // the future so both siblings read as older than the horizon.
+        let future = std::time::SystemTime::now() + Duration::from_secs(STALE_TEMP_AGE_SECS + 60);
+        clean_temp_siblings_with_now(&destination, future);
+
+        assert!(!stale_dash.exists(), "aged dash litter must go");
+        assert!(!stale_dot.exists(), "aged dot litter must go");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_write_sweeps_stale_before_committing() {
+        let dir = sweep_dir("write");
+        let destination = dir.join("current.json");
+        std::fs::write(&destination, b"old").expect("write old");
+        let litter = dir.join("current.json.tmp-7-7");
+        std::fs::write(&litter, b"litter").expect("write litter");
+        // Age the litter via a pre-sweep with a future clock, then verify a
+        // real `write_atomic_durably` (real clock) keeps the commit path
+        // intact; the sweep itself is covered above.
+        let future = std::time::SystemTime::now() + Duration::from_secs(STALE_TEMP_AGE_SECS + 60);
+        clean_temp_siblings_with_now(&destination, future);
+        assert!(!litter.exists());
+
+        let temp = dir.join("current.json.tmp-1-1");
+        write_atomic_durably(&NativeFileSystem, &destination, b"new", &temp).expect("atomic write");
+        assert_eq!(std::fs::read(&destination).expect("read"), b"new");
+        assert!(!temp.exists(), "live temp renamed away");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

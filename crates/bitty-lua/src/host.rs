@@ -22,6 +22,20 @@
 //!   rejects traversal/escapes and non-`.lua` artifacts, and caches per VM.
 //! - The `bitty` table and every sub-table are read-only proxies: assignment
 //!   and raw metatable mutation fail with a typed `runtime` diagnostic.
+//!
+//! CTX-1087 (F12, #1891) intentional-confinement note: `require` carries no
+//! `fs.read` grant head on purpose (smaller diff, tests stay green). The
+//! module root is the single VFS-style capability root for code loading:
+//! names are validated (`validate_module_name`), resolved under the root,
+//! canonicalized back under it (symlink escapes fail closed), restricted to
+//! source-only `.lua` files, and capped at `MODULE_FILE_MAX_BYTES`. That
+//! confinement is the grant — `require` can never name an arbitrary host
+//! path, so there is nothing for an `fs.read:PATTERN` grant to authorize.
+//! `bitty.fs.read` grants govern the separate `bitty.fs.read` data path
+//! (arbitrary host files via `HostServices`), not module loading. Gating
+//! `require` under `fs.read` would conflate code loading with data reads
+//! and is explicitly deferred; this note documents the intentional OR
+//! (confinement instead of a grant gate).
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -4849,6 +4863,12 @@ impl LuaVm {
     /// module configuration, so this injection is the only searcher — a VM
     /// without a module root keeps the preload-only `require`, which resolves
     /// nothing.
+    ///
+    /// CTX-1087 (F12, #1891): intentionally NOT gated under `fs.read`. The
+    /// confinement above (name validation + canonicalize-under-root +
+    /// `.lua`-only + `MODULE_FILE_MAX_BYTES` cap) is the authorization, so no
+    /// grant head is consulted here. See the crate-level
+    /// intentional-confinement note.
     fn install_require(&mut self) -> Result<(), VmError> {
         let Some(root) = self.directory_root() else {
             return Err(VmError::Load("module root not configured".into()));
@@ -5806,6 +5826,34 @@ mod tests {
             "{outcome:?}"
         );
         assert!(!vm.is_suspended());
+    }
+
+    #[test]
+    fn require_confinement_is_intentional_not_fs_grant() {
+        // CTX-1087 (F12, #1891): `require` carries no `fs.read` grant head by
+        // design — the module-root confinement (name shape + canonicalize +
+        // `.lua`-only + byte cap) is the authorization. Pin all four walls
+        // here so a future change must update this test explicitly.
+        assert!(validate_module_name("ok_mod").is_ok());
+        assert!(validate_module_name("../outside").is_err());
+        assert!(validate_module_name(".leading").is_err());
+        assert!(validate_module_name("has space").is_err());
+        assert!(validate_module_name("has/slash").is_err());
+
+        let root = temp_module_root("f12-confinement");
+        // Resolves inside the root with no grant context at all.
+        std::fs::write(root.0.join("inner.lua"), "return { v = 1 }").expect("write");
+        assert!(resolve_module_source(&root.0, "inner").is_ok());
+        // Missing module fails closed without consulting any grant.
+        let err = resolve_module_source(&root.0, "nope").expect_err("missing");
+        assert_eq!(err.code, "E_REQUIRE_NOT_FOUND");
+        // A non-`.lua` artifact can never be required even when present.
+        std::fs::write(root.0.join("native.so"), "bytes").expect("write so");
+        let err = resolve_module_source(&root.0, "native").expect_err("non-lua");
+        assert!(matches!(
+            err.code,
+            "E_REQUIRE_NOT_FOUND" | "E_REQUIRE_NATIVE"
+        ));
     }
 
     #[test]

@@ -38,6 +38,14 @@ use crate::uitree::UiNode;
 // ---------------------------------------------------------------------------
 
 /// Texture cap for [`BudgetTier::Essential`] (8 MiB).
+///
+/// CTX-1087 (F11, #1891): this 8/32/64 MiB ladder is a candidate UI-tier
+/// preset, explicitly NOT normative for Kitty texture quotas. The ONE
+/// normative site for Kitty present quotas is
+/// `bitty-rich::kitty_place::{KITTY_PRESENT_MAX_BLITS_PER_FRAME,
+/// KITTY_PRESENT_MAX_BYTES_PER_FRAME}` (32 blits / 64 MiB per frame);
+/// `bitty-render` mirrors those values. Values here must not be read as
+/// Kitty policy; this note declares truth, no value changes.
 pub const ESSENTIAL_TEXTURE_BYTES: u64 = 8 * 1024 * 1024;
 /// Texture cap for [`BudgetTier::Standard`] (32 MiB).
 pub const STANDARD_TEXTURE_BYTES: u64 = 32 * 1024 * 1024;

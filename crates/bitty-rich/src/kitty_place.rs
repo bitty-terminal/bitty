@@ -126,6 +126,24 @@
 //! mechanics; the caps above stay Core-owned so the present layer keeps
 //! enforcing the same ceilings the parity tests pin.
 //!
+//! CTX-1087 (F11, #1891) normative declaration: this module is the ONE
+//! normative site for the Kitty present per-frame quotas (32 blits,
+//! 64 MiB). `bitty-render`'s `MAX_IMAGE_BLITS_PER_FRAME` /
+//! `MAX_IMAGE_UPLOAD_BYTES_PER_FRAME` mirror these values (see
+//! `bitty-render/src/batch.rs`), and the `bitty-graphics` extension holds
+//! its own `KITTY_PRESENT_MAX_*` copies received per request. Values here
+//! must not change without updating the mirrors; this note declares truth,
+//! no value changes.
+//!
+//! CTX-1087 placement-ownership note: this [`KittyImageLayer`] owns the
+//! live presentation truth (decoded bitmaps, viewport pixel rects, paint
+//! order); `bitty-term-state`'s `PlacementStore` owns the terminal-grid
+//! truth (anchors, scroll, delete selectors, animation timing, and the
+//! normative `KITTY_Z_BELOW_BACKGROUND` threshold this layer orders `z`
+//! against). The stores are complementary, not duplicates; neither is
+//! deleted. The demoted legacy seam is `bitty-term-state::image`'s
+//! `ImagePlaceholder`.
+//!
 //! # Determinism
 //!
 //! Storage and placement are pure functions of insertion order: same calls

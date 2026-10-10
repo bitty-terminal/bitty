@@ -181,12 +181,23 @@ impl AtlasLayout {
 // Reference: kitty `graphics-protocol.rst` (z-index layering, compose
 // modes), kitty `graphics.c` layer sort (`z`, then image id), ghostty
 // `graphics_storage.zig` paint ordering.
+//
+// CTX-1087 (F11, #1891) normative note: the Kitty z-order threshold is
+// single-sourced in `bitty-term-state::KITTY_Z_BELOW_BACKGROUND` (the
+// terminal-truth placement store owns the value). This module consumes it;
+// [`IMAGE_Z_BELOW_BACKGROUND`] below is a compatibility alias, not an
+// independent definition, and must never drift (pinned by
+// `z_threshold_single_sourced`).
 // ---------------------------------------------------------------------------
 
 /// `z-index` below which images draw under non-default cell backgrounds
-/// (`INT32_MIN/2`, kitty layering rule; mirrors
-/// `bitty-term-state`'s `KITTY_Z_BELOW_BACKGROUND` without depending on it).
-pub const IMAGE_Z_BELOW_BACKGROUND: i32 = -1_073_741_824;
+/// (`INT32_MIN/2`, kitty layering rule).
+///
+/// CTX-1087 compatibility alias of the normative
+/// `bitty-term-state::KITTY_Z_BELOW_BACKGROUND`: the value is defined once
+/// in term-state and consumed here, so render never invents its own
+/// threshold. New code should prefer the term-state constant directly.
+pub const IMAGE_Z_BELOW_BACKGROUND: i32 = bitty_term_state::KITTY_Z_BELOW_BACKGROUND;
 
 /// Whether `z` draws under text (any negative z-index).
 #[must_use]
@@ -649,6 +660,22 @@ mod tests {
         assert!(!image_is_below_background(-1));
         assert!(image_is_below_background(IMAGE_Z_BELOW_BACKGROUND - 1));
         assert_eq!(IMAGE_Z_BELOW_BACKGROUND, -1_073_741_824);
+    }
+
+    #[test]
+    fn z_threshold_single_sourced() {
+        // CTX-1087 (F11, #1891): the render alias must equal the normative
+        // term-state threshold; the value is defined once in term-state.
+        assert_eq!(
+            IMAGE_Z_BELOW_BACKGROUND,
+            bitty_term_state::KITTY_Z_BELOW_BACKGROUND
+        );
+        assert!(image_is_below_background(
+            bitty_term_state::KITTY_Z_BELOW_BACKGROUND - 1
+        ));
+        assert!(!image_is_below_background(
+            bitty_term_state::KITTY_Z_BELOW_BACKGROUND
+        ));
     }
 
     #[test]

@@ -103,20 +103,24 @@ pub const IMAGE_VERTEX_SIZE_BYTES: usize = 16;
 
 /// Maximum Kitty image blits the real-GPU path uploads per frame.
 ///
-/// Mirrors the rich layer's `KITTY_PRESENT_MAX_BLITS_PER_FRAME` present
-/// budget (pinned by a cross-crate test in `bitty-runtime`): the GPU can
-/// never be asked to upload more blits than the runtime already admitted.
-/// Excess blits are skipped fail-closed and counted, never dropped silently.
+/// CTX-1087 (F11, #1891): mirrors the normative
+/// `bitty-rich::KITTY_PRESENT_MAX_BLITS_PER_FRAME` present budget (pinned by
+/// a cross-crate test in `bitty-runtime`): the GPU can never be asked to
+/// upload more blits than the runtime already admitted. Excess blits are
+/// skipped fail-closed and counted, never dropped silently. Do not change
+/// this value without the normative site; this note declares truth, no
+/// value changes.
 pub const MAX_IMAGE_BLITS_PER_FRAME: usize = 32;
 
 /// Maximum padded staging bytes the real-GPU path uploads per frame.
 ///
-/// Mirrors the rich layer's `KITTY_PRESENT_MAX_BYTES_PER_FRAME` present
-/// budget (pinned by a cross-crate test in `bitty-runtime`). The check runs
-/// before any staging allocation and counts the padded row stride the
-/// `queue.write_texture` alignment requires, so a frame can never allocate
-/// more than this bound regardless of blit shapes. Excess blits are skipped
-/// fail-closed and counted.
+/// CTX-1087 (F11, #1891): mirrors the normative
+/// `bitty-rich::KITTY_PRESENT_MAX_BYTES_PER_FRAME` present budget (pinned by
+/// a cross-crate test in `bitty-runtime`). The check runs before any staging
+/// allocation and counts the padded row stride the `queue.write_texture`
+/// alignment requires, so a frame can never allocate more than this bound
+/// regardless of blit shapes. Excess blits are skipped fail-closed and
+/// counted. Do not change this value without the normative site.
 pub const MAX_IMAGE_UPLOAD_BYTES_PER_FRAME: usize = 64 * 1024 * 1024;
 
 /// Vertices per quad and indices per quad (two triangles).

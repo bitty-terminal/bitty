@@ -14,7 +14,18 @@
 //! Hyprland-like placement
 //! ([`drop_spec_for_point`](bitty_ui::drop_spec_for_point): nearest-edge
 //! docking with position-based sizing, so small panels grow by dropping
-//! centrally and large ones shrink by dropping near an edge).
+//! centrally and large ones shrink by dropping near an edge; corner-zone
+//! drops resolve through the accepted #1804 balanced policy at `0.5`).
+//!
+//! Issue #1811 (CTX-1070): the tiled move shows continuous feedback — the
+//! grab arms the drag transition on the dragged frame (ghost outline) and
+//! every motion re-arms it on the dragged frame plus the hovered drop
+//! target (drop-target highlight), all through the existing Core-owned
+//! chrome-ring fade (geometry and terminal content are never interpolated).
+//! A committed drop arms the move transition on the moved panel so the
+//! result settles instead of snapping, and `Esc` cancels mid-drag with the
+//! tree untouched (the preview never mutates, so cancel restores the
+//! pre-drag layout byte-identically with no re-parent and no residue).
 //!
 //! CTX-0334 (Hyprland-like mouse-enter activation): when
 //! `RuntimeConfig::focus_follows_mouse_delay` is non-zero, pointer entry on
@@ -40,7 +51,7 @@
 
 use super::*;
 use bitty_platform::CursorPosition;
-use bitty_ui::{DragMoveSession, Point as UiPoint, SplitAxis, drop_spec_for_point};
+use bitty_ui::{DragMoveSession, DropSpec, Point as UiPoint, SplitAxis, drop_spec_for_point};
 use std::time::Instant;
 
 /// Pending hover activation with a positive dwell delay (CTX-0334).
@@ -250,6 +261,26 @@ impl Runtime {
             .and_then(|drag| drag.session.preview_target())
     }
 
+    /// Hyprland-like drop placement for the active Mod+drag at the last
+    /// known cursor (issue #1811, CTX-1070 test seam and live-preview paint
+    /// hook): the [`DropSpec`] a release would commit — target, edge axis,
+    /// ratio, and side — or `None` over background, over a floating
+    /// overlay, on the source itself, or when no drag is active. Pure query;
+    /// the tree is never mutated here.
+    #[must_use]
+    pub fn tiled_drag_drop_spec(&self) -> Option<DropSpec> {
+        let drag = self.tiled_drag.as_ref()?;
+        let cursor = self.last_cursor?;
+        let point = self.cursor_to_layout_point(cursor)?;
+        drop_spec_for_point(
+            &self.layout,
+            self.container,
+            self.gaps(),
+            drag.session.source(),
+            point,
+        )
+    }
+
     /// Whether `id` is a floating (overlay-tier) leaf in the current tree.
     ///
     /// CTX-1058 (#1844 P2): structural [`LayoutNode::Overlay`] tiers are
@@ -288,6 +319,12 @@ impl Runtime {
     /// the drag started (caller consumes the press and skips selection);
     /// `false` leaves all state untouched so the press falls through.
     pub fn begin_tiled_drag(&mut self) -> bool {
+        self.begin_tiled_drag_at(Instant::now())
+    }
+
+    /// [`Self::begin_tiled_drag`] with an explicit wall clock (CTX-0967
+    /// virtual-clock seam: tests arm the drag transition deterministically).
+    pub fn begin_tiled_drag_at(&mut self, now: Instant) -> bool {
         if self.shift_pressed || !(self.alt_pressed || self.super_pressed) {
             return false;
         }
@@ -312,6 +349,11 @@ impl Runtime {
         self.tiled_drag = Some(TiledDragState { session });
         self.set_focus(leaf);
         self.clear_hover_pending();
+        // CTX-1070 (issue #1811): the grab arms the drag transition on the
+        // dragged frame (ghost outline). The layout is untouched — only the
+        // leaf's chrome ring fades — and repeat motion restarts the bounded
+        // transition instead of accumulating (see `update_tiled_drag_at`).
+        self.trigger_animation(AnimationKind::Drag, Some(leaf), now);
         true
     }
 
@@ -326,6 +368,12 @@ impl Runtime {
     /// When the layout no longer owns the source (closed mid-drag) the drag
     /// ends fail-soft and `false` is returned so the motion falls through.
     pub fn update_tiled_drag(&mut self, pos: CursorPosition) -> bool {
+        self.update_tiled_drag_at(pos, Instant::now())
+    }
+
+    /// [`Self::update_tiled_drag`] with an explicit wall clock (CTX-0967
+    /// virtual-clock seam: tests arm the drag transition deterministically).
+    pub fn update_tiled_drag_at(&mut self, pos: CursorPosition, now: Instant) -> bool {
         let Some(point) = self.cursor_to_layout_point(pos) else {
             return self.tiled_drag.is_some();
         };
@@ -344,6 +392,18 @@ impl Runtime {
         if drag.session.preview_target() != before {
             self.pending_full_redraw = true;
         }
+        // CTX-1070 (issue #1811): live preview transitions. The dragged
+        // frame keeps its ghost outline while moving and the hovered drop
+        // target highlights under the cursor; both ride the existing
+        // Core-owned chrome-ring fade (geometry and terminal content are
+        // never interpolated). Repeat motion restarts the bounded
+        // transitions instead of accumulating, mirroring the Alt+drag path.
+        let source = drag.session.source();
+        let target = drag.session.preview_target();
+        self.trigger_animation(AnimationKind::Drag, Some(source), now);
+        if let Some(hovered) = target {
+            self.trigger_animation(AnimationKind::Drag, Some(hovered), now);
+        }
         true
     }
 
@@ -361,6 +421,12 @@ impl Runtime {
     /// selection, so there is nothing to commit and stale highlights must
     /// not auto-copy); `false` when no drag was active.
     pub fn end_tiled_drag(&mut self) -> bool {
+        self.end_tiled_drag_at(Instant::now())
+    }
+
+    /// [`Self::end_tiled_drag`] with an explicit wall clock (CTX-0967
+    /// virtual-clock seam: tests arm the drop transition deterministically).
+    pub fn end_tiled_drag_at(&mut self, now: Instant) -> bool {
         let Some(drag) = self.tiled_drag.take() else {
             return false;
         };
@@ -383,16 +449,27 @@ impl Runtime {
         self.set_layout(next);
         self.set_focus(source);
         self.pending_full_redraw = true;
+        // CTX-1070 (issue #1811): a committed drop arms the move transition
+        // on the moved panel so the result settles instead of snapping. The
+        // tree commits immediately (terminal content is never interpolated);
+        // only the moved panel's chrome ring fades, mirroring the keyboard
+        // reposition path.
+        self.trigger_animation(AnimationKind::Move, Some(source), now);
         true
     }
 
     /// Cancels the active Mod+drag without committing (cursor left the
-    /// window). Returns `true` when a drag was active.
+    /// window, or `Esc` cancelled mid-drag). The preview never mutates the
+    /// tree, so cancel restores the pre-drag layout byte-identically: no
+    /// re-parent, no selection, no residue. Arms a repaint when a drag was
+    /// active so the ghost outline and drop-target highlight clear on the
+    /// next frame. Returns `true` when a drag was active.
     pub fn cancel_tiled_drag(&mut self) -> bool {
         if self.tiled_drag.is_none() {
             return false;
         }
         self.tiled_drag = None;
+        self.pending_full_redraw = true;
         true
     }
 

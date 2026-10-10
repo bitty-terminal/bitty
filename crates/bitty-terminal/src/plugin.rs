@@ -3358,23 +3358,16 @@ fn ask_source_consent(
             .unwrap_or_else(|_| "unknown capability".to_string());
         let _ = writeln!(output, "  - {capability} — {effect}");
     }
-    for _ in 0..MAX_CONSENT_ATTEMPTS {
+    // Bounded read (bitty#1919): same helper as `ask_consent` so a large
+    // piped answer cannot grow memory without bound.
+    for attempt in 1..=MAX_CONSENT_ATTEMPTS {
         let _ = write!(output, "Grant these capabilities? [y/N] ");
         let _ = output.flush();
-        let mut line = String::new();
-        let read = input.read_line(&mut line).map_err(|error| {
-            PluginFailure::generic(
-                "IoError",
-                format!("bitty plugin: cannot read consent answer: {error}"),
-            )
-        })?;
-        if read == 0 {
-            return Err(PluginFailure::generic(
-                "ConsentAborted",
-                "bitty plugin: consent input ended before an answer — nothing changed".to_string(),
-            ));
-        }
-        let answer = line.trim();
+        let Some(answer) = read_plugin_consent_answer(input, output, attempt) else {
+            continue;
+        };
+        let answer = answer?;
+        let answer = answer.trim();
         if answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") {
             return Ok(true);
         }
@@ -3817,7 +3810,13 @@ fn op_revoke(
 /// Ask the interactive capability-consent question (fails closed).
 ///
 /// Returns `Ok(true)` when the user approves, `Ok(false)` on an explicit
-/// decline, and `Err` when input ends before an answer (aborted).
+/// decline, and `Err` when input ends before an answer (aborted). The read
+/// itself is bounded (bitty#1919, same class as #1916): at most
+/// `MAX_CONSENT_LINE_BYTES + 2` bytes are buffered per answer (room for a
+/// 64-byte answer plus `\r\n`); an unterminated longer line is rejected as
+/// overlong after its remainder is discarded through bounded `fill_buf`
+/// takes, so a large piped answer cannot grow memory without bound and no
+/// byte-index truncation can split a UTF-8 character.
 fn ask_consent(
     input: &mut dyn std::io::BufRead,
     output: &mut dyn std::io::Write,
@@ -3854,28 +3853,18 @@ fn ask_consent(
     for attempt in 1..=MAX_CONSENT_ATTEMPTS {
         let _ = write!(output, "Grant these capabilities? [y/N]: ");
         let _ = output.flush();
-        let mut line = String::new();
-        match input.read_line(&mut line) {
-            Ok(0) | Err(_) => {
-                return Err(PluginFailure::generic(
-                    "ConsentAborted",
-                    "bitty plugin: aborted (end of input) — nothing changed".to_string(),
-                ));
-            }
-            Ok(_) => {
-                if line.len() > MAX_CONSENT_LINE_BYTES {
-                    line.truncate(MAX_CONSENT_LINE_BYTES);
-                }
-                match line.trim().to_ascii_lowercase().as_str() {
-                    "y" | "yes" => return Ok(true),
-                    "" | "n" | "no" => return Ok(false),
-                    _ => {
-                        let _ = writeln!(
-                            output,
-                            "  (answer y or n — try again [{attempt}/{MAX_CONSENT_ATTEMPTS}])"
-                        );
-                    }
-                }
+        let Some(answer) = read_plugin_consent_answer(input, output, attempt) else {
+            continue;
+        };
+        let answer = answer?;
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" => return Ok(true),
+            "" | "n" | "no" => return Ok(false),
+            _ => {
+                let _ = writeln!(
+                    output,
+                    "  (answer y or n — try again [{attempt}/{MAX_CONSENT_ATTEMPTS}])"
+                );
             }
         }
     }
@@ -3885,6 +3874,93 @@ fn ask_consent(
             "bitty plugin: aborted (too many invalid answers, limit {MAX_CONSENT_ATTEMPTS}) — nothing changed"
         ),
     ))
+}
+
+/// Read one consent answer with a bounded buffer.
+///
+/// Twin of `component.rs` `read_consent_answer` (bitty#1916); keep the two in
+/// sync. Returns `None` when the answer was overlong (already reported; the
+/// caller retries without consuming an extra attempt branch), otherwise
+/// `Some(Ok(line))` for a complete line or `Some(Err(..))` on EOF/read
+/// error/invalid UTF-8 (fail closed, nothing changed).
+fn read_plugin_consent_answer(
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
+    attempt: usize,
+) -> Option<Result<String, PluginFailure>> {
+    // Window: a 64-byte answer plus a `\r\n` terminator. A line that does
+    // not terminate inside the window is overlong and rejected. Bytes are
+    // taken via `fill_buf`/`consume` (never a wide `read`) so a single
+    // answer never swallows the start of the next line.
+    const WINDOW: usize = MAX_CONSENT_LINE_BYTES + 2;
+    let mut answer: Vec<u8> = Vec::with_capacity(WINDOW);
+    let mut terminated = false;
+    let mut failed = false;
+    while answer.len() < WINDOW {
+        let ate: usize = match input.fill_buf() {
+            Ok(&[]) => break, // EOF: line ends here, if any.
+            Err(_) => {
+                failed = true;
+                break;
+            }
+            Ok(buffered) => {
+                let mut end = buffered.len().min(WINDOW - answer.len());
+                if let Some(pos) = buffered[..end].iter().position(|&b| b == b'\n') {
+                    end = pos + 1;
+                    terminated = true;
+                }
+                answer.extend_from_slice(&buffered[..end]);
+                end
+            }
+        };
+        input.consume(ate);
+        if terminated {
+            break;
+        }
+    }
+    if failed || (answer.is_empty() && !terminated) {
+        return Some(Err(PluginFailure::generic(
+            "ConsentAborted",
+            "bitty plugin: aborted (end of input) — nothing changed".to_string(),
+        )));
+    }
+    // A short EOF-terminated line (window not filled) is a complete
+    // answer; only a filled window without a newline is overlong.
+    if !terminated && answer.len() < WINDOW {
+        terminated = true;
+    }
+    if !terminated {
+        // Overlong: discard the line remainder (never past its newline,
+        // so a queued next answer survives) so the next attempt starts
+        // fresh. Fixed-window takes keep memory bounded no matter how
+        // long the piped line is.
+        loop {
+            match input.fill_buf() {
+                Ok(&[]) | Err(_) => break,
+                Ok(buffered) => {
+                    if let Some(pos) = buffered.iter().position(|&b| b == b'\n') {
+                        let ate = pos + 1;
+                        input.consume(ate);
+                        break;
+                    }
+                    let ate = buffered.len();
+                    input.consume(ate);
+                }
+            }
+        }
+        let _ = writeln!(
+            output,
+            "  (answer too long — at most {MAX_CONSENT_LINE_BYTES} bytes — try again [{attempt}/{MAX_CONSENT_ATTEMPTS}])"
+        );
+        return None;
+    }
+    match String::from_utf8(answer) {
+        Ok(line) => Some(Ok(line)),
+        Err(_) => Some(Err(PluginFailure::generic(
+            "ConsentAborted",
+            "bitty plugin: aborted (end of input) — nothing changed".to_string(),
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4396,6 +4472,58 @@ mod tests {
         assert!(text.contains("(high risk)"), "{text}");
         assert!(text.contains("Read raw terminal bytes"), "{text}");
         assert!(text.contains("Grant these capabilities? [y/N]:"), "{text}");
+    }
+
+    fn consent_fixture() -> (PluginManifest, BTreeSet<CapabilityId>) {
+        let manifest = bundled_manifest_for("bitty-terminal.shell-integration").expect("bundled");
+        let mut needed = BTreeSet::new();
+        needed.insert(CapabilityId::parse("terminal.raw-read").expect("known high risk"));
+        (manifest, needed)
+    }
+
+    #[test]
+    fn consent_overlong_line_is_rejected_and_stream_resyncs() {
+        // A 500-byte piped answer must not grow memory without bound: it
+        // is rejected as overlong, its remainder discarded, and the next
+        // queued answer (`y`) still applies.
+        let (manifest, needed) = consent_fixture();
+        let mut output = Vec::new();
+        let stdin = format!("{}\ny\n", "x".repeat(500));
+        let mut input = std::io::BufReader::new(stdin.as_bytes());
+        let approved = ask_consent(&mut input, &mut output, "a.b", &manifest, &needed, false)
+            .expect("resyncs to the queued approval");
+        assert!(approved);
+        let shown = String::from_utf8(output).expect("utf-8");
+        assert!(shown.contains("too long"), "{shown}");
+    }
+
+    #[test]
+    fn consent_multibyte_at_boundary_does_not_panic() {
+        // 63 ASCII bytes + `e` with acute (2 bytes) put byte 64
+        // mid-character: the old `truncate(64)` panicked here. The bounded
+        // read evaluates the full line instead (invalid answer, no panic),
+        // then the queued `n` declines.
+        let (manifest, needed) = consent_fixture();
+        let mut output = Vec::new();
+        let stdin = format!("{}é\nn\n", "a".repeat(63));
+        let mut input = std::io::BufReader::new(stdin.as_bytes());
+        let approved = ask_consent(&mut input, &mut output, "a.b", &manifest, &needed, false)
+            .expect("boundary answer must not panic");
+        assert!(!approved);
+    }
+
+    #[test]
+    fn consent_short_eof_terminated_line_still_counts() {
+        // `printf 'n'` (no trailing newline) declines exactly like `n\n`:
+        // a short EOF-terminated line is a complete answer, not overlong.
+        let (manifest, needed) = consent_fixture();
+        let mut output = Vec::new();
+        let mut input = std::io::BufReader::new(&b"n"[..]);
+        let approved = ask_consent(&mut input, &mut output, "a.b", &manifest, &needed, false)
+            .expect("short EOF-terminated answer counts");
+        assert!(!approved);
+        let shown = String::from_utf8(output).expect("utf-8");
+        assert!(!shown.contains("too long"), "{shown}");
     }
 
     // ── revocation (CTX-0765, #1381) ────────────────────────────────────────

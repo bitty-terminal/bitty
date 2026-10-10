@@ -20,8 +20,8 @@
 //! | `CSI Ps $ p` / `CSI ? Ps $ p` (DECRQM) | `CSI [?] Ps ; Pm $ y` (`Pm`: 0 unknown, 1 set, 2 reset) | [`decrqm_value`] reads live `State` |
 //! | `CSI 14 t` (XTWINOPS text area, pixels) | `CSI 4 ; height ; width t` | [`xtwinops_pixels_reply`]: focused leaf content grid × live cell metrics (exact multiples) |
 //! | `CSI 18 t` (XTWINOPS text area, cells) | `CSI 8 ; rows ; cols t` | [`xtwinops_cells_reply`]: focused leaf content grid |
-//! | `APC G f=.. a=q .. ST` (Kitty support probe) | `ESC _ G f=<f>,OK ST` or `ESC _ G f=<f>,ERROR ST` | [`kitty_probe_ok_reply`] / [`kitty_probe_err_reply`] |
-//! | `APC G a=q,i=..[p=..] ST` (Kitty image/placement status) | `ESC _ G i=<id>[,p=<pin>],s=<w>,v=<h>,OK ST` or `ESC _ G i=<id>[,p=<pin>],ERROR ST` | [`kitty_image_ok_reply`] / [`kitty_placement_ok_reply`] / [`kitty_image_err_reply`] |
+//! | `APC G i=<id>,a=q,f=..;bytes ST` (Kitty support probe, spec) | `ESC _ G i=<id>;OK ST` or `ESC _ G i=<id>;EINVAL:<msg> ST` / `;ENOSPC:<msg> ST` | [`kitty_probe_ok_reply`] / [`kitty_probe_einval_reply`] / [`kitty_probe_enospc_reply`] |
+//! | `APC G a=q,i=..[p=..] ST` with empty payload (payload-less status lookup, bitty extension in spec shape) | `ESC _ G i=<id>[,p=<pin>];OK ST` or `ESC _ G i=<id>[,p=<pin>];ENOENT:<msg> ST` (`I=` echoed when queried by number) | [`kitty_status_ok_reply`] / [`kitty_status_enoent_reply`] |
 //!
 //! Values are bitty's TRUE capabilities, never borrowed prestige:
 //!
@@ -549,77 +549,160 @@ pub(crate) fn find_xtwinops(combined: &[u8], new_start: usize) -> Vec<u16> {
 /// Maximum bytes of one Kitty `a=q` answer (S2, #1849).
 ///
 /// Every shape below is fixed-format with only bounded numeric fields
-/// (`u32` values are at most 10 digits), so even all-maximum digits stay
-/// two orders of magnitude under this bound. The builders `debug_assert`
-/// it; the unit tests assert it on all-maximum shapes.
+/// (`u32` values are at most 10 digits) plus short fixed `CODE:msg`
+/// verdicts, so even all-maximum digits stay two orders of magnitude
+/// under this bound. The builders `debug_assert` it; the unit tests
+/// assert it on all-maximum shapes.
 pub(crate) const KITTY_QUERY_REPLY_MAX_BYTES: usize = 1024;
 
-/// Kitty `a=q` image-status success reply (S2, #1849).
+/// Kitty `a=q` wire identity prefix (S2, #1849).
 ///
-/// Bitty-defined fixed shape (no vendored Kitty response snapshot exists
-/// in the repo; mirrors the `DCS 1+r`/`0+r` accept/reject style above):
-/// `ESC _ G i=<id>,s=<w>,v=<h>,OK ESC \`, where `s=`/`v=` echo the held
-/// decoded dimensions. Always `ESC \` terminated, never `BEL`.
-#[must_use]
-pub(crate) fn kitty_image_ok_reply(image_id: u32, width: u32, height: u32) -> Vec<u8> {
-    let reply = format!("\x1b_Gi={image_id},s={width},v={height},OK\x1b\\").into_bytes();
-    debug_assert!(reply.len() < KITTY_QUERY_REPLY_MAX_BYTES);
-    reply
-}
-
-/// Kitty `a=q` placement-status success reply (S2, #1849).
-///
-/// Like [`kitty_image_ok_reply`] with the pinned placement echoed:
-/// `ESC _ G i=<id>,p=<pin>,s=<w>,v=<h>,OK ESC \`.
-#[must_use]
-pub(crate) fn kitty_placement_ok_reply(
-    image_id: u32,
-    placement_id: u32,
-    width: u32,
-    height: u32,
-) -> Vec<u8> {
-    let reply =
-        format!("\x1b_Gi={image_id},p={placement_id},s={width},v={height},OK\x1b\\").into_bytes();
-    debug_assert!(reply.len() < KITTY_QUERY_REPLY_MAX_BYTES);
-    reply
+/// Spec-exact echo rule, mirroring kitty `finish_command_response`
+/// (`kitty/graphics.c:942-946` at `recording/references/kitty@0b12ed8`,
+/// GPL-3.0-only): `Gi=<id>` when `image_id` is non-zero, `,I=<num>` when
+/// `image_number` is non-zero, `,p=<pin>` when a pin is given. The caller
+/// guarantees at least one of `image_id`/`image_number` is non-zero;
+/// otherwise kitty answers nothing (`graphics.c:933` returns `NULL`
+/// when neither is present, and the `a=q` path `REPORT_ERROR`s with no
+/// reply when `!q_iid` at `:2540-2543`), and bitty stays silent too (no
+/// reply built). Never echoes `s=`/`v=`/`f=` (kitty never does).
+fn kitty_query_prefix(image_id: u32, image_number: u32, placement_id: Option<u32>) -> String {
+    debug_assert!(image_id != 0 || image_number != 0);
+    let mut prefix = String::from("G");
+    let mut first = true;
+    if image_id != 0 {
+        prefix.push_str(&format!("i={image_id}"));
+        first = false;
+    }
+    if image_number != 0 {
+        if !first {
+            prefix.push(',');
+        }
+        prefix.push_str(&format!("I={image_number}"));
+        first = false;
+    }
+    if let Some(pin) = placement_id {
+        if !first {
+            prefix.push(',');
+        }
+        prefix.push_str(&format!("p={pin}"));
+    }
+    prefix
 }
 
 /// Kitty `a=q` support-probe success reply (S2, #1849).
 ///
-/// The probe test-loads through the declared-size pre-check without
-/// storing; success answers `ESC _ G f=<f>,OK ESC \` (no `s=`/`v=`: the
-/// verdict is loadability, and PNG probes carry no meaningful claim).
+/// Spec-exact (`recording/references/kitty@0b12ed8`, GPL-3.0-only):
+/// `ESC _ G i=<id>;OK ESC \`, e.g. `docs/graphics-protocol.rst:430`
+/// (`<ESC>_Gi=31;error message or OK<ESC>\`) and the `a=q` example at
+/// `:457` (`<ESC>_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA<ESC>\` answered with
+/// the echoed `i=`). The `;` separator and the echoed `i=` are what the
+/// client parses (`kitty_tests/graphics.py:40-52`: `partition(';')[2]`
+/// for the verdict, `split(':', 1)[0]` for the code).
+///
+/// Probes REQUIRE `i=` (spec-exact, no `f=`-echo extension): kitty
+/// mandates the id on queries (`kitty/graphics.c:2540-2543`:
+/// `REPORT_ERROR("Query graphics command without image id")` with no
+/// reply when `!q_iid`) and echoes only it (`:2549` constructs
+/// `{.id = q_iid}` discarding every other key). An `f=`-echo shape
+/// (`Gf=..,OK`) would break the client's `;` parser (empty verdict,
+/// treated as failure) with zero interop value, while kitty-native
+/// clients always send `i=` on queries per the spec example — so
+/// requiring it is compatible and silence on missing `i=`/`I=` matches
+/// kitty's no-reply. Rationale recorded here per the open point: no
+/// bitty `f=`-echo extension is kept. Always `ESC \` terminated, never
+/// `BEL`.
 #[must_use]
-pub(crate) fn kitty_probe_ok_reply(format_f: u32) -> Vec<u8> {
-    let reply = format!("\x1b_Gf={format_f},OK\x1b\\").into_bytes();
+pub(crate) fn kitty_probe_ok_reply(image_id: u32) -> Vec<u8> {
+    debug_assert!(image_id != 0);
+    let reply = format!("\x1b_Gi={image_id};OK\x1b\\").into_bytes();
     debug_assert!(reply.len() < KITTY_QUERY_REPLY_MAX_BYTES);
     reply
 }
 
-/// Kitty `a=q` failure reply for image/placement status (S2, #1849).
+/// Kitty `a=q` support-probe `EINVAL` reply (S2, #1849).
 ///
-/// `ESC _ G i=<id>,ERROR ESC \` without a pin (unknown image for this
-/// origin, including unresolvable `I=` numbers reported as id `0`), or
-/// `ESC _ G i=<id>,p=<pin>,ERROR ESC \` for a named placement that is
-/// not held. Fixed `ERROR` token: the verdict is binary (held or not).
+/// `ESC _ G i=<id>;EINVAL:<msg> ESC \`: unknown `f=`, a refused
+/// declared-size pre-check, or a length-mismatched payload (kitty
+/// `ABRT(EINVAL, ...)` family: unknown format, too large, dimensions
+/// mismatch). `msg` is a short fixed literal at the call site (never
+/// client bytes), ASCII printable plus spaces per
+/// `docs/graphics-protocol.rst:433-435`. Probe replies never carry
+/// `p=` even when queried (kitty `:2549` discards it).
 #[must_use]
-pub(crate) fn kitty_image_err_reply(image_id: u32, placement_id: Option<u32>) -> Vec<u8> {
-    let reply = match placement_id {
-        Some(pin) => format!("\x1b_Gi={image_id},p={pin},ERROR\x1b\\"),
-        None => format!("\x1b_Gi={image_id},ERROR\x1b\\"),
-    }
+pub(crate) fn kitty_probe_einval_reply(image_id: u32, msg: &str) -> Vec<u8> {
+    debug_assert!(image_id != 0);
+    debug_assert!(!msg.is_empty() && !msg.contains([';', '\x1b', '\x07']));
+    let reply = format!("\x1b_Gi={image_id};EINVAL:{msg}\x1b\\").into_bytes();
+    debug_assert!(reply.len() < KITTY_QUERY_REPLY_MAX_BYTES);
+    reply
+}
+
+/// Kitty `a=q` support-probe `ENOSPC` reply (S2, #1849).
+///
+/// `ESC _ G i=<id>;ENOSPC:<msg> ESC \`: the payload would decode but
+/// the store would refuse under the quota caps (kitty `ABRT(ENOSPC,
+/// "Failed to store image data in cache")`). Same echo/terminator
+/// rules as [`kitty_probe_einval_reply`].
+#[must_use]
+pub(crate) fn kitty_probe_enospc_reply(image_id: u32, msg: &str) -> Vec<u8> {
+    debug_assert!(image_id != 0);
+    debug_assert!(!msg.is_empty() && !msg.contains([';', '\x1b', '\x07']));
+    let reply = format!("\x1b_Gi={image_id};ENOSPC:{msg}\x1b\\").into_bytes();
+    debug_assert!(reply.len() < KITTY_QUERY_REPLY_MAX_BYTES);
+    reply
+}
+
+/// Kitty payload-less image/placement status success reply (S2, #1849).
+///
+/// Bitty extension in spec shape (no Kitty counterpart: kitty `a=q`
+/// always test-loads payload bytes and never answers a payload-less
+/// lookup; kitty-native clients always send payload plus `i=`, so they
+/// never hit this path and are unaffected): `ESC _ G
+/// i=<id>[,I=<num>][,p=<pin>];OK ESC \` with the
+/// [`kitty_query_prefix`] echo rule. The placement-id form mirrors the
+/// spec acknowledgement `docs/graphics-protocol.rst:500`
+/// (`<ESC>_Gi=<image id>,p=<placement id>;OK<ESC>\`); the image-level
+/// form mirrors `:476` (`<ESC>_Gi=<id>;OK<ESC>\`). The `I=` echo (when
+/// queried by number and resolved through terminal truth) mirrors the
+/// transmit echo `i=<assigned>,I=<queried>` proven by
+/// `kitty_tests/graphics.py:632-647`, preserving correlation both ways.
+/// Never echoes `s=`/`v=`/`f=`; always `ESC \` terminated.
+#[must_use]
+pub(crate) fn kitty_status_ok_reply(
+    image_id: u32,
+    image_number: u32,
+    placement_id: Option<u32>,
+) -> Vec<u8> {
+    let reply = format!(
+        "\x1b_{};OK\x1b\\",
+        kitty_query_prefix(image_id, image_number, placement_id)
+    )
     .into_bytes();
     debug_assert!(reply.len() < KITTY_QUERY_REPLY_MAX_BYTES);
     reply
 }
 
-/// Kitty `a=q` support-probe failure reply (S2, #1849).
+/// Kitty payload-less image/placement status `ENOENT` reply (S2, #1849).
 ///
-/// `ESC _ G f=<f>,ERROR ESC \`: unknown `f=`, a refused declared-size
-/// pre-check, or a store that would refuse under the quota caps.
+/// Same extension and echo rule as [`kitty_status_ok_reply`]:
+/// `ESC _ G i=<id>[,I=<num>][,p=<pin>];ENOENT:<msg> ESC \` for a named
+/// but unheld entry (unknown id, evicted image, dangling placement,
+/// unresolvable `I=` number reported with the queried `I=` echoed).
+/// Mirrors the spec `docs/graphics-protocol.rst:480`
+/// (`<ESC>_Gi=<id>;ENOENT:<some detailed error msg><ESC>\`). `msg` is a
+/// short fixed literal at the call site, never client bytes.
 #[must_use]
-pub(crate) fn kitty_probe_err_reply(format_f: u32) -> Vec<u8> {
-    let reply = format!("\x1b_Gf={format_f},ERROR\x1b\\").into_bytes();
+pub(crate) fn kitty_status_enoent_reply(
+    image_id: u32,
+    image_number: u32,
+    placement_id: Option<u32>,
+) -> Vec<u8> {
+    let reply = format!(
+        "\x1b_{};ENOENT:not held\x1b\\",
+        kitty_query_prefix(image_id, image_number, placement_id)
+    )
+    .into_bytes();
     debug_assert!(reply.len() < KITTY_QUERY_REPLY_MAX_BYTES);
     reply
 }
@@ -771,25 +854,44 @@ mod tests {
 
     #[test]
     fn kitty_query_replies_are_byte_exact_and_bounded() {
-        assert_eq!(kitty_image_ok_reply(7, 2, 2), b"\x1b_Gi=7,s=2,v=2,OK\x1b\\");
+        // Spec shapes (recording/references/kitty@0b12ed8): `;` separator,
+        // `CODE:msg` errors, identity echo (`i=`/`I=`/`p=`), never
+        // `s=`/`v=`/`f=`. Client parsing: `partition(';')[2]` then
+        // `split(':', 1)[0]` (kitty_tests/graphics.py:40-52).
+        assert_eq!(kitty_probe_ok_reply(31), b"\x1b_Gi=31;OK\x1b\\");
         assert_eq!(
-            kitty_placement_ok_reply(7, 3, 2, 2),
-            b"\x1b_Gi=7,p=3,s=2,v=2,OK\x1b\\"
+            kitty_probe_einval_reply(7, "unknown format"),
+            b"\x1b_Gi=7;EINVAL:unknown format\x1b\\"
         );
-        assert_eq!(kitty_probe_ok_reply(100), b"\x1b_Gf=100,OK\x1b\\");
-        assert_eq!(kitty_image_err_reply(99, None), b"\x1b_Gi=99,ERROR\x1b\\");
         assert_eq!(
-            kitty_image_err_reply(7, Some(9)),
-            b"\x1b_Gi=7,p=9,ERROR\x1b\\"
+            kitty_probe_enospc_reply(31, "store full"),
+            b"\x1b_Gi=31;ENOSPC:store full\x1b\\"
         );
-        assert_eq!(kitty_probe_err_reply(7), b"\x1b_Gf=7,ERROR\x1b\\");
+        assert_eq!(kitty_status_ok_reply(11, 0, None), b"\x1b_Gi=11;OK\x1b\\");
+        assert_eq!(
+            kitty_status_ok_reply(11, 0, Some(5)),
+            b"\x1b_Gi=11,p=5;OK\x1b\\"
+        );
+        assert_eq!(
+            kitty_status_ok_reply(4, 3, None),
+            b"\x1b_Gi=4,I=3;OK\x1b\\",
+            "number-queried status echoes both resolved id and queried number"
+        );
+        assert_eq!(
+            kitty_status_enoent_reply(99, 0, None),
+            b"\x1b_Gi=99;ENOENT:not held\x1b\\"
+        );
+        assert_eq!(
+            kitty_status_enoent_reply(11, 0, Some(9)),
+            b"\x1b_Gi=11,p=9;ENOENT:not held\x1b\\"
+        );
         // All-maximum digits stay far under the 1 KiB reply bound.
         for reply in [
-            kitty_image_ok_reply(u32::MAX, u32::MAX, u32::MAX),
-            kitty_placement_ok_reply(u32::MAX, u32::MAX, u32::MAX, u32::MAX),
             kitty_probe_ok_reply(u32::MAX),
-            kitty_image_err_reply(u32::MAX, Some(u32::MAX)),
-            kitty_probe_err_reply(u32::MAX),
+            kitty_probe_einval_reply(u32::MAX, "unknown format"),
+            kitty_probe_enospc_reply(u32::MAX, "store full"),
+            kitty_status_ok_reply(u32::MAX, u32::MAX, Some(u32::MAX)),
+            kitty_status_enoent_reply(u32::MAX, u32::MAX, Some(u32::MAX)),
         ] {
             assert!(
                 reply.len() < KITTY_QUERY_REPLY_MAX_BYTES,

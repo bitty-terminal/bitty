@@ -284,9 +284,14 @@ elif ! grep -qF -- 'checksum mismatch' <<<"$corrupt_mac_out"; then
 fi
 
 # 9d. Linux bundle fixture (minimal TOPDIR/bin/bitty + share file).
+HAVE_BUNDLE=0
 if ! command -v tar >/dev/null 2>&1 || ! command -v zstd >/dev/null 2>&1; then
-  echo "FAIL: live Linux bundle legs need tar and zstd" >&2
-  FAIL=1
+  if [[ "$(uname -s)" == "Linux" ]]; then
+    echo "FAIL: live Linux bundle legs need tar and zstd" >&2
+    FAIL=1
+  else
+    echo "SKIP: live Linux bundle legs need tar and zstd" >&2
+  fi
 else
   BUNDLE_TOP="bitty-$FAKE_VER-x86_64-unknown-linux-gnu"
   BUNDLE_STAGE="$TMP/bundle-stage"
@@ -299,6 +304,7 @@ else
     echo "FAIL: could not assemble the fake Linux bundle" >&2
     FAIL=1
   else
+    HAVE_BUNDLE=1
     write_sidecar "$BUNDLE"
 
     # 9e. Linux pointer install hermetic (--bin-dir: binary-only, no share).
@@ -360,10 +366,33 @@ else
 fi
 
 # 9h. Host-native auto-detect live install (no --target): the uname path the
-# per-OS CI runners actually take. Linux x86_64 resolves the fake bundle,
-# Darwin resolves the matching fake bare binary.
+# per-OS CI runners actually take. Darwin (either arch) resolves a fake bare
+# binary; glibc x86_64 Linux resolves the fake bundle. Other hosts select
+# targets this fixture does not carry (musl, non-x86_64 Linux), so they skip.
 host_os="$(uname -s)"
-if [[ "$host_os" == "Linux" || "$host_os" == "Darwin" ]]; then
+host_arch="$(uname -m)"
+run_native=0
+native_skip=""
+if [[ "$host_os" == "Darwin" ]]; then
+  run_native=1
+elif [[ "$host_os" == "Linux" ]] && [[ "$host_arch" == "x86_64" || "$host_arch" == "amd64" ]]; then
+  # Mirror install.sh is_musl(): the fixture carries only the glibc bundle.
+  if [[ -f /etc/alpine-release ]]; then
+    native_skip="musl host selects a bundle this fixture does not carry"
+  elif command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; then
+    native_skip="musl host selects a bundle this fixture does not carry"
+  elif ((HAVE_BUNDLE == 0)); then
+    native_skip="no bundle fixture was assembled"
+  else
+    run_native=1
+  fi
+else
+  native_skip="have $host_os/$host_arch, need Darwin or glibc x86_64 Linux"
+fi
+if [[ -n "$native_skip" ]]; then
+  echo "SKIP: host-native leg ($native_skip)" >&2
+fi
+if ((run_native)); then
   native_out="$(BITTY_CDN_BASE="file://$FAKE_CDN" "$SCRIPT" --bin-dir "$TMP/fake-native-bin" 2>&1)" && native_status=0 || native_status=$?
   if ((native_status != 0)); then
     echo "FAIL: host-native pointer install exited $native_status ($host_os)" >&2

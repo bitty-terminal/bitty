@@ -569,6 +569,18 @@ pub fn plugin_help_text() -> String {
      \x20 --force                     remove only: confirm the destructive drop.\n\
      \x20 --cap <capability>          revoke only: revoke one capability.\n\
      \n\
+     download consent:\n\
+     \x20 Capability grants use explicit confirm: --yes approves\n\
+     \x20 non-interactively, otherwise the installer prompts\n\
+     \x20 `Grant these capabilities? [y/N]` (up to 3 attempts, 64 bytes per\n\
+     \x20 answer); `y`/`yes` approves, `n`/`no`/empty declines, EOF aborts.\n\
+     \x20 A decline or EOF exits 1 with nothing changed. Unchanged or\n\
+     \x20 narrowed capability sets carry forward silently; added\n\
+     \x20 capabilities always need fresh consent. Native component downloads\n\
+     \x20 (`bitty component install`) follow the same levels: the builtin\n\
+     \x20 installer egress cdn.bitty.run:443 needs no extra grant, while\n\
+     \x20 third-party hosts stay consent-gated and fail closed.\n\
+     \n\
      authority:\n\
      \x20 Plugin code is never executed by any `bitty plugin` operation. A\n\
      \x20 capability is granted only when the manifest requests it and consent\n\

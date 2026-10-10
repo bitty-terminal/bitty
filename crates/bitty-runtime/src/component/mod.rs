@@ -91,7 +91,10 @@ pub use descriptor::{
     executable_file_name, resolve, validate_component_name,
 };
 pub use env::{ComponentEnv, is_allowlisted_env};
-pub use grant::{GrantError, PluginGrant};
+pub use grant::{
+    BUILTIN_INSTALLER_EGRESS, BUILTIN_INSTALLER_EGRESS_HOST, BUILTIN_INSTALLER_EGRESS_PORT,
+    GrantError, PluginGrant, builtin_installer_egress, is_builtin_installer_egress,
+};
 pub use inventory::{
     ComponentSource, ComponentSummary, InstalledVersion, SYSTEM_COMPONENTS_DIR_DEFAULT,
     SYSTEM_COMPONENTS_DIR_ENV, SearchedComponent, component_search_roots_for, discover_components,

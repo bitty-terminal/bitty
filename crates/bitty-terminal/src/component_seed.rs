@@ -72,6 +72,141 @@ pub const SEED_CDN_HOST: &str = "cdn.bitty.run";
 /// CDN base URL the seed ever contacts (derived from [`SEED_CDN_HOST`]).
 pub const SEED_CDN_BASE: &str = "https://cdn.bitty.run";
 
+/// CDN port the seed ever contacts (HTTPS; never appears in the URL, which
+/// relies on the `https` default, but pins the egress `host:port`).
+pub const SEED_CDN_PORT: u16 = 443;
+
+/// Core-built-in installer egress host (first-party CDN, issue #1905).
+///
+/// Alias of [`SEED_CDN_HOST`]: strict configurations allow this host without
+/// a per-plugin `[[network.egress]]` declaration or per-source consent.
+/// Every other host stays consent-gated (fail closed without explicit
+/// consent). Must stay equal to
+/// `bitty_runtime::component::BUILTIN_INSTALLER_EGRESS_HOST` (pinned by test).
+pub const BUILTIN_INSTALLER_EGRESS_HOST: &str = SEED_CDN_HOST;
+
+/// Core-built-in installer egress port (HTTPS).
+pub const BUILTIN_INSTALLER_EGRESS_PORT: u16 = SEED_CDN_PORT;
+
+/// Core-built-in installer egress in `host:port` form for strict-config
+/// allowlists (`cdn.bitty.run:443`).
+pub const BUILTIN_INSTALLER_EGRESS: &str = "cdn.bitty.run:443";
+
+/// Whether `host` is the core-built-in installer egress host.
+///
+/// Exact, case-sensitive equality with [`BUILTIN_INSTALLER_EGRESS_HOST`].
+/// Suffix tricks (`cdn.bitty.run.evil.com`), userinfo splits
+/// (`cdn.bitty.run@evil`), case tricks (`CDN.BITTY.RUN`), and empty hosts
+/// all return `false`.
+#[must_use]
+pub fn is_builtin_installer_host(host: &str) -> bool {
+    host == BUILTIN_INSTALLER_EGRESS_HOST
+}
+
+/// Whether `url` addresses the core-built-in installer egress.
+///
+/// Strict, case-sensitive: the URL must start with exactly
+/// `https://cdn.bitty.run/` (implicit [`BUILTIN_INSTALLER_EGRESS_PORT`])
+/// or `https://cdn.bitty.run:443/` (explicit port). Anything else — suffix
+/// hosts (`https://cdn.bitty.run.evil.com/`), userinfo
+/// (`https://cdn.bitty.run@evil/`), uppercase schemes/hosts
+/// (`HTTPS://`/`CDN.BITTY.RUN`), or port swaps (`:8443`, `:80`) — returns
+/// `false`. Path contents are irrelevant here (egress is host-level); the
+/// URL-shape audit ([`audit_seed_url`]) still applies to constructed URLs.
+#[must_use]
+pub fn is_builtin_installer_url(url: &str) -> bool {
+    if !(url.starts_with("https://cdn.bitty.run/") || url.starts_with("https://cdn.bitty.run:443/"))
+    {
+        return false;
+    }
+    // Belt and braces: the literal prefixes above already pin the host, but
+    // route through the host check so `is_builtin_installer_host`,
+    // `BUILTIN_INSTALLER_EGRESS_HOST`, and `BUILTIN_INSTALLER_EGRESS_PORT`
+    // stay live in non-test builds (no dead-code drift between the URL gate
+    // and the host/port gate).
+    let after_scheme = &url["https://".len()..];
+    let authority = after_scheme.split('/').next().unwrap_or("");
+    let host = authority.split(':').next().unwrap_or("");
+    if !is_builtin_installer_host(host) {
+        return false;
+    }
+    if let Some(port_text) = authority.split(':').nth(1) {
+        return port_text.parse::<u16>().ok() == Some(BUILTIN_INSTALLER_EGRESS_PORT);
+    }
+    // No explicit port: `https` implies `BUILTIN_INSTALLER_EGRESS_PORT`.
+    // Reference the port constant so the implicit-443 invariant is checked
+    // against the egress definition, not a magic number.
+    debug_assert_eq!(BUILTIN_INSTALLER_EGRESS_PORT, SEED_CDN_PORT);
+    true
+}
+
+/// Auto-download consent level for one installer fetch (issue #1905,
+/// delta 6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallerConsentLevel {
+    /// No prompt: the fetch targets the built-in CDN host and both digests
+    /// verify (registry/manifest digest and CDN `SHA256SUMS` both match the
+    /// fetched bytes, per the #1906 dual-digest direction).
+    Silent,
+    /// Explicit confirm required: third-party host, single-digest-only, or
+    /// any prior digest mismatch history. The caller prompts (`--yes`
+    /// approves non-interactively, interactive `[y/N]`, decline/EOF exits
+    /// 1 with no staging).
+    Confirm,
+}
+
+/// Consent level for a fetch: silent iff the host is the built-in installer
+/// egress **and** the payload is dual-digest verified; otherwise confirm.
+///
+/// Pure (no I/O): `is_builtin` should come from
+/// [`is_builtin_installer_url`] and `dual_digest_verified` from
+/// [`is_dual_digest_verified`].
+#[must_use]
+pub fn installer_consent_level(
+    is_builtin: bool,
+    dual_digest_verified: bool,
+) -> InstallerConsentLevel {
+    if is_builtin && dual_digest_verified {
+        InstallerConsentLevel::Silent
+    } else {
+        InstallerConsentLevel::Confirm
+    }
+}
+
+/// Whether a hex digest string is a 64-character SHA-256 hex value.
+#[must_use]
+pub fn is_hex_digest(digest: &str) -> bool {
+    digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Whether the dual-digest rule holds (issue #1906 direction, checked
+/// locally): both the registry/manifest digest and the CDN `SHA256SUMS`
+/// digest are present, well-formed, and both equal the fetched bytes'
+/// digest.
+///
+/// - `registry_digest`: the out-of-CDN pin (`None` means single-source-only,
+///   which returns `false` so the caller takes the confirm path).
+/// - `cdn_digest` / `actual`: the `SHA256SUMS` entry and the `sha256_hex` of
+///   the fetched bytes. Comparison is ASCII case-insensitive (both sides
+///   are lowercased, mirroring [`find_tarball_digest`]).
+/// - Any malformed digest or any mismatch returns `false` (never a silent
+///   pick: mismatch is an integrity failure upstream, single-source is a
+///   confirm, per #1905/#1906).
+#[must_use]
+pub fn is_dual_digest_verified(
+    registry_digest: Option<&str>,
+    cdn_digest: &str,
+    actual: &str,
+) -> bool {
+    let Some(registry) = registry_digest else {
+        return false;
+    };
+    if !is_hex_digest(registry) || !is_hex_digest(cdn_digest) || !is_hex_digest(actual) {
+        return false;
+    }
+    registry.eq_ignore_ascii_case(actual) && cdn_digest.eq_ignore_ascii_case(actual)
+}
+
 /// R2 key prefix for prebuilt component distributions.
 pub const SEED_KEY_PREFIX: &str = "bitty/components";
 
@@ -1306,6 +1441,144 @@ mod tests {
             assert!(urls.manifest_url.starts_with(SEED_CDN_BASE));
             assert!(!urls.tarball_url.contains("evil"));
         }
+    }
+
+    // --- builtin installer egress (#1905 delta 2) -------------------------
+
+    #[test]
+    fn builtin_egress_constants_match_runtime_grant() {
+        assert_eq!(SEED_CDN_HOST, "cdn.bitty.run");
+        assert_eq!(SEED_CDN_PORT, 443);
+        assert_eq!(BUILTIN_INSTALLER_EGRESS_HOST, SEED_CDN_HOST);
+        assert_eq!(BUILTIN_INSTALLER_EGRESS_PORT, SEED_CDN_PORT);
+        assert_eq!(BUILTIN_INSTALLER_EGRESS, "cdn.bitty.run:443");
+        assert_eq!(
+            BUILTIN_INSTALLER_EGRESS_HOST,
+            bitty_runtime::component::BUILTIN_INSTALLER_EGRESS_HOST
+        );
+        assert_eq!(
+            BUILTIN_INSTALLER_EGRESS_PORT,
+            bitty_runtime::component::BUILTIN_INSTALLER_EGRESS_PORT
+        );
+        assert_eq!(
+            BUILTIN_INSTALLER_EGRESS,
+            bitty_runtime::component::BUILTIN_INSTALLER_EGRESS
+        );
+    }
+
+    #[test]
+    fn builtin_host_check_is_exact_and_case_sensitive() {
+        assert!(is_builtin_installer_host("cdn.bitty.run"));
+        for hostile in [
+            "cdn.bitty.run.evil.com",
+            "cdn.bitty.run@evil",
+            "evil.com",
+            "CDN.BITTY.RUN",
+            "Cdn.BitTy.Run",
+            "cdn.bitty.run ",
+            " cdn.bitty.run",
+            "",
+            "cdn.bitty.run:443",
+        ] {
+            assert!(
+                !is_builtin_installer_host(hostile),
+                "hostile host must not be builtin: {hostile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_url_check_rejects_hostile_posing() {
+        for builtin in [
+            "https://cdn.bitty.run/bitty/components/net/0.0.23/x.tar.gz",
+            "https://cdn.bitty.run/bitty/components/net/0.0.23/SHA256SUMS",
+            "https://cdn.bitty.run:443/bitty/components/net/0.0.23/x.tar.gz",
+        ] {
+            assert!(
+                is_builtin_installer_url(builtin),
+                "builtin URL must pass: {builtin}"
+            );
+        }
+        for hostile in [
+            "https://cdn.bitty.run.evil.com/bitty/components/net/0.0.23/x.tar.gz",
+            "https://cdn.bitty.run@evil/bitty/components/net/0.0.23/x.tar.gz",
+            "https://CDN.BITTY.RUN/bitty/components/net/0.0.23/x.tar.gz",
+            "https://cdn.bitty.run:8443/bitty/components/net/0.0.23/x.tar.gz",
+            "https://cdn.bitty.run:80/x",
+            "http://cdn.bitty.run/x",
+            "HTTPS://cdn.bitty.run/x",
+            "https://evil.com/https://cdn.bitty.run/x",
+            "https://evil.com/x",
+            "",
+        ] {
+            assert!(
+                !is_builtin_installer_url(hostile),
+                "hostile URL must not be builtin: {hostile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn seed_urls_are_builtin_egress() {
+        let urls = seed_urls("net", "0.0.23", "x86_64-unknown-linux-gnu").expect("urls");
+        assert!(is_builtin_installer_url(&urls.tarball_url));
+        assert!(is_builtin_installer_url(&urls.manifest_url));
+        assert!(is_builtin_installer_host(SEED_CDN_HOST));
+        assert!(bitty_runtime::component::is_builtin_installer_egress(
+            SEED_CDN_HOST,
+            SEED_CDN_PORT
+        ));
+    }
+
+    // --- dual-digest + consent levels (#1905 delta 6, #1906 direction) ----
+
+    #[test]
+    fn dual_digest_needs_both_sources_matching() {
+        let digest = "a".repeat(64);
+        let other = "b".repeat(64);
+        // Both present and matching the bytes: verified.
+        assert!(is_dual_digest_verified(Some(&digest), &digest, &digest));
+        // Uppercase is normalized (mirrors manifest parsing).
+        assert!(is_dual_digest_verified(
+            Some(&digest.to_ascii_uppercase()),
+            &digest.to_ascii_uppercase(),
+            &digest
+        ));
+        // Single-source-only (no registry pin): confirm path, never silent.
+        assert!(!is_dual_digest_verified(None, &digest, &digest));
+        // Either side mismatching the bytes: not verified (mismatch is an
+        // integrity failure upstream, never a silent pick).
+        assert!(!is_dual_digest_verified(Some(&other), &digest, &digest));
+        assert!(!is_dual_digest_verified(Some(&digest), &other, &digest));
+        assert!(!is_dual_digest_verified(Some(&digest), &digest, &other));
+        // Malformed digests never verify.
+        assert!(!is_dual_digest_verified(Some("abc"), &digest, &digest));
+        assert!(!is_dual_digest_verified(
+            Some(&digest),
+            "not-hex-at-all______________________________________________",
+            &digest
+        ));
+    }
+
+    #[test]
+    fn consent_level_is_silent_only_for_builtin_and_dual() {
+        assert_eq!(
+            installer_consent_level(true, true),
+            InstallerConsentLevel::Silent
+        );
+        // Third-party host, single-digest-only, or both: explicit confirm.
+        assert_eq!(
+            installer_consent_level(false, true),
+            InstallerConsentLevel::Confirm
+        );
+        assert_eq!(
+            installer_consent_level(true, false),
+            InstallerConsentLevel::Confirm
+        );
+        assert_eq!(
+            installer_consent_level(false, false),
+            InstallerConsentLevel::Confirm
+        );
     }
 
     // --- curl/tar argv shape ----------------------------------------------

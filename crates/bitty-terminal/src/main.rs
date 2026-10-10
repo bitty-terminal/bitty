@@ -609,9 +609,12 @@ fn main() {
         };
         let stdout = std::io::stdout();
         let mut output = stdout.lock();
+        let stdin = std::io::stdin();
+        let mut input = stdin.lock();
         std::process::exit(component::run_component_subcommand(
             &args.component_raw,
             &context,
+            &mut input,
             &mut output,
         ));
     }

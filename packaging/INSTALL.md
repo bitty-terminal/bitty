@@ -2,7 +2,9 @@
 
 Part of: bitty-terminal/bitty#1847 | Task: CTX-1097 | Milestone: v0.1.0
 
-Every supported install channel in one page. All channels verify downloads
+Every supported install channel in one page. Supported means
+release-matrix-verified: a CI-built binary is not support evidence (see
+`packaging/README.md` `Support evidence`). All channels verify downloads
 before installing and fail closed on mismatch; there are no signatures in
 0.1.0 (verification is hash-only, Windows signing deferred past 0.2.0).
 
@@ -50,21 +52,27 @@ What each script installs:
 ## Package managers
 
 - **Arch Linux (AUR)**: `paru -S bitty-bin` (prebuilt, recommended) or
-  `paru -S bitty` (build from source). They conflict; install one. See the
-  top-level README `Install` section.
-- **Homebrew**: the formula is generated at tag time into the external tap
-  `bitty-terminal/homebrew-tap` (no in-repo copy).
-- **Scoop**: the manifest is generated at tag time into the external bucket
-  `bitty-terminal/scoop-bucket` and ships the bare exes, sidestepping
-  SmartScreen by construction. See `packaging/README.md`.
-- **Alpine/openSUSE**: see `packaging/alpine.md` and
-  `packaging/opensuse.md`.
+  `paru -S bitty` (build from source). They conflict; install one. Only a
+  tag-time published recipe counts as supported (both publishes are gated
+  on secrets). See the top-level README `Install` section.
+- **Homebrew**: only a tag-time published formula in the external tap
+  `bitty-terminal/homebrew-tap` counts as supported (no in-repo copy); a
+  CI-built macOS binary is not support evidence.
+- **Scoop**: only a tag-time published manifest in the external bucket
+  `bitty-terminal/scoop-bucket` counts as supported; it ships the bare
+  exes, sidestepping SmartScreen by construction. See `packaging/README.md`.
+- **Alpine**: verified via the release `verify-install` Alpine leg; see
+  `packaging/alpine.md`.
+- **openSUSE**: best-effort, not supported (no release `verify-install`
+  leg); see `packaging/opensuse.md`.
 
 ## Prebuilt binaries (manual download)
 
 [GitHub Releases](https://github.com/bitty-terminal/bitty/releases) carry
 binaries for Linux, macOS, and Windows plus `.deb`, `.rpm`, `.apk`, and Arch
-packages. Everything is mirrored to R2 at `releases/<tag>/` with read-back
+packages. Only release-matrix-verified artifacts count as supported (see
+`packaging/README.md` `Release Matrix` and `Support evidence`).
+Everything is mirrored to R2 at `releases/<tag>/` with read-back
 hash verification. Each artifact has a `.sha256` sidecar — check it before
 running anything.
 

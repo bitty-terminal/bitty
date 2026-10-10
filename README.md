@@ -140,8 +140,10 @@ dependency set, and `--force` to overwrite an existing install.
 
 ### Other packaging
 
-In-repo recipes for Homebrew, Scoop, and a Nix flake are documented in
-[`packaging/README.md`](packaging/README.md).
+The Nix flake and the release-published Homebrew tap and Scoop bucket are
+documented in [`packaging/README.md`](packaging/README.md). Only
+release-matrix-verified artifacts count as supported; a CI-built binary is
+not support evidence. There is no Flatpak artifact in 0.1.0.
 
 ## Quick start
 

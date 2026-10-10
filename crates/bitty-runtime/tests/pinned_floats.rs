@@ -10,8 +10,9 @@
 
 use bitty_platform::{CursorPosition, MouseButton, PressState};
 use bitty_runtime::{
-    LayoutNode, OverlayTier, PresentationMode, Runtime, RuntimeConfig, SplitAxis, UiRect, View,
-    ViewId,
+    LayoutNode, OverlayTier, PaneAttachment, PaneRoute, PaneSnapshot, PinnedSnapshot,
+    PresentationMode, Runtime, RuntimeConfig, SESSION_FORMAT_VERSION, SessionSnapshot, SplitAxis,
+    UiRect, View, ViewId, WorkspaceSnapshot,
 };
 
 fn make_runtime() -> Runtime {
@@ -316,4 +317,186 @@ fn stacked_pins_cascade_so_each_stays_visible() {
         (first.frame.width, first.frame.height),
         "cascade shifts origin only, never resizes"
     );
+}
+
+#[test]
+fn pinned_leaf_survives_session_round_trip_with_identical_present() {
+    // CTX-1082: detached pinned leaves were lost on restart (capture
+    // iterated slot layouts only). In-memory capture/apply round-trip (no
+    // file I/O, no backend).
+    let mut rt = make_runtime();
+    install(&mut rt, two_pane());
+    rt.pin_floating(ViewId::new(1)).expect("pin must apply");
+    let fresh = frame_of(&rt, ViewId::new(1));
+    assert_eq!(fresh.tier, Some(OverlayTier::Float));
+
+    let snap = rt.capture_session_snapshot();
+    assert_eq!(snap.version, SESSION_FORMAT_VERSION);
+    // The live layout holds only the survivor; the pin rides the snapshot.
+    assert_eq!(snap.workspaces.len(), 1);
+    assert_eq!(snap.pinned.len(), 1);
+    let pin = &snap.pinned[0];
+    assert_eq!(pin.view.id(), ViewId::new(1));
+    assert_eq!(pin.view.presentation(), PresentationMode::Floating);
+    assert_eq!(
+        pin.attach,
+        PaneAttachment::Detached,
+        "no live session backs the pin"
+    );
+    assert_eq!(pin.anchor, Some(ViewId::new(2)));
+    assert!(!pin.after, "pin anchors before the following neighbor");
+    assert!(pin.cwd.is_none() && pin.scrollback.is_empty());
+
+    let mut restored = make_runtime();
+    restored.set_container(UiRect::new(0, 0, 80, 24));
+    let summary = restored
+        .apply_session_snapshot(&snap)
+        .expect("captured snapshot applies");
+    assert_eq!(summary.panes, 2, "surviving leaf plus the pinned entry");
+    assert_eq!(summary.pending, 0, "detached pin earns no pending entry");
+    assert_eq!(restored.pinned_views(), vec![ViewId::new(1)]);
+    assert_eq!(restored.layout().leaf_ids(), vec![ViewId::new(2)]);
+    assert!(
+        !restored.session_pending_contains(&ViewId::new(1)),
+        "detached pin earns no pending entry"
+    );
+    let back = frame_of(&restored, ViewId::new(1));
+    assert_eq!(back.tier, Some(OverlayTier::Float));
+    assert_eq!(
+        back.frame, fresh.frame,
+        "pinned geometry recomputes identically"
+    );
+    assert_eq!(back.content, fresh.content);
+    assert_eq!(back.border, fresh.border);
+
+    // Unpin-after-restore returns the floating panel beside its anchor.
+    let id = restored
+        .unpin_floating(ViewId::new(1))
+        .expect("unpin must apply");
+    assert_eq!(id, ViewId::new(1));
+    assert!(!restored.pinned_occupied());
+    assert_eq!(restored.focused_view(), Some(ViewId::new(1)));
+    assert_eq!(
+        restored
+            .layout()
+            .find_leaf(ViewId::new(1))
+            .expect("leaf back in the live tree")
+            .presentation(),
+        PresentationMode::Floating
+    );
+}
+
+#[test]
+fn pinned_session_history_waits_pending_and_unpins_after_restore() {
+    // CTX-1082: an attached pinned leaf's history rides the snapshot and
+    // waits pending like an attached layout pane; unpin-after-restore
+    // returns the floating panel. In-memory (no file I/O, no backend).
+    let pane = |id: u64, attach: PaneAttachment, history: &[&str]| PaneSnapshot {
+        view: ViewId::new(id),
+        cwd: None,
+        scrollback: history.iter().map(|line| line.to_string()).collect(),
+        attach: Some(attach),
+        route: PaneRoute::Terminal,
+        mode: PresentationMode::Tiled,
+    };
+    let snap = SessionSnapshot {
+        version: SESSION_FORMAT_VERSION,
+        workspaces: vec![WorkspaceSnapshot {
+            seq: 1,
+            name: "ws1".to_string(),
+            layout: LayoutNode::split(
+                SplitAxis::Horizontal,
+                0.5,
+                LayoutNode::leaf(View::new(ViewId::new(100), 80, 24)),
+                LayoutNode::leaf(View::new(ViewId::new(101), 80, 24)),
+            ),
+            focus: Some(ViewId::new(100)),
+            panes: vec![
+                pane(100, PaneAttachment::Primary, &["owner-history"]),
+                pane(101, PaneAttachment::Detached, &[]),
+            ],
+        }],
+        active: 0,
+        mru: vec![0],
+        pinned: vec![PinnedSnapshot {
+            view: View::with_presentation(ViewId::new(9), 80, 24, PresentationMode::Floating),
+            cwd: None,
+            scrollback: vec!["pinned-history".to_string()],
+            attach: PaneAttachment::Session,
+            anchor: Some(ViewId::new(101)),
+            after: false,
+        }],
+    };
+
+    let mut rt = make_runtime();
+    rt.set_container(UiRect::new(0, 0, 80, 24));
+    let summary = rt.apply_session_snapshot(&snap).expect("apply valid");
+    assert_eq!(summary.panes, 3, "layout leaves plus the pinned entry");
+    assert_eq!(summary.pending, 1, "only the pinned session waits pending");
+    assert_eq!(rt.pinned_views(), vec![ViewId::new(9)]);
+    assert!(rt.session_pending_contains(&ViewId::new(9)));
+    assert!(
+        !rt.session_pending_contains(&ViewId::new(101)),
+        "detached layout leaf earns no pending entry"
+    );
+    let frame = frame_of(&rt, ViewId::new(9));
+    assert_eq!(frame.tier, Some(OverlayTier::Float));
+
+    let id = rt.unpin_floating(ViewId::new(9)).expect("unpin must apply");
+    assert_eq!(id, ViewId::new(9));
+    assert!(!rt.pinned_occupied());
+    assert_eq!(rt.focused_view(), Some(ViewId::new(9)));
+    assert!(rt.layout().leaf_ids().contains(&ViewId::new(9)));
+    assert_eq!(
+        rt.layout()
+            .find_leaf(ViewId::new(9))
+            .expect("leaf back in the live tree")
+            .presentation(),
+        PresentationMode::Floating
+    );
+    // The pending restore survives the unpin: the next spawn of the leaf
+    // hydrates it.
+    assert!(rt.session_pending_contains(&ViewId::new(9)));
+}
+
+#[test]
+fn old_version_snapshot_without_pinned_still_applies() {
+    // CTX-1082 compat: a v2 snapshot (no pinned block) still loads — the
+    // world restores with an empty pinned store.
+    let pane = |id: u64, attach: PaneAttachment| PaneSnapshot {
+        view: ViewId::new(id),
+        cwd: None,
+        scrollback: Vec::new(),
+        attach: Some(attach),
+        route: PaneRoute::Terminal,
+        mode: PresentationMode::Tiled,
+    };
+    let snap = SessionSnapshot {
+        version: 2,
+        workspaces: vec![WorkspaceSnapshot {
+            seq: 1,
+            name: "ws1".to_string(),
+            layout: LayoutNode::split(
+                SplitAxis::Horizontal,
+                0.5,
+                LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+                LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+            ),
+            focus: Some(ViewId::new(1)),
+            panes: vec![
+                pane(1, PaneAttachment::Primary),
+                pane(2, PaneAttachment::Session),
+            ],
+        }],
+        active: 0,
+        mru: vec![0],
+        pinned: Vec::new(),
+    };
+
+    let mut rt = make_runtime();
+    rt.set_container(UiRect::new(0, 0, 80, 24));
+    let summary = rt.apply_session_snapshot(&snap).expect("v2 applies");
+    assert_eq!(summary.panes, 2);
+    assert_eq!(rt.layout().leaf_ids(), vec![ViewId::new(1), ViewId::new(2)]);
+    assert!(!rt.pinned_occupied(), "v2 load restores no pinned entries");
 }

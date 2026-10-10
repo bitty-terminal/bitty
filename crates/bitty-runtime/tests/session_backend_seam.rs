@@ -50,6 +50,7 @@ impl StubBackend {
             }],
             active: 0,
             mru: vec![0],
+            pinned: Vec::new(),
         }
     }
 

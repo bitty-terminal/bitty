@@ -448,3 +448,78 @@ fn live_views_rule_is_checked_against_existing_views() {
     });
     assert_eq!(outline.width_focused, Some(3));
 }
+
+#[test]
+fn window_zero_opacity_presents_no_blit_and_rasterizes_nothing() {
+    // CTX-1076 (CodeRabbit Major on PR #1884): a fully transparent window
+    // image has no visual effect, so the present path must skip it before
+    // the raster resolve — counting or storing the blit would waste the
+    // shared BG-7 budget (32 blits / 64 MiB) needed by per-View images.
+    let root = scratch("window-transparent");
+    let path = root.join("red.png");
+    std::fs::write(&path, RED_PNG).expect("write fixture");
+    let path = path.display().to_string();
+    let mut rt = Runtime::new(RuntimeConfig {
+        window_background_image: Some(path),
+        window_background_fit: "stretch".to_string(),
+        window_background_opacity: 0.0,
+        window_background_position: "center".to_string(),
+        background_image_roots: vec![root.display().to_string()],
+        ..RuntimeConfig::default()
+    })
+    .expect("transparent window image builds");
+    assert!(rt.config().has_window_background_image());
+    single_leaf(&mut rt);
+    let stats = rt.tick().expect("first tick presents");
+    assert_eq!(
+        stats.backgrounds, 0,
+        "a zero-opacity window image must not consume a background blit"
+    );
+    assert_eq!(
+        rt.background_raster_stats(),
+        (0, 0, 0, 0),
+        "the skipped window image must not even resolve a raster"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn window_and_per_view_images_are_both_admitted() {
+    // CTX-1076 (CodeRabbit Major on PR #1884): per-View blits are admitted
+    // first and the window blit is prepended only when frame capacity and
+    // byte budget remain, so a window image must never starve the per-View
+    // image at normal sizes. (Full-budget eviction ordering is by
+    // construction — the per-View loop runs before the window block — and
+    // cannot be reproduced at headless test scale below the 64 MiB bound.)
+    let root = scratch("window-plus-view");
+    let path = root.join("red.png");
+    std::fs::write(&path, RED_PNG).expect("write fixture");
+    let path = path.display().to_string();
+    let mut rt = Runtime::new(RuntimeConfig {
+        background_image: Some(path.clone()),
+        background_fit: "stretch".to_string(),
+        window_background_image: Some(path),
+        window_background_fit: "stretch".to_string(),
+        window_background_opacity: 1.0,
+        window_background_position: "center".to_string(),
+        background_image_roots: vec![root.display().to_string()],
+        ..RuntimeConfig::default()
+    })
+    .expect("window plus per-View images build");
+    single_leaf(&mut rt);
+    let stats = rt.tick().expect("first tick presents");
+    assert_eq!(
+        stats.backgrounds, 2,
+        "window and per-View blits share the frame instead of starving"
+    );
+    let rgba = rt.headless_rgba().expect("rgba after tick");
+    let width = surface_width(&rt);
+    // The per-View image never covers the padding band, so a red pixel at
+    // the window corner proves the window blit survived alongside it.
+    assert_eq!(
+        probe(&rgba, width, 2, 2),
+        [255, 0, 0, 255],
+        "window background must still cover the padding band"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

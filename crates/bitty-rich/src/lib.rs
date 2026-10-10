@@ -160,9 +160,10 @@ pub use kitty_place::{
     KITTY_FORMAT_RGBA, KITTY_PER_ORIGIN_MAX_BYTES, KITTY_PER_ORIGIN_MAX_IMAGES,
     KITTY_PER_ORIGIN_MAX_PLACEMENTS, KITTY_PLACE_MAX_BYTES, KITTY_PLACE_MAX_IMAGES,
     KITTY_PLACE_MAX_ITEMS, KITTY_PRESENT_MAX_BLITS_PER_FRAME, KITTY_PRESENT_MAX_BYTES_PER_FRAME,
-    KittyAction, KittyImageId, KittyImageLayer, KittyPlacedImage, KittyPlacement,
-    KittyPlacementError, KittyPlacementId, KittyPrecheckError, placement_full_rect_for,
-    placement_rect_for, precheck_declared_image, viewport_extent,
+    KITTY_VIRTUAL_MAX_ITEMS, KittyAction, KittyImageId, KittyImageLayer, KittyPlacedImage,
+    KittyPlacement, KittyPlacementError, KittyPlacementId, KittyPrecheckError,
+    KittyVirtualPrototype, placement_full_rect_for, placement_rect_for, precheck_declared_image,
+    viewport_extent,
 };
 pub use kitty_raster::{rasterize_kitty, rasterize_kitty_clipped};
 pub use kitty_unicode::{

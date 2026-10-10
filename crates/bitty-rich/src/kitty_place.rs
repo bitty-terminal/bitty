@@ -162,6 +162,39 @@
 //! deleted. The demoted legacy seam is `bitty-term-state::image`'s
 //! `ImagePlaceholder`.
 //!
+//! # Virtual prototypes (`U=1`, S4, #1849)
+//!
+//! Unicode-placeholder images (`U+10EEEE` runs) paint through the grid,
+//! never as blits: the client transmits the image (quiet `a=t`, or the
+//! combined `a=T,U=1` form) and registers a virtual prototype
+//! (`a=p,U=1,i=<id>,c=<cols>,r=<rows>`, always bodiless — the parser
+//! refuses payload on control-only actions), then prints placeholder
+//! runs the present layer sizes via [`crate::kitty_unicode`]. This layer
+//! keeps the prototype registry ([`KittyVirtualPrototype`], bounded by
+//! [`KITTY_VIRTUAL_MAX_ITEMS`]) so runs resolve against registered spans:
+//!
+//! - Registration is origin-tagged with wire `i=`/`p=` identity and the
+//!   `scrollback_base` at registration; scroll follows the same
+//!   `current.saturating_sub(base)` delta as blit placements.
+//! - Prototypes count against the shared placement budget (128 global /
+//!   32 per origin): admission runs the same quota shape as blits, with
+//!   same-kind FIFO eviction only (a prototype never evicts a visible
+//!   blit and vice versa; a budget held entirely by the other kind
+//!   refuses with [`KittyPlacementError::QuotaExceeded`]).
+//! - Present never blits prototypes: they live outside the placements
+//!   deque, so every paint-order iterator skips them by construction
+//!   (no double-paint with the grid runs).
+//! - Deletion mirrors terminal truth (`bitty-term-state::placement`):
+//!   unpinned `d=i` clears every prototype of the image, pinned deletes
+//!   spare them (any prototype still serves runs), pin `0` names nothing;
+//!   `d=a` and alternate-screen suppression keep them (`clear_origin`
+//!   stays placements-only) while `ED 2`/`ED 22`/`FullReset`
+//!   (`clear_virtual_for_origin`), pane teardown (`retire_origin`), and
+//!   image eviction (linked combined-form prototypes cascade) drop them.
+//! - Combined-form prototypes link their stored image (`Some` handle);
+//!   bodiless prototypes carry `None` and explicit spans only (`0` sides
+//!   derive `>= 1` cell, as in [`crate::kitty_unicode`]).
+//!
 //! # Determinism
 //!
 //! Storage and placement are pure functions of insertion order: same calls
@@ -170,6 +203,8 @@
 use std::collections::VecDeque;
 
 use crate::geometry::{CellMetrics, ExtentPx, RectPx};
+use crate::kitty_unicode::{KittyUnicodeRect, KittyUnicodeVirtual, unicode_run_rect};
+use bitty_term_state::{KittyUnicodeCell, KittyUnicodeRun};
 
 /// Kitty `f=` value for PNG payloads (Core-retained contract mirror).
 ///
@@ -241,6 +276,14 @@ pub const KITTY_PER_ORIGIN_MAX_BYTES: usize = 64 * 1024 * 1024;
 /// The per-frame blit budget (32 blits) already means placements past one
 /// origin quota rarely paint on a single pane in one frame.
 pub const KITTY_PER_ORIGIN_MAX_PLACEMENTS: usize = 32;
+
+/// Maximum virtual prototypes retained by the registry (S4, #1849).
+///
+/// Mirrors the terminal-truth [`bitty_term_state`] placement capacity so
+/// every recorded prototype has a registry slot. The shared 128-global
+/// placement budget subsumes it in practice (prototypes count against
+/// that budget); this stays as the absolute backstop.
+pub const KITTY_VIRTUAL_MAX_ITEMS: usize = 256;
 
 /// Maximum scroll lines one Kitty placement may drive (CTX-1072, #1850).
 ///
@@ -582,6 +625,60 @@ pub struct KittyPlacement {
     pub z: i32,
 }
 
+/// Virtual-prototype record for one `U=1` registration (S4, #1849).
+///
+/// Invisible bookkeeping for `U+10EEEE` runs: the prototype names the
+/// image and the cell span the client's runs will cover, but it is never
+/// anchored, never moves the cursor, and never emits a blit (prototypes
+/// live outside the placements deque, so paint-order iterators skip them
+/// by construction — the double-paint rule).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct KittyVirtualPrototype {
+    /// Origin token of the emitting PTY stream (`None` primary,
+    /// `Some(token)` pane session): quota scope and lookup scope, like
+    /// [`KittyPlacement::origin`].
+    pub origin: Option<u64>,
+    /// Wire `i=` image id naming the prototype (`0` anonymous).
+    pub wire_image: u32,
+    /// Wire `p=` placement id (`0` anonymous: any-placement fallback,
+    /// never singly addressable).
+    pub wire_placement: u32,
+    /// Linked stored image for the combined `a=T,U=1` form (`None` for
+    /// bodiless `a=p,U=1`, which carries no pixels).
+    pub image: Option<KittyImageId>,
+    /// Explicit `c=` span columns (`0` derives, see below).
+    pub cols: u16,
+    /// Explicit `r=` span rows (`0` derives, see below).
+    pub rows: u16,
+    /// Decoded image width in pixels (`0` when bodiless/unknown).
+    pub image_width: u32,
+    /// Decoded image height in pixels (`0` when bodiless/unknown).
+    pub image_height: u32,
+    /// `State::scrollback_len()` at registration (scroll tracking, same
+    /// delta shape as [`KittyPlacement::scrollback_base`]).
+    pub scrollback_base: usize,
+}
+
+impl KittyVirtualPrototype {
+    /// Sizing view for [`unicode_run_rect`]: wire `p=0` maps to absent
+    /// (any virtual placement of the image may serve the run).
+    #[must_use]
+    pub fn as_unicode_virtual(&self) -> KittyUnicodeVirtual {
+        KittyUnicodeVirtual {
+            image_id: self.wire_image,
+            placement_id: if self.wire_placement == 0 {
+                None
+            } else {
+                Some(self.wire_placement)
+            },
+            cols: self.cols,
+            rows: self.rows,
+            image_width: self.image_width,
+            image_height: self.image_height,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -744,6 +841,7 @@ fn cell_span(explicit: u16, pixels: u32, cell_px: u32) -> u16 {
 pub struct KittyImageLayer {
     images: VecDeque<KittyPlacedImage>,
     placements: VecDeque<KittyPlacement>,
+    virtual_protos: VecDeque<KittyVirtualPrototype>,
     total_bytes: usize,
     next_image_id: u64,
     next_placement_id: u64,
@@ -756,6 +854,7 @@ impl KittyImageLayer {
         Self {
             images: VecDeque::new(),
             placements: VecDeque::new(),
+            virtual_protos: VecDeque::new(),
             total_bytes: 0,
             next_image_id: 1,
             next_placement_id: 1,
@@ -814,6 +913,174 @@ impl KittyImageLayer {
     #[must_use]
     pub fn placement_len(&self) -> usize {
         self.placements.len()
+    }
+
+    /// Number of registered virtual prototypes (S4, #1849).
+    #[must_use]
+    pub fn virtual_len(&self) -> usize {
+        self.virtual_protos.len()
+    }
+
+    /// Number of registered virtual prototypes of one origin (S4, #1849).
+    #[must_use]
+    pub fn virtual_count_for_origin(&self, origin: Option<u64>) -> usize {
+        self.virtual_protos
+            .iter()
+            .filter(|v| v.origin == origin)
+            .count()
+    }
+
+    /// Looks up a virtual prototype by origin-scoped wire identity (S4,
+    /// #1849): `None` placement matches the oldest prototype of the
+    /// image on `origin` (any-placement fallback); `Some(pin)` needs the
+    /// exact `(image, pin)` pair. `Some(0)` names nothing singly
+    /// addressable and returns `None` (mirrors [`Self::delete_by_wire`]).
+    #[must_use]
+    pub fn get_virtual(
+        &self,
+        origin: Option<u64>,
+        image_id: u32,
+        placement: Option<u32>,
+    ) -> Option<&KittyVirtualPrototype> {
+        match placement {
+            Some(0) => None,
+            Some(pinned) => self.virtual_protos.iter().find(|v| {
+                v.origin == origin && v.wire_image == image_id && v.wire_placement == pinned
+            }),
+            None => self
+                .virtual_protos
+                .iter()
+                .find(|v| v.origin == origin && v.wire_image == image_id),
+        }
+    }
+
+    /// Registers a virtual prototype for one origin (S4, #1849).
+    ///
+    /// An addressed re-put (`i != 0`, `p != 0`) of an already-registered
+    /// `(origin, image, placement)` key replaces in place (terminal-truth
+    /// `upsert` parity: no quota consumed, nothing evicted); anything
+    /// else appends. Appends count against the shared placement budget
+    /// (128 global / 32 per origin): pressure evicts that origin's own
+    /// oldest prototype first (FIFO within the origin, deterministic),
+    /// and global pressure from other origins refuses with
+    /// [`KittyPlacementError::QuotaExceeded`] instead of evicting a
+    /// victim — no cross-origin eviction. Same-kind FIFO only: a budget
+    /// held entirely by blit placements refuses (a prototype never
+    /// evicts visible content). The absolute [`KITTY_VIRTUAL_MAX_ITEMS`]
+    /// bound backstops the registry. Failures register nothing and evict
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`KittyPlacementError::QuotaExceeded`] on global pressure from
+    /// other origins, or when the origin's budget is held entirely by
+    /// blit placements.
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_virtual_for_origin(
+        &mut self,
+        origin: Option<u64>,
+        wire_image: u32,
+        wire_placement: u32,
+        image: Option<KittyImageId>,
+        cols: u16,
+        rows: u16,
+        image_width: u32,
+        image_height: u32,
+        scrollback_base: usize,
+    ) -> Result<(), KittyPlacementError> {
+        if wire_image != 0 && wire_placement != 0 {
+            if let Some(slot) = self.virtual_protos.iter_mut().find(|v| {
+                v.origin == origin
+                    && v.wire_image == wire_image
+                    && v.wire_placement == wire_placement
+            }) {
+                *slot = KittyVirtualPrototype {
+                    origin,
+                    wire_image,
+                    wire_placement,
+                    image,
+                    cols,
+                    rows,
+                    image_width,
+                    image_height,
+                    scrollback_base,
+                };
+                return Ok(());
+            }
+        }
+        self.check_virtual_quota_for_origin(origin)?;
+        if self.placement_count_for_origin(origin) + self.virtual_count_for_origin(origin)
+            >= KITTY_PER_ORIGIN_MAX_PLACEMENTS
+        {
+            if let Some(pos) = self.virtual_protos.iter().position(|v| v.origin == origin) {
+                self.virtual_protos.remove(pos);
+            }
+        }
+        if self.virtual_protos.len() >= KITTY_VIRTUAL_MAX_ITEMS {
+            if let Some(pos) = self.virtual_protos.iter().position(|v| v.origin == origin) {
+                self.virtual_protos.remove(pos);
+            } else {
+                return Err(KittyPlacementError::QuotaExceeded);
+            }
+        }
+        self.virtual_protos.push_back(KittyVirtualPrototype {
+            origin,
+            wire_image,
+            wire_placement,
+            image,
+            cols,
+            rows,
+            image_width,
+            image_height,
+            scrollback_base,
+        });
+        Ok(())
+    }
+
+    /// Resolves one grid run against the oldest matching prototype of
+    /// `origin` (S4, #1849): the two-layer link between placeholder runs
+    /// and the `U=1` registry. First registered match wins
+    /// (deterministic); `None` when no prototype of `origin` serves the
+    /// run, when the run scrolled fully off the top, or when clipping
+    /// leaves nothing painted. `scrollback_now` is the current
+    /// `State::scrollback_len()`: callers holding print-time-anchored
+    /// runs pass it for the blit-style delta, while live-grid callers
+    /// (whose decoded rows are already scrolled truth) pass the
+    /// prototype's own base so the delta cancels.
+    #[must_use]
+    pub fn virtual_run_rect(
+        &self,
+        origin: Option<u64>,
+        run: &KittyUnicodeRun,
+        cells: &[KittyUnicodeCell],
+        metrics: CellMetrics,
+        scrollback_now: usize,
+    ) -> Option<KittyUnicodeRect> {
+        self.virtual_protos
+            .iter()
+            .filter(|v| v.origin == origin)
+            .find_map(|v| {
+                let virt = v.as_unicode_virtual();
+                unicode_run_rect(
+                    run,
+                    cells,
+                    &virt,
+                    metrics,
+                    scrollback_now,
+                    v.scrollback_base,
+                )
+            })
+    }
+
+    /// Drops every virtual prototype of `origin`, keeping blit placements
+    /// and all stored images (S4, #1849).
+    ///
+    /// `ED 2`/`ED 22`/`FullReset` counterpart to [`Self::clear_origin`]:
+    /// terminal truth drops prototypes on full clear (`clear_screen`) but
+    /// spares them on `d=a` (`AllVisible`), so the two clear paths stay
+    /// split here too.
+    pub fn clear_virtual_for_origin(&mut self, origin: Option<u64>) {
+        self.virtual_protos.retain(|v| v.origin != origin);
     }
 
     /// Whether no placement is retained.
@@ -912,6 +1179,11 @@ impl KittyImageLayer {
             self.images.retain(|img| !evict.contains(&img.id));
             self.total_bytes = self.total_bytes.saturating_sub(freed_bytes);
             self.placements.retain(|p| !evict.contains(&p.image));
+            // S4 (#1849): combined-form prototypes link their stored
+            // image and cascade like blit placements; bodiless
+            // prototypes (`None`) have no link and survive.
+            self.virtual_protos
+                .retain(|v| v.image.is_none_or(|id| !evict.contains(&id)));
         }
         let id = KittyImageId(self.next_image_id);
         self.next_image_id = self.next_image_id.wrapping_add(1).max(1);
@@ -949,6 +1221,9 @@ impl KittyImageLayer {
         if removed {
             self.total_bytes = self.total_bytes.saturating_sub(removed_bytes);
             self.placements.retain(|p| p.image != id);
+            // S4 (#1849): linked combined-form prototypes cascade with
+            // their image, like blit placements.
+            self.virtual_protos.retain(|v| v.image != Some(id));
         }
         removed
     }
@@ -1084,9 +1359,14 @@ impl KittyImageLayer {
         // global pressure from other origins refuses instead (no
         // cross-origin eviction). Decided before any mutation so a refusal
         // evicts nothing (shared with `check_placement_quota_for_origin`,
-        // which transmit-and-display preflights before storing).
+        // which transmit-and-display preflights before storing). S4
+        // (#1849): prototypes share the budget, so the counts below cover
+        // both deques with same-kind eviction only.
         self.check_placement_quota_for_origin(origin)?;
-        let evict_own = self.placement_count_for_origin(origin) >= KITTY_PER_ORIGIN_MAX_PLACEMENTS;
+        let evict_own = self.placement_count_for_origin(origin)
+            + self.virtual_count_for_origin(origin)
+            >= KITTY_PER_ORIGIN_MAX_PLACEMENTS
+            && self.placement_count_for_origin(origin) > 0;
         if evict_own {
             if let Some(pos) = self.placements.iter().position(|p| p.origin == origin) {
                 self.placements.remove(pos);
@@ -1205,6 +1485,9 @@ impl KittyImageLayer {
         }
         self.placements
             .retain(|p| p.origin != origin && !dead.contains(&p.image));
+        // S4 (#1849): a retired origin's prototypes die with it, like its
+        // placements (terminal truth drops the whole pane `State`).
+        self.virtual_protos.retain(|v| v.origin != origin);
     }
 
     /// Placement-quota preflight for one origin: the refusal half of
@@ -1215,13 +1498,59 @@ impl KittyImageLayer {
     /// (S5, #1849): `store_for_origin` may evict the origin's own oldest
     /// images, which a post-store rollback could not restore. Non-display
     /// and alternate-screen paths store without placing and skip this.
+    ///
+    /// S4 (#1849): the budget is shared with virtual prototypes, so both
+    /// deques count; eviction stays same-kind (a blit never evicts a
+    /// prototype — a budget held entirely by prototypes refuses instead).
     pub fn check_placement_quota_for_origin(
         &self,
         origin: Option<u64>,
     ) -> Result<(), KittyPlacementError> {
-        let evict_own = self.placement_count_for_origin(origin) >= KITTY_PER_ORIGIN_MAX_PLACEMENTS;
-        let global_len_after = self.placements.len().saturating_sub(usize::from(evict_own));
+        self.check_shared_placement_quota(origin, self.placement_count_for_origin(origin))
+    }
+
+    /// Virtual-prototype quota preflight for one origin (S4, #1849): the
+    /// refusal half of [`KittyImageLayer::register_virtual_for_origin`]
+    /// without mutation.
+    ///
+    /// The combined `a=T,U=1` form calls this before decoding/storing, so
+    /// a quota refusal stores nothing and never discards FIFO-evicted
+    /// images (same S5 atomicity rationale as
+    /// [`KittyImageLayer::check_placement_quota_for_origin`]). Same-kind
+    /// FIFO only: a prototype never evicts a visible blit — a budget held
+    /// entirely by blits refuses instead.
+    pub fn check_virtual_quota_for_origin(
+        &self,
+        origin: Option<u64>,
+    ) -> Result<(), KittyPlacementError> {
+        self.check_shared_placement_quota(origin, self.virtual_count_for_origin(origin))
+    }
+
+    /// Shared placement-budget admission check (S5 quotas, S4 sharing).
+    ///
+    /// `own_evictable` is the admitting kind's own-origin count
+    /// (placements for blits, prototypes for virtual): pressure evicts
+    /// the origin's own oldest entry of that kind first, and global
+    /// pressure from other origins refuses with
+    /// [`KittyPlacementError::QuotaExceeded`] instead of evicting a
+    /// victim. When the origin's budget is held entirely by the other
+    /// kind (`own_evictable == 0`), admission refuses rather than
+    /// destroying another kind's entries. Decided before any mutation so
+    /// a refusal evicts nothing.
+    fn check_shared_placement_quota(
+        &self,
+        origin: Option<u64>,
+        own_evictable: usize,
+    ) -> Result<(), KittyPlacementError> {
+        let own_total =
+            self.placement_count_for_origin(origin) + self.virtual_count_for_origin(origin);
+        let evict_own = own_total >= KITTY_PER_ORIGIN_MAX_PLACEMENTS && own_evictable > 0;
+        let global_total = self.placements.len() + self.virtual_protos.len();
+        let global_len_after = global_total.saturating_sub(usize::from(evict_own));
         if global_len_after >= KITTY_PLACE_MAX_ITEMS {
+            return Err(KittyPlacementError::QuotaExceeded);
+        }
+        if own_total >= KITTY_PER_ORIGIN_MAX_PLACEMENTS && own_evictable == 0 {
             return Err(KittyPlacementError::QuotaExceeded);
         }
         Ok(())
@@ -1239,13 +1568,19 @@ impl KittyImageLayer {
     /// (`c`/`p`/`q`/`r`/`x`/`y`/`z`) stay follow-up work: they address
     /// screen geometry, not identity, so they cannot orphan through this
     /// mapping.
+    ///
+    /// S4 (#1849): virtual prototypes follow the terminal-truth `ImageId`
+    /// rule — an unpinned delete clears every prototype of the image on
+    /// `origin` (any prototype still serves runs otherwise), while a
+    /// pinned delete spares them and pin `0` clears nothing. The return
+    /// sums removed blit placements and prototypes.
     pub fn delete_by_wire(
         &mut self,
         origin: Option<u64>,
         image_id: u32,
         placement: Option<u32>,
     ) -> usize {
-        let before = self.placements.len();
+        let before = self.placements.len() + self.virtual_protos.len();
         match placement {
             Some(pinned) if pinned != 0 => {
                 self.placements.retain(|p| {
@@ -1258,15 +1593,19 @@ impl KittyImageLayer {
             None => {
                 self.placements
                     .retain(|p| !(p.origin == origin && p.wire_image == image_id));
+                self.virtual_protos
+                    .retain(|v| !(v.origin == origin && v.wire_image == image_id));
             }
         }
-        before - self.placements.len()
+        before - (self.placements.len() + self.virtual_protos.len())
     }
 
-    /// Clears all images and placements (alternate-screen entry).
+    /// Clears all images, placements, and virtual prototypes
+    /// (alternate-screen entry).
     pub fn clear(&mut self) {
         self.images.clear();
         self.placements.clear();
+        self.virtual_protos.clear();
         self.total_bytes = 0;
     }
 
@@ -2147,6 +2486,326 @@ mod tests {
         assert!(layer.placement_is_empty());
         // Stored images stay inert under the store caps.
         assert_eq!(layer.len(), 1);
+    }
+
+    #[test]
+    fn virtual_prototype_registers_and_resolves() {
+        // S4 (#1849): a bodiless `a=p,U=1` registers an origin-tagged
+        // prototype keyed by wire `i=`/`p=`; no blit placement exists.
+        let mut layer = KittyImageLayer::new();
+        layer
+            .register_virtual_for_origin(None, 42, 0, None, 4, 2, 0, 0, 0)
+            .expect("first prototype must register");
+        assert_eq!(layer.virtual_len(), 1);
+        assert_eq!(layer.virtual_count_for_origin(None), 1);
+        assert!(layer.placement_is_empty(), "prototypes never emit blits");
+        assert!(layer.placements_in_paint_order_for(None).is_empty());
+        let proto = layer.get_virtual(None, 42, None).expect("held");
+        assert_eq!(
+            *proto,
+            KittyVirtualPrototype {
+                origin: None,
+                wire_image: 42,
+                wire_placement: 0,
+                image: None,
+                cols: 4,
+                rows: 2,
+                image_width: 0,
+                image_height: 0,
+                scrollback_base: 0,
+            }
+        );
+        // Wire `p=0` is anonymous: the sizing view carries no placement.
+        assert_eq!(proto.as_unicode_virtual().placement_id, None);
+        // Other origins and images resolve to nothing.
+        assert!(layer.get_virtual(Some(7), 42, None).is_none());
+        assert!(layer.get_virtual(None, 43, None).is_none());
+        assert!(layer.get_virtual(None, 42, Some(0)).is_none());
+    }
+
+    #[test]
+    fn virtual_prototype_reput_replaces_addressed() {
+        // S4 (#1849): re-putting the same addressed `(origin, i, p)` key
+        // replaces in place (terminal-truth `upsert` parity); anonymous
+        // prototypes accumulate.
+        let mut layer = KittyImageLayer::new();
+        layer
+            .register_virtual_for_origin(None, 42, 9, None, 4, 2, 0, 0, 0)
+            .unwrap();
+        layer
+            .register_virtual_for_origin(None, 42, 9, None, 6, 3, 0, 0, 5)
+            .unwrap();
+        assert_eq!(layer.virtual_len(), 1, "addressed re-put replaces");
+        let proto = layer.get_virtual(None, 42, Some(9)).expect("replaced");
+        assert_eq!((proto.cols, proto.rows), (6, 3));
+        assert_eq!(proto.scrollback_base, 5);
+        layer
+            .register_virtual_for_origin(None, 42, 0, None, 4, 2, 0, 0, 0)
+            .unwrap();
+        layer
+            .register_virtual_for_origin(None, 42, 0, None, 4, 2, 0, 0, 0)
+            .unwrap();
+        assert_eq!(layer.virtual_len(), 3, "anonymous protos accumulate");
+    }
+
+    #[test]
+    fn virtual_prototype_per_origin_quota_evicts_own_oldest() {
+        // S4 (#1849): prototypes share the 32-per-origin placement quota;
+        // pressure evicts the origin's own oldest prototype first.
+        let mut layer = KittyImageLayer::new();
+        for i in 1..=KITTY_PER_ORIGIN_MAX_PLACEMENTS + 5 {
+            layer
+                .register_virtual_for_origin(None, 100 + i as u32, 0, None, 4, 2, 0, 0, 0)
+                .unwrap();
+        }
+        assert_eq!(layer.virtual_len(), KITTY_PER_ORIGIN_MAX_PLACEMENTS);
+        assert!(
+            layer.get_virtual(None, 101, None).is_none(),
+            "oldest own prototype evicted"
+        );
+        assert!(layer.get_virtual(None, 106, None).is_some());
+        // Another origin is untouched by the pressure.
+        layer
+            .register_virtual_for_origin(Some(7), 7, 0, None, 4, 2, 0, 0, 0)
+            .unwrap();
+        assert!(layer.get_virtual(Some(7), 7, None).is_some());
+    }
+
+    #[test]
+    fn virtual_prototype_global_pressure_refuses_without_evicting() {
+        // S4 (#1849): when the shared 128 global placement bound is held
+        // by other origins, admission refuses with `QuotaExceeded`
+        // instead of evicting a victim (S5 no-cross-origin-eviction).
+        let mut layer = KittyImageLayer::new();
+        for origin in 0..4u64 {
+            for i in 0..KITTY_PER_ORIGIN_MAX_PLACEMENTS {
+                layer
+                    .register_virtual_for_origin(
+                        Some(origin),
+                        1000 + (origin as u32) * 100 + i as u32,
+                        0,
+                        None,
+                        4,
+                        2,
+                        0,
+                        0,
+                        0,
+                    )
+                    .unwrap();
+            }
+        }
+        assert_eq!(layer.virtual_len(), KITTY_PLACE_MAX_ITEMS);
+        assert_eq!(
+            layer.register_virtual_for_origin(None, 42, 0, None, 4, 2, 0, 0, 0),
+            Err(KittyPlacementError::QuotaExceeded),
+            "over-cap prototype refused"
+        );
+        assert_eq!(layer.virtual_len(), KITTY_PLACE_MAX_ITEMS);
+    }
+
+    #[test]
+    fn virtual_prototypes_share_the_placement_budget() {
+        // S4 (#1849): prototypes consume the same 32-per-origin budget as
+        // blit placements; same-kind FIFO only, never cross-kind eviction.
+        let mut layer = KittyImageLayer::new();
+        let img = stored_red(&mut layer);
+        for _ in 0..KITTY_PER_ORIGIN_MAX_PLACEMENTS {
+            layer.display(img, 0, 0, 1, 1, METRICS, 0, 0).unwrap();
+        }
+        assert_eq!(
+            layer.register_virtual_for_origin(None, 42, 0, None, 4, 2, 0, 0, 0),
+            Err(KittyPlacementError::QuotaExceeded),
+            "blit-held budget refuses prototypes without evicting blits"
+        );
+        assert_eq!(layer.placement_len(), KITTY_PER_ORIGIN_MAX_PLACEMENTS);
+        let mut layer = KittyImageLayer::new();
+        for i in 1..=KITTY_PER_ORIGIN_MAX_PLACEMENTS as u32 {
+            layer
+                .register_virtual_for_origin(None, 500 + i, 0, None, 4, 2, 0, 0, 0)
+                .unwrap();
+        }
+        let img = stored_red(&mut layer);
+        assert_eq!(
+            layer.display(img, 0, 0, 1, 1, METRICS, 0, 0),
+            Err(KittyPlacementError::QuotaExceeded),
+            "proto-held budget refuses blits without evicting protos"
+        );
+        assert_eq!(layer.virtual_len(), KITTY_PER_ORIGIN_MAX_PLACEMENTS);
+    }
+
+    #[test]
+    fn virtual_prototype_delete_by_wire_mirrors_truth_selectors() {
+        // S4 (#1849): terminal truth kills prototypes only to unpinned id
+        // selectors (`placement.rs` ImageId arm); pinned deletes spare
+        // them, and pin `0` names nothing.
+        let mut layer = KittyImageLayer::new();
+        layer
+            .register_virtual_for_origin(None, 42, 0, None, 4, 2, 0, 0, 0)
+            .unwrap();
+        layer
+            .register_virtual_for_origin(None, 42, 9, None, 4, 2, 0, 0, 0)
+            .unwrap();
+        layer
+            .register_virtual_for_origin(Some(7), 42, 0, None, 4, 2, 0, 0, 0)
+            .unwrap();
+        assert_eq!(layer.delete_by_wire(None, 42, Some(9)), 0);
+        assert_eq!(layer.virtual_len(), 3, "pinned delete spares prototypes");
+        assert_eq!(layer.delete_by_wire(None, 42, Some(0)), 0);
+        assert_eq!(layer.delete_by_wire(None, 42, None), 2);
+        assert_eq!(layer.virtual_len(), 1, "unpinned clears origin protos");
+        assert!(layer.get_virtual(Some(7), 42, None).is_some());
+    }
+
+    #[test]
+    fn virtual_prototype_clear_scopes_match_truth() {
+        // S4 (#1849): `d=a`/alt-suppression (`clear_origin`) keeps
+        // prototypes like terminal-truth `AllVisible`; ED2/FullReset
+        // (`clear_virtual_for_origin`) drops them like `clear_screen`;
+        // pane teardown (`retire_origin`) and total `clear` drop them.
+        let mut layer = KittyImageLayer::new();
+        let img = stored_red(&mut layer);
+        layer.display(img, 0, 0, 1, 1, METRICS, 0, 0).unwrap();
+        layer
+            .register_virtual_for_origin(None, 42, 0, None, 4, 2, 0, 0, 0)
+            .unwrap();
+        layer.clear_origin(None);
+        assert!(layer.placement_is_empty(), "blits cleared");
+        assert_eq!(layer.virtual_len(), 1, "prototypes survive d=a/alt");
+        layer.clear_virtual_for_origin(None);
+        assert_eq!(layer.virtual_len(), 0, "ED2 clears prototypes");
+        assert_eq!(layer.len(), 1, "images stay inert");
+        layer
+            .register_virtual_for_origin(Some(7), 7, 0, None, 4, 2, 0, 0, 0)
+            .unwrap();
+        layer.retire_origin(Some(7));
+        assert!(layer.get_virtual(Some(7), 7, None).is_none());
+        layer
+            .register_virtual_for_origin(None, 9, 0, None, 4, 2, 0, 0, 0)
+            .unwrap();
+        layer.clear();
+        assert_eq!(layer.virtual_len(), 0);
+        assert!(layer.is_empty());
+    }
+
+    #[test]
+    fn virtual_prototype_dies_with_evicted_image() {
+        // S4 (#1849): a combined-form prototype links its stored image;
+        // store eviction and explicit removal cascade like blit
+        // placements. Bodiless prototypes (`None`) have no link.
+        let mut layer = KittyImageLayer::new();
+        let first = layer.store(2, 2, vec![1; 16], 16).unwrap();
+        layer
+            .register_virtual_for_origin(None, 42, 0, Some(first), 4, 2, 2, 2, 0)
+            .unwrap();
+        layer
+            .register_virtual_for_origin(None, 43, 0, None, 4, 2, 0, 0, 0)
+            .unwrap();
+        assert!(layer.remove(first));
+        assert!(
+            layer.get_virtual(None, 42, None).is_none(),
+            "linked prototype cascades"
+        );
+        assert!(
+            layer.get_virtual(None, 43, None).is_some(),
+            "bodiless prototype survives"
+        );
+        // Store-pressure eviction cascades the same way: filling the
+        // origin's image quota evicts the oldest image and its linked
+        // prototype, while the bodiless one survives.
+        let mut layer = KittyImageLayer::new();
+        let first = layer.store(2, 2, vec![1; 16], 16).unwrap();
+        layer
+            .register_virtual_for_origin(None, 42, 0, Some(first), 4, 2, 2, 2, 0)
+            .unwrap();
+        for _ in 0..KITTY_PER_ORIGIN_MAX_IMAGES {
+            layer.store(2, 2, vec![2; 16], 16).unwrap();
+        }
+        assert!(layer.get(first).is_none(), "oldest image evicted");
+        assert!(
+            layer.get_virtual(None, 42, None).is_none(),
+            "linked prototype cascades on store eviction"
+        );
+    }
+
+    #[test]
+    fn virtual_run_rect_links_runs_to_prototype() {
+        // S4 (#1849): the two-layer link resolves a grid run against the
+        // registered prototype; scroll follows the `scrollback_base`
+        // delta; mismatches and foreign origins resolve to nothing.
+        use bitty_term_state::{KittyUnicodeCell, KittyUnicodeId, KittyUnicodeRun};
+        let mut layer = KittyImageLayer::new();
+        layer
+            .register_virtual_for_origin(None, 42, 0, None, 4, 2, 32, 32, 100)
+            .unwrap();
+        let cells = vec![
+            KittyUnicodeCell {
+                grid_row: 10,
+                grid_col: 3,
+                id: KittyUnicodeId {
+                    image_id: 42,
+                    placement_id: None,
+                    row: 0,
+                    col: 0,
+                },
+            },
+            KittyUnicodeCell {
+                grid_row: 10,
+                grid_col: 4,
+                id: KittyUnicodeId {
+                    image_id: 42,
+                    placement_id: None,
+                    row: 0,
+                    col: 1,
+                },
+            },
+        ];
+        let run = KittyUnicodeRun {
+            image_id: 42,
+            placement_id: None,
+            row: 0,
+            col: 0,
+            grid_row: 10,
+            grid_col: 3,
+            width: 2,
+        };
+        let rect = layer
+            .virtual_run_rect(None, &run, &cells, METRICS, 100)
+            .expect("run resolves against the prototype");
+        assert_eq!((rect.grid_row, rect.grid_col), (10, 3));
+        assert_eq!((rect.cols, rect.rows), (2, 1));
+        assert_eq!(rect.rect, RectPx::new(3 * 8, 10 * 16, 2 * 8, 16));
+        // Scroll delta: three lines scrolled moves the rect up three rows.
+        let scrolled = layer
+            .virtual_run_rect(None, &run, &cells, METRICS, 103)
+            .expect("scrolled rect");
+        assert_eq!(scrolled.rect.y, (10 - 3) * 16);
+        // Scrolled fully off the top paints nothing.
+        assert!(
+            layer
+                .virtual_run_rect(None, &run, &cells, METRICS, 112)
+                .is_none()
+        );
+        // A run naming another image resolves to nothing.
+        let other = KittyUnicodeRun {
+            image_id: 43,
+            ..run
+        };
+        assert!(
+            layer
+                .virtual_run_rect(None, &other, &cells, METRICS, 100)
+                .is_none()
+        );
+        // Prototypes are origin-scoped: a foreign origin resolves nothing.
+        assert!(
+            layer
+                .virtual_run_rect(Some(7), &run, &cells, METRICS, 100)
+                .is_none()
+        );
+        assert!(
+            layer
+                .virtual_run_rect(None, &run, &[], METRICS, 100)
+                .is_none()
+        );
     }
 
     #[test]

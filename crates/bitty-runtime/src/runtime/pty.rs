@@ -925,6 +925,29 @@ impl Runtime {
                 // downstream; placement removal is identical either way.
                 let mut clear_all_visible = false;
                 let mut delete_wire: Option<(u32, Option<u32>)> = None;
+                // S4 (#1849): bodiless `a=p,U=1` additionally registers a
+                // virtual prototype in the rich registry (no pixels:
+                // explicit spans only). Copied out before the state apply
+                // below; the registry registers after truth records.
+                let register_bodiless_virtual: Option<(u16, u16, u32, u32, bool)> =
+                    if let TerminalAction::KittyGraphics {
+                        action_a: Some('p'),
+                        cols_c,
+                        rows_r,
+                        control,
+                        ..
+                    } = &action
+                    {
+                        control.is_virtual_placement().then_some((
+                            *cols_c,
+                            *rows_r,
+                            control.image_id,
+                            control.placement_id,
+                            control.has_parent(),
+                        ))
+                    } else {
+                        None
+                    };
                 if let TerminalAction::KittyGraphics {
                     action_a: Some('d'),
                     control,
@@ -981,7 +1004,29 @@ impl Runtime {
                         self.pending_full_redraw = true;
                     }
                 } else if let Some((image, pin)) = delete_wire {
+                    // S4 (#1849): identity deletes clear both layers — the
+                    // rich registry (blits plus prototypes, via the
+                    // extended `delete_by_wire`) and the named grid runs.
                     self.kitty_delete_rendered_image(image, pin);
+                    self.kitty_unicode_delete(image, pin);
+                }
+                // S4 (#1849): mirror the terminal-truth prototype into the
+                // rich registry. Registration mirrors headless admission
+                // (`State::kitty_place`): virtual children of a parent and
+                // spanless prototypes are refused there, so only
+                // admittable prototypes register here; the alternate
+                // screen suppresses rich registration while terminal truth
+                // keeps its own on-alt scoping. Quota refusals fail closed
+                // and silent (this branch never warns).
+                if let Some((cols, rows, image, placement, has_parent)) = register_bodiless_virtual
+                {
+                    if !has_parent && (cols != 0 || rows != 0) && !self.state.alt_screen_active() {
+                        let base = self.state.scrollback_len();
+                        let origin = self.kitty_origin;
+                        let _ = self.kitty_images.register_virtual_for_origin(
+                            origin, image, placement, None, cols, rows, 0, 0, base,
+                        );
+                    }
                 }
                 continue;
             }
@@ -1011,6 +1056,35 @@ impl Runtime {
                 // the action is moved, so continue to the next one.
                 continue;
             }
+            // S4 (#1849): combined `a=T,U=1` (or absent action with
+            // `U=1`) plus payload transmits and registers a virtual
+            // prototype with one command. Terminal truth records first
+            // (prototype plus `I=` number mapping; refusals count
+            // telemetry there — the action borrows, so this runs before
+            // the owned destructure below), then the owned seam decodes,
+            // stores, and registers — skipping blit placement and cursor
+            // advance, so the image paints via grid runs and never
+            // double-paints as a blit. A decode/store failure after truth
+            // recorded leaves a dangling truth prototype (fail-closed:
+            // runs resolve to text, queries answer `ENOENT`), the same
+            // class as a bodiless registration.
+            let is_virtual_combined = matches!(
+                &action,
+                TerminalAction::KittyGraphics {
+                    action_a: None | Some('T'),
+                    control,
+                    ..
+                } if control.is_virtual_placement()
+            );
+            if is_virtual_combined {
+                let damage = self.state.apply(&action);
+                if !damage.regions.is_empty() {
+                    let generation = damage.generation;
+                    self.cold_queue.push(ColdEvent::Damage { generation });
+                    self.plugin_host
+                        .push_observation(HostObservation::Damage { generation });
+                }
+            }
             if let TerminalAction::KittyGraphics {
                 format_f,
                 width_s,
@@ -1023,6 +1097,30 @@ impl Runtime {
                 control,
             } = action
             {
+                if is_virtual_combined {
+                    if let Err(err) = self.kitty_display_virtual_owned_with_wire(
+                        format_f,
+                        width_s,
+                        height_v,
+                        cols_c,
+                        rows_r,
+                        payload,
+                        control.image_id,
+                        control.placement_id,
+                        control.has_parent(),
+                    ) {
+                        // Same rate-limited rejection posture as the pixel
+                        // path below: a hostile child can spam refused
+                        // virtual payloads.
+                        if let Some(suppressed) = self.kitty_log.admit_now() {
+                            eprintln!(
+                                "bitty: rejecting kitty virtual image ({err}): stored nothing{}",
+                                log_throttle::suppressed_suffix(suppressed)
+                            );
+                        }
+                    }
+                    continue;
+                }
                 let wire_image = control.image_id;
                 let wire_placement = control.placement_id;
                 if let Err(err) = self.kitty_display_image_owned_with_wire(
@@ -1124,6 +1222,11 @@ impl Runtime {
                 // placements is the Core-retained half (no cached blits to
                 // drop in Core anymore).
                 self.kitty_images.clear_origin(self.kitty_origin);
+                // S4 (#1849): full clears drop virtual prototypes too
+                // (terminal-truth `clear_screen` parity; grid runs die in
+                // the erase above).
+                self.kitty_images
+                    .clear_virtual_for_origin(self.kitty_origin);
             }
 
             // CTX-0146 (Issue #238): answer standard terminal queries with

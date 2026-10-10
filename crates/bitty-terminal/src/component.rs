@@ -1137,8 +1137,14 @@ fn read_tofu_pin(user: &Path, name: &str) -> Result<Option<String>, ComponentFai
             )));
         }
     }
-    match std::fs::read_to_string(&path) {
-        Ok(text) => {
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let Ok(text) = String::from_utf8(bytes) else {
+                return Err(ComponentFailure::component(format!(
+                    "bitty component: pin-mismatch for '{name}': pin file '{}' is not UTF-8 (corrupt pin; use --force to re-pin)",
+                    path.display()
+                )));
+            };
             let digest = text.trim().to_ascii_lowercase();
             if !crate::component_seed::is_hex_digest(&digest) {
                 return Err(ComponentFailure::component(format!(
@@ -3241,15 +3247,18 @@ mod tests {
         if crate::component_seed::host_target_triple().is_none() {
             return;
         }
-        for tag in ["invalid-hex", "oversize"] {
+        for tag in ["invalid-hex", "oversize", "non-utf8"] {
             let base = scratch(&format!("install-corrupt-pin-{tag}"));
             let user = base.join("user");
             std::fs::create_dir_all(user.join("net")).expect("component dir");
-            // Plant a corrupt pin: non-hex text or an oversize blob.
-            let corrupt = if tag == "oversize" {
-                "x".repeat(200)
+            // Plant a corrupt pin: non-hex text, an oversize blob, or
+            // non-UTF-8 bytes (torn write / disk corruption).
+            let corrupt: Vec<u8> = if tag == "oversize" {
+                vec![b'x'; 200]
+            } else if tag == "non-utf8" {
+                vec![0xff, 0xfe, 0x00, 0x62]
             } else {
-                "not-a-hex-pin".to_string()
+                b"not-a-hex-pin".to_vec()
             };
             std::fs::write(user.join("net").join(TARBALL_PIN_FILE), &corrupt).expect("corrupt pin");
             let target = "x86_64-unknown-linux-gnu";

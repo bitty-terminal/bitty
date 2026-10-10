@@ -140,6 +140,7 @@ fn parity_namespaces_present_with_accepted_spellings() {
             assert(type(bitty.panel.get_presentation) == "function")
             assert(type(bitty.panel.set_presentation) == "function")
             assert(type(bitty.panel.toggle_floating) == "function")
+            assert(type(bitty.panel.set_pinned) == "function")
             assert(type(bitty.panel.get_state) == "function")
         "#,
         )

@@ -70,7 +70,10 @@
 //!   last-used, `alt+1..=9` jump to workspace N,
 //!   `shift+alt+1..=9` move focused window to workspace N),
 //!   `toggle_floating` (alias `floating_toggle`; CTX-0962 / #1695: focused
-//!   panel tiled/floating toggle, default `alt+a`, `global` only).
+//!   panel tiled/floating toggle, default `alt+a`, `global` only),
+//!   `toggle_pinned` (alias `pinned_toggle`; CTX-1083 follow-up to CTX-1077
+//!   #1757: focused panel pinned/sticky-float toggle, manual bind only,
+//!   never in defaults).
 //!   W-144 (CTX-0937): the search/copy-mode policy actions retired with
 //!   the Core policy; their namespace moves to W-138 with the plugins
 //!   (CTX-0003), so the retired spellings fail closed as unknown here.
@@ -838,6 +841,22 @@ pub enum ChromeAction {
     /// Super flip rebinds it to `super+a`. User-overridable via an explicit
     /// `keymaps` entry with the same `context + chord` identity.
     ToggleFloating,
+    /// Toggle the focused panel's pinned (sticky-float) state
+    /// (`toggle_pinned`, alias `pinned_toggle`; CTX-1083 follow-up to
+    /// CTX-1077 issue #1757).
+    ///
+    /// Present-path verb over the window-global pinned store: the app
+    /// resolves the focused view and routes it through the
+    /// `bitty.workspace:pin-toggle` primitive (`Runtime::apply_pin_command`
+    /// into `toggle_pinned`). Pinning detaches a tiled or floating leaf so
+    /// it presents over every workspace; toggling again returns the still
+    /// floating panel to the active workspace. Fail-closed with a loud
+    /// warning and no state change when nothing is focused, the id is
+    /// unknown, the mode is not pinnable, or the pin would strand a
+    /// single-leaf layout. Manual bind only, never in [`DEFAULT_KEYMAPS`]
+    /// (same byte-identical discipline as [`Self::TogglePalette`]); the user
+    /// opts in with e.g. `{ chord = "alt+p", action = "toggle_pinned" }`.
+    TogglePinned,
     /// Invoke one registered plugin command (`command:<owner:command>`,
     /// alias `invoke_command:<owner:command>`; CTX-1035 issue #1829).
     ///
@@ -1030,6 +1049,10 @@ impl ChromeAction {
                 reject_arg(arg, trimmed)?;
                 Ok(Self::ToggleFloating)
             }
+            "toggle_pinned" | "pinned_toggle" => {
+                reject_arg(arg, trimmed)?;
+                Ok(Self::TogglePinned)
+            }
             "command" | "invoke_command" | "run_command" => {
                 let target = require_invoke_command(arg, trimmed)?;
                 Ok(Self::InvokeCommand(target))
@@ -1079,6 +1102,7 @@ impl ChromeAction {
             Self::SelectCommandOutput => "select_command_output".to_string(),
             Self::TogglePalette => "toggle_palette".to_string(),
             Self::ToggleFloating => "toggle_floating".to_string(),
+            Self::TogglePinned => "toggle_pinned".to_string(),
             Self::InvokeCommand(qualified) => format!("command:{qualified}"),
         }
     }
@@ -1089,7 +1113,7 @@ impl ChromeAction {
 /// W-144 (CTX-0937): the search/copy-mode policy actions retired with the
 /// Core policy; their namespace moves to W-138 with the plugins (CTX-0003),
 /// so the retired spellings fail closed as unknown here.
-const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, new_panel, resize_split:<left|right|up|down>, close_view, toggle_zoom, toggle_help, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, fold_toggle, fold_expand, fold_collapse, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_focus:<1..=16>, workspace_move:<1..=16>, workspace_swap:<1..=16>, jump_to_prompt:<prev|next>, select_command_output, toggle_palette, toggle_floating, command:<owner:command>";
+const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, new_panel, resize_split:<left|right|up|down>, close_view, toggle_zoom, toggle_help, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, fold_toggle, fold_expand, fold_collapse, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_focus:<1..=16>, workspace_move:<1..=16>, workspace_swap:<1..=16>, jump_to_prompt:<prev|next>, select_command_output, toggle_palette, toggle_floating, toggle_pinned, command:<owner:command>";
 
 /// Require a `<head>:<dir>` argument.
 fn require_dir_arg(arg: Option<&str>, raw: &str) -> Result<SplitDir, ConfigError> {
@@ -3766,6 +3790,42 @@ mod tests {
             match_keymap(&maps, key_ref(KeyName::Char('a'), false, true, false)),
             Some(ChromeAction::ToggleFloating),
             "default survives an unrelated append"
+        );
+    }
+
+    #[test]
+    fn pinned_toggle_parses_canonicalizes_and_stays_manual_bind_only() {
+        // CTX-1083 (follow-up to CTX-1077 #1757): the pinned-toggle action
+        // parses (primary plus primitive-order alias), canonicalizes to the
+        // primary spelling, ships on no default chord (manual bind only, so
+        // Normal Mode stays byte-identical), and binds by explicit chord.
+        assert_eq!(
+            ChromeAction::parse("toggle_pinned").expect("parses"),
+            ChromeAction::TogglePinned
+        );
+        assert_eq!(
+            ChromeAction::parse("pinned_toggle").expect("alias parses"),
+            ChromeAction::TogglePinned
+        );
+        assert_eq!(ChromeAction::TogglePinned.canonical(), "toggle_pinned");
+        let maps = default_keymaps().expect("defaults valid");
+        assert!(
+            !maps.iter().any(|m| m.action == ChromeAction::TogglePinned),
+            "toggle_pinned ships unbound"
+        );
+        let rebound = EffectiveConfig {
+            keymaps: vec![KeymapEntry {
+                chord: "alt+p".into(),
+                action: "toggle_pinned".into(),
+                context: "global".into(),
+            }],
+            ..Default::default()
+        };
+        let maps = resolve_keymaps(&rebound).expect("resolves");
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('p'), false, true, false)),
+            Some(ChromeAction::TogglePinned),
+            "toggle_pinned binds by explicit chord"
         );
     }
 

@@ -1659,6 +1659,19 @@ pub trait HostServices {
         Err(BridgeError::capability_denied("panel.focus"))
     }
 
+    /// Set the pinned (sticky-float) state for `bitty.panel.set_pinned`
+    /// (CTX-1083 follow-up to CTX-1077, issue #1757).
+    ///
+    /// Grant-gated on `panel.focus`; returns whether the requested state now
+    /// holds (`true` covers both an applied transition and an idempotent
+    /// no-op that was already in the desired state). `false` is the
+    /// fail-closed answer for an unknown or unpinnable target: state is
+    /// untouched, never a panic. The default denies.
+    fn panel_set_pinned(&self, panel_id: u64, pinned: bool) -> Result<bool, BridgeError> {
+        let _ = (panel_id, pinned);
+        Err(BridgeError::capability_denied("panel.focus"))
+    }
+
     /// Get panel state for `bitty.panel.get_state` (CTX-0915).
     ///
     /// Grant-gated on `panel.focus`; returns a table with panel state fields
@@ -4168,6 +4181,46 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
             }),
         )
         .expect("panel table accepts 'toggle_floating'");
+    panel
+        .set(
+            ctx,
+            "set_pinned",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let panel_id = match stack.get(0) {
+                        Value::Integer(id) => id as u64,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_DEF_INVALID",
+                                "panel.set_pinned id must be an integer",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let pinned = match stack.get(1) {
+                        Value::Boolean(pinned) => pinned,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_DEF_INVALID",
+                                "panel.set_pinned pinned must be a boolean",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let applied = state
+                        .bounded_mutation(|_expiry| {
+                            state.services.panel_set_pinned(panel_id, pinned)
+                        })
+                        .map_err(|e| e.to_error(ctx))?;
+                    stack.replace(ctx, Value::Boolean(applied));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("panel table accepts 'set_pinned'");
     panel
         .set(
             ctx,

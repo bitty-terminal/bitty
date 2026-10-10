@@ -439,6 +439,29 @@ impl Runtime {
         }
     }
 
+    /// Apply the `bitty.workspace:pin-toggle` workspace command string to
+    /// the window-global pinned store (CTX-1083 follow-up to CTX-1077).
+    ///
+    /// String-dispatch twin of [`Self::toggle_pinned`] for the keymap
+    /// (`toggle_pinned` chrome action) and Lua (`bitty.panel.set_pinned`
+    /// backend) paths, mirroring the [`bitty_ui::pinned::apply_pin_toggle`]
+    /// command-registry shape but with the runtime post-edit fixups (focus
+    /// moves off the pinned leaf, primary-grid ownership follows). Only
+    /// [`bitty_ui::PIN_CMD_TOGGLE`] is accepted; anything else fails with an
+    /// unknown-command error and touches no state. Otherwise delegates to
+    /// [`Self::toggle_pinned`], so the same fail-closed rules apply
+    /// (missing target, unknown id, unsupported mode, stranded layout).
+    pub fn apply_pin_command(
+        &mut self,
+        command: &str,
+        target: Option<ViewId>,
+    ) -> Result<Option<ViewId>, String> {
+        if command != bitty_ui::PIN_CMD_TOGGLE {
+            return Err(format!("unknown pin command: {command}"));
+        }
+        self.toggle_pinned(target)
+    }
+
     /// Number of pinned floating panels in the window-global store.
     #[must_use]
     pub fn pinned_count(&self) -> usize {

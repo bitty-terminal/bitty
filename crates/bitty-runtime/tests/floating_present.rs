@@ -11,7 +11,8 @@
 
 use bitty_platform::{CursorPosition, MouseButton, NamedKey, PressState};
 use bitty_runtime::{
-    LayoutNode, OverlayTier, PresentFrame, Runtime, RuntimeConfig, SplitAxis, UiRect, View, ViewId,
+    LayoutNode, OverlayTier, PresentFrame, PresentationMode, Runtime, RuntimeConfig, SplitAxis,
+    UiRect, View, ViewId,
 };
 
 fn make_runtime() -> Runtime {
@@ -305,4 +306,98 @@ fn alt_drag_grabs_mode_floating_leaf() {
         "the release re-parents nothing"
     );
     rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
+}
+
+#[test]
+fn focused_single_leaf_toggle_flips_tier_and_geometry() {
+    // CTX-1058 (#1844 P3): the spec toggle flips Some(Float) to None and
+    // back on one focused leaf. Pure present-level assertion (no session
+    // I/O): tier None -> Float -> None with anchored float geometry
+    // replacing the solver allocation and back, focus pinned throughout.
+    let mut rt = make_runtime();
+    let id = ViewId::new(1);
+    rt.set_layout(LayoutNode::leaf(View::new(id, 80, 24)));
+    rt.set_container(UiRect::new(0, 0, 80, 24));
+    assert_eq!(rt.focused_view(), Some(id), "the single leaf is focused");
+    let tiled = frame_of(&rt, id);
+    assert_eq!(tiled.tier, None);
+    let tiled_allocations = rt.layout_allocations();
+
+    toggle(&mut rt, id);
+    assert_eq!(
+        rt.focused_view(),
+        Some(id),
+        "toggle keeps focus on the leaf"
+    );
+    let floated = frame_of(&rt, id);
+    assert_eq!(floated.tier, Some(OverlayTier::Float));
+    assert_ne!(floated.frame, tiled.frame);
+    assert_ne!(floated.content, tiled.content);
+    assert_eq!(
+        floated.border,
+        tiled
+            .border
+            .saturating_add(bitty_ui::presentation::FLOAT_BORDER_EXTRA)
+    );
+    assert_eq!(rt.layout_allocations(), tiled_allocations);
+
+    toggle(&mut rt, id);
+    assert_eq!(rt.focused_view(), Some(id), "toggle back keeps focus");
+    let restored = frame_of(&rt, id);
+    assert_eq!(restored.tier, None);
+    assert_eq!(restored.frame, tiled.frame);
+    assert_eq!(restored.content, tiled.content);
+    assert_eq!(restored.border, tiled.border);
+    assert_eq!(rt.layout_allocations(), tiled_allocations);
+}
+
+#[test]
+fn floating_mode_survives_session_round_trip_with_recomputed_geometry() {
+    // CTX-1058 (#1844 P3): PresentationMode stamps are session truth
+    // (PaneSnapshot.mode plus the LayoutNode leaf stamp via strip_overlays
+    // in bitty-runtime/src/runtime/session.rs), while float geometry is
+    // recomputed at present time via float_frame — no stale rects persist.
+    // In-memory capture/apply round-trip (no file I/O, no backend).
+    let mut rt = make_runtime();
+    install(&mut rt, two_pane());
+    toggle(&mut rt, ViewId::new(1));
+    let fresh = frame_of(&rt, ViewId::new(1));
+    assert_eq!(fresh.tier, Some(OverlayTier::Float));
+
+    let snap = rt.capture_session_snapshot();
+    let pane_mode = snap
+        .workspaces
+        .iter()
+        .flat_map(|ws| ws.panes.iter())
+        .find(|pane| pane.view == ViewId::new(1))
+        .expect("leaf 1 pane persists")
+        .mode;
+    assert_eq!(pane_mode, PresentationMode::Floating);
+    let tree_mode = snap
+        .workspaces
+        .iter()
+        .find_map(|ws| ws.layout.find_leaf(ViewId::new(1)))
+        .expect("leaf 1 survives capture")
+        .presentation();
+    assert_eq!(tree_mode, PresentationMode::Floating);
+
+    let mut restored = make_runtime();
+    restored.set_container(UiRect::new(0, 0, 80, 24));
+    restored
+        .apply_session_snapshot(&snap)
+        .expect("captured snapshot applies");
+    assert_eq!(
+        restored
+            .layout()
+            .find_leaf(ViewId::new(1))
+            .expect("leaf restores")
+            .presentation(),
+        PresentationMode::Floating,
+        "the mode stamp survives save/load"
+    );
+    let back = frame_of(&restored, ViewId::new(1));
+    assert_eq!(back.tier, Some(OverlayTier::Float));
+    assert_eq!(back.frame, fresh.frame, "geometry recomputes identically");
+    assert_eq!(back.content, fresh.content);
+    assert_eq!(back.border, fresh.border);
 }

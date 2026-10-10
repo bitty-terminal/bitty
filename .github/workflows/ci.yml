@@ -822,13 +822,12 @@ jobs:
 
       # CTX-1061 (#1861): macOS live leg for the bootstrap installers. Same
       # fixture test as the quality job: latest.txt pointer fetch plus real
-      # download, sidecar verify, extract/install against a file:// fake-CDN
+      # download, sidecar verify, and install against a file:// fake-CDN
       # (no external network). Running it here proves the script under the
-      # macOS host shell (shasum fallback, Darwin auto-detect leg).
+      # macOS host shell (shasum fallback, Darwin auto-detect leg); the
+      # Linux bundle legs skip here by design (GNU tar -I) and run on Linux.
       - name: Check install scripts live legs (fake-CDN fixture test)
-        run: |
-          command -v zstd >/dev/null 2>&1 || brew install zstd
-          bash scripts/tests/install-scripts.test.sh
+        run: bash scripts/tests/install-scripts.test.sh
 
       # CTX-0847: the previous `--all-targets` run also executed the bitty-perf
       # benches; nextest runs none of them, so that coverage is kept

@@ -284,14 +284,16 @@ elif ! grep -qF -- 'checksum mismatch' <<<"$corrupt_mac_out"; then
 fi
 
 # 9d. Linux bundle fixture (minimal TOPDIR/bin/bitty + share file).
+# Linux-only: install.sh extracts with GNU tar -I zstd, which macOS bsdtar
+# rejects (its -I is an inclusion pattern), and production never extracts
+# bundles on macOS (it installs bare binaries). The macOS legs above plus
+# the native Darwin leg cover that runner; quality covers this leg on Linux.
 HAVE_BUNDLE=0
-if ! command -v tar >/dev/null 2>&1 || ! command -v zstd >/dev/null 2>&1; then
-  if [[ "$(uname -s)" == "Linux" ]]; then
-    echo "FAIL: live Linux bundle legs need tar and zstd" >&2
-    FAIL=1
-  else
-    echo "SKIP: live Linux bundle legs need tar and zstd" >&2
-  fi
+if [[ "$(uname -s)" != "Linux" ]]; then
+  echo "SKIP: live Linux bundle legs run on Linux hosts only" >&2
+elif ! command -v tar >/dev/null 2>&1 || ! command -v zstd >/dev/null 2>&1; then
+  echo "FAIL: live Linux bundle legs need tar and zstd" >&2
+  FAIL=1
 else
   BUNDLE_TOP="bitty-$FAKE_VER-x86_64-unknown-linux-gnu"
   BUNDLE_STAGE="$TMP/bundle-stage"

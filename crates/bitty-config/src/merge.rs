@@ -81,6 +81,10 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "window.opacity"
         | "window.padding"
         | "window.radius_px"
+        | "window.background_image"
+        | "window.background_fit"
+        | "window.background_opacity"
+        | "window.background_position"
         | "terminal.scrollback"
         | "terminal.shell"
         | "terminal.scroll_lines_per_notch"
@@ -603,6 +607,10 @@ const ATTRIBUTED_FIELDS: &[&str] = &[
     "window.opacity",
     "window.padding",
     "window.radius_px",
+    "window.background_image",
+    "window.background_fit",
+    "window.background_opacity",
+    "window.background_position",
     "window",
     "terminal.scrollback",
     "terminal.shell",
@@ -1003,6 +1011,51 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
                     MergeClass::ScalarReplace,
                 );
             }
+            // CTX-1076 (issue #1815): window background leaves follow the
+            // same "unset says nothing" scalar-replace rule as the decoration
+            // background pair; absent keys never shadow a lower layer.
+            let mut window_acc = MergeAccumulators {
+                policy_fields: &mut policy_fields,
+                attribution: &mut attribution,
+                conflicts: &mut conflicts,
+                policy_violations: &mut policy_violations,
+            };
+            merge_view_leaf(
+                win.background_image.as_ref(),
+                &mut effective.window.background_image,
+                "window",
+                "background_image",
+                src,
+                is_policy,
+                &mut window_acc,
+            );
+            merge_view_leaf(
+                win.background_fit.as_ref(),
+                &mut effective.window.background_fit,
+                "window",
+                "background_fit",
+                src,
+                is_policy,
+                &mut window_acc,
+            );
+            merge_view_leaf(
+                win.background_opacity.as_ref(),
+                &mut effective.window.background_opacity,
+                "window",
+                "background_opacity",
+                src,
+                is_policy,
+                &mut window_acc,
+            );
+            merge_view_leaf(
+                win.background_position.as_ref(),
+                &mut effective.window.background_position,
+                "window",
+                "background_position",
+                src,
+                is_policy,
+                &mut window_acc,
+            );
             attribution.insert("window".to_string(), src.clone());
         }
 
@@ -2518,6 +2571,51 @@ fn merge_layers_allow_policy_violations(
                     MergeClass::ScalarReplace,
                 );
             }
+            // CTX-1076 (issue #1815): window background leaves follow the
+            // same "unset says nothing" scalar-replace rule as the decoration
+            // background pair; absent keys never shadow a lower layer.
+            let mut window_acc = MergeAccumulators {
+                policy_fields: &mut policy_fields,
+                attribution: &mut attribution,
+                conflicts: &mut conflicts,
+                policy_violations: &mut policy_violations,
+            };
+            merge_view_leaf(
+                win.background_image.as_ref(),
+                &mut effective.window.background_image,
+                "window",
+                "background_image",
+                src,
+                is_policy,
+                &mut window_acc,
+            );
+            merge_view_leaf(
+                win.background_fit.as_ref(),
+                &mut effective.window.background_fit,
+                "window",
+                "background_fit",
+                src,
+                is_policy,
+                &mut window_acc,
+            );
+            merge_view_leaf(
+                win.background_opacity.as_ref(),
+                &mut effective.window.background_opacity,
+                "window",
+                "background_opacity",
+                src,
+                is_policy,
+                &mut window_acc,
+            );
+            merge_view_leaf(
+                win.background_position.as_ref(),
+                &mut effective.window.background_position,
+                "window",
+                "background_position",
+                src,
+                is_policy,
+                &mut window_acc,
+            );
             attribution.insert("window".to_string(), src.clone());
         }
         if let Some(term) = &plan.terminal {
@@ -5573,6 +5671,7 @@ mod tests {
                     padding: 8,
                     radius_px: 12,
                     blur_radius: 0,
+                    ..Default::default()
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -5592,6 +5691,7 @@ mod tests {
                     padding: 8,
                     radius_px: 6,
                     blur_radius: 0,
+                    ..Default::default()
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -5605,6 +5705,7 @@ mod tests {
                     padding: 8,
                     radius_px: 12,
                     blur_radius: 0,
+                    ..Default::default()
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -5626,6 +5727,105 @@ mod tests {
         assert_eq!(merged3.effective.window.radius_px, 0);
         assert_eq!(
             merged3.source_of("window.radius_px").unwrap().layer,
+            LayerKind::CoreDefaults
+        );
+    }
+
+    #[test]
+    fn window_background_merges_says_nothing_with_attribution() {
+        // CTX-1076 (issue #1815): window background leaves are scalar-replace
+        // with "unset says nothing" semantics; absent keys never shadow a
+        // lower layer, and empty stacks keep no image with core-defaults
+        // source.
+        use crate::types::{BackgroundFit, BackgroundPosition};
+        let user = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                window: Some(WindowConfig {
+                    opacity: 1.0,
+                    padding: 8,
+                    radius_px: 0,
+                    blur_radius: 0,
+                    background_image: Some("/wall/one.png".to_string()),
+                    background_fit: Some(BackgroundFit::Tile),
+                    background_opacity: Some(0.5),
+                    background_position: Some(BackgroundPosition::TopLeft),
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged = merge_layers(vec![user]).expect("merge");
+        assert_eq!(
+            merged.effective.window.background_image.as_deref(),
+            Some("/wall/one.png")
+        );
+        assert_eq!(
+            merged.effective.window.background_fit,
+            Some(BackgroundFit::Tile)
+        );
+        assert_eq!(
+            merged.source_of("window.background_image").unwrap().layer,
+            LayerKind::User
+        );
+        // Higher layer setting only fit leaves the inherited image in place.
+        let cli = LayeredPlan::new(
+            ConfigSource::new(LayerKind::Cli, Some("cli")),
+            ConfigPlan {
+                window: Some(WindowConfig {
+                    opacity: 1.0,
+                    padding: 8,
+                    radius_px: 0,
+                    blur_radius: 0,
+                    background_image: None,
+                    background_fit: Some(BackgroundFit::Fit),
+                    background_opacity: None,
+                    background_position: None,
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let user2 = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                window: Some(WindowConfig {
+                    opacity: 1.0,
+                    padding: 8,
+                    radius_px: 0,
+                    blur_radius: 0,
+                    background_image: Some("/wall/one.png".to_string()),
+                    background_fit: Some(BackgroundFit::Tile),
+                    background_opacity: Some(0.5),
+                    background_position: Some(BackgroundPosition::TopLeft),
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged2 = merge_layers(vec![user2, cli]).expect("merge");
+        assert_eq!(
+            merged2.effective.window.background_image.as_deref(),
+            Some("/wall/one.png"),
+            "absent image says nothing"
+        );
+        assert_eq!(
+            merged2.effective.window.background_fit,
+            Some(BackgroundFit::Fit),
+            "present fit wins"
+        );
+        assert_eq!(
+            merged2.source_of("window.background_fit").unwrap().layer,
+            LayerKind::Cli
+        );
+        assert_eq!(
+            merged2.source_of("window.background_image").unwrap().layer,
+            LayerKind::User
+        );
+        let merged3 = merge_layers(vec![]).expect("empty layers merge");
+        assert_eq!(merged3.effective.window.background_image, None);
+        assert_eq!(
+            merged3.source_of("window.background_image").unwrap().layer,
             LayerKind::CoreDefaults
         );
     }

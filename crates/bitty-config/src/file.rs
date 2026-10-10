@@ -30,6 +30,20 @@
 //!     -- font = { family = "JetBrainsMono Nerd Font", size = 12.0,
 //!     --          line_height = 1.375, letter_spacing = 2.0 },
 //!     window = { opacity = 0.95, padding = 8 },
+//!     -- Optional window background image behind the grid (CTX-1076, #1815):
+//!     -- window = { opacity = 0.95, padding = 8,
+//!     --            background_image = "/abs/wall.png",
+//!     --            background_fit = "fill", background_opacity = 1.0,
+//!     --            background_position = "center" },
+//!     -- `background_fit` is one of fill (cover) | fit (contain) | center |
+//!     -- tile | stretch (default fill); `background_opacity` dims the image
+//!     -- 0.0..=1.0 (default 1.0, orthogonal to window.opacity);
+//!     -- `background_position` is center (default) | top-left | top |
+//!     -- top-right | left | right | bottom-left | bottom | bottom-right
+//!     -- (observed only by fit/center letterbox). The image must live
+//!     -- under `decoration.background_image_roots` (deny-by-default) and
+//!     -- missing/unreadable files fail closed. Blur stays a no-op stub
+//!     -- (OQ-038): never parsed, always 0.
 //!     terminal = { scrollback = 10000, shell = "/bin/fish", scroll_lines_per_notch = 3, scroll_pixels_per_notch = 16, cursor_style = "steady_bar", bell = "visual" },
 //!     selection = { auto_copy = true }, -- opt in to copy-on-select; false (default) matches kitty/ghostty (CTX-0371)
 //!     layout = { gaps_in = 1, gaps_out = 2, resize_step = 0.05 }, -- Hyprland-like panel gaps in cells, 0 = edge-to-edge (CTX-0177, default 0/0) + tiled resize step as split-ratio delta per keypress, 0.01..=0.20 (CTX-0963, default 0.05)
@@ -114,7 +128,11 @@
 //! - `window` needs both `opacity` and `padding` (`radius_px` optional,
 //!   defaulting to [`crate::types::DEFAULT_WINDOW_RADIUS_PX`] (`0`, square
 //!   no-op, CTX-0241 S0) when omitted, so existing `{ opacity, padding }`
-//!   tables keep working), `terminal` needs
+//!   tables keep working; CTX-1076 `background_image`/`background_fit`/
+//!   `background_opacity`/`background_position` are optional extras with the
+//!   same absent-means-silent contract — omitted keys keep the lower-layer
+//!   value, present values validate fail-closed with the field path),
+//!   `terminal` needs
 //!   `scrollback` (`shell`, `scroll_lines_per_notch`,
 //!   `scroll_pixels_per_notch`, `cursor_style`, `bell` optional, defaulting to
 //!   [`TerminalConfig`](crate::types::TerminalConfig) defaults when absent:
@@ -194,11 +212,11 @@ use crate::keymap::ModKey;
 use crate::migration::CURRENT_SCHEMA_VERSION;
 use crate::plan::{ConfigPlan, ConfigSource, LayerKind, LayeredPlan};
 use crate::types::{
-    AppearanceConfig, BackgroundFit, DecorationConfig, FontConfig, KeymapEntry, LayoutConfig,
-    MAX_BACKGROUND_IMAGE_PATH_BYTES, MAX_DECORATION_BORDER_WIDTH_PX, MAX_FONT_FAMILY_LEN,
-    MAX_PLUGIN_ID_LEN, MouseConfig, OutlineColor, PluginSpec, ScrollbarConfig, ScrollbarMode,
-    SelectionConfig, SessionConfig, TerminalConfig, ViewAppearanceOverride, ViewOverride,
-    ViewSelector, WindowConfig,
+    AppearanceConfig, BackgroundFit, BackgroundPosition, DecorationConfig, FontConfig, KeymapEntry,
+    LayoutConfig, MAX_BACKGROUND_IMAGE_PATH_BYTES, MAX_DECORATION_BORDER_WIDTH_PX,
+    MAX_FONT_FAMILY_LEN, MAX_PLUGIN_ID_LEN, MouseConfig, OutlineColor, PluginSpec, ScrollbarConfig,
+    ScrollbarMode, SelectionConfig, SessionConfig, TerminalConfig, ViewAppearanceOverride,
+    ViewOverride, ViewSelector, WindowConfig,
 };
 
 /// Config directory name under the XDG config root.
@@ -674,6 +692,13 @@ impl CliOverrides {
                     padding: base.window.padding,
                     radius_px: base.window.radius_px,
                     blur_radius: base.window.blur_radius,
+                    // No `--background-*` CLI flags: inherit the base image
+                    // and placement like the other non-overridden siblings,
+                    // so `--opacity` never clears a configured background.
+                    background_image: base.window.background_image.clone(),
+                    background_fit: base.window.background_fit,
+                    background_opacity: base.window.background_opacity,
+                    background_position: base.window.background_position,
                 };
                 cfg.validate()?;
                 Some(cfg)
@@ -1030,6 +1055,10 @@ pub fn resolve_effective_with_profiles(
         "window.opacity",
         "window.padding",
         "window.radius_px",
+        "window.background_image",
+        "window.background_fit",
+        "window.background_opacity",
+        "window.background_position",
     ] {
         if !cli.overrides_field(field) {
             if let Some(src) = base.attribution.get(field) {
@@ -1411,11 +1440,61 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
                         v as u32
                     }
                 };
+                // CTX-1076 (issue #1815): `background_image`/`background_fit`/
+                // `background_opacity`/`background_position` are optional
+                // extras like `radius_px`: absent means "this layer says
+                // nothing" so existing `{ opacity, padding }` tables keep
+                // working. Present values are parsed fail-closed here and
+                // again by `WindowConfig::validate` via `plan.validate()`.
+                // Blur stays a no-op stub (OQ-038): never parsed, always 0.
+                let background_fit = match w.background_fit.as_deref() {
+                    None => None,
+                    Some(raw) => match BackgroundFit::parse(raw.trim()) {
+                        Some(fit) => Some(fit),
+                        None => {
+                            return Err(ConfigError::validation(
+                                "window.background_fit",
+                                "must be one of \"fill\", \"fit\", \"center\", \"tile\", \"stretch\"",
+                            ));
+                        }
+                    },
+                };
+                let background_opacity = match w.background_opacity {
+                    None => None,
+                    Some(v) => {
+                        let opacity = v as f32;
+                        if !(opacity.is_finite() && (0.0..=1.0).contains(&opacity)) {
+                            return Err(ConfigError::validation(
+                                "window.background_opacity",
+                                format!("must be finite within [0.0, 1.0] (found {v})"),
+                            ));
+                        }
+                        Some(opacity)
+                    }
+                };
+                let background_position = match w.background_position.as_deref() {
+                    None => None,
+                    Some(raw) => match BackgroundPosition::parse(raw.trim()) {
+                        Some(pos) => Some(pos),
+                        None => {
+                            return Err(ConfigError::validation(
+                                "window.background_position",
+                                "must be one of \"center\", \"top-left\", \"top\", \
+                                 \"top-right\", \"left\", \"right\", \"bottom-left\", \
+                                 \"bottom\", \"bottom-right\"",
+                            ));
+                        }
+                    },
+                };
                 Some(WindowConfig {
                     opacity: opacity as f32,
                     padding: padding as u32,
                     radius_px,
                     blur_radius: 0,
+                    background_image: w.background_image,
+                    background_fit,
+                    background_opacity,
+                    background_position,
                 })
             }
             _ => {
@@ -3764,6 +3843,68 @@ mod tests {
                 err.to_string().contains("window.radius_px"),
                 "must name the field: {err}"
             );
+        }
+    }
+
+    #[test]
+    fn lua_window_background_optional_with_defaults_and_bounds() {
+        // CTX-1076 (issue #1815): `background_image`/`background_fit`/
+        // `background_opacity`/`background_position` are optional extras in
+        // the atomic `window` table (legacy `{ opacity, padding }` keeps
+        // working); explicit values parse, out-of-range/unknown fails closed
+        // with the field path.
+        let plan = parse_lua_config(
+            r#"return { window = { opacity = 1.0, padding = 8 } }"#,
+            &test_source(),
+        )
+        .expect("legacy table works");
+        let win = plan.window.as_ref().unwrap();
+        assert_eq!(win.background_image, None);
+        assert_eq!(win.background_fit, None);
+        assert_eq!(win.background_opacity, None);
+        assert_eq!(win.background_position, None);
+        let plan = parse_lua_config(
+            r#"return { window = { opacity = 1.0, padding = 8, background_image = "/wall/one.png", background_fit = "tile", background_opacity = 0.5, background_position = "top-left" } }"#,
+            &test_source(),
+        )
+        .expect("background parses");
+        let win = plan.window.as_ref().unwrap();
+        assert_eq!(win.background_image.as_deref(), Some("/wall/one.png"));
+        assert_eq!(win.background_fit, Some(BackgroundFit::Tile));
+        assert!((win.background_opacity.unwrap() - 0.5).abs() < f32::EPSILON);
+        assert_eq!(
+            win.background_position,
+            Some(crate::types::BackgroundPosition::TopLeft)
+        );
+        plan.validate().expect("valid window background");
+        for (bad, field) in [
+            (
+                r#"return { window = { opacity = 1.0, padding = 8, background_image = "relative/one.png" } }"#,
+                "window.background_image",
+            ),
+            (
+                r#"return { window = { opacity = 1.0, padding = 8, background_image = "" } }"#,
+                "window.background_image",
+            ),
+            (
+                r#"return { window = { opacity = 1.0, padding = 8, background_fit = "cover" } }"#,
+                "window.background_fit",
+            ),
+            (
+                r#"return { window = { opacity = 1.0, padding = 8, background_opacity = 2.0 } }"#,
+                "window.background_opacity",
+            ),
+            (
+                r#"return { window = { opacity = 1.0, padding = 8, background_opacity = -0.1 } }"#,
+                "window.background_opacity",
+            ),
+            (
+                r#"return { window = { opacity = 1.0, padding = 8, background_position = "middle" } }"#,
+                "window.background_position",
+            ),
+        ] {
+            let err = parse_lua_config(bad, &test_source()).expect_err(bad);
+            assert_eq!(err.field(), Some(field), "{bad}: {err}");
         }
     }
 

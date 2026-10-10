@@ -864,6 +864,7 @@ mod tests {
                 padding: 8,
                 radius_px: 12,
                 blur_radius: 0,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -874,6 +875,7 @@ mod tests {
                 padding: 8,
                 radius_px: crate::types::MAX_WINDOW_RADIUS_PX + 1,
                 blur_radius: 0,
+                ..Default::default()
             }),
             ..Default::default()
         };

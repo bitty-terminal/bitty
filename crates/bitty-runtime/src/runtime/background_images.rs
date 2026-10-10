@@ -35,11 +35,12 @@ fn background_policy(config: &RuntimeConfig) -> Result<bitty_rich::ResourcePolic
 /// Rebuilds the full background state (decoded store plus the configured
 /// path -> identity map) for `config`, fail-closed.
 ///
-/// Every configured image — the global `decoration.background_image` and
-/// every `views[<selector>].background_image` — is loaded in configuration
-/// order. The first failure returns [`RuntimeError::BackgroundImage`] naming
-/// the owning key; nothing is partially applied because the caller only
-/// swaps state on success.
+/// Every configured image — the global `decoration.background_image`, the
+/// window `window.background_image` (CTX-1076, issue #1815), and every
+/// `views[<selector>].background_image` — is loaded in configuration order.
+/// The first failure returns [`RuntimeError::BackgroundImage`] naming the
+/// owning key; nothing is partially applied because the caller only swaps
+/// state on success.
 fn build_background_state(
     config: &RuntimeConfig,
 ) -> Result<
@@ -61,6 +62,11 @@ fn build_background_state(
     };
     if let Some(path) = config.background_image.as_deref() {
         load("decoration.background_image", path)?;
+    }
+    // CTX-1076: the window image shares the same deny-by-default roots,
+    // BG-1..BG-5 bounds, and fail-closed loader as the decoration image.
+    if let Some(path) = config.window_background_image.as_deref() {
+        load("window.background_image", path)?;
     }
     for rule in &config.view_appearance {
         if let Some(path) = rule.background_image.as_deref() {
@@ -88,13 +94,17 @@ pub fn validate_background_images(config: &RuntimeConfig) -> Result<(), RuntimeE
 }
 
 /// The config-side background/views fields one live adopt swaps as a unit
-/// (CTX-0898).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// (CTX-0898, extended by CTX-1076 with the window background quartet).
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BackgroundFields {
     view_appearance: Vec<crate::config::ViewAppearanceRule>,
     background_image: Option<String>,
     background_fit: String,
     background_image_roots: Vec<String>,
+    window_background_image: Option<String>,
+    window_background_fit: String,
+    window_background_opacity: f32,
+    window_background_position: String,
 }
 
 /// One retained background generation (CTX-0898): the fields plus the
@@ -156,10 +166,13 @@ impl Runtime {
     }
 
     /// Live-adopts the background and per-`View` appearance set without
-    /// restart (CTX-0898, issue #1522).
+    /// restart (CTX-0898, issue #1522; extended by CTX-1076 with the window
+    /// background quartet).
     ///
     /// Covers `decoration.background_image` / `background_fit` /
-    /// `background_image_roots` and the `views` rule table. The candidate is
+    /// `background_image_roots`, the `views` rule table, and
+    /// `window.background_image` / `background_fit` / `background_opacity` /
+    /// `background_position`. The candidate is
     /// checked through the same gates as construction — the runtime config
     /// bounds, the full background load pipeline (approved roots, trust,
     /// sniff, decode, BG-4/BG-5), and the RFC-0001 AC-1/AC-2 first-match
@@ -174,18 +187,27 @@ impl Runtime {
     /// [`RuntimeError::BackgroundImage`] for a rejected image, and
     /// [`RuntimeError::ViewAppearance`] when a rule would compose a violating
     /// outline pair on an existing `View`.
+    #[allow(clippy::too_many_arguments)]
     pub fn set_background_appearance(
         &mut self,
         view_appearance: Vec<crate::config::ViewAppearanceRule>,
         background_image: Option<String>,
         background_fit: String,
         background_image_roots: Vec<String>,
+        window_background_image: Option<String>,
+        window_background_fit: String,
+        window_background_opacity: f32,
+        window_background_position: String,
     ) -> Result<(), RuntimeError> {
         let requested = BackgroundFields {
             view_appearance,
             background_image,
             background_fit,
             background_image_roots,
+            window_background_image,
+            window_background_fit,
+            window_background_opacity,
+            window_background_position,
         };
         if self.background_fields() == requested {
             return Ok(());
@@ -195,6 +217,10 @@ impl Runtime {
         candidate.background_image = requested.background_image.clone();
         candidate.background_fit = requested.background_fit.clone();
         candidate.background_image_roots = requested.background_image_roots.clone();
+        candidate.window_background_image = requested.window_background_image.clone();
+        candidate.window_background_fit = requested.window_background_fit.clone();
+        candidate.window_background_opacity = requested.window_background_opacity;
+        candidate.window_background_position = requested.window_background_position.clone();
         candidate.validate()?;
         self.validate_existing_views_against(&candidate)?;
         // Rollback fast path: the request is exactly the generation the last
@@ -217,6 +243,10 @@ impl Runtime {
         self.config.background_image = requested.background_image;
         self.config.background_fit = requested.background_fit;
         self.config.background_image_roots = requested.background_image_roots;
+        self.config.window_background_image = requested.window_background_image;
+        self.config.window_background_fit = requested.window_background_fit;
+        self.config.window_background_opacity = requested.window_background_opacity;
+        self.config.window_background_position = requested.window_background_position;
         self.background_rasters = bitty_rich::BackgroundRasterCache::new();
         self.pending_full_redraw = true;
         Ok(())
@@ -244,6 +274,10 @@ impl Runtime {
             background_image: self.config.background_image.clone(),
             background_fit: self.config.background_fit.clone(),
             background_image_roots: self.config.background_image_roots.clone(),
+            window_background_image: self.config.window_background_image.clone(),
+            window_background_fit: self.config.window_background_fit.clone(),
+            window_background_opacity: self.config.window_background_opacity,
+            window_background_position: self.config.window_background_position.clone(),
         }
     }
 

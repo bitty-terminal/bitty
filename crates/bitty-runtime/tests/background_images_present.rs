@@ -203,11 +203,115 @@ fn no_image_config_opens_nothing_and_presents_no_background() {
     let mut rt = Runtime::new(RuntimeConfig::default()).expect("default runtime");
     assert_eq!(rt.background_image_count(), 0);
     assert_eq!(rt.background_loads(), 0, "no file may be opened");
+    assert!(!rt.config().has_window_background_image());
     single_leaf(&mut rt);
     let stats = rt.tick().expect("presents");
     assert_eq!(stats.backgrounds, 0);
     let (hits, misses, entries, bytes) = rt.background_raster_stats();
     assert_eq!((hits, misses, entries, bytes), (0, 0, 0, 0));
+}
+
+#[test]
+fn window_image_loads_at_construction_and_paints_behind_grid() {
+    // CTX-1076 (issue #1815): `window.background_image` loads fail-closed at
+    // construction and paints window-sized behind the grid with the
+    // configured placement.
+    let root = scratch("window-present");
+    let path = root.join("red.png");
+    std::fs::write(&path, RED_PNG).expect("write fixture");
+    let path = path.display().to_string();
+    let roots = vec![root.display().to_string()];
+    let mut rt = Runtime::new(RuntimeConfig {
+        window_background_image: Some(path.clone()),
+        window_background_fit: "stretch".to_string(),
+        window_background_opacity: 1.0,
+        window_background_position: "center".to_string(),
+        background_image_roots: roots,
+        ..RuntimeConfig::default()
+    })
+    .expect("one approved window image builds");
+    assert!(rt.config().has_window_background_image());
+    assert_eq!(rt.background_image_count(), 1);
+    single_leaf(&mut rt);
+    let stats = rt.tick().expect("first tick presents");
+    assert_eq!(stats.backgrounds, 1, "one window background blit presented");
+    let rgba = rt.headless_rgba().expect("rgba after tick");
+    let width = surface_width(&rt);
+    // Probe the padding band (top-left corner of the window): the per-View
+    // image never covers it, so a red pixel proves the window image paints
+    // the whole window behind the grid.
+    assert_eq!(
+        probe(&rgba, width, 2, 2),
+        [255, 0, 0, 255],
+        "window background must cover the padding band"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn window_missing_image_fails_closed_naming_the_key() {
+    // CTX-1076: a missing window file rejects the whole config and names
+    // `window.background_image` with a clear error.
+    let root = scratch("window-missing");
+    let missing = root.join("nope.png").display().to_string();
+    let err = Runtime::new(RuntimeConfig {
+        window_background_image: Some(missing),
+        window_background_fit: "fill".to_string(),
+        window_background_opacity: 1.0,
+        window_background_position: "center".to_string(),
+        background_image_roots: vec![root.display().to_string()],
+        ..RuntimeConfig::default()
+    })
+    .expect_err("missing window image must fail closed");
+    assert!(
+        matches!(err, bitty_runtime::RuntimeError::BackgroundImage(_)),
+        "typed background error: {err}"
+    );
+    assert!(
+        err.to_string().contains("window.background_image"),
+        "must name the owning key: {err}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn window_live_adopt_paints_and_clears() {
+    // CTX-1076 hot-reload: `set_background_appearance` adopts the window
+    // quartet live; clearing releases the store.
+    let root = scratch("window-live");
+    let path = root.join("red.png");
+    std::fs::write(&path, RED_PNG).expect("write fixture");
+    let path = path.display().to_string();
+    let roots = vec![root.display().to_string()];
+    let mut rt = Runtime::new(RuntimeConfig::default()).expect("default runtime");
+    single_leaf(&mut rt);
+    rt.set_background_appearance(
+        Vec::new(),
+        None,
+        "fill".to_string(),
+        roots.clone(),
+        Some(path.clone()),
+        "fill".to_string(),
+        1.0,
+        "center".to_string(),
+    )
+    .expect("window image adopts live");
+    assert_eq!(rt.background_image_count(), 1);
+    let stats = rt.tick().expect("adoption repaints");
+    assert_eq!(stats.backgrounds, 1);
+    rt.set_background_appearance(
+        Vec::new(),
+        None,
+        "fill".to_string(),
+        Vec::new(),
+        None,
+        "fill".to_string(),
+        1.0,
+        "center".to_string(),
+    )
+    .expect("clear adopts");
+    assert_eq!(rt.background_image_count(), 0);
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -229,6 +333,10 @@ fn live_background_appearance_adopts_and_fails_closed() {
         Some(path.clone()),
         "stretch".to_string(),
         roots.clone(),
+        None,
+        "fill".to_string(),
+        1.0,
+        "center".to_string(),
     )
     .expect("approved image adopts live");
     assert_eq!(rt.background_image_count(), 1);
@@ -242,6 +350,10 @@ fn live_background_appearance_adopts_and_fails_closed() {
         Some(path.clone()),
         "stretch".to_string(),
         roots.clone(),
+        None,
+        "fill".to_string(),
+        1.0,
+        "center".to_string(),
     )
     .expect("unchanged set is a no-op");
     assert_eq!(rt.background_loads(), 1, "no file reopened");
@@ -253,6 +365,10 @@ fn live_background_appearance_adopts_and_fails_closed() {
             Some(root.join("absent.png").display().to_string()),
             "stretch".to_string(),
             roots.clone(),
+            None,
+            "fill".to_string(),
+            1.0,
+            "center".to_string(),
         )
         .expect_err("missing image must fail closed");
     assert!(
@@ -263,8 +379,17 @@ fn live_background_appearance_adopts_and_fails_closed() {
     assert_eq!(rt.background_image_count(), 1, "running store untouched");
 
     // Clearing the image releases the store.
-    rt.set_background_appearance(Vec::new(), None, "fill".to_string(), Vec::new())
-        .expect("clear adopts");
+    rt.set_background_appearance(
+        Vec::new(),
+        None,
+        "fill".to_string(),
+        Vec::new(),
+        None,
+        "fill".to_string(),
+        1.0,
+        "center".to_string(),
+    )
+    .expect("clear adopts");
     assert_eq!(rt.background_image_count(), 0);
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -282,7 +407,16 @@ fn live_views_rule_is_checked_against_existing_views() {
         ..Default::default()
     };
     let err = rt
-        .set_background_appearance(vec![bad], None, "fill".to_string(), Vec::new())
+        .set_background_appearance(
+            vec![bad],
+            None,
+            "fill".to_string(),
+            Vec::new(),
+            None,
+            "fill".to_string(),
+            1.0,
+            "center".to_string(),
+        )
         .expect_err("violating rule must fail closed");
     assert!(
         matches!(err, bitty_runtime::RuntimeError::ViewAppearance(_)),
@@ -295,8 +429,17 @@ fn live_views_rule_is_checked_against_existing_views() {
         border_width: Some(3),
         ..Default::default()
     };
-    rt.set_background_appearance(vec![good.clone()], None, "fill".to_string(), Vec::new())
-        .expect("valid rule adopts");
+    rt.set_background_appearance(
+        vec![good.clone()],
+        None,
+        "fill".to_string(),
+        Vec::new(),
+        None,
+        "fill".to_string(),
+        1.0,
+        "center".to_string(),
+    )
+    .expect("valid rule adopts");
     assert_eq!(rt.config().view_appearance, vec![good]);
     let outline = rt.config().resolve_view_outline(&RuntimeViewTarget {
         content: "empty",

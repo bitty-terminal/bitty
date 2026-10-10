@@ -139,12 +139,13 @@ pub use trust::{
 };
 pub use types::{
     AnimationDurations, AnimationEasing, AnimationEasings, AnimationTransition, AnimationsConfig,
-    AppearanceConfig, BackgroundFit, BellMode, CloseConfirm, CursorStyle, DecorationConfig,
-    EffectiveConfig, FontConfig, KeymapEntry, LayoutConfig, MAX_BACKGROUND_IMAGE_PATH_BYTES,
-    MAX_VIEW_SELECTOR_BYTES, MAX_WORKSPACE_LABEL, MouseConfig, OutlineColor, PluginSpec,
-    ReducedMotion, ResolvedOutlineColors, ResolvedOutlineWidths, ResolvedViewAppearance,
-    ScrollbarConfig, ScrollbarMode, SelectionConfig, TerminalConfig, ViewAppearanceOverride,
-    ViewAppearanceTarget, ViewContent, ViewOverride, ViewSelector, WindowConfig, WorkspaceConfig,
+    AppearanceConfig, BackgroundFit, BackgroundPosition, BellMode, CloseConfirm, CursorStyle,
+    DecorationConfig, EffectiveConfig, FontConfig, KeymapEntry, LayoutConfig,
+    MAX_BACKGROUND_IMAGE_PATH_BYTES, MAX_VIEW_SELECTOR_BYTES, MAX_WORKSPACE_LABEL, MouseConfig,
+    OutlineColor, PluginSpec, ReducedMotion, ResolvedOutlineColors, ResolvedOutlineWidths,
+    ResolvedViewAppearance, ScrollbarConfig, ScrollbarMode, SelectionConfig, TerminalConfig,
+    ViewAppearanceOverride, ViewAppearanceTarget, ViewContent, ViewOverride, ViewSelector,
+    WindowConfig, WorkspaceConfig,
 };
 pub use validation::{Validate, collect_diagnostics, validate_stack};
 pub use wheel::{

@@ -385,8 +385,12 @@ pub(crate) fn apply_live_presentation(
             resolved.background_image,
             resolved.background_fit,
             resolved.background_image_roots,
+            resolved.window_background_image,
+            resolved.window_background_fit,
+            resolved.window_background_opacity,
+            resolved.window_background_position,
         )
-        .map_err(|err| format!("decoration.background: {err}"))?;
+        .map_err(|err| format!("background: {err}"))?;
     runtime.set_animations(resolved.animations);
     runtime
         .set_window_padding(effective.window.padding)

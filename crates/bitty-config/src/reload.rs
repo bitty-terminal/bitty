@@ -93,6 +93,10 @@ impl std::fmt::Display for ReloadClass {
 /// | `window.opacity`          | Live               |
 /// | `window.padding`          | Live               |
 /// | `window.radius_px`        | Live               |
+/// | `window.background_image` | Live               |
+/// | `window.background_fit`   | Live               |
+/// | `window.background_opacity` | Live             |
+/// | `window.background_position` | Live            |
 /// | `decoration.gaps_in`      | Live               |
 /// | `decoration.gaps_out`     | Live               |
 /// | `decoration.border`       | Live               |
@@ -171,6 +175,10 @@ pub const LIVE_FIELDS: &[&str] = &[
     "window.opacity",
     "window.padding",
     "window.radius_px",
+    "window.background_image",
+    "window.background_fit",
+    "window.background_opacity",
+    "window.background_position",
     "decoration.gaps_in",
     "decoration.gaps_out",
     "decoration.border",
@@ -403,6 +411,34 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
         old.window.radius_px.to_string(),
         new.window.radius_px.to_string(),
     );
+    // CTX-1076 (issue #1815): the window background quartet is classified
+    // Live and adopted by the runtime (fail-closed load pipeline), so each
+    // leaf must diff; without these a background-only edit reported
+    // `unchanged` and was never adopted.
+    for (field, before, after) in [
+        (
+            "window.background_image",
+            format!("{:?}", old.window.background_image),
+            format!("{:?}", new.window.background_image),
+        ),
+        (
+            "window.background_fit",
+            format!("{:?}", old.window.background_fit),
+            format!("{:?}", new.window.background_fit),
+        ),
+        (
+            "window.background_opacity",
+            format!("{:?}", old.window.background_opacity),
+            format!("{:?}", new.window.background_opacity),
+        ),
+        (
+            "window.background_position",
+            format!("{:?}", old.window.background_position),
+            format!("{:?}", new.window.background_position),
+        ),
+    ] {
+        push_if_changed(field, before, after);
+    }
     // CTX-0292: Core-owned decoration is validated + stored live (the
     // runtime `set_decoration` path adopts it without restart), so changes
     // reconcile live like `window.radius_px`.
@@ -1303,6 +1339,40 @@ mod tests {
         assert_eq!(cur.window.padding, 4);
         assert!((cur.window.opacity - 0.9).abs() < f32::EPSILON);
         assert_eq!(cur.window.radius_px, 12);
+    }
+
+    #[test]
+    fn diff_window_background_is_live_and_reconcile() {
+        // CTX-1076 (issue #1815): the window background quartet surfaces as
+        // Live diffs and reconciles without restart (fail-closed load in the
+        // runtime adopter).
+        assert_eq!(classify_field("window.background_image"), ReloadClass::Live);
+        assert_eq!(classify_field("window.background_fit"), ReloadClass::Live);
+        assert_eq!(
+            classify_field("window.background_opacity"),
+            ReloadClass::Live
+        );
+        assert_eq!(
+            classify_field("window.background_position"),
+            ReloadClass::Live
+        );
+        let old = EffectiveConfig::default();
+        let mut new = old.clone();
+        new.window.background_image = Some("/wall/one.png".to_string());
+        new.window.background_fit = Some(crate::types::BackgroundFit::Tile);
+        new.window.background_opacity = Some(0.5);
+        new.window.background_position = Some(crate::types::BackgroundPosition::TopLeft);
+        let r = diff(&old, &new);
+        assert_eq!(r.overall, ReloadClass::Live);
+        assert!(!r.needs_restart);
+        for field in [
+            "window.background_image",
+            "window.background_fit",
+            "window.background_opacity",
+            "window.background_position",
+        ] {
+            assert!(r.diffs.iter().any(|d| d.field == field), "{field}");
+        }
     }
 
     #[test]

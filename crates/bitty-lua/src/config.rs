@@ -251,6 +251,20 @@ pub struct WindowData {
     pub padding: Option<i64>,
     /// Corner radius in physical px (CTX-0241 S0: parsed no-op, default 0).
     pub radius_px: Option<i64>,
+    /// Window background image path (CTX-1076, issue #1815
+    /// `window.background_image`); raw string, syntax-checked downstream in
+    /// `bitty-config` (fail-closed) and resolved only under an approved root.
+    pub background_image: Option<String>,
+    /// Window background fit mode (CTX-1076): one of
+    /// `fill`/`fit`/`center`/`tile`/`stretch`; the closed enum is enforced
+    /// downstream in `bitty-config` (fail-closed).
+    pub background_fit: Option<String>,
+    /// Window background dim factor (CTX-1076 `window.background_opacity`);
+    /// raw number, bounds-checked downstream in `bitty-config` (fail-closed).
+    pub background_opacity: Option<f64>,
+    /// Window background position (CTX-1076 `window.background_position`);
+    /// raw string, spelling validated downstream in `bitty-config`.
+    pub background_position: Option<String>,
 }
 
 /// Terminal overrides, plain data (see [`FontData`] for `Option` semantics).
@@ -1405,7 +1419,19 @@ impl ConfigData {
                 }
                 "window" => {
                     let nested = expect_table(key, val)?;
-                    check_nested_keys(key, nested, &["opacity", "padding", "radius_px"])?;
+                    check_nested_keys(
+                        key,
+                        nested,
+                        &[
+                            "opacity",
+                            "padding",
+                            "radius_px",
+                            "background_image",
+                            "background_fit",
+                            "background_opacity",
+                            "background_position",
+                        ],
+                    )?;
                     let opacity = match get_field(nested, "opacity") {
                         Some(v) => Some(expect_number("window.opacity", v)?),
                         None => None,
@@ -1418,10 +1444,39 @@ impl ConfigData {
                         Some(v) => Some(expect_integer("window.radius_px", v)?),
                         None => None,
                     };
+                    // CTX-1076 (issue #1815): window background image and
+                    // placement are plain strings/numbers here; the accepted
+                    // path syntax, the closed fit/position enums, and the
+                    // opacity bounds are enforced fail-closed in
+                    // `bitty-config`.
+                    let background_image = match get_field(nested, "background_image") {
+                        Some(v) => Some(expect_bounded_string(
+                            "window.background_image",
+                            v,
+                            MAX_CONFIG_BACKGROUND_PATH_BYTES,
+                        )?),
+                        None => None,
+                    };
+                    let background_fit = match get_field(nested, "background_fit") {
+                        Some(v) => Some(expect_string("window.background_fit", v)?),
+                        None => None,
+                    };
+                    let background_opacity = match get_field(nested, "background_opacity") {
+                        Some(v) => Some(expect_number("window.background_opacity", v)?),
+                        None => None,
+                    };
+                    let background_position = match get_field(nested, "background_position") {
+                        Some(v) => Some(expect_string("window.background_position", v)?),
+                        None => None,
+                    };
                     out.window = Some(WindowData {
                         opacity,
                         padding,
                         radius_px,
+                        background_image,
+                        background_fit,
+                        background_opacity,
+                        background_position,
                     });
                 }
                 "terminal" => {

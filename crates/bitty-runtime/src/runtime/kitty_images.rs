@@ -92,6 +92,11 @@ pub enum KittyImageError {
     Decode(bitty_rich::KittyPrecheckError),
     /// Store/placement admission refused an otherwise decoded image.
     Placement(bitty_rich::KittyPlacementError),
+    /// Local-medium (`t=f`/`t=t`/`t=s`) file/shm read refused by the
+    /// open-time sandbox (S3, #1849): bad name, unsupported platform,
+    /// non-regular object, over-cap read, out-of-range offset, or refused
+    /// I/O. No bitmap, no placement, no unlink on refusal.
+    LocalRead(crate::runtime::kitty_file::KittyLocalReadError),
 }
 
 impl std::fmt::Display for KittyImageError {
@@ -100,6 +105,7 @@ impl std::fmt::Display for KittyImageError {
             Self::UnknownFormat(value) => write!(f, "kitty image unknown format f={value}"),
             Self::Decode(err) => write!(f, "kitty image decode: {err}"),
             Self::Placement(err) => write!(f, "kitty image placement: {err}"),
+            Self::LocalRead(err) => write!(f, "kitty local file/shm read: {err}"),
         }
     }
 }

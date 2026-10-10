@@ -186,7 +186,8 @@ registry/uninstall scripting for the same bar.
   post-0.2.0 Azure Trusted Signing / OV revisit per the owner decision on
   #1810). The installer must not claim trust it does not have: SmartScreen
   will show the standard unsigned warning and the click-through guidance
-  (More info -> Run anyway) will live in the docs (see #1866). The verify job asserts
+  (More info -> Run anyway) lives in `packaging/WINDOWS-SMARTSCREEN.md`
+  (see #1866). The verify job asserts
   `Get-AuthenticodeSignature` reports `NotSigned` so a silent signing without
   updating the script and this README fails CI instead of shipping quietly.
 - Artifact: `bitty-<VERSION>-windows-x86_64-setup.exe` plus its `.sha256`

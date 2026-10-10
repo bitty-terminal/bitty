@@ -293,7 +293,7 @@ if "BITTY_SHELL_INIT" not-in $env {
     $env.BITTY_SHELL_INIT = "1"
     $env.config = ($env.config | default {} hooks | upsert hooks.pre_prompt ((try { $env.config.hooks.pre_prompt } catch { [] }) ++ [{||
         print -n $"\e]133;D;($env.LAST_EXIT_CODE)\e\\"
-        print -n $"\e]7;file://(sys host | get hostname)(pwd | str replace --all "\\" "/" | url encode | str replace --regex '^([A-Za-z]):/' '$1__BITTY_DRIVE__/' | str replace --all ':' '%3A' | str replace --all '__BITTY_DRIVE__' ':')\e\\"
+        print -n $"\e]7;file://(sys host | get hostname)(pwd | str replace --all "\\" "/" | url encode | str replace --all ':' '%3A' | str replace --regex '^([A-Za-z])%3A/' '$1:/')\e\\"
         print -n "\e]133;A\e\\"
     }]))
 }
@@ -704,8 +704,12 @@ mod tests {
             "nushell encodes non-drive colons"
         );
         assert!(
-            nu.contains("__BITTY_DRIVE__"),
-            "nushell preserves drive-letter colon"
+            nu.contains("^([A-Za-z])%3A/"),
+            "nushell preserves drive-letter colon without sentinel"
+        );
+        assert!(
+            !nu.contains("__BITTY_DRIVE__"),
+            "nushell avoids filename-colliding sentinel"
         );
         assert!(
             nu.contains("sys host | get hostname"),

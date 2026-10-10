@@ -131,9 +131,10 @@ pub struct PanelSpawnRule {
     /// Durable fixed-size constraint (CTX-1088): sizes the PTY and session
     /// grid at spawn and stamps the per-view flag so solver sync keeps
     /// them there until cleared (clearing returns to solver ownership).
-    /// Fixed wins over pseudo-tiling on conflict; rule edits affect future
-    /// spawns only. Degenerate or oversize values fail closed at
-    /// validation and never stamp.
+    /// Paint stays slot-sized (centered when the flag fits, clipped to
+    /// the slot window when larger). Fixed wins over pseudo-tiling on
+    /// conflict; rule edits affect future spawns only. Degenerate or
+    /// oversize values fail closed at validation and never stamp.
     pub width: Option<u16>,
     /// Requested height in cells (`1..=1000`).
     ///

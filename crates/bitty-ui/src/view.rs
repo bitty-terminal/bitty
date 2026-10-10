@@ -97,29 +97,34 @@ pub struct View {
     pseudo: Option<PseudoConstraint>,
     /// Durable fixed-size constraint (CTX-1088, follow-up to CTX-1080).
     /// `None` means solver-owned steady-state geometry; `Some(size)` pins
-    /// the leaf, its grid, and its PTY winsize to `size` through every
-    /// solver sync. The solver still allocates the slot (allocations stay
-    /// byte-identical for restore); only the steady-state size is owned.
+    /// the leaf grid and its PTY winsize to `size` through every solver
+    /// sync. The solver still allocates the slot and owns the leaf size
+    /// (allocations stay byte-identical for restore); only grid and PTY
+    /// sizing is owned.
     ///
     /// Contract:
     /// - Spawn-time vs durable: panel-rule `width`/`height` used to be a
     ///   spawn-time initial-size request (solver reflowed back on the next
-    ///   sync). Stamping this flag makes them durable: the present,
-    ///   reflow, and sync paths all honor it until it is cleared.
+    ///   sync). Stamping this flag makes them durable: the sync paths
+    ///   size grid and PTY from the flag until it is cleared, while paint
+    ///   stays slot-sized. Rule edits affect future spawns only, and a
+    ///   respawn never overwrites an existing flag (clear first to
+    ///   re-stamp).
     /// - Vs pseudo (`set_pseudo_size`, `pseudo.rs`): deliberately NOT
     ///   reused. Pseudo is a present-only centered viewport for tiled
     ///   leaves that falls back to tiled fill when the slot is smaller
     ///   and is ignored for floating leaves (the float branch wins). The
     ///   fixed flag owns grid and PTY size even when larger than the slot
-    ///   (painted through the cursor-follow window, never overlapping
-    ///   neighbours) and sizes floating leaves too. Fixed wins over
-    ///   pseudo on conflict; clearing fixed restores pseudo (when set)
-    ///   else solver ownership.
+    ///   (painted through the cursor-follow window into slot-sized paint
+    ///   dims, never overlapping neighbours) and sizes floating leaves
+    ///   too. Fixed wins over pseudo on conflict; clearing fixed restores
+    ///   pseudo (when set) else solver ownership.
     /// - Fail-closed and bounded: only `1..=MAX_FIXED_SIZE_DIM` per axis
     ///   is stored; empty or oversize inputs store `None` (solver
-    ///   default). Presentation-safe: tiled content stays inside the slot
-    ///   when it fits (gutter is window background) and clips to the slot
-    ///   window when larger; floating content stays clamped in-container.
+    ///   default). An explicit zero axis in a rule stamps nothing at all.
+    ///   Presentation-safe: tiled paint stays inside the slot when the
+    ///   flag fits (gutter is window background) and clips to the slot
+    ///   window when larger; floating paint stays clamped in-container.
     fixed_size: Option<Size>,
 }
 
@@ -249,9 +254,9 @@ impl View {
     }
 
     /// Durable fixed-size constraint (CTX-1088). `None` means solver-owned
-    /// steady-state geometry; `Some` pins leaf, grid, and PTY to that size
-    /// until cleared. See the field contract for spawn-time vs durable,
-    /// pseudo interplay (fixed wins), and fail-closed bounds.
+    /// steady-state geometry; `Some` pins grid and PTY to that size until
+    /// cleared. See the field contract for spawn-time vs durable, pseudo
+    /// interplay (fixed wins), and fail-closed bounds.
     #[must_use]
     pub fn fixed_size(&self) -> Option<Size> {
         self.fixed_size
@@ -261,9 +266,10 @@ impl View {
     /// `1..=MAX_FIXED_SIZE_DIM` per axis is stored; empty or oversize
     /// inputs store `None` (fail-closed to solver ownership) so stored
     /// state is always valid and consumers never re-validate. The solver
-    /// still allocates the slot (byte-identical); only the steady-state
-    /// size is owned. Clearing restores solver ownership (or pseudo, when
-    /// a pseudo flag is also set) on the next sync.
+    /// still allocates the slot and owns the leaf size (byte-identical);
+    /// only grid and PTY sizing is owned. Clearing restores solver
+    /// ownership (or pseudo paint, when a pseudo flag is also set) on the
+    /// next sync.
     pub fn set_fixed_size(&mut self, size: Option<Size>) {
         self.fixed_size = match size {
             Some(s)

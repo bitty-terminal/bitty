@@ -193,12 +193,13 @@ impl Runtime {
         }
         // CTX-1080 + CTX-1088: apply the matched rule to the primary
         // owner with the same semantics as the per-view path below. Dims
-        // are durable fixed-size constraints (the owner leaf, grid, and
-        // PTY keep them through solver sync until cleared; clearing
-        // returns to solver ownership). Fixed wins over pseudo on
-        // conflict; rule edits affect future spawns only. Presentation
-        // stamps the owner leaf verbatim; workspace moves only when the
-        // owner is focused and the target exists, otherwise skipped
+        // are durable fixed-size constraints (grid and PTY keep them
+        // through solver sync until cleared; paint stays slot-sized and
+        // clearing returns to solver ownership). Fixed wins over pseudo
+        // on conflict; rule edits affect future spawns only and a
+        // respawn never overwrites an existing flag. Presentation stamps
+        // the owner leaf verbatim; workspace moves only when the owner
+        // is focused and the target exists, otherwise skipped
         // fail-closed.
         if let Some(rule) = matched_rule.as_ref() {
             if rule.width.is_some() || rule.height.is_some() {
@@ -562,17 +563,16 @@ impl Runtime {
         // after a successful spawn. Presentation stamps the leaf verbatim
         // (the solver ignores it, so solver output stays byte-identical).
         // Dims are durable fixed-size constraints: they size the PTY and
-        // session grid here, resize the leaf stored size to match, and
-        // stamp the per-view flag so `present_frames` (fixed wins over
-        // pseudo; tiled centers when it fits, windows when larger;
-        // floating centers in-container), `reflow_present_layout`, the
-        // solver reflow skip, and `sync_pane_geometry_to` keep grid, PTY,
-        // and leaf at the rule size until cleared. Clearing returns to
-        // solver ownership on the next sync. Workspace moves only when
-        // the spawned leaf is focused and the target exists, otherwise
-        // skipped fail-closed. Centered is placement intent for floating
-        // panels (floats already center via the overlay frame), so no
-        // extra step.
+        // session grid here and stamp the per-view flag (first stamp
+        // wins; a respawn never overwrites) so the sync paths keep grid
+        // and PTY at the rule size until cleared. Paint stays slot-sized
+        // (`present_frames` centers fixed content when it fits and clips
+        // to the slot window when larger; fixed wins over pseudo).
+        // Clearing returns grid and PTY to solver ownership on the next
+        // sync. Workspace moves only when the spawned leaf is focused and
+        // the target exists, otherwise skipped fail-closed. Centered is
+        // placement intent for floating panels (floats already center via
+        // the overlay frame), so no extra step.
         if let Some(rule) = matched_rule.as_ref() {
             if let Some(presentation) = rule.presentation {
                 let mode = match presentation {
@@ -846,7 +846,10 @@ impl Runtime {
     /// The present path already holds this frame's decorated content frames;
     /// passing them in keeps the per-frame sync from recomputing them. The
     /// resize rule is identical: only sessions whose grid or PTY winsize
-    /// differs from their leaf frame are touched.
+    /// differs from their target are touched. CTX-1088: a leaf carrying a
+    /// durable fixed-size constraint targets the flag (its paint dims stay
+    /// slot-sized, so the frames alone would shrink the grid back); every
+    /// other leaf targets its frame as before.
     pub(super) fn sync_pane_geometry_to(&mut self, frames: &[PresentFrame]) {
         if self.pane_sessions.is_empty() {
             return;
@@ -854,8 +857,14 @@ impl Runtime {
         // CTX-0294: decorated content frames (Core px decoration + CTX-0177
         // cell gaps) so pane grids/PTYs match the painted viewport.
         for frame in frames {
-            let cols = frame.cols.max(1);
-            let rows = frame.rows.max(1);
+            let (cols, rows) = match self
+                .layout
+                .find_leaf(frame.view)
+                .and_then(|leaf| leaf.fixed_size())
+            {
+                Some(size) => (size.width.max(1), size.height.max(1)),
+                None => (frame.cols.max(1), frame.rows.max(1)),
+            };
             if let Some(sess) = self.pane_sessions.get_mut(&frame.view) {
                 if sess.state.width() != cols as usize || sess.state.height() != rows as usize {
                     // CTX-0312: a single resize preserves visible content;

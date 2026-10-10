@@ -316,24 +316,67 @@ mod tests {
         let focused = rt.focused_view().expect("focused leaf");
         rt.spawn_shell_for_view(focused, "/bin/sh", &[], 40, 12)
             .expect("spawn");
-        // Immediate: the rule sizes the PTY at spawn and stamps the leaf.
+        // Immediate: the rule sizes the PTY at spawn and stamps the flag.
         assert_eq!(rt.pane_pty_size(&focused), Some((100, 30)));
         let leaf = rt.layout().find_leaf(focused).expect("leaf present");
-        assert_eq!((leaf.cols(), leaf.rows()), (100, 30));
         assert_eq!(leaf.fixed_size(), Some(crate::UiSize::new(100, 30)));
-        // Steady-state: the present frame owns the fixed dims even though
-        // the default 80x24 container cannot fit 100x30 (clipped slot
-        // window, never overlapping neighbours), and geometry sync keeps
-        // grid and PTY there instead of reflowing to the solver frame.
+        // Steady-state split: paint stays slot-sized (the default 80x24
+        // container cannot fit 100x30) while geometry sync keeps the grid
+        // and PTY at the rule size instead of reflowing to the solver
+        // frame.
         let frames = rt.present_frames();
         let frame = frames.iter().find(|f| f.view == focused).expect("frame");
-        assert_eq!((frame.cols, frame.rows), (100, 30));
+        assert_ne!((frame.cols, frame.rows), (100, 30));
         rt.sync_pane_geometry_to(&frames);
         assert_eq!(rt.pane_pty_size(&focused), Some((100, 30)));
-        // Reflow keeps the leaf at the rule size too.
+        let grid = rt.pane_snapshot(&focused).expect("pane grid");
+        assert_eq!((grid.width, grid.height), (100, 30));
+        // Reflow keeps the leaf at the solver slot for the paint paths.
         rt.reflow_present_layout(&frames);
         let leaf = rt.layout().find_leaf(focused).expect("leaf present");
-        assert_eq!((leaf.cols(), leaf.rows()), (100, 30));
+        assert_eq!((leaf.cols(), leaf.rows()), (frame.cols, frame.rows));
+        assert_eq!(leaf.fixed_size(), Some(crate::UiSize::new(100, 30)));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn respawn_preserves_existing_fixed_size() {
+        require_pty!();
+        use crate::Runtime;
+        let mut rt = Runtime::with_defaults().expect("defaults build");
+        let rule = |w: u16, h: u16| PanelSpawnRule {
+            cmd: Some("sh".to_string()),
+            cmd_regex: None,
+            title_regex: None,
+            content: None,
+            presentation: None,
+            width: Some(w),
+            height: Some(h),
+            workspace: None,
+            centered: None,
+        };
+        rt.set_panel_spawn_rules(vec![rule(100, 30)]);
+        let focused = rt.focused_view().expect("focused leaf");
+        rt.spawn_shell_for_view(focused, "/bin/sh", &[], 40, 12)
+            .expect("spawn");
+        assert_eq!(
+            rt.layout().find_leaf(focused).expect("leaf").fixed_size(),
+            Some(crate::UiSize::new(100, 30))
+        );
+        // A rule edit plus respawn must not overwrite the kept flag: the
+        // first stamp wins until explicitly cleared.
+        rt.set_panel_spawn_rules(vec![rule(50, 20)]);
+        rt.spawn_shell_for_view(focused, "/bin/sh", &[], 40, 12)
+            .expect("respawn");
+        assert_eq!(
+            rt.layout().find_leaf(focused).expect("leaf").fixed_size(),
+            Some(crate::UiSize::new(100, 30))
+        );
+        let frames = rt.present_frames();
+        rt.sync_pane_geometry_to(&frames);
+        assert_eq!(rt.pane_pty_size(&focused), Some((100, 30)));
+        let grid = rt.pane_snapshot(&focused).expect("pane grid");
+        assert_eq!((grid.width, grid.height), (100, 30));
     }
 
     #[test]
@@ -402,11 +445,13 @@ mod tests {
         assert_eq!((frame.cols, frame.rows), (40, 12));
         let leaf = rt.layout().find_leaf(id).expect("leaf");
         assert_eq!((leaf.cols(), leaf.rows()), (40, 12));
-        // Direct solver reflow keeps the pinned size (origin still tracks
-        // the slot).
+        // Direct solver reflow owns the leaf size (paint stays slot-sized
+        // for the scrolled-viewport and scrollbar paths); the flag itself
+        // survives for the grid/PTY sync paths.
         rt.reflow_layout();
         let leaf = rt.layout().find_leaf(id).expect("leaf");
-        assert_eq!((leaf.cols(), leaf.rows()), (40, 12));
+        assert_eq!((leaf.cols(), leaf.rows()), (100, 40));
+        assert_eq!(leaf.fixed_size(), Some(crate::UiSize::new(40, 12)));
         // Clearing restores solver geometry on the next layout install.
         let mut tree = rt.layout().clone();
         tree.find_leaf_mut(id).expect("leaf").clear_fixed_size();
@@ -474,5 +519,96 @@ mod tests {
         // Floating lifts to the Float tier with the fixed grid dims.
         assert!(frame.tier.is_some());
         assert_eq!((frame.cols, frame.rows), (40, 12));
+    }
+
+    #[test]
+    fn explicit_zero_dims_stamp_nothing_headless() {
+        use crate::Runtime;
+        let mut rt = Runtime::with_defaults().expect("defaults build");
+        let focused = rt.focused_view().expect("focused leaf");
+        let rule = |w: Option<u16>, h: Option<u16>| PanelSpawnRule {
+            cmd: Some("sh".to_string()),
+            cmd_regex: None,
+            title_regex: None,
+            content: None,
+            presentation: None,
+            width: w,
+            height: h,
+            workspace: None,
+            centered: None,
+        };
+        // Programmatic rules bypass config validation, so an explicit zero
+        // axis must fail closed here rather than clamp to 1 as a durable
+        // size.
+        rt.stamp_rule_fixed_size(focused, &rule(Some(0), Some(30)), 40, 12);
+        assert_eq!(
+            rt.layout().find_leaf(focused).expect("leaf").fixed_size(),
+            None
+        );
+        rt.stamp_rule_fixed_size(focused, &rule(Some(40), Some(0)), 40, 12);
+        assert_eq!(
+            rt.layout().find_leaf(focused).expect("leaf").fixed_size(),
+            None
+        );
+        // An absent axis keeps the spawn fallback; a first stamp wins over
+        // later ones until explicitly cleared.
+        rt.stamp_rule_fixed_size(focused, &rule(None, Some(30)), 40, 12);
+        assert_eq!(
+            rt.layout().find_leaf(focused).expect("leaf").fixed_size(),
+            Some(crate::UiSize::new(40, 30))
+        );
+        rt.stamp_rule_fixed_size(focused, &rule(Some(50), Some(20)), 40, 12);
+        assert_eq!(
+            rt.layout().find_leaf(focused).expect("leaf").fixed_size(),
+            Some(crate::UiSize::new(40, 30))
+        );
+    }
+
+    #[test]
+    fn oversized_fixed_tiled_paints_within_slot_bounds_headless() {
+        use crate::Runtime;
+        use bitty_ui::{LayoutNode, SplitAxis, View, ViewId};
+        fn two_pane() -> LayoutNode {
+            LayoutNode::split(
+                SplitAxis::Horizontal,
+                0.5,
+                LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+                LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+            )
+        }
+        // Baseline without any flag: the solver slots both leaves.
+        let mut rt = Runtime::with_defaults().expect("defaults build");
+        rt.set_layout(two_pane());
+        rt.set_container(crate::UiRect::new(0, 0, 120, 40));
+        let mut baseline = rt.present_frames();
+        baseline.sort_by_key(|frame| frame.view);
+        // An oversized fixed flag on leaf 1 must not move paint: its frame
+        // stays the slot and the sibling stays byte-identical, so no grid
+        // cell can bleed into the neighbouring tile.
+        let mut stamped = two_pane();
+        stamped
+            .find_leaf_mut(ViewId::new(1))
+            .expect("leaf")
+            .set_fixed_size(Some(crate::UiSize::new(100, 30)));
+        rt.set_layout(stamped);
+        let mut after = rt.present_frames();
+        after.sort_by_key(|frame| frame.view);
+        assert_eq!(after.len(), baseline.len());
+        for (before, now) in baseline.iter().zip(after.iter()) {
+            assert_eq!(now.view, before.view);
+            assert_eq!(now.frame, before.frame);
+            assert_eq!(now.content, before.content);
+            assert_eq!((now.cols, now.rows), (before.cols, before.rows));
+            assert_eq!(now.border, before.border);
+            assert_eq!(now.tier, before.tier);
+        }
+        // The flag itself survives the layout install for the sync paths.
+        assert_eq!(
+            rt.layout()
+                .find_leaf(ViewId::new(1))
+                .expect("leaf")
+                .fixed_size(),
+            Some(crate::UiSize::new(100, 30))
+        );
     }
 }

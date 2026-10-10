@@ -194,12 +194,23 @@ impl Runtime {
         let Some(frame) = frames.iter().find(|frame| frame.view == primary) else {
             return;
         };
-        let cols = usize::from(frame.cols.max(1));
-        let rows = usize::from(frame.rows.max(1));
+        // CTX-1088: the primary owner leaf may carry a durable fixed-size
+        // constraint whose paint dims stay slot-sized; the primary grid
+        // and PTY target the flag then, exactly like the pane sync.
+        let (cols_u16, rows_u16) = match self
+            .layout
+            .find_leaf(primary)
+            .and_then(|leaf| leaf.fixed_size())
+        {
+            Some(size) => (size.width.max(1), size.height.max(1)),
+            None => (frame.cols.max(1), frame.rows.max(1)),
+        };
+        let cols = usize::from(cols_u16);
+        let rows = usize::from(rows_u16);
         if self.state.width() != cols || self.state.height() != rows {
             self.resize_primary_grid(cols, rows);
             if let Some(pty) = self.pty.as_mut() {
-                let _ = pty.resize(frame.cols.max(1), frame.rows.max(1));
+                let _ = pty.resize(cols_u16, rows_u16);
             }
         }
     }
@@ -1006,19 +1017,28 @@ impl Runtime {
                     }
                     (dv.frame, content, dv.border)
                 };
-                // CTX-1088: fixed views own their grid dims even when the
-                // painted content is a clipped window (larger-than-slot) or
-                // a border-inset float; content-derived dims would shrink
-                // the grid back to the solver frame and drop durability.
-                // The viewport snapshot bridges grid-vs-frame mismatch with
-                // cursor-follow windowing and erased padding, so this stays
-                // presentation-safe.
+                // CTX-1088: fixed views own their grid dims only where the
+                // painted content was built for the fixed grid (floating, or
+                // tiled that fits and centers). An oversized tiled fixed
+                // keeps slot-sized paint dims: the viewport snapshot,
+                // cursor, and retained paths then window into the durable
+                // grid instead of rendering the full fixed grid into the
+                // slot, which would bleed glyphs and fills into neighbour
+                // tiles (square frames keep the documented overhang
+                // unclipped). Grid and PTY durability for the oversized
+                // case lives in the sync paths, which read the leaf flag
+                // directly rather than these paint dims.
+                let fixed_owns_paint = match fixed {
+                    Some(_) if mode_tier.is_some() => true,
+                    Some(_) => fixed_fits_tiled,
+                    None => false,
+                };
                 let (cols, rows) = match fixed {
-                    Some(size) => (
+                    Some(size) if fixed_owns_paint => (
                         u32::from(size.width).clamp(1, max_dim) as u16,
                         u32::from(size.height).clamp(1, max_dim) as u16,
                     ),
-                    None => (
+                    _ => (
                         (u32::from(content_rect.width) / cw).clamp(1, max_dim) as u16,
                         (u32::from(content_rect.height) / ch).clamp(1, max_dim) as u16,
                     ),
@@ -2128,11 +2148,15 @@ impl Runtime {
     /// fixed-size constraint (CTX-1088).
     ///
     /// Missing axes fall back to the spawn dims (matching the PTY sizing
-    /// above); degenerate or oversize inputs fail closed to solver
-    /// ownership (nothing stamped). Stamps the active layout, every
-    /// stashed workspace layout, and the pinned store so the constraint
-    /// survives workspace moves and unpin anchors. No-op when the rule
-    /// carries no dims.
+    /// above). An explicit zero axis stamps nothing at all: programmatic
+    /// rules bypass `PanelSpawnRule::validate`, so `Some(0)` must fail
+    /// closed here rather than clamp to 1 as a durable size. Oversize
+    /// inputs fail closed the same way. First stamp wins per site: a
+    /// respawn never overwrites an existing flag (clear it first to
+    /// re-stamp), so the keeps-until-cleared contract holds across rule
+    /// edits. Stamps the active layout, every stashed workspace layout,
+    /// and the pinned store so the constraint survives workspace moves
+    /// and unpin anchors. No-op when the rule carries no dims.
     pub(super) fn stamp_rule_fixed_size(
         &mut self,
         view: ViewId,
@@ -2143,6 +2167,9 @@ impl Runtime {
         if rule.width.is_none() && rule.height.is_none() {
             return;
         }
+        if rule.width == Some(0) || rule.height == Some(0) {
+            return;
+        }
         let cols = rule.width.unwrap_or(fallback_cols).max(1);
         let rows = rule.height.unwrap_or(fallback_rows).max(1);
         if cols > bitty_ui::view::MAX_FIXED_SIZE_DIM || rows > bitty_ui::view::MAX_FIXED_SIZE_DIM {
@@ -2150,15 +2177,21 @@ impl Runtime {
         }
         let size = bitty_ui::Size::new(cols, rows);
         if let Some(leaf) = self.layout.find_leaf_mut(view) {
-            leaf.set_fixed_size(Some(size));
-        }
-        for slot in &mut self.workspaces {
-            if let Some(leaf) = slot.layout.find_leaf_mut(view) {
+            if leaf.fixed_size().is_none() {
                 leaf.set_fixed_size(Some(size));
             }
         }
+        for slot in &mut self.workspaces {
+            if let Some(leaf) = slot.layout.find_leaf_mut(view) {
+                if leaf.fixed_size().is_none() {
+                    leaf.set_fixed_size(Some(size));
+                }
+            }
+        }
         if let Some(stored) = self.pinned.find_mut(view) {
-            stored.set_fixed_size(Some(size));
+            if stored.fixed_size().is_none() {
+                stored.set_fixed_size(Some(size));
+            }
         }
     }
 

@@ -84,6 +84,9 @@ pub fn centered_for(rule: &PanelSpawnRule) -> bool {
 mod tests {
     use super::*;
     use bitty_config::panel_rules::{PanelPresentation, PanelSpawnRule};
+    // Only the POSIX-shell live-spawn tests below use this (all
+    // `#[cfg(unix)]`); without the gate the import is unused on Windows.
+    #[cfg(unix)]
     use bitty_test_support::require_pty;
 
     fn floating_btop() -> PanelSpawnRule {

@@ -5471,6 +5471,131 @@ fn init_preview_never_writes_config_file() {
 }
 
 #[test]
+fn init_preview_baseline_prefers_loaded_config() {
+    // Empty layers stay on the shipped fallback (headless/test default).
+    let empty_dir = init_test_dir("baseline-empty");
+    let empty_home = empty_dir.display().to_string();
+    let empty_args = Args::new();
+    let empty_env = init_env(None, None, None, Some(&empty_home), true);
+    assert_eq!(
+        crate::init::init_preview_baseline(&empty_args, &empty_env),
+        bitty_config::fallback_builtin(),
+        "no file/profile/CLI stays on fallback"
+    );
+    let _ = std::fs::remove_dir_all(&empty_dir);
+
+    // Explicit file wins: custom theme/font seed the baseline.
+    let dir = init_test_dir("baseline-file");
+    let target = dir.join("custom.lua");
+    std::fs::write(
+        &target,
+        "return { theme = \"tokyo-night\", font = { family = \"Fira Code\", size = 14 } }\n",
+    )
+    .expect("write custom config");
+    let mut file_args = Args::new();
+    file_args.config_path = Some(target.display().to_string());
+    let home = dir.display().to_string();
+    let file_env = init_env(None, None, None, Some(&home), true);
+    let baseline = crate::init::init_preview_baseline(&file_args, &file_env);
+    assert_eq!(
+        baseline.appearance.theme.as_deref(),
+        Some("tokyo-night"),
+        "file theme seeds baseline"
+    );
+    assert_eq!(baseline.font.family, "Fira Code");
+    assert!((baseline.font.size - 14.0).abs() < f32::EPSILON);
+    assert_ne!(
+        baseline,
+        bitty_config::fallback_builtin(),
+        "loaded file differs from fallback"
+    );
+
+    // CLI wins over the file: --theme overrides the file theme.
+    let mut cli_args = Args::new();
+    cli_args.config_path = Some(target.display().to_string());
+    cli_args.theme = Some("catppuccin".to_string());
+    let cli_baseline = crate::init::init_preview_baseline(&cli_args, &file_env);
+    assert_eq!(
+        cli_baseline.appearance.theme.as_deref(),
+        Some("catppuccin"),
+        "CLI theme wins over file"
+    );
+
+    // CLI alone (no file) still seeds: --theme with empty layers.
+    let nodir = init_test_dir("baseline-cli");
+    let nohome = nodir.display().to_string();
+    let mut lone_cli = Args::new();
+    lone_cli.theme = Some("tokyo-night".to_string());
+    let lone_env = init_env(None, None, None, Some(&nohome), true);
+    let lone = crate::init::init_preview_baseline(&lone_cli, &lone_env);
+    assert_eq!(
+        lone.appearance.theme.as_deref(),
+        Some("tokyo-night"),
+        "CLI theme seeds without a file"
+    );
+    let _ = std::fs::remove_dir_all(&nodir);
+
+    // Invalid file falls back, never blocks the wizard.
+    std::fs::write(&target, "return { theme = }\n").expect("write invalid config");
+    let fallback = crate::init::init_preview_baseline(&file_args, &file_env);
+    assert_eq!(
+        fallback,
+        bitty_config::fallback_builtin(),
+        "invalid file falls back"
+    );
+
+    // Profile layering: --profile seeds under the same XDG root.
+    let prof_root = init_test_dir("baseline-profile");
+    let prof_root_s = prof_root.display().to_string();
+    let prof_dir = prof_root.join("bitty").join("profiles");
+    std::fs::create_dir_all(&prof_dir).expect("profiles dir");
+    std::fs::write(
+        prof_dir.join("myprof.lua"),
+        "return { theme = \"tokyo-night\" }\n",
+    )
+    .expect("write profile");
+    let mut prof_args = Args::new();
+    prof_args.profile = Some("myprof".to_string());
+    let prof_env = init_env(None, None, Some(&prof_root_s), None, true);
+    let prof = crate::init::init_preview_baseline(&prof_args, &prof_env);
+    assert_eq!(
+        prof.appearance.theme.as_deref(),
+        Some("tokyo-night"),
+        "profile theme seeds baseline"
+    );
+
+    // Missing profile falls back, never blocks the wizard.
+    let mut missing_args = Args::new();
+    missing_args.profile = Some("ghost".to_string());
+    let missing = crate::init::init_preview_baseline(&missing_args, &prof_env);
+    assert_eq!(
+        missing,
+        bitty_config::fallback_builtin(),
+        "missing profile falls back"
+    );
+
+    // BITTY_PROFILE env participates like --profile when the flag is absent.
+    let bitty_env = InitEnv {
+        bitty_config: None,
+        bitty_profile: Some("myprof"),
+        shell: None,
+        xdg_config_home: Some(&prof_root_s),
+        home: None,
+        columns: None,
+        stdin_is_tty: true,
+    };
+    let env_prof = crate::init::init_preview_baseline(&Args::new(), &bitty_env);
+    assert_eq!(
+        env_prof.appearance.theme.as_deref(),
+        Some("tokyo-night"),
+        "BITTY_PROFILE seeds baseline"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&prof_root);
+}
+
+#[test]
 fn init_pending_recap_matches_written_file() {
     // Full TTY pass: eleven Enters take every default; the recap printed
     // before write must equal the file subsequently written.
@@ -5818,6 +5943,7 @@ fn init_env<'a>(
 ) -> InitEnv<'a> {
     InitEnv {
         bitty_config,
+        bitty_profile: None,
         shell,
         xdg_config_home,
         home,

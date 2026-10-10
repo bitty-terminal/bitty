@@ -61,13 +61,15 @@
 //!   `expand_fold`), `fold_collapse` (alias `collapse_fold`; CTX-0723 /
 //!   #980: latest-command fold verbs, manual bind only, never in defaults),
 //!   `workspace_new`, `workspace_close`, `workspace_prev`, `workspace_next`,
-//!   `workspace_last`, `workspace_focus:<1..=16>`, `workspace_move:<1..=16>`
+//!   `workspace_last`, `workspace_next_occupied`, `workspace_prev_occupied`,
+//!   `workspace_focus:<1..=16>`, `workspace_move:<1..=16>`
 //!   (CTX-0257 workspace ops entry per DEC-0034 plus CTX-0259 move, rechorded
 //!   CTX-0766: `alt+n` opens a new panel, `alt+t` opens a new workspace):
 //!   `alt+n` new panel, `alt+t` new, `alt+d`/`alt+q` close pane/view with confirm,
 //!   `alt+w` close workspace with kill-confirm,
 //!   `alt+-`/`alt+=` prev/next (`=` is the unshifted DEC `+`), `alt+tab`
-//!   last-used, `alt+1..=9` jump to workspace N,
+//!   last-used, `alt+[`/`alt+]` next/prev occupied with wrap (CTX-1100 #1904),
+//!   `alt+1..=9` jump to workspace N,
 //!   `shift+alt+1..=9` move focused window to workspace N),
 //!   `toggle_floating` (alias `floating_toggle`; CTX-0962 / #1695: focused
 //!   panel tiled/floating toggle, default `alt+a`, `global` only),
@@ -94,7 +96,9 @@
 //! `ctrl+tab` cycles, `ctrl+shift+c/v` copy/paste) plus the DEC-0034
 //! workspace entry (CTX-0257, rechorded CTX-0766): `alt+t` new workspace,
 //! `alt+1..=9` jump to
-//! workspace N, `alt+-`/`alt+=` prev/next, `alt+tab` last-used, `alt+d`/`alt+q`
+//! workspace N, `alt+-`/`alt+=` prev/next, `alt+tab` last-used,
+//! `alt+[`/`alt+]` next/prev occupied with wrap (CTX-1100 #1904),
+//! `alt+d`/`alt+q`
 //! close pane with confirm, `alt+w` close workspace with kill-confirm,
 //! plus the Hyprland-style panel entry (CTX-0838 #1441): `alt+n`
 //! `new_panel` (adaptive dwindle axis, new-second, focus follows), plus the
@@ -769,6 +773,22 @@ pub enum ChromeAction {
     /// Switch to the last-used workspace (`workspace_last`, default
     /// `alt+tab`, MRU order). No-op with a single workspace.
     WorkspaceLast,
+    /// Switch to the next occupied workspace rightward with wrap
+    /// (`workspace_next_occupied`, default `alt+[` per #1904, CTX-1100).
+    ///
+    /// Occupied means at least one live pane session or ownership of the
+    /// primary shell (see `Runtime::workspace_is_occupied`); session-less
+    /// tiles are skipped.
+    /// From the active index lands on the next occupied slot rightward,
+    /// wrapping to the leftmost occupied at the rightmost. Fewer than two
+    /// occupied workspaces is a fail-closed no-op (loud warning, never a
+    /// panic, never a kill).
+    WorkspaceNextOccupied,
+    /// Switch to the previous occupied workspace leftward with wrap
+    /// (`workspace_prev_occupied`, default `alt+]` per #1904, CTX-1100).
+    ///
+    /// Exact mirror of [`Self::WorkspaceNextOccupied`].
+    WorkspacePrevOccupied,
     /// Jump to workspace N (`workspace_focus:<1..=16>`, defaults
     /// `alt+1..=9`). Unknown indices warn and keep the current workspace.
     WorkspaceFocus(u64),
@@ -1009,6 +1029,18 @@ impl ChromeAction {
                 reject_arg(arg, trimmed)?;
                 Ok(Self::WorkspaceLast)
             }
+            "workspace_next_occupied"
+            | "workspace_cycle_next"
+            | "workspace_cycle_next_occupied" => {
+                reject_arg(arg, trimmed)?;
+                Ok(Self::WorkspaceNextOccupied)
+            }
+            "workspace_prev_occupied"
+            | "workspace_cycle_prev"
+            | "workspace_cycle_prev_occupied" => {
+                reject_arg(arg, trimmed)?;
+                Ok(Self::WorkspacePrevOccupied)
+            }
             "workspace_focus" => {
                 let n = require_workspace_index(arg, trimmed)?;
                 Ok(Self::WorkspaceFocus(n))
@@ -1094,6 +1126,8 @@ impl ChromeAction {
             Self::WorkspacePrev => "workspace_prev".to_string(),
             Self::WorkspaceNext => "workspace_next".to_string(),
             Self::WorkspaceLast => "workspace_last".to_string(),
+            Self::WorkspaceNextOccupied => "workspace_next_occupied".to_string(),
+            Self::WorkspacePrevOccupied => "workspace_prev_occupied".to_string(),
             Self::WorkspaceFocus(n) => format!("workspace_focus:{n}"),
             Self::WorkspaceMove(n) => format!("workspace_move:{n}"),
             Self::WorkspaceSwap(n) => format!("workspace_swap:{n}"),
@@ -1113,7 +1147,7 @@ impl ChromeAction {
 /// W-144 (CTX-0937): the search/copy-mode policy actions retired with the
 /// Core policy; their namespace moves to W-138 with the plugins (CTX-0003),
 /// so the retired spellings fail closed as unknown here.
-const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, new_panel, resize_split:<left|right|up|down>, close_view, toggle_zoom, toggle_help, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, fold_toggle, fold_expand, fold_collapse, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_focus:<1..=16>, workspace_move:<1..=16>, workspace_swap:<1..=16>, jump_to_prompt:<prev|next>, select_command_output, toggle_palette, toggle_floating, toggle_pinned, command:<owner:command>";
+const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, new_panel, resize_split:<left|right|up|down>, close_view, toggle_zoom, toggle_help, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, fold_toggle, fold_expand, fold_collapse, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_next_occupied, workspace_prev_occupied, workspace_focus:<1..=16>, workspace_move:<1..=16>, workspace_swap:<1..=16>, jump_to_prompt:<prev|next>, select_command_output, toggle_palette, toggle_floating, toggle_pinned, command:<owner:command>";
 
 /// Require a `<head>:<dir>` argument.
 fn require_dir_arg(arg: Option<&str>, raw: &str) -> Result<SplitDir, ConfigError> {
@@ -1465,6 +1499,12 @@ pub const DEFAULT_KEYMAPS: &[(&str, &str)] = &[
     ("alt+-", "workspace_prev"),
     ("alt+=", "workspace_next"),
     ("alt+tab", "workspace_last"),
+    // CTX-1100 (#1904): cycle occupied workspaces with wrap. Both chords
+    // were free in the shipped map (no conflict); they carry the Mod slot
+    // so a Super flip rebinds to super+[/]. Per the owner verbatim intent,
+    // `[` moves rightward (next occupied) and `]` mirrors leftward (prev).
+    ("alt+[", "workspace_next_occupied"),
+    ("alt+]", "workspace_prev_occupied"),
     // CTX-0263 font zoom (per-window, Ctrl-held so bare typing stays
     // shell): `=` covers the unshifted `=` key, `plus` covers `+`
     // (Shift+= on US reports `+`+shift or `=`+shift depending on platform,
@@ -2475,6 +2515,22 @@ mod tests {
             ChromeAction::WorkspaceLast
         );
         assert_eq!(
+            ChromeAction::parse("workspace_next_occupied").expect("ws next occ"),
+            ChromeAction::WorkspaceNextOccupied
+        );
+        assert_eq!(
+            ChromeAction::WorkspaceNextOccupied.canonical(),
+            "workspace_next_occupied"
+        );
+        assert_eq!(
+            ChromeAction::parse("workspace_prev_occupied").expect("ws prev occ"),
+            ChromeAction::WorkspacePrevOccupied
+        );
+        assert_eq!(
+            ChromeAction::WorkspacePrevOccupied.canonical(),
+            "workspace_prev_occupied"
+        );
+        assert_eq!(
             ChromeAction::parse("workspace_focus:3").expect("ws focus"),
             ChromeAction::WorkspaceFocus(3)
         );
@@ -3118,6 +3174,7 @@ mod tests {
         // chords (shift+alt+pageup/pagedown + alt+o) = 93 total,
         // plus CTX-0962's 1 floating-toggle chord (alt+a) = 94 total,
         // plus issue #1776's 1 close-view chord (alt+q) = 95 total,
+        // plus CTX-1100's 2 occupied-cycle chords (alt+[/]) = 97 total,
         // and the full DEC
         // set resolves. Zoom chords carry
         // no `alt`, so they must stay unique under Alt and Super alike.
@@ -3125,8 +3182,8 @@ mod tests {
             let maps = default_keymaps_with_mod(mod_key).expect("defaults valid");
             assert_eq!(
                 maps.len(),
-                95,
-                "35 shipped + 4 workspace-entry chords + 4 resize chords + 16 arrow aliases + 7 zoom chords + 9 move chords + 9 swap chords + 4 help chords + 1 CTX-0766 rechord + 1 issue-1444 close-view + 3 CTX-0952 prompt chords + 1 CTX-0962 floating-toggle + 1 issue-1776 close-view (W-144 retired copy-mode + search)"
+                97,
+                "35 shipped + 4 workspace-entry chords + 4 resize chords + 16 arrow aliases + 7 zoom chords + 9 move chords + 9 swap chords + 4 help chords + 1 CTX-0766 rechord + 1 issue-1444 close-view + 3 CTX-0952 prompt chords + 1 CTX-0962 floating-toggle + 1 issue-1776 close-view + 2 CTX-1100 occupied-cycle (W-144 retired copy-mode + search)"
             );
             let mut seen = std::collections::HashSet::new();
             for m in &maps {
@@ -3164,6 +3221,19 @@ mod tests {
             match_keymap(&maps, key_ref(KeyName::Tab, false, true, false)),
             Some(ChromeAction::WorkspaceLast),
             "alt+tab is last-used workspace"
+        );
+        // CTX-1100 (#1904): occupied-cycle defaults. Both chords were free;
+        // per the owner verbatim intent `[` moves rightward (next) and `]`
+        // mirrors leftward (prev).
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('['), false, true, false)),
+            Some(ChromeAction::WorkspaceNextOccupied),
+            "alt+[ is next occupied"
+        );
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char(']'), false, true, false)),
+            Some(ChromeAction::WorkspacePrevOccupied),
+            "alt+] is prev occupied"
         );
         // CTX-0838 (#1441): alt+n opens a new panel with Hyprland-dwindle
         // semantics (adaptive axis, new-second, focus follows).
@@ -3475,6 +3545,15 @@ mod tests {
             match_keymap(&maps, key_ref_super(KeyName::Char('a'), false, false)),
             Some(ChromeAction::ToggleFloating)
         );
+        // CTX-1100 (#1904): the occupied-cycle pair follows the Mod slot.
+        assert_eq!(
+            match_keymap(&maps, key_ref_super(KeyName::Char('['), false, false)),
+            Some(ChromeAction::WorkspaceNextOccupied)
+        );
+        assert_eq!(
+            match_keymap(&maps, key_ref_super(KeyName::Char(']'), false, false)),
+            Some(ChromeAction::WorkspacePrevOccupied)
+        );
         // Old Alt spellings are unbound (back to the shell) under Super.
         for key in [
             KeyName::Char('n'),
@@ -3482,6 +3561,8 @@ mod tests {
             KeyName::Char('a'),
             KeyName::Char('-'),
             KeyName::Char('='),
+            KeyName::Char('['),
+            KeyName::Char(']'),
             KeyName::Tab,
             KeyName::Char('1'),
         ] {
@@ -3962,14 +4043,14 @@ mod tests {
             let defaults = default_keymaps_with_mod(mod_key).expect("defaults valid");
             assert_eq!(
                 defaults.len(),
-                95,
-                "no new shipped defaults under mod {:?} (90 + 3 CTX-0952 prompt chords + 1 CTX-0962 floating-toggle + 1 issue-1776 close-view)",
+                97,
+                "no new shipped defaults under mod {:?} (90 + 3 CTX-0952 prompt chords + 1 CTX-0962 floating-toggle + 1 issue-1776 close-view + 2 CTX-1100 occupied-cycle)",
                 mod_key
             );
             let maps = resolve_keymaps(&mk_effective(mod_key)).expect("resolves");
             assert_eq!(
                 maps.len(),
-                95 + entries.len(),
+                97 + entries.len(),
                 "explicit binds append, never shadow, under mod {:?}",
                 mod_key
             );

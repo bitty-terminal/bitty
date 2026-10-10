@@ -959,6 +959,130 @@ impl Runtime {
         self.active_workspace
     }
 
+    /// Whether workspace `index` counts as occupied for cycle jumps.
+    ///
+    /// CTX-1100 (#1904): occupied means at least one live pane session
+    /// owned by the workspace leaves, or ownership of the runtime-global
+    /// primary shell (see [`Self::workspace_owns_primary`]). Every slot
+    /// always holds at least one leaf by invariant, so leaf count cannot
+    /// define occupancy; a session-less tile (fresh idle leaf, or the
+    /// emptied tile kept by the CTX-1044 reap branch) renders empty and is
+    /// skipped. Reuses [`Self::workspace_live_count`] for the pane half.
+    #[must_use]
+    pub fn workspace_is_occupied(&self, index: usize) -> bool {
+        self.workspace_live_count(index) > 0 || self.workspace_owns_primary(index)
+    }
+
+    /// Whether the runtime-global primary shell is owned by a leaf of
+    /// workspace `index` (CTX-1100, #1904 follow-up).
+    ///
+    /// The primary shell is never a pane session — [`Self::workspace_live_count`]
+    /// counts it 0 so close never confirm-kills it — but a workspace holding
+    /// the primary owner is live for the user: the normal two-workspace flow
+    /// (primary attached in ws1, replayed pane shell in ws2) must cycle
+    /// instead of no-op-ing on a single pane-counted occupant. The recipe
+    /// latch (`primary_spawn`) distinguishes an attached primary from the
+    /// fresh-designated owner (`primary_view` is pre-pinned to the initial
+    /// leaf with no shell behind it, `Runtime` construction): headless with
+    /// no attach owns nothing. Time O(l) over the workspace leaves; space
+    /// O(l) for the id list.
+    #[must_use]
+    pub fn workspace_owns_primary(&self, index: usize) -> bool {
+        if self.primary_spawn.is_none() {
+            return false;
+        }
+        let Some(owner) = self.primary_view else {
+            return false;
+        };
+        if index == self.active_workspace {
+            self.layout.leaf_ids().contains(&owner)
+        } else {
+            self.workspaces
+                .get(index)
+                .is_some_and(|slot| slot.layout.leaf_ids().contains(&owner))
+        }
+    }
+
+    /// Occupied workspace indices in index order (CTX-1100, #1904).
+    ///
+    /// Bounded by `MAX_WORKSPACES` slots. Time O(w * l) over `w` workspaces
+    /// and `l` total leaves; space O(w).
+    #[must_use]
+    pub fn workspace_occupied_indices(&self) -> Vec<usize> {
+        (0..self.workspaces.len())
+            .filter(|&i| self.workspace_is_occupied(i))
+            .collect()
+    }
+
+    /// Switch to the next occupied workspace rightward with wrap (CTX-1100).
+    ///
+    /// From the active index, lands on the smallest occupied index above it;
+    /// when none sits above (rightmost occupied), wraps to the smallest
+    /// occupied index (leftmost). Fewer than two occupied workspaces is a
+    /// fail-closed `None` with state untouched (loud-warn at the keymap
+    /// layer, never a panic). Reuses [`Self::workspace_switch`], so every
+    /// switch side effect (stash/load, MRU, pending-shell respawn, redraw)
+    /// matches the other switch paths. Returns the new active index.
+    pub fn workspace_next_occupied(&mut self) -> Option<usize> {
+        let occupied = self.workspace_occupied_indices();
+        self.workspace_next_in(&occupied)
+    }
+
+    /// Switch to the previous occupied workspace leftward with wrap (CTX-1100).
+    ///
+    /// Exact mirror of [`Self::workspace_next_occupied`]: lands on the
+    /// largest occupied index below the active one, wrapping to the largest
+    /// occupied index (rightmost) when none sits below. Fewer than two
+    /// occupied is a fail-closed `None` with state untouched.
+    pub fn workspace_prev_occupied(&mut self) -> Option<usize> {
+        let occupied = self.workspace_occupied_indices();
+        self.workspace_prev_in(&occupied)
+    }
+
+    /// Switch to the next index in `occupied` rightward with wrap (CTX-1100).
+    ///
+    /// Shared engine behind [`Self::workspace_next_occupied`] and the
+    /// app-level zoom-aware cycle: the caller supplies occupancy in index
+    /// order (the runtime list, or that list plus zoom-backed leaves the
+    /// runtime cannot see). Fewer than two entries, or a target outside the
+    /// live slot table, is a fail-closed `None` with state untouched.
+    /// Returns the new active index.
+    pub fn workspace_next_in(&mut self, occupied: &[usize]) -> Option<usize> {
+        if occupied.len() < 2 {
+            return None;
+        }
+        let target = occupied
+            .iter()
+            .copied()
+            .find(|&i| i > self.active_workspace)
+            .unwrap_or(occupied[0]);
+        if target >= self.workspaces.len() {
+            return None;
+        }
+        self.workspace_switch(target);
+        Some(self.active_workspace)
+    }
+
+    /// Switch to the previous index in `occupied` leftward with wrap (CTX-1100).
+    ///
+    /// Exact mirror of [`Self::workspace_next_in`]; same fail-closed contract.
+    pub fn workspace_prev_in(&mut self, occupied: &[usize]) -> Option<usize> {
+        if occupied.len() < 2 {
+            return None;
+        }
+        let target = occupied
+            .iter()
+            .copied()
+            .rev()
+            .find(|&i| i < self.active_workspace)
+            .unwrap_or(occupied[occupied.len() - 1]);
+        if target >= self.workspaces.len() {
+            return None;
+        }
+        self.workspace_switch(target);
+        Some(self.active_workspace)
+    }
+
     /// Jump to workspace `one_based` (1-based display index, the `Alt+N`
     /// key path). Issue #1365: `N` beyond the live count clamps to the
     /// last workspace instead of failing; `0` (and an empty slot list,
@@ -1880,6 +2004,257 @@ mod tests {
         assert_eq!(rt.workspace_names(), vec![String::from("ws1")]);
         assert!(!rt.has_pending_ws_close());
         assert_eq!(rt.workspace_live_count(0), 0);
+    }
+
+    #[test]
+    fn cycle_occupied_noop_when_fewer_than_two_occupied_headless() {
+        // CTX-1100 (#1904): fail-closed no-op without live shells, never a
+        // panic. Fresh headless runtime holds zero occupied workspaces.
+        let mut rt = fresh();
+        assert!(rt.workspace_occupied_indices().is_empty());
+        assert!(!rt.workspace_is_occupied(0));
+        assert_eq!(rt.workspace_next_occupied(), None);
+        assert_eq!(rt.active_workspace_index(), 0);
+        assert_eq!(rt.workspace_prev_occupied(), None);
+        assert_eq!(rt.active_workspace_index(), 0);
+        assert_eq!(rt.workspace_count(), 1);
+    }
+
+    // Live-spawn: runs real POSIX shells (no Windows equivalent).
+    // `#[cfg(unix)]` keeps it off Windows CI; `require_pty!()` keeps the
+    // force-no-PTY simulation path.
+    #[test]
+    #[cfg(unix)]
+    fn cycle_occupied_counts_primary_owner_as_occupied() {
+        require_pty!();
+        // CTX-1100 follow-up (CodeRabbit PR #1917): the normal two-workspace
+        // flow holds the primary shell in ws1 and a replayed pane shell in
+        // ws2. The primary is never a pane session, so the close gate still
+        // sees ws1 as idle — but the cycle must treat the primary owner as
+        // occupied, or the pair wrongly no-ops on a single pane-counted
+        // occupant.
+        let mut rt = fresh();
+        rt.spawn_shell("/bin/sh").expect("primary must attach");
+        let owner = rt.primary_view().expect("primary owner");
+        assert_eq!(
+            rt.workspace_live_count(0),
+            0,
+            "primary-only stays idle for the close gate"
+        );
+        assert!(rt.workspace_owns_primary(0));
+        assert!(
+            rt.workspace_is_occupied(0),
+            "primary owner counts for the cycle"
+        );
+        rt.workspace_new().expect("ws2 replays the primary recipe");
+        let ws2_leaf = rt.focused_view().expect("ws2 focus");
+        assert!(
+            rt.has_pane_session(&ws2_leaf),
+            "replay gives ws2 its own pane shell"
+        );
+        assert_eq!(rt.workspace_occupied_indices(), vec![0, 1]);
+        assert!(rt.workspace_switch(0));
+        assert_eq!(rt.workspace_next_occupied().expect("must jump"), 1);
+        assert_eq!(rt.workspace_prev_occupied().expect("must mirror"), 0);
+        assert_eq!(rt.workspace_count(), 2, "cycle must not kill");
+        assert_eq!(rt.primary_view(), Some(owner), "primary survives");
+        assert!(rt.focused_view().is_some(), "focus survives");
+    }
+
+    // Live-spawn: runs real POSIX shells (no Windows equivalent).
+    // `#[cfg(unix)]` keeps it off Windows CI; `require_pty!()` keeps the
+    // force-no-PTY simulation path.
+    #[test]
+    #[cfg(unix)]
+    fn cycle_next_occupied_moves_right_and_skips_empty() {
+        require_pty!();
+        // CTX-1100 (#1904): ws1 occupied, ws2 empty, ws3 occupied. From ws1
+        // the next occupied rightward skips ws2 and lands on ws3.
+        let mut rt = fresh();
+        let ws1_leaf = rt.focused_view().expect("ws1 focus");
+        rt.spawn_shell_for_view(ws1_leaf, "/bin/sh", &[], 40, 12)
+            .expect("ws1 shell must spawn");
+        rt.workspace_new().expect("ws2 empty");
+        rt.workspace_new().expect("ws3");
+        let ws3_leaf = rt.focused_view().expect("ws3 focus");
+        rt.spawn_shell_for_view(ws3_leaf, "/bin/sh", &[], 40, 12)
+            .expect("ws3 shell must spawn");
+        assert_eq!(rt.workspace_count(), 3);
+        assert_eq!(rt.workspace_occupied_indices(), vec![0, 2]);
+        assert!(!rt.workspace_is_occupied(1));
+        assert!(rt.workspace_switch(0));
+        let before = rt.pane_session_ids();
+        assert_eq!(before.len(), 2);
+        let target = rt.workspace_next_occupied().expect("must jump to ws3");
+        assert_eq!(target, 2);
+        assert_eq!(rt.active_workspace_index(), 2);
+        assert_eq!(rt.workspace_count(), 3, "jump must not kill");
+        assert_eq!(rt.pane_session_ids().len(), 2, "sessions intact");
+        for id in &before {
+            assert!(rt.has_pane_session(id), "session survives jump");
+        }
+        assert!(rt.focused_view().is_some(), "focus intact after jump");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cycle_next_occupied_from_ws1_lands_ws2_when_occupied() {
+        require_pty!();
+        // CTX-1100 (#1904): the base case, both neighbors occupied.
+        let mut rt = fresh();
+        let ws1_leaf = rt.focused_view().expect("ws1 focus");
+        rt.spawn_shell_for_view(ws1_leaf, "/bin/sh", &[], 40, 12)
+            .expect("ws1 shell must spawn");
+        rt.workspace_new().expect("ws2");
+        let ws2_leaf = rt.focused_view().expect("ws2 focus");
+        rt.spawn_shell_for_view(ws2_leaf, "/bin/sh", &[], 40, 12)
+            .expect("ws2 shell must spawn");
+        assert_eq!(rt.workspace_occupied_indices(), vec![0, 1]);
+        assert!(rt.workspace_switch(0));
+        let target = rt.workspace_next_occupied().expect("must jump to ws2");
+        assert_eq!(target, 1);
+        assert_eq!(rt.active_workspace_index(), 1);
+        assert_eq!(rt.workspace_count(), 2);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cycle_next_occupied_wraps_rightmost_to_leftmost() {
+        require_pty!();
+        // CTX-1100 (#1904): at the rightmost occupied, wrap to leftmost.
+        let mut rt = fresh();
+        let ws1_leaf = rt.focused_view().expect("ws1 focus");
+        rt.spawn_shell_for_view(ws1_leaf, "/bin/sh", &[], 40, 12)
+            .expect("ws1 shell must spawn");
+        rt.workspace_new().expect("ws2");
+        let ws2_leaf = rt.focused_view().expect("ws2 focus");
+        rt.spawn_shell_for_view(ws2_leaf, "/bin/sh", &[], 40, 12)
+            .expect("ws2 shell must spawn");
+        rt.workspace_new().expect("ws3");
+        let ws3_leaf = rt.focused_view().expect("ws3 focus");
+        rt.spawn_shell_for_view(ws3_leaf, "/bin/sh", &[], 40, 12)
+            .expect("ws3 shell must spawn");
+        assert_eq!(rt.workspace_count(), 3);
+        assert_eq!(rt.workspace_occupied_indices(), vec![0, 1, 2]);
+        assert_eq!(rt.active_workspace_index(), 2);
+        let target = rt.workspace_next_occupied().expect("must wrap");
+        assert_eq!(target, 0);
+        assert_eq!(rt.active_workspace_index(), 0);
+        assert_eq!(rt.workspace_count(), 3, "wrap must not kill");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cycle_prev_occupied_mirrors_next_with_wrap_and_skip() {
+        require_pty!();
+        // CTX-1100 (#1904): `]` mirrors `[`. ws1 occupied, ws2 empty, ws3
+        // occupied: from ws1 prev wraps to ws3; from ws3 prev skips ws2.
+        let mut rt = fresh();
+        let ws1_leaf = rt.focused_view().expect("ws1 focus");
+        rt.spawn_shell_for_view(ws1_leaf, "/bin/sh", &[], 40, 12)
+            .expect("ws1 shell must spawn");
+        rt.workspace_new().expect("ws2 empty");
+        rt.workspace_new().expect("ws3");
+        let ws3_leaf = rt.focused_view().expect("ws3 focus");
+        rt.spawn_shell_for_view(ws3_leaf, "/bin/sh", &[], 40, 12)
+            .expect("ws3 shell must spawn");
+        assert_eq!(rt.workspace_occupied_indices(), vec![0, 2]);
+        assert!(rt.workspace_switch(0));
+        let wrapped = rt.workspace_prev_occupied().expect("must wrap to ws3");
+        assert_eq!(wrapped, 2);
+        assert_eq!(rt.active_workspace_index(), 2);
+        let skipped = rt.workspace_prev_occupied().expect("must skip ws2");
+        assert_eq!(skipped, 0);
+        assert_eq!(rt.active_workspace_index(), 0);
+        assert_eq!(rt.workspace_count(), 3, "mirror must not kill");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cycle_prev_occupied_wraps_leftmost_to_rightmost() {
+        require_pty!();
+        // CTX-1100 (#1904): all occupied, leftmost prev wraps to rightmost.
+        let mut rt = fresh();
+        let ws1_leaf = rt.focused_view().expect("ws1 focus");
+        rt.spawn_shell_for_view(ws1_leaf, "/bin/sh", &[], 40, 12)
+            .expect("ws1 shell must spawn");
+        rt.workspace_new().expect("ws2");
+        let ws2_leaf = rt.focused_view().expect("ws2 focus");
+        rt.spawn_shell_for_view(ws2_leaf, "/bin/sh", &[], 40, 12)
+            .expect("ws2 shell must spawn");
+        rt.workspace_new().expect("ws3");
+        let ws3_leaf = rt.focused_view().expect("ws3 focus");
+        rt.spawn_shell_for_view(ws3_leaf, "/bin/sh", &[], 40, 12)
+            .expect("ws3 shell must spawn");
+        assert!(rt.workspace_switch(0));
+        let wrapped = rt.workspace_prev_occupied().expect("must wrap");
+        assert_eq!(wrapped, 2);
+        assert_eq!(rt.active_workspace_index(), 2);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cycle_occupied_singleton_is_fail_closed_noop() {
+        require_pty!();
+        // CTX-1100 (#1904): fewer than two occupied is a loud-warn no-op at
+        // the keymap layer; the runtime returns None with state untouched.
+        let mut rt = fresh();
+        let ws1_leaf = rt.focused_view().expect("ws1 focus");
+        rt.spawn_shell_for_view(ws1_leaf, "/bin/sh", &[], 40, 12)
+            .expect("ws1 shell must spawn");
+        rt.workspace_new().expect("ws2 empty");
+        rt.workspace_new().expect("ws3 empty");
+        assert_eq!(rt.workspace_occupied_indices(), vec![0]);
+        assert!(rt.workspace_switch(0));
+        assert_eq!(rt.workspace_next_occupied(), None);
+        assert_eq!(rt.active_workspace_index(), 0);
+        assert_eq!(rt.workspace_prev_occupied(), None);
+        assert_eq!(rt.active_workspace_index(), 0);
+        assert_eq!(rt.workspace_count(), 3, "no-op must not kill");
+        assert!(rt.has_pane_session(&ws1_leaf), "session intact");
+        assert!(rt.focused_view().is_some(), "focus intact");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cycle_occupied_keeps_focus_and_sessions_intact() {
+        require_pty!();
+        // CTX-1100 (#1904): a jump never kills workspaces or sessions and
+        // leaves a focused leaf behind.
+        let mut rt = fresh();
+        let ws1_leaf = rt.focused_view().expect("ws1 focus");
+        rt.spawn_shell_for_view(ws1_leaf, "/bin/sh", &[], 40, 12)
+            .expect("ws1 shell must spawn");
+        rt.workspace_new().expect("ws2");
+        let ws2_leaf = rt.focused_view().expect("ws2 focus");
+        rt.spawn_shell_for_view(ws2_leaf, "/bin/sh", &[], 40, 12)
+            .expect("ws2 shell must spawn");
+        assert!(rt.workspace_switch(0));
+        let before_ids = rt.pane_session_ids();
+        let before_count = rt.workspace_count();
+        let before_leaves: usize = rt
+            .workspace_summaries()
+            .iter()
+            .map(|s| s.panel_ids.len())
+            .sum();
+        rt.workspace_next_occupied().expect("must jump");
+        assert_eq!(rt.workspace_count(), before_count, "no workspace killed");
+        assert_eq!(rt.pane_session_ids().len(), before_ids.len());
+        for id in &before_ids {
+            assert!(rt.has_pane_session(id), "every session survives");
+        }
+        let after_leaves: usize = rt
+            .workspace_summaries()
+            .iter()
+            .map(|s| s.panel_ids.len())
+            .sum();
+        assert_eq!(after_leaves, before_leaves, "no panel lost");
+        assert!(rt.focused_view().is_some(), "focus survives jump");
+        // Mirror back preserves the same invariants.
+        rt.workspace_prev_occupied().expect("must jump back");
+        assert_eq!(rt.workspace_count(), before_count);
+        assert_eq!(rt.pane_session_ids().len(), before_ids.len());
+        assert!(rt.focused_view().is_some());
     }
 
     /// CTX-0979: Core draws no workspace display (Hyprland-style). The

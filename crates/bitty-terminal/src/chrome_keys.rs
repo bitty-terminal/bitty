@@ -220,6 +220,15 @@ impl ZoomState {
             .map(|entry| entry.backup.leaf_ids().len())
     }
 
+    /// Live leaf ids of one workspace's real tree while zoomed, without
+    /// consuming the entry (CTX-1100 occupied-cycle read).
+    ///
+    /// `None` when the workspace holds no zoom backup. The caller owns the
+    /// vec; zoom state is untouched, so a later disengage still restores.
+    pub(crate) fn backup_leaf_ids_for_seq(&self, seq: u64) -> Option<Vec<ViewId>> {
+        self.entries.get(&seq).map(|entry| entry.backup.leaf_ids())
+    }
+
     /// Engages zoom on `view`: captures the real tree and installs the
     /// single-leaf proxy. Refuses when the active workspace is already
     /// zoomed or the view is not a leaf, leaving the layout untouched.
@@ -921,6 +930,59 @@ impl TerminalApp {
         active + self.runtime.inactive_workspaces_leaf_count()
     }
 
+    /// Occupied workspace indices in index order for the occupied cycle
+    /// (CTX-1100, #1904 follow-up to CodeRabbit PR #1917).
+    ///
+    /// Starts from [`Runtime::workspace_occupied_indices`] (pane sessions
+    /// plus the primary owner) and unions zoom-backed leaves: while zoomed
+    /// the live layout — and the stashed slot after a switch-away — holds
+    /// only the single-leaf proxy, so a workspace zoomed onto a
+    /// session-less leaf would wrongly read empty while its backup still
+    /// owns live sessions. Backup leaves are read without consuming zoom
+    /// state, so a later disengage still restores. Bounded by the live
+    /// workspace count; time O(w * l).
+    #[must_use]
+    pub(crate) fn occupied_indices_for_cycle(&self) -> Vec<usize> {
+        (0..self.runtime.workspace_count())
+            .filter(|&index| {
+                self.runtime.workspace_is_occupied(index) || self.backup_holds_live_session(index)
+            })
+            .collect()
+    }
+
+    /// Whether workspace `index`'s zoom backup owns a live session
+    /// (CTX-1100). Read-only: the backup entry is never consumed here.
+    fn backup_holds_live_session(&self, index: usize) -> bool {
+        let Some(seq) = self.runtime.workspace_seq_at(index) else {
+            return false;
+        };
+        let Some(ids) = self.chrome.zoom.backup_leaf_ids_for_seq(seq) else {
+            return false;
+        };
+        ids.iter()
+            .any(|id| self.runtime.has_pane_session(id) || self.runtime.primary_view() == Some(*id))
+    }
+
+    /// Switch to the next occupied workspace rightward with wrap (CTX-1100).
+    ///
+    /// Zoom-aware engine behind the `workspace_next_occupied` chord: same
+    /// wrap and fail-closed contract as
+    /// [`Runtime::workspace_next_occupied`], over
+    /// [`Self::occupied_indices_for_cycle`]. Never consumes zoom state.
+    /// Returns the new active index, or `None` with state untouched.
+    fn cycle_next_occupied(&mut self) -> Option<usize> {
+        let occupied = self.occupied_indices_for_cycle();
+        self.runtime.workspace_next_in(&occupied)
+    }
+
+    /// Switch to the previous occupied workspace leftward with wrap (CTX-1100).
+    ///
+    /// Exact mirror of [`Self::cycle_next_occupied`].
+    fn cycle_prev_occupied(&mut self) -> Option<usize> {
+        let occupied = self.occupied_indices_for_cycle();
+        self.runtime.workspace_prev_in(&occupied)
+    }
+
     /// Applies one `fold_toggle`/`fold_expand`/`fold_collapse` verb to the
     /// focused view's latest command block (CTX-0723 #980).
     ///
@@ -1034,7 +1096,12 @@ impl TerminalApp {
         // no-op with no capture active. `InvokeCommand` is not a focus
         // switch (invoking a command never moves focus), so it clones for
         // the predicate and runs below.
-        if Self::is_overlay_focus_switch(action.clone()) {
+        // CTX-1100: the occupied cycle revokes only after a successful
+        // switch (see its arms below); a refused cycle (<2 occupied)
+        // preserves the capture, so it is deferred here.
+        let defer_capture_revoke =
+            matches!(&action, A::WorkspaceNextOccupied | A::WorkspacePrevOccupied);
+        if !defer_capture_revoke && Self::is_overlay_focus_switch(action.clone()) {
             self.revoke_overlay_capture();
         }
         match action {
@@ -1467,6 +1534,45 @@ impl TerminalApp {
                     index + 1,
                     self.runtime.workspace_names().join(" ")
                 );
+            }
+            A::WorkspaceNextOccupied => {
+                // CTX-1100 (#1904): next occupied rightward with wrap.
+                // Fewer than two occupied is a loud no-op, never a panic,
+                // never a kill; sessions and focus stay intact either way.
+                // The overlay capture revokes only on a successful switch —
+                // a refused cycle preserves it (CodeRabbit PR #1917).
+                match self.cycle_next_occupied() {
+                    Some(index) => {
+                        self.revoke_overlay_capture();
+                        eprintln!(
+                            "bitty: keymap workspace_next_occupied -> workspace {} ({})",
+                            index + 1,
+                            self.runtime.workspace_names().join(" ")
+                        );
+                    }
+                    None => eprintln!(
+                        "warning: keymap workspace_next_occupied needs two occupied workspaces ({}) — ignoring",
+                        self.runtime.workspace_names().join(" ")
+                    ),
+                }
+            }
+            A::WorkspacePrevOccupied => {
+                // CTX-1100 (#1904): exact mirror leftward with wrap. Same
+                // capture-safe contract as the next arm.
+                match self.cycle_prev_occupied() {
+                    Some(index) => {
+                        self.revoke_overlay_capture();
+                        eprintln!(
+                            "bitty: keymap workspace_prev_occupied -> workspace {} ({})",
+                            index + 1,
+                            self.runtime.workspace_names().join(" ")
+                        );
+                    }
+                    None => eprintln!(
+                        "warning: keymap workspace_prev_occupied needs two occupied workspaces ({}) — ignoring",
+                        self.runtime.workspace_names().join(" ")
+                    ),
+                }
             }
             A::WorkspaceFocus(n) => {
                 // Issue #1365: Alt+N clamps to the last workspace when N
@@ -2247,6 +2353,19 @@ impl TerminalApp {
                             return true;
                         }
                         match &matched {
+                            Some(
+                                bitty_config::ChromeAction::WorkspaceNextOccupied
+                                | bitty_config::ChromeAction::WorkspacePrevOccupied,
+                            ) => {
+                                // CTX-1100: eligible for focus-switch dispatch
+                                // (falls through below like the other
+                                // workspace moves) but the capture revokes
+                                // only after a successful switch in
+                                // `apply_chrome_action` — a refused cycle
+                                // (<2 occupied) preserves it (CodeRabbit
+                                // PR #1917). No queue, no swallow: the chord
+                                // must reach dispatch, never the overlay.
+                            }
                             Some(action) if Self::is_overlay_focus_switch(action.clone()) => {
                                 self.revoke_overlay_capture();
                             }
@@ -2662,6 +2781,15 @@ mod tests {
         assert_eq!(
             match_keymap(&maps, shell(KeyName::Tab, false, true, false)),
             Some(bitty_config::ChromeAction::WorkspaceLast)
+        );
+        // CTX-1100 (#1904): occupied-cycle pair on Mod+[/].
+        assert_eq!(
+            match_keymap(&maps, shell(KeyName::Char('['), false, true, false)),
+            Some(bitty_config::ChromeAction::WorkspaceNextOccupied)
+        );
+        assert_eq!(
+            match_keymap(&maps, shell(KeyName::Char(']'), false, true, false)),
+            Some(bitty_config::ChromeAction::WorkspacePrevOccupied)
         );
         assert_eq!(
             match_keymap(&maps, shell(KeyName::Char('u'), false, true, false)),
@@ -4524,6 +4652,331 @@ mod tests {
         app.apply_chrome_action(ChromeAction::WorkspaceClose);
         assert!(!app.runtime.has_pending_ws_close());
         assert_eq!(app.runtime.workspace_names(), vec![String::from("ws1")]);
+    }
+
+    #[test]
+    fn chrome_workspace_occupied_cycle_noop_when_fewer_than_two_occupied() {
+        // CTX-1100 (#1904): headless fail-closed path, never a panic, never
+        // a kill. Fresh app holds zero occupied workspaces.
+        use bitty_config::ChromeAction;
+        let mut app = workspace_test_app();
+        app.apply_chrome_action(ChromeAction::WorkspaceNew);
+        app.apply_chrome_action(ChromeAction::WorkspaceNew);
+        assert_eq!(app.runtime.workspace_count(), 3);
+        assert!(app.runtime.workspace_occupied_indices().is_empty());
+        assert!(app.runtime.workspace_switch(0));
+        app.apply_chrome_action(ChromeAction::WorkspaceNextOccupied);
+        assert_eq!(app.runtime.active_workspace_index(), 0);
+        app.apply_chrome_action(ChromeAction::WorkspacePrevOccupied);
+        assert_eq!(app.runtime.active_workspace_index(), 0);
+        assert_eq!(app.runtime.workspace_count(), 3);
+        assert!(app.runtime.focused_view().is_some());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn chrome_workspace_occupied_cycle_jumps_with_wrap_and_keeps_sessions() {
+        // CTX-1100 (#1904): Mod+[ / Mod+] through the chrome arms. ws1 and
+        // ws3 occupied, ws2 empty: next skips ws2, prev mirrors, wrap holds,
+        // and no workspace or session dies.
+        require_pty!();
+        use bitty_config::ChromeAction;
+        let mut app = workspace_test_app();
+        let ws1_leaf = app.runtime.focused_view().expect("ws1 focus");
+        app.runtime
+            .spawn_shell_for_view(ws1_leaf, "/bin/sh", &[], 40, 12)
+            .expect("ws1 shell must spawn");
+        app.apply_chrome_action(ChromeAction::WorkspaceNew);
+        app.apply_chrome_action(ChromeAction::WorkspaceNew);
+        let ws3_leaf = app.runtime.focused_view().expect("ws3 focus");
+        app.runtime
+            .spawn_shell_for_view(ws3_leaf, "/bin/sh", &[], 40, 12)
+            .expect("ws3 shell must spawn");
+        assert_eq!(app.runtime.workspace_count(), 3);
+        assert_eq!(app.runtime.workspace_occupied_indices(), vec![0, 2]);
+        assert!(app.runtime.workspace_switch(0));
+        let before = app.runtime.pane_session_ids();
+        assert_eq!(before.len(), 2);
+        // Mod+[ is next occupied rightward.
+        app.apply_chrome_action(ChromeAction::WorkspaceNextOccupied);
+        assert_eq!(app.runtime.active_workspace_index(), 2);
+        // At the rightmost occupied, next wraps to the leftmost.
+        app.apply_chrome_action(ChromeAction::WorkspaceNextOccupied);
+        assert_eq!(app.runtime.active_workspace_index(), 0);
+        // Mod+] mirrors: from ws1 prev wraps to ws3, then skips ws2 back.
+        app.apply_chrome_action(ChromeAction::WorkspacePrevOccupied);
+        assert_eq!(app.runtime.active_workspace_index(), 2);
+        app.apply_chrome_action(ChromeAction::WorkspacePrevOccupied);
+        assert_eq!(app.runtime.active_workspace_index(), 0);
+        assert_eq!(app.runtime.workspace_count(), 3, "cycle must not kill");
+        assert_eq!(app.runtime.pane_session_ids().len(), before.len());
+        for id in &before {
+            assert!(app.runtime.has_pane_session(id), "session survives cycle");
+        }
+        assert!(app.runtime.focused_view().is_some(), "focus survives cycle");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn chrome_workspace_occupied_cycle_counts_zoom_backed_up_sessions() {
+        // CTX-1100 follow-up (CodeRabbit PR #1917): a workspace zoomed onto
+        // a session-less leaf keeps its other leaves in the zoom backup.
+        // The live proxy alone reads empty, so the runtime list misses it;
+        // the app cycle must count the backup without consuming zoom state.
+        require_pty!();
+        use bitty_config::ChromeAction;
+        let mut app = workspace_test_app();
+        // ws2 first (fresh single leaf), then split ws1 with a high id so
+        // later allocations can never collide with the escaped tree.
+        app.apply_chrome_action(ChromeAction::WorkspaceNew);
+        assert!(app.runtime.workspace_switch(0));
+        let first = app.runtime.focused_view().expect("ws1 focus");
+        let second = ViewId::new(9);
+        let mut layout = app.runtime.layout().clone();
+        let old = layout.find_leaf(first).cloned().expect("ws1 leaf");
+        layout = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(old),
+            LayoutNode::leaf(View::new(second, 80, 24)),
+        );
+        app.runtime.set_layout(layout);
+        // Live session only on the second leaf; zoom onto the session-less
+        // first leaf so the live proxy hides the session.
+        app.runtime
+            .spawn_shell_for_view(second, "/bin/sh", &[], 40, 12)
+            .expect("ws1 second shell must spawn");
+        assert!(app.runtime.set_focus(first));
+        app.apply_chrome_action(ChromeAction::ToggleZoom);
+        assert_eq!(app.runtime.leaf_count(), 1, "zoom collapses to proxy");
+        assert_eq!(
+            app.runtime.workspace_live_count(0),
+            0,
+            "proxy alone reads empty at runtime level"
+        );
+        assert_eq!(
+            app.chrome.zoom.backup_leaf_count(&app.runtime),
+            Some(2),
+            "backup still holds the real tree"
+        );
+        // ws2 gets its own shell; the zoom-aware list sees both workspaces
+        // while the runtime list sees only ws2.
+        assert!(app.runtime.workspace_switch(1));
+        let ws2_leaf = app.runtime.focused_view().expect("ws2 focus");
+        app.runtime
+            .spawn_shell_for_view(ws2_leaf, "/bin/sh", &[], 40, 12)
+            .expect("ws2 shell must spawn");
+        assert_eq!(app.runtime.workspace_occupied_indices(), vec![1]);
+        assert_eq!(app.occupied_indices_for_cycle(), vec![0, 1]);
+        // From ws2 (rightmost occupied) next wraps onto zoomed ws1; the
+        // backup survives the round trip instead of being consumed.
+        app.apply_chrome_action(ChromeAction::WorkspaceNextOccupied);
+        assert_eq!(app.runtime.active_workspace_index(), 0);
+        assert_eq!(
+            app.chrome.zoom.backup_leaf_count(&app.runtime),
+            Some(2),
+            "cycle must not consume the zoom backup"
+        );
+        // Mirror back to ws2; sessions and workspaces intact.
+        app.apply_chrome_action(ChromeAction::WorkspacePrevOccupied);
+        assert_eq!(app.runtime.active_workspace_index(), 1);
+        assert_eq!(app.runtime.workspace_count(), 2, "cycle must not kill");
+        assert!(
+            app.runtime.has_pane_session(&second),
+            "backed-up session survives"
+        );
+        assert!(
+            app.runtime.has_pane_session(&ws2_leaf),
+            "ws2 session survives"
+        );
+        assert!(app.runtime.focused_view().is_some(), "focus survives");
+    }
+
+    /// Overlay-capture app for the CTX-1100 capture tests: one Lua plugin
+    /// mounts an overlay Text block and acquires capture on init (same
+    /// wiring as
+    /// `crate::tests::overlay_capture_wiring_lifecycle_cancel_timeout_and_paint`).
+    /// Returns the app (capture active) plus temp dirs the caller removes.
+    fn overlay_capture_test_app(
+        name: &str,
+    ) -> (TerminalApp, std::path::PathBuf, std::path::PathBuf) {
+        use bitty_runtime::plugin_runtime::{
+            BridgeError, EmptySettings, LuaValue, PluginRuntime, PluginRuntimeConfig,
+            SnapshotSource,
+        };
+
+        struct StaticSnapshot;
+        impl SnapshotSource for StaticSnapshot {
+            fn snapshot(&self, _scope: &str) -> Result<LuaValue, BridgeError> {
+                Ok(LuaValue::table([
+                    ("version", LuaValue::Integer(1)),
+                    ("zones", LuaValue::array(vec![])),
+                ]))
+            }
+        }
+
+        let tag = format!("ctx1100-{name}-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("bitty-{tag}-root"));
+        let data = std::env::temp_dir().join(format!("bitty-{tag}-data"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&data);
+        let id = "bitty-featured.ctx1100capture";
+        let plugin_dir = root.join(id);
+        std::fs::create_dir_all(plugin_dir.join("lua")).expect("dirs");
+        std::fs::write(
+            plugin_dir.join("bitty-plugin.toml"),
+            format!(
+                r#"[plugin]
+id = "{id}"
+name = "CTX-1100 capture"
+version = "0.1.0"
+description = "occupied-cycle capture test"
+
+[compat]
+plugin-api = "^1.0"
+
+[capabilities]
+ui.rich = true
+ui.overlay = true
+ui.overlay.focus = true
+
+[lazy]
+commands = []
+events = []
+claims = []
+"#
+            ),
+        )
+        .expect("manifest");
+        std::fs::write(
+            plugin_dir.join("lua/init.lua"),
+            r#"
+        local mount_ok, handle = pcall(bitty.ui.mount, "overlay", { kind = "Text", text = "ctx1100-capture" })
+        if mount_ok then
+          pcall(bitty.ui.overlay.acquire, handle)
+        end
+        return {}
+        "#,
+        )
+        .expect("init");
+
+        let mut plugin_runtime = PluginRuntime::new(PluginRuntimeConfig {
+            safe_mode: false,
+            data_dir: Some(data.clone()),
+            store_root: None,
+            bundled_roots: Vec::new(),
+            third_party_roots: vec![root.clone()],
+            settings: std::rc::Rc::new(EmptySettings),
+            snapshot: std::rc::Rc::new(StaticSnapshot),
+        });
+        plugin_runtime.set_store_backend(Some(std::sync::Arc::new(
+            crate::storage_backends::StorageKvBackend::new(),
+        )));
+        plugin_runtime.discover();
+        let pid = bitty_plugin_host::manifest::PluginId::new(id).expect("valid id");
+        plugin_runtime.activate(&pid).expect("activate");
+        assert!(
+            plugin_runtime.overlay_capture().borrow().is_active(),
+            "setup must hold the capture"
+        );
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let app = TerminalApp::with_theme(
+            Runtime::with_defaults().expect("must build"),
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            maps,
+            SpawnSpec::default(),
+        )
+        .with_plugin_runtime(Some(plugin_runtime));
+        assert!(app.overlay_capture_active());
+        (app, root, data)
+    }
+
+    fn overlay_queued_len(app: &TerminalApp) -> usize {
+        app.plugin_runtime
+            .as_ref()
+            .expect("plugin runtime")
+            .overlay_capture()
+            .borrow()
+            .queued_len()
+    }
+
+    #[test]
+    fn chrome_workspace_occupied_cycle_failure_preserves_overlay_capture() {
+        // CTX-1100 follow-up (CodeRabbit PR #1917): a refused cycle (<2
+        // occupied) through the real intercept must preserve the active
+        // overlay capture — still active, nothing queued as overlay input —
+        // with workspace state untouched. Headless: refusal needs no shells.
+        use bitty_config::ChromeAction;
+        let (mut app, root, data) = overlay_capture_test_app("refusal");
+        // Two workspaces, zero occupied: every cycle refuses.
+        app.apply_chrome_action(ChromeAction::WorkspaceNew);
+        assert_eq!(app.runtime.workspace_count(), 2);
+        assert!(app.runtime.workspace_occupied_indices().is_empty());
+        assert!(app.runtime.workspace_switch(0));
+        assert!(app.overlay_capture_active(), "setup must hold capture");
+        let queued = overlay_queued_len(&app);
+        assert!(
+            drive_mod_char(&mut app, "[", false, true, false, false),
+            "Mod+[ stays chrome-owned"
+        );
+        assert!(
+            app.overlay_capture_active(),
+            "refused next-cycle preserves capture"
+        );
+        assert_eq!(
+            overlay_queued_len(&app),
+            queued,
+            "refused chord never queues as overlay input"
+        );
+        assert_eq!(app.runtime.active_workspace_index(), 0);
+        assert!(
+            drive_mod_char(&mut app, "]", false, true, false, false),
+            "Mod+] stays chrome-owned"
+        );
+        assert!(
+            app.overlay_capture_active(),
+            "refused prev-cycle preserves capture"
+        );
+        assert_eq!(overlay_queued_len(&app), queued);
+        assert_eq!(app.runtime.active_workspace_index(), 0);
+        assert_eq!(app.runtime.workspace_count(), 2);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn chrome_workspace_occupied_cycle_success_revokes_overlay_capture() {
+        // CTX-1100 follow-up (CodeRabbit PR #1917): a successful cycle still
+        // ends the capture (contract `focus_switched`) — revocation moves to
+        // after the switch, not before dispatch.
+        require_pty!();
+        use bitty_config::ChromeAction;
+        let (mut app, root, data) = overlay_capture_test_app("success");
+        let ws1_leaf = app.runtime.focused_view().expect("ws1 focus");
+        app.runtime
+            .spawn_shell_for_view(ws1_leaf, "/bin/sh", &[], 40, 12)
+            .expect("ws1 shell must spawn");
+        app.apply_chrome_action(ChromeAction::WorkspaceNew);
+        let ws2_leaf = app.runtime.focused_view().expect("ws2 focus");
+        app.runtime
+            .spawn_shell_for_view(ws2_leaf, "/bin/sh", &[], 40, 12)
+            .expect("ws2 shell must spawn");
+        assert!(app.runtime.workspace_switch(0));
+        assert!(app.overlay_capture_active(), "setup must hold capture");
+        assert!(
+            drive_mod_char(&mut app, "[", false, true, false, false),
+            "Mod+[ stays chrome-owned"
+        );
+        assert!(
+            !app.overlay_capture_active(),
+            "successful cycle ends the capture"
+        );
+        assert_eq!(app.runtime.active_workspace_index(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&data);
     }
 
     #[test]

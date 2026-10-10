@@ -935,10 +935,16 @@ impl Runtime {
                     match selector {
                         'a' => clear_all_visible = true,
                         'i' => {
-                            delete_wire = Some((
-                                control.image_id,
-                                (control.placement_id != 0).then_some(control.placement_id),
-                            ));
+                            // Kitty treats `i=0` as no image named: a
+                            // `d=i` with no `i=` key must delete nothing.
+                            // Without the guard every anonymous placement
+                            // (`wire_image == 0`) would be wiped.
+                            if control.image_id != 0 {
+                                delete_wire = Some((
+                                    control.image_id,
+                                    (control.placement_id != 0).then_some(control.placement_id),
+                                ));
+                            }
                         }
                         'n' => {
                             if let Some(id) = self

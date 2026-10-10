@@ -277,3 +277,36 @@ fn placement_delete_then_render_leaves_no_orphan_blit() {
         "no orphan blit may survive deletion"
     );
 }
+
+#[test]
+fn delete_image_id_zero_deletes_nothing_anonymous_survives() {
+    // CodeRabbit Minor (pty.rs:942): `a=d,d=i` with no `i=` key yields
+    // `image_id` 0, and `delete_by_wire(origin, 0, None)` wipes every
+    // anonymous placement on the origin. Kitty treats `i=0` as no image
+    // named, so the delete must leave anonymous placements alone.
+    let mut rt = make_runtime();
+    let encoded = "/wAA//8AAP//AAD//wAA/w==";
+    // No `i=` key: anonymous placement (`wire_image == 0`).
+    let display = format!("\x1b_Gf=32,s=2,v=2,m=0;{encoded}\x1b\\");
+    rt.handle_pty_bytes(display.as_bytes());
+    assert_eq!(rt.kitty_placement_count(), 1);
+    assert!(rt.tick().is_some());
+    assert_eq!(rt.kitty_last_frame_images(), 1);
+    // Missing `i=` defaults to 0: must delete nothing.
+    rt.handle_pty_bytes(b"\x1b_Ga=d,d=i\x1b\\");
+    assert_eq!(
+        rt.kitty_placement_count(),
+        1,
+        "d=i with no i= must delete nothing"
+    );
+    // Explicit `i=0` also names no image.
+    rt.handle_pty_bytes(b"\x1b_Ga=d,d=i,i=0\x1b\\");
+    assert_eq!(rt.kitty_placement_count(), 1, "d=i,i=0 must delete nothing");
+    let _ = rt.tick();
+    assert_eq!(rt.kitty_placement_count(), 1);
+    assert_eq!(
+        rt.kitty_last_frame_images(),
+        1,
+        "anonymous blit must survive a zero-id delete"
+    );
+}

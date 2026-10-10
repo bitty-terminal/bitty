@@ -86,6 +86,7 @@ pub mod file;
 pub mod keymap;
 pub mod merge;
 pub mod migration;
+pub mod panel_rules;
 pub mod plan;
 pub mod project_schema;
 pub mod reload;
@@ -110,6 +111,10 @@ pub use merge::{
     safe_merged, try_merge_layers,
 };
 pub use migration::{CURRENT_SCHEMA_VERSION, migrate, needs_migration};
+pub use panel_rules::{
+    MAX_PANEL_RULES, PanelPresentation, PanelSpawnRule, command_line_for, find_match,
+    matches_regex, validate_regex_pattern,
+};
 pub use plan::{ConfigPlan, ConfigSource, LayerKind, LayeredPlan};
 pub use project_schema::{
     MAX_ENTRY_NAME_BYTES, MAX_ENTRY_PATH_BYTES, MAX_PATH_SEGMENT_BYTES,

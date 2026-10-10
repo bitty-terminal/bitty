@@ -186,6 +186,11 @@ pub fn collect_diagnostics(plan: &ConfigPlan) -> Vec<ConfigError> {
             }
         }
     }
+    if let Some(rules) = &plan.panel_rules {
+        if let Err(e) = crate::panel_rules::validate_all(rules) {
+            out.push(e);
+        }
+    }
     if let Some(ext) = &plan.extends {
         if ext.trim().is_empty() {
             out.push(ConfigError::validation(

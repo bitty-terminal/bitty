@@ -92,6 +92,11 @@ pub const MAX_CONFIG_KEYMAPS: usize = 1024;
 /// host never iterates unbounded sequences outside fuel accounting).
 pub const MAX_CONFIG_PLUGINS: usize = 1024;
 
+/// Maximum panel-rule entries read (CTX-1080; mirrors `bitty-config`
+/// `MAX_PANEL_RULES` so the host never iterates unbounded sequences
+/// outside fuel accounting).
+pub const MAX_CONFIG_PANEL_RULES: usize = 64;
+
 /// Maximum bytes per background-image path (CTX-0347, RFC-0001/OQ-042:
 /// `<= 4096` bytes). The general [`MAX_CONFIG_STRING_BYTES`] host cap is
 /// tighter, so background paths use their own accepted bound.
@@ -161,6 +166,36 @@ pub struct KeymapData {
     pub action: String,
     /// Context, e.g. `"global"`.
     pub context: String,
+}
+
+/// One declarative panel spawn rule, plain data mirroring `bitty-config`
+/// `PanelSpawnRule` (CTX-1080, issue 1756).
+///
+/// Matchers (`cmd`, `cmd_regex`, `title_regex`, `content`) and actions
+/// (`presentation`, `width`, `height`, `workspace`, `centered`) are all
+/// optional here; `bitty-config` rejects rules with no matcher or no action
+/// fail-closed. Types are raw (strings/ints/bools, never coerced); grammar
+/// and bounds live downstream.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PanelRuleData {
+    /// Exact command matcher.
+    pub cmd: Option<String>,
+    /// Regex matcher against the full command line.
+    pub cmd_regex: Option<String>,
+    /// Regex matcher against the title text.
+    pub title_regex: Option<String>,
+    /// Content-kind matcher.
+    pub content: Option<String>,
+    /// Requested presentation (`tiled`/`floating`/`scratchpad`).
+    pub presentation: Option<String>,
+    /// Requested width in cells.
+    pub width: Option<i64>,
+    /// Requested height in cells.
+    pub height: Option<i64>,
+    /// Requested workspace label.
+    pub workspace: Option<i64>,
+    /// Whether a floating panel requests centering.
+    pub centered: Option<bool>,
 }
 
 /// Font overrides, plain data.
@@ -575,6 +610,9 @@ pub struct ConfigData {
     /// `plugins` array (each entry `{ id, enabled? }`; absent means "this
     /// layer says nothing").
     pub plugins: Option<Vec<PluginData>>,
+    /// `panel_rules` array (CTX-1080 declarative spawn rules; absent means
+    /// this layer says nothing).
+    pub panel_rules: Option<Vec<PanelRuleData>>,
     /// Dotted unknown key paths (e.g. `"frobnicate"`, `"keymaps[2].foo"`),
     /// sorted for deterministic messages.
     pub undeclared: Vec<String>,
@@ -615,6 +653,7 @@ impl ConfigData {
             && self.extends.is_none()
             && self.keymaps.is_none()
             && self.plugins.is_none()
+            && self.panel_rules.is_none()
     }
 }
 
@@ -1854,6 +1893,9 @@ impl ConfigData {
                 "plugins" => {
                     out.plugins = Some(extract_plugins(val)?);
                 }
+                "panel_rules" => {
+                    out.panel_rules = Some(extract_panel_rules(val)?);
+                }
                 // CTX-0236: top-level `mod_key` scalar (raw string; typed
                 // parsing and fail-closed validation live downstream in
                 // `bitty-config`, like the `theme` alias).
@@ -2171,6 +2213,114 @@ fn extract_plugins(val: &ValueSnapshot) -> Result<Vec<PluginData>, String> {
             None => true,
         };
         out.push(PluginData { id, enabled });
+    }
+    Ok(out)
+}
+
+/// Extract the `panel_rules` array (CTX-1080, 1-based Lua sequence).
+///
+/// Fail-closed like [`extract_keymaps`]: map keys, non-table entries, wrong
+/// leaf types, and unknown entry fields all reject with the offending
+/// `panel_rules[<n>]` path. All leaves are raw (strings/ints/bools, never
+/// coerced); matcher/action presence plus grammar and bounds live
+/// downstream in `bitty-config`.
+fn extract_panel_rules(val: &ValueSnapshot) -> Result<Vec<PanelRuleData>, String> {
+    let (pairs, seq, truncated, has_non_string_keys) = match val {
+        ValueSnapshot::Table {
+            pairs,
+            seq,
+            truncated,
+            has_non_string_keys,
+        } => (pairs, seq, *truncated, *has_non_string_keys),
+        ValueSnapshot::Nil => {
+            return Err("panel_rules: expected array (found nil)".to_string());
+        }
+        other => {
+            return Err(format!(
+                "panel_rules: expected array (found {})",
+                other.kind()
+            ));
+        }
+    };
+    if !pairs.is_empty() || has_non_string_keys {
+        return Err("panel_rules: expected array (found map keys)".to_string());
+    }
+    if truncated {
+        return Err(format!(
+            "panel_rules: exceeds {MAX_CONFIG_PANEL_RULES} entries"
+        ));
+    }
+    if seq.len() > MAX_CONFIG_PANEL_RULES {
+        return Err(format!(
+            "panel_rules: exceeds {MAX_CONFIG_PANEL_RULES} entries"
+        ));
+    }
+    let mut out = Vec::with_capacity(seq.len());
+    for (idx, entry) in seq.iter().enumerate() {
+        let path = format!("panel_rules[{}]", idx + 1);
+        let nested = expect_table(&path, entry)?;
+        check_nested_keys(
+            &path,
+            nested,
+            &[
+                "cmd",
+                "cmd_regex",
+                "title_regex",
+                "content",
+                "presentation",
+                "width",
+                "height",
+                "workspace",
+                "centered",
+            ],
+        )?;
+        let cmd = match get_field(nested, "cmd") {
+            Some(v) => Some(expect_string(&format!("{path}.cmd"), v)?),
+            None => None,
+        };
+        let cmd_regex = match get_field(nested, "cmd_regex") {
+            Some(v) => Some(expect_string(&format!("{path}.cmd_regex"), v)?),
+            None => None,
+        };
+        let title_regex = match get_field(nested, "title_regex") {
+            Some(v) => Some(expect_string(&format!("{path}.title_regex"), v)?),
+            None => None,
+        };
+        let content = match get_field(nested, "content") {
+            Some(v) => Some(expect_string(&format!("{path}.content"), v)?),
+            None => None,
+        };
+        let presentation = match get_field(nested, "presentation") {
+            Some(v) => Some(expect_string(&format!("{path}.presentation"), v)?),
+            None => None,
+        };
+        let width = match get_field(nested, "width") {
+            Some(v) => Some(expect_integer(&format!("{path}.width"), v)?),
+            None => None,
+        };
+        let height = match get_field(nested, "height") {
+            Some(v) => Some(expect_integer(&format!("{path}.height"), v)?),
+            None => None,
+        };
+        let workspace = match get_field(nested, "workspace") {
+            Some(v) => Some(expect_integer(&format!("{path}.workspace"), v)?),
+            None => None,
+        };
+        let centered = match get_field(nested, "centered") {
+            Some(v) => Some(expect_bool(&format!("{path}.centered"), v)?),
+            None => None,
+        };
+        out.push(PanelRuleData {
+            cmd,
+            cmd_regex,
+            title_regex,
+            content,
+            presentation,
+            width,
+            height,
+            workspace,
+            centered,
+        });
     }
     Ok(out)
 }
@@ -3172,6 +3322,57 @@ mod tests {
                 "undeclared field 'plugins[1].bogus'",
             ),
             (r#"return { plugins = 42 }"#, "plugins: expected array"),
+        ] {
+            let message = eval_err(code);
+            assert!(
+                message.contains(want),
+                "code: {code:?} -> {message:?} (want {want:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn panel_rules_extract_and_fail_closed() {
+        let data = eval_ok(
+            r#"return { panel_rules = {
+                { cmd = "btop", presentation = "floating", width = 100, height = 30, centered = true },
+                { cmd_regex = "^tail -f", workspace = 3 },
+            } }"#,
+        );
+        assert!(data.undeclared.is_empty());
+        assert!(!data.is_empty());
+        let rules = data.panel_rules.expect("panel_rules declared");
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].cmd.as_deref(), Some("btop"));
+        assert_eq!(rules[0].presentation.as_deref(), Some("floating"));
+        assert_eq!(rules[0].width, Some(100));
+        assert_eq!(rules[1].cmd_regex.as_deref(), Some("^tail -f"));
+        assert_eq!(rules[1].workspace, Some(3));
+        for (code, want) in [
+            (
+                r#"return { panel_rules = { "btop" } }"#,
+                "panel_rules[1]: expected table",
+            ),
+            (
+                r#"return { panel_rules = { { cmd = 42, presentation = "floating" } } }"#,
+                "panel_rules[1].cmd: expected string",
+            ),
+            (
+                r#"return { panel_rules = { { cmd = "btop", presentation = "floating", width = "wide" } } }"#,
+                "panel_rules[1].width: expected integer",
+            ),
+            (
+                r#"return { panel_rules = { { cmd = "btop", presentation = "floating", centered = "yes" } } }"#,
+                "panel_rules[1].centered: expected boolean",
+            ),
+            (
+                r#"return { panel_rules = { { cmd = "btop", presentation = "floating", bogus = 1 } } }"#,
+                "undeclared field 'panel_rules[1].bogus'",
+            ),
+            (
+                r#"return { panel_rules = 42 }"#,
+                "panel_rules: expected array",
+            ),
         ] {
             let message = eval_err(code);
             assert!(

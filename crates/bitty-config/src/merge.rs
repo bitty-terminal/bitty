@@ -155,6 +155,7 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "appearance.animations"
         | "session" => Some(MergeClass::DeepMerge),
         "keymaps" | "plugins" => Some(MergeClass::SetById),
+        "panel_rules" => Some(MergeClass::ListReplace),
         _ => None,
     }
 }
@@ -665,6 +666,7 @@ const ATTRIBUTED_FIELDS: &[&str] = &[
     "appearance",
     "keymaps",
     "plugins",
+    "panel_rules",
     "session.restore_on_startup",
     "session",
     "schema_version",
@@ -2287,6 +2289,46 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
             }
         }
 
+        if let Some(rules) = &plan.panel_rules {
+            let field = "panel_rules";
+            if is_policy {
+                policy_fields.insert(field.to_string(), src.clone());
+                effective.panel_rules.clone_from(rules);
+                let prev = attribution.get(field).cloned();
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ListReplace,
+                );
+            } else if let Some(policy_src) = policy_fields.get(field) {
+                policy_violations.push(ConfigError::NonOverridable {
+                    field: field.to_string(),
+                    policy_source: policy_src.describe(),
+                    attempted_source: src.describe(),
+                });
+                conflicts.push(MergeConflict {
+                    field: field.to_string(),
+                    previous_source: policy_src.clone(),
+                    new_source: src.clone(),
+                    merge_class: MergeClass::ListReplace,
+                });
+            } else {
+                let prev = attribution.get(field).cloned();
+                effective.panel_rules.clone_from(rules);
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ListReplace,
+                );
+            }
+        }
+
         if plan.extends.is_some() {
             let field = "extends";
             let prev = attribution.get(field).cloned();
@@ -3657,6 +3699,45 @@ fn merge_layers_allow_policy_violations(
                 );
             }
         }
+        if let Some(rules) = &plan.panel_rules {
+            let field = "panel_rules";
+            if is_policy {
+                policy_fields.insert(field.to_string(), src.clone());
+                effective.panel_rules.clone_from(rules);
+                let prev = attribution.get(field).cloned();
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ListReplace,
+                );
+            } else if let Some(policy_src) = policy_fields.get(field) {
+                policy_violations.push(ConfigError::NonOverridable {
+                    field: field.to_string(),
+                    policy_source: policy_src.describe(),
+                    attempted_source: src.describe(),
+                });
+                conflicts.push(MergeConflict {
+                    field: field.to_string(),
+                    previous_source: policy_src.clone(),
+                    new_source: src.clone(),
+                    merge_class: MergeClass::ListReplace,
+                });
+            } else {
+                let prev = attribution.get(field).cloned();
+                effective.panel_rules.clone_from(rules);
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ListReplace,
+                );
+            }
+        }
         if plan.extends.is_some() {
             let field = "extends";
             let prev = attribution.get(field).cloned();
@@ -4423,6 +4504,52 @@ mod tests {
         assert_eq!(merged.effective.keymaps.len(), 1);
         assert_eq!(merged.effective.keymaps[0].action, "focus_prev");
         assert_eq!(merged.source_of("keymaps").unwrap().layer, LayerKind::Cli);
+    }
+
+    #[test]
+    fn panel_rules_array_replace_preserves_order() {
+        use crate::panel_rules::{PanelPresentation, PanelSpawnRule};
+        let mk = |cmd: &str, presentation: PanelPresentation| PanelSpawnRule {
+            cmd: Some(cmd.to_string()),
+            cmd_regex: None,
+            title_regex: None,
+            content: None,
+            presentation: Some(presentation),
+            width: None,
+            height: None,
+            workspace: None,
+            centered: None,
+        };
+        let user = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                panel_rules: Some(vec![
+                    mk("btop", PanelPresentation::Floating),
+                    mk("htop", PanelPresentation::Tiled),
+                ]),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let cli = LayeredPlan::new(
+            ConfigSource::new(LayerKind::Cli, Some("cli")),
+            ConfigPlan {
+                panel_rules: Some(vec![mk("nvim", PanelPresentation::Scratchpad)]),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged = merge_layers(vec![user, cli]).expect("merge");
+        assert_eq!(merged.effective.panel_rules.len(), 1);
+        assert_eq!(merged.effective.panel_rules[0].cmd.as_deref(), Some("nvim"));
+        assert_eq!(
+            merged.source_of("panel_rules").unwrap().layer,
+            LayerKind::Cli
+        );
+        assert_eq!(
+            merge_class_for("panel_rules"),
+            Some(MergeClass::ListReplace)
+        );
     }
 
     #[test]

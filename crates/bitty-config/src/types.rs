@@ -14,6 +14,7 @@
 
 use crate::error::ConfigError;
 use crate::keymap::{Chord, ModKey};
+use crate::panel_rules::PanelSpawnRule;
 
 /// Upper bounds that keep every structure bounded against untrusted input
 /// (threat T-01).
@@ -3487,6 +3488,11 @@ pub struct EffectiveConfig {
     pub keymaps: Vec<KeymapEntry>,
     /// Plugins, possibly empty.
     pub plugins: Vec<PluginSpec>,
+    /// Declarative panel spawn rules in first-match-wins order (CTX-1080).
+    ///
+    /// Empty by default and always empty under safe mode. Array-replace
+    /// across layers so ordering stays within one layer.
+    pub panel_rules: Vec<PanelSpawnRule>,
     /// Profile name that produced this config, if any.
     pub profile: Option<String>,
     /// Schema version of the source plan that produced this config.
@@ -3517,6 +3523,7 @@ impl Default for EffectiveConfig {
             session: SessionConfig::default(),
             keymaps: Vec::new(),
             plugins: Vec::new(),
+            panel_rules: Vec::new(),
             profile: None,
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
         }
@@ -3580,6 +3587,7 @@ impl EffectiveConfig {
     pub fn with_safe_decoration(mut self) -> Self {
         self.decoration = DecorationConfig::safe();
         self.views.clear();
+        self.panel_rules.clear();
         self.animations.duration_ms = AnimationDurations {
             open: 0,
             close: 0,
@@ -3642,6 +3650,7 @@ impl EffectiveConfig {
         for p in &self.plugins {
             p.validate()?;
         }
+        crate::panel_rules::validate_all(&self.panel_rules)?;
         // Keymap and plugin IDs must be unique per merge contract.
         let mut seen_km = std::collections::HashSet::new();
         for km in &self.keymaps {

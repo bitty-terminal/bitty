@@ -1984,8 +1984,9 @@ pub(crate) fn help_text() -> String {
                              requires capability consent; remove requires\n  \
                              --force; `bitty plugin --help` for detail\n  \
             component <verb>  Native binary extension management (local, no execution):\n  \
-                              list|add|remove over user XDG (wins) and system tiers;\n  \
+                              list|add|install|remove over user XDG (wins) and system tiers;\n  \
                               add stages from a local path only (no download);\n  \
+                              install fetches one hash-verified R2 release;\n  \
                               remove only touches the user tier\n  \
             cmd <qualified-id> [--format SHAPE] [-- <args-json>]  Direct qualified\n  \
                              executable invocation for automation/diagnostics\n  \
@@ -2139,7 +2140,7 @@ pub(crate) fn help_text_short(color: bool) -> String {
            inspect <target> <value> Explain state and ownership (command|key|plugin|config|protocol)\n  \
            dev <verb>              Developer tracing, captures, synthesis, dumps, overlays\n  \
            plugin <verb>           Plugin management: list|install|remove|enable|disable|info\n  \
-           component <verb>        Native binary extension management: list|add|remove\n  \
+           component <verb>        Native binary extension management: list|add|install|remove\n  \
            cmd <id>                Direct qualified executable invocation for automation\n  \
            x <id> <command>        Qualified plugin namespace (extension, no VM load)\n  \
            completion <shell>      Emit shell completion script (alias comp)\n  \

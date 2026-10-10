@@ -275,6 +275,57 @@ fn component_add_rejects_remote_source() {
 }
 
 #[test]
+fn component_install_needs_an_exact_version() {
+    let home = scratch_dir("install-version");
+    let system = home.join("system-components");
+    std::fs::create_dir_all(&system).expect("system dir");
+    // No `--version`: usage error, no fetch attempted.
+    let output = run_in(&home, &system, &["component", "install", "net"]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(stderr(&output).contains("--version"), "{}", stderr(&output));
+    // Non-`X.Y.Z` versions fail before any fetch (usage, not integrity).
+    let output = run_in(
+        &home,
+        &system,
+        &["component", "install", "net", "--version", "1.0-alpha"],
+    );
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(!user_root(&home).join("net").exists());
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn component_install_rejects_hostile_names_without_fetch() {
+    let home = scratch_dir("install-hostile");
+    let system = home.join("system-components");
+    std::fs::create_dir_all(&system).expect("system dir");
+    // Hostile names fail while building the allowlisted URL, before any
+    // transport contact: a regression to fetch-first would attempt real
+    // network access and surface a different exit code.
+    for hostile in [
+        "https://evil.example/net.tar.gz",
+        "../evil",
+        "net;evil",
+        "net|evil",
+    ] {
+        let output = run_in(
+            &home,
+            &system,
+            &["component", "install", hostile, "--version", "0.0.23"],
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{hostile}: {}",
+            stderr(&output)
+        );
+    }
+    assert!(!user_root(&home).join("net").exists());
+    assert!(!user_root(&home).join("evil").exists());
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn component_missing_soft_fails_with_actionable_error() {
     let home = scratch_dir("missing");
     let system = home.join("system-components");

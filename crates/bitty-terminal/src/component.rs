@@ -6,7 +6,7 @@
 //!
 //! # Contract (implemented, v1 local-path only)
 //!
-//! - Shape: `bitty component list|add|remove` with `list` accepting
+//! - Shape: `bitty component list|add|install|remove` with `list` accepting
 //!   `--format table|json|jsonl` (default table) and `--no-color`.
 //! - `list`: read-only enumeration across both tiers (merged, user shadows
 //!   system on the same version). Shows name, version, active marker, source,
@@ -30,6 +30,13 @@
 //!   user version when none is named; removing the version named by `current`
 //!   also removes `current`. Never touches the system tier (needs a package
 //!   manager); a system-only component fails with an actionable diagnostic.
+//! - `install <name> --version <X.Y.Z>`: fetch one prebuilt release from R2
+//!   through the minimal install seed (`crate::component_seed`, issue
+//!   #1791 option A): fixed-argv system `curl` pinned to
+//!   `https://cdn.bitty.run`, `SHA256SUMS` hash verify fail-closed, exact
+//!   member audit, then the same atomic publish path as `add`. The version
+//!   is required and exact (no registry, no solving); the full manager
+//!   takes over after the install.
 //! - Class: local-only (no instance, no IPC, no component code is ever
 //!   loaded or executed; safe-mode clean).
 //!
@@ -39,7 +46,10 @@
 //! sources are a follow-up (DIR-030 D6: no automatic download in v1). A URL
 //! operand fails closed naming the local-path form. This keeps Core
 //! network-free (package-manager-boundary DIR-016/DIR-017) and install
-//! offline-capable.
+//! offline-capable. The narrow exception is `install`: the minimal seed
+//! fetches exactly one allowlisted R2 release (fixed-argv `curl`, no shell,
+//! hash-verified before unpack), and nothing else in Core touches the
+//! network.
 //!
 //! # Exit codes (stable taxonomy, cli-contract-rfc.md)
 //!
@@ -140,6 +150,8 @@ pub enum ComponentVerb {
     List,
     /// `add <path> [--version <semver>]`: stage a local binary.
     Add,
+    /// `install <name> --version <X.Y.Z>`: fetch one R2 release via seed.
+    Install,
     /// `remove <name> [<version>]`: drop a user-installed component.
     Remove,
 }
@@ -151,6 +163,7 @@ impl ComponentVerb {
         match token {
             "list" => Some(Self::List),
             "add" => Some(Self::Add),
+            "install" => Some(Self::Install),
             "remove" => Some(Self::Remove),
             _ => None,
         }
@@ -162,6 +175,7 @@ impl ComponentVerb {
         match self {
             Self::List => "list",
             Self::Add => "add",
+            Self::Install => "install",
             Self::Remove => "remove",
         }
     }
@@ -172,11 +186,13 @@ impl ComponentVerb {
 pub struct ComponentRequest {
     /// Requested verb.
     pub verb: ComponentVerb,
-    /// First operand: source path for `add`, component name for `remove`.
+    /// First operand: source path for `add`, component name for
+    /// `install`/`remove`.
     pub operand: Option<String>,
     /// Second operand: version for `remove` (no flag form).
     pub version_operand: Option<String>,
-    /// `--version <semver>` for `add` from a bare executable.
+    /// `--version <semver>` for `add` from a bare executable; required
+    /// `X.Y.Z` for `install`.
     pub version_flag: Option<String>,
     /// Output shape for `list`.
     pub format: ComponentFormat,
@@ -320,7 +336,7 @@ pub fn parse_component_request(
                 Some(parsed) => verb = Some(parsed),
                 None => {
                     return Err(ComponentParseError::Usage(format!(
-                        "bitty component: unknown verb {token:?} (want list|add|remove)"
+                        "bitty component: unknown verb {token:?} (want list|add|install|remove)"
                     )));
                 }
             }
@@ -344,7 +360,7 @@ pub fn parse_component_request(
 
     let verb = verb.ok_or_else(|| {
         ComponentParseError::Usage(
-            "bitty component: missing verb (want list|add|remove)".to_string(),
+            "bitty component: missing verb (want list|add|install|remove)".to_string(),
         )
     })?;
 
@@ -378,6 +394,32 @@ pub fn parse_component_request(
             if version_operand.is_some() {
                 return Err(ComponentParseError::Usage(
                     "bitty component: `add` takes one path operand (the version comes from `--version <semver>` for bare executables)"
+                        .to_string(),
+                ));
+            }
+            if format != ComponentFormat::Table || no_color {
+                return Err(ComponentParseError::Usage(format!(
+                    "bitty component: --format/--no-color only apply to `list` (got `{}`)",
+                    verb.name()
+                )));
+            }
+        }
+        ComponentVerb::Install => {
+            if operand.is_none() {
+                return Err(ComponentParseError::Usage(
+                    "bitty component: `install` needs a component name (e.g. `bitty component install net --version 0.0.23`)"
+                        .to_string(),
+                ));
+            }
+            if version_operand.is_some() {
+                return Err(ComponentParseError::Usage(
+                    "bitty component: `install` takes the version from `--version <X.Y.Z>`, not a second operand"
+                        .to_string(),
+                ));
+            }
+            if version_flag.is_none() {
+                return Err(ComponentParseError::Usage(
+                    "bitty component: `install` needs `--version <X.Y.Z>` (the seed installs exactly the version named; version solving arrives with the full manager)"
                         .to_string(),
                 ));
             }
@@ -426,12 +468,15 @@ pub fn parse_component_request(
 pub fn component_usage() -> String {
     "usage: bitty component list [--format table|json|jsonl] [--no-color]\n\
      \x20      bitty component add <path> [--version <semver>]\n\
+     \x20      bitty component install <name> --version <X.Y.Z>\n\
      \x20      bitty component remove <name> [<version>]\n\
      \n\
      Components are upstream native binaries resolved user-first:\n\
      $XDG_DATA_HOME/bitty/components/ wins over /usr/lib/bitty/components/.\n\
      `add` stages from a local path only (v1 has no registry download);\n\
-     `remove` only touches the user tier (no root required).\n\
+     `install` fetches one R2 prebuilt release through the hash-verified\n\
+     seed, then the full manager takes over; `remove` only touches the\n\
+     user tier (no root required).\n\
      `bitty component --help` explains sources, ABI checks, and exit codes."
         .to_string()
 }
@@ -455,6 +500,12 @@ pub fn component_help_text() -> String {
      \x20                             computed and ABI compat verified before\n\
      \x20                             anything is written. URLs fail closed (v1\n\
      \x20                             has no registry download).\n\
+     \x20 install <name> --version V Fetch one prebuilt release from R2\n\
+     \x20                             (https://cdn.bitty.run, SHA256SUMS hash\n\
+     \x20                             verified) into the user tier, then hand\n\
+     \x20                             off to the full manager. The version is\n\
+     \x20                             required and exact: the seed keeps no\n\
+     \x20                             registry and does no solving.\n\
      \x20 remove <name> [<version>]   Remove one user-installed version, or every\n\
      \x20                             user version when none is named. Removing\n\
      \x20                             the active version also drops `current`.\n\
@@ -463,7 +514,8 @@ pub fn component_help_text() -> String {
      flags:\n\
      \x20 --format table|json|jsonl   list output shape (default table).\n\
      \x20 --no-color                  Accepted for parity (tables are plain text).\n\
-     \x20 --version <semver>          add only: version for a bare executable.\n\
+     \x20 --version <semver>          add: version for a bare executable.\n\
+     \x20                             install: required exact R2 release.\n\
      \n\
      resolution:\n\
      \x20 User $XDG_DATA_HOME/bitty/components/ wins over system\n\
@@ -484,6 +536,7 @@ pub fn component_help_text() -> String {
      \x20 bitty component list\n\
      \x20 bitty component list --format json\n\
      \x20 bitty component add ./dist/net --version 0.0.1\n\
+     \x20 bitty component install net --version 0.0.23\n\
      \x20 bitty component remove net 0.0.1"
         .to_string()
 }
@@ -512,7 +565,7 @@ pub struct ComponentContext<'a> {
 
 /// One dispatch failure with its stable exit code.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ComponentFailure {
+pub(crate) struct ComponentFailure {
     exit: i32,
     message: String,
 }
@@ -587,6 +640,26 @@ pub fn run_component_subcommand(
                 request.version_flag.as_deref(),
                 user_root.as_deref(),
                 output,
+            ) {
+                Ok(summary) => {
+                    let _ = writeln!(output, "{summary}");
+                    EXIT_OK
+                }
+                Err(failure) => {
+                    eprintln!("{}", failure.message);
+                    failure.exit
+                }
+            }
+        }
+        ComponentVerb::Install => {
+            let name = request.operand.as_deref().expect("install requires a name");
+            let mut transport = crate::component_seed::SystemTransport;
+            match op_install(
+                name,
+                request.version_flag.as_deref(),
+                user_root.as_deref(),
+                output,
+                &mut transport,
             ) {
                 Ok(summary) => {
                     let _ = writeln!(output, "{summary}");
@@ -747,13 +820,22 @@ pub fn format_list_envelope(summaries: &[bitty_runtime::component::ComponentSumm
 
 /// Staged source: validated name/version/protocol/executable plus the raw
 /// executable bytes for the digest.
-struct StagedSource {
-    name: String,
-    version: String,
-    protocol_min: u16,
-    protocol_max: u16,
-    executable: String,
-    bytes: Vec<u8>,
+///
+/// Shared by `add` (local path) and the install seed (verified R2 payload):
+/// both run the same ABI check and `install_staged` downstream.
+pub(crate) struct StagedSource {
+    /// Validated component name.
+    pub(crate) name: String,
+    /// Validated version.
+    pub(crate) version: String,
+    /// Lowest supported wire protocol version.
+    pub(crate) protocol_min: u16,
+    /// Highest supported wire protocol version.
+    pub(crate) protocol_max: u16,
+    /// Executable base name (`bitty-<name>`).
+    pub(crate) executable: String,
+    /// Raw executable bytes.
+    pub(crate) bytes: Vec<u8>,
 }
 
 fn is_url_operand(source: &str) -> bool {
@@ -797,6 +879,91 @@ fn op_add(
         )));
     }
     install_staged(&staged, user)
+}
+
+// ---------------------------------------------------------------------------
+// install (minimal seed: one allowlisted R2 release, then manager handoff)
+// ---------------------------------------------------------------------------
+
+/// Map a seed failure onto the stable exit taxonomy.
+fn seed_failure(error: &crate::component_seed::SeedError) -> ComponentFailure {
+    let message = format!("bitty component: install failed: {}", error.message());
+    match error.exit_code() {
+        2 => ComponentFailure::usage(message),
+        4 => ComponentFailure::component(message),
+        _ => ComponentFailure::generic(message),
+    }
+}
+
+fn op_install(
+    name: &str,
+    version_flag: Option<&str>,
+    user_root: Option<&Path>,
+    _output: &mut dyn std::io::Write,
+    transport: &mut dyn crate::component_seed::SeedTransport,
+) -> Result<String, ComponentFailure> {
+    // The parser requires `--version`; this is defense in depth.
+    let Some(version) = version_flag else {
+        return Err(ComponentFailure::usage(
+            "bitty component: `install` needs `--version <X.Y.Z>` (the seed installs exactly the version named)".to_string(),
+        ));
+    };
+    let Some(user) = user_root else {
+        return Err(ComponentFailure::component(
+            "bitty component: no user component root (data directory unavailable; set $XDG_DATA_HOME or $HOME)".to_string(),
+        ));
+    };
+    // Validate name/version before probing the host: hostile input is a
+    // usage error (exit 2) on every host, even where no seed target exists.
+    if let Err(error) = validate_component_name(name) {
+        return Err(seed_failure(
+            &crate::component_seed::SeedError::InvalidName(format!("{name:?} ({error})")),
+        ));
+    }
+    if !crate::component_seed::valid_seed_version(version) {
+        return Err(seed_failure(
+            &crate::component_seed::SeedError::InvalidVersion(version.to_owned()),
+        ));
+    }
+    let target = crate::component_seed::host_target_triple().ok_or_else(|| {
+        seed_failure(&crate::component_seed::SeedError::UnsupportedHost(format!(
+            "bitty component: unsupported host {}-{} (no prebuilt seed target; install the component from a local path with `bitty component add`)",
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+        )))
+    })?;
+    let payload = crate::component_seed::fetch_seed_payload(name, version, target, transport)
+        .map_err(|error| seed_failure(&error))?;
+    // ABI-compat check before any mutation (same gate as `add`).
+    let core = bitty_runtime::component::PROTOCOL_VERSION;
+    if !(payload.protocol_min..=payload.protocol_max).contains(&core) {
+        return Err(ComponentFailure::component(incompatible_component_hint(
+            &payload.name,
+            payload.protocol_min,
+            payload.protocol_max,
+            core,
+        )));
+    }
+    let staged = StagedSource {
+        name: payload.name.clone(),
+        version: payload.version.clone(),
+        protocol_min: payload.protocol_min,
+        protocol_max: payload.protocol_max,
+        executable: payload.executable.clone(),
+        bytes: payload.bytes,
+    };
+    let summary = install_staged(&staged, user)?;
+    // Handoff: the seed is done; name the installed executable so the
+    // caller (or the user, for the manager itself) invokes the full
+    // component directly from here.
+    let executable_path = user
+        .join(&staged.name)
+        .join(&staged.version)
+        .join(executable_file_name(&staged.executable));
+    Ok(format!(
+        "{summary}\nseed handoff: '{}' is installed and active; the full manager takes over from here",
+        executable_path.display()
+    ))
 }
 
 fn load_staged_source(
@@ -1079,7 +1246,10 @@ fn publish_bytes_atomic(
     Ok(())
 }
 
-fn install_staged(staged: &StagedSource, user: &Path) -> Result<String, ComponentFailure> {
+pub(crate) fn install_staged(
+    staged: &StagedSource,
+    user: &Path,
+) -> Result<String, ComponentFailure> {
     let component_dir = user.join(&staged.name);
     let version_dir = component_dir.join(&staged.version);
     // Fail closed on symlinked install dirs: a symlinked component or
@@ -1389,6 +1559,58 @@ mod tests {
     }
 
     #[test]
+    fn parses_install() {
+        let request = parse_component_request(
+            &[
+                String::from("install"),
+                String::from("net"),
+                String::from("--version"),
+                String::from("0.0.23"),
+            ],
+            None,
+        )
+        .expect("install");
+        assert_eq!(request.verb, ComponentVerb::Install);
+        assert_eq!(request.operand.as_deref(), Some("net"));
+        assert_eq!(request.version_flag.as_deref(), Some("0.0.23"));
+
+        // `--version` is required for install.
+        assert!(
+            parse_component_request(&[String::from("install"), String::from("net")], None,)
+                .is_err()
+        );
+        // The version comes from the flag, never a second operand.
+        assert!(
+            parse_component_request(
+                &[
+                    String::from("install"),
+                    String::from("net"),
+                    String::from("0.0.1"),
+                    String::from("--version"),
+                    String::from("0.0.1"),
+                ],
+                None,
+            )
+            .is_err()
+        );
+        // `--format`/`--no-color` only apply to `list`.
+        assert!(
+            parse_component_request(
+                &[
+                    String::from("install"),
+                    String::from("net"),
+                    String::from("--version"),
+                    String::from("0.0.1"),
+                    String::from("--format"),
+                    String::from("json"),
+                ],
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn rejects_unknown_verb_and_flags() {
         assert!(parse_component_request(&[String::from("frobnicate")], None).is_err());
         assert!(
@@ -1505,6 +1727,200 @@ mod tests {
         let (context, _, _) = context_for(&base.join("user"), &base.join("system"));
         let (code, _) = run_with(&context, &["add", "https://example.com/net.tar.gz"]);
         assert_eq!(code, EXIT_COMPONENT);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn install_rejects_hostile_name_before_any_fetch() {
+        let base = scratch("install-hostile");
+        let (context, _, _) = context_for(&base.join("user"), &base.join("system"));
+        // Hostile names fail as usage errors while building the allowlisted
+        // URL, before any transport contact (zero-spawn is pinned with a
+        // recording stub in the `component_seed` tests).
+        for hostile in [
+            "https://evil.example/net.tar.gz",
+            "../evil",
+            "net;evil",
+            "net|evil",
+            "Net",
+        ] {
+            let args = vec![
+                "install".to_string(),
+                hostile.to_string(),
+                "--version".to_string(),
+                "0.0.23".to_string(),
+            ];
+            let mut buf = Vec::new();
+            let code = run_component_subcommand(&args, &context, &mut buf);
+            assert_eq!(code, EXIT_USAGE, "hostile {hostile:?}");
+        }
+        let user_root = Path::new(context.components_dir.expect("user"));
+        assert!(!user_root.join("net").exists());
+        assert!(!user_root.join("evil").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn install_requires_version_at_cli_level() {
+        let base = scratch("install-no-version");
+        let (context, _, _) = context_for(&base.join("user"), &base.join("system"));
+        let (code, _) = run_with(&context, &["install", "net"]);
+        assert_eq!(code, EXIT_USAGE);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Stub transport serving one canned, digest-consistent release.
+    struct InstallStub {
+        tarball: Vec<u8>,
+        manifest: String,
+        descriptor: Vec<u8>,
+        executable: Vec<u8>,
+    }
+
+    impl InstallStub {
+        fn canned(name: &str, version: &str, target: &str, exe: &[u8]) -> Self {
+            let tarball = format!("canned-tarball-{name}-{version}-{target}").into_bytes();
+            let tarball_digest = bitty_package::integrity::sha256_hex(&tarball);
+            let exe_digest = bitty_package::integrity::sha256_hex(exe);
+            // The stub fetch returns the same tarball bytes for any tarball
+            // URL, so the stub is host-independent: the manifest carries one
+            // line per mapped host triple (see `host_target_triple`) all
+            // pointing at that single digest, so the real host lookup always
+            // hits regardless of where the test runs.
+            const HOST_TRIPLES: [&str; 7] = [
+                "x86_64-unknown-linux-gnu",
+                "aarch64-unknown-linux-gnu",
+                "x86_64-unknown-linux-musl",
+                "aarch64-apple-darwin",
+                "x86_64-apple-darwin",
+                "x86_64-pc-windows-msvc",
+                "aarch64-pc-windows-msvc",
+            ];
+            let mut manifest = String::new();
+            for triple in HOST_TRIPLES {
+                manifest.push_str(&format!("{tarball_digest}  {triple}.tar.gz\n"));
+            }
+            let descriptor = format!(
+                "[component]\nname = \"{name}\"\nversion = \"{version}\"\nprotocol = [1, 1]\nexecutable = \"bitty-{name}\"\nsha256 = \"{exe_digest}\"\n"
+            )
+            .into_bytes();
+            Self {
+                tarball,
+                manifest,
+                descriptor,
+                executable: exe.to_vec(),
+            }
+        }
+    }
+
+    impl crate::component_seed::SeedTransport for InstallStub {
+        fn fetch(
+            &mut self,
+            url: &str,
+            dest: &Path,
+            _max: u64,
+        ) -> Result<(), crate::component_seed::SeedError> {
+            let bytes = if url.ends_with("SHA256SUMS") {
+                self.manifest.as_bytes()
+            } else {
+                &self.tarball
+            };
+            if let Some(parent) = dest.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent).expect("stub parent");
+                }
+            }
+            std::fs::write(dest, bytes).expect("stub write");
+            Ok(())
+        }
+
+        fn extract(
+            &mut self,
+            _archive: &Path,
+            dest: &Path,
+            _members: &[String],
+        ) -> Result<(), crate::component_seed::SeedError> {
+            std::fs::write(dest.join(COMPONENT_DESCRIPTOR_FILE), &self.descriptor)
+                .expect("stub descriptor");
+            // The member name is `bitty-<name>`; the one canned release here
+            // is `net`.
+            std::fs::write(dest.join("bitty-net"), &self.executable).expect("stub exe");
+            Ok(())
+        }
+
+        fn list_members(
+            &mut self,
+            _archive: &Path,
+        ) -> Result<Vec<String>, crate::component_seed::SeedError> {
+            Ok(vec![
+                COMPONENT_DESCRIPTOR_FILE.to_string(),
+                "bitty-net".to_string(),
+            ])
+        }
+    }
+
+    #[test]
+    fn install_stages_verified_seed_payload_end_to_end() {
+        // Truly unmapped hosts (FreeBSD/musl-riscv/...) return
+        // UnsupportedHost before the stub is reached, so there is nothing
+        // end-to-end to exercise there.
+        if crate::component_seed::host_target_triple().is_none() {
+            return;
+        }
+        let base = scratch("install-e2e");
+        let (context, _, _) = context_for(&base.join("user"), &base.join("system"));
+        let user = Path::new(context.components_dir.expect("user")).to_path_buf();
+        // Fixed triple keeps the canned tarball bytes stable; the manifest
+        // above covers the real host lookup, so the test holds on any mapped
+        // host.
+        let target = "x86_64-unknown-linux-gnu";
+        let mut stub = InstallStub::canned("net", "0.0.23", target, b"seed-net-bytes");
+        let mut out = Vec::new();
+        let summary = op_install("net", Some("0.0.23"), Some(&user), &mut out, &mut stub)
+            .expect("seed install");
+        assert!(
+            summary.contains("installed component 'net' version 0.0.23"),
+            "{summary}"
+        );
+        assert!(summary.contains("seed handoff"), "{summary}");
+
+        // The same three destinations `add` publishes, then `list` sees it.
+        let version_dir = user.join("net").join("0.0.23");
+        assert!(version_dir.join(COMPONENT_DESCRIPTOR_FILE).is_file());
+        assert_eq!(
+            std::fs::read(version_dir.join(executable_file_name(&format!(
+                "{COMPONENT_EXECUTABLE_PREFIX}net"
+            ))))
+            .expect("installed exe"),
+            b"seed-net-bytes"
+        );
+        assert_eq!(
+            std::fs::read_to_string(user.join("net").join("current")).expect("current"),
+            "0.0.23\n"
+        );
+        let (code, stdout) = run_with(&context, &["list"]);
+        assert_eq!(code, EXIT_OK, "{stdout}");
+        assert!(stdout.contains("net"), "{stdout}");
+
+        // Re-installing the same bytes is idempotent, like `add`.
+        let mut stub = InstallStub::canned("net", "0.0.23", target, b"seed-net-bytes");
+        let mut out = Vec::new();
+        op_install("net", Some("0.0.23"), Some(&user), &mut out, &mut stub).expect("idempotent");
+
+        // Different bytes for the same version fail closed (downgrade by
+        // content swap), leaving the install untouched.
+        let mut stub = InstallStub::canned("net", "0.0.23", target, b"other-bytes");
+        let mut out = Vec::new();
+        let error = op_install("net", Some("0.0.23"), Some(&user), &mut out, &mut stub)
+            .expect_err("content swap must fail");
+        assert_eq!(error.exit, EXIT_COMPONENT, "{}", error.message);
+        assert_eq!(
+            std::fs::read(version_dir.join(executable_file_name(&format!(
+                "{COMPONENT_EXECUTABLE_PREFIX}net"
+            ))))
+            .expect("installed exe"),
+            b"seed-net-bytes"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 

@@ -231,6 +231,7 @@ mod cmd;
 mod color;
 mod completion;
 mod component;
+mod component_seed;
 mod composer_owner;
 mod config_cli;
 mod config_reload;

@@ -539,7 +539,9 @@ pub fn plugin_help_text() -> String {
      \x20                             .zip (unzip -q -d). Fixed-argv system\n\
      \x20                             helpers unpack into an exclusive temp\n\
      \x20                             staging dir (members audited for ../,\n\
-     \x20                             absolute paths, and symlinks), then the\n\
+     \x20                             absolute paths, and symlinks; declared\n\
+     \x20                             unpacked content bounded at 64 MiB\n\
+     \x20                             before extraction), then the\n\
      \x20                             same local-path pipeline. A missing\n\
      \x20                             helper or a bad/hostile archive fails\n\
      \x20                             closed with nothing staged.\n\
@@ -2235,9 +2237,19 @@ fn is_valid_scp_git_source(token: &str) -> bool {
 // Fetch staging (CTX-1103, #1901): exclusive temp dirs, fixed-argv helpers
 // ---------------------------------------------------------------------------
 
-/// Maximum archive file size staged (64 MiB; the module-tree ceilings still
-/// bound the unpacked content to 16 MiB / 4096 files).
+/// Maximum archive file size staged (64 MiB; the declared unpacked content is
+/// bounded separately by [`MAX_FETCH_UNPACKED_BYTES`], and the module-tree
+/// ceilings still bound the committed content to 16 MiB / 4096 files).
 const MAX_FETCH_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum total declared unpacked bytes one archive may hold (64 MiB, same
+/// as the compressed-file cap).
+///
+/// Zip-bomb defense: a highly compressible archive can declare far more
+/// temporary disk than its file size suggests, so the declared total from
+/// the pre-extraction listing (`tar -tv` / `unzip -l` sizes) is rejected
+/// above this limit before anything is extracted, and the same total is
+/// enforced again while walking the extracted tree (defense in depth).
+const MAX_FETCH_UNPACKED_BYTES: u64 = 64 * 1024 * 1024;
 /// Maximum bytes of one helper listing (`tar -tf` / `unzip -Z1`) parsed.
 const MAX_FETCH_LIST_BYTES: usize = 256 * 1024;
 /// Maximum archive members listed (2x the module-tree file ceiling + slack
@@ -2431,6 +2443,213 @@ fn parse_member_list(bytes: &[u8]) -> Result<Vec<String>, String> {
     Ok(members)
 }
 
+/// Declared unpacked total for a tar archive via `tar -tv` sizes.
+///
+/// Never extracts: the verbose listing carries one size field per member.
+/// Returns the entry count plus the summed declared bytes so the caller can
+/// cross-check the count against the names listing (a mismatch fails closed).
+fn declared_tar_unpacked_bytes(archive: &Path, kind: ArchiveKind) -> Result<(usize, u64), String> {
+    let archive_arg = archive.to_string_lossy().into_owned();
+    let argv: Vec<String> = match kind {
+        ArchiveKind::TarGz => vec!["-tzvf".to_string(), archive_arg],
+        ArchiveKind::TarZst => vec![
+            "--use-compress-program=unzstd".to_string(),
+            "-tvf".to_string(),
+            archive_arg,
+        ],
+        ArchiveKind::Zip => {
+            return Err(
+                "bitty plugin: internal error: tar size lister called for .zip".to_string(),
+            );
+        }
+    };
+    let output = run_fetch_tool("tar", &argv)?;
+    if !output.status.success() {
+        let tail = fetch_stderr_tail(&output.stderr);
+        return Err(format!(
+            "bitty plugin: cannot list archive sizes ({}; {tail})",
+            output.status
+        ));
+    }
+    parse_tar_verbose_total(&output.stdout)
+}
+
+/// BSD `tar -tv` month abbreviations (libarchive output spells the date as
+/// `Mon DD HH:MM` or `Mon DD YYYY` where GNU spells `YYYY-MM-DD HH:MM`).
+const TAR_VERBOSE_MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// Whether a field looks like a GNU `tar -tv` date (`YYYY-MM-DD`).
+fn is_tar_verbose_date(field: &str) -> bool {
+    field.len() == 10
+        && field.as_bytes()[4] == b'-'
+        && field.as_bytes()[7] == b'-'
+        && field
+            .bytes()
+            .enumerate()
+            .all(|(i, b)| i == 4 || i == 7 || b.is_ascii_digit())
+}
+
+/// Whether a field looks like a `tar -tv` time (`HH:MM`).
+fn is_tar_verbose_time(field: &str) -> bool {
+    field.len() == 5
+        && field.as_bytes()[2] == b':'
+        && field
+            .bytes()
+            .enumerate()
+            .all(|(i, b)| i == 2 || b.is_ascii_digit())
+}
+
+/// Parse `tar -tv` output into an entry count plus a declared byte total.
+///
+/// Accepts GNU (`PERMS OWNER SIZE YYYY-MM-DD HH:MM NAME`) and BSD/libarchive
+/// (`PERMS NLINK USER GROUP SIZE Mon DD HH:MM|YYYY NAME`) shapes by anchoring
+/// the size on the date field (the GNU date is searched first so a BSD month
+/// name inside a GNU filename can never misalign the parse). Every line must
+/// match one shape with a numeric size, a date, a time-or-year, and a name;
+/// anything else fails closed rather than guessing.
+fn parse_tar_verbose_total(bytes: &[u8]) -> Result<(usize, u64), String> {
+    let refuse = |why: &str| {
+        format!("bitty plugin: cannot parse archive sizes ({why}; refusing hostile archive)")
+    };
+    if bytes.len() > MAX_FETCH_LIST_BYTES {
+        return Err(refuse("size listing too large"));
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| refuse("size listing is not UTF-8"))?;
+    let mut count = 0usize;
+    let mut total = 0u64;
+    for line in text.lines() {
+        if line.is_empty() {
+            return Err(refuse("blank size entry"));
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        // GNU shape first: the size sits immediately before the date field.
+        let size = if let Some(date_at) = fields.iter().position(|f| is_tar_verbose_date(f)) {
+            let Some(size_text) = date_at.checked_sub(1).and_then(|i| fields.get(i)) else {
+                return Err(refuse("malformed size entry"));
+            };
+            // The date must be followed by a time and a name.
+            let (Some(time), Some(_)) = (fields.get(date_at + 1), fields.get(date_at + 2)) else {
+                return Err(refuse("malformed size entry"));
+            };
+            if !is_tar_verbose_time(time) {
+                return Err(refuse("malformed size entry"));
+            }
+            size_text
+        } else if let Some(month_at) = fields.iter().position(|f| TAR_VERBOSE_MONTHS.contains(f)) {
+            // BSD shape: the size sits immediately before the month, followed
+            // by a 1-2 digit day and a time (`HH:MM`) or year (`YYYY`).
+            let Some(size_text) = month_at.checked_sub(1).and_then(|i| fields.get(i)) else {
+                return Err(refuse("malformed size entry"));
+            };
+            let (Some(day), Some(clock)) = (fields.get(month_at + 1), fields.get(month_at + 2))
+            else {
+                return Err(refuse("malformed size entry"));
+            };
+            let day_ok =
+                !day.is_empty() && day.len() <= 2 && day.bytes().all(|b| b.is_ascii_digit());
+            let clock_ok = is_tar_verbose_time(clock)
+                || (clock.len() == 4 && clock.bytes().all(|b| b.is_ascii_digit()));
+            if !day_ok || !clock_ok || fields.get(month_at + 3).is_none() {
+                return Err(refuse("malformed size entry"));
+            }
+            size_text
+        } else {
+            return Err(refuse("malformed size entry"));
+        };
+        let size: u64 = size.parse().map_err(|_| refuse("non-numeric size entry"))?;
+        total = total.saturating_add(size);
+        count += 1;
+        if count > MAX_FETCH_MEMBERS {
+            return Err(format!(
+                "bitty plugin: archive holds {} members (limit {MAX_FETCH_MEMBERS}; refusing hostile archive)",
+                count + 1
+            ));
+        }
+        if total > MAX_FETCH_UNPACKED_BYTES * 4 {
+            // Early stop: the total already exceeds any enforcement bound by
+            // a wide margin, so stop summing rather than walking megabytes
+            // of hostile listing output.
+            break;
+        }
+    }
+    Ok((count, total))
+}
+
+/// Declared unpacked total for a zip archive via `unzip -l` sizes.
+///
+/// Never extracts: the table carries one `Length` field per member row.
+/// Returns the data-row count plus the summed lengths so the caller can
+/// cross-check the count against the `-Z1` names listing.
+fn declared_zip_unpacked_bytes(archive: &Path) -> Result<(usize, u64), String> {
+    let argv = vec!["-l".to_string(), archive.to_string_lossy().into_owned()];
+    let output = run_fetch_tool("unzip", &argv)?;
+    if !output.status.success() {
+        let tail = fetch_stderr_tail(&output.stderr);
+        return Err(format!(
+            "bitty plugin: cannot list archive sizes ({}; {tail})",
+            output.status
+        ));
+    }
+    parse_zip_list_total(&output.stdout)
+}
+
+/// Parse an `unzip -l` table into a data-row count plus a summed total.
+///
+/// Skips the `Archive:`/`Length` header and consumes rows after the first
+/// `-----` separator until the footer separator; every row must lead with a
+/// numeric length (names may contain spaces, which is why only the first
+/// field is read). Anything else fails closed.
+fn parse_zip_list_total(bytes: &[u8]) -> Result<(usize, u64), String> {
+    let refuse = |why: &str| {
+        format!("bitty plugin: cannot parse archive sizes ({why}; refusing hostile archive)")
+    };
+    if bytes.len() > MAX_FETCH_LIST_BYTES {
+        return Err(refuse("size listing too large"));
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| refuse("size listing is not UTF-8"))?;
+    let mut lines = text.lines();
+    let mut in_rows = false;
+    let mut count = 0usize;
+    let mut total = 0u64;
+    let mut closed = false;
+    for line in &mut lines {
+        if line.starts_with("-----") {
+            if in_rows {
+                closed = true;
+                break;
+            }
+            in_rows = true;
+            continue;
+        }
+        if !in_rows {
+            continue;
+        }
+        if line.trim().is_empty() {
+            return Err(refuse("blank size entry"));
+        }
+        let Some(first) = line.split_whitespace().next() else {
+            return Err(refuse("malformed size entry"));
+        };
+        let size: u64 = first
+            .parse()
+            .map_err(|_| refuse("non-numeric size entry"))?;
+        total = total.saturating_add(size);
+        count += 1;
+        if count > MAX_FETCH_MEMBERS {
+            return Err(format!(
+                "bitty plugin: archive holds {} members (limit {MAX_FETCH_MEMBERS}; refusing hostile archive)",
+                count + 1
+            ));
+        }
+    }
+    if !closed {
+        return Err(refuse("size table has no footer"));
+    }
+    Ok((count, total))
+}
+
 /// Validate one archive member name (fail closed on traversal).
 ///
 /// Rejects absolute members (`/…`), Windows separators (`\`, `:` so drive
@@ -2567,15 +2786,19 @@ fn extract_zip(archive: &Path, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Fail closed when the extracted tree holds a symlink.
+/// Audit the extracted tree: no symlinks, total regular-file bytes bounded.
 ///
 /// Both GNU `tar` and `unzip` refuse to follow a just-created symlink dir
 /// component during the same extraction (verified), so a symlink member lands
 /// inside staging as a link and is caught here before the package manager
-/// ever reads the tree. The staging dir is removed by the caller.
-fn audit_no_symlinks(root: &Path) -> Result<(), String> {
+/// ever reads the tree. The walked byte total re-enforces
+/// [`MAX_FETCH_UNPACKED_BYTES`] as defense in depth (the declared total was
+/// already checked pre-extraction; the listing and the payload could still
+/// disagree). The staging dir is removed by the caller on any failure.
+fn audit_extracted_tree(root: &Path) -> Result<(), String> {
     let mut stack = vec![root.to_path_buf()];
     let mut seen = 0usize;
+    let mut total = 0u64;
     while let Some(dir) = stack.pop() {
         let entries = std::fs::read_dir(&dir).map_err(|error| {
             format!(
@@ -2608,6 +2831,13 @@ fn audit_no_symlinks(root: &Path) -> Result<(), String> {
             }
             if metadata.is_dir() {
                 stack.push(path);
+            } else if metadata.is_file() {
+                total = total.saturating_add(metadata.len());
+                if total > MAX_FETCH_UNPACKED_BYTES {
+                    return Err(format!(
+                        "bitty plugin: unpacked archive exceeds {MAX_FETCH_UNPACKED_BYTES} bytes (refusing hostile archive)"
+                    ));
+                }
             }
         }
     }
@@ -2650,19 +2880,40 @@ fn find_plugin_root(extract_dir: &Path) -> PathBuf {
 /// Unpack one local archive file into `dest` (must exist, must be empty).
 ///
 /// Lists members first (never extracted here), audits every name for
-/// traversal, extracts with the fixed-argv helper, then audits the tree for
-/// symlinks. Any failure is fail-closed with nothing trusted.
+/// traversal, rejects declared unpacked totals above
+/// [`MAX_FETCH_UNPACKED_BYTES`] before anything is extracted (zip-bomb
+/// defense), extracts with the fixed-argv helper, then audits the tree for
+/// symlinks and re-enforces the byte total. Any failure is fail-closed with
+/// nothing trusted.
 fn unpack_archive_into(archive: &Path, dest: &Path, kind: ArchiveKind) -> Result<(), String> {
     let members = match kind {
         ArchiveKind::TarGz | ArchiveKind::TarZst => list_tar_members(archive, kind)?,
         ArchiveKind::Zip => list_zip_members(archive)?,
     };
     audit_archive_members(&members)?;
+    // Zip-bomb gate: the declared total must fit before extraction starts.
+    // The entry count must agree with the names listing; a mismatch means
+    // the two listing passes disagreed and fails closed.
+    let (declared_count, declared_total) = match kind {
+        ArchiveKind::TarGz | ArchiveKind::TarZst => declared_tar_unpacked_bytes(archive, kind)?,
+        ArchiveKind::Zip => declared_zip_unpacked_bytes(archive)?,
+    };
+    if declared_count != members.len() {
+        return Err(
+            "bitty plugin: archive size listing disagrees with its member listing (refusing hostile archive)"
+                .to_string(),
+        );
+    }
+    if declared_total > MAX_FETCH_UNPACKED_BYTES {
+        return Err(format!(
+            "bitty plugin: archive declares {declared_total} unpacked bytes (limit {MAX_FETCH_UNPACKED_BYTES}; refusing hostile archive)"
+        ));
+    }
     match kind {
         ArchiveKind::TarGz | ArchiveKind::TarZst => extract_tar(archive, dest, kind)?,
         ArchiveKind::Zip => extract_zip(archive, dest)?,
     }
-    audit_no_symlinks(dest)
+    audit_extracted_tree(dest)
 }
 
 /// Install or update one plugin from a local directory into the XDG store.
@@ -2853,20 +3104,18 @@ fn install_archive_source(
     }
     if let Err(message) = unpack_archive_into(&staged_archive, &extract_dir, kind) {
         // Distinguish validation (plugin error, exit 4) from helper/io
-        // failures (exit 1) by message shape: hostile-member audits name the
-        // member, everything else is an io/helper failure.
+        // failures (exit 1) by message shape: hostile-archive audits refuse
+        // explicitly, everything else is an io/helper failure. `unpack` ends
+        // with the extracted-tree audit, so no second walk is needed here.
         eprintln!("{message}");
         if message.contains("refusing hostile archive")
             || message.contains("no members")
             || message.contains("empty archive")
+            || message.contains("disagrees with its member listing")
         {
             return EXIT_PLUGIN;
         }
         return EXIT_GENERIC;
-    }
-    if let Err(message) = audit_no_symlinks(&extract_dir) {
-        eprintln!("{message}");
-        return EXIT_PLUGIN;
     }
     let root = find_plugin_root(&extract_dir);
     install_local_path(request, display, &root, store_root, input, output)
@@ -4496,35 +4745,67 @@ mod tests {
             );
         }
     }
+    /// Test-only `git` with the ambient repository location scrubbed.
+    ///
+    /// Cargo tests can run under `git hooks` (or any parent that exports
+    /// `GIT_DIR`/`GIT_WORK_TREE`/…); without scrubbing, `GIT_DIR` overrides
+    /// `-C` and the fixture commands would write into the developer's real
+    /// repository. Signing is pinned off so `commit` works on machines with
+    /// `commit.gpgsign=true`.
+    fn test_git() -> std::process::Command {
+        let mut command = std::process::Command::new("git");
+        for var in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_PREFIX",
+        ] {
+            command.env_remove(var);
+        }
+        command.args(["-c", "commit.gpgsign=false"]);
+        command
+    }
+
     #[test]
     fn git_clone_fixed_argv_succeeds_on_a_local_path() {
         // Transport-level proof (bypasses scheme validation): fixed-argv
         // `git clone --filter=blob:none --depth=1 -- <src> <dest>` works and
-        // inherits env. Uses a local path as the repo (no network).
+        // inherits env. Uses a local path as the repo (no network). Skips
+        // (does not panic) when `git` is absent.
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
         let base = scratch_dir("git-clone");
         let repo = base.join("repo");
         std::fs::create_dir_all(repo.join("lua")).expect("lua dir");
         std::fs::write(repo.join("bitty-plugin.toml"), "x = 1\n").expect("manifest");
         std::fs::write(repo.join("lua/init.lua"), "-- hi\n").expect("init");
         let repo_arg = repo.display().to_string();
-        let status = std::process::Command::new("git")
+        let status = test_git()
             .args(["init", "-q", &repo_arg])
             .status()
             .expect("git init");
         assert!(status.success());
         for (key, value) in [("user.email", "t@t"), ("user.name", "t")] {
-            let status = std::process::Command::new("git")
+            let status = test_git()
                 .args(["-C", &repo_arg, "config", key, value])
                 .status()
                 .expect("git config");
             assert!(status.success());
         }
-        let status = std::process::Command::new("git")
+        let status = test_git()
             .args(["-C", &repo_arg, "add", "-A"])
             .status()
             .expect("git add");
         assert!(status.success());
-        let status = std::process::Command::new("git")
+        let status = test_git()
             .args(["-C", &repo_arg, "commit", "-qm", "init"])
             .status()
             .expect("git commit");
@@ -4567,7 +4848,7 @@ mod tests {
         let dest = base.join("out");
         std::fs::create_dir(&dest).expect("dest dir");
         unpack_archive_into(&archive, &dest, ArchiveKind::TarGz).expect("unpacks");
-        audit_no_symlinks(&dest).expect("no symlinks");
+        audit_extracted_tree(&dest).expect("no symlinks and within byte bound");
         assert_eq!(find_plugin_root(&dest), dest);
 
         // A symlink member lists fine but fails closed at audit (never
@@ -4597,10 +4878,36 @@ mod tests {
             // to follow it); the audit then fails closed.
             let _ = extract_tar(&link_archive, &link_dest, ArchiveKind::TarGz);
             assert!(
-                audit_no_symlinks(&link_dest).is_err(),
+                audit_extracted_tree(&link_dest).is_err(),
                 "symlink member must fail closed"
             );
         }
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn archive_size_listings_parse_gnu_bsd_and_zip_shapes() {
+        // GNU `tar -tv` (the local `tar --version` shape): size sits before
+        // the `YYYY-MM-DD HH:MM` date, names may hold spaces.
+        let gnu = b"drwxr-xr-x fuyu/fuyu         0 2026-10-11 01:20 ./\n\
+            -rw-r--r-- fuyu/fuyu         6 2026-10-11 01:20 ./file with space.txt\n\
+            lrwxrwxrwx fuyu/fuyu         4 2026-10-11 01:20 ./link -> /tmp\n";
+        let (count, total) = parse_tar_verbose_total(gnu).expect("gnu parses");
+        assert_eq!((count, total), (3, 10));
+        // BSD/libarchive `tar -tv` (`Mon DD HH:MM` dates, link-count field).
+        let bsd = b"drwxr-xr-x  2 user  group  96 Oct 11 01:20 dir/\n\
+            -rw-r--r--  1 user  group  12 Oct 11 01:20 file\n";
+        let (count, total) = parse_tar_verbose_total(bsd).expect("bsd parses");
+        assert_eq!((count, total), (2, 108));
+        // A line with no date shape fails closed instead of guessing a size.
+        assert!(parse_tar_verbose_total(b"garbage line\n").is_err());
+        // `unzip -l` tables: rows between the separators, first field sizes.
+        let zipped = b"Archive:  /tmp/a.zip\n  Length      Date    Time    Name\n\
+            ---------  ---------- -----   ----\n        6  2026-10-11 01:20   file with space.txt\n\
+                  0  2026-10-11 01:20   lua/\n---------                     -------\n\
+                  6                     2 files\n";
+        let (count, total) = parse_zip_list_total(zipped).expect("zip parses");
+        assert_eq!((count, total), (2, 6));
+        assert!(parse_zip_list_total(b"Archive: x\nno table here\n").is_err());
     }
 }

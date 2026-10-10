@@ -727,6 +727,48 @@ fn plugin_external_archive_install_and_hostile_members_fail_closed() {
 }
 
 #[test]
+fn plugin_external_archive_zip_bomb_fails_closed_pre_extraction() {
+    // CTX-1103 CodeRabbit MAJOR: a highly compressible tar.gz whose member
+    // names are all valid (so the traversal audit passes) but whose declared
+    // unpacked bytes exceed the 64 MiB cap must fail closed at the size gate
+    // before anything is extracted — exit 4 naming the unpacked total, with
+    // no store record staged.
+    let home = scratch_dir("external-zipbomb");
+    let store = data_store(&home);
+    let bomb = home.join("bomb.tar.gz");
+    let status = std::process::Command::new("python3")
+        .args([
+            "-c",
+            &format!(
+                "import tarfile; tf=tarfile.open({archive:?},'w:gz'); \
+                 import io; \
+                 m='[plugin]\\nid = \"xuepoo.bomb\"\\nname = \"B\"\\nversion = \"1.0.0\"\\ndescription = \"b\"\\n'; \
+                 ti=tarfile.TarInfo('bitty-plugin.toml'); ti.size=len(m); tf.addfile(ti,io.BytesIO(m.encode())); \
+                 big=65*1024*1024; ti=tarfile.TarInfo('big.bin'); ti.size=big; tf.addfile(ti,io.BytesIO(bytes(big))); tf.close()",
+                archive = bomb.display().to_string(),
+            ),
+        ])
+        .status()
+        .expect("craft bomb tar");
+    assert!(status.success());
+    let output = run_in(
+        &home,
+        &["plugin", "install", &bomb.display().to_string(), "--yes"],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("unpacked bytes")
+            && stderr(&output).contains("refusing hostile archive"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!store.join("current.json").exists());
+    assert!(!store.join("packages").exists());
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn plugin_external_bundled_id_is_rejected() {
     let home = scratch_dir("external-bundled");
     // #1572 / CTX-0994: shell-integration is the remaining bundled id.

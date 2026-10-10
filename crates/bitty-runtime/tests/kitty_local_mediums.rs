@@ -99,6 +99,7 @@ fn red_1x1_png() -> Vec<u8> {
 }
 
 #[test]
+#[cfg(unix)]
 fn file_valid_raw_stores_places_and_paints() {
     let root = temp_root("file-valid");
     let file = root.join("img.bin");
@@ -157,6 +158,7 @@ fn temp_missing_marker_refused_and_kept() {
 }
 
 #[test]
+#[cfg(unix)]
 fn temp_valid_deletes_after_read_and_places() {
     let root = temp_root("temp-valid");
     let file = root.join(format!(
@@ -286,6 +288,7 @@ fn fifo_refused_without_hanging() {
 }
 
 #[test]
+#[cfg(unix)]
 fn offset_size_slice_selects_bytes() {
     // `O=`/`S=` window into the file: 4 garbage bytes, then an exact 2x1
     // RGBA payload read from offset 4.
@@ -372,6 +375,7 @@ fn query_missing_file_answers_einval_and_honors_quiet() {
 }
 
 #[test]
+#[cfg(unix)]
 fn query_valid_file_answers_ok_and_stores_nothing() {
     let root = temp_root("query-valid");
     let file = root.join("img.png");
@@ -427,4 +431,66 @@ fn local_mediums_denied_on_windows() {
     assert_eq!(rt.kitty_placement_count(), 0);
     rt.handle_pty_bytes(&apc_with_path("Gf=100,t=s,m=0;", b"/shm"));
     assert_eq!(rt.kitty_image_count(), 0);
+}
+
+#[test]
+#[cfg(windows)]
+fn file_valid_denied_on_windows_keeps_file() {
+    // Even a valid existing `t=f` file hits `UnsupportedPlatform` before
+    // any I/O on Windows: nothing stored or placed, file kept.
+    let root = temp_root("file-valid-windows");
+    let file = root.join("img.bin");
+    std::fs::write(&file, red_2x2_rgba()).expect("fixture must write");
+
+    let mut rt = make_runtime();
+    rt.handle_pty_bytes(&apc_with_path("Gf=32,s=2,v=2,t=f,m=0;", &path_bytes(&file)));
+    assert_eq!(rt.kitty_image_count(), 0);
+    assert_eq!(rt.kitty_placement_count(), 0);
+    assert!(file.is_file(), "denied t=f must not delete");
+
+    remove_tree_best_effort(&root);
+}
+
+#[test]
+#[cfg(windows)]
+fn temp_valid_denied_on_windows_keeps_file() {
+    // Valid `t=t` (marker-bearing temp path) still hits
+    // `UnsupportedPlatform` before containment/open: nothing stored,
+    // nothing deleted (unlink runs only after a successful read).
+    let root = temp_root("temp-valid-windows");
+    let file = root.join(format!(
+        "tty-graphics-protocol-ctx1108-{}",
+        std::process::id()
+    ));
+    std::fs::write(&file, [0xFF, 0x00, 0x00, 0xFF]).expect("fixture must write");
+
+    let mut rt = make_runtime();
+    rt.handle_pty_bytes(&apc_with_path("Gf=32,s=1,v=1,t=t,m=0;", &path_bytes(&file)));
+    assert_eq!(rt.kitty_image_count(), 0);
+    assert_eq!(rt.kitty_placement_count(), 0);
+    assert!(file.is_file(), "denied t=t must not delete");
+
+    remove_tree_best_effort(&root);
+}
+
+#[test]
+#[cfg(windows)]
+fn query_valid_file_denied_on_windows_answers_einval() {
+    // File-backed `a=q` probes on Windows answer `EINVAL:bad data` (same
+    // as missing files): the read never runs, nothing stored, file kept.
+    let root = temp_root("query-valid-windows");
+    let file = root.join("img.png");
+    std::fs::write(&file, red_1x1_png()).expect("fixture must write");
+
+    let mut rt = make_runtime();
+    rt.handle_pty_bytes(&apc_with_path(
+        "Gf=100,t=f,a=q,i=31,m=0;",
+        &path_bytes(&file),
+    ));
+    let replies: Vec<Vec<u8>> = rt.take_replies().iter().map(|r| r.to_vec()).collect();
+    assert_eq!(replies, vec![b"\x1b_Gi=31;EINVAL:bad data\x1b\\".to_vec()]);
+    assert_eq!(rt.kitty_image_count(), 0, "probes never store");
+    assert!(file.is_file(), "denied probe must not delete");
+
+    remove_tree_best_effort(&root);
 }

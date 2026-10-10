@@ -109,9 +109,27 @@
 #![forbid(unsafe_code)]
 
 use super::*;
-#[cfg(unix)]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
 use std::io::{Read, Seek, SeekFrom};
-#[cfg(unix)]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
 use std::path::{Path, PathBuf};
 
 use bitty_rich::{
@@ -288,7 +306,16 @@ pub fn read_kitty_local(
 
 /// Candidate temp-dir roots for `t=t` containment, each canonicalized
 /// fail-closed (missing entries skipped, duplicates dropped).
-#[cfg(unix)]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
 fn temp_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     for candidate in [
@@ -309,7 +336,16 @@ fn temp_roots() -> Vec<PathBuf> {
 /// under a temp-dir root and still carry the marker (a symlink final
 /// component resolving to a differently-named file is refused here; the
 /// `O_NOFOLLOW` open refuses it again as `ELOOP`).
-#[cfg(unix)]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
 fn check_temp_containment(path: &Path) -> Result<(), KittyLocalReadError> {
     use std::os::unix::ffi::OsStrExt;
     let canonical = path
@@ -377,7 +413,16 @@ fn open_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
 
 /// Unix open-time half: containment, `O_NOFOLLOW` open, fd `fstat`, size
 /// precheck, bounded read, unlink-after-read for `t=t`/`t=s`.
-#[cfg(unix)]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
 fn read_kitty_local_unix(
     medium: bitty_vt::KittyMedium,
     name: &[u8],
@@ -472,6 +517,33 @@ fn read_kitty_local_unix(
         let _ = std::fs::remove_file(&path);
     }
     Ok(bytes)
+}
+
+/// Other Unix targets without a sandboxed `O_NOFOLLOW` open (illumos,
+/// Solaris, AIX, ...): fail closed without attempting I/O. `read_kitty_local`
+/// still dispatches here under `cfg(unix)`, so the stub keeps the call site
+/// compiling while denying the read as `UnsupportedPlatform`.
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))
+))]
+fn read_kitty_local_unix(
+    _medium: bitty_vt::KittyMedium,
+    _name: &[u8],
+    _data_size: u32,
+    _offset: u64,
+    _cap: usize,
+) -> Result<Vec<u8>, KittyLocalReadError> {
+    Err(KittyLocalReadError::UnsupportedPlatform)
 }
 
 impl Runtime {
@@ -726,7 +798,16 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))]
     fn temp_roots_allowlist_is_nonempty() {
         assert!(
             !temp_roots().is_empty(),

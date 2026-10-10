@@ -204,3 +204,109 @@ fn rejected_transmission_leaves_grid_idle() {
     assert!(rt.tick().is_some(), "first tick still presents the grid");
     assert_eq!(rt.tick(), None, "rejected image must not force a present");
 }
+
+#[test]
+fn maximal_row_placement_bounds_scroll_work() {
+    // CTX-1072 (#1850): a maximal-row (r=65535) placement of a 1x1 image
+    // must not drive about 65k linefeeds per placement. Scroll is capped
+    // to the trusted viewport height and the absolute ceiling, so work
+    // stays bounded while the cursor still lands at the bottom.
+    let mut rt = make_runtime();
+    let viewport_rows = rt.state().height();
+    let scrollback_before = rt.state().scrollback_len();
+    let pixel = vec![0xFF, 0x00, 0x00, 0xFF];
+    let start = std::time::Instant::now();
+    let outcome = rt
+        .kitty_display_image(32, Some(1), Some(1), None, 1, u16::MAX, 0, &pixel, 0)
+        .expect("maximal-row placement must still place");
+    assert!(matches!(outcome, KittyDisplayOutcome::Displayed { .. }));
+    assert_eq!(rt.kitty_placement_count(), 1);
+    let elapsed = start.elapsed();
+    // Bounded work: completes quickly (far below the unbounded 65k-apply
+    // cost) and pushes at most one screen into scrollback.
+    assert!(
+        elapsed.as_secs() < 5,
+        "maximal-row placement took {elapsed:?}, expected bounded work"
+    );
+    let scrolled = rt
+        .state()
+        .scrollback_len()
+        .saturating_sub(scrollback_before);
+    assert!(
+        scrolled <= viewport_rows.max(1),
+        "scrollback grew by {scrolled} lines, viewport is {viewport_rows}"
+    );
+    assert!(
+        scrolled <= usize::from(bitty_rich::KITTY_CURSOR_MAX_SCROLL_LINES_PER_PLACEMENT),
+        "scrollback grew by {scrolled} lines, exceeding the absolute ceiling"
+    );
+    // Cursor still lands at the bottom row, past the span.
+    let cursor = rt.state().cursor().position;
+    assert_eq!(
+        usize::from(cursor.row),
+        viewport_rows.saturating_sub(1),
+        "cursor must clamp to the bottom row"
+    );
+    // The viewport-clamped placement still paints one blit.
+    assert!(rt.tick().is_some());
+    assert_eq!(rt.kitty_last_frame_images(), 1);
+}
+
+#[test]
+fn placement_delete_then_render_leaves_no_orphan_blit() {
+    // CTX-1072 (#1850): protocol-level deletion clears the rendered
+    // placement through the origin-scoped wire identity mapping, so the
+    // next present paints no orphan blit.
+    let mut rt = make_runtime();
+    let encoded = "/wAA//8AAP//AAD//wAA/w==";
+    let display = format!("\x1b_Gf=32,s=2,v=2,i=7,m=0;{encoded}\x1b\\");
+    rt.handle_pty_bytes(display.as_bytes());
+    assert_eq!(rt.kitty_placement_count(), 1);
+    assert!(rt.tick().is_some());
+    assert_eq!(rt.kitty_last_frame_images(), 1);
+    rt.handle_pty_bytes(b"\x1b_Ga=d,d=i,i=7\x1b\\");
+    assert_eq!(
+        rt.kitty_placement_count(),
+        0,
+        "protocol delete must clear the rendered placement"
+    );
+    assert!(rt.tick().is_some(), "delete forces a present");
+    assert_eq!(
+        rt.kitty_last_frame_images(),
+        0,
+        "no orphan blit may survive deletion"
+    );
+}
+
+#[test]
+fn delete_image_id_zero_deletes_nothing_anonymous_survives() {
+    // CodeRabbit Minor (pty.rs:942): `a=d,d=i` with no `i=` key yields
+    // `image_id` 0, and `delete_by_wire(origin, 0, None)` wipes every
+    // anonymous placement on the origin. Kitty treats `i=0` as no image
+    // named, so the delete must leave anonymous placements alone.
+    let mut rt = make_runtime();
+    let encoded = "/wAA//8AAP//AAD//wAA/w==";
+    // No `i=` key: anonymous placement (`wire_image == 0`).
+    let display = format!("\x1b_Gf=32,s=2,v=2,m=0;{encoded}\x1b\\");
+    rt.handle_pty_bytes(display.as_bytes());
+    assert_eq!(rt.kitty_placement_count(), 1);
+    assert!(rt.tick().is_some());
+    assert_eq!(rt.kitty_last_frame_images(), 1);
+    // Missing `i=` defaults to 0: must delete nothing.
+    rt.handle_pty_bytes(b"\x1b_Ga=d,d=i\x1b\\");
+    assert_eq!(
+        rt.kitty_placement_count(),
+        1,
+        "d=i with no i= must delete nothing"
+    );
+    // Explicit `i=0` also names no image.
+    rt.handle_pty_bytes(b"\x1b_Ga=d,d=i,i=0\x1b\\");
+    assert_eq!(rt.kitty_placement_count(), 1, "d=i,i=0 must delete nothing");
+    let _ = rt.tick();
+    assert_eq!(rt.kitty_placement_count(), 1);
+    assert_eq!(
+        rt.kitty_last_frame_images(),
+        1,
+        "anonymous blit must survive a zero-id delete"
+    );
+}

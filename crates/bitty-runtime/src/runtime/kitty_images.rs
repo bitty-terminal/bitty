@@ -268,6 +268,43 @@ impl Runtime {
         payload: &[u8],
         z: i32,
     ) -> Result<KittyDisplayOutcome, KittyImageError> {
+        self.kitty_display_image_with_wire(
+            format_f,
+            width_s,
+            height_v,
+            action_a,
+            cols_c,
+            rows_r,
+            cursor_movement_c,
+            payload,
+            z,
+            0,
+            0,
+        )
+    }
+
+    /// Decodes, stores and places with origin-scoped wire identity.
+    ///
+    /// Same behavior as [`Self::kitty_display_image`] except the rendered
+    /// placement records the wire `i=`/`p=` ids (`0` when absent), so a
+    /// later protocol-level deletion (`a=d,d=i`) clears it via
+    /// [`Self::kitty_delete_rendered_image`] instead of leaving an orphan
+    /// blit (CTX-1072, #1850).
+    #[allow(clippy::too_many_arguments)]
+    pub fn kitty_display_image_with_wire(
+        &mut self,
+        format_f: u32,
+        width_s: Option<u32>,
+        height_v: Option<u32>,
+        action_a: Option<char>,
+        cols_c: u16,
+        rows_r: u16,
+        cursor_movement_c: u8,
+        payload: &[u8],
+        z: i32,
+        wire_image: u32,
+        wire_placement: u32,
+    ) -> Result<KittyDisplayOutcome, KittyImageError> {
         let compressed_len = payload.len();
         let image =
             self.kitty_transmit_image(format_f, width_s, height_v, payload, compressed_len)?;
@@ -290,7 +327,7 @@ impl Runtime {
         };
         let placement_id = self
             .kitty_images
-            .display_for_origin(
+            .display_for_origin_with_wire(
                 image,
                 cursor.col,
                 cursor.row,
@@ -300,6 +337,8 @@ impl Runtime {
                 self.state.scrollback_len(),
                 z,
                 self.kitty_origin,
+                wire_image,
+                wire_placement,
             )
             .map_err(KittyImageError::Placement)?;
         self.pending_full_redraw = true;
@@ -332,6 +371,15 @@ impl Runtime {
     /// (saturating; the state machine clamps to the grid anyway). Without
     /// the shift the cursor lands one cell too early and the next printed
     /// text overlaps the image's last column/row (issue #1802).
+    ///
+    /// Security bound (CTX-1072, #1850): the wire `r=` span is untrusted
+    /// PTY input, so scroll driven past the bottom is capped to the
+    /// trusted viewport height and to
+    /// [`bitty_rich::KITTY_CURSOR_MAX_SCROLL_LINES_PER_PLACEMENT`],
+    /// whichever is smaller. A maximal-row (`r=65535`) placement of a 1x1
+    /// image therefore scrolls at most one screen instead of driving
+    /// about 65k linefeeds per placement. In-budget placements (overflow
+    /// within one screen) behave exactly as before.
     fn advance_cursor_past_placement(
         &mut self,
         cursor_col: u16,
@@ -350,12 +398,15 @@ impl Runtime {
         let effective_rows = if rows_r > 0 { rows_r } else { placement.rows };
         let new_col = cursor_col.saturating_add(effective_cols);
         let target_row = cursor_row.saturating_add(effective_rows);
-        let max_row = u16::try_from(self.state.height())
-            .unwrap_or(u16::MAX)
-            .saturating_sub(1);
+        let viewport_rows = u16::try_from(self.state.height()).unwrap_or(u16::MAX);
+        let max_row = viewport_rows.saturating_sub(1);
         if target_row > max_row {
             let overflow = target_row - max_row;
-            for _ in 0..overflow {
+            let viewport_cap = viewport_rows.max(1);
+            let lines = overflow
+                .min(viewport_cap)
+                .min(bitty_rich::KITTY_CURSOR_MAX_SCROLL_LINES_PER_PLACEMENT);
+            for _ in 0..lines {
                 self.state.apply(&bitty_vt::TerminalAction::PrintControl(
                     bitty_vt::ControlChar(0x0A),
                 ));
@@ -389,6 +440,41 @@ impl Runtime {
         payload: Box<[u8]>,
         z: i32,
     ) -> Result<KittyDisplayOutcome, KittyImageError> {
+        self.kitty_display_image_owned_with_wire(
+            format_f,
+            width_s,
+            height_v,
+            action_a,
+            cols_c,
+            rows_r,
+            cursor_movement_c,
+            payload,
+            z,
+            0,
+            0,
+        )
+    }
+
+    /// Owned variant of [`Self::kitty_display_image_with_wire`].
+    ///
+    /// Same behavior but moves the payload to avoid an intermediate copy
+    /// on raw streams, while recording the wire `i=`/`p=` identity for
+    /// later protocol-level deletion (CTX-1072, #1850).
+    #[allow(clippy::too_many_arguments)]
+    pub fn kitty_display_image_owned_with_wire(
+        &mut self,
+        format_f: u32,
+        width_s: Option<u32>,
+        height_v: Option<u32>,
+        action_a: Option<char>,
+        cols_c: u16,
+        rows_r: u16,
+        cursor_movement_c: u8,
+        payload: Box<[u8]>,
+        z: i32,
+        wire_image: u32,
+        wire_placement: u32,
+    ) -> Result<KittyDisplayOutcome, KittyImageError> {
         let compressed_len = payload.len();
         let image =
             self.kitty_transmit_image_owned(format_f, width_s, height_v, payload, compressed_len)?;
@@ -411,7 +497,7 @@ impl Runtime {
         };
         let placement_id = self
             .kitty_images
-            .display_for_origin(
+            .display_for_origin_with_wire(
                 image,
                 cursor.col,
                 cursor.row,
@@ -421,6 +507,8 @@ impl Runtime {
                 self.state.scrollback_len(),
                 z,
                 self.kitty_origin,
+                wire_image,
+                wire_placement,
             )
             .map_err(KittyImageError::Placement)?;
         self.pending_full_redraw = true;
@@ -439,6 +527,31 @@ impl Runtime {
             image,
             placement: placement_id,
         })
+    }
+
+    /// Deletes rendered placements by origin-scoped wire identity.
+    ///
+    /// Origin-scoped counterpart to the terminal-truth `a=d,d=i` delete:
+    /// removes rendered placements of the currently drained stream
+    /// (`self.kitty_origin`) naming `(image_id, placement_id)`, so a
+    /// protocol-level deletion reliably clears displayed output instead
+    /// of leaving an orphan blit (CTX-1072, #1850). `None` clears every
+    /// placement of the image; `Some(p)` clears only the pinned one
+    /// (anonymous placements never match a pin). Stored images stay
+    /// inert under the store caps. Returns the removed count. A positive
+    /// count forces a full redraw so the next tick drops the blit.
+    pub fn kitty_delete_rendered_image(
+        &mut self,
+        image_id: u32,
+        placement_id: Option<u32>,
+    ) -> usize {
+        let removed = self
+            .kitty_images
+            .delete_by_wire(self.kitty_origin, image_id, placement_id);
+        if removed > 0 {
+            self.pending_full_redraw = true;
+        }
+        removed
     }
 
     /// Deletes Unicode placeholder grid cells naming `(image_id,

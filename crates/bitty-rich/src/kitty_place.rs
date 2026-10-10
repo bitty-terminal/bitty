@@ -184,6 +184,18 @@ pub const KITTY_PLACE_MAX_BYTES: usize = crate::image::IMAGE_STORE_MAX_BYTES;
 /// Maximum placements (RFC IMG-8 parity).
 pub const KITTY_PLACE_MAX_ITEMS: usize = crate::image::IMAGE_MAX_PLACEMENTS;
 
+/// Maximum scroll lines one Kitty placement may drive (CTX-1072, #1850).
+///
+/// The wire `r=` span is untrusted PTY input: a maximal-row (`r=65535`)
+/// placement of a 1x1 image must not drive about 65k linefeeds per
+/// placement. The runtime caps cursor-advance scroll to the trusted
+/// viewport height and to this absolute ceiling, whichever is smaller,
+/// so per-placement scroll work stays bounded while in-budget placements
+/// (a few rows) behave exactly as before. Mirrors the per-frame blit
+/// budget posture (`KITTY_PRESENT_MAX_*`): a named Core-owned ceiling
+/// enforced at the call site, no unbounded PTY-driven loops.
+pub const KITTY_CURSOR_MAX_SCROLL_LINES_PER_PLACEMENT: u16 = 256;
+
 // ---------------------------------------------------------------------------
 // Declared-size pre-check (Core-retained, P0-AC-003)
 // ---------------------------------------------------------------------------
@@ -482,6 +494,16 @@ pub struct KittyPlacement {
     /// only on its own origin's leaf, so background panes cannot spoof
     /// pixels over the focused pane.
     pub origin: Option<u64>,
+    /// Wire `i=` image id naming this placement (CTX-1072, #1850): `0`
+    /// when absent (anonymous). Together with `origin` and
+    /// `wire_placement` this is the origin-scoped identity mapping that
+    /// lets protocol-level deletion (`a=d,d=i`) reliably clear the
+    /// rendered placement instead of leaving an orphan blit.
+    pub wire_image: u32,
+    /// Wire `p=` placement id naming this placement (CTX-1072, #1850):
+    /// `0` when absent (anonymous, never singly addressable, mirroring
+    /// the terminal-truth store).
+    pub wire_placement: u32,
     /// Cursor column at display time.
     pub anchor_col: u16,
     /// Cursor row at display time (before scroll adjustment).
@@ -809,7 +831,9 @@ impl KittyImageLayer {
     /// Identical to [`KittyImageLayer::display`] except the placement is
     /// tagged with `origin` (`None` primary, `Some(token)` pane session),
     /// so the present layer can confine it to its own leaf. Same errors
-    /// and eviction behavior as [`KittyImageLayer::display`].
+    /// and eviction behavior as [`KittyImageLayer::display`]. The wire
+    /// identity defaults to anonymous (`0`, `0`); callers with protocol
+    /// ids use [`KittyImageLayer::display_for_origin_with_wire`].
     ///
     /// # Errors
     ///
@@ -828,6 +852,51 @@ impl KittyImageLayer {
         z: i32,
         origin: Option<u64>,
     ) -> Result<KittyPlacementId, KittyPlacementError> {
+        self.display_for_origin_with_wire(
+            image,
+            anchor_col,
+            anchor_row,
+            cols,
+            rows,
+            metrics,
+            scrollback_base,
+            z,
+            origin,
+            0,
+            0,
+        )
+    }
+
+    /// Places a stored image with origin-scoped wire identity (CTX-1072).
+    ///
+    /// Identical to [`KittyImageLayer::display_for_origin`] except the
+    /// placement also records the wire `i=`/`p=` ids (`0` when absent).
+    /// Protocol-level deletion (`a=d,d=i`) matches on
+    /// `(origin, wire_image, wire_placement)` via
+    /// [`KittyImageLayer::delete_by_wire`], so the rendered placement
+    /// clears instead of leaving an orphan blit. Anonymous placements
+    /// (`wire_placement == 0`) are never singly addressable, mirroring
+    /// the terminal-truth store.
+    ///
+    /// # Errors
+    ///
+    /// [`KittyPlacementError::ImageNotFound`] when `image` is unknown.
+    /// Stores nothing new on failure.
+    #[allow(clippy::too_many_arguments)]
+    pub fn display_for_origin_with_wire(
+        &mut self,
+        image: KittyImageId,
+        anchor_col: u16,
+        anchor_row: u16,
+        cols: u16,
+        rows: u16,
+        metrics: CellMetrics,
+        scrollback_base: usize,
+        z: i32,
+        origin: Option<u64>,
+        wire_image: u32,
+        wire_placement: u32,
+    ) -> Result<KittyPlacementId, KittyPlacementError> {
         let stored = self
             .get(image)
             .ok_or(KittyPlacementError::ImageNotFound(image))?;
@@ -842,6 +911,8 @@ impl KittyImageLayer {
             id,
             image,
             origin,
+            wire_image,
+            wire_placement,
             anchor_col,
             anchor_row,
             cols,
@@ -908,6 +979,42 @@ impl KittyImageLayer {
     /// out under the store caps.
     pub fn clear_origin(&mut self, origin: Option<u64>) {
         self.placements.retain(|p| p.origin != origin);
+    }
+
+    /// Deletes rendered placements by origin-scoped wire identity (CTX-1072).
+    ///
+    /// Matches the `a=d,d=i` protocol selector: every placement with
+    /// `origin` and `wire_image == image_id` is removed, or only the one
+    /// with `wire_placement == placement` when `placement` is `Some`.
+    /// Anonymous placements (`wire_placement == 0`) never match a pinned
+    /// delete, mirroring the terminal-truth store. Other origins are
+    /// untouched, stored images stay inert under the store caps, and the
+    /// return is the removed count. Location-based selectors
+    /// (`c`/`p`/`q`/`r`/`x`/`y`/`z`) stay follow-up work: they address
+    /// screen geometry, not identity, so they cannot orphan through this
+    /// mapping.
+    pub fn delete_by_wire(
+        &mut self,
+        origin: Option<u64>,
+        image_id: u32,
+        placement: Option<u32>,
+    ) -> usize {
+        let before = self.placements.len();
+        match placement {
+            Some(pinned) if pinned != 0 => {
+                self.placements.retain(|p| {
+                    !(p.origin == origin && p.wire_image == image_id && p.wire_placement == pinned)
+                });
+            }
+            Some(_) => {
+                // Pin `0` names nothing singly addressable: remove nothing.
+            }
+            None => {
+                self.placements
+                    .retain(|p| !(p.origin == origin && p.wire_image == image_id));
+            }
+        }
+        before - self.placements.len()
     }
 
     /// Clears all images and placements (alternate-screen entry).
@@ -1745,5 +1852,58 @@ mod tests {
         assert_eq!(KITTY_FORMAT_RGBA, 32);
         assert_eq!(KITTY_PRESENT_MAX_BLITS_PER_FRAME, 32);
         assert_eq!(KITTY_PRESENT_MAX_BYTES_PER_FRAME, 64 * 1024 * 1024);
+        assert_eq!(KITTY_CURSOR_MAX_SCROLL_LINES_PER_PLACEMENT, 256);
+    }
+
+    #[test]
+    fn delete_by_wire_is_origin_scoped_and_pinned() {
+        // CTX-1072 (#1850): protocol-level deletion clears rendered
+        // placements through the origin-scoped wire identity mapping.
+        let mut layer = KittyImageLayer::new();
+        let img = stored_red(&mut layer);
+        layer
+            .display_for_origin_with_wire(img, 0, 0, 1, 1, METRICS, 0, 0, None, 7, 0)
+            .unwrap();
+        layer
+            .display_for_origin_with_wire(img, 0, 0, 1, 1, METRICS, 0, 0, Some(7), 7, 0)
+            .unwrap();
+        layer
+            .display_for_origin_with_wire(img, 0, 0, 1, 1, METRICS, 0, 0, None, 7, 1)
+            .unwrap();
+        assert_eq!(layer.placement_len(), 3);
+        // Pinned delete removes only the pinned placement on that origin.
+        assert_eq!(layer.delete_by_wire(None, 7, Some(1)), 1);
+        assert_eq!(layer.placement_len(), 2);
+        // Anonymous placements never match a pin.
+        assert_eq!(layer.delete_by_wire(None, 7, Some(9)), 0);
+        assert_eq!(layer.delete_by_wire(None, 7, Some(0)), 0);
+        // Unpinned delete removes every placement of the image on that
+        // origin only.
+        assert_eq!(layer.delete_by_wire(None, 7, None), 1);
+        assert_eq!(layer.placement_len(), 1);
+        assert!(!layer.placement_for_origin_is_empty(Some(7)));
+        assert_eq!(layer.delete_by_wire(Some(7), 7, None), 1);
+        assert!(layer.placement_is_empty());
+        // Stored images stay inert under the store caps.
+        assert_eq!(layer.len(), 1);
+    }
+
+    #[test]
+    fn maximal_row_span_stays_placeable_and_viewport_clamped() {
+        // CTX-1072 (#1850): a maximal-row span is still admitted as a
+        // placement; only the cursor-advance scroll is bounded downstream.
+        // The visible rect stays viewport-clamped so raster work is bounded
+        // by the viewport, never by the 65535-row span.
+        let mut layer = KittyImageLayer::new();
+        let img = stored_red(&mut layer);
+        let pid = layer
+            .display_for_origin_with_wire(img, 0, 0, 1, u16::MAX, METRICS, 0, 0, None, 7, 0)
+            .expect("maximal-row span must still place");
+        let placement = layer.get_placement(pid).unwrap();
+        assert_eq!(placement.rows, u16::MAX);
+        assert_eq!((placement.wire_image, placement.wire_placement), (7, 0));
+        let visible =
+            KittyImageLayer::placement_rect(placement, METRICS, 80, 24, 0).expect("visible");
+        assert_eq!(visible, RectPx::new(0, 0, 8, 24 * 16));
     }
 }

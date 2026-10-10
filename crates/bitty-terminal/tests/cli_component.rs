@@ -59,6 +59,35 @@ fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+/// Run the binary like [`run_in`] plus extra child-environment entries.
+///
+/// `extra_env` entries override the inherited environment (used to poison
+/// secrets or to point `PATH` at an empty dir so `curl`/`tar` resolve to
+/// nothing). The binary itself is invoked by absolute path, so a scrubbed
+/// `PATH` only blinds its children, never the test harness.
+fn run_with_env(home: &Path, system: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
+    let mut command = Command::new(BITTY_BIN);
+    command
+        .args(args)
+        .env("XDG_CONFIG_HOME", home)
+        .env("XDG_DATA_HOME", home)
+        .env("HOME", home)
+        .env("BITTY_SYSTEM_COMPONENTS_DIR", system)
+        .env("NO_COLOR", "1")
+        .env_remove("BITTY_CONFIG")
+        .env_remove("BITTY_COMPONENTS_DIR")
+        .env_remove("BITTY_PLUGIN_DIR")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null());
+    for (name, value) in extra_env {
+        command.env(name, value);
+    }
+    command
+        .output()
+        .unwrap_or_else(|err| panic!("run {BITTY_BIN:?} {args:?}: {err}"))
+}
+
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
@@ -499,5 +528,122 @@ fn component_add_publishes_atomically_without_temp_litter() {
         before, after,
         "failed re-add must not overwrite the install"
     );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn component_install_absent_curl_fails_closed_with_manual_path() {
+    let home = scratch_dir("absent-curl");
+    let system = home.join("system-components");
+    std::fs::create_dir_all(&system).expect("system dir");
+    // A PATH with no helpers: `curl` (and `tar`) resolve to nothing, so the
+    // preflight fails before any fetch or staging. `--yes` skips consent so
+    // the failure lands in the fetch environment, not the prompt.
+    let empty_path = home.join("empty-path");
+    std::fs::create_dir_all(&empty_path).expect("empty path dir");
+    let output = run_with_env(
+        &home,
+        &system,
+        &[
+            "component",
+            "install",
+            "net",
+            "--version",
+            "0.0.23",
+            "--yes",
+        ],
+        &[("PATH", &empty_path.display().to_string())],
+    );
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let diagnostic = stderr(&output);
+    assert!(
+        diagnostic.contains("`curl` not found"),
+        "absent curl must name the tool: {diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("$XDG_DATA_HOME/bitty/components/"),
+        "diagnostic must point at manual placement: {diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("nothing was fetched or staged"),
+        "diagnostic must promise no staging: {diagnostic}"
+    );
+    assert!(
+        !user_root(&home).join("net").exists(),
+        "absent curl must stage nothing"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn component_install_with_hostile_env_still_fails_closed() {
+    let home = scratch_dir("hostile-env");
+    let system = home.join("system-components");
+    std::fs::create_dir_all(&system).expect("system dir");
+    let poisoned: &[(&str, &str)] = &[
+        ("BITTY_CTX1112_GITHUB_TOKEN", "poison-token"),
+        ("BITTY_CTX1112_AWS_SECRET_ACCESS_KEY", "poison-secret"),
+        ("BITTY_CTX1112_API_KEY", "poison-key"),
+    ];
+    // Hostile names still fail at URL construction (exit 2) with zero spawn,
+    // even under a poisoned environment: validation precedes any fetch, so
+    // no secret can reach a child that is never spawned.
+    let output = run_with_env(
+        &home,
+        &system,
+        &["component", "install", "../evil", "--version", "0.0.23"],
+        poisoned,
+    );
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    // With no helpers on PATH, the poisoned environment still lands in the
+    // curl-missing diagnostic (exit 1), never in a child.
+    let empty_path = home.join("empty-path");
+    std::fs::create_dir_all(&empty_path).expect("empty path dir");
+    let empty_path_str = empty_path.display().to_string();
+    let mut env: Vec<(&str, &str)> = poisoned.to_vec();
+    env.push(("PATH", &empty_path_str));
+    let output = run_with_env(
+        &home,
+        &system,
+        &[
+            "component",
+            "install",
+            "net",
+            "--version",
+            "0.0.23",
+            "--yes",
+        ],
+        &env,
+    );
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("`curl` not found"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        !user_root(&home).join("net").exists(),
+        "hostile env must stage nothing"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn component_help_documents_fetch_environment() {
+    let home = scratch_dir("fetch-help");
+    let system = home.join("system-components");
+    std::fs::create_dir_all(&system).expect("system dir");
+    let output = run_in(&home, &system, &["component", "--help"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    // Curl floor: preflight + minimum version.
+    assert!(text.contains("curl --version"), "{text}");
+    assert!(text.contains("7.68.0"), "{text}");
+    // Absent/too-old diagnostic: manual placement path + exit code.
+    assert!(text.contains("$XDG_DATA_HOME/bitty/components/"), "{text}");
+    // CA + proxy posture pin plus the no-secrets audit.
+    assert!(text.contains("system CA store"), "{text}");
+    assert!(text.contains("proxy"), "{text}");
+    assert!(text.contains("*_TOKEN"), "{text}");
     let _ = std::fs::remove_dir_all(&home);
 }

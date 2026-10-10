@@ -103,6 +103,12 @@ pub const MAX_COMPONENT_FORMAT_BYTES: usize = 16;
 pub const MAX_COMPONENT_VERSION_BYTES: usize = 64;
 /// Maximum bytes for a source path operand.
 pub const MAX_COMPONENT_PATH_BYTES: usize = 4096;
+/// Maximum bytes read from one install-consent answer line (mirrors
+/// `plugin.rs` `MAX_CONSENT_LINE_BYTES`).
+pub const MAX_COMPONENT_CONSENT_LINE_BYTES: usize = 64;
+/// Install-consent attempts before aborting (mirrors `plugin.rs`
+/// `MAX_CONSENT_ATTEMPTS`).
+pub const MAX_COMPONENT_CONSENT_ATTEMPTS: usize = 3;
 
 // ---------------------------------------------------------------------------
 // Parsed request (headless, bounded, fail-closed)
@@ -198,6 +204,8 @@ pub struct ComponentRequest {
     pub format: ComponentFormat,
     /// `--no-color` (accepted for parity; tables are plain text).
     pub no_color: bool,
+    /// `install --yes`: approve the download consent non-interactively.
+    pub yes: bool,
 }
 
 /// Why parsing failed.
@@ -243,6 +251,7 @@ pub fn parse_component_request(
     let mut version_flag: Option<String> = None;
     let mut format: Option<String> = None;
     let mut no_color = false;
+    let mut yes = false;
 
     let mut index = 0usize;
     while index < raw.len() {
@@ -251,6 +260,11 @@ pub fn parse_component_request(
             "-h" | "--help" => return Err(ComponentParseError::Help),
             "--no-color" => {
                 no_color = true;
+                index += 1;
+                continue;
+            }
+            "--yes" => {
+                yes = true;
                 index += 1;
                 continue;
             }
@@ -383,6 +397,12 @@ pub fn parse_component_request(
                     verb.name()
                 )));
             }
+            if yes {
+                return Err(ComponentParseError::Usage(format!(
+                    "bitty component: --yes only applies to `install` (got `{}`)",
+                    verb.name()
+                )));
+            }
         }
         ComponentVerb::Add => {
             if operand.is_none() {
@@ -400,6 +420,12 @@ pub fn parse_component_request(
             if format != ComponentFormat::Table || no_color {
                 return Err(ComponentParseError::Usage(format!(
                     "bitty component: --format/--no-color only apply to `list` (got `{}`)",
+                    verb.name()
+                )));
+            }
+            if yes {
+                return Err(ComponentParseError::Usage(format!(
+                    "bitty component: --yes only applies to `install` (got `{}`)",
                     verb.name()
                 )));
             }
@@ -450,6 +476,12 @@ pub fn parse_component_request(
                     verb.name()
                 )));
             }
+            if yes {
+                return Err(ComponentParseError::Usage(format!(
+                    "bitty component: --yes only applies to `install` (got `{}`)",
+                    verb.name()
+                )));
+            }
         }
     }
 
@@ -460,6 +492,7 @@ pub fn parse_component_request(
         version_flag,
         format,
         no_color,
+        yes,
     })
 }
 
@@ -468,15 +501,16 @@ pub fn parse_component_request(
 pub fn component_usage() -> String {
     "usage: bitty component list [--format table|json|jsonl] [--no-color]\n\
      \x20      bitty component add <path> [--version <semver>]\n\
-     \x20      bitty component install <name> --version <X.Y.Z>\n\
+     \x20      bitty component install <name> --version <X.Y.Z> [--yes]\n\
      \x20      bitty component remove <name> [<version>]\n\
      \n\
      Components are upstream native binaries resolved user-first:\n\
      $XDG_DATA_HOME/bitty/components/ wins over /usr/lib/bitty/components/.\n\
      `add` stages from a local path only (v1 has no registry download);\n\
      `install` fetches one R2 prebuilt release through the hash-verified\n\
-     seed, then the full manager takes over; `remove` only touches the\n\
-     user tier (no root required).\n\
+     seed (builtin cdn.bitty.run:443 egress, dual-digest verified silent\n\
+     else explicit consent), then the full manager takes over; `remove` only\n\
+     touches the user tier (no root required).\n\
      `bitty component --help` explains sources, ABI checks, and exit codes."
         .to_string()
 }
@@ -501,7 +535,7 @@ pub fn component_help_text() -> String {
      \x20                             anything is written. URLs fail closed (v1\n\
      \x20                             has no registry download).\n\
      \x20 install <name> --version V Fetch one prebuilt release from R2\n\
-     \x20                             (https://cdn.bitty.run, SHA256SUMS hash\n\
+     \x20 [--yes]                     (https://cdn.bitty.run, SHA256SUMS hash\n\
      \x20                             verified) into the user tier, then hand\n\
      \x20                             off to the full manager. The version is\n\
      \x20                             required and exact: the seed keeps no\n\
@@ -516,6 +550,26 @@ pub fn component_help_text() -> String {
      \x20 --no-color                  Accepted for parity (tables are plain text).\n\
      \x20 --version <semver>          add: version for a bare executable.\n\
      \x20                             install: required exact R2 release.\n\
+     \x20 --yes                       install only: approve the download consent\n\
+     \x20                             non-interactively (no prompt).\n\
+     \n\
+     installer egress:\n\
+     \x20 cdn.bitty.run:443 is the core-built-in installer egress: strict\n\
+     \x20 configurations allow the pinned first-party host with no extra\n\
+     \x20 grant. Every other host stays consent-gated and fails closed\n\
+     \x20 without explicit consent. Fetch uses fixed-argv system curl\n\
+     \x20 (pinned to https://cdn.bitty.run, --proto =https, no shell) plus\n\
+     \x20 system tar; no Rust network stack.\n\
+     \n\
+     download consent:\n\
+     \x20 Silent only when the fetch targets the builtin CDN host AND both\n\
+     \x20 digests verify (registry/manifest digest and CDN SHA256SUMS both\n\
+     \x20 match, per the dual-digest rule); anything else (third-party host,\n\
+     \x20 single-digest-only, digest mismatch history) needs explicit\n\
+     \x20 confirm. Without --yes the installer prompts `Grant download\n\
+     \x20 <name> <version>? [y/N]` (up to 3 attempts, 64 bytes per answer);\n\
+     \x20 `y`/`yes` approves, `n`/`no`/empty declines, EOF aborts. A\n\
+     \x20 decline or EOF exits 1 with nothing staged or fetched.\n\
      \n\
      resolution:\n\
      \x20 User $XDG_DATA_HOME/bitty/components/ wins over system\n\
@@ -530,13 +584,15 @@ pub fn component_help_text() -> String {
      \x20 the `bitty component add` command to run, and never a stack trace.\n\
      \n\
      exit codes:\n\
-     \x20 0 success | 1 filesystem failure | 2 usage | 4 component error\n\
+     \x20 0 success | 1 declined consent, aborted prompt, or filesystem\n\
+     \x20 failure | 2 usage | 4 component error (integrity, ABI, digest)\n\
      \n\
      examples:\n\
      \x20 bitty component list\n\
      \x20 bitty component list --format json\n\
      \x20 bitty component add ./dist/net --version 0.0.1\n\
      \x20 bitty component install net --version 0.0.23\n\
+     \x20 bitty component install net --version 0.0.23 --yes\n\
      \x20 bitty component remove net 0.0.1"
         .to_string()
 }
@@ -597,6 +653,7 @@ impl ComponentFailure {
 pub fn run_component_subcommand(
     raw: &[String],
     context: &ComponentContext<'_>,
+    input: &mut dyn std::io::BufRead,
     output: &mut dyn std::io::Write,
 ) -> i32 {
     let request = match parse_component_request(raw, context.pre_format) {
@@ -659,6 +716,8 @@ pub fn run_component_subcommand(
                 request.version_flag.as_deref(),
                 user_root.as_deref(),
                 output,
+                input,
+                request.yes,
                 &mut transport,
             ) {
                 Ok(summary) => {
@@ -899,7 +958,9 @@ fn op_install(
     name: &str,
     version_flag: Option<&str>,
     user_root: Option<&Path>,
-    _output: &mut dyn std::io::Write,
+    output: &mut dyn std::io::Write,
+    input: &mut dyn std::io::BufRead,
+    yes: bool,
     transport: &mut dyn crate::component_seed::SeedTransport,
 ) -> Result<String, ComponentFailure> {
     // The parser requires `--version`; this is defense in depth.
@@ -932,6 +993,48 @@ fn op_install(
             std::env::consts::ARCH,
         )))
     })?;
+    // Build the allowlisted URLs first (pure: hostile input fails here with
+    // zero spawn) so the consent prompt names the exact fetch and the
+    // builtin-egress check runs before any child is spawned.
+    let urls = crate::component_seed::seed_urls(name, version, target)
+        .map_err(|error| seed_failure(&error))?;
+    // Defense in depth: seed_urls only ever emits the pinned base, but the
+    // egress gate owns the decision, so audit both URLs through it. A
+    // non-builtin URL (unrepresentable today; future third-party hosts)
+    // always takes the confirm path.
+    let is_builtin = crate::component_seed::is_builtin_installer_url(&urls.tarball_url)
+        && crate::component_seed::is_builtin_installer_url(&urls.manifest_url);
+    // Dual-digest (#1906 direction, checked locally): the registry pin is
+    // not yet available in this slice (it lands with the manager index),
+    // so installs are single-source-only (CDN SHA256SUMS) and always take
+    // the confirm path. The check runs through the real predicate so the
+    // dual-digest rule stays live in non-test builds: `None` (no registry
+    // pin) always yields `false` (confirm), and when the registry digest
+    // arrives the call becomes
+    // `is_dual_digest_verified(Some(registry), &cdn_digest, &actual)` with
+    // silent activating for builtin+dual.
+    let dual_verified = crate::component_seed::is_dual_digest_verified(None, "", "");
+    let level = crate::component_seed::installer_consent_level(is_builtin, dual_verified);
+    let needs_consent = level == crate::component_seed::InstallerConsentLevel::Confirm;
+    if needs_consent && !yes {
+        // Consent precedes any fetch: a decline/EOF exits 1 with no spawn
+        // and no staging (provable by the zero-spawn hostile corpus plus
+        // the no-staging decline tests).
+        match ask_component_install_consent(input, output, name, version, &urls)? {
+            true => {}
+            false => {
+                return Err(ComponentFailure::generic(format!(
+                    "bitty component: download of '{name}' version {version} was not approved — nothing changed"
+                )));
+            }
+        }
+    } else if needs_consent && yes {
+        let _ = writeln!(
+            output,
+            "bitty component: --yes approved download of '{name}' version {version} from {}",
+            crate::component_seed::BUILTIN_INSTALLER_EGRESS
+        );
+    }
     let payload = crate::component_seed::fetch_seed_payload(name, version, target, transport)
         .map_err(|error| seed_failure(&error))?;
     // ABI-compat check before any mutation (same gate as `add`).
@@ -964,6 +1067,149 @@ fn op_install(
         "{summary}\nseed handoff: '{}' is installed and active; the full manager takes over from here",
         executable_path.display()
     ))
+}
+
+/// Interactive download consent for `component install` (fails closed).
+///
+/// Mirrors `plugin.rs` `ask_consent` (`MAX_CONSENT_LINE_BYTES` /
+/// `MAX_CONSENT_ATTEMPTS` precedent) for prompts, matching, attempts, and
+/// exit codes: returns `Ok(true)` on approval, `Ok(false)` on explicit
+/// decline, and `Err` (exit 1, nothing changed) on EOF/read error or too
+/// many invalid answers. Unlike the `plugin.rs` precedent, the read itself
+/// is bounded (CodeRabbit 4238843895): at most
+/// `MAX_COMPONENT_CONSENT_LINE_BYTES + 2` bytes are buffered per answer
+/// (room for a 64-byte answer plus `\r\n`); an unterminated longer line is
+/// rejected as overlong after its remainder is discarded through bounded
+/// `fill_buf` takes, so a large piped answer cannot grow memory without
+/// bound and no byte-index truncation can split a UTF-8 character. Portable (generic
+/// `BufRead`/`Write`, byte-oriented reads, no Unix-only calls; helpers stay
+/// PATH-resolved `curl`/`tar`).
+fn ask_component_install_consent(
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
+    name: &str,
+    version: &str,
+    urls: &crate::component_seed::SeedUrls,
+) -> Result<bool, ComponentFailure> {
+    let _ = writeln!(
+        output,
+        "bitty component: install '{name}' version {version} downloads an executable from the builtin installer egress {}:",
+        crate::component_seed::BUILTIN_INSTALLER_EGRESS
+    );
+    let _ = writeln!(output, "  manifest: {}", urls.manifest_url);
+    let _ = writeln!(output, "  tarball:  {}", urls.tarball_url);
+    let _ = writeln!(
+        output,
+        "  trust: single-source-only (CDN SHA256SUMS; registry pin arrives with #1906) — explicit confirm required."
+    );
+    for attempt in 1..=MAX_COMPONENT_CONSENT_ATTEMPTS {
+        let _ = write!(
+            output,
+            "Grant download of '{name}' version {version}? [y/N]: "
+        );
+        let _ = output.flush();
+        let Some(answer) = read_consent_answer(input, output, attempt) else {
+            continue;
+        };
+        let answer = answer?;
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" => return Ok(true),
+            "" | "n" | "no" => return Ok(false),
+            _ => {
+                let _ = writeln!(
+                    output,
+                    "  (answer y or n — try again [{attempt}/{MAX_COMPONENT_CONSENT_ATTEMPTS}])"
+                );
+            }
+        }
+    }
+    Err(ComponentFailure::generic(format!(
+        "bitty component: aborted (too many invalid answers, limit {MAX_COMPONENT_CONSENT_ATTEMPTS}) — nothing changed"
+    )))
+}
+
+/// Read one consent answer with a bounded buffer.
+///
+/// Returns `None` when the answer was overlong (already reported; the
+/// caller retries without consuming an extra attempt branch), otherwise
+/// `Some(Ok(line))` for a complete line or `Some(Err(..))` on EOF/read
+/// error/invalid UTF-8 (fail closed, nothing changed).
+fn read_consent_answer(
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
+    attempt: usize,
+) -> Option<Result<String, ComponentFailure>> {
+    // Window: a 64-byte answer plus a `\r\n` terminator. A line that does
+    // not terminate inside the window is overlong and rejected. Bytes are
+    // taken via `fill_buf`/`consume` (never a wide `read`) so a single
+    // answer never swallows the start of the next line.
+    const WINDOW: usize = MAX_COMPONENT_CONSENT_LINE_BYTES + 2;
+    let mut answer: Vec<u8> = Vec::with_capacity(WINDOW);
+    let mut terminated = false;
+    let mut failed = false;
+    while answer.len() < WINDOW {
+        let ate: usize = match input.fill_buf() {
+            Ok(&[]) => break, // EOF: line ends here, if any.
+            Err(_) => {
+                failed = true;
+                break;
+            }
+            Ok(buffered) => {
+                let mut end = buffered.len().min(WINDOW - answer.len());
+                if let Some(pos) = buffered[..end].iter().position(|&b| b == b'\n') {
+                    end = pos + 1;
+                    terminated = true;
+                }
+                answer.extend_from_slice(&buffered[..end]);
+                end
+            }
+        };
+        input.consume(ate);
+        if terminated {
+            break;
+        }
+    }
+    if failed || (answer.is_empty() && !terminated) {
+        return Some(Err(ComponentFailure::generic(
+            "bitty component: aborted (end of input) — nothing changed".to_string(),
+        )));
+    }
+    // A short EOF-terminated line (window not filled) is a complete
+    // answer; only a filled window without a newline is overlong.
+    if !terminated && answer.len() < WINDOW {
+        terminated = true;
+    }
+    if !terminated {
+        // Overlong: discard the line remainder (never past its newline,
+        // so a queued next answer survives) so the next attempt starts
+        // fresh. Fixed-window takes keep memory bounded no matter how
+        // long the piped line is.
+        loop {
+            match input.fill_buf() {
+                Ok(&[]) | Err(_) => break,
+                Ok(buffered) => {
+                    if let Some(pos) = buffered.iter().position(|&b| b == b'\n') {
+                        let ate = pos + 1;
+                        input.consume(ate);
+                        break;
+                    }
+                    let ate = buffered.len();
+                    input.consume(ate);
+                }
+            }
+        }
+        let _ = writeln!(
+            output,
+            "  (answer too long — at most {MAX_COMPONENT_CONSENT_LINE_BYTES} bytes — try again [{attempt}/{MAX_COMPONENT_CONSENT_ATTEMPTS}])"
+        );
+        return None;
+    }
+    match String::from_utf8(answer) {
+        Ok(line) => Some(Ok(line)),
+        Err(_) => Some(Err(ComponentFailure::generic(
+            "bitty component: aborted (end of input) — nothing changed".to_string(),
+        ))),
+    }
 }
 
 fn load_staged_source(
@@ -1514,9 +1760,14 @@ mod tests {
     }
 
     fn run_with(context: &ComponentContext<'_>, args: &[&str]) -> (i32, String) {
+        run_with_input(context, args, "")
+    }
+
+    fn run_with_input(context: &ComponentContext<'_>, args: &[&str], stdin: &str) -> (i32, String) {
         let raw: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+        let mut input = std::io::BufReader::new(stdin.as_bytes());
         let mut buf = Vec::new();
-        let code = run_component_subcommand(&raw, context, &mut buf);
+        let code = run_component_subcommand(&raw, context, &mut input, &mut buf);
         (code, String::from_utf8_lossy(&buf).into_owned())
     }
 
@@ -1573,6 +1824,20 @@ mod tests {
         assert_eq!(request.verb, ComponentVerb::Install);
         assert_eq!(request.operand.as_deref(), Some("net"));
         assert_eq!(request.version_flag.as_deref(), Some("0.0.23"));
+        assert!(!request.yes);
+
+        let request = parse_component_request(
+            &[
+                String::from("install"),
+                String::from("net"),
+                String::from("--version"),
+                String::from("0.0.23"),
+                String::from("--yes"),
+            ],
+            None,
+        )
+        .expect("install --yes");
+        assert!(request.yes);
 
         // `--version` is required for install.
         assert!(
@@ -1603,6 +1868,32 @@ mod tests {
                     String::from("0.0.1"),
                     String::from("--format"),
                     String::from("json"),
+                ],
+                None,
+            )
+            .is_err()
+        );
+        // `--yes` only applies to `install`.
+        assert!(
+            parse_component_request(
+                &[
+                    String::from("add"),
+                    String::from("x"),
+                    String::from("--yes")
+                ],
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_component_request(&[String::from("list"), String::from("--yes")], None,).is_err()
+        );
+        assert!(
+            parse_component_request(
+                &[
+                    String::from("remove"),
+                    String::from("net"),
+                    String::from("--yes")
                 ],
                 None,
             )
@@ -1750,8 +2041,9 @@ mod tests {
                 "--version".to_string(),
                 "0.0.23".to_string(),
             ];
+            let mut input = std::io::BufReader::new(&b""[..]);
             let mut buf = Vec::new();
-            let code = run_component_subcommand(&args, &context, &mut buf);
+            let code = run_component_subcommand(&args, &context, &mut input, &mut buf);
             assert_eq!(code, EXIT_USAGE, "hostile {hostile:?}");
         }
         let user_root = Path::new(context.components_dir.expect("user"));
@@ -1775,6 +2067,7 @@ mod tests {
         manifest: String,
         descriptor: Vec<u8>,
         executable: Vec<u8>,
+        fetch_calls: usize,
     }
 
     impl InstallStub {
@@ -1809,6 +2102,7 @@ mod tests {
                 manifest,
                 descriptor,
                 executable: exe.to_vec(),
+                fetch_calls: 0,
             }
         }
     }
@@ -1820,6 +2114,7 @@ mod tests {
             dest: &Path,
             _max: u64,
         ) -> Result<(), crate::component_seed::SeedError> {
+            self.fetch_calls += 1;
             let bytes = if url.ends_with("SHA256SUMS") {
                 self.manifest.as_bytes()
             } else {
@@ -1876,8 +2171,17 @@ mod tests {
         let target = "x86_64-unknown-linux-gnu";
         let mut stub = InstallStub::canned("net", "0.0.23", target, b"seed-net-bytes");
         let mut out = Vec::new();
-        let summary = op_install("net", Some("0.0.23"), Some(&user), &mut out, &mut stub)
-            .expect("seed install");
+        let mut input = std::io::BufReader::new(&b""[..]);
+        let summary = op_install(
+            "net",
+            Some("0.0.23"),
+            Some(&user),
+            &mut out,
+            &mut input,
+            true,
+            &mut stub,
+        )
+        .expect("seed install");
         assert!(
             summary.contains("installed component 'net' version 0.0.23"),
             "{summary}"
@@ -1905,14 +2209,33 @@ mod tests {
         // Re-installing the same bytes is idempotent, like `add`.
         let mut stub = InstallStub::canned("net", "0.0.23", target, b"seed-net-bytes");
         let mut out = Vec::new();
-        op_install("net", Some("0.0.23"), Some(&user), &mut out, &mut stub).expect("idempotent");
+        let mut input = std::io::BufReader::new(&b""[..]);
+        op_install(
+            "net",
+            Some("0.0.23"),
+            Some(&user),
+            &mut out,
+            &mut input,
+            true,
+            &mut stub,
+        )
+        .expect("idempotent");
 
         // Different bytes for the same version fail closed (downgrade by
         // content swap), leaving the install untouched.
         let mut stub = InstallStub::canned("net", "0.0.23", target, b"other-bytes");
         let mut out = Vec::new();
-        let error = op_install("net", Some("0.0.23"), Some(&user), &mut out, &mut stub)
-            .expect_err("content swap must fail");
+        let mut input = std::io::BufReader::new(&b""[..]);
+        let error = op_install(
+            "net",
+            Some("0.0.23"),
+            Some(&user),
+            &mut out,
+            &mut input,
+            true,
+            &mut stub,
+        )
+        .expect_err("content swap must fail");
         assert_eq!(error.exit, EXIT_COMPONENT, "{}", error.message);
         assert_eq!(
             std::fs::read(version_dir.join(executable_file_name(&format!(
@@ -1925,6 +2248,255 @@ mod tests {
     }
 
     #[test]
+    fn install_consent_decline_exits_generic_with_no_staging_or_fetch() {
+        if crate::component_seed::host_target_triple().is_none() {
+            return;
+        }
+        let base = scratch("install-decline");
+        let user = base.join("user");
+        std::fs::create_dir_all(&user).expect("user dir");
+        let target = "x86_64-unknown-linux-gnu";
+        let mut stub = InstallStub::canned("net", "0.0.23", target, b"seed-net-bytes");
+        let mut out = Vec::new();
+        let mut input = std::io::BufReader::new(&b"n\n"[..]);
+        let error = op_install(
+            "net",
+            Some("0.0.23"),
+            Some(&user),
+            &mut out,
+            &mut input,
+            false,
+            &mut stub,
+        )
+        .expect_err("decline must fail");
+        assert_eq!(error.exit, EXIT_GENERIC, "{}", error.message);
+        assert!(
+            error.message.contains("not approved"),
+            "decline must name the refusal: {}",
+            error.message
+        );
+        assert_eq!(stub.fetch_calls, 0, "decline must not fetch");
+        assert!(!user.join("net").exists(), "decline must not stage files");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn install_consent_eof_exits_generic_with_no_staging_or_fetch() {
+        if crate::component_seed::host_target_triple().is_none() {
+            return;
+        }
+        let base = scratch("install-eof");
+        let user = base.join("user");
+        std::fs::create_dir_all(&user).expect("user dir");
+        let target = "x86_64-unknown-linux-gnu";
+        let mut stub = InstallStub::canned("net", "0.0.23", target, b"seed-net-bytes");
+        let mut out = Vec::new();
+        let mut input = std::io::BufReader::new(&b""[..]);
+        let error = op_install(
+            "net",
+            Some("0.0.23"),
+            Some(&user),
+            &mut out,
+            &mut input,
+            false,
+            &mut stub,
+        )
+        .expect_err("EOF must fail");
+        assert_eq!(error.exit, EXIT_GENERIC, "{}", error.message);
+        assert_eq!(stub.fetch_calls, 0, "EOF must not fetch");
+        assert!(!user.join("net").exists(), "EOF must not stage files");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn install_consent_too_many_invalid_exits_generic_with_no_staging() {
+        if crate::component_seed::host_target_triple().is_none() {
+            return;
+        }
+        let base = scratch("install-invalid");
+        let user = base.join("user");
+        std::fs::create_dir_all(&user).expect("user dir");
+        let target = "x86_64-unknown-linux-gnu";
+        let mut stub = InstallStub::canned("net", "0.0.23", target, b"seed-net-bytes");
+        let mut out = Vec::new();
+        let mut input = std::io::BufReader::new(&b"maybe\nperhaps\n???\n"[..]);
+        let error = op_install(
+            "net",
+            Some("0.0.23"),
+            Some(&user),
+            &mut out,
+            &mut input,
+            false,
+            &mut stub,
+        )
+        .expect_err("invalid answers must fail");
+        assert_eq!(error.exit, EXIT_GENERIC, "{}", error.message);
+        assert_eq!(stub.fetch_calls, 0, "invalid answers must not fetch");
+        assert!(!user.join("net").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn install_consent_approve_via_stdin_stages() {
+        if crate::component_seed::host_target_triple().is_none() {
+            return;
+        }
+        let base = scratch("install-approve");
+        let user = base.join("user");
+        std::fs::create_dir_all(&user).expect("user dir");
+        let target = "x86_64-unknown-linux-gnu";
+        let mut stub = InstallStub::canned("net", "0.0.23", target, b"seed-net-bytes");
+        let mut out = Vec::new();
+        let mut input = std::io::BufReader::new(&b"y\n"[..]);
+        let summary = op_install(
+            "net",
+            Some("0.0.23"),
+            Some(&user),
+            &mut out,
+            &mut input,
+            false,
+            &mut stub,
+        )
+        .expect("approval stages");
+        assert!(summary.contains("installed component"), "{summary}");
+        assert!(user.join("net").join("0.0.23").is_dir());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn install_yes_skips_prompt_and_stages() {
+        if crate::component_seed::host_target_triple().is_none() {
+            return;
+        }
+        let base = scratch("install-yes");
+        let (context, _, _) = context_for(&base.join("user"), &base.join("system"));
+        let user = Path::new(context.components_dir.expect("user")).to_path_buf();
+        let target = "x86_64-unknown-linux-gnu";
+        let mut stub = InstallStub::canned("net", "0.0.23", target, b"seed-net-bytes");
+        let mut out = Vec::new();
+        // Empty stdin with `--yes` must not prompt (EOF would fail without it).
+        let mut input = std::io::BufReader::new(&b""[..]);
+        let summary = op_install(
+            "net",
+            Some("0.0.23"),
+            Some(&user),
+            &mut out,
+            &mut input,
+            true,
+            &mut stub,
+        )
+        .expect("--yes stages without prompting");
+        assert!(summary.contains("installed component"), "{summary}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn install_consent_bounds_match_plugin_precedent() {
+        assert_eq!(
+            MAX_COMPONENT_CONSENT_LINE_BYTES,
+            crate::plugin::MAX_CONSENT_LINE_BYTES
+        );
+        assert_eq!(
+            MAX_COMPONENT_CONSENT_ATTEMPTS,
+            crate::plugin::MAX_CONSENT_ATTEMPTS
+        );
+    }
+
+    fn consent_urls() -> crate::component_seed::SeedUrls {
+        crate::component_seed::seed_urls("net", "0.0.23", "x86_64-unknown-linux-gnu")
+            .expect("consent urls")
+    }
+
+    #[test]
+    fn install_consent_overlong_line_is_rejected_and_stream_resyncs() {
+        // A 500-byte piped answer must not grow memory without bound: it
+        // is rejected as overlong, its remainder discarded, and the next
+        // queued answer (`y`) still applies.
+        let urls = consent_urls();
+        let mut out = Vec::new();
+        let stdin = format!("{}\ny\n", "x".repeat(500));
+        let mut input = std::io::BufReader::new(stdin.as_bytes());
+        let approved = ask_component_install_consent(&mut input, &mut out, "net", "0.0.23", &urls)
+            .expect("resyncs to the queued approval");
+        assert!(approved);
+        let shown = String::from_utf8_lossy(&out);
+        assert!(shown.contains("too long"), "{shown}");
+    }
+
+    #[test]
+    fn install_consent_multibyte_at_boundary_does_not_panic() {
+        // 63 ASCII bytes + `é` (2 bytes) put byte 64 mid-character: the old
+        // `truncate(64)` panicked here. The bounded read evaluates the full
+        // line instead (invalid answer, no panic), then the queued `n`
+        // declines.
+        let urls = consent_urls();
+        let mut out = Vec::new();
+        let stdin = format!("{}é\nn\n", "a".repeat(63));
+        let mut input = std::io::BufReader::new(stdin.as_bytes());
+        let approved = ask_component_install_consent(&mut input, &mut out, "net", "0.0.23", &urls)
+            .expect("boundary answer must not panic");
+        assert!(!approved);
+    }
+
+    #[test]
+    fn install_consent_overlong_multibyte_resyncs() {
+        // 100 `é`s (200 bytes, unterminated in the window) are overlong:
+        // discarded, then the queued `n` declines.
+        let urls = consent_urls();
+        let mut out = Vec::new();
+        let stdin = format!("{}\nn\n", "é".repeat(100));
+        let mut input = std::io::BufReader::new(stdin.as_bytes());
+        let approved = ask_component_install_consent(&mut input, &mut out, "net", "0.0.23", &urls)
+            .expect("multibyte overlong must resync");
+        assert!(!approved);
+    }
+
+    #[test]
+    fn install_consent_overlong_then_eof_aborts_without_staging() {
+        // Overlong line with no further input: the retry hits EOF and
+        // aborts fail-closed (exit 1), never staging.
+        if crate::component_seed::host_target_triple().is_none() {
+            return;
+        }
+        let base = scratch("install-overlong-eof");
+        let user = base.join("user");
+        std::fs::create_dir_all(&user).expect("user dir");
+        let target = "x86_64-unknown-linux-gnu";
+        let mut stub = InstallStub::canned("net", "0.0.23", target, b"seed-net-bytes");
+        let mut out = Vec::new();
+        let stdin = "x".repeat(500);
+        let mut input = std::io::BufReader::new(stdin.as_bytes());
+        let error = op_install(
+            "net",
+            Some("0.0.23"),
+            Some(&user),
+            &mut out,
+            &mut input,
+            false,
+            &mut stub,
+        )
+        .expect_err("overlong-then-EOF must fail");
+        assert_eq!(error.exit, EXIT_GENERIC, "{}", error.message);
+        assert_eq!(stub.fetch_calls, 0, "abort must not fetch");
+        assert!(!user.join("net").exists(), "abort must not stage files");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn install_consent_short_eof_terminated_line_still_counts() {
+        // `printf 'n'` (no trailing newline) declines exactly like `n\n`:
+        // a short EOF-terminated line is a complete answer, not overlong.
+        let urls = consent_urls();
+        let mut out = Vec::new();
+        let mut input = std::io::BufReader::new(&b"n"[..]);
+        let approved = ask_component_install_consent(&mut input, &mut out, "net", "0.0.23", &urls)
+            .expect("short EOF-terminated answer counts");
+        assert!(!approved);
+        let shown = String::from_utf8_lossy(&out);
+        assert!(!shown.contains("too long"), "{shown}");
+    }
+
+    #[test]
     fn remove_reports_system_only_with_actionable_error() {
         let base = scratch("system-only");
         let user = base.join("user");
@@ -1933,8 +2505,9 @@ mod tests {
         std::fs::create_dir_all(system.join("net").join("0.0.1")).expect("system component");
         let (context, _, _) = context_for(&user, &system);
         let raw = vec![String::from("remove"), String::from("net")];
+        let mut input = std::io::BufReader::new(&b""[..]);
         let mut buf = Vec::new();
-        let code = run_component_subcommand(&raw, &context, &mut buf);
+        let code = run_component_subcommand(&raw, &context, &mut input, &mut buf);
         assert_eq!(code, EXIT_COMPONENT);
         let _ = std::fs::remove_dir_all(&base);
     }

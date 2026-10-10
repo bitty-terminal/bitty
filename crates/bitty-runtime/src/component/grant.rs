@@ -13,6 +13,47 @@ use bitty_plugin_host::manifest::NetworkEgress;
 /// Capability head whose parameter names a destination.
 const NETWORK_CONNECT_PREFIX: &str = "network.connect:";
 
+/// Core-built-in installer egress host (first-party CDN, issue #1905).
+///
+/// The minimal install seed (`bitty component install`) fetches exactly this
+/// host over HTTPS; strict configurations must allow it without a per-plugin
+/// `[[network.egress]]` declaration or per-source consent. Every other host
+/// stays consent-gated (fail closed without explicit consent).
+pub const BUILTIN_INSTALLER_EGRESS_HOST: &str = "cdn.bitty.run";
+
+/// Core-built-in installer egress port (HTTPS).
+pub const BUILTIN_INSTALLER_EGRESS_PORT: u16 = 443;
+
+/// Core-built-in installer egress in `host:port` form for strict-config
+/// allowlists.
+pub const BUILTIN_INSTALLER_EGRESS: &str = "cdn.bitty.run:443";
+
+/// Whether `(host, port)` is the core-built-in installer egress.
+///
+/// Exact, case-sensitive match on the host plus equality on the port.
+/// Suffix tricks (`cdn.bitty.run.evil.com`), userinfo shapes (split before
+/// calling: `cdn.bitty.run@evil` never equals the host), case tricks
+/// (`CDN.BITTY.RUN`), and port swaps (`:8443`) all return `false` by
+/// construction. Callers must pass an already-split host/port pair, never a
+/// raw URL.
+#[must_use]
+pub fn is_builtin_installer_egress(host: &str, port: u16) -> bool {
+    host == BUILTIN_INSTALLER_EGRESS_HOST && port == BUILTIN_INSTALLER_EGRESS_PORT
+}
+
+/// The core-built-in installer egress entry for strict-config allowlists.
+///
+/// Returns the single `[[network.egress]]`-shaped entry covering the
+/// first-party CDN (`cdn.bitty.run:443`). Third-party hosts have no
+/// built-in entry and must be declared plus consented explicitly.
+#[must_use]
+pub fn builtin_installer_egress() -> NetworkEgress {
+    NetworkEgress {
+        host: BUILTIN_INSTALLER_EGRESS_HOST.to_string(),
+        ports: vec![BUILTIN_INSTALLER_EGRESS_PORT],
+    }
+}
+
 /// A Core-computed grant bound to the plugin it was computed for.
 ///
 /// The only constructor is [`PluginGrant::compute`], so a request can never
@@ -295,5 +336,38 @@ mod tests {
             ("a.example:99999", None)
         );
         assert_eq!(split_host_port(":443"), (":443", None));
+    }
+
+    #[test]
+    fn builtin_installer_egress_is_pinned_first_party() {
+        assert_eq!(BUILTIN_INSTALLER_EGRESS_HOST, "cdn.bitty.run");
+        assert_eq!(BUILTIN_INSTALLER_EGRESS_PORT, 443);
+        assert_eq!(BUILTIN_INSTALLER_EGRESS, "cdn.bitty.run:443");
+        assert!(is_builtin_installer_egress("cdn.bitty.run", 443));
+        let entry = builtin_installer_egress();
+        assert_eq!(entry.host, "cdn.bitty.run");
+        assert_eq!(entry.ports, vec![443]);
+        assert!(entry.validate().is_ok());
+    }
+
+    #[test]
+    fn builtin_installer_egress_rejects_hostile_shapes() {
+        // Suffix, userinfo-split, case, and port-swap shapes all fail.
+        for (host, port) in [
+            ("cdn.bitty.run.evil.com", 443),
+            ("cdn.bitty.run@evil", 443),
+            ("evil.com", 443),
+            ("CDN.BITTY.RUN", 443),
+            ("Cdn.BitTy.Run", 443),
+            ("cdn.bitty.run", 8443),
+            ("cdn.bitty.run", 80),
+            ("cdn.bitty.run", 0),
+            ("", 443),
+        ] {
+            assert!(
+                !is_builtin_installer_egress(host, port),
+                "hostile egress must not be builtin: {host}:{port}"
+            );
+        }
     }
 }

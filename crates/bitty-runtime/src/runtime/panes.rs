@@ -506,11 +506,13 @@ impl Runtime {
             },
         );
         // CTX-0254 (PX-1588): a respawned leaf starts with a fresh grid, so
-        // drop the previous session's placements with it. Without this, a
+        // retire the previous session's origin with it. Without this, a
         // replace on the same `ViewId` inherits the dead grid's placements
         // onto the fresh grid (same stale-pixel class the close path fixes).
-        // Stored images survive inertly under the store caps.
-        self.kitty_images.clear_origin(Some(view.0));
+        // Stored images retire too: the token is dead, so its bytes must not
+        // keep occupying the shared image/byte caps (S5 refuses cross-origin
+        // eviction, so leaked slots would block other origins).
+        self.kitty_images.retire_origin(Some(view.0));
         // Issue #1762: a respawn reuses the same `ViewId`, so drop its
         // pointer-shape stack with the old session. Without this the fresh
         // shell inherits the dead session's cursor (e.g. stuck `wait`) until
@@ -786,10 +788,11 @@ impl Runtime {
         if let Some(handle) = old_handle {
             let _ = super::join_forwarder_with_timeout(handle, super::FORWARDER_JOIN_TIMEOUT);
         }
-        // CTX-0254: drop the closed pane's placements with its grid, so
+        // CTX-0254: retire the closed pane's origin with its grid, so
         // a later leaf reusing the numeric id can never inherit stale
-        // image pixels (origin tokens are `ViewId.0` values).
-        self.kitty_images.clear_origin(Some(view.0));
+        // image pixels (origin tokens are `ViewId.0` values) and the dead
+        // session's stored images stop occupying the shared caps.
+        self.kitty_images.retire_origin(Some(view.0));
         // Issue #1762: a pane exit resets its pointer shape. Dropping the
         // closed leaf's stack means a later leaf reusing the numeric id
         // starts from the default pointer, and the focused icon falls back

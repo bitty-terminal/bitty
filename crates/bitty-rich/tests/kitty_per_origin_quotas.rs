@@ -231,6 +231,88 @@ fn origin_clear_keeps_other_origins_and_images() {
 }
 
 #[test]
+fn retired_origin_releases_images_while_active_survives() {
+    // Pane teardown retires the origin token: its stored images and
+    // placements drop so the dead session stops occupying the shared
+    // caps, while live origins keep every image and placement.
+    let mut layer = KittyImageLayer::new();
+    let victim_image = store_on(&mut layer, VICTIM);
+    let noisy_image = store_on(&mut layer, NOISY);
+    let victim_own = place_on(&mut layer, victim_image, VICTIM);
+    let _ = place_on(&mut layer, noisy_image, NOISY);
+    // Cross-origin bind: the victim displays the noisy origin's image.
+    // Retiring the noisy origin must drop this placement too (its image
+    // is gone), while the victim's own placement survives.
+    let borrowed = place_on(&mut layer, noisy_image, VICTIM);
+    assert_eq!(layer.len(), 2);
+    assert_eq!(layer.placement_len(), 3);
+    let bytes_before = layer.total_bytes();
+    layer.retire_origin(NOISY);
+    assert_eq!(layer.image_count_for_origin(NOISY), 0);
+    assert!(layer.get(noisy_image).is_none());
+    assert!(layer.placement_for_origin_is_empty(NOISY));
+    assert!(layer.get_placement(borrowed).is_none());
+    assert!(layer.get(victim_image).is_some());
+    assert!(layer.get_placement(victim_own).is_some());
+    assert!(!layer.placement_for_origin_is_empty(VICTIM));
+    assert_eq!(layer.len(), 1);
+    assert_eq!(layer.placement_len(), 1);
+    assert_eq!(
+        layer.total_bytes(),
+        bytes_before.saturating_sub(tiny_rgba().len())
+    );
+}
+
+#[test]
+fn placement_full_transmit_and_display_refuses_without_storing_or_evicting() {
+    // Global placement bound full (4 origins x 32): the transmit-and-display
+    // sequence (preflight, then store, then place) must refuse before
+    // storing, so the store is unchanged and the admitting origin's held
+    // images are never FIFO-evicted by a doomed admission.
+    let mut layer = KittyImageLayer::new();
+    let newcomer: Option<u64> = Some(99);
+    let mut held = Vec::new();
+    for _ in 0..KITTY_PER_ORIGIN_MAX_IMAGES {
+        held.push(store_on(&mut layer, newcomer));
+    }
+    assert_eq!(layer.len(), KITTY_PLACE_MAX_IMAGES);
+    let origins = [None, Some(7), Some(8), Some(9)];
+    for origin in origins {
+        for _ in 0..KITTY_PER_ORIGIN_MAX_PLACEMENTS {
+            place_on(&mut layer, held[0], origin);
+        }
+    }
+    assert_eq!(layer.placement_len(), KITTY_PLACE_MAX_ITEMS);
+    let bytes_before = layer.total_bytes();
+    // Runtime order: preflight placement admission BEFORE storing. A bare
+    // store here would have evicted the newcomer's own oldest image
+    // (per-origin quota full); the preflight refuses first instead.
+    assert_eq!(
+        layer.check_placement_quota_for_origin(newcomer),
+        Err(KittyPlacementError::QuotaExceeded)
+    );
+    assert_eq!(layer.len(), KITTY_PLACE_MAX_IMAGES);
+    assert_eq!(layer.total_bytes(), bytes_before);
+    assert_eq!(
+        layer.image_count_for_origin(newcomer),
+        KITTY_PER_ORIGIN_MAX_IMAGES
+    );
+    for id in &held {
+        assert!(
+            layer.get(*id).is_some(),
+            "held image {id:?} must survive a refused admission"
+        );
+    }
+    assert_eq!(layer.placement_len(), KITTY_PLACE_MAX_ITEMS);
+    for origin in origins {
+        assert_eq!(
+            layer.placement_count_for_origin(origin),
+            KITTY_PER_ORIGIN_MAX_PLACEMENTS
+        );
+    }
+}
+
+#[test]
 fn fail_closed_posture_is_preserved() {
     // Unsupported wire actions still store without painting, unknown
     // images still refuse placement, and the quota refusal stores nothing.

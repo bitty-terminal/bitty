@@ -1083,12 +1083,10 @@ impl KittyImageLayer {
         // Per-origin pressure evicts this origin's own oldest placement;
         // global pressure from other origins refuses instead (no
         // cross-origin eviction). Decided before any mutation so a refusal
-        // evicts nothing.
+        // evicts nothing (shared with `check_placement_quota_for_origin`,
+        // which transmit-and-display preflights before storing).
+        self.check_placement_quota_for_origin(origin)?;
         let evict_own = self.placement_count_for_origin(origin) >= KITTY_PER_ORIGIN_MAX_PLACEMENTS;
-        let global_len_after = self.placements.len().saturating_sub(usize::from(evict_own));
-        if global_len_after >= KITTY_PLACE_MAX_ITEMS {
-            return Err(KittyPlacementError::QuotaExceeded);
-        }
         if evict_own {
             if let Some(pos) = self.placements.iter().position(|p| p.origin == origin) {
                 self.placements.remove(pos);
@@ -1168,6 +1166,65 @@ impl KittyImageLayer {
     /// out under the store caps.
     pub fn clear_origin(&mut self, origin: Option<u64>) {
         self.placements.retain(|p| p.origin != origin);
+    }
+
+    /// Retires `origin`: drops its stored images plus every placement of
+    /// that origin and every placement bound to a removed image, keeping
+    /// all other origins intact (S5 per-origin quotas, #1849).
+    ///
+    /// Pane-teardown counterpart to [`KittyImageLayer::clear_origin`]:
+    /// a closed or respawned pane's origin token is dead, so its decoded
+    /// images must not keep occupying the shared image/byte caps after
+    /// the pane is gone (S5 refuses cross-origin eviction, so leaked
+    /// slots would block other origins with
+    /// [`KittyPlacementError::QuotaExceeded`]). Alternate-screen entry,
+    /// protocol deletion, and display-erase clearing keep using
+    /// `clear_origin` (placements drop, images stay inert under the
+    /// store caps).
+    pub fn retire_origin(&mut self, origin: Option<u64>) {
+        // Bounded scans (at most `KITTY_PLACE_MAX_IMAGES` images,
+        // `KITTY_PLACE_MAX_ITEMS` placements), same style as the
+        // store-path FIFO collection.
+        let dead: Vec<KittyImageId> = self
+            .images
+            .iter()
+            .filter(|img| img.origin == origin)
+            .map(|img| img.id)
+            .collect();
+        if !dead.is_empty() {
+            let mut freed_bytes = 0usize;
+            self.images.retain(|img| {
+                if img.origin == origin {
+                    freed_bytes = freed_bytes.saturating_add(img.rgba.len());
+                    false
+                } else {
+                    true
+                }
+            });
+            self.total_bytes = self.total_bytes.saturating_sub(freed_bytes);
+        }
+        self.placements
+            .retain(|p| p.origin != origin && !dead.contains(&p.image));
+    }
+
+    /// Placement-quota preflight for one origin: the refusal half of
+    /// [`KittyImageLayer::display_for_origin_with_wire`] without mutation.
+    ///
+    /// Transmit-and-display calls this before storing so a placement-quota
+    /// refusal leaves no new image and never discards FIFO-evicted images
+    /// (S5, #1849): `store_for_origin` may evict the origin's own oldest
+    /// images, which a post-store rollback could not restore. Non-display
+    /// and alternate-screen paths store without placing and skip this.
+    pub fn check_placement_quota_for_origin(
+        &self,
+        origin: Option<u64>,
+    ) -> Result<(), KittyPlacementError> {
+        let evict_own = self.placement_count_for_origin(origin) >= KITTY_PER_ORIGIN_MAX_PLACEMENTS;
+        let global_len_after = self.placements.len().saturating_sub(usize::from(evict_own));
+        if global_len_after >= KITTY_PLACE_MAX_ITEMS {
+            return Err(KittyPlacementError::QuotaExceeded);
+        }
+        Ok(())
     }
 
     /// Deletes rendered placements by origin-scoped wire identity (CTX-1072).

@@ -329,11 +329,23 @@ impl Runtime {
         wire_image: u32,
         wire_placement: u32,
     ) -> Result<KittyDisplayOutcome, KittyImageError> {
+        let action = bitty_rich::KittyAction::from_a(action_a);
+        let alt_active = self.state.alt_screen_active();
+        if action.displays() && !alt_active {
+            // Atomic transmit-and-display (S5, #1849): preflight placement
+            // admission before decoding/storing, so a placement-quota
+            // refusal stores nothing and never discards FIFO-evicted
+            // images (a post-store rollback could not restore evictions).
+            // Transmit-only, unsupported actions, and alternate-screen
+            // display keep storing without placing.
+            self.kitty_images
+                .check_placement_quota_for_origin(self.kitty_origin)
+                .map_err(KittyImageError::Placement)?;
+        }
         let compressed_len = payload.len();
         let image =
             self.kitty_transmit_image(format_f, width_s, height_v, payload, compressed_len)?;
-        let action = bitty_rich::KittyAction::from_a(action_a);
-        if self.state.alt_screen_active() {
+        if alt_active {
             return Ok(KittyDisplayOutcome::SuppressedAlternateScreen { image });
         }
         if !action.displays() {
@@ -499,11 +511,23 @@ impl Runtime {
         wire_image: u32,
         wire_placement: u32,
     ) -> Result<KittyDisplayOutcome, KittyImageError> {
+        let action = bitty_rich::KittyAction::from_a(action_a);
+        let alt_active = self.state.alt_screen_active();
+        if action.displays() && !alt_active {
+            // Atomic transmit-and-display (S5, #1849): preflight placement
+            // admission before decoding/storing, so a placement-quota
+            // refusal stores nothing and never discards FIFO-evicted
+            // images (a post-store rollback could not restore evictions).
+            // Transmit-only, unsupported actions, and alternate-screen
+            // display keep storing without placing.
+            self.kitty_images
+                .check_placement_quota_for_origin(self.kitty_origin)
+                .map_err(KittyImageError::Placement)?;
+        }
         let compressed_len = payload.len();
         let image =
             self.kitty_transmit_image_owned(format_f, width_s, height_v, payload, compressed_len)?;
-        let action = bitty_rich::KittyAction::from_a(action_a);
-        if self.state.alt_screen_active() {
+        if alt_active {
             return Ok(KittyDisplayOutcome::SuppressedAlternateScreen { image });
         }
         if !action.displays() {

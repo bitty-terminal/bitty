@@ -11,9 +11,14 @@
 //! area, 64 MiB RGBA) and the raster step ([`bitty_rich::kitty_raster`]:
 //! uncached nearest-neighbor; the `bitty-graphics` extension holds its own
 //! copies plus a raster cache, and Core never depends on extension
-//! internals). Placement policy (admission, eviction, origin tagging,
-//! alternate-screen suppression) is unchanged and unit-tested in
+//! internals). Placement policy (admission, per-origin quotas, origin
+//! tagging, alternate-screen suppression) is unchanged and unit-tested in
 //! `bitty-rich`.
+//!
+//! Stored bytes count against the transmitting stream's origin (S5
+//! per-origin quotas, #1849): the transmit seams pass `self.kitty_origin`
+//! into the layer, so a noisy pane evicts only its own oldest images and
+//! global pressure refuses without evicting a victim.
 //!
 //! Display anchors at the drained stream's cursor cell (the primary grid,
 //! or the pane session swapped in by `handle_pane_bytes`) with that
@@ -34,7 +39,7 @@
 //! Still deferred (blocked, recorded in the PR body): `a=p` virtual
 //! (`U=1`) store bookkeeping beyond the grid-cell runs, animation
 //! (`a=f`/`a=a`/`a=c`), queries (`a=q`), local mediums (`t=f`/`t=t`/`t=s`
-//! file reads), per-origin store quotas, the raster cache, and
+//! file reads), the raster cache, and
 //! cursor-on-top compositing.//!
 //! Display anchors at the drained stream's cursor cell (the primary grid,
 //! or the pane session swapped in by `handle_pane_bytes`) with that
@@ -156,7 +161,10 @@ impl Runtime {
     /// pre-check ([`bitty_rich::precheck_declared_image`]) runs before any
     /// allocation; the Core-owned decoder ([`bitty_rich::kitty_decode`])
     /// then produces the RGBA8 bitmap the image layer stores under the
-    /// store caps (FIFO eviction).
+    /// per-origin store quotas (S5, #1849: FIFO eviction within the
+    /// transmitting origin only, global pressure refuses without evicting
+    /// a victim). The bytes count against the currently drained stream's
+    /// origin (`self.kitty_origin`: `None` primary, `Some` pane session).
     ///
     /// # Errors
     ///
@@ -164,7 +172,8 @@ impl Runtime {
     /// [`KittyImageError::Decode`] for empty, underspecified, oversize,
     /// length-mismatched, or malformed payloads (before allocation where
     /// the bound allows), [`KittyImageError::Placement`] when the decoded
-    /// bitmap exceeds the layer caps. Failures store nothing.
+    /// bitmap exceeds the layer caps or the global bound is held by other
+    /// origins. Failures store nothing and evict nothing.
     pub fn kitty_transmit_image(
         &mut self,
         format_f: u32,
@@ -177,8 +186,15 @@ impl Runtime {
         let decoded = bitty_rich::decode_kitty_payload(format_f, width_s, height_v, payload)
             .map_err(|err| KittyImageError::Decode(bitty_rich::KittyPrecheckError::from(err)))?;
         let compressed_len = payload.len();
+        let origin = self.kitty_origin;
         self.kitty_images
-            .store(decoded.width, decoded.height, decoded.rgba, compressed_len)
+            .store_for_origin(
+                decoded.width,
+                decoded.height,
+                decoded.rgba,
+                compressed_len,
+                origin,
+            )
             .map_err(KittyImageError::Placement)
     }
 
@@ -186,7 +202,8 @@ impl Runtime {
     ///
     /// Same behavior as [`Self::kitty_transmit_image`]; the owned buffer
     /// moves into the stored bitmap without copying for `f=32` (and
-    /// expands in place for `f=24`).
+    /// expands in place for `f=24`). The bytes count against the currently
+    /// drained stream's origin, like [`Self::kitty_transmit_image`].
     pub fn kitty_transmit_image_owned(
         &mut self,
         format_f: u32,
@@ -201,8 +218,15 @@ impl Runtime {
             format_f, width_s, height_v, payload,
         )
         .map_err(|err| KittyImageError::Decode(bitty_rich::KittyPrecheckError::from(err)))?;
+        let origin = self.kitty_origin;
         self.kitty_images
-            .store(decoded.width, decoded.height, decoded.rgba, wire_len)
+            .store_for_origin(
+                decoded.width,
+                decoded.height,
+                decoded.rgba,
+                wire_len,
+                origin,
+            )
             .map_err(KittyImageError::Placement)
     }
 

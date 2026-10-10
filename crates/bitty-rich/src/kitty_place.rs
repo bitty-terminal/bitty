@@ -82,6 +82,24 @@
 //! state are likewise resolved per origin at present time, never against a
 //! global grid.
 //!
+//! Per-origin quotas (S5, #1849, CTX-1093).
+//!
+//! The shipped global caps below are partitioned per origin: every stored
+//! image carries the transmitting stream's origin token
+//! ([`KittyPlacedImage::origin`]) and counts against that origin's 64-image
+//! / 64 MiB quotas ([`KITTY_PER_ORIGIN_MAX_IMAGES`] /
+//! [`KITTY_PER_ORIGIN_MAX_BYTES`]); every placement counts against its
+//! origin's 32-placement quota ([`KITTY_PER_ORIGIN_MAX_PLACEMENTS`]). A
+//! noisy origin therefore evicts only its own oldest entries (FIFO within
+//! the origin, deterministic), and global pressure from other origins
+//! refuses the new admission ([`KittyPlacementError::QuotaExceeded`])
+//! instead of evicting a victim — no cross-origin eviction. Dangling
+//! placements (image refused or evicted) fail closed at lookup and paint
+//! nothing, as before. Origin count stays bounded by the live pane-session
+//! count plus the primary grid, and accounting scans the bounded deques,
+//! so quotas add no allocation and the global totals never exceed the
+//! shipped bounds.
+//!
 //! Residual posture (documented, not enforced here):
 //!
 //! - Within one origin, images stay topmost over that pane's own cursor and
@@ -90,11 +108,6 @@
 //!   own grid, so covering its own chrome adds no new spoof capability
 //!   beyond what PTY text already allows. Cursor-on-top remains follow-up
 //!   work.
-//! - The decoded-image *store* stays global and bounded (FIFO eviction on
-//!   the count/byte caps). A noisy origin can therefore evict another
-//!   origin's stored images (availability only — dangling placements fail
-//!   closed at lookup and paint nothing). Per-origin quotas are follow-up
-//!   work if this ever matters operationally.
 //!
 //! # Bounds (threat T-01/T-02)
 //!
@@ -110,10 +123,15 @@
 //! (`rect_w * rect_h * 4`, itself bounded because the rect is clamped to
 //! the viewport first). Layer totals are additionally capped: 64 stored
 //! images ([`KITTY_PLACE_MAX_IMAGES`], kitty-ledger parity) and 256 MiB
-//! decoded bytes ([`KITTY_PLACE_MAX_BYTES`], RFC IMG-4 parity), oldest
-//! evicted first; placements are capped at 128 ([`KITTY_PLACE_MAX_ITEMS`],
-//! RFC IMG-8 parity), oldest evicted first. A single image larger than the
-//! byte cap is rejected.
+//! decoded bytes ([`KITTY_PLACE_MAX_BYTES`], RFC IMG-4 parity), partitioned
+//! per origin at 64 images / 64 MiB ([`KITTY_PER_ORIGIN_MAX_IMAGES`] /
+//! [`KITTY_PER_ORIGIN_MAX_BYTES`]) with FIFO eviction within the admitting
+//! origin only; placements are capped at 128 globally
+//! ([`KITTY_PLACE_MAX_ITEMS`], RFC IMG-8 parity) and 32 per origin
+//! ([`KITTY_PER_ORIGIN_MAX_PLACEMENTS`]), oldest-of-origin evicted first.
+//! Global pressure from other origins refuses the admission
+//! ([`KittyPlacementError::QuotaExceeded`]) instead of evicting a victim.
+//! A single image larger than the byte cap is rejected.
 //!
 //! # Per-frame budget (CTX-0252 F2, policy half retained)
 //!
@@ -201,6 +219,28 @@ pub const KITTY_PLACE_MAX_BYTES: usize = crate::image::IMAGE_STORE_MAX_BYTES;
 
 /// Maximum placements (RFC IMG-8 parity).
 pub const KITTY_PLACE_MAX_ITEMS: usize = crate::image::IMAGE_MAX_PLACEMENTS;
+
+/// Maximum stored decoded images per origin (S5 per-origin quota, #1849).
+///
+/// Keeps kitty-ledger parity (64) so single-origin count behavior is
+/// unchanged: the count cap only binds one origin at a time, while the
+/// byte quota below is the binding partition for large bitmaps.
+pub const KITTY_PER_ORIGIN_MAX_IMAGES: usize = 64;
+
+/// Maximum decoded RGBA bytes held per origin (S5 per-origin quota, #1849).
+///
+/// Quarters the 256 MiB global bound so up to four full origins fit inside
+/// it. The 64 MiB single-bitmap decode ceiling exactly fills one origin
+/// quota: a maximal image is still admittable, evicting that origin's own
+/// older images first.
+pub const KITTY_PER_ORIGIN_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// Maximum placements per origin (S5 per-origin quota, #1849).
+///
+/// Quarters the 128 global bound so up to four full origins fit inside it.
+/// The per-frame blit budget (32 blits) already means placements past one
+/// origin quota rarely paint on a single pane in one frame.
+pub const KITTY_PER_ORIGIN_MAX_PLACEMENTS: usize = 32;
 
 /// Maximum scroll lines one Kitty placement may drive (CTX-1072, #1850).
 ///
@@ -489,6 +529,12 @@ impl KittyPlacementId {
 pub struct KittyPlacedImage {
     /// Stable handle.
     pub id: KittyImageId,
+    /// Origin token of the transmitting stream (S5 per-origin quotas,
+    /// #1849): `None` for the primary grid, `Some(token)` for a split-pane
+    /// session. The image counts against this origin's store quota and is
+    /// only ever evicted for pressure from the same origin, never for
+    /// another origin's admissions.
+    pub origin: Option<u64>,
     /// Decoded pixel width.
     pub width: u32,
     /// Decoded pixel height.
@@ -578,6 +624,14 @@ pub enum KittyPlacementError {
     },
     /// Placement references an unknown (or evicted) image.
     ImageNotFound(KittyImageId),
+    /// Admission would exceed a global bound held by other origins.
+    ///
+    /// S5 per-origin quotas (#1849): eviction never crosses origins, so
+    /// when the admitting origin is within its own quota but the global
+    /// image, byte, or placement bound is already held by other origins,
+    /// the admission is refused instead of evicting a victim. Failures
+    /// store and place nothing.
+    QuotaExceeded,
 }
 
 impl std::fmt::Display for KittyPlacementError {
@@ -600,6 +654,10 @@ impl std::fmt::Display for KittyPlacementError {
                 "kitty placement rgba of {actual} bytes does not match {expected} expected bytes"
             ),
             Self::ImageNotFound(id) => write!(f, "kitty placement image not found: {}", id.0),
+            Self::QuotaExceeded => write!(
+                f,
+                "kitty quota exceeded: global bound held by other origins, refused without evicting"
+            ),
         }
     }
 }
@@ -676,9 +734,12 @@ fn cell_span(explicit: u16, pixels: u32, cell_px: u32) -> u16 {
 
 /// Owned Kitty image + placement layer (headless, bounded).
 ///
-/// Deterministic FIFO eviction on images (count and byte caps) and on
-/// placements (count cap). Same call order always yields the same ids and
-/// the same retained set.
+/// Deterministic per-origin FIFO eviction (S5, #1849): each origin is
+/// capped at [`KITTY_PER_ORIGIN_MAX_IMAGES`] images,
+/// [`KITTY_PER_ORIGIN_MAX_BYTES`] bytes, and
+/// [`KITTY_PER_ORIGIN_MAX_PLACEMENTS`] placements inside the global bounds,
+/// and pressure evicts that origin's own oldest entries first. Same call
+/// order always yields the same ids and the same retained set.
 #[derive(Debug, Clone, Default)]
 pub struct KittyImageLayer {
     images: VecDeque<KittyPlacedImage>,
@@ -719,6 +780,36 @@ impl KittyImageLayer {
         self.total_bytes
     }
 
+    /// Number of stored decoded images of one origin (S5, #1849).
+    #[must_use]
+    pub fn image_count_for_origin(&self, origin: Option<u64>) -> usize {
+        self.images
+            .iter()
+            .filter(|img| img.origin == origin)
+            .count()
+    }
+
+    /// Decoded RGBA bytes held by one origin (S5, #1849).
+    ///
+    /// Summed with saturating arithmetic over the bounded store, so the
+    /// accounting itself can never overflow on hostile inputs.
+    #[must_use]
+    pub fn bytes_for_origin(&self, origin: Option<u64>) -> usize {
+        self.images
+            .iter()
+            .filter(|img| img.origin == origin)
+            .fold(0usize, |acc, img| acc.saturating_add(img.rgba.len()))
+    }
+
+    /// Number of retained placements of one origin (S5, #1849).
+    #[must_use]
+    pub fn placement_count_for_origin(&self, origin: Option<u64>) -> usize {
+        self.placements
+            .iter()
+            .filter(|p| p.origin == origin)
+            .count()
+    }
+
     /// Number of retained placements.
     #[must_use]
     pub fn placement_len(&self) -> usize {
@@ -733,21 +824,52 @@ impl KittyImageLayer {
 
     /// Stores a decoded bitmap, validating decode caps before admission.
     ///
-    /// `rgba` must be exactly `width * height * 4` bytes. On success the
-    /// oldest images are evicted first to satisfy the count and byte caps
-    /// (placements of evicted images are dropped deterministically).
+    /// Primary-origin shorthand for
+    /// [`KittyImageLayer::store_for_origin`] (`origin == None`); pane
+    /// sessions use `store_for_origin` with their origin token so the
+    /// bytes count against the emitting origin's quota.
     ///
     /// # Errors
     ///
-    /// [`KittyPlacementError`] dimension/area/byte/length rejections, or
-    /// [`KittyPlacementError::DecodedTooLarge`] when the bitmap alone
-    /// exceeds the layer byte cap. Failures store nothing.
+    /// Same as [`KittyImageLayer::store_for_origin`].
     pub fn store(
         &mut self,
         width: u32,
         height: u32,
         rgba: Vec<u8>,
         compressed_len: usize,
+    ) -> Result<KittyImageId, KittyPlacementError> {
+        self.store_for_origin(width, height, rgba, compressed_len, None)
+    }
+
+    /// Stores a decoded bitmap for one origin (S5 per-origin quotas,
+    /// #1849), validating decode caps before admission.
+    ///
+    /// `rgba` must be exactly `width * height * 4` bytes. On success the
+    /// oldest images *of this origin* are evicted first (FIFO within the
+    /// origin) to satisfy the per-origin count and byte quotas, and
+    /// placements of evicted images are dropped deterministically. Other
+    /// origins are never evicted: when this origin is within its own quota
+    /// but a global bound is already held by other origins, the store is
+    /// refused with [`KittyPlacementError::QuotaExceeded`] instead.
+    /// Origin count stays bounded by the live pane-session count plus the
+    /// primary grid: accounting scans the bounded deques, so no per-origin
+    /// table is ever allocated.
+    ///
+    /// # Errors
+    ///
+    /// [`KittyPlacementError`] dimension/area/byte/length rejections, or
+    /// [`KittyPlacementError::DecodedTooLarge`] when the bitmap alone
+    /// exceeds the layer byte cap, or
+    /// [`KittyPlacementError::QuotaExceeded`] on global pressure from other
+    /// origins. Failures store nothing and evict nothing.
+    pub fn store_for_origin(
+        &mut self,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+        compressed_len: usize,
+        origin: Option<u64>,
     ) -> Result<KittyImageId, KittyPlacementError> {
         checked_bitmap(width, height, rgba.len())?;
         let bytes = rgba.len();
@@ -757,21 +879,45 @@ impl KittyImageLayer {
                 cap: KITTY_PLACE_MAX_BYTES,
             });
         }
-        while self.images.len() >= KITTY_PLACE_MAX_IMAGES
-            || self.total_bytes.saturating_add(bytes) > KITTY_PLACE_MAX_BYTES
-        {
-            if let Some(evicted) = self.images.pop_front() {
-                self.total_bytes = self.total_bytes.saturating_sub(evicted.rgba.len());
-                let evicted_id = evicted.id;
-                self.placements.retain(|p| p.image != evicted_id);
-            } else {
+        // Per-origin pressure, oldest first (front of the deque): collect
+        // the own-origin images that must go so the quotas below hold.
+        // Computed before any mutation so a refusal evicts nothing.
+        let mut evict: Vec<KittyImageId> = Vec::new();
+        let mut freed_bytes = 0usize;
+        let mut kept_count = self.image_count_for_origin(origin);
+        let mut kept_bytes = self.bytes_for_origin(origin);
+        for img in &self.images {
+            if kept_count.saturating_add(1) <= KITTY_PER_ORIGIN_MAX_IMAGES
+                && kept_bytes.saturating_add(bytes) <= KITTY_PER_ORIGIN_MAX_BYTES
+            {
                 break;
             }
+            if img.origin == origin {
+                evict.push(img.id);
+                freed_bytes = freed_bytes.saturating_add(img.rgba.len());
+                kept_count = kept_count.saturating_sub(1);
+                kept_bytes = kept_bytes.saturating_sub(img.rgba.len());
+            }
+        }
+        // Global pressure from other origins refuses instead of evicting a
+        // victim (no cross-origin eviction).
+        let global_len_after = self.images.len().saturating_sub(evict.len());
+        let global_bytes_after = self.total_bytes.saturating_sub(freed_bytes);
+        if global_len_after.saturating_add(1) > KITTY_PLACE_MAX_IMAGES
+            || global_bytes_after.saturating_add(bytes) > KITTY_PLACE_MAX_BYTES
+        {
+            return Err(KittyPlacementError::QuotaExceeded);
+        }
+        if !evict.is_empty() {
+            self.images.retain(|img| !evict.contains(&img.id));
+            self.total_bytes = self.total_bytes.saturating_sub(freed_bytes);
+            self.placements.retain(|p| !evict.contains(&p.image));
         }
         let id = KittyImageId(self.next_image_id);
         self.next_image_id = self.next_image_id.wrapping_add(1).max(1);
         self.images.push_back(KittyPlacedImage {
             id,
+            origin,
             width,
             height,
             rgba,
@@ -811,9 +957,12 @@ impl KittyImageLayer {
     ///
     /// `cols`/`rows` are the explicit `c=`/`r=` spans (0 or absent derives
     /// from decoded pixels). `scrollback_base` is
-    /// `State::scrollback_len()` now. Evicts the oldest placement at the
-    /// 128 cap (FIFO). The placement is bound to the primary origin
-    /// (`None`); pane sessions use [`KittyImageLayer::display_for_origin`].
+    /// `State::scrollback_len()` now. Evicts the origin's oldest placement
+    /// at the per-origin quota (FIFO within the origin; S5, #1849) and
+    /// refuses with [`KittyPlacementError::QuotaExceeded`] on global
+    /// pressure from other origins. The placement is bound to the primary
+    /// origin (`None`); pane sessions use
+    /// [`KittyImageLayer::display_for_origin`].
     ///
     /// # Errors
     ///
@@ -849,7 +998,8 @@ impl KittyImageLayer {
     /// Identical to [`KittyImageLayer::display`] except the placement is
     /// tagged with `origin` (`None` primary, `Some(token)` pane session),
     /// so the present layer can confine it to its own leaf. Same errors
-    /// and eviction behavior as [`KittyImageLayer::display`]. The wire
+    /// and per-origin eviction behavior as
+    /// [`KittyImageLayer::display_for_origin_with_wire`]. The wire
     /// identity defaults to anonymous (`0`, `0`); callers with protocol
     /// ids use [`KittyImageLayer::display_for_origin_with_wire`].
     ///
@@ -896,10 +1046,20 @@ impl KittyImageLayer {
     /// (`wire_placement == 0`) are never singly addressable, mirroring
     /// the terminal-truth store.
     ///
+    /// S5 per-origin quotas (#1849): the placement counts against `origin`'s
+    /// 32-placement quota and evicts that origin's own oldest placement
+    /// first (FIFO within the origin). Other origins are never evicted:
+    /// when `origin` is within its own quota but the 128 global bound is
+    /// already held by other origins, the placement is refused with
+    /// [`KittyPlacementError::QuotaExceeded`] instead. Dangling references
+    /// (image evicted under the store quotas) still fail closed with
+    /// [`KittyPlacementError::ImageNotFound`].
+    ///
     /// # Errors
     ///
-    /// [`KittyPlacementError::ImageNotFound`] when `image` is unknown.
-    /// Stores nothing new on failure.
+    /// [`KittyPlacementError::ImageNotFound`] when `image` is unknown, or
+    /// [`KittyPlacementError::QuotaExceeded`] on global pressure from other
+    /// origins. Failures store nothing new and evict nothing.
     #[allow(clippy::too_many_arguments)]
     pub fn display_for_origin_with_wire(
         &mut self,
@@ -920,8 +1080,19 @@ impl KittyImageLayer {
             .ok_or(KittyPlacementError::ImageNotFound(image))?;
         let cols = cell_span(cols, stored.width, metrics.width);
         let rows = cell_span(rows, stored.height, metrics.height);
-        if self.placements.len() >= KITTY_PLACE_MAX_ITEMS {
-            self.placements.pop_front();
+        // Per-origin pressure evicts this origin's own oldest placement;
+        // global pressure from other origins refuses instead (no
+        // cross-origin eviction). Decided before any mutation so a refusal
+        // evicts nothing.
+        let evict_own = self.placement_count_for_origin(origin) >= KITTY_PER_ORIGIN_MAX_PLACEMENTS;
+        let global_len_after = self.placements.len().saturating_sub(usize::from(evict_own));
+        if global_len_after >= KITTY_PLACE_MAX_ITEMS {
+            return Err(KittyPlacementError::QuotaExceeded);
+        }
+        if evict_own {
+            if let Some(pos) = self.placements.iter().position(|p| p.origin == origin) {
+                self.placements.remove(pos);
+            }
         }
         let id = KittyPlacementId(self.next_placement_id);
         self.next_placement_id = self.next_placement_id.wrapping_add(1).max(1);
@@ -1540,17 +1711,21 @@ mod tests {
     }
 
     #[test]
-    fn placement_cap_evicts_oldest() {
+    fn placement_cap_evicts_oldest_within_origin() {
+        // S5 (#1849): the placement quota is per origin (32). One origin
+        // placing past it evicts its own oldest first; other origins are
+        // untouched (cross-origin cases live in the per-origin quota
+        // integration suite).
         let mut layer = KittyImageLayer::new();
         let id = stored_red(&mut layer);
         let mut first = None;
-        for i in 0..KITTY_PLACE_MAX_ITEMS + 5 {
+        for i in 0..KITTY_PER_ORIGIN_MAX_PLACEMENTS + 5 {
             let pid = layer.display(id, 0, 0, 1, 1, METRICS, 0, i as i32).unwrap();
             if i == 0 {
                 first = Some(pid);
             }
         }
-        assert_eq!(layer.placement_len(), KITTY_PLACE_MAX_ITEMS);
+        assert_eq!(layer.placement_len(), KITTY_PER_ORIGIN_MAX_PLACEMENTS);
         assert!(layer.get_placement(first.unwrap()).is_none());
     }
 
@@ -1559,11 +1734,22 @@ mod tests {
         // Compile-time: placement enforces exactly the decode ceilings.
         const _: () = assert!(KITTY_PLACE_MAX_BYTES == 256 * 1024 * 1024);
         const _: () = assert!(KITTY_PLACE_MAX_ITEMS == 128);
+        // S5 (#1849): per-origin quotas live inside the global caps.
+        const _: () = assert!(KITTY_PER_ORIGIN_MAX_IMAGES == 64);
+        const _: () = assert!(KITTY_PER_ORIGIN_MAX_BYTES == 64 * 1024 * 1024);
+        const _: () = assert!(KITTY_PER_ORIGIN_MAX_PLACEMENTS == 32);
+        const _: () = assert!(KITTY_PER_ORIGIN_MAX_IMAGES == KITTY_PLACE_MAX_IMAGES);
+        const _: () = assert!(KITTY_PER_ORIGIN_MAX_BYTES * 4 == KITTY_PLACE_MAX_BYTES);
+        const _: () = assert!(KITTY_PER_ORIGIN_MAX_PLACEMENTS * 4 == KITTY_PLACE_MAX_ITEMS);
         assert_eq!(KITTY_PLACE_MAX_IMAGES, crate::kitty::KITTY_MAX_PLACEHOLDERS);
         // Error strings stay stable for snapshot greps.
         assert_eq!(
             KittyPlacementError::ImageNotFound(KittyImageId(7)).to_string(),
             "kitty placement image not found: 7"
+        );
+        assert_eq!(
+            KittyPlacementError::QuotaExceeded.to_string(),
+            "kitty quota exceeded: global bound held by other origins, refused without evicting"
         );
     }
 

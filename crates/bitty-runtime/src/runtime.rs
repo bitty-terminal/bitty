@@ -135,6 +135,7 @@ pub mod copy_mode;
 pub mod cw_live;
 pub mod help;
 pub mod input;
+pub mod kitty_file;
 pub mod kitty_images;
 pub mod layout_focus;
 pub mod live_config;
@@ -163,6 +164,7 @@ pub use self::animations::{
     AnimationCurve, AnimationKind, AnimationPolicy, ClosingFrame, MAX_CONCURRENT_ANIMATIONS,
     PanelAnimator, ReducedMotionMode,
 };
+pub use self::kitty_file::KittyLocalReadError;
 pub use self::kitty_images::{KittyDisplayOutcome, KittyImageError};
 pub use self::present::{ImeCursorArea, PresentStats};
 pub use self::search_host::{

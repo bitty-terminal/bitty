@@ -1054,6 +1054,18 @@ impl Runtime {
                 ..
             } = action
             {
+                // S3 (#1849): file-backed probes (`t=f`/`t=t`/`t=s` with
+                // `i=`) read the named object first (bounded, fail closed)
+                // and test-load the read bytes; `I=` number lookups ignore
+                // the name like direct streams. Read failures answer
+                // `EINVAL` as silent protocol replies honoring `q=`, never
+                // stderr, so probing clients never flood diagnostics.
+                if !control.medium.is_direct() {
+                    self.answer_kitty_local_query(format_f, width_s, height_v, &payload, control);
+                    // The query is answered (at most one bounded reply
+                    // queued); the action is moved, so continue.
+                    continue;
+                }
                 self.answer_kitty_query(format_f, width_s, height_v, &payload, control);
                 // The query is answered (at most one bounded reply queued);
                 // the action is moved, so continue to the next one.
@@ -1100,6 +1112,58 @@ impl Runtime {
                 control,
             } = action
             {
+                // S3 (#1849): local mediums (`t=f`/`t=t`/`t=s`) name a
+                // file/shm object; the parser already validated the name
+                // shape single-shot, so `payload` is the name bytes. Read
+                // the object under the decode caps (fail closed), then
+                // decode, store and place through the same seams as direct
+                // streams so per-origin quotas (S5) apply unchanged.
+                // Failures store nothing and paint nothing; warn loudly
+                // (rate-limited like the pixel path below).
+                if !control.medium.is_direct() {
+                    if is_virtual_combined {
+                        if let Err(err) = self.kitty_display_local_virtual_owned_with_wire(
+                            format_f, width_s, height_v, cols_c, rows_r, payload, control,
+                        ) {
+                            // Same rate-limited rejection posture as the
+                            // pixel path below: a hostile child can spam
+                            // refused local payloads.
+                            if let Some(suppressed) = self.kitty_log.admit_now() {
+                                eprintln!(
+                                    "bitty: rejecting kitty local virtual image ({err}): stored nothing{}",
+                                    log_throttle::suppressed_suffix(suppressed)
+                                );
+                            }
+                        }
+                        continue;
+                    }
+                    if let Err(err) = self.kitty_display_local_owned_with_wire(
+                        format_f,
+                        width_s,
+                        height_v,
+                        action_a,
+                        cols_c,
+                        rows_r,
+                        cursor_movement_c,
+                        payload,
+                        control,
+                    ) {
+                        // Rate-limited (CTX-0473): a hostile child can spam
+                        // rejected kitty payloads; the parser's own warnings
+                        // stay bounded too.
+                        if let Some(suppressed) = self.kitty_log.admit_now() {
+                            eprintln!(
+                                "bitty: rejecting kitty local image ({err}): stored nothing{}",
+                                log_throttle::suppressed_suffix(suppressed)
+                            );
+                        }
+                    }
+                    // The state-owned `a=p`/`a=d`/`a=a` commands were
+                    // applied above. This branch consumes the remaining
+                    // local-medium actions for the file pipeline, and we
+                    // already moved the action, so continue.
+                    continue;
+                }
                 if is_virtual_combined {
                     if let Err(err) = self.kitty_display_virtual_owned_with_wire(
                         format_f,

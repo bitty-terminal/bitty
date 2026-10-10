@@ -84,6 +84,7 @@ pub fn centered_for(rule: &PanelSpawnRule) -> bool {
 mod tests {
     use super::*;
     use bitty_config::panel_rules::{PanelPresentation, PanelSpawnRule};
+    use bitty_test_support::require_pty;
 
     fn floating_btop() -> PanelSpawnRule {
         PanelSpawnRule {
@@ -175,8 +176,13 @@ mod tests {
         assert!(evaluate_panel_rules(&rules, &meta).is_none());
     }
 
+    // Live-spawn: runs a real POSIX shell (`/bin/sh` has no Windows
+    // equivalent). `#[cfg(unix)]` keeps it off Windows CI; `require_pty!()`
+    // keeps the force-no-PTY simulation path (workspaces.rs precedent).
     #[test]
+    #[cfg(unix)]
     fn spawn_applies_presentation_and_dims() {
+        require_pty!();
         use crate::Runtime;
         let mut rt = Runtime::with_defaults().expect("defaults build");
         rt.set_panel_spawn_rules(vec![PanelSpawnRule {
@@ -203,7 +209,9 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn spawn_assigns_workspace_when_focused() {
+        require_pty!();
         use crate::Runtime;
         use bitty_ui::{LayoutNode, View, ViewId};
         let mut rt = Runtime::with_defaults().expect("defaults build");
@@ -237,7 +245,9 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn empty_rules_leave_spawn_unchanged() {
+        require_pty!();
         use crate::Runtime;
         let mut rt = Runtime::with_defaults().expect("defaults build");
         assert!(rt.panel_spawn_rules().is_empty());

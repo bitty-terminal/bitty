@@ -60,7 +60,8 @@ What each script installs:
   CI-built macOS binary is not support evidence.
 - **Scoop**: only a tag-time published manifest in the external bucket
   `bitty-terminal/scoop-bucket` counts as supported; it ships the bare
-  exes, sidestepping SmartScreen by construction. See `packaging/README.md`.
+  exes, sidestepping the setup-installer SmartScreen dialog. Windows may still
+  show a first-run reputation check. See `packaging/README.md`.
 - **Alpine**: verified via the release `verify-install` Alpine leg; see
   `packaging/alpine.md`.
 - **openSUSE**: best-effort, not supported (no release `verify-install`

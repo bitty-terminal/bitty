@@ -1633,6 +1633,8 @@ impl TerminalApp {
                 | A::WorkspacePrev
                 | A::WorkspaceNext
                 | A::WorkspaceLast
+                | A::WorkspaceNextOccupied
+                | A::WorkspacePrevOccupied
                 | A::WorkspaceFocus(_)
                 | A::WorkspaceMove(_)
         )

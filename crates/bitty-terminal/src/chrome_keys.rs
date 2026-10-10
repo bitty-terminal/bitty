@@ -1468,6 +1468,36 @@ impl TerminalApp {
                     self.runtime.workspace_names().join(" ")
                 );
             }
+            A::WorkspaceNextOccupied => {
+                // CTX-1100 (#1904): next occupied rightward with wrap.
+                // Fewer than two occupied is a loud no-op, never a panic,
+                // never a kill; sessions and focus stay intact either way.
+                match self.runtime.workspace_next_occupied() {
+                    Some(index) => eprintln!(
+                        "bitty: keymap workspace_next_occupied -> workspace {} ({})",
+                        index + 1,
+                        self.runtime.workspace_names().join(" ")
+                    ),
+                    None => eprintln!(
+                        "warning: keymap workspace_next_occupied needs two occupied workspaces ({}) — ignoring",
+                        self.runtime.workspace_names().join(" ")
+                    ),
+                }
+            }
+            A::WorkspacePrevOccupied => {
+                // CTX-1100 (#1904): exact mirror leftward with wrap.
+                match self.runtime.workspace_prev_occupied() {
+                    Some(index) => eprintln!(
+                        "bitty: keymap workspace_prev_occupied -> workspace {} ({})",
+                        index + 1,
+                        self.runtime.workspace_names().join(" ")
+                    ),
+                    None => eprintln!(
+                        "warning: keymap workspace_prev_occupied needs two occupied workspaces ({}) — ignoring",
+                        self.runtime.workspace_names().join(" ")
+                    ),
+                }
+            }
             A::WorkspaceFocus(n) => {
                 // Issue #1365: Alt+N clamps to the last workspace when N
                 // exceeds the live count; zero fails closed with no state
@@ -2662,6 +2692,15 @@ mod tests {
         assert_eq!(
             match_keymap(&maps, shell(KeyName::Tab, false, true, false)),
             Some(bitty_config::ChromeAction::WorkspaceLast)
+        );
+        // CTX-1100 (#1904): occupied-cycle pair on Mod+[/].
+        assert_eq!(
+            match_keymap(&maps, shell(KeyName::Char('['), false, true, false)),
+            Some(bitty_config::ChromeAction::WorkspaceNextOccupied)
+        );
+        assert_eq!(
+            match_keymap(&maps, shell(KeyName::Char(']'), false, true, false)),
+            Some(bitty_config::ChromeAction::WorkspacePrevOccupied)
         );
         assert_eq!(
             match_keymap(&maps, shell(KeyName::Char('u'), false, true, false)),
@@ -4524,6 +4563,68 @@ mod tests {
         app.apply_chrome_action(ChromeAction::WorkspaceClose);
         assert!(!app.runtime.has_pending_ws_close());
         assert_eq!(app.runtime.workspace_names(), vec![String::from("ws1")]);
+    }
+
+    #[test]
+    fn chrome_workspace_occupied_cycle_noop_when_fewer_than_two_occupied() {
+        // CTX-1100 (#1904): headless fail-closed path, never a panic, never
+        // a kill. Fresh app holds zero occupied workspaces.
+        use bitty_config::ChromeAction;
+        let mut app = workspace_test_app();
+        app.apply_chrome_action(ChromeAction::WorkspaceNew);
+        app.apply_chrome_action(ChromeAction::WorkspaceNew);
+        assert_eq!(app.runtime.workspace_count(), 3);
+        assert!(app.runtime.workspace_occupied_indices().is_empty());
+        assert!(app.runtime.workspace_switch(0));
+        app.apply_chrome_action(ChromeAction::WorkspaceNextOccupied);
+        assert_eq!(app.runtime.active_workspace_index(), 0);
+        app.apply_chrome_action(ChromeAction::WorkspacePrevOccupied);
+        assert_eq!(app.runtime.active_workspace_index(), 0);
+        assert_eq!(app.runtime.workspace_count(), 3);
+        assert!(app.runtime.focused_view().is_some());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn chrome_workspace_occupied_cycle_jumps_with_wrap_and_keeps_sessions() {
+        // CTX-1100 (#1904): Mod+[ / Mod+] through the chrome arms. ws1 and
+        // ws3 occupied, ws2 empty: next skips ws2, prev mirrors, wrap holds,
+        // and no workspace or session dies.
+        require_pty!();
+        use bitty_config::ChromeAction;
+        let mut app = workspace_test_app();
+        let ws1_leaf = app.runtime.focused_view().expect("ws1 focus");
+        app.runtime
+            .spawn_shell_for_view(ws1_leaf, "/bin/sh", &[], 40, 12)
+            .expect("ws1 shell must spawn");
+        app.apply_chrome_action(ChromeAction::WorkspaceNew);
+        app.apply_chrome_action(ChromeAction::WorkspaceNew);
+        let ws3_leaf = app.runtime.focused_view().expect("ws3 focus");
+        app.runtime
+            .spawn_shell_for_view(ws3_leaf, "/bin/sh", &[], 40, 12)
+            .expect("ws3 shell must spawn");
+        assert_eq!(app.runtime.workspace_count(), 3);
+        assert_eq!(app.runtime.workspace_occupied_indices(), vec![0, 2]);
+        assert!(app.runtime.workspace_switch(0));
+        let before = app.runtime.pane_session_ids();
+        assert_eq!(before.len(), 2);
+        // Mod+[ is next occupied rightward.
+        app.apply_chrome_action(ChromeAction::WorkspaceNextOccupied);
+        assert_eq!(app.runtime.active_workspace_index(), 2);
+        // At the rightmost occupied, next wraps to the leftmost.
+        app.apply_chrome_action(ChromeAction::WorkspaceNextOccupied);
+        assert_eq!(app.runtime.active_workspace_index(), 0);
+        // Mod+] mirrors: from ws1 prev wraps to ws3, then skips ws2 back.
+        app.apply_chrome_action(ChromeAction::WorkspacePrevOccupied);
+        assert_eq!(app.runtime.active_workspace_index(), 2);
+        app.apply_chrome_action(ChromeAction::WorkspacePrevOccupied);
+        assert_eq!(app.runtime.active_workspace_index(), 0);
+        assert_eq!(app.runtime.workspace_count(), 3, "cycle must not kill");
+        assert_eq!(app.runtime.pane_session_ids().len(), before.len());
+        for id in &before {
+            assert!(app.runtime.has_pane_session(id), "session survives cycle");
+        }
+        assert!(app.runtime.focused_view().is_some(), "focus survives cycle");
     }
 
     #[test]

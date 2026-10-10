@@ -196,12 +196,9 @@ impl Runtime {
         };
         // CTX-1088: the primary owner leaf may carry a durable fixed-size
         // constraint whose paint dims stay slot-sized; the primary grid
-        // and PTY target the flag then, exactly like the pane sync.
-        let (cols_u16, rows_u16) = match self
-            .layout
-            .find_leaf(primary)
-            .and_then(|leaf| leaf.fixed_size())
-        {
+        // and PTY target the flag then, exactly like the pane sync (the
+        // lookup covers the pinned store for the same reason).
+        let (cols_u16, rows_u16) = match self.fixed_size_for_view(primary) {
             Some(size) => (size.width.max(1), size.height.max(1)),
             None => (frame.cols.max(1), frame.rows.max(1)),
         };
@@ -2193,6 +2190,29 @@ impl Runtime {
                 stored.set_fixed_size(Some(size));
             }
         }
+    }
+
+    /// Durable fixed-size flag for `view` across the live trees (CTX-1088).
+    ///
+    /// Reads the active layout first, then the pinned store. Stashed
+    /// workspace layouts are deliberately excluded: every production
+    /// caller sizes from active-scene frames (`present_frames` covers the
+    /// active layout plus the pinned composite), so a stashed view never
+    /// has a frame and its session is never visited by the sync loop —
+    /// nothing can shrink it. When its workspace becomes active again
+    /// the flag is read from the then-active tree. The pinned fallback
+    /// matters: pinning moves the whole flagged `View` out of the layout,
+    /// and without it the next sync would size the pinned grid and PTY
+    /// to the anchor instead of the flag.
+    pub(super) fn fixed_size_for_view(&self, view: ViewId) -> Option<bitty_ui::Size> {
+        if let Some(size) = self
+            .layout
+            .find_leaf(view)
+            .and_then(|leaf| leaf.fixed_size())
+        {
+            return Some(size);
+        }
+        self.pinned.get(view).and_then(|stored| stored.fixed_size())
     }
 
     /// Placement for the fresh pane in an adaptive split (`NewPanel`):

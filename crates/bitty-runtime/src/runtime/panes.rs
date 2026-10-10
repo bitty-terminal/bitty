@@ -857,11 +857,7 @@ impl Runtime {
         // CTX-0294: decorated content frames (Core px decoration + CTX-0177
         // cell gaps) so pane grids/PTYs match the painted viewport.
         for frame in frames {
-            let (cols, rows) = match self
-                .layout
-                .find_leaf(frame.view)
-                .and_then(|leaf| leaf.fixed_size())
-            {
+            let (cols, rows) = match self.fixed_size_for_view(frame.view) {
                 Some(size) => (size.width.max(1), size.height.max(1)),
                 None => (frame.cols.max(1), frame.rows.max(1)),
             };

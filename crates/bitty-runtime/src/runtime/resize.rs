@@ -465,8 +465,7 @@ impl Runtime {
             // the frame alone would shrink the grid back.
             if let Some(fixed) = self
                 .primary_view
-                .and_then(|primary| self.layout.find_leaf(primary))
-                .and_then(|leaf| leaf.fixed_size())
+                .and_then(|primary| self.fixed_size_for_view(primary))
             {
                 (
                     usize::from(fixed.width.max(1)),

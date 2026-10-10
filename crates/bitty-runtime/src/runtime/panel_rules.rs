@@ -522,6 +522,52 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn pinned_fixed_keeps_grid_through_sync() {
+        require_pty!();
+        use crate::Runtime;
+        use bitty_ui::{LayoutNode, SplitAxis, View, ViewId};
+        let mut rt = Runtime::with_defaults().expect("defaults build");
+        // Two leaves: pinning refuses a stranded single-leaf layout.
+        let first = rt.focused_view().expect("focused leaf");
+        let second = ViewId::new(2);
+        let old = rt.layout().find_leaf(first).expect("leaf").clone();
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(old),
+            LayoutNode::leaf(View::new(second, 40, 12)),
+        ));
+        rt.set_panel_spawn_rules(vec![PanelSpawnRule {
+            cmd: Some("sh".to_string()),
+            cmd_regex: None,
+            title_regex: None,
+            content: None,
+            presentation: None,
+            width: Some(100),
+            height: Some(30),
+            workspace: None,
+            centered: None,
+        }]);
+        rt.spawn_shell_for_view(first, "/bin/sh", &[], 40, 12)
+            .expect("spawn");
+        assert_eq!(rt.pane_pty_size(&first), Some((100, 30)));
+        // Pinning moves the whole flagged view out of the layout; the
+        // session survives the move.
+        rt.pin_floating(first).expect("pin");
+        assert!(rt.layout().find_leaf(first).is_none());
+        // The pinned frame paints the anchor, not the flag — but the sync
+        // must still size the grid and PTY from the pinned store flag.
+        let frames = rt.present_frames();
+        let frame = frames.iter().find(|f| f.view == first).expect("frame");
+        assert_ne!((frame.cols, frame.rows), (100, 30));
+        rt.sync_pane_geometry_to(&frames);
+        assert_eq!(rt.pane_pty_size(&first), Some((100, 30)));
+        let grid = rt.pane_snapshot(&first).expect("pane grid");
+        assert_eq!((grid.width, grid.height), (100, 30));
+    }
+
+    #[test]
     fn explicit_zero_dims_stamp_nothing_headless() {
         use crate::Runtime;
         let mut rt = Runtime::with_defaults().expect("defaults build");

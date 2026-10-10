@@ -914,19 +914,68 @@ impl Runtime {
             // Terminal Truth recorded in `TerminalState`. Apply here and
             // skip pixel intake, which would reject the payload-less
             // command as a failed image decode.
-            if matches!(
-                &action,
-                TerminalAction::KittyGraphics {
-                    action_a: Some('p' | 'd' | 'a'),
+            if let TerminalAction::KittyGraphics {
+                action_a: Some('p' | 'd' | 'a'),
+                ..
+            } = &action
+            {
+                // CTX-1072 (#1850): resolve identity deletes before the
+                // state apply prunes number mappings, so the rendered layer
+                // clears the same image. Uppercase selectors free data
+                // downstream; placement removal is identical either way.
+                let mut clear_all_visible = false;
+                let mut delete_wire: Option<(u32, Option<u32>)> = None;
+                if let TerminalAction::KittyGraphics {
+                    action_a: Some('d'),
+                    control,
                     ..
+                } = &action
+                {
+                    let selector = control.delete.unwrap_or('a').to_ascii_lowercase();
+                    match selector {
+                        'a' => clear_all_visible = true,
+                        'i' => {
+                            delete_wire = Some((
+                                control.image_id,
+                                (control.placement_id != 0).then_some(control.placement_id),
+                            ));
+                        }
+                        'n' => {
+                            if let Some(id) = self
+                                .state
+                                .kitty_placements()
+                                .newest_with_number(control.image_number)
+                            {
+                                delete_wire = Some((
+                                    id,
+                                    (control.placement_id != 0).then_some(control.placement_id),
+                                ));
+                            }
+                        }
+                        _ => {}
+                    }
                 }
-            ) {
                 let damage = self.state.apply(&action);
                 if !damage.regions.is_empty() {
                     let generation = damage.generation;
                     self.cold_queue.push(ColdEvent::Damage { generation });
                     self.plugin_host
                         .push_observation(HostObservation::Damage { generation });
+                }
+                // Close the deletion-vs-placement identity split: a
+                // protocol-level delete also clears the rendered placements
+                // of this origin, so no orphan blit survives to the next
+                // present. Location-based selectors stay follow-up work.
+                if clear_all_visible {
+                    if !self
+                        .kitty_images
+                        .placement_for_origin_is_empty(self.kitty_origin)
+                    {
+                        self.kitty_images.clear_origin(self.kitty_origin);
+                        self.pending_full_redraw = true;
+                    }
+                } else if let Some((image, pin)) = delete_wire {
+                    self.kitty_delete_rendered_image(image, pin);
                 }
                 continue;
             }
@@ -939,12 +988,12 @@ impl Runtime {
                 rows_r,
                 cursor_movement_c,
                 payload,
-                // CTX-0950 advanced keys (placement/animation/medium):
-                // not yet consumed here; state owns anchors/lifetime.
-                control: _,
+                control,
             } = action
             {
-                if let Err(err) = self.kitty_display_image_owned(
+                let wire_image = control.image_id;
+                let wire_placement = control.placement_id;
+                if let Err(err) = self.kitty_display_image_owned_with_wire(
                     format_f,
                     width_s,
                     height_v,
@@ -954,6 +1003,8 @@ impl Runtime {
                     cursor_movement_c,
                     payload,
                     0,
+                    wire_image,
+                    wire_placement,
                 ) {
                     // Rate-limited (CTX-0473): a hostile child can spam rejected
                     // kitty payloads; the parser's own warnings stay bounded too.

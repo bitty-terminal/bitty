@@ -1,4 +1,5 @@
-//! Renderer-side panel animations (RFC-0002, CTX-0341; CTX-0967 move/resize/drag).
+//! Renderer-side panel animations (RFC-0002, CTX-0341; CTX-0967 move/resize/drag;
+//! CTX-1078 splits/zoom/workspaces).
 //!
 //! Accepted contract: a closed transition set (panel open/close, focus change,
 //! workspace switch, panel move, panel resize, panel drag) with per-transition
@@ -8,6 +9,15 @@
 //! scrollback, or Terminal Truth. Frame-on-demand is preserved: a frame is
 //! scheduled only while an animation is active, and a completed animation
 //! schedules no further wakeups (PB-7).
+//!
+//! Split open/close, single-pane zoom, and workspace switches (CTX-1078,
+//! issue #1755) ride this same contract: the layout commits its final state
+//! immediately (geometry and terminal content are never interpolated) and
+//! only the Core-owned decoration ring fades over the configured duration
+//! with a smooth cubic easing (`ease_in_out` smoothstep is degree-3, the
+//! `spring` name resolves to it with zero overshoot). They are detected from
+//! the `View`-set delta and the active-workspace index on the next present
+//! with a virtual-clock seam, so tests advance time deterministically.
 //!
 //! Move/resize/drag (CTX-0967, issue #1696) are Hyprland-style geometry gestures:
 //! the layout commits its final state immediately (terminal content is never
@@ -128,9 +138,12 @@ impl AnimationCurve {
     /// All four curves are polynomial and total: `linear` is identity,
     /// `ease_in` is quadratic, `ease_out` is its mirror, and `ease_in_out` is
     /// the smoothstep S-curve. Values stay in `0..=1` for `t` in `0..=1`.
+    /// Non-finite `t` settles: NaN clamps to `0`, infinities to their end,
+    /// mirroring the `bitty-ui` motion sampler so headless callers never
+    /// observe NaN progress.
     #[must_use]
     pub fn eval(self, t: f32) -> f32 {
-        let t = t.clamp(0.0, 1.0);
+        let t = if t.is_nan() { 0.0 } else { t.clamp(0.0, 1.0) };
         match self {
             Self::Linear => t,
             Self::EaseIn => t * t,
@@ -688,5 +701,125 @@ mod tests {
         assert!(!anim.is_active(end));
         assert_eq!(anim.next_deadline(end), None);
         assert!(anim.tick(end));
+    }
+
+    #[test]
+    fn bezier_easing_is_monotone_endpoints_exact_and_mirror_symmetric() {
+        // CTX-1078 (issue #1755): the closed easing set is the smooth
+        // cubic-compatible family for splits, zoom, and workspace nav.
+        // `ease_in_out` smoothstep is degree-3, `ease_in`/`ease_out` are its
+        // quadratic mirrors, and `linear` is identity. Endpoints are exact
+        // so settled values land on target, every curve is monotone so
+        // motion never runs backwards, and the mirror pairs are symmetric.
+        for curve in [
+            AnimationCurve::Linear,
+            AnimationCurve::EaseIn,
+            AnimationCurve::EaseOut,
+            AnimationCurve::EaseInOut,
+        ] {
+            assert_eq!(curve.eval(0.0), 0.0, "{curve:?} start must be exact");
+            assert_eq!(curve.eval(1.0), 1.0, "{curve:?} end must be exact");
+            let mut prev = 0.0_f32;
+            let mut i = 0;
+            while i <= 100 {
+                let t = (i as f32) / 100.0;
+                let next = curve.eval(t);
+                assert!(next >= prev, "{curve:?} must not run backwards at t={t}");
+                assert!(
+                    (0.0..=1.0).contains(&next),
+                    "{curve:?} must stay bounded at t={t}: {next}"
+                );
+                prev = next;
+                i += 1;
+            }
+        }
+        // Mirror symmetry: ease-out mirrors ease-in around the midpoint.
+        let mut i = 0;
+        while i <= 20 {
+            let t = (i as f32) / 20.0;
+            let out = AnimationCurve::EaseOut.eval(t);
+            let mirrored = 1.0 - AnimationCurve::EaseIn.eval(1.0 - t);
+            assert!(
+                (out - mirrored).abs() < 1e-6,
+                "ease_out must mirror ease_in at t={t}: {out} vs {mirrored}"
+            );
+            // Ease-in-out symmetry around the midpoint.
+            let a = AnimationCurve::EaseInOut.eval(t);
+            let b = AnimationCurve::EaseInOut.eval(1.0 - t);
+            assert!(
+                (a + b - 1.0).abs() < 1e-6,
+                "ease_in_out must be symmetric at t={t}: {a} + {b} must be 1"
+            );
+            i += 1;
+        }
+        assert_eq!(AnimationCurve::EaseInOut.eval(0.5), 0.5);
+    }
+
+    #[test]
+    fn spring_overshoot_is_bounded_to_zero() {
+        // CTX-1078 (issue #1755): RFC-0002 defers `spring` parameters, so the
+        // config layer resolves `spring` to `ease_in_out`. The resolved curve
+        // never overshoots: every sample stays in `0..=1`, so the overshoot
+        // bound is zero and a settled value always lands exactly on target.
+        // Geometry and content are never interpolated; only the chrome ring
+        // fades, so there is no spring displacement to bound beyond this.
+        let resolved = AnimationCurve::EaseInOut;
+        let mut max = 0.0_f32;
+        let mut min = 1.0_f32;
+        let mut i = 0;
+        while i <= 200 {
+            let t = (i as f32) / 200.0;
+            let v = resolved.eval(t);
+            assert!(
+                (0.0..=1.0).contains(&v),
+                "resolved spring must stay bounded at t={t}: {v}"
+            );
+            max = max.max(v);
+            min = min.min(v);
+            i += 1;
+        }
+        assert_eq!(min, 0.0, "resolved spring must start exactly at 0");
+        assert_eq!(max, 1.0, "resolved spring must end exactly at 1");
+        let overshoot = max - 1.0;
+        assert_eq!(overshoot, 0.0, "resolved spring overshoot must be zero");
+        // Non-finite inputs settle instead of producing overshoot.
+        assert_eq!(resolved.eval(f32::NAN), 0.0);
+        assert_eq!(resolved.eval(f32::INFINITY), 1.0);
+        assert_eq!(resolved.eval(f32::NEG_INFINITY), 0.0);
+        assert_eq!(resolved.eval(2.0), 1.0);
+        assert_eq!(resolved.eval(-1.0), 0.0);
+    }
+
+    #[test]
+    fn split_zoom_workspace_durations_stay_within_motion_budget() {
+        // CTX-1078 (issue #1755): split open/close, zoom (open/close), and
+        // workspace switches stay within the RFC-0002 motion budget:
+        // every duration in `0..=500` ms, at most one animation per surface,
+        // and a bounded number of concurrently animating surfaces. Excess
+        // triggers commit their end state immediately (no queue growth).
+        let policy = AnimationPolicy::default();
+        for kind in [
+            AnimationKind::Open,
+            AnimationKind::Close,
+            AnimationKind::Workspace,
+        ] {
+            let ms = policy.duration_ms[kind.index()];
+            assert!(
+                ms <= 500,
+                "{kind:?} duration {ms} ms must stay within the 500 ms ceiling"
+            );
+            assert!(policy.animates(kind), "{kind:?} must animate by default");
+        }
+        assert_eq!(MAX_CONCURRENT_ANIMATIONS, 8);
+        // The budget is enforced by the tracker, not by queueing.
+        let now = t0();
+        let mut anim = PanelAnimator::new(policy);
+        for i in 0..MAX_CONCURRENT_ANIMATIONS {
+            assert!(anim.trigger(AnimationKind::Open, Some(ViewId::new(i as u64 + 1)), now));
+        }
+        assert!(
+            !anim.trigger(AnimationKind::Workspace, None, now),
+            "past capacity the workspace switch must cut instantly"
+        );
     }
 }

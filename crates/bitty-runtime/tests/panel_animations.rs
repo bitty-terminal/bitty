@@ -1,10 +1,16 @@
 #![forbid(unsafe_code)]
-//! Renderer-side panel animations (RFC-0002, CTX-0341; CTX-0967 move/resize/drag).
+//! Renderer-side panel animations (RFC-0002, CTX-0341; CTX-0967 move/resize/drag;
+//! CTX-1078 splits/zoom/workspaces).
 //!
 //! Pins the runtime wiring of the accepted contract:
 //! - a new split `View` arms a bounded open transition and presents extra
 //!   frames while active; when it completes the present path idles again
 //!   (frame-on-demand, PB-7: zero wakeups after completion);
+//! - single-pane zoom engage/disengage arms bounded close/open transitions
+//!   through the same chrome-ring fade (geometry and content commit
+//!   immediately, never interpolated);
+//! - workspace switches (new/switch/prev/next/last) arm the bounded
+//!   workspace transition with the same virtual-clock seam;
 //! - panel move (same-workspace reposition, cross-workspace reparent),
 //!   panel resize (border-drag divider, keyboard step), and panel drag
 //!   (Alt+drag float move) arm their own bounded transitions from the
@@ -769,4 +775,262 @@ fn terminal_grid_is_never_interpolated_during_move() {
         .map(|c| c.glyph)
         .collect();
     assert_eq!(row, "MOVE-TRUTH", "grid content is never animated");
+}
+
+// ── CTX-1078: splits/zoom/workspaces Bezier transitions ───────────────────
+
+fn single_leaf() -> LayoutNode {
+    LayoutNode::leaf(View::new(ViewId::new(1), 80, 24))
+}
+
+#[test]
+fn zoom_engage_arms_close_and_disengage_arms_open() {
+    // CTX-1078 (issue #1755): single-pane zoom rides the same chrome-ring
+    // contract as splits. Engage collapses to one leaf (a close for the
+    // hidden leaf); disengage restores the split (an open for the restored
+    // leaf). Geometry commits immediately; only the ring fades, driven by
+    // the virtual clock with no wall-clock sleeps.
+    let mut rt = runtime_with(AnimationPolicy::default());
+    let start = Instant::now();
+    let _ = rt.tick_at(start).expect("baseline presents");
+    rt.set_layout(two_pane_split());
+    let _ = rt.tick_at(start).expect("split presents");
+    let settled = start + Duration::from_millis(150);
+    rt.tick_at(settled);
+    assert!(rt.tick_at(settled).is_none(), "idle baseline");
+
+    // Zoom engage: collapse to the focused leaf through the grid-preserving
+    // path (the toggle_zoom lane). The tree commits at once.
+    rt.set_layout_preserve_grid(single_leaf());
+    assert_eq!(rt.layout().leaf_ids(), vec![ViewId::new(1)]);
+    let _ = rt.tick_at(settled).expect("zoom engage presents");
+    assert!(
+        rt.animation_progress(AnimationKind::Close, Some(ViewId::new(2)), settled)
+            .is_some(),
+        "zoom engage must arm a close for the hidden leaf"
+    );
+    let mid = settled + Duration::from_millis(60);
+    let p = rt
+        .animation_progress(AnimationKind::Close, Some(ViewId::new(2)), mid)
+        .expect("mid close progress");
+    assert!((0.0..1.0).contains(&p), "mid zoom-close progress {p}");
+    let close_end = settled + Duration::from_millis(120);
+    rt.tick_at(close_end);
+    assert!(
+        rt.animation_progress(AnimationKind::Close, Some(ViewId::new(2)), close_end)
+            .is_none(),
+        "zoom close must expire by 120 ms"
+    );
+
+    // Zoom disengage: restore the split. The restored leaf opens.
+    rt.set_layout_preserve_grid(two_pane_split());
+    assert_eq!(rt.layout().leaf_ids().len(), 2);
+    let _ = rt.tick_at(close_end).expect("zoom release presents");
+    assert!(
+        rt.animation_progress(AnimationKind::Open, Some(ViewId::new(2)), close_end)
+            .is_some(),
+        "zoom release must arm an open for the restored leaf"
+    );
+    let open_end = close_end + Duration::from_millis(150);
+    rt.tick_at(open_end);
+    assert!(!rt.animations_active(), "zoom open must complete");
+    assert!(rt.tick_at(open_end).is_none(), "idle after zoom completes");
+}
+
+#[test]
+fn zoom_never_interpolates_grid_or_geometry() {
+    // CTX-1078: zoom commits geometry and content at once. The leaf count
+    // changes at the mutation (not at animation end), and a grid byte
+    // written mid-zoom reads back verbatim.
+    let mut rt = runtime_with(AnimationPolicy::default());
+    let start = Instant::now();
+    let _ = rt.tick_at(start);
+    rt.set_layout(two_pane_split());
+    let _ = rt.tick_at(start);
+    rt.set_layout_preserve_grid(single_leaf());
+    assert_eq!(
+        rt.layout().leaf_ids(),
+        vec![ViewId::new(1)],
+        "zoom geometry must commit immediately"
+    );
+    let _ = rt.tick_at(start).expect("zoom presents");
+    assert!(rt.animations_active(), "zoom close must be active");
+    rt.handle_pty_bytes(b"\x1b[2;1HZOOM-TRUTH");
+    let snap = rt.snapshot();
+    let row: String = snap
+        .cells
+        .chunks(snap.width)
+        .nth(1)
+        .expect("row 2")
+        .iter()
+        .take(10)
+        .map(|c| c.glyph)
+        .collect();
+    assert_eq!(row, "ZOOM-TRUTH", "grid content is never animated by zoom");
+}
+
+#[test]
+fn workspace_prev_next_last_arm_workspace_transition() {
+    // CTX-1078: every workspace navigation path arms the same bounded
+    // workspace transition with the virtual clock. Three workspaces give
+    // prev/next/last distinct targets.
+    let mut rt = runtime_with(AnimationPolicy::default());
+    let start = Instant::now();
+    let _ = rt.tick_at(start).expect("first frame");
+    rt.workspace_new().expect("second workspace");
+    let _ = rt.tick_at(start).expect("switch presents");
+    let settled = start + Duration::from_millis(200);
+    rt.tick_at(settled);
+    assert!(rt.tick_at(settled).is_none(), "idle baseline");
+    rt.workspace_new().expect("third workspace");
+    let _ = rt.tick_at(settled).expect("switch presents");
+    let base = settled + Duration::from_millis(200);
+    rt.tick_at(base);
+    assert!(rt.tick_at(base).is_none());
+    assert_eq!(rt.workspace_count(), 3);
+
+    // Prev wraps to the second workspace.
+    rt.workspace_prev();
+    let _ = rt.tick_at(base).expect("prev presents");
+    assert_eq!(
+        rt.animation_progress(AnimationKind::Workspace, None, base),
+        Some(0.0),
+        "prev must arm the workspace transition at the virtual time"
+    );
+    let end = base + Duration::from_millis(200);
+    rt.tick_at(end);
+    assert!(
+        rt.animation_progress(AnimationKind::Workspace, None, end)
+            .is_none(),
+        "prev must expire by 200 ms"
+    );
+
+    // Next returns to the third workspace.
+    rt.workspace_next();
+    let _ = rt.tick_at(end).expect("next presents");
+    assert!(
+        rt.animation_progress(AnimationKind::Workspace, None, end)
+            .is_some(),
+        "next must arm the workspace transition"
+    );
+    let end2 = end + Duration::from_millis(200);
+    rt.tick_at(end2);
+    assert!(
+        rt.animation_progress(AnimationKind::Workspace, None, end2)
+            .is_none(),
+        "next must expire by 200 ms"
+    );
+
+    // Last jumps to the most-recently-used workspace.
+    rt.workspace_last();
+    let _ = rt.tick_at(end2).expect("last presents");
+    assert!(
+        rt.animation_progress(AnimationKind::Workspace, None, end2)
+            .is_some(),
+        "last must arm the workspace transition"
+    );
+    let end3 = end2 + Duration::from_millis(200);
+    rt.tick_at(end3);
+    assert!(
+        rt.animation_progress(AnimationKind::Workspace, None, end3)
+            .is_none(),
+        "last must expire by 200 ms"
+    );
+    assert!(rt.tick_at(end3).is_none(), "idle after nav completes");
+}
+
+#[test]
+fn zoom_and_switch_suppressed_when_instant() {
+    // CTX-1078: disabled, reduced-motion-always, safe-mode, and 0 ms
+    // policies arm no zoom or workspace transition, while the state change
+    // itself still commits (instant final geometry, never a degraded
+    // intermediate). This is the headless no-arm gate: without a live
+    // frame loop there is no interpolation, only the committed end state.
+    for policy in [
+        AnimationPolicy {
+            enabled: false,
+            ..AnimationPolicy::default()
+        },
+        AnimationPolicy {
+            reduced_motion: ReducedMotionMode::Always,
+            ..AnimationPolicy::default()
+        },
+        AnimationPolicy {
+            safe_mode: true,
+            ..AnimationPolicy::default()
+        },
+        AnimationPolicy {
+            duration_ms: [0; AnimationKind::COUNT],
+            ..AnimationPolicy::default()
+        },
+    ] {
+        // Zoom still collapses; it just does not animate.
+        let mut rt = runtime_with(policy);
+        let start = Instant::now();
+        let _ = rt.tick_at(start);
+        rt.set_layout(two_pane_split());
+        let _ = rt.tick_at(start);
+        rt.set_layout_preserve_grid(single_leaf());
+        assert_eq!(rt.layout().leaf_ids(), vec![ViewId::new(1)]);
+        assert!(rt.tick_at(start).is_some(), "zoom presents once");
+        assert!(
+            !rt.animations_active(),
+            "suppressed zoom must not arm: {policy:?}"
+        );
+        assert!(
+            rt.animation_progress(AnimationKind::Close, Some(ViewId::new(2)), start)
+                .is_none(),
+            "suppressed zoom close must not arm: {policy:?}"
+        );
+        assert!(rt.tick_at(start).is_none(), "suppressed zoom idles");
+
+        // Workspace switch still moves; it just does not animate.
+        let mut rt = runtime_with(policy);
+        let _ = rt.tick_at(start);
+        rt.workspace_new().expect("new workspace");
+        assert!(rt.tick_at(start).is_some(), "switch presents once");
+        assert!(
+            !rt.animations_active(),
+            "suppressed switch must not arm: {policy:?}"
+        );
+        assert!(
+            rt.animation_progress(AnimationKind::Workspace, None, start)
+                .is_none(),
+            "suppressed workspace must not arm: {policy:?}"
+        );
+        assert_eq!(rt.animation_deadline(), None);
+        assert!(rt.tick_at(start).is_none(), "suppressed switch idles");
+    }
+}
+
+#[test]
+fn split_zoom_switch_respect_concurrent_surface_budget() {
+    // CTX-1078: the motion budget caps concurrently animating surfaces at
+    // eight. Past capacity a split, zoom, or switch commits its end state
+    // immediately (instant cut) instead of queueing unbounded work, and the
+    // tracker idles with zero wakeups once the bounded set completes.
+    let mut rt = runtime_with(AnimationPolicy::default());
+    let now = Instant::now();
+    // Fill the tracker directly through the same arm gate the gesture
+    // paths use: eight distinct surfaces animate, the ninth cuts instantly.
+    for i in 0..8 {
+        assert!(rt.trigger_animation(AnimationKind::Open, Some(ViewId::new(i as u64 + 1)), now));
+    }
+    assert!(
+        !rt.trigger_animation(AnimationKind::Workspace, None, now),
+        "past capacity the workspace switch must cut instantly"
+    );
+    assert!(
+        !rt.trigger_animation(AnimationKind::Open, Some(ViewId::new(999)), now),
+        "past capacity a split must cut instantly"
+    );
+    let end = now + Duration::from_millis(200);
+    assert!(
+        rt.tick_at(end).is_some(),
+        "bounded set still presents its final frame"
+    );
+    assert!(!rt.animations_active(), "bounded set must complete");
+    assert_eq!(rt.animation_deadline(), None);
+    // Capacity is available again after completion.
+    assert!(rt.trigger_animation(AnimationKind::Workspace, None, end));
 }

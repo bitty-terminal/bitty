@@ -14,6 +14,7 @@
 
 use crate::error::ConfigError;
 use crate::keymap::ModKey;
+use crate::panel_rules::PanelSpawnRule;
 use crate::types::{
     AppearanceConfig, ChromeConfig, CloseConfirm, DecorationConfig, FontConfig, KeymapEntry,
     LayoutConfig, MouseConfig, PluginSpec, ScrollbarConfig, SelectionConfig, SessionConfig,
@@ -91,6 +92,10 @@ pub struct ConfigPlan {
     pub keymaps: Option<Vec<KeymapEntry>>,
     /// Plugin set (full set for this layer).
     pub plugins: Option<Vec<PluginSpec>>,
+    /// Declarative panel spawn rules (CTX-1080 `panel_rules`; array-replace).
+    /// `None` means this layer says nothing; `Some` carries the full ordered
+    /// set with first-match-wins evaluation.
+    pub panel_rules: Option<Vec<PanelSpawnRule>>,
     /// Profile name this plan declares itself as (for `extends` sources).
     pub profile_name: Option<String>,
     /// Single-parent `extends` target; cycle detection is enforced.
@@ -273,6 +278,9 @@ impl ConfigPlan {
                 p.validate()?;
             }
         }
+        if let Some(rules) = &self.panel_rules {
+            crate::panel_rules::validate_all(rules)?;
+        }
         if let Some(ext) = &self.extends {
             if ext.trim().is_empty() {
                 return Err(ConfigError::validation(
@@ -304,6 +312,7 @@ impl ConfigPlan {
             && self.hints_enabled.is_none()
             && self.keymaps.is_none()
             && self.plugins.is_none()
+            && self.panel_rules.is_none()
             && self.extends.is_none()
             && self.profile_name.is_none()
             && self.session.is_none()

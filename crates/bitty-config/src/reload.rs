@@ -114,6 +114,7 @@ impl std::fmt::Display for ReloadClass {
 /// | `leader_timeout_ms`       | Live               |
 /// | `hints_enabled`           | Live               |
 /// | `keymaps`                 | Live               |
+/// | `panel_rules`             | Live               |
 /// | `workspace.show_bar`      | Live               |
 /// | `workspace.bar.edge`      | Live               |
 /// | `terminal.scrollback`     | RestartRequired    |
@@ -207,6 +208,7 @@ pub const LIVE_FIELDS: &[&str] = &[
     "leader_timeout_ms",
     "hints_enabled",
     "keymaps",
+    "panel_rules",
     // CTX-0963 (#1697): the tiled resize step is read at keypress time from
     // the effective config (no PTY recreation, no layout rebuild), so it
     // reconciles live like the keymaps — unlike `layout.gaps_in/out`, which
@@ -794,6 +796,11 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
     old_pls.sort();
     new_pls.sort();
     push_if_changed("plugins", format!("{old_pls:?}"), format!("{new_pls:?}"));
+    push_if_changed(
+        "panel_rules",
+        format!("{:?}", old.panel_rules),
+        format!("{:?}", new.panel_rules),
+    );
 
     // CTX-0343: `views` diffs are keyed by canonical selector so an added,
     // removed, or edited `*`/content/`ws:`/`view:` entry is detected as one
@@ -1544,6 +1551,32 @@ mod tests {
         let mut cur = old;
         reconcile_live(&mut cur, &new).expect("keymap rebind must reconcile live");
         assert_eq!(cur.keymaps[0].action, "focus_prev");
+    }
+
+    #[test]
+    fn diff_panel_rules_is_live_and_reconciles() {
+        use crate::panel_rules::{PanelPresentation, PanelSpawnRule};
+        let old = EffectiveConfig::default();
+        let mut new = old.clone();
+        new.panel_rules = vec![PanelSpawnRule {
+            cmd: Some("btop".to_string()),
+            cmd_regex: None,
+            title_regex: None,
+            content: None,
+            presentation: Some(PanelPresentation::Floating),
+            width: Some(100),
+            height: Some(30),
+            workspace: None,
+            centered: Some(true),
+        }];
+        let r = diff(&old, &new);
+        assert_eq!(r.overall, ReloadClass::Live);
+        assert!(!r.needs_restart);
+        assert!(r.diffs.iter().any(|d| d.field == "panel_rules"));
+        assert_eq!(classify_field("panel_rules"), ReloadClass::Live);
+        let mut cur = old;
+        reconcile_live(&mut cur, &new).expect("panel rules must reconcile live");
+        assert_eq!(cur.panel_rules.len(), 1);
     }
 
     #[test]

@@ -141,6 +141,7 @@ pub mod live_config;
 pub mod log_throttle;
 pub mod mouse_chrome;
 pub mod mouse_encode;
+pub mod panel_rules;
 pub mod panes;
 pub mod plaintext_url;
 pub mod plugin;
@@ -593,6 +594,12 @@ pub struct Runtime {
     help_visible: bool,
     /// Adaptive panel creation mode (Spiral vs Dwindle).
     panel_layout_mode: PanelLayoutMode,
+    /// Declarative panel spawn rules in first-match-wins order (CTX-1080).
+    ///
+    /// Empty by default; set from the effective `panel_rules` by the app
+    /// layer. Consulted at PTY spawn and view initialization; empty means
+    /// no rule applies and spawn behavior is unchanged.
+    panel_spawn_rules: Vec<bitty_config::panel_rules::PanelSpawnRule>,
     /// Help popup rows (CTX-0265), regenerated from the live keymap
     /// registry by the app on every show.
     ///
@@ -1609,6 +1616,7 @@ impl Runtime {
             last_presented_bands: Vec::new(),
             help_visible: false,
             panel_layout_mode: config.panel_layout_mode,
+            panel_spawn_rules: Vec::new(),
             help_rows: Vec::new(),
             overlay_modal_active: false,
             next_workspace_seq: 2,
@@ -1854,6 +1862,7 @@ impl Runtime {
             last_presented_bands: Vec::new(),
             help_visible: false,
             panel_layout_mode: config.panel_layout_mode,
+            panel_spawn_rules: Vec::new(),
             help_rows: Vec::new(),
             overlay_modal_active: false,
             next_workspace_seq: 2,

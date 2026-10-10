@@ -48,8 +48,24 @@
 //!     plugins = {
 //!         { id = "owner/name", enabled = true },
 //!     },
+//!     panel_rules = {
+//!         { cmd = "btop", presentation = "floating", width = 100, height = 30, centered = true },
+//!         { cmd_regex = "^tail -f", workspace = 3 },
+//!     },
 //! }
 //! ```
+//!
+//! - `panel_rules` is a fully-optional top-level array with the same
+//!   absent-means-silent contract (CTX-1080, issue 1756): absent or empty
+//!   means this layer says nothing. Each entry needs at least one matcher
+//!   (`cmd` exact against the program basename or full command line,
+//!   `cmd_regex`/`title_regex` in the bounded subset, `content` one of
+//!   `empty`/`terminal`/`rich`/`browser`) and at least one action
+//!   (`presentation` one of `tiled`/`floating`/`scratchpad`, `width`/`height`
+//!   `1..=1000`, `workspace` `1..=16`, `centered` boolean). Matchers combine
+//!   with AND; the first matching rule in array order wins. Invalid entries
+//!   fail closed with the `panel_rules[<n>].<field>` path, matching the
+//!   `keymaps`/`plugins` precedent.
 //!
 //! - `mod_key` is a fully-optional top-level scalar (absent means "this layer
 //!   says nothing", so existing configs without it keep working). When
@@ -2199,6 +2215,103 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
         restore_on_startup: s.restore_on_startup,
     });
 
+    // CTX-1080: `panel_rules` is a fully-optional top-level array with the
+    // same absent-means-silent contract as `plugins`: absent or empty means
+    // this layer says nothing. Each entry maps to `PanelSpawnRule`; per-entry
+    // grammar and bounds validate fail-closed with the indexed
+    // `panel_rules[<n>].<field>` path, matching the `keymaps`/`plugins`
+    // precedent. Ordering is preserved for first-match-wins evaluation.
+    let panel_rules = match data.panel_rules {
+        None => None,
+        Some(list) if list.is_empty() => None,
+        Some(list) => {
+            if list.len() > crate::panel_rules::MAX_PANEL_RULES {
+                return Err(ConfigError::validation(
+                    "panel_rules",
+                    format!(
+                        "must contain at most {} entries",
+                        crate::panel_rules::MAX_PANEL_RULES
+                    ),
+                ));
+            }
+            let mut out = Vec::with_capacity(list.len());
+            for (idx, r) in list.into_iter().enumerate() {
+                let base = format!("panel_rules[{}]", idx + 1);
+                let presentation = match r.presentation {
+                    None => None,
+                    Some(raw) => match crate::panel_rules::PanelPresentation::parse(&raw) {
+                        Some(mode) => Some(mode),
+                        None => {
+                            return Err(ConfigError::validation(
+                                format!("{base}.presentation"),
+                                "must be one of tiled, floating, scratchpad",
+                            ));
+                        }
+                    },
+                };
+                let width = match r.width {
+                    None => None,
+                    Some(v) => {
+                        if !(1..=i64::from(crate::panel_rules::MAX_PANEL_RULE_DIM)).contains(&v) {
+                            return Err(ConfigError::validation(
+                                format!("{base}.width"),
+                                format!(
+                                    "must be within [1, {}]",
+                                    crate::panel_rules::MAX_PANEL_RULE_DIM
+                                ),
+                            ));
+                        }
+                        Some(v as u16)
+                    }
+                };
+                let height = match r.height {
+                    None => None,
+                    Some(v) => {
+                        if !(1..=i64::from(crate::panel_rules::MAX_PANEL_RULE_DIM)).contains(&v) {
+                            return Err(ConfigError::validation(
+                                format!("{base}.height"),
+                                format!(
+                                    "must be within [1, {}]",
+                                    crate::panel_rules::MAX_PANEL_RULE_DIM
+                                ),
+                            ));
+                        }
+                        Some(v as u16)
+                    }
+                };
+                let workspace = match r.workspace {
+                    None => None,
+                    Some(v) => {
+                        if !(1..=i64::from(crate::panel_rules::MAX_PANEL_RULE_WORKSPACE))
+                            .contains(&v)
+                        {
+                            return Err(ConfigError::validation(
+                                format!("{base}.workspace"),
+                                format!(
+                                    "must be within [1, {}]",
+                                    crate::panel_rules::MAX_PANEL_RULE_WORKSPACE
+                                ),
+                            ));
+                        }
+                        Some(v as u8)
+                    }
+                };
+                out.push(crate::panel_rules::PanelSpawnRule {
+                    cmd: r.cmd,
+                    cmd_regex: r.cmd_regex,
+                    title_regex: r.title_regex,
+                    content: r.content,
+                    presentation,
+                    width,
+                    height,
+                    workspace,
+                    centered: r.centered,
+                });
+            }
+            Some(out)
+        }
+    };
+
     let plan = ConfigPlan {
         schema_version: None,
         font,
@@ -2221,6 +2334,7 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
         hints_enabled,
         keymaps,
         plugins,
+        panel_rules,
         profile_name: None,
         extends,
         undeclared_fields: Vec::new(),
@@ -3518,6 +3632,81 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("plugins[1].id"), "overlong id: {msg}");
         assert!(!msg.contains(&long), "must not echo the id");
+    }
+
+    #[test]
+    fn lua_panel_rules_parse_and_match() {
+        // CTX-1080: `panel_rules` parses, preserves order, and matches.
+        let plan = parse_lua_config(
+            r#"return { panel_rules = {
+                { cmd = "btop", presentation = "floating", width = 100, height = 30, centered = true },
+                { cmd_regex = "^tail -f", workspace = 3 },
+            } }"#,
+            &test_source(),
+        )
+        .expect("panel_rules declared");
+        let rules = plan.panel_rules.expect("rules present");
+        assert_eq!(rules.len(), 2);
+        let hit =
+            crate::panel_rules::find_match(&rules, "btop", "", "terminal").expect("btop matches");
+        assert_eq!(hit.0, 0);
+        assert_eq!(
+            hit.1.presentation,
+            Some(crate::panel_rules::PanelPresentation::Floating)
+        );
+        let hit = crate::panel_rules::find_match(&rules, "tail -f /var/log/syslog", "", "terminal")
+            .expect("tail matches");
+        assert_eq!(hit.0, 1);
+        assert_eq!(hit.1.workspace, Some(3));
+    }
+
+    #[test]
+    fn lua_panel_rules_empty_means_silent() {
+        let plan = parse_lua_config(r#"return { panel_rules = {} }"#, &test_source())
+            .expect("empty accepted");
+        assert!(plan.panel_rules.is_none());
+    }
+
+    #[test]
+    fn lua_panel_rules_bad_shapes_fail_closed_with_path() {
+        // CTX-1080: whole-layer fail-closed like keymaps/plugins; every
+        // rejection names the offending `panel_rules[<n>]` path.
+        for (bad, want) in [
+            (r#"return { panel_rules = { "btop" } }"#, "panel_rules[1]"),
+            (r#"return { panel_rules = { {} } }"#, "panel_rules[1]"),
+            (
+                r#"return { panel_rules = { { cmd = "btop" } } }"#,
+                "panel_rules[1]",
+            ),
+            (
+                r#"return { panel_rules = { { presentation = "floating" } } }"#,
+                "panel_rules[1]",
+            ),
+            (
+                r#"return { panel_rules = { { cmd = "btop", presentation = "zoom" } } }"#,
+                "panel_rules[1].presentation",
+            ),
+            (
+                r#"return { panel_rules = { { cmd = "btop", presentation = "floating", width = 0 } } }"#,
+                "panel_rules[1].width",
+            ),
+            (
+                r#"return { panel_rules = { { cmd = "btop", presentation = "floating", workspace = 17 } } }"#,
+                "panel_rules[1].workspace",
+            ),
+            (
+                r#"return { panel_rules = { { cmd_regex = "([", presentation = "floating" } } }"#,
+                "panel_rules[1]",
+            ),
+            (
+                r#"return { panel_rules = { { cmd = "btop", presentation = "floating", bogus = 1 } } }"#,
+                "panel_rules[1].bogus",
+            ),
+        ] {
+            let err = parse_lua_config(bad, &test_source()).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains(want), "must name the path: {bad} -> {msg}");
+        }
     }
 
     #[test]

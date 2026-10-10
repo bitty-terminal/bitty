@@ -1938,6 +1938,23 @@ impl Runtime {
         self.panel_layout_mode = mode;
     }
 
+    /// Declarative panel spawn rules in first-match-wins order (CTX-1080).
+    ///
+    /// Empty by default; the app layer assigns the effective `panel_rules`
+    /// here. Consulted at PTY spawn and view initialization.
+    #[must_use]
+    pub fn panel_spawn_rules(&self) -> &[bitty_config::panel_rules::PanelSpawnRule] {
+        &self.panel_spawn_rules
+    }
+
+    /// Replaces the declarative panel spawn rules.
+    ///
+    /// Validated rules only; invalid entries must have failed closed at
+    /// config validation. Empty clears all rules.
+    pub fn set_panel_spawn_rules(&mut self, rules: Vec<bitty_config::panel_rules::PanelSpawnRule>) {
+        self.panel_spawn_rules = rules;
+    }
+
     /// Placement for the fresh pane in an adaptive split (`NewPanel`):
     /// - `Spiral` (default): 4-way clockwise rotating spiral (Right, Down, Left, Up):
     ///   - Step 0 (1 -> 2 leaves): Right (`place_new_first = false`)

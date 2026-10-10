@@ -1220,10 +1220,12 @@ impl Runtime {
 
     /// Scoped `Esc` routing: consume the press only for a real confirmation
     /// gate (CTX-0186 paste, CTX-0257 workspace close, CTX-0370 view/window
-    /// close).
+    /// close) or an active pointer gesture with advisory-only state
+    /// (CTX-1070 Mod+drag tiled move).
     ///
     /// Returns `true` when an `Esc` press cancelled at least one pending
-    /// **confirmation gate**: the gate is dropped without delivery, a redraw
+    /// **confirmation gate** or the active tiled-drag gesture: the gate or
+    /// gesture is dropped without delivery, a redraw
     /// is requested so any pending indicator clears, and the caller must not
     /// forward the key to the PTY (a dismissal must not also drive shell/vim
     /// state on the gate it just aborted). Returns `false` otherwise (not
@@ -1245,6 +1247,20 @@ impl Runtime {
             return false;
         }
         let mut gate_cancelled = false;
+        // CTX-1070 (issue #1811): Esc cancels an active Mod+drag tiled move
+        // without committing. The preview never mutates the tree, so the
+        // cancel restores the pre-drag layout byte-identically (no
+        // re-parent, no selection, no residue) and the press is consumed —
+        // the gesture owned the pointer, so the dismissal must not also
+        // drive shell/vim state. Live-mutating gestures (Alt+drag float
+        // moves, border-drag resizes) commit continuously and have no
+        // no-op cancel; only the advisory-preview tiled drag cancels here.
+        // The transient pointer gesture owns Esc before the confirmation
+        // gates below (a second Esc press reaches them).
+        if self.tiled_drag.is_some() {
+            self.cancel_tiled_drag();
+            return true;
+        }
         // CTX-0370: Esc cancels a pending view/window close confirmation
         // (the close itself is aborted; nothing is torn down).
         if self.pending_close_confirm.is_some() {

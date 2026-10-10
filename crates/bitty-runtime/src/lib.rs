@@ -264,7 +264,7 @@ pub use runtime::{
 // The runtime depends on `bitty-ui` only via these owned value types; no
 // render/platform/pty coupling is introduced through them.
 pub use bitty_ui::{
-    DecoratedView, Decoration, DecorationError, Focus, FocusDirection, Gaps, LayoutNode,
+    DecoratedView, Decoration, DecorationError, DropSpec, Focus, FocusDirection, Gaps, LayoutNode,
     OverlayLayer, OverlayTier, PresentationMode, ScrollbarMode, SplitAxis, View, ViewId,
 };
 

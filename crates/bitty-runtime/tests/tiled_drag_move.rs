@@ -7,8 +7,17 @@
 //! the drop position), and the release never desyncs into a selection
 //! commit. Shift still forces selection; floating leaves stay on the
 //! Alt+drag path; single-leaf trees fail soft to block selection.
+//!
+//! Issue #1811 (CTX-1070): the drag shows continuous feedback (ghost
+//! outline on the dragged frame plus drop-target highlight under the
+//! cursor, both via the Core-owned chrome-ring drag transition), corner
+//! drops resolve through the accepted #1804 balanced policy at `0.5`, a
+//! committed drop settles via the move transition, and `Esc` cancels
+//! mid-drag restoring the pre-drag layout byte-identically.
 use bitty_platform::{CursorPosition, MouseButton, NamedKey, PressState};
-use bitty_runtime::{LayoutNode, Runtime, RuntimeConfig, SplitAxis, UiRect, View, ViewId};
+use bitty_runtime::{
+    AnimationKind, DropSpec, LayoutNode, Runtime, RuntimeConfig, SplitAxis, UiRect, View, ViewId,
+};
 
 fn make_runtime() -> Runtime {
     Runtime::with_defaults().expect("defaults must build")
@@ -244,6 +253,186 @@ fn cursor_left_cancels_without_committing() {
         alt: false,
         super_pressed: false,
     };
+}
+
+// -- Issue #1811 (CTX-1070) live preview, balanced corners, Esc cancel --
+
+#[test]
+fn drag_arms_live_preview_and_drop_settles() {
+    use std::time::{Duration, Instant};
+    let mut rt = make_runtime();
+    rt.set_layout(two_pane());
+    rt.handle_cursor_moved(cell_pixels(10, 12));
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Pressed));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(rt.tiled_drag_active());
+    let source = ViewId::new(1);
+    let target = ViewId::new(2);
+    // Motion arms the ghost outline on the dragged frame plus the
+    // drop-target highlight under the cursor, both at the gesture time.
+    // The event path records the cursor for the live plan seam; the
+    // explicit clock then re-arms both transitions deterministically.
+    let t = Instant::now();
+    rt.handle_cursor_moved(cell_pixels(60, 12));
+    assert!(rt.update_tiled_drag_at(cell_pixels(60, 12), t));
+    assert_eq!(rt.tiled_drag_preview(), Some(target));
+    assert_eq!(
+        rt.animation_progress(AnimationKind::Drag, Some(source), t),
+        Some(0.0),
+        "ghost outline must arm at the gesture time"
+    );
+    assert_eq!(
+        rt.animation_progress(AnimationKind::Drag, Some(target), t),
+        Some(0.0),
+        "drop-target highlight must arm at the gesture time"
+    );
+    // The live plan tracks the hovered edge: the center tie docks left at
+    // half, matching the position-based placement a release would commit.
+    assert_eq!(
+        rt.tiled_drag_drop_spec(),
+        Some(DropSpec::new(target, SplitAxis::Horizontal, 0.5, false))
+    );
+    // Mid-transition the preview is still live.
+    let mid = t + Duration::from_millis(75);
+    assert!(
+        rt.animation_progress(AnimationKind::Drag, Some(source), mid)
+            .is_some(),
+        "ghost outline must stay live mid-drag"
+    );
+    // Release commits the edge insert and settles via the move transition;
+    // the preview clears with the gesture.
+    rt.handle_cursor_moved(cell_pixels(70, 12));
+    let t1 = Instant::now();
+    assert!(rt.end_tiled_drag_at(t1));
+    assert_eq!(
+        rt.animation_progress(AnimationKind::Move, Some(source), t1),
+        Some(0.0),
+        "committed drop must settle, not snap"
+    );
+    assert!(!rt.tiled_drag_active());
+    assert_eq!(rt.tiled_drag_preview(), None);
+    assert_eq!(rt.tiled_drag_drop_spec(), None);
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
+}
+
+#[test]
+fn corner_drop_inserts_balanced_cell() {
+    let mut rt = make_runtime();
+    rt.set_layout(two_pane());
+    rt.handle_cursor_moved(cell_pixels(10, 12));
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Pressed));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(rt.tiled_drag_active());
+    // Top-right corner of the right pane (col 76, row 2): the physically
+    // tall target stacks the dragged pane above it at a balanced half
+    // instead of a position-sized sliver.
+    rt.handle_cursor_moved(cell_pixels(76, 2));
+    assert_eq!(rt.tiled_drag_preview(), Some(ViewId::new(2)));
+    let spec = rt
+        .tiled_drag_drop_spec()
+        .expect("corner hover must plan a drop");
+    assert_eq!(spec.target, ViewId::new(2));
+    assert_eq!(spec.axis, SplitAxis::Vertical);
+    assert!(
+        (spec.ratio - 0.5).abs() < 1e-6,
+        "corner drops split balanced, got {}",
+        spec.ratio
+    );
+    assert!(!spec.after, "top corner docks before");
+    rt.handle_mouse_input(release(MouseButton::Left));
+    assert!(!rt.tiled_drag_active());
+    assert!(!rt.has_selection());
+    assert_eq!(rt.focused_view(), Some(ViewId::new(1)));
+    assert_eq!(rt.tiled_drag_preview(), None);
+    assert_eq!(rt.tiled_drag_drop_spec(), None);
+    // Balanced vertical insert: the dragged pane sits above the target at
+    // half height, both leaves retained exactly once.
+    assert_eq!(rt.layout().split_axis_at(&[]), Some(SplitAxis::Vertical));
+    assert!(
+        (rt.layout().split_ratio_at(&[]).expect("root split") - 0.5).abs() < 1e-6,
+        "corner drop must land balanced"
+    );
+    assert_eq!(rt.layout().leaf_ids(), vec![ViewId::new(1), ViewId::new(2)]);
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
+}
+
+#[test]
+fn esc_cancels_mid_drag_byte_identical_without_selection() {
+    let mut rt = make_runtime();
+    rt.set_layout(two_pane());
+    let before = rt.layout().clone();
+    rt.handle_cursor_moved(cell_pixels(10, 12));
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Pressed));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(rt.tiled_drag_active());
+    // Hover the right pane: preview and drop plan appear mid-drag, tree
+    // untouched.
+    rt.handle_cursor_moved(cell_pixels(60, 12));
+    assert_eq!(rt.tiled_drag_preview(), Some(ViewId::new(2)));
+    assert!(rt.tiled_drag_drop_spec().is_some());
+    assert_eq!(*rt.layout(), before);
+    // Esc cancels the gesture and is consumed (never reaches the shell).
+    let delivered = rt.handle_key_event(named_key(NamedKey::Escape, PressState::Pressed));
+    assert_eq!(delivered, None, "Esc cancel must not reach the PTY");
+    assert!(
+        rt.pending_input().is_empty(),
+        "consumed Esc must leave no input bytes"
+    );
+    assert!(!rt.tiled_drag_active(), "Esc must end the drag");
+    assert_eq!(rt.tiled_drag_preview(), None);
+    assert_eq!(rt.tiled_drag_drop_spec(), None);
+    assert_eq!(
+        *rt.layout(),
+        before,
+        "cancel must restore the pre-drag layout byte-identically"
+    );
+    assert!(!rt.has_selection(), "cancel must not select");
+    // A stale release after the cancel commits nothing either.
+    rt.handle_mouse_input(release(MouseButton::Left));
+    assert_eq!(*rt.layout(), before);
+    assert!(!rt.has_selection());
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
+}
+
+#[test]
+fn esc_without_drag_still_reaches_shell() {
+    // Non-regression guard for the CTX-0475 scope: with no drag active the
+    // same Esc still encodes for the shell.
+    let mut rt = make_runtime();
+    rt.set_layout(two_pane());
+    assert_eq!(
+        rt.handle_key_event(named_key(NamedKey::Escape, PressState::Pressed)),
+        Some(vec![27])
+    );
+    assert!(!rt.tiled_drag_active());
+}
+
+#[test]
+fn cursor_left_cancel_clears_preview_and_repaints() {
+    use bitty_platform::{PlatformEvent, WindowEventKind, WindowId};
+    use std::time::Instant;
+    let mut rt = make_runtime();
+    rt.set_layout(two_pane());
+    let before = rt.layout().clone();
+    rt.handle_cursor_moved(cell_pixels(10, 12));
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Pressed));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    rt.handle_cursor_moved(cell_pixels(60, 12));
+    assert_eq!(rt.tiled_drag_preview(), Some(ViewId::new(2)));
+    assert!(rt.tiled_drag_drop_spec().is_some());
+    rt.handle_platform_event(PlatformEvent::Window {
+        window_id: WindowId::from_raw_public(1),
+        kind: WindowEventKind::CursorLeft,
+    });
+    assert!(!rt.tiled_drag_active(), "leave must cancel the drag");
+    assert_eq!(rt.tiled_drag_preview(), None);
+    assert_eq!(rt.tiled_drag_drop_spec(), None);
+    assert_eq!(*rt.layout(), before, "cancel must not mutate the tree");
+    assert!(
+        rt.tick_at(Instant::now()).is_some(),
+        "cancel must repaint so the ghost outline and highlight clear"
+    );
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
 }
 
 // -- Issue #1710 (CTX-0995) tiled-drag follow-ups -------------------------

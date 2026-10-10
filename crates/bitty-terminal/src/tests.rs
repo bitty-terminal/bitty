@@ -7141,6 +7141,93 @@ fn reap_exited_last_remaining_shell_signals_app_exit() {
 }
 
 #[test]
+#[cfg(unix)]
+fn reap_exited_last_leaf_of_workspace_keeps_workspace_session_less() {
+    require_pty!();
+    // CTX-1044: the reap session-less branch. With two single-panel
+    // workspaces, the active leaf exiting must close the pane session and
+    // leave its tile session-less, never exit the app. The emptied
+    // workspace stays selected and presents safe (erased tile).
+    let maps =
+        bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        maps,
+        SpawnSpec::default(),
+    );
+    assert_eq!(app.runtime.leaf_count(), 1);
+    app.runtime.workspace_new().expect("second workspace opens");
+    assert_eq!(app.runtime.workspace_count(), 2);
+    assert_eq!(app.runtime.active_workspace_index(), 1);
+    assert_eq!(app.runtime.leaf_count(), 1);
+    assert_eq!(app.effective_window_leaf_count(), 2);
+    let active_view = app.runtime.focused_view().expect("active leaf focused");
+
+    let script = write_fake_editor("exit-ws-last", "#!/bin/sh\nexit 0\n");
+    let script_arg = script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell_for_view_in(active_view, script_arg.as_str(), &[], 80, 24, None)
+        .expect("spawn pane shell");
+    assert!(app.runtime.has_pane_session(&active_view));
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut outcome = terminal_app::ShellExitOutcome::NoExit;
+    while std::time::Instant::now() < deadline {
+        let _ = app.poll_pty_pump();
+        outcome = app.reap_exited_shells();
+        if outcome != terminal_app::ShellExitOutcome::NoExit {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    assert_eq!(
+        outcome,
+        terminal_app::ShellExitOutcome::PaneClosed,
+        "exiting last leaf with panels elsewhere must close the pane, never the app"
+    );
+    assert_eq!(app.runtime.workspace_count(), 2, "emptied workspace stays");
+    assert_eq!(
+        app.runtime.active_workspace_index(),
+        1,
+        "emptied workspace stays selected"
+    );
+    assert_eq!(app.runtime.leaf_count(), 1, "workspace keeps its tile");
+    assert_eq!(
+        app.effective_window_leaf_count(),
+        2,
+        "no panel lost window-wide"
+    );
+    assert!(
+        !app.runtime.has_pane_session(&active_view),
+        "exited tile must be session-less"
+    );
+    assert_eq!(
+        app.runtime.focused_view(),
+        Some(active_view),
+        "focus stays in the emptied workspace"
+    );
+
+    // Present path stays safe on the session-less tile (erased, no panic).
+    let _ = app.drive_tick();
+    assert_eq!(app.runtime.workspace_count(), 2);
+    assert_eq!(app.runtime.leaf_count(), 1);
+
+    // The other workspace still holds its panel: switching back proves no
+    // unrelated workspace (or its bookkeeping) died on the reap path.
+    assert!(app.runtime.workspace_switch(0));
+    assert_eq!(app.runtime.leaf_count(), 1);
+    assert!(app.runtime.focused_view().is_some());
+    assert!(app.runtime.workspace_switch(1));
+    assert_eq!(app.runtime.active_workspace_index(), 1);
+    assert_eq!(app.runtime.focused_view(), Some(active_view));
+    let _ = std::fs::remove_file(&script);
+}
+
+#[test]
 fn live_reload_adopts_keymaps_leader_hints_and_opacity_on_the_app() {
     // CTX-0898 (#1522): the app half of a live reload swaps the chrome key
     // table, the Leader binding, and the hint switch, cancels a Leader

@@ -236,6 +236,30 @@ pub const BACKGROUND_FITS: [&str; 5] = ["fill", "fit", "center", "tile", "stretc
 /// defaults to `fill`).
 pub const DEFAULT_BACKGROUND_FIT: &str = "fill";
 
+/// Accepted window background position spellings (CTX-1076, issue #1815
+/// `window.background_position`). CSS `background-position` vocabulary; only
+/// `fit`/`center` letterbox observes it (`fill`/`stretch` cover, `tile`
+/// repeats from the top-left).
+pub const WINDOW_BACKGROUND_POSITIONS: [&str; 9] = [
+    "center",
+    "top-left",
+    "top",
+    "top-right",
+    "left",
+    "right",
+    "bottom-left",
+    "bottom",
+    "bottom-right",
+];
+
+/// Default window background position spelling (CTX-1076: `center`).
+pub const DEFAULT_WINDOW_BACKGROUND_POSITION: &str = "center";
+
+/// Default window background dim factor (CTX-1076
+/// `window.background_opacity`; `1.0` = opaque image, orthogonal to
+/// `window.opacity` whole-window translucency).
+pub const DEFAULT_WINDOW_BACKGROUND_OPACITY: f32 = 1.0;
+
 /// Minimum resolved focused-outline contrast against the background
 /// (RFC-0001 AC-1, `3:1`). Mirrors
 /// `bitty-config` `MIN_OUTLINE_FOCUSED_BACKGROUND_CONTRAST`; `bitty-runtime`
@@ -481,6 +505,27 @@ fn validate_background_fit(fit: &str) -> Result<(), RuntimeError> {
     Ok(())
 }
 
+/// Validates one window background position spelling (CTX-1076).
+fn validate_window_background_position(position: &str) -> Result<(), RuntimeError> {
+    if !WINDOW_BACKGROUND_POSITIONS.contains(&position) {
+        return Err(RuntimeError::InvalidConfig(
+            "window background position must be one of center, top-left, top, \
+             top-right, left, right, bottom-left, bottom, bottom-right",
+        ));
+    }
+    Ok(())
+}
+
+/// Validates one window background dim factor (CTX-1076).
+fn validate_window_background_opacity(opacity: f32) -> Result<(), RuntimeError> {
+    if !(opacity.is_finite() && (0.0..=1.0).contains(&opacity)) {
+        return Err(RuntimeError::InvalidConfig(
+            "window background opacity must be finite within [0.0, 1.0]",
+        ));
+    }
+    Ok(())
+}
+
 /// Maps a Core decoration validation failure to the runtime config error
 /// (CTX-0292), naming the offending property without echoing user content.
 pub(crate) fn decoration_runtime_error(err: bitty_ui::DecorationError) -> RuntimeError {
@@ -691,6 +736,23 @@ pub struct RuntimeConfig {
     /// `decoration.background_image_roots`), deny-by-default. Global-only:
     /// no `views` rule can widen it.
     pub background_image_roots: Vec<String>,
+    /// Window background-image path (CTX-1076, issue #1815
+    /// `window.background_image`). `None` means no window image (the
+    /// allocation-free fast path). Syntax-validated here and resolved against
+    /// [`Self::background_image_roots`] by the `bitty-rich` loader, same
+    /// deny-by-default policy as the decoration image.
+    pub window_background_image: Option<String>,
+    /// Window background fit spelling; always one of [`BACKGROUND_FITS`]
+    /// (default [`DEFAULT_BACKGROUND_FIT`], `fill` = cover).
+    pub window_background_fit: String,
+    /// Window background dim factor (CTX-1076 `window.background_opacity`),
+    /// finite within `[0.0, 1.0]` (default
+    /// [`DEFAULT_WINDOW_BACKGROUND_OPACITY`]).
+    pub window_background_opacity: f32,
+    /// Window background position spelling; always one of
+    /// [`WINDOW_BACKGROUND_POSITIONS`] (default
+    /// [`DEFAULT_WINDOW_BACKGROUND_POSITION`]).
+    pub window_background_position: String,
     /// Resolved terminal palette for `appearance.theme` (CTX-0355): window
     /// background (clear color), default foreground, cursor, selection, and
     /// the 16 ANSI colors.
@@ -845,6 +907,10 @@ impl Default for RuntimeConfig {
             background_image: None,
             background_fit: DEFAULT_BACKGROUND_FIT.to_string(),
             background_image_roots: Vec::new(),
+            window_background_image: None,
+            window_background_fit: DEFAULT_BACKGROUND_FIT.to_string(),
+            window_background_opacity: DEFAULT_WINDOW_BACKGROUND_OPACITY,
+            window_background_position: DEFAULT_WINDOW_BACKGROUND_POSITION.to_string(),
             theme: bitty_render::ThemePalette::default(),
             theme_resolved: false,
             window_padding: DEFAULT_WINDOW_PADDING,
@@ -937,6 +1003,10 @@ impl RuntimeConfig {
             background_image: None,
             background_fit: DEFAULT_BACKGROUND_FIT.to_string(),
             background_image_roots: Vec::new(),
+            window_background_image: None,
+            window_background_fit: DEFAULT_BACKGROUND_FIT.to_string(),
+            window_background_opacity: DEFAULT_WINDOW_BACKGROUND_OPACITY,
+            window_background_position: DEFAULT_WINDOW_BACKGROUND_POSITION.to_string(),
             theme: bitty_render::ThemePalette::default(),
             theme_resolved: false,
             window_padding,
@@ -1116,6 +1186,15 @@ impl RuntimeConfig {
         for root in &self.background_image_roots {
             validate_background_path(root)?;
         }
+        // CTX-1076 (issue #1815): the window background quartet repeats the
+        // same fail-closed bounds; the approved-root policy is shared with
+        // the decoration image (no separate widening surface).
+        if let Some(path) = &self.window_background_image {
+            validate_background_path(path)?;
+        }
+        validate_background_fit(&self.window_background_fit)?;
+        validate_window_background_opacity(self.window_background_opacity)?;
+        validate_window_background_position(&self.window_background_position)?;
         // Issue #1438: paste confirmation timeout must be bounded to prevent
         // indefinite paste-pending state and ensure users have reasonable time to react.
         // Compare the full Duration (not `as_secs()`) so fractional seconds
@@ -1174,6 +1253,15 @@ impl RuntimeConfig {
                 .view_appearance
                 .iter()
                 .any(|rule| rule.background_image.is_some())
+    }
+
+    /// True when a window background image is configured (CTX-1076, issue
+    /// #1815 `window.background_image`). Branch-cheap fast-path predicate
+    /// for the present hot path: `false` must skip all window-image work
+    /// allocation-free, keeping the image-less frame identical to today.
+    #[must_use]
+    pub fn has_window_background_image(&self) -> bool {
+        self.window_background_image.is_some()
     }
 
     /// Resolves one `View`'s background image and fit (CTX-0347,    /// RFC-0001/OQ-042) from the global pair plus every matching per-`View`

@@ -683,6 +683,49 @@ pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                 println!(
                     "{}",
                     check_row(
+                        "window.background_image",
+                        e.window
+                            .background_image
+                            .as_deref()
+                            .map_or(String::from("(unset)"), |v| format!("\"{v}\"")),
+                        &src("window.background_image")
+                    )
+                );
+                println!(
+                    "{}",
+                    check_row(
+                        "window.background_fit",
+                        e.window
+                            .background_fit
+                            .map(|f| f.as_str().to_string())
+                            .unwrap_or_else(|| String::from("(default fill)")),
+                        &src("window.background_fit")
+                    )
+                );
+                println!(
+                    "{}",
+                    check_row(
+                        "window.background_opacity",
+                        e.window
+                            .background_opacity
+                            .map_or(String::from("(default 1.0)"), |v| format!("{v}")),
+                        &src("window.background_opacity")
+                    )
+                );
+                println!(
+                    "{}",
+                    check_row(
+                        "window.background_position",
+                        e.window
+                            .background_position
+                            .map(|p| p.as_str().to_string())
+                            .unwrap_or_else(|| String::from("(default center)")),
+                        &src("window.background_position")
+                    )
+                );
+                println!(
+                    "{}",
+                    check_row(
                         "terminal.scrollback",
                         format!("{}", e.terminal.scrollback),
                         &src("terminal.scrollback")
@@ -1335,6 +1378,15 @@ pub(crate) fn runtime_config_from_effective_for_with_warnings(
         .iter()
         .map(|root| expand_home_path(root))
         .collect::<Result<Vec<_>, String>>()?;
+    // CTX-1076 (issue #1815): `~`-anchored window background paths expand at
+    // the same environment boundary; trust reuses the decoration roots.
+    let window_background_image = match effective.window.background_image.as_deref() {
+        Some(path) => Some(expand_home_path(path)?),
+        None => None,
+    };
+    let window_background_fit = effective.window.resolve_background_fit();
+    let window_background_opacity = effective.window.resolve_background_opacity();
+    let window_background_position = effective.window.resolve_background_position();
     let view_appearance = effective
         .views
         .iter()
@@ -1446,6 +1498,14 @@ pub(crate) fn runtime_config_from_effective_for_with_warnings(
         cfg.background_image = background_image;
         cfg.background_fit = background_fit.as_str().to_string();
         cfg.background_image_roots = background_image_roots;
+        // CTX-1076 (issue #1815): carry the window background image and its
+        // placement (`background_fit` cover/contain/tile vocabulary,
+        // `background_opacity` dim, `background_position`). `Runtime::new`
+        // loads it fail-closed through the same BG-1..BG-5 pipeline.
+        cfg.window_background_image = window_background_image;
+        cfg.window_background_fit = window_background_fit.as_str().to_string();
+        cfg.window_background_opacity = window_background_opacity;
+        cfg.window_background_position = window_background_position.as_str().to_string();
         // CTX-0355: carry the same resolved preset's terminal palette
         // (background/foreground/cursor/selection + 16 ANSI) onto the runtime
         // config so the default-path renderer and clear color follow

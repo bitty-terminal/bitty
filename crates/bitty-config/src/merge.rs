@@ -81,6 +81,10 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "window.opacity"
         | "window.padding"
         | "window.radius_px"
+        | "window.background_image"
+        | "window.background_fit"
+        | "window.background_opacity"
+        | "window.background_position"
         | "terminal.scrollback"
         | "terminal.shell"
         | "terminal.scroll_lines_per_notch"
@@ -526,6 +530,8 @@ fn view_leaf_global_field(leaf: &str) -> Option<&'static str> {
 
 /// Applies one present `views` leaf into the merged slot, honoring the
 /// policy-ownership rules exactly like every other scalar-replace field.
+/// (`window.*`/`decoration.*` background leaves reuse this helper; see the
+/// `views[` gate on the global fallback below.)
 ///
 /// A `SystemPolicy` pin on the matching global `decoration.*` leaf also
 /// protects the `views` leaf: a pinned field stays pinned through all
@@ -555,6 +561,14 @@ fn merge_view_leaf<T: Clone>(
             .policy_fields
             .get(&field)
             .or_else(|| {
+                // The `decoration.*` fallback protects `views[...]` leaves
+                // only (CTX-0343/CTX-0347). `window.*` merges reuse this
+                // helper but own a separate policy namespace, so a
+                // decoration pin must not reject a window setting no window
+                // pin covers; exact-field checks apply there.
+                if !base.starts_with("views[") {
+                    return None;
+                }
                 view_leaf_global_field(leaf).and_then(|global| acc.policy_fields.get(global))
             })
             .cloned();
@@ -603,6 +617,10 @@ const ATTRIBUTED_FIELDS: &[&str] = &[
     "window.opacity",
     "window.padding",
     "window.radius_px",
+    "window.background_image",
+    "window.background_fit",
+    "window.background_opacity",
+    "window.background_position",
     "window",
     "terminal.scrollback",
     "terminal.shell",
@@ -1003,6 +1021,51 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
                     MergeClass::ScalarReplace,
                 );
             }
+            // CTX-1076 (issue #1815): window background leaves follow the
+            // same "unset says nothing" scalar-replace rule as the decoration
+            // background pair; absent keys never shadow a lower layer.
+            let mut window_acc = MergeAccumulators {
+                policy_fields: &mut policy_fields,
+                attribution: &mut attribution,
+                conflicts: &mut conflicts,
+                policy_violations: &mut policy_violations,
+            };
+            merge_view_leaf(
+                win.background_image.as_ref(),
+                &mut effective.window.background_image,
+                "window",
+                "background_image",
+                src,
+                is_policy,
+                &mut window_acc,
+            );
+            merge_view_leaf(
+                win.background_fit.as_ref(),
+                &mut effective.window.background_fit,
+                "window",
+                "background_fit",
+                src,
+                is_policy,
+                &mut window_acc,
+            );
+            merge_view_leaf(
+                win.background_opacity.as_ref(),
+                &mut effective.window.background_opacity,
+                "window",
+                "background_opacity",
+                src,
+                is_policy,
+                &mut window_acc,
+            );
+            merge_view_leaf(
+                win.background_position.as_ref(),
+                &mut effective.window.background_position,
+                "window",
+                "background_position",
+                src,
+                is_policy,
+                &mut window_acc,
+            );
             attribution.insert("window".to_string(), src.clone());
         }
 
@@ -2518,6 +2581,51 @@ fn merge_layers_allow_policy_violations(
                     MergeClass::ScalarReplace,
                 );
             }
+            // CTX-1076 (issue #1815): window background leaves follow the
+            // same "unset says nothing" scalar-replace rule as the decoration
+            // background pair; absent keys never shadow a lower layer.
+            let mut window_acc = MergeAccumulators {
+                policy_fields: &mut policy_fields,
+                attribution: &mut attribution,
+                conflicts: &mut conflicts,
+                policy_violations: &mut policy_violations,
+            };
+            merge_view_leaf(
+                win.background_image.as_ref(),
+                &mut effective.window.background_image,
+                "window",
+                "background_image",
+                src,
+                is_policy,
+                &mut window_acc,
+            );
+            merge_view_leaf(
+                win.background_fit.as_ref(),
+                &mut effective.window.background_fit,
+                "window",
+                "background_fit",
+                src,
+                is_policy,
+                &mut window_acc,
+            );
+            merge_view_leaf(
+                win.background_opacity.as_ref(),
+                &mut effective.window.background_opacity,
+                "window",
+                "background_opacity",
+                src,
+                is_policy,
+                &mut window_acc,
+            );
+            merge_view_leaf(
+                win.background_position.as_ref(),
+                &mut effective.window.background_position,
+                "window",
+                "background_position",
+                src,
+                is_policy,
+                &mut window_acc,
+            );
             attribution.insert("window".to_string(), src.clone());
         }
         if let Some(term) = &plan.terminal {
@@ -5573,6 +5681,7 @@ mod tests {
                     padding: 8,
                     radius_px: 12,
                     blur_radius: 0,
+                    ..Default::default()
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -5592,6 +5701,7 @@ mod tests {
                     padding: 8,
                     radius_px: 6,
                     blur_radius: 0,
+                    ..Default::default()
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -5605,6 +5715,7 @@ mod tests {
                     padding: 8,
                     radius_px: 12,
                     blur_radius: 0,
+                    ..Default::default()
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -5627,6 +5738,176 @@ mod tests {
         assert_eq!(
             merged3.source_of("window.radius_px").unwrap().layer,
             LayerKind::CoreDefaults
+        );
+    }
+
+    #[test]
+    fn window_background_merges_says_nothing_with_attribution() {
+        // CTX-1076 (issue #1815): window background leaves are scalar-replace
+        // with "unset says nothing" semantics; absent keys never shadow a
+        // lower layer, and empty stacks keep no image with core-defaults
+        // source.
+        use crate::types::{BackgroundFit, BackgroundPosition};
+        // Portable absolute fixture (`/wall/...` is not absolute on
+        // Windows); `temp_dir()` is absolute on every host.
+        let wall = std::env::temp_dir()
+            .join("wall-one.png")
+            .display()
+            .to_string();
+        let user = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                window: Some(WindowConfig {
+                    opacity: 1.0,
+                    padding: 8,
+                    radius_px: 0,
+                    blur_radius: 0,
+                    background_image: Some(wall.clone()),
+                    background_fit: Some(BackgroundFit::Tile),
+                    background_opacity: Some(0.5),
+                    background_position: Some(BackgroundPosition::TopLeft),
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged = merge_layers(vec![user]).expect("merge");
+        assert_eq!(
+            merged.effective.window.background_image.as_deref(),
+            Some(wall.as_str())
+        );
+        assert_eq!(
+            merged.effective.window.background_fit,
+            Some(BackgroundFit::Tile)
+        );
+        assert_eq!(
+            merged.source_of("window.background_image").unwrap().layer,
+            LayerKind::User
+        );
+        // Higher layer setting only fit leaves the inherited image in place.
+        let cli = LayeredPlan::new(
+            ConfigSource::new(LayerKind::Cli, Some("cli")),
+            ConfigPlan {
+                window: Some(WindowConfig {
+                    opacity: 1.0,
+                    padding: 8,
+                    radius_px: 0,
+                    blur_radius: 0,
+                    background_image: None,
+                    background_fit: Some(BackgroundFit::Fit),
+                    background_opacity: None,
+                    background_position: None,
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let user2 = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                window: Some(WindowConfig {
+                    opacity: 1.0,
+                    padding: 8,
+                    radius_px: 0,
+                    blur_radius: 0,
+                    background_image: Some(wall.clone()),
+                    background_fit: Some(BackgroundFit::Tile),
+                    background_opacity: Some(0.5),
+                    background_position: Some(BackgroundPosition::TopLeft),
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged2 = merge_layers(vec![user2, cli]).expect("merge");
+        assert_eq!(
+            merged2.effective.window.background_image.as_deref(),
+            Some(wall.as_str()),
+            "absent image says nothing"
+        );
+        assert_eq!(
+            merged2.effective.window.background_fit,
+            Some(BackgroundFit::Fit),
+            "present fit wins"
+        );
+        assert_eq!(
+            merged2.source_of("window.background_fit").unwrap().layer,
+            LayerKind::Cli
+        );
+        assert_eq!(
+            merged2.source_of("window.background_image").unwrap().layer,
+            LayerKind::User
+        );
+        let merged3 = merge_layers(vec![]).expect("empty layers merge");
+        assert_eq!(merged3.effective.window.background_image, None);
+        assert_eq!(
+            merged3.source_of("window.background_image").unwrap().layer,
+            LayerKind::CoreDefaults
+        );
+    }
+
+    #[test]
+    fn window_background_ignores_decoration_policy_pin() {
+        // CTX-1076: `window.*` merges reuse `merge_view_leaf`, but the
+        // `decoration.*` global fallback exists only to protect `views[...]`
+        // leaves (CTX-0343/CTX-0347). A policy pin on
+        // `decoration.background_image`/`background_fit` must not reject a
+        // user `window.*` setting no window pin covers.
+        use crate::types::{BackgroundFit, DecorationConfig};
+        let wall = std::env::temp_dir()
+            .join("wall-two.png")
+            .display()
+            .to_string();
+        let policy = LayeredPlan::new(
+            ConfigSource::new(LayerKind::SystemPolicy, Some("policy.lua")),
+            ConfigPlan {
+                decoration: Some(DecorationConfig {
+                    background_image: Some("~/policy-wall.png".to_string()),
+                    background_fit: Some(BackgroundFit::Center),
+                    ..Default::default()
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let user = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                window: Some(WindowConfig {
+                    opacity: 1.0,
+                    padding: 8,
+                    radius_px: 0,
+                    blur_radius: 0,
+                    background_image: Some(wall.clone()),
+                    background_fit: Some(BackgroundFit::Tile),
+                    ..Default::default()
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged = try_merge_layers(vec![user, policy]).expect("merge");
+        assert!(
+            merged.policy_violations.is_empty(),
+            "decoration pin must not block window.*: {:?}",
+            merged.policy_violations
+        );
+        assert_eq!(
+            merged.effective.window.background_image.as_deref(),
+            Some(wall.as_str())
+        );
+        assert_eq!(
+            merged.effective.window.background_fit,
+            Some(BackgroundFit::Tile)
+        );
+        // The decoration pin itself still holds on the global leaves.
+        assert_eq!(
+            merged.effective.decoration.background_image.as_deref(),
+            Some("~/policy-wall.png")
+        );
+        assert_eq!(
+            merged.effective.decoration.background_fit,
+            Some(BackgroundFit::Center)
         );
     }
 

@@ -134,6 +134,10 @@ fn runtime_adopts(field: &str) -> bool {
             | "window.opacity"
             | "window.padding"
             | "window.radius_px"
+            | "window.background_image"
+            | "window.background_fit"
+            | "window.background_opacity"
+            | "window.background_position"
             | "decoration.gaps_in"
             | "decoration.gaps_out"
             | "decoration.border"
@@ -385,8 +389,12 @@ pub(crate) fn apply_live_presentation(
             resolved.background_image,
             resolved.background_fit,
             resolved.background_image_roots,
+            resolved.window_background_image,
+            resolved.window_background_fit,
+            resolved.window_background_opacity,
+            resolved.window_background_position,
         )
-        .map_err(|err| format!("decoration.background: {err}"))?;
+        .map_err(|err| format!("background: {err}"))?;
     runtime.set_animations(resolved.animations);
     runtime
         .set_window_padding(effective.window.padding)
@@ -832,6 +840,15 @@ mod tests {
         all.window.opacity = 0.5;
         all.window.padding = base.window.padding + 1;
         all.window.radius_px = base.window.radius_px + 1;
+        all.window.background_image = Some(
+            std::env::temp_dir()
+                .join("bitty-wall.png")
+                .display()
+                .to_string(),
+        );
+        all.window.background_fit = Some(bitty_config::types::BackgroundFit::Tile);
+        all.window.background_opacity = Some(0.5);
+        all.window.background_position = Some(bitty_config::types::BackgroundPosition::TopLeft);
         all.appearance.theme = Some(String::from("dracula"));
         all.mod_key = bitty_config::ModKey::Super;
         all.leader_timeout_ms = Some(2_000);

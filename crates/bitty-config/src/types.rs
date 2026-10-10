@@ -1560,6 +1560,14 @@ pub const DEFAULT_WINDOW_BLUR_RADIUS: u32 = 0;
 /// Bounds untrusted input; larger values fail closed.
 pub const MAX_WINDOW_BLUR_RADIUS: u32 = 128;
 
+/// Default `window.background_opacity` (CTX-1076, issue #1815): `1.0`.
+///
+/// The window background image paints fully opaque by default; lower values
+/// dim it (multiply its alpha) so grid text stays readable over busy images.
+/// `window.opacity` (the whole-window translucency) is orthogonal and
+/// unchanged.
+pub const DEFAULT_WINDOW_BACKGROUND_OPACITY: f32 = 1.0;
+
 /// Default window padding in logical pixels (CTX-0223).
 ///
 /// 8px keeps ghostty/alacritty-class breathing room between the grid and the
@@ -2104,6 +2112,77 @@ impl FontConfig {
     }
 }
 
+/// Window background-image position (CTX-1076, issue #1815).
+///
+/// Controls where a letterboxed image sits inside the window when the fit
+/// leaves empty bands (`fit`/`center` only): `fill`/`stretch` cover the whole
+/// window so position is ignored, and `tile` repeats from the top-left so it
+/// is ignored there too. CSS `background-position` vocabulary, nine closed
+/// values; unknown spellings fail closed, never guessed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum BackgroundPosition {
+    /// Centered both axes (default).
+    #[default]
+    Center,
+    /// Top-left corner.
+    TopLeft,
+    /// Top edge, horizontally centered.
+    Top,
+    /// Top-right corner.
+    TopRight,
+    /// Left edge, vertically centered.
+    Left,
+    /// Right edge, vertically centered.
+    Right,
+    /// Bottom-left corner.
+    BottomLeft,
+    /// Bottom edge, horizontally centered.
+    Bottom,
+    /// Bottom-right corner.
+    BottomRight,
+}
+
+impl BackgroundPosition {
+    /// Parses a canonical position name (exact, case-sensitive).
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "center" => Some(Self::Center),
+            "top-left" => Some(Self::TopLeft),
+            "top" => Some(Self::Top),
+            "top-right" => Some(Self::TopRight),
+            "left" => Some(Self::Left),
+            "right" => Some(Self::Right),
+            "bottom-left" => Some(Self::BottomLeft),
+            "bottom" => Some(Self::Bottom),
+            "bottom-right" => Some(Self::BottomRight),
+            _ => None,
+        }
+    }
+
+    /// Canonical config spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Center => "center",
+            Self::TopLeft => "top-left",
+            Self::Top => "top",
+            Self::TopRight => "top-right",
+            Self::Left => "left",
+            Self::Right => "right",
+            Self::BottomLeft => "bottom-left",
+            Self::Bottom => "bottom",
+            Self::BottomRight => "bottom-right",
+        }
+    }
+}
+
+impl std::fmt::Display for BackgroundPosition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Window presentation configuration.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowConfig {
@@ -2117,6 +2196,29 @@ pub struct WindowConfig {
     /// Background blur radius in logical pixels `0..=128` (CTX-0832).
     /// Platform support varies: Wayland (KDE/Hyprland), macOS NSVisualEffectView.
     pub blur_radius: u32,
+    /// Window background image path (CTX-1076, issue #1815
+    /// `window.background_image`). `None` means no image (the allocation-free
+    /// fast path) or, per layer, "this layer says nothing". Syntax-validated
+    /// only (absolute or `~`-anchored, `<= 4096` bytes, no NUL); root trust,
+    /// format, decode, and cache bounds reuse the `decoration` loader policy
+    /// (`decoration.background_image_roots`, deny-by-default).
+    pub background_image: Option<String>,
+    /// Window background fit mode (CTX-1076 `window.background_fit`).
+    /// `None` resolves to `fill` (cover). `fill` covers the window (crop
+    /// overflow), `fit` contains it (letterbox), `tile` repeats native size
+    /// from the top-left, `center` paints native size once, `stretch`
+    /// scales non-uniformly.
+    pub background_fit: Option<BackgroundFit>,
+    /// Window background dim factor (CTX-1076 `window.background_opacity`),
+    /// finite within `[0.0, 1.0]`. `None` resolves to `1.0` (opaque image).
+    /// Multiplies the decoded image alpha at raster time so text stays
+    /// readable; orthogonal to `window.opacity` (whole-window translucency).
+    pub background_opacity: Option<f32>,
+    /// Window background position (CTX-1076 `window.background_position`).
+    /// `None` resolves to `center`. Only `fit`/`center` letterbox, so only
+    /// they observe it; `fill`/`stretch`/`tile` ignore it (documented, never
+    /// an error).
+    pub background_position: Option<BackgroundPosition>,
 }
 
 impl Default for WindowConfig {
@@ -2126,6 +2228,10 @@ impl Default for WindowConfig {
             padding: DEFAULT_WINDOW_PADDING,
             radius_px: DEFAULT_WINDOW_RADIUS_PX,
             blur_radius: DEFAULT_WINDOW_BLUR_RADIUS,
+            background_image: None,
+            background_fit: None,
+            background_opacity: None,
+            background_position: None,
         }
     }
 }
@@ -2157,7 +2263,47 @@ impl WindowConfig {
                 format!("must be <= {MAX_WINDOW_BLUR_RADIUS}"),
             ));
         }
+        if let Some(path) = &self.background_image {
+            validate_background_image_path("window.background_image", path)?;
+        }
+        if let Some(opacity) = self.background_opacity {
+            if !(opacity.is_finite() && (0.0..=1.0).contains(&opacity)) {
+                return Err(ConfigError::validation(
+                    "window.background_opacity",
+                    "must be finite within [0.0, 1.0]",
+                ));
+            }
+        }
         Ok(())
+    }
+
+    /// Resolves the window background fit mode (default `fill`/cover).
+    #[must_use]
+    pub fn resolve_background_fit(&self) -> BackgroundFit {
+        self.background_fit.unwrap_or(BackgroundFit::Fill)
+    }
+
+    /// Resolves the window background dim factor (default `1.0` = opaque).
+    #[must_use]
+    pub fn resolve_background_opacity(&self) -> f32 {
+        self.background_opacity
+            .unwrap_or(DEFAULT_WINDOW_BACKGROUND_OPACITY)
+    }
+
+    /// Resolves the window background position (default `center`).
+    #[must_use]
+    pub fn resolve_background_position(&self) -> BackgroundPosition {
+        self.background_position
+            .unwrap_or(BackgroundPosition::Center)
+    }
+
+    /// Whether a window background image contributes (`background_image` set).
+    ///
+    /// Branch-cheap fast-path predicate for the present hot path: `false`
+    /// must skip all image work allocation-free.
+    #[must_use]
+    pub fn has_background_image(&self) -> bool {
+        self.background_image.is_some()
     }
 }
 
@@ -4423,6 +4569,66 @@ mod tests {
         }
         .validate()
         .unwrap_err();
+    }
+
+    #[test]
+    fn window_background_validation() {
+        // CTX-1076 (issue #1815): image path syntax, opacity bounds, and the
+        // closed fit/position enums fail closed; defaults resolve to
+        // fill/1.0/center with no image (allocation-free fast path).
+        assert_eq!(WindowConfig::default().background_image, None);
+        assert!(!WindowConfig::default().has_background_image());
+        assert_eq!(
+            WindowConfig::default().resolve_background_fit(),
+            BackgroundFit::Fill
+        );
+        assert!((WindowConfig::default().resolve_background_opacity() - 1.0).abs() < f32::EPSILON);
+        assert_eq!(
+            WindowConfig::default().resolve_background_position(),
+            BackgroundPosition::Center
+        );
+        // Portable absolute fixture: `/wall/...` is not absolute on
+        // Windows (`Path::is_absolute` needs a drive/UNC prefix there), so
+        // build it from `temp_dir()` which is absolute on every host.
+        let abs_wall = std::env::temp_dir()
+            .join("wall")
+            .join("one.png")
+            .display()
+            .to_string();
+        WindowConfig {
+            background_image: Some(abs_wall),
+            background_fit: Some(BackgroundFit::Tile),
+            background_opacity: Some(0.5),
+            background_position: Some(BackgroundPosition::TopLeft),
+            ..Default::default()
+        }
+        .validate()
+        .expect("valid window background");
+        for bad in [
+            WindowConfig {
+                background_image: Some("relative/one.png".to_string()),
+                ..Default::default()
+            },
+            WindowConfig {
+                background_image: Some(String::new()),
+                ..Default::default()
+            },
+            WindowConfig {
+                background_opacity: Some(2.0),
+                ..Default::default()
+            },
+            WindowConfig {
+                background_opacity: Some(f32::NAN),
+                ..Default::default()
+            },
+        ] {
+            bad.validate().unwrap_err();
+        }
+        assert_eq!(
+            BackgroundPosition::parse("center"),
+            Some(BackgroundPosition::Center)
+        );
+        assert_eq!(BackgroundPosition::parse("cover"), None);
     }
 
     #[test]

@@ -1461,6 +1461,106 @@ impl Runtime {
                 built.glyphs.extend(glyphs);
             }
 
+            // CTX-1076 (issue #1815): the window background image paints
+            // behind the grid (whole window, including the padding band),
+            // below per-`View` backgrounds, overlay fills, and glyphs. The
+            // decode already happened at config reconcile; this path is a
+            // pure cache lookup plus a bounded nearest-neighbor scale. Per-View
+            // blits are admitted first above, and the window blit is prepended
+            // only when frame capacity and byte budget remain, sharing the BG-7
+            // budget (32 blits / 64 MiB) so a hostile config can never allocate
+            // beyond the accepted present bound. Resolution is skipped entirely
+            // when no window image is configured
+            // (`has_window_background_image`), and when the sanitized opacity
+            // is zero (fully transparent: no visual effect), keeping the common
+            // image-less frame free of any resolve or allocation.
+            if self.config.has_window_background_image() {
+                let opacity = bitty_render::window::sanitize_window_background_opacity(
+                    self.config.window_background_opacity,
+                );
+                if opacity > 0.0 {
+                    if let Some(path) = self.config.window_background_image.as_deref() {
+                        if let Some(key) = self.background_keys.get(path).cloned() {
+                            if let Some(image) = self.backgrounds.get(&key) {
+                                let window_extent = self
+                                    .surface
+                                    .extent()
+                                    .unwrap_or_else(|| self.config.window_extent());
+                                if window_extent.width() > 0 && window_extent.height() > 0 {
+                                    let outer = bitty_rich::RectPx::new(
+                                        0,
+                                        0,
+                                        window_extent.width(),
+                                        window_extent.height(),
+                                    );
+                                    let fit = bitty_rich::BackgroundFit::parse(
+                                        &self.config.window_background_fit,
+                                    )
+                                    .unwrap_or_default();
+                                    let raster_key = bitty_rich::BackgroundRasterKey {
+                                        source: bitty_rich::BackgroundRasterKeySource::from(&key),
+                                        fit,
+                                        dest: outer,
+                                        dpi_bits: self.scale_factor.get().to_bits(),
+                                    };
+                                    if let Some(blit) =
+                                        self.background_rasters.get_or_rasterize(raster_key, &image)
+                                    {
+                                        let position =
+                                            bitty_render::window::WindowBackgroundPosition::parse(
+                                                &self.config.window_background_position,
+                                            )
+                                            .unwrap_or_default();
+                                        let outer_render = bitty_render::geometry::RectPx::new(
+                                            0,
+                                            0,
+                                            window_extent.width(),
+                                            window_extent.height(),
+                                        );
+                                        let inner_render = bitty_render::geometry::RectPx::new(
+                                            blit.dest.x,
+                                            blit.dest.y,
+                                            blit.dest.width,
+                                            blit.dest.height,
+                                        );
+                                        let positioned =
+                                            bitty_render::window::reposition_window_background(
+                                                &outer_render,
+                                                &inner_render,
+                                                position,
+                                            );
+                                        let mut rgba = blit.rgba.clone();
+                                        bitty_render::window::dim_rgba_alpha(&mut rgba, opacity);
+                                        let bytes = u64::from(positioned.width)
+                                            .saturating_mul(u64::from(positioned.height))
+                                            .saturating_mul(4)
+                                            as usize;
+                                        if built.backgrounds.len()
+                                            < bitty_rich::BG_PRESENT_MAX_BLITS_PER_FRAME
+                                            && built.background_bytes.saturating_add(bytes)
+                                                <= bitty_rich::BG_PRESENT_MAX_BYTES_PER_FRAME
+                                        {
+                                            if let Ok(entry) =
+                                                bitty_render::grid::ImageBlit::try_new(
+                                                    positioned, rgba,
+                                                )
+                                            {
+                                                built.background_bytes =
+                                                    built.background_bytes.saturating_add(bytes);
+                                                // Prepend behind the per-View
+                                                // blits admitted above.
+                                                built.backgrounds.insert(0, entry);
+                                                built.needs_draw = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // CTX-0979: Core draws no workspace display; only plugin bands
             // paint (their own pass below). No Core bar paint here.
 

@@ -701,19 +701,16 @@ impl Runtime {
         })
     }
 
-    /// Paints the deferred focused-cursor overlay (CTX-0386) and arms the
-    /// platform-IME caret rect (CTX-0367). The fill lands in the CTX-0347
-    /// overlay layer so it stays visible above a per-`View` background image.
-    /// A no-op when the window lost focus; the cursor never leaves a stale
-    /// fill because it is not part of any retained leaf list. Returns whether
-    /// a fill was pushed.
-    fn paint_cursor(
-        &mut self,
-        paint: &CursorPaint,
-        combined_overlay: &mut Vec<bitty_render::grid::FillRect>,
-    ) -> bool {
+    /// Arms the platform-IME caret rect for the deferred focused cursor
+    /// (CTX-0367). Split verbatim out of the pre-S7 `paint_cursor` under
+    /// #1849 S7 so the caret stays armed before the overlay phase —
+    /// the inline preedit overlay and the OS candidate window both anchor
+    /// here — while the cursor fill itself paints after the kitty image
+    /// layer. A no-op when the window lost focus; like the fill, the caret
+    /// tracks the focused leaf only.
+    fn arm_ime_caret(&mut self, paint: &CursorPaint) {
         if !self.focused {
-            return false;
+            return;
         }
         let live = self.live_cell_metrics();
         // CTX-0367: arm the platform-IME caret rect (window-relative
@@ -730,9 +727,38 @@ impl Runtime {
             },
             cells_available: paint.cells_available,
         });
+    }
+
+    /// Paints the deferred focused-cursor overlay after the kitty image
+    /// layer (#1849 S7 cursor-on-top). The fill lands in the CTX-0347
+    /// overlay layer so it stays visible above a per-`View` background
+    /// image, and the same rect is cleared out of every covering kitty
+    /// blit below so the cursor wins over images regardless of image z on
+    /// the focused leaf. A no-op when the window lost focus; the cursor
+    /// never leaves a stale fill because it is not part of any retained
+    /// leaf list. Returns whether a fill was pushed.
+    ///
+    /// Layer contract (S7): kitty blits keep their 32-blit / 64-MiB
+    /// per-frame budget, and the cursor overlay is not counted in it — the
+    /// only cursor cost is the pre-existing 1-cell overlay fill (no new
+    /// allocation; the punch zeroes owned blit bytes in place). Selection,
+    /// banner, scrollbar, and hint fills keep their overlay order under
+    /// the kitty layer; only the focused cursor is topmost. The unfocused
+    /// leaf is unchanged: `CursorPaint` is built for the focused leaf
+    /// only, and the window-focus gate below matches the pre-S7 behavior.
+    fn paint_cursor_on_top(
+        &mut self,
+        paint: &CursorPaint,
+        combined_overlay: &mut Vec<bitty_render::grid::FillRect>,
+        combined_images: &mut [bitty_render::grid::ImageBlit],
+    ) -> bool {
+        if !self.focused {
+            return false;
+        }
         if paint.on_spacer {
             return false;
         }
+        let live = self.live_cell_metrics();
         // DECSCUSR shape comes from the shared render primitive
         // (`bitty_render::grid::cursor_fill`: block = full cell, bar = left
         // strip, underline = bottom strip, 15% thickness per DEC-0017
@@ -757,6 +783,11 @@ impl Runtime {
                 fill.rect.width,
                 fill.rect.height,
             );
+            // S7: the compositor blends kitty blits after overlay fills, so
+            // the fill alone cannot win. Clear the identical rect out of
+            // every covering blit (all image z orders); the overlay fill
+            // then shows through the transparent window.
+            Self::punch_cursor_from_kitty_images(combined_images, rect);
             combined_overlay.push(bitty_render::grid::FillRect {
                 rect,
                 color: themed,
@@ -764,6 +795,56 @@ impl Runtime {
             return true;
         }
         false
+    }
+
+    /// Clears `cursor` out of every kitty blit it overlaps (#1849 S7).
+    ///
+    /// Zeroes the intersecting bytes of the owned blit buffers in place:
+    /// no allocation beyond the pre-existing 1-cell cursor fill, and the
+    /// per-frame 32-blit / 64-MiB budget is untouched (counts were already
+    /// latched at budget enforcement). All arithmetic is `i64` with
+    /// saturation (CTX-0253 F4): blit and cursor origins may be negative
+    /// and hostile cell metrics must never wrap the products. A zero-span
+    /// cursor punches nothing. The punch window is the exact rect pushed
+    /// as the overlay fill, so fill and hole can never disagree.
+    fn punch_cursor_from_kitty_images(
+        images: &mut [bitty_render::grid::ImageBlit],
+        cursor: bitty_render::geometry::RectPx,
+    ) {
+        if cursor.width == 0 || cursor.height == 0 {
+            return;
+        }
+        let cursor_left = i64::from(cursor.x);
+        let cursor_top = i64::from(cursor.y);
+        let cursor_right = cursor_left.saturating_add(i64::from(cursor.width));
+        let cursor_bottom = cursor_top.saturating_add(i64::from(cursor.height));
+        for blit in images.iter_mut() {
+            let blit_left = i64::from(blit.dest.x);
+            let blit_top = i64::from(blit.dest.y);
+            let blit_right = blit_left.saturating_add(i64::from(blit.dest.width));
+            let blit_bottom = blit_top.saturating_add(i64::from(blit.dest.height));
+            let left = cursor_left.max(blit_left);
+            let top = cursor_top.max(blit_top);
+            let right = cursor_right.min(blit_right);
+            let bottom = cursor_bottom.min(blit_bottom);
+            if right <= left || bottom <= top {
+                continue;
+            }
+            // Blit-local window: the intersection lies inside the blit
+            // extent, so the differences are non-negative and fit `usize`.
+            let local_left = (left - blit_left) as usize;
+            let local_top = (top - blit_top) as usize;
+            let local_bottom = (bottom - blit_top) as usize;
+            let punch_width = (right - left) as usize;
+            let stride = blit.dest.width as usize * 4;
+            for row in local_top..local_bottom {
+                let start = row * stride + local_left * 4;
+                let end = start + punch_width * 4;
+                if let Some(span) = blit.rgba.get_mut(start..end) {
+                    span.fill(0);
+                }
+            }
+        }
     }
 
     /// Tick with an explicit wall clock (CTX-0192 virtual-clock seam).
@@ -787,13 +868,25 @@ impl Runtime {
         }
         let basis = self.collect_tick_basis(now)?;
         let mut layers = self.build_leaf_primitives(&basis, now);
-        if let Some(paint) = layers.cursor.take() {
-            layers.any_needs_draw |= self.paint_cursor(&paint, &mut layers.combined_overlay);
+        // #1849 S7: arm the IME caret before the overlay phase (the
+        // preedit overlay anchors here), but paint the cursor fill after
+        // the kitty image layer so the focused cursor wins over covering
+        // images regardless of image z.
+        let cursor = layers.cursor.take();
+        if let Some(ref paint) = cursor {
+            self.arm_ime_caret(paint);
         }
         self.paint_frame_overlays(&basis, now, &mut layers);
         self.paint_chrome_bands(basis.pad_px, &mut layers);
         self.paint_plugin_overlay(&basis.allocations, basis.pad_px, &mut layers);
         self.paint_kitty_images(&basis, &mut layers);
+        if let Some(paint) = cursor {
+            layers.any_needs_draw |= self.paint_cursor_on_top(
+                &paint,
+                &mut layers.combined_overlay,
+                &mut layers.combined_images,
+            );
+        }
         if self.reject_stale_atlas_frame(&layers) {
             return None;
         }
@@ -1606,7 +1699,9 @@ impl Runtime {
     /// confirmation banners, the help panel, the scrollbar thumb, then the
     /// Leader hint overlay. The hint overlay paints last so its label pills
     /// stay above grid chrome while armed (issue #1344). The
-    /// kitty image layer is painted afterwards by [`Self::paint_kitty_images`].
+    /// kitty image layer is painted afterwards by [`Self::paint_kitty_images`],
+    /// and the focused cursor after that by [`Self::paint_cursor_on_top`]
+    /// (#1849 S7 cursor-on-top).
     fn paint_frame_overlays(
         &mut self,
         basis: &TickBasis,
@@ -2550,11 +2645,17 @@ impl Runtime {
 
     /// Phase 5 (CTX-0474): the CTX-0248/0252/0254 kitty image layer.
     ///
-    /// Topmost per-pane blits for all visible allocations, budget-checked before
+    /// Per-pane blits for all visible allocations, budget-checked before
     /// rasterizing and clipped to each pane's content rectangle. Placements are
     /// skipped while a view inspects scrollback. Unfocused panes retain and
     /// display their own Kitty images without disappearing on focus switch.
     /// Alternate-screen entry clears only the entering origin (`clear_origin`).
+    ///
+    /// #1849 S7: blits composite above cells, text, and overlay fills, but
+    /// below the focused cursor — [`Self::paint_cursor_on_top`] runs after
+    /// this phase and clears the cursor rect out of every covering blit, so
+    /// the cursor wins regardless of image z. The 32-blit / 64-MiB budget
+    /// counts kitty blits only; the cursor overlay is never counted.
     ///
     /// Raster is the Core-owned uncached nearest-neighbor step
     /// ([`bitty_rich::rasterize_kitty_clipped`]; the extension holds its own

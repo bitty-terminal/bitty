@@ -25,9 +25,15 @@
 //!   verified before anything is staged, added capabilities need the same
 //!   consent, and the atomic `current.json` pointer is switched last. The
 //!   runtime then discovers and activates the package as a visibly
-//!   unverified third-party (`local-path`) source. Remote (`git`) sources
-//!   fail closed with a clear message and land with the package-manager
-//!   follow-up.
+//!   unverified third-party (`local-path`) source. `install <git-url>`
+//!   clones a `https://<host>/<path>.git`, `git+https://…`, or
+//!   `git@<host>:<path>` source with fixed-argv system `git` into an
+//!   exclusive temp staging dir and then runs the same local-path pipeline
+//!   unchanged. `install <archive>` unpacks a local `.tar.gz`/`.tgz`/
+//!   `.tar.zst`/`.zip` file with fixed-argv system `tar`/`unzip` into the
+//!   same kind of staging and then runs the same pipeline. Unsupported
+//!   schemes (`file://`, `http://`, `ssh://`, …) fail closed with a naming
+//!   diagnostic.
 //! - `remove <id> --force` is destructive: bundled records lose their managed
 //!   entry with `bitty-plugins.toml.bak` kept; installed packages delete their
 //!   store record and staged tree. `enable`/`disable` are idempotent toggles
@@ -70,12 +76,16 @@
 //! # Exit codes (stable taxonomy, cli-contract-rfc.md)
 //!
 //! - `0` success (including idempotent no-op toggles).
-//! - `1` aborted consent (declined/EOF), filesystem failure after approval.
+//! - `1` aborted consent (declined/EOF), filesystem failure after approval,
+//!   missing fetch helper (`git`/`tar`/`unzip`), `git clone` failure, or
+//!   archive unpack failure (nothing staged).
 //! - `2` usage error (missing/unknown verb, missing `<id>`, unknown flag,
 //!   bad `--format`, stray `--`, malformed plugin id, destructive `remove`
 //!   without `--force`, `--yes`/`--force`/`--format` on the wrong verb).
 //! - `4` plugin error (unknown/non-bundled id, invalid or corrupt managed
-//!   manifest, pin mismatch, uncovered grant, blocked capability increase).
+//!   manifest, pin mismatch, uncovered grant, blocked capability increase,
+//!   rejected fetch scheme such as `file://`/`http://`/`ssh://`, malformed
+//!   git URL, hostile archive member).
 //!
 //! # Bounds (fail closed before any filesystem mutation)
 //!
@@ -472,6 +482,8 @@ pub fn plugin_usage() -> String {
     "usage: bitty plugin list [--format table|json|jsonl] [--no-color]\n\
      \x20      bitty plugin install <id> [--yes]\n\
      \x20      bitty plugin install <path> [--yes]   (local directory package)\n\
+     \x20      bitty plugin install <git-url> [--yes]   (https://<host>/<path>.git | git+https://... | git@<host>:<path>)\n\
+     \x20      bitty plugin install <archive> [--yes]   (.tar.gz/.tgz/.tar.zst/.zip file)\n\
      \x20      bitty plugin remove <id> --force\n\
      \x20      bitty plugin enable <id>\n\
      \x20      bitty plugin disable <id>\n\
@@ -482,6 +494,8 @@ pub fn plugin_usage() -> String {
      (fallback ~/.config/bitty/...), or beside an explicit --config path.\n\
      External packages install into $XDG_DATA_HOME/bitty/plugins (fallback\n\
      ~/.local/share/bitty/plugins). No plugin code runs during any operation.\n\
+     Exit codes: 0 success | 1 aborted/io (consent, helper, clone, unpack) |\n\
+     2 usage | 4 plugin error (id, scheme, validation).\n\
      `bitty plugin --help` explains capabilities, consent, and exit codes."
         .to_string()
 }
@@ -507,6 +521,28 @@ pub fn plugin_help_text() -> String {
      \x20                             manifest, entry point, bounds, and compat\n\
      \x20                             ranges are verified before anything is\n\
      \x20                             staged; added capabilities need consent.\n\
+     \x20 install <git-url> [--yes]  Install from a git source: exactly\n\
+     \x20                             https://<host>/<path>.git,\n\
+     \x20                             git+https://<host>/<path>.git (the git+\n\
+     \x20                             prefix is stripped before cloning), or\n\
+     \x20                             git@<host>:<path>. Fixed-argv system\n\
+     \x20                             `git clone --filter=blob:none --depth=1\n\
+     \x20                             <url> <staging-dir>` into an exclusive\n\
+     \x20                             temp dir (caller env inherited for\n\
+     \x20                             gitconfig/SSH-agent/proxy/CA), then the\n\
+     \x20                             same local-path pipeline. file://,\n\
+     \x20                             http://, ssh://, and other schemes fail\n\
+     \x20                             closed with a naming diagnostic.\n\
+     \x20 install <archive> [--yes]  Install from a local archive file:\n\
+     \x20                             .tar.gz/.tgz (tar -xzf), .tar.zst (tar\n\
+     \x20                             --use-compress-program=unzstd -xf), or\n\
+     \x20                             .zip (unzip -q -d). Fixed-argv system\n\
+     \x20                             helpers unpack into an exclusive temp\n\
+     \x20                             staging dir (members audited for ../,\n\
+     \x20                             absolute paths, and symlinks), then the\n\
+     \x20                             same local-path pipeline. A missing\n\
+     \x20                             helper or a bad/hostile archive fails\n\
+     \x20                             closed with nothing staged.\n\
      \x20 remove <id> --force         Remove a record: bundled records drop from\n\
      \x20                             the managed manifest (previous copy kept as\n\
      \x20                             .bak); installed packages delete their store\n\
@@ -536,18 +572,36 @@ pub fn plugin_help_text() -> String {
      \x20 capability is granted only when the manifest requests it and consent\n\
      \x20 is explicit; grants are bound to the exact manifest hash, so a later\n\
      \x20 manifest that adds a capability blocks until re-approved. Installed\n\
-     \x20 packages come from local directories (source class `local-path`),\n\
-     \x20 are stored under packages/<id>/<version>/ with an owner-only mode,\n\
-     \x20 and load as visibly unverified third-party packages.\n\
+     \x20 packages come from local directories, git checkouts, or local\n\
+     \x20 archives (source class `local-path`), are stored under\n\
+     \x20 packages/<id>/<version>/ with an owner-only mode, and load as\n\
+     \x20 visibly unverified third-party packages.\n\
+     \n\
+     fetch:\n\
+     \x20 Git and archive installs stage under an exclusive temp dir and run\n\
+     \x20 zero plugin code. `git`/`tar`/`unzip` resolve via PATH (git.exe/\n\
+     \x20 tar.exe on Windows); a missing helper fails closed. `unzip` may be\n\
+     \x20 absent on Windows: .zip installs then fail closed with a diagnostic.\n\
      \n\
      exit codes:\n\
-     \x20 0 success | 1 aborted/io | 2 usage | 4 plugin error\n\
+     \x20 0 success (including idempotent no-ops).\n\
+     \x20 1 aborted/io: declined/EOF consent, filesystem failure, missing\n\
+     \x20    fetch helper, `git clone` failure, archive unpack failure.\n\
+     \x20 2 usage: bad verb/flag/format/id, stray `--`, wrong-verb flags.\n\
+     \x20 4 plugin error: unknown id, bad manifest/pin/grant, rejected fetch\n\
+     \x20    scheme (file://, http://, ssh://, ...), malformed git URL,\n\
+     \x20    hostile archive member.\n\
      \n\
      examples:\n\
      \x20 bitty plugin list\n\
      \x20 bitty plugin list --format json\n\
      \x20 bitty plugin install bitty-terminal.shell-integration --yes\n\
      \x20 bitty plugin install ./my-plugin --yes\n\
+     \x20 bitty plugin install https://example.com/my-plugin.git --yes\n\
+     \x20 bitty plugin install git+https://example.com/my-plugin.git --yes\n\
+     \x20 bitty plugin install git@example.com:my-plugin.git --yes\n\
+     \x20 bitty plugin install ./my-plugin.tar.gz --yes\n\
+     \x20 bitty plugin install ./my-plugin.zip --yes\n\
      \x20 bitty plugin info xuepoo.hello\n\
      \x20 bitty plugin disable bitty-terminal.shell-integration\n\
      \x20 bitty plugin remove xuepoo.hello --force"
@@ -1917,26 +1971,698 @@ fn is_managed_operand(state: &PluginState, id: &str) -> bool {
 /// Whether an `install` operand names a filesystem source rather than a
 /// bundled plugin id.
 ///
-/// Path separators, leading `.`/`~`, and an existing directory all select the
-/// package-manager path. A bare dotted token is a bundled id; the id grammar
-/// cannot contain separators, so the two never overlap.
+/// Path separators, leading `.`/`~`, an existing directory or file, an
+/// archive suffix, and any git/URL spelling all select the package-manager
+/// path. A bare dotted token is a bundled id; the id grammar cannot contain
+/// separators, so the two never overlap.
 fn is_source_operand(token: &str) -> bool {
+    if classify_archive_kind(token).is_some() {
+        return true;
+    }
+    if normalize_git_source(token).is_some() || rejected_scheme(token).is_some() {
+        return true;
+    }
     token.contains('/')
         || token.contains('\\')
         || token.starts_with('.')
         || token.starts_with('~')
         || Path::new(token).is_dir()
+        || Path::new(token).is_file()
 }
 
-/// Whether an operand looks like a remote source locator (not yet supported).
-fn is_remote_source(token: &str) -> bool {
+/// Naming diagnostic for a rejected fetch scheme (fail-closed, exit 4).
+///
+/// Names the scheme so `file://`, `http://`, `ssh://`, `git://`, `git:`,
+/// `ftp://`, and other non-git spellings are distinguishable from a malformed
+/// git URL. Returns `None` when the token carries no URL scheme at all.
+fn rejected_scheme(token: &str) -> Option<String> {
     let lower = token.to_ascii_lowercase();
-    lower.starts_with("git:")
-        || lower.starts_with("https://")
-        || lower.starts_with("http://")
-        || lower.starts_with("ssh://")
-        || lower.starts_with("git@")
-        || lower.starts_with("git://")
+    // Order matters: check the longest distinctive prefixes first.
+    for scheme in [
+        "file://", "http://", "https://", "ssh://", "git://", "ftp://", "ftps://", "git:",
+    ] {
+        if lower.starts_with(scheme) {
+            // `https://` and `git@` have allowed git spellings; only report
+            // them here when they fail the git allowlist (the caller checks
+            // `normalize_git_source` first).
+            return Some(scheme.to_string());
+        }
+    }
+    None
+}
+
+/// Local archive kind selected by file-name suffix (case-insensitive).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchiveKind {
+    /// `.tar.gz` / `.tgz` (gzip-compressed tar).
+    TarGz,
+    /// `.tar.zst` (zstd-compressed tar).
+    TarZst,
+    /// `.zip`.
+    Zip,
+}
+
+/// Classify an `install` operand as a local archive by suffix.
+///
+/// Returns `None` for non-archive spellings. The file itself is validated
+/// later (must exist, must be a regular file, size-bounded); the suffix alone
+/// selects the unpack helper.
+fn classify_archive_kind(token: &str) -> Option<ArchiveKind> {
+    let lower = token.to_ascii_lowercase();
+    if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
+        Some(ArchiveKind::TarGz)
+    } else if lower.ends_with(".tar.zst") {
+        Some(ArchiveKind::TarZst)
+    } else if lower.ends_with(".zip") {
+        Some(ArchiveKind::Zip)
+    } else {
+        None
+    }
+}
+
+/// Normalize an `install` operand to a cloneable git URL.
+///
+/// Accepts exactly three spellings (case-insensitive scheme where applicable):
+/// `https://<host>/<path>.git`, `git+https://<host>/<path>.git` (the `git+`
+/// prefix is stripped before cloning; git itself does not understand it),
+/// and scp-like `git@<host>:<path>`. Returns the URL to pass to
+/// `git clone` (stripped for `git+https`), or `None` when the token is not an
+/// allowed git spelling. Malformed git-looking tokens fail closed in the
+/// caller with a naming diagnostic; this function only recognizes the
+/// allowlist.
+fn normalize_git_source(token: &str) -> Option<String> {
+    let lower = token.to_ascii_lowercase();
+    if let Some(inner) = token
+        .strip_prefix("git+")
+        .or_else(|| token.strip_prefix("GIT+"))
+        .or_else(|| {
+            if lower.starts_with("git+") {
+                Some(&token[4..])
+            } else {
+                None
+            }
+        })
+    {
+        // `git+https://…` only: `git+` plus any other scheme is rejected.
+        if inner.to_ascii_lowercase().starts_with("https://") && is_valid_https_git_url(inner) {
+            return Some(inner.to_string());
+        }
+        return None;
+    }
+    if lower.starts_with("https://") {
+        if is_valid_https_git_url(token) {
+            return Some(token.to_string());
+        }
+        return None;
+    }
+    if token.starts_with("git@") {
+        if is_valid_scp_git_source(token) {
+            return Some(token.to_string());
+        }
+        return None;
+    }
+    None
+}
+
+/// Whether `token` is a valid `https://` git URL for cloning.
+///
+/// Strict allowlist: `https://` host (`[A-Za-z0-9.-]`, leading alnum,
+/// optional `:port`) `/` path (`[A-Za-z0-9._/-]`, non-empty) ending in
+/// `.git`. Anything else (whitespace, control, backslash, quotes, shell
+/// metacharacters, `=` so `--config`/`--upload-pack=` cannot hide in the
+/// path, `@` so credentials cannot hide in the URL) fails closed. The length
+/// is already bounded by [`MAX_PLUGIN_TOKEN_BYTES`] at parse time.
+fn is_valid_https_git_url(token: &str) -> bool {
+    let Some(rest) = token
+        .strip_prefix("https://")
+        .or_else(|| token.strip_prefix("HTTPS://"))
+        .or_else(|| {
+            if token.len() >= 8 && token[..8].eq_ignore_ascii_case("https://") {
+                Some(&token[8..])
+            } else {
+                None
+            }
+        })
+    else {
+        return false;
+    };
+    if rest.is_empty() || rest.len() > MAX_PLUGIN_TOKEN_BYTES {
+        return false;
+    }
+    if rest
+        .bytes()
+        .any(|b| b.is_ascii_control() || b == b' ' || b == b'\t' || b == b'\n' || b == b'\r')
+    {
+        return false;
+    }
+    // No shell metacharacters, no backslash, no credential `@`, no `=` (which
+    // would let `--config`/`--upload-pack=` hide in the path as one argv).
+    if rest.contains([
+        '\\', '"', '\'', '`', '$', '|', ';', '&', '<', '>', '(', ')', '{', '}', '*', '?', '#', '@',
+        '=', '!', '+', ',', '%',
+    ]) {
+        return false;
+    }
+    // A leading dash would let the URL be parsed as a git flag without the
+    // end-of-options separator; reject regardless (defense in depth: the
+    // clone argv also carries `--`).
+    if rest.starts_with('-') {
+        return false;
+    }
+    let Some(slash) = rest.find('/') else {
+        return false;
+    };
+    let (host_port, path) = (&rest[..slash], &rest[slash + 1..]);
+    if host_port.is_empty() || path.is_empty() {
+        return false;
+    }
+    if !host_port
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b':')
+    {
+        return false;
+    }
+    let host = host_port.split(':').next().unwrap_or("");
+    if host.is_empty()
+        || !host
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphanumeric())
+    {
+        return false;
+    }
+    if let Some(port) = host_port.split(':').nth(1) {
+        if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+        if host_port.split(':').count() != 2 {
+            return false;
+        }
+    }
+    if !path
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-' || b == b'/')
+    {
+        return false;
+    }
+    if path.contains("//") {
+        return false;
+    }
+    path.ends_with(".git") && path.len() > ".git".len()
+}
+
+/// Whether `token` is a valid scp-like `git@<host>:<path>` source.
+///
+/// Strict allowlist: literal `git@`, host (`[A-Za-z0-9.-]`, leading alnum),
+/// `:`, path (`[A-Za-z0-9._/-]`, non-empty, no leading dash). The `.git`
+/// suffix is conventional but not required for this spelling. The same
+/// metacharacter denylist as [`is_valid_https_git_url`] applies.
+fn is_valid_scp_git_source(token: &str) -> bool {
+    let Some(rest) = token.strip_prefix("git@") else {
+        return false;
+    };
+    if rest.is_empty() || rest.len() > MAX_PLUGIN_TOKEN_BYTES {
+        return false;
+    }
+    if rest
+        .bytes()
+        .any(|b| b.is_ascii_control() || b == b' ' || b == b'\t' || b == b'\n' || b == b'\r')
+    {
+        return false;
+    }
+    if rest.contains([
+        '\\', '"', '\'', '`', '$', '|', ';', '&', '<', '>', '(', ')', '{', '}', '*', '?', '#', '@',
+        '=', '!', '+', ',', '%',
+    ]) {
+        return false;
+    }
+    if rest.starts_with('-') {
+        return false;
+    }
+    let Some(colon) = rest.find(':') else {
+        return false;
+    };
+    let (host, path) = (&rest[..colon], &rest[colon + 1..]);
+    if host.is_empty() || path.is_empty() {
+        return false;
+    }
+    if !host
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+    {
+        return false;
+    }
+    if !host
+        .bytes()
+        .next()
+        .is_some_and(|b| b.is_ascii_alphanumeric())
+    {
+        return false;
+    }
+    if !path
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-' || b == b'/')
+    {
+        return false;
+    }
+    if path.contains("//") || path.starts_with('-') {
+        return false;
+    }
+    true
+}
+
+// ---------------------------------------------------------------------------
+// Fetch staging (CTX-1103, #1901): exclusive temp dirs, fixed-argv helpers
+// ---------------------------------------------------------------------------
+
+/// Maximum archive file size staged (64 MiB; the module-tree ceilings still
+/// bound the unpacked content to 16 MiB / 4096 files).
+const MAX_FETCH_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum bytes of one helper listing (`tar -tf` / `unzip -Z1`) parsed.
+const MAX_FETCH_LIST_BYTES: usize = 256 * 1024;
+/// Maximum archive members listed (2x the module-tree file ceiling + slack
+/// for directory entries).
+const MAX_FETCH_MEMBERS: usize = 8192;
+/// Maximum bytes kept from a failed helper's stderr (bounded detail).
+const MAX_FETCH_STDERR_BYTES: usize = 2048;
+/// Maximum bytes for one archive member path (the ratified 1024-byte ceiling).
+const MAX_FETCH_MEMBER_PATH_BYTES: usize = 1024;
+
+/// Exclusive temp staging dir for one git/archive fetch (removed on drop
+/// unless disarmed by forgetting — the caller moves the payload out through
+/// the package manager first, then drops the guard to clean the temp copy).
+struct ScopedFetchDir {
+    path: PathBuf,
+}
+
+impl ScopedFetchDir {
+    fn create(tag: &str) -> Result<Self, String> {
+        #[cfg(unix)]
+        use std::os::unix::fs::DirBuilderExt as _;
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        for _ in 0..100 {
+            let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.subsec_nanos())
+                .unwrap_or(0);
+            let path = std::env::temp_dir().join(format!(
+                "bitty-plugin-fetch-{tag}-{}-{sequence}-{nanos}",
+                std::process::id()
+            ));
+            #[cfg(unix)]
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(not(unix))]
+            let builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            builder.mode(0o700);
+            match builder.create(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "bitty plugin: cannot create staging dir '{}': {error}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        Err("bitty plugin: cannot create staging dir (no fresh name after retries)".to_string())
+    }
+}
+
+impl Drop for ScopedFetchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Bounded, sanitized tail of a failed helper's stderr (no control bytes).
+fn fetch_stderr_tail(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let tail: String = text
+        .chars()
+        .rev()
+        .take(MAX_FETCH_STDERR_BYTES)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    tail.chars()
+        .map(|c| {
+            if c.is_control() && c != '\n' && c != '\t' {
+                '\u{fffd}'
+            } else {
+                c
+            }
+        })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// Run one fixed-argv helper; map every failure to a user-facing message.
+///
+/// `tool` resolves via `PATH` (`Command::new` finds `git.exe`/`tar.exe` on
+/// Windows). The child inherits the caller's environment (system
+/// gitconfig/SSH-agent/proxy/CA handling comes free, mirroring
+/// `component_seed.rs` `SystemTransport` posture). No shell is ever
+/// constructed: every element of `argv` is inert data.
+fn run_fetch_tool(tool: &str, argv: &[String]) -> Result<std::process::Output, String> {
+    std::process::Command::new(tool)
+        .args(argv)
+        .output()
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                match tool {
+                    "git" => "bitty plugin: `git` not found (install git first, or install from a local directory or archive)".to_string(),
+                    "tar" => "bitty plugin: `tar` not found (install tar first, or install from a local directory)".to_string(),
+                    "unzip" => "bitty plugin: `unzip` not found (install unzip first, or repack as .tar.gz; .zip installs fail closed without it)".to_string(),
+                    _ => format!("bitty plugin: `{tool}` not found (install {tool} first)"),
+                }
+            } else {
+                format!("bitty plugin: cannot run `{tool}`: {error}")
+            }
+        })
+}
+
+/// Fixed-argv `git clone --filter=blob:none --depth=1 -- <url> <dest>`.
+///
+/// The `--` end-of-options separator plus the leading-dash rejection in
+/// [`is_valid_https_git_url`]/[`is_valid_scp_git_source`] closes
+/// `--upload-pack=`/`--config` smuggling via the URL: the URL is always one
+/// inert argv element, never a flag.
+fn run_git_clone(url: &str, dest: &Path) -> Result<(), String> {
+    let argv = vec![
+        "clone".to_string(),
+        "--filter=blob:none".to_string(),
+        "--depth=1".to_string(),
+        "--".to_string(),
+        url.to_string(),
+        dest.to_string_lossy().into_owned(),
+    ];
+    let output = run_fetch_tool("git", &argv)?;
+    if !output.status.success() {
+        let tail = fetch_stderr_tail(&output.stderr);
+        return Err(format!(
+            "bitty plugin: `git clone` failed ({}; {tail})",
+            output.status
+        ));
+    }
+    Ok(())
+}
+
+/// List tar members (names only, never extracted here).
+fn list_tar_members(archive: &Path, kind: ArchiveKind) -> Result<Vec<String>, String> {
+    let archive_arg = archive.to_string_lossy().into_owned();
+    let argv: Vec<String> = match kind {
+        ArchiveKind::TarGz => vec!["-tzf".to_string(), archive_arg],
+        ArchiveKind::TarZst => vec![
+            "--use-compress-program=unzstd".to_string(),
+            "-tf".to_string(),
+            archive_arg,
+        ],
+        ArchiveKind::Zip => {
+            return Err("bitty plugin: internal error: tar lister called for .zip".to_string());
+        }
+    };
+    let output = run_fetch_tool("tar", &argv)?;
+    if !output.status.success() {
+        let tail = fetch_stderr_tail(&output.stderr);
+        return Err(format!(
+            "bitty plugin: cannot list archive members ({}; {tail})",
+            output.status
+        ));
+    }
+    parse_member_list(&output.stdout)
+}
+
+/// List zip members via `unzip -Z1` (bare names, one per line).
+fn list_zip_members(archive: &Path) -> Result<Vec<String>, String> {
+    let argv = vec!["-Z1".to_string(), archive.to_string_lossy().into_owned()];
+    let output = run_fetch_tool("unzip", &argv)?;
+    if !output.status.success() {
+        let tail = fetch_stderr_tail(&output.stderr);
+        return Err(format!(
+            "bitty plugin: cannot list archive members ({}; {tail})",
+            output.status
+        ));
+    }
+    parse_member_list(&output.stdout)
+}
+
+/// Parse and bound one helper listing (UTF-8, member-count bounded).
+fn parse_member_list(bytes: &[u8]) -> Result<Vec<String>, String> {
+    if bytes.len() > MAX_FETCH_LIST_BYTES {
+        return Err(format!(
+            "bitty plugin: archive member list exceeds {MAX_FETCH_LIST_BYTES} bytes (refusing hostile archive)"
+        ));
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| {
+        "bitty plugin: archive member names are not UTF-8 (refusing hostile archive)".to_string()
+    })?;
+    let members: Vec<String> = text.lines().map(str::to_string).collect();
+    if members.len() > MAX_FETCH_MEMBERS {
+        return Err(format!(
+            "bitty plugin: archive holds {} members (limit {MAX_FETCH_MEMBERS}; refusing hostile archive)",
+            members.len()
+        ));
+    }
+    Ok(members)
+}
+
+/// Validate one archive member name (fail closed on traversal).
+///
+/// Rejects absolute members (`/…`), Windows separators (`\`, `:` so drive
+/// letters cannot hide), `..` path segments, over-long paths, and control
+/// characters. Leading `./` and trailing `/` (directory entries) are
+/// tolerated and stripped before the checks. An empty root entry (`./`)
+/// is allowed.
+fn validate_archive_member(raw: &str) -> Result<(), String> {
+    if raw.is_empty() {
+        return Err(
+            "bitty plugin: archive holds an empty member name (refusing hostile archive)"
+                .to_string(),
+        );
+    }
+    if raw.len() > MAX_FETCH_MEMBER_PATH_BYTES {
+        return Err(format!(
+            "bitty plugin: archive member {raw:?} exceeds {MAX_FETCH_MEMBER_PATH_BYTES} bytes (refusing hostile archive)"
+        ));
+    }
+    if raw.contains('\0') || raw.chars().any(|c| c.is_control() && c != '\t') {
+        return Err(format!(
+            "bitty plugin: archive member {raw:?} carries control characters (refusing hostile archive)"
+        ));
+    }
+    // Tolerate the `./` prefix tar emits for `tar -C src .` archives and the
+    // trailing `/` on directory entries; everything else is checked literally
+    // (no normalization — normalization is where traversal bugs hide).
+    let mut name = raw;
+    if let Some(stripped) = name.strip_prefix("./") {
+        name = stripped;
+    } else if name == "." {
+        return Ok(());
+    }
+    name = name.strip_suffix('/').unwrap_or(name);
+    if name.is_empty() {
+        // `./` or `/` root entries (the latter is stripped to empty only when
+        // the raw member was exactly `/`, which is absolute and rejected
+        // below — but `./` legitimately reduces to empty here).
+        if raw == "./" || raw == "." {
+            return Ok(());
+        }
+        return Err(format!(
+            "bitty plugin: archive member {raw:?} is not a usable path (refusing hostile archive)"
+        ));
+    }
+    if raw.starts_with('/') {
+        return Err(format!(
+            "bitty plugin: archive member {raw:?} is absolute (refusing hostile archive)"
+        ));
+    }
+    if name.starts_with('/') {
+        return Err(format!(
+            "bitty plugin: archive member {raw:?} is absolute (refusing hostile archive)"
+        ));
+    }
+    if raw.contains('\\') || raw.contains(':') {
+        return Err(format!(
+            "bitty plugin: archive member {raw:?} carries a Windows separator or drive (refusing hostile archive)"
+        ));
+    }
+    for component in name.split('/') {
+        if component.is_empty() {
+            return Err(format!(
+                "bitty plugin: archive member {raw:?} has an empty path segment (refusing hostile archive)"
+            ));
+        }
+        if component == ".." {
+            return Err(format!(
+                "bitty plugin: archive member {raw:?} escapes its directory (refusing hostile archive)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Audit every listed member before anything is extracted.
+fn audit_archive_members(members: &[String]) -> Result<(), String> {
+    if members.is_empty() {
+        return Err("bitty plugin: archive holds no members (refusing empty archive)".to_string());
+    }
+    for member in members {
+        validate_archive_member(member)?;
+    }
+    Ok(())
+}
+
+/// Extract a tar archive (fixed argv, confined with `-C`).
+fn extract_tar(archive: &Path, dest: &Path, kind: ArchiveKind) -> Result<(), String> {
+    let argv: Vec<String> = match kind {
+        ArchiveKind::TarGz => vec![
+            "-xzf".to_string(),
+            archive.to_string_lossy().into_owned(),
+            "-C".to_string(),
+            dest.to_string_lossy().into_owned(),
+        ],
+        ArchiveKind::TarZst => vec![
+            "--use-compress-program=unzstd".to_string(),
+            "-xf".to_string(),
+            archive.to_string_lossy().into_owned(),
+            "-C".to_string(),
+            dest.to_string_lossy().into_owned(),
+        ],
+        ArchiveKind::Zip => {
+            return Err("bitty plugin: internal error: tar extractor called for .zip".to_string());
+        }
+    };
+    let output = run_fetch_tool("tar", &argv)?;
+    if !output.status.success() {
+        let tail = fetch_stderr_tail(&output.stderr);
+        return Err(format!(
+            "bitty plugin: cannot unpack archive ({}; {tail})",
+            output.status
+        ));
+    }
+    Ok(())
+}
+
+/// Extract a zip archive (`unzip -q <archive> -d <dest>`, fixed argv).
+fn extract_zip(archive: &Path, dest: &Path) -> Result<(), String> {
+    let argv = vec![
+        "-q".to_string(),
+        archive.to_string_lossy().into_owned(),
+        "-d".to_string(),
+        dest.to_string_lossy().into_owned(),
+    ];
+    let output = run_fetch_tool("unzip", &argv)?;
+    if !output.status.success() {
+        let tail = fetch_stderr_tail(&output.stderr);
+        return Err(format!(
+            "bitty plugin: cannot unpack archive ({}; {tail})",
+            output.status
+        ));
+    }
+    Ok(())
+}
+
+/// Fail closed when the extracted tree holds a symlink.
+///
+/// Both GNU `tar` and `unzip` refuse to follow a just-created symlink dir
+/// component during the same extraction (verified), so a symlink member lands
+/// inside staging as a link and is caught here before the package manager
+/// ever reads the tree. The staging dir is removed by the caller.
+fn audit_no_symlinks(root: &Path) -> Result<(), String> {
+    let mut stack = vec![root.to_path_buf()];
+    let mut seen = 0usize;
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir).map_err(|error| {
+            format!(
+                "bitty plugin: cannot inspect unpacked archive '{}': {error}",
+                dir.display()
+            )
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!("bitty plugin: cannot inspect unpacked archive entry: {error}")
+            })?;
+            seen += 1;
+            if seen > MAX_FETCH_MEMBERS {
+                return Err(format!(
+                    "bitty plugin: unpacked archive exceeds {MAX_FETCH_MEMBERS} entries (refusing hostile archive)"
+                ));
+            }
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+                format!(
+                    "bitty plugin: cannot inspect unpacked member '{}': {error}",
+                    path.display()
+                )
+            })?;
+            if metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "bitty plugin: archive member '{}' is a symlink (refusing hostile archive)",
+                    path.display()
+                ));
+            }
+            if metadata.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Pick the package root inside an extracted archive.
+///
+/// Archives either lay the manifest at the extraction root
+/// (`bitty-plugin.toml`) or under one top-level directory
+/// (`my-plugin/bitty-plugin.toml`); both are accepted. Anything else falls
+/// through to the extraction root so the existing manifest-missing diagnostic
+/// names the problem.
+fn find_plugin_root(extract_dir: &Path) -> PathBuf {
+    if extract_dir.join("bitty-plugin.toml").is_file() {
+        return extract_dir.to_path_buf();
+    }
+    let Ok(entries) = std::fs::read_dir(extract_dir) else {
+        return extract_dir.to_path_buf();
+    };
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut has_files = false;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+            continue;
+        }
+        if path.is_dir() {
+            dirs.push(path);
+        } else {
+            has_files = true;
+        }
+    }
+    if !has_files && dirs.len() == 1 && dirs[0].join("bitty-plugin.toml").is_file() {
+        return dirs.remove(0);
+    }
+    extract_dir.to_path_buf()
+}
+
+/// Unpack one local archive file into `dest` (must exist, must be empty).
+///
+/// Lists members first (never extracted here), audits every name for
+/// traversal, extracts with the fixed-argv helper, then audits the tree for
+/// symlinks. Any failure is fail-closed with nothing trusted.
+fn unpack_archive_into(archive: &Path, dest: &Path, kind: ArchiveKind) -> Result<(), String> {
+    let members = match kind {
+        ArchiveKind::TarGz | ArchiveKind::TarZst => list_tar_members(archive, kind)?,
+        ArchiveKind::Zip => list_zip_members(archive)?,
+    };
+    audit_archive_members(&members)?;
+    match kind {
+        ArchiveKind::TarGz | ArchiveKind::TarZst => extract_tar(archive, dest, kind)?,
+        ArchiveKind::Zip => extract_zip(archive, dest)?,
+    }
+    audit_no_symlinks(dest)
 }
 
 /// Install or update one plugin from a local directory into the XDG store.
@@ -1951,13 +2677,213 @@ fn install_source(
         eprintln!("bitty plugin: no data root ($XDG_DATA_HOME or $HOME unset)");
         return EXIT_USAGE;
     };
-    if is_remote_source(source) {
+    // Git spellings (allowlist) clone first, then share the local pipeline.
+    if let Some(url) = normalize_git_source(source) {
+        return install_git_source(request, source, &url, store_root, input, output);
+    }
+    // A URL-looking operand that is not an allowed git spelling fails closed
+    // with a naming diagnostic (http downgrade, file escape, ssh without
+    // git@, option-smuggling spellings that still look like URLs).
+    if rejected_scheme(source).is_some() || looks_like_url(source) {
+        return reject_fetch_scheme(source);
+    }
+    if let Some(kind) = classify_archive_kind(source) {
+        return install_archive_source(request, source, kind, store_root, input, output);
+    }
+    install_local_path(
+        request,
+        source,
+        Path::new(source),
+        store_root,
+        input,
+        output,
+    )
+}
+
+/// Whether a token looks like a URL even when its scheme is not allowlisted.
+///
+/// Catches `GIT+HTTPS://…` case variants, `ssh:…`, and leading-dash
+/// smuggling spellings (`--upload-pack=…`, `--config …`) that reach this
+/// layer as one argv element, so they fail closed as scheme errors (exit 4)
+/// instead of masquerading as bundled ids.
+fn looks_like_url(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    lower.contains("://")
+        || lower.starts_with("git@")
+        || lower.starts_with("git:")
+        || lower.starts_with("ssh:")
+        || token.starts_with('-')
+}
+
+/// Fail closed on a rejected fetch scheme with a naming diagnostic.
+fn reject_fetch_scheme(source: &str) -> i32 {
+    let lower = source.to_ascii_lowercase();
+    let scheme = if lower.starts_with("file://") {
+        "file://"
+    } else if lower.starts_with("http://") {
+        "http://"
+    } else if lower.starts_with("ssh://") || lower.starts_with("ssh:") {
+        "ssh://"
+    } else if lower.starts_with("git://") || lower.starts_with("git:") {
+        "git://"
+    } else if lower.starts_with("ftp://") || lower.starts_with("ftps://") {
+        "ftp://"
+    } else if lower.contains("://") {
+        "URL"
+    } else if source.starts_with('-') {
+        "flag-like"
+    } else {
+        "non-git"
+    };
+    if scheme == "http://" {
         eprintln!(
-            "bitty plugin: remote sources are not implemented yet; \
-             install from a local directory with `bitty plugin install <path>`"
+            "bitty plugin: refusing {scheme} source {source:?}: plugin git sources require https:// (or git+https:// / git@); \
+             install from a local directory or archive instead"
+        );
+    } else if scheme == "flag-like" {
+        eprintln!(
+            "bitty plugin: refusing flag-like source {source:?}: plugin sources are bundled ids, local paths, \
+             https://<host>/<path>.git, git+https://..., git@<host>:<path>, or local .tar.gz/.tgz/.tar.zst/.zip files"
+        );
+    } else {
+        eprintln!(
+            "bitty plugin: refusing {scheme} source {source:?}: plugin git sources are https://<host>/<path>.git, \
+             git+https://..., or git@<host>:<path> only; install from a local directory or archive instead"
+        );
+    }
+    EXIT_PLUGIN
+}
+
+/// Install from a git URL: clone into exclusive temp staging, then the
+/// existing local-path pipeline unchanged (manifest/schema/compat, hash pin,
+/// consent, atomic `current.json`). No plugin code runs at any step.
+fn install_git_source(
+    request: &PluginRequest,
+    display: &str,
+    url: &str,
+    store_root: &Path,
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
+) -> i32 {
+    let staging = match ScopedFetchDir::create("git") {
+        Ok(staging) => staging,
+        Err(message) => {
+            eprintln!("{message}");
+            return EXIT_GENERIC;
+        }
+    };
+    let checkout = staging.path.join("src");
+    if let Err(message) = run_git_clone(url, &checkout) {
+        eprintln!("{message}");
+        return EXIT_GENERIC;
+    }
+    install_local_path(request, display, &checkout, store_root, input, output)
+}
+
+/// Install from a local archive file: unpack into exclusive temp staging,
+/// then the existing local-path pipeline unchanged.
+fn install_archive_source(
+    request: &PluginRequest,
+    display: &str,
+    kind: ArchiveKind,
+    store_root: &Path,
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
+) -> i32 {
+    let canonical = match std::fs::canonicalize(display) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("bitty plugin: invalid source: '{display}': {error}");
+            return EXIT_GENERIC;
+        }
+    };
+    let metadata = match std::fs::metadata(&canonical) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            eprintln!("bitty plugin: invalid source: '{display}': {error}");
+            return EXIT_GENERIC;
+        }
+    };
+    if !metadata.is_file() {
+        eprintln!("bitty plugin: invalid source: '{display}' is not a file");
+        return EXIT_GENERIC;
+    }
+    if metadata.len() > MAX_FETCH_ARCHIVE_BYTES {
+        eprintln!(
+            "bitty plugin: archive '{display}' exceeds {MAX_FETCH_ARCHIVE_BYTES} bytes (refusing hostile archive)"
         );
         return EXIT_PLUGIN;
     }
+    // Snapshot the archive into staging first so a concurrent replace of the
+    // user path cannot change the bytes between listing and extraction.
+    let staging = match ScopedFetchDir::create("archive") {
+        Ok(staging) => staging,
+        Err(message) => {
+            eprintln!("{message}");
+            return EXIT_GENERIC;
+        }
+    };
+    let suffix = match kind {
+        ArchiveKind::TarGz => "payload.tar.gz",
+        ArchiveKind::TarZst => "payload.tar.zst",
+        ArchiveKind::Zip => "payload.zip",
+    };
+    let staged_archive = staging.path.join(suffix);
+    let bytes = match std::fs::read(&canonical) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("bitty plugin: invalid source: '{display}': {error}");
+            return EXIT_GENERIC;
+        }
+    };
+    if bytes.len() as u64 > MAX_FETCH_ARCHIVE_BYTES {
+        eprintln!(
+            "bitty plugin: archive '{display}' exceeds {MAX_FETCH_ARCHIVE_BYTES} bytes (refusing hostile archive)"
+        );
+        return EXIT_PLUGIN;
+    }
+    if let Err(error) = std::fs::write(&staged_archive, &bytes) {
+        eprintln!("bitty plugin: cannot stage archive: {error}");
+        return EXIT_GENERIC;
+    }
+    let extract_dir = staging.path.join("src");
+    if let Err(error) = std::fs::create_dir(&extract_dir) {
+        eprintln!("bitty plugin: cannot create staging dir: {error}");
+        return EXIT_GENERIC;
+    }
+    if let Err(message) = unpack_archive_into(&staged_archive, &extract_dir, kind) {
+        // Distinguish validation (plugin error, exit 4) from helper/io
+        // failures (exit 1) by message shape: hostile-member audits name the
+        // member, everything else is an io/helper failure.
+        eprintln!("{message}");
+        if message.contains("refusing hostile archive")
+            || message.contains("no members")
+            || message.contains("empty archive")
+        {
+            return EXIT_PLUGIN;
+        }
+        return EXIT_GENERIC;
+    }
+    if let Err(message) = audit_no_symlinks(&extract_dir) {
+        eprintln!("{message}");
+        return EXIT_PLUGIN;
+    }
+    let root = find_plugin_root(&extract_dir);
+    install_local_path(request, display, &root, store_root, input, output)
+}
+
+/// Shared local-path pipeline tail: consent bound to the staged snapshot,
+/// then `package::install_local_dir` (manifest, entry point, bounds, compat,
+/// hash pin, atomic `current.json`). The `source` argument selects the input
+/// dir; `display` names the original operand in consent prompts.
+fn install_local_path(
+    request: &PluginRequest,
+    display: &str,
+    source: &Path,
+    store_root: &Path,
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
+) -> i32 {
     let options = LocalInstallOptions::default();
     let approve_all = request.yes;
     // Consent is bound to the staged snapshot the installer reviewed: the
@@ -1969,12 +2895,12 @@ fn install_source(
                 if approve_all {
                     return Ok(true);
                 }
-                match ask_source_consent(input, output, consent_request, source) {
+                match ask_source_consent(input, output, consent_request, display) {
                     Ok(approved) => Ok(approved),
                     Err(failure) => Err(PackageOpError::ConsentAborted(failure.message)),
                 }
             };
-        package::install_local_dir(store_root, Path::new(source), &options, &mut consent)
+        package::install_local_dir(store_root, source, &options, &mut consent)
     };
     match outcome {
         Ok(Some(report)) => {
@@ -2235,7 +3161,9 @@ fn bundled_manifest(id: &str) -> Result<PluginManifest, PluginFailure> {
             "UnknownPlugin",
             format!(
                 "bitty plugin: '{id}' is not a bundled plugin; install an external package \
-                 from a local directory with `bitty plugin install <path>`"
+                 from a local directory (`bitty plugin install <path>`), a git URL \
+                 (`https://<host>/<path>.git`, `git+https://...`, `git@<host>:<path>`), \
+                 or a local archive (`.tar.gz`/`.tgz`/`.tar.zst`/`.zip`)"
             ),
         )
     })?;
@@ -3462,5 +4390,217 @@ mod tests {
         // Explicit opt-out stays plain as well.
         let plain = format_list_table(&[], true);
         assert!(!plain.contains("\u{1b}"));
+    }
+
+    // ── fetch sources (CTX-1103, #1901) ────────────────────────────────────
+
+    #[test]
+    fn git_spellings_normalize_and_reject_hostile_urls() {
+        // Allowed spellings normalize (git+ stripped for cloning).
+        assert_eq!(
+            normalize_git_source("https://example.com/a/b.git").as_deref(),
+            Some("https://example.com/a/b.git")
+        );
+        assert_eq!(
+            normalize_git_source("git+https://example.com/a/b.git").as_deref(),
+            Some("https://example.com/a/b.git")
+        );
+        assert_eq!(
+            normalize_git_source("git@example.com:a/b.git").as_deref(),
+            Some("git@example.com:a/b.git")
+        );
+        // Port in https URL is accepted.
+        assert!(normalize_git_source("https://example.com:8443/a/b.git").is_some());
+        // scp without .git is accepted for this spelling.
+        assert!(normalize_git_source("git@example.com:a/b").is_some());
+
+        // Rejected: http downgrade, file escape, ssh without git@, git://.
+        for hostile in [
+            "http://example.com/a/b.git",
+            "file:///tmp/a.git",
+            "ssh://example.com/a/b.git",
+            "git://example.com/a/b.git",
+            "https://example.com/a/b",
+            "https://example.com/a/b.git ",
+            "https://example.com/--upload-pack=evil.git",
+            "https://example.com/a/b.git--config",
+            "--upload-pack=touch evil",
+            "--config",
+            "-u",
+            "git+ssh://example.com/a.git",
+            "git+file:///tmp/a.git",
+            "GIT@example.com:a/b.git",
+            "https://user@example.com/a/b.git",
+            "https://example.com/a b.git",
+        ] {
+            assert!(
+                normalize_git_source(hostile).is_none(),
+                "must reject hostile git spelling: {hostile:?}"
+            );
+        }
+        // Rejected schemes carry a naming diagnostic.
+        assert_eq!(
+            rejected_scheme("file:///tmp/a.git").as_deref(),
+            Some("file://")
+        );
+        assert_eq!(
+            rejected_scheme("http://example.com/a.git").as_deref(),
+            Some("http://")
+        );
+        // Archive suffixes select helpers case-insensitively.
+        assert_eq!(
+            classify_archive_kind("pkg.TAR.GZ"),
+            Some(ArchiveKind::TarGz)
+        );
+        assert_eq!(classify_archive_kind("pkg.tgz"), Some(ArchiveKind::TarGz));
+        assert_eq!(
+            classify_archive_kind("pkg.tar.zst"),
+            Some(ArchiveKind::TarZst)
+        );
+        assert_eq!(classify_archive_kind("pkg.ZIP"), Some(ArchiveKind::Zip));
+        assert_eq!(classify_archive_kind("pkg.toml"), None);
+        // Git and archive operands select the source path (even bare names).
+        assert!(is_source_operand("https://example.com/a/b.git"));
+        assert!(is_source_operand("git@example.com:a/b.git"));
+        assert!(is_source_operand("pkg.zip"));
+        assert!(is_source_operand("./my-plugin"));
+        assert!(!is_source_operand("bitty-terminal.shell-integration"));
+    }
+
+    #[test]
+    fn archive_members_reject_traversal_absolute_and_windows_paths() {
+        for good in [
+            "bitty-plugin.toml",
+            "lua/init.lua",
+            "lua/",
+            "./",
+            "./lua/init.lua",
+        ] {
+            validate_archive_member(good).expect("good member validates");
+        }
+        for hostile in [
+            "",
+            "/tmp/absolute.txt",
+            "../evil.txt",
+            "a/../../b.txt",
+            "a/../b.txt",
+            "..",
+            "a//b.txt",
+            "C:\\evil.txt",
+            "a:b.txt",
+            "a\\b.txt",
+        ] {
+            assert!(
+                validate_archive_member(hostile).is_err(),
+                "must reject hostile member: {hostile:?}"
+            );
+        }
+    }
+    #[test]
+    fn git_clone_fixed_argv_succeeds_on_a_local_path() {
+        // Transport-level proof (bypasses scheme validation): fixed-argv
+        // `git clone --filter=blob:none --depth=1 -- <src> <dest>` works and
+        // inherits env. Uses a local path as the repo (no network).
+        let base = scratch_dir("git-clone");
+        let repo = base.join("repo");
+        std::fs::create_dir_all(repo.join("lua")).expect("lua dir");
+        std::fs::write(repo.join("bitty-plugin.toml"), "x = 1\n").expect("manifest");
+        std::fs::write(repo.join("lua/init.lua"), "-- hi\n").expect("init");
+        let repo_arg = repo.display().to_string();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q", &repo_arg])
+            .status()
+            .expect("git init");
+        assert!(status.success());
+        for (key, value) in [("user.email", "t@t"), ("user.name", "t")] {
+            let status = std::process::Command::new("git")
+                .args(["-C", &repo_arg, "config", key, value])
+                .status()
+                .expect("git config");
+            assert!(status.success());
+        }
+        let status = std::process::Command::new("git")
+            .args(["-C", &repo_arg, "add", "-A"])
+            .status()
+            .expect("git add");
+        assert!(status.success());
+        let status = std::process::Command::new("git")
+            .args(["-C", &repo_arg, "commit", "-qm", "init"])
+            .status()
+            .expect("git commit");
+        assert!(status.success());
+        let dest = base.join("clone");
+        run_git_clone(&repo_arg, &dest).expect("clone succeeds");
+        assert!(dest.join("bitty-plugin.toml").is_file());
+        assert!(dest.join("lua/init.lua").is_file());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn archive_unpack_round_trips_and_rejects_symlinks() {
+        // Skip when helpers are absent (Windows without tar/unzip): the
+        // production path fails closed with a diagnostic instead.
+        if std::process::Command::new("tar")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let base = scratch_dir("archive-roundtrip");
+        let src = base.join("src");
+        std::fs::create_dir_all(src.join("lua")).expect("lua dir");
+        std::fs::write(src.join("bitty-plugin.toml"), "x = 1\n").expect("manifest");
+        std::fs::write(src.join("lua/init.lua"), "-- hi\n").expect("init");
+        let archive = base.join("pkg.tar.gz");
+        let status = std::process::Command::new("tar")
+            .args([
+                "-czf",
+                &archive.display().to_string(),
+                "-C",
+                &src.display().to_string(),
+                ".",
+            ])
+            .status()
+            .expect("tar pack");
+        assert!(status.success());
+        let dest = base.join("out");
+        std::fs::create_dir(&dest).expect("dest dir");
+        unpack_archive_into(&archive, &dest, ArchiveKind::TarGz).expect("unpacks");
+        audit_no_symlinks(&dest).expect("no symlinks");
+        assert_eq!(find_plugin_root(&dest), dest);
+
+        // A symlink member lists fine but fails closed at audit (never
+        // trusted by the package manager).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink as symlink_file;
+            let link_src = base.join("link-src");
+            std::fs::create_dir_all(&link_src).expect("link src");
+            symlink_file("/tmp", link_src.join("evil-link")).expect("symlink");
+            std::fs::write(link_src.join("bitty-plugin.toml"), "x = 1\n").expect("m");
+            let link_archive = base.join("link.tar.gz");
+            let status = std::process::Command::new("tar")
+                .args([
+                    "-czf",
+                    &link_archive.display().to_string(),
+                    "-C",
+                    &link_src.display().to_string(),
+                    ".",
+                ])
+                .status()
+                .expect("tar pack link");
+            assert!(status.success());
+            let link_dest = base.join("link-out");
+            std::fs::create_dir(&link_dest).expect("link dest");
+            // Extraction itself lands the link inside staging (tools refuse
+            // to follow it); the audit then fails closed.
+            let _ = extract_tar(&link_archive, &link_dest, ArchiveKind::TarGz);
+            assert!(
+                audit_no_symlinks(&link_dest).is_err(),
+                "symlink member must fail closed"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

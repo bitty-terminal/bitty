@@ -457,24 +457,272 @@ fn plugin_external_install_requires_consent() {
 
 #[test]
 fn plugin_external_remote_source_fails_closed() {
+    // CTX-1103 (#1901): allowed git spellings clone via fixed-argv system
+    // git; rejected schemes fail closed with a naming diagnostic. An
+    // unroutable https git URL fails at clone time (exit 1) with nothing
+    // staged.
     let home = scratch_dir("external-remote");
     let output = run_in(
         &home,
         &[
             "plugin",
             "install",
-            "https://example.com/plugin.git",
+            "https://127.0.0.1:9/no-such-plugin.git",
+            "--yes",
+        ],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("`git clone` failed"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!data_store(&home).join("current.json").exists());
+
+    // http downgrade fails closed with a naming diagnostic (exit 4).
+    let output = run_in(
+        &home,
+        &[
+            "plugin",
+            "install",
+            "http://example.com/plugin.git",
             "--yes",
         ],
         None,
     );
     assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
     assert!(
-        stderr(&output).contains("remote sources are not implemented"),
+        stderr(&output).contains("refusing http://"),
         "{}",
         stderr(&output)
     );
     assert!(!data_store(&home).join("current.json").exists());
+
+    // file escape fails closed with a naming diagnostic (exit 4).
+    let output = run_in(
+        &home,
+        &["plugin", "install", "file:///tmp/plugin.git", "--yes"],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("refusing file://"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!data_store(&home).join("current.json").exists());
+
+    // ssh without git@ fails closed with a naming diagnostic (exit 4).
+    let output = run_in(
+        &home,
+        &["plugin", "install", "ssh://example.com/plugin.git", "--yes"],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("refusing ssh://"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!data_store(&home).join("current.json").exists());
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn plugin_external_git_spellings_are_accepted_as_sources() {
+    // The three allowed spellings reach the git fetch path (not the bundled
+    // id path): unroutable hosts fail at clone (exit 1), never as unknown
+    // plugin (exit 4 with UnknownPlugin) and never with usage (exit 2).
+    let home = scratch_dir("external-git-spellings");
+    for url in [
+        "https://127.0.0.1:9/a/b.git",
+        "git+https://127.0.0.1:9/a/b.git",
+        "git@127.0.0.1:a/b.git",
+    ] {
+        let output = run_in(&home, &["plugin", "install", url, "--yes"], None);
+        assert_eq!(output.status.code(), Some(1), "{url}: {}", stderr(&output));
+        assert!(
+            stderr(&output).contains("`git clone` failed"),
+            "{url}: {}",
+            stderr(&output)
+        );
+    }
+    assert!(!data_store(&home).join("current.json").exists());
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Pack a source dir into an archive via the system helper under test.
+fn pack_archive(source: &Path, archive: &Path, kind: &str) {
+    let status = match kind {
+        "tar.gz" => std::process::Command::new("tar")
+            .args([
+                "-czf",
+                &archive.display().to_string(),
+                "-C",
+                &source.display().to_string(),
+                ".",
+            ])
+            .status()
+            .expect("run tar"),
+        "tar.zst" => std::process::Command::new("tar")
+            .args([
+                "--use-compress-program=unzstd",
+                "-cf",
+                &archive.display().to_string(),
+                "-C",
+                &source.display().to_string(),
+                ".",
+            ])
+            .status()
+            .expect("run tar"),
+        "zip" => {
+            let status = std::process::Command::new("zip")
+                .args(["-r", &archive.display().to_string(), "."])
+                .current_dir(source)
+                .status();
+            match status {
+                Ok(status) => status,
+                Err(_) => {
+                    // `zip` may be absent where only `unzip` ships; fall back
+                    // to python for packing (unpack still uses system unzip).
+                    std::process::Command::new("python3")
+                        .args([
+                            "-c",
+                            &format!(
+                                "import zipfile,pathlib; z=zipfile.ZipFile({archive:?},'w',zipfile.ZIP_STORED); \
+                                 [z.write(p,p.relative_to({source:?})) for p in pathlib.Path({source:?}).rglob('*') if p.is_file()]"
+                            ),
+                        ])
+                        .status()
+                        .expect("run python3")
+                }
+            }
+        }
+        _ => panic!("unknown archive kind {kind}"),
+    };
+    assert!(status.success(), "pack {kind} failed: {status}");
+}
+
+#[test]
+fn plugin_external_archive_install_and_hostile_members_fail_closed() {
+    let home = scratch_dir("external-archive");
+    let store = data_store(&home);
+
+    // Happy path: .tar.gz installs exactly like the unpacked directory.
+    let source = write_external_fixture(&home, "arch-src", "1.0.0", "hello arc");
+    let archive = home.join("pkg.tar.gz");
+    pack_archive(&source, &archive, "tar.gz");
+    let output = run_in(
+        &home,
+        &["plugin", "install", &archive.display().to_string(), "--yes"],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(stdout(&output).contains("installed"), "{}", stdout(&output));
+    assert!(
+        store
+            .join("packages/xuepoo.external/1.0.0/lua/init.lua")
+            .is_file()
+    );
+    // Remove before the hostile cases so they must prove nothing is staged.
+    let output = run_in(
+        &home,
+        &["plugin", "remove", "xuepoo.external", "--force"],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+
+    // Happy path: .zip installs as well (skip when unzip is absent, e.g.
+    // Windows without unzip: the install must fail closed, tested below).
+    if std::process::Command::new("unzip")
+        .arg("-v")
+        .output()
+        .is_ok()
+    {
+        let zip_archive = home.join("pkg.zip");
+        pack_archive(&source, &zip_archive, "zip");
+        let output = run_in(
+            &home,
+            &[
+                "plugin",
+                "install",
+                &zip_archive.display().to_string(),
+                "--yes",
+            ],
+            None,
+        );
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+        let output = run_in(
+            &home,
+            &["plugin", "remove", "xuepoo.external", "--force"],
+            None,
+        );
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    }
+
+    // Hostile: `../` member fails closed (exit 4), nothing staged.
+    let hostile = home.join("hostile.tar.gz");
+    std::process::Command::new("python3")
+        .args([
+            "-c",
+            &format!(
+                "import tarfile,io; tf=tarfile.open({archive:?},'w:gz'); \
+                 ti=tarfile.TarInfo('../evil.txt'); d=b'x'; ti.size=len(d); tf.addfile(ti,io.BytesIO(d)); tf.close()",
+                archive = hostile.display().to_string(),
+            ),
+        ])
+        .status()
+        .expect("craft hostile tar");
+    let output = run_in(
+        &home,
+        &["plugin", "install", &hostile.display().to_string(), "--yes"],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("refusing hostile archive"),
+        "{}",
+        stderr(&output)
+    );
+    // The happy-path package was removed above; a hostile archive must not
+    // stage anything new (the index file itself persists as an empty list).
+    assert!(!store.join("packages/xuepoo.external").exists());
+    if store.join("current.json").is_file() {
+        let index = std::fs::read_to_string(store.join("current.json")).expect("index");
+        assert!(!index.contains("xuepoo.external"), "{index}");
+    }
+
+    // Hostile: absolute member fails closed (exit 4), nothing staged.
+    let hostile_abs = home.join("hostile-abs.zip");
+    std::process::Command::new("python3")
+        .args([
+            "-c",
+            &format!(
+                "import zipfile; z=zipfile.ZipFile({archive:?},'w'); z.writestr('/tmp/absolute.txt','x'); z.close()",
+                archive = hostile_abs.display().to_string(),
+            ),
+        ])
+        .status()
+        .expect("craft hostile zip");
+    // When unzip is absent the install fails closed as missing-helper (1);
+    // otherwise it fails as hostile member (4). Either is fail-closed.
+    let output = run_in(
+        &home,
+        &[
+            "plugin",
+            "install",
+            &hostile_abs.display().to_string(),
+            "--yes",
+        ],
+        None,
+    );
+    assert!(
+        output.status.code() == Some(4) || output.status.code() == Some(1),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!store.join("packages/xuepoo.external").exists());
     let _ = std::fs::remove_dir_all(&home);
 }
 

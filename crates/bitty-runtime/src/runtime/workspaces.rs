@@ -391,6 +391,9 @@ impl Runtime {
         self.pinned
             .pin(&mut self.layout, id)
             .map_err(|error| error.to_string())?;
+        // CTX-1081: a fresh pin starts at the cascade anchor — drop any
+        // stale re-anchor offset so a re-pin never inherits a past drag.
+        self.pinned_offsets.remove(&id);
         // Shared post-edit fixups: focus moves off the pinned leaf onto the
         // first surviving leaf and primary-grid ownership follows (a pinned
         // leaf is no longer in any workspace layout). Unlike the scratchpad
@@ -407,11 +410,16 @@ impl Runtime {
     /// The leaf keeps its `Floating` mode: unpin returns the floating panel
     /// to the currently active workspace; re-tiling is a separate toggle.
     /// Fail-closed with state untouched when the leaf is not pinned.
+    ///
+    /// CTX-1081: unpin also drops the leaf's Alt+drag re-anchor offset —
+    /// the offset is present-only for the pinned composite, so the panel
+    /// returns with default anchored geometry.
     pub fn unpin_floating(&mut self, id: ViewId) -> Result<ViewId, String> {
         let id = self
             .pinned
             .unpin(&mut self.layout, id)
             .map_err(|error| error.to_string())?;
+        self.pinned_offsets.remove(&id);
         self.focus = Focus::with_focus(id);
         self.after_scratchpad_move(None);
         Ok(id)

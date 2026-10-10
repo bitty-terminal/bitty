@@ -532,6 +532,18 @@ pub struct Runtime {
     /// [`OverlayTier::Float`](bitty_ui::OverlayTier::Float), painted after
     /// same-tier mode-floating leaves in stable pin order.
     pinned: PinnedStore,
+    /// Alt+drag re-anchor offsets for pinned leaves (CTX-1081).
+    ///
+    /// A pinned leaf has anchored (container-derived) present geometry with
+    /// no stored position to move, so an Alt+drag accumulates its cell delta
+    /// here instead of in the layout tree. The present path adds the offset
+    /// to the anchored bounds (clamped into the container); the drop keeps
+    /// it, so the drop point becomes the new anchor. Keyed by [`ViewId`];
+    /// bounded by the live-leaf population (one entry per pinned leaf at
+    /// most). Dropped on unpin: unpin returns the panel to the active
+    /// workspace with default anchored geometry. Presentation-only: never
+    /// grid truth.
+    pinned_offsets: std::collections::HashMap<ViewId, (i32, i32)>,
     /// Monotonic high-water mark of every [`ViewId`] ever installed in a
     /// layout (CTX-0536, issue #923).
     ///
@@ -1606,6 +1618,7 @@ impl Runtime {
             scratchpad: ScratchpadSlot::new(),
             scratchpad_primary_owner: None,
             pinned: PinnedStore::new(),
+            pinned_offsets: std::collections::HashMap::new(),
             view_id_high_water: 0,
             session_pending: BTreeMap::new(),
             session_primary_cwd: None,
@@ -1852,6 +1865,7 @@ impl Runtime {
             scratchpad: ScratchpadSlot::new(),
             scratchpad_primary_owner: None,
             pinned: PinnedStore::new(),
+            pinned_offsets: std::collections::HashMap::new(),
             view_id_high_water: 0,
             session_pending: BTreeMap::new(),
             session_primary_cwd: None,

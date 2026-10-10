@@ -709,16 +709,24 @@ impl Runtime {
                         .container
                         .y
                         .saturating_add(self.container.height.saturating_sub(base.height));
-                    let bounds = UiRect::new(
-                        base.x
-                            .saturating_add(PIN_CASCADE_DX.saturating_mul(step))
-                            .min(max_x),
-                        base.y
-                            .saturating_add(PIN_CASCADE_DY.saturating_mul(step))
-                            .min(max_y),
-                        base.width,
-                        base.height,
-                    );
+                    // CTX-1081: an Alt+drag re-anchor offset moves the
+                    // anchored bounds without touching the store (the drop
+                    // point becomes the new anchor; unpin drops the offset).
+                    // The composed origin clamps into the container, so a
+                    // later container shrink can never push a dragged pin
+                    // off-screen; a missing entry drifts nothing.
+                    let (drag_dx, drag_dy) =
+                        self.pinned_offsets.get(&id).copied().unwrap_or((0, 0));
+                    let origin_x = (i32::from(base.x)
+                        + i32::from(PIN_CASCADE_DX.saturating_mul(step))
+                        + drag_dx)
+                        .clamp(i32::from(self.container.x), i32::from(max_x));
+                    let origin_y = (i32::from(base.y)
+                        + i32::from(PIN_CASCADE_DY.saturating_mul(step))
+                        + drag_dy)
+                        .clamp(i32::from(self.container.y), i32::from(max_y));
+                    let bounds =
+                        UiRect::new(origin_x as u16, origin_y as u16, base.width, base.height);
                     Some(bitty_ui::OverlayLayer::new(
                         OverlayTier::Float,
                         LayoutNode::leaf(view),

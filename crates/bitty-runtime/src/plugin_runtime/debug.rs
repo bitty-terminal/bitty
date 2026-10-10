@@ -28,6 +28,11 @@
 //! redaction and bounds evidence, caller audit, fail-closed version
 //! negotiation, docs sync, independent review plus green CI). This slice
 //! retires nothing and changes no behavior.
+//!
+//! CTX-1087 (F7, #1891) readiness gate: same story — Core keeps the
+//! debug/trace seam only because `bitty-observability` is not consumed yet.
+//! When that repo signals readiness, the Core path retires there (tracked in
+//! `bitty-observability`, not here). No retirements in this slice.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Instant;

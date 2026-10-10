@@ -168,6 +168,12 @@ pub trait BellSink {
 /// [`OsDeliverySkip::BackendMissing`]. A missing backend binary also reports
 /// `BackendMissing` (fail-closed); only a present backend is ever spawned,
 /// with fixed argv (never a shell) and stdio nulled.
+///
+/// CTX-1087 (F6, #1891) readiness gate: Core keeps this sink only because
+/// the `bitty-platform-services` backends are stubs. When that repo signals
+/// readiness, the Core path retires there (tracked in
+/// `bitty-platform-services`, not here). This slice retires nothing and
+/// changes no behavior.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct OsNotificationSink;
 

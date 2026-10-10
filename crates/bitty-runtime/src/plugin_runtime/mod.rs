@@ -54,7 +54,10 @@ pub use bitty_lua::{
     WORKSPACE_LIST_MAX_ITEMS, WORKSPACE_NAME_MAX_CHARS as WORKSPACE_INFO_NAME_MAX_CHARS,
     WORKSPACE_RENAME_MAX_BYTES, WorkspaceAttention, WorkspaceInfo, WorkspaceRequest,
 };
-pub use fs::{FakeFileSystem, FileSystem, NativeFileSystem, write_atomic_durably};
+pub use fs::{
+    FakeFileSystem, FileSystem, NativeFileSystem, STALE_TEMP_AGE_SECS, clean_temp_siblings,
+    write_atomic_durably,
+};
 pub use overlay::{
     CRASHED_RELEASE_REASON, CapturePoll, DEFAULT_RELEASE_REASON, FOCUS_SWITCHED_RELEASE_REASON,
     OVERLAY_CAPTURE_TIMEOUT_MS, OWNER_RELEASE_REASONS, OverlayCapture, RELEASE_REASONS,

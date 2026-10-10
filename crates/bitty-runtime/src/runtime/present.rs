@@ -1040,7 +1040,6 @@ impl Runtime {
         let frames = self.present_frames();
         self.reflow_present_layout(&frames);
 
-        let snapshot = self.state.snapshot();
         let mut pending_full = self.pending_full_redraw;
         // Collect allocations deterministically BEFORE the idle check so
         // geometry-only changes are visible (CTX-0228). `present_frames`
@@ -1075,9 +1074,18 @@ impl Runtime {
             }
         }
         if current_alt_screens != self.kitty_alt_screens_latched {
-            self.kitty_alt_screens_latched = current_alt_screens;
+            self.kitty_alt_screens_latched = current_alt_screens.clone();
             pending_full = true;
         }
+        // S1 (#1849) Kitty animation playback: advance visible origins'
+        // descriptors by the present-tick elapsed. Runs before the idle
+        // short-circuit (like the panel animations below) so a quiet grid
+        // with a running animation still presents its frame changes. A
+        // changed frame bumps that origin's generation through the state
+        // seam, so the `origins_changed` comparison below observes it and
+        // the frame presents damage-driven (no forced full redraw).
+        self.advance_kitty_animations_at(now, &allocations, &current_alt_screens);
+        let snapshot = self.state.snapshot();
         let last = self.last_presented_generation;
         // CTX-0176/CTX-0289: the primary state and every pane session own
         // independent grid generation counters, so a single scalar `max`
@@ -2677,6 +2685,82 @@ impl Runtime {
     /// Core-retained [`bitty_rich::KITTY_PRESENT_MAX_BLITS_PER_FRAME`] /
     /// [`bitty_rich::KITTY_PRESENT_MAX_BYTES_PER_FRAME`] ceilings with
     /// skip-and-continue in paint order.
+    /// Advances Kitty animation descriptors by the present-tick elapsed
+    /// (S1, #1849).
+    ///
+    /// Tick source (CTX-1090 tick-source question, decided): present-tick
+    /// elapsed time is the only clock — no dedicated timer. The first tick
+    /// stamps without advancing; every later tick advances by the
+    /// saturating elapsed since the stamp, so virtual-clock tests
+    /// (`tick_at`) pace animations deterministically and a wall-clock jump
+    /// never rewinds.
+    ///
+    /// Pause policy (CTX-1090 hidden-pane/scrolled-off question, decided):
+    /// an origin advances only while it owns a visible non-alt leaf this
+    /// frame. Hidden panes (no allocation), alternate-screen origins, and
+    /// session-less leaves pause — nothing paints for them, so advancing
+    /// would only burn raster work and desync the resume point. Scrolled-off
+    /// placements keep time (they advance with their origin): only
+    /// descriptor math runs for unpainted placements (no raster, no blits),
+    /// so on scroll-back the animation is time-correct with its siblings
+    /// instead of frozen mid-cycle. `Stopped` descriptors freeze and
+    /// `Loading` ones park on the last frame (the state seam owns that).
+    ///
+    /// Each advancing state steps through
+    /// [`bitty_term_state::State::advance_kitty_animations`] (IMG-9 33ms
+    /// gap floor, at most 4 timed transitions, leftover dropped), which
+    /// damages exactly the changed images' spans and bumps the generation
+    /// only when something changed — a frozen animation costs the
+    /// descriptor scan and never wakes the frame-on-demand present.
+    fn advance_kitty_animations_at(
+        &mut self,
+        now: std::time::Instant,
+        allocations: &[layout_focus::PresentFrame],
+        alt_screens: &std::collections::BTreeSet<Option<u64>>,
+    ) {
+        let elapsed = match self.kitty_anim_last_tick {
+            Some(last) => now.saturating_duration_since(last),
+            None => std::time::Duration::ZERO,
+        };
+        self.kitty_anim_last_tick = Some(now);
+        if elapsed.is_zero() {
+            return;
+        }
+        let elapsed_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+        let mut visible: std::collections::BTreeSet<Option<u64>> =
+            std::collections::BTreeSet::new();
+        for frame in allocations {
+            if frame.cols == 0 || frame.rows == 0 {
+                continue;
+            }
+            if self.pane_sessions.contains_key(&frame.view) {
+                visible.insert(Some(frame.view.0));
+            } else if Some(frame.view) == self.primary_view {
+                visible.insert(None);
+            }
+        }
+        let steps = bitty_term_state::KITTY_ANIM_MAX_STEPS_PER_TICK;
+        if visible.contains(&None) && !alt_screens.contains(&None) {
+            let changed = self.state.advance_kitty_animations(elapsed_ms, steps);
+            for id in changed {
+                self.damage_kitty_wire_for_origin(None, id);
+            }
+        }
+        for origin in visible {
+            let Some(token) = origin else { continue };
+            if alt_screens.contains(&Some(token)) {
+                continue;
+            }
+            let changed = match self.pane_sessions.get_mut(&ViewId::new(token)) {
+                Some(sess) => sess.state.advance_kitty_animations(elapsed_ms, steps),
+                None => Vec::new(),
+            };
+            for id in changed {
+                self.damage_kitty_wire_for_origin(Some(token), id);
+            }
+        }
+    }
+
     fn paint_kitty_images(&mut self, basis: &TickBasis, layers: &mut FrameLayers) {
         let snapshot = &basis.snapshot;
         let allocations = &basis.allocations;
@@ -2759,6 +2843,16 @@ impl Runtime {
                 let Some(stored) = self.kitty_images.get(placement.image) else {
                     continue;
                 };
+                // S1 (#1849): the current frame comes from the origin's
+                // terminal-truth descriptor (1-based, frame 1 when
+                // static); a truth frame with no stored pixels (past the
+                // pixel caps) paints nothing, fail closed.
+                let frame_no = self.kitty_current_frame_for(pane_origin, placement.wire_image);
+                let Some((frame_width, frame_height, frame_bytes)) =
+                    self.kitty_images.frame_bytes(placement.image, frame_no)
+                else {
+                    continue;
+                };
                 // Full (unclamped) extent for true-scale sampling plus the
                 // viewport-clipped window to emit. `None` paints nothing
                 // (scrolled fully off the top or outside the viewport).
@@ -2797,14 +2891,20 @@ impl Runtime {
                 // a miss (or a disabled cache) falls back to the uncached
                 // path with byte-identical bytes, so correctness never
                 // depends on the cache. The key binds (id, generation) —
-                // never a bare id — plus frame 0 (S1 future) and the
+                // never a bare id — plus the S1 animation frame and the
                 // full/visible geometry.
-                let cache_key = bitty_rich::KittyRasterKey::for_image(stored, 0, full_px, rect_px);
+                let cache_key =
+                    bitty_rich::KittyRasterKey::for_image(stored, frame_no, full_px, rect_px);
                 let rgba = if let Some(hit) = self.kitty_raster_cache.get(&cache_key) {
                     hit
                 } else {
-                    let Some(fresh) = bitty_rich::rasterize_kitty_clipped(stored, full_px, rect_px)
-                    else {
+                    let Some(fresh) = bitty_rich::rasterize_rgba_clipped(
+                        frame_width,
+                        frame_height,
+                        frame_bytes,
+                        full_px,
+                        rect_px,
+                    ) else {
                         continue;
                     };
                     // Admit an owned clone; an oversize blit is simply not

@@ -49,13 +49,21 @@
 //! suppression (see [`Runtime::answer_kitty_query`]); queries without
 //! `i=`/`I=` stay silent like kitty's `REPORT_ERROR`-with-no-reply.
 //!
-//! Still deferred (blocked, recorded in the PR body): animation
-//! (`a=f`/`a=a`/`a=c`) and local mediums (`t=f`/`t=t`/`t=s`
-//! file reads). The raster cache (S6, #1849) and cursor-on-top
-//! compositing (S7, #1849) are shipped: the present layer serves scaled
-//! blits from [`bitty_rich::KittyRasterCache`] (pure optimization over the
-//! uncached raster step) and the focused cursor punches through covering
-//! blits.
+//! Still deferred (blocked, recorded in the PR body): local mediums
+//! (`t=f`/`t=t`/`t=s` file reads). The raster cache (S6, #1849) and
+//! cursor-on-top compositing (S7, #1849) are shipped: the present layer
+//! serves scaled blits from [`bitty_rich::KittyRasterCache`] (pure
+//! optimization over the uncached raster step) and the focused cursor
+//! punches through covering blits.
+//!
+//! Animation playback (S1, #1849): `a=f` appends decoded frame bitmaps to
+//! the origin-scoped wire identity's stored root image (per-frame caps
+//! plus per-image/global totals, never evicting), `a=a` drives the
+//! terminal-truth descriptors (the present tick advances them with tick
+//! pacing and selects the current frame per placement), and `a=c`
+//! composes bounded rects between stored frames in place. See
+//! [`Runtime::kitty_append_frame_owned`], [`Runtime::kitty_compose_frames`],
+//! and the `bitty_rich::kitty_place` frame-store note.
 //! Display anchors at the drained stream's cursor cell (the primary grid,
 //! or the pane session swapped in by `handle_pane_bytes`) with that
 //! grid's `State::scrollback_len()` as the scroll base (images scroll with
@@ -92,6 +100,10 @@ pub enum KittyImageError {
     Decode(bitty_rich::KittyPrecheckError),
     /// Store/placement admission refused an otherwise decoded image.
     Placement(bitty_rich::KittyPlacementError),
+    /// Animation target unheld (S1, #1849): no stored root image for the
+    /// origin-scoped wire id, so an `a=f` frame or `a=c` compose names
+    /// nothing. Stores nothing, composes nothing.
+    NoAnimationTarget(u32),
     /// Local-medium (`t=f`/`t=t`/`t=s`) file/shm read refused by the
     /// open-time sandbox (S3, #1849): bad name, unsupported platform,
     /// non-regular object, over-cap read, out-of-range offset, or refused
@@ -105,6 +117,9 @@ impl std::fmt::Display for KittyImageError {
             Self::UnknownFormat(value) => write!(f, "kitty image unknown format f={value}"),
             Self::Decode(err) => write!(f, "kitty image decode: {err}"),
             Self::Placement(err) => write!(f, "kitty image placement: {err}"),
+            Self::NoAnimationTarget(wire) => {
+                write!(f, "kitty animation target not held: i={wire}")
+            }
             Self::LocalRead(err) => write!(f, "kitty local file/shm read: {err}"),
         }
     }
@@ -440,6 +455,10 @@ impl Runtime {
         let compressed_len = payload.len();
         let image =
             self.kitty_transmit_image(format_f, width_s, height_v, payload, compressed_len)?;
+        // S1 (#1849): tag the stored root with its wire `i=` id so later
+        // `a=f`/`a=c` commands resolve this image as their animation
+        // target (no-op for anonymous transmits).
+        self.kitty_images.set_wire_image(image, wire_image);
         if alt_active {
             return Ok(KittyDisplayOutcome::SuppressedAlternateScreen { image });
         }
@@ -622,6 +641,9 @@ impl Runtime {
         let compressed_len = payload.len();
         let image =
             self.kitty_transmit_image_owned(format_f, width_s, height_v, payload, compressed_len)?;
+        // S1 (#1849): tag the stored root with its wire `i=` id (see the
+        // borrowed seam above).
+        self.kitty_images.set_wire_image(image, wire_image);
         if alt_active {
             return Ok(KittyDisplayOutcome::SuppressedAlternateScreen { image });
         }
@@ -726,6 +748,10 @@ impl Runtime {
         let compressed_len = payload.len();
         let image =
             self.kitty_transmit_image_owned(format_f, width_s, height_v, payload, compressed_len)?;
+        // S1 (#1849): tag the stored root with its wire `i=` id so later
+        // `a=f` frames ingest through the identical path as blit roots
+        // (painting stays grid-run-only per the S4 double-paint rule).
+        self.kitty_images.set_wire_image(image, wire_image);
         if self.state.alt_screen_active() {
             return Ok(KittyDisplayOutcome::SuppressedAlternateScreen { image });
         }
@@ -755,6 +781,395 @@ impl Runtime {
             )
             .map_err(KittyImageError::Placement)?;
         Ok(KittyDisplayOutcome::VirtualPrototype { image })
+    }
+    /// Stored animation frame count for one origin-scoped wire identity
+    /// (S1, #1849, headless-observable): root included, `0` when no root
+    /// image is held for `(self.kitty_origin, wire_image)`.
+    #[must_use]
+    pub fn kitty_anim_frame_count(&self, wire_image: u32) -> u32 {
+        self.kitty_images
+            .find_root_for_origin(self.kitty_origin, wire_image)
+            .and_then(|id| self.kitty_images.frame_count(id))
+            .unwrap_or(0)
+    }
+
+    /// Current 1-based animation frame for one origin-scoped wire identity
+    /// (S1, #1849, headless-observable): the drained grid's terminal-truth
+    /// descriptor, or frame 1 when no descriptor exists (static image).
+    /// The present layer selects these bytes per placement every tick.
+    #[must_use]
+    pub fn kitty_anim_current_frame(&self, wire_image: u32) -> u32 {
+        self.kitty_current_frame_for(self.kitty_origin, wire_image)
+    }
+
+    /// Current 1-based animation frame for one origin's wire identity (S1,
+    /// #1849): that origin's terminal-truth descriptor, or frame 1 when
+    /// the wire id is anonymous, the session is gone, or no descriptor
+    /// exists. Unknown sessions fail closed to the root frame (their
+    /// placements paint nothing anyway once the session vanishes).
+    pub(super) fn kitty_current_frame_for(&self, origin: Option<u64>, wire_image: u32) -> u32 {
+        if wire_image == 0 {
+            return 1;
+        }
+        let current = match origin {
+            None => self
+                .state
+                .kitty_placements()
+                .animation(wire_image)
+                .map(|anim| anim.current()),
+            Some(token) => self
+                .pane_sessions
+                .get(&ViewId::new(token))
+                .and_then(|sess| sess.state.kitty_placements().animation(wire_image))
+                .map(|anim| anim.current()),
+        };
+        current.unwrap_or(1)
+    }
+
+    /// Decodes and appends one animation frame to a stored root image
+    /// (`a=f` with `r=0`, S1, #1849) with owned payload.
+    ///
+    /// `wire_image` is the already-resolved wire `i=` id (the caller maps
+    /// `I=` numbers through terminal truth first). The root must already
+    /// be held for `(self.kitty_origin, wire_image)` — transmit-only
+    /// roots count — otherwise the frame is homeless and refused with
+    /// [`KittyImageError::NoAnimationTarget`] before any decode work.
+    /// Decoded bytes ingest through the layer's frame bounds (per-frame
+    /// caps plus per-image/global totals, never evicting). This is the
+    /// pixel half only: it records no terminal-truth gap (direct callers
+    /// driving playback pair it with truth themselves); the `APC G` path
+    /// uses [`Self::kitty_ingest_frame`], which records the gap on pixel
+    /// success so truth gaps never outnumber stored frames. Cached blits
+    /// drop wholesale (frame bytes changed).
+    ///
+    /// Returns the new 1-based frame number.
+    ///
+    /// # Errors
+    ///
+    /// [`KittyImageError::NoAnimationTarget`] for unheld wire ids,
+    /// [`KittyImageError::UnknownFormat`] for unsupported `f=` values,
+    /// [`KittyImageError::Decode`] for empty, underspecified, oversize,
+    /// length-mismatched, or malformed payloads, or
+    /// [`KittyImageError::Placement`] when the frame trips a layer bound.
+    /// Failures store nothing and evict nothing.
+    pub fn kitty_append_frame_owned(
+        &mut self,
+        format_f: u32,
+        width_s: Option<u32>,
+        height_v: Option<u32>,
+        payload: Box<[u8]>,
+        wire_image: u32,
+    ) -> Result<u32, KittyImageError> {
+        let root = self
+            .kitty_images
+            .find_root_for_origin(self.kitty_origin, wire_image)
+            .ok_or(KittyImageError::NoAnimationTarget(wire_image))?;
+        let decoded = Self::decode_frame_owned(format_f, width_s, height_v, payload)?;
+        let frame_no = self
+            .kitty_images
+            .append_frame(root, decoded.width, decoded.height, decoded.rgba)
+            .map_err(KittyImageError::Placement)?;
+        // S6 (#1849): frame bytes changed, so cached blits of this image
+        // are stale budget; drop them wholesale (the generation in the key
+        // is defense-in-depth for any future mutation path).
+        self.invalidate_kitty_raster_cache();
+        Ok(frame_no)
+    }
+
+    /// Shared wire-format admission plus Core-owned decode for one owned
+    /// frame payload (S1, #1849): maps `f=` without guessing, runs the
+    /// pre-allocation validator, then decodes. No pixel buffer exists
+    /// before the pre-check passes.
+    fn decode_frame_owned(
+        format_f: u32,
+        width_s: Option<u32>,
+        height_v: Option<u32>,
+        payload: Box<[u8]>,
+    ) -> Result<bitty_rich::KittyDecodedImage, KittyImageError> {
+        let wire_len = payload.len();
+        Self::precheck_transmit(format_f, width_s, height_v, wire_len)?;
+        bitty_rich::kitty_decode::decode_kitty_payload_owned(format_f, width_s, height_v, payload)
+            .map_err(|err| KittyImageError::Decode(bitty_rich::KittyPrecheckError::from(err)))
+    }
+
+    /// Composes a rect from one stored frame onto another in place (`a=c`,
+    /// S1, #1849).
+    ///
+    /// `wire_image` is the already-resolved wire `i=` id; `dest_frame` /
+    /// `src_frame` are the 1-based `c=` / `r=` frames; `(x, y, w, h)` is
+    /// the wire rect addressing the same position on both frames; `mode`
+    /// is the `X=` blend (0) / replace (1) mode (`Y=` background is
+    /// reserved for frame creation and ignored — see the
+    /// `bitty_rich::kitty_place` frame-store note). Bounds, modes, and
+    /// refusal posture are the layer's ([`KittyImageError::Placement`]
+    /// taxonomy). Cached blits drop wholesale and the composed image's
+    /// spans damage (scoped, generation-bumping) so the next tick
+    /// repaints exactly the affected placements.
+    ///
+    /// # Errors
+    ///
+    /// [`KittyImageError::NoAnimationTarget`] for unheld wire ids, else
+    /// the layer [`KittyImageError::Placement`] taxonomy. Failures compose
+    /// nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kitty_compose_frames(
+        &mut self,
+        wire_image: u32,
+        dest_frame: u32,
+        src_frame: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        mode: u32,
+    ) -> Result<(), KittyImageError> {
+        let root = self
+            .kitty_images
+            .find_root_for_origin(self.kitty_origin, wire_image)
+            .ok_or(KittyImageError::NoAnimationTarget(wire_image))?;
+        self.kitty_images
+            .compose_frame(root, dest_frame, src_frame, x, y, w, h, mode)
+            .map_err(KittyImageError::Placement)?;
+        // S6 (#1849): composed bytes changed, so cached blits of this
+        // image are stale budget; drop them wholesale.
+        self.invalidate_kitty_raster_cache();
+        self.damage_kitty_wire(wire_image);
+        Ok(())
+    }
+
+    /// Ingests one `a=f` frame command: pixels first, truth gap second
+    /// (S1, #1849).
+    ///
+    /// `payload` is borrowed (the caller keeps ownership): direct mediums
+    /// decode it in place, local mediums (`t=f`/`t=t`/`t=s`) treat it as
+    /// the name bytes and read the object first (bounded, fail closed).
+    /// `action` is the original command for the truth apply — `a=f`
+    /// truth reads `rows_r` plus `control` only, so the same value the
+    /// parser emitted records the gap descriptor.
+    ///
+    /// Ordering (store-first, decided): the wire target resolves, then
+    /// (`r=0`) the frame decodes and appends; only on pixel success does
+    /// terminal truth record the gap descriptor. A refused frame therefore
+    /// stores nothing AND records nothing — truth gaps never outnumber
+    /// stored frames, so playback never names a missing frame. (`r>0`
+    /// edits that frame's gap in truth only; any payload is dropped with
+    /// a rate-limited warning — pixel edits go through `a=c`.) Damage and
+    /// cold observations follow the `a=p` branch shape on success.
+    ///
+    /// # Errors
+    ///
+    /// [`KittyImageError::NoAnimationTarget`] for unresolvable wire ids,
+    /// [`KittyImageError::LocalRead`] for refused medium reads, else the
+    /// decode/append taxonomy. Failures store nothing and record nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn kitty_ingest_frame(
+        &mut self,
+        format_f: u32,
+        width_s: Option<u32>,
+        height_v: Option<u32>,
+        rows_r: u16,
+        payload: &[u8],
+        control: bitty_vt::KittyControlKeys,
+        action: &TerminalAction,
+    ) -> Result<(), KittyImageError> {
+        let wire = self
+            .kitty_wire_target(control.image_id, control.image_number)
+            .ok_or(KittyImageError::NoAnimationTarget(control.image_id))?;
+        if rows_r != 0 {
+            let damage = self.state.apply(action);
+            if !damage.regions.is_empty() {
+                let generation = damage.generation;
+                self.cold_queue.push(ColdEvent::Damage { generation });
+                self.plugin_host
+                    .push_observation(HostObservation::Damage { generation });
+            }
+            if !payload.is_empty() {
+                // Gap edit with payload: truth applied above; the bytes are
+                // dropped (documented: pixel edits go through `a=c`). Loud,
+                // rate-limited: a well-formed client never sends pixels on
+                // an edit.
+                if let Some(suppressed) = self.kitty_log.admit_now() {
+                    eprintln!(
+                        "bitty: ignoring kitty animation frame payload on gap edit (r={rows_r}): stored nothing{}",
+                        log_throttle::suppressed_suffix(suppressed)
+                    );
+                }
+            }
+            return Ok(());
+        }
+        // New frame (`r=0`): resolve the root before any decode work, so
+        // homeless frames fail fast without allocating.
+        let root = self
+            .kitty_images
+            .find_root_for_origin(self.kitty_origin, wire)
+            .ok_or(KittyImageError::NoAnimationTarget(wire))?;
+        let bytes: &[u8] = if control.medium.is_direct() {
+            payload
+        } else {
+            &self.read_frame_medium(format_f, width_s, height_v, payload, &control)?
+        };
+        // Borrowed decode (the caller keeps the wire bytes): admission is
+        // for frame arrivals (rare control-plane events), not the hot
+        // display path, so the owned zero-copy seam stays display-only.
+        Self::precheck_transmit(format_f, width_s, height_v, bytes.len())?;
+        let decoded = bitty_rich::decode_kitty_payload(format_f, width_s, height_v, bytes)
+            .map_err(|err| KittyImageError::Decode(bitty_rich::KittyPrecheckError::from(err)))?;
+        self.kitty_images
+            .append_frame(root, decoded.width, decoded.height, decoded.rgba)
+            .map_err(KittyImageError::Placement)?;
+        // Pixels stored: record the truth gap now (never before), drop
+        // cached blits wholesale, and publish damage like `a=p`.
+        let damage = self.state.apply(action);
+        if !damage.regions.is_empty() {
+            let generation = damage.generation;
+            self.cold_queue.push(ColdEvent::Damage { generation });
+            self.plugin_host
+                .push_observation(HostObservation::Damage { generation });
+        }
+        self.invalidate_kitty_raster_cache();
+        Ok(())
+    }
+
+    /// Reads one frame payload through a local medium (S1 `a=f` over S3,
+    /// #1849): the `t=f`/`t=t`/`t=s` object named by `name`, bounded and
+    /// fail closed. Returns the read bytes; the caller decodes and
+    /// appends. Failures store nothing (and delete nothing for `t=t`/`t=s`
+    /// — the unlink runs only after a successful bounded read).
+    fn read_frame_medium(
+        &self,
+        format_f: u32,
+        width_s: Option<u32>,
+        height_v: Option<u32>,
+        name: &[u8],
+        control: &bitty_vt::KittyControlKeys,
+    ) -> Result<Vec<u8>, KittyImageError> {
+        super::kitty_file::read_kitty_local(
+            control.medium,
+            name,
+            control.data_size,
+            control.data_offset,
+            format_f,
+            width_s,
+            height_v,
+        )
+        .map_err(KittyImageError::LocalRead)
+    }
+
+    /// Resolves an animation/delete wire target on the drained grid (S1,
+    /// #1849): explicit `i=` wins, else the newest image under `I=`
+    /// (terminal-truth number mapping, like the `d=n` delete path),
+    /// else nothing (`None`). Mirrors
+    /// `bitty_term_state::State::kitty_anim_target` without taking the
+    /// action, so the pty loop resolves once for pixel ingest, compose,
+    /// and identity deletes alike.
+    pub(super) fn kitty_wire_target(&self, image_id: u32, image_number: u32) -> Option<u32> {
+        if image_id != 0 {
+            return Some(image_id);
+        }
+        if image_number != 0 {
+            return self
+                .state
+                .kitty_placements()
+                .newest_with_number(image_number);
+        }
+        None
+    }
+
+    /// Scroll-adjusted, grid-clamped cell spans of one wire image's rich
+    /// placements (S1 damage helper, #1849).
+    ///
+    /// Plain transmit-and-display placements live in the presentation
+    /// layer only (the pixel path skips `state.apply` so the cursor
+    /// advances exactly once), so terminal truth knows no spans for them:
+    /// tick advance and compose derive damage spans here instead, from the
+    /// same anchor/scroll math the present layer paints with. Returns
+    /// `(top_row, left_col, rows, cols)` per visible span; placements
+    /// scrolled fully off the top or outside the `width x height` grid
+    /// contribute nothing.
+    pub(super) fn kitty_wire_spans_for(
+        &self,
+        origin: Option<u64>,
+        wire_image: u32,
+        scrollback_now: usize,
+        width: usize,
+        height: usize,
+    ) -> Vec<(u16, u16, u16, u16)> {
+        if wire_image == 0 || width == 0 || height == 0 {
+            return Vec::new();
+        }
+        let height_i64 = i64::try_from(height).unwrap_or(i64::MAX);
+        let width_u16 = u16::try_from(width).unwrap_or(u16::MAX);
+        self.kitty_images
+            .placements()
+            .filter(|p| p.origin == origin && p.wire_image == wire_image)
+            .filter_map(|p| {
+                let scrolled = i64::try_from(scrollback_now.saturating_sub(p.scrollback_base))
+                    .unwrap_or(i64::MAX);
+                let top = i64::from(p.anchor_row).saturating_sub(scrolled);
+                let bottom = top.saturating_add(i64::from(p.rows));
+                if bottom <= 0 || top >= height_i64 {
+                    return None;
+                }
+                let clamped_top = top.max(0) as u16;
+                let clamped_bottom = bottom.min(height_i64) as u16;
+                let rows = clamped_bottom.saturating_sub(clamped_top).max(1);
+                if p.anchor_col >= width_u16 {
+                    return None;
+                }
+                let right = p
+                    .anchor_col
+                    .saturating_add(p.cols)
+                    .min(width_u16)
+                    .max(p.anchor_col.saturating_add(1));
+                let cols = right.saturating_sub(p.anchor_col).max(1);
+                Some((clamped_top, p.anchor_col, rows, cols))
+            })
+            .collect()
+    }
+
+    /// Damages one wire image's spans on one origin's grid (S1, #1849):
+    /// terminal-truth spans (covers `a=p`/virtual placements) plus rich
+    /// spans (covers plain transmit-and-display, which truth never
+    /// records — see [`Self::kitty_wire_spans_for`]). Other images gain no
+    /// damage; origins without the image cost nothing and never wake the
+    /// frame-on-demand present.
+    pub(super) fn damage_kitty_wire_for_origin(&mut self, origin: Option<u64>, wire_image: u32) {
+        let (scrollback_now, grid_width, grid_height) = match origin {
+            None => (
+                self.state.scrollback_len(),
+                self.state.width(),
+                self.state.height(),
+            ),
+            Some(token) => match self.pane_sessions.get(&ViewId::new(token)) {
+                Some(sess) => (
+                    sess.state.scrollback_len(),
+                    sess.state.width(),
+                    sess.state.height(),
+                ),
+                None => return,
+            },
+        };
+        let spans =
+            self.kitty_wire_spans_for(origin, wire_image, scrollback_now, grid_width, grid_height);
+        match origin {
+            None => {
+                self.state.damage_kitty_image(wire_image);
+                self.state.damage_kitty_spans(&spans);
+            }
+            Some(token) => {
+                if let Some(sess) = self.pane_sessions.get_mut(&ViewId::new(token)) {
+                    sess.state.damage_kitty_image(wire_image);
+                    sess.state.damage_kitty_spans(&spans);
+                }
+            }
+        }
+    }
+
+    /// Damages one wire image's spans on the drained grid (S1, #1849):
+    /// [`Self::damage_kitty_wire_for_origin`] with `self.kitty_origin`.
+    pub(super) fn damage_kitty_wire(&mut self, wire_image: u32) {
+        let origin = self.kitty_origin;
+        self.damage_kitty_wire_for_origin(origin, wire_image);
     }
 
     /// Deletes rendered placements by origin-scoped wire identity.

@@ -202,6 +202,69 @@
 //!
 //! Storage and placement are pure functions of insertion order: same calls
 //! always yield the same ids and the same retained set.
+//!
+//! # Animation frame store (`a=f` / `a=c` playback, S1, #1849)
+//!
+//! Terminal truth (`bitty-term-state::placement`) owns the animation
+//! descriptors (frame gaps, current frame, run/stop state, loop budget);
+//! this layer owns the frame *pixels*. Frame 1 is the root image (the
+//! [`KittyPlacedImage::rgba`] bytes stored at transmit time); `a=f`
+//! appends frames 2..=N as [`KittyFrame`] records and `a=c` blends or
+//! replaces bounded rects between stored frames in place.
+//!
+//! Frame ingest reuses every shipped per-frame cap
+//! ([`KITTY_DECODE_MAX_DIMENSION`]/[`KITTY_DECODE_MAX_PIXELS`]/[`KITTY_DECODE_MAX_BYTES`]:
+//! 8192 px/side, 4096 x 4096 px area, 64 MiB RGBA) and adds two animation
+//! totals enforced before any buffer grows: at most
+//! [`KITTY_ANIM_MAX_FRAMES`] frames per image (root included) and at most
+//! [`KITTY_ANIM_MAX_BYTES_PER_IMAGE`] decoded bytes per image (64 MiB,
+//! the per-frame ceiling applied to the whole animation). The global
+//! [`KITTY_PLACE_MAX_BYTES`] (256 MiB) bound covers frame bytes too, so a
+//! frame ingest that would overflow it refuses with
+//! [`KittyPlacementError::QuotaExceeded`]. Frame ingest never evicts:
+//! refusals store nothing and evict nothing (evicting whole images to make
+//! room for one frame would drop other animations' pixels mid-playback).
+//! Every frame must match the root frame's width and height exactly
+//! ([`KittyPlacementError::FrameDimensionsMismatch`] otherwise): the
+//! raster step samples every frame at the root extent, and mixed-size
+//! frames would alias the cache key.
+//!
+//! Frame-count reconciliation (CTX-1090 open question 2, decided): the
+//! generic image store caps animations at 64 frames
+//! (`IMAGE_MAX_FRAMES`), and presentation follows it — but terminal truth
+//! allows 256 gap entries per descriptor (cheap `u32`s, no pixels). Past
+//! 64 stored frames ingest refuses with
+//! [`KittyPlacementError::TooManyFrames`]; the runtime records the truth
+//! gap only on successful ingest (store-first), so the two counts agree
+//! and the 256-gap ceiling is unreachable through the pixel path —
+//! playback still clamps the truth current frame into the stored range,
+//! and a truth frame with no stored pixels paints nothing (fail closed,
+//! same shape as a dangling placement), as defense-in-depth.
+//!
+//! `a=c` compose (CTX-1090 open question 3, decided): the single wire rect
+//! (`x=`, `y=`, `w=`, `h=`) addresses the same position on both frames —
+//! source frame `r=`, destination frame `c=` — and must lie inside the
+//! frame bounds with checked `u64` arithmetic, else the compose refuses
+//! with [`KittyPlacementError::ComposeOutOfBounds`] and composes nothing
+//! (this includes empty rects and rect-end overflow past `u32::MAX`).
+//! `X=0` alpha-blends the source over the destination (straight-alpha
+//! src-over, rounded integer math, pinned by test); `X=1` replaces the
+//! rect bytes outright; any other mode refuses with
+//! [`KittyPlacementError::UnknownComposeMode`]. `Y=` (frame background
+//! color) is reserved for frame creation and ignored by compose —
+//! documented, not refused, so future clients sending it keep working.
+//! A successful compose bumps the image generation (the cache key binds
+//! it) and the runtime drops cached blits wholesale, so no stale frame
+//! bytes can survive either path.
+//!
+//! Wire identity: every stored image carries the transmitting command's
+//! wire `i=` id ([`KittyPlacedImage::wire_image`], `0` anonymous) scoped
+//! by its origin, so `a=f`/`a=c` resolve their target without touching
+//! placements — transmit-only roots (never placed) still gain frames.
+//! Resolution takes the newest image of `(origin, wire id)`; anonymous
+//! (`0`) wire ids never resolve. Virtual (`U=1`) roots tag the same way,
+//! so virtual animations ingest through the identical path while painting
+//! stays grid-run-only (the S4 double-paint rule is unchanged).
 
 use std::collections::VecDeque;
 
@@ -279,6 +342,28 @@ pub const KITTY_PER_ORIGIN_MAX_BYTES: usize = 64 * 1024 * 1024;
 /// The per-frame blit budget (32 blits) already means placements past one
 /// origin quota rarely paint on a single pane in one frame.
 pub const KITTY_PER_ORIGIN_MAX_PLACEMENTS: usize = 32;
+
+/// Maximum animation frames per image, root frame included (S1, #1849).
+///
+/// `IMAGE_MAX_FRAMES` parity (64): the generic image store's IMG-6 bound.
+/// Terminal truth holds up to 256 gap entries per descriptor (cheap
+/// `u32`s); presentation stores pixels for at most these 64 — see the
+/// module-level frame-count reconciliation note.
+pub const KITTY_ANIM_MAX_FRAMES: usize = crate::image::IMAGE_MAX_FRAMES as usize;
+
+/// Maximum total decoded bytes per animated image (S1, #1849): the
+/// per-frame ceiling ([`KITTY_DECODE_MAX_BYTES`], 64 MiB) applied to the
+/// whole animation (root plus every appended frame). A single maximal
+/// frame already fills it; 64 one-MiB frames fit exactly.
+pub const KITTY_ANIM_MAX_BYTES_PER_IMAGE: usize = KITTY_DECODE_MAX_BYTES;
+
+/// Compose mode `X=0` (S1, #1849): alpha-blend the source rect over the
+/// destination rect (straight-alpha src-over).
+pub const KITTY_COMPOSE_BLEND: u32 = 0;
+
+/// Compose mode `X=1` (S1, #1849): replace the destination rect bytes
+/// with the source rect bytes outright.
+pub const KITTY_COMPOSE_REPLACE: u32 = 1;
 
 /// Maximum virtual prototypes retained by the registry (S4, #1849).
 ///
@@ -571,6 +656,10 @@ impl KittyPlacementId {
 // ---------------------------------------------------------------------------
 
 /// Stored decoded image: owned RGBA8 pixels in row-major order.
+///
+/// Frame 1 (the root) lives in [`Self::rgba`]; animation frames 2..=N
+/// (S1, #1849) live in [`Self::frames`]. See the module-level animation
+/// frame store note for the bounds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KittyPlacedImage {
     /// Stable handle.
@@ -582,6 +671,11 @@ pub struct KittyPlacedImage {
     /// theoretical at 2^64 stores) can never serve stale bytes: a reused
     /// id carries a fresh generation and misses. Stored bitmaps are
     /// otherwise immutable; a future in-place update path must bump this.
+    ///
+    /// S1 (`a=c` compose, #1849) is that update path: a successful compose
+    /// bumps the generation (the cache key binds it, and the runtime drops
+    /// cached blits wholesale on top), so edited frames never serve stale
+    /// bytes.
     pub generation: u64,
     /// Origin token of the transmitting stream (S5 per-origin quotas,
     /// #1849): `None` for the primary grid, `Some(token)` for a split-pane
@@ -589,14 +683,57 @@ pub struct KittyPlacedImage {
     /// only ever evicted for pressure from the same origin, never for
     /// another origin's admissions.
     pub origin: Option<u64>,
+    /// Wire `i=` image id naming this image (S1 animation target, #1849):
+    /// `0` when absent (anonymous). Scoped by [`Self::origin`]:
+    /// `a=f`/`a=c` resolve `(origin, wire_image)` to the newest stored
+    /// image, so transmit-only roots (never placed) still gain frames.
+    /// Anonymous images never resolve as animation targets.
+    pub wire_image: u32,
     /// Decoded pixel width.
     pub width: u32,
     /// Decoded pixel height.
     pub height: u32,
     /// RGBA8 bytes, exactly `width * height * 4` long.
     pub rgba: Vec<u8>,
+    /// Animation frames 2..=N (S1, #1849), oldest first. Frame 1 is the
+    /// root ([`Self::rgba`]); every entry matches the root width and
+    /// height exactly (enforced at ingest).
+    pub frames: Vec<KittyFrame>,
     /// Wire payload length (diagnostics; the bytes themselves are decoded).
     pub compressed_len: usize,
+}
+
+impl KittyPlacedImage {
+    /// Total decoded bytes held by this image: root plus every appended
+    /// frame, summed with saturation so hostile lengths can never wrap
+    /// the accounting itself.
+    #[must_use]
+    pub fn stored_bytes(&self) -> usize {
+        self.frames.iter().fold(self.rgba.len(), |acc, frame| {
+            acc.saturating_add(frame.rgba.len())
+        })
+    }
+
+    /// Frame count including the root frame (always `>= 1`).
+    #[must_use]
+    pub fn frame_count(&self) -> u32 {
+        u32::try_from(self.frames.len().saturating_add(1)).unwrap_or(u32::MAX)
+    }
+}
+
+/// One stored animation frame beyond the root (S1, #1849).
+///
+/// Same row-major straight-alpha RGBA8 shape as the root; width and height
+/// always equal the root's (enforced at ingest, re-checked fail-closed by
+/// the raster step).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KittyFrame {
+    /// Decoded pixel width (always the root width).
+    pub width: u32,
+    /// Decoded pixel height (always the root height).
+    pub height: u32,
+    /// RGBA8 bytes, exactly `width * height * 4` long.
+    pub rgba: Vec<u8>,
 }
 
 /// Placement binding one image to a cursor-anchored cell rect.
@@ -732,6 +869,65 @@ pub enum KittyPlacementError {
     },
     /// Placement references an unknown (or evicted) image.
     ImageNotFound(KittyImageId),
+    /// Animation frame ingest refused: the image already holds
+    /// [`KITTY_ANIM_MAX_FRAMES`] frames (root included). Stores nothing
+    /// and evicts nothing.
+    TooManyFrames {
+        /// Frames already held (root included).
+        count: usize,
+        /// Frame cap that refused the append.
+        cap: usize,
+    },
+    /// Animation frame ingest refused: the new frame would push the
+    /// image's decoded total past [`KITTY_ANIM_MAX_BYTES_PER_IMAGE`].
+    /// Stores nothing and evicts nothing.
+    AnimationTooLarge {
+        /// Bytes the animation would have held.
+        total: usize,
+        /// Per-image byte cap that refused the append.
+        cap: usize,
+    },
+    /// Animation frame ingest refused: the frame's dimensions differ from
+    /// the root frame's. Every frame of one image shares the root extent
+    /// (the raster step samples at the root size). Stores nothing.
+    FrameDimensionsMismatch {
+        /// Frame width.
+        width: u32,
+        /// Frame height.
+        height: u32,
+        /// Root width the frame had to match.
+        root_width: u32,
+        /// Root height the frame had to match.
+        root_height: u32,
+    },
+    /// Compose refused: `dest` or `src` names a frame with no stored
+    /// pixels (1-based; frame 1 is the root). Composes nothing.
+    NoSuchFrame {
+        /// Image the compose addressed.
+        image: KittyImageId,
+        /// Missing 1-based frame number.
+        frame: u32,
+    },
+    /// Compose refused: the rect lies outside the frame bounds, is empty,
+    /// or its end overflows `u32`. Composes nothing.
+    ComposeOutOfBounds {
+        /// Rect left edge (`x=`).
+        x: u32,
+        /// Rect top edge (`y=`).
+        y: u32,
+        /// Rect width (`w=`).
+        w: u32,
+        /// Rect height (`h=`).
+        h: u32,
+        /// Frame width the rect had to fit.
+        width: u32,
+        /// Frame height the rect had to fit.
+        height: u32,
+    },
+    /// Compose refused: the `X=` mode is neither
+    /// [`KITTY_COMPOSE_BLEND`] (0) nor [`KITTY_COMPOSE_REPLACE`] (1).
+    /// Composes nothing.
+    UnknownComposeMode(u32),
     /// Admission would exceed a global bound held by other origins.
     ///
     /// S5 per-origin quotas (#1849): eviction never crosses origins, so
@@ -762,6 +958,42 @@ impl std::fmt::Display for KittyPlacementError {
                 "kitty placement rgba of {actual} bytes does not match {expected} expected bytes"
             ),
             Self::ImageNotFound(id) => write!(f, "kitty placement image not found: {}", id.0),
+            Self::TooManyFrames { count, cap } => write!(
+                f,
+                "kitty animation of {count} frames exceeds max of {cap} frames"
+            ),
+            Self::AnimationTooLarge { total, cap } => write!(
+                f,
+                "kitty animation of {total} bytes exceeds max of {cap} bytes per image"
+            ),
+            Self::FrameDimensionsMismatch {
+                width,
+                height,
+                root_width,
+                root_height,
+            } => write!(
+                f,
+                "kitty animation frame {width}x{height} does not match root {root_width}x{root_height}"
+            ),
+            Self::NoSuchFrame { image, frame } => write!(
+                f,
+                "kitty compose frame {frame} not held by image {}",
+                image.0
+            ),
+            Self::ComposeOutOfBounds {
+                x,
+                y,
+                w,
+                h,
+                width,
+                height,
+            } => write!(
+                f,
+                "kitty compose rect {w}x{h} at ({x},{y}) outside frame {width}x{height}"
+            ),
+            Self::UnknownComposeMode(mode) => {
+                write!(f, "kitty compose unknown mode X={mode}")
+            }
             Self::QuotaExceeded => write!(
                 f,
                 "kitty quota exceeded: global bound held by other origins, refused without evicting"
@@ -904,13 +1136,14 @@ impl KittyImageLayer {
     /// Decoded RGBA bytes held by one origin (S5, #1849).
     ///
     /// Summed with saturating arithmetic over the bounded store, so the
-    /// accounting itself can never overflow on hostile inputs.
+    /// accounting itself can never overflow on hostile inputs. S1 (#1849):
+    /// covers root plus every appended animation frame.
     #[must_use]
     pub fn bytes_for_origin(&self, origin: Option<u64>) -> usize {
         self.images
             .iter()
             .filter(|img| img.origin == origin)
-            .fold(0usize, |acc, img| acc.saturating_add(img.rgba.len()))
+            .fold(0usize, |acc, img| acc.saturating_add(img.stored_bytes()))
     }
 
     /// Number of retained placements of one origin (S5, #1849).
@@ -1136,6 +1369,11 @@ impl KittyImageLayer {
     /// primary grid: accounting scans the bounded deques, so no per-origin
     /// table is ever allocated.
     ///
+    /// The wire identity defaults to anonymous (`0`); callers with a
+    /// protocol image id use
+    /// [`KittyImageLayer::store_for_origin_with_wire`] so later `a=f`/`a=c`
+    /// commands resolve this image as their animation target.
+    ///
     /// # Errors
     ///
     /// [`KittyPlacementError`] dimension/area/byte/length rejections, or
@@ -1150,6 +1388,30 @@ impl KittyImageLayer {
         rgba: Vec<u8>,
         compressed_len: usize,
         origin: Option<u64>,
+    ) -> Result<KittyImageId, KittyPlacementError> {
+        self.store_for_origin_with_wire(width, height, rgba, compressed_len, origin, 0)
+    }
+
+    /// Stores a decoded bitmap for one origin with wire identity (S1
+    /// animation targets, #1849).
+    ///
+    /// Identical to [`KittyImageLayer::store_for_origin`] except the image
+    /// records the wire `i=` id (`0` anonymous): later `a=f`/`a=c`
+    /// commands addressing `(origin, wire_image)` resolve to the newest
+    /// image stored under that pair (see
+    /// [`KittyImageLayer::find_root_for_origin`]).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`KittyImageLayer::store_for_origin`].
+    pub fn store_for_origin_with_wire(
+        &mut self,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+        compressed_len: usize,
+        origin: Option<u64>,
+        wire_image: u32,
     ) -> Result<KittyImageId, KittyPlacementError> {
         checked_bitmap(width, height, rgba.len())?;
         let bytes = rgba.len();
@@ -1174,9 +1436,11 @@ impl KittyImageLayer {
             }
             if img.origin == origin {
                 evict.push(img.id);
-                freed_bytes = freed_bytes.saturating_add(img.rgba.len());
+                // S1 (#1849): eviction frees the whole animation (root
+                // plus every appended frame), never one frame.
+                freed_bytes = freed_bytes.saturating_add(img.stored_bytes());
                 kept_count = kept_count.saturating_sub(1);
-                kept_bytes = kept_bytes.saturating_sub(img.rgba.len());
+                kept_bytes = kept_bytes.saturating_sub(img.stored_bytes());
             }
         }
         // Global pressure from other origins refuses instead of evicting a
@@ -1206,13 +1470,265 @@ impl KittyImageLayer {
             id,
             generation,
             origin,
+            wire_image,
             width,
             height,
             rgba,
+            frames: Vec::new(),
             compressed_len,
         });
         self.total_bytes = self.total_bytes.saturating_add(bytes);
         Ok(id)
+    }
+
+    /// Resolves the animation root for one origin-scoped wire identity
+    /// (S1, #1849): the newest stored image with `(origin, wire_image)`,
+    /// or `None` when no such image is held. `wire_image == 0`
+    /// (anonymous) never resolves — anonymous images are not animation
+    /// targets, mirroring the terminal-truth store.
+    #[must_use]
+    pub fn find_root_for_origin(
+        &self,
+        origin: Option<u64>,
+        wire_image: u32,
+    ) -> Option<KittyImageId> {
+        if wire_image == 0 {
+            return None;
+        }
+        self.images
+            .iter()
+            .rev()
+            .find(|img| img.origin == origin && img.wire_image == wire_image)
+            .map(|img| img.id)
+    }
+
+    /// Frame count of one stored image, root included (`None` when the
+    /// image is unknown or evicted).
+    #[must_use]
+    pub fn frame_count(&self, id: KittyImageId) -> Option<u32> {
+        self.get(id).map(|img| img.frame_count())
+    }
+
+    /// Byte view of one stored animation frame (S1, #1849): frame 1 is the
+    /// root ([`KittyPlacedImage::rgba`]), frames 2..=N are the appended
+    /// [`KittyFrame`] records. Returns the frame dimensions plus the
+    /// row-major RGBA8 bytes, or `None` when the image is unknown or the
+    /// 1-based frame has no stored pixels (fail closed: the present layer
+    /// paints nothing for truth frames past the stored range).
+    #[must_use]
+    pub fn frame_bytes(&self, id: KittyImageId, frame: u32) -> Option<(u32, u32, &[u8])> {
+        let img = self.get(id)?;
+        if frame == 1 {
+            return Some((img.width, img.height, &img.rgba));
+        }
+        let extra = img.frames.get(frame.checked_sub(2)? as usize)?;
+        Some((extra.width, extra.height, &extra.rgba))
+    }
+
+    /// Appends one animation frame to a stored image (`a=f` with `r=0`,
+    /// S1, #1849).
+    ///
+    /// `rgba` must be exactly `width * height * 4` bytes and must match
+    /// the root frame's extent (see [`KittyPlacementError`]). Every
+    /// shipped per-frame cap applies, plus the per-image
+    /// ([`KITTY_ANIM_MAX_FRAMES`], [`KITTY_ANIM_MAX_BYTES_PER_IMAGE`]) and
+    /// global ([`KITTY_PLACE_MAX_BYTES`]) totals — all checked before any
+    /// buffer grows. Frame ingest never evicts: refusals store nothing and
+    /// evict nothing. Returns the new 1-based frame number.
+    ///
+    /// # Errors
+    ///
+    /// [`KittyPlacementError::ImageNotFound`] for unknown images, the
+    /// dimension/area/byte/length rejections for over-cap frames,
+    /// [`KittyPlacementError::FrameDimensionsMismatch`] for reshaped
+    /// frames, [`KittyPlacementError::TooManyFrames`] past 64 frames,
+    /// [`KittyPlacementError::AnimationTooLarge`] past the 64 MiB
+    /// per-image total, or [`KittyPlacementError::QuotaExceeded`] when the
+    /// global store is already full.
+    pub fn append_frame(
+        &mut self,
+        id: KittyImageId,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    ) -> Result<u32, KittyPlacementError> {
+        checked_bitmap(width, height, rgba.len())?;
+        let bytes = rgba.len();
+        let slot = self
+            .images
+            .iter()
+            .position(|img| img.id == id)
+            .ok_or(KittyPlacementError::ImageNotFound(id))?;
+        {
+            let root = &self.images[slot];
+            if width != root.width || height != root.height {
+                return Err(KittyPlacementError::FrameDimensionsMismatch {
+                    width,
+                    height,
+                    root_width: root.width,
+                    root_height: root.height,
+                });
+            }
+            let count = root.frames.len().saturating_add(1);
+            if count >= KITTY_ANIM_MAX_FRAMES {
+                return Err(KittyPlacementError::TooManyFrames {
+                    count,
+                    cap: KITTY_ANIM_MAX_FRAMES,
+                });
+            }
+            let image_total = root.stored_bytes().saturating_add(bytes);
+            if image_total > KITTY_ANIM_MAX_BYTES_PER_IMAGE {
+                return Err(KittyPlacementError::AnimationTooLarge {
+                    total: image_total,
+                    cap: KITTY_ANIM_MAX_BYTES_PER_IMAGE,
+                });
+            }
+        }
+        if self.total_bytes.saturating_add(bytes) > KITTY_PLACE_MAX_BYTES {
+            return Err(KittyPlacementError::QuotaExceeded);
+        }
+        self.images[slot].frames.push(KittyFrame {
+            width,
+            height,
+            rgba,
+        });
+        self.total_bytes = self.total_bytes.saturating_add(bytes);
+        Ok(self.images[slot].frame_count())
+    }
+
+    /// Composes a rect from one stored frame onto another in place (`a=c`,
+    /// S1, #1849).
+    ///
+    /// `dest`/`src` are 1-based frame numbers (1 = root); `(x, y, w, h)`
+    /// is the wire rect addressing the same position on both frames (both
+    /// frames share the root extent, enforced at ingest); `mode` is
+    /// [`KITTY_COMPOSE_BLEND`] (src-over) or [`KITTY_COMPOSE_REPLACE`]
+    /// (byte copy). The rect must fit the frame bounds with checked `u64`
+    /// arithmetic — out-of-bounds, empty, or overflowing rects refuse with
+    /// [`KittyPlacementError::ComposeOutOfBounds`] and compose nothing.
+    /// A successful compose bumps the image generation (the raster-cache
+    /// key binds it; callers additionally drop cached blits wholesale).
+    /// `total_bytes` is unchanged (same extent, same length).
+    ///
+    /// # Errors
+    ///
+    /// [`KittyPlacementError::ImageNotFound`] for unknown images,
+    /// [`KittyPlacementError::NoSuchFrame`] for missing frames,
+    /// [`KittyPlacementError::UnknownComposeMode`] for modes past 1, or
+    /// [`KittyPlacementError::ComposeOutOfBounds`] for unplaceable rects.
+    /// Failures compose nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compose_frame(
+        &mut self,
+        id: KittyImageId,
+        dest: u32,
+        src: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        mode: u32,
+    ) -> Result<(), KittyPlacementError> {
+        if mode != KITTY_COMPOSE_BLEND && mode != KITTY_COMPOSE_REPLACE {
+            return Err(KittyPlacementError::UnknownComposeMode(mode));
+        }
+        let slot = self
+            .images
+            .iter()
+            .position(|img| img.id == id)
+            .ok_or(KittyPlacementError::ImageNotFound(id))?;
+        let count = self.images[slot].frame_count();
+        if dest == 0 || dest > count {
+            return Err(KittyPlacementError::NoSuchFrame {
+                image: id,
+                frame: dest,
+            });
+        }
+        if src == 0 || src > count {
+            return Err(KittyPlacementError::NoSuchFrame {
+                image: id,
+                frame: src,
+            });
+        }
+        let (width, height) = {
+            let root = &self.images[slot];
+            (root.width, root.height)
+        };
+        // Checked rect fit in `u64`: `u32` ends can never overflow there,
+        // and unplaceable (empty or over-edge) rects refuse. `x`/`y` at or
+        // past the edge always fail through the end checks below.
+        let end_x = u64::from(x).saturating_add(u64::from(w));
+        let end_y = u64::from(y).saturating_add(u64::from(h));
+        if w == 0 || h == 0 || end_x > u64::from(width) || end_y > u64::from(height) {
+            return Err(KittyPlacementError::ComposeOutOfBounds {
+                x,
+                y,
+                w,
+                h,
+                width,
+                height,
+            });
+        }
+        // Byte length of the rect window, checked before any copy: bounded
+        // by the frame extent (itself within the 64 MiB cap), so the temp
+        // source window below can never exceed it.
+        let stride = u64::from(width) * 4;
+        (u64::from(w))
+            .checked_mul(u64::from(h))
+            .and_then(|n| n.checked_mul(4))
+            .filter(|&n| n <= KITTY_DECODE_MAX_BYTES as u64)
+            .ok_or(KittyPlacementError::ComposeOutOfBounds {
+                x,
+                y,
+                w,
+                h,
+                width,
+                height,
+            })?;
+        // Extra-frame slot for 1-based frame numbers past the root.
+        let extra_slot = |frame: u32| (frame as usize).saturating_sub(2);
+        // Snapshot the source window first so `src == dest` (self-compose)
+        // reads stable bytes: the window is at most one frame (64 MiB),
+        // admitted above.
+        let window: Vec<u8> = {
+            let img = &self.images[slot];
+            let src_bytes: &[u8] = if src == 1 {
+                &img.rgba
+            } else {
+                &img.frames[extra_slot(src)].rgba
+            };
+            let row_bytes = (w as usize).saturating_mul(4);
+            let mut window = Vec::with_capacity(row_bytes.saturating_mul(h as usize));
+            for row in 0..h {
+                let start = ((u64::from(y) + u64::from(row)) * stride + u64::from(x) * 4) as usize;
+                let end = start.saturating_add(row_bytes);
+                window.extend_from_slice(&src_bytes[start..end]);
+            }
+            window
+        };
+        {
+            let img = &mut self.images[slot];
+            let dest_bytes: &mut [u8] = if dest == 1 {
+                &mut img.rgba
+            } else {
+                &mut img.frames[extra_slot(dest)].rgba
+            };
+            if mode == KITTY_COMPOSE_REPLACE {
+                let row_bytes = (w as usize).saturating_mul(4);
+                for row in 0..h {
+                    let start =
+                        ((u64::from(y) + u64::from(row)) * stride + u64::from(x) * 4) as usize;
+                    let end = start.saturating_add(row_bytes);
+                    let src_start = (row as usize).saturating_mul(row_bytes);
+                    let src_end = src_start.saturating_add(row_bytes);
+                    dest_bytes[start..end].copy_from_slice(&window[src_start..src_end]);
+                }
+            } else {
+                blend_rect_over(dest_bytes, &window, width, x, y, w, h);
+            }
+            img.generation = img.generation.wrapping_add(1).max(1);
+        }
+        Ok(())
     }
 
     /// Looks up a stored image by id.
@@ -1221,13 +1737,30 @@ impl KittyImageLayer {
         self.images.iter().find(|img| img.id == id)
     }
 
+    /// Tags a stored image with its wire `i=` id (S1 animation targets,
+    /// #1849). Anonymous (`0`) is a no-op; any previous tag is
+    /// overwritten (a re-place of one stored image under a new wire id
+    /// supersedes it — placements keep their own per-placement wire
+    /// identity regardless). No-op for unknown images.
+    pub fn set_wire_image(&mut self, id: KittyImageId, wire_image: u32) {
+        if wire_image == 0 {
+            return;
+        }
+        if let Some(slot) = self.images.iter_mut().find(|img| img.id == id) {
+            slot.wire_image = wire_image;
+        }
+    }
+
     /// Removes the image with `id` and its placements; `true` when removed.
+    ///
+    /// S1 (#1849): frees the whole animation (root plus every appended
+    /// frame), never one frame.
     pub fn remove(&mut self, id: KittyImageId) -> bool {
         let before = self.images.len();
         let mut removed_bytes = 0usize;
         self.images.retain(|img| {
             if img.id == id {
-                removed_bytes = removed_bytes.saturating_add(img.rgba.len());
+                removed_bytes = removed_bytes.saturating_add(img.stored_bytes());
                 false
             } else {
                 true
@@ -1491,7 +2024,9 @@ impl KittyImageLayer {
             let mut freed_bytes = 0usize;
             self.images.retain(|img| {
                 if img.origin == origin {
-                    freed_bytes = freed_bytes.saturating_add(img.rgba.len());
+                    // S1 (#1849): frees whole animations (root plus
+                    // frames), like `remove`.
+                    freed_bytes = freed_bytes.saturating_add(img.stored_bytes());
                     false
                 } else {
                     true
@@ -1681,6 +2216,59 @@ impl KittyImageLayer {
         // Viewport extent in pixels.
         let extent = metrics.extent_for(usize::from(viewport_cols), usize::from(viewport_rows));
         intersect(RectPx::new(0, 0, extent.width, extent.height), full)
+    }
+}
+
+/// Blends a packed source window over a destination frame in place
+/// (S1 `a=c` `X=0`, #1849): straight-alpha src-over per pixel with
+/// rounded integer math, no float, no allocation. `window` holds the
+/// `w*h` source pixels row-major; `dest` is the full frame addressed at
+/// `(x, y)` with row stride `width * 4`. The caller bounds the rect; all
+/// indexing here stays inside both buffers by construction.
+fn blend_rect_over(dest: &mut [u8], window: &[u8], width: u32, x: u32, y: u32, w: u32, h: u32) {
+    let stride = (width as usize).saturating_mul(4);
+    let row_bytes = (w as usize).saturating_mul(4);
+    for row in 0..h {
+        let dest_row = ((y as usize).saturating_add(row as usize)).saturating_mul(stride);
+        let src_row = (row as usize).saturating_mul(row_bytes);
+        for col in 0..w {
+            let d = dest_row
+                .saturating_add((x as usize).saturating_mul(4))
+                .saturating_add((col as usize).saturating_mul(4));
+            let s = src_row.saturating_add((col as usize).saturating_mul(4));
+            let (sr, sg, sb, sa) = (
+                u32::from(window[s]),
+                u32::from(window[s + 1]),
+                u32::from(window[s + 2]),
+                u32::from(window[s + 3]),
+            );
+            let (dr, dg, db, da) = (
+                u32::from(dest[d]),
+                u32::from(dest[d + 1]),
+                u32::from(dest[d + 2]),
+                u32::from(dest[d + 3]),
+            );
+            // Source-over: out = src + dst * (1 - sa), in `u32` with
+            // round-half-up. An opaque source covers exactly (replace
+            // parity at the endpoints); a transparent source keeps dest.
+            let w_src = sa;
+            let w_dst = da.saturating_mul(255 - sa).saturating_add(127) / 255;
+            let out_a = (w_src + w_dst).min(255);
+            if out_a == 0 {
+                dest[d..d + 4].copy_from_slice(&[0, 0, 0, 0]);
+                continue;
+            }
+            let blend = |sc: u32, dc: u32| {
+                ((sc.saturating_mul(w_src)
+                    .saturating_add(dc.saturating_mul(w_dst)))
+                .saturating_add(out_a / 2)
+                    / out_a) as u8
+            };
+            dest[d] = blend(sr, dr);
+            dest[d + 1] = blend(sg, dg);
+            dest[d + 2] = blend(sb, db);
+            dest[d + 3] = out_a as u8;
+        }
     }
 }
 

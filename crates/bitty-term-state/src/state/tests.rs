@@ -2399,6 +2399,58 @@ fn kitty_animation_control_and_frame_cap() {
 }
 
 #[test]
+fn kitty_tick_advance_damages_only_changed_images() {
+    // S1 (#1849) seam contract: `advance_kitty_animations` returns the
+    // wire ids whose frame changed, damages exactly their spans, and
+    // bumps the generation only when something changed.
+    let mut s = State::new();
+    // Image 9 runs on rows 0..1; image 10 stays stopped on rows 2..3.
+    s.apply(&kitty_graphics(Some('p'), 2, 2, 0, place_keys(9, 1)));
+    s.apply(&kitty_graphics(Some('f'), 0, 0, 0, place_keys(9, 0)));
+    s.apply(&kitty_graphics(Some('p'), 2, 2, 0, place_keys(10, 2)));
+    s.apply(&kitty_graphics(Some('f'), 0, 0, 0, place_keys(10, 0)));
+    // `a=a,i=9,s=3` runs image 9 (root gapless + 40ms second frame).
+    s.apply(&TerminalAction::KittyGraphics {
+        format_f: 0,
+        width_s: Some(3),
+        height_v: None,
+        action_a: Some('a'),
+        cols_c: 0,
+        rows_r: 0,
+        cursor_movement_c: 0,
+        payload: Box::default(),
+        control: place_keys(9, 0),
+    });
+    let generation = s.generation();
+    let changed = s.advance_kitty_animations(100, 4);
+    assert_eq!(changed, vec![9]);
+    assert_eq!(s.kitty_placements().animation(9).unwrap().current(), 2);
+    assert_eq!(s.kitty_placements().animation(10).unwrap().current(), 1);
+    let regions = s.damage_since(generation);
+    assert!(!regions.is_empty(), "advance must damage");
+    for region in &regions {
+        match region {
+            crate::DamagedRegion::Grid(rect) => assert!(
+                rect.bottom < 2,
+                "damage must stay inside rows 0..1, got {rect:?}"
+            ),
+            crate::DamagedRegion::Scrollback { .. } => panic!("advance must not scroll"),
+        }
+    }
+    // No change: no damage, no generation bump (frame-on-demand idles).
+    let settled = s.generation();
+    let changed = s.advance_kitty_animations(0, 4);
+    assert!(changed.is_empty());
+    assert_eq!(s.generation(), settled);
+    assert!(s.damage_since(settled).is_empty());
+    // Caller-computed spans damage exactly their rect, clamped to the grid.
+    s.damage_kitty_spans(&[(0, 0, 2, 2), (1000, 1000, 2, 2)]);
+    let regions = s.damage_since(settled);
+    assert_eq!(regions.len(), 1, "off-grid span damages nothing");
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
 fn kitty_spanless_transmit_records_nothing_headless() {
     // Without `c=`/`r=` spans the grid anchor is unknowable headless
     // (pixels size it downstream): counted, not stored, cursor kept.

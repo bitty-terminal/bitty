@@ -374,8 +374,83 @@ impl Runtime {
         }
     }
 
+    /// Pinned floating panels in the window-global store (CTX-1077, #1757).
+    ///
+    /// Pinning detaches a live leaf into the pinned store and stamps it
+    /// `Floating`; the present path composites it over the active scene, so
+    /// it stays visible across workspace switches without ever living in
+    /// two trees at once. Only `Tiled`/`Floating` leaves pin (`Tiled`
+    /// converges on `Floating`); `Fullscreen`/`Scratchpad` leaves are
+    /// refused. Sessions stay keyed globally by [`ViewId`](bitty_ui::ViewId)
+    /// and are never killed here.
+    ///
+    /// Fail-closed with state untouched: unknown id, already-pinned id,
+    /// unsupported mode, or pinning the live layout's last leaf (an empty
+    /// live layout would strand focus and present).
+    pub fn pin_floating(&mut self, id: ViewId) -> Result<(), String> {
+        self.pinned
+            .pin(&mut self.layout, id)
+            .map_err(|error| error.to_string())?;
+        // Shared post-edit fixups: focus moves off the pinned leaf onto the
+        // first surviving leaf and primary-grid ownership follows (a pinned
+        // leaf is no longer in any workspace layout). Unlike the scratchpad
+        // slot, unpin does not hand primary ownership back: the handoff
+        // keeps it, so a workspace close can never strand input on a leaf
+        // that left every layout.
+        self.after_scratchpad_move(Some(id));
+        Ok(())
+    }
+
+    /// Restore the pinned leaf `id` into the live (active-workspace) layout
+    /// and focus it (CTX-1077, #1757).
+    ///
+    /// The leaf keeps its `Floating` mode: unpin returns the floating panel
+    /// to the currently active workspace; re-tiling is a separate toggle.
+    /// Fail-closed with state untouched when the leaf is not pinned.
+    pub fn unpin_floating(&mut self, id: ViewId) -> Result<ViewId, String> {
+        let id = self
+            .pinned
+            .unpin(&mut self.layout, id)
+            .map_err(|error| error.to_string())?;
+        self.focus = Focus::with_focus(id);
+        self.after_scratchpad_move(None);
+        Ok(id)
+    }
+
+    /// Toggle the window-global pinned store (CTX-1077, #1757).
+    ///
+    /// Unpins `target` when pinned (returning the restored id), otherwise
+    /// pins it (returning `None`). Same fail-closed rules as
+    /// [`Self::pin_floating`] and [`Self::unpin_floating`].
+    pub fn toggle_pinned(&mut self, target: Option<ViewId>) -> Result<Option<ViewId>, String> {
+        let id = target.ok_or_else(|| String::from("pin toggle needs a target leaf"))?;
+        if self.pinned.contains(id) {
+            self.unpin_floating(id).map(Some)
+        } else {
+            self.pin_floating(id).map(|()| None)
+        }
+    }
+
+    /// Number of pinned floating panels in the window-global store.
+    #[must_use]
+    pub fn pinned_count(&self) -> usize {
+        self.pinned.len()
+    }
+
+    /// Whether the window-global pinned store holds any panel.
+    #[must_use]
+    pub fn pinned_occupied(&self) -> bool {
+        !self.pinned.is_empty()
+    }
+
+    /// Pinned leaf ids in pin order (present-time paint order).
+    #[must_use]
+    pub fn pinned_views(&self) -> Vec<ViewId> {
+        self.pinned.ids()
+    }
+
     /// Shared post-edit fixups after the live layout lost or gained a leaf
-    /// through the scratchpad slot (CTX-0954).
+    /// through the scratchpad slot (CTX-0954) or the pinned store (CTX-1077).
     ///
     /// `hidden` is the just-parked leaf, if any: focus moves off it onto the
     /// first surviving leaf, and primary-grid ownership follows (a parked leaf
@@ -576,6 +651,10 @@ impl Runtime {
         if let Some(parked) = self.scratchpad.peek() {
             raws.push(parked.id().0);
         }
+        // CTX-1077: pinned leaves are window-owned while pinned (detached
+        // from every slot layout); covering them keeps the allocator from
+        // re-handing an id before it is unpinned.
+        raws.extend(self.pinned.ids().iter().map(|id| id.0));
         raws
     }
 
@@ -595,6 +674,19 @@ impl Runtime {
         if let Some(slot) = self.workspaces.get(index) {
             self.layout = slot.layout.clone();
             self.focus = slot.focus.clone();
+        }
+        // CTX-1077: the stashed focus may name a leaf that left every layout
+        // since (pinned, then unpinned into another workspace, then switched
+        // back here). Clamp to the first live leaf so focus never dangles
+        // behind the read guard; a still-pinned focus is kept as-is.
+        if self
+            .focus
+            .focused()
+            .is_some_and(|id| !self.layout.leaf_ids().contains(&id) && !self.pinned.contains(id))
+        {
+            if let Some(first) = self.layout.leaf_ids().into_iter().next() {
+                self.focus = Focus::with_focus(first);
+            }
         }
         // CTX-0536 (#923): loading a slot is a layout install; cover ids that
         // entered through the workspace-new / empty-reset paths.

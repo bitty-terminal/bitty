@@ -164,6 +164,7 @@ pub mod panel_persist;
 pub mod panel_rehydrate;
 pub mod panel_rules;
 pub mod panel_state;
+pub mod pinned;
 pub mod placement;
 pub mod presentation;
 pub mod provider;
@@ -268,6 +269,7 @@ pub use panel_state::{
     PanelAttention, PanelFocusState, PanelInteraction, PanelLifecycle, PanelStateError,
     PanelVisibility, SevenPanelState,
 };
+pub use pinned::{PIN_CMD_TOGGLE, PinnedEntry, PinnedError, PinnedStore, apply_pin_toggle};
 pub use presentation::{
     FLOATING_CMD_TOGGLE, FloatingToggleError, PRESENTATION_CMD_FLOATING,
     PRESENTATION_CMD_FULLSCREEN, PRESENTATION_CMD_SCRATCHPAD, PRESENTATION_CMD_TILED,

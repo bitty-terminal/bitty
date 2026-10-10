@@ -1117,6 +1117,7 @@ impl Runtime {
                 action_a: Some('c'),
                 cols_c,
                 rows_r,
+                cursor_movement_c,
                 control,
                 ..
             } = action
@@ -1124,15 +1125,19 @@ impl Runtime {
                 let wire = self.kitty_wire_target(control.image_id, control.image_number);
                 match wire {
                     Some(target) => {
+                        // Kitty `a=c` wire map: `X=`/`Y=` source offset,
+                        // `x=`/`y=` destination offset, `C=` mode.
                         let composed = self.kitty_compose_frames(
                             target,
                             u32::from(cols_c),
                             u32::from(rows_r),
+                            control.cell_x_offset,
+                            control.cell_y_offset,
                             control.src_x,
                             control.src_y,
                             control.src_w,
                             control.src_h,
-                            control.cell_x_offset,
+                            u32::from(cursor_movement_c),
                         );
                         match composed {
                             Ok(()) => {

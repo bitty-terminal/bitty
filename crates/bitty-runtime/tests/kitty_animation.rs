@@ -230,11 +230,17 @@ fn scrolled_off_placement_keeps_time() {
 fn compose_replace_changes_painted_pixels() {
     let mut rt = make_runtime();
     running_two_frame(&mut rt);
-    rt.tick_at(Instant::now());
+    // Frozen virtual clock: both presents see the same instant, so any
+    // repaint below comes from the compose itself, never from a 40ms gap
+    // elapsing on a slow shard.
+    let t0 = Instant::now();
+    rt.tick_at(t0);
     let before = rt.headless_rgba().expect("frame must exist");
-    // Replace frame 1's top-left pixel with frame 2's (blue).
-    rt.handle_pty_bytes(&apc("Ga=c,i=1,r=2,c=1,x=0,y=0,w=1,h=1,X=1,m=0;"));
-    rt.tick();
+    // Replace frame 1's top-left pixel with frame 2's bottom-right pixel
+    // (blue): distinct source (`X=`, `Y=`) and destination (`x=`, `y=`)
+    // offsets, `C=1` replace mode.
+    rt.handle_pty_bytes(&apc("Ga=c,i=1,r=2,c=1,X=1,Y=1,x=0,y=0,w=1,h=1,C=1,m=0;"));
+    rt.tick_at(t0);
     let after = rt.headless_rgba().expect("frame must exist");
     assert_ne!(before, after, "composed frame must repaint");
 }
@@ -243,13 +249,30 @@ fn compose_replace_changes_painted_pixels() {
 fn compose_out_of_bounds_refused_with_nothing_composed() {
     let mut rt = make_runtime();
     running_two_frame(&mut rt);
-    rt.tick_at(Instant::now());
+    // Frozen virtual clock (see above): a refused compose must paint
+    // nothing new even when the shard is too slow for a 40ms gap to
+    // elapse between the two presents — the old wall-clock `tick()` let
+    // the running animation advance mid-test and flaked QG2 shard 2/2.
+    let t0 = Instant::now();
+    rt.tick_at(t0);
     let before = rt.headless_rgba().expect("frame must exist");
-    // 2x2 frames: a 4-wide rect at (1,1) overflows.
-    rt.handle_pty_bytes(&apc("Ga=c,i=1,r=2,c=1,x=1,y=1,w=4,h=4,X=1,m=0;"));
-    rt.tick();
+    // 2x2 frames: source (0,0) 1x1 fits, but the destination (2,0) starts
+    // past the right edge.
+    rt.handle_pty_bytes(&apc("Ga=c,i=1,r=2,c=1,X=0,Y=0,x=2,y=0,w=1,h=1,C=1,m=0;"));
+    rt.tick_at(t0);
     let after = rt.headless_rgba().expect("frame must exist");
     assert_eq!(before, after, "refused compose must paint nothing new");
+}
+
+#[test]
+fn partial_frame_with_base_stores_instead_of_mismatching() {
+    let mut rt = make_runtime();
+    display_root(&mut rt);
+    // 1x1 opaque blue (`f=32`) at offset (1,0), composited onto the red
+    // root as base (`c=1`, `X=1` replace): a valid partial frame the old
+    // exact-extent ingest refused with `FrameDimensionsMismatch`.
+    rt.handle_pty_bytes(&apc("Gf=32,s=1,v=1,a=f,i=1,x=1,y=0,c=1,X=1,m=0;AAD//w=="));
+    assert_eq!(rt.kitty_anim_frame_count(1), 2);
 }
 
 #[test]
@@ -390,6 +413,7 @@ fn base64_encode(bytes: &[u8]) -> String {
 }
 
 #[test]
+#[cfg(unix)]
 fn file_backed_frame_reuses_s3_read() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -402,12 +426,36 @@ fn file_backed_frame_reuses_s3_read() {
     display_root(&mut rt);
     // `a=f` with `t=f` names the frame object; the S3 sandbox reads it
     // (bounded, fail closed) and the bytes ingest as frame 2.
-    #[cfg(unix)]
     let path_bytes = {
         use std::os::unix::ffi::OsStrExt;
         file.as_os_str().as_bytes().to_vec()
     };
-    #[cfg(not(unix))]
+    let mut seq = "\x1b_Gf=32,s=2,v=2,a=f,i=1,t=f,m=0;"
+        .to_string()
+        .into_bytes();
+    seq.extend_from_slice(base64_encode(&path_bytes).as_bytes());
+    seq.extend_from_slice(b"\x1b\\");
+    rt.handle_pty_bytes(&seq);
+    assert_eq!(rt.kitty_anim_frame_count(1), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[cfg(windows)]
+fn file_backed_frame_denied_on_windows_keeps_file() {
+    // Windows has no `O_NOFOLLOW`/`/dev/shm` equivalent in this slice:
+    // the `t=f` frame read fails closed with `UnsupportedPlatform`
+    // before any I/O — nothing stored, file kept (mirrors the S3
+    // `file_valid_denied_on_windows_keeps_file` verdict).
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("bitty-ctx1111-anim-w-{}-{n}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir must build");
+    let file = dir.join("frame.bin");
+    std::fs::write(&file, blue_2x2()).expect("frame fixture must write");
+    let mut rt = make_runtime();
+    display_root(&mut rt);
     let path_bytes = file
         .to_str()
         .expect("test paths are UTF-8")
@@ -419,6 +467,7 @@ fn file_backed_frame_reuses_s3_read() {
     seq.extend_from_slice(base64_encode(&path_bytes).as_bytes());
     seq.extend_from_slice(b"\x1b\\");
     rt.handle_pty_bytes(&seq);
-    assert_eq!(rt.kitty_anim_frame_count(1), 2);
+    assert_eq!(rt.kitty_anim_frame_count(1), 1);
+    assert!(file.is_file(), "denied t=f frame must not delete");
     let _ = std::fs::remove_dir_all(&dir);
 }

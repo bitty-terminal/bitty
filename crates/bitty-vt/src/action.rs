@@ -1191,6 +1191,8 @@ pub enum TerminalAction {
         /// Wire `r=` explicit cell rows (`0` derives from pixels).
         rows_r: u16,
         /// Wire `C=` cursor movement flag (`0` moves cursor, `1` keeps it).
+        /// For `a=c` compose this key instead carries the composition mode
+        /// (`0` alpha blend, `1` replace).
         cursor_movement_c: u8,
         /// Base64-decoded payload bytes (assembled across `m=` chunks).
         payload: Box<[u8]>,

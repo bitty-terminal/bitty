@@ -174,11 +174,14 @@ impl KittyMedium {
 /// reference): `c`/`r` name cell spans for display but 1-based frame
 /// numbers for animation; `s`/`v` name image width/height for transmit but
 /// animation state/loop count for `a=a`; `z` names z-index for display but
-/// frame gap for animation; `X` names a cell x-offset for display but the
-/// compose/blend mode for animation; `Y` names a cell y-offset for display
-/// but the frame background color for animation. The parser stores the raw
-/// key values here (and in the base fields); the accessors below give the
-/// per-action view so each consumer reads the meaning its action defines.
+/// frame gap for animation; `x`/`y` name the display source rect but the
+/// `a=c` destination offset (and the `a=f` partial-update offset);
+/// `X`/`Y` name cell offsets for display but the `a=c` source offset (and
+/// for `a=f`, the composition mode / frame background color); `C` names
+/// cursor movement for display but the composition mode for `a=c`. The
+/// parser stores the raw key values here (and in the base fields); the
+/// accessors below give the per-action view so each consumer reads the
+/// meaning its action defines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KittyControlKeys {
     /// Wire `t=` transmission medium (`d` when absent).
@@ -196,19 +199,24 @@ pub struct KittyControlKeys {
     pub quiet: u8,
     /// Wire `d=` delete selector (`None` when absent, i.e. `a`).
     pub delete: Option<char>,
-    /// Wire `x=`/`y=` source-rectangle left/top edge in pixels.
+    /// Wire `x=` left edge in pixels: display source rect, `a=c`
+    /// destination offset, or `a=f` partial-update offset.
     pub src_x: u32,
-    /// Wire `y=` source-rectangle top edge in pixels.
+    /// Wire `y=` top edge in pixels: display source rect, `a=c`
+    /// destination offset, or `a=f` partial-update offset.
     pub src_y: u32,
-    /// Wire `w=` source-rectangle width in pixels (`0` = full width).
+    /// Wire `w=` rect width in pixels (`0` = full width): display source
+    /// rect or `a=c` rect size shared by both rectangles.
     pub src_w: u32,
-    /// Wire `h=` source-rectangle height in pixels (`0` = full height).
+    /// Wire `h=` rect height in pixels (`0` = full height): display source
+    /// rect or `a=c` rect size shared by both rectangles.
     pub src_h: u32,
-    /// Wire `X=` cell x-offset in pixels (display), or compose/blend mode
-    /// (`0` alpha blend, `1` replace) for `a=f`/`a=c`.
+    /// Wire `X=` cell x-offset in pixels (display), `a=c` source offset,
+    /// or composition mode (`0` alpha blend, `1` replace) for `a=f` frame
+    /// creation.
     pub cell_x_offset: u32,
-    /// Wire `Y=` cell y-offset in pixels (display), or 32-bit RGBA
-    /// background color for `a=f` frame creation.
+    /// Wire `Y=` cell y-offset in pixels (display), `a=c` source offset,
+    /// or 32-bit RGBA background color for `a=f` frame creation.
     pub cell_y_offset: u32,
     /// Wire `z=` z-index for display (signed; negative draws under text,
     /// below `INT32_MIN/2` draws under non-default cell backgrounds), or
@@ -304,6 +312,8 @@ pub struct KittyApcParams {
     /// [`KittyApcParams::frame_r`].
     pub rows_r: u16,
     /// Wire `C=` cursor movement (`0` moves cursor, `1` keeps it, default `0`).
+    /// For `a=c` compose this key instead carries the composition mode
+    /// (`0` alpha blend, `1` replace).
     pub cursor_movement_c: u8,
     /// Wire `m=` more-chunks (`false` when absent, i.e. single-shot/final).
     /// Honored only for direct (`t=d`) transmissions; local mediums
@@ -356,8 +366,9 @@ impl KittyApcParams {
         self.keys.z_index
     }
 
-    /// Compose/blend mode from the overloaded `X=` key (`0` alpha blend,
-    /// `1` replace).
+    /// Composition mode from the overloaded `X=` key for `a=f` frame
+    /// creation (`0` alpha blend, `1` replace). For `a=c` compose the mode
+    /// is the overloaded `C=` key ([`Self::cursor_movement_c`]).
     #[must_use]
     pub const fn compose_mode(self) -> u32 {
         self.keys.cell_x_offset
@@ -416,8 +427,9 @@ impl KittyCompleted {
         self.keys.z_index
     }
 
-    /// Compose/blend mode from the overloaded `X=` key. See
-    /// [`KittyApcParams::compose_mode`].
+    /// Composition mode from the overloaded `X=` key for `a=f`. See
+    /// [`KittyApcParams::compose_mode`] (for `a=c` the mode is the
+    /// overloaded `C=` key, `cursor_movement_c`).
     #[must_use]
     pub const fn compose_mode(&self) -> u32 {
         self.keys.cell_x_offset
@@ -508,6 +520,8 @@ pub struct KittyCompleted {
     /// Wire `r=` rows (`0` when absent).
     pub rows_r: u16,
     /// Wire `C=` cursor movement (`0` moves cursor, `1` keeps it).
+    /// For `a=c` compose this key instead carries the composition mode
+    /// (`0` alpha blend, `1` replace).
     pub cursor_movement_c: u8,
     /// Assembled base64-decoded bytes across `m=` chunks.
     pub payload: Box<[u8]>,
@@ -2583,8 +2597,13 @@ mod tests {
         assert_eq!(done.keys.image_id, 1);
         assert_eq!((done.frame_r(), done.frame_c()), (7, 9));
         assert_eq!((done.keys.src_w, done.keys.src_h), (23, 27));
-        assert_eq!(done.compose_mode(), 4);
+        // `X=`/`Y=` are the source offset, `x=`/`y=` the destination
+        // offset, and the mode rides on `C=` (absent = blend).
+        assert_eq!((done.keys.cell_x_offset, done.keys.cell_y_offset), (4, 8));
         assert_eq!((done.keys.src_x, done.keys.src_y), (1, 3));
+        assert_eq!(done.cursor_movement_c, 0);
+        let done = completed(b"Ga=c,i=1,r=7,c=9,w=1,h=1,X=0,Y=0,x=0,y=0,C=1;");
+        assert_eq!(done.cursor_movement_c, 1);
         // A bodiless `a=q` names nothing to test-load: `f=` is mandatory
         // for queries, so this fails closed instead of completing.
         let mut assembler = KittyApcAssembler::new();

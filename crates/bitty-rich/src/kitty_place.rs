@@ -241,21 +241,30 @@
 //! and a truth frame with no stored pixels paints nothing (fail closed,
 //! same shape as a dangling placement), as defense-in-depth.
 //!
-//! `a=c` compose (CTX-1090 open question 3, decided): the single wire rect
-//! (`x=`, `y=`, `w=`, `h=`) addresses the same position on both frames —
-//! source frame `r=`, destination frame `c=` — and must lie inside the
-//! frame bounds with checked `u64` arithmetic, else the compose refuses
-//! with [`KittyPlacementError::ComposeOutOfBounds`] and composes nothing
-//! (this includes empty rects and rect-end overflow past `u32::MAX`).
-//! `X=0` alpha-blends the source over the destination (straight-alpha
-//! src-over, rounded integer math, pinned by test); `X=1` replaces the
+//! `a=c` compose (CTX-1090 open question 3, decided): the wire rect size
+//! (`w=`, `h=`, defaulting to the full frame extent) applies to two
+//! independent positions — source frame `r=` at (`X=`, `Y=`) and
+//! destination frame `c=` at (`x=`, `y=`) — and each rectangle must lie
+//! inside the frame bounds with checked `u64` arithmetic, else the compose
+//! refuses with [`KittyPlacementError::ComposeOutOfBounds`] and composes
+//! nothing (this includes empty rects and rect-end overflow past
+//! `u32::MAX`).
+//! `C=0` alpha-blends the source over the destination (straight-alpha
+//! src-over, rounded integer math, pinned by test); `C=1` replaces the
 //! rect bytes outright; any other mode refuses with
-//! [`KittyPlacementError::UnknownComposeMode`]. `Y=` (frame background
-//! color) is reserved for frame creation and ignored by compose —
-//! documented, not refused, so future clients sending it keep working.
+//! [`KittyPlacementError::UnknownComposeMode`].
 //! A successful compose bumps the image generation (the cache key binds
 //! it) and the runtime drops cached blits wholesale, so no stale frame
 //! bytes can survive either path.
+//!
+//! `a=f` partial frames: wire data smaller than the root extent (or sent
+//! with an `x=`/`y=` offset) composites onto a background canvas before
+//! ingest — wire `c=` base frame when present, else the wire `Y=` 32-bit
+//! RGBA color (transparent black when absent) — with the wire `X=`
+//! composition mode. The composed full-extent frame then ingests through
+//! the same quota-checked path as full frames, so a valid partial frame
+//! with a `c=` base stores instead of tripping
+//! [`KittyPlacementError::FrameDimensionsMismatch`].
 //!
 //! Wire identity: every stored image carries the transmitting command's
 //! wire `i=` id ([`KittyPlacedImage::wire_image`], `0` anonymous) scoped
@@ -357,11 +366,11 @@ pub const KITTY_ANIM_MAX_FRAMES: usize = crate::image::IMAGE_MAX_FRAMES as usize
 /// frame already fills it; 64 one-MiB frames fit exactly.
 pub const KITTY_ANIM_MAX_BYTES_PER_IMAGE: usize = KITTY_DECODE_MAX_BYTES;
 
-/// Compose mode `X=0` (S1, #1849): alpha-blend the source rect over the
+/// Compose mode `C=0` (S1, #1849): alpha-blend the source rect over the
 /// destination rect (straight-alpha src-over).
 pub const KITTY_COMPOSE_BLEND: u32 = 0;
 
-/// Compose mode `X=1` (S1, #1849): replace the destination rect bytes
+/// Compose mode `C=1` (S1, #1849): replace the destination rect bytes
 /// with the source rect bytes outright.
 pub const KITTY_COMPOSE_REPLACE: u32 = 1;
 
@@ -992,7 +1001,7 @@ impl std::fmt::Display for KittyPlacementError {
                 "kitty compose rect {w}x{h} at ({x},{y}) outside frame {width}x{height}"
             ),
             Self::UnknownComposeMode(mode) => {
-                write!(f, "kitty compose unknown mode X={mode}")
+                write!(f, "kitty compose unknown mode C={mode}")
             }
             Self::QuotaExceeded => write!(
                 f,
@@ -1531,7 +1540,8 @@ impl KittyImageLayer {
     /// `rgba` must be exactly `width * height * 4` bytes and must match
     /// the root frame's extent (see [`KittyPlacementError`]). Every
     /// shipped per-frame cap applies, plus the per-image
-    /// ([`KITTY_ANIM_MAX_FRAMES`], [`KITTY_ANIM_MAX_BYTES_PER_IMAGE`]) and
+    /// ([`KITTY_ANIM_MAX_FRAMES`], [`KITTY_ANIM_MAX_BYTES_PER_IMAGE`]),
+    /// per-origin ([`KITTY_PER_ORIGIN_MAX_BYTES`]), and
     /// global ([`KITTY_PLACE_MAX_BYTES`]) totals — all checked before any
     /// buffer grows. Frame ingest never evicts: refusals store nothing and
     /// evict nothing. Returns the new 1-based frame number.
@@ -1544,7 +1554,7 @@ impl KittyImageLayer {
     /// frames, [`KittyPlacementError::TooManyFrames`] past 64 frames,
     /// [`KittyPlacementError::AnimationTooLarge`] past the 64 MiB
     /// per-image total, or [`KittyPlacementError::QuotaExceeded`] when the
-    /// global store is already full.
+    /// origin or global store is already full.
     pub fn append_frame(
         &mut self,
         id: KittyImageId,
@@ -1584,6 +1594,10 @@ impl KittyImageLayer {
                 });
             }
         }
+        let origin = self.images[slot].origin;
+        if self.bytes_for_origin(origin).saturating_add(bytes) > KITTY_PER_ORIGIN_MAX_BYTES {
+            return Err(KittyPlacementError::QuotaExceeded);
+        }
         if self.total_bytes.saturating_add(bytes) > KITTY_PLACE_MAX_BYTES {
             return Err(KittyPlacementError::QuotaExceeded);
         }
@@ -1599,13 +1613,18 @@ impl KittyImageLayer {
     /// Composes a rect from one stored frame onto another in place (`a=c`,
     /// S1, #1849).
     ///
-    /// `dest`/`src` are 1-based frame numbers (1 = root); `(x, y, w, h)`
-    /// is the wire rect addressing the same position on both frames (both
-    /// frames share the root extent, enforced at ingest); `mode` is
+    /// `dest`/`src` are 1-based frame numbers (1 = root);
+    /// `(src_x, src_y)` is the wire `X=`/`Y=` source offset,
+    /// `(dst_x, dst_y)` the wire `x=`/`y=` destination offset, and
+    /// `(w, h)` the wire `w=`/`h=` rect size shared by both rectangles
+    /// (`0` defaults to the full frame width/height, per the kitty
+    /// graphics protocol). Both frames share the root extent (enforced at
+    /// ingest); `mode` is the wire `C=` composition mode,
     /// [`KITTY_COMPOSE_BLEND`] (src-over) or [`KITTY_COMPOSE_REPLACE`]
-    /// (byte copy). The rect must fit the frame bounds with checked `u64`
+    /// (byte copy). Each rect must fit the frame bounds with checked `u64`
     /// arithmetic — out-of-bounds, empty, or overflowing rects refuse with
-    /// [`KittyPlacementError::ComposeOutOfBounds`] and compose nothing.
+    /// [`KittyPlacementError::ComposeOutOfBounds`] and compose nothing
+    /// (the reported rect is the offending one).
     /// A successful compose bumps the image generation (the raster-cache
     /// key binds it; callers additionally drop cached blits wholesale).
     /// `total_bytes` is unchanged (same extent, same length).
@@ -1623,8 +1642,10 @@ impl KittyImageLayer {
         id: KittyImageId,
         dest: u32,
         src: u32,
-        x: u32,
-        y: u32,
+        src_x: u32,
+        src_y: u32,
+        dst_x: u32,
+        dst_y: u32,
         w: u32,
         h: u32,
         mode: u32,
@@ -1654,15 +1675,34 @@ impl KittyImageLayer {
             let root = &self.images[slot];
             (root.width, root.height)
         };
+        // Wire `w=`/`h=` default to the full frame extent; explicit sizes
+        // stay as sent.
+        let w = if w == 0 { width } else { w };
+        let h = if h == 0 { height } else { h };
         // Checked rect fit in `u64`: `u32` ends can never overflow there,
-        // and unplaceable (empty or over-edge) rects refuse. `x`/`y` at or
-        // past the edge always fail through the end checks below.
-        let end_x = u64::from(x).saturating_add(u64::from(w));
-        let end_y = u64::from(y).saturating_add(u64::from(h));
-        if w == 0 || h == 0 || end_x > u64::from(width) || end_y > u64::from(height) {
+        // and unplaceable (empty or over-edge) rects refuse. Offsets at or
+        // past the edge always fail through the end checks below. Each
+        // rectangle is checked against the shared frame bounds
+        // independently (kitty protocol: `X=`/`Y=` source, `x=`/`y=`
+        // destination).
+        let src_end_x = u64::from(src_x).saturating_add(u64::from(w));
+        let src_end_y = u64::from(src_y).saturating_add(u64::from(h));
+        if w == 0 || h == 0 || src_end_x > u64::from(width) || src_end_y > u64::from(height) {
             return Err(KittyPlacementError::ComposeOutOfBounds {
-                x,
-                y,
+                x: src_x,
+                y: src_y,
+                w,
+                h,
+                width,
+                height,
+            });
+        }
+        let dst_end_x = u64::from(dst_x).saturating_add(u64::from(w));
+        let dst_end_y = u64::from(dst_y).saturating_add(u64::from(h));
+        if dst_end_x > u64::from(width) || dst_end_y > u64::from(height) {
+            return Err(KittyPlacementError::ComposeOutOfBounds {
+                x: dst_x,
+                y: dst_y,
                 w,
                 h,
                 width,
@@ -1678,8 +1718,8 @@ impl KittyImageLayer {
             .and_then(|n| n.checked_mul(4))
             .filter(|&n| n <= KITTY_DECODE_MAX_BYTES as u64)
             .ok_or(KittyPlacementError::ComposeOutOfBounds {
-                x,
-                y,
+                x: src_x,
+                y: src_y,
                 w,
                 h,
                 width,
@@ -1700,7 +1740,8 @@ impl KittyImageLayer {
             let row_bytes = (w as usize).saturating_mul(4);
             let mut window = Vec::with_capacity(row_bytes.saturating_mul(h as usize));
             for row in 0..h {
-                let start = ((u64::from(y) + u64::from(row)) * stride + u64::from(x) * 4) as usize;
+                let start =
+                    ((u64::from(src_y) + u64::from(row)) * stride + u64::from(src_x) * 4) as usize;
                 let end = start.saturating_add(row_bytes);
                 window.extend_from_slice(&src_bytes[start..end]);
             }
@@ -1716,19 +1757,121 @@ impl KittyImageLayer {
             if mode == KITTY_COMPOSE_REPLACE {
                 let row_bytes = (w as usize).saturating_mul(4);
                 for row in 0..h {
-                    let start =
-                        ((u64::from(y) + u64::from(row)) * stride + u64::from(x) * 4) as usize;
+                    let start = ((u64::from(dst_y) + u64::from(row)) * stride
+                        + u64::from(dst_x) * 4) as usize;
                     let end = start.saturating_add(row_bytes);
                     let src_start = (row as usize).saturating_mul(row_bytes);
                     let src_end = src_start.saturating_add(row_bytes);
                     dest_bytes[start..end].copy_from_slice(&window[src_start..src_end]);
                 }
             } else {
-                blend_rect_over(dest_bytes, &window, width, x, y, w, h);
+                blend_rect_over(dest_bytes, &window, width, dst_x, dst_y, w, h);
             }
             img.generation = img.generation.wrapping_add(1).max(1);
         }
         Ok(())
+    }
+
+    /// Builds one full-extent animation frame from partial wire data and
+    /// appends it (`a=f` partial ingest, S1, #1849).
+    ///
+    /// The kitty graphics protocol sends partial frames as a small
+    /// `width` x `height` payload at wire offset (`x=`, `y=`) composited
+    /// onto a background canvas: wire `c=` base frame `base_frame` (0 for
+    /// none), else the wire `Y=` 32-bit RGBA `background` color (0 for
+    /// transparent black), with wire `X=` composition `mode`
+    /// ([`KITTY_COMPOSE_BLEND`] src-over or [`KITTY_COMPOSE_REPLACE`]
+    /// byte copy). The composed full-extent frame then ingests through
+    /// [`Self::append_frame`], so every per-image/per-origin/global quota
+    /// still binds and ingest still never evicts.
+    ///
+    /// # Errors
+    ///
+    /// [`KittyPlacementError::ImageNotFound`] for unknown images,
+    /// [`KittyPlacementError::UnknownComposeMode`] for modes past 1,
+    /// [`KittyPlacementError::NoSuchFrame`] for a missing base frame,
+    /// [`KittyPlacementError::ComposeOutOfBounds`] when the update rect
+    /// leaves the root extent, else the [`Self::append_frame`] taxonomy.
+    /// Failures store nothing and evict nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_frame_composited(
+        &mut self,
+        id: KittyImageId,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+        base_frame: u32,
+        background: u32,
+        mode: u32,
+    ) -> Result<u32, KittyPlacementError> {
+        checked_bitmap(width, height, rgba.len())?;
+        if mode != KITTY_COMPOSE_BLEND && mode != KITTY_COMPOSE_REPLACE {
+            return Err(KittyPlacementError::UnknownComposeMode(mode));
+        }
+        let slot = self
+            .images
+            .iter()
+            .position(|img| img.id == id)
+            .ok_or(KittyPlacementError::ImageNotFound(id))?;
+        let (root_width, root_height) = {
+            let root = &self.images[slot];
+            (root.width, root.height)
+        };
+        let end_x = u64::from(x).saturating_add(u64::from(width));
+        let end_y = u64::from(y).saturating_add(u64::from(height));
+        if width == 0
+            || height == 0
+            || end_x > u64::from(root_width)
+            || end_y > u64::from(root_height)
+        {
+            return Err(KittyPlacementError::ComposeOutOfBounds {
+                x,
+                y,
+                w: width,
+                h: height,
+                width: root_width,
+                height: root_height,
+            });
+        }
+        // Background canvas: the base frame's bytes, else the `Y=` color
+        // fill (32-bit RGBA, big-endian byte order: `0xff0000ff` is opaque
+        // red), else transparent black.
+        let mut canvas: Vec<u8> = if base_frame != 0 {
+            let img = &self.images[slot];
+            let count = img.frame_count();
+            if base_frame > count {
+                return Err(KittyPlacementError::NoSuchFrame {
+                    image: id,
+                    frame: base_frame,
+                });
+            }
+            let base: &[u8] = if base_frame == 1 {
+                &img.rgba
+            } else {
+                &img.frames[(base_frame as usize).saturating_sub(2)].rgba
+            };
+            base.to_vec()
+        } else {
+            background
+                .to_be_bytes()
+                .repeat((root_width as usize).saturating_mul(root_height as usize))
+        };
+        if mode == KITTY_COMPOSE_REPLACE {
+            let stride = (root_width as usize).saturating_mul(4);
+            let row_bytes = (width as usize).saturating_mul(4);
+            for row in 0..height {
+                let dest = ((y as usize).saturating_add(row as usize)).saturating_mul(stride)
+                    + (x as usize).saturating_mul(4);
+                let src = (row as usize).saturating_mul(row_bytes);
+                canvas[dest..dest.saturating_add(row_bytes)]
+                    .copy_from_slice(&rgba[src..src.saturating_add(row_bytes)]);
+            }
+        } else {
+            blend_rect_over(&mut canvas, &rgba, root_width, x, y, width, height);
+        }
+        self.append_frame(id, root_width, root_height, canvas)
     }
 
     /// Looks up a stored image by id.
@@ -2220,7 +2363,7 @@ impl KittyImageLayer {
 }
 
 /// Blends a packed source window over a destination frame in place
-/// (S1 `a=c` `X=0`, #1849): straight-alpha src-over per pixel with
+/// (S1 `a=c` `C=0`, #1849): straight-alpha src-over per pixel with
 /// rounded integer math, no float, no allocation. `window` holds the
 /// `w*h` source pixels row-major; `dest` is the full frame addressed at
 /// `(x, y)` with row stride `width * 4`. The caller bounds the rect; all

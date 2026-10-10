@@ -896,11 +896,11 @@ impl Runtime {
     /// S1, #1849).
     ///
     /// `wire_image` is the already-resolved wire `i=` id; `dest_frame` /
-    /// `src_frame` are the 1-based `c=` / `r=` frames; `(x, y, w, h)` is
-    /// the wire rect addressing the same position on both frames; `mode`
-    /// is the `X=` blend (0) / replace (1) mode (`Y=` background is
-    /// reserved for frame creation and ignored — see the
-    /// `bitty_rich::kitty_place` frame-store note). Bounds, modes, and
+    /// `src_frame` are the 1-based `c=` / `r=` frames; `(src_x, src_y)` is
+    /// the wire `X=`/`Y=` source offset, `(dst_x, dst_y)` the wire `x=`/`y=`
+    /// destination offset, and `(w, h)` the wire `w=`/`h=` rect size shared
+    /// by both rectangles (`0` defaults to the full frame extent); `mode`
+    /// is the `C=` blend (0) / replace (1) mode. Bounds, modes, and
     /// refusal posture are the layer's ([`KittyImageError::Placement`]
     /// taxonomy). Cached blits drop wholesale and the composed image's
     /// spans damage (scoped, generation-bumping) so the next tick
@@ -917,8 +917,10 @@ impl Runtime {
         wire_image: u32,
         dest_frame: u32,
         src_frame: u32,
-        x: u32,
-        y: u32,
+        src_x: u32,
+        src_y: u32,
+        dst_x: u32,
+        dst_y: u32,
         w: u32,
         h: u32,
         mode: u32,
@@ -928,7 +930,9 @@ impl Runtime {
             .find_root_for_origin(self.kitty_origin, wire_image)
             .ok_or(KittyImageError::NoAnimationTarget(wire_image))?;
         self.kitty_images
-            .compose_frame(root, dest_frame, src_frame, x, y, w, h, mode)
+            .compose_frame(
+                root, dest_frame, src_frame, src_x, src_y, dst_x, dst_y, w, h, mode,
+            )
             .map_err(KittyImageError::Placement)?;
         // S6 (#1849): composed bytes changed, so cached blits of this
         // image are stale budget; drop them wholesale.
@@ -955,6 +959,12 @@ impl Runtime {
     /// edits that frame's gap in truth only; any payload is dropped with
     /// a rate-limited warning — pixel edits go through `a=c`.) Damage and
     /// cold observations follow the `a=p` branch shape on success.
+    ///
+    /// Partial frames (`x=`/`y=` offset, `c=` base, `Y=` background, or a
+    /// smaller-than-root extent) composite onto the background canvas
+    /// first (kitty protocol frame creation), so valid partials store
+    /// instead of tripping the exact-extent ingest bound; full frames
+    /// append directly with no extra allocation.
     ///
     /// # Errors
     ///
@@ -1014,9 +1024,44 @@ impl Runtime {
         Self::precheck_transmit(format_f, width_s, height_v, bytes.len())?;
         let decoded = bitty_rich::decode_kitty_payload(format_f, width_s, height_v, bytes)
             .map_err(|err| KittyImageError::Decode(bitty_rich::KittyPrecheckError::from(err)))?;
-        self.kitty_images
-            .append_frame(root, decoded.width, decoded.height, decoded.rgba)
-            .map_err(KittyImageError::Placement)?;
+        // Frame creation canvas (kitty protocol): full-extent frames with
+        // no offset, base, or background append directly; anything partial
+        // composites onto the `c=` base (or `Y=` color) first, with the
+        // `X=` mode. The composed frame then takes the same
+        // quota-checked, never-evicting path as full frames.
+        let (root_w, root_h) = match self.kitty_images.frame_bytes(root, 1) {
+            Some((w, h, _)) => (w, h),
+            None => return Err(KittyImageError::NoAnimationTarget(wire)),
+        };
+        let base_frame = match action {
+            TerminalAction::KittyGraphics { cols_c, .. } => u32::from(*cols_c),
+            _ => 0,
+        };
+        if decoded.width == root_w
+            && decoded.height == root_h
+            && control.src_x == 0
+            && control.src_y == 0
+            && base_frame == 0
+            && control.cell_y_offset == 0
+        {
+            self.kitty_images
+                .append_frame(root, decoded.width, decoded.height, decoded.rgba)
+                .map_err(KittyImageError::Placement)?;
+        } else {
+            self.kitty_images
+                .append_frame_composited(
+                    root,
+                    control.src_x,
+                    control.src_y,
+                    decoded.width,
+                    decoded.height,
+                    decoded.rgba,
+                    base_frame,
+                    control.cell_y_offset,
+                    control.cell_x_offset,
+                )
+                .map_err(KittyImageError::Placement)?;
+        }
         // Pixels stored: record the truth gap now (never before), drop
         // cached blits wholesale, and publish damage like `a=p`.
         let damage = self.state.apply(action);

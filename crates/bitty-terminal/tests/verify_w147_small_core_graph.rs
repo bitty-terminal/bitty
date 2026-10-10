@@ -9,13 +9,25 @@
 //!   edge;
 //! - harness-only crates (`bitty-test-support`, `bitty-test-vm`) are
 //!   dev-dependencies only: no production (`[dependencies]`) edge anywhere;
-//! - extension mechanics (`bitty-storage`) link only through the composition
-//!   root (`bitty-terminal`), behind Core-owned traits; Core library sources
-//!   never name the storage implementation (`Core-never-imports-extension`,
-//!   W-146 DEC-W146-2);
+//! - extension mechanics (`bitty-storage`, `bitty-graphics`, `bitty-execution`,
+//!   `bitty-a11y`) link only through the composition root (`bitty-terminal`),
+//!   behind Core-owned traits; Core library sources never name an extension
+//!   implementation (`Core-never-imports-extension`, W-146 DEC-W146-2,
+//!   generalized to all four by CTX-1086 / #1890);
 //! - `bitty --safe` starts with zero third-party plugins: the safe load
 //!   policy selects nothing hostile, and the built binary skips a hostile
 //!   dev-root plugin with no VM.
+//!
+//! Source-level vs manifest-level: the `Cargo.toml` gate
+//! (`only_composition_root_links_storage_extension`) proves no production
+//! dependency edge exists, but it stays green when Core duplicates extension
+//! logic without declaring a dependency (audit CTX-1085 F10: kitty
+//! decode/raster, process supervisors, a11y model). The
+//! `core_library_sources_never_name_extension_impls` scan adds a source-reference
+//! fence by rejecting the `bitty_storage` / `bitty_execution` /
+//! `bitty_graphics` / `bitty_a11y` identifiers in Core library sources. It does
+//! not detect copied logic that contains none of these identifiers. To fence a fifth
+//! extension crate, add one entry to `EXTENSION_CRATES` (storage stays first).
 //!
 //! Graph evidence beyond assertion: `cargo tree -e normal` (recorded in the
 //! CTX-0940 verification report) shows `bitty-storage` reachable only from
@@ -337,40 +349,60 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 #[test]
-fn core_library_sources_never_name_storage_impl() {
-    // Core-never-imports-extension at the source level: the only Rust source
-    // allowed to name `bitty_storage::` paths is the composition-root seam
-    // (`storage_backends.rs`), which implements the Core-owned backends behind
-    // Core validation. Every other crate reaches persistence through the
-    // `SessionFileBackend` / `KvCommitBackend` traits.
+fn core_library_sources_never_name_extension_impls() {
+    // Core-never-imports-extension at the source level (CTX-1086 / #1890,
+    // generalizing W-146 DEC-W146-2): no Core library source may name an
+    // extension implementation. The manifest-level gate stays green when Core
+    // duplicates extension logic without a `Cargo.toml` edge (audit CTX-1085
+    // F10), so this scan rejects the Rust identifiers directly. The only
+    // exception is the composition-root seam (`storage_backends.rs`), which
+    // may name `bitty_storage` to implement the Core-owned backends behind
+    // Core validation; every other crate reaches persistence through the
+    // `SessionFileBackend` / `KvCommitBackend` traits. `EXTENSION_CRATES[0]`
+    // stays the storage seam so the storage case runs first; to fence a fifth
+    // extension crate, add one entry to `EXTENSION_CRATES`.
     let root = workspace_root();
+    let members = workspace_members(&root);
+    let (first, _) = EXTENSION_CRATES
+        .split_first()
+        .expect("EXTENSION_CRATES names the linked seam first");
+    assert_eq!(
+        *first, "bitty-storage",
+        "test contract: EXTENSION_CRATES[0] is the composition-root seam"
+    );
     let seam = root
         .join("crates")
         .join("bitty-terminal")
         .join("src")
         .join("storage_backends.rs");
-    let mut offenders = Vec::new();
-    for member in workspace_members(&root) {
-        let src = root.join("crates").join(&member).join("src");
-        if !src.is_dir() {
-            continue;
-        }
-        let mut files = Vec::new();
-        rust_files(&src, &mut files);
-        for file in files {
-            if file == seam {
+    for dep in EXTENSION_CRATES {
+        let ident = dep.replace('-', "_");
+        let mut offenders = Vec::new();
+        for member in &members {
+            let src = root.join("crates").join(member).join("src");
+            if !src.is_dir() {
                 continue;
             }
-            let text = std::fs::read_to_string(&file).expect("read rs file");
-            if names_crate(&text, "bitty_storage") {
-                offenders.push(file);
+            let mut files = Vec::new();
+            rust_files(&src, &mut files);
+            for file in files {
+                // Only the storage seam may name its implementation; the
+                // graphics/execution/a11y identifiers are banned everywhere,
+                // including the seam.
+                if *dep == "bitty-storage" && file == seam {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&file).expect("read rs file");
+                if names_crate(&text, &ident) {
+                    offenders.push(file);
+                }
             }
         }
+        assert!(
+            offenders.is_empty(),
+            "Core library sources must not name the {ident} implementation: {offenders:?}"
+        );
     }
-    assert!(
-        offenders.is_empty(),
-        "Core library sources must not name the storage implementation: {offenders:?}"
-    );
 }
 
 #[test]

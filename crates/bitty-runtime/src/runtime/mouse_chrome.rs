@@ -151,7 +151,10 @@ impl Runtime {
         // has anchored (container-derived) geometry with no stored position
         // to move — free rects are a follow-up — but the grab still owns the
         // gesture (focus moves, no selection starts), so it passes the probe
-        // via `leaf_is_floating`. Tiled leaves fail soft here and the Mod
+        // via `leaf_is_floating`. A pinned leaf passes the same way
+        // (CTX-1081: detached from the tree yet presented at Float tier);
+        // its motion accumulates a present-time re-anchor offset instead.
+        // Tiled leaves fail soft here and the Mod
         // tiled-drag path (`begin_tiled_drag`) owns them instead
         // (issue #1694, CTX-0966).
         if !self
@@ -208,7 +211,44 @@ impl Runtime {
             // selection/hover/capture mid-gesture. A leaf that is neither
             // movable nor floating (closed mid-drag) ends fail-soft as
             // before, and the motion falls through to normal handling.
-            if !self.leaf_is_floating(drag.leaf) {
+            //
+            // CTX-1081: a pinned leaf is anchored the same way, but its
+            // bounds are composited per present (not stored in the tree), so
+            // the drag accumulates the cell delta in the Runtime-owned
+            // re-anchor offset (`pinned_offsets`) instead of standing still:
+            // the present path adds it to the anchored bounds, the drop
+            // keeps it (the drop point becomes the new anchor), and unpin
+            // drops it. The pinned store itself is never written here.
+            //
+            // CodeRabbit 1893: the STORED offset clamps into the permitted
+            // range from `pinned_anchor` (the same base + cascade +
+            // container values the composite uses) right after the
+            // saturating add. Present only clamps the composed origin, so an
+            // unclamped store would keep a dead zone when dragging back
+            // (drag 30 past an 8-cell margin, drag back 1, the frame sits
+            // still) and teleport on a later container grow.
+            if self.pinned.contains(drag.leaf) {
+                let (cur_dx, cur_dy) = self
+                    .pinned_offsets
+                    .get(&drag.leaf)
+                    .copied()
+                    .unwrap_or((0, 0));
+                let (next_dx, next_dy) = (cur_dx.saturating_add(dx), cur_dy.saturating_add(dy));
+                let (stored_dx, stored_dy) = match self.pinned_anchor(drag.leaf) {
+                    Some(anchor) => (
+                        next_dx.clamp(anchor.dx_range.0, anchor.dx_range.1),
+                        next_dy.clamp(anchor.dy_range.0, anchor.dy_range.1),
+                    ),
+                    // Not a composited pin (defensive duplicate also living
+                    // in the base layout): the offset paints nothing, so
+                    // store it verbatim; unpin still drops the entry.
+                    None => (next_dx, next_dy),
+                };
+                self.pinned_offsets
+                    .insert(drag.leaf, (stored_dx, stored_dy));
+                self.pending_full_redraw = true;
+                self.trigger_animation(AnimationKind::Drag, Some(drag.leaf), now);
+            } else if !self.leaf_is_floating(drag.leaf) {
                 self.alt_drag = None;
                 return false;
             }
@@ -231,6 +271,11 @@ impl Runtime {
     /// Ends the active Alt+drag, if any. Returns `true` when one was active
     /// (caller skips the selection-release commit/copy: no selection was
     /// started by the grabbing press).
+    ///
+    /// CTX-1081: ending the drag keeps a pinned leaf's accumulated
+    /// re-anchor offset — the drop point is the new anchor — while a
+    /// structural float keeps its moved overlay bounds and a mode float
+    /// keeps its anchored frame.
     pub fn end_alt_drag(&mut self) -> bool {
         if self.alt_drag.is_none() {
             return false;
@@ -291,6 +336,14 @@ impl Runtime {
     /// mode-floating leaf was invisible to the Alt+drag path (the grab probe
     /// failed soft) yet eligible for the Mod tiled-drag below, which would
     /// re-parent it on release.
+    ///
+    /// CTX-1081: a pinned leaf is detached from the layout tree (the store
+    /// is read-only here — [`PinnedStore::contains`](bitty_ui::PinnedStore::contains)
+    /// only), yet the present path composites it at `Float` tier over the
+    /// active scene, so it counts as floating too. Without this arm an
+    /// Alt+press on a presented pinned frame failed soft in
+    /// [`Self::begin_alt_drag`] (no selection started, but no grab either)
+    /// while the Mod tiled-drag below could grab the covered base leaf.
     fn leaf_is_floating(&self, id: ViewId) -> bool {
         if self
             .layout
@@ -299,6 +352,9 @@ impl Runtime {
             .find(|(leaf, _)| *leaf == id)
             .is_some_and(|(_, tier)| tier.is_some())
         {
+            return true;
+        }
+        if self.pinned.contains(id) {
             return true;
         }
         self.layout

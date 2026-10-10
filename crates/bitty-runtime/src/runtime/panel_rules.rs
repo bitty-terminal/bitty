@@ -263,4 +263,67 @@ mod tests {
             bitty_ui::presentation::PresentationMode::Tiled
         );
     }
+
+    #[test]
+    #[cfg(unix)]
+    fn primary_spawn_applies_matching_rule() {
+        require_pty!();
+        use crate::Runtime;
+        let mut rt = Runtime::with_defaults().expect("defaults build");
+        rt.set_panel_spawn_rules(vec![PanelSpawnRule {
+            cmd: Some("sh".to_string()),
+            cmd_regex: None,
+            title_regex: None,
+            content: None,
+            presentation: Some(PanelPresentation::Floating),
+            width: Some(100),
+            height: Some(30),
+            workspace: None,
+            centered: None,
+        }]);
+        rt.spawn_shell_with_args("/bin/sh", &[])
+            .expect("primary spawn");
+        assert_eq!(rt.pty_size(), Some((100, 30)));
+        let owner = rt.primary_view().expect("primary owner");
+        let leaf = rt.layout().find_leaf(owner).expect("leaf present");
+        assert_eq!(
+            leaf.presentation(),
+            bitty_ui::presentation::PresentationMode::Floating
+        );
+        assert_eq!(leaf.cols(), 100);
+        assert_eq!(leaf.rows(), 30);
+        assert_eq!(rt.state().width(), 100);
+        assert_eq!(rt.state().height(), 30);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn rule_dims_are_spawn_time_request_solver_owns_steady_state() {
+        require_pty!();
+        use crate::Runtime;
+        let mut rt = Runtime::with_defaults().expect("defaults build");
+        rt.set_panel_spawn_rules(vec![PanelSpawnRule {
+            cmd: Some("sh".to_string()),
+            cmd_regex: None,
+            title_regex: None,
+            content: None,
+            presentation: None,
+            width: Some(100),
+            height: Some(30),
+            workspace: None,
+            centered: None,
+        }]);
+        let focused = rt.focused_view().expect("focused leaf");
+        rt.spawn_shell_for_view(focused, "/bin/sh", &[], 40, 12)
+            .expect("spawn");
+        // Immediate: the rule sizes the PTY at spawn.
+        assert_eq!(rt.pane_pty_size(&focused), Some((100, 30)));
+        // Steady-state: geometry sync reflows to the solver frame, which
+        // differs here (default 80x24 container cannot fit 100x30).
+        let frames = rt.present_frames();
+        let frame = frames.iter().find(|f| f.view == focused).expect("frame");
+        assert_ne!((frame.cols, frame.rows), (100, 30));
+        rt.sync_pane_geometry_to(&frames);
+        assert_eq!(rt.pane_pty_size(&focused), Some((frame.cols, frame.rows)));
+    }
 }

@@ -97,8 +97,32 @@ impl Runtime {
             let label = self.active_workspace_label();
             self.validate_view_target_at("terminal", label, primary)?;
         }
-        let cols = self.cols.min(u16::MAX as usize) as u16;
-        let rows = self.rows.min(u16::MAX as usize) as u16;
+        // CTX-1080: declarative panel rules evaluated deterministically at
+        // spawn from already-available metadata only (program plus argv,
+        // empty title, terminal content). First match wins; empty rules mean
+        // no override. Invalid patterns never match (fail-closed skip).
+        // Same evaluation as the per-view path below so a startup-command
+        // rule applies to the primary pane too.
+        let matched_rule = {
+            let cmd_line = bitty_config::panel_rules::command_line_for(program, args);
+            bitty_config::panel_rules::find_match(
+                &self.panel_spawn_rules,
+                &cmd_line,
+                "",
+                "terminal",
+            )
+            .map(|(_, rule)| rule.clone())
+        };
+        let mut cols = self.cols.min(u16::MAX as usize) as u16;
+        let mut rows = self.rows.min(u16::MAX as usize) as u16;
+        if let Some(rule) = matched_rule.as_ref() {
+            if let Some(w) = rule.width {
+                cols = w.max(1);
+            }
+            if let Some(h) = rule.height {
+                rows = h.max(1);
+            }
+        }
         let mut builder = PtyBuilder::new(program).size(cols, rows);
         // CTX-0585 (M1-25): the primary restart attach must seed its cwd from
         // the captured `OSC 7` report, exactly like a split spawn. The leaf
@@ -165,6 +189,56 @@ impl Runtime {
             // this attach (split panes drain through the pending map).
             if self.session_primary_cwd.as_ref().map(|(o, _)| *o) == Some(owner) {
                 self.session_primary_cwd = None;
+            }
+        }
+        // CTX-1080: apply the matched rule to the primary owner with the
+        // same semantics as the per-view path below. Dims are a spawn-time
+        // initial-size request (solver owns steady-state geometry, see the
+        // per-view application); presentation stamps the owner leaf
+        // verbatim; workspace moves only when the owner is focused and the
+        // target exists, otherwise skipped fail-closed.
+        if let Some(rule) = matched_rule.as_ref() {
+            if rule.width.is_some() || rule.height.is_some() {
+                self.state.resize(cols as usize, rows as usize);
+            }
+            if let Some(owner) = self.primary_view {
+                if let Some(presentation) = rule.presentation {
+                    let mode = match presentation {
+                        bitty_config::panel_rules::PanelPresentation::Tiled => {
+                            bitty_ui::presentation::PresentationMode::Tiled
+                        }
+                        bitty_config::panel_rules::PanelPresentation::Floating => {
+                            bitty_ui::presentation::PresentationMode::Floating
+                        }
+                        bitty_config::panel_rules::PanelPresentation::Scratchpad => {
+                            bitty_ui::presentation::PresentationMode::Scratchpad
+                        }
+                    };
+                    if let Some(leaf) = self.layout.find_leaf_mut(owner) {
+                        leaf.set_presentation(mode);
+                    }
+                    for slot in &mut self.workspaces {
+                        if let Some(leaf) = slot.layout.find_leaf_mut(owner) {
+                            leaf.set_presentation(mode);
+                        }
+                    }
+                }
+                if rule.width.is_some() || rule.height.is_some() {
+                    let w = rule.width.unwrap_or(cols).max(1) as usize;
+                    let h = rule.height.unwrap_or(rows).max(1) as usize;
+                    if let Some(leaf) = self.layout.find_leaf_mut(owner) {
+                        leaf.resize(w, h);
+                    }
+                }
+                if let Some(target) = rule.workspace {
+                    let target_idx = (target as usize).saturating_sub(1);
+                    if self.focus.focused() == Some(owner)
+                        && target_idx < self.workspaces.len()
+                        && target_idx != self.active_workspace_index()
+                    {
+                        let _ = self.workspace_move_focused_to(target_idx);
+                    }
+                }
             }
         }
         Ok(())
@@ -475,8 +549,13 @@ impl Runtime {
         self.drop_view_bindings_for(view);
         // CTX-1080: apply the matched rule deterministically after a
         // successful spawn. Presentation stamps the leaf verbatim (the solver
-        // ignores it, so solver output stays byte-identical); dims resize the
-        // leaf grid to match the PTY; workspace moves only when the spawned
+        // ignores it, so solver output stays byte-identical). Dims are a
+        // spawn-time initial-size request only: they size the PTY and session
+        // grid here and resize the leaf stored size to match, but steady-state
+        // geometry is solver-owned (`present_frames` derives cols/rows from
+        // the decorated content frames; `sync_pane_geometry_to` and
+        // `reflow_present_layout` reflow grid, PTY, and leaf back to the
+        // solver frame). Workspace moves only when the spawned
         // leaf is focused and the target exists, otherwise skipped
         // fail-closed. Centered is placement intent for floating panels
         // (floats already center via the overlay frame), so no extra step.

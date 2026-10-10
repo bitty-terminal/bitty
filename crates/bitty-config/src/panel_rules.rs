@@ -127,8 +127,14 @@ pub struct PanelSpawnRule {
     /// Requested presentation mode.
     pub presentation: Option<PanelPresentation>,
     /// Requested initial width in cells (`1..=1000`).
+    ///
+    /// Spawn-time request only: sizes the PTY and session grid at spawn.
+    /// Steady-state geometry stays solver-owned (a later geometry sync
+    /// reflows back to the solver frame).
     pub width: Option<u16>,
     /// Requested initial height in cells (`1..=1000`).
+    ///
+    /// Same spawn-time contract as [`Self::width`].
     pub height: Option<u16>,
     /// Requested workspace label (`1..=16`).
     pub workspace: Option<u8>,

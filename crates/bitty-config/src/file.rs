@@ -1462,14 +1462,16 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
                 let background_opacity = match w.background_opacity {
                     None => None,
                     Some(v) => {
-                        let opacity = v as f32;
-                        if !(opacity.is_finite() && (0.0..=1.0).contains(&opacity)) {
+                        // Validate before the `f32` conversion: values like
+                        // `1.00000001` round to `1.0` in `f32` and would pass
+                        // a post-conversion range check (fail-closed contract).
+                        if !(v.is_finite() && (0.0..=1.0).contains(&v)) {
                             return Err(ConfigError::validation(
                                 "window.background_opacity",
                                 format!("must be finite within [0.0, 1.0] (found {v})"),
                             ));
                         }
-                        Some(opacity)
+                        Some(v as f32)
                     }
                 };
                 let background_position = match w.background_position.as_deref() {
@@ -3907,6 +3909,11 @@ mod tests {
             ),
             (
                 r#"return { window = { opacity = 1.0, padding = 8, background_opacity = -0.1 } }"#,
+                "window.background_opacity",
+            ),
+            // Rounds to `1.0` in `f32`: must fail closed before conversion.
+            (
+                r#"return { window = { opacity = 1.0, padding = 8, background_opacity = 1.00000001 } }"#,
                 "window.background_opacity",
             ),
             (

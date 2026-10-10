@@ -530,6 +530,8 @@ fn view_leaf_global_field(leaf: &str) -> Option<&'static str> {
 
 /// Applies one present `views` leaf into the merged slot, honoring the
 /// policy-ownership rules exactly like every other scalar-replace field.
+/// (`window.*`/`decoration.*` background leaves reuse this helper; see the
+/// `views[` gate on the global fallback below.)
 ///
 /// A `SystemPolicy` pin on the matching global `decoration.*` leaf also
 /// protects the `views` leaf: a pinned field stays pinned through all
@@ -559,6 +561,14 @@ fn merge_view_leaf<T: Clone>(
             .policy_fields
             .get(&field)
             .or_else(|| {
+                // The `decoration.*` fallback protects `views[...]` leaves
+                // only (CTX-0343/CTX-0347). `window.*` merges reuse this
+                // helper but own a separate policy namespace, so a
+                // decoration pin must not reject a window setting no window
+                // pin covers; exact-field checks apply there.
+                if !base.starts_with("views[") {
+                    return None;
+                }
                 view_leaf_global_field(leaf).and_then(|global| acc.policy_fields.get(global))
             })
             .cloned();
@@ -5833,6 +5843,71 @@ mod tests {
         assert_eq!(
             merged3.source_of("window.background_image").unwrap().layer,
             LayerKind::CoreDefaults
+        );
+    }
+
+    #[test]
+    fn window_background_ignores_decoration_policy_pin() {
+        // CTX-1076: `window.*` merges reuse `merge_view_leaf`, but the
+        // `decoration.*` global fallback exists only to protect `views[...]`
+        // leaves (CTX-0343/CTX-0347). A policy pin on
+        // `decoration.background_image`/`background_fit` must not reject a
+        // user `window.*` setting no window pin covers.
+        use crate::types::{BackgroundFit, DecorationConfig};
+        let wall = std::env::temp_dir()
+            .join("wall-two.png")
+            .display()
+            .to_string();
+        let policy = LayeredPlan::new(
+            ConfigSource::new(LayerKind::SystemPolicy, Some("policy.lua")),
+            ConfigPlan {
+                decoration: Some(DecorationConfig {
+                    background_image: Some("~/policy-wall.png".to_string()),
+                    background_fit: Some(BackgroundFit::Center),
+                    ..Default::default()
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let user = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                window: Some(WindowConfig {
+                    opacity: 1.0,
+                    padding: 8,
+                    radius_px: 0,
+                    blur_radius: 0,
+                    background_image: Some(wall.clone()),
+                    background_fit: Some(BackgroundFit::Tile),
+                    ..Default::default()
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged = try_merge_layers(vec![user, policy]).expect("merge");
+        assert!(
+            merged.policy_violations.is_empty(),
+            "decoration pin must not block window.*: {:?}",
+            merged.policy_violations
+        );
+        assert_eq!(
+            merged.effective.window.background_image.as_deref(),
+            Some(wall.as_str())
+        );
+        assert_eq!(
+            merged.effective.window.background_fit,
+            Some(BackgroundFit::Tile)
+        );
+        // The decoration pin itself still holds on the global leaves.
+        assert_eq!(
+            merged.effective.decoration.background_image.as_deref(),
+            Some("~/policy-wall.png")
+        );
+        assert_eq!(
+            merged.effective.decoration.background_fit,
+            Some(BackgroundFit::Center)
         );
     }
 

@@ -437,3 +437,63 @@ fn ed2_clear_keeps_store_shape_under_quotas() {
         "ED2 clears placements only; stored images stay inert"
     );
 }
+
+#[test]
+fn focused_cursor_wins_over_covering_image() {
+    // #1849 S7 cursor-on-top: an image rect covering the cursor cell must
+    // not hide the focused cursor. The cursor fill stays in the overlay
+    // after the combined images, so the headless pixel at the cursor cell
+    // carries the theme cursor hue while a sibling covered cell stays
+    // image red. The cursor overlay is not counted in the 32-blit budget.
+    use bitty_runtime::RuntimeConfig;
+
+    let mut rt = make_runtime();
+    // 2x2-cell opaque red image placed at the cursor origin (0,0); the
+    // cursor advances past it to (2,2).
+    let _ = rt
+        .kitty_display_image(32, Some(2), Some(2), None, 2, 2, 0, &red_2x2(), 0)
+        .expect("display must succeed");
+    assert!(rt.tick().is_some(), "display forces a present");
+    assert_eq!(rt.kitty_last_frame_images(), 1);
+    // Move the cursor back onto the image-covered cell (0,0).
+    rt.handle_pty_bytes(b"\x1b[1;1H");
+    let stats = rt.tick().expect("cursor move must present");
+    assert_eq!(
+        rt.kitty_last_frame_images(),
+        1,
+        "covering image must still composite its blit"
+    );
+    assert_eq!(
+        stats.images, 1,
+        "cursor overlay must not consume the blit budget"
+    );
+    // Same geometry pins as `tick_cursor_overlay_uses_theme_cursor_hue`
+    // in `runtime_present.rs`: default 9x19 cells, 8px window padding,
+    // 14px decoration inset, 736px window width.
+    let cfg = RuntimeConfig::default();
+    assert_eq!((cfg.cell_width, cfg.cell_height), (9, 19));
+    let pad = usize::try_from(rt.window_padding_physical()).expect("pad fits usize");
+    assert_eq!(pad, 8, "default padding inset is 8px at scale 1.0");
+    const DECORATION: usize = 14;
+    let width = usize::try_from(cfg.window_extent().width()).expect("width fits usize");
+    let rgba = rt.headless_rgba().expect("rgba after tick");
+    // Cursor cell (0,0): theme cursor #f5e0dc at 0xA0 alpha, premultiplied
+    // overwrite by the overlay fill — not image red.
+    let cx = pad + DECORATION + 4;
+    let cy = pad + DECORATION + 9;
+    let idx = (cy * width + cx) * 4;
+    assert_eq!(
+        &rgba[idx..idx + 4],
+        &[153, 140, 138, 160],
+        "cursor cell covered by the image must still carry the cursor hue"
+    );
+    // Sibling covered cell (1,0): opaque image red, proving the punch is
+    // confined to the cursor rect.
+    let rx = pad + DECORATION + cfg.cell_width as usize + 4;
+    let ridx = (cy * width + rx) * 4;
+    assert_eq!(
+        &rgba[ridx..ridx + 4],
+        &[255, 0, 0, 255],
+        "non-cursor covered cell must stay image red"
+    );
+}

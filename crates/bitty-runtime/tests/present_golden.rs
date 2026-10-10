@@ -220,7 +220,13 @@ fn golden_selection_overlay() {
     // highlight past the frame into the decoration band. The frame-clipped
     // paint is the intended behavior change; the rest of the matrix is
     // byte-identical.
-    assert_digest("selection", &rt, &selected, 0x58a2_9eb5_707e_b630);
+    // Re-recorded under #1849 S7 (CTX-1104): the focused cursor fill now
+    // paints last in the overlay vector so the cursor stays visible over a
+    // same-cell selection (terminal convention, reviewer PX-5559 ACCEPTABLE).
+    // The delta is exactly one 9x19 cell (171 px) at the cursor rect: cursor
+    // hue 0xA0-alpha replaces selection hue there; stats (fills=45,
+    // images=0) and the IME caret are unchanged.
+    assert_digest("selection", &rt, &selected, 0x5c80_fabc_d84e_7799);
 }
 
 #[test]
@@ -229,7 +235,13 @@ fn golden_ime_preedit_overlay() {
     let _ = rt.tick().expect("first tick presents");
     rt.handle_ime_preedit(Some("preedit".to_string()), Some(2));
     let shown = rt.tick().expect("preedit present");
-    assert_digest("preedit_shown", &rt, &shown, 0xaa44_398b_363b_1700);
+    // Re-recorded under #1849 S7 (CTX-1104): same cursor-on-top order as
+    // the selection golden above. The focused cursor fill now paints last
+    // in the overlay vector (after the IME preedit background/underline/
+    // caret fills), so the same-cell cursor rect carries the cursor hue.
+    // Delta is exactly one 9x19 cell (171 px) at the IME caret rect;
+    // stats (fills=26, images=0) and the caret (21,21,9,19) are unchanged.
+    assert_digest("preedit_shown", &rt, &shown, 0x29a3_4e74_5a12_f3a7);
     rt.handle_ime_preedit(None, None);
     let cleared = rt.tick().expect("preedit clear present");
     assert_digest("preedit_cleared", &rt, &cleared, 0xa769_7a2c_a636_3963);

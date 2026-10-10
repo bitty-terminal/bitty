@@ -68,10 +68,45 @@ const BASH_SCRIPT: &str = r#"# bitty shell integration for Bash (static; generat
 # - Prompt hooks: OSC 7 cwd report plus OSC 133 prompt-start (A) and
 #   command-done-with-status (D) marks (observation only; ignored by
 #   terminals without support).
+# - OSC 7 cwd is percent-encoded (RFC 3986 unreserved plus slash kept).
+#   Hostname passes through verbatim (DNS-safe, authority must match).
 if [ -z "${_BITTY_SHELL_INIT:-}" ]; then
     _BITTY_SHELL_INIT=1
+    # Encode a path for OSC 7: keep unreserved and slash, encode the rest.
+    # Drive-letter colon (C:/) survives for the file URI convention.
+    _bitty_urlencode() {
+        local LC_ALL=C
+        local _bitty_input
+        _bitty_input="${1:-}"
+        local _bitty_len
+        _bitty_len=${#_bitty_input}
+        local _bitty_i
+        local _bitty_c
+        local _bitty_o
+        local _bitty_out=""
+        for (( _bitty_i = 0; _bitty_i < _bitty_len; _bitty_i++ )); do
+            _bitty_c="${_bitty_input:_bitty_i:1}"
+            case "$_bitty_c" in
+                [A-Za-z0-9.~_/-])
+                    _bitty_o="$_bitty_c"
+                    ;;
+                :)
+                    if [[ $_bitty_i -eq 1 && ${_bitty_input:0:1} == [A-Za-z] && ${_bitty_input:2:1} == "/" ]]; then
+                        _bitty_o=":"
+                    else
+                        _bitty_o="%3A"
+                    fi
+                    ;;
+                *)
+                    printf -v _bitty_o '%%%02X' "'$_bitty_c"
+                    ;;
+            esac
+            _bitty_out+="$_bitty_o"
+        done
+        printf '%s' "$_bitty_out"
+    }
     _bitty_osc7() {
-        printf '\e]7;file://%s%s\e\\' "$HOSTNAME" "$PWD"
+        printf '\e]7;file://%s%s\e\\' "$HOSTNAME" "$(_bitty_urlencode "$PWD")"
     }
     _bitty_prompt_hook() {
         local _bitty_status=$?
@@ -102,10 +137,45 @@ const ZSH_SCRIPT: &str = r#"# bitty shell integration for Zsh (static; generated
 # - Prompt hooks: OSC 7 cwd report plus OSC 133 prompt-start (A) and
 #   command-done-with-status (D) marks (observation only; ignored by
 #   terminals without support).
+# - OSC 7 cwd is percent-encoded (RFC 3986 unreserved plus slash kept).
+#   Hostname passes through verbatim (DNS-safe, authority must match).
 if (( ! ${+_BITTY_SHELL_INIT} )); then
     typeset -g _BITTY_SHELL_INIT=1
+    # Encode a path for OSC 7: keep unreserved and slash, encode the rest.
+    # Drive-letter colon (C:/) survives for the file URI convention.
+    _bitty_urlencode() {
+        local LC_ALL=C
+        local _bitty_input
+        _bitty_input="${1:-}"
+        local _bitty_len
+        _bitty_len=${#_bitty_input}
+        local _bitty_i
+        local _bitty_c
+        local _bitty_o
+        local _bitty_out=""
+        for (( _bitty_i = 0; _bitty_i < _bitty_len; _bitty_i++ )); do
+            _bitty_c="${_bitty_input:_bitty_i:1}"
+            case "$_bitty_c" in
+                [A-Za-z0-9.~_/-])
+                    _bitty_o="$_bitty_c"
+                    ;;
+                :)
+                    if [[ $_bitty_i -eq 1 && ${_bitty_input:0:1} == [A-Za-z] && ${_bitty_input:2:1} == "/" ]]; then
+                        _bitty_o=":"
+                    else
+                        _bitty_o="%3A"
+                    fi
+                    ;;
+                *)
+                    printf -v _bitty_o '%%%02X' "'$_bitty_c"
+                    ;;
+            esac
+            _bitty_out+="$_bitty_o"
+        done
+        printf '%s' "$_bitty_out"
+    }
     _bitty_osc7() {
-        printf '\e]7;file://%s%s\e\\' "$HOST" "$PWD"
+        printf '\e]7;file://%s%s\e\\' "$HOST" "$(_bitty_urlencode "$PWD")"
     }
     _bitty_prompt_hook() {
         local _bitty_status=$?
@@ -131,12 +201,23 @@ const FISH_SCRIPT: &str = r#"# bitty shell integration for Fish (static; generat
 # - Prompt hooks: OSC 7 cwd report plus OSC 133 prompt-start (A) and
 #   command-done-with-status (D) marks (observation only; ignored by
 #   terminals without support).
+# - OSC 7 cwd is percent-encoded (RFC 3986 unreserved plus slash kept).
+#   Hostname passes through verbatim (DNS-safe, authority must match).
 if not set -q _BITTY_SHELL_INIT
     set -g _BITTY_SHELL_INIT 1
+    # Encode a path for OSC 7: keep unreserved and slash, encode the rest.
+    # Drive-letter colon (C:/) survives for the file URI convention.
+    function _bitty_urlencode
+        set -l _bitty_input $argv[1]
+        set -l _bitty_encoded (string escape --style=url -- "$_bitty_input")
+        string replace -r '^([A-Za-z])%3[Aa]/' '$1:/' -- "$_bitty_encoded"
+        # Mask replace status: no drive match still prints input with status 1.
+        true
+    end
     function _bitty_prompt_hook --on-event fish_prompt
         set -l _bitty_status $status
         printf '\e]133;D;%s\e\\' $_bitty_status
-        printf '\e]7;file://%s%s\e\\' (hostname) (pwd)
+        printf '\e]7;file://%s%s\e\\' (hostname) (_bitty_urlencode (pwd))
         printf '\e]133;A\e\\'
     end
 end
@@ -152,18 +233,34 @@ const POWERSHELL_SCRIPT: &str = r#"# bitty shell integration for PowerShell (sta
 # - Prompt hooks: OSC 7 cwd report plus OSC 133 prompt-start (A) and
 #   command-done-with-status (D) marks (observation only; ignored by
 #   terminals without support).
+# - OSC 7 cwd is percent-encoded (RFC 3986 unreserved plus slash kept).
+#   Hostname passes through verbatim (DNS-safe, authority must match).
 if (-not (Test-Path variable:global:_BittyShellInit)) {
     $global:_BittyShellInit = $true
     $global:_BittyPromptChain = (Get-Command prompt -CommandType Function -ErrorAction SilentlyContinue).ScriptBlock
+    # Encode a path for OSC 7: backslashes become slashes, then each
+    # segment is escaped. Drive-letter colon (C:) survives for file URIs.
+    function Global:_BittyUrlEncode([string]$Path) {
+        $normalized = $Path -replace '\\', '/'
+        $parts = $normalized.Split('/')
+        for ($i = 0; $i -lt $parts.Length; $i++) {
+            if ($parts[$i] -match '^[A-Za-z]:$') {
+                continue
+            }
+            $parts[$i] = [System.Uri]::EscapeDataString($parts[$i])
+        }
+        return ($parts -join '/')
+    }
     function global:prompt {
         # Prefer the native exit code: $? alone collapses every native
         # failure to 1 (a native command exiting 42 must report D;42).
         $status = if ($?) { 0 } elseif ($LASTEXITCODE) { $LASTEXITCODE } else { 1 }
         $host_name = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { hostname }
-        $cwd = (Get-Location).Path
+        $uri_path = _BittyUrlEncode (Get-Location).Path
+        if ($uri_path -notmatch '^/') { $uri_path = '/' + $uri_path }
         $esc = [char]27
         Write-Host -NoNewline "$esc]133;D;$status$esc\"
-        Write-Host -NoNewline "$esc]7;file://$host_name/$cwd$esc\"
+        Write-Host -NoNewline "$esc]7;file://$host_name$uri_path$esc\"
         Write-Host -NoNewline "$esc]133;A$esc\"
         if ($global:_BittyPromptChain) { & $global:_BittyPromptChain } else { "PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) " }
     }
@@ -189,11 +286,14 @@ const NUSHELL_HEADER: &str = r#"# bitty shell integration for Nushell (static; g
 # - Prompt hooks: OSC 7 cwd report plus OSC 133 prompt-start (A) and
 #   command-done-with-status (D) marks (observation only; ignored by
 #   terminals without support).
+# - OSC 7 cwd is percent-encoded (RFC 3986 unreserved plus slash kept).
+#   Hostname passes through verbatim (DNS-safe, authority must match).
+#   Drive-letter colon (C:/) survives for the file URI convention.
 if "BITTY_SHELL_INIT" not-in $env {
     $env.BITTY_SHELL_INIT = "1"
     $env.config = ($env.config | default {} hooks | upsert hooks.pre_prompt ((try { $env.config.hooks.pre_prompt } catch { [] }) ++ [{||
         print -n $"\e]133;D;($env.LAST_EXIT_CODE)\e\\"
-        print -n $"\e]7;file://(sys host | get hostname)(pwd)\e\\"
+        print -n $"\e]7;file://(sys host | get hostname)(pwd | str replace --all "\\" "/" | url encode | str replace --regex '^([A-Za-z]):/' '$1__BITTY_DRIVE__/' | str replace --all ':' '%3A' | str replace --all '__BITTY_DRIVE__' ':')\e\\"
         print -n "\e]133;A\e\\"
     }]))
 }
@@ -530,6 +630,86 @@ mod tests {
         assert!(
             script.contains("$LASTEXITCODE"),
             "powershell prefers the native exit code"
+        );
+    }
+
+    #[test]
+    fn osc7_cwd_is_percent_encoded() {
+        // CTX-1074: every hook must encode cwd before OSC 7 insertion.
+        // Table: RFC 3986 unreserved plus slash kept, rest pct-encoded.
+        // Hostname passes through verbatim. Drive colon survives.
+        let bash = shell_init_script(CompletionShell::Bash);
+        assert!(bash.contains("_bitty_urlencode"), "bash defines encoder");
+        assert!(
+            bash.contains(r#"$(_bitty_urlencode "$PWD")"#),
+            "bash encodes PWD for OSC 7"
+        );
+        assert!(bash.contains("%%%02X"), "bash pct-encodes via printf");
+        assert!(bash.contains("%3A"), "bash encodes non-drive colons");
+        assert!(
+            bash.contains(r#""$HOSTNAME""#),
+            "bash passes hostname through verbatim"
+        );
+
+        let zsh = shell_init_script(CompletionShell::Zsh);
+        assert!(zsh.contains("_bitty_urlencode"), "zsh defines encoder");
+        assert!(
+            zsh.contains(r#"$(_bitty_urlencode "$PWD")"#),
+            "zsh encodes PWD for OSC 7"
+        );
+        assert!(zsh.contains("%%%02X"), "zsh pct-encodes via printf");
+        assert!(zsh.contains("%3A"), "zsh encodes non-drive colons");
+
+        let fish = shell_init_script(CompletionShell::Fish);
+        assert!(
+            fish.contains("string escape --style=url"),
+            "fish encodes via string escape"
+        );
+        assert!(
+            fish.contains("(_bitty_urlencode (pwd))"),
+            "fish encodes pwd for OSC 7"
+        );
+        assert!(
+            fish.contains("(hostname)"),
+            "fish passes hostname through verbatim"
+        );
+        assert!(fish.contains("%3[Aa]"), "fish preserves drive-letter colon");
+
+        let pwsh = shell_init_script(CompletionShell::Powershell);
+        assert!(
+            pwsh.contains("_BittyUrlEncode"),
+            "powershell defines encoder"
+        );
+        assert!(
+            pwsh.contains("EscapeDataString"),
+            "powershell pct-encodes via EscapeDataString"
+        );
+        assert!(
+            pwsh.contains(r#"-replace '\\', '/'"#),
+            "powershell normalizes backslashes"
+        );
+        assert!(
+            pwsh.contains("^[A-Za-z]:$"),
+            "powershell preserves drive-letter colon"
+        );
+        assert!(
+            pwsh.contains("$host_name$uri_path"),
+            "powershell emits encoded path without raw cwd"
+        );
+
+        let nu = shell_init_script(CompletionShell::Nushell);
+        assert!(nu.contains("url encode"), "nushell encodes via url encode");
+        assert!(
+            nu.contains("str replace --all ':' '%3A'"),
+            "nushell encodes non-drive colons"
+        );
+        assert!(
+            nu.contains("__BITTY_DRIVE__"),
+            "nushell preserves drive-letter colon"
+        );
+        assert!(
+            nu.contains("sys host | get hostname"),
+            "nushell passes hostname through verbatim"
         );
     }
 

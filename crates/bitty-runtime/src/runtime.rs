@@ -1126,6 +1126,14 @@ pub struct Runtime {
     /// the grid generation is unchanged, so entering alt clears painted images
     /// (and leaving alt repaints the restored grid) instead of idling on a stale frame.
     kitty_alt_screens_latched: std::collections::BTreeSet<Option<u64>>,
+    /// Last wall clock the Kitty animation tick ran at (S1, #1849).
+    ///
+    /// `None` until the first present: the first tick stamps without
+    /// advancing (zero elapsed), and every later tick advances visible
+    /// origins by the saturating elapsed since the stamp. Present-tick
+    /// elapsed time is the only tick source — no dedicated timer — so
+    /// virtual-clock tests (`tick_at`) pace animations deterministically.
+    kitty_anim_last_tick: Option<std::time::Instant>,
     /// Decoded per-`View` background images (CTX-0347, RFC-0001/OQ-042).
     ///
     /// Loaded eagerly at construction from the validated config (global
@@ -1620,6 +1628,7 @@ impl Runtime {
             kitty_raster_cache: bitty_rich::KittyRasterCache::new(),
             kitty_last_frame_images: 0,
             kitty_alt_screens_latched: std::collections::BTreeSet::new(),
+            kitty_anim_last_tick: None,
             backgrounds: bitty_rich::BackgroundStore::deny_all(),
             background_keys: std::collections::HashMap::new(),
             background_rasters: bitty_rich::BackgroundRasterCache::new(),
@@ -1868,6 +1877,7 @@ impl Runtime {
             kitty_raster_cache: bitty_rich::KittyRasterCache::new(),
             kitty_last_frame_images: 0,
             kitty_alt_screens_latched: std::collections::BTreeSet::new(),
+            kitty_anim_last_tick: None,
             backgrounds: bitty_rich::BackgroundStore::deny_all(),
             background_keys: std::collections::HashMap::new(),
             background_rasters: bitty_rich::BackgroundRasterCache::new(),

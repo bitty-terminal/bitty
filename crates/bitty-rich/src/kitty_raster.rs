@@ -69,6 +69,26 @@ pub fn rasterize_kitty_clipped(
     full: RectPx,
     visible: RectPx,
 ) -> Option<Vec<u8>> {
+    rasterize_rgba_clipped(image.width, image.height, &image.rgba, full, visible)
+}
+
+/// Scales one raw RGBA8 frame to the visible window (nearest neighbor,
+/// S1 animation frames, #1849).
+///
+/// Identical to [`rasterize_kitty_clipped`] except the source is an
+/// explicit `(width, height, rgba)` triple instead of a stored root
+/// image, so the present layer rasterizes any stored animation frame
+/// through the same validated path (same caps, same bit-identical
+/// scale-then-crop semantics). No logic of its own: the body below is the
+/// moved [`rasterize_kitty_clipped`] implementation, unchanged.
+#[must_use]
+pub fn rasterize_rgba_clipped(
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+    full: RectPx,
+    visible: RectPx,
+) -> Option<Vec<u8>> {
     if visible.width == 0 || visible.height == 0 || full.width == 0 || full.height == 0 {
         return None;
     }
@@ -92,17 +112,17 @@ pub fn rasterize_kitty_clipped(
     // `out_len` fits `usize` on every supported target: it is at most
     // 64 MiB while `usize` is at least 32 bits.
     let out_len = out_len as usize;
-    if image.width == 0 || image.height == 0 {
+    if width == 0 || height == 0 {
         return None;
     }
-    let expected_src = (u64::from(image.width) * u64::from(image.height))
+    let expected_src = (u64::from(width) * u64::from(height))
         .checked_mul(4)
         .filter(|&n| n <= KITTY_DECODE_MAX_BYTES as u64)?;
-    if image.rgba.len() as u64 != expected_src {
+    if rgba.len() as u64 != expected_src {
         return None;
     }
     let mut out = vec![0_u8; out_len];
-    let (sw, sh) = (u64::from(image.width), u64::from(image.height));
+    let (sw, sh) = (u64::from(width), u64::from(height));
     let (fw, fh) = (u64::from(full.width), u64::from(full.height));
     let (vw, vh) = (u64::from(visible.width), u64::from(visible.height));
     for dy in 0..vh {
@@ -115,7 +135,7 @@ pub fn rasterize_kitty_clipped(
             let sx = (offset_x + dx) * sw / fw;
             let src = ((sy * sw + sx) * 4) as usize;
             let dst = ((dy * vw + dx) * 4) as usize;
-            out[dst..dst + 4].copy_from_slice(&image.rgba[src..src + 4]);
+            out[dst..dst + 4].copy_from_slice(&rgba[src..src + 4]);
         }
     }
     Some(out)
@@ -127,11 +147,11 @@ pub fn rasterize_kitty_clipped(
 /// id — so an id reuse (counter wrap, currently only theoretical at 2^64
 /// stores; see [`KittyPlacedImage::generation`]) can never serve stale
 /// bytes: a reused id carries a fresh generation and misses. `frame` is
-/// the animation frame index, always `0` until S1 animation lands; it is
-/// part of the key from the start so a future animated image cannot alias
-/// frame 0's bytes. `src_width`/`src_height` bind the decoded extent the
-/// raster sampled, and `full`/`visible` bind the placement geometry, so
-/// the same image at two sizes never aliases.
+/// the 1-based animation frame number (S1, #1849; frame 1 is the root):
+/// two frames of one image never alias, and a compose (`a=c`) bumps the
+/// generation on top so edited frames miss too. `src_width`/`src_height`
+/// bind the decoded extent the raster sampled, and `full`/`visible` bind
+/// the placement geometry, so the same image at two sizes never aliases.
 ///
 /// Construct only via [`KittyRasterKey::for_image`]: the constructor takes
 /// the stored image itself, so callers cannot forget the generation.
@@ -154,9 +174,13 @@ pub struct KittyRasterKey {
 }
 
 impl KittyRasterKey {
-    /// Binds a key to one stored image and placement geometry.
+    /// Binds a key to one stored image, animation frame, and placement
+    /// geometry.
     ///
-    /// `frame` is always `0` until S1 animation wires real frames.
+    /// `frame` is the 1-based animation frame number (S1, #1849; frame 1
+    /// is the root). The frame bytes themselves are not in the key: the
+    /// `(generation, frame)` pair already distinguishes them (ingest
+    /// refuses reshaped frames, and compose bumps the generation).
     #[must_use]
     pub const fn for_image(
         image: &KittyPlacedImage,
@@ -369,9 +393,11 @@ mod tests {
             id: KittyImageId(1),
             generation: 1,
             origin: None,
+            wire_image: 0,
             width: 2,
             height: 2,
             rgba: [0xFF, 0x00, 0x00, 0xFF].repeat(4),
+            frames: Vec::new(),
             compressed_len: 16,
         }
     }
@@ -381,9 +407,11 @@ mod tests {
             id: KittyImageId(2),
             generation: 1,
             origin: None,
+            wire_image: 0,
             width: 2,
             height: 1,
             rgba: vec![0xFF, 0x00, 0x00, 0xFF, 0x00, 0x00, 0xFF, 0xFF],
+            frames: Vec::new(),
             compressed_len: 8,
         }
     }
@@ -455,9 +483,11 @@ mod tests {
             id: KittyImageId(9),
             generation: 1,
             origin: None,
+            wire_image: 0,
             width: 2,
             height: 2,
             rgba: vec![0; 5],
+            frames: Vec::new(),
             compressed_len: 5,
         };
         assert_eq!(rasterize_kitty(&bad, RectPx::new(0, 0, 2, 2)), None);
@@ -576,9 +606,11 @@ mod tests {
             id: KittyImageId(70),
             generation: 1,
             origin: None,
+            wire_image: 0,
             width: 1024,
             height: 1024,
             rgba: vec![0x7F; 1024 * 1024 * 4],
+            frames: Vec::new(),
             compressed_len: 1024 * 1024 * 4,
         };
         let mut byte_keys = Vec::new();
@@ -662,5 +694,27 @@ mod tests {
         cache.invalidate_image(red.id);
         assert_eq!(cache.get(&red_key), None);
         assert_eq!(cache.get(&blue_key), Some(blue_rgba));
+    }
+
+    #[test]
+    fn animation_frames_never_alias_in_cache_and_rasterize() {
+        // S1 (#1849): two frames of one image share the id and generation
+        // but key (and rasterize) distinctly — no stale frame hits.
+        let red = solid_red_2x2();
+        let blue_bytes = [0x00, 0x00, 0xFF, 0xFF].repeat(4);
+        let full = RectPx::new(0, 0, 2, 2);
+        let frame1 = KittyRasterKey::for_image(&red, 1, full, full);
+        let frame2 = KittyRasterKey::for_image(&red, 2, full, full);
+        assert_ne!(frame1, frame2);
+        let mut cache = KittyRasterCache::new();
+        let red_rgba = rasterize_rgba_clipped(2, 2, &red.rgba, full, full).expect("raster");
+        let blue_rgba = rasterize_rgba_clipped(2, 2, &blue_bytes, full, full).expect("raster");
+        assert_ne!(red_rgba, blue_rgba);
+        assert!(cache.insert(frame1, red_rgba.clone()));
+        assert!(cache.insert(frame2, blue_rgba.clone()));
+        // Each frame hits its own bytes; cycling back to frame 1 still
+        // hits (the advance path keeps old frames resident).
+        assert_eq!(cache.get(&frame2), Some(blue_rgba));
+        assert_eq!(cache.get(&frame1), Some(red_rgba));
     }
 }

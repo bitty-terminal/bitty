@@ -116,8 +116,9 @@ pub use kitty_unicode::{
 pub use modes::Modes;
 pub use placement::{
     KITTY_ANIM_DEFAULT_GAP_MS, KITTY_ANIM_MAX_FRAMES, KITTY_ANIM_MAX_IMAGES,
-    KITTY_PLACE_MAX_PLACEMENTS, KITTY_Z_BELOW_BACKGROUND, KittyAnimState, KittyAnimation,
-    KittyDeleteSelector, KittyFrameError, KittyPlacement, PlacementStore,
+    KITTY_ANIM_MAX_STEPS_PER_TICK, KITTY_ANIM_TICK_QUANTUM_MS, KITTY_PLACE_MAX_PLACEMENTS,
+    KITTY_Z_BELOW_BACKGROUND, KittyAnimState, KittyAnimation, KittyDeleteSelector, KittyFrameError,
+    KittyPlacement, PlacementStore,
 };
 pub use replies::{REPLY_CAP_BYTES, Replies};
 pub use scrollback::{SCROLLBACK_DEFAULT_LINES, SCROLLBACK_MAX_LINES, ScrollbackLine};

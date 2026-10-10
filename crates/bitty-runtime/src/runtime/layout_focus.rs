@@ -28,6 +28,31 @@ pub const HYPERLINK_PREVIEW_MAX_CHARS: usize = 96;
 pub(crate) const PIN_CASCADE_DX: u16 = 3;
 pub(crate) const PIN_CASCADE_DY: u16 = 2;
 
+/// Anchored geometry plus the permitted Alt+drag re-anchor range for one
+/// composited pinned leaf (CTX-1081, CodeRabbit 1893 follow-up).
+///
+/// Single source of truth shared by the pinned composite in
+/// [`Runtime::present_frames`] (which composes `origin + clamped drag`)
+/// and the update-time stored-offset clamp in
+/// [`Runtime::update_alt_drag_at`]: both derive base, cascade, and
+/// container from the same values, so the stored offset can never outrun
+/// what present permits — no dead zone when dragging back, no teleport on
+/// a later container grow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PinnedAnchor {
+    /// Cascaded anchored origin in container cells: centered
+    /// [`float_frame`](bitty_ui::presentation::float_frame) plus the
+    /// pin-depth cascade offset.
+    pub(super) origin: (i32, i32),
+    /// Anchored size in container cells.
+    pub(super) size: (u16, u16),
+    /// Permitted re-anchor dx range keeping the composed origin inside the
+    /// container: `(container.x - origin.x, max_x - origin.x)`.
+    pub(super) dx_range: (i32, i32),
+    /// Permitted re-anchor dy range, likewise.
+    pub(super) dy_range: (i32, i32),
+}
+
 /// OSC 8 hyperlink span under the pointer (issue #1759, R-005 hover state).
 ///
 /// Presentation-only: the owner-grid span backing the pointer cursor, the
@@ -617,6 +642,58 @@ impl Runtime {
             .map(|(id, _)| id)
     }
 
+    /// Anchored geometry + permitted Alt+drag range for pinned leaf `id`.
+    ///
+    /// Derives the same base ([`float_frame`](bitty_ui::presentation::float_frame)
+    /// over the cell container), pin-depth cascade offset, and container
+    /// clamp the present composite uses, so
+    /// [`Runtime::update_alt_drag_at`] can clamp the stored re-anchor
+    /// offset into exactly what present permits. Returns `None` when `id`
+    /// is not a composited pin (unknown id, or a pinned id already present
+    /// in the base layout, which the composite skips defensively).
+    pub(super) fn pinned_anchor(&self, id: ViewId) -> Option<PinnedAnchor> {
+        let base_ids = self.layout.leaf_ids();
+        let depth = self
+            .pinned
+            .ids()
+            .into_iter()
+            .filter(|pid| !base_ids.contains(pid))
+            .position(|pid| pid == id)?;
+        // Anchored (not free) geometry, matching the mode-float contract:
+        // `float_frame` ignores its first argument and centers ~80% of the
+        // container. Overlay bounds are authored in cells (the decorated
+        // solver scales them by the live cell size), so frame the cell
+        // container here rather than a pixel area.
+        let base = bitty_ui::presentation::float_frame(UiRect::zero(), self.container);
+        // CodeRabbit 1883: cascade stacked pins so each one stays visible
+        // and clickable instead of fully covering the earlier pins. Offset
+        // grows with pin depth and is clamped to the container (degenerate
+        // containers pin at the container origin).
+        let step = u16::try_from(depth).unwrap_or(u16::MAX);
+        let max_x = self
+            .container
+            .x
+            .saturating_add(self.container.width.saturating_sub(base.width));
+        let max_y = self
+            .container
+            .y
+            .saturating_add(self.container.height.saturating_sub(base.height));
+        let origin_x = i32::from(base.x) + i32::from(PIN_CASCADE_DX.saturating_mul(step));
+        let origin_y = i32::from(base.y) + i32::from(PIN_CASCADE_DY.saturating_mul(step));
+        Some(PinnedAnchor {
+            origin: (origin_x, origin_y),
+            size: (base.width, base.height),
+            dx_range: (
+                i32::from(self.container.x) - origin_x,
+                i32::from(max_x) - origin_x,
+            ),
+            dy_range: (
+                i32::from(self.container.y) - origin_y,
+                i32::from(max_y) - origin_y,
+            ),
+        })
+    }
+
     /// Live-present View frames in physical pixels (CTX-0294).
     ///
     /// The accepted CTX-0118 decoration is logical px; this is the render-time
@@ -685,48 +762,26 @@ impl Runtime {
                 .ids()
                 .into_iter()
                 .filter(|id| !base_ids.contains(id))
-                .enumerate()
-                .filter_map(|(depth, id)| {
+                .filter_map(|id| {
                     let view = self.pinned.get(id)?.clone();
-                    // Anchored (not free) geometry, matching the mode-float
-                    // contract: `float_frame` ignores its first argument and
-                    // centers ~80% of the container. Overlay bounds are
-                    // authored in cells (the decorated solver scales them by
-                    // the live cell size), so frame the cell container here
-                    // rather than the pixel area above.
-                    let base = bitty_ui::presentation::float_frame(UiRect::zero(), self.container);
-                    // CodeRabbit 1883: cascade stacked pins so each one
-                    // stays visible and clickable instead of fully covering
-                    // the earlier pins. Offset grows with pin depth and is
-                    // clamped to the container (degenerate containers pin
-                    // at the container origin).
-                    let step = u16::try_from(depth).unwrap_or(u16::MAX);
-                    let max_x = self
-                        .container
-                        .x
-                        .saturating_add(self.container.width.saturating_sub(base.width));
-                    let max_y = self
-                        .container
-                        .y
-                        .saturating_add(self.container.height.saturating_sub(base.height));
+                    let anchor = self.pinned_anchor(id)?;
                     // CTX-1081: an Alt+drag re-anchor offset moves the
                     // anchored bounds without touching the store (the drop
                     // point becomes the new anchor; unpin drops the offset).
-                    // The composed origin clamps into the container, so a
-                    // later container shrink can never push a dragged pin
-                    // off-screen; a missing entry drifts nothing.
+                    // The drag clamps into the permitted range first, so the
+                    // composed origin stays in-container even when the
+                    // container shrank after the drop; a missing entry
+                    // drifts nothing.
                     let (drag_dx, drag_dy) =
                         self.pinned_offsets.get(&id).copied().unwrap_or((0, 0));
-                    let origin_x = (i32::from(base.x)
-                        + i32::from(PIN_CASCADE_DX.saturating_mul(step))
-                        + drag_dx)
-                        .clamp(i32::from(self.container.x), i32::from(max_x));
-                    let origin_y = (i32::from(base.y)
-                        + i32::from(PIN_CASCADE_DY.saturating_mul(step))
-                        + drag_dy)
-                        .clamp(i32::from(self.container.y), i32::from(max_y));
-                    let bounds =
-                        UiRect::new(origin_x as u16, origin_y as u16, base.width, base.height);
+                    let bounds = UiRect::new(
+                        (anchor.origin.0 + drag_dx.clamp(anchor.dx_range.0, anchor.dx_range.1))
+                            as u16,
+                        (anchor.origin.1 + drag_dy.clamp(anchor.dy_range.0, anchor.dy_range.1))
+                            as u16,
+                        anchor.size.0,
+                        anchor.size.1,
+                    );
                     Some(bitty_ui::OverlayLayer::new(
                         OverlayTier::Float,
                         LayoutNode::leaf(view),

@@ -302,6 +302,56 @@ fn pinned_drag_clamps_into_the_container() {
 }
 
 #[test]
+fn pinned_drag_back_has_no_dead_zone() {
+    // CodeRabbit 1893: the STORED offset clamps at update time into what
+    // present permits. In the 80x24 container the depth-0 pin anchors at
+    // cell x=8 with a 64-wide float (max x=16: an 8-cell right margin), so
+    // dragging 30 cells right must store only +8; dragging back one cell
+    // then moves the frame one cell. Pre-fix the store kept +30 and the
+    // frame sat still in a 22-cell dead zone.
+    let mut rt = Runtime::new(RuntimeConfig {
+        focus_follows_mouse: false,
+        ..RuntimeConfig::default()
+    })
+    .expect("opt-out runtime must build");
+    install(&mut rt, two_pane());
+    rt.pin_floating(ViewId::new(1)).expect("pin must apply");
+    let home = frame_of(&rt, ViewId::new(1));
+
+    let grab_pos = frame_point(&rt, ViewId::new(1), 0.5, 0.5);
+    alt_press(&mut rt, grab_pos);
+    assert!(rt.alt_drag_active());
+    let grab_cell = rt.cursor_to_cell(grab_pos);
+    // +30 cols stays on the 80-col grid from the frame center (~col 40).
+    rt.handle_cursor_moved(cell_pixels(grab_cell.col + 30, grab_cell.row));
+    assert!(rt.alt_drag_active());
+    let past_edge = frame_of(&rt, ViewId::new(1));
+    assert_eq!(
+        past_edge.frame.x - home.frame.x,
+        8 * 9,
+        "only the 8-cell permitted margin may apply"
+    );
+    // Drag back exactly one cell: the frame must follow by one cell, not
+    // sit in the dead zone of the clamped-away excess.
+    rt.handle_cursor_moved(cell_pixels(grab_cell.col + 29, grab_cell.row));
+    assert!(rt.alt_drag_active());
+    let back_one = frame_of(&rt, ViewId::new(1));
+    assert_eq!(
+        back_one.frame.x - past_edge.frame.x,
+        -9,
+        "dragging back one cell must move the frame one cell"
+    );
+    assert_eq!(
+        back_one.frame.x - home.frame.x,
+        7 * 9,
+        "stored offset must be the clamped +7"
+    );
+    alt_release(&mut rt);
+    assert!(!rt.has_selection());
+    rt.unpin_floating(ViewId::new(1)).expect("cleanup unpin");
+}
+
+#[test]
 fn pinned_drag_arms_drag_transition_on_virtual_clock() {
     // The pinned motion arms the same Drag chrome transition a structural
     // float move arms. Virtual clock only: `tick_at` advances time, so no

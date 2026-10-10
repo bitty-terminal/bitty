@@ -264,6 +264,11 @@ fn plugin_help_exits_zero_without_config_or_state() {
     let text = stdout(&output);
     assert!(text.contains("usage: bitty plugin"), "{text}");
     assert!(text.contains("exit codes"), "{text}");
+    // Fetch-adjacent posture: helpers resolve via PATH and inherit the
+    // system proxy env plus the system CA store (no bundled certs).
+    assert!(text.contains("resolve via PATH"), "{text}");
+    assert!(text.contains("system proxy env"), "{text}");
+    assert!(text.contains("system CA store"), "{text}");
     assert!(!state_file(&home).exists());
     let _ = std::fs::remove_dir_all(&home);
 }

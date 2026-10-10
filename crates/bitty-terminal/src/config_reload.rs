@@ -151,6 +151,7 @@ fn runtime_adopts(field: &str) -> bool {
             | "appearance.theme"
             | "appearance.colors"
             | "keymaps"
+            | "panel_rules"
             | "mod_key"
             | "leader_key"
             | "leader_timeout_ms"
@@ -418,6 +419,9 @@ pub(crate) fn apply_live_presentation(
     // CTX-0979: Core draws no workspace display. `workspace.show_bar` and
     // `workspace.bar.edge` are accepted by `bitty-config` for the bar
     // plugin; Core carries no visibility or edge state to adopt here.
+    // CTX-1080: declarative panel spawn rules adopt live; future spawns
+    // evaluate the new set, existing panes keep their stamped state.
+    runtime.set_panel_spawn_rules(effective.panel_rules.clone());
     Ok(())
 }
 

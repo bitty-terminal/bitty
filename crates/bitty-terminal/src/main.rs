@@ -764,6 +764,9 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // CTX-1080: install declarative panel spawn rules from the effective
+    // config so PTY spawn and view initialization evaluate them.
+    runtime.set_panel_spawn_rules(app_config.effective.panel_rules.clone());
     // CTX-0929 G-1: sweep crashed-owner editor temps once per start, before
     // session restore or any new editor use.
     startup_maintenance();
@@ -1052,6 +1055,9 @@ fn main() {
                 std::process::exit(1);
             }
         };
+        // CTX-1080: same panel-rule install as the primary path so headless
+        // smoke evaluates the same spawn rules.
+        rt.set_panel_spawn_rules(app_config.effective.panel_rules.clone());
         // Re-apply layout and focus in fallback so headless smoke proves the same composition
         // that real mode would have driven via the window (TERM-APP-003 / CTX-0553).
         apply_startup_layout_and_focus(&mut rt, &args);

@@ -412,6 +412,111 @@ fn fish_osc7_encodes_spaces_and_percent() {
 }
 
 #[test]
+fn nushell_nested_session_self_configures_and_resource_is_idempotent() {
+    // #1856: the pre-fix guard keyed hook registration on $env.BITTY_SHELL_INIT,
+    // which a child nu inherits while starting with a fresh $env.config, so the
+    // child skipped registration and emitted no marks. The guard now probes the
+    // session's own hooks list for the marker closure.
+    let nu = Command::new("nu")
+        .args(["--version"])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    if !nu {
+        return;
+    }
+    let out = run_bitty(&["shell-init", "nushell"]);
+    assert_eq!(out.status.code(), Some(0));
+    let dir = scratch_dir("nu-nested");
+    let script = dir.join("bitty-shell-init.nu");
+    std::fs::write(&script, stdout(&out)).expect("write nushell script");
+    let script_arg = script.to_string_lossy().replace('\\', "/");
+
+    // Re-sourcing in one session registers the hook exactly once.
+    let resourced = Command::new("nu")
+        .args([
+            "--no-config-file",
+            "-c",
+            &format!(
+                "source \"{script_arg}\"; source \"{script_arg}\"; \
+                 print (($env.config.hooks.pre_prompt | length))"
+            ),
+        ])
+        .output()
+        .expect("spawn nu re-source probe");
+    assert!(
+        resourced.status.success(),
+        "re-source probe failed: {}",
+        String::from_utf8_lossy(&resourced.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&resourced.stdout).trim(),
+        "1",
+        "re-sourcing registers the hook exactly once"
+    );
+
+    // A pre-existing hook that merely mentions the generated filename must
+    // not suppress registration: the probe matches the full `# ...` marker,
+    // not the bare filename stem.
+    let filename_mention = Command::new("nu")
+        .args([
+            "--no-config-file",
+            "-c",
+            &format!(
+                "$env.config = ($env.config | upsert hooks.pre_prompt \
+                 [\"source ~/.config/nushell/bitty-shell-init.nu\"]); \
+                 source \"{script_arg}\"; source \"{script_arg}\"; \
+                 print (($env.config.hooks.pre_prompt | length))"
+            ),
+        ])
+        .output()
+        .expect("spawn nu filename-mention probe");
+    assert!(
+        filename_mention.status.success(),
+        "filename-mention probe failed: {}",
+        String::from_utf8_lossy(&filename_mention.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&filename_mention.stdout).trim(),
+        "2",
+        "a hook mentioning the filename still gets our hook exactly once"
+    );
+
+    // A child session self-configures even when the parent leaked the
+    // pre-#1856 guard var into the environment, and its hook emits marks.
+    // (--no-config-file skips the default env.nu that provides
+    // LAST_EXIT_CODE, so the probe seeds what a real session provides.)
+    let child = Command::new("nu")
+        .env("BITTY_SHELL_INIT", "1")
+        .args([
+            "--no-config-file",
+            "-c",
+            &format!(
+                "source \"{script_arg}\"; \
+                 print (($env.config.hooks.pre_prompt | length)); \
+                 $env.LAST_EXIT_CODE = 0; \
+                 do ($env.config.hooks.pre_prompt | get 0)"
+            ),
+        ])
+        .output()
+        .expect("spawn nu child probe");
+    assert!(
+        child.status.success(),
+        "child probe failed: {}",
+        String::from_utf8_lossy(&child.stderr)
+    );
+    let text = String::from_utf8_lossy(&child.stdout).into_owned();
+    let count_line = text.lines().next().unwrap_or_default().trim().to_string();
+    assert_eq!(
+        count_line, "1",
+        "child session registers its own hook despite inherited env: {text:?}"
+    );
+    for mark in ["]133;D;", "]7;", "]133;A"] {
+        assert!(text.contains(mark), "child hook emits {mark:?}: {text:?}");
+    }
+}
+
+#[test]
 fn completion_scripts_complete_shell_init() {
     for shell in ["bash", "zsh", "fish", "powershell", "nushell"] {
         let out = run_bitty(&["completion", shell]);

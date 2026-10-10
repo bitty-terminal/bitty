@@ -283,6 +283,135 @@ fn fish_script_parses_cleanly_when_fish_exists() {
 }
 
 #[test]
+fn osc7_scripts_encode_cwd() {
+    // CTX-1074: all five scripts must encode cwd before OSC 7 insertion.
+    let bash = stdout(&run_bitty(&["shell-init", "bash"]));
+    assert!(bash.contains("_bitty_urlencode"), "bash defines encoder");
+    assert!(
+        bash.contains(r#"$(_bitty_urlencode "$PWD")"#),
+        "bash encodes PWD"
+    );
+    let zsh = stdout(&run_bitty(&["shell-init", "zsh"]));
+    assert!(zsh.contains("_bitty_urlencode"), "zsh defines encoder");
+    let fish = stdout(&run_bitty(&["shell-init", "fish"]));
+    assert!(
+        fish.contains("string escape --style=url"),
+        "fish encodes via string escape"
+    );
+    assert!(
+        fish.contains("(_bitty_urlencode (pwd))"),
+        "fish encodes pwd"
+    );
+    let pwsh = stdout(&run_bitty(&["shell-init", "powershell"]));
+    assert!(
+        pwsh.contains("_BittyUrlEncode"),
+        "powershell defines encoder"
+    );
+    assert!(pwsh.contains("EscapeDataString"), "powershell pct-encodes");
+    assert!(
+        pwsh.contains(r#"-replace '\\', '/'"#),
+        "powershell normalizes backslashes"
+    );
+    assert!(
+        pwsh.contains("$i -eq 0 -and $parts[$i] -match '^[A-Za-z]:$'"),
+        "powershell restricts drive colon to first segment (/tmp/C:/x keeps %3A)"
+    );
+    let nu = stdout(&run_bitty(&["shell-init", "nushell"]));
+    assert!(nu.contains("url encode"), "nushell encodes via url encode");
+    assert!(
+        nu.contains("str replace --all ':' '%3A'"),
+        "nushell encodes colons"
+    );
+}
+
+#[test]
+fn bash_osc7_encodes_spaces_and_percent() {
+    let bash = Command::new("bash")
+        .args(["--version"])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    if !bash {
+        return;
+    }
+    let out = run_bitty(&["shell-init", "bash"]);
+    assert_eq!(out.status.code(), Some(0));
+    let dir = scratch_dir("bash-encode");
+    let script = dir.join("bitty-shell-init.bash");
+    std::fs::write(&script, stdout(&out)).expect("write bash script");
+    let script_arg = script.to_string_lossy().replace('\\', "/");
+    let probe = dir.join("encode-probe.bash");
+    std::fs::write(
+        &probe,
+        format!(
+            "bitty() {{ :; }}\nsource \"{script_arg}\"\n\
+             _bitty_urlencode \"/tmp/foo bar\"\nprintf '\\n'\n\
+             _bitty_urlencode \"/tmp/100% legit\"\nprintf '\\n'\n\
+             _bitty_urlencode \"/tmp/a#b?c\"\nprintf '\\n'\n"
+        ),
+    )
+    .expect("write probe");
+    let probe_arg = probe.to_string_lossy().replace('\\', "/");
+    let check = Command::new("bash")
+        .arg(&probe_arg)
+        .output()
+        .expect("spawn bash encode probe");
+    assert!(check.status.success(), "probe failed: {:?}", check.status);
+    let text = String::from_utf8_lossy(&check.stdout).into_owned();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        lines,
+        vec!["/tmp/foo%20bar", "/tmp/100%25%20legit", "/tmp/a%23b%3Fc"],
+        "bash encoder pins spaces and percent signs: {lines:?}"
+    );
+}
+
+#[test]
+fn fish_osc7_encodes_spaces_and_percent() {
+    let fish = Command::new("fish")
+        .args(["--version"])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    if !fish {
+        return;
+    }
+    let out = run_bitty(&["shell-init", "fish"]);
+    assert_eq!(out.status.code(), Some(0));
+    let dir = scratch_dir("fish-encode");
+    let script = dir.join("bitty-shell-init.fish");
+    std::fs::write(&script, stdout(&out)).expect("write fish script");
+    let probe = dir.join("encode-probe.fish");
+    std::fs::write(
+        &probe,
+        format!(
+            "function bitty; end\nsource {}\n\
+             _bitty_urlencode \"/tmp/foo bar\"\n\
+             _bitty_urlencode \"/tmp/100% legit\"\n\
+             _bitty_urlencode \"/tmp/a#b?c\"\n",
+            script.to_string_lossy()
+        ),
+    )
+    .expect("write probe");
+    let check = Command::new("fish")
+        .arg(probe.as_os_str())
+        .output()
+        .expect("spawn fish encode probe");
+    assert!(
+        check.status.success(),
+        "probe failed: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let text = String::from_utf8_lossy(&check.stdout).into_owned();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        lines,
+        vec!["/tmp/foo%20bar", "/tmp/100%25%20legit", "/tmp/a%23b%3Fc"],
+        "fish encoder pins spaces and percent signs: {lines:?}"
+    );
+}
+
+#[test]
 fn completion_scripts_complete_shell_init() {
     for shell in ["bash", "zsh", "fish", "powershell", "nushell"] {
         let out = run_bitty(&["completion", shell]);

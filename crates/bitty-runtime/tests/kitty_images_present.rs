@@ -196,6 +196,74 @@ fn display_erase_clears_placement_but_keeps_store_shape() {
 }
 
 #[test]
+fn place_action_for_stored_image_paints_no_blit_today() {
+    // Issue #1802 acceptance pin, documents the R2 shape: `a=p` is
+    // state-owned Terminal Truth (grid records / virtual prototypes),
+    // not yet wired to the pixel layer, so placing a stored image
+    // paints no blit today.
+    let mut rt = make_runtime();
+    let encoded = "/wAA//8AAP//AAD//wAA/w==";
+    let transmit = format!("\x1b_Gf=32,s=2,v=2,a=t,i=7,m=0;{encoded}\x1b\\");
+    rt.handle_pty_bytes(transmit.as_bytes());
+    assert_eq!(rt.kitty_image_count(), 1);
+    assert_eq!(rt.kitty_placement_count(), 0);
+    rt.handle_pty_bytes(b"\x1b_Ga=p,i=7\x1b\\");
+    assert_eq!(rt.kitty_image_count(), 1, "place action stores nothing new");
+    assert_eq!(
+        rt.kitty_placement_count(),
+        0,
+        "place action places nothing on the pixel layer today"
+    );
+    assert!(rt.tick().is_some());
+    assert_eq!(
+        rt.kitty_last_frame_images(),
+        0,
+        "no blit may paint for a state-only place"
+    );
+}
+
+#[test]
+fn ed_scroll_and_clear_clears_placements_but_keeps_store_shape() {
+    // Issue #1802 acceptance pin: ED 22 (ScrollAndClear) clears
+    // placements like ED 2, while stored images stay inert.
+    let mut rt = make_runtime();
+    let _ = rt
+        .kitty_display_image(32, Some(2), Some(2), None, 2, 2, 0, &red_2x2(), 0)
+        .expect("display must succeed");
+    assert_eq!(rt.kitty_placement_count(), 1);
+    rt.handle_pty_bytes(b"\x1b[22J");
+    assert_eq!(rt.kitty_placement_count(), 0);
+    assert_eq!(
+        rt.kitty_image_count(),
+        1,
+        "ED 22 clears placements only; stored images stay inert"
+    );
+}
+
+#[test]
+fn ed_below_and_above_keep_placements() {
+    // Issue #1802 acceptance pin: partial erases (ED 0 below, ED 1
+    // above) never clear placements; only whole-screen erases do.
+    for seq in [
+        b"\x1b[0J".as_slice(),
+        b"\x1b[J".as_slice(),
+        b"\x1b[1J".as_slice(),
+    ] {
+        let mut rt = make_runtime();
+        let _ = rt
+            .kitty_display_image(32, Some(2), Some(2), None, 2, 2, 0, &red_2x2(), 0)
+            .expect("display must succeed");
+        rt.handle_pty_bytes(seq);
+        assert_eq!(
+            rt.kitty_placement_count(),
+            1,
+            "partial erase must keep the placement"
+        );
+        assert_eq!(rt.kitty_image_count(), 1);
+    }
+}
+
+#[test]
 fn rejected_transmission_leaves_grid_idle() {
     let mut rt = make_runtime();
     let _ = rt.kitty_display_image(7, Some(2), Some(2), None, 1, 1, 0, &red_2x2(), 0);
@@ -308,5 +376,64 @@ fn delete_image_id_zero_deletes_nothing_anonymous_survives() {
         rt.kitty_last_frame_images(),
         1,
         "anonymous blit must survive a zero-id delete"
+    );
+}
+
+#[test]
+fn primary_origin_placement_quota_is_32_fifo() {
+    // S5 per-origin quotas (#1849, CTX-1093): the primary origin keeps 32
+    // placements; the 33rd evicts the oldest of its own origin (FIFO),
+    // deterministically. `C=1` keeps the cursor still so grid scroll plays
+    // no role in the count.
+    let mut rt = make_runtime();
+    let pixel = vec![0xFF, 0x00, 0x00, 0xFF];
+    for _ in 0..bitty_rich::KITTY_PER_ORIGIN_MAX_PLACEMENTS + 1 {
+        let outcome = rt
+            .kitty_display_image(32, Some(1), Some(1), None, 1, 1, 1, &pixel, 0)
+            .expect("within-quota display must succeed");
+        assert!(matches!(outcome, KittyDisplayOutcome::Displayed { .. }));
+    }
+    assert_eq!(
+        rt.kitty_placement_count(),
+        bitty_rich::KITTY_PER_ORIGIN_MAX_PLACEMENTS,
+        "primary origin keeps exactly its placement quota"
+    );
+    assert_eq!(
+        rt.kitty_image_count(),
+        bitty_rich::KITTY_PER_ORIGIN_MAX_PLACEMENTS + 1,
+        "stores are unaffected by placement eviction"
+    );
+}
+
+#[test]
+fn primary_origin_image_fifo_stays_64() {
+    // S5 keeps single-origin count behavior: transmit-only stores past 64
+    // evict oldest-first, 64 stay.
+    let mut rt = make_runtime();
+    let pixel = vec![0xFF, 0x00, 0x00, 0xFF];
+    for _ in 0..bitty_rich::KITTY_PLACE_MAX_IMAGES + 3 {
+        rt.kitty_transmit_image(32, Some(1), Some(1), &pixel, 4)
+            .expect("within-quota transmit must succeed");
+    }
+    assert_eq!(rt.kitty_image_count(), bitty_rich::KITTY_PLACE_MAX_IMAGES);
+    assert_eq!(rt.kitty_placement_count(), 0);
+}
+
+#[test]
+fn ed2_clear_keeps_store_shape_under_quotas() {
+    // ED2 clearing is unchanged by S5: placements drop, stored images stay
+    // inert under the store quotas.
+    let mut rt = make_runtime();
+    let _ = rt
+        .kitty_display_image(32, Some(2), Some(2), None, 2, 2, 0, &red_2x2(), 0)
+        .expect("display must succeed");
+    assert_eq!(rt.kitty_placement_count(), 1);
+    assert_eq!(rt.kitty_image_count(), 1);
+    rt.handle_pty_bytes(b"\x1b[2J");
+    assert_eq!(rt.kitty_placement_count(), 0);
+    assert_eq!(
+        rt.kitty_image_count(),
+        1,
+        "ED2 clears placements only; stored images stay inert"
     );
 }

@@ -111,6 +111,7 @@ mod tests {
     fn solid_red_2x2() -> KittyPlacedImage {
         KittyPlacedImage {
             id: KittyImageId(1),
+            origin: None,
             width: 2,
             height: 2,
             rgba: [0xFF, 0x00, 0x00, 0xFF].repeat(4),
@@ -121,6 +122,7 @@ mod tests {
     fn two_color_2x1() -> KittyPlacedImage {
         KittyPlacedImage {
             id: KittyImageId(2),
+            origin: None,
             width: 2,
             height: 1,
             rgba: vec![0xFF, 0x00, 0x00, 0xFF, 0x00, 0x00, 0xFF, 0xFF],
@@ -189,6 +191,7 @@ mod tests {
     fn corrupt_source_paints_nothing() {
         let bad = KittyPlacedImage {
             id: KittyImageId(9),
+            origin: None,
             width: 2,
             height: 2,
             rgba: vec![0; 5],

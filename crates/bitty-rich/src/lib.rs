@@ -50,6 +50,8 @@
 //! | [`kitty_place::KITTY_DECODE_MAX_BYTES`] declared/decoded RGBA | 64 MiB | typed error, no allocation |
 //! | [`kitty_place::KITTY_PRESENT_MAX_BLITS_PER_FRAME`] per-frame blits | 32 | skip-for-frame in paint order |
 //! | [`kitty_place::KITTY_PRESENT_MAX_BYTES_PER_FRAME`] per-frame blit bytes | 64 MiB | skip-for-frame before rasterize |
+//! | [`kitty_place::KITTY_PLACE_MAX_IMAGES`] / [`kitty_place::KITTY_PLACE_MAX_BYTES`] / [`kitty_place::KITTY_PLACE_MAX_ITEMS`] (global kitty store) | 64 / 256 MiB / 128 | S5 per-origin quotas inside; global pressure refuses without evicting |
+//! | [`kitty_place::KITTY_PER_ORIGIN_MAX_IMAGES`] / [`kitty_place::KITTY_PER_ORIGIN_MAX_BYTES`] / [`kitty_place::KITTY_PER_ORIGIN_MAX_PLACEMENTS`] (per-origin kitty quotas) | 64 / 64 MiB / 32 | oldest-of-origin evicted first |
 //! | [`image::IMAGE_STORE_MAX_COUNT`] (IMG-5) | 256 | oldest evicted on admission |
 //! | [`image::IMAGE_STORE_MAX_BYTES`] (IMG-4) | 256 MiB | oldest evicted on admission |
 //! | [`image::IMAGE_MAX_DECODED_BYTES`] (IMG-3) | 64 MiB | typed error, no placement |
@@ -155,11 +157,12 @@ pub use kitty_decode::{KittyDecodeError, KittyDecodedImage, decode_kitty_payload
 pub use kitty_place::{
     KITTY_CURSOR_MAX_SCROLL_LINES_PER_PLACEMENT, KITTY_DECODE_MAX_BYTES,
     KITTY_DECODE_MAX_DIMENSION, KITTY_DECODE_MAX_PIXELS, KITTY_FORMAT_PNG, KITTY_FORMAT_RGB,
-    KITTY_FORMAT_RGBA, KITTY_PLACE_MAX_BYTES, KITTY_PLACE_MAX_IMAGES, KITTY_PLACE_MAX_ITEMS,
-    KITTY_PRESENT_MAX_BLITS_PER_FRAME, KITTY_PRESENT_MAX_BYTES_PER_FRAME, KittyAction,
-    KittyImageId, KittyImageLayer, KittyPlacedImage, KittyPlacement, KittyPlacementError,
-    KittyPlacementId, KittyPrecheckError, placement_full_rect_for, placement_rect_for,
-    precheck_declared_image, viewport_extent,
+    KITTY_FORMAT_RGBA, KITTY_PER_ORIGIN_MAX_BYTES, KITTY_PER_ORIGIN_MAX_IMAGES,
+    KITTY_PER_ORIGIN_MAX_PLACEMENTS, KITTY_PLACE_MAX_BYTES, KITTY_PLACE_MAX_IMAGES,
+    KITTY_PLACE_MAX_ITEMS, KITTY_PRESENT_MAX_BLITS_PER_FRAME, KITTY_PRESENT_MAX_BYTES_PER_FRAME,
+    KittyAction, KittyImageId, KittyImageLayer, KittyPlacedImage, KittyPlacement,
+    KittyPlacementError, KittyPlacementId, KittyPrecheckError, placement_full_rect_for,
+    placement_rect_for, precheck_declared_image, viewport_extent,
 };
 pub use kitty_raster::{rasterize_kitty, rasterize_kitty_clipped};
 pub use kitty_unicode::{

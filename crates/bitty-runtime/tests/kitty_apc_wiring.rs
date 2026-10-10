@@ -72,6 +72,47 @@ fn apc_g_png_stores_places_and_paints() {
 }
 
 #[test]
+fn apc_g_chunked_png_three_chunks_with_wire_id_places_and_paints() {
+    // Issue #1802 acceptance pin: a chunked PNG (`m=1`, `m=1`, `m=0`)
+    // carrying a wire image id stores, places, and paints one blit.
+    let mut rt = make_runtime();
+    let encoded = red_1x1_png_b64();
+    let (first, rest) = encoded.split_at(encoded.len() / 3);
+    let (second, third) = rest.split_at(rest.len() / 2);
+    let open = format!("\x1b_Gf=100,i=7,m=1;{first}\x1b\\");
+    rt.handle_pty_bytes(open.as_bytes());
+    assert_eq!(rt.kitty_image_count(), 0, "open chunk stores nothing yet");
+    let middle = format!("\x1b_Gm=1;{second}\x1b\\");
+    rt.handle_pty_bytes(middle.as_bytes());
+    assert_eq!(rt.kitty_image_count(), 0, "middle chunk stores nothing yet");
+    let tail = format!("\x1b_Gm=0;{third}\x1b\\");
+    rt.handle_pty_bytes(tail.as_bytes());
+    assert_eq!(rt.kitty_image_count(), 1);
+    assert_eq!(rt.kitty_placement_count(), 1);
+    assert!(rt.tick().is_some());
+    assert_eq!(rt.kitty_last_frame_images(), 1);
+}
+
+#[test]
+fn apc_g_continuation_repeating_display_action_accepted() {
+    // Issue #1802 acceptance pin: an open chunk with explicit `a=T`
+    // accepts a continuation repeating the identical action.
+    let mut rt = make_runtime();
+    let encoded = red_2x2_b64();
+    let mid = encoded.len() / 2;
+    let (first, rest) = encoded.split_at(mid);
+    let open = format!("\x1b_Gf=32,s=2,v=2,a=T,m=1;{first}\x1b\\");
+    rt.handle_pty_bytes(open.as_bytes());
+    assert_eq!(rt.kitty_image_count(), 0, "open chunk stores nothing yet");
+    let tail = format!("\x1b_Ga=T,m=0;{rest}\x1b\\");
+    rt.handle_pty_bytes(tail.as_bytes());
+    assert_eq!(rt.kitty_image_count(), 1);
+    assert_eq!(rt.kitty_placement_count(), 1);
+    assert!(rt.tick().is_some());
+    assert_eq!(rt.kitty_last_frame_images(), 1);
+}
+
+#[test]
 fn apc_g_unknown_format_fails_closed_without_storing() {
     let mut rt = make_runtime();
     let seq = format!("\x1b_Gf=7,s=2,v=2,m=0;{}\x1b\\", red_2x2_b64());

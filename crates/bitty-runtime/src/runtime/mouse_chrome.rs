@@ -26,9 +26,10 @@
 //!
 //! CTX-0339 (click-to-focus): a left press routes through
 //! [`Runtime::click_focus_at`], which focuses the hit-tested leaf even when
-//! `focus_follows_mouse` is off (the default). It shares the hover
-//! hit-test ([`Runtime::cursor_to_leaf_cell`]) and Shift suppression, so a
-//! click and a hover agree on which pane owns the pointer.
+//! `focus_follows_mouse` is off (the default). It shares the present-frames
+//! hit-test ([`Runtime::cursor_to_present_cell`]) with hover, selection,
+//! and hyperlink resolution plus Shift suppression, so a click, a hover, a
+//! selection, and a mouse report agree on which pane owns the pointer.
 //!
 //! Lane note: pointer chrome only. Selection, capture encoding, scrollbar
 //! drags, and workspace switching belong to their owning paths; this module
@@ -124,38 +125,28 @@ impl Runtime {
         let Some(cursor) = self.last_cursor else {
             return false;
         };
-        // Topmost hit-test (paint order): overlapping floats own the cursor
-        // over the base layer. The grab anchors in the primary-global cell
-        // space `update_alt_drag` measures its deltas in, so it resolves the
-        // leaf from that cell rather than through `cursor_to_leaf_cell`.
-        let anchor = self.cursor_to_cell(cursor);
-        // CTX-0873: allocations are container-absolute; a top chrome band
-        // shifts the container origin, so lift the grid-local anchor into
-        // container space for the leaf lookup (deltas stay grid-local).
-        let probe_col = u32::from(anchor.col) + u32::from(self.container.x);
-        let probe_row = u32::from(anchor.row) + u32::from(self.container.y);
-        let leaf = self
-            .layout_allocations()
-            .into_iter()
-            .rev()
-            .find(|(_, rect)| {
-                !rect.is_empty()
-                    && probe_col >= u32::from(rect.x)
-                    && probe_row >= u32::from(rect.y)
-                    && probe_col < rect.right()
-                    && probe_row < rect.bottom()
-            })
-            .map(|(id, _)| id);
-        let Some(leaf) = leaf else {
+        // Topmost hit-test in paint order: the grab resolves through the
+        // present frames (last painted wins), so a visible float owns the
+        // cursor over the base leaf it covers — including a mode-floating
+        // leaf whose anchored float geometry shares no solver allocation
+        // with its slot. The grab still anchors in the primary-global cell
+        // space `update_alt_drag` measures its deltas in.
+        let Some((leaf, _)) = self.cursor_to_present_cell(cursor) else {
             return false;
         };
+        let anchor = self.cursor_to_cell(cursor);
         // Probe: a zero-delta move succeeds only where the layout model
-        // permits (an owning float exists); tiled leaves fail soft here and
-        // the Mod tiled-drag path (`begin_tiled_drag`) owns them instead
+        // permits (an owning structural float exists). A mode-floating leaf
+        // has anchored (container-derived) geometry with no stored position
+        // to move — free rects are a follow-up — but the grab still owns the
+        // gesture (focus moves, no selection starts), so it passes the probe
+        // via `leaf_is_floating`. Tiled leaves fail soft here and the Mod
+        // tiled-drag path (`begin_tiled_drag`) owns them instead
         // (issue #1694, CTX-0966).
         if !self
             .layout
             .move_overlay_containing(leaf, 0, 0, self.container)
+            && !self.leaf_is_floating(leaf)
         {
             return false;
         }
@@ -198,20 +189,31 @@ impl Runtime {
             .layout
             .move_overlay_containing(drag.leaf, dx, dy, self.container)
         {
-            self.alt_drag = None;
-            return false;
+            // CTX-1058 (#1844 P2): a mode-floating leaf has anchored
+            // (container-derived) geometry with no stored position to move,
+            // so motion changes nothing — but the grab still owns the
+            // gesture (focus moved, no selection started), so it stays armed
+            // and consumes the motion instead of dropping into
+            // selection/hover/capture mid-gesture. A leaf that is neither
+            // movable nor floating (closed mid-drag) ends fail-soft as
+            // before, and the motion falls through to normal handling.
+            if !self.leaf_is_floating(drag.leaf) {
+                self.alt_drag = None;
+                return false;
+            }
+        } else {
+            self.pending_full_redraw = true;
+            // CTX-0967: a live float move arms the drag transition on the
+            // dragged leaf. The layout commits immediately (terminal content is
+            // never interpolated); only the leaf's chrome ring fades, and repeat
+            // updates restart the bounded transition instead of accumulating.
+            self.trigger_animation(AnimationKind::Drag, Some(drag.leaf), now);
         }
         self.alt_drag = Some(AltDragState {
             leaf: drag.leaf,
             anchor_col: i32::from(cell.col),
             anchor_row: i32::from(cell.row),
         });
-        self.pending_full_redraw = true;
-        // CTX-0967: a live float move arms the drag transition on the
-        // dragged leaf. The layout commits immediately (terminal content is
-        // never interpolated); only the leaf's chrome ring fades, and repeat
-        // updates restart the bounded transition instead of accumulating.
-        self.trigger_animation(AnimationKind::Drag, Some(drag.leaf), now);
         true
     }
 
@@ -249,12 +251,28 @@ impl Runtime {
     }
 
     /// Whether `id` is a floating (overlay-tier) leaf in the current tree.
+    ///
+    /// CTX-1058 (#1844 P2): structural [`LayoutNode::Overlay`] tiers are
+    /// not the whole story — a leaf stamped `Floating` (or a shown
+    /// `Scratchpad`) carries no structural tier but paints at
+    /// [`OverlayTier::Float`](bitty_ui::OverlayTier::Float) via the present
+    /// override, so it counts as floating here too. Without the mode arm a
+    /// mode-floating leaf was invisible to the Alt+drag path (the grab probe
+    /// failed soft) yet eligible for the Mod tiled-drag below, which would
+    /// re-parent it on release.
     fn leaf_is_floating(&self, id: ViewId) -> bool {
-        self.layout
+        if self
+            .layout
             .leaf_overlay_tiers()
             .into_iter()
             .find(|(leaf, _)| *leaf == id)
             .is_some_and(|(_, tier)| tier.is_some())
+        {
+            return true;
+        }
+        self.layout
+            .find_leaf(id)
+            .is_some_and(|leaf| leaf.presentation().overlay_tier().is_some())
     }
 
     /// Attempts to grab the tiled pane under the last known cursor for a
@@ -618,13 +636,15 @@ impl Runtime {
     /// pointer, independent of the opt-in hover flag (the default keeps
     /// click-to-focus).
     ///
-    /// Uses the same [`Self::cursor_to_leaf_cell`] hit-test as
-    /// [`Self::hover_focus_at_at`], so gap/padding bands (no leaf) keep the
-    /// current focus and a click and a hover agree on the target. Shift is
-    /// the accessibility escape (CTX-0181) and never steals focus, matching
-    /// the hover path. Mouse capture and scrollbar chrome never reach here:
-    /// the caller consumes those presses first, so a mouse-tracking app or
-    /// an active thumb drag keeps the pointer.
+    /// Uses the present-frames hit-test ([`Self::cursor_to_present_cell`],
+    /// topmost painted leaf first) — the same order the selection press and
+    /// hyperlink paths resolve — so a click, a selection, and a mouse report
+    /// agree on which pane owns the pointer, including where a mode-floating
+    /// leaf covers a sibling's slot. Gap/padding bands (no frame) keep the
+    /// current focus. Shift is the accessibility escape (CTX-0181) and never
+    /// steals focus, matching the hover path. Mouse capture and scrollbar
+    /// chrome never reach here: the caller consumes those presses first, so
+    /// a mouse-tracking app or an active thumb drag keeps the pointer.
     ///
     /// Returns `true` when the pointer landed on a leaf (whether or not it
     /// already held focus), `false` over a gap or under Shift.
@@ -632,7 +652,7 @@ impl Runtime {
         if self.shift_pressed {
             return false;
         }
-        let Some((id, _)) = self.cursor_to_leaf_cell(pos) else {
+        let Some((id, _)) = self.cursor_to_present_cell(pos) else {
             if self.focus.focused().is_none() {
                 if let Some(primary) = self.primary_view {
                     self.set_focus(primary);
@@ -677,7 +697,10 @@ impl Runtime {
     /// pane it landed on. Nothing changes when no pane involved tracks the
     /// mouse (the selection path's own click-to-focus stays authoritative),
     /// under Shift, Alt, or Super (selection and drag escapes), over a gap
-    /// band, or on a split handle (a divider owns no leaf).
+    /// band, or on a split handle (a divider owns no leaf). The pointer
+    /// owner resolves in present paint order (a visible float, including a
+    /// mode-floating leaf, wins over the base beneath it), matching the
+    /// click the selection path is about to apply.
     pub(super) fn focus_pointer_pane_before_capture(&mut self) {
         if self.shift_pressed || self.alt_pressed || self.super_pressed {
             return;
@@ -685,7 +708,7 @@ impl Runtime {
         let Some(pos) = self.last_cursor else {
             return;
         };
-        let Some((hit, _)) = self.cursor_to_leaf_cell(pos) else {
+        let Some((hit, _)) = self.cursor_to_present_cell(pos) else {
             return;
         };
         if Some(hit) == self.focus.focused() {
@@ -706,11 +729,14 @@ impl Runtime {
     /// No-op unless [`crate::config::RuntimeConfig::focus_follows_mouse`]
     /// is set (default off preserves click-to-focus) and Shift is released
     /// (Shift forces the selection path). Hover over gap/padding bands
-    /// (`cursor_to_leaf_cell` yields `None` there) keeps focus and clears
-    /// any pending dwell. With a zero delay focus moves immediately through
-    /// [`Self::set_focus`] (which dirties only on change, so steady hover
-    /// costs no present); with a positive delay the candidate is recorded
-    /// and [`Self::apply_hover_deadline`] commits it once `now` reaches the
+    /// (the present hit-test yields `None` there) keeps focus and clears
+    /// any pending dwell. The hover owner resolves in present paint order
+    /// (a visible float, including a mode-floating leaf, wins over the base
+    /// beneath it), so hover and click-to-focus agree on the target. With
+    /// a zero delay focus moves immediately through [`Self::set_focus`]
+    /// (which dirties only on change, so steady hover costs no present);
+    /// with a positive delay the candidate is recorded and
+    /// [`Self::apply_hover_deadline`] commits it once `now` reaches the
     /// deadline. Moving to a different candidate re-arms the dwell clock.
     pub(super) fn hover_focus_at_at(&mut self, pos: CursorPosition, now: Instant) {
         if !self.config.focus_follows_mouse || self.shift_pressed {
@@ -725,7 +751,7 @@ impl Runtime {
             self.hover_pending = None;
             return;
         }
-        let Some((id, _)) = self.cursor_to_leaf_cell(pos) else {
+        let Some((id, _)) = self.cursor_to_present_cell(pos) else {
             // Gap/padding band: no candidate, keep focus, drop any dwell.
             self.hover_pending = None;
             return;

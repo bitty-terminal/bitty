@@ -1334,8 +1334,26 @@ impl Runtime {
         // the base leaf painted *beneath* a visible float: a click on a float
         // moved keyboard focus to the pane behind it, and the capture
         // pre-focus stole focus from a mouse-tracking app in a focused float.
-        let tiers: std::collections::HashMap<ViewId, Option<OverlayTier>> =
-            self.layout.leaf_overlay_tiers().into_iter().collect();
+        //
+        // CTX-1058 (#1844 P2): the tier key mirrors the present sort exactly
+        // (`structural.or(mode)`, as in `present_frames`): the structural
+        // map covers `LayoutNode::Overlay` trees only, so a mode-floating
+        // (or shown scratchpad) leaf lifts to `Float` here too. Where solver
+        // allocations overlap (stacks, stamped overlays) the visible float
+        // wins, like paint; structural tiers still win over the mode stamp.
+        let tiers: std::collections::HashMap<ViewId, Option<OverlayTier>> = self
+            .layout
+            .leaf_overlay_tiers()
+            .into_iter()
+            .map(|(id, structural)| {
+                let tier = structural.or_else(|| {
+                    self.layout
+                        .find_leaf(id)
+                        .and_then(|leaf| leaf.presentation().overlay_tier())
+                });
+                (id, tier)
+            })
+            .collect();
         let (_, id, rect) = self
             .layout_allocations()
             .into_iter()

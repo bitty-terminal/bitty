@@ -9,7 +9,10 @@
 //! stay byte-identical across the toggle (slot restore), and toggling back
 //! restores the exact prior frame.
 
-use bitty_runtime::{LayoutNode, OverlayTier, Runtime, SplitAxis, UiRect, View, ViewId};
+use bitty_platform::{CursorPosition, MouseButton, NamedKey, PressState};
+use bitty_runtime::{
+    LayoutNode, OverlayTier, PresentFrame, Runtime, RuntimeConfig, SplitAxis, UiRect, View, ViewId,
+};
 
 fn make_runtime() -> Runtime {
     Runtime::with_defaults().expect("defaults must build")
@@ -33,6 +36,44 @@ fn toggle(rt: &mut Runtime, id: ViewId) {
     let mut tree = rt.layout().clone();
     bitty_ui::presentation::toggle_floating(&mut tree, id).expect("toggle must apply");
     rt.set_layout(tree);
+}
+
+fn frame_of(rt: &Runtime, view: ViewId) -> PresentFrame {
+    rt.present_frames()
+        .into_iter()
+        .find(|frame| frame.view == view)
+        .unwrap_or_else(|| panic!("{view:?} must be presented"))
+}
+
+/// Physical cursor position at fractional (`fx`, `fy`) offsets inside
+/// `view`'s present hit-test frame, derived from public geometry only (no
+/// hard-coded pixel, padding, or decoration constants).
+fn frame_point(rt: &Runtime, view: ViewId, fx: f64, fy: f64) -> CursorPosition {
+    let frame = frame_of(rt, view);
+    let pad = f64::from(rt.window_padding_physical());
+    CursorPosition {
+        x: pad + f64::from(frame.frame.x) + f64::from(frame.frame.width) * fx,
+        y: pad + f64::from(frame.frame.y) + f64::from(frame.frame.height) * fy,
+    }
+}
+
+fn named_key(named: NamedKey, state: PressState) -> bitty_platform::KeyEvent {
+    bitty_platform::KeyEvent {
+        logical_key: bitty_platform::LogicalKey::Named(named),
+        text: None,
+        location: bitty_platform::KeyLocation::Standard,
+        state,
+        repeat: false,
+        is_synthetic: false,
+    }
+}
+
+fn press(button: MouseButton) -> bitty_platform::MouseEvent {
+    bitty_platform::MouseEvent::new(button, PressState::Pressed)
+}
+
+fn release(button: MouseButton) -> bitty_platform::MouseEvent {
+    bitty_platform::MouseEvent::new(button, PressState::Released)
 }
 
 #[test]
@@ -149,4 +190,119 @@ fn structural_tier_wins_over_mode_stamp() {
         .expect("overlay leaf presents");
     assert_eq!(overlay.tier, Some(OverlayTier::Popup));
     assert_eq!(frames.last().expect("frames").view, ViewId::new(2));
+}
+
+#[test]
+fn click_focuses_topmost_mode_float() {
+    // CTX-1058 (#1844 P2): pointer routing follows paint. Leaf 1 floats over
+    // the centered float frame while its solver slot stays the left half, so
+    // a point on the right side of the float is visually the float but
+    // geometrically inside leaf 2's slot. Click-to-focus must resolve the
+    // visible (topmost painted) leaf, agreeing with the selection press hit
+    // test — not the base leaf painted beneath.
+    let mut rt = Runtime::new(RuntimeConfig {
+        focus_follows_mouse: false,
+        ..RuntimeConfig::default()
+    })
+    .expect("opt-out runtime must build");
+    install(&mut rt, two_pane());
+    toggle(&mut rt, ViewId::new(1));
+    assert!(rt.set_focus(ViewId::new(2)), "park focus on the base leaf");
+    // Right side of the float frame: visually the float, geometrically in
+    // leaf 2's slot (the anchored float covers ~80% centered).
+    let pos = frame_point(&rt, ViewId::new(1), 0.75, 0.5);
+    assert_eq!(
+        rt.cursor_to_present_cell(pos).map(|(view, _)| view),
+        Some(ViewId::new(1)),
+        "the present hit test resolves the visible float"
+    );
+    assert_eq!(
+        rt.cursor_to_leaf_cell(pos).map(|(view, _)| view),
+        Some(ViewId::new(2)),
+        "the solver hit test still sees the covered slot (tiled-drag model)"
+    );
+    rt.handle_cursor_moved(pos);
+    assert_eq!(
+        rt.focused_view(),
+        Some(ViewId::new(2)),
+        "hover alone must not move focus when disabled"
+    );
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert_eq!(
+        rt.focused_view(),
+        Some(ViewId::new(1)),
+        "left click must focus the topmost float, not the covered base leaf"
+    );
+    assert!(
+        !rt.has_selection(),
+        "the grid-less float press selects nothing instead of the base grid"
+    );
+    rt.handle_mouse_input(release(MouseButton::Left));
+    assert_eq!(rt.focused_view(), Some(ViewId::new(1)));
+}
+
+#[test]
+fn alt_drag_grabs_mode_floating_leaf() {
+    // CTX-1058 (#1844 P2): Alt+Left-press on a mode-floating leaf grabs it
+    // for an Alt+drag (focus follows, no selection starts) instead of
+    // falling through to the Mod tiled-drag, which would re-parent the float
+    // on release. The anchored float geometry has no stored position to
+    // move, so motion keeps the drag armed with the slot byte-identical.
+    let mut rt = Runtime::new(RuntimeConfig {
+        focus_follows_mouse: false,
+        ..RuntimeConfig::default()
+    })
+    .expect("opt-out runtime must build");
+    install(&mut rt, two_pane());
+    toggle(&mut rt, ViewId::new(1));
+    assert!(rt.set_focus(ViewId::new(2)), "park focus on the base leaf");
+    let slots = rt.layout_allocations();
+    // Right side of the float frame, as above: the old solver-order lookup
+    // resolved the covered base leaf (and tiled-dragged it); the present
+    // order resolves the float.
+    let pos = frame_point(&rt, ViewId::new(1), 0.75, 0.5);
+    assert_eq!(
+        rt.cursor_to_present_cell(pos).map(|(view, _)| view),
+        Some(ViewId::new(1)),
+        "the present hit test resolves the visible float"
+    );
+    rt.handle_cursor_moved(pos);
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Pressed));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(rt.alt_drag_active(), "Alt+press on a mode float must grab");
+    assert!(
+        !rt.tiled_drag_active(),
+        "a floating leaf must never start a tiled move"
+    );
+    assert!(
+        !rt.is_selection_dragging(),
+        "the grabbing press must not start selection"
+    );
+    assert_eq!(
+        rt.focused_view(),
+        Some(ViewId::new(1)),
+        "grabbing focuses the dragged float"
+    );
+    // Motion owns the gesture (no selection, no hover steal) while the
+    // anchored geometry — and the solver slot — stay exactly put.
+    rt.handle_cursor_moved(frame_point(&rt, ViewId::new(1), 0.25, 0.5));
+    assert!(rt.alt_drag_active(), "motion keeps a mode-float drag armed");
+    assert!(!rt.has_selection(), "owned motion selects nothing");
+    assert_eq!(
+        rt.layout_allocations(),
+        slots,
+        "anchored float motion never moves the solver slot"
+    );
+    rt.handle_mouse_input(release(MouseButton::Left));
+    assert!(!rt.alt_drag_active());
+    assert!(
+        !rt.has_selection(),
+        "drag release must not commit a selection (desync guard)"
+    );
+    assert_eq!(
+        rt.layout_allocations(),
+        slots,
+        "the release re-parents nothing"
+    );
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
 }

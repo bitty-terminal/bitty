@@ -5544,6 +5544,18 @@ fn init_preview_baseline_prefers_loaded_config() {
         "invalid file falls back"
     );
 
+    // CodeRabbit 1877: a broken existing file fails closed even when --theme
+    // supplies another layer — the preview must not hide the breakage behind
+    // theme-on-defaults.
+    let mut broken_cli = Args::new();
+    broken_cli.config_path = Some(target.display().to_string());
+    broken_cli.theme = Some("catppuccin".to_string());
+    assert_eq!(
+        crate::init::init_preview_baseline(&broken_cli, &file_env),
+        bitty_config::fallback_builtin(),
+        "broken file + --theme still falls back"
+    );
+
     // Profile layering: --profile seeds under the same XDG root.
     let prof_root = init_test_dir("baseline-profile");
     let prof_root_s = prof_root.display().to_string();

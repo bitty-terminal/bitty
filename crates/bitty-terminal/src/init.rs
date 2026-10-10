@@ -2354,13 +2354,28 @@ pub(crate) fn init_preview_baseline(
         env.home,
         &|path| path.exists(),
     );
+    // CodeRabbit 1877: preserve the load error instead of discarding it
+    // with `.ok()`. An existing file that fails to parse is user error the
+    // real load will also reject, so fail closed to the fallback even when
+    // another layer (e.g. --theme) is present — a theme-on-defaults preview
+    // would otherwise hide the breakage. Missing files stay soft (None).
+    let mut file_broken = false;
     let file_layer = probed.as_ref().and_then(|found| {
         if found.path.exists() {
-            bitty_config::file::load_user_layer(&found.path).ok()
+            match bitty_config::file::load_user_layer(&found.path) {
+                Ok(layer) => Some(layer),
+                Err(_) => {
+                    file_broken = true;
+                    None
+                }
+            }
         } else {
             None
         }
     });
+    if file_broken {
+        return bitty_config::fallback_builtin();
+    }
     let profile_request =
         bitty_config::file::resolve_profile_request(args.profile.as_deref(), env.bitty_profile);
     let mut profile_layers = Vec::new();

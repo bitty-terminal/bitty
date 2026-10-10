@@ -1229,7 +1229,7 @@ pub(crate) fn init_ask_option<T>(
     }
 }
 
-/// In-memory live preview for the init wizard (phase 2 of #1806).
+/// In-memory live preview for the init wizard (phase 2 of #1806, seeded p3 CTX-1071).
 ///
 /// Holds the exact previous effective config (`baseline`, never mutated)
 /// plus the preview overlay (`current`) the wizard updates after every
@@ -1246,11 +1246,15 @@ pub(crate) fn init_ask_option<T>(
 /// list in `crate::config_reload`) adopts live in a running session via
 /// the reload `apply_live` path; the restart-required remainder
 /// (`terminal.shell`, `terminal.scrollback`, `close_confirm`) is staged in
-/// the same overlay and takes effect on confirm/next start. The headed
-/// wiring that calls `apply_live` from the overlay lives outside this
-/// module (it needs a `Runtime`; this file stays `Runtime`-free so the
-/// whole flow remains headless-testable); until then the overlay is the
-/// preview truth the tests assert.
+/// the same overlay and takes effect on confirm/next start. TTY seeds
+/// `baseline` from the loaded effective config via [`init_preview_baseline`]
+/// (`CLI > file > profile > defaults`; empty layers stay on the shipped
+/// `fallback_builtin` headless/test default). The headed live adoption that
+/// would call `apply_live` from the overlay is NOT wired here: `bitty init`
+/// is a standalone subcommand that exits before any `Runtime` exists, and
+/// this file stays `Runtime`-free so the whole flow remains
+/// headless-testable; until then the overlay is the preview truth the tests
+/// assert (see the follow-up note on [`init_preview_baseline`]).
 ///
 /// `snapshots` records one `current` clone per successful prompted step
 /// (skipped override steps apply silently first), so headless tests prove
@@ -1286,8 +1290,8 @@ impl InitPreview {
 
     /// Enabled preview seeded from the exact previous effective config.
     /// Tests inject `fallback_builtin` (or a tweaked clone); production TTY
-    /// seeds the same way until the headed integration seeds the loaded
-    /// effective config instead.
+    /// seeds via [`init_preview_baseline`] (loaded effective when present,
+    /// else `fallback_builtin`).
     pub(crate) fn enabled(baseline: bitty_config::EffectiveConfig) -> Self {
         Self {
             current: baseline.clone(),
@@ -2252,6 +2256,8 @@ pub(crate) fn init_usage() -> String {
 pub(crate) struct InitEnv<'a> {
     /// Stands in for `BITTY_CONFIG`.
     pub(crate) bitty_config: Option<&'a str>,
+    /// Stands in for `BITTY_PROFILE` (named profile request).
+    pub(crate) bitty_profile: Option<&'a str>,
     /// Stands in for `SHELL`.
     pub(crate) shell: Option<&'a str>,
     /// Stands in for `XDG_CONFIG_HOME`.
@@ -2277,8 +2283,8 @@ pub(crate) fn run_init_subcommand(args: &Args) -> i32 {
 }
 
 /// [`run_init_subcommand`] with injected `BITTY_CONFIG`/`SHELL` values; the
-/// remaining environment (XDG root, COLUMNS, TTY-ness) is read live. Tests
-/// use [`run_init_subcommand_with_io`] for full hermeticity.
+/// remaining environment (XDG root, `BITTY_PROFILE`, COLUMNS, TTY-ness) is
+/// read live. Tests use [`run_init_subcommand_with_io`] for full hermeticity.
 pub(crate) fn run_init_subcommand_with_env(
     args: &Args,
     bitty_config_env: Option<&str>,
@@ -2286,9 +2292,11 @@ pub(crate) fn run_init_subcommand_with_env(
 ) -> i32 {
     let xdg = std::env::var("XDG_CONFIG_HOME").ok();
     let home = std::env::var("HOME").ok();
+    let profile = std::env::var("BITTY_PROFILE").ok();
     let columns = init_columns_from_env(std::env::var("COLUMNS").ok().as_deref());
     let env = InitEnv {
         bitty_config: bitty_config_env,
+        bitty_profile: profile.as_deref(),
         shell: shell_env,
         xdg_config_home: xdg.as_deref(),
         home: home.as_deref(),
@@ -2298,6 +2306,99 @@ pub(crate) fn run_init_subcommand_with_env(
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     run_init_subcommand_with_io(args, &env, &mut stdin.lock(), &mut stdout.lock())
+}
+
+/// Baseline for the TTY live preview (p3 of #1806, CTX-1071).
+///
+/// Best-effort load of the effective config with the same layering as
+/// startup (`CLI > file > profile > defaults`):
+/// explicit `--config`/`BITTY_CONFIG` plus the XDG default probe for the
+/// user file, `--profile`/`BITTY_PROFILE` for the profile chain (via
+/// `load_profile_chain_with_env` with the injected XDG roots), and the CLI
+/// appearance overrides (`--theme`/`--font-family`/`--font-size`/`--opacity`
+/// via `crate::config_cli::cli_overrides_from_args`). `--safe` stays on the
+/// built-in safe config (which equals `fallback_builtin`).
+///
+/// Never blocks the wizard: a missing file, an unreadable/invalid file or
+/// profile, or a merge failure all fall back to `fallback_builtin`. Empty
+/// layers (no file, no profile, no CLI override) also stay on
+/// `fallback_builtin`, so headless runs and fresh-machine TTY runs keep the
+/// exact previous baseline byte-for-byte.
+///
+/// Headed live-adoption follow-up (NOT wired here, no new IPC or threads):
+/// `bitty init` is a standalone subcommand — `main.rs` dispatches
+/// `init_word` and exits before `load_app_config` plus `Runtime::new` plus
+/// `TerminalApp` plus `config_reload::install` ever run — so no live
+/// `Runtime` handle is reachable from this path without architecture
+/// surgery. A future in-session init overlay would seed from this baseline
+/// and push each `InitPreview::current` step through the existing reload
+/// path as a non-persistent preview (no file write until confirm):
+/// `config_reload::apply_live` (`config_reload.rs`) for the runtime half
+/// plus the stashed `AppAdoption` taken via `take_app_adoption` into
+/// `TerminalApp::adopt_live_config` (`terminal_app.rs`), reusing the
+/// `runtime_adopts` adopter list and the `ReloadClass::Live` policy in
+/// `bitty-config`. Until that overlay exists, cancel/EOF rollback stays an
+/// in-memory discard and the file write on confirm stays the only adoption.
+pub(crate) fn init_preview_baseline(
+    args: &Args,
+    env: &InitEnv<'_>,
+) -> bitty_config::EffectiveConfig {
+    if args.safe {
+        return bitty_config::fallback_builtin();
+    }
+    let explicit =
+        bitty_config::file::resolve_config_explicit(args.config_path.as_deref(), env.bitty_config);
+    let probed = bitty_config::file::probe_config_path_with_env(
+        explicit.as_deref(),
+        env.xdg_config_home,
+        env.home,
+        &|path| path.exists(),
+    );
+    // CodeRabbit 1877: preserve the load error instead of discarding it
+    // with `.ok()`. An existing file that fails to parse is user error the
+    // real load will also reject, so fail closed to the fallback even when
+    // another layer (e.g. --theme) is present — a theme-on-defaults preview
+    // would otherwise hide the breakage. Missing files stay soft (None).
+    let mut file_broken = false;
+    let file_layer = probed.as_ref().and_then(|found| {
+        if found.path.exists() {
+            match bitty_config::file::load_user_layer(&found.path) {
+                Ok(layer) => Some(layer),
+                Err(_) => {
+                    file_broken = true;
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    });
+    if file_broken {
+        return bitty_config::fallback_builtin();
+    }
+    let profile_request =
+        bitty_config::file::resolve_profile_request(args.profile.as_deref(), env.bitty_profile);
+    let mut profile_layers = Vec::new();
+    if let Some(requested) = profile_request {
+        match bitty_config::file::load_profile_chain_with_env(
+            &requested,
+            env.xdg_config_home,
+            env.home,
+            None,
+            None,
+        ) {
+            Ok(layers) => profile_layers = layers,
+            Err(_) => return bitty_config::fallback_builtin(),
+        }
+    }
+    let cli = crate::config_cli::cli_overrides_from_args(args);
+    if file_layer.is_none() && profile_layers.is_empty() && cli.is_empty() {
+        return bitty_config::fallback_builtin();
+    }
+    match bitty_config::file::resolve_effective_with_profiles(file_layer, profile_layers, &cli) {
+        Ok(merged) => merged.effective,
+        Err(_) => bitty_config::fallback_builtin(),
+    }
 }
 
 /// [`run_init_subcommand`] over injected IO and environment. `input` is read
@@ -2372,14 +2473,16 @@ pub(crate) fn run_init_subcommand_with_io(
             || args.plugin_no_color
             || args.component_no_color;
         let color = init_color_enabled(no_color);
-        // Live preview (phase 2 of #1806): on a TTY the wizard overlays
-        // each answer onto an in-memory preview seeded from the shipped
-        // fallback (the headed follow-up seeds the loaded effective config
-        // and adopts the overlay via the reload `apply_live` path). The
-        // user file is never written until confirm below; cancel/EOF
-        // rolls the overlay back and returns 1 with nothing written.
-        // Piped/non-TTY stays preview-free (nothing to see).
-        let mut preview = InitPreview::enabled(bitty_config::fallback_builtin());
+        // Live preview (phase 2 of #1806, seeded p3 CTX-1071): on a TTY the
+        // wizard overlays each answer onto an in-memory preview seeded from
+        // the loaded effective config (`init_preview_baseline`: `CLI > file
+        // > profile > defaults`, else the shipped fallback). The user file
+        // is never written until confirm below; cancel/EOF rolls the overlay
+        // back and returns 1 with nothing written. Piped/non-TTY stays
+        // preview-free (nothing to see). Headed live adoption via the reload
+        // `apply_live` path is a follow-up (see `init_preview_baseline`):
+        // this standalone subcommand owns no live `Runtime` to adopt into.
+        let mut preview = InitPreview::enabled(init_preview_baseline(args, env));
         match run_init_interactive_with_preview(
             input,
             output,

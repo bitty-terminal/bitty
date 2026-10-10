@@ -19,11 +19,12 @@ use std::time::Duration;
 
 use bitty_runtime::runtime::session::{
     MAX_SESSION_CWD_BYTES, MAX_SESSION_FILE_BYTES, MAX_SESSION_SCROLLBACK_LINES_PER_PANE,
-    PaneAttachment, PaneRoute, PaneSnapshot, SESSION_FORMAT_VERSION, SessionError, SessionSnapshot,
-    WorkspaceSnapshot,
+    PaneAttachment, PaneRoute, PaneSnapshot, PinnedSnapshot, SESSION_FORMAT_VERSION, SessionError,
+    SessionSnapshot, WorkspaceSnapshot,
 };
 use bitty_runtime::{
-    Focus, LayoutNode, PresentationMode, Runtime, SessionFileBackend, SplitAxis, View, ViewId,
+    Focus, LayoutNode, PresentationMode, Runtime, SessionFileBackend, SplitAxis, UiRect, View,
+    ViewId,
 };
 
 use crate::storage_backends::StorageSessionBackend;
@@ -83,6 +84,7 @@ fn single_leaf_snapshot(id: u64, cwd: Option<String>, history: &str) -> SessionS
         }],
         active: 0,
         mru: vec![0],
+        pinned: Vec::new(),
     }
 }
 
@@ -435,6 +437,7 @@ fn hostile_cwd_that_escapes_past_line_cap_fails_closed_pre_io() {
         }],
         active: 0,
         mru: vec![0],
+        pinned: Vec::new(),
     };
     let err = backend()
         .encode_snapshot(&snap)
@@ -513,6 +516,7 @@ fn inactive_workspace_respawns_pending_panes_on_first_switch() {
         workspaces: vec![leaf(100, "ws0-history"), leaf(200, "ws1-history")],
         active: 0,
         mru: vec![0, 1],
+        pinned: Vec::new(),
     };
     rt.apply_session_snapshot(&snap).expect("apply valid");
     assert_eq!(
@@ -577,6 +581,7 @@ fn workspace_close_respawns_loaded_pending_panes_and_purges_removed() {
         ],
         active: 0,
         mru: vec![0, 1, 2, 3],
+        pinned: Vec::new(),
     };
     rt.apply_session_snapshot(&snap).expect("apply valid");
     assert_eq!(
@@ -661,6 +666,7 @@ fn workspace_close_rehomes_primary_onto_pending_leaf_and_drains_restore() {
         workspaces: vec![leaf(100, "ws0-history"), leaf(200, "ws1-history")],
         active: 0,
         mru: vec![0, 1],
+        pinned: Vec::new(),
     };
     rt.apply_session_snapshot(&snap).expect("apply valid");
     assert_eq!(
@@ -783,13 +789,13 @@ fn primary_restore_stale_cwd_falls_back_and_still_hydrates() {
 
 /// CW-16 (#994): versioning fails closed — a structurally valid file
 /// claiming a future version is rejected whole, never applied partially,
-/// and the runtime is left untouched. v2 is the current version (the old
-/// v2-rejection pin now lives on v3); v1 still migrates (see the
+/// and the runtime is left untouched. v3 is the current version (CTX-1082;
+/// the old v3-rejection pin now lives on v4); v1 still migrates (see the
 /// `v1_file_migrates_with_legacy_defaults` unit test).
 #[test]
 fn future_version_is_rejected_before_any_mutation() {
     let raw = concat!(
-        "bitty-session v3\n",
+        "bitty-session v4\n",
         "workspaces 1 active 0 mru 0\n",
         "workspace 1 7\n",
         "name ws1\n",
@@ -801,19 +807,19 @@ fn future_version_is_rejected_before_any_mutation() {
     );
     let err = backend()
         .decode_snapshot(raw.as_bytes())
-        .expect_err("v3 must be rejected");
-    assert_eq!(err, SessionError::UnsupportedVersion(3));
+        .expect_err("v4 must be rejected");
+    assert_eq!(err, SessionError::UnsupportedVersion(4));
 
     let dir = scratch_dir("version");
     std::fs::create_dir_all(&dir).expect("scratch dir");
     let path = dir.join("session");
-    std::fs::write(&path, raw).expect("write v3 file");
+    std::fs::write(&path, raw).expect("write v4 file");
     let mut rt = present_runtime();
     let before = rt.layout().clone();
     let err = rt
         .load_session_from_path(&path)
-        .expect_err("v3 load must fail closed");
-    assert_eq!(err, SessionError::UnsupportedVersion(3));
+        .expect_err("v4 load must fail closed");
+    assert_eq!(err, SessionError::UnsupportedVersion(4));
     assert_eq!(
         rt.layout(),
         &before,
@@ -1038,7 +1044,7 @@ fn capture_records_live_attachment_map() {
         assert_eq!(pane.mode, PresentationMode::Tiled);
     }
 
-    // The captured map round-trips through the v2 file byte-identically.
+    // The captured map round-trips through the file byte-identically.
     let bytes = backend().encode_snapshot(&snap).expect("capture encodes");
     let back = backend()
         .decode_snapshot(&bytes)
@@ -1087,13 +1093,13 @@ fn apply_rejects_snapshot_claiming_live_session() {
     assert_eq!(rt.session_pending_len(), 0, "no pending residue");
 }
 
-/// CW-15/16 (#993/#994): a v2 snapshot routes each pane by its attachment
+/// CW-15/16 (#993/#994): a snapshot routes each pane by its attachment
 /// — the startup owner hydrates the primary grid, `session` panes wait
 /// pending, `detached` leaves restore empty with no entry and no respawn
 /// claim. Hermetic (no PTY): asserts the routing state apply installs.
 #[test]
 fn apply_routes_panes_by_recorded_attachment() {
-    let v2_pane = |id: u64, attach: Option<PaneAttachment>, history: &[&str]| -> PaneSnapshot {
+    let mk_pane = |id: u64, attach: Option<PaneAttachment>, history: &[&str]| -> PaneSnapshot {
         PaneSnapshot {
             view: ViewId::new(id),
             cwd: None,
@@ -1117,8 +1123,8 @@ fn apply_routes_panes_by_recorded_attachment() {
                 ),
                 focus: Some(ViewId::new(100)),
                 panes: vec![
-                    v2_pane(100, Some(PaneAttachment::Primary), &["owner-history"]),
-                    v2_pane(101, Some(PaneAttachment::Detached), &[]),
+                    mk_pane(100, Some(PaneAttachment::Primary), &["owner-history"]),
+                    mk_pane(101, Some(PaneAttachment::Detached), &[]),
                 ],
             },
             WorkspaceSnapshot {
@@ -1126,7 +1132,7 @@ fn apply_routes_panes_by_recorded_attachment() {
                 name: "ws2".to_string(),
                 layout: LayoutNode::leaf(View::new(ViewId::new(200), 80, 24)),
                 focus: Some(ViewId::new(200)),
-                panes: vec![v2_pane(
+                panes: vec![mk_pane(
                     200,
                     Some(PaneAttachment::Session),
                     &["pending-history"],
@@ -1135,12 +1141,11 @@ fn apply_routes_panes_by_recorded_attachment() {
         ],
         active: 0,
         mru: vec![0, 1],
+        pinned: Vec::new(),
     };
-    // Through the file: pins the v2 record end to end, not just structs.
-    let bytes = backend()
-        .encode_snapshot(&snap)
-        .expect("v2 snapshot encodes");
-    let back = backend().decode_snapshot(&bytes).expect("v2 file decodes");
+    // Through the file: pins the pane record end to end, not just structs.
+    let bytes = backend().encode_snapshot(&snap).expect("snapshot encodes");
+    let back = backend().decode_snapshot(&bytes).expect("file decodes");
     assert_eq!(snap, back);
 
     let mut rt = present_runtime();
@@ -1185,7 +1190,7 @@ fn apply_routes_panes_by_recorded_attachment() {
 /// histories into the one global grid. Contents preserved, bindings fresh.
 #[test]
 fn recorded_primary_elsewhere_downgrades_to_pending() {
-    let v2_pane = |id: u64, attach: PaneAttachment, history: &str| PaneSnapshot {
+    let mk_pane = |id: u64, attach: PaneAttachment, history: &str| PaneSnapshot {
         view: ViewId::new(id),
         cwd: None,
         scrollback: vec![history.to_string()],
@@ -1206,17 +1211,16 @@ fn recorded_primary_elsewhere_downgrades_to_pending() {
             ),
             focus: Some(ViewId::new(100)),
             panes: vec![
-                v2_pane(100, PaneAttachment::Session, "focus-history"),
-                v2_pane(101, PaneAttachment::Primary, "stale-owner-history"),
+                mk_pane(100, PaneAttachment::Session, "focus-history"),
+                mk_pane(101, PaneAttachment::Primary, "stale-owner-history"),
             ],
         }],
         active: 0,
         mru: vec![0],
+        pinned: Vec::new(),
     };
-    let bytes = backend()
-        .encode_snapshot(&snap)
-        .expect("v2 snapshot encodes");
-    let back = backend().decode_snapshot(&bytes).expect("v2 file decodes");
+    let bytes = backend().encode_snapshot(&snap).expect("snapshot encodes");
+    let back = backend().decode_snapshot(&bytes).expect("file decodes");
 
     let mut rt = present_runtime();
     let summary = rt.apply_session_snapshot(&back).expect("apply valid");
@@ -1264,6 +1268,7 @@ fn ambiguous_resolved_ownership_rejected_at_load_not_round_trip() {
         }],
         active: 0,
         mru: vec![0],
+        pinned: Vec::new(),
     };
     let mut rt = present_runtime();
     let err = rt
@@ -1311,7 +1316,7 @@ fn ambiguous_resolved_ownership_rejected_at_load_not_round_trip() {
 /// into the live tree — the mode token stamps the restored leaf at decode
 /// and apply installs that tree live.
 #[test]
-fn v2_modes_survive_file_round_trip_into_live_layout() {
+fn modes_survive_file_round_trip_into_live_layout() {
     let snap = SessionSnapshot {
         version: SESSION_FORMAT_VERSION,
         workspaces: vec![WorkspaceSnapshot {
@@ -1330,15 +1335,14 @@ fn v2_modes_survive_file_round_trip_into_live_layout() {
         }],
         active: 0,
         mru: vec![0],
+        pinned: Vec::new(),
     };
-    let bytes = backend()
-        .encode_snapshot(&snap)
-        .expect("v2 snapshot encodes");
+    let bytes = backend().encode_snapshot(&snap).expect("snapshot encodes");
     assert!(
         String::from_utf8_lossy(&bytes).contains("pane 7 80 24 1 0 primary terminal floating"),
-        "v2 header carries attach, route, and mode tokens"
+        "pane header carries attach, route, and mode tokens"
     );
-    let back = backend().decode_snapshot(&bytes).expect("v2 file decodes");
+    let back = backend().decode_snapshot(&bytes).expect("file decodes");
     assert_eq!(back.workspaces[0].panes[0].mode, PresentationMode::Floating);
 
     let mut rt = present_runtime();
@@ -1362,7 +1366,7 @@ fn detached_leaf_never_respawns_on_first_switch() {
     rt.spawn_shell("/bin/sh")
         .expect("primary shell records recipe");
 
-    let v2_pane = |id: u64, attach: PaneAttachment, history: &[&str]| PaneSnapshot {
+    let mk_pane = |id: u64, attach: PaneAttachment, history: &[&str]| PaneSnapshot {
         view: ViewId::new(id),
         cwd: None,
         scrollback: history.iter().map(|line| line.to_string()).collect(),
@@ -1378,7 +1382,7 @@ fn detached_leaf_never_respawns_on_first_switch() {
                 name: "ws1".to_string(),
                 layout: LayoutNode::leaf(View::new(ViewId::new(100), 80, 24)),
                 focus: Some(ViewId::new(100)),
-                panes: vec![v2_pane(100, PaneAttachment::Primary, &["ws0-history"])],
+                panes: vec![mk_pane(100, PaneAttachment::Primary, &["ws0-history"])],
             },
             WorkspaceSnapshot {
                 seq: 2,
@@ -1391,13 +1395,14 @@ fn detached_leaf_never_respawns_on_first_switch() {
                 ),
                 focus: Some(ViewId::new(200)),
                 panes: vec![
-                    v2_pane(200, PaneAttachment::Session, &["ws1-history"]),
-                    v2_pane(201, PaneAttachment::Detached, &[]),
+                    mk_pane(200, PaneAttachment::Session, &["ws1-history"]),
+                    mk_pane(201, PaneAttachment::Detached, &[]),
                 ],
             },
         ],
         active: 0,
         mru: vec![0, 1],
+        pinned: Vec::new(),
     };
     rt.apply_session_snapshot(&snap).expect("apply valid");
     assert_eq!(rt.session_pending_len(), 1, "detached leaf claims nothing");
@@ -1415,5 +1420,263 @@ fn detached_leaf_never_respawns_on_first_switch() {
         rt.session_pending_len(),
         0,
         "pending drains into fresh shells"
+    );
+}
+
+/// CTX-1082: the window-global pinned store round-trips through the v3
+/// file — the parked leaf (identity, geometry, floating mode), its unpin
+/// anchor, and its history come back; the attached entry waits pending and
+/// unpin-after-restore returns the floating panel. Hermetic (no PTY): the
+/// history rides the snapshot, not a live shell.
+#[test]
+fn pinned_store_round_trips_through_v3_file() {
+    let snap = SessionSnapshot {
+        version: SESSION_FORMAT_VERSION,
+        workspaces: vec![WorkspaceSnapshot {
+            seq: 1,
+            name: "ws1".to_string(),
+            layout: LayoutNode::split(
+                SplitAxis::Horizontal,
+                0.5,
+                LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+                LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+            ),
+            focus: Some(ViewId::new(1)),
+            panes: vec![
+                PaneSnapshot {
+                    view: ViewId::new(1),
+                    cwd: None,
+                    scrollback: vec!["owner-history".to_string()],
+                    attach: Some(PaneAttachment::Primary),
+                    route: PaneRoute::Terminal,
+                    mode: PresentationMode::Tiled,
+                },
+                PaneSnapshot {
+                    view: ViewId::new(2),
+                    cwd: None,
+                    scrollback: Vec::new(),
+                    attach: Some(PaneAttachment::Detached),
+                    route: PaneRoute::Terminal,
+                    mode: PresentationMode::Tiled,
+                },
+            ],
+        }],
+        active: 0,
+        mru: vec![0],
+        pinned: vec![PinnedSnapshot {
+            view: View::with_presentation(ViewId::new(9), 80, 24, PresentationMode::Floating),
+            cwd: Some(String::from("file:///tmp/pinned")),
+            scrollback: vec!["pinned-history".to_string()],
+            attach: PaneAttachment::Session,
+            anchor: Some(ViewId::new(2)),
+            after: false,
+        }],
+    };
+    // Through the file: the v3 record carries the pinned block end to end.
+    let bytes = backend().encode_snapshot(&snap).expect("v3 encodes");
+    assert!(bytes.starts_with(b"bitty-session v3\n"));
+    let back = backend().decode_snapshot(&bytes).expect("v3 decodes");
+    assert_eq!(snap, back, "pinned snapshot round-trips byte-identically");
+
+    let mut rt = present_runtime();
+    rt.set_container(UiRect::new(0, 0, 80, 24));
+    let summary = rt.apply_session_snapshot(&back).expect("apply valid");
+    assert_eq!(summary.panes, 3, "layout leaves plus the pinned entry");
+    assert_eq!(summary.pending, 1, "only the pinned session waits pending");
+    assert_eq!(rt.pinned_views(), vec![ViewId::new(9)]);
+    assert!(rt.pinned_occupied());
+    let parked = rt
+        .pinned_views()
+        .into_iter()
+        .next()
+        .expect("pinned leaf restored");
+    assert!(rt.session_pending_contains(&parked));
+    assert!(
+        rt.present_frames()
+            .iter()
+            .any(|frame| frame.view == parked
+                && frame.tier == Some(bitty_runtime::OverlayTier::Float)),
+        "restored pin composites over the scene"
+    );
+
+    // Unpin-after-restore returns the floating panel beside its anchor.
+    let restored = rt.unpin_floating(parked).expect("unpin must apply");
+    assert_eq!(restored, parked);
+    assert!(!rt.pinned_occupied());
+    assert_eq!(rt.focused_view(), Some(parked));
+    assert_eq!(
+        rt.layout()
+            .find_leaf(parked)
+            .expect("leaf back in the live tree")
+            .presentation(),
+        PresentationMode::Floating
+    );
+}
+
+/// CTX-1082 compat: a v2 file (no pinned block) still loads — decode
+/// migrates it to an empty pinned store and the world restores without
+/// pinned entries.
+#[test]
+fn old_v2_file_loads_with_empty_pinned_store() {
+    let raw = concat!(
+        "bitty-session v2\n",
+        "workspaces 1 active 0 mru 0\n",
+        "workspace 1 7\n",
+        "name ws1\n",
+        "layout (leaf 7 80 24)\n",
+        "pane 7 80 24 1 0 primary terminal tiled\n",
+        "compat line\n",
+        "end-pane\n",
+        "end-workspace\n",
+        "end-session\n",
+    );
+    let snap = backend()
+        .decode_snapshot(raw.as_bytes())
+        .expect("v2 must still decode");
+    assert_eq!(snap.version, SESSION_FORMAT_VERSION);
+    assert!(snap.pinned.is_empty(), "v2 carries no pinned block");
+
+    let mut rt = present_runtime();
+    let summary = rt.apply_session_snapshot(&snap).expect("apply valid");
+    assert_eq!(summary.panes, 1);
+    assert_eq!(rt.layout().leaf_ids(), vec![ViewId::new(7)]);
+    assert!(!rt.pinned_occupied(), "no pinned entries after a v2 load");
+}
+
+/// Snapshot shared by the pinned-respawn tests: two layout leaves plus
+/// one attached pinned entry carrying history. Unix-gated like its only
+/// callers (live-spawn respawn tests); without the gate the helper is
+/// dead on Windows and fails the deny-warnings build.
+#[cfg(unix)]
+fn respawn_snapshot() -> SessionSnapshot {
+    SessionSnapshot {
+        version: SESSION_FORMAT_VERSION,
+        workspaces: vec![WorkspaceSnapshot {
+            seq: 1,
+            name: "ws1".to_string(),
+            layout: LayoutNode::split(
+                SplitAxis::Horizontal,
+                0.5,
+                LayoutNode::leaf(View::new(ViewId::new(100), 80, 24)),
+                LayoutNode::leaf(View::new(ViewId::new(101), 80, 24)),
+            ),
+            focus: Some(ViewId::new(100)),
+            panes: vec![
+                PaneSnapshot {
+                    view: ViewId::new(100),
+                    cwd: None,
+                    scrollback: vec!["owner-history".to_string()],
+                    attach: Some(PaneAttachment::Primary),
+                    route: PaneRoute::Terminal,
+                    mode: PresentationMode::Tiled,
+                },
+                PaneSnapshot {
+                    view: ViewId::new(101),
+                    cwd: None,
+                    scrollback: Vec::new(),
+                    attach: Some(PaneAttachment::Detached),
+                    route: PaneRoute::Terminal,
+                    mode: PresentationMode::Tiled,
+                },
+            ],
+        }],
+        active: 0,
+        mru: vec![0],
+        pinned: vec![PinnedSnapshot {
+            view: View::with_presentation(ViewId::new(9), 80, 24, PresentationMode::Floating),
+            cwd: None,
+            scrollback: vec!["pinned-history".to_string()],
+            attach: PaneAttachment::Session,
+            anchor: Some(ViewId::new(101)),
+            after: false,
+        }],
+    }
+}
+
+/// CTX-1082 (CodeRabbit 1897): a restored attached pin must gain a live
+/// shell at startup — staging it pending is not enough, since hydrate
+/// only restores scrollback into an existing session. Drives the real
+/// startup spawn path.
+#[test]
+#[cfg(unix)]
+fn restored_attached_pin_respawns_at_startup_with_history() {
+    use crate::spawn::{SpawnSpec, spawn_startup_pane_shells};
+
+    bitty_test_support::require_pty!();
+    let mut rt = present_runtime();
+    rt.set_container(UiRect::new(0, 0, 80, 24));
+    rt.apply_session_snapshot(&respawn_snapshot())
+        .expect("apply valid");
+    assert_eq!(rt.pinned_views(), vec![ViewId::new(9)]);
+    assert!(
+        !rt.has_pane_session(&ViewId::new(9)),
+        "no shell before startup spawn"
+    );
+
+    let spec = SpawnSpec {
+        program: Some(String::from("/bin/sh")),
+        ..Default::default()
+    };
+    let failed = spawn_startup_pane_shells(&mut rt, &spec);
+    assert_eq!(failed, 0, "pinned shell spawns");
+    assert!(
+        rt.has_pane_session(&ViewId::new(9)),
+        "restored pin has a live session after startup spawn"
+    );
+    assert!(
+        !rt.session_pending_contains(&ViewId::new(9)),
+        "pending history hydrates into the fresh grid"
+    );
+    assert_eq!(rt.pinned_views(), vec![ViewId::new(9)]);
+    assert!(
+        rt.present_frames()
+            .iter()
+            .any(|frame| frame.view == ViewId::new(9)
+                && frame.tier == Some(bitty_runtime::OverlayTier::Float)),
+        "respawned pin still composites over the scene"
+    );
+}
+
+/// CTX-1082 (CodeRabbit 1897): the deferred switch path respawns a pinned
+/// pending entry too (covering a startup spawn that failed). Drives the
+/// real workspace-switch respawn.
+#[test]
+#[cfg(unix)]
+fn restored_attached_pin_respawns_on_workspace_switch() {
+    bitty_test_support::require_pty!();
+    let mut rt = present_runtime();
+    rt.set_container(UiRect::new(0, 0, 80, 24));
+    rt.spawn_shell("/bin/sh")
+        .expect("primary shell records recipe");
+    let mut snap = respawn_snapshot();
+    snap.workspaces.push(WorkspaceSnapshot {
+        seq: 2,
+        name: "ws2".to_string(),
+        layout: LayoutNode::leaf(View::new(ViewId::new(200), 80, 24)),
+        focus: Some(ViewId::new(200)),
+        panes: vec![PaneSnapshot {
+            view: ViewId::new(200),
+            cwd: None,
+            scrollback: vec!["ws1-history".to_string()],
+            attach: Some(PaneAttachment::Session),
+            route: PaneRoute::Terminal,
+            mode: PresentationMode::Tiled,
+        }],
+    });
+    snap.mru = vec![0, 1];
+    rt.apply_session_snapshot(&snap).expect("apply valid");
+    assert!(
+        !rt.has_pane_session(&ViewId::new(9)),
+        "no shell before the switch"
+    );
+
+    assert!(rt.workspace_switch(1), "switch to ws2");
+    assert!(
+        rt.has_pane_session(&ViewId::new(9)),
+        "deferred path respawns the pinned pending entry"
+    );
+    assert!(
+        !rt.session_pending_contains(&ViewId::new(9)),
+        "pending history hydrates into the fresh grid"
     );
 }

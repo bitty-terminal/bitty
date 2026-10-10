@@ -10,12 +10,12 @@
 //! workspace arrives with layout plus pending history and respawns its
 //! shells lazily on the first switch to it (bounded, best-effort).
 //!
-//! # Format (v2, hand-rolled, no new dependencies)
+//! # Format (v3, hand-rolled, no new dependencies)
 //!
-//! A UTF-8 text file, `\n`-separated, magic first line `bitty-session v2`:
+//! A UTF-8 text file, `\n`-separated, magic first line `bitty-session v3`:
 //!
 //! ```text
-//! bitty-session v2
+//! bitty-session v3
 //! workspaces <n> active <a> mru <m0,m1,...>
 //! workspace <seq> <focus-id|none>
 //! name <escaped workspace name>
@@ -25,9 +25,25 @@
 //! <k escaped scrollback lines, oldest first>
 //! end-pane
 //! end-workspace
+//! pinned <p>
+//! pin <view-id> <cols> <rows> <k> <cwd:0|1> <attach> <anchor-id|none> <after:0|1>
+//! <escaped cwd, iff cwd == 1>
+//! <k escaped scrollback lines, oldest first>
+//! end-pin
 //! end-session
 //! ```
 //!
+//! The v3 file appends one window-global `pinned` block after the workspace
+//! blocks: every leaf parked in the [`PinnedStore`](bitty_ui::PinnedStore)
+//! at capture, in pin order (present-time paint order). A `pin` record
+//! mirrors the v2 `pane` record minus the `<route>`/`<mode>` tokens — pinned
+//! leaves are floating terminal panels by construction, so the mode is
+//! always `Floating` and the route always terminal; a future route or mode
+//! arrives with its own format version, never smuggled into v3. The trailing
+//! `<anchor-id|none> <after:0|1>` pair carries the unpin restore anchor
+//! (the neighboring leaf id at pin time and which side the leaf returns
+//! to); a missing anchor at unpin falls back to docking beside the first
+//! live leaf, exactly like a live unpin whose anchor closed meanwhile.
 //! The v2 pane header appends three fixed tokens: `<attach>` is the live
 //! attachment map (`primary` = owned the primary grid, `session` = owned a
 //! private pane session, `detached` = session-less leaf with no state);
@@ -42,16 +58,21 @@
 //!
 //! | File version | Decoder behavior |
 //! |---|----------------------------------------------------------------------------|
-//! | v1 | Migrated in memory (unspecified attachment, terminal route, tiled mode); re-encoding writes v2 (one-way on disk). |
-//! | v2 | Native: all three pane tokens parsed and validated. |
+//! | v1 | Migrated in memory (unspecified attachment, terminal route, tiled mode, empty pinned store); capture always writes v3. |
+//! | v2 | Migrated in memory (empty pinned store); the workspace blocks decode exactly like v3. |
+//! | v3 | Native: workspace blocks plus the window-global pinned block. |
 //! | anything else | [`SessionError::UnsupportedVersion`]: whole file rejected before any other parsing, runtime untouched. |
 //!
 //! Migration normalizes at decode: downstream (validation, apply,
-//! re-encode) only ever sees [`SESSION_FORMAT_VERSION`] snapshots.
-//! Unknown `<attach>`/`<route>`/`<mode>` tokens in a v2 file are
+//! re-encode) only ever sees [`SESSION_FORMAT_VERSION`] snapshots. A v1/v2
+//! snapshot carrying pinned entries is corrupt (those versions carry no
+//! pinned block by construction). Unknown `<attach>`/`<route>`/`<mode>`
+//! tokens in a v2/v3 file are
 //! [`SessionError::Corrupt`], never defaulted — a future activity route or
-//! mode must arrive with its own format version, not smuggled into v2.
-//! At most one pane per file may claim `primary`; a `detached` pane
+//! mode must arrive with its own format version, not smuggled into v3.
+//! At most one layout pane per file may claim `primary` (pinned entries
+//! never hydrate the shared grid, so they are excluded from the tally and
+//! route to pending instead); a `detached` pane
 //! carrying a cwd or scrollback is corrupt (capture never emits it).
 //!
 //! # Rehydration rules (CW-15, under the accepted WS-INV-25/26 contract)
@@ -71,6 +92,16 @@
 //! * Detached leaves restore empty: no grid write, no pending entry, no
 //!   respawn on switch or startup. Only attached (`session`) leaves earn
 //!   fresh shells.
+//! * Pinned floats restore into the window-global pinned store (CTX-1082):
+//!   the parked leaf (identity, geometry, `Floating` mode), its unpin
+//!   anchor, and its cwd plus scrollback history come back in pin order, so
+//!   the composited scene presents identically. Attached pinned leaves
+//!   (`primary`/`session`) wait pending like attached layout panes — the
+//!   entry drains into the fresh grid on the next successful spawn of that
+//!   view; `detached` pinned leaves restore empty with no entry. The
+//!   Alt+drag re-anchor offset is presentation-only and resets: a restored
+//!   pin presents at its cascade anchor, exactly like a fresh pin (unpin
+//!   already drops the offset, so the lifecycle stays consistent).
 //!
 //! Field escaping is backslash-only (`\\` → `\`, `\n` → LF, `\r` → CR);
 //! whole-line fields (name, cwd, scrollback) may contain spaces. Transient
@@ -100,7 +131,8 @@
 //! | Line bytes | [`MAX_SESSION_LINE_BYTES`] (4096) | parser bound parity |
 //! | Workspaces | [`MAX_SESSION_WORKSPACES`] (16) | `MAX_WORKSPACES` |
 //! | Panes / workspace | [`MAX_SESSION_PANES_PER_WORKSPACE`] (32) | registry bound |
-//! | Panes total | [`MAX_SESSION_PANES_TOTAL`] (128) | decode-CPU guard |
+//! | Panes total (layout panes plus pinned entries) | [`MAX_SESSION_PANES_TOTAL`] (128) | decode-CPU guard |
+//! | Pinned entries | counted in the panes total (no separate cap) | live-leaf population |
 //! | Scrollback lines / pane | [`MAX_SESSION_SCROLLBACK_LINES_PER_PANE`] (200) | issue: cap restored lines |
 //! | Scrollback line bytes | [`MAX_SESSION_LINE_BYTES`] (4096) | parser bound parity |
 //! | Cwd bytes | [`MAX_SESSION_CWD_BYTES`] (4096) | `bitty_rich::shell::SHELL_CWD_MAX_BYTES` |
@@ -152,7 +184,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use bitty_ui::{Focus, LayoutNode, PresentationMode, View, ViewId};
+use bitty_ui::{Focus, LayoutNode, PinnedStore, PresentationMode, View, ViewId};
 
 use super::panes::osc7_cwd_path;
 use super::workspaces::WorkspaceSlot;
@@ -160,18 +192,18 @@ use super::*;
 
 /// Session file format version written by this slice.
 ///
-/// v2 extends the v1 pane record with the live attachment map
-/// ([`PaneAttachment`]), the content route ([`PaneRoute`]), and the
-/// per-leaf presentation mode. See the module docs for the v1/v2 record
-/// shapes and the migration rules.
-pub const SESSION_FORMAT_VERSION: u32 = 2;
+/// v3 extends the v2 snapshot with the window-global pinned block (one
+/// [`PinnedSnapshot`] per parked leaf, in pin order). See the module docs
+/// for the v3 record shape and the v1/v2 migration rules.
+pub const SESSION_FORMAT_VERSION: u32 = 3;
 
 /// Earliest format version the decoder still migrates. v1 files carry the
 /// short pane record (`pane <id> <cols> <rows> <k> <cwd:0|1>`); migration
 /// leaves the attachment unspecified (resolved through
 /// [`derive_startup_owner`] exactly like the pre-v2 restore), defaults the
 /// route to [`PaneRoute::Terminal`], and defaults the mode to
-/// [`PresentationMode::Tiled`].
+/// [`PresentationMode::Tiled`]. v1 and v2 files carry no pinned block, so
+/// migration yields an empty pinned store.
 pub const SESSION_MIN_DECODE_VERSION: u32 = 1;
 
 /// Maximum session file bytes read or written (issue: bounded size).
@@ -377,6 +409,37 @@ pub struct PaneSnapshot {
     pub mode: PresentationMode,
 }
 
+/// One pinned leaf's persisted state (CTX-1082): the parked view plus its
+/// restore anchor and its cwd plus scrollback history.
+///
+/// A pinned leaf is detached from every workspace layout, so unlike
+/// [`PaneSnapshot`] this carries the full stripped [`View`] (identity,
+/// geometry, `Floating` mode — origin dropped as presentation-only, exactly
+/// like [`strip_overlays`]) instead of referencing a layout leaf. The mode
+/// is always [`PresentationMode::Floating`] (pinning stamps it through the
+/// CW-08 gate); the route is always terminal, so neither travels as a file
+/// token. `anchor`/`after` are the unpin restore hint recorded at pin time
+/// (see [`PinnedStore`](bitty_ui::PinnedStore)); a stale anchor falls back
+/// to docking beside the first live leaf at unpin.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PinnedSnapshot {
+    /// Parked leaf (stripped: identity, geometry, floating mode).
+    pub view: View,
+    /// Captured `OSC 7` report, if the pinned leaf had a live grid.
+    pub cwd: Option<String>,
+    /// Scrollback lines oldest-first, trimmed, bounded like panes.
+    pub scrollback: Vec<String>,
+    /// Live attachment at capture (`primary`/`session` earn a pending
+    /// restore; `detached` restores empty). Always recorded: pinned entries
+    /// are v3-born and have no legacy unspecified form.
+    pub attach: PaneAttachment,
+    /// Neighboring leaf id recorded at pin time, if any.
+    pub anchor: Option<ViewId>,
+    /// Which side of the anchor the leaf returns to (`false` restores
+    /// before the anchor).
+    pub after: bool,
+}
+
 /// One workspace's persisted state: identity plus layout, focus, and panes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkspaceSnapshot {
@@ -392,7 +455,8 @@ pub struct WorkspaceSnapshot {
     pub panes: Vec<PaneSnapshot>,
 }
 
-/// A persistable session: all workspaces plus active index and MRU order.
+/// A persistable session: all workspaces plus active index, MRU order, and
+/// the window-global pinned store.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionSnapshot {
     /// Always [`SESSION_FORMAT_VERSION`] from capture.
@@ -403,6 +467,9 @@ pub struct SessionSnapshot {
     pub active: usize,
     /// MRU workspace indices, active fronted, each live index exactly once.
     pub mru: Vec<usize>,
+    /// Parked pinned leaves in pin order (empty for migrated v1/v2
+    /// snapshots, which carry no pinned block).
+    pub pinned: Vec<PinnedSnapshot>,
 }
 
 /// Counts from a successful restore (no contents, safe to log).
@@ -410,7 +477,7 @@ pub struct SessionSnapshot {
 pub struct SessionRestoreSummary {
     /// Workspaces rebuilt.
     pub workspaces: usize,
-    /// Panes rebuilt.
+    /// Panes rebuilt (layout leaves plus restored pinned entries).
     pub panes: usize,
     /// Scrollback lines rehydrated into live grids.
     pub scrollback_lines: usize,
@@ -423,7 +490,7 @@ pub struct SessionRestoreSummary {
 pub struct SessionSaveSummary {
     /// Workspaces persisted.
     pub workspaces: usize,
-    /// Panes persisted.
+    /// Panes persisted (layout leaves plus pinned entries).
     pub panes: usize,
     /// Scrollback lines persisted.
     pub scrollback_lines: usize,
@@ -557,8 +624,14 @@ fn truncate_bytes(text: &str, limit: usize) -> &str {
 
 /// Validates every bound without touching runtime state; content-free errors.
 fn validate_snapshot(snap: &SessionSnapshot) -> Result<(), SessionError> {
-    if snap.version != SESSION_FORMAT_VERSION {
+    if snap.version < SESSION_MIN_DECODE_VERSION || snap.version > SESSION_FORMAT_VERSION {
         return Err(SessionError::UnsupportedVersion(snap.version));
+    }
+    // CTX-1082: only v3 carries a pinned block; an older version claiming
+    // pinned entries never came from a decoder (decode migrates to an empty
+    // store) and is corrupt.
+    if snap.version < SESSION_FORMAT_VERSION && !snap.pinned.is_empty() {
+        return Err(SessionError::Corrupt("pinned version"));
     }
     if snap.workspaces.is_empty() || snap.workspaces.len() > MAX_SESSION_WORKSPACES {
         return Err(SessionError::Corrupt("workspace count"));
@@ -649,8 +722,53 @@ fn validate_snapshot(snap: &SessionSnapshot) -> Result<(), SessionError> {
             return Err(SessionError::Corrupt("too many panes"));
         }
     }
-    // CW-16: the primary grid is single — at most one leaf may claim it
-    // across the whole file. Count resolved attachments, not recorded ones:
+    // CTX-1082: pinned entries share the decode-CPU total with layout
+    // panes (same per-entry history profile) and must name live ids
+    // outside every layout tree; the mode is always `Floating` (pinning
+    // stamps it) and a session-less pinned leaf carries no state, exactly
+    // like a `detached` layout pane.
+    for pin in &snap.pinned {
+        if !all_views.insert(pin.view.id()) {
+            return Err(SessionError::Corrupt("duplicate pane"));
+        }
+        if pin.view.presentation() != PresentationMode::Floating {
+            return Err(SessionError::Corrupt("pinned mode"));
+        }
+        let (cols, rows) = (usize::from(pin.view.cols()), usize::from(pin.view.rows()));
+        if !(1..=MAX_SESSION_GRID_DIM).contains(&cols)
+            || !(1..=MAX_SESSION_GRID_DIM).contains(&rows)
+        {
+            return Err(SessionError::Corrupt("pinned dims"));
+        }
+        if let Some(cwd) = &pin.cwd {
+            if cwd.len() > MAX_SESSION_CWD_BYTES {
+                return Err(SessionError::Corrupt("cwd bound"));
+            }
+        }
+        if pin.scrollback.len() > MAX_SESSION_SCROLLBACK_LINES_PER_PANE {
+            return Err(SessionError::Corrupt("scrollback bound"));
+        }
+        for line in &pin.scrollback {
+            if line.len() > MAX_SESSION_LINE_TEXT_BYTES {
+                return Err(SessionError::Corrupt("scrollback line bound"));
+            }
+        }
+        if pin.attach == PaneAttachment::Detached
+            && (pin.cwd.is_some() || !pin.scrollback.is_empty())
+        {
+            return Err(SessionError::Corrupt("detached pane state"));
+        }
+    }
+    total_panes += snap.pinned.len();
+    if total_panes > MAX_SESSION_PANES_TOTAL {
+        return Err(SessionError::Corrupt("too many panes"));
+    }
+    // CW-16: the primary grid is single — at most one layout leaf may claim
+    // it across the whole file. Pinned entries are excluded from the tally:
+    // they never hydrate the shared grid (apply routes every attached pinned
+    // leaf to a pending respawn, the stale-owner downgrade by construction),
+    // so a recorded pinned `primary` is not a second grid claim.
+    // Count resolved attachments, not recorded ones:
     // a `None` (v1-legacy) pane resolves through `derive_startup_owner` at
     // encode, so one explicit primary off-owner plus a `None` on the derived
     // owner would encode to two primaries that the next load rejects.
@@ -856,16 +974,63 @@ impl Runtime {
                 panes,
             });
         }
+        // CTX-1082: the window-global pinned store is layout-detached, so
+        // the slot loop above never sees it — capture every parked leaf in
+        // pin order (present-time paint order) with its live history and
+        // its unpin anchor. The stored view rebuilds stripped (identity,
+        // geometry, floating mode) so origin never persists, exactly like
+        // `strip_overlays`; the Alt+drag re-anchor offset is
+        // presentation-only and is never captured (restore resets to the
+        // cascade anchor).
+        let mut pinned = Vec::with_capacity(self.pinned.len());
+        for id in self.pinned.ids() {
+            let Some(stored) = self.pinned.get(id).cloned() else {
+                continue;
+            };
+            let mut view = View::with_presentation(
+                id,
+                usize::from(stored.cols()),
+                usize::from(stored.rows()),
+                PresentationMode::Floating,
+            );
+            view.set_pseudo_constraint(stored.pseudo_constraint());
+            let state = self.session_state_for(id);
+            let (cwd, scrollback) = match state {
+                Some(state) => (
+                    state.cwd_report().map(str::to_owned),
+                    scrollback_tail_text(state, MAX_SESSION_SCROLLBACK_LINES_PER_PANE),
+                ),
+                None => (None, Vec::new()),
+            };
+            let attach = if self.primary_view == Some(id) {
+                PaneAttachment::Primary
+            } else if self.pane_sessions.contains_key(&id) {
+                PaneAttachment::Session
+            } else {
+                PaneAttachment::Detached
+            };
+            let (anchor, after) = self.pinned.anchor_of(id).unwrap_or((None, true));
+            pinned.push(PinnedSnapshot {
+                view,
+                cwd,
+                scrollback,
+                attach,
+                anchor,
+                after,
+            });
+        }
         SessionSnapshot {
             version: SESSION_FORMAT_VERSION,
             workspaces,
             active: self.active_workspace,
             mru: self.workspace_mru.iter().copied().collect(),
+            pinned,
         }
     }
 
     /// Applies a validated snapshot: rebuilds workspaces, the live
-    /// layout/focus pair, and the primary owner, rehydrates scrollback into
+    /// layout/focus pair, the window-global pinned store, and the primary
+    /// owner, rehydrates scrollback into
     /// live grids, and stashes the rest in the pending map for the next
     /// spawn of each leaf.
     ///
@@ -882,12 +1047,19 @@ impl Runtime {
         // fresh PTYs for restored leaves; merging snapshot history into a
         // live grid would alias two histories onto one session, the exact
         // second-live-terminal hazard the registry rejects with
-        // `PersistentIdInUse`. The runtime is left untouched.
+        // `PersistentIdInUse`. The runtime is left untouched. Pinned views
+        // collide the same way: their pending restores also drain into
+        // fresh grids.
         for ws in &snap.workspaces {
             for pane in &ws.panes {
                 if self.pane_sessions.contains_key(&pane.view) {
                     return Err(SessionError::Corrupt("attachment in use"));
                 }
+            }
+        }
+        for pin in &snap.pinned {
+            if self.pane_sessions.contains_key(&pin.view.id()) {
+                return Err(SessionError::Corrupt("attachment in use"));
             }
         }
         // CTX-0567 (#992): fold the outgoing live layout plus every stashed
@@ -911,6 +1083,19 @@ impl Runtime {
         self.workspace_mru = snap.mru.iter().copied().collect::<VecDeque<_>>();
         self.layout = self.workspaces[snap.active].layout.clone();
         self.focus = self.workspaces[snap.active].focus.clone();
+        // CTX-1082: a restore installs a whole new world, so the pinned
+        // store is replaced wholesale in snapshot pin order (present-time
+        // paint order) with the recorded unpin anchors. The Alt+drag
+        // re-anchor offsets reset: they are presentation-only
+        // container-derived geometry, and unpin already drops them, so a
+        // restored pin presents at its cascade anchor exactly like a fresh
+        // pin. Installed before the high-water raise below so restored
+        // pinned ids are covered like every other installed id.
+        self.pinned = PinnedStore::new();
+        self.pinned_offsets.clear();
+        for pin in &snap.pinned {
+            self.pinned.restore(pin.view.clone(), pin.anchor, pin.after);
+        }
         // CTX-0536 (#923): a restored snapshot installs ids directly; raise
         // the monotonic high-water so a later allocation never reuses one.
         self.raise_view_id_high_water();
@@ -961,6 +1146,22 @@ impl Runtime {
                 }
             }
         }
+        // CTX-1082: attached pinned leaves wait pending like attached
+        // layout panes — pinned views never own the primary grid (the
+        // startup recipe binds it at the derived layout owner), so even a
+        // recorded `primary` routes to a pending respawn and keeps its own
+        // history and cwd. `Detached` pinned leaves restore empty with no
+        // entry, and the entry drains on the next successful spawn of that
+        // view.
+        for pin in &snap.pinned {
+            panes += 1;
+            match pin.attach {
+                PaneAttachment::Primary | PaneAttachment::Session => {
+                    self.stage_pending(pin.view.id(), pin.cwd.clone(), pin.scrollback.clone());
+                }
+                PaneAttachment::Detached => {}
+            }
+        }
         // CTX-0873: a restore can change the workspace count across one,
         // which reserves or releases the bar band.
         self.refresh_chrome_band();
@@ -994,13 +1195,15 @@ impl Runtime {
     /// Stages one pane's captured history and cwd in the pending map for
     /// the next successful spawn of its leaf.
     fn stage_pending_restore(&mut self, pane: &PaneSnapshot) {
-        self.session_pending.insert(
-            pane.view,
-            PendingPaneRestore {
-                cwd: pane.cwd.clone(),
-                scrollback: pane.scrollback.clone(),
-            },
-        );
+        self.stage_pending(pane.view, pane.cwd.clone(), pane.scrollback.clone());
+    }
+
+    /// Stages one view's captured history and cwd in the pending map for
+    /// the next successful spawn of that view (shared by layout panes and
+    /// pinned entries, which drain through the same spawn paths).
+    fn stage_pending(&mut self, view: ViewId, cwd: Option<String>, scrollback: Vec<String>) {
+        self.session_pending
+            .insert(view, PendingPaneRestore { cwd, scrollback });
     }
 
     /// Drains the pending restore for `view` into its fresh grid after a
@@ -1079,23 +1282,37 @@ impl Runtime {
     /// restore and no live session gets a fresh shell replaying the primary
     /// attach recipe (startup parity with `workspace_new`), which hydrates
     /// the pending scrollback and seeds the spawn cwd from the captured
-    /// `OSC 7` report. Best-effort with loud warnings; leaves already owning
-    /// a session are untouched. No-op before any successful primary attach
-    /// (no recipe to replay) or with nothing pending.
+    /// `OSC 7` report. Restored attached pins are window-global (in no
+    /// layout) yet presented in every workspace scene, so pending ones
+    /// respawn here too — covering a startup spawn that failed, or an
+    /// apply that landed after startup. Unpinned ids rejoin the layout set
+    /// above, so no special path is needed after unpin. Best-effort with
+    /// loud warnings; leaves already owning a session are untouched. No-op
+    /// before any successful primary attach (no recipe to replay) or with
+    /// nothing pending.
     pub(super) fn spawn_session_pending_for_active(&mut self) {
         let Some((program, args)) = self.primary_spawn.clone() else {
             return;
         };
-        let targets: Vec<ViewId> = self
+        let still_pending = |view: &ViewId| {
+            self.session_pending.contains_key(view)
+                && !self.pane_sessions.contains_key(view)
+                && Some(*view) != self.primary_view
+        };
+        let mut targets: Vec<ViewId> = self
             .layout
             .leaf_ids()
             .into_iter()
-            .filter(|view| {
-                self.session_pending.contains_key(view)
-                    && !self.pane_sessions.contains_key(view)
-                    && Some(*view) != self.primary_view
-            })
+            .filter(|view| still_pending(view))
             .collect();
+        // CTX-1082: pinned ids live in no layout — keep them out of the
+        // layout filter above and cover them here, in stable pin order.
+        targets.extend(
+            self.pinned
+                .ids()
+                .into_iter()
+                .filter(|view| still_pending(view)),
+        );
         if targets.is_empty() {
             return;
         }
@@ -1150,12 +1367,22 @@ impl Runtime {
         backend.commit_session_bytes(path, &bytes)?;
         Ok(SessionSaveSummary {
             workspaces: snap.workspaces.len(),
-            panes: snap.workspaces.iter().map(|ws| ws.panes.len()).sum(),
+            panes: snap
+                .workspaces
+                .iter()
+                .map(|ws| ws.panes.len())
+                .sum::<usize>()
+                + snap.pinned.len(),
             scrollback_lines: snap
                 .workspaces
                 .iter()
                 .flat_map(|ws| ws.panes.iter().map(|pane| pane.scrollback.len()))
-                .sum(),
+                .sum::<usize>()
+                + snap
+                    .pinned
+                    .iter()
+                    .map(|pin| pin.scrollback.len())
+                    .sum::<usize>(),
             bytes: bytes.len(),
         })
     }
@@ -1395,6 +1622,7 @@ mod tests {
             workspaces: vec![ws],
             active: 0,
             mru: vec![0],
+            pinned: Vec::new(),
         };
         assert!(validate_snapshot(&snap).is_err());
         let mut snap2 = SessionSnapshot {
@@ -1415,6 +1643,7 @@ mod tests {
             }],
             active: 0,
             mru: vec![1],
+            pinned: Vec::new(),
         };
         assert!(validate_snapshot(&snap2).is_err());
         snap2.mru = vec![0];
@@ -1496,6 +1725,7 @@ mod tests {
             }],
             active: 0,
             mru: vec![0],
+            pinned: Vec::new(),
         }
     }
 
@@ -1589,6 +1819,7 @@ mod tests {
             }],
             active: 0,
             mru: vec![0],
+            pinned: Vec::new(),
         };
         validate_snapshot(&on_owner).expect("primary on the owner must validate");
         on_owner.workspaces[0].panes[1].attach = Some(PaneAttachment::Session);
@@ -1630,5 +1861,144 @@ mod tests {
             ),
             PaneAttachment::Detached
         );
+    }
+
+    fn pinned_entry(id: u64, attach: PaneAttachment) -> PinnedSnapshot {
+        PinnedSnapshot {
+            view: View::with_presentation(ViewId::new(id), 80, 24, PresentationMode::Floating),
+            cwd: None,
+            scrollback: Vec::new(),
+            attach,
+            anchor: Some(ViewId::new(1)),
+            after: false,
+        }
+    }
+
+    #[test]
+    fn pinned_validation_rejects_duplicates_and_old_version_claims() {
+        // A pinned id colliding with a layout leaf aliases two histories
+        // onto one session.
+        let mut colliding = two_pane_snapshot(Some(PaneAttachment::Primary));
+        colliding
+            .pinned
+            .push(pinned_entry(2, PaneAttachment::Session));
+        let err = validate_snapshot(&colliding).expect_err("pinned/layout alias must fail");
+        assert_eq!(format!("{err}"), "session file corrupt (duplicate pane)");
+
+        // Two pinned entries sharing one id collide the same way.
+        let mut doubled = two_pane_snapshot(Some(PaneAttachment::Primary));
+        doubled
+            .pinned
+            .push(pinned_entry(9, PaneAttachment::Session));
+        doubled
+            .pinned
+            .push(pinned_entry(9, PaneAttachment::Detached));
+        let err = validate_snapshot(&doubled).expect_err("pinned/pinned alias must fail");
+        assert_eq!(format!("{err}"), "session file corrupt (duplicate pane)");
+
+        // v1/v2 carry no pinned block by construction: an older version
+        // claiming pinned entries never came from a decoder.
+        let mut backdated = two_pane_snapshot(Some(PaneAttachment::Primary));
+        backdated.version = 2;
+        backdated
+            .pinned
+            .push(pinned_entry(9, PaneAttachment::Session));
+        let err = validate_snapshot(&backdated).expect_err("v2 with pinned must fail");
+        assert_eq!(format!("{err}"), "session file corrupt (pinned version)");
+
+        // A session-less pinned leaf carrying state is corrupt, mirroring
+        // the layout `detached` rule.
+        let mut stowaway = two_pane_snapshot(Some(PaneAttachment::Primary));
+        let mut smuggled = pinned_entry(9, PaneAttachment::Detached);
+        smuggled.scrollback = vec!["stowaway".to_string()];
+        stowaway.pinned.push(smuggled);
+        let err = validate_snapshot(&stowaway).expect_err("stateful detached pin must fail");
+        assert_eq!(
+            format!("{err}"),
+            "session file corrupt (detached pane state)"
+        );
+
+        // Pinned views are floating by construction; anything else is corrupt.
+        let mut tiled = two_pane_snapshot(Some(PaneAttachment::Primary));
+        let mut wrong_mode = pinned_entry(9, PaneAttachment::Session);
+        wrong_mode.view = View::new(ViewId::new(9), 80, 24);
+        tiled.pinned.push(wrong_mode);
+        let err = validate_snapshot(&tiled).expect_err("non-floating pin must fail");
+        assert_eq!(format!("{err}"), "session file corrupt (pinned mode)");
+    }
+
+    #[test]
+    fn pinned_entries_share_the_total_pane_bound() {
+        let mut snap = two_pane_snapshot(Some(PaneAttachment::Primary));
+        snap.pinned.push(pinned_entry(9, PaneAttachment::Session));
+        validate_snapshot(&snap).expect("one pinned entry validates");
+        // Fill to the total with distinct pinned ids, then tip over it.
+        for id in 10..(10 + (MAX_SESSION_PANES_TOTAL - 3) as u64) {
+            snap.pinned.push(pinned_entry(id, PaneAttachment::Detached));
+        }
+        validate_snapshot(&snap).expect("exactly at the total validates");
+        snap.pinned
+            .push(pinned_entry(1000, PaneAttachment::Detached));
+        let err = validate_snapshot(&snap).expect_err("over the total must fail");
+        assert_eq!(format!("{err}"), "session file corrupt (too many panes)");
+    }
+
+    #[test]
+    fn capture_reads_pinned_live_grids_with_attachment() {
+        // CTX-1082: capture reads a pinned leaf's live grid exactly like a
+        // layout leaf's (the store detaches the leaf, never its session).
+        // Hermetic: the test parks the leaf directly and points the primary
+        // grid at it — pinning through the public path would hand primary
+        // ownership to the surviving leaf first.
+        let mut rt = Runtime::with_defaults().expect("defaults build");
+        // Feed past the viewport so history enters the scrollback ring
+        // (a single visible line is grid, not scrollback).
+        for i in 0..30 {
+            rt.handle_pty_bytes(format!("pinned-history {i:02}\r\n").as_bytes());
+        }
+        assert!(rt.state().scrollback_len() > 0, "must have scrollback");
+        let parked = View::with_presentation(ViewId::new(9), 80, 24, PresentationMode::Floating);
+        rt.pinned.restore(parked, Some(ViewId::new(1)), false);
+        rt.primary_view = Some(ViewId::new(9));
+
+        let snap = rt.capture_session_snapshot();
+        assert_eq!(snap.pinned.len(), 1);
+        let pin = &snap.pinned[0];
+        assert_eq!(pin.view.id(), ViewId::new(9));
+        assert_eq!(pin.attach, PaneAttachment::Primary);
+        assert_eq!(pin.anchor, Some(ViewId::new(1)));
+        assert!(!pin.after);
+        assert!(
+            pin.scrollback
+                .iter()
+                .any(|line| line.contains("pinned-history")),
+            "pinned history captures from the live grid"
+        );
+
+        // The captured entry applies: a recorded pinned primary routes to
+        // pending (it never hydrates the shared grid).
+        let mut fresh = Runtime::with_defaults().expect("defaults build");
+        let summary = fresh.apply_session_snapshot(&snap).expect("apply valid");
+        assert_eq!(fresh.pinned_views(), vec![ViewId::new(9)]);
+        assert!(fresh.session_pending_contains(&ViewId::new(9)));
+        assert_eq!(summary.pending, 1);
+    }
+
+    #[test]
+    fn old_version_snapshot_without_pinned_still_validates() {
+        // CTX-1082 compat: a v2 snapshot (no pinned block) validates as-is;
+        // decode migrates it to an empty pinned store.
+        let mut legacy = two_pane_snapshot(Some(PaneAttachment::Primary));
+        legacy.version = 2;
+        validate_snapshot(&legacy).expect("v2 without pinned validates");
+        let mut ancient = two_pane_snapshot(None);
+        ancient.version = SESSION_MIN_DECODE_VERSION;
+        validate_snapshot(&ancient).expect("v1 without pinned validates");
+        let mut future = two_pane_snapshot(Some(PaneAttachment::Primary));
+        future.version = SESSION_FORMAT_VERSION + 1;
+        assert!(matches!(
+            validate_snapshot(&future),
+            Err(SessionError::UnsupportedVersion(_))
+        ));
     }
 }

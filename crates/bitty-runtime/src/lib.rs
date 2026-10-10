@@ -240,7 +240,7 @@ pub use runtime::session::{
     MAX_SESSION_LINE_BYTES, MAX_SESSION_LINE_TEXT_BYTES, MAX_SESSION_NAME_CHARS,
     MAX_SESSION_PANES_PER_WORKSPACE, MAX_SESSION_PANES_TOTAL,
     MAX_SESSION_SCROLLBACK_LINES_PER_PANE, MAX_SESSION_WORKSPACES, PaneAttachment, PaneRoute,
-    PaneSnapshot, PendingPaneRestore, SESSION_APP_DIR_NAME, SESSION_FILE_NAME,
+    PaneSnapshot, PendingPaneRestore, PinnedSnapshot, SESSION_APP_DIR_NAME, SESSION_FILE_NAME,
     SESSION_FORMAT_VERSION, SESSION_MIN_DECODE_VERSION, SESSIONS_DIR_NAME, SessionError,
     SessionExitSaveOutcome, SessionFileBackend, SessionRestoreSummary, SessionSaveSummary,
     SessionSnapshot, SessionStartupOutcome, WorkspaceSnapshot,

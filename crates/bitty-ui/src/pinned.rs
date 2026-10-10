@@ -119,6 +119,13 @@ impl PinnedEntry {
     pub fn anchor(&self) -> Option<ViewId> {
         self.anchor
     }
+
+    /// Which side of the anchor the leaf returns to (`false` restores
+    /// before the anchor).
+    #[must_use]
+    pub fn after(&self) -> bool {
+        self.after
+    }
 }
 
 /// Window-global pinned-leaf store (CTX-1077, issue #1757).
@@ -182,6 +189,34 @@ impl PinnedStore {
     #[must_use]
     pub fn ids(&self) -> Vec<ViewId> {
         self.entries.iter().map(|entry| entry.view.id()).collect()
+    }
+
+    /// The recorded restore anchor of pinned leaf `id`, if pinned: the
+    /// neighboring leaf id at pin time plus which side the leaf returns
+    /// to (`None` outer for an unknown id).
+    ///
+    /// Session restore (CTX-1082) reads this to persist the anchor beside
+    /// the parked leaf; [`Self::restore`] writes it back.
+    #[must_use]
+    pub fn anchor_of(&self, id: ViewId) -> Option<(Option<ViewId>, bool)> {
+        self.entries
+            .iter()
+            .find(|entry| entry.view.id() == id)
+            .map(|entry| (entry.anchor, entry.after))
+    }
+
+    /// Reinstalls a previously captured pinned leaf (session restore,
+    /// CTX-1082): pushes `view` with its recorded anchor without touching
+    /// any layout tree. Pin order is the restore order.
+    ///
+    /// The caller validates the snapshot first; like [`Self::pin`] this
+    /// stays total and never fails.
+    pub fn restore(&mut self, view: View, anchor: Option<ViewId>, after: bool) {
+        self.entries.push(PinnedEntry {
+            view,
+            anchor,
+            after,
+        });
     }
 
     /// Pins leaf `id`: detaches it from `tree` and stamps it `Floating`.
@@ -569,5 +604,33 @@ mod tests {
         assert!(view.reflow_to_rect(Rect::new(0, 0, 10, 8)));
         assert_eq!(store.get(ViewId::new(1)).expect("parked").cols(), 10);
         assert!(store.find_mut(ViewId::new(404)).is_none());
+    }
+
+    #[test]
+    fn restore_reinstalls_captured_anchor_without_touching_tree() {
+        // CTX-1082: session restore reinstalls the parked leaf plus its
+        // recorded anchor; the layout tree is never touched here.
+        let mut tree = triple();
+        let mut store = PinnedStore::new();
+        store.pin(&mut tree, ViewId::new(2)).expect("pin leaf 2");
+        let parked = store.get(ViewId::new(2)).expect("parked").clone();
+        let (anchor, after) = store.anchor_of(ViewId::new(2)).expect("anchor recorded");
+        assert_eq!(anchor, Some(ViewId::new(3)));
+        assert!(!after, "pin anchors before the following neighbor");
+        assert_eq!(store.anchor_of(ViewId::new(404)), None);
+
+        let mut revived = PinnedStore::new();
+        revived.restore(parked.clone(), anchor, after);
+        assert_eq!(revived.ids(), vec![ViewId::new(2)]);
+        assert_eq!(revived.get(ViewId::new(2)), Some(&parked));
+        assert_eq!(revived.anchor_of(ViewId::new(2)), Some((anchor, after)));
+        // The tree the leaf came from is untouched by the reinstall.
+        assert_eq!(tree.leaf_ids(), vec![ViewId::new(1), ViewId::new(3)]);
+
+        // Restoring into the live tree honors the carried anchor.
+        let restored = revived.unpin(&mut tree, ViewId::new(2)).expect("unpin");
+        assert_eq!(restored, ViewId::new(2));
+        assert!(revived.is_empty());
+        assert!(tree.leaf_ids().contains(&ViewId::new(2)));
     }
 }

@@ -1161,6 +1161,28 @@ fn write_tofu_pin(user: &Path, name: &str, digest: &str) -> Result<(), Component
     publish_bytes_atomic(&path, format!("{digest}\n").as_bytes(), None)
 }
 
+/// Enforce the registry half of both-must-match (issue #1906 seam).
+///
+/// `None` (registry index absent today, manager#11 open) is a no-op so the
+/// seam stays live without changing behavior. `Some` must constant-shape
+/// match the verified tarball digest; any mismatch or malformed value fails
+/// closed as integrity failure (exit 4), never a silent pick.
+fn check_registry_digest(
+    registry: Option<&str>,
+    tarball_digest: &str,
+) -> Result<(), ComponentFailure> {
+    let Some(expected) = registry else {
+        return Ok(());
+    };
+    if !crate::component_seed::digests_equal_ct(expected, tarball_digest) {
+        return Err(ComponentFailure::component(format!(
+            "bitty component: install failed: registry digest {} does not match verified tarball digest {tarball_digest} (refusing to install)",
+            expected.to_ascii_lowercase(),
+        )));
+    }
+    Ok(())
+}
+
 // Nine args: install needs name/version/digest/force/roots/stdio/consent/
 // transport together (all bounded, fail-closed before mutation). A params
 // struct would obscure the call-site audit, so allow the lint here.
@@ -1264,19 +1286,8 @@ fn op_install(
             .map_err(|error| seed_failure(&error))?;
     // Registry seam (manager#11): when the index lands, the registry digest
     // joins both-must-match here (all-available-must-match). Today it is
-    // `None`, so this is a no-op keeping the seam live in non-test builds.
-    if let Some(registry) = registry_digest.as_deref() {
-        // Real check once the index exists (constant-shape, exit 4 on mismatch):
-        // registry must match the verified CDN digest (which equals the actual
-        // tarball digest after the fetch above). Kept live so the seam cannot
-        // drift: `None` today always yields confirm.
-        let dual_post = crate::component_seed::is_dual_digest_verified(
-            Some(registry),
-            &payload.tarball_digest,
-            &payload.tarball_digest,
-        );
-        let _ = crate::component_seed::installer_consent_level(is_builtin, dual_post);
-    }
+    // `None`, so this is a no-op. A mismatching `Some` fails closed (exit 4).
+    check_registry_digest(registry_digest.as_deref(), &payload.tarball_digest)?;
     // ABI-compat check before any mutation (same gate as `add`).
     let core = bitty_runtime::component::PROTOCOL_VERSION;
     if !(payload.protocol_min..=payload.protocol_max).contains(&core) {
@@ -1299,10 +1310,16 @@ fn op_install(
     // TOFU-with-pin (#1906): first contact records the verified CDN digest;
     // later differing digests fail closed as pin-mismatch unless `--force`
     // re-pins. Never auto-updates. Check runs before any mutation so a
-    // pin-mismatch stages nothing.
-    let existing_pin = read_tofu_pin(user, &staged.name)?;
+    // pin-mismatch stages nothing. A corrupt pin (exit 4) is a mismatch that
+    // `--force` may overwrite after verification; filesystem refusals
+    // (symlink, non-file, I/O; exit 1) always propagate.
+    let (existing_pin, pin_corrupt) = match read_tofu_pin(user, &staged.name) {
+        Ok(pin) => (pin, false),
+        Err(failure) if failure.exit == EXIT_COMPONENT && force => (None, true),
+        Err(failure) => return Err(failure),
+    };
     let pin_matches = match existing_pin.as_deref() {
-        None => true,
+        None => !pin_corrupt,
         Some(pinned) => crate::component_seed::digests_equal_ct(pinned, &verified_digest),
     };
     if !pin_matches && !force {
@@ -1317,13 +1334,14 @@ fn op_install(
     // never on failure). First contact writes; `--force` overwrites a
     // differing pin; a matching pin needs no write.
     let needs_pin_write = match existing_pin.as_deref() {
+        // First contact and corrupt-pin recovery (force-only) both write.
         None => true,
         Some(_) if force && !pin_matches => true,
         Some(_) => false,
     };
     let pin_note = if needs_pin_write {
         write_tofu_pin(user, &staged.name, &verified_digest)?;
-        if existing_pin.is_none() {
+        if existing_pin.is_none() && !pin_corrupt {
             format!(
                 "\ntofupin: pinned tarball digest {verified_digest} for '{}' (first contact)",
                 staged.name,
@@ -3191,6 +3209,102 @@ mod tests {
             crate::component_seed::installer_consent_level(false, false),
             crate::component_seed::InstallerConsentLevel::Confirm
         );
+    }
+
+    #[test]
+    fn registry_check_enforces_some_path() {
+        // None (index absent today) is a no-op.
+        assert!(check_registry_digest(None, &"a".repeat(64)).is_ok());
+        // Matching registry digests pass (lower and upper).
+        let digest = "b".repeat(64);
+        assert!(check_registry_digest(Some(&digest), &digest).is_ok());
+        assert!(check_registry_digest(Some(&digest.to_ascii_uppercase()), &digest).is_ok());
+        // Mismatching or malformed registry values fail closed (exit 4).
+        let other = "c".repeat(64);
+        let error =
+            check_registry_digest(Some(&other), &digest).expect_err("registry mismatch must fail");
+        assert_eq!(error.exit, EXIT_COMPONENT, "{}", error.message);
+        assert!(
+            error.message.contains("registry digest"),
+            "{}",
+            error.message
+        );
+        for malformed in ["abc".to_string(), "g".repeat(64), "a".repeat(63)] {
+            let error = check_registry_digest(Some(&malformed), &digest)
+                .expect_err("malformed registry must fail");
+            assert_eq!(error.exit, EXIT_COMPONENT, "{}", error.message);
+        }
+    }
+
+    #[test]
+    fn install_corrupt_pin_fails_closed_without_force_but_recovers_with_force() {
+        if crate::component_seed::host_target_triple().is_none() {
+            return;
+        }
+        for tag in ["invalid-hex", "oversize"] {
+            let base = scratch(&format!("install-corrupt-pin-{tag}"));
+            let user = base.join("user");
+            std::fs::create_dir_all(user.join("net")).expect("component dir");
+            // Plant a corrupt pin: non-hex text or an oversize blob.
+            let corrupt = if tag == "oversize" {
+                "x".repeat(200)
+            } else {
+                "not-a-hex-pin".to_string()
+            };
+            std::fs::write(user.join("net").join(TARBALL_PIN_FILE), &corrupt).expect("corrupt pin");
+            let target = "x86_64-unknown-linux-gnu";
+            // Without --force: fail closed (exit 4) with no staging.
+            let mut stub = InstallStub::canned("net", "0.0.23", target, b"seed-net-bytes");
+            let mut out = Vec::new();
+            let mut input = std::io::BufReader::new(&b""[..]);
+            let error = op_install(
+                "net",
+                Some("0.0.23"),
+                None,
+                false,
+                Some(&user),
+                &mut out,
+                &mut input,
+                true,
+                &mut stub,
+            )
+            .expect_err("corrupt pin must fail without --force");
+            assert_eq!(error.exit, EXIT_COMPONENT, "{tag}: {}", error.message);
+            assert!(
+                error.message.contains("pin-mismatch"),
+                "{tag}: {}",
+                error.message
+            );
+            assert!(
+                !user.join("net").join("0.0.23").exists(),
+                "{tag}: corrupt pin must not stage"
+            );
+            // With --force: verification passes, then the corrupt pin is
+            // overwritten (re-pinned, not first contact).
+            let mut stub = InstallStub::canned("net", "0.0.23", target, b"seed-net-bytes");
+            let mut out = Vec::new();
+            let mut input = std::io::BufReader::new(&b""[..]);
+            let summary = op_install(
+                "net",
+                Some("0.0.23"),
+                None,
+                true,
+                Some(&user),
+                &mut out,
+                &mut input,
+                true,
+                &mut stub,
+            )
+            .expect("corrupt pin must recover with --force");
+            assert!(summary.contains("re-pinned"), "{tag}: {summary}");
+            let pin =
+                std::fs::read_to_string(user.join("net").join(TARBALL_PIN_FILE)).expect("pin");
+            assert!(
+                crate::component_seed::is_hex_digest(pin.trim()),
+                "{tag}: re-pinned value must be valid hex"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
     }
 
     #[test]

@@ -168,6 +168,7 @@ pub mod pinned;
 pub mod placement;
 pub mod presentation;
 pub mod provider;
+pub mod pseudo;
 pub mod resolved_style;
 pub mod scratchpad;
 pub mod scrollbar;
@@ -283,6 +284,11 @@ pub use provider::{
     NOOP_PROVIDER_NAME, NoopTiler, ProviderId, ProviderName, ProviderRegistry,
     RESERVED_PROVIDER_NAMES, SPIRAL_PROVIDER_ID, SpiralProvider, WorkspaceSnapshot,
     validate_proposal,
+};
+pub use pseudo::{
+    DEFAULT_PSEUDO_COLS, DEFAULT_PSEUDO_ROWS, PSEUDO_CMD_TOGGLE, PseudoConstraint, PseudoError,
+    apply_pseudo_toggle, clear_pseudo, pseudo_viewport, pseudo_viewport_aspect,
+    resolve_pseudo_viewport, set_pseudo_aspect, set_pseudo_size, toggle_pseudo,
 };
 pub use resolved_style::{ResolvedStyle, StyleCascade, StyleError, StyleOrigin};
 pub use scratchpad::{

@@ -755,42 +755,108 @@ impl Runtime {
                     .find_leaf(view)
                     .and_then(|leaf| leaf.presentation().overlay_tier());
                 let tier = structural.or(mode_tier);
-                let (frame_rect, content_rect, border) =
-                    if structural.is_none() && mode_tier.is_some() {
-                        let float_rect = bitty_ui::presentation::float_frame(dv.frame, area);
-                        // Elevated float chrome: one extra border px so the
-                        // float reads distinct from tiled base; the content
-                        // inset grows with it so glyphs never sit under the
-                        // ring.
-                        let border = dv
-                            .border
-                            .saturating_add(bitty_ui::presentation::FLOAT_BORDER_EXTRA);
-                        // CodeRabbit 1873: cap the insets by the float frame
-                        // so a degenerate (tiny/empty) float rect keeps the
-                        // content origin inside the frame instead of
-                        // overshooting past its far edge.
-                        let inset_x = dv
-                            .content
-                            .x
-                            .saturating_sub(dv.frame.x)
-                            .saturating_add(bitty_ui::presentation::FLOAT_BORDER_EXTRA)
-                            .min(float_rect.width);
-                        let inset_y = dv
-                            .content
-                            .y
-                            .saturating_sub(dv.frame.y)
-                            .saturating_add(bitty_ui::presentation::FLOAT_BORDER_EXTRA)
-                            .min(float_rect.height);
-                        let content_rect = UiRect::new(
-                            float_rect.x.saturating_add(inset_x),
-                            float_rect.y.saturating_add(inset_y),
-                            float_rect.width.saturating_sub(inset_x.saturating_mul(2)),
-                            float_rect.height.saturating_sub(inset_y.saturating_mul(2)),
-                        );
-                        (float_rect, content_rect, border)
-                    } else {
-                        (dv.frame, dv.content, dv.border)
-                    };
+                let (frame_rect, content_rect, border) = if structural.is_none()
+                    && mode_tier.is_some()
+                {
+                    let float_rect = bitty_ui::presentation::float_frame(dv.frame, area);
+                    // Elevated float chrome: one extra border px so the
+                    // float reads distinct from tiled base; the content
+                    // inset grows with it so glyphs never sit under the
+                    // ring.
+                    let border = dv
+                        .border
+                        .saturating_add(bitty_ui::presentation::FLOAT_BORDER_EXTRA);
+                    // CodeRabbit 1873: cap the insets by the float frame
+                    // so a degenerate (tiny/empty) float rect keeps the
+                    // content origin inside the frame instead of
+                    // overshooting past its far edge.
+                    let inset_x = dv
+                        .content
+                        .x
+                        .saturating_sub(dv.frame.x)
+                        .saturating_add(bitty_ui::presentation::FLOAT_BORDER_EXTRA)
+                        .min(float_rect.width);
+                    let inset_y = dv
+                        .content
+                        .y
+                        .saturating_sub(dv.frame.y)
+                        .saturating_add(bitty_ui::presentation::FLOAT_BORDER_EXTRA)
+                        .min(float_rect.height);
+                    let content_rect = UiRect::new(
+                        float_rect.x.saturating_add(inset_x),
+                        float_rect.y.saturating_add(inset_y),
+                        float_rect.width.saturating_sub(inset_x.saturating_mul(2)),
+                        float_rect.height.saturating_sub(inset_y.saturating_mul(2)),
+                    );
+                    (float_rect, content_rect, border)
+                } else {
+                    // CTX-1079 (#1758): pseudo-tiling fixed-dimension viewport.
+                    // The solver slot stays byte-identical; only the present
+                    // content shrinks to the preferred grid centered inside
+                    // the slot, with the gutter left as window background.
+                    // Fail-closed to plain tiled fill when the slot is
+                    // smaller than preferred in either axis; saturating math
+                    // throughout, mirroring the float clamp precedent.
+                    let mut content = dv.content;
+                    if structural.is_none() {
+                        if let Some(constraint) = scene
+                            .find_leaf(view)
+                            .and_then(|leaf| leaf.pseudo_constraint())
+                        {
+                            // Slot grid from the decorated content pixels (floor;
+                            // the sub-cell remainder stays background).
+                            let slot_cols =
+                                (u32::from(dv.content.width) / cw.max(1)).min(65535) as u16;
+                            let slot_rows =
+                                (u32::from(dv.content.height) / ch.max(1)).min(65535) as u16;
+                            let preferred = match constraint {
+                                bitty_ui::PseudoConstraint::Fixed(size) => Some(size),
+                                bitty_ui::PseudoConstraint::Aspect { num, den } => {
+                                    if slot_cols == 0 || slot_rows == 0 {
+                                        None
+                                    } else {
+                                        let fitted = bitty_ui::pseudo_viewport_aspect(
+                                            UiRect::new(0, 0, slot_cols, slot_rows),
+                                            num,
+                                            den,
+                                        );
+                                        if fitted.is_empty() {
+                                            None
+                                        } else {
+                                            Some(bitty_ui::Size::new(fitted.width, fitted.height))
+                                        }
+                                    }
+                                }
+                            };
+                            if let Some(pref) = preferred {
+                                let fits = slot_cols >= pref.width
+                                    && slot_rows >= pref.height
+                                    && pref.width > 0
+                                    && pref.height > 0;
+                                if fits {
+                                    let pref_w = (u32::from(pref.width).saturating_mul(cw))
+                                        .min(65535)
+                                        as u16;
+                                    let pref_h = (u32::from(pref.height).saturating_mul(ch))
+                                        .min(65535)
+                                        as u16;
+                                    // The preferred grid never exceeds the slot grid,
+                                    // so preferred pixels never exceed slot pixels;
+                                    // saturating guards keep this total regardless.
+                                    let dx = dv.content.width.saturating_sub(pref_w) / 2;
+                                    let dy = dv.content.height.saturating_sub(pref_h) / 2;
+                                    content = UiRect::new(
+                                        dv.content.x.saturating_add(dx),
+                                        dv.content.y.saturating_add(dy),
+                                        pref_w.min(dv.content.width),
+                                        pref_h.min(dv.content.height),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    (dv.frame, content, dv.border)
+                };
                 PresentFrame {
                     view,
                     frame: bitty_render::geometry::RectPx::new(

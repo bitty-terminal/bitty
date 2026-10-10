@@ -27,6 +27,7 @@ use bitty_term_state::{Cell, Snapshot, State, Style};
 
 use crate::geometry::{Point, Rect, Size};
 use crate::presentation::PresentationMode;
+use crate::pseudo::PseudoConstraint;
 
 /// Opaque identifier for a view leaf.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -81,6 +82,11 @@ pub struct View {
     /// Requested per-leaf display mode (CTX-0276). Defaults to
     /// [`PresentationMode::Tiled`]; ignored by the layout solver.
     presentation: PresentationMode,
+    /// Optional pseudo-tiling constraint (CTX-1079, issue #1758). `None`
+    /// means plain tiled fill; `Some` centers the present viewport inside
+    /// the solver slot at the preferred size. Ignored by the layout solver
+    /// like `presentation`, so stamping never moves allocations.
+    pseudo: Option<PseudoConstraint>,
 }
 
 impl View {
@@ -92,8 +98,9 @@ impl View {
     /// Creates a new view with the given id and cell dimensions.
     ///
     /// Dimensions are clamped to at least [`View::MIN_COLS`] x [`View::MIN_ROWS`]
-    /// and to `u16::MAX` (grid bounds). Scroll starts at live (0) and
-    /// presentation starts at [`PresentationMode::Tiled`].
+    /// and to `u16::MAX` (grid bounds). Scroll starts at live (0),
+    /// presentation starts at [`PresentationMode::Tiled`], and the
+    /// pseudo-tiling flag starts cleared (plain tiled fill).
     #[must_use]
     pub fn new(id: ViewId, cols: usize, rows: usize) -> Self {
         let cols = clamp_dim(cols, Self::MIN_COLS);
@@ -106,6 +113,7 @@ impl View {
             col_offset: 0,
             origin: Point::new(0, 0),
             presentation: PresentationMode::Tiled,
+            pseudo: None,
         }
     }
 
@@ -168,6 +176,40 @@ impl View {
     /// [`PresentationMode::can_transition`] gate is enforced.
     pub fn set_presentation(&mut self, mode: PresentationMode) {
         self.presentation = mode;
+    }
+
+    /// Optional pseudo-tiling constraint (CTX-1079). `None` means plain
+    /// tiled fill; `Some` centers the present viewport inside the solver
+    /// slot. Ignored by the layout solver like `presentation`.
+    #[must_use]
+    pub fn pseudo_constraint(&self) -> Option<PseudoConstraint> {
+        self.pseudo
+    }
+
+    /// Stamps a pseudo-tiling constraint on this leaf. Stored verbatim and
+    /// ignored by the layout solver (allocations byte-identical). Prefer the
+    /// [`crate::pseudo`] helpers so the toggle/set/clear paths stay uniform.
+    pub fn set_pseudo_constraint(&mut self, constraint: Option<PseudoConstraint>) {
+        self.pseudo = constraint;
+    }
+
+    /// Clears the pseudo-tiling flag (restores plain tiled fill).
+    pub fn clear_pseudo(&mut self) {
+        self.pseudo = None;
+    }
+
+    /// True when a pseudo-tiling constraint is stamped.
+    #[must_use]
+    pub fn is_pseudo(&self) -> bool {
+        self.pseudo.is_some()
+    }
+
+    /// Resolves the present viewport for `slot`: the centered preferred
+    /// rect when pseudo is set, otherwise `slot` unchanged. Pure geometry;
+    /// never mutates the leaf.
+    #[must_use]
+    pub fn pseudo_viewport(&self, slot: Rect) -> Rect {
+        crate::pseudo::resolve_pseudo_viewport(slot, self.pseudo)
     }
 
     /// Current scroll offset (0 = live bottom, `n` = `n` lines up into scrollback).

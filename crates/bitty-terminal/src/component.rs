@@ -30,13 +30,18 @@
 //!   user version when none is named; removing the version named by `current`
 //!   also removes `current`. Never touches the system tier (needs a package
 //!   manager); a system-only component fails with an actionable diagnostic.
-//! - `install <name> --version <X.Y.Z>`: fetch one prebuilt release from R2
-//!   through the minimal install seed (`crate::component_seed`, issue
-//!   #1791 option A): fixed-argv system `curl` pinned to
-//!   `https://cdn.bitty.run`, `SHA256SUMS` hash verify fail-closed, exact
-//!   member audit, then the same atomic publish path as `add`. The version
-//!   is required and exact (no registry, no solving); the full manager
-//!   takes over after the install.
+//! - `install <name> --version <X.Y.Z> [--digest <hex>] [--force] [--yes]`:
+//!   fetch one prebuilt release from R2 through the minimal install seed
+//!   (`crate::component_seed`, issue #1791 option A): fixed-argv system
+//!   `curl` pinned to `https://cdn.bitty.run`, `SHA256SUMS` hash verify
+//!   fail-closed with both-must-match against `--digest` when provided
+//!   (#1906, constant-shape compare, exit 4 on any mismatch), exact member
+//!   audit, TOFU pin of the verified CDN digest into
+//!   `<user>/<name>/tarball.sha256` (later differing digests fail closed as
+//!   pin-mismatch unless `--force` re-pins, never auto-updated), then the
+//!   same atomic publish path as `add`. The version is required and exact
+//!   (no registry, no solving; registry index lands with manager#11); the
+//!   full manager takes over after the install.
 //! - Class: local-only (no instance, no IPC, no component code is ever
 //!   loaded or executed; safe-mode clean).
 //!
@@ -56,19 +61,21 @@
 //! - `0` success (including idempotent re-add and empty list).
 //! - `1` filesystem failure after validation (copy/write/remove I/O).
 //! - `2` usage error (missing/unknown verb, missing operand, unknown flag,
-//!   bad `--format`/`--version`, stray `--`, `--version`/`--format` on the
-//!   wrong verb).
+//!   bad `--format`/`--version`/`--digest`, stray `--`, `--version`/`--format`/
+//!   `--digest`/`--force`/`--yes` on the wrong verb).
 //! - `4` component error (unknown/invalid name, missing component, ABI
-//!   mismatch, digest mismatch, system-only remove, remote source).
+//!   mismatch, digest mismatch, pin-mismatch, system-only remove, remote source).
 //!
 //! # Bounds (fail closed before any filesystem mutation)
 //!
 //! - Raw tokens: 1..=[`MAX_COMPONENT_TOKEN_BYTES`] bytes, no NUL.
 //! - `--format`: 1..=[`MAX_COMPONENT_FORMAT_BYTES`] bytes.
 //! - `--version`: 1..=[`MAX_COMPONENT_VERSION_BYTES`] bytes.
+//! - `--digest`: 1..=[`MAX_COMPONENT_DIGEST_BYTES`] bytes, no NUL, plus 64 hex shape.
 //! - Source path: 1..=[`MAX_COMPONENT_PATH_BYTES`] bytes, no NUL.
 //! - Descriptor: [`COMPONENT_DESCRIPTOR_MAX_BYTES`] bytes (via runtime).
 //! - Executable: [`COMPONENT_EXECUTABLE_MAX_BYTES`] bytes (via runtime).
+//! - TOFU pin file: [`MAX_PIN_FILE_BYTES`] bytes (`tarball.sha256`).
 
 #![forbid(unsafe_code)]
 
@@ -109,6 +116,13 @@ pub const MAX_COMPONENT_CONSENT_LINE_BYTES: usize = 64;
 /// Install-consent attempts before aborting (mirrors `plugin.rs`
 /// `MAX_CONSENT_ATTEMPTS`).
 pub const MAX_COMPONENT_CONSENT_ATTEMPTS: usize = 3;
+/// Maximum bytes for a `--digest` value (64 hex chars, bounded like tokens).
+pub const MAX_COMPONENT_DIGEST_BYTES: usize = 256;
+/// TOFU pin file name inside `<user>/<name>/` holding the verified CDN
+/// tarball digest (`<hex>\n`, written atomically like `current`).
+pub const TARBALL_PIN_FILE: &str = "tarball.sha256";
+/// Maximum bytes read from a TOFU pin file (64 hex plus newline and slack).
+pub const MAX_PIN_FILE_BYTES: u64 = 128;
 
 // ---------------------------------------------------------------------------
 // Parsed request (headless, bounded, fail-closed)
@@ -206,6 +220,13 @@ pub struct ComponentRequest {
     pub no_color: bool,
     /// `install --yes`: approve the download consent non-interactively.
     pub yes: bool,
+    /// `install --digest <hex>`: caller-supplied expected tarball digest.
+    /// Both-must-match with CDN `SHA256SUMS`; malformed fails as usage.
+    pub digest: Option<String>,
+    /// `install --force`: re-pin the TOFU pin to the new verified digest.
+    /// Never bypasses digest verification; only overwrites the pin after
+    /// both-must-match passes.
+    pub force: bool,
 }
 
 /// Why parsing failed.
@@ -240,6 +261,17 @@ fn path_token_ok(token: &str) -> bool {
     !token.is_empty() && token.len() <= MAX_COMPONENT_PATH_BYTES && !token.contains('\0')
 }
 
+fn digest_token_ok(token: &str) -> bool {
+    !token.is_empty() && token.len() <= MAX_COMPONENT_DIGEST_BYTES && !token.contains('\0')
+}
+
+/// Validate a `--digest` value: bounded token plus 64 hex chars (fail-closed,
+/// usage error). Case-insensitive (upper/lower both accepted, normalized at
+/// compare time via constant-shape compare).
+fn valid_digest_flag(value: &str) -> bool {
+    digest_token_ok(value) && crate::component_seed::is_hex_digest(value)
+}
+
 /// Parse the tokens captured after the `component` word (bounded, fail-closed).
 pub fn parse_component_request(
     raw: &[String],
@@ -252,6 +284,8 @@ pub fn parse_component_request(
     let mut format: Option<String> = None;
     let mut no_color = false;
     let mut yes = false;
+    let mut digest: Option<String> = None;
+    let mut force = false;
 
     let mut index = 0usize;
     while index < raw.len() {
@@ -265,6 +299,11 @@ pub fn parse_component_request(
             }
             "--yes" => {
                 yes = true;
+                index += 1;
+                continue;
+            }
+            "--force" => {
+                force = true;
                 index += 1;
                 continue;
             }
@@ -323,6 +362,42 @@ pub fn parse_component_request(
                 ));
             }
             version_flag = Some(value.clone());
+            index += 2;
+            continue;
+        }
+        if let Some(value) = token.strip_prefix("--digest=") {
+            if !valid_digest_flag(value) {
+                return Err(ComponentParseError::Usage(format!(
+                    "bitty component: invalid --digest {value:?} (want 64 hex characters, SHA-256)"
+                )));
+            }
+            if digest.is_some() {
+                return Err(ComponentParseError::Usage(
+                    "bitty component: duplicate --digest".to_string(),
+                ));
+            }
+            digest = Some(value.to_string());
+            index += 1;
+            continue;
+        }
+        if token == "--digest" {
+            let Some(value) = raw.get(index + 1) else {
+                return Err(ComponentParseError::Usage(
+                    "bitty component: --digest needs a value (64 hex characters, SHA-256)"
+                        .to_string(),
+                ));
+            };
+            if !valid_digest_flag(value) {
+                return Err(ComponentParseError::Usage(format!(
+                    "bitty component: invalid --digest {value:?} (want 64 hex characters, SHA-256)"
+                )));
+            }
+            if digest.is_some() {
+                return Err(ComponentParseError::Usage(
+                    "bitty component: duplicate --digest".to_string(),
+                ));
+            }
+            digest = Some(value.clone());
             index += 2;
             continue;
         }
@@ -403,6 +478,18 @@ pub fn parse_component_request(
                     verb.name()
                 )));
             }
+            if digest.is_some() {
+                return Err(ComponentParseError::Usage(format!(
+                    "bitty component: --digest only applies to `install` (got `{}`)",
+                    verb.name()
+                )));
+            }
+            if force {
+                return Err(ComponentParseError::Usage(format!(
+                    "bitty component: --force only applies to `install` (got `{}`)",
+                    verb.name()
+                )));
+            }
         }
         ComponentVerb::Add => {
             if operand.is_none() {
@@ -426,6 +513,18 @@ pub fn parse_component_request(
             if yes {
                 return Err(ComponentParseError::Usage(format!(
                     "bitty component: --yes only applies to `install` (got `{}`)",
+                    verb.name()
+                )));
+            }
+            if digest.is_some() {
+                return Err(ComponentParseError::Usage(format!(
+                    "bitty component: --digest only applies to `install` (got `{}`)",
+                    verb.name()
+                )));
+            }
+            if force {
+                return Err(ComponentParseError::Usage(format!(
+                    "bitty component: --force only applies to `install` (got `{}`)",
                     verb.name()
                 )));
             }
@@ -482,6 +581,18 @@ pub fn parse_component_request(
                     verb.name()
                 )));
             }
+            if digest.is_some() {
+                return Err(ComponentParseError::Usage(format!(
+                    "bitty component: --digest only applies to `install` (got `{}`)",
+                    verb.name()
+                )));
+            }
+            if force {
+                return Err(ComponentParseError::Usage(format!(
+                    "bitty component: --force only applies to `install` (got `{}`)",
+                    verb.name()
+                )));
+            }
         }
     }
 
@@ -493,6 +604,8 @@ pub fn parse_component_request(
         format,
         no_color,
         yes,
+        digest,
+        force,
     })
 }
 
@@ -501,7 +614,7 @@ pub fn parse_component_request(
 pub fn component_usage() -> String {
     "usage: bitty component list [--format table|json|jsonl] [--no-color]\n\
      \x20      bitty component add <path> [--version <semver>]\n\
-     \x20      bitty component install <name> --version <X.Y.Z> [--yes]\n\
+     \x20      bitty component install <name> --version <X.Y.Z> [--digest <hex>] [--force] [--yes]\n\
      \x20      bitty component remove <name> [<version>]\n\
      \n\
      Components are upstream native binaries resolved user-first:\n\
@@ -509,8 +622,8 @@ pub fn component_usage() -> String {
      `add` stages from a local path only (v1 has no registry download);\n\
      `install` fetches one R2 prebuilt release through the hash-verified\n\
      seed (builtin cdn.bitty.run:443 egress, dual-digest verified silent\n\
-     else explicit consent), then the full manager takes over; `remove` only\n\
-     touches the user tier (no root required).\n\
+     else explicit consent, TOFU-pinned; --force re-pins), then the full\n\
+     manager takes over; `remove` only touches the user tier (no root required).\n\
      `bitty component --help` explains sources, ABI checks, and exit codes."
         .to_string()
 }
@@ -535,10 +648,10 @@ pub fn component_help_text() -> String {
      \x20                             anything is written. URLs fail closed (v1\n\
      \x20                             has no registry download).\n\
      \x20 install <name> --version V Fetch one prebuilt release from R2\n\
-     \x20 [--yes]                     (https://cdn.bitty.run, SHA256SUMS hash\n\
-     \x20                             verified) into the user tier, then hand\n\
-     \x20                             off to the full manager. The version is\n\
-     \x20                             required and exact: the seed keeps no\n\
+     \x20 [--digest H] [--force]      (https://cdn.bitty.run, SHA256SUMS hash\n\
+     \x20 [--yes]                     verified, TOFU-pinned) into the user tier,\n\
+     \x20                             then hand off to the full manager. The version\n\
+     \x20                             is required and exact: the seed keeps no\n\
      \x20                             registry and does no solving.\n\
      \x20 remove <name> [<version>]   Remove one user-installed version, or every\n\
      \x20                             user version when none is named. Removing\n\
@@ -550,6 +663,15 @@ pub fn component_help_text() -> String {
      \x20 --no-color                  Accepted for parity (tables are plain text).\n\
      \x20 --version <semver>          add: version for a bare executable.\n\
      \x20                             install: required exact R2 release.\n\
+     \x20 --digest <hex>              install only: caller-supplied expected tarball\n\
+     \x20                             digest (64 hex, SHA-256). Both-must-match with\n\
+     \x20                             CDN SHA256SUMS; any mismatch is an integrity\n\
+     \x20                             failure (exit 4), never a silent pick. Malformed\n\
+     \x20                             values fail as usage (exit 2). Stands in for the\n\
+     \x20                             registry value until the index lands (manager#11).\n\
+     \x20 --force                     install only: re-pin the TOFU pin to the new\n\
+     \x20                             verified digest after both-must-match passes. Does\n\
+     \x20                             NOT bypass digest verification.\n\
      \x20 --yes                       install only: approve the download consent\n\
      \x20                             non-interactively (no prompt).\n\
      \n\
@@ -561,12 +683,27 @@ pub fn component_help_text() -> String {
      \x20 (pinned to https://cdn.bitty.run, --proto =https, no shell) plus\n\
      \x20 system tar; no Rust network stack.\n\
      \n\
+     digest arbitration:\n\
+     \x20 Both-must-match: CDN SHA256SUMS and the caller-supplied --digest\n\
+     \x20 (registry value later) must EACH match the downloaded bytes.\n\
+     \x20 Any mismatch exits 4, never a silent pick. Hex compare is\n\
+     \x20 constant-shape (pass/fail only, no position oracle).\n\
+     \n\
+     TOFU pinning:\n\
+     \x20 First install of a component records (pins) the verified CDN\n\
+     \x20 tarball digest to <user>/<name>/tarball.sha256. Later installs\n\
+     \x20 (reinstall, upgrade, downgrade) with a differing digest fail closed\n\
+     \x20 as pin-mismatch (exit 4) naming the component, versions, and digests;\n\
+     \x20 use --force to re-pin after verification. The pin never auto-updates.\n\
+     \n\
      download consent:\n\
      \x20 Silent only when the fetch targets the builtin CDN host AND both\n\
-     \x20 digests verify (registry/manifest digest and CDN SHA256SUMS both\n\
+     \x20 digests verify (registry digest and CDN SHA256SUMS both\n\
      \x20 match, per the dual-digest rule); anything else (third-party host,\n\
      \x20 single-digest-only, digest mismatch history) needs explicit\n\
-     \x20 confirm. Without --yes the installer prompts `Grant download\n\
+     \x20 confirm. The registry half is absent today (manager#11 open), so\n\
+     \x20 installs always confirm; --digest does NOT grant silent. Without --yes\n\
+     \x20 the installer prompts `Grant download\n\
      \x20 <name> <version>? [y/N]` (up to 3 attempts, 64 bytes per answer);\n\
      \x20 `y`/`yes` approves, `n`/`no`/empty declines, EOF aborts. A\n\
      \x20 decline or EOF exits 1 with nothing staged or fetched.\n\
@@ -585,14 +722,16 @@ pub fn component_help_text() -> String {
      \n\
      exit codes:\n\
      \x20 0 success | 1 declined consent, aborted prompt, or filesystem\n\
-     \x20 failure | 2 usage | 4 component error (integrity, ABI, digest)\n\
+     \x20 failure | 2 usage (including malformed --digest) | 4 component error\n\
+     \x20 (integrity, ABI, digest, pin-mismatch)\n\
      \n\
      examples:\n\
      \x20 bitty component list\n\
      \x20 bitty component list --format json\n\
      \x20 bitty component add ./dist/net --version 0.0.1\n\
      \x20 bitty component install net --version 0.0.23\n\
-     \x20 bitty component install net --version 0.0.23 --yes\n\
+     \x20 bitty component install net --version 0.0.23 --digest <hex>\n\
+     \x20 bitty component install net --version 0.0.23 --force --yes\n\
      \x20 bitty component remove net 0.0.1"
         .to_string()
 }
@@ -714,6 +853,8 @@ pub fn run_component_subcommand(
             match op_install(
                 name,
                 request.version_flag.as_deref(),
+                request.digest.as_deref(),
+                request.force,
                 user_root.as_deref(),
                 output,
                 input,
@@ -954,9 +1095,109 @@ fn seed_failure(error: &crate::component_seed::SeedError) -> ComponentFailure {
     }
 }
 
+/// TOFU pin path for one component (`<user>/<name>/tarball.sha256`).
+fn tofu_pin_path(user: &Path, name: &str) -> PathBuf {
+    user.join(name).join(TARBALL_PIN_FILE)
+}
+
+/// Read the recorded TOFU pin for `name` (`None` means first contact).
+///
+/// Fail-closed: a symlinked pin refuses with exit 1 (like other install
+/// paths); an oversize, non-UTF-8, or non-hex pin fails as pin-mismatch
+/// (exit 4) requiring `--force` to re-pin. Comparison by callers is
+/// constant-shape via [`crate::component_seed::digests_equal_ct`].
+fn read_tofu_pin(user: &Path, name: &str) -> Result<Option<String>, ComponentFailure> {
+    let path = tofu_pin_path(user, name);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(ComponentFailure::generic(format!(
+                "bitty component: refusing symlink pin file '{}'",
+                path.display()
+            )));
+        }
+        Ok(metadata) if metadata.is_file() => {
+            if metadata.len() > MAX_PIN_FILE_BYTES {
+                return Err(ComponentFailure::component(format!(
+                    "bitty component: pin-mismatch for '{name}': pin file '{}' exceeds {MAX_PIN_FILE_BYTES} bytes (corrupt pin; use --force to re-pin)",
+                    path.display()
+                )));
+            }
+        }
+        Ok(_) => {
+            return Err(ComponentFailure::generic(format!(
+                "bitty component: refusing non-file pin path '{}'",
+                path.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(ComponentFailure::generic(format!(
+                "bitty component: cannot inspect '{}': {error}",
+                path.display()
+            )));
+        }
+    }
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let Ok(text) = String::from_utf8(bytes) else {
+                return Err(ComponentFailure::component(format!(
+                    "bitty component: pin-mismatch for '{name}': pin file '{}' is not UTF-8 (corrupt pin; use --force to re-pin)",
+                    path.display()
+                )));
+            };
+            let digest = text.trim().to_ascii_lowercase();
+            if !crate::component_seed::is_hex_digest(&digest) {
+                return Err(ComponentFailure::component(format!(
+                    "bitty component: pin-mismatch for '{name}': pin file '{}' is invalid (want 64 hex characters; use --force to re-pin)",
+                    path.display()
+                )));
+            }
+            Ok(Some(digest))
+        }
+        Err(error) => Err(ComponentFailure::generic(format!(
+            "bitty component: cannot read '{}': {error}",
+            path.display()
+        ))),
+    }
+}
+
+/// Record (first contact) or re-pin (`--force`) the TOFU pin atomically.
+fn write_tofu_pin(user: &Path, name: &str, digest: &str) -> Result<(), ComponentFailure> {
+    let path = tofu_pin_path(user, name);
+    publish_bytes_atomic(&path, format!("{digest}\n").as_bytes(), None)
+}
+
+/// Enforce the registry half of both-must-match (issue #1906 seam).
+///
+/// `None` (registry index absent today, manager#11 open) is a no-op so the
+/// seam stays live without changing behavior. `Some` must constant-shape
+/// match the verified tarball digest; any mismatch or malformed value fails
+/// closed as integrity failure (exit 4), never a silent pick.
+fn check_registry_digest(
+    registry: Option<&str>,
+    tarball_digest: &str,
+) -> Result<(), ComponentFailure> {
+    let Some(expected) = registry else {
+        return Ok(());
+    };
+    if !crate::component_seed::digests_equal_ct(expected, tarball_digest) {
+        return Err(ComponentFailure::component(format!(
+            "bitty component: install failed: registry digest {} does not match verified tarball digest {tarball_digest} (refusing to install)",
+            expected.to_ascii_lowercase(),
+        )));
+    }
+    Ok(())
+}
+
+// Nine args: install needs name/version/digest/force/roots/stdio/consent/
+// transport together (all bounded, fail-closed before mutation). A params
+// struct would obscure the call-site audit, so allow the lint here.
+#[allow(clippy::too_many_arguments)]
 fn op_install(
     name: &str,
     version_flag: Option<&str>,
+    digest_flag: Option<&str>,
+    force: bool,
     user_root: Option<&Path>,
     output: &mut dyn std::io::Write,
     input: &mut dyn std::io::BufRead,
@@ -986,6 +1227,16 @@ fn op_install(
             &crate::component_seed::SeedError::InvalidVersion(version.to_owned()),
         ));
     }
+    // Defense in depth: the parser already rejects malformed `--digest` as
+    // usage (exit 2); a malformed value reaching here fails the same way
+    // before any fetch or staging.
+    if let Some(digest) = digest_flag {
+        if !crate::component_seed::is_hex_digest(digest) {
+            return Err(seed_failure(
+                &crate::component_seed::SeedError::InvalidDigest(digest.to_owned()),
+            ));
+        }
+    }
     let target = crate::component_seed::host_target_triple().ok_or_else(|| {
         seed_failure(&crate::component_seed::SeedError::UnsupportedHost(format!(
             "bitty component: unsupported host {}-{} (no prebuilt seed target; install the component from a local path with `bitty component add`)",
@@ -1004,16 +1255,17 @@ fn op_install(
     // always takes the confirm path.
     let is_builtin = crate::component_seed::is_builtin_installer_url(&urls.tarball_url)
         && crate::component_seed::is_builtin_installer_url(&urls.manifest_url);
-    // Dual-digest (#1906 direction, checked locally): the registry pin is
-    // not yet available in this slice (it lands with the manager index),
-    // so installs are single-source-only (CDN SHA256SUMS) and always take
+    // Dual-digest (#1906, Core side only): the registry index does NOT exist
+    // yet (manager#11 open), so `registry_digest_for` returns `None` today
+    // and installs are single-source-only for consent purposes: always take
     // the confirm path. The check runs through the real predicate so the
-    // dual-digest rule stays live in non-test builds: `None` (no registry
-    // pin) always yields `false` (confirm), and when the registry digest
-    // arrives the call becomes
-    // `is_dual_digest_verified(Some(registry), &cdn_digest, &actual)` with
-    // silent activating for builtin+dual.
-    let dual_verified = crate::component_seed::is_dual_digest_verified(None, "", "");
+    // dual-digest rule stays live in non-test builds. `--digest` is the
+    // caller-supplied half for integrity (both-must-match in the fetch
+    // below) but does NOT grant silent: silent requires the registry half,
+    // keeping today always-confirm until both halves exist. Do NOT weaken.
+    let registry_digest = crate::component_seed::registry_digest_for(name, version);
+    let dual_verified =
+        crate::component_seed::is_dual_digest_verified(registry_digest.as_deref(), "", "");
     let level = crate::component_seed::installer_consent_level(is_builtin, dual_verified);
     let needs_consent = level == crate::component_seed::InstallerConsentLevel::Confirm;
     if needs_consent && !yes {
@@ -1035,8 +1287,13 @@ fn op_install(
             crate::component_seed::BUILTIN_INSTALLER_EGRESS
         );
     }
-    let payload = crate::component_seed::fetch_seed_payload(name, version, target, transport)
-        .map_err(|error| seed_failure(&error))?;
+    let payload =
+        crate::component_seed::fetch_seed_payload(name, version, target, digest_flag, transport)
+            .map_err(|error| seed_failure(&error))?;
+    // Registry seam (manager#11): when the index lands, the registry digest
+    // joins both-must-match here (all-available-must-match). Today it is
+    // `None`, so this is a no-op. A mismatching `Some` fails closed (exit 4).
+    check_registry_digest(registry_digest.as_deref(), &payload.tarball_digest)?;
     // ABI-compat check before any mutation (same gate as `add`).
     let core = bitty_runtime::component::PROTOCOL_VERSION;
     if !(payload.protocol_min..=payload.protocol_max).contains(&core) {
@@ -1047,6 +1304,7 @@ fn op_install(
             core,
         )));
     }
+    let verified_digest = payload.tarball_digest.clone();
     let staged = StagedSource {
         name: payload.name.clone(),
         version: payload.version.clone(),
@@ -1055,7 +1313,54 @@ fn op_install(
         executable: payload.executable.clone(),
         bytes: payload.bytes,
     };
+    // TOFU-with-pin (#1906): first contact records the verified CDN digest;
+    // later differing digests fail closed as pin-mismatch unless `--force`
+    // re-pins. Never auto-updates. Check runs before any mutation so a
+    // pin-mismatch stages nothing. A corrupt pin (exit 4) is a mismatch that
+    // `--force` may overwrite after verification; filesystem refusals
+    // (symlink, non-file, I/O; exit 1) always propagate.
+    let (existing_pin, pin_corrupt) = match read_tofu_pin(user, &staged.name) {
+        Ok(pin) => (pin, false),
+        Err(failure) if failure.exit == EXIT_COMPONENT && force => (None, true),
+        Err(failure) => return Err(failure),
+    };
+    let pin_matches = match existing_pin.as_deref() {
+        None => !pin_corrupt,
+        Some(pinned) => crate::component_seed::digests_equal_ct(pinned, &verified_digest),
+    };
+    if !pin_matches && !force {
+        let pinned = existing_pin.as_deref().unwrap_or("?");
+        return Err(ComponentFailure::component(format!(
+            "bitty component: pin-mismatch for '{}' version {}: pinned tarball digest {pinned} differs from verified CDN digest {verified_digest} (TOFU pin; refusing to auto-update; use --force to re-pin)",
+            staged.name, staged.version,
+        )));
+    }
     let summary = install_staged(&staged, user)?;
+    // Record or re-pin the TOFU pin after successful staging (never before,
+    // never on failure). First contact writes; `--force` overwrites a
+    // differing pin; a matching pin needs no write.
+    let needs_pin_write = match existing_pin.as_deref() {
+        // First contact and corrupt-pin recovery (force-only) both write.
+        None => true,
+        Some(_) if force && !pin_matches => true,
+        Some(_) => false,
+    };
+    let pin_note = if needs_pin_write {
+        write_tofu_pin(user, &staged.name, &verified_digest)?;
+        if existing_pin.is_none() && !pin_corrupt {
+            format!(
+                "\ntofupin: pinned tarball digest {verified_digest} for '{}' (first contact)",
+                staged.name,
+            )
+        } else {
+            format!(
+                "\ntofupin: re-pinned tarball digest {verified_digest} for '{}' (--force)",
+                staged.name,
+            )
+        }
+    } else {
+        String::new()
+    };
     // Handoff: the seed is done; name the installed executable so the
     // caller (or the user, for the manager itself) invokes the full
     // component directly from here.
@@ -1064,7 +1369,7 @@ fn op_install(
         .join(&staged.version)
         .join(executable_file_name(&staged.executable));
     Ok(format!(
-        "{summary}\nseed handoff: '{}' is installed and active; the full manager takes over from here",
+        "{summary}\nseed handoff: '{}' is installed and active; the full manager takes over from here{pin_note}",
         executable_path.display()
     ))
 }
@@ -1100,7 +1405,7 @@ fn ask_component_install_consent(
     let _ = writeln!(output, "  tarball:  {}", urls.tarball_url);
     let _ = writeln!(
         output,
-        "  trust: single-source-only (CDN SHA256SUMS; registry pin arrives with #1906) — explicit confirm required."
+        "  trust: CDN SHA256SUMS verified (both-must-match with --digest when provided); TOFU-pinned, registry pin arrives with manager#11 — explicit confirm required."
     );
     for attempt in 1..=MAX_COMPONENT_CONSENT_ATTEMPTS {
         let _ = write!(
@@ -1825,6 +2130,8 @@ mod tests {
         assert_eq!(request.operand.as_deref(), Some("net"));
         assert_eq!(request.version_flag.as_deref(), Some("0.0.23"));
         assert!(!request.yes);
+        assert!(request.digest.is_none());
+        assert!(!request.force);
 
         let request = parse_component_request(
             &[
@@ -1899,6 +2206,141 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn parses_install_digest_and_force() {
+        let digest = "a".repeat(64);
+        let request = parse_component_request(
+            &[
+                String::from("install"),
+                String::from("net"),
+                String::from("--version"),
+                String::from("0.0.23"),
+                String::from("--digest"),
+                digest.clone(),
+                String::from("--force"),
+            ],
+            None,
+        )
+        .expect("install --digest --force");
+        assert_eq!(request.digest.as_deref(), Some(digest.as_str()));
+        assert!(request.force);
+
+        // `--digest=` form plus uppercase hex.
+        let upper = "B".repeat(64);
+        let request = parse_component_request(
+            &[
+                String::from("install"),
+                String::from("net"),
+                String::from("--version"),
+                String::from("0.0.23"),
+                format!("--digest={upper}"),
+            ],
+            None,
+        )
+        .expect("install --digest=upper");
+        assert_eq!(request.digest.as_deref(), Some(upper.as_str()));
+
+        // Malformed digests fail as usage (exit 2 at dispatch).
+        for bad in [
+            "abc".to_string(),
+            String::new(),
+            "g".repeat(64),
+            "a".repeat(63),
+            "a".repeat(65),
+        ] {
+            assert!(
+                parse_component_request(
+                    &[
+                        String::from("install"),
+                        String::from("net"),
+                        String::from("--version"),
+                        String::from("0.0.23"),
+                        String::from("--digest"),
+                        bad.clone(),
+                    ],
+                    None,
+                )
+                .is_err(),
+                "malformed --digest must fail: {bad:?}"
+            );
+        }
+        // Missing value, duplicate, and wrong-verb uses fail.
+        assert!(
+            parse_component_request(
+                &[
+                    String::from("install"),
+                    String::from("net"),
+                    String::from("--version"),
+                    String::from("0.0.23"),
+                    String::from("--digest"),
+                ],
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_component_request(
+                &[
+                    String::from("install"),
+                    String::from("net"),
+                    String::from("--version"),
+                    String::from("0.0.23"),
+                    String::from("--digest"),
+                    digest.clone(),
+                    format!("--digest={digest}"),
+                ],
+                None,
+            )
+            .is_err()
+        );
+        for verb in ["list", "add", "remove"] {
+            let args: Vec<String> = if verb == "list" {
+                vec![
+                    String::from("list"),
+                    String::from("--digest"),
+                    digest.clone(),
+                ]
+            } else if verb == "add" {
+                vec![
+                    String::from("add"),
+                    String::from("x"),
+                    String::from("--digest"),
+                    digest.clone(),
+                ]
+            } else {
+                vec![
+                    String::from("remove"),
+                    String::from("net"),
+                    String::from("--digest"),
+                    digest.clone(),
+                ]
+            };
+            assert!(
+                parse_component_request(&args, None).is_err(),
+                "--digest on {verb} must fail"
+            );
+            let force_args: Vec<String> = if verb == "list" {
+                vec![String::from("list"), String::from("--force")]
+            } else if verb == "add" {
+                vec![
+                    String::from("add"),
+                    String::from("x"),
+                    String::from("--force"),
+                ]
+            } else {
+                vec![
+                    String::from("remove"),
+                    String::from("net"),
+                    String::from("--force"),
+                ]
+            };
+            assert!(
+                parse_component_request(&force_args, None).is_err(),
+                "--force on {verb} must fail"
+            );
+        }
     }
 
     #[test]
@@ -2175,6 +2617,8 @@ mod tests {
         let summary = op_install(
             "net",
             Some("0.0.23"),
+            None,
+            false,
             Some(&user),
             &mut out,
             &mut input,
@@ -2213,6 +2657,8 @@ mod tests {
         op_install(
             "net",
             Some("0.0.23"),
+            None,
+            false,
             Some(&user),
             &mut out,
             &mut input,
@@ -2229,6 +2675,8 @@ mod tests {
         let error = op_install(
             "net",
             Some("0.0.23"),
+            None,
+            false,
             Some(&user),
             &mut out,
             &mut input,
@@ -2262,6 +2710,8 @@ mod tests {
         let error = op_install(
             "net",
             Some("0.0.23"),
+            None,
+            false,
             Some(&user),
             &mut out,
             &mut input,
@@ -2295,6 +2745,8 @@ mod tests {
         let error = op_install(
             "net",
             Some("0.0.23"),
+            None,
+            false,
             Some(&user),
             &mut out,
             &mut input,
@@ -2323,6 +2775,8 @@ mod tests {
         let error = op_install(
             "net",
             Some("0.0.23"),
+            None,
+            false,
             Some(&user),
             &mut out,
             &mut input,
@@ -2351,6 +2805,8 @@ mod tests {
         let summary = op_install(
             "net",
             Some("0.0.23"),
+            None,
+            false,
             Some(&user),
             &mut out,
             &mut input,
@@ -2379,6 +2835,8 @@ mod tests {
         let summary = op_install(
             "net",
             Some("0.0.23"),
+            None,
+            false,
             Some(&user),
             &mut out,
             &mut input,
@@ -2388,6 +2846,474 @@ mod tests {
         .expect("--yes stages without prompting");
         assert!(summary.contains("installed component"), "{summary}");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // --- digest arbitration + TOFU pinning (#1906) --------------------------
+
+    fn canned_tarball_digest(name: &str, version: &str, target: &str) -> String {
+        let tarball = format!("canned-tarball-{name}-{version}-{target}").into_bytes();
+        bitty_package::integrity::sha256_hex(&tarball)
+    }
+
+    #[test]
+    fn install_digest_match_stages_and_pins() {
+        if crate::component_seed::host_target_triple().is_none() {
+            return;
+        }
+        let base = scratch("install-digest-ok");
+        let user = base.join("user");
+        std::fs::create_dir_all(&user).expect("user dir");
+        let target = "x86_64-unknown-linux-gnu";
+        let digest = canned_tarball_digest("net", "0.0.23", target);
+        let mut stub = InstallStub::canned("net", "0.0.23", target, b"seed-net-bytes");
+        let mut out = Vec::new();
+        let mut input = std::io::BufReader::new(&b""[..]);
+        let summary = op_install(
+            "net",
+            Some("0.0.23"),
+            Some(&digest),
+            false,
+            Some(&user),
+            &mut out,
+            &mut input,
+            true,
+            &mut stub,
+        )
+        .expect("matching --digest stages");
+        assert!(summary.contains("installed component"), "{summary}");
+        // First contact records the verified CDN digest.
+        let pin =
+            std::fs::read_to_string(user.join("net").join(TARBALL_PIN_FILE)).expect("pin file");
+        assert_eq!(pin.trim(), digest);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn install_digest_mismatch_fails_closed() {
+        if crate::component_seed::host_target_triple().is_none() {
+            return;
+        }
+        let base = scratch("install-digest-mismatch");
+        let user = base.join("user");
+        std::fs::create_dir_all(&user).expect("user dir");
+        let target = "x86_64-unknown-linux-gnu";
+        let other = "e".repeat(64);
+        let mut stub = InstallStub::canned("net", "0.0.23", target, b"seed-net-bytes");
+        let mut out = Vec::new();
+        let mut input = std::io::BufReader::new(&b""[..]);
+        let error = op_install(
+            "net",
+            Some("0.0.23"),
+            Some(&other),
+            false,
+            Some(&user),
+            &mut out,
+            &mut input,
+            true,
+            &mut stub,
+        )
+        .expect_err("expected mismatch must fail");
+        // Both-must-match: integrity failure (exit 4), never a silent pick.
+        assert_eq!(error.exit, EXIT_COMPONENT, "{}", error.message);
+        assert!(
+            error.message.contains("does not match expected digest"),
+            "{}",
+            error.message
+        );
+        // Fetched (2 calls: manifest + tarball) but never unpacked or staged.
+        assert_eq!(stub.fetch_calls, 2);
+        assert!(!user.join("net").exists(), "mismatch must not stage");
+        assert!(
+            !user.join("net").join(TARBALL_PIN_FILE).exists(),
+            "mismatch must not pin"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn install_malformed_digest_fails_as_usage_before_fetch() {
+        if crate::component_seed::host_target_triple().is_none() {
+            return;
+        }
+        let base = scratch("install-digest-bad");
+        let user = base.join("user");
+        std::fs::create_dir_all(&user).expect("user dir");
+        let target = "x86_64-unknown-linux-gnu";
+        for bad in [
+            "abc".to_string(),
+            String::new(),
+            "g".repeat(64),
+            "a".repeat(63),
+        ] {
+            let mut stub = InstallStub::canned("net", "0.0.23", target, b"seed-net-bytes");
+            let mut out = Vec::new();
+            let mut input = std::io::BufReader::new(&b""[..]);
+            let error = op_install(
+                "net",
+                Some("0.0.23"),
+                Some(bad.as_str()),
+                false,
+                Some(&user),
+                &mut out,
+                &mut input,
+                true,
+                &mut stub,
+            )
+            .expect_err("malformed --digest must fail");
+            assert_eq!(
+                error.exit, EXIT_USAGE,
+                "malformed {bad:?}: {}",
+                error.message
+            );
+            assert_eq!(stub.fetch_calls, 0, "malformed must not fetch");
+            assert!(!user.join("net").exists(), "malformed must not stage");
+        }
+        // CLI dispatch maps the same shape to exit 2.
+        let (context, _, _) = context_for(&base.join("user2"), &base.join("system"));
+        let (code, _) = run_with(
+            &context,
+            &["install", "net", "--version", "0.0.23", "--digest", "abc"],
+        );
+        assert_eq!(code, EXIT_USAGE);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn install_tofu_pin_mismatch_fails_closed_until_force() {
+        if crate::component_seed::host_target_triple().is_none() {
+            return;
+        }
+        let base = scratch("install-pin");
+        let user = base.join("user");
+        std::fs::create_dir_all(&user).expect("user dir");
+        let target = "x86_64-unknown-linux-gnu";
+        // First contact pins.
+        let mut stub = InstallStub::canned("net", "0.0.23", target, b"seed-net-bytes");
+        let mut out = Vec::new();
+        let mut input = std::io::BufReader::new(&b""[..]);
+        op_install(
+            "net",
+            Some("0.0.23"),
+            None,
+            false,
+            Some(&user),
+            &mut out,
+            &mut input,
+            true,
+            &mut stub,
+        )
+        .expect("first contact pins");
+        let pin = std::fs::read_to_string(user.join("net").join(TARBALL_PIN_FILE)).expect("pin");
+        assert!(crate::component_seed::is_hex_digest(pin.trim()));
+
+        // Same bytes reinstall is idempotent (pin matches, no --force needed).
+        let mut stub = InstallStub::canned("net", "0.0.23", target, b"seed-net-bytes");
+        let mut out = Vec::new();
+        let mut input = std::io::BufReader::new(&b""[..]);
+        op_install(
+            "net",
+            Some("0.0.23"),
+            None,
+            false,
+            Some(&user),
+            &mut out,
+            &mut input,
+            true,
+            &mut stub,
+        )
+        .expect("pin match is idempotent");
+
+        // Different tarball bytes for the same version: pin-mismatch, fail closed.
+        // (InstallStub cans the tarball per name/version/target, so mutate the
+        // tarball plus its manifest to emulate a rotated release; the exe stays
+        // identical so the failure is definitely the pin, not the executable.)
+        let mut stub = InstallStub::canned("net", "0.0.23", target, b"seed-net-bytes");
+        stub.tarball = b"rotated-tarball-bytes".to_vec();
+        let rotated_digest = bitty_package::integrity::sha256_hex(&stub.tarball);
+        {
+            const HOST_TRIPLES: [&str; 7] = [
+                "x86_64-unknown-linux-gnu",
+                "aarch64-unknown-linux-gnu",
+                "x86_64-unknown-linux-musl",
+                "aarch64-apple-darwin",
+                "x86_64-apple-darwin",
+                "x86_64-pc-windows-msvc",
+                "aarch64-pc-windows-msvc",
+            ];
+            let mut manifest = String::new();
+            for triple in HOST_TRIPLES {
+                manifest.push_str(&format!("{rotated_digest}  {triple}.tar.gz\n"));
+            }
+            stub.manifest = manifest;
+        }
+        let mut out = Vec::new();
+        let mut input = std::io::BufReader::new(&b""[..]);
+        let error = op_install(
+            "net",
+            Some("0.0.23"),
+            None,
+            false,
+            Some(&user),
+            &mut out,
+            &mut input,
+            true,
+            &mut stub,
+        )
+        .expect_err("pin mismatch must fail");
+        assert_eq!(error.exit, EXIT_COMPONENT, "{}", error.message);
+        assert!(error.message.contains("pin-mismatch"), "{}", error.message);
+        assert!(error.message.contains("--force"), "{}", error.message);
+        // Installed bytes untouched; pin never auto-updated.
+        let version_dir = user.join("net").join("0.0.23");
+        assert_eq!(
+            std::fs::read(version_dir.join(executable_file_name(&format!(
+                "{COMPONENT_EXECUTABLE_PREFIX}net"
+            ))))
+            .expect("installed exe"),
+            b"seed-net-bytes"
+        );
+        assert_eq!(
+            std::fs::read_to_string(user.join("net").join(TARBALL_PIN_FILE)).expect("pin"),
+            pin,
+            "pin must never auto-update"
+        );
+
+        // Explicit --force re-pins after verification.
+        let mut stub = InstallStub::canned("net", "0.0.23", target, b"seed-net-bytes");
+        stub.tarball = b"rotated-tarball-bytes".to_vec();
+        {
+            const HOST_TRIPLES: [&str; 7] = [
+                "x86_64-unknown-linux-gnu",
+                "aarch64-unknown-linux-gnu",
+                "x86_64-unknown-linux-musl",
+                "aarch64-apple-darwin",
+                "x86_64-apple-darwin",
+                "x86_64-pc-windows-msvc",
+                "aarch64-pc-windows-msvc",
+            ];
+            let mut manifest = String::new();
+            for triple in HOST_TRIPLES {
+                manifest.push_str(&format!("{rotated_digest}  {triple}.tar.gz\n"));
+            }
+            stub.manifest = manifest;
+        }
+        let mut out = Vec::new();
+        let mut input = std::io::BufReader::new(&b""[..]);
+        let summary = op_install(
+            "net",
+            Some("0.0.23"),
+            None,
+            true,
+            Some(&user),
+            &mut out,
+            &mut input,
+            true,
+            &mut stub,
+        )
+        .expect("--force re-pins");
+        assert!(summary.contains("re-pinned"), "{summary}");
+        let new_pin =
+            std::fs::read_to_string(user.join("net").join(TARBALL_PIN_FILE)).expect("pin");
+        assert_ne!(new_pin, pin);
+        assert_eq!(
+            std::fs::read(version_dir.join(executable_file_name(&format!(
+                "{COMPONENT_EXECUTABLE_PREFIX}net"
+            ))))
+            .expect("installed exe"),
+            b"seed-net-bytes"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn install_downgrade_with_differing_digest_is_pin_mismatch() {
+        if crate::component_seed::host_target_triple().is_none() {
+            return;
+        }
+        let base = scratch("install-downgrade");
+        let user = base.join("user");
+        std::fs::create_dir_all(&user).expect("user dir");
+        let target = "x86_64-unknown-linux-gnu";
+        // Install newer version first (pins its digest per component name).
+        let mut stub = InstallStub::canned("net", "0.0.23", target, b"newer-bytes");
+        // InstallStub always serves the canned tarball for its own version;
+        // emulate a newer release by installing 0.0.23 first.
+        let mut out = Vec::new();
+        let mut input = std::io::BufReader::new(&b""[..]);
+        // Direct op_install for 0.0.23 with distinct bytes.
+        op_install(
+            "net",
+            Some("0.0.23"),
+            None,
+            false,
+            Some(&user),
+            &mut out,
+            &mut input,
+            true,
+            &mut stub,
+        )
+        .expect("newer pins");
+        // Downgrade to an older version with a differing tarball digest:
+        // per-name TOFU pin differs, so fail closed as pin-mismatch (not a
+        // silent accept), requiring --force.
+        let mut older = InstallStub::canned("net", "0.0.1", target, b"older-bytes");
+        // The stub serves 0.0.1 bytes but the pin holds the 0.0.23 digest, so
+        // the digests necessarily differ.
+        let mut out = Vec::new();
+        let mut input = std::io::BufReader::new(&b""[..]);
+        // Bypass version validation by calling the pin path directly: emulate
+        // an older release whose tarball digest differs from the pin.
+        // Here the stub's tarball digest for 0.0.1 differs from the pinned
+        // 0.0.23 digest by construction (different canned bytes).
+        let error = op_install(
+            "net",
+            Some("0.0.1"),
+            None,
+            false,
+            Some(&user),
+            &mut out,
+            &mut input,
+            true,
+            &mut older,
+        )
+        .expect_err("downgrade with differing digest must fail");
+        assert_eq!(error.exit, EXIT_COMPONENT, "{}", error.message);
+        assert!(error.message.contains("pin-mismatch"), "{}", error.message);
+        // With --force the downgrade re-pins explicitly.
+        let mut older = InstallStub::canned("net", "0.0.1", target, b"older-bytes");
+        let mut out = Vec::new();
+        let mut input = std::io::BufReader::new(&b""[..]);
+        op_install(
+            "net",
+            Some("0.0.1"),
+            None,
+            true,
+            Some(&user),
+            &mut out,
+            &mut input,
+            true,
+            &mut older,
+        )
+        .expect("--force downgrade re-pins");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn install_single_digest_only_takes_confirm_path() {
+        // Registry half absent today: dual never verifies, consent is Confirm.
+        let digest = "f".repeat(64);
+        assert!(!crate::component_seed::is_dual_digest_verified(
+            crate::component_seed::registry_digest_for("net", "0.0.23").as_deref(),
+            &digest,
+            &digest
+        ));
+        assert_eq!(
+            crate::component_seed::installer_consent_level(true, false),
+            crate::component_seed::InstallerConsentLevel::Confirm
+        );
+        assert_eq!(
+            crate::component_seed::installer_consent_level(false, false),
+            crate::component_seed::InstallerConsentLevel::Confirm
+        );
+    }
+
+    #[test]
+    fn registry_check_enforces_some_path() {
+        // None (index absent today) is a no-op.
+        assert!(check_registry_digest(None, &"a".repeat(64)).is_ok());
+        // Matching registry digests pass (lower and upper).
+        let digest = "b".repeat(64);
+        assert!(check_registry_digest(Some(&digest), &digest).is_ok());
+        assert!(check_registry_digest(Some(&digest.to_ascii_uppercase()), &digest).is_ok());
+        // Mismatching or malformed registry values fail closed (exit 4).
+        let other = "c".repeat(64);
+        let error =
+            check_registry_digest(Some(&other), &digest).expect_err("registry mismatch must fail");
+        assert_eq!(error.exit, EXIT_COMPONENT, "{}", error.message);
+        assert!(
+            error.message.contains("registry digest"),
+            "{}",
+            error.message
+        );
+        for malformed in ["abc".to_string(), "g".repeat(64), "a".repeat(63)] {
+            let error = check_registry_digest(Some(&malformed), &digest)
+                .expect_err("malformed registry must fail");
+            assert_eq!(error.exit, EXIT_COMPONENT, "{}", error.message);
+        }
+    }
+
+    #[test]
+    fn install_corrupt_pin_fails_closed_without_force_but_recovers_with_force() {
+        if crate::component_seed::host_target_triple().is_none() {
+            return;
+        }
+        for tag in ["invalid-hex", "oversize", "non-utf8"] {
+            let base = scratch(&format!("install-corrupt-pin-{tag}"));
+            let user = base.join("user");
+            std::fs::create_dir_all(user.join("net")).expect("component dir");
+            // Plant a corrupt pin: non-hex text, an oversize blob, or
+            // non-UTF-8 bytes (torn write / disk corruption).
+            let corrupt: Vec<u8> = if tag == "oversize" {
+                vec![b'x'; 200]
+            } else if tag == "non-utf8" {
+                vec![0xff, 0xfe, 0x00, 0x62]
+            } else {
+                b"not-a-hex-pin".to_vec()
+            };
+            std::fs::write(user.join("net").join(TARBALL_PIN_FILE), &corrupt).expect("corrupt pin");
+            let target = "x86_64-unknown-linux-gnu";
+            // Without --force: fail closed (exit 4) with no staging.
+            let mut stub = InstallStub::canned("net", "0.0.23", target, b"seed-net-bytes");
+            let mut out = Vec::new();
+            let mut input = std::io::BufReader::new(&b""[..]);
+            let error = op_install(
+                "net",
+                Some("0.0.23"),
+                None,
+                false,
+                Some(&user),
+                &mut out,
+                &mut input,
+                true,
+                &mut stub,
+            )
+            .expect_err("corrupt pin must fail without --force");
+            assert_eq!(error.exit, EXIT_COMPONENT, "{tag}: {}", error.message);
+            assert!(
+                error.message.contains("pin-mismatch"),
+                "{tag}: {}",
+                error.message
+            );
+            assert!(
+                !user.join("net").join("0.0.23").exists(),
+                "{tag}: corrupt pin must not stage"
+            );
+            // With --force: verification passes, then the corrupt pin is
+            // overwritten (re-pinned, not first contact).
+            let mut stub = InstallStub::canned("net", "0.0.23", target, b"seed-net-bytes");
+            let mut out = Vec::new();
+            let mut input = std::io::BufReader::new(&b""[..]);
+            let summary = op_install(
+                "net",
+                Some("0.0.23"),
+                None,
+                true,
+                Some(&user),
+                &mut out,
+                &mut input,
+                true,
+                &mut stub,
+            )
+            .expect("corrupt pin must recover with --force");
+            assert!(summary.contains("re-pinned"), "{tag}: {summary}");
+            let pin =
+                std::fs::read_to_string(user.join("net").join(TARBALL_PIN_FILE)).expect("pin");
+            assert!(
+                crate::component_seed::is_hex_digest(pin.trim()),
+                "{tag}: re-pinned value must be valid hex"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
     }
 
     #[test]
@@ -2469,6 +3395,8 @@ mod tests {
         let error = op_install(
             "net",
             Some("0.0.23"),
+            None,
+            false,
             Some(&user),
             &mut out,
             &mut input,

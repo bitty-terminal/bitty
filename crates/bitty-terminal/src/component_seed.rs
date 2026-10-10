@@ -174,21 +174,49 @@ pub fn installer_consent_level(
 }
 
 /// Whether a hex digest string is a 64-character SHA-256 hex value.
+///
+/// Constant-shape: the length check is O(1) and the hex scan always walks
+/// all 64 bytes with no early exit, so no per-byte oracle leaks beyond the
+/// pass/fail verdict.
 #[must_use]
 pub fn is_hex_digest(digest: &str) -> bool {
-    digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())
+    if digest.len() != 64 {
+        return false;
+    }
+    let mut bad: u8 = 0;
+    for byte in digest.bytes() {
+        bad |= (byte.is_ascii_hexdigit() as u8) ^ 1;
+    }
+    bad == 0
 }
 
-/// Whether the dual-digest rule holds (issue #1906 direction, checked
-/// locally): both the registry/manifest digest and the CDN `SHA256SUMS`
-/// digest are present, well-formed, and both equal the fetched bytes'
-/// digest.
+/// Constant-shape hex digest equality (ASCII case-insensitive).
+///
+/// Always compares all 64 bytes (`diff` accumulates, never early-exits), so
+/// a timing observer learns only pass/fail, never the first mismatch
+/// position. Lengths other than 64 fail closed. Both sides are compared
+/// lowercased per byte, mirroring [`find_tarball_digest`] normalization.
+#[must_use]
+pub fn digests_equal_ct(left: &str, right: &str) -> bool {
+    if left.len() != 64 || right.len() != 64 {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (left_byte, right_byte) in left.bytes().zip(right.bytes()) {
+        diff |= left_byte.to_ascii_lowercase() ^ right_byte.to_ascii_lowercase();
+    }
+    diff == 0
+}
+
+/// Whether the dual-digest rule holds (issue #1906, checked locally): both
+/// the registry/expected digest and the CDN `SHA256SUMS` digest are present,
+/// well-formed, and both equal the fetched bytes' digest.
 ///
 /// - `registry_digest`: the out-of-CDN pin (`None` means single-source-only,
 ///   which returns `false` so the caller takes the confirm path).
 /// - `cdn_digest` / `actual`: the `SHA256SUMS` entry and the `sha256_hex` of
-///   the fetched bytes. Comparison is ASCII case-insensitive (both sides
-///   are lowercased, mirroring [`find_tarball_digest`]).
+///   the fetched bytes. Comparison is constant-shape case-insensitive via
+///   [`digests_equal_ct`].
 /// - Any malformed digest or any mismatch returns `false` (never a silent
 ///   pick: mismatch is an integrity failure upstream, single-source is a
 ///   confirm, per #1905/#1906).
@@ -204,7 +232,22 @@ pub fn is_dual_digest_verified(
     if !is_hex_digest(registry) || !is_hex_digest(cdn_digest) || !is_hex_digest(actual) {
         return false;
     }
-    registry.eq_ignore_ascii_case(actual) && cdn_digest.eq_ignore_ascii_case(actual)
+    digests_equal_ct(registry, actual) && digests_equal_ct(cdn_digest, actual)
+}
+
+/// Registry digest seam for one component release (issue #1906, Core side).
+///
+/// The registry index does NOT exist yet (`bitty-plugin-manager#11` open):
+/// this always returns `None` today, so installs are single-source-only
+/// (CDN `SHA256SUMS`) and always take the confirm path. When the index lands,
+/// this returns `Some(lowercase-hex)` for the release and the pipeline
+/// generalizes from both-must-match (`--digest` today) to
+/// all-available-must-match (CDN + registry + `--digest` when provided), with
+/// [`installer_consent_level`] silent activating for builtin+dual. No caller
+/// may treat `None` as verified: `None` always yields confirm, never silent.
+#[must_use]
+pub fn registry_digest_for(_name: &str, _version: &str) -> Option<String> {
+    None
 }
 
 /// R2 key prefix for prebuilt component distributions.
@@ -272,6 +315,8 @@ pub enum SeedError {
     InvalidName(String),
     /// The version is not a strict `X.Y.Z` numeric core (CLI input).
     InvalidVersion(String),
+    /// The caller-supplied expected digest (`--digest`) is malformed (CLI input).
+    InvalidDigest(String),
     /// The target triple violates the grammar (internal; no CLI flag feeds
     /// it, so reaching this means a corrupt host mapping or caller bug).
     InvalidTarget(String),
@@ -300,7 +345,7 @@ impl SeedError {
     #[must_use]
     pub fn exit_code(&self) -> i32 {
         match self {
-            Self::InvalidName(_) | Self::InvalidVersion(_) => 2,
+            Self::InvalidName(_) | Self::InvalidVersion(_) | Self::InvalidDigest(_) => 2,
             Self::InvalidTarget(_)
             | Self::UnsupportedHost(_)
             | Self::ToolMissing(_)
@@ -322,6 +367,9 @@ impl SeedError {
             }
             Self::InvalidVersion(version) => {
                 format!("invalid version {version:?} (want strict X.Y.Z numeric core, e.g. 0.0.23)")
+            }
+            Self::InvalidDigest(digest) => {
+                format!("invalid --digest {digest:?} (want 64 hex characters, SHA-256)")
             }
             Self::InvalidTarget(target) => {
                 format!("invalid target triple {target:?} (internal error: refusing to fetch)")
@@ -671,6 +719,12 @@ pub struct SeedPayload {
     pub executable: String,
     /// Raw executable bytes (digest-verified).
     pub bytes: Vec<u8>,
+    /// Verified CDN tarball digest (lowercase hex, from `SHA256SUMS`).
+    ///
+    /// Recorded into the TOFU pin on first contact (`component.rs`); checked
+    /// against the pin on later installs. Never auto-updated: a differing
+    /// digest fails closed as pin-mismatch unless `--force` re-pins.
+    pub tarball_digest: String,
 }
 
 /// Staging directory guard: a fresh temp dir removed on drop (success moves
@@ -797,13 +851,26 @@ fn find_tarball_digest(manifest: &str, tarball_file: &str) -> Result<String, See
 
 /// Fetch the tarball plus its manifest and verify the digest (fail closed).
 ///
-/// Returns the verified tarball bytes. The manifest is the authoritative
-/// checksum record; a missing entry, a malformed manifest, or a digest
-/// mismatch refuses the install before anything is unpacked or staged.
+/// Both-must-match (#1906): the CDN `SHA256SUMS` entry and the
+/// caller-supplied `expected_digest` (`--digest` today, registry value later
+/// via [`registry_digest_for`]) must EACH match the downloaded bytes.
+/// Any mismatch is an integrity failure (exit 4), never a silent pick.
+/// A malformed `expected_digest` fails closed as [`SeedError::InvalidDigest`]
+/// (exit 2). Returns the verified bytes plus the CDN digest for the TOFU pin.
+///
+/// The manifest remains the authoritative checksum record; a missing entry,
+/// a malformed manifest, or any digest mismatch refuses the install before
+/// anything is unpacked or staged.
 fn fetch_verified_tarball(
     urls: &SeedUrls,
+    expected_digest: Option<&str>,
     transport: &mut dyn SeedTransport,
-) -> Result<Vec<u8>, SeedError> {
+) -> Result<(Vec<u8>, String), SeedError> {
+    if let Some(expected) = expected_digest {
+        if !is_hex_digest(expected) {
+            return Err(SeedError::InvalidDigest(expected.to_owned()));
+        }
+    }
     let stage = ScopedDir::create("fetch")?;
     let manifest_path = stage.path.join("SHA256SUMS");
     transport.fetch(&urls.manifest_url, &manifest_path, SEED_MANIFEST_MAX_BYTES)?;
@@ -840,12 +907,20 @@ fn fetch_verified_tarball(
         ));
     }
     let actual = bitty_package::integrity::sha256_hex(&bytes);
-    if actual != expected {
+    if !digests_equal_ct(&actual, &expected) {
         return Err(SeedError::DigestMismatch(format!(
             "bitty component: tarball digest {actual} does not match SHA256SUMS entry {expected} (tampered or corrupt download; refusing to install)"
         )));
     }
-    Ok(bytes)
+    if let Some(caller) = expected_digest {
+        if !digests_equal_ct(&actual, caller) {
+            return Err(SeedError::DigestMismatch(format!(
+                "bitty component: tarball digest {actual} does not match expected digest {} (both CDN SHA256SUMS {expected} and the caller-supplied digest must match; refusing to install)",
+                caller.to_ascii_lowercase(),
+            )));
+        }
+    }
+    Ok((bytes, expected))
 }
 
 /// Audit the extracted staging dir: exactly the two expected members, both
@@ -946,6 +1021,7 @@ fn audit_extracted(
 /// equality against the extracted binary (tamper fails here).
 fn unpack_and_validate(
     tarball: &[u8],
+    tarball_digest: &str,
     name: &str,
     version: &str,
     transport: &mut dyn SeedTransport,
@@ -1038,24 +1114,28 @@ fn unpack_and_validate(
         protocol_max: descriptor.protocol_max,
         executable: executable_name,
         bytes: executable_bytes,
+        tarball_digest: tarball_digest.to_owned(),
     })
 }
 
 /// Fetch, verify, and unpack one component release (no staging).
 ///
 /// Pure pipeline over `transport`: builds allowlisted URLs (zero spawn on
-/// hostile input), fetches manifest + tarball, verifies the digest, audits
-/// the members, and binds the descriptor to the request. The caller stages
-/// the payload through the shared `install_staged` path.
+/// hostile input), fetches manifest + tarball, verifies both digests
+/// (CDN `SHA256SUMS` plus caller-supplied `expected_digest` when present,
+/// both-must-match per #1906), audits the members, and binds the descriptor
+/// to the request. The caller stages the payload through the shared
+/// `install_staged` path plus the TOFU pin.
 pub fn fetch_seed_payload(
     name: &str,
     version: &str,
     target: &str,
+    expected_digest: Option<&str>,
     transport: &mut dyn SeedTransport,
 ) -> Result<SeedPayload, SeedError> {
     let urls = seed_urls(name, version, target)?;
-    let tarball = fetch_verified_tarball(&urls, transport)?;
-    unpack_and_validate(&tarball, name, version, transport)
+    let (tarball, cdn_digest) = fetch_verified_tarball(&urls, expected_digest, transport)?;
+    unpack_and_validate(&tarball, &cdn_digest, name, version, transport)
 }
 
 #[cfg(test)]
@@ -1416,7 +1496,7 @@ mod tests {
                 .expect_err(&format!("hostile input must fail ({why})"));
             // The builder is pure: pipeline entry would fail identically,
             // and the stub proves nothing was spawned on the way there.
-            let _ = fetch_seed_payload(name, version, target, &mut stub)
+            let _ = fetch_seed_payload(name, version, target, None, &mut stub)
                 .expect_err(&format!("hostile input must fail in pipeline ({why})"));
             assert!(
                 stub.spawns.is_empty(),
@@ -1581,6 +1661,149 @@ mod tests {
         );
     }
 
+    // --- digest arbitration (#1906: both-must-match + constant-shape) ----
+
+    #[test]
+    fn hex_digest_check_is_constant_shape() {
+        assert!(is_hex_digest(&"a".repeat(64)));
+        assert!(is_hex_digest(&"A".repeat(64)));
+        assert!(is_hex_digest(
+            "0123456789abcdefABCDEF0123456789abcdefABCDEF0123456789ABCD123456"
+        ));
+        for bad in [
+            String::new(),
+            "abc".to_string(),
+            "a".repeat(63),
+            "a".repeat(65),
+            "g".repeat(64),
+            " ".repeat(64),
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz".to_string(),
+        ] {
+            assert!(!is_hex_digest(&bad), "malformed must fail: {bad:?}");
+        }
+    }
+
+    #[test]
+    fn constant_time_compare_matches_case_insensitive() {
+        let lower = "a".repeat(64);
+        let upper = "A".repeat(64);
+        assert!(digests_equal_ct(&lower, &lower));
+        assert!(digests_equal_ct(&lower, &upper));
+        assert!(digests_equal_ct(&upper, &lower));
+        // Every mismatch position fails (no early-exit oracle beyond pass/fail).
+        for position in [0usize, 1, 31, 32, 63] {
+            let mut other = lower.clone();
+            other.replace_range(position..position + 1, "b");
+            assert!(
+                !digests_equal_ct(&lower, &other),
+                "position {position} must fail"
+            );
+            assert!(
+                !digests_equal_ct(&other, &lower),
+                "position {position} must fail (swapped)"
+            );
+        }
+        // Malformed lengths fail closed.
+        assert!(!digests_equal_ct("abc", &lower));
+        assert!(!digests_equal_ct(&lower, "abc"));
+        assert!(!digests_equal_ct("", ""));
+    }
+
+    #[test]
+    fn registry_seam_is_none_until_manager_index_lands() {
+        // Registry index does NOT exist yet (manager#11 open): Core side only.
+        assert_eq!(registry_digest_for("net", "0.0.23"), None);
+        assert_eq!(registry_digest_for("evil", "9.9.9"), None);
+        // Single-source-only never verifies (confirm path, not silent).
+        let digest = "c".repeat(64);
+        assert!(!is_dual_digest_verified(
+            registry_digest_for("net", "0.0.23").as_deref(),
+            &digest,
+            &digest
+        ));
+        assert_eq!(
+            installer_consent_level(true, false),
+            InstallerConsentLevel::Confirm
+        );
+    }
+
+    #[test]
+    fn fetch_seed_payload_enforces_both_must_match() {
+        let exe = b"fake-net-bytes";
+        let (mut stub, _) = valid_stub("net", "0.0.1", "x86_64-unknown-linux-gnu", exe);
+        // Matching caller-supplied digest: both sides match, payload carries
+        // the verified CDN digest for the TOFU pin.
+        let tarball_bytes = "fake-tarball-for-net-0.0.1-x86_64-unknown-linux-gnu"
+            .as_bytes()
+            .to_vec();
+        let cdn_digest = bitty_package::integrity::sha256_hex(&tarball_bytes);
+        let payload = fetch_seed_payload(
+            "net",
+            "0.0.1",
+            "x86_64-unknown-linux-gnu",
+            Some(&cdn_digest),
+            &mut stub,
+        )
+        .expect("both matching must pass");
+        assert_eq!(payload.tarball_digest, cdn_digest);
+        // Uppercase caller digest is normalized (constant-shape compare).
+        let (mut stub, _) = valid_stub("net", "0.0.1", "x86_64-unknown-linux-gnu", exe);
+        fetch_seed_payload(
+            "net",
+            "0.0.1",
+            "x86_64-unknown-linux-gnu",
+            Some(&cdn_digest.to_ascii_uppercase()),
+            &mut stub,
+        )
+        .expect("uppercase expected must pass");
+    }
+
+    #[test]
+    fn fetch_seed_payload_refuses_expected_mismatch() {
+        let exe = b"fake-net-bytes";
+        let (mut stub, _) = valid_stub("net", "0.0.1", "x86_64-unknown-linux-gnu", exe);
+        let other = "d".repeat(64);
+        let error = fetch_seed_payload(
+            "net",
+            "0.0.1",
+            "x86_64-unknown-linux-gnu",
+            Some(&other),
+            &mut stub,
+        )
+        .expect_err("expected mismatch must fail");
+        assert_eq!(error.exit_code(), 4);
+        assert!(
+            error.message().contains("does not match expected digest"),
+            "{error}"
+        );
+        // Refused before unpacking: tar never ran (integrity failure, never a
+        // silent pick of either digest).
+        assert_eq!(stub.spawn_count("tar"), 0);
+    }
+
+    #[test]
+    fn fetch_seed_payload_refuses_malformed_expected() {
+        let exe = b"fake-net-bytes";
+        for malformed in [
+            "abc".to_string(),
+            String::new(),
+            "g".repeat(64),
+            "a".repeat(63),
+            "a".repeat(65),
+        ] {
+            let (mut stub, _) = valid_stub("net", "0.0.1", "x86_64-unknown-linux-gnu", exe);
+            let error = fetch_seed_payload(
+                "net",
+                "0.0.1",
+                "x86_64-unknown-linux-gnu",
+                Some(malformed.as_str()),
+                &mut stub,
+            )
+            .expect_err("malformed expected must fail");
+            assert_eq!(error.exit_code(), 2, "malformed {malformed:?}: {error}");
+        }
+    }
+
     // --- curl/tar argv shape ----------------------------------------------
 
     #[test]
@@ -1717,13 +1940,23 @@ mod tests {
     fn fetch_seed_payload_verifies_and_unpacks() {
         let exe = b"fake-net-bytes";
         let (mut stub, urls) = valid_stub("net", "0.0.1", "x86_64-unknown-linux-gnu", exe);
-        let payload = fetch_seed_payload("net", "0.0.1", "x86_64-unknown-linux-gnu", &mut stub)
-            .expect("payload");
+        let payload =
+            fetch_seed_payload("net", "0.0.1", "x86_64-unknown-linux-gnu", None, &mut stub)
+                .expect("payload");
         assert_eq!(payload.name, "net");
         assert_eq!(payload.version, "0.0.1");
         assert_eq!(payload.executable, "bitty-net");
         assert_eq!(payload.bytes, exe);
         assert_eq!((payload.protocol_min, payload.protocol_max), (1, 1));
+        // The verified CDN digest rides along for the TOFU pin.
+        let tarball_bytes = "fake-tarball-for-net-0.0.1-x86_64-unknown-linux-gnu"
+            .as_bytes()
+            .to_vec();
+        assert_eq!(
+            payload.tarball_digest,
+            bitty_package::integrity::sha256_hex(&tarball_bytes)
+        );
+        assert!(is_hex_digest(&payload.tarball_digest));
         // Exactly one manifest fetch plus one tarball fetch, one member
         // list, then one extraction: no registry chatter, no extra downloads.
         assert_eq!(stub.spawn_count("curl"), 2);
@@ -1745,7 +1978,7 @@ mod tests {
         // Serve different bytes than the manifest pins.
         stub.fetches
             .insert(urls.tarball_url.clone(), b"tampered-bytes".to_vec());
-        let error = fetch_seed_payload("net", "0.0.1", "x86_64-unknown-linux-gnu", &mut stub)
+        let error = fetch_seed_payload("net", "0.0.1", "x86_64-unknown-linux-gnu", None, &mut stub)
             .expect_err("tamper must fail");
         assert_eq!(error.exit_code(), 4);
         assert!(error.message().contains("does not match"), "{error}");
@@ -1761,7 +1994,7 @@ mod tests {
             urls.manifest_url.clone(),
             format!("{}  some-other.tar.gz\n", "d".repeat(64)).into_bytes(),
         );
-        let error = fetch_seed_payload("net", "0.0.1", "x86_64-unknown-linux-gnu", &mut stub)
+        let error = fetch_seed_payload("net", "0.0.1", "x86_64-unknown-linux-gnu", None, &mut stub)
             .expect_err("missing entry must fail");
         assert_eq!(error.exit_code(), 4);
         assert!(error.message().contains("no entry"), "{error}");
@@ -1787,8 +2020,9 @@ mod tests {
                 ),
                 ("bitty-net".to_string(), exe.to_vec()),
             ];
-            let error = fetch_seed_payload("net", "0.0.1", "x86_64-unknown-linux-gnu", &mut stub)
-                .expect_err(&format!("substitution must fail ({why})"));
+            let error =
+                fetch_seed_payload("net", "0.0.1", "x86_64-unknown-linux-gnu", None, &mut stub)
+                    .expect_err(&format!("substitution must fail ({why})"));
             assert_eq!(error.exit_code(), 4, "{why}: {error}");
             assert!(
                 error.message().contains("refusing to install"),
@@ -1809,7 +2043,7 @@ mod tests {
             ),
             ("bitty-net".to_string(), exe.to_vec()),
         ];
-        let error = fetch_seed_payload("net", "0.0.1", "x86_64-unknown-linux-gnu", &mut stub)
+        let error = fetch_seed_payload("net", "0.0.1", "x86_64-unknown-linux-gnu", None, &mut stub)
             .expect_err("digest tamper must fail");
         assert_eq!(error.exit_code(), 4);
         assert!(error.message().contains("tampered"), "{error}");
@@ -1821,7 +2055,7 @@ mod tests {
         let (mut stub, _) = valid_stub("net", "0.0.1", "x86_64-unknown-linux-gnu", exe);
         stub.extract_files
             .push(("evil.sh".to_string(), b"evil".to_vec()));
-        let error = fetch_seed_payload("net", "0.0.1", "x86_64-unknown-linux-gnu", &mut stub)
+        let error = fetch_seed_payload("net", "0.0.1", "x86_64-unknown-linux-gnu", None, &mut stub)
             .expect_err("extra member must fail");
         assert_eq!(error.exit_code(), 4);
         assert!(
@@ -1864,8 +2098,9 @@ mod tests {
             let exe = b"fake-net-bytes";
             let (mut stub, _) = valid_stub("net", "0.0.1", "x86_64-unknown-linux-gnu", exe);
             stub.listed_members = Some(listed.iter().map(|name| (*name).to_string()).collect());
-            let error = fetch_seed_payload("net", "0.0.1", "x86_64-unknown-linux-gnu", &mut stub)
-                .expect_err(&format!("hostile member list must fail ({why})"));
+            let error =
+                fetch_seed_payload("net", "0.0.1", "x86_64-unknown-linux-gnu", None, &mut stub)
+                    .expect_err(&format!("hostile member list must fail ({why})"));
             assert_eq!(error.exit_code(), 4, "{why}: {error}");
             assert!(
                 stub.argv_for("tar").iter().all(|argv| argv[0] != "-xzf"),
@@ -1879,7 +2114,7 @@ mod tests {
         let exe = b"fake-net-bytes";
         let (mut stub, _) = valid_stub("net", "0.0.1", "x86_64-unknown-linux-gnu", exe);
         stub.extract_files.retain(|(name, _)| name != "bitty-net");
-        let error = fetch_seed_payload("net", "0.0.1", "x86_64-unknown-linux-gnu", &mut stub)
+        let error = fetch_seed_payload("net", "0.0.1", "x86_64-unknown-linux-gnu", None, &mut stub)
             .expect_err("missing member must fail");
         assert_eq!(error.exit_code(), 4);
     }
@@ -1904,7 +2139,7 @@ mod tests {
                 "/etc/hostname".to_string(),
             ),
         ];
-        let error = fetch_seed_payload("net", "0.0.1", "x86_64-unknown-linux-gnu", &mut stub)
+        let error = fetch_seed_payload("net", "0.0.1", "x86_64-unknown-linux-gnu", None, &mut stub)
             .expect_err("symlinked members must fail");
         assert_eq!(error.exit_code(), 4);
         assert!(error.message().contains("not a regular file"), "{error}");
@@ -1914,6 +2149,7 @@ mod tests {
     fn seed_errors_map_to_stable_exit_codes() {
         assert_eq!(SeedError::InvalidName("x".into()).exit_code(), 2);
         assert_eq!(SeedError::InvalidVersion("x".into()).exit_code(), 2);
+        assert_eq!(SeedError::InvalidDigest("x".into()).exit_code(), 2);
         assert_eq!(SeedError::InvalidTarget("x".into()).exit_code(), 1);
         assert_eq!(SeedError::UnsupportedHost("x".into()).exit_code(), 1);
         assert_eq!(SeedError::ToolMissing("x".into()).exit_code(), 1);
@@ -2063,7 +2299,8 @@ mod tests {
             .fetches
             .insert(urls.manifest_url.clone(), manifest.into_bytes());
 
-        let payload = fetch_seed_payload("net", "0.0.23", target, &mut transport).expect("payload");
+        let payload =
+            fetch_seed_payload("net", "0.0.23", target, None, &mut transport).expect("payload");
         assert_eq!(payload.name, "net");
         assert_eq!(payload.version, "0.0.23");
         assert_eq!(payload.executable, "bitty-net");
@@ -2119,7 +2356,7 @@ mod tests {
         // The stray member fails the member-list audit even though the
         // explicit-member extraction would never materialize it: the seed
         // pins the exact dist contract end to end.
-        let error = fetch_seed_payload("net", "0.0.23", target, &mut transport)
+        let error = fetch_seed_payload("net", "0.0.23", target, None, &mut transport)
             .expect_err("stray member must fail");
         assert_eq!(error.exit_code(), 4);
         assert!(

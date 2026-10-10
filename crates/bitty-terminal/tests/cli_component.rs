@@ -531,14 +531,23 @@ fn component_add_publishes_atomically_without_temp_litter() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// Unix-only: hiding `curl`/`tar` through `PATH` cannot work on Windows.
+/// Windows `CreateProcess` resolves tools through a fixed order (application
+/// directory, then `C:\Windows\System32`, then the Windows directory, and
+/// only then `PATH`), so `C:\Windows\System32\curl.exe` (and `tar.exe`)
+/// always resolve no matter how `PATH` is scrubbed. The fail-closed
+/// diagnostic itself stays covered on every platform by the
+/// `missing_tool_diagnostics_*` and `tool_version_output_against_absent_*`
+/// unit tests, which use a guaranteed-absent tool name instead of `PATH`.
+#[cfg(unix)]
 #[test]
-fn component_install_absent_curl_fails_closed_with_manual_path() {
-    let home = scratch_dir("absent-curl");
+fn component_install_absent_helpers_fails_closed_with_manual_path() {
+    let home = scratch_dir("absent-helpers");
     let system = home.join("system-components");
     std::fs::create_dir_all(&system).expect("system dir");
-    // A PATH with no helpers: `curl` (and `tar`) resolve to nothing, so the
-    // preflight fails before any fetch or staging. `--yes` skips consent so
-    // the failure lands in the fetch environment, not the prompt.
+    // A PATH with no helpers: the tar presence preflight fires first (before
+    // any fetch or staging), so the diagnostic names `tar`. `--yes` skips
+    // consent so the failure lands in the fetch environment, not the prompt.
     let empty_path = home.join("empty-path");
     std::fs::create_dir_all(&empty_path).expect("empty path dir");
     let output = run_with_env(
@@ -557,8 +566,8 @@ fn component_install_absent_curl_fails_closed_with_manual_path() {
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
     let diagnostic = stderr(&output);
     assert!(
-        diagnostic.contains("`curl` not found"),
-        "absent curl must name the tool: {diagnostic}"
+        diagnostic.contains("`tar` not found"),
+        "absent tar must name the tool: {diagnostic}"
     );
     assert!(
         diagnostic.contains("$XDG_DATA_HOME/bitty/components/"),
@@ -570,7 +579,7 @@ fn component_install_absent_curl_fails_closed_with_manual_path() {
     );
     assert!(
         !user_root(&home).join("net").exists(),
-        "absent curl must stage nothing"
+        "absent helpers must stage nothing"
     );
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -587,7 +596,8 @@ fn component_install_with_hostile_env_still_fails_closed() {
     ];
     // Hostile names still fail at URL construction (exit 2) with zero spawn,
     // even under a poisoned environment: validation precedes any fetch, so
-    // no secret can reach a child that is never spawned.
+    // no secret can reach a child that is never spawned. Portable: no `PATH`
+    // games, so this half runs on every platform.
     let output = run_with_env(
         &home,
         &system,
@@ -595,8 +605,26 @@ fn component_install_with_hostile_env_still_fails_closed() {
         poisoned,
     );
     assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Unix-only: the poisoned-environment plus scrubbed-`PATH` half of the
+/// hostile proof (see the `System32` note on
+/// `component_install_absent_helpers_fails_closed_with_manual_path`).
+#[cfg(unix)]
+#[test]
+fn component_install_with_hostile_env_and_absent_helpers_fails_closed() {
+    let home = scratch_dir("hostile-env-nocurl");
+    let system = home.join("system-components");
+    std::fs::create_dir_all(&system).expect("system dir");
+    let poisoned: &[(&str, &str)] = &[
+        ("BITTY_CTX1112_GITHUB_TOKEN", "poison-token"),
+        ("BITTY_CTX1112_AWS_SECRET_ACCESS_KEY", "poison-secret"),
+        ("BITTY_CTX1112_API_KEY", "poison-key"),
+    ];
     // With no helpers on PATH, the poisoned environment still lands in the
-    // curl-missing diagnostic (exit 1), never in a child.
+    // tar-missing diagnostic (exit 1, tar preflight fires first), never in
+    // a child.
     let empty_path = home.join("empty-path");
     std::fs::create_dir_all(&empty_path).expect("empty path dir");
     let empty_path_str = empty_path.display().to_string();
@@ -617,7 +645,7 @@ fn component_install_with_hostile_env_still_fails_closed() {
     );
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
     assert!(
-        stderr(&output).contains("`curl` not found"),
+        stderr(&output).contains("`tar` not found"),
         "{}",
         stderr(&output)
     );

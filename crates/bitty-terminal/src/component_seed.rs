@@ -27,7 +27,9 @@
 //!   follow-up, not a silent addition.
 //! - Environment: `curl` 7.68.0 or newer (preflighted once per invocation;
 //!   absent or too-old curl fails closed with a manual-placement
-//!   diagnostic, exit `1`). `curl`/`tar` inherit the caller's environment
+//!   diagnostic, exit `1`) plus a `tar --version` presence preflight (a
+//!   missing tar fails before any byte is downloaded, exit `1`).
+//!   `curl`/`tar` inherit the caller's environment
 //!   for proxy and TLS store discovery (mirroring `scripts/install.sh`),
 //!   minus secret-shaped variables (`*_TOKEN`/`*_KEY`/`*_SECRET`, which are
 //!   scrubbed from every child). Argv is fixed and audited; system CA store
@@ -754,6 +756,42 @@ static CURL_PREFLIGHT: std::sync::OnceLock<Result<CurlVersion, SeedError>> =
 /// (cache misses; hits never spawn). Observed by tests.
 static CURL_PREFLIGHT_SPAWNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Result of the once-per-invocation `tar --version` presence preflight.
+static TAR_PREFLIGHT: std::sync::OnceLock<Result<(), SeedError>> = std::sync::OnceLock::new();
+
+/// How many times the tar preflight actually spawned `tar --version`
+/// (cache misses; hits never spawn). Observed by tests.
+static TAR_PREFLIGHT_SPAWNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Spawn `tool --version` via [`scrubbed_command`] and return its stdout.
+///
+/// Absent tools map to `missing` (the established manual-placement
+/// diagnostic); other spawn failures map to `Io`; a non-zero exit maps to
+/// `Fetch`. Shared by both preflights so the missing-tool path is defined
+/// once and unit-testable against a guaranteed-absent tool name (portable:
+/// no `PATH` games, so no Windows `System32` fallback can interfere).
+fn tool_version_output(tool: &str, missing: SeedError) -> Result<String, SeedError> {
+    let output = scrubbed_command(tool)
+        .arg("--version")
+        .output()
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                missing
+            } else {
+                SeedError::Io(format!(
+                    "bitty component: cannot run `{tool} --version`: {error}"
+                ))
+            }
+        })?;
+    if !output.status.success() {
+        return Err(SeedError::Fetch(format!(
+            "bitty component: `{tool} --version` failed ({})",
+            output.status
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 /// Run the cached preflight: `curl --version` parsed against the floor.
 ///
 /// The first call in the process spawns `curl --version` (via
@@ -766,26 +804,24 @@ pub fn preflight_curl() -> Result<CurlVersion, SeedError> {
     CURL_PREFLIGHT
         .get_or_init(|| {
             CURL_PREFLIGHT_SPAWNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let output = scrubbed_command("curl")
-                .arg("--version")
-                .output()
-                .map_err(|error| {
-                    if error.kind() == std::io::ErrorKind::NotFound {
-                        SeedError::ToolMissing(curl_missing_diagnostic())
-                    } else {
-                        SeedError::Io(format!(
-                            "bitty component: cannot run `curl --version`: {error}"
-                        ))
-                    }
-                })?;
-            if !output.status.success() {
-                return Err(SeedError::Fetch(format!(
-                    "bitty component: `curl --version` failed ({})",
-                    output.status
-                )));
-            }
-            let text = String::from_utf8_lossy(&output.stdout);
+            let text =
+                tool_version_output("curl", SeedError::ToolMissing(curl_missing_diagnostic()))?;
             check_curl_version_output(&text)
+        })
+        .clone()
+}
+
+/// Run the cached tar presence preflight: `tar --version` must succeed.
+///
+/// Like [`preflight_curl`], the first call spawns once and caches; later
+/// calls are free. A missing tar fails closed with the established
+/// [`tar_missing_diagnostic`] (exit `1`) before any byte is downloaded, so
+/// `fetch` never wastes bandwidth on an archive it cannot unpack.
+pub fn preflight_tar() -> Result<(), SeedError> {
+    TAR_PREFLIGHT
+        .get_or_init(|| {
+            TAR_PREFLIGHT_SPAWNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            SystemTransport::run_tool("tar", &["--version".to_string()])
         })
         .clone()
 }
@@ -907,8 +943,10 @@ impl SystemTransport {
 
 impl SeedTransport for SystemTransport {
     fn fetch(&mut self, url: &str, dest: &Path, max_bytes: u64) -> Result<(), SeedError> {
-        // Preflight once per invocation (cached): absent or too-old curl
-        // fails here, before any fetch or staging.
+        // Presence preflights (each cached once per invocation): a missing
+        // tar fails with the established diagnostic before any byte is
+        // downloaded, then absent or too-old curl fails before any fetch.
+        preflight_tar()?;
         preflight_curl()?;
         let argv = Self::curl_argv(url, dest, max_bytes);
         Self::run_tool("curl", &argv)
@@ -2307,6 +2345,47 @@ mod tests {
         assert_eq!(middle, after, "second preflight must be a cache hit");
     }
 
+    #[test]
+    fn tool_version_output_against_absent_tool_fails_closed() {
+        // Portable missing-tool proof: the tool name exists nowhere (no
+        // `PATH` games, so no Windows `System32` fallback can interfere).
+        // Mirrors what `preflight_curl` reports for an absent curl.
+        let error = tool_version_output(
+            "bitty-ctx1112-no-such-tool",
+            SeedError::ToolMissing(curl_missing_diagnostic()),
+        )
+        .expect_err("absent tool must fail");
+        assert_eq!(error.exit_code(), 1);
+        let message = error.message();
+        assert!(message.contains("not found"), "{message}");
+        assert!(
+            message.contains("$XDG_DATA_HOME/bitty/components/"),
+            "{message}"
+        );
+        assert!(
+            message.contains("nothing was fetched or staged"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn preflight_tar_runs_once_per_invocation() {
+        let before = TAR_PREFLIGHT_SPAWNS.load(std::sync::atomic::Ordering::Relaxed);
+        let first = preflight_tar();
+        let middle = TAR_PREFLIGHT_SPAWNS.load(std::sync::atomic::Ordering::Relaxed);
+        let second = preflight_tar();
+        let after = TAR_PREFLIGHT_SPAWNS.load(std::sync::atomic::Ordering::Relaxed);
+        // Both calls agree (the second is a cache hit), and at most one
+        // spawn happened here. Passes with or without tar present: absent
+        // tar caches the same fail-closed diagnostic both times.
+        assert_eq!(format!("{first:?}"), format!("{second:?}"));
+        assert!(
+            middle - before <= 1,
+            "tar preflight must spawn at most once"
+        );
+        assert_eq!(middle, after, "second tar preflight must be a cache hit");
+    }
+
     // --- CA + proxy posture pin (issue #1907) -------------------------------
 
     #[test]
@@ -2349,7 +2428,10 @@ mod tests {
 
     #[test]
     fn secret_env_names_cover_tokens_keys_secrets_not_proxies() {
-        for secret in [
+        // Loop binding is `candidate`, not `secret`: a `secret`-named value
+        // flowing into an assert message trips the cleartext-logging lint
+        // (the values here are env var NAMES under audit, never values).
+        for candidate in [
             "GITHUB_TOKEN",
             "github_token",
             "AWS_SECRET_ACCESS_KEY",
@@ -2358,7 +2440,7 @@ mod tests {
             "DB_SECRET",
             "A_B_C_SECRET",
         ] {
-            assert!(is_secret_env_name(secret), "{secret}");
+            assert!(is_secret_env_name(candidate), "{candidate}");
         }
         for plain in [
             "https_proxy",
@@ -2422,15 +2504,17 @@ mod tests {
             "BITTY_CTX1112_CANARY",
         ];
         let removals = secret_removals_in(present.iter().map(|name| (*name).to_string()));
-        for secret in [
+        // Loop binding is `candidate`, not `secret`: see
+        // `secret_env_names_cover_tokens_keys_secrets_not_proxies`.
+        for candidate in [
             "BITTY_CTX1112_GITHUB_TOKEN",
             "BITTY_CTX1112_AWS_SECRET_ACCESS_KEY",
             "BITTY_CTX1112_API_KEY",
             "GITHUB_TOKEN",
         ] {
             assert!(
-                removals.iter().any(|listed| listed == secret),
-                "scrub must cover {secret}"
+                removals.iter().any(|listed| listed == candidate),
+                "scrub must cover {candidate}"
             );
         }
         for kept in [

@@ -1,11 +1,13 @@
 //! Fetch-environment hostile proof (issue #1907, unix only).
 //!
 //! A fake `curl` on `PATH` serves a genuine locally packed component release
-//! while dumping every fetch child's environment to a file. The install runs
-//! under poisoned secret-shaped variables plus canary/proxy sentinels, so
-//! one test proves both halves of the posture: the fetch still works (exit
-//! 0, staged payload) and no `*_TOKEN`/`*_KEY`/`*_SECRET` variable reaches a
-//! fetch child (dump audit) while proxy/canary inheritance stays intact.
+//! while recording every fetch child's environment variable NAMES (values
+//! redacted: `env | cut -d= -f1`, so no secret value ever touches the file).
+//! The install runs under poisoned secret-shaped variables plus
+//! canary/proxy sentinels, so one test proves both halves of the posture:
+//! the fetch still works (exit 0, staged payload) and no `*_TOKEN`/`*_KEY`/
+//! `*_SECRET` variable reaches a fetch child (name audit) while
+//! proxy/canary inheritance stays intact.
 //!
 //! Unix-gated: the fake `curl` is a `sh` script (Windows needs a separate
 //! helper and stays on the fail-closed unit path). Skips (does not panic)
@@ -140,7 +142,7 @@ fn fetch_env_hostile_secrets_scrubbed_and_fetch_still_works() {
          \x20 prev=\"$arg\"\n\
          \x20 url=\"$arg\"\n\
          done\n\
-         { echo \"--- fetch $url\"; env; echo '--- end'; } >> \"$FAKE_CURL_ENV_DUMP\"\n\
+         { echo \"--- fetch $url\"; env | cut -d= -f1 | sort; echo '--- end'; } >> \"$FAKE_CURL_ENV_DUMP\"\n\
          case \"$url\" in\n\
          \x20 */SHA256SUMS) cat \"$FAKE_CURL_MANIFEST\" > \"$dest\" ;;\n\
          \x20 *) cat \"$FAKE_CURL_TARBALL\" > \"$dest\" ;;\n\
@@ -207,8 +209,9 @@ fn fetch_env_hostile_secrets_scrubbed_and_fetch_still_works() {
         "0.0.23\n"
     );
 
-    // Dump audit: both fetches ran, no poisoned var reached either child,
-    // and proxy/canary inheritance stayed intact.
+    // Dump audit: both fetches ran, no poisoned NAME reached either child,
+    // no secret VALUE appears anywhere (the dump holds names only), and
+    // proxy/canary inheritance stayed intact.
     let dump_text = std::fs::read_to_string(&dump).expect("dump");
     assert!(
         dump_text.contains("--- fetch https://cdn.bitty.run/"),
@@ -220,26 +223,33 @@ fn fetch_env_hostile_secrets_scrubbed_and_fetch_still_works() {
         "BITTY_CTX1112_API_KEY",
     ] {
         assert!(
-            !dump_text.lines().any(|line| line.starts_with(poisoned)),
+            !dump_text.lines().any(|line| line == poisoned),
             "child env leaks {poisoned}: {dump_text}"
         );
     }
+    for value in [
+        "poison-token",
+        "poison-secret",
+        "poison-key",
+        "http://sentinel-proxy.invalid:8080",
+        "sentinel-noproxy",
+        "canary",
+    ] {
+        assert!(
+            !dump_text.contains(value),
+            "dump must hold names only, never values ({value}): {dump_text}"
+        );
+    }
     assert!(
-        dump_text
-            .lines()
-            .any(|line| line == "BITTY_CTX1112_CANARY=canary"),
+        dump_text.lines().any(|line| line == "BITTY_CTX1112_CANARY"),
         "child env must inherit non-secret vars: {dump_text}"
     );
     assert!(
-        dump_text
-            .lines()
-            .any(|line| line == "https_proxy=http://sentinel-proxy.invalid:8080"),
+        dump_text.lines().any(|line| line == "https_proxy"),
         "child env must inherit the proxy env: {dump_text}"
     );
     assert!(
-        dump_text
-            .lines()
-            .any(|line| line == "no_proxy=sentinel-noproxy"),
+        dump_text.lines().any(|line| line == "no_proxy"),
         "child env must inherit no_proxy: {dump_text}"
     );
     let _ = std::fs::remove_dir_all(&home);

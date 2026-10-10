@@ -776,8 +776,9 @@ pub enum ChromeAction {
     /// Switch to the next occupied workspace rightward with wrap
     /// (`workspace_next_occupied`, default `alt+[` per #1904, CTX-1100).
     ///
-    /// Occupied means at least one live pane session (see
-    /// `Runtime::workspace_is_occupied`); session-less tiles are skipped.
+    /// Occupied means at least one live pane session or ownership of the
+    /// primary shell (see `Runtime::workspace_is_occupied`); session-less
+    /// tiles are skipped.
     /// From the active index lands on the next occupied slot rightward,
     /// wrapping to the leftmost occupied at the rightmost. Fewer than two
     /// occupied workspaces is a fail-closed no-op (loud warning, never a

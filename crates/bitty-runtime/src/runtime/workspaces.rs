@@ -962,14 +962,45 @@ impl Runtime {
     /// Whether workspace `index` counts as occupied for cycle jumps.
     ///
     /// CTX-1100 (#1904): occupied means at least one live pane session
-    /// owned by the workspace leaves, reusing [`Self::workspace_live_count`].
-    /// Every slot always holds at least one leaf by invariant, so leaf count
-    /// cannot define occupancy; a session-less tile (fresh idle leaf, or the
+    /// owned by the workspace leaves, or ownership of the runtime-global
+    /// primary shell (see [`Self::workspace_owns_primary`]). Every slot
+    /// always holds at least one leaf by invariant, so leaf count cannot
+    /// define occupancy; a session-less tile (fresh idle leaf, or the
     /// emptied tile kept by the CTX-1044 reap branch) renders empty and is
-    /// skipped. The runtime-global primary is never counted.
+    /// skipped. Reuses [`Self::workspace_live_count`] for the pane half.
     #[must_use]
     pub fn workspace_is_occupied(&self, index: usize) -> bool {
-        self.workspace_live_count(index) > 0
+        self.workspace_live_count(index) > 0 || self.workspace_owns_primary(index)
+    }
+
+    /// Whether the runtime-global primary shell is owned by a leaf of
+    /// workspace `index` (CTX-1100, #1904 follow-up).
+    ///
+    /// The primary shell is never a pane session — [`Self::workspace_live_count`]
+    /// counts it 0 so close never confirm-kills it — but a workspace holding
+    /// the primary owner is live for the user: the normal two-workspace flow
+    /// (primary attached in ws1, replayed pane shell in ws2) must cycle
+    /// instead of no-op-ing on a single pane-counted occupant. The recipe
+    /// latch (`primary_spawn`) distinguishes an attached primary from the
+    /// fresh-designated owner (`primary_view` is pre-pinned to the initial
+    /// leaf with no shell behind it, `Runtime` construction): headless with
+    /// no attach owns nothing. Time O(l) over the workspace leaves; space
+    /// O(l) for the id list.
+    #[must_use]
+    pub fn workspace_owns_primary(&self, index: usize) -> bool {
+        if self.primary_spawn.is_none() {
+            return false;
+        }
+        let Some(owner) = self.primary_view else {
+            return false;
+        };
+        if index == self.active_workspace {
+            self.layout.leaf_ids().contains(&owner)
+        } else {
+            self.workspaces
+                .get(index)
+                .is_some_and(|slot| slot.layout.leaf_ids().contains(&owner))
+        }
     }
 
     /// Occupied workspace indices in index order (CTX-1100, #1904).
@@ -994,16 +1025,7 @@ impl Runtime {
     /// matches the other switch paths. Returns the new active index.
     pub fn workspace_next_occupied(&mut self) -> Option<usize> {
         let occupied = self.workspace_occupied_indices();
-        if occupied.len() < 2 {
-            return None;
-        }
-        let target = occupied
-            .iter()
-            .copied()
-            .find(|&i| i > self.active_workspace)
-            .unwrap_or(occupied[0]);
-        self.workspace_switch(target);
-        Some(self.active_workspace)
+        self.workspace_next_in(&occupied)
     }
 
     /// Switch to the previous occupied workspace leftward with wrap (CTX-1100).
@@ -1014,6 +1036,37 @@ impl Runtime {
     /// occupied is a fail-closed `None` with state untouched.
     pub fn workspace_prev_occupied(&mut self) -> Option<usize> {
         let occupied = self.workspace_occupied_indices();
+        self.workspace_prev_in(&occupied)
+    }
+
+    /// Switch to the next index in `occupied` rightward with wrap (CTX-1100).
+    ///
+    /// Shared engine behind [`Self::workspace_next_occupied`] and the
+    /// app-level zoom-aware cycle: the caller supplies occupancy in index
+    /// order (the runtime list, or that list plus zoom-backed leaves the
+    /// runtime cannot see). Fewer than two entries, or a target outside the
+    /// live slot table, is a fail-closed `None` with state untouched.
+    /// Returns the new active index.
+    pub fn workspace_next_in(&mut self, occupied: &[usize]) -> Option<usize> {
+        if occupied.len() < 2 {
+            return None;
+        }
+        let target = occupied
+            .iter()
+            .copied()
+            .find(|&i| i > self.active_workspace)
+            .unwrap_or(occupied[0]);
+        if target >= self.workspaces.len() {
+            return None;
+        }
+        self.workspace_switch(target);
+        Some(self.active_workspace)
+    }
+
+    /// Switch to the previous index in `occupied` leftward with wrap (CTX-1100).
+    ///
+    /// Exact mirror of [`Self::workspace_next_in`]; same fail-closed contract.
+    pub fn workspace_prev_in(&mut self, occupied: &[usize]) -> Option<usize> {
         if occupied.len() < 2 {
             return None;
         }
@@ -1023,6 +1076,9 @@ impl Runtime {
             .rev()
             .find(|&i| i < self.active_workspace)
             .unwrap_or(occupied[occupied.len() - 1]);
+        if target >= self.workspaces.len() {
+            return None;
+        }
         self.workspace_switch(target);
         Some(self.active_workspace)
     }
@@ -1962,6 +2018,47 @@ mod tests {
         assert_eq!(rt.workspace_prev_occupied(), None);
         assert_eq!(rt.active_workspace_index(), 0);
         assert_eq!(rt.workspace_count(), 1);
+    }
+
+    // Live-spawn: runs real POSIX shells (no Windows equivalent).
+    // `#[cfg(unix)]` keeps it off Windows CI; `require_pty!()` keeps the
+    // force-no-PTY simulation path.
+    #[test]
+    #[cfg(unix)]
+    fn cycle_occupied_counts_primary_owner_as_occupied() {
+        require_pty!();
+        // CTX-1100 follow-up (CodeRabbit PR #1917): the normal two-workspace
+        // flow holds the primary shell in ws1 and a replayed pane shell in
+        // ws2. The primary is never a pane session, so the close gate still
+        // sees ws1 as idle — but the cycle must treat the primary owner as
+        // occupied, or the pair wrongly no-ops on a single pane-counted
+        // occupant.
+        let mut rt = fresh();
+        rt.spawn_shell("/bin/sh").expect("primary must attach");
+        let owner = rt.primary_view().expect("primary owner");
+        assert_eq!(
+            rt.workspace_live_count(0),
+            0,
+            "primary-only stays idle for the close gate"
+        );
+        assert!(rt.workspace_owns_primary(0));
+        assert!(
+            rt.workspace_is_occupied(0),
+            "primary owner counts for the cycle"
+        );
+        rt.workspace_new().expect("ws2 replays the primary recipe");
+        let ws2_leaf = rt.focused_view().expect("ws2 focus");
+        assert!(
+            rt.has_pane_session(&ws2_leaf),
+            "replay gives ws2 its own pane shell"
+        );
+        assert_eq!(rt.workspace_occupied_indices(), vec![0, 1]);
+        assert!(rt.workspace_switch(0));
+        assert_eq!(rt.workspace_next_occupied().expect("must jump"), 1);
+        assert_eq!(rt.workspace_prev_occupied().expect("must mirror"), 0);
+        assert_eq!(rt.workspace_count(), 2, "cycle must not kill");
+        assert_eq!(rt.primary_view(), Some(owner), "primary survives");
+        assert!(rt.focused_view().is_some(), "focus survives");
     }
 
     // Live-spawn: runs real POSIX shells (no Windows equivalent).

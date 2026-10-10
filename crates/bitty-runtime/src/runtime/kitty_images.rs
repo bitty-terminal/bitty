@@ -55,7 +55,7 @@
 //! compositing (S7, #1849) are shipped: the present layer serves scaled
 //! blits from [`bitty_rich::KittyRasterCache`] (pure optimization over the
 //! uncached raster step) and the focused cursor punches through covering
-//! blits.//!
+//! blits.
 //! Display anchors at the drained stream's cursor cell (the primary grid,
 //! or the pane session swapped in by `handle_pane_bytes`) with that
 //! grid's `State::scrollback_len()` as the scroll base (images scroll with

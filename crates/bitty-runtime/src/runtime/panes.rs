@@ -191,17 +191,21 @@ impl Runtime {
                 self.session_primary_cwd = None;
             }
         }
-        // CTX-1080: apply the matched rule to the primary owner with the
-        // same semantics as the per-view path below. Dims are a spawn-time
-        // initial-size request (solver owns steady-state geometry, see the
-        // per-view application); presentation stamps the owner leaf
-        // verbatim; workspace moves only when the owner is focused and the
-        // target exists, otherwise skipped fail-closed.
+        // CTX-1080 + CTX-1088: apply the matched rule to the primary
+        // owner with the same semantics as the per-view path below. Dims
+        // are durable fixed-size constraints (the owner leaf, grid, and
+        // PTY keep them through solver sync until cleared; clearing
+        // returns to solver ownership). Fixed wins over pseudo on
+        // conflict; rule edits affect future spawns only. Presentation
+        // stamps the owner leaf verbatim; workspace moves only when the
+        // owner is focused and the target exists, otherwise skipped
+        // fail-closed.
         if let Some(rule) = matched_rule.as_ref() {
             if rule.width.is_some() || rule.height.is_some() {
                 self.state.resize(cols as usize, rows as usize);
             }
             if let Some(owner) = self.primary_view {
+                self.stamp_rule_fixed_size(owner, rule, cols, rows);
                 if let Some(presentation) = rule.presentation {
                     let mode = match presentation {
                         bitty_config::panel_rules::PanelPresentation::Tiled => {
@@ -554,18 +558,21 @@ impl Runtime {
         // exists. Dropping it is the only honest option (the new grid has no
         // equivalent range).
         self.drop_view_bindings_for(view);
-        // CTX-1080: apply the matched rule deterministically after a
-        // successful spawn. Presentation stamps the leaf verbatim (the solver
-        // ignores it, so solver output stays byte-identical). Dims are a
-        // spawn-time initial-size request only: they size the PTY and session
-        // grid here and resize the leaf stored size to match, but steady-state
-        // geometry is solver-owned (`present_frames` derives cols/rows from
-        // the decorated content frames; `sync_pane_geometry_to` and
-        // `reflow_present_layout` reflow grid, PTY, and leaf back to the
-        // solver frame). Workspace moves only when the spawned
-        // leaf is focused and the target exists, otherwise skipped
-        // fail-closed. Centered is placement intent for floating panels
-        // (floats already center via the overlay frame), so no extra step.
+        // CTX-1080 + CTX-1088: apply the matched rule deterministically
+        // after a successful spawn. Presentation stamps the leaf verbatim
+        // (the solver ignores it, so solver output stays byte-identical).
+        // Dims are durable fixed-size constraints: they size the PTY and
+        // session grid here, resize the leaf stored size to match, and
+        // stamp the per-view flag so `present_frames` (fixed wins over
+        // pseudo; tiled centers when it fits, windows when larger;
+        // floating centers in-container), `reflow_present_layout`, the
+        // solver reflow skip, and `sync_pane_geometry_to` keep grid, PTY,
+        // and leaf at the rule size until cleared. Clearing returns to
+        // solver ownership on the next sync. Workspace moves only when
+        // the spawned leaf is focused and the target exists, otherwise
+        // skipped fail-closed. Centered is placement intent for floating
+        // panels (floats already center via the overlay frame), so no
+        // extra step.
         if let Some(rule) = matched_rule.as_ref() {
             if let Some(presentation) = rule.presentation {
                 let mode = match presentation {
@@ -593,6 +600,7 @@ impl Runtime {
                     if let Some(leaf) = self.layout.find_leaf_mut(view) {
                         leaf.resize(w, h);
                     }
+                    self.stamp_rule_fixed_size(view, rule, cols, rows);
                 }
             } else if rule.width.is_some() || rule.height.is_some() {
                 let w = rule.width.unwrap_or(cols).max(1) as usize;
@@ -600,6 +608,7 @@ impl Runtime {
                 if let Some(leaf) = self.layout.find_leaf_mut(view) {
                     leaf.resize(w, h);
                 }
+                self.stamp_rule_fixed_size(view, rule, cols, rows);
             }
             if let Some(target) = rule.workspace {
                 let target_idx = (target as usize).saturating_sub(1);

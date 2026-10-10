@@ -298,7 +298,7 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn rule_dims_are_spawn_time_request_solver_owns_steady_state() {
+    fn rule_dims_are_durable_through_solver_sync() {
         require_pty!();
         use crate::Runtime;
         let mut rt = Runtime::with_defaults().expect("defaults build");
@@ -316,14 +316,163 @@ mod tests {
         let focused = rt.focused_view().expect("focused leaf");
         rt.spawn_shell_for_view(focused, "/bin/sh", &[], 40, 12)
             .expect("spawn");
-        // Immediate: the rule sizes the PTY at spawn.
+        // Immediate: the rule sizes the PTY at spawn and stamps the leaf.
         assert_eq!(rt.pane_pty_size(&focused), Some((100, 30)));
-        // Steady-state: geometry sync reflows to the solver frame, which
-        // differs here (default 80x24 container cannot fit 100x30).
+        let leaf = rt.layout().find_leaf(focused).expect("leaf present");
+        assert_eq!((leaf.cols(), leaf.rows()), (100, 30));
+        assert_eq!(leaf.fixed_size(), Some(crate::UiSize::new(100, 30)));
+        // Steady-state: the present frame owns the fixed dims even though
+        // the default 80x24 container cannot fit 100x30 (clipped slot
+        // window, never overlapping neighbours), and geometry sync keeps
+        // grid and PTY there instead of reflowing to the solver frame.
+        let frames = rt.present_frames();
+        let frame = frames.iter().find(|f| f.view == focused).expect("frame");
+        assert_eq!((frame.cols, frame.rows), (100, 30));
+        rt.sync_pane_geometry_to(&frames);
+        assert_eq!(rt.pane_pty_size(&focused), Some((100, 30)));
+        // Reflow keeps the leaf at the rule size too.
+        rt.reflow_present_layout(&frames);
+        let leaf = rt.layout().find_leaf(focused).expect("leaf present");
+        assert_eq!((leaf.cols(), leaf.rows()), (100, 30));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn clear_fixed_returns_to_solver_ownership() {
+        require_pty!();
+        use crate::Runtime;
+        let mut rt = Runtime::with_defaults().expect("defaults build");
+        rt.set_panel_spawn_rules(vec![PanelSpawnRule {
+            cmd: Some("sh".to_string()),
+            cmd_regex: None,
+            title_regex: None,
+            content: None,
+            presentation: None,
+            width: Some(100),
+            height: Some(30),
+            workspace: None,
+            centered: None,
+        }]);
+        let focused = rt.focused_view().expect("focused leaf");
+        rt.spawn_shell_for_view(focused, "/bin/sh", &[], 40, 12)
+            .expect("spawn");
+        assert_eq!(rt.pane_pty_size(&focused), Some((100, 30)));
+        // Clearing the per-view flag returns the view to solver ownership
+        // on the next sync: grid and PTY follow the solver frame again.
+        let mut tree = rt.layout().clone();
+        tree.find_leaf_mut(focused)
+            .expect("leaf present")
+            .clear_fixed_size();
+        rt.set_layout(tree);
         let frames = rt.present_frames();
         let frame = frames.iter().find(|f| f.view == focused).expect("frame");
         assert_ne!((frame.cols, frame.rows), (100, 30));
         rt.sync_pane_geometry_to(&frames);
         assert_eq!(rt.pane_pty_size(&focused), Some((frame.cols, frame.rows)));
+    }
+
+    #[test]
+    fn degenerate_fixed_dims_fail_closed_headless() {
+        use crate::Runtime;
+        use bitty_ui::{LayoutNode, View, ViewId};
+        let mut rt = Runtime::with_defaults().expect("defaults build");
+        let id = ViewId::new(1);
+        // Degenerate stamps fail closed to solver ownership (stored None).
+        let mut tree = LayoutNode::leaf(View::new(id, 80, 24));
+        tree.find_leaf_mut(id)
+            .expect("leaf")
+            .set_fixed_size(Some(crate::UiSize::new(0, 24)));
+        assert_eq!(tree.find_leaf(id).expect("leaf").fixed_size(), None);
+        tree.find_leaf_mut(id)
+            .expect("leaf")
+            .set_fixed_size(Some(crate::UiSize::new(2000, 2000)));
+        assert_eq!(tree.find_leaf(id).expect("leaf").fixed_size(), None);
+        // A valid stamp survives solver reflow and present; clearing
+        // returns to the solver frame.
+        tree.find_leaf_mut(id)
+            .expect("leaf")
+            .set_fixed_size(Some(crate::UiSize::new(40, 12)));
+        rt.set_layout(tree);
+        rt.set_container(crate::UiRect::new(0, 0, 100, 40));
+        let frame = rt
+            .present_frames()
+            .into_iter()
+            .find(|frame| frame.view == id)
+            .expect("frame");
+        assert_eq!((frame.cols, frame.rows), (40, 12));
+        let leaf = rt.layout().find_leaf(id).expect("leaf");
+        assert_eq!((leaf.cols(), leaf.rows()), (40, 12));
+        // Direct solver reflow keeps the pinned size (origin still tracks
+        // the slot).
+        rt.reflow_layout();
+        let leaf = rt.layout().find_leaf(id).expect("leaf");
+        assert_eq!((leaf.cols(), leaf.rows()), (40, 12));
+        // Clearing restores solver geometry on the next layout install.
+        let mut tree = rt.layout().clone();
+        tree.find_leaf_mut(id).expect("leaf").clear_fixed_size();
+        rt.set_layout(tree);
+        let frame = rt
+            .present_frames()
+            .into_iter()
+            .find(|frame| frame.view == id)
+            .expect("frame");
+        assert_ne!((frame.cols, frame.rows), (40, 12));
+    }
+
+    #[test]
+    fn fixed_wins_over_pseudo_and_restores_it_headless() {
+        use crate::Runtime;
+        use bitty_ui::{LayoutNode, View, ViewId};
+        let mut rt = Runtime::with_defaults().expect("defaults build");
+        let id = ViewId::new(1);
+        let mut tree = LayoutNode::leaf(View::new(id, 80, 24));
+        bitty_ui::set_pseudo_size(&mut tree, id, 60, 20).expect("pseudo stamp");
+        tree.find_leaf_mut(id)
+            .expect("leaf")
+            .set_fixed_size(Some(crate::UiSize::new(40, 12)));
+        rt.set_layout(tree);
+        rt.set_container(crate::UiRect::new(0, 0, 100, 40));
+        // Fixed governs present while both flags are set.
+        let frame = rt
+            .present_frames()
+            .into_iter()
+            .find(|frame| frame.view == id)
+            .expect("frame");
+        assert_eq!((frame.cols, frame.rows), (40, 12));
+        // Clearing fixed restores pseudo (which fits here).
+        let mut tree = rt.layout().clone();
+        tree.find_leaf_mut(id).expect("leaf").clear_fixed_size();
+        rt.set_layout(tree);
+        let frame = rt
+            .present_frames()
+            .into_iter()
+            .find(|frame| frame.view == id)
+            .expect("frame");
+        assert_eq!((frame.cols, frame.rows), (60, 20));
+    }
+
+    #[test]
+    fn fixed_floating_sizes_the_float_headless() {
+        use crate::Runtime;
+        use bitty_ui::{LayoutNode, PresentationMode, View, ViewId};
+        let mut rt = Runtime::with_defaults().expect("defaults build");
+        let id = ViewId::new(1);
+        let mut tree = LayoutNode::leaf(View::new(id, 80, 24));
+        tree.find_leaf_mut(id)
+            .expect("leaf")
+            .set_presentation(PresentationMode::Floating);
+        tree.find_leaf_mut(id)
+            .expect("leaf")
+            .set_fixed_size(Some(crate::UiSize::new(40, 12)));
+        rt.set_layout(tree);
+        rt.set_container(crate::UiRect::new(0, 0, 100, 40));
+        let frame = rt
+            .present_frames()
+            .into_iter()
+            .find(|frame| frame.view == id)
+            .expect("frame");
+        // Floating lifts to the Float tier with the fixed grid dims.
+        assert!(frame.tier.is_some());
+        assert_eq!((frame.cols, frame.rows), (40, 12));
     }
 }

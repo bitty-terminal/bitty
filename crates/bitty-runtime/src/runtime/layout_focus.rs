@@ -818,9 +818,95 @@ impl Runtime {
                     .find_leaf(view)
                     .and_then(|leaf| leaf.presentation().overlay_tier());
                 let tier = structural.or(mode_tier);
-                let (frame_rect, content_rect, border) = if structural.is_none()
-                    && mode_tier.is_some()
-                {
+                // CTX-1088: durable fixed-size constraint. Fixed wins over
+                // pseudo (checked first); structural overlays keep their
+                // explicit bounds (like pseudo, fixed ignores them).
+                let fixed = if structural.is_none() {
+                    scene
+                        .find_leaf(view)
+                        .and_then(|leaf| leaf.fixed_size())
+                        .filter(|size| size.width > 0 && size.height > 0)
+                } else {
+                    None
+                };
+                // Tiled fit precomputed outside the condition (clippy
+                // blocks-in-conditions): whether the fixed grid fits the
+                // decorated slot grid.
+                let fixed_fits_tiled = match fixed {
+                    Some(fixed_size) if mode_tier.is_none() => {
+                        let slot_cols = (u32::from(dv.content.width) / cw.max(1)).min(65535) as u16;
+                        let slot_rows =
+                            (u32::from(dv.content.height) / ch.max(1)).min(65535) as u16;
+                        slot_cols >= fixed_size.width && slot_rows >= fixed_size.height
+                    }
+                    _ => false,
+                };
+                let (frame_rect, content_rect, border) = if let Some(fixed_size) = fixed {
+                    if mode_tier.is_some() {
+                        // Fixed floating: center the fixed grid in the
+                        // container area, clamped in-container (overlap with
+                        // base is allowed for floats; overflow past the
+                        // container is not). Larger-than-area stays durable
+                        // with a clipped window; the grid still owns PTY
+                        // size through the frame dims below.
+                        let pref_w =
+                            (u32::from(fixed_size.width).saturating_mul(cw)).min(65535) as u16;
+                        let pref_h =
+                            (u32::from(fixed_size.height).saturating_mul(ch)).min(65535) as u16;
+                        let fw = pref_w.min(area.width);
+                        let fh = pref_h.min(area.height);
+                        let fx = area.x.saturating_add(area.width.saturating_sub(fw) / 2);
+                        let fy = area.y.saturating_add(area.height.saturating_sub(fh) / 2);
+                        let frame_fixed = UiRect::new(fx, fy, fw, fh);
+                        let border = dv
+                            .border
+                            .saturating_add(bitty_ui::presentation::FLOAT_BORDER_EXTRA);
+                        let inset_x = dv
+                            .content
+                            .x
+                            .saturating_sub(dv.frame.x)
+                            .saturating_add(bitty_ui::presentation::FLOAT_BORDER_EXTRA)
+                            .min(frame_fixed.width);
+                        let inset_y = dv
+                            .content
+                            .y
+                            .saturating_sub(dv.frame.y)
+                            .saturating_add(bitty_ui::presentation::FLOAT_BORDER_EXTRA)
+                            .min(frame_fixed.height);
+                        let content_fixed = UiRect::new(
+                            frame_fixed.x.saturating_add(inset_x),
+                            frame_fixed.y.saturating_add(inset_y),
+                            frame_fixed.width.saturating_sub(inset_x.saturating_mul(2)),
+                            frame_fixed.height.saturating_sub(inset_y.saturating_mul(2)),
+                        );
+                        (frame_fixed, content_fixed, border)
+                    } else if fixed_fits_tiled {
+                        // Fixed tiled that fits: center like pseudo; the
+                        // gutter stays window background, never overlapping
+                        // neighbours (frame stays the slot).
+                        let pref_w =
+                            (u32::from(fixed_size.width).saturating_mul(cw)).min(65535) as u16;
+                        let pref_h =
+                            (u32::from(fixed_size.height).saturating_mul(ch)).min(65535) as u16;
+                        let dx = dv.content.width.saturating_sub(pref_w) / 2;
+                        let dy = dv.content.height.saturating_sub(pref_h) / 2;
+                        let content_fixed = UiRect::new(
+                            dv.content.x.saturating_add(dx),
+                            dv.content.y.saturating_add(dy),
+                            pref_w.min(dv.content.width),
+                            pref_h.min(dv.content.height),
+                        );
+                        (dv.frame, content_fixed, dv.border)
+                    } else {
+                        // Fixed tiled larger than the slot: stay durable
+                        // with a clipped slot window (frame stays the slot
+                        // so neighbours never move); the grid paints through
+                        // the cursor-follow window, exactly like the
+                        // deferred grid-resize reflow the viewport snapshot
+                        // already bridges.
+                        (dv.frame, dv.content, dv.border)
+                    }
+                } else if structural.is_none() && mode_tier.is_some() {
                     let float_rect = bitty_ui::presentation::float_frame(dv.frame, area);
                     // Elevated float chrome: one extra border px so the
                     // float reads distinct from tiled base; the content
@@ -920,6 +1006,23 @@ impl Runtime {
                     }
                     (dv.frame, content, dv.border)
                 };
+                // CTX-1088: fixed views own their grid dims even when the
+                // painted content is a clipped window (larger-than-slot) or
+                // a border-inset float; content-derived dims would shrink
+                // the grid back to the solver frame and drop durability.
+                // The viewport snapshot bridges grid-vs-frame mismatch with
+                // cursor-follow windowing and erased padding, so this stays
+                // presentation-safe.
+                let (cols, rows) = match fixed {
+                    Some(size) => (
+                        u32::from(size.width).clamp(1, max_dim) as u16,
+                        u32::from(size.height).clamp(1, max_dim) as u16,
+                    ),
+                    None => (
+                        (u32::from(content_rect.width) / cw).clamp(1, max_dim) as u16,
+                        (u32::from(content_rect.height) / ch).clamp(1, max_dim) as u16,
+                    ),
+                };
                 PresentFrame {
                     view,
                     frame: bitty_render::geometry::RectPx::new(
@@ -934,8 +1037,8 @@ impl Runtime {
                         u32::from(content_rect.width),
                         u32::from(content_rect.height),
                     ),
-                    cols: (u32::from(content_rect.width) / cw).clamp(1, max_dim) as u16,
-                    rows: (u32::from(content_rect.height) / ch).clamp(1, max_dim) as u16,
+                    cols,
+                    rows,
                     border,
                     radius: dv.radius,
                     tier,
@@ -2013,9 +2116,50 @@ impl Runtime {
     /// Replaces the declarative panel spawn rules.
     ///
     /// Validated rules only; invalid entries must have failed closed at
-    /// config validation. Empty clears all rules.
+    /// config validation. Empty clears all rules. Rule edits affect future
+    /// spawns only: views already stamped with a durable fixed size keep
+    /// it until cleared per-view (clearing returns to solver ownership on
+    /// the next sync).
     pub fn set_panel_spawn_rules(&mut self, rules: Vec<bitty_config::panel_rules::PanelSpawnRule>) {
         self.panel_spawn_rules = rules;
+    }
+
+    /// Stamps a matched rule's `width`/`height` as a durable per-view
+    /// fixed-size constraint (CTX-1088).
+    ///
+    /// Missing axes fall back to the spawn dims (matching the PTY sizing
+    /// above); degenerate or oversize inputs fail closed to solver
+    /// ownership (nothing stamped). Stamps the active layout, every
+    /// stashed workspace layout, and the pinned store so the constraint
+    /// survives workspace moves and unpin anchors. No-op when the rule
+    /// carries no dims.
+    pub(super) fn stamp_rule_fixed_size(
+        &mut self,
+        view: ViewId,
+        rule: &bitty_config::panel_rules::PanelSpawnRule,
+        fallback_cols: u16,
+        fallback_rows: u16,
+    ) {
+        if rule.width.is_none() && rule.height.is_none() {
+            return;
+        }
+        let cols = rule.width.unwrap_or(fallback_cols).max(1);
+        let rows = rule.height.unwrap_or(fallback_rows).max(1);
+        if cols > bitty_ui::view::MAX_FIXED_SIZE_DIM || rows > bitty_ui::view::MAX_FIXED_SIZE_DIM {
+            return;
+        }
+        let size = bitty_ui::Size::new(cols, rows);
+        if let Some(leaf) = self.layout.find_leaf_mut(view) {
+            leaf.set_fixed_size(Some(size));
+        }
+        for slot in &mut self.workspaces {
+            if let Some(leaf) = slot.layout.find_leaf_mut(view) {
+                leaf.set_fixed_size(Some(size));
+            }
+        }
+        if let Some(stored) = self.pinned.find_mut(view) {
+            stored.set_fixed_size(Some(size));
+        }
     }
 
     /// Placement for the fresh pane in an adaptive split (`NewPanel`):

@@ -602,11 +602,24 @@ impl LayoutNode {
     /// Gap-aware reflow (CTX-0177): like [`Self::reflow`] but allocates with
     /// [`Self::layout_with_gaps`], so leaf origins/sizes already exclude the
     /// gap bands. With [`Gaps::ZERO`] this is identical to [`Self::reflow`].
+    ///
+    /// CTX-1088: the solver owns steady-state geometry EXCEPT leaves
+    /// carrying a durable fixed-size constraint — those are allotted their
+    /// exact pinned size (origin still tracks the slot so moves stay
+    /// coherent; the present path later centers the fixed content).
+    /// Allocations from [`Self::layout_with_gaps`] stay byte-identical
+    /// regardless (slot preserved for restore); only the stored leaf size
+    /// is owned by the flag instead of the slot.
     pub fn reflow_with_gaps(&mut self, container: Rect, gaps: Gaps) {
         let allocations = self.layout_with_gaps(container, gaps);
         for (id, rect) in allocations {
             if let Some(view) = self.find_leaf_mut(id) {
-                view.reflow_to_rect(rect);
+                if let Some(fixed) = view.fixed_size() {
+                    view.set_origin(Point::new(rect.x, rect.y));
+                    view.resize(usize::from(fixed.width), usize::from(fixed.height));
+                } else {
+                    view.reflow_to_rect(rect);
+                }
             }
         }
     }
@@ -1674,6 +1687,31 @@ mod tests {
         assert_eq!(v2.cols(), 50);
         assert_eq!(v1.origin().x, 0);
         assert_eq!(v2.origin().x, 50);
+    }
+
+    #[test]
+    fn reflow_preserves_fixed_size_but_tracks_origin() {
+        use crate::geometry::Size;
+        let mut fixed_leaf = view(1, 80, 24);
+        fixed_leaf.set_fixed_size(Some(Size::new(40, 12)));
+        let mut root = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(fixed_leaf),
+            LayoutNode::leaf(view(2, 80, 24)),
+        );
+        let bounds = Rect::new(0, 0, 100, 50);
+        root.reflow(bounds);
+        // Solver allocations stay byte-identical (slot preserved).
+        let alloc = root.layout(bounds);
+        assert_eq!(alloc[0].1, Rect::new(0, 0, 50, 50));
+        // The fixed leaf keeps its pinned size while its origin still
+        // tracks the slot; the solver-owned sibling follows the slot.
+        let v1 = root.find_leaf(ViewId::new(1)).unwrap();
+        let v2 = root.find_leaf(ViewId::new(2)).unwrap();
+        assert_eq!((v1.cols(), v1.rows()), (40, 12));
+        assert_eq!(v1.origin().x, 0);
+        assert_eq!((v2.cols(), v2.rows()), (50, 50));
     }
 
     #[test]

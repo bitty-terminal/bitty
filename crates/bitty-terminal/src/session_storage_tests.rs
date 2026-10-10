@@ -1544,7 +1544,10 @@ fn old_v2_file_loads_with_empty_pinned_store() {
 }
 
 /// Snapshot shared by the pinned-respawn tests: two layout leaves plus
-/// one attached pinned entry carrying history.
+/// one attached pinned entry carrying history. Unix-gated like its only
+/// callers (live-spawn respawn tests); without the gate the helper is
+/// dead on Windows and fails the deny-warnings build.
+#[cfg(unix)]
 fn respawn_snapshot() -> SessionSnapshot {
     SessionSnapshot {
         version: SESSION_FORMAT_VERSION,

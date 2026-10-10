@@ -49,8 +49,7 @@
 //! suppression (see [`Runtime::answer_kitty_query`]); queries without
 //! `i=`/`I=` stay silent like kitty's `REPORT_ERROR`-with-no-reply.
 //!
-//! Still deferred (blocked, recorded in the PR body): `a=p` virtual
-//! (`U=1`) store bookkeeping beyond the grid-cell runs, animation
+//! Still deferred (blocked, recorded in the PR body): animation
 //! (`a=f`/`a=a`/`a=c`), local mediums (`t=f`/`t=t`/`t=s`
 //! file reads), the raster cache, and
 //! cursor-on-top compositing.//!
@@ -67,12 +66,16 @@
 //! combining diacritics, decoded headlessly via
 //! [`bitty_term_state::kitty_unicode`] (`State::kitty_unicode_run_at`,
 //! `State::kitty_unicode_runs_on_row`) and sized via
-//! [`bitty_rich::kitty_unicode`] (`unicode_run_rect`). This module adds
-//! the runtime delete seam: [`Runtime::kitty_unicode_delete`] clears the
-//! named runs' grid cells ([`bitty_term_state::State::kitty_unicode_clear`]),
-//! so `a=d,d=i[,p=]` has deterministic grid-text semantics. Stored-image
-//! and placement-layer bookkeeping for the `U=1` virtual prototype itself
-//! stays follow-up work (recorded in the PR body).
+//! [`bitty_rich::kitty_unicode`] (`unicode_run_rect`). This module owns
+//! the runtime `U=1` bookkeeping (S4, #1849): the combined `a=T,U=1`
+//! form decodes, stores, and registers a prototype in the rich registry
+//! ([`Runtime::kitty_display_virtual_owned_with_wire`], skipping blit
+//! placement and cursor advance — the image paints via grid runs, never
+//! as a blit), the bodiless `a=p,U=1` form registers through the PTY
+//! loop, and the delete seam ([`Runtime::kitty_unicode_delete`] clears
+//! the named runs' grid cells alongside the rich prototype, see
+//! [`bitty_term_state::State::kitty_unicode_clear`]), so `a=d,d=i[,p=]`
+//! has deterministic two-layer semantics.
 
 use super::*;
 
@@ -126,6 +129,13 @@ pub enum KittyDisplayOutcome {
         /// Handle of the stored image.
         image: bitty_rich::KittyImageId,
     },
+    /// Virtual prototype (`U=1`): decoded, stored, and registered in the
+    /// rich prototype registry — never placed as a blit, cursor unmoved.
+    /// The image paints via grid `U+10EEEE` runs (double-paint rule).
+    VirtualPrototype {
+        /// Handle of the stored image.
+        image: bitty_rich::KittyImageId,
+    },
 }
 
 impl Runtime {
@@ -139,6 +149,13 @@ impl Runtime {
     #[must_use]
     pub fn kitty_placement_count(&self) -> usize {
         self.kitty_images.placement_len()
+    }
+
+    /// Number of registered `U=1` virtual prototypes (S4, #1849,
+    /// headless-observable).
+    #[must_use]
+    pub fn kitty_virtual_count(&self) -> usize {
+        self.kitty_images.virtual_len()
     }
 
     /// Image blits composited on the last presented frame (CTX-0252 F2).
@@ -590,6 +607,91 @@ impl Runtime {
         })
     }
 
+    /// Decodes, stores and registers a `U=1` virtual prototype with owned
+    /// payload (S4, #1849).
+    ///
+    /// Combined transmit-and-register form (`a=T` or absent action with
+    /// `U=1` plus payload): the bytes decode and store under the
+    /// per-origin store quotas like any transmit, then the prototype
+    /// registers in the rich registry (wire `i=`/`p=`, explicit `c=`/`r=`,
+    /// decoded dims, current scrollback base) instead of anchoring a blit
+    /// placement — the image paints via grid `U+10EEEE` runs, never as a
+    /// blit (double-paint rule), and the cursor never advances (terminal
+    /// truth moves no cursor for virtual prototypes either). Alternate
+    /// screen stores without registering
+    /// ([`KittyDisplayOutcome::SuppressedAlternateScreen`]).
+    ///
+    /// Prototype registration mirrors terminal-truth admission
+    /// (`bitty-term-state` `kitty_place`): a virtual prototype cannot hang
+    /// off a parent, and headless sizing needs an explicit span. Refused
+    /// prototypes still store their bytes (inert under the store quotas,
+    /// as documented at the headless seam) and report
+    /// [`KittyDisplayOutcome::Stored`].
+    ///
+    /// Quota preflight runs before decoding/storing (S5 atomicity): a
+    /// refusal stores nothing and never discards FIFO-evicted images. No
+    /// full redraw is forced: registration changes no pixels (runs paint
+    /// through their own grid damage when printed).
+    ///
+    /// # Errors
+    ///
+    /// Same taxonomy as [`Runtime::kitty_transmit_image_owned`], plus
+    /// [`KittyImageError::Placement`] on prototype-quota refusal.
+    /// Failures store nothing, register nothing, and place nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kitty_display_virtual_owned_with_wire(
+        &mut self,
+        format_f: u32,
+        width_s: Option<u32>,
+        height_v: Option<u32>,
+        cols_c: u16,
+        rows_r: u16,
+        payload: Box<[u8]>,
+        wire_image: u32,
+        wire_placement: u32,
+        has_parent: bool,
+    ) -> Result<KittyDisplayOutcome, KittyImageError> {
+        // Atomic virtual transmit (S5, #1849): preflight prototype
+        // admission before decoding/storing, so a quota refusal stores
+        // nothing and never discards FIFO-evicted images (a post-store
+        // rollback could not restore evictions).
+        self.kitty_images
+            .check_virtual_quota_for_origin(self.kitty_origin)
+            .map_err(KittyImageError::Placement)?;
+        let compressed_len = payload.len();
+        let image =
+            self.kitty_transmit_image_owned(format_f, width_s, height_v, payload, compressed_len)?;
+        if self.state.alt_screen_active() {
+            return Ok(KittyDisplayOutcome::SuppressedAlternateScreen { image });
+        }
+        if has_parent || (cols_c == 0 && rows_r == 0) {
+            return Ok(KittyDisplayOutcome::Stored { image });
+        }
+        let origin = self.kitty_origin;
+        let base = self.state.scrollback_len();
+        let (width, height) = {
+            let stored = self
+                .kitty_images
+                .get(image)
+                .expect("image just stored must exist");
+            (stored.width, stored.height)
+        };
+        self.kitty_images
+            .register_virtual_for_origin(
+                origin,
+                wire_image,
+                wire_placement,
+                Some(image),
+                cols_c,
+                rows_r,
+                width,
+                height,
+                base,
+            )
+            .map_err(KittyImageError::Placement)?;
+        Ok(KittyDisplayOutcome::VirtualPrototype { image })
+    }
+
     /// Deletes rendered placements by origin-scoped wire identity.
     ///
     /// Origin-scoped counterpart to the terminal-truth `a=d,d=i` delete:
@@ -812,20 +914,25 @@ impl Runtime {
     /// store: only the draining stream's origin (`self.kitty_origin`)
     /// answers `held`, so one pane's images never leak into another pane's
     /// status. Placements whose image was evicted fail closed (`false`,
-    /// like dangling lookups at paint time). Bounded scan over the
-    /// capped placement deque; no allocation.
+    /// like dangling lookups at paint time). S4 (#1849): registered
+    /// virtual prototypes answer held in the same spec shape — runs paint
+    /// from the registry, not from blits. Bounded scan over the
+    /// capped placement deque plus the bounded prototype registry; no
+    /// allocation.
     fn kitty_status_held(&self, image_id: u32, placement: Option<u32>) -> bool {
         if image_id == 0 {
             return false;
         }
-        let Some(hit) = self.kitty_images.placements().find(|entry| {
+        if let Some(hit) = self.kitty_images.placements().find(|entry| {
             entry.origin == self.kitty_origin
                 && entry.wire_image == image_id
                 && placement.is_none_or(|pin| entry.wire_placement == pin)
-        }) else {
-            return false;
-        };
-        self.kitty_images.get(hit.image).is_some()
+        }) {
+            return self.kitty_images.get(hit.image).is_some();
+        }
+        self.kitty_images
+            .get_virtual(self.kitty_origin, image_id, placement)
+            .is_some()
     }
 
     /// Whether a support-probe payload would be admittable for this origin
@@ -882,5 +989,51 @@ impl Runtime {
         row: usize,
     ) -> Vec<bitty_term_state::KittyUnicodeRunCells> {
         self.state.kitty_unicode_runs_on_row(row)
+    }
+
+    /// Resolved run rectangles for one grid row (S4, #1849).
+    ///
+    /// Headless-observable two-layer link: each live-grid run on `row`
+    /// resolves against the oldest matching virtual prototype of the
+    /// drained stream's origin
+    /// ([`bitty_rich::KittyImageLayer::virtual_run_rect`]). Runs naming
+    /// unregistered images resolve to nothing (the cells stay text).
+    /// `metrics` is the caller-supplied cell size (headless,
+    /// deterministic). Each run passes its prototype's own
+    /// `scrollback_base` as the scroll delta base: live-grid rows are
+    /// already scrolled truth, so the delta cancels and the rect lands on
+    /// the run's current cells; callers holding print-time-anchored runs
+    /// use the layer directly with the current scrollback instead.
+    #[must_use]
+    pub fn kitty_unicode_run_rects_on_row(
+        &self,
+        row: usize,
+        metrics: bitty_rich::CellMetrics,
+    ) -> Vec<bitty_rich::KittyUnicodeRect> {
+        let origin = self.kitty_origin;
+        self.state
+            .kitty_unicode_runs_on_row(row)
+            .iter()
+            .filter_map(|(cells, key)| {
+                let first = cells.first()?;
+                let proto = self.kitty_images.get_virtual(origin, key.0, key.1)?;
+                let run = bitty_term_state::KittyUnicodeRun {
+                    image_id: key.0,
+                    placement_id: key.1,
+                    row: first.id.row,
+                    col: first.id.col,
+                    grid_row: first.grid_row,
+                    grid_col: first.grid_col,
+                    width: cells.len(),
+                };
+                self.kitty_images.virtual_run_rect(
+                    origin,
+                    &run,
+                    cells,
+                    metrics,
+                    proto.scrollback_base,
+                )
+            })
+            .collect()
     }
 }

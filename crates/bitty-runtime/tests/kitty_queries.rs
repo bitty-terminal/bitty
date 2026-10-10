@@ -266,3 +266,31 @@ fn query_probe_refuses_when_store_full() {
     );
     assert_eq!(rt.kitty_image_count(), 64, "probes store nothing");
 }
+
+#[test]
+fn query_virtual_prototype_status_ok_replies_exact() {
+    // S4 (#1849, CTX-1101): payload-less status lookups of virtual ids
+    // reuse the S2 shape — a registered prototype answers held/OK with
+    // the `;` separator, and deleting it answers `ENOENT`.
+    let mut rt = make_runtime();
+    rt.handle_pty_bytes(b"\x1b_Ga=p,U=1,i=42,c=4,r=2\x1b\\");
+    rt.handle_pty_bytes(b"\x1b_Ga=p,U=1,i=42,p=9,c=4,r=2\x1b\\");
+    assert_eq!(rt.kitty_virtual_count(), 2);
+    rt.take_replies();
+    rt.handle_pty_bytes(b"\x1b_Gf=32,a=q,i=42;\x1b\\");
+    assert_eq!(replies(&mut rt), vec![b"\x1b_Gi=42;OK\x1b\\".to_vec()]);
+    rt.handle_pty_bytes(b"\x1b_Gf=32,a=q,i=42,p=9;\x1b\\");
+    assert_eq!(replies(&mut rt), vec![b"\x1b_Gi=42,p=9;OK\x1b\\".to_vec()]);
+    rt.handle_pty_bytes(b"\x1b_Gf=32,a=q,i=42,p=8;\x1b\\");
+    assert_eq!(
+        replies(&mut rt),
+        vec![b"\x1b_Gi=42,p=8;ENOENT:not held\x1b\\".to_vec()]
+    );
+    rt.handle_pty_bytes(b"\x1b_Ga=d,d=i,i=42\x1b\\");
+    assert_eq!(rt.kitty_virtual_count(), 0);
+    rt.handle_pty_bytes(b"\x1b_Gf=32,a=q,i=42;\x1b\\");
+    assert_eq!(
+        replies(&mut rt),
+        vec![b"\x1b_Gi=42;ENOENT:not held\x1b\\".to_vec()]
+    );
+}

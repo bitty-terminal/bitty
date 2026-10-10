@@ -1627,7 +1627,17 @@ impl TerminalApp {
                 // that is already pinned lives outside the live layout, so it
                 // skips the mode check and unpins. For a valid toggle, zoom
                 // restores next so the mutation lands on the real tree, not
-                // the zoom proxy. No focused pane warns and keeps everything.
+                // the zoom proxy — except when the backed-up tree holds a
+                // single leaf (CodeRabbit PR #1903): pinning there refuses
+                // (`StrandedLayout`), so restoring first would consume the
+                // zoom backup behind a refused action. Skipping the restore
+                // on `Some(1)` keeps a refused toggle byte-identical (zoom,
+                // layout, focus); unpin never refuses on leaf count, and an
+                // unpin landing in the proxy is covered by the stale-backup
+                // discipline on disengage. (`ToggleFloating` keeps the plain
+                // restore: its post-restore mode flip has no leaf-count
+                // refusal, the mode already validated above.) No focused pane
+                // warns and keeps everything.
                 let focused = match self.runtime.focused_view() {
                     Some(id) => id,
                     None => {
@@ -1655,7 +1665,9 @@ impl TerminalApp {
                         return false;
                     }
                 }
-                self.restore_zoom();
+                if self.chrome.zoom.backup_leaf_count(&self.runtime) != Some(1) {
+                    self.restore_zoom();
+                }
                 match self
                     .runtime
                     .apply_pin_command(bitty_runtime::PIN_CMD_TOGGLE, Some(focused))
@@ -4113,6 +4125,71 @@ mod tests {
         assert!(app.runtime.pinned_views().is_empty());
         assert_eq!(format!("{:?}", app.runtime.layout()), before);
         assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+    }
+
+    #[test]
+    fn chrome_toggle_pinned_keeps_zoom_on_refused_sole_leaf_pin() {
+        // CodeRabbit PR #1903: a zoomed single-leaf workspace refuses the pin
+        // (it would strand an empty live layout). The refusal must leave zoom
+        // state untouched: still zoomed, backup intact, layout byte-identical.
+        use bitty_config::ChromeAction;
+        let mut app = workspace_test_app();
+        app.runtime
+            .set_layout(LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)));
+        assert!(app.runtime.set_focus(ViewId::new(1)));
+        app.apply_chrome_action(ChromeAction::ToggleZoom);
+        assert!(app.chrome.zoom.is_zoomed(&app.runtime), "zoom engaged");
+        assert_eq!(
+            app.chrome.zoom.backup_leaf_count(&app.runtime),
+            Some(1),
+            "backed-up tree holds the sole leaf"
+        );
+        let before = format!("{:?}", app.runtime.layout());
+        app.apply_chrome_action(ChromeAction::TogglePinned);
+        assert!(
+            app.runtime.pinned_views().is_empty(),
+            "refused pin parks nothing"
+        );
+        assert!(
+            app.chrome.zoom.is_zoomed(&app.runtime),
+            "refusal keeps the zoom backup"
+        );
+        assert_eq!(
+            app.chrome.zoom.backup_leaf_count(&app.runtime),
+            Some(1),
+            "refusal keeps the backed-up leaf count"
+        );
+        assert_eq!(
+            format!("{:?}", app.runtime.layout()),
+            before,
+            "refusal keeps the layout byte-identical"
+        );
+        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+    }
+
+    #[test]
+    fn chrome_toggle_pinned_restores_zoom_for_multi_leaf_pin() {
+        // Companion to the sole-leaf refusal above: with 2+ backed-up leaves
+        // the restore still runs, so the pin lands on the real tree and the
+        // zoom backup is consumed.
+        use bitty_config::ChromeAction;
+        let mut app = workspace_test_app();
+        app.runtime.set_layout(two_pane_layout());
+        assert!(app.runtime.set_focus(ViewId::new(1)));
+        app.apply_chrome_action(ChromeAction::ToggleZoom);
+        assert!(app.chrome.zoom.is_zoomed(&app.runtime), "zoom engaged");
+        assert_eq!(
+            app.chrome.zoom.backup_leaf_count(&app.runtime),
+            Some(2),
+            "backed-up tree holds both leaves"
+        );
+        app.apply_chrome_action(ChromeAction::TogglePinned);
+        assert!(
+            !app.chrome.zoom.is_zoomed(&app.runtime),
+            "valid pin consumes the zoom restore"
+        );
+        assert_eq!(app.runtime.pinned_views(), vec![ViewId::new(1)]);
+        assert_eq!(app.runtime.layout().leaf_ids(), vec![ViewId::new(2)]);
     }
 
     #[test]

@@ -22,6 +22,12 @@ pub(super) fn default_container(cols: usize, rows: usize) -> UiRect {
 /// Bound on the hovered-URL preview text (issue #1759, R-005 anti-spoofing).
 pub const HYPERLINK_PREVIEW_MAX_CHARS: usize = 96;
 
+/// Pinned-float cascade step in cells per pin depth (issue #1757, CodeRabbit
+/// 1883): stacked pins offset so each stays visible and clickable instead of
+/// fully covering the earlier pins.
+pub(crate) const PIN_CASCADE_DX: u16 = 3;
+pub(crate) const PIN_CASCADE_DY: u16 = 2;
+
 /// OSC 8 hyperlink span under the pointer (issue #1759, R-005 hover state).
 ///
 /// Presentation-only: the owner-grid span backing the pointer cursor, the
@@ -660,13 +666,75 @@ impl Runtime {
             u16::try_from(ch).unwrap_or(u16::MAX),
         );
         let max_dim = u32::try_from(bitty_term_state::MAX_GRID_DIM).unwrap_or(u32::MAX);
+        // CTX-1077 (#1757): composite the window-global pinned store over
+        // the active layout for this present pass only. Pinned leaves ride
+        // `Float`-tier layers with anchored float bounds, so the tier,
+        // geometry, paint-order, and pointer paths below treat them exactly
+        // like mode-floating leaves (painted after same-tier floats in
+        // stable pin order, topmost hit first). Slot state is untouched:
+        // stash/load keep working on the base layout, and the same leaf
+        // never lives in two trees at once (a pinned id already present in
+        // the base layout is skipped defensively).
+        let scene: LayoutNode;
+        let scene = if self.pinned.is_empty() {
+            &self.layout
+        } else {
+            let base_ids = self.layout.leaf_ids();
+            let layers: Vec<bitty_ui::OverlayLayer> = self
+                .pinned
+                .ids()
+                .into_iter()
+                .filter(|id| !base_ids.contains(id))
+                .enumerate()
+                .filter_map(|(depth, id)| {
+                    let view = self.pinned.get(id)?.clone();
+                    // Anchored (not free) geometry, matching the mode-float
+                    // contract: `float_frame` ignores its first argument and
+                    // centers ~80% of the container. Overlay bounds are
+                    // authored in cells (the decorated solver scales them by
+                    // the live cell size), so frame the cell container here
+                    // rather than the pixel area above.
+                    let base = bitty_ui::presentation::float_frame(UiRect::zero(), self.container);
+                    // CodeRabbit 1883: cascade stacked pins so each one
+                    // stays visible and clickable instead of fully covering
+                    // the earlier pins. Offset grows with pin depth and is
+                    // clamped to the container (degenerate containers pin
+                    // at the container origin).
+                    let step = u16::try_from(depth).unwrap_or(u16::MAX);
+                    let max_x = self
+                        .container
+                        .x
+                        .saturating_add(self.container.width.saturating_sub(base.width));
+                    let max_y = self
+                        .container
+                        .y
+                        .saturating_add(self.container.height.saturating_sub(base.height));
+                    let bounds = UiRect::new(
+                        base.x
+                            .saturating_add(PIN_CASCADE_DX.saturating_mul(step))
+                            .min(max_x),
+                        base.y
+                            .saturating_add(PIN_CASCADE_DY.saturating_mul(step))
+                            .min(max_y),
+                        base.width,
+                        base.height,
+                    );
+                    Some(bitty_ui::OverlayLayer::new(
+                        OverlayTier::Float,
+                        LayoutNode::leaf(view),
+                        bounds,
+                    ))
+                })
+                .collect();
+            scene = LayoutNode::overlay_stack(self.layout.clone(), layers);
+            &scene
+        };
         // CW-12: per-leaf paint tiers from the tiered overlay primitives.
         // Keyed by `ViewId` (not zipped) so the tier map cannot drift from
         // the decorated solver when either walk changes.
         let tiers: std::collections::HashMap<ViewId, Option<OverlayTier>> =
-            self.layout.leaf_overlay_tiers().into_iter().collect();
-        let mut frames: Vec<PresentFrame> = self
-            .layout
+            scene.leaf_overlay_tiers().into_iter().collect();
+        let mut frames: Vec<PresentFrame> = scene
             .layout_with_decoration_scaled(
                 area,
                 self.config.decoration,
@@ -683,8 +751,7 @@ impl Runtime {
                 // still ignores the mode (slot restore stays byte-identical);
                 // only the present tier and geometry lift.
                 let structural = tiers.get(&view).copied().flatten();
-                let mode_tier = self
-                    .layout
+                let mode_tier = scene
                     .find_leaf(view)
                     .and_then(|leaf| leaf.presentation().overlay_tier());
                 let tier = structural.or(mode_tier);
@@ -770,6 +837,16 @@ impl Runtime {
             let y = (frame.content.y.max(0) as u32) / ch;
             if let Some(view) = self.layout.find_leaf_mut(frame.view) {
                 view.reflow_to_rect(UiRect::new(
+                    x.min(u32::from(u16::MAX)) as u16,
+                    y.min(u32::from(u16::MAX)) as u16,
+                    frame.cols,
+                    frame.rows,
+                ));
+            } else if let Some(stored) = self.pinned.find_mut(frame.view) {
+                // CTX-1077: the frame belongs to a pinned leaf composited
+                // over the scene; keep its stored dims fresh the same way
+                // so unpin and session capture see live geometry.
+                stored.reflow_to_rect(UiRect::new(
                     x.min(u32::from(u16::MAX)) as u16,
                     y.min(u32::from(u16::MAX)) as u16,
                     frame.cols,
@@ -1575,7 +1652,10 @@ impl Runtime {
         // CTX-0334: an explicit focus set abandons any pending hover dwell,
         // so hover activation can never override a deliberate choice.
         self.clear_hover_pending();
-        if self.layout.leaf_ids().contains(&id) {
+        // CTX-1077: a pinned leaf composited over the scene is a valid focus
+        // target even though it lives outside the live layout; its session
+        // stays keyed globally by `ViewId`, so input routes to it unchanged.
+        if self.layout.leaf_ids().contains(&id) || self.pinned.contains(id) {
             // Only dirty when the focus actually moves; re-selecting the
             // focused pane is a no-op present-wise.
             if self.focus.focused() != Some(id) {

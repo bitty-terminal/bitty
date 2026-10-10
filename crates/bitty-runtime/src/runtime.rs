@@ -106,8 +106,8 @@ use bitty_term_state::search::{SearchMatch, SearchOptions};
 use bitty_term_state::{Damage, DamageRect, DamagedRegion, Snapshot, State, TerminalAction};
 use bitty_ui::{
     CellPos, Focus, FocusDirection, Gaps, LayoutNode, OverlayTier, PersistentSelection,
-    Rect as UiRect, ScratchpadSlot, SearchHighlight, Selection, SelectionKind, View, ViewId,
-    search::SearchState,
+    PinnedStore, Rect as UiRect, ScratchpadSlot, SearchHighlight, Selection, SelectionKind, View,
+    ViewId, search::SearchState,
 };
 use bitty_vt::{
     BoundedString, ClipboardOp, DynamicColorOp, DynamicColorTarget, Notification,
@@ -523,6 +523,14 @@ pub struct Runtime {
     /// — a workspace close may have re-homed it elsewhere since. `None`
     /// while the slot is empty or the parked leaf never owned the shell.
     scratchpad_primary_owner: Option<(ViewId, Option<ViewId>)>,
+    /// Window-global pinned floating panels (CTX-1077, issue #1757).
+    ///
+    /// Holds every pinned leaf detached from the live layout; pinned leaves
+    /// never enter the layout solver and survive workspace switches. The
+    /// present path composites them over the active scene at
+    /// [`OverlayTier::Float`](bitty_ui::OverlayTier::Float), painted after
+    /// same-tier mode-floating leaves in stable pin order.
+    pinned: PinnedStore,
     /// Monotonic high-water mark of every [`ViewId`] ever installed in a
     /// layout (CTX-0536, issue #923).
     ///
@@ -1590,6 +1598,7 @@ impl Runtime {
             workspace_mru: std::collections::VecDeque::new(),
             scratchpad: ScratchpadSlot::new(),
             scratchpad_primary_owner: None,
+            pinned: PinnedStore::new(),
             view_id_high_water: 0,
             session_pending: BTreeMap::new(),
             session_primary_cwd: None,
@@ -1834,6 +1843,7 @@ impl Runtime {
             workspace_mru: std::collections::VecDeque::new(),
             scratchpad: ScratchpadSlot::new(),
             scratchpad_primary_owner: None,
+            pinned: PinnedStore::new(),
             view_id_high_water: 0,
             session_pending: BTreeMap::new(),
             session_primary_cwd: None,

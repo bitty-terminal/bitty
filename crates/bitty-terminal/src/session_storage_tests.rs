@@ -1542,3 +1542,138 @@ fn old_v2_file_loads_with_empty_pinned_store() {
     assert_eq!(rt.layout().leaf_ids(), vec![ViewId::new(7)]);
     assert!(!rt.pinned_occupied(), "no pinned entries after a v2 load");
 }
+
+/// Snapshot shared by the pinned-respawn tests: two layout leaves plus
+/// one attached pinned entry carrying history.
+fn respawn_snapshot() -> SessionSnapshot {
+    SessionSnapshot {
+        version: SESSION_FORMAT_VERSION,
+        workspaces: vec![WorkspaceSnapshot {
+            seq: 1,
+            name: "ws1".to_string(),
+            layout: LayoutNode::split(
+                SplitAxis::Horizontal,
+                0.5,
+                LayoutNode::leaf(View::new(ViewId::new(100), 80, 24)),
+                LayoutNode::leaf(View::new(ViewId::new(101), 80, 24)),
+            ),
+            focus: Some(ViewId::new(100)),
+            panes: vec![
+                PaneSnapshot {
+                    view: ViewId::new(100),
+                    cwd: None,
+                    scrollback: vec!["owner-history".to_string()],
+                    attach: Some(PaneAttachment::Primary),
+                    route: PaneRoute::Terminal,
+                    mode: PresentationMode::Tiled,
+                },
+                PaneSnapshot {
+                    view: ViewId::new(101),
+                    cwd: None,
+                    scrollback: Vec::new(),
+                    attach: Some(PaneAttachment::Detached),
+                    route: PaneRoute::Terminal,
+                    mode: PresentationMode::Tiled,
+                },
+            ],
+        }],
+        active: 0,
+        mru: vec![0],
+        pinned: vec![PinnedSnapshot {
+            view: View::with_presentation(ViewId::new(9), 80, 24, PresentationMode::Floating),
+            cwd: None,
+            scrollback: vec!["pinned-history".to_string()],
+            attach: PaneAttachment::Session,
+            anchor: Some(ViewId::new(101)),
+            after: false,
+        }],
+    }
+}
+
+/// CTX-1082 (CodeRabbit 1897): a restored attached pin must gain a live
+/// shell at startup — staging it pending is not enough, since hydrate
+/// only restores scrollback into an existing session. Drives the real
+/// startup spawn path.
+#[test]
+#[cfg(unix)]
+fn restored_attached_pin_respawns_at_startup_with_history() {
+    use crate::spawn::{SpawnSpec, spawn_startup_pane_shells};
+
+    bitty_test_support::require_pty!();
+    let mut rt = present_runtime();
+    rt.set_container(UiRect::new(0, 0, 80, 24));
+    rt.apply_session_snapshot(&respawn_snapshot())
+        .expect("apply valid");
+    assert_eq!(rt.pinned_views(), vec![ViewId::new(9)]);
+    assert!(
+        !rt.has_pane_session(&ViewId::new(9)),
+        "no shell before startup spawn"
+    );
+
+    let spec = SpawnSpec {
+        program: Some(String::from("/bin/sh")),
+        ..Default::default()
+    };
+    let failed = spawn_startup_pane_shells(&mut rt, &spec);
+    assert_eq!(failed, 0, "pinned shell spawns");
+    assert!(
+        rt.has_pane_session(&ViewId::new(9)),
+        "restored pin has a live session after startup spawn"
+    );
+    assert!(
+        !rt.session_pending_contains(&ViewId::new(9)),
+        "pending history hydrates into the fresh grid"
+    );
+    assert_eq!(rt.pinned_views(), vec![ViewId::new(9)]);
+    assert!(
+        rt.present_frames()
+            .iter()
+            .any(|frame| frame.view == ViewId::new(9)
+                && frame.tier == Some(bitty_runtime::OverlayTier::Float)),
+        "respawned pin still composites over the scene"
+    );
+}
+
+/// CTX-1082 (CodeRabbit 1897): the deferred switch path respawns a pinned
+/// pending entry too (covering a startup spawn that failed). Drives the
+/// real workspace-switch respawn.
+#[test]
+#[cfg(unix)]
+fn restored_attached_pin_respawns_on_workspace_switch() {
+    bitty_test_support::require_pty!();
+    let mut rt = present_runtime();
+    rt.set_container(UiRect::new(0, 0, 80, 24));
+    rt.spawn_shell("/bin/sh")
+        .expect("primary shell records recipe");
+    let mut snap = respawn_snapshot();
+    snap.workspaces.push(WorkspaceSnapshot {
+        seq: 2,
+        name: "ws2".to_string(),
+        layout: LayoutNode::leaf(View::new(ViewId::new(200), 80, 24)),
+        focus: Some(ViewId::new(200)),
+        panes: vec![PaneSnapshot {
+            view: ViewId::new(200),
+            cwd: None,
+            scrollback: vec!["ws1-history".to_string()],
+            attach: Some(PaneAttachment::Session),
+            route: PaneRoute::Terminal,
+            mode: PresentationMode::Tiled,
+        }],
+    });
+    snap.mru = vec![0, 1];
+    rt.apply_session_snapshot(&snap).expect("apply valid");
+    assert!(
+        !rt.has_pane_session(&ViewId::new(9)),
+        "no shell before the switch"
+    );
+
+    assert!(rt.workspace_switch(1), "switch to ws2");
+    assert!(
+        rt.has_pane_session(&ViewId::new(9)),
+        "deferred path respawns the pinned pending entry"
+    );
+    assert!(
+        !rt.session_pending_contains(&ViewId::new(9)),
+        "pending history hydrates into the fresh grid"
+    );
+}

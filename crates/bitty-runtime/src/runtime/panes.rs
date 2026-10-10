@@ -326,8 +326,8 @@ impl Runtime {
     /// # Errors
     ///
     /// [`RuntimeError::InvalidConfig`] when `program` is blank or `view` is
-    /// not a leaf of the current layout; [`RuntimeError::Pty`] when the
-    /// platform reports spawn failure.
+    /// neither a leaf of the current layout nor a pinned panel;
+    /// [`RuntimeError::Pty`] when the platform reports spawn failure.
     pub fn spawn_shell_for_view(
         &mut self,
         view: ViewId,
@@ -411,9 +411,14 @@ impl Runtime {
                 "spawn cwd is not an existing directory",
             ));
         }
-        if !self.layout.leaf_ids().contains(&view) {
+        // CTX-1082: pinned panels are live, presented, focusable views
+        // outside every layout tree — spawning into one gives it the
+        // session its pending restore drains into (startup/deferred
+        // respawn after a session restore). Anything else is still
+        // rejected fail-closed before any spawn.
+        if !self.layout.leaf_ids().contains(&view) && !self.pinned.contains(view) {
             return Err(RuntimeError::InvalidConfig(
-                "view is not a leaf of the current layout",
+                "view is not a leaf of the current layout or the pinned store",
             ));
         }
         // CTX-0343: a pane bind turns (or keeps) the leaf at `terminal`

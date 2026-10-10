@@ -1282,23 +1282,37 @@ impl Runtime {
     /// restore and no live session gets a fresh shell replaying the primary
     /// attach recipe (startup parity with `workspace_new`), which hydrates
     /// the pending scrollback and seeds the spawn cwd from the captured
-    /// `OSC 7` report. Best-effort with loud warnings; leaves already owning
-    /// a session are untouched. No-op before any successful primary attach
-    /// (no recipe to replay) or with nothing pending.
+    /// `OSC 7` report. Restored attached pins are window-global (in no
+    /// layout) yet presented in every workspace scene, so pending ones
+    /// respawn here too — covering a startup spawn that failed, or an
+    /// apply that landed after startup. Unpinned ids rejoin the layout set
+    /// above, so no special path is needed after unpin. Best-effort with
+    /// loud warnings; leaves already owning a session are untouched. No-op
+    /// before any successful primary attach (no recipe to replay) or with
+    /// nothing pending.
     pub(super) fn spawn_session_pending_for_active(&mut self) {
         let Some((program, args)) = self.primary_spawn.clone() else {
             return;
         };
-        let targets: Vec<ViewId> = self
+        let still_pending = |view: &ViewId| {
+            self.session_pending.contains_key(view)
+                && !self.pane_sessions.contains_key(view)
+                && Some(*view) != self.primary_view
+        };
+        let mut targets: Vec<ViewId> = self
             .layout
             .leaf_ids()
             .into_iter()
-            .filter(|view| {
-                self.session_pending.contains_key(view)
-                    && !self.pane_sessions.contains_key(view)
-                    && Some(*view) != self.primary_view
-            })
+            .filter(|view| still_pending(view))
             .collect();
+        // CTX-1082: pinned ids live in no layout — keep them out of the
+        // layout filter above and cover them here, in stable pin order.
+        targets.extend(
+            self.pinned
+                .ids()
+                .into_iter()
+                .filter(|view| still_pending(view)),
+        );
         if targets.is_empty() {
             return;
         }

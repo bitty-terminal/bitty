@@ -204,10 +204,12 @@ pub(crate) fn spawn_pane_shell_in(
 }
 
 /// Spawns a private shell for every layout leaf except the focused one
-/// (CTX-0176), which keeps the already-spawned primary session. Each pane
-/// shell is sized to its leaf allocation. Best-effort: per-leaf failures
-/// warn loudly and leave that pane empty (CTX-0359: never a silent mirror
-/// of the primary grid). Call only after a successful primary spawn.
+/// (CTX-0176), which keeps the already-spawned primary session, plus every
+/// restored attached pin (CTX-1082). Each pane shell is sized to its leaf
+/// allocation; each pinned shell to its composited frame. Best-effort:
+/// per-leaf failures warn loudly and leave that pane empty (CTX-0359: never
+/// a silent mirror of another pane's grid). Call only after a successful
+/// primary spawn.
 ///
 /// Returns the number of panes whose shell failed (CTX-0481): the
 /// `--fail-loud` startup path turns any non-zero count into a non-zero
@@ -236,6 +238,37 @@ pub(crate) fn spawn_startup_pane_shells(runtime: &mut Runtime, spec: &SpawnSpec)
                 )
             });
             failed += 1;
+        }
+    }
+    // CTX-1082: restored attached pins live in no layout, so the
+    // allocation loop above never sees them — yet they composite over the
+    // active scene at startup. Respawn each pending one sized to its
+    // composited frame (present frames include pins). Fresh starts skip:
+    // the pinned store is empty then, and session-less pins carry no
+    // pending entry by design. Unpinned ids rejoin the layout loop above,
+    // so no path changes there. Pinned ids stay out of the layout filter:
+    // they are spawned here, by identity, never as layout leaves.
+    if runtime.session_restored() {
+        let frames = runtime.present_frames();
+        for id in runtime.pinned_views() {
+            if !runtime.session_pending_contains(&id) || runtime.has_pane_session(&id) {
+                continue;
+            }
+            let Some(frame) = frames.iter().find(|frame| frame.view == id) else {
+                // Degenerate container (no frames at all): the deferred
+                // switch path retries with layout-independent fallback dims.
+                continue;
+            };
+            if let Err(err) =
+                spawn_pane_shell(runtime, spec, id, frame.cols.max(1), frame.rows.max(1))
+            {
+                crate::logging::warn(|| {
+                    format!(
+                        "warning: startup pinned pane {id:?} shell spawn failed ({err}) — pane stays empty"
+                    )
+                });
+                failed += 1;
+            }
         }
     }
     failed

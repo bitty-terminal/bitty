@@ -277,7 +277,15 @@ bitty completion powershell | Out-String | Invoke-Expression
 /// paths at parse time: a `save -f` then `source` roundtrip of a just-written
 /// file cannot work on first setup — the file does not exist yet when the
 /// `source` line is parsed.
-const NUSHELL_HEADER: &str = r#"# bitty shell integration for Nushell (static; generated, do not edit).
+///
+/// The hook guard probes the session's own `$env.config.hooks.pre_prompt`
+/// for the `bitty-shell-init` marker closure below, never `$env`: `$env.*`
+/// entries are real OS environment variables, so a child `nu` inherits them
+/// while starting with a fresh `$env.config` — an env-var guard would skip
+/// registration in the child and it would emit no marks (#1856). Probing
+/// actual hook state keeps re-sourcing exactly-once per session while child
+/// sessions self-configure.
+const NUSHELL_HEADER: &str = r##"# bitty shell integration for Nushell (static; generated, do not edit).
 # Enable with: bitty shell-init nushell | save -f ~/.config/nushell/bitty-shell-init.nu
 # then add `source ~/.config/nushell/bitty-shell-init.nu` to config.nu
 # - Tab completion inlined below (same output as `bitty completion nushell`).
@@ -289,15 +297,18 @@ const NUSHELL_HEADER: &str = r#"# bitty shell integration for Nushell (static; g
 # - OSC 7 cwd is percent-encoded (RFC 3986 unreserved plus slash kept).
 #   Hostname passes through verbatim (DNS-safe, authority must match).
 #   Drive-letter colon (C:/) survives for the file URI convention.
-if "BITTY_SHELL_INIT" not-in $env {
-    $env.BITTY_SHELL_INIT = "1"
+# - Guard: this session's own hooks list is probed for the marker closure
+#   below (an $env guard would leak into child sessions via inheritance
+#   while each child starts with a fresh $env.config: #1856).
+if not (try { $env.config.hooks.pre_prompt? | default [] | any {|h| try { $h | to nuon --serialize | str contains "# bitty-shell-init" } catch { false } } } catch { false }) {
     $env.config = ($env.config | default {} hooks | upsert hooks.pre_prompt ((try { $env.config.hooks.pre_prompt } catch { [] }) ++ [{||
+        # bitty-shell-init
         print -n $"\e]133;D;($env.LAST_EXIT_CODE)\e\\"
         print -n $"\e]7;file://(sys host | get hostname)(pwd | str replace --all "\\" "/" | url encode | str replace --all ':' '%3A' | str replace --regex '^([A-Za-z])%3A/' '$1:/')\e\\"
         print -n "\e]133;A\e\\"
     }]))
 }
-"#;
+"##;
 
 /// Static shell-integration script for a shell (hooks + completion wiring).
 ///
@@ -557,8 +568,8 @@ mod tests {
             ),
             (
                 CompletionShell::Nushell,
-                r#"if "BITTY_SHELL_INIT" not-in $env"#,
-                "pre_prompt",
+                "to nuon --serialize",
+                "upsert hooks.pre_prompt",
             ),
         ];
         for (shell, guard, hook) in guards {
@@ -751,6 +762,45 @@ mod tests {
         assert!(
             script.contains(completion_script(CompletionShell::Nushell).trim()),
             "nushell init shares the bitty completion nushell output"
+        );
+    }
+
+    #[test]
+    fn nushell_guard_probes_hooks_not_env() {
+        // #1856: `$env.*` entries are real OS environment variables, so a
+        // child nu inherits the guard var while starting with a fresh
+        // `$env.config` — an env-var guard skips hook registration in the
+        // child and it emits no marks. The guard must probe the session's
+        // own hooks list for the marker closure instead.
+        let script = shell_init_script(CompletionShell::Nushell);
+        assert!(
+            !script.contains("BITTY_SHELL_INIT"),
+            "nushell init must not key hook registration on an inherited $env var"
+        );
+        assert!(
+            script.contains(r#"if not (try { $env.config.hooks.pre_prompt?"#),
+            "nushell guard probes the session's own pre_prompt hooks"
+        );
+        assert!(
+            script.contains(r##"str contains "# bitty-shell-init""##),
+            "nushell guard looks for the full marker, not the bare filename stem"
+        );
+        // Each hook is probed element-wise: a single unserializable entry
+        // (e.g. a plugin custom value, which `to nuon --serialize` rejects)
+        // must not poison the whole probe into re-registering on every
+        // re-source, nor may a probe error abort the init script (which
+        // would also drop the inlined completion below).
+        assert!(
+            script.contains("any {|h| try { $h | to nuon --serialize"),
+            "nushell guard isolates per-hook serialization failures"
+        );
+        // The marker lives inside the registered closure (header comments
+        // are not part of the hooks list, so only a closure-body marker is
+        // visible to the probe after registration).
+        let register_pos = script.find("upsert hooks.pre_prompt").unwrap_or(usize::MAX);
+        assert!(
+            register_pos < script.len() && script[register_pos..].contains("# bitty-shell-init"),
+            "nushell marker sits inside the registered hook closure"
         );
     }
 

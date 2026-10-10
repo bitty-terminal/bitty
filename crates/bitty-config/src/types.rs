@@ -4587,8 +4587,16 @@ mod tests {
             WindowConfig::default().resolve_background_position(),
             BackgroundPosition::Center
         );
+        // Portable absolute fixture: `/wall/...` is not absolute on
+        // Windows (`Path::is_absolute` needs a drive/UNC prefix there), so
+        // build it from `temp_dir()` which is absolute on every host.
+        let abs_wall = std::env::temp_dir()
+            .join("wall")
+            .join("one.png")
+            .display()
+            .to_string();
         WindowConfig {
-            background_image: Some("/wall/one.png".to_string()),
+            background_image: Some(abs_wall),
             background_fit: Some(BackgroundFit::Tile),
             background_opacity: Some(0.5),
             background_position: Some(BackgroundPosition::TopLeft),

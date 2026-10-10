@@ -840,7 +840,12 @@ mod tests {
         all.window.opacity = 0.5;
         all.window.padding = base.window.padding + 1;
         all.window.radius_px = base.window.radius_px + 1;
-        all.window.background_image = Some(String::from("/tmp/bitty-wall.png"));
+        all.window.background_image = Some(
+            std::env::temp_dir()
+                .join("bitty-wall.png")
+                .display()
+                .to_string(),
+        );
         all.window.background_fit = Some(bitty_config::types::BackgroundFit::Tile);
         all.window.background_opacity = Some(0.5);
         all.window.background_position = Some(bitty_config::types::BackgroundPosition::TopLeft);

@@ -5738,6 +5738,12 @@ mod tests {
         // lower layer, and empty stacks keep no image with core-defaults
         // source.
         use crate::types::{BackgroundFit, BackgroundPosition};
+        // Portable absolute fixture (`/wall/...` is not absolute on
+        // Windows); `temp_dir()` is absolute on every host.
+        let wall = std::env::temp_dir()
+            .join("wall-one.png")
+            .display()
+            .to_string();
         let user = LayeredPlan::new(
             ConfigSource::new(LayerKind::User, Some("user.lua")),
             ConfigPlan {
@@ -5746,7 +5752,7 @@ mod tests {
                     padding: 8,
                     radius_px: 0,
                     blur_radius: 0,
-                    background_image: Some("/wall/one.png".to_string()),
+                    background_image: Some(wall.clone()),
                     background_fit: Some(BackgroundFit::Tile),
                     background_opacity: Some(0.5),
                     background_position: Some(BackgroundPosition::TopLeft),
@@ -5758,7 +5764,7 @@ mod tests {
         let merged = merge_layers(vec![user]).expect("merge");
         assert_eq!(
             merged.effective.window.background_image.as_deref(),
-            Some("/wall/one.png")
+            Some(wall.as_str())
         );
         assert_eq!(
             merged.effective.window.background_fit,
@@ -5794,7 +5800,7 @@ mod tests {
                     padding: 8,
                     radius_px: 0,
                     blur_radius: 0,
-                    background_image: Some("/wall/one.png".to_string()),
+                    background_image: Some(wall.clone()),
                     background_fit: Some(BackgroundFit::Tile),
                     background_opacity: Some(0.5),
                     background_position: Some(BackgroundPosition::TopLeft),
@@ -5806,7 +5812,7 @@ mod tests {
         let merged2 = merge_layers(vec![user2, cli]).expect("merge");
         assert_eq!(
             merged2.effective.window.background_image.as_deref(),
-            Some("/wall/one.png"),
+            Some(wall.as_str()),
             "absent image says nothing"
         );
         assert_eq!(

@@ -1358,7 +1358,14 @@ mod tests {
         );
         let old = EffectiveConfig::default();
         let mut new = old.clone();
-        new.window.background_image = Some("/wall/one.png".to_string());
+        // Portable absolute fixture (`/wall/...` is not absolute on
+        // Windows); `temp_dir()` is absolute on every host.
+        new.window.background_image = Some(
+            std::env::temp_dir()
+                .join("wall-one.png")
+                .display()
+                .to_string(),
+        );
         new.window.background_fit = Some(crate::types::BackgroundFit::Tile);
         new.window.background_opacity = Some(0.5);
         new.window.background_position = Some(crate::types::BackgroundPosition::TopLeft);

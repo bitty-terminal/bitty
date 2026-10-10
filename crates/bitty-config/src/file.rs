@@ -3863,13 +3863,24 @@ mod tests {
         assert_eq!(win.background_fit, None);
         assert_eq!(win.background_opacity, None);
         assert_eq!(win.background_position, None);
+        // Portable absolute fixture (`/wall/...` is not absolute on
+        // Windows); `temp_dir()` is absolute on every host. Backslashes
+        // are doubled so the Lua double-quoted string parses back to the
+        // same path on Windows.
+        let abs_wall = std::env::temp_dir()
+            .join("wall-one.png")
+            .display()
+            .to_string();
+        let lua_wall = abs_wall.replace('\\', "\\\\");
         let plan = parse_lua_config(
-            r#"return { window = { opacity = 1.0, padding = 8, background_image = "/wall/one.png", background_fit = "tile", background_opacity = 0.5, background_position = "top-left" } }"#,
+            &format!(
+                r#"return {{ window = {{ opacity = 1.0, padding = 8, background_image = "{lua_wall}", background_fit = "tile", background_opacity = 0.5, background_position = "top-left" }} }}"#
+            ),
             &test_source(),
         )
         .expect("background parses");
         let win = plan.window.as_ref().unwrap();
-        assert_eq!(win.background_image.as_deref(), Some("/wall/one.png"));
+        assert_eq!(win.background_image.as_deref(), Some(abs_wall.as_str()));
         assert_eq!(win.background_fit, Some(BackgroundFit::Tile));
         assert!((win.background_opacity.unwrap() - 0.5).abs() < f32::EPSILON);
         assert_eq!(

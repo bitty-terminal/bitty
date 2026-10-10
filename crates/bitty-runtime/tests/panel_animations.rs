@@ -854,7 +854,16 @@ fn zoom_never_interpolates_grid_or_geometry() {
         "zoom geometry must commit immediately"
     );
     let _ = rt.tick_at(start).expect("zoom presents");
-    assert!(rt.animations_active(), "zoom close must be active");
+    // Query the arming on the same virtual clock `tick_at` uses. The
+    // wall-clock `animations_active()` reads the close as already expired
+    // when a loaded CI scheduler stalls this thread for more than the
+    // 120 ms close duration between arming and the assertion (same
+    // mechanism as the CTX-0408 focus cross-fade fix above).
+    assert!(
+        rt.animation_progress(AnimationKind::Close, Some(ViewId::new(2)), start)
+            .is_some(),
+        "zoom close must be active"
+    );
     rt.handle_pty_bytes(b"\x1b[2;1HZOOM-TRUTH");
     let snap = rt.snapshot();
     let row: String = snap

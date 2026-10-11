@@ -321,6 +321,223 @@ fn maximal_row_placement_bounds_scroll_work() {
 }
 
 #[test]
+fn oversize_pixel_backed_placement_scrolls_full_span_like_kitty() {
+    // Issue #1954: a placement taller than the viewport (chafa emits a
+    // 150-row placement in a 40-row viewport) must scroll the full span
+    // like kitty, so the image bottom lands at the cursor row and later
+    // text rows print below the blit instead of underneath it. Capping
+    // the scroll at one viewport leaves the bottom edge below the
+    // screen: every later row prints under the image (S7 paints blits
+    // above text) and the input line stays invisible.
+    let mut rt = make_runtime();
+    let viewport_rows = rt.state().height();
+    let scrollback_before = rt.state().scrollback_len();
+    // 60 cell rows of real pixels at the default 9x19 cell: explicit
+    // spans (the chafa --size path), taller than the 24-row viewport.
+    let tall_rows: u16 = 60;
+    let pixels = vec![0x88u8; 9 * 19 * usize::from(tall_rows) * 4];
+    let outcome = rt
+        .kitty_display_image(
+            32,
+            Some(9),
+            Some(19 * u32::from(tall_rows)),
+            None,
+            1,
+            tall_rows,
+            0,
+            &pixels,
+            0,
+        )
+        .expect("oversize pixel-backed placement must still place");
+    assert!(matches!(outcome, KittyDisplayOutcome::Displayed { .. }));
+    assert_eq!(rt.kitty_placement_count(), 1);
+    // Full kitty overflow from the origin anchor, not the viewport cap:
+    // kitty moves the cursor down by rows - 1 and the screen scrolls to
+    // fit, so rows - 1 linefeeds from row 0 scroll rows - viewport.
+    let want_scroll = usize::from(tall_rows - 1).saturating_sub(viewport_rows.saturating_sub(1));
+    assert!(
+        want_scroll > viewport_rows,
+        "fixture must overflow past the old viewport cap"
+    );
+    let scrolled = rt
+        .state()
+        .scrollback_len()
+        .saturating_sub(scrollback_before);
+    assert_eq!(
+        scrolled, want_scroll,
+        "oversize pixel-backed span must scroll its full overflow like kitty"
+    );
+    assert!(
+        scrolled <= usize::from(bitty_rich::KITTY_CURSOR_MAX_SCROLL_LINES_PER_PLACEMENT),
+        "scroll stays under the absolute ceiling"
+    );
+    let cursor = rt.state().cursor().position;
+    assert_eq!(
+        usize::from(cursor.row),
+        viewport_rows.saturating_sub(1),
+        "cursor must land at the bottom row"
+    );
+    // The viewport-clipped placement still paints one blit.
+    assert!(rt.tick().is_some());
+    assert_eq!(rt.kitty_last_frame_images(), 1);
+    // Post-placement rows stay addressable: typed text lands on the
+    // grid past the span instead of being swallowed by the image.
+    rt.handle_pty_bytes(b"AB");
+    let snap = rt.snapshot();
+    let row_start = viewport_rows.saturating_sub(1) * snap.width;
+    assert_eq!(snap.cells[row_start + 1].glyph, 'A');
+    assert_eq!(snap.cells[row_start + 2].glyph, 'B');
+    let cursor = rt.state().cursor().position;
+    assert_eq!(usize::from(cursor.row), viewport_rows.saturating_sub(1));
+    assert_eq!(usize::from(cursor.col), 3);
+}
+
+#[test]
+fn oversize_derived_span_scrolls_full_span() {
+    // Issue #1954, no---size path: spans derived from pixels (no
+    // explicit c=/r=) taller than the viewport scroll the full span
+    // exactly like the explicit-span path above.
+    let mut rt = make_runtime();
+    let viewport_rows = rt.state().height();
+    let scrollback_before = rt.state().scrollback_len();
+    let tall_rows: u16 = 60;
+    let pixels = vec![0x88u8; 9 * 19 * usize::from(tall_rows) * 4];
+    let outcome = rt
+        .kitty_display_image(
+            32,
+            Some(9),
+            Some(19 * u32::from(tall_rows)),
+            None,
+            0,
+            0,
+            0,
+            &pixels,
+            0,
+        )
+        .expect("derived oversize placement must still place");
+    assert!(matches!(outcome, KittyDisplayOutcome::Displayed { .. }));
+    let want_scroll = usize::from(tall_rows - 1).saturating_sub(viewport_rows.saturating_sub(1));
+    let scrolled = rt
+        .state()
+        .scrollback_len()
+        .saturating_sub(scrollback_before);
+    assert_eq!(
+        scrolled, want_scroll,
+        "derived oversize span must scroll its full overflow like kitty"
+    );
+    let cursor = rt.state().cursor().position;
+    assert_eq!(
+        usize::from(cursor.row),
+        viewport_rows.saturating_sub(1),
+        "cursor must land at the bottom row"
+    );
+    assert!(rt.tick().is_some());
+    assert_eq!(rt.kitty_last_frame_images(), 1);
+}
+
+#[test]
+fn oversize_placement_near_bottom_scrolls_to_fit() {
+    // Issue #1954 headed shape: the image is placed near the bottom of
+    // the viewport (right after a shell prompt), so almost every
+    // linefeed scrolls. The image bottom still lands at the cursor row.
+    let mut rt = make_runtime();
+    let viewport_rows = rt.state().height();
+    rt.handle_pty_bytes(b"\x1b[21;1H");
+    assert_eq!(usize::from(rt.state().cursor().position.row), 20);
+    let scrollback_before = rt.state().scrollback_len();
+    let tall_rows: u16 = 60;
+    let pixels = vec![0x88u8; 9 * 19 * usize::from(tall_rows) * 4];
+    let outcome = rt
+        .kitty_display_image(
+            32,
+            Some(9),
+            Some(19 * u32::from(tall_rows)),
+            None,
+            1,
+            tall_rows,
+            0,
+            &pixels,
+            0,
+        )
+        .expect("oversize placement near the bottom must still place");
+    assert!(matches!(outcome, KittyDisplayOutcome::Displayed { .. }));
+    // 59 linefeeds from row 20: 3 walk to the bottom, 56 scroll.
+    let want_scroll = usize::from(tall_rows - 1)
+        .saturating_sub(viewport_rows.saturating_sub(1).saturating_sub(20));
+    let scrolled = rt
+        .state()
+        .scrollback_len()
+        .saturating_sub(scrollback_before);
+    assert_eq!(
+        scrolled, want_scroll,
+        "near-bottom oversize span must scroll to fit like kitty"
+    );
+    let cursor = rt.state().cursor().position;
+    assert_eq!(
+        usize::from(cursor.row),
+        viewport_rows.saturating_sub(1),
+        "cursor must land at the bottom row"
+    );
+    assert!(rt.tick().is_some());
+    assert_eq!(rt.kitty_last_frame_images(), 1);
+}
+
+#[test]
+fn exact_and_smaller_spans_keep_prior_scroll_behavior() {
+    // Issue #1954 non-goals: placements that fit (or exactly fill) the
+    // viewport keep the pre-existing scroll accounting bit-for-bit.
+    let mut rt = make_runtime();
+    let viewport_rows = rt.state().height();
+    // Smaller span: no overflow, no scroll, cursor past the span.
+    let scrollback_before = rt.state().scrollback_len();
+    let outcome = rt
+        .kitty_display_image(32, Some(2), Some(2), None, 2, 2, 0, &red_2x2(), 0)
+        .expect("small placement must place");
+    assert!(matches!(outcome, KittyDisplayOutcome::Displayed { .. }));
+    assert_eq!(
+        rt.state().scrollback_len() - scrollback_before,
+        0,
+        "fitting span must not scroll"
+    );
+    let cursor = rt.state().cursor().position;
+    assert_eq!((cursor.col, cursor.row), (2, 2));
+    // Exact-viewport span from the origin: the cursor walks to the last
+    // row with plain linefeeds, so no scroll is driven at all —
+    // unchanged by the oversize fix.
+    let mut rt = make_runtime();
+    let exact_rows = u16::try_from(viewport_rows).unwrap_or(u16::MAX);
+    let exact_pixels = vec![0x88u8; 9 * 19 * viewport_rows * 4];
+    let scrollback_before = rt.state().scrollback_len();
+    let outcome = rt
+        .kitty_display_image(
+            32,
+            Some(9),
+            Some(19 * u32::try_from(viewport_rows).unwrap_or(u32::MAX)),
+            None,
+            1,
+            exact_rows,
+            0,
+            &exact_pixels,
+            0,
+        )
+        .expect("exact-viewport placement must place");
+    assert!(matches!(outcome, KittyDisplayOutcome::Displayed { .. }));
+    assert_eq!(
+        rt.state().scrollback_len() - scrollback_before,
+        0,
+        "exact-viewport span from the origin must not scroll"
+    );
+    let cursor = rt.state().cursor().position;
+    assert_eq!(
+        usize::from(cursor.row),
+        viewport_rows.saturating_sub(1),
+        "cursor must land at the bottom row"
+    );
+    assert!(rt.tick().is_some());
+    assert_eq!(rt.kitty_last_frame_images(), 1);
+}
+
+#[test]
 fn placement_delete_then_render_leaves_no_orphan_blit() {
     // CTX-1072 (#1850): protocol-level deletion clears the rendered
     // placement through the origin-scoped wire identity mapping, so the

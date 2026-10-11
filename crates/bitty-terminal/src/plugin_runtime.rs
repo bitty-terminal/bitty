@@ -18,11 +18,11 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use bitty_runtime::WorkspaceSummary;
 use bitty_runtime::plugin_runtime::{
-    EmptySettings, LuaValue, PluginRuntime, PluginRuntimeConfig, SnapshotSource,
-    WorkspaceAttention, WorkspaceInfo, WorkspaceSource,
+    EmptySettings, LuaValue, PanelPinHandler, PanelPinQueue, PluginRuntime, PluginRuntimeConfig,
+    QueuedPinRequest, SnapshotSource, WorkspaceAttention, WorkspaceInfo, WorkspaceSource,
 };
+use bitty_runtime::{ViewId, WorkspaceSummary};
 
 /// Environment override for a local-path development plugin root.
 ///
@@ -232,6 +232,89 @@ pub(crate) struct PluginSession {
     pub(crate) snapshot: Rc<LiveSnapshot>,
     /// Live workspace source (CTX-0889).
     pub(crate) workspaces: Rc<LiveWorkspaces>,
+    /// Live pin-target snapshot (CTX-1115).
+    pub(crate) pin_state: Rc<LivePinState>,
+}
+
+/// Live pin-target snapshot for `bitty.panel.set_pinned` (CTX-1115).
+///
+/// Same publish pattern as [`LiveWorkspaces`]: the tick loop publishes the
+/// active-workspace leaf ids plus the window-global pinned ids once per
+/// tick, and the deferred pin backend validates intents against the last
+/// committed copy, so unknown ids fail closed synchronously without the
+/// closure ever borrowing the live runtime. Pin targets resolve against the
+/// active layout, exactly like the `toggle_pinned` keymap path (which pins
+/// the focused pane); a leaf living on an inactive workspace is not pinnable
+/// until its workspace is active. The drain revalidates against live state,
+/// so a panel that vanished between publish and drain still fails closed
+/// with state untouched.
+#[derive(Default)]
+pub(crate) struct LivePinState {
+    leaves: RefCell<Vec<ViewId>>,
+    pinned: RefCell<Vec<ViewId>>,
+}
+
+impl LivePinState {
+    /// Commit the given leaf and pinned ids (already bounded by Core).
+    pub(crate) fn publish(&self, leaves: &[ViewId], pinned: &[ViewId]) {
+        let mut current_leaves = self.leaves.borrow_mut();
+        if current_leaves.as_slice() != leaves {
+            *current_leaves = leaves.to_vec();
+        }
+        let mut current_pinned = self.pinned.borrow_mut();
+        if current_pinned.as_slice() != pinned {
+            *current_pinned = pinned.to_vec();
+        }
+    }
+
+    /// Whether the last published active layout holds `id` as a live leaf.
+    pub(crate) fn is_live_leaf(&self, id: ViewId) -> bool {
+        self.leaves.borrow().contains(&id)
+    }
+
+    /// Whether the last published state holds `id` as pinned.
+    pub(crate) fn is_pinned(&self, id: ViewId) -> bool {
+        self.pinned.borrow().contains(&id)
+    }
+}
+
+/// Deferred `bitty.panel.set_pinned` backend for production startup (CTX-1115).
+///
+/// Validates each granted call against the last published [`LivePinState`]
+/// and enqueues the intent into the runtime-shared [`PanelPinQueue`]; the
+/// application drains it each tick through the same `pin_floating` /
+/// `unpin_floating` runtime path the `toggle_pinned` keymap action uses.
+/// `true` covers a queued transition plus an idempotent no-op; `false` is
+/// the fail-closed answer for an unknown target or a full queue, with state
+/// untouched. The closure captures only shared handles, never the live
+/// runtime, so it stays `'static`-compatible while `TerminalApp` keeps sole
+/// `Runtime` ownership (DEC-0107).
+pub(crate) fn startup_pin_backend(
+    queue: Rc<RefCell<PanelPinQueue>>,
+    state: Rc<LivePinState>,
+) -> PanelPinHandler {
+    Rc::new(move |panel_id, pinned| {
+        let id = ViewId::new(panel_id);
+        if pinned {
+            if state.is_pinned(id) {
+                return Ok(true);
+            }
+            if !state.is_live_leaf(id) {
+                return Ok(false);
+            }
+        } else if !state.is_pinned(id) {
+            // Unpin of a live leaf holds without queueing; an unknown
+            // target fails closed without touching the queue.
+            if !state.is_live_leaf(id) {
+                return Ok(false);
+            }
+            return Ok(true);
+        }
+        let accepted = queue
+            .borrow_mut()
+            .push(QueuedPinRequest { panel_id, pinned });
+        Ok(accepted)
+    })
 }
 
 /// Resolved XDG plugin store root (`$XDG_DATA_HOME/bitty/plugins`).
@@ -280,21 +363,52 @@ fn dev_roots() -> Vec<PathBuf> {
     }
 }
 
+/// Startup-committed state seeded into the plugin host before activation.
+///
+/// The workspace rows feed [`LiveWorkspaces`] (CTX-0889) while the leaf and
+/// pinned ids seed [`LivePinState`] (CTX-1115), so `init.lua` already
+/// observes the constructed runtime on every read path.
+pub(crate) struct StartupSeed<'a> {
+    /// Workspace summaries for the live workspace source.
+    pub(crate) workspaces: &'a [WorkspaceSummary],
+    /// Active-workspace leaf ids for the pin-target snapshot.
+    pub(crate) leaves: &'a [ViewId],
+    /// Window-global pinned ids for the pin-target snapshot.
+    pub(crate) pinned: &'a [ViewId],
+}
+
 /// Discover and activate installed and development plugins, returning the
-/// live runtime plus the shared live-snapshot (CTX-0481) and live-workspace
-/// (CTX-0889) handles.
+/// live runtime plus the shared live-snapshot (CTX-0481), live-workspace
+/// (CTX-0889), and live-pin-state (CTX-1115) handles.
 ///
 /// Returns `None` when neither the XDG store nor a development root exists (no
-/// plugin work is attempted). The caller feeds the handle to the app tick
-/// loop so `bitty.terminal.snapshot` reflects committed state.
+/// plugin work is attempted). The caller feeds the handles to the app tick
+/// loop so `bitty.terminal.snapshot` reflects committed state, workspace
+/// reads serve published rows, and `bitty.panel.set_pinned` validates plus
+/// applies through the tick drain.
 pub(crate) fn discover_and_activate(
     safe_mode: bool,
     cols: usize,
     rows: usize,
-    initial_workspaces: &[WorkspaceSummary],
+    seed: &StartupSeed<'_>,
 ) -> Option<PluginSession> {
-    let store_root = store_root();
-    let dev_roots = dev_roots();
+    discover_with_roots(safe_mode, cols, rows, seed, store_root(), dev_roots())
+}
+
+/// Env-free startup wiring behind [`discover_and_activate`] (CTX-1115 test seam).
+///
+/// Production resolves both roots from the environment; tests pass explicit
+/// roots so the real backend installation plus activation path runs without
+/// process-global environment mutation (which `#![forbid(unsafe_code)]`
+/// rules out).
+pub(crate) fn discover_with_roots(
+    safe_mode: bool,
+    cols: usize,
+    rows: usize,
+    seed: &StartupSeed<'_>,
+    store_root: Option<PathBuf>,
+    dev_roots: Vec<PathBuf>,
+) -> Option<PluginSession> {
     let store_present = store_root.as_deref().is_some_and(Path::is_dir);
     if !store_present && dev_roots.is_empty() {
         return None;
@@ -322,8 +436,18 @@ pub(crate) fn discover_and_activate(
     // CTX-0889: seed the workspace source before activation so `init.lua`
     // already observes the startup workspaces.
     let workspaces = Rc::new(LiveWorkspaces::default());
-    workspaces.publish(initial_workspaces);
+    workspaces.publish(seed.workspaces);
     runtime.set_workspace_source(workspaces.clone());
+    // CTX-1115: seed the pin snapshot and install the deferred pin backend
+    // before activation so `init.lua` already observes a working
+    // `set_pinned`. Activation captures the backend into `panel.focus`
+    // generations only; the call-time grant gate stays as the second layer.
+    let pin_state = Rc::new(LivePinState::default());
+    pin_state.publish(seed.leaves, seed.pinned);
+    runtime.set_panel_pin_backend(Some(startup_pin_backend(
+        Rc::clone(runtime.panel_pin_queue()),
+        Rc::clone(&pin_state),
+    )));
     let _ = runtime.discover();
     for (id, result) in runtime.activate_discovered() {
         match result {
@@ -357,6 +481,7 @@ pub(crate) fn discover_and_activate(
         runtime,
         snapshot,
         workspaces,
+        pin_state,
     })
 }
 
@@ -364,6 +489,7 @@ pub(crate) fn discover_and_activate(
 mod tests {
     use super::*;
     use bitty_runtime::Runtime;
+    use bitty_runtime::{LayoutNode, SplitAxis, UiRect, View};
 
     fn generation_of(snapshot: &LuaValue) -> u64 {
         match snapshot.get("generation") {
@@ -488,5 +614,224 @@ mod tests {
             "regression must not commit"
         );
         assert_eq!(integer_of(&after, "width"), 80);
+    }
+
+    const PIN_PROBE_COMMANDS: &[&str] = &["pin", "unpin", "pin_unknown"];
+
+    const PIN_PROBE: &str = r#"
+local function call(f, ...)
+  local ok, result = pcall(f, ...)
+  if ok then return "OK:" .. tostring(result) end
+  return "ERR:" .. result.code
+end
+
+bitty.commands.register({ id = "pin", title = "Pin", run = function()
+  return call(bitty.panel.set_pinned, 1, true) end })
+bitty.commands.register({ id = "unpin", title = "Unpin", run = function()
+  return call(bitty.panel.set_pinned, 1, false) end })
+bitty.commands.register({ id = "pin_unknown", title = "Pin unknown", run = function()
+  return call(bitty.panel.set_pinned, 404, true) end })
+"#;
+
+    fn pin_test_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "bitty-startup-pin-{tag}-{}-{counter}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    fn write_pin_probe(root: &Path, id: &str, capabilities: &[&str]) {
+        let plugin = root.join(id);
+        std::fs::create_dir_all(plugin.join("lua")).expect("dirs");
+        let qualified: Vec<String> = PIN_PROBE_COMMANDS
+            .iter()
+            .map(|command| format!("\"{id}:{command}\""))
+            .collect();
+        let capabilities_toml = capabilities
+            .iter()
+            .map(|capability| format!("{capability} = true\n"))
+            .collect::<String>();
+        std::fs::write(
+            plugin.join("bitty-plugin.toml"),
+            format!(
+                "[plugin]\nid = \"{id}\"\nname = \"Test\"\nversion = \"0.1.0\"\ndescription = \"test\"\n\n[compat]\nplugin-api = \"^1.0\"\n\n[capabilities]\n{capabilities_toml}[lazy]\ncommands = [{}]\nevents = []\n",
+                qualified.join(", "),
+            ),
+        )
+        .expect("manifest");
+        std::fs::write(plugin.join("lua/init.lua"), PIN_PROBE).expect("init");
+    }
+
+    fn two_leaf_runtime() -> Runtime {
+        let mut live = Runtime::with_defaults().expect("defaults must build");
+        live.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+        ));
+        live.set_container(UiRect::new(0, 0, 80, 24));
+        live
+    }
+
+    fn pin_test_app(
+        tag: &str,
+        id: &str,
+        capabilities: &[&str],
+    ) -> crate::terminal_app::TerminalApp {
+        let root = pin_test_dir(tag);
+        write_pin_probe(&root, id, capabilities);
+        let live = two_leaf_runtime();
+        let summaries = live.workspace_summaries();
+        let leaves = live.layout().leaf_ids();
+        let pinned = live.pinned_views();
+        let seed = StartupSeed {
+            workspaces: &summaries,
+            leaves: &leaves,
+            pinned: &pinned,
+        };
+        let session = discover_with_roots(false, 80, 24, &seed, None, vec![root])
+            .expect("dev root must yield a session");
+        let pin_state = Rc::clone(&session.pin_state);
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        crate::terminal_app::TerminalApp::with_theme(
+            live,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            maps,
+            crate::spawn::SpawnSpec::default(),
+        )
+        .with_plugin_runtime(Some(session.runtime))
+        .with_live_pin_state(Some(pin_state))
+    }
+
+    fn dispatch_pin(app: &mut crate::terminal_app::TerminalApp, id: &str, command: &str) -> String {
+        use bitty_plugin_host::manifest::PluginId;
+        let pid = PluginId::new(id).expect("id");
+        match app
+            .plugin_runtime
+            .as_mut()
+            .expect("plugin runtime")
+            .dispatch_command(&pid, command, &[])
+        {
+            Ok(LuaValue::String(value)) => value,
+            Ok(other) => panic!("{command}: expected a string result, got {other:?}"),
+            Err(error) => panic!("{command}: dispatch failed: {error:?}"),
+        }
+    }
+
+    /// Run the pin half of the app tick without a full `drive_tick`.
+    ///
+    /// A full tick also drains the process-global control queue with empty
+    /// scopes, which would poison the concurrent CTX-0220 socket tests, so
+    /// these tests drive the pin apply plus snapshot publish directly in
+    /// tick order (apply before publish, mirroring `drive_tick`).
+    fn drain_pin_tick(app: &mut crate::terminal_app::TerminalApp) {
+        app.apply_plugin_pin_requests();
+        assert!(
+            app.plugin_runtime
+                .as_ref()
+                .expect("plugin runtime")
+                .panel_pin_queue()
+                .borrow()
+                .is_empty(),
+            "the drain must consume every queued intent"
+        );
+        let pin_state = app.live_pin_state.clone().expect("pin state");
+        pin_state.publish(
+            &app.runtime.layout().leaf_ids(),
+            &app.runtime.pinned_views(),
+        );
+    }
+
+    #[test]
+    fn startup_pin_backend_applies_through_lua_verb_on_tick() {
+        // CTX-1115 prod path: startup installs the deferred backend before
+        // activation, so a granted `bitty.panel.set_pinned` from Lua queues
+        // and the tick drain applies it through the live pin runtime path.
+        let mut app = pin_test_app("granted", "xuepoo.prodpin", &["panel.focus"]);
+        assert_eq!(
+            dispatch_pin(&mut app, "xuepoo.prodpin", "pin"),
+            "OK:true",
+            "granted pin queues"
+        );
+        assert!(
+            app.runtime.pinned_views().is_empty(),
+            "nothing applies before the tick drain"
+        );
+        drain_pin_tick(&mut app);
+        assert_eq!(app.runtime.pinned_views(), vec![ViewId::new(1)]);
+        // The tick republished the snapshot, so a re-pin holds without
+        // queueing and an unknown id still fails closed synchronously.
+        assert_eq!(
+            dispatch_pin(&mut app, "xuepoo.prodpin", "pin"),
+            "OK:true",
+            "re-pin holds"
+        );
+        assert_eq!(
+            dispatch_pin(&mut app, "xuepoo.prodpin", "pin_unknown"),
+            "OK:false",
+            "unknown id fails closed"
+        );
+        drain_pin_tick(&mut app);
+        assert_eq!(app.runtime.pinned_views(), vec![ViewId::new(1)]);
+        assert_eq!(
+            dispatch_pin(&mut app, "xuepoo.prodpin", "unpin"),
+            "OK:true",
+            "granted unpin queues"
+        );
+        drain_pin_tick(&mut app);
+        assert!(app.runtime.pinned_views().is_empty());
+        assert_eq!(
+            app.runtime.layout().leaf_ids(),
+            vec![ViewId::new(1), ViewId::new(2)],
+            "unpin restores the floating panel to the live layout"
+        );
+        assert_eq!(
+            dispatch_pin(&mut app, "xuepoo.prodpin", "unpin"),
+            "OK:true",
+            "unpin of a live leaf holds"
+        );
+    }
+
+    #[test]
+    fn startup_pin_backend_denied_without_panel_focus_grant() {
+        // Grant gating stays: without `panel.focus` the generation captures
+        // no backend and the call-time gate denies first, so the live
+        // runtime is never touched.
+        let mut app = pin_test_app("denied", "xuepoo.prodindenied", &[]);
+        assert_eq!(
+            dispatch_pin(&mut app, "xuepoo.prodindenied", "pin"),
+            "ERR:E_CAPABILITY_DENIED"
+        );
+        assert_eq!(
+            dispatch_pin(&mut app, "xuepoo.prodindenied", "unpin"),
+            "ERR:E_CAPABILITY_DENIED"
+        );
+        drain_pin_tick(&mut app);
+        assert!(app.runtime.pinned_views().is_empty());
+        assert_eq!(
+            app.runtime.layout().leaf_ids(),
+            vec![ViewId::new(1), ViewId::new(2)]
+        );
+    }
+
+    #[test]
+    fn live_pin_state_publishes_leaves_and_pinned() {
+        let state = LivePinState::default();
+        assert!(!state.is_live_leaf(ViewId::new(1)));
+        let live = two_leaf_runtime();
+        state.publish(&live.layout().leaf_ids(), &live.pinned_views());
+        assert!(state.is_live_leaf(ViewId::new(1)));
+        assert!(state.is_live_leaf(ViewId::new(2)));
+        assert!(!state.is_live_leaf(ViewId::new(404)));
+        assert!(!state.is_pinned(ViewId::new(1)));
     }
 }

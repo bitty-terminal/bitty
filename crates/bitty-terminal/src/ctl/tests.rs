@@ -1646,6 +1646,19 @@ fn control_help_documents_windows_degradation() {
 }
 
 #[test]
+fn control_help_documents_send_quoting() {
+    // Issue #1939 (follow-up of the CTX-1116 quoting-artifact diagnosis):
+    // `bitty ctl --help` must state that a bare CR needs ANSI-C quoting,
+    // so a fish continuation reads as a shell quoting artifact, not a
+    // bitty bug.
+    let help = ctl_help_text();
+    assert!(
+        help.contains("ANSI-C quoting ($'\\r')"),
+        "help must document ANSI-C quoting for bare-CR send, got {help:?}"
+    );
+}
+
+#[test]
 fn windows_ctl_degradation_message_is_actionable() {
     // Issue #1800 detect-and-advise, tested on every platform: the
     // Windows message names the missing transport and the surviving

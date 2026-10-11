@@ -319,9 +319,11 @@ pub fn ctl_help_text() -> String {
           \x20 Without it those four verbs fail closed (exit 7, no partial state).\n\
           \x20 All other verbs — including view split / view focus (view.manage)\n\
           \x20 and workspace list / new / focus / move / rename / move-panel, panel list,\n\
-          \x20 and every list, terminal send, and terminal text verb — need no elevation.\n\
-          \n\
-          PTY discovery (issue #1900): each PTY child inherits an advisory\n\
+           \x20 and every list, terminal send, and terminal text verb — need no elevation.\n\
+           \n\
+           Send quoting (issue #1939): a bare CR needs ANSI-C quoting ($'\\r'); plain '\\r' sends literal backslash-r bytes (fish shows a shell continuation, not a bitty bug).\n\
+           \n\
+           PTY discovery (issue #1900): each PTY child inherits an advisory\n\
           \x20 BITTY_SOCKET pointing at its own instance (never overriding an\n\
           \x20 explicitly-set outer value; inherit wins). BITTY_INSTANCE_ID is\n\
           \x20 the advisory instance label for the same precedence. Targeting\n\

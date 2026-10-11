@@ -48,6 +48,16 @@ fn every_shell_emits_a_script() {
             script.contains("completion"),
             "shell {shell} completes itself"
         );
+        // The hidden `component` alias (issue #1959) must not appear as a
+        // standalone token; only the canonical `extension` spelling is
+        // offered. Token-boundary match so `--with-components` does not
+        // false-positive.
+        assert!(
+            !script
+                .split(|c: char| !c.is_alphanumeric())
+                .any(|tok| tok == "component"),
+            "shell {shell} leaks hidden `component` alias"
+        );
     }
 }
 

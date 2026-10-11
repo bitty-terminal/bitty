@@ -8,7 +8,7 @@
 //!
 //! # Guest distro selection and persistence
 //!
-//! - Explicit `--distro <name>` wins (CLI flag, `bitty component --help`).
+//! - Explicit `--distro <name>` wins (CLI flag, `bitty extension --help`).
 //! - Else `BITTY_WSL_DISTRO` environment/config wins (`select_wsl_distro` takes
 //!   both as pure inputs; the caller reads the environment).
 //! - Else the trampoline is disabled (native execution, `None`). There is no
@@ -575,7 +575,7 @@ impl ProbeDecision {
         match Self::classify(Some(error.kind()), false) {
             Self::Missing => WslError::AbsentWsl(absent_diagnostic()),
             _ => WslError::ProbeFailed(format!(
-                "bitty component: cannot run `{WSL_EXE} {arg}`: {error}"
+                "bitty extension: cannot run `{WSL_EXE} {arg}`: {error}"
             )),
         }
     }
@@ -603,7 +603,7 @@ fn wait_for_exit_gracefully(
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(WslError::ProbeFailed(format!(
-                        "bitty component: `{WSL_EXE} {arg}` closed stdout but never exited within {}s (killed; refusing to hang)",
+                        "bitty extension: `{WSL_EXE} {arg}` closed stdout but never exited within {}s (killed; refusing to hang)",
                         grace.as_secs()
                     )));
                 }
@@ -614,7 +614,7 @@ fn wait_for_exit_gracefully(
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(WslError::ProbeFailed(format!(
-                    "bitty component: cannot wait for `{WSL_EXE} {arg}`: {error}"
+                    "bitty extension: cannot wait for `{WSL_EXE} {arg}`: {error}"
                 )));
             }
         }
@@ -668,7 +668,7 @@ fn run_probe_command(arg: &str) -> Result<(bool, Vec<u8>), WslError> {
         .map_err(|error| {
             let _ = child.kill();
             let _ = child.wait();
-            WslError::ProbeFailed(format!("bitty component: WSL probe thread failed: {error}"))
+            WslError::ProbeFailed(format!("bitty extension: WSL probe thread failed: {error}"))
         })?;
     let stdout = match rx.recv_timeout(WSL_PROBE_TIMEOUT) {
         Ok(Ok(bytes)) => bytes,
@@ -676,7 +676,7 @@ fn run_probe_command(arg: &str) -> Result<(bool, Vec<u8>), WslError> {
             let _ = child.kill();
             let _ = child.wait();
             return Err(WslError::ProbeFailed(format!(
-                "bitty component: cannot read `{WSL_EXE} {arg}` output: {error}"
+                "bitty extension: cannot read `{WSL_EXE} {arg}` output: {error}"
             )));
         }
         Err(_) => {
@@ -691,7 +691,7 @@ fn run_probe_command(arg: &str) -> Result<(bool, Vec<u8>), WslError> {
         let _ = child.kill();
         let _ = child.wait();
         return Err(WslError::ProbeFailed(format!(
-            "bitty component: `{WSL_EXE} {arg}` output exceeds {WSL_VERSION_OUTPUT_MAX_BYTES} bytes"
+            "bitty extension: `{WSL_EXE} {arg}` output exceeds {WSL_VERSION_OUTPUT_MAX_BYTES} bytes"
         )));
     }
     let status = wait_for_exit_gracefully(&mut child, arg, WSL_PROBE_EXIT_GRACE)?;
@@ -702,7 +702,7 @@ fn run_probe_command(arg: &str) -> Result<(bool, Vec<u8>), WslError> {
 /// inbox builds, per the fail-closed posture).
 #[must_use]
 pub fn absent_diagnostic() -> String {
-    "bitty component: WSL2 is unavailable (`wsl.exe --version` and `wsl.exe --status` both failed; install or enable WSL2 from the Microsoft Store (inbox builds lack `--version`) and add a guest distro, or run without --distro for native Windows execution)".to_string()
+    "bitty extension: WSL2 is unavailable (`wsl.exe --version` and `wsl.exe --status` both failed; install or enable WSL2 from the Microsoft Store (inbox builds lack `--version`) and add a guest distro, or run without --distro for native Windows execution)".to_string()
 }
 
 /// Detect the WSL context for trampoline execution.

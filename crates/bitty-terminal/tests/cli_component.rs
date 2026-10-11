@@ -1,13 +1,19 @@
-//! `bitty component` end-to-end dispatch proofs (issue #1651).
+//! `bitty extension` end-to-end dispatch proofs (issue #1651, verb renamed
+//! from `bitty component` by issue #1959).
 //!
 //! Search priority: user `$XDG_DATA_HOME/bitty/extensions/` wins over system
 //! (`BITTY_SYSTEM_COMPONENTS_DIR` in tests, `/usr/lib/bitty/extensions/`
 //! in production). `add` stages from local paths only (no network fetch);
 //! every spawn re-verifies ABI compat. These tests drive the built `bitty`
 //! binary via `CARGO_BIN_EXE_bitty` with isolated XDG roots, so the
-//! developer's real components are never touched. `component` dispatches
+//! developer's real components are never touched. `extension` dispatches
 //! before config load and GUI startup: no display, no instance, no component
 //! code is ever executed.
+//!
+//! The hidden `component` alias shares these handlers byte-for-byte on
+//! stdout and adds only a stderr deprecation note (kept at least through
+//! 0.1.0): the pre-existing `component ...` cases below double as alias
+//! proofs, and `component_alias_works_and_warns` pins the warning.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -362,7 +368,7 @@ fn component_missing_soft_fails_with_actionable_error() {
     let output = run_in(&home, &system, &["component", "remove", "net"]);
     assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
     assert!(
-        stderr(&output).contains("bitty component add"),
+        stderr(&output).contains("bitty extension add"),
         "missing component must name the install command: {}",
         stderr(&output)
     );
@@ -431,7 +437,7 @@ fn component_help_and_usage_have_stable_exit_codes() {
     let output = run_in(&home, &system, &["component", "--help"]);
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert!(
-        stdout(&output).contains("usage: bitty component"),
+        stdout(&output).contains("usage: bitty extension"),
         "{}",
         stdout(&output)
     );
@@ -439,7 +445,7 @@ fn component_help_and_usage_have_stable_exit_codes() {
     let output = run_in(&home, &system, &["component", "frobnicate"]);
     assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
     assert!(
-        stderr(&output).contains("usage: bitty component"),
+        stderr(&output).contains("usage: bitty extension"),
         "{}",
         stderr(&output)
     );
@@ -673,5 +679,134 @@ fn component_help_documents_fetch_environment() {
     assert!(text.contains("system CA store"), "{text}");
     assert!(text.contains("proxy"), "{text}");
     assert!(text.contains("*_TOKEN"), "{text}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn extension_list_is_empty_and_local() {
+    // Primary verb (issue #1959): same empty-list behavior as the alias,
+    // with no deprecation note on stderr.
+    let home = scratch_dir("ext-empty");
+    let system = home.join("system-components");
+    std::fs::create_dir_all(&system).expect("system dir");
+    let output = run_in(&home, &system, &["extension", "list"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("(no components)"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(
+        !stderr(&output).contains("deprecated"),
+        "canonical verb must not warn: {}",
+        stderr(&output)
+    );
+    assert!(!user_root(&home).join("net").exists());
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn extension_add_list_remove_lifecycle() {
+    // Primary verb lifecycle: add stages, list shows, remove drops.
+    let home = scratch_dir("ext-lifecycle");
+    let system = home.join("system-components");
+    std::fs::create_dir_all(&system).expect("system dir");
+    let source = write_source_dir(&home.join("source"), "net", "0.0.1", "[1, 1]");
+    let source = source.display().to_string();
+
+    let output = run_in(&home, &system, &["extension", "add", &source]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(stdout(&output).contains("installed"), "{}", stdout(&output));
+    assert!(
+        user_root(&home)
+            .join("net/0.0.1/bitty-component.toml")
+            .is_file(),
+        "descriptor must be staged"
+    );
+
+    let output = run_in(&home, &system, &["extension", "list"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("net"), "{text}");
+    assert!(text.contains("0.0.1"), "{text}");
+
+    let output = run_in(&home, &system, &["extension", "list", "--format", "json"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("\"command\":\"component\""), "{text}");
+    assert!(text.contains("\"verb\":\"list\""), "{text}");
+
+    let output = run_in(&home, &system, &["extension", "remove", "net", "0.0.1"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(!user_root(&home).join("net/0.0.1").exists());
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn extension_help_and_usage_name_new_verb() {
+    let home = scratch_dir("ext-help");
+    let system = home.join("system-components");
+    std::fs::create_dir_all(&system).expect("system dir");
+
+    let output = run_in(&home, &system, &["extension", "--help"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("usage: bitty extension"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(
+        !stdout(&output).contains("bitty component list"),
+        "help must not name the old verb: {}",
+        stdout(&output)
+    );
+
+    let output = run_in(&home, &system, &["extension", "frobnicate"]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("usage: bitty extension"),
+        "{}",
+        stderr(&output)
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn component_alias_works_and_warns() {
+    // Hidden deprecated alias (issue #1959, kept at least through 0.1.0):
+    // full behavior plus a stderr deprecation note pointing at `extension`.
+    // Stdout stays byte-identical to the canonical verb.
+    let home = scratch_dir("alias-warns");
+    let system = home.join("system-components");
+    std::fs::create_dir_all(&system).expect("system dir");
+
+    let via_alias = run_in(&home, &system, &["component", "list"]);
+    let via_canonical = run_in(&home, &system, &["extension", "list"]);
+    assert_eq!(via_alias.status.code(), Some(0), "{}", stderr(&via_alias));
+    assert_eq!(stdout(&via_alias), stdout(&via_canonical));
+    let warning = stderr(&via_alias);
+    assert!(
+        warning.contains("deprecated") && warning.contains("extension"),
+        "alias must warn toward the new verb: {warning}"
+    );
+    assert!(
+        !stderr(&via_canonical).contains("deprecated"),
+        "canonical verb must not warn: {}",
+        stderr(&via_canonical)
+    );
+
+    // Alias help prints the canonical text (stdout) with the note on stderr.
+    let output = run_in(&home, &system, &["component", "--help"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("usage: bitty extension"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(
+        stderr(&output).contains("deprecated"),
+        "alias help must warn: {}",
+        stderr(&output)
+    );
     let _ = std::fs::remove_dir_all(&home);
 }

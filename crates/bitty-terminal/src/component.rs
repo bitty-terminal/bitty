@@ -1,4 +1,8 @@
-//! `bitty component`: CLI-first native binary extension management (issue #1651).
+//! `bitty extension`: CLI-first native binary extension management (issue #1651).
+//!
+//! Renamed from `bitty component` by issue #1959: `component` stays as a
+//! hidden deprecated alias (same handlers, stderr deprecation note, kept at
+//! least through 0.1.0) and never appears in help or shell completions.
 //!
 //! Search priority: user `$XDG_DATA_HOME/bitty/extensions/` wins over system
 //! `/usr/lib/bitty/extensions/` (or platform equivalent). The user tier is
@@ -6,7 +10,7 @@
 //!
 //! # Contract (implemented, v1 local-path only)
 //!
-//! - Shape: `bitty component list|add|install|remove` with `list` accepting
+//! - Shape: `bitty extension list|add|install|remove` with `list` accepting
 //!   `--format table|json|jsonl` (default table) and `--no-color`.
 //! - `list`: read-only enumeration across both tiers (merged, user shadows
 //!   system on the same version). Shows name, version, active marker, source,
@@ -102,6 +106,17 @@ pub const EXIT_USAGE: i32 = 2;
 /// Component-level failure (missing, incompatible, digest, system-only).
 pub const EXIT_COMPONENT: i32 = 4;
 
+/// Stderr deprecation note for the hidden `component` alias (issue #1959).
+///
+/// The dispatch prints this to stderr (never stdout, so `--format json`
+/// stays parseable) whenever the subcommand was invoked as
+/// `bitty component ...`. The alias keeps full behavior at least through
+/// 0.1.0; new scripts should use `bitty extension ...`.
+#[must_use]
+pub fn component_deprecated_note() -> String {
+    "warning: `bitty component` is deprecated, use `bitty extension` instead (hidden alias kept through 0.1.0)".to_string()
+}
+
 /// Maximum bytes for one raw token (verb, name, flag value).
 pub const MAX_COMPONENT_TOKEN_BYTES: usize = 256;
 /// Maximum bytes for a `--format` value.
@@ -149,7 +164,7 @@ impl ComponentFormat {
             Some(value) => {
                 if value.len() > MAX_COMPONENT_FORMAT_BYTES || value.contains('\0') {
                     return Err(format!(
-                        "bitty component: unknown --format {value:?} (want table|json|jsonl)"
+                        "bitty extension: unknown --format {value:?} (want table|json|jsonl)"
                     ));
                 }
                 match value.trim().to_ascii_lowercase().as_str() {
@@ -157,7 +172,7 @@ impl ComponentFormat {
                     "json" => Ok(Self::Json),
                     "jsonl" => Ok(Self::Jsonl),
                     other => Err(format!(
-                        "bitty component: unknown --format {other:?} (want table|json|jsonl)"
+                        "bitty extension: unknown --format {other:?} (want table|json|jsonl)"
                     )),
                 }
             }
@@ -165,7 +180,7 @@ impl ComponentFormat {
     }
 }
 
-/// One `bitty component` verb.
+/// One `bitty extension` verb.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComponentVerb {
     /// `list`: enumerate installed components across both tiers.
@@ -203,7 +218,7 @@ impl ComponentVerb {
     }
 }
 
-/// Validated request for one `bitty component` invocation.
+/// Validated request for one `bitty extension` invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComponentRequest {
     /// Requested verb.
@@ -333,7 +348,7 @@ pub fn parse_component_request(
             }
             "--" => {
                 return Err(ComponentParseError::Usage(
-                    "bitty component: stray `--` separator (component takes no child argv)"
+                    "bitty extension: stray `--` separator (component takes no child argv)"
                         .to_string(),
                 ));
             }
@@ -347,12 +362,12 @@ pub fn parse_component_request(
         if let Some(value) = token.strip_prefix("--version=") {
             if !version_token_ok(value) {
                 return Err(ComponentParseError::Usage(format!(
-                    "bitty component: --version value is empty, contains NUL, or exceeds {MAX_COMPONENT_VERSION_BYTES} bytes"
+                    "bitty extension: --version value is empty, contains NUL, or exceeds {MAX_COMPONENT_VERSION_BYTES} bytes"
                 )));
             }
             if version_flag.is_some() {
                 return Err(ComponentParseError::Usage(
-                    "bitty component: duplicate --version".to_string(),
+                    "bitty extension: duplicate --version".to_string(),
                 ));
             }
             version_flag = Some(value.to_string());
@@ -362,7 +377,7 @@ pub fn parse_component_request(
         if token == "--format" {
             let Some(value) = raw.get(index + 1) else {
                 return Err(ComponentParseError::Usage(
-                    "bitty component: --format needs a value (table|json|jsonl)".to_string(),
+                    "bitty extension: --format needs a value (table|json|jsonl)".to_string(),
                 ));
             };
             format = Some(value.clone());
@@ -372,17 +387,17 @@ pub fn parse_component_request(
         if token == "--version" {
             let Some(value) = raw.get(index + 1) else {
                 return Err(ComponentParseError::Usage(
-                    "bitty component: --version needs a value (strict semver)".to_string(),
+                    "bitty extension: --version needs a value (strict semver)".to_string(),
                 ));
             };
             if !version_token_ok(value) {
                 return Err(ComponentParseError::Usage(format!(
-                    "bitty component: --version value is empty, contains NUL, or exceeds {MAX_COMPONENT_VERSION_BYTES} bytes"
+                    "bitty extension: --version value is empty, contains NUL, or exceeds {MAX_COMPONENT_VERSION_BYTES} bytes"
                 )));
             }
             if version_flag.is_some() {
                 return Err(ComponentParseError::Usage(
-                    "bitty component: duplicate --version".to_string(),
+                    "bitty extension: duplicate --version".to_string(),
                 ));
             }
             version_flag = Some(value.clone());
@@ -392,12 +407,12 @@ pub fn parse_component_request(
         if let Some(value) = token.strip_prefix("--digest=") {
             if !valid_digest_flag(value) {
                 return Err(ComponentParseError::Usage(format!(
-                    "bitty component: invalid --digest {value:?} (want 64 hex characters, SHA-256)"
+                    "bitty extension: invalid --digest {value:?} (want 64 hex characters, SHA-256)"
                 )));
             }
             if digest.is_some() {
                 return Err(ComponentParseError::Usage(
-                    "bitty component: duplicate --digest".to_string(),
+                    "bitty extension: duplicate --digest".to_string(),
                 ));
             }
             digest = Some(value.to_string());
@@ -407,18 +422,18 @@ pub fn parse_component_request(
         if token == "--digest" {
             let Some(value) = raw.get(index + 1) else {
                 return Err(ComponentParseError::Usage(
-                    "bitty component: --digest needs a value (64 hex characters, SHA-256)"
+                    "bitty extension: --digest needs a value (64 hex characters, SHA-256)"
                         .to_string(),
                 ));
             };
             if !valid_digest_flag(value) {
                 return Err(ComponentParseError::Usage(format!(
-                    "bitty component: invalid --digest {value:?} (want 64 hex characters, SHA-256)"
+                    "bitty extension: invalid --digest {value:?} (want 64 hex characters, SHA-256)"
                 )));
             }
             if digest.is_some() {
                 return Err(ComponentParseError::Usage(
-                    "bitty component: duplicate --digest".to_string(),
+                    "bitty extension: duplicate --digest".to_string(),
                 ));
             }
             digest = Some(value.clone());
@@ -428,12 +443,12 @@ pub fn parse_component_request(
         if let Some(value) = token.strip_prefix("--distro=") {
             if !valid_distro_flag(value) {
                 return Err(ComponentParseError::Usage(format!(
-                    "bitty component: invalid --distro {value:?} (want 1..={MAX_COMPONENT_DISTRO_BYTES} bytes of [A-Za-z0-9._-], or the literal `default`)"
+                    "bitty extension: invalid --distro {value:?} (want 1..={MAX_COMPONENT_DISTRO_BYTES} bytes of [A-Za-z0-9._-], or the literal `default`)"
                 )));
             }
             if distro.is_some() {
                 return Err(ComponentParseError::Usage(
-                    "bitty component: duplicate --distro".to_string(),
+                    "bitty extension: duplicate --distro".to_string(),
                 ));
             }
             distro = Some(value.to_string());
@@ -443,18 +458,18 @@ pub fn parse_component_request(
         if token == "--distro" {
             let Some(value) = raw.get(index + 1) else {
                 return Err(ComponentParseError::Usage(
-                    "bitty component: --distro needs a value (a WSL distro name, or `default`)"
+                    "bitty extension: --distro needs a value (a WSL distro name, or `default`)"
                         .to_string(),
                 ));
             };
             if !valid_distro_flag(value) {
                 return Err(ComponentParseError::Usage(format!(
-                    "bitty component: invalid --distro {value:?} (want 1..={MAX_COMPONENT_DISTRO_BYTES} bytes of [A-Za-z0-9._-], or the literal `default`)"
+                    "bitty extension: invalid --distro {value:?} (want 1..={MAX_COMPONENT_DISTRO_BYTES} bytes of [A-Za-z0-9._-], or the literal `default`)"
                 )));
             }
             if distro.is_some() {
                 return Err(ComponentParseError::Usage(
-                    "bitty component: duplicate --distro".to_string(),
+                    "bitty extension: duplicate --distro".to_string(),
                 ));
             }
             distro = Some(value.clone());
@@ -463,7 +478,7 @@ pub fn parse_component_request(
         }
         if token.starts_with('-') && token.len() > 1 {
             return Err(ComponentParseError::Usage(format!(
-                "bitty component: unknown flag {token:?}"
+                "bitty extension: unknown flag {token:?}"
             )));
         }
         // Positional operand: length bound depends on the verb under
@@ -472,12 +487,12 @@ pub fn parse_component_request(
         if looks_like_path {
             if !path_token_ok(token) {
                 return Err(ComponentParseError::Usage(format!(
-                    "bitty component: argument is empty, contains NUL, or exceeds {MAX_COMPONENT_PATH_BYTES} bytes"
+                    "bitty extension: argument is empty, contains NUL, or exceeds {MAX_COMPONENT_PATH_BYTES} bytes"
                 )));
             }
         } else if !bare_token_ok(token) {
             return Err(ComponentParseError::Usage(format!(
-                "bitty component: argument is empty, contains NUL, or exceeds {MAX_COMPONENT_TOKEN_BYTES} bytes"
+                "bitty extension: argument is empty, contains NUL, or exceeds {MAX_COMPONENT_TOKEN_BYTES} bytes"
             )));
         }
         if verb.is_none() {
@@ -485,7 +500,7 @@ pub fn parse_component_request(
                 Some(parsed) => verb = Some(parsed),
                 None => {
                     return Err(ComponentParseError::Usage(format!(
-                        "bitty component: unknown verb {token:?} (want list|add|install|remove)"
+                        "bitty extension: unknown verb {token:?} (want list|add|install|remove)"
                     )));
                 }
             }
@@ -503,13 +518,13 @@ pub fn parse_component_request(
             continue;
         }
         return Err(ComponentParseError::Usage(format!(
-            "bitty component: unexpected extra argument {token:?}"
+            "bitty extension: unexpected extra argument {token:?}"
         )));
     }
 
     let verb = verb.ok_or_else(|| {
         ComponentParseError::Usage(
-            "bitty component: missing verb (want list|add|install|remove)".to_string(),
+            "bitty extension: missing verb (want list|add|install|remove)".to_string(),
         )
     })?;
 
@@ -522,37 +537,37 @@ pub fn parse_component_request(
         ComponentVerb::List => {
             if operand.is_some() {
                 return Err(ComponentParseError::Usage(format!(
-                    "bitty component: `{}` takes no operand",
+                    "bitty extension: `{}` takes no operand",
                     verb.name()
                 )));
             }
             if version_flag.is_some() {
                 return Err(ComponentParseError::Usage(format!(
-                    "bitty component: --version only applies to `add` (got `{}`)",
+                    "bitty extension: --version only applies to `add` (got `{}`)",
                     verb.name()
                 )));
             }
             if yes {
                 return Err(ComponentParseError::Usage(format!(
-                    "bitty component: --yes only applies to `install` (got `{}`)",
+                    "bitty extension: --yes only applies to `install` (got `{}`)",
                     verb.name()
                 )));
             }
             if digest.is_some() {
                 return Err(ComponentParseError::Usage(format!(
-                    "bitty component: --digest only applies to `install` (got `{}`)",
+                    "bitty extension: --digest only applies to `install` (got `{}`)",
                     verb.name()
                 )));
             }
             if force {
                 return Err(ComponentParseError::Usage(format!(
-                    "bitty component: --force only applies to `install` (got `{}`)",
+                    "bitty extension: --force only applies to `install` (got `{}`)",
                     verb.name()
                 )));
             }
             if distro.is_some() {
                 return Err(ComponentParseError::Usage(format!(
-                    "bitty component: --distro only applies to `add` (got `{}`)",
+                    "bitty extension: --distro only applies to `add` (got `{}`)",
                     verb.name()
                 )));
             }
@@ -560,37 +575,37 @@ pub fn parse_component_request(
         ComponentVerb::Add => {
             if operand.is_none() {
                 return Err(ComponentParseError::Usage(
-                    "bitty component: `add` needs a source path (local directory or `bitty-<name>` executable)"
+                    "bitty extension: `add` needs a source path (local directory or `bitty-<name>` executable)"
                         .to_string(),
                 ));
             }
             if version_operand.is_some() {
                 return Err(ComponentParseError::Usage(
-                    "bitty component: `add` takes one path operand (the version comes from `--version <semver>` for bare executables)"
+                    "bitty extension: `add` takes one path operand (the version comes from `--version <semver>` for bare executables)"
                         .to_string(),
                 ));
             }
             if format != ComponentFormat::Table || no_color {
                 return Err(ComponentParseError::Usage(format!(
-                    "bitty component: --format/--no-color only apply to `list` (got `{}`)",
+                    "bitty extension: --format/--no-color only apply to `list` (got `{}`)",
                     verb.name()
                 )));
             }
             if yes {
                 return Err(ComponentParseError::Usage(format!(
-                    "bitty component: --yes only applies to `install` (got `{}`)",
+                    "bitty extension: --yes only applies to `install` (got `{}`)",
                     verb.name()
                 )));
             }
             if digest.is_some() {
                 return Err(ComponentParseError::Usage(format!(
-                    "bitty component: --digest only applies to `install` (got `{}`)",
+                    "bitty extension: --digest only applies to `install` (got `{}`)",
                     verb.name()
                 )));
             }
             if force {
                 return Err(ComponentParseError::Usage(format!(
-                    "bitty component: --force only applies to `install` (got `{}`)",
+                    "bitty extension: --force only applies to `install` (got `{}`)",
                     verb.name()
                 )));
             }
@@ -598,25 +613,25 @@ pub fn parse_component_request(
         ComponentVerb::Install => {
             if operand.is_none() {
                 return Err(ComponentParseError::Usage(
-                    "bitty component: `install` needs a component name (e.g. `bitty component install net --version 0.0.23`)"
+                    "bitty extension: `install` needs a component name (e.g. `bitty extension install net --version 0.0.23`)"
                         .to_string(),
                 ));
             }
             if version_operand.is_some() {
                 return Err(ComponentParseError::Usage(
-                    "bitty component: `install` takes the version from `--version <X.Y.Z>`, not a second operand"
+                    "bitty extension: `install` takes the version from `--version <X.Y.Z>`, not a second operand"
                         .to_string(),
                 ));
             }
             if version_flag.is_none() {
                 return Err(ComponentParseError::Usage(
-                    "bitty component: `install` needs `--version <X.Y.Z>` (the seed installs exactly the version named; version solving arrives with the full manager)"
+                    "bitty extension: `install` needs `--version <X.Y.Z>` (the seed installs exactly the version named; version solving arrives with the full manager)"
                         .to_string(),
                 ));
             }
             if format != ComponentFormat::Table || no_color {
                 return Err(ComponentParseError::Usage(format!(
-                    "bitty component: --format/--no-color only apply to `list` (got `{}`)",
+                    "bitty extension: --format/--no-color only apply to `list` (got `{}`)",
                     verb.name()
                 )));
             }
@@ -626,51 +641,51 @@ pub fn parse_component_request(
             // guest helper. Stage guest helpers with `add` instead.
             if distro.is_some() {
                 return Err(ComponentParseError::Usage(
-                    "bitty component: --distro only applies to `add` (guest-helper staging); `install` fetches the host triple and cannot stage a Linux guest helper — stage one with `bitty component add <path> --distro <name>` (e.g. from inside the guest)".to_string(),
+                    "bitty extension: --distro only applies to `add` (guest-helper staging); `install` fetches the host triple and cannot stage a Linux guest helper — stage one with `bitty extension add <path> --distro <name>` (e.g. from inside the guest)".to_string(),
                 ));
             }
         }
         ComponentVerb::Remove => {
             if operand.is_none() {
                 return Err(ComponentParseError::Usage(format!(
-                    "bitty component: `{}` needs a component name",
+                    "bitty extension: `{}` needs a component name",
                     verb.name()
                 )));
             }
             if version_flag.is_some() {
                 return Err(ComponentParseError::Usage(format!(
-                    "bitty component: `{}` takes an optional version operand, not `--version` (got `{}`)",
+                    "bitty extension: `{}` takes an optional version operand, not `--version` (got `{}`)",
                     verb.name(),
                     verb.name()
                 )));
             }
             if format != ComponentFormat::Table || no_color {
                 return Err(ComponentParseError::Usage(format!(
-                    "bitty component: --format/--no-color only apply to `list` (got `{}`)",
+                    "bitty extension: --format/--no-color only apply to `list` (got `{}`)",
                     verb.name()
                 )));
             }
             if yes {
                 return Err(ComponentParseError::Usage(format!(
-                    "bitty component: --yes only applies to `install` (got `{}`)",
+                    "bitty extension: --yes only applies to `install` (got `{}`)",
                     verb.name()
                 )));
             }
             if digest.is_some() {
                 return Err(ComponentParseError::Usage(format!(
-                    "bitty component: --digest only applies to `install` (got `{}`)",
+                    "bitty extension: --digest only applies to `install` (got `{}`)",
                     verb.name()
                 )));
             }
             if force {
                 return Err(ComponentParseError::Usage(format!(
-                    "bitty component: --force only applies to `install` (got `{}`)",
+                    "bitty extension: --force only applies to `install` (got `{}`)",
                     verb.name()
                 )));
             }
             if distro.is_some() {
                 return Err(ComponentParseError::Usage(format!(
-                    "bitty component: --distro only applies to `add` (got `{}`)",
+                    "bitty extension: --distro only applies to `add` (got `{}`)",
                     verb.name()
                 )));
             }
@@ -694,10 +709,10 @@ pub fn parse_component_request(
 /// Short usage block (`stderr` on usage failures).
 #[must_use]
 pub fn component_usage() -> String {
-    "usage: bitty component list [--format table|json|jsonl] [--no-color]\n\
-     \x20      bitty component add <path> [--version <semver>] [--distro <name|default>]\n\
-     \x20      bitty component install <name> --version <X.Y.Z> [--digest <hex>] [--force] [--yes]\n\
-     \x20      bitty component remove <name> [<version>]\n\
+    "usage: bitty extension list [--format table|json|jsonl] [--no-color]\n\
+     \x20      bitty extension add <path> [--version <semver>] [--distro <name|default>]\n\
+     \x20      bitty extension install <name> --version <X.Y.Z> [--digest <hex>] [--force] [--yes]\n\
+     \x20      bitty extension remove <name> [<version>]\n\
      \n\
      Components are upstream native binaries resolved user-first:\n\
      $XDG_DATA_HOME/bitty/extensions/ wins over /usr/lib/bitty/extensions/.\n\
@@ -710,17 +725,17 @@ pub fn component_usage() -> String {
      (wsl.exe --distribution D --exec, default distro with `default`);\n\
      `install --distro` is rejected (install fetches the host triple and\n\
      cannot stage a guest helper — use `add`); Unix ignores --distro\n\
-     (native execution). `bitty component --help` explains sources, ABI\n\
+     (native execution). `bitty extension --help` explains sources, ABI\n\
      checks, WSL2 paths and stdio, and exit codes."
         .to_string()
 }
 
-/// Long help (`bitty component --help`).
+/// Long help (`bitty extension --help`).
 #[must_use]
 pub fn component_help_text() -> String {
-    "bitty component — CLI-first native binary extension management (local class, no execution)\n\
+    "bitty extension — CLI-first native binary extension management (local class, no execution)\n\
      \n\
-     usage: bitty component <verb> [args] [flags]\n\
+     usage: bitty extension <verb> [args] [flags]\n\
      \n\
      verbs:\n\
      \x20 list                        Show installed components across both tiers:\n\
@@ -861,9 +876,9 @@ pub fn component_help_text() -> String {
      \x20 and SHA-256; a protocol range excluding Core fails closed.\n\
      \n\
      authority:\n\
-     \x20 No component code ever runs during any `bitty component` operation.\n\
+     \x20 No component code ever runs during any `bitty extension` operation.\n\
      \x20 Missing optional components fail soft: resolution reports the name,\n\
-     \x20 the `bitty component add` command to run, and never a stack trace.\n\
+     \x20 the `bitty extension add` command to run, and never a stack trace.\n\
      \n\
      exit codes:\n\
      \x20 0 success | 1 declined consent, aborted prompt, filesystem\n\
@@ -873,14 +888,14 @@ pub fn component_help_text() -> String {
      \x20 component error (integrity, ABI, digest, pin-mismatch)\n\
      \n\
      examples:\n\
-     \x20 bitty component list\n\
-     \x20 bitty component list --format json\n\
-     \x20 bitty component add ./dist/net --version 0.0.1\n\
-     \x20 bitty component add ./dist/net --distro Ubuntu\n\
-     \x20 bitty component install net --version 0.0.23\n\
-     \x20 bitty component install net --version 0.0.23 --digest <hex>\n\
-     \x20 bitty component install net --version 0.0.23 --force --yes\n\
-     \x20 bitty component remove net 0.0.1"
+     \x20 bitty extension list\n\
+     \x20 bitty extension list --format json\n\
+     \x20 bitty extension add ./dist/net --version 0.0.1\n\
+     \x20 bitty extension add ./dist/net --distro Ubuntu\n\
+     \x20 bitty extension install net --version 0.0.23\n\
+     \x20 bitty extension install net --version 0.0.23 --digest <hex>\n\
+     \x20 bitty extension install net --version 0.0.23 --force --yes\n\
+     \x20 bitty extension remove net 0.0.1"
         .to_string()
 }
 
@@ -888,7 +903,7 @@ pub fn component_help_text() -> String {
 // Dispatch
 // ---------------------------------------------------------------------------
 
-/// Injected environment for one `bitty component` dispatch (hermetic).
+/// Injected environment for one `bitty extension` dispatch (hermetic).
 #[derive(Debug, Clone, Default)]
 pub struct ComponentContext<'a> {
     /// `XDG_DATA_HOME` environment value (user tier parent).
@@ -953,7 +968,7 @@ fn check_wsl_for_store_verb(
     let selection = match bitty_runtime::component::select_wsl_distro(explicit_distro, env_distro) {
         Ok(selection) => selection,
         Err(error) => {
-            eprintln!("bitty component: {}", error.message());
+            eprintln!("bitty extension: {}", error.message());
             return Err(EXIT_USAGE);
         }
     };
@@ -967,7 +982,7 @@ fn check_wsl_for_store_verb(
     {
         if selection.is_some() {
             if let Err(error) = bitty_runtime::component::detect_wsl_context() {
-                eprintln!("bitty component: {}", error.message());
+                eprintln!("bitty extension: {}", error.message());
                 return Err(error.exit_code());
             }
         }
@@ -1001,7 +1016,7 @@ fn persist_wsl_selection(
     publish_bytes_atomic(&path, content.as_bytes(), None)
 }
 
-/// Run one `bitty component` invocation; returns the process exit code.
+/// Run one `bitty extension` invocation; returns the process exit code.
 pub fn run_component_subcommand(
     raw: &[String],
     context: &ComponentContext<'_>,
@@ -1050,12 +1065,12 @@ pub fn run_component_subcommand(
                 Ok(None) => None,
                 Ok(Some(_)) => {
                     eprintln!(
-                        "bitty component: --distro only applies to `add` (guest-helper staging); `install` fetches the host triple and cannot stage a Linux guest helper — stage one with `bitty component add <path> --distro <name>` (e.g. from inside the guest; cross-target Linux fetching is a #1908 follow-up, not in this change)"
+                        "bitty extension: --distro only applies to `add` (guest-helper staging); `install` fetches the host triple and cannot stage a Linux guest helper — stage one with `bitty extension add <path> --distro <name>` (e.g. from inside the guest; cross-target Linux fetching is a #1908 follow-up, not in this change)"
                     );
                     return EXIT_USAGE;
                 }
                 Err(error) => {
-                    eprintln!("bitty component: {}", error.message());
+                    eprintln!("bitty extension: {}", error.message());
                     return EXIT_USAGE;
                 }
             }
@@ -1214,6 +1229,11 @@ fn json_escape(value: &str) -> String {
 }
 
 /// Success envelope for `list`.
+///
+/// The `"command":"component"` field is deliberately stable across the #1959
+/// verb rename: both spellings share this handler, so stdout stays
+/// byte-identical and machine consumers keep parsing without a flag day.
+/// Only the stderr deprecation note distinguishes the alias.
 #[must_use]
 pub fn format_list_envelope(summaries: &[bitty_runtime::component::ComponentSummary]) -> String {
     let mut out = String::from(
@@ -1305,7 +1325,7 @@ fn op_add(
 ) -> Result<String, ComponentFailure> {
     if is_url_operand(source) {
         return Err(ComponentFailure::component(format!(
-            "bitty component: remote sources are not implemented in v1 \
+            "bitty extension: remote sources are not implemented in v1 \
              (got {source:?}); stage from a local directory holding \
              bitty-component.toml plus the executable, or a bare \
              `bitty-<name>` executable with `--version <semver>`"
@@ -1313,7 +1333,7 @@ fn op_add(
     }
     let Some(user) = user_root else {
         return Err(ComponentFailure::component(
-            "bitty component: no user component root (data directory unavailable; set $XDG_DATA_HOME or $HOME)".to_string(),
+            "bitty extension: no user component root (data directory unavailable; set $XDG_DATA_HOME or $HOME)".to_string(),
         ));
     };
     let staged = load_staged_source(source, version_flag)?;
@@ -1341,7 +1361,7 @@ fn op_add(
 
 /// Map a seed failure onto the stable exit taxonomy.
 fn seed_failure(error: &crate::component_seed::SeedError) -> ComponentFailure {
-    let message = format!("bitty component: install failed: {}", error.message());
+    let message = format!("bitty extension: install failed: {}", error.message());
     match error.exit_code() {
         2 => ComponentFailure::usage(message),
         4 => ComponentFailure::component(message),
@@ -1365,28 +1385,28 @@ fn read_tofu_pin(user: &Path, name: &str) -> Result<Option<String>, ComponentFai
     match std::fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             return Err(ComponentFailure::generic(format!(
-                "bitty component: refusing symlink pin file '{}'",
+                "bitty extension: refusing symlink pin file '{}'",
                 path.display()
             )));
         }
         Ok(metadata) if metadata.is_file() => {
             if metadata.len() > MAX_PIN_FILE_BYTES {
                 return Err(ComponentFailure::component(format!(
-                    "bitty component: pin-mismatch for '{name}': pin file '{}' exceeds {MAX_PIN_FILE_BYTES} bytes (corrupt pin; use --force to re-pin)",
+                    "bitty extension: pin-mismatch for '{name}': pin file '{}' exceeds {MAX_PIN_FILE_BYTES} bytes (corrupt pin; use --force to re-pin)",
                     path.display()
                 )));
             }
         }
         Ok(_) => {
             return Err(ComponentFailure::generic(format!(
-                "bitty component: refusing non-file pin path '{}'",
+                "bitty extension: refusing non-file pin path '{}'",
                 path.display()
             )));
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(ComponentFailure::generic(format!(
-                "bitty component: cannot inspect '{}': {error}",
+                "bitty extension: cannot inspect '{}': {error}",
                 path.display()
             )));
         }
@@ -1395,21 +1415,21 @@ fn read_tofu_pin(user: &Path, name: &str) -> Result<Option<String>, ComponentFai
         Ok(bytes) => {
             let Ok(text) = String::from_utf8(bytes) else {
                 return Err(ComponentFailure::component(format!(
-                    "bitty component: pin-mismatch for '{name}': pin file '{}' is not UTF-8 (corrupt pin; use --force to re-pin)",
+                    "bitty extension: pin-mismatch for '{name}': pin file '{}' is not UTF-8 (corrupt pin; use --force to re-pin)",
                     path.display()
                 )));
             };
             let digest = text.trim().to_ascii_lowercase();
             if !crate::component_seed::is_hex_digest(&digest) {
                 return Err(ComponentFailure::component(format!(
-                    "bitty component: pin-mismatch for '{name}': pin file '{}' is invalid (want 64 hex characters; use --force to re-pin)",
+                    "bitty extension: pin-mismatch for '{name}': pin file '{}' is invalid (want 64 hex characters; use --force to re-pin)",
                     path.display()
                 )));
             }
             Ok(Some(digest))
         }
         Err(error) => Err(ComponentFailure::generic(format!(
-            "bitty component: cannot read '{}': {error}",
+            "bitty extension: cannot read '{}': {error}",
             path.display()
         ))),
     }
@@ -1436,7 +1456,7 @@ fn check_registry_digest(
     };
     if !crate::component_seed::digests_equal_ct(expected, tarball_digest) {
         return Err(ComponentFailure::component(format!(
-            "bitty component: install failed: registry digest {} does not match verified tarball digest {tarball_digest} (refusing to install)",
+            "bitty extension: install failed: registry digest {} does not match verified tarball digest {tarball_digest} (refusing to install)",
             expected.to_ascii_lowercase(),
         )));
     }
@@ -1465,12 +1485,12 @@ fn op_install(
     // The parser requires `--version`; this is defense in depth.
     let Some(version) = version_flag else {
         return Err(ComponentFailure::usage(
-            "bitty component: `install` needs `--version <X.Y.Z>` (the seed installs exactly the version named)".to_string(),
+            "bitty extension: `install` needs `--version <X.Y.Z>` (the seed installs exactly the version named)".to_string(),
         ));
     };
     let Some(user) = user_root else {
         return Err(ComponentFailure::component(
-            "bitty component: no user component root (data directory unavailable; set $XDG_DATA_HOME or $HOME)".to_string(),
+            "bitty extension: no user component root (data directory unavailable; set $XDG_DATA_HOME or $HOME)".to_string(),
         ));
     };
     // Validate name/version before probing the host: hostile input is a
@@ -1497,7 +1517,7 @@ fn op_install(
     }
     let target = crate::component_seed::host_target_triple().ok_or_else(|| {
         seed_failure(&crate::component_seed::SeedError::UnsupportedHost(format!(
-            "bitty component: unsupported host {}-{} (no prebuilt seed target; install the component from a local path with `bitty component add`)",
+            "bitty extension: unsupported host {}-{} (no prebuilt seed target; install the component from a local path with `bitty extension add`)",
             std::env::consts::OS,
             std::env::consts::ARCH,
         )))
@@ -1534,14 +1554,14 @@ fn op_install(
             true => {}
             false => {
                 return Err(ComponentFailure::generic(format!(
-                    "bitty component: download of '{name}' version {version} was not approved — nothing changed"
+                    "bitty extension: download of '{name}' version {version} was not approved — nothing changed"
                 )));
             }
         }
     } else if needs_consent && yes {
         let _ = writeln!(
             output,
-            "bitty component: --yes approved download of '{name}' version {version} from {}",
+            "bitty extension: --yes approved download of '{name}' version {version} from {}",
             crate::component_seed::BUILTIN_INSTALLER_EGRESS
         );
     }
@@ -1589,7 +1609,7 @@ fn op_install(
     if !pin_matches && !force {
         let pinned = existing_pin.as_deref().unwrap_or("?");
         return Err(ComponentFailure::component(format!(
-            "bitty component: pin-mismatch for '{}' version {}: pinned tarball digest {pinned} differs from verified CDN digest {verified_digest} (TOFU pin; refusing to auto-update; use --force to re-pin)",
+            "bitty extension: pin-mismatch for '{}' version {}: pinned tarball digest {pinned} differs from verified CDN digest {verified_digest} (TOFU pin; refusing to auto-update; use --force to re-pin)",
             staged.name, staged.version,
         )));
     }
@@ -1658,7 +1678,7 @@ fn ask_component_install_consent(
 ) -> Result<bool, ComponentFailure> {
     let _ = writeln!(
         output,
-        "bitty component: install '{name}' version {version} downloads an executable from the builtin installer egress {}:",
+        "bitty extension: install '{name}' version {version} downloads an executable from the builtin installer egress {}:",
         crate::component_seed::BUILTIN_INSTALLER_EGRESS
     );
     let _ = writeln!(output, "  manifest: {}", urls.manifest_url);
@@ -1689,7 +1709,7 @@ fn ask_component_install_consent(
         }
     }
     Err(ComponentFailure::generic(format!(
-        "bitty component: aborted (too many invalid answers, limit {MAX_COMPONENT_CONSENT_ATTEMPTS}) — nothing changed"
+        "bitty extension: aborted (too many invalid answers, limit {MAX_COMPONENT_CONSENT_ATTEMPTS}) — nothing changed"
     )))
 }
 
@@ -1736,7 +1756,7 @@ fn read_consent_answer(
     }
     if failed || (answer.is_empty() && !terminated) {
         return Some(Err(ComponentFailure::generic(
-            "bitty component: aborted (end of input) — nothing changed".to_string(),
+            "bitty extension: aborted (end of input) — nothing changed".to_string(),
         )));
     }
     // A short EOF-terminated line (window not filled) is a complete
@@ -1772,7 +1792,7 @@ fn read_consent_answer(
     match String::from_utf8(answer) {
         Ok(line) => Some(Ok(line)),
         Err(_) => Some(Err(ComponentFailure::generic(
-            "bitty component: aborted (end of input) — nothing changed".to_string(),
+            "bitty extension: aborted (end of input) — nothing changed".to_string(),
         ))),
     }
 }
@@ -1784,13 +1804,13 @@ fn load_staged_source(
     let path = Path::new(source);
     let metadata = std::fs::symlink_metadata(path).map_err(|error| {
         ComponentFailure::component(format!(
-            "bitty component: cannot read source {source:?}: {error} ({})",
+            "bitty extension: cannot read source {source:?}: {error} ({})",
             missing_component_hint_for_add()
         ))
     })?;
     if metadata.file_type().is_symlink() {
         return Err(ComponentFailure::component(format!(
-            "bitty component: source {source:?} is a symlink (refusing to follow)"
+            "bitty extension: source {source:?} is a symlink (refusing to follow)"
         )));
     }
     if metadata.is_dir() {
@@ -1799,7 +1819,7 @@ fn load_staged_source(
         load_staged_file(path, version_flag)
     } else {
         Err(ComponentFailure::component(format!(
-            "bitty component: source {source:?} is not a directory or file"
+            "bitty extension: source {source:?} is not a directory or file"
         )))
     }
 }
@@ -1812,21 +1832,21 @@ fn load_staged_dir(dir: &Path) -> Result<StagedSource, ComponentFailure> {
     let descriptor_path = dir.join(COMPONENT_DESCRIPTOR_FILE);
     let bytes = std::fs::read(&descriptor_path).map_err(|error| {
         ComponentFailure::component(format!(
-            "bitty component: cannot read '{}': {error} (a source directory must hold \
+            "bitty extension: cannot read '{}': {error} (a source directory must hold \
              bitty-component.toml plus the executable)",
             descriptor_path.display()
         ))
     })?;
     if bytes.len() > bitty_runtime::component::COMPONENT_DESCRIPTOR_MAX_BYTES {
         return Err(ComponentFailure::component(format!(
-            "bitty component: '{}' exceeds {} bytes",
+            "bitty extension: '{}' exceeds {} bytes",
             descriptor_path.display(),
             bitty_runtime::component::COMPONENT_DESCRIPTOR_MAX_BYTES
         )));
     }
     let text = std::str::from_utf8(&bytes).map_err(|_| {
         ComponentFailure::component(format!(
-            "bitty component: '{}' is not UTF-8",
+            "bitty extension: '{}' is not UTF-8",
             descriptor_path.display()
         ))
     })?;
@@ -1860,7 +1880,7 @@ fn load_staged_dir(dir: &Path) -> Result<StagedSource, ComponentFailure> {
                 ),
                 Err(error) => {
                     return Err(ComponentFailure::component(format!(
-                        "bitty component: invalid source descriptor '{}': {error}",
+                        "bitty extension: invalid source descriptor '{}': {error}",
                         descriptor_path.display()
                     )));
                 }
@@ -1873,7 +1893,7 @@ fn load_staged_dir(dir: &Path) -> Result<StagedSource, ComponentFailure> {
     if let Some(expected) = expected_digest {
         if expected != actual {
             return Err(ComponentFailure::component(format!(
-                "bitty component: source descriptor sha256 {expected} does not match \
+                "bitty extension: source descriptor sha256 {expected} does not match \
                  computed digest {actual} for '{}'",
                 executable_path.display()
             )));
@@ -1895,12 +1915,12 @@ fn load_staged_file(
 ) -> Result<StagedSource, ComponentFailure> {
     let Some(version) = version_flag else {
         return Err(ComponentFailure::usage(
-            "bitty component: `add <executable>` needs `--version <semver>` (a directory source carries its version in bitty-component.toml)".to_string(),
+            "bitty extension: `add <executable>` needs `--version <semver>` (a directory source carries its version in bitty-component.toml)".to_string(),
         ));
     };
     if bitty_package::Version::parse(version).is_err() {
         return Err(ComponentFailure::usage(format!(
-            "bitty component: invalid --version {version:?} (want strict semver, e.g. 0.0.1)"
+            "bitty extension: invalid --version {version:?} (want strict semver, e.g. 0.0.1)"
         )));
     }
     let file_name = path
@@ -1908,7 +1928,7 @@ fn load_staged_file(
         .and_then(|name| name.to_str())
         .ok_or_else(|| {
             ComponentFailure::component(format!(
-                "bitty component: source '{}' has no file name",
+                "bitty extension: source '{}' has no file name",
                 path.display()
             ))
         })?;
@@ -1920,12 +1940,12 @@ fn load_staged_file(
         .unwrap_or(file_name);
     let name = stem.strip_prefix(COMPONENT_EXECUTABLE_PREFIX).ok_or_else(|| {
         ComponentFailure::component(format!(
-            "bitty component: executable {file_name:?} must be named `bitty-<name>` (name matches [a-z][a-z0-9-]{{0,31}})"
+            "bitty extension: executable {file_name:?} must be named `bitty-<name>` (name matches [a-z][a-z0-9-]{{0,31}})"
         ))
     })?;
     if let Err(error) = validate_component_name(name) {
         return Err(ComponentFailure::component(format!(
-            "bitty component: invalid component name derived from {file_name:?}: {error}"
+            "bitty extension: invalid component name derived from {file_name:?}: {error}"
         )));
     }
     let executable = format!("{COMPONENT_EXECUTABLE_PREFIX}{name}");
@@ -1944,20 +1964,20 @@ fn load_staged_file(
 fn read_executable(path: &Path) -> Result<Vec<u8>, ComponentFailure> {
     let bytes = std::fs::read(path).map_err(|error| {
         ComponentFailure::component(format!(
-            "bitty component: cannot read executable '{}': {error}",
+            "bitty extension: cannot read executable '{}': {error}",
             path.display()
         ))
     })?;
     if bytes.len() as u64 > bitty_runtime::component::COMPONENT_EXECUTABLE_MAX_BYTES {
         return Err(ComponentFailure::component(format!(
-            "bitty component: executable '{}' exceeds {} bytes",
+            "bitty extension: executable '{}' exceeds {} bytes",
             path.display(),
             bitty_runtime::component::COMPONENT_EXECUTABLE_MAX_BYTES
         )));
     }
     if bytes.is_empty() {
         return Err(ComponentFailure::component(format!(
-            "bitty component: executable '{}' is empty",
+            "bitty extension: executable '{}' is empty",
             path.display()
         )));
     }
@@ -2007,7 +2027,7 @@ fn publish_bytes_atomic(
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).map_err(|error| {
                 ComponentFailure::generic(format!(
-                    "bitty component: cannot create '{}': {error}",
+                    "bitty extension: cannot create '{}': {error}",
                     parent.display()
                 ))
             })?;
@@ -2050,7 +2070,7 @@ fn publish_bytes_atomic(
     if let Err(error) = outcome {
         let _ = std::fs::remove_file(&temp);
         return Err(ComponentFailure::generic(format!(
-            "bitty component: cannot publish '{}': {error}",
+            "bitty extension: cannot publish '{}': {error}",
             destination.display()
         )));
     }
@@ -2072,14 +2092,14 @@ pub(crate) fn install_staged(
             Ok(metadata) if metadata.file_type().is_dir() => {}
             Ok(_) => {
                 return Err(ComponentFailure::generic(format!(
-                    "bitty component: refusing symlink or non-directory '{}'",
+                    "bitty extension: refusing symlink or non-directory '{}'",
                     path.display()
                 )));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(ComponentFailure::generic(format!(
-                    "bitty component: cannot inspect '{}': {error}",
+                    "bitty extension: cannot inspect '{}': {error}",
                     path.display()
                 )));
             }
@@ -2095,7 +2115,7 @@ pub(crate) fn install_staged(
         match std::fs::symlink_metadata(path) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err(ComponentFailure::generic(format!(
-                    "bitty component: refusing symlink install path '{}'",
+                    "bitty extension: refusing symlink install path '{}'",
                     path.display()
                 )));
             }
@@ -2103,7 +2123,7 @@ pub(crate) fn install_staged(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(ComponentFailure::generic(format!(
-                    "bitty component: cannot inspect '{}': {error}",
+                    "bitty extension: cannot inspect '{}': {error}",
                     path.display()
                 )));
             }
@@ -2119,7 +2139,7 @@ pub(crate) fn install_staged(
                 Ok(installed) => {
                     if installed.sha256 != digest {
                         return Err(ComponentFailure::component(format!(
-                            "bitty component: version {} of '{}' is already installed with a different digest (refusing to overwrite)",
+                            "bitty extension: version {} of '{}' is already installed with a different digest (refusing to overwrite)",
                             staged.version, staged.name
                         )));
                     }
@@ -2128,14 +2148,14 @@ pub(crate) fn install_staged(
                     // A corrupt installed descriptor fails closed rather
                     // than being silently overwritten.
                     return Err(ComponentFailure::component(format!(
-                        "bitty component: installed descriptor '{}' is invalid (refusing to overwrite)",
+                        "bitty extension: installed descriptor '{}' is invalid (refusing to overwrite)",
                         descriptor_path.display()
                     )));
                 }
             },
             Err(error) => {
                 return Err(ComponentFailure::generic(format!(
-                    "bitty component: cannot read '{}': {error}",
+                    "bitty extension: cannot read '{}': {error}",
                     descriptor_path.display()
                 )));
             }
@@ -2144,7 +2164,7 @@ pub(crate) fn install_staged(
 
     std::fs::create_dir_all(&version_dir).map_err(|error| {
         ComponentFailure::generic(format!(
-            "bitty component: cannot create '{}': {error}",
+            "bitty extension: cannot create '{}': {error}",
             version_dir.display()
         ))
     })?;
@@ -2160,7 +2180,7 @@ pub(crate) fn install_staged(
     // Defense in depth: never write bytes this module cannot read back.
     ComponentDescriptor::parse(&descriptor_text).map_err(|error| {
         ComponentFailure::generic(format!(
-            "bitty component: internal error: rendered descriptor invalid: {error}"
+            "bitty extension: internal error: rendered descriptor invalid: {error}"
         ))
     })?;
     publish_bytes_atomic(&descriptor_path, descriptor_text.as_bytes(), None)?;
@@ -2190,19 +2210,19 @@ fn op_remove(
 ) -> Result<String, ComponentFailure> {
     if let Err(error) = validate_component_name(name) {
         return Err(ComponentFailure::usage(format!(
-            "bitty component: invalid component name {name:?}: {error}"
+            "bitty extension: invalid component name {name:?}: {error}"
         )));
     }
     if let Some(version) = version {
         if bitty_package::Version::parse(version).is_err() {
             return Err(ComponentFailure::usage(format!(
-                "bitty component: invalid version {version:?} (want strict semver)"
+                "bitty extension: invalid version {version:?} (want strict semver)"
             )));
         }
     }
     let Some(user) = user_root else {
         return Err(ComponentFailure::component(
-            "bitty component: no user component root (data directory unavailable; set $XDG_DATA_HOME or $HOME)".to_string(),
+            "bitty extension: no user component root (data directory unavailable; set $XDG_DATA_HOME or $HOME)".to_string(),
         ));
     };
     let component_dir = user.join(name);
@@ -2213,7 +2233,7 @@ fn op_remove(
         if let Some(system) = system_root {
             if system.join(name).is_dir() {
                 return Err(ComponentFailure::component(format!(
-                    "bitty component: '{}' is installed system-wide at {} (`bitty component remove` only removes user-installed components; use your system package manager)",
+                    "bitty extension: '{}' is installed system-wide at {} (`bitty extension remove` only removes user-installed components; use your system package manager)",
                     name,
                     system.join(name).display()
                 )));
@@ -2227,13 +2247,13 @@ fn op_remove(
             let version_dir = component_dir.join(version);
             if !version_dir.is_dir() {
                 return Err(ComponentFailure::component(format!(
-                    "bitty component: version {version} of '{name}' is not installed in the user tier ({})",
+                    "bitty extension: version {version} of '{name}' is not installed in the user tier ({})",
                     version_dir.display()
                 )));
             }
             std::fs::remove_dir_all(&version_dir).map_err(|error| {
                 ComponentFailure::generic(format!(
-                    "bitty component: cannot remove '{}': {error}",
+                    "bitty extension: cannot remove '{}': {error}",
                     version_dir.display()
                 ))
             })?;
@@ -2256,7 +2276,7 @@ fn op_remove(
         None => {
             std::fs::remove_dir_all(&component_dir).map_err(|error| {
                 ComponentFailure::generic(format!(
-                    "bitty component: cannot remove '{}': {error}",
+                    "bitty extension: cannot remove '{}': {error}",
                     component_dir.display()
                 ))
             })?;

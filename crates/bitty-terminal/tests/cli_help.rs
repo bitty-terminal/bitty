@@ -74,7 +74,7 @@ fn default_help_lists_every_subcommand_on_one_line() {
         "inspect",
         "dev",
         "plugin",
-        "component",
+        "extension",
         "cmd",
         "x",
         "completion",
@@ -180,7 +180,10 @@ fn every_subcommand_still_reachable_via_per_command_help() {
         ("inspect", "bitty inspect"),
         ("dev", "bitty dev"),
         ("plugin", "bitty plugin"),
-        ("component", "bitty component"),
+        ("extension", "bitty extension"),
+        // Hidden deprecated alias (issue #1959): still resolves, prints the
+        // canonical help, and warns on stderr (asserted in cli_component.rs).
+        ("component", "bitty extension"),
         ("cmd", "bitty cmd"),
         ("x", "bitty x"),
         ("completion", "bitty completion"),

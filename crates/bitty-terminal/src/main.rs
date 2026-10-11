@@ -439,9 +439,14 @@ fn main() {
         println!("{}", plugin::plugin_help_text());
         std::process::exit(0);
     }
-    // `bitty component --help` shows component help (local class: no
-    // instance, no config, no component execution).
+    // `bitty extension --help` (or the hidden `bitty component --help`
+    // alias) shows extension help (local class: no instance, no config, no
+    // component execution). The alias prints the stderr deprecation note;
+    // stdout stays identical so `--help` output is diffable.
     if args.help && args.component_word {
+        if args.component_spelling == "component" {
+            eprintln!("{}", component::component_deprecated_note());
+        }
         println!("{}", component::component_help_text());
         std::process::exit(0);
     }
@@ -552,7 +557,13 @@ fn main() {
                     println!("{}", plugin::plugin_help_text());
                     std::process::exit(0);
                 }
-                Some("component") => {
+                Some("extension") => {
+                    // Hidden alias `bitty help component` resolves here too;
+                    // stdout matches `bitty extension --help`, the deprecation
+                    // note goes to stderr.
+                    if raw == "component" {
+                        eprintln!("{}", component::component_deprecated_note());
+                    }
                     println!("{}", component::component_help_text());
                     std::process::exit(0);
                 }
@@ -754,11 +765,17 @@ fn main() {
         ));
     }
 
-    // `bitty component` native binary extension management (issue #1651).
-    // Local class: file inventory only — no instance, no IPC, no component
-    // code ever loaded or executed. Runs before config load so `component`
-    // works with a missing config (safe-mode clean).
+    // `bitty extension` native binary extension management (issue #1651,
+    // renamed from `bitty component` by issue #1959). Local class: file
+    // inventory only — no instance, no IPC, no component code ever loaded
+    // or executed. Runs before config load so `extension` works with a
+    // missing config (safe-mode clean). The hidden `component` alias shares
+    // this handler byte-for-byte on stdout and adds only the stderr
+    // deprecation note (kept at least through 0.1.0).
     if args.component_word {
+        if args.component_spelling == "component" {
+            eprintln!("{}", component::component_deprecated_note());
+        }
         let xdg_data_home = std::env::var("XDG_DATA_HOME").ok();
         let home = std::env::var("HOME").ok();
         let components_dir = std::env::var("BITTY_COMPONENTS_DIR").ok();

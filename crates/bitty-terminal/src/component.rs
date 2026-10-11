@@ -118,6 +118,8 @@ pub const MAX_COMPONENT_CONSENT_LINE_BYTES: usize = 64;
 pub const MAX_COMPONENT_CONSENT_ATTEMPTS: usize = 3;
 /// Maximum bytes for a `--digest` value (64 hex chars, bounded like tokens).
 pub const MAX_COMPONENT_DIGEST_BYTES: usize = 256;
+/// Maximum bytes for a `--distro` value (mirrors the WSL module bound).
+pub const MAX_COMPONENT_DISTRO_BYTES: usize = 64;
 /// TOFU pin file name inside `<user>/<name>/` holding the verified CDN
 /// tarball digest (`<hex>\n`, written atomically like `current`).
 pub const TARBALL_PIN_FILE: &str = "tarball.sha256";
@@ -227,6 +229,11 @@ pub struct ComponentRequest {
     /// Never bypasses digest verification; only overwrites the pin after
     /// both-must-match passes.
     pub force: bool,
+    /// `add`/`install --distro <name>`: WSL2 guest distro for component
+    /// execution on Windows (explicit selection; `default` means the `wsl.exe`
+    /// default distro). Windows-only in effect: Unix accepts and validates
+    /// the value but stays native (no-op).
+    pub distro: Option<String>,
 }
 
 /// Why parsing failed.
@@ -272,6 +279,20 @@ fn valid_digest_flag(value: &str) -> bool {
     digest_token_ok(value) && crate::component_seed::is_hex_digest(value)
 }
 
+/// Validate a `--distro` value: bounded token plus the WSL distro grammar.
+///
+/// The literal `default` selects the `wsl.exe` default distro; every other
+/// value must pass the WSL distro grammar. Fail-closed as usage (exit 2).
+fn valid_distro_flag(value: &str) -> bool {
+    if value.is_empty() || value.len() > MAX_COMPONENT_DISTRO_BYTES || value.contains('\0') {
+        return false;
+    }
+    if value == "default" {
+        return true;
+    }
+    bitty_runtime::component::valid_wsl_distro(value)
+}
+
 /// Parse the tokens captured after the `component` word (bounded, fail-closed).
 pub fn parse_component_request(
     raw: &[String],
@@ -286,6 +307,7 @@ pub fn parse_component_request(
     let mut yes = false;
     let mut digest: Option<String> = None;
     let mut force = false;
+    let mut distro: Option<String> = None;
 
     let mut index = 0usize;
     while index < raw.len() {
@@ -401,6 +423,42 @@ pub fn parse_component_request(
             index += 2;
             continue;
         }
+        if let Some(value) = token.strip_prefix("--distro=") {
+            if !valid_distro_flag(value) {
+                return Err(ComponentParseError::Usage(format!(
+                    "bitty component: invalid --distro {value:?} (want 1..={MAX_COMPONENT_DISTRO_BYTES} bytes of [A-Za-z0-9._-], or the literal `default`)"
+                )));
+            }
+            if distro.is_some() {
+                return Err(ComponentParseError::Usage(
+                    "bitty component: duplicate --distro".to_string(),
+                ));
+            }
+            distro = Some(value.to_string());
+            index += 1;
+            continue;
+        }
+        if token == "--distro" {
+            let Some(value) = raw.get(index + 1) else {
+                return Err(ComponentParseError::Usage(
+                    "bitty component: --distro needs a value (a WSL distro name, or `default`)"
+                        .to_string(),
+                ));
+            };
+            if !valid_distro_flag(value) {
+                return Err(ComponentParseError::Usage(format!(
+                    "bitty component: invalid --distro {value:?} (want 1..={MAX_COMPONENT_DISTRO_BYTES} bytes of [A-Za-z0-9._-], or the literal `default`)"
+                )));
+            }
+            if distro.is_some() {
+                return Err(ComponentParseError::Usage(
+                    "bitty component: duplicate --distro".to_string(),
+                ));
+            }
+            distro = Some(value.clone());
+            index += 2;
+            continue;
+        }
         if token.starts_with('-') && token.len() > 1 {
             return Err(ComponentParseError::Usage(format!(
                 "bitty component: unknown flag {token:?}"
@@ -487,6 +545,12 @@ pub fn parse_component_request(
             if force {
                 return Err(ComponentParseError::Usage(format!(
                     "bitty component: --force only applies to `install` (got `{}`)",
+                    verb.name()
+                )));
+            }
+            if distro.is_some() {
+                return Err(ComponentParseError::Usage(format!(
+                    "bitty component: --distro only applies to `add`/`install` (got `{}`)",
                     verb.name()
                 )));
             }
@@ -593,6 +657,12 @@ pub fn parse_component_request(
                     verb.name()
                 )));
             }
+            if distro.is_some() {
+                return Err(ComponentParseError::Usage(format!(
+                    "bitty component: --distro only applies to `add`/`install` (got `{}`)",
+                    verb.name()
+                )));
+            }
         }
     }
 
@@ -606,6 +676,7 @@ pub fn parse_component_request(
         yes,
         digest,
         force,
+        distro,
     })
 }
 
@@ -613,8 +684,8 @@ pub fn parse_component_request(
 #[must_use]
 pub fn component_usage() -> String {
     "usage: bitty component list [--format table|json|jsonl] [--no-color]\n\
-     \x20      bitty component add <path> [--version <semver>]\n\
-     \x20      bitty component install <name> --version <X.Y.Z> [--digest <hex>] [--force] [--yes]\n\
+     \x20      bitty component add <path> [--version <semver>] [--distro <name|default>]\n\
+     \x20      bitty component install <name> --version <X.Y.Z> [--digest <hex>] [--force] [--yes] [--distro <name|default>]\n\
      \x20      bitty component remove <name> [<version>]\n\
      \n\
      Components are upstream native binaries resolved user-first:\n\
@@ -624,7 +695,10 @@ pub fn component_usage() -> String {
      seed (builtin cdn.bitty.run:443 egress, dual-digest verified silent\n\
      else explicit consent, TOFU-pinned; --force re-pins), then the full\n\
      manager takes over; `remove` only touches the user tier (no root required).\n\
-     `bitty component --help` explains sources, ABI checks, and exit codes."
+     On Windows, --distro routes execution through the WSL2 trampoline\n\
+     (wsl.exe --distribution D --exec, default distro with `default`);\n\
+     Unix ignores --distro (native execution). `bitty component --help`\n\
+     explains sources, ABI checks, WSL2 paths and stdio, and exit codes."
         .to_string()
 }
 
@@ -674,6 +748,35 @@ pub fn component_help_text() -> String {
      \x20                             NOT bypass digest verification.\n\
      \x20 --yes                       install only: approve the download consent\n\
      \x20                             non-interactively (no prompt).\n\
+     \x20 --distro <name|default>     add/install only: WSL2 guest distro for\n\
+     \x20                             component execution on Windows. `default` uses\n\
+     \x20                             the wsl.exe default distro. Windows-only in\n\
+     \x20                             effect: Unix validates the value but stays\n\
+     \x20                             native (no-op). See `WSL2 trampoline` below.\n\
+     \n\
+     WSL2 trampoline (Windows only, issue #1908):\n\
+     \x20 Windows component helpers that must run inside a WSL2 guest do so\n\
+     \x20 through wsl.exe [--distribution D] --exec <helper> <fixed-argv>\n\
+     \x20 (PATH-resolved wsl.exe, fixed argv, no shell on either side).\n\
+     \x20 Guest distro selection: explicit --distro wins, else BITTY_WSL_DISTRO\n\
+     \x20 config wins, else native execution (no trampoline); pass the literal\n\
+     \x20 `default` for the wsl.exe default distro (no --distribution flag).\n\
+     \x20 A selected distro with absent WSL fails closed before any fetch or\n\
+     \x20 staging (exit 1): install or enable WSL2, or run without --distro.\n\
+     \x20 Path mapping (Windows to guest for spawn): drive-absolute X:\\...\n\
+     \x20 maps to /mnt/<lower-x>/... and WSL UNC \\\\wsl$\\<distro>\\...\n\
+     \x20 maps to guest-absolute /...; device paths, drive-relative,\n\
+     \x20 relative, and other UNC spellings fail closed (exit 2, no silent\n\
+     \x20 mangling). Backslash rewriting happens only inside path mapping;\n\
+     \x20 general argv elements pass through discrete with spaces preserved\n\
+     \x20 and metacharacters inert. Reverse (/mnt/... to Windows) exists for\n\
+     \x20 diagnostics only; other guest paths have no Windows spelling.\n\
+     \x20 Stdio and signals: stdin/stdout/stderr pipes pass through wsl.exe\n\
+     \x20 unchanged (binary-safe, no CRLF translation); Ctrl-C propagates via\n\
+     \x20 wsl.exe to the guest helper; the wsl.exe exit status is the helper\n\
+     \x20 exit status (1:1 fidelity, no remapping). Fetch stays native\n\
+     \x20 (Windows curl.exe/tar.exe); the trampoline applies to component\n\
+     \x20 execution, never to downloads.\n\
      \n\
      installer egress:\n\
      \x20 cdn.bitty.run:443 is the core-built-in installer egress: strict\n\
@@ -737,17 +840,20 @@ pub fn component_help_text() -> String {
      \n\
      exit codes:\n\
      \x20 0 success | 1 declined consent, aborted prompt, filesystem\n\
-     \x20 failure, or fetch-environment failure (missing/too-old curl,\n\
-     \x20 missing tar) | 2 usage (including malformed --digest) | 4\n\
+     \x20 failure, fetch-environment failure (missing/too-old curl,\n\
+     \x20 missing tar), or WSL absent when --distro was requested | 2 usage\n\
+     \x20 (including malformed --digest/--distro and unmappable WSL paths) | 4\n\
      \x20 component error (integrity, ABI, digest, pin-mismatch)\n\
      \n\
      examples:\n\
      \x20 bitty component list\n\
      \x20 bitty component list --format json\n\
      \x20 bitty component add ./dist/net --version 0.0.1\n\
+     \x20 bitty component add ./dist/net --distro Ubuntu\n\
      \x20 bitty component install net --version 0.0.23\n\
      \x20 bitty component install net --version 0.0.23 --digest <hex>\n\
      \x20 bitty component install net --version 0.0.23 --force --yes\n\
+     \x20 bitty component install net --version 0.0.23 --distro default\n\
      \x20 bitty component remove net 0.0.1"
         .to_string()
 }
@@ -768,6 +874,9 @@ pub struct ComponentContext<'a> {
     /// `BITTY_SYSTEM_COMPONENTS_DIR` override (tests; default is the
     /// platform system path).
     pub system_components_dir: Option<&'a str>,
+    /// `BITTY_WSL_DISTRO` environment/config value for guest distro
+    /// selection (tests pass values in; production reads the environment).
+    pub wsl_distro_env: Option<&'a str>,
     /// Pre-word global `--format` fallback.
     pub pre_format: Option<&'a str>,
     /// Pre-word `--no-color`.
@@ -804,6 +913,43 @@ impl ComponentFailure {
     }
 }
 
+/// Validate WSL2 distro selection for `add`/`install` (fail-closed before mutation).
+///
+/// Returns `Err(exit_code)` when the caller should exit early: invalid distro
+/// selection fails as usage (exit 2) on every platform; on Windows a selected
+/// distro with absent WSL fails as environmental (exit 1) with the actionable
+/// diagnostic. Unix never probes (no-op, `Ok(())` when the selection itself
+/// is valid, even when a distro is selected).
+fn check_wsl_for_store_verb(
+    explicit_distro: Option<&str>,
+    env_distro: Option<&str>,
+) -> Result<(), i32> {
+    let selection = match bitty_runtime::component::select_wsl_distro(explicit_distro, env_distro) {
+        Ok(selection) => selection,
+        Err(error) => {
+            eprintln!("bitty component: {}", error.message());
+            return Err(EXIT_USAGE);
+        }
+    };
+    // Unix: selection validated above, execution stays native (no probe).
+    #[cfg(not(windows))]
+    {
+        let _ = &selection;
+        Ok(())
+    }
+    // Windows: probe only when a distro was selected; native otherwise.
+    #[cfg(windows)]
+    {
+        if selection.is_some() {
+            if let Err(error) = bitty_runtime::component::detect_wsl_context() {
+                eprintln!("bitty component: {}", error.message());
+                return Err(error.exit_code());
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Run one `bitty component` invocation; returns the process exit code.
 pub fn run_component_subcommand(
     raw: &[String],
@@ -830,6 +976,21 @@ pub fn run_component_subcommand(
         data_home.as_deref(),
         context.system_components_dir,
     );
+
+    // WSL2 trampoline gate (#1908) for store verbs that stage executables
+    // (`add`/`install`): validate distro selection on every platform (usage
+    // error on invalid, exit 2, before any mutation); on Windows probe WSL
+    // when a distro is selected and fail closed when absent (exit 1, before
+    // any fetch or staging). Unix never probes (no-op, native execution).
+    // `list`/`remove` never consult the trampoline (read-only or user-tier
+    // only, no execution).
+    if matches!(request.verb, ComponentVerb::Add | ComponentVerb::Install) {
+        if let Err(exit) =
+            check_wsl_for_store_verb(request.distro.as_deref(), context.wsl_distro_env)
+        {
+            return exit;
+        }
+    }
 
     match request.verb {
         ComponentVerb::List => {
@@ -2054,6 +2215,7 @@ mod tests {
                 home: None,
                 components_dir: Some(user),
                 system_components_dir: Some(system),
+                wsl_distro_env: None,
                 pre_format: None,
                 pre_no_color: false,
             },
@@ -2357,6 +2519,133 @@ mod tests {
                 "--force on {verb} must fail"
             );
         }
+    }
+
+    #[test]
+    fn parses_distro_for_add_and_install() {
+        // `install --distro` and `add --distro` parse; `default` selects the
+        // `wsl.exe` default distro. Unix validates but stays native (no-op).
+        let request = parse_component_request(
+            &[
+                String::from("install"),
+                String::from("net"),
+                String::from("--version"),
+                String::from("0.0.23"),
+                String::from("--distro"),
+                String::from("Ubuntu"),
+            ],
+            None,
+        )
+        .expect("install --distro");
+        assert_eq!(request.distro.as_deref(), Some("Ubuntu"));
+
+        let request = parse_component_request(
+            &[
+                String::from("install"),
+                String::from("net"),
+                String::from("--version"),
+                String::from("0.0.23"),
+                String::from("--distro=default"),
+            ],
+            None,
+        )
+        .expect("install --distro=default");
+        assert_eq!(request.distro.as_deref(), Some("default"));
+
+        let request = parse_component_request(
+            &[
+                String::from("add"),
+                String::from("./dist"),
+                String::from("--distro"),
+                String::from("Debian"),
+            ],
+            None,
+        )
+        .expect("add --distro");
+        assert_eq!(request.distro.as_deref(), Some("Debian"));
+
+        // The CLI bound mirrors the WSL module bound.
+        assert_eq!(
+            MAX_COMPONENT_DISTRO_BYTES,
+            bitty_runtime::component::WSL_DISTRO_MAX_BYTES
+        );
+
+        // Malformed, missing, and duplicate values fail as usage.
+        for bad in [
+            String::new(),
+            "../evil".to_string(),
+            "Ubuntu/Debian".to_string(),
+            "Ubuntu Debian".to_string(),
+            "a".repeat(65),
+        ] {
+            assert!(
+                parse_component_request(
+                    &[
+                        String::from("install"),
+                        String::from("net"),
+                        String::from("--version"),
+                        String::from("0.0.23"),
+                        String::from("--distro"),
+                        bad.clone(),
+                    ],
+                    None,
+                )
+                .is_err(),
+                "malformed --distro must fail: {bad:?}"
+            );
+        }
+        assert!(
+            parse_component_request(
+                &[
+                    String::from("install"),
+                    String::from("net"),
+                    String::from("--version"),
+                    String::from("0.0.23"),
+                    String::from("--distro"),
+                ],
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_component_request(
+                &[
+                    String::from("install"),
+                    String::from("net"),
+                    String::from("--version"),
+                    String::from("0.0.23"),
+                    String::from("--distro"),
+                    String::from("Ubuntu"),
+                    String::from("--distro=Debian"),
+                ],
+                None,
+            )
+            .is_err()
+        );
+        // `--distro` only applies to `add`/`install`.
+        assert!(
+            parse_component_request(
+                &[
+                    String::from("list"),
+                    String::from("--distro"),
+                    String::from("Ubuntu")
+                ],
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_component_request(
+                &[
+                    String::from("remove"),
+                    String::from("net"),
+                    String::from("--distro"),
+                    String::from("Ubuntu"),
+                ],
+                None,
+            )
+            .is_err()
+        );
     }
 
     #[test]

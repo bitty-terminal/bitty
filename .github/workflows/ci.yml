@@ -1011,6 +1011,18 @@ jobs:
         run: |
           cargo test -p bitty-terminal --features dev-tools --test cli_dev --locked
 
+      # CTX-1114 (#1908): Windows WSL2 trampoline leg (explicitly labeled until
+      # verified end-to-end, never a silent-empty cell). Runs the gated
+      # integration plus the component unit suites; skips with notice when WSL
+      # is absent on the runner (must NOT fail the suite there). Unix legs prove
+      # the no-op contract via the same tests.
+      - name: Verify WSL2 trampoline (Windows, gated — skips with notice when WSL absent)
+        shell: bash
+        run: |
+          cargo test -p bitty-runtime --test component_wsl_trampoline --locked -- --nocapture
+          cargo test -p bitty-runtime --lib --locked component::wsl::
+          cargo test -p bitty-terminal --bin bitty --locked component::
+
       # M1-10 / CTX-0574: Windows x86_64 (ConPTY) leg of the M1 compatibility
       # matrix, the third ADR-0002 Tier 1 platform. `shell: bash` selects the
       # Git Bash on windows-latest; the suites are headless and the rasterizer

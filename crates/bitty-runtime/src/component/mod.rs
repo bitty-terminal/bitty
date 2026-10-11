@@ -78,6 +78,7 @@ mod grant;
 mod inventory;
 mod policy;
 mod stderr;
+mod wsl;
 
 use std::time::Duration;
 
@@ -103,6 +104,12 @@ pub use inventory::{
 };
 pub use policy::{CrashTracker, DeadlineStrikes, SpawnGate};
 pub use stderr::{StderrRing, stderr_log_tail};
+pub use wsl::{
+    WSL_DISTRO_ENV, WSL_DISTRO_MAX_BYTES, WSL_EXE, WSL_PATH_MAX_BYTES, WSL_PROBE_TIMEOUT,
+    WSL_VERSION_OUTPUT_MAX_BYTES, WslDistro, WslError, detect_wsl_context, guest_mnt_to_windows,
+    map_store_paths_for_guest, select_wsl_distro, valid_wsl_distro, windows_path_to_guest,
+    wsl_argv, wsl_argv_with_cwd, wsl_trampoline_active,
+};
 
 /// Wire codec re-exports the broker API is expressed in.
 ///

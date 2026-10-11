@@ -126,10 +126,19 @@ pub struct BrokerConfig {
     pub shutdown_grace: Duration,
     /// `HelloAck` deadline.
     pub handshake_timeout: Duration,
+    /// WSL2 trampoline selection on Windows (`None` means native execution).
+    ///
+    /// Windows-only: when `Some`, component helpers spawn through `wsl.exe`
+    /// (`--distribution` for `Named`, no flag for `Default`, plus `--cd` to
+    /// the mapped version directory and `--exec` to the mapped helper, fixed
+    /// argv preserved). Unix ignores this field entirely (no-op, native
+    /// execution, so Unix behavior is 100% unchanged).
+    pub wsl: Option<super::wsl::WslDistro>,
 }
 
 impl BrokerConfig {
-    /// DIR-030 defaults for `root` and `env` (system tier disabled).
+    /// DIR-030 defaults for `root` and `env` (system tier disabled, native
+    /// execution on every platform).
     #[must_use]
     pub fn new(root: Option<PathBuf>, env: ComponentEnv) -> Self {
         Self {
@@ -140,6 +149,7 @@ impl BrokerConfig {
             idle_timeout: COMPONENT_IDLE_TIMEOUT,
             shutdown_grace: COMPONENT_SHUTDOWN_GRACE,
             handshake_timeout: COMPONENT_HANDSHAKE_TIMEOUT,
+            wsl: None,
         }
     }
 
@@ -147,6 +157,16 @@ impl BrokerConfig {
     #[must_use]
     pub fn with_system_root(mut self, system_root: Option<PathBuf>) -> Self {
         self.system_root = system_root;
+        self
+    }
+
+    /// Select the WSL2 trampoline on Windows (`None` disables it, native).
+    ///
+    /// Windows-only in effect: Unix ignores the value (no-op). `Some(Default)`
+    /// uses the `wsl.exe` default distro, `Some(Named)` uses `--distribution`.
+    #[must_use]
+    pub fn with_wsl_distro(mut self, wsl: Option<super::wsl::WslDistro>) -> Self {
+        self.wsl = wsl;
         self
     }
 }
@@ -909,16 +929,63 @@ fn spawn(
     })
     .map_err(BrokerError::InvalidRequest)?;
 
-    let mut command = Command::new(executable);
-    command
-        .env_clear()
-        .current_dir(version_dir)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for (name, value) in config.env.vars() {
-        command.env(name, value);
-    }
+    // Windows WSL2 trampoline (#1908): when a distro is selected, route through
+    // `wsl.exe [--distribution D] --cd <guest-dir> --exec <guest-helper>`
+    // with Windows-to-guest path mapping (fail-closed on unmappable paths).
+    // Unix ignores `config.wsl` entirely (no-op, native execution).
+    #[cfg(windows)]
+    let mut command = {
+        use super::wsl::{map_store_paths_for_guest, wsl_argv_with_cwd, wsl_trampoline_active};
+        if wsl_trampoline_active(config.wsl.as_ref()) {
+            let distro = config.wsl.as_ref().expect("active means Some");
+            let (guest_exe, guest_dir) = map_store_paths_for_guest(executable, version_dir)
+                .map_err(|_| BrokerError::Spawn(std::io::ErrorKind::InvalidInput))?;
+            let argv = wsl_argv_with_cwd(distro, Some(&guest_dir), &guest_exe, &[])
+                .map_err(|_| BrokerError::Spawn(std::io::ErrorKind::InvalidInput))?;
+            // `argv[0]` is `wsl.exe`; the rest are discrete fixed argv
+            // (no shell). The Windows cwd stays the version directory so
+            // relative behavior matches native; `--cd` sets the guest cwd.
+            let mut command = Command::new(&argv[0]);
+            command.args(&argv[1..]);
+            command
+                .env_clear()
+                .current_dir(version_dir)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            for (name, value) in config.env.vars() {
+                command.env(name, value);
+            }
+            command
+        } else {
+            let mut command = Command::new(executable);
+            command
+                .env_clear()
+                .current_dir(version_dir)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            for (name, value) in config.env.vars() {
+                command.env(name, value);
+            }
+            command
+        }
+    };
+    #[cfg(not(windows))]
+    let mut command = {
+        let _ = &config.wsl;
+        let mut command = Command::new(executable);
+        command
+            .env_clear()
+            .current_dir(version_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (name, value) in config.env.vars() {
+            command.env(name, value);
+        }
+        command
+    };
     let mut child = command
         .spawn()
         .map_err(|error| BrokerError::Spawn(error.kind()))?;

@@ -321,7 +321,7 @@ pub fn ctl_help_text() -> String {
           \x20 and workspace list / new / focus / move / rename / move-panel, panel list,\n\
            \x20 and every list, terminal send, and terminal text verb — need no elevation.\n\
            \n\
-           Send quoting (issue #1939): a bare CR needs ANSI-C quoting ($'\\r'); plain '\\r' sends literal backslash-r bytes (fish shows a shell continuation, not a bitty bug).\n\
+           Send quoting (issue #1939): a bare CR needs ANSI-C quoting ($'\\r' in bash/zsh; in fish use (printf '\\r')); plain '\\r' sends literal backslash-r bytes (fish shows a shell continuation, not a bitty bug).\n\
            \n\
            PTY discovery (issue #1900): each PTY child inherits an advisory\n\
           \x20 BITTY_SOCKET pointing at its own instance (never overriding an\n\

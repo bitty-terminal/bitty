@@ -2619,7 +2619,13 @@ impl AppHandler for TerminalApp {
                 // deadline too, otherwise an idle window holds an expired
                 // capture (and its painted overlay) until unrelated activity.
                 let capture = self.overlay_capture_deadline();
-                let wake = [hover, animation, bell, capture]
+                // CTX-1110 fix pass (CodeRabbit Major #2): arm a wake at the
+                // earliest kitty-local worker deadline too, otherwise a
+                // completed or expired read sits unapplied under
+                // `ControlFlow::Wait` until unrelated activity wakes the
+                // loop. `None` when no worker is in flight.
+                let kitty_local = self.runtime.kitty_local_deadline();
+                let wake = [hover, animation, bell, capture, kitty_local]
                     .into_iter()
                     .flatten()
                     .min();

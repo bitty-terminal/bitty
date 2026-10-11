@@ -1107,8 +1107,9 @@ pub struct Runtime {
     ///
     /// The PTY poll never blocks on filesystem I/O: local-medium reads run
     /// on short-lived worker threads (one in flight, FIFO) while the poll
-    /// keeps draining every pane. Bounded (8 global / 2 per origin,
-    /// queued + in-flight + orphans); see `runtime::kitty_file`.
+    /// keeps draining every pane. Bounded by split caps (8 global / 2 per
+    /// origin live threads plus 64 global / 32 per origin queued requests);
+    /// see `runtime::kitty_file`.
     kitty_local_queue: std::collections::VecDeque<kitty_file::KittyLocalRequest>,
     /// In-flight local-medium worker, if any (CTX-1110, single-flight).
     kitty_local_in_flight: Option<kitty_file::KittyLocalInFlight>,

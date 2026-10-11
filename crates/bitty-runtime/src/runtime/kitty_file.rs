@@ -147,14 +147,26 @@ const KITTY_LOCAL_READ_CAP: usize = KITTY_DECODE_MAX_BYTES;
 ///
 /// The PTY poll never blocks on filesystem I/O: local-medium reads run on
 /// short-lived worker threads (one in flight at a time, FIFO) while the
-/// poll keeps draining every pane. Caps count queued + in-flight + timed-out
+/// poll keeps draining every pane. Thread caps count in-flight + timed-out
 /// orphans (hung threads still blocked in the kernel), so a hung filesystem
-/// leaks at most a bounded number of threads and then refuses fail-closed.
+/// leaks at most a bounded number of threads and then refuses fail-closed;
+/// queue caps count admitted-but-unstarted requests (each holds only a small
+/// `KittyLocalRequest`, no thread), so a burst of frames/images from one
+/// pane is admitted instead of silently dropped.
 pub(crate) const KITTY_LOCAL_MAX_PENDING_GLOBAL: usize = 8;
-/// Per-origin queued + in-flight + orphan cap: one origin can hold at most
-/// two slots, so a noisy pane cannot starve other origins out of the global
-/// eight.
+/// Per-origin in-flight + orphan thread cap: one origin can hold at most
+/// two worker threads, so a noisy pane cannot starve other origins out of
+/// the global eight.
 pub(crate) const KITTY_LOCAL_MAX_PENDING_PER_ORIGIN: usize = 2;
+/// Per-origin queued-request cap (CTX-1110 fix pass, CodeRabbit Major #1):
+/// a 10-frame `a=f,t=f` burst from one pane must not drop 8 frames. Queued
+/// requests hold no thread, so 32 per origin is cheap (each is one small
+/// request plus a path-sized name) while still bounding memory.
+pub(crate) const KITTY_LOCAL_MAX_QUEUED_PER_ORIGIN: usize = 32;
+/// Global queued-request cap (CTX-1110 fix pass): two full per-origin
+/// bursts plus headroom; with the 8 thread slots above the total outstanding
+/// work stays bounded at 72 slots worst case.
+pub(crate) const KITTY_LOCAL_MAX_QUEUED_GLOBAL: usize = 64;
 /// Generous wall-clock bound for one local-medium read (CTX-1110).
 ///
 /// Rationale: local SSD reads of at most 64 MiB complete in milliseconds;
@@ -635,6 +647,16 @@ pub(crate) struct KittyLocalRequest {
     /// delete/clear/retire landed in between and the storing completion
     /// drops as stale (delete-wins) instead of resurrecting the image.
     delete_epoch: u64,
+    /// Enqueue-time image anchor (CTX-1110 fix pass, CodeRabbit Major #3):
+    /// cursor cell plus scrollback base on the origin's grid at drain time
+    /// (the pane grid is already swapped in by `handle_pane_bytes`, so
+    /// `self.state` is the emitting grid here). Completion places the blit
+    /// at this cell and advances the cursor from it — reproducing the sync
+    /// order (place at APC cursor, then advance past the image) even when
+    /// prompt/output text drained after the enqueue moved the live cursor.
+    anchor_col: u16,
+    anchor_row: u16,
+    scrollback_base: usize,
     op: KittyLocalOp,
     name: Box<[u8]>,
     medium: bitty_vt::KittyMedium,
@@ -697,14 +719,27 @@ impl Runtime {
             + self.kitty_local_orphans.len()
     }
 
-    /// Pending slots held by one origin.
-    pub(crate) fn kitty_local_pending_for_origin(&self, origin: Option<u64>) -> usize {
+    /// Queued (admitted, unstarted) requests globally. No thread held.
+    pub(crate) fn kitty_local_queued_total(&self) -> usize {
+        self.kitty_local_queue.len()
+    }
+
+    /// Queued requests held by one origin.
+    pub(crate) fn kitty_local_queued_for_origin(&self, origin: Option<u64>) -> usize {
+        self.kitty_local_queue
+            .iter()
+            .filter(|req| req.origin == origin)
+            .count()
+    }
+
+    /// Live worker threads globally (in-flight plus timed-out orphans).
+    pub(crate) fn kitty_local_threads_total(&self) -> usize {
+        usize::from(self.kitty_local_in_flight.is_some()) + self.kitty_local_orphans.len()
+    }
+
+    /// Live worker threads held by one origin.
+    pub(crate) fn kitty_local_threads_for_origin(&self, origin: Option<u64>) -> usize {
         let mut count = 0;
-        for req in &self.kitty_local_queue {
-            if req.origin == origin {
-                count += 1;
-            }
-        }
         if self
             .kitty_local_in_flight
             .as_ref()
@@ -720,11 +755,33 @@ impl Runtime {
         count
     }
 
-    /// Caps check before any I/O (CTX-1110): global plus per-origin
-    /// queued/in-flight limits. Refusals happen here, before spawning.
+    /// Caps check before any I/O (CTX-1110; split CTX-1110 fix pass,
+    /// CodeRabbit Major #1): thread caps (global plus per-origin
+    /// in-flight/orphan limits, bounding kernel-blocked threads) plus the
+    /// larger bounded queue caps (per-origin and global queued limits, no
+    /// thread held). Refusals happen here, before spawning — and before any
+    /// filesystem I/O, so a refused `t=t`/`t=s` object is never unlinked,
+    /// exactly like a sync S3 read refusal (the unlink runs only after a
+    /// successful bounded read; see `read_kitty_local_unix`). No leak
+    /// regression: queue-full parity with the sync refusal posture.
     pub(crate) fn kitty_local_caps_allow(&self, origin: Option<u64>) -> bool {
-        self.kitty_local_pending_total() < KITTY_LOCAL_MAX_PENDING_GLOBAL
-            && self.kitty_local_pending_for_origin(origin) < KITTY_LOCAL_MAX_PENDING_PER_ORIGIN
+        self.kitty_local_threads_total() < KITTY_LOCAL_MAX_PENDING_GLOBAL
+            && self.kitty_local_threads_for_origin(origin) < KITTY_LOCAL_MAX_PENDING_PER_ORIGIN
+            && self.kitty_local_queued_for_origin(origin) < KITTY_LOCAL_MAX_QUEUED_PER_ORIGIN
+            && self.kitty_local_queued_total() < KITTY_LOCAL_MAX_QUEUED_GLOBAL
+    }
+
+    /// Earliest pending local-medium deadline, if any (CTX-1110 fix pass,
+    /// CodeRabbit Major #2): the in-flight worker's wall-clock bound. The
+    /// app event loop arms a timed wake at this instant so a completed or
+    /// expired read applies promptly instead of sitting until the next
+    /// incidental event under `ControlFlow::Wait`. Queued requests carry no
+    /// deadline until promoted; orphans already expired.
+    #[must_use]
+    pub fn kitty_local_deadline(&self) -> Option<std::time::Instant> {
+        self.kitty_local_in_flight
+            .as_ref()
+            .map(|flight| flight.deadline)
     }
 
     /// Current delete generation for one origin (CTX-1110 fix pass):
@@ -767,9 +824,13 @@ impl Runtime {
         name: &[u8],
         control: bitty_vt::KittyControlKeys,
     ) -> bool {
+        let cursor = self.state.cursor().position;
         let request = KittyLocalRequest {
             origin: self.kitty_origin,
             delete_epoch: self.kitty_local_delete_epoch_for(self.kitty_origin),
+            anchor_col: cursor.col,
+            anchor_row: cursor.row,
+            scrollback_base: self.state.scrollback_len(),
             op: KittyLocalOp::Display {
                 format_f,
                 width_s,
@@ -805,9 +866,13 @@ impl Runtime {
         name: &[u8],
         control: bitty_vt::KittyControlKeys,
     ) -> bool {
+        let cursor = self.state.cursor().position;
         let request = KittyLocalRequest {
             origin: self.kitty_origin,
             delete_epoch: self.kitty_local_delete_epoch_for(self.kitty_origin),
+            anchor_col: cursor.col,
+            anchor_row: cursor.row,
+            scrollback_base: self.state.scrollback_len(),
             op: KittyLocalOp::Virtual {
                 format_f,
                 width_s,
@@ -847,9 +912,13 @@ impl Runtime {
             self.answer_kitty_query(format_f, width_s, height_v, &[], control);
             return;
         }
+        let cursor = self.state.cursor().position;
         let request = KittyLocalRequest {
             origin: self.kitty_origin,
             delete_epoch: self.kitty_local_delete_epoch_for(self.kitty_origin),
+            anchor_col: cursor.col,
+            anchor_row: cursor.row,
+            scrollback_base: self.state.scrollback_len(),
             op: KittyLocalOp::Query {
                 format_f,
                 width_s,
@@ -887,9 +956,13 @@ impl Runtime {
         control: bitty_vt::KittyControlKeys,
         action: &bitty_term_state::TerminalAction,
     ) -> bool {
+        let cursor = self.state.cursor().position;
         let request = KittyLocalRequest {
             origin: self.kitty_origin,
             delete_epoch: self.kitty_local_delete_epoch_for(self.kitty_origin),
+            anchor_col: cursor.col,
+            anchor_row: cursor.row,
+            scrollback_base: self.state.scrollback_len(),
             op: KittyLocalOp::Frame {
                 format_f,
                 width_s,
@@ -956,21 +1029,42 @@ impl Runtime {
         // The worker moves the whole `read_kitty_local` call (S3 sandbox
         // behavior preserved exactly: `O_NOFOLLOW`, containment, caps,
         // deny platforms) — never a reimplementation.
+        // CTX-1110 fix pass (CodeRabbit Major #2): the worker wakes the
+        // event loop on EVERY exit. The `PtyWaker` clone moves into the
+        // thread behind a `Drop` guard, so normal completion, caught
+        // panics, AND pre-`catch_unwind` early exits (the old `test_panic`
+        // path panicked before the catch) all wake a `ControlFlow::Wait`
+        // loop; without this a completed read sits unapplied until the
+        // next incidental event. The guard runs during unwinding too, so
+        // no exit path can skip the wake. Wakers are idempotent by
+        // contract (see `PtyWaker` docs), so a racing second wake is safe.
+        let waker: Option<crate::runtime::PtyWaker> = self.pty_waker.clone();
         let spawn = std::thread::Builder::new()
             .name("bitty-kitty-local".to_string())
             .spawn(move || {
-                if test_delay_ms != 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(test_delay_ms));
+                struct WakeOnDrop(Option<crate::runtime::PtyWaker>);
+                impl Drop for WakeOnDrop {
+                    fn drop(&mut self) {
+                        if let Some(wake) = self.0.take() {
+                            wake();
+                        }
+                    }
                 }
-                if test_panic {
-                    panic!("bitty test-injected kitty local worker panic");
-                }
+                let _guard = WakeOnDrop(waker);
                 // Panic isolation: a worker panic must not take down the
-                // PTY poll. `catch_unwind` maps it to a refusal here (plus
-                // `join` below maps a join-level panic the same way).
+                // PTY poll. The whole operation — including the test hooks
+                // — runs inside `catch_unwind`, which maps a panic to a
+                // refusal here (plus `join` below maps a join-level panic
+                // the same way).
                 // `AssertUnwindSafe` is sound: the closure owns its read
                 // parameters and touches no shared `&mut` state.
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if test_delay_ms != 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(test_delay_ms));
+                    }
+                    if test_panic {
+                        panic!("bitty test-injected kitty local worker panic");
+                    }
                     read_kitty_local(
                         medium,
                         &name_owned,
@@ -1122,14 +1216,14 @@ impl Runtime {
                 handle: flight.handle,
             });
             // Defense in depth only (unreachable through this path): the
-            // enqueue gate holds the total at the global cap, and both the
-            // timeout move (in-flight to orphan) and the promote below
-            // (queue to in-flight) preserve it, so the total cannot exceed
-            // the cap here. Retained so a future path change that grows the
-            // total still detaches instead of leaking unbounded (dropping
-            // the handle detaches the thread). At most one timeout lands
-            // per pump, so one detach per pump suffices.
-            if self.kitty_local_pending_total() > KITTY_LOCAL_MAX_PENDING_GLOBAL {
+            // enqueue gate holds the live threads at the global thread cap,
+            // and both the timeout move (in-flight to orphan) and the
+            // promote below (queue to in-flight) preserve it, so the thread
+            // total cannot exceed the cap here. Retained so a future path
+            // change that grows the total still detaches instead of leaking
+            // unbounded (dropping the handle detaches the thread). At most
+            // one timeout lands per pump, so one detach per pump suffices.
+            if self.kitty_local_threads_total() > KITTY_LOCAL_MAX_PENDING_GLOBAL {
                 if let Some(orphan) = self.kitty_local_orphans.pop() {
                     let _ = orphan;
                 }
@@ -1205,15 +1299,19 @@ impl Runtime {
     /// display before frame N of the same image. Panic isolation: panics
     /// arrive here as `Io("read")` refusals, never propagated.
     ///
-    /// Residuals (documented, conservative): completions anchor at
-    /// completion-time cursor/scrollback (same as if the bytes arrived
-    /// then; drift bounded to the current poll's remaining text, zero in
-    /// the common single-image case). Sequencing: a delete/clear/retire
-    /// that lands while a transmit pends advances the origin's delete
-    /// generation, so the stale storing completion drops (delete-wins,
-    /// silent) instead of resurrecting the image; control-only composes
-    /// racing a pending frame still fail closed to prior state
-    /// (`NoAnimationTarget`) rather than waiting.
+    /// Residuals (documented, conservative): completions anchor at the
+    /// enqueue-time cursor/scrollback captured when the APC drained (see
+    /// `KittyLocalRequest::anchor_col`), reproducing the sync order — place
+    /// at the APC cell, then advance past the image from that anchor — even
+    /// when prompt or output text drained after the enqueue moved the live
+    /// cursor. The worker behind a slow disk finishes on a later poll; the
+    /// anchor (not the completion-time cursor) decides placement, so drift
+    /// is bounded by construction rather than by poll timing. Sequencing: a
+    /// delete/clear/retire that lands while a transmit pends advances the
+    /// origin's delete generation, so the stale storing completion drops
+    /// (delete-wins, silent) instead of resurrecting the image;
+    /// control-only composes racing a pending frame still fail closed to
+    /// prior state (`NoAnimationTarget`) rather than waiting.
     fn complete_kitty_local_request(
         &mut self,
         request: &KittyLocalRequest,
@@ -1267,7 +1365,7 @@ impl Runtime {
                 wire_placement,
             } => match result {
                 Ok(bytes) => {
-                    if let Err(err) = self.kitty_display_image_owned_with_wire(
+                    if let Err(err) = self.kitty_display_image_owned_with_wire_at_anchor(
                         *format_f,
                         *width_s,
                         *height_v,
@@ -1279,6 +1377,9 @@ impl Runtime {
                         0,
                         *wire_image,
                         *wire_placement,
+                        request.anchor_col,
+                        request.anchor_row,
+                        request.scrollback_base,
                     ) {
                         if let Some(suppressed) = self.kitty_log.admit_now() {
                             eprintln!(
@@ -1308,7 +1409,7 @@ impl Runtime {
                 has_parent,
             } => match result {
                 Ok(bytes) => {
-                    if let Err(err) = self.kitty_display_virtual_owned_with_wire(
+                    if let Err(err) = self.kitty_display_virtual_owned_with_wire_at_base(
                         *format_f,
                         *width_s,
                         *height_v,
@@ -1318,6 +1419,7 @@ impl Runtime {
                         *wire_image,
                         *wire_placement,
                         *has_parent,
+                        request.scrollback_base,
                     ) {
                         if let Some(suppressed) = self.kitty_log.admit_now() {
                             eprintln!(
@@ -1744,41 +1846,20 @@ mod tests {
 
     #[test]
     fn async_queue_caps_bound_global_and_per_origin() {
-        // Blocked workers (injected delay, generous deadline) fill the
-        // bounded queue without any I/O timing dependence.
+        // Split caps (CTX-1110 fix pass, CodeRabbit Major #1): blocked
+        // workers (injected delay, generous deadline) fill the bounded
+        // QUEUE without any I/O timing dependence. Thread caps (2 per
+        // origin / 8 global in-flight+orphan) stay tight; queue caps (32
+        // per origin / 64 global) admit bursts a 10-frame animation needs.
         let mut rt = async_runtime();
         rt.kitty_local_test_timeout_ms = 5000;
         rt.kitty_local_test_delay_ms = 300;
         let name = b"/tmp/bitty-ctx1110-caps.bin".as_slice();
         let control = async_control(name.len());
-        // Per-origin cap: two slots for the primary, third refuses.
-        assert!(rt.enqueue_kitty_local_display(32, Some(1), Some(1), None, 1, 1, 0, name, control));
-        assert!(rt.enqueue_kitty_local_display(32, Some(1), Some(1), None, 1, 1, 0, name, control));
-        assert!(
-            !rt.enqueue_kitty_local_display(32, Some(1), Some(1), None, 1, 1, 0, name, control),
-            "per-origin cap refuses the third primary slot"
-        );
-        assert_eq!(rt.kitty_local_pending_count(), 2);
-        // Other origins still have slots (no starvation).
-        rt.kitty_origin = Some(7);
-        assert!(rt.enqueue_kitty_local_display(32, Some(1), Some(1), None, 1, 1, 0, name, control));
-        rt.kitty_origin = None;
-        // Fill the global eight: primary holds two, origin 7 holds one,
-        // origins 11 and 12 hold two each (seven total), origin 13 takes
-        // the eighth below.
-        for origin in [11u64, 12] {
-            rt.kitty_origin = Some(origin);
-            assert!(rt.enqueue_kitty_local_display(
-                32,
-                Some(1),
-                Some(1),
-                None,
-                1,
-                1,
-                0,
-                name,
-                control
-            ));
+        // Burst tolerance: ten frames from one origin are all admitted
+        // (one in flight, nine queued) — the old unified cap of two
+        // dropped eight of them silently.
+        for _ in 0..10 {
             assert!(rt.enqueue_kitty_local_display(
                 32,
                 Some(1),
@@ -1791,23 +1872,282 @@ mod tests {
                 control
             ));
         }
-        rt.kitty_origin = Some(13);
-        assert!(
-            rt.enqueue_kitty_local_display(32, Some(1), Some(1), None, 1, 1, 0, name, control),
-            "origin 13 takes the eighth slot"
+        assert_eq!(rt.kitty_local_threads_total(), 1);
+        assert_eq!(rt.kitty_local_queued_for_origin(None), 9);
+        // Per-origin queue cap: 32 queued for the primary (1 in flight +
+        // 32 queued = 33 admitted), the 34th refuses.
+        for _ in 10..33 {
+            assert!(rt.enqueue_kitty_local_display(
+                32,
+                Some(1),
+                Some(1),
+                None,
+                1,
+                1,
+                0,
+                name,
+                control
+            ));
+        }
+        assert_eq!(rt.kitty_local_queued_for_origin(None), 32);
+        assert_eq!(
+            rt.kitty_local_pending_count(),
+            33,
+            "primary holds 1 in flight + 32 queued"
         );
         assert!(
             !rt.enqueue_kitty_local_display(32, Some(1), Some(1), None, 1, 1, 0, name, control),
-            "per-origin cap refuses the third slot for origin 13"
+            "per-origin queue cap refuses past 32 queued"
         );
-        rt.kitty_origin = Some(14);
+        // Other origins still have slots (no starvation): origin 7 queues
+        // its own 32, and the 33rd refuses on the per-origin cap.
+        rt.kitty_origin = Some(7);
+        for _ in 0..32 {
+            assert!(rt.enqueue_kitty_local_display(
+                32,
+                Some(1),
+                Some(1),
+                None,
+                1,
+                1,
+                0,
+                name,
+                control
+            ));
+        }
         assert!(
             !rt.enqueue_kitty_local_display(32, Some(1), Some(1), None, 1, 1, 0, name, control),
-            "global cap refuses past eight slots"
+            "per-origin queue cap refuses the 33rd queued for origin 7"
         );
         rt.kitty_origin = None;
-        assert_eq!(rt.kitty_local_pending_count(), 8);
+        // Global queue cap: 32 + 32 = 64 queued; a fresh origin refuses.
+        assert_eq!(rt.kitty_local_queued_total(), 64);
+        rt.kitty_origin = Some(11);
+        assert!(
+            !rt.enqueue_kitty_local_display(32, Some(1), Some(1), None, 1, 1, 0, name, control),
+            "global queue cap refuses past 64 queued"
+        );
+        rt.kitty_origin = None;
         // Blocked workers detach on drop; the test itself never waited.
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn async_thread_caps_refuse_when_orphans_saturate() {
+        // Thread caps stay tight (CTX-1110 fix pass, CodeRabbit Major #1):
+        // two timed-out orphans for one origin refuse the next enqueue on
+        // the per-origin thread cap even though the queue has room.
+        let file = async_fixture("threadcap", &[0xFF, 0x00, 0x00, 0xFF]);
+        let name = async_path_bytes(&file);
+        let mut rt = async_runtime();
+        rt.kitty_local_test_timeout_ms = 30;
+        rt.kitty_local_test_delay_ms = 500;
+        let control = async_control(name.len());
+        for _ in 0..2 {
+            assert!(rt.enqueue_kitty_local_display(
+                32,
+                Some(1),
+                Some(1),
+                None,
+                1,
+                1,
+                0,
+                &name,
+                control
+            ));
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            rt.pump_kitty_local_completions();
+        }
+        rt.kitty_local_test_timeout_ms = 0;
+        rt.kitty_local_test_delay_ms = 0;
+        assert_eq!(rt.kitty_local_threads_for_origin(None), 2);
+        assert_eq!(rt.kitty_local_queued_total(), 0);
+        assert!(
+            !rt.enqueue_kitty_local_display(32, Some(1), Some(1), None, 1, 1, 0, &name, control),
+            "per-origin thread cap refuses with two orphans outstanding"
+        );
+        let _ = std::fs::remove_dir_all(file.parent().expect("temp parent"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn async_worker_wakes_loop_on_completion() {
+        // CodeRabbit Major #2: the worker invokes `pty_waker` when its read
+        // finishes, so a `ControlFlow::Wait` loop applies the completion
+        // promptly instead of sitting until the next incidental event.
+        let file = async_fixture("waker", &[0xFF, 0x00, 0x00, 0xFF]);
+        let name = async_path_bytes(&file);
+        let mut rt = async_runtime();
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let witness = std::sync::Arc::clone(&fired);
+        rt.set_pty_waker(std::sync::Arc::new(move || {
+            witness.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        let control = async_control(name.len());
+        assert!(rt.enqueue_kitty_local_display(
+            32,
+            Some(1),
+            Some(1),
+            None,
+            1,
+            1,
+            0,
+            &name,
+            control
+        ));
+        for _ in 0..200 {
+            rt.pump_kitty_local_completions();
+            if rt.kitty_local_pending_count() == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(rt.kitty_image_count(), 1, "fast read still lands");
+        assert!(
+            fired.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "worker must wake the loop on completion"
+        );
+        let _ = std::fs::remove_dir_all(file.parent().expect("temp parent"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn async_worker_wakes_loop_on_panic_path() {
+        // CodeRabbit Major #2, early-exit path: the injected panic used to
+        // fire before `catch_unwind`, skipping a wake placed only after it.
+        // The `Drop` guard wakes on every exit, including this one.
+        let file = async_fixture("waker-panic", &[0xFF, 0x00, 0x00, 0xFF]);
+        let name = async_path_bytes(&file);
+        let mut rt = async_runtime();
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let witness = std::sync::Arc::clone(&fired);
+        rt.set_pty_waker(std::sync::Arc::new(move || {
+            witness.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        rt.kitty_local_test_panic = true;
+        let control = async_control(name.len());
+        assert!(rt.enqueue_kitty_local_display(
+            32,
+            Some(1),
+            Some(1),
+            None,
+            1,
+            1,
+            0,
+            &name,
+            control
+        ));
+        for _ in 0..200 {
+            rt.pump_kitty_local_completions();
+            if rt.kitty_local_pending_count() == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        rt.kitty_local_test_panic = false;
+        assert_eq!(rt.kitty_image_count(), 0, "panicked read stores nothing");
+        assert!(
+            fired.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "worker must wake the loop even on the panic path"
+        );
+        let _ = std::fs::remove_dir_all(file.parent().expect("temp parent"));
+    }
+
+    #[test]
+    fn async_deadline_tracks_in_flight_worker() {
+        // CodeRabbit Major #2: the in-flight worker publishes its wall-clock
+        // bound so the app loop can arm `set_wait_until` at it. Queued-only
+        // and idle states publish `None`.
+        let mut rt = async_runtime();
+        assert_eq!(
+            rt.kitty_local_deadline(),
+            None,
+            "idle publishes no deadline"
+        );
+        rt.kitty_local_test_timeout_ms = 5000;
+        rt.kitty_local_test_delay_ms = 300;
+        let name = b"/tmp/bitty-ctx1110-deadline.bin".as_slice();
+        let control = async_control(name.len());
+        assert!(rt.enqueue_kitty_local_display(32, Some(1), Some(1), None, 1, 1, 0, name, control));
+        let before = std::time::Instant::now();
+        let deadline = rt
+            .kitty_local_deadline()
+            .expect("in-flight worker must publish a deadline");
+        // Generous 5 s test override: strictly in the future, bounded above
+        // by the configured timeout (the app's `min` over deadlines can only
+        // wake at or before this instant).
+        assert!(deadline > before, "deadline must be in the future");
+        assert!(
+            deadline <= before + std::time::Duration::from_millis(5000),
+            "deadline must respect the configured timeout"
+        );
+        // Blocked worker detaches on drop; the test itself never waited.
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn async_completion_places_at_enqueue_anchor() {
+        // CodeRabbit Major #3 (icat-then-prompt): the completion places at
+        // the enqueue-time anchor even though prompt text drained after the
+        // enqueue moved the live cursor — reproducing the sync order (place
+        // at APC cursor, advance past the image from the anchor).
+        let file = async_fixture("anchor", &[0xFF, 0x00, 0x00, 0xFF]);
+        let name = async_path_bytes(&file);
+        let mut rt = async_runtime();
+        // Cursor starts at (0,0) with an empty scrollback: the enqueue
+        // captures that anchor.
+        let control = async_control(name.len());
+        assert!(rt.enqueue_kitty_local_display(
+            32,
+            Some(1),
+            Some(1),
+            None,
+            1,
+            1,
+            0,
+            &name,
+            control
+        ));
+        // Prompt text drains before the worker finishes: the live cursor
+        // advances to (2,0) and the grid holds the prompt.
+        rt.handle_pty_bytes(b"AB");
+        assert_eq!(rt.state().cursor().position.col, 2);
+        assert_eq!(rt.state().cursor().position.row, 0);
+        for _ in 0..200 {
+            rt.pump_kitty_local_completions();
+            if rt.kitty_local_pending_count() == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(rt.kitty_image_count(), 1, "anchored read still lands");
+        assert_eq!(rt.kitty_placement_count(), 1);
+        // Placement sits at the enqueue-time anchor (0,0) with its base —
+        // not at the live cursor (2,0) where the prompt printed.
+        let (anchor_col, anchor_row, base) = {
+            let placement = rt
+                .kitty_images
+                .placements()
+                .next()
+                .expect("placement must exist");
+            (
+                placement.anchor_col,
+                placement.anchor_row,
+                placement.scrollback_base,
+            )
+        };
+        assert_eq!((anchor_col, anchor_row), (0, 0));
+        assert_eq!(base, 0);
+        // Cursor advanced past the 1x1 image FROM the anchor (sync order:
+        // (0,0) + 1 col + 1 row), not from the live cursor (which would
+        // land at (3,1)).
+        let cursor = rt.state().cursor().position;
+        assert_eq!((cursor.col, cursor.row), (1, 1));
+        // Prompt text intact in the grid: the blit overlays, never erases.
+        let row = rt.state().live_grid_row(0).expect("row 0 must exist");
+        assert_eq!(row[0].glyph, 'A');
+        assert_eq!(row[1].glyph, 'B');
+        let _ = std::fs::remove_dir_all(file.parent().expect("temp parent"));
     }
 
     #[test]

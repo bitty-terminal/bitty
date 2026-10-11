@@ -106,10 +106,10 @@ pub use policy::{CrashTracker, DeadlineStrikes, SpawnGate};
 pub use stderr::{StderrRing, stderr_log_tail};
 pub use wsl::{
     WSL_DISTRO_ENV, WSL_DISTRO_FILE, WSL_DISTRO_FILE_MAX_BYTES, WSL_DISTRO_MAX_BYTES, WSL_EXE,
-    WSL_PATH_MAX_BYTES, WSL_PROBE_TIMEOUT, WSL_VERSION_OUTPUT_MAX_BYTES, WslDistro, WslError,
-    absent_diagnostic, build_wslenv_for_forwarding, check_unc_distro_binding, decode_probe_output,
-    detect_wsl_context, guest_mnt_to_windows, is_secret_wsl_env_name, map_store_paths_for_guest,
-    persisted_distro_path, read_persisted_wsl_distro, select_wsl_distro,
+    WSL_PATH_MAX_BYTES, WSL_PROBE_EXIT_GRACE, WSL_PROBE_TIMEOUT, WSL_VERSION_OUTPUT_MAX_BYTES,
+    WslDistro, WslError, absent_diagnostic, build_wslenv_for_forwarding, check_unc_distro_binding,
+    decode_probe_output, detect_wsl_context, guest_mnt_to_windows, is_secret_wsl_env_name,
+    map_store_paths_for_guest, persisted_distro_path, read_persisted_wsl_distro, select_wsl_distro,
     unc_distro_of_windows_path, valid_wsl_distro, windows_path_to_guest, wsl_argv,
     wsl_argv_with_cwd, wsl_trampoline_active,
 };

@@ -103,9 +103,12 @@
 //!
 //! Bound honesty: the probe uses `spawn` with piped stdout (stderr discarded
 //! to null so the child never blocks on it), reads at most
-//! [`WSL_VERSION_OUTPUT_MAX_BYTES`] + 1 bytes while reading (excess fails as
-//! [`WslError::ProbeFailed`] without buffering the remainder), and kills plus
-//! reaps the child on timeout, so no probe outlives failure.
+//! [`WSL_VERSION_OUTPUT_MAX_BYTES`] + 1 bytes while reading (excess kills and
+//! reaps at once as [`WslError::ProbeFailed`], checked before any exit wait),
+//! kills plus reaps the child on read timeout, and after a successful in-cap
+//! read gives the child [`WSL_PROBE_EXIT_GRACE`] to exit (polled `try_wait`;
+//! a stdout-closed-but-hung child is killed and reaped as `ProbeFailed`).
+//! No probe path blocks indefinitely, and no probe child outlives failure.
 //!
 //! # Guest environment (WSLENV, clean by design)
 //!
@@ -155,8 +158,16 @@ pub const WSL_PATH_MAX_BYTES: usize = 4096;
 /// without buffering the remainder (honestly bounded, unlike `output()`).
 pub const WSL_VERSION_OUTPUT_MAX_BYTES: usize = 8192;
 
-/// Bounded wait for one probe command (`--version` or `--status`).
+/// Bounded wait for one probe command's stdout read (`--version`/`--status`).
 pub const WSL_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Grace after stdout EOF for the probe child to exit before it is killed.
+///
+/// A child that closed stdout but never exits (daemonized, hung) must not hang
+/// the CLI: after a successful bounded read the spawner polls with
+/// `try_wait`, sleeps briefly between polls up to this grace, then kills and
+/// reaps before failing closed as `ProbeFailed`.
+pub const WSL_PROBE_EXIT_GRACE: Duration = Duration::from_secs(2);
 
 /// Per-component persisted distro file name inside `<user>/<name>/`.
 pub const WSL_DISTRO_FILE: &str = "wsl_distro";
@@ -570,13 +581,57 @@ impl ProbeDecision {
     }
 }
 
-/// Run one probe command with an honestly bounded stdout read.
+/// Wait for a probe child to exit within `grace`, else kill and reap.
+///
+/// Polls `try_wait` with short sleeps (50ms) up to `grace`; a clean exit
+/// returns its status, while expiry kills the child, reaps it, and fails
+/// closed as `ProbeFailed` naming `arg`. Portable (std only); shared by the
+/// Windows probe and the bound unit test.
+#[cfg(any(windows, test))]
+fn wait_for_exit_gracefully(
+    child: &mut std::process::Child,
+    arg: &str,
+    grace: Duration,
+) -> Result<std::process::ExitStatus, WslError> {
+    let poll = Duration::from_millis(50);
+    let mut waited = Duration::ZERO;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {
+                if waited >= grace {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(WslError::ProbeFailed(format!(
+                        "bitty component: `{WSL_EXE} {arg}` closed stdout but never exited within {}s (killed; refusing to hang)",
+                        grace.as_secs()
+                    )));
+                }
+                std::thread::sleep(poll);
+                waited += poll;
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(WslError::ProbeFailed(format!(
+                    "bitty component: cannot wait for `{WSL_EXE} {arg}`: {error}"
+                )));
+            }
+        }
+    }
+}
+
+/// Run one probe command with an honestly bounded stdout read plus exit.
 ///
 /// `spawn` with piped stdout (stderr discarded to null so the child never
 /// blocks on it); the reader takes at most `WSL_VERSION_OUTPUT_MAX_BYTES + 1`
-/// bytes while reading (excess fails as `ProbeFailed` without buffering the
-/// remainder). On `WSL_PROBE_TIMEOUT` the child is killed and reaped before
-/// returning, so no probe outlives failure. Returns `(success, stdout)`.
+/// bytes while reading (excess kills and reaps at once as `ProbeFailed`
+/// without buffering the remainder or waiting for exit). On
+/// `WSL_PROBE_TIMEOUT` the child is killed and reaped before returning.
+/// After a successful in-cap read the child gets `WSL_PROBE_EXIT_GRACE` to
+/// exit via [`wait_for_exit_gracefully`]; a stdout-closed-but-hung child is
+/// killed and reaped as `ProbeFailed` instead of hanging the CLI. Returns
+/// `(success, stdout)`.
 ///
 /// Windows-only in effect (the caller is `#[cfg(windows)]`); defined on every
 /// platform so unit tests exercise the bounded-read core via `read` injection
@@ -630,16 +685,16 @@ fn run_probe_command(arg: &str) -> Result<(bool, Vec<u8>), WslError> {
             return Err(WslError::AbsentWsl(absent_diagnostic()));
         }
     };
-    let status = child.wait().map_err(|error| {
-        WslError::ProbeFailed(format!(
-            "bitty component: cannot wait for `{WSL_EXE} {arg}`: {error}"
-        ))
-    })?;
+    // Excess fails at once (kill, reap, no exit wait): the child already
+    // proved itself unbounded, so no grace is owed.
     if stdout.len() > WSL_VERSION_OUTPUT_MAX_BYTES {
+        let _ = child.kill();
+        let _ = child.wait();
         return Err(WslError::ProbeFailed(format!(
             "bitty component: `{WSL_EXE} {arg}` output exceeds {WSL_VERSION_OUTPUT_MAX_BYTES} bytes"
         )));
     }
+    let status = wait_for_exit_gracefully(&mut child, arg, WSL_PROBE_EXIT_GRACE)?;
     Ok((status.success(), stdout))
 }
 
@@ -1247,6 +1302,44 @@ mod tests {
             ProbeDecision::classify(None, false),
             ProbeDecision::Fallback
         );
+    }
+
+    /// A stdout-closed-but-hung child must not hang the caller: the grace
+    /// expires, the child is killed and reaped, and the wait fails closed.
+    ///
+    /// Unix-gated (`sh` may not resolve on Windows runners): the helper itself
+    /// is portable std-only code shared by the Windows probe, so proving the
+    /// bound on Linux proves the logic; Windows exercises it via the gated
+    /// live probe. Fast (300ms grace) and hermetic (no FS, no network).
+    #[cfg(not(windows))]
+    #[test]
+    fn hung_child_that_closed_stdout_is_killed_within_grace() {
+        use std::process::Stdio;
+
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exec >&-; sleep 30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("sh sleeper must spawn on the Linux dev box");
+        // stdout closes at once (`exec >&-`); the child then sleeps 30s and
+        // would hang an unbounded `wait()` forever.
+        let start = std::time::Instant::now();
+        let result = wait_for_exit_gracefully(&mut child, "--version", Duration::from_millis(300));
+        let elapsed = start.elapsed();
+        assert!(result.is_err(), "hung child must fail closed, not hang");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "bounded return must take <5s, took {elapsed:?}"
+        );
+        // Reaped: try_wait must not observe a still-running child.
+        if let Ok(None) = child.try_wait() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("hung child must be reaped by the helper");
+        }
     }
 
     #[test]

@@ -71,9 +71,9 @@ pub use resolution::{
 pub use services::{
     CommandDirectory, CommandRecord, EmptyEnv, EmptySettings, EnvSource, MAX_ENV_GRANTS,
     MAX_ENV_VALUE_BYTES, MapEnv, Notification, NotificationQueue, OverlayPeers, PanelPinHandler,
-    PluginServices, ProcessEnv, QueuedWorkspaceRequest, ServiceDirectory, ServiceRecord,
-    SettingsSource, SnapshotSource, UiAccess, UiBlock, UiBlocks, UnavailableSnapshot,
-    UnavailableWorkspaces, WorkspaceRequestQueue, WorkspaceSource,
+    PanelPinQueue, PluginServices, ProcessEnv, QueuedPinRequest, QueuedWorkspaceRequest,
+    ServiceDirectory, ServiceRecord, SettingsSource, SnapshotSource, UiAccess, UiBlock, UiBlocks,
+    UnavailableSnapshot, UnavailableWorkspaces, WorkspaceRequestQueue, WorkspaceSource,
 };
 pub use store::{KvCommitBackend, KvCommitError, PluginStore, STORE_FILE_MAX_BYTES};
 // Bridge value/error types the host-service traits are expressed in, so the
@@ -102,6 +102,15 @@ pub const NOTIFICATION_QUEUE_CAPACITY: usize = 64;
 /// cannot queue unbounded work. Overflow drops the newest request and the
 /// Lua call returns `false`.
 pub const WORKSPACE_REQUEST_QUEUE_CAPACITY: usize = 2 * WORKSPACE_LIST_MAX_ITEMS;
+
+/// Bound on queued `bitty.panel.set_pinned` mutation intents across all
+/// plugins between two app ticks (CTX-1115).
+///
+/// Same governance as [`WORKSPACE_REQUEST_QUEUE_CAPACITY`]: small enough
+/// that a hostile loop cannot queue unbounded work, large enough for a
+/// legitimate burst (one intent per panel per tick across the window).
+/// Overflow drops the newest intent and the Lua call returns `false`.
+pub const PANEL_PIN_QUEUE_CAPACITY: usize = 64;
 
 /// Event-kind prefix of the workspace domain (CTX-0889, ADR-0014).
 ///
@@ -558,7 +567,20 @@ pub struct PluginRuntime {
     /// workspace-source pattern. Sibling panel verbs have no backend seam
     /// yet, so wiring only `set_pinned` leaves nothing inconsistent: the
     /// siblings stay `E_NOT_IMPLEMENTED` until their own seams land.
+    ///
+    /// CTX-1115: the production host supplies a deferred backend here. The
+    /// closure validates against a per-tick published pin snapshot and
+    /// enqueues into [`PanelPinQueue`]; the application drains it each tick
+    /// through the same `pin_floating`/`unpin_floating` runtime path the
+    /// `toggle_pinned` keymap action uses. A direct live-runtime closure
+    /// would need shared `Runtime` ownership, which `TerminalApp` does not
+    /// offer, so the deferred queue (mirroring CTX-0889 workspace requests)
+    /// is the host-handle decision. Tests keep injecting direct closures.
     panel_pin_backend: Option<PanelPinHandler>,
+    /// CTX-1115: bounded queue of `bitty.panel.set_pinned` intents, drained
+    /// by the application each tick
+    /// ([`PluginRuntime::drain_panel_pin_requests`]).
+    panel_pin_requests: Rc<RefCell<PanelPinQueue>>,
     /// CTX-0941: runtime-shared single-owner focusable-overlay capture switch
     /// and bounded input queue. Shared with every generation's services so the
     /// single-owner invariant holds across plugins and reload.
@@ -625,6 +647,7 @@ impl PluginRuntime {
                 WORKSPACE_REQUEST_QUEUE_CAPACITY,
             ))),
             panel_pin_backend: None,
+            panel_pin_requests: Rc::new(RefCell::new(PanelPinQueue::new(PANEL_PIN_QUEUE_CAPACITY))),
             overlay_capture: Rc::new(RefCell::new(OverlayCapture::new())),
             overlay_peers: Rc::new(RefCell::new(BTreeMap::new())),
             target_registry: Rc::new(RefCell::new(bitty_ui::TargetRegistry::new())),
@@ -762,6 +785,33 @@ impl PluginRuntime {
     #[must_use]
     pub fn workspace_requests_dropped(&self) -> u64 {
         self.workspace_requests.borrow().dropped()
+    }
+
+    /// Runtime-shared pin intent queue handle (CTX-1115).
+    ///
+    /// The production host builds its deferred [`PanelPinHandler`] backend
+    /// over this handle before activation, so granted `set_pinned` calls
+    /// from `panel.focus` generations enqueue here. Diagnostics and tests
+    /// read the live queue through this handle.
+    #[must_use]
+    pub fn panel_pin_queue(&self) -> &Rc<RefCell<PanelPinQueue>> {
+        &self.panel_pin_requests
+    }
+
+    /// Drain queued `bitty.panel.set_pinned` intents in FIFO order (CTX-1115).
+    ///
+    /// The application applies each intent on its own thread through the
+    /// same `pin_floating`/`unpin_floating` runtime path the `toggle_pinned`
+    /// keymap action uses, revalidating against live state. Bounded by
+    /// [`PANEL_PIN_QUEUE_CAPACITY`].
+    pub fn drain_panel_pin_requests(&mut self) -> Vec<QueuedPinRequest> {
+        self.panel_pin_requests.borrow_mut().drain()
+    }
+
+    /// Pin intents dropped by queue overflow since creation.
+    #[must_use]
+    pub fn panel_pin_requests_dropped(&self) -> u64 {
+        self.panel_pin_requests.borrow().dropped()
     }
 
     /// Runtime-shared focusable-overlay capture switch (CTX-0941).

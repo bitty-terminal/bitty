@@ -9,7 +9,7 @@ use bitty_platform::{
 };
 use bitty_render::gpu::{GpuContext, select_instance_backends};
 use bitty_runtime::plugin_runtime::{LuaValue, PluginRuntime, WorkspaceRequest};
-use bitty_runtime::{Runtime, WorkspaceSummary};
+use bitty_runtime::{Runtime, ViewId, WorkspaceSummary};
 
 use crate::ctl;
 use crate::layout_cmd::spawn_demo_pty_pump_with_theme;
@@ -568,6 +568,11 @@ pub(crate) struct TerminalApp {
     /// Core's workspace summaries here so `bitty.workspace.list()` serves
     /// committed state. `None` without a plugin runtime.
     pub(crate) live_workspaces: Option<std::rc::Rc<crate::plugin_runtime::LiveWorkspaces>>,
+    /// Shared live pin-target snapshot (CTX-1115): `drive_tick` publishes
+    /// the active-workspace leaf ids plus the window-global pinned ids here
+    /// so the deferred `bitty.panel.set_pinned` backend validates against
+    /// committed state. `None` without a plugin runtime.
+    pub(crate) live_pin_state: Option<std::rc::Rc<crate::plugin_runtime::LivePinState>>,
     /// Plugin runtime (CTX-0892): owns all plugin VMs, delivers events,
     /// dispatches commands. Kept alive by the app loop.
     pub(crate) plugin_runtime: Option<PluginRuntime>,
@@ -676,6 +681,7 @@ impl TerminalApp {
             session_persistence: true,
             live_snapshot: None,
             live_workspaces: None,
+            live_pin_state: None,
             plugin_runtime: None,
             safe_mode: false,
             composer_core_fallback_latched: false,
@@ -715,6 +721,7 @@ impl TerminalApp {
             session_persistence: true,
             live_snapshot: None,
             live_workspaces: None,
+            live_pin_state: None,
             plugin_runtime: None,
             safe_mode: false,
             composer_core_fallback_latched: false,
@@ -829,6 +836,18 @@ impl TerminalApp {
         workspaces: Option<std::rc::Rc<crate::plugin_runtime::LiveWorkspaces>>,
     ) -> Self {
         self.live_workspaces = workspaces;
+        self
+    }
+
+    /// Attaches the shared live pin-target snapshot (CTX-1115). Production
+    /// startup passes the handle returned by
+    /// [`crate::plugin_runtime::discover_and_activate`]; plugin-less runs
+    /// leave it `None`.
+    pub(crate) fn with_live_pin_state(
+        mut self,
+        pin_state: Option<std::rc::Rc<crate::plugin_runtime::LivePinState>>,
+    ) -> Self {
+        self.live_pin_state = pin_state;
         self
     }
 
@@ -1212,6 +1231,9 @@ impl TerminalApp {
         // CTX-0889: apply plugin workspace mutations queued since the last
         // tick before it commits, so the presented frame reflects them.
         self.apply_plugin_workspace_requests();
+        // CTX-1115: apply queued `bitty.panel.set_pinned` intents before
+        // present, so the presented frame reflects the pin state.
+        self.apply_plugin_pin_requests();
         // CTX-0911 (issue #1570): read mounted UiBlocks from plugin runtime,
         // convert to ChromeBands, and push into Runtime before present so
         // bands render on this frame.
@@ -1361,6 +1383,15 @@ impl TerminalApp {
         let workspaces = self.runtime.workspace_summaries();
         if let Some(live) = self.live_workspaces.as_ref() {
             live.publish(&workspaces);
+        }
+        // CTX-1115: publish the pin-target snapshot alongside the workspace
+        // source, so handlers running on this tick validate against the
+        // state this tick applied.
+        if let Some(pin_state) = self.live_pin_state.as_ref() {
+            pin_state.publish(
+                &self.runtime.layout().leaf_ids(),
+                &self.runtime.pinned_views(),
+            );
         }
         // One bounded snapshot pass serves the whole state diff (issue
         // #1828): terminals, per-terminal cwds, the observed-`BEL` counter,
@@ -1932,6 +1963,64 @@ impl TerminalApp {
             }
         }
         true
+    }
+
+    /// Applies queued `bitty.panel.set_pinned` intents (CTX-1115, DEC-0107).
+    ///
+    /// Bounded by the plugin runtime's pin queue capacity. Each intent runs
+    /// through the same `pin_floating`/`unpin_floating` runtime path the
+    /// `toggle_pinned` keymap action uses, so plugin and keyboard behaviour
+    /// cannot drift. Zoom restores before a mutation lands (same guard as
+    /// the keymap arm: skipped only while the backup holds a single leaf,
+    /// where a restore would consume the backup behind a refused pin).
+    /// Fail-closed rules:
+    /// - an already-pinned pin, or an unpin of a live leaf, holds without
+    ///   touching state;
+    /// - an intent whose target vanished between enqueue and drain drops
+    ///   with a warning and state untouched.
+    pub(crate) fn apply_plugin_pin_requests(&mut self) {
+        let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
+            return;
+        };
+        let requests = plugin_runtime.drain_panel_pin_requests();
+        for queued in requests {
+            let id = ViewId::new(queued.panel_id);
+            if queued.pinned {
+                if self.runtime.pinned_views().contains(&id) {
+                    continue;
+                }
+                if self.chrome.zoom.backup_leaf_count(&self.runtime) != Some(1) {
+                    self.restore_zoom();
+                }
+                if let Err(error) = self.runtime.pin_floating(id) {
+                    crate::logging::warn(|| {
+                        format!(
+                            "bitty: plugin pin request for panel {} refused ({error})",
+                            queued.panel_id
+                        )
+                    });
+                }
+            } else if self.runtime.pinned_views().contains(&id) {
+                if self.chrome.zoom.backup_leaf_count(&self.runtime) != Some(1) {
+                    self.restore_zoom();
+                }
+                if let Err(error) = self.runtime.unpin_floating(id) {
+                    crate::logging::warn(|| {
+                        format!(
+                            "bitty: plugin unpin request for panel {} refused ({error})",
+                            queued.panel_id
+                        )
+                    });
+                }
+            } else if !self.runtime.layout().leaf_ids().contains(&id) {
+                crate::logging::warn(|| {
+                    format!(
+                        "bitty: plugin pin request dropped (unknown panel id {})",
+                        queued.panel_id
+                    )
+                });
+            }
+        }
     }
 
     /// Checks for exited shell processes across both split pane sessions and

@@ -863,11 +863,18 @@ fn main() {
     // freezing at generation 1.
     // CTX-0889: the live workspace source is seeded from the constructed
     // runtime and republished by the tick loop.
+    // CTX-1115: the live pin-target snapshot is seeded the same way and the
+    // deferred pin backend is installed before activation, so `init.lua`
+    // already observes a working `bitty.panel.set_pinned`.
     let plugin_session = plugin_runtime::discover_and_activate(
         args.safe,
         runtime.config().cols,
         runtime.config().rows,
-        &runtime.workspace_summaries(),
+        &plugin_runtime::StartupSeed {
+            workspaces: &runtime.workspace_summaries(),
+            leaves: &runtime.layout().leaf_ids(),
+            pinned: &runtime.pinned_views(),
+        },
     );
     let live_snapshot = plugin_session
         .as_ref()
@@ -875,6 +882,9 @@ fn main() {
     let live_workspaces = plugin_session
         .as_ref()
         .map(|session| Rc::clone(&session.workspaces));
+    let live_pin_state = plugin_session
+        .as_ref()
+        .map(|session| Rc::clone(&session.pin_state));
     let plugin_runtime_handle = plugin_session.map(|session| session.runtime);
 
     // Single-window vertical slice: one PTY per leaf, one shell each.
@@ -982,6 +992,8 @@ fn main() {
     .with_live_snapshot(live_snapshot)
     // CTX-0889: publish the live workspace source from the tick loop.
     .with_live_workspaces(live_workspaces)
+    // CTX-1115: publish the live pin-target snapshot from the tick loop.
+    .with_live_pin_state(live_pin_state)
     // CTX-0892: wire the plugin runtime into the app loop for event delivery.
     .with_plugin_runtime(plugin_runtime_handle)
     // W-103 S-5 (CTX-0929): latch the safe recovery flag so the composer

@@ -187,6 +187,79 @@ impl WorkspaceRequestQueue {
     }
 }
 
+/// One queued pinned-float mutation (CTX-1115).
+///
+/// Carries no requesting plugin id: the shared [`PanelPinHandler`] backend
+/// seam has no per-generation identity, so drain diagnostics name the panel
+/// id instead (authority was checked at enqueue time against the generation's
+/// `panel.focus` grant, and the snapshot check below ran before queueing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueuedPinRequest {
+    /// Lua-validated panel id (a `ViewId` raw value).
+    pub panel_id: u64,
+    /// Desired pinned state.
+    pub pinned: bool,
+}
+
+/// Bounded runtime-shared pin request queue (CTX-1115).
+///
+/// Same governance as [`WorkspaceRequestQueue`]: overflow drops the newest
+/// request and counts it, and the application drains it once per tick. The
+/// queue holds validated intents only; the drain revalidates each intent
+/// against live state, so a panel that vanished between enqueue and drain
+/// fails closed with state untouched.
+#[derive(Debug)]
+pub struct PanelPinQueue {
+    items: VecDeque<QueuedPinRequest>,
+    capacity: usize,
+    dropped: u64,
+}
+
+impl PanelPinQueue {
+    /// Create a bounded queue (capacity at least 1).
+    #[must_use]
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            items: VecDeque::new(),
+            capacity: capacity.max(1),
+            dropped: 0,
+        }
+    }
+
+    /// Push a request; returns whether it was accepted.
+    pub fn push(&mut self, request: QueuedPinRequest) -> bool {
+        if self.items.len() >= self.capacity {
+            self.dropped = self.dropped.saturating_add(1);
+            return false;
+        }
+        self.items.push_back(request);
+        true
+    }
+
+    /// Drain all queued requests in FIFO order.
+    pub fn drain(&mut self) -> Vec<QueuedPinRequest> {
+        self.items.drain(..).collect()
+    }
+
+    /// Number of queued requests.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Whether the queue is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Number dropped since creation.
+    #[must_use]
+    pub fn dropped(&self) -> u64 {
+        self.dropped
+    }
+}
+
 /// Synchronous pinned-float backend for one plugin generation (CTX-1083).
 ///
 /// Receives the Lua-validated panel id (a `ViewId` raw value) plus the
@@ -3163,6 +3236,42 @@ mod tests {
                 .expect("unknown unpin fails closed"),
             "unknown id unpins nothing"
         );
+    }
+
+    #[test]
+    fn panel_pin_queue_drains_fifo_and_drops_newest_on_overflow() {
+        // CTX-1115: same governance as the workspace request queue — FIFO
+        // drain for the tick loop, newest-dropped plus counted on overflow.
+        let mut queue = PanelPinQueue::new(2);
+        assert!(queue.is_empty());
+        assert!(queue.push(QueuedPinRequest {
+            panel_id: 1,
+            pinned: true,
+        }));
+        assert!(queue.push(QueuedPinRequest {
+            panel_id: 1,
+            pinned: false,
+        }));
+        assert_eq!(queue.len(), 2);
+        assert!(!queue.push(QueuedPinRequest {
+            panel_id: 2,
+            pinned: true,
+        }));
+        assert_eq!(queue.dropped(), 1);
+        assert_eq!(
+            queue.drain(),
+            vec![
+                QueuedPinRequest {
+                    panel_id: 1,
+                    pinned: true,
+                },
+                QueuedPinRequest {
+                    panel_id: 1,
+                    pinned: false,
+                },
+            ]
+        );
+        assert!(queue.is_empty());
     }
 
     #[test]

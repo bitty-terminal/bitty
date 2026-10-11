@@ -148,6 +148,23 @@ pub(crate) struct Args {
     pub(crate) init_border: Option<String>,
     /// `--radius PX`: init-only explicit answer (raw, validated at dispatch).
     pub(crate) init_radius: Option<String>,
+    /// `--plugins IDS`: init-only first-batch selection (comma-separated
+    /// bundled ids, validated fail-closed against the same bundled source
+    /// `plugin install <id>` uses; missing value fails closed).
+    /// `None` means absent (prompt in TTY, none with `--yes`).
+    pub(crate) init_plugins: Option<String>,
+    /// `--no-plugins`: init-only negation for `--plugins` (explicit none;
+    /// wins over `--plugins` when both are present).
+    pub(crate) init_no_plugins: bool,
+    /// `--with-components` / `--no-with-components` (`--no-components`
+    /// alias): init-only component-seed opt-in. `None` means absent (prompt
+    /// when plugins are selected in TTY, off with `--yes`); `Some` skips the
+    /// prompt. Last occurrence wins.
+    pub(crate) init_with_components: Option<bool>,
+    /// `--print-shell-init` / `--no-print-shell-init`: init-only shell-init
+    /// handoff. `None` means absent (default prints); `Some(false)` suppresses.
+    /// Last occurrence wins.
+    pub(crate) init_print_shell_init: Option<bool>,
     /// Unexpected extra positionals in init mode (dispatch errors).
     pub(crate) init_args: Vec<String>,
     /// `bitty doctor` installation and compatibility diagnosis (CTX-0175).
@@ -426,6 +443,10 @@ impl Args {
             init_gaps_out: None,
             init_border: None,
             init_radius: None,
+            init_plugins: None,
+            init_no_plugins: false,
+            init_with_components: None,
+            init_print_shell_init: None,
             init_args: Vec::new(),
             doctor_word: false,
             doctor_format: None,
@@ -618,10 +639,17 @@ fn push_verbatim_new_word(out: &mut Args, raw: &[String], i: usize) -> Option<us
 /// - init-only value flags (parsed globally, validated fail-closed by the
 ///   init dispatch; CTX-0345): `--scrollback LINES`,
 ///   `--close-confirm always|when_busy|never`, `--gaps-in PX`,
-///   `--gaps-out PX`, `--border PX`, `--radius PX`; the existing
+///   `--gaps-out PX`, `--border PX`, `--radius PX`, `--plugins a,b`
+///   (CTX-1132, #1913: first-batch bundled ids, same source as
+///   `plugin install <id>`); the existing
 ///   `--theme`/`--font-family`/`--font-size` flags also answer their init
 ///   step. A flag answered step is skipped in the interactive wizard and
 ///   wins over the `--yes` defaults.
+/// - init-only boolean follow-ups (CTX-1132, #1913, parsed globally,
+///   last wins): `--with-components` / `--no-with-components`
+///   (component-seed offer), `--print-shell-init` / `--no-print-shell-init`
+///   (shell-init handoff, default prints), `--no-plugins` (explicit none,
+///   wins over `--plugins`).
 /// - `run [OPTIONS] -- COMMAND...` → explicit child launch (CTX-0170);
 ///   a program literally named `run` needs `bitty run -- run ...` or
 ///   `bitty -- run ...`. Tokens after `run` are kept verbatim for
@@ -806,6 +834,7 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                 "gaps-out" => Some(&mut out.init_gaps_out),
                 "border" => Some(&mut out.init_border),
                 "radius" => Some(&mut out.init_radius),
+                "plugins" => Some(&mut out.init_plugins),
                 _ => None,
             };
             if let Some(slot) = slot {
@@ -1091,6 +1120,46 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                     out.init_radius = Some(String::new());
                     i += 1;
                 }
+            }
+            "--plugins" => {
+                // `bitty init --plugins a,b`: init-only first-batch selection
+                // (raw; validated fail-closed at the init dispatch against
+                // the same bundled source `plugin install <id>` uses).
+                if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
+                    out.init_plugins = Some(raw[i + 1].clone());
+                    i += 2;
+                } else {
+                    out.init_plugins = Some(String::new());
+                    i += 1;
+                }
+            }
+            "--no-plugins" => {
+                // `bitty init --no-plugins`: explicit none (negation for
+                // `--plugins`; wins over `--plugins` at the init dispatch).
+                out.init_no_plugins = true;
+                i += 1;
+            }
+            "--with-components" => {
+                // `bitty init --with-components`: opt into the component-seed
+                // offer (last occurrence wins against `--no-with-components`).
+                out.init_with_components = Some(true);
+                i += 1;
+            }
+            "--no-with-components" | "--no-components" | "--without-components" => {
+                // Negations for `--with-components` (existing `--no-*` style).
+                out.init_with_components = Some(false);
+                i += 1;
+            }
+            "--print-shell-init" => {
+                // `bitty init --print-shell-init`: explicitly request the
+                // shell-init handoff line (default already prints; last wins).
+                out.init_print_shell_init = Some(true);
+                i += 1;
+            }
+            "--no-print-shell-init" | "--no-shell-init" => {
+                // Suppress the shell-init handoff line.
+                out.init_print_shell_init = Some(false);
+                i += 1;
             }
             "--format" => {
                 // CTX-0763: post-word pairs stay verbatim for the
@@ -2023,7 +2092,14 @@ pub(crate) fn help_text() -> String {
                               --theme NAME, --font-family NAME, --font-size PTS,\n  \
                               --scrollback LINES, --close-confirm MODE,\n  \
                               --gaps-in PX, --gaps-out PX, --border PX,\n  \
-                              --radius PX (each validated fail-closed).\n  \
+                              --radius PX, --plugins a,b (each validated fail-closed).\n  \
+                              Follow-ups (#1913): --plugins selects the first\n  \
+                              batch (bundled ids, recorded offline);\n  \
+                              --with-components / --no-with-components offers\n  \
+                              component installs; --print-shell-init /\n  \
+                              --no-print-shell-init controls the shell-init\n  \
+                              handoff line (default prints); --no-plugins\n  \
+                              selects none.\n  \
             doctor [--format SHAPE] [--no-color]  Diagnose installation and\n  \
                               compatibility (local class, safe mode): binary,\n  \
                               config, keymaps, fonts, display, GPU, clipboard,\n  \

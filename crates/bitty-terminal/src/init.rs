@@ -120,6 +120,17 @@ pub(crate) struct InitOverrides {
     pub(crate) border: Option<u32>,
     /// `--radius PX` answer.
     pub(crate) radius: Option<u32>,
+    /// `--plugins a,b` answer (CTX-1132, #1913): explicit first-batch bundled
+    /// ids. `None` means absent (prompt in TTY, none with `--yes`); `Some`
+    /// (possibly empty via `--no-plugins`) skips the prompt.
+    pub(crate) plugins: Option<Vec<String>>,
+    /// `--with-components` / `--no-*` answer (CTX-1132, #1913): component-seed
+    /// opt-in. `None` means absent (prompt when plugins are selected in TTY,
+    /// off with `--yes`); `Some` skips the prompt.
+    pub(crate) with_components: Option<bool>,
+    /// `--print-shell-init` / `--no-*` answer (CTX-1132, #1913): shell-init
+    /// handoff. `None` means absent (default prints); `Some(false)` suppresses.
+    pub(crate) print_shell_init: Option<bool>,
 }
 
 /// Validates and normalizes one shell path: trims, rejects empty,
@@ -238,6 +249,20 @@ pub(crate) fn init_overrides_from_args(args: &Args) -> Result<InitOverrides, Str
             bitty_config::types::MAX_DECORATION_RADIUS_PX,
             bitty_config::types::DEFAULT_DECORATION_RADIUS_PX,
         )?);
+    }
+    // CTX-1132 (#1913): `--no-plugins` wins over `--plugins` (explicit none
+    // for scripted setups); otherwise `--plugins` validates fail-closed
+    // against the bundled source.
+    if args.init_no_plugins {
+        out.plugins = Some(Vec::new());
+    } else if let Some(raw) = args.init_plugins.as_deref() {
+        out.plugins = Some(init_parse_plugins_flag(raw)?);
+    }
+    if let Some(value) = args.init_with_components {
+        out.with_components = Some(value);
+    }
+    if let Some(value) = args.init_print_shell_init {
+        out.print_shell_init = Some(value);
     }
     Ok(out)
 }
@@ -433,6 +458,169 @@ pub(crate) fn init_parse_preset_answer(raw: &str) -> Result<InitKeyPreset, Strin
         "2" | "vim" => Ok(InitKeyPreset::Vim),
         _ => Err("pick 1 (default) or 2 (vim)".to_string()),
     }
+}
+
+/// Parses one first-batch plugin-selection answer (CTX-1132, #1913).
+///
+/// Empty means none. Otherwise a comma-separated list of bundled plugin ids,
+/// each validated against the same bundled source `plugin install <id>` uses
+/// ([`bitty_plugin_host::bundled::bundled_manifest_for`], no duplicate list):
+/// unknown ids fail closed with the valid bundled ids as a hint (same shape
+/// as `inspect` diagnostics). Duplicates collapse, order is catalog order.
+/// English-only, no network, no secrets.
+pub(crate) fn init_parse_plugins_answer(raw: &str) -> Result<Vec<String>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+        return Ok(Vec::new());
+    }
+    let mut seen: Vec<String> = Vec::new();
+    for part in trimmed.split(',') {
+        let id = part.trim();
+        if id.is_empty() {
+            continue;
+        }
+        if id.len() > 256 || id.contains('\0') {
+            return Err(format!("unknown plugin '{id}'"));
+        }
+        let Some(manifest) = bitty_plugin_host::bundled::bundled_manifest_for(id) else {
+            let valid = bitty_plugin_host::bundled::bundled_ids_sorted().join(", ");
+            let hint = if valid.is_empty() {
+                "(none)".to_string()
+            } else {
+                valid
+            };
+            return Err(format!("unknown plugin '{id}' (bundled ids: {hint})"));
+        };
+        // Validate the manifest the same way `plugin install` does, so a
+        // corrupt bundled manifest fails closed here instead of recording a
+        // hash that install would reject.
+        manifest
+            .validate()
+            .map_err(|error| format!("bundled manifest '{id}' is invalid: {error}"))?;
+        let canonical = manifest.identity.id.as_str().to_string();
+        if !seen.iter().any(|seen| seen == &canonical) {
+            seen.push(canonical);
+        }
+    }
+    // Deterministic catalog order (same as `bundled_ids_sorted`), so
+    // `--plugins b,a` and interactive `a,b` record identically.
+    let order = bitty_plugin_host::bundled::bundled_ids_sorted();
+    seen.sort_by_key(|id| {
+        order
+            .iter()
+            .position(|ordered| ordered == id)
+            .unwrap_or(usize::MAX)
+    });
+    Ok(seen)
+}
+
+/// Parses one `--plugins` flag value (CTX-1132, #1913): like
+/// [`init_parse_plugins_answer`] but an empty value fails closed (a missing
+/// flag value is a usage error, never a silent none; use `--no-plugins` for
+/// explicit none).
+pub(crate) fn init_parse_plugins_flag(raw: &str) -> Result<Vec<String>, String> {
+    if raw.trim().is_empty() {
+        return Err("--plugins needs a comma-separated bundled id list".to_string());
+    }
+    init_parse_plugins_answer(raw)
+}
+
+/// Parses one yes/no opt-in answer (component-seed and plugin-fetch gates).
+/// Empty means no (fail-closed default); `y`/`yes` means yes, `n`/`no`/empty
+/// means no; anything else reprompts.
+pub(crate) fn init_parse_yes_no_answer(raw: &str) -> Result<bool, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "n" | "no" => Ok(false),
+        "y" | "yes" => Ok(true),
+        _ => Err("answer y or n".to_string()),
+    }
+}
+
+/// Maps a shell path or name to the canonical `shell-init` shell name
+/// (CTX-1132, #1913).
+///
+/// Takes the basename (`/bin/bash` -> `bash`, `pwsh` stays `pwsh`), then
+/// resolves through the same [`crate::completion::CompletionShell`] table
+/// `shell-init` uses, so the handoff line and `shell-init` can never disagree
+/// on names. Returns the canonical `shell-init` spelling (`bash`, `zsh`,
+/// `fish`, `powershell`, `nushell`).
+pub(crate) fn init_shell_name_from_path(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let base = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed).trim();
+    if base.is_empty() {
+        return None;
+    }
+    // Strip a trailing `.exe` so Windows shell paths still map.
+    let stem = base
+        .strip_suffix(".exe")
+        .or_else(|| base.strip_suffix(".EXE"))
+        .unwrap_or(base);
+    let shell = crate::completion::CompletionShell::parse(stem)?;
+    let canonical = match shell {
+        crate::completion::CompletionShell::Bash => "bash",
+        crate::completion::CompletionShell::Zsh => "zsh",
+        crate::completion::CompletionShell::Fish => "fish",
+        crate::completion::CompletionShell::Powershell => "powershell",
+        crate::completion::CompletionShell::Nushell => "nushell",
+    };
+    Some(canonical.to_string())
+}
+
+/// Detects the shell name for the handoff (CTX-1132, #1913): the wizard's
+/// chosen shell wins, else `$SHELL`, else `bash` fallback. Never reads the
+/// environment itself (pure over injected values, English-only).
+pub(crate) fn init_detect_shell_for_handoff(
+    chosen_shell: Option<&str>,
+    shell_env: Option<&str>,
+) -> String {
+    if let Some(chosen) = chosen_shell {
+        if let Some(name) = init_shell_name_from_path(chosen) {
+            return name;
+        }
+    }
+    if let Some(env) = shell_env {
+        if let Some(name) = init_shell_name_from_path(env) {
+            return name;
+        }
+    }
+    "bash".to_string()
+}
+
+/// Renders the exact shell-integration handoff line for a shell name
+/// (CTX-1132, #1913; PRINT, never eval).
+///
+/// `bash`/`zsh` use the `eval "$(bitty shell-init <shell>)"` form; the other
+/// shells use their documented wiring from `shell-init --help` (fish sources,
+/// PowerShell invokes, Nushell saves once then sources), so the printed line
+/// is runnable verbatim in the named shell.
+pub(crate) fn init_shell_init_line(shell: &str) -> String {
+    match shell.trim().to_ascii_lowercase().as_str() {
+        "fish" => "bitty shell-init fish | source".to_string(),
+        "powershell" | "pwsh" => {
+            "bitty shell-init powershell | Out-String | Invoke-Expression".to_string()
+        }
+        "nushell" | "nu" => {
+            "bitty shell-init nushell | save -f ~/.config/nushell/bitty-shell-init.nu".to_string()
+        }
+        "zsh" => "eval \"$(bitty shell-init zsh)\"".to_string(),
+        _ => "eval \"$(bitty shell-init bash)\"".to_string(),
+    }
+}
+
+/// Declared native components for a bundled plugin id (CTX-1132, #1913).
+///
+/// Current bundled manifests declare no `[components]` section, so this
+/// returns empty today (the component offer then prints a nothing-to-do
+/// line). Kept as a function (not a constant) so a future manifest with a
+/// `[components]` declaration flows into the offer without touching the
+/// wizard: when that lands, return its component names here and the existing
+/// offer installs the missing ones under the same opt-in gate.
+pub(crate) fn init_bundled_plugin_components(id: &str) -> Vec<String> {
+    let _ = id;
+    Vec::new()
 }
 
 /// Escapes a string for a double-quoted Lua value. Wizard inputs are
@@ -2497,6 +2685,12 @@ pub(crate) fn init_usage() -> String {
      \x20 --gaps-out PX        edge gap within [0, 32] (decoration.gaps_out)\n\
      \x20 --border PX          frame thickness within [0, 8]\n\
      \x20 --radius PX          corner radius within [0, 16]\n\
+     \x20 --plugins IDS        comma-separated bundled ids (e.g. bitty-terminal.shell-integration)\n\
+     \x20 --no-plugins         select no plugins (wins over --plugins)\n\
+     \n\
+     follow-ups (#1913, offline-safe, no network/secrets without opt-in):\n\
+     \x20 --with-components / --no-with-components  offer component installs\n\
+     \x20 --print-shell-init / --no-print-shell-init  print the shell-init handoff line\n\
      \n\
      target: --config PATH wins, else BITTY_CONFIG, else\n\
      $XDG_CONFIG_HOME/bitty/init.lua (fallback ~/.config/bitty/init.lua).\n\
@@ -2666,6 +2860,54 @@ pub(crate) fn init_preview_baseline(
     }
 }
 
+/// Prompts the optional first-batch plugin selection (CTX-1132, #1913).
+///
+/// Lists bundled ids from the same source `plugin install <id>` uses
+/// ([`bitty_plugin_host::bundled::bundled_ids_sorted`], no duplicate list),
+/// then reads one comma-separated answer via [`init_ask`] (reprompt
+/// fail-closed, EOF aborts, Esc cancels). Empty means none. Offline-safe:
+/// no fetch, no consent, no secrets — recording happens later in the dispatch.
+/// Returns the selected ids in catalog order.
+fn init_prompt_plugin_selection(
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
+    history: &mut Vec<String>,
+) -> Result<Vec<String>, String> {
+    let ids = bitty_plugin_host::bundled::bundled_ids_sorted();
+    if ids.is_empty() {
+        let _ = writeln!(output, "\nPlugins (none bundled; skipping):");
+        let _ = output.flush();
+        return Ok(Vec::new());
+    }
+    let _ = writeln!(output, "\nPlugins (optional first batch, offline-safe):");
+    for id in &ids {
+        let _ = writeln!(output, "  - {id}");
+    }
+    let _ = writeln!(
+        output,
+        "Selections are recorded offline without fetching; fetching needs explicit opt-in."
+    );
+    let _ = output.flush();
+    init_ask(
+        input,
+        output,
+        "Plugins [comma-separated ids, empty for none]:",
+        init_parse_plugins_answer,
+        history,
+    )
+}
+
+/// Prompts one yes/no opt-in gate (plugin-fetch and component-seed share this
+/// shape; CTX-1132, #1913). Empty means no (fail-closed default).
+fn init_prompt_yes_no(
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
+    prompt: &str,
+    history: &mut Vec<String>,
+) -> Result<bool, String> {
+    init_ask(input, output, prompt, init_parse_yes_no_answer, history)
+}
+
 /// [`run_init_subcommand`] over injected IO and environment. `input` is read
 /// only by the interactive wizard; `output` receives prompts only. Writes go
 /// to the resolved config path and diagnostics to stderr.
@@ -2778,6 +3020,65 @@ pub(crate) fn run_init_subcommand_with_io(
             }
         }
     };
+    // CTX-1132 (#1913) follow-up decisions (no filesystem writes yet):
+    // plugin selection, fetch opt-in, component opt-in, shell-init print.
+    // Prompts fail closed (EOF/cancel/too many invalid -> exit 1, nothing
+    // written); `--yes` takes flag values or offline-safe defaults without
+    // prompting. Offline contract: no network/secrets here, only decisions.
+    let mut followup_history: Vec<String> = Vec::new();
+    let plugin_ids: Vec<String> = if let Some(list) = overrides.plugins.clone() {
+        list
+    } else if args.init_yes {
+        Vec::new()
+    } else {
+        match init_prompt_plugin_selection(input, output, &mut followup_history) {
+            Ok(ids) => ids,
+            Err(message) => {
+                eprintln!("{message}");
+                return 1;
+            }
+        }
+    };
+    let fetch_approved: bool = if plugin_ids.is_empty() {
+        false
+    } else if args.init_yes {
+        // `--yes` honors per-plugin consent (same as `plugin install --yes`).
+        true
+    } else {
+        match init_prompt_yes_no(
+            input,
+            output,
+            "Install selected plugins now (grant capabilities)? [y/N]:",
+            &mut followup_history,
+        ) {
+            Ok(approved) => approved,
+            Err(message) => {
+                eprintln!("{message}");
+                return 1;
+            }
+        }
+    };
+    let with_components: bool = if plugin_ids.is_empty() {
+        false
+    } else if let Some(value) = overrides.with_components {
+        value
+    } else if args.init_yes {
+        false
+    } else {
+        match init_prompt_yes_no(
+            input,
+            output,
+            "Install missing native components for selected plugins? [y/N]:",
+            &mut followup_history,
+        ) {
+            Ok(approved) => approved,
+            Err(message) => {
+                eprintln!("{message}");
+                return 1;
+            }
+        }
+    };
+    let print_shell_init: bool = overrides.print_shell_init.unwrap_or(true);
     let content = render_init_lua(&answers);
     // Visible preview: show the exact pending config before write.
     // Print-only (no confirm prompt); abort paths return above, so this
@@ -2823,9 +3124,112 @@ pub(crate) fn run_init_subcommand_with_io(
                 answers.close_confirm.as_str(),
             );
             println!("bitty init: validate any time with `bitty config check`");
-            println!(
-                "bitty init: wire Tab completion + prompt hooks with `eval \"$(bitty shell-init bash)\"` (pick your shell; `bitty shell-init --help` lists all five)"
-            );
+            // CTX-1132 (#1913) follow-up commits (after the config write, so a
+            // config refusal writes nothing at all, preserving --yes
+            // idempotence). All offline-safe: plugin records without fetching,
+            // per-plugin consent only on explicit opt-in, component hints
+            // only (never silent fetch), shell-init printed (never evaled).
+            if !plugin_ids.is_empty() {
+                let state_path = match crate::plugin::init_plugin_state_path(
+                    args.config_path.as_deref(),
+                    env.bitty_config,
+                    env.xdg_config_home,
+                    env.home,
+                ) {
+                    Ok(path) => Some(path),
+                    Err(message) => {
+                        eprintln!(
+                            "bitty init: {message} (plugin queue skipped; re-run `bitty plugin install <id>` later)"
+                        );
+                        None
+                    }
+                };
+                if let Some(state_path) = state_path {
+                    match crate::plugin::init_record_bundled_offline(&state_path, &plugin_ids) {
+                        Ok(recorded) => {
+                            if recorded > 0 {
+                                let _ = writeln!(
+                                    output,
+                                    "bitty init: recorded {} plugin{} offline (disabled, no fetch)",
+                                    recorded,
+                                    if recorded == 1 { "" } else { "s" },
+                                );
+                            } else {
+                                let _ = writeln!(
+                                    output,
+                                    "bitty init: plugins already recorded (nothing new)"
+                                );
+                            }
+                            let _ = output.flush();
+                        }
+                        Err(message) => {
+                            eprintln!(
+                                "bitty init: {message} (re-run `bitty plugin install <id>` later)"
+                            );
+                        }
+                    }
+                    if fetch_approved {
+                        for id in &plugin_ids {
+                            match crate::plugin::init_install_bundled_with_consent(
+                                &state_path,
+                                id,
+                                args.init_yes,
+                                input,
+                                output,
+                            ) {
+                                Ok(summary) => {
+                                    let _ = writeln!(output, "bitty init: {summary}");
+                                    let _ = output.flush();
+                                }
+                                Err(message) => {
+                                    let _ = writeln!(
+                                        output,
+                                        "bitty init: {message} (kept offline record; re-run `bitty plugin install {id}` later)"
+                                    );
+                                    let _ = output.flush();
+                                }
+                            }
+                        }
+                    } else {
+                        let _ = writeln!(
+                            output,
+                            "bitty init: skipped fetching (offline record kept; re-run `bitty plugin install <id>` to grant)"
+                        );
+                        let _ = output.flush();
+                    }
+                }
+            }
+            if with_components && !plugin_ids.is_empty() {
+                let mut declared: Vec<String> = Vec::new();
+                for id in &plugin_ids {
+                    for component in init_bundled_plugin_components(id) {
+                        if !declared.iter().any(|seen| seen == &component) {
+                            declared.push(component);
+                        }
+                    }
+                }
+                if declared.is_empty() {
+                    let _ = writeln!(
+                        output,
+                        "bitty init: no selected plugin declares native components; nothing to install"
+                    );
+                } else {
+                    for component in &declared {
+                        let _ = writeln!(
+                            output,
+                            "bitty init: component '{component}' is missing; re-run `bitty component install {component} --version <X.Y.Z>` (offline, nothing fetched; or stage via `bitty component add <path>`)"
+                        );
+                    }
+                }
+                let _ = output.flush();
+            }
+            if print_shell_init {
+                let detected = init_detect_shell_for_handoff(answers.shell.as_deref(), env.shell);
+                let line = init_shell_init_line(&detected);
+                println!(
+                    "bitty init: wire Tab completion + prompt hooks with `{line}` (detected shell: {detected}; `bitty shell-init --help` lists all five)"
+                );
+            }
             0
         }
         Err(InitWriteError::Refused(message)) => {

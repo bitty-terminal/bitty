@@ -4777,6 +4777,9 @@ fn init_interactive_overrides_skip_prompts() {
         gaps_out: Some(0),
         border: Some(1),
         radius: Some(0),
+        plugins: None,
+        with_components: None,
+        print_shell_init: None,
     };
     let (result, printed) =
         drive_init_wizard_with_overrides("\n\n", Some("/bin/bash"), None, &overrides);
@@ -6203,8 +6206,9 @@ fn init_live_preview_esc_restores_baseline_unix() {
 
 #[test]
 fn init_pending_recap_matches_written_file() {
-    // Full TTY pass: eleven Enters take every default; the recap printed
-    // before write must equal the file subsequently written.
+    // Full TTY pass: eleven Enters take every lua default plus one Enter for
+    // the plugin follow-up (empty = none); the recap printed before write
+    // must equal the file subsequently written.
     let dir = init_test_dir("pending-recap");
     let target = dir.join("init.lua");
     let home = dir.display().to_string();
@@ -6212,7 +6216,7 @@ fn init_pending_recap_matches_written_file() {
     args.init_word = true;
     args.config_path = Some(target.display().to_string());
     let env = init_env(None, Some("/bin/bash"), None, Some(&home), true);
-    let mut input = std::io::BufReader::new("\n\n\n\n\n\n\n\n\n\n\n".as_bytes());
+    let mut input = std::io::BufReader::new("\n\n\n\n\n\n\n\n\n\n\n\n".as_bytes());
     let mut output = Vec::new();
     assert_eq!(
         run_init_subcommand_with_io(&args, &env, &mut input, &mut output),
@@ -6251,7 +6255,7 @@ fn init_pending_recap_matches_written_file() {
     // Refusal path (existing file, no --force) prints no recap: the header
     // must never read as a write promise for a write that will not happen.
     std::fs::write(&target, "-- sentinel").expect("pre-existing file");
-    let mut input = std::io::BufReader::new("\n\n\n\n\n\n\n\n\n\n\n".as_bytes());
+    let mut input = std::io::BufReader::new("\n\n\n\n\n\n\n\n\n\n\n\n".as_bytes());
     let mut output = Vec::new();
     assert_eq!(
         run_init_subcommand_with_io(&args, &env, &mut input, &mut output),
@@ -6784,8 +6788,9 @@ fn init_dispatch_interactive_tty_prompts_and_writes_answers() {
     let mut args = Args::new();
     args.init_word = true; // interactive: TTY + no --yes
     let env = init_env(None, Some("/bin/bash"), Some(&xdg_s), None, true);
-    // Eleven Enters take every default.
-    let stdin_lines = "\n\n\n\n\n\n\n\n\n\n\n";
+    // Eleven Enters take every lua default plus one Enter for the plugin
+    // follow-up (empty = none).
+    let stdin_lines = "\n\n\n\n\n\n\n\n\n\n\n\n";
     let mut input = std::io::BufReader::new(stdin_lines.as_bytes());
     let mut output = Vec::new();
     assert_eq!(
@@ -6839,7 +6844,250 @@ fn init_usage_names_flags_and_target() {
     assert!(usage.contains("--gaps-out"));
     assert!(usage.contains("--border"));
     assert!(usage.contains("--radius"));
+    assert!(usage.contains("--plugins"));
+    assert!(usage.contains("--no-plugins"));
+    assert!(usage.contains("--with-components"));
+    assert!(usage.contains("--print-shell-init"));
     assert!(usage.contains("stdin"));
+}
+
+#[test]
+fn init_plugins_answer_parses_bundled_ids_offline() {
+    // Empty and `none` mean no selection (offline-safe default).
+    assert!(
+        init_parse_plugins_answer("")
+            .expect("empty is none")
+            .is_empty()
+    );
+    assert!(
+        init_parse_plugins_answer("  none  ")
+            .expect("none is none")
+            .is_empty()
+    );
+    // Single bundled id resolves (same source `plugin install` uses).
+    let single = init_parse_plugins_answer("bitty-terminal.shell-integration").expect("bundled id");
+    assert_eq!(single, vec!["bitty-terminal.shell-integration".to_string()]);
+    // Duplicates collapse, whitespace trimmed, catalog order kept.
+    let dup = init_parse_plugins_answer(
+        " bitty-terminal.shell-integration , bitty-terminal.shell-integration ",
+    )
+    .expect("dup collapses");
+    assert_eq!(dup, vec!["bitty-terminal.shell-integration".to_string()]);
+    // Unknown ids fail closed with a bundled-ids hint (no duplicate list).
+    let err = init_parse_plugins_answer("not-a-plugin").expect_err("unknown fails");
+    assert!(err.contains("unknown plugin"), "{err}");
+    assert!(err.contains("bundled ids"), "{err}");
+    // Flag values reject empty (missing value is usage error, never silent none).
+    assert!(init_parse_plugins_flag("").is_err());
+    assert!(init_parse_plugins_flag("   ").is_err());
+}
+
+#[test]
+fn init_yes_no_and_shell_handoff_helpers() {
+    assert!(!init_parse_yes_no_answer("").expect("empty is no"));
+    assert!(!init_parse_yes_no_answer("n").expect("n is no"));
+    assert!(!init_parse_yes_no_answer("N").expect("N is no"));
+    assert!(!init_parse_yes_no_answer("no").expect("no is no"));
+    assert!(init_parse_yes_no_answer("y").expect("y is yes"));
+    assert!(init_parse_yes_no_answer("YES").expect("YES is yes"));
+    assert!(init_parse_yes_no_answer("maybe").is_err());
+
+    // Shell basenames map through the same CompletionShell table shell-init uses.
+    assert_eq!(
+        init_shell_name_from_path("/bin/bash").as_deref(),
+        Some("bash")
+    );
+    assert_eq!(
+        init_shell_name_from_path("/usr/bin/zsh").as_deref(),
+        Some("zsh")
+    );
+    assert_eq!(
+        init_shell_name_from_path("/usr/bin/fish").as_deref(),
+        Some("fish")
+    );
+    assert_eq!(
+        init_shell_name_from_path("pwsh").as_deref(),
+        Some("powershell")
+    );
+    assert_eq!(init_shell_name_from_path("nu").as_deref(), Some("nushell"));
+    assert!(init_shell_name_from_path("tcl").is_none());
+    assert!(init_shell_name_from_path("").is_none());
+
+    // Detection prefers the chosen shell, then $SHELL, then bash fallback.
+    assert_eq!(
+        init_detect_shell_for_handoff(Some("/bin/zsh"), Some("/bin/bash")),
+        "zsh"
+    );
+    assert_eq!(
+        init_detect_shell_for_handoff(None, Some("/usr/bin/fish")),
+        "fish"
+    );
+    assert_eq!(init_detect_shell_for_handoff(None, None), "bash");
+    assert_eq!(
+        init_detect_shell_for_handoff(Some("/bin/unknown-shell"), Some("/bin/bash")),
+        "bash"
+    );
+
+    // Handoff lines are exact and shell-appropriate (PRINT, never eval).
+    assert_eq!(
+        init_shell_init_line("bash"),
+        "eval \"$(bitty shell-init bash)\""
+    );
+    assert_eq!(
+        init_shell_init_line("zsh"),
+        "eval \"$(bitty shell-init zsh)\""
+    );
+    assert_eq!(
+        init_shell_init_line("fish"),
+        "bitty shell-init fish | source"
+    );
+    assert!(
+        init_shell_init_line("powershell").contains("bitty shell-init powershell"),
+        "powershell wiring"
+    );
+    assert!(
+        init_shell_init_line("nushell").contains("bitty shell-init nushell"),
+        "nushell wiring"
+    );
+
+    // No bundled plugin declares native components today (future [components]
+    // flows through the same helper without touching the wizard).
+    assert!(init_bundled_plugin_components("bitty-terminal.shell-integration").is_empty());
+}
+
+#[test]
+fn parse_init_followup_flags() {
+    // `--plugins` accepts space and `=` forms; missing value fails closed.
+    let p = parse_args(&args_of(&[
+        "bitty",
+        "init",
+        "--plugins",
+        "bitty-terminal.shell-integration",
+    ]));
+    assert!(p.init_word);
+    assert_eq!(
+        p.init_plugins.as_deref(),
+        Some("bitty-terminal.shell-integration")
+    );
+    let p = parse_args(&args_of(&[
+        "bitty",
+        "init",
+        "--plugins=bitty-terminal.shell-integration",
+    ]));
+    assert_eq!(
+        p.init_plugins.as_deref(),
+        Some("bitty-terminal.shell-integration")
+    );
+    let p = parse_args(&args_of(&["bitty", "init", "--plugins"]));
+    assert_eq!(p.init_plugins.as_deref(), Some(""));
+
+    // Negations follow the existing `--no-*` style; last wins.
+    let p = parse_args(&args_of(&["bitty", "init", "--no-plugins"]));
+    assert!(p.init_no_plugins);
+    let p = parse_args(&args_of(&["bitty", "init", "--with-components"]));
+    assert_eq!(p.init_with_components, Some(true));
+    let p = parse_args(&args_of(&["bitty", "init", "--no-with-components"]));
+    assert_eq!(p.init_with_components, Some(false));
+    let p = parse_args(&args_of(&["bitty", "init", "--no-components"]));
+    assert_eq!(p.init_with_components, Some(false));
+    let p = parse_args(&args_of(&[
+        "bitty",
+        "init",
+        "--with-components",
+        "--no-with-components",
+    ]));
+    assert_eq!(p.init_with_components, Some(false));
+    let p = parse_args(&args_of(&["bitty", "init", "--print-shell-init"]));
+    assert_eq!(p.init_print_shell_init, Some(true));
+    let p = parse_args(&args_of(&["bitty", "init", "--no-print-shell-init"]));
+    assert_eq!(p.init_print_shell_init, Some(false));
+}
+
+#[test]
+fn init_dispatch_yes_with_plugins_records_and_grants() {
+    // `--yes --plugins <bundled>` records offline then grants via the install
+    // consent flow (`--yes` honors per-plugin consent). Both files land.
+    let dir = init_test_dir("yes-plugins");
+    let target = dir.join("init.lua");
+    let home = dir.display().to_string();
+    let mut args = Args::new();
+    args.init_word = true;
+    args.init_yes = true;
+    args.config_path = Some(target.display().to_string());
+    args.init_plugins = Some("bitty-terminal.shell-integration".to_string());
+    let env = init_env(None, Some("/bin/bash"), None, Some(&home), false);
+    let mut input: &[u8] = b"";
+    let mut output = Vec::new();
+    assert_eq!(
+        run_init_subcommand_with_io(&args, &env, &mut input, &mut output),
+        0
+    );
+    assert!(target.exists(), "config written");
+    let state_path = dir.join("bitty-plugins.toml");
+    assert!(state_path.exists(), "plugin queue recorded");
+    let state_text = std::fs::read_to_string(&state_path).expect("state readable");
+    assert!(
+        state_text.contains("bitty-terminal.shell-integration"),
+        "selected id recorded"
+    );
+    let printed = String::from_utf8(output).expect("UTF-8");
+    assert!(printed.contains("recorded"), "{printed}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn init_dispatch_yes_with_plugins_unknown_fails_closed() {
+    // Unknown `--plugins` ids are usage errors (exit 2, nothing written).
+    let dir = init_test_dir("yes-plugins-bad");
+    let target = dir.join("init.lua");
+    let home = dir.display().to_string();
+    let mut args = Args::new();
+    args.init_word = true;
+    args.init_yes = true;
+    args.config_path = Some(target.display().to_string());
+    args.init_plugins = Some("not-a-plugin".to_string());
+    let env = init_env(None, Some("/bin/bash"), None, Some(&home), false);
+    let mut input: &[u8] = b"";
+    let mut output = Vec::new();
+    assert_eq!(
+        run_init_subcommand_with_io(&args, &env, &mut input, &mut output),
+        2
+    );
+    assert!(!target.exists(), "usage error writes no config");
+    assert!(
+        !dir.join("bitty-plugins.toml").exists(),
+        "usage error writes no plugin queue"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn init_dispatch_interactive_plugins_and_components() {
+    // Interactive: 11 lua defaults + plugin id + fetch y + component y.
+    // Component offer finds no declared components (nothing-to-do line).
+    let dir = init_test_dir("interactive-plugins");
+    let target = dir.join("init.lua");
+    let home = dir.display().to_string();
+    let mut args = Args::new();
+    args.init_word = true;
+    args.config_path = Some(target.display().to_string());
+    let env = init_env(None, Some("/bin/bash"), None, Some(&home), true);
+    let stdin_lines = "\n\n\n\n\n\n\n\n\n\n\nbitty-terminal.shell-integration\ny\ny\ny\n";
+    let mut input = std::io::BufReader::new(stdin_lines.as_bytes());
+    let mut output = Vec::new();
+    assert_eq!(
+        run_init_subcommand_with_io(&args, &env, &mut input, &mut output),
+        0
+    );
+    let state_path = dir.join("bitty-plugins.toml");
+    assert!(state_path.exists(), "interactive selection recorded");
+    let printed = String::from_utf8(output).expect("UTF-8");
+    assert!(
+        printed.contains("bitty-terminal.shell-integration"),
+        "{printed}"
+    );
+    assert!(printed.contains("no selected plugin declares"), "{printed}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

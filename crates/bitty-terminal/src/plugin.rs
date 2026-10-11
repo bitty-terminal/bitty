@@ -1277,6 +1277,117 @@ fn save_state(path: &Path, state: &PluginState) -> Result<Option<PathBuf>, Plugi
 }
 
 // ---------------------------------------------------------------------------
+// Init follow-ups (CTX-1132, #1913): offline-first batch recording
+// ---------------------------------------------------------------------------
+
+/// Resolve the managed-manifest path for `bitty init` follow-ups.
+///
+/// Mirrors [`resolve_state_path`] (explicit `--config`/`BITTY_CONFIG` parent,
+/// else XDG config root): the init wizard records into the same
+/// `bitty-plugins.toml` `plugin install <id>` uses, so a recorded queue is
+/// consumable later by `plugin install`. Returns a plain string error for the
+/// init dispatch (English-only, no secrets).
+pub(crate) fn init_plugin_state_path(
+    config_path: Option<&str>,
+    bitty_config_env: Option<&str>,
+    xdg_config_home: Option<&str>,
+    home: Option<&str>,
+) -> Result<PathBuf, String> {
+    resolve_state_path(config_path, bitty_config_env, xdg_config_home, home)
+        .map_err(|failure| failure.message)
+}
+
+/// Record first-batch bundled ids offline without fetching or consent.
+///
+/// For each id in `ids` (validated against the same bundled source
+/// `plugin install <id>` uses via [`bundled_manifest_for`], no duplicate
+/// list): when absent, inserts a disabled record (`source = "bundled"`,
+/// pinned `manifest_hash`, `enabled = false`, empty grants/denials) so no
+/// capability is granted without explicit consent; when already recorded with
+/// the same hash, leaves it untouched (idempotent). Capability-bearing grants
+/// happen only later via [`init_install_bundled_with_consent`] (the install
+/// consent flow) or a later `plugin install <id>`.
+///
+/// Offline-only: filesystem only, no network, no secrets. Fails closed on an
+/// unknown id, an over-limit state, or any filesystem error (nothing partially
+/// written: the state is saved once at the end with a `.bak` backup).
+/// Returns the number of newly recorded ids.
+pub(crate) fn init_record_bundled_offline(
+    state_path: &Path,
+    ids: &[String],
+) -> Result<usize, String> {
+    let mut state = load_state(state_path).map_err(|failure| failure.message)?;
+    let mut recorded = 0usize;
+    for id in ids {
+        let manifest = bundled_manifest_for(id.trim()).ok_or_else(|| {
+            let valid = bitty_plugin_host::bundled::bundled_ids_sorted().join(", ");
+            format!(
+                "bitty init: unknown plugin '{}' (bundled ids: {})",
+                id.trim(),
+                if valid.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    valid
+                }
+            )
+        })?;
+        manifest
+            .validate()
+            .map_err(|error| format!("bitty init: bundled manifest '{id}' is invalid: {error}"))?;
+        let manifest_hash = manifest.manifest_hash();
+        if let Some(existing) = state.get(id.trim()) {
+            if existing.manifest_hash == manifest_hash {
+                continue;
+            }
+        }
+        if state.records.len() >= MAX_STATE_PLUGINS && state.get(id.trim()).is_none() {
+            return Err(format!(
+                "bitty init: too many plugins (limit {MAX_STATE_PLUGINS}) — nothing changed"
+            ));
+        }
+        state.insert(
+            id.trim().to_string(),
+            PluginRecord {
+                source: "bundled".to_string(),
+                manifest_hash,
+                enabled: false,
+                granted: BTreeSet::new(),
+                denied: BTreeSet::new(),
+            },
+        );
+        recorded += 1;
+    }
+    if recorded > 0 {
+        save_state(state_path, &state).map_err(|failure| failure.message)?;
+    }
+    Ok(recorded)
+}
+
+/// Install one bundled plugin via the install consent flow (CTX-1132, #1913).
+///
+/// Reuses [`op_install`] (per-plugin `Grant these capabilities? [y/N]`
+/// consent, `--yes` honors) then persists with the same backup/hardening as
+/// `plugin install <id>`. Call only after explicit opt-in (interactive `y` or
+/// `--yes`); offline-safe for bundled ids (no network fetch, capability
+/// consent only). Returns the install summary line.
+pub(crate) fn init_install_bundled_with_consent(
+    state_path: &Path,
+    id: &str,
+    yes: bool,
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
+) -> Result<String, String> {
+    let mut state = load_state(state_path).map_err(|failure| failure.message)?;
+    let result =
+        op_install(&mut state, id.trim(), yes, input, output).map_err(|failure| failure.message)?;
+    let summary = result.summary.clone();
+    if result.changed {
+        save_state(state_path, &state).map_err(|failure| failure.message)?;
+    }
+    Ok(summary)
+}
+
+// ---------------------------------------------------------------------------
 // Rows (static manifest + recorded state) and rendering
 // ---------------------------------------------------------------------------
 

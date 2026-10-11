@@ -40,6 +40,7 @@ jobs:
           echo '#!/bin/sh
           echo "bitty 0.0.1"' > target/release/bitty
           chmod +x target/release/bitty
+          tic -x -o target/terminfo terminfo/bitty.ti
       - name: Validate nfpm (deb/rpm/apk/archlinux)
         run: |
           nfpm package --config nfpm.yaml --packager deb --target /tmp/bitty.deb

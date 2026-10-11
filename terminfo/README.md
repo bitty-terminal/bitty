@@ -30,9 +30,12 @@ Audited extensions in `bitty.ti`:
 - `Hls`: `OSC 8` hyperlinks (tmux canonical
   `\E]8;%?%p1%l%tid=%p1%s%;;%p2%s\E\\`, for tmux passthrough + SSH).
 - `pairs#32767`: ncurses-limit correction of the base `pairs#0x10000`.
+- `Ms@`: cancels the `Ms` (`OSC 52` clipboard) inherited from
+  `xterm-256color`; bitty clipboard policy is default-deny (PARTIAL), so the
+  compiled entry must not advertise `Ms`.
 
 Deliberately excluded: `Ms` (`OSC 52` clipboard, parser-supported but
-runtime-gated default-deny + state-inert — PARTIAL, not advertised),
+runtime-gated default-deny + state-inert — PARTIAL, cancelled with `Ms@`),
 `fullkbd` (legacy Kitty `DEC 2017` full mode, absent; bitty implements the
 progressive `CSI u` protocol which has no terminfo string cap), `RGB`
 (covered by `Tc`; `kitty-direct` geometry not claimed).

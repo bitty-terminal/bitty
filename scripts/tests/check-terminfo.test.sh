@@ -2,8 +2,9 @@
 # check-terminfo.test.sh — CTX-1121 fixture test for the audited terminfo gate.
 #
 # Drives scripts/check-terminfo.sh against synthetic repository roots so the
-# tic-syntax + audited-flag + no-aspirational-cap decisions are exercised
-# without touching the checkout. Requires tic/infocmp (ncurses) like the gate.
+# tic-syntax + audited-flag + Ms@-cancel + no-aspirational-cap decisions are
+# exercised without touching the checkout. Requires tic/infocmp (ncurses) like
+# the gate.
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
@@ -14,7 +15,8 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 # make_root <dir>: minimal tree with the paths the gate inspects, seeded with
-# a valid bitty.ti (copied from the real entry) and tic-based AUR recipes.
+# a valid bitty.ti (copied from the real entry), tic-based AUR recipes, and
+# the staged nFPM terminfo mapping.
 make_root() {
   local root="$1"
   mkdir -p "$root/terminfo" "$root/packaging" "$root/.github/workflows"
@@ -23,7 +25,7 @@ make_root() {
   for f in "$root/packaging/PKGBUILD" "$root/packaging/PKGBUILD.bin"; do
     printf 'tic -x -o "$pkgdir/usr/share/terminfo" terminfo/bitty.ti\n' >"$f"
   done
-  : >"$root/nfpm.yaml"
+  printf '  - src: ./target/terminfo/b/bitty\n    dst: /usr/share/terminfo/b/bitty\n' >"$root/nfpm.yaml"
   : >"$root/.github/workflows/release.yml"
 }
 
@@ -96,6 +98,15 @@ grep -v '^[[:space:]]*Tc,' "$root/terminfo/bitty.ti" >"$root/terminfo/bitty.ti.t
 mv "$root/terminfo/bitty.ti.tmp" "$root/terminfo/bitty.ti"
 expect_fail_tag "audited capability 'Tc'" 'missing Tc' --root "$root"
 
+# 7b. Missing Ms@ cancellation fails: the use-chain inherits Ms from
+# xterm-256color, so the compiled entry contains Ms= even though the source
+# never claims Ms. Proves the compiled-entry check (not just source).
+root="$TMP/nomsat"
+make_root "$root"
+grep -v '^[[:space:]]*Ms@' "$root/terminfo/bitty.ti" >"$root/terminfo/bitty.ti.tmp"
+mv "$root/terminfo/bitty.ti.tmp" "$root/terminfo/bitty.ti"
+expect_fail_tag "must cancel inherited Ms with 'Ms@'" 'missing Ms@ cancel' --root "$root"
+
 # 8. Aspirational Ms fails.
 root="$TMP/ms"
 make_root "$root"
@@ -120,6 +131,12 @@ root="$TMP/notic"
 make_root "$root"
 : >"$root/packaging/PKGBUILD"
 expect_fail_tag "must compile terminfo with 'tic -x'" 'missing tic step' --root "$root"
+
+# 11b. nFPM without the staged compiled-entry mapping fails.
+root="$TMP/nonfpmmap"
+make_root "$root"
+: >"$root/nfpm.yaml"
+expect_fail_tag "must map the staged compiled entry" 'missing nfpm terminfo mapping' --root "$root"
 
 # 12. A workflow recreating the retired path fails.
 root="$TMP/workflow"

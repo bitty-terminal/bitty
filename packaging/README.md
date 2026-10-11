@@ -70,11 +70,12 @@ Scripts under `packaging/scripts/` are bounded no-ops (exit 0) to keep package h
 ## Terminfo distribution (`terminfo/bitty.ti`, CTX-1121 #1764)
 
 Canonical source `terminfo/bitty.ti` (`use=xterm-256color` + audited `Tc`,
-`Su`/`Setulc`/`Smulx`, `Sync`, `Hls`, `pairs#32767`; see
+`Su`/`Setulc`/`Smulx`, `Sync`, `Hls`, `pairs#32767`, `Ms@` cancel; see
 `terminfo/README.md`). Never install the raw source to
 `/usr/share/terminfo`; always compile with `tic -x` and install the
 compiled database entry. `scripts/check-terminfo.sh` fails on the retired
-placeholder path, on raw-source installs, and on aspirational caps.
+placeholder path, on raw-source installs, on aspirational caps, and on a
+compiled entry containing `Ms`.
 
 Linux (`.deb`/`.rpm`/`.pkg.tar.zst`/AUR) — compile at package build time:
 
@@ -86,9 +87,14 @@ tic -x -o "$pkgdir/usr/share/terminfo" terminfo/bitty.ti
 - AUR source (`packaging/PKGBUILD`) and prebuilt (`packaging/PKGBUILD.bin`)
   run the same `tic -x` line in `package()` and install the compiled
   `b/bitty` entry (requires `ncurses` providing `tic` at build time).
-- `nfpm.yaml` (`.deb`/`.rpm`/`.apk`/`.pkg.tar.zst` via nfpm) documents the
-  same manual step: compile with `tic -x` before `nfpm package`, or run
-  `tic -x terminfo/bitty.ti` post-install and `rm -f
+- `nfpm.yaml` (`.deb`/`.rpm`/`.apk`/`.pkg.tar.zst` via nfpm) maps the staged
+  compiled entry. Before `nfpm package`, run:
+
+  ```sh
+  tic -x -o ./target/terminfo terminfo/bitty.ti
+  ```
+
+  You can also run `tic -x terminfo/bitty.ti` post-install and `rm -f
 /usr/share/terminfo/b/bitty` on remove. No new hook is added; the
   existing `packaging/scripts/*-postinstall.sh` stays a bounded no-op per
   pipeline convention.

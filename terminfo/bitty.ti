@@ -29,6 +29,8 @@
 #   Ms (OSC 52 clipboard): parser dispatch.rs:1123-1130 SUPPORTED but runtime
 #     pty.rs:799-852 gates reads/writes default-deny + state.rs:1462-1468 inert.
 #     Marked PARTIAL; not advertised so apps do not assume clipboard writes work.
+#     Cancelled below with `Ms@` because `use=xterm-256color` would otherwise
+#     inherit `Ms=\E]52;...` and advertise clipboard support.
 #     (Task text "Ms (sync update)" conflates Ms/clipboard with Sync/2026;
 #     Sync above is the correct sync-update capability.)
 #   fullkbd (Kitty full-keyboard mode DEC 2017): ABSENT. Bitty implements the
@@ -45,6 +47,7 @@
 bitty|bitty terminal emulator,
 	use=xterm-256color,
 	pairs#32767,
+	Ms@,
 	Tc,
 	Su,
 	Setulc=\E[58:2::%p1%{65536}%/%d:%p1%{256}%/%{255}%&%d:%p1%{255}%&%d%;m,

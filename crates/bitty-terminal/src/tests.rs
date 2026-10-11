@@ -5943,6 +5943,145 @@ fn init_preview_push_live_maps_final_overlay() {
     );
 }
 
+#[test]
+fn init_preview_echo_tracks_running_theme_with_color() {
+    // User-visible half of the live preview (DEC-0109): the running echo is
+    // styled in the running preview theme. Same custom picks as the mapping
+    // test; no live session needed since the echo reads the overlay only.
+    let baseline = bitty_config::fallback_builtin();
+    let mut input = std::io::BufReader::new(
+        "2\nbitty-dark\nFira Code\n14\n10\n12\n3\n8\n50000\nalways\n2\n".as_bytes(),
+    );
+    let mut output = Vec::new();
+    let mut preview = InitPreview::enabled(baseline);
+    let result = run_init_interactive_with_preview(
+        &mut input,
+        &mut output,
+        Some("/bin/bash"),
+        None,
+        &|p| p == "/bin/bash" || p == "/bin/sh",
+        &InitOverrides::default(),
+        true,
+        Some(&mut preview),
+        None,
+    );
+    result.expect("custom picks accepted");
+    let printed = String::from_utf8(output).expect("wizard output is UTF-8");
+    let echoes: Vec<&str> = printed
+        .lines()
+        .filter(|line| line.contains("(preview:"))
+        .collect();
+    assert_eq!(echoes.len(), 11, "one echo per step, got:\n{printed}");
+    // The first echo still carries the shipped defaults while the last one
+    // carries every custom pick: the echo tracks the running overlay.
+    assert!(
+        echoes[0].contains(bitty_config::types::DEFAULT_FONT_FAMILY),
+        "first echo shows the default family, got: {}",
+        echoes[0]
+    );
+    assert!(
+        !echoes[0].contains("Fira Code"),
+        "first echo predates the family pick, got: {}",
+        echoes[0]
+    );
+    assert!(
+        echoes[10].contains("font=\"Fira Code\" 14pt"),
+        "last echo shows the picked family and size, got: {}",
+        echoes[10]
+    );
+    assert!(
+        echoes[10].contains("gaps 10/12, border 3, radius 8"),
+        "last echo shows the picked decoration, got: {}",
+        echoes[10]
+    );
+    assert!(
+        echoes[10].contains("theme=\"dark\""),
+        "last echo shows the picked theme, got: {}",
+        echoes[10]
+    );
+    // Styled in the running preview theme through the existing convention.
+    let (dark, _) = bitty_config::theme::resolve_theme_with_status(Some("dark"));
+    let foreground = format!(
+        "\u{1b}[38;2;{};{};{}m",
+        dark.foreground[0], dark.foreground[1], dark.foreground[2]
+    );
+    let background = format!(
+        "\u{1b}[48;2;{};{};{}m",
+        dark.background[0], dark.background[1], dark.background[2]
+    );
+    assert!(
+        echoes.iter().any(|line| line.contains(&foreground)),
+        "echo wears the preview theme foreground, got:\n{printed}"
+    );
+    assert!(
+        echoes.iter().any(|line| line.contains(&background)),
+        "echo wears the preview theme background, got:\n{printed}"
+    );
+}
+
+#[test]
+fn init_preview_echo_plain_without_color() {
+    // Without color the same running echo stays plain (existing plain-output
+    // contract keeps holding with echoes present).
+    let baseline = bitty_config::fallback_builtin();
+    let mut input = std::io::BufReader::new(
+        "2\nbitty-dark\nFira Code\n14\n10\n12\n3\n8\n50000\nalways\n2\n".as_bytes(),
+    );
+    let mut output = Vec::new();
+    let mut preview = InitPreview::enabled(baseline);
+    let result = run_init_interactive_with_preview(
+        &mut input,
+        &mut output,
+        Some("/bin/bash"),
+        None,
+        &|p| p == "/bin/bash" || p == "/bin/sh",
+        &InitOverrides::default(),
+        false,
+        Some(&mut preview),
+        None,
+    );
+    result.expect("custom picks accepted");
+    let printed = String::from_utf8(output).expect("wizard output is UTF-8");
+    assert_eq!(
+        printed.matches("(preview:").count(),
+        11,
+        "one plain echo per step, got:\n{printed}"
+    );
+    assert!(
+        printed.contains("(preview: theme=\"dark\", font=\"Fira Code\" 14pt"),
+        "plain echo carries the running picks, got:\n{printed}"
+    );
+    assert!(
+        !printed.contains("\u{1b}["),
+        "plain echo adds no ANSI, got:\n{printed}"
+    );
+}
+
+#[test]
+fn init_preview_echo_absent_without_preview() {
+    // Piped/plain path (no preview): prompts behave exactly as before with
+    // no echo lines.
+    let mut input = std::io::BufReader::new(
+        "2\nbitty-dark\nFira Code\n14\n10\n12\n3\n8\n50000\nalways\n2\n".as_bytes(),
+    );
+    let mut output = Vec::new();
+    let result = run_init_interactive(
+        &mut input,
+        &mut output,
+        Some("/bin/bash"),
+        None,
+        &|p| p == "/bin/bash" || p == "/bin/sh",
+        &InitOverrides::default(),
+        true,
+    );
+    result.expect("custom picks accepted");
+    let printed = String::from_utf8(output).expect("wizard output is UTF-8");
+    assert!(
+        !printed.contains("(preview:"),
+        "no preview means no echo, got:\n{printed}"
+    );
+}
+
 // Live-spawn: the wizard-owned preview session hot-updates per step on the
 // real constructor (not the deterministic rasterizer). Unix-only in this
 // slice (no ConPTY coverage); require_pty keeps the force-no-PTY simulation

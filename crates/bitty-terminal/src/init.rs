@@ -1244,22 +1244,25 @@ pub(crate) fn init_ask_option<T>(
 /// field is cloned from `baseline` untouched. Of those, the `Live` subset
 /// (`appearance.theme`, `font.family`/`font.size`, `decoration.*`,
 /// `keymaps` — see `bitty-config::ReloadClass` and the `runtime_adopts`
-/// list in `crate::config_reload`) adopts live per step into the
-/// wizard-owned preview `Runtime` via [`init_preview_push_live`] (the reload
-/// `apply_live` path plus the stashed `AppAdoption` for
-/// `TerminalApp::adopt_live_config`); the restart-required remainder
-/// (`terminal.shell`, `terminal.scrollback`, `close_confirm`) is staged in
-/// the same overlay and takes effect on confirm/next start. TTY seeds
-/// `baseline` from the loaded effective config via [`init_preview_baseline`]
-/// (`CLI > file > profile > defaults`; empty layers stay on the shipped
-/// `fallback_builtin` headless/test default). `bitty init` stays a
-/// standalone pre-`Runtime` subcommand with its line-prompt flow (no
-/// fullscreen TUI library): the wizard builds its own preview `Runtime` from
-/// the baseline when [`init_live_preview_enabled`] holds and pushes
-/// `current` per step as a non-persistent preview (no file write until
-/// confirm, no new process or env authority, fail-soft otherwise). Esc
-/// rollback restores the baseline both in memory (`rollback`) and live
-/// (baseline push, see [`run_init_interactive_with_preview`]).
+/// list in `crate::config_reload`) is validated per step through the reload
+/// `apply_live` path against a wizard-owned headless `Runtime`
+/// ([`init_preview_push_live`]: fail-soft validation and producer state with
+/// no visible effect on its own); the user-visible preview is the per-step
+/// stdout echo from [`init_emit_preview_echo`], which renders the running
+/// overlay appearance in the running preview theme. The restart-required
+/// remainder (`terminal.shell`, `terminal.scrollback`, `close_confirm`) is
+/// staged in the same overlay and takes effect on confirm/next start. TTY
+/// seeds `baseline` from the loaded effective config via
+/// [`init_preview_baseline`] (`CLI > file > profile > defaults`; empty layers
+/// stay on the shipped `fallback_builtin` headless/test default). `bitty
+/// init` stays a standalone pre-`Runtime` subcommand with its line-prompt
+/// flow (no fullscreen TUI library): the wizard builds its own headless
+/// preview `Runtime` from the baseline when [`init_live_preview_enabled`]
+/// holds and pushes `current` per step as non-persistent producer state (no
+/// file write until confirm, no new process or env authority, fail-soft
+/// otherwise). Esc rollback restores the baseline both in memory (`rollback`,
+/// plus a baseline push into the headless session) and on screen (the echo
+/// simply stops; see [`run_init_interactive_with_preview`]).
 ///
 /// `snapshots` records one `current` clone per successful prompted step
 /// (skipped override steps apply silently first), so headless tests prove
@@ -1502,23 +1505,26 @@ pub(crate) fn init_live_preview_enabled(args: &Args, env: &InitEnv<'_>) -> bool 
     env.stdin_is_tty && !args.init_yes && !args.safe && !args.headless && !args.test_mode
 }
 
-/// Push the preview overlay live through the existing reload path (p4 of
-/// #1806, CTX-1119 DEC-0108, shape a).
+/// Push the preview overlay through the existing reload path (p4 of #1806,
+/// CTX-1119 DEC-0108 shape a, rescoped by DEC-0109).
 ///
 /// Calls `config_reload::apply_live` with `preview.current()` (runtime half
-/// adopts theme, font, decoration; the app half is stashed for
-/// `TerminalApp::adopt_live_config`) and returns the stashed `AppAdoption`
-/// for a preview app to adopt, or `None` when preview is disabled or the
-/// adoption failed. Fail-soft by construction: any `apply_live` error is
-/// discarded via `ok`, so a live rejection can never abort the wizard — the
-/// in-memory overlay stays the commit truth and the file write on confirm
-/// stays the sole persistence. Never writes the user file, never spawns a
-/// shell, never touches the session store.
+/// validates theme, font, decoration; the app half is stashed for a future
+/// headed owner via `TerminalApp::adopt_live_config`) and returns the
+/// stashed `AppAdoption`, or `None` when preview is disabled or the adoption
+/// failed. Headless validation and producer state only: the session has no
+/// window and is never presented, so this has no visible effect on its own —
+/// the user-visible preview is the stdout echo from
+/// [`init_emit_preview_echo`]. Fail-soft by construction: any `apply_live`
+/// error is discarded via `ok`, so a live rejection can never abort the
+/// wizard — the in-memory overlay stays the commit truth and the file write
+/// on confirm stays the sole persistence. Never writes the user file, never
+/// spawns a shell, never touches the session store.
 ///
 /// The caller pushes after every successful prompted step (plus once after
 /// the silent override seeding) and pushes the baseline again after an
-/// in-memory `rollback` on cancel/EOF, so Esc restores the prior live
-/// appearance as well as the prior config.
+/// in-memory `rollback` on cancel/EOF, so the headless session ends on the
+/// prior state as well as the overlay.
 pub(crate) fn init_preview_push_live(
     runtime: &mut bitty_runtime::Runtime,
     preview: &InitPreview,
@@ -1534,11 +1540,14 @@ pub(crate) fn init_preview_push_live(
 ///
 /// Uses the same mapping plus constructor as startup
 /// (`runtime_config_from_effective_for` with `startup_prefer_light` plus
-/// `Runtime::new`), so the preview shows what a fresh launch would show.
-/// Fail-soft: `None` on any mapping or construction error, in which case the
-/// wizard continues with the in-memory overlay only. No new process or env
-/// authority beyond the existing startup path; the preview never spawns
-/// shells and never writes the user file.
+/// `Runtime::new`), so the preview computes the presentation values a fresh
+/// launch would compute. Fail-soft: `None` on any mapping or construction
+/// error, in which case the wizard continues with the in-memory overlay only.
+/// No new process or env authority beyond the existing startup path; the
+/// preview never spawns shells and never writes the user file. The session
+/// stays headless (no window, no tick, no present): it validates Live
+/// adoption and stages producer state, while the user-visible preview is the
+/// stdout echo from [`init_emit_preview_echo`].
 fn init_preview_runtime(
     baseline: &bitty_config::EffectiveConfig,
 ) -> Option<bitty_runtime::Runtime> {
@@ -1548,6 +1557,51 @@ fn init_preview_runtime(
     )
     .ok()?;
     bitty_runtime::Runtime::new(cfg).ok()
+}
+
+/// One-line running appearance preview printed after each wizard step (p4 of
+/// #1806, CTX-1119 DEC-0109, CodeRabbit 1931 verdict B).
+///
+/// The `bitty init` process owns no window: the outer terminal renders every
+/// visible pixel, so this stdout line is the user-visible half of the live
+/// preview. It summarizes the running overlay appearance (theme, font
+/// family/size, decoration geometry) and is styled in the running preview
+/// theme through the existing option-list convention
+/// ([`init_style_label`]: truecolor foreground on background when `color`
+/// allows, plain otherwise). Print-only and fail-soft: write errors are
+/// ignored, the overlay stays the commit truth, and the user file is never
+/// touched. Gated on an enabled preview; a disabled preview prints nothing.
+/// Styling resolves with `resolve_theme_with_status` (no stderr), so an
+/// unknown seeded theme still echoes its stored name in default colors.
+fn init_emit_preview_echo(output: &mut dyn std::io::Write, preview: &InitPreview, color: bool) {
+    if !preview.is_enabled() {
+        return;
+    }
+    let current = preview.current();
+    let (resolved, _) =
+        bitty_config::theme::resolve_theme_with_status(current.appearance.theme.as_deref());
+    let size_text = if current.font.size.fract() == 0.0 {
+        format!("{}", current.font.size as u32)
+    } else {
+        format!("{}", current.font.size)
+    };
+    let line = format!(
+        "  (preview: theme={:?}, font={:?} {}pt, gaps {}/{}, border {}, radius {})",
+        current.appearance.theme.as_deref().unwrap_or("default"),
+        current.font.family,
+        size_text,
+        current.decoration.gaps_in,
+        current.decoration.gaps_out,
+        current.decoration.border,
+        current.decoration.radius,
+    );
+    let item = InitOptionItem {
+        label: line,
+        value_text: String::new(),
+        style_fg: Some(resolved.foreground),
+        style_bg: Some(resolved.background),
+    };
+    let _ = writeln!(output, "{}", init_style_label(&item, false, color));
 }
 
 /// Runs the interactive wizard: mascot greeting, then shell / theme / font
@@ -1562,15 +1616,18 @@ fn init_preview_runtime(
 /// option list (phase 1 of #1806) with their shipped default and reprompt
 /// fail-closed on invalid input.
 ///
-/// Live preview (phase 2 of #1806, per-step live p4 CTX-1119): when `preview`
-/// is `Some`, each answered step overlays its value onto the preview's
-/// in-memory config (no file writes) and, when `live` is `Some`, pushes the
-/// overlay live through [`init_preview_push_live`] as a non-persistent
-/// preview; cancel/EOF discards the overlay, restores the baseline in memory
-/// via `rollback`, and pushes the baseline live again so the prior live
-/// appearance returns (see [`InitPreview`]). `None` preview disables overlay
-/// (piped/non-TTY); `None` live keeps the in-memory overlay only
-/// (headless, safe, piped, or construction failed — fail-soft).
+/// Live preview (phase 2 of #1806, per-step live p4 CTX-1119, stdout echo
+/// DEC-0109): when `preview` is `Some`, each answered step overlays its value
+/// onto the preview's in-memory config (no file writes), prints the running
+/// appearance preview via [`init_emit_preview_echo`] (the user-visible half),
+/// and, when `live` is `Some`, pushes the overlay through
+/// [`init_preview_push_live`] as headless validation/producer state (no
+/// visible effect on its own); cancel/EOF discards the overlay, restores the
+/// baseline in memory via `rollback`, and pushes the baseline into the
+/// headless session again (see [`InitPreview`]). `None` preview disables
+/// overlay and echo (piped/non-TTY); `None` live keeps the in-memory overlay
+/// plus echo only (headless, safe, piped, or construction failed —
+/// fail-soft).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_init_interactive_with_preview(
     input: &mut dyn std::io::BufRead,
@@ -1586,8 +1643,9 @@ pub(crate) fn run_init_interactive_with_preview(
     // Rollback guard: any abort below restores the exact previous config
     // before the error propagates, so Esc/cancel/EOF can never leave a
     // partial overlay behind (the user file was never written either). The
-    // live push after the in-memory rollback restores the prior live
-    // appearance on the same fail-soft path as the per-step pushes.
+    // baseline push after the in-memory rollback returns the headless
+    // session to the prior state on the same fail-soft path as the per-step
+    // pushes; on screen the echo simply stops with the abort message.
     let mut preview = preview;
     let mut live = live;
     // Reborrow the inner `&mut` for the callee; a plain move would lose
@@ -1647,8 +1705,9 @@ pub(crate) fn run_init_interactive(
 
 /// Wizard body shared by [`run_init_interactive`] and
 /// [`run_init_interactive_with_preview`]; `preview` overlays each answered
-/// step in memory and `live` pushes each overlay live (see [`InitPreview`]
-/// and [`init_preview_push_live`]).
+/// step in memory, prints the running appearance echo, and `live` pushes each
+/// overlay through headless validation (see [`InitPreview`],
+/// [`init_emit_preview_echo`], and [`init_preview_push_live`]).
 #[allow(clippy::too_many_arguments)]
 fn run_init_interactive_impl(
     input: &mut dyn std::io::BufRead,
@@ -1711,11 +1770,15 @@ fn run_init_interactive_impl(
     if let Some(active) = preview.as_mut() {
         active.apply_shell(shell.as_deref());
     };
-    // Per-step live hot-update (p4 CTX-1119): the shell itself is
-    // restart-required, but the push keeps the preview session in sync and is
-    // a fail-soft no-op without a live session.
+    // Per-step preview: push the overlay through the headless reload path
+    // (fail-soft validation/producer with no visible effect on its own) and
+    // echo the running appearance preview to stdout (the user-visible half).
+    // The shell itself is restart-required and stays staged for confirm.
     if let (Some(active), Some(runtime)) = (preview.as_deref(), live.as_mut()) {
         let _ = init_preview_push_live(runtime, active);
+    }
+    if let Some(active) = preview.as_deref() {
+        init_emit_preview_echo(output, active, color);
     }
     let theme = match &overrides.theme {
         Some(theme) => theme.clone(),
@@ -1770,10 +1833,14 @@ fn run_init_interactive_impl(
             })?
         }
     };
-    // Per-step live hot-update: the theme visibly adopts in the preview
-    // session; fail-soft without one.
+    // Per-step preview: headless reload-path push (fail-soft, no visible
+    // effect on its own) plus the user-visible stdout echo in the running
+    // preview theme.
     if let (Some(active), Some(runtime)) = (preview.as_deref(), live.as_mut()) {
         let _ = init_preview_push_live(runtime, active);
+    }
+    if let Some(active) = preview.as_deref() {
+        init_emit_preview_echo(output, active, color);
     }
     let font_family = match &overrides.font_family {
         Some(family) => family.clone(),
@@ -1822,10 +1889,14 @@ fn run_init_interactive_impl(
             })?
         }
     };
-    // Per-step live hot-update: the font family visibly adopts in the preview
-    // session; fail-soft without one.
+    // Per-step preview: headless reload-path push (fail-soft, no visible
+    // effect on its own) plus the user-visible stdout echo in the running
+    // preview theme.
     if let (Some(active), Some(runtime)) = (preview.as_deref(), live.as_mut()) {
         let _ = init_preview_push_live(runtime, active);
+    }
+    if let Some(active) = preview.as_deref() {
+        init_emit_preview_echo(output, active, color);
     }
     let font_size = match overrides.font_size {
         Some(size) => size,
@@ -1879,10 +1950,14 @@ fn run_init_interactive_impl(
             })?
         }
     };
-    // Per-step live hot-update: the font size visibly adopts in the preview
-    // session; fail-soft without one.
+    // Per-step preview: headless reload-path push (fail-soft, no visible
+    // effect on its own) plus the user-visible stdout echo in the running
+    // preview theme.
     if let (Some(active), Some(runtime)) = (preview.as_deref(), live.as_mut()) {
         let _ = init_preview_push_live(runtime, active);
+    }
+    if let Some(active) = preview.as_deref() {
+        init_emit_preview_echo(output, active, color);
     }
     let _ = writeln!(
         output,
@@ -1943,9 +2018,14 @@ fn run_init_interactive_impl(
             })?
         }
     };
-    // Per-step live hot-update: gaps_in visibly adopts in the preview session.
+    // Per-step preview: headless reload-path push (fail-soft, no visible
+    // effect on its own) plus the user-visible stdout echo in the running
+    // preview theme.
     if let (Some(active), Some(runtime)) = (preview.as_deref(), live.as_mut()) {
         let _ = init_preview_push_live(runtime, active);
+    }
+    if let Some(active) = preview.as_deref() {
+        init_emit_preview_echo(output, active, color);
     }
     let gaps_out = match overrides.gaps_out {
         Some(value) => value,
@@ -2002,9 +2082,14 @@ fn run_init_interactive_impl(
             })?
         }
     };
-    // Per-step live hot-update: gaps_out visibly adopts in the preview session.
+    // Per-step preview: headless reload-path push (fail-soft, no visible
+    // effect on its own) plus the user-visible stdout echo in the running
+    // preview theme.
     if let (Some(active), Some(runtime)) = (preview.as_deref(), live.as_mut()) {
         let _ = init_preview_push_live(runtime, active);
+    }
+    if let Some(active) = preview.as_deref() {
+        init_emit_preview_echo(output, active, color);
     }
     let border = match overrides.border {
         Some(value) => value,
@@ -2060,9 +2145,14 @@ fn run_init_interactive_impl(
             })?
         }
     };
-    // Per-step live hot-update: border visibly adopts in the preview session.
+    // Per-step preview: headless reload-path push (fail-soft, no visible
+    // effect on its own) plus the user-visible stdout echo in the running
+    // preview theme.
     if let (Some(active), Some(runtime)) = (preview.as_deref(), live.as_mut()) {
         let _ = init_preview_push_live(runtime, active);
+    }
+    if let Some(active) = preview.as_deref() {
+        init_emit_preview_echo(output, active, color);
     }
     let radius = match overrides.radius {
         Some(value) => value,
@@ -2119,9 +2209,14 @@ fn run_init_interactive_impl(
             })?
         }
     };
-    // Per-step live hot-update: radius visibly adopts in the preview session.
+    // Per-step preview: headless reload-path push (fail-soft, no visible
+    // effect on its own) plus the user-visible stdout echo in the running
+    // preview theme.
     if let (Some(active), Some(runtime)) = (preview.as_deref(), live.as_mut()) {
         let _ = init_preview_push_live(runtime, active);
+    }
+    if let Some(active) = preview.as_deref() {
+        init_emit_preview_echo(output, active, color);
     }
     let _ = writeln!(output, "\nBehavior:");
     let scrollback = match overrides.scrollback {
@@ -2164,10 +2259,15 @@ fn run_init_interactive_impl(
             })?
         }
     };
-    // Staged live push: scrollback is restart-required, but the push keeps the
-    // preview session in sync and stays a fail-soft no-op without one.
+    // Per-step preview: the scrollback value is restart-required and stays
+    // staged for confirm; the headless push is a fail-soft no-op without a
+    // live session while the stdout echo still shows the running appearance
+    // preview (the user-visible half).
     if let (Some(active), Some(runtime)) = (preview.as_deref(), live.as_mut()) {
         let _ = init_preview_push_live(runtime, active);
+    }
+    if let Some(active) = preview.as_deref() {
+        init_emit_preview_echo(output, active, color);
     }
     let close_confirm = match overrides.close_confirm {
         Some(mode) => mode,
@@ -2213,10 +2313,14 @@ fn run_init_interactive_impl(
             })?
         }
     };
-    // Staged live push: close-confirm takes effect on confirm, but the push
-    // keeps the preview session in sync and stays fail-soft without one.
+    // Per-step preview: close-confirm takes effect on confirm; the headless
+    // push is a fail-soft no-op without a live session while the stdout echo
+    // still shows the running appearance preview (the user-visible half).
     if let (Some(active), Some(runtime)) = (preview.as_deref(), live.as_mut()) {
         let _ = init_preview_push_live(runtime, active);
+    }
+    if let Some(active) = preview.as_deref() {
+        init_emit_preview_echo(output, active, color);
     }
     let preset_options = vec![
         InitOptionItem {
@@ -2246,10 +2350,15 @@ fn run_init_interactive_impl(
     if let Some(active) = preview.as_mut() {
         active.apply_key_preset(key_preset);
     }
-    // Final live push: the key preset rides the app half of the reload path
-    // (stashed for adopt_live_config); fail-soft without a live session.
+    // Final per-step preview: the key preset rides the app half of the reload
+    // path (stashed for a future headed owner via adopt_live_config); the
+    // stdout echo shows the running appearance preview. Fail-soft without a
+    // live session.
     if let (Some(active), Some(runtime)) = (preview.as_deref(), live.as_mut()) {
         let _ = init_preview_push_live(runtime, active);
+    }
+    if let Some(active) = preview.as_deref() {
+        init_emit_preview_echo(output, active, color);
     }
     Ok(InitAnswers {
         shell,
@@ -2476,20 +2585,25 @@ pub(crate) fn run_init_subcommand_with_env(
 /// `fallback_builtin`, so headless runs and fresh-machine TTY runs keep the
 /// exact previous baseline byte-for-byte.
 ///
-/// Live wiring (p4 CTX-1119, shape a): `bitty init` stays a standalone
-/// pre-`Runtime` subcommand with its line-prompt flow (no fullscreen TUI,
-/// no new IPC or threads). When [`init_live_preview_enabled`] holds, the
-/// dispatch builds a wizard-owned preview `Runtime` from this baseline via
+/// Live wiring (p4 CTX-1119, shape a, rescoped by DEC-0109 CodeRabbit 1931):
+/// `bitty init` stays a standalone pre-`Runtime` subcommand with its
+/// line-prompt flow (no fullscreen TUI, no new IPC or threads) in the outer
+/// terminal, which owns every visible pixel. The user-visible preview is the
+/// per-step stdout echo from [`init_emit_preview_echo`], driven by
+/// `InitPreview::current` and styled in the running preview theme. When
+/// [`init_live_preview_enabled`] holds, the dispatch additionally builds a
+/// wizard-owned headless preview `Runtime` from this baseline via
 /// [`init_preview_runtime`] and pushes each `InitPreview::current` step
-/// through the existing reload path as a non-persistent preview (no file
-/// write until confirm): `config_reload::apply_live` (`config_reload.rs`)
-/// for the runtime half plus the stashed `AppAdoption` taken via
-/// `take_app_adoption` for `TerminalApp::adopt_live_config`
+/// through the existing reload path as validation/producer state (no file
+/// write until confirm, no visible effect on its own):
+/// `config_reload::apply_live` (`config_reload.rs`) for the runtime half
+/// plus the stashed `AppAdoption` taken via `take_app_adoption` for a future
+/// headed owner through `TerminalApp::adopt_live_config`
 /// (`terminal_app.rs`), reusing the `runtime_adopts` adopter list and the
 /// `ReloadClass::Live` policy in `bitty-config`. Cancel/EOF rolls the
-/// overlay back in memory and pushes the baseline live again, so Esc
-/// restores the prior live appearance; the file write on confirm stays the
-/// only persistence.
+/// overlay back in memory (the echo stops with the abort message) and pushes
+/// the baseline into the headless session again; the file write on confirm
+/// stays the only persistence.
 pub(crate) fn init_preview_baseline(
     args: &Args,
     env: &InitEnv<'_>,
@@ -2625,17 +2739,21 @@ pub(crate) fn run_init_subcommand_with_io(
             || args.component_no_color;
         let color = init_color_enabled(no_color);
         // Live preview (phase 2 of #1806, seeded p3 CTX-1071, per-step live p4
-        // CTX-1119): on a TTY the wizard overlays each answer onto an
-        // in-memory preview seeded from the loaded effective config
-        // (`init_preview_baseline`: `CLI > file > profile > defaults`, else
-        // the shipped fallback). The user file is never written until confirm
-        // below; cancel/EOF rolls the overlay back and returns 1 with nothing
-        // written. Piped/non-TTY stays preview-free (nothing to see). When
-        // `init_live_preview_enabled` holds, the wizard also owns a preview
-        // `Runtime` built from the baseline and pushes each overlay per step
-        // through the reload `apply_live` path as a non-persistent preview
-        // (fail-soft without a live display path); headless, safe, and piped
-        // modes keep the in-memory behavior unchanged.
+        // CTX-1119, stdout echo DEC-0109): on a TTY the wizard overlays each
+        // answer onto an in-memory preview seeded from the loaded effective
+        // config (`init_preview_baseline`: `CLI > file > profile > defaults`,
+        // else the shipped fallback) and echoes the running appearance
+        // preview to stdout after each step (the user-visible half, styled in
+        // the running preview theme when color allows). The user file is
+        // never written until confirm below; cancel/EOF rolls the overlay
+        // back and returns 1 with nothing written. Piped/non-TTY stays
+        // preview-free (nothing to see). When `init_live_preview_enabled`
+        // holds, the wizard additionally owns a headless preview `Runtime`
+        // built from the baseline and pushes each overlay per step through
+        // the reload `apply_live` path as validation/producer state (no
+        // visible effect on its own, fail-soft without a live display path);
+        // headless, safe, and piped modes keep the in-memory-plus-echo
+        // behavior unchanged.
         let mut preview = InitPreview::enabled(init_preview_baseline(args, env));
         let mut live_runtime = if init_live_preview_enabled(args, env) {
             init_preview_runtime(preview.baseline())

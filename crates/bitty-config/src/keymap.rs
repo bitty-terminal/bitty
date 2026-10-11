@@ -1140,6 +1140,184 @@ impl ChromeAction {
             Self::InvokeCommand(qualified) => format!("command:{qualified}"),
         }
     }
+
+    /// One-line English description for user and doc tooling (CTX-1127).
+    ///
+    /// Canonical source: `bitty list actions` and `bitty inspect key` both
+    /// render this string, so help, inspect, and list can never drift into
+    /// parallel copies. Keep to one line, English-only.
+    #[must_use]
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::GotoSplit(_) => "Move focus spatially to the neighboring pane.",
+            Self::NewSplit(_) => "Split the focused pane in a direction.",
+            Self::NewPanel => "Open a new panel with smart split axis.",
+            Self::ResizeSplit(_) => "Nudge the enclosing split ratio.",
+            Self::CloseView => "Close the focused pane (confirm when busy).",
+            Self::ToggleZoom => "Toggle single-pane zoom.",
+            Self::ToggleHelp => "Toggle the help overlay listing bound shortcuts.",
+            Self::FocusNext => "Focus the next pane in depth-first order.",
+            Self::FocusPrev => "Focus the previous pane in depth-first order.",
+            Self::FocusId(_) => "Focus a pane by numeric view id.",
+            Self::CopyToClipboard => "Copy the current selection to the system clipboard.",
+            Self::PasteFromClipboard => "Paste the system clipboard through the inspection gate.",
+            Self::ScrollPageUp => "Scroll the focused pane up by one viewport page.",
+            Self::ScrollPageDown => "Scroll the focused pane down by one viewport page.",
+            Self::IncreaseFontSize => "Increase the per-window font size one step.",
+            Self::DecreaseFontSize => "Decrease the per-window font size one step.",
+            Self::ResetFontSize => "Reset the per-window font size to the startup value.",
+            Self::OpenComposer => "Open the Command Composer.",
+            Self::FoldToggle => "Toggle the latest command block fold.",
+            Self::FoldExpand => "Unfold the latest command block.",
+            Self::FoldCollapse => "Fold the latest command block.",
+            Self::WorkspaceNew => "Create a fresh workspace and switch to it.",
+            Self::WorkspaceClose => "Close the active workspace (confirm when live).",
+            Self::WorkspacePrev => "Switch to the previous workspace.",
+            Self::WorkspaceNext => "Switch to the next workspace.",
+            Self::WorkspaceLast => "Switch to the last-used workspace.",
+            Self::WorkspaceNextOccupied => {
+                "Switch to the next occupied workspace rightward with wrap."
+            }
+            Self::WorkspacePrevOccupied => {
+                "Switch to the previous occupied workspace leftward with wrap."
+            }
+            Self::WorkspaceFocus(_) => "Jump to workspace N.",
+            Self::WorkspaceMove(_) => "Move the focused window to workspace N.",
+            Self::WorkspaceSwap(_) => "Swap the current workspace with workspace N.",
+            Self::JumpToPromptPrev => "Jump the viewport to the previous shell prompt.",
+            Self::JumpToPromptNext => "Jump the viewport to the next shell prompt.",
+            Self::SelectCommandOutput => "Select exactly the last command output.",
+            Self::TogglePalette => "Toggle the command palette overlay.",
+            Self::ToggleFloating => "Toggle the focused panel between tiled and floating.",
+            Self::TogglePinned => "Toggle the focused panel pinned state.",
+            Self::InvokeCommand(_) => "Invoke one registered plugin command.",
+        }
+    }
+
+    /// Whether this action ships with no default binding (CTX-1127).
+    ///
+    /// Derived from [`DEFAULT_KEYMAPS`] itself (same discriminant present in
+    /// the shipped map means bound): there is no hardcoded list to drift when
+    /// defaults change. Manual-bind-only actions keep Normal Mode
+    /// byte-identical until the user opts in via config `keymaps`.
+    #[must_use]
+    pub fn is_manual_bind_only(&self) -> bool {
+        for (_, action_raw) in DEFAULT_KEYMAPS {
+            if let Ok(parsed) = Self::parse(action_raw) {
+                if std::mem::discriminant(&parsed) == std::mem::discriminant(self) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Whether executing this action needs live runtime state (CTX-1127).
+    ///
+    /// Every chrome action resolves against the live window layout, so all
+    /// entries report `true`: `bitty list actions` itself stays local (no
+    /// instance needed) while marking each row runtime-dependent.
+    #[must_use]
+    pub const fn requires_runtime(&self) -> bool {
+        true
+    }
+}
+
+/// One representative per [`ChromeAction`] variant (CTX-1127, issue #1934).
+///
+/// Parameterized variants use a representative argument (`left`, `1`,
+/// `prev`, example qualified command) so each row carries a parseable
+/// canonical `id` spelling. The count and ids are asserted against the
+/// registry in tests; doc tooling (bitty-manual#15) generates from this.
+#[must_use]
+pub fn all_chrome_actions() -> Vec<ChromeAction> {
+    vec![
+        ChromeAction::GotoSplit(SplitDir::Left),
+        ChromeAction::NewSplit(SplitDir::Left),
+        ChromeAction::NewPanel,
+        ChromeAction::ResizeSplit(SplitDir::Left),
+        ChromeAction::CloseView,
+        ChromeAction::ToggleZoom,
+        ChromeAction::ToggleHelp,
+        ChromeAction::FocusNext,
+        ChromeAction::FocusPrev,
+        ChromeAction::FocusId(1),
+        ChromeAction::CopyToClipboard,
+        ChromeAction::PasteFromClipboard,
+        ChromeAction::ScrollPageUp,
+        ChromeAction::ScrollPageDown,
+        ChromeAction::IncreaseFontSize,
+        ChromeAction::DecreaseFontSize,
+        ChromeAction::ResetFontSize,
+        ChromeAction::OpenComposer,
+        ChromeAction::FoldToggle,
+        ChromeAction::FoldExpand,
+        ChromeAction::FoldCollapse,
+        ChromeAction::WorkspaceNew,
+        ChromeAction::WorkspaceClose,
+        ChromeAction::WorkspacePrev,
+        ChromeAction::WorkspaceNext,
+        ChromeAction::WorkspaceLast,
+        ChromeAction::WorkspaceNextOccupied,
+        ChromeAction::WorkspacePrevOccupied,
+        ChromeAction::WorkspaceFocus(1),
+        ChromeAction::WorkspaceMove(1),
+        ChromeAction::WorkspaceSwap(1),
+        ChromeAction::JumpToPromptPrev,
+        ChromeAction::JumpToPromptNext,
+        ChromeAction::SelectCommandOutput,
+        ChromeAction::TogglePalette,
+        ChromeAction::ToggleFloating,
+        ChromeAction::TogglePinned,
+        ChromeAction::InvokeCommand("example.owner:example-command".to_string()),
+    ]
+}
+
+/// Shipped keymap table for introspection (CTX-1127, issue #1934).
+///
+/// Shared code path for `bitty inspect key` and `bitty list keymaps`: both
+/// resolve the built-in defaults through [`resolve_keymaps`] over
+/// [`EffectiveConfig::default`] (default `mod_key`, no user overrides), so a
+/// chord resolves identically in both surfaces with no forked logic. User
+/// overrides stay owned by `bitty config check` and the live app path, which
+/// call [`resolve_keymaps`] over the effective file config.
+pub fn shipped_resolved_keymaps() -> Vec<ResolvedKeymap> {
+    resolve_keymaps(&EffectiveConfig::default()).expect("internal DEFAULT_KEYMAPS must resolve")
+}
+
+/// Effective keybinding for one catalog action (CTX-1127 follow-up).
+///
+/// Shared helper for `list actions` and `list keymaps` (no fork): given any
+/// resolved table (shipped defaults or effective file config with user
+/// overrides via [`resolve_keymaps`]), return the chord that triggers
+/// `action` — user-configured chord first (`from_default == false`), else the
+/// shipped default, else `None` for manual-bind-only actions.
+///
+/// Matching is exact canonical (including args), so `workspace_focus:1` never
+/// borrows `workspace_focus:2` and `goto_split:left` never borrows `right`.
+/// Among same-source matches the smallest chord wins for determinism.
+#[must_use]
+pub fn effective_binding_for_action(
+    resolved: &[ResolvedKeymap],
+    action: &ChromeAction,
+) -> Option<String> {
+    let want = action.canonical();
+    let mut user: Vec<String> = resolved
+        .iter()
+        .filter(|e| !e.from_default && e.action.canonical() == want)
+        .map(|e| e.chord.canonical())
+        .collect();
+    user.sort();
+    if let Some(first) = user.into_iter().next() {
+        return Some(first);
+    }
+    let mut shipped: Vec<String> = resolved
+        .iter()
+        .filter(|e| e.from_default && e.action.canonical() == want)
+        .map(|e| e.chord.canonical())
+        .collect();
+    shipped.sort();
+    shipped.into_iter().next()
 }
 
 /// Hint listing the accepted action vocabulary.

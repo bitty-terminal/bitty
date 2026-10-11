@@ -610,6 +610,130 @@ mod tests {
         );
     }
 
+    // CTX-1105: explicit zero (or oversize) rule axes fail closed per-axis
+    // at spawn sizing — PTY and grid fall back to the slot dims instead of
+    // clamping `Some(0)` to 1 — while the stamp still stamps nothing at
+    // all, mirroring `stamp_rule_fixed_size`.
+    #[test]
+    #[cfg(unix)]
+    fn zero_rule_axes_fall_back_to_slot_dims_at_spawn() {
+        require_pty!();
+        use crate::Runtime;
+        let mut rt = Runtime::with_defaults().expect("defaults build");
+        rt.set_panel_spawn_rules(vec![PanelSpawnRule {
+            cmd: Some("sh".to_string()),
+            cmd_regex: None,
+            title_regex: None,
+            content: None,
+            presentation: None,
+            width: Some(0),
+            height: Some(0),
+            workspace: None,
+            centered: None,
+        }]);
+        let focused = rt.focused_view().expect("focused leaf");
+        rt.spawn_shell_for_view(focused, "/bin/sh", &[], 40, 12)
+            .expect("spawn");
+        assert_eq!(rt.pane_pty_size(&focused), Some((40, 12)));
+        let grid = rt.pane_snapshot(&focused).expect("pane grid");
+        assert_eq!((grid.width, grid.height), (40, 12));
+        assert_eq!(
+            rt.layout().find_leaf(focused).expect("leaf").fixed_size(),
+            None
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn zero_width_axis_keeps_valid_height_at_spawn() {
+        require_pty!();
+        use crate::Runtime;
+        let mut rt = Runtime::with_defaults().expect("defaults build");
+        rt.set_panel_spawn_rules(vec![PanelSpawnRule {
+            cmd: Some("sh".to_string()),
+            cmd_regex: None,
+            title_regex: None,
+            content: None,
+            presentation: None,
+            width: Some(0),
+            height: Some(30),
+            workspace: None,
+            centered: None,
+        }]);
+        let focused = rt.focused_view().expect("focused leaf");
+        rt.spawn_shell_for_view(focused, "/bin/sh", &[], 40, 12)
+            .expect("spawn");
+        // Width falls back to the slot dim (not 1); the valid height
+        // still applies. The stamp still stamps nothing at all.
+        assert_eq!(rt.pane_pty_size(&focused), Some((40, 30)));
+        let grid = rt.pane_snapshot(&focused).expect("pane grid");
+        assert_eq!((grid.width, grid.height), (40, 30));
+        assert_eq!(
+            rt.layout().find_leaf(focused).expect("leaf").fixed_size(),
+            None
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn oversize_rule_axis_falls_back_to_slot_dims_at_spawn() {
+        require_pty!();
+        use crate::Runtime;
+        let mut rt = Runtime::with_defaults().expect("defaults build");
+        rt.set_panel_spawn_rules(vec![PanelSpawnRule {
+            cmd: Some("sh".to_string()),
+            cmd_regex: None,
+            title_regex: None,
+            content: None,
+            presentation: None,
+            width: Some(bitty_ui::view::MAX_FIXED_SIZE_DIM + 1),
+            height: Some(30),
+            workspace: None,
+            centered: None,
+        }]);
+        let focused = rt.focused_view().expect("focused leaf");
+        rt.spawn_shell_for_view(focused, "/bin/sh", &[], 40, 12)
+            .expect("spawn");
+        assert_eq!(rt.pane_pty_size(&focused), Some((40, 30)));
+        let grid = rt.pane_snapshot(&focused).expect("pane grid");
+        assert_eq!((grid.width, grid.height), (40, 30));
+        assert_eq!(
+            rt.layout().find_leaf(focused).expect("leaf").fixed_size(),
+            None
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn zero_rule_primary_spawn_keeps_slot_dims() {
+        require_pty!();
+        use crate::Runtime;
+        let mut rt = Runtime::with_defaults().expect("defaults build");
+        rt.set_panel_spawn_rules(vec![PanelSpawnRule {
+            cmd: Some("sh".to_string()),
+            cmd_regex: None,
+            title_regex: None,
+            content: None,
+            presentation: None,
+            width: Some(0),
+            height: Some(0),
+            workspace: None,
+            centered: None,
+        }]);
+        rt.spawn_shell_with_args("/bin/sh", &[])
+            .expect("primary spawn");
+        // Default geometry is the 80x24 initial grid; the zero axes must
+        // not clamp the PTY or grid to 1.
+        assert_eq!(rt.pty_size(), Some((80, 24)));
+        assert_eq!(rt.state().width(), 80);
+        assert_eq!(rt.state().height(), 24);
+        let owner = rt.primary_view().expect("primary owner");
+        assert_eq!(
+            rt.layout().find_leaf(owner).expect("leaf").fixed_size(),
+            None
+        );
+    }
+
     #[test]
     fn oversized_fixed_tiled_paints_within_slot_bounds_headless() {
         use crate::Runtime;

@@ -67,6 +67,46 @@ package on divergence. See `packaging/linux/README.md`.
 
 Scripts under `packaging/scripts/` are bounded no-ops (exit 0) to keep package hooks honest.
 
+## Terminfo distribution (`terminfo/bitty.ti`, CTX-1121 #1764)
+
+Canonical source `terminfo/bitty.ti` (`use=xterm-256color` + audited `Tc`,
+`Su`/`Setulc`/`Smulx`, `Sync`, `Hls`, `pairs#32767`; see
+`terminfo/README.md`). Never install the raw source to
+`/usr/share/terminfo`; always compile with `tic -x` and install the
+compiled database entry. `scripts/check-terminfo.sh` fails on the retired
+placeholder path, on raw-source installs, and on aspirational caps.
+
+Linux (`.deb`/`.rpm`/`.pkg.tar.zst`/AUR) — compile at package build time:
+
+```sh
+tic -x -o "$pkgdir/usr/share/terminfo" terminfo/bitty.ti
+# verifies as: infocmp -x bitty | grep -E 'Tc|Smulx|Sync|Hls'
+```
+
+- AUR source (`packaging/PKGBUILD`) and prebuilt (`packaging/PKGBUILD.bin`)
+  run the same `tic -x` line in `package()` and install the compiled
+  `b/bitty` entry (requires `ncurses` providing `tic` at build time).
+- `nfpm.yaml` (`.deb`/`.rpm`/`.apk`/`.pkg.tar.zst` via nfpm) documents the
+  same manual step: compile with `tic -x` before `nfpm package`, or run
+  `tic -x terminfo/bitty.ti` post-install and `rm -f
+/usr/share/terminfo/b/bitty` on remove. No new hook is added; the
+  existing `packaging/scripts/*-postinstall.sh` stays a bounded no-op per
+  pipeline convention.
+
+Homebrew/macOS — install the entry into the user or system terminfo dir:
+
+```sh
+tic -x -o ~/.terminfo terminfo/bitty.ti
+# or system-wide: sudo tic -x -o /usr/share/terminfo terminfo/bitty.ti
+infocmp -x bitty
+```
+
+Windows — terminfo is irrelevant. Windows uses ConPTY passthrough; there is
+no native terminfo database. Keep `TERM=xterm-256color` (the default) and
+do not set `TERM=bitty` on Windows. `cargo check --target
+x86_64-pc-windows-gnu` must stay green; no Windows packaging change ships
+a terminfo file.
+
 ## Application icons
 
 `packaging/icons/hicolor/` holds the launcher icons installed by every package format: `apps/bitty.png` at 16, 32, 64, 128, 256, and 512 px plus the scalable `scalable/apps/bitty.svg`. They are generated from the approved Bitty mascot artwork (the mascot peeking over a dark terminal window on a cream rounded-square background) and share one square framing. The PNGs carry transparent corners, so the icon reads on both light and dark launchers. Regenerate every size together when the approved artwork changes.

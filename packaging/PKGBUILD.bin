@@ -26,6 +26,7 @@ arch=('x86_64')
 url="https://github.com/bitty-terminal/bitty"
 license=('MIT' 'Apache-2.0')
 depends=('fontconfig' 'freetype2')
+makedepends=('ncurses')
 optdepends=('noto-fonts: fallback font')
 provides=('bitty')
 conflicts=('bitty' 'bitty-nightly' 'bitty-git')
@@ -51,4 +52,6 @@ package() {
     install -Dm644 "packaging/icons/hicolor/${size}x${size}/apps/bitty.png" "${pkgdir}/usr/share/icons/hicolor/${size}x${size}/apps/bitty.png"
   done
   install -Dm644 packaging/icons/hicolor/scalable/apps/bitty.svg "${pkgdir}/usr/share/icons/hicolor/scalable/apps/bitty.svg"
+  # Terminfo (CTX-1121 #1764): compile canonical source; never install raw .ti.
+  tic -x -o "$pkgdir/usr/share/terminfo" terminfo/bitty.ti
 }

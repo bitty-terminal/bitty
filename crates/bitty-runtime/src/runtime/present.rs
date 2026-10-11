@@ -2816,6 +2816,13 @@ impl Runtime {
             };
 
             if alt_active {
+                // Delete-wins sequencing (CTX-1110 fix pass): alt entry
+                // clears this origin's placements, so a transmit pending
+                // across the enter/exit cycle must not resurrect afterwards
+                // (sync order stores, clears, then exits with absent).
+                // Unconditional: a pending transmit may exist while nothing
+                // is placed yet.
+                self.bump_kitty_local_delete_epoch(pane_origin);
                 if !self.kitty_images.placement_for_origin_is_empty(pane_origin) {
                     self.kitty_images.clear_origin(pane_origin);
                     // S6 (#1849): placements are gone, so their cached

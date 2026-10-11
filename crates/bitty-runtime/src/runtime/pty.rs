@@ -1006,6 +1006,11 @@ impl Runtime {
                 // of this origin, so no orphan blit survives to the next
                 // present. Location-based selectors stay follow-up work.
                 if clear_all_visible {
+                    // Delete-wins sequencing (CTX-1110 fix pass): `d=a`
+                    // invalidates every pending transmit of this origin,
+                    // even when nothing is placed yet (sync order stores
+                    // then deletes and yields absent).
+                    self.bump_kitty_local_delete_epoch(self.kitty_origin);
                     if !self
                         .kitty_images
                         .placement_for_origin_is_empty(self.kitty_origin)
@@ -1404,8 +1409,12 @@ impl Runtime {
                     }
                 );
             if screen_cleared {
+                // Delete-wins sequencing (CTX-1110 fix pass): a full clear
+                // invalidates pending transmits like a protocol delete
+                // (sync order stores then clears and yields absent).
                 // S6 (#1849): placements are gone, so their cached blits
                 // are dead budget; drop them (images stay inert).
+                self.bump_kitty_local_delete_epoch(self.kitty_origin);
                 self.kitty_images.clear_origin(self.kitty_origin);
                 self.invalidate_kitty_raster_cache();
                 // S4 (#1849): full clears drop virtual prototypes too

@@ -1115,6 +1115,17 @@ pub struct Runtime {
     /// Timed-out orphan workers still blocked in the kernel (CTX-1110).
     /// Bounded by the global cap; reaped once finished, detached on drop.
     kitty_local_orphans: Vec<kitty_file::KittyLocalOrphan>,
+    /// Delete-vs-enqueue generation per origin (CTX-1110 fix pass).
+    ///
+    /// Monotonic counter bumped on every rendered-layer delete/clear/
+    /// retire for the origin; each queued local-medium request stamps the
+    /// current value at enqueue and storing completions (display/virtual)
+    /// drop silently when it moved (delete-wins, no resurrection).
+    /// Memory: one `u64` per origin token ever seen (`None` primary plus
+    /// pane `ViewId.0` values) — O(distinct origins), never per request
+    /// or per wire id. Entries survive retire so a later leaf reusing a
+    /// numeric id cannot accept a stale completion.
+    kitty_local_delete_epoch: std::collections::HashMap<Option<u64>, u64>,
     /// Test-only worker deadline override in ms (`0` = production default).
     /// Unit tests only; see `runtime::kitty_file` for the contract.
     pub(crate) kitty_local_test_timeout_ms: u64,
@@ -1647,6 +1658,7 @@ impl Runtime {
             kitty_local_queue: std::collections::VecDeque::new(),
             kitty_local_in_flight: None,
             kitty_local_orphans: Vec::new(),
+            kitty_local_delete_epoch: std::collections::HashMap::new(),
             kitty_local_test_timeout_ms: 0,
             kitty_local_test_delay_ms: 0,
             kitty_local_test_panic: false,
@@ -1902,6 +1914,7 @@ impl Runtime {
             kitty_local_queue: std::collections::VecDeque::new(),
             kitty_local_in_flight: None,
             kitty_local_orphans: Vec::new(),
+            kitty_local_delete_epoch: std::collections::HashMap::new(),
             kitty_local_test_timeout_ms: 0,
             kitty_local_test_delay_ms: 0,
             kitty_local_test_panic: false,

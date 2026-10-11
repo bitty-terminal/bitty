@@ -1263,6 +1263,12 @@ impl Runtime {
         image_id: u32,
         placement_id: Option<u32>,
     ) -> usize {
+        // Delete-wins sequencing (CTX-1110 fix pass): advance the origin's
+        // delete generation even when nothing is stored yet (removed 0) —
+        // a transmit pending on a hung filesystem completes after this
+        // delete, and its stale completion must drop instead of
+        // resurrecting the image.
+        self.bump_kitty_local_delete_epoch(self.kitty_origin);
         let removed = self
             .kitty_images
             .delete_by_wire(self.kitty_origin, image_id, placement_id);

@@ -25,6 +25,10 @@ fn make_runtime() -> Runtime {
 
 /// Drains the CTX-1110 async local-medium worker (file-backed `t=f`
 /// frames settle on later pumps, never inside `handle_pty_bytes`).
+/// Unix-only: the sole caller is the `#[cfg(unix)]` file-backed test
+/// (Windows denies before any worker exists), keeping `--tests` Windows
+/// builds `dead_code`-clean under CI `-D warnings`.
+#[cfg(unix)]
 fn pump_settled(rt: &mut Runtime) {
     for _ in 0..200 {
         rt.pump_kitty_local_completions();

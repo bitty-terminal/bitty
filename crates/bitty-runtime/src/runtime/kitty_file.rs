@@ -630,6 +630,11 @@ pub(crate) enum KittyLocalOp {
 #[derive(Debug, Clone)]
 pub(crate) struct KittyLocalRequest {
     origin: Option<u64>,
+    /// Delete generation stamped at enqueue (CTX-1110 fix pass): when the
+    /// origin's generation moved before this request completes, a
+    /// delete/clear/retire landed in between and the storing completion
+    /// drops as stale (delete-wins) instead of resurrecting the image.
+    delete_epoch: u64,
     op: KittyLocalOp,
     name: Box<[u8]>,
     medium: bitty_vt::KittyMedium,
@@ -722,6 +727,28 @@ impl Runtime {
             && self.kitty_local_pending_for_origin(origin) < KITTY_LOCAL_MAX_PENDING_PER_ORIGIN
     }
 
+    /// Current delete generation for one origin (CTX-1110 fix pass):
+    /// missing entries are generation zero. Stamped on every queued
+    /// request at enqueue; see [`Self::bump_kitty_local_delete_epoch`].
+    pub(crate) fn kitty_local_delete_epoch_for(&self, origin: Option<u64>) -> u64 {
+        self.kitty_local_delete_epoch
+            .get(&origin)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Advances one origin's delete generation (CTX-1110 fix pass).
+    ///
+    /// Every rendered-layer delete/clear/retire for the origin calls this,
+    /// so storing completions stamped earlier drop as stale (delete-wins).
+    /// Over-invalidation across wire ids of the same origin is fail-closed
+    /// (stores nothing) by design: precision per wire id would need
+    /// unbounded per-id state for no visible gain.
+    pub(crate) fn bump_kitty_local_delete_epoch(&mut self, origin: Option<u64>) {
+        let next = self.kitty_local_delete_epoch_for(origin).wrapping_add(1);
+        self.kitty_local_delete_epoch.insert(origin, next);
+    }
+
     /// Enqueues one display read without doing I/O (CTX-1110).
     ///
     /// Captures the draining origin (`self.kitty_origin`, already tagged by
@@ -742,6 +769,7 @@ impl Runtime {
     ) -> bool {
         let request = KittyLocalRequest {
             origin: self.kitty_origin,
+            delete_epoch: self.kitty_local_delete_epoch_for(self.kitty_origin),
             op: KittyLocalOp::Display {
                 format_f,
                 width_s,
@@ -779,6 +807,7 @@ impl Runtime {
     ) -> bool {
         let request = KittyLocalRequest {
             origin: self.kitty_origin,
+            delete_epoch: self.kitty_local_delete_epoch_for(self.kitty_origin),
             op: KittyLocalOp::Virtual {
                 format_f,
                 width_s,
@@ -820,6 +849,7 @@ impl Runtime {
         }
         let request = KittyLocalRequest {
             origin: self.kitty_origin,
+            delete_epoch: self.kitty_local_delete_epoch_for(self.kitty_origin),
             op: KittyLocalOp::Query {
                 format_f,
                 width_s,
@@ -859,6 +889,7 @@ impl Runtime {
     ) -> bool {
         let request = KittyLocalRequest {
             origin: self.kitty_origin,
+            delete_epoch: self.kitty_local_delete_epoch_for(self.kitty_origin),
             op: KittyLocalOp::Frame {
                 format_f,
                 width_s,
@@ -937,6 +968,8 @@ impl Runtime {
                 // Panic isolation: a worker panic must not take down the
                 // PTY poll. `catch_unwind` maps it to a refusal here (plus
                 // `join` below maps a join-level panic the same way).
+                // `AssertUnwindSafe` is sound: the closure owns its read
+                // parameters and touches no shared `&mut` state.
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     read_kitty_local(
                         medium,
@@ -1088,11 +1121,14 @@ impl Runtime {
                 origin: flight.request.origin,
                 handle: flight.handle,
             });
-            // Bound the orphan list when a burst of timeouts lands while
-            // threads still run: detach one (handle drop detaches the
-            // thread) so the count stays at the global cap even before
-            // threads exit. At most one timeout lands per pump, so one
-            // detach per pump keeps the bound.
+            // Defense in depth only (unreachable through this path): the
+            // enqueue gate holds the total at the global cap, and both the
+            // timeout move (in-flight to orphan) and the promote below
+            // (queue to in-flight) preserve it, so the total cannot exceed
+            // the cap here. Retained so a future path change that grows the
+            // total still detaches instead of leaking unbounded (dropping
+            // the handle detaches the thread). At most one timeout lands
+            // per pump, so one detach per pump suffices.
             if self.kitty_local_pending_total() > KITTY_LOCAL_MAX_PENDING_GLOBAL {
                 if let Some(orphan) = self.kitty_local_orphans.pop() {
                     let _ = orphan;
@@ -1172,9 +1208,12 @@ impl Runtime {
     /// Residuals (documented, conservative): completions anchor at
     /// completion-time cursor/scrollback (same as if the bytes arrived
     /// then; drift bounded to the current poll's remaining text, zero in
-    /// the common single-image case), and control-only composes/deletes
-    /// that race a pending local store apply to prior state fail-closed
-    /// (`NoAnimationTarget`/no-op) rather than waiting.
+    /// the common single-image case). Sequencing: a delete/clear/retire
+    /// that lands while a transmit pends advances the origin's delete
+    /// generation, so the stale storing completion drops (delete-wins,
+    /// silent) instead of resurrecting the image; control-only composes
+    /// racing a pending frame still fail closed to prior state
+    /// (`NoAnimationTarget`) rather than waiting.
     fn complete_kitty_local_request(
         &mut self,
         request: &KittyLocalRequest,
@@ -1186,6 +1225,21 @@ impl Runtime {
             if !self.pane_sessions.contains_key(&ViewId::new(token)) {
                 return;
             }
+        }
+        // Delete-wins sequencing (CTX-1110 fix pass): a transmit enqueued
+        // before a delete/clear/retire for this origin must not resurrect
+        // the image when its worker finishes after the delete (the delete
+        // no-oped on the not-yet-stored image, while sync order stores
+        // then deletes and yields absent). Queries never store and frames
+        // re-resolve their target fail-closed, so only storing completions
+        // (display/virtual) drop here — silently, like a closed origin
+        // (a racing delete is routine, not diagnostics).
+        if matches!(
+            request.op,
+            KittyLocalOp::Display { .. } | KittyLocalOp::Virtual { .. }
+        ) && request.delete_epoch != self.kitty_local_delete_epoch_for(origin)
+        {
+            return;
         }
         let prev_origin = self.kitty_origin;
         let mut swapped = false;
@@ -1570,12 +1624,17 @@ mod tests {
 
     // CTX-1110 async worker tests: hermetic and fast (tiny timeouts plus
     // fault-injection hooks, never real multi-second sleeps or hung mounts).
+    // File fixtures only run on Unix (every file caller is `#[cfg(unix)]`;
+    // the caps test uses a byte literal), so the counter, fixture, and path
+    // helpers are Unix-gated to stay `dead_code`-clean on Windows.
+    #[cfg(unix)]
     static ASYNC_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     fn async_runtime() -> crate::runtime::Runtime {
         crate::runtime::Runtime::with_defaults().expect("defaults must build")
     }
 
+    #[cfg(unix)]
     fn async_fixture(tag: &str, bytes: &[u8]) -> std::path::PathBuf {
         let n = ASYNC_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir =
@@ -1590,14 +1649,6 @@ mod tests {
     fn async_path_bytes(path: &std::path::Path) -> Vec<u8> {
         use std::os::unix::ffi::OsStrExt;
         path.as_os_str().as_bytes().to_vec()
-    }
-
-    #[cfg(not(unix))]
-    fn async_path_bytes(path: &std::path::Path) -> Vec<u8> {
-        path.to_str()
-            .expect("test paths are UTF-8")
-            .as_bytes()
-            .to_vec()
     }
 
     fn async_control(name_len: usize) -> bitty_vt::KittyControlKeys {
@@ -1907,5 +1958,83 @@ mod tests {
         assert_eq!(rt.kitty_placement_count(), 2);
         let _ = std::fs::remove_dir_all(file_a.parent().expect("temp parent"));
         let _ = std::fs::remove_dir_all(file_b.parent().expect("temp parent"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn async_delete_before_completion_drops_stale() {
+        // Transmit-then-delete resurrection (CTX-1110 fix pass): a display
+        // enqueued on a hung filesystem, deleted before its worker wakes,
+        // must not resurrect on completion. Sync order stores then deletes
+        // and yields absent; the delete no-ops here on the not-yet-stored
+        // image, so the delete generation is what invalidates the stale
+        // completion. The worker still runs to completion (generous
+        // deadline, injected delay): only the storing drops — silently,
+        // with no placement and no reply.
+        let file = async_fixture("del-race", &[0xFF, 0x00, 0x00, 0xFF]);
+        let name = async_path_bytes(&file);
+        let mut rt = async_runtime();
+        rt.kitty_local_test_timeout_ms = 5000;
+        rt.kitty_local_test_delay_ms = 300;
+        let mut control = async_control(name.len());
+        control.image_id = 41;
+        assert!(rt.enqueue_kitty_local_display(
+            32,
+            Some(1),
+            Some(1),
+            None,
+            1,
+            1,
+            0,
+            &name,
+            control
+        ));
+        // Delete names the wire id before the worker wakes: a no-op on
+        // the store (removed 0) that still advances the generation.
+        assert_eq!(rt.kitty_delete_rendered_image(41, None), 0);
+        // Pump past the worker's completion (300 ms delay, 5 s deadline).
+        for _ in 0..200 {
+            rt.pump_kitty_local_completions();
+            if rt.kitty_local_pending_count() == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(rt.kitty_local_pending_count(), 0, "worker must finish");
+        assert_eq!(rt.kitty_image_count(), 0, "stale completion stores nothing");
+        assert_eq!(
+            rt.kitty_placement_count(),
+            0,
+            "stale completion places nothing"
+        );
+        assert!(
+            rt.take_replies().is_empty(),
+            "stale display completion replies nothing"
+        );
+        // A transmit enqueued after the delete stamps the new generation
+        // and still lands: delete-wins, no wedge.
+        let mut control = async_control(name.len());
+        control.image_id = 41;
+        assert!(rt.enqueue_kitty_local_display(
+            32,
+            Some(1),
+            Some(1),
+            None,
+            1,
+            1,
+            0,
+            &name,
+            control
+        ));
+        for _ in 0..200 {
+            rt.pump_kitty_local_completions();
+            if rt.kitty_local_pending_count() == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(rt.kitty_image_count(), 1, "post-delete transmit lands");
+        assert_eq!(rt.kitty_placement_count(), 1);
+        let _ = std::fs::remove_dir_all(file.parent().expect("temp parent"));
     }
 }

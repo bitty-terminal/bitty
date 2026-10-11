@@ -519,3 +519,139 @@ fn frame_eviction_cascades_with_image_accounting() {
     assert_eq!(layer.total_bytes(), 0);
     assert_eq!(layer.frame_count(id), None);
 }
+
+#[test]
+fn edit_replace_changes_frame_pixels_in_place() {
+    let mut layer = KittyImageLayer::new();
+    let id = stored_root(&mut layer);
+    layer
+        .append_frame(id, 2, 2, blue_2x2())
+        .expect("frame 2 must store");
+    let bytes_before = layer.total_bytes();
+    // Replace frame 2's top-left pixel with opaque green: the edited frame
+    // changes, the root is untouched, and no new frame appears.
+    layer
+        .edit_frame(
+            id,
+            2,
+            0,
+            0,
+            1,
+            1,
+            &[0x00, 0xFF, 0x00, 0xFF],
+            KITTY_COMPOSE_REPLACE,
+        )
+        .expect("in-bounds replace must edit");
+    let (_, _, second) = layer.frame_bytes(id, 2).expect("frame 2");
+    let mut expected = blue_2x2();
+    expected[0..4].copy_from_slice(&[0x00, 0xFF, 0x00, 0xFF]);
+    assert_eq!(second, expected.as_slice());
+    let (_, _, root) = layer.frame_bytes(id, 1).expect("frame 1");
+    assert_eq!(root, red_2x2().as_slice());
+    assert_eq!(layer.frame_count(id), Some(2));
+    assert_eq!(layer.total_bytes(), bytes_before);
+}
+
+#[test]
+fn edit_blend_is_src_over_on_the_frame_itself() {
+    let mut layer = KittyImageLayer::new();
+    // Opaque blue root, half-transparent red edit at (0, 0).
+    let id = layer
+        .store_for_origin_with_wire(1, 1, vec![0x00, 0x00, 0xFF, 0xFF], 4, None, 3)
+        .expect("root must store");
+    layer
+        .edit_frame(
+            id,
+            1,
+            0,
+            0,
+            1,
+            1,
+            &[0xFF, 0x00, 0x00, 0x80],
+            KITTY_COMPOSE_BLEND,
+        )
+        .expect("blend must edit");
+    let (_, _, out) = layer.frame_bytes(id, 1).expect("frame 1");
+    // Same rounded src-over math as `a=c` blend (see
+    // `compose_blend_is_src_over_with_rounded_integers`).
+    assert_eq!(out, &[128, 0, 127, 255]);
+    assert_eq!(layer.frame_count(id), Some(1));
+}
+
+#[test]
+fn edit_refusals_edit_nothing() {
+    let mut layer = KittyImageLayer::new();
+    let id = stored_root(&mut layer);
+    let snapshot = layer.frame_bytes(id, 1).expect("frame 1").2.to_vec();
+    let bytes_before = layer.total_bytes();
+    // Missing frames (past the end and zero).
+    assert!(matches!(
+        layer.edit_frame(
+            id,
+            9,
+            0,
+            0,
+            1,
+            1,
+            &[0x00, 0x00, 0xFF, 0xFF],
+            KITTY_COMPOSE_REPLACE
+        ),
+        Err(KittyPlacementError::NoSuchFrame { .. })
+    ));
+    assert!(matches!(
+        layer.edit_frame(
+            id,
+            0,
+            0,
+            0,
+            1,
+            1,
+            &[0x00, 0x00, 0xFF, 0xFF],
+            KITTY_COMPOSE_REPLACE
+        ),
+        Err(KittyPlacementError::NoSuchFrame { .. })
+    ));
+    // Unknown mode (only X=0 blend / X=1 replace exist).
+    assert_eq!(
+        layer.edit_frame(id, 1, 0, 0, 1, 1, &[0x00, 0x00, 0xFF, 0xFF], 4),
+        Err(KittyPlacementError::UnknownComposeMode(4))
+    );
+    // Out-of-bounds rects: offset past the edge and end overflow past
+    // `u32::MAX` (checked `u64` arithmetic cannot wrap into bounds).
+    assert!(matches!(
+        layer.edit_frame(
+            id,
+            1,
+            2,
+            0,
+            1,
+            1,
+            &[0x00, 0x00, 0xFF, 0xFF],
+            KITTY_COMPOSE_REPLACE
+        ),
+        Err(KittyPlacementError::ComposeOutOfBounds { .. })
+    ));
+    assert!(matches!(
+        layer.edit_frame(id, 1, u32::MAX, 0, 2, 2, &[0xFF; 16], KITTY_COMPOSE_REPLACE),
+        Err(KittyPlacementError::ComposeOutOfBounds { .. })
+    ));
+    // Reshaped payload (length does not match the claimed extent).
+    assert!(matches!(
+        layer.edit_frame(
+            id,
+            1,
+            0,
+            0,
+            1,
+            1,
+            &[0x00, 0x00, 0xFF],
+            KITTY_COMPOSE_REPLACE
+        ),
+        Err(KittyPlacementError::LengthMismatch { .. })
+    ));
+    // Every refusal left the frame byte-identical with stable accounting.
+    let (_, _, root) = layer.frame_bytes(id, 1).expect("frame 1");
+    assert_eq!(root, snapshot.as_slice());
+    assert_eq!(layer.frame_count(id), Some(1));
+    assert_eq!(layer.total_bytes(), bytes_before);
+}

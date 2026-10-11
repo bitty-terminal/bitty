@@ -276,4 +276,22 @@ fn help_with_unknown_flag_is_usage_error() {
         stderr.contains("unknown flag") && stderr.contains("--typo"),
         "help unknown flag must name the flag, got {stderr:?}"
     );
+
+    // CodeRabbit 4240273068: same class mirrored to the `<cmd> --help`
+    // branches for config/init/doctor — a typo must exit 2 naming the
+    // flag, not print help with exit 0.
+    for sub in ["config", "init", "doctor"] {
+        let output = run_bitty(&[sub, "--help", "--typo"]);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "bitty {sub} --help --typo must be UsageError (exit 2), stderr={:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            stderr.contains("unknown flag") && stderr.contains("--typo"),
+            "bitty {sub} --help --typo must name the flag, got {stderr:?}"
+        );
+    }
 }

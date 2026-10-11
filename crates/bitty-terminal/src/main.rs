@@ -385,15 +385,32 @@ fn main() {
     // (which prints `config_usage`/`init_usage`/`doctor_usage`), not the
     // top-level overview. Same `println!` shape as the help-word branch so
     // the bytes are equal.
+    // CodeRabbit 4240273068: reject unknown flags here (exit 2) before
+    // printing help — same class as the `help <cmd> --typo` case.
     if args.help && args.config_word {
+        if let Some(flag) = args.unknown_flag.as_deref() {
+            eprintln!("bitty config: unknown flag '{flag}'\n{}", config_usage());
+            std::process::exit(2);
+        }
         println!("{}", config_usage());
         std::process::exit(0);
     }
     if args.help && args.init_word {
+        if let Some(flag) = args.unknown_flag.as_deref() {
+            eprintln!("bitty init: unknown flag '{flag}'\n{}", init::init_usage());
+            std::process::exit(2);
+        }
         println!("{}", init::init_usage());
         std::process::exit(0);
     }
     if args.help && args.doctor_word {
+        if let Some(flag) = args.unknown_flag.as_deref() {
+            eprintln!(
+                "bitty doctor: unknown flag '{flag}'\n{}",
+                doctor::doctor_usage()
+            );
+            std::process::exit(2);
+        }
         println!("{}", doctor::doctor_usage());
         std::process::exit(0);
     }

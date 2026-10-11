@@ -70,10 +70,10 @@ pub use resolution::{
 };
 pub use services::{
     CommandDirectory, CommandRecord, EmptyEnv, EmptySettings, EnvSource, MAX_ENV_GRANTS,
-    MAX_ENV_VALUE_BYTES, MapEnv, Notification, NotificationQueue, OverlayPeers, PluginServices,
-    ProcessEnv, QueuedWorkspaceRequest, ServiceDirectory, ServiceRecord, SettingsSource,
-    SnapshotSource, UiAccess, UiBlock, UiBlocks, UnavailableSnapshot, UnavailableWorkspaces,
-    WorkspaceRequestQueue, WorkspaceSource,
+    MAX_ENV_VALUE_BYTES, MapEnv, Notification, NotificationQueue, OverlayPeers, PanelPinHandler,
+    PluginServices, ProcessEnv, QueuedWorkspaceRequest, ServiceDirectory, ServiceRecord,
+    SettingsSource, SnapshotSource, UiAccess, UiBlock, UiBlocks, UnavailableSnapshot,
+    UnavailableWorkspaces, WorkspaceRequestQueue, WorkspaceSource,
 };
 pub use store::{KvCommitBackend, KvCommitError, PluginStore, STORE_FILE_MAX_BYTES};
 // Bridge value/error types the host-service traits are expressed in, so the
@@ -551,6 +551,14 @@ pub struct PluginRuntime {
     /// CTX-0889: bounded queue of `workspace.control` mutations, drained by
     /// the application each tick ([`PluginRuntime::drain_workspace_requests`]).
     workspace_requests: Rc<RefCell<WorkspaceRequestQueue>>,
+    /// CTX-1099: synchronous pinned-float backend for
+    /// `bitty.panel.set_pinned`, shared with every activated generation
+    /// that holds `panel.focus`. `None` (no host wired yet) leaves granted
+    /// calls failing closed with `E_NOT_IMPLEMENTED`, mirroring the
+    /// workspace-source pattern. Sibling panel verbs have no backend seam
+    /// yet, so wiring only `set_pinned` leaves nothing inconsistent: the
+    /// siblings stay `E_NOT_IMPLEMENTED` until their own seams land.
+    panel_pin_backend: Option<PanelPinHandler>,
     /// CTX-0941: runtime-shared single-owner focusable-overlay capture switch
     /// and bounded input queue. Shared with every generation's services so the
     /// single-owner invariant holds across plugins and reload.
@@ -616,6 +624,7 @@ impl PluginRuntime {
             workspace_requests: Rc::new(RefCell::new(WorkspaceRequestQueue::new(
                 WORKSPACE_REQUEST_QUEUE_CAPACITY,
             ))),
+            panel_pin_backend: None,
             overlay_capture: Rc::new(RefCell::new(OverlayCapture::new())),
             overlay_peers: Rc::new(RefCell::new(BTreeMap::new())),
             target_registry: Rc::new(RefCell::new(bitty_ui::TargetRegistry::new())),
@@ -728,6 +737,16 @@ impl PluginRuntime {
     /// source when its services are built.
     pub fn set_workspace_source(&mut self, source: Rc<dyn WorkspaceSource>) {
         self.workspace_source = Some(source);
+    }
+
+    /// Install the synchronous pinned-float backend for
+    /// `bitty.panel.set_pinned` (CTX-1099). Call before activation: each
+    /// generation captures the backend when its services are built, and
+    /// only when `panel.focus` is granted (no backend without grant).
+    /// Without it a granted call fails closed with `E_NOT_IMPLEMENTED`,
+    /// like every other panel verb without a host.
+    pub fn set_panel_pin_backend(&mut self, backend: Option<PanelPinHandler>) {
+        self.panel_pin_backend = backend;
     }
 
     /// Drain queued `bitty.workspace.*` mutations in FIFO order (CTX-0889).
@@ -1244,6 +1263,14 @@ impl PluginRuntime {
         plugin_services.set_debug_inspect(debug_inspect);
         plugin_services.set_debug_trace(debug_trace);
         plugin_services.set_panel_access(panel_create, panel_focus);
+        // CTX-1099: the `bitty.panel.set_pinned` host backend. Installed
+        // only for `panel.focus` generations (no backend without grant);
+        // the call-time grant gate in `panel_set_pinned` stays as the
+        // second layer. Sibling panel verbs have no backend seam, so they
+        // keep failing closed with `E_NOT_IMPLEMENTED` unchanged.
+        if panel_focus {
+            plugin_services.set_panel_pin_backend(self.panel_pin_backend.clone());
+        }
         plugin_services.set_granted_capabilities(
             granted
                 .iter()

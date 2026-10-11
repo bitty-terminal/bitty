@@ -1147,7 +1147,11 @@ impl Runtime {
             // (control-only: the parser refuses payload on it). Truth owns
             // no compose state, so there is no `state.apply` here — the
             // compose seam damages the composed image's spans itself. The
-            // action is moved, so continue afterwards.
+            // action is moved, so continue afterwards. Overlapping
+            // self-compose (CTX-1124, kitty
+            // `docs/graphics-protocol.rst:1024-1027`) refuses with a
+            // spec-shaped `;EINVAL:` reply honoring `q=` (S2 posture);
+            // all compose refusals compose nothing (fail closed).
             if let TerminalAction::KittyGraphics {
                 action_a: Some('c'),
                 cols_c,
@@ -1182,6 +1186,27 @@ impl Runtime {
                                     .push_observation(HostObservation::Damage { generation });
                             }
                             Err(err) => {
+                                // Overlapping self-compose answers
+                                // `EINVAL` honoring `q=` (S2 shape); other
+                                // compose refusals stay log-only.
+                                // Fail-closed either way: nothing composed,
+                                // no damage, no cache drop (the seam only
+                                // damages on `Ok`).
+                                if matches!(
+                                    err,
+                                    crate::runtime::kitty_images::KittyImageError::Placement(
+                                        bitty_rich::KittyPlacementError::ComposeSelfOverlap { .. }
+                                    )
+                                ) && control.quiet < 2
+                                {
+                                    let reply = crate::queries::kitty_probe_einval_reply(
+                                        target,
+                                        "overlapping self-compose",
+                                    );
+                                    self.state.apply(&TerminalAction::Reply {
+                                        bytes: reply.into_boxed_slice(),
+                                    });
+                                }
                                 if let Some(suppressed) = self.kitty_log.admit_now() {
                                     eprintln!(
                                         "bitty: rejecting kitty compose ({err}): composed nothing{}",

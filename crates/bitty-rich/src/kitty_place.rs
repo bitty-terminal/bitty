@@ -252,7 +252,15 @@
 //! `C=0` alpha-blends the source over the destination (straight-alpha
 //! src-over, rounded integer math, pinned by test); `C=1` replaces the
 //! rect bytes outright; any other mode refuses with
-//! [`KittyPlacementError::UnknownComposeMode`].
+//! [`KittyPlacementError::UnknownComposeMode`]. When source and
+//! destination name the same frame and the rectangles overlap, the
+//! compose refuses with
+//! [`KittyPlacementError::ComposeSelfOverlap`] and composes nothing
+//! (S1 spec follow-up, CTX-1124: kitty
+//! `docs/graphics-protocol.rst:1024-1027`,
+//! `kitty/graphics.c:2077-2083` — `MAX(src,dst) < MIN(src,dst)+size` on
+//! both axes; identical rects and partial overlaps refuse, disjoint
+//! including edge-touching still composes).
 //! A successful compose bumps the image generation (the cache key binds
 //! it) and the runtime drops cached blits wholesale, so no stale frame
 //! bytes can survive either path.
@@ -944,6 +952,23 @@ pub enum KittyPlacementError {
     /// [`KITTY_COMPOSE_BLEND`] (0) nor [`KITTY_COMPOSE_REPLACE`] (1).
     /// Composes nothing.
     UnknownComposeMode(u32),
+    /// Compose refused: source and destination frames are the same and
+    /// the rectangles overlap (S1 spec follow-up, CTX-1124). Composes
+    /// nothing.
+    ComposeSelfOverlap {
+        /// Source left edge (`X=`).
+        src_x: u32,
+        /// Source top edge (`Y=`).
+        src_y: u32,
+        /// Destination left edge (`x=`).
+        dst_x: u32,
+        /// Destination top edge (`y=`).
+        dst_y: u32,
+        /// Rect width (`w=`, defaulted to the frame extent).
+        w: u32,
+        /// Rect height (`h=`, defaulted to the frame extent).
+        h: u32,
+    },
     /// Admission would exceed a global bound held by other origins.
     ///
     /// S5 per-origin quotas (#1849): eviction never crosses origins, so
@@ -1010,6 +1035,17 @@ impl std::fmt::Display for KittyPlacementError {
             Self::UnknownComposeMode(mode) => {
                 write!(f, "kitty compose unknown mode C={mode}")
             }
+            Self::ComposeSelfOverlap {
+                src_x,
+                src_y,
+                dst_x,
+                dst_y,
+                w,
+                h,
+            } => write!(
+                f,
+                "kitty compose overlapping self-compose {w}x{h} src ({src_x},{src_y}) dst ({dst_x},{dst_y}) on same frame"
+            ),
             Self::QuotaExceeded => write!(
                 f,
                 "kitty quota exceeded: global bound held by other origins, refused without evicting"
@@ -1641,7 +1677,9 @@ impl KittyImageLayer {
     /// [`KittyPlacementError::ImageNotFound`] for unknown images,
     /// [`KittyPlacementError::NoSuchFrame`] for missing frames,
     /// [`KittyPlacementError::UnknownComposeMode`] for modes past 1, or
-    /// [`KittyPlacementError::ComposeOutOfBounds`] for unplaceable rects.
+    /// [`KittyPlacementError::ComposeOutOfBounds`] for unplaceable rects, or
+    /// [`KittyPlacementError::ComposeSelfOverlap`] when `dest == src` and
+    /// the rectangles overlap (kitty `graphics.c:2077-2083`).
     /// Failures compose nothing.
     #[allow(clippy::too_many_arguments)]
     pub fn compose_frame(
@@ -1716,6 +1754,29 @@ impl KittyImageLayer {
                 height,
             });
         }
+        // Overlapping self-compose (CTX-1124, kitty
+        // `graphics.c:2077-2083`): same frame with intersecting rects
+        // refuses with `EINVAL`. `MAX(src,dst) < MIN(src,dst)+size` on
+        // both axes, so identical and partially overlapping rects refuse
+        // while disjoint (including edge-touching) still composes.
+        // Checked after the bounds above (kitty order) on the defaulted
+        // `w`/`h`, before any copy: failures compose nothing.
+        if dest == src {
+            let x_overlap = u64::from(src_x.max(dst_x))
+                < u64::from(src_x.min(dst_x)).saturating_add(u64::from(w));
+            let y_overlap = u64::from(src_y.max(dst_y))
+                < u64::from(src_y.min(dst_y)).saturating_add(u64::from(h));
+            if x_overlap && y_overlap {
+                return Err(KittyPlacementError::ComposeSelfOverlap {
+                    src_x,
+                    src_y,
+                    dst_x,
+                    dst_y,
+                    w,
+                    h,
+                });
+            }
+        }
         // Byte length of the rect window, checked before any copy: bounded
         // by the frame extent (itself within the 64 MiB cap), so the temp
         // source window below can never exceed it.
@@ -1734,9 +1795,10 @@ impl KittyImageLayer {
             })?;
         // Extra-frame slot for 1-based frame numbers past the root.
         let extra_slot = |frame: u32| (frame as usize).saturating_sub(2);
-        // Snapshot the source window first so `src == dest` (self-compose)
-        // reads stable bytes: the window is at most one frame (64 MiB),
-        // admitted above.
+        // Snapshot the source window first so disjoint `src == dest`
+        // (non-overlapping self-compose, still allowed) reads stable
+        // bytes: the window is at most one frame (64 MiB), admitted
+        // above.
         let window: Vec<u8> = {
             let img = &self.images[slot];
             let src_bytes: &[u8] = if src == 1 {

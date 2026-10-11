@@ -655,3 +655,88 @@ fn edit_refusals_edit_nothing() {
     assert_eq!(layer.frame_count(id), Some(1));
     assert_eq!(layer.total_bytes(), bytes_before);
 }
+
+#[test]
+fn compose_overlapping_self_compose_refused() {
+    // S1 spec follow-up (CTX-1124, PX-5618): kitty
+    // `docs/graphics-protocol.rst:1024-1027` refuses `a=c` with `EINVAL`
+    // when source and destination frames are the same and the rectangles
+    // overlap (`kitty/graphics.c:2077-2083`: `MAX(src,dst) <
+    // MIN(src,dst)+size` on both axes). Identical rects and partial
+    // overlaps refuse; disjoint (including edge-touching) still composes.
+    let mut layer = KittyImageLayer::new();
+    // 4x4 red root for in-bounds partial-overlap shapes.
+    let red_4x4 = [0xFF, 0x00, 0x00, 0xFF].repeat(16);
+    let id = layer
+        .store_for_origin_with_wire(4, 4, red_4x4.clone(), red_4x4.len(), None, 11)
+        .expect("4x4 root must store");
+    let snapshot = layer.frame_bytes(id, 1).expect("frame 1").2.to_vec();
+    // Identical rects on the same frame overlap.
+    assert!(matches!(
+        layer.compose_frame(id, 1, 1, 0, 0, 0, 0, 2, 2, KITTY_COMPOSE_REPLACE),
+        Err(KittyPlacementError::ComposeSelfOverlap { .. })
+    ));
+    // Partial overlap: 2x2 at (0,0) vs (1,1) share a 1x1 region.
+    assert!(matches!(
+        layer.compose_frame(id, 1, 1, 0, 0, 1, 1, 2, 2, KITTY_COMPOSE_REPLACE),
+        Err(KittyPlacementError::ComposeSelfOverlap { .. })
+    ));
+    // Partial overlap in blend mode refuses too.
+    assert!(matches!(
+        layer.compose_frame(id, 1, 1, 0, 0, 1, 0, 2, 2, KITTY_COMPOSE_BLEND),
+        Err(KittyPlacementError::ComposeSelfOverlap { .. })
+    ));
+    // Every refusal left the frame byte-identical.
+    let (_, _, root) = layer.frame_bytes(id, 1).expect("frame 1");
+    assert_eq!(root, snapshot.as_slice());
+}
+
+#[test]
+fn compose_disjoint_self_compose_allowed() {
+    // Same frame, disjoint rects: no overlap per the reference rule, so
+    // the compose still applies (kitty allows it).
+    let mut layer = KittyImageLayer::new();
+    let red_4x4 = [0xFF, 0x00, 0x00, 0xFF].repeat(16);
+    let blue_4x4 = [0x00, 0x00, 0xFF, 0xFF].repeat(16);
+    let id = layer
+        .store_for_origin_with_wire(4, 4, red_4x4, 64, None, 12)
+        .expect("4x4 root must store");
+    // Paint the source window blue via a different-frame compose first so
+    // the self-compose has an observable effect: copy blue from a second
+    // image? Simpler: use edit_frame to make (0,0) 2x2 blue, then
+    // self-compose it onto disjoint (2,2).
+    layer
+        .edit_frame(id, 1, 0, 0, 2, 2, &blue_4x4[0..16], KITTY_COMPOSE_REPLACE)
+        .expect("edit must apply");
+    // Disjoint: (0,0) 2x2 vs (2,2) 2x2 touch only at the corner point.
+    layer
+        .compose_frame(id, 1, 1, 0, 0, 2, 2, 2, 2, KITTY_COMPOSE_REPLACE)
+        .expect("disjoint self-compose must compose");
+    let (_, _, root) = layer.frame_bytes(id, 1).expect("frame 1");
+    // Destination (2,2) 2x2 now carries the source blue bytes.
+    // Row 2 (y=2): x=2,3 pixels blue; row 3 same.
+    // 4x4 row-major: row 2 starts at byte 2*4*4=32, so x=2 starts at 40.
+    assert_eq!(&root[40..48], &blue_4x4[0..8]);
+    assert_eq!(&root[56..64], &blue_4x4[0..8]);
+    // Edge-touching (shared edge, no area overlap) also composes:
+    // (0,0) 2x2 vs (2,0) 2x2 share the x=2 edge only.
+    layer
+        .compose_frame(id, 1, 1, 0, 0, 2, 0, 2, 2, KITTY_COMPOSE_REPLACE)
+        .expect("edge-touching self-compose must compose");
+}
+
+#[test]
+fn compose_different_frame_identical_rects_unaffected() {
+    // Same rectangles on different frames never trigger the self-overlap
+    // rule: identical positions across frames still compose.
+    let mut layer = KittyImageLayer::new();
+    let id = stored_root(&mut layer);
+    layer
+        .append_frame(id, 2, 2, blue_2x2())
+        .expect("frame 2 must store");
+    layer
+        .compose_frame(id, 1, 2, 0, 0, 0, 0, 2, 2, KITTY_COMPOSE_REPLACE)
+        .expect("different-frame identical rects must compose");
+    let (_, _, root) = layer.frame_bytes(id, 1).expect("frame 1");
+    assert_eq!(root, blue_2x2().as_slice());
+}

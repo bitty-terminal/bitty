@@ -354,6 +354,144 @@ fn compose_out_of_bounds_refused_with_nothing_composed() {
 }
 
 #[test]
+fn compose_overlapping_self_compose_refused_with_einval() {
+    // CTX-1124 (PX-5618): same frame `r==c` with intersecting rects
+    // refuses with `EINVAL` (kitty `docs/graphics-protocol.rst:1024-1027`),
+    // nothing composed, reply honoring `q=`.
+    let mut rt = make_runtime();
+    running_two_frame(&mut rt);
+    let t0 = Instant::now();
+    rt.tick_at(t0);
+    let before = rt.headless_rgba().expect("frame must exist");
+    // Identical rects on frame 1: `r=1,c=1` at (0,0) 2x2 (full extent).
+    rt.take_replies();
+    rt.handle_pty_bytes(&apc("Ga=c,i=1,r=1,c=1,X=0,Y=0,x=0,y=0,w=2,h=2,C=1,m=0;"));
+    let replies: Vec<Vec<u8>> = rt
+        .take_replies()
+        .iter()
+        .map(|reply| reply.to_vec())
+        .collect();
+    assert_eq!(
+        replies,
+        vec![b"\x1b_Gi=1;EINVAL:overlapping self-compose\x1b\\".to_vec()],
+        "identical self-compose must answer EINVAL"
+    );
+    rt.tick_at(t0);
+    let after = rt.headless_rgba().expect("frame must exist");
+    assert_eq!(before, after, "refused self-compose must paint nothing new");
+    assert_eq!(rt.kitty_anim_frame_count(1), 2);
+    // Partial overlap: 1x1 at (0,0) vs (0,0)? Identical already covers;
+    // use offset overlap on 2x2: src (0,0) 2x1 top row vs dst (0,0)? Need
+    // distinct offsets sharing area: src (0,0) 1x2 left column vs dst
+    // (0,0) 1x2 identical is overlap; for partial use 1x1 vs 1x1 offset
+    // by 0? 1x1 rects either coincide or are disjoint, so partial needs
+    // the 2x2 full-extent identical above plus a 1x1 identical here.
+    rt.take_replies();
+    rt.handle_pty_bytes(&apc("Ga=c,i=1,r=1,c=1,X=0,Y=0,x=0,y=0,w=1,h=1,C=1,m=0;"));
+    let replies: Vec<Vec<u8>> = rt
+        .take_replies()
+        .iter()
+        .map(|reply| reply.to_vec())
+        .collect();
+    assert_eq!(
+        replies,
+        vec![b"\x1b_Gi=1;EINVAL:overlapping self-compose\x1b\\".to_vec()],
+        "identical 1x1 self-compose must answer EINVAL"
+    );
+    rt.tick_at(t0);
+    let after2 = rt.headless_rgba().expect("frame must exist");
+    assert_eq!(before, after2, "second refusal must also paint nothing");
+}
+
+#[test]
+fn compose_overlapping_self_compose_quiet_suppresses_reply() {
+    // `q=2` suppresses the `EINVAL` failure reply (S2 posture), still
+    // composing nothing.
+    let mut rt = make_runtime();
+    running_two_frame(&mut rt);
+    let t0 = Instant::now();
+    rt.tick_at(t0);
+    let before = rt.headless_rgba().expect("frame must exist");
+    rt.take_replies();
+    rt.handle_pty_bytes(&apc(
+        "Ga=c,i=1,r=1,c=1,X=0,Y=0,x=0,y=0,w=1,h=1,C=1,m=0,q=2;",
+    ));
+    assert!(
+        rt.take_replies().is_empty(),
+        "q=2 must suppress the EINVAL failure reply"
+    );
+    rt.tick_at(t0);
+    let after = rt.headless_rgba().expect("frame must exist");
+    assert_eq!(
+        before, after,
+        "suppressed refusal must still compose nothing"
+    );
+    // `q=1` suppresses only `OK`: failures still reply.
+    rt.handle_pty_bytes(&apc(
+        "Ga=c,i=1,r=1,c=1,X=0,Y=0,x=0,y=0,w=1,h=1,C=1,m=0,q=1;",
+    ));
+    let replies: Vec<Vec<u8>> = rt
+        .take_replies()
+        .iter()
+        .map(|reply| reply.to_vec())
+        .collect();
+    assert_eq!(
+        replies,
+        vec![b"\x1b_Gi=1;EINVAL:overlapping self-compose\x1b\\".to_vec()],
+        "q=1 must not suppress failure replies"
+    );
+}
+
+#[test]
+fn compose_disjoint_self_compose_still_works() {
+    // Same frame, disjoint rects: allowed per the reference rule
+    // (edge-touching counts as disjoint). Striped 2x2 root (row 0 red,
+    // row 1 blue): copy (0,0) 1x1 red onto (1,1) 1x1 blue — distinct
+    // pixels, no area overlap — so the repaint is observable (a uniform
+    // root would pass vacuously).
+    let mut rt = make_runtime();
+    rt.handle_pty_bytes(&apc(&format!(
+        "Gf=32,s=2,v=2,i=1,c=2,r=2,m=0;{}",
+        striped_2x2_b64()
+    )));
+    assert_eq!(rt.kitty_image_count(), 1);
+    assert_eq!(rt.kitty_placement_count(), 1);
+    let t0 = Instant::now();
+    rt.tick_at(t0);
+    let before = rt.headless_rgba().expect("frame must exist");
+    rt.take_replies();
+    rt.handle_pty_bytes(&apc("Ga=c,i=1,r=1,c=1,X=0,Y=0,x=1,y=1,w=1,h=1,C=1,m=0;"));
+    // Disjoint success stays silent (no new reply shape in this slice).
+    assert!(
+        rt.take_replies().is_empty(),
+        "disjoint self-compose success must not reply"
+    );
+    rt.tick_at(t0);
+    let after = rt.headless_rgba().expect("frame must exist");
+    assert_ne!(before, after, "disjoint self-compose must repaint");
+}
+
+#[test]
+fn compose_different_frame_identical_rects_unaffected() {
+    // Identical rectangles across different frames never trigger the
+    // self-overlap rule: `r=2,c=1` at the same offsets still composes.
+    let mut rt = make_runtime();
+    running_two_frame(&mut rt);
+    let t0 = Instant::now();
+    rt.tick_at(t0);
+    let before = rt.headless_rgba().expect("frame must exist");
+    rt.take_replies();
+    rt.handle_pty_bytes(&apc("Ga=c,i=1,r=2,c=1,X=0,Y=0,x=0,y=0,w=2,h=2,C=1,m=0;"));
+    assert!(
+        rt.take_replies().is_empty(),
+        "different-frame compose success must not reply"
+    );
+    rt.tick_at(t0);
+    let after = rt.headless_rgba().expect("frame must exist");
+    assert_ne!(before, after, "different-frame compose must repaint");
+}
+
+#[test]
 fn partial_frame_with_base_stores_instead_of_mismatching() {
     let mut rt = make_runtime();
     display_root(&mut rt);

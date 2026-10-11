@@ -273,7 +273,7 @@ fn compose_src_y_selects_source_row_on_wire() {
     // onto (0, 0) must paint different pixels for `Y=0` versus `Y=1`.
     // Uniform fixtures pass vacuously here, so this pin uses distinct
     // rows to lock the live `Y=` source offset.
-    fn painted_after_src_y(src_y: u32) -> Vec<u8> {
+    fn painted_after_src_y(src_y: u32) -> (Vec<u8>, Runtime) {
         let mut rt = make_runtime();
         display_root(&mut rt);
         let seq = apc(&format!("Gf=32,s=2,v=2,a=f,i=1,m=0;{}", striped_2x2_b64()));
@@ -287,14 +287,40 @@ fn compose_src_y_selects_source_row_on_wire() {
             "Ga=c,i=1,r=2,c=1,X=0,Y={src_y},x=0,y=0,w=1,h=1,C=1,m=0;"
         )));
         rt.tick_at(t0);
-        rt.headless_rgba().expect("frame must exist")
+        let rgba = rt.headless_rgba().expect("frame must exist");
+        (rgba, rt)
     }
 
-    let with_y0 = painted_after_src_y(0);
-    let with_y1 = painted_after_src_y(1);
+    /// First pixel of the composed dest cell (0,0) in the headless frame.
+    /// The cursor-anchored 2x2 image sits at the content origin, so dest
+    /// (0,0) lands on `pad + content` at the live surface stride — no
+    /// hardcoded pixels, same frame math the present path uses.
+    fn dest_first_pixel(rgba: &[u8], rt: &Runtime) -> [u8; 4] {
+        let pad = usize::try_from(rt.window_padding_physical()).expect("pad fits");
+        let extent = rt.surface_extent().expect("surface extent exists");
+        let stride = usize::try_from(extent.width()).expect("width fits");
+        let content = rt.present_frames()[0].content;
+        let x = pad + usize::try_from(content.x).expect("content x fits");
+        let y = pad + usize::try_from(content.y).expect("content y fits");
+        let i = (y * stride + x) * 4;
+        [rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]]
+    }
+
+    let (with_y0, rt0) = painted_after_src_y(0);
+    let (with_y1, rt1) = painted_after_src_y(1);
     assert_ne!(
         with_y0, with_y1,
         "wire Y offset must select distinct source rows"
+    );
+    assert_eq!(
+        dest_first_pixel(&with_y0, &rt0),
+        [0xFF, 0x00, 0x00, 0xFF],
+        "wire Y=0 must select the red row"
+    );
+    assert_eq!(
+        dest_first_pixel(&with_y1, &rt1),
+        [0x00, 0x00, 0xFF, 0xFF],
+        "wire Y=1 must select the blue row"
     );
 }
 

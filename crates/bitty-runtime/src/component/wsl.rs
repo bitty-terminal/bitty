@@ -6,10 +6,10 @@
 //! Unix hosts never use this module (all entry points are no-ops there, so
 //! Unix behavior is 100% unchanged).
 //!
-//! # Guest distro selection
+//! # Guest distro selection and persistence
 //!
 //! - Explicit `--distro <name>` wins (CLI flag, `bitty component --help`).
-//! - Else `BITTY_WSL_DISTRO` environment/config wins (`WslDistro::select` takes
+//! - Else `BITTY_WSL_DISTRO` environment/config wins (`select_wsl_distro` takes
 //!   both as pure inputs; the caller reads the environment).
 //! - Else the trampoline is disabled (native execution, `None`). There is no
 //!   silent default: to run with the `wsl.exe` default distro pass the literal
@@ -19,10 +19,18 @@
 //! - The literal `default` is reserved and never a distro name
 //!   ([`valid_wsl_distro`] rejects it); any other invalid name fails closed as
 //!   usage (exit `2`), never a silent pick.
-//! - When a distro is selected but WSL is absent (no `wsl.exe` or the version
-//!   probe fails), execution fails closed with an actionable diagnostic (exit
-//!   `1`): install or enable WSL2, or run natively without `--distro`. There
-//!   is no silent fallback to native when WSL was requested.
+//! - When a distro is selected but WSL is absent (no `wsl.exe` or both probes
+//!   fail), execution fails closed with an actionable diagnostic (exit `1`):
+//!   install or enable WSL2 (Store version for `--version`; inbox builds use
+//!   `--status` as presence-only fallback, see below), or run natively without
+//!   `--distro`. There is no silent fallback to native when WSL was requested.
+//! - `add`/`install` are staging/fetch operations only (they never execute the
+//!   component). When a distro is selected they persist it per-component to
+//!   `<user>/<name>/wsl_distro` (`WSL_DISTRO_FILE`, `default` or the distro
+//!   name plus a newline, atomic write like the TOFU pin). Omission preserves
+//!   any previous placement (never deletes); later component runs (broker)
+//!   read that file when no explicit in-memory selection overrides it. Unix
+//!   records the file but never acts on it (native execution, no-op).
 //!
 //! # Windows to guest path mapping (primary direction)
 //!
@@ -75,11 +83,51 @@
 //!
 //! # Detection (Windows-gated, bounded, fail-closed)
 //!
-//! [`detect_wsl_context`] on Windows runs `wsl.exe --version` with a bounded
-//! output cap ([`WSL_VERSION_OUTPUT_MAX_BYTES`]) and a bounded wait
-//! ([`WSL_PROBE_TIMEOUT`]); absent `wsl.exe` or a failed probe returns
-//! [`WslError::AbsentWsl`] with the manual-install diagnostic (exit `1`). On
-//! Unix this function is a no-op returning `Ok(None)` with zero spawn.
+//! [`detect_wsl_context`] on Windows probes presence with a bounded,
+//! honestly-capped read (see below) and a bounded wait ([`WSL_PROBE_TIMEOUT`]):
+//! first `wsl.exe --version` (Store builds; returns a version string), else
+//! `wsl.exe --status` as presence-only fallback for older inbox builds that
+//! lack `--version` (returns `present-but-unversioned`, no version floor is
+//! enforced, so proceeding is safe). Absent `wsl.exe` or both probes failing
+//! returns [`WslError::AbsentWsl`] with the actionable diagnostic naming the
+//! Store upgrade (exit `1`). Choosing fallback-over-fail-closed for
+//! `--version`-only absence is deliberate: inbox WSL2 is operational, just
+//! unversioned; genuinely absent WSL still fails closed. Probe output is
+//! decoded as UTF-8 lossy, with UTF-16LE (BOM or NUL-interleaved) handled so
+//! redirected inbox output never surfaces as NULs. On Unix this function is a
+//! no-op returning `Ok(None)` with zero spawn.
+//!
+//! Bound honesty: the probe uses `spawn` with piped stdout (stderr discarded
+//! to null so the child never blocks on it), reads at most
+//! [`WSL_VERSION_OUTPUT_MAX_BYTES`] + 1 bytes while reading (excess fails as
+//! [`WslError::ProbeFailed`] without buffering the remainder), and kills plus
+//! reaps the child on timeout, so no probe outlives failure.
+//!
+//! # Guest environment (WSLENV, clean by design)
+//!
+//! The guest receives ONLY variables named in `WSLENV` (WSL interop allowlist).
+//! The broker sets `WSLENV` explicitly for trampoline spawns: it preserves the
+//! caller's existing entries (from the hermetic [`ComponentEnv`], which may
+//! carry a user `WSLENV`), appends the forwarded allowlisted names (proxy,
+//! TLS, locale), and NEVER includes secret-shaped names (`*_TOKEN`, `*_KEY`,
+//! `*_SECRET`, filtered from both existing and forwarding lists, even if the
+//! caller listed them). Forwarded names are bare (no `/p` conversion; proxy
+//! URLs need none); existing suffixes (`/p`, `/u`, ...) are preserved
+//! verbatim. The guest environment is otherwise clean by design: nothing
+//! outside `WSLENV` crosses, even though the Windows `wsl.exe` process itself
+//! carries the cleared-plus-allowlist environment.
+//!
+//! # UNC-to-launch distro binding
+//!
+//! [`windows_path_to_guest`] maps `\\wsl$\<distroA>\...` to `/...` (dropping
+//! the source namespace). Executing that `/...` under a different launch
+//! distro `B` would address B's bytes, not the verified A's bytes
+//! (substitution across the namespace boundary). [`check_unc_distro_binding`]
+//! fails closed on any such mismatch: UNC paths require an explicit
+//! [`WslDistro::Named`] launch equal (case-sensitive) to the UNC distro;
+//! [`WslDistro::Default`] with a UNC path fails (the default may differ).
+//! Drive-absolute paths (`X:\...`, visible in every distro via `/mnt`) bind
+//! to any launch distro.
 
 use std::path::Path;
 use std::time::Duration;
@@ -97,11 +145,20 @@ pub const WSL_DISTRO_MAX_BYTES: usize = 64;
 /// Maximum bytes of one path spelling converted by this module.
 pub const WSL_PATH_MAX_BYTES: usize = 4096;
 
-/// Maximum bytes of `wsl.exe --version` output kept for the probe.
+/// Maximum bytes of probe stdout kept while reading (`--version`/`--status`).
+///
+/// The probe reads at most this plus one byte; excess fails as `ProbeFailed`
+/// without buffering the remainder (honestly bounded, unlike `output()`).
 pub const WSL_VERSION_OUTPUT_MAX_BYTES: usize = 8192;
 
-/// Bounded wait for the `wsl.exe --version` probe.
+/// Bounded wait for one probe command (`--version` or `--status`).
 pub const WSL_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Per-component persisted distro file name inside `<user>/<name>/`.
+pub const WSL_DISTRO_FILE: &str = "wsl_distro";
+
+/// Maximum bytes read from a persisted distro file (name plus newline).
+pub const WSL_DISTRO_FILE_MAX_BYTES: u64 = 128;
 
 /// Guest distro selection when the trampoline is active.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -430,56 +487,212 @@ pub fn wsl_argv_with_cwd(
     Ok(argv)
 }
 
-/// Detect the WSL context for trampoline execution.
+/// Decode probe stdout that may be UTF-8 or UTF-16LE.
 ///
-/// On Windows this probes `wsl.exe --version` with a bounded output cap and
-/// a bounded wait; success returns `Ok(Some(version))` (first line trimmed),
-/// absence or failure returns [`WslError::AbsentWsl`] with the actionable
-/// diagnostic (exit `1`). On Unix this is a no-op returning `Ok(None)` with
-/// zero spawn (native execution, trampoline disabled).
+/// Inbox `wsl.exe` commonly writes UTF-16LE without a BOM when redirected to
+/// a pipe; Store builds write UTF-8. This decodes UTF-16LE (BOM `FF FE` or
+/// NUL-interleaved ASCII) to lossy UTF-8, otherwise falls back to UTF-8 lossy.
+/// Pure (no I/O), testable on every platform.
+#[must_use]
+pub fn decode_probe_output(bytes: &[u8]) -> String {
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        return decode_utf16le(&bytes[2..]);
+    }
+    // Heuristic for BOM-less UTF-16LE ASCII (`V\0 e\0 r\0 ...`): even length,
+    // every odd byte NUL, at least one NUL present.
+    if bytes.len() >= 2
+        && bytes.len() % 2 == 0
+        && bytes.iter().skip(1).step_by(2).all(|&b| b == 0)
+        && bytes.iter().step_by(2).any(|&b| b != 0)
+    {
+        return decode_utf16le(bytes);
+    }
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// Lossy UTF-16LE decode (no new deps, ASCII-first, unpaired surrogates fail
+/// closed to the replacement character, never panic).
+fn decode_utf16le(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    let mut chunks = bytes.chunks_exact(2);
+    for pair in &mut chunks {
+        let unit = u16::from_le_bytes([pair[0], pair[1]]);
+        out.push(char::from_u32(u32::from(unit)).unwrap_or('\u{FFFD}'));
+    }
+    // A trailing odd byte cannot form a unit; surface it as a replacement.
+    if !chunks.remainder().is_empty() {
+        out.push('\u{FFFD}');
+    }
+    out
+}
+
+/// Outcome of one probe command (pure decision core, testable everywhere).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(any(windows, test))]
+enum ProbeDecision {
+    /// `wsl.exe` itself is missing (spawn `NotFound`): fail closed at once,
+    /// no fallback can help.
+    Missing,
+    /// Command ran and succeeded: present (caller decodes stdout as needed).
+    Present,
+    /// Command ran but failed (non-zero exit, e.g. inbox `--version`
+    /// unsupported): try the next fallback command, if any.
+    Fallback,
+    /// Spawn failed for a non-`NotFound` I/O reason: probe failure.
+    SpawnFailed,
+}
+
+#[cfg(any(windows, test))]
+impl ProbeDecision {
+    /// Classify a spawn/result pair without touching the filesystem.
+    fn classify(spawn_kind: Option<std::io::ErrorKind>, exit_success: bool) -> Self {
+        match spawn_kind {
+            Some(std::io::ErrorKind::NotFound) => Self::Missing,
+            Some(_) => Self::SpawnFailed,
+            None if exit_success => Self::Present,
+            None => Self::Fallback,
+        }
+    }
+
+    /// Map a spawn error through the classifier to a typed probe error.
+    #[cfg(windows)]
+    fn spawn_error(arg: &str, error: std::io::Error) -> WslError {
+        match Self::classify(Some(error.kind()), false) {
+            Self::Missing => WslError::AbsentWsl(absent_diagnostic()),
+            _ => WslError::ProbeFailed(format!(
+                "bitty component: cannot run `{WSL_EXE} {arg}`: {error}"
+            )),
+        }
+    }
+}
+
+/// Run one probe command with an honestly bounded stdout read.
+///
+/// `spawn` with piped stdout (stderr discarded to null so the child never
+/// blocks on it); the reader takes at most `WSL_VERSION_OUTPUT_MAX_BYTES + 1`
+/// bytes while reading (excess fails as `ProbeFailed` without buffering the
+/// remainder). On `WSL_PROBE_TIMEOUT` the child is killed and reaped before
+/// returning, so no probe outlives failure. Returns `(success, stdout)`.
+///
+/// Windows-only in effect (the caller is `#[cfg(windows)]`); defined on every
+/// platform so unit tests exercise the bounded-read core via `read` injection
+/// without spawning.
 #[cfg(windows)]
-pub fn detect_wsl_context() -> Result<Option<String>, WslError> {
-    let absent = || {
-        WslError::AbsentWsl(
-            "bitty component: WSL2 is unavailable (`wsl.exe --version` failed; install or enable WSL2 and a guest distro, or run without --distro for native Windows execution)".to_string(),
-        )
-    };
-    let (tx, rx) = std::sync::mpsc::channel::<Result<std::process::Output, std::io::Error>>();
+fn run_probe_command(arg: &str) -> Result<(bool, Vec<u8>), WslError> {
+    use std::io::Read as _;
+    use std::process::Stdio;
+
+    let mut child = std::process::Command::new(WSL_EXE)
+        .arg(arg)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| ProbeDecision::spawn_error(arg, error))?;
+    let stdout = child.stdout.take();
+    let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<Vec<u8>>>();
     std::thread::Builder::new()
-        .name("bitty-wsl-probe".into())
+        .name("bitty-wsl-probe-read".into())
         .spawn(move || {
-            let output = std::process::Command::new(WSL_EXE)
-                .arg("--version")
-                .output();
-            let _ = tx.send(output);
+            let result = (|| -> std::io::Result<Vec<u8>> {
+                let Some(pipe) = stdout else {
+                    return Ok(Vec::new());
+                };
+                // One byte past the cap proves excess without keeping it.
+                let mut bounded = pipe.take(WSL_VERSION_OUTPUT_MAX_BYTES as u64 + 1);
+                let mut buf = Vec::new();
+                bounded.read_to_end(&mut buf)?;
+                Ok(buf)
+            })();
+            let _ = tx.send(result);
         })
         .map_err(|error| {
+            let _ = child.kill();
+            let _ = child.wait();
             WslError::ProbeFailed(format!("bitty component: WSL probe thread failed: {error}"))
         })?;
-    let output = rx.recv_timeout(WSL_PROBE_TIMEOUT).map_err(|_| absent())?;
-    let output = output.map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            absent()
-        } else {
-            WslError::ProbeFailed(format!(
-                "bitty component: cannot run `wsl.exe --version`: {error}"
-            ))
+    let stdout = match rx.recv_timeout(WSL_PROBE_TIMEOUT) {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(error)) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(WslError::ProbeFailed(format!(
+                "bitty component: cannot read `{WSL_EXE} {arg}` output: {error}"
+            )));
         }
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(WslError::AbsentWsl(absent_diagnostic()));
+        }
+    };
+    let status = child.wait().map_err(|error| {
+        WslError::ProbeFailed(format!(
+            "bitty component: cannot wait for `{WSL_EXE} {arg}`: {error}"
+        ))
     })?;
-    if !output.status.success() {
-        return Err(absent());
+    if stdout.len() > WSL_VERSION_OUTPUT_MAX_BYTES {
+        return Err(WslError::ProbeFailed(format!(
+            "bitty component: `{WSL_EXE} {arg}` output exceeds {WSL_VERSION_OUTPUT_MAX_BYTES} bytes"
+        )));
     }
-    if output.stdout.len() > WSL_VERSION_OUTPUT_MAX_BYTES {
-        return Err(WslError::ProbeFailed(
-            "bitty component: `wsl.exe --version` output exceeds bounds".to_string(),
-        ));
+    Ok((status.success(), stdout))
+}
+
+/// Actionable diagnostic when WSL is absent (names the Store upgrade for
+/// inbox builds, per the fail-closed posture).
+#[must_use]
+pub fn absent_diagnostic() -> String {
+    "bitty component: WSL2 is unavailable (`wsl.exe --version` and `wsl.exe --status` both failed; install or enable WSL2 from the Microsoft Store (inbox builds lack `--version`) and add a guest distro, or run without --distro for native Windows execution)".to_string()
+}
+
+/// Detect the WSL context for trampoline execution.
+///
+/// On Windows this first probes `wsl.exe --version` (Store builds; success
+/// returns `Ok(Some(version))`, first line trimmed). When that command is
+/// unsupported (non-zero exit, older inbox builds) it falls back to
+/// `wsl.exe --status` success as present-but-unversioned
+/// (`Ok(Some("present (unversioned, --status ok)"))`; no version floor is
+/// enforced, so proceeding is safe). Missing `wsl.exe` (`NotFound`) or both
+/// probes failing returns [`WslError::AbsentWsl`] with [`absent_diagnostic`]
+/// (exit `1`). Choosing fallback-over-fail-closed for `--version`-only
+/// absence is deliberate and documented: inbox WSL2 is operational, just
+/// unversioned; genuinely absent WSL still fails closed. Probe stdout is
+/// decoded via [`decode_probe_output`] (UTF-8 or UTF-16LE). On Unix this is a
+/// no-op returning `Ok(None)` with zero spawn.
+#[cfg(windows)]
+pub fn detect_wsl_context() -> Result<Option<String>, WslError> {
+    // Preferred probe: Store `wsl.exe` understands `--version`.
+    match run_probe_command("--version") {
+        Ok((true, stdout)) => {
+            let text = decode_probe_output(&stdout);
+            let first = text.lines().next().unwrap_or("").trim().to_string();
+            if first.is_empty() || first.contains('\0') {
+                // Empty or NUL-bearing version after decode: treat as
+                // unsupported output, fall through to `--status` rather than
+                // failing closed on a present-but-odd build.
+            } else {
+                return Ok(Some(first));
+            }
+        }
+        Ok((false, _)) => {
+            // Non-zero exit (notably inbox `--version` unsupported): fall
+            // through to `--status`. `NotFound` never reaches here (it
+            // errors as `AbsentWsl` inside `run_probe_command`).
+        }
+        Err(error) => {
+            // Missing `wsl.exe` fails closed at once; any other spawn/read
+            // failure is already a typed error.
+            return Err(error);
+        }
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let first = text.lines().next().unwrap_or("").trim().to_string();
-    if first.is_empty() {
-        return Err(absent());
+    // Fallback probe for inbox builds: `--status` success means present,
+    // version unknown. Output is presence-only (ignored beyond success).
+    match run_probe_command("--status") {
+        Ok((true, _)) => Ok(Some("present (unversioned, --status ok)".to_string())),
+        Ok((false, _)) => Err(WslError::AbsentWsl(absent_diagnostic())),
+        Err(error) => Err(error),
     }
-    Ok(Some(first))
 }
 
 /// No-op WSL detection off Windows: native execution, zero spawn.
@@ -533,6 +746,183 @@ pub fn map_store_paths_for_guest(
         )));
     }
     Ok((guest_exe, guest_dir))
+}
+
+/// Extract the UNC distro from a Windows path, if it is a WSL UNC spelling.
+///
+/// Returns `Some(distro)` for `\\wsl$\<distro>\...` and
+/// `\\wsl.localhost\<distro>\...` (bare `\\wsl$\<distro>` included), else
+/// `None` (drive-absolute or unmappable shapes carry no namespace). Pure,
+/// testable on every platform.
+#[must_use]
+pub fn unc_distro_of_windows_path(windows: &str) -> Option<String> {
+    for prefix in ["\\\\wsl$\\", "\\\\wsl.localhost\\"] {
+        if let Some(rest) = windows.strip_prefix(prefix) {
+            let distro = match rest.split_once(['\\', '/']) {
+                Some((distro, _)) => distro,
+                None => rest,
+            };
+            if distro.is_empty() {
+                return None;
+            }
+            return Some(distro.to_owned());
+        }
+    }
+    None
+}
+
+/// Bind a Windows store path to its launch distro (fail-closed on mismatch).
+///
+/// UNC paths (`\\wsl$\<distroA>\...`) name their source namespace; executing
+/// the mapped `/...` under a different launch distro `B` would address B's
+/// bytes, not the verified A's bytes. This fails closed: UNC requires an
+/// explicit [`WslDistro::Named`] equal (case-sensitive) to the UNC distro;
+/// [`WslDistro::Default`] with a UNC path fails (the default may differ).
+/// Drive-absolute paths bind to any launch distro. Pure, testable everywhere.
+pub fn check_unc_distro_binding(windows_path: &str, launch: &WslDistro) -> Result<(), WslError> {
+    let Some(unc) = unc_distro_of_windows_path(windows_path) else {
+        return Ok(());
+    };
+    match launch {
+        WslDistro::Named(selected) if selected == &unc => Ok(()),
+        WslDistro::Named(selected) => Err(WslError::InvalidHelper(format!(
+            "WSL UNC path {windows_path:?} names distro {unc:?} but launch selects {selected:?} (refusing cross-distro exec; verified bytes are from {unc:?})"
+        ))),
+        WslDistro::Default => Err(WslError::InvalidHelper(format!(
+            "WSL UNC path {windows_path:?} names distro {unc:?} but launch uses the default distro (explicitly select --distro {unc:?} to bind execution to the verified store)"
+        ))),
+    }
+}
+
+/// Whether an env name is secret-shaped and must never cross into the guest.
+///
+/// Case-insensitive suffix match on `_TOKEN`, `_KEY`, `_SECRET` (mirrors the
+/// seed transport posture). Proxy/TLS/locale names never match, so
+/// forwarding is unaffected.
+#[must_use]
+pub fn is_secret_wsl_env_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper.ends_with("_TOKEN") || upper.ends_with("_KEY") || upper.ends_with("_SECRET")
+}
+
+/// Base name of a `WSLENV` entry (strips `/p`, `/u`, `/l`, `/w` suffixes).
+///
+/// `WSLENV` entries may carry flags (`NAME/p`, `NAME/u`); the secret check
+/// applies to the base name, while construction preserves the full entry
+/// verbatim.
+fn wslenv_base_name(entry: &str) -> &str {
+    entry.split('/').next().unwrap_or(entry)
+}
+
+/// Build the `WSLENV` value for one trampoline spawn.
+///
+/// `existing` is the caller's current `WSLENV` (from the hermetic env, may be
+/// `None`); `forwarding` are the allowlisted names the broker sets on the
+/// Windows `wsl.exe` process and wants the guest to receive. Result is
+/// colon-separated `existing` (verbatim, suffixes preserved) plus each
+/// non-secret forwarding name not already present (bare, no suffix).
+/// Secret-shaped names are stripped from both lists, even if the caller
+/// listed them. Pure, testable on every platform.
+#[must_use]
+pub fn build_wslenv_for_forwarding(existing: Option<&str>, forwarding: &[String]) -> String {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(list) = existing {
+        for entry in list.split(':') {
+            if entry.is_empty() {
+                continue;
+            }
+            if is_secret_wsl_env_name(wslenv_base_name(entry)) {
+                continue;
+            }
+            if !out.iter().any(|kept| kept == entry) {
+                out.push(entry.to_owned());
+            }
+        }
+    }
+    for name in forwarding {
+        if name == "WSLENV" {
+            continue;
+        }
+        if is_secret_wsl_env_name(name) {
+            continue;
+        }
+        if !out.iter().any(|kept| kept == name) {
+            out.push(name.clone());
+        }
+    }
+    out.join(":")
+}
+
+/// Persisted distro file path inside one component directory (`<root>/<name>/`).
+#[must_use]
+pub fn persisted_distro_path(component_dir: &Path) -> std::path::PathBuf {
+    component_dir.join(WSL_DISTRO_FILE)
+}
+
+/// Read the persisted distro selection for one component directory.
+///
+/// Missing file means native execution (`Ok(None)`, first contact). A valid
+/// `default` or distro name (trimmed) returns the selection; oversize,
+/// non-UTF-8, empty, symlink, non-file, or invalid content fails closed as
+/// [`WslError`] (never a silent native fallback when the file exists). Pure
+/// filesystem read (no spawn), testable on every platform via tempdirs.
+pub fn read_persisted_wsl_distro(component_dir: &Path) -> Result<Option<WslDistro>, WslError> {
+    let path = persisted_distro_path(component_dir);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(WslError::InvalidHelper(format!(
+                "refusing symlink distro file '{}'",
+                path.display()
+            )));
+        }
+        Ok(metadata) if metadata.is_file() => {
+            if metadata.len() > WSL_DISTRO_FILE_MAX_BYTES {
+                return Err(WslError::InvalidDistro(format!(
+                    "persisted distro file '{}' exceeds {WSL_DISTRO_FILE_MAX_BYTES} bytes (corrupt; remove it or re-run with --distro)",
+                    path.display()
+                )));
+            }
+        }
+        Ok(_) => {
+            return Err(WslError::InvalidHelper(format!(
+                "refusing non-file distro path '{}'",
+                path.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(WslError::ProbeFailed(format!(
+                "cannot inspect '{}': {error}",
+                path.display()
+            )));
+        }
+    }
+    let bytes = std::fs::read(&path).map_err(|error| {
+        WslError::ProbeFailed(format!("cannot read '{}': {error}", path.display()))
+    })?;
+    let text = String::from_utf8(bytes).map_err(|_| {
+        WslError::InvalidDistro(format!(
+            "persisted distro file '{}' is not UTF-8 (corrupt; remove it or re-run with --distro)",
+            path.display()
+        ))
+    })?;
+    let name = text.trim();
+    if name.is_empty() {
+        return Err(WslError::InvalidDistro(format!(
+            "persisted distro file '{}' is empty (corrupt; remove it or re-run with --distro)",
+            path.display()
+        )));
+    }
+    if name == "default" {
+        return Ok(Some(WslDistro::Default));
+    }
+    if !valid_wsl_distro(name) {
+        return Err(WslError::InvalidDistro(format!(
+            "persisted distro file '{}' holds invalid distro {name:?} (corrupt; remove it or re-run with --distro)",
+            path.display()
+        )));
+    }
+    Ok(Some(WslDistro::Named(name.to_owned())))
 }
 
 #[cfg(test)]
@@ -815,5 +1205,126 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn probe_output_decodes_utf8_and_utf16le() {
+        assert_eq!(
+            decode_probe_output(b"WSL version: 2.0.0\n"),
+            "WSL version: 2.0.0\n"
+        );
+        // BOM-less UTF-16LE ASCII (`V\0 ...`).
+        let mut utf16 = Vec::new();
+        for byte in b"WSL 2" {
+            utf16.push(*byte);
+            utf16.push(0);
+        }
+        assert_eq!(decode_probe_output(&utf16), "WSL 2");
+        // BOM-prefixed UTF-16LE.
+        let mut bom = vec![0xFF, 0xFE];
+        bom.extend(utf16);
+        assert_eq!(decode_probe_output(&bom), "WSL 2");
+        // Plain UTF-8 with no NULs passes through.
+        assert_eq!(decode_probe_output(b""), "");
+    }
+
+    #[test]
+    fn probe_decision_classifies_missing_present_fallback() {
+        assert_eq!(
+            ProbeDecision::classify(Some(std::io::ErrorKind::NotFound), false),
+            ProbeDecision::Missing
+        );
+        assert_eq!(
+            ProbeDecision::classify(Some(std::io::ErrorKind::PermissionDenied), false),
+            ProbeDecision::SpawnFailed
+        );
+        assert_eq!(ProbeDecision::classify(None, true), ProbeDecision::Present);
+        assert_eq!(
+            ProbeDecision::classify(None, false),
+            ProbeDecision::Fallback
+        );
+    }
+
+    #[test]
+    fn unc_distro_binding_rejects_cross_distro() {
+        let a = WslDistro::Named("Ubuntu".to_string());
+        let b = WslDistro::Named("Debian".to_string());
+        assert!(check_unc_distro_binding("C:\\x\\y", &a).is_ok());
+        assert!(check_unc_distro_binding("\\\\wsl$\\Ubuntu\\home\\you", &a).is_ok());
+        assert!(check_unc_distro_binding("\\\\wsl$\\Ubuntu\\home\\you", &b).is_err());
+        assert!(
+            check_unc_distro_binding("\\\\wsl$\\Ubuntu\\home\\you", &WslDistro::Default).is_err()
+        );
+        assert_eq!(
+            unc_distro_of_windows_path("\\\\wsl$\\Ubuntu\\home\\you").as_deref(),
+            Some("Ubuntu")
+        );
+        assert_eq!(unc_distro_of_windows_path("C:\\x"), None);
+    }
+
+    #[test]
+    fn wslenv_appends_without_secrets_and_preserves_existing() {
+        // Existing entries preserved (suffixes verbatim), forwarding appended,
+        // secrets stripped from both lists, `WSLENV` itself never listed.
+        let built = build_wslenv_for_forwarding(
+            Some("MYVAR/MYVAR2:p"),
+            &[
+                "HTTPS_PROXY".to_string(),
+                "no_proxy".to_string(),
+                "WSLENV".to_string(),
+                "GITHUB_TOKEN".to_string(),
+            ],
+        );
+        assert_eq!(built, "MYVAR/MYVAR2:p:HTTPS_PROXY:no_proxy");
+        // Existing secret entries are stripped even when the caller listed them.
+        let built =
+            build_wslenv_for_forwarding(Some("MYVAR:GITHUB_TOKEN"), &["HTTPS_PROXY".to_string()]);
+        assert_eq!(built, "MYVAR:HTTPS_PROXY");
+        // No existing list: forwarding alone, proxy present.
+        let built =
+            build_wslenv_for_forwarding(None, &["HTTPS_PROXY".to_string(), "LANG".to_string()]);
+        assert_eq!(built, "HTTPS_PROXY:LANG");
+        assert!(is_secret_wsl_env_name("GITHUB_TOKEN"));
+        assert!(is_secret_wsl_env_name("aws_secret_access_key"));
+        assert!(!is_secret_wsl_env_name("HTTPS_PROXY"));
+        assert!(!is_secret_wsl_env_name("WSLENV"));
+    }
+
+    #[test]
+    fn persisted_distro_round_trips_and_fails_closed() {
+        let dir = std::env::temp_dir().join(format!(
+            "bitty-wsl-distro-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        // Missing means native.
+        assert_eq!(read_persisted_wsl_distro(&dir).expect("missing"), None);
+        // Valid names round-trip (written as the CLI writes them).
+        for (contents, expected) in [
+            ("Ubuntu\n", WslDistro::Named("Ubuntu".to_string())),
+            ("default\n", WslDistro::Default),
+            ("  Debian  \r\n", WslDistro::Named("Debian".to_string())),
+        ] {
+            std::fs::write(persisted_distro_path(&dir), contents).expect("write");
+            assert_eq!(
+                read_persisted_wsl_distro(&dir).expect("valid"),
+                Some(expected),
+                "{contents:?}"
+            );
+        }
+        // Corrupt content fails closed (never silent native).
+        for bad in ["", "\n", "../evil", "Ubuntu/Debian", &"a".repeat(200)] {
+            std::fs::write(persisted_distro_path(&dir), bad).expect("write bad");
+            assert!(
+                read_persisted_wsl_distro(&dir).is_err(),
+                "corrupt {bad:?} must fail"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

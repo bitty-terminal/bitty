@@ -758,25 +758,32 @@ pub fn component_help_text() -> String {
      \x20 Windows component helpers that must run inside a WSL2 guest do so\n\
      \x20 through wsl.exe [--distribution D] --exec <helper> <fixed-argv>\n\
      \x20 (PATH-resolved wsl.exe, fixed argv, no shell on either side).\n\
-     \x20 Guest distro selection: explicit --distro wins, else BITTY_WSL_DISTRO\n\
-     \x20 config wins, else native execution (no trampoline); pass the literal\n\
-     \x20 `default` for the wsl.exe default distro (no --distribution flag).\n\
-     \x20 A selected distro with absent WSL fails closed before any fetch or\n\
-     \x20 staging (exit 1): install or enable WSL2, or run without --distro.\n\
-     \x20 Path mapping (Windows to guest for spawn): drive-absolute X:\\...\n\
-     \x20 maps to /mnt/<lower-x>/... and WSL UNC \\\\wsl$\\<distro>\\...\n\
-     \x20 maps to guest-absolute /...; device paths, drive-relative,\n\
-     \x20 relative, and other UNC spellings fail closed (exit 2, no silent\n\
-     \x20 mangling). Backslash rewriting happens only inside path mapping;\n\
-     \x20 general argv elements pass through discrete with spaces preserved\n\
-     \x20 and metacharacters inert. Reverse (/mnt/... to Windows) exists for\n\
-     \x20 diagnostics only; other guest paths have no Windows spelling.\n\
-     \x20 Stdio and signals: stdin/stdout/stderr pipes pass through wsl.exe\n\
-     \x20 unchanged (binary-safe, no CRLF translation); Ctrl-C propagates via\n\
-     \x20 wsl.exe to the guest helper; the wsl.exe exit status is the helper\n\
-     \x20 exit status (1:1 fidelity, no remapping). Fetch stays native\n\
-     \x20 (Windows curl.exe/tar.exe); the trampoline applies to component\n\
-     \x20 execution, never to downloads.\n\
+     \x20 `add`/`install` never execute the component here: they stage/fetch\n\
+     \x20 only and persist the resolved selection per-component to\n\
+     \x20 <user>/<name>/wsl_distro for later runs (omission preserves any\n\
+     \x20 previous placement). Guest distro selection: explicit --distro wins,\n\
+     \x20 else BITTY_WSL_DISTRO config wins, else native execution (no\n\
+     \x20 trampoline); pass the literal `default` for the wsl.exe default\n\
+     \x20 distro (no --distribution flag). A selected distro with absent WSL\n\
+     \x20 fails closed before any fetch or staging (exit 1): install WSL2 from\n\
+     \x20 the Store (inbox builds use --status fallback, unversioned) or run\n\
+     \x20 without --distro. Path mapping (Windows to guest for spawn):\n\
+     \x20 drive-absolute X:\\... maps to /mnt/<lower-x>/... and WSL UNC\n\
+     \x20 \\\\wsl$\\<distro>\\... maps to guest-absolute /...; UNC paths bind\n\
+     \x20 to their launch distro (cross-distro exec fails closed); device\n\
+     \x20 paths, drive-relative, relative, and other UNC spellings fail closed\n\
+     \x20 (exit 2, no silent mangling). Backslash rewriting happens only inside\n\
+     \x20 path mapping; general argv elements pass through discrete with spaces\n\
+     \x20 preserved and metacharacters inert. Reverse (/mnt/... to Windows)\n\
+     \x20 exists for diagnostics only; other guest paths have no Windows\n\
+     \x20 spelling. Guest env is WSLENV-gated (forwarded proxy/TLS/locale\n\
+     \x20 names only, secrets never, otherwise clean by design). Stdio and\n\
+     \x20 signals: stdin/stdout/stderr pipes pass through wsl.exe unchanged\n\
+     \x20 (binary-safe, no CRLF translation); Ctrl-C propagates via wsl.exe to\n\
+     \x20 the guest helper; the wsl.exe exit status is the helper exit status\n\
+     \x20 (1:1 fidelity, no remapping). Fetch stays native (Windows\n\
+     \x20 curl.exe/tar.exe); the trampoline applies to component execution,\n\
+     \x20 never to downloads.\n\
      \n\
      installer egress:\n\
      \x20 cdn.bitty.run:443 is the core-built-in installer egress: strict\n\
@@ -915,15 +922,15 @@ impl ComponentFailure {
 
 /// Validate WSL2 distro selection for `add`/`install` (fail-closed before mutation).
 ///
-/// Returns `Err(exit_code)` when the caller should exit early: invalid distro
-/// selection fails as usage (exit 2) on every platform; on Windows a selected
-/// distro with absent WSL fails as environmental (exit 1) with the actionable
-/// diagnostic. Unix never probes (no-op, `Ok(())` when the selection itself
-/// is valid, even when a distro is selected).
+/// Returns the resolved selection (`None` means native, no trampoline) for the
+/// caller to persist after successful staging; `Err(exit_code)` means exit
+/// early. Invalid selection fails as usage (exit 2) on every platform; on
+/// Windows a selected distro with absent WSL fails as environmental (exit 1).
+/// Unix never probes (no-op, native execution even when selected).
 fn check_wsl_for_store_verb(
     explicit_distro: Option<&str>,
     env_distro: Option<&str>,
-) -> Result<(), i32> {
+) -> Result<Option<bitty_runtime::component::WslDistro>, i32> {
     let selection = match bitty_runtime::component::select_wsl_distro(explicit_distro, env_distro) {
         Ok(selection) => selection,
         Err(error) => {
@@ -934,8 +941,7 @@ fn check_wsl_for_store_verb(
     // Unix: selection validated above, execution stays native (no probe).
     #[cfg(not(windows))]
     {
-        let _ = &selection;
-        Ok(())
+        Ok(selection)
     }
     // Windows: probe only when a distro was selected; native otherwise.
     #[cfg(windows)]
@@ -946,8 +952,34 @@ fn check_wsl_for_store_verb(
                 return Err(error.exit_code());
             }
         }
-        Ok(())
+        Ok(selection)
     }
+}
+
+/// Persist a resolved WSL distro selection for one installed component.
+///
+/// `add`/`install` are staging/fetch operations only (they never execute the
+/// component); this records the execution placement for later runs (broker
+/// reads `<user>/<name>/wsl_distro` when no explicit override is set).
+/// `None` preserves any previous placement (never deletes); `Some` overwrites
+/// atomically. Failures propagate as generic (exit 1) without rolling back
+/// the already-staged component.
+fn persist_wsl_selection(
+    user: &std::path::Path,
+    name: &str,
+    selection: Option<&bitty_runtime::component::WslDistro>,
+) -> Result<(), ComponentFailure> {
+    let Some(distro) = selection else {
+        return Ok(());
+    };
+    let content = match distro {
+        bitty_runtime::component::WslDistro::Default => "default\n".to_string(),
+        bitty_runtime::component::WslDistro::Named(distro) => format!("{distro}\n"),
+    };
+    let path = user
+        .join(name)
+        .join(bitty_runtime::component::WSL_DISTRO_FILE);
+    publish_bytes_atomic(&path, content.as_bytes(), None)
 }
 
 /// Run one `bitty component` invocation; returns the process exit code.
@@ -983,14 +1015,17 @@ pub fn run_component_subcommand(
     // when a distro is selected and fail closed when absent (exit 1, before
     // any fetch or staging). Unix never probes (no-op, native execution).
     // `list`/`remove` never consult the trampoline (read-only or user-tier
-    // only, no execution).
-    if matches!(request.verb, ComponentVerb::Add | ComponentVerb::Install) {
-        if let Err(exit) =
-            check_wsl_for_store_verb(request.distro.as_deref(), context.wsl_distro_env)
-        {
-            return exit;
-        }
-    }
+    // only, no execution). `add`/`install` never execute the component here;
+    // the resolved selection is persisted per-component for later runs.
+    let wsl_selection: Option<bitty_runtime::component::WslDistro> =
+        if matches!(request.verb, ComponentVerb::Add | ComponentVerb::Install) {
+            match check_wsl_for_store_verb(request.distro.as_deref(), context.wsl_distro_env) {
+                Ok(selection) => selection,
+                Err(exit) => return exit,
+            }
+        } else {
+            None
+        };
 
     match request.verb {
         ComponentVerb::List => {
@@ -1013,6 +1048,7 @@ pub fn run_component_subcommand(
                 request.version_flag.as_deref(),
                 user_root.as_deref(),
                 output,
+                wsl_selection.as_ref(),
             ) {
                 Ok(summary) => {
                     let _ = writeln!(output, "{summary}");
@@ -1037,6 +1073,7 @@ pub fn run_component_subcommand(
                 input,
                 request.yes,
                 &mut transport,
+                wsl_selection.as_ref(),
             ) {
                 Ok(summary) => {
                     let _ = writeln!(output, "{summary}");
@@ -1229,6 +1266,7 @@ fn op_add(
     version_flag: Option<&str>,
     user_root: Option<&Path>,
     _output: &mut dyn std::io::Write,
+    wsl_selection: Option<&bitty_runtime::component::WslDistro>,
 ) -> Result<String, ComponentFailure> {
     if is_url_operand(source) {
         return Err(ComponentFailure::component(format!(
@@ -1255,7 +1293,11 @@ fn op_add(
             core,
         )));
     }
-    install_staged(&staged, user)
+    let summary = install_staged(&staged, user)?;
+    // Persist execution placement for later runs (staging only; never executes
+    // here). `None` preserves any previous placement.
+    persist_wsl_selection(user, &staged.name, wsl_selection)?;
+    Ok(summary)
 }
 
 // ---------------------------------------------------------------------------
@@ -1366,9 +1408,9 @@ fn check_registry_digest(
     Ok(())
 }
 
-// Nine args: install needs name/version/digest/force/roots/stdio/consent/
-// transport together (all bounded, fail-closed before mutation). A params
-// struct would obscure the call-site audit, so allow the lint here.
+// Ten args: install needs name/version/digest/force/roots/stdio/consent/
+// transport/selection together (all bounded, fail-closed before mutation). A
+// params struct would obscure the call-site audit, so allow the lint here.
 #[allow(clippy::too_many_arguments)]
 fn op_install(
     name: &str,
@@ -1380,6 +1422,7 @@ fn op_install(
     input: &mut dyn std::io::BufRead,
     yes: bool,
     transport: &mut dyn crate::component_seed::SeedTransport,
+    wsl_selection: Option<&bitty_runtime::component::WslDistro>,
 ) -> Result<String, ComponentFailure> {
     // The parser requires `--version`; this is defense in depth.
     let Some(version) = version_flag else {
@@ -1538,6 +1581,9 @@ fn op_install(
     } else {
         String::new()
     };
+    // Persist execution placement for later runs (staging only; never executes
+    // here). `None` preserves any previous placement.
+    persist_wsl_selection(user, &staged.name, wsl_selection)?;
     // Handoff: the seed is done; name the installed executable so the
     // caller (or the user, for the manager itself) invokes the full
     // component directly from here.
@@ -2649,6 +2695,40 @@ mod tests {
     }
 
     #[test]
+    fn add_persists_distro_selection_for_later_runs() {
+        // `add --distro` stages (never executes) and records placement;
+        // omission preserves (never deletes).
+        let base = scratch("distro-persist");
+        let (context, _, _) = context_for(&base.join("user"), &base.join("system"));
+        let source = write_source_dir(&base.join("source"), "net", "0.0.1", "[1, 1]");
+        let (code, _) = run_with(
+            &context,
+            &["add", &source.display().to_string(), "--distro", "Ubuntu"],
+        );
+        assert_eq!(code, EXIT_OK);
+        let user_root = Path::new(context.components_dir.expect("user"));
+        assert_eq!(
+            std::fs::read_to_string(user_root.join("net").join("wsl_distro")).expect("distro file"),
+            "Ubuntu\n"
+        );
+        let persisted = bitty_runtime::component::read_persisted_wsl_distro(&user_root.join("net"))
+            .expect("read")
+            .expect("selected");
+        assert_eq!(
+            persisted,
+            bitty_runtime::component::WslDistro::Named("Ubuntu".to_string())
+        );
+        let source2 = write_source_dir(&base.join("source2"), "net", "0.0.1", "[1, 1]");
+        let (code, _) = run_with(&context, &["add", &source2.display().to_string()]);
+        assert_eq!(code, EXIT_OK);
+        assert_eq!(
+            std::fs::read_to_string(user_root.join("net").join("wsl_distro")).expect("preserved"),
+            "Ubuntu\n"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn rejects_unknown_verb_and_flags() {
         assert!(parse_component_request(&[String::from("frobnicate")], None).is_err());
         assert!(
@@ -2929,6 +3009,7 @@ mod tests {
             &mut input,
             true,
             &mut stub,
+            None,
         )
         .expect("seed install");
         assert!(
@@ -2969,6 +3050,7 @@ mod tests {
             &mut input,
             true,
             &mut stub,
+            None,
         )
         .expect("idempotent");
 
@@ -2987,6 +3069,7 @@ mod tests {
             &mut input,
             true,
             &mut stub,
+            None,
         )
         .expect_err("content swap must fail");
         assert_eq!(error.exit, EXIT_COMPONENT, "{}", error.message);
@@ -3022,6 +3105,7 @@ mod tests {
             &mut input,
             false,
             &mut stub,
+            None,
         )
         .expect_err("decline must fail");
         assert_eq!(error.exit, EXIT_GENERIC, "{}", error.message);
@@ -3057,6 +3141,7 @@ mod tests {
             &mut input,
             false,
             &mut stub,
+            None,
         )
         .expect_err("EOF must fail");
         assert_eq!(error.exit, EXIT_GENERIC, "{}", error.message);
@@ -3087,6 +3172,7 @@ mod tests {
             &mut input,
             false,
             &mut stub,
+            None,
         )
         .expect_err("invalid answers must fail");
         assert_eq!(error.exit, EXIT_GENERIC, "{}", error.message);
@@ -3117,6 +3203,7 @@ mod tests {
             &mut input,
             false,
             &mut stub,
+            None,
         )
         .expect("approval stages");
         assert!(summary.contains("installed component"), "{summary}");
@@ -3147,6 +3234,7 @@ mod tests {
             &mut input,
             true,
             &mut stub,
+            None,
         )
         .expect("--yes stages without prompting");
         assert!(summary.contains("installed component"), "{summary}");
@@ -3183,6 +3271,7 @@ mod tests {
             &mut input,
             true,
             &mut stub,
+            None,
         )
         .expect("matching --digest stages");
         assert!(summary.contains("installed component"), "{summary}");
@@ -3216,6 +3305,7 @@ mod tests {
             &mut input,
             true,
             &mut stub,
+            None,
         )
         .expect_err("expected mismatch must fail");
         // Both-must-match: integrity failure (exit 4), never a silent pick.
@@ -3263,6 +3353,7 @@ mod tests {
                 &mut input,
                 true,
                 &mut stub,
+                None,
             )
             .expect_err("malformed --digest must fail");
             assert_eq!(
@@ -3306,6 +3397,7 @@ mod tests {
             &mut input,
             true,
             &mut stub,
+            None,
         )
         .expect("first contact pins");
         let pin = std::fs::read_to_string(user.join("net").join(TARBALL_PIN_FILE)).expect("pin");
@@ -3325,6 +3417,7 @@ mod tests {
             &mut input,
             true,
             &mut stub,
+            None,
         )
         .expect("pin match is idempotent");
 
@@ -3363,6 +3456,7 @@ mod tests {
             &mut input,
             true,
             &mut stub,
+            None,
         )
         .expect_err("pin mismatch must fail");
         assert_eq!(error.exit, EXIT_COMPONENT, "{}", error.message);
@@ -3414,6 +3508,7 @@ mod tests {
             &mut input,
             true,
             &mut stub,
+            None,
         )
         .expect("--force re-pins");
         assert!(summary.contains("re-pinned"), "{summary}");
@@ -3456,6 +3551,7 @@ mod tests {
             &mut input,
             true,
             &mut stub,
+            None,
         )
         .expect("newer pins");
         // Downgrade to an older version with a differing tarball digest:
@@ -3480,6 +3576,7 @@ mod tests {
             &mut input,
             true,
             &mut older,
+            None,
         )
         .expect_err("downgrade with differing digest must fail");
         assert_eq!(error.exit, EXIT_COMPONENT, "{}", error.message);
@@ -3498,6 +3595,7 @@ mod tests {
             &mut input,
             true,
             &mut older,
+            None,
         )
         .expect("--force downgrade re-pins");
         let _ = std::fs::remove_dir_all(&base);
@@ -3581,6 +3679,7 @@ mod tests {
                 &mut input,
                 true,
                 &mut stub,
+                None,
             )
             .expect_err("corrupt pin must fail without --force");
             assert_eq!(error.exit, EXIT_COMPONENT, "{tag}: {}", error.message);
@@ -3608,6 +3707,7 @@ mod tests {
                 &mut input,
                 true,
                 &mut stub,
+                None,
             )
             .expect("corrupt pin must recover with --force");
             assert!(summary.contains("re-pinned"), "{tag}: {summary}");
@@ -3707,6 +3807,7 @@ mod tests {
             &mut input,
             false,
             &mut stub,
+            None,
         )
         .expect_err("overlong-then-EOF must fail");
         assert_eq!(error.exit, EXIT_GENERIC, "{}", error.message);
@@ -3755,8 +3856,14 @@ mod tests {
         std::fs::write(user.join("net"), "not-a-dir").expect("file");
         let source = write_source_dir(&base.join("source"), "net", "0.0.1", "[1, 1]");
         let mut out = Vec::new();
-        let error = op_add(&source.display().to_string(), None, Some(&user), &mut out)
-            .expect_err("non-directory component dir must fail");
+        let error = op_add(
+            &source.display().to_string(),
+            None,
+            Some(&user),
+            &mut out,
+            None,
+        )
+        .expect_err("non-directory component dir must fail");
         assert_eq!(error.exit, EXIT_GENERIC, "{}", error.message);
         assert!(
             error.message.contains("refusing symlink or non-directory"),
@@ -3779,8 +3886,14 @@ mod tests {
         std::os::unix::fs::symlink(&outside, user.join("net")).expect("symlink");
         let source = write_source_dir(&base.join("source"), "net", "0.0.1", "[1, 1]");
         let mut out = Vec::new();
-        let error = op_add(&source.display().to_string(), None, Some(&user), &mut out)
-            .expect_err("symlinked component dir must fail");
+        let error = op_add(
+            &source.display().to_string(),
+            None,
+            Some(&user),
+            &mut out,
+            None,
+        )
+        .expect_err("symlinked component dir must fail");
         assert_eq!(error.exit, EXIT_GENERIC, "{}", error.message);
         assert!(
             error.message.contains("refusing symlink"),
@@ -3808,8 +3921,14 @@ mod tests {
         std::os::unix::fs::symlink(&outside, user.join("net").join("0.0.1")).expect("symlink");
         let source = write_source_dir(&base.join("source"), "net", "0.0.1", "[1, 1]");
         let mut out = Vec::new();
-        let error = op_add(&source.display().to_string(), None, Some(&user), &mut out)
-            .expect_err("symlinked version dir must fail");
+        let error = op_add(
+            &source.display().to_string(),
+            None,
+            Some(&user),
+            &mut out,
+            None,
+        )
+        .expect_err("symlinked version dir must fail");
         assert_eq!(error.exit, EXIT_GENERIC, "{}", error.message);
         assert!(
             error.message.contains("refusing symlink"),
@@ -3842,8 +3961,14 @@ mod tests {
         .expect("symlink");
         let source = write_source_dir(&base.join("source"), "net", "0.0.1", "[1, 1]");
         let mut out = Vec::new();
-        let error = op_add(&source.display().to_string(), None, Some(&user), &mut out)
-            .expect_err("symlinked executable path must fail");
+        let error = op_add(
+            &source.display().to_string(),
+            None,
+            Some(&user),
+            &mut out,
+            None,
+        )
+        .expect_err("symlinked executable path must fail");
         assert_eq!(error.exit, EXIT_GENERIC, "{}", error.message);
         assert!(
             error.message.contains("refusing symlink install path"),

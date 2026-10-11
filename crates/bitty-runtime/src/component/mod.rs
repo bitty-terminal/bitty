@@ -105,10 +105,13 @@ pub use inventory::{
 pub use policy::{CrashTracker, DeadlineStrikes, SpawnGate};
 pub use stderr::{StderrRing, stderr_log_tail};
 pub use wsl::{
-    WSL_DISTRO_ENV, WSL_DISTRO_MAX_BYTES, WSL_EXE, WSL_PATH_MAX_BYTES, WSL_PROBE_TIMEOUT,
-    WSL_VERSION_OUTPUT_MAX_BYTES, WslDistro, WslError, detect_wsl_context, guest_mnt_to_windows,
-    map_store_paths_for_guest, select_wsl_distro, valid_wsl_distro, windows_path_to_guest,
-    wsl_argv, wsl_argv_with_cwd, wsl_trampoline_active,
+    WSL_DISTRO_ENV, WSL_DISTRO_FILE, WSL_DISTRO_FILE_MAX_BYTES, WSL_DISTRO_MAX_BYTES, WSL_EXE,
+    WSL_PATH_MAX_BYTES, WSL_PROBE_TIMEOUT, WSL_VERSION_OUTPUT_MAX_BYTES, WslDistro, WslError,
+    absent_diagnostic, build_wslenv_for_forwarding, check_unc_distro_binding, decode_probe_output,
+    detect_wsl_context, guest_mnt_to_windows, is_secret_wsl_env_name, map_store_paths_for_guest,
+    persisted_distro_path, read_persisted_wsl_distro, select_wsl_distro,
+    unc_distro_of_windows_path, valid_wsl_distro, windows_path_to_guest, wsl_argv,
+    wsl_argv_with_cwd, wsl_trampoline_active,
 };
 
 /// Wire codec re-exports the broker API is expressed in.
@@ -185,10 +188,13 @@ pub const COMPONENT_ENV_ALLOWLIST: [&str; 10] = [
     "LC_ALL",
 ];
 
-/// Additional environment variables forwarded on Windows only (DIR-030 D1):
-/// Winsock initialization needs `SystemRoot`. `windir` is not forwarded,
-/// and `PATH` still never is. On other platforms this list is not consulted.
-pub const COMPONENT_ENV_WINDOWS_ALLOWLIST: [&str; 1] = ["SystemRoot"];
+/// Additional environment variables forwarded on Windows only (DIR-030 D1 plus
+/// #1908): Winsock initialization needs `SystemRoot`, and the WSL trampoline
+/// preserves the caller's existing `WSLENV` entries (appended to, never
+/// overwritten; secret-shaped entries stripped in `wsl.rs`). `windir` is not
+/// forwarded, and `PATH` still never is. On other platforms this list is not
+/// consulted.
+pub const COMPONENT_ENV_WINDOWS_ALLOWLIST: [&str; 2] = ["SystemRoot", "WSLENV"];
 
 /// Bounded stderr ring per component (64 KiB, newest bytes kept).
 pub const COMPONENT_STDERR_MAX_BYTES: usize = 64 * 1024;

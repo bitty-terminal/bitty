@@ -1,13 +1,13 @@
 //! WSL2 trampoline gated integration (issue #1908).
 //!
-//! Windows CI-runnable: proves the live `wsl.exe --version` probe and the
-//! fixed-argv trampoline wiring without ever failing the suite on runners
-//! without WSL (skip with notice when WSL is absent). Unix legs prove the
-//! no-op contract (native execution, zero spawn).
+//! Windows CI-runnable: proves the live probe (with `--status` fallback for
+//! inbox builds) and the fixed-argv trampoline wiring without ever failing the
+//! suite on runners without WSL (skip with notice when WSL is absent). Unix
+//! legs prove the no-op contract (native execution, zero spawn).
 
 use bitty_runtime::component::{
-    WslDistro, detect_wsl_context, select_wsl_distro, windows_path_to_guest, wsl_argv,
-    wsl_trampoline_active,
+    WslDistro, build_wslenv_for_forwarding, check_unc_distro_binding, decode_probe_output,
+    detect_wsl_context, select_wsl_distro, windows_path_to_guest, wsl_argv, wsl_trampoline_active,
 };
 
 #[test]
@@ -25,13 +25,14 @@ fn wsl_trampoline_gated_live_probe() {
     #[cfg(windows)]
     {
         // Windows: fail-closed when WSL is absent on the runner — skip with
-        // notice instead of failing the suite. Only when WSL is present do we
-        // assert the live probe plus the mapped argv wiring.
+        // notice instead of failing the suite. When present (Store `--version`
+        // or inbox `--status` fallback, unversioned) assert the mapped argv
+        // wiring plus the UNC binding.
         match detect_wsl_context() {
             Ok(Some(version)) => {
                 assert!(
                     !version.trim().is_empty(),
-                    "version probe must name a version"
+                    "probe must name a version or unversioned presence"
                 );
                 let selection = select_wsl_distro(Some("Ubuntu"), None)
                     .expect("valid distro")
@@ -100,4 +101,25 @@ fn wsl_distro_selection_is_pure_on_every_platform() {
     assert!(argv.contains(&"--exec".to_string()));
     assert!(argv.contains(&guest));
     assert!(argv.contains(&"a b".to_string()));
+    // Probe decoding, UNC binding, and WSLENV construction run everywhere
+    // (pure, no spawn): inbox UTF-16LE never surfaces as NULs, cross-distro
+    // exec fails closed, and secrets never enter WSLENV.
+    assert_eq!(decode_probe_output(b"WSL 2\n"), "WSL 2\n");
+    assert!(check_unc_distro_binding("\\\\wsl$\\Ubuntu\\home\\you", &selection).is_ok());
+    assert!(
+        check_unc_distro_binding(
+            "\\\\wsl$\\Ubuntu\\home\\you",
+            &WslDistro::Named("Debian".to_string())
+        )
+        .is_err()
+    );
+    let wslenv = build_wslenv_for_forwarding(
+        Some("MYVAR"),
+        &[
+            "HTTPS_PROXY".to_string(),
+            "GITHUB_TOKEN".to_string(),
+            "WSLENV".to_string(),
+        ],
+    );
+    assert_eq!(wslenv, "MYVAR:HTTPS_PROXY");
 }

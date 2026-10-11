@@ -141,6 +141,7 @@ mod tests {
     fn windows_host() -> BTreeMap<&'static str, &'static str> {
         [
             ("SystemRoot", "fixture-system-root"),
+            ("WSLENV", "MYVAR"),
             ("windir", "fixture-windir"),
             ("PATH", "fixture-path"),
             ("LANG", "C.UTF-8"),
@@ -151,11 +152,11 @@ mod tests {
 
     #[test]
     fn system_root_is_forwarded_only_for_windows() {
-        assert_eq!(COMPONENT_ENV_WINDOWS_ALLOWLIST, ["SystemRoot"]);
+        assert_eq!(COMPONENT_ENV_WINDOWS_ALLOWLIST, ["SystemRoot", "WSLENV"]);
         let host = windows_host();
         let windows = ComponentEnv::capture_for(true, |name| host.get(name).map(OsString::from));
         let names: Vec<&OsStr> = windows.vars().map(|(name, _)| name).collect();
-        assert_eq!(names, ["LANG", "SystemRoot"]);
+        assert_eq!(names, ["LANG", "SystemRoot", "WSLENV"]);
         let other = ComponentEnv::capture_for(false, |name| host.get(name).map(OsString::from));
         let names: Vec<&OsStr> = other.vars().map(|(name, _)| name).collect();
         assert_eq!(names, ["LANG"]);
@@ -173,6 +174,7 @@ mod tests {
         let forwarded = env.vars().any(|(name, _)| name == "SystemRoot");
         assert_eq!(forwarded, cfg!(windows));
         assert_eq!(is_allowlisted_env("SystemRoot"), cfg!(windows));
+        assert_eq!(is_allowlisted_env("WSLENV"), cfg!(windows));
         assert!(!is_allowlisted_env("windir"));
     }
 }

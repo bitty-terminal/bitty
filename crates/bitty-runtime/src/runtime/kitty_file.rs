@@ -30,10 +30,14 @@
 //!    symlink final components (`ELOOP`); `O_NONBLOCK` keeps FIFO opens
 //!    from parking the render thread until a writer arrives (the fstat next
 //!    refuses the FIFO anyway).
-//! 6. Linux only, `t=t`: re-derive the open file's canonical target from
+//! 6. Linux only, `t=t`: re-derive the open file's fd-target *name* from
 //!    `/proc/self/fd` and re-check containment *and* the temp marker, closing
-//!    the canonicalize-then-open rename race (a same-user rename swapping in
-//!    a marker-less temp file post-open is refused here fail-closed).
+//!    the fd-target-name variant of the canonicalize-then-open rename race
+//!    (a same-user rename leaving the fd at a marker-less target name is
+//!    refused here fail-closed). Residual: a same-user rename placing a
+//!    marker-less inode at a marker pathname before open still yields a
+//!    marker-bearing fd-target name and is admitted; bytes stay capped and
+//!    quota-charged.
 //! 7. `fstat` on the fd (never `stat` by path): non-regular files
 //!    (directories, FIFOs, sockets, devices) are refused.
 //! 8. `fstat` size precheck against the read cap: oversize files are refused
@@ -413,12 +417,12 @@ fn check_temp_containment(path: &Path) -> Result<(), KittyLocalReadError> {
     }
 }
 
-/// Linux-only re-containment on the open fd: re-derives the canonical target
+/// Linux-only re-containment on the open fd: re-derives the fd-target *name*
 /// from `/proc/self/fd` and re-checks the temp-dir roots *and* the temp
-/// marker (same shape check as the entry pre-check), closing the
-/// canonicalize-then-open rename race where a same-user rename swaps in a
-/// marker-less temp file post-open. Refuses fail-closed when the target
-/// cannot be derived or the marker is absent.
+/// marker (same name-substring shape check as the entry pre-check), closing
+/// only the fd-target-name variant of the canonicalize-then-open rename race;
+/// a path-substring check cannot bind marker to inode identity. Refuses
+/// fail-closed when the target cannot be derived or the marker is absent.
 #[cfg(target_os = "linux")]
 fn check_fd_containment(file: &std::fs::File) -> Result<(), KittyLocalReadError> {
     use std::os::fd::{AsFd, AsRawFd};

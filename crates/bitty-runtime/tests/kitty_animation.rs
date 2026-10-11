@@ -50,6 +50,11 @@ fn blue_2x2_b64() -> &'static str {
     "AAD//wAA//8AAP//AAD//w=="
 }
 
+/// 2x2 striped RGBA payload (`f=32`): row 0 red, row 1 blue.
+fn striped_2x2_b64() -> &'static str {
+    "/wAA//8AAP8AAP//AAD//w=="
+}
+
 /// 2x2 opaque blue RGBA frame bytes (`f=32`).
 fn blue_2x2() -> Vec<u8> {
     [0x00, 0x00, 0xFF, 0xFF].repeat(4)
@@ -260,6 +265,37 @@ fn compose_replace_changes_painted_pixels() {
     rt.tick_at(t0);
     let after = rt.headless_rgba().expect("frame must exist");
     assert_ne!(before, after, "composed frame must repaint");
+}
+
+#[test]
+fn compose_src_y_selects_source_row_on_wire() {
+    // Striped frame 2 (row 0 red, row 1 blue): the same 1x1 `C=1` compose
+    // onto (0, 0) must paint different pixels for `Y=0` versus `Y=1`.
+    // Uniform fixtures pass vacuously here, so this pin uses distinct
+    // rows to lock the live `Y=` source offset.
+    fn painted_after_src_y(src_y: u32) -> Vec<u8> {
+        let mut rt = make_runtime();
+        display_root(&mut rt);
+        let seq = apc(&format!("Gf=32,s=2,v=2,a=f,i=1,m=0;{}", striped_2x2_b64()));
+        rt.handle_pty_bytes(&seq);
+        assert_eq!(rt.kitty_anim_frame_count(1), 2);
+        // Frozen virtual clock (see above): both presents share one
+        // instant, so the repaint comes from the compose itself.
+        let t0 = Instant::now();
+        rt.tick_at(t0);
+        rt.handle_pty_bytes(&apc(&format!(
+            "Ga=c,i=1,r=2,c=1,X=0,Y={src_y},x=0,y=0,w=1,h=1,C=1,m=0;"
+        )));
+        rt.tick_at(t0);
+        rt.headless_rgba().expect("frame must exist")
+    }
+
+    let with_y0 = painted_after_src_y(0);
+    let with_y1 = painted_after_src_y(1);
+    assert_ne!(
+        with_y0, with_y1,
+        "wire Y offset must select distinct source rows"
+    );
 }
 
 #[test]

@@ -25,6 +25,13 @@ fn blue_2x2() -> Vec<u8> {
     [0x00, 0x00, 0xFF, 0xFF].repeat(4)
 }
 
+/// 2x2 striped source: row 0 red, row 1 blue (16 bytes).
+fn striped_2x2() -> Vec<u8> {
+    let mut bytes = [0xFF, 0x00, 0x00, 0xFF].repeat(2);
+    bytes.extend_from_slice(&[0x00, 0x00, 0xFF, 0xFF].repeat(2));
+    bytes
+}
+
 /// Stores a 2x2 root image tagged with wire id 7 on the primary origin.
 fn stored_root(layer: &mut KittyImageLayer) -> bitty_rich::KittyImageId {
     layer
@@ -351,6 +358,42 @@ fn compose_copies_between_independent_source_and_dest_offsets() {
     // Frame 2 (source) is unchanged.
     let (_, _, second) = layer.frame_bytes(id, 2).expect("frame 2");
     assert_eq!(second, blue_2x2().as_slice());
+}
+
+#[test]
+fn compose_src_y_selects_source_row() {
+    // Striped source (row 0 red, row 1 blue): a 1x1 REPLACE from
+    // (0, src_y) onto (0, 0) must pick the addressed source row, so the
+    // two results differ. Uniform fixtures pass vacuously here, which is
+    // why this pin uses distinct rows.
+    fn composed_with_src_y(src_y: u32) -> Vec<u8> {
+        let mut layer = KittyImageLayer::new();
+        let id = stored_root(&mut layer);
+        layer
+            .append_frame(id, 2, 2, striped_2x2())
+            .expect("striped frame 2 must store");
+        layer
+            .compose_frame(id, 1, 2, 0, src_y, 0, 0, 1, 1, KITTY_COMPOSE_REPLACE)
+            .expect("in-bounds replace must compose");
+        layer.frame_bytes(id, 1).expect("frame 1").2.to_vec()
+    }
+
+    let with_y0 = composed_with_src_y(0);
+    let with_y1 = composed_with_src_y(1);
+    assert_eq!(
+        &with_y0[0..4],
+        &[0xFF, 0x00, 0x00, 0xFF],
+        "src_y=0 must select the red row"
+    );
+    assert_eq!(
+        &with_y1[0..4],
+        &[0x00, 0x00, 0xFF, 0xFF],
+        "src_y=1 must select the blue row"
+    );
+    assert_ne!(
+        with_y0, with_y1,
+        "Y source offset must change the composed bytes"
+    );
 }
 
 #[test]

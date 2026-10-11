@@ -53,6 +53,16 @@ impl PaneSession {
     }
 }
 
+/// Effective rule dim at spawn (CTX-1105): an explicit zero or oversize
+/// axis fails closed per-axis, falling back to the slot dim, instead of
+/// clamping `Some(0)` to 1 transiently. Mirrors the
+/// `stamp_rule_fixed_size` zero-reject convention (which stamps nothing
+/// for an explicit zero axis); the sync paths self-heal either way, so
+/// there is no behavior change for valid dims.
+fn spawn_rule_dim(dim: Option<u16>) -> Option<u16> {
+    dim.filter(|&v| v != 0 && v <= bitty_ui::view::MAX_FIXED_SIZE_DIM)
+}
+
 impl Runtime {
     /// Spawns `program` inside a PTY sized to the current grid, storing the
     /// child handle. The program is taken as a direct argv[0] without shell
@@ -116,11 +126,11 @@ impl Runtime {
         let mut cols = self.cols.min(u16::MAX as usize) as u16;
         let mut rows = self.rows.min(u16::MAX as usize) as u16;
         if let Some(rule) = matched_rule.as_ref() {
-            if let Some(w) = rule.width {
-                cols = w.max(1);
+            if let Some(w) = spawn_rule_dim(rule.width) {
+                cols = w;
             }
-            if let Some(h) = rule.height {
-                rows = h.max(1);
+            if let Some(h) = spawn_rule_dim(rule.height) {
+                rows = h;
             }
         }
         let mut builder = PtyBuilder::new(program).size(cols, rows);
@@ -229,8 +239,8 @@ impl Runtime {
                     }
                 }
                 if rule.width.is_some() || rule.height.is_some() {
-                    let w = rule.width.unwrap_or(cols).max(1) as usize;
-                    let h = rule.height.unwrap_or(rows).max(1) as usize;
+                    let w = spawn_rule_dim(rule.width).unwrap_or(cols) as usize;
+                    let h = spawn_rule_dim(rule.height).unwrap_or(rows) as usize;
                     if let Some(leaf) = self.layout.find_leaf_mut(owner) {
                         leaf.resize(w, h);
                     }
@@ -449,11 +459,11 @@ impl Runtime {
         let mut cols = cols.max(1);
         let mut rows = rows.max(1);
         if let Some(rule) = matched_rule.as_ref() {
-            if let Some(w) = rule.width {
-                cols = w.max(1);
+            if let Some(w) = spawn_rule_dim(rule.width) {
+                cols = w;
             }
-            if let Some(h) = rule.height {
-                rows = h.max(1);
+            if let Some(h) = spawn_rule_dim(rule.height) {
+                rows = h;
             }
         }
         let mut builder = PtyBuilder::new(program).size(cols, rows);
@@ -602,16 +612,16 @@ impl Runtime {
                     }
                 }
                 if rule.width.is_some() || rule.height.is_some() {
-                    let w = rule.width.unwrap_or(cols).max(1) as usize;
-                    let h = rule.height.unwrap_or(rows).max(1) as usize;
+                    let w = spawn_rule_dim(rule.width).unwrap_or(cols) as usize;
+                    let h = spawn_rule_dim(rule.height).unwrap_or(rows) as usize;
                     if let Some(leaf) = self.layout.find_leaf_mut(view) {
                         leaf.resize(w, h);
                     }
                     self.stamp_rule_fixed_size(view, rule, cols, rows);
                 }
             } else if rule.width.is_some() || rule.height.is_some() {
-                let w = rule.width.unwrap_or(cols).max(1) as usize;
-                let h = rule.height.unwrap_or(rows).max(1) as usize;
+                let w = spawn_rule_dim(rule.width).unwrap_or(cols) as usize;
+                let h = spawn_rule_dim(rule.height).unwrap_or(rows) as usize;
                 if let Some(leaf) = self.layout.find_leaf_mut(view) {
                     leaf.resize(w, h);
                 }

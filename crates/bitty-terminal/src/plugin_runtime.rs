@@ -284,9 +284,11 @@ impl LivePinState {
 /// and enqueues the intent into the runtime-shared [`PanelPinQueue`]; the
 /// application drains it each tick through the same `pin_floating` /
 /// `unpin_floating` runtime path the `toggle_pinned` keymap action uses.
-/// `true` covers a queued transition plus an idempotent no-op; `false` is
-/// the fail-closed answer for an unknown target or a full queue, with state
-/// untouched. The closure captures only shared handles, never the live
+/// Only truly unknown targets (neither pinned nor a live leaf) fail closed
+/// with `false` and touch nothing; redundant intents for known targets
+/// queue normally because the snapshot is last-tick state and the drain
+/// treats redundancies as no-ops against live state. A full queue also
+/// returns `false`. The closure captures only shared handles, never the live
 /// runtime, so it stays `'static`-compatible while `TerminalApp` keeps sole
 /// `Runtime` ownership (DEC-0107).
 pub(crate) fn startup_pin_backend(
@@ -295,20 +297,12 @@ pub(crate) fn startup_pin_backend(
 ) -> PanelPinHandler {
     Rc::new(move |panel_id, pinned| {
         let id = ViewId::new(panel_id);
-        if pinned {
-            if state.is_pinned(id) {
-                return Ok(true);
-            }
-            if !state.is_live_leaf(id) {
-                return Ok(false);
-            }
-        } else if !state.is_pinned(id) {
-            // Unpin of a live leaf holds without queueing; an unknown
-            // target fails closed without touching the queue.
-            if !state.is_live_leaf(id) {
-                return Ok(false);
-            }
-            return Ok(true);
+        // Reject only truly unknown targets. A same-tick second intent
+        // (pin then unpin, or a repeat) must not be shadowed by snapshot
+        // staleness: the drain revalidates each intent against live state,
+        // so redundancies land as no-ops in FIFO order there.
+        if !state.is_pinned(id) && !state.is_live_leaf(id) {
+            return Ok(false);
         }
         let accepted = queue
             .borrow_mut()
@@ -798,6 +792,49 @@ bitty.commands.register({ id = "pin_unknown", title = "Pin unknown", run = funct
             dispatch_pin(&mut app, "xuepoo.prodpin", "unpin"),
             "OK:true",
             "unpin of a live leaf holds"
+        );
+    }
+
+    #[test]
+    fn startup_pin_backend_queues_same_tick_reversal_and_rejects_unknown() {
+        // CodeRabbit 1928: the snapshot is last-tick state, so a same-tick
+        // second intent must queue rather than be shadowed by staleness;
+        // only truly unknown targets fail closed with nothing queued.
+        let mut app = pin_test_app("reversal", "xuepoo.prodpinrev", &["panel.focus"]);
+        assert_eq!(
+            dispatch_pin(&mut app, "xuepoo.prodpinrev", "pin"),
+            "OK:true",
+            "pin queues"
+        );
+        assert_eq!(
+            dispatch_pin(&mut app, "xuepoo.prodpinrev", "unpin"),
+            "OK:true",
+            "same-tick unpin queues instead of holding on stale state"
+        );
+        assert_eq!(
+            dispatch_pin(&mut app, "xuepoo.prodpinrev", "pin_unknown"),
+            "OK:false",
+            "unknown id fails closed"
+        );
+        assert_eq!(
+            app.plugin_runtime
+                .as_ref()
+                .expect("plugin runtime")
+                .panel_pin_queue()
+                .borrow()
+                .len(),
+            2,
+            "the unknown intent queues nothing"
+        );
+        drain_pin_tick(&mut app);
+        assert!(
+            app.runtime.pinned_views().is_empty(),
+            "pin-then-unpin in one tick ends unpinned"
+        );
+        assert_eq!(
+            app.runtime.layout().leaf_ids(),
+            vec![ViewId::new(1), ViewId::new(2)],
+            "the transient pin leaves no layout trace"
         );
     }
 

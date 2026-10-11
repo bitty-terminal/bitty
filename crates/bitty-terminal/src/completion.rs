@@ -97,7 +97,9 @@ const COMPLETION_FLAGS: &str = "--help --version --verbose --log-level --headles
     --safe --fail-loud --mascot --no-splash --split --split-ratio --stack --overlay \
     --layout --focus --config --profile --theme --font-family --font-size --opacity \
     --format --socket --instance --no-color --yes --force --scrollback --close-confirm \
-    --gaps-in --gaps-out --border --radius";
+    --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components \
+    --no-with-components --no-components --without-components --print-shell-init \
+    --no-print-shell-init --no-shell-init";
 
 // ---------------------------------------------------------------------------
 // Static scripts (core tree; plugin subtrees are a follow-up)
@@ -109,7 +111,7 @@ const BASH_SCRIPT: &str = r#"# bitty completion for Bash (static v1 core tree; g
 _bitty_complete() {
     local cur cmds flags
     cmds="run ctl config cfg plugin component list ls inspect dev doctor cmd x completion comp version init shell-init help"
-    flags="--help --version --verbose --log-level --headless --test-mode --safe --fail-loud --mascot --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius"
+    flags="--help --version --verbose --log-level --headless --test-mode --safe --fail-loud --mascot --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init"
     cur="${COMP_WORDS[COMP_CWORD]}"
     if [[ "$cur" == -* ]]; then
         COMPREPLY=($(compgen -W "$flags" -- "$cur"))
@@ -127,7 +129,7 @@ const ZSH_SCRIPT: &str = r#"#compdef bitty
 _bitty() {
     local -a cmds flags
     cmds=(run ctl config cfg plugin component list ls inspect dev doctor cmd x completion comp version init shell-init help)
-    flags=(--help --version --verbose --log-level --headless --test-mode --safe --fail-loud --mascot --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius)
+    flags=(--help --version --verbose --log-level --headless --test-mode --safe --fail-loud --mascot --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init)
     _arguments -C '1: :->cmd' '*: :->args'
     case "$state" in
         cmd) _describe 'bitty command' cmds ;;
@@ -142,7 +144,7 @@ const FISH_SCRIPT: &str = r#"# bitty completion for Fish (static v1 core tree; g
 for cmd in run ctl config cfg plugin component list ls inspect dev doctor cmd x completion comp version init shell-init help
     complete -c bitty -f -n __fish_use_subcommand -a $cmd
 end
-for flag in --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --mascot --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius
+for flag in --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --mascot --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
     complete -c bitty -f -l (string replace -- '--' '' $flag)
 end
 "#;
@@ -153,7 +155,7 @@ const POWERSHELL_SCRIPT: &str = r#"# bitty completion for PowerShell (static v1 
 Register-ArgumentCompleter -Native -CommandName @('bitty') -ScriptBlock {
     param($wordToComplete, $commandAst, $cursorPosition)
     $cmds = @('run','ctl','config','cfg','plugin','component','list','ls','inspect','dev','doctor','cmd','x','completion','comp','version','init','shell-init','help')
-    $flags = @('--help','--version','--verbose','--log-level','--headless','--test-mode','--safe','--fail-loud','--mascot','--no-splash','--split','--split-ratio','--stack','--overlay','--layout','--focus','--config','--profile','--theme','--font-family','--font-size','--opacity','--format','--socket','--instance','--no-color','--yes','--force','--scrollback','--close-confirm','--gaps-in','--gaps-out','--border','--radius')
+    $flags = @('--help','--version','--verbose','--log-level','--headless','--test-mode','--safe','--fail-loud','--mascot','--no-splash','--split','--split-ratio','--stack','--overlay','--layout','--focus','--config','--profile','--theme','--font-family','--font-size','--opacity','--format','--socket','--instance','--no-color','--yes','--force','--scrollback','--close-confirm','--gaps-in','--gaps-out','--border','--radius','--plugins','--no-plugins','--with-components','--no-with-components','--no-components','--without-components','--print-shell-init','--no-print-shell-init','--no-shell-init')
     $pool = if ($wordToComplete.StartsWith('-')) { $flags } else { $cmds }
     $pool | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
         [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)
@@ -168,7 +170,7 @@ def "nu-complete bitty commands" [] {
     [run ctl config cfg plugin component list ls inspect dev doctor cmd x completion comp version init shell-init help]
 }
 def "nu-complete bitty flags" [] {
-    [--help --version --verbose --log-level --headless --test-mode --safe --fail-loud --mascot --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius]
+    [--help --version --verbose --log-level --headless --test-mode --safe --fail-loud --mascot --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init]
 }
 extern "bitty" [
     command?: string@"nu-complete bitty commands",

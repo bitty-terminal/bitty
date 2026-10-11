@@ -593,6 +593,359 @@ fn control_terminal_send_and_text_headless() {
     assert_eq!(missing.code, "NotFound");
 }
 
+// ── CTX-1116: `terminal send` CR delivery proofs ─────────────────────────
+//
+// Headed side finding: `send` text with a trailing CR accumulated as pending
+// fish input while the send reported success and fish never executed. These
+// probes pin the headless contract stage by stage: CLI parsing keeps the CR
+// byte, the IPC params round-trip keeps it, and a live shell executes on it.
+
+#[test]
+fn ctx1116_terminal_send_parse_keeps_cr_byte() {
+    // The CR byte arrives inside one argv element (e.g. bash `$'..\r'`);
+    // `terminal send` joins tail args with spaces but must not strip it.
+    let (req, _) =
+        parse_ctl_request(&words(&["terminal", "send", "t:1", "echo hi\r"])).expect("must parse");
+    assert_eq!(
+        req,
+        CtlRequest::TerminalSend {
+            terminal_id: String::from("t:1"),
+            text: String::from("echo hi\r"),
+        }
+    );
+    assert!(
+        matches!(req, CtlRequest::TerminalSend { ref text, .. } if text.as_bytes().last() == Some(&b'\r')),
+        "trailing byte must be CR (0x0D), got {req:?}"
+    );
+}
+
+#[test]
+fn ctx1116_send_params_round_trip_keeps_cr_and_lf() {
+    // Full in-process chain without a live writer: params builder, control
+    // envelope, params parser, pending-input buffer. Every stage must carry
+    // CR (0x0D) and LF (0x0A) through byte-exact: no IPC escaping loss, no
+    // CR-vs-LF translation, no bracketed-paste framing.
+    let mut rt = headless_runtime();
+    let cli = bitty_ipc::ScopeSet::cli_default();
+    let params = ipc_ctl::params_send_input("t:1", "A\rB\nC\tx");
+    let sent = apply_control_envelope(&mut rt, ipc_ctl::METHOD_SEND_INPUT, Some(&params), &cli);
+    assert!(sent.ok, "send must succeed: {sent:?}");
+    assert_eq!(
+        rt.pending_input(),
+        b"A\rB\nC\tx",
+        "pending bytes must be byte-exact (CR kept, LF kept, no framing)"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn ctx1116_send_cr_executes_on_live_shell() {
+    // Live proof through the identical code path the headed campaign used:
+    // an interactive shell must EXECUTE a CR-terminated line sent via the
+    // control envelope, while the same text without a terminator stays
+    // pending (the headed symptom shape). Output lines are matched
+    // line-exact: `echo MARKER` prints the bare marker on its own row,
+    // while echoed-but-unexecuted input always carries the `echo ` prefix
+    // (plus prompt), so the two states are distinguishable in grid text.
+    use std::time::{Duration, Instant};
+    bitty_test_support::require_pty!();
+    let mut rt = headless_runtime();
+    rt.spawn_shell_with_args("/bin/sh", &[])
+        .expect("primary shell must attach headless");
+    let cli = bitty_ipc::ScopeSet::cli_default();
+    let output_line = |rt: &bitty_runtime::Runtime, marker: &str| {
+        snapshot_text(&rt.snapshot())
+            .lines()
+            .any(|line| line.trim() == marker)
+    };
+    let wait_for_output = |rt: &mut bitty_runtime::Runtime, marker: &str, secs: u64| {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while Instant::now() < deadline {
+            let _ = rt.poll_pty();
+            rt.tick();
+            if output_line(rt, marker) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    };
+    // Control first: unterminated text is echoed by the line discipline but
+    // never executed, so the bare marker never appears as its own output.
+    let pending = ipc_ctl::params_send_input("t:1", "echo CTX1116-NOT-EXECUTED-7f3a");
+    let sent = apply_control_envelope(&mut rt, ipc_ctl::METHOD_SEND_INPUT, Some(&pending), &cli);
+    assert!(sent.ok, "unterminated send must succeed: {sent:?}");
+    assert!(
+        !wait_for_output(&mut rt, "CTX1116-NOT-EXECUTED-7f3a", 2),
+        "unterminated text must stay pending, never execute"
+    );
+    // CR-terminated line must execute. The leading CR first submits the
+    // stale control line (pending-input hygiene, same as pressing Enter on
+    // a half-typed prompt); the trailing CR executes the marker command.
+    let exec = ipc_ctl::params_send_input("t:1", "\r echo CTX1116-CR-EXECUTED-7f3a\r");
+    let sent = apply_control_envelope(&mut rt, ipc_ctl::METHOD_SEND_INPUT, Some(&exec), &cli);
+    assert!(sent.ok, "CR-terminated send must succeed: {sent:?}");
+    assert!(
+        wait_for_output(&mut rt, "CTX1116-CR-EXECUTED-7f3a", 10),
+        "CR-terminated send must execute on the live shell"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn ctx1116_send_cr_submit_over_socket_executes() {
+    // Definitive headed-shape probe: the EXACT headed stack (framed Unix
+    // socket -> serve_bound_connection -> cross-thread queue ->
+    // main-thread drain -> live PTY shell), with the text send and the
+    // bare-CR submit as SEPARATE round-trips, exactly like the headed
+    // driver (14 sends, zero executions on build 231348d2).
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    use std::time::{Duration, Instant};
+    bitty_test_support::require_pty!();
+    let _wm_guard = hold_wm_lock();
+    let _wake_guard = ControlWakeGuard::take();
+    let mut rt = headless_runtime();
+    rt.spawn_shell_with_args("/bin/sh", &[])
+        .expect("primary shell must attach headless");
+
+    let dispatcher = bitty_ipc::devtools::Dispatcher::with_defaults();
+    let server_info = bitty_ipc::devtools::ServerInfo::new(
+        "ctx1116-proof".to_string(),
+        "/tmp/bitty-ctx1116-proof.sock".to_string(),
+        80,
+        24,
+    );
+    let mut context = bitty_ipc::devtools::ServeContext::with_granted(
+        &server_info,
+        bitty_ipc::ScopeSet::cli_default(),
+    );
+    let (mut client, mut server_stream) = UnixStream::pair().expect("socketpair");
+    client
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let proof = context
+        .bind_connected_stream_current(&server_stream)
+        .expect("bound peer proof");
+    context.attest_local_peer(&proof.identity());
+    let handle = std::thread::spawn(move || {
+        let mut limiter = bitty_ipc::RateLimiter::rc9_default();
+        let clock = || 0u64;
+        bitty_ipc::devtools::serve_bound_connection(
+            &mut server_stream,
+            &proof,
+            &dispatcher,
+            &context,
+            &mut limiter,
+            &clock,
+        )
+    });
+
+    // One headed-shaped round-trip: framed client bytes in, control
+    // queue drained on this thread (the sole Runtime owner), framed
+    // reply out. Returns the raw reply body.
+    fn roundtrip(
+        client: &mut UnixStream,
+        rt: &mut bitty_runtime::Runtime,
+        method: &str,
+        params: Option<&str>,
+    ) -> String {
+        let params_part = match params {
+            None => String::new(),
+            Some(p) => format!(",\"params\":{p}"),
+        };
+        let envelope = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"version\":\"1.0\",\"method\":\"{method}\"{params_part}}}"
+        );
+        let wire = bitty_ipc::encode_frame(envelope.as_bytes()).unwrap();
+        client.write_all(&wire).unwrap();
+        client.flush().unwrap();
+        let granted = bitty_ipc::ScopeSet::cli_default();
+        for _ in 0..200 {
+            let drained = drain_global_control_queue_with(rt, &granted, |_, _| {});
+            if drained > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut header = [0u8; 4];
+        client.read_exact(&mut header).unwrap();
+        let len = u32::from_be_bytes(header) as usize;
+        let mut body = vec![0u8; len];
+        client.read_exact(&mut body).unwrap();
+        String::from_utf8(body).unwrap()
+    }
+
+    // Text send first (headed run_case shape).
+    let text = ipc_ctl::params_send_input("t:1", "echo CTX1116-SOCK-PROBE-4c1d");
+    let body = roundtrip(
+        &mut client,
+        &mut rt,
+        ipc_ctl::METHOD_SEND_INPUT,
+        Some(&text),
+    );
+    assert!(
+        body.contains("\"result\""),
+        "text send must succeed: {body:?}"
+    );
+    // Bare-CR submit as its own round-trip (headed submit() shape:
+    // `terminal send t:1 "$(printf '\r')"`).
+    let cr = ipc_ctl::params_send_input("t:1", "\r");
+    let body = roundtrip(&mut client, &mut rt, ipc_ctl::METHOD_SEND_INPUT, Some(&cr));
+    assert!(
+        body.contains("\"result\""),
+        "CR submit must succeed: {body:?}"
+    );
+
+    // The shell must have executed the line: the bare marker on its own
+    // output row (echoed-but-pending input always carries the `echo `
+    // prefix, so line-exact match distinguishes execution).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut executed = false;
+    while Instant::now() < deadline {
+        let _ = rt.poll_pty();
+        rt.tick();
+        if snapshot_text(&rt.snapshot())
+            .lines()
+            .any(|line| line.trim() == "CTX1116-SOCK-PROBE-4c1d")
+        {
+            executed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        executed,
+        "over-socket bare-CR submit must execute; grid:\n{}",
+        snapshot_text(&rt.snapshot())
+    );
+    drop(client);
+    let stats = handle.join().expect("server thread must finish").unwrap();
+    assert!(stats.requests >= 2, "server must see both sends");
+}
+
+#[cfg(unix)]
+#[test]
+fn ctx1116_send_headed_clear_line_executes_on_fish() {
+    // The EXACT headed v1 TEXT1 (backslashes + single quotes) followed
+    // by a bare-CR submit, to headless fish --no-config. Guards the
+    // headed byte shape: fish must consume (execute) the line, which
+    // runs the printf and clears the grid via its ED-2 output.
+    use std::time::{Duration, Instant};
+    bitty_test_support::require_pty!();
+    let mut rt = headless_runtime();
+    rt.spawn_shell_with_args("fish", &["--no-config", "--interactive"])
+        .expect("fish must attach headless");
+    let cli = bitty_ipc::ScopeSet::cli_default();
+    // Byte-for-byte the headed clear-line argv (bash "\\\\" -> "\\").
+    let text1 = "printf '\\\\x1b[2J\\\\x1b[H'";
+    let params = ipc_ctl::params_send_input("t:1", text1);
+    let sent = apply_control_envelope(&mut rt, ipc_ctl::METHOD_SEND_INPUT, Some(&params), &cli);
+    assert!(sent.ok, "text1 send must succeed: {sent:?}");
+    let cr = ipc_ctl::params_send_input("t:1", "\r");
+    let sent = apply_control_envelope(&mut rt, ipc_ctl::METHOD_SEND_INPUT, Some(&cr), &cli);
+    assert!(sent.ok, "CR submit must succeed: {sent:?}");
+    // Settle, then dump the grid: did fish execute (fresh prompt, output
+    // row) or continue (pending buffer)?
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let _ = rt.poll_pty();
+        rt.tick();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let grid = snapshot_text(&rt.snapshot());
+    // Execution consumes the line from the reader buffer. (An earlier
+    // revision asserted the literal `\x1b` output row; fish printf turns
+    // the doubled backslashes into a real ED-2 clear instead, so a
+    // successful submit leaves a fresh prompt with no `printf` anywhere.)
+    assert!(
+        !grid.contains("printf"),
+        "headed TEXT1 must be consumed (executed) by fish; grid:\n{grid}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn ctx1116_send_preserves_backslashes_via_cat_echo() {
+    // Byte census: send the exact headed TEXT1 bytes to `cat` and read
+    // back the echo. The echo proves byte-for-byte what crossed the
+    // master: doubled backslashes must survive (a single survivor would
+    // mean the JSON layer ate a level).
+    use std::time::{Duration, Instant};
+    bitty_test_support::require_pty!();
+    let mut rt = headless_runtime();
+    rt.spawn_shell_with_args("/bin/sh", &["-c", "cat"])
+        .expect("cat must attach headless");
+    let cli = bitty_ipc::ScopeSet::cli_default();
+    let text1 = "printf '\\\\x1b[2J\\\\x1b[H'";
+    let params = ipc_ctl::params_send_input("t:1", text1);
+    let sent = apply_control_envelope(&mut rt, ipc_ctl::METHOD_SEND_INPUT, Some(&params), &cli);
+    assert!(sent.ok, "text1 send must succeed: {sent:?}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut echoed = String::new();
+    while Instant::now() < deadline {
+        let _ = rt.poll_pty();
+        rt.tick();
+        echoed = snapshot_text(&rt.snapshot());
+        if echoed.contains("printf") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Count the backslashes in the echoed row: headed argv carries two
+    // before each `x1b`, and both must survive the send chain.
+    let row = echoed
+        .lines()
+        .find(|line| line.contains("printf"))
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        row.contains("\\\\x1b[2J\\\\x1b[H"),
+        "echo must preserve doubled backslashes, got row: {row:?} (full grid:\n{echoed})"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn ctx1116_send_cr_submit_fish_noconfig_executes() {
+    // Fish-reader leg: the headed shell was fish (4.x). Tide stalls
+    // headless (prompt init waits on terminal queries the bare-Runtime
+    // harness never answers), so drive fish --no-config: the line reader
+    // under test is identical, only the prompt theme differs.
+    use std::time::{Duration, Instant};
+    bitty_test_support::require_pty!();
+    let mut rt = headless_runtime();
+    rt.spawn_shell_with_args("fish", &["--no-config", "--interactive"])
+        .expect("fish must attach headless");
+    let cli = bitty_ipc::ScopeSet::cli_default();
+    // Text send then bare-CR submit as separate envelope applies.
+    let text = ipc_ctl::params_send_input("t:1", "echo CTX1116-FISH-PROBE-8a4e");
+    let sent = apply_control_envelope(&mut rt, ipc_ctl::METHOD_SEND_INPUT, Some(&text), &cli);
+    assert!(sent.ok, "text send must succeed: {sent:?}");
+    let cr = ipc_ctl::params_send_input("t:1", "\r");
+    let sent = apply_control_envelope(&mut rt, ipc_ctl::METHOD_SEND_INPUT, Some(&cr), &cli);
+    assert!(sent.ok, "bare-CR submit must succeed: {sent:?}");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut executed = false;
+    while Instant::now() < deadline {
+        let _ = rt.poll_pty();
+        rt.tick();
+        if snapshot_text(&rt.snapshot())
+            .lines()
+            .any(|line| line.trim() == "CTX1116-FISH-PROBE-8a4e")
+        {
+            executed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        executed,
+        "bare-CR submit must execute on live fish; grid:\n{}",
+        snapshot_text(&rt.snapshot())
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn control_terminal_spawn_creates_observable_session() {

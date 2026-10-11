@@ -1109,12 +1109,13 @@ impl Runtime {
                 if !control.medium.is_direct() && *rows_r == 0 {
                     if !self.enqueue_kitty_local_frame(
                         *format_f, *width_s, *height_v, payload, *control, &action,
-                    ) && let Some(suppressed) = self.kitty_log.admit_now()
-                    {
-                        eprintln!(
-                            "bitty: rejecting kitty animation frame (queue full): stored nothing{}",
-                            log_throttle::suppressed_suffix(suppressed)
-                        );
+                    ) {
+                        if let Some(suppressed) = self.kitty_log.admit_now() {
+                            eprintln!(
+                                "bitty: rejecting kitty animation frame (queue full): stored nothing{}",
+                                log_throttle::suppressed_suffix(suppressed)
+                            );
+                        }
                     }
                     continue;
                 }
@@ -1248,12 +1249,13 @@ impl Runtime {
                     if is_virtual_combined {
                         if !self.enqueue_kitty_local_virtual(
                             format_f, width_s, height_v, cols_c, rows_r, &payload, control,
-                        ) && let Some(suppressed) = self.kitty_log.admit_now()
-                        {
-                            eprintln!(
-                                "bitty: rejecting kitty local virtual image (queue full): stored nothing{}",
-                                log_throttle::suppressed_suffix(suppressed)
-                            );
+                        ) {
+                            if let Some(suppressed) = self.kitty_log.admit_now() {
+                                eprintln!(
+                                    "bitty: rejecting kitty local virtual image (queue full): stored nothing{}",
+                                    log_throttle::suppressed_suffix(suppressed)
+                                );
+                            }
                         }
                         continue;
                     }
@@ -1267,12 +1269,13 @@ impl Runtime {
                         cursor_movement_c,
                         &payload,
                         control,
-                    ) && let Some(suppressed) = self.kitty_log.admit_now()
-                    {
-                        eprintln!(
-                            "bitty: rejecting kitty local image (queue full): stored nothing{}",
-                            log_throttle::suppressed_suffix(suppressed)
-                        );
+                    ) {
+                        if let Some(suppressed) = self.kitty_log.admit_now() {
+                            eprintln!(
+                                "bitty: rejecting kitty local image (queue full): stored nothing{}",
+                                log_throttle::suppressed_suffix(suppressed)
+                            );
+                        }
                     }
                     // The state-owned `a=p`/`a=d`/`a=a` commands were
                     // applied above. This branch consumes the remaining

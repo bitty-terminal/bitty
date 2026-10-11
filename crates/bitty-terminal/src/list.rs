@@ -758,14 +758,18 @@ pub fn list_keymaps_with(resolved: &[bitty_config::keymap::ResolvedKeymap]) -> V
 ///
 /// Tries the full merged config (CLI > file > profile > defaults, honors
 /// `--safe`/`--config`/`BITTY_CONFIG`/profiles like the app startup); on any
-/// load or resolve failure falls back to built-in defaults so `list actions`
-/// and `list keymaps` always succeed (exit 0, safe-mode-clean fallback).
-/// Diagnostics stay on stderr so JSON on stdout is never corrupted.
+/// load failure falls back to built-in defaults so `list actions` and `list
+/// keymaps` always succeed (exit 0, safe-mode-clean fallback). The load error
+/// is reported on stderr only, so JSON on stdout is never corrupted and the
+/// exit code is unchanged.
 #[must_use]
 pub fn effective_for_catalog(args: &crate::cli::Args) -> bitty_config::EffectiveConfig {
     match crate::config_cli::load_merged_config(args) {
         Ok(loaded) => loaded.merged.effective,
-        Err(_) => bitty_config::EffectiveConfig::default(),
+        Err(err) => {
+            eprintln!("bitty list: invalid config ({err}); using shipped defaults");
+            bitty_config::EffectiveConfig::default()
+        }
     }
 }
 
@@ -773,15 +777,18 @@ pub fn effective_for_catalog(args: &crate::cli::Args) -> bitty_config::Effective
 ///
 /// Same [`resolve_keymaps`](bitty_config::keymap::resolve_keymaps) resolver
 /// for both `list actions` (`binding`) and `list keymaps` (rows): config
-/// overrides + defaults, fallback to shipped defaults when the effective
-/// table fails to resolve (invalid user keymaps never break the catalog).
+/// overrides + defaults. When the effective table fails to resolve (invalid
+/// user keymaps), fall back to the defaults for the effective modifier so the
+/// chords stay consistent with the reported `mod_key`; invalid user keymaps
+/// never break the catalog (silent-success fallback, exit 0).
 #[must_use]
 pub fn resolved_for_catalog(
     effective: &bitty_config::EffectiveConfig,
 ) -> Vec<bitty_config::keymap::ResolvedKeymap> {
     match bitty_config::keymap::resolve_keymaps(effective) {
         Ok(table) => table,
-        Err(_) => bitty_config::keymap::shipped_resolved_keymaps(),
+        Err(_) => bitty_config::keymap::default_keymaps_with_mod(effective.mod_key)
+            .unwrap_or_else(|_| bitty_config::keymap::shipped_resolved_keymaps()),
     }
 }
 

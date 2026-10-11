@@ -143,6 +143,39 @@ use bitty_vt::{KITTY_APC_PATH_MAX_BYTES, KITTY_APC_SHM_NAME_MAX, KITTY_APC_TMP_N
 /// so the opener can never hand the decoder more than it admits.
 const KITTY_LOCAL_READ_CAP: usize = KITTY_DECODE_MAX_BYTES;
 
+/// Async worker bounds (CTX-1110, follow-up of S3 #1918 CodeRabbit Major).
+///
+/// The PTY poll never blocks on filesystem I/O: local-medium reads run on
+/// short-lived worker threads (one in flight at a time, FIFO) while the
+/// poll keeps draining every pane. Caps count queued + in-flight + timed-out
+/// orphans (hung threads still blocked in the kernel), so a hung filesystem
+/// leaks at most a bounded number of threads and then refuses fail-closed.
+pub(crate) const KITTY_LOCAL_MAX_PENDING_GLOBAL: usize = 8;
+/// Per-origin queued + in-flight + orphan cap: one origin can hold at most
+/// two slots, so a noisy pane cannot starve other origins out of the global
+/// eight.
+pub(crate) const KITTY_LOCAL_MAX_PENDING_PER_ORIGIN: usize = 2;
+/// Generous wall-clock bound for one local-medium read (CTX-1110).
+///
+/// Rationale: local SSD reads of at most 64 MiB complete in milliseconds;
+/// spinning disks take hundreds of milliseconds and a loaded network
+/// filesystem can take around a second. Three seconds covers legitimate
+/// slow disks without false timeouts (a too-small bound such as 100 ms
+/// would break them), while a hung mount still degrades to a silent
+/// refusal after at most this long. The poll itself never waits: the
+/// deadline is checked non-blockingly on later pumps.
+pub(crate) const KITTY_LOCAL_READ_TIMEOUT_SECS: u64 = 3;
+
+// Per-`Runtime` test hooks (CTX-1110, unit tests only; production leaves
+// them at zero/false). Stored on the `Runtime` — never process-global —
+// so parallel tests cannot interfere: each test owns its `Runtime`.
+// `kitty_local_test_timeout_ms` is the tiny deadline override for hermetic
+// fast timeout proofs (`0` = the generous production default),
+// `kitty_local_test_delay_ms` the injected worker sleep simulating a hung
+// filesystem (`0` = none), and `kitty_local_test_panic` the injected worker
+// panic proving panic isolation. Declared on `Runtime` in `runtime.rs`
+// next to the queue fields; unit tests (child module below) set them.
+
 /// Typed local-medium read rejection (fail closed, stores nothing).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KittyLocalReadError {
@@ -546,6 +579,774 @@ fn read_kitty_local_unix(
     Err(KittyLocalReadError::UnsupportedPlatform)
 }
 
+/// Async local-medium operation (CTX-1110): what to do with the read bytes
+/// once the worker finishes. All wire parameters are captured at enqueue
+/// time (arrival order); the read bytes arrive later via the worker.
+#[derive(Debug, Clone)]
+pub(crate) enum KittyLocalOp {
+    /// Transmit-and-display (or transmit-only) image.
+    Display {
+        format_f: u32,
+        width_s: Option<u32>,
+        height_v: Option<u32>,
+        action_a: Option<char>,
+        cols_c: u16,
+        rows_r: u16,
+        cursor_movement_c: u8,
+        wire_image: u32,
+        wire_placement: u32,
+    },
+    /// Combined `a=T,U=1` virtual prototype registration.
+    Virtual {
+        format_f: u32,
+        width_s: Option<u32>,
+        height_v: Option<u32>,
+        cols_c: u16,
+        rows_r: u16,
+        wire_image: u32,
+        wire_placement: u32,
+        has_parent: bool,
+    },
+    /// File-backed `a=q` probe (test-loads, never stores).
+    Query {
+        format_f: u32,
+        width_s: Option<u32>,
+        height_v: Option<u32>,
+        control: bitty_vt::KittyControlKeys,
+    },
+    /// Animation frame append (`a=f`, `r=0`) via a local medium.
+    Frame {
+        format_f: u32,
+        width_s: Option<u32>,
+        height_v: Option<u32>,
+        control: bitty_vt::KittyControlKeys,
+        action: Box<bitty_term_state::TerminalAction>,
+    },
+}
+
+/// One queued local-medium read (CTX-1110): the sandbox read parameters
+/// plus the deferred operation. The worker thread owns a clone of the
+/// read parameters; the queue keeps this copy for completion.
+#[derive(Debug, Clone)]
+pub(crate) struct KittyLocalRequest {
+    origin: Option<u64>,
+    op: KittyLocalOp,
+    name: Box<[u8]>,
+    medium: bitty_vt::KittyMedium,
+    data_size: u32,
+    data_offset: u32,
+    format_f: u32,
+    width_s: Option<u32>,
+    height_v: Option<u32>,
+}
+
+/// One in-flight worker thread (CTX-1110): the request plus its deadline
+/// and join handle. The handle is only joined after `is_finished` reports
+/// ready, so the poll never blocks; panic payloads arrive via `join` and
+/// degrade to refusals.
+pub(crate) struct KittyLocalInFlight {
+    request: KittyLocalRequest,
+    deadline: std::time::Instant,
+    handle: std::thread::JoinHandle<Result<Vec<u8>, KittyLocalReadError>>,
+}
+
+/// One timed-out orphan thread (CTX-1110): the worker is still blocked in
+/// the kernel after its deadline passed. Kept only to bound the leak and
+/// reclaim the handle once it finishes; dropped (detached) otherwise.
+pub(crate) struct KittyLocalOrphan {
+    origin: Option<u64>,
+    handle: std::thread::JoinHandle<Result<Vec<u8>, KittyLocalReadError>>,
+}
+
+/// Design choice (CTX-1110, conservative new failure-mode surface).
+///
+/// Chosen: per-request short-lived worker threads, at most one in flight,
+/// FIFO queue — over a persistent 1-2-thread pool or a synchronous read
+/// with a wall-clock deadline.
+///
+/// - A synchronous deadline cannot work: regular-file `read` ignores
+///   `O_NONBLOCK` for data and a hung network filesystem blocks
+///   uninterruptibly in the kernel, so no same-thread primitive bounds it.
+/// - A persistent pool needs restart logic on panic and still head-of-line
+///   blocks a hung read behind one thread; per-request threads isolate
+///   panic and timeout per read via `join` + deadline.
+/// - One in flight (not two) minimizes thread, ordering, and leak surface:
+///   global FIFO implies per-image FIFO, so frame N+1 cannot complete
+///   before frame N of the same image and no per-key scheduler is needed.
+///   The poll itself never waits, so every pane keeps draining while a
+///   hung read pends; the only head-of-line is queued completions waiting
+///   up to the generous timeout, bounded by the caps below.
+impl Runtime {
+    /// Pending async local-medium slots (CTX-1110, headless-observable
+    /// test seam): queued + in-flight + timed-out orphans. `0` means no
+    /// local-medium work is outstanding.
+    #[must_use]
+    pub fn kitty_local_pending_count(&self) -> usize {
+        self.kitty_local_pending_total()
+    }
+
+    /// Total pending slots (queued + in-flight + orphans).
+    pub(crate) fn kitty_local_pending_total(&self) -> usize {
+        self.kitty_local_queue.len()
+            + usize::from(self.kitty_local_in_flight.is_some())
+            + self.kitty_local_orphans.len()
+    }
+
+    /// Pending slots held by one origin.
+    pub(crate) fn kitty_local_pending_for_origin(&self, origin: Option<u64>) -> usize {
+        let mut count = 0;
+        for req in &self.kitty_local_queue {
+            if req.origin == origin {
+                count += 1;
+            }
+        }
+        if self
+            .kitty_local_in_flight
+            .as_ref()
+            .is_some_and(|flight| flight.request.origin == origin)
+        {
+            count += 1;
+        }
+        for orphan in &self.kitty_local_orphans {
+            if orphan.origin == origin {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Caps check before any I/O (CTX-1110): global plus per-origin
+    /// queued/in-flight limits. Refusals happen here, before spawning.
+    pub(crate) fn kitty_local_caps_allow(&self, origin: Option<u64>) -> bool {
+        self.kitty_local_pending_total() < KITTY_LOCAL_MAX_PENDING_GLOBAL
+            && self.kitty_local_pending_for_origin(origin) < KITTY_LOCAL_MAX_PENDING_PER_ORIGIN
+    }
+
+    /// Enqueues one display read without doing I/O (CTX-1110).
+    ///
+    /// Captures the draining origin (`self.kitty_origin`, already tagged by
+    /// `handle_pane_bytes` for panes). Returns `false` when the bounded
+    /// queue is full: the caller logs rate-limited and stores nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn enqueue_kitty_local_display(
+        &mut self,
+        format_f: u32,
+        width_s: Option<u32>,
+        height_v: Option<u32>,
+        action_a: Option<char>,
+        cols_c: u16,
+        rows_r: u16,
+        cursor_movement_c: u8,
+        name: &[u8],
+        control: bitty_vt::KittyControlKeys,
+    ) -> bool {
+        let request = KittyLocalRequest {
+            origin: self.kitty_origin,
+            op: KittyLocalOp::Display {
+                format_f,
+                width_s,
+                height_v,
+                action_a,
+                cols_c,
+                rows_r,
+                cursor_movement_c,
+                wire_image: control.image_id,
+                wire_placement: control.placement_id,
+            },
+            name: name.to_vec().into_boxed_slice(),
+            medium: control.medium,
+            data_size: control.data_size,
+            data_offset: control.data_offset,
+            format_f,
+            width_s,
+            height_v,
+        };
+        self.enqueue_kitty_local(request)
+    }
+
+    /// Enqueues one virtual-prototype read without doing I/O (CTX-1110).
+    /// Returns `false` when the bounded queue is full (caller logs).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn enqueue_kitty_local_virtual(
+        &mut self,
+        format_f: u32,
+        width_s: Option<u32>,
+        height_v: Option<u32>,
+        cols_c: u16,
+        rows_r: u16,
+        name: &[u8],
+        control: bitty_vt::KittyControlKeys,
+    ) -> bool {
+        let request = KittyLocalRequest {
+            origin: self.kitty_origin,
+            op: KittyLocalOp::Virtual {
+                format_f,
+                width_s,
+                height_v,
+                cols_c,
+                rows_r,
+                wire_image: control.image_id,
+                wire_placement: control.placement_id,
+                has_parent: control.has_parent(),
+            },
+            name: name.to_vec().into_boxed_slice(),
+            medium: control.medium,
+            data_size: control.data_size,
+            data_offset: control.data_offset,
+            format_f,
+            width_s,
+            height_v,
+        };
+        self.enqueue_kitty_local(request)
+    }
+
+    /// Enqueues one file-backed query probe without doing I/O (CTX-1110).
+    /// `I=` number lookups and silent queries (no `i=`/`I=`) answer
+    /// synchronously without I/O like direct streams (delegated with an
+    /// empty payload); only spec probes (`i=` non-zero) enqueue a worker
+    /// read. Queue-full answers `EINVAL:bad data` immediately honoring
+    /// `q=` (never stderr), like a refused read.
+    pub(crate) fn enqueue_kitty_local_query(
+        &mut self,
+        format_f: u32,
+        width_s: Option<u32>,
+        height_v: Option<u32>,
+        name: &[u8],
+        control: bitty_vt::KittyControlKeys,
+    ) {
+        if control.image_id == 0 {
+            self.answer_kitty_query(format_f, width_s, height_v, &[], control);
+            return;
+        }
+        let request = KittyLocalRequest {
+            origin: self.kitty_origin,
+            op: KittyLocalOp::Query {
+                format_f,
+                width_s,
+                height_v,
+                control,
+            },
+            name: name.to_vec().into_boxed_slice(),
+            medium: control.medium,
+            data_size: control.data_size,
+            data_offset: control.data_offset,
+            format_f,
+            width_s,
+            height_v,
+        };
+        if !self.enqueue_kitty_local(request) {
+            if control.quiet >= 2 {
+                return;
+            }
+            let reply = crate::queries::kitty_probe_einval_reply(control.image_id, "bad data");
+            self.state.apply(&bitty_term_state::TerminalAction::Reply {
+                bytes: reply.into_boxed_slice(),
+            });
+        }
+    }
+
+    /// Enqueues one local-medium animation frame without doing I/O
+    /// (CTX-1110, `r=0` only; `r>0` gap edits never enqueue). Returns
+    /// `false` when the bounded queue is full (caller logs).
+    pub(crate) fn enqueue_kitty_local_frame(
+        &mut self,
+        format_f: u32,
+        width_s: Option<u32>,
+        height_v: Option<u32>,
+        name: &[u8],
+        control: bitty_vt::KittyControlKeys,
+        action: &bitty_term_state::TerminalAction,
+    ) -> bool {
+        let request = KittyLocalRequest {
+            origin: self.kitty_origin,
+            op: KittyLocalOp::Frame {
+                format_f,
+                width_s,
+                height_v,
+                control,
+                action: Box::new(action.clone()),
+            },
+            name: name.to_vec().into_boxed_slice(),
+            medium: control.medium,
+            data_size: control.data_size,
+            data_offset: control.data_offset,
+            format_f,
+            width_s,
+            height_v,
+        };
+        self.enqueue_kitty_local(request)
+    }
+
+    /// Enqueues one local-medium read without doing I/O (CTX-1110).
+    ///
+    /// Returns `false` when the bounded queue is full (global or
+    /// per-origin): the caller must fail closed immediately (display/frame
+    /// rate-limited log, query `EINVAL` honoring `q=`), exactly like a
+    /// refused read. On `true` the read is queued and promotion starts it
+    /// promptly when no worker is in flight.
+    pub(crate) fn enqueue_kitty_local(&mut self, request: KittyLocalRequest) -> bool {
+        if !self.kitty_local_caps_allow(request.origin) {
+            return false;
+        }
+        self.kitty_local_queue.push_back(request);
+        self.promote_kitty_local_queue();
+        true
+    }
+
+    /// Starts the queue head when no worker is in flight (CTX-1110,
+    /// single-flight FIFO). Spawns at most one thread; spawn failure
+    /// degrades to an immediate refusal of the head (popped, failed
+    /// closed) so the queue cannot wedge on OS thread exhaustion.
+    fn promote_kitty_local_queue(&mut self) {
+        if self.kitty_local_in_flight.is_some() {
+            return;
+        }
+        let Some(request) = self.kitty_local_queue.pop_front() else {
+            return;
+        };
+        let name_owned: Vec<u8> = request.name.to_vec();
+        let medium = request.medium;
+        let data_size = request.data_size;
+        let data_offset = request.data_offset;
+        let format_f = request.format_f;
+        let width_s = request.width_s;
+        let height_v = request.height_v;
+        // Per-Runtime test hooks are captured by value at spawn so parallel
+        // tests (each owning its `Runtime`) cannot interfere.
+        let test_delay_ms = self.kitty_local_test_delay_ms;
+        let test_panic = self.kitty_local_test_panic;
+        let timeout_ms = self.kitty_local_test_timeout_ms;
+        let deadline = std::time::Instant::now()
+            + if timeout_ms != 0 {
+                std::time::Duration::from_millis(timeout_ms)
+            } else {
+                std::time::Duration::from_secs(KITTY_LOCAL_READ_TIMEOUT_SECS)
+            };
+        // The worker moves the whole `read_kitty_local` call (S3 sandbox
+        // behavior preserved exactly: `O_NOFOLLOW`, containment, caps,
+        // deny platforms) — never a reimplementation.
+        let spawn = std::thread::Builder::new()
+            .name("bitty-kitty-local".to_string())
+            .spawn(move || {
+                if test_delay_ms != 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(test_delay_ms));
+                }
+                if test_panic {
+                    panic!("bitty test-injected kitty local worker panic");
+                }
+                // Panic isolation: a worker panic must not take down the
+                // PTY poll. `catch_unwind` maps it to a refusal here (plus
+                // `join` below maps a join-level panic the same way).
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    read_kitty_local(
+                        medium,
+                        &name_owned,
+                        data_size,
+                        data_offset,
+                        format_f,
+                        width_s,
+                        height_v,
+                    )
+                }));
+                match outcome {
+                    Ok(inner) => inner,
+                    Err(_) => Err(KittyLocalReadError::Io("read")),
+                }
+            });
+        match spawn {
+            Ok(handle) => {
+                self.kitty_local_in_flight = Some(KittyLocalInFlight {
+                    request,
+                    deadline,
+                    handle,
+                });
+            }
+            Err(_) => {
+                // Spawn refused by the OS: fail the head closed now with
+                // the same silent posture as a refused read (the caller
+                // already continued; completion-time handling reports it).
+                self.fail_kitty_local_request(&request, true);
+            }
+        }
+    }
+
+    /// Silent failure posture for one request that never ran (CTX-1110):
+    /// spawn refusal or queue-full fast refusal. Display/frame/virtual log
+    /// rate-limited (no stderr flood); queries answer `EINVAL:bad data`
+    /// honoring `q=` (never stderr). `from_spawn` only selects the log
+    /// wording.
+    pub(crate) fn fail_kitty_local_request(
+        &mut self,
+        request: &KittyLocalRequest,
+        from_spawn: bool,
+    ) {
+        let origin = request.origin;
+        // Lifetime: a pane closed before failure handling drops everything.
+        if let Some(token) = origin {
+            if !self.pane_sessions.contains_key(&ViewId::new(token)) {
+                return;
+            }
+        }
+        let prev_origin = self.kitty_origin;
+        // Pane completions run on the pane's grid (swapped in); primary
+        // runs on the primary grid already in place.
+        let mut swapped = false;
+        if let Some(token) = origin {
+            if let Some(sess) = self.pane_sessions.get_mut(&ViewId::new(token)) {
+                std::mem::swap(&mut self.parser, &mut sess.parser);
+                std::mem::swap(&mut self.state, &mut sess.state);
+                std::mem::swap(&mut self.query_overlap, &mut sess.query_overlap);
+                swapped = true;
+            } else {
+                return;
+            }
+        }
+        self.kitty_origin = origin;
+        match &request.op {
+            KittyLocalOp::Query { control, .. } => {
+                if control.quiet < 2 {
+                    let reply =
+                        crate::queries::kitty_probe_einval_reply(control.image_id, "bad data");
+                    self.state.apply(&bitty_term_state::TerminalAction::Reply {
+                        bytes: reply.into_boxed_slice(),
+                    });
+                }
+            }
+            KittyLocalOp::Display { .. }
+            | KittyLocalOp::Virtual { .. }
+            | KittyLocalOp::Frame { .. } => {
+                if let Some(suppressed) = self.kitty_log.admit_now() {
+                    let what = if from_spawn {
+                        "spawn refused"
+                    } else {
+                        "queue full"
+                    };
+                    eprintln!(
+                        "bitty: rejecting kitty local image ({what}): stored nothing{}",
+                        super::log_throttle::suppressed_suffix(suppressed)
+                    );
+                }
+            }
+        }
+        if swapped {
+            if let Some(sess) = self
+                .pane_sessions
+                .get_mut(&ViewId::new(origin.expect("swapped implies origin")))
+            {
+                std::mem::swap(&mut self.parser, &mut sess.parser);
+                std::mem::swap(&mut self.state, &mut sess.state);
+                std::mem::swap(&mut self.query_overlap, &mut sess.query_overlap);
+            }
+        }
+        self.kitty_origin = prev_origin;
+        self.sync_mode_caches_to_focus();
+    }
+
+    /// Non-blocking pump for the async worker (CTX-1110): reaps finished
+    /// orphans, completes or times out the in-flight read, then promotes
+    /// the queue head. Never blocks, never panics on worker output.
+    pub fn pump_kitty_local_completions(&mut self) {
+        // Reap finished orphans first (bounded leak: hung threads that
+        // finally exited release their slots here).
+        let mut index = 0;
+        while index < self.kitty_local_orphans.len() {
+            if self.kitty_local_orphans[index].handle.is_finished() {
+                let orphan = self.kitty_local_orphans.remove(index);
+                let _ = orphan.handle.join();
+            } else {
+                index += 1;
+            }
+        }
+        // Check the in-flight worker without blocking.
+        let mut timed_out = false;
+        // Take a finished worker out first (borrow ends before completion
+        // handling, which needs `&mut self`).
+        let finished = self
+            .kitty_local_in_flight
+            .as_ref()
+            .is_some_and(|flight| flight.handle.is_finished());
+        if finished {
+            let flight = self.kitty_local_in_flight.take().expect("checked above");
+            let result = match flight.handle.join() {
+                Ok(inner) => inner,
+                Err(_) => Err(KittyLocalReadError::Io("read")),
+            };
+            self.complete_kitty_local_request(&flight.request, result);
+        } else if let Some(flight) = self.kitty_local_in_flight.as_ref() {
+            if std::time::Instant::now() >= flight.deadline {
+                timed_out = true;
+            }
+        }
+        if timed_out {
+            let flight = self.kitty_local_in_flight.take().expect("checked above");
+            // On timeout answer silent failure honoring `q=` (S2 shape, no
+            // stderr flood): display/frame/virtual rate-limited log, query
+            // `EINVAL` unless `q=2`. The hung thread becomes a bounded
+            // orphan: it still counts toward the caps until it exits.
+            self.fail_kitty_local_timed_out(&flight.request);
+            self.kitty_local_orphans.push(KittyLocalOrphan {
+                origin: flight.request.origin,
+                handle: flight.handle,
+            });
+            // Bound the orphan list when a burst of timeouts lands while
+            // threads still run: detach one (handle drop detaches the
+            // thread) so the count stays at the global cap even before
+            // threads exit. At most one timeout lands per pump, so one
+            // detach per pump keeps the bound.
+            if self.kitty_local_pending_total() > KITTY_LOCAL_MAX_PENDING_GLOBAL {
+                if let Some(orphan) = self.kitty_local_orphans.pop() {
+                    let _ = orphan;
+                }
+            }
+        }
+        self.promote_kitty_local_queue();
+    }
+
+    /// Timeout failure posture (CTX-1110): same silent shape as a refused
+    /// read (rate-limited log for display/frame/virtual, `EINVAL` honoring
+    /// `q=` for queries), worded as a timeout.
+    fn fail_kitty_local_timed_out(&mut self, request: &KittyLocalRequest) {
+        let origin = request.origin;
+        if let Some(token) = origin {
+            if !self.pane_sessions.contains_key(&ViewId::new(token)) {
+                return;
+            }
+        }
+        let prev_origin = self.kitty_origin;
+        let mut swapped = false;
+        if let Some(token) = origin {
+            if let Some(sess) = self.pane_sessions.get_mut(&ViewId::new(token)) {
+                std::mem::swap(&mut self.parser, &mut sess.parser);
+                std::mem::swap(&mut self.state, &mut sess.state);
+                std::mem::swap(&mut self.query_overlap, &mut sess.query_overlap);
+                swapped = true;
+            } else {
+                return;
+            }
+        }
+        self.kitty_origin = origin;
+        match &request.op {
+            KittyLocalOp::Query { control, .. } => {
+                if control.quiet < 2 {
+                    let reply =
+                        crate::queries::kitty_probe_einval_reply(control.image_id, "bad data");
+                    self.state.apply(&bitty_term_state::TerminalAction::Reply {
+                        bytes: reply.into_boxed_slice(),
+                    });
+                }
+            }
+            KittyLocalOp::Display { .. }
+            | KittyLocalOp::Virtual { .. }
+            | KittyLocalOp::Frame { .. } => {
+                if let Some(suppressed) = self.kitty_log.admit_now() {
+                    eprintln!(
+                        "bitty: rejecting kitty local image (read timed out): stored nothing{}",
+                        super::log_throttle::suppressed_suffix(suppressed)
+                    );
+                }
+            }
+        }
+        if swapped {
+            if let Some(sess) = self
+                .pane_sessions
+                .get_mut(&ViewId::new(origin.expect("swapped implies origin")))
+            {
+                std::mem::swap(&mut self.parser, &mut sess.parser);
+                std::mem::swap(&mut self.state, &mut sess.state);
+                std::mem::swap(&mut self.query_overlap, &mut sess.query_overlap);
+            }
+        }
+        self.kitty_origin = prev_origin;
+        self.sync_mode_caches_to_focus();
+    }
+
+    /// Applies one finished worker result on the requesting origin's grid
+    /// (CTX-1110 completion).
+    ///
+    /// Lifetime: a pane closed mid-read drops its result (no
+    /// use-after-close, no store, no reply). Ordering: single-flight FIFO
+    /// means completions already run in enqueue order, so frame N+1 cannot
+    /// display before frame N of the same image. Panic isolation: panics
+    /// arrive here as `Io("read")` refusals, never propagated.
+    ///
+    /// Residuals (documented, conservative): completions anchor at
+    /// completion-time cursor/scrollback (same as if the bytes arrived
+    /// then; drift bounded to the current poll's remaining text, zero in
+    /// the common single-image case), and control-only composes/deletes
+    /// that race a pending local store apply to prior state fail-closed
+    /// (`NoAnimationTarget`/no-op) rather than waiting.
+    fn complete_kitty_local_request(
+        &mut self,
+        request: &KittyLocalRequest,
+        result: Result<Vec<u8>, KittyLocalReadError>,
+    ) {
+        let origin = request.origin;
+        // Lifetime gate first: no grid touch when the origin is gone.
+        if let Some(token) = origin {
+            if !self.pane_sessions.contains_key(&ViewId::new(token)) {
+                return;
+            }
+        }
+        let prev_origin = self.kitty_origin;
+        let mut swapped = false;
+        if let Some(token) = origin {
+            if let Some(sess) = self.pane_sessions.get_mut(&ViewId::new(token)) {
+                std::mem::swap(&mut self.parser, &mut sess.parser);
+                std::mem::swap(&mut self.state, &mut sess.state);
+                std::mem::swap(&mut self.query_overlap, &mut sess.query_overlap);
+                swapped = true;
+            } else {
+                return;
+            }
+        }
+        self.kitty_origin = origin;
+        match &request.op {
+            KittyLocalOp::Display {
+                format_f,
+                width_s,
+                height_v,
+                action_a,
+                cols_c,
+                rows_r,
+                cursor_movement_c,
+                wire_image,
+                wire_placement,
+            } => match result {
+                Ok(bytes) => {
+                    if let Err(err) = self.kitty_display_image_owned_with_wire(
+                        *format_f,
+                        *width_s,
+                        *height_v,
+                        *action_a,
+                        *cols_c,
+                        *rows_r,
+                        *cursor_movement_c,
+                        bytes.into_boxed_slice(),
+                        0,
+                        *wire_image,
+                        *wire_placement,
+                    ) {
+                        if let Some(suppressed) = self.kitty_log.admit_now() {
+                            eprintln!(
+                                "bitty: rejecting kitty local image ({err}): stored nothing{}",
+                                super::log_throttle::suppressed_suffix(suppressed)
+                            );
+                        }
+                    }
+                }
+                Err(err) => {
+                    if let Some(suppressed) = self.kitty_log.admit_now() {
+                        eprintln!(
+                            "bitty: rejecting kitty local image ({err}): stored nothing{}",
+                            super::log_throttle::suppressed_suffix(suppressed)
+                        );
+                    }
+                }
+            },
+            KittyLocalOp::Virtual {
+                format_f,
+                width_s,
+                height_v,
+                cols_c,
+                rows_r,
+                wire_image,
+                wire_placement,
+                has_parent,
+            } => match result {
+                Ok(bytes) => {
+                    if let Err(err) = self.kitty_display_virtual_owned_with_wire(
+                        *format_f,
+                        *width_s,
+                        *height_v,
+                        *cols_c,
+                        *rows_r,
+                        bytes.into_boxed_slice(),
+                        *wire_image,
+                        *wire_placement,
+                        *has_parent,
+                    ) {
+                        if let Some(suppressed) = self.kitty_log.admit_now() {
+                            eprintln!(
+                                "bitty: rejecting kitty local virtual image ({err}): stored nothing{}",
+                                super::log_throttle::suppressed_suffix(suppressed)
+                            );
+                        }
+                    }
+                }
+                Err(err) => {
+                    if let Some(suppressed) = self.kitty_log.admit_now() {
+                        eprintln!(
+                            "bitty: rejecting kitty local virtual image ({err}): stored nothing{}",
+                            super::log_throttle::suppressed_suffix(suppressed)
+                        );
+                    }
+                }
+            },
+            KittyLocalOp::Query {
+                format_f,
+                width_s,
+                height_v,
+                control,
+            } => match result {
+                Ok(bytes) => {
+                    self.answer_kitty_query(*format_f, *width_s, *height_v, &bytes, *control);
+                }
+                Err(_) => {
+                    if control.quiet >= 2 {
+                        // Suppressed like the synchronous path.
+                    } else {
+                        let reply =
+                            crate::queries::kitty_probe_einval_reply(control.image_id, "bad data");
+                        self.state.apply(&bitty_term_state::TerminalAction::Reply {
+                            bytes: reply.into_boxed_slice(),
+                        });
+                    }
+                }
+            },
+            KittyLocalOp::Frame {
+                format_f,
+                width_s,
+                height_v,
+                control,
+                action,
+            } => match result {
+                Ok(bytes) => {
+                    if let Err(err) = self.kitty_ingest_frame_bytes(
+                        *format_f, *width_s, *height_v, &bytes, control, action,
+                    ) {
+                        if let Some(suppressed) = self.kitty_log.admit_now() {
+                            eprintln!(
+                                "bitty: rejecting kitty animation frame ({err}): stored nothing{}",
+                                super::log_throttle::suppressed_suffix(suppressed)
+                            );
+                        }
+                    }
+                }
+                Err(err) => {
+                    if let Some(suppressed) = self.kitty_log.admit_now() {
+                        eprintln!(
+                            "bitty: rejecting kitty animation frame ({err}): stored nothing{}",
+                            super::log_throttle::suppressed_suffix(suppressed)
+                        );
+                    }
+                }
+            },
+        }
+        if swapped {
+            if let Some(sess) = self
+                .pane_sessions
+                .get_mut(&ViewId::new(origin.expect("swapped implies origin")))
+            {
+                std::mem::swap(&mut self.parser, &mut sess.parser);
+                std::mem::swap(&mut self.state, &mut sess.state);
+                std::mem::swap(&mut self.query_overlap, &mut sess.query_overlap);
+            }
+        }
+        self.kitty_origin = prev_origin;
+        self.sync_mode_caches_to_focus();
+    }
+}
+
 impl Runtime {
     /// Decodes, stores and places a Kitty image named by a local medium.
     ///
@@ -644,55 +1445,6 @@ impl Runtime {
             control.placement_id,
             control.has_parent(),
         )
-    }
-
-    /// Answers one file-backed Kitty `a=q` probe with at most one bounded
-    /// reply (S3 read half over the S2 answer seam, #1849).
-    ///
-    /// `I=` number lookups ignore the named object (like direct streams:
-    /// delegated with an empty payload, which the verdict treats as a
-    /// status lookup); queries without `i=`/`I=` stay silent (like kitty).
-    /// Spec probes (`i=` non-zero) read the named object first (bounded,
-    /// fail closed) and test-load the *read* bytes through
-    /// [`Self::answer_kitty_query`], so `OK`/`EINVAL`/`ENOSPC` verdicts and
-    /// `q=` suppression apply unchanged. Read failures answer
-    /// `EINVAL:bad data` as silent protocol replies honoring `q=` (never
-    /// stderr), so probing clients never flood diagnostics. Queries never
-    /// store, place, or evict.
-    pub(crate) fn answer_kitty_local_query(
-        &mut self,
-        format_f: u32,
-        width_s: Option<u32>,
-        height_v: Option<u32>,
-        name: &[u8],
-        control: bitty_vt::KittyControlKeys,
-    ) {
-        if control.image_id == 0 {
-            self.answer_kitty_query(format_f, width_s, height_v, &[], control);
-            return;
-        }
-        let bytes = match read_kitty_local(
-            control.medium,
-            name,
-            control.data_size,
-            control.data_offset,
-            format_f,
-            width_s,
-            height_v,
-        ) {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                if control.quiet >= 2 {
-                    return;
-                }
-                let reply = crate::queries::kitty_probe_einval_reply(control.image_id, "bad data");
-                self.state.apply(&TerminalAction::Reply {
-                    bytes: reply.into_boxed_slice(),
-                });
-                return;
-            }
-        };
-        self.answer_kitty_query(format_f, width_s, height_v, &bytes, control);
     }
 }
 
@@ -814,5 +1566,346 @@ mod tests {
             "at least the OS temp dir must canonicalize"
         );
         assert!(temp_roots().iter().all(|root| root.is_absolute()));
+    }
+
+    // CTX-1110 async worker tests: hermetic and fast (tiny timeouts plus
+    // fault-injection hooks, never real multi-second sleeps or hung mounts).
+    static ASYNC_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn async_runtime() -> crate::runtime::Runtime {
+        crate::runtime::Runtime::with_defaults().expect("defaults must build")
+    }
+
+    fn async_fixture(tag: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let n = ASYNC_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("bitty-ctx1110-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir must build");
+        let file = dir.join("img.bin");
+        std::fs::write(&file, bytes).expect("fixture must write");
+        file
+    }
+
+    #[cfg(unix)]
+    fn async_path_bytes(path: &std::path::Path) -> Vec<u8> {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    }
+
+    #[cfg(not(unix))]
+    fn async_path_bytes(path: &std::path::Path) -> Vec<u8> {
+        path.to_str()
+            .expect("test paths are UTF-8")
+            .as_bytes()
+            .to_vec()
+    }
+
+    fn async_control(name_len: usize) -> bitty_vt::KittyControlKeys {
+        let _ = name_len;
+        bitty_vt::KittyControlKeys {
+            medium: bitty_vt::KittyMedium::File,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn async_timeout_fires_hermetic_fast() {
+        // Fault-injected hung filesystem: the worker sleeps past a tiny
+        // deadline. Timeout degrades to silent refusal (no store), fast.
+        let file = async_fixture("timeout", &[0xFF, 0x00, 0x00, 0xFF]);
+        let name = async_path_bytes(&file);
+
+        let mut rt = async_runtime();
+        rt.kitty_local_test_timeout_ms = 30;
+        rt.kitty_local_test_delay_ms = 500;
+        let control = async_control(name.len());
+        assert!(rt.enqueue_kitty_local_display(
+            32,
+            Some(1),
+            Some(1),
+            None,
+            1,
+            1,
+            0,
+            &name,
+            control
+        ));
+        // Past the 30 ms deadline, well before the 500 ms worker sleep.
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        rt.pump_kitty_local_completions();
+        rt.kitty_local_test_timeout_ms = 0;
+        rt.kitty_local_test_delay_ms = 0;
+        assert_eq!(
+            rt.kitty_image_count(),
+            0,
+            "timed-out display stores nothing"
+        );
+        assert_eq!(
+            rt.kitty_placement_count(),
+            0,
+            "timed-out display places nothing"
+        );
+        // Orphan detached on drop; no hang.
+        let _ = std::fs::remove_dir_all(file.parent().expect("temp parent"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn async_query_timeout_honors_quiet() {
+        // Hung probe with `q=0` answers `EINVAL:bad data`; `q=2`
+        // suppresses. Both hermetic and fast via the same hooks.
+        let file = async_fixture("qtimeout", &[0xFF, 0x00, 0x00, 0xFF]);
+        let name = async_path_bytes(&file);
+
+        let mut rt = async_runtime();
+        rt.kitty_local_test_timeout_ms = 30;
+        rt.kitty_local_test_delay_ms = 500;
+        let mut control = async_control(name.len());
+        control.image_id = 31;
+        control.quiet = 0;
+        rt.enqueue_kitty_local_query(100, None, None, &name, control);
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        rt.pump_kitty_local_completions();
+        let replies: Vec<Vec<u8>> = rt.take_replies().iter().map(|r| r.to_vec()).collect();
+        assert_eq!(
+            replies,
+            vec![b"\x1b_Gi=31;EINVAL:bad data\x1b\\".to_vec()],
+            "timed-out probe answers EINVAL honoring q=0"
+        );
+
+        let mut rt = async_runtime();
+        rt.kitty_local_test_timeout_ms = 30;
+        rt.kitty_local_test_delay_ms = 500;
+        let mut control = async_control(name.len());
+        control.image_id = 31;
+        control.quiet = 2;
+        rt.enqueue_kitty_local_query(100, None, None, &name, control);
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        rt.pump_kitty_local_completions();
+        assert!(
+            rt.take_replies().is_empty(),
+            "q=2 suppresses timeout failures"
+        );
+
+        let _ = std::fs::remove_dir_all(file.parent().expect("temp parent"));
+    }
+
+    #[test]
+    fn async_queue_caps_bound_global_and_per_origin() {
+        // Blocked workers (injected delay, generous deadline) fill the
+        // bounded queue without any I/O timing dependence.
+        let mut rt = async_runtime();
+        rt.kitty_local_test_timeout_ms = 5000;
+        rt.kitty_local_test_delay_ms = 300;
+        let name = b"/tmp/bitty-ctx1110-caps.bin".as_slice();
+        let control = async_control(name.len());
+        // Per-origin cap: two slots for the primary, third refuses.
+        assert!(rt.enqueue_kitty_local_display(32, Some(1), Some(1), None, 1, 1, 0, name, control));
+        assert!(rt.enqueue_kitty_local_display(32, Some(1), Some(1), None, 1, 1, 0, name, control));
+        assert!(
+            !rt.enqueue_kitty_local_display(32, Some(1), Some(1), None, 1, 1, 0, name, control),
+            "per-origin cap refuses the third primary slot"
+        );
+        assert_eq!(rt.kitty_local_pending_count(), 2);
+        // Other origins still have slots (no starvation).
+        rt.kitty_origin = Some(7);
+        assert!(rt.enqueue_kitty_local_display(32, Some(1), Some(1), None, 1, 1, 0, name, control));
+        rt.kitty_origin = None;
+        // Fill the global eight: primary holds two, origin 7 holds one,
+        // origins 11 and 12 hold two each (seven total), origin 13 takes
+        // the eighth below.
+        for origin in [11u64, 12] {
+            rt.kitty_origin = Some(origin);
+            assert!(rt.enqueue_kitty_local_display(
+                32,
+                Some(1),
+                Some(1),
+                None,
+                1,
+                1,
+                0,
+                name,
+                control
+            ));
+            assert!(rt.enqueue_kitty_local_display(
+                32,
+                Some(1),
+                Some(1),
+                None,
+                1,
+                1,
+                0,
+                name,
+                control
+            ));
+        }
+        rt.kitty_origin = Some(13);
+        assert!(
+            rt.enqueue_kitty_local_display(32, Some(1), Some(1), None, 1, 1, 0, name, control),
+            "origin 13 takes the eighth slot"
+        );
+        assert!(
+            !rt.enqueue_kitty_local_display(32, Some(1), Some(1), None, 1, 1, 0, name, control),
+            "per-origin cap refuses the third slot for origin 13"
+        );
+        rt.kitty_origin = Some(14);
+        assert!(
+            !rt.enqueue_kitty_local_display(32, Some(1), Some(1), None, 1, 1, 0, name, control),
+            "global cap refuses past eight slots"
+        );
+        rt.kitty_origin = None;
+        assert_eq!(rt.kitty_local_pending_count(), 8);
+        // Blocked workers detach on drop; the test itself never waited.
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn async_pane_closed_mid_read_drops_result() {
+        // Lifetime: an origin with no live pane session drops its result
+        // (no use-after-close, no store, no reply).
+        let file = async_fixture("gone", &[0xFF, 0x00, 0x00, 0xFF]);
+        let name = async_path_bytes(&file);
+        let mut rt = async_runtime();
+        rt.kitty_origin = Some(9999);
+        let control = async_control(name.len());
+        assert!(rt.enqueue_kitty_local_display(
+            32,
+            Some(1),
+            Some(1),
+            None,
+            1,
+            1,
+            0,
+            &name,
+            control
+        ));
+        rt.kitty_origin = None;
+        for _ in 0..200 {
+            rt.pump_kitty_local_completions();
+            if rt.kitty_local_pending_count() == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(rt.kitty_image_count(), 0, "gone origin stores nothing");
+        assert_eq!(rt.kitty_placement_count(), 0);
+
+        let mut rt = async_runtime();
+        rt.kitty_origin = Some(9999);
+        let mut control = async_control(name.len());
+        control.image_id = 31;
+        rt.enqueue_kitty_local_query(100, None, None, &name, control);
+        rt.kitty_origin = None;
+        for _ in 0..200 {
+            rt.pump_kitty_local_completions();
+            if rt.kitty_local_pending_count() == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(rt.take_replies().is_empty(), "gone origin answers nothing");
+        let _ = std::fs::remove_dir_all(file.parent().expect("temp parent"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn async_worker_panic_degrades_to_refusal() {
+        // Panic isolation: a panicking worker refuses without taking down
+        // the poll, and the next read still works.
+        let file = async_fixture("panic", &[0xFF, 0x00, 0x00, 0xFF]);
+        let name = async_path_bytes(&file);
+        let mut rt = async_runtime();
+        rt.kitty_local_test_panic = true;
+        let control = async_control(name.len());
+        assert!(rt.enqueue_kitty_local_display(
+            32,
+            Some(1),
+            Some(1),
+            None,
+            1,
+            1,
+            0,
+            &name,
+            control
+        ));
+        for _ in 0..200 {
+            rt.pump_kitty_local_completions();
+            if rt.kitty_local_pending_count() == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        rt.kitty_local_test_panic = false;
+        assert_eq!(rt.kitty_image_count(), 0, "panicked read stores nothing");
+        // Recovery: the queue still works after a panic.
+        let control = async_control(name.len());
+        assert!(rt.enqueue_kitty_local_display(
+            32,
+            Some(1),
+            Some(1),
+            None,
+            1,
+            1,
+            0,
+            &name,
+            control
+        ));
+        for _ in 0..200 {
+            rt.pump_kitty_local_completions();
+            if rt.kitty_local_pending_count() == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(rt.kitty_image_count(), 1, "queue recovers after panic");
+        let _ = std::fs::remove_dir_all(file.parent().expect("temp parent"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn async_fifo_stores_in_order() {
+        // Ordering smoke: single-flight FIFO completes both enqueued
+        // displays (frame N+1 cannot pass frame N by construction).
+        let file_a = async_fixture("fifo-a", &[0xFF, 0x00, 0x00, 0xFF]);
+        let file_b = async_fixture("fifo-b", &[0x00, 0xFF, 0x00, 0xFF]);
+        let name_a = async_path_bytes(&file_a);
+        let name_b = async_path_bytes(&file_b);
+        let mut rt = async_runtime();
+        let control = async_control(name_a.len());
+        assert!(rt.enqueue_kitty_local_display(
+            32,
+            Some(1),
+            Some(1),
+            None,
+            1,
+            1,
+            0,
+            &name_a,
+            control
+        ));
+        assert!(rt.enqueue_kitty_local_display(
+            32,
+            Some(1),
+            Some(1),
+            None,
+            1,
+            1,
+            0,
+            &name_b,
+            control
+        ));
+        for _ in 0..200 {
+            rt.pump_kitty_local_completions();
+            if rt.kitty_local_pending_count() == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        // Per-origin cap is two, so both enqueued; FIFO completes both.
+        assert_eq!(rt.kitty_image_count(), 2);
+        assert_eq!(rt.kitty_placement_count(), 2);
+        let _ = std::fs::remove_dir_all(file_a.parent().expect("temp parent"));
+        let _ = std::fs::remove_dir_all(file_b.parent().expect("temp parent"));
     }
 }

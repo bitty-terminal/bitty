@@ -23,6 +23,19 @@ fn make_runtime() -> Runtime {
     Runtime::with_defaults().expect("defaults must build")
 }
 
+/// Drains the CTX-1110 async local-medium worker (file-backed `t=f`
+/// frames settle on later pumps, never inside `handle_pty_bytes`).
+fn pump_settled(rt: &mut Runtime) {
+    for _ in 0..200 {
+        rt.pump_kitty_local_completions();
+        if rt.kitty_local_pending_count() == 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    rt.pump_kitty_local_completions();
+}
+
 /// 2x2 opaque red RGBA payload (`f=32`), base64 `/wAA//8AAP//AAD//wAA/w==`.
 fn red_2x2_b64() -> &'static str {
     "/wAA//8AAP//AAD//wAA/w=="
@@ -436,6 +449,7 @@ fn file_backed_frame_reuses_s3_read() {
     seq.extend_from_slice(base64_encode(&path_bytes).as_bytes());
     seq.extend_from_slice(b"\x1b\\");
     rt.handle_pty_bytes(&seq);
+    pump_settled(&mut rt);
     assert_eq!(rt.kitty_anim_frame_count(1), 2);
     let _ = std::fs::remove_dir_all(&dir);
 }

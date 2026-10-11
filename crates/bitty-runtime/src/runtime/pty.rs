@@ -572,6 +572,12 @@ impl Runtime {
         // first drain source rotates every poll: each busy session leads
         // (and so drains at least one chunk) once every `1 + panes` polls,
         // so a flooding primary cannot starve a pane, nor one pane another.
+        //
+        // CTX-1110: drain prior async local-medium completions first so
+        // arrivals apply before newly drained bytes, then drain new bytes
+        // (which only enqueue, never block), then pump again for any
+        // completions already ready.
+        self.pump_kitty_local_completions();
         let mut budget = PollBudget::new();
         let mut primary: Vec<Vec<u8>> = Vec::new();
         if let Some(seed) = seed {
@@ -622,6 +628,10 @@ impl Runtime {
             }
             self.sync_mode_caches_to_focus();
         }
+        // CTX-1110: completions for reads enqueued above that already
+        // finished (fast disks) apply here, still within the same poll's
+        // timing class; slower reads complete on later polls. Non-blocking.
+        self.pump_kitty_local_completions();
         count
     }
 
@@ -1054,15 +1064,15 @@ impl Runtime {
                 ..
             } = action
             {
-                // S3 (#1849): file-backed probes (`t=f`/`t=t`/`t=s` with
-                // `i=`) read the named object first (bounded, fail closed)
-                // and test-load the read bytes; `I=` number lookups ignore
-                // the name like direct streams. Read failures answer
-                // `EINVAL` as silent protocol replies honoring `q=`, never
-                // stderr, so probing clients never flood diagnostics.
+                // S3 (#1849) over the CTX-1110 async worker: file-backed
+                // probes (`t=f`/`t=t`/`t=s` with `i=`) enqueue a bounded
+                // worker read and answer on completion; `I=` number lookups
+                // ignore the name like direct streams. Queue-full refuses
+                // immediately as `EINVAL` honoring `q=` (never stderr).
+                // The poll never blocks on the filesystem.
                 if !control.medium.is_direct() {
-                    self.answer_kitty_local_query(format_f, width_s, height_v, &payload, control);
-                    // The query is answered (at most one bounded reply
+                    self.enqueue_kitty_local_query(format_f, width_s, height_v, &payload, control);
+                    // Deferred (or fast-refused with its reply already
                     // queued); the action is moved, so continue.
                     continue;
                 }
@@ -1091,6 +1101,23 @@ impl Runtime {
                 ..
             } = &action
             {
+                // CTX-1110: local-medium frame payloads (`r=0`) enqueue a
+                // bounded worker read (never block the poll); direct
+                // payloads and `r>0` gap edits (truth-only, no I/O) stay
+                // synchronous. Queue-full fails closed with the same
+                // rate-limited posture below.
+                if !control.medium.is_direct() && *rows_r == 0 {
+                    if !self.enqueue_kitty_local_frame(
+                        *format_f, *width_s, *height_v, payload, *control, &action,
+                    ) && let Some(suppressed) = self.kitty_log.admit_now()
+                    {
+                        eprintln!(
+                            "bitty: rejecting kitty animation frame (queue full): stored nothing{}",
+                            log_throttle::suppressed_suffix(suppressed)
+                        );
+                    }
+                    continue;
+                }
                 if let Err(err) = self.kitty_ingest_frame(
                     *format_f, *width_s, *height_v, *rows_r, payload, *control, &action,
                 ) {
@@ -1208,32 +1235,29 @@ impl Runtime {
                 control,
             } = action
             {
-                // S3 (#1849): local mediums (`t=f`/`t=t`/`t=s`) name a
-                // file/shm object; the parser already validated the name
-                // shape single-shot, so `payload` is the name bytes. Read
-                // the object under the decode caps (fail closed), then
-                // decode, store and place through the same seams as direct
-                // streams so per-origin quotas (S5) apply unchanged.
-                // Failures store nothing and paint nothing; warn loudly
-                // (rate-limited like the pixel path below).
+                // S3 (#1849) over the CTX-1110 async worker: local mediums
+                // (`t=f`/`t=t`/`t=s`) name a file/shm object; the parser
+                // already validated the name shape single-shot, so
+                // `payload` is the name bytes. Enqueue a bounded worker
+                // read (never block the poll); completion decodes, stores
+                // and places through the same seams as direct streams so
+                // per-origin quotas (S5) apply unchanged. Queue-full
+                // refuses immediately with the same rate-limited posture
+                // as the pixel path below.
                 if !control.medium.is_direct() {
                     if is_virtual_combined {
-                        if let Err(err) = self.kitty_display_local_virtual_owned_with_wire(
-                            format_f, width_s, height_v, cols_c, rows_r, payload, control,
-                        ) {
-                            // Same rate-limited rejection posture as the
-                            // pixel path below: a hostile child can spam
-                            // refused local payloads.
-                            if let Some(suppressed) = self.kitty_log.admit_now() {
-                                eprintln!(
-                                    "bitty: rejecting kitty local virtual image ({err}): stored nothing{}",
-                                    log_throttle::suppressed_suffix(suppressed)
-                                );
-                            }
+                        if !self.enqueue_kitty_local_virtual(
+                            format_f, width_s, height_v, cols_c, rows_r, &payload, control,
+                        ) && let Some(suppressed) = self.kitty_log.admit_now()
+                        {
+                            eprintln!(
+                                "bitty: rejecting kitty local virtual image (queue full): stored nothing{}",
+                                log_throttle::suppressed_suffix(suppressed)
+                            );
                         }
                         continue;
                     }
-                    if let Err(err) = self.kitty_display_local_owned_with_wire(
+                    if !self.enqueue_kitty_local_display(
                         format_f,
                         width_s,
                         height_v,
@@ -1241,18 +1265,14 @@ impl Runtime {
                         cols_c,
                         rows_r,
                         cursor_movement_c,
-                        payload,
+                        &payload,
                         control,
-                    ) {
-                        // Rate-limited (CTX-0473): a hostile child can spam
-                        // rejected kitty payloads; the parser's own warnings
-                        // stay bounded too.
-                        if let Some(suppressed) = self.kitty_log.admit_now() {
-                            eprintln!(
-                                "bitty: rejecting kitty local image ({err}): stored nothing{}",
-                                log_throttle::suppressed_suffix(suppressed)
-                            );
-                        }
+                    ) && let Some(suppressed) = self.kitty_log.admit_now()
+                    {
+                        eprintln!(
+                            "bitty: rejecting kitty local image (queue full): stored nothing{}",
+                            log_throttle::suppressed_suffix(suppressed)
+                        );
                     }
                     // The state-owned `a=p`/`a=d`/`a=a` commands were
                     // applied above. This branch consumes the remaining

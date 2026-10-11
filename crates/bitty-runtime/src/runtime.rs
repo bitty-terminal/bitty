@@ -1103,6 +1103,25 @@ pub struct Runtime {
     /// own leaf (cross-pane spoof prevention). Always restored after
     /// the pane pump; never observed outside the drain path.
     kitty_origin: Option<u64>,
+    /// Async local-medium worker queue (CTX-1110, follow-up of S3 #1918).
+    ///
+    /// The PTY poll never blocks on filesystem I/O: local-medium reads run
+    /// on short-lived worker threads (one in flight, FIFO) while the poll
+    /// keeps draining every pane. Bounded (8 global / 2 per origin,
+    /// queued + in-flight + orphans); see `runtime::kitty_file`.
+    kitty_local_queue: std::collections::VecDeque<kitty_file::KittyLocalRequest>,
+    /// In-flight local-medium worker, if any (CTX-1110, single-flight).
+    kitty_local_in_flight: Option<kitty_file::KittyLocalInFlight>,
+    /// Timed-out orphan workers still blocked in the kernel (CTX-1110).
+    /// Bounded by the global cap; reaped once finished, detached on drop.
+    kitty_local_orphans: Vec<kitty_file::KittyLocalOrphan>,
+    /// Test-only worker deadline override in ms (`0` = production default).
+    /// Unit tests only; see `runtime::kitty_file` for the contract.
+    pub(crate) kitty_local_test_timeout_ms: u64,
+    /// Test-only injected worker sleep in ms (`0` = none). Unit tests only.
+    pub(crate) kitty_local_test_delay_ms: u64,
+    /// Test-only injected worker panic. Unit tests only.
+    pub(crate) kitty_local_test_panic: bool,
     /// Scaled-blit raster cache across present frames (S6, #1849), keyed
     /// by image identity plus content generation (never a bare id), frame
     /// index, and full/visible geometry.
@@ -1625,6 +1644,12 @@ impl Runtime {
             inspect_ring: crate::inspect::InputRing::new(),
             kitty_images: bitty_rich::KittyImageLayer::new(),
             kitty_origin: None,
+            kitty_local_queue: std::collections::VecDeque::new(),
+            kitty_local_in_flight: None,
+            kitty_local_orphans: Vec::new(),
+            kitty_local_test_timeout_ms: 0,
+            kitty_local_test_delay_ms: 0,
+            kitty_local_test_panic: false,
             kitty_raster_cache: bitty_rich::KittyRasterCache::new(),
             kitty_last_frame_images: 0,
             kitty_alt_screens_latched: std::collections::BTreeSet::new(),
@@ -1874,6 +1899,12 @@ impl Runtime {
             inspect_ring: crate::inspect::InputRing::new(),
             kitty_images: bitty_rich::KittyImageLayer::new(),
             kitty_origin: None,
+            kitty_local_queue: std::collections::VecDeque::new(),
+            kitty_local_in_flight: None,
+            kitty_local_orphans: Vec::new(),
+            kitty_local_test_timeout_ms: 0,
+            kitty_local_test_delay_ms: 0,
+            kitty_local_test_panic: false,
             kitty_raster_cache: bitty_rich::KittyRasterCache::new(),
             kitty_last_frame_images: 0,
             kitty_alt_screens_latched: std::collections::BTreeSet::new(),

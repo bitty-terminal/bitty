@@ -982,7 +982,9 @@ impl Runtime {
         control: bitty_vt::KittyControlKeys,
         action: &TerminalAction,
     ) -> Result<(), KittyImageError> {
-        let wire = self
+        // Wire check first (preserves the S1 refusal for unresolvable ids
+        // on gap edits too): the value itself is only needed for `r=0`.
+        let _wire = self
             .kitty_wire_target(control.image_id, control.image_number)
             .ok_or(KittyImageError::NoAnimationTarget(control.image_id))?;
         if rows_r != 0 {
@@ -1007,17 +1009,45 @@ impl Runtime {
             }
             return Ok(());
         }
-        // New frame (`r=0`): resolve the root before any decode work, so
-        // homeless frames fail fast without allocating.
+        // New frame (`r=0`): direct payloads decode in place; local
+        // mediums read first (bounded, fail closed). Both share the
+        // bytes-ingest half below so the async worker (CTX-1110) reuses
+        // the identical decode/append/truth path with worker bytes.
+        if control.medium.is_direct() {
+            return self
+                .kitty_ingest_frame_bytes(format_f, width_s, height_v, payload, &control, action);
+        }
+        let read = self.read_frame_medium(format_f, width_s, height_v, payload, &control)?;
+        self.kitty_ingest_frame_bytes(format_f, width_s, height_v, &read, &control, action)
+    }
+
+    /// Ingests one `r=0` frame from already-available bytes (CTX-1110
+    /// completion seam over the S1 pixel half).
+    ///
+    /// Shared by [`Self::kitty_ingest_frame`] (direct payloads, or local
+    /// reads just finished synchronously) and the async local-medium
+    /// worker completion (worker bytes): resolves the wire target, decodes
+    /// and appends (full or composited partial canvas), then records the
+    /// truth gap on pixel success. Failures store nothing and record
+    /// nothing.
+    pub(super) fn kitty_ingest_frame_bytes(
+        &mut self,
+        format_f: u32,
+        width_s: Option<u32>,
+        height_v: Option<u32>,
+        bytes: &[u8],
+        control: &bitty_vt::KittyControlKeys,
+        action: &TerminalAction,
+    ) -> Result<(), KittyImageError> {
+        let wire = self
+            .kitty_wire_target(control.image_id, control.image_number)
+            .ok_or(KittyImageError::NoAnimationTarget(control.image_id))?;
+        // Resolve the root before any decode work, so homeless frames fail
+        // fast without allocating.
         let root = self
             .kitty_images
             .find_root_for_origin(self.kitty_origin, wire)
             .ok_or(KittyImageError::NoAnimationTarget(wire))?;
-        let bytes: &[u8] = if control.medium.is_direct() {
-            payload
-        } else {
-            &self.read_frame_medium(format_f, width_s, height_v, payload, &control)?
-        };
         // Borrowed decode (the caller keeps the wire bytes): admission is
         // for frame arrivals (rare control-plane events), not the hot
         // display path, so the owned zero-copy seam stays display-only.

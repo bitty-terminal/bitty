@@ -9,14 +9,16 @@
 //! - Shape: `bitty list <kind> [--format table|json|jsonl] [--socket PATH]
 //!   [--instance ID] [--no-color]` and alias `bitty ls <kind> ...` (same
 //!   executable, envelope `command` names the invoked spelling).
-//! - Kinds (task-required): `themes`, `plugins`, `instances` (singular
-//!   `theme|plugin|instance` accepted as convenience, same result).
-//!   Unknown kinds are `UsageError` (exit 2) naming the valid set. RFC
-//!   candidates (`fonts|keymaps|actions|commands|protocols`) are not invented
-//!   here: they fail closed as unknown kinds until their owning slice lands.
-//! - Class: `themes` and `plugins` are local (no instance, safe-mode clean,
-//!   no plugin VM loaded). `instances` is runtime discovery (registry scan,
-//!   live endpoint probe) but fetches no terminal content.
+//! - Kinds (task-required): `themes`, `plugins`, `instances`, `actions`,
+//!   `keymaps` (singular `theme|plugin|instance|action|keymap` accepted as
+//!   convenience, same result). Unknown kinds are `UsageError` (exit 2)
+//!   naming the valid set. RFC candidates (`fonts|commands|protocols`) are
+//!   not invented here: they fail closed as unknown kinds until their owning
+//!   slice lands.
+//! - Class: `themes`, `plugins`, `actions`, and `keymaps` are local (no
+//!   instance, safe-mode clean, no plugin VM loaded). `instances` is runtime
+//!   discovery (registry scan, live endpoint probe) but fetches no terminal
+//!   content.
 //!   Unix scans `$XDG_RUNTIME_DIR/bitty/*.sock` (plus the `BITTY_SOCKET`
 //!   parent) and probes each socket with a `connect`; Windows scans the same
 //!   registry inputs for `<instance>.sock` markers and probes each
@@ -52,6 +54,14 @@
 //!   and are out of scope here, which is how bearer scoping is respected: no
 //!   privileged read occurs, and explicit `--socket` paths that fail OS
 //!   authentication surface as exit 7 rather than data.
+//! - Actions reuse the canonical [`ChromeAction::description`](bitty_config::keymap::ChromeAction::description)
+//!   source (same strings `bitty inspect key` shows, never a parallel copy)
+//!   plus the `inspect` core-command registry summaries (no duplicated
+//!   strings). Manual-bind-only is derived from `DEFAULT_KEYMAPS` absence.
+//!   No file I/O.
+//! - Keymaps reuse the shared shipped resolver
+//!   ([`shipped_resolved_keymaps`](bitty_config::keymap::shipped_resolved_keymaps))
+//!   that `bitty inspect key` reads (same code path, no fork). No file I/O.
 //!
 //! # Exit codes (stable taxonomy)
 //!
@@ -109,7 +119,7 @@ pub const EXIT_PERM: i32 = 7;
 // Bounds
 // ---------------------------------------------------------------------------
 
-/// Maximum bytes for a kind token (plenty for `themes|plugins|instances`).
+/// Maximum bytes for a kind token (plenty for `themes|plugins|instances|actions|keymaps`).
 pub const MAX_LIST_KIND_LEN: usize = 32;
 /// Maximum bytes for a `--format` value.
 pub const MAX_LIST_FORMAT_LEN: usize = 16;
@@ -133,6 +143,10 @@ pub enum ListKind {
     Plugins,
     /// Live socket discovery (no content fetch).
     Instances,
+    /// Machine-readable chrome-action + core-command catalog (local).
+    Actions,
+    /// Resolved chord to action keymaps (local, shipped defaults).
+    Keymaps,
 }
 
 impl ListKind {
@@ -147,6 +161,8 @@ impl ListKind {
             "themes" | "theme" => Some(Self::Themes),
             "plugins" | "plugin" => Some(Self::Plugins),
             "instances" | "instance" => Some(Self::Instances),
+            "actions" | "action" => Some(Self::Actions),
+            "keymaps" | "keymap" => Some(Self::Keymaps),
             _ => None,
         }
     }
@@ -158,6 +174,8 @@ impl ListKind {
             Self::Themes => "themes",
             Self::Plugins => "plugins",
             Self::Instances => "instances",
+            Self::Actions => "actions",
+            Self::Keymaps => "keymaps",
         }
     }
 
@@ -171,6 +189,8 @@ impl ListKind {
             Self::Themes => "core.list.themes",
             Self::Plugins => "core.list.plugins",
             Self::Instances => "core.list.instances",
+            Self::Actions => "core.list.actions",
+            Self::Keymaps => "core.list.keymaps",
         }
     }
 }
@@ -245,13 +265,13 @@ impl ListRequest {
         let kind_token = kind_raw.ok_or_else(|| {
             format!(
                 "{}\n{}",
-                "bitty list: missing <kind> (want themes|plugins|instances)",
+                "bitty list: missing <kind> (want themes|plugins|instances|actions|keymaps)",
                 list_usage()
             )
         })?;
         let kind = ListKind::parse(kind_token).ok_or_else(|| {
             format!(
-                "bitty list: unknown kind {kind_token:?} (want themes|plugins|instances)\n{}",
+                "bitty list: unknown kind {kind_token:?} (want themes|plugins|instances|actions|keymaps)\n{}",
                 list_usage()
             )
         })?;
@@ -326,7 +346,7 @@ fn validate_instance_value(value: &str) -> Result<(), String> {
 /// Short usage for stderr (fail-closed exit 2 trailer).
 #[must_use]
 pub fn list_usage() -> String {
-    "usage: bitty list <themes|plugins|instances> [--format table|json|jsonl] [--socket PATH | --instance ID] [--no-color]\n       bitty ls <themes|plugins|instances> [--format table|json|jsonl] [--no-color]\n\nkinds:\n  themes     built-in theme presets (local, safe-mode clean)\n  plugins    static bundled plugin catalog, no VM (local, safe-mode clean)\n  instances  live instance discovery: instance, socket, live (runtime, no content fetch)"
+    "usage: bitty list <themes|plugins|instances|actions|keymaps> [--format table|json|jsonl] [--socket PATH | --instance ID] [--no-color]\n       bitty ls <themes|plugins|instances|actions|keymaps> [--format table|json|jsonl] [--no-color]\n\nkinds:\n  themes     built-in theme presets (local, safe-mode clean)\n  plugins    static bundled plugin catalog, no VM (local, safe-mode clean)\n  instances  live instance discovery: instance, socket, live (runtime, no content fetch)\n  actions    chrome actions + core commands catalog (local, safe-mode clean)\n  keymaps    resolved chord to action table, shipped defaults (local, safe-mode clean)"
         .to_string()
 }
 
@@ -336,7 +356,7 @@ pub fn list_help_text(invoked_as: &str) -> String {
     format!(
         "bitty {invoked_as} — enumerate resources (local or runtime)\n\
          \n\
-         Usage: bitty {invoked_as} <themes|plugins|instances> [--format table|json|jsonl] [--socket PATH | --instance ID] [--no-color]\n\
+         Usage: bitty {invoked_as} <themes|plugins|instances|actions|keymaps> [--format table|json|jsonl] [--socket PATH | --instance ID] [--no-color]\n\
          \n\
          Kinds:\n  \
            themes     Built-in theme preset catalog from bitty-config::theme (e.g. bitty-dark,\n  \
@@ -352,7 +372,16 @@ pub fn list_help_text(invoked_as: &str) -> String {
                        transport lands (issue #1800), so Windows rows report stale/empty\n  \
                        until then. Terminal content is never fetched;\n  \
                        detailed snapshots need debug.inspect via ctl/DevTools (bearer scoping\n  \
-                       respected by not reading privileged data here).\n\
+                       respected by not reading privileged data here).\n  \
+           actions    Machine-readable action catalog for users and doc tooling\n  \
+                      (consumer: bitty-manual#15 drift guard). Every ChromeAction variant\n  \
+                      plus every registered core.* command. Local class: no instance,\n  \
+                      no file I/O, safe-mode clean; rows needing live state carry\n  \
+                      requires_runtime true (chrome actions) or class runtime (core).\n  \
+           keymaps    Resolved chord to action table from the shipped defaults\n  \
+                      (same resolver `bitty inspect key` reads: shared code path, no fork).\n  \
+                      Local class: no instance, no file I/O, safe-mode clean.\n  \
+                      Header and JSON meta carry the mod_key context (alt default).\n\
          \n\
          Options:\n  \
            --format SHAPE  table (default, human, not a contract) | json | jsonl (envelope v1)\n  \
@@ -367,7 +396,17 @@ pub fn list_help_text(invoked_as: &str) -> String {
            Stdout carries the result; stderr carries diagnostics. JSON/JSONL use\n  \
            envelope {{\"v\":1,\"command\":\"{invoked_as}\",\"ok\":true,\"result\":{{\"kind\":...}}}}.\n  \
            Usage errors (exit 2) go to stderr with no stdout envelope. Runtime\n  \
-           failures for `instances` emit ok:false envelopes (exit 6/7).\n\
+           failures for `instances` emit ok:false envelopes (exit 6/7).\n  \
+           actions result keys: kind, count (actions plus commands), actions\n  \
+           (array of {{\"id\",\"description\",\"manual_bind_only\",\"requires_runtime\",\"kind\":\"chrome\"}}),\n  \
+           commands (array of {{\"id\",\"description\",\"class\",\"requires_runtime\",\"kind\",\"scopes\",\"owner\"}}).\n  \
+           Action descriptions reuse the canonical ChromeAction::description source\n  \
+           (same strings inspect key shows); core descriptions reuse the\n  \
+           inspect command registry summaries. Manual-bind-only is derived from\n  \
+           DEFAULT_KEYMAPS (absent means manual).\n  \
+           keymaps result keys: kind, count, mod_key, source, keymaps\n  \
+           (array of {{\"chord\",\"action\",\"description\",\"context\",\"source\"}}).\n  \
+           The table header names mod_key and source; JSON meta carries both.\n\
          \n\
          Exit codes:\n  \
            0 success (empty instances is success with count 0)\n  \
@@ -380,6 +419,8 @@ pub fn list_help_text(invoked_as: &str) -> String {
            bitty list plugins --format json\n  \
            bitty list instances\n  \
            bitty list instances --format jsonl\n  \
+           bitty list actions --format json\n  \
+           bitty list keymaps --format table\n  \
            bitty ls themes --format table\n"
     )
 }
@@ -498,6 +539,157 @@ pub fn list_plugins_from_manifests(
         })
         .collect();
     out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Action catalog (CTX-1127, issue #1934; consumer bitty-manual#15)
+// ---------------------------------------------------------------------------
+
+/// One chrome-action row.
+///
+/// `id` is the canonical spelling, `description` reuses the canonical
+/// [`ChromeAction::description`](bitty_config::keymap::ChromeAction::description)
+/// source (same strings `bitty inspect key` shows — never a parallel copy),
+/// `manual_bind_only` is derived from `DEFAULT_KEYMAPS` absence, and
+/// `requires_runtime` marks entries needing live state (all chrome actions
+/// need the live window; `list` itself stays local).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChromeActionInfo {
+    /// Canonical id spelling (e.g. `close_view`, `goto_split:left`).
+    pub id: String,
+    /// One-line English description (canonical source).
+    pub description: String,
+    /// True when no shipped default binds this variant.
+    pub manual_bind_only: bool,
+    /// True when execution needs live runtime state.
+    pub requires_runtime: bool,
+}
+
+/// One core-command row (reuses the `inspect` registry summaries directly).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoreCommandInfo {
+    /// Stable registry id (e.g. `core.terminal.text`).
+    pub id: String,
+    /// One-line description (registry summary, no copy).
+    pub description: String,
+    /// Entry class (`local`, `runtime`, or `extension`).
+    pub class: String,
+    /// True when `class` is `runtime`.
+    pub requires_runtime: bool,
+    /// Entry kind (always `command` today).
+    pub kind: String,
+    /// Required scopes.
+    pub scopes: Vec<String>,
+    /// Owning service (`core`).
+    pub owner: String,
+}
+
+/// Enumerate every chrome-action variant (local, no I/O).
+///
+/// Pure: builds from
+/// [`all_chrome_actions`](bitty_config::keymap::all_chrome_actions) and the
+/// canonical description/manual/runtime accessors. Sorted by `id` for stable
+/// output.
+#[must_use]
+pub fn list_chrome_actions() -> Vec<ChromeActionInfo> {
+    let mut out: Vec<ChromeActionInfo> = bitty_config::keymap::all_chrome_actions()
+        .iter()
+        .map(|action| ChromeActionInfo {
+            id: action.canonical(),
+            description: action.description().to_string(),
+            manual_bind_only: action.is_manual_bind_only(),
+            requires_runtime: action.requires_runtime(),
+        })
+        .collect();
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
+/// Enumerate every registered core command (local, no I/O).
+///
+/// Pure: reuses [`crate::inspect::CORE_COMMANDS`] summaries directly, so the
+/// `inspect command` and `list actions` surfaces can never disagree silently.
+/// Sorted by `id` for stable output.
+#[must_use]
+pub fn list_core_commands() -> Vec<CoreCommandInfo> {
+    let mut out: Vec<CoreCommandInfo> = crate::inspect::CORE_COMMANDS
+        .iter()
+        .map(|c| CoreCommandInfo {
+            id: c.id.to_string(),
+            description: c.summary.to_string(),
+            class: c.class.to_string(),
+            requires_runtime: c.class == "runtime",
+            kind: c.kind.to_string(),
+            scopes: c.scopes.iter().map(|s| (*s).to_string()).collect(),
+            owner: c.owner.to_string(),
+        })
+        .collect();
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Keymap catalog (CTX-1127, issue #1934)
+// ---------------------------------------------------------------------------
+
+/// One resolved keymap row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeymapInfo {
+    /// Canonical chord (e.g. `alt+h`).
+    pub chord: String,
+    /// Canonical action (e.g. `goto_split:left`).
+    pub action: String,
+    /// One-line action description (canonical source).
+    pub description: String,
+    /// Keymap context (always `global` today).
+    pub context: String,
+    /// Owning layer (`default` for shipped entries, `user` for overrides).
+    pub source: String,
+}
+
+/// Shipped `mod_key` plus its provenance (local, no I/O).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeymapMeta {
+    /// Canonical `mod_key` (`alt` default).
+    pub mod_key: String,
+    /// Provenance (`default`: built-in defaults only).
+    pub source: String,
+}
+
+/// Effective `mod_key` for the shipped table (local, no I/O).
+#[must_use]
+pub fn keymap_meta() -> KeymapMeta {
+    let effective = bitty_config::EffectiveConfig::default();
+    KeymapMeta {
+        mod_key: effective.mod_key.canonical().to_string(),
+        source: "default".to_string(),
+    }
+}
+
+/// Enumerate the resolved chord to action table (local, no I/O).
+///
+/// Shared code path with `bitty inspect key`: both resolve through
+/// [`shipped_resolved_keymaps`](bitty_config::keymap::shipped_resolved_keymaps)
+/// (built-in defaults, no file I/O), so a chord resolves identically in both
+/// surfaces. Sorted by chord for stable output.
+#[must_use]
+pub fn list_keymaps() -> Vec<KeymapInfo> {
+    let mut out: Vec<KeymapInfo> = bitty_config::keymap::shipped_resolved_keymaps()
+        .iter()
+        .map(|entry| KeymapInfo {
+            chord: entry.chord.canonical(),
+            action: entry.action.canonical(),
+            description: entry.action.description().to_string(),
+            context: entry.context.clone(),
+            source: if entry.from_default {
+                "default".to_string()
+            } else {
+                "user".to_string()
+            },
+        })
+        .collect();
+    out.sort_by(|a, b| a.chord.cmp(&b.chord));
     out
 }
 
@@ -1295,8 +1487,125 @@ pub fn format_success_envelope(
             }
             out.push(']');
         }
+        ListKind::Actions => {
+            // Legacy entry point carries no action rows; the `actions` dispatch
+            // uses `format_actions_envelope`. Emit the stable empty shape so
+            // the envelope stays total over every kind.
+            out.push_str(",\"count\":0,\"actions\":[],\"commands\":[]");
+        }
+        ListKind::Keymaps => {
+            // Same total-shape note as `Actions`: the `keymaps` dispatch uses
+            // `format_keymaps_envelope`.
+            let meta = keymap_meta();
+            let _ = write!(
+                out,
+                ",\"count\":0,\"mod_key\":\"{}\",\"source\":\"{}\",\"keymaps\":[]",
+                json_escape(&meta.mod_key),
+                json_escape(&meta.source)
+            );
+        }
     }
     out.push_str("}}");
+    out
+}
+
+/// Render the success envelope for `bitty list actions` (CTX-1127).
+///
+/// Stable keys: `kind`, `count` (actions plus commands), `actions` (array of
+/// `{"id","description","manual_bind_only","requires_runtime","kind":"chrome"}`),
+/// `commands` (array of
+/// `{"id","description","class","requires_runtime","kind","scopes","owner"}`).
+/// Documented in `list --help` output contract.
+#[must_use]
+pub fn format_actions_envelope(
+    spelling: &str,
+    actions: &[ChromeActionInfo],
+    commands: &[CoreCommandInfo],
+) -> String {
+    let mut out = String::with_capacity(2048);
+    let _ = write!(
+        out,
+        "{{\"v\":1,\"command\":\"{}\",\"ok\":true,\"result\":{{\"kind\":\"actions\",\"count\":{}",
+        json_escape(spelling),
+        actions.len() + commands.len()
+    );
+    out.push_str(",\"actions\":[");
+    for (i, a) in actions.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let _ = write!(
+            out,
+            "{{\"id\":\"{}\",\"description\":\"{}\",\"manual_bind_only\":{},\"requires_runtime\":{},\"kind\":\"chrome\"}}",
+            json_escape(&a.id),
+            json_escape(&a.description),
+            a.manual_bind_only,
+            a.requires_runtime
+        );
+    }
+    out.push_str("],\"commands\":[");
+    for (i, c) in commands.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let mut scopes = String::from("[");
+        for (j, s) in c.scopes.iter().enumerate() {
+            if j > 0 {
+                scopes.push(',');
+            }
+            let _ = write!(scopes, "\"{}\"", json_escape(s));
+        }
+        scopes.push(']');
+        let _ = write!(
+            out,
+            "{{\"id\":\"{}\",\"description\":\"{}\",\"class\":\"{}\",\"requires_runtime\":{},\"kind\":\"{}\",\"scopes\":{scopes},\"owner\":\"{}\"}}",
+            json_escape(&c.id),
+            json_escape(&c.description),
+            json_escape(&c.class),
+            c.requires_runtime,
+            json_escape(&c.kind),
+            json_escape(&c.owner),
+        );
+    }
+    out.push_str("]}}");
+    out
+}
+
+/// Render the success envelope for `bitty list keymaps` (CTX-1127).
+///
+/// Stable keys: `kind`, `count`, `mod_key`, `source`, `keymaps` (array of
+/// `{"chord","action","description","context","source"}`). Documented in
+/// `list --help` output contract.
+#[must_use]
+pub fn format_keymaps_envelope(
+    spelling: &str,
+    meta: &KeymapMeta,
+    keymaps: &[KeymapInfo],
+) -> String {
+    let mut out = String::with_capacity(2048);
+    let _ = write!(
+        out,
+        "{{\"v\":1,\"command\":\"{}\",\"ok\":true,\"result\":{{\"kind\":\"keymaps\",\"count\":{},\"mod_key\":\"{}\",\"source\":\"{}\",\"keymaps\":[",
+        json_escape(spelling),
+        keymaps.len(),
+        json_escape(&meta.mod_key),
+        json_escape(&meta.source)
+    );
+    for (i, k) in keymaps.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let _ = write!(
+            out,
+            "{{\"chord\":\"{}\",\"action\":\"{}\",\"description\":\"{}\",\"context\":\"{}\",\"source\":\"{}\"}}",
+            json_escape(&k.chord),
+            json_escape(&k.action),
+            json_escape(&k.description),
+            json_escape(&k.context),
+            json_escape(&k.source)
+        );
+    }
+    out.push_str("]}}");
     out
 }
 
@@ -1493,6 +1802,75 @@ pub fn format_instances_table(instances: &[InstanceInfo], no_color: bool) -> Str
     out
 }
 
+/// Render actions as a human table (CTX-1127).
+///
+/// Two sections: chrome actions (`KIND chrome`) then core commands (`KIND
+/// command`). Descriptions reuse the canonical sources; manual-bind-only and
+/// runtime columns mark entries needing explicit binds or live state.
+#[must_use]
+pub fn format_actions_table(
+    actions: &[ChromeActionInfo],
+    commands: &[CoreCommandInfo],
+    no_color: bool,
+) -> String {
+    let color = color_enabled(no_color);
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{}\n",
+        bold("KIND ID DESCRIPTION MANUAL_BIND RUNTIME", color)
+    ));
+    if actions.is_empty() && commands.is_empty() {
+        out.push_str("(no actions)\n");
+        return out;
+    }
+    for a in actions {
+        out.push_str(&format!(
+            "chrome {} {} {} {}\n",
+            a.id,
+            a.description,
+            if a.manual_bind_only { "yes" } else { "no" },
+            if a.requires_runtime {
+                "runtime"
+            } else {
+                "local"
+            }
+        ));
+    }
+    for c in commands {
+        out.push_str(&format!(
+            "command {} {} - {}\n",
+            c.id, c.description, c.class
+        ));
+    }
+    out
+}
+
+/// Render keymaps as a human table (CTX-1127).
+///
+/// Header names the `mod_key` context and source so the table carries the
+/// same meta as the JSON envelope. Rows are `chord action context source`.
+#[must_use]
+pub fn format_keymaps_table(meta: &KeymapMeta, keymaps: &[KeymapInfo], no_color: bool) -> String {
+    let color = color_enabled(no_color);
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# mod_key: {} (source: {})\n",
+        meta.mod_key, meta.source
+    ));
+    out.push_str(&format!("{}\n", bold("CHORD ACTION CONTEXT SOURCE", color)));
+    if keymaps.is_empty() {
+        out.push_str("(no keymaps)\n");
+        return out;
+    }
+    for k in keymaps {
+        out.push_str(&format!(
+            "{} {} {} {}\n",
+            k.chord, k.action, k.context, k.source
+        ));
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Dispatch (called by main.rs; returns process exit code)
 // ---------------------------------------------------------------------------
@@ -1500,7 +1878,8 @@ pub fn format_instances_table(instances: &[InstanceInfo], no_color: bool) -> Str
 /// Run `bitty list` from a validated request; prints to stdout, diagnostics
 /// to stderr, and returns the process exit code.
 ///
-/// - Themes/plugins always succeed (exit 0, even when empty in tests).
+/// - Themes/plugins/actions/keymaps always succeed (exit 0, even when empty
+///   in tests). Actions and keymaps are local (no instance, no file I/O).
 /// - Instances maps discovery failures to ok:false envelopes for json/jsonl
 ///   (exit 6/7) and to stderr + exit code for table (no partial table).
 pub fn run_list(request: &ListRequest) -> i32 {
@@ -1580,6 +1959,44 @@ pub fn run_list(request: &ListRequest) -> i32 {
                 }
             }
         }
+        ListKind::Actions => {
+            let actions = list_chrome_actions();
+            let commands = list_core_commands();
+            match request.format {
+                ListFormat::Table => {
+                    print!(
+                        "{}",
+                        format_actions_table(&actions, &commands, request.no_color)
+                    );
+                }
+                ListFormat::Json | ListFormat::Jsonl => {
+                    println!(
+                        "{}",
+                        format_actions_envelope(&request.spelling, &actions, &commands)
+                    );
+                }
+            }
+            EXIT_OK
+        }
+        ListKind::Keymaps => {
+            let meta = keymap_meta();
+            let keymaps = list_keymaps();
+            match request.format {
+                ListFormat::Table => {
+                    print!(
+                        "{}",
+                        format_keymaps_table(&meta, &keymaps, request.no_color)
+                    );
+                }
+                ListFormat::Json | ListFormat::Jsonl => {
+                    println!(
+                        "{}",
+                        format_keymaps_envelope(&request.spelling, &meta, &keymaps)
+                    );
+                }
+            }
+            EXIT_OK
+        }
     }
 }
 
@@ -1637,6 +2054,10 @@ mod tests {
         assert_eq!(ListKind::parse("plugin"), Some(ListKind::Plugins));
         assert_eq!(ListKind::parse("instances"), Some(ListKind::Instances));
         assert_eq!(ListKind::parse("Instance"), Some(ListKind::Instances));
+        assert_eq!(ListKind::parse("actions"), Some(ListKind::Actions));
+        assert_eq!(ListKind::parse("Action"), Some(ListKind::Actions));
+        assert_eq!(ListKind::parse("keymaps"), Some(ListKind::Keymaps));
+        assert_eq!(ListKind::parse("Keymap"), Some(ListKind::Keymaps));
         assert_eq!(ListKind::parse("fonts"), None);
         assert_eq!(ListKind::parse(""), None);
         assert_eq!(ListKind::parse("themes;rm"), None);
@@ -2172,5 +2593,204 @@ mod tests {
             "world-writable scan dir must fail closed, got: {rows:?}"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ── CTX-1127 actions/keymaps catalog (issue #1934) ─────────────────────
+
+    #[test]
+    fn actions_catalog_matches_registry_counts() {
+        let chrome = list_chrome_actions();
+        let core = list_core_commands();
+        assert_eq!(
+            chrome.len(),
+            bitty_config::keymap::all_chrome_actions().len(),
+            "chrome rows must match variant catalog"
+        );
+        assert_eq!(
+            core.len(),
+            crate::inspect::CORE_COMMANDS.len(),
+            "core rows must match registry"
+        );
+        // Ids are unique across the combined catalog.
+        let mut ids = std::collections::HashSet::new();
+        for a in &chrome {
+            assert!(!a.description.is_empty(), "description empty for {}", a.id);
+            assert!(ids.insert(a.id.clone()), "duplicate action id {}", a.id);
+        }
+        for c in &core {
+            assert!(!c.description.is_empty(), "description empty for {}", c.id);
+            assert!(ids.insert(c.id.clone()), "duplicate command id {}", c.id);
+        }
+        // Chrome rows all mark runtime (local verb, runtime-dependent rows).
+        for a in &chrome {
+            assert!(a.requires_runtime, "chrome {} must mark runtime", a.id);
+        }
+        // Core runtime marking follows the registry class.
+        for c in &core {
+            assert_eq!(
+                c.requires_runtime,
+                c.class == "runtime",
+                "core {} class/runtime mismatch",
+                c.id
+            );
+        }
+    }
+
+    #[test]
+    fn actions_descriptions_reuse_canonical_source() {
+        // Chrome descriptions are exactly the canonical method strings (no
+        // parallel copy): compare row by row against `all_chrome_actions`.
+        let catalog = bitty_config::keymap::all_chrome_actions();
+        let rows = list_chrome_actions();
+        for action in &catalog {
+            let id = action.canonical();
+            let row = rows.iter().find(|r| r.id == id).unwrap_or_else(|| {
+                panic!("catalog id {id:?} missing from list rows");
+            });
+            assert_eq!(row.description, action.description(), "drift for {id}");
+            assert_eq!(
+                row.manual_bind_only,
+                action.is_manual_bind_only(),
+                "manual flag drift for {id}"
+            );
+        }
+        // Core descriptions are exactly the registry summaries.
+        let core_rows = list_core_commands();
+        for reg in crate::inspect::CORE_COMMANDS {
+            let row = core_rows
+                .iter()
+                .find(|r| r.id == reg.id)
+                .unwrap_or_else(|| panic!("registry id {:?} missing", reg.id));
+            assert_eq!(row.description, reg.summary, "drift for {}", reg.id);
+        }
+    }
+
+    #[test]
+    fn actions_envelope_shape_is_stable() {
+        let chrome = list_chrome_actions();
+        let core = list_core_commands();
+        let env = format_actions_envelope("list", &chrome, &core);
+        assert!(env.contains("\"v\":1"), "envelope: {env:?}");
+        assert!(env.contains("\"command\":\"list\""), "envelope: {env:?}");
+        assert!(env.contains("\"ok\":true"), "envelope: {env:?}");
+        assert!(env.contains("\"kind\":\"actions\""), "envelope: {env:?}");
+        assert!(
+            env.contains(&format!("\"count\":{}", chrome.len() + core.len())),
+            "count: {env:?}"
+        );
+        assert!(env.contains("\"actions\":["), "envelope: {env:?}");
+        assert!(env.contains("\"commands\":["), "envelope: {env:?}");
+        assert!(env.contains("\"manual_bind_only\":"), "envelope: {env:?}");
+        assert!(env.contains("\"requires_runtime\":"), "envelope: {env:?}");
+        assert!(env.contains("close_view"), "envelope: {env:?}");
+        assert!(env.contains("core.terminal.text"), "envelope: {env:?}");
+        // Alias spelling propagates to the envelope command field.
+        let alias = format_actions_envelope("ls", &chrome, &core);
+        assert!(alias.contains("\"command\":\"ls\""));
+    }
+
+    #[test]
+    fn actions_table_smoke() {
+        let chrome = list_chrome_actions();
+        let core = list_core_commands();
+        let table = format_actions_table(&chrome, &core, true);
+        assert!(table.contains("KIND ID DESCRIPTION"), "table: {table:?}");
+        assert!(table.contains("close_view"), "table: {table:?}");
+        assert!(table.contains("core.terminal.text"), "table: {table:?}");
+        assert!(table.contains("chrome"), "table: {table:?}");
+        assert!(table.contains("command"), "table: {table:?}");
+    }
+
+    #[test]
+    fn keymaps_resolution_matches_inspect_on_sample_chords() {
+        let rows = list_keymaps();
+        let meta = keymap_meta();
+        assert_eq!(meta.mod_key, "alt");
+        assert_eq!(meta.source, "default");
+        assert_eq!(
+            rows.len(),
+            bitty_config::keymap::DEFAULT_KEYMAPS.len(),
+            "shipped table must cover every default"
+        );
+        // Bound chords resolve identically in both surfaces (shared path).
+        for sample in ["alt+h", "alt+n", "ctrl+shift+c", "alt+tab"] {
+            let info = crate::inspect::inspect_key(sample);
+            assert!(info.bound, "sample {sample:?} must stay bound");
+            let action = info.action.clone().expect("bound action");
+            let row = rows
+                .iter()
+                .find(|r| r.chord == info.canonical)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "chord {sample:?} canonical {:?} missing from list",
+                        info.canonical
+                    );
+                });
+            assert_eq!(row.action, action, "mismatch for {sample:?}");
+            assert_eq!(row.context, info.context.clone().unwrap_or_default());
+            // Description reuses the same canonical source.
+            let parsed =
+                bitty_config::keymap::ChromeAction::parse(&action).expect("parse bound action");
+            assert_eq!(row.description, parsed.description());
+            assert_eq!(
+                info.description.as_deref(),
+                Some(parsed.description()),
+                "inspect description drift for {sample:?}"
+            );
+        }
+        // Unbound chords succeed in inspect with bound:false and never appear
+        // in the shipped table (single-owner rule: they reach the shell).
+        let free = crate::inspect::inspect_key("ctrl+shift+f9");
+        assert!(!free.bound);
+        assert!(rows.iter().all(|r| r.chord != free.canonical));
+    }
+
+    #[test]
+    fn keymaps_envelope_and_table_shapes() {
+        let meta = keymap_meta();
+        let rows = list_keymaps();
+        let env = format_keymaps_envelope("list", &meta, &rows);
+        assert!(env.contains("\"v\":1"), "envelope: {env:?}");
+        assert!(env.contains("\"kind\":\"keymaps\""), "envelope: {env:?}");
+        assert!(env.contains("\"mod_key\":\"alt\""), "envelope: {env:?}");
+        assert!(env.contains("\"source\":\"default\""), "envelope: {env:?}");
+        assert!(
+            env.contains(&format!("\"count\":{}", rows.len())),
+            "count: {env:?}"
+        );
+        assert!(env.contains("\"chord\":\"alt+h\""), "envelope: {env:?}");
+        assert!(env.contains("goto_split:left"), "envelope: {env:?}");
+        let table = format_keymaps_table(&meta, &rows, true);
+        assert!(table.contains("mod_key: alt"), "table: {table:?}");
+        assert!(
+            table.contains("CHORD ACTION CONTEXT SOURCE"),
+            "table: {table:?}"
+        );
+        assert!(table.contains("alt+h"), "table: {table:?}");
+    }
+
+    #[test]
+    fn list_help_documents_actions_keymaps_contract() {
+        let help = list_help_text("list");
+        assert!(
+            help.contains("actions"),
+            "help must name actions, got {help:?}"
+        );
+        assert!(
+            help.contains("keymaps"),
+            "help must name keymaps, got {help:?}"
+        );
+        assert!(
+            help.contains("manual_bind_only"),
+            "help must document actions JSON keys, got {help:?}"
+        );
+        assert!(
+            help.contains("mod_key"),
+            "help must document keymaps meta, got {help:?}"
+        );
+        assert!(
+            help.contains("bitty list actions"),
+            "help must carry examples, got {help:?}"
+        );
     }
 }

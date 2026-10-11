@@ -373,9 +373,10 @@ pub struct CommandInfo {
     pub owner: &'static str,
 }
 
-/// Static core command surface: the 11 `ctl` executables plus the 3 `list`
+/// Static core command surface: the 11 `ctl` executables plus the 5 `list`
 /// executables. Summaries mirror the `ctl --help` and `list --help` texts so
-/// the three surfaces can never disagree silently.
+/// the three surfaces can never disagree silently. `bitty list actions`
+/// reuses these summaries directly (no copied strings).
 pub const CORE_COMMANDS: &[CommandInfo] = &[
     CommandInfo {
         id: "core.instance.list",
@@ -489,6 +490,22 @@ pub const CORE_COMMANDS: &[CommandInfo] = &[
         summary: "Enumerate live instances via socket discovery (no content fetch).",
         owner: "core",
     },
+    CommandInfo {
+        id: "core.list.actions",
+        kind: "command",
+        class: "local",
+        scopes: &[],
+        summary: "Enumerate chrome actions and core commands (local catalog).",
+        owner: "core",
+    },
+    CommandInfo {
+        id: "core.list.keymaps",
+        kind: "command",
+        class: "local",
+        scopes: &[],
+        summary: "Enumerate resolved chord to action keymaps (local, shipped defaults).",
+        owner: "core",
+    },
 ];
 
 /// Normalize a registry id for comparison: `:` and `.` compare equivalently,
@@ -555,14 +572,22 @@ pub struct KeyInfo {
     pub bound: bool,
     /// Owning action canonical name (e.g. `copy_to_clipboard`).
     pub action: Option<String>,
+    /// One-line action description from the canonical
+    /// [`ChromeAction::description`](bitty_config::keymap::ChromeAction::description)
+    /// source (same strings `bitty list actions` shows).
+    pub description: Option<String>,
     /// Keymap context (always `global` today).
     pub context: Option<String>,
     /// Owning layer (`default` for shipped entries).
     pub owner: String,
 }
 
-/// Resolve a chord against the shipped defaults.
+/// Resolve a chord against the shipped defaults (CTX-1127, issue #1934).
 ///
+/// Shared code path with `bitty list keymaps`: both resolve through
+/// [`shipped_resolved_keymaps`](bitty_config::keymap::shipped_resolved_keymaps)
+/// (built-in defaults via `resolve_keymaps`, no file I/O, safe-mode clean),
+/// so a chord resolves identically in both surfaces with no forked logic.
 /// The query was already validated by [`InspectRequest::validate`]
 /// (`Chord::parse` succeeds); a parse failure here maps to unbound rather
 /// than panicking (defense in depth for direct API callers).
@@ -572,7 +597,7 @@ pub fn inspect_key(query: &str) -> KeyInfo {
     let canonical = parsed
         .as_ref()
         .map_or_else(|_| query.trim().to_string(), |chord| chord.canonical());
-    let defaults = bitty_config::keymap::default_keymaps().unwrap_or_default();
+    let defaults = bitty_config::keymap::shipped_resolved_keymaps();
     if let Ok(want) = parsed {
         for entry in &defaults {
             if entry.chord.canonical() == want.canonical() {
@@ -580,6 +605,7 @@ pub fn inspect_key(query: &str) -> KeyInfo {
                     canonical: entry.chord.canonical(),
                     bound: true,
                     action: Some(entry.action.canonical()),
+                    description: Some(entry.action.description().to_string()),
                     context: Some(entry.context.clone()),
                     owner: if entry.from_default {
                         "default".to_string()
@@ -594,6 +620,7 @@ pub fn inspect_key(query: &str) -> KeyInfo {
         canonical,
         bound: false,
         action: None,
+        description: None,
         context: None,
         owner: "pty".to_string(),
     }
@@ -962,12 +989,16 @@ pub fn result_key_json(query: &str, info: &KeyInfo) -> String {
         .action
         .as_deref()
         .map_or_else(|| "null".to_string(), |a| format!("\"{}\"", json_escape(a)));
+    let description = info
+        .description
+        .as_deref()
+        .map_or_else(|| "null".to_string(), |d| format!("\"{}\"", json_escape(d)));
     let context = info
         .context
         .as_deref()
         .map_or_else(|| "null".to_string(), |c| format!("\"{}\"", json_escape(c)));
     format!(
-        "{{\"target\":\"key\",\"query\":\"{}\",\"canonical\":\"{}\",\"bound\":{},\"action\":{action},\"context\":{context},\"owner\":\"{}\"}}",
+        "{{\"target\":\"key\",\"query\":\"{}\",\"canonical\":\"{}\",\"bound\":{},\"action\":{action},\"description\":{description},\"context\":{context},\"owner\":\"{}\"}}",
         json_escape(query),
         json_escape(&info.canonical),
         info.bound,
@@ -1057,10 +1088,11 @@ pub fn format_plugin_command_table(query: &str, info: &PluginCommandInfo) -> Str
 pub fn format_key_table(query: &str, info: &KeyInfo) -> String {
     if info.bound {
         format!(
-            "key {}\n  canonical: {}\n  bound: yes\n  action: {}\n  context: {}\n  owner: {} (shipped defaults; user overrides via config keymaps)\n",
+            "key {}\n  canonical: {}\n  bound: yes\n  action: {}\n  description: {}\n  context: {}\n  owner: {} (shipped defaults; user overrides via config keymaps)\n",
             query,
             info.canonical,
             info.action.as_deref().unwrap_or("(none)"),
+            info.description.as_deref().unwrap_or("(none)"),
             info.context.as_deref().unwrap_or("(none)"),
             info.owner
         )

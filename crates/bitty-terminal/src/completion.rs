@@ -111,6 +111,7 @@ const COMPLETION_FLAGS: &str = "--help --version --verbose --log-level --headles
 const BASH_SCRIPT: &str = r#"# bitty completion for Bash (static v1 core tree; generated, do not edit).
 # Install: bitty completion bash >> ~/.bash_completion
 _bitty_complete() {
+    local cur cmds flags
     cmds="run ctl config cfg plugin extension list ls inspect dev doctor cmd x completion comp version init shell-init help"
     flags="--help --version --verbose --log-level --headless --test-mode --safe --fail-loud --mascot --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init"
     cur="${COMP_WORDS[COMP_CWORD]}"
@@ -411,6 +412,30 @@ mod tests {
         }
         for flag in ["--format", "--socket", "--no-color"] {
             assert!(completion_flags().contains(flag), "flags missing {flag}");
+        }
+    }
+
+    #[test]
+    fn scripts_exclude_hidden_component_alias() {
+        // The hidden `component` alias (issue #1959) must not appear as a
+        // standalone token in any completion script; only the canonical
+        // `extension` spelling is offered. Split on non-alphanumeric
+        // boundaries so `--with-components` does not false-positive.
+        for shell in [
+            CompletionShell::Bash,
+            CompletionShell::Zsh,
+            CompletionShell::Fish,
+            CompletionShell::Powershell,
+            CompletionShell::Nushell,
+        ] {
+            let script = completion_script(shell);
+            let leaks_alias = script
+                .split(|c: char| !c.is_alphanumeric())
+                .any(|tok| tok == "component");
+            assert!(
+                !leaks_alias,
+                "shell {shell:?} leaks hidden `component` alias"
+            );
         }
     }
 

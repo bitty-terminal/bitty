@@ -1088,8 +1088,9 @@ impl Runtime {
             }
             // Kitty animation frames (S1, #1849): `a=f` appends pixel
             // frames to the origin-scoped wire identity's stored root
-            // (`r=0`), or edits that frame's gap in terminal truth only
-            // (`r>0`, payload dropped — pixel edits go through `a=c`).
+            // (`r=0`), edits one existing frame's pixels in place (`r>0`
+            // with payload), or edits that frame's gap in terminal truth
+            // only (`r>0` with an empty payload).
             // Pixels ingest before truth records (store-first): a refused
             // frame stores nothing and records nothing, so truth gaps
             // never outnumber stored frames and playback never names a
@@ -1106,12 +1107,13 @@ impl Runtime {
                 ..
             } = &action
             {
-                // CTX-1110: local-medium frame payloads (`r=0`) enqueue a
-                // bounded worker read (never block the poll); direct
-                // payloads and `r>0` gap edits (truth-only, no I/O) stay
+                // CTX-1110/CTX-1123: local-medium frame payloads (`r=0`
+                // appends, `r>0` pixel edits) enqueue a bounded worker read
+                // (never block the poll); direct payloads and `r>0`
+                // gap-only edits (empty payload: truth-only, no I/O) stay
                 // synchronous. Queue-full fails closed with the same
                 // rate-limited posture below.
-                if !control.medium.is_direct() && *rows_r == 0 {
+                if !control.medium.is_direct() && (*rows_r == 0 || !payload.is_empty()) {
                     if !self.enqueue_kitty_local_frame(
                         *format_f, *width_s, *height_v, payload, *control, &action,
                     ) {

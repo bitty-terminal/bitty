@@ -266,6 +266,13 @@
 //! with a `c=` base stores instead of tripping
 //! [`KittyPlacementError::FrameDimensionsMismatch`].
 //!
+//! `a=f` edits (`r>0`): the wire extent composites onto the existing frame
+//! itself in place — the background canvas is the edited frame, never the
+//! wire `c=` base or `Y=` color — with the wire `X=` composition mode at
+//! the wire `x=`/`y=` offset. Missing frames, unknown modes, and
+//! out-of-bounds rects refuse with nothing edited; byte totals are
+//! unchanged, so no quota can trip.
+//!
 //! Wire identity: every stored image carries the transmitting command's
 //! wire `i=` id ([`KittyPlacedImage::wire_image`], `0` anonymous) scoped
 //! by its origin, so `a=f`/`a=c` resolve their target without touching
@@ -1766,6 +1773,116 @@ impl KittyImageLayer {
                 }
             } else {
                 blend_rect_over(dest_bytes, &window, width, dst_x, dst_y, w, h);
+            }
+            img.generation = img.generation.wrapping_add(1).max(1);
+        }
+        Ok(())
+    }
+
+    /// Edits one stored frame's rect in place from decoded wire bytes
+    /// (`a=f` with `r>0`, S1, #1849).
+    ///
+    /// The kitty graphics protocol edits an existing frame by compositing
+    /// the transmitted extent onto the frame itself: the background canvas
+    /// is the edited frame (`frame`), never the wire `c=` base or `Y=`
+    /// color (both are ignored here; the runtime does not forward them).
+    /// `(x, y)` is the wire `x=`/`y=` destination offset on the frame and
+    /// `width`/`height`/`rgba` the decoded `s=`/`v=` extent; `mode` is the
+    /// wire `X=` composition mode ([`KITTY_COMPOSE_BLEND`] src-over or
+    /// [`KITTY_COMPOSE_REPLACE`] byte copy). The rect must fit the shared
+    /// root extent with checked `u64` arithmetic — out-of-bounds, empty, or
+    /// overflowing rects refuse with
+    /// [`KittyPlacementError::ComposeOutOfBounds`] and edit nothing (the
+    /// reported rect is the offending one). The decoded bytes reuse the
+    /// shipped per-frame caps through `checked_bitmap`, so over-cap
+    /// extents refuse before any copy.
+    /// A successful edit bumps the image generation (the raster-cache key
+    /// binds it; callers additionally drop cached blits wholesale).
+    /// `total_bytes` is unchanged (same extent, same length), so the
+    /// per-image ([`KITTY_ANIM_MAX_BYTES_PER_IMAGE`]), per-origin
+    /// ([`KITTY_PER_ORIGIN_MAX_BYTES`]), and global
+    /// ([`KITTY_PLACE_MAX_BYTES`]) totals cannot trip here: an edit grows
+    /// no buffer and evicts nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`KittyPlacementError::ImageNotFound`] for unknown images,
+    /// [`KittyPlacementError::NoSuchFrame`] for a missing frame,
+    /// [`KittyPlacementError::UnknownComposeMode`] for modes past 1, the
+    /// `checked_bitmap` dimension/area/byte/length rejections for
+    /// over-cap extents, or [`KittyPlacementError::ComposeOutOfBounds`]
+    /// for unplaceable rects. Failures edit nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn edit_frame(
+        &mut self,
+        id: KittyImageId,
+        frame: u32,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+        mode: u32,
+    ) -> Result<(), KittyPlacementError> {
+        checked_bitmap(width, height, rgba.len())?;
+        if mode != KITTY_COMPOSE_BLEND && mode != KITTY_COMPOSE_REPLACE {
+            return Err(KittyPlacementError::UnknownComposeMode(mode));
+        }
+        let slot = self
+            .images
+            .iter()
+            .position(|img| img.id == id)
+            .ok_or(KittyPlacementError::ImageNotFound(id))?;
+        let count = self.images[slot].frame_count();
+        if frame == 0 || frame > count {
+            return Err(KittyPlacementError::NoSuchFrame { image: id, frame });
+        }
+        let (root_width, root_height) = {
+            let root = &self.images[slot];
+            (root.width, root.height)
+        };
+        // Checked rect fit in `u64`: the decoded extent must land inside
+        // the shared frame bounds (`u32` ends can never overflow there).
+        // `checked_bitmap` above already refused empty extents through the
+        // exact-length check, so a zero `w`/`h` here is defense-in-depth.
+        let end_x = u64::from(x).saturating_add(u64::from(width));
+        let end_y = u64::from(y).saturating_add(u64::from(height));
+        if width == 0
+            || height == 0
+            || end_x > u64::from(root_width)
+            || end_y > u64::from(root_height)
+        {
+            return Err(KittyPlacementError::ComposeOutOfBounds {
+                x,
+                y,
+                w: width,
+                h: height,
+                width: root_width,
+                height: root_height,
+            });
+        }
+        // Extra-frame slot for 1-based frame numbers past the root.
+        let extra_slot = (frame as usize).saturating_sub(2);
+        {
+            let img = &mut self.images[slot];
+            let dest_bytes: &mut [u8] = if frame == 1 {
+                &mut img.rgba
+            } else {
+                &mut img.frames[extra_slot].rgba
+            };
+            if mode == KITTY_COMPOSE_REPLACE {
+                let row_bytes = (width as usize).saturating_mul(4);
+                for row in 0..height {
+                    let start = (((u64::from(y) + u64::from(row)) * u64::from(root_width)
+                        + u64::from(x)) as usize)
+                        .saturating_mul(4);
+                    let end = start.saturating_add(row_bytes);
+                    let src_start = (row as usize).saturating_mul(row_bytes);
+                    let src_end = src_start.saturating_add(row_bytes);
+                    dest_bytes[start..end].copy_from_slice(&rgba[src_start..src_end]);
+                }
+            } else {
+                blend_rect_over(dest_bytes, rgba, root_width, x, y, width, height);
             }
             img.generation = img.generation.wrapping_add(1).max(1);
         }

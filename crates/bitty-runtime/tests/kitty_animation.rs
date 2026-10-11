@@ -55,6 +55,16 @@ fn striped_2x2_b64() -> &'static str {
     "/wAA//8AAP8AAP//AAD//w=="
 }
 
+/// 1x1 opaque blue RGBA payload (`f=32`), base64 `AAD//w==`.
+fn blue_1x1_b64() -> &'static str {
+    "AAD//w=="
+}
+
+/// 1x1 opaque green RGBA payload (`f=32`), base64 `AP8A/w==`.
+fn green_1x1_b64() -> &'static str {
+    "AP8A/w=="
+}
+
 /// 2x2 opaque blue RGBA frame bytes (`f=32`).
 fn blue_2x2() -> Vec<u8> {
     [0x00, 0x00, 0xFF, 0xFF].repeat(4)
@@ -352,6 +362,194 @@ fn partial_frame_with_base_stores_instead_of_mismatching() {
     // exact-extent ingest refused with `FrameDimensionsMismatch`.
     rt.handle_pty_bytes(&apc("Gf=32,s=1,v=1,a=f,i=1,x=1,y=0,c=1,X=1,m=0;AAD//w=="));
     assert_eq!(rt.kitty_anim_frame_count(1), 2);
+}
+
+#[test]
+fn pixel_edit_changes_displayed_frame_without_appending() {
+    let mut rt = make_runtime();
+    display_root(&mut rt);
+    let t0 = Instant::now();
+    rt.tick_at(t0);
+    let before = rt.headless_rgba().expect("frame must exist");
+    // `r=1` pixel edit: 1x1 opaque blue (`f=32`) replaced (`X=1`) at the
+    // frame origin. The canvas is frame 1 itself (kitty protocol frame
+    // edit), so the displayed root repaints with no new frame appended.
+    rt.handle_pty_bytes(&apc(&format!(
+        "Gf=32,s=1,v=1,a=f,i=1,r=1,x=0,y=0,X=1,m=0;{}",
+        blue_1x1_b64()
+    )));
+    assert_eq!(rt.kitty_anim_frame_count(1), 1);
+    assert_eq!(rt.kitty_image_count(), 1);
+    rt.tick_at(t0);
+    let after = rt.headless_rgba().expect("frame must exist");
+    assert_ne!(before, after, "edited frame must repaint");
+    // Queries are unaffected by the edit.
+    rt.take_replies();
+    rt.handle_pty_bytes(&apc("Gf=32,a=q,i=1,m=0;"));
+    let replies: Vec<Vec<u8>> = rt
+        .take_replies()
+        .iter()
+        .map(|reply| reply.to_vec())
+        .collect();
+    assert_eq!(replies, vec![b"\x1b_Gi=1;OK\x1b\\".to_vec()]);
+}
+
+#[test]
+fn pixel_edit_targets_r_not_c_base() {
+    let mut rt = make_runtime();
+    display_root(&mut rt);
+    append_blue_frame(&mut rt);
+    // Frozen virtual clock (see above): every present below shares one
+    // instant, so repaints come from the edit itself, never from gaps.
+    let t0 = Instant::now();
+    rt.tick_at(t0);
+    let root_shown = rt.headless_rgba().expect("frame must exist");
+    // Show frame 2 through client-driven selection (no run needed).
+    rt.handle_pty_bytes(&apc("Ga=a,i=1,c=2,m=0;"));
+    rt.tick_at(t0);
+    let frame2_before = rt.headless_rgba().expect("frame must exist");
+    assert_ne!(
+        root_shown, frame2_before,
+        "frame 2 (blue) must differ from the root (red)"
+    );
+    // Edit frame 2 with a `c=1` base alongside: the `c=` base governs
+    // `r=0` creation only — the edit canvas is frame `r` itself, so
+    // frame 2 gains the green pixel while frame 1 stays red.
+    rt.handle_pty_bytes(&apc(&format!(
+        "Gf=32,s=1,v=1,a=f,i=1,r=2,c=1,x=0,y=0,X=1,m=0;{}",
+        green_1x1_b64()
+    )));
+    assert_eq!(rt.kitty_anim_frame_count(1), 2);
+    rt.tick_at(t0);
+    let frame2_after = rt.headless_rgba().expect("frame must exist");
+    assert_ne!(frame2_before, frame2_after, "frame r=2 must carry the edit");
+    rt.handle_pty_bytes(&apc("Ga=a,i=1,c=1,m=0;"));
+    rt.tick_at(t0);
+    let root_after = rt.headless_rgba().expect("frame must exist");
+    assert_eq!(
+        root_shown, root_after,
+        "the named c=1 base must be untouched by the edit"
+    );
+}
+
+#[test]
+fn edit_missing_frame_refused_with_nothing_recorded() {
+    let mut rt = make_runtime();
+    display_root(&mut rt);
+    let t0 = Instant::now();
+    rt.tick_at(t0);
+    let before = rt.headless_rgba().expect("frame must exist");
+    // Frame 99 is not held: the edit fails closed — no pixels change and
+    // (store-first) no truth gap is recorded either.
+    rt.handle_pty_bytes(&apc(&format!(
+        "Gf=32,s=1,v=1,a=f,i=1,r=99,x=0,y=0,X=1,m=0;{}",
+        blue_1x1_b64()
+    )));
+    assert_eq!(rt.kitty_anim_frame_count(1), 1);
+    assert_eq!(rt.kitty_image_count(), 1);
+    assert_eq!(
+        rt.state()
+            .kitty_placements()
+            .animation(1)
+            .map(|anim| anim.frame_count()),
+        None,
+        "refused edit must record no truth gap"
+    );
+    rt.tick_at(t0);
+    let after = rt.headless_rgba().expect("frame must exist");
+    assert_eq!(before, after, "refused edit must paint nothing new");
+}
+
+#[test]
+fn edit_out_of_bounds_refused_with_nothing_changed() {
+    let mut rt = make_runtime();
+    display_root(&mut rt);
+    let t0 = Instant::now();
+    rt.tick_at(t0);
+    let before = rt.headless_rgba().expect("frame must exist");
+    // 2x2 frame: the 1x1 edit at (2,0) starts past the right edge.
+    rt.handle_pty_bytes(&apc(&format!(
+        "Gf=32,s=1,v=1,a=f,i=1,r=1,x=2,y=0,X=1,m=0;{}",
+        blue_1x1_b64()
+    )));
+    assert_eq!(rt.kitty_anim_frame_count(1), 1);
+    assert_eq!(
+        rt.state()
+            .kitty_placements()
+            .animation(1)
+            .map(|anim| anim.frame_count()),
+        None,
+        "refused edit must record no truth gap"
+    );
+    rt.tick_at(t0);
+    let after = rt.headless_rgba().expect("frame must exist");
+    assert_eq!(before, after, "refused edit must paint nothing new");
+}
+
+#[test]
+fn edit_overcap_refused_with_nothing_stored() {
+    let mut rt = make_runtime();
+    display_root(&mut rt);
+    // 5000x5000 trips the area cap at the pre-check, before any
+    // allocation — the per-frame caps bind edits exactly like appends.
+    rt.handle_pty_bytes(&apc(
+        "Gf=32,s=5000,v=5000,a=f,i=1,r=1,x=0,y=0,X=1,m=0;bm90LWEtcG5n;",
+    ));
+    assert_eq!(rt.kitty_anim_frame_count(1), 1);
+    assert_eq!(rt.kitty_image_count(), 1);
+    assert_eq!(
+        rt.state()
+            .kitty_placements()
+            .animation(1)
+            .map(|anim| anim.frame_count()),
+        None,
+        "refused edit must record no truth gap"
+    );
+    // The store stays usable: a valid edit still applies to frame 1.
+    let t0 = Instant::now();
+    rt.tick_at(t0);
+    let before = rt.headless_rgba().expect("frame must exist");
+    rt.handle_pty_bytes(&apc(&format!(
+        "Gf=32,s=1,v=1,a=f,i=1,r=1,x=0,y=0,X=1,m=0;{}",
+        blue_1x1_b64()
+    )));
+    rt.tick_at(t0);
+    let after = rt.headless_rgba().expect("frame must exist");
+    assert_ne!(before, after, "valid edit must apply after a refusal");
+}
+
+#[test]
+fn edit_invalidates_raster_cache() {
+    let mut rt = make_runtime();
+    display_root(&mut rt);
+    let t0 = Instant::now();
+    rt.tick_at(t0);
+    assert!(
+        rt.kitty_raster_misses() >= 1,
+        "first present must rasterize frame 1"
+    );
+    // Printing text forces a present on the same frame 1: a cache hit.
+    rt.handle_pty_bytes(b"x");
+    rt.tick_at(t0 + Duration::from_millis(1));
+    assert!(
+        rt.kitty_raster_hits() >= 1,
+        "re-presenting frame 1 must hit"
+    );
+    let misses_warm = rt.kitty_raster_misses();
+    let before = rt.headless_rgba().expect("frame must exist");
+    // Pixel-edit the displayed root: the next present must re-raster the
+    // edited bytes, never serve the stale cached blit.
+    rt.handle_pty_bytes(&apc(&format!(
+        "Gf=32,s=1,v=1,a=f,i=1,r=1,x=0,y=0,X=1,m=0;{}",
+        blue_1x1_b64()
+    )));
+    rt.tick_at(t0 + Duration::from_millis(2));
+    let after = rt.headless_rgba().expect("frame must exist");
+    assert_ne!(before, after, "edited frame must repaint, not stale");
+    assert!(
+        rt.kitty_raster_misses() > misses_warm,
+        "edited frame must re-raster its own key"
+    );
 }
 
 #[test]

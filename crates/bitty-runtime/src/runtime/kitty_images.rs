@@ -58,7 +58,9 @@
 //!
 //! Animation playback (S1, #1849): `a=f` appends decoded frame bitmaps to
 //! the origin-scoped wire identity's stored root image (per-frame caps
-//! plus per-image/global totals, never evicting), `a=a` drives the
+//! plus per-image/global totals, never evicting) or edits one existing
+//! frame's rect in place (`r>0`: the canvas is the edited frame itself,
+//! per the kitty protocol), `a=a` drives the
 //! terminal-truth descriptors (the present tick advances them with tick
 //! pacing and selects the current frame per placement), and `a=c`
 //! composes bounded rects between stored frames in place. See
@@ -1100,13 +1102,14 @@ impl Runtime {
     /// parser emitted records the gap descriptor.
     ///
     /// Ordering (store-first, decided): the wire target resolves, then
-    /// (`r=0`) the frame decodes and appends; only on pixel success does
-    /// terminal truth record the gap descriptor. A refused frame therefore
-    /// stores nothing AND records nothing — truth gaps never outnumber
-    /// stored frames, so playback never names a missing frame. (`r>0`
-    /// edits that frame's gap in truth only; any payload is dropped with
-    /// a rate-limited warning — pixel edits go through `a=c`.) Damage and
-    /// cold observations follow the `a=p` branch shape on success.
+    /// (`r=0`) the frame decodes and appends, or (`r>0` with payload) the
+    /// decoded extent edits the existing frame in place; only on pixel
+    /// success does terminal truth record the gap descriptor. A refused
+    /// frame therefore stores nothing AND records nothing — truth gaps
+    /// never outnumber stored frames, so playback never names a missing
+    /// frame. (`r>0` with an empty payload stays a gap-only truth edit.)
+    /// Damage and cold observations follow the `a=p` branch shape on
+    /// success.
     ///
     /// Partial frames (`x=`/`y=` offset, `c=` base, `Y=` background, or a
     /// smaller-than-root extent) composite onto the background canvas
@@ -1136,26 +1139,32 @@ impl Runtime {
             .kitty_wire_target(control.image_id, control.image_number)
             .ok_or(KittyImageError::NoAnimationTarget(control.image_id))?;
         if rows_r != 0 {
-            let damage = self.state.apply(action);
-            if !damage.regions.is_empty() {
-                let generation = damage.generation;
-                self.cold_queue.push(ColdEvent::Damage { generation });
-                self.plugin_host
-                    .push_observation(HostObservation::Damage { generation });
-            }
-            if !payload.is_empty() {
-                // Gap edit with payload: truth applied above; the bytes are
-                // dropped (documented: pixel edits go through `a=c`). Loud,
-                // rate-limited: a well-formed client never sends pixels on
-                // an edit.
-                if let Some(suppressed) = self.kitty_log.admit_now() {
-                    eprintln!(
-                        "bitty: ignoring kitty animation frame payload on gap edit (r={rows_r}): stored nothing{}",
-                        log_throttle::suppressed_suffix(suppressed)
-                    );
+            if payload.is_empty() {
+                // Gap-only edit: no pixels travel, so truth applies alone.
+                let damage = self.state.apply(action);
+                if !damage.regions.is_empty() {
+                    let generation = damage.generation;
+                    self.cold_queue.push(ColdEvent::Damage { generation });
+                    self.plugin_host
+                        .push_observation(HostObservation::Damage { generation });
                 }
+                return Ok(());
             }
-            return Ok(());
+            // Pixel edit (`r>0` with payload): the decoded extent applies
+            // onto the existing frame in place (kitty protocol frame edit),
+            // then truth records the gap on pixel success (store-first).
+            // Local mediums read first (bounded, fail closed). The async
+            // worker (CTX-1110) reuses the identical bytes-edit path with
+            // worker bytes for file-backed edits.
+            if control.medium.is_direct() {
+                return self.kitty_ingest_frame_edit_bytes(
+                    format_f, width_s, height_v, rows_r, payload, &control, action,
+                );
+            }
+            let read = self.read_frame_medium(format_f, width_s, height_v, payload, &control)?;
+            return self.kitty_ingest_frame_edit_bytes(
+                format_f, width_s, height_v, rows_r, &read, &control, action,
+            );
         }
         // New frame (`r=0`): direct payloads decode in place; local
         // mediums read first (bounded, fail closed). Both share the
@@ -1250,6 +1259,83 @@ impl Runtime {
                 .push_observation(HostObservation::Damage { generation });
         }
         self.invalidate_kitty_raster_cache();
+        Ok(())
+    }
+
+    /// Edits one `r>0` frame from already-available bytes (CTX-1123 edit
+    /// seam over the S1 pixel half).
+    ///
+    /// Shared by [`Self::kitty_ingest_frame`] (direct payloads, or local
+    /// reads just finished synchronously) and the async local-medium
+    /// worker completion (worker bytes): resolves the wire target, decodes
+    /// and composites the extent onto the existing frame `frame_r` in
+    /// place, then records the truth gap on pixel success. Failures edit
+    /// nothing and record nothing.
+    ///
+    /// Wire map (kitty protocol frame edit,
+    /// `recording/references/kitty@74b7ef892`, GPL-3.0-only:
+    /// `docs/graphics-protocol.rst:932-937`): the background canvas is the
+    /// edited frame itself, so the wire `c=` base and `Y=` color are
+    /// ignored; `x=`/`y=` is the destination offset on the frame,
+    /// `s=`/`v=` the decoded extent, `X=` the composition mode (0 blend,
+    /// 1 replace), and `z=` retargets the frame's truth gap like any edit.
+    /// The edited pixels reuse the per-frame decode caps plus the
+    /// in-bounds rect check (fail closed on a missing frame, a reshaped
+    /// payload, or an overflowing rect); byte totals are unchanged, so no
+    /// quota can trip and nothing is evicted. Queries are unaffected (no
+    /// query state is touched).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn kitty_ingest_frame_edit_bytes(
+        &mut self,
+        format_f: u32,
+        width_s: Option<u32>,
+        height_v: Option<u32>,
+        frame_r: u16,
+        bytes: &[u8],
+        control: &bitty_vt::KittyControlKeys,
+        action: &TerminalAction,
+    ) -> Result<(), KittyImageError> {
+        let wire = self
+            .kitty_wire_target(control.image_id, control.image_number)
+            .ok_or(KittyImageError::NoAnimationTarget(control.image_id))?;
+        // Resolve the root before any decode work, so homeless edits fail
+        // fast without allocating.
+        let root = self
+            .kitty_images
+            .find_root_for_origin(self.kitty_origin, wire)
+            .ok_or(KittyImageError::NoAnimationTarget(wire))?;
+        // Borrowed decode (the caller keeps the wire bytes): admission is
+        // for frame arrivals (rare control-plane events), not the hot
+        // display path, so the owned zero-copy seam stays display-only.
+        Self::precheck_transmit(format_f, width_s, height_v, bytes.len())?;
+        let decoded = bitty_rich::decode_kitty_payload(format_f, width_s, height_v, bytes)
+            .map_err(|err| KittyImageError::Decode(bitty_rich::KittyPrecheckError::from(err)))?;
+        self.kitty_images
+            .edit_frame(
+                root,
+                u32::from(frame_r),
+                control.src_x,
+                control.src_y,
+                decoded.width,
+                decoded.height,
+                &decoded.rgba,
+                control.cell_x_offset,
+            )
+            .map_err(KittyImageError::Placement)?;
+        // Pixels edited: record the truth gap now (never before), drop
+        // cached blits wholesale (edited bytes are stale budget), publish
+        // damage like `a=p`, and damage the wire spans so plain
+        // transmit-and-display placements (which truth never records)
+        // repaint the edited frame on the next tick.
+        let damage = self.state.apply(action);
+        if !damage.regions.is_empty() {
+            let generation = damage.generation;
+            self.cold_queue.push(ColdEvent::Damage { generation });
+            self.plugin_host
+                .push_observation(HostObservation::Damage { generation });
+        }
+        self.invalidate_kitty_raster_cache();
+        self.damage_kitty_wire(wire);
         Ok(())
     }
 

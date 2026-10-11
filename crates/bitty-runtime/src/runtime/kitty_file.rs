@@ -643,7 +643,8 @@ pub(crate) enum KittyLocalOp {
         height_v: Option<u32>,
         control: bitty_vt::KittyControlKeys,
     },
-    /// Animation frame append (`a=f`, `r=0`) via a local medium.
+    /// Animation frame ingest (`a=f`, `r=0` append or `r>0` pixel edit)
+    /// via a local medium.
     Frame {
         format_f: u32,
         width_s: Option<u32>,
@@ -962,7 +963,8 @@ impl Runtime {
     }
 
     /// Enqueues one local-medium animation frame without doing I/O
-    /// (CTX-1110, `r=0` only; `r>0` gap edits never enqueue). Returns
+    /// (CTX-1110/CTX-1123: `r=0` appends and `r>0` pixel edits; `r>0`
+    /// gap-only edits carry no name to read and never enqueue). Returns
     /// `false` when the bounded queue is full (caller logs).
     pub(crate) fn enqueue_kitty_local_frame(
         &mut self,
@@ -1484,9 +1486,22 @@ impl Runtime {
                 action,
             } => match result {
                 Ok(bytes) => {
-                    if let Err(err) = self.kitty_ingest_frame_bytes(
-                        *format_f, *width_s, *height_v, &bytes, control, action,
-                    ) {
+                    // File-backed edits (`r>0`) reuse the edit seam with
+                    // worker bytes; appends (`r=0`) keep the append seam.
+                    let frame_r = match action.as_ref() {
+                        bitty_term_state::TerminalAction::KittyGraphics { rows_r, .. } => *rows_r,
+                        _ => 0,
+                    };
+                    let ingested = if frame_r == 0 {
+                        self.kitty_ingest_frame_bytes(
+                            *format_f, *width_s, *height_v, &bytes, control, action,
+                        )
+                    } else {
+                        self.kitty_ingest_frame_edit_bytes(
+                            *format_f, *width_s, *height_v, frame_r, &bytes, control, action,
+                        )
+                    };
+                    if let Err(err) = ingested {
                         if let Some(suppressed) = self.kitty_log.admit_now() {
                             eprintln!(
                                 "bitty: rejecting kitty animation frame ({err}): stored nothing{}",

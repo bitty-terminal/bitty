@@ -24,13 +24,17 @@
 //!   install or enable WSL2 (Store version for `--version`; inbox builds use
 //!   `--status` as presence-only fallback, see below), or run natively without
 //!   `--distro`. There is no silent fallback to native when WSL was requested.
-//! - `add`/`install` are staging/fetch operations only (they never execute the
-//!   component). When a distro is selected they persist it per-component to
+//! - `add` is a staging operation only (it never executes the component).
+//!   When a distro is selected it persists it per-component to
 //!   `<user>/<name>/wsl_distro` (`WSL_DISTRO_FILE`, `default` or the distro
 //!   name plus a newline, atomic write like the TOFU pin). Omission preserves
 //!   any previous placement (never deletes); later component runs (broker)
 //!   read that file when no explicit in-memory selection overrides it. Unix
 //!   records the file but never acts on it (native execution, no-op).
+//!   `install` takes no distro selection: it fetches the host triple (a
+//!   Windows PE on Windows hosts) and cannot stage a Linux guest helper, so
+//!   any selection for it is rejected before any fetch (cross-target Linux
+//!   fetching is a #1908 follow-up, not in this change).
 //!
 //! # Windows to guest path mapping (primary direction)
 //!

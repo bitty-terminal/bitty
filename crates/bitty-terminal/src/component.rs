@@ -229,10 +229,12 @@ pub struct ComponentRequest {
     /// Never bypasses digest verification; only overwrites the pin after
     /// both-must-match passes.
     pub force: bool,
-    /// `add`/`install --distro <name>`: WSL2 guest distro for component
-    /// execution on Windows (explicit selection; `default` means the `wsl.exe`
-    /// default distro). Windows-only in effect: Unix accepts and validates
-    /// the value but stays native (no-op).
+    /// `add --distro <name>`: WSL2 guest distro for component execution on
+    /// Windows (explicit selection; `default` means the `wsl.exe` default
+    /// distro). Parsed for `install` only to reject it with a usage error
+    /// naming `add` (install fetches the host triple and cannot stage a guest
+    /// helper). Windows-only in effect: Unix accepts and validates the value
+    /// but stays native (no-op).
     pub distro: Option<String>,
 }
 
@@ -550,7 +552,7 @@ pub fn parse_component_request(
             }
             if distro.is_some() {
                 return Err(ComponentParseError::Usage(format!(
-                    "bitty component: --distro only applies to `add`/`install` (got `{}`)",
+                    "bitty component: --distro only applies to `add` (got `{}`)",
                     verb.name()
                 )));
             }
@@ -618,6 +620,15 @@ pub fn parse_component_request(
                     verb.name()
                 )));
             }
+            // Fail-closed scope: `install` fetches the host triple (a Windows
+            // PE on Windows hosts) and cannot stage a Linux guest helper, so a
+            // WSL placement for it would re-launch the PE via interop, never a
+            // guest helper. Stage guest helpers with `add` instead.
+            if distro.is_some() {
+                return Err(ComponentParseError::Usage(
+                    "bitty component: --distro only applies to `add` (guest-helper staging); `install` fetches the host triple and cannot stage a Linux guest helper — stage one with `bitty component add <path> --distro <name>` (e.g. from inside the guest)".to_string(),
+                ));
+            }
         }
         ComponentVerb::Remove => {
             if operand.is_none() {
@@ -659,7 +670,7 @@ pub fn parse_component_request(
             }
             if distro.is_some() {
                 return Err(ComponentParseError::Usage(format!(
-                    "bitty component: --distro only applies to `add`/`install` (got `{}`)",
+                    "bitty component: --distro only applies to `add` (got `{}`)",
                     verb.name()
                 )));
             }
@@ -685,7 +696,7 @@ pub fn parse_component_request(
 pub fn component_usage() -> String {
     "usage: bitty component list [--format table|json|jsonl] [--no-color]\n\
      \x20      bitty component add <path> [--version <semver>] [--distro <name|default>]\n\
-     \x20      bitty component install <name> --version <X.Y.Z> [--digest <hex>] [--force] [--yes] [--distro <name|default>]\n\
+     \x20      bitty component install <name> --version <X.Y.Z> [--digest <hex>] [--force] [--yes]\n\
      \x20      bitty component remove <name> [<version>]\n\
      \n\
      Components are upstream native binaries resolved user-first:\n\
@@ -695,10 +706,12 @@ pub fn component_usage() -> String {
      seed (builtin cdn.bitty.run:443 egress, dual-digest verified silent\n\
      else explicit consent, TOFU-pinned; --force re-pins), then the full\n\
      manager takes over; `remove` only touches the user tier (no root required).\n\
-     On Windows, --distro routes execution through the WSL2 trampoline\n\
+     On Windows, `add --distro` routes execution through the WSL2 trampoline\n\
      (wsl.exe --distribution D --exec, default distro with `default`);\n\
-     Unix ignores --distro (native execution). `bitty component --help`\n\
-     explains sources, ABI checks, WSL2 paths and stdio, and exit codes."
+     `install --distro` is rejected (install fetches the host triple and\n\
+     cannot stage a guest helper — use `add`); Unix ignores --distro\n\
+     (native execution). `bitty component --help` explains sources, ABI\n\
+     checks, WSL2 paths and stdio, and exit codes."
         .to_string()
 }
 
@@ -748,24 +761,31 @@ pub fn component_help_text() -> String {
      \x20                             NOT bypass digest verification.\n\
      \x20 --yes                       install only: approve the download consent\n\
      \x20                             non-interactively (no prompt).\n\
-     \x20 --distro <name|default>     add/install only: WSL2 guest distro for\n\
-     \x20                             component execution on Windows. `default` uses\n\
-     \x20                             the wsl.exe default distro. Windows-only in\n\
-     \x20                             effect: Unix validates the value but stays\n\
-     \x20                             native (no-op). See `WSL2 trampoline` below.\n\
+     \x20 --distro <name|default>     add only: WSL2 guest distro for component\n\
+     \x20                             execution on Windows. `default` uses the\n\
+     \x20                             wsl.exe default distro. `install --distro`\n\
+     \x20                             is rejected (install fetches the host triple\n\
+     \x20                             and cannot stage a guest helper — use `add`).\n\
+     \x20                             Windows-only in effect: Unix validates the\n\
+     \x20                             value but stays native (no-op). See `WSL2\n\
+     \x20                             trampoline` below.\n\
      \n\
      WSL2 trampoline (Windows only, issue #1908):\n\
      \x20 Windows component helpers that must run inside a WSL2 guest do so\n\
      \x20 through wsl.exe [--distribution D] --exec <helper> <fixed-argv>\n\
      \x20 (PATH-resolved wsl.exe, fixed argv, no shell on either side).\n\
-     \x20 `add`/`install` never execute the component here: they stage/fetch\n\
-     \x20 only and persist the resolved selection per-component to\n\
-     \x20 <user>/<name>/wsl_distro for later runs (omission preserves any\n\
-     \x20 previous placement). Guest distro selection: explicit --distro wins,\n\
+     \x20 `add` never executes the component here: it stages only and persists\n\
+     \x20 the resolved selection per-component to <user>/<name>/wsl_distro for\n\
+     \x20 later runs (omission preserves any previous placement). `install`\n\
+     \x20 always fetches the host triple (a Windows PE on Windows hosts) and\n\
+     \x20 takes no --distro (flag or env): any selection for it fails as usage\n\
+     \x20 (exit 2) naming `add`, before any fetch or staging. Cross-target\n\
+     \x20 Linux fetching for `install --distro` is a #1908 follow-up, not in\n\
+     \x20 this change. Guest distro selection (`add`): explicit --distro wins,\n\
      \x20 else BITTY_WSL_DISTRO config wins, else native execution (no\n\
      \x20 trampoline); pass the literal `default` for the wsl.exe default\n\
      \x20 distro (no --distribution flag). A selected distro with absent WSL\n\
-     \x20 fails closed before any fetch or staging (exit 1): install WSL2 from\n\
+     \x20 fails closed before any staging (exit 1): install WSL2 from\n\
      \x20 the Store (inbox builds use --status fallback, unversioned) or run\n\
      \x20 without --distro. Path mapping (Windows to guest for spawn):\n\
      \x20 drive-absolute X:\\... maps to /mnt/<lower-x>/... and WSL UNC\n\
@@ -860,7 +880,6 @@ pub fn component_help_text() -> String {
      \x20 bitty component install net --version 0.0.23\n\
      \x20 bitty component install net --version 0.0.23 --digest <hex>\n\
      \x20 bitty component install net --version 0.0.23 --force --yes\n\
-     \x20 bitty component install net --version 0.0.23 --distro default\n\
      \x20 bitty component remove net 0.0.1"
         .to_string()
 }
@@ -1009,23 +1028,40 @@ pub fn run_component_subcommand(
         context.system_components_dir,
     );
 
-    // WSL2 trampoline gate (#1908) for store verbs that stage executables
-    // (`add`/`install`): validate distro selection on every platform (usage
-    // error on invalid, exit 2, before any mutation); on Windows probe WSL
-    // when a distro is selected and fail closed when absent (exit 1, before
-    // any fetch or staging). Unix never probes (no-op, native execution).
-    // `list`/`remove` never consult the trampoline (read-only or user-tier
-    // only, no execution). `add`/`install` never execute the component here;
-    // the resolved selection is persisted per-component for later runs.
-    let wsl_selection: Option<bitty_runtime::component::WslDistro> =
-        if matches!(request.verb, ComponentVerb::Add | ComponentVerb::Install) {
+    // WSL2 trampoline gate (#1908): `add` stages guest helpers (validates,
+    // probes on Windows, persists placement); `install` fetches the host
+    // triple and cannot stage a guest helper, so any distro selection for it
+    // (flag or env) fails as usage (exit 2) before any fetch or staging.
+    // Unix never probes (no-op). `list`/`remove` never consult the trampoline.
+    // Neither verb executes the component here; `add` persists the resolved
+    // selection per-component for later runs.
+    let wsl_selection: Option<bitty_runtime::component::WslDistro> = match request.verb {
+        ComponentVerb::Add => {
             match check_wsl_for_store_verb(request.distro.as_deref(), context.wsl_distro_env) {
                 Ok(selection) => selection,
                 Err(exit) => return exit,
             }
-        } else {
-            None
-        };
+        }
+        ComponentVerb::Install => {
+            match bitty_runtime::component::select_wsl_distro(
+                request.distro.as_deref(),
+                context.wsl_distro_env,
+            ) {
+                Ok(None) => None,
+                Ok(Some(_)) => {
+                    eprintln!(
+                        "bitty component: --distro only applies to `add` (guest-helper staging); `install` fetches the host triple and cannot stage a Linux guest helper — stage one with `bitty component add <path> --distro <name>` (e.g. from inside the guest; cross-target Linux fetching is a #1908 follow-up, not in this change)"
+                    );
+                    return EXIT_USAGE;
+                }
+                Err(error) => {
+                    eprintln!("bitty component: {}", error.message());
+                    return EXIT_USAGE;
+                }
+            }
+        }
+        _ => None,
+    };
 
     match request.verb {
         ComponentVerb::List => {
@@ -1073,7 +1109,6 @@ pub fn run_component_subcommand(
                 input,
                 request.yes,
                 &mut transport,
-                wsl_selection.as_ref(),
             ) {
                 Ok(summary) => {
                     let _ = writeln!(output, "{summary}");
@@ -1408,9 +1443,13 @@ fn check_registry_digest(
     Ok(())
 }
 
-// Ten args: install needs name/version/digest/force/roots/stdio/consent/
-// transport/selection together (all bounded, fail-closed before mutation). A
-// params struct would obscure the call-site audit, so allow the lint here.
+// Nine args: install needs name/version/digest/force/roots/stdio/consent/
+// transport together (all bounded, fail-closed before mutation). A params
+// struct would obscure the call-site audit, so allow the lint here.
+//
+// Note: `install` takes no WSL selection (it fetches the host triple and
+// cannot stage a guest helper; `--distro`/env for it is rejected at dispatch
+// before this runs, so there is nothing to persist here).
 #[allow(clippy::too_many_arguments)]
 fn op_install(
     name: &str,
@@ -1422,7 +1461,6 @@ fn op_install(
     input: &mut dyn std::io::BufRead,
     yes: bool,
     transport: &mut dyn crate::component_seed::SeedTransport,
-    wsl_selection: Option<&bitty_runtime::component::WslDistro>,
 ) -> Result<String, ComponentFailure> {
     // The parser requires `--version`; this is defense in depth.
     let Some(version) = version_flag else {
@@ -1581,9 +1619,8 @@ fn op_install(
     } else {
         String::new()
     };
-    // Persist execution placement for later runs (staging only; never executes
-    // here). `None` preserves any previous placement.
-    persist_wsl_selection(user, &staged.name, wsl_selection)?;
+    // No WSL persistence here by design: `install` fetches the host triple
+    // (a Windows PE on Windows hosts) and cannot stage a Linux guest helper.
     // Handoff: the seed is done; name the installed executable so the
     // caller (or the user, for the manager itself) invokes the full
     // component directly from here.
@@ -2568,36 +2605,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_distro_for_add_and_install() {
-        // `install --distro` and `add --distro` parse; `default` selects the
-        // `wsl.exe` default distro. Unix validates but stays native (no-op).
-        let request = parse_component_request(
-            &[
-                String::from("install"),
-                String::from("net"),
-                String::from("--version"),
-                String::from("0.0.23"),
-                String::from("--distro"),
-                String::from("Ubuntu"),
-            ],
-            None,
-        )
-        .expect("install --distro");
-        assert_eq!(request.distro.as_deref(), Some("Ubuntu"));
-
-        let request = parse_component_request(
-            &[
-                String::from("install"),
-                String::from("net"),
-                String::from("--version"),
-                String::from("0.0.23"),
-                String::from("--distro=default"),
-            ],
-            None,
-        )
-        .expect("install --distro=default");
-        assert_eq!(request.distro.as_deref(), Some("default"));
-
+    fn parses_distro_for_add_only() {
+        // `add --distro` parses; `default` selects the `wsl.exe` default
+        // distro. Unix validates but stays native (no-op). `install --distro`
+        // is rejected at parse (install fetches the host triple and cannot
+        // stage a guest helper; cross-target fetching is a follow-up).
         let request = parse_component_request(
             &[
                 String::from("add"),
@@ -2610,13 +2622,42 @@ mod tests {
         .expect("add --distro");
         assert_eq!(request.distro.as_deref(), Some("Debian"));
 
+        let request = parse_component_request(
+            &[
+                String::from("add"),
+                String::from("./dist"),
+                String::from("--distro=default"),
+            ],
+            None,
+        )
+        .expect("add --distro=default");
+        assert_eq!(request.distro.as_deref(), Some("default"));
+
+        for distro_args in [
+            vec![String::from("--distro"), String::from("Ubuntu")],
+            vec![String::from("--distro=default")],
+        ] {
+            let mut args = vec![
+                String::from("install"),
+                String::from("net"),
+                String::from("--version"),
+                String::from("0.0.23"),
+            ];
+            args.extend(distro_args.clone());
+            assert!(
+                parse_component_request(&args, None).is_err(),
+                "install --distro must fail at parse: {distro_args:?}"
+            );
+        }
+
         // The CLI bound mirrors the WSL module bound.
         assert_eq!(
             MAX_COMPONENT_DISTRO_BYTES,
             bitty_runtime::component::WSL_DISTRO_MAX_BYTES
         );
 
-        // Malformed, missing, and duplicate values fail as usage.
+        // Malformed, missing, and duplicate values fail as usage (on `add`,
+        // where the flag applies; `install` rejects the flag itself above).
         for bad in [
             String::new(),
             "../evil".to_string(),
@@ -2627,10 +2668,8 @@ mod tests {
             assert!(
                 parse_component_request(
                     &[
-                        String::from("install"),
-                        String::from("net"),
-                        String::from("--version"),
-                        String::from("0.0.23"),
+                        String::from("add"),
+                        String::from("./dist"),
                         String::from("--distro"),
                         bad.clone(),
                     ],
@@ -2643,11 +2682,9 @@ mod tests {
         assert!(
             parse_component_request(
                 &[
-                    String::from("install"),
-                    String::from("net"),
-                    String::from("--version"),
-                    String::from("0.0.23"),
-                    String::from("--distro"),
+                    String::from("add"),
+                    String::from("./dist"),
+                    String::from("--distro")
                 ],
                 None,
             )
@@ -2656,10 +2693,8 @@ mod tests {
         assert!(
             parse_component_request(
                 &[
-                    String::from("install"),
-                    String::from("net"),
-                    String::from("--version"),
-                    String::from("0.0.23"),
+                    String::from("add"),
+                    String::from("./dist"),
                     String::from("--distro"),
                     String::from("Ubuntu"),
                     String::from("--distro=Debian"),
@@ -2668,7 +2703,7 @@ mod tests {
             )
             .is_err()
         );
-        // `--distro` only applies to `add`/`install`.
+        // `--distro` only applies to `add`.
         assert!(
             parse_component_request(
                 &[
@@ -2725,6 +2760,55 @@ mod tests {
             std::fs::read_to_string(user_root.join("net").join("wsl_distro")).expect("preserved"),
             "Ubuntu\n"
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn install_rejects_distro_with_usage_and_no_staging() {
+        // `install` fetches the host triple (a Windows PE on Windows hosts)
+        // and cannot stage a Linux guest helper: flag and env selections both
+        // fail as usage (exit 2) before any fetch or staging, naming `add`.
+        let base = scratch("install-distro-reject");
+        let (context, _, _) = context_for(&base.join("user"), &base.join("system"));
+        let (code, _) = run_with(
+            &context,
+            &[
+                "install",
+                "net",
+                "--version",
+                "0.0.23",
+                "--distro",
+                "Ubuntu",
+            ],
+        );
+        assert_eq!(code, EXIT_USAGE);
+        assert!(!base.join("user").join("net").exists());
+
+        // Env-only selection (no flag) fails the same way at dispatch.
+        let user: &'static str = Box::leak(
+            base.join("user")
+                .to_string_lossy()
+                .into_owned()
+                .into_boxed_str(),
+        );
+        let system: &'static str = Box::leak(
+            base.join("system")
+                .to_string_lossy()
+                .into_owned()
+                .into_boxed_str(),
+        );
+        let env_context = ComponentContext {
+            xdg_data_home: None,
+            home: None,
+            components_dir: Some(user),
+            system_components_dir: Some(system),
+            wsl_distro_env: Some("Ubuntu"),
+            pre_format: None,
+            pre_no_color: false,
+        };
+        let (code, _) = run_with(&env_context, &["install", "net", "--version", "0.0.23"]);
+        assert_eq!(code, EXIT_USAGE);
+        assert!(!base.join("user").join("net").exists());
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -3009,7 +3093,6 @@ mod tests {
             &mut input,
             true,
             &mut stub,
-            None,
         )
         .expect("seed install");
         assert!(
@@ -3050,7 +3133,6 @@ mod tests {
             &mut input,
             true,
             &mut stub,
-            None,
         )
         .expect("idempotent");
 
@@ -3069,7 +3151,6 @@ mod tests {
             &mut input,
             true,
             &mut stub,
-            None,
         )
         .expect_err("content swap must fail");
         assert_eq!(error.exit, EXIT_COMPONENT, "{}", error.message);
@@ -3105,7 +3186,6 @@ mod tests {
             &mut input,
             false,
             &mut stub,
-            None,
         )
         .expect_err("decline must fail");
         assert_eq!(error.exit, EXIT_GENERIC, "{}", error.message);
@@ -3141,7 +3221,6 @@ mod tests {
             &mut input,
             false,
             &mut stub,
-            None,
         )
         .expect_err("EOF must fail");
         assert_eq!(error.exit, EXIT_GENERIC, "{}", error.message);
@@ -3172,7 +3251,6 @@ mod tests {
             &mut input,
             false,
             &mut stub,
-            None,
         )
         .expect_err("invalid answers must fail");
         assert_eq!(error.exit, EXIT_GENERIC, "{}", error.message);
@@ -3203,7 +3281,6 @@ mod tests {
             &mut input,
             false,
             &mut stub,
-            None,
         )
         .expect("approval stages");
         assert!(summary.contains("installed component"), "{summary}");
@@ -3234,7 +3311,6 @@ mod tests {
             &mut input,
             true,
             &mut stub,
-            None,
         )
         .expect("--yes stages without prompting");
         assert!(summary.contains("installed component"), "{summary}");
@@ -3271,7 +3347,6 @@ mod tests {
             &mut input,
             true,
             &mut stub,
-            None,
         )
         .expect("matching --digest stages");
         assert!(summary.contains("installed component"), "{summary}");
@@ -3305,7 +3380,6 @@ mod tests {
             &mut input,
             true,
             &mut stub,
-            None,
         )
         .expect_err("expected mismatch must fail");
         // Both-must-match: integrity failure (exit 4), never a silent pick.
@@ -3353,7 +3427,6 @@ mod tests {
                 &mut input,
                 true,
                 &mut stub,
-                None,
             )
             .expect_err("malformed --digest must fail");
             assert_eq!(
@@ -3397,7 +3470,6 @@ mod tests {
             &mut input,
             true,
             &mut stub,
-            None,
         )
         .expect("first contact pins");
         let pin = std::fs::read_to_string(user.join("net").join(TARBALL_PIN_FILE)).expect("pin");
@@ -3417,7 +3489,6 @@ mod tests {
             &mut input,
             true,
             &mut stub,
-            None,
         )
         .expect("pin match is idempotent");
 
@@ -3456,7 +3527,6 @@ mod tests {
             &mut input,
             true,
             &mut stub,
-            None,
         )
         .expect_err("pin mismatch must fail");
         assert_eq!(error.exit, EXIT_COMPONENT, "{}", error.message);
@@ -3508,7 +3578,6 @@ mod tests {
             &mut input,
             true,
             &mut stub,
-            None,
         )
         .expect("--force re-pins");
         assert!(summary.contains("re-pinned"), "{summary}");
@@ -3551,7 +3620,6 @@ mod tests {
             &mut input,
             true,
             &mut stub,
-            None,
         )
         .expect("newer pins");
         // Downgrade to an older version with a differing tarball digest:
@@ -3576,7 +3644,6 @@ mod tests {
             &mut input,
             true,
             &mut older,
-            None,
         )
         .expect_err("downgrade with differing digest must fail");
         assert_eq!(error.exit, EXIT_COMPONENT, "{}", error.message);
@@ -3595,7 +3662,6 @@ mod tests {
             &mut input,
             true,
             &mut older,
-            None,
         )
         .expect("--force downgrade re-pins");
         let _ = std::fs::remove_dir_all(&base);
@@ -3679,7 +3745,6 @@ mod tests {
                 &mut input,
                 true,
                 &mut stub,
-                None,
             )
             .expect_err("corrupt pin must fail without --force");
             assert_eq!(error.exit, EXIT_COMPONENT, "{tag}: {}", error.message);
@@ -3707,7 +3772,6 @@ mod tests {
                 &mut input,
                 true,
                 &mut stub,
-                None,
             )
             .expect("corrupt pin must recover with --force");
             assert!(summary.contains("re-pinned"), "{tag}: {summary}");
@@ -3807,7 +3871,6 @@ mod tests {
             &mut input,
             false,
             &mut stub,
-            None,
         )
         .expect_err("overlong-then-EOF must fail");
         assert_eq!(error.exit, EXIT_GENERIC, "{}", error.message);

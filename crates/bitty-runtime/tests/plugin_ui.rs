@@ -304,14 +304,14 @@ impl Drop for Fixture {
 /// RED PROBE 2: before CTX-0428 this failed with `type error, expected table,
 /// found nil` because `bitty.ui` was absent on a full activation.
 #[test]
-fn probe_plugin_mounts_statusline_block() {
+fn probe_plugin_mounts_bottom_block() {
     let fixture = Fixture::activate(
         "probe",
         "bitty-featured.uiprobe",
         &["ui.rich"],
         &[],
         r#"
-        local ok, handle = pcall(bitty.ui.mount, "statusline", {
+        local ok, handle = pcall(bitty.ui.mount, "bottom", {
           kind = "Row",
           children = { { kind = "Text", text = "cwd:/tmp" } },
         })
@@ -352,7 +352,7 @@ fn probe_plugin_mounts_statusline_block() {
         .expect("services")
         .with_ui_blocks(|blocks| {
             let block = blocks.get(handle).expect("block retained");
-            assert_eq!(block.slot(), "statusline");
+            assert_eq!(block.slot(), "bottom");
             assert_eq!(block.version(), 2, "one mount plus one served update");
             assert_eq!(block.node(), &UiNode::text("v2"));
         });
@@ -366,7 +366,7 @@ fn mount_denied_without_ui_rich_is_typed() {
         &[],
         &[],
         r#"
-        local mount_ok, mount_err = pcall(bitty.ui.mount, "statusline", { kind = "Text", text = "x" })
+        local mount_ok, mount_err = pcall(bitty.ui.mount, "bottom", { kind = "Text", text = "x" })
         local update_ok, update_err = pcall(bitty.ui.update, 1, { kind = "Text", text = "x" })
         bitty.store.set("mount_code", mount_ok and "NONE" or mount_err.code)
         bitty.store.set("update_code", update_ok and "NONE" or update_err.code)
@@ -398,7 +398,7 @@ fn overlay_slot_requires_ui_overlay_grant() {
         &[],
         r#"
         local overlay_ok, overlay_err = pcall(bitty.ui.mount, "overlay", { kind = "Text", text = "x" })
-        local status_ok, status = pcall(bitty.ui.mount, "statusline", { kind = "Text", text = "ok" })
+        local status_ok, status = pcall(bitty.ui.mount, "bottom", { kind = "Text", text = "ok" })
         bitty.store.set("overlay_code", overlay_ok and "NONE" or overlay_err.code)
         bitty.store.set("status_ok", status_ok)
         bitty.store.set("status_handle", status_ok and status or -1)
@@ -527,15 +527,15 @@ fn overlay_slot_with_grant_is_hosted() {
 
 #[test]
 fn lua_band_slot_mounts_land_in_the_expected_band() {
-    // CTX-0923: the statusline plugin's `ui.mount("statusline")` must reach
-    // the bottom band, next to plain `bottom` mounts; `top` reaches the top.
+    // CTX-0923: a plugin's `ui.mount("bottom")` must reach
+    // the bottom band, next to other `bottom` mounts; `top` reaches the top.
     let fixture = Fixture::activate(
         "bands",
         "bitty-featured.uibands",
         &["ui.rich"],
         &[],
         r#"
-        bitty.ui.mount("statusline", { kind = "Text", text = "status" })
+        bitty.ui.mount("bottom", { kind = "Text", text = "status" })
         bitty.ui.mount("top", { kind = "Text", text = "top" })
         bitty.ui.mount("bottom", { kind = "Text", text = "bottom" })
         bitty.ui.mount("left", { kind = "Text", text = "left" })
@@ -566,10 +566,7 @@ fn lua_band_slot_mounts_land_in_the_expected_band() {
     };
     assert_eq!(slots(BandEdge::Top), [UiSlot::Top]);
     // One plugin, two bottom-edge mounts: mount order is kept.
-    assert_eq!(
-        slots(BandEdge::Bottom),
-        [UiSlot::Statusline, UiSlot::Bottom]
-    );
+    assert_eq!(slots(BandEdge::Bottom), [UiSlot::Bottom, UiSlot::Bottom]);
     assert_eq!(slots(BandEdge::Left), [UiSlot::Left]);
     assert_eq!(slots(BandEdge::Right), [UiSlot::Right]);
 }
@@ -586,7 +583,7 @@ fn mount_loop_hits_block_budget_fail_closed() {
         local mounted = 0
         local last_code = "NONE"
         for _ = 1, 65 do
-          local ok, err = pcall(bitty.ui.mount, "statusline", { kind = "Text", text = "x" })
+          local ok, err = pcall(bitty.ui.mount, "bottom", { kind = "Text", text = "x" })
           if ok then
             mounted = mounted + 1
           else
@@ -631,7 +628,7 @@ fn oversized_component_is_rejected_before_any_mount() {
         local chunk = table.concat(chunk_units)
         local text = chunk
         for _ = 1, 5 do text = text .. chunk end
-        local ok, err = pcall(bitty.ui.mount, "statusline", { kind = "Text", text = text })
+        local ok, err = pcall(bitty.ui.mount, "bottom", { kind = "Text", text = text })
         bitty.store.set("ok", ok)
         bitty.store.set("code", ok and "NONE" or err.code)
         return {}
@@ -671,7 +668,7 @@ fn reload_starts_the_next_generation_with_a_fresh_registry() {
             return ok
           end,
         })
-        local mounted, handle = pcall(bitty.ui.mount, "statusline", { kind = "Text", text = "gen" })
+        local mounted, handle = pcall(bitty.ui.mount, "bottom", { kind = "Text", text = "gen" })
         bitty.store.set("handle", mounted and handle or -1)
         -- Remember the first generation's real handle across the reload.
         if bitty.store.get("old_handle") == nil then
@@ -777,12 +774,12 @@ fn suspend_invalidates_handles_until_remount() {
           id = "remount",
           title = "Remount",
           run = function()
-            local mounted, handle = pcall(bitty.ui.mount, "statusline", { kind = "Text", text = "again" })
+            local mounted, handle = pcall(bitty.ui.mount, "bottom", { kind = "Text", text = "again" })
             if mounted then bitty.store.set("handle", handle) end
             return mounted
           end,
         })
-        local mounted, handle = pcall(bitty.ui.mount, "statusline", { kind = "Text", text = "gen" })
+        local mounted, handle = pcall(bitty.ui.mount, "bottom", { kind = "Text", text = "gen" })
         bitty.store.set("handle", mounted and handle or -1)
         bitty.store.set("old_handle", mounted and handle or -1)
         return {}

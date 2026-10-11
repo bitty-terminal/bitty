@@ -57,8 +57,6 @@ pub enum UiSlot {
     Right,
     /// `tabline` — exclusive-claim tab strip (reserved for panel tabs).
     Tabline,
-    /// `statusline` — composable status components.
-    Statusline,
     /// `overlay` — Core-hosted focusable overlay (needs `ui.overlay`).
     ///
     /// The v1 slot was presentation-only; the Core host now retains the block
@@ -69,14 +67,13 @@ pub enum UiSlot {
 
 impl UiSlot {
     /// Every accepted slot, in the canonical declaration order.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 7] = [
         Self::Terminal,
         Self::Top,
         Self::Bottom,
         Self::Left,
         Self::Right,
         Self::Tabline,
-        Self::Statusline,
         Self::Overlay,
     ];
 
@@ -97,7 +94,6 @@ impl UiSlot {
             Self::Left => "left",
             Self::Right => "right",
             Self::Tabline => "tabline",
-            Self::Statusline => "statusline",
             Self::Overlay => "overlay",
         }
     }
@@ -111,14 +107,13 @@ impl std::fmt::Display for UiSlot {
 
 /// Accepted closed slot set for `bitty.ui.mount` as strings, in
 /// [`UiSlot::ALL`] order (kept for callers that list names).
-pub const UI_SLOTS: [&str; 8] = [
+pub const UI_SLOTS: [&str; 7] = [
     UiSlot::Terminal.as_str(),
     UiSlot::Top.as_str(),
     UiSlot::Bottom.as_str(),
     UiSlot::Left.as_str(),
     UiSlot::Right.as_str(),
     UiSlot::Tabline.as_str(),
-    UiSlot::Statusline.as_str(),
     UiSlot::Overlay.as_str(),
 ];
 
@@ -637,7 +632,15 @@ mod tests {
             assert_eq!(UiSlot::parse(slot.as_str()), Some(slot));
             assert!(is_ui_slot(slot.as_str()));
         }
-        for bad in ["", "Statusline", "status", "workspaceline", "tabs", " top"] {
+        for bad in [
+            "",
+            "Statusline",
+            "statusline",
+            "status",
+            "workspaceline",
+            "tabs",
+            " top",
+        ] {
             assert_eq!(UiSlot::parse(bad), None, "{bad:?}");
             assert!(!is_ui_slot(bad));
         }

@@ -385,8 +385,7 @@ pub const PASTE_BANNER_FLASH_TEXT: &str = "Paste pending (paste again to confirm
 pub struct ChromeBands {
     /// Top edge bands (index `0` at the window top, stacking downward).
     pub top: Vec<BandContent>,
-    /// Bottom edge bands (index `0` at the window bottom, stacking upward;
-    /// carries both `bottom` and `statusline` mounts).
+    /// Bottom edge bands (index `0` at the window bottom, stacking upward).
     pub bottom: Vec<BandContent>,
     /// Left edge bands (stacked left-to-right, deferred for v0.1).
     pub left: Vec<BandContent>,
@@ -400,7 +399,7 @@ pub struct BandContent {
     /// Owning plugin id.
     pub plugin_id: String,
     /// Accepted slot the block was mounted into (`top`, `bottom`,
-    /// `statusline`, `left`, or `right`; see [`band_slots`]).
+    /// `left`, or `right`; see [`band_slots`]).
     pub slot: bitty_lua::ui::UiSlot,
     /// Root UiNode tree.
     pub root: bitty_lua::ui::UiNode,

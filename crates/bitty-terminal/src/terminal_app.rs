@@ -1535,7 +1535,7 @@ impl TerminalApp {
         let blocks = plugin_runtime.ui_blocks();
         // CTX-0923: slot routing and stacking live in one place
         // (`bitty_runtime::ui_slot_placement` via `ChromeBands::from_mounts`),
-        // the same policy the `ui.mount` gate uses: `statusline` joins the
+        // the same policy the `ui.mount` gate uses: `bottom` mounts join the
         // bottom band, `tabline`/`terminal` mounts are rejected at mount time
         // with `E_UI_UNAVAILABLE`, and the focusable `overlay` slot (CTX-0941)
         // is hosted by the overlay surface rather than this band renderer.

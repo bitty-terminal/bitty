@@ -6428,7 +6428,7 @@ mod tests {
     fn chrome_order_valid_list() {
         let config = ChromeConfig {
             top_order: vec!["plugin-a".to_string(), "plugin-b".to_string()],
-            bottom_order: vec!["statusline".to_string()],
+            bottom_order: vec!["plugin-c".to_string()],
             left_order: vec![],
             right_order: vec![],
         };

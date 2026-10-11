@@ -256,7 +256,7 @@ fn mount_and_update_round_trip_validated_scene() {
     run(
         &mut vm,
         r#"
-        local handle = bitty.ui.mount("statusline", {
+        local handle = bitty.ui.mount("bottom", {
           kind = "Column",
           children = {
             { kind = "Row", children = { { kind = "Text", text = "cwd:/tmp" } } },
@@ -272,7 +272,7 @@ fn mount_and_update_round_trip_validated_scene() {
 
     let mounts = services.mounts.borrow();
     assert_eq!(mounts.len(), 1);
-    assert_eq!(mounts[0].0, "statusline");
+    assert_eq!(mounts[0].0, "bottom");
     assert_eq!(mounts[0].1.kind(), "Column");
     assert_eq!(mounts[0].1.count_nodes(), 5);
     assert_eq!(mounts[0].1.text_bytes(), "cwd:/tmpitem".len());
@@ -311,14 +311,23 @@ fn unknown_slot_is_typed_component_error() {
     run(
         &mut vm,
         r#"
-        local ok, err = pcall(bitty.ui.mount, "nowhere", { kind = "Text", text = "x" })
-        bitty.store.set("ok", ok)
-        bitty.store.set("code", ok and "NONE" or err.code)
+        local codes = {}
+        for _, slot in ipairs({ "nowhere", "statusline" }) do
+          local ok, err = pcall(bitty.ui.mount, slot, { kind = "Text", text = "x" })
+          codes[slot] = ok and "NONE" or err.code
+        end
+        bitty.store.set("nowhere_code", codes["nowhere"])
+        bitty.store.set("statusline_code", codes["statusline"])
     "#,
     );
-    assert_eq!(stored(&services, "ok"), Some(LuaValue::Bool(false)));
     assert_eq!(
-        stored(&services, "code"),
+        stored(&services, "nowhere_code"),
+        Some(LuaValue::String("E_UI_COMPONENT_INVALID".to_string()))
+    );
+    // CTX-1140 (#1961): the removed `statusline` slot is refused exactly
+    // like any other unknown slot name.
+    assert_eq!(
+        stored(&services, "statusline_code"),
         Some(LuaValue::String("E_UI_COMPONENT_INVALID".to_string()))
     );
     assert!(services.mounts.borrow().is_empty());
@@ -464,7 +473,7 @@ fn oversized_update_rejected_before_commit() {
     run(
         &mut vm,
         r#"
-        local handle = bitty.ui.mount("statusline", { kind = "Text", text = "ok" })
+        local handle = bitty.ui.mount("bottom", { kind = "Text", text = "ok" })
         bitty.store.set("handle", handle)
         -- 44 KiB linear chunk appended six times: over SCN-3, inside RC-1.
         local unit_parts = {}
@@ -568,7 +577,7 @@ fn host_without_ui_surface_fails_closed() {
     run(
         &mut vm,
         r#"
-        local ok, err = pcall(bitty.ui.mount, "statusline", { kind = "Text", text = "x" })
+        local ok, err = pcall(bitty.ui.mount, "bottom", { kind = "Text", text = "x" })
         bitty.store.set("code", ok and "NONE" or err.code)
     "#,
     );
@@ -589,7 +598,7 @@ fn capability_denial_propagates_typed() {
     run(
         &mut vm,
         r#"
-        local mount_ok, mount_err = pcall(bitty.ui.mount, "statusline", { kind = "Text", text = "x" })
+        local mount_ok, mount_err = pcall(bitty.ui.mount, "bottom", { kind = "Text", text = "x" })
         local update_ok, update_err = pcall(bitty.ui.update, 11, { kind = "Text", text = "x" })
         bitty.store.set("mount_code", mount_ok and "NONE" or mount_err.code)
         bitty.store.set("update_code", update_ok and "NONE" or update_err.code)
@@ -618,7 +627,7 @@ fn expired_mount_returns_timeout_without_commit() {
     run(
         &mut vm,
         r#"
-        local ok, err = pcall(bitty.ui.mount, "statusline", { kind = "Text", text = "x" })
+        local ok, err = pcall(bitty.ui.mount, "bottom", { kind = "Text", text = "x" })
         bitty.store.set("code", ok and "NONE" or err.code)
     "#,
     );

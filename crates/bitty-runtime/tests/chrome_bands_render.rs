@@ -100,10 +100,10 @@ fn bottom_band_renders_at_window_bottom() {
     let mut rt = minimal_runtime();
 
     let band = BandContent {
-        plugin_id: "statusline".to_string(),
+        plugin_id: "bottom-bar".to_string(),
         slot: UiSlot::Bottom,
         root: UiNode::Text {
-            text: "statusline content".to_string(),
+            text: "bottom content".to_string(),
             fg: Some("foreground".to_string()),
             bg: Some("background".to_string()),
             bold: Some(false),
@@ -411,15 +411,15 @@ fn presented(bands: ChromeBands) -> Runtime {
 }
 
 #[test]
-fn statusline_band_paints_on_the_window_edge() {
+fn bottom_band_paints_on_the_window_edge() {
     for (band_edge, slot) in [
-        (BandEdge::Bottom, UiSlot::Statusline),
+        (BandEdge::Bottom, UiSlot::Bottom),
         (BandEdge::Top, UiSlot::Top),
     ] {
         let mut bands = ChromeBands::default();
         match band_edge {
-            BandEdge::Top => bands.top.push(text_band("statusline", slot, "STATUS")),
-            _ => bands.bottom.push(text_band("statusline", slot, "STATUS")),
+            BandEdge::Top => bands.top.push(text_band("top-bar", slot, "STATUS")),
+            _ => bands.bottom.push(text_band("bottom-bar", slot, "STATUS")),
         }
         let without = presented(ChromeBands::default());
         let with = presented(bands);

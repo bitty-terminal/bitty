@@ -3699,7 +3699,7 @@ mod tests {
     fn ui_mount_defaults_deny() {
         let services = services();
         let error = services
-            .ui_mount("statusline", &UiNode::text("x"))
+            .ui_mount("bottom", &UiNode::text("x"))
             .expect_err("default access must deny");
         assert_eq!(error.code, "E_CAPABILITY_DENIED");
         services.with_ui_blocks(|blocks| assert!(blocks.is_empty()));
@@ -3708,18 +3708,20 @@ mod tests {
     #[test]
     fn ui_mount_rejects_unknown_slot_at_host_boundary() {
         let services = ui_services(rich_only());
-        let error = services
-            .ui_mount("nowhere", &UiNode::text("x"))
-            .expect_err("unknown slot must fail closed");
-        assert_eq!(error.code, "E_UI_COMPONENT_INVALID");
+        for slot in ["nowhere", "statusline"] {
+            let error = services
+                .ui_mount(slot, &UiNode::text("x"))
+                .expect_err("unknown slot must fail closed");
+            assert_eq!(error.code, "E_UI_COMPONENT_INVALID", "{slot}");
+        }
     }
 
     #[test]
     fn overlay_slot_requires_ui_overlay() {
         let services = ui_services(rich_only());
         services
-            .ui_mount("statusline", &UiNode::text("ok"))
-            .expect("statusline mount");
+            .ui_mount("bottom", &UiNode::text("ok"))
+            .expect("bottom mount");
         let error = services
             .ui_mount("overlay", &UiNode::text("denied"))
             .expect_err("overlay needs ui.overlay");
@@ -4267,20 +4269,20 @@ mod tests {
                 }
             }
         }
-        // top, bottom, left, right, statusline, overlay
-        services.with_ui_blocks(|blocks| assert_eq!(blocks.len(), 6));
+        // top, bottom, left, right, overlay
+        services.with_ui_blocks(|blocks| assert_eq!(blocks.len(), 5));
     }
 
     #[test]
     fn mount_update_round_trip_and_stale_handle() {
         let services = ui_services(rich_only());
         let handle = services
-            .ui_mount("statusline", &UiNode::row(vec![UiNode::text("v1")]))
+            .ui_mount("bottom", &UiNode::row(vec![UiNode::text("v1")]))
             .expect("mount");
         assert!(handle > 0);
         services.with_ui_blocks(|blocks| {
             let block = blocks.get(handle).expect("block retained");
-            assert_eq!(block.slot(), "statusline");
+            assert_eq!(block.slot(), "bottom");
             assert_eq!(block.version(), 1);
             assert_eq!(block.node().text_bytes(), 2);
         });
@@ -4308,12 +4310,12 @@ mod tests {
         let first = ui_services(rich_only());
         first.set_ui_epoch(7);
         let handle = first
-            .ui_mount("statusline", &UiNode::text("gen1"))
+            .ui_mount("bottom", &UiNode::text("gen1"))
             .expect("mount");
         let second = ui_services(rich_only());
         second.set_ui_epoch(8);
         let own = second
-            .ui_mount("statusline", &UiNode::text("gen2"))
+            .ui_mount("bottom", &UiNode::text("gen2"))
             .expect("mount");
         assert_ne!(
             handle, own,
@@ -4340,7 +4342,7 @@ mod tests {
         let services = ui_services(rich_only());
         services.set_ui_epoch(3);
         let first = services
-            .ui_mount("statusline", &UiNode::text("gen1"))
+            .ui_mount("bottom", &UiNode::text("gen1"))
             .expect("mount");
         services.clear_ui_blocks();
         services.with_ui_blocks(|blocks| assert!(blocks.is_empty()));
@@ -4351,7 +4353,7 @@ mod tests {
             "a cleared handle must report false"
         );
         let second = services
-            .ui_mount("statusline", &UiNode::text("gen2"))
+            .ui_mount("bottom", &UiNode::text("gen2"))
             .expect("remount");
         assert_ne!(
             first, second,
@@ -4370,11 +4372,11 @@ mod tests {
         let services = ui_services(rich_only());
         for index in 0..UI_MAX_BLOCKS {
             services
-                .ui_mount("statusline", &UiNode::text(format!("{index}")))
+                .ui_mount("bottom", &UiNode::text(format!("{index}")))
                 .expect("under the block cap");
         }
         let error = services
-            .ui_mount("statusline", &UiNode::text("overflow"))
+            .ui_mount("bottom", &UiNode::text("overflow"))
             .expect_err("block cap must fail closed");
         assert_eq!(error.code, "E_UI_BLOCK_BUDGET");
         assert_eq!(error.class, "budget");
@@ -4387,11 +4389,11 @@ mod tests {
         let chunk = "x".repeat(UI_MAX_TEXT_BYTES);
         for _ in 0..(UI_MAX_AGGREGATED_TEXT_BYTES / UI_MAX_TEXT_BYTES) {
             services
-                .ui_mount("statusline", &UiNode::text(chunk.clone()))
+                .ui_mount("bottom", &UiNode::text(chunk.clone()))
                 .expect("exactly at the aggregate cap");
         }
         let error = services
-            .ui_mount("statusline", &UiNode::text("one byte over"))
+            .ui_mount("bottom", &UiNode::text("one byte over"))
             .expect_err("aggregate cap must fail closed");
         assert_eq!(error.code, "E_UI_BLOCK_BUDGET");
         services.with_ui_blocks(|blocks| {

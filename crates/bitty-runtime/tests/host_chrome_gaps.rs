@@ -493,7 +493,7 @@ fn stacked_bands_never_share_a_row() {
     rt.set_chrome_bands(ChromeBands {
         bottom: vec![
             text_band("a", UiSlot::Bottom, plain("A")),
-            text_band("b", UiSlot::Statusline, plain("B")),
+            text_band("b", UiSlot::Bottom, plain("B")),
         ],
         ..Default::default()
     });

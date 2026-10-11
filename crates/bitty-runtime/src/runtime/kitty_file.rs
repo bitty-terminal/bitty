@@ -30,9 +30,14 @@
 //!    symlink final components (`ELOOP`); `O_NONBLOCK` keeps FIFO opens
 //!    from parking the render thread until a writer arrives (the fstat next
 //!    refuses the FIFO anyway).
-//! 6. Linux only, `t=t`: re-derive the open file's canonical target from
-//!    `/proc/self/fd` and re-check containment, closing the
-//!    canonicalize-then-open rename race.
+//! 6. Linux only, `t=t`: re-derive the open file's fd-target *name* from
+//!    `/proc/self/fd` and re-check containment *and* the temp marker, closing
+//!    the fd-target-name variant of the canonicalize-then-open rename race
+//!    (a same-user rename leaving the fd at a marker-less target name is
+//!    refused here fail-closed). Residual: a same-user rename placing a
+//!    marker-less inode at a marker pathname before open still yields a
+//!    marker-bearing fd-target name and is admitted; bytes stay capped and
+//!    quota-charged.
 //! 7. `fstat` on the fd (never `stat` by path): non-regular files
 //!    (directories, FIFOs, sockets, devices) are refused.
 //! 8. `fstat` size precheck against the read cap: oversize files are refused
@@ -54,11 +59,17 @@
 //!   elsewhere. macOS `shm_open` objects live outside any stable
 //!   caller-visible filesystem path, so the same containment story cannot
 //!   be told; Windows has no POSIX shm namespace at all.
-//! - The `/proc/self/fd` re-containment (step 6) is Linux only. Other Unix
-//!   keeps the pre-open canonicalize check plus `O_NOFOLLOW` (documented
-//!   residual: a privileged same-user rename race between canonicalize and
-//!   open could swap a regular file; the swapped bytes still decode under
-//!   the caps and charge to the same origin quota).
+//! - The `/proc/self/fd` re-containment (step 6) is Linux only: only Linux
+//!   guarantees a stable fd-target path (`/proc/self/fd/<fd>` readlink).
+//!   Other Unix keeps the pre-open canonicalize check plus `O_NOFOLLOW`.
+//!   macOS offers `fcntl(F_GETPATH)` instead of a `/proc` target, and the
+//!   BSDs expose `/dev/fd/<fd>` or an optionally-mounted `procfs` — neither
+//!   is a stable hermetic primitive, so wiring them would add platform
+//!   plumbing and audit surface for one slice. Documented residual: on
+//!   non-Linux Unix (including Android, which also keeps the pre-open check
+//!   only) a same-user rename race between canonicalize and open could swap
+//!   in a marker-less regular file; the swapped bytes still decode under
+//!   the caps and charge to the same origin quota.
 //!
 //! # Temp-dir allowlist (`t=t`)
 //!
@@ -406,16 +417,22 @@ fn check_temp_containment(path: &Path) -> Result<(), KittyLocalReadError> {
     }
 }
 
-/// Linux-only re-containment on the open fd: re-derives the canonical target
-/// from `/proc/self/fd` and re-checks the temp-dir roots, closing the
-/// canonicalize-then-open rename race. Refuses fail-closed when the target
-/// cannot be derived.
+/// Linux-only re-containment on the open fd: re-derives the fd-target *name*
+/// from `/proc/self/fd` and re-checks the temp-dir roots *and* the temp
+/// marker (same name-substring shape check as the entry pre-check), closing
+/// only the fd-target-name variant of the canonicalize-then-open rename race;
+/// a path-substring check cannot bind marker to inode identity. Refuses
+/// fail-closed when the target cannot be derived or the marker is absent.
 #[cfg(target_os = "linux")]
 fn check_fd_containment(file: &std::fs::File) -> Result<(), KittyLocalReadError> {
     use std::os::fd::{AsFd, AsRawFd};
+    use std::os::unix::ffi::OsStrExt;
     let fd = file.as_fd().as_raw_fd();
     let target = std::fs::read_link(format!("/proc/self/fd/{fd}"))
         .map_err(|_| KittyLocalReadError::Io("fd-target"))?;
+    if !contains_tmp_marker(target.as_os_str().as_bytes()) {
+        return Err(KittyLocalReadError::BadName);
+    }
     if temp_roots().iter().any(|root| target.starts_with(root)) {
         Ok(())
     } else {
@@ -1722,6 +1739,40 @@ mod tests {
             "at least the OS temp dir must canonicalize"
         );
         assert!(temp_roots().iter().all(|root| root.is_absolute()));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn fd_containment_rechecks_marker_hermetic() {
+        // CTX-1118 H1: the fd-target re-check must refuse a marker-less temp
+        // file even though it sits under a temp root (same-user rename
+        // swapping in a marker-less file post-open), while still admitting
+        // the marker-bearing control. Hermetic and fast: fixtures live under
+        // `temp_dir()`, no sleeps, no threads, best-effort cleanup.
+        let n = ASYNC_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "bitty-ctx1118-fd-marker-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir must build");
+        let marker = dir.join("tty-graphics-protocol-marker.bin");
+        let plain = dir.join("plain.bin");
+        std::fs::write(&marker, b"marker").expect("marker fixture must write");
+        std::fs::write(&plain, b"plain").expect("plain fixture must write");
+
+        let marker_file = std::fs::File::open(&marker).expect("marker open must succeed");
+        assert_eq!(
+            check_fd_containment(&marker_file),
+            Ok(()),
+            "fd to a marker-bearing temp file stays admitted"
+        );
+        let plain_file = std::fs::File::open(&plain).expect("plain open must succeed");
+        assert_eq!(
+            check_fd_containment(&plain_file),
+            Err(KittyLocalReadError::BadName),
+            "fd to a marker-less temp file refuses fail-closed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // CTX-1110 async worker tests: hermetic and fast (tiny timeouts plus

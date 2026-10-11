@@ -1282,7 +1282,42 @@ pub fn all_chrome_actions() -> Vec<ChromeAction> {
 /// overrides stay owned by `bitty config check` and the live app path, which
 /// call [`resolve_keymaps`] over the effective file config.
 pub fn shipped_resolved_keymaps() -> Vec<ResolvedKeymap> {
-    resolve_keymaps(&EffectiveConfig::default()).unwrap_or_default()
+    resolve_keymaps(&EffectiveConfig::default()).expect("internal DEFAULT_KEYMAPS must resolve")
+}
+
+/// Effective keybinding for one catalog action (CTX-1127 follow-up).
+///
+/// Shared helper for `list actions` and `list keymaps` (no fork): given any
+/// resolved table (shipped defaults or effective file config with user
+/// overrides via [`resolve_keymaps`]), return the chord that triggers
+/// `action` — user-configured chord first (`from_default == false`), else the
+/// shipped default, else `None` for manual-bind-only actions.
+///
+/// Matching is exact canonical (including args), so `workspace_focus:1` never
+/// borrows `workspace_focus:2` and `goto_split:left` never borrows `right`.
+/// Among same-source matches the smallest chord wins for determinism.
+#[must_use]
+pub fn effective_binding_for_action(
+    resolved: &[ResolvedKeymap],
+    action: &ChromeAction,
+) -> Option<String> {
+    let want = action.canonical();
+    let mut user: Vec<String> = resolved
+        .iter()
+        .filter(|e| !e.from_default && e.action.canonical() == want)
+        .map(|e| e.chord.canonical())
+        .collect();
+    user.sort();
+    if let Some(first) = user.into_iter().next() {
+        return Some(first);
+    }
+    let mut shipped: Vec<String> = resolved
+        .iter()
+        .filter(|e| e.from_default && e.action.canonical() == want)
+        .map(|e| e.chord.canonical())
+        .collect();
+    shipped.sort();
+    shipped.into_iter().next()
 }
 
 /// Hint listing the accepted action vocabulary.

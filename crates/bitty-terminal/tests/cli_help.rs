@@ -80,6 +80,7 @@ fn default_help_lists_every_subcommand_on_one_line() {
         "completion",
         "shell-init",
         "version",
+        "help",
     ] {
         assert!(
             help.lines().any(|line| line.trim_start().starts_with(sub)),
@@ -167,15 +168,14 @@ fn verbose_help_restores_full_detail() {
 
 #[test]
 fn every_subcommand_still_reachable_via_per_command_help() {
-    // (subcommand, marker that proves its dedicated help rendered;
-    // `config`/`init`/`doctor` fall back to the top-level help, which must
-    // still exit 0 with usage on stdout.)
+    // (subcommand, marker that proves its dedicated help rendered; each
+    // prints its own command help and exits 0.)
     let cases: &[(&str, &str)] = &[
         ("run", "bitty run"),
         ("ctl", "bitty ctl"),
-        ("config", "Usage:"),
-        ("init", "Usage:"),
-        ("doctor", "Usage:"),
+        ("config", "usage: bitty config"),
+        ("init", "usage: bitty init"),
+        ("doctor", "usage: bitty doctor"),
         ("list", "bitty list"),
         ("inspect", "bitty inspect"),
         ("dev", "bitty dev"),
@@ -186,6 +186,7 @@ fn every_subcommand_still_reachable_via_per_command_help() {
         ("completion", "bitty completion"),
         ("shell-init", "bitty shell-init"),
         ("version", "bitty version"),
+        ("help", "help [cmd]"),
     ];
     for (sub, marker) in cases {
         let output = run_bitty(&[sub, "--help"]);
@@ -203,6 +204,94 @@ fn every_subcommand_still_reachable_via_per_command_help() {
         assert!(
             help.contains(marker),
             "bitty {sub} --help must contain {marker:?}, got:\n{help}"
+        );
+    }
+}
+
+#[test]
+fn help_subcommand_never_spawns_and_aliases_per_command_help() {
+    // CTX-1117 (issue #1900): `bitty help` aliases `--help` (no-arg) and
+    // `bitty help <cmd>` aliases `bitty <cmd> --help`; unknown names fail
+    // closed (exit 2) naming valid commands; `bitty help` never spawns.
+    let output = run_bitty(&["help"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "bitty help must exit 0, stderr={:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let help = stdout(&output);
+    assert!(
+        help.contains("Subcommands") && help.contains("help [cmd]"),
+        "bitty help must print the short overview with 16 subcommands:\n{help}"
+    );
+
+    let via_help = stdout(&run_bitty(&["help", "plugin"]));
+    let via_flag = stdout(&run_bitty(&["plugin", "--help"]));
+    assert_eq!(
+        via_help, via_flag,
+        "bitty help plugin must equal bitty plugin --help"
+    );
+
+    // CodeRabbit 4240219272: `bitty help <cmd>` must equal
+    // `bitty <cmd> --help` for config/init/doctor too (same text, not the
+    // top-level overview).
+    for sub in ["config", "init", "doctor"] {
+        let via_help = stdout(&run_bitty(&["help", sub]));
+        let via_flag = stdout(&run_bitty(&[sub, "--help"]));
+        assert_eq!(
+            via_help, via_flag,
+            "bitty help {sub} must equal bitty {sub} --help"
+        );
+    }
+
+    let output = run_bitty(&["help", "bogus"]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "unknown help cmd must be UsageError (exit 2), stderr={:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.contains("unknown command") && stderr.contains("run, ctl"),
+        "unknown help cmd must name valid commands, got {stderr:?}"
+    );
+}
+
+#[test]
+fn help_with_unknown_flag_is_usage_error() {
+    // CodeRabbit 4240150291: `bitty help plugin --typo` records `--typo`
+    // in `unknown_flag` (the dash arm has no help handling), so the help
+    // branch must reject it (exit 2) instead of printing help (exit 0).
+    let output = run_bitty(&["help", "plugin", "--typo"]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "help with unknown flag must be UsageError (exit 2), stderr={:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.contains("unknown flag") && stderr.contains("--typo"),
+        "help unknown flag must name the flag, got {stderr:?}"
+    );
+
+    // CodeRabbit 4240273068: same class mirrored to the `<cmd> --help`
+    // branches for config/init/doctor — a typo must exit 2 naming the
+    // flag, not print help with exit 0.
+    for sub in ["config", "init", "doctor"] {
+        let output = run_bitty(&[sub, "--help", "--typo"]);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "bitty {sub} --help --typo must be UsageError (exit 2), stderr={:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            stderr.contains("unknown flag") && stderr.contains("--typo"),
+            "bitty {sub} --help --typo must name the flag, got {stderr:?}"
         );
     }
 }

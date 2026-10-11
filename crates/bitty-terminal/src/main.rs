@@ -261,7 +261,10 @@ mod terminal_app;
 mod test_mode;
 mod x;
 
-use cli::{help_color_enabled, help_text, help_text_short, parse_args};
+use cli::{
+    help_canonical_cmd, help_color_enabled, help_help_text, help_text, help_text_short, help_usage,
+    help_valid_commands, parse_args,
+};
 use config_cli::{
     config_usage, load_app_config, run_config_subcommand, runtime_config_from_effective_for,
     startup_prefer_light,
@@ -352,6 +355,17 @@ fn ipc_serve_failure_exit(
     })
 }
 
+/// Whether to store the early-resolved IPC socket path on `Runtime` for PTY
+/// `BITTY_SOCKET` injection (CTX-1117, CodeRabbit 4240150294).
+///
+/// Headless never serves, so it never stores — except test mode, which takes
+/// precedence over headless and still serves IPC after spawning. Storing
+/// when `test_mode` is true (even with `headless`) ensures test-mode shells
+/// receive their instance's socket.
+fn should_store_ipc_socket_path(headless: bool, test_mode: bool) -> bool {
+    !headless || test_mode
+}
+
 fn main() {
     let raw: Vec<String> = std::env::args().collect();
     let args = parse_args(&raw);
@@ -366,6 +380,40 @@ fn main() {
     // a violation panics in debug (fail-closed development, never production).
     debug_assert!(observability::default_posture_pins_hold(args.safe));
 
+    // CodeRabbit 4240219272: `bitty config/init/doctor --help` must print
+    // the same command help as the documented `bitty help <cmd>` alias
+    // (which prints `config_usage`/`init_usage`/`doctor_usage`), not the
+    // top-level overview. Same `println!` shape as the help-word branch so
+    // the bytes are equal.
+    // CodeRabbit 4240273068: reject unknown flags here (exit 2) before
+    // printing help — same class as the `help <cmd> --typo` case.
+    if args.help && args.config_word {
+        if let Some(flag) = args.unknown_flag.as_deref() {
+            eprintln!("bitty config: unknown flag '{flag}'\n{}", config_usage());
+            std::process::exit(2);
+        }
+        println!("{}", config_usage());
+        std::process::exit(0);
+    }
+    if args.help && args.init_word {
+        if let Some(flag) = args.unknown_flag.as_deref() {
+            eprintln!("bitty init: unknown flag '{flag}'\n{}", init::init_usage());
+            std::process::exit(2);
+        }
+        println!("{}", init::init_usage());
+        std::process::exit(0);
+    }
+    if args.help && args.doctor_word {
+        if let Some(flag) = args.unknown_flag.as_deref() {
+            eprintln!(
+                "bitty doctor: unknown flag '{flag}'\n{}",
+                doctor::doctor_usage()
+            );
+            std::process::exit(2);
+        }
+        println!("{}", doctor::doctor_usage());
+        std::process::exit(0);
+    }
     // `bitty list --help` shows list help (never needs an instance or VM);
     // `bitty inspect --help` shows inspect help; bare `--help` shows the
     // top-level help.
@@ -426,6 +474,120 @@ fn main() {
     if args.help && args.x_word && args.x_raw.is_empty() {
         print!("{}", x::x_help_text());
         std::process::exit(0);
+    }
+    // `bitty help [cmd]` introspection (issue #1900, CTX-1117, local class).
+    // Bare `bitty help` aliases `--help` (short overview, `-v` for full);
+    // `bitty help <cmd>` aliases `bitty <cmd> --help`. Never spawns: a
+    // program literally named `help` needs `bitty -- help ...`. Unknown
+    // names fail closed (exit 2) naming valid commands.
+    if args.help_word {
+        // CodeRabbit 4240150291: unknown dash-flags after `help` land in
+        // `unknown_flag` (the dash arm has no help handling), not
+        // `help_args`. Reject them here (exit 2) before printing help.
+        if let Some(flag) = args.unknown_flag.as_deref() {
+            eprintln!("bitty help: unknown flag '{flag}'\n{}", help_usage());
+            std::process::exit(2);
+        }
+        if !args.help_args.is_empty() {
+            eprintln!(
+                "bitty help: unexpected argument '{}'\n{}",
+                args.help_args[0],
+                help_usage()
+            );
+            std::process::exit(2);
+        }
+        match args.help_cmd.as_deref() {
+            None => {
+                if args.verbose {
+                    println!("{}", help_text());
+                } else {
+                    println!("{}", help_text_short(help_color_enabled(&args)));
+                }
+                std::process::exit(0);
+            }
+            Some(raw) => match help_canonical_cmd(raw) {
+                None => {
+                    eprintln!(
+                        "bitty help: unknown command {raw:?} (want {})\n{}",
+                        help_valid_commands(),
+                        help_usage()
+                    );
+                    std::process::exit(2);
+                }
+                Some("run") => {
+                    print!("{}", run::run_help_text());
+                    std::process::exit(0);
+                }
+                Some("ctl") => {
+                    print!("{}", ctl::ctl_help_text());
+                    std::process::exit(0);
+                }
+                Some("config") => {
+                    println!("{}", config_usage());
+                    std::process::exit(0);
+                }
+                Some("init") => {
+                    println!("{}", init::init_usage());
+                    std::process::exit(0);
+                }
+                Some("doctor") => {
+                    println!("{}", doctor::doctor_usage());
+                    std::process::exit(0);
+                }
+                Some("list") => {
+                    println!("{}", list::list_help_text(raw));
+                    std::process::exit(0);
+                }
+                Some("inspect") => {
+                    println!("{}", inspect::inspect_help_text());
+                    std::process::exit(0);
+                }
+                Some("dev") => {
+                    println!("{}", dev::dev_help_text());
+                    std::process::exit(0);
+                }
+                Some("plugin") => {
+                    println!("{}", plugin::plugin_help_text());
+                    std::process::exit(0);
+                }
+                Some("component") => {
+                    println!("{}", component::component_help_text());
+                    std::process::exit(0);
+                }
+                Some("version") => {
+                    println!("{}", version::version_help_text());
+                    std::process::exit(0);
+                }
+                Some("completion") => {
+                    println!("{}", completion::completion_help_text(raw));
+                    std::process::exit(0);
+                }
+                Some("cmd") => {
+                    println!("{}", cmd::cmd_help_text());
+                    std::process::exit(0);
+                }
+                Some("x") => {
+                    print!("{}", x::x_help_text());
+                    std::process::exit(0);
+                }
+                Some("shell-init") => {
+                    print!("{}", shell_init::shell_init_help_text());
+                    std::process::exit(0);
+                }
+                Some("help") => {
+                    print!("{}", help_help_text());
+                    std::process::exit(0);
+                }
+                Some(other) => {
+                    eprintln!(
+                        "bitty help: unknown command {other:?} (want {})\n{}",
+                        help_valid_commands(),
+                        help_usage()
+                    );
+                    std::process::exit(2);
+                }
+            },
+        }
     }
     // Bare `--help` prints the compact overview (CTX-1060, issue #1808);
     // `--help -v` / `--help --verbose` prints the full flag detail.
@@ -904,6 +1066,28 @@ fn main() {
         shell_env: shell_env.clone(),
         config_shell: config_shell.clone(),
     };
+    // CTX-1117 (issue #1900): advisory `BITTY_SOCKET` for PTY children so
+    // in-terminal `bitty ctl` targets its own instance without the
+    // exactly-one-live fallback (which breaks with 2+ instances). Resolved
+    // early (same `SocketEnv` + `None` uid as the servo, so the later bind
+    // lands on the same path) and stored on `Runtime` for explicit
+    // `PtyBuilder` injection (inherit wins when an outer value is present;
+    // precedence `--socket` > `--instance` > `BITTY_SOCKET` /
+    // `BITTY_INSTANCE_ID` > exactly-one-live, unchanged). Headless never
+    // serves, so it never stores (no misleading path) — except test mode,
+    // which takes precedence over headless and still serves (see
+    // [`should_store_ipc_socket_path`]). `BITTY_INSTANCE_ID`
+    // is documented for precedence only (see `ctl --help`); only the socket
+    // path is injected. Fail-soft: an unresolvable base stores nothing
+    // (same as the servo's fail-soft disable). No process-env mutation
+    // (safe under `#![forbid(unsafe_code)]`): children get the socket via
+    // explicit builder overrides, grandchildren via inheritance.
+    if should_store_ipc_socket_path(args.headless, args.test_mode) {
+        let env = bitty_ipc::devtools::SocketEnv::from_process_env();
+        if let Ok((path, _)) = bitty_ipc::devtools::resolve_socket_path_from_env(&env, None) {
+            runtime.set_ipc_socket_path(path);
+        }
+    }
     let startup_spawn_failed = spawn_startup_shells(&mut runtime, &args, &spawn_spec);
     if let Some(code) = fail_loud_exit(args.fail_loud, startup_spawn_failed) {
         eprintln!("bitty: startup failed (--fail-loud): PTY shell startup did not complete");

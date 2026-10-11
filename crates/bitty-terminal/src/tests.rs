@@ -55,6 +55,92 @@ fn parse_help_and_version_flags() {
 }
 
 #[test]
+fn parse_help_subcommand_never_spawns() {
+    // CTX-1117 (issue #1900): `bitty help` aliases `--help` (no-arg) and
+    // per-command help (`bitty help plugin` == `bitty plugin --help`);
+    // unknown names fail closed at dispatch (exit 2 naming valid commands).
+    // `bitty help` must never spawn (program stays None).
+    let parsed = parse_args(&args_of(&["bitty", "help"]));
+    assert!(parsed.help_word);
+    assert_eq!(parsed.help_cmd, None);
+    assert!(parsed.help_args.is_empty());
+    assert_eq!(parsed.program, None);
+
+    let parsed = parse_args(&args_of(&["bitty", "help", "plugin"]));
+    assert!(parsed.help_word);
+    assert_eq!(parsed.help_cmd.as_deref(), Some("plugin"));
+    assert!(parsed.help_args.is_empty());
+    assert_eq!(parsed.program, None);
+
+    let parsed = parse_args(&args_of(&["bitty", "help", "bogus"]));
+    assert!(parsed.help_word);
+    assert_eq!(parsed.help_cmd.as_deref(), Some("bogus"));
+    assert_eq!(parsed.program, None);
+
+    let parsed = parse_args(&args_of(&["bitty", "help", "plugin", "extra"]));
+    assert!(parsed.help_word);
+    assert_eq!(parsed.help_cmd.as_deref(), Some("plugin"));
+    assert_eq!(parsed.help_args, vec![String::from("extra")]);
+
+    // Escape hatch still spawns a program literally named `help`.
+    let parsed = parse_args(&args_of(&["bitty", "--", "help"]));
+    assert!(!parsed.help_word);
+    assert_eq!(parsed.program.as_deref(), Some("help"));
+
+    // CodeRabbit 4240150291: dash-flags after `help` land in `unknown_flag`
+    // (the dash arm has no help handling), so the help branch must reject
+    // them (exit 2) instead of printing help (exit 0).
+    let parsed = parse_args(&args_of(&["bitty", "help", "plugin", "--typo"]));
+    assert!(parsed.help_word);
+    assert_eq!(parsed.help_cmd.as_deref(), Some("plugin"));
+    assert_eq!(parsed.unknown_flag.as_deref(), Some("--typo"));
+
+    // `bitty help` lists 16 subcommands (short help).
+    let short = crate::cli::help_text_short(false);
+    assert!(short.contains("help [cmd]"), "short help must list help");
+    for cmd in [
+        "run -- COMMAND",
+        "ctl <resource>",
+        "config <verb>",
+        "init [FLAGS]",
+        "doctor",
+        "list <kind>",
+        "inspect <target>",
+        "dev <verb>",
+        "plugin <verb>",
+        "component <verb>",
+        "cmd <id>",
+        "x <id>",
+        "completion <shell>",
+        "shell-init <shell>",
+        "version",
+        "help [cmd]",
+    ] {
+        assert!(short.contains(cmd), "short help must list {cmd}");
+    }
+    // Valid commands name all 16 (plus aliases).
+    let valid = crate::cli::help_valid_commands();
+    assert!(valid.contains("help"));
+    assert_eq!(crate::cli::help_canonical_cmd("plugin"), Some("plugin"));
+    assert_eq!(crate::cli::help_canonical_cmd("cfg"), Some("config"));
+    assert_eq!(crate::cli::help_canonical_cmd("ls"), Some("list"));
+    assert_eq!(crate::cli::help_canonical_cmd("comp"), Some("completion"));
+    assert_eq!(crate::cli::help_canonical_cmd("bogus"), None);
+}
+
+#[test]
+fn ipc_socket_path_stored_unless_headless_without_test_mode() {
+    // CodeRabbit 4240150294: test mode serves IPC even when headless
+    // (BITTY_HEADLESS=1 + --test-mode), so spawned shells must still
+    // receive BITTY_SOCKET. Headless alone never serves (no misleading
+    // path).
+    assert!(super::should_store_ipc_socket_path(false, false));
+    assert!(super::should_store_ipc_socket_path(false, true));
+    assert!(!super::should_store_ipc_socket_path(true, false));
+    assert!(super::should_store_ipc_socket_path(true, true));
+}
+
+#[test]
 fn default_shell_prefers_shell_env_when_no_configured_shell() {
     assert_eq!(resolve_default_shell(None, None), "/bin/sh");
     assert_eq!(resolve_default_shell(None, Some("/bin/fish")), "/bin/fish");

@@ -129,6 +129,45 @@ pub fn apply_control_envelope(
     params: Option<&str>,
     granted: &bitty_ipc::ScopeSet,
 ) -> ipc_ctl::ControlReply {
+    // CTX-1117 (issue #1900): `panel list` is local to `bitty-terminal` (the
+    // `bitty-ipc` pin predates it). Authorize as `view.inspect` (same as
+    // `view list`): read-only, no elevation, no mutation.
+    if method == super::request::METHOD_LIST_PANELS {
+        if !granted.contains(bitty_ipc::Scope::ViewInspect) {
+            let err = bitty_ipc::IpcError::ScopeDenied {
+                scope: String::from("view.inspect"),
+                action: String::from(method),
+            };
+            let (category, code, message) = ipc_error_triple(&err);
+            return ipc_ctl::ControlReply {
+                ok: false,
+                result_json: String::new(),
+                category,
+                code,
+                message,
+            };
+        }
+        match apply_control(runtime, method, params) {
+            Ok(result_json) => {
+                return ipc_ctl::ControlReply {
+                    ok: true,
+                    result_json,
+                    category: "",
+                    code: "",
+                    message: String::new(),
+                };
+            }
+            Err((category, code, message)) => {
+                return ipc_ctl::ControlReply {
+                    ok: false,
+                    result_json: String::new(),
+                    category,
+                    code,
+                    message,
+                };
+            }
+        }
+    }
     if let Err(ipc_err) = ipc_ctl::authorize_ctl_method(method, granted) {
         let (category, code, message) = ipc_error_triple(&ipc_err);
         return ipc_ctl::ControlReply {
@@ -205,6 +244,46 @@ pub fn apply_control(
             }
             out.push_str(&format!(
                 "{{\"id\":\"v:{}\",\"focused\":{}}}",
+                id.0,
+                focused.is_some_and(|f| f == *id)
+            ));
+        }
+        out.push_str("]}");
+        return Ok(out);
+    }
+    if method == super::request::METHOD_LIST_PANELS {
+        // CTX-1117 (issue #1900): tiled panels are layout leaves (Panel ==
+        // leaf View, 1:1 with `view list` ids as `p:N`/`v:N`). Minimal
+        // read-only query (no mutation): id, bounds from the solver
+        // allocations, role from the leaf presentation mode, focused marker
+        // mirroring `view list`. Pinned/scratchpad leaves outside the live
+        // layout are not listed (same scope as `view list`). Like `view
+        // list`, wire params are ignored (lists take none; `None` from the
+        // typed client).
+        let _ = params;
+        let ids = runtime.layout().leaf_ids();
+        let focused = runtime.focused_view();
+        let allocations = runtime.layout_allocations();
+        let mut out = String::from("{\"panels\":[");
+        for (idx, id) in ids.iter().enumerate() {
+            if idx > 0 {
+                out.push(',');
+            }
+            let bounds = allocations
+                .iter()
+                .find(|(alloc_id, _)| *alloc_id == *id)
+                .map(|(_, rect)| *rect);
+            let role = runtime
+                .layout()
+                .find_leaf(*id)
+                .map(|view| view.presentation().as_str())
+                .unwrap_or("tiled");
+            let (x, y, width, height) = bounds
+                .map(|rect| (rect.x, rect.y, rect.width, rect.height))
+                .unwrap_or((0, 0, 0, 0));
+            out.push_str(&format!(
+                "{{\"id\":\"p:{}\",\"view\":\"v:{}\",\"bounds\":{{\"x\":{x},\"y\":{y},\"width\":{width},\"height\":{height}}},\"role\":\"{role}\",\"focused\":{}}}",
+                id.0,
                 id.0,
                 focused.is_some_and(|f| f == *id)
             ));

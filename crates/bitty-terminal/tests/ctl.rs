@@ -217,6 +217,36 @@ fn ctl_help_names_workspace_verbs() {
 }
 
 #[test]
+fn ctl_help_names_panel_list_and_panel_needs_live_instance() {
+    // CTX-1117 (issue #1900): `panel list` is a first-class ctl verb with
+    // the same needs-live-instance semantics as other runtime verbs.
+    let output = run_bitty(&["ctl", "--help"]);
+    assert_eq!(output.status.code(), Some(0));
+    let text = stdout(&output);
+    assert!(
+        text.contains("panel list") && text.contains("core.panel.list"),
+        "help must name panel list, got {text:?}"
+    );
+    // Usage names it too.
+    let output = run_bitty(&["ctl", "panel"]);
+    assert_eq!(output.status.code(), Some(2));
+    // No live instance fails closed with exit 6 (same as workspace list).
+    let output = run_bitty(&[
+        "ctl",
+        "--socket",
+        "/tmp/bitty-ctl-test-nonexistent.sock",
+        "panel",
+        "list",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(6),
+        "missing socket must be Unavailable (exit 6), stderr={:?}",
+        stderr(&output)
+    );
+}
+
+#[test]
 fn ctl_workspace_bad_id_is_usage_error() {
     for args in [
         &["ctl", "workspace", "close", "v:2"] as &[&str],

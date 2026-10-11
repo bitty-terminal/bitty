@@ -69,6 +69,60 @@ pub const DEFAULT_COLORTERM: &str = "truecolor";
 /// `PtyBuilder::env("TERM_PROGRAM", …)` still wins.
 pub const DEFAULT_TERM_PROGRAM: &str = "bitty";
 
+/// Advisory IPC socket variable injected into PTY children (CTX-1117,
+/// issue #1900).
+///
+/// When a Bitty instance serves its Unix socket, each PTY child gets
+/// `BITTY_SOCKET=<own-socket-path>` as an explicit builder override so
+/// in-terminal `bitty ctl` targets its own instance without relying on the
+/// exactly-one-live fallback (which breaks with 2+ instances). Never
+/// overriding an explicitly-set outer value: when the spawner's own
+/// environment already carries `BITTY_SOCKET`, inheritance wins and no
+/// injection occurs (see [`bitty_socket_inject_value`]).
+///
+/// Precedence is unchanged from `bitty ctl` targeting:
+/// `--socket` > `--instance` > `BITTY_SOCKET`/`BITTY_INSTANCE_ID` >
+/// exactly-one-live, else ambiguity (exit 6).
+pub const BITTY_SOCKET_ENV: &str = "BITTY_SOCKET";
+
+/// Advisory instance label for `bitty ctl` targeting (CTX-1117, issue #1900).
+///
+/// Documented here for precedence only; never injected into PTY children by
+/// this crate (the socket path alone selects the instance; the label is
+/// derived from it or from `--instance`). Same precedence as above:
+/// `--socket` > `--instance` > `BITTY_SOCKET`/`BITTY_INSTANCE_ID` >
+/// exactly-one-live.
+pub const BITTY_INSTANCE_ID_ENV: &str = "BITTY_INSTANCE_ID";
+
+/// Decide the `BITTY_SOCKET` value to inject for `socket_path`, if any.
+///
+/// Returns `Some(socket_path)` when the spawner's own environment lacks
+/// `BITTY_SOCKET` (outer absent: inject our own socket so children target
+/// us); returns `None` when an explicit outer value is present (inherit
+/// wins, never override).
+///
+/// Callers (e.g. `bitty-runtime` after serving) apply the result via
+/// [`PtyBuilder::env`] when `Some`; `None` means do nothing (inheritance
+/// already carries the outer value).
+#[must_use]
+pub fn bitty_socket_inject_value(socket_path: &str) -> Option<OsString> {
+    bitty_socket_inject_value_with_outer(socket_path, std::env::var_os(BITTY_SOCKET_ENV).as_deref())
+}
+
+/// Pure core of [`bitty_socket_inject_value`] over an injected outer value
+/// (hermetic for tests; `None` means outer absent).
+#[must_use]
+pub fn bitty_socket_inject_value_with_outer(
+    socket_path: &str,
+    outer: Option<&OsStr>,
+) -> Option<OsString> {
+    if outer.is_some() {
+        None
+    } else {
+        Some(OsString::from(socket_path))
+    }
+}
+
 /// Inherited key prefixes stripped at spawn time (CTX-0194).
 ///
 /// Every variable whose name starts with one of these prefixes claims a host
@@ -246,6 +300,12 @@ impl PtyBuilder {
     /// fingerprint markers (see [`should_strip_graphics_fingerprint`]) are
     /// removed from the inherited environment at spawn time; explicit
     /// [`PtyBuilder::env`] entries are applied after that removal and win.
+    ///
+    /// `BITTY_SOCKET` is not a default here: the serving instance injects
+    /// its own socket via [`PtyBuilder::env`] using
+    /// [`bitty_socket_inject_value`] (inherit wins when an outer value is
+    /// present; see [`BITTY_SOCKET_ENV`]/[`BITTY_INSTANCE_ID_ENV`] for
+    /// precedence).
     pub fn new(program: impl Into<OsString>) -> Self {
         PtyBuilder {
             program: program.into(),
@@ -821,5 +881,58 @@ mod tests {
         let redacted = redact_skipped_key_name(&long);
         assert_eq!(redacted.len(), MAX_NAMED_SKIPPED_KEY_CHARS);
         assert!(redacted.chars().all(|c| c == 'K'));
+    }
+
+    #[test]
+    fn bitty_socket_inject_when_outer_absent_returns_path() {
+        // CTX-1117 (issue #1900): with no outer BITTY_SOCKET, the serving
+        // instance injects its own socket so in-terminal `bitty ctl` targets
+        // itself without the exactly-one-live fallback.
+        let injected =
+            bitty_socket_inject_value_with_outer("/run/user/1000/bitty/default.sock", None);
+        assert_eq!(
+            injected,
+            Some(OsString::from("/run/user/1000/bitty/default.sock"))
+        );
+        // The injected value lands in the child env via an explicit builder
+        // entry (child env contains the socket path).
+        let value = injected.expect("outer absent must inject");
+        let cfg = valid_builder()
+            .env(BITTY_SOCKET_ENV, value)
+            .validate()
+            .unwrap();
+        let slot = cfg
+            .env
+            .iter()
+            .find(|(k, _)| k == BITTY_SOCKET_ENV)
+            .expect("BITTY_SOCKET explicit present");
+        assert_eq!(slot.1, OsString::from("/run/user/1000/bitty/default.sock"));
+    }
+
+    #[test]
+    fn bitty_socket_inject_when_outer_present_preserves_outer() {
+        // CTX-1117: an explicitly-set outer BITTY_SOCKET is never overridden
+        // (inherit wins). The helper returns None so the caller does nothing
+        // and platform inheritance carries the outer value.
+        let injected = bitty_socket_inject_value_with_outer(
+            "/run/user/1000/bitty/default.sock",
+            Some(OsStr::new("/outer/bitty.sock")),
+        );
+        assert_eq!(injected, None, "explicit outer must be preserved");
+        // An explicit builder entry for the same key still wins over the
+        // default (no duplicate), so a caller that really wants to override
+        // can still do so explicitly — the helper just declines to do it
+        // automatically.
+        let cfg = valid_builder()
+            .env(BITTY_SOCKET_ENV, "/outer/bitty.sock")
+            .validate()
+            .unwrap();
+        let matches: Vec<_> = cfg
+            .env
+            .iter()
+            .filter(|(k, _)| k == BITTY_SOCKET_ENV)
+            .collect();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].1, OsString::from("/outer/bitty.sock"));
     }
 }

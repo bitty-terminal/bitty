@@ -6,10 +6,12 @@ use super::client::extract_string_from;
 use super::client::parse_ctl_response;
 use super::client::resolve_ctl_target;
 use super::render::{
-    class_for_server_error, exit_for_server_error, format_failure, format_success,
+    class_for_server_error, exit_for_server_error, format_failure, format_panels_table,
+    format_success, format_workspaces_table,
 };
 use super::request::{
-    CtlFormat, CtlParseError, CtlRequest, CtlTargeting, ctl_help_text, parse_ctl_request,
+    CtlFormat, CtlParseError, CtlRequest, CtlTargeting, METHOD_LIST_PANELS, ctl_help_text,
+    ctl_usage, parse_ctl_request,
 };
 use super::{EXIT_CONFLICT, EXIT_GENERIC, EXIT_PERM, EXIT_RUNTIME};
 use bitty_ipc::ctl as ipc_ctl;
@@ -564,6 +566,96 @@ fn control_view_list_terminal_list_window_list_headless() {
     let wins = apply_control_envelope(&mut rt, ipc_ctl::METHOD_LIST_WINDOWS, None, &cli);
     assert!(wins.ok, "window list must succeed: {wins:?}");
     assert!(wins.result_json.contains("w:1"));
+}
+
+#[test]
+fn panel_list_parses_like_other_lists() {
+    // CTX-1117: `panel list` parses with the same needs-live-instance
+    // semantics as other list verbs (rejects extra args and misplaced
+    // split/cwd options, same usage shape).
+    let (req, _) = parse_ctl_request(&words(&["panel", "list"])).expect("must parse");
+    assert_eq!(req, CtlRequest::PanelList);
+    assert_eq!(req.registry_id(), "core.panel.list");
+    assert_eq!(req.wire_method(), Some(METHOD_LIST_PANELS));
+    assert_eq!(req.wire_params(), None);
+    assert!(parse_ctl_request(&words(&["panel"])).is_err());
+    assert!(parse_ctl_request(&words(&["panel", "list", "extra"])).is_err());
+    assert!(parse_ctl_request(&words(&["panel", "list", "--right"])).is_err());
+    assert!(parse_ctl_request(&words(&["panel", "list", "--cwd", "/tmp"])).is_err());
+    // Usage and help name the new verb.
+    assert!(ctl_usage().contains("panel list"));
+    assert!(ctl_help_text().contains("panel list"));
+    assert!(ctl_help_text().contains("core.panel.list"));
+}
+
+#[test]
+fn control_panel_list_mirrors_view_list_with_bounds_role_focused() {
+    // CTX-1117: minimal read-only query (no mutation) mirroring `view list`:
+    // id (`p:N`), bounds/role summary, focused marker. Same `view.inspect`
+    // scope, same live-instance path.
+    let mut rt = headless_runtime();
+    let cli = bitty_ipc::ScopeSet::cli_default();
+    let panels = apply_control_envelope(&mut rt, METHOD_LIST_PANELS, None, &cli);
+    assert!(panels.ok, "panel list must succeed: {panels:?}");
+    assert!(
+        panels.result_json.contains("\"id\":\"p:1\""),
+        "panel id p:1: {panels:?}"
+    );
+    assert!(
+        panels.result_json.contains("\"view\":\"v:1\""),
+        "panel view v:1: {panels:?}"
+    );
+    assert!(
+        panels.result_json.contains("\"bounds\""),
+        "panel bounds: {panels:?}"
+    );
+    assert!(
+        panels.result_json.contains("\"role\":\"tiled\""),
+        "panel role tiled: {panels:?}"
+    );
+    assert!(
+        panels.result_json.contains("\"focused\":true"),
+        "focused marker mirrors view list: {panels:?}"
+    );
+    // Read-only: layout unchanged (same leaves as view list).
+    let views = apply_control_envelope(&mut rt, ipc_ctl::METHOD_LIST_VIEWS, None, &cli);
+    assert!(views.ok);
+    assert!(views.result_json.contains("v:1"));
+    // Scope: empty grant denies (permission, not transport).
+    let empty = bitty_ipc::ScopeSet::new();
+    let denied = apply_control_envelope(&mut rt, METHOD_LIST_PANELS, None, &empty);
+    assert!(!denied.ok);
+    assert_eq!(denied.code, "ScopeDenied");
+}
+
+#[test]
+fn workspace_list_table_marks_active_and_panel_table_marks_focused() {
+    // CTX-1117: `workspace list` table marks the active row from
+    // `active`/`active_id`; panel table marks focused (current). No new
+    // `current` verbs — markers are the affordance.
+    let ws_json = "{\"workspaces\":[\"ws:1\",\"ws:2\"],\"names\":[\"main\",\"editor\"],\"active\":1,\"active_id\":\"ws:1\",\"count\":2}";
+    let table = format_workspaces_table(ws_json).expect("must render");
+    assert!(table.contains("WORKSPACE NAME ACTIVE"));
+    assert!(
+        table.contains("ws:1 main yes"),
+        "active row marked: {table}"
+    );
+    assert!(
+        table.contains("ws:2 editor no"),
+        "inactive row unmarked: {table}"
+    );
+
+    let panel_json = "{\"panels\":[{\"id\":\"p:1\",\"view\":\"v:1\",\"bounds\":{\"x\":0,\"y\":0,\"width\":80,\"height\":24},\"role\":\"tiled\",\"focused\":true},{\"id\":\"p:2\",\"view\":\"v:2\",\"bounds\":{\"x\":40,\"y\":0,\"width\":40,\"height\":24},\"role\":\"tiled\",\"focused\":false}]}";
+    let table = format_panels_table(panel_json).expect("must render");
+    assert!(table.contains("PANEL VIEW BOUNDS ROLE FOCUSED"));
+    assert!(
+        table.contains("p:1 v:1 80x24+0+0 tiled yes"),
+        "focused (current) marked: {table}"
+    );
+    assert!(
+        table.contains("p:2 v:2 40x24+40+0 tiled no"),
+        "unfocused unmarked: {table}"
+    );
 }
 
 #[test]

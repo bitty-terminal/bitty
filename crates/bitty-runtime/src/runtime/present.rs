@@ -1074,6 +1074,20 @@ impl Runtime {
             }
         }
         if current_alt_screens != self.kitty_alt_screens_latched {
+            // Delete-wins sequencing (CTX-1110 fix pass, CodeRabbit Major):
+            // bump once when an origin newly enters the alternate screen so
+            // a transmit pending across the enter cycle drops as stale (sync
+            // order stores, clears, then exits with absent). Never bump on
+            // every presented frame: while alt stays active each tick would
+            // advance the epoch past an in-flight transmit's stamp and drop
+            // every alt-screen local transmit silently.
+            let entering: Vec<Option<u64>> = current_alt_screens
+                .difference(&self.kitty_alt_screens_latched)
+                .copied()
+                .collect();
+            for origin in entering {
+                self.bump_kitty_local_delete_epoch(origin);
+            }
             self.kitty_alt_screens_latched = current_alt_screens.clone();
             pending_full = true;
         }
@@ -2818,11 +2832,14 @@ impl Runtime {
             if alt_active {
                 // Delete-wins sequencing (CTX-1110 fix pass): alt entry
                 // clears this origin's placements, so a transmit pending
-                // across the enter/exit cycle must not resurrect afterwards
-                // (sync order stores, clears, then exits with absent).
-                // Unconditional: a pending transmit may exist while nothing
-                // is placed yet.
-                self.bump_kitty_local_delete_epoch(pane_origin);
+                // across the enter cycle must not resurrect afterwards
+                // (sync order stores, clears, then exits with absent). The
+                // delete epoch is bumped once on alt entry in
+                // `collect_tick_basis` (latch diff), never here: bumping on
+                // every presented frame would advance past an in-flight
+                // alt-screen transmit's stamp and drop it silently.
+                // Unconditional clear: a pending transmit may exist while
+                // nothing is placed yet.
                 if !self.kitty_images.placement_for_origin_is_empty(pane_origin) {
                     self.kitty_images.clear_origin(pane_origin);
                     // S6 (#1849): placements are gone, so their cached

@@ -135,6 +135,50 @@ fn file_valid_raw_stores_places_and_paints() {
 }
 
 #[test]
+#[cfg(unix)]
+fn alt_screen_local_transmit_stores_despite_ticks() {
+    // Alt-epoch fix (CTX-1110, CodeRabbit Major): the paint path bumped
+    // the origin delete epoch on every presented frame while alt was
+    // active, so a tick running before the worker finished advanced the
+    // epoch past the request stamp and the completion dropped silently
+    // (for `t=t`/`t=s` after already unlinking). The epoch now bumps once
+    // on alt entry (latch diff in `collect_tick_basis`), so an alt-screen
+    // transmit stamps the post-entry generation and still stores
+    // (suppressed: no placement while alt is active).
+    let root = temp_root("alt-transmit");
+    let file = root.join("img.bin");
+    std::fs::write(&file, red_2x2_rgba()).expect("fixture must write");
+
+    let mut rt = make_runtime();
+    rt.handle_pty_bytes(b"\x1b[?1049h");
+    assert!(rt.state().alt_screen_active());
+    assert!(rt.tick().is_some(), "alt entry must present");
+    // Transmit while alt is active.
+    rt.handle_pty_bytes(&apc_with_path("Gf=32,s=2,v=2,t=f,m=0;", &path_bytes(&file)));
+    // Force a present while the worker is in flight: the completion is
+    // only pumped below, so this tick runs first either way. With the old
+    // per-frame bump it advanced the epoch past the request stamp and the
+    // store dropped; now the epoch is stable and the store lands.
+    rt.handle_pty_bytes(b"x");
+    assert!(rt.tick().is_some());
+    pump_settled(&mut rt);
+    assert_eq!(
+        rt.kitty_image_count(),
+        1,
+        "alt-screen local transmit must store"
+    );
+    assert_eq!(
+        rt.kitty_placement_count(),
+        0,
+        "alt-screen display stays suppressed (stored, not placed)"
+    );
+    // `t=f` never deletes: the fixture stays for its owner.
+    assert!(file.is_file(), "t=f must not delete the source file");
+
+    remove_tree_best_effort(&root);
+}
+
+#[test]
 fn file_traversal_refused_without_touching_filesystem() {
     // `..` components are refused at parse time: no open is attempted and
     // nothing is stored, even though the suffix names a real fixture.

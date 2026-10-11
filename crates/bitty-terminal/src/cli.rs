@@ -2083,7 +2083,7 @@ pub(crate) fn help_text() -> String {
                              exit code is the child's. `bitty htop` never means\n  \
                              `bitty run -- htop`; colliding names need `run --`.\n  \
             ctl [--socket P] [--instance ID] [--format SHAPE] <resource> <verb>  Control a running instance (runtime)\n  \
-                             instance|window|view|terminal|panel|workspace list; terminal spawn|close|send|text;\n  \
+                             instance|window|view|terminal|workspace list; terminal spawn|close|send|text;\n  \
                              view split|focus; workspace new|close|focus|move|rename|move-panel;\n  \
                              config reload. `ctl --help` never needs an instance.\n  \
             config path      Print the resolved config file path (alias `cfg`)\n\

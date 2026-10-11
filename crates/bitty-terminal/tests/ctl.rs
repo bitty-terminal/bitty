@@ -217,15 +217,18 @@ fn ctl_help_names_workspace_verbs() {
 }
 
 #[test]
-fn ctl_help_names_panel_list_and_panel_needs_live_instance() {
-    // CTX-1117 (issue #1900): `panel list` is a first-class ctl verb with
-    // the same needs-live-instance semantics as other runtime verbs.
+fn ctl_help_does_not_advertise_panel_list_until_wired() {
+    // CTX-1145 (issue #1967): `panel list` stays a dormant client/server
+    // inventory until the `bitty-ipc` pin authorizes `bitty.debug/listPanels`
+    // (live calls fail closed with NotFound today), so help and usage must
+    // not advertise it. The parse path keeps its needs-live-instance shape:
+    // no live instance still fails closed with exit 6, like workspace list.
     let output = run_bitty(&["ctl", "--help"]);
     assert_eq!(output.status.code(), Some(0));
     let text = stdout(&output);
     assert!(
-        text.contains("panel list") && text.contains("core.panel.list"),
-        "help must name panel list, got {text:?}"
+        !text.contains("panel list") && !text.contains("core.panel.list"),
+        "help must not advertise panel list until wired, got {text:?}"
     );
     // Usage names it too.
     let output = run_bitty(&["ctl", "panel"]);

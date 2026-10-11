@@ -1,0 +1,56 @@
+# bitty terminfo source — canonical, audited (CTX-1121, bitty#1764, RFC OQ-004).
+#
+# Base: xterm-256color via `use=xterm-256color`; only differing audited
+# extensions are listed here. Inherited from the base (no override needed):
+#   cols#80, lines#24 (State::GRID_COLUMNS/GRID_ROWS = 80x24),
+#   colors#256 (Color::Indexed(u8) 0-255),
+#   E3=\E[3J (ED 3 scrollback clear),
+#   Ss=\E[%p1%d q / Se=\E[2 q (DECSCUSR 0-6),
+#   XM=\E[?1006;1000... (SGR mouse 1006; 1000/1002/1003 + 1005/1015/1016 also handled),
+#   BE=\E[?2004h / BD=\E[?2004l / PS=\E[200~ / PE=\E[201~ (bracketed paste 2004),
+#   fe=\E[?1004h / fd=\E[?1004l (focus reporting 1004).
+#
+# Audited extensions (SUPPORTED with file:line proof, see PR body):
+#   Tc: truecolor SGR 38;2/48;2 (+58 underline color, colon+semicolon forms)
+#     parser crates/bitty-vt/src/parser/sgr.rs:13-46,112-120,227,250-251
+#     action crates/bitty-vt/src/action.rs:185-192 (Indexed(u8), Rgb)
+#     render crates/bitty-render/src/grid.rs:402-411 (resolve_color Rgb)
+#     pty   crates/bitty-pty/src/builder.rs:62 (COLORTERM=truecolor)
+#   Su + Setulc + Smulx: styled underlines SGR 4:0-5 (None/Single/Double/Curly/Dotted/Dashed)
+#     + underline color SGR 58/59
+#     parser sgr.rs:112-120,58=>extended_color; action.rs:216-231; render grid.rs:788-834
+#   Sync: synchronized updates DEC 2026 (NOT DCS; DCS legacy ABSENT by design)
+#     parser dispatch.rs:136; action.rs:302-305; modes.rs:159-163
+#     runtime present.rs:997-1006 (defer frames); queries.rs:246 (DECRQM 2026)
+#   Hls: OSC 8 hyperlinks (tmux canonical, for tmux passthrough + SSH propagation)
+#     parser dispatch.rs:1096-1116; state.rs:3133-3172 (osc_hyperlink, HyperlinkId table)
+#
+# Deliberately EXCLUDED (no aspirational caps):
+#   Ms (OSC 52 clipboard): parser dispatch.rs:1123-1130 SUPPORTED but runtime
+#     pty.rs:799-852 gates reads/writes default-deny + state.rs:1462-1468 inert.
+#     Marked PARTIAL; not advertised so apps do not assume clipboard writes work.
+#     Cancelled below with `Ms@` because `use=xterm-256color` would otherwise
+#     inherit `Ms=\E]52;...` and advertise clipboard support.
+#     (Task text "Ms (sync update)" conflates Ms/clipboard with Sync/2026;
+#     Sync above is the correct sync-update capability.)
+#   fullkbd (Kitty full-keyboard mode DEC 2017): ABSENT. Bitty implements the
+#     progressive CSI u protocol (flags 1,2,4,8,16 mask 0x1F, modes.rs:24-27,
+#     dispatch.rs:62-100,710-810, input.rs:20-28,285-341) which has no terminfo
+#     string cap; fullkbd names the legacy 2017 mode and must not be claimed.
+#   RGB (direct-color flag): not listed; Tc covers the proven SGR 38;2/48;2 path.
+#     kitty-direct uses RGB+colors#16777216; bitty stays colors#256+Tc like
+#     xterm-256color+Tc to avoid overstating direct-mode geometry.
+#
+# Compile: tic -x -o <dir> terminfo/bitty.ti
+# Verify:  TERMINFO=<dir> infocmp -x bitty
+# See scripts/check-terminfo.sh (tic syntax + audited-flag gate).
+bitty|bitty terminal emulator,
+	Ms@,
+	use=xterm-256color,
+	pairs#32767,
+	Tc,
+	Su,
+	Setulc=\E[58:2::%p1%{65536}%/%d:%p1%{256}%/%{255}%&%d:%p1%{255}%&%d%;m,
+	Smulx=\E[4:%p1%dm,
+	Sync=\E[?2026%?%p1%{1}%-%tl%eh%;,
+	Hls=\E]8;%?%p1%l%tid=%p1%s%;;%p2%s\E\\,

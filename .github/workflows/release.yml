@@ -40,6 +40,7 @@ jobs:
           echo '#!/bin/sh
           echo "bitty 0.0.1"' > target/release/bitty
           chmod +x target/release/bitty
+          tic -x -o target/terminfo terminfo/bitty.ti
       - name: Validate nfpm (deb/rpm/apk/archlinux)
         run: |
           nfpm package --config nfpm.yaml --packager deb --target /tmp/bitty.deb
@@ -293,6 +294,12 @@ jobs:
           echo "$GOPATH_BIN" >> "$GITHUB_PATH"
           mkdir -p target/release dist
           cp "target/${{ matrix.target }}/release/bitty" target/release/bitty
+          # Stage the compiled terminfo entry for the nFPM mapping
+          # (nfpm.yaml maps ./target/terminfo/b/bitty). Each packaging job
+          # runs in its own workspace, so the validate job's tic output is
+          # unavailable here; compile in this workspace instead (tic from
+          # ncurses-bin, preinstalled on ubuntu-latest).
+          tic -x -o target/terminfo terminfo/bitty.ti
           # Map target arch to nfpm arch
           NFPM_ARCH="${{ matrix.arch }}"
           if [[ "$NFPM_ARCH" == "arm64" ]]; then NFPM_ARCH="arm64"; fi
@@ -341,7 +348,7 @@ jobs:
       - name: Install Alpine build prerequisites
         run: |
           apk add --no-cache bash git build-base curl ca-certificates pkgconf \
-            fontconfig-dev freetype-dev nfpm
+            fontconfig-dev freetype-dev nfpm ncurses
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -406,6 +413,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Stage the compiled terminfo entry for the nFPM mapping
+          # (nfpm.yaml maps ./target/terminfo/b/bitty). Each packaging job
+          # runs in its own workspace, so the validate job's tic output is
+          # unavailable here; compile in this workspace instead (tic from
+          # the ncurses prerequisite above).
+          tic -x -o target/terminfo terminfo/bitty.ti
           nfpm package --config nfpm.yaml --packager apk \
             --target dist/bitty-x86_64-unknown-linux-musl.apk
           ls -lh dist/

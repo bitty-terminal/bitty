@@ -45,9 +45,9 @@
 # Verify:  TERMINFO=<dir> infocmp -x bitty
 # See scripts/check-terminfo.sh (tic syntax + audited-flag gate).
 bitty|bitty terminal emulator,
+	Ms@,
 	use=xterm-256color,
 	pairs#32767,
-	Ms@,
 	Tc,
 	Su,
 	Setulc=\E[58:2::%p1%{65536}%/%d:%p1%{256}%/%{255}%&%d:%p1%{255}%&%d%;m,

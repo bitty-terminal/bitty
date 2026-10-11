@@ -1,7 +1,7 @@
 //! `bitty component` end-to-end dispatch proofs (issue #1651).
 //!
-//! Search priority: user `$XDG_DATA_HOME/bitty/components/` wins over system
-//! (`BITTY_SYSTEM_COMPONENTS_DIR` in tests, `/usr/lib/bitty/components/`
+//! Search priority: user `$XDG_DATA_HOME/bitty/extensions/` wins over system
+//! (`BITTY_SYSTEM_COMPONENTS_DIR` in tests, `/usr/lib/bitty/extensions/`
 //! in production). `add` stages from local paths only (no network fetch);
 //! every spawn re-verifies ABI compat. These tests drive the built `bitty`
 //! binary via `CARGO_BIN_EXE_bitty` with isolated XDG roots, so the
@@ -93,7 +93,7 @@ fn stderr(output: &Output) -> String {
 }
 
 fn user_root(home: &Path) -> PathBuf {
-    home.join("bitty").join("components")
+    home.join("bitty").join("extensions")
 }
 
 /// Write a source directory holding `bitty-component.toml` (no `sha256`,
@@ -570,7 +570,7 @@ fn component_install_absent_helpers_fails_closed_with_manual_path() {
         "absent tar must name the tool: {diagnostic}"
     );
     assert!(
-        diagnostic.contains("$XDG_DATA_HOME/bitty/components/"),
+        diagnostic.contains("$XDG_DATA_HOME/bitty/extensions/"),
         "diagnostic must point at manual placement: {diagnostic}"
     );
     assert!(
@@ -668,7 +668,7 @@ fn component_help_documents_fetch_environment() {
     assert!(text.contains("curl --version"), "{text}");
     assert!(text.contains("7.68.0"), "{text}");
     // Absent/too-old diagnostic: manual placement path + exit code.
-    assert!(text.contains("$XDG_DATA_HOME/bitty/components/"), "{text}");
+    assert!(text.contains("$XDG_DATA_HOME/bitty/extensions/"), "{text}");
     // CA + proxy posture pin plus the no-secrets audit.
     assert!(text.contains("system CA store"), "{text}");
     assert!(text.contains("proxy"), "{text}");

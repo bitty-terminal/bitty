@@ -32,7 +32,7 @@ const SHA256_HEX_LEN: usize = 64;
 ///
 /// `override_dir` is the developer-only `BITTY_COMPONENTS_DIR` value and
 /// wins when non-empty; otherwise the root is
-/// `<data_home>/bitty/components`, where `data_home` comes from the same
+/// `<data_home>/bitty/extensions`, where `data_home` comes from the same
 /// resolver as the plugin store ([`crate::data_home_for`]). Never consults
 /// `PATH`.
 #[must_use]
@@ -716,7 +716,7 @@ mod tests {
         );
         assert_eq!(
             components_root_for(Some("  "), Some(data)),
-            Some(data.join("bitty").join("components"))
+            Some(data.join("bitty").join("extensions"))
         );
         assert_eq!(components_root_for(None, None), None);
     }

@@ -47,7 +47,7 @@ fn stderr(output: &Output) -> String {
 }
 
 fn user_root(home: &Path) -> PathBuf {
-    home.join("bitty").join("components")
+    home.join("bitty").join("extensions")
 }
 
 /// Host seed triple for this test binary (`None` on unmapped OS/arch).

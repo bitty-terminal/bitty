@@ -39,9 +39,9 @@
 //! # Windows to guest path mapping (primary direction)
 //!
 //! Component-store paths are Windows spellings on the host (for example
-//! `C:\Users\you\AppData\Local\bitty\components\net\0.0.1\bitty-net.exe`)
+//! `C:\Users\you\AppData\Local\bitty\extensions\net\0.0.1\bitty-net.exe`)
 //! and must be mapped to guest spellings before `exec` (for example
-//! `/mnt/c/Users/you/AppData/Local/bitty/components/net/0.0.1/bitty-net.exe`).
+//! `/mnt/c/Users/you/AppData/Local/bitty/extensions/net/0.0.1/bitty-net.exe`).
 //! [`windows_path_to_guest`] implements exactly:
 //!
 //! - Drive-absolute `X:\...` or `X:/...` (`X` is `A-Z`/`a-z`) maps to
@@ -1079,8 +1079,8 @@ mod tests {
             "/mnt/c/a/../b"
         );
         assert_eq!(
-            windows_path_to_guest("C:\\Program Files\\Bitty\\components").expect("spaces"),
-            "/mnt/c/Program Files/Bitty/components"
+            windows_path_to_guest("C:\\Program Files\\Bitty\\extensions").expect("spaces"),
+            "/mnt/c/Program Files/Bitty/extensions"
         );
     }
 

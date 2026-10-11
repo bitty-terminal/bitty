@@ -1,7 +1,7 @@
 //! Two-tier component inventory (issue #1651, DIR-030 D6).
 //!
-//! Search priority: user `$XDG_DATA_HOME/bitty/components/` wins over the
-//! system `/usr/lib/bitty/components/` (or platform equivalent). The user
+//! Search priority: user `$XDG_DATA_HOME/bitty/extensions/` wins over the
+//! system `/usr/lib/bitty/extensions/` (or platform equivalent). The user
 //! tier is writable without privilege; the system tier is read-only for
 //! `bitty component` (removal there needs a package manager). `PATH` is
 //! never consulted.
@@ -32,18 +32,18 @@ pub const SYSTEM_COMPONENTS_DIR_ENV: &str = "BITTY_SYSTEM_COMPONENTS_DIR";
 
 /// System component root on Unix (read-only for `bitty component`).
 #[cfg(not(windows))]
-pub const SYSTEM_COMPONENTS_DIR_DEFAULT: &str = "/usr/lib/bitty/components";
+pub const SYSTEM_COMPONENTS_DIR_DEFAULT: &str = "/usr/lib/bitty/extensions";
 
 /// System component root on Windows (read-only for `bitty component`).
 #[cfg(windows)]
-pub const SYSTEM_COMPONENTS_DIR_DEFAULT: &str = "C:\\Program Files\\Bitty\\components";
+pub const SYSTEM_COMPONENTS_DIR_DEFAULT: &str = "C:\\Program Files\\Bitty\\extensions";
 
 /// Which tier a component resolved from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComponentSource {
-    /// `$XDG_DATA_HOME/bitty/components/` (writable, wins on collision).
+    /// `$XDG_DATA_HOME/bitty/extensions/` (writable, wins on collision).
     User,
-    /// `/usr/lib/bitty/components/` or platform equivalent (read-only).
+    /// `/usr/lib/bitty/extensions/` or platform equivalent (read-only).
     System,
 }
 

@@ -14,8 +14,8 @@
 //!   root ([`components_root_for`], same resolver as `plugins/`, with the
 //!   developer-only [`COMPONENTS_DIR_ENV`] override). `PATH` is never read.
 //! - [`resolve_search`] applies the issue #1651 search priority (user
-//!   `$XDG_DATA_HOME/bitty/components/` over system
-//!   `/usr/lib/bitty/components/` via [`system_components_root_for`]); the
+//!   `$XDG_DATA_HOME/bitty/extensions/` over system
+//!   `/usr/lib/bitty/extensions/` via [`system_components_root_for`]); the
 //!   user tier wins on collision and a tampered user install fails closed
 //!   without system fallback. [`discover_components`] merges both tiers for
 //!   `bitty component list`.
@@ -130,7 +130,7 @@ pub use bitty_network_wire::{ErrorKind, Grant, GrantHost, Method, PROTOCOL_VERSI
 ///
 /// The single data-directory resolver shared by the plugin store
 /// (`<data_home>/bitty/plugins`) and the component root
-/// (`<data_home>/bitty/components`), so both always agree.
+/// (`<data_home>/bitty/extensions`), so both always agree.
 #[must_use]
 pub fn data_home_for(
     xdg_data_home: Option<&str>,
@@ -150,7 +150,7 @@ pub fn data_home_for(
 pub const COMPONENTS_DIR_ENV: &str = "BITTY_COMPONENTS_DIR";
 
 /// Directory under the Bitty data directory holding installed components.
-pub const COMPONENTS_DIR_NAME: &str = "components";
+pub const COMPONENTS_DIR_NAME: &str = "extensions";
 
 /// Plain-text file under `<root>/<name>/` naming the active version.
 pub const COMPONENT_CURRENT_FILE: &str = "current";

@@ -324,7 +324,7 @@ and verified prefix never moves:
 | `bitty/install/latest.txt`                                         | Mutable stable version pointer        | Published by the `r2-stable` job (new in this task)                                                 |
 | `bitty/install/install.sh`                                         | Mutable stable script object          | Reserved; lands with CTX-1047 Phase 2, same cache policy                                            |
 | `bitty/install/install.ps1`                                        | Mutable stable script object          | Reserved; lands with CTX-1047 Phase 2, same cache policy                                            |
-| `bitty/components/<name>/<version>/<target>.tar.gz` + `SHA256SUMS` | Immutable versioned component payload | Packed by `scripts/make-component-dist.sh` (#1792); upload lands with the first shippable component |
+| `bitty/extensions/<name>/<version>/<target>.tar.gz` + `SHA256SUMS` | Immutable versioned extension payload | Packed by `scripts/make-component-dist.sh` (#1792); upload lands with the first shippable extension |
 | `bitty/docs/<version>/<lang>.tar.gz`                               | Immutable versioned docs payload      | Reserved manual track, not uploaded here                                                            |
 
 ### CDN key-to-URL mapping
@@ -342,7 +342,7 @@ https://cdn.bitty.run/bitty/install/latest.txt
 
 | Class                                                            | Keys                                                               | `Cache-Control`                                                                                   |
 | ---------------------------------------------------------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------- |
-| Immutable versioned (`releases/`, future `components/`, `docs/`) | Every versioned artifact, sidecar, `SHA256SUMS`, `provenance.json` | `public, max-age=31536000, immutable` (already emitted by `r2-mirror`)                            |
+| Immutable versioned (`releases/`, future `extensions/`, `docs/`) | Every versioned artifact, sidecar, `SHA256SUMS`, `provenance.json` | `public, max-age=31536000, immutable` (already emitted by `r2-mirror`)                            |
 | Mutable stable (`install/`)                                      | `latest.txt`, `install.sh`, `install.ps1`                          | `public, max-age=300, must-revalidate` (5 minutes, bounded staleness; scripts re-fetch every run) |
 
 ### Checksums and signatures
@@ -474,15 +474,15 @@ built for. Both segments below are literal; only `NAME`, `VERSION`, and
 `TARGET` vary:
 
 ```text
-https://cdn.bitty.run/bitty/components/<name>/<version>/<target>.tar.gz
-https://cdn.bitty.run/bitty/components/<name>/<version>/SHA256SUMS
+https://cdn.bitty.run/bitty/extensions/<name>/<version>/<target>.tar.gz
+https://cdn.bitty.run/bitty/extensions/<name>/<version>/SHA256SUMS
 ```
 
 Worked example (`net`, `0.0.23`, Linux x86_64 glibc):
 
 ```text
-https://cdn.bitty.run/bitty/components/net/0.0.23/x86_64-unknown-linux-gnu.tar.gz
-https://cdn.bitty.run/bitty/components/net/0.0.23/SHA256SUMS
+https://cdn.bitty.run/bitty/extensions/net/0.0.23/x86_64-unknown-linux-gnu.tar.gz
+https://cdn.bitty.run/bitty/extensions/net/0.0.23/SHA256SUMS
 ```
 
 Pack one target with `scripts/make-component-dist.sh` (needs only `tar`,
@@ -491,7 +491,7 @@ Pack one target with `scripts/make-component-dist.sh` (needs only `tar`,
 ```sh
 scripts/make-component-dist.sh --source ./dist/net-stage --version 0.0.23 \
   --target x86_64-unknown-linux-gnu --binary ./dist/bitty-net \
-  --output ./dist/components/x86_64-unknown-linux-gnu.tar.gz
+  --output ./dist/extensions/x86_64-unknown-linux-gnu.tar.gz
 scripts/make-component-dist.sh --print-url --name net --version 0.0.23 \
   --target x86_64-unknown-linux-gnu
 ```
@@ -515,9 +515,9 @@ the literal URL templates, and a hostile-URL corpus (traversal, schemes,
 lookalike hosts, non-https bases) refused before any emission.
 
 The future `r2-components` publisher uploads each `<name>/<version>/`
-directory (tarballs, sidecars, `SHA256SUMS`) under `bitty/components/` with
+directory (tarballs, sidecars, `SHA256SUMS`) under `bitty/extensions/` with
 the immutable cache policy (`public, max-age=31536000, immutable`) and the
-same read-back hash verification `r2-mirror` performs. Versioned component
+same read-back hash verification `r2-mirror` performs. Versioned extension
 prefixes are immutable once published, like `releases/`. The publisher lands
-with the first shippable component; until then no workflow uploads to
-`bitty/components/`.
+with the first shippable extension; until then no workflow uploads to
+`bitty/extensions/`.

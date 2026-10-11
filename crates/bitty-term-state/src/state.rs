@@ -2078,6 +2078,88 @@ impl State {
         }
     }
 
+    /// Advances every Kitty animation by `elapsed_ms` with tick pacing
+    /// (S1, #1849): each descriptor steps through
+    /// [`placement::KittyAnimation::advance_bounded`] with `max_steps`
+    /// (the present tick passes
+    /// [`placement::KITTY_ANIM_MAX_STEPS_PER_TICK`]), so `Stopped`
+    /// descriptors freeze, `Loading` ones park on the last frame, and
+    /// `Running` ones wrap against their loop budget.
+    ///
+    /// Only images whose current frame changed are damaged
+    /// ([`Self::damage_kitty_image`] scoping: placements of untouched
+    /// images keep no new damage), and the batch finalizes — bumping the
+    /// generation — only when something changed, so a frozen animation
+    /// costs the descriptor scan and never wakes the frame-on-demand
+    /// present. Returns the wire image ids whose frame changed (bounded
+    /// by [`placement::KITTY_ANIM_MAX_IMAGES`]).
+    ///
+    /// No clocks: the caller (present tick) stamps `elapsed_ms` from its
+    /// own clock, keeping playback testable through virtual time.
+    pub fn advance_kitty_animations(&mut self, elapsed_ms: u64, max_steps: u32) -> Vec<u32> {
+        let changed = self
+            .kitty_placements
+            .advance_animations(elapsed_ms, max_steps);
+        for id in &changed {
+            self.damage_image_placements(*id);
+        }
+        if !changed.is_empty() {
+            let _ = self.finalize_batch();
+        }
+        changed
+    }
+
+    /// Damages every span of one image's placements for a pixel-side
+    /// mutation with no grid truth of its own (S1 `a=c` compose, #1849):
+    /// the frame bytes changed without moving any anchor, so the placed
+    /// spans repaint on the next tick. Scoped to `image_id` exactly like
+    /// [`Self::advance_kitty_animations`]: other images gain no damage.
+    /// Finalizes only when at least one span was damaged, so a compose
+    /// against an image with no placements costs nothing and never wakes
+    /// the frame-on-demand present.
+    pub fn damage_kitty_image(&mut self, image_id: u32) {
+        let before = self.batch_rects.len();
+        self.damage_image_placements(image_id);
+        if self.batch_rects.len() != before {
+            let _ = self.finalize_batch();
+        }
+    }
+
+    /// Damages caller-computed grid spans for image-pixel mutations (S1,
+    /// #1849).
+    ///
+    /// Plain transmit-and-display placements live in the presentation
+    /// layer only (the pixel path skips `state.apply` so the cursor
+    /// advances exactly once), so terminal truth knows no spans for them:
+    /// the runtime derives their scroll-adjusted, viewport-clamped cell
+    /// spans from its own placement records and damages them here. Each
+    /// span is `(top_row, left_col, rows, cols)` in grid cells; spans
+    /// fully outside the grid damage nothing. Finalizes only when at
+    /// least one rect was pushed, so unaffected ticks never wake the
+    /// frame-on-demand present.
+    pub fn damage_kitty_spans(&mut self, spans: &[(u16, u16, u16, u16)]) {
+        if spans.is_empty() {
+            return;
+        }
+        let before = self.batch_rects.len();
+        let last_row = self.height as u16 - 1;
+        let last_col = self.width as u16 - 1;
+        for &(row, col, rows, cols) in spans {
+            if rows == 0 || cols == 0 {
+                continue;
+            }
+            if row > last_row || col > last_col {
+                continue;
+            }
+            let bottom = row.saturating_add(rows).saturating_sub(1).min(last_row);
+            let right = col.saturating_add(cols).saturating_sub(1).min(last_col);
+            self.damage_grid_rect(row, col, bottom.max(row), right.max(col));
+        }
+        if self.batch_rects.len() != before {
+            let _ = self.finalize_batch();
+        }
+    }
+
     /// Decodes the placeholder run covering `(row, col)` on the active
     /// screen, if that cell is a Kitty Unicode placeholder (CTX-0821).
     ///

@@ -52,7 +52,10 @@
 //! - No I/O, no clocks: [`KittyAnimation::advance`] is a pure function of
 //!   caller-supplied elapsed milliseconds, so playback is testable without
 //!   timers and advancement cost is linear in skipped gapless frames with
-//!   a zero-duration guard against spinning.
+//!   a zero-duration guard against spinning. The present-tick path uses
+//!   [`KittyAnimation::advance_bounded`] instead (IMG-9 33ms gap floor,
+//!   at most [`KITTY_ANIM_MAX_STEPS_PER_TICK`] timed transitions, leftover
+//!   dropped) so a stalled animation resumes without a catch-up spiral.
 //!
 //! Pixel decode, file/shm reads, and paint compositing live downstream
 //! (`bitty-graphics` extension, `bitty-render` atlas layers): this store
@@ -97,6 +100,26 @@ pub const KITTY_ANIM_MAX_FRAMES: usize = 256;
 /// `z=0`. The root frame defaults to gapless (`0`) until `a=a,r=1,z=N`
 /// gives it one.
 pub const KITTY_ANIM_DEFAULT_GAP_MS: u32 = 40;
+
+/// Tick quantum in milliseconds for animation playback (S1, #1849):
+/// `1000 / 30 = 33ms`, the [`crate::image`] `IMAGE_MAX_FPS` (IMG-9,
+/// "at most 30fps, host-throttled") floor. The present-tick path
+/// ([`KittyAnimation::advance_bounded`]) floors every positive wire gap to
+/// at least one quantum — sub-33ms gaps display one quantum (slowed to the
+/// ceiling rate, never sped up) — so a hostile `z=1` stream cannot force a
+/// 1000fps repaint storm. The unbounded [`KittyAnimation::advance`] keeps
+/// exact gap semantics (pinned by tests); only the tick path throttles.
+pub const KITTY_ANIM_TICK_QUANTUM_MS: u64 = 33;
+
+/// Maximum timed frame transitions per present tick (S1, #1849).
+///
+/// The tick path ([`KittyAnimation::advance_bounded`]) stops after this
+/// many timed transitions and drops the leftover time instead of catching
+/// up, so a long-hidden animation resumes smoothly instead of spinning
+/// through hours of missed frames in one tick. Gapless skips stay free
+/// (bounded by the frame count, never by time). Four quanta (132ms) of
+/// catch-up per tick re-syncs within a few frames after a stall.
+pub const KITTY_ANIM_MAX_STEPS_PER_TICK: u32 = 4;
 
 /// `z-index` below which placements draw under non-default cell
 /// backgrounds (`INT32_MIN/2`, kitty layering rule).
@@ -422,6 +445,78 @@ impl KittyAnimation {
     /// One step forward with wrap (pure helper; callers hold `total >= 2`).
     fn step(index: u32, total: u32) -> u32 {
         if index + 1 >= total { 0 } else { index + 1 }
+    }
+
+    /// Advances playback by `elapsed_ms` with tick pacing (S1, #1849):
+    /// like [`Self::advance`] except every positive gap floors to
+    /// [`KITTY_ANIM_TICK_QUANTUM_MS`] (IMG-9 host throttle, at most 30fps)
+    /// and at most `max_steps` timed transitions run per call — leftover
+    /// time is dropped, never banked (no catch-up spiral). Gapless frames
+    /// still skip free (bounded by the frame count). `max_steps == 0`
+    /// skips gapless frames without consuming any time.
+    ///
+    /// Pure function of the arguments: no clocks, no I/O. Stopped
+    /// animations, single-frame animations, and zero-duration (all-gapless)
+    /// animations never advance; `Loading` parks on the last frame and
+    /// `Running` wraps with the same loop budget as [`Self::advance`].
+    /// Returns the new current frame (1-based) when it changed.
+    pub fn advance_bounded(&mut self, elapsed_ms: u64, max_steps: u32) -> Option<u32> {
+        if self.state == KittyAnimState::Stopped || self.gaps.len() < 2 {
+            return None;
+        }
+        if self.duration_ms() == 0 {
+            return None;
+        }
+        let total = self.gaps.len() as u32;
+        let mut remaining = elapsed_ms;
+        let mut index = self.current - 1;
+        let mut steps = 0u32;
+        loop {
+            let gap = u64::from(self.gaps[index as usize]);
+            // Positive gaps floor to one tick quantum (IMG-9 throttle);
+            // gapless (`0`) frames skip without consuming time.
+            let effective = if gap == 0 {
+                0
+            } else {
+                gap.max(KITTY_ANIM_TICK_QUANTUM_MS)
+            };
+            if effective == 0 {
+                index = Self::step(index, total);
+                if index == 0 && self.on_wrap() {
+                    break;
+                }
+                continue;
+            }
+            if steps >= max_steps || remaining < effective {
+                break;
+            }
+            remaining -= effective;
+            steps += 1;
+            let next = Self::step(index, total);
+            if next == 0 {
+                if self.state == KittyAnimState::Loading {
+                    // Loading parks on the last frame instead of
+                    // wrapping: the frame's gap was consumed above.
+                    break;
+                }
+                index = 0;
+                if self.on_wrap() {
+                    break;
+                }
+                continue;
+            }
+            index = next;
+        }
+        let next = index + 1;
+        if next == self.current {
+            // Net-zero (exact multiples of the cycle, only gapless skips
+            // that changed nothing visible, or an exhausted step budget
+            // with no completed transition): no repaint needed.
+            None
+        } else {
+            self.current = next;
+            Some(next)
+        }
     }
 
     /// Records one wrap past the last frame. Returns `true` when the loop
@@ -818,6 +913,26 @@ impl PlacementStore {
         &mut self.animations.last_mut().expect("just pushed").1
     }
 
+    /// Advances every animation by `elapsed_ms` with tick pacing (S1,
+    /// #1849): each descriptor steps through
+    /// [`KittyAnimation::advance_bounded`] with `max_steps`, so `Stopped`
+    /// descriptors freeze, `Loading` ones park on the last frame, and
+    /// `Running` ones wrap against their loop budget. Returns the wire
+    /// image ids whose current frame changed (bounded by
+    /// [`KITTY_ANIM_MAX_IMAGES`]), oldest descriptor first. Pure
+    /// descriptor math: no clocks, no I/O, no damage — the caller
+    /// ([`crate::State::advance_kitty_animations`]) damages the changed
+    /// images.
+    pub fn advance_animations(&mut self, elapsed_ms: u64, max_steps: u32) -> Vec<u32> {
+        let mut changed = Vec::new();
+        for (id, anim) in &mut self.animations {
+            if anim.advance_bounded(elapsed_ms, max_steps).is_some() {
+                changed.push(*id);
+            }
+        }
+        changed
+    }
+
     /// Registers an `I=` number mapping for an image id (bounded like
     /// animations; newest mapping wins for deletes and controls).
     pub fn register_number(&mut self, number: u32, image_id: u32) {
@@ -1118,6 +1233,86 @@ mod tests {
         anim.set_current(2).unwrap();
         assert_eq!(anim.advance(1000), None);
         assert_eq!(anim.current(), 2);
+    }
+
+    /// S1 (#1849) tick pacing: sub-quantum gaps floor to one 33ms quantum
+    /// (IMG-9 host throttle, at most 30fps), never speed up.
+    #[test]
+    fn bounded_advance_floors_sub_quantum_gaps() {
+        let mut anim = KittyAnimation::new();
+        anim.set_gap(1, 5).unwrap();
+        anim.push_frame(5).unwrap();
+        anim.set_state(KittyAnimState::Running);
+        // 5ms wire gaps would flip in 10ms unbounded; the tick path floors
+        // each to one 33ms quantum, so 32ms advances nothing ...
+        assert_eq!(anim.advance_bounded(32, 4), None);
+        assert_eq!(anim.current(), 1);
+        // ... while 33ms consumes exactly one floored gap.
+        assert_eq!(anim.advance_bounded(33, 4), Some(2));
+    }
+
+    /// S1 (#1849) tick pacing: at most `max_steps` timed transitions per
+    /// call; leftover time is dropped (no catch-up spiral).
+    #[test]
+    fn bounded_advance_caps_steps_and_drops_leftover() {
+        let mut anim = KittyAnimation::new();
+        anim.set_gap(1, 40).unwrap();
+        anim.push_frame(40).unwrap();
+        anim.push_frame(40).unwrap();
+        anim.set_state(KittyAnimState::Running);
+        // 1000ms would lap the 120ms cycle ~8 times unbounded; bounded to
+        // one step it moves a single frame and drops the rest.
+        assert_eq!(anim.advance_bounded(1000, 1), Some(2));
+        assert_eq!(anim.current(), 2);
+        // The dropped time does not accumulate: the next tick starts fresh.
+        assert_eq!(anim.advance_bounded(39, 4), None);
+        assert_eq!(anim.current(), 2);
+        assert_eq!(anim.advance_bounded(40, 4), Some(3));
+    }
+
+    /// S1 (#1849): gapless skips stay free under the step cap (bounded by
+    /// the frame count, never by time), and zero steps still skips a
+    /// gapless current frame without consuming time.
+    #[test]
+    fn bounded_advance_gapless_skips_stay_free() {
+        let mut anim = KittyAnimation::new();
+        anim.set_gap(1, 0).unwrap();
+        anim.push_frame(100).unwrap();
+        anim.set_state(KittyAnimState::Running);
+        assert_eq!(anim.advance_bounded(0, 0), Some(2));
+        assert_eq!(anim.current(), 2);
+    }
+
+    /// S1 (#1849): stopped animations never advance, however large the
+    /// tick; loading parks on the last frame instead of wrapping.
+    #[test]
+    fn bounded_advance_stopped_freezes_and_loading_parks() {
+        let mut anim = KittyAnimation::new();
+        anim.set_gap(1, 40).unwrap();
+        anim.push_frame(40).unwrap();
+        anim.set_state(KittyAnimState::Stopped);
+        assert_eq!(anim.advance_bounded(u64::MAX, 4), None);
+        assert_eq!(anim.current(), 1);
+        anim.set_state(KittyAnimState::Loading);
+        assert_eq!(anim.advance_bounded(40, 4), Some(2));
+        assert_eq!(anim.advance_bounded(u64::MAX, 4), None);
+        assert_eq!(anim.current(), 2);
+    }
+
+    /// S1 (#1849): loop budgets count under the step cap; exhaustion stops
+    /// on the root frame exactly like the unbounded path.
+    #[test]
+    fn bounded_advance_counts_loops() {
+        let mut anim = KittyAnimation::new();
+        anim.set_gap(1, 40).unwrap();
+        anim.push_frame(40).unwrap();
+        anim.set_loops(2);
+        anim.set_state(KittyAnimState::Running);
+        anim.set_current(2).unwrap();
+        // Frame 2 (40) then root (40): one wrap exhausts the `v=2` budget.
+        assert_eq!(anim.advance_bounded(80, 4), Some(1));
+        assert_eq!(anim.state(), KittyAnimState::Stopped);
+        assert_eq!(anim.current(), 1);
     }
 
     #[test]

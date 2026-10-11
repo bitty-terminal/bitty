@@ -8,7 +8,7 @@
 //! store nothing.
 
 use bitty_rich::KittyPrecheckError;
-use bitty_runtime::{KittyDisplayOutcome, KittyImageError, Runtime};
+use bitty_runtime::{KittyDisplayOutcome, KittyImageError, Runtime, ViewId};
 
 fn make_runtime() -> Runtime {
     Runtime::with_defaults().expect("defaults must build")
@@ -810,5 +810,59 @@ fn raster_cache_invalidate_on_store_drops_stale() {
         rt.kitty_last_frame_images(),
         1,
         "live placement re-warms and still paints after invalidation"
+    );
+}
+
+#[test]
+fn idle_runtime_holds_no_bytes_in_bounded_stores() {
+    // CTX-1144 (#1968): settled idle single-pane meets RSS <= 150MB and
+    // PSS <= 120MB (release, WS5, 10s settle: HEAD ~130MB RSS / ~103MB PSS,
+    // flat vs the Oct 09 baseline; the ~184MB snapshot was early + driven,
+    // not settled). Every bounded image, raster, background, fx, pin, and
+    // local-medium store constructs empty and admits only on use, so a
+    // future eager allocation fails here instead of regressing silently.
+    let rt = make_runtime();
+    assert_eq!(rt.kitty_image_count(), 0, "no image stored at idle");
+    assert_eq!(rt.kitty_placement_count(), 0, "no placement at idle");
+    assert_eq!(rt.kitty_virtual_count(), 0, "no virtual prototype at idle");
+    assert_eq!(rt.kitty_last_frame_images(), 0, "no blit painted at idle");
+    assert_eq!(rt.kitty_raster_len(), 0, "raster cache empty at idle");
+    assert_eq!(rt.kitty_raster_bytes(), 0, "raster cache holds no bytes");
+    assert_eq!(
+        rt.kitty_raster_hits(),
+        0,
+        "no raster hit before first paint"
+    );
+    assert_eq!(
+        rt.kitty_raster_misses(),
+        0,
+        "no raster miss before first paint"
+    );
+    assert_eq!(rt.background_image_count(), 0, "no background at idle");
+    assert_eq!(rt.background_bytes(), 0, "background holds no bytes");
+    assert_eq!(rt.background_loads(), 0, "no background decoded at idle");
+    assert_eq!(
+        rt.background_raster_stats(),
+        (0, 0, 0, 0),
+        "background raster cache empty at idle"
+    );
+    assert_eq!(rt.pinned_count(), 0, "no pinned panel at idle");
+    assert!(rt.pinned_views().is_empty(), "no pinned views at idle");
+    assert_eq!(
+        rt.kitty_local_pending_count(),
+        0,
+        "no local-medium work at idle"
+    );
+    assert_eq!(
+        rt.kitty_local_deadline(),
+        None,
+        "no worker deadline at idle"
+    );
+    assert!(!rt.animations_active(), "no animation active at idle");
+    assert_eq!(rt.animation_deadline(), None, "no wakeup armed at idle");
+    assert_eq!(
+        rt.fx_progress(ViewId::new(1), std::time::Instant::now()),
+        None,
+        "no fx pulse armed at idle"
     );
 }
